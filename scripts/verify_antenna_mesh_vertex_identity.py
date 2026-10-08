@@ -96,6 +96,32 @@ class VertexIdentityChecks(unittest.TestCase):
                     np.testing.assert_array_equal(loaded.nodes, mesh.nodes)
                     np.testing.assert_array_equal(loaded.elements, mesh.elements)
 
+    def test_degenerate_cleanup_preserves_actual_identity_without_inventing_ids(self):
+        from fullmag.meshing._gmsh_types import MeshData
+        from fullmag.meshing.asset_pipeline import MeshQualityUnavailableError, _drop_degenerate_tetrahedra
+        for identity in (self.identity((107, 3, 900001, 45, 8007)), None):
+            with self.subTest(identity=identity):
+                mesh = MeshData.from_legacy_tet4(
+                    nodes=[[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [0.25, 0.25, 0.]],
+                    elements=[[0, 1, 2, 3], [0, 1, 2, 4]], element_markers=[7, 8],
+                    boundary_faces=[[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3], [0, 1, 4]],
+                    boundary_markers=[11, 12, 13, 14, 15], vertex_identity=identity,
+                )
+                fallbacks = []
+                cleaned = _drop_degenerate_tetrahedra(mesh, context="identity cleanup", fallbacks_triggered=fallbacks)
+                self.assertEqual(cleaned.vertex_identity, mesh.vertex_identity)
+                np.testing.assert_array_equal(cleaned.nodes, mesh.nodes)
+                np.testing.assert_array_equal(cleaned.elements, [[0, 1, 2, 3]])
+                np.testing.assert_array_equal(cleaned.element_markers, [7])
+                np.testing.assert_array_equal(cleaned.boundary_faces, mesh.boundary_faces[:4])
+                np.testing.assert_array_equal(cleaned.boundary_markers, [11, 12, 13, 14])
+                self.assertEqual(fallbacks, ["shared_domain_degenerate_tetra_cleanup"])
+                self.assertIsNone(cleaned.quality)
+                self.assertIsNone(cleaned.per_domain_quality)
+                self.assertIs(_drop_degenerate_tetrahedra(cleaned, context="valid cleanup", fallbacks_triggered=[]), cleaned)
+                with self.assertRaises(MeshQualityUnavailableError):
+                    _drop_degenerate_tetrahedra(replace(mesh, quality=object()), context="stale quality", fallbacks_triggered=[])
+
     def test_optional_real_gmsh_antenna_scaling_keeps_identity(self):
         if not self.with_gmsh:
             self.skipTest("real Gmsh meshing is opt-in; use --with-gmsh")

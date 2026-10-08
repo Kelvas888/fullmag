@@ -1016,6 +1016,7 @@ def _drop_degenerate_tetrahedra(
     boundary_faces, boundary_markers = _boundary_faces_for_kept_elements(mesh, keep)
     return MeshData.from_legacy_tet4(
         nodes=mesh.nodes,
+        vertex_identity=mesh.vertex_identity,
         elements=mesh.elements[keep],
         element_markers=mesh.element_markers[keep],
         boundary_faces=boundary_faces,

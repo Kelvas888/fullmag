@@ -100,6 +100,12 @@ Ten przyrost jest już zaimplementowany w ekstrakcji, rekonstrukcjach i asset
 pipeline. Interpretowane sprawdzenie `verify_antenna_mesh_vertex_identity.py
 --with-gmsh`: **5/5 PASS**, łącznie z rzeczywistym Gmsh microstrip.
 Nie zmienia MeshIR i nie jest jeszcze automatycznym przygotowaniem source.
+Kolejna regresja wykazała utratę ID w `_drop_degenerate_tetrahedra`. Po poprawce
+interpretowany check ma **6/6 PASS** z `--with-gmsh`: zachowane sparse ID,
+brak syntetycznego fallbacku, unchanged nodes z orphan node, markers/facets,
+no-op i odmowa nieaktualnego quality. Przed poprawką dokładnie jeden failure
+z sześciu checks. Polityka tolerancji i orientacji nie zmieniła się.
+Ponowna kontrola konsumenta przygotowania doprowadzeń: **11/11 PASS** z Gmsh.
 Jawny kontrakt znajduje się w 0950, anchor
 `antenna-straight-lead-preparation`. Prywatny helper jest już zaimplementowany:
 `prepare_antenna_external_lead_source` generuje rzeczywiste Tet4 leads i strict

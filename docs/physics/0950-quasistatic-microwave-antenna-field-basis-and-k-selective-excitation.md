@@ -3455,13 +3455,18 @@ Retencja MeshData zachowuje faktyczne ordered `getNodes` tags, nie indeksy
 Nie oznacza to globalnie stabilnego ID pomiędzy remeshami. Przyszły preparation
 owner musi nadal wiązać listę z konkretną geometrią, topology i material pins.
 Save/load, skalowanie i oriented copy zachowują kolejność nodes oraz ich IDs;
-format bez metadanych nie otrzymuje syntetycznego fallbacku. Sama poprawna
+`asset_pipeline.py::_drop_degenerate_tetrahedra` zachowuje je również podczas
+usuwania cells, ponieważ lista nodes nie jest wtedy zmieniana. Nie kompaktuje
+orphan nodes ani nie zmienia istniejącej tolerancji objętości i polityki quality.
+Format bez metadanych nie otrzymuje syntetycznego fallbacku. Sama poprawna
 etykieta issuer nie dowodzi autentyczności, aktualności ani acceptance solve.
 
 Interpretowany `scripts/verify_antenna_mesh_vertex_identity.py` wykonano
-08.10.2026 z `--with-gmsh`: **5/5 PASS**, w tym sparse/niesortowane actual
+08.10.2026 z `--with-gmsh`: **6/6 PASS**, w tym sparse/niesortowane actual
 `getNodes` tags, owned copy, oriented/scaled copy, JSON/NPZ, invalid/missing
-identity oraz rzeczywista siatka Gmsh microstrip. Nie uruchamiał FEM ani LLG;
+identity, cleanup degenerate cells oraz rzeczywista siatka Gmsh microstrip.
+Regresja cleanup była RED przed dodaniem retencji ID: jeden failure z sześciu
+checks, następnie GREEN. Nie uruchamiał FEM ani LLG;
 nie dowodzi zgodności wygenerowanych leadów lub zbieżności pola.
 
 Python/ProblemIR: ta zmiana nie dodaje publicznego konstruktora doprowadzeń
@@ -5752,7 +5757,8 @@ evidence and cannot promote a capability lane.
 | `packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py` | `_owned_vertex_identity` | walidacja i immutable copy actual ordered positive unique u64 IDs; bez zmiany MeshIR |
 | `packages/fullmag-py/src/fullmag/meshing/_gmsh_extraction.py` | `_extract_mesh_data` | zachowanie rzeczywistych ordered Gmsh tags, nie ordinal fallback |
 | `packages/fullmag-py/src/fullmag/meshing/_gmsh_infra.py` | `_scale_mesh_nodes` | geometry-only scale bez utraty vertex identity |
-| `scripts/verify_antenna_mesh_vertex_identity.py` | `VertexIdentityChecks` | 5 interpretowanych checks PASS z rzeczywistym Gmsh, bez native solvera |
+| `packages/fullmag-py/src/fullmag/meshing/asset_pipeline.py` | `_drop_degenerate_tetrahedra` | zachowanie ordered IDs przy unchanged nodes i filtrowaniu cells; bez zmiany tolerancji lub quality policy |
+| `scripts/verify_antenna_mesh_vertex_identity.py` | `VertexIdentityChecks` | 6 interpretowanych checks PASS z rzeczywistym Gmsh, cleanup RED→GREEN, bez native solvera |
 | `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `reject_unqualified_external_lead_source` | jawny source_not_qualified w legacy LLG/spectrum boundaries przed projekcją |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/input.rs` | `with_materialized_external_lead_request` | existing CPU-double ABI request z actual input i jawnie pinned native-v1 jump defaults |
 | `crates/fullmag-runner/src/antenna_external_lead_solution/publication.rs` | `publish_antenna_external_lead_solution_atomically` | fixed-name immutable revision, verify przed rename, cancel i exact reuse; source-only |
