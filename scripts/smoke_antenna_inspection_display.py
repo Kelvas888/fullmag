@@ -8,6 +8,7 @@ import argparse
 from hashlib import sha256
 import json
 import struct
+from uuid import uuid4
 from urllib.parse import quote, urlencode
 
 import antenna_rt0_fixture_check as framing
@@ -15,6 +16,34 @@ from smoke_antenna_external_lead_inspection import (
     MAX_BINARY_BYTES, MAX_METADATA_BYTES, json_body, request, require,
     session_scope, strong_etag, validate_resource,
 )
+
+
+def verify_route_contract(origin):
+    """Read-only admission checks; never claim a published numerical result."""
+    spec = json_body(request(origin, "/v2/platform/openapi.json", {}, 4 << 20), 200)
+    template = "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection"
+    operation = spec["paths"][template + "/display"]["get"]
+    require(any(parameter.get("name") == "content_digest" and parameter.get("in") == "query"
+                and parameter.get("required") is True for parameter in operation["parameters"]),
+            "display OpenAPI must require the immutable content digest")
+    require("AntennaInspectionDisplayResource" in spec["components"]["schemas"],
+            "display schema is absent from live OpenAPI")
+    path = template.replace("{stage_id}", "missing-display-probe-" + uuid4().hex)
+    missing = json_body(request(origin, path + "/display", {}, MAX_METADATA_BYTES), 400)
+    require(missing.get("message", "").startswith("invalid inspection display query:"),
+            "missing digest did not reach the display query guard")
+    unknown = urlencode({"content_digest": "sha256:" + "0" * 64, "unexpected": "1"})
+    json_body(request(origin, path + "/display?" + unknown, {}, MAX_METADATA_BYTES), 400)
+    query = urlencode({"content_digest": "sha256:" + "0" * 64})
+    for kind in ("device_positions", "device_topology"):
+        # These kinds must be admitted by the binary router but cannot invent
+        # a result for an unregistered stage (or an absent current session).
+        json_body(request(origin, path + f"/payloads/{kind}?{query}", {}, MAX_METADATA_BYTES), 404)
+    invalid = json_body(request(origin, path + "/payloads/not-a-quantity?" + query,
+                                {}, MAX_METADATA_BYTES), 400)
+    require(invalid.get("message") == "unknown inspection payload kind", "unknown payload kind admitted")
+    return {"status": "passed", "qualification": "live route/query guards only, no published data or solver",
+            "build_identity": spec.get("x-fullmag-build-identity")}
 
 
 def verify(origin, stage_id):
@@ -100,6 +129,9 @@ def verify(origin, stage_id):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--origin", default="http://127.0.0.1:8081")
-    parser.add_argument("--stage-id", required=True)
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--stage-id")
+    selection.add_argument("--route-only", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(verify(args.origin, args.stage_id), indent=2))
+    print(json.dumps(verify_route_contract(args.origin) if args.route_only
+                     else verify(args.origin, args.stage_id), indent=2))

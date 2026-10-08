@@ -218,6 +218,68 @@ Test nie obejmuje pełnego workspace HUD ani odpowiedzi prawdziwego solvera.
 Receipts i zrzuty znajdują się w resolverowym
 `storage/builds/<worktree-id>/windows-control-room-{source-check,browser-fixture}/`.
 
+Przyrost zapisano jako `8f603397eb4bb44ee900c13910e7c76bc703d5ad`.
+Changed-page scientific validator dla bazy `f693a2f7f58be6516ce074c76abce2d18787c6e2`
+i tego HEAD przeszedł. Zarządzany `just windows-backend-dev 3197` zakończył się
+08.10.2026 o 21:31:59 UTC: `completed`, exit 0. Zbudowano CLI/API/desktop,
+bez kompilacji unit tests. Manifest SHA-256:
+`4dacac2a718cc5a5f1ab5b2c968ba3c2dee23f132b10d8e7dc6835371c25094e`;
+native source snapshot:
+`50edf403750c0e95d1eac05d9c9bad5ccaefee20ea448598e2db45f62be64a11`.
+To natywny workspace Windows, **nie** wykonanie solvera FEM ani kwalifikacja
+four-lane. Log: `windows-native-fdm-cpu-dev/logs/native-build-e690072b2ebf46b999e4bb011aca3a7c.log`.
+
+Ten pakiet przeszedł także zarządzaną bramkę
+`verify-windows-frozen-development-backend-api`: **296 kontroli**, `completed`,
+exit 0, receipt `e703ddc7212e463fb74cad230acb88c5`. Sprawdzono rzeczywiste
+procesy CLI/API, admission guards, przekazanie właściciela, kontrolowany restart
+i zachowanie modelu w fixture. Nie jest to browser test ani wykonanie anteny.
+Receipt znajduje się w
+`storage/builds/<worktree-id>/development-backend-api-checks/checks/<receipt>/receipt.json`.
+
+Następnie `just windows-ui dev 3197 false dev` uruchomił istniejący, zgodny
+pakiet bez ponownego buildu. Read-only
+`smoke_antenna_inspection_display.py --origin http://127.0.0.1:8081 --route-only`
+przeszedł na żywym API tego HEAD: OpenAPI zawiera zasób i obowiązkowy digest,
+brak/błędny query jest odrzucany, router rozpoznaje nowe binarne XYZ/Tet4,
+a nieistniejący stage nie otrzymuje fikcyjnych danych. To dowód rzeczywistej
+obsługi tras i query guards, **nie** pozytywnego transportu opublikowanego
+wyniku. Pełny tryb `--stage-id` nadal wymaga świeżego, faktycznie obliczonego
+i zarejestrowanego bundle; nie podstawiamy historycznego fixture.
+
+### Potwierdzone granice następnego przyrostu authoring-to-solve
+
+Odczyt bieżących źródeł ujawnił dwie luki, których nie naprawia samo wywołanie
+prywatnego preparera:
+
+1. `model/problem.py::Problem.to_ir` emituje root `physics_objects`, lecz
+   aktywne `fullmag-ir/src/lib.rs::ProblemIR` i `ProblemIRWire` 0.3 go nie
+   deklarują. Przy typed deserialization pole jest ignorowane. Przetrwały
+   nośnik tożsamości to istniejące `physics_graph.objects` emitowane przez
+   `model/physics_scope.py::build_physics_graph`. Zarówno
+   `fullmag-ir/src/antenna.rs::validate_antenna_composition_v03`, jak i
+   `fullmag-plan/src/antenna_field_solve.rs::geometry_name_for_object` nadal
+   opierają się na magnetach/nazwach zamiast tej mapie. Naprawa musi objąć
+   wspólną walidację i resolver immutable `object_id → geometry_id`, zgodny
+   z Rust authoring normalizerem; nie tylko lookup ani nowy równoległy registry.
+   Jawnie błędny binding nie może uruchomić name fallback. V04 ma osobne
+   `objects` i opt-in migration; nie przełączamy wersji IR po cichu.
+2. `runtime/scene_document_ir.py::scene_document_to_problem_ir` oraz
+   `scene_document_to_execution_config` celowo używają
+   `include_geometry_assets=False`. Rustowy materializer etapu od razu
+   przekazuje taki IR plannerowi. Potrzebny jest jawny execution-only krok
+   materializacji kanonicznego Python producera z retained antenna MeshData
+   albo typed preparation intent zachowany do tego kroku. Lightweight
+   preview/GET nie powinien uruchamiać meshingu ani emitować fake source.
+
+Następny odbiór obejmuje antenę, której nazwa różni się od ID, rename bez
+zmiany ownera, odmowy duplikatów/brakujących geometrii/konfliktów, niezależną
+siatkę anteny obok domeny magnetycznej oraz rzeczywisty scheduled standalone
+stage. Publiczne typed preparation, jego scene/script round-trip i podłączenie
+do run admission nadal **nie są zaimplementowane**. Nie wystarczy zmienić
+domyślnych terminali UI z legacy na nowe etykiety.
+
 Cały moduł i T00–T18 pozostają **nieukończone**. Źródła B/C przeszły powyższe
-bramki, lecz actual HTTP, authoring-to-solve i kwalifikacja pozostają otwarte.
+bramki; live HTTP route guards przeszły, lecz pozytywny transport rzeczywistego
+wyniku, authoring-to-solve i kwalifikacja pozostają otwarte.
 D nie wolno oznaczyć jako gotowe na podstawie danych inspekcyjnych.
