@@ -92,7 +92,7 @@ export function buildObjectExplorerNode(
       children: [
         {
           id: `${parentId}:geometry`,
-          kind: "object.geometry",
+          kind: "object.antenna.geometry",
           label: "Geometry",
           parentId,
           badge: object.geometryKind ?? "unresolved",

@@ -43,6 +43,7 @@ export type ExplorerNodeKind =
   | "object.frozen-spins"
   | "object.geometry"
   | "object.antenna"
+  | "object.antenna.geometry"
   | "object.antenna.regional"
   | "object.antenna.conductor"
   | "object.antenna.port"

@@ -27,6 +27,9 @@ try {
   const screenshot = async name => { const path = resolve(directory, `${name}.png`); await page.screenshot({ path, fullPage: true }); screenshots.push(path); };
   const read = () => page.evaluate(() => window.__primitiveColorFixture.read());
   await panel.getByRole("textbox", { name: "Primitive color", exact: true }).waitFor({ timeout });
+  assert.ok(!(await panel.innerText()).includes("Average m"));
+  assert.ok(!(await panel.innerText()).includes("Energies"));
+  assert.ok(!(await read()).calls.some(call => call.path.includes("/metrics")), "Unmagnetized conductor fetched magnetic metrics");
   await page.getByTestId("primitive-unrelated").fill("retained local draft");
   await panel.getByRole("textbox", { name: "Name", exact: true }).fill("Unsaved antenna name");
   await screenshot("01-object-before");

@@ -339,6 +339,17 @@ try {
   }
   const afterCreation = await read();
   requestEvidence = { ...(requestEvidence ?? {}), [layout]: afterCreation };
+  layoutUrl.searchParams.set("inspector", "geometry");
+  await page.goto(layoutUrl.href, { waitUntil: "domcontentloaded", timeout });
+  const geometryPanel = page.locator('[data-inspector-owner="object.antenna.geometry"]');
+  await geometryPanel.getByRole("textbox", { name: "Station 1 signal width", exact: true }).waitFor({ timeout });
+  assert.ok((await geometryPanel.innerText()).includes(layout === "cpw" ? "two coplanar return strips" : "not an antenna bounding box"));
+  assert.ok(!(await geometryPanel.innerText()).includes("Average m"));
+  assert.equal(await geometryPanel.getByRole("combobox", { name: "Placement side", exact: true }).count(), 1);
+  assert.equal((await read()).unexpected.length, 0);
+  await screenshot("16-geometry-inspector");
+  assert.equal(pageErrors.length, 0, pageErrors.join(" | "));
+  checks.push({ name: `${layout} Explorer Geometry routes to its dedicated layout and placement inspector`, passed: true });
   await page.close();
   page = null;
   }

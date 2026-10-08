@@ -148,13 +148,18 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
   const scene = useSceneResource();
   const validation = useGeometryValidationResource();
   const object = resolveObjectGeneralPanelModel(selection, scene.data);
+  const sceneObject = scene.data?.objects?.find((entry) => entry.id === object.objectId);
+  const antennaWithoutMagnetization = sceneObject?.role === "antenna"
+    && sceneObject.magnetization_ref == null
+    && !sceneObject.physics_stack?.length
+    && !Object.keys(sceneObject.region_overrides ?? {}).length;
   const visualizationState = useVisualizationStateResource({
     enabled: object.mode === "committed",
   });
   const displayVisualizationState =
     visualizationState.optimisticData ?? visualizationState.data;
   const objectMetrics = useObjectMetricsResource(
-    object.mode === "committed" ? object.objectId : null,
+    object.mode === "committed" && !antennaWithoutMagnetization ? object.objectId : null,
   );
 
   const draftKey = `${object.mode}:${object.objectId}:${object.revision}`;
@@ -409,7 +414,7 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
         ) : null}
       </InspectorGroup>
 
-      <InspectorGroup title="Energies" badge={metricsModel.status} collapsible defaultOpen>
+      {!antennaWithoutMagnetization ? <InspectorGroup title="Energies" badge={metricsModel.status} collapsible defaultOpen>
         <FieldRow label="Fetch state" value={objectMetrics.status} />
         <FieldRow label="Sample" value={metricsModel.sample} />
         <FieldRow label="Source" value={metricsModel.source} />
@@ -420,7 +425,7 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
         <FieldRow label="Anisotropy" value={metricsModel.anisotropy} />
         <FieldRow label="DMI" value={metricsModel.dmi} />
         <FieldRow label="Total" value={metricsModel.total} />
-      </InspectorGroup>
+      </InspectorGroup> : null}
 
       <InspectorGroup title="Resource State" collapsible defaultOpen>
         <FieldRow label="Source" value={object.source} />

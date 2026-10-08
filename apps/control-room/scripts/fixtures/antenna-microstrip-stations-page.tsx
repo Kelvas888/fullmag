@@ -3,7 +3,7 @@
 import { Profiler, useEffect, useMemo, useSyncExternalStore } from "react";
 
 import { ControlRoomApi } from "@/kernel/api/ControlRoomApi";
-import { MODEL_SCENE_PATH, MODEL_TRANSACTIONS_PATH, SESSION_STATUS_PATH, SESSIONS_PATH } from "@/kernel/api/apiPaths";
+import { MODEL_GEOMETRY_REALIZATION_CURRENT_PATH, MODEL_SCENE_PATH, MODEL_TRANSACTIONS_PATH, SESSION_STATUS_PATH, SESSIONS_PATH } from "@/kernel/api/apiPaths";
 import type { AuthoringTransactionRequest, JsonObject, SceneResource } from "@/kernel/api/apiTypes";
 import { RequestDiagnosticsController } from "@/kernel/api/RequestDiagnosticsController";
 import { EventBus } from "@/kernel/events/EventBus";
@@ -20,6 +20,10 @@ import { SESSION_STATUS_RESOURCE_KEY } from "@/kernel/resources/useSessionStatus
 import type { KernelApi } from "@/kernel/types";
 import { MicrostripGeometryEditor } from "@/modules/inspector/panels/antenna/MicrostripGeometryEditor";
 import { AntennaConductorDetails } from "@/modules/inspector/panels/antenna/AntennaCompositionPanels";
+import { EMPTY_SELECTION } from "@/kernel/selection/selectionTypes";
+import { buildObjectExplorerNode } from "@/modules/explorer/builders/objectExplorerNodes";
+import { selectionRefFromNode } from "@/modules/explorer/explorerSelection";
+import { resolveInspectorRoute } from "@/modules/inspector/inspectorRouteCatalog";
 
 const OBJECT_ID = "fixture-microstrip-conductor";
 const API_INSTANCE = "22222222-2222-4222-8222-222222222222";
@@ -96,6 +100,7 @@ function makeFixture() {
         if (!state.holdScene) return json(snapshot);
         return new Promise<Response>((resolve) => pendingSceneReads.push(() => resolve(json(snapshot))));
       }
+      if (request.method === "GET" && path === MODEL_GEOMETRY_REALIZATION_CURRENT_PATH) return json({ source_scene_revision: state.scene.revision, bodies: [] });
       if (request.method === "POST" && path === MODEL_TRANSACTIONS_PATH) {
         const transaction = body as AuthoringTransactionRequest;
         if (transaction.kind === "merge_patch" && transaction.base_revision === state.scene.revision) {
@@ -161,8 +166,11 @@ function makeFixture() {
 function EditorHarness() {
   const resource = useSceneResource();
   const created = resource.data?.objects?.findLast((object) => object.id !== OBJECT_ID);
+  const geometryInspector = new URL(window.location.href).searchParams.get("inspector") === "geometry";
+  const node = buildObjectExplorerNode({ id: OBJECT_ID, label: "Antenna", objectRole: "antenna" }, {}).children?.find((child) => child.id.endsWith(":geometry"));
+  const GeometryPanel = node ? resolveInspectorRoute(node.kind)?.component : undefined;
   return <div data-testid="antenna-stations-editor" data-resource-status={resource.status} data-scene-revision={resource.data?.revision}>
-    <MicrostripGeometryEditor objectId={OBJECT_ID} scene={resource.data} status={resource.status} refetch={resource.refetch} />
+    {geometryInspector && GeometryPanel && node ? <GeometryPanel selection={{ ...EMPTY_SELECTION, kind: node.kind, objectId: OBJECT_ID, ref: selectionRefFromNode(node) }} /> : <MicrostripGeometryEditor objectId={OBJECT_ID} scene={resource.data} status={resource.status} refetch={resource.refetch} />}
     {created ? <div data-testid="antenna-created-details" data-object-id={created.id} style={{ width: 320, maxWidth: "100%" }}>
       <AntennaConductorDetails objectId={created.id} scene={resource.data} />
     </div> : null}

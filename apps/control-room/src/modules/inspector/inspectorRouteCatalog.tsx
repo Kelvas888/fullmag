@@ -11,6 +11,7 @@ import { FdmMultilayerAirboxTargetPanel } from "./panels/airbox/FdmMultilayerAir
 import { AirboxVisualizationDebugInspectorPanel } from "./panels/airbox/AirboxVisualizationDebugInspectorPanel";
 import { AntennaObjectPanel } from "./panels/AntennaObjectPanel";
 import { AntennaVisualizationPanel } from "./panels/antenna/AntennaVisualizationPanel";
+import { AntennaGeometryPanel } from "./panels/antenna/AntennaGeometryPanel";
 import {
   AntennaConductorPanel,
   AntennaPortPanel,
@@ -912,6 +913,12 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
     title: "Regional field drive",
     selectionKinds: ["object.antenna", "object.antenna.regional"],
     component: AntennaObjectPanel,
+  },
+  {
+    id: "antenna-geometry",
+    title: "Antenna geometry",
+    selectionKinds: ["object.antenna.geometry"],
+    component: AntennaGeometryPanel,
   },
   {
     id: "antenna-conductor",

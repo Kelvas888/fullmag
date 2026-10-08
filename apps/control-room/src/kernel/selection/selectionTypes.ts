@@ -22,6 +22,7 @@ type ObjectSelectionKind =
   | "object.root"
   | "object.geometry"
   | "object.antenna"
+  | "object.antenna.geometry"
   | "object.antenna.regional"
   | "object.antenna.conductor"
   | "object.antenna.port"
