@@ -438,6 +438,7 @@ def generate_box_mesh(
         )
         return MeshData.from_legacy_tet4(
             nodes=mesh.nodes / SCALE,
+            vertex_identity=mesh.vertex_identity,
             elements=mesh.elements,
             element_markers=mesh.element_markers,
             boundary_faces=mesh.boundary_faces,
@@ -503,6 +504,7 @@ def generate_cylinder_mesh(
         )
         return MeshData.from_legacy_tet4(
             nodes=mesh.nodes / SCALE,
+            vertex_identity=mesh.vertex_identity,
             elements=mesh.elements,
             element_markers=mesh.element_markers,
             boundary_faces=mesh.boundary_faces,
@@ -568,6 +570,7 @@ def generate_difference_mesh(
         # Scale nodes back to SI metres
         return MeshData.from_legacy_tet4(
             nodes=mesh.nodes / SCALE,
+            vertex_identity=mesh.vertex_identity,
             elements=mesh.elements,
             element_markers=mesh.element_markers,
             boundary_faces=mesh.boundary_faces,
@@ -693,6 +696,7 @@ def _generate_csg_mesh(
         )
         return MeshData.from_legacy_tet4(
             nodes=mesh.nodes / SCALE,
+            vertex_identity=mesh.vertex_identity,
             elements=mesh.elements,
             element_markers=mesh.element_markers,
             boundary_faces=mesh.boundary_faces,

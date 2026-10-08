@@ -806,6 +806,10 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
             get(handlers::data::get_antenna_external_lead_inspection),
         )
         .route(
+            "/v2/sessions/current/data/antenna/stages/:stage_id/external-lead-inspection/display",
+            get(handlers::data::get_antenna_external_lead_inspection_display),
+        )
+        .route(
             "/v2/sessions/current/data/antenna/stages/:stage_id/external-lead-inspection/payloads/:payload_kind",
             get(handlers::data::get_antenna_external_lead_inspection_payload),
         )

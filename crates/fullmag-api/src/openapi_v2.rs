@@ -259,6 +259,7 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::data::antenna::get_antenna_field_solution_payload,
         crate::router_v2::handlers::data::antenna::get_antenna_stage_output_catalog,
         crate::router_v2::handlers::data::antenna_inspection::get_antenna_external_lead_inspection,
+        crate::router_v2::handlers::data::antenna_inspection::get_antenna_external_lead_inspection_display,
         crate::router_v2::handlers::data::antenna_inspection::get_antenna_external_lead_inspection_payload,
         crate::router_v2::handlers::data::antenna::get_antenna_source_spectrum,
         crate::router_v2::handlers::data::antenna::get_antenna_source_spectrum_payload,

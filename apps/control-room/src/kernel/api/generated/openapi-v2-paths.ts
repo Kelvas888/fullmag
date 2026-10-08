@@ -97,6 +97,7 @@ export const openApiV2PathLiterals = [
   "/v2/sessions/current/data/antenna/source-spectra/{output_id}",
   "/v2/sessions/current/data/antenna/source-spectra/{output_id}/payloads/{payload_kind}",
   "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection",
+  "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection/display",
   "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection/payloads/{payload_kind}",
   "/v2/sessions/current/data/antenna/stages/{stage_id}/output-catalog",
   "/v2/sessions/current/data/artifacts",

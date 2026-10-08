@@ -29,6 +29,12 @@
     }
   ],
   "symbols": [
+    {"id":"straight_lead_indices","latex":"$e,a,k$","meaning":"indeksy doprowadzenia, wierzchołka cap i warstwy","si_unit":"$1$"},
+    {"id":"straight_lead_positions","latex":"$\\mathbf x_a,\\mathbf x_{a,k}$","meaning":"actual device cap i wygenerowane pozycje warstw","si_unit":"$\\mathrm m$"},
+    {"id":"straight_lead_length","latex":"$L_e$","meaning":"jawna długość doprowadzenia","si_unit":"$\\mathrm m$"},
+    {"id":"straight_lead_layers","latex":"$N_e$","meaning":"liczba przedziałów ekstrudowania","si_unit":"$1$"},
+    {"id":"straight_lead_direction","latex":"$\\mathbf d_e$","meaning":"jawny jednostkowy kierunek zewnętrzny","si_unit":"$1$"},
+    {"id":"straight_lead_norm","latex":"$\\lVert\\cdot\\rVert_2$","meaning":"norma euklidesowa","si_unit":"$1$ jako operator"},
     {"id":"duffy_positions","latex":"$\\mathbf t,\\mathbf r',\\mathbf v_i$","meaning":"cel, źródło i trzy pozostałe wierzchołki części","si_unit":"$\\mathrm m$"},
     {"id":"duffy_edges","latex":"$\\mathbf e_i,\\mathbf q$","meaning":"wektory krawędzi i promień mapowania","si_unit":"$\\mathrm m$"},
     {"id":"duffy_parameters","latex":"$\\xi,\\eta,\\zeta,x$","meaning":"bezwymiarowe parametry na przedziale jednostkowym","si_unit":"$1$"},
@@ -142,6 +148,7 @@
     {"id": "P_max", "latex": "$P_{\\max}$", "meaning": "versioned maximum direct-Oersted pair count", "si_unit": "$1$"}
   ],
   "equations": [
+    {"id":"antenna-straight-lead-layer-map","symbols":["straight_lead_indices","straight_lead_positions","straight_lead_length","straight_lead_layers","straight_lead_direction","straight_lead_norm"],"sources":["antenna-straight-lead-preparation-contract","antenna-straight-lead-preparation-owner","antenna-straight-lead-preparation-check"]},
     {"id":"antenna-duffy-source-map","symbols":["duffy_positions","duffy_edges","duffy_parameters"],"sources":["antenna-duffy-native","antenna-duffy-model","antenna-duffy-document"]},
     {"id":"antenna-duffy-jacobian","symbols":["duffy_edges","duffy_parameters","duffy_measure","duffy_operators"],"sources":["antenna-duffy-native","antenna-duffy-model"]},
     {"id":"antenna-duffy-regular-field","symbols":["duffy_positions","duffy_edges","duffy_parameters","duffy_measure","duffy_field","duffy_operators","J"],"sources":["antenna-duffy-native","antenna-duffy-sign-model","antenna-duffy-source-regression"]},
@@ -195,6 +202,20 @@
     }
   ],
   "sources": [
+    {"id":"antenna-mesh-identity-owner","path":"packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py","symbol":"_owned_vertex_identity","responsibility":"Exact ordered positive unique u64 identity, immutable copy, bez nowego MeshIR.","evidence_status":"source_only"},
+    {"id":"antenna-mesh-identity-extraction","path":"packages/fullmag-py/src/fullmag/meshing/_gmsh_extraction.py","symbol":"_extract_mesh_data","responsibility":"Actual ordered getNodes tags retained; bez ordinal fallback.","evidence_status":"source_only"},
+    {"id":"antenna-mesh-identity-scaling","path":"packages/fullmag-py/src/fullmag/meshing/_gmsh_infra.py","symbol":"_scale_mesh_nodes","responsibility":"Zachowanie identity przy geometry-only scale.","evidence_status":"source_only"},
+    {"id":"antenna-mesh-identity-check","path":"scripts/verify_antenna_mesh_vertex_identity.py","symbol":"class VertexIdentityChecks","responsibility":"Wykonane 5 interpretowanych przypadków z rzeczywistym Gmsh, bez FEM/LLG.","evidence_status":"source_only"},
+    {"id":"antenna-straight-lead-preparation-contract","path":"docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md","symbol":"DOC-ANCHOR:antenna-straight-lead-preparation","responsibility":"Prywatne mesh-exact straight stubs, explicit currents, conservative collision gates i odmowa kwalifikacji basis/FFT/LLG.","evidence_status":"planned_contract"},
+    {"id":"antenna-straight-lead-preparation-parameters","path":"packages/fullmag-py/src/fullmag/meshing/_antenna_external_lead_preparation.py","symbol":"class TerminalLeadExtension","responsibility":"Typed private electrode/cap/material parameters z jednostkami SI i jawną bounded admission.","evidence_status":"interpreted_checks_passed"},
+    {"id":"antenna-straight-lead-preparation-owner","path":"packages/fullmag-py/src/fullmag/meshing/_antenna_external_lead_preparation.py","symbol":"prepare_antenna_external_lead_source","responsibility":"Actual-ID lineage, full3D Tet4, strict source MeshIR i explicit currents; 11 interpretowanych kontroli PASS, nie native solve.","evidence_status":"interpreted_checks_passed"},
+    {"id":"antenna-straight-lead-preparation-check","path":"scripts/verify_antenna_external_lead_preparation.py","symbol":"class LeadPreparationChecks","responsibility":"Wykonane 11/11 PASS z actual Gmsh microstrip/taper; geometria/topologia/source/round-trip, bez solvera i LLG.","evidence_status":"interpreted_checks_passed"},
+    {"id": "antenna-inspection-display-contract", "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md", "symbol": "DOC-ANCHOR:antenna-inspection-display-carrier", "responsibility": "SI i immutable raw display, bez basis/FFT/LLG promotion; optional actual Gmsh identity retention, bez nowego MeshIR.", "evidence_status": "planned_contract"},
+    {"id": "antenna-inspection-display-device", "path": "crates/fullmag-runner/src/antenna_external_lead_solution.rs", "symbol": "device_display", "responsibility": "Exact retained device XYZ/Tet4 projection i odmowa mixed/foreign ownership.", "evidence_status": "source_only"},
+    {"id": "antenna-inspection-display-api", "path": "crates/fullmag-api/src/router_v2/handlers/data/antenna_inspection.rs", "symbol": "get_antenna_external_lead_inspection_display", "responsibility": "Session/digest-bound thin display descriptors po pełnym decode, osobno od manifest-only GET.", "evidence_status": "source_only"},
+    {"id": "antenna-inspection-display-http-check", "path": "scripts/smoke_antenna_inspection_display.py", "symbol": "verify", "responsibility": "Read-only HTTP, Range/304/stale digest i niezależny retained-byte comparator; runtime przed rebuildem niewykonany.", "evidence_status": "source_only"},
+    {"id": "antenna-inspection-display-etag", "path": "apps/control-room/src/kernel/resources/antennaResources.ts", "symbol": "antennaInspectionPayloadEtag", "responsibility": "Expected strong binary ETag z API ordered tuple i odmowa unsafe revision/digest.", "evidence_status": "source_only"},
+    {"id": "antenna-inspection-display-browser", "path": "apps/control-room/scripts/fixtures/antenna-visualization-page.tsx", "symbol": "AntennaVisualizationFixturePage", "responsibility": "Fixture wykonana przez smoke-antenna-visualization.mjs: managed browser cda2a5f86e754004967d0dff61988693 PASS, 13 grup kontroli UI/real layer/WebGL raw V/H i negatywne payloady; kontrolowany transport, nie native HTTP/FEM.", "evidence_status": "interpreted_checks_passed"},
     {"id":"antenna-execution-config-inventory-contract","path":"docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md","symbol":"DOC-ANCHOR:antenna-execution-config-inventory","responsibility":"Typowany transport deklaracji poza aktywnym IR i jawna materializacja; managed runtime pozostaje nieodebrany.","evidence_status":"planned_contract"},
     {"id":"antenna-execution-config-inventory-python","path":"packages/fullmag-py/src/fullmag/model/antenna_inventory.py","symbol":"to_ir","responsibility":"Serializacja czterech kolekcji deklaracyjnych bez aktywacji.","evidence_status":"source_only"},
     {"id":"antenna-execution-config-inventory-export","path":"packages/fullmag-py/src/fullmag/runtime/run_config_export.py","symbol":"export_run_config","responsibility":"Wspólny eksport typowanego ownera dla sceny i skryptu.","evidence_status":"source_only"},

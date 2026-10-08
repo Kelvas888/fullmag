@@ -1,5 +1,14 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Aktualny punkt wznowienia — 2026-10-08 (implementacja przepływu UI → source → display):**
+[Domknięcie end-to-end](2026-10-08-antenna-end-to-end-gap-closure.md) porównuje
+rzeczywisty stan z T04/T05/T06/T14/T15 i rozpisuje kolejność dalszych prac.
+Geometry/root zapisano jako `28c41969e77213afa01139bb8afecf3fe34e1542`.
+Inspekcja external-lead nie jest qualified basis; pełny producent źródła,
+renderer V/J/H oraz odbiór FFT/LLG nadal wymagają implementacji i wykonania.
+Nowszy checkpoint zastępuje poniższe historyczne wskazanie następnego kroku,
+nie zmieniając znaczenia wcześniejszych dowodów ani checkboxów T00–T18.
+
 Uzupełnienie 2026-10-08: [checkpoint inwentarza eksportu sceny](2026-10-08-antenna-scene-export-inventory-checkpoint.md)
 naprawia pomijanie anten w Rust override dla istniejącego skryptu. Solver
 projection pozostaje magnetic-only. Python round-trip i production API

@@ -1,4 +1,6 @@
 "use client";
+import { useAntennaFieldOverlay } from "./hooks/useAntennaFieldOverlay";
+import { antennaFieldDisplayLabel } from "@/kernel/visualization/antennaFieldIntent";
 
 import { useThree } from "@react-three/fiber";
 import {
@@ -1972,6 +1974,12 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   ...sceneProps
 }: Viewport3DFrameProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const antennaFieldOverlay = useAntennaFieldOverlay();
+  const antennaFieldSourceLabel = antennaFieldOverlay
+    ? sceneProps.primitiveModel?.objects.find(
+        (object) => object.objectId === antennaFieldOverlay.intent.sourceObjectId,
+      )?.label ?? antennaFieldOverlay.intent.sourceObjectId
+    : null;
   const pendingCaptureRevisionRef = useRef<number | null>(null);
   const primitiveObjectIds =
     sceneProps.primitiveModel?.objects
@@ -2629,6 +2637,8 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
         sceneProps.bounds ? JSON.stringify(sceneProps.bounds) : ""
       }
       data-visual-profile-id={sceneProps.visualProfileId}
+      data-antenna-field-quantity={antennaFieldOverlay?.intent.quantity}
+      data-antenna-field-sample-count={antennaFieldOverlay?.count}
       onPointerDown={() => kernel.layout.setFocusedSlot(slotId)}
     >
       <div aria-live="polite" className="fm-viewport-3d__hud">
@@ -2648,10 +2658,13 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             </Button>
           </fieldset>
         ) : null}
-        <span>{quantityId}</span>
-        <span>{selectedLabel}</span>
+        <span>{antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityId}</span>
+        <span>{antennaFieldSourceLabel ?? selectedLabel}</span>
         {hysteresisReplayLabel ? <span>{hysteresisReplayLabel}</span> : null}
-        <span>{domainSummary}</span>
+        <span>{antennaFieldOverlay ? `${antennaFieldOverlay.count} samples` : domainSummary}</span>
+        {antennaFieldOverlay?.intent.kind === "inspection" ? (
+          <span>inspection only · external electrode truncation · not qualified for LLG</span>
+        ) : null}
         {meshQualityLegend ? <span>{meshQualityLegend}</span> : null}
         {sceneProps.meshSizeHighlightModel ? (
           <span>
@@ -2816,6 +2829,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           />
           <Viewport3DScene
             {...sceneProps}
+            antennaFieldOverlay={antennaFieldOverlay}
             adoptionRegistry={visualizationDebugAdoptionRegistry}
             colors={colors}
             savedViewportActive={savedViewportActive}

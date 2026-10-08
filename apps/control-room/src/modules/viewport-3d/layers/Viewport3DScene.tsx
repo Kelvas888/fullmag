@@ -134,6 +134,8 @@ import {
 } from "./FdmCuboidLayer";
 import { resolveFdmCuboidPassPlan } from "./fdmCuboidPasses";
 import { VectorGlyphDerivedBufferCacheProvider } from "./vectorGlyphDerivedBufferRuntime";
+import { AntennaFieldLayer } from "./AntennaFieldLayer";
+import type { AntennaFieldOverlayModel } from "../model/antennaFieldOverlayModel";
 import { HysteresisReplayGlyphLayer } from "./HysteresisReplayGlyphLayer";
 import { Viewport3DLightingRig } from "./Viewport3DLightingRig";
 import {
@@ -174,6 +176,7 @@ import { Viewport3DMoveToolLayer, type Translation3 } from "../MoveObjectGizmo";
 const EMPTY_REGION_OVERLAYS: readonly RegionOverlayInput[] = [];
 
 interface Viewport3DSceneProps {
+  antennaFieldOverlay?: AntennaFieldOverlayModel | null;
   adoptionRegistry?: Viewport3DRenderAdoptionRegistry;
   sessionIdentity?: SessionResourceIdentity | null;
   bounds: Viewport3DBounds | null;
@@ -1726,6 +1729,7 @@ function useViewport3DRenderAdoptionFrame({
 }
 
 export function Viewport3DScene({
+  antennaFieldOverlay,
   adoptionRegistry,
   sessionIdentity,
   bounds,
@@ -2006,6 +2010,7 @@ export function Viewport3DScene({
 
   return (
     <VectorGlyphDerivedBufferCacheProvider tracker={tracker}>
+      <AntennaFieldLayer model={antennaFieldOverlay ?? null} colors={colors} tracker={tracker} sessionIdentity={sessionIdentity ?? null} />
       <color attach="background" args={[colors.background]} />
       <Viewport3DLightingRig profileId={visualProfileId} />
       {viewport3DCanvasLifecycleProbeEnabledFromBrowserConfig() ? (

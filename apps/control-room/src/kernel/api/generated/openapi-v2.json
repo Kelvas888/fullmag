@@ -2522,6 +2522,142 @@
           }
         ]
       },
+      "AntennaInspectionDisplayCapabilities": {
+        "properties": {
+          "current_density": {
+            "type": "boolean"
+          },
+          "display": {
+            "type": "boolean"
+          },
+          "llg_drive": {
+            "type": "boolean"
+          },
+          "per_ampere_basis": {
+            "type": "boolean"
+          },
+          "source_fft": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "display",
+          "per_ampere_basis",
+          "source_fft",
+          "llg_drive",
+          "current_density"
+        ],
+        "type": "object"
+      },
+      "AntennaInspectionDisplayResource": {
+        "properties": {
+          "capabilities": {
+            "$ref": "#/components/schemas/AntennaInspectionDisplayCapabilities"
+          },
+          "content_digest": {
+            "type": "string"
+          },
+          "device_cell_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "device_node_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "device_positions": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "device_potential": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "device_topology": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "field_scope": {
+            "type": "string"
+          },
+          "magnetic_field": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "normalization": {
+            "type": "string"
+          },
+          "qualification": {
+            "type": "string"
+          },
+          "record_content_digest": {
+            "type": "string"
+          },
+          "request_scope_epoch": {
+            "type": "string"
+          },
+          "resource_id": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "runtime_stage_id": {
+            "type": "string"
+          },
+          "sample_positions": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "sampling_carrier": {
+            "$ref": "#/components/schemas/AntennaInspectionSamplingResource"
+          },
+          "schema_version": {
+            "type": "string"
+          },
+          "session_epoch": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "source_object_id": {
+            "type": "string"
+          },
+          "stage_revision": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "resource_id",
+          "session_id",
+          "session_epoch",
+          "request_scope_epoch",
+          "run_id",
+          "runtime_stage_id",
+          "stage_revision",
+          "record_content_digest",
+          "content_digest",
+          "source_object_id",
+          "status",
+          "qualification",
+          "field_scope",
+          "normalization",
+          "capabilities",
+          "device_node_count",
+          "device_cell_count",
+          "sampling_carrier",
+          "device_positions",
+          "device_topology",
+          "device_potential",
+          "sample_positions",
+          "magnetic_field"
+        ],
+        "type": "object"
+      },
       "AntennaInspectionManifestResource": {
         "properties": {
           "bundle": {
@@ -49386,6 +49522,126 @@
         ]
       }
     },
+    "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection/display": {
+      "get": {
+        "operationId": "data_get_sessions_current_data_antenna_stages_stage_id_external_lead_inspection_display",
+        "parameters": [
+          {
+            "description": "Exact runtime stage ID",
+            "in": "path",
+            "name": "stage_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Required immutable inspection content digest",
+            "in": "query",
+            "name": "content_digest",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Canonical current-session scope",
+            "in": "header",
+            "name": "x-fullmag-session-scope",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Previous strong ETag",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "$ref": "#/components/parameters/FullmagSessionScope"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AntennaInspectionDisplayResource"
+                }
+              }
+            },
+            "description": "Fully verified immutable display descriptors; no FFT/LLG qualification"
+          },
+          "304": {
+            "description": "Unchanged after integrity validation"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid query"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "No registered inspection"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Stale owner, content digest or failed/cancelled result"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid bundle or device ownership"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            },
+            "description": "Worker failure"
+          }
+        },
+        "tags": [
+          "data"
+        ]
+      }
+    },
     "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection/payloads/{payload_kind}": {
       "get": {
         "operationId": "data_get_sessions_current_data_antenna_stages_stage_id_external_lead_inspection_payloads_payload_kind",
@@ -49400,7 +49656,7 @@
             }
           },
           {
-            "description": "bundle, sample_positions, magnetic_field, device_vertex_ids, device_potential",
+            "description": "bundle, sample_positions, magnetic_field, device_vertex_ids, device_potential, device_positions, device_topology",
             "in": "path",
             "name": "payload_kind",
             "required": true,

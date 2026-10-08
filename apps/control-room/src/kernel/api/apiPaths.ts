@@ -417,6 +417,10 @@ export const DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH = openApiV2Path(
   "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection",
 );
 
+export const DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH = openApiV2Path(
+  "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection/display",
+);
+
 export const DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH = openApiV2Path(
   "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection/payloads/{payload_kind}",
 );

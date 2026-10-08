@@ -144,6 +144,43 @@ pub struct AntennaExternalLeadInspectionResource {
     pub manifest: Option<AntennaInspectionManifestResource>,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AntennaInspectionDisplayCapabilities {
+    pub display: bool,
+    pub per_ampere_basis: bool,
+    pub source_fft: bool,
+    pub llg_drive: bool,
+    pub current_density: bool,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AntennaInspectionDisplayResource {
+    pub schema_version: String,
+    pub resource_id: String,
+    pub session_id: String,
+    pub session_epoch: String,
+    pub request_scope_epoch: String,
+    pub run_id: String,
+    pub runtime_stage_id: String,
+    pub stage_revision: u64,
+    pub record_content_digest: String,
+    pub content_digest: String,
+    pub source_object_id: String,
+    pub status: String,
+    pub qualification: String,
+    pub field_scope: String,
+    pub normalization: String,
+    pub capabilities: AntennaInspectionDisplayCapabilities,
+    pub device_node_count: u64,
+    pub device_cell_count: u64,
+    pub sampling_carrier: AntennaInspectionSamplingResource,
+    pub device_positions: AntennaInspectionPayloadResource,
+    pub device_topology: AntennaInspectionPayloadResource,
+    pub device_potential: AntennaInspectionPayloadResource,
+    pub sample_positions: AntennaInspectionPayloadResource,
+    pub magnetic_field: AntennaInspectionPayloadResource,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AntennaInspectionPayloadQuery {
@@ -529,6 +566,110 @@ pub async fn get_antenna_external_lead_inspection(
     Ok(crate::router_v2::handlers::shared::conditional_json_response(&headers, &etag, &resource))
 }
 
+fn device_display_payloads(
+    loaded: &LoadedAntennaExternalLeadSolution,
+) -> Result<[(AntennaExternalLeadPayloadRef, Vec<u8>); 2], ApiError> {
+    let display = loaded.device_display().map_err(|e| invalid(e.message))?;
+    let positions_count = display.positions_xyz_m.len() as u64 * 3;
+    let topology_count = display.tet4_cells.len() as u64 * 4;
+    let positions = display.positions_xyz_m.into_iter().flatten().flat_map(f64::to_le_bytes).collect::<Vec<_>>();
+    let topology = display.tet4_cells.into_iter().flatten().flat_map(u32::to_le_bytes).collect::<Vec<_>>();
+    Ok([
+        ("device_positions", positions, "float64_le", "node_xyz_interleaved", "m", positions_count),
+        ("device_topology", topology, "uint32_le", "tet4_connectivity", "1", topology_count),
+    ].map(|(kind, bytes, scalar_type, layout, unit, value_count)| {
+        (AntennaExternalLeadPayloadRef {
+            path: format!("display/{kind}.bin"),
+            sha256: digest(&bytes),
+            byte_count: bytes.len() as u64,
+            scalar_type: scalar_type.into(),
+            layout: layout.into(),
+            unit: unit.into(),
+            value_count,
+        }, bytes)
+    }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection/display",
+    params(
+        ("stage_id" = String, Path, description = "Exact runtime stage ID"),
+        ("content_digest" = String, Query, description = "Required immutable inspection content digest"),
+        ("x-fullmag-session-scope" = Option<String>, Header, description = "Canonical current-session scope"),
+        ("If-None-Match" = Option<String>, Header, description = "Previous strong ETag")
+    ),
+    responses(
+        (status = 200, description = "Fully verified immutable display descriptors; no FFT/LLG qualification", body = AntennaInspectionDisplayResource),
+        (status = 304, description = "Unchanged after integrity validation"),
+        (status = 400, description = "Invalid query", body = crate::schemas::common::ApiErrorResponse),
+        (status = 404, description = "No registered inspection", body = crate::schemas::common::ApiErrorResponse),
+        (status = 409, description = "Stale owner, content digest or failed/cancelled result", body = crate::schemas::common::ApiErrorResponse),
+        (status = 422, description = "Invalid bundle or device ownership", body = crate::schemas::common::ApiErrorResponse),
+        (status = 500, description = "Worker failure", body = crate::schemas::common::ApiErrorResponse)
+    ),
+    tag = "data"
+)]
+pub async fn get_antenna_external_lead_inspection_display(
+    State(state): State<Arc<AppState>>,
+    Path(stage_id): Path<String>,
+    query: Result<Query<AntennaInspectionPayloadQuery>, axum::extract::rejection::QueryRejection>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let Query(query) = query.map_err(|error| ApiError::bad_request(format!("invalid inspection display query: {error}")))?;
+    let captured = snapshot(&state, &stage_id).await?;
+    let owner = captured.owner.clone();
+    let resource = tokio::task::spawn_blocking(move || {
+        let record_bytes = read_registered_record(&captured.owner)?;
+        let record = parse_record(&record_bytes)?;
+        let output = record.outputs.first().ok_or_else(|| ApiError::conflict_with_code(
+            "inspection_has_no_payload", "failed/cancelled inspection has no display payload"))?;
+        if output.inspection_ref.content_digest != query.content_digest {
+            return Err(ApiError::conflict_with_code("inspection_digest_mismatch", "inspection revision differs from requested digest"));
+        }
+        let loaded = fullmag_runner::load_published_antenna_external_lead_solution(
+            &captured.owner.artifact_dir, &output.inspection_ref.runner_reference(),
+        ).map_err(|e| invalid(e.message))?;
+        validate_port(&record, &loaded.manifest)?;
+        let [(positions, _), (topology, _)] = device_display_payloads(&loaded)?;
+        let manifest = manifest_resource(loaded.manifest)?;
+        Ok::<_, ApiError>(AntennaInspectionDisplayResource {
+            schema_version: "antenna_inspection_display.v1".into(),
+            resource_id: format!("data/antenna/stages/{}/external-lead-inspection/display", captured.owner.runtime_stage_id),
+            session_id: captured.owner.session_id,
+            session_epoch: captured.owner.session_epoch,
+            request_scope_epoch: captured.owner.request_context.request_scope_epoch,
+            run_id: captured.owner.run_id,
+            runtime_stage_id: captured.owner.runtime_stage_id,
+            stage_revision: captured.stage_revision,
+            record_content_digest: format!("sha256:{}", digest(&record_bytes)),
+            content_digest: manifest.content_digest,
+            source_object_id: manifest.source_object_id,
+            status: "inspection_only".into(),
+            qualification: "NOT VERIFIED".into(),
+            field_scope: "external_electrode_truncation".into(),
+            normalization: "raw_authored_current".into(),
+            capabilities: AntennaInspectionDisplayCapabilities {
+                display: true, per_ampere_basis: false, source_fft: false,
+                llg_drive: false, current_density: false,
+            },
+            device_node_count: positions.value_count / 3,
+            device_cell_count: topology.value_count / 4,
+            sampling_carrier: manifest.sampling_carrier,
+            device_positions: positions.into(),
+            device_topology: topology.into(),
+            device_potential: manifest.device_potential,
+            sample_positions: manifest.sample_positions,
+            magnetic_field: manifest.magnetic_field,
+        })
+    }).await.map_err(|e| ApiError::internal(format!("inspection display worker: {e}")))??;
+    check_owner(&state, &owner).await?;
+    let etag = crate::router_v2::handlers::shared::stable_strong_etag(&digest(
+        &serde_json::to_vec(&resource).map_err(|e| ApiError::internal(e.to_string()))?,
+    ));
+    Ok(crate::router_v2::handlers::shared::conditional_json_response(&headers, &etag, &resource))
+}
+
 fn select_payload(
     loaded: LoadedAntennaExternalLeadSolution,
     kind: &str,
@@ -569,6 +710,10 @@ fn select_payload(
                 .flat_map(f64::to_le_bytes)
                 .collect(),
         ),
+        "device_positions" | "device_topology" => {
+            let [positions, topology] = device_display_payloads(&loaded)?;
+            if kind == "device_positions" { positions } else { topology }
+        },
         _ => return Err(ApiError::bad_request("unknown inspection payload kind")),
     };
     if descriptor.byte_count != bytes.len() as u64 || descriptor.sha256 != digest(&bytes) {
@@ -584,7 +729,7 @@ fn select_payload(
     path = "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection/payloads/{payload_kind}",
     params(
         ("stage_id" = String, Path, description = "Exact runtime stage ID"),
-        ("payload_kind" = String, Path, description = "bundle, sample_positions, magnetic_field, device_vertex_ids, device_potential"),
+        ("payload_kind" = String, Path, description = "bundle, sample_positions, magnetic_field, device_vertex_ids, device_potential, device_positions, device_topology"),
         ("content_digest" = String, Query, description = "Required sha256: digest from inspection_ref, not the stage record digest"),
         ("x-fullmag-session-scope" = Option<String>, Header, description = "Canonical current-session scope; stale scope is rejected before artifact reads"),
         ("If-None-Match" = Option<String>, Header, description = "Previous strong ETag"),
@@ -618,6 +763,8 @@ pub async fn get_antenna_external_lead_inspection_payload(
         "magnetic_field",
         "device_vertex_ids",
         "device_potential",
+        "device_positions",
+        "device_topology",
     ]
     .contains(&payload_kind.as_str())
     {

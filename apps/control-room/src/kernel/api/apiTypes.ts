@@ -282,12 +282,19 @@ export type AntennaStageOutputCatalogResource =
   components["schemas"]["AntennaStageOutputCatalogResource"];
 export type AntennaExternalLeadInspectionResource =
   components["schemas"]["AntennaExternalLeadInspectionResource"];
+export type AntennaInspectionDisplayResource =
+  components["schemas"]["AntennaInspectionDisplayResource"];
 export type AntennaInspectionPayloadKind =
   | "bundle"
   | "sample_positions"
   | "magnetic_field"
   | "device_vertex_ids"
-  | "device_potential";
+  | "device_potential"
+  | "device_positions"
+  | "device_topology";
+export type AntennaInspectionManifestPayloadKind = Exclude<
+  AntennaInspectionPayloadKind, "device_positions" | "device_topology"
+>;
 export type AntennaSourceSpectrumResource =
   components["schemas"]["AntennaSourceSpectrumResource"];
 export type AntennaSpectrumPayloadKind =

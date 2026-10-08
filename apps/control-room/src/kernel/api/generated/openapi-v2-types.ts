@@ -1556,6 +1556,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection/display": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["data_get_sessions_current_data_antenna_stages_stage_id_external_lead_inspection_display"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection/payloads/{payload_kind}": {
         parameters: {
             query?: never;
@@ -5322,6 +5338,42 @@ export interface components {
             kind: "region";
             object_id: string;
             region_id: string;
+        };
+        AntennaInspectionDisplayCapabilities: {
+            current_density: boolean;
+            display: boolean;
+            llg_drive: boolean;
+            per_ampere_basis: boolean;
+            source_fft: boolean;
+        };
+        AntennaInspectionDisplayResource: {
+            capabilities: components["schemas"]["AntennaInspectionDisplayCapabilities"];
+            content_digest: string;
+            /** Format: int64 */
+            device_cell_count: number;
+            /** Format: int64 */
+            device_node_count: number;
+            device_positions: components["schemas"]["AntennaInspectionPayloadResource"];
+            device_potential: components["schemas"]["AntennaInspectionPayloadResource"];
+            device_topology: components["schemas"]["AntennaInspectionPayloadResource"];
+            field_scope: string;
+            magnetic_field: components["schemas"]["AntennaInspectionPayloadResource"];
+            normalization: string;
+            qualification: string;
+            record_content_digest: string;
+            request_scope_epoch: string;
+            resource_id: string;
+            run_id: string;
+            runtime_stage_id: string;
+            sample_positions: components["schemas"]["AntennaInspectionPayloadResource"];
+            sampling_carrier: components["schemas"]["AntennaInspectionSamplingResource"];
+            schema_version: string;
+            session_epoch: string;
+            session_id: string;
+            source_object_id: string;
+            /** Format: int64 */
+            stage_revision: number;
+            status: string;
         };
         AntennaInspectionManifestResource: {
             bundle: components["schemas"]["AntennaInspectionPayloadResource"];
@@ -19402,6 +19454,89 @@ export interface operations {
             };
         };
     };
+    data_get_sessions_current_data_antenna_stages_stage_id_external_lead_inspection_display: {
+        parameters: {
+            query: {
+                /** @description Required immutable inspection content digest */
+                content_digest: string;
+            };
+            header?: {
+                /** @description Optional current-session identity in canonical form `session=<encodeURIComponent(session_id)>&epoch=<encodeURIComponent(session_epoch)>&request_scope_epoch=<encodeURIComponent(request_scope_epoch)>`. Bootstrap, legacy, and input-only inspection requests may omit it; context-bound current-session handlers reject a stale value with 409. */
+                "x-fullmag-session-scope"?: components["parameters"]["FullmagSessionScope"];
+                /** @description Previous strong ETag */
+                "If-None-Match"?: string | null;
+            };
+            path: {
+                /** @description Exact runtime stage ID */
+                stage_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Fully verified immutable display descriptors; no FFT/LLG qualification */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AntennaInspectionDisplayResource"];
+                };
+            };
+            /** @description Unchanged after integrity validation */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description No registered inspection */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Stale owner, content digest or failed/cancelled result */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Invalid bundle or device ownership */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Worker failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
     data_get_sessions_current_data_antenna_stages_stage_id_external_lead_inspection_payloads_payload_kind: {
         parameters: {
             query: {
@@ -19419,7 +19554,7 @@ export interface operations {
             path: {
                 /** @description Exact runtime stage ID */
                 stage_id: string;
-                /** @description bundle, sample_positions, magnetic_field, device_vertex_ids, device_potential */
+                /** @description bundle, sample_positions, magnetic_field, device_vertex_ids, device_potential, device_positions, device_topology */
                 payload_kind: string;
             };
             cookie?: never;

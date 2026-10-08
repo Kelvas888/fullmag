@@ -118,6 +118,49 @@ pub struct LoadedAntennaExternalLeadSolution {
     pub device_potential_v: Vec<f64>,
     pub sample_positions_xyz_m: Vec<[f64; 3]>,
     pub magnetic_field_xyz_apm: Vec<[f64; 3]>,
+    retained_charge: crate::native_fem::accepted_terminal_charge::AcceptedTerminalChargeRecord,
+    retained_lead_vertex_ids: Vec<u64>,
+}
+
+/// Immutable device geometry extracted from the retained solve, not a live mesh.
+pub struct AntennaInspectionDeviceDisplay {
+    pub positions_xyz_m: Vec<[f64; 3]>,
+    pub tet4_cells: Vec<[u32; 4]>,
+}
+
+impl LoadedAntennaExternalLeadSolution {
+    pub fn device_display(&self) -> Result<AntennaInspectionDeviceDisplay, RunError> {
+        let vertices = &self.retained_charge.vertices;
+        let by_id = vertices.iter().map(|vertex| (vertex.id, vertex.xyz_m))
+            .collect::<BTreeMap<_, _>>();
+        let device = self.device_vertex_ids.iter().enumerate()
+            .map(|(index, id)| u32::try_from(index).map(|index| (*id, index)))
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(|_| RunError { message: "inspection device index exceeds uint32".into() })?;
+        let leads = self.retained_lead_vertex_ids.iter().copied().collect::<BTreeSet<_>>();
+        require(by_id.len() == vertices.len()
+            && device.len() == self.device_vertex_ids.len()
+            && leads.len() == self.retained_lead_vertex_ids.len()
+            && device.keys().all(|id| by_id.contains_key(id) && !leads.contains(id))
+            && leads.iter().all(|id| by_id.contains_key(id))
+            && device.len().checked_add(leads.len()) == Some(by_id.len()),
+            "inspection display vertex ownership is missing, repeated or foreign")?;
+        let positions_xyz_m = self.device_vertex_ids.iter().map(|id| by_id[id]).collect();
+        let mut tet4_cells = Vec::new();
+        for element in &self.retained_charge.elements {
+            let ids = element.vertex_ids;
+            require(ids.iter().all(|id| by_id.contains_key(id)),
+                "inspection display tetrahedron references a foreign vertex")?;
+            if ids.iter().all(|id| device.contains_key(id)) {
+                tet4_cells.push(ids.map(|id| device[&id]));
+            } else {
+                require(ids.iter().all(|id| leads.contains(id)),
+                    "inspection display tetrahedron has mixed device/lead ownership")?;
+            }
+        }
+        require(!tet4_cells.is_empty(), "inspection display has no device-owned tetrahedra")?;
+        Ok(AntennaInspectionDeviceDisplay { positions_xyz_m, tet4_cells })
+    }
 }
 
 fn require(condition: bool, message: &str) -> Result<(), RunError> {
@@ -613,6 +656,8 @@ pub fn load_antenna_external_lead_solution(
         device_potential_v,
         sample_positions_xyz_m: bundle.field.targets_m,
         magnetic_field_xyz_apm: bundle.h_xyz_apm,
+        retained_charge: bundle.charge,
+        retained_lead_vertex_ids: bundle.source.lead_vertex_ids,
     })
 }
 

@@ -57,6 +57,7 @@ import {
   DATA_ANTENNA_FIELD_SOLUTION_PATH,
   DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH,
   DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH,
+  DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH,
   DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH,
   DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH,
   DATA_ANTENNA_SOURCE_SPECTRUM_PATH,
@@ -377,6 +378,7 @@ import type {
   AntennaFieldSolutionResource,
   AntennaFieldPayloadKind,
   AntennaExternalLeadInspectionResource,
+  AntennaInspectionDisplayResource,
   AntennaInspectionPayloadKind,
   AntennaStageOutputCatalogResource,
   AntennaSpectrumPayloadKind,
@@ -1766,6 +1768,16 @@ export class ControlRoomApi {
           DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH,
           options,
           { path: { stage_id: stageId } },
+        ),
+      externalLeadInspectionDisplay: (
+        stageId: string,
+        contentDigest: string,
+        options?: RequestOptions,
+      ) =>
+        this.requestJson<AntennaInspectionDisplayResource>(
+          DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH,
+          options,
+          { path: { stage_id: stageId }, query: { content_digest: contentDigest } },
         ),
       externalLeadInspectionPayload: (
         stageId: string,

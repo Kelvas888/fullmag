@@ -359,6 +359,16 @@ def _extract_frozen_magnetic_submesh(
 
     frozen_mesh = MeshData(
         nodes=np.asarray(shared_mesh.nodes[used_nodes], dtype=np.float64),
+        vertex_identity=(
+            {
+                **shared_mesh.vertex_identity,
+                "vertex_ids": [
+                    shared_mesh.vertex_identity["vertex_ids"][int(index)]
+                    for index in used_nodes
+                ],
+            }
+            if shared_mesh.vertex_identity is not None else None
+        ),
         cell_types=cell_types,
         cell_offsets=cell_offsets,
         cell_nodes=cell_nodes,
@@ -3274,6 +3284,7 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
         else:
             classified_mesh = MeshData(
                 nodes=mesh.nodes,
+                vertex_identity=mesh.vertex_identity,
                 cell_types=mesh.cell_types,
                 cell_offsets=mesh.cell_offsets,
                 cell_nodes=mesh.cell_nodes,

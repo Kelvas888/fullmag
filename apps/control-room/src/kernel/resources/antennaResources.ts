@@ -6,6 +6,7 @@ import {
   DATA_ANTENNA_FIELD_SOLUTION_PATH,
   DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH,
   DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH,
+  DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH,
   DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH,
   DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH,
   DATA_ANTENNA_SOURCE_SPECTRUM_PATH,
@@ -16,6 +17,8 @@ import type {
   AntennaFieldSolutionResource,
   AntennaFieldPayloadKind,
   AntennaExternalLeadInspectionResource,
+  AntennaInspectionDisplayResource,
+  AntennaInspectionManifestPayloadKind,
   AntennaInspectionPayloadKind,
   AntennaStageOutputCatalogResource,
   AntennaSpectrumPayloadKind,
@@ -34,6 +37,7 @@ export interface AntennaResourceOptions {
 
 interface AntennaPayloadResourceOptions extends AntennaResourceOptions {
   expectedEtag?: string;
+  maxResponseBytes?: number;
   range?: string;
 }
 
@@ -81,6 +85,28 @@ export function requireMatchingAntennaPayloadRevision(
     throw new Error("antenna payload revision does not match selected manifest");
   }
   return result;
+}
+
+export async function antennaInspectionPayloadEtag(
+  inspection: AntennaExternalLeadInspectionResource,
+  payloadKind: AntennaInspectionPayloadKind,
+  payloadSha256: string,
+): Promise<string> {
+  const output = inspection.outputs.length === 1 ? inspection.outputs[0] : null;
+  if (!output || !Number.isSafeInteger(inspection.stage_revision) ||
+    !/^[0-9a-f]{64}$/.test(payloadSha256)) {
+    throw new Error("antenna inspection payload has invalid owner or digest");
+  }
+  // This ordered tuple is the API's immutable binary-response identity.
+  const token = JSON.stringify([
+    inspection.session_id, inspection.session_epoch, inspection.request_scope_epoch,
+    inspection.run_id, inspection.stage_revision, inspection.runtime_stage_id,
+    inspection.stage_id, inspection.output_id, output.inspection_ref.content_digest,
+    payloadKind, payloadSha256,
+  ]);
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", new TextEncoder().encode(token));
+  const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+  return `"${hex}"`;
 }
 
 function concretePath(template: string, name: string, value: string): string {
@@ -202,13 +228,13 @@ export function useAntennaFieldSolutionPayloadResource(
     async ({ signal, sessionScopeKey }: { signal: AbortSignal; sessionScopeKey?: string }) => {
       if (!solutionId || !payloadKind) return null;
       const result = await api.data.antenna
-        .fieldSolutionPayload(solutionId, payloadKind, portModeId ?? undefined, { signal, sessionScopeKey, range: options.range })
+        .fieldSolutionPayload(solutionId, payloadKind, portModeId ?? undefined, { signal, sessionScopeKey, range: options.range, maxResponseBytes: options.maxResponseBytes })
         .catch(ignoreMissingAntennaResource<BinaryResourceResult<ArrayBuffer>>);
       return options.expectedEtag
         ? requireMatchingAntennaPayloadRevision(result, options.expectedEtag)
         : result;
     },
-    [api, options.expectedEtag, options.range, payloadKind, portModeId, solutionId],
+    [api, options.expectedEtag, options.maxResponseBytes, options.range, payloadKind, portModeId, solutionId],
   );
 
   return useResource<BinaryResourceResult<ArrayBuffer> | null>({
@@ -260,13 +286,13 @@ export function useAntennaSourceSpectrumPayloadResource(
     async ({ signal, sessionScopeKey }: { signal: AbortSignal; sessionScopeKey?: string }) => {
       if (!outputId || !payloadKind) return null;
       const result = await api.data.antenna
-        .sourceSpectrumPayload(outputId, payloadKind, { signal, sessionScopeKey, range: options.range })
+        .sourceSpectrumPayload(outputId, payloadKind, { signal, sessionScopeKey, range: options.range, maxResponseBytes: options.maxResponseBytes })
         .catch(ignoreMissingAntennaResource<BinaryResourceResult<ArrayBuffer>>);
       return options.expectedEtag
         ? requireMatchingAntennaPayloadRevision(result, options.expectedEtag)
         : result;
     },
-    [api, options.expectedEtag, options.range, outputId, payloadKind],
+    [api, options.expectedEtag, options.maxResponseBytes, options.range, outputId, payloadKind],
   );
 
   return useResource<BinaryResourceResult<ArrayBuffer> | null>({
@@ -307,10 +333,138 @@ export function useAntennaExternalLeadInspectionResource(
   });
 }
 
+function inspectionDisplayPayloadMatchesManifest(
+  display: AntennaInspectionDisplayResource["device_potential"],
+  manifest: NonNullable<AntennaExternalLeadInspectionResource["manifest"]>["device_potential"],
+): boolean {
+  return (["sha256", "byte_count", "value_count", "scalar_type", "layout", "unit"] as const)
+    .every((key) => display[key] === manifest[key]);
+}
+
+export function antennaInspectionDisplayMatchesOwner(
+  inspection: AntennaExternalLeadInspectionResource,
+  display: AntennaInspectionDisplayResource,
+): boolean {
+  const output = inspection.outputs.length === 1 ? inspection.outputs[0] : null;
+  return Boolean(output && inspection.manifest &&
+    display.schema_version === "antenna_inspection_display.v1" &&
+    display.session_id === inspection.session_id &&
+    display.session_epoch === inspection.session_epoch &&
+    display.request_scope_epoch === inspection.request_scope_epoch &&
+    display.run_id === inspection.run_id &&
+    display.runtime_stage_id === inspection.runtime_stage_id &&
+    display.stage_revision === inspection.stage_revision &&
+    display.record_content_digest === inspection.record_content_digest &&
+    display.content_digest === output.inspection_ref.content_digest &&
+    display.content_digest === inspection.manifest.content_digest &&
+    display.source_object_id === inspection.manifest.source_object_id &&
+    inspectionDisplayPayloadMatchesManifest(display.device_potential, inspection.manifest.device_potential) &&
+    inspectionDisplayPayloadMatchesManifest(display.sample_positions, inspection.manifest.sample_positions) &&
+    inspectionDisplayPayloadMatchesManifest(display.magnetic_field, inspection.manifest.magnetic_field) &&
+    display.sampling_carrier.carrier_kind === inspection.manifest.sampling_carrier.carrier_kind &&
+    display.sampling_carrier.location === inspection.manifest.sampling_carrier.location &&
+    display.sampling_carrier.sample_count === inspection.manifest.sampling_carrier.sample_count &&
+    display.sampling_carrier.topology_digest === inspection.manifest.sampling_carrier.topology_digest &&
+    JSON.stringify(display.sampling_carrier.domain) === JSON.stringify(inspection.manifest.sampling_carrier.domain) &&
+    display.status === "inspection_only" && display.qualification === "NOT VERIFIED" &&
+    display.field_scope === "external_electrode_truncation" &&
+    display.normalization === "raw_authored_current" && display.capabilities.display === true &&
+    display.capabilities.per_ampere_basis === false && display.capabilities.llg_drive === false &&
+    display.capabilities.source_fft === false && display.capabilities.current_density === false);
+}
+
+export function useAntennaInspectionDisplayResource(
+  inspection: AntennaExternalLeadInspectionResource | null | undefined,
+  options: AntennaResourceOptions = {},
+) {
+  const { api } = useKernel();
+  const stageId = inspection?.runtime_stage_id;
+  const contentDigest = inspection?.outputs.length === 1
+    ? inspection.outputs[0].inspection_ref.content_digest : null;
+  const unscopedResourceKey = inspection && stageId && contentDigest
+    ? `${concretePath(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, "stage_id", stageId)}?content_digest=${encodeURIComponent(contentDigest)}#${inspection.stage_revision}:${inspection.record_content_digest}`
+    : `${DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH}:none`;
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(unscopedResourceKey);
+  const ownerMatches = inspection && sessionResourceIdentitiesEqual(sessionIdentity, {
+    sessionId: inspection.session_id, sessionEpoch: inspection.session_epoch,
+    requestScopeEpoch: inspection.request_scope_epoch,
+  });
+  const load = useCallback(
+    async ({ signal, sessionScopeKey }: { signal: AbortSignal; sessionScopeKey?: string }) => {
+      if (!inspection || !ownerMatches || !stageId || !contentDigest) return null;
+      const result = await api.data.antenna.externalLeadInspectionDisplay(
+        stageId, contentDigest, { signal, sessionScopeKey },
+      ).catch(ignoreMissingAntennaResource<AntennaInspectionDisplayResource>);
+      if (result && !antennaInspectionDisplayMatchesOwner(inspection, result)) {
+        throw new Error("antenna display metadata does not match its immutable inspection owner");
+      }
+      return result;
+    }, [api, contentDigest, inspection, ownerMatches, stageId],
+  );
+  return useResource<AntennaInspectionDisplayResource | null>({
+    enabled: Boolean(ownerMatches && stageId && contentDigest && inspection?.status === "inspection_only") && options.enabled !== false,
+    load, resourceKey,
+    resolveRevision: (data) => data ? `${data.stage_revision}:${data.record_content_digest}:${data.content_digest}` : null,
+  });
+}
+
+type AntennaDisplayPayloadKind = "device_positions" | "device_topology" | "device_potential" | "sample_positions" | "magnetic_field";
+
+export function useAntennaInspectionDisplayPayloadResource(
+  inspection: AntennaExternalLeadInspectionResource | null | undefined,
+  display: AntennaInspectionDisplayResource | null | undefined,
+  payloadKind: AntennaDisplayPayloadKind | null | undefined,
+  options: Pick<AntennaPayloadResourceOptions, "enabled" | "range" | "maxResponseBytes"> = {},
+) {
+  const { api } = useKernel();
+  const compatible = Boolean(inspection && display && antennaInspectionDisplayMatchesOwner(inspection, display));
+  const unscopedResourceKey = compatible && display && payloadKind
+    ? `${concretePath(concretePath(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, "stage_id", display.runtime_stage_id), "payload_kind", payloadKind)}?content_digest=${encodeURIComponent(display.content_digest)}#${display.stage_revision}:${display.record_content_digest}${options.range ? `@${options.range}` : ""}`
+    : `${DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH}:display:none`;
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(unscopedResourceKey);
+  const ownerMatches = display && sessionResourceIdentitiesEqual(sessionIdentity, {
+    sessionId: display.session_id, sessionEpoch: display.session_epoch,
+    requestScopeEpoch: display.request_scope_epoch,
+  });
+  const load = useCallback(
+    async ({ signal, sessionScopeKey }: { signal: AbortSignal; sessionScopeKey?: string }) => {
+      if (!compatible || !ownerMatches || !inspection || !display || !payloadKind) return null;
+      const descriptor = display[payloadKind];
+      if (!Number.isSafeInteger(descriptor.byte_count) || descriptor.byte_count <= 0 ||
+          descriptor.byte_count > 64 * 1024 * 1024) {
+        throw new Error("antenna display payload exceeds its complete bounded transport contract");
+      }
+      const expectedEtag = await antennaInspectionPayloadEtag(inspection, payloadKind, descriptor.sha256);
+      const result = await api.data.antenna.externalLeadInspectionPayload(
+        display.runtime_stage_id, payloadKind, display.content_digest,
+        { signal, sessionScopeKey, range: options.range,
+          maxResponseBytes: Math.min(options.maxResponseBytes ?? descriptor.byte_count, descriptor.byte_count) },
+      );
+      const pinned = requireMatchingAntennaPayloadRevision(result, expectedEtag);
+      const complete = !options.range || options.range === `bytes=0-${descriptor.byte_count - 1}`;
+      if (pinned?.status === "ready" && complete) {
+        if (pinned.data.byteLength !== descriptor.byte_count) {
+          throw new Error("antenna display payload length differs from its immutable descriptor");
+        }
+        const hash = await globalThis.crypto.subtle.digest("SHA-256", pinned.data);
+        const hex = Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, "0")).join("");
+        if (hex !== descriptor.sha256) {
+          throw new Error("antenna display payload digest differs from its immutable descriptor");
+        }
+      }
+      return pinned;
+    }, [api, compatible, display, inspection, options.maxResponseBytes, options.range, ownerMatches, payloadKind],
+  );
+  return useResource<BinaryResourceResult<ArrayBuffer> | null>({
+    enabled: Boolean(compatible && ownerMatches && payloadKind) && options.enabled !== false,
+    load, resourceKey, resolveRevision: (data) => data?.status === "ready" ? data.etag : null,
+  });
+}
+
 export function useAntennaExternalLeadInspectionPayloadResource(
   inspection: AntennaExternalLeadInspectionResource | null | undefined,
-  payloadKind: AntennaInspectionPayloadKind | null | undefined,
-  options: Pick<AntennaPayloadResourceOptions, "enabled" | "range"> = {},
+  payloadKind: AntennaInspectionManifestPayloadKind | null | undefined,
+  options: Pick<AntennaPayloadResourceOptions, "enabled" | "range" | "maxResponseBytes"> = {},
 ) {
   const { api } = useKernel();
   const stageId = inspection?.runtime_stage_id;
@@ -330,13 +484,17 @@ export function useAntennaExternalLeadInspectionPayloadResource(
     contentDigest && inspection.manifest.content_digest === contentDigest,
   );
   const load = useCallback(
-    ({ signal, sessionScopeKey }: { signal: AbortSignal; sessionScopeKey?: string }) =>
-      ownerMatches && hasPayload && stageId && payloadKind && contentDigest
-        ? api.data.antenna.externalLeadInspectionPayload(
-            stageId, payloadKind, contentDigest, { signal, sessionScopeKey, range: options.range },
-          )
-        : Promise.resolve(null),
-    [api, contentDigest, hasPayload, options.range, ownerMatches, payloadKind, stageId],
+    async ({ signal, sessionScopeKey }: { signal: AbortSignal; sessionScopeKey?: string }) => {
+      if (!inspection || !ownerMatches || !hasPayload || !stageId || !payloadKind || !contentDigest) return null;
+      const descriptor = inspection.manifest?.[payloadKind];
+      if (!descriptor) throw new Error("antenna inspection has no selected payload descriptor");
+      const expectedEtag = await antennaInspectionPayloadEtag(inspection, payloadKind, descriptor.sha256);
+      const result = await api.data.antenna.externalLeadInspectionPayload(
+        stageId, payloadKind, contentDigest, { signal, sessionScopeKey, range: options.range, maxResponseBytes: options.maxResponseBytes },
+      );
+      return requireMatchingAntennaPayloadRevision(result, expectedEtag);
+    },
+    [api, contentDigest, hasPayload, inspection, options.maxResponseBytes, options.range, ownerMatches, payloadKind, stageId],
   );
 
   return useResource<BinaryResourceResult<ArrayBuffer> | null>({

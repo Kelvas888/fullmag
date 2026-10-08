@@ -102,6 +102,12 @@ approximation and renamed in provenance to
 
 | Symbol | Meaning | SI unit |
 |---|---|---|
+| $e,a,k$ | indeksy doprowadzenia, wierzchołka cap i warstwy | $1$ |
+| $\mathbf x_a,\mathbf x_{a,k}$ | actual device cap i wygenerowane pozycje warstw | $\mathrm m$ |
+| $L_e$ | jawna długość prostego doprowadzenia | $\mathrm m$ |
+| $N_e$ | liczba przedziałów ekstrudowania, co najmniej dwa | $1$ |
+| $\mathbf d_e$ | jawny jednostkowy kierunek zewnętrzny | $1$ |
+| $\lVert\cdot\rVert_2$ | norma euklidesowa | $1$ jako operator |
 | $p,Q_\ell^{\mathrm{lo}},Q_\ell^{\mathrm{hi}}$ | indeks próbki i zbiory reguł low/high globalnego ledgeru | $1$ |
 | $\mathbf w_{\ell p},S_\ell,R_t$ | ważony wkład, suma norm próbek i heurystyczny wskaźnik roundoff | $\mathrm{A\,m^{-1}}$ |
 | $u_{64}$ | binary64 epsilon, dokładnie $2^{-52}$ | $1$ |
@@ -3408,6 +3414,90 @@ Wersjonowany rekord finalizacji wiąże accepted SHA, znormalizowane partycje,
 wszystkie role i obserwacje oraz niezależne pomiary. Limit preimage wynosi
 128 MiB, nie jest deklaracją limitu peak RAM.
 
+(antenna-inspection-display-carrier)=
+#### Nośniki wizualizacji raw V/H oraz zachowanie tożsamości siatki
+
+Kontrakt read-only z 08.10.2026 nie zmienia równań przewodnictwa ani pola.
+Wizualizuje zachowany wynik skończonej domeny opisanej wyżej; nie zamienia
+`inspection_only` w bazę na amper. Niezmienny manifest v1 zachowuje pięć
+dotychczasowych payloadów. Oddzielny zasób `antenna_inspection_display.v1`
+może udostępniać pochodną geometrię **tego samego** zweryfikowanego bundle.
+
+V w jednostkach $\mathrm V$ należy do węzłów device wskazanych przez
+`device_vertex_ids`. Pozycje są wybierane z retained charge record w tej
+samej kolejności. Connectivity Tet4 zawiera tylko elementy w całości należące
+do device, z lokalnymi indeksami tej listy. Element mixed device/lead,
+nieznany ID lub brak pełnej partycji oznacza odmowę. Nie pobieramy w ich miejsce
+aktualnej siatki z workspace i nie kolorujemy autorskiej bryły primitive.
+
+Raw H w jednostkach $\mathrm{A\,m^{-1}}$ należy do retained `targets_m`.
+Punkty i wektory są dopuszczalne bez connectivity. Topology digest nie
+pozwala odtworzyć powierzchni ani legalnie interpolować na dowolnej siatce.
+RT0 moments mają jednostkę $\mathrm A$, nie $\mathrm{A\,m^{-2}}$;
+publikacja J wymaga osobnego próbkowania zaakceptowanego evaluatora RT0,
+według kontraktu `antenna-rt0-stable-shared-reconstruction`.
+Nie wolno dzielić współczynników przez umowny przekrój w frontendzie.
+
+| Parametr/nośnik | Typ i default | SI | Walidacja i znaczenie | Wpływ Python → IR |
+|---|---|---|---|---|
+| `device_positions` | binary float64 little-endian XYZ / wymagany | $\mathrm m$ | trzy wartości na retained device vertex; exact order, finite i hash | pochodna publikacji, nie nowe authoring |
+| `device_topology` | binary uint32 little-endian Tet4 / wymagany | $1$ | cztery indeksy na device cell, poprawny zakres, dokładna retained ownership | pochodna publikacji, bez zmiany MeshIR |
+| `device_potential` | istniejący binary float64 / wymagany | $\mathrm V$ | jedna wartość na device vertex, bez dzielenia przez prąd | existing raw manifest |
+| `sample_positions`, `magnetic_field` | istniejące binary XYZ / wymagane | odpowiednio $\mathrm m$, $\mathrm{A\,m^{-1}}$ | identyczna cardinality i retained sampling; bez domyślnego carrier substitution | existing raw manifest |
+| `content_digest` | string / wymagany | $1$ | dokładny bundle/manifest revision z inspection reference | read-only API query, nie pin wpisywany przez autora solved result |
+| `normalization` | fixed `raw_authored_current` | $1$ | wartości dla faktycznie zadanego prądu; bez implicit 1 A rescale | nie tworzy `SolvedAntennaDrive` |
+| `capabilities` | fixed display; per-A/FFT/LLG/current-density false | $1$ | sam display nie kwalifikuje źródła | bez zmiany planowania solvera |
+| `MeshData.vertex_identity` | optional mapping / `None` | $1$ | schema `mesh_vertex_identity.v1`, issuer `gmsh_node_tags.v1`, dokładnie jeden positive unique uint64 ID na ordered node; brak coercion bool/float/string | metadane meshingu i save/load, **bez nowego pola MeshIR** |
+
+Retencja MeshData zachowuje faktyczne ordered `getNodes` tags, nie indeksy
+`index+1`. Gmsh definiuje te numery jako dodatnie i unikalne w obrębie siatki
+[Gmsh API](https://gmsh.info/doc/texinfo/#index-gmsh_002fmodel_002fmesh_002fgetNodes).
+Nie oznacza to globalnie stabilnego ID pomiędzy remeshami. Przyszły preparation
+owner musi nadal wiązać listę z konkretną geometrią, topology i material pins.
+Save/load, skalowanie i oriented copy zachowują kolejność nodes oraz ich IDs;
+format bez metadanych nie otrzymuje syntetycznego fallbacku. Sama poprawna
+etykieta issuer nie dowodzi autentyczności, aktualności ani acceptance solve.
+
+Interpretowany `scripts/verify_antenna_mesh_vertex_identity.py` wykonano
+08.10.2026 z `--with-gmsh`: **5/5 PASS**, w tym sparse/niesortowane actual
+`getNodes` tags, owned copy, oriented/scaled copy, JSON/NPZ, invalid/missing
+identity oraz rzeczywista siatka Gmsh microstrip. Nie uruchamiał FEM ani LLG;
+nie dowodzi zgodności wygenerowanych leadów lub zbieżności pola.
+
+Python/ProblemIR: ta zmiana nie dodaje publicznego konstruktora doprowadzeń
+ani solved view. Publiczny przykład `fem_antenna_current_source_inspection.py`
+i jego istniejący `ExternalLeadCurrentSource` pozostają kontraktem wejścia.
+Prywatne przygotowanie leadów z terminal caps opisano i sprawdzono niżej;
+nie jest skutkiem samego zachowania node tags ani gotowym przepływem UI.
+UI musi nadal jawnie wybrać runtime stage
+i pokazywać inspection scope; nie może aktywować FFT/LLG dla tego wyniku.
+
+| Realizacja | Stan i granica |
+|---|---|
+| FEM CPU/double | read-only adapter retained bundle implementowany; runtime HTTP/display jeszcze nieodebrane |
+| FEM GPU | brak producenta accepted inspection w tej lane; display nie stanowi GPU qualification |
+| FDM CPU | nie wykonuje tego FEM current solve; brak promocji do FDM drive |
+| FDM GPU | brak domniemanego transferu lub fallbacku; oddzielna kwalifikacja wymagane |
+
+Weryfikacja wymaga zgodnych record/session/run/stage/digest, pełnego decode
+przed odpowiedzią warunkową, exact XYZ/V/Tet4 względem bundle, odmów stale
+scope i foreign ownership, strong ETag/Range oraz widocznego WebGL canvas.
+Wynik naukowy i render fixture pozostają osobnymi bramkami. Ograniczenie
+braku J, powierzchni H, auto-preparation i qualified basis jest jawne;
+zakaz kompilacji unit-test targets nie jest uchylony.
+
+08.10.2026 zarządzany browser receipt `cda2a5f86e754004967d0dff61988693`
+zakończył się PASS przy niezmienionych źródłach. Produkcyjne hooks i renderer
+wyświetliły raw H [A/m] oraz raw V [V] na retained Tet4 kontrolowanej fixture,
+z aktywnymi wspólnymi Display/Surface/Wireframe/Points, widocznym canvas,
+nieutraconym WebGL i niezerowym drawing buffer. Trzynaście grup kontroli
+obejmuje brak pracy idle, owner switch oraz odmowy błędnych layoutów,
+rozmiarów, SHA, ETag, non-finite i topologii. Zrzuty H/V obejrzano.
+To dowód UI przy kontrolowanym transporcie, nie runtime HTTP ani FEM solve.
+ESLint receipt `1379a488f5ea4a93aecad631da174c50` i API hygiene
+`07047a00c08f497ba934e63a17f255d1` również PASS. Szczegóły i granice dowodów:
+`docs/superpowers/plans/2026-10-08-antenna-end-to-end-gap-closure.md`.
+
 (antenna-duffy-singular-transformation)=
 ### Całka w źródle: transformacja Duffy i znak pola
 
@@ -4721,6 +4811,124 @@ jeszcze podłączone. Wykonane Python checks to **76 passed i 91 subtests
 passed**; źródłowe regresje Rust nie były kompilowane ani wykonywane.
 Te dowody dotyczą authoringu i odmowy nieobsługiwanej ścieżki, nie pola H.
 
+(antenna-straight-lead-preparation)=
+#### Jawne przygotowanie prostych doprowadzeń po materializacji siatki
+
+To prywatny, ograniczony owner przygotowania wejścia, nie nowy publiczny
+solver i nie model zamkniętego obwodu. Zachowuje powyższy
+`ExternalLeadCurrentSource`: żądane prądy zewnętrznych elektrod autor określa
+jawnie przez `CurrentSourceDrive`, niezależnie od wag portu. Przygotowanie
+nie modyfikuje sceny, transportu, gauge ani legacy boundaries.
+
+Każda specyfikacja `TerminalLeadExtension` wskazuje rzeczywiste boundary
+markers urządzenia, kierunek zewnętrzny i długość prostej ekstrudowanej
+objętości. Markery wybierają kontakt; geometria jedynie waliduje ten wybór.
+Nie szukamy kontaktów przez nazwę, odległość ani nearest-neighbour weld.
+Prywatna funkcja `prepare_antenna_external_lead_source` przyjmuje `MeshData`
+z rzeczywistymi ordered `gmsh_node_tags.v1`, jawne extensions, drives i
+revision; zwraca immutable source, siatkę doprowadzeń oraz receipt przygotowania.
+
+```{math}
+:label: antenna-straight-lead-layer-map
+\mathbf x_{a,k}=\mathbf x_a+\frac{kL_e}{N_e}\mathbf d_e,
+\qquad k=0,\ldots,N_e,\qquad \lVert\mathbf d_e\rVert_2=1.
+```
+
+| Symbol | Znaczenie | SI |
+|---|---|---|
+| $e,a,k$ | indeks doprowadzenia, wierzchołka wybranego kontaktu i warstwy | $1$ |
+| $\mathbf x_a,\mathbf x_{a,k}$ | rzeczywista pozycja kontaktu i wygenerowanego wierzchołka warstwy | $\mathrm m$ |
+| $L_e$ | jawna długość doprowadzenia | $\mathrm m$ |
+| $N_e$ | liczba przedziałów ekstrudowania, co najmniej dwa | $1$ |
+| $\mathbf d_e$ | jawny jednostkowy kierunek zewnętrzny | $1$ |
+| $\lVert\cdot\rVert_2$ | norma euklidesowa | $1$ jako operator |
+
+Layer 0 kopiuje XYZ dokładnie, lecz otrzymuje nowe, rozłączne ID. Jawna
+lineage tworzy bijekcje interface vertices i faces. Porządek stable IDs
+trójkąta wyznacza spójny staircase split każdego prism na trzy Tet4;
+pozytywna orientacja, nieosobliwość i pełna zgodność wspólnych ścian są
+sprawdzane. Layer $N_e$ stanowi outer electrode, a pozostałe ściany
+zewnętrzne są izolujące. Minimum dwóch przedziałów oddziela DOF elektrod
+od interface trace; nie oznacza zbieżności siatki.
+
+| Prywatny parametr / wynik | Typ / default | SI | Walidacja i znaczenie | Mapowanie do istniejącego ProblemIR |
+|---|---|---|---|---|
+| `device_mesh` | `MeshData`, required | XYZ $\mathrm m$ | wyłącznie Tet4/Tri3, actual positive unique u64 identity, finite XYZ, bez periodic; nie ordinal fallback | device mesh pozostaje niezmieniona; `device_stable_vertex_ids` zachowuje jej porządek |
+| `extensions` | `Sequence[TerminalLeadExtension]`, required | $1$ | 2–128, unikalne ID, rozłączne cap/reaction DOF; co najmniej dwie elektrody każdego komponentu, łącznie najwyżej 64 niezależne terminal controls | generuje `interface_pairs`, `outer_terminals`, `terminal_observations` |
+| `TerminalLeadExtension.id` | `str`, required | $1$ | unique ID zewnętrznej elektrody, nie nazwa obiektu | `outer_terminals[].id` i exact drive keys |
+| `TerminalLeadExtension.observation_id` | `str`, required | $1$ | unique jawne ID pasywnej obserwacji device endpointu | `terminal_observations[].id` |
+| `TerminalLeadExtension.object_id` | `str`, required | $1$ | immutable właściciel; planner nadal sprawdza rzeczywisty object segment | `terminal_observations[].object_id` |
+| `TerminalLeadExtension.boundary_markers` | `tuple[int,...]`, required | $1$ | dodatnie, unikalne i istniejące; wszystkie wybrane faces są actual exterior; żadnego fallbacku | wyłącznie rozwiązanie actual cap faces do stable-ID triples |
+| `TerminalLeadExtension.length_m` | `float`, required | $\mathrm m$ | finite positive; rozszerzenie objętości, nie deklaracja błędu truncacji | rzeczywiste `lead_mesh.nodes` |
+| `TerminalLeadExtension.outward_direction_xyz` | `tuple[float,float,float]`, required | $1$ | finite unit, zgodny z outward normals; bez cichej normalizacji | rzeczywiste `lead_mesh.nodes`, kierunek zachowany w receipt |
+| `TerminalLeadExtension.conductivity_spm` | `float`, required | $\mathrm{S\,m^{-1}}$ | finite positive, jawna stała danego leadu; bez `inherit` | `lead_conductivity_spm_per_element` w rzeczywistym cell order |
+| `TerminalLeadExtension.layers` | `int`, 2 | $1$ | exact int bez bool, 2–1048576; aggregate counts bounded przed alokacją | określa actual Tet4, nie nową politykę solvera |
+| `drives` | `Sequence[CurrentSourceDrive]`, required | signed currents $\mathrm A$ | exact terminal coverage każdego mode, finite signed/zero; bilans osobno na actual trace-connected komponencie | `drives[]` bez zmiany wartości ani wyprowadzania z wag |
+| `revision` | `str`, required | $1$ | autorska niepusta rewizja, nie SHA przyszłego wyniku | `conservative_current_source.revision` |
+| `PreparedAntennaExternalLeadSource.source` | `ExternalLeadCurrentSource`, wynik | jak powyżej | przechodzi istniejący input validator; nadal nie accepted source | istniejący `conservative_current_source.v1`, bez nowego IR kind |
+| `PreparedAntennaExternalLeadSource.lead_mesh` | `MeshData`, wynik | XYZ $\mathrm m$ | `vertex_identity=None`: wygenerowane ID nie udają tagów Gmsh; właścicielem ID jest source | istniejący `lead_mesh` |
+| `PreparedAntennaExternalLeadSource.receipt` | immutable mapping, wynik | $1$ | policy `isolated_branch_straight_stubs.v1`, issuer `antenna_straight_stub_ids.v1`, input mesh/IDs/parametry/drives; bez solved SHA | receipt przygotowania, nie pole SolutionManifest |
+
+Nowe lead IDs powstają w porządku extension ID, layer i device stable ID,
+z zakresu zaczynającego się za największym rzeczywistym device ID. Sprawdzamy
+overflow u64 przed alokacją. To przydział ID nowo utworzonych wierzchołków,
+nie zastąpienie brakującej tożsamości istniejącej siatki przez `index+1`.
+
+Pierwszy wariant wymaga połączonego, płaskiego, wypukłego manifold disk
+kontaktu, complete cap triangulation i outward separating plane względem
+**wszystkich** device vertices. Dzięki temu stub nie wnika w urządzenie.
+Między stubami wymagany jest dowód strict AABB separation w co najmniej
+jednej osi. Nakładające się AABB oznaczają **brak obsługiwanej certyfikacji**,
+nie dowód kolizji i nie przyzwolenie na kontynuację. Rotated lub złożone
+układy bez takiego dowodu są jawnie unsupported; nie dopisujemy heurystyki.
+Vertex/edge-only shorting, niepełne caps, mixed cells, niezgodne normals,
+brak identity lub niezbilansowane currents powodują odmowę przed solverem.
+
+Prywatna polityka admission nie zmienia tolerancji native solvera. Wymaga
+dodatniej orientacji wejściowych Tet4; tylko nowe lead cells mogą zostać
+przeorientowane. Wyznacznik liczony po skalowaniu lokalnych krawędzi jest
+odrzucany, gdy jego moduł nie przekracza `64 * binary64 epsilon`.
+To konserwatywna bramka numeryczna przygotowania, nie definicja fizycznie
+zerowej objętości ani polityka exact rational determinant native ownera.
+Planarity/separating-plane używa `512 * binary64 epsilon * device extent`,
+a unit direction wymaga błędu normy najwyżej `1e-12` bez normalizacji.
+Bilans każdego komponentu zachowuje gate planera:
+`abs(sum signed currents) <= 1e-18 A + 1e-10 * sum abs(currents)`;
+sumy są kompensowane, finite i nie korzystają ze skali innej gałęzi.
+Budżety wejścia/generacji to najwyżej 1048576 cells i 4194304 items;
+ich sprawdzenie poprzedza alokację lead nodes/cells.
+Preparacja nie certyfikuje braku wszystkich geometrycznych self-intersections
+całego device: sprawdza actual face incidence, strony wspólnych faces oraz
+bijekcję volume/P1 connectivity. Nie należy przedstawiać tych kontroli jako
+general-purpose repair lub certyfikacji dowolnej importowanej geometrii.
+
+FEM CPU/double: przygotowanie wejścia i osobna kwalifikacja runtime;
+FEM GPU oraz source solve FDM CPU/GPU: unsupported, bez fallbacku.
+Wariant taperowany zachowuje pełną rzeczywistą siatkę 3D device; żaden
+przekrój 2.5D nie zastępuje zmiany szerokości wzdłuż przepływu.
+Przygotowane straight stubs pozostają `external_electrode_truncation`.
+Nie wolno nadać im capability basis/FFT/LLG ani certyfikatu pominiętego obwodu.
+
+Odbiór obejmuje interpretowane geometrical/identity/round-trip regresje,
+rzeczywistą siatkę Gmsh microstrip/taper, odmowy unsafe topology/actuation
+oraz osobno wykonanie native V/RT0/H i niezależną zbieżność. Samo przygotowanie
+source ani receipt nie dowodzi wyniku pola. Helper zaimplementowano w
+`_antenna_external_lead_preparation.py::prepare_antenna_external_lead_source`.
+Zwraca full `MeshData` osobno od strict sześciopolowego source MeshIR,
+zbudowanego jawnie z tych samych wygenerowanych arrays; validator źródła
+pozostaje niezmieniony. Interpretowany
+`scripts/verify_antenna_external_lead_preparation.py::LeadPreparationChecks`
+wykonano 08.10.2026 z `--with-gmsh`: **11/11 PASS**. Obejmuje rzeczywisty
+Gmsh microstrip prosty/taperowany, sparse IDs, permutacje vertices/cells/facets,
+exact lineage i volume, reversal/scaling/zero current, per-component balance,
+JSON/NPZ/source round-trip oraz odmowy niepełnych caps, winding-two star,
+brakujących IDs, złego kierunku, overflow i niecertyfikowanej separacji.
+SHA-256 helpera `26970db59898c1a92ef9f5a4054d18636ccd663882efda1b8345a02dcfd632e0`,
+regresji `e2d7a4e68320f8cb79e14dbfee6324d160ef72f5895feff5749f6c4adb9f6c8c`.
+Nie jest to publikacja publicznego konstruktora, podłączenie wszystkich węzłów
+UI ani wykonanie native. Native V/RT0/H przygotowanego modelu, zbieżność i
+qualification pozostają `NOT VERIFIED`.
+
 (antenna-current-source-materialization)=
 #### Materializacja wejścia nie dopuszcza publicznego wykonania
 
@@ -5533,6 +5741,18 @@ evidence and cannot promote a capability lane.
 | `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `AntennaExternalLeadSolutionManifest` | thin raw V/RT0/H inspection schema, requested/resolved execution i pięć binary refs; source-only |
 | `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `build_antenna_external_lead_solution` | alternatywna ścieżka retained bytes: actual input, exact decode i request binding, bez dodatkowego solve |
 | `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `load_antenna_external_lead_solution` | solver-free bounded decode, bitowe H/xyz/device V checks; nie freshness lub authentication |
+| `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `LoadedAntennaExternalLeadSolution::device_display` | retained device XYZ/Tet4 projection, exact ownership; runtime niewykonany |
+| `crates/fullmag-api/src/router_v2/handlers/data/antenna_inspection.rs` | `get_antenna_external_lead_inspection_display` | oddzielny thin display resource po full integrity; bez basis/FFT/LLG promotion |
+| `scripts/smoke_antenna_inspection_display.py` | `verify` | rzeczywisty HTTP i niezależne porównanie pochodnych z bundle; przed buildem niewykonany |
+| `apps/control-room/src/kernel/resources/antennaResources.ts` | `antennaInspectionPayloadEtag` | expected binary ETag z dokładnego ordered owner tuple; runtime/browser niewykonane dla nowej kontroli |
+| `docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md` | `DOC-ANCHOR:antenna-inspection-display-carrier` | kontrakt SI, ownership, display i opcjonalnej retencji ordered node tags |
+| `docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md` | `DOC-ANCHOR:antenna-straight-lead-preparation` | planned private straight-stub input, explicit currents i conservative refusal; nie closed circuit |
+| `packages/fullmag-py/src/fullmag/meshing/_antenna_external_lead_preparation.py` | `TerminalLeadExtension`, `prepare_antenna_external_lead_source` | prywatna jawna preparacja actual cap → Tet4 leads i strict source MeshIR; bez solve |
+| `scripts/verify_antenna_external_lead_preparation.py` | `LeadPreparationChecks` | 11/11 interpretowanych PASS, actual Gmsh microstrip/taper, lineage, prądy i odmowy; nie kwalifikacja pola |
+| `packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py` | `_owned_vertex_identity` | walidacja i immutable copy actual ordered positive unique u64 IDs; bez zmiany MeshIR |
+| `packages/fullmag-py/src/fullmag/meshing/_gmsh_extraction.py` | `_extract_mesh_data` | zachowanie rzeczywistych ordered Gmsh tags, nie ordinal fallback |
+| `packages/fullmag-py/src/fullmag/meshing/_gmsh_infra.py` | `_scale_mesh_nodes` | geometry-only scale bez utraty vertex identity |
+| `scripts/verify_antenna_mesh_vertex_identity.py` | `VertexIdentityChecks` | 5 interpretowanych checks PASS z rzeczywistym Gmsh, bez native solvera |
 | `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `reject_unqualified_external_lead_source` | jawny source_not_qualified w legacy LLG/spectrum boundaries przed projekcją |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/input.rs` | `with_materialized_external_lead_request` | existing CPU-double ABI request z actual input i jawnie pinned native-v1 jump defaults |
 | `crates/fullmag-runner/src/antenna_external_lead_solution/publication.rs` | `publish_antenna_external_lead_solution_atomically` | fixed-name immutable revision, verify przed rename, cancel i exact reuse; source-only |
