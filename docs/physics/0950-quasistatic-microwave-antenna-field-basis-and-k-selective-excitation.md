@@ -2700,6 +2700,66 @@ nie zmieniono ID/nazwy jako obejścia. Round-trip wszystkich portów,
 transportu, projekcji i etapów tej sceny pozostaje **NOT VERIFIED**;
 zmiana źródeł Python nie jest dowodem wdrożenia do działającego pakietu.
 
+(antenna-v03-explicit-object-binding)=
+### Jawne powiązanie obiektów pomocniczych w Rust IR 0.3
+
+**Zaimplementowana walidacja IR i wspólny resolver; nie dowód wykonania solvera.** Istniejące
+`physics_graph.objects` jest nośnikiem zapisanych przez Python obiektów
+pomocniczych. Root `physics_objects` nie jest deklarowane w typed Rust 0.3;
+nie dodajemy równoległego registry ani nie przełączamy wersji na 0.4.
+Wspólny resolver IR odczytuje graph records przez istniejący
+`PhysicsObjectIR` i odrzuca błędny schema/type, puste lub powtórzone ID,
+nieistniejącą lub niejednoznaczną geometrię, wielu właścicieli jednej geometrii
+oraz kolizję z jawnym ID/nazwą lub geometrią magnetyka. Nie wybiera pierwszego
+pasującego wpisu. Walidacja działa również bez etapu antenowego.
+
+| Pole kontraktu | Typ / default | SI | Znaczenie i odmowa |
+|---|---|---|---|
+| `physics_graph.objects` | optional array / absent | $1$ | absent zachowuje legacy auxiliary name adapter; obecna tablica, także pusta, ustanawia jawny auxiliary owner contract bez fallbacku nazw |
+| `objects[].schema_version` | string / required | $1$ | dokładnie `physics_object.v1` |
+| `objects[].object_id` | string / required | $1$ | niepuste immutable ID, unikalne również względem magnetów |
+| `objects[].name` | string / required | $1$ | niepusta etykieta, nie klucz solvera |
+| `objects[].geometry_id` | string / required | $1$ | dokładnie jeden istniejący `geometry.entries[].name`; geometry namespace nie zmienia się przy rozwiązywaniu ownera |
+| `objects[].type` | presentation enum / required | $1$ | vocabulary istniejącego Python obejmuje także `electrode`; jawne rozszerzenie enumu Rust zachowuje tę etykietę bez nadania nowego solver capability |
+
+Tablica obejmuje obiekty pomocnicze, **nie** cały inventory magnetyków.
+Magnet zachowuje oddzielne jawne powiązanie `object_id → region → geometry`
+i opisany legacy alias `magnet.name`. Jeżeli magnetyczne referencje są
+niejednoznaczne, resolver odmawia. Antena z ID różnym od nazwy korzysta
+wyłącznie z bindingu, również po rename; błędny binding nie uruchamia adaptera
+legacy. Typ obiektu nie aktywuje transportu, pola ani LLG. Dekoder prezentacji
+`electrode` nie rozszerza filtra źródeł anten V04 (`Antenna | Conductor`).
+
+Ta walidacja/lookup jest backend-neutral dla czterech realizacji; nie dodaje
+FEM/FDM operatora, mesh assetu, prepared source, projekcji ani solved result.
+Istniejący read-model `/model/physics-graph` pozostaje projekcją modułów;
+nie uznajemy go za dowód publikacji nowej typed tabeli ownerów. Rustowy
+normalizer inventory i wykonawczy krok meshowania wymagają osobnych przyrostów.
+Odbiór tego przyrostu wymaga realnego `Problem.to_ir` i produkcyjnego
+`validate-json` dla dwóch anten z ID różnymi od nazw, magnetyka, elektrody,
+rename i wszystkich odmów. Ogólny `plan-json` nie dowodzi dedykowanego
+`geometry_name_for_object` ani solve anteny; te bramki pozostają oddzielne.
+
+Wykonany odbiór 09.10.2026: `scripts/verify_antenna_object_binding.py::verify`
+przeszedł **24/24** przypadki rzeczywistego publicznego Python → produkcyjne
+CLI `validate-json`. Sprawdzono także deklaracje port/solve z niezmiennym ID,
+rename oraz odmowę użycia etykiety zamiast ID. Wcześniejszy pakiet nie spełniał
+18 oczekiwań tego zestawu; odmowę duplikatu geometrii zapewniał już istniejący
+dekoder, więc nie przypisujemy jej nowemu resolverowi. Przy braku tabeli
+zachowano dawną kolejność: jawne ID magnetyka, dokładna nazwa geometrii,
+następnie alias nazwy magnetyka. Wykonanie tej kolejności w dedykowanym
+planerze nadal wymaga osobnej regresji runtime.
+
+Finalny zarządzany build natywnego workspace Windows zakończył się
+`completed`, exit 0, 08.10.2026 o 22:31:04 UTC (09.10 lokalnie).
+Snapshot źródeł `666da4e1d6a58635da8254c062d6edb34fc2d8bdaf9fba209bc854dc1108968d`;
+CLI SHA-256 `9cf578bbe450675914c231ab5cc4f986776315479bfa1513349be84c17d02071`.
+Zapis pełnego wyniku na tym hoście:
+`D:/git/fullmag/storage/runs/antenna-frontend/2026-10-09-object-binding-final.json`.
+Nie kompilowano testów jednostkowych, nie wykonywano FEM, FFT ani LLG.
+To nie kwalifikacja żadnej z czterech realizacji ani publikacji tabeli ownerów
+w API. Nie zmieniono równań, jednostek ani aktywacji fizyki.
+
 (antenna-authoring-inventory-execution-separation)=
 ### Obowiązkowe rozdzielenie deklaracji od aktywacji — kontrakt wdrożenia
 
@@ -5758,6 +5818,9 @@ evidence and cannot promote a capability lane.
 | `packages/fullmag-py/src/fullmag/meshing/_gmsh_extraction.py` | `_extract_mesh_data` | zachowanie rzeczywistych ordered Gmsh tags, nie ordinal fallback |
 | `packages/fullmag-py/src/fullmag/meshing/_gmsh_infra.py` | `_scale_mesh_nodes` | geometry-only scale bez utraty vertex identity |
 | `packages/fullmag-py/src/fullmag/meshing/asset_pipeline.py` | `_drop_degenerate_tetrahedra` | zachowanie ordered IDs przy unchanged nodes i filtrowaniu cells; bez zmiany tolerancji lub quality policy |
+| `crates/fullmag-ir/src/object_binding.rs` | `physics_object_geometry_bindings_v03`, `geometry_name_for_physics_object_v03` | typed auxiliary bindings, global ownership validation i exact resolver; brak nowego solvera |
+| `crates/fullmag-plan/src/antenna_field_solve.rs` | `geometry_name_for_object` | dedykowany planner korzysta ze wspólnego resolvera; wykonanie planu wymaga osobnego dowodu |
+| `scripts/verify_antenna_object_binding.py` | `verify` | public Python→production CLI, positive/negative ownership; bez solvera lub live API resource |
 | `scripts/verify_antenna_mesh_vertex_identity.py` | `VertexIdentityChecks` | 6 interpretowanych checks PASS z rzeczywistym Gmsh, cleanup RED→GREEN, bez native solvera |
 | `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `reject_unqualified_external_lead_source` | jawny source_not_qualified w legacy LLG/spectrum boundaries przed projekcją |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/input.rs` | `with_materialized_external_lead_request` | existing CPU-double ABI request z actual input i jawnie pinned native-v1 jump defaults |

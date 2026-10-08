@@ -25,6 +25,7 @@ pub enum PhysicsObjectTypeIR {
     Geometry,
     Ferromagnet,
     Conductor,
+    Electrode,
     Antenna,
 }
 

@@ -1329,6 +1329,14 @@ pub(crate) fn validate_antenna_composition(problem: &ProblemIRV04, errors: &mut 
 /// validator here makes the additive 0.3 fields executable without silently
 /// accepting an unbound port or converting it to a prescribed field drive.
 pub(crate) fn validate_antenna_composition_v03(problem: &ProblemIR, errors: &mut Vec<String>) {
+    // Ownership is a global authoring invariant, even without an antenna stage.
+    let bindings = match crate::physics_object_geometry_bindings_v03(problem) {
+        Ok(bindings) => bindings,
+        Err(binding_errors) => {
+            errors.extend(binding_errors);
+            return;
+        }
+    };
     if problem.antenna_port_modes.is_empty()
         && problem.antenna_field_solve_stages.is_empty()
         && problem.antenna_target_projections.is_empty()
@@ -1340,7 +1348,7 @@ pub(crate) fn validate_antenna_composition_v03(problem: &ProblemIR, errors: &mut
         return;
     }
 
-    let object_ids = problem
+    let mut object_ids = problem
         .magnets
         .iter()
         .flat_map(|magnet| {
@@ -1350,8 +1358,12 @@ pub(crate) fn validate_antenna_composition_v03(problem: &ProblemIR, errors: &mut
                 .into_iter()
                 .chain(std::iter::once(magnet.name.as_str()))
         })
-        .chain(problem.geometry.entries.iter().map(|entry| entry.name()))
         .collect::<BTreeSet<_>>();
+    if let Some(bindings) = &bindings {
+        object_ids.extend(bindings.keys().map(String::as_str));
+    } else {
+        object_ids.extend(problem.geometry.entries.iter().map(|entry| entry.name()));
+    }
     validate_current_source_references(
         &problem.current_modules,
         &problem.antenna_port_modes,

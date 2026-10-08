@@ -255,7 +255,7 @@ i zarejestrowanego bundle; nie podstawiamy historycznego fixture.
 
 ### Potwierdzone granice następnego przyrostu authoring-to-solve
 
-Odczyt bieżących źródeł ujawnił dwie luki, których nie naprawia samo wywołanie
+Odczyt przed przyrostem z 09.10 ujawnił dwie luki, których nie naprawia samo wywołanie
 prywatnego preparera:
 
 1. `model/problem.py::Problem.to_ir` emituje root `physics_objects`, lecz
@@ -264,8 +264,8 @@ prywatnego preparera:
    nośnik tożsamości to istniejące `physics_graph.objects` emitowane przez
    `model/physics_scope.py::build_physics_graph`. Zarówno
    `fullmag-ir/src/antenna.rs::validate_antenna_composition_v03`, jak i
-   `fullmag-plan/src/antenna_field_solve.rs::geometry_name_for_object` nadal
-   opierają się na magnetach/nazwach zamiast tej mapie. Naprawa musi objąć
+   `fullmag-plan/src/antenna_field_solve.rs::geometry_name_for_object` wówczas
+   opierały się na magnetach/nazwach zamiast tej mapie. Naprawa musi objąć
    wspólną walidację i resolver immutable `object_id → geometry_id`, zgodny
    z Rust authoring normalizerem; nie tylko lookup ani nowy równoległy registry.
    Jawnie błędny binding nie może uruchomić name fallback. V04 ma osobne
@@ -289,3 +289,53 @@ Cały moduł i T00–T18 pozostają **nieukończone**. Źródła B/C przeszły p
 bramki; live HTTP route guards przeszły, lecz pozytywny transport rzeczywistego
 wyniku, authoring-to-solve i kwalifikacja pozostają otwarte.
 D nie wolno oznaczyć jako gotowe na podstawie danych inspekcyjnych.
+
+### Przyrost 09.10 — immutable owner w Rust 0.3 i przebudowany workspace
+
+Zaimplementowano wspólny walidator i resolver
+`fullmag-ir/src/object_binding.rs::physics_object_geometry_bindings_v03`
+oraz `geometry_name_for_physics_object_v03`. Walidator kompozycji i dedykowany
+planner anteny korzystają teraz z istniejącego `physics_graph.objects`;
+etykieta anteny nie zastępuje jej ID. Błędna lub jawnie pusta tabela nie
+uruchamia fallbacku nazw. Nie dodano drugiego registry ani cichej migracji IR.
+Rozszerzenie enumu prezentacji o `Electrode` zachowuje istniejący Python
+vocabulary, nie aktywuje solvera. Legacy kolejność rozwiązywania geometrii
+została zachowana po uwadze review; jej runtime w dedykowanym plannerze
+pozostaje osobną niewykonaną bramką.
+
+Interpretowany driver `verify_antenna_object_binding.py` wykonał prawdziwe
+`Problem.to_ir` i produkcyjne `validate-json`: **24/24 PASS**, exit 0.
+Obejmuje dwie anteny o ID innych niż nazwy, magnetyk, elektrodę, rename,
+deklaracje port/solve oraz odmowy konfliktów i wadliwych danych. Wcześniejszy
+pakiet: 18 niespełnionych oczekiwań / 24; duplikat wpisu geometrii odrzucał
+już istniejący decoder. Fixture nie wykonuje nierozwiązanej referencji RT0.
+Pełny log JSON:
+`D:/git/fullmag/storage/runs/antenna-frontend/2026-10-09-object-binding-final.json`.
+
+Po jawnej zgodzie użytkownika zamknięto wyłącznie własne okno testowego
+workspace; launcher i watcher zakończyły się kontrolowanie z exit 0.
+Nie kasowano cache, wyników ani worktree. Finalny
+`just windows-backend-dev 3197`: `completed`, exit 0, 22:31:04 UTC 08.10
+(09.10 lokalnie), log `native-build-aa8faf53bbc3486988401b8f20d35e93.log`.
+Snapshot `666da4e1d6a58635da8254c062d6edb34fc2d8bdaf9fba209bc854dc1108968d`,
+manifest SHA-256 `601d67a0885a1fe7ad076bbfc7dd5f21322f45efd370b43307fec1927df6a664`,
+CLI SHA-256 `9cf578bbe450675914c231ab5cc4f986776315479bfa1513349be84c17d02071`.
+Produkcyjny CLI/API/desktop zbudowano bez kompilowania unit tests.
+Pośredni build `91a62d67facc45d4b23eb1745a65b3fd` był sprzed poprawki
+legacy priorytetu — nie jest finalnym dowodem tego przyrostu.
+
+`just windows-ui dev 3197 false dev` uruchomił finalny zgodny pakiet;
+sealed runtime copy ma powyższy digest CLI. `GET /workspace` na 3197 zwraca
+200, a read-only `--route-only` przeszło na API 8081 z tym snapshotem.
+Nie odtworzono automatycznie zapisanej sceny ani historii Undo. Próba
+wizualnej kontroli karty nie wykonała się: narzędzie przeglądarki zgłosiło
+`windows sandbox failed: helper_unknown_error: setup refresh had errors`.
+HTTP 200 nie jest nowym dowodem WebGL; wcześniejszy fixture UI pozostaje
+ważny tylko dla niezmienionych źródeł renderera.
+
+Otwarte po tym przyroście: Rust authoring normalizer oraz publikacja owner
+inventory przez API, execution-only materializacja siatki i typed lead intent,
+publiczny/scene/script round-trip przygotowania, scheduled standalone solve,
+pozytywne endpointy prawdziwego V/RT0/H i próbkowanego J, qualified basis,
+FFT/LLG i T00–T18. Punkt 1 powyżej jest naprawiony w warstwie walidacji/lookup,
+nie w całym authoring-to-run przepływie; punkt 2 pozostaje otwarty.

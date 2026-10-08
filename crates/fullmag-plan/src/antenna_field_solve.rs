@@ -68,43 +68,8 @@ pub(crate) fn geometry_name_for_object<'a>(
     problem: &'a ProblemIR,
     object_id: &str,
 ) -> Result<&'a str, PlanError> {
-    let explicit_object = problem
-        .magnets
-        .iter()
-        .find(|magnet| magnet.object_id.as_deref() == Some(object_id));
-    if explicit_object.is_none() {
-        if let Some(entry) = problem
-            .geometry
-            .entries
-            .iter()
-            .find(|entry| entry.name() == object_id)
-        {
-            return Ok(entry.name());
-        }
-    }
-    let magnet = explicit_object
-        .or_else(|| {
-            problem
-                .magnets
-                .iter()
-                .find(|magnet| magnet.name == object_id)
-        })
-        .ok_or_else(|| {
-            fail(format!(
-                "antenna object '{object_id}' has no geometry binding in ProblemIR 0.3"
-            ))
-        })?;
-    let region = problem
-        .regions
-        .iter()
-        .find(|region| region.name == magnet.region)
-        .ok_or_else(|| {
-            fail(format!(
-                "antenna object '{object_id}' references missing region '{}'",
-                magnet.region
-            ))
-        })?;
-    Ok(region.geometry.as_str())
+    fullmag_ir::geometry_name_for_physics_object_v03(problem, object_id)
+        .map_err(|reasons| PlanError { reasons })
 }
 
 fn load_object_mesh(
