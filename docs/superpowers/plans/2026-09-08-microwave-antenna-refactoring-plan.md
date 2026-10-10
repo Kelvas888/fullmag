@@ -1,5 +1,28 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Aktualny punkt wznowienia — 2026-10-10 (jawna deklaracja doprowadzeń):**
+Publiczne `ExternalLeadPreparation` i `TerminalLeadExtension` zachowują intencję
+przed siatką w Python → scena → eksport Python → `ProblemIR`. Deklaracja nie
+zawiera ciężkich danych, rozwiązanej bazy ani certyfikatu zamknięcia obwodu.
+Jawne `.prepare(device_mesh=...)` korzysta z dotychczasowego przygotowania
+na rzeczywistej niezależnej siatce przewodnika. Bez przygotowania planner
+odmawia wykonania; nie wraca do dawnych warunków brzegowych.
+Interpretowany authoring: **9/9 PASS**; helper z rzeczywistym Gmsh, microstrip
+i taper: **11/11 PASS**. `just check-cli-source`: passed/0, receipt
+`f722599ff0d445a7b36fab6b98860ab1`, digest przed/po
+`010e6220bf6e62f529e87aebb625ecd5bc05859437805bc305f6fe371cd5266f`.
+Produkcja OpenAPI: passed/0 (`e9610c2ff6d745f5b1fdac13295a86a7`),
+generacja klienta: passed/0 (`b43e6be6449f488fbdd029f872fa7cd3`),
+kontrola źródeł frontendu: passed/0 (`89584c16fa654697a83491d127df800a`).
+Walidacja noty 0950 i mapy źródeł: exit 0. Testy Rust zapisane,
+ale niewykonane i niekompilowane zgodnie z ograniczeniem projektu.
+Te kontrole nie dowodzą wykonania nowego pola przez HTTP ani solvera.
+Dokładny kontrakt i ograniczenia: nota 0950,
+`DOC-ANCHOR:antenna-authored-lead-preparation`.
+Następny krok: wykonawcza materializacja niezależnej siatki z zachowaniem
+tożsamości Gmsh i intencji, jeden wynik V/RT0/H, publikacja i wyświetlenie
+V/J/H. Zamknięcie obwodu, baza na amper, FFT i LLG pozostają otwarte.
+
 **Aktualny punkt wznowienia — 2026-10-10 (inventory anten w rzeczywistym API):**
 Rustowy graf sceny publikuje auxiliary-only `PhysicsObjectIR` w istniejącym
 GET `model/physics-graph`. ID pozostają niezmienne; nazwy mają wspólny
@@ -3340,7 +3363,7 @@ zakończone exit 13, bez OOM, przed natywnym solve V/RT0/H:
   Nie był to błąd solvera prądowego ani wyniku pola.
 
 Poprawiono właściciela granicy
-`packages/fullmag-py/src/fullmag/runtime/helper.py::_runtime_stage_action`:
+`packages/fullmag-py/src/fullmag/runtime/run_config_export.py::_runtime_stage_action`:
 pełna definicja bieżącego solve trafia do jego `ProblemIR`, zaś akcja
 przekazuje wyłącznie `kind`, `stage_id`, `port_mode_ids`, zgodnie z
 `crates/fullmag-cli/src/types.rs::ScriptExecutionStageAction` i
@@ -7203,7 +7226,7 @@ Wykonanie T00–T18 może wymagać kilku przeglądanych zmian, a nie jednego ogr
 | `scripts/antenna_inspection_export.py` | `read_inspection`, `manifest_digest` | T06/T12: bounded integralność exact exportu; nie authoritative native decoder ani kwalifikacja |
 | `scripts/compare_managed_antenna_ram.py` | `compare`, `reconstruct_inputs` | T05/T06/T12: binding konkretnego runu, kapsuły, staged input i V/H; native porównanie NOT VERIFIED |
 | `scripts/test_compare_managed_antenna_ram.py` | `test_uses_exact_run_values_and_never_promotes_scope` | T12: interpretowana orkiestracja i brak promocji qualification; nie wykonanie solvera |
-| `packages/fullmag-py/src/fullmag/runtime/helper.py` | `_runtime_stage_action` | T03/T12: referencyjna akcja CLI i definicja bieżącego solve w stage IR, bez future leakage |
+| `packages/fullmag-py/src/fullmag/runtime/run_config_export.py` | `_runtime_stage_action` | T03/T12: referencyjna akcja CLI i definicja bieżącego solve w stage IR, bez future leakage |
 | `packages/fullmag-py/tests/test_antenna_current_source_example.py` | `test_multi_stage_run_config_never_imports_future_solve_definitions` | T03/T12: pełny export wcześniejszego Run i dwóch solve; nie wykonanie fizyki |
 | `packages/fullmag-py/tests/test_antenna_run_config_export.py` | `test_runtime_export_materializes_only_the_current_definition` | T03/T12: samodzielna regresja serializacji z izolowanym HEAD RED→GREEN, nie model solvera |
 | `scripts/test_antenna_inspection_export.py` | `test_same_size_payload_mutation_is_rejected` | T06/T12: syntetyczne odmowy mutacji pięciu payloadów; nie native proof |

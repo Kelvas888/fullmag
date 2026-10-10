@@ -1729,6 +1729,32 @@ fn validate_current_transport(
             validate_scene_charge_contract(index, transport, object_ids)?;
         }
     }
+    if let Some(value) = transport.external_lead_preparation.as_ref() {
+        let prefix = format!("current_transports[{index}].external_lead_preparation");
+        if transport.model != CurrentTransportModel::OhmicPoisson
+            || transport.coupling != SceneTransportCoupling::OneWay
+            || transport.conservative_current_source.is_some()
+            || transport.conservative_current_view.is_some()
+            || transport.structured_current_closure.is_some()
+            || transport.time_envelope.is_some()
+        {
+            return Err(SceneDocumentValidationError::new(format!("{prefix} requires static one-way ohmic_poisson and no source/view/closure")));
+        }
+        let preparation: fullmag_ir::ExternalLeadPreparationIR = serde_json::from_value(
+            serde_json::to_value(value).expect("JSON object is serializable"),
+        ).map_err(|error| SceneDocumentValidationError::new(format!("{prefix}: {error}")))?;
+        let errors = preparation.validation_errors(&prefix);
+        if !errors.is_empty() {
+            return Err(SceneDocumentValidationError::new(errors.join("; ")));
+        }
+        for extension in &preparation.extensions {
+            if !object_ids.contains(&extension.object_id)
+                || !transport.domain.iter().any(|region| region.object_id == extension.object_id)
+            {
+                return Err(SceneDocumentValidationError::new(format!("{prefix} observation '{}' must belong to an existing charge-domain object", extension.observation_id)));
+            }
+        }
+    }
     if let Some(value) = transport.conservative_current_source.as_ref() {
         if transport.model != CurrentTransportModel::OhmicPoisson
             || transport.coupling != SceneTransportCoupling::OneWay
@@ -2409,7 +2435,8 @@ fn validate_scene_charge_contract(
     let prefix = format!("current_transports[{index}]");
     if transport.domain.is_empty()
         || transport.materials.is_empty()
-        || (transport.boundaries.is_empty() && transport.conservative_current_source.is_none())
+        || (transport.boundaries.is_empty() && transport.conservative_current_source.is_none()
+            && transport.external_lead_preparation.is_none())
         || transport.gauge.is_none()
         || transport.solver.is_none()
     {
@@ -2422,6 +2449,12 @@ fn validate_scene_charge_contract(
             || transport.gauge != Some(SceneChargePotentialGauge::TerminalReference))
     {
         return Err(SceneDocumentValidationError::new(format!("{prefix}.conservative_current_source requires empty boundaries and gauge=terminal_reference")));
+    }
+    if transport.external_lead_preparation.is_some()
+        && (!transport.boundaries.is_empty()
+            || transport.gauge != Some(SceneChargePotentialGauge::TerminalReference))
+    {
+        return Err(SceneDocumentValidationError::new(format!("{prefix}.external_lead_preparation requires empty boundaries and gauge=terminal_reference")));
     }
     let mut domain = BTreeSet::new();
     for (region_index, region) in transport.domain.iter().enumerate() {
@@ -2571,6 +2604,7 @@ fn validate_scene_charge_contract(
         }
         Some(SceneChargePotentialGauge::TerminalReference)
             if transport.conservative_current_source.is_none()
+                && transport.external_lead_preparation.is_none()
                 && (terminal_count == 0 || voltage_count != 0 || current_density_count != 0) =>
         {
             return Err(SceneDocumentValidationError::new(format!(
@@ -2597,7 +2631,8 @@ fn validate_scene_charge_contract(
     let expected_engine = if reciprocal { "block_gmres" } else { "cg" };
     let expected_operator = if reciprocal {
         "fdm_coupled_charge_spin_fv_block_gmres.v1"
-    } else if terminal_count != 0 || transport.conservative_current_source.is_some() {
+    } else if terminal_count != 0 || transport.conservative_current_source.is_some()
+        || transport.external_lead_preparation.is_some() {
         "fem_charge_conforming_h1_p1.transparent.v1"
     } else if transport.structured_current_closure.is_some() {
         "fv_charge_harmonic_source_cut_v1"
@@ -4163,6 +4198,33 @@ mod tests {
             .unwrap_err()
             .message
             .contains("non-empty"));
+    }
+
+    #[test]
+    fn scene_lead_preparation_is_authored_only_and_strictly_validated() {
+        let intent = serde_json::json!({"schema_version":"antenna_external_lead_preparation.v1", "kind":"isolated_branch_straight_stubs", "revision":"intent-r1",
+            "extensions":[
+                {"id":"minus","observation_id":"observe-minus","object_id":"body","boundary_markers":[11],"length_m":1e-6,"outward_direction_xyz":[-1.,0.,0.],"conductivity_spm":4e7},
+                {"id":"plus","observation_id":"observe-plus","object_id":"body","boundary_markers":[12],"length_m":1e-6,"outward_direction_xyz":[1.,0.,0.],"conductivity_spm":4e7}],
+            "drives":[{"id":"drive","port_mode_ref":"port","outer_terminal_currents_a":{"minus":-0.002,"plus":0.002}}]});
+        let mut transport: KnownSceneCurrentTransport = serde_json::from_value(serde_json::json!({
+            "kind":"current_transport","name":"source","model":"ohmic_poisson","coupling":"one_way",
+            "domain":[{"object_id":"body"}],"materials":[{"region":{"object_id":"body"},"material":{"sigma_Spm":4e7}}],
+            "boundaries":[],"gauge":"terminal_reference","solver":{"engine":"cg","linear":{"relative_tolerance":1e-10,"absolute_tolerance":0.,"max_iterations":100},"operator_version":"fem_charge_conforming_h1_p1.transparent.v1","physical_residual_version":"charge_balance_integrated_l2.v1"},
+            "external_lead_preparation":intent
+        })).unwrap();
+        let objects = BTreeSet::from(["body".to_string()]);
+        validate_current_transport(0, &transport, &objects).unwrap();
+        assert!(transport.conservative_current_source.is_none());
+        assert_eq!(serde_json::to_value(&transport).unwrap()["external_lead_preparation"], intent);
+        transport.external_lead_preparation.as_mut().unwrap().insert("certificate".into(), serde_json::json!("fake"));
+        assert!(validate_current_transport(0, &transport, &objects).unwrap_err().message.contains("external_lead_preparation"));
+        transport.external_lead_preparation = serde_json::from_value(intent.clone()).unwrap();
+        transport.conservative_current_source = Some(BTreeMap::new());
+        assert!(validate_current_transport(0, &transport, &objects).unwrap_err().message.contains("no source/view/closure"));
+        transport.conservative_current_source = None;
+        transport.gauge = Some(SceneChargePotentialGauge::ZeroMean);
+        assert!(validate_current_transport(0, &transport, &objects).unwrap_err().message.contains("terminal_reference"));
     }
 
     #[test]

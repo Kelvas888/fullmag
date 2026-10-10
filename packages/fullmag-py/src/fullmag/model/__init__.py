@@ -30,6 +30,8 @@ from .antenna import (
 )
 from .current_transport import (
     ExternalLeadCurrentSource,
+    ExternalLeadPreparation,
+    TerminalLeadExtension,
     CurrentSourceInterfacePair,
     CurrentSourceOuterTerminal,
     CurrentSourceTerminalObservation,
@@ -258,6 +260,8 @@ __all__ = [
     "ChargeTransportMaterialAssignment",
     "EquipotentialCurrentTerminal",
     "ExternalLeadCurrentSource",
+    "ExternalLeadPreparation",
+    "TerminalLeadExtension",
     "CurrentSourceInterfacePair",
     "CurrentSourceOuterTerminal",
     "CurrentSourceTerminalObservation",

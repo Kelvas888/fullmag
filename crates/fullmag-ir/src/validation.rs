@@ -2276,6 +2276,13 @@ pub(crate) fn validate_current_modules(problem: &ProblemIR, errors: &mut Vec<Str
                 {
                     errors.push(format!("current_modules[{index}].conservative_current_source requires static one-way ohmic_poisson transport"));
                 }
+                if definition.as_ref().is_some_and(|definition| definition.external_lead_preparation.is_some())
+                    && (*model != CurrentTransportModelIR::OhmicPoisson
+                        || *coupling != crate::TransportCouplingIR::OneWay
+                        || time_envelope.is_some())
+                {
+                    errors.push(format!("current_modules[{index}].external_lead_preparation requires static one-way ohmic_poisson transport"));
+                }
                 if let Some(envelope) = time_envelope {
                     validate_time_envelope(
                         format!("current_modules[{index}] current_transport time_envelope")
@@ -2416,6 +2423,31 @@ fn current_source_definition_keeps_source_specific_boundary_and_gauge_contract()
     assert!(errors.iter().any(|error| error.contains("FEM H1")));
 }
 
+#[test]
+fn lead_preparation_definition_retains_authored_intent_without_legacy_boundary_fallback() {
+    let mut definition: crate::ChargeTransportDefinitionIR = serde_json::from_value(serde_json::json!({
+        "domain":[{"object_id":"device"}],"materials":[{"region":{"object_id":"device"},"material":{"sigma_Spm":4e7}}],
+        "boundaries":[],"gauge":"terminal_reference","solver":{"engine":"cg","linear":{"relative_tolerance":1e-10,"absolute_tolerance":0.,"max_iterations":100},"operator_version":"fem_charge_conforming_h1_p1.transparent.v1","physical_residual_version":"charge_balance_integrated_l2.v1"},
+        "external_lead_preparation":crate::antenna_lead_preparation::tests::fixture()
+    })).unwrap();
+    let mut errors = Vec::new();
+    validate_charge_transport_definition(0, &definition, false, crate::BackendTarget::Fem, &mut errors);
+    assert!(errors.is_empty(), "{errors:?}");
+    assert!(definition.conservative_current_source.is_none());
+    definition.external_lead_preparation.as_mut().unwrap().extensions[0].object_id = "unknown".into();
+    validate_charge_transport_definition(0, &definition, false, crate::BackendTarget::Fem, &mut errors);
+    assert!(errors.iter().any(|error| error.contains("charge domain")));
+    definition.external_lead_preparation.as_mut().unwrap().extensions[0].object_id = "device".into();
+    errors.clear();
+    definition.conservative_current_source = Some(crate::spin_transport::current_source_tests::fixture());
+    validate_charge_transport_definition(0, &definition, false, crate::BackendTarget::Fem, &mut errors);
+    assert!(errors.iter().any(|error| error.contains("no source/view/closure")));
+    definition.conservative_current_source = None;
+    errors.clear();
+    validate_charge_transport_definition(0, &definition, false, crate::BackendTarget::Fdm, &mut errors);
+    assert!(errors.iter().any(|error| error.contains("external_lead_preparation requires the FEM H1")));
+}
+
 fn validate_charge_transport_definition(
     index: usize,
     definition: &crate::ChargeTransportDefinitionIR,
@@ -2424,6 +2456,28 @@ fn validate_charge_transport_definition(
     errors: &mut Vec<String>,
 ) {
     let prefix = format!("current_modules[{index}] current_transport");
+    if let Some(preparation) = &definition.external_lead_preparation {
+        errors.extend(preparation.validation_errors(&format!("{prefix}.external_lead_preparation")));
+        if reciprocal || !definition.boundaries.is_empty()
+            || definition.gauge != crate::ChargePotentialGaugeIR::TerminalReference
+            || definition.conservative_current_source.is_some()
+            || definition.conservative_current_view.is_some()
+            || definition.structured_current_closure.is_some()
+        {
+            errors.push(format!("{prefix}.external_lead_preparation requires one-way transport, empty boundaries, terminal_reference gauge and no source/view/closure"));
+        }
+        if !matches!(requested_backend, crate::BackendTarget::Fem | crate::BackendTarget::Auto)
+            || definition.solver.operator_version != "fem_charge_conforming_h1_p1.transparent.v1"
+            || definition.solver.engine != "cg"
+        {
+            errors.push(format!("{prefix}.external_lead_preparation requires the FEM H1 cg policy"));
+        }
+        for extension in &preparation.extensions {
+            if !definition.domain.iter().any(|region| region.object_id == extension.object_id) {
+                errors.push(format!("{prefix}.external_lead_preparation observation '{}' object_id must belong to the charge domain", extension.observation_id));
+            }
+        }
+    }
     if let Some(source) = &definition.conservative_current_source {
         errors.extend(source.validation_errors(&format!("{prefix}.conservative_current_source")));
         if reciprocal
@@ -2607,6 +2661,7 @@ fn validate_charge_transport_definition(
         )),
         crate::ChargePotentialGaugeIR::TerminalReference
             if definition.conservative_current_source.is_none()
+                && definition.external_lead_preparation.is_none()
                 && (terminal_count == 0 || voltage_count != 0 || current_density_count != 0) =>
         {
             errors.push(format!(

@@ -13,6 +13,9 @@ from fullmag.runtime.output_storage_lowering import (
 )
 from fullmag.model.current_transport import (
     ExternalLeadCurrentSource,
+    ExternalLeadPreparation,
+    TerminalLeadExtension,
+    _CURRENT_SOURCE_MAX_ITEMS,
     CurrentSourceInterfacePair,
     CurrentSourceOuterTerminal,
     CurrentSourceTerminalObservation,
@@ -104,6 +107,7 @@ _CURRENT_TRANSPORT_FIELDS = frozenset(
         "time_envelope",
         "conservative_current_view",
         "conservative_current_source",
+        "external_lead_preparation",
         "structured_current_closure",
     }
 )
@@ -495,12 +499,56 @@ def _decode_current_transport(value: object) -> CurrentTransport:
             if entry.get("conservative_current_source") is not None
             else None
         ),
+        external_lead_preparation=(
+            _decode_external_lead_preparation(entry["external_lead_preparation"])
+            if entry.get("external_lead_preparation") is not None
+            else None
+        ),
         structured_current_closure=(
             _decode_structured_current_closure(structured_closure_value)
             if structured_closure_value is not None
             else None
         ),
     )
+
+
+def _decode_external_lead_preparation(value: object) -> ExternalLeadPreparation:
+    entry = dict(_mapping(value, "external_lead_preparation"))
+    if set(entry) != {"schema_version", "kind", "revision", "extensions", "drives"}:
+        raise ValueError("external_lead_preparation has unknown or missing fields")
+    if entry.pop("kind") != "isolated_branch_straight_stubs":
+        raise ValueError("unsupported external_lead_preparation kind")
+    extensions, drives = entry["extensions"], entry["drives"]
+    if not isinstance(extensions, list) or not isinstance(drives, list):
+        raise ValueError("external_lead_preparation extensions and drives must be lists")
+    if not 2 <= len(extensions) <= 128 or not drives or len(drives) * len(extensions) > _CURRENT_SOURCE_MAX_ITEMS:
+        raise ValueError("external_lead_preparation exceeds bounded input support before construction")
+    for values, key in ((extensions, "boundary_markers"), (drives, "outer_terminal_currents_a")):
+        count = 0
+        for raw in values:
+            item = _mapping(raw, "external_lead_preparation entry")
+            controls = item.get(key)
+            expected_type = list if key == "boundary_markers" else Mapping
+            if not isinstance(controls, expected_type):
+                raise ValueError(f"external_lead_preparation.{key} has an invalid shape")
+            count += len(controls)
+            if count > _CURRENT_SOURCE_MAX_ITEMS:
+                raise ValueError("external_lead_preparation exceeds bounded input support before construction")
+    groups = (
+        ("extensions", TerminalLeadExtension, {"id", "observation_id", "object_id", "boundary_markers",
+                                              "length_m", "outward_direction_xyz", "conductivity_spm", "layers"}),
+        ("drives", CurrentSourceDrive, {"id", "port_mode_ref", "outer_terminal_currents_a"}),
+    )
+    for name, cls, fields in groups:
+        values = []
+        for raw in entry[name]:
+            item = _mapping(raw, f"external_lead_preparation.{name}")
+            required = fields - {"layers"} if name == "extensions" else fields
+            if not required <= item.keys() or not item.keys() <= fields:
+                raise ValueError(f"external_lead_preparation.{name} has unknown or missing fields")
+            values.append(cls(**item))
+        entry[name] = values
+    return ExternalLeadPreparation(**entry)
 
 
 def _decode_conservative_current_source(value: object) -> ExternalLeadCurrentSource:

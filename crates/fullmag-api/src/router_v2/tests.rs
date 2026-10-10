@@ -969,6 +969,7 @@ fn public_m1_fem_run_fixture() -> (fullmag_ir::ProblemIR, fullmag_runner::FemMes
         },
         conservative_current_view: None,
         conservative_current_source: None,
+        external_lead_preparation: None,
         structured_current_closure: None,
     };
     problem.current_modules = vec![CurrentModuleIR::CurrentTransport {

@@ -74,6 +74,7 @@ from fullmag.model.current_transport import (
     ChargeTransportMaterialAssignment,
     ConservativeCurrentView,
     ExternalLeadCurrentSource,
+    ExternalLeadPreparation,
     NormalCurrentElectrode,
     StructuredCurrentClosure,
     CurrentTransport,
@@ -6496,6 +6497,7 @@ class StudyBuilder:
         conservative_current_view: ConservativeCurrentView | None = None,
         structured_current_closure: StructuredCurrentClosure | None = None,
         conservative_current_source: ExternalLeadCurrentSource | None = None,
+        external_lead_preparation: ExternalLeadPreparation | None = None,
     ) -> CurrentTransport:
         return current_transport(
             name=name,
@@ -6513,6 +6515,7 @@ class StudyBuilder:
             conservative_current_view=conservative_current_view,
             structured_current_closure=structured_current_closure,
             conservative_current_source=conservative_current_source,
+            external_lead_preparation=external_lead_preparation,
         )
 
     def spin_torque(self, module: SpinTorqueModule) -> SpinTorqueModule:
@@ -8866,6 +8869,7 @@ def current_transport(
     conservative_current_view: ConservativeCurrentView | None = None,
     structured_current_closure: StructuredCurrentClosure | None = None,
     conservative_current_source: ExternalLeadCurrentSource | None = None,
+    external_lead_preparation: ExternalLeadPreparation | None = None,
 ) -> CurrentTransport:
     module = CurrentTransport(
         name=name,
@@ -8883,6 +8887,7 @@ def current_transport(
         conservative_current_view=conservative_current_view,
         structured_current_closure=structured_current_closure,
         conservative_current_source=conservative_current_source,
+        external_lead_preparation=external_lead_preparation,
     )
     _state._current_modules.append(module)
     return module

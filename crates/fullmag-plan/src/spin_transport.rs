@@ -1556,6 +1556,9 @@ fn materialize_fem_charge_components(
     current_source_id: &str,
     reciprocal: bool,
 ) -> Result<FemChargeComponents, Vec<String>> {
+    if charge.external_lead_preparation.is_some() {
+        return Err(vec![format!("{owner_kind} '{owner_id}' external_lead_preparation requires execution-only materialization; legacy charge fallback is forbidden")]);
+    }
     if charge.conservative_current_source.is_some() {
         return Err(vec![format!(
             "{owner_kind} '{owner_id}' conservative_current_source execution is unavailable: the current-driven owned-bundle producer is not connected; legacy boundary materialization and solve are forbidden"
@@ -2541,6 +2544,9 @@ fn materialize_fdm_descriptor(
     time_envelope: Option<&fullmag_ir::TimeEnvelopeIR>,
     active_graph: &ActiveFdmTransportGraph,
 ) -> Result<ResolvedFdmSpinTransportIR, Vec<String>> {
+    if charge.external_lead_preparation.is_some() {
+        return Err(vec![format!("spin transport '{}' external_lead_preparation requires execution-only materialization; no FDM fallback", module.id)]);
+    }
     if charge.conservative_current_source.is_some() {
         return Err(vec![format!(
             "spin transport '{}' conservative_current_source has no FDM source-solve realization; legacy FDM charge fallback is forbidden",
@@ -2795,6 +2801,9 @@ pub(crate) fn materialize_fdm_gpu_charge_descriptor(
     charge: &fullmag_ir::ChargeTransportDefinitionIR,
     context: &FdmSpinTransportResolutionContext<'_>,
 ) -> Result<ResolvedFdmGpuChargeTransportIR, Vec<String>> {
+    if charge.external_lead_preparation.is_some() {
+        return Err(vec![format!("FDM GPU charge transport '{module_id}' external_lead_preparation requires execution-only materialization; no FDM fallback")]);
+    }
     if charge.conservative_current_source.is_some() {
         return Err(vec![format!(
             "FDM GPU charge transport '{module_id}' conservative_current_source has no FDM source-solve realization; legacy FDM charge fallback is forbidden"
@@ -4173,6 +4182,7 @@ mod tests {
                 },
                 conservative_current_view: None,
                 conservative_current_source: None,
+                external_lead_preparation: None,
                 structured_current_closure: None,
             }),
         }];

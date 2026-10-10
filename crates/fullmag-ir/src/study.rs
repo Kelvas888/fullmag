@@ -299,9 +299,9 @@ where
     D: Deserializer<'de>,
 {
     let remaining = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
-    let has_current_source = remaining
-        .get("conservative_current_source")
-        .is_some_and(|source| !source.is_null());
+    let has_current_source = ["conservative_current_source", "external_lead_preparation"]
+        .iter()
+        .any(|name| remaining.get(*name).is_some_and(|source| !source.is_null()));
     let parsed = serde_json::from_value::<crate::ChargeTransportDefinitionIR>(
         serde_json::Value::Object(remaining),
     );

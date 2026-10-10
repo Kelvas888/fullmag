@@ -615,7 +615,7 @@
     },
     {
       "id": "antenna-runtime-action-reference-lowering",
-      "path": "packages/fullmag-py/src/fullmag/runtime/helper.py",
+      "path": "packages/fullmag-py/src/fullmag/runtime/run_config_export.py",
       "symbol": "_runtime_stage_action",
       "responsibility": "Referencyjny kształt akcji Rust i materializacja wyłącznie bieżącej definicji w stage IR, z kontrolą konfliktu."
     },

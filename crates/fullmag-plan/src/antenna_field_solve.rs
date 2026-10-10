@@ -290,6 +290,12 @@ pub fn plan_antenna_field_solve_execution(
         )));
     };
 
+    if definition.external_lead_preparation.is_some() {
+        return Err(fail(
+            "external_lead_preparation requires execution-only materialization against the original independent conductor mesh before antenna planning; no legacy source fallback",
+        ));
+    }
+
     let mut object_ids = Vec::new();
     let mut seen = BTreeSet::new();
     for region in &definition.domain {

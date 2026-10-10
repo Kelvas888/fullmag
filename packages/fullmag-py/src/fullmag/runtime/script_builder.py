@@ -4871,6 +4871,25 @@ def _render_conservative_current_source_payload(payload: object) -> str:
     return "fm.ExternalLeadCurrentSource(" + ", ".join(kwargs) + ")"
 
 
+def _render_external_lead_preparation_payload(payload: object) -> str:
+    from fullmag.runtime.scene_document import _decode_external_lead_preparation
+
+    intent = _decode_external_lead_preparation(payload).to_ir()
+    extensions = [
+        "fm.TerminalLeadExtension(" + ", ".join(f"{key}={value!r}" for key, value in extension.items()) + ")"
+        for extension in intent["extensions"]
+    ]
+    drives = [
+        "fm.CurrentSourceDrive(" + ", ".join(f"{key}={value!r}" for key, value in drive.items()) + ")"
+        for drive in intent["drives"]
+    ]
+    return (
+        f"fm.ExternalLeadPreparation(revision={intent['revision']!r}, "
+        f"extensions=[{', '.join(extensions)}], drives=[{', '.join(drives)}], "
+        f"schema_version={intent['schema_version']!r})"
+    )
+
+
 def _render_current_transport_payload(payload: object, *, surface: str) -> str:
     entry = _normalize_mapping(payload)
     kwargs = [f"name={_py_repr(str(entry.get('name') or 'transport'))}"]
@@ -4924,6 +4943,8 @@ def _render_current_transport_payload(payload: object, *, surface: str) -> str:
     conservative_view = entry.get("conservative_current_view")
     if entry.get("conservative_current_source") is not None:
         kwargs.append("conservative_current_source=" + _render_conservative_current_source_payload(entry["conservative_current_source"]))
+    if entry.get("external_lead_preparation") is not None:
+        kwargs.append("external_lead_preparation=" + _render_external_lead_preparation_payload(entry["external_lead_preparation"]))
     if isinstance(conservative_view, Mapping):
         kwargs.append(
             "conservative_current_view="

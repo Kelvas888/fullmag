@@ -5,7 +5,11 @@ from dataclasses import dataclass
 import copy
 import math
 from types import MappingProxyType
-from typing import Protocol, Sequence
+from typing import TYPE_CHECKING, Protocol, Sequence
+
+if TYPE_CHECKING:
+    from fullmag.meshing._antenna_external_lead_preparation import PreparedAntennaExternalLeadSource
+    from fullmag.meshing._gmsh_types import MeshData
 
 from fullmag._validation import (
     as_vector3,
@@ -1174,6 +1178,108 @@ def _source_mesh(mesh: object) -> dict[str, object]:
 
 
 @dataclass(frozen=True, slots=True)
+class TerminalLeadExtension:
+    """Explicit straight extension of a mesh-marked terminal cap, in SI."""
+
+    id: str
+    observation_id: str
+    object_id: str
+    boundary_markers: tuple[int, ...]
+    length_m: float
+    outward_direction_xyz: tuple[float, float, float]
+    conductivity_spm: float
+    layers: int = 2
+
+    def __post_init__(self) -> None:
+        for name in ("id", "observation_id", "object_id"):
+            object.__setattr__(self, name, _source_text(getattr(self, name), name))
+        markers = tuple(self.boundary_markers)
+        if not markers or len(markers) > _CURRENT_SOURCE_MAX_ITEMS or any(
+            type(value) is not int or not 0 < value < 1 << 31 for value in markers
+        ) or len(set(markers)) != len(markers):
+            raise ValueError("boundary_markers must be unique positive native int32 markers")
+        object.__setattr__(self, "boundary_markers", markers)
+        for name in ("length_m", "conductivity_spm"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive")
+            object.__setattr__(self, name, float(value))
+        direction = tuple(self.outward_direction_xyz)
+        if len(direction) != 3 or any(
+            isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
+            for value in direction
+        ) or abs(math.hypot(*direction) - 1.0) > 1e-12:
+            raise ValueError("outward_direction_xyz must be an explicit finite unit vector")
+        object.__setattr__(self, "outward_direction_xyz", tuple(float(v) for v in direction))
+        if type(self.layers) is not int or not 2 <= self.layers <= 1 << 20:
+            raise ValueError("layers must be an exact integer between 2 and the bounded cell budget")
+
+    def to_ir(self) -> dict[str, object]:
+        return {
+            "id": self.id, "observation_id": self.observation_id, "object_id": self.object_id,
+            "boundary_markers": list(self.boundary_markers), "length_m": self.length_m,
+            "outward_direction_xyz": list(self.outward_direction_xyz),
+            "conductivity_spm": self.conductivity_spm, "layers": self.layers,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ExternalLeadPreparation:
+    """Authored straight-stub intent; preparation requires the actual device mesh."""
+
+    revision: str
+    extensions: tuple[TerminalLeadExtension, ...]
+    drives: tuple[CurrentSourceDrive, ...]
+    schema_version: str = "antenna_external_lead_preparation.v1"
+
+    def __post_init__(self) -> None:
+        if self.schema_version != "antenna_external_lead_preparation.v1":
+            raise ValueError("unsupported external lead preparation schema_version")
+        object.__setattr__(self, "revision", _source_text(self.revision, "preparation.revision"))
+        extensions, drives = tuple(self.extensions), tuple(self.drives)
+        if not 2 <= len(extensions) <= 128 or not all(isinstance(e, TerminalLeadExtension) for e in extensions):
+            raise ValueError("extensions require two or more bounded typed electrodes")
+        for name in ("id", "observation_id"):
+            if len({getattr(e, name) for e in extensions}) != len(extensions):
+                raise ValueError(f"extension {name} values must be unique")
+        marker_count = sum(len(e.boundary_markers) for e in extensions)
+        if marker_count > _CURRENT_SOURCE_MAX_ITEMS:
+            raise ValueError("extension markers must be disjoint and bounded")
+        markers = {marker for e in extensions for marker in e.boundary_markers}
+        if len(markers) != marker_count:
+            raise ValueError("extension markers must be disjoint and bounded")
+        if not drives or len(drives) > _CURRENT_SOURCE_MAX_ITEMS or not all(isinstance(d, CurrentSourceDrive) for d in drives):
+            raise ValueError("drives require bounded explicit CurrentSourceDrive values")
+        if len(drives) * len(extensions) > _CURRENT_SOURCE_MAX_ITEMS:
+            raise ValueError("aggregate drive controls exceed the source item budget")
+        for name in ("id", "port_mode_ref"):
+            if len({getattr(d, name) for d in drives}) != len(drives):
+                raise ValueError(f"drive {name} values must be unique")
+        terminals = {e.id for e in extensions}
+        if any(set(d.outer_terminal_currents_a) != terminals for d in drives):
+            raise ValueError("each drive must cover exactly all outer terminal IDs")
+        object.__setattr__(self, "extensions", extensions)
+        object.__setattr__(self, "drives", drives)
+
+    def to_ir(self) -> dict[str, object]:
+        return {
+            "schema_version": self.schema_version, "kind": "isolated_branch_straight_stubs",
+            "revision": self.revision, "extensions": [e.to_ir() for e in self.extensions],
+            "drives": [d.to_ir() for d in self.drives],
+        }
+
+    def prepare(self, *, device_mesh: MeshData) -> PreparedAntennaExternalLeadSource:
+        from fullmag.meshing._antenna_external_lead_preparation import prepare_antenna_external_lead_source
+
+        return prepare_antenna_external_lead_source(
+            device_mesh=device_mesh, extensions=self.extensions, drives=self.drives, revision=self.revision,
+        )
+
+    def __deepcopy__(self, memo: dict) -> ExternalLeadPreparation:
+        return self
+
+
+@dataclass(frozen=True, slots=True)
 class ExternalLeadCurrentSource:
     """Expert post-mesh current-driven input, not an accepted field or runtime qualification."""
     revision: str
@@ -1317,6 +1423,7 @@ class CurrentTransport:
     conservative_current_view: ConservativeCurrentView | None = None
     structured_current_closure: StructuredCurrentClosure | None = None
     conservative_current_source: ExternalLeadCurrentSource | None = None
+    external_lead_preparation: ExternalLeadPreparation | None = None
 
     def __init__(
         self,
@@ -1336,6 +1443,7 @@ class CurrentTransport:
         conservative_current_view: ConservativeCurrentView | None = None,
         structured_current_closure: StructuredCurrentClosure | None = None,
         conservative_current_source: ExternalLeadCurrentSource | None = None,
+        external_lead_preparation: ExternalLeadPreparation | None = None,
     ) -> None:
         raw_model = require_non_empty(model, "model").lower()
         resolved_magnetoresistive_model = raw_model == "magnetoresistive_poisson"
@@ -1372,10 +1480,12 @@ class CurrentTransport:
                 "time_envelope must be one of the canonical TimeEnvelope values"
             )
         object.__setattr__(self, "time_envelope", time_envelope)
-        if sum(v is not None for v in (conservative_current_view, structured_current_closure, conservative_current_source)) > 1:
+        if sum(v is not None for v in (conservative_current_view, structured_current_closure, conservative_current_source, external_lead_preparation)) > 1:
             raise ValueError(
-                "conservative_current_view, structured_current_closure and conservative_current_source are mutually exclusive"
+                "conservative_current_view, structured_current_closure, conservative_current_source and external_lead_preparation are mutually exclusive"
             )
+        if external_lead_preparation is not None and not isinstance(external_lead_preparation, ExternalLeadPreparation):
+            raise TypeError("external_lead_preparation must be ExternalLeadPreparation")
         if conservative_current_source is not None and not isinstance(conservative_current_source, ExternalLeadCurrentSource):
             raise TypeError("conservative_current_source must be ExternalLeadCurrentSource")
         if conservative_current_view is not None and not isinstance(
@@ -1408,19 +1518,24 @@ class CurrentTransport:
                 raise ValueError("equipotential current terminals require gauge='terminal_reference'")
             if any(isinstance(item, (VoltageElectrode, NormalCurrentElectrode)) for item in normalized_boundaries):
                 raise ValueError("equipotential current terminals cannot mix with voltage or current-density electrodes")
-        elif conservative_current_source is None and gauge is not None and gauge.kind == "terminal_reference":
+        elif conservative_current_source is None and external_lead_preparation is None and gauge is not None and gauge.kind == "terminal_reference":
             raise ValueError("gauge='terminal_reference' requires equipotential current terminals")
-        if conservative_current_source is not None:
+        if conservative_current_source is not None or external_lead_preparation is not None:
+            source_field = "conservative_current_source" if conservative_current_source is not None else "external_lead_preparation"
             if normalized_model != "ohmic_poisson" or normalized_coupling != "one_way":
-                raise ValueError("conservative_current_source requires complete one-way ohmic_poisson")
+                raise ValueError(f"{source_field} requires complete one-way ohmic_poisson")
             if normalized_boundaries:
-                raise ValueError("conservative_current_source requires empty boundaries")
+                raise ValueError(f"{source_field} requires empty boundaries")
             if time_envelope is not None:
-                raise ValueError("conservative_current_source is static precompute; time_envelope belongs to the downstream antenna drive")
+                raise ValueError(f"{source_field} is static precompute; time_envelope belongs to the downstream antenna drive")
             if gauge is None or gauge.kind != "terminal_reference":
-                raise ValueError("conservative_current_source requires gauge='terminal_reference'")
+                raise ValueError(f"{source_field} requires gauge='terminal_reference'")
             if solver is None or solver.engine != "cg" or solver.operator_version != _FEM_CHARGE_OPERATOR_VERSION:
-                raise ValueError("conservative_current_source requires the FEM H1 charge operator and cg")
+                raise ValueError(f"{source_field} requires the FEM H1 charge operator and cg")
+        if external_lead_preparation is not None:
+            domain_objects = {region.object_id for region in normalized_domain}
+            if any(extension.object_id not in domain_objects for extension in external_lead_preparation.extensions):
+                raise ValueError("external_lead_preparation extensions must belong to the charge domain")
         if conservative_current_view is not None and (
             normalized_model != "ohmic_poisson" or normalized_coupling != "one_way"
         ):
@@ -1465,6 +1580,7 @@ class CurrentTransport:
         object.__setattr__(self, "conservative_current_view", conservative_current_view)
         object.__setattr__(self, "structured_current_closure", structured_current_closure)
         object.__setattr__(self, "conservative_current_source", conservative_current_source)
+        object.__setattr__(self, "external_lead_preparation", external_lead_preparation)
 
         if normalized_model == "prescribed_density":
             if current_density is None:
@@ -1478,7 +1594,7 @@ class CurrentTransport:
         elif (
             not normalized_domain
             or not normalized_materials
-            or (not normalized_boundaries and conservative_current_source is None)
+            or (not normalized_boundaries and conservative_current_source is None and external_lead_preparation is None)
             or gauge is None
             or solver is None
         ):
@@ -1537,7 +1653,7 @@ class CurrentTransport:
             ir["domain"] = [region.to_ir() for region in self.domain]
         if self.materials:
             ir["materials"] = [assignment.to_ir() for assignment in self.materials]
-        if self.boundaries or self.conservative_current_source is not None:
+        if self.boundaries or self.conservative_current_source is not None or self.external_lead_preparation is not None:
             ir["boundaries"] = [boundary.to_ir() for boundary in self.boundaries]
         if self.gauge is not None:
             ir["gauge"] = self.gauge.to_ir()
@@ -1551,10 +1667,14 @@ class CurrentTransport:
             ir["structured_current_closure"] = self.structured_current_closure.to_ir()
         if self.conservative_current_source is not None:
             ir["conservative_current_source"] = self.conservative_current_source.to_ir()
+        if self.external_lead_preparation is not None:
+            ir["external_lead_preparation"] = self.external_lead_preparation.to_ir()
         return ir
 
 
 __all__ = [
+    "ExternalLeadPreparation",
+    "TerminalLeadExtension",
     "ExternalLeadCurrentSource",
     "CurrentSourceInterfacePair",
     "CurrentSourceOuterTerminal",

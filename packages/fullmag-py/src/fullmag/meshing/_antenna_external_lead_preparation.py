@@ -16,6 +16,7 @@ from fullmag.model.current_transport import (
     CurrentSourceOuterTerminal,
     CurrentSourceTerminalObservation,
     ExternalLeadCurrentSource,
+    TerminalLeadExtension,
     _source_freeze,
     _source_text,
 )
@@ -27,42 +28,6 @@ _MAX_ITEMS = 4 * _MAX_CELLS
 _U64_MAX = (1 << 64) - 1
 _EPS = np.finfo(np.float64).eps
 _TET_FACES = ((1, 2, 3), (0, 3, 2), (0, 1, 3), (0, 2, 1))
-
-
-@dataclass(frozen=True, slots=True)
-class TerminalLeadExtension:
-    id: str
-    observation_id: str
-    object_id: str
-    boundary_markers: tuple[int, ...]
-    length_m: float
-    outward_direction_xyz: tuple[float, float, float]
-    conductivity_spm: float
-    layers: int = 2
-
-    def __post_init__(self) -> None:
-        for name in ("id", "observation_id", "object_id"):
-            object.__setattr__(self, name, _source_text(getattr(self, name), name))
-        markers = tuple(self.boundary_markers)
-        if not markers or len(markers) > _MAX_ITEMS or any(
-            type(value) is not int or not 0 < value < 1 << 31 for value in markers
-        ) or len(set(markers)) != len(markers):
-            raise ValueError("boundary_markers must be unique positive native int32 markers")
-        object.__setattr__(self, "boundary_markers", markers)
-        for name in ("length_m", "conductivity_spm"):
-            value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
-                raise ValueError(f"{name} must be finite and positive")
-            object.__setattr__(self, name, float(value))
-        direction = tuple(self.outward_direction_xyz)
-        if len(direction) != 3 or any(
-            isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value)
-            for value in direction
-        ) or abs(math.hypot(*direction) - 1.0) > 1e-12:
-            raise ValueError("outward_direction_xyz must be an explicit finite unit vector")
-        object.__setattr__(self, "outward_direction_xyz", tuple(float(v) for v in direction))
-        if type(self.layers) is not int or not 2 <= self.layers <= _MAX_CELLS:
-            raise ValueError("layers must be an exact integer between 2 and the bounded cell budget")
 
 
 @dataclass(frozen=True, slots=True)

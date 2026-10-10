@@ -74,6 +74,10 @@ pub struct KnownSceneCurrentTransport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(additional_properties, nullable)]
     pub conservative_current_source: Option<BTreeMap<String, serde_json::Value>>,
+    /// Mesh-independent authored intent; execution binds it to the device mesh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(additional_properties, nullable)]
+    pub external_lead_preparation: Option<BTreeMap<String, serde_json::Value>>,
     /// Authored FDM closed-current intent. Grid face indices and runtime
     /// certificate state are resolved later and never enter the scene model.
     #[serde(default, skip_serializing_if = "Option::is_none")]

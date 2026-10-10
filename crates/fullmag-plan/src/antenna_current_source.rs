@@ -617,6 +617,8 @@ pub fn materialize_antenna_external_lead_current_input(
     port: &AntennaPortModeIR,
     field_sampling: &AntennaFieldSamplingPlanIR,
 ) -> Result<ResolvedAntennaExternalLeadCurrentInputIR, PlanError> {
+    require(definition.external_lead_preparation.is_none(),
+        "external_lead_preparation requires execution-only materialization before current source input binding")?;
     require(
         device_mesh.cell_count() > 0
             && device_mesh.cell_count() <= MAX_ELEMENTS
@@ -1271,6 +1273,7 @@ mod tests {
                 operator_version: "fem_charge_conforming_h1_p1.transparent.v1".into(),
             },
             conservative_current_source: Some(source),
+            external_lead_preparation: None,
             conservative_current_view: None,
             structured_current_closure: None,
         };

@@ -44,6 +44,8 @@ pub struct ChargeTransportDefinitionIR {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conservative_current_source: Option<ConservativeCurrentSourceIR>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_lead_preparation: Option<crate::ExternalLeadPreparationIR>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_current_closure: Option<StructuredCurrentClosureIR>,
 }
 

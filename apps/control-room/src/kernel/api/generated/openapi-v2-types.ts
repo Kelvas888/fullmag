@@ -9204,6 +9204,10 @@ export interface components {
             coupling?: components["schemas"]["SceneTransportCoupling"];
             current_density?: number[] | null;
             domain?: components["schemas"]["SceneRegionRef"][];
+            /** @description Mesh-independent authored intent; execution binds it to the device mesh. */
+            external_lead_preparation?: {
+                [key: string]: unknown;
+            } | null;
             gauge?: null | components["schemas"]["SceneChargePotentialGauge"];
             kind: components["schemas"]["CurrentTransportKind"];
             materials?: components["schemas"]["SceneChargeTransportMaterialAssignment"][];

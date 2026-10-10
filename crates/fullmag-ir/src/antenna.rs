@@ -770,8 +770,20 @@ fn validate_v2_port_structure(
     let Some(definition) = definition else {
         return;
     };
-    if let Some(source) = &definition.conservative_current_source {
+    let authored_terminals = if let Some(source) = &definition.conservative_current_source {
         let crate::ConservativeCurrentSourceIR::ExternalLeadCurrent { drives, .. } = source;
+        Some((drives, source.terminal_observations().iter()
+            .map(|observation| (observation.id.as_str(), observation.object_id.as_str()))
+            .collect::<std::collections::BTreeMap<_, _>>()))
+    } else {
+        definition.external_lead_preparation.as_ref().map(|preparation| (
+            &preparation.drives,
+            preparation.extensions.iter()
+                .map(|extension| (extension.observation_id.as_str(), extension.object_id.as_str()))
+                .collect::<std::collections::BTreeMap<_, _>>(),
+        ))
+    };
+    if let Some((drives, observations)) = authored_terminals {
         if drives
             .iter()
             .filter(|drive| drive.port_mode_ref == port.id)
@@ -780,26 +792,21 @@ fn validate_v2_port_structure(
         {
             errors.push(format!("{prefix} requires exactly one explicitly authored current-source drive for this port mode"));
         }
-        let observations = source
-            .terminal_observations()
-            .iter()
-            .map(|observation| (observation.id.as_str(), observation))
-            .collect::<std::collections::BTreeMap<_, _>>();
         for branch in &port.branches {
             let mut objects = Vec::new();
             for (role, id) in [
                 ("inlet_terminal_ref", branch.inlet_terminal_ref.as_str()),
                 ("outlet_terminal_ref", branch.outlet_terminal_ref.as_str()),
             ] {
-                if let Some(observation) = observations.get(id) {
+                if let Some(object_id) = observations.get(id) {
                     if !definition
                         .domain
                         .iter()
-                        .any(|region| region.object_id == observation.object_id)
+                        .any(|region| region.object_id == *object_id)
                     {
                         errors.push(format!("{prefix}.branches branch '{}' {role} must observe an object in the CurrentTransport domain", branch.id));
                     }
-                    objects.push(observation.object_id.as_str());
+                    objects.push(*object_id);
                 } else {
                     errors.push(format!("{prefix}.branches branch '{}' {role} '{}' does not exist in current-source terminal_observations", branch.id, id));
                 }
@@ -954,6 +961,18 @@ fn validate_current_source_references(
             ..
         } = module
         {
+            if let Some(preparation) = &definition.external_lead_preparation {
+                for drive in &preparation.drives {
+                    if !ports.iter().any(|port| port.id == drive.port_mode_ref && port.current_transport_id == *name) {
+                        errors.push(format!("CurrentTransport '{name}' lead-preparation drive '{}' must reference a port mode bound to this transport", drive.id));
+                    }
+                }
+                for extension in &preparation.extensions {
+                    if !objects.contains(extension.object_id.as_str()) {
+                        errors.push(format!("CurrentTransport '{name}' lead-preparation observation '{}' references an unknown object", extension.observation_id));
+                    }
+                }
+            }
             if let Some(crate::ConservativeCurrentSourceIR::ExternalLeadCurrent {
                 drives,
                 terminal_observations,
@@ -1000,12 +1019,12 @@ fn validate_stage_current_view_ref(
                 definition: Some(definition),
                 ..
             } if name == &stage.current_transport_id
-                && definition.conservative_current_source.is_some()
+                && (definition.conservative_current_source.is_some() || definition.external_lead_preparation.is_some())
         )
     });
     if !has_typed_source {
         errors.push(format!(
-            "{prefix}.conservative_current_view_ref may be omitted only when CurrentTransport '{}' defines conservative_current_source",
+            "{prefix}.conservative_current_view_ref may be omitted only when CurrentTransport '{}' defines conservative_current_source or authored external_lead_preparation",
             stage.current_transport_id
         ));
     }
@@ -1343,7 +1362,7 @@ pub(crate) fn validate_antenna_composition_v03(problem: &ProblemIR, errors: &mut
         && problem.solved_antenna_drives.is_empty()
         && problem.antenna_spectrum_requests.is_empty()
         && !problem.current_modules.iter().any(|module| matches!(module,
-            CurrentModuleIR::CurrentTransport { definition: Some(definition), .. } if definition.conservative_current_source.is_some()))
+            CurrentModuleIR::CurrentTransport { definition: Some(definition), .. } if definition.conservative_current_source.is_some() || definition.external_lead_preparation.is_some()))
     {
         return;
     }
@@ -1843,6 +1862,23 @@ mod tests {
         stage.conservative_current_view_ref = Some("historical:view".into());
         validate_stage_current_view_ref(&stage, &modules, "stage", &mut errors);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn authored_lead_preparation_resolves_only_its_own_observations_and_port() {
+        let mut module = stage_transport("antenna_current", None);
+        let CurrentModuleIR::CurrentTransport { definition: Some(definition), .. } = &mut module else { unreachable!() };
+        let mut preparation: crate::ExternalLeadPreparationIR = serde_json::from_value(crate::antenna_lead_preparation::tests::fixture()).unwrap();
+        preparation.drives[0].port_mode_ref = "port_1".into();
+        for extension in &mut preparation.extensions { extension.object_id = "antenna_1".into(); }
+        definition.external_lead_preparation = Some(preparation);
+        let mut stage = solved_stage();
+        stage.conservative_current_view_ref = None;
+        let mut errors = Vec::new();
+        validate_stage_current_view_ref(&stage, &[module.clone()], "stage", &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        validate_current_source_references(&[module], &[], &BTreeSet::from(["antenna_1"]), &mut errors);
+        assert!(errors.iter().any(|error| error.contains("port mode bound to this transport")));
     }
 
     #[test]

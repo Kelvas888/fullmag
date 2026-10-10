@@ -87,6 +87,12 @@ pub(crate) fn resolve_current_transports(
                 definition,
                 ..
             } => {
+                if definition.as_ref().is_some_and(|charge| charge.external_lead_preparation.is_some()) {
+                    reasons.push(format!(
+                        "current_modules[{index}] external_lead_preparation requires execution-only materialization; legacy charge fallback is forbidden"
+                    ));
+                    continue;
+                }
                 if definition.as_ref().is_some_and(|charge| {
                     charge.conservative_current_source.is_some()
                 }) {
@@ -273,6 +279,7 @@ pub(crate) fn resolve_fdm_gpu_charge_transports_with_active_graph(
         return Err(fdm_gpu_charge_scope_error(scope_reasons));
     };
     if charge.conservative_current_source.is_some()
+        || charge.external_lead_preparation.is_some()
         || charge.conservative_current_view.is_some()
         || charge.structured_current_closure.is_some()
     {
@@ -707,6 +714,7 @@ mod tests {
                 },
                 conservative_current_view: None,
                 conservative_current_source: None,
+                external_lead_preparation: None,
                 structured_current_closure: None,
             }),
         }];
@@ -1327,5 +1335,23 @@ mod tests {
             .reasons
             .iter()
             .any(|reason| reason.contains("requires a bound spin_transport module")));
+    }
+
+    #[test]
+    fn authored_lead_preparation_never_enters_a_legacy_charge_solver() {
+        let mut problem = bounded_gpu_charge_problem();
+        charge_definition_mut(&mut problem).external_lead_preparation = Some(
+            serde_json::from_value(serde_json::json!({
+                "schema_version":"antenna_external_lead_preparation.v1", "kind":"isolated_branch_straight_stubs", "revision":"intent-r1",
+                "extensions":[
+                    {"id":"minus","observation_id":"observe-minus","object_id":"body","boundary_markers":[11],"length_m":1e-6,"outward_direction_xyz":[-1.,0.,0.],"conductivity_spm":4e7},
+                    {"id":"plus","observation_id":"observe-plus","object_id":"body","boundary_markers":[12],"length_m":1e-6,"outward_direction_xyz":[1.,0.,0.],"conductivity_spm":4e7}],
+                "drives":[{"id":"drive","port_mode_ref":"port","outer_terminal_currents_a":{"minus":-0.002,"plus":0.002}}]
+            })).unwrap()
+        );
+        for lane in [CurrentTransportExecutableLane::Fdm, CurrentTransportExecutableLane::Fem] {
+            let error = resolve_current_transports(&problem, lane).unwrap_err();
+            assert!(error.reasons.iter().any(|reason| reason.contains("external_lead_preparation requires execution-only materialization") && reason.contains("fallback is forbidden")));
+        }
     }
 }

@@ -28,6 +28,7 @@ pub mod quantities;
 pub mod selection;
 pub mod spectral_validation;
 pub mod spin_transport;
+pub mod antenna_lead_preparation;
 pub mod study;
 mod validation;
 pub use antenna::*;
@@ -57,6 +58,7 @@ pub use quantities::{
 pub use selection::*;
 pub use spectral_validation::BlochWavevectorIR;
 pub use spin_transport::*;
+pub use antenna_lead_preparation::*;
 pub use study::*;
 use validation::*;
 

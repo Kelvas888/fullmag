@@ -18008,6 +18008,14 @@
             },
             "type": "array"
           },
+          "external_lead_preparation": {
+            "additionalProperties": true,
+            "description": "Mesh-independent authored intent; execution binds it to the device mesh.",
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "gauge": {
             "oneOf": [
               {

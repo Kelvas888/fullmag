@@ -4960,6 +4960,77 @@ Te dowody dotyczą authoringu i odmowy nieobsługiwanej ścieżki, nie pola H.
 (antenna-straight-lead-preparation)=
 #### Jawne przygotowanie prostych doprowadzeń po materializacji siatki
 
+(antenna-authored-lead-preparation)=
+##### Deklaracja przed siatką a rozwiązane wejście źródła
+
+Publiczny kontrakt `ExternalLeadPreparation` przechowuje intencję,
+nie gotową siatkę: `revision`, `extensions` i `drives`. `TerminalLeadExtension`
+ma parametry i ograniczenia opisane w tabeli poniżej; wybór rzeczywistych
+markerów nie może zostać zastąpiony nazwą terminala. Serializacja używa
+`schema_version='antenna_external_lead_preparation.v1'` oraz
+`kind='isolated_branch_straight_stubs'`. Pole
+`CurrentTransport.external_lead_preparation` jest wyłączne względem
+`conservative_current_source`, `conservative_current_view` i
+`structured_current_closure`. Wymaga one-way `ohmic_poisson`, pustych
+boundaries, gauge `terminal_reference`, statycznego precompute i solvera
+FEM H1/cg. Nie aktywuje fizyki przez typ prezentacyjny obiektu.
+
+| Parametr publiczny | Typ | Wartość domyślna | SI | Walidacja | Znaczenie | Obsługa backendów | Python → ProblemIR |
+|---|---|---|---|---|---|---|---|
+| ExternalLeadPreparation.revision | str | required | $1$ | nonempty UTF-8 bez NUL, do4096bytes | rewizja intencji, nie solved SHA | backend-neutral authoring; prepare FEM CPU/double; execution NOT VERIFIED | current_modules[].definition.external_lead_preparation.revision |
+| ExternalLeadPreparation.extensions | Sequence[TerminalLeadExtension] | required | $1$ | 2–128 typed, unique electrode/observation IDs i globally disjoint bounded markers | jawne selector/length/material/kierunek każdego leadu | backend-neutral authoring; execution materializer missing | current_modules[].definition.external_lead_preparation.extensions |
+| ExternalLeadPreparation.drives | Sequence[CurrentSourceDrive] | required | $\mathrm A$ dla currents | nonempty bounded typed, unique drive/port IDs, exact terminalcoverage; componentbalance poactualmesh | jawne signed/zero current controls | backend-neutral authoring; source solve FEM CPU/double niezakwalifikowany | current_modules[].definition.external_lead_preparation.drives |
+| ExternalLeadPreparation.schema_version | str | antenna_external_lead_preparation.v1 | $1$ | tylko wskazana wersja | wersja przedsiatkowej deklaracji | backend-neutral authoring | current_modules[].definition.external_lead_preparation.schema_version |
+| CurrentTransport/StudyBuilder.current_transport/current_transport.external_lead_preparation | ExternalLeadPreparation \| None | None | $1$ | static complete one-way ohmic, no boundaries, terminal_reference FEMH1cg; exclusive source/view/closure | deklaracja przygotowania, nie executionready source | backend-neutral authoring; nierozwiązany intent odmawia execution | current_modules[].definition.external_lead_preparation |
+| ExternalLeadPreparation.prepare.device_mesh | MeshData | required; keyword-only | $\mathrm m$ dla XYZ | finite positive oriented Tet4/Tri3, actual gmsh tags, caps/topology/lineage/balance existing validator | jawne przygotowanie bez mutacji intencji | interpretowane przygotowanie FEM CPU/double; nie solve | wynik source.to_ir → existing conservative_current_source.v1 |
+| TerminalLeadExtension.id | str | required | $1$ | nonempty UTF-8 bez NUL do4096bytes; unique wdeclaration | ID outer electrode | backend-neutral authoring | external_lead_preparation.extensions[].id → outer_terminals[].id |
+| TerminalLeadExtension.observation_id | str | required | $1$ | nonempty UTF-8 bez NUL do4096bytes; unique wdeclaration | pasywna obserwacja device cap | backend-neutral authoring | external_lead_preparation.extensions[].observation_id → terminal_observations[].id |
+| TerminalLeadExtension.object_id | str | required | $1$ | bounded nonempty bezNUL, charge-domain owner; actualmeshsegmentation gate osobno | immutable owner, nie nazwa prezentacyjna | backend-neutral authoring | external_lead_preparation.extensions[].object_id → terminal_observations[].object_id |
+| TerminalLeadExtension.boundary_markers | Sequence[int] | required | $1$ | 1..4194304 unique positive exactint32 bezbool; globallydisjoint indeclaration; existence poactualmesh | jawne selectory kontaktów | backend-neutral authoring; actual Gmsh przygotowanie | external_lead_preparation.extensions[].boundary_markers |
+| TerminalLeadExtension.length_m | float | required | $\mathrm m$ | finite positive, boolodrzucony | długość modeled lead, nie closure certificate | backend-neutral authoring; 3Dpreparation | external_lead_preparation.extensions[].length_m → lead_mesh.nodes |
+| TerminalLeadExtension.outward_direction_xyz | Sequence[float] | required | $1$ | 3finite bezbool, unit norm tolerance1e-12 beznormalizacji; actualoutward poactualmesh | jawny kierunek ekstrudowania | backend-neutral authoring; 3Dpreparation | external_lead_preparation.extensions[].outward_direction_xyz → lead_mesh.nodes |
+| TerminalLeadExtension.conductivity_spm | float | required | $\mathrm{S\,m^{-1}}$ | finitepositive bezbool, brakinherit | jawna przewodność leadu | backend-neutral authoring; 3Dpreparation | external_lead_preparation.extensions[].conductivity_spm → lead_conductivity_spm_per_element |
+| TerminalLeadExtension.layers | int | 2 | $1$ | exactint bezbool, 2..1048576, aggregatebudget poactualmesh | liczba przedziałów ekstrudowania | backend-neutral authoring; 3Dpreparation | external_lead_preparation.extensions[].layers → actual Tet4 subdivision |
+
+Light capture sceny i eksport Python zachowują deklarację bez meshingu.
+Jawne przygotowanie po siatce używa tej samej realizacji warstw
+`antenna-straight-lead-layer-map`. Declaration i resolved source to osobne
+stany: przed admission runtime musi uzyskać niezależną siatkę przewodnika,
+związać z nią source i zachować receipt oraz authored intent w provenance.
+Nie wolno zastąpić jej shared-domain siatką magnetyków, zgubić sparse IDs,
+reinterpretować legacy BC ani przypisać publicznego solved digestu.
+
+Parametry `TerminalLeadExtension` są publiczne (`fullmag.TerminalLeadExtension`);
+owner ekstrudowania pozostaje prywatny. `.prepare(device_mesh=...)` zwraca
+`PreparedAntennaExternalLeadSource` z istniejącymi `.source`, `.lead_mesh`
+i `.receipt`; żaden z tych wyników nie zmienia automatycznie deklaracji.
+Po przygotowaniu transport musi zostać jawnie skonstruowany z
+`conservative_current_source=prepared.source` zamiast deklaracji. Docelowy
+execution-only materializer wykona tę zmianę w kopii wykonawczej, nie scenie.
+
+Interpretowane sprawdzenie
+`scripts/verify_antenna_lead_authoring.py::LeadAuthoringChecks` wykonano
+10.10.2026: **9/9 PASS**. Obejmuje immutable intent, strict decoder,
+default `layers=2`, wykonanie wygenerowanego wyrażenia Python, kompletny
+script→scene→script→IR bez wywołania Gmsh, statyczny kontrakt transportu,
+odmowę niejawnych selectorów/kontroli oraz bilans actual komponentów.
+Review wykazał za późną kontrolę liczności w decoderze; dodano preflight
+raw shape/liczności/product/aggregate przed konstrukcją typed entries.
+Regresja oversized extensions, drives, markers i currents wymaga odmowy
+bez wywołania obu konstruktorów wpisów.
+Pierwszy przebieg miał błąd konstrukcji fixture `ConstantEnvelope` (brak
+wymaganego `value`); poprawiono fixture, nie warunek odmowy dynamic source.
+Istniejący helper po przeniesieniu typu publicznego ponownie przeszedł
+**11/11 PASS** z `--with-gmsh`, w tym rzeczywisty microstrip i taper.
+To dowody interpretowanego authoringu/przygotowania, nie wykonania Rust,
+HTTP nowego pola ani solvera. Same nowe typy i round-trip
+nie dowodzą przygotowania w publicznej ścieżce wykonania. Nierozwiązana
+deklaracja musi spowodować jawną odmowę planera zamiast uruchomienia legacy
+charge solve. Przygotowanie wejścia pozostaje FEM CPU/double; source solve
+FEM GPU i FDM CPU/GPU są unsupported. Dalsze kwalifikowane konsumery pola
+na czterech lane wymagają osobnego dowodu. Nie dodaje to zamknięcia obwodu,
+per-amperowej bazy, FFT ani LLG.
+
 To prywatny, ograniczony owner przygotowania wejścia, nie nowy publiczny
 solver i nie model zamkniętego obwodu. Zachowuje powyższy
 `ExternalLeadCurrentSource`: żądane prądy zewnętrznych elektrod autor określa
@@ -4997,14 +5068,14 @@ sprawdzane. Layer $N_e$ stanowi outer electrode, a pozostałe ściany
 zewnętrzne są izolujące. Minimum dwóch przedziałów oddziela DOF elektrod
 od interface trace; nie oznacza zbieżności siatki.
 
-| Prywatny parametr / wynik | Typ / default | SI | Walidacja i znaczenie | Mapowanie do istniejącego ProblemIR |
+| Parametr przygotowania / wynik | Typ / default | SI | Walidacja i znaczenie | Mapowanie do istniejącego ProblemIR |
 |---|---|---|---|---|
 | `device_mesh` | `MeshData`, required | XYZ $\mathrm m$ | wyłącznie Tet4/Tri3, actual positive unique u64 identity, finite XYZ, bez periodic; nie ordinal fallback | device mesh pozostaje niezmieniona; `device_stable_vertex_ids` zachowuje jej porządek |
-| `extensions` | `Sequence[TerminalLeadExtension]`, required | $1$ | 2–128, unikalne ID, rozłączne cap/reaction DOF; co najmniej dwie elektrody każdego komponentu, łącznie najwyżej 64 niezależne terminal controls | generuje `interface_pairs`, `outer_terminals`, `terminal_observations` |
+| `extensions` | `Sequence[TerminalLeadExtension]`, required | $1$ | 2–128, unikalne ID, rozłączne cap/reaction DOF; publiczna deklaracja wymaga też globalnie rozłącznych markerów; co najmniej dwie elektrody każdego komponentu, łącznie najwyżej 64 niezależne terminal controls | generuje `interface_pairs`, `outer_terminals`, `terminal_observations` |
 | `TerminalLeadExtension.id` | `str`, required | $1$ | unique ID zewnętrznej elektrody, nie nazwa obiektu | `outer_terminals[].id` i exact drive keys |
 | `TerminalLeadExtension.observation_id` | `str`, required | $1$ | unique jawne ID pasywnej obserwacji device endpointu | `terminal_observations[].id` |
 | `TerminalLeadExtension.object_id` | `str`, required | $1$ | immutable właściciel; planner nadal sprawdza rzeczywisty object segment | `terminal_observations[].object_id` |
-| `TerminalLeadExtension.boundary_markers` | `tuple[int,...]`, required | $1$ | dodatnie, unikalne i istniejące; wszystkie wybrane faces są actual exterior; żadnego fallbacku | wyłącznie rozwiązanie actual cap faces do stable-ID triples |
+| `TerminalLeadExtension.boundary_markers` | `tuple[int,...]`, required | $1$ | positive native int32 bez bool, niepuste i unikalne, bounded 4194304; istnienie/actual exterior sprawdzane dopiero na siatce; żadnego fallbacku | deklaracja zachowana w `external_lead_preparation.extensions`; po przygotowaniu actual cap faces do stable-ID triples |
 | `TerminalLeadExtension.length_m` | `float`, required | $\mathrm m$ | finite positive; rozszerzenie objętości, nie deklaracja błędu truncacji | rzeczywiste `lead_mesh.nodes` |
 | `TerminalLeadExtension.outward_direction_xyz` | `tuple[float,float,float]`, required | $1$ | finite unit, zgodny z outward normals; bez cichej normalizacji | rzeczywiste `lead_mesh.nodes`, kierunek zachowany w receipt |
 | `TerminalLeadExtension.conductivity_spm` | `float`, required | $\mathrm{S\,m^{-1}}$ | finite positive, jawna stała danego leadu; bez `inherit` | `lead_conductivity_spm_per_element` w rzeczywistym cell order |
@@ -5071,8 +5142,9 @@ JSON/NPZ/source round-trip oraz odmowy niepełnych caps, winding-two star,
 brakujących IDs, złego kierunku, overflow i niecertyfikowanej separacji.
 SHA-256 helpera `26970db59898c1a92ef9f5a4054d18636ccd663882efda1b8345a02dcfd632e0`,
 regresji `e2d7a4e68320f8cb79e14dbfee6324d160ef72f5895feff5749f6c4adb9f6c8c`.
-Nie jest to publikacja publicznego konstruktora, podłączenie wszystkich węzłów
-UI ani wykonanie native. Native V/RT0/H przygotowanego modelu, zbieżność i
+Historyczny dowód 08.10 nie obejmował publicznego konstruktora; aktualny
+kontrakt authoringu i jego osobne dowody opisano powyżej. Nadal nie jest to
+podłączenie wszystkich węzłów UI ani wykonanie native. Native V/RT0/H przygotowanego modelu, zbieżność i
 qualification pozostają `NOT VERIFIED`.
 
 (antenna-current-source-materialization)=
@@ -5893,7 +5965,12 @@ evidence and cannot promote a capability lane.
 | `apps/control-room/src/kernel/resources/antennaResources.ts` | `antennaInspectionPayloadEtag` | expected binary ETag z dokładnego ordered owner tuple; runtime/browser niewykonane dla nowej kontroli |
 | `docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md` | `DOC-ANCHOR:antenna-inspection-display-carrier` | kontrakt SI, ownership, display i opcjonalnej retencji ordered node tags |
 | `docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md` | `DOC-ANCHOR:antenna-straight-lead-preparation` | planned private straight-stub input, explicit currents i conservative refusal; nie closed circuit |
-| `packages/fullmag-py/src/fullmag/meshing/_antenna_external_lead_preparation.py` | `TerminalLeadExtension`, `prepare_antenna_external_lead_source` | prywatna jawna preparacja actual cap → Tet4 leads i strict source MeshIR; bez solve |
+| `packages/fullmag-py/src/fullmag/model/current_transport.py` | `TerminalLeadExtension`, `ExternalLeadPreparation` | publiczna SI-clean deklaracja, strict intent i jawne prepare na actual mesh; nie solved source |
+| `packages/fullmag-py/src/fullmag/meshing/_antenna_external_lead_preparation.py` | `prepare_antenna_external_lead_source` | prywatna jawna preparacja actual cap → Tet4 leads i strict source MeshIR; bez solve |
+| `packages/fullmag-py/src/fullmag/runtime/scene_document.py` | `_decode_external_lead_preparation` | ścisły decoder sceny z default layers=2; brak unknown-field fallbacku |
+| `packages/fullmag-py/src/fullmag/runtime/script_builder.py` | `_render_external_lead_preparation_payload` | kanoniczny publiczny Python bez generowania siatki |
+| `crates/fullmag-ir/src/antenna_lead_preparation.rs` | `ExternalLeadPreparationIR` | kanoniczna authored deklaracja bez mesh, solved digestu i certyfikatu closure |
+| `scripts/verify_antenna_lead_authoring.py` | `LeadAuthoringChecks` | wykonane 9/9 interpretowanych authoring/round-trip/mesh-exact kontroli; nie Rust ani native solve |
 | `scripts/verify_antenna_external_lead_preparation.py` | `LeadPreparationChecks` | 11/11 interpretowanych PASS, actual Gmsh microstrip/taper, lineage, prądy i odmowy; nie kwalifikacja pola |
 | `packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py` | `_owned_vertex_identity` | walidacja i immutable copy actual ordered positive unique u64 IDs; bez zmiany MeshIR |
 | `packages/fullmag-py/src/fullmag/meshing/_gmsh_extraction.py` | `_extract_mesh_data` | zachowanie rzeczywistych ordered Gmsh tags, nie ordinal fallback |

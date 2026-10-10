@@ -2058,6 +2058,7 @@ mod tests {
             solver: charge_solver.clone(),
             conservative_current_view: None,
             conservative_current_source: None,
+            external_lead_preparation: None,
             structured_current_closure: None,
         };
         ResolvedSpinTransportPlanIR {
