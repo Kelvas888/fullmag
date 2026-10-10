@@ -11,7 +11,10 @@ import fullmag as fm
 from fullmag import world
 from fullmag.model.physics_scope import build_physics_graph
 from fullmag.runtime.loader import load_problem_from_script
-from fullmag.runtime.scene_document import build_scene_document_from_builder
+from fullmag.runtime.scene_document import (
+    build_builder_from_scene_document,
+    build_scene_document_from_builder,
+)
 from fullmag.runtime.script_builder import (
     _stage_signature,
     export_builder_draft,
@@ -54,6 +57,15 @@ class AuxiliaryObjectIdentityTests(unittest.TestCase):
         self.assertEqual(objects[0]["object_id"], "legacy")
         self.assertEqual(objects[0]["name"], "legacy")
         self.assertEqual(objects[0]["geometry_id"], "legacy")
+
+    def test_scene_identity_and_name_are_not_coerced_to_strings(self):
+        item = {"id": "antenna-id", "name": "Antenna", "role": "antenna"}
+        for field, values in (("id", (42, True, None)), ("name", (42, True, None))):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    changed = {**item, field: value}
+                    with self.assertRaisesRegex(ValueError, "must be a string"):
+                        build_builder_from_scene_document({"objects": [changed]})
 
     def test_all_public_wrappers_preserve_explicit_identity_and_geometry_name(self):
         for index, constructor in enumerate(self.constructors()):

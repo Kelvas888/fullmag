@@ -1708,9 +1708,35 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
     }
     geometries: list[dict[str, Any]] = []
 
+    object_ids: set[str] = set()
+    geometry_names: set[str] = set()
+    magnetic_aliases = {
+        str(obj.get("name") or "").strip() or str(obj.get("id") or "")
+        for obj in scene.get("objects") or []
+        if obj.get("role", "magnet") == "magnet"
+    }
     for obj in scene.get("objects") or []:
-        role = str(obj.get("role") or "magnet")
+        role = str(obj.get("role", "magnet"))
+        if role not in {"magnet", "geometry", "conductor", "electrode", "antenna"}:
+            raise ValueError(f"unsupported scene presentation type '{role}'")
+        object_id = obj.get("id")
+        if not isinstance(object_id, str):
+            raise ValueError("immutable object ID must be a string")
+        if not object_id or object_id.strip() != object_id:
+            raise ValueError("immutable object ID must be nonempty without surrounding whitespace")
+        raw_name = obj.get("name", "")
+        if not isinstance(raw_name, str):
+            raise ValueError("geometry name must be a string")
+        name = raw_name.strip() or object_id
         is_auxiliary = role != "magnet"
+        if object_id in object_ids:
+            raise ValueError(f"duplicate immutable object ID '{object_id}'")
+        if name in geometry_names:
+            raise ValueError(f"ambiguous geometry name '{name}'")
+        if is_auxiliary and object_id in magnetic_aliases:
+            raise ValueError("auxiliary ID conflicts with a magnetic name alias")
+        object_ids.add(object_id)
+        geometry_names.add(name)
         material_ref = str(obj.get("material_ref") or "")
         if not is_auxiliary and (not material_ref or material_ref not in materials):
             raise ValueError(
@@ -1725,8 +1751,6 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
             )
         geometry = dict(obj.get("geometry") or {})
         geometry_params = dict(geometry.get("geometry_params") or {})
-        object_id = str(obj.get("id") or obj.get("name") or "")
-        name = str(obj.get("name") or obj.get("id") or "")
         transform = dict(obj.get("transform") or {})
         translation = _owner_frame_translation(transform, object_id)
         if any(abs(value) > 0 for value in translation):
@@ -1770,8 +1794,8 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
         )
 
         entry: dict[str, Any] = {
-            "object_id": str(obj.get("id") or obj.get("name") or ""),
-            "name": str(obj.get("name") or obj.get("id") or ""),
+            "object_id": object_id,
+            "name": name,
             "role": role,
             "region_name": obj.get("region_name"),
             "geometry_kind": str(geometry.get("geometry_kind", "")),

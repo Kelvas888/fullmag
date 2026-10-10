@@ -28,6 +28,21 @@ The older public `/v1/live/current/...` tree has been removed. Only
 
 ## 2. Canonical route families
 
+### Pomocniczy inventory grafu fizyki
+
+`GET /v2/sessions/current/model/physics-graph` udostępnia opcjonalne
+`objects` w formacie `physics_object.v1`: immutable `object_id`, autorską
+nazwę, prezentacyjny `type` oraz dokładny `geometry_id` używany przez
+kanoniczny eksport sceny. Ta tabela obejmuje wyłącznie obiekty pomocnicze,
+nie magnetyki; przy pustej kolekcji pole jest pomijane, zgodnie z Python DSL.
+Nie aktywuje solvera na podstawie nazwy/typu i nie zawiera danych siatki lub
+pól. Opcjonalne `label` oraz `material_assignment_ids` nie są uzupełniane
+z domysłu. Nieznana rola lub konflikt właścicieli kończy się odmową
+normalizacji, nie cichym remapowaniem ID. `scene_revision` i existing
+request-context guard pozostają granicą aktualności zasobu. Stan wykonania
+i ograniczenia odbioru opisuje nota 0950, anchor
+`antenna-auxiliary-graph-resource`.
+
 ### Warunek oczekiwanej sesji HTTP (P3a)
 
 Żądania powiązane z sesją mogą przekazać `x-fullmag-session-scope`:

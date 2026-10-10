@@ -10972,6 +10972,18 @@ export interface components {
             solve_domain: components["schemas"]["SceneRegionRef"][];
             source_path: string;
         };
+        /** @description OpenAPI projection only; serialized ownership uses the canonical IR type. */
+        PhysicsGraphObjectResource: {
+            geometry_id: string;
+            label?: string | null;
+            material_assignment_ids?: string[];
+            name: string;
+            object_id: string;
+            schema_version: string;
+            type: components["schemas"]["PhysicsGraphObjectTypeResource"];
+        };
+        /** @enum {string} */
+        PhysicsGraphObjectTypeResource: "geometry" | "ferromagnet" | "conductor" | "electrode" | "antenna";
         PhysicsGraphPresentationResource: {
             family: string;
             label: string;
@@ -10982,6 +10994,7 @@ export interface components {
         PhysicsGraphResource: {
             edges: components["schemas"]["PhysicsGraphEdgeResource"][];
             modules: components["schemas"]["PhysicsGraphModuleResource"][];
+            objects?: components["schemas"]["PhysicsGraphObjectResource"][];
             provenance: components["schemas"]["PhysicsGraphProvenanceResource"];
             /** Format: int64 */
             scene_revision: number;

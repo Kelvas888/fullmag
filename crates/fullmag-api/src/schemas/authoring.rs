@@ -810,10 +810,38 @@ pub struct PhysicsGraphProvenanceResource {
     pub normalizer: String,
 }
 
+/// OpenAPI projection only; serialized ownership uses the canonical IR type.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct PhysicsGraphObjectResource {
+    pub schema_version: String,
+    pub object_id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(rename = "type")]
+    pub object_type: PhysicsGraphObjectTypeResource,
+    pub geometry_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub material_assignment_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PhysicsGraphObjectTypeResource {
+    Geometry,
+    Ferromagnet,
+    Conductor,
+    Electrode,
+    Antenna,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct PhysicsGraphResource {
     pub scene_revision: u64,
     pub schema_version: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schema(value_type = Vec<PhysicsGraphObjectResource>)]
+    pub objects: Vec<fullmag_ir::PhysicsObjectIR>,
     pub modules: Vec<PhysicsGraphModuleResource>,
     pub edges: Vec<PhysicsGraphEdgeResource>,
     pub provenance: PhysicsGraphProvenanceResource,
@@ -824,6 +852,7 @@ impl PhysicsGraphResource {
         Self {
             scene_revision: graph.scene_revision,
             schema_version: graph.schema_version,
+            objects: graph.objects,
             modules: graph
                 .modules
                 .into_iter()

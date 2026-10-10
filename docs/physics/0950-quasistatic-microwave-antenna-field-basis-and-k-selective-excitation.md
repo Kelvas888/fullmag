@@ -2760,6 +2760,87 @@ Nie kompilowano testów jednostkowych, nie wykonywano FEM, FFT ani LLG.
 To nie kwalifikacja żadnej z czterech realizacji ani publikacji tabeli ownerów
 w API. Nie zmieniono równań, jednostek ani aktywacji fizyki.
 
+(antenna-auxiliary-graph-resource)=
+### Pomocniczy inventory w normalizowanym grafie sceny i API
+
+Rustowy `normalize_physics_graph` i istniejący
+GET `/v2/sessions/current/model/physics-graph` zachowują tę samą pomocniczą
+tabelę co `model/physics_scope.py::build_physics_graph`. Nie jest to drugi
+registry całego modelu ani lista magnetyków. Każdy wpis zachowuje immutable
+ID sceny, nazwę i typ prezentacji, a `geometry_id` odpowiada dokładnie nazwie
+geometrii z istniejącego adaptera eksportu, także przy pustej nazwie i fallbacku
+do ID. Otaczające spacje nazwy są usuwane zgodnie z publicznym Python DSL;
+nazwa z samych spacji używa ID. Kolizje sprawdza się po tej normalizacji.
+Zmiana nazwy aktualizuje klucz geometrii, nie immutable ID. ID sceny z
+otaczającymi spacjami jest odrzucane, nigdy automatycznie przycinane.
+Role sceny muszą być dokładnymi tokenami podanymi poniżej: normalizator nie
+zmienia wielkości liter ani nie przycina roli, aby nie aktywować fizyki przez
+naprawę błędnego wejścia. Publiczny konstruktor Python może normalizować
+argumenty przed utworzeniem encji; istniejąca tożsamość encji sceny jest stała.
+
+Pole `objects` jest opcjonalne i pomijane przy pustej tabeli, zgodnie z Python.
+`label` jest opcjonalne, bez dopisywania zastępczej etykiety;
+`material_assignment_ids` jest pustą opcjonalną listą, bo obecny auxiliary
+inventory nie publikuje przypisań materiałowych. Oba pola są bezwymiarowe
+($1$), nie zmieniają `sigma_Spm` ani aktywacji operatora. Nieznany typ,
+puste/duplikowane ID, niejednoznaczna nazwa geometrii lub kolizja auxiliary ID
+z aliasem magnetyka skutkują odmową normalizacji GET (HTTP 409) albo wcześniejszą
+odmową walidacji zapisu sceny PUT (HTTP 400), nie cichą
+zmianą typu albo właściciela. Typy pomocnicze: `geometry`, `conductor`,
+`electrode`, `antenna`; `magnet` pozostaje w oddzielnym inventory magnetycznym.
+
+Realizacja jest backend-neutral; nie zmienia FEM/FDM CPU/GPU capabilities,
+nie tworzy siatki, danych pola ani solved result. API pozostaje cienkim JSON
+z aktualnym `scene_revision`, z zachowaniem istniejącego session-context guard.
+Odbiór wymaga normalizacji sceny, zgodności z faktycznym capture Python,
+OpenAPI i regeneracji klienta oraz rzeczywistego odczytu GET. Kompilacja lub
+obecność `objects` w schemacie nie zastępują tego odczytu. Nie domyka to
+execution-only przygotowania źródła ani standalone solve.
+
+(antenna-auxiliary-graph-http-evidence)=
+### Odbiór pomocniczego inventory — 2026-10-10
+
+Zarządzany `just windows-workspace-build dev dev 3197 auto` zakończył się
+`completed`, exit 0, z istniejącym krótkim targetem `c` w tym samym profilu.
+Native snapshot semantyczny:
+`dc0aa950beb5f8ecf9a91c57540218431fcf2fd15b01d1e002338105c7a1f2ea`;
+zamrożona kopia wejść:
+`d3e0bf9f20bb3a31cde49c6d64abcc5dc74f6acd9a119f442cf34bbceb922e51`.
+Manifest pakietu ma SHA-256
+`25e64837065e88ff44f59a7e0a8f37d2cadeee4d52e799300fb1e55ba6ec9a6e`.
+Zainstalowany Python ma wersję
+`0.1.0.dev20261010+g8dc3d39c7a7f.dirty.sdc0aa950beb5`;
+`scene_document.py` w pakiecie i checkoutcie ma identyczny SHA-256
+`8cabee553e69caa2f8aefab9db9507d9374e738daba35c405cf3c6b5d44b91a7`.
+
+`scripts/verify_antenna_graph_inventory.py::exercise` wykonał rzeczywiste
+POST/PUT/GET na własnym produkcyjnym API i capture publicznego Python DSL:
+**15/15 PASS**, sześć scen poprawnych i dziewięć odmów semantycznych.
+Pokrycie: dwa obiekty anten, wszystkie cztery typy auxiliary, rename bez zmiany
+ID, reorder, trim/fallback nazw, magnetic-only bez pustego `objects`,
+duplikaty ID/geometrii, kolizja z aliasem magnetyka, puste/padded ID oraz
+niepoprawne/padded/uppercase role. Odmowa wymaga diagnostyki odpowiadającej
+konkretnemu błędowi, nie dowolnego HTTP 400/409. Typ nie tworzy modułu fizyki.
+Receipt `f8f0a61a06e74b858477d62dfd0da3e6` jest zapisany w resolverowym
+`runs/<worktree-id>/antenna-graph-inventory/`; własny proces został zamknięty
+i odebrany. Nie dotykano sesji użytkownika.
+
+SHA-256 API przed/po oraz w manifeście pakietu:
+`17ade5109f864131b3016b2b24f6e3076168fc81b82588e0ade52e4945a8b3a7`.
+Verifier:
+`ad4c76327d160fc66d40584333e5c3be8c3d7712c195cafa074feb02934e0871`.
+OpenAPI i klient wygenerowano zarządzanymi receptami: receipts
+`60661ce7e1c2468e9507abc027136e44` i `b1435295487243ec9f522370a3ae01a8`.
+`just check-control-room-production-source`: passed/0, receipt
+`f89be0bfd0cc49a6bc8afd97260ddea0`. To typecheck produkcyjnych źródeł
+frontendu, nie dowód renderowania WebGL ani stabilności Inspectora.
+Interpretowany test `test_scene_identity_and_name_are_not_coerced_to_strings`
+odrzuca liczbowe, boolean i null ID/nazwy bez cichej konwersji.
+
+To dowód kontraktu authoringu i HTTP, nie obliczenia pola. Nie wykonano tu
+meshingu, FEM, LLG, FFT ani kwalifikacji naukowej żadnej z czterech realizacji.
+Execution-only przygotowanie rzeczywistego źródła pozostaje następną granicą.
+
 (antenna-authoring-inventory-execution-separation)=
 ### Obowiązkowe rozdzielenie deklaracji od aktywacji — kontrakt wdrożenia
 
@@ -5821,6 +5902,11 @@ evidence and cannot promote a capability lane.
 | `crates/fullmag-ir/src/object_binding.rs` | `physics_object_geometry_bindings_v03`, `geometry_name_for_physics_object_v03` | typed auxiliary bindings, global ownership validation i exact resolver; brak nowego solvera |
 | `crates/fullmag-plan/src/antenna_field_solve.rs` | `geometry_name_for_object` | dedykowany planner korzysta ze wspólnego resolvera; wykonanie planu wymaga osobnego dowodu |
 | `scripts/verify_antenna_object_binding.py` | `verify` | public Python→production CLI, positive/negative ownership; bez solvera lub live API resource |
+| `crates/fullmag-authoring/src/physics_graph.rs` | `normalize_auxiliary_objects` | pomocniczy inventory sceny zgodny z Python; bez aktywacji fizyki przez typ |
+| `crates/fullmag-api/src/schemas/authoring.rs` | `PhysicsGraphResource::from_graph` | cienka projekcja kanonicznej tabeli; nie transport siatki lub pól |
+| `packages/fullmag-py/src/fullmag/runtime/scene_document.py` | `build_builder_from_scene_document` | nazwy trim/fallback, dokładne string ID, strict role i odmowy kolizji przed capture |
+| `packages/fullmag-py/tests/test_auxiliary_object_identity.py` | `test_scene_identity_and_name_are_not_coerced_to_strings` | wykonana interpretowana odmowa liczbowych/boolean/null ID i nazw; nie native |
+| `scripts/verify_antenna_graph_inventory.py` | `exercise` | inventory przez własne API oraz publiczny capture Python; bez siatek i solvera |
 | `scripts/verify_antenna_mesh_vertex_identity.py` | `VertexIdentityChecks` | 6 interpretowanych checks PASS z rzeczywistym Gmsh, cleanup RED→GREEN, bez native solvera |
 | `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `reject_unqualified_external_lead_source` | jawny source_not_qualified w legacy LLG/spectrum boundaries przed projekcją |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/input.rs` | `with_materialized_external_lead_request` | existing CPU-double ABI request z actual input i jawnie pinned native-v1 jump defaults |

@@ -25217,6 +25217,56 @@
         ],
         "type": "object"
       },
+      "PhysicsGraphObjectResource": {
+        "description": "OpenAPI projection only; serialized ownership uses the canonical IR type.",
+        "properties": {
+          "geometry_id": {
+            "type": "string"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "material_assignment_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "name": {
+            "type": "string"
+          },
+          "object_id": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "string"
+          },
+          "type": {
+            "$ref": "#/components/schemas/PhysicsGraphObjectTypeResource"
+          }
+        },
+        "required": [
+          "schema_version",
+          "object_id",
+          "name",
+          "type",
+          "geometry_id"
+        ],
+        "type": "object"
+      },
+      "PhysicsGraphObjectTypeResource": {
+        "enum": [
+          "geometry",
+          "ferromagnet",
+          "conductor",
+          "electrode",
+          "antenna"
+        ],
+        "type": "string"
+      },
       "PhysicsGraphPresentationResource": {
         "properties": {
           "family": {
@@ -25254,6 +25304,12 @@
           "modules": {
             "items": {
               "$ref": "#/components/schemas/PhysicsGraphModuleResource"
+            },
+            "type": "array"
+          },
+          "objects": {
+            "items": {
+              "$ref": "#/components/schemas/PhysicsGraphObjectResource"
             },
             "type": "array"
           },

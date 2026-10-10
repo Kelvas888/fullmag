@@ -1,5 +1,21 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Aktualny punkt wznowienia — 2026-10-10 (inventory anten w rzeczywistym API):**
+Rustowy graf sceny publikuje auxiliary-only `PhysicsObjectIR` w istniejącym
+GET `model/physics-graph`. ID pozostają niezmienne; nazwy mają wspólny
+trim/fallback, role muszą być kanoniczne, a kolizje są jawnie odrzucane.
+Produkcyjny native Windows build `backend-dev`: completed/0; zaktualizowany
+Python zawiera poprawkę obsługi nazw/ID. Izolowany HTTP + publiczny capture
+Python: **15/15 PASS**, bez zmiany sesji użytkownika. OpenAPI i klient
+zregenerowane; `just check-control-room-production-source`: passed/0,
+receipt `f89be0bfd0cc49a6bc8afd97260ddea0`.
+Dokładne hashe i scope dowodu: nota 0950,
+`DOC-ANCHOR:antenna-auxiliary-graph-http-evidence`.
+Nie jest to obliczenie pola ani zamknięcie T00–T18. Następna granica:
+publiczny typed intent doprowadzeń → execution-only przygotowanie siatki
+źródła → jeden wynik V/RT0/H → publikacja i odbiór V/J/H w UI.
+Kwalifikacja closed-circuit basis, FFT, LLG i czterech lane nadal otwarta.
+
 **Aktualny punkt wznowienia — 2026-10-08 (implementacja przepływu UI → source → display):**
 [Domknięcie end-to-end](2026-10-08-antenna-end-to-end-gap-closure.md) porównuje
 rzeczywisty stan z T04/T05/T06/T14/T15 i rozpisuje kolejność dalszych prac.

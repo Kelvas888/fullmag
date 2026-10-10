@@ -1514,11 +1514,11 @@ fn upsert_interaction(
     }
 }
 
-fn builder_geometry_name_for_object(object: &SceneObject) -> String {
+pub(crate) fn builder_geometry_name_for_object(object: &SceneObject) -> String {
     if object.name.trim().is_empty() {
         object.id.clone()
     } else {
-        object.name.clone()
+        object.name.trim().to_string()
     }
 }
 

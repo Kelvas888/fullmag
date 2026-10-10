@@ -804,6 +804,8 @@ use utoipa::OpenApi;
         crate::schemas::authoring::SceneMaterialResource,
         crate::schemas::authoring::ScenePatchRequest,
         crate::schemas::authoring::PhysicsGraphResource,
+        crate::schemas::authoring::PhysicsGraphObjectResource,
+        crate::schemas::authoring::PhysicsGraphObjectTypeResource,
         crate::schemas::authoring::PhysicsGraphModuleResource,
         crate::schemas::authoring::PhysicsGraphScopeResource,
         crate::schemas::authoring::PhysicsGraphEdgeResource,
