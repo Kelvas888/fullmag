@@ -1,5 +1,31 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Aktualny punkt wznowienia — 2026-10-10 (materializacja kopii wykonawczej):**
+Pełny eksport `Problem.to_ir(include_geometry_assets=True)` przygotowuje
+`ExternalLeadPreparation` na niezależnej siatce oryginalnego przewodnika.
+Actual ordered Gmsh IDs pochodzą z tej samej `MeshData`; raw sink omija cache
+samego MeshIR, zachowując istniejący cache NPZ. Authored model pozostaje
+niezmieniony, kopia wykonawcza oraz mirror grafu otrzymują zgodne źródło.
+W provenance zachowano deklarację i bounded receipt, bez ciężkich arrays.
+CLI waliduje lekki root i stage IRs, ale odracza mesh-dependent planning
+do pełnego eksportu; obejmuje intencję obecną dopiero w późniejszym etapie.
+Interpretowane regresje: **5/5 PASS**, w tym actual Gmsh microstrip/taper
+i ponowne wykorzystanie cache; authoring po zmianie: **9/9 PASS**.
+`just check-cli-source`: passed/0, receipt
+`5b7533947875483a9840202720fa134f`, before/after digest zgodny:
+`8fbcbc5ae10aae41616ed96400e1842913ac496ec41834286261d91c69bc8d53`.
+Niezależny przegląd: brak Blocker/Required w zakresie przyrostu.
+Regresja Rust root/future-stage zapisana, niewykonana i niekompilowana.
+Kontrakt naukowy: nota 0950, `DOC-ANCHOR:antenna-execution-lead-materialization`.
+To **nie** dowód wykonania V/J/H, zbieżności ani nowego UI. Działający
+ostatnio zweryfikowany workspace korzystał z pakietu `97b320d883b55c5df5daa44e5f70196114164c88`.
+Kontrola końcowa wykazała zakończenie tego runu: receipt `completed/0`,
+brak procesów i nasłuchu 3197/8081; nie zamknięto go w ramach tego przyrostu.
+Kolejne bramki: pełny native inspection solve,
+compatible sampling carrier także dla target Object przy shared airbox,
+rzeczywiste J z owned RT0 oraz odbiór V/J/H w API/viewportcie. Zamknięcie
+obwodu, zakwalifikowana baza na amper, FFT/LLG i T00–T18 pozostają otwarte.
+
 **Aktualny punkt wznowienia — 2026-10-10 (jawna deklaracja doprowadzeń):**
 Publiczne `ExternalLeadPreparation` i `TerminalLeadExtension` zachowują intencję
 przed siatką w Python → scena → eksport Python → `ProblemIR`. Deklaracja nie

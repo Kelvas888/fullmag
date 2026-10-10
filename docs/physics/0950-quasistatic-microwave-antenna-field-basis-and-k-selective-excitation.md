@@ -4978,7 +4978,7 @@ FEM H1/cg. Nie aktywuje fizyki przez typ prezentacyjny obiektu.
 | Parametr publiczny | Typ | Wartość domyślna | SI | Walidacja | Znaczenie | Obsługa backendów | Python → ProblemIR |
 |---|---|---|---|---|---|---|---|
 | ExternalLeadPreparation.revision | str | required | $1$ | nonempty UTF-8 bez NUL, do4096bytes | rewizja intencji, nie solved SHA | backend-neutral authoring; prepare FEM CPU/double; execution NOT VERIFIED | current_modules[].definition.external_lead_preparation.revision |
-| ExternalLeadPreparation.extensions | Sequence[TerminalLeadExtension] | required | $1$ | 2–128 typed, unique electrode/observation IDs i globally disjoint bounded markers | jawne selector/length/material/kierunek każdego leadu | backend-neutral authoring; execution materializer missing | current_modules[].definition.external_lead_preparation.extensions |
+| ExternalLeadPreparation.extensions | Sequence[TerminalLeadExtension] | required | $1$ | 2–128 typed, unique electrode/observation IDs i globally disjoint bounded markers | jawne selector/length/material/kierunek każdego leadu | backend-neutral authoring; interpretowana materializacja; native runtime NOT VERIFIED | current_modules[].definition.external_lead_preparation.extensions |
 | ExternalLeadPreparation.drives | Sequence[CurrentSourceDrive] | required | $\mathrm A$ dla currents | nonempty bounded typed, unique drive/port IDs, exact terminalcoverage; componentbalance poactualmesh | jawne signed/zero current controls | backend-neutral authoring; source solve FEM CPU/double niezakwalifikowany | current_modules[].definition.external_lead_preparation.drives |
 | ExternalLeadPreparation.schema_version | str | antenna_external_lead_preparation.v1 | $1$ | tylko wskazana wersja | wersja przedsiatkowej deklaracji | backend-neutral authoring | current_modules[].definition.external_lead_preparation.schema_version |
 | CurrentTransport/StudyBuilder.current_transport/current_transport.external_lead_preparation | ExternalLeadPreparation \| None | None | $1$ | static complete one-way ohmic, no boundaries, terminal_reference FEMH1cg; exclusive source/view/closure | deklaracja przygotowania, nie executionready source | backend-neutral authoring; nierozwiązany intent odmawia execution | current_modules[].definition.external_lead_preparation |
@@ -5006,7 +5006,55 @@ owner ekstrudowania pozostaje prywatny. `.prepare(device_mesh=...)` zwraca
 i `.receipt`; żaden z tych wyników nie zmienia automatycznie deklaracji.
 Po przygotowaniu transport musi zostać jawnie skonstruowany z
 `conservative_current_source=prepared.source` zamiast deklaracji. Docelowy
-execution-only materializer wykona tę zmianę w kopii wykonawczej, nie scenie.
+execution-only materializer wykonuje tę zmianę w kopii wykonawczej, nie scenie;
+native runtime tego przyrostu pozostaje NOT VERIFIED.
+
+(antenna-execution-lead-materialization)=
+#### Materializacja kopii wykonawczej
+
+Przyrost wykonawczy ma używać rzeczywistej, niezależnej siatki jednego
+pełnego obiektu przewodzącego. Selektory terminali i ordered Gmsh IDs pochodzą
+z tej samej `MeshData`, którą serializujemy do assetu przewodnika; nie można
+odtworzyć IDs jako `index+1` z samego MeshIR. Siatka shared-domain magnetyka
+i airboxa pozostaje odrębnym właścicielem. Przygotowanie wymaga jawnego FEM,
+P1, strict/double oraz CPU lub auto; forced GPU nie otrzymuje fallbacku.
+
+Materializer zastępuje `external_lead_preparation` przez
+`conservative_current_source` wyłącznie w wyniku pełnego eksportu IR oraz
+w jego `physics_graph.modules[].family_payload`. Zachowuje authored intent,
+owner obiektu i receipt przygotowania w runtime provenance. Lekki authoring,
+scena i eksport edytowalnego Python pozostają przedsiatkowe. Ponowny eksport
+nie mutuje wcześniej zwróconego wyniku ani obiektów Python.
+
+Istniejący cache NPZ musi zachować actual vertex identity; cache samego
+zserializowanego MeshIR nie wystarcza do przygotowania doprowadzeń. JSON mesh
+bez tego ownera, subregion i wiele obiektów muszą powodować odmowę przed
+solverem. Rozwiązanie problemu V/J/H, kwalifikacja zamknięcia obwodu,
+per-amperowa baza, FFT i LLG pozostają osobnymi bramkami. Ten kontrakt nie
+dodaje nowych równań ani publicznych parametrów; używa parametrów i ograniczeń
+z tabeli `antenna-authored-lead-preparation`.
+
+Właściciel implementacji:
+`packages/fullmag-py/src/fullmag/runtime/antenna_lead_materialization.py::materialize_antenna_lead_preparations`,
+wywoływany przez `Problem.to_ir` tylko przy `include_geometry_assets=True`.
+`build_geometry_assets_for_request` udostępnia raw object mesh sink;
+nie zmienia publicznego MeshIR. Receipt w runtime metadata zawiera małe
+digests/status/counts i authored intent, nie kopię ciężkich node/cell arrays.
+
+CLI `step_utils.rs::requires_antenna_lead_materialization` sprawdza root oraz
+wszystkie stage IRs. `orchestrator.rs::run_script_mode` zachowuje wczesną
+walidację IR/inventory, ale nie ogłasza ukończonego planowania przed siatką.
+Późniejszy pełny eksport i planner pozostają obowiązkowe. Scratch UI uruchamia
+eksportowany skrypt tą samą trasą CLI; sam lekki `export-scene-config`
+nie otrzymał ukrytego meshingu.
+
+Interpretowane `LeadMaterializationChecks`: **5/5 PASS**, w tym full export
+rzeczywistego Gmsh microstripu i taperu, cache NPZ, zgodny mirror grafu,
+unchanged authored builder i izolacja shared asset. Odmowy GPU i override
+sprawdzono przed niezależnym meshingiem helpera; pełny eksport może wcześniej
+przygotować zwykłe geometry assets. Regresja Rust root/future-stage jest
+zapisana, niewykonana i niekompilowana. To nie dowód solve V/J/H, fresh
+workspace/browser lub kwalifikacji fizyki.
 
 Interpretowane sprawdzenie
 `scripts/verify_antenna_lead_authoring.py::LeadAuthoringChecks` wykonano
@@ -5971,6 +6019,10 @@ evidence and cannot promote a capability lane.
 | `packages/fullmag-py/src/fullmag/runtime/script_builder.py` | `_render_external_lead_preparation_payload` | kanoniczny publiczny Python bez generowania siatki |
 | `crates/fullmag-ir/src/antenna_lead_preparation.rs` | `ExternalLeadPreparationIR` | kanoniczna authored deklaracja bez mesh, solved digestu i certyfikatu closure |
 | `scripts/verify_antenna_lead_authoring.py` | `LeadAuthoringChecks` | wykonane 9/9 interpretowanych authoring/round-trip/mesh-exact kontroli; nie Rust ani native solve |
+| `packages/fullmag-py/src/fullmag/runtime/antenna_lead_materialization.py` | `materialize_antenna_lead_preparations` | execution-only independent device/source, authored intent i bounded receipt; interpretowana preparacja, nie solve |
+| `scripts/verify_antenna_lead_materialization.py` | `LeadMaterializationChecks` | 5/5 interpretowanych PASS, actual Gmsh microstrip/taper, cache i immutability; nie native runtime |
+| `crates/fullmag-cli/src/step_utils.rs` | `requires_antenna_lead_materialization` | guard root/future-stage; produkcyjny source-check, bez wykonanej regresji Rust |
+| `crates/fullmag-cli/src/orchestrator.rs` | `run_script_mode` | deferred mesh-dependent antenna planning, wczesna walidacja zachowana; runtime NOT VERIFIED |
 | `scripts/verify_antenna_external_lead_preparation.py` | `LeadPreparationChecks` | 11/11 interpretowanych PASS, actual Gmsh microstrip/taper, lineage, prądy i odmowy; nie kwalifikacja pola |
 | `packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py` | `_owned_vertex_identity` | walidacja i immutable copy actual ordered positive unique u64 IDs; bez zmiany MeshIR |
 | `packages/fullmag-py/src/fullmag/meshing/_gmsh_extraction.py` | `_extract_mesh_data` | zachowanie rzeczywistych ordered Gmsh tags, nie ordinal fallback |

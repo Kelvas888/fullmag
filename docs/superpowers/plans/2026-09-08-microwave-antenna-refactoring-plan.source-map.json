@@ -31,6 +31,7 @@
   "symbols": [],
   "equations": [],
   "sources": [
+    {"id":"antenna-execution-lead-materialization","path":"docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md","symbol":"DOC-ANCHOR:antenna-execution-lead-materialization","responsibility":"Wykonawcza kopia IR, independent mesh/source i authored provenance; 5/5 interpretowanych regresji, bez native solve.","evidence_status":"planned_contract"},
     {"id":"antenna-catalog-asset-owner","path":"crates/fullmag-cli/src/orchestrator.rs","symbol":"read_ready_antenna_stage_outputs","responsibility":"WIP: integralnosc assetu i zgodnosc manifestu przed referencja ready; runtime otwarty.","evidence_status":"source_only"},
     {"id":"antenna-catalog-port-owner","path":"crates/fullmag-runner/src/antenna_stage.rs","symbol":"load_published_antenna_field_solution_for_port","responsibility":"Wspolna integralnosc historycznego wyniku i obecnosc portu; nie aktualnosc modelu.","evidence_status":"source_only"},
     {"id":"antenna-catalog-asset-regression","path":"scripts/test_antenna_catalog_asset_source.py","symbol":"class AntennaCatalogAssetSourceTests","responsibility":"Wykonany source RED2 do GREEN2/2; bez Rust i solvera.","evidence_status":"source_only"},

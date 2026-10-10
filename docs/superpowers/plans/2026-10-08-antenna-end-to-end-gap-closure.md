@@ -1,5 +1,26 @@
 # Anteny mikrofalowe — domknięcie przepływu od geometrii do pola
 
+## Aktualizacja wykonawcza — 10.10.2026
+
+Publiczny typed lead intent i round-trip są zapisane w `97b320d883b55c5df5daa44e5f70196114164c88`.
+Kolejny przyrost podłączył preparację do pełnego eksportu: niezależna raw
+`MeshData` z ordered Gmsh identity → source w execution IR → zgodny mirror
+physics graph, z zachowaniem authored modelu i małego receipt. Regresje
+interpretowane **5/5 PASS** obejmują rzeczywisty microstrip/taper i cache NPZ;
+authoring **9/9 PASS**. CLI source-check passed/0:
+`5b7533947875483a9840202720fa134f`. Scope i ograniczenia:
+nota 0950, `DOC-ANCHOR:antenna-execution-lead-materialization`.
+
+Nie trzeba włączać siatkowania w lekkim `export-scene-config`: aktualna
+trasa scratch UI eksportuje skrypt i uruchamia ten sam CLI. Jego lekki
+preflight odracza planowanie wymagające mesha, zachowując walidację root
+i wszystkich stage IRs. Wykonanie tej nowej ścieżki w native runtime oraz
+browser nadal NOT VERIFIED. Sampling target Object z shared airboxem
+wymaga osobnego, zgodnego carrier; samo dodanie assetu anteny tego nie
+zapewnia. Następnie: actual V/RT0/H, próbkowane J, API i viewport, dopiero
+później qualified closure/basis, FFT i LLG. Historyczne checkpointy poniżej
+nie zastępują tej aktualizacji ani nie zamykają T00–T18.
+
 ## Punkt wznowienia i zakres
 
 To uzupełnienie istniejącego [planu T00–T18](2026-09-08-microwave-antenna-refactoring-plan.md)

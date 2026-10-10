@@ -838,6 +838,18 @@ pub(crate) fn materialize_script_stages(
     )
 }
 
+pub(crate) fn requires_antenna_lead_materialization(config: &ScriptExecutionConfig) -> bool {
+    std::iter::once(&config.ir)
+        .chain(config.stages.iter().map(|stage| &stage.ir))
+        .any(|ir| {
+            ir.current_modules.iter().any(|module| {
+                matches!(module, fullmag_ir::CurrentModuleIR::CurrentTransport {
+                    definition: Some(definition), ..
+                } if definition.external_lead_preparation.is_some())
+            })
+        })
+}
+
 fn reject_direct_minimizer_llg_command(
     algorithm: fullmag_ir::RelaxationAlgorithmIR,
     command: &crate::types::SessionCommand,
@@ -2106,6 +2118,36 @@ mod tests {
         assert!(message
             .contains("antenna field precomputation requires requested_backend='fem'"));
         assert!(!message.contains("not yet executable by the runtime"));
+    }
+
+    #[test]
+    fn antenna_lead_preflight_deferral_checks_root_and_future_stage_intent() {
+        let mut config = ScriptExecutionConfig {
+            antenna_inventory: Default::default(), ir: sample_problem_ir(),
+            shared_geometry_assets: None, default_until_seconds: None,
+            study_pipeline: None, stages: vec![],
+        };
+        assert!(!requires_antenna_lead_materialization(&config));
+        let module = serde_json::from_value(json!({
+            "kind":"current_transport", "name":"charge", "model":"ohmic_poisson", "coupling":"one_way",
+            "domain":[{"object_id":"device"}], "materials":[{"region":{"object_id":"device"},"material":{"sigma_Spm":4e7}}],
+            "boundaries":[], "gauge":"terminal_reference", "solver":{"engine":"cg", "linear":{"relative_tolerance":1e-10,"absolute_tolerance":0.,"max_iterations":100},
+            "operator_version":"fem_charge_conforming_h1_p1.transparent.v1","physical_residual_version":"charge_balance_integrated_l2.v1"},
+            "external_lead_preparation":{"schema_version":"antenna_external_lead_preparation.v1","kind":"isolated_branch_straight_stubs","revision":"r1",
+            "extensions":[{"id":"minus","observation_id":"observe-minus","object_id":"device","boundary_markers":[11],"length_m":1e-6,"outward_direction_xyz":[-1.,0.,0.],"conductivity_spm":4e7},
+            {"id":"plus","observation_id":"observe-plus","object_id":"device","boundary_markers":[12],"length_m":1e-6,"outward_direction_xyz":[1.,0.,0.],"conductivity_spm":4e7}],
+            "drives":[{"id":"drive","port_mode_ref":"port","outer_terminal_currents_a":{"minus":-0.002,"plus":0.002}}]}
+        })).expect("authored lead module");
+        config.ir.current_modules.push(module);
+        assert!(requires_antenna_lead_materialization(&config));
+        let stage_ir = config.ir.clone();
+        config.ir.current_modules.clear();
+        config.stages.push(fullmag_application::script_stage_contract::ScriptExecutionStage {
+            ir: stage_ir, default_until_seconds: None, entrypoint_kind: "flat_workspace".into(), action: None,
+        });
+        assert!(requires_antenna_lead_materialization(&config));
+        config.stages[0].ir.current_modules.clear();
+        assert!(!requires_antenna_lead_materialization(&config));
     }
 
     fn frozen_spins_binding_command(source_scene_revision: u64) -> crate::types::SessionCommand {

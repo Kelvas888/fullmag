@@ -8863,7 +8863,26 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             }
         },
     };
-    let early_preflight_completed = if let Some(early_config) = early_config {
+    if let Some(config) = early_config.as_ref().filter(|config| requires_antenna_lead_materialization(config)) {
+        run_active_preparation_operation(
+            &live_workspace,
+            "script_materialization_failed",
+            "Authored antenna lead validation failed",
+            || {
+                config.antenna_inventory.validate().map_err(anyhow::Error::msg)?;
+                validate_ir(&config.ir)?;
+                for stage in &config.stages {
+                    validate_ir(&stage.ir)?;
+                }
+                Ok(())
+            },
+        )?;
+        live_workspace.push_log(
+            "info",
+            "Antenna lead planning deferred until the independent conductor mesh is materialized",
+        );
+    }
+    let early_preflight_completed = if let Some(early_config) = early_config.filter(|config| !requires_antenna_lead_materialization(config)) {
         let early_stages = run_active_preparation_operation(
             &live_workspace,
             "script_materialization_failed",

@@ -868,6 +868,7 @@ def build_geometry_assets_for_request(
     _realized_domain_mesh_sink: list[
         tuple[object, list[dict[str, object]], object | None]
     ] | None = None,
+    _realized_object_mesh_sink: dict[str, object] | None = None,
 ) -> dict[str, Any] | None:
     if discretization is None:
         return None
@@ -888,7 +889,7 @@ def build_geometry_assets_for_request(
         geometry_object_ids=geometry_object_ids,
         fdm_only=fdm_only,
     )
-    if asset_cache is not None and asset_cache_key in asset_cache:
+    if _realized_object_mesh_sink is None and asset_cache is not None and asset_cache_key in asset_cache:
         cached = asset_cache[asset_cache_key]
         return copy.deepcopy(cached) if _copy_cached_assets else cached
 
@@ -1021,6 +1022,11 @@ def build_geometry_assets_for_request(
                 if mesh_source is None and isinstance(geometry, ImportedGeometry):
                     mesh_source = geometry.source
                 if mesh_source is not None and mesh_source.lower().endswith(".json"):
+                    if _realized_object_mesh_sink is not None:
+                        raise ValueError(
+                            "antenna lead preparation requires actual MeshData vertex identity; "
+                            "a serialized MeshIR JSON cannot supply it"
+                        )
                     emit_progress(
                         f"Preparing FEM mesh asset for '{geometry.geometry_name}' from MeshIR JSON"
                     )
@@ -1112,6 +1118,8 @@ def build_geometry_assets_for_request(
                         f"{mesh.n_boundary_faces} boundary faces"
                     )
                     mesh_ir = mesh.to_ir(geometry.geometry_name)
+                    if _realized_object_mesh_sink is not None:
+                        _realized_object_mesh_sink[geometry.geometry_name] = mesh
                     is_valid = validate_mesh_ir(mesh_ir)
                     if is_valid is False:
                         raise ValueError(
@@ -2968,6 +2976,14 @@ class Problem:
         }
         if physics_objects:
             result["physics_objects"] = physics_objects
+        if include_geometry_assets:
+            from fullmag.runtime.antenna_lead_materialization import materialize_antenna_lead_preparations
+
+            materialize_antenna_lead_preparations(
+                self, result, geometries=geometries, discretization=discretization,
+                mesh_workflow=mesh_workflow,
+                runtime_device_override=runtime_device_override,
+            )
         return result
 
     def to_model_definition(self, *, model_id: str | None = None) -> "ModelDefinition":
