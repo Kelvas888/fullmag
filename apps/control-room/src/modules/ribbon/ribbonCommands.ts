@@ -580,8 +580,8 @@ async function applyGlobalQuantityFromCommand(
     };
   }
 
-  const overlayBeforeQuantityPatch =
-    context.analysisFieldOverlay?.getSnapshot() ?? null;
+  const overlayController = context.analysisFieldOverlay;
+  const overlayBeforeQuantityPatch = overlayController?.getSnapshot() ?? null;
   const patch: VisualizationStatePatch = {
     active_quantity_id: input.activeQuantityId,
     quantity: { active_quantity_id: input.activeQuantityId },
@@ -607,10 +607,11 @@ async function applyGlobalQuantityFromCommand(
   // revision, or payload changes. Treat that object as the overlay generation
   // so a late acknowledgement cannot clear a newer field selected meanwhile.
   if (
+    overlayController &&
     overlayBeforeQuantityPatch &&
-    context.analysisFieldOverlay?.getSnapshot() === overlayBeforeQuantityPatch
+    overlayController.getSnapshot() === overlayBeforeQuantityPatch
   ) {
-    context.analysisFieldOverlay.clear();
+    overlayController.clear();
   }
   return { status: "completed" };
 }

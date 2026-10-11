@@ -54,10 +54,137 @@ function overlayForOwner(
 function visualizationState(revision: number): VisualizationStateResource {
   return {
     active_quantity_id: "H_eff",
+    auto_contrast: true,
+    camera: {
+      fov_degrees: 45,
+      orthographic_scale: null,
+      position: [0, 0, 1],
+      projection: "perspective",
+      target: [0, 0, 0],
+      up: [0, 1, 0],
+    },
+    clip: {
+      enabled: false,
+      axis: "x",
+      flipped: false,
+      position_percent: 50,
+    },
+    colormap: "viridis",
+    contrast_max: null,
+    contrast_min: null,
+    diagnostics: {
+      degraded_reasons: [],
+      warnings: [],
+    },
+    domains: {
+      active_scope: {
+        object_id: null,
+        part_id: null,
+        scope: "full",
+      },
+      topology_mode: "auto",
+      volume_edges_budget: 100_000,
+    },
+    fdm: {
+      x_chosen_size: 0,
+      y_chosen_size: 0,
+    },
+    fem: {},
+    field_component: "magnitude",
+    layers: {
+      airbox: {
+        render_mode: "wireframe",
+        show_airbox: false,
+        show_airbox_vectors: false,
+      },
+      bounds: {
+        visible: false,
+      },
+      points: {
+        visible: false,
+      },
+      primitives: {
+        visible: true,
+      },
+      quantity: {
+        visible: true,
+      },
+      surface: {
+        opacity: 1,
+        visible: true,
+      },
+      vectors: {
+        density: 50,
+        domain: "auto",
+        visible: false,
+      },
+      wireframe: {
+        visible: false,
+      },
+    },
+    max_points: 16_384,
     overrides: [],
-    quantity: { active_quantity_id: "H_eff" },
+    quantity: {
+      active_quantity_id: "H_eff",
+      auto_contrast: true,
+      colormap: "viridis",
+      component: "magnitude",
+      contrast_max: null,
+      contrast_min: null,
+      field_component: "magnitude",
+    },
     revision,
-  } as VisualizationStateResource;
+    sampling: {
+      max_bytes: null,
+      max_glyphs: 16_384,
+      max_points: 16_384,
+      profile: "balanced",
+      progressive: true,
+    },
+    schema_version: 5,
+    slice: {
+      axis: "z",
+      auto_contrast: true,
+      colormap: "viridis",
+      component: "magnitude",
+      layer_index: 0,
+      mode: "single",
+      position_percent: 50,
+      projection_include_air_as_zero: false,
+      projection_reduction: "mean_occupied",
+      projection_resolution: 128,
+      projection_samples: 32,
+      quantity_id: "H_eff",
+      render_mode: "heatmap",
+      show_airbox: false,
+      show_magnetic_texture: true,
+      show_mesh: false,
+      show_primitives: true,
+      show_quantity: true,
+      show_vectors: false,
+      thickness_percent: null,
+    },
+    slice_layer: 0,
+    slice_mode: "single",
+    trim: {
+      x: { enabled: false, max_percent: 100, min_percent: 0 },
+      y: { enabled: false, max_percent: 100, min_percent: 0 },
+      z: { enabled: false, max_percent: 100, min_percent: 0 },
+    },
+    vector_density: 50,
+    vector_glyphs: false,
+    vector_style: {
+      alpha: 1,
+      color_mode: "orientation",
+      ferromagnet_visibility: "hide",
+      length_scale: 1,
+      mono_color: "#00c2ff",
+      thickness: 1,
+    },
+    view_mode: "3d",
+    x_chosen_size: 0,
+    y_chosen_size: 0,
+  } satisfies VisualizationStateResource;
 }
 
 function deferred<T>() {

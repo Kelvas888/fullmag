@@ -735,6 +735,21 @@
       "native_runtime": "NOT VERIFIED",
       "log_sha256": "ed0cda56f8232c8e17316f695a8ccf3cae85c9abd632195b832f4e082c066f51",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38147211342,
+      "sha": "d8081b28754c73a76ca3721c93a790a252bfa6a1",
+      "conclusion": "failure",
+      "scope": "delayed_global_quantity_ACK_overlay_generation",
+      "tests_passed": 143,
+      "test_files": 11,
+      "new_ACK_regressions_passed": 4,
+      "architecture": "passed",
+      "typecheck": "failure:TS2352 new test minimal VisualizationStateResource fixture missing required fields",
+      "React_Doctor": "failure:617 diagnostic semantics unchanged vs38145183697",
+      "log_sha256": "d7ccac1011e46875a5b3cdf857cf50707acf22d64ac7f7407b51b442b07ef113",
+      "browser": "NOT VERIFIED",
+      "qualification_claimed": false
     }
   ]
 }
