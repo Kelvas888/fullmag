@@ -31,6 +31,8 @@ requireOrdered(spawn, ["let result = current_live_publisher_loop(", "worker_stop
 const loop = live.slice(live.indexOf("fn current_live_publisher_loop("), live.indexOf("fn owner_session_lost("));
 assert(loop.includes("while !stopping.load(Ordering::Acquire) && pending.swap"), "stop must retire stale delta retries");
 checks++;
+assert(!/\breturn\s*;/.test(loop), "Result-returning publisher must report every exit through its owned completion receipt");
+checks++;
 const terminal = loop.slice(loop.indexOf("    if stopping.load(Ordering::Acquire) || pending.swap"));
 requireOrdered(terminal, ["build_pending_payload_from_workspace", "let mut snapshot", "if stopping.load(Ordering::Acquire)", "full_sync(&session_id, &snapshot)", "published?;", "return Ok(())"], "canonical terminal snapshot before real HTTP ACK");
 const end = orchestrator.slice(orchestrator.indexOf("    let finished_at_unix_ms = unix_time_millis()?;", orchestrator.indexOf("let synthetic_completed_at_unix_ms")));

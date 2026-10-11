@@ -5314,7 +5314,7 @@ fn current_live_publisher_loop(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
         if owner_session_lost(&session_id, enable_api_fallback) {
-            return;
+            return Err(anyhow!("live publication session owner changed"));
         }
         if !coalesce_delay.is_zero() {
             std::thread::sleep(coalesce_delay);
