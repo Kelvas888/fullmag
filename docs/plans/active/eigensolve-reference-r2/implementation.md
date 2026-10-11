@@ -931,3 +931,12 @@ Spectrum scope4060116242 pozostaje rzeczywistą luką Python→OutputIR. Zachowa
 Nestedfixture poprawiona po dokładnym źródłowym porównaniu generated schemas lokalnych i remote cfabf405 (blob b3470c7e55843b4c3f8044c54e46dc068d8a0b5e). Top-level/domain/FEM/layers/quantity/slice/trim są jawnie zgodne; wszystkie4 behavioral assertions zachowane, bez casts/generated changes. Pełny typecheck wymaga ponownego GHA.
 
 #38148168315 na5e0117aa74cb83d5a0d5e8643bea8453c2be4c1a:143tests/11files (4ACK) PASS, pełny typecheck i architecture PASS. Doctor617 diagnostics semantycznie zgodne z38147674127 po pominięciu tylko pozycji; pełny workflow FAIL, bez waiver. Poprawka overlayu zakończona źródłowo, browser pozostaje NOT VERIFIED. Poprzednie fixture FAIL zachowane. P0–P10 nadal częściowe, bez promocji runtime/nauki.
+
+
+## Kolejne uwagi GitHub i historia definicji
+
+Refresh780 timeline entries dał4 nowe actionable findings; rejestr321. Adaptive Pause/Stop powtarza wcześniejsze dwa zgłoszenia. Stage source-ref histerezy, trwałe absolute workerlog paths i authoring-history po definition mutation wymagają odrębnych korekt.
+
+4241893351: import/pin/unpin po successfulACK i session fence czyszczą revision-stale authoringHistory, przed resource invalidation. Noop już istniejącego pinu, rejection i obsolete-session ACK nie czyszczą historii.10 regresji korzysta z rzeczywistego AuthoringHistoryController z poprawnym typed SceneResource; source/diff review PASS, scoped GHA wymagane.
+
+Weryfikacja native:4 zielone modal-phase CTest nie obejmowały mixed dense descriptor ani rtol0 sentinel. Istniejący floquet-modal-slepc dispatch #38149497927 potwierdzony in_progress na exact fdf811f10ba90d87861ceac67a5b81fc385cc6c1. GitHub przyjmuje branch/tag ref, nie bareSHA w dispatch; sourceSHA zweryfikowano po ACK. Brak terminalnego wyniku. Private/runtime loader attestation pozostaje oddzielną bramką fem-cpu-slepc-modal-v1.

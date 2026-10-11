@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 
+import type { SceneResource } from "@/kernel/api/apiTypes";
+import { AuthoringHistoryController } from "@/kernel/authoring/AuthoringHistoryController";
+
 import { ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH } from "@/kernel/api/apiPaths";
 import { MAX_REFERENCE_POINTS } from "@/shared/domain/analysis/referenceImport";
 
@@ -62,6 +65,7 @@ function savedModeDefinition(
 function commandContext(
   definitions: readonly ReturnType<typeof savedModeDefinition>[],
   create = vi.fn(),
+  authoringHistory?: AuthoringHistoryController,
 ) {
   const list = vi.fn().mockResolvedValue({ definitions, scene_revision: 11 });
   const invalidate = vi.fn();
@@ -70,6 +74,7 @@ function commandContext(
       api: { analysis: { postprocessing: { definitions: { list, create } } } },
       selection: { get: () => modeSelection() },
       resources: { invalidate },
+      authoringHistory,
     } as never,
     create,
     invalidate,
@@ -379,4 +384,75 @@ describe.each(scopedCommands)("postprocessing command session scope: %s", (comma
     expect(fixture.mutation).toHaveBeenCalledTimes(1);
     expect(fixture.invalidate).not.toHaveBeenCalled();
   });
+});
+
+
+function seededAuthoringHistory() {
+  const before = { editor: { marker: "before" }, revision: 10 } satisfies SceneResource;
+  const after = { editor: { marker: "after" }, revision: 11 } satisfies SceneResource;
+  const history = new AuthoringHistoryController(
+    { model: { scene: vi.fn().mockResolvedValue(after), commitTransaction: vi.fn() } },
+    { invalidate: vi.fn() } as never,
+  );
+  history.record({ before, after, label: "Edit geometry", committedRevision: 11 });
+  expect(history.canUndo()).toBe(true);
+  return history;
+}
+
+describe.each(scopedCommands)("postprocessing mutation history invalidation: %s", (commandId) => {
+  it("clears revision-stale undo entries after an acknowledged definition mutation", async () => {
+    const fixture = scopedCommandFixture(commandId);
+    const history = seededAuthoringHistory();
+    const generation = history.getGeneration();
+    const result = await fixture.command.run({ ...fixture.context, authoringHistory: history } as never);
+    expect(result.status).toBe("completed");
+    expect(history.canUndo()).toBe(false);
+    expect(history.canRedo()).toBe(false);
+    expect(history.getGeneration()).toBe(generation + 1);
+  });
+
+  it("preserves history when the mutation fails before its acknowledgement", async () => {
+    const fixture = scopedCommandFixture(commandId);
+    const history = seededAuthoringHistory();
+    const generation = history.getGeneration();
+    fixture.mutation.mockRejectedValueOnce(new Error("mutation rejected"));
+    try {
+      const result = await fixture.command.run({ ...fixture.context, authoringHistory: history } as never);
+      expect(result.status).toBe("failed");
+    } catch (error) {
+      expect(error).toEqual(new Error("mutation rejected"));
+    }
+    expect(history.canUndo()).toBe(true);
+    expect(history.getGeneration()).toBe(generation);
+  });
+
+  it("does not clear history after an acknowledgement for an obsolete session", async () => {
+    const fixture = scopedCommandFixture(commandId);
+    const history = seededAuthoringHistory();
+    const generation = history.getGeneration();
+    const acknowledgement = deferred<{ definition: { label: string }; scene_revision: number }>();
+    const submitted = deferred<void>();
+    fixture.mutation.mockImplementationOnce(() => {
+      submitted.resolve();
+      return acknowledgement.promise;
+    });
+    const pending = fixture.command.run({ ...fixture.context, authoringHistory: history } as never);
+    await submitted.promise;
+    fixture.expire();
+    acknowledgement.resolve({ definition: { label: "Reference" }, scene_revision: 12 });
+    expect((await pending).status).toBe("cancelled");
+    expect(history.canUndo()).toBe(true);
+    expect(history.getGeneration()).toBe(generation);
+  });
+});
+
+it("does not clear authoring history for an already pinned mode", async () => {
+  const history = seededAuthoringHistory();
+  const fixture = commandContext([savedModeDefinition("7")], vi.fn(), history);
+  const command = pinCommand();
+  if (!command) throw new Error("Pin command is not registered");
+  const result = await command.run(fixture.context);
+  expect(result.status).toBe("completed");
+  expect(fixture.create).not.toHaveBeenCalled();
+  expect(history.canUndo()).toBe(true);
 });

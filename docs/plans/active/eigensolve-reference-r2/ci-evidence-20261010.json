@@ -777,6 +777,16 @@
       "log_sha256": "8da2b4f4f7dd7822fee28a6089828e9a0000ac6a55c0fadc403a728a7959f4c0",
       "browser": "NOT VERIFIED",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38149497927,
+      "sha": "fdf811f10ba90d87861ceac67a5b81fc385cc6c1",
+      "conclusion": "pending",
+      "scope": "floquet-modal-slepc",
+      "dispatch": "bootstrap.yml contract_scope=floquet-modal-slepc",
+      "head_sha_verified_after_ACK": true,
+      "private_runtime_attestation": "NOT VERIFIED",
+      "qualification_claimed": false
     }
   ]
 }

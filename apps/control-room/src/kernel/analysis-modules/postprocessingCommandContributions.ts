@@ -92,6 +92,7 @@ async function importDispersionReference(context: CommandContext): Promise<Comma
     }, options);
     const obsoleteAfterWrite = obsoleteSessionResult(context);
     if (obsoleteAfterWrite) return obsoleteAfterWrite;
+    context.authoringHistory?.clear();
     try {
       context.resources?.invalidate(ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH, created.scene_revision);
     } catch {
@@ -155,6 +156,7 @@ async function pinModeVisualization(context: CommandContext): Promise<CommandRes
   }, options);
   const obsoleteAfterWrite = obsoleteSessionResult(context);
   if (obsoleteAfterWrite) return obsoleteAfterWrite;
+  context.authoringHistory?.clear();
   context.resources?.invalidate(ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH, created.scene_revision);
   return { message: `Pinned ${created.definition.label}.`, status: "completed" };
 }
@@ -182,6 +184,7 @@ async function unpinDefinition(context: CommandContext): Promise<CommandResult> 
   }, options);
   const obsoleteAfterWrite = obsoleteSessionResult(context);
   if (obsoleteAfterWrite) return obsoleteAfterWrite;
+  context.authoringHistory?.clear();
   context.resources?.invalidate(ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH, removed.scene_revision);
   return { message: "Pinned visualization removed.", status: "completed" };
 }
