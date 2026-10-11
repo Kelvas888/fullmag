@@ -656,12 +656,48 @@ class ContainerClientTests(unittest.TestCase):
             with patch.object(container_client.time, "sleep", return_value=None):
                 with self.assertRaisesRegex(
                     container_client.ContainerClientError,
-                    "remains unverified after 3 bounded authenticated health checks",
+                    "remains unverified after 60 bounded authenticated health checks",
                 ):
                     container_client.start(self.layout, "alice", docker_call=docker)
         self.assertEqual(container_client.STARTUP_HEALTH_ATTEMPTS, request.call_count)
         self.assertIn(["start", CONTAINER_ID], docker.calls)
         self.assertFalse(any(call[0] in {"stop", "rm", "kill", "prune"} for call in docker.calls))
+
+    def test_cold_start_can_confirm_profiles_after_ten_seconds(self):
+        self.configure()
+        docker = FakeDocker(self.storage)
+        clock = [0.0]
+        def health(*args, **kwargs):
+            return healthy_profiles() if clock[0] >= 10.0 else {'ok': True}
+        def sleep(seconds):
+            clock[0] += seconds
+        with patch.object(container_client.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(container_client.time, 'sleep', side_effect=sleep), \
+                patch.object(container_client, 'request', side_effect=health) as rpc:
+            result = container_client.start(self.layout, 'alice', docker_call=docker)
+        self.assertEqual('active', result['profile_activation']['status'])
+        self.assertEqual(11, rpc.call_count)
+        self.assertFalse(any(call[0] in {'stop', 'rm', 'kill', 'prune'} for call in docker.calls))
+
+    def test_slow_health_requests_share_the_total_startup_deadline(self):
+        self.configure()
+        docker = FakeDocker(self.storage)
+        clock = [0.0]
+        def health(*args, **kwargs):
+            self.assertGreater(kwargs['timeout'], 0)
+            self.assertLessEqual(kwargs['timeout'], 60.0 - clock[0])
+            clock[0] += kwargs['timeout']
+            raise container_client.ContainerClientError('health timed out')
+        def sleep(seconds):
+            clock[0] += seconds
+        with patch.object(container_client.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(container_client.time, 'sleep', side_effect=sleep), \
+                patch.object(container_client, 'request', side_effect=health) as rpc:
+            with self.assertRaisesRegex(container_client.ContainerClientError, 'within 60 seconds'):
+                container_client.start(self.layout, 'alice', docker_call=docker)
+        self.assertEqual(60.0, clock[0])
+        self.assertLess(rpc.call_count, container_client.STARTUP_HEALTH_ATTEMPTS)
+        self.assertFalse(any(call[0] in {'stop', 'rm', 'kill', 'prune'} for call in docker.calls))
 
     def test_explicit_replace_applies_new_profile_list_only_after_quiescent_replacement(self):
         initial = self.configure()

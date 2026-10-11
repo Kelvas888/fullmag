@@ -636,6 +636,29 @@
       "log_sha256": "a411fd9b4f738595127cdf12fb21ec35576c365f6a1ff9edf1edaf50a09c06a9",
       "host_cleanup_performed": false,
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38142944158,
+      "sha": "a511d35d068d550cdb989aeac058654ede197939",
+      "conclusion": "success",
+      "scope": "output_publication_with_completed_sweep_count_guard",
+      "tests_passed": 25,
+      "actual_tracked_bias_pipeline_with_incomplete_completed_negative_case": "passed",
+      "log_sha256": "b857d1ca5e5229e3695b3a7aa3f6cc6d4150f2e153784b7005ebeda26147fc52",
+      "qualification_claimed": false
+    },
+    {
+      "run_id": 38142989199,
+      "sha": "3182d6b10ff2cb93bd2f3669433a3d5d4898e5dc",
+      "conclusion": "success",
+      "scope": "retention_source_contracts_Linux_Windows",
+      "retention_tests_run_per_platform": 99,
+      "Linux_retention_skips": 1,
+      "Windows_retention_skips": 4,
+      "new_forced_tick_regression": "passed on both platforms",
+      "log_sha256": "69aaaa141389d095149cfaf7a6230bcc641d2e093f69138ef9769790139c8ba4",
+      "host_cleanup_performed": false,
+      "qualification_claimed": false
     }
   ]
 }

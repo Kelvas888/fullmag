@@ -875,3 +875,12 @@ Częste terminalne buildy wywołują force tick przed regularnym interval; wcze�
 #38142322832:retention Linux SUCCESS, Windows FAIL w dwóch wcześniejszych fixture oczekujących actualDocker probe; nowa forced-tick regression PASS na obu. Fixture mockuje wyłącznie Docker-root telemetry (osobne admission tests pozostają), nadal rzeczywiste temp inventory/lock/queue i5s bounded join. Zapisano FAIL; rerun wymagany.
 
 Dodatkowy guard poprawności finalizacji: inferred/explicit Completed sweep z liczbą runów inną niż sample_count odmówiony przed publikacją; jawny Paused/Cancelled prefix nadal legalny. Nowa negative regression musi przejść w GHA. To zapobiega ukryciu brakującej próbki po rozszerzeniu selector plan universe.
+
+
+## Potwierdzone countguard i retention; readiness i pairpolicy
+
+#38142944158 scoped output workflow SUCCESS25tests; actualtrackedbias sprawdził także odmowę incompleteCompleted. #38142989199retention Linux/Windows SUCCESS;99retentiontests/platform,skips1/4; opt-in i executor/reference/cleanup guard suite zachowane. Nie wykonano cleanup hosta.
+
+4240898368:shared monotonic deadline60s, perHTTPtimeout5s ograniczony remaining; maks60 attempts,1s waits ograniczone remaining; błędnyprofil kończy natychmiast, brak cleanup/replacement. Fakeclock potwierdza cold-start10s oraz totaldeadline wolnychrequests; AST/source PASS,GHA pending.
+
+4240898364:policy-only correction względem naukowego właściciela0600 i actual shared-domain owner eigen_mass_metric canonical_shared_domain_phases. Empty=all już supported w runtime; explicit proper subset nie jest supported przy assembler unionallpairs i phase graph. Helper rozpoznaje emptyall/fullset; planner dynamiclane odrzuca subset bez względu na obecnośćcontrols. Generic/scalarFloquet filtrowanie pozostaje. Niezależny source review potwierdził invariant; publicplanner emptycontrols/subsetwithwithoutcontrols oraz existinggeneric regressions przygotowane. Runtime/science NOT VERIFIED; nie rozszerzono deklaracji capability do subset.

@@ -74,8 +74,10 @@ _PROFILE_LISTS = (
     CURRENT_CONTRACT_PROFILES,
     SLEPC_MODAL_PROFILES,
 )
-STARTUP_HEALTH_ATTEMPTS = 3
-STARTUP_HEALTH_RETRY_SECONDS = 0.25
+STARTUP_HEALTH_ATTEMPTS = 60
+STARTUP_HEALTH_RETRY_SECONDS = 1.0
+STARTUP_HEALTH_TIMEOUT_SECONDS = 60.0
+STARTUP_HEALTH_REQUEST_TIMEOUT_SECONDS = 5.0
 
 
 def _known_profile_list(value: object) -> bool:
@@ -950,11 +952,20 @@ def _verify_startup_profile_activation(
     owner: str,
     public: Mapping[str, object],
 ) -> tuple[object, dict[str, Any]]:
-    """Wait briefly for health, then require an exact observed profile set."""
+    """Bound startup by a wall-clock deadline and require the exact profile set."""
     last_reason = "Coordinator health did not confirm the configured profile list."
+    deadline = time.monotonic() + STARTUP_HEALTH_TIMEOUT_SECONDS
+    checks = 0
     for attempt in range(STARTUP_HEALTH_ATTEMPTS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        checks += 1
         try:
-            health = request(layout, owner, "GET", "/health")
+            health = request(
+                layout, owner, "GET", "/health",
+                timeout=min(STARTUP_HEALTH_REQUEST_TIMEOUT_SECONDS, remaining),
+            )
             activation = _profile_activation(public, health)
         except ContainerClientError as error:
             health = None
@@ -974,10 +985,13 @@ def _verify_startup_profile_activation(
             )
         last_reason = str(activation["reason"])
         if attempt + 1 < STARTUP_HEALTH_ATTEMPTS:
-            time.sleep(STARTUP_HEALTH_RETRY_SECONDS)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(STARTUP_HEALTH_RETRY_SECONDS, remaining))
     raise ContainerClientError(
         "Coordinator profile activation remains unverified after "
-        f"{STARTUP_HEALTH_ATTEMPTS} bounded authenticated health checks; "
+        f"{checks} bounded authenticated health checks within "
+        f"{STARTUP_HEALTH_TIMEOUT_SECONDS:g} seconds; "
         f"no automatic stop or replacement was attempted. {last_reason}"
     )
 
