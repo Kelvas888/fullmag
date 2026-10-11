@@ -3893,13 +3893,19 @@ pub async fn get_authoring_script_source(
 pub async fn sync_authoring_script(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ScriptSyncRequest>,
-) -> Result<Json<ScriptSyncResponse>, ApiError> {
+) -> Result<(axum::http::HeaderMap, Json<ScriptSyncResponse>), ApiError> {
     let request_context = crate::capture_current_live_request_context(&state).await?;
     let _transition = state.current_live_session_transition.lock().await;
     crate::validate_current_live_request_context(&state, &request_context).await?;
     let response = crate::script::sync_current_live_script_with_request(&state, req).await?;
     crate::validate_current_live_request_context(&state, &request_context).await?;
-    Ok(Json(response))
+    let current = state.current_live_state.read().await;
+    let snapshot = current.as_ref().ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    let scope = crate::current_live_publisher_scope_header(&state, snapshot);
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(crate::router_v2::middleware::session_scope::HEADER_NAME,
+        axum::http::HeaderValue::from_str(&scope).map_err(|error| ApiError::internal(error.to_string()))?);
+    Ok((headers, Json(response)))
 }
 
 fn apply_scene_merge_patch(

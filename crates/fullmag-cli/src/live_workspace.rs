@@ -1629,12 +1629,14 @@ impl CurrentLivePublisher {
             // time-to-first-step on the Windows Docker lane.
             return Self::disabled();
         }
+        let scope = Arc::new(crate::control_room::live_publisher_scope::LivePublisherScope::new(session_id));
+        let delta_scope = Arc::clone(&scope);
         Self::spawn_with_sinks(
             session_id,
             std::time::Duration::ZERO,
             true,
-            Arc::new(sync_current_live_delta),
-            Arc::new(sync_current_live_snapshot),
+            Arc::new(move |id, payload| sync_current_live_delta(id, payload, &delta_scope)),
+            Arc::new(move |id, payload| sync_current_live_snapshot(id, payload, &scope)),
         )
     }
 

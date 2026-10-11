@@ -660,7 +660,7 @@ fn run(
                             == Some(command_id.as_str())
                         {
                             match render_current_scene(&client, &api_base) {
-                                Ok(script_path) => {
+                                Ok((script_path, publisher_scope)) => {
                                     if current_session_matches(
                                         &client,
                                         &api_base,
@@ -676,6 +676,7 @@ fn run(
                                             &session_id,
                                             &backend,
                                             &script_path,
+                                            &publisher_scope,
                                         ) {
                                             Ok(next_child) => {
                                                 eprintln!(
@@ -950,7 +951,7 @@ fn pending_compute_command(client: &Client, api_base: &str) -> Option<String> {
         })
 }
 
-fn render_current_scene(client: &Client, api_base: &str) -> anyhow::Result<PathBuf> {
+fn render_current_scene(client: &Client, api_base: &str) -> anyhow::Result<(PathBuf, String)> {
     let response = client
         .post(format!("{api_base}/v2/sessions/current/model/syncs"))
         .timeout(MODEL_SYNC_TIMEOUT)
@@ -966,13 +967,19 @@ fn render_current_scene(client: &Client, api_base: &str) -> anyhow::Result<PathB
         return Err(anyhow::Error::new(error)
             .context(format!("model sync returned {status}: {}", detail.trim(),)));
     }
+    let scope = response.headers().get(crate::control_room::live_publisher_scope::HEADER_NAME)
+        .ok_or_else(|| anyhow::anyhow!("model sync did not acknowledge publisher session scope"))?
+        .to_str()?.to_string();
+    let parsed = crate::control_room::live_publisher_scope::parse_expected_session_scope(&scope)
+        .map_err(anyhow::Error::msg)?;
+    parsed.validate(&parsed.session_id)?;
     let body = response.json::<Value>()?;
     let path = body
         .get("script_path")
         .and_then(Value::as_str)
         .filter(|path| !path.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("model sync did not return script_path"))?;
-    Ok(PathBuf::from(path))
+    Ok((PathBuf::from(path), scope))
 }
 
 fn bootstrap_owner_is_current(client: &Client, api_base: &str, owner: &BootstrapOwner) -> bool {
@@ -998,7 +1005,11 @@ fn spawn_attached_runtime(
     session_id: &str,
     backend: &str,
     script_path: &PathBuf,
+    publisher_scope: &str,
 ) -> anyhow::Result<Child> {
+    let scope = crate::control_room::live_publisher_scope::parse_expected_session_scope(publisher_scope)
+        .map_err(anyhow::Error::msg)?;
+    scope.validate(session_id)?;
     let mut command = Command::new(executable);
     command
         .arg(script_path)
@@ -1011,6 +1022,7 @@ fn spawn_attached_runtime(
         .arg("double")
         .env("FULLMAG_API_PORT", api_port.to_string())
         .env("FULLMAG_ATTACHED_SESSION_ID", session_id)
+        .env(crate::control_room::live_publisher_scope::ATTACHED_SCOPE_ENV, publisher_scope)
         .env("FULLMAG_ATTACHED_WAIT_FOR_SOLVE", "1")
         .env("FULLMAG_SKIP_CONTROL_ROOM", "1")
         .stdin(Stdio::null())
