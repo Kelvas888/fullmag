@@ -27,6 +27,14 @@ class RetentionServiceTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         (self.root / 'locks').mkdir()
+        # Lifecycle fixtures inventory their isolated temp storage, never the
+        # host daemon. Docker root telemetry has its own admission tests.
+        docker_probe = patch(
+            'local_runner.observability._probe_docker_root',
+            return_value=(str(self.root), 'Docker backing storage', None),
+        )
+        docker_probe.start()
+        self.addCleanup(docker_probe.stop)
         self.hub = ObservabilityHub(self.root)
         self.queue = Queue()
         self.stream_logs = lambda *_args, **_kwargs: 'stdout_then_stderr'
