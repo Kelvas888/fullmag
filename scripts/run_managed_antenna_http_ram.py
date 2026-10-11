@@ -18,6 +18,7 @@ import subprocess
 import sys
 import time
 import uuid
+from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
 PROFILE = "managed-antenna-http-ram-cpu"
@@ -65,13 +66,97 @@ def check_tools(root, expected):
         raise ValueError("HTTP gate host tool identity changed")
 
 
-def get_json(path):
+class HttpDiagnosticError(ValueError):
+    def __init__(self, diagnostic):
+        self.diagnostic = diagnostic
+        super().__init__(f"HTTP gate GET {diagnostic['path']}: "
+                         f"status {diagnostic.get('status')}: "
+                         f"{diagnostic.get('error', diagnostic.get('body', ''))}")
+
+
+def read_http(path):
     opener = build_opener(ProxyHandler({}))
-    with opener.open(ORIGIN + path, timeout=3) as response:
+    try:
+        response = opener.open(ORIGIN + path, timeout=3)
+    except HTTPError as error:
+        response = error
+    with response:
         data = response.read(MAX_JSON + 1)
-        if response.status != 200 or len(data) > MAX_JSON:
-            raise ValueError("HTTP gate metadata response exceeds contract")
+        status = response.code
+    diagnostic = {"path": path, "status": status}
+    if status != 200 or len(data) > MAX_JSON:
+        # Preserve exact bounded response bytes, including a non-JSON error.
+        retained = data[:65536]
+        diagnostic.update(body=retained.decode("utf-8", errors="replace"),
+            body_base64=base64.b64encode(retained).decode(),
+            body_truncated=len(data) > len(retained))
+        if len(data) > MAX_JSON:
+            diagnostic["error"] = "metadata response exceeds contract"
+        raise HttpDiagnosticError(diagnostic)
+    try:
         return json.loads(data)
+    except (ValueError, UnicodeDecodeError) as error:
+        retained = data[:65536]
+        diagnostic.update(error=str(error),
+            body=retained.decode("utf-8", errors="replace"),
+            body_base64=base64.b64encode(retained).decode(),
+            body_truncated=len(data) > len(retained))
+        raise HttpDiagnosticError(diagnostic) from error
+
+
+def get_json(path):
+    return read_http(path)
+
+
+def error_diagnostic(path, error):
+    if isinstance(error, HttpDiagnosticError):
+        return error.diagnostic
+    return {"path": path, "error": str(error)}
+
+
+def retain_inspection_failure(export, last_error, last_metadata):
+    diagnostic = {"last_poll_error": last_error,
+                  "last_200_inspection_metadata": last_metadata, "resources": {}}
+    paths = ("/v2/sessions/current", "/v2/sessions/current/status",
+             "/v2/sessions/current/simulation/runs/current",
+             "/v2/sessions/current/simulation/stages/execution",
+             "/v2/sessions/current/data/artifacts")
+    keys = {"schema_version", "session_id", "session_epoch", "request_scope_epoch",
+            "state_version", "revision", "revisions", "status", "session", "run",
+            "run_id", "artifact_dir", "active_stage_index", "active_stage_kind",
+            "total_stages", "runtime_state", "completed_stage_indexes", "stages"}
+    for path in paths:
+        try:
+            value = get_json(path)
+            if isinstance(value, dict):
+                value = {key: item for key, item in value.items() if key in keys}
+            diagnostic["resources"][path] = {"status": 200, "resource": value}
+        except (OSError, ValueError) as error:
+            diagnostic["resources"][path] = error_diagnostic(path, error)
+    (export / "inspection-failure-diagnostic.json").write_text(
+        json.dumps(diagnostic, sort_keys=True), encoding="utf-8")
+    return "inspection-failure-diagnostic.json"
+
+
+def wait_inspection(export, timeout=15):
+    path = "/v2/sessions/current/data/antenna/stages/stage-000/external-lead-inspection"
+    deadline = time.monotonic() + timeout
+    last_error = None
+    metadata = None
+    while time.monotonic() < deadline:
+        try:
+            candidate = get_json(path)
+            metadata = candidate
+            if isinstance(candidate, dict) and candidate.get("runtime_stage_id") == "stage-000":
+                return candidate
+            last_error = {"path": path, "status": 200,
+                          "error": "inspection runtime_stage_id differs from stage-000"}
+        except (OSError, ValueError) as error:
+            last_error = error_diagnostic(path, error)
+        time.sleep(0.25)
+    retain_inspection_failure(export, last_error, metadata)
+    raise ValueError("Real solve did not register its inspection stage; "
+                     "read inspection-failure-diagnostic.json")
 
 
 def post_json(path, payload, limit=MAX_JSON):
@@ -211,18 +296,7 @@ def execute_in_container():
                 raise ValueError("Native solve failed; read retained solver.log")
             # Snapshot ownership must be produced by the real run. Do not
             # construct, inject or modify stage_execution/artifact_refs.
-            deadline = time.monotonic() + 15
-            metadata = None
-            while time.monotonic() < deadline:
-                try:
-                    metadata = get_json("/v2/sessions/current/data/antenna/stages/stage-000/external-lead-inspection")
-                    if metadata.get("runtime_stage_id") == "stage-000":
-                        break
-                except (OSError, ValueError):
-                    pass
-                time.sleep(0.25)
-            else:
-                raise ValueError("Real solve did not register its inspection stage")
+            metadata = wait_inspection(export)
             (export / "inspection-metadata.json").write_text(json.dumps(metadata, sort_keys=True))
             result["http_smokes"] = {
                 name: smoke(name, "stage-000", export) for name in

@@ -237,3 +237,100 @@ def test_cold_incarnation_changes_but_scientific_content_must_not():
         gate.compare_cold_metadata(warm, {**cold, "runtime_stage_id": "stage-001"})
     with pytest.raises(ValueError):
         gate.compare_cold_metadata({}, {})
+
+
+def test_http_error_retains_exact_bounded_non_json_bytes(monkeypatch):
+    import io
+    from urllib.error import HTTPError
+    raw = b"inspection unavailable \xff"
+    class Opener:
+        def open(self, url, timeout):
+            assert timeout == 3
+            raise HTTPError(url, 404, "Not Found", {}, io.BytesIO(raw))
+    monkeypatch.setattr(gate, "build_opener", lambda *args: Opener())
+    with pytest.raises(gate.HttpDiagnosticError) as captured:
+        gate.get_json("/inspection")
+    diagnostic = captured.value.diagnostic
+    assert diagnostic["status"] == 404
+    assert gate.base64.b64decode(diagnostic["body_base64"]) == raw
+    assert diagnostic["body_truncated"] is False
+
+
+def test_204_stage_resource_is_retained_as_absent_not_invalid_json(monkeypatch):
+    import io
+    class Response(io.BytesIO):
+        code = 204
+    class Opener:
+        def open(self, *args, **kwargs): return Response(b"")
+    monkeypatch.setattr(gate, "build_opener", lambda *args: Opener())
+    with pytest.raises(gate.HttpDiagnosticError) as captured:
+        gate.get_json("/stages")
+    assert captured.value.diagnostic == {"path": "/stages", "status": 204,
+        "body": "", "body_base64": "", "body_truncated": False}
+
+
+def test_oversized_error_body_is_truncated_and_never_marked_pass(monkeypatch):
+    import io
+    from urllib.error import HTTPError
+    class Opener:
+        def open(self, url, **kwargs):
+            raise HTTPError(url, 500, "Failed", {}, io.BytesIO(b"x" * (gate.MAX_JSON + 2)))
+    monkeypatch.setattr(gate, "build_opener", lambda *args: Opener())
+    with pytest.raises(gate.HttpDiagnosticError) as captured:
+        gate.get_json("/inspection")
+    diagnostic = captured.value.diagnostic
+    assert len(gate.base64.b64decode(diagnostic["body_base64"])) == 65536
+    assert diagnostic["body_truncated"] is True
+    assert diagnostic["error"] == "metadata response exceeds contract"
+
+
+def test_poll_failure_retains_last_http_error_and_real_resource_ownership(tmp_path, monkeypatch):
+    ticks = iter([0, 0, 16])
+    monkeypatch.setattr(gate.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(gate.time, "sleep", lambda *args: None)
+    calls = []
+    def get(path):
+        calls.append(path)
+        if path.endswith("external-lead-inspection"):
+            raise gate.HttpDiagnosticError({"path": path, "status": 404,
+                "body": '{"message":"no stage execution state"}'})
+        if path.endswith("stages/execution"):
+            raise gate.HttpDiagnosticError({"path": path, "status": 204, "body": ""})
+        if path.endswith("runs/current"):
+            return {"run_id": "actual-run", "revision": 11,
+                    "artifact_dir": "/ram/result.zarr", "final_total_energy": 42}
+        if path.endswith("data/artifacts"):
+            return [{"path": "stage-000/actual-record.json"}]
+        return {"session_id": "actual-session", "unrelated_secret": "excluded"}
+    monkeypatch.setattr(gate, "get_json", get)
+    with pytest.raises(ValueError, match="did not register"):
+        gate.wait_inspection(tmp_path)
+    diagnostic = json.loads((tmp_path / "inspection-failure-diagnostic.json").read_text())
+    assert diagnostic["last_poll_error"]["status"] == 404
+    assert "no stage execution state" in diagnostic["last_poll_error"]["body"]
+    resources = diagnostic["resources"]
+    assert resources["/v2/sessions/current/simulation/stages/execution"]["status"] == 204
+    assert resources["/v2/sessions/current/simulation/runs/current"]["resource"] == {
+        "run_id": "actual-run", "revision": 11, "artifact_dir": "/ram/result.zarr"}
+    assert "unrelated_secret" not in json.dumps(diagnostic)
+    assert len(calls) == 6
+
+
+def test_wrong_200_stage_is_retained_but_correct_stage_writes_no_failure(tmp_path, monkeypatch):
+    ticks = iter([0, 0, 16])
+    monkeypatch.setattr(gate.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(gate.time, "sleep", lambda *args: None)
+    wrong = {"runtime_stage_id": "authored-antenna", "outputs": []}
+    monkeypatch.setattr(gate, "get_json", lambda path: wrong)
+    with pytest.raises(ValueError, match="did not register"):
+        gate.wait_inspection(tmp_path)
+    diagnostic = json.loads((tmp_path / "inspection-failure-diagnostic.json").read_text())
+    assert diagnostic["last_200_inspection_metadata"] == wrong
+    assert diagnostic["last_poll_error"]["status"] == 200
+    (tmp_path / "inspection-failure-diagnostic.json").unlink()
+    ticks = iter([0, 0])
+    monkeypatch.setattr(gate.time, "monotonic", lambda: next(ticks))
+    correct = {"runtime_stage_id": "stage-000"}
+    monkeypatch.setattr(gate, "get_json", lambda path: correct)
+    assert gate.wait_inspection(tmp_path) == correct
+    assert not (tmp_path / "inspection-failure-diagnostic.json").exists()
