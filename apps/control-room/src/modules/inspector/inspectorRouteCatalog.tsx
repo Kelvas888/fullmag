@@ -11,6 +11,7 @@ import { FdmMultilayerAirboxTargetPanel } from "./panels/airbox/FdmMultilayerAir
 import { AirboxVisualizationDebugInspectorPanel } from "./panels/airbox/AirboxVisualizationDebugInspectorPanel";
 import { AntennaObjectPanel } from "./panels/AntennaObjectPanel";
 import { AntennaVisualizationPanel } from "./panels/antenna/AntennaVisualizationPanel";
+import { AntennaTerminalsPanel } from "./panels/antenna/AntennaTerminalsPanel";
 import { AntennaGeometryPanel } from "./panels/antenna/AntennaGeometryPanel";
 import {
   AntennaConductorPanel,
@@ -919,6 +920,12 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
     title: "Antenna geometry",
     selectionKinds: ["object.antenna.geometry"],
     component: AntennaGeometryPanel,
+  },
+  {
+    id: "antenna-terminals",
+    title: "Antenna terminals",
+    selectionKinds: ["object.antenna.terminals"],
+    component: AntennaTerminalsPanel,
   },
   {
     id: "antenna-conductor",

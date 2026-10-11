@@ -259,6 +259,20 @@ function antennaCompositionNodes(
 
   return [
     {
+      id: `${antennaParentId}:terminals`,
+      kind: "object.antenna.terminals",
+      label: "Terminals and external actuators",
+      parentId: antennaParentId,
+      badge: "inspection preparation",
+      icon: "activity",
+      objectId,
+      objectRole: "antenna",
+      antennaResourceId: objectId,
+      antennaResourceKind: "terminals",
+      status: "warning",
+      contextCommands: ["workspace.focus-selection"],
+    },
+    {
       id: `${antennaParentId}:conductor`,
       kind: "object.antenna.conductor",
       label: "Conductor",

@@ -24,6 +24,7 @@ type ObjectSelectionKind =
   | "object.antenna"
   | "object.antenna.geometry"
   | "object.antenna.regional"
+  | "object.antenna.terminals"
   | "object.antenna.conductor"
   | "object.antenna.port"
   | "object.antenna.solution"
@@ -380,6 +381,7 @@ export type SelectionRef =
       objectRole?: "antenna" | "magnet" | "auxiliary";
       antennaResourceId?: string;
       antennaResourceKind?:
+        | "terminals"
         | "conductor"
         | "port"
         | "solution"

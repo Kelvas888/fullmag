@@ -142,6 +142,7 @@ describe("antenna composition explorer nodes", () => {
     const antenna = node.children?.find((child) => child.kind === "object.antenna");
     expect(antenna?.children?.map((child) => child.kind)).toEqual([
       "object.antenna.regional",
+      "object.antenna.terminals",
       "object.antenna.conductor",
       "object.antenna.port",
       "object.antenna.solution",
