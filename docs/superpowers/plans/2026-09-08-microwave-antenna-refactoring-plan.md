@@ -10,10 +10,14 @@ próby `22b7919f7700414d90ba0919e459fe64` oraz
 `2089836736454d189938c8140dcfb333` wykonały solver z exit 0, ale nie przeszły
 bramy HTTP. Ostatnia odpowiedź endpointu etapu: HTTP 404,
 `missing_antenna_inspection`, `stage has no registered inspection result`.
-API odbierało aktualizacje sesji; zachowana kopia `result.zarr` zawiera jedynie
-`fullmag-run.json` i `output-storage.json`, bez artefaktów anteny.
-Nie ustalono jeszcze wspólnej przyczyny braku artefaktów i końcowego ref.
-Nie przypisywać tego wyłącznie asynchronicznemu publisherowi bez reprodukcji.
+API odbierało aktualizacje sesji. Odczyt z uwzględnieniem ukrytych katalogów
+potwierdził kompletną kopię artefaktów V/J/H, bundle, manifest v2 i record
+etapu w `result.zarr/artifacts/antenna`; digest manifestu odpowiada udanemu
+runowi bez API (`4cd5b183…`). Początkowy odczyt bez `-Force` pominął ukryte
+katalogi; nie jest to utrata danych ani błąd cleanup.
+Source review wykazał brak końcowego flush/ACK asynchronicznego publishera
+przed powrotem z orchestratora. To kandydat na przyczynę braku końcowego ref;
+poprawka wymaga reprodukcji i bramy runtime, nie samego przeglądu źródeł.
 Raport błędu i logi pozostają w storage profilu `managed-antenna-http-ram-cpu`.
 Canonical Rust re-decode przez API, prawdziwe HTTP smokes i cold import
 pozostają **NOT VERIFIED**. Nie rejestrować sztucznych refs, nie zastępować
@@ -21,6 +25,23 @@ próby fixture-em API ani nie wyłączać guardów SessionStore.
 Regresje helpera/launchera: **38 PASS + 7 subtestów**; wcześniejszy łączny
 pakiet readerów, transportu i helpera: **181 PASS + 49 subtestów**.
 Komparator V/J/H poniżej dotyczy odrębnego, zakończonego sukcesem runu bez API.
+
+**Następny przyrost — terminalny ACK publikacji (jeszcze nie zaimplementowany):**
+`crates/fullmag-cli/src/live_workspace.rs::CurrentLivePublisher` uruchamia
+worker bez zachowania `JoinHandle`; `request_publish` jedynie kolejkuje wake.
+`current_live_publisher_loop` ma drain po zamknięciu kanału, ale orchestrator
+nie czeka na jego zakończenie przed wyjściem procesu.
+Implementacja musi przesłać niezmienny końcowy snapshot po ostatnim update/log
+przez ten sam serialny worker i przydzielić mu monotoniczny numer publikacji.
+ACK powinien potwierdzać dokładny numer, session_id i run_id dopiero po
+pełnym sukcesie istniejącego cyklu HTTP, nie po samym session-frame.
+Nie wystarczy obserwacja `pending=false`/`sending=false` ani arbitralny sleep.
+Wyłączone API pozostaje jawnym no-op; deadline, zerwany worker, zmiana ownera
+i błąd HTTP kończą próbę błędem bez usuwania wyników naukowych.
+Regresje: brak ACK starszego preview, zachowanie terminalnych artifact_refs,
+serializacja z trwającym publish, odmowa obcego ownera, timeout i API off.
+Odbiór: nowy managed build, ta sama brama rzeczywistego HTTP i oba smokes
+V/J/H; dopiero wtedy canonical API re-decode może uzyskać PASS.
 
 **Rzeczywisty odbiór V/J/H — 2026-10-11:**
 Build nr 41 `1128d9f468ee4b0981387a8cdf448451` zakończył się
