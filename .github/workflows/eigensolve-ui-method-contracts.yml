@@ -12,6 +12,8 @@ on:
       - 'apps/control-room/src/modules/ribbon/RibbonModule*'
       - 'apps/control-room/src/modules/ribbon/ribbonCommands*'
       - 'apps/control-room/src/kernel/analysis-modules/postprocessingCommandContributions*'
+      - 'apps/control-room/src/kernel/analysis-modules/postprocessingDefinitions*'
+      - 'apps/control-room/src/modules/analysis-plots/referenceOverlaySeries.test.ts'
       - 'apps/control-room/src/modules/analysis-plots/useAnalysisPlotsController.ts'
       - 'apps/control-room/src/modules/analysis-plots/referenceChartQuantity.test.ts'
       - 'apps/control-room/src/shared/domain/analysis/modalDampingObservables*'
@@ -29,6 +31,8 @@ on:
       - 'apps/control-room/src/modules/ribbon/RibbonModule*'
       - 'apps/control-room/src/modules/ribbon/ribbonCommands*'
       - 'apps/control-room/src/kernel/analysis-modules/postprocessingCommandContributions*'
+      - 'apps/control-room/src/kernel/analysis-modules/postprocessingDefinitions*'
+      - 'apps/control-room/src/modules/analysis-plots/referenceOverlaySeries.test.ts'
       - 'apps/control-room/src/modules/analysis-plots/useAnalysisPlotsController.ts'
       - 'apps/control-room/src/modules/analysis-plots/referenceChartQuantity.test.ts'
       - 'apps/control-room/src/shared/domain/analysis/modalDampingObservables*'
@@ -81,6 +85,8 @@ jobs:
           src/modules/ribbon/RibbonModule.contextualTab.test.ts
           src/modules/ribbon/ribbonCommands.test.ts
           src/kernel/analysis-modules/postprocessingCommandContributions.test.ts
+          src/kernel/analysis-modules/postprocessingDefinitions.test.ts
+          src/modules/analysis-plots/referenceOverlaySeries.test.ts
           src/modules/analysis-plots/referenceChartQuantity.test.ts
           src/shared/domain/analysis/modalDampingObservables.test.ts
           src/shared/domain/analysis/phasorConventionAdapter.test.ts

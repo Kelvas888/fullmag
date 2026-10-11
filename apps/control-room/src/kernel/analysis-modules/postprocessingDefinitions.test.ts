@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { MAX_REFERENCE_POINTS } from "@/shared/domain/analysis/referenceImport";
 
+import type { ImportedReferenceInput } from "./postprocessingDefinitions";
 import {
   IMPORTED_REFERENCE_SCHEMA,
   importedReferenceDefinition,
@@ -207,26 +208,26 @@ describe("imported dispersion reference definitions", () => {
     sourceUnits: { frequency: "GHz", path: "rad/um" } as const,
   };
 
-  it("preserves every accepted SI pair through definition construction and readback", () => {
-    const definition = importedReferenceDefinition(baseInput);
+  it("preserves every accepted SI pair through definition construction and readback", async () => {
+    const definition = await importedReferenceDefinition(baseInput);
 
     expect(definition.definition_schema).toBe(IMPORTED_REFERENCE_SCHEMA);
     expect(importedReferencePoints(definition)).toEqual([[3, 9], [-1, 2]]);
   });
 
-  it("accepts the exact point limit and rejects an oversized constructor input before copying", () => {
+  it("accepts the exact point limit and rejects an oversized constructor input before copying", async () => {
     const points = Array.from({ length: MAX_REFERENCE_POINTS }, (_, index) => [index, index] as const);
-    const definition = importedReferenceDefinition({ ...baseInput, points });
+    const definition = await importedReferenceDefinition({ ...baseInput, points });
 
     expect(importedReferencePoints(definition)).toHaveLength(MAX_REFERENCE_POINTS);
-    expect(() => importedReferenceDefinition({
+    await expect(importedReferenceDefinition({
       ...baseInput,
       points: [...points, [MAX_REFERENCE_POINTS, MAX_REFERENCE_POINTS] as const],
-    })).toThrow(/at most/);
+    })).rejects.toThrow(/at most/);
   });
 
-  it("rejects malformed stored point sets as a whole instead of dropping individual rows", () => {
-    const definition = importedReferenceDefinition(baseInput);
+  it("rejects malformed stored point sets as a whole instead of dropping individual rows", async () => {
+    const definition = await importedReferenceDefinition(baseInput);
     const malformed = {
       ...definition,
       settings: { ...definition.settings, points: [[0, 1], [2, "3"], [4, 5]] },
@@ -252,7 +253,102 @@ describe("imported dispersion reference definitions", () => {
     ["non-finite SI value", { points: [[0, 1], [2, Number.NaN]] }],
     ["unsupported unit", { sourceUnits: { frequency: "kHz", path: "rad/m" } }],
     ["non-finite published revision", { dataset: { artifactRevision: Number.NaN, runId: "run-1", stageId: "stage-1" } }],
-  ])("rejects %s in a direct constructor call", (_description, overrides) => {
-    expect(() => importedReferenceDefinition({ ...baseInput, ...overrides } as never)).toThrow();
+  ])("rejects %s in a direct constructor call", async (_description, overrides) => {
+    await expect(importedReferenceDefinition({ ...baseInput, ...overrides } as never)).rejects.toThrow();
+  });
+
+  it("uses a stable SHA-256 ID for equivalent full payloads and distinguishes changed content", async () => {
+    const original = await importedReferenceDefinition(baseInput);
+    const equivalent = await importedReferenceDefinition({
+      ...baseInput,
+      dataset: { ...baseInput.dataset },
+      points: baseInput.points.map(([path, frequency]): [number, number] => [path, frequency]),
+      sourceUnits: { ...baseInput.sourceUnits },
+    });
+    const changedLaterPoint = await importedReferenceDefinition({
+      ...baseInput,
+      points: [[3, 9], [-1, 3]],
+    });
+    const changedUnits = await importedReferenceDefinition({
+      ...baseInput,
+      sourceUnits: { ...baseInput.sourceUnits, path: "rad/m" },
+    });
+    const changedFrequencyUnits = await importedReferenceDefinition({
+      ...baseInput,
+      sourceUnits: { ...baseInput.sourceUnits, frequency: "Hz" },
+    });
+    const changedLabel = await importedReferenceDefinition({ ...baseInput, label: "Other reference" });
+    const changedFileName = await importedReferenceDefinition({ ...baseInput, fileName: "other.csv" });
+    const changedOwnerRevision = await importedReferenceDefinition({
+      ...baseInput,
+      dataset: { ...baseInput.dataset, artifactRevision: 8 },
+    });
+
+    expect(original.definition_id).toMatch(/^analysis\.dispersion:reference:sha256:[0-9a-f]{64}$/);
+    expect(equivalent.definition_id).toBe(original.definition_id);
+    expect(importedReferencePoints(changedLaterPoint)).toEqual([[3, 9], [-1, 3]]);
+    expect(importedReferencePoints(changedLaterPoint)).toHaveLength(baseInput.points.length);
+    expect(importedReferencePoints(changedLaterPoint)?.[0]).toEqual(baseInput.points[0]);
+    for (const changed of [changedLaterPoint, changedUnits, changedFrequencyUnits, changedLabel, changedFileName, changedOwnerRevision]) {
+      expect(changed.definition_id).not.toBe(original.definition_id);
+    }
+  });
+
+  it("hashes and returns the same detached payload snapshot before awaiting SHA-256", async () => {
+    const points: [number, number][] = [[3, 9], [-1, 2]];
+    const input: ImportedReferenceInput = {
+      dataset: { ...baseInput.dataset },
+      fileName: baseInput.fileName,
+      label: baseInput.label,
+      points,
+      sourceUnits: { ...baseInput.sourceUnits },
+    };
+    const originalDigest = globalThis.crypto.subtle.digest.bind(globalThis.crypto.subtle);
+    let resolveStarted!: (data: BufferSource) => void;
+    const started = new Promise<BufferSource>((resolve) => { resolveStarted = resolve; });
+    let releaseDigest!: () => void;
+    const digestGate = new Promise<void>((resolve) => { releaseDigest = resolve; });
+    const delayedDigest = vi.fn(async (algorithm: AlgorithmIdentifier, data: BufferSource) => {
+      resolveStarted(data);
+      await digestGate;
+      return originalDigest(algorithm, data);
+    });
+    vi.stubGlobal("crypto", { subtle: { digest: delayedDigest } });
+
+    try {
+      const pending = importedReferenceDefinition(input);
+      const digestPayload = await started;
+      points[1][1] = 99;
+      input.dataset.artifactRevision = 8;
+      input.fileName = "mutated.csv";
+      input.label = "Mutated label";
+      input.sourceUnits.path = "rad/m";
+      releaseDigest();
+      const definition = await pending;
+
+      const serializedSnapshot = JSON.parse(new TextDecoder().decode(digestPayload)) as Record<string, unknown>;
+      const { definition_id: _definitionId, ...persistedPayload } = definition;
+      const digest = await originalDigest("SHA-256", digestPayload);
+      const expectedContentSha256 = Array.from(new Uint8Array(digest), (byte) =>
+        byte.toString(16).padStart(2, "0"),
+      ).join("");
+
+      expect(serializedSnapshot).toMatchObject({
+        definition_schema: IMPORTED_REFERENCE_SCHEMA,
+        label: "Reference",
+        module_id: "analysis.dispersion",
+        data_ref: { run_id: "run-1", dataset_id: "eigen-dispersion", dataset_revision: "7" },
+        settings: {
+          file_name: "reference.csv",
+          points: [[3, 9], [-1, 2]],
+          source_units: { frequency: "GHz", path: "rad/um" },
+        },
+      });
+      expect(persistedPayload).toEqual(serializedSnapshot);
+      expect(definition.definition_id).toBe(`analysis.dispersion:reference:sha256:${expectedContentSha256}`);
+    } finally {
+      releaseDigest();
+      vi.unstubAllGlobals();
+    }
   });
 });

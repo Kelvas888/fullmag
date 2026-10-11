@@ -945,3 +945,15 @@ Weryfikacja native:4 zielone modal-phase CTest nie obejmowały mixed dense descr
 4241893347: manifest histerezy zachowuje actualresolved source ref względem run root (ta sama baza co existingabsolute stage resolver), zamiast jednej stałej nazwy dla wielu etapów. Decoder/hash i builder używają tego samego źródła. Normalizacja slash oraz sanitizer odmawiają outside/parent/empty. Dwustopniowy test sprawdza stable paths/byte hashes, zmianę revision po zmianie path;4guards zachowują legacyflat jako artifacts/hysteresis_points.json. Pure source tests przygotowane, handler/browser runtime NOT VERIFIED.
 
 #38149842014:177tests/12files PASS,10 nowych history cases i pełny typecheck/architecture PASS. React Doctor617 findings semantycznie zgodne z38148168315 po pominięciu tylko pozycji. Fullworkflow FAIL, nie waiver; source correction history ukończona, browser pending.
+
+
+## Wyniki bieżących bramek
+
+GHA38150465728 na839023d43438fab98b96440861e7d6ede99a936d SUCCESS:114 testów API, w tym5 nowych przypadków ścieżki/dataset revision histerezy. Uwaga4241893347 ma dowód wykonania kontraktu.
+
+GHA38149497927 na fdf811f10ba90d87861ceac67a5b81fc385cc6c1 zakończyła się FAIL dopiero w CTest:7/12 PASS,5 FAIL (full, mixed oraz3 borrowed-Pmat). Receipt/artifact11705733979 zachowane. Diagnoza oraz poprawki wymagają kolejnej bramki GHA; nie restartujemy joba bez ustalenia przyczyny. Runtime/scientific/GPU qualification pozostaje NOT VERIFIED.
+
+
+## Tożsamość importowanej referencji
+
+4240898344: SHA-256 pełnego payloadu eliminuje kolizję plików o tej samej nazwie, liczbie punktów i pierwszym wierszu. Snapshot wszystkich danych przed await zachowuje zgodność ID/payload; session fence po digest nie dopuszcza mutacji wygasłej sesji. WebCrypto wymagane (secure browser context); brak tej capability kończy import jawnym błędem przed create. Nie migrujemy historycznych IDs i nie uznajemy poprawki canonical dataset identity4241564392 za wykonaną. GHA uruchomi także rzeczywiste tests definicji oraz reference overlay; browser/runtime NOT VERIFIED.

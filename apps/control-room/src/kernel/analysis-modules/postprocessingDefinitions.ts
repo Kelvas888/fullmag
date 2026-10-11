@@ -193,7 +193,7 @@ export const IMPORTED_REFERENCE_SCHEMA = "analysis.dispersion.reference.v1";
  * frequency [Hz]. The reference carries no physics assumptions of its own;
  * its comparison status stays "unknown" until metadata is provided.
  */
-export function importedReferenceDefinition(input: ImportedReferenceInput): PostprocessingDefinition {
+export async function importedReferenceDefinition(input: ImportedReferenceInput): Promise<PostprocessingDefinition> {
   if (!input || typeof input !== "object") {
     throw new TypeError("Reference import details are required.");
   }
@@ -225,9 +225,7 @@ export function importedReferenceDefinition(input: ImportedReferenceInput): Post
     throw new TypeError("The selected dispersion result has an invalid published identity.");
   }
   const manifest = ANALYSIS_FEATURE_MANIFESTS.find((candidate) => candidate.id === "analysis.dispersion");
-  const stamp = `${input.fileName}:${input.points.length}:${input.points[0]?.join(",") ?? ""}`;
-  return {
-    definition_id: `analysis.dispersion:reference:${input.dataset.runId}:${input.dataset.stageId}:${stamp}`,
+  const payload: Omit<PostprocessingDefinition, "definition_id"> = {
     revision: 0,
     module_id: "analysis.dispersion",
     module_version: manifest?.version ?? "0.1.0",
@@ -242,7 +240,7 @@ export function importedReferenceDefinition(input: ImportedReferenceInput): Post
     settings: {
       file_name: input.fileName,
       path_quantity: "path_coordinate_rad_per_m",
-      // The complete array was validated and bounded before this copy.
+      // The complete array was validated and bounded before this detached copy.
       points: input.points.map(([path, frequency]) => [path, frequency]),
       source: "imported_table",
       source_units: {
@@ -251,6 +249,21 @@ export function importedReferenceDefinition(input: ImportedReferenceInput): Post
       },
       y_quantity: "frequency_hz",
     },
+  };
+  const subtle = globalThis.crypto?.subtle;
+  if (!subtle) {
+    throw new Error("SHA-256 digest is unavailable for reference identity.");
+  }
+  const digest = await subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(JSON.stringify(payload)),
+  );
+  const contentSha256 = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  return {
+    definition_id: `analysis.dispersion:reference:sha256:${contentSha256}`,
+    ...payload,
   };
 }
 

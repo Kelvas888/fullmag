@@ -781,12 +781,26 @@
     {
       "run_id": 38149497927,
       "sha": "fdf811f10ba90d87861ceac67a5b81fc385cc6c1",
-      "conclusion": "pending",
+      "conclusion": "failure",
       "scope": "floquet-modal-slepc",
       "dispatch": "bootstrap.yml contract_scope=floquet-modal-slepc",
       "head_sha_verified_after_ACK": true,
       "private_runtime_attestation": "NOT VERIFIED",
-      "qualification_claimed": false
+      "qualification_claimed": false,
+      "tests_passed": 7,
+      "tests_failed": 5,
+      "tests_total": 12,
+      "failure_phase": "native CTest after successful image and source build",
+      "failed_tests": [
+        "fem_modal_eigen_contract",
+        "modal_eigen_borrowed_pmat_row_restore_fault_quarantine",
+        "modal_eigen_borrowed_pmat_row_primary_cleanup_fault_quarantine",
+        "modal_eigen_borrowed_pmat_pattern_mismatch_fixture",
+        "fem_modal_eigen_mixed_dense_contract"
+      ],
+      "artifact_id": 11705733979,
+      "artifact_archive_sha256": "070850b37a12f60601584a05d5e18a46d4f59b3c0fa199692faf1798ecb31599",
+      "scientific_qualification": "NOT VERIFIED"
     },
     {
       "run_id": 38149842014,
@@ -802,6 +816,19 @@
       "log_sha256": "47c6af054f62b37d5d8aa7d3582a37b6587e2604f2a590eea8da3150993d5f3d",
       "browser": "NOT VERIFIED",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38150465728,
+      "sha": "839023d43438fab98b96440861e7d6ede99a936d",
+      "conclusion": "success",
+      "scope": "actual_hysteresis_stage_source_reference_and_revision",
+      "tests_passed": 114,
+      "session_tests_passed": 83,
+      "results_module_tests_passed": 28,
+      "exact_router_cases_passed": 3,
+      "new_hysteresis_cases_passed": 5,
+      "log_sha256": "72b3fc502d5743d95a6496695de272ad59e65786554180bbe947f479b741f23e",
+      "scientific_qualification": "NOT VERIFIED"
     }
   ]
 }

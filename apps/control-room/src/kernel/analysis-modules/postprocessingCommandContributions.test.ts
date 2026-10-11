@@ -277,6 +277,33 @@ describe("import dispersion reference command bounds", () => {
     expect(fixture.create).not.toHaveBeenCalled();
   });
 
+  it("fails closed without WebCrypto SHA-256 and never creates a reference", async () => {
+    const command = referenceCommand();
+    expect(command).toBeDefined();
+    if (!command) return;
+    const fixture = referenceCommandContext({
+      fileName: "reference.csv",
+      label: "Reference",
+      points: [[0, 1], [1, 2]],
+      sourceUnits: { frequency: "GHz", path: "rad/um" },
+    });
+    vi.stubGlobal("crypto", { subtle: undefined });
+
+    try {
+      const result = await command.run(fixture.context);
+
+      expect(result).toMatchObject({
+        message: "Reference import failed: SHA-256 digest is unavailable for reference identity.",
+        status: "failed",
+      });
+      expect(fixture.list).toHaveBeenCalledTimes(1);
+      expect(fixture.create).not.toHaveBeenCalled();
+      expect(fixture.invalidate).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("returns facade failures as a command result", async () => {
     const command = referenceCommand();
     expect(command).toBeDefined();
@@ -386,6 +413,31 @@ describe.each(scopedCommands)("postprocessing command session scope: %s", (comma
   });
 });
 
+it("does not create an imported reference when the session expires during SHA-256", async () => {
+  const fixture = scopedCommandFixture(IMPORT_DISPERSION_REFERENCE_COMMAND);
+  const digestStarted = deferred<void>();
+  const digestResult = deferred<ArrayBuffer>();
+  const digest = vi.fn(() => {
+    digestStarted.resolve();
+    return digestResult.promise;
+  });
+  vi.stubGlobal("crypto", { subtle: { digest } });
+
+  try {
+    const pending = fixture.command.run(fixture.context as never);
+    await digestStarted.promise;
+    expect(fixture.list).toHaveBeenCalledExactlyOnceWith({ sessionScopeKey: fixture.context.sessionScopeKey });
+    fixture.expire();
+    digestResult.resolve(new ArrayBuffer(32));
+
+    expect((await pending).status).toBe("cancelled");
+    expect(fixture.mutation).not.toHaveBeenCalled();
+    expect(fixture.invalidate).not.toHaveBeenCalled();
+  } finally {
+    digestResult.resolve(new ArrayBuffer(32));
+    vi.unstubAllGlobals();
+  }
+});
 
 function seededAuthoringHistory() {
   const before = { editor: { marker: "before" }, revision: 10 } satisfies SceneResource;

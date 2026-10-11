@@ -86,8 +86,11 @@ async function importDispersionReference(context: CommandContext): Promise<Comma
     const current = await definitions.list(options);
     const obsoleteAfterRead = obsoleteSessionResult(context);
     if (obsoleteAfterRead) return obsoleteAfterRead;
+    const definition = await importedReferenceDefinition({ ...validation.input, dataset });
+    const obsoleteAfterDigest = obsoleteSessionResult(context);
+    if (obsoleteAfterDigest) return obsoleteAfterDigest;
     const created = await definitions.create({
-      definition: importedReferenceDefinition({ ...validation.input, dataset }),
+      definition,
       expected_scene_revision: current.scene_revision,
     }, options);
     const obsoleteAfterWrite = obsoleteSessionResult(context);

@@ -18,16 +18,18 @@ const computed = [{
   xUnit: "rad/m",
 }] as unknown as ChartSeries[];
 
-const reference = importedReferenceDefinition({
-  dataset: { artifactRevision: 7, runId: "run-1", stageId: "eigen" },
-  fileName: "comsol.txt",
-  label: "COMSOL sweep",
-  points: [[-25e6, 13.68e9], [0, 9.32e9]],
-  sourceUnits: { frequency: "GHz", path: "rad/um" },
-});
+function createReferenceDefinition() {
+  return importedReferenceDefinition({
+    dataset: { artifactRevision: 7, runId: "run-1", stageId: "eigen" },
+    fileName: "comsol.txt",
+    label: "COMSOL sweep",
+    points: [[-25e6, 13.68e9], [0, 9.32e9]],
+    sourceUnits: { frequency: "GHz", path: "rad/um" },
+  });
+}
 
 describe("reference overlay series", () => {
-  it("matches the published selection revision separately from the CSV digest", () => {
+  it("matches the published selection revision separately from the CSV digest", async () => {
     const ref = selectionRefFromNode({
       id: "run-1:eigen:dispersion",
       kind: "results.dispersion.modal.relation",
@@ -40,7 +42,7 @@ describe("reference overlay series", () => {
     if (ref?.type !== "frequency-domain" || ref.artifactRevision === undefined || !ref.analysisRunId || !ref.analysisStageId) {
       throw new Error("Published dispersion node must carry a dataset selection identity");
     }
-    const imported = importedReferenceDefinition({
+    const imported = await importedReferenceDefinition({
       dataset: { artifactRevision: ref.artifactRevision, runId: ref.analysisRunId, stageId: ref.analysisStageId },
       fileName: "comsol.txt",
       label: "COMSOL sweep",
@@ -64,19 +66,22 @@ describe("reference overlay series", () => {
     }
   });
 
-  it("draws imported references of the shown run in the computed unit", () => {
+  it("draws imported references of the shown run in the computed unit", async () => {
+    const reference = await createReferenceDefinition();
     const [series] = referenceOverlaySeries(computed, [reference], { artifactRevision: 7, runId: "run-1", stageId: "eigen" });
     expect(series).toMatchObject({ label: "COMSOL sweep (reference)", quantity: "reference_frequency", unit: "GHz" });
     expect(series?.points.map((point) => [point.x, point.y])).toEqual([[-25e6, 13.68], [0, 9.32]]);
   });
 
-  it("does not overlay a reference on a republished or unidentified dataset", () => {
+  it("does not overlay a reference on a republished or unidentified dataset", async () => {
+    const reference = await createReferenceDefinition();
     expect(referenceOverlaySeries(computed, [reference], { artifactRevision: 8, runId: "run-1", stageId: "eigen" })).toEqual([]);
     expect(referenceOverlaySeries(computed, [reference], { artifactRevision: null, runId: "run-1", stageId: "eigen" })).toEqual([]);
     expect(referenceOverlaySeries(computed, [reference], { artifactRevision: "7", runId: "run-1", stageId: "eigen" })).toHaveLength(1);
   });
 
-  it("ignores references of another run or stage", () => {
+  it("ignores references of another run or stage", async () => {
+    const reference = await createReferenceDefinition();
     expect(referenceOverlaySeries(computed, [reference], { artifactRevision: 7, runId: "run-2", stageId: "eigen" })).toEqual([]);
     expect(referenceOverlaySeries(computed, [reference], { artifactRevision: 7, runId: "run-1", stageId: "other" })).toEqual([]);
   });
