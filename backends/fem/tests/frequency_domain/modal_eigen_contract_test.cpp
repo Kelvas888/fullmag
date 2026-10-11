@@ -7795,7 +7795,7 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
     }
 
     if (fault_quarantine_only || borrowed_pmat_row_restore_fault_only ||
-        borrowed_pmat_primary_cleanup_fault_only) {
+        borrowed_pmat_primary_cleanup_fault_only || pattern_mismatch_fixture_only) {
         fixture.descriptor.term_presence_mask =
             FULLMAG_FEM_MODAL_LINEARIZATION_TERM_FIELD;
         fixture.descriptor.field_term_digest =
@@ -7952,6 +7952,49 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
             contains(fault_result.diagnostics_json,
                      "\"production_phi_solution_unchanged_after_observation_available\":true,\"production_phi_solution_unchanged_after_observation\":true") &&
             contains(fault_result.result_json, "\"status\":\"solve_error\"");
+        const std::array<std::pair<bool, const char *>, 13> row_contract_checks{{
+            {fault_result.status == FULLMAG_FEM_FD_SOLVE_ERROR, "status_solve_error"},
+            {contains(fault_result.diagnostics_json,
+                      "\"shifted_ksp_failure_probe\":{\"schema_version\":\"shifted_ksp_failure_probe.v1\""),
+             "failure_probe_present"},
+            {borrowed_observation != nullptr, "borrowed_observation_present"},
+            {contains(fault_result.diagnostics_json,
+                      "\"borrowed_pmat_copy\":{\"schema_version\":\"floquet_borrowed_pmat_copy.v1\",\"requested\":true"),
+             "borrowed_observation_requested"},
+            {borrowed_pmat_primary_cleanup_fault_only
+                 ? contains(fault_result.diagnostics_json,
+                            "\"comparison_reason\":\"copied_matrix_row_restore_failed_after_reference_row_unavailable\"")
+                 : contains(fault_result.diagnostics_json,
+                            "\"comparison_reason\":\"reference_matrix_row_restore_failed\""),
+             "comparison_reason_expected"},
+            {contains(fault_result.diagnostics_json, "\"row_restore_attempts_available\":true"),
+             "row_restore_attempts_available"},
+            {row_attempt_order_observed, "row_attempt_order_observed"},
+            {contains(fault_result.diagnostics_json,
+                      "\"cleanup_attempted\":true,\"cleanup_succeeded_available\":true,\"cleanup_succeeded\":false"),
+             "cleanup_failure_observed"},
+            {contains(fault_result.diagnostics_json, "\"cleanup_error_code_available\":true"),
+             "cleanup_error_code_available"},
+            {contains(fault_result.diagnostics_json,
+                      "\"reason\":\"matrix_row_restore_failed_diagnostic_graph_quarantined\""),
+             "diagnostic_graph_quarantine_reason"},
+            {contains(fault_result.diagnostics_json,
+                      "\"production_phi_rhs_unchanged_after_observation_available\":true,\"production_phi_rhs_unchanged_after_observation\":true"),
+             "production_phi_rhs_unchanged"},
+            {contains(fault_result.diagnostics_json,
+                      "\"production_phi_solution_unchanged_after_observation_available\":true,\"production_phi_solution_unchanged_after_observation\":true"),
+             "production_phi_solution_unchanged"},
+            {contains(fault_result.result_json, "\"status\":\"solve_error\""),
+             "result_status_solve_error"},
+        }};
+        // Keep bounded scalar/string evidence alive across result destruction.
+        const int fault_status = static_cast<int>(fault_result.status);
+        const std::string fault_diagnostics = std::string(
+            fault_result.diagnostics_json != nullptr ? fault_result.diagnostics_json : "null").substr(0u, 32768u);
+        const std::string fault_result_json = std::string(
+            fault_result.result_json != nullptr ? fault_result.result_json : "null").substr(0u, 32768u);
+        const std::string fault_borrowed_observation = std::string(
+            borrowed_observation != nullptr ? borrowed_observation : "null").substr(0u, 16384u);
         bool primary_cleanup_codes_distinct = !borrowed_pmat_primary_cleanup_fault_only;
         if (borrowed_pmat_primary_cleanup_fault_only && borrowed_observation != nullptr) {
             const double primary_error_code = extract_json_number(
@@ -7981,6 +8024,25 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
                 fullmag::fem::runtime::petsc_slepc_process_mutex());
             process_unsafe_after_destroy =
                 fullmag::fem::runtime::petsc_slepc_process_is_unsafe_locked();
+        }
+        if (!row_restore_failure_observed || !primary_cleanup_codes_distinct ||
+            !process_unsafe_before_destroy || !process_unsafe_after_destroy) {
+            std::fprintf(stderr,
+                         "FAIL-DIAGNOSTICS: borrowed_pmat fault=%s status=%d\n"
+                         "diagnostics=%s\nresult=%s\nborrowed_observation=%s\n",
+                         row_fault_name, fault_status, fault_diagnostics.c_str(),
+                         fault_result_json.c_str(), fault_borrowed_observation.c_str());
+            for (const auto &entry : row_contract_checks) {
+                std::fprintf(stderr, "FAIL-DIAGNOSTICS: %s=%d\n", entry.second,
+                             entry.first ? 1 : 0);
+            }
+            std::fprintf(stderr,
+                         "FAIL-DIAGNOSTICS: row_restore_failure_observed=%d primary_cleanup_codes_distinct=%d "
+                         "process_unsafe_before_destroy=%d process_unsafe_after_destroy=%d\n",
+                         row_restore_failure_observed ? 1 : 0,
+                         primary_cleanup_codes_distinct ? 1 : 0,
+                         process_unsafe_before_destroy ? 1 : 0,
+                         process_unsafe_after_destroy ? 1 : 0);
         }
         check(row_restore_failure_observed && primary_cleanup_codes_distinct,
               "borrowed-Pmat row failure preserves restore order, distinct primary/cleanup errors, and solve/quarantine evidence");

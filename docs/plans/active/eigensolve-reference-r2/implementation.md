@@ -957,3 +957,11 @@ GHA38149497927 na fdf811f10ba90d87861ceac67a5b81fc385cc6c1 zakończyła się FAI
 ## Tożsamość importowanej referencji
 
 4240898344: SHA-256 pełnego payloadu eliminuje kolizję plików o tej samej nazwie, liczbie punktów i pierwszym wierszu. Snapshot wszystkich danych przed await zachowuje zgodność ID/payload; session fence po digest nie dopuszcza mutacji wygasłej sesji. WebCrypto wymagane (secure browser context); brak tej capability kończy import jawnym błędem przed create. Nie migrujemy historycznych IDs i nie uznajemy poprawki canonical dataset identity4241564392 za wykonaną. GHA uruchomi także rzeczywiste tests definicji oraz reference overlay; browser/runtime NOT VERIFIED.
+
+
+GHA38152887838 na c0baba9d76ebd6be82b08e447a1d3c94e534b923:196tests/14files, full typecheck i architecture PASS. Nowy SHA/snapshot/sessionfence/overlay kontrakt wykonany. React Doctor617 diagnostics semantycznie identycznych z38149842014, pełna bramka FAIL (nie waived). Browser i kwalifikacja pozostają NOT VERIFIED.
+
+
+## Korekta fixture i diagnostyka pięciu native failures
+
+Po analizie artifact11705733979 pattern-mismatch fixture dostał ten sam poprawny FIELD descriptor/digest co inne probes. Dwa rowrestore/primarycleanup probes zachowują dokładne PASS criteria; na FAILURE drukują status, 13 named conjuncts oraz bounded owned JSON snapshots przed/po destroy. Nie osłabiono production guards i nie uznano happybreakdown full/mixed za naprawione. SOURCE diff review PASS, compile i rerun wyłącznie GHA wymagane.

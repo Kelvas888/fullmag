@@ -829,6 +829,20 @@
       "new_hysteresis_cases_passed": 5,
       "log_sha256": "72b3fc502d5743d95a6496695de272ad59e65786554180bbe947f479b741f23e",
       "scientific_qualification": "NOT VERIFIED"
+    },
+    {
+      "run_id": 38152887838,
+      "sha": "c0baba9d76ebd6be82b08e447a1d3c94e534b923",
+      "conclusion": "failure",
+      "scope": "full_reference_content_sha256_snapshot_session_fence_and_overlay",
+      "tests_passed": 196,
+      "test_files": 14,
+      "complete_typecheck": "passed",
+      "architecture": "passed",
+      "React_Doctor": "failure:617 diagnostic semantics unchanged vs38149842014 ignoring only source positions",
+      "browser": "NOT VERIFIED",
+      "qualification_claimed": false,
+      "log_sha256": "8e3de266345d50229504f7219fea55e074148a1a73096d44bc9017eae95d7e61"
     }
   ]
 }
