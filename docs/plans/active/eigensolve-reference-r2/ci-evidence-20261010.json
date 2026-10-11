@@ -465,6 +465,33 @@
       "failure": "two new render round-trip fixtures lack local render_scene_document_as_script import; production validation assertions reached and passed",
       "log_sha256": "451e55580f9ee778c77c9cc48720d253d4c507f50defc6ccdd997118aa97f541",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38137488625,
+      "sha": "618413ee951f9fcec07d3a0c94573fd8fbd669ab",
+      "conclusion": "success",
+      "scope": "focused_authoring_policy_and_script_round_trip",
+      "tests_passed": 83,
+      "tests_failed": 0,
+      "subtests_passed": 24,
+      "tests_deselected": 341,
+      "log_sha256": "14ef8901cd718a34fa669daf948024d4eee2d60c8249742a734c3e753cccab92",
+      "managed_runtime": "NOT VERIFIED",
+      "browser": "NOT VERIFIED",
+      "qualification_claimed": false
+    },
+    {
+      "run_id": 38138305982,
+      "sha": "3d8c25939bfb3da0ee802c5f8c874ae0832b8da4",
+      "conclusion": "failure",
+      "scope": "focused_field_output_selection",
+      "runner_test_compilation": "passed",
+      "output_selection_tests_passed": 15,
+      "actual_single_writer_test_passed": true,
+      "tracked_bias_aggregation_executed": false,
+      "failure": "CI host lacks rg; named-execution guard failed after single writer actually passed; replace guard with available grep",
+      "log_sha256": "2cde2b8c23cebb8b0e223755d7409490283a7d1817aea1c3ea01f335ab5bfcb4",
+      "qualification_claimed": false
     }
   ]
 }

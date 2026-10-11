@@ -34,8 +34,8 @@ jobs:
       - name: Run actual single-sample writer contract
         run: |
           cargo test --locked -p fullmag-runner --lib fem::eigen_tests::native_eigen_v2_mode_metadata_preserves_operator_provenance -- --exact --nocapture | tee "$RUNNER_TEMP/modal-single-writer.log"
-          rg -F "test fem::eigen_tests::native_eigen_v2_mode_metadata_preserves_operator_provenance ... ok" "$RUNNER_TEMP/modal-single-writer.log"
+          grep -F "test fem::eigen_tests::native_eigen_v2_mode_metadata_preserves_operator_provenance ... ok" "$RUNNER_TEMP/modal-single-writer.log"
       - name: Run actual tracked bias aggregation contract
         run: |
           cargo test --locked -p fullmag-runner --lib fem::eigen_path::test_support::bias_field_branch_selection_tracks_native_publisher_artifacts_before_publication -- --exact --nocapture | tee "$RUNNER_TEMP/modal-tracked-writer.log"
-          rg -F "test fem::eigen_path::test_support::bias_field_branch_selection_tracks_native_publisher_artifacts_before_publication ... ok" "$RUNNER_TEMP/modal-tracked-writer.log"
+          grep -F "test fem::eigen_path::test_support::bias_field_branch_selection_tracks_native_publisher_artifacts_before_publication ... ok" "$RUNNER_TEMP/modal-tracked-writer.log"

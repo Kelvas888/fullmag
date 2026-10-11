@@ -797,3 +797,15 @@ wspólną candidatepool/disjointsamples oraz istniejący tracked-bias pipeline,
 sprawdzając finalny indeks, metadata, manifest/branches i backingSHA.
 Nowy focused GHA wymaga rzeczywistych named tests PASS. Typy, execution
 i parity fizyki pozostają NOT VERIFIED do odpowiednich dowodów.
+
+
+P0/P10 authoring gate #38137488625 na618413ee951f9fcec07d3a0c94573fd8fbd669ab:83 tests i24subtests PASS,341deselected; scientific validator PASS. Zachowano wcześniejszy FAIL z brakującymi importami. Runtime/browser/nauka pozostają odrębne.
+
+
+Field selection #38138305982 na3d8c25939bfb3da0ee802c5f8c874ae0832b8da4:
+Rust test compilation oraz15outputselectiontests i namedactualsinglewriter
+PASS. JobFAIL dopiero na named-execution guard: na hoście GHA nie ma rg.
+Tracked-bias case jeszcze niewykonany. Guard korzysta teraz z dostępnego
+grep i zachowuje obowiązek wykonanego namedPASS; nie usunięto zabezpieczenia
+zero-tests. Fieldreview nadal implemented_pending_ci, bez zamknięcia
+agregacji ani kwalifikacji CPU/GPU.
