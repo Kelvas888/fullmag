@@ -7,6 +7,7 @@ use super::eigen_projection::tangent_bases;
 use super::eigen_reduction::{
     tangent_frame_identity_mismatch, tangent_transport_matrix, tangent_transport_nonunitarity,
 };
+use crate::eigen::output_selection::{validate_eigen_mode_fields, SampleModeId};
 use crate::types::AuxiliaryArtifact;
 use crate::types::RunError;
 use fullmag_engine::fem::MeshTopology;
@@ -17,6 +18,7 @@ use fullmag_ir::EquilibriumSourceIR;
 use fullmag_ir::FemEigenPlanIR;
 use fullmag_ir::KSamplingIR;
 use fullmag_ir::OutputIR;
+use fullmag_ir::SampleSelectorIR;
 use fullmag_ir::SpinWaveBoundaryConditionIR;
 use fullmag_ir::SpinWaveBoundaryKindIR;
 use num_complex::Complex64;
@@ -28,7 +30,10 @@ pub(super) fn requested_mode_indices(outputs: &[OutputIR]) -> std::collections::
     outputs
         .iter()
         .filter_map(|output| {
-            if let OutputIR::EigenMode { indices, .. } = output {
+            if let OutputIR::EigenMode {
+                indices, ..
+            } = output
+            {
                 Some(indices.iter().copied())
             } else {
                 None
@@ -41,6 +46,9 @@ pub(super) fn requested_mode_indices(outputs: &[OutputIR]) -> std::collections::
 /// Native single-k artifacts use the actual returned vector slots. Path
 /// publication resolves public raw identities from the emitted spectrum.
 pub(super) fn requested_mode_indices_for_result(outputs: &[OutputIR], returned_count: usize) -> Result<BTreeSet<u32>, RunError> {
+    validate_eigen_mode_fields(outputs).map_err(|error| RunError {
+        message: error.to_string(),
+    })?;
     if outputs.iter().any(|output| matches!(output, OutputIR::EigenMode { all_modes: true, .. })) {
         let count = u32::try_from(returned_count).map_err(|_| RunError {
             message: "returned native mode count exceeds output selector range".to_string(),
@@ -1411,6 +1419,331 @@ fn mode_payload_path(sample_index: usize, raw_mode_index: u64) -> String {
     format!("eigen/mode_fields/sample_{sample_index:04}/mode_{raw_mode_index:04}/vector.bin")
 }
 
+const EIGEN_MODE_OUTPUT_SELECTION_PATH: &str = "eigen/mode_output_selection.v1.json";
+
+fn direct_sample_selector_matches(
+    selector: Option<&SampleSelectorIR>,
+    summary_payload: &serde_json::Value,
+    sample_index: usize,
+) -> Result<bool, RunError> {
+    let Some(selector) = selector else {
+        return Ok(true);
+    };
+    if selector.sample_indices.is_empty() && selector.sample_labels.is_empty() {
+        return Err(RunError {
+            message: "eigen_mode sample_selector must contain sample_indices or sample_labels".to_string(),
+        });
+    }
+    let selected_by_index = if selector.sample_indices.is_empty() {
+        false
+    } else {
+        let sample_index = u32::try_from(sample_index).map_err(|_| RunError {
+            message: format!("eigen_mode sample index {sample_index} does not fit the selector range"),
+        })?;
+        selector.sample_indices.contains(&sample_index)
+    };
+    let selected_by_label = if selector.sample_labels.is_empty() {
+        false
+    } else {
+        let sample_label = summary_payload
+            .get("sample_label")
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                summary_payload
+                    .get("sample")
+                    .and_then(|sample| sample.get("label"))
+                    .and_then(|value| value.as_str())
+            });
+        match sample_label {
+            Some(sample_label) => selector
+                .sample_labels
+                .iter()
+                .any(|label| label.trim() == sample_label.trim()),
+            None if selected_by_index => false,
+            None => {
+                return Err(RunError {
+                    message: "single-sample eigen writer cannot resolve the requested sample label".to_string(),
+                });
+            }
+        }
+    };
+    Ok(selected_by_index || selected_by_label)
+}
+
+fn direct_sample_mode_output_selection(
+    summary_payload: &serde_json::Value,
+    outputs: &[OutputIR],
+    requested_modes: &BTreeSet<u32>,
+    sample_index: usize,
+) -> Result<
+    (
+        BTreeMap<String, BTreeSet<SampleModeId>>,
+        BTreeMap<String, BTreeSet<usize>>,
+    ),
+    RunError,
+> {
+    validate_eigen_mode_fields(outputs).map_err(|error| RunError {
+        message: error.to_string(),
+    })?;
+    let mut field_mode_ids = BTreeMap::<String, BTreeSet<SampleModeId>>::new();
+    let mut field_sample_ids = BTreeMap::<String, BTreeSet<usize>>::new();
+    if outputs.is_empty() {
+        if !requested_modes.is_empty() {
+            field_sample_ids
+                .entry("mode".to_string())
+                .or_default()
+                .insert(sample_index);
+            for raw_mode_index in requested_modes {
+                let raw_mode_index = usize::try_from(*raw_mode_index).map_err(|_| RunError {
+                    message: format!("requested raw mode index {raw_mode_index} does not fit this platform"),
+                })?;
+                field_mode_ids
+                    .entry("mode".to_string())
+                    .or_default()
+                    .insert(SampleModeId::new(sample_index, raw_mode_index));
+            }
+        }
+        return Ok((field_mode_ids, field_sample_ids));
+    }
+
+    for output in outputs {
+        let OutputIR::EigenMode {
+            field,
+            all_modes,
+            indices,
+            branches,
+            sample_selector,
+        } = output
+        else {
+            continue;
+        };
+        if !branches.is_empty() {
+            return Err(RunError {
+                message: format!(
+                    "direct single-sample eigen writer cannot resolve branch selectors {:?} to raw mode indices; use the tracked path writer",
+                    branches
+                ),
+            });
+        }
+        if !direct_sample_selector_matches(sample_selector.as_ref(), summary_payload, sample_index)? {
+            continue;
+        }
+        let field = field.trim().to_string();
+        field_sample_ids
+            .entry(field.clone())
+            .or_default()
+            .insert(sample_index);
+        for raw_mode_index in requested_modes {
+            if !all_modes && !indices.contains(raw_mode_index) {
+                continue;
+            }
+            let raw_mode_index = usize::try_from(*raw_mode_index).map_err(|_| RunError {
+                message: format!("requested raw mode index {raw_mode_index} does not fit this platform"),
+            })?;
+            field_mode_ids
+                .entry(field.clone())
+                .or_default()
+                .insert(SampleModeId::new(sample_index, raw_mode_index));
+        }
+    }
+    Ok((field_mode_ids, field_sample_ids))
+}
+
+fn unique_artifact_index(
+    artifacts: &[AuxiliaryArtifact],
+    relative_path: &str,
+) -> Result<usize, RunError> {
+    let mut matches = artifacts
+        .iter()
+        .enumerate()
+        .filter(|(_, artifact)| artifact.relative_path == relative_path);
+    let Some((index, _)) = matches.next() else {
+        return Err(RunError {
+            message: format!("eigen mode output selection is missing backing artifact {relative_path}"),
+        });
+    };
+    if matches.next().is_some() {
+        return Err(RunError {
+            message: format!("eigen mode output selection has duplicate backing artifact {relative_path}"),
+        });
+    }
+    Ok(index)
+}
+
+pub(super) fn append_eigen_mode_output_selection(
+    artifacts: &mut Vec<AuxiliaryArtifact>,
+    field_mode_ids_by_field: &BTreeMap<String, BTreeSet<SampleModeId>>,
+    field_sample_ids_by_field: &BTreeMap<String, BTreeSet<usize>>,
+) -> Result<Option<String>, RunError> {
+    let fields = field_mode_ids_by_field
+        .keys()
+        .chain(field_sample_ids_by_field.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut field_selections = Vec::new();
+    let mut fields_by_mode = BTreeMap::<SampleModeId, BTreeSet<String>>::new();
+    for field in fields {
+        if !matches!(field.as_str(), "mode" | "mode_complex") {
+            return Err(RunError {
+                message: format!(
+                    "eigen_mode field {field:?} is unsupported; supported fields are 'mode' and 'mode_complex'"
+                ),
+            });
+        }
+        let sample_ids = field_sample_ids_by_field
+            .get(&field)
+            .cloned()
+            .unwrap_or_default();
+        let mode_ids = field_mode_ids_by_field
+            .get(&field)
+            .cloned()
+            .unwrap_or_default();
+        for mode_id in &mode_ids {
+            if !sample_ids.contains(&mode_id.sample_index) {
+                return Err(RunError {
+                    message: format!(
+                        "eigen mode field {field:?} selected raw mode {} outside its sample selector",
+                        mode_id.raw_mode_index
+                    ),
+                });
+            }
+            fields_by_mode
+                .entry(*mode_id)
+                .or_default()
+                .insert(field.clone());
+        }
+        for sample_index in sample_ids {
+            let raw_mode_indices = mode_ids
+                .iter()
+                .filter(|mode_id| mode_id.sample_index == sample_index)
+                .map(|mode_id| mode_id.raw_mode_index)
+                .collect::<Vec<_>>();
+            field_selections.push(serde_json::json!({
+                "field": field,
+                "sample_index": sample_index,
+                "raw_mode_indices": raw_mode_indices,
+            }));
+        }
+    }
+
+    let mut payload_entries = Vec::new();
+    let mut metadata_updates = Vec::new();
+    for (mode_id, requested_fields) in &fields_by_mode {
+        let raw_mode_index = u64::try_from(mode_id.raw_mode_index).map_err(|_| RunError {
+            message: format!(
+                "raw mode index {} does not fit the artifact range",
+                mode_id.raw_mode_index
+            ),
+        })?;
+        let metadata_path = mode_metadata_path(mode_id.sample_index, raw_mode_index);
+        let payload_path = mode_payload_path(mode_id.sample_index, raw_mode_index);
+        let metadata_index = unique_artifact_index(artifacts, &metadata_path)?;
+        let payload_index = unique_artifact_index(artifacts, &payload_path)?;
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&artifacts[metadata_index].bytes).map_err(|error| RunError {
+                message: format!(
+                    "selected eigen mode metadata {metadata_path} is invalid JSON: {error}"
+                ),
+            })?;
+        let actual_sample_index = metadata
+            .get("sample_index")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| usize::try_from(value).ok());
+        let actual_raw_mode_index = metadata
+            .get("raw_mode_index")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| usize::try_from(value).ok());
+        if actual_sample_index != Some(mode_id.sample_index)
+            || actual_raw_mode_index != Some(mode_id.raw_mode_index)
+        {
+            return Err(RunError {
+                message: format!(
+                    "selected eigen mode metadata {metadata_path} identity does not match the requested sample/raw-mode pair"
+                ),
+            });
+        }
+        let expected_field_id = mode_field_id(mode_id.sample_index, raw_mode_index);
+        if metadata.get("mode_field_id").and_then(|value| value.as_str())
+            != Some(expected_field_id.as_str())
+        {
+            return Err(RunError {
+                message: format!(
+                    "selected eigen mode metadata {metadata_path} has no matching mode_field_id"
+                ),
+            });
+        }
+        let payload_sha256 = metadata
+            .get("payload_sha256")
+            .and_then(|value| value.as_str())
+            .map(str::to_owned)
+            .ok_or_else(|| RunError {
+                message: format!(
+                    "selected eigen mode metadata {metadata_path} has no payload_sha256"
+                ),
+            })?;
+        let actual_payload_sha256 =
+            format!("sha256:{:x}", Sha256::digest(&artifacts[payload_index].bytes));
+        if payload_sha256 != actual_payload_sha256 {
+            return Err(RunError {
+                message: format!(
+                    "selected eigen mode payload {payload_path} SHA-256 does not match {metadata_path}"
+                ),
+            });
+        }
+        let object = metadata.as_object_mut().ok_or_else(|| RunError {
+            message: format!("selected eigen mode metadata {metadata_path} must be a JSON object"),
+        })?;
+        object.insert(
+            "requested_fields".to_string(),
+            serde_json::to_value(requested_fields.iter().collect::<Vec<_>>()).map_err(
+                |error| RunError {
+                    message: format!("failed to serialize requested eigen mode fields: {error}"),
+                },
+            )?,
+        );
+        object.insert(
+            "field_output_selection_path".to_string(),
+            serde_json::json!(EIGEN_MODE_OUTPUT_SELECTION_PATH),
+        );
+        metadata_updates.push((
+            metadata_index,
+            serde_json::to_vec_pretty(&metadata).map_err(|error| RunError {
+                message: format!(
+                    "failed to serialize eigen mode metadata {metadata_path}: {error}"
+                ),
+            })?,
+        ));
+
+        for field in requested_fields {
+            payload_entries.push(serde_json::json!({
+                "field": field,
+                "sample_index": mode_id.sample_index,
+                "raw_mode_index": mode_id.raw_mode_index,
+                "mode_field_id": expected_field_id,
+                "metadata_path": metadata_path,
+                "payload_path": payload_path,
+                "payload_sha256": payload_sha256,
+            }));
+        }
+    }
+
+    for (index, bytes) in metadata_updates {
+        artifacts[index].bytes = bytes;
+    }
+    artifacts.retain(|artifact| artifact.relative_path != EIGEN_MODE_OUTPUT_SELECTION_PATH);
+    if field_selections.is_empty() {
+        return Ok(None);
+    }
+
+    let selection_value = serde_json::json!({
+        "schema_version": "eigen_mode_output_selection.v1",
+        "payload_semantics": "full_complex_delta_m",
+        "field_selections": field_selections,
+        "payloads": payload_entries,
+    });
+    artifacts.push(json_artifact(EIGEN_MODE_OUTPUT_SELECTION_PATH, &selection_value)?);
+    Ok(Some(EIGEN_MODE_OUTPUT_SELECTION_PATH.to_string()))
+}
 pub(super) fn floquet_potential_payload_path(sample_index: usize, raw_mode_index: u64) -> String {
     format!(
         "eigen/mode_fields/sample_{sample_index:04}/mode_{raw_mode_index:04}/potential_real_split.bin"
@@ -2217,6 +2550,7 @@ pub(super) fn write_eigen_v2_bundle(
         auxiliary_artifacts,
         sample_index,
         &[],
+        false,
     )
 }
 
@@ -2227,7 +2561,37 @@ pub(super) fn write_eigen_v2_bundle_with_outputs(
     auxiliary_artifacts: &mut Vec<AuxiliaryArtifact>,
     sample_index: usize,
     outputs: &[OutputIR],
+    defer_mode_output_selection_binding: bool,
 ) -> Result<(), RunError> {
+    validate_eigen_mode_fields(outputs).map_err(|error| RunError {
+        message: error.to_string(),
+    })?;
+    let output_selection = if defer_mode_output_selection_binding {
+        None
+    } else {
+        Some(direct_sample_mode_output_selection(
+            summary_payload,
+            outputs,
+            requested_modes,
+            sample_index,
+        )?)
+    };
+    let selected_mode_indices = if defer_mode_output_selection_binding {
+        requested_modes.clone()
+    } else if outputs.is_empty() {
+        requested_modes.clone()
+    } else {
+        output_selection
+            .as_ref()
+            .expect("direct output selection was resolved")
+            .0
+            .values()
+            .flat_map(|mode_ids| mode_ids.iter().map(|mode_id| mode_id.raw_mode_index))
+            .map(|raw_mode_index| u32::try_from(raw_mode_index).map_err(|_| RunError {
+                message: format!("requested raw mode index {raw_mode_index} exceeds output selector range"),
+            }))
+            .collect::<Result<BTreeSet<_>, _>>()?
+    };
     let has_diagnostics_request = outputs
         .iter()
         .any(|output| matches!(output, OutputIR::EigenDiagnostics { .. }));
@@ -2272,7 +2636,7 @@ pub(super) fn write_eigen_v2_bundle_with_outputs(
         .unwrap_or_default();
     let (floquet_metadata_by_mode, floquet_publications) = collect_floquet_potential_publications(
         &modes,
-        requested_modes,
+        &selected_mode_indices,
         auxiliary_artifacts,
         sample_index,
     )?;
@@ -2300,7 +2664,7 @@ pub(super) fn write_eigen_v2_bundle_with_outputs(
     // by the author remain legitimate spectrum-only observations and never
     // receive a dangling field identifier.
     let mut visualizable_mode_indices = BTreeSet::new();
-    for raw_mode_index in requested_modes.iter().copied().map(u64::from) {
+    for raw_mode_index in selected_mode_indices.iter().copied().map(u64::from) {
         let legacy_path = format!("eigen/modes/mode_{raw_mode_index:04}.json");
         let legacy_mode = auxiliary_artifacts
             .iter()
@@ -2592,7 +2956,7 @@ pub(super) fn write_eigen_v2_bundle_with_outputs(
     let mut mode_metadata_paths = Vec::new();
     let mut mode_resource_keys = Vec::new();
     let mut wrote_mode_zarr_store = false;
-    for raw_mode_index in requested_modes.iter().copied().map(u64::from) {
+    for raw_mode_index in selected_mode_indices.iter().copied().map(u64::from) {
         let legacy_path = format!("eigen/modes/mode_{raw_mode_index:04}.json");
         let legacy_mode = auxiliary_artifacts
             .iter()
@@ -2897,6 +3261,13 @@ pub(super) fn write_eigen_v2_bundle_with_outputs(
             &[sample_index],
         );
 
+    let mode_output_selection_path = if defer_mode_output_selection_binding {
+        None
+    } else if let Some((field_mode_ids, field_sample_ids)) = output_selection.as_ref() {
+        append_eigen_mode_output_selection(auxiliary_artifacts, field_mode_ids, field_sample_ids)?
+    } else {
+        None
+    };
     let has_mode_fields = !mode_metadata_paths.is_empty();
     let spectrum_revision = spectrum_v2_revision.clone();
     let branches_revision = if publish_branches_bundle {
@@ -2960,6 +3331,7 @@ pub(super) fn write_eigen_v2_bundle_with_outputs(
             },
             "mode_field_storage_format": if has_mode_fields { "zarr" } else { "none" },
             "mode_metadata_paths": mode_metadata_paths,
+            "mode_output_selection_path": mode_output_selection_path,
             "linearization_identity_v2_path": linearization_identity_paths
                 .as_ref()
                 .map(|(identity_path, _)| serde_json::json!(identity_path))

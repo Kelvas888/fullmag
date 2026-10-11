@@ -38,7 +38,7 @@ use fullmag_engine::{
 };
 use fullmag_ir::{
     EigenDampingPolicyIR, EigenNormalizationIR, EquilibriumSourceIR, FemEigenPlanIR, KPointIR,
-    KSamplingIR, OutputIR, SpinWaveBoundaryConditionIR, SpinWaveBoundaryKindIR,
+    KSamplingIR, OutputIR, SampleSelectorIR, SpinWaveBoundaryConditionIR, SpinWaveBoundaryKindIR,
 };
 use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use num_complex::Complex64;
@@ -5296,6 +5296,227 @@ fn native_eigen_v2_mode_metadata_preserves_operator_provenance() {
     assert_eq!(
         nested["payload_sha256"],
         format!("sha256:{:x}", Sha256::digest(&chunk.bytes))
+    );
+    assert_eq!(nested["requested_fields"], serde_json::json!(["mode"]));
+    assert_eq!(
+        manifest["artifacts"]["mode_output_selection_path"],
+        "eigen/mode_output_selection.v1.json"
+    );
+    let default_selection = artifacts
+        .iter()
+        .find(|artifact| artifact.relative_path == "eigen/mode_output_selection.v1.json")
+        .and_then(|artifact| serde_json::from_slice::<serde_json::Value>(&artifact.bytes).ok())
+        .expect("default mode request should publish its field selection");
+    assert_eq!(
+        default_selection["field_selections"],
+        serde_json::json!([{
+            "field": "mode",
+            "sample_index": 0,
+            "raw_mode_indices": [0],
+        }])
+    );
+
+    let mode_for_sample_zero = OutputIR::EigenMode {
+        field: "mode".to_string(),
+        all_modes: false,
+        indices: vec![0],
+        branches: vec![],
+        sample_selector: Some(SampleSelectorIR {
+            sample_indices: vec![0],
+            sample_labels: vec![],
+        }),
+    };
+    let mode_for_sample_one = OutputIR::EigenMode {
+        field: "mode_complex".to_string(),
+        all_modes: false,
+        indices: vec![1],
+        branches: vec![],
+        sample_selector: Some(SampleSelectorIR {
+            sample_indices: vec![1],
+            sample_labels: vec![],
+        }),
+    };
+    let global_mode_outputs = [mode_for_sample_zero, mode_for_sample_one];
+    let mut mode_one = legacy_mode.clone();
+    mode_one["index"] = serde_json::json!(1);
+    let mut shared_summary = summary.clone();
+    shared_summary["modes"] = serde_json::json!([legacy_mode.clone(), mode_one.clone()]);
+    let shared_requested_modes = BTreeSet::from([0_u32, 1_u32]);
+
+    let mut sample_zero_artifacts = vec![
+        json_artifact("eigen/modes/mode_0000.json", &legacy_mode)
+            .expect("sample zero legacy mode should serialize"),
+        json_artifact("eigen/modes/mode_0001.json", &mode_one)
+            .expect("second legacy candidate should serialize"),
+    ];
+    write_eigen_v2_bundle_with_outputs(
+        &plan,
+        &shared_summary,
+        &shared_requested_modes,
+        &mut sample_zero_artifacts,
+        0,
+        &global_mode_outputs,
+        false,
+    )
+    .expect("sample zero mode request should write from the shared candidate pool");
+    let sample_zero_selection = sample_zero_artifacts
+        .iter()
+        .find(|artifact| artifact.relative_path == "eigen/mode_output_selection.v1.json")
+        .and_then(|artifact| serde_json::from_slice::<serde_json::Value>(&artifact.bytes).ok())
+        .expect("sample zero field selection should be published");
+    assert_eq!(
+        sample_zero_selection["field_selections"],
+        serde_json::json!([{
+            "field": "mode",
+            "sample_index": 0,
+            "raw_mode_indices": [0],
+        }])
+    );
+    assert_eq!(sample_zero_selection["payloads"].as_array().unwrap().len(), 1);
+    assert_eq!(sample_zero_selection["payloads"][0]["field"], "mode");
+    assert_eq!(sample_zero_selection["payloads"][0]["sample_index"], 0);
+    assert_eq!(sample_zero_selection["payloads"][0]["raw_mode_index"], 0);
+    let sample_zero_metadata = sample_zero_artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.relative_path == "eigen/modes/sample_0000/mode_0000.json"
+        })
+        .and_then(|artifact| serde_json::from_slice::<serde_json::Value>(&artifact.bytes).ok())
+        .expect("sample zero selected metadata should be backed");
+    assert_eq!(
+        sample_zero_metadata["requested_fields"],
+        serde_json::json!(["mode"])
+    );
+    assert!(
+        sample_zero_artifacts.iter().all(|artifact| {
+            artifact.relative_path != "eigen/modes/sample_0000/mode_0001.json"
+                && artifact.relative_path
+                    != "eigen/mode_fields/sample_0000/mode_0001/vector.bin"
+        }),
+        "sample zero must not publish its mode_complex/raw-mode-1 candidate"
+    );
+    let sample_zero_payload = sample_zero_artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.relative_path
+                == "eigen/mode_fields/sample_0000/mode_0000/vector.bin"
+        })
+        .expect("sample zero selection should link a real vector payload");
+    assert_eq!(
+        sample_zero_selection["payloads"][0]["payload_sha256"],
+        format!("sha256:{:x}", Sha256::digest(&sample_zero_payload.bytes))
+    );
+
+    let mut sample_one_artifacts = vec![
+        json_artifact("eigen/modes/mode_0000.json", &legacy_mode)
+            .expect("first legacy candidate should serialize"),
+        json_artifact("eigen/modes/mode_0001.json", &mode_one)
+            .expect("sample one legacy mode should serialize"),
+    ];
+    write_eigen_v2_bundle_with_outputs(
+        &plan,
+        &shared_summary,
+        &shared_requested_modes,
+        &mut sample_one_artifacts,
+        1,
+        &global_mode_outputs,
+        false,
+    )
+    .expect("sample one complex mode request should write from the shared candidate pool");
+    let sample_one_selection = sample_one_artifacts
+        .iter()
+        .find(|artifact| artifact.relative_path == "eigen/mode_output_selection.v1.json")
+        .and_then(|artifact| serde_json::from_slice::<serde_json::Value>(&artifact.bytes).ok())
+        .expect("sample one field selection should be published");
+    assert_eq!(
+        sample_one_selection["field_selections"],
+        serde_json::json!([{
+            "field": "mode_complex",
+            "sample_index": 1,
+            "raw_mode_indices": [1],
+        }])
+    );
+    assert_eq!(sample_one_selection["payloads"].as_array().unwrap().len(), 1);
+    assert_eq!(sample_one_selection["payloads"][0]["field"], "mode_complex");
+    assert_eq!(sample_one_selection["payloads"][0]["sample_index"], 1);
+    assert_eq!(sample_one_selection["payloads"][0]["raw_mode_index"], 1);
+    let sample_one_metadata = sample_one_artifacts
+        .iter()
+        .find(|artifact| {
+            artifact.relative_path == "eigen/modes/sample_0001/mode_0001.json"
+        })
+        .and_then(|artifact| serde_json::from_slice::<serde_json::Value>(&artifact.bytes).ok())
+        .expect("sample one selected metadata should be backed");
+    assert_eq!(
+        sample_one_metadata["requested_fields"],
+        serde_json::json!(["mode_complex"])
+    );
+    assert_eq!(
+        sample_one_metadata["field_output_selection_path"],
+        "eigen/mode_output_selection.v1.json"
+    );
+    assert!(
+        sample_one_artifacts.iter().all(|artifact| {
+            artifact.relative_path != "eigen/modes/sample_0001/mode_0000.json"
+                && artifact.relative_path
+                    != "eigen/mode_fields/sample_0001/mode_0000/vector.bin"
+        }),
+        "sample one must not publish its mode/raw-mode-0 candidate"
+    );
+    let unsupported_output = OutputIR::EigenMode {
+        field: "mode_real".to_string(),
+        all_modes: false,
+        indices: vec![0],
+        branches: vec![],
+        sample_selector: None,
+    };
+    let mut unsupported_artifacts = vec![
+        json_artifact("eigen/modes/mode_0000.json", &legacy_mode)
+            .expect("sentinel legacy mode should serialize"),
+    ];
+    let unsupported_before = unsupported_artifacts[0].bytes.clone();
+    let unsupported_error = write_eigen_v2_bundle_with_outputs(
+        &plan,
+        &summary,
+        &BTreeSet::from([0_u32]),
+        &mut unsupported_artifacts,
+        0,
+        &[unsupported_output],
+        false,
+    )
+    .expect_err("unsupported field must be rejected before artifacts are written");
+    assert!(unsupported_error.message.contains("unsupported"));
+    assert_eq!(unsupported_artifacts.len(), 1);
+    assert_eq!(unsupported_artifacts[0].relative_path, "eigen/modes/mode_0000.json");
+    assert_eq!(unsupported_artifacts[0].bytes, unsupported_before);
+
+    let unresolved_branch_output = OutputIR::EigenMode {
+        field: "mode".to_string(),
+        all_modes: false,
+        indices: vec![],
+        branches: vec![17],
+        sample_selector: None,
+    };
+    let mut unresolved_branch_artifacts = vec![
+        json_artifact("eigen/modes/mode_0000.json", &legacy_mode)
+            .expect("sentinel legacy mode should serialize"),
+    ];
+    let unresolved_branch_before = unresolved_branch_artifacts[0].bytes.clone();
+    let unresolved_branch_error = write_eigen_v2_bundle_with_outputs(
+        &plan,
+        &summary,
+        &BTreeSet::from([0_u32]),
+        &mut unresolved_branch_artifacts,
+        0,
+        &[unresolved_branch_output],
+        false,
+    )
+    .expect_err("direct writer must not alias branch IDs to raw mode IDs");
+    assert!(unresolved_branch_error.message.contains("branch selectors"));
+    assert_eq!(unresolved_branch_artifacts.len(), 1);
+    assert_eq!(
+        unresolved_branch_artifacts[0].bytes,
+        unresolved_branch_before
     );
 }
 

@@ -92,6 +92,7 @@ impl DispersionCurveSelection {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OutputSelectionError {
     EmptyEigenModeField,
+    UnsupportedEigenModeField(String),
     UnsupportedSpectrumQuantity(String),
     EmptyEigenModeSelector,
     ConflictingAllModeSelector,
@@ -142,6 +143,10 @@ impl fmt::Display for OutputSelectionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyEigenModeField => formatter.write_str("eigen_mode field must not be empty"),
+            Self::UnsupportedEigenModeField(field) => write!(
+                formatter,
+                "eigen_mode field {field:?} is unsupported; supported fields are 'mode' and 'mode_complex'"
+            ),
             Self::UnsupportedSpectrumQuantity(quantity) => write!(
                 formatter,
                 "eigen_spectrum quantity {quantity:?} is unsupported; supported quantity is '{CANONICAL_EIGEN_SPECTRUM_QUANTITY}'"
@@ -252,6 +257,7 @@ pub(crate) struct EigenOutputSelection {
     diagnostic_mode_ids: BTreeSet<SampleModeId>,
     diagnostics_request: Option<EigenDiagnosticsRequest>,
     field_mode_ids_by_field: BTreeMap<String, BTreeSet<SampleModeId>>,
+    field_sample_ids_by_field: BTreeMap<String, BTreeSet<usize>>,
     selected_sample_ids: BTreeSet<usize>,
     tracked_branch_ids: BTreeSet<usize>,
     dispersion_curves: Vec<DispersionCurveSelection>,
@@ -282,6 +288,14 @@ impl EigenOutputSelection {
 
     pub(crate) fn field_mode_ids_for_field(&self, field: &str) -> Option<&BTreeSet<SampleModeId>> {
         self.field_mode_ids_by_field.get(field)
+    }
+
+    pub(crate) fn field_mode_ids_by_field(&self) -> &BTreeMap<String, BTreeSet<SampleModeId>> {
+        &self.field_mode_ids_by_field
+    }
+
+    pub(crate) fn field_sample_ids_by_field(&self) -> &BTreeMap<String, BTreeSet<usize>> {
+        &self.field_sample_ids_by_field
     }
 
     pub(crate) fn selected_sample_ids(&self) -> &BTreeSet<usize> {
@@ -381,6 +395,26 @@ impl EigenOutputSelection {
     }
 }
 
+/// Reject mode field identifiers without a published modal payload contract.
+pub(crate) fn validate_eigen_mode_fields(
+    outputs: &[OutputIR],
+) -> Result<(), OutputSelectionError> {
+    for output in outputs {
+        if let OutputIR::EigenMode { field, .. } = output {
+            let normalized = field.trim();
+            if normalized.is_empty() {
+                return Err(OutputSelectionError::EmptyEigenModeField);
+            }
+            if !matches!(normalized, "mode" | "mode_complex") {
+                return Err(OutputSelectionError::UnsupportedEigenModeField(
+                    field.clone(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reject unsupported spectrum quantities before solving or selecting outputs.
 pub(crate) fn validate_eigen_spectrum_quantities(
     outputs: &[OutputIR],
@@ -402,6 +436,7 @@ pub(crate) fn select_eigen_outputs(
     path_result: &PathSolveResult,
     outputs: &[OutputIR],
 ) -> Result<EigenOutputSelection, OutputSelectionError> {
+    validate_eigen_mode_fields(outputs)?;
     validate_eigen_spectrum_quantities(outputs)?;
     let available = AvailableModes::from_result(path_result)?;
     let mut selection = EigenOutputSelection::default();
@@ -485,6 +520,11 @@ pub(crate) fn select_eigen_outputs(
         let sample_ids = available.resolve_sample_selector(request.sample_selector)?;
         selection
             .selected_sample_ids
+            .extend(sample_ids.iter().copied());
+        selection
+            .field_sample_ids_by_field
+            .entry(request.field.to_string())
+            .or_default()
             .extend(sample_ids.iter().copied());
         let mut request_mode_ids = BTreeSet::new();
 
@@ -928,6 +968,75 @@ mod tests {
         assert!(selection.contains_field_mode_for_field("mode", 10, 2));
         assert!(!selection.contains_field_mode_for_field("mode", 20, 2));
         assert!(selection.requires_branch_tracking());
+    }
+
+    #[test]
+    fn mode_fields_keep_disjoint_sample_and_raw_mode_selections() {
+        let selection = select_eigen_outputs(
+            &result(),
+            &[
+                OutputIR::EigenMode {
+                    field: "mode".to_string(),
+                    all_modes: false,
+                    indices: vec![2],
+                    branches: vec![],
+                    sample_selector: Some(SampleSelectorIR {
+                        sample_indices: vec![10],
+                        sample_labels: vec![],
+                    }),
+                },
+                OutputIR::EigenMode {
+                    field: "mode_complex".to_string(),
+                    all_modes: false,
+                    indices: vec![15],
+                    branches: vec![],
+                    sample_selector: Some(SampleSelectorIR {
+                        sample_indices: vec![20],
+                        sample_labels: vec![],
+                    }),
+                },
+            ],
+        )
+        .expect("both declared mode fields are supported");
+
+        let mode = [SampleModeId::new(10, 2)].into_iter().collect();
+        let mode_complex = [SampleModeId::new(20, 15)].into_iter().collect();
+        assert_eq!(selection.field_mode_ids_for_field("mode"), Some(&mode));
+        assert_eq!(
+            selection.field_mode_ids_for_field("mode_complex"),
+            Some(&mode_complex)
+        );
+        assert_eq!(
+            selection.field_sample_ids_by_field()["mode"],
+            [10].into_iter().collect()
+        );
+        assert_eq!(
+            selection.field_sample_ids_by_field()["mode_complex"],
+            [20].into_iter().collect()
+        );
+        assert_eq!(
+            selection.field_mode_ids().iter().copied().collect::<Vec<_>>(),
+            vec![SampleModeId::new(10, 2), SampleModeId::new(20, 15)]
+        );
+    }
+
+    #[test]
+    fn unsupported_mode_field_is_rejected_before_mode_selection() {
+        let error = select_eigen_outputs(
+            &result(),
+            &[OutputIR::EigenMode {
+                field: "mode_real".to_string(),
+                all_modes: false,
+                indices: vec![2],
+                branches: vec![],
+                sample_selector: None,
+            }],
+        )
+        .expect_err("unpublished mode field identifiers must fail closed");
+        assert_eq!(
+            error,
+            OutputSelectionError::UnsupportedEigenModeField("mode_real".to_string())
+        );
     }
 
     #[test]

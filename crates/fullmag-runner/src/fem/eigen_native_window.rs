@@ -16,7 +16,8 @@ use super::eigen_mass_metric::{
     canonical_shared_domain_phases, validate_shared_domain_phase_anchors, SharedDomainSparseMass,
 };
 use super::eigen_native_artifacts::{
-    native_gpu_modal_shared_domain_execution_provenance, native_modal_artifacts,
+    native_gpu_modal_shared_domain_execution_provenance,
+    native_modal_artifacts_with_selection_binding,
     native_modal_execution_provenance,
 };
 use super::eigen_nonshared_domain::{
@@ -347,6 +348,7 @@ pub(super) fn execute_native_modal_window(
         }
         _ => NATIVE_CPU_MODAL_WINDOW_SOLVER_KIND,
     };
+    let defer_mode_output_selection_binding = potential_publication.is_some();
     emit_fem_eigen_progress(
         &mut progress,
         FemEigenProgress {
@@ -993,7 +995,7 @@ pub(super) fn execute_native_modal_window(
             runner_operator
                 .and_then(|(_, mass)| node_mass_weights_from_tangent_mass(mass, active_nodes))
         });
-    let mut auxiliary_artifacts = native_modal_artifacts(
+    let mut auxiliary_artifacts = native_modal_artifacts_with_selection_binding(
         plan,
         outputs,
         &equilibrium,
@@ -1009,6 +1011,7 @@ pub(super) fn execute_native_modal_window(
         nonshared_floquet_provenance.as_ref(),
         artifact_sample_index,
         state_artifact_sample_index,
+        defer_mode_output_selection_binding,
     )?;
     if shared_domain_mode && !interrupted && plan.enable_demag && plan.operator.include_demag {
         let (_, _, _, scalar_classes, scalar_class_count) =
@@ -1318,6 +1321,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex(
         planned_execution,
         shared_domain_problem,
         None,
+        false,
     )
 }
 
@@ -1383,8 +1387,8 @@ pub(super) fn build_nonshared_floquet_provenance_from_complex(
 }
 
 /// Variant used by the execution owner once it has built the non-shared
-/// source handoff.  The legacy wrapper above intentionally remains source
-/// compatible until that caller is migrated.
+/// source handoff. Selection binding is deferred only when an enclosing path
+/// execution will resolve and publish the final per-field selections.
 pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_provenance(
     plan: &FemEigenPlanIR,
     outputs: &[OutputIR],
@@ -1404,6 +1408,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
     planned_execution: Option<PlannedFemEigenExecution<'_>>,
     shared_domain_problem: Option<native_fem::NativeModalEigenSharedDomainProblem<'_>>,
     mut nonshared_floquet_provenance: Option<NonSharedFloquetProvenance>,
+    defer_mode_output_selection_binding: bool,
 ) -> Result<ExecutedRun, RunError> {
     emit_fem_eigen_progress(
         &mut progress,
@@ -1676,7 +1681,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
         )?;
     }
 
-    let mut auxiliary_artifacts = native_modal_artifacts(
+    let mut auxiliary_artifacts = native_modal_artifacts_with_selection_binding(
         plan,
         outputs,
         &equilibrium,
@@ -1692,6 +1697,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
         nonshared_floquet_provenance.as_ref(),
         artifact_sample_index,
         state_artifact_sample_index,
+        defer_mode_output_selection_binding,
     )?;
     if interrupted {
         auxiliary_artifacts.push(json_artifact(

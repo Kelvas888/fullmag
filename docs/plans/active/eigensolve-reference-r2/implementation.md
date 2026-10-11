@@ -779,3 +779,21 @@ round-trip/omission fixtures przy odwołaniu do niezaimportowanego renderer:
 walidacja wartości i wcześniejsze asercje przeszły. Dodano lokalne importy
 w obu funkcjach, zgodnie z istniejącym stylem. Produkcji i oczekiwań
 nie zmieniono. Obie bramki wymagają kolejnego wykonania w GHA.
+
+
+## P10 — field/sample/raw-mode publication fidelity
+
+Per-field index oraz requested_fields w selectedmetadata odwołują się
+do rzeczywistych backing vector bytes i SHA, zachowując istniejący
+full-complex format dla mode/mode_complex. Unknown fields i direct
+branches bez tracking odmówiono; raw helper nie używa branchIDs. Path
+child publication jest jawnie deferred (także nativewindow i GPUK0),
+finalizer wiąże actualselection po trackingu i retention. Bias aggregation
+usuwa wszystkie provisional childindices przed finalnym append/dedup.
+
+SOURCE root i niezależny review PASS po poprawieniu stalechildindex oraz
+niezwiązanego w jednej funkcji boola. Regresje przechodzą directwriter z
+wspólną candidatepool/disjointsamples oraz istniejący tracked-bias pipeline,
+sprawdzając finalny indeks, metadata, manifest/branches i backingSHA.
+Nowy focused GHA wymaga rzeczywistych named tests PASS. Typy, execution
+i parity fizyki pozostają NOT VERIFIED do odpowiednich dowodów.

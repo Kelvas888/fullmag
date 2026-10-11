@@ -15,6 +15,7 @@ use crate::eigen::output_selection::{select_eigen_outputs, EigenOutputSelection,
 use crate::eigen::{KSampleDescriptor, SingleKModeResult, SingleKSolveResult};
 use crate::fem::eigen_capability::native_cpu_modal_window_enabled;
 use crate::fem::eigen_execution_resolution::{FemEigenExecutionLane, PlannedFemEigenExecution};
+use crate::fem::eigen_output::append_eigen_mode_output_selection;
 use crate::fem::eigen_k_pool::{
     prepare_process_pool_samples, PrecomputedSingleK, ProcessPoolPreparation,
 };
@@ -1208,13 +1209,28 @@ pub(crate) mod test_support {
                 execution: test_bias_field_execution_resolution(),
             },
         ];
-        let outputs = vec![OutputIR::EigenMode {
-            field: "mode".to_string(),
-            all_modes: false,
-            indices: Vec::new(),
-            branches: vec![0],
-            sample_selector: None,
-        }];
+        let outputs = vec![
+            OutputIR::EigenMode {
+                field: "mode".to_string(),
+                all_modes: false,
+                indices: vec![0],
+                branches: Vec::new(),
+                sample_selector: Some(fullmag_ir::SampleSelectorIR {
+                    sample_indices: vec![0],
+                    sample_labels: Vec::new(),
+                }),
+            },
+            OutputIR::EigenMode {
+                field: "mode_complex".to_string(),
+                all_modes: false,
+                indices: Vec::new(),
+                branches: vec![0],
+                sample_selector: Some(fullmag_ir::SampleSelectorIR {
+                    sample_indices: vec![1],
+                    sample_labels: Vec::new(),
+                }),
+            },
+        ];
         assert!(crate::fem::eigen_sweep::bias_field_branch_tracking_requested(
             &outputs
         ));
@@ -1240,7 +1256,25 @@ pub(crate) mod test_support {
             FemEngine::CpuNative,
             true,
             |point_plan, sample_index| {
-                bias_field_native_artifact_pipeline_fixture(point_plan, sample_index, &tracking_outputs)
+                let run = bias_field_native_artifact_pipeline_fixture(
+                    point_plan,
+                    sample_index,
+                    &tracking_outputs,
+                )?;
+                let child_selection: Value = serde_json::from_slice(
+                    artifact_bytes(&run, "eigen/mode_output_selection.v1.json")
+                        .expect("tracked child writer emits its provisional mode index"),
+                )
+                .expect("tracked child mode index is valid JSON");
+                assert_eq!(
+                    child_selection["field_selections"],
+                    serde_json::json!([{
+                        "field": "mode",
+                        "sample_index": sample_index,
+                        "raw_mode_indices": [0, 1],
+                    }])
+                );
+                Ok(run)
             },
         )
         .expect("native publisher samples should track and publish branch zero");
@@ -1292,6 +1326,71 @@ pub(crate) mod test_support {
         assert_eq!(branches["branches"][0]["points"].as_array().unwrap().len(), 2);
         assert_eq!(branches["branches"][0]["points"][0]["k_vector"], serde_json::json!([5.0e-13, 0.0, 0.0]));
         assert_eq!(branches["branches"][0]["points"][1]["k_vector"], serde_json::json!([5.0e-13, 0.0, 0.0]));
+        assert_eq!(
+            branches["mode_output_selection_path"],
+            "eigen/mode_output_selection.v1.json"
+        );
+        let selection_path = "eigen/mode_output_selection.v1.json";
+        assert_eq!(
+            merged
+                .auxiliary_artifacts
+                .iter()
+                .filter(|artifact| artifact.relative_path == selection_path)
+                .count(),
+            1,
+            "bias-field aggregation must replace child selection indexes with one global index"
+        );
+        let mode_output_selection: Value = serde_json::from_slice(
+            artifact_bytes(&merged, selection_path)
+                .expect("tracked field selection index is published"),
+        )
+        .expect("tracked field selection index is valid JSON");
+        assert_eq!(
+            mode_output_selection["field_selections"],
+            serde_json::json!([
+                {"field": "mode", "sample_index": 0, "raw_mode_indices": [0]},
+                {"field": "mode_complex", "sample_index": 1, "raw_mode_indices": [1]},
+            ])
+        );
+        assert_eq!(mode_output_selection["payloads"].as_array().unwrap().len(), 2);
+        assert_eq!(mode_output_selection["payloads"][0]["field"], "mode");
+        assert_eq!(mode_output_selection["payloads"][0]["raw_mode_index"], 0);
+        assert_eq!(mode_output_selection["payloads"][1]["field"], "mode_complex");
+        assert_eq!(mode_output_selection["payloads"][1]["sample_index"], 1);
+        assert_eq!(mode_output_selection["payloads"][1]["raw_mode_index"], 1);
+        let mode_selection_manifest: Value = serde_json::from_slice(
+            artifact_bytes(&merged, "frequency_domain/manifest.v1.json")
+                .expect("first bias-field frequency-domain manifest is preserved"),
+        )
+        .expect("frequency-domain manifest is valid JSON");
+        assert_eq!(
+            mode_selection_manifest["artifacts"]["mode_output_selection_path"],
+            selection_path
+        );
+        let mode_zero_metadata: Value = serde_json::from_slice(
+            artifact_bytes(&merged, "eigen/modes/sample_0000/mode_0000.json")
+                .expect("sample zero selected mode metadata is published"),
+        )
+        .expect("sample zero selected mode metadata is valid JSON");
+        let mode_one_metadata: Value = serde_json::from_slice(
+            artifact_bytes(&merged, "eigen/modes/sample_0001/mode_0001.json")
+                .expect("sample one selected mode metadata is published"),
+        )
+        .expect("sample one selected mode metadata is valid JSON");
+        assert_eq!(mode_zero_metadata["requested_fields"], serde_json::json!(["mode"]));
+        assert_eq!(
+            mode_one_metadata["requested_fields"],
+            serde_json::json!(["mode_complex"])
+        );
+        for payload in mode_output_selection["payloads"].as_array().unwrap() {
+            let payload_path = payload["payload_path"].as_str().unwrap();
+            let bytes = artifact_bytes(&merged, payload_path)
+                .expect("every selected field pair points at a backing vector");
+            assert_eq!(
+                payload["payload_sha256"],
+                format!("sha256:{:x}", Sha256::digest(bytes))
+            );
+        }
         let dispersion = std::str::from_utf8(
             artifact_bytes(&merged, "eigen/dispersion.csv")
                 .expect("final dispersion table is published"),
@@ -1435,6 +1534,10 @@ pub(crate) mod test_support {
             let prefix = format!(
                 "eigen/mode_fields/sample_{sample_index:04}/mode_{raw_mode_index:04}"
             );
+            let metadata_path = format!(
+                "eigen/modes/sample_{sample_index:04}/mode_{raw_mode_index:04}.json"
+            );
+            assert!(artifact_bytes(&merged, &metadata_path).is_none());
             assert!(artifact_bytes(&merged, &format!("{prefix}/vector.bin")).is_none());
             assert!(artifact_bytes(&merged, &format!("{prefix}/potential_full.bin")).is_none());
             assert!(artifact_bytes(&merged, &format!("{prefix}/demag_element_full.bin")).is_none());
@@ -2036,14 +2139,48 @@ pub(super) fn track_bias_field_sweep_samples(
     retain_selected_eigen_path_mode_artifacts(&mut mode_artifacts, selection.field_mode_ids());
     validate_eigen_path_selected_mode_artifacts(&mode_artifacts, selection.field_mode_ids())?;
     bind_eigen_path_tracked_mode_metadata(&mut mode_artifacts, &path_result)?;
+    let mode_output_selection_path = append_eigen_mode_output_selection(
+        &mut mode_artifacts,
+        selection.field_mode_ids_by_field(),
+        selection.field_sample_ids_by_field(),
+    )?;
+    if let Some(first_run) = runs.first_mut() {
+        if let Some(manifest_artifact) = first_run
+            .auxiliary_artifacts
+            .iter_mut()
+            .find(|artifact| artifact.relative_path == "frequency_domain/manifest.v1.json")
+        {
+            let mut manifest: Value = serde_json::from_slice(&manifest_artifact.bytes).map_err(|error| RunError {
+                message: format!("invalid bias-field frequency-domain manifest: {error}"),
+            })?;
+            let manifest_artifacts = manifest
+                .get_mut("artifacts")
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| RunError {
+                    message: "bias-field frequency-domain manifest has no artifacts object".to_string(),
+                })?;
+            manifest_artifacts.insert(
+                "mode_output_selection_path".to_string(),
+                mode_output_selection_path
+                    .clone()
+                    .map_or(Value::Null, Value::String),
+            );
+            manifest_artifact.bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| RunError {
+                message: format!("failed to serialize bias-field frequency-domain manifest: {error}"),
+            })?;
+        }
+    }
 
-    let branches_payload = bias_field_sweep_branches_payload(
+    let mut branches_payload = bias_field_sweep_branches_payload(
         plan,
         &path_result,
         &selection,
         &published_mode_ids,
         authored_k_vector,
     );
+    if let Some(path) = mode_output_selection_path.as_deref() {
+        branches_payload["mode_output_selection_path"] = serde_json::json!(path);
+    }
     let legacy_branches_payload = serde_json::json!({
         "schema_version": "2",
         "tracking_policy_availability": branches_payload["tracking_policy_availability"],
@@ -2215,6 +2352,7 @@ pub(super) fn track_bias_field_sweep_samples(
         runs[sample_index].auxiliary_artifacts.retain(|artifact| {
             artifact.relative_path != "eigen/branches.v2.json"
                 && artifact.relative_path != "eigen/branches.json"
+                && artifact.relative_path != "eigen/mode_output_selection.v1.json"
                 && !artifact.relative_path.starts_with("eigen/modes/")
                 && !artifact.relative_path.starts_with("eigen/mode_fields/")
                 && !artifact.relative_path.starts_with("eigen/mode_fields.zarr/")
@@ -3396,6 +3534,11 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
     retain_selected_eigen_path_mode_artifacts(&mut mode_artifacts, selection.field_mode_ids());
     validate_eigen_path_selected_mode_artifacts(&mode_artifacts, selection.field_mode_ids())?;
     bind_eigen_path_tracked_mode_metadata(&mut mode_artifacts, &path_result)?;
+    let mode_output_selection_path = append_eigen_mode_output_selection(
+        &mut mode_artifacts,
+        selection.field_mode_ids_by_field(),
+        selection.field_sample_ids_by_field(),
+    )?;
 
     // Build the ExecutedRun with both V2 and legacy-compatible artifacts
     let mut auxiliary_artifacts = Vec::new();
@@ -3670,6 +3813,7 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
         "overlap_floor": recorded_policy.map(|policy| policy.overlap_floor),
         "frequency_window_hz": recorded_policy.and_then(|policy| policy.frequency_window_hz),
         "branches": v2_branches.clone(),
+        "mode_output_selection_path": mode_output_selection_path.clone(),
         "diagnostics": {
             "min_overlap": min_overlap,
             "median_overlap": median_overlap,
@@ -3914,18 +4058,35 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
     }
     }
     append_eigen_path_k0_kittel_validation_artifacts(&mut auxiliary_artifacts, &path_result)?;
+    let mut frequency_domain_manifest = build_eigen_path_frequency_domain_manifest(
+        engine,
+        &path_result,
+        &mode_artifacts,
+        plan,
+        outputs,
+    );
+    let Some(artifacts) = frequency_domain_manifest
+        .get_mut("artifacts")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Err(RunError {
+            message: "k-path frequency-domain manifest has no artifacts object".to_string(),
+        });
+    };
+    {
+        artifacts.insert(
+            "mode_output_selection_path".to_string(),
+            mode_output_selection_path
+                .clone()
+                .map_or(serde_json::Value::Null, serde_json::Value::String),
+        );
+    }
     auxiliary_artifacts.push(AuxiliaryArtifact {
         relative_path: "frequency_domain/manifest.v1.json".to_string(),
-        bytes: serde_json::to_vec_pretty(&build_eigen_path_frequency_domain_manifest(
-            engine,
-            &path_result,
-            &mode_artifacts,
-            plan,
-            outputs,
-        ))
-        .map_err(|error| RunError {
-            message: format!("failed to serialize k-path frequency-domain manifest: {error}"),
-        })?,
+        bytes: serde_json::to_vec_pretty(&frequency_domain_manifest)
+            .map_err(|error| RunError {
+                message: format!("failed to serialize k-path frequency-domain manifest: {error}"),
+            })?,
     });
     auxiliary_artifacts.extend(mode_artifacts);
     if let Some(report) = parallel_report {

@@ -18,7 +18,8 @@ use super::eigen_math::{
     angular_frequency_from_eigenvalue, angular_frequency_from_raw_eigenvalue, norm,
 };
 use super::eigen_native_artifacts::{
-    execution_provenance, native_gpu_k0_kittel_execution_provenance, native_modal_artifacts,
+    execution_provenance, native_gpu_k0_kittel_execution_provenance,
+    native_modal_artifacts_with_selection_binding,
 };
 use super::eigen_native_result::{
     complex_block_mass_norm, gyrotropic_pencil_residual_norms, normalize_complex_block_mode,
@@ -260,6 +261,7 @@ pub(super) fn execute_fem_eigen_path_single_k(
                     None,
                     artifact_sample_index,
                     state_artifact_sample_index,
+                    true,
                 );
             }
             validate_modal_solver_policy_admission(plan, true, true)?;
@@ -1365,6 +1367,7 @@ pub(crate) fn execute_gpu_fem_eigen_with_handoff_and_progress_and_producer_ident
             handoff,
             artifact_sample_index,
             state_artifact_sample_index,
+            false,
         );
     }
 
@@ -1522,6 +1525,7 @@ fn execute_native_gpu_k0_kittel_modal(
     expected_handoff: Option<&AcceptedFemEigenEquilibriumHandoff>,
     artifact_sample_index: usize,
     state_artifact_sample_index: Option<usize>,
+    defer_mode_output_selection_binding: bool,
 ) -> Result<ExecutedRun, RunError> {
     validate_eigen_equilibrium_certificate(plan, expected_handoff, None)?;
     let initial_magnetization = plan.equilibrium_magnetization.clone();
@@ -1671,7 +1675,7 @@ fn execute_native_gpu_k0_kittel_modal(
         field_eigenvalue,
         residual_relative_l2,
     );
-    let auxiliary_artifacts = native_modal_artifacts(
+    let auxiliary_artifacts = native_modal_artifacts_with_selection_binding(
         plan,
         outputs,
         &equilibrium,
@@ -1687,6 +1691,7 @@ fn execute_native_gpu_k0_kittel_modal(
         None,
         artifact_sample_index,
         state_artifact_sample_index,
+        defer_mode_output_selection_binding,
     )?;
 
     let stats = StepStats {
@@ -2342,6 +2347,7 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
                 planned_execution,
                 None,
                 Some(nonshared_floquet_provenance),
+                potential_publication.is_some(),
             );
         }
         solve_complex_hermitian_eigenpairs(plan, stiffness, mass)?
@@ -2854,6 +2860,7 @@ pub(super) fn execute_fem_eigen_inner_with_potential_publication(
         &mut auxiliary_artifacts,
         artifact_sample_index,
         outputs,
+        potential_publication.is_some(),
     )?;
 
     let stats = StepStats {

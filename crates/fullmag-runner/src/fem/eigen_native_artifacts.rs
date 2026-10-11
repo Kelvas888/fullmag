@@ -304,6 +304,44 @@ pub(super) fn native_modal_artifacts(
     sample_index: usize,
     state_artifact_sample_index: Option<usize>,
 ) -> Result<Vec<AuxiliaryArtifact>, RunError> {
+    native_modal_artifacts_with_selection_binding(
+        plan,
+        outputs,
+        equilibrium,
+        reduction,
+        bases,
+        modes,
+        node_mass_weights,
+        solver_diagnostics,
+        relaxation_steps,
+        linearization_state,
+        source_relax_handoff,
+        relax_to_eigen_handoff,
+        nonshared_floquet_provenance,
+        sample_index,
+        state_artifact_sample_index,
+        false,
+    )
+}
+
+pub(super) fn native_modal_artifacts_with_selection_binding(
+    plan: &FemEigenPlanIR,
+    outputs: &[OutputIR],
+    equilibrium: &[Vector3],
+    reduction: &ReductionMap,
+    bases: &[(Vector3, Vector3)],
+    modes: &[NativeModalEigenpair],
+    node_mass_weights: Option<&[f64]>,
+    solver_diagnostics: serde_json::Value,
+    relaxation_steps: u64,
+    linearization_state: Option<&SharedDomainLinearizationState>,
+    source_relax_handoff: Option<&AcceptedFemRelaxStageHandoff>,
+    relax_to_eigen_handoff: Option<&AcceptedFemEigenEquilibriumHandoff>,
+    nonshared_floquet_provenance: Option<&NonSharedFloquetProvenance>,
+    sample_index: usize,
+    state_artifact_sample_index: Option<usize>,
+    defer_mode_output_selection_binding: bool,
+) -> Result<Vec<AuxiliaryArtifact>, RunError> {
     if let Some(state_sample_index) = state_artifact_sample_index {
         if state_sample_index != sample_index {
             return Err(RunError {
@@ -1190,6 +1228,7 @@ pub(super) fn native_modal_artifacts(
         &mut auxiliary_artifacts,
         sample_index,
         outputs,
+        defer_mode_output_selection_binding,
     )?;
     auxiliary_artifacts
         .retain(|artifact| artifact.relative_path != "eigen/diagnostics/solver.v1.json");

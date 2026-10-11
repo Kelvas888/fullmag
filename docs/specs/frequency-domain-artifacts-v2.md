@@ -2995,3 +2995,23 @@ policy. Rozszerzenie nie zmienia operatora, kryteriow residualu ani
 admission wynikow. Historyczne artefakty bez nowych pol pozostaja historyczne
 i nie sa uzupelniane zgadywanymi wartosciami. Stan source/test/runtime
 tej zmiany jest rejestrowany w trackerze R2.
+
+
+### PR97 — field-specific mode output selection
+
+Kontrakt korekty uwagi4204074530: requested field i jego sample/raw-mode
+selection muszą pozostać rozróżnialne w terminalnych sidecarach/manifestach
+i runtime writerze. Globalna suma może służyć planowaniu obliczeń,
+nie zastępuje per-field publikacji. Mode i mode_complex zachowują osobne
+żądania; nie ograniczamy ich do wspólnego bezimiennego outputu. Nieznany
+lub nieobsługiwany field musi być odrzucony jawnie, przed publikacją.
+Nie zmienia to operatora, normalizacji, jednostek ani surowych mode IDs.
+Regresja ma przejść przez rzeczywisty writer z rozłącznymi selectorami
+obu pól i potwierdzić brak niezamówionych par field/sample/mode.
+
+`mode` i `mode_complex` są istniejącymi identyfikatorami żądania
+powiązanymi z tym samym pełnym zespolonym payloadem. Ta poprawka
+nie wprowadza nowego formatu real-only ani nie odcina części urojonej.
+Indeks `eigen/mode_output_selection.v1.json` mapuje każde żądanie
+field/sample_index/raw_mode_index na istniejące metadata i vector payload
+z ich SHA-256. Współdzielenie blobu nie znosi odrębności selektorów.
