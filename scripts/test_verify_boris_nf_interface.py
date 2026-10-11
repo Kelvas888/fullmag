@@ -212,16 +212,16 @@ def test_interface_slice_uses_normal_flux_and_tsi_thickness() -> None:
     zeros = tuple((0.0, 0.0, 0.0) for _ in range(4))
     normal = MeshFields(
         vector("n_jc", ((0.0, 0.0, 10.0),) * 4),
-        vector("n_jsx", ((0.0, 0.0, 1.0),) * 4),
-        vector("n_jsy", ((0.0, 0.0, 2.0),) * 4),
-        vector("n_jsz", ((0.0, 0.0, 3.0),) * 4),
+        vector("n_jsx", ((11.0, 12.0, 13.0),) * 4),
+        vector("n_jsy", ((21.0, 22.0, 23.0),) * 4),
+        vector("n_jsz", ((1.0, 2.0, 3.0),) * 4),
         vector("n_s", zeros),
     )
     ferromagnet = MeshFields(
         vector("f_jc", ((0.0, 0.0, 8.0),) * 4),
-        vector("f_jsx", ((0.0, 0.0, 0.5),) * 4),
-        vector("f_jsy", ((0.0, 0.0, 1.0),) * 4),
-        vector("f_jsz", ((0.0, 0.0, 1.5),) * 4),
+        vector("f_jsx", ((31.0, 32.0, 33.0),) * 4),
+        vector("f_jsy", ((41.0, 42.0, 43.0),) * 4),
+        vector("f_jsz", ((0.5, 1.0, 1.5),) * 4),
         vector("f_s", zeros),
     )
     torque = vector(

@@ -13,6 +13,7 @@ from typing import Sequence
 
 
 MUB_E_V_PER_T = 5.788381608e-05
+BORIS_UNIT_ADAPTER_VERSION = "fullmag.boris_flow_major_units.v2"
 Vector3 = tuple[float, float, float]
 
 
@@ -413,9 +414,9 @@ def compute_interface_slice(
 ) -> InterfaceSlice:
     """Extract a signed N/F interface slice from exported BORIS fields.
 
-    BORIS stores each spin-polarization current as a vector-valued field.  The
-    ``+z`` interface therefore uses component ``z`` from ``Jsx``, ``Jsy`` and
-    ``Jsz``.  Those display fields contain BORIS' explicit ``MUB_E`` factor;
+    BORIS exports flow-major rows: Jsx = (Q_xx, Q_xy, Q_xz), and likewise
+    for Jsy/Jsz. The +z interface therefore uses all three components of
+    Jsz. Those display fields contain BORIS' explicit ``MUB_E`` factor;
     the comparison adapter maps them to Fullmag's charge-equivalent
     ``Q_ia`` by dividing by ``MUB_E``.  BORIS reports ``Tsi`` in A/(m s)
     through its effective-field normalization.  We retain a documented
@@ -463,15 +464,13 @@ def compute_interface_slice(
         ]
         return sum(values) / len(values)
 
-    normal_flux = (
-        plane_average(normal.spin_current_x, n_k, 2),
-        plane_average(normal.spin_current_y, n_k, 2),
-        plane_average(normal.spin_current_z, n_k, 2),
+    normal_flux = tuple(
+        plane_average(normal.spin_current_z, n_k, polarization)
+        for polarization in range(3)
     )
-    ferromagnet_flux = (
-        plane_average(ferromagnet.spin_current_x, f_k, 2),
-        plane_average(ferromagnet.spin_current_y, f_k, 2),
-        plane_average(ferromagnet.spin_current_z, f_k, 2),
+    ferromagnet_flux = tuple(
+        plane_average(ferromagnet.spin_current_z, f_k, polarization)
+        for polarization in range(3)
     )
     torque = tuple(
         sum(

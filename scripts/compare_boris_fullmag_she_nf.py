@@ -16,7 +16,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from verify_boris_nf_interface import (
+    BORIS_UNIT_ADAPTER_VERSION,
     MUB_E_V_PER_T,
+    MeshFields,
+    compute_interface_balance,
+    compute_interface_slice,
     map_boris_spin_to_fullmag_mu_s,
     read_text_ovf,
     validate_boris_artifact,
@@ -347,10 +351,9 @@ def _concat_qia(normal: Mapping[str, Any], ferromagnet: Mapping[str, Any]) -> tu
         mesh = normal if index < len(normal["Jc"].values) else ferromagnet
         local = index if mesh is normal else index - len(normal["Jc"].values)
         components = []
-        for flow_axis in range(3):
-            components.extend(
-                mesh[field].values[local][flow_axis] for field in ("Jsx", "Jsy", "Jsz")
-            )
+        # BORIS GetSpinCurrent selects a flow row; each row is spin XYZ.
+        for field in ("Jsx", "Jsy", "Jsz"):
+            components.extend(mesh[field].values[local])
         result.append(_tensor(components, label=f"BORIS Q_ia[{index}]"))
     return tuple(result)
 
@@ -413,7 +416,26 @@ def normalize_boris_artifact(path: Path) -> NormalizedTransportArtifact:
     torque = tuple((0.0, 0.0, 0.0) for _ in normal["Jc"].values) + tuple(
         tuple(row) for row in ferromagnet["Tsi"].values
     )
-    balance = dict(payload["interface_balances"])
+    # Historical summaries may contain transposed interface extraction.
+    # Rebuild from the same raw fields as Q_ia; never relabel old balances.
+    historical_balance = payload["interface_balances"]
+    axis = str(historical_balance.get("normal_axis", "z"))
+    sign = historical_balance.get("normal_sign", 1)
+    if not isinstance(sign, int) or isinstance(sign, bool):
+        raise ValueError("BORIS interface normal_sign must be an integer")
+
+    def mesh_fields(mesh: Mapping[str, Any]) -> MeshFields:
+        return MeshFields(mesh["Jc"], mesh["Jsx"], mesh["Jsy"], mesh["Jsz"], mesh["S"])
+
+    balance = compute_interface_balance(compute_interface_slice(
+        mesh_fields(normal), mesh_fields(ferromagnet), ferromagnet["Tsi"],
+        normal_axis=axis, normal_sign=sign,
+    ))
+    balance["adapter_version"] = BORIS_UNIT_ADAPTER_VERSION
+    balance["provenance"] = "recomputed_from_raw_ovf"
+    # Torque closure mixes distinct native conventions and is not a parity gate.
+    balance.pop("spin_torque_closure_vector")
+    balance.pop("spin_torque_closure")
     spin_current_scale = 1.0 / MUB_E_V_PER_T
     for key in (
         "normal_spin_flux",
@@ -429,6 +451,7 @@ def normalize_boris_artifact(path: Path) -> NormalizedTransportArtifact:
     balance["torque_unit"] = "boris_tsi_A_per_m_s"
     balance["torque_comparison_status"] = "not_comparable_without_tsi_eff_gamma_mapping"
     conventions = {
+        "adapter_version": BORIS_UNIT_ADAPTER_VERSION,
         "component_order": "row_major_Q_ia",
         "mu_s_convention": "full_spin_splitting_voltage",
         "spin_mapping": "mu_s=2*De*S/(elC*MUB_E)",
@@ -439,10 +462,6 @@ def normalize_boris_artifact(path: Path) -> NormalizedTransportArtifact:
         "torque_unit": "boris_tsi_A_per_m_s",
         "source_spin_quantity": "BORIS_native_S",
     }
-    axis = str(balance.get("normal_axis", "z"))
-    sign = balance.get("normal_sign", 1)
-    if not isinstance(sign, int) or isinstance(sign, bool):
-        raise ValueError("BORIS interface normal_sign must be an integer")
     shape = (n_shape[0], n_shape[1], n_shape[2] + f_shape[2])
     return NormalizedTransportArtifact(
         source=str(path),

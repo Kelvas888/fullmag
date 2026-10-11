@@ -2066,6 +2066,53 @@ topological-Hall, or pumping sources. A normal-metal scalar residual must never
 be applied to an F mesh; an N/F comparison either evaluates those terms from an
 explicit material/magnetization manifest or marks the F residual unsupported.
 
+(boris-flow-major-unit-adapter-v2)=
+#### 5.2.2 Adapter BORIS: kolejność indeksów i jednostki v2
+
+Adapter `fullmag.boris_flow_major_units.v2` naprawia mapowanie danych; nie
+zmienia równań transportu, publicznego Python DSL, `ProblemIR`, capabilities
+ani realizacji żadnej z czterech lane FDM CPU/GPU i FEM CPU/GPU. Nie kwalifikuje
+ich przez podobieństwo wyników BORIS. Właścicielem mapowania jest
+`scripts/compare_boris_fullmag_she_nf.py::normalize_boris_artifact`.
+
+Dla BORIS `048503d2ca6475e91b073eb1762ecf9d3634c3e1`,
+`Transport::GetSpinCurrent(component)` wybiera kierunek przepływu. `Jsx`, `Jsy`,
+`Jsz` zawierają odpowiednio wiersze przepływu x, y, z; komponenty XYZ każdego
+wiersza oznaczają polaryzację spinu. Fullmag zachowuje indeks przepływu $i$
+i polaryzacji $a$ w `row_major_Q_ia`: xx, xy, xz, yx, yy, yz, zx, zy, zz.
+Nie należy transponować tych wierszy. Dane OVF są x-fast; adapter zachowuje
+kolejność punktów domeny N, następnie F na wspólnej siatce z-normalnej.
+
+| Wielkość | Wejście BORIS | Wyjście/odmowa adaptera |
+|---|---|---|
+| Potencjał ładunku | $V$ w $\mathrm V$ | $V$ w $\mathrm V$; porównanie dopuszcza tylko stały offset gauge |
+| Potencjał spinowy | $\mathbf S$ w $\mathrm{A\,m^{-1}}$ | pełne splitting voltage $\boldsymbol\mu_s$ w $\mathrm V$, zgodnie z mapowaniem 5.2.1 |
+| Prąd spinowy | $J^s_{ia}$ w $\mathrm{A\,s^{-1}}$ | $Q_{ia}$ w $\mathrm{A\,m^{-2}}$, przez dokładne historyczne `MUB_E=5.788381608e-05` w $\mathrm{m^2\,s^{-1}}$ |
+| Strumień normalny | wszystkie polaryzacje wiersza `Jsz` | znak skoku wynika z zadanej normalnej; pola osi przepływu nie są osiami polaryzacji |
+| Torque `Tsi` | $\mathrm{A\,m^{-1}\,s^{-1}}$ | pozostaje `boris_tsi_A_per_m_s`, nieporównywalny z Gilbert source w $\mathrm{s^{-1}}$ bez osobnego modelu `tsi_eff`/gamma |
+
+Bilans interfejsu jest ponownie wyznaczany z tych samych surowych OVF przez
+`scripts/verify_boris_nf_interface.py::compute_interface_slice`, a nie
+przejmowany z historycznego `summary.json`, które mogło zawierać transpozycję.
+Pozostaje diagnostyką; mieszanej jednostkowo różnicy strumień–torque nie
+przedstawia się jako bramki parity. Residuals zachowują provenance historycznego
+wejścia i nie otrzymują automatycznie nowej kwalifikacji.
+
+`scripts/verify_boris_tensor_adapter.py::main` sprawdza surowe pliki OVF:
+osiem punktów N/F, 72 różne podpisane składowe, kolejność punktów, splitting
+voltage, normalną ±z, ponowny odczyt z celowo błędnym historycznym bilansem
+oraz odmowę porównania torque. Hashe trzech przypiętych plików BORIS, w tym
+`Funcs_Math_base.h`, są sprawdzane przed oceną adaptera. Nie dopasowuje się
+współczynnika ani globalnego znaku do wyników solvera.
+
+Dowód 11.10.2026: poprzedni adapter RED, exit 1, 48 błędnych składowych
+pozadiagonalnych; poprawiony GREEN, exit 0, 72/72 składowych, oba znaki normalnej.
+Raporty zachowano pod `storage/runs/antenna-transport-e2e-20261011-5e7f0d529ca256ef/e1/`.
+To **kwalifikacja adaptera na fixture**, nie ponowne wykonanie benchmarku
+BORIS–Fullmag ani dowód bilansu fizycznego solverów. Historyczne porównania
+pozostają historyczne. Nowy benchmark wymaga oddzielnie źródeł, binariów,
+parametrów i wyników obu solverów oraz niezależnej walidacji znaków SHE/iSHE.
+
 ### 5.3 Regression and quantitative gates
 
 Tests cover local FV residual, electrode balance, anisotropic N/F balance,
@@ -2304,6 +2351,9 @@ a qualified workload without the validation gates above.
 
 | Claim | Path | Symbol | Responsibility | Evidence |
 |---|---|---|---|---|
+| Adapter BORIS v2 | scripts/compare_boris_fullmag_she_nf.py | normalize_boris_artifact; _concat_qia | flow-major rows i raw-OVF provenance | raw OVF fixture, nie parity solverów |
+| Strumień interfejsu BORIS | scripts/verify_boris_nf_interface.py | compute_interface_slice | wszystkie polaryzacje wiersza z | oba znaki normalnej na fixture |
+| Regresja adaptera BORIS | scripts/verify_boris_tensor_adapter.py | main | 8 punktów N/F, 72 komponenty, jednostki i torque refusal | RED→GREEN, bez solve |
 | M1 charge realization | backends/fem/cpu/mfem/transport/steady_transport.cpp | SteadyTransportOracle::solve_charge | FEM CPU charge assembly and solve | managed native M1 contract |
 | M1 spin realization | backends/fem/cpu/mfem/transport/steady_transport.cpp | SteadyTransportOracle::solve_spin | FEM CPU spin assembly and solve | managed native M1 contract |
 | M2 reciprocal realization | backends/fem/cpu/mfem/transport/steady_transport.cpp | SteadyTransportOracle::solve_reciprocal | monolithic reciprocal FEM block solve | focused managed M2 runtime test |
@@ -2357,8 +2407,8 @@ a qualified workload without the validation gates above.
 | Public pure-Neumann managed recipe | justfile | verify-fdm-gpu-public-charge-zero-mean-runtime | compile through the container-backed runtime, execute the public fixture, and run the independent oracle | managed actual-device gate |
 | FDM GPU M1 contract and qualification boundary | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:fdm-gpu-m1-fp64-contract | own the bounded charge realization and keep the broader M1 qualification gates explicit | partial implementation; unvalidated |
 | Frozen solved-current racetrack contract | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:racetrack-m1-v1-contract | freeze the synthetic fixture, equations, signs, parameter provenance, and qualification boundary | bounded implementation and executable contract; production qualification remains open |
-| Racetrack stage current action | crates/fullmag-cli/src/step_utils.rs | apply_pipeline_set_transport_current | apply the complete named normal-current electrode set at a workflow stage with exact terminal coverage | source contract; fresh production gate remains open |
-| Racetrack stage torque action | crates/fullmag-cli/src/step_utils.rs | apply_pipeline_set_spin_torque_enabled | atomically enable or disable the typed spin-torque graph module and incoming edges | source contract; fresh production gate remains open |
+| Racetrack stage current action | crates/fullmag-application/src/script_stage_materialization.rs | apply_pipeline_set_transport_current | apply the complete named normal-current electrode set at a workflow stage with exact terminal coverage | source contract; fresh production gate remains open |
+| Racetrack stage torque action | crates/fullmag-application/src/script_stage_materialization.rs | apply_pipeline_set_spin_torque_enabled | atomically enable or disable the typed spin-torque graph module and incoming edges | source contract; fresh production gate remains open |
 | Racetrack zero-drive torque gate | crates/fullmag-plan/src/spin_transport.rs | materialize_fdm_descriptor | allow inactive torque only when all named normal-current terminals are exactly zero and preserve fail-closed nonzero-drive conservation | source contract; fresh production gate remains open |
 | Public racetrack Neel seed authoring | packages/fullmag-py/src/fullmag/init/textures.py | neel_skyrmion | serialize the exact public preset parameters, world mapping, and translation into current ProblemIR | public lowering and formula-sample contract test |
 | Python racetrack Neel seed evaluator | packages/fullmag-py/src/fullmag/init/preset_eval.py | _skyrmion | evaluate and normalize the repository-owned analytic skyrmion formula | centre, wall, far-field, direction, and norm contract samples |
