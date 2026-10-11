@@ -305,15 +305,23 @@ def scene_document_to_execution_config(
     requested_precision: str,
     requested_mode: str,
     source_root: str | Path | None = None,
+    materialize_geometry_assets: bool = False,
 ) -> dict[str, object]:
-    """Return the canonical base IR and ordered stage IRs for a SceneDocument."""
+    """Capture stages without solving; geometry realization is execution-only opt-in.
+
+    The default remains geometry-light authoring. Opt-in uses the existing
+    canonical geometry/lead producers, preserving their validation and device
+    restrictions. It is not a native preparation receipt or a field result.
+    """
+
+    if not isinstance(materialize_geometry_assets, bool):
+        raise TypeError("materialize_geometry_assets must be a bool")
 
     raw_study = scene_document.get("study") if isinstance(scene_document, Mapping) else None
     raw_pipeline = (
         raw_study.get("study_pipeline") if isinstance(raw_study, Mapping) else None
     )
-    raw_nodes = raw_pipeline.get("nodes") if isinstance(raw_pipeline, Mapping) else None
-    scene_pipeline_owns_stage_expansion = isinstance(raw_nodes, list) and bool(raw_nodes)
+    scene_pipeline_owns_stage_expansion = raw_pipeline is not None
 
     with _capture_scene_document(
         scene_document,
@@ -327,7 +335,7 @@ def scene_document_to_execution_config(
     ) as capture:
         study_pipeline = _scene_capture_study_pipeline(capture)
         run_capture = capture
-        if study_pipeline is not None and study_pipeline.get("nodes"):
+        if study_pipeline is not None:
             # The shared Rust materializer expands typed Scene pipeline nodes.
             # Leave explicit Python stages empty so macros/groups remain the
             # single execution source instead of being shadowed by flattened
@@ -345,7 +353,7 @@ def scene_document_to_execution_config(
                     workspace_problem=base_problem,
                 ),
             )
-        base_ir = _scene_capture_to_ir(run_capture, include_geometry_assets=False)
+        base_ir = _scene_capture_to_ir(run_capture, include_geometry_assets=materialize_geometry_assets)
         return export_run_config(
             run_capture.loaded,
             base_ir,
@@ -356,7 +364,7 @@ def scene_document_to_execution_config(
                 runtime_device_override=(
                     capture.device if capture.device in {"cpu", "gpu"} else None
                 ),
-                include_geometry_assets=False,
+                include_geometry_assets=materialize_geometry_assets,
                 source_root=capture.source_root,
                 source_stem=capture.source_stem,
                 study_pipeline=_scene_capture_study_pipeline(capture),
@@ -421,6 +429,15 @@ def _reject_unlowered_scene_fields(scene: Mapping[str, object]) -> None:
         if unknown_study_fields:
             names = ", ".join(sorted(str(name) for name in unknown_study_fields))
             raise ValueError(f"scene_document_unlowered_study_fields: {names}")
+
+        pipeline = study.get("study_pipeline")
+        if pipeline is not None:
+            if not isinstance(pipeline, Mapping):
+                raise ValueError("SceneDocument.study.study_pipeline must be an object")
+            if pipeline.get("version", "study_pipeline.v1") != "study_pipeline.v1":
+                raise ValueError("scene_document_study_pipeline_version_not_supported")
+            if not isinstance(pipeline.get("nodes", []), list):
+                raise ValueError("SceneDocument.study.study_pipeline.nodes must be a list")
 
         mesh_interfaces = study.get("mesh_interfaces", [])
         if not isinstance(mesh_interfaces, list):
