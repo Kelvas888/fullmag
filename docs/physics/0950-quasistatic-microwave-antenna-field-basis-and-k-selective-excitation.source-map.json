@@ -29,6 +29,10 @@
     }
   ],
   "symbols": [
+    {"id":"current_display_cell","latex":"$K,\\lvert K\\rvert,dV$","meaning":"owned Tet4, jego objętość i dodatnia miara całkowania","si_unit":"$\\mathrm{m^3}$"},
+    {"id":"current_display_index","latex":"$a$","meaning":"lokalny indeks wierzchołka $0,1,2,3$ w kolejności MFEM elementu","si_unit":"$1$"},
+    {"id":"current_display_positions","latex":"$\\mathbf v_{K,a},\\mathbf x,\\mathbf x_K^c$","meaning":"wierzchołki, punkt fizyczny i barycentrum komórki","si_unit":"$\\mathrm m$"},
+    {"id":"current_display_values","latex":"$\\mathbf J_K,\\overline{\\mathbf J}_K$","meaning":"lokalne pole RT0 i jego średnia objętościowa, nie średnia normy","si_unit":"$\\mathrm{A\\,m^{-2}}$"},
     {"id":"straight_lead_indices","latex":"$e,a,k$","meaning":"indeksy doprowadzenia, wierzchołka cap i warstwy","si_unit":"$1$"},
     {"id":"straight_lead_positions","latex":"$\\mathbf x_a,\\mathbf x_{a,k}$","meaning":"actual device cap i wygenerowane pozycje warstw","si_unit":"$\\mathrm m$"},
     {"id":"straight_lead_length","latex":"$L_e$","meaning":"jawna długość doprowadzenia","si_unit":"$\\mathrm m$"},
@@ -148,6 +152,7 @@
     {"id": "P_max", "latex": "$P_{\\max}$", "meaning": "versioned maximum direct-Oersted pair count", "si_unit": "$1$"}
   ],
   "equations": [
+    {"id":"antenna-current-display-affine-traces","symbols":["current_display_cell","current_display_index","current_display_positions","current_display_values"],"sources":["antenna-current-display-contract","antenna-current-display-native","antenna-rt0-stable-current"]},
     {"id":"antenna-straight-lead-layer-map","symbols":["straight_lead_indices","straight_lead_positions","straight_lead_length","straight_lead_layers","straight_lead_direction","straight_lead_norm"],"sources":["antenna-straight-lead-preparation-contract","antenna-straight-lead-preparation-owner","antenna-straight-lead-preparation-check"]},
     {"id":"antenna-duffy-source-map","symbols":["duffy_positions","duffy_edges","duffy_parameters"],"sources":["antenna-duffy-native","antenna-duffy-model","antenna-duffy-document"]},
     {"id":"antenna-duffy-jacobian","symbols":["duffy_edges","duffy_parameters","duffy_measure","duffy_operators"],"sources":["antenna-duffy-native","antenna-duffy-model"]},
@@ -202,6 +207,18 @@
     }
   ],
   "sources": [
+    {"id":"antenna-current-display-contract","path":"docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md","symbol":"DOC-ANCHOR:antenna-owned-current-display-snapshot","responsibility":"Same-owner J carrier, cell-local traces, SI, pins i granice; bez capability promotion.","evidence_status":"planned_contract"},
+    {"id":"antenna-current-display-native","path":"backends/fem/cpu/mfem/workflows/antenna_field_solve/accepted_external_lead_source.cpp","symbol":"sample_current_display","responsibility":"Cold native sampling tego samego accepted AffineRt0Element, centers/traces bez drugiego solve; source-only.","evidence_status":"source_only"},
+    {"id":"antenna-current-display-size","path":"backends/fem/cpu/mfem/workflows/antenna_field_solve/accepted_external_lead_source.cpp","symbol":"accepted_external_lead_current_display_payload_size","responsibility":"Exact framed size i actual device-cell ownership przed charge solve; source-only.","evidence_status":"source_only"},
+    {"id":"antenna-current-display-decoder","path":"crates/fullmag-runner/src/native_fem/accepted_external_lead/current_display.rs","symbol":"decode_current_display","responsibility":"Bounded ordered snapshot, SHA bundle/charge/source, exact device Tet4 i local geometry, bez rekonstrukcji RT0.","evidence_status":"source_only"},
+    {"id":"antenna-current-display-archive","path":"crates/fullmag-runner/src/antenna_external_lead_solution.rs","symbol":"load_antenna_external_lead_solution","responsibility":"Archive v1/v2, receipt SI/policy/count i pełny binding snapshotu; legacy J absent, brak basis promotion.","evidence_status":"source_only"},
+    {"id":"antenna-current-display-publication","path":"crates/fullmag-runner/src/antenna_external_lead_solution/publication.rs","symbol":"publish_antenna_external_lead_solution_atomically","responsibility":"Dokładny versioned manifest/payload allowlist i full load przed atomic rename/reuse.","evidence_status":"source_only"},
+    {"id":"antenna-current-display-api","path":"crates/fullmag-api/src/router_v2/handlers/data/antenna_inspection.rs","symbol":"get_antenna_external_lead_inspection_display","responsibility":"Typed thin descriptors i binary cell/local traces, pełny snapshot wymagany przed J display availability.","evidence_status":"source_only"},
+    {"id":"antenna-current-display-carrier","path":"apps/control-room/src/modules/viewport-3d/model/antennaCurrentOverlayModel.ts","symbol":"buildAntennaCurrentOverlayModel","responsibility":"Owned cell-local traces i centers, exact Tet4/XYZ, bounded SI carrier bez uśredniania; interpretowane 90/90 PASS.","evidence_status":"interpreted_checks_passed"},
+    {"id":"antenna-current-display-projection","path":"apps/control-room/src/modules/viewport-3d/model/antennaCurrentOverlayModel.ts","symbol":"projectAntennaCurrentOverlayModel","responsibility":"Komponentowy SI zakres/scalars bez przebudowy immutable carrier i pełnych XYZ glyphów.","evidence_status":"interpreted_checks_passed"},
+    {"id":"antenna-current-display-shader","path":"apps/control-room/src/modules/viewport-3d/layers/antennaCurrentSurfaceMaterial.ts","symbol":"createAntennaCurrentSurfaceMaterial","responsibility":"Interpolacja wektora przed normą; rzeczywisty GPU cancellation readback na kontrolowanym UI fixture, nie solve.","evidence_status":"browser_fixture_passed"},
+    {"id":"antenna-current-display-style","path":"apps/control-room/src/modules/viewport-3d/layers/antennaCurrentSurfaceMaterial.ts","symbol":"updateAntennaCurrentSurfaceMaterial","responsibility":"Uniforms/LUT bez nowego materiału lub tekstury; browser UUID regression PASS.","evidence_status":"browser_fixture_passed"},
+    {"id":"antenna-current-display-layer","path":"apps/control-room/src/modules/viewport-3d/layers/AntennaFieldLayer.tsx","symbol":"AntennaFieldLayer","responsibility":"Wspólne passy, śledzenie/disposal geometrii/materiałów/tekstury; browser owner cleanup i UUID regression PASS.","evidence_status":"browser_fixture_passed"},
     {"id":"antenna-mesh-identity-owner","path":"packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py","symbol":"_owned_vertex_identity","responsibility":"Exact ordered positive unique u64 identity, immutable copy, bez nowego MeshIR.","evidence_status":"source_only"},
     {"id":"antenna-mesh-identity-extraction","path":"packages/fullmag-py/src/fullmag/meshing/_gmsh_extraction.py","symbol":"_extract_mesh_data","responsibility":"Actual ordered getNodes tags retained; bez ordinal fallback.","evidence_status":"source_only"},
     {"id":"antenna-mesh-identity-scaling","path":"packages/fullmag-py/src/fullmag/meshing/_gmsh_infra.py","symbol":"_scale_mesh_nodes","responsibility":"Zachowanie identity przy geometry-only scale.","evidence_status":"source_only"},

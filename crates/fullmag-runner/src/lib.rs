@@ -20,11 +20,14 @@ pub use antenna_external_lead_solution::{
     load_antenna_external_lead_solution, load_antenna_external_lead_solution_manifest,
     load_published_antenna_external_lead_solution,
     load_published_antenna_external_lead_solution_manifest,
-    publish_antenna_external_lead_solution_atomically, AntennaExternalLeadExecutionReceipt,
+    publish_antenna_external_lead_solution_atomically, AntennaExternalLeadCurrentDisplayReceipt,
+    AntennaExternalLeadExecutionReceipt,
     AntennaExternalLeadPayloadRef, AntennaExternalLeadSamplingCarrier,
     AntennaExternalLeadSolutionArtifact, AntennaExternalLeadSolutionManifest,
     AntennaExternalLeadSolutionRef, LoadedAntennaExternalLeadSolution,
+    AntennaInspectionCurrentDisplayCell, AntennaInspectionDeviceCurrentDisplay,
     PublishedAntennaExternalLeadSolution, ANTENNA_EXTERNAL_LEAD_SOLUTION_SCHEMA,
+    ANTENNA_EXTERNAL_LEAD_CURRENT_DISPLAY_SOLUTION_SCHEMA,
 };
 mod antenna_field_solution;
 mod antenna_spectrum;

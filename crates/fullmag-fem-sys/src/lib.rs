@@ -1444,6 +1444,32 @@ pub struct fullmag_fem_accepted_external_lead_result_v1 {
     pub error_message: [c_char; 256],
 }
 
+pub const FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_DISPLAY_ABI_VERSION: u32 = 2;
+pub const FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_DISPLAY_LAYOUT_FINGERPRINT: &str =
+    "fullmag:fem-accepted-external-lead:abi:v2:owned-current-display";
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fem_accepted_external_lead_result_v2 {
+    pub abi_version: u32,
+    pub reserved_flags: u32,
+    pub struct_size: u64,
+    pub canonical_payload: *mut u8,
+    pub canonical_payload_capacity: u64,
+    pub canonical_payload_len: u64,
+    pub digest_schema: [c_char; FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY],
+    pub operator_version: [c_char; FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY],
+    pub layout_fingerprint: [c_char; FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY],
+    pub content_sha256: [c_char; 65],
+    pub error_message: [c_char; 256],
+    pub current_display_payload: *mut u8,
+    pub current_display_payload_capacity: u64,
+    pub current_display_payload_len: u64,
+    pub current_display_digest_schema: [c_char; FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY],
+    pub current_display_operator_version: [c_char; FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY],
+    pub current_display_content_sha256: [c_char; 65],
+}
+
 #[cfg(target_pointer_width = "64")]
 const _: () = {
     assert!(std::mem::size_of::<fullmag_fem_accepted_external_lead_boundary_v1>() == 40);
@@ -1459,6 +1485,17 @@ const _: () = {
     assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v1, canonical_payload) == 16);
     assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v1, content_sha256) == 328);
     assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v1, error_message) == 393);
+    assert!(std::mem::size_of::<fullmag_fem_accepted_external_lead_result_v2>() == 944);
+    assert!(std::mem::align_of::<fullmag_fem_accepted_external_lead_result_v2>() == 8);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, canonical_payload) == 16);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, content_sha256) == 328);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, error_message) == 393);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, current_display_payload) == 656);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, current_display_payload_capacity) == 664);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, current_display_payload_len) == 672);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, current_display_digest_schema) == 680);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, current_display_operator_version) == 776);
+    assert!(std::mem::offset_of!(fullmag_fem_accepted_external_lead_result_v2, current_display_content_sha256) == 872);
 };
 
 pub const FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_ABI_VERSION: u32 = 1;
@@ -3197,6 +3234,10 @@ extern "C" {
     pub fn fullmag_fem_solve_accepted_external_lead_field_v1(
         request: *const fullmag_fem_accepted_external_lead_request_v1,
         result: *mut fullmag_fem_accepted_external_lead_result_v1,
+    ) -> i32;
+    pub fn fullmag_fem_solve_accepted_external_lead_field_v2(
+        request: *const fullmag_fem_accepted_external_lead_request_v1,
+        result: *mut fullmag_fem_accepted_external_lead_result_v2,
     ) -> i32;
     pub fn fullmag_fem_solve_accepted_terminal_charge_v1(
         request: *const fullmag_fem_accepted_terminal_charge_request_v1,

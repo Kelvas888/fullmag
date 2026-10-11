@@ -2,8 +2,9 @@
 //! Trusted local writers: std path checks/rename do not defeat hostile TOCTOU.
 use super::{
     load_antenna_external_lead_solution, load_antenna_external_lead_solution_manifest,
-    validate_reference, AntennaExternalLeadSolutionArtifact, AntennaExternalLeadSolutionManifest,
-    AntennaExternalLeadSolutionRef, LoadedAntennaExternalLeadSolution,
+    solution_manifest_basename, validate_reference, AntennaExternalLeadSolutionArtifact,
+    AntennaExternalLeadSolutionManifest, AntennaExternalLeadSolutionRef,
+    LoadedAntennaExternalLeadSolution,
 };
 use crate::types::{AuxiliaryArtifact, RunError};
 use std::collections::BTreeSet;
@@ -12,13 +13,22 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const MANIFEST: &str = "manifest.v1.json";
-const PAYLOADS: [&str; 5] = [
+const MANIFEST_V1: &str = "manifest.v1.json";
+const MANIFEST_V2: &str = "manifest.v2.json";
+const PAYLOADS_V1: [&str; 5] = [
     "bundle.v1.bin",
     "sample_positions.f64le.bin",
     "H.f64le.bin",
     "device_vertex_ids.u64le.bin",
     "device_V.f64le.bin",
+];
+const PAYLOADS_V2: [&str; 6] = [
+    "bundle.v1.bin",
+    "sample_positions.f64le.bin",
+    "H.f64le.bin",
+    "device_vertex_ids.u64le.bin",
+    "device_V.f64le.bin",
+    "current_display.v1.bin",
 ];
 const MANIFEST_LIMIT: usize = 1 << 20;
 const BINARY_LIMIT: usize = 128 << 20;
@@ -174,12 +184,10 @@ fn read_bounded(
     )?;
     Ok(bytes)
 }
-fn read_revision(
-    root: &Path,
+fn revision_entries(
     revision: &Path,
     interrupt: Option<&AtomicBool>,
-) -> Result<(Vec<u8>, Vec<AuxiliaryArtifact>), RunError> {
-    directory(revision, root)?;
+) -> Result<(BTreeSet<String>, &'static str), RunError> {
     let mut found = BTreeSet::new();
     for entry in fs::read_dir(revision).map_err(|e| io("enumerate external-lead revision", e))? {
         cancel(interrupt)?;
@@ -189,7 +197,8 @@ fn read_revision(
             .into_string()
             .map_err(|_| fail("external-lead revision has a non-UTF8 or foreign entry"))?;
         require(
-            (name == MANIFEST || PAYLOADS.contains(&name.as_str())) && found.insert(name),
+            (name == MANIFEST_V1 || name == MANIFEST_V2 || PAYLOADS_V2.contains(&name.as_str()))
+                && found.insert(name),
             "external-lead revision contains a duplicate or unexpected entry",
         )?;
         let kind = entry
@@ -200,13 +209,64 @@ fn read_revision(
             "external-lead entries must be regular files, not directories or symlinks",
         )?;
     }
+    let manifest = match (found.contains(MANIFEST_V1), found.contains(MANIFEST_V2)) {
+        (true, false) => MANIFEST_V1,
+        (false, true) => MANIFEST_V2,
+        _ => {
+            return Err(fail(
+                "external-lead revision must contain exactly one versioned manifest",
+            ))
+        }
+    };
+    let names = payload_names(manifest)?;
     require(
-        found.len() == 6,
-        "external-lead revision must contain exactly manifest and five fixed payloads",
+        found
+            .iter()
+            .all(|name| name == manifest || names.contains(&name.as_str())),
+        "external-lead revision contains a payload from a different schema",
     )?;
-    let manifest = read_bounded(&revision.join(MANIFEST), MANIFEST_LIMIT, interrupt)?;
-    let mut payloads = Vec::with_capacity(5);
-    for name in PAYLOADS {
+    Ok((found, manifest))
+}
+fn payload_names(manifest: &str) -> Result<&'static [&'static str], RunError> {
+    match manifest {
+        MANIFEST_V1 => Ok(&PAYLOADS_V1),
+        MANIFEST_V2 => Ok(&PAYLOADS_V2),
+        _ => Err(fail("unsupported external-lead manifest basename")),
+    }
+}
+fn validate_revision_entries(found: &BTreeSet<String>, manifest: &str) -> Result<(), RunError> {
+    let names = payload_names(manifest)?;
+    require(
+        found.len() == names.len() + 1 && names.iter().all(|name| found.contains(*name)),
+        "external-lead revision must contain exactly manifest and its versioned fixed payloads",
+    )
+}
+fn read_revision_manifest(
+    revision: &Path,
+    basename: &str,
+    interrupt: Option<&AtomicBool>,
+) -> Result<Vec<u8>, RunError> {
+    let bytes = read_bounded(&revision.join(basename), MANIFEST_LIMIT, interrupt)?;
+    let manifest: AntennaExternalLeadSolutionManifest = serde_json::from_slice(&bytes)
+        .map_err(|e| fail(format!("parse external-lead publication manifest: {e}")))?;
+    require(
+        solution_manifest_basename(&manifest)? == basename,
+        "external-lead manifest schema does not match its versioned filename",
+    )?;
+    Ok(bytes)
+}
+fn read_revision(
+    root: &Path,
+    revision: &Path,
+    interrupt: Option<&AtomicBool>,
+) -> Result<(Vec<u8>, Vec<AuxiliaryArtifact>), RunError> {
+    directory(revision, root)?;
+    let (found, basename) = revision_entries(revision, interrupt)?;
+    validate_revision_entries(&found, basename)?;
+    let manifest = read_revision_manifest(revision, basename, interrupt)?;
+    let names = payload_names(basename)?;
+    let mut payloads = Vec::with_capacity(names.len());
+    for &name in names {
         payloads.push(AuxiliaryArtifact {
             relative_path: name.into(),
             bytes: read_bounded(&revision.join(name), BINARY_LIMIT, interrupt)?,
@@ -215,16 +275,28 @@ fn read_revision(
     directory(revision, root)?;
     Ok((manifest, payloads))
 }
-fn validate_artifact(artifact: &AntennaExternalLeadSolutionArtifact) -> Result<(), RunError> {
+fn validate_artifact(
+    artifact: &AntennaExternalLeadSolutionArtifact,
+) -> Result<&'static str, RunError> {
     validate_reference(&artifact.reference)?;
     require(
-        artifact.manifest_bytes.len() <= MANIFEST_LIMIT && artifact.payloads.len() == 5,
-        "external-lead manifest or payload count exceeds fixed publication support",
+        artifact.manifest_bytes.len() <= MANIFEST_LIMIT,
+        "external-lead manifest exceeds bounded publication support",
+    )?;
+    let manifest = load_antenna_external_lead_solution_manifest(
+        &artifact.manifest_bytes,
+        &artifact.reference,
+    )?;
+    let basename = solution_manifest_basename(&manifest)?;
+    let names = payload_names(basename)?;
+    require(
+        artifact.payloads.len() == names.len(),
+        "external-lead artifact payload count differs from its schema",
     )?;
     let mut found = BTreeSet::new();
     for payload in &artifact.payloads {
         require(
-            PAYLOADS.contains(&payload.relative_path.as_str())
+            names.contains(&payload.relative_path.as_str())
                 && found.insert(payload.relative_path.as_str())
                 && payload.bytes.len() <= BINARY_LIMIT,
             "external-lead artifact requires unique fixed basenames and bounded payloads",
@@ -235,7 +307,7 @@ fn validate_artifact(artifact: &AntennaExternalLeadSolutionArtifact) -> Result<(
         &artifact.payloads,
         &artifact.reference,
     )?;
-    Ok(())
+    Ok(basename)
 }
 fn verify_exact_revision(
     root: &Path,
@@ -345,7 +417,7 @@ pub fn publish_antenna_external_lead_solution_atomically(
     interrupt_requested: Option<&AtomicBool>,
 ) -> Result<PublishedAntennaExternalLeadSolution, RunError> {
     cancel(interrupt_requested)?;
-    validate_artifact(artifact)?;
+    let manifest_name = validate_artifact(artifact)?;
     cancel(interrupt_requested)?;
     let (root, parent, final_dir) =
         revision_paths(output_root, &artifact.reference, true, interrupt_requested)?;
@@ -353,12 +425,12 @@ pub fn publish_antenna_external_lead_solution_atomically(
         verify_exact_revision(&root, &final_dir, artifact, interrupt_requested)?;
         return Ok(PublishedAntennaExternalLeadSolution {
             reference: artifact.reference.clone(),
-            manifest_path: final_dir.join(MANIFEST),
+            manifest_path: final_dir.join(manifest_name),
             reused_existing: true,
         });
     }
     let mut temporary = Temporary::create(&root, &parent)?;
-    for name in PAYLOADS {
+    for &name in payload_names(manifest_name)? {
         let payload = artifact
             .payloads
             .iter()
@@ -366,7 +438,7 @@ pub fn publish_antenna_external_lead_solution_atomically(
             .ok_or_else(|| fail("external-lead fixed payload is absent"))?;
         temporary.write(name, &payload.bytes, interrupt_requested)?;
     }
-    temporary.write(MANIFEST, &artifact.manifest_bytes, interrupt_requested)?;
+    temporary.write(manifest_name, &artifact.manifest_bytes, interrupt_requested)?;
     verify_exact_revision(&root, &temporary.path, artifact, interrupt_requested)?;
     sync_directory(&temporary.path)?;
     directory(&parent, &root)?;
@@ -375,7 +447,7 @@ pub fn publish_antenna_external_lead_solution_atomically(
         verify_exact_revision(&root, &final_dir, artifact, interrupt_requested)?;
         return Ok(PublishedAntennaExternalLeadSolution {
             reference: artifact.reference.clone(),
-            manifest_path: final_dir.join(MANIFEST),
+            manifest_path: final_dir.join(manifest_name),
             reused_existing: true,
         });
     }
@@ -389,7 +461,7 @@ pub fn publish_antenna_external_lead_solution_atomically(
                 verify_exact_revision(&root, &final_dir, artifact, interrupt_requested)?;
                 return Ok(PublishedAntennaExternalLeadSolution {
                     reference: artifact.reference.clone(),
-                    manifest_path: final_dir.join(MANIFEST),
+                    manifest_path: final_dir.join(manifest_name),
                     reused_existing: true,
                 });
             }
@@ -401,7 +473,7 @@ pub fn publish_antenna_external_lead_solution_atomically(
     verify_exact_revision(&root, &final_dir, artifact, None)?;
     Ok(PublishedAntennaExternalLeadSolution {
         reference: artifact.reference.clone(),
-        manifest_path: final_dir.join(MANIFEST),
+        manifest_path: final_dir.join(manifest_name),
         reused_existing: false,
     })
 }
@@ -412,7 +484,8 @@ pub fn load_published_antenna_external_lead_solution_manifest(
 ) -> Result<AntennaExternalLeadSolutionManifest, RunError> {
     let (root, _, revision) = revision_paths(output_root, reference, false, None)?;
     directory(&revision, &root)?;
-    let manifest = read_bounded(&revision.join(MANIFEST), MANIFEST_LIMIT, None)?;
+    let (_, basename) = revision_entries(&revision, None)?;
+    let manifest = read_revision_manifest(&revision, basename, None)?;
     let manifest = load_antenna_external_lead_solution_manifest(&manifest, reference)?;
     directory(&revision, &root)?;
     Ok(manifest)
@@ -449,8 +522,8 @@ mod tests {
     fn bounded_reads_reject_oversized_files_before_loading() {
         let root = fixture_root();
         let mut temporary = Temporary::create(&root, &root).unwrap();
-        temporary.write(MANIFEST, b"1234", None).unwrap();
-        let path = temporary.path.join(MANIFEST);
+        temporary.write(MANIFEST_V1, b"1234", None).unwrap();
+        let path = temporary.path.join(MANIFEST_V1);
         assert_eq!(read_bounded(&path, 4, None).unwrap(), b"1234");
         assert!(read_bounded(&path, 3, None)
             .unwrap_err()
@@ -469,18 +542,18 @@ mod tests {
     fn revision_requires_exact_regular_file_set() {
         let root = fixture_root();
         let mut temporary = Temporary::create(&root, &root).unwrap();
-        temporary.write(MANIFEST, b"{}", None).unwrap();
-        assert!(read_revision(&root, &temporary.path, None)
+        temporary.write(MANIFEST_V1, b"{}", None).unwrap();
+        let (found, basename) = revision_entries(&temporary.path, None).unwrap();
+        assert!(validate_revision_entries(&found, basename)
             .unwrap_err()
             .message
             .contains("exactly manifest"));
-        for name in PAYLOADS {
+        for name in PAYLOADS_V1 {
             temporary.write(name, b"", None).unwrap();
         }
-        assert_eq!(
-            read_revision(&root, &temporary.path, None).unwrap().1.len(),
-            5
-        );
+        let (found, basename) = revision_entries(&temporary.path, None).unwrap();
+        validate_revision_entries(&found, basename).unwrap();
+        assert_eq!(payload_names(basename).unwrap().len(), 5);
         let extra = temporary.path.join("unexpected.bin");
         File::create(&extra).unwrap();
         assert!(read_revision(&root, &temporary.path, None)
@@ -488,13 +561,45 @@ mod tests {
             .message
             .contains("unexpected entry"));
         fs::remove_file(extra).unwrap();
-        fs::remove_file(temporary.path.join(PAYLOADS[0])).unwrap();
-        fs::create_dir(temporary.path.join(PAYLOADS[0])).unwrap();
+        fs::remove_file(temporary.path.join(PAYLOADS_V1[0])).unwrap();
+        fs::create_dir(temporary.path.join(PAYLOADS_V1[0])).unwrap();
         assert!(read_revision(&root, &temporary.path, None)
             .unwrap_err()
             .message
             .contains("regular files"));
-        fs::remove_dir(temporary.path.join(PAYLOADS[0])).unwrap();
+        fs::remove_dir(temporary.path.join(PAYLOADS_V1[0])).unwrap();
+        drop(temporary);
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn versioned_revision_discovery_rejects_mixed_manifests_and_payloads() {
+        let root = fixture_root();
+        let mut temporary = Temporary::create(&root, &root).unwrap();
+        temporary.write(MANIFEST_V1, b"{}", None).unwrap();
+        temporary.write(MANIFEST_V2, b"{}", None).unwrap();
+        assert!(revision_entries(&temporary.path, None)
+            .unwrap_err()
+            .message
+            .contains("exactly one versioned manifest"));
+        fs::remove_file(temporary.path.join(MANIFEST_V2)).unwrap();
+        temporary.write(PAYLOADS_V2[5], b"", None).unwrap();
+        assert!(revision_entries(&temporary.path, None)
+            .unwrap_err()
+            .message
+            .contains("different schema"));
+        fs::remove_file(temporary.path.join(MANIFEST_V1)).unwrap();
+        temporary.write(MANIFEST_V2, b"{}", None).unwrap();
+        for name in PAYLOADS_V1 {
+            temporary.write(name, b"", None).unwrap();
+        }
+        let (found, basename) = revision_entries(&temporary.path, None).unwrap();
+        assert_eq!(basename, MANIFEST_V2);
+        validate_revision_entries(&found, basename).unwrap();
+        assert_eq!(payload_names(basename).unwrap().len(), 6);
+        fs::remove_file(temporary.path.join(PAYLOADS_V2[5])).unwrap();
+        let (found, basename) = revision_entries(&temporary.path, None).unwrap();
+        assert!(validate_revision_entries(&found, basename).is_err());
         drop(temporary);
         fs::remove_dir(root).unwrap();
     }
@@ -504,18 +609,18 @@ mod tests {
         let root = fixture_root();
         let mut temporary = Temporary::create(&root, &root).unwrap();
         let revision = temporary.path.clone();
-        temporary.write(MANIFEST, b"owned", None).unwrap();
+        temporary.write(MANIFEST_V1, b"owned", None).unwrap();
         let foreign = revision.join("foreign.bin");
         File::create(&foreign).unwrap();
         let interrupted = AtomicBool::new(true);
         assert!(temporary
-            .write(PAYLOADS[0], b"not written", Some(&interrupted))
+            .write(PAYLOADS_V1[0], b"not written", Some(&interrupted))
             .unwrap_err()
             .message
             .contains("cancelled"));
-        assert!(!revision.join(PAYLOADS[0]).exists());
+        assert!(!revision.join(PAYLOADS_V1[0]).exists());
         drop(temporary);
-        assert!(!revision.join(MANIFEST).exists());
+        assert!(!revision.join(MANIFEST_V1).exists());
         assert!(foreign.is_file());
         fs::remove_file(foreign).unwrap();
         fs::remove_dir(revision).unwrap();

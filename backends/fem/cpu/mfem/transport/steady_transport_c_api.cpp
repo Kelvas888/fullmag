@@ -8,6 +8,7 @@
 
 #include "fullmag_fem.h"
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 
 #if FULLMAG_HAS_MFEM_STACK
@@ -76,6 +77,17 @@ static_assert(alignof(fullmag_fem_accepted_external_lead_result_v1) == 8);
 static_assert(offsetof(fullmag_fem_accepted_external_lead_result_v1, canonical_payload) == 16);
 static_assert(offsetof(fullmag_fem_accepted_external_lead_result_v1, content_sha256) == 328);
 static_assert(offsetof(fullmag_fem_accepted_external_lead_result_v1, error_message) == 393);
+static_assert(sizeof(fullmag_fem_accepted_external_lead_result_v2) == 944);
+static_assert(alignof(fullmag_fem_accepted_external_lead_result_v2) == 8);
+static_assert(offsetof(fullmag_fem_accepted_external_lead_result_v2, canonical_payload) == 16);
+static_assert(offsetof(fullmag_fem_accepted_external_lead_result_v2, content_sha256) == 328);
+static_assert(offsetof(fullmag_fem_accepted_external_lead_result_v2, error_message) == 393);
+static_assert(offsetof(fullmag_fem_accepted_external_lead_result_v2, current_display_payload) == 656);
+static_assert(offsetof(fullmag_fem_accepted_external_lead_result_v2, current_display_payload_capacity) == 664);
+static_assert(offsetof(fullmag_fem_accepted_external_lead_result_v2, current_display_payload_len) == 672);
+static_assert(offsetof(fullmag_fem_accepted_external_lead_result_v2, current_display_digest_schema) == 680);
+static_assert(offsetof(fullmag_fem_accepted_external_lead_result_v2, current_display_operator_version) == 776);
+static_assert(offsetof(fullmag_fem_accepted_external_lead_result_v2, current_display_content_sha256) == 872);
 #endif
 
 void set_error(fullmag_fem_accepted_terminal_charge_result_v1 *result, const char *message)
@@ -97,6 +109,21 @@ void set_error(fullmag_fem_accepted_external_lead_result_v1 *result, const char 
     result->operator_version[0] = '\0';
     result->layout_fingerprint[0] = '\0';
     result->content_sha256[0] = '\0';
+    std::snprintf(result->error_message, sizeof(result->error_message), "%s", message);
+}
+
+void set_error(fullmag_fem_accepted_external_lead_result_v2 *result, const char *message)
+{
+    if (result == nullptr || result->struct_size < sizeof(*result)) return;
+    result->canonical_payload_len = 0;
+    result->digest_schema[0] = '\0';
+    result->operator_version[0] = '\0';
+    result->layout_fingerprint[0] = '\0';
+    result->content_sha256[0] = '\0';
+    result->current_display_payload_len = 0;
+    result->current_display_digest_schema[0] = '\0';
+    result->current_display_operator_version[0] = '\0';
+    result->current_display_content_sha256[0] = '\0';
     std::snprintf(result->error_message, sizeof(result->error_message), "%s", message);
 }
 
@@ -989,8 +1016,15 @@ int solve_accepted_terminal_charge(const fullmag_fem_accepted_terminal_charge_re
     return FULLMAG_FEM_OK;
 }
 
-int solve_accepted_external_lead(const fullmag_fem_accepted_external_lead_request_v1 &request,
-    fullmag_fem_accepted_external_lead_result_v1 &result)
+struct ResolvedAcceptedExternalLeadRequest {
+    ResolvedAcceptedChargeRequest charge_owner;
+    fullmag::fem::antenna_field_solve::AcceptedExternalLeadSourceRequest closure;
+    std::vector<std::array<double, 3>> targets;
+    fullmag::fem::oersted::DirectTetraQuadratureOptions options;
+};
+
+ResolvedAcceptedExternalLeadRequest resolve_accepted_external_lead_request(
+    const fullmag_fem_accepted_external_lead_request_v1 &request)
 {
     namespace workflow = fullmag::fem::antenna_field_solve;
     static_assert(workflow::AcceptedTerminalChargeSource::maximum_digest_preimage_bytes ==
@@ -1001,9 +1035,6 @@ int solve_accepted_external_lead(const fullmag_fem_accepted_external_lead_reques
     if (request.charge.execution_lane == FULLMAG_FEM_STEADY_TRANSPORT_GPU_DOUBLE) {
         throw std::domain_error("accepted external lead bundle requires CPU/double; GPU has no silent fallback");
     }
-    rt0_require(result.canonical_payload != nullptr && result.canonical_payload_capacity > 0 &&
-            result.canonical_payload_capacity <= FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_MAX_PAYLOAD_BYTES,
-        "external lead bundle payload pointer/capacity is invalid");
     rt0_require(request.base_quadrature_order >= 2 && request.base_quadrature_order <= 16 &&
             request.maximum_subdivision_depth >= 0 && request.maximum_subdivision_depth <= 6 &&
             std::isfinite(request.absolute_tolerance_apm) && request.absolute_tolerance_apm >= 0 &&
@@ -1015,7 +1046,7 @@ int solve_accepted_external_lead(const fullmag_fem_accepted_external_lead_reques
     // Each ordered target contributes 252 bytes before the fixed field/bundle headers.
     rt0_require(request.target_count <= FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_MAX_PAYLOAD_BYTES / 252,
         "external lead bundle target record exceeds its preflight budget");
-    const auto resolved = resolve_accepted_charge_request(request.charge);
+    auto resolved = resolve_accepted_charge_request(request.charge);
     const auto vertices = static_cast<std::uint64_t>(resolved.mesh->GetNV());
     const auto boundary_count = static_cast<std::uint64_t>(resolved.mesh->GetNBE());
     rt0_require(request.device_vertex_ids != nullptr && request.lead_vertex_ids != nullptr &&
@@ -1084,7 +1115,44 @@ int solve_accepted_external_lead(const fullmag_fem_accepted_external_lead_reques
     options.absolute_tolerance_apm = request.absolute_tolerance_apm;
     options.relative_tolerance = request.relative_tolerance;
     options.maximum_source_target_pairs = request.maximum_source_target_pairs;
-    const auto bundle = workflow::solve_accepted_external_lead_bundle(resolved.charge, std::move(closure), targets, options);
+    return {std::move(resolved), std::move(closure), std::move(targets), options};
+}
+
+void validate_external_lead_payload_buffer(const std::uint8_t *payload, std::uint64_t capacity)
+{
+    rt0_require(payload != nullptr && capacity > 0 &&
+            capacity <= FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_MAX_PAYLOAD_BYTES,
+        "external lead payload pointer/capacity is invalid");
+}
+
+bool external_lead_ranges_overlap(const void *first, std::uint64_t first_size,
+    const void *second, std::uint64_t second_size)
+{
+    const auto first_begin = reinterpret_cast<std::uintptr_t>(first);
+    const auto second_begin = reinterpret_cast<std::uintptr_t>(second);
+    constexpr auto maximum = std::numeric_limits<std::uintptr_t>::max();
+    rt0_require(first != nullptr && second != nullptr && first_size <= maximum - first_begin &&
+            second_size <= maximum - second_begin,
+        "external lead payload address range is invalid");
+    return first_begin < second_begin + second_size && second_begin < first_begin + first_size;
+}
+
+int solve_accepted_external_lead(const fullmag_fem_accepted_external_lead_request_v1 &request,
+    fullmag_fem_accepted_external_lead_result_v1 &result)
+{
+    namespace workflow = fullmag::fem::antenna_field_solve;
+    rt0_require(request.charge.abi_version == FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_ABI_VERSION &&
+            request.charge.struct_size == sizeof(request.charge) && request.charge.reserved_flags == 0,
+        "external lead bundle nested charge ABI header mismatch");
+    if (request.charge.execution_lane == FULLMAG_FEM_STEADY_TRANSPORT_GPU_DOUBLE) {
+        throw std::domain_error("accepted external lead bundle requires CPU/double; GPU has no silent fallback");
+    }
+    rt0_require(result.canonical_payload != nullptr && result.canonical_payload_capacity > 0 &&
+            result.canonical_payload_capacity <= FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_MAX_PAYLOAD_BYTES,
+        "external lead bundle payload pointer/capacity is invalid");
+    auto resolved = resolve_accepted_external_lead_request(request);
+    const auto bundle = workflow::solve_accepted_external_lead_bundle(resolved.charge_owner.charge,
+        std::move(resolved.closure), resolved.targets, resolved.options);
     rt0_require(!bundle.canonical_content_bytes.empty() &&
             bundle.canonical_content_bytes.size() <= result.canonical_payload_capacity && bundle.content_digest.size() == 64,
         "external lead bundle payload capacity is insufficient or digest is invalid");
@@ -1096,6 +1164,56 @@ int solve_accepted_external_lead(const fullmag_fem_accepted_external_lead_reques
     std::copy(bundle.canonical_content_bytes.begin(), bundle.canonical_content_bytes.end(), result.canonical_payload);
     result.canonical_payload_len = bundle.canonical_content_bytes.size();
     result.error_message[0] = '\0';
+    return FULLMAG_FEM_OK;
+}
+
+int solve_accepted_external_lead_display(const fullmag_fem_accepted_external_lead_request_v1 &request,
+    fullmag_fem_accepted_external_lead_result_v2 &result)
+{
+    namespace workflow = fullmag::fem::antenna_field_solve;
+    validate_external_lead_payload_buffer(result.canonical_payload, result.canonical_payload_capacity);
+    validate_external_lead_payload_buffer(result.current_display_payload, result.current_display_payload_capacity);
+    rt0_require(!external_lead_ranges_overlap(result.canonical_payload, result.canonical_payload_capacity,
+            result.current_display_payload, result.current_display_payload_capacity) &&
+            !external_lead_ranges_overlap(result.canonical_payload, result.canonical_payload_capacity,
+                &result, sizeof(result)) &&
+            !external_lead_ranges_overlap(result.current_display_payload, result.current_display_payload_capacity,
+                &result, sizeof(result)),
+        "external lead display output buffers overlap");
+    auto resolved = resolve_accepted_external_lead_request(request);
+    const auto expected_display_size = workflow::accepted_external_lead_current_display_payload_size(
+        resolved.charge_owner.charge, resolved.closure.device_vertex_ids);
+    rt0_require(expected_display_size > 0 && expected_display_size <= result.current_display_payload_capacity,
+        "external lead current display capacity is insufficient before solve");
+    const auto display = workflow::solve_accepted_external_lead_display_bundle(resolved.charge_owner.charge,
+        std::move(resolved.closure), resolved.targets, resolved.options);
+    const auto &bundle = display.bundle;
+    const auto &current = display.current_display;
+    rt0_require(!bundle.canonical_content_bytes.empty() &&
+            bundle.canonical_content_bytes.size() <= result.canonical_payload_capacity &&
+            bundle.content_digest.size() == 64 && current.content_digest.size() == 64 &&
+            current.canonical_content_bytes.size() == expected_display_size &&
+            current.canonical_content_bytes.size() <= result.current_display_payload_capacity,
+        "external lead display payload capacity, framed size or digest is invalid");
+    // Validate every text into local metadata before copying either caller buffer.
+    auto published = result;
+    copy_rt0_text(published.digest_schema, sizeof(published.digest_schema), bundle.digest_schema, "bundle digest schema");
+    copy_rt0_text(published.operator_version, sizeof(published.operator_version), bundle.operator_version, "bundle operator version");
+    copy_rt0_text(published.layout_fingerprint, sizeof(published.layout_fingerprint),
+        FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_DISPLAY_LAYOUT_FINGERPRINT, "external lead display ABI fingerprint");
+    copy_rt0_text(published.content_sha256, sizeof(published.content_sha256), bundle.content_digest, "bundle content digest");
+    copy_rt0_text(published.current_display_digest_schema, sizeof(published.current_display_digest_schema),
+        current.digest_schema, "current display digest schema");
+    copy_rt0_text(published.current_display_operator_version, sizeof(published.current_display_operator_version),
+        current.operator_version, "current display operator version");
+    copy_rt0_text(published.current_display_content_sha256, sizeof(published.current_display_content_sha256),
+        current.content_digest, "current display content digest");
+    std::copy(bundle.canonical_content_bytes.begin(), bundle.canonical_content_bytes.end(), result.canonical_payload);
+    std::copy(current.canonical_content_bytes.begin(), current.canonical_content_bytes.end(), result.current_display_payload);
+    published.canonical_payload_len = bundle.canonical_content_bytes.size();
+    published.current_display_payload_len = current.canonical_content_bytes.size();
+    published.error_message[0] = '\0';
+    result = published;
     return FULLMAG_FEM_OK;
 }
 
@@ -2590,6 +2708,41 @@ extern "C" int fullmag_fem_solve_accepted_external_lead_field_v1(
     }
 #else
     set_error(result, "accepted external lead bundle requires FULLMAG_USE_MFEM_STACK=ON");
+    return FULLMAG_FEM_ERR_UNAVAILABLE;
+#endif
+}
+
+extern "C" int fullmag_fem_solve_accepted_external_lead_field_v2(
+    const fullmag_fem_accepted_external_lead_request_v1 *request,
+    fullmag_fem_accepted_external_lead_result_v2 *result)
+{
+    if (request == nullptr || result == nullptr) {
+        set_error(result, "accepted external lead display requires non-null request and result");
+        return FULLMAG_FEM_ERR_INVALID;
+    }
+    set_error(result, "");
+    if (request->abi_version != FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_ABI_VERSION ||
+        request->struct_size != sizeof(*request) || request->reserved_flags != 0 ||
+        result->abi_version != FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_DISPLAY_ABI_VERSION ||
+        result->struct_size != sizeof(*result) || result->reserved_flags != 0) {
+        set_error(result, "accepted external lead display ABI header mismatch");
+        return FULLMAG_FEM_ERR_INVALID;
+    }
+#if FULLMAG_HAS_MFEM_STACK
+    try {
+        return solve_accepted_external_lead_display(*request, *result);
+    } catch (const std::domain_error &error) {
+        set_error(result, error.what());
+        return FULLMAG_FEM_ERR_UNAVAILABLE;
+    } catch (const std::invalid_argument &error) {
+        set_error(result, error.what());
+        return FULLMAG_FEM_ERR_INVALID;
+    } catch (const std::exception &error) {
+        set_error(result, error.what());
+        return FULLMAG_FEM_ERR_INTERNAL;
+    }
+#else
+    set_error(result, "accepted external lead display requires FULLMAG_USE_MFEM_STACK=ON");
     return FULLMAG_FEM_ERR_UNAVAILABLE;
 #endif
 }

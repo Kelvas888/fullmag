@@ -3644,6 +3644,161 @@ ESLint receipt `1379a488f5ea4a93aecad631da174c50` i API hygiene
 `07047a00c08f497ba934e63a17f255d1` również PASS. Szczegóły i granice dowodów:
 `docs/superpowers/plans/2026-10-08-antenna-end-to-end-gap-closure.md`.
 
+(antenna-owned-current-display-snapshot)=
+#### Nośnik J z tego samego accepted RT0: środki i lokalne ślady
+
+Kontrakt przyrostu z 10.10.2026: native cold sampling **przed zwolnieniem**
+owned charge/source, bez drugiego H1, RT0 projection lub importu współczynników
+do alternatywnego solvera. `AffineRt0Element::current_at` jest tym samym
+evaluatorem, którego używa `DirectTetraQuadrature`. Dotychczasowy bundle v1
+i ABI v1 zachowują bajty oraz layout. Nowy niezależny wersjonowany snapshot
+wiąże SHA bundle, charge i source, dlatego samo posiadanie legacy rekordu
+nie uprawnia do ogłoszenia `current_density=true`.
+
+Dla prostego Tet4 i zaakceptowanego afinicznego RT0:
+
+```{math}
+:label: antenna-current-display-affine-traces
+\mathbf x_K^c=\frac14\sum_{a=0}^3\mathbf v_{K,a},\qquad
+\overline{\mathbf J}_K=\frac1{\lvert K\rvert}\int_K\mathbf J_K(\mathbf x)\,dV
+=\mathbf J_K(\mathbf x_K^c)
+=\frac14\sum_{a=0}^3\mathbf J_K(\mathbf v_{K,a}).
+```
+
+Równość wynika z dokładności pierwszego momentu barycentrycznego dla funkcji
+afinicznej: każda współrzędna barycentryczna ma średnią $1/4$ na simpleksie.
+Native zapisuje rzeczywiste trzy składowe J w środku i cztery lokalne ślady
+w wierzchołkach. To reprezentacja tego samego pola, nie nowa projekcja.
+Arytmetyka binary64/long double i zaokrąglony zapis środka nie gwarantują
+bitowej identyczności trzech dróg obliczeń; niezależny check musi uwzględniać
+ich błąd zaokrąglenia bez osłabienia fizycznych bramek prądu.
+
+| Dokładny symbol | Znaczenie | SI |
+|---|---|---|
+| $K,\lvert K\rvert,dV$ | owned Tet4, jego objętość i dodatnia miara całkowania | $\mathrm{m^3}$ |
+| $a$ | lokalny indeks wierzchołka $0,1,2,3$ w kolejności MFEM elementu | $1$ |
+| $\mathbf v_{K,a},\mathbf x,\mathbf x_K^c$ | wierzchołki, punkt fizyczny i barycentrum komórki | $\mathrm m$ |
+| $\mathbf J_K,\overline{\mathbf J}_K$ | lokalne pole RT0 i jego średnia objętościowa, nie średnia normy | $\mathrm{A\,m^{-2}}$ |
+
+RT0 zapewnia ciągłość normalną, nie ciągłość całego wektora. Dlatego renderer
+surface używa śladów **właściciela konkretnej komórki**, bez uśredniania
+wektorów do wspólnego węzła. Zewnętrzna ściana Tet4 zachowuje lokalny ślad
+sąsiedniej komórki; prezentacyjne powielenie vertices nie zmienia logical IDs.
+Składowe interpoluje się afinicznie wewnątrz ściany, a moduł oblicza dopiero
+z interpolowanego wektora. Norma średniego J nie jest średnią normy J.
+Cell centers obsługują wektory i punkty; same środki nie wystarczają do pełnego
+powierzchniowego widoku wymaganego przez wspólny Inspector.
+
+| Prywatny parametr/nośnik | Typ/default | SI | Walidacja i semantyka | Python → IR |
+|---|---|---|---|---|
+| snapshot policy | fixed `cell_center_and_cell_local_vertices.v1` | $1$ | generic affine RT0, serial straight Tet4; żadnego nodal averaging | brak nowego authoringu |
+| cell identity | ordered uint64 element index + cztery actual stable vertex IDs | $1$ | indeks w retained whole-domain mesh, kompletna device ownership i lokalna kolejność; brak synthetic IDs | istniejąca siatka wykonawcza |
+| vertex positions / center | float64 XYZ, wymagane | $\mathrm m$ | skończone actual coordinates; środek obliczony z tych czterech vertices | pochodny immutable output |
+| vertex traces / center J | float64 XYZ, wymagane | $\mathrm{A\,m^{-2}}$ | evaluated accepted RT0, finite i representable; cztery/trzy składowe zgodne z layout | nie `rt0_flux_a` ani osobny charge solve |
+| SHA pins | trzy wymagane SHA-256 | $1$ | exact bundle/charge/source, własny SHA całego ordered stream | istniejący request/provenance |
+| normalization / scope | fixed `raw_authored_current` / `external_electrode_truncation` | $1$ | bez dzielenia przez prąd, również zero current; inspection only | nie tworzy qualified drive |
+| record budget | fixed 128 MiB maksimum | $1$ jako liczba bajtów | preflight liczności/rozmiaru przed solve, finite typed canonical framing | bez nowego publicznego parametru |
+
+Wersjonowany ABI sprawdza poprawność capacity i rozłączne zakresy pamięci obu
+caller buffers przed solve. Dokładny rozmiar J jest znany z device Tet4 i
+framingu przed solve, więc za mały bufor J odmawia bez obliczeń. Rozmiar legacy
+bundle zależy również od wynikowego charge/source ledgeru; zachowuje dodatni,
+ograniczony caller buffer i sprawdza jego wystarczalność po solve, przed kopią.
+Nie wymaga fikcyjnej znajomości tego rozmiaru ani bufora 128 MiB dla małej sceny.
+Niepowodzenie nie publikuje lengths/SHA/accepted
+metadata żadnego wyniku; legacy ABI nie otrzymuje nowych pól. SHA snapshotu
+obejmuje policy, ordering, wszystkie coordinates/values i pins; SHA bundle
+pozostaje SHA dotychczasowych trzech nested records, nie zmienionego strumienia.
+Decoder/atomic publisher/API wymagają pełnego bindingu zanim udostępnią J.
+Nie rekonstruują J w Rust ani frontendzie. Starszy artefakt zachowuje jawny
+brak J, zamiast fikcyjnego wyniku lub automatycznego ponownego solve.
+
+Trwały nośnik `antenna_external_lead_solution.v2` zapisuje
+`manifest.v2.json` oraz dotychczasowe pięć payloadów i dodatkowy
+`current_display.v1.bin`. Wymaga receipt operatora, ewaluatora, polityk
+próbkowania/środka, normalizacji, SI oraz liczby komórek. Legacy v1 zachowuje
+`manifest.v1.json`, dokładnie pięć payloadów i brak pola `current_display`
+w serializacji; jego content digest ani SHA bundle nie są zmieniane przez
+dodanie obsługi v2. Mieszane generacje, dwa manifesty, brakujące/obce
+payloady oraz duplikaty kluczy JSON są odrzucane przy pełnym odczycie.
+Odczyt manifest-only może pokazać receipt mimo brakującego payloadu i nie
+stanowi dowodu dostępności J. Pełny load sprawdza ordered snapshot względem
+retained bundle i kompletnej partycji device/lead; publikacja i reuse
+wykonują ten load przed zaakceptowaniem atomowego revision.
+
+Właściciele: `crates/fullmag-runner/src/antenna_external_lead_solution.rs::load_antenna_external_lead_solution`,
+`crates/fullmag-runner/src/native_fem/accepted_external_lead/current_display.rs::decode_current_display`
+oraz `crates/fullmag-runner/src/antenna_external_lead_solution/publication.rs::publish_antenna_external_lead_solution_atomically`.
+Stage record v2 zachowuje zarejestrowany basename rekordu, ale jawnie wiąże
+schema v2, ścieżkę manifestu v2 i `J_charge` w $\mathrm{A\,m^{-2}}$.
+API `crates/fullmag-api/src/router_v2/handlers/data/antenna_inspection.rs::get_antenna_external_lead_inspection_display`
+udostępnia środki/J oraz cztery lokalne pozycje/ślady każdego device Tet4
+jako osobne deskryptory binary64, nie ciężkie tablice JSON. Wersja v1 nie
+otrzymuje `current_density=true`; wersja v2 wymaga pełnego zweryfikowanego
+snapshotu. To dostępność obserwabli inspekcyjnej, nie kwalifikacja obwodu
+ani dokładności pola. Obie generacje nadal odmawiają source FFT i LLG/Relax.
+
+Frontend interpretuje sześć kompletnych, SHA/ETag-zweryfikowanych payloadów:
+device XYZ/Tet4, centers XYZ/J oraz cell-local vertices XYZ/J. Buduje lokalny
+nośnik powierzchni bez uśredniania między komórkami; wektory/punkty zachowują
+natywne wartości w środkach. Skala kolorów komponentu obejmuje wszystkie
+centers/traces, a dla modułu dolna granica wynosi zero, bo wektor afiniczny
+może zanikać wewnątrz ściany mimo niezerowych wartości w wierzchołkach.
+Shader interpoluje trzy składowe i dopiero w fragmencie oblicza komponent
+lub normę. Wspólny Inspector udostępnia powierzchnię, wireframe, punkty,
+pełne wektory XYZ, komponent i paletę dla raw J. Wersja v1 nie oferuje J.
+Admission: najwyżej 100000 komórek/400000 lokalnych wierzchołków oraz
+64 MiB pojedynczego kompletnego carriera; odmowa, nie automatyczna decymacja.
+Zmiany komponentu, palety i pojedynczych passów zachowują geometrię,
+materiał oraz teksturę LUT; zmiana ownera zwalnia zasoby. Wszystkie widoki
+używają jednego zakresu SI i stałej skali glyphów niezależnej od kamery.
+
+Dowód UI z 11.10.2026: izolowany managed browser receipt
+`4a3609574f2443f39aed36e46d7db3b0`, passed/0, 16 grup kontroli;
+source digest przed/po
+`25186155a82134b079022e79c366805768eb914ef712298a0020b58165444e35`.
+Sprawdzono wspólny Inspector V/J/H, UUID zasobów przy zmianach ustawień,
+jednostki, bounded binary reads, owner cleanup i odmowy uszkodzonych danych.
+Jednorazowy odczyt GPU przy znoszeniu się afinicznych wektorów dał
+RGBA `(68,2,85,255)` (minimum Viridis), a punkt niezerowy
+`(51,150,130,255)`; test odróżnia normę interpolowanego wektora od błędnej
+interpolacji norm wierzchołkowych. Canvas był widoczny, drawing buffer
+niezerowy, WebGL context niezagubiony; obejrzano screenshot znoszenia.
+Interpretowany adapter produkcyjny: 90/90 PASS, bez kompilacji unit targets.
+Kontrola typów frontendu: passed/0, `f21e7af3f6cd4ca09bdd65c93ea9cf91`.
+Ten check poprzedza wyłącznie korektę oczekiwania na gotowość w skrypcie
+Playwright; sprawdzone źródła produkcyjne TS/TSX pozostały niezmienione.
+Lint całego końcowego frontendu: passed/0, `a4c9831b634c4e7695567890c2ac362e`.
+To **kontrolowany transport testowy UI**, nie native solve, rzeczywisty
+HTTP, zbieżność RT0 ani kwalifikacja naukowa. Snapshot testowy nie jest
+publikowanym wynikiem solvera. Build FEM nr 40 jest succeeded/0 i ma
+127/127 zgodnych rozmiarów/SHA artefaktów, ale jego kapsuła poprzedza
+adapter Rust/archive/API/frontend; nie stanowi dowodu tego przepływu.
+
+| Realizacja | Stan i granica przyrostu |
+|---|---|
+| FEM CPU/double | producent native zbudowany; decoder/archive/API source-check, UI na kontrolowanych danych PASS; solve/publikacja/cold-load/rzeczywisty HTTP i nauka wymagają osobnych dowodów |
+| FEM GPU | brak producenta tego accepted charge workflow; brak fallbacku i GPU qualification |
+| FDM CPU | może konsumować jawny wynik read-only, ale nie wykonuje tego native current solve |
+| FDM GPU | brak domniemanego transferu; mapy/LLG/parity pozostają oddzielnymi bramkami |
+
+Publiczny Python, parametry transportu, `ProblemIR`, planner i runtime stage
+semantics nie zmieniają się. To cold observable istniejącego single-owned
+workflow, nie nowa fizyka, energia, torque, per-A baza ani certyfikat obwodu.
+Normalizacja, terminal/interface ledger i ograniczenia skończonego źródła
+pozostają te same. Zapis J nie aktywuje FFT ani LLG/Relax.
+
+Wymagane dowody: identyczny owner/evaluator i brak dodatkowego solve; signed,
+zero/tiny currents, analityczne $J=I/A$; layered conductivity, rzeczywiste
+signed maps MFEM/skew/scale/translation/permutations; zgodność centrów i śladów
+oraz niezależnych całek normalnych z retained ledgerem; bounded odmowy
+count/capacity/alias/foreign IDs/stale SHA; source-pinned managed FEM CPU,
+actual binary HTTP i wspólny Inspector x/y/z/moduł/wektory/powierzchnia.
+Zakaz kompilacji unit-test targets pozostaje w mocy. Interpretowany model
+barycentryczny lub source review nie zastępuje tych dowodów native/UI.
+Podstawa: affine RT0/Piola w istniejącej bibliografii [8] oraz powyższy
+kontrakt `antenna-rt0-stable-shared-reconstruction`.
+
 (antenna-duffy-singular-transformation)=
 ### Całka w źródle: transformacja Duffy i znak pola
 
@@ -6012,6 +6167,12 @@ evidence and cannot promote a capability lane.
 | `scripts/smoke_antenna_inspection_display.py` | `verify` | rzeczywisty HTTP i niezależne porównanie pochodnych z bundle; przed buildem niewykonany |
 | `apps/control-room/src/kernel/resources/antennaResources.ts` | `antennaInspectionPayloadEtag` | expected binary ETag z dokładnego ordered owner tuple; runtime/browser niewykonane dla nowej kontroli |
 | `docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md` | `DOC-ANCHOR:antenna-inspection-display-carrier` | kontrakt SI, ownership, display i opcjonalnej retencji ordered node tags |
+| `docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md` | `DOC-ANCHOR:antenna-owned-current-display-snapshot` | same-owner J, centers i cell-local traces; kontrakt bez native qualification |
+| `backends/fem/cpu/mfem/workflows/antenna_field_solve/accepted_external_lead_source.cpp` | `sample_current_display` | source-only cold snapshot J z tego samego RT0; nie Rust reconstruction ani drugi solve |
+| `backends/fem/cpu/mfem/workflows/antenna_field_solve/accepted_external_lead_source.cpp` | `accepted_external_lead_current_display_payload_size` | exact framing budget i whole-cell partition przed solve; runtime nieodebrany |
+| `apps/control-room/src/modules/viewport-3d/model/antennaCurrentOverlayModel.ts` | `buildAntennaCurrentOverlayModel`, `projectAntennaCurrentOverlayModel` | owned J, brak nodal averaging, immutable carrier i reprojekcja komponentów; interpretowane 90/90 PASS |
+| `apps/control-room/src/modules/viewport-3d/layers/antennaCurrentSurfaceMaterial.ts` | `createAntennaCurrentSurfaceMaterial`, `updateAntennaCurrentSurfaceMaterial` | wektor interpolowany przed normą, aktualizacja LUT/uniforms bez zmiany zasobów; kontrolowany browser/GPU PASS |
+| `apps/control-room/src/modules/viewport-3d/layers/AntennaFieldLayer.tsx` | `AntennaFieldLayer` | wspólne passy i śledzone zasoby GPU, stabilne UUID oraz owner cleanup; kontrolowany browser PASS |
 | `docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md` | `DOC-ANCHOR:antenna-straight-lead-preparation` | planned private straight-stub input, explicit currents i conservative refusal; nie closed circuit |
 | `packages/fullmag-py/src/fullmag/model/current_transport.py` | `TerminalLeadExtension`, `ExternalLeadPreparation` | publiczna SI-clean deklaracja, strict intent i jawne prepare na actual mesh; nie solved source |
 | `packages/fullmag-py/src/fullmag/meshing/_antenna_external_lead_preparation.py` | `prepare_antenna_external_lead_source` | prywatna jawna preparacja actual cap → Tet4 leads i strict source MeshIR; bez solve |

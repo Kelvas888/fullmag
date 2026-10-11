@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { useThree } from "@react-three/fiber";
-import { BufferGeometry, Vector2 } from "three";
+import { BufferGeometry, ShaderMaterial, SRGBColorSpace, Vector2, Vector3, WebGLRenderTarget } from "three";
 import { ControlRoomApi } from "@/kernel/api/ControlRoomApi";
 import { DATA_ANTENNA_FIELD_SOLUTION_PATH, DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH, DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, MODEL_SCENE_PATH, SESSIONS_PATH, SESSION_STATUS_PATH } from "@/kernel/api/apiPaths";
 import type { AntennaFieldSolutionResource, AntennaExternalLeadInspectionResource, AntennaInspectionDisplayResource, SceneResource } from "@/kernel/api/apiTypes";
@@ -33,11 +33,12 @@ const subscribe = () => () => {};
 const client = () => true;
 const server = () => false;
 type Call = { path: string; range: string | null; scope: string | null; port: string | null };
-declare global { interface Window { __antennaVisualizationFixture?: { read(): { calls: Call[]; tree: unknown; unexpected: string[] }; selectOther(): void; }; __antennaFieldCanvas?: () => { lost: boolean; width: number; height: number; sampleCount: number; pointCount: number; glyphCount: number; surfaceTriangles: number; wireframeEdges: number; normalization: string; quantity: string; colorMinimum: number; colorMaximum: number; }; } }
+declare global { interface Window { __antennaVisualizationFixture?: { read(): { calls: Call[]; tree: unknown; unexpected: string[] }; selectOther(): void; }; __antennaFieldPixel?: (position: number[]) => number[]; __antennaFieldCanvas?: () => { lost: boolean; width: number; height: number; sampleCount: number; pointCount: number; glyphCount: number; surfaceTriangles: number; wireframeEdges: number; normalization: string; quantity: string; colorMinimum: number; colorMaximum: number; currentVertices: number; currentMaterial: string; currentComponent: number; paletteTextures: number; minimum: number; maximum: number; surfaceUuid: string; wireUuid: string; pointsUuid: string; materialUuid: string; paletteUuid: string; }; } }
 
 function makeFixture() {
   const scenario = new URL(window.location.href).searchParams.get("scenario") ?? "ready";
   const isInspection = scenario.startsWith("inspection");
+  const isCurrent = scenario.startsWith("inspection-current");
   const scene = {
     revision: 1, objects: [{ id: "antenna", name: "Antenna", role: "antenna" }],
     antenna_field_solve_stages: scenario === "empty" ? [] : [{ id: "solve", source_object_id: "antenna", current_transport_id: "transport", port_mode_ids: ["port"], model: "quasistatic_conduction_biot_savart3d", oersted_realization: "direct_tetra_quadrature", conductor_mesh_policy: "inherit_source", solver_policy: "default", field_sampling_domain: { kind: "global" }, target_refs: [{ kind: "global" }], outputs: [{ id: "solution", quantity: "H_ant_basis" }] }],
@@ -57,12 +58,12 @@ function makeFixture() {
   if (scenario === "cardinality") solution.bases[0].magnetic_field_per_ampere.value_count = 27;
   if (scenario === "multiport") solution.bases.push({ ...solution.bases[0], port_mode_id: "port-two" });
   const inspection: AntennaExternalLeadInspectionResource = {
-    ...owner, schema_version: "antenna_inspection_stage_record.v1", resource_id: "fixture-inspection", run_id: "fixture-run", runtime_stage_id: "solve", stage_revision: 1,
+    ...owner, schema_version: "antenna_external_lead_stage_output.v1", resource_id: "fixture-inspection", run_id: "fixture-run", runtime_stage_id: "solve", stage_revision: 1,
     record_content_digest: digest, stage_id: "solve", stage_kind: "antenna_external_lead_inspection", output_id: "inspection", port_mode_id: "port",
     status: "inspection_only", field_scope: "external_electrode_truncation", qualification: "NOT VERIFIED", resolved_action: "inspection_only",
     outputs: [{ kind: "inspection_only", manifest_ref: "fixture-only", payload_units: {}, reused_existing: false, inspection_ref: { content_digest: digest, output_id: "inspection", stage_id: "solve" } }],
     manifest: {
-      schema_version: "antenna_external_lead_inspection.v1", content_digest: digest, source_object_id: "antenna", current_transport_id: "transport", drive_id: "fixture-drive", closure_revision: "fixture-closure",
+      schema_version: "antenna_external_lead_solution.v1", content_digest: digest, source_object_id: "antenna", current_transport_id: "transport", drive_id: "fixture-drive", closure_revision: "fixture-closure",
       validation_scope: "inspection_only", requested_execution: {}, resolved_execution: {}, input_pins: {}, solver_policy: {}, charge_content_sha256: "a".repeat(64), source_content_sha256: "a".repeat(64), field_content_sha256: "a".repeat(64),
       sampling_carrier: { carrier_kind: "mesh_nodes", location: "node", domain: { kind: "global" }, sample_count: 10, topology_digest: "fixture-samples" },
       sample_positions: { ...ref("sample_xyz_interleaved", "m", 30), byte_count: 240 },
@@ -84,11 +85,26 @@ function makeFixture() {
   if (scenario === "inspection-duplicate-cell") cellIndices.splice(4, 4, 0, 1, 2, 3);
   const topology = new ArrayBuffer(cellIndices.length * 4), topologyView = new DataView(topology);
   cellIndices.forEach((value, index) => topologyView.setUint32(index * 4, value, true));
+  // Controlled affine vectors with different cell-local traces, not a transport solution.
+  const traceCoordinates = cellIndices.flatMap((node) => deviceCoordinates.slice(node * 3, node * 3 + 3));
+  const traceCurrent = cellIndices.flatMap((node, local) => [0, 1, 2].map((axis) =>
+    scenario === "inspection-current-cancellation"
+      // Affine RT0-shaped vectors cancel at the visible face's barycenter.
+      ? (deviceCoordinates[node * 3 + axis] - ([-5e-7 / 3 + Math.floor(node / 5) * 4e-7, -1e-7 / 3, 1e-7 / 3][axis])) * 1e15
+      : (Math.floor(local / 4) % 2 ? -1 : 1) * (axis + 1) * 1e8 + deviceCoordinates[node * 3 + axis] * 1e14));
+  const centers = Array.from({ length: 4 }, (_, cell) => [0, 1, 2].map((axis) =>
+    [0, 1, 2, 3].reduce((sum, local) => sum + traceCoordinates[(cell * 4 + local) * 3 + axis] / 4, 0))).flat();
+  const centerCurrent = Array.from({ length: 4 }, (_, cell) => [0, 1, 2].map((axis) =>
+    [0, 1, 2, 3].reduce((sum, local) => sum + traceCurrent[(cell * 4 + local) * 3 + axis] / 4, 0))).flat();
+  if (scenario === "inspection-current-position") traceCoordinates[0] += 1e-8;
+  if (scenario === "inspection-current-nonfinite") traceCurrent[0] = NaN;
   const rawPayloads = {
     device_positions: f64(deviceCoordinates), device_topology: topology,
     device_potential: f64(Array.from({ length: 10 }, (_, node) => scenario === "inspection-extreme" ? node < 5 ? -1e308 : 1e308 : scenario === "inspection-nonfinite" && node === 2 ? NaN : node - 4.5)),
     sample_positions: f64(Array.from({ length: 30 }, (_, index) => { const node = Math.floor(index / 3), axis = index % 3; return axis === 0 ? (node % 5 - 2) * 1e-7 : axis === 1 ? (Math.floor(node / 5) - 0.5) * 2e-7 : 0; })),
     magnetic_field: f64(Array.from({ length: 30 }, (_, index) => index + 1)),
+    current_center_positions: f64(centers), current_center_density: f64(centerCurrent),
+    current_trace_positions: f64(traceCoordinates), current_trace_density: f64(traceCurrent),
   };
   let displayPromise: Promise<AntennaInspectionDisplayResource> | null = null;
   const displayMetadata = () => displayPromise ??= (async () => {
@@ -107,6 +123,29 @@ function makeFixture() {
     inspection.manifest!.device_potential = display.device_potential;
     inspection.manifest!.sample_positions = display.sample_positions;
     inspection.manifest!.magnetic_field = display.magnetic_field;
+    if (isCurrent) {
+      inspection.schema_version = "antenna_external_lead_stage_output.v2";
+      inspection.manifest!.schema_version = "antenna_external_lead_solution.v2";
+      display.schema_version = "antenna_inspection_display.v2";
+      display.capabilities.current_density = true;
+      const snapshot = { ...ref("accepted_external_lead_current_display.ordered.v1", "A/m^2", 1), scalar_type: "ordered_binary_v1", byte_count: 1, path: "current_display.v1.bin" };
+      const receipt = {
+        schema_version: "accepted_external_lead_current_display.ordered.v1", operator_version: "fem_accepted_external_lead_current_display.v1",
+        current_evaluator_version: "fem_generic_affine_rt0.v1", sampling_policy: "cell_center_and_cell_local_vertices.v1",
+        center_policy: "vertex_quarter_sum.long_double.v1", normalization: "raw_authored_current", coordinate_unit: "m", current_density_unit: "A/m^2", cell_count: 4, payload: snapshot,
+      };
+      const currentDescriptor = async (kind: keyof typeof rawPayloads, layout: string, unit: string) => ({ ...await descriptor(kind, layout, unit), path: `display/${kind}.bin` });
+      display.device_current = {
+        receipt, ordered_snapshot: snapshot,
+        center_positions: await currentDescriptor("current_center_positions", "cell_xyz_interleaved", "m"),
+        center_current_density: await currentDescriptor("current_center_density", "cell_vector_xyz_interleaved", "A/m^2"),
+        trace_positions: await currentDescriptor("current_trace_positions", "cell_local_vertex_xyz_interleaved", "m"),
+        trace_current_density: await currentDescriptor("current_trace_density", "cell_local_vertex_vector_xyz_interleaved", "A/m^2"),
+      };
+      inspection.manifest!.current_display = structuredClone(receipt);
+      if (scenario === "inspection-current-unit") display.device_current.trace_current_density.unit = "A/m";
+      if (scenario === "inspection-current-generation") inspection.manifest!.schema_version = "antenna_external_lead_solution.v1";
+    }
     if (scenario === "inspection-foreign") display.source_object_id = "foreign-antenna";
     if (scenario === "inspection-digest") display.content_digest = `sha256:${"b".repeat(64)}`;
     if (scenario === "inspection-layout") display.device_potential.layout = "node_scalar";
@@ -143,8 +182,13 @@ function makeFixture() {
     if (url.pathname.startsWith(inspectionPrefix)) {
       const kind = url.pathname.slice(inspectionPrefix.length) as keyof typeof rawPayloads;
       if (!isInspection || !Object.hasOwn(rawPayloads, kind) || url.searchParams.get("content_digest") !== digest) throw new Error("Unexpected inspection payload contract");
-      const data = rawPayloads[kind], descriptor = (await displayMetadata())[kind];
-      if (request.headers.get("range") !== `bytes=0-${data.byteLength - 1}`) throw new Error("Unexpected inspection payload range");
+      const metadata = await displayMetadata();
+      const currentDescriptors = {
+        current_center_positions: metadata.device_current?.center_positions, current_center_density: metadata.device_current?.center_current_density,
+        current_trace_positions: metadata.device_current?.trace_positions, current_trace_density: metadata.device_current?.trace_current_density,
+      };
+      const data = rawPayloads[kind], descriptor = kind in currentDescriptors ? currentDescriptors[kind as keyof typeof currentDescriptors] : metadata[kind as "device_potential" | "device_positions" | "device_topology" | "sample_positions" | "magnetic_field"];
+      if (!descriptor || request.headers.get("range") !== null && request.headers.get("range") !== `bytes=0-${data.byteLength - 1}`) throw new Error("Unexpected inspection payload range");
       let body = data;
       if (kind === "device_potential" && scenario === "inspection-corrupt") { body = data.slice(0); new DataView(body).setFloat64(0, 999, true); }
       if (kind === "device_potential" && scenario === "inspection-short") body = data.slice(0, data.byteLength - 8);
@@ -169,9 +213,22 @@ function makeFixture() {
   return { kernel: { api, bus, resources, diagnostics, diagnosticRecorder, selection, visualization } as unknown as KernelApi, control: { read: () => ({ calls, tree, unexpected }), selectOther: () => selection.set({ objectId: "other", ref: null }, "inspector") } };
 }
 
-function FieldCanvasProbe() {
-  const { gl, scene } = useThree();
+function FieldCanvasProbe({ tracker }: { tracker: Viewport3DResourceTracker }) {
+  const { gl, scene, camera } = useThree();
   useEffect(() => {
+    // One bounded diagnostic render/readback, fixture-only; no production render loop.
+    window.__antennaFieldPixel = (position) => {
+      const size = gl.getDrawingBufferSize(new Vector2());
+      const target = new WebGLRenderTarget(size.x * 2, size.y * 2);
+      target.texture.colorSpace = SRGBColorSpace;
+      const previous = gl.getRenderTarget(), pixel = new Uint8Array(4);
+      try {
+        gl.setRenderTarget(target); gl.render(scene, camera);
+        const projected = new Vector3(position[0], position[1], position[2]).project(camera);
+        gl.readRenderTargetPixels(target, Math.floor((projected.x + 1) / 2 * target.width), Math.floor((projected.y + 1) / 2 * target.height), 1, 1, pixel);
+        return Array.from(pixel);
+      } finally { gl.setRenderTarget(previous); target.dispose(); }
+    };
     window.__antennaFieldCanvas = () => {
       const size = gl.getDrawingBufferSize(new Vector2());
       let glyphCount = 0;
@@ -186,10 +243,18 @@ function FieldCanvasProbe() {
         if (attribute) for (let index = 0; index < attribute.array.length; index += 1) { colorMinimum = Math.min(colorMinimum, attribute.array[index]); colorMaximum = Math.max(colorMaximum, attribute.array[index]); }
       }
       const indices = (object: typeof surface) => object && "geometry" in object && object.geometry instanceof BufferGeometry ? object.geometry.index?.count ?? 0 : 0;
-      return { lost: gl.getContext().isContextLost(), width: size.x, height: size.y, sampleCount: field?.userData.sampleCount ?? 0, pointCount: points ? field?.userData.sampleCount ?? 0 : 0, glyphCount, surfaceTriangles: indices(surface) / 3, wireframeEdges: indices(wireframe) / 2, quantity: field?.userData.quantity ?? "", normalization: field?.userData.normalization ?? "", colorMinimum, colorMaximum };
+      const currentMaterial = surface && "material" in surface && surface.material instanceof ShaderMaterial ? surface.material : null;
+      return { lost: gl.getContext().isContextLost(), width: size.x, height: size.y, sampleCount: field?.userData.sampleCount ?? 0, pointCount: points ? field?.userData.sampleCount ?? 0 : 0, glyphCount, surfaceTriangles: indices(surface) / 3, wireframeEdges: indices(wireframe) / 2, quantity: field?.userData.quantity ?? "", normalization: field?.userData.normalization ?? "", colorMinimum, colorMaximum,
+        currentVertices: geometry instanceof BufferGeometry ? geometry.getAttribute("fmAntennaCurrentVector")?.count ?? 0 : 0,
+        currentMaterial: currentMaterial?.name ?? "", currentComponent: currentMaterial?.uniforms.fmAntennaComponent.value ?? -1,
+        paletteTextures: tracker.getSnapshot().textures, minimum: field?.userData.minimum ?? 0, maximum: field?.userData.maximum ?? 0,
+        surfaceUuid: surface && "geometry" in surface && surface.geometry instanceof BufferGeometry ? surface.geometry.uuid : "",
+        wireUuid: wireframe && "geometry" in wireframe && wireframe.geometry instanceof BufferGeometry ? wireframe.geometry.uuid : "",
+        pointsUuid: points && "geometry" in points && points.geometry instanceof BufferGeometry ? points.geometry.uuid : "",
+        materialUuid: currentMaterial?.uuid ?? "", paletteUuid: currentMaterial?.uniforms.fmAntennaPalette.value.uuid ?? "" };
     };
-    return () => { delete window.__antennaFieldCanvas; };
-  }, [gl, scene]);
+    return () => { delete window.__antennaFieldCanvas; delete window.__antennaFieldPixel; };
+  }, [gl, scene, camera, tracker]);
   return null;
 }
 
@@ -202,7 +267,7 @@ function FieldViewport() {
     <Viewport3DCanvas camera={{ position: [0, 0, 1e-6], near: 1e-9, far: 1e-4 }} frameloop="demand">
       <VectorGlyphDerivedBufferCacheProvider tracker={tracker}>
         <color attach="background" args={["black"]} />
-        <FieldCanvasProbe />
+        <FieldCanvasProbe tracker={tracker} />
         <AntennaFieldLayer model={model} colors={{ accent: "white", background: "black", field: "white", mesh: "white", wire: "white" }} tracker={tracker} sessionIdentity={owner} />
       </VectorGlyphDerivedBufferCacheProvider>
     </Viewport3DCanvas>

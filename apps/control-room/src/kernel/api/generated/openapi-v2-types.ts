@@ -5339,6 +5339,27 @@ export interface components {
             object_id: string;
             region_id: string;
         };
+        AntennaInspectionCurrentDisplayResource: {
+            center_current_density: components["schemas"]["AntennaInspectionPayloadResource"];
+            center_positions: components["schemas"]["AntennaInspectionPayloadResource"];
+            ordered_snapshot: components["schemas"]["AntennaInspectionPayloadResource"];
+            receipt: components["schemas"]["AntennaInspectionCurrentReceiptResource"];
+            trace_current_density: components["schemas"]["AntennaInspectionPayloadResource"];
+            trace_positions: components["schemas"]["AntennaInspectionPayloadResource"];
+        };
+        AntennaInspectionCurrentReceiptResource: {
+            /** Format: int64 */
+            cell_count: number;
+            center_policy: string;
+            coordinate_unit: string;
+            current_density_unit: string;
+            current_evaluator_version: string;
+            normalization: string;
+            operator_version: string;
+            payload: components["schemas"]["AntennaInspectionPayloadResource"];
+            sampling_policy: string;
+            schema_version: string;
+        };
         AntennaInspectionDisplayCapabilities: {
             current_density: boolean;
             display: boolean;
@@ -5351,6 +5372,7 @@ export interface components {
             content_digest: string;
             /** Format: int64 */
             device_cell_count: number;
+            device_current?: null | components["schemas"]["AntennaInspectionCurrentDisplayResource"];
             /** Format: int64 */
             device_node_count: number;
             device_positions: components["schemas"]["AntennaInspectionPayloadResource"];
@@ -5380,6 +5402,7 @@ export interface components {
             charge_content_sha256: string;
             closure_revision: string;
             content_digest: string;
+            current_display?: null | components["schemas"]["AntennaInspectionCurrentReceiptResource"];
             current_transport_id: string;
             device_potential: components["schemas"]["AntennaInspectionPayloadResource"];
             device_vertex_ids: components["schemas"]["AntennaInspectionPayloadResource"];
@@ -19571,7 +19594,7 @@ export interface operations {
             path: {
                 /** @description Exact runtime stage ID */
                 stage_id: string;
-                /** @description bundle, sample_positions, magnetic_field, device_vertex_ids, device_potential, device_positions, device_topology */
+                /** @description bundle, sample_positions, magnetic_field, device_vertex_ids, device_potential, device_positions, device_topology; v2 additionally current_center_positions, current_center_density, current_trace_positions, current_trace_density, current_snapshot */
                 payload_kind: string;
             };
             cookie?: never;

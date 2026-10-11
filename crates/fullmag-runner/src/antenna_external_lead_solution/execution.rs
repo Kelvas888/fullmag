@@ -32,15 +32,21 @@ fn execute_revalidated(
     cancelled: Option<&AtomicBool>,
 ) -> Result<AntennaExternalLeadSolutionArtifact, RunError> {
     use crate::native_fem::accepted_external_lead::{
-        solve_accepted_external_lead_field, with_materialized_external_lead_request,
+        solve_accepted_external_lead_display, with_materialized_external_lead_request,
     };
     let solved = with_materialized_external_lead_request(input, |request| {
         check_cancelled(cancelled)?;
-        solve_accepted_external_lead_field(request)
+        solve_accepted_external_lead_display(request)
     });
     check_cancelled(cancelled)?;
-    let bundle = solved?;
-    let artifact = super::build_bound_solution(input, requested_execution, output_id, bundle)?;
+    let solved = solved?;
+    let artifact = super::build_bound_solution(
+        input,
+        requested_execution,
+        output_id,
+        solved.bundle,
+        Some(solved.current_display),
+    )?;
     // Also suppress handoff if cancellation arrived during derived payload verification.
     check_cancelled(cancelled)?;
     Ok(artifact)

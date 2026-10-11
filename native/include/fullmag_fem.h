@@ -1420,6 +1420,33 @@ typedef struct {
     char error_message[256];
 } fullmag_fem_accepted_external_lead_result_v1;
 
+/* Same legacy canonical bundle plus device-cell J sampled from its live RT0.
+ * Both caller buffers must be disjoint and bounded; failures publish neither.
+ * The unchanged v1 request is used with this independently versioned result. */
+#define FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_DISPLAY_ABI_VERSION 2u
+#define FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_DISPLAY_LAYOUT_FINGERPRINT \
+    "fullmag:fem-accepted-external-lead:abi:v2:owned-current-display"
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved_flags;
+    uint64_t struct_size;
+    uint8_t *canonical_payload;
+    uint64_t canonical_payload_capacity;
+    uint64_t canonical_payload_len;
+    char digest_schema[FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY];
+    char operator_version[FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY];
+    char layout_fingerprint[FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY];
+    char content_sha256[65];
+    char error_message[256];
+    uint8_t *current_display_payload;
+    uint64_t current_display_payload_capacity;
+    uint64_t current_display_payload_len;
+    char current_display_digest_schema[FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY];
+    char current_display_operator_version[FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY];
+    char current_display_content_sha256[65];
+} fullmag_fem_accepted_external_lead_result_v2;
+
 typedef struct {
     uint64_t step;
     double time_seconds;
@@ -3398,6 +3425,10 @@ FULLMAG_FEM_API int fullmag_fem_solve_accepted_terminal_charge_v1(
 FULLMAG_FEM_API int fullmag_fem_solve_accepted_external_lead_field_v1(
     const fullmag_fem_accepted_external_lead_request_v1 *request,
     fullmag_fem_accepted_external_lead_result_v1 *result
+);
+FULLMAG_FEM_API int fullmag_fem_solve_accepted_external_lead_field_v2(
+    const fullmag_fem_accepted_external_lead_request_v1 *request,
+    fullmag_fem_accepted_external_lead_result_v2 *result
 );
 FULLMAG_FEM_API int fullmag_fem_solve_steady_transport_m2_v1(
     const fullmag_fem_steady_transport_m2_request_v1 *request,

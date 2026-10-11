@@ -13,6 +13,7 @@ namespace fullmag::fem::transport {
 // local signed coefficients are frozen before assembly or field quadrature.
 class AffineRt0Element {
 public:
+    static constexpr const char *operator_version = "fem_generic_affine_rt0.v1";
     using Point = std::array<double, 3>;
     using Face = std::array<Point, 3>;
 

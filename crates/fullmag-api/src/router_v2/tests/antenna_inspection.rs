@@ -127,6 +127,47 @@ fn inspection_record() -> serde_json::Value {
     record
 }
 
+fn current_inspection_record() -> serde_json::Value {
+    let mut record = inspection_record();
+    record["schema_version"] = "antenna_external_lead_stage_output.v2".into();
+    record["outputs"][0]["manifest_ref"] = format!(
+        "antenna/external_lead_solutions/inspection-output/{}/manifest.v2.json", "0".repeat(64)
+    ).into();
+    record["outputs"][0]["payload_units"]["J_charge"] = "A/m^2".into();
+    record
+}
+
+#[tokio::test]
+async fn current_inspection_record_requires_matching_schema_path_and_current_units() {
+    let fixture = Fixture::new().await;
+    for mutate in [
+        (|v: &mut serde_json::Value| v["schema_version"] = "antenna_external_lead_stage_output.v1".into()) as fn(&mut serde_json::Value),
+        |v| v["outputs"][0]["manifest_ref"] = format!(
+            "antenna/external_lead_solutions/inspection-output/{}/manifest.v1.json", "0".repeat(64)).into(),
+        |v| { v["outputs"][0]["payload_units"].as_object_mut().unwrap().remove("J_charge"); },
+        |v| v["outputs"][0]["payload_units"]["J_charge"] = "A".into(),
+        |v| v["outputs"][0]["payload_units"]["J_charge"] = "A/m^2/A".into(),
+    ] {
+        let mut record = current_inspection_record();
+        mutate(&mut record);
+        fixture.write(&record);
+        let response = fixture.get(RESOURCE_PATH, Some("*")).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(response).await["code"], "invalid_antenna_inspection");
+    }
+    // Syntactically correct v2 reaches the same digest gate before touching a manifest.
+    fixture.write(&current_inspection_record());
+    let response = fixture.get(&format!(
+        "{RESOURCE_PATH}/payloads/current_center_density?content_digest=sha256:{}", "1".repeat(64)
+    ), Some("*")).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(response).await["code"], "inspection_digest_mismatch");
+    let mut terminal = terminal_record("failed");
+    terminal["schema_version"] = "antenna_external_lead_stage_output.v2".into();
+    fixture.write(&terminal);
+    assert_eq!(fixture.get(RESOURCE_PATH, Some("*")).await.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
 #[tokio::test]
 async fn all_antenna_reads_reject_stale_scope_before_artifact_io_or_304() {
     let fixture = Fixture::new().await;
@@ -138,6 +179,12 @@ async fn all_antenna_reads_reject_stale_scope_before_artifact_io_or_304() {
         "/v2/sessions/current/data/antenna/source-spectra/missing/payloads/power".into(),
         RESOURCE_PATH.to_string(),
         format!("{RESOURCE_PATH}/payloads/magnetic_field?content_digest=sha256:{}", "0".repeat(64)),
+        format!("{RESOURCE_PATH}/display?content_digest=sha256:{}", "0".repeat(64)),
+        format!("{RESOURCE_PATH}/payloads/current_center_positions?content_digest=sha256:{}", "0".repeat(64)),
+        format!("{RESOURCE_PATH}/payloads/current_center_density?content_digest=sha256:{}", "0".repeat(64)),
+        format!("{RESOURCE_PATH}/payloads/current_trace_positions?content_digest=sha256:{}", "0".repeat(64)),
+        format!("{RESOURCE_PATH}/payloads/current_trace_density?content_digest=sha256:{}", "0".repeat(64)),
+        format!("{RESOURCE_PATH}/payloads/current_snapshot?content_digest=sha256:{}", "0".repeat(64)),
     ];
     let scope = fixture.scope().await;
     // Verify this exact header is accepted before testing incarnation-only invalidation.
@@ -368,4 +415,8 @@ fn inspection_openapi_documents_separate_resources_and_digest_query() {
         .iter()
         .any(|p| p["name"] == "content_digest" && p["required"] == true));
     assert!(value["components"]["schemas"]["AntennaExternalLeadInspectionResource"].is_object());
+    for schema in ["AntennaInspectionCurrentReceiptResource", "AntennaInspectionCurrentDisplayResource"] {
+        assert!(value["components"]["schemas"][schema].is_object(), "{schema}");
+    }
+    assert!(value["components"]["schemas"]["AntennaInspectionDisplayResource"]["properties"]["device_current"].is_object());
 }

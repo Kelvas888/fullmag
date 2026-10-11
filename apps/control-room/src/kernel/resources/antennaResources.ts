@@ -341,13 +341,61 @@ function inspectionDisplayPayloadMatchesManifest(
     .every((key) => display[key] === manifest[key]);
 }
 
+function inspectionCurrentDisplayMatchesManifest(
+  inspection: AntennaExternalLeadInspectionResource,
+  display: AntennaInspectionDisplayResource,
+): boolean {
+  const manifest = inspection.manifest;
+  const current = display.device_current;
+  if (display.schema_version === "antenna_inspection_display.v1") {
+    return inspection.schema_version === "antenna_external_lead_stage_output.v1" &&
+      manifest?.schema_version === "antenna_external_lead_solution.v1" &&
+      !manifest.current_display && !current && display.capabilities.current_density === false;
+  }
+  const receipt = current?.receipt;
+  const expected = manifest?.current_display;
+  if (display.schema_version !== "antenna_inspection_display.v2" ||
+      inspection.schema_version !== "antenna_external_lead_stage_output.v2" ||
+      manifest?.schema_version !== "antenna_external_lead_solution.v2" ||
+      !current || !receipt || !expected || display.capabilities.current_density !== true ||
+      !Number.isSafeInteger(receipt.cell_count) || receipt.cell_count <= 0 ||
+      receipt.cell_count !== display.device_cell_count) return false;
+  const policies = {
+    schema_version: "accepted_external_lead_current_display.ordered.v1",
+    operator_version: "fem_accepted_external_lead_current_display.v1",
+    current_evaluator_version: "fem_generic_affine_rt0.v1",
+    sampling_policy: "cell_center_and_cell_local_vertices.v1",
+    center_policy: "vertex_quarter_sum.long_double.v1",
+    normalization: "raw_authored_current",
+    coordinate_unit: "m",
+    current_density_unit: "A/m^2",
+  } as const;
+  if (!Object.entries(policies).every(([key, value]) =>
+    receipt[key as keyof typeof policies] === value && expected[key as keyof typeof policies] === value) ||
+      receipt.cell_count !== expected.cell_count ||
+      !inspectionDisplayPayloadMatchesManifest(receipt.payload, expected.payload) ||
+      !inspectionDisplayPayloadMatchesManifest(current.ordered_snapshot, expected.payload)) return false;
+  return ([
+    [current.center_positions, "current_center_positions", "cell_xyz_interleaved", "m", 3],
+    [current.center_current_density, "current_center_density", "cell_vector_xyz_interleaved", "A/m^2", 3],
+    [current.trace_positions, "current_trace_positions", "cell_local_vertex_xyz_interleaved", "m", 12],
+    [current.trace_current_density, "current_trace_density", "cell_local_vertex_vector_xyz_interleaved", "A/m^2", 12],
+  ] as const).every(([payload, kind, layout, unit, width]) =>
+    payload.path === `display/${kind}.bin` && payload.scalar_type === "float64_le" &&
+    payload.layout === layout && payload.unit === unit &&
+    payload.value_count === receipt.cell_count * width &&
+    payload.byte_count === payload.value_count * 8 &&
+    Number.isSafeInteger(payload.byte_count) && payload.byte_count <= 64 * 1024 * 1024 &&
+    /^[0-9a-f]{64}$/.test(payload.sha256));
+}
+
 export function antennaInspectionDisplayMatchesOwner(
   inspection: AntennaExternalLeadInspectionResource,
   display: AntennaInspectionDisplayResource,
 ): boolean {
   const output = inspection.outputs.length === 1 ? inspection.outputs[0] : null;
   return Boolean(output && inspection.manifest &&
-    display.schema_version === "antenna_inspection_display.v1" &&
+    inspectionCurrentDisplayMatchesManifest(inspection, display) &&
     display.session_id === inspection.session_id &&
     display.session_epoch === inspection.session_epoch &&
     display.request_scope_epoch === inspection.request_scope_epoch &&
@@ -370,7 +418,7 @@ export function antennaInspectionDisplayMatchesOwner(
     display.field_scope === "external_electrode_truncation" &&
     display.normalization === "raw_authored_current" && display.capabilities.display === true &&
     display.capabilities.per_ampere_basis === false && display.capabilities.llg_drive === false &&
-    display.capabilities.source_fft === false && display.capabilities.current_density === false);
+    display.capabilities.source_fft === false);
 }
 
 export function useAntennaInspectionDisplayResource(
@@ -408,7 +456,18 @@ export function useAntennaInspectionDisplayResource(
   });
 }
 
-type AntennaDisplayPayloadKind = "device_positions" | "device_topology" | "device_potential" | "sample_positions" | "magnetic_field";
+type AntennaDisplayPayloadKind = "device_positions" | "device_topology" | "device_potential" | "sample_positions" | "magnetic_field" |
+  "current_center_positions" | "current_center_density" | "current_trace_positions" | "current_trace_density";
+
+function inspectionDisplayPayloadDescriptor(display: AntennaInspectionDisplayResource, kind: AntennaDisplayPayloadKind) {
+  switch (kind) {
+    case "current_center_positions": return display.device_current?.center_positions;
+    case "current_center_density": return display.device_current?.center_current_density;
+    case "current_trace_positions": return display.device_current?.trace_positions;
+    case "current_trace_density": return display.device_current?.trace_current_density;
+    default: return display[kind];
+  }
+}
 
 export function useAntennaInspectionDisplayPayloadResource(
   inspection: AntennaExternalLeadInspectionResource | null | undefined,
@@ -429,7 +488,8 @@ export function useAntennaInspectionDisplayPayloadResource(
   const load = useCallback(
     async ({ signal, sessionScopeKey }: { signal: AbortSignal; sessionScopeKey?: string }) => {
       if (!compatible || !ownerMatches || !inspection || !display || !payloadKind) return null;
-      const descriptor = display[payloadKind];
+      const descriptor = inspectionDisplayPayloadDescriptor(display, payloadKind);
+      if (!descriptor) throw new Error("antenna inspection has no selected current payload");
       if (!Number.isSafeInteger(descriptor.byte_count) || descriptor.byte_count <= 0 ||
           descriptor.byte_count > 64 * 1024 * 1024) {
         throw new Error("antenna display payload exceeds its complete bounded transport contract");

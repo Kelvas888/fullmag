@@ -15,7 +15,11 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(any(feature = "fem-native", feature = "fem-gpu"))]
 use std::ffi::CString;
 
+mod current_display;
 mod record;
+pub(crate) use current_display::decode_current_display;
+#[cfg(any(feature = "fem-native", feature = "fem-gpu"))]
+pub(crate) use current_display::AcceptedExternalLeadCurrentDisplay;
 #[cfg(all(test, any(feature = "fem-native", feature = "fem-gpu")))]
 pub(crate) use record::inspection_test_bundle;
 #[cfg(any(feature = "fem-native", feature = "fem-gpu"))]
@@ -267,9 +271,10 @@ fn preflight(request: &AcceptedExternalLeadRequest<'_>) -> Result<(), RunError> 
 }
 
 #[cfg(any(feature = "fem-native", feature = "fem-gpu"))]
-pub(crate) fn solve_accepted_external_lead_field(
+fn with_packed_external_lead_request<T>(
     request: &AcceptedExternalLeadRequest<'_>,
-) -> Result<AcceptedExternalLeadBundle, RunError> {
+    consume: impl FnOnce(&ffi::fullmag_fem_accepted_external_lead_request_v1) -> Result<T, RunError>,
+) -> Result<T, RunError> {
     preflight(request)?;
     let revision = input_text(request.closure_revision)?;
     let circuit_ids = request
@@ -360,6 +365,15 @@ pub(crate) fn solve_accepted_external_lead_field(
             relative_tolerance: p.relative_tolerance,
             maximum_source_target_pairs: p.maximum_source_target_pairs,
         };
+        consume(&input)
+    })
+}
+
+#[cfg(any(feature = "fem-native", feature = "fem-gpu"))]
+pub(crate) fn solve_accepted_external_lead_field(
+    request: &AcceptedExternalLeadRequest<'_>,
+) -> Result<AcceptedExternalLeadBundle, RunError> {
+    with_packed_external_lead_request(request, |input| {
         let mut payload = Vec::new();
         payload
             .try_reserve_exact(ffi::FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_MAX_PAYLOAD_BYTES)
@@ -383,7 +397,7 @@ pub(crate) fn solve_accepted_external_lead_field(
         };
         // SAFETY: the nested charge pack and every closure/target buffer outlive this single call.
         let status =
-            unsafe { ffi::fullmag_fem_solve_accepted_external_lead_field_v1(&input, &mut output) };
+            unsafe { ffi::fullmag_fem_solve_accepted_external_lead_field_v1(input, &mut output) };
         require(
             output.abi_version == input.abi_version
                 && output.reserved_flags == 0
@@ -420,5 +434,115 @@ pub(crate) fn solve_accepted_external_lead_field(
         )?;
         payload.truncate(output.canonical_payload_len as usize);
         record::decode_bundle(payload, &result_text(&output.content_sha256)?, request)
+    })
+}
+
+#[cfg(any(feature = "fem-native", feature = "fem-gpu"))]
+pub(crate) struct AcceptedExternalLeadDisplayBundle {
+    pub bundle: AcceptedExternalLeadBundle,
+    pub current_display: AcceptedExternalLeadCurrentDisplay,
+}
+
+#[cfg(any(feature = "fem-native", feature = "fem-gpu"))]
+pub(crate) fn solve_accepted_external_lead_display(
+    request: &AcceptedExternalLeadRequest<'_>,
+) -> Result<AcceptedExternalLeadDisplayBundle, RunError> {
+    with_packed_external_lead_request(request, |input| {
+        let buffer = || {
+            let mut payload = Vec::new();
+            payload
+                .try_reserve_exact(MAX_PAYLOAD_BYTES)
+                .map_err(|_| RunError {
+                    message: "cannot reserve bounded external lead display output".into(),
+                })?;
+            payload.resize(MAX_PAYLOAD_BYTES, 0);
+            Ok::<_, RunError>(payload)
+        };
+        let mut bundle_payload = buffer()?;
+        let mut current_payload = buffer()?;
+        let mut output = ffi::fullmag_fem_accepted_external_lead_result_v2 {
+            abi_version: ffi::FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_DISPLAY_ABI_VERSION,
+            reserved_flags: 0,
+            struct_size: std::mem::size_of::<ffi::fullmag_fem_accepted_external_lead_result_v2>()
+                as u64,
+            canonical_payload: bundle_payload.as_mut_ptr(),
+            canonical_payload_capacity: bundle_payload.len() as u64,
+            canonical_payload_len: 0,
+            digest_schema: [0; 96],
+            operator_version: [0; 96],
+            layout_fingerprint: [0; 96],
+            content_sha256: [0; 65],
+            error_message: [0; 256],
+            current_display_payload: current_payload.as_mut_ptr(),
+            current_display_payload_capacity: current_payload.len() as u64,
+            current_display_payload_len: 0,
+            current_display_digest_schema: [0; 96],
+            current_display_operator_version: [0; 96],
+            current_display_content_sha256: [0; 65],
+        };
+        // SAFETY: all packed inputs and two independent writable buffers outlive this single call.
+        let status =
+            unsafe { ffi::fullmag_fem_solve_accepted_external_lead_field_v2(input, &mut output) };
+        require(
+            output.abi_version == ffi::FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_DISPLAY_ABI_VERSION
+                && output.reserved_flags == 0
+                && output.struct_size == std::mem::size_of_val(&output) as u64
+                && output.canonical_payload == bundle_payload.as_mut_ptr()
+                && output.canonical_payload_capacity == bundle_payload.len() as u64
+                && output.current_display_payload == current_payload.as_mut_ptr()
+                && output.current_display_payload_capacity == current_payload.len() as u64,
+            "native display result modified caller-owned buffers/header",
+        )?;
+        if status != ffi::FULLMAG_FEM_OK {
+            require(
+                output.canonical_payload_len == 0
+                    && output.current_display_payload_len == 0
+                    && output.content_sha256[0] == 0
+                    && output.digest_schema[0] == 0
+                    && output.operator_version[0] == 0
+                    && output.layout_fingerprint[0] == 0
+                    && output.current_display_content_sha256[0] == 0
+                    && output.current_display_digest_schema[0] == 0
+                    && output.current_display_operator_version[0] == 0,
+                "failed display solve published acceptance metadata",
+            )?;
+            return Err(RunError {
+                message: format!(
+                    "accepted external lead display failed ({status}): {}",
+                    result_text(&output.error_message)?
+                ),
+            });
+        }
+        require(
+            result_text(&output.digest_schema)? == SCHEMA
+                && result_text(&output.operator_version)? == OPERATOR
+                && result_text(&output.layout_fingerprint)?
+                    == ffi::FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_DISPLAY_LAYOUT_FINGERPRINT
+                && result_text(&output.current_display_digest_schema)? == current_display::SCHEMA
+                && result_text(&output.current_display_operator_version)?
+                    == current_display::OPERATOR
+                && output.error_message[0] == 0
+                && output.canonical_payload_len > 0
+                && output.canonical_payload_len <= bundle_payload.len() as u64
+                && output.current_display_payload_len > 0
+                && output.current_display_payload_len <= current_payload.len() as u64,
+            "native display schema/layout/length mismatch",
+        )?;
+        bundle_payload.truncate(output.canonical_payload_len as usize);
+        current_payload.truncate(output.current_display_payload_len as usize);
+        let bundle = record::decode_bundle(
+            bundle_payload,
+            &result_text(&output.content_sha256)?,
+            request,
+        )?;
+        let current_display = decode_current_display(
+            current_payload,
+            &result_text(&output.current_display_content_sha256)?,
+            &bundle,
+        )?;
+        Ok(AcceptedExternalLeadDisplayBundle {
+            bundle,
+            current_display,
+        })
     })
 }

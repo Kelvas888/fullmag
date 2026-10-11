@@ -2522,6 +2522,86 @@
           }
         ]
       },
+      "AntennaInspectionCurrentDisplayResource": {
+        "properties": {
+          "center_current_density": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "center_positions": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "ordered_snapshot": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/AntennaInspectionCurrentReceiptResource"
+          },
+          "trace_current_density": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "trace_positions": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          }
+        },
+        "required": [
+          "receipt",
+          "center_positions",
+          "center_current_density",
+          "trace_positions",
+          "trace_current_density",
+          "ordered_snapshot"
+        ],
+        "type": "object"
+      },
+      "AntennaInspectionCurrentReceiptResource": {
+        "properties": {
+          "cell_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "center_policy": {
+            "type": "string"
+          },
+          "coordinate_unit": {
+            "type": "string"
+          },
+          "current_density_unit": {
+            "type": "string"
+          },
+          "current_evaluator_version": {
+            "type": "string"
+          },
+          "normalization": {
+            "type": "string"
+          },
+          "operator_version": {
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/AntennaInspectionPayloadResource"
+          },
+          "sampling_policy": {
+            "type": "string"
+          },
+          "schema_version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "operator_version",
+          "current_evaluator_version",
+          "sampling_policy",
+          "center_policy",
+          "normalization",
+          "coordinate_unit",
+          "current_density_unit",
+          "cell_count",
+          "payload"
+        ],
+        "type": "object"
+      },
       "AntennaInspectionDisplayCapabilities": {
         "properties": {
           "current_density": {
@@ -2561,6 +2641,16 @@
             "format": "int64",
             "minimum": 0,
             "type": "integer"
+          },
+          "device_current": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AntennaInspectionCurrentDisplayResource"
+              }
+            ]
           },
           "device_node_count": {
             "format": "int64",
@@ -2671,6 +2761,16 @@
           },
           "content_digest": {
             "type": "string"
+          },
+          "current_display": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/AntennaInspectionCurrentReceiptResource"
+              }
+            ]
           },
           "current_transport_id": {
             "type": "string"
@@ -49720,7 +49820,7 @@
             }
           },
           {
-            "description": "bundle, sample_positions, magnetic_field, device_vertex_ids, device_potential, device_positions, device_topology",
+            "description": "bundle, sample_positions, magnetic_field, device_vertex_ids, device_potential, device_positions, device_topology; v2 additionally current_center_positions, current_center_density, current_trace_positions, current_trace_density, current_snapshot",
             "in": "path",
             "name": "payload_kind",
             "required": true,

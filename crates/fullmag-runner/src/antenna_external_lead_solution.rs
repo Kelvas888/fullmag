@@ -1,8 +1,8 @@
 //! Inspection of one retained modeled-domain V/RT0/H result, never a drive basis.
 
-use crate::native_fem::accepted_external_lead::decode_owned_bundle;
 #[cfg(any(feature = "fem-native", feature = "fem-gpu"))]
 use crate::native_fem::accepted_external_lead::AcceptedExternalLeadBundle;
+use crate::native_fem::accepted_external_lead::{decode_current_display, decode_owned_bundle};
 use crate::{AuxiliaryArtifact, RunError};
 use fullmag_ir::{
     AntennaCurrentInputPinsIR, BackendTarget, ChargeSolverPolicyIR, ExecutionDevice, ExecutionMode,
@@ -22,6 +22,8 @@ pub use publication::{
 };
 
 pub const ANTENNA_EXTERNAL_LEAD_SOLUTION_SCHEMA: &str = "antenna_external_lead_solution.v1";
+pub const ANTENNA_EXTERNAL_LEAD_CURRENT_DISPLAY_SOLUTION_SCHEMA: &str =
+    "antenna_external_lead_solution.v2";
 const MAX_MANIFEST_BYTES: usize = 1 << 20;
 const MAX_BINARY_BYTES: usize = 128 << 20;
 const BUNDLE_PATH: &str = "bundle.v1.bin";
@@ -29,6 +31,8 @@ const POSITIONS_PATH: &str = "sample_positions.f64le.bin";
 const FIELD_PATH: &str = "H.f64le.bin";
 const DEVICE_IDS_PATH: &str = "device_vertex_ids.u64le.bin";
 const DEVICE_V_PATH: &str = "device_V.f64le.bin";
+const CURRENT_DISPLAY_PATH: &str = "current_display.v1.bin";
+const CURRENT_DISPLAY_SCHEMA: &str = "accepted_external_lead_current_display.ordered.v1";
 const ADAPTER_VERSION: &str = "antenna_external_lead_request_adapter.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,6 +79,21 @@ pub struct AntennaExternalLeadExecutionReceipt {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+pub struct AntennaExternalLeadCurrentDisplayReceipt {
+    pub schema_version: String,
+    pub operator_version: String,
+    pub current_evaluator_version: String,
+    pub sampling_policy: String,
+    pub center_policy: String,
+    pub normalization: String,
+    pub coordinate_unit: String,
+    pub current_density_unit: String,
+    pub cell_count: u64,
+    pub payload: AntennaExternalLeadPayloadRef,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct AntennaExternalLeadSolutionManifest {
     pub schema_version: String,
     pub status: String,
@@ -100,6 +119,8 @@ pub struct AntennaExternalLeadSolutionManifest {
     pub magnetic_field: AntennaExternalLeadPayloadRef,
     pub device_vertex_ids: AntennaExternalLeadPayloadRef,
     pub device_potential: AntennaExternalLeadPayloadRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_display: Option<AntennaExternalLeadCurrentDisplayReceipt>,
     pub content_digest: String,
 }
 
@@ -118,8 +139,24 @@ pub struct LoadedAntennaExternalLeadSolution {
     pub device_potential_v: Vec<f64>,
     pub sample_positions_xyz_m: Vec<[f64; 3]>,
     pub magnetic_field_xyz_apm: Vec<[f64; 3]>,
+    pub device_current: Option<AntennaInspectionDeviceCurrentDisplay>,
     retained_charge: crate::native_fem::accepted_terminal_charge::AcceptedTerminalChargeRecord,
     retained_lead_vertex_ids: Vec<u64>,
+}
+
+/// Native samples remain cell-local: tangential RT0 traces are not averaged at shared nodes.
+pub struct AntennaInspectionCurrentDisplayCell {
+    pub source_element_index: u64,
+    pub vertex_ids: [u64; 4],
+    pub vertex_xyz_m: [[f64; 3]; 4],
+    pub vertex_j_apm2: [[f64; 3]; 4],
+    pub center_xyz_m: [f64; 3],
+    pub center_j_apm2: [f64; 3],
+}
+
+pub struct AntennaInspectionDeviceCurrentDisplay {
+    pub canonical_payload: Vec<u8>,
+    pub cells: Vec<AntennaInspectionCurrentDisplayCell>,
 }
 
 /// Immutable device geometry extracted from the retained solve, not a live mesh.
@@ -131,35 +168,60 @@ pub struct AntennaInspectionDeviceDisplay {
 impl LoadedAntennaExternalLeadSolution {
     pub fn device_display(&self) -> Result<AntennaInspectionDeviceDisplay, RunError> {
         let vertices = &self.retained_charge.vertices;
-        let by_id = vertices.iter().map(|vertex| (vertex.id, vertex.xyz_m))
+        let by_id = vertices
+            .iter()
+            .map(|vertex| (vertex.id, vertex.xyz_m))
             .collect::<BTreeMap<_, _>>();
-        let device = self.device_vertex_ids.iter().enumerate()
+        let device = self
+            .device_vertex_ids
+            .iter()
+            .enumerate()
             .map(|(index, id)| u32::try_from(index).map(|index| (*id, index)))
             .collect::<Result<BTreeMap<_, _>, _>>()
-            .map_err(|_| RunError { message: "inspection device index exceeds uint32".into() })?;
-        let leads = self.retained_lead_vertex_ids.iter().copied().collect::<BTreeSet<_>>();
-        require(by_id.len() == vertices.len()
-            && device.len() == self.device_vertex_ids.len()
-            && leads.len() == self.retained_lead_vertex_ids.len()
-            && device.keys().all(|id| by_id.contains_key(id) && !leads.contains(id))
-            && leads.iter().all(|id| by_id.contains_key(id))
-            && device.len().checked_add(leads.len()) == Some(by_id.len()),
-            "inspection display vertex ownership is missing, repeated or foreign")?;
+            .map_err(|_| RunError {
+                message: "inspection device index exceeds uint32".into(),
+            })?;
+        let leads = self
+            .retained_lead_vertex_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        require(
+            by_id.len() == vertices.len()
+                && device.len() == self.device_vertex_ids.len()
+                && leads.len() == self.retained_lead_vertex_ids.len()
+                && device
+                    .keys()
+                    .all(|id| by_id.contains_key(id) && !leads.contains(id))
+                && leads.iter().all(|id| by_id.contains_key(id))
+                && device.len().checked_add(leads.len()) == Some(by_id.len()),
+            "inspection display vertex ownership is missing, repeated or foreign",
+        )?;
         let positions_xyz_m = self.device_vertex_ids.iter().map(|id| by_id[id]).collect();
         let mut tet4_cells = Vec::new();
         for element in &self.retained_charge.elements {
             let ids = element.vertex_ids;
-            require(ids.iter().all(|id| by_id.contains_key(id)),
-                "inspection display tetrahedron references a foreign vertex")?;
+            require(
+                ids.iter().all(|id| by_id.contains_key(id)),
+                "inspection display tetrahedron references a foreign vertex",
+            )?;
             if ids.iter().all(|id| device.contains_key(id)) {
                 tet4_cells.push(ids.map(|id| device[&id]));
             } else {
-                require(ids.iter().all(|id| leads.contains(id)),
-                    "inspection display tetrahedron has mixed device/lead ownership")?;
+                require(
+                    ids.iter().all(|id| leads.contains(id)),
+                    "inspection display tetrahedron has mixed device/lead ownership",
+                )?;
             }
         }
-        require(!tet4_cells.is_empty(), "inspection display has no device-owned tetrahedra")?;
-        Ok(AntennaInspectionDeviceDisplay { positions_xyz_m, tet4_cells })
+        require(
+            !tet4_cells.is_empty(),
+            "inspection display has no device-owned tetrahedra",
+        )?;
+        Ok(AntennaInspectionDeviceDisplay {
+            positions_xyz_m,
+            tet4_cells,
+        })
     }
 }
 
@@ -351,9 +413,9 @@ fn validate_manifest(
 ) -> Result<(), RunError> {
     validate_reference(expected)?;
     validate_execution(&manifest.requested_execution)?;
+    solution_manifest_basename(manifest)?;
     require(
-        manifest.schema_version == ANTENNA_EXTERNAL_LEAD_SOLUTION_SCHEMA
-            && manifest.status == "inspection_only"
+        manifest.status == "inspection_only"
             && manifest.qualification == "NOT VERIFIED"
             && manifest.field_scope == "external_electrode_truncation"
             && manifest.stage_id == expected.stage_id
@@ -437,6 +499,23 @@ fn validate_manifest(
     )
 }
 
+/// Filename and payload generation are inseparable; legacy v1 never acquires J implicitly.
+pub(crate) fn solution_manifest_basename(
+    manifest: &AntennaExternalLeadSolutionManifest,
+) -> Result<&'static str, RunError> {
+    match (
+        manifest.schema_version.as_str(),
+        manifest.current_display.as_ref(),
+    ) {
+        (ANTENNA_EXTERNAL_LEAD_SOLUTION_SCHEMA, None) => Ok("manifest.v1.json"),
+        (ANTENNA_EXTERNAL_LEAD_CURRENT_DISPLAY_SOLUTION_SCHEMA, Some(_)) => Ok("manifest.v2.json"),
+        _ => Err(RunError {
+            message: "antenna external lead solution: schema/current snapshot generation mismatch"
+                .into(),
+        }),
+    }
+}
+
 /// Metadata only: does not verify payload existence, bytes, or numerical consistency.
 pub fn load_antenna_external_lead_solution_manifest(
     manifest_bytes: &[u8],
@@ -447,9 +526,11 @@ pub fn load_antenna_external_lead_solution_manifest(
         "manifest exceeds its byte bound",
     )?;
     let value: serde_json::Value =
-        serde_json::from_slice(manifest_bytes).map_err(|error| RunError {
-            message: format!("parse external lead solution manifest: {error}"),
-        })?;
+        serde_json::from_slice::<crate::artifact_json::UnambiguousJson>(manifest_bytes)
+            .map(|value| value.0)
+            .map_err(|error| RunError {
+                message: format!("parse external lead solution manifest: {error}"),
+            })?;
     let manifest: AntennaExternalLeadSolutionManifest = serde_json::from_value(value.clone())
         .map_err(|error| RunError {
             message: format!("validate external lead solution manifest shape: {error}"),
@@ -518,6 +599,32 @@ pub fn load_antenna_external_lead_solution_manifest(
     ] {
         validate_payload_descriptor(reference, path, scalar, layout, unit, count, width)?;
     }
+    if let Some(current) = &manifest.current_display {
+        require(
+            current.schema_version == CURRENT_DISPLAY_SCHEMA
+                && current.operator_version == "fem_accepted_external_lead_current_display.v1"
+                && current.current_evaluator_version == "fem_generic_affine_rt0.v1"
+                && current.sampling_policy == "cell_center_and_cell_local_vertices.v1"
+                && current.center_policy == "vertex_quarter_sum.long_double.v1"
+                && current.normalization == "raw_authored_current"
+                && current.coordinate_unit == "m"
+                && current.current_density_unit == "A/m^2"
+                && current.cell_count > 0
+                && current.cell_count.checked_mul(1501).is_some_and(|bytes| {
+                    bytes < current.payload.byte_count && bytes <= MAX_BINARY_BYTES as u64
+                }),
+            "current snapshot receipt/schema/policy/count mismatch",
+        )?;
+        validate_payload_descriptor(
+            &current.payload,
+            CURRENT_DISPLAY_PATH,
+            "ordered_binary_v1",
+            CURRENT_DISPLAY_SCHEMA,
+            "A/m^2",
+            current.payload.byte_count,
+            1,
+        )?;
+    }
     Ok(manifest)
 }
 
@@ -532,17 +639,19 @@ pub fn load_antenna_external_lead_solution(
         .iter()
         .map(|payload| payload.relative_path.as_str())
         .collect::<BTreeSet<_>>();
+    let mut expected_paths = BTreeSet::from([
+        BUNDLE_PATH,
+        POSITIONS_PATH,
+        FIELD_PATH,
+        DEVICE_IDS_PATH,
+        DEVICE_V_PATH,
+    ]);
+    if manifest.current_display.is_some() {
+        expected_paths.insert(CURRENT_DISPLAY_PATH);
+    }
     require(
-        payloads.len() == 5
-            && paths
-                == BTreeSet::from([
-                    BUNDLE_PATH,
-                    POSITIONS_PATH,
-                    FIELD_PATH,
-                    DEVICE_IDS_PATH,
-                    DEVICE_V_PATH,
-                ]),
-        "payload set must contain exactly the five distinct fixed basenames",
+        payloads.len() == expected_paths.len() && paths == expected_paths,
+        "payload set must match the exact schema-specific distinct fixed basenames",
     )?;
     let bundle_size = usize::try_from(manifest.bundle.byte_count).map_err(|_| RunError {
         message: "bundle size is not representable".into(),
@@ -649,6 +758,43 @@ pub fn load_antenna_external_lead_solution(
         potential == encode_reals(device_potential_v.iter().copied()),
         "derived device V bytes differ from retained stable-ID selection",
     )?;
+    let device_current = if let Some(current) = &manifest.current_display {
+        let size = usize::try_from(current.payload.byte_count).map_err(|_| RunError {
+            message: "current snapshot size is not representable".into(),
+        })?;
+        let bytes = verified_payload(
+            &current.payload,
+            payloads,
+            CURRENT_DISPLAY_PATH,
+            "ordered_binary_v1",
+            CURRENT_DISPLAY_SCHEMA,
+            "A/m^2",
+            size,
+            1,
+        )?;
+        let decoded = decode_current_display(bytes.to_vec(), &current.payload.sha256, &bundle)?;
+        require(
+            decoded.cells.len() as u64 == current.cell_count,
+            "current snapshot device cell count differs from receipt",
+        )?;
+        Some(AntennaInspectionDeviceCurrentDisplay {
+            canonical_payload: decoded.canonical_payload,
+            cells: decoded
+                .cells
+                .into_iter()
+                .map(|cell| AntennaInspectionCurrentDisplayCell {
+                    source_element_index: cell.source_element_index,
+                    vertex_ids: cell.vertex_ids,
+                    vertex_xyz_m: cell.vertex_xyz_m,
+                    vertex_j_apm2: cell.vertex_j_apm2,
+                    center_xyz_m: cell.center_xyz_m,
+                    center_j_apm2: cell.center_j_apm2,
+                })
+                .collect(),
+        })
+    } else {
+        None
+    };
     Ok(LoadedAntennaExternalLeadSolution {
         manifest,
         canonical_bundle: bundle.canonical_payload,
@@ -656,6 +802,7 @@ pub fn load_antenna_external_lead_solution(
         device_potential_v,
         sample_positions_xyz_m: bundle.field.targets_m,
         magnetic_field_xyz_apm: bundle.h_xyz_apm,
+        device_current,
         retained_charge: bundle.charge,
         retained_lead_vertex_ids: bundle.source.lead_vertex_ids,
     })
@@ -679,7 +826,7 @@ pub(crate) fn build_antenna_external_lead_solution(
             crate::native_fem::accepted_external_lead::validate_bundle_request(&bundle, request)
         },
     )?;
-    build_bound_solution(input, requested_execution, output_id, bundle)
+    build_bound_solution(input, requested_execution, output_id, bundle, None)
 }
 
 fn validate_stage_output(
@@ -728,6 +875,9 @@ fn build_bound_solution(
     requested_execution: &RequestedTransportExecutionIR,
     output_id: &str,
     bundle: AcceptedExternalLeadBundle,
+    current_display: Option<
+        crate::native_fem::accepted_external_lead::AcceptedExternalLeadCurrentDisplay,
+    >,
 ) -> Result<AntennaExternalLeadSolutionArtifact, RunError> {
     let by_id = bundle
         .charge
@@ -747,7 +897,12 @@ fn build_bound_solution(
     let n = input.device_stable_vertex_ids.len();
     let samples = bundle.field.targets_m.len();
     let mut manifest = AntennaExternalLeadSolutionManifest {
-        schema_version: ANTENNA_EXTERNAL_LEAD_SOLUTION_SCHEMA.into(),
+        schema_version: if current_display.is_some() {
+            ANTENNA_EXTERNAL_LEAD_CURRENT_DISPLAY_SOLUTION_SCHEMA
+        } else {
+            ANTENNA_EXTERNAL_LEAD_SOLUTION_SCHEMA
+        }
+        .into(),
         status: "inspection_only".into(),
         qualification: "NOT VERIFIED".into(),
         field_scope: input.field_scope.clone(),
@@ -820,6 +975,27 @@ fn build_bound_solution(
             "V",
             n,
         ),
+        current_display: current_display.as_ref().map(|current| {
+            AntennaExternalLeadCurrentDisplayReceipt {
+                schema_version: CURRENT_DISPLAY_SCHEMA.into(),
+                operator_version: "fem_accepted_external_lead_current_display.v1".into(),
+                current_evaluator_version: "fem_generic_affine_rt0.v1".into(),
+                sampling_policy: "cell_center_and_cell_local_vertices.v1".into(),
+                center_policy: "vertex_quarter_sum.long_double.v1".into(),
+                normalization: "raw_authored_current".into(),
+                coordinate_unit: "m".into(),
+                current_density_unit: "A/m^2".into(),
+                cell_count: current.cells.len() as u64,
+                payload: payload_ref(
+                    CURRENT_DISPLAY_PATH,
+                    &current.canonical_payload,
+                    "ordered_binary_v1",
+                    CURRENT_DISPLAY_SCHEMA,
+                    "A/m^2",
+                    current.canonical_payload.len(),
+                ),
+            }
+        }),
         content_digest: String::new(),
     };
     manifest.content_digest = content_digest(&manifest)?;
@@ -831,7 +1007,7 @@ fn build_bound_solution(
     let manifest_bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| RunError {
         message: format!("serialize external lead solution: {error}"),
     })?;
-    let payloads = [
+    let mut payloads = [
         (BUNDLE_PATH, bundle.canonical_payload),
         (POSITIONS_PATH, xyz),
         (FIELD_PATH, h),
@@ -844,6 +1020,16 @@ fn build_bound_solution(
         bytes,
     })
     .collect::<Vec<_>>();
+    if let Some(current) = current_display {
+        require(
+            sha256(&current.canonical_payload) == current.content_sha256,
+            "current snapshot canonical hash mismatch",
+        )?;
+        payloads.push(AuxiliaryArtifact {
+            relative_path: CURRENT_DISPLAY_PATH.into(),
+            bytes: current.canonical_payload,
+        });
+    }
     load_antenna_external_lead_solution(&manifest_bytes, &payloads, &reference)?;
     Ok(AntennaExternalLeadSolutionArtifact {
         reference,
@@ -857,14 +1043,21 @@ pub(crate) fn reject_unqualified_external_lead_source(
     manifest_bytes: &[u8],
 ) -> Result<(), RunError> {
     let value: serde_json::Value =
-        serde_json::from_slice(manifest_bytes).map_err(|error| RunError {
-            message: format!("parse antenna manifest qualification: {error}"),
-        })?;
+        serde_json::from_slice::<crate::artifact_json::UnambiguousJson>(manifest_bytes)
+            .map(|value| value.0)
+            .map_err(|error| RunError {
+                message: format!("parse antenna manifest qualification: {error}"),
+            })?;
     require(
-        value
-            .get("schema_version")
-            .and_then(serde_json::Value::as_str)
-            != Some(ANTENNA_EXTERNAL_LEAD_SOLUTION_SCHEMA),
+        !matches!(
+            value
+                .get("schema_version")
+                .and_then(serde_json::Value::as_str),
+            Some(
+                ANTENNA_EXTERNAL_LEAD_SOLUTION_SCHEMA
+                    | ANTENNA_EXTERNAL_LEAD_CURRENT_DISPLAY_SOLUTION_SCHEMA
+            )
+        ),
         "source_not_qualified: inspection-only external lead result cannot drive LLG or source FFT",
     )
 }

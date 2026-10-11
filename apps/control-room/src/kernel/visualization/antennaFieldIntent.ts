@@ -1,8 +1,9 @@
-export type AntennaFieldQuantity = "electric_potential_per_ampere" | "current_density_per_ampere" | "magnetic_field_per_ampere" | "device_potential" | "magnetic_field";
+export type AntennaFieldQuantity = "electric_potential_per_ampere" | "current_density_per_ampere" | "magnetic_field_per_ampere" | "device_potential" | "current_density" | "magnetic_field";
 
 export function antennaFieldDisplayLabel(intent: Pick<AntennaFieldIntent, "quantity">): string {
   switch (intent.quantity) {
     case "device_potential": return "V [V]";
+    case "current_density": return "J [A/m^2]";
     case "magnetic_field": return "H [A/m]";
     case "electric_potential_per_ampere": return "V/I [V/A]";
     case "current_density_per_ampere": return "J/I [A/m^2/A]";

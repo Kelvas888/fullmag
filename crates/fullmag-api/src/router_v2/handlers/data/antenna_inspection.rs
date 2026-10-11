@@ -10,8 +10,8 @@ use axum::http::{HeaderMap, HeaderValue};
 use axum::response::Response;
 use fullmag_ir::FieldTargetIR;
 use fullmag_runner::{
-    AntennaExternalLeadPayloadRef, AntennaExternalLeadSolutionManifest,
-    AntennaExternalLeadSolutionRef, LoadedAntennaExternalLeadSolution,
+    AntennaExternalLeadCurrentDisplayReceipt, AntennaExternalLeadPayloadRef, AntennaExternalLeadSolutionManifest,
+    AntennaExternalLeadSolutionRef, AntennaInspectionDeviceCurrentDisplay, LoadedAntennaExternalLeadSolution,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -106,6 +106,47 @@ pub struct AntennaInspectionSamplingResource {
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AntennaInspectionCurrentReceiptResource {
+    pub schema_version: String,
+    pub operator_version: String,
+    pub current_evaluator_version: String,
+    pub sampling_policy: String,
+    pub center_policy: String,
+    pub normalization: String,
+    pub coordinate_unit: String,
+    pub current_density_unit: String,
+    pub cell_count: u64,
+    pub payload: AntennaInspectionPayloadResource,
+}
+
+impl From<AntennaExternalLeadCurrentDisplayReceipt> for AntennaInspectionCurrentReceiptResource {
+    fn from(value: AntennaExternalLeadCurrentDisplayReceipt) -> Self {
+        Self {
+            schema_version: value.schema_version,
+            operator_version: value.operator_version,
+            current_evaluator_version: value.current_evaluator_version,
+            sampling_policy: value.sampling_policy,
+            center_policy: value.center_policy,
+            normalization: value.normalization,
+            coordinate_unit: value.coordinate_unit,
+            current_density_unit: value.current_density_unit,
+            cell_count: value.cell_count,
+            payload: value.payload.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct AntennaInspectionCurrentDisplayResource {
+    pub receipt: AntennaInspectionCurrentReceiptResource,
+    pub center_positions: AntennaInspectionPayloadResource,
+    pub center_current_density: AntennaInspectionPayloadResource,
+    pub trace_positions: AntennaInspectionPayloadResource,
+    pub trace_current_density: AntennaInspectionPayloadResource,
+    pub ordered_snapshot: AntennaInspectionPayloadResource,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct AntennaInspectionManifestResource {
     pub schema_version: String,
     pub validation_scope: String,
@@ -127,6 +168,8 @@ pub struct AntennaInspectionManifestResource {
     pub magnetic_field: AntennaInspectionPayloadResource,
     pub device_vertex_ids: AntennaInspectionPayloadResource,
     pub device_potential: AntennaInspectionPayloadResource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_display: Option<AntennaInspectionCurrentReceiptResource>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -179,6 +222,8 @@ pub struct AntennaInspectionDisplayResource {
     pub device_potential: AntennaInspectionPayloadResource,
     pub sample_positions: AntennaInspectionPayloadResource,
     pub magnetic_field: AntennaInspectionPayloadResource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_current: Option<AntennaInspectionCurrentDisplayResource>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,8 +339,12 @@ fn parse_record(bytes: &[u8]) -> Result<AntennaInspectionStageRecordResource, Ap
     }
     let record: AntennaInspectionStageRecordResource = serde_json::from_slice(bytes)
         .map_err(|error| invalid(format!("invalid inspection record shape: {error}")))?;
-    if record.schema_version != "antenna_external_lead_stage_output.v1"
-        || record.stage_kind != "antenna_field_solve"
+    let manifest_basename = match record.schema_version.as_str() {
+        "antenna_external_lead_stage_output.v1" => "manifest.v1.json",
+        "antenna_external_lead_stage_output.v2" => "manifest.v2.json",
+        _ => return Err(invalid("unsupported inspection record schema")),
+    };
+    if record.stage_kind != "antenna_field_solve"
         || record.resolved_action != "external_lead_inspection"
         || record.qualification != "NOT VERIFIED"
         || record.field_scope != "external_electrode_truncation"
@@ -319,10 +368,13 @@ fn parse_record(bytes: &[u8]) -> Result<AntennaInspectionStageRecordResource, Ap
                 })
                 .ok_or_else(|| invalid("invalid inspection digest"))?;
             let expected_manifest = format!(
-                "antenna/external_lead_solutions/{}/{digest}/manifest.v1.json",
+                "antenna/external_lead_solutions/{}/{digest}/{manifest_basename}",
                 reference.output_id
             );
-            let expected_units = serde_json::json!({"V": "V", "RT0_coefficients": "A", "H": "A/m", "positions": "m"});
+            let mut expected_units = serde_json::json!({"V": "V", "RT0_coefficients": "A", "H": "A/m", "positions": "m"});
+            if record.schema_version == "antenna_external_lead_stage_output.v2" {
+                expected_units["J_charge"] = "A/m^2".into();
+            }
             if output.kind != "antenna_external_lead_inspection"
                 || reference.stage_id != record.stage_id
                 || reference.output_id != record.output_id
@@ -335,7 +387,8 @@ fn parse_record(bytes: &[u8]) -> Result<AntennaInspectionStageRecordResource, Ap
             }
         }
         "failed" | "cancelled"
-            if record.outputs.is_empty()
+            if record.schema_version == "antenna_external_lead_stage_output.v1"
+                && record.outputs.is_empty()
                 && record
                     .diagnostic
                     .as_deref()
@@ -485,6 +538,7 @@ fn manifest_resource(
         magnetic_field: manifest.magnetic_field.into(),
         device_vertex_ids: manifest.device_vertex_ids.into(),
         device_potential: manifest.device_potential.into(),
+        current_display: manifest.current_display.map(Into::into),
     })
 }
 
@@ -492,10 +546,22 @@ fn validate_port(
     record: &AntennaInspectionStageRecordResource,
     manifest: &AntennaExternalLeadSolutionManifest,
 ) -> Result<(), ApiError> {
-    if manifest.port_mode_id != record.port_mode_id {
-        return Err(invalid("inspection stage/manifest port identity mismatch"));
+    let generation_matches = inspection_generation_matches(
+        &record.schema_version, &manifest.schema_version, manifest.current_display.is_some());
+    if !generation_matches || manifest.port_mode_id != record.port_mode_id
+        || manifest.stage_id != record.stage_id || manifest.output_id != record.output_id
+    {
+        return Err(invalid("inspection stage/manifest generation or identity mismatch"));
     }
     Ok(())
+}
+
+fn inspection_generation_matches(record_schema: &str, manifest_schema: &str, has_current: bool) -> bool {
+    matches!(
+        (record_schema, manifest_schema, has_current),
+        ("antenna_external_lead_stage_output.v1", "antenna_external_lead_solution.v1", false)
+            | ("antenna_external_lead_stage_output.v2", "antenna_external_lead_solution.v2", true)
+    )
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -590,6 +656,64 @@ fn device_display_payloads(
     }))
 }
 
+/// Keep native cell-local ordering and vectors; never average RT0 traces at shared nodes.
+fn current_display_payloads(
+    current: Option<&AntennaInspectionDeviceCurrentDisplay>,
+    receipt: Option<&AntennaExternalLeadCurrentDisplayReceipt>,
+) -> Result<Option<[(AntennaExternalLeadPayloadRef, Vec<u8>); 4]>, ApiError> {
+    let (current, receipt) = match (current, receipt) {
+        (None, None) => return Ok(None),
+        (Some(current), Some(receipt)) => (current, receipt),
+        _ => return Err(invalid("current display decoded payload/receipt mismatch")),
+    };
+    if current.cells.len() as u64 != receipt.cell_count {
+        return Err(invalid("current display decoded cell count differs from receipt"));
+    }
+    let cell_values = receipt.cell_count.checked_mul(3)
+        .ok_or_else(|| invalid("current display center count overflow"))?;
+    let trace_values = cell_values.checked_mul(4)
+        .ok_or_else(|| invalid("current display trace count overflow"))?;
+    let center_positions = current.cells.iter().flat_map(|cell| cell.center_xyz_m)
+        .flat_map(f64::to_le_bytes).collect::<Vec<_>>();
+    let center_density = current.cells.iter().flat_map(|cell| cell.center_j_apm2)
+        .flat_map(f64::to_le_bytes).collect::<Vec<_>>();
+    let trace_positions = current.cells.iter().flat_map(|cell| cell.vertex_xyz_m)
+        .flatten().flat_map(f64::to_le_bytes).collect::<Vec<_>>();
+    let trace_density = current.cells.iter().flat_map(|cell| cell.vertex_j_apm2)
+        .flatten().flat_map(f64::to_le_bytes).collect::<Vec<_>>();
+    Ok(Some([
+        ("current_center_positions", center_positions, "cell_xyz_interleaved", "m", cell_values),
+        ("current_center_density", center_density, "cell_vector_xyz_interleaved", "A/m^2", cell_values),
+        ("current_trace_positions", trace_positions, "cell_local_vertex_xyz_interleaved", "m", trace_values),
+        ("current_trace_density", trace_density, "cell_local_vertex_vector_xyz_interleaved", "A/m^2", trace_values),
+    ].map(|(kind, bytes, layout, unit, value_count)| {
+        (AntennaExternalLeadPayloadRef {
+            path: format!("display/{kind}.bin"), sha256: digest(&bytes),
+            byte_count: bytes.len() as u64, scalar_type: "float64_le".into(),
+            layout: layout.into(), unit: unit.into(), value_count,
+        }, bytes)
+    })))
+}
+
+fn current_display_resource(
+    loaded: &LoadedAntennaExternalLeadSolution,
+) -> Result<Option<AntennaInspectionCurrentDisplayResource>, ApiError> {
+    let Some([center_positions, center_density, trace_positions, trace_density]) =
+        current_display_payloads(loaded.device_current.as_ref(), loaded.manifest.current_display.as_ref())?
+        else { return Ok(None); };
+    let receipt = loaded.manifest.current_display.clone()
+        .ok_or_else(|| invalid("current display receipt missing"))?;
+    let ordered_snapshot = receipt.payload.clone().into();
+    Ok(Some(AntennaInspectionCurrentDisplayResource {
+        receipt: receipt.into(),
+        center_positions: center_positions.0.into(),
+        center_current_density: center_density.0.into(),
+        trace_positions: trace_positions.0.into(),
+        trace_current_density: trace_density.0.into(),
+        ordered_snapshot,
+    }))
+}
+
 #[utoipa::path(
     get,
     path = "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection/display",
@@ -632,9 +756,14 @@ pub async fn get_antenna_external_lead_inspection_display(
         ).map_err(|e| invalid(e.message))?;
         validate_port(&record, &loaded.manifest)?;
         let [(positions, _), (topology, _)] = device_display_payloads(&loaded)?;
+        let device_current = current_display_resource(&loaded)?;
+        if device_current.as_ref().is_some_and(|current| current.receipt.cell_count != topology.value_count / 4) {
+            return Err(invalid("current display carrier differs from device topology"));
+        }
+        let has_current = device_current.is_some();
         let manifest = manifest_resource(loaded.manifest)?;
         Ok::<_, ApiError>(AntennaInspectionDisplayResource {
-            schema_version: "antenna_inspection_display.v1".into(),
+            schema_version: if has_current { "antenna_inspection_display.v2" } else { "antenna_inspection_display.v1" }.into(),
             resource_id: format!("data/antenna/stages/{}/external-lead-inspection/display", captured.owner.runtime_stage_id),
             session_id: captured.owner.session_id,
             session_epoch: captured.owner.session_epoch,
@@ -651,7 +780,7 @@ pub async fn get_antenna_external_lead_inspection_display(
             normalization: "raw_authored_current".into(),
             capabilities: AntennaInspectionDisplayCapabilities {
                 display: true, per_ampere_basis: false, source_fft: false,
-                llg_drive: false, current_density: false,
+                llg_drive: false, current_density: has_current,
             },
             device_node_count: positions.value_count / 3,
             device_cell_count: topology.value_count / 4,
@@ -661,6 +790,7 @@ pub async fn get_antenna_external_lead_inspection_display(
             device_potential: manifest.device_potential,
             sample_positions: manifest.sample_positions,
             magnetic_field: manifest.magnetic_field,
+            device_current,
         })
     }).await.map_err(|e| ApiError::internal(format!("inspection display worker: {e}")))??;
     check_owner(&state, &owner).await?;
@@ -714,6 +844,22 @@ fn select_payload(
             let [positions, topology] = device_display_payloads(&loaded)?;
             if kind == "device_positions" { positions } else { topology }
         },
+        "current_snapshot" => {
+            let receipt = loaded.manifest.current_display.ok_or_else(|| ApiError::conflict_with_code(
+                "inspection_current_unavailable", "legacy inspection has no owned current snapshot"))?;
+            let current = loaded.device_current.ok_or_else(|| invalid("owned current snapshot missing after load"))?;
+            (receipt.payload, current.canonical_payload)
+        },
+        "current_center_positions" | "current_center_density" | "current_trace_positions"
+            | "current_trace_density" => {
+            let payloads = current_display_payloads(loaded.device_current.as_ref(), loaded.manifest.current_display.as_ref())?.ok_or_else(|| ApiError::conflict_with_code(
+                "inspection_current_unavailable", "legacy inspection has no owned current snapshot"))?;
+            let index = match kind {
+                "current_center_positions" => 0, "current_center_density" => 1,
+                "current_trace_positions" => 2, _ => 3,
+            };
+            payloads.into_iter().nth(index).ok_or_else(|| invalid("current display payload selection failed"))?
+        },
         _ => return Err(ApiError::bad_request("unknown inspection payload kind")),
     };
     if descriptor.byte_count != bytes.len() as u64 || descriptor.sha256 != digest(&bytes) {
@@ -729,7 +875,7 @@ fn select_payload(
     path = "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection/payloads/{payload_kind}",
     params(
         ("stage_id" = String, Path, description = "Exact runtime stage ID"),
-        ("payload_kind" = String, Path, description = "bundle, sample_positions, magnetic_field, device_vertex_ids, device_potential, device_positions, device_topology"),
+        ("payload_kind" = String, Path, description = "bundle, sample_positions, magnetic_field, device_vertex_ids, device_potential, device_positions, device_topology; v2 additionally current_center_positions, current_center_density, current_trace_positions, current_trace_density, current_snapshot"),
         ("content_digest" = String, Query, description = "Required sha256: digest from inspection_ref, not the stage record digest"),
         ("x-fullmag-session-scope" = Option<String>, Header, description = "Canonical current-session scope; stale scope is rejected before artifact reads"),
         ("If-None-Match" = Option<String>, Header, description = "Previous strong ETag"),
@@ -765,6 +911,11 @@ pub async fn get_antenna_external_lead_inspection_payload(
         "device_potential",
         "device_positions",
         "device_topology",
+        "current_center_positions",
+        "current_center_density",
+        "current_trace_positions",
+        "current_trace_density",
+        "current_snapshot",
     ]
     .contains(&payload_kind.as_str())
     {
@@ -828,6 +979,89 @@ pub async fn get_antenna_external_lead_inspection_payload(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inspection_record_and_manifest_generation_cannot_be_mixed() {
+        for (record_schema, manifest_schema, has_current, accepted) in [
+            ("antenna_external_lead_stage_output.v1", "antenna_external_lead_solution.v1", false, true),
+            ("antenna_external_lead_stage_output.v2", "antenna_external_lead_solution.v2", true, true),
+            ("antenna_external_lead_stage_output.v1", "antenna_external_lead_solution.v1", true, false),
+            ("antenna_external_lead_stage_output.v2", "antenna_external_lead_solution.v2", false, false),
+            ("antenna_external_lead_stage_output.v1", "antenna_external_lead_solution.v2", true, false),
+            ("antenna_external_lead_stage_output.v2", "antenna_external_lead_solution.v1", false, false),
+        ] {
+            assert_eq!(inspection_generation_matches(record_schema, manifest_schema, has_current), accepted);
+        }
+    }
+
+    fn current_fixture() -> (AntennaInspectionDeviceCurrentDisplay, AntennaExternalLeadCurrentDisplayReceipt) {
+        let current = AntennaInspectionDeviceCurrentDisplay {
+            // Adapter serialization fixture, not a native solve or scientific qualification.
+            canonical_payload: vec![1, 2, 3],
+            cells: vec![
+                fullmag_runner::AntennaInspectionCurrentDisplayCell {
+                    source_element_index: 7, vertex_ids: [1, 2, 3, 4],
+                    vertex_xyz_m: [[0., 0., 0.], [1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+                    vertex_j_apm2: [[1., 2., 3.], [4., 5., 6.], [7., 8., 9.], [10., 11., 12.]],
+                    center_xyz_m: [0.25, 0.25, 0.25], center_j_apm2: [13., 14., 15.],
+                },
+                fullmag_runner::AntennaInspectionCurrentDisplayCell {
+                    source_element_index: 12, vertex_ids: [1, 5, 6, 7],
+                    vertex_xyz_m: [[0., 0., 0.], [-1., 0., 0.], [0., -1., 0.], [0., 0., -1.]],
+                    vertex_j_apm2: [[-1., -2., -3.], [-4., -5., -6.], [-7., -8., -9.], [-10., -11., -12.]],
+                    center_xyz_m: [-0.25, -0.25, -0.25], center_j_apm2: [-13., -14., -15.],
+                },
+            ],
+        };
+        let receipt = AntennaExternalLeadCurrentDisplayReceipt {
+            schema_version: "accepted_external_lead_current_display.ordered.v1".into(),
+            operator_version: "fem_accepted_external_lead_current_display.v1".into(),
+            current_evaluator_version: "fem_generic_affine_rt0.v1".into(),
+            sampling_policy: "cell_center_and_cell_local_vertices.v1".into(),
+            center_policy: "vertex_quarter_sum.long_double.v1".into(),
+            normalization: "raw_authored_current".into(), coordinate_unit: "m".into(),
+            current_density_unit: "A/m^2".into(), cell_count: 2,
+            payload: AntennaExternalLeadPayloadRef {
+                path: "current_display.v1.bin".into(), sha256: digest(&current.canonical_payload),
+                byte_count: 3, scalar_type: "ordered_binary_v1".into(),
+                layout: "accepted_external_lead_current_display.ordered.v1".into(),
+                unit: "A/m^2".into(), value_count: 3,
+            },
+        };
+        (current, receipt)
+    }
+
+    #[test]
+    fn current_display_uses_owned_native_centers_and_distinct_cell_local_traces() {
+        let (current, receipt) = current_fixture();
+        let payloads = current_display_payloads(Some(&current), Some(&receipt)).unwrap().unwrap();
+        let decode = |bytes: &[u8]| bytes.chunks_exact(8)
+            .map(|bytes| f64::from_le_bytes(bytes.try_into().unwrap())).collect::<Vec<_>>();
+        assert_eq!(decode(&payloads[0].1), vec![0.25, 0.25, 0.25, -0.25, -0.25, -0.25]);
+        assert_eq!(decode(&payloads[1].1), vec![13., 14., 15., -13., -14., -15.]);
+        // Shared vertex ID 1 has two distinct tangential traces, not a nodal average.
+        assert_eq!(decode(&payloads[3].1), (1..=12).map(f64::from)
+            .chain((1..=12).map(|value| -f64::from(value))).collect::<Vec<_>>());
+        for (index, (descriptor, bytes)) in payloads.iter().enumerate() {
+            assert_eq!(descriptor.byte_count, bytes.len() as u64);
+            assert_eq!(descriptor.sha256, digest(bytes));
+            assert_eq!(descriptor.value_count, if index < 2 { 6 } else { 24 });
+            assert_eq!(descriptor.byte_count, descriptor.value_count * 8);
+            assert_eq!(descriptor.scalar_type, "float64_le");
+            assert_eq!(descriptor.unit, if index % 2 == 0 { "m" } else { "A/m^2" });
+        }
+        assert_eq!(payloads[3].0.layout, "cell_local_vertex_vector_xyz_interleaved");
+    }
+
+    #[test]
+    fn legacy_display_has_no_current_and_partial_current_state_is_rejected() {
+        assert!(current_display_payloads(None, None).unwrap().is_none());
+        let (current, mut receipt) = current_fixture();
+        assert!(current_display_payloads(Some(&current), None).is_err());
+        assert!(current_display_payloads(None, Some(&receipt)).is_err());
+        receipt.cell_count = 1;
+        assert!(current_display_payloads(Some(&current), Some(&receipt)).is_err());
+    }
 
     #[tokio::test]
     async fn inspection_owner_recheck_rejects_same_identity_reopen() {

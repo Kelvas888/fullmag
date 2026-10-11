@@ -148,8 +148,13 @@ pub(super) fn execute(
             return Err(error);
         }
     };
+    let has_current = manifest.current_display.is_some();
+    let mut payload_units = json!({"V": "V", "RT0_coefficients": "A", "H": "A/m", "positions": "m"});
+    if has_current {
+        payload_units["J_charge"] = "A/m^2".into();
+    }
     let payload = json!({
-        "schema_version": "antenna_external_lead_stage_output.v1",
+        "schema_version": if has_current { "antenna_external_lead_stage_output.v2" } else { "antenna_external_lead_stage_output.v1" },
         "stage_kind": "antenna_field_solve",
         "resolved_action": "external_lead_inspection",
         "stage_id": input.stage.id,
@@ -162,7 +167,7 @@ pub(super) fn execute(
             "kind": "antenna_external_lead_inspection",
             "inspection_ref": published.reference,
             "manifest_ref": manifest_ref,
-            "payload_units": {"V": "V", "RT0_coefficients": "A", "H": "A/m", "positions": "m"},
+            "payload_units": payload_units,
             "reused_existing": published.reused_existing,
         }],
     });

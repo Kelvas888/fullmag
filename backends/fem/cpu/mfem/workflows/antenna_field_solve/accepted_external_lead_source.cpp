@@ -1,4 +1,5 @@
 #include "cpu/mfem/workflows/antenna_field_solve/accepted_external_lead_source.hpp"
+#include "cpu/mfem/transport/affine_rt0_element.hpp"
 #include "frequency_domain/canonical_digest.hpp"
 
 #include <mfem.hpp>
@@ -85,6 +86,7 @@ public:
         auto digest = builder_.sha256_hex();
         return {std::move(digest), std::move(builder_).release_payload()};
     }
+    std::uint64_t size() const { return used_; }
     void preflight_repeated_fields(std::uint64_t count, std::uint64_t stride, std::uint64_t trailer) const
     {
         constexpr auto maximum = AcceptedTerminalChargeSource::maximum_digest_preimage_bytes;
@@ -546,11 +548,120 @@ AcceptedExternalLeadFieldResult evaluate_accepted_external_lead_field(
         charge.content_digest(), field_operator, std::move(payload.first), std::move(payload.second)};
 }
 
-AcceptedExternalLeadBundle solve_accepted_external_lead_bundle(
+namespace {
+
+constexpr std::uint64_t current_display_cell_stride()
+{
+    constexpr auto scalar = [](std::string_view name) { return std::uint64_t{25} + name.size(); };
+    return scalar("source_element_index") + 4 * (scalar("vertex_id") +
+        3 * scalar("vertex_coordinate_m") + 3 * scalar("vertex_current_apm2")) +
+        3 * scalar("center_coordinate_m") + 3 * scalar("center_current_apm2");
+}
+
+std::uint64_t device_cell_count(const mfem::Mesh &mesh,
+    const transport::StableMeshVertexIdentities &ids,
+    const std::vector<std::uint64_t> &device_vertex_ids)
+{
+    require(mesh.GetNE() > 0 && ids.local_to_stable.size() == static_cast<std::size_t>(mesh.GetNV()) &&
+            !device_vertex_ids.empty() && device_vertex_ids.size() <= ids.local_to_stable.size(),
+        "current display needs an exact nonempty mesh/vertex partition");
+    const std::set<std::uint64_t> device(device_vertex_ids.begin(), device_vertex_ids.end());
+    const std::set<std::uint64_t> actual(ids.local_to_stable.begin(), ids.local_to_stable.end());
+    require(device.size() == device_vertex_ids.size() && actual.size() == ids.local_to_stable.size() &&
+            actual.count(0) == 0 && std::includes(actual.begin(), actual.end(), device.begin(), device.end()),
+        "current display partition has foreign, zero or repeated vertex IDs");
+    std::uint64_t count = 0;
+    mfem::Array<int> vertices;
+    for (int element = 0; element < mesh.GetNE(); ++element) {
+        mesh.GetElementVertices(element, vertices);
+        require(vertices.Size() == 4, "current display requires Tet4 elements");
+        const bool owned = device.count(ids.local_to_stable.at(vertices[0])) != 0;
+        for (const auto vertex : vertices) {
+            require((device.count(ids.local_to_stable.at(vertex)) != 0) == owned,
+                "current display partition splits a tetrahedron");
+        }
+        if (owned) ++count;
+    }
+    require(count > 0, "current display partition contains no device cells");
+    return count;
+}
+
+BoundedRecord current_display_header(const std::string &bundle_digest,
+    const std::string &charge_digest, const std::string &source_digest,
+    const std::string &vertex_id_version, std::uint64_t count)
+{
+    require(bundle_digest.size() == 64 && charge_digest.size() == 64 && source_digest.size() == 64,
+        "current display requires exact content pins");
+    BoundedRecord record(AcceptedExternalLeadCurrentDisplaySnapshot::digest_schema);
+    record.text("operator_version", AcceptedExternalLeadCurrentDisplaySnapshot::operator_version);
+    record.text("current_evaluator_version", transport::AffineRt0Element::operator_version);
+    record.text("sampling_policy", AcceptedExternalLeadCurrentDisplaySnapshot::sampling_policy);
+    record.text("center_policy", "vertex_quarter_sum.long_double.v1");
+    record.text("field_scope", AcceptedExternalLeadCurrentSource::field_scope);
+    record.text("status", "inspection_only");
+    record.text("normalization", "raw_authored_current");
+    record.text("coordinate_unit", "m");
+    record.text("current_density_unit", "A/m^2");
+    record.text("bundle_content_sha256", bundle_digest);
+    record.text("charge_content_sha256", charge_digest);
+    record.text("source_content_sha256", source_digest);
+    record.text("stable_vertex_id_version", vertex_id_version);
+    record.integer("cell_count", count);
+    record.preflight_repeated_fields(count, current_display_cell_stride(), 0);
+    return record;
+}
+
+AcceptedExternalLeadCurrentDisplaySnapshot sample_current_display(
+    const AcceptedExternalLeadCurrentSource &source, const AcceptedExternalLeadBundle &bundle,
+    const std::vector<std::uint64_t> &device_vertex_ids)
+{
+    const auto &charge = source.charge_source();
+    const auto &projection = charge.rt0_projection();
+    const auto &field = projection.field();
+    const auto &mesh = *field.FESpace()->GetMesh();
+    require(charge.potential().FESpace()->GetMesh() == &mesh,
+        "current display lost its owned charge/RT0 mesh binding");
+    const auto &ids = projection.stable_vertex_identities();
+    const auto count = device_cell_count(mesh, ids, device_vertex_ids);
+    auto record = current_display_header(bundle.content_digest, charge.content_digest(),
+        source.content_digest(), ids.version, count);
+    const std::set<std::uint64_t> device(device_vertex_ids.begin(), device_vertex_ids.end());
+    mfem::Array<int> vertices;
+    for (int element = 0; element < mesh.GetNE(); ++element) {
+        mesh.GetElementVertices(element, vertices);
+        if (device.count(ids.local_to_stable.at(vertices[0])) == 0) continue;
+        const transport::AffineRt0Element evaluator(field, element);
+        std::array<transport::AffineRt0Element::Point, 4> coordinates;
+        record.integer("source_element_index", static_cast<std::uint64_t>(element));
+        for (int local = 0; local < 4; ++local) {
+            const auto *point = mesh.GetVertex(vertices[local]);
+            coordinates[local] = {point[0], point[1], point[2]};
+            record.integer("vertex_id", ids.local_to_stable.at(vertices[local]));
+            for (const auto value : coordinates[local]) record.real("vertex_coordinate_m", value);
+            for (const auto value : evaluator.current_at(coordinates[local])) record.real("vertex_current_apm2", value);
+        }
+        transport::AffineRt0Element::Point center;
+        for (int component = 0; component < 3; ++component) {
+            long double value = 0.0L;
+            for (const auto &point : coordinates) value += static_cast<long double>(point[component]) / 4.0L;
+            center[component] = static_cast<double>(value);
+            require(std::isfinite(value) && std::isfinite(center[component]) &&
+                    (value == 0.0L || center[component] != 0.0),
+                "current display center is not representable");
+            record.real("center_coordinate_m", center[component]);
+        }
+        for (const auto value : evaluator.current_at(center)) record.real("center_current_apm2", value);
+    }
+    auto payload = record.finish();
+    return {std::move(payload.first), std::move(payload.second)};
+}
+
+AcceptedExternalLeadBundle solve_bundle_impl(
     const AcceptedTerminalChargeRequest &charge_request,
     AcceptedExternalLeadSourceRequest closure_request,
     const std::vector<std::array<double, 3>> &target_points,
-    const oersted::DirectTetraQuadratureOptions &options)
+    const oersted::DirectTetraQuadratureOptions &options,
+    AcceptedExternalLeadCurrentDisplaySnapshot *current_display)
 {
     require(!closure_request.accepted_source && closure_request.required_charge_content_digest.empty(),
         "external lead bundle must resolve its own accepted charge owner and content pin");
@@ -560,6 +671,9 @@ AcceptedExternalLeadBundle solve_accepted_external_lead_bundle(
     require(target_points.empty() || static_cast<std::uint64_t>(charge_request.mesh->GetNE()) <=
             options.maximum_source_target_pairs / target_points.size(),
         "external lead bundle exceeds its source-target pair budget");
+    if (current_display != nullptr) {
+        (void)accepted_external_lead_current_display_payload_size(charge_request, closure_request.device_vertex_ids);
+    }
     const auto charge = solve_accepted_terminal_charge_source(charge_request);
     closure_request.accepted_source = charge;
     closure_request.required_charge_content_digest = charge->content_digest();
@@ -584,7 +698,45 @@ AcceptedExternalLeadBundle solve_accepted_external_lead_bundle(
     record.text("field_content_sha256", field.evaluation_content_digest);
     record.bytes("field_record", field.canonical_evaluation_bytes);
     auto payload = record.finish();
-    return {std::move(payload.first), std::move(payload.second)};
+    AcceptedExternalLeadBundle bundle{std::move(payload.first), std::move(payload.second)};
+    if (current_display != nullptr) {
+        *current_display = sample_current_display(*source, bundle, closure_request.device_vertex_ids);
+    }
+    return bundle;
+}
+
+} // namespace
+
+std::uint64_t accepted_external_lead_current_display_payload_size(
+    const AcceptedTerminalChargeRequest &charge_request,
+    const std::vector<std::uint64_t> &device_vertex_ids)
+{
+    require(charge_request.mesh != nullptr, "current display requires a charge mesh");
+    const auto count = device_cell_count(*charge_request.mesh, charge_request.stable_vertex_identities, device_vertex_ids);
+    const std::string digest(64, '0');
+    const auto header = current_display_header(digest, digest, digest,
+        charge_request.stable_vertex_identities.version, count);
+    return header.size() + count * current_display_cell_stride();
+}
+
+AcceptedExternalLeadBundle solve_accepted_external_lead_bundle(
+    const AcceptedTerminalChargeRequest &charge_request,
+    AcceptedExternalLeadSourceRequest closure_request,
+    const std::vector<std::array<double, 3>> &target_points,
+    const oersted::DirectTetraQuadratureOptions &options)
+{
+    return solve_bundle_impl(charge_request, std::move(closure_request), target_points, options, nullptr);
+}
+
+AcceptedExternalLeadDisplayBundle solve_accepted_external_lead_display_bundle(
+    const AcceptedTerminalChargeRequest &charge_request,
+    AcceptedExternalLeadSourceRequest closure_request,
+    const std::vector<std::array<double, 3>> &target_points,
+    const oersted::DirectTetraQuadratureOptions &options)
+{
+    AcceptedExternalLeadDisplayBundle result;
+    result.bundle = solve_bundle_impl(charge_request, std::move(closure_request), target_points, options, &result.current_display);
+    return result;
 }
 
 } // namespace fullmag::fem::antenna_field_solve

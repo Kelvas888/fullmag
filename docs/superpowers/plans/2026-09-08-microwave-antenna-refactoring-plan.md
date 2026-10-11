@@ -1,5 +1,90 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Aktualny punkt wznowienia — 2026-10-11 (owned snapshot `J_charge`, WIP):**
+Natywny producent `solve_accepted_external_lead_display_bundle` zachowuje
+legacy bundle i próbkuje J z tego samego live accepted RT0 przed zwolnieniem
+ownera. Osobny rekord zawiera środki device Tet4 oraz cell-local vertex traces,
+rzeczywiste stable IDs, ordered whole-mesh element index i SHA bundle/charge/source.
+Nie używa starszego nodal J ani dodatkowego solve/projection. Nowe ABI
+`fullmag_fem_solve_accepted_external_lead_field_v2` korzysta z request v1
+oraz osobno wersjonowanego result v2; legacy layout i trzy records są zachowane.
+Dokładny J capacity admission następuje przed solve; publikacja obu lengths
+i SHA jest wspólna, po kontroli rozłączności buforów i przygotowaniu metadata.
+Kontrakt naukowy: nota 0950,
+`DOC-ANCHOR:antenna-owned-current-display-snapshot`.
+Focused validator: exit 0; interpretowany validator contract **33/33 PASS**;
+layout/admission source checks **7/7 PASS**; nie są to wykonania native ani fizyki.
+Bounded Rust decoder wiąże snapshot J z zachowanym bundle, charge mesh,
+ordered whole-mesh Tet4 i stable IDs/XYZ. Archiwum v1 zachowuje pięć payloadów
+i brak J; v2 dodaje `current_display.v1.bin` i wersjonowany receipt. Publikacja
+odrzuca mieszane generacje, podwójny manifest i obce pliki. Pełny loader
+odrzuca także duplikaty kluczy JSON, brak payloadu i niezgodność pinów.
+CLI zapisuje stage record v2 z jednostką J, zachowując nazwę rejestru v1.
+Typed API v2 publikuje cztery binarne carriery (środki/ślady × pozycje/J)
+oraz oryginalny snapshot; JSON pozostaje lekki. `current_density=true`
+dotyczy wyłącznie poprawnie wczytanego wyniku v2, nie samego manifestu.
+Frontend rozpoznaje zgodne v1/v2 bez blokowania dotychczasowych V/H.
+Interpretowana regresja rzeczywistej bramki frontendu: **48/48 PASS**,
+`apps/control-room/scripts/check-antenna-inspection-generation.mjs`.
+Produkcja CLI/API source-check: passed/0, receipt
+`df13aef3347140d1b688d1f9c70691c3`; OpenAPI: passed/0,
+`24bfdfa35fc24762a6c1ba65dc5aeb53`; klient: passed/0,
+`e79efc05b5ac4d3fb24c0584f207cd41`; frontend production source-check:
+passed/0, `b99eb90dcfe4495b841559ed42412b5d`; API hygiene: passed/0,
+`1a44269b4ec34c79901e231833f7cd23`; lint całego frontendu: passed/0,
+`5b852c8d09b248fb9cc416e2c1de5705`. Receipty mają niezmienione źródła
+przed/po. Frontend check poprzedza dodanie samego interpretowanego skryptu.
+Te bramki nie kompilują testów jednostkowych ani natywnego FEM;
+regresje Rust są zapisane, niewykonane i niekompilowane.
+Build `fem-cpu-release` nr 40:
+`c9ed53df3f734af9ae997ea5341c9d80`, terminalny `succeeded`, exit 0.
+Sprawdzono 127/127 artefaktów: rozmiary i SHA-256 zgodne z build receipt;
+kwalifikacja pozostaje `NOT VERIFIED`. Image
+`sha256:e360637ea8b00e280efdca7648ee022e6dd16150b10130b734425bb8a65b5aa0`.
+Kapsuła `ebedb8a8855722e4b41e6258e9e314a443311cf214cb4a698a543572fb405d16`,
+native snapshot `3d2549e6327b3c7fddb2ac069f6aaa1d8f94a8ecda6a905b939402da54b3beb1`,
+bazowy HEAD `4a1cfd9cb8ae363579a9fb1a79bc307b5d177203`.
+Ta zamrożona kapsuła zawiera producenta C++/ABI, lecz nie późniejszy adapter
+Rust, archiwum, API ani frontend; sukces tego buildu nie zakwalifikuje
+całego nowego przepływu i wymaga osobnego, właściwego odbioru runtime.
+Nie ponawiać tego joba: do pełnej integracji potrzebna jest nowa kapsuła
+obejmująca cały adapter/archive/API/frontend.
+Raw J jest już zaimplementowane w rendererze i wspólnym Inspectorze:
+surface/wireframe/points/full-XYZ vectors, komponenty x/y/z/moduł, palety.
+Cell-local traces nie są uśredniane; shader liczy normę po interpolacji
+wektora, points/glyphs zachowują native centers. Immutable carrier jest
+oddzielony od stylu i projekcji; geometrie, materiał i LUT nie zmieniają
+UUID przy zmianie komponentu, palety lub pojedynczych passów.
+Interpretowany adapter: 90/90 PASS. Production frontend source-check:
+passed/0, `f21e7af3f6cd4ca09bdd65c93ea9cf91` (przed wyłącznie korektą
+oczekiwania gotowości w skrypcie browser; źródła TS/TSX niezmienione).
+API hygiene: passed/0, `10a023c6bf634103b7018ef634d621c1`.
+Końcowy lint całego frontendu: passed/0, `a4c9831b634c4e7695567890c2ac362e`.
+Managed browser `4a3609574f2443f39aed36e46d7db3b0`: passed/0,
+16 grup kontroli; before/after digest
+`25186155a82134b079022e79c366805768eb914ef712298a0020b58165444e35`.
+V/J/H Inspector, rzeczywiste shader GPU cancellation readback, stabilne
+zasoby, scoped bounded reads, odmowy i cleanup PASS; screenshot obejrzano.
+WebGL niezagubiony, canvas widoczny, drawing buffer niezerowy.
+Przeglądy źródłowe adapter/archive/ABI i renderera: bez Blocker/Required.
+To wyłącznie kontrolowany test UI, nie prawdziwy solve/HTTP/nauka.
+Następne kroki: build pełnej kapsuły, natywny adapter i wykonanie
+solve/publikacji/cold-load/HTTP oraz rzeczywista kwalifikacja V/J/H.
+Nowe API nie działa jeszcze w uruchomionym zamrożonym backendzie.
+Obwód, per-A baza, FFT, LLG/Relax i pełne T00–T18 pozostają otwarte.
+Workspace 3197 działa z przebudowanym pakietem HEAD 4a1cfd9c; odtworzono
+ostatnią zapisaną pustą scenę, nie starszy model demonstracyjny microstrip.
+Nie zawiera jeszcze tego natywnego WIP i nie był ponownie restartowany.
+
+**Audyt BORIS — 2026-10-11:** ukończony raport i manifest dowodów zapisano
+w `docs/superpowers/specs/2026-10-11-boris-transport-oersted-antenna-audit.md`
+oraz sąsiednim `.evidence.json`. Commit dokumentacji:
+`6fbe4a6403d01ef3545bb5ac1500fb0559af6be4`. Przypięte źródła upstream,
+równania charge/spin/Oersted, waveform/cache, jednostki, ryzyka i bramki
+porównania; potwierdzono permutację indeksów w `_concat_qia`.
+BORIS nie był budowany ani uruchamiany; audyt nie promuje capabilities,
+nie kopiuje kodu solvera i nie zamyka żadnej bramki fizyki T00–T18.
+
 **Aktualny punkt wznowienia — 2026-10-10 (materializacja kopii wykonawczej):**
 Pełny eksport `Problem.to_ir(include_geometry_assets=True)` przygotowuje
 `ExternalLeadPreparation` na niezależnej siatce oryginalnego przewodnika.

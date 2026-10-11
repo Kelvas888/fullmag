@@ -101,4 +101,29 @@ AcceptedExternalLeadBundle solve_accepted_external_lead_bundle(
     const std::vector<std::array<double, 3>> &target_points,
     const oersted::DirectTetraQuadratureOptions &options = {});
 
+struct AcceptedExternalLeadCurrentDisplaySnapshot {
+    static constexpr const char *operator_version = "fem_accepted_external_lead_current_display.v1";
+    static constexpr const char *digest_schema = "accepted_external_lead_current_display.ordered.v1";
+    static constexpr const char *sampling_policy = "cell_center_and_cell_local_vertices.v1";
+    std::string content_digest;
+    std::string canonical_content_bytes;
+};
+
+struct AcceptedExternalLeadDisplayBundle {
+    AcceptedExternalLeadBundle bundle;
+    AcceptedExternalLeadCurrentDisplaySnapshot current_display;
+};
+
+// Exact framed size admission on the input mesh, before any charge solve.
+std::uint64_t accepted_external_lead_current_display_payload_size(
+    const AcceptedTerminalChargeRequest &charge_request,
+    const std::vector<std::uint64_t> &device_vertex_ids);
+
+// The legacy bundle is unchanged; J is sampled from the same live charge owner.
+AcceptedExternalLeadDisplayBundle solve_accepted_external_lead_display_bundle(
+    const AcceptedTerminalChargeRequest &charge_request,
+    AcceptedExternalLeadSourceRequest closure_request,
+    const std::vector<std::array<double, 3>> &target_points,
+    const oersted::DirectTetraQuadratureOptions &options = {});
+
 } // namespace fullmag::fem::antenna_field_solve

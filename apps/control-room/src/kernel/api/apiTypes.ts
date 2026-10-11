@@ -284,7 +284,14 @@ export type AntennaExternalLeadInspectionResource =
   components["schemas"]["AntennaExternalLeadInspectionResource"];
 export type AntennaInspectionDisplayResource =
   components["schemas"]["AntennaInspectionDisplayResource"];
+export type AntennaInspectionCurrentPayloadKind =
+  | "current_center_positions"
+  | "current_center_density"
+  | "current_trace_positions"
+  | "current_trace_density"
+  | "current_snapshot";
 export type AntennaInspectionPayloadKind =
+  | AntennaInspectionCurrentPayloadKind
   | "bundle"
   | "sample_positions"
   | "magnetic_field"
@@ -293,7 +300,7 @@ export type AntennaInspectionPayloadKind =
   | "device_positions"
   | "device_topology";
 export type AntennaInspectionManifestPayloadKind = Exclude<
-  AntennaInspectionPayloadKind, "device_positions" | "device_topology"
+  AntennaInspectionPayloadKind, "device_positions" | "device_topology" | AntennaInspectionCurrentPayloadKind
 >;
 export type AntennaSourceSpectrumResource =
   components["schemas"]["AntennaSourceSpectrumResource"];

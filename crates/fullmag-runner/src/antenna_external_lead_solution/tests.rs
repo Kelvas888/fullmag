@@ -136,6 +136,7 @@ impl Fixture {
                 "V",
                 8,
             ),
+            current_display: None,
             content_digest: String::new(),
         };
         let mut f = Self {
@@ -173,6 +174,148 @@ impl Fixture {
             output_id: self.manifest.output_id.clone(),
             content_digest: self.manifest.content_digest.clone(),
         };
+    }
+    fn with_current(mut self) -> Self {
+        // Independent framing fixture, not evidence of an executed RT0 current solve.
+        fn field(bytes: &mut Vec<u8>, name: &str, tag: u8, value: &[u8]) {
+            bytes.extend_from_slice(&(name.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(tag);
+            bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+            bytes.extend_from_slice(value);
+        }
+        let bundle = decode_owned_bundle(
+            self.payload(BUNDLE_PATH).to_vec(),
+            &self.manifest.bundle.sha256,
+        )
+        .unwrap();
+        let selected = bundle
+            .charge
+            .elements
+            .iter()
+            .enumerate()
+            .filter(|(_, element)| {
+                element
+                    .vertex_ids
+                    .iter()
+                    .all(|id| bundle.source.device_vertex_ids.contains(id))
+            })
+            .collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        for (name, value) in [
+            ("schema", CURRENT_DISPLAY_SCHEMA),
+            (
+                "operator_version",
+                "fem_accepted_external_lead_current_display.v1",
+            ),
+            ("current_evaluator_version", "fem_generic_affine_rt0.v1"),
+            ("sampling_policy", "cell_center_and_cell_local_vertices.v1"),
+            ("center_policy", "vertex_quarter_sum.long_double.v1"),
+            ("field_scope", "external_electrode_truncation"),
+            ("status", "inspection_only"),
+            ("normalization", "raw_authored_current"),
+            ("coordinate_unit", "m"),
+            ("current_density_unit", "A/m^2"),
+            ("bundle_content_sha256", bundle.content_sha256.as_str()),
+            (
+                "charge_content_sha256",
+                bundle.charge.content_sha256.as_str(),
+            ),
+            (
+                "source_content_sha256",
+                bundle.source_content_sha256.as_str(),
+            ),
+            (
+                "stable_vertex_id_version",
+                bundle.charge.stable_vertex_version.as_str(),
+            ),
+        ] {
+            field(&mut bytes, name, 1, value.as_bytes());
+        }
+        field(
+            &mut bytes,
+            "cell_count",
+            2,
+            &(selected.len() as u64).to_be_bytes(),
+        );
+        for (index, element) in &selected {
+            field(
+                &mut bytes,
+                "source_element_index",
+                2,
+                &(*index as u64).to_be_bytes(),
+            );
+            let mut center = [0.; 3];
+            for id in element.vertex_ids {
+                field(&mut bytes, "vertex_id", 2, &id.to_be_bytes());
+                let xyz = bundle
+                    .charge
+                    .vertices
+                    .iter()
+                    .find(|vertex| vertex.id == id)
+                    .unwrap()
+                    .xyz_m;
+                for (axis, value) in xyz.into_iter().enumerate() {
+                    center[axis] += 0.25 * value;
+                    field(
+                        &mut bytes,
+                        "vertex_coordinate_m",
+                        4,
+                        &value.to_bits().to_be_bytes(),
+                    );
+                }
+                for value in [1.0f64, -2., 3.] {
+                    field(
+                        &mut bytes,
+                        "vertex_current_apm2",
+                        4,
+                        &value.to_bits().to_be_bytes(),
+                    );
+                }
+            }
+            for value in center {
+                field(
+                    &mut bytes,
+                    "center_coordinate_m",
+                    4,
+                    &value.to_bits().to_be_bytes(),
+                );
+            }
+            for value in [1.0f64, -2., 3.] {
+                field(
+                    &mut bytes,
+                    "center_current_apm2",
+                    4,
+                    &value.to_bits().to_be_bytes(),
+                );
+            }
+        }
+        self.manifest.schema_version = ANTENNA_EXTERNAL_LEAD_CURRENT_DISPLAY_SOLUTION_SCHEMA.into();
+        self.manifest.current_display = Some(AntennaExternalLeadCurrentDisplayReceipt {
+            schema_version: CURRENT_DISPLAY_SCHEMA.into(),
+            operator_version: "fem_accepted_external_lead_current_display.v1".into(),
+            current_evaluator_version: "fem_generic_affine_rt0.v1".into(),
+            sampling_policy: "cell_center_and_cell_local_vertices.v1".into(),
+            center_policy: "vertex_quarter_sum.long_double.v1".into(),
+            normalization: "raw_authored_current".into(),
+            coordinate_unit: "m".into(),
+            current_density_unit: "A/m^2".into(),
+            cell_count: selected.len() as u64,
+            payload: payload_ref(
+                CURRENT_DISPLAY_PATH,
+                &bytes,
+                "ordered_binary_v1",
+                CURRENT_DISPLAY_SCHEMA,
+                "A/m^2",
+                bytes.len(),
+            ),
+        });
+        self.payloads.push(AuxiliaryArtifact {
+            relative_path: CURRENT_DISPLAY_PATH.into(),
+            bytes,
+        });
+        self.rehash_manifest();
+        self
     }
     fn bytes(&self) -> Vec<u8> {
         serde_json::to_vec(&self.manifest).unwrap()
@@ -232,6 +375,96 @@ fn manifest_only_loader_does_not_claim_payload_integrity() {
     f.payloads.clear();
     assert!(load_antenna_external_lead_solution_manifest(&f.bytes(), &f.reference).is_ok());
     assert!(f.load().is_err());
+}
+
+#[test]
+fn current_archive_roundtrip_preserves_legacy_digest_and_local_traces() {
+    let legacy = Fixture::new();
+    assert!(legacy.load().unwrap().device_current.is_none());
+    assert!(!serde_json::to_value(&legacy.manifest)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .contains_key("current_display"));
+    let current = legacy.clone().with_current();
+    assert_eq!(current.manifest.bundle, legacy.manifest.bundle);
+    assert_ne!(
+        current.reference.content_digest,
+        legacy.reference.content_digest
+    );
+    let loaded = current.load().unwrap();
+    let display = loaded.device_current.unwrap();
+    assert_eq!(
+        display.canonical_payload,
+        current.payload(CURRENT_DISPLAY_PATH)
+    );
+    assert_eq!(display.cells.len(), 6);
+    for cell in display.cells {
+        assert_eq!(cell.center_j_apm2, [1., -2., 3.]);
+        assert_eq!(cell.vertex_j_apm2, [[1., -2., 3.]; 4]);
+    }
+    assert!(reject_unqualified_external_lead_source(&current.bytes())
+        .unwrap_err()
+        .message
+        .contains("source_not_qualified"));
+}
+
+#[test]
+fn current_archive_refuses_mixed_schema_missing_payload_and_rehashed_bad_pins() {
+    let baseline = Fixture::new().with_current();
+    for mutate in [
+        (|f: &mut Fixture| f.manifest.schema_version = ANTENNA_EXTERNAL_LEAD_SOLUTION_SCHEMA.into())
+            as fn(&mut Fixture),
+        |f| f.manifest.current_display = None,
+        |f| f.manifest.current_display.as_mut().unwrap().cell_count += 1,
+        |f| f.manifest.current_display.as_mut().unwrap().normalization = "per_ampere".into(),
+        |f| f.manifest.current_display.as_mut().unwrap().payload.unit = "A".into(),
+    ] {
+        let mut corrupt = baseline.clone();
+        mutate(&mut corrupt);
+        corrupt.rehash_manifest();
+        assert!(corrupt.load().is_err());
+    }
+    let mut missing = baseline.clone();
+    missing
+        .payloads
+        .retain(|p| p.relative_path != CURRENT_DISPLAY_PATH);
+    assert!(
+        load_antenna_external_lead_solution_manifest(&missing.bytes(), &missing.reference).is_ok()
+    );
+    assert!(missing.load().is_err());
+    let mut foreign = baseline.clone();
+    let bytes = &mut foreign.payloads.last_mut().unwrap().bytes;
+    let pin = baseline.manifest.bundle.sha256.as_bytes();
+    let offset = bytes
+        .windows(pin.len())
+        .position(|window| window == pin)
+        .unwrap();
+    bytes[offset] = if bytes[offset] == b'0' { b'1' } else { b'0' };
+    foreign
+        .manifest
+        .current_display
+        .as_mut()
+        .unwrap()
+        .payload
+        .sha256 = sha256(bytes);
+    foreign.rehash_manifest();
+    assert!(foreign.load().is_err());
+}
+
+#[test]
+fn inspection_manifest_refuses_duplicate_current_keys_and_nested_units() {
+    let f = Fixture::new().with_current();
+    let text = String::from_utf8(f.bytes()).unwrap();
+    for prefix in ["\"current_display\":", "\"normalization\":", "\"unit\":"] {
+        let ambiguous = text.replacen(prefix, &format!("{prefix}null,{prefix}"), 1);
+        assert!(
+            load_antenna_external_lead_solution_manifest(ambiguous.as_bytes(), &f.reference)
+                .unwrap_err()
+                .message
+                .contains("duplicate JSON key")
+        );
+    }
 }
 
 #[test]
@@ -502,6 +735,14 @@ fn cleanup_publication_test(root: &Path, references: &[AntennaExternalLeadSoluti
     for reference in references {
         assert_eq!(reference.output_id, references[0].output_id);
         let revision = output.join(reference.content_digest.strip_prefix("sha256:").unwrap());
+        let manifest_name = if revision.join("manifest.v1.json").is_file() {
+            assert!(!revision.join("manifest.v2.json").exists());
+            "manifest.v1.json"
+        } else {
+            assert!(revision.join("manifest.v2.json").is_file());
+            fs::remove_file(revision.join(CURRENT_DISPLAY_PATH)).unwrap();
+            "manifest.v2.json"
+        };
         // Remove only our exact known files; any unexpected entry prevents directory removal.
         for name in [
             BUNDLE_PATH,
@@ -509,7 +750,7 @@ fn cleanup_publication_test(root: &Path, references: &[AntennaExternalLeadSoluti
             FIELD_PATH,
             DEVICE_IDS_PATH,
             DEVICE_V_PATH,
-            "manifest.v1.json",
+            manifest_name,
         ] {
             fs::remove_file(revision.join(name)).unwrap();
         }
@@ -519,6 +760,38 @@ fn cleanup_publication_test(root: &Path, references: &[AntennaExternalLeadSoluti
     fs::remove_dir(root.join("antenna").join("external_lead_solutions")).unwrap();
     fs::remove_dir(root.join("antenna")).unwrap();
     fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn atomic_current_archive_publication_roundtrips_and_rejects_missing_or_mixed_files() {
+    let f = Fixture::new().with_current();
+    let root = publication_test_root();
+    let artifact = f.artifact();
+    let first = publish_antenna_external_lead_solution_atomically(&root, &artifact, None).unwrap();
+    assert_eq!(first.manifest_path.file_name().unwrap(), "manifest.v2.json");
+    let loaded = load_published_antenna_external_lead_solution(&root, &f.reference).unwrap();
+    assert_eq!(
+        loaded.device_current.unwrap().canonical_payload,
+        f.payload(CURRENT_DISPLAY_PATH)
+    );
+    assert!(
+        publish_antenna_external_lead_solution_atomically(&root, &artifact, None)
+            .unwrap()
+            .reused_existing
+    );
+    let revision = first.manifest_path.parent().unwrap();
+    let current_path = revision.join(CURRENT_DISPLAY_PATH);
+    fs::remove_file(&current_path).unwrap();
+    assert!(load_published_antenna_external_lead_solution_manifest(&root, &f.reference).is_ok());
+    assert!(load_published_antenna_external_lead_solution(&root, &f.reference).is_err());
+    assert!(publish_antenna_external_lead_solution_atomically(&root, &artifact, None).is_err());
+    fs::write(&current_path, f.payload(CURRENT_DISPLAY_PATH)).unwrap();
+    let foreign_manifest = revision.join("manifest.v1.json");
+    fs::write(&foreign_manifest, f.bytes()).unwrap();
+    assert!(load_published_antenna_external_lead_solution_manifest(&root, &f.reference).is_err());
+    assert!(load_published_antenna_external_lead_solution(&root, &f.reference).is_err());
+    fs::remove_file(foreign_manifest).unwrap();
+    cleanup_publication_test(&root, &[f.reference]);
 }
 
 #[test]
