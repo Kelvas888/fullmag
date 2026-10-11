@@ -20,6 +20,7 @@ import { AntennaExternalLeadInspectionPanel } from "./AntennaExternalLeadInspect
 import { AntennaProjectionDriveComposer } from "./AntennaProjectionDriveComposer";
 import { AntennaSolveTargetsEditor } from "./AntennaSolveTargetsEditor";
 import { AntennaSpectrumComposer } from "./AntennaSpectrumComposer";
+import { AntennaResourceEditor } from "./AntennaResourceEditor";
 import { MicrostripGeometryEditor } from "./MicrostripGeometryEditor";
 import { AntennaPlacementEditor } from "./AntennaPlacementEditor";
 import { SolvedAntennaDriveEditor } from "./SolvedAntennaDriveEditor";
@@ -937,6 +938,7 @@ export function AntennaCompositionPanel({
       ) : null}
       {kind === "solution" && resourceId ? <AntennaProjectionDriveComposer key={`projection:${resourceId}`} stageId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "solution" && resourceId ? <AntennaSpectrumComposer key={`spectrum:${resourceId}`} stageId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
+      {(kind === "port" || kind === "projection" || kind === "spectrum") && resourceId ? <AntennaResourceEditor kind={kind} resourceId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "drive" && resourceId ? <SolvedAntennaDriveEditor driveId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "spectrum" &&
       ids.spectrumOutputId &&
