@@ -176,3 +176,64 @@ def test_nonterminal_build_prevents_storage_and_docker(tmp_path, monkeypatch):
     monkeypatch.setattr(browser, "docker", lambda *args: pytest.fail("no Docker"))
     with pytest.raises(ValueError, match="terminal"):
         gate.start(tmp_path, "a" * 32, "b" * 40, "c" * 64, "d" * 64)
+
+
+
+def test_nonmagnetic_fixture_is_explicit_and_shares_only_source_assets():
+    magnetic = gate.fixture_contract()
+    nonmagnetic = gate.fixture_contract("nonmagnetic")
+    assert "fem_antenna_current_source_inspection.py" in magnetic
+    assert "fem_antenna_current_source_inspection.py" not in nonmagnetic
+    assert nonmagnetic["fem_antenna_field_only_nonmagnetic.py"] == gate.NONMAGNETIC_SHA
+    assert {k: v for k, v in magnetic.items() if k.startswith("assets/")} == {
+        k: v for k, v in nonmagnetic.items() if k.startswith("assets/")}
+    with pytest.raises(ValueError):
+        gate.fixture_contract("unknown")
+
+
+def test_native_archive_bytes_are_retained_without_reencoding(tmp_path, monkeypatch):
+    import base64
+    raw = b"native archive bytes"
+    encoded = base64.b64encode(raw).decode()
+    calls = []
+    def post(path, payload, limit):
+        calls.append((path, payload, limit))
+        return {"profile": "archive", "session_id": "native-session",
+                "fms_base64": encoded, "size_bytes": len(raw)}
+    monkeypatch.setattr(gate, "post_json", post)
+    assert gate.export_archive(tmp_path) == (encoded, "native-session")
+    assert (tmp_path / "snapshot.fms").read_bytes() == raw
+    assert calls == [("/v2/sessions/current/persistence/exports",
+                      {"profile": "archive"}, 2 * gate.MAX_ARCHIVE)]
+
+
+@pytest.mark.parametrize("mutation", ["invalid_base64", "size", "profile", "empty", "large"])
+def test_corrupt_or_oversized_archive_is_not_retained(tmp_path, monkeypatch, mutation):
+    import base64
+    result = {"profile": "archive", "session_id": "s",
+              "fms_base64": base64.b64encode(b"bytes").decode(), "size_bytes": 5}
+    if mutation == "invalid_base64": result["fms_base64"] = "!!!"
+    elif mutation == "size": result["size_bytes"] = 6
+    elif mutation == "profile": result["profile"] = "compact"
+    elif mutation == "empty": result.update(fms_base64="", size_bytes=0)
+    elif mutation == "large": monkeypatch.setattr(gate, "MAX_ARCHIVE", 3)
+    monkeypatch.setattr(gate, "post_json", lambda *args: result)
+    with pytest.raises(ValueError):
+        gate.export_archive(tmp_path)
+    assert not (tmp_path / "snapshot.fms").exists()
+
+
+def test_cold_incarnation_changes_but_scientific_content_must_not():
+    warm = {"runtime_stage_id": "stage-000", "request_scope_epoch": "old",
+            "outputs": [{"inspection_ref": {"content_digest": "sha256:pinned"},
+                         "payload_units": {"current": "A/m^2"}}]}
+    cold = {**warm, "request_scope_epoch": "fresh"}
+    gate.compare_cold_metadata(warm, cold)
+    altered = copy.deepcopy(cold)
+    altered["outputs"][0]["inspection_ref"]["content_digest"] = "sha256:other"
+    with pytest.raises(ValueError, match="identity"):
+        gate.compare_cold_metadata(warm, altered)
+    with pytest.raises(ValueError):
+        gate.compare_cold_metadata(warm, {**cold, "runtime_stage_id": "stage-001"})
+    with pytest.raises(ValueError):
+        gate.compare_cold_metadata({}, {})

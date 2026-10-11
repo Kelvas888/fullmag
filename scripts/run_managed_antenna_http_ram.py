@@ -2,11 +2,13 @@
 
 All application state remains in tmpfs. Host tools have their own immutable
 manifest; they are not attributed to the solver source capsule. No build or
-durable SessionStore qualification is performed.
+durable SessionStore qualification is performed. A fresh API process imports
+the bounded native archive before repeating the real HTTP checks.
 """
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -16,7 +18,7 @@ import subprocess
 import sys
 import time
 import uuid
-from urllib.request import ProxyHandler, build_opener
+from urllib.request import ProxyHandler, Request, build_opener
 
 PROFILE = "managed-antenna-http-ram-cpu"
 SCHEMA = "fullmag.managed-antenna-http-ram.v1"
@@ -27,6 +29,19 @@ TOOLS = (
 )
 ORIGIN = "http://127.0.0.1:8081"
 MAX_JSON = 4 << 20
+MAX_ARCHIVE = 16 << 20
+NONMAGNETIC_SHA = "e3ce550d020ca3e2c811b87f3686890a671b6bf592521a8af5ecfdff06986199"
+
+
+def fixture_contract(fixture="magnetic"):
+    import run_managed_antenna_ram as ram
+    files = dict(ram.FIXTURE_FILES)
+    if fixture == "nonmagnetic":
+        files.pop("fem_antenna_current_source_inspection.py")
+        files["fem_antenna_field_only_nonmagnetic.py"] = NONMAGNETIC_SHA
+    elif fixture != "magnetic":
+        raise ValueError("Unsupported antenna fixture")
+    return files
 
 
 def sha(path):
@@ -54,6 +69,41 @@ def get_json(path):
         if response.status != 200 or len(data) > MAX_JSON:
             raise ValueError("HTTP gate metadata response exceeds contract")
         return json.loads(data)
+
+
+def post_json(path, payload, limit=MAX_JSON):
+    body = json.dumps(payload).encode()
+    if len(body) > 2 * MAX_ARCHIVE:
+        raise ValueError("Archive request exceeds bounded gate support")
+    request = Request(ORIGIN + path, data=body,
+                      headers={"Content-Type": "application/json"}, method="POST")
+    with build_opener(ProxyHandler({})).open(request, timeout=120) as response:
+        raw = response.read(limit + 1)
+        if response.status != 200 or len(raw) > limit:
+            raise ValueError("Archive response exceeds bounded gate support")
+        return json.loads(raw)
+
+
+def export_archive(export):
+    response = post_json("/v2/sessions/current/persistence/exports",
+                         {"profile": "archive"}, 2 * MAX_ARCHIVE)
+    encoded = response.get("fms_base64")
+    if not isinstance(encoded, str) or len(encoded) > 2 * MAX_ARCHIVE:
+        raise ValueError("Missing or oversized native archive")
+    raw = base64.b64decode(encoded, validate=True)
+    if not raw or len(raw) > MAX_ARCHIVE or response.get("size_bytes") != len(raw) \
+            or response.get("profile") != "archive":
+        raise ValueError("Native archive size/profile differs")
+    (export / "snapshot.fms").write_bytes(raw)
+    return encoded, response["session_id"]
+
+
+def compare_cold_metadata(warm, cold):
+    # Revisions and request incarnation must change; scientific identity must not.
+    if not warm.get("outputs") or warm.get("runtime_stage_id") != "stage-000" \
+            or warm.get("runtime_stage_id") != cold.get("runtime_stage_id") \
+            or warm.get("outputs") != cold.get("outputs"):
+        raise ValueError("Cold archive changed canonical inspection identity")
 
 
 def wait_api(api, timeout=45):
@@ -113,6 +163,9 @@ def execute_in_container():
     expected = json.loads((tools / "manifest.json").read_text())
     check_tools(tools, expected["tools_sha256"])
     fixture_sha = expected["fixture_sha256"]
+    fixture_script = expected.get("fixture_script", "fem_antenna_current_source_inspection.py")
+    if fixture_script not in fixture_sha:
+        raise ValueError("Fixture script is absent from pinned inputs")
     for name, digest in fixture_sha.items():
         path = Path("/input") / name
         if path.is_symlink() or not path.is_file() or sha(path) != digest:
@@ -142,11 +195,12 @@ def execute_in_container():
             api = subprocess.Popen(["/package/bin/fullmag-api"], stdout=api_log,
                 stderr=subprocess.STDOUT)
             wait_api(api)
+            result["warm_api_pid"] = api.pid
             with (export / "solver.log").open("wb") as log:
                 solve = subprocess.run(["/package/bin/fullmag-bin",
-                    "/input/fem_antenna_current_source_inspection.py", "--headless",
+                    "/input/" + fixture_script, "--headless",
                     "--api-port", "8081", "--expect-script-sha256",
-                    fixture_sha["fem_antenna_current_source_inspection.py"],
+                    fixture_sha[fixture_script],
                     "--output-dir", "/ram/result.zarr"], stdout=log,
                     stderr=subprocess.STDOUT, timeout=300)
             result["solver_exit_code"] = solve.returncode
@@ -176,6 +230,42 @@ def execute_in_container():
                 native_canonical_bundle_redecoded=True,
                 canonical_decoder_owner="API load_published_antenna_external_lead_solution",
                 inspection_ref=metadata["outputs"][0]["inspection_ref"])
+            encoded, session_id = export_archive(export)
+            stop_owned(api)
+            api = None
+            # Original locations disappear before cold import. The archive is
+            # the only route back to stage artifacts; retained trees are evidence.
+            (workspace / ".fullmag").rename(Path("/ram/warm-state-retired"))
+            Path("/ram/result.zarr").rename(Path("/ram/warm-result.zarr"))
+            cold_root = Path("/ram/cold-state")
+            if cold_root.exists():
+                raise ValueError("Cold state root was not fresh")
+            cold_env = dict(os.environ, FULLMAG_STATE_ROOT=str(cold_root),
+                            FULLMAG_STATE_DIR="/ram/cold-user-state")
+            with (export / "cold-api.log").open("wb") as cold_log:
+                api = subprocess.Popen(["/package/bin/fullmag-api"], env=cold_env,
+                    stdout=cold_log, stderr=subprocess.STDOUT)
+                wait_api(api)
+                if api.pid == result["warm_api_pid"]:
+                    raise ValueError("Cold API process identity was reused")
+                result["cold_api_pid"] = api.pid
+                restored = post_json("/v2/sessions/current/persistence/imports",
+                    {"fms_base64": encoded, "restore_mode": "visualization_only"})
+                if restored.get("session_id") != session_id \
+                        or restored.get("restore_mode") != "visualization_only":
+                    raise ValueError("Cold imported session identity differs")
+                cold = get_json("/v2/sessions/current/data/antenna/stages/stage-000/external-lead-inspection")
+                compare_cold_metadata(metadata, cold)
+                (export / "cold-inspection-metadata.json").write_text(json.dumps(cold, sort_keys=True))
+                cold_export = export / "cold-http"
+                cold_export.mkdir()
+                result["cold_http_smokes"] = {name: smoke(name, "stage-000", cold_export)
+                    for name in ("smoke_antenna_external_lead_inspection.py",
+                                 "smoke_antenna_inspection_display.py")}
+                result.update(state="cold_http_pass", cold_archive_import="PASS",
+                    archive_sha256=sha(export / "snapshot.fms"),
+                    cold_process_state_root=str(cold_root), cold_solver_executed=False)
+
     except Exception as error:
         result["error"] = str(error)
     finally:
@@ -183,11 +273,13 @@ def execute_in_container():
             stop_owned(api)
         except Exception as error:
             result.update(state="failed", shutdown_error=str(error))
-        output = Path("/ram/result.zarr")
+        output = Path("/ram/warm-result.zarr")
+        if not output.is_dir():
+            output = Path("/ram/result.zarr")
         if output.is_dir():
             shutil.copytree(output, export / "result.zarr")
         (export / "gate-result.json").write_text(json.dumps(result, sort_keys=True))
-    return 0 if result["state"] == "warm_http_pass" else 1
+    return 0 if result["state"] == "cold_http_pass" else 1
 
 
 def http_spec(image, source, package, inputs, export, tools):
@@ -208,13 +300,18 @@ def resolved(repo, job, commit, source, native):
     return storage.resolve_layout(repo, PROFILE), build, context, built, capsule, package
 
 
-def start(repo, job, commit, source_digest, native_digest):
+def start(repo, job, commit, source_digest, native_digest, fixture="magnetic"):
     import fullmag_storage as storage
     import run_managed_antenna_ram as ram
     from run_managed_browser import docker
     layout, build, context, built, capsule, package = resolved(
         repo, job, commit, source_digest, native_digest)
-    fixtures = ram.fixture_paths(repo)
+    fixture_sha = fixture_contract(fixture)
+    fixtures = {name: storage.validate_path(repo / "examples" / name, repo) for name in fixture_sha}
+    for name, path in fixtures.items():
+        if storage.is_link(path) or not path.is_file() or sha(path) != fixture_sha[name]:
+            raise ValueError("Fixed scientific input differs: " + name)
+    fixture_script = next(name for name in fixture_sha if name.endswith(".py"))
     host_tools = repo / "scripts"
     tools_sha = tool_manifest(host_tools)
     image = json.loads(docker("image", "inspect", context["image_digest"]))[0]
@@ -231,13 +328,13 @@ def start(repo, job, commit, source_digest, native_digest):
         target = inputs / name
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, target)
-        if sha(target) != ram.FIXTURE_FILES[name]:
+        if sha(target) != fixture_sha[name]:
             raise ValueError("Fixture changed during staging")
     for name in TOOLS:
         shutil.copyfile(host_tools / name, tools / name)
     check_tools(tools, tools_sha)
     storage.atomic_json(tools / "manifest.json", {"tools_sha256": tools_sha,
-        "fixture_sha256": ram.FIXTURE_FILES, "solver_capsule_attribution": False})
+        "fixture_sha256": fixture_sha, "fixture_script": fixture_script, "solver_capsule_attribution": False})
     spec = http_spec(context["image_digest"], capsule / "tree", package, inputs, export, tools)
     storage.atomic_json(root / "compose.json", spec)
     project = "fullmag-antenna-http-ram-" + root.name
@@ -247,7 +344,7 @@ def start(repo, job, commit, source_digest, native_digest):
         "image_digest": context["image_digest"], "compose_project": project,
         "compose_sha256": sha(root / "compose.json"), "tools_sha256": tools_sha,
         "tool_manifest_sha256": sha(tools / "manifest.json"),
-        "fixture_sha256": ram.FIXTURE_FILES,
+        "fixture_sha256": fixture_sha, "fixture": fixture, "fixture_script": fixture_script,
         "build_receipt_sha256": sha(build / "artifacts/build-receipt.json"),
         "session_storage": "disposable_tmpfs", "qualification": "NOT VERIFIED",
         "physics_qualified": False, "durable_session_storage_qualified": False,
@@ -284,12 +381,13 @@ def observe(repo, root):
         native["head_commit_full"], receipt["source_digest"], native["source_snapshot_sha256"])
     tools, inputs = root / "tools", root / "input"
     check_tools(tools, receipt["tools_sha256"])
+    fixture_sha = fixture_contract(receipt.get("fixture", "magnetic"))
     manifest = read_json(tools / "manifest.json")
     if receipt["tool_manifest_sha256"] != sha(tools / "manifest.json") \
             or manifest != {"tools_sha256": receipt["tools_sha256"],
-                            "fixture_sha256": ram.FIXTURE_FILES, "solver_capsule_attribution": False}:
+                            "fixture_sha256": fixture_sha, "fixture_script": receipt["fixture_script"], "solver_capsule_attribution": False}:
         raise ValueError("Pinned host-tool manifest differs")
-    for name, expected in ram.FIXTURE_FILES.items():
+    for name, expected in fixture_sha.items():
         if sha(inputs / name) != expected or storage.is_link(inputs / name):
             raise ValueError("Pinned scientific input differs")
     spec = read_json(root / "compose.json")
@@ -297,7 +395,7 @@ def observe(repo, root):
                          inputs, root / "export", tools) \
             or receipt["native_source_identity"] != built["native_source_identity"] \
             or receipt["image_digest"] != context["image_digest"] \
-            or receipt["fixture_sha256"] != ram.FIXTURE_FILES \
+            or receipt["fixture_sha256"] != fixture_sha \
             or receipt["build_receipt_sha256"] != sha(build / "artifacts/build-receipt.json") \
             or receipt["compose_project"] != "fullmag-antenna-http-ram-" + root.name:
         raise ValueError("HTTP gate source/build/spec binding changed")
@@ -312,7 +410,7 @@ def observe(repo, root):
             raise ValueError("HTTP gate container failed; read retained logs")
         export = root / "export"
         result = read_json(export / "gate-result.json")
-        if result.get("schema") != SCHEMA or result.get("state") != "warm_http_pass" \
+        if result.get("schema") != SCHEMA or result.get("state") != "cold_http_pass" \
                 or result.get("solver_exit_code") != 0 \
                 or result.get("native_canonical_bundle_redecoded") is not True \
                 or result.get("physics_qualified") is not False \
@@ -320,15 +418,27 @@ def observe(repo, root):
                 or result.get("reuse_LLG_FFT_qualified") is not False \
                 or result.get("tool_manifest_sha256") != receipt["tool_manifest_sha256"]:
             raise ValueError("HTTP gate result is missing or promotes qualification")
-        for name in ("api.log", "solver.log"):
+        for name in ("api.log", "solver.log", "cold-api.log"):
             check_stamp((export / name).read_text(encoding="utf-8"), native["head_commit_full"],
                 native["source_snapshot_sha256"], dirty=native["source_snapshot_dirty"])
         if not (export / "result.zarr").is_dir() or storage.is_link(export / "result.zarr"):
             raise ValueError("Retained real solver output is absent")
-        receipt.update(state="warm_http_pass_resources_retained", startup_identity="PASS",
+        if result.get("cold_archive_import") != "PASS" or result.get("cold_solver_executed") is not False \
+                or result.get("cold_process_state_root") != "/ram/cold-state" \
+                or type(result.get("warm_api_pid")) is not int \
+                or type(result.get("cold_api_pid")) is not int \
+                or result["warm_api_pid"] <= 0 or result["cold_api_pid"] <= 0 \
+                or result["warm_api_pid"] == result["cold_api_pid"] \
+                or result.get("archive_sha256") != sha(export / "snapshot.fms"):
+            raise ValueError("Cold archive proof is missing")
+        compare_cold_metadata(read_json(export / "inspection-metadata.json"),
+                              read_json(export / "cold-inspection-metadata.json"))
+        receipt.update(state="cold_http_pass_resources_retained", startup_identity="PASS",
             gate_result_sha256=sha(export / "gate-result.json"),
             api_log_sha256=sha(export / "api.log"), solver_log_sha256=sha(export / "solver.log"),
-            native_canonical_bundle_redecoded=True, cold_archive_import="NOT VERIFIED")
+            native_canonical_bundle_redecoded=True, cold_archive_import="PASS",
+            cold_api_log_sha256=sha(export / "cold-api.log"),
+            archive_sha256=sha(export / "snapshot.fms"))
     except Exception as error:
         receipt["error"] = str(error)
         raise
@@ -344,6 +454,7 @@ if __name__ == "__main__":
     start_args = sub.add_parser("start")
     for flag in ("job-id", "commit", "source-digest", "native-snapshot-sha256"):
         start_args.add_argument("--" + flag, required=True)
+    start_args.add_argument("--fixture", choices=("magnetic", "nonmagnetic"), default="magnetic")
     sub.add_parser("observe").add_argument("--run-root", type=Path, required=True)
     sub.add_parser("execute")
     args = parser.parse_args()
@@ -353,6 +464,6 @@ if __name__ == "__main__":
         parser.error("host actions require --repo-root")
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     if args.action == "start":
-        start(args.repo_root, args.job_id, args.commit, args.source_digest, args.native_snapshot_sha256)
+        start(args.repo_root, args.job_id, args.commit, args.source_digest, args.native_snapshot_sha256, args.fixture)
     else:
         print(json.dumps(observe(args.repo_root, args.run_root)))
