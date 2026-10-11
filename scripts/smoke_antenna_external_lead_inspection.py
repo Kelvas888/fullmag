@@ -25,6 +25,17 @@ PAYLOADS = {
     "device_vertex_ids": ("device_vertex_ids.u64le.bin", "uint64_le", "authored_device_vertex_order", "1", 8),
     "device_potential": ("device_V.f64le.bin", "float64_le", "authored_device_vertex_order", "V", 8),
 }
+CURRENT_POLICY = {
+    "schema_version": "accepted_external_lead_current_display.ordered.v1",
+    "operator_version": "fem_accepted_external_lead_current_display.v1",
+    "current_evaluator_version": "fem_generic_affine_rt0.v1",
+    "sampling_policy": "cell_center_and_cell_local_vertices.v1",
+    "center_policy": "vertex_quarter_sum.long_double.v1",
+    "normalization": "raw_authored_current", "coordinate_unit": "m",
+    "current_density_unit": "A/m^2",
+}
+CURRENT_PAYLOAD = ("current_display.v1.bin", "ordered_binary_v1",
+                   "accepted_external_lead_current_display.ordered.v1", "A/m^2", 1)
 
 
 class SmokeError(ValueError):
@@ -94,12 +105,48 @@ def strong_etag(response: HttpResult) -> str:
 def json_body(response: HttpResult, status: int) -> dict:
     require(response.status == status, f"expected HTTP {status}, received {response.status}")
     require(response.headers.get("content-type", "").split(";", 1)[0] == "application/json", "expected JSON response")
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, "duplicate HTTP JSON key")
+            result[key] = value
+        return result
     try:
-        value = json.loads(response.body)
+        value = json.loads(response.body, object_pairs_hook=unique_object,
+                           parse_constant=lambda _: require(False, "non-finite HTTP JSON token"))
     except (UnicodeError, ValueError) as error:
         raise SmokeError("invalid JSON response") from error
     require(isinstance(value, dict), "expected JSON object")
     return value
+
+
+def validate_descriptor(descriptor, kind, spec):
+    path, scalar, layout, unit, width = spec
+    require(isinstance(descriptor, dict) and set(descriptor) == {
+        "path", "scalar_type", "layout", "unit", "value_count", "byte_count", "sha256"},
+        f"missing or invalid {kind} descriptor")
+    require(all(descriptor.get(key) == value for key, value in {
+        "path": path, "scalar_type": scalar, "layout": layout, "unit": unit}.items()),
+        f"invalid {kind} path/type/layout/unit")
+    count, size = descriptor.get("value_count"), descriptor.get("byte_count")
+    require(type(count) is int and count > 0 and type(size) is int
+            and 0 < size <= MAX_BINARY_BYTES and size == count * width,
+            f"invalid {kind} count/size")
+    require(isinstance(descriptor.get("sha256"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", descriptor["sha256"]) is not None,
+            f"invalid {kind} SHA")
+
+
+def validate_current_receipt(receipt):
+    require(isinstance(receipt, dict) and set(receipt) == set(CURRENT_POLICY) | {"cell_count", "payload"},
+            "invalid current display receipt shape")
+    require(all(receipt.get(key) == value for key, value in CURRENT_POLICY.items()),
+            "invalid current display policy/SI")
+    count = receipt["cell_count"]
+    require(type(count) is int and 0 < count <= MAX_BINARY_BYTES // 1501,
+            "invalid current display cell count")
+    validate_descriptor(receipt["payload"], "current_snapshot", CURRENT_PAYLOAD)
+    require(count * 1501 < receipt["payload"]["byte_count"], "current snapshot framing/count mismatch")
 
 
 def validate_resource(resource: dict, stage_id: str) -> tuple[dict, str]:
@@ -110,13 +157,17 @@ def validate_resource(resource: dict, stage_id: str) -> tuple[dict, str]:
                 and len(resource[key]) <= 4096 and "\0" not in resource[key], f"missing or invalid {key}")
     require(isinstance(resource.get("record_content_digest"), str) and re.fullmatch(r"sha256:[0-9a-f]{64}", resource["record_content_digest"]) is not None, "invalid record digest")
     require(type(resource.get("stage_revision")) is int and resource["stage_revision"] >= 0, "invalid stage revision")
+    require(isinstance(resource.get("schema_version"), str), "invalid inspection schema_version type")
+    generation = {"antenna_external_lead_stage_output.v1": 1,
+                  "antenna_external_lead_stage_output.v2": 2}.get(resource.get("schema_version"))
+    require(generation is not None, "unexpected inspection schema_version")
     for key, expected in {
-        "schema_version": "antenna_external_lead_stage_output.v1", "stage_kind": "antenna_field_solve",
+        "stage_kind": "antenna_field_solve",
         "resolved_action": "external_lead_inspection", "status": "inspection_only",
         "qualification": "NOT VERIFIED", "field_scope": "external_electrode_truncation",
     }.items():
         require(resource.get(key) == expected, f"unexpected inspection {key}")
-    require(not any(key in resource for key in ("asset_id", "solution_ref", "quantity", "ready", "H_per_A")), "inspection was promoted to a field basis")
+    require(not any(key in resource for key in ("asset_id", "solution_ref", "quantity", "ready", "H_per_A", "capabilities", "device_current")), "inspection was promoted to a field basis")
     outputs = resource.get("outputs")
     require(isinstance(outputs, list) and len(outputs) == 1 and isinstance(outputs[0], dict), "expected one inspection output")
     output = outputs[0]
@@ -127,21 +178,25 @@ def validate_resource(resource: dict, stage_id: str) -> tuple[dict, str]:
     require(reference.get("stage_id") == resource["stage_id"] and reference.get("output_id") == resource["output_id"], "authored output identity mismatch")
     digest = reference.get("content_digest")
     require(isinstance(digest, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is not None, "invalid inspection digest")
-    require(output["manifest_ref"] == f"antenna/external_lead_solutions/{resource['output_id']}/{digest[7:]}/manifest.v1.json", "invalid inspection manifest reference")
-    require(output["payload_units"] == {"V": "V", "RT0_coefficients": "A", "H": "A/m", "positions": "m"}, "invalid inspection payload units")
+    require(output["manifest_ref"] == f"antenna/external_lead_solutions/{resource['output_id']}/{digest[7:]}/manifest.v{generation}.json", "invalid inspection manifest reference")
+    units = {"V": "V", "RT0_coefficients": "A", "H": "A/m", "positions": "m"}
+    if generation == 2:
+        units["J_charge"] = "A/m^2"
+    require(output["payload_units"] == units, "invalid inspection payload units")
     manifest = resource.get("manifest")
     require(isinstance(manifest, dict), "missing inspection manifest")
-    require(manifest.get("schema_version") == "antenna_external_lead_solution.v1" and manifest.get("validation_scope") == "manifest_only", "invalid manifest validation scope")
+    require(manifest.get("schema_version") == f"antenna_external_lead_solution.v{generation}" and manifest.get("validation_scope") == "manifest_only", "invalid manifest validation scope/generation")
+    require("capabilities" not in manifest and "device_current" not in manifest,
+            "manifest-only metadata cannot declare display availability")
+    if generation == 2:
+        validate_current_receipt(manifest.get("current_display"))
+    else:
+        require("current_display" not in manifest, "legacy manifest cannot declare current snapshot")
     require(manifest.get("content_digest") == digest, "manifest reference digest mismatch")
     sampling = manifest.get("sampling_carrier")
     require(isinstance(sampling, dict) and type(sampling.get("sample_count")) is int and 1 <= sampling["sample_count"] <= 1_000_000, "invalid sample count")
-    for kind, (path, scalar, layout, unit, width) in PAYLOADS.items():
-        descriptor = manifest.get(kind)
-        require(isinstance(descriptor, dict), f"missing {kind} descriptor")
-        require(all(descriptor.get(key) == value for key, value in {"path": path, "scalar_type": scalar, "layout": layout, "unit": unit}.items()), f"invalid {kind} path/type/layout/unit")
-        count, size = descriptor.get("value_count"), descriptor.get("byte_count")
-        require(type(count) is int and count > 0 and type(size) is int and 0 < size <= MAX_BINARY_BYTES and size == count * width, f"invalid {kind} count/size")
-        require(isinstance(descriptor.get("sha256"), str) and re.fullmatch(r"[0-9a-f]{64}", descriptor["sha256"]) is not None, f"invalid {kind} SHA")
+    for kind, spec in PAYLOADS.items():
+        validate_descriptor(manifest.get(kind), kind, spec)
     require(manifest["sample_positions"]["value_count"] == manifest["magnetic_field"]["value_count"] == 3 * sampling["sample_count"], "xyz/sample count mismatch")
     require(manifest["device_vertex_ids"]["value_count"] == manifest["device_potential"]["value_count"], "device ID/potential count mismatch")
     return manifest, digest
@@ -155,6 +210,33 @@ def session_scope(resource: dict, request_scope_epoch: str) -> str:
     ))
 
 
+def verify_binary(origin, path, scope_headers, kind, descriptor, *, fetch=None):
+    """Check one immutable binary resource, including its cache/range contract."""
+    fetch = request if fetch is None else fetch
+    response = fetch(origin, path, scope_headers, descriptor["byte_count"])
+    require(response.status == 200, f"{kind}: expected HTTP 200, received {response.status}")
+    require(response.headers.get("content-type") == "application/octet-stream" and response.headers.get("accept-ranges") == "bytes", f"{kind}: invalid binary headers")
+    etag = strong_etag(response)
+    require(len(response.body) == descriptor["byte_count"], f"{kind}: byte count mismatch")
+    require(sha256(response.body).hexdigest() == descriptor["sha256"], f"{kind}: SHA mismatch")
+    if descriptor["scalar_type"] == "float64_le":
+        require(all(math.isfinite(value) for (value,) in struct.iter_unpack("<d", response.body)), f"{kind}: non-finite float")
+    cached = fetch(origin, path, {**scope_headers, "If-None-Match": etag}, MAX_METADATA_BYTES)
+    require(cached.status == 304 and not cached.body and strong_etag(cached) == etag, f"{kind}: invalid conditional response")
+    end = min(15, len(response.body) - 1)
+    partial = fetch(origin, path, {**scope_headers, "Range": f"bytes=0-{end}"}, MAX_METADATA_BYTES)
+    require(partial.status == 206 and partial.body == response.body[:end + 1]
+            and partial.headers.get("content-type") == "application/octet-stream"
+            and partial.headers.get("accept-ranges") == "bytes"
+            and partial.headers.get("content-range") == f"bytes 0-{end}/{len(response.body)}"
+            and strong_etag(partial) == etag, f"{kind}: invalid partial response")
+    outside = fetch(origin, path, {**scope_headers, "Range": f"bytes={len(response.body)}-"}, MAX_METADATA_BYTES)
+    require(outside.status == 416 and not outside.body and outside.headers.get("accept-ranges") == "bytes"
+            and outside.headers.get("content-range") == f"bytes */{len(response.body)}"
+            and strong_etag(outside) == etag, f"{kind}: invalid unsatisfiable range")
+    return response.body, etag
+
+
 def verify(origin: str, stage_id: str) -> dict[str, object]:
     origin = validate_origin(origin)
     require(bool(stage_id.strip()) and len(stage_id) <= 4096 and "\0" not in stage_id, "invalid runtime stage ID")
@@ -165,31 +247,26 @@ def verify(origin: str, stage_id: str) -> dict[str, object]:
     manifest, digest = validate_resource(resource, stage_id)
     scope_headers = {"x-fullmag-session-scope": session_scope(resource, resource["request_scope_epoch"])}
     checked = []
-    for kind in PAYLOADS:
-        descriptor = manifest[kind]
+    descriptors = {kind: manifest[kind] for kind in PAYLOADS}
+    if "current_display" in manifest:
+        descriptors["current_snapshot"] = manifest["current_display"]["payload"]
+        import antenna_rt0_fixture_check as framing
+        require(all(descriptors[kind]["byte_count"] <= framing.LIMIT for kind in ("bundle", "current_snapshot")),
+                "current snapshot/bundle exceeds bounded fixture decode support")
+    retained = {}
+    for kind, descriptor in descriptors.items():
         binary = f"{path}/payloads/{kind}?{urlencode({'content_digest': digest})}"
-        response = request(origin, binary, scope_headers, descriptor["byte_count"])
-        require(response.status == 200, f"{kind}: expected HTTP 200, received {response.status}")
-        require(response.headers.get("content-type") == "application/octet-stream" and response.headers.get("accept-ranges") == "bytes", f"{kind}: invalid binary headers")
-        etag = strong_etag(response)
-        require(len(response.body) == descriptor["byte_count"], f"{kind}: byte count mismatch")
-        require(sha256(response.body).hexdigest() == descriptor["sha256"], f"{kind}: SHA mismatch")
-        if descriptor["scalar_type"] == "float64_le":
-            require(all(math.isfinite(value) for (value,) in struct.iter_unpack("<d", response.body)), f"{kind}: non-finite float")
-        cached = request(origin, binary, {**scope_headers, "If-None-Match": etag}, MAX_METADATA_BYTES)
-        require(cached.status == 304 and not cached.body and strong_etag(cached) == etag, f"{kind}: invalid conditional response")
-        end = min(15, len(response.body) - 1)
-        partial = request(origin, binary, {**scope_headers, "Range": f"bytes=0-{end}"}, MAX_METADATA_BYTES)
-        require(partial.status == 206 and partial.body == response.body[:end + 1]
-                and partial.headers.get("content-type") == "application/octet-stream"
-                and partial.headers.get("accept-ranges") == "bytes"
-                and partial.headers.get("content-range") == f"bytes 0-{end}/{len(response.body)}"
-                and strong_etag(partial) == etag, f"{kind}: invalid partial response")
-        outside = request(origin, binary, {**scope_headers, "Range": f"bytes={len(response.body)}-"}, MAX_METADATA_BYTES)
-        require(outside.status == 416 and not outside.body and outside.headers.get("accept-ranges") == "bytes"
-                and outside.headers.get("content-range") == f"bytes */{len(response.body)}"
-                and strong_etag(outside) == etag, f"{kind}: invalid unsatisfiable range")
-        checked.append({"kind": kind, "sha256": descriptor["sha256"], "byte_count": len(response.body), "unit": descriptor["unit"], "etag": etag})
+        body, etag = verify_binary(origin, binary, scope_headers, kind, descriptor)
+        if "current_snapshot" in descriptors and kind in ("bundle", "current_snapshot"):
+            retained[kind] = body
+        checked.append({"kind": kind, "sha256": descriptor["sha256"], "byte_count": len(body), "unit": descriptor["unit"], "etag": etag})
+    if retained:
+        from antenna_current_display_fixture_check import decode_current_snapshot
+        try:
+            decode_current_snapshot(retained["current_snapshot"], bundle_bytes=retained["bundle"],
+                                    receipt=manifest["current_display"])
+        except (ValueError, UnicodeError) as error:
+            raise SmokeError("invalid bounded current snapshot/bundle association") from error
     field_path = f"{path}/payloads/magnetic_field"
     json_body(request(origin, field_path, {**scope_headers, "If-None-Match": "*"}, MAX_METADATA_BYTES), 400)
     changed_digest = "sha256:" + ("0" if digest[7] != "0" else "1") + digest[8:]
@@ -209,6 +286,8 @@ def verify(origin: str, stage_id: str) -> dict[str, object]:
         f"{antenna_path}/source-spectra/scope-probe/payloads/power",
         path, f"{field_path}?{urlencode({'content_digest': digest})}",
     ]
+    if "current_snapshot" in descriptors:
+        scope_paths.append(f"{path}/payloads/current_snapshot?{urlencode({'content_digest': digest})}")
     for scope_path in scope_paths:
         rejected = json_body(request(origin, scope_path, stale_headers, MAX_METADATA_BYTES), 409)
         require(rejected.get("error") == "request_context_stale", "missing stale request incarnation gate")
@@ -219,6 +298,7 @@ def verify(origin: str, stage_id: str) -> dict[str, object]:
         "scope": "http_inspection_integrity_only", "qualification": "NOT VERIFIED", "physics_qualified": False,
         **{key: resource[key] for key in ("session_id", "session_epoch", "request_scope_epoch", "run_id", "runtime_stage_id", "stage_revision", "record_content_digest")},
         "stale_scope_routes_checked": len(scope_paths),
+        "current_snapshot_decoded": bool(retained), "native_canonical_bundle_redecoded": False,
         "inspection_ref": resource["outputs"][0]["inspection_ref"], "metadata_etag": metadata_etag, "payloads": checked,
     }
 

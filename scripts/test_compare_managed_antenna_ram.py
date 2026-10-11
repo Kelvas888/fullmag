@@ -1,4 +1,5 @@
 """Interpreted comparison orchestration checks, not native qualification."""
+import json
 from pathlib import Path
 
 import pytest
@@ -122,3 +123,69 @@ def test_bundle_observable_mismatch_is_not_success(tmp_path, monkeypatch):
     monkeypatch.setattr(comparison, "compare_bundle_observables", reject)
     with pytest.raises(ValueError, match="observable association"):
         comparison.compare(tmp_path, root)
+
+
+@pytest.mark.parametrize("reject_current", [False, True])
+def test_v2_checks_J_before_reporting_any_scientific_success(tmp_path, monkeypatch, reject_current):
+    root = prepared_comparison(tmp_path, monkeypatch)
+    legacy_reader = comparison.read_inspection
+    monkeypatch.setattr(comparison, "read_inspection", lambda *args: {
+        **legacy_reader(*args), "current_display_bytes": b"snapshot", "current_display_receipt": {},
+        "current_display_sha256": "9" * 64})
+    calls = []
+    def current(inputs, values):
+        assert inputs == {"exact_reconstructed_input": True}
+        assert values["current_display_bytes"] == b"snapshot"
+        calls.append("J")
+        if reject_current:
+            raise ValueError("I/A vector mismatch")
+        return {"comparison": "PASS", "physics_qualified": False}
+    def oracle(*args, **kwargs):
+        assert calls == ["J"]
+        return {"physics_qualified": False}
+    monkeypatch.setattr(comparison, "compare_current_display_fixture", current)
+    monkeypatch.setattr(comparison, "compare_fixture", oracle)
+    if reject_current:
+        with pytest.raises(ValueError, match="I/A"):
+            comparison.compare(tmp_path, root)
+    else:
+        result = comparison.compare(tmp_path, root)
+        assert result["schema"] == "fullmag.antenna-ram-V-J-H-comparison.v2"
+        assert result["current_display_comparison"]["comparison"] == "PASS"
+        assert result["current_display_sha256"] == "9" * 64
+        assert result["physics_qualified"] is False and result["reuse_LLG_FFT_qualified"] is False
+
+
+def test_cli_retains_report_only_after_success(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "runs" / ("1" * 32)
+    (root / "export").mkdir(parents=True)
+    monkeypatch.setattr(comparison.launcher.storage, "resolve_layout", lambda *args: {
+        "build_root": str(tmp_path)})
+    result = {"comparison": "PASS", "physics_qualified": False,
+              "native_canonical_bundle_redecoded": False}
+    monkeypatch.setattr(comparison, "compare", lambda *args: dict(result))
+    reported = comparison.main([
+        "--repo-root", str(tmp_path), "--run-root", str(root), "--write-report"])
+    retained = json.loads((root / "export/V-J-H-comparison.json").read_text())
+    assert retained == reported == json.loads(capsys.readouterr().out)
+    assert retained["comparison_sources_sha256"] == comparison.comparison_sources_sha256()
+    assert retained["physics_qualified"] is False
+    assert retained["native_canonical_bundle_redecoded"] is False
+
+
+@pytest.mark.parametrize("source_change", [False, True])
+def test_cli_does_not_publish_failed_or_changed_comparison(tmp_path, monkeypatch, source_change):
+    root = tmp_path / "runs" / ("1" * 32)
+    root.mkdir(parents=True)
+    def execute(*args):
+        if not source_change:
+            raise ValueError("field mismatch")
+        return {"comparison": "PASS"}
+    monkeypatch.setattr(comparison, "compare", execute)
+    if source_change:
+        pins = iter([{"reader": "a" * 64}, {"reader": "b" * 64}])
+        monkeypatch.setattr(comparison, "comparison_sources_sha256", lambda: next(pins))
+    with pytest.raises(ValueError, match="sources changed" if source_change else "field mismatch"):
+        comparison.main([
+            "--repo-root", str(tmp_path), "--run-root", str(root), "--write-report"])
+    assert not (root / "export/V-J-H-comparison.json").exists()

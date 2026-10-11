@@ -1,5 +1,37 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Odbiór narzędzi porównania V/J/H — 2026-10-11:**
+Hostowy reader rozdziela exact export v1/v2, w tym manifest, jednostki,
+receipt i payload snapshotu J. Legacy v1 pozostaje bez J; mieszane generacje,
+złe hashe, dodatkowe pliki i błędne liczności są odrzucane.
+`scripts/antenna_current_display_fixture_check.py::decode_current_snapshot`
+wiąże bounded snapshot z retained bundle/charge/source, whole-mesh Tet4,
+stable IDs i bitami XYZ. Nie rekonstruuje ani nie uśrednia native J.
+`compare_current_display_fixture` sprawdza niezależny stały model:
+12 środków, 48 cell-local traces, J=I/A, affine consistency oraz
+48 device face moments i bilanse elementów. Tolerancje i ograniczenia:
+nota 0950, `DOC-ANCHOR:antenna-current-source-fixture-current-display-check`.
+Comparator RAM wykonuje te kontrole przed V/H dla v2 i zachowuje v1.
+HTTP smokes weryfikują v1/v2, scope/revision/digest, SI, ETag, Range,
+snapshot oraz bitową zgodność czterech carrierów J z zachowanymi próbkami.
+Liczniki vertices/elements są admitted przed iteracją; regresje obejmują
+zero i maksymalne u64 także po ponownym obliczeniu hashy/pinów.
+Wykonane interpretowane dowody: reader/snapshot/comparator **73 PASS**;
+istniejące RT0/oracle/RAM launcher **63 PASS + 12 subtestów**;
+HTTP smokes **74 PASS + 49 subtestów**. Focused scientific validator exit 0.
+Niezależny review snapshotu/oracle nie wykazał Blocker/Required;
+Required count admission z review HTTP poprawiono i przetestowano.
+To syntetyczne testy readerów i transportu oraz prywatny fixed-fixture oracle,
+nie dowód native solve, canonical re-decode, rzeczywistego endpointu ani fizyki.
+Nie kompilowano testów jednostkowych. Nowe narzędzia powstały po capture
+buildu nr 41; nie zmieniają jego zamrożonych źródeł ani pakietu.
+Odczyt API tego samego joba `1128d9f468ee4b0981387a8cdf448451` nadal
+zwraca `running`, exit code null. Nie wykonano kolejnego submit ani RAM runu.
+Następny krok: terminalny receipt i integralność pakietu nr 41 → uzgodniony
+`run-managed-antenna-ram` → rzeczywiste porównanie V/J/H → odbiór
+publikacji/cold-load/HTTP. Obwód, per-A, FFT, LLG i T00–T18 pozostają otwarte.
+Workspace 3197 i jego sesja nie zostały zmienione.
+
 **Zapis etapu i build integracyjny — 2026-10-11:**
 Spójny przyrost producent/ABI2 → Rust decoder/archive v2 → typed API →
 wspólny Inspector/renderer raw J zapisano jako

@@ -1,4 +1,4 @@
-"""Compare one verified RAM inspection export with V/H and RT0 fixture checks.
+"""Compare a verified RAM export with V/H, RT0 and optional native J checks.
 
 Read-only scientific support, not a solver, canonical bundle decoder, complete
 input-pin reimplementation, or qualification of reusable LLG/FFT drive fields.
@@ -17,6 +17,7 @@ from antenna_current_source_oracle import (
 )
 from antenna_inspection_export import RECORD, parse, read_inspection
 from antenna_rt0_fixture_check import compare_rt0_fixture, compare_bundle_observables
+from antenna_current_display_fixture_check import compare_current_display_fixture
 
 TOLERANCES = {"voltage_tolerance_v": 1e-8, "field_absolute_tolerance_apm": 1e-8,
               "field_relative_tolerance": 1e-6}
@@ -75,10 +76,13 @@ def compare(repo, root):
     values = read_inspection(artifact_root, stage)
     rt0 = compare_rt0_fixture(inputs, values["bundle_bytes"])
     association = compare_bundle_observables(inputs, values)
+    current = (compare_current_display_fixture(inputs, values)
+               if values.get("current_display_bytes") is not None else None)
     measured = compare_fixture(inputs, values["device_ids"], values["potential_v"],
         values["positions_m"], values["field_apm"], **TOLERANCES)
-    return {"schema": "fullmag.antenna-ram-V-H-comparison.v1", "comparison": "PASS",
-        "opis": "Porównanie V/H i geometrycznych momentów RT0 jednego przypiętego modelu; wejście odtworzone z dokładnego skryptu i Python DSL kapsuły. Wagi DOF są zachowane z native, nie certyfikowane niezależnie. Nie jest to dump wykonanego IR ani pełna kwalifikacja fizyki.",
+    return {"schema": ("fullmag.antenna-ram-V-J-H-comparison.v2" if current is not None
+                       else "fullmag.antenna-ram-V-H-comparison.v1"), "comparison": "PASS",
+        "opis": "Porównanie V/H, geometrycznych momentów RT0 i, dla eksportu v2, zachowanych próbek J jednego przypiętego modelu; wejście odtworzone z dokładnego skryptu i Python DSL kapsuły. Wagi DOF są zachowane z native, nie certyfikowane niezależnie. Nie jest to dump wykonanego IR ani pełna kwalifikacja fizyki.",
         "run_root": str(root), "managed_job_id": receipt["managed_job_id"],
         "native_source_identity": native, "source_digest": receipt["source_digest"],
         "build_receipt_sha256": receipt["build_receipt_sha256"],
@@ -86,6 +90,8 @@ def compare(repo, root):
         "input_reconstruction": "pinned_script_with_executed_capsule_DSL",
         "tolerances": dict(TOLERANCES), "oracle": measured, "rt0_fixture": rt0,
         "bundle_observable_association": association,
+        "current_display_comparison": current,
+        "current_display_sha256": values.get("current_display_sha256"),
         **{key: values[key] for key in ("manifest_content_digest", "manifest_sha256",
             "record_sha256", "bundle_sha256", "device_ids", "potential_v", "positions_m", "field_apm")},
         "native_input_pins_recomputed": False, "native_canonical_bundle_redecoded": False,
@@ -93,9 +99,34 @@ def compare(repo, root):
         "reuse_LLG_FFT_qualified": False, "qualification": "NOT VERIFIED"}
 
 
-if __name__ == "__main__":
+def comparison_sources_sha256():
+    return {name: launcher.digest(Path(__file__).with_name(name)) for name in (
+        "compare_managed_antenna_ram.py", "antenna_inspection_export.py",
+        "antenna_rt0_fixture_check.py", "antenna_current_display_fixture_check.py",
+        "antenna_current_source_oracle.py",
+    )}
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", required=True, type=Path)
     parser.add_argument("--run-root", required=True, type=Path)
-    args = parser.parse_args()
-    print(json.dumps(compare(args.repo_root, args.run_root), ensure_ascii=False, allow_nan=False))
+    parser.add_argument("--write-report", action="store_true",
+                        help="Retain the successful comparison in this run's export directory")
+    args = parser.parse_args(argv)
+    sources = comparison_sources_sha256() if args.write_report else None
+    result = compare(args.repo_root, args.run_root)
+    if args.write_report:
+        if comparison_sources_sha256() != sources:
+            raise ValueError("Comparison sources changed during report generation")
+        layout = launcher.storage.resolve_layout(args.repo_root, launcher.PROFILE)
+        root = launcher.storage.validate_path(args.run_root, Path(layout["build_root"]) / "runs")
+        report = launcher.storage.validate_path(root / "export/V-J-H-comparison.json", root)
+        result["comparison_sources_sha256"] = sources
+        launcher.storage.atomic_json(report, result)
+    print(json.dumps(result, ensure_ascii=False, allow_nan=False))
+    return result
+
+
+if __name__ == "__main__":
+    main()

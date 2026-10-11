@@ -14,6 +14,7 @@ import struct
 from pathlib import Path
 
 import fullmag_storage as storage
+from antenna_current_display_fixture_check import validate_current_receipt
 
 RECORD = "antenna_external_lead_stage_output.v1.json"
 PAYLOADS = {
@@ -86,7 +87,11 @@ def read_inspection(artifact_root, stage_record):
         raise ValueError("Exact inspection stage record required")
     record_bytes = bounded_bytes(record_path, root, 1 << 20)
     record = parse(record_bytes)
-    expected = {"schema_version": "antenna_external_lead_stage_output.v1",
+    generation = {"antenna_external_lead_stage_output.v1": 1,
+                  "antenna_external_lead_stage_output.v2": 2}.get(record.get("schema_version"))
+    if generation is None:
+        raise ValueError("Unknown inspection stage generation")
+    expected = {"schema_version": f"antenna_external_lead_stage_output.v{generation}",
         "stage_kind": "antenna_field_solve", "resolved_action": "external_lead_inspection",
         "stage_id": "inspect_antenna", "port_mode_id": "port", "output_id": "inspection",
         "status": "inspection_only", "qualification": "NOT VERIFIED",
@@ -97,20 +102,23 @@ def read_inspection(artifact_root, stage_record):
     output = record["outputs"][0]
     reference = output.get("inspection_ref", {})
     revision = reference.get("content_digest", "")
+    units = {"V": "V", "RT0_coefficients": "A", "H": "A/m", "positions": "m"}
+    if generation == 2:
+        units["J_charge"] = "A/m^2"
     if output.get("kind") != "antenna_external_lead_inspection" \
             or reference.get("stage_id") != "inspect_antenna" \
             or reference.get("output_id") != "inspection" \
             or not re.fullmatch(r"sha256:[0-9a-f]{64}", revision) \
-            or output.get("payload_units") != {"V": "V", "RT0_coefficients": "A", "H": "A/m", "positions": "m"}:
+            or output.get("payload_units") != units:
         raise ValueError("Inspection output reference/units differ")
-    manifest_ref = f"antenna/external_lead_solutions/inspection/{revision[7:]}/manifest.v1.json"
+    manifest_ref = f"antenna/external_lead_solutions/inspection/{revision[7:]}/manifest.v{generation}.json"
     if output.get("manifest_ref") != manifest_ref:
         raise ValueError("Inspection manifest path differs from exact revision")
     manifest_path = root / manifest_ref
     manifest_bytes = bounded_bytes(manifest_path, root, 1 << 20)
     manifest = parse(manifest_bytes)
     if manifest_digest(manifest_bytes) != revision or manifest.get("content_digest") != revision \
-            or manifest.get("schema_version") != "antenna_external_lead_solution.v1" \
+            or manifest.get("schema_version") != f"antenna_external_lead_solution.v{generation}" \
             or any(manifest.get(k) != expected[k] for k in (
                 "stage_id", "port_mode_id", "output_id", "status", "qualification", "field_scope")) \
             or manifest.get("source_object_id") != "antenna" \
@@ -128,9 +136,14 @@ def read_inspection(artifact_root, stage_record):
             or manifest["sampling_carrier"]["sample_count"] != 4:
         raise ValueError("Inspection sampling cardinality differs")
     revision_root = manifest_path.parent
-    if {p.name for p in revision_root.iterdir()} != {"manifest.v1.json"} | {
-            row[0] for row in PAYLOADS.values()}:
-        raise ValueError("Inspection revision must contain exactly six files")
+    expected_files = {f"manifest.v{generation}.json"} | {row[0] for row in PAYLOADS.values()}
+    if generation == 2:
+        expected_files.add("current_display.v1.bin")
+    elif "current_display" in manifest:
+        raise ValueError("Legacy inspection must not contain a current receipt")
+    if {p.name for p in revision_root.iterdir()} != expected_files:
+        raise ValueError("Inspection revision must contain exactly " +
+                         ("six files" if generation == 1 else "seven files"))
     payloads = {}
     for key, (name, scalar, layout, unit, count) in PAYLOADS.items():
         descriptor = manifest.get(key, {})
@@ -146,6 +159,12 @@ def read_inspection(artifact_root, stage_record):
                 or len(data) != expected_count * width or descriptor.get("sha256") != sha256(data):
             raise ValueError("Inspection payload hash/size/cardinality differs")
         payloads[key] = data
+    current = None
+    if generation == 2:
+        current = bounded_bytes(revision_root / "current_display.v1.bin", root, 2 << 20)
+        validate_current_receipt(manifest.get("current_display"), current)
+        if manifest["current_display"]["cell_count"] != 12:
+            raise ValueError("Fixed-fixture current cell cardinality differs")
     def doubles(key):
         data = payloads[key]
         return list(struct.unpack("<" + "d" * (len(data) // 8), data))
@@ -159,5 +178,8 @@ def read_inspection(artifact_root, stage_record):
         "manifest_content_digest": revision, "bundle_bytes": payloads["bundle"],
         "nested_content_sha256": {name: manifest.get(name + "_content_sha256")
                                   for name in ("charge", "source", "field")},
+        "inspection_generation": generation,
+        "current_display_bytes": current, "current_display_receipt": manifest.get("current_display"),
+        "current_display_sha256": sha256(current) if current is not None else None,
         "native_canonical_bundle_redecoded": False,
         "physics_qualified": False, "qualification": "NOT VERIFIED"}

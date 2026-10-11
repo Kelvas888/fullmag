@@ -232,6 +232,54 @@ class InspectionHttpSmokeTests(unittest.TestCase):
                 self.assertEqual(len(self.calls), 1)
             self.resource = original
 
+    def test_current_v2_generation_receipt_and_manifest_only_gates_precede_io(self) -> None:
+        for mutation in ["stage", "manifest", "path", "units", "missing", "policy", "count",
+                         "bool_count", "snapshot_sha", "snapshot_path", "snapshot_count",
+                         "extra_samples", "metadata_capability", "manifest_capability"]:
+            original = copy.deepcopy(self.resource)
+            with self.subTest(mutation=mutation):
+                resource = self.resource
+                resource["schema_version"] = "antenna_external_lead_stage_output.v2"
+                manifest = resource["manifest"]
+                manifest["schema_version"] = "antenna_external_lead_solution.v2"
+                output = resource["outputs"][0]
+                output["manifest_ref"] = output["manifest_ref"].replace("manifest.v1.json", "manifest.v2.json")
+                output["payload_units"]["J_charge"] = "A/m^2"
+                receipt = {**smoke.CURRENT_POLICY, "cell_count": 1, "payload": {
+                    "path": "current_display.v1.bin", "scalar_type": "ordered_binary_v1",
+                    "layout": "accepted_external_lead_current_display.ordered.v1", "unit": "A/m^2",
+                    "value_count": 2000, "byte_count": 2000, "sha256": "0" * 64}}
+                manifest["current_display"] = receipt
+                if mutation == "stage": resource["schema_version"] = "antenna_external_lead_stage_output.v1"
+                elif mutation == "manifest": manifest["schema_version"] = "antenna_external_lead_solution.v1"
+                elif mutation == "path": output["manifest_ref"] = output["manifest_ref"].replace("manifest.v2.json", "manifest.v1.json")
+                elif mutation == "units": output["payload_units"]["J_charge"] = "A"
+                elif mutation == "missing": manifest.pop("current_display")
+                elif mutation == "policy": receipt["center_policy"] = "recomputed_node_average"
+                elif mutation == "count": receipt["cell_count"] = 2
+                elif mutation == "bool_count": receipt["cell_count"] = True
+                elif mutation == "snapshot_sha": receipt["payload"]["sha256"] = "Z" * 64
+                elif mutation == "snapshot_path": receipt["payload"]["path"] = "../current.bin"
+                elif mutation == "snapshot_count": receipt["payload"]["value_count"] = 1999
+                elif mutation == "extra_samples": receipt["center_j"] = [1, 2, 3]
+                elif mutation == "metadata_capability": resource["capabilities"] = {"current_density": True}
+                else: manifest["capabilities"] = {"current_density": True}
+                self.calls.clear()
+                with self.assertRaises(smoke.SmokeError): self.run_smoke()
+                self.assertEqual(len(self.calls), 1)
+            self.resource = original
+
+    def test_legacy_manifest_cannot_acquire_a_current_snapshot(self) -> None:
+        self.resource["manifest"]["current_display"] = None
+        with self.assertRaisesRegex(smoke.SmokeError, "legacy manifest"):
+            self.run_smoke()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_http_json_rejects_duplicate_keys_and_nonfinite_tokens(self) -> None:
+        for body in (b'{"revision":1,"revision":2}', b'{"value":NaN}', b'{"value":Infinity}'):
+            with self.subTest(body=body), self.assertRaises(smoke.SmokeError):
+                smoke.json_body(self.response(200, body, **{"content-type": "application/json"}), 200)
+
     def test_etag_must_be_one_strong_opaque_tag(self) -> None:
         for tag in ['W/"abc"', '"a", "b"', '"white space"', '"line\nbreak"']:
             with self.subTest(tag=tag), self.assertRaises(smoke.SmokeError):
