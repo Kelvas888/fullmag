@@ -692,6 +692,28 @@
       "log_sha256": "f7615a6152a945a9bd44aa0f113e352b250550ee12b51dae02ffa992407236fa",
       "live_host_restarted": false,
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38145183697,
+      "sha": "e4b8065e2aa544dc15c5d4fcf780a82a52850b08",
+      "conclusion": "failure",
+      "scope": "inspector_revision_fences_and_contextual_ribbon",
+      "tests_passed": 139,
+      "test_files": 10,
+      "typecheck": "passed",
+      "architecture": "passed",
+      "React_Doctor": "failure:617 diagnostics semantically equal to baseline38141709909 after ignoring source positions only",
+      "browser": "NOT VERIFIED",
+      "qualification_claimed": false
+    },
+    {
+      "run_id": 38145536160,
+      "sha": "cf9ca10cd7c96c7680ff12057f235000181606fe",
+      "conclusion": "failure",
+      "scope": "sweep_provenance_and_Floquet_solver_identity",
+      "failure": "homogeneous Floquet path reports generic dense identity; expected Floquet Schur identity",
+      "log_sha256": "22bc0782bd482064f02dddedb95fd4a0862c887d173c36c8cf39011edb9c8729",
+      "qualification_claimed": false
     }
   ]
 }

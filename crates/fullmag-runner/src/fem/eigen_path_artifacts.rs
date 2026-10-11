@@ -2015,6 +2015,7 @@ mod output_publication_tests {
             "production_native_solver_available": true,
             "production_gyrotropic_mapping": true,
             "modal_periodic_pair_contract_available": true,
+            "floquet_periodic_pair_count": 1,
             "validation_only": false,
         });
         crate::fem::eigen_native_result::merge_poisson_airbox_modal_result_diagnostics(
@@ -2038,6 +2039,7 @@ mod output_publication_tests {
         ] {
             assert_eq!(sample_diagnostics[field], expected);
         }
+        assert_eq!(sample_diagnostics["floquet_periodic_pair_count"], 1);
         let solver_model = crate::eigen::EigenSolverModel::ProductionCpuShiftInvert;
         let sample = |sample_index| crate::eigen::SingleKSolveResult {
             sample: crate::eigen::KSampleDescriptor {

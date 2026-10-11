@@ -905,3 +905,12 @@ Dodatkowy guard poprawności finalizacji: inferred/explicit Completed sweep z li
 4241442703:top-level solveridentity wynika z homogenicznych actualsamplediag producerfields, guarded Full2x2/Floquet/demag/finite nonzerok. Missing/mixed k/schema nie daje promocji. Rootreview poprawił closurelifetimes, niefinitywne samplek i syntheticfixture zastąpiono existingRustdiag-normalizer. Raw C++ oraztranslatorfieldnames sprawdzone; native runtime NOT VERIFIED. Parser/diff PASS,GHA wymagane.
 
 #38144770123 readiness/retention LinuxWindows SUCCESS z actual request timeout regression; poprzedni TypeError FAIL zachowany. Nie restartowano hosta.
+
+
+## Aktualne bramki P10 i tożsamości Floqueta
+
+GHA #38145183697 na e4b8065e2aa544dc15c5d4fcf780a82a52850b08:139 testów/10 plików, pełny typecheck i architecture PASS. React Doctor nadal FAIL:617 wpisów semantycznie zgodnych z #38141709909 po pominięciu wyłącznie pozycji źródeł. Bramka nie została wyłączona. UI revision fences i Ribbon oczekują dowodu browser.
+
+GHA #38145536160 na cf9ca10cd7c96c7680ff12057f235000181606fe FAIL w named Floquet identity regression: zamiast floquet_airbox_cpu_schur_slepc raportowano slepc_multi_shift_invert_production_cpu_dense. Zachowano log awarii; poprawka wymaga następnego CI. Nie jest to wynik fizycznej dyspersji ani dowód braku dynamicznego demagu. P0–P10 pozostają częściowo wdrożone; runtime, zbieżność i kwalifikacja nie zostały przez te testy potwierdzone.
+
+Przyczyna #38145536160: nowa fixture podała floquet_periodic_pair_count w result_json, podczas gdy produkcyjny producent przekazuje go w raw diagnostics_json. Guard poprawnie odmówił promocji bez tej wartości. Fixture teraz odtwarza właściwy kanał i wymaga dodatniego count; produkcji ani bramki nie poluzowano. Ponowne CI wymagane.
