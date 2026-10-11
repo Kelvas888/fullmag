@@ -119,6 +119,46 @@ try {
   checks.push({ name: "exact merge patch, immutable identities, newer draft survives delayed ACK and history records write", passed: true, stable });
   await screenshot("03-committed"); await budget("delayed ACK");
 
+  await boot();
+  const beforeBranches = await read();
+  await field("Branch 2 signed weight").fill("-0.5"); await click("Add branch");
+  await field("Branch 3 ID").fill("return2");
+  await field("Branch 3 inlet terminal").fill("return2-in");
+  await field("Branch 3 outlet terminal").fill("return2-out");
+  await field("Branch 3 signed weight").fill("-0.5"); await apply();
+  const addedWrite = writes(await read())[0].body;
+  assert.equal(addedWrite.base_revision, 1);
+  assert.deepEqual(Object.keys(addedWrite.merge_patch), ["antenna_port_modes"]);
+  assert.deepEqual(addedWrite.merge_patch.antenna_port_modes[0].branches.map((branch) => branch.signed_weight), [1, -0.5, -0.5]);
+  assert.deepEqual(addedWrite.merge_patch.antenna_port_modes[1], beforeBranches.scene.antenna_port_modes[1]);
+  await release(); await wait(() => document.querySelector('[data-testid="port-dirty"]')?.textContent === "false");
+  assert.deepEqual((await read()).scene.current_transports, beforeBranches.scene.current_transports);
+  // Edit the new branch after its ACK to verify originalId rebinding, not only a one-shot addition.
+  await field("Branch 3 ID").fill("renamed-return2"); await apply(); await release();
+  await wait(() => document.querySelector('[data-testid="port-dirty"]')?.textContent === "false");
+  assert.equal((await read()).scene.antenna_port_modes[0].branches[2].id, "renamed-return2");
+  await click("Remove port branch 3"); await field("Branch 2 signed weight").fill("-1"); await apply();
+  const removedWrite = writes(await read())[2].body;
+  assert.equal(removedWrite.base_revision, 3);
+  assert.deepEqual(removedWrite.merge_patch.antenna_port_modes[0].branches, beforeBranches.scene.antenna_port_modes[0].branches);
+  await release(); await wait(() => document.querySelector('[data-testid="port-dirty"]')?.textContent === "false");
+  assert.deepEqual((await read()).scene.current_transports, beforeBranches.scene.current_transports);
+  assert.equal((await read()).canUndo, true);
+  checks.push({ name: "explicit branch addition, acknowledged rename and removal preserve transport and unrelated port", passed: true });
+  await budget("branch addition and removal");
+
+  await boot(); await field("Branch 1 ID").fill("local-rename");
+  await page.evaluate(() => window.__antennaPortEditorFixture.conflict("remote-rename"));
+  await button("Rebase port").waitFor({ timeout }); await click("Rebase port");
+  await editor.getByText("Original branch 'signal' changed or is ambiguous. Revert and edit the current port.", { exact: true }).waitFor({ timeout });
+  assert.equal(await field("Branch 1 ID").inputValue(), "local-rename");
+  assert.equal(await button("Apply port").isDisabled(), true); assert.equal(writes(await read()).length, 0);
+  await click("Revert port");
+  assert.equal(await field("Branch 1 ID").inputValue(), "remote-rename");
+  assert.equal(await page.getByTestId("port-dirty").textContent(), "false");
+  checks.push({ name: "remote branch identity change cannot be resurrected by explicit rebase", passed: true });
+  await budget("remote branch identity");
+
   await boot(); await field("Branch 1 ID").fill("conflict-draft");
   await page.evaluate(() => window.__antennaPortEditorFixture.conflict());
   await button("Rebase port").waitFor({ timeout });

@@ -1,5 +1,31 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Checkpoint T15 — 2026-10-11, pełny cykl edycji gałęzi portu:**
+Rozszerzono kontrolowany browser fixture o jawnie istniejące dodatkowe
+referencje terminali, bez tworzenia ich przez edytor. Poprawne dodanie trzeciej
+gałęzi z wagami `1, -0.5, -0.5`, jej zmiana ID po ACK oraz usunięcie z powrotem
+do dwóch gałęzi przeszły przez rzeczywisty klient transakcji i panel produkcyjny.
+Payload zachował current transports i drugi port; kolejne zapisy użyły dokładnie
+rewizji 1, 2 i 3. Osobna próba z serwerową zmianą ID gałęzi potwierdziła, że
+jawny Rebase nie wskrzesza starej gałęzi: szkic pozostaje, Apply jest zablokowane,
+a Revert przyjmuje aktualny identyfikator. Nie zmieniano kodu edytora.
+
+`verify-antenna-port-editor-browser`: **11 scenariuszy PASS**, dziewięć workflow,
+4–11 żądań i 14–36 renderów; zachowane wcześniejsze kontrole stabilności oraz
+idle, brak błędów strony/konsoli. Receipt i raport:
+`storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/windows-control-room-browser-fixture/antenna-port-editor-browser/b4a2861a820344d8adee70272159bc60/`.
+TypeScript rozszerzonego fixture: **PASS**, receipt
+`storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/windows-control-room-source-check/production-source/7f44c01208c5447bba6bb5b94bf63a47/receipt.json`.
+Końcowy ESLint: **PASS**, receipt `lint/4a295223dc824c638e36d9e57d4e18f0`
+w tym samym profilu source-check. Nie zmieniono produkcyjnych endpointów,
+resource hooks ani edytora; wcześniejsza zielona kontrola API tych źródeł
+pozostaje ważna. Oczekiwanie `runner-wait` na konkretny build 47 zakończyło
+się timeoutem obserwacji, nadal `queued`; nie jest to awaria ani zgoda na restart.
+Jest to authoring z kontrolowanym HTTP, nie rzeczywisty backend ani
+kwalifikacja dwóch fizycznych ścieżek powrotnych. Nie kompilowano unit tests.
+Build 47 i bieżący kod natywny pozostają przypięte do poprzedniej kapsuły;
+rozszerzenie fixture nie zmienia tamtych źródeł.
+
 **Kontynuacja odbioru — 2026-10-11, build 47 queued:**
 Zweryfikowany fragment edytora portu zapisano w commicie
 `5c573ac4fcd2b9db13a7cf954fc06e82274055f1`.

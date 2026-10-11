@@ -27,7 +27,7 @@ type Call = { method: string; path: string; scope: string | null; body: unknown 
 interface FixtureControl {
   read(): { calls: Call[]; pending: number; renders: number; scene: SceneResource; canUndo: boolean; invalidations: number; unexpected: string[] };
   release(): void;
-  conflict(): void;
+  conflict(renameFirstBranch?: string): void;
   rejectNext(): void;
   malformedNext(kind?: "normalization" | "scene_revision"): void;
   switchSession(name: "A" | "B"): void;
@@ -36,7 +36,7 @@ interface FixtureControl {
 declare global { interface Window { __antennaPortEditorFixture?: FixtureControl; } }
 
 function makeScene(name: string): SceneResource {
-  const terminals = ["signal-in", "signal-out", "return-in", "return-out"];
+  const terminals = ["signal-in", "signal-out", "return-in", "return-out", "return2-in", "return2-out"];
   const port = { id: portId, schema_version: "antenna_port_mode.v2", source_object_id: sourceId,
     current_transport_id: "transport", normalization_current_a: 1,
     branches: [{ id: "signal", inlet_terminal_ref: terminals[0], outlet_terminal_ref: terminals[1], signed_weight: 1 },
@@ -109,7 +109,8 @@ function makeFixture() {
     release: () => { const release = pending.shift(); if (!release) throw new Error("No pending port write"); release(); },
     rejectNext: () => { state.reject = true; },
     malformedNext: (kind = "normalization") => { state.malformed = kind; },
-    conflict: () => { const scene = state.scenes[state.name], revision = (scene.revision ?? 0) + 1;
+    conflict: (renameFirstBranch) => { const scene = structuredClone(state.scenes[state.name]), revision = (scene.revision ?? 0) + 1;
+      if (renameFirstBranch && scene.antenna_port_modes) scene.antenna_port_modes[0].branches[0].id = renameFirstBranch;
       state.scenes[state.name] = { ...scene, revision, scene_revision: revision }; state.clock += 1;
       resources.invalidate(SESSION_STATUS_RESOURCE_KEY, state.clock); resources.invalidate(MODEL_SCENE_PATH, state.clock); },
     switchSession: (name) => { state.name = name; state.clock += 1; resources.invalidate(SESSIONS_PATH, state.clock); resources.invalidate(SESSION_STATUS_RESOURCE_KEY, state.clock); },
