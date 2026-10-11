@@ -762,6 +762,21 @@
       "React_Doctor": "failure:617 diagnostics semantically unchanged",
       "log_sha256": "0acd8b2331f4fe2f58196918be030c3d62bac4afb26f181128a2a54c66f24461",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38148168315,
+      "sha": "5e0117aa74cb83d5a0d5e8643bea8453c2be4c1a",
+      "conclusion": "failure",
+      "scope": "overlay_ACK_generation_with_current_API_typed_fixture",
+      "tests_passed": 143,
+      "test_files": 11,
+      "new_ACK_regressions_passed": 4,
+      "complete_typecheck": "passed",
+      "architecture": "passed",
+      "React_Doctor": "failure:617 diagnostic semantics unchanged vs38147674127 ignoring only source positions",
+      "log_sha256": "8da2b4f4f7dd7822fee28a6089828e9a0000ac6a55c0fadc403a728a7959f4c0",
+      "browser": "NOT VERIFIED",
+      "qualification_claimed": false
     }
   ]
 }
