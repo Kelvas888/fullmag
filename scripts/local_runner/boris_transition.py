@@ -148,6 +148,8 @@ def _locks(layout):
     try:
         stack.enter_context(file_lock(container_lock, 'offline BORIS profile', blocking=True))
         stack.enter_context(file_lock(storage / 'locks' / 'local-runner-coordinator.lock', 'offline BORIS catalogue', blocking=True))
+        from local_runner.coordinator_replacement import assert_no_pending
+        assert_no_pending(storage)
         return stack
     except BaseException:
         stack.close()

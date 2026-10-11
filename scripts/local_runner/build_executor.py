@@ -55,6 +55,8 @@ def configure_build(layout, profile, image_digest, *, owner, cpus=2, memory_byte
     storage = Path(layout['storage_root'])
     path = validate_path(storage / 'index' / 'local-runner-build-config.json', storage)
     with file_lock(storage / 'locks' / 'local-runner-coordinator.lock', 'build configuration'):
+        from local_runner.coordinator_replacement import assert_no_pending
+        assert_no_pending(storage)
         from local_runner.boris_transition import assert_no_pending
         assert_no_pending(storage)
         config = json.loads(path.read_text()) if path.exists() else {'schema': 'fullmag.runner-build-config.v1', 'operator': owner, 'profiles': {}}
@@ -303,6 +305,9 @@ def execute_build(layout, *, owner, call=docker, sleep=time.sleep, timeout_secon
                and 'buildx_buildkit' not in item.get('Name', '')
                and item.get('Name') != '/Fullmag_build_runner' for item in running):
             return {'state': 'waiting_for_existing_fullmag_container'}
+        from local_runner.coordinator_replacement import is_pending
+        if is_pending(storage):
+            return {'state': 'waiting_for_coordinator_replacement'}
         job = queue.claim('local-host', owner=owner, expected_job_id=expected_job_id)
         if job is None:
             return None

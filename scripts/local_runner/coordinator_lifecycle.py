@@ -226,9 +226,14 @@ def _queue_guard(storage):
     with closing(sqlite3.connect(path.as_uri()+'?mode=ro',uri=True,timeout=3)) as db:
         if db.execute('PRAGMA user_version').fetchone()[0]!=1:raise client.ContainerClientError('Unsupported queue schema')
         if db.execute("SELECT 1 FROM jobs WHERE state IS NULL OR state NOT IN ('queued','succeeded','failed','cancelled','blocked','interrupted') OR lease_token IS NOT NULL LIMIT 1").fetchone():raise client.ContainerClientError('Active or uncertain queue lease prevents lifecycle stop')
-        rows=db.execute('SELECT job_id,state,profile,operation,owner,source_digest,sequence FROM jobs ORDER BY sequence LIMIT 100001').fetchall()
-        if len(rows)>100000:raise client.ContainerClientError('Queue inventory exceeds guard bound')
-        return dict(jobs=len(rows),sha256=hashlib.sha256(json.dumps(rows,separators=(',',':')).encode()).hexdigest())
+        cursor=db.execute('SELECT * FROM jobs ORDER BY sequence LIMIT 100001')
+        digest=hashlib.sha256();total=0;count=0
+        digest.update(json.dumps([column[0] for column in cursor.description],separators=(',',':')).encode())
+        for row in cursor:
+            count+=1;encoded=json.dumps(row,separators=(',',':')).encode();total+=len(encoded)
+            if count>100000 or len(encoded)>65536 or total>32*1024**2:raise client.ContainerClientError('Queue inventory exceeds guard bound')
+            digest.update(b'\n'+encoded)
+        return dict(jobs=count,sha256=digest.hexdigest())
 
 
 def _guard(layout,owner,public,identifier,docker_call,health_call):
@@ -250,7 +255,7 @@ def quiesce_and_stop(layout, owner, *, expected_container_id, expected_image_id,
     if not client._CONTAINER_ID_RE.fullmatch(expected_container_id or '') or set(expected_source_hashes)!=set(SOURCE_FILES) or any(not re.fullmatch('[a-f0-9]{64}',v) for v in [expected_public_sha256,expected_catalog_sha256,*expected_source_hashes.values()]):raise client.ContainerClientError('Exact coordinator/config/reviewed source digests required')
     docker_call=docker_call or _docker;health_call=health_call or client.request;fence_factory=fence_factory or LinuxFence
     storage=client._storage_root(layout);destination=validate_path(Path(layout['build_root'])/('coordinator-quiesce-'+uuid.uuid4().hex),storage);destination.mkdir(parents=True)
-    receipt=dict(schema='fullmag.runner.coordinator-quiesce.v1',container_id=expected_container_id,image_id=expected_image_id,status='RUNNING',host_locks_claim_fence=False,linux_fence_script_sha256=hashlib.sha256(REMOTE.encode()).hexdigest(),reviewed_source_hashes=expected_source_hashes,worker_stop_executed=False,queue_mutation_executed=False,profile_mutation_executed=False,expected_public_sha256=expected_public_sha256,expected_catalog_sha256=expected_catalog_sha256,producer_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    receipt=dict(schema='fullmag.runner.coordinator-quiesce.v2',operator=owner,storage=str(storage),container_id=expected_container_id,image_id=expected_image_id,status='RUNNING',host_locks_claim_fence=False,linux_fence_script_sha256=hashlib.sha256(REMOTE.encode()).hexdigest(),reviewed_source_hashes=expected_source_hashes,worker_stop_executed=False,queue_mutation_executed=False,profile_mutation_executed=False,expected_public_sha256=expected_public_sha256,expected_catalog_sha256=expected_catalog_sha256,producer_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
     receipt_path=destination/'terminal-receipt.json';receipt['receipt_path']=str(receipt_path)
     atomic_json(receipt_path,receipt)
     fence=None;arm_requested=False;stop_requested=False;exited=False
@@ -260,6 +265,8 @@ def quiesce_and_stop(layout, owner, *, expected_container_id, expected_image_id,
             locks.enter_context(file_lock(container_lock,'owned coordinator lifecycle',blocking=False))
             locks.enter_context(file_lock(storage/'locks'/'local-runner-coordinator.lock','host lifecycle serialization only',blocking=False))
             transition.assert_no_pending(storage)
+            from local_runner.coordinator_replacement import assert_no_pending, snapshot
+            assert_no_pending(storage)
             baseline,public=_configs(layout,owner,expected_public_sha256,expected_catalog_sha256)
             if public['image_id']!=expected_image_id:raise client.ContainerClientError('Expected coordinator image differs from public config')
             receipt['initial_guard']=_guard(layout,owner,public,expected_container_id,docker_call,health_call)
@@ -268,6 +275,7 @@ def quiesce_and_stop(layout, owner, *, expected_container_id, expected_image_id,
             _configs(layout,owner,expected_public_sha256,expected_catalog_sha256,baseline)
             receipt['final_guard']=_guard(layout,owner,public,expected_container_id,docker_call,health_call)
             _configs(layout,owner,expected_public_sha256,expected_catalog_sha256,baseline)
+            receipt['config_snapshot']=snapshot(destination,storage,owner,baseline)
             fence.check();arm_requested=True
             receipt['status']='ARM_REQUESTED';atomic_json(receipt_path,receipt)
             receipt['armed_ack']=fence.arm()
@@ -282,6 +290,7 @@ def quiesce_and_stop(layout, owner, *, expected_container_id, expected_image_id,
             if _queue_guard(storage)!=receipt['final_guard']['queue']:raise client.ContainerClientError('Queue changed across guarded coordinator stop')
             if read_stop_request(ServicePaths.from_storage(storage)) is None:
                 request_stop(ServicePaths.from_storage(storage),requested_by=owner,reason='owned coordinator lifecycle remains paused')
+            receipt['pause_marker_sha256']=hashlib.sha256(ServicePaths.from_storage(storage).stop_request_path.read_bytes()).hexdigest()
             receipt.update(status='SUCCEEDED_EXITED_PAUSED_ONLY',pause_marker_preserved=True,qualification='REPLACEMENT_NOT_EXECUTED')
             return receipt
     except BaseException:

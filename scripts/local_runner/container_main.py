@@ -10,6 +10,7 @@ import time
 
 from fullmag_storage import validate_path
 from local_runner.queue import JobQueue
+from local_runner.coordinator_replacement import is_pending
 from local_runner.build_executor import execute_build, reconcile_build, capsule_path, profile_lane, PROFILES
 from local_runner.build_source import bind_identity
 from local_runner.worker_entrypoint import canonical, SCHEMA
@@ -118,7 +119,8 @@ class Application:
         if service_state == 'error' and not worker_error:
             worker_error = service.get('last_error') or 'Worker service reported an error'
         stop = read_stop_request(self.paths)
-        paused = stop is not None or worker_state in ('paused', 'failed') or not worker_alive
+        replacement_pending = is_pending(self.storage)
+        paused = replacement_pending or stop is not None or worker_state in ('paused', 'failed') or not worker_alive
         accepting_jobs = worker_alive and worker_state not in ('starting', 'paused', 'failed', 'stopping') and not paused and not legacy and not worker_error
         # ``ok`` describes the API/coordinator process.  An intentional
         # paused coordinator remains healthy for lifecycle reconciliation,
@@ -126,6 +128,7 @@ class Application:
         healthy = worker_state not in ('starting', 'failed', 'stopping') and not legacy and not worker_error
         return {
             'ok': healthy,
+            'replacement_pending': replacement_pending,
             'accepting_jobs': accepting_jobs,
             'worker_alive': worker_alive,
             'worker_state': worker_state,
@@ -334,6 +337,12 @@ class Application:
 
     def resume(self):
         with self._lifecycle_lock:
+            if is_pending(self.storage):
+                return {'resumed': False, 'worker_started': False,
+                        'worker_alive': bool(self._worker_thread and self._worker_thread.is_alive()),
+                        'worker_state': self._worker_state,
+                        'stop_requested': read_stop_request(self.paths) is not None,
+                        'reason': 'coordinator replacement requires explicit forward recovery'}
             worker_alive = self._worker_thread is not None and self._worker_thread.is_alive()
             # Once drain starts, the service can decide to stop before it
             # publishes its terminal record. Do not clear the marker until
@@ -382,6 +391,7 @@ class Application:
             free_bytes = None
         return {
             'ok': snapshot['ok'],
+            'replacement_pending': snapshot['replacement_pending'],
             'service': 'fullmag-build-runner',
             'worker_alive': snapshot['worker_alive'],
             'worker_state': snapshot['worker_state'],

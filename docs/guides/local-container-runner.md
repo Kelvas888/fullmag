@@ -233,8 +233,56 @@ lub kolejki po wyjściu wymaga przeglądu przed restartem.
 
 Dowody: 26 niezależnych interpretowanych regresji helpera PASS. Prywatna
 rzeczywista próba na zamrożonym obrazie potwierdziła HELD, odmowę konkurencyjnego
-Linux `flock` i zwolnienie przed ARM. Rzeczywiste ARM/disconnect oraz lifecycle
-zainstalowanego operatora pozostają **NOT VERIFIED**.
+Linux `flock` i zwolnienie przed ARM. Odrębny prywatny probe potwierdził
+rzeczywiste ARM/disconnect: receipt
+`root-armed-exec-probe-7bb51aaafca648b78e6f3f5a361ddeef/receipt.json`, SHA256
+`d24aaf1fc5e6e7c9b571f24cd83f359ce036eab9b0a6bef6bc0b9a7811072b29`.
+To dowód prywatnego fence; lifecycle zainstalowanego operatora nadal jest
+**NOT VERIFIED**.
+
+### Jawna wymiana zatrzymanego koordynatora
+
+`container-replace` nadal wymaga działającego starego API. Po udanym quiesce
+stosuj osobny `container-replace-exited`; helper wymaga receiptu quiesce v2
+z prywatnym ograniczonym snapshotem trzech konfiguracji. Snapshot powstaje przed
+ARM; publiczny receipt zawiera wyłącznie jego ścieżkę/hash. Token pozostaje prywatny.
+Zmiany profilu między stop a wymianą mogą obejmować tylko zadeklarowane dodanie lub
+usunięcie BORIS; pozostałe profile FEM, token, port i storage są porównywane z kopią.
+
+```text
+python -B scripts/local_runner_cli.py --worktree <checkout> container-replace-exited --quiesce-receipt <receipt-v2> --quiesce-receipt-sha256 <SHA> --expected-container-id <old-full-ID> --expected-image-id sha256:<old-image-ID> --expected-container-sha256 <current-public-SHA> --expected-build-config-sha256 <current-catalog-SHA> --image-id sha256:<new-image-ID> --image-build-receipt <managed-image-receipt> --image-build-receipt-sha256 <SHA> --profile-delta unchanged
+```
+
+Dla `enable-boris-cpu` lub `disable-boris-cpu` podaj też
+`--expected-boris-entry-sha256`. Zmianę profilu przygotowuje wcześniejsza konfiguracja
+offline; sama wymiana zmienia wyłącznie image_id pliku publicznego. Sprawdza rzeczywisty
+obraz, RootFS/Entrypoint i źródłowy readback readonly/network-none jako UID 65532.
+Nowy frozen obraz musi zawierać guard runtime; starsze obrazy nie spełniają kontraktu.
+
+Oddzielny prywatny `index/local-runner-exited-replacement/pending.json` poprzedza
+rm/public-write/create/start. Pod istniejącym Linux coordinator.lock blokuje claim;
+API odmawia resume (`resumed=false`, bez usunięcia pauzy) oraz przyjmowania zadań.
+Strażnik blokuje też zwykłe hostowe start/configure/replace i transakcje profilu.
+Uszkodzony pending również blokuje; startup ani upływ czasu go nie usuwają.
+Diagnostyka pozostaje dostępna. Kolejka jest odczytywana, porównywana w całości i
+pozostaje niezmieniona; helper nie zatrzymuje workerów ani nie odtwarza SQLite.
+
+Fazy trwałe: PREPARED, REMOVE_REQUESTED, OLD_REMOVED, PUBLIC_UPDATE_REQUESTED,
+PUBLIC_UPDATED, CREATE_REQUESTED, CREATED, START_REQUESTED, STARTED_PAUSED,
+SUCCEEDED_PAUSED. Terminalny receipt powstaje przed usunięciem pending, które jest
+ostatnim commit point. Sukces pozostawia nowego koordynatora w pauzie.
+
+```text
+python -B scripts/local_runner_cli.py --worktree <checkout> container-recover-exited-replacement --transaction-id <ID>
+```
+
+Recovery kontynuuje wyłącznie do przodu. Utracony wynik create wymaga dodatkowego
+`--expected-new-container-id <pełne-ID>` i pełnej atestacji; sama nazwa nie dowodzi
+własności. Zmiana konfiguracji, pauzy, kolejki lub obcy kontener zatrzymuje recovery
+z zachowaniem pending. Nie ma automatycznego resume, rollbacku DB ani restartu starego
+obrazu. Powrót do starego obrazu wymaga osobnego kontrolowanego przejścia.
+Regresje interpretowane nie kwalifikują aktualizacji operatora: rzeczywista wymiana,
+nowy runtime guard i lifecycle zainstalowanego runnera pozostają **NOT VERIFIED**.
 
 ### Wyłączenie profilu BORIS i odzyskiwanie transakcji offline
 

@@ -48,6 +48,15 @@ def main(argv=None):
     quiesce.add_argument('--expected-catalog-sha256', required=True)
     quiesce.add_argument('--reviewed-source-sha256', action='append', required=True,
                          metavar='PATH=SHA256')
+    exited = sub.add_parser('container-replace-exited')
+    for flag in ('quiesce-receipt','quiesce-receipt-sha256','expected-container-id','expected-image-id',
+                 'expected-container-sha256','expected-build-config-sha256','image-id','image-build-receipt','image-build-receipt-sha256'):
+        exited.add_argument('--'+flag, required=True)
+    exited.add_argument('--profile-delta', choices=('unchanged','enable-boris-cpu','disable-boris-cpu'), default='unchanged')
+    exited.add_argument('--expected-boris-entry-sha256')
+    recovery_exited = sub.add_parser('container-recover-exited-replacement')
+    recovery_exited.add_argument('--transaction-id', required=True)
+    recovery_exited.add_argument('--expected-new-container-id')
     replacement = sub.add_parser('container-replace')
     replacement.add_argument('--image-id', required=True)
     sub.add_parser('container-resume')
@@ -130,6 +139,14 @@ def main(argv=None):
                     expected_public_sha256=args.expected_public_sha256,
                     expected_catalog_sha256=args.expected_catalog_sha256,
                     expected_source_hashes=reviewed)
+            elif args.action == 'container-replace-exited':
+                keys = ('quiesce_receipt','quiesce_receipt_sha256','expected_container_id','expected_image_id',
+                        'expected_container_sha256','expected_build_config_sha256','image_id','image_build_receipt',
+                        'image_build_receipt_sha256','profile_delta','expected_boris_entry_sha256')
+                result = container_client.replace_exited(layout, owner, **{key:getattr(args,key) for key in keys})
+            elif args.action == 'container-recover-exited-replacement':
+                result = container_client.recover_exited_replacement(layout, owner, args.transaction_id,
+                    expected_new_container_id=args.expected_new_container_id)
             elif args.action == 'container-replace':
                 result = container_client.replace(layout, args.image_id, owner=owner)
             elif args.action == 'container-resume':

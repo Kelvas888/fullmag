@@ -26,6 +26,7 @@ from urllib.parse import unquote, urlsplit
 
 from fullmag_storage import StorageError, atomic_json, file_lock
 from local_runner import coordinator
+from local_runner.coordinator_replacement import assert_no_pending as assert_no_replacement
 
 
 def _resolve_env_port(default: int = 48765) -> int:
@@ -355,6 +356,7 @@ def configure(
     with file_lock(lock_path, "local runner container configuration", blocking=True):
         from local_runner.boris_transition import assert_no_pending
         assert_no_pending(storage)
+        assert_no_replacement(storage)
         public_exists = public_path.exists()
         secret_exists = secret_path.exists()
         if public_exists != secret_exists:
@@ -656,6 +658,7 @@ def _start_unlocked(
     """Create/start the exact reserved container, never replacing a foreign one."""
 
     operator = _owner(owner)
+    assert_no_replacement(_storage_root(layout))
     storage, secret_path, public, _ = _load_config(layout, operator)
     docker = _selected_docker_call(docker_call, call)
     image = _image_id(public["image_id"])
@@ -786,6 +789,8 @@ def request(
     if not isinstance(method, str) or method.upper() not in {"GET", "POST"}:
         raise ContainerClientError("Runner API supports only GET and POST")
     method = method.upper()
+    if method == "POST":
+        assert_no_replacement(_storage_root(layout))
     path = _request_path(path)
     try:
         body = None if payload is None else json.dumps(payload, ensure_ascii=False, allow_nan=False).encode("utf-8")
@@ -871,6 +876,7 @@ def _replace_unlocked(
     call: Callable[[list[str]], object] | None = None,
 ) -> dict[str, Any]:
     operator = _owner(owner)
+    assert_no_replacement(_storage_root(layout))
     new_image = _image_id(image_id)
     public_path, _, _ = _config_paths(layout)
     storage, secret_path, public, _ = _load_config(layout, operator)
@@ -954,6 +960,7 @@ def replace(
 
 def disable_boris_cpu(layout, owner, expected_public_sha256, expected_catalog_sha256, expected_boris_sha256, *, docker_call=None):
     """Remove only matching BORIS activation from an attested exited coordinator."""
+    assert_no_replacement(_storage_root(layout))
     from local_runner.boris_transition import disable
     return disable(layout, owner, expected_public_sha256, expected_catalog_sha256,
                    expected_boris_sha256, docker_call=docker_call)
@@ -961,6 +968,7 @@ def disable_boris_cpu(layout, owner, expected_public_sha256, expected_catalog_sh
 
 def recover_boris_profile(layout, owner, transaction_id, direction, *, docker_call=None):
     """Resolve an exact pending offline transaction without starting Docker."""
+    assert_no_replacement(_storage_root(layout))
     from local_runner.boris_transition import recover
     return recover(layout, owner, transaction_id, direction, docker_call=docker_call)
 
@@ -995,3 +1003,13 @@ __all__ = [
     "status",
     "stop",
 ]
+
+
+def replace_exited(layout, owner, **arguments):
+    from local_runner.coordinator_replacement import replace_exited as replace
+    return replace(layout, owner, **arguments)
+
+
+def recover_exited_replacement(layout, owner, transaction_id, **arguments):
+    from local_runner.coordinator_replacement import recover_exited
+    return recover_exited(layout, owner, transaction_id, **arguments)
