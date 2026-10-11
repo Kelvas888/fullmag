@@ -62,6 +62,8 @@ ALLOWED_PROFILES = (
 CPU_CONTRACT_PROFILES = (*ALLOWED_PROFILES, "fem-cpu-current-contracts-v1")
 CURRENT_CONTRACT_PROFILES = (*CPU_CONTRACT_PROFILES, "fem-gpu-current-contracts-v1")
 SLEPC_MODAL_PROFILES = (*CURRENT_CONTRACT_PROFILES, "fem-cpu-slepc-modal-v1")
+BORIS_CPU_PROFILE = "boris-cpu-v1"
+CATALOG_PROFILES = (*SLEPC_MODAL_PROFILES, BORIS_CPU_PROFILE)
 _PROFILE_LISTS = (
     ALLOWED_PROFILES,
     CPU_CONTRACT_PROFILES,
@@ -76,7 +78,7 @@ def _known_profile_list(value: object) -> bool:
     val_list = list(value)
     if any(val_list == list(profiles) for profiles in _PROFILE_LISTS):
         return True
-    if len(set(val_list)) == len(val_list) and all(isinstance(p, str) and p in SLEPC_MODAL_PROFILES for p in val_list):
+    if len(set(val_list)) == len(val_list) and all(isinstance(p, str) and p in CATALOG_PROFILES for p in val_list):
         if val_list[:len(ALLOWED_PROFILES)] == list(ALLOWED_PROFILES):
             return True
     return False
@@ -326,6 +328,7 @@ def configure(
     image: str | None = None,
     enable_current_contracts: bool = False,
     enable_slepc_modal: bool = False,
+    enable_boris_cpu: bool = False,
 ) -> dict[str, Any]:
     """Install or update host configuration without contacting Docker.
 
@@ -338,7 +341,7 @@ def configure(
         image_id = image
     elif image is not None:
         raise ContainerClientError("Specify only one coordinator image ID")
-    if not isinstance(enable_current_contracts, bool) or not isinstance(enable_slepc_modal, bool):
+    if not all(isinstance(value, bool) for value in (enable_current_contracts, enable_slepc_modal, enable_boris_cpu)):
         raise ContainerClientError("Profile activation flags must be boolean")
     if enable_current_contracts and enable_slepc_modal:
         raise ContainerClientError("Choose only one profile activation set")
@@ -387,10 +390,13 @@ def configure(
                     port = CONTAINER_PORT
             port = _port(port)
             token = secrets.token_urlsafe(48)
+        had_boris = BORIS_CPU_PROFILE in selected_profiles
         if enable_slepc_modal:
             selected_profiles = list(SLEPC_MODAL_PROFILES)
         elif enable_current_contracts and "fem-cpu-slepc-modal-v1" not in selected_profiles:
             selected_profiles = list(CURRENT_CONTRACT_PROFILES)
+        if (enable_boris_cpu or had_boris) and BORIS_CPU_PROFILE not in selected_profiles:
+            selected_profiles.append(BORIS_CPU_PROFILE)
         public = _public_record(storage, operator, image, port, allowed_profiles=selected_profiles)
         secret = _secret_record(storage, operator, token, port, allowed_profiles=selected_profiles)
         atomic_json(secret_path, secret)

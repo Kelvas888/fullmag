@@ -57,6 +57,41 @@ def _source_manifest_path(build_root: Path) -> Path:
     )
 
 
+SOURCE_MANIFEST_MAX_BYTES = 1024 * 1024
+
+
+def _read_source_manifest(path: Path) -> dict[str, object]:
+    """Inspect bounded provenance without granting caller JSON build authority."""
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError("BORIS source manifest must be a regular nonsymlink file")
+    with path.open("rb") as stream:
+        raw = stream.read(SOURCE_MANIFEST_MAX_BYTES + 1)
+    if not raw or len(raw) > SOURCE_MANIFEST_MAX_BYTES:
+        raise RuntimeError("BORIS source manifest exceeds the 1 MiB bound")
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate manifest key")
+            result[key] = value
+        return result
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object,
+                           parse_constant=lambda _: (_ for _ in ()).throw(ValueError("nonfinite JSON")))
+    except (UnicodeError, ValueError, RecursionError) as error:
+        raise RuntimeError(f"BORIS source manifest is invalid: {error}") from error
+    if not isinstance(value, dict):
+        raise RuntimeError("BORIS source manifest must be an object")
+    return value
+
+
+def _require_verified_build(manifest: Path) -> None:
+    source = _read_source_manifest(manifest)
+    if source.get("schema_version") == "fullmag.boris.source.v1":
+        raise RuntimeError("BORIS run requires verified managed build proof; legacy v1 is incomplete")
+    raise RuntimeError("BORIS source manifest has no supported managed build receipt verifier")
+
+
 def _probe_host_binary(binary: Path, device: str) -> dict[str, object]:
     try:
         result = subprocess.run(
@@ -96,7 +131,7 @@ def capture_runtime_identity(
     *,
     runtime_probe: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Capture immutable BORIS source, binary, image, and device identity."""
+    """Observe legacy hashes/device data without asserting verified build precision."""
 
     if device not in {"cpu", "cuda"}:
         raise ValueError("device must be cpu or cuda")
@@ -109,6 +144,7 @@ def capture_runtime_identity(
     if digest_match is None:
         raise RuntimeError("BORIS runtime image must be pinned by digest")
     manifest = _source_manifest_path(build_root)
+    source = _read_source_manifest(manifest)
     probe = dict(runtime_probe) if runtime_probe is not None else _probe_host_binary(binary, device)
     required_probe = ("binary_version", "python_version", "device_detected", "device_residency_evidence")
     missing_probe = [key for key in required_probe if not probe.get(key)]
@@ -116,7 +152,7 @@ def capture_runtime_identity(
         raise RuntimeError(f"managed BORIS runtime probe is incomplete: {', '.join(missing_probe)}")
     identity: dict[str, object] = {
         "schema_version": "fullmag.boris.runtime.v1",
-        "identity_complete": True,
+        "identity_complete": False,
         "source_manifest": str(manifest),
         "source_manifest_sha256": _sha256(manifest),
         "binary": str(binary),
@@ -128,13 +164,15 @@ def capture_runtime_identity(
         "device_detected": str(probe["device_detected"]),
         "compute_capability": probe.get("compute_capability"),
         "device_residency_evidence": str(probe["device_residency_evidence"]),
-        "precision": "double",
+        "precision": None,
+        "source_manifest_schema": source.get("schema_version"),
+        "build_proof_status": "unverified",
+        "build_proof_reason": "trusted_managed_build_receipt_verifier_unavailable",
         "probe_stdout_sha256": str(probe.get("probe_stdout_sha256", "")),
         "probe_stderr_sha256": str(probe.get("probe_stderr_sha256", "")),
     }
     if device == "cuda":
         identity["nvidia_smi_query"] = str(probe.get("nvidia_smi_query", ""))
-    validate_runtime_identity(identity)
     return identity
 
 
@@ -153,6 +191,9 @@ def validate_runtime_identity(identity: Mapping[str, object]) -> None:
     )
     if identity.get("schema_version") != "fullmag.boris.runtime.v1":
         raise ValueError("BORIS runtime identity schema is unsupported")
+    # Legacy v1 has no trusted build receipt binding, even if caller says true.
+    if identity.get("identity_complete") is True:
+        raise ValueError("BORIS runtime v1 has no verified managed build proof")
     if identity.get("identity_complete") is not True:
         raise ValueError("BORIS runtime identity is incomplete")
     missing = [key for key in required if not identity.get(key)]
@@ -410,7 +451,7 @@ def run_boris_case(
     binary = build_root / "BorisLin"
     if not binary.is_file():
         raise RuntimeError(f"BorisLin binary is missing: {binary}")
-    _source_manifest_path(build_root)
+    _require_verified_build(_source_manifest_path(build_root))
     if timeout_s < 1:
         raise ValueError("timeout_s must be positive")
     output_dir.mkdir(parents=True, exist_ok=True)

@@ -2478,6 +2478,86 @@ M2 affine z wyłączonym spin-flip nadal nie przechodzi publicznego authoringu,
 ponieważ publiczny `lambda_sf_m` wymaga finite dodatniej długości. Ten checker
 nie kwalifikuje M2 ani nie zastępuje disabled reaction dużą długością.
 
+### E1: luka zaufanego dowodu builda BORIS
+
+(boris-managed-build-proof-gate)=
+
+Existing source/runtime v1 nie wiążą trusted operator receipt ze źródłami,
+compile flags i actual binary. SHA dowolnego caller JSON ani literal double
+nie są takim dowodem. Legacy capture zachowuje observed source/binary/image
+hashes, lecz identity_complete=false, precision=null oraz
+build_proof_status=unverified. Nowy run i public benchmark verifier odmawiają.
+Synthetic OVF mapping nie jest wykonaniem BORIS ani solver qualification.
+Regresja `scripts/verify_boris_tensor_adapter.py::main` jawnie sprawdza odmowę
+public admission, następnie używa prywatnego obliczeniowego helpera
+`scripts/compare_boris_fullmag_she_nf.py::_normalize_boris_fields` dla raw OVF.
+Helper nie nadaje runtime proof; public normalize_boris_artifact zawsze przechodzi
+przez pełny verifier. Brak public allow-incomplete flag lub synthetic receipt.
+
+| Generated pole / typ | Zakres i walidacja | SI / znaczenie |
+|---|---|---|
+| source manifest / JSON object | regular nonsymlink file, 1..1 MiB, UTF-8, unique keys; unknown schema bez authority | $1$; obserwacja, nie trusted build receipt |
+| identity_complete / bool | false dla obecnego producer v1; caller true nie zastępuje receipt | $1$; completeness, nie science PASS |
+| precision / nullable string | null bez verified source/compile proof; nie zgadywać double | $1$; precision pozostaje niezweryfikowana |
+| build_proof_status / string | unverified; actual managed verifier jeszcze nie istnieje | $1$; jawna luka |
+
+Proposed fullmag.boris.source.v2/runtime.v2 wymaga actual managed profile,
+niezależnego receipt verifiera i exact binding pinned upstream/source-file
+hashes, CPU overlay/flags, compiler/Python/link, worker/runtime image oraz
+binary SHA. Manifest nie hashuje własnego checksumu. Caller JSON nie nadaje
+complete/double. Profil boris-cpu-v1 ma teraz source-only fixed build producer; operator activation,
+rzeczywisty build oraz trusted runtime admission pozostają NOT VERIFIED.
+Nie zmienia się fizyka, normalizacja, tolerancje ani CPU/GPU qualification.
+
+Źródła: scripts/run_boris_nf_interface.py::capture_runtime_identity,
+validate_runtime_identity, run_boris_case oraz
+scripts/verify_boris_nf_interface.py::validate_boris_artifact.
+
+(boris-cpu-abi-witness-contract)=
+### E1: prerejestracja produkcyjnego CPU ABI witness
+
+Kontrakt prerejestrowany przed kodem; implementacja SOURCE ONLY, NOT VERIFIED.
+Witness jest artefaktem pochodzenia profilu boris-cpu-v1,
+nie testem jednostkowym ani solverem. Nie wykonano kompilacji,
+witnessa ani runtime benchmarku. W upstream
+048503d2ca6475e91b073eb1762ecf9d3634c3e1 Boris/MeshBase.h deklaruje
+VEC_VC<double> V oraz VEC_VC<DBL3> E/S; BorisLib/Types_VAL.h definiuje
+DBL3=VAL3<double>. Oryginalne hashe obu plików są przypięte do pełnego
+image_source.v1; worker odmawia drift. SINGLEPRECISION opisuje CUDA,
+nie jest samodzielnym dowodem precyzji CPU.
+
+Fixed witness obejmuje actual MeshBase.h i static_assert typów skalarów V/E/S
+oraz DBL3. Sprawdza CHAR_BIT=8, sizeof(double)=8, radix=2, digits=53,
+max_exponent=1024. CPU solver i witness używają tego samego compiler path,
+flags -Ofast/-std=c++17/-fopenmp, includes, sanitised image environment oraz
+tego samego zestawu flag linkowania. Wyjściowe fakty ABI są obserwowane przez
+fixed stage i kopiowane do bounded JSON wraz z job/source/image/flags binding.
+Wszystkie trzy etapy compile/link/observe muszą mieć dokładnie jeden sukces;
+exact komendy witnessa są sprawdzane wobec komend produkcyjnego solvera.
+-Ofast nie oznacza ścisłej arytmetyki IEEE: binary64 ABI nie kwalifikuje
+błędów naukowych ani konwergencji. Brak witnessa odmawia nowego build receipt.
+Legacy runtime.v1 nadal incomplete; witness nie nadaje identity_complete,
+nie otwiera public benchmark admission i nie zmienia żadnej tolerancji fizycznej.
+
+| Generated parametr / typ | Granica i walidacja | Jednostka / znaczenie |
+|---|---|---|
+| schema_version / string | fullmag.boris.cpu_abi.v1; exact fixed fields | $1$; wersja dowodu ABI |
+| job_id, capsule_digest, image_digest / string | exact owning receipt values | $1$; managed provenance |
+| compile_flags_sha256, cuda_flags_sha256 / string | SHA256 actual output headers | $1$; compiler input binding |
+| type_source_sha256 / map | exact pinned MeshBase.h/Types_VAL.h SHA256 | $1$; rzeczywiste typy V/E/S |
+| facts / object | integer CHAR_BIT=8, double_bytes=8, radix=2, digits=53, max_exponent=1024; bool nie zastępuje integer | $1$; ABI, nie science PASS |
+| cpu_abi_witness.cpp / bytes | exact generated source, <=8 KiB | $1$; fixed production witness |
+| cpu_abi_witness / bytes | regular file, 1..16 MiB; actual SHA256 | $1$; production provenance executable |
+| cpu_abi_witness.json / JSON | regular UTF8 unique-key file, 1..4 KiB; same job/source/flags; no self hash | $1$; retained observation |
+| boris-cpu-abi-compile/link/observe / stages | unique exit=0; exact compile/link/run commands; bounded stdout <=4 KiB | $1$; managed execution evidence required |
+
+Wspólne Python authoring, ProblemIR, FDM/FEM równania i publiczne jednostki
+pozostają niezmienione. Witness dotyczy wyłącznie zewnętrznego BORIS CPU;
+nie kwalifikuje FDM CPU/GPU ani FEM CPU/GPU Fullmaga. Toolchain/dependencies
+pozostają faktyczną bramką preflight: brak FFTW3/X11/TBB odmawia przed compile.
+Actual source implementation: scripts/local_runner/boris_cpu.py::run_build,
+validate_abi_outputs, validate_outputs; output membership scripts/local_runner/build_entrypoint.py::required_outputs_for_profile.
+
 (source-code-index)=
 ## 8. Source-code index
 
@@ -2487,6 +2567,12 @@ a qualified workload without the validation gates above.
 
 | Claim | Path | Symbol | Responsibility | Evidence |
 |---|---|---|---|---|
+| boris-cpu-abi-build-source | scripts/local_runner/boris_cpu.py | run_build | Fixed actual-source CPU ABI production stages share solver compiler flags/link/environment; no execution proof. | source_only; interpreted guards, no native run |
+| boris-cpu-abi-verifier-source | scripts/local_runner/boris_cpu.py | validate_abi_outputs | Bounded witness/source/flags/same-job observation and exact stage command binding; no runtime identity admission. | source_only; interpreted guards, no native run |
+| boris-cpu-abi-witness-contract | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:boris-cpu-abi-witness-contract | fixed CPU ABI provenance, separate runtime admission gate | planned_contract; no compilation/runtime proof |
+| boris-managed-build-proof-gate | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:boris-managed-build-proof-gate | legacy incomplete, future trusted v2 receipt prerequisite | planned contract, runtime NOT VERIFIED |
+| boris-raw-unit-algorithm | scripts/compare_boris_fullmag_she_nf.py | _normalize_boris_fields | pure raw OVF unit mapping after admission; synthetic checker uses algorithm only | 8 points/72 tensor checks, no solver proof |
+| boris-build-admission-source | scripts/run_boris_nf_interface.py | _require_verified_build | refusal before output/runtime without trusted build proof | interpreted guards, no native proof |
 | Kontrakt projekcji tensora | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:spin-current-tensor-projection-contract | komponent, norma i wektor kolumny po interpolacji | planned contract, runtime/UI jeszcze niezweryfikowane |
 | Metadane tensora spinowego | crates/fullmag-quantities/src/catalog.rs | tensor_descriptor | rank, shape, flow/spin axes i 9 etykiet z canonical ID | implementacja; runtime/API jeszcze niezweryfikowane |
 | Adapter BORIS v2 | scripts/compare_boris_fullmag_she_nf.py | normalize_boris_artifact; _concat_qia | flow-major rows i raw-OVF provenance | raw OVF fixture, nie parity solverów |

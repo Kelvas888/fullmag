@@ -10,7 +10,9 @@ import math
 from dataclasses import replace
 from pathlib import Path
 
-from compare_boris_fullmag_she_nf import compare_transport_artifacts, normalize_boris_artifact
+from compare_boris_fullmag_she_nf import (
+    _normalize_boris_fields, compare_transport_artifacts, normalize_boris_artifact,
+)
 from verify_boris_nf_interface import (
     MeshFields, compute_interface_balance, compute_interface_slice, read_text_ovf,
 )
@@ -78,7 +80,8 @@ def fixture(root: Path) -> tuple[dict[str, dict[str, Path]], list[list[float]]]:
     }
     summary = {
         "schema_version": "fullmag.boris_she_nf.v1",
-        "runtime": {"identity_complete": True, "kind": "synthetic_raw_ovf_fixture",
+        "runtime": {"schema_version": "fullmag.boris.runtime.v1", "identity_complete": False,
+                    "precision": None, "kind": "synthetic_raw_ovf_fixture",
                     "solver_executed": False},
         "scenario": {"workload": "N/F", "parameters": {
             "SHA": 0.1, "iSHA": 0.1, "Gi_Spm2": 1.0, "Gmix_Spm2": [2.0, 3.0],
@@ -104,8 +107,20 @@ def main() -> int:
         source_hashes[relative] = actual
         if actual != expected_hash:
             errors.append(f"source hash mismatch: {relative}")
+    if args.output_dir.exists() and any(args.output_dir.iterdir()):
+        raise RuntimeError("adapter fixture output must be fresh")
     fields, expected = fixture(args.output_dir / "raw-ovf")
-    artifact = normalize_boris_artifact(args.output_dir / "raw-ovf")
+    raw_root = args.output_dir / "raw-ovf"
+    try:
+        normalize_boris_artifact(raw_root)
+    except ValueError as error:
+        if "incomplete" not in str(error):
+            raise
+    else:
+        errors.append("synthetic input was admitted by the public benchmark gate")
+    artifact = _normalize_boris_fields(raw_root,
+        json.loads((raw_root / "summary.json").read_text(encoding="utf-8")),
+        source="synthetic_raw_ovf_algorithm_fixture")
 
     def check(label: str, actual: float, desired: float) -> None:
         if not math.isclose(actual, desired, rel_tol=2e-15, abs_tol=1e-15):
@@ -146,7 +161,8 @@ def main() -> int:
     summary["interface_balances"]["normal_sign"] = -1
     summary["interface_balances"]["normal_spin_flux"] = [999.0] * 3
     summary_path.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    reversed_artifact = normalize_boris_artifact(args.output_dir / "raw-ovf")
+    reversed_artifact = _normalize_boris_fields(raw_root, summary,
+        source="synthetic_raw_ovf_algorithm_fixture")
     for a in range(3):
         n = (expected[2][6 + a] + expected[3][6 + a]) / 2
         f = (expected[4][6 + a] + expected[5][6 + a]) / 2
@@ -168,6 +184,8 @@ def main() -> int:
         "schema": "fullmag.boris_tensor_adapter.raw_ovf_check.v1",
         "status": "pass" if not errors else "fail",
         "qualification": "adapter_fixture_only",
+        "public_runtime_admission": "refused_incomplete_synthetic_identity",
+        "solver_executed": False,
         "upstream_commit": PINNED_COMMIT, "source_sha256": source_hashes,
         "adapter_version": artifact.conventions.get("adapter_version"),
         "point_count": len(expected), "tensor_component_checks": len(expected) * 9,

@@ -16,7 +16,7 @@ import uuid
 from fullmag_storage import StorageError, build_lock, initialize, resolve_layout, validate_path
 from local_runner.queue import JobQueue, QueueError
 from local_runner.source import SourceError
-from local_runner.container_client import ContainerClientError, SLEPC_MODAL_PROFILES
+from local_runner.container_client import ContainerClientError, CATALOG_PROFILES
 from local_runner.coordinator import CoordinatorError, acknowledge_uncreated, configure_image, configured_image, execute_once, reconcile
 
 
@@ -33,6 +33,7 @@ def main(argv=None):
     profile_activation = container_config.add_mutually_exclusive_group()
     profile_activation.add_argument('--enable-current-contracts', action='store_true')
     profile_activation.add_argument('--enable-slepc-modal', action='store_true')
+    container_config.add_argument('--enable-boris-cpu', action='store_true')
     replacement = sub.add_parser('container-replace')
     replacement.add_argument('--image-id', required=True)
     sub.add_parser('container-resume')
@@ -44,7 +45,7 @@ def main(argv=None):
     configure = sub.add_parser('configure-image')
     configure.add_argument('--image-id', required=True)
     build_config = sub.add_parser('configure-build')
-    build_config.add_argument('--profile', choices=SLEPC_MODAL_PROFILES, required=True)
+    build_config.add_argument('--profile', choices=CATALOG_PROFILES, required=True)
     build_config.add_argument('--image-id', required=True)
     build_config.add_argument('--cpus', type=float, default=2)
     build_config.add_argument('--memory-mib', type=int, default=8192)
@@ -64,7 +65,7 @@ def main(argv=None):
     submit.add_argument('--request-key', default=None)
     # Do not advertise build/qualification until the corresponding executor is verified.
     submit.add_argument('--operation', choices=('verify-source', 'build'), default='verify-source')
-    submit.add_argument('--profile', choices=SLEPC_MODAL_PROFILES)
+    submit.add_argument('--profile', choices=CATALOG_PROFILES)
     args = parser.parse_args(argv)
     try:
         layout = resolve_layout(args.repo_root, 'windows-native')
@@ -92,6 +93,7 @@ def main(argv=None):
                     port=args.port,
                     enable_current_contracts=args.enable_current_contracts,
                     enable_slepc_modal=args.enable_slepc_modal,
+                    enable_boris_cpu=args.enable_boris_cpu,
                 )
             elif args.action == 'container-replace':
                 result = container_client.replace(layout, args.image_id, owner=owner)

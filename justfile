@@ -123,6 +123,14 @@ runner-once:
 runner-build mode profile="fem-cpu-release" ref="":
     {{storage_python}} scripts/local_runner_cli.py submit --operation build --profile {{quote(profile)}} --source {{quote(mode)}} {{if ref == "" { "" } else { "--ref " + quote(ref) }}}
 
+# Capture clean pinned BORIS sources under resolver-owned storage; no build.
+runner-boris-image-context boris_source toolchain_image:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/boris_cpu.py" prepare-image-context --repo-root {{quote(repo_root)}} --boris-source {{quote(boris_source)}} --toolchain-image {{quote(toolchain_image)}}
+
+# External CPU reference uses the same single heavy-build queue after opt-in.
+runner-boris-build mode ref="":
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner_cli.py" submit --operation build --profile boris-cpu-v1 --source {{quote(mode)}} {{if ref == "" { "" } else { "--ref " + quote(ref) }}}
+
 runner-configure-build profile image_id:
     {{storage_python}} scripts/local_runner_cli.py configure-build --profile {{quote(profile)}} --image-id {{quote(image_id)}}
 

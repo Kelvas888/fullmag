@@ -1,0 +1,10 @@
+# Offline provisioning only; base already contains all CPU build dependencies.
+ARG TOOLCHAIN_IMAGE
+FROM ${TOOLCHAIN_IMAGE}
+USER root
+COPY source/ /opt/fullmag-boris/source/
+COPY source_manifest.json /opt/fullmag-boris/source_manifest.json
+RUN chmod -R a+rX /opt/fullmag-boris
+USER 65532:65532
+ENV PYTHONDONTWRITEBYTECODE=1
+LABEL org.fullmag.local-runner.boris-contract="boris-cpu-v1"

@@ -241,7 +241,7 @@ def test_interface_slice_uses_normal_flux_and_tsi_thickness() -> None:
 def test_artifact_validation_is_fail_closed(tmp_path: Path) -> None:
     payload = {
         "schema_version": "fullmag.boris_she_nf.v1",
-        "runtime": {"identity_complete": True},
+        "runtime": {"schema_version": "fullmag.boris.runtime.v1", "identity_complete": True},
         "scenario": {
             "workload": "N/F",
             "parameters": {
@@ -266,5 +266,5 @@ def test_artifact_validation_is_fail_closed(tmp_path: Path) -> None:
     (tmp_path / "f_field.ovf").write_text("# OOMMF OVF 2.0\n", encoding="utf-8")
     (tmp_path / "summary.json").write_text(json.dumps(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="OVF"):
+    with pytest.raises(ValueError, match="verified managed build proof"):
         validate_boris_artifact(tmp_path)

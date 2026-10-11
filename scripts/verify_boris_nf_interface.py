@@ -528,6 +528,8 @@ def validate_boris_artifact(root: Path) -> dict[str, object]:
     runtime = payload.get("runtime")
     if not isinstance(runtime, dict) or runtime.get("identity_complete") is not True:
         raise ValueError("BORIS artifact runtime identity is incomplete")
+    from run_boris_nf_interface import validate_runtime_identity
+    validate_runtime_identity(runtime)
     scenario = payload.get("scenario")
     if not isinstance(scenario, dict) or scenario.get("workload") != "N/F":
         raise ValueError("BORIS artifact scenario workload must be N/F")

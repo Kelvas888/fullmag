@@ -383,6 +383,17 @@ def normalize_boris_artifact(path: Path) -> NormalizedTransportArtifact:
 
     root = path if path.is_dir() else path.parent
     payload = validate_boris_artifact(root)
+    return _normalize_boris_fields(root, payload, source=str(path))
+
+
+def _normalize_boris_fields(
+    root: Path, payload: Mapping[str, Any], *, source: str,
+) -> NormalizedTransportArtifact:
+    """Pure OVF unit mapping after admission; this helper grants no runtime proof.
+
+    Synthetic regression callers exercise this algorithm directly. Public
+    benchmark callers must enter through normalize_boris_artifact.
+    """
     scenario = payload["scenario"]
     parameters = scenario["parameters"]
     fields = payload["fields"]
@@ -464,7 +475,7 @@ def normalize_boris_artifact(path: Path) -> NormalizedTransportArtifact:
     }
     shape = (n_shape[0], n_shape[1], n_shape[2] + f_shape[2])
     return NormalizedTransportArtifact(
-        source=str(path),
+        source=source,
         shape=shape,
         origin_m=normal["V"].origin_m,
         step_m=normal["V"].step_m,

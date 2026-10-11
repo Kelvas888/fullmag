@@ -92,6 +92,33 @@ usuwania storage. Samo `configure` nie podmienia istniejącej instalacji.
 Zdrowie API i stan wykonawcy są oddzielne: sprawdzaj `accepting_jobs`,
 `worker_alive`, błąd oraz stan kolejki, nie tylko Docker `running`.
 
+### Zewnętrzna referencja BORIS CPU — profil źródłowy
+
+`boris-cpu-v1` jest osobnym profilem buildu zewnętrznej referencji, a nie
+backendem Fullmaga. Implementacja źródłowa nie aktywuje go w operatorowym
+katalogu. Istniejące profile i ich receipt zachowują dotychczasowy kontrakt.
+
+`just runner-boris-image-context <checkout-BORIS> sha256:<image-id-toolchaina>`
+przygotowuje ograniczony kontekst pod resolverowym `storage/tmp`. Wymaga czystego
+checkoutu dokładnie `048503d2ca6475e91b073eb1762ecf9d3634c3e1`, sprawdza każdy
+blob Git i zapisuje manifest SHA-256. Nie pobiera źródeł ani zależności i nie
+buduje obrazu. Wskazany toolchain musi już mieć g++, readelf, Python embedding
+oraz biblioteki developerskie FFTW3, X11 i TBB; sam argument image ID nie jest
+dowodem ich obecności.
+
+Po odrębnym provisioningu, weryfikacji obrazu oraz jawnym opt-in operatora
+`just runner-boris-build commit <pełny-SHA-Fullmaga>` zgłasza build do tej samej
+kolejki. Konfiguracja koordynatora wymaga `--enable-boris-cpu`; profil workera
+musi wskazywać niezmienny obraz z przypiętymi źródłami. Aktualizacja operatora
+wymaga opisanej wyżej pauzy i pustego aktywnego slotu. Nie zmieniaj konfiguracji
+ani obrazu w trakcie cudzego buildu.
+
+Worker stosuje stały overlay CPU, kompiluje źródła C++ i sprawdza zależności
+ELF. Receipt wiąże obraz, kapsułę Fullmaga, oryginalne źródła, overlay i binarium.
+Sukces kompilacji nie dowodzi precyzji wykonania ani poprawności adaptera.
+Provisioning, terminalny receipt, admission rzeczywistego runtime i nowe
+porównanie naukowe pozostają **NOT VERIFIED**.
+
 ## Dane, zakończenie i retencja
 
 - `storage/runs/<worktree-id>/<capture-id>/source`: kapsuła readonly.

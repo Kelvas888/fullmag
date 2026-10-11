@@ -26,6 +26,7 @@ PROFILES = {
     'fem-cpu-current-contracts-v1': ('fem', 'cpu'),
     'fem-gpu-current-contracts-v1': ('fem', 'gpu'),
     'fem-cpu-slepc-modal-v1': ('fem', 'cpu'),
+    'boris-cpu-v1': ('external-reference', 'cpu'),
 }
 TARGETS = {'source': '/source', 'workspace': '/workspace',
            'build': '/workspace/.fullmag-build', 'artifacts': '/artifacts',
@@ -87,7 +88,10 @@ def capsule_path(storage, job):
 
 def trusted_identity(run_root, journal, storage):
     for name, expected in journal['trusted_hashes'].items():
-        if name not in ('build_entrypoint.py', 'worker_entrypoint.py', 'context.json'):
+        allowed = ('build_entrypoint.py', 'worker_entrypoint.py', 'context.json')
+        if journal.get('profile') == 'boris-cpu-v1':
+            allowed += ('boris_cpu.py',)
+        if name not in allowed:
             raise ValueError('Unknown trusted input')
         path = validate_path(run_root / 'trusted' / name, storage)
         if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
@@ -113,6 +117,8 @@ def prepare_worker_directory(path, storage):
 
 
 def dependency_cache_paths(storage, profile):
+    if profile == 'boris-cpu-v1':
+        raise ValueError('BORIS external reference uses private execution paths, no shared solver cache')
     backend, device = profile_lane(profile)
     lane = backend + '-' + device
     base = Path(storage) / 'cache' / 'windows' / lane
@@ -201,12 +207,14 @@ def validate_build_receipt(artifacts, job, journal):
     if not isinstance(entries, list) or not entries:
         raise ValueError('Build receipt has no artifacts')
     outputs = required_outputs_for_profile(job['profile'])
-    required = {'outputs/.fullmag/local/' + name for name in outputs}
+    output_root = 'outputs/boris/' if job['profile'] == 'boris-cpu-v1' else 'outputs/.fullmag/local/'
+    required = {output_root + name for name in outputs}
     if not required.issubset({entry.get('path') for entry in entries}):
         raise ValueError('Required build outputs missing')
     stages = receipt.get('stages', [])
+    required_stages = () if job['profile'] == 'boris-cpu-v1' else ('native-build', 'frontend-dependencies', 'frontend-build')
     if any(not any(stage.get('name') == name and stage.get('exit_code') == 0 for stage in stages)
-           for name in ('native-build', 'frontend-dependencies', 'frontend-build')):
+           for name in required_stages):
         raise ValueError('Required build stages did not pass')
     seen = set()
     for entry in entries:
@@ -222,6 +230,9 @@ def validate_build_receipt(artifacts, job, journal):
         digest = artifact_sha256(artifact)
         if digest != entry['sha256']:
             raise ValueError('Artifact hash mismatch')
+    if job["profile"] == "boris-cpu-v1":
+        from local_runner.boris_cpu import validate_outputs
+        validate_outputs(Path(artifacts), receipt)
     return receipt
 
 
@@ -326,9 +337,11 @@ def execute_build(layout, *, owner, call=docker, sleep=time.sleep, timeout_secon
             run_root = validate_path(storage / 'runs' / job['worktree_id'] / job['job_id'], storage)
             run_root.mkdir(exist_ok=False)
             profile_key = 'runner-' + job['profile'] + '-' + config['image_digest'][7:19]
+            caches = ({name: run_root / ('unused-' + name) for name in ('cargo', 'rustup', 'pnpm')}
+                      if job['profile'] == 'boris-cpu-v1' else dependency_cache_paths(storage, job['profile']))
             paths = {'source': capsule, 'workspace': run_root / 'execution', 'artifacts': run_root / 'artifacts',
                      'trusted': run_root / 'trusted', 'build': storage / 'builds' / job['worktree_id'] / profile_key,
-                     **dependency_cache_paths(storage, job['profile'])}
+                     **caches}
             for key, path in paths.items():
                 validate_path(path, storage)
                 if layout.get('container_coordinator') and key in ('cargo', 'rustup', 'pnpm'):
@@ -342,7 +355,10 @@ def execute_build(layout, *, owner, call=docker, sleep=time.sleep, timeout_secon
                 for key in ('workspace', 'artifacts', 'build'):
                     prepare_worker_directory(paths[key], storage)
             trusted_hashes = {}
-            for filename in ('build_entrypoint.py', 'worker_entrypoint.py'):
+            trusted_files = ('build_entrypoint.py', 'worker_entrypoint.py')
+            if job['profile'] == 'boris-cpu-v1':
+                trusted_files += ('boris_cpu.py',)
+            for filename in trusted_files:
                 content = (Path(__file__).parent / filename).read_bytes()
                 (paths['trusted'] / filename).write_bytes(content)
                 trusted_hashes[filename] = hashlib.sha256(content).hexdigest()
