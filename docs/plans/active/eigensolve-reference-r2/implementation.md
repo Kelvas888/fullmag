@@ -834,3 +834,8 @@ Field follow-up source fix: merger eigen_sweep zachowuje niepusty mode_output_se
 #38140440374 potwierdził poprawiony branches pointer, lecz dalsza paused-prefix regression ujawniła odrzucanie requestu dla przyszłej nieobliczonej próbki1. Naprawa musi zachować planned intent i publikować accepted prefix; invalid poza pełnym planem pozostaje błędem. Nie uznano całej publikacji za zakończoną.
 
 Nowe4241399051 jest zasadne: sample identity wcześniej sprawdzało wyłącznie pierwszy mod i diagnostykę. Dodano ścisłe sprawdzanie trzech hashów każdego dalszego modu przed publikacją, bez zmiany legalnych wartości ani empty-sample fallback. Regresja obejmuje zgodne mody, obie kolejności konfliktu dla każdego hasha, brak/null/malformed w dalszym modzie z diagnostyką i bez. Parser/diff PASS; GHA wykonanie wymagane.
+
+
+## Actual field freshness 4241442695
+
+Po wyborze zaakceptowanej observation frame freshness helper aktualizuje teraz nie tylko source_step/time/stale_by_steps, lecz również Complete/StaleComplete i reason field_stale_complete. Brak wybranej frame nie zmienia istniejącego wyniku. Existing router test rzeczywistego callbacku physical7→SolverProgress8 wymaga teraz state/reason obok source_step i wieku; scoped GHA wykonuje named test z guardem zero-tests. Parser/diff PASS; execution pending.

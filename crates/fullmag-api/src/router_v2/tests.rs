@@ -38916,6 +38916,8 @@ async fn v2_progress_keeps_live_magnetization_at_its_original_observation_step()
     assert_eq!(meta["source_time_seconds"], 7.0e-12);
     assert_eq!(meta["observation_frame"]["source_step"], 7);
     assert_eq!(meta["stale_by_steps"], 1);
+    assert_eq!(meta["state"], "stale_complete");
+    assert_eq!(meta["materialization_reason_code"], "field_stale_complete");
 
     let response = app
         .oneshot(

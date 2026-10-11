@@ -1408,6 +1408,13 @@ fn freshness_from_selected_observation_frame(
         .source_time_seconds
         .filter(|time| time.is_finite() && *time >= 0.0);
     freshness.stale_by_steps = current_source_step(snapshot).saturating_sub(frame.source_step);
+    freshness.state = if freshness.stale_by_steps == 0 {
+        FieldMaterializationState::Complete
+    } else {
+        FieldMaterializationState::StaleComplete
+    };
+    freshness.materialization_reason_code = (freshness.stale_by_steps > 0)
+        .then_some("field_stale_complete".to_string());
     freshness
 }
 
