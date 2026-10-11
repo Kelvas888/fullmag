@@ -1,5 +1,23 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Zapis etapu i build integracyjny — 2026-10-11:**
+Spójny przyrost producent/ABI2 → Rust decoder/archive v2 → typed API →
+wspólny Inspector/renderer raw J zapisano jako
+`62d9618b2eebec639e52eeea842ffde19525a4bd`. Zakres i dowody poniżej;
+nie zamyka to fizyki, rzeczywistego runtime ani całego T00–T18.
+Po commicie worktree było czyste; changed-scientific-docs gate exit 0.
+Zgłoszono dokładnie jeden `fem-cpu-release` build przez istniejący,
+zdrowy koordynator: nr 41, `1128d9f468ee4b0981387a8cdf448451`.
+Tryb `commit`, pełny SHA powyżej, `source_snapshot_dirty=false`;
+kapsuła `164ce78afc59e0e195b82c34d9a959762a420416abf4a6fdf0c91669c5059d57`,
+native snapshot `ad8075fbd2d058c120537e316de8aff14b7b98563875e0e2668436418cb2e0a2`.
+Build przyjęto jako `queued`, ostatni odczyt API: `running`;
+brak jeszcze terminalnego wyniku/exit code.
+Nie ponawiać submit: obserwować ten job, odebrać receipt i artefakty,
+a następnie wykonać solve/publikację/cold-load/HTTP i scientific gates.
+Poniższy starszy tekst „WIP” opisuje zakres kwalifikacji, nie brak commita.
+Backend/sesja na 3197 nie były zmieniane ani restartowane.
+
 **Aktualny punkt wznowienia — 2026-10-11 (owned snapshot `J_charge`, WIP):**
 Natywny producent `solve_accepted_external_lead_display_bundle` zachowuje
 legacy bundle i próbkuje J z tego samego live accepted RT0 przed zwolnieniem
