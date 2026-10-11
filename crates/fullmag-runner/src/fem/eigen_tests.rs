@@ -45,7 +45,7 @@ use num_complex::Complex64;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 
 fn frozen_v2_record_fixture() -> AcceptedFemRelaxStageHandoffV2Record {
@@ -10105,6 +10105,298 @@ fn native_modal_run_result_completion_matches_status() {
         .completion
         .expect("completed results carry completion");
     assert_eq!(completion.status, "completed");
+
+    let paused = native_modal_run_result(RunStatus::Paused, StepStats::default(), Vec::new());
+    assert_eq!(paused.status, RunStatus::Paused);
+    let completion = paused
+        .completion
+        .expect("paused results carry completion");
+    assert_eq!(completion.status, "paused");
+    assert!(!completion.converged);
+    assert_eq!(completion.reason, None);
+}
+
+#[test]
+fn direct_floquet_runtime_control_preserves_pause_and_stop_reasons() {
+    let pause_request = AtomicU8::new(NativeModalControlRequest::None as u8);
+    record_native_modal_control_request(&pause_request, StepAction::Pause);
+    assert_eq!(
+        NativeModalControlRequest::from_atomic_value(pause_request.load(Ordering::Relaxed)),
+        NativeModalControlRequest::Pause
+    );
+    record_native_modal_control_request(&pause_request, StepAction::Continue);
+    assert_eq!(
+        NativeModalControlRequest::from_atomic_value(pause_request.load(Ordering::Relaxed)),
+        NativeModalControlRequest::Pause
+    );
+    let stop_request = AtomicU8::new(NativeModalControlRequest::None as u8);
+    record_native_modal_control_request(&stop_request, StepAction::Stop);
+    assert_eq!(
+        NativeModalControlRequest::from_atomic_value(stop_request.load(Ordering::Relaxed)),
+        NativeModalControlRequest::Stop
+    );
+    let pause_wins = AtomicU8::new(NativeModalControlRequest::None as u8);
+    record_native_modal_control_request(&pause_wins, StepAction::Stop);
+    record_native_modal_control_request(&pause_wins, StepAction::Pause);
+    assert_eq!(
+        NativeModalControlRequest::from_atomic_value(pause_wins.load(Ordering::Relaxed)),
+        NativeModalControlRequest::Pause
+    );
+
+    let paused =
+        NativeModalTerminalState::resolve(true, NativeModalControlRequest::Pause);
+    assert_eq!(paused.run_status(), RunStatus::Paused);
+    assert_eq!(
+        paused.diagnostics_stop_reason(),
+        Some("pause_requested")
+    );
+    assert_eq!(paused.partial_stop_reason(), Some("pause_requested"));
+
+    let stopped =
+        NativeModalTerminalState::resolve(true, NativeModalControlRequest::Stop);
+    assert_eq!(stopped.run_status(), RunStatus::Cancelled);
+    assert_eq!(
+        stopped.diagnostics_stop_reason(),
+        Some("cancel_requested")
+    );
+    assert_eq!(stopped.partial_stop_reason(), Some("cancelled"));
+
+    let interrupted_without_step_action =
+        NativeModalTerminalState::resolve(true, NativeModalControlRequest::None);
+    assert_eq!(
+        interrupted_without_step_action.run_status(),
+        RunStatus::Cancelled
+    );
+    assert_eq!(
+        interrupted_without_step_action.diagnostics_stop_reason(),
+        Some("cancel_requested")
+    );
+
+    let completed = NativeModalTerminalState::resolve(false, NativeModalControlRequest::Pause);
+    assert_eq!(completed.run_status(), RunStatus::Completed);
+    assert_eq!(completed.diagnostics_stop_reason(), None);
+    assert_eq!(completed.partial_stop_reason(), None);
+}
+
+#[test]
+fn direct_floquet_pause_and_stop_metadata_match_checkpoint_receipts() {
+    let plan = minimal_native_modal_plan();
+    let mut provenance = ExecutionProvenance::default();
+    provenance.execution_engine = "fem_eigen_cpu_native".to_string();
+    provenance.precision = "double".to_string();
+
+    for (terminal_state, expected_status, expected_diagnostics_reason, expected_partial_reason) in [
+        (
+            NativeModalTerminalState::Paused,
+            "paused",
+            "pause_requested",
+            "pause_requested",
+        ),
+        (
+            NativeModalTerminalState::Cancelled,
+            "cancelled",
+            "cancel_requested",
+            "cancelled",
+        ),
+    ] {
+        let mode_payload = b"complex mode vector bytes".to_vec();
+        let mode_payload_sha256 =
+            format!("sha256:{:x}", Sha256::digest(&mode_payload));
+        let mode_field_id = "analysis:eigen:sample-0000:mode-0000";
+        let mode_metadata_path = "eigen/modes/sample_0000/mode_0000.json";
+        let mode_payload_path = "eigen/mode_fields/sample_0000/mode_0000/vector.bin";
+        let selection_index = serde_json::json!({
+            "schema_version": "eigen_mode_output_selection.v1",
+            "payload_semantics": "full_complex_delta_m",
+            "field_selections": [{
+                "field": "mode",
+                "sample_index": 0,
+                "raw_mode_indices": [0],
+            }],
+            "payloads": [{
+                "field": "mode",
+                "sample_index": 0,
+                "raw_mode_index": 0,
+                "mode_field_id": mode_field_id,
+                "metadata_path": mode_metadata_path,
+                "payload_path": mode_payload_path,
+                "payload_sha256": mode_payload_sha256.clone(),
+            }],
+        });
+        let mode_selection_bytes = serde_json::to_vec_pretty(&selection_index).unwrap();
+        let mut solver_diagnostics = serde_json::json!({
+            "status": "ready",
+            "complete": true,
+        });
+        apply_native_modal_terminal_diagnostics(&mut solver_diagnostics, terminal_state)
+            .expect("terminal state should produce solver diagnostics");
+
+        let spectrum = serde_json::json!({
+            "schema_version": "eigen_spectrum.v2",
+            "samples": [],
+        });
+        let spectrum_bytes = serde_json::to_vec_pretty(&spectrum).unwrap();
+        let spectrum_revision = format!("sha256:{:x}", Sha256::digest(&spectrum_bytes));
+        let manifest = serde_json::json!({
+            "schema_version": "frequency_domain_manifest.v1",
+            "status": "ready",
+            "complete": true,
+            "artifacts": {
+                "spectrum_v2_path": "eigen/spectrum.v2.json",
+                "mode_output_selection_path": "eigen/mode_output_selection.v1.json",
+            },
+            "cross_artifact_refs": [{
+                "relation": "source_spectrum",
+                "artifact": "eigen/spectrum.v2.json",
+                "revision": spectrum_revision.clone(),
+            }],
+        });
+        let mut artifacts = vec![
+            json_artifact(
+                "frequency_domain/manifest.v1.json",
+                &manifest,
+            )
+            .unwrap(),
+            AuxiliaryArtifact {
+                relative_path: "eigen/spectrum.v2.json".to_string(),
+                bytes: spectrum_bytes.clone(),
+            },
+            AuxiliaryArtifact {
+                relative_path: "eigen/mode_output_selection.v1.json".to_string(),
+                bytes: mode_selection_bytes.clone(),
+            },
+            json_artifact(
+                mode_metadata_path,
+                &serde_json::json!({
+                    "sample_index": 0,
+                    "raw_mode_index": 0,
+                    "mode_field_id": mode_field_id,
+                    "payload_sha256": mode_payload_sha256,
+                    "requested_fields": ["mode"],
+                    "field_output_selection_path": "eigen/mode_output_selection.v1.json",
+                }),
+            )
+            .unwrap(),
+            AuxiliaryArtifact {
+                relative_path: mode_payload_path.to_string(),
+                bytes: mode_payload.clone(),
+            },
+            json_artifact("eigen/diagnostics/solver.v1.json", &solver_diagnostics).unwrap(),
+        ];
+        append_native_modal_terminal_artifacts(&mut artifacts, terminal_state, 0, 1)
+            .expect("terminal state should update and preserve its artifact manifest");
+
+        let artifact = |path: &str| {
+            artifacts
+                .iter()
+                .find(|artifact| artifact.relative_path == path)
+                .unwrap_or_else(|| panic!("missing artifact {path}"))
+        };
+        let terminal_diagnostics: serde_json::Value =
+            serde_json::from_slice(&artifact("eigen/diagnostics/solver.v1.json").bytes).unwrap();
+        assert_eq!(terminal_diagnostics["status"], "interrupted");
+        assert_eq!(terminal_diagnostics["complete"], false);
+        assert_eq!(
+            terminal_diagnostics["stop_reason"],
+            expected_diagnostics_reason
+        );
+        let partial: serde_json::Value =
+            serde_json::from_slice(&artifact("eigen/partial.v1.json").bytes).unwrap();
+        assert_eq!(partial["complete"], false);
+        assert_eq!(partial["stop_reason"], expected_partial_reason);
+        let final_manifest: serde_json::Value =
+            serde_json::from_slice(&artifact("frequency_domain/manifest.v1.json").bytes)
+                .unwrap();
+        assert_eq!(final_manifest["status"], "interrupted");
+        assert_eq!(final_manifest["complete"], false);
+        assert_eq!(
+            final_manifest["artifacts"]["mode_output_selection_path"],
+            "eigen/mode_output_selection.v1.json"
+        );
+        assert_eq!(
+            artifact("eigen/mode_output_selection.v1.json").bytes.as_slice(),
+            mode_selection_bytes.as_slice()
+        );
+        let final_selection: serde_json::Value = serde_json::from_slice(
+            &artifact("eigen/mode_output_selection.v1.json").bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            final_selection["field_selections"],
+            serde_json::json!([{
+                "field": "mode",
+                "sample_index": 0,
+                "raw_mode_indices": [0],
+            }])
+        );
+        assert_eq!(
+            final_selection["payloads"][0]["payload_sha256"],
+            format!("sha256:{:x}", Sha256::digest(&artifact(mode_payload_path).bytes))
+        );
+        assert_eq!(
+            artifact(mode_payload_path).bytes.as_slice(),
+            mode_payload.as_slice()
+        );
+        assert_eq!(
+            final_manifest["cross_artifact_refs"][0]["revision"],
+            spectrum_revision
+        );
+        assert_eq!(
+            final_manifest["cross_artifact_refs"][0]["revision"],
+            format!("sha256:{:x}", Sha256::digest(&artifact("eigen/spectrum.v2.json").bytes))
+        );
+
+        let status = terminal_state.run_status();
+        let result = native_modal_run_result(status, StepStats::default(), Vec::new());
+        assert_eq!(result.status, status);
+        assert_eq!(
+            result.completion.as_ref().map(|completion| completion.status.as_str()),
+            Some(expected_status)
+        );
+        let checkpoint_artifacts = super::single_k_checkpoint::
+            interrupted_single_k_diagnostic_artifacts(
+                0,
+                [0.0, 0.0, 0.0],
+                &plan,
+                &artifacts,
+                status,
+                &provenance,
+            )
+            .expect("interrupted checkpoint receipt should preserve status and provenance");
+        let checkpoint_manifest: serde_json::Value = serde_json::from_slice(
+            &checkpoint_artifacts
+                .iter()
+                .find(|artifact| {
+                    artifact.relative_path
+                        == "eigen/diagnostics/raw_single_k/sample_0000/manifest.json"
+                })
+                .expect("checkpoint manifest is published")
+                .bytes,
+        )
+        .unwrap();
+        assert_eq!(checkpoint_manifest["run_status"], expected_status);
+        assert_eq!(
+            checkpoint_manifest["execution_provenance"],
+            serde_json::to_value(&provenance).unwrap()
+        );
+        let partial_record = checkpoint_manifest["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["source_relative_path"] == "eigen/partial.v1.json")
+            .expect("checkpoint receipt covers the terminal partial artifact bytes");
+        let copied_partial = checkpoint_artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.relative_path
+                    == "eigen/diagnostics/raw_single_k/sample_0000/eigen/partial.v1.json"
+            })
+            .expect("checkpoint retains the terminal partial artifact");
+        assert_eq!(
+            partial_record["sha256"],
+            format!("{:x}", Sha256::digest(&copied_partial.bytes))
+        );
+    }
 }
 
 #[cfg(feature = "fem-gpu")]

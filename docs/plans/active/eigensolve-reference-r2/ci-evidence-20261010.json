@@ -553,6 +553,20 @@
       "failure": "paused tracked sweep rejects requested future sample1 as unknown; eigen_path.rs1727",
       "log_sha256": "0754b37a93f75964fae602a12df8aa39a91ff86e96d3237cb18109f12ee0fecd",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38140833390,
+      "sha": "80cb2ad0fe1d358acec4eed68c6c58e01c85257b",
+      "conclusion": "failure",
+      "scope": "all_mode_identity_and_field_selection",
+      "identity_tests_passed": 5,
+      "identity_tests_failed": 0,
+      "named_identity_regression": "fem::eigen_sweep::native_field_sweep_identity_tests::every_mode_in_a_field_sweep_sample_must_share_valid_provenance",
+      "output_selection_tests_passed": 15,
+      "actual_single_writer_test_passed": true,
+      "failure": "later independent paused-prefix selection regression still rejects requested future sample1",
+      "log_sha256": "da2707402f4140fc40bc62896b90ec82a8d63bfe8d1da84b1959c9236bdce6c4",
+      "qualification_claimed": false
     }
   ]
 }

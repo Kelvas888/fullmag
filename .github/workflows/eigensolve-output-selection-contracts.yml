@@ -34,6 +34,12 @@ jobs:
         run: cargo test --locked -p fullmag-runner --lib eigen::output_selection::tests -- --nocapture
       - name: Validate provenance across all sweep modes
         run: cargo test --locked -p fullmag-runner --lib fem::eigen_sweep::native_field_sweep_identity_tests -- --nocapture
+      - name: Preserve direct Floquet pause and stop lifecycle
+        run: |
+          cargo test --locked -p fullmag-runner --lib fem::eigen_tests::direct_floquet_runtime_control_preserves_pause_and_stop_reasons -- --exact | tee "$RUNNER_TEMP/floquet-control.log"
+          grep -F "test fem::eigen_tests::direct_floquet_runtime_control_preserves_pause_and_stop_reasons ... ok" "$RUNNER_TEMP/floquet-control.log"
+          cargo test --locked -p fullmag-runner --lib fem::eigen_tests::direct_floquet_pause_and_stop_metadata_match_checkpoint_receipts -- --exact | tee "$RUNNER_TEMP/floquet-terminal.log"
+          grep -F "test fem::eigen_tests::direct_floquet_pause_and_stop_metadata_match_checkpoint_receipts ... ok" "$RUNNER_TEMP/floquet-terminal.log"
       - name: Run actual single-sample writer contract
         run: |
           cargo test --locked -p fullmag-runner --lib fem::eigen_tests::native_eigen_v2_mode_metadata_preserves_operator_provenance -- --exact --nocapture | tee "$RUNNER_TEMP/modal-single-writer.log"

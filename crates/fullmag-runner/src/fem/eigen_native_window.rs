@@ -55,6 +55,7 @@ use super::eigen_solve::{
 };
 use super::eigen_types::{NativeBlochFloquetDensePayload, SharedDomainModeContext};
 use crate::native_fem;
+use crate::types::AuxiliaryArtifact;
 use crate::types::ExecutedRun;
 use crate::types::RunError;
 use crate::types::RunResult;
@@ -74,6 +75,7 @@ use num_complex::Complex64;
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
@@ -316,6 +318,163 @@ pub(super) fn native_modal_run_result(
             crate::relaxation::RelaxationCompletionMetrics::default(),
         )),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// The numeric order is terminal priority; Pause wins if both callback actions
+// are observed, matching the runner's other stage finalizers.
+#[repr(u8)]
+pub(super) enum NativeModalControlRequest {
+    None = 0,
+    Stop = 1,
+    Pause = 2,
+}
+
+pub(super) fn record_native_modal_control_request(
+    requested_control: &AtomicU8,
+    action: StepAction,
+) {
+    let value = match action {
+        StepAction::Continue => NativeModalControlRequest::None as u8,
+        StepAction::Pause => NativeModalControlRequest::Pause as u8,
+        StepAction::Stop => NativeModalControlRequest::Stop as u8,
+    };
+    if value != NativeModalControlRequest::None as u8 {
+        requested_control.fetch_max(value, Ordering::Relaxed);
+    }
+}
+
+impl NativeModalControlRequest {
+    pub(super) fn from_atomic_value(value: u8) -> Self {
+        match value {
+            value if value == Self::Pause as u8 => Self::Pause,
+            value if value == Self::Stop as u8 => Self::Stop,
+            _ => Self::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeModalTerminalState {
+    Completed,
+    Cancelled,
+    Paused,
+}
+
+impl NativeModalTerminalState {
+    pub(super) fn resolve(
+        interrupted: bool,
+        requested_control: NativeModalControlRequest,
+    ) -> Self {
+        if !interrupted {
+            Self::Completed
+        } else if requested_control == NativeModalControlRequest::Pause {
+            Self::Paused
+        } else {
+            Self::Cancelled
+        }
+    }
+
+    pub(super) fn is_interrupted(self) -> bool {
+        self != Self::Completed
+    }
+
+    pub(super) fn run_status(self) -> RunStatus {
+        match self {
+            Self::Completed => RunStatus::Completed,
+            Self::Cancelled => RunStatus::Cancelled,
+            Self::Paused => RunStatus::Paused,
+        }
+    }
+
+    pub(super) fn diagnostics_stop_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Completed => None,
+            Self::Cancelled => Some("cancel_requested"),
+            Self::Paused => Some("pause_requested"),
+        }
+    }
+
+    pub(super) fn partial_stop_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Completed => None,
+            Self::Cancelled => Some("cancelled"),
+            Self::Paused => Some("pause_requested"),
+        }
+    }
+}
+
+pub(super) fn apply_native_modal_terminal_diagnostics(
+    diagnostics: &mut serde_json::Value,
+    terminal_state: NativeModalTerminalState,
+) -> Result<(), RunError> {
+    if !terminal_state.is_interrupted() {
+        return Ok(());
+    }
+    let stop_reason = terminal_state
+        .diagnostics_stop_reason()
+        .ok_or_else(|| RunError {
+            message: "interrupted native modal state is missing a stop reason".to_string(),
+        })?;
+    let object = diagnostics.as_object_mut().ok_or_else(|| RunError {
+        message: "native modal solver diagnostics must be a JSON object".to_string(),
+    })?;
+    object.insert("status".to_string(), serde_json::json!("interrupted"));
+    object.insert("complete".to_string(), serde_json::json!(false));
+    object.insert("stop_reason".to_string(), serde_json::json!(stop_reason));
+    object.insert(
+        "partial_artifacts_available".to_string(),
+        serde_json::json!(true),
+    );
+    Ok(())
+}
+
+pub(super) fn append_native_modal_terminal_artifacts(
+    auxiliary_artifacts: &mut Vec<AuxiliaryArtifact>,
+    terminal_state: NativeModalTerminalState,
+    sample_index: usize,
+    preserved_mode_count: usize,
+) -> Result<(), RunError> {
+    if !terminal_state.is_interrupted() {
+        return Ok(());
+    }
+    let partial_stop_reason = terminal_state
+        .partial_stop_reason()
+        .ok_or_else(|| RunError {
+            message: "interrupted native modal state is missing a partial stop reason".to_string(),
+        })?;
+    let manifest_artifact = auxiliary_artifacts
+        .iter_mut()
+        .find(|artifact| artifact.relative_path == "frequency_domain/manifest.v1.json")
+        .ok_or_else(|| RunError {
+            message: "native Floquet interruption is missing its frequency-domain manifest"
+                .to_string(),
+        })?;
+    let mut manifest = serde_json::from_slice::<serde_json::Value>(&manifest_artifact.bytes)
+        .map_err(|error| RunError {
+            message: format!(
+                "native Floquet interruption frequency-domain manifest is invalid JSON: {error}"
+            ),
+        })?;
+    let manifest_object = manifest.as_object_mut().ok_or_else(|| RunError {
+        message: "native Floquet frequency-domain manifest must be a JSON object".to_string(),
+    })?;
+    manifest_object.insert("status".to_string(), serde_json::json!("interrupted"));
+    manifest_object.insert("complete".to_string(), serde_json::json!(false));
+    manifest_artifact.bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| RunError {
+        message: format!("failed to serialize native Floquet interruption manifest: {error}"),
+    })?;
+    auxiliary_artifacts.push(json_artifact(
+        "eigen/partial.v1.json",
+        &serde_json::json!({
+            "schema_version": "fem_floquet_modal_partial.v1",
+            "complete": false,
+            "stop_reason": partial_stop_reason,
+            "sample_index": sample_index,
+            "preserved_mode_count": preserved_mode_count,
+        }),
+    )?);
+    Ok(())
 }
 
 pub(super) fn execute_native_modal_window(
@@ -1475,7 +1634,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
     } else {
         operator_diagnostics_value.to_string()
     };
-    let stop_requested = AtomicBool::new(false);
+    let requested_control = AtomicU8::new(NativeModalControlRequest::None as u8);
     // Keep the phase-reduced Floquet path interruptible for the same two
     // control sources as the shared-domain native path: runtime callbacks and
     // the opt-in managed cancellation deadline used by qualification tests.
@@ -1485,7 +1644,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
         .map(|milliseconds| Instant::now() + Duration::from_millis(milliseconds));
     let live_progress_sink = RefCell::new(progress.take());
     let cancel_callback = || {
-        stop_requested.load(Ordering::Relaxed)
+        requested_control.load(Ordering::Relaxed) != NativeModalControlRequest::None as u8
             || cancellation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
     };
     let progress_callback = |progress_json: &str| {
@@ -1499,9 +1658,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
             return;
         };
         if let Some(callback) = live_progress_sink.borrow_mut().as_deref_mut() {
-            if callback(event) != StepAction::Continue {
-                stop_requested.store(true, Ordering::Relaxed);
-            }
+            record_native_modal_control_request(&requested_control, callback(event));
         }
     };
     let solver_policy = native_modal_solver_policy(plan);
@@ -1552,8 +1709,9 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
     .map_err(|message| RunError { message })?;
     progress = live_progress_sink.into_inner();
 
-    let interrupted = native_result.status == native_fem::NativeFrequencyDomainStatus::Interrupted;
-    if native_result.status != native_fem::NativeFrequencyDomainStatus::Ok && !interrupted {
+    let native_interrupted =
+        native_result.status == native_fem::NativeFrequencyDomainStatus::Interrupted;
+    if native_result.status != native_fem::NativeFrequencyDomainStatus::Ok && !native_interrupted {
         return Err(RunError {
             message: format!(
                 "native FEM modal_eigen Bloch/Floquet production CPU solve failed: {} (diagnostics_json={})",
@@ -1561,6 +1719,11 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
             ),
         });
     }
+    let terminal_state = NativeModalTerminalState::resolve(
+        native_interrupted,
+        NativeModalControlRequest::from_atomic_value(requested_control.load(Ordering::Relaxed)),
+    );
+    let interrupted = terminal_state.is_interrupted();
     let native_execution_attestation = if let Some(execution) = planned_execution {
         let resolution = execution.resolution().ok_or_else(|| RunError {
             message: "planned_fem_eigen_resolution_missing_at_native_boundary".to_string(),
@@ -1611,20 +1774,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
             }
         }
     }
-    if interrupted {
-        if let Some(object) = solver_diagnostics.as_object_mut() {
-            object.insert("status".to_string(), serde_json::json!("interrupted"));
-            object.insert("complete".to_string(), serde_json::json!(false));
-            object.insert(
-                "stop_reason".to_string(),
-                serde_json::json!("cancel_requested"),
-            );
-            object.insert(
-                "partial_artifacts_available".to_string(),
-                serde_json::json!(true),
-            );
-        }
-    }
+    apply_native_modal_terminal_diagnostics(&mut solver_diagnostics, terminal_state)?;
     let result_value = serde_json::from_str::<serde_json::Value>(&native_result.result_json)
         .map_err(|error| RunError {
             message: format!("failed to parse native modal result JSON: {error}"),
@@ -1699,18 +1849,12 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
         state_artifact_sample_index,
         defer_mode_output_selection_binding,
     )?;
-    if interrupted {
-        auxiliary_artifacts.push(json_artifact(
-            "eigen/partial.v1.json",
-            &serde_json::json!({
-                "schema_version": "fem_floquet_modal_partial.v1",
-                "complete": false,
-                "stop_reason": "cancelled",
-                "sample_index": artifact_sample_index,
-                "preserved_mode_count": modes.len(),
-            }),
-        )?);
-    }
+    append_native_modal_terminal_artifacts(
+        &mut auxiliary_artifacts,
+        terminal_state,
+        artifact_sample_index,
+        modes.len(),
+    )?;
 
     let stats = StepStats {
         step: relaxation_steps,
@@ -1749,11 +1893,7 @@ pub(super) fn execute_native_cpu_modal_window_from_bloch_floquet_complex_with_pr
         )?;
     }
 
-    let status = if interrupted {
-        RunStatus::Cancelled
-    } else {
-        RunStatus::Completed
-    };
+    let status = terminal_state.run_status();
 
     Ok(ExecutedRun {
         result: native_modal_run_result(status, stats, equilibrium),

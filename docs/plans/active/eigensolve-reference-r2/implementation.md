@@ -839,3 +839,10 @@ Nowe4241399051 jest zasadne: sample identity wcześniej sprawdzało wyłącznie 
 ## Actual field freshness 4241442695
 
 Po wyborze zaakceptowanej observation frame freshness helper aktualizuje teraz nie tylko source_step/time/stale_by_steps, lecz również Complete/StaleComplete i reason field_stale_complete. Brak wybranej frame nie zmienia istniejącego wyniku. Existing router test rzeczywistego callbacku physical7→SolverProgress8 wymaga teraz state/reason obok source_step i wieku; scoped GHA wykonuje named test z guardem zero-tests. Parser/diff PASS; execution pending.
+
+
+## Pauza direct Floquet 4240898338 — osobny terminal lifecycle
+
+Callback zachowuje Pause/Stop w atomic reason; wspólny terminal state steruje RunStatus, completion, diagnostics reason, partial metadata i manifest interrupted/complete=false. Pauza nie staje się Cancelled. Pole i mode-output-selection payloady/provenance zachowane; manifest nie ma self-hash, existing spectrum refs pozostają związane z niemutowanymi bytes. Helper regressions sprawdzają latching, priority, Pause/Stop i checkpoint status/provenance/SHA. Root review poprawił początkową sprzeczną asercję priority; parser/diff PASS. GHA pending, actual native C ABI interruption NOT VERIFIED. Generic boundary progress→RunError jest osobnym otwartym findingiem i nie został przez tę poprawkę ukryty.
+
+All-mode provenance #38140833390:5 identity tests PASS, w tym nowa named regression; całe CI nadal FAIL w odrębnej paused-prefix selection. Awarii nie przemianowano na pełny PASS.
