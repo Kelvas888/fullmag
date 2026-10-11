@@ -1,5 +1,35 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Snapshot do odbioru — build nr 45, queued:**
+Po zakończeniu review i zamrożeniu wszystkich writerów zgłoszono
+`fc763cf735b74842bc07fbe92915b6e0` z base
+`47323b145006b8f9148bbf0113fef910bcc99723`, source digest
+`03d5128036b8ef790435045ffe48d3530970b14168a0268921b6860ab4a22b77`,
+native snapshot `71a01b577cc4bab9ed6ace95f2f1d1a4114b7bc33bf234de73a711a5186ee181`.
+Kapsuła obejmuje terminalny ACK, guard bez zmiany connectivity przy odmowie
+oraz cold-import normalization, z dwoma jawnie dołączonymi nowymi modułami.
+To snapshot WIP, nie clean commit ani sukces buildu. Następny krok:
+terminalny receipt i walidacja pakietu → `run-managed-antenna-http-ram`
+z dokładnie tymi pinami → rzeczywisty cold import → browser/UI.
+Zweryfikowane narzędzie negatywnej bramki zapisano w powyższym base commicie;
+same poprawki Rust pozostają WIP do odbioru managed. Workspace 3197 bez zmian.
+
+**Cold import — kod po review, odbiór runtime otwarty:**
+`session_persistence.rs::import_session_commit_with_context` normalizuje
+istniejące refs inspekcji przed zmianą katalogu artefaktów i publikacją importu.
+`session_persistence_antenna_import.rs::normalize_registered_refs` zachowuje
+autorstwo etapu, wymaga dokładnego runtime stage/run namespace, starego rootu
+oraz faktycznej obecności rekordu w `FmsStagedPreflight::contains_document`.
+Przepisuje ref na względny suffix; nigdy nie odczytuje starego hosta i nie
+odtwarza refs przez skanowanie archiwum. Plan całej zamiany jest walidowany
+przed mutacją. Obce rooty, traversal, aliasy, duplikaty i brakujące rekordy
+kończą import błędem przed publikacją. Compact/bez artefaktów i nieznane
+etykiety nie są przepisywane. Payloady nadal waliduje canonical reader.
+Niezależny source review nie wykazał Required/Blocker; pięć regresji Rust
+zapisano, ale nie uruchomiono ani nie skompilowano. Wymagane pozostają managed
+build oraz real warm → archive → cold import z niedostępnym starym rootem,
+następnie metadata/display/binary V/J/H i negatywne próby archiwum.
+
 **Przyrost terminalnej publikacji — kod po review, runtime NOT VERIFIED:**
 Dodano `live_workspace.rs::LocalLiveWorkspace::publish_terminal_and_wait`
 oraz `terminal_publication.rs::TerminalPublication`: niezmienny snapshot,
