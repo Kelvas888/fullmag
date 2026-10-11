@@ -27,6 +27,77 @@ def test_http_error_preserves_bounded_real_failure(monkeypatch):
     assert str(caught.value) == "HTTP 404 at /missing: " + "x" * 4096
 
 
+def terminal_status():
+    return {"session": {"session_id": "session", "session_epoch": "scientific@123",
+                        "request_scope_epoch": "api-instance:7"},
+            "run": {"run_id": "run"}, "resources": {"fields": {"revision": 3}},
+            "lifecycle": {"connectivity": "connected"}}
+
+
+def owner_error(code):
+    message = "terminal_snapshot_owner_stale" if code == 409 else "invalid terminal snapshot owner header"
+    error_code = message if code == 409 else "bad_request"
+    return json.dumps({"code": error_code, "error": message, "message": message}).encode()
+
+
+def test_terminal_owner_probe_checks_real_rejections_without_scientific_injection(monkeypatch):
+    requests = []
+    status = terminal_status()
+    monkeypatch.setattr(gate, "get_json", lambda path: status)
+    class Opener:
+        def open(self, request, timeout):
+            assert timeout == 5
+            assert request.full_url.endswith("/internal/live/snapshot")
+            body = json.loads(request.data)
+            assert set(body) == {"session_id", "metadata"}
+            guard = json.loads(request.get_header("X-fullmag-terminal-owner"))
+            requests.append(guard)
+            code = 400 if "unknown" in guard else 409
+            raise gate.HTTPError(request.full_url, code, "rejected", {}, io.BytesIO(owner_error(code)))
+    monkeypatch.setattr(gate, "build_opener", lambda *args: Opener())
+    result = gate.reject_stale_terminal_owners()
+    assert result["status"] == "pass" and len(result["cases"]) == 5
+    assert result["concurrent_race_qualified"] is False
+    assert result["timeout_qualified"] is False
+    assert requests[0]["session_epoch"] == 7
+    assert requests[1]["session_epoch"] == 8
+
+
+@pytest.mark.parametrize("failure", ["accepted", "wrong_code", "oversized", "changed_resources",
+                                     "changed_lifecycle", "unrelated_error", "wrong_guard_code"])
+def test_terminal_owner_probe_fails_closed(monkeypatch, failure):
+    calls = []
+    def status(path):
+        value = terminal_status()
+        if calls and failure == "changed_resources":
+            value["resources"]["fields"]["revision"] = 4
+        if calls and failure == "changed_lifecycle":
+            value["lifecycle"]["connectivity"] = "degraded"
+        return value
+    monkeypatch.setattr(gate, "get_json", status)
+    class Response:
+        status = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+    class Opener:
+        def open(self, request, timeout):
+            calls.append(request)
+            if failure == "accepted": return Response()
+            guard = json.loads(request.get_header("X-fullmag-terminal-owner"))
+            code = 400 if "unknown" in guard else 409
+            if failure == "wrong_code": code = 500
+            body = b"x" * 5000 if failure == "oversized" else owner_error(code)
+            if failure == "unrelated_error": body = b'{}'
+            if failure == "wrong_guard_code" and code == 400:
+                detail = json.loads(body)
+                detail["code"] = "unrelated_error"
+                body = json.dumps(detail).encode()
+            raise gate.HTTPError(request.full_url, code, "rejected", {}, io.BytesIO(body))
+    monkeypatch.setattr(gate, "build_opener", lambda *args: Opener())
+    with pytest.raises(ValueError):
+        gate.reject_stale_terminal_owners()
+
+
 def document(tmp_path):
     return gate.http_spec("sha256:" + "a" * 64, tmp_path / "source",
         tmp_path / "package", tmp_path / "input", tmp_path / "export", tmp_path / "tools")

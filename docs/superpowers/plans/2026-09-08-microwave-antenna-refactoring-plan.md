@@ -1,5 +1,46 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Przyrost terminalnej publikacji — kod po review, runtime NOT VERIFIED:**
+Dodano `live_workspace.rs::LocalLiveWorkspace::publish_terminal_and_wait`
+oraz `terminal_publication.rs::TerminalPublication`: niezmienny snapshot,
+monotoniczny numer, ograniczone oczekiwanie i dokładny ACK przez istniejący
+serialny worker. Orchestrator czeka przed zakończeniem lease; błąd zachowuje
+wyniki i scratch. API off pozostaje no-op. Worker najpierw odprowadza próbki
+skalarne i istniejącą transakcję generacji pól, potem końcowe metadane oraz
+diagnostykę. Nie wymusza nielegalnego zastąpienia pól ani powtórzenia generacji.
+Prywatny istniejący RPC snapshot przyjmuje precondition owner w nagłówku
+`x-fullmag-terminal-owner`. `main.rs::validate_terminal_snapshot_owner`
+sprawdza session/run oraz licznik i instancję request scope pod blokadą
+przejścia, przed apply. Sprawdzenie GET przed/po POST nie zastępuje tej kontroli.
+Pierwszy frame może wymagać rzeczywiście pustego workspace; po wcześniejszej
+próbie publikacji worker nie odtwarza znikniętej sesji. Bootstrap nie publikuje
+najnowszej próbki przed starszymi. Publiczne OpenAPI i frontend nie zmieniają się.
+Niezależny source review: wcześniejsze Required poprawione; diff check PASS.
+Regresje Rust zapisano, ale **nie kompilowano ani nie uruchamiano** zgodnie
+z obowiązującym zakazem. Managed build i rzeczywiste V/J/H HTTP smokes muszą
+dopiero potwierdzić poprawkę. Nie zmienia to negatywnego wyniku buildu nr 41
+w bramie HTTP ani pozostałych otwartych bramek fizycznych T00–T18.
+Zgłoszono snapshot buildu nr 44: `17744d15abc742eabb56dfee08cf04a6`,
+base `b66fa562e1e9e32021517b9ffe352ca69f1575d8`, source digest
+`b8cf3d4fe776eca4bf4cb1f5a1f9fea2e2b9d2d2fc123ba975af4613683e187a`,
+native snapshot `9eaf08f0fb60923796f9fbd309ce93f2b11dc5f99a584254ab041cfb754a9f16`.
+Build pozostał w kolejce i został anulowany przed rozpoczęciem kompilacji
+po wykryciu dodatkowego skutku ubocznego odrzucenia ownera. Stan terminalny
+`cancelled` potwierdzono; kapsuła pozostaje zachowana. Następny snapshot musi
+zawierać poprawkę: tylko typowane błędy admission `terminal_snapshot_owner_stale`
+i `terminal_snapshot_owner_busy` nie oznaczają bieżącej sesji jako degraded.
+Pozostałe błędy apply zachowują dotychczasowe zachowanie.
+Osobno przypinane narzędzie `run_managed_antenna_http_ram.py::reject_stale_terminal_owners`
+sprawdza po rzeczywistym read-back odrzucenie złego runu, epoki, instancji API,
+bootstrapu bez wymaganej jawnej koperty session/run i nieznanego pola guardu.
+Nie wstrzykuje pól naukowych ani refs; wymaga rzeczywistego kodu i komunikatu
+błędu oraz niezmienności właściciela, rewizji zasobów i lifecycle.
+Regresje interpretowane helpera: **41 PASS**. To nie jest runtime dowód
+wyścigu współbieżnego, timeoutu ani bootstrapu poprawnej koperty do niepustej
+sesji; te kwalifikacje pozostają otwarte. Regresję odrzucenia ownera bez zmiany
+connectivity zapisano także w Rust, lecz nie uruchomiono.
+Narzędzie uzupełniono po capture i nie przypisuje się go kapsule buildu nr 44.
+
 **Brama rzeczywistego HTTP — wynik negatywny, 2026-10-11:**
 Dodano kontrolowaną receptę `just run-managed-antenna-http-ram` i obserwator,
 używające istniejącego buildu nr 41, osobno przypiętych SHA narzędzi oraz
@@ -26,7 +67,7 @@ Regresje helpera/launchera: **38 PASS + 7 subtestów**; wcześniejszy łączny
 pakiet readerów, transportu i helpera: **181 PASS + 49 subtestów**.
 Komparator V/J/H poniżej dotyczy odrębnego, zakończonego sukcesem runu bez API.
 
-**Następny przyrost — terminalny ACK publikacji (jeszcze nie zaimplementowany):**
+**Kontrakt przyrostu — terminalny ACK publikacji (kod powyżej, odbiór otwarty):**
 `crates/fullmag-cli/src/live_workspace.rs::CurrentLivePublisher` uruchamia
 worker bez zachowania `JoinHandle`; `request_publish` jedynie kolejkuje wake.
 `current_live_publisher_loop` ma drain po zamknięciu kanału, ale orchestrator

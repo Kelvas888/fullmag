@@ -16,7 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
-from urllib.request import ProxyHandler, build_opener
+from urllib.request import ProxyHandler, Request, build_opener
 from urllib.error import HTTPError
 
 PROFILE = "managed-antenna-http-ram-cpu"
@@ -115,6 +115,60 @@ def smoke(script, stage, export):
     return result
 
 
+def reject_stale_terminal_owners():
+    """Probe only this owned RAM API after the scientific read-back.
+
+    This is a negative admission test, not a concurrent-race or timeout proof.
+    It does not inject scientific fields or stage references.
+    """
+    before = get_json("/v2/sessions/current/status")
+    session = before["session"]
+    run = before["run"]
+    scope = session["request_scope_epoch"]
+    epoch = int(scope.rsplit(":", 1)[1])
+    owner = {"session_id": session["session_id"], "run_id": run["run_id"],
+             "session_epoch": epoch, "request_scope_epoch": scope,
+             "require_empty": False}
+    cases = {
+        "wrong_run": ({**owner, "run_id": owner["run_id"] + "-stale"}, 409),
+        "wrong_epoch": ({**owner, "session_epoch": epoch + 1}, 409),
+        "wrong_instance": ({**owner, "request_scope_epoch": "other-api:" + str(epoch)}, 409),
+        "missing_bootstrap_payload": ({"session_id": owner["session_id"],
+                               "run_id": owner["run_id"], "require_empty": True}, 409),
+        "malformed_guard": ({**owner, "unknown": True}, 400),
+    }
+    results = {}
+    body = json.dumps({"session_id": owner["session_id"],
+                       "metadata": {"terminal_guard_rejection_probe": True}}).encode()
+    opener = build_opener(ProxyHandler({}))
+    for name, (guard, expected) in cases.items():
+        request = Request(ORIGIN + "/v2/sessions/current/internal/live/snapshot",
+            data=body, method="POST", headers={"content-type": "application/json",
+            "x-fullmag-terminal-owner": json.dumps(guard)})
+        try:
+            with opener.open(request, timeout=5) as response:
+                raise ValueError(f"Stale terminal owner accepted: {name}: {response.status}")
+        except HTTPError as error:
+            raw = error.read(4097)
+            if error.code != expected or len(raw) > 4096:
+                raise ValueError(f"Unexpected terminal guard rejection: {name}: {error.code}")
+            detail = json.loads(raw)
+            message = ("terminal_snapshot_owner_stale" if expected == 409
+                       else "invalid terminal snapshot owner header")
+            error_code = "terminal_snapshot_owner_stale" if expected == 409 else "bad_request"
+            if not isinstance(detail, dict) or detail.get("error") != message \
+                    or detail.get("message") != message \
+                    or detail.get("code") != error_code:
+                raise ValueError(f"Unrelated error is not a terminal guard rejection: {name}")
+            results[name] = {"http_status": error.code}
+    after = get_json("/v2/sessions/current/status")
+    if any(after[key] != before[key] for key in ("session", "run", "resources", "lifecycle")):
+        raise ValueError("Rejected terminal guard changed owner or resource revisions")
+    return {"status": "pass", "cases": results,
+            "concurrent_race_qualified": False, "timeout_qualified": False,
+            "nonempty_bootstrap_qualified": False}
+
+
 def execute_in_container():
     export, tools = Path("/export"), Path("/tools")
     expected = json.loads((tools / "manifest.json").read_text())
@@ -179,6 +233,7 @@ def execute_in_container():
             result["http_smokes"] = {
                 name: smoke(name, "stage-000", export) for name in
                 ("smoke_antenna_external_lead_inspection.py", "smoke_antenna_inspection_display.py")}
+            result["terminal_owner_negative_admission"] = reject_stale_terminal_owners()
             # Both API handlers invoke the full canonical disk loader. The
             # Python smoke itself correctly does not claim native decoding.
             result.update(state="warm_http_pass", runtime_stage_id="stage-000",
