@@ -57,10 +57,11 @@ mutacją. Niepoprawny format jest błędem żądania.
 Backend wiąże oczekiwaną tożsamość z immutable request context pod blokadą
 transition. Ponowne otwarcie tego samego `session_id` i `session_epoch` otrzymuje
 inny `request_scope_epoch`; stary nagłówek dostaje 409. Klucze cache, decode
-i generacja viewportu używają tej samej inkarnacji. Brak nagłówka pozostaje
-kompatybilny z bootstrapem i klientami
-w migracji; nie jest dowodem ochrony wieloetapowej operacji. Szczegóły
-ograniczeń i usunięcia adaptera: ADR 0011, uzupełnienie P3a z 22.09.2026.
+i generacja viewportu używają tej samej inkarnacji. Dla odczytów i publicznej
+ścieżki browser bootstrap brak nagłówka zachowuje adapter migracyjny;
+nie jest dowodem ochrony wieloetapowej operacji. Wewnętrzna publikacja solvera
+ma obowiązkowy kontrakt opisany poniżej. Szczegóły ograniczeń adaptera
+browser: ADR 0011, uzupełnienie P3a z 22.09.2026.
 
 Pierwsza zaakceptowana publikacja sesji przez wewnętrzny publisher solvera
 również zwiększa licznik inkarnacji API (`current_live_session_epoch`), nawet
@@ -69,6 +70,43 @@ blokadą transition razem z pierwszym snapshotem. Kolejne klatki tej samej
 sesji nie zwiększają licznika; odrzucona pierwsza klatka ani wyczerpanie
 licznika nie publikują sesji. Nie zmienia to naukowego `session_epoch`
 zapisanego w metadanych sesji ani kształtu zasobów OpenAPI.
+
+### Wewnętrzny publisher: potwierdzona inkarnacja sesji
+
+Zmiana z 11.10.2026 wymaga spójnego nowego pakietu API/CLI. Wewnętrzne
+kanały snapshot, session, runtime, scalar, fields i heartbeat wymagają
+`x-fullmag-session-scope`, gdy sesja jest już aktywna. Kontrola wszystkich
+trzech pól odbywa się pod blokadą transition przed zastosowaniem klatki,
+zapisem journalu lub aktualizacją liveness. Brak nagłówka albo obca inkarnacja
+kończy się 409; starszy publisher nie otrzymuje cichego trybu zgodności.
+
+Jedyny bootstrap bez nagłówka to pełny snapshot z kanonicznym `session`,
+z zgodnym `session_id`, przy braku aktywnej sesji. Delta i heartbeat nie
+mogą utworzyć sesji. Zaakceptowana publikacja zwraca
+`{accepted: true, session_scope: {session_id, session_epoch, request_scope_epoch}, revision}`.
+Scope i revision pochodzą z zaakceptowanego stanu tej samej transakcji.
+CLI współdzieli jedno powiązanie między kanałami, serializuje wysyłanie
+i przyjmuje kolejne potwierdzenia. Naukowy `session_epoch` może zmienić się
+wraz z lifecycle; potwierdzenie nie może zmienić inkarnacji API/sesji
+`request_scope_epoch`. Brak lub niezgodne potwierdzenie blokuje dalszą
+publikację tego ownera; nie wolno pobrać nowego tokenu z GET i przepiąć
+starego publishera do odtworzonej sesji.
+
+Scratch runtime otrzymuje scope w nagłówku odpowiedzi
+`POST /v2/sessions/current/model/syncs` i przekazuje go do dziecka jako
+`FULLMAG_ATTACHED_SESSION_SCOPE`. Kształt JSON ScriptSyncResponse pozostaje
+bez zmian. Import lub zmiana sesji pomiędzy ACK i publikacją dziecka powoduje
+odmowę starego scope. To kontrakt wewnętrznego bridge; przeglądarka nadal
+korzysta z istniejącego API v2, facady i resource hooks.
+
+Właściciele implementacji: `crates/fullmag-api/src/main.rs`
+(`require_current_live_publisher_scope`, `sync_current_live_frame_update`),
+`crates/fullmag-api/src/router_v2/middleware/session_scope.rs`
+(`session_scope_middleware`), `crates/fullmag-cli/src/control_room/live_publisher_scope.rs`
+(`LivePublisherScope::send`) oraz `crates/fullmag-cli/src/scratch_runtime.rs`.
+Kod i kontrole źródłowe nie zastępują dowodu zgodnego buildu API/CLI,
+rzeczywistego HTTP ani archive → cold-load → HTTP; te bramki E5 pozostają
+NOT VERIFIED do wykonania na pakiecie o zapisanej tożsamości.
 
 WebSocket nie przenosi scope w URL. Pierwszy `hello.payload.request_scope_epoch`
 jest wymagany i odpowiada inkarnacji przechwyconej przy upgrade. Klient ze
