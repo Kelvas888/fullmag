@@ -1,5 +1,22 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Kontynuacja odbioru — 2026-10-11, build 47 queued:**
+Zweryfikowany fragment edytora portu zapisano w commicie
+`5c573ac4fcd2b9db13a7cf954fc06e82274055f1`.
+Po potwierdzeniu zdrowia runnera i osobnego aktywnego zadania nr 46 zgłoszono
+nową kapsułę przez zaufany klient tej samej kolejki, bez zatrzymywania kontenerów:
+job `f11d42f1ab354cb38870baba73c652f3`, profil `fem-cpu-release`,
+base `5c573ac4fcd2b9db13a7cf954fc06e82274055f1`, source digest
+`fbd49d5fbb22cafb7d9a47ed33e2d3daad5720dd16723ceea8060b35445e5ace`,
+native snapshot `8453732232feabeefc7218e76e6a3ed2c909299bb036d408f16e4ec62215fe55`,
+capture `d59822fcd7204527b7656adc34fd96b8`. Stan przy zgłoszeniu: `queued`.
+Kapsuła jawnie zawiera oba nowe moduły Rust; siedem zmian natywnych pozostaje
+WIP. Build 45 zachowuje terminalne `blocked`; nie zmieniano jego rekordu.
+To nie sukces kompilacji ani odbioru naukowego. Po terminalnym sukcesie 47
+należy wykonać `run-managed-antenna-cold-http-ram` z dokładnie powyższymi
+czterema pinami, sprawdzić warm/cold metadata/display/binary V/J/H i negatywne
+próby importu. Brak poprawnego receipt blokuje ten run, nie upoważnia do fallbacku.
+
 **Checkpoint T15 — 2026-10-11, edycja istniejącego portu; build 45 blocked:**
 Ten wpis aktualizuje stan wcześniejszych checkpointów: edytor istniejącego
 portu jest zaimplementowany, a build nr 45 nie jest już `queued`, lecz `blocked`.
