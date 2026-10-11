@@ -982,3 +982,10 @@ Native interruption nadal NOT VERIFIED. Odrębny serial worker wait zachowuje wc
 ## Korekta CPU provenance wykryta w pełnej suite
 
 GHA38153749590 na a848dce7bb842efb701563a4a991138a148fa221:1614 PASS,1 FAIL,1 ignored. Nowe adaptive pool regressions PASS, ale explicit_cpu_zhang_li_plan_reaches_cpu_preflight wykrył istniejącą policy-only lukę: GPU small-mesh policy stosowała się też do resolved CPU i nadpisywała fallback. Guard ogranicza ją do nadal NativeGpu; CPU oraz wcześniejszy fallback zachowane. Deterministyczna regresja wymusza threshold i zachowuje previous host env przed assertions, obejmuje CPU bez fallback oraz CPU z wcześniejszą decyzją. Strict GPU nadal failclosed, legal extended GPU fallback bez zmian. Zakres requested/resolved zgodny z istniejącym0600 i czterema lanes backend masterplan; nie zmieniono fizyki, publicznych tokenów, API/generated ani deklaracji capability. SOURCE/parser PASS, nowy GHA wymagany.
+
+
+## Checkpoint do niezależnego audytu GitHub — 11.10.2026
+
+Source1c398528a762ced690fb09cf00082619c4031bc8:38154212824 SUCCESS (1616runner tests,1ignored,38scientific contracts). Adaptive38153749586 SUCCESS:56scoped tests. Native38153278619 FAIL:7/12PASS,5FAIL; poprawka patternfixture nie zamknęła testu. Rowfault diagnostic checks rhs/solution unchanged są false; nie dowodzi to jeszcze rzeczywistej mutacji, dopóki nie rozróżnimy unavailable od mismatch.
+
+4060116242: przyjęta decyzja użytkownika per_sample=indywidualnie adresowalne widmo każdego k, global=kolekcja sweepa; planowane wdrożenie/publication contract nadal otwarte. Nie uśredniać różnych k, nie migrować historycznych artefaktów bez jawnego versioned contract. Starsze zapisy o braku odpowiedzi są historyczne. [Checkpoint audytowy](../../../superpowers/plans/external-review-checkpoint-20261011.md) określa zakres źródeł i pozostałe ograniczenia.

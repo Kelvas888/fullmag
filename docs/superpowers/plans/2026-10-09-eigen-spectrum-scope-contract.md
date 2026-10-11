@@ -1,6 +1,6 @@
 # Kontrakt spectrum_scope — propozycja naprawy #4060116242
 
-Stan: diagnoza źródłowa potwierdzona; wybór semantyki oczekuje na odpowiedź użytkownika. Implementacja i wykonanie **NOT VERIFIED**. Nie jest to przyjęty nowy kontrakt API.
+Stan na 11.10.2026: użytkownik wybrał wariant 1: osobno adresowalne per_sample oraz global jako kolekcja całego sweepa. Decyzja semantyczna jest przyjęta; lowering, publikacja, zasoby i wykonanie pozostają **NOT VERIFIED**. Nie jest to dowód wdrożonego nowego kontraktu API.
 
 ## Obecna luka
 
@@ -13,7 +13,7 @@ Obecny artefakt v2/v3 ma jedną kolekcję `samples[]`. Specyfikacje frequency-do
 1. **Osobno adresowalne per_sample + kolekcja global (propozycja zalecana):** global publikuje widmo całego badania jako kolekcję niezależnych próbek. Per_sample publikuje widma próbek z uporządkowanym indeksem i stabilnymi IDs. Scope opisuje publikację, nie zmianę operatora ani jedno wspólne rozwiązanie dla różnych k/pól.
 2. **Grupowanie w jednym zasobie:** oba zakresy pozostają jednym resource, ale różnica jest jawnie zdefiniowana w jego projekcji i konsumentach. Zawartość fizyczna i tożsamość próbek pozostają identyczne.
 
-Użytkownik otrzymał pytanie o ten wybór. Brak odpowiedzi nie jest zgodą na zmianę publicznej semantyki. Dopiero wybór pozwoli ustalić minimalny scoped ADR/spec, shape/version resource i zaimplementować całą ścieżkę.
+Odpowiedź użytkownika z 11.10.2026: „Zalecane: per_sample daje osobno adresowalne widmo każdego k; global daje kolekcję całego sweepa.” Wariant 2 nie został wybrany. Kolejny krok implementacyjny obejmuje scoped ADR/spec, wersjonowany shape zasobów i całą ścieżkę. Dotychczasowych artefaktów nie migrujemy ani nie klasyfikujemy retroaktywnie na podstawie samej kolekcji samples[].
 
 ## Wspólne niezmienniki
 

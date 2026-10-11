@@ -847,12 +847,25 @@
     {
       "run_id": 38153278619,
       "sha": "9c82dca62c3e12fe0252f509f473e3c6c2cf7586",
-      "conclusion": "pending",
+      "conclusion": "failure",
       "scope": "floquet-modal-slepc_pattern_descriptor_and_row_fault_diagnostics",
       "dispatch": "bootstrap.yml contract_scope=floquet-modal-slepc",
       "head_sha_verified_after_ACK": true,
       "private_runtime_attestation": "NOT VERIFIED",
-      "qualification_claimed": false
+      "qualification_claimed": false,
+      "tests_passed": 7,
+      "tests_failed": 5,
+      "tests_total": 12,
+      "failure_phase": "native CTest after successful source build",
+      "failed_tests": [
+        "fem_modal_eigen_contract",
+        "modal_eigen_borrowed_pmat_row_restore_fault_quarantine",
+        "modal_eigen_borrowed_pmat_row_primary_cleanup_fault_quarantine",
+        "modal_eigen_borrowed_pmat_pattern_mismatch_fixture",
+        "fem_modal_eigen_mixed_dense_contract"
+      ],
+      "diagnostic_boundary": "row-fault source-contract checks production_phi_rhs_unchanged and production_phi_solution_unchanged are false; absence versus mismatch must be diagnosed, not assumed",
+      "scientific_qualification": "NOT VERIFIED"
     },
     {
       "run_id": 38153749590,
@@ -866,6 +879,26 @@
       "failure": "existing small-mesh GPU policy also applies to an already CPU resolution and overwrites fallback provenance; threshold environment exposes defect",
       "new_pool_contracts": "passed",
       "log_sha256": "73da3113b6c795677a60fb6f11e7a3dec1f8bc897e2e992da098f04ac9de8672",
+      "scientific_qualification": "NOT VERIFIED"
+    },
+    {
+      "run_id": 38154212824,
+      "sha": "1c398528a762ced690fb09cf00082619c4031bc8",
+      "conclusion": "success",
+      "scope": "complete_default_feature_runner_after_cpu_provenance_guard",
+      "tests_passed": 1616,
+      "log_sha256": "771eb0ec395e749667ceec1490cdd4c7b0b6a6cc859fa60caf87c1f7a0fd6318",
+      "scientific_qualification": "NOT VERIFIED",
+      "runner_tests_ignored": 1,
+      "scientific_contract_tests_passed": 38
+    },
+    {
+      "run_id": 38153749586,
+      "sha": "a848dce7bb842efb701563a4a991138a148fa221",
+      "conclusion": "success",
+      "scope": "adaptive_pool_prefix_tracking_output_selection_and_writer_contracts",
+      "tests_passed": 56,
+      "log_sha256": "ba3f6e7c923afdf989fbc90284944762bd4d66ac2437fd3ac01056efd1746228",
       "scientific_qualification": "NOT VERIFIED"
     }
   ]
