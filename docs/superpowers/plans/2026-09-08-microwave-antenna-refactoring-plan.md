@@ -1,5 +1,57 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Rzeczywisty odbiór V/J/H — 2026-10-11:**
+Build nr 41 `1128d9f468ee4b0981387a8cdf448451` zakończył się
+`succeeded`, exit 0, dla commita `62d9618b2eebec639e52eeea842ffde19525a4bd`.
+Pełny validator launchera sprawdził pakiet, trusted documents i kapsułę.
+Zatwierdzony `just run-managed-antenna-ram` wykonał przypięty model na
+FEM CPU/double: run `92cdc1e909c242c58c81f1aa495df435`, solver exit 0,
+startup identity i izolacja PASS. Rzeczywisty eksport v2 zawiera V/J/H.
+Independent fixed-fixture comparison PASS: maksymalny błąd V
+`1.1102230246251565e-16 V`, J `4.440892098500626e-16 A/m²`,
+H `6.760249178929324e-9 A/m`; 12 środków i 48 lokalnych śladów J,
+108 geometrycznych momentów RT0 oraz 36 bilansów elementów.
+Odbiór dotyczy tego modelu i próbek poza źródłem, nie taper/inside-source,
+zamknięcia obwodu ani zakwalifikowanej bazy do LLG/FFT.
+Pełny raport zachowuje `physics_qualified=false`,
+`native_canonical_bundle_redecoded=false` i brak kwalifikacji trwałości.
+Nowe `--write-report` zapisuje wynik z SHA narzędzi w `export/V-J-H-comparison.json`
+wyłącznie po sukcesie i przy niezmienionych źródłach podczas porównania.
+Kolejny etap: rzeczywista publikacja HTTP i canonical disk-loader w osobnej
+sesji RAM przez publiczny runtime, bez sztucznych stage refs ani zmiany
+guardów SessionStore. Workspace 3197 nie był zmieniany.
+
+**Odbiór narzędzi porównania V/J/H — 2026-10-11:**
+Hostowy reader rozdziela exact export v1/v2, w tym manifest, jednostki,
+receipt i payload snapshotu J. Legacy v1 pozostaje bez J; mieszane generacje,
+złe hashe, dodatkowe pliki i błędne liczności są odrzucane.
+`scripts/antenna_current_display_fixture_check.py::decode_current_snapshot`
+wiąże bounded snapshot z retained bundle/charge/source, whole-mesh Tet4,
+stable IDs i bitami XYZ. Nie rekonstruuje ani nie uśrednia native J.
+`compare_current_display_fixture` sprawdza niezależny stały model:
+12 środków, 48 cell-local traces, J=I/A, affine consistency oraz
+48 device face moments i bilanse elementów. Tolerancje i ograniczenia:
+nota 0950, `DOC-ANCHOR:antenna-current-source-fixture-current-display-check`.
+Comparator RAM wykonuje te kontrole przed V/H dla v2 i zachowuje v1.
+HTTP smokes weryfikują v1/v2, scope/revision/digest, SI, ETag, Range,
+snapshot oraz bitową zgodność czterech carrierów J z zachowanymi próbkami.
+Liczniki vertices/elements są admitted przed iteracją; regresje obejmują
+zero i maksymalne u64 także po ponownym obliczeniu hashy/pinów.
+Wykonane interpretowane dowody: reader/snapshot/comparator **73 PASS**;
+istniejące RT0/oracle/RAM launcher **63 PASS + 12 subtestów**;
+HTTP smokes **74 PASS + 49 subtestów**. Focused scientific validator exit 0.
+Niezależny review snapshotu/oracle nie wykazał Blocker/Required;
+Required count admission z review HTTP poprawiono i przetestowano.
+To syntetyczne testy readerów i transportu oraz prywatny fixed-fixture oracle,
+nie dowód native solve, canonical re-decode, rzeczywistego endpointu ani fizyki.
+Nie kompilowano testów jednostkowych. Nowe narzędzia powstały po capture
+buildu nr 41; nie zmieniają jego zamrożonych źródeł ani pakietu.
+W chwili tego wcześniejszego checkpointu odczyt API joba nr 41 zwracał
+`running`, exit code null. Późniejszy odbiór terminalnego sukcesu i rzeczywisty
+RAM run opisano powyżej; nie zgłoszono drugiego buildu.
+Publikacja/cold-load/HTTP, obwód, per-A, FFT, LLG i T00–T18 pozostają otwarte.
+Workspace 3197 i jego sesja nie zostały zmienione.
+
 **Zapis etapu i build integracyjny — 2026-10-11:**
 Spójny przyrost producent/ABI2 → Rust decoder/archive v2 → typed API →
 wspólny Inspector/renderer raw J zapisano jako

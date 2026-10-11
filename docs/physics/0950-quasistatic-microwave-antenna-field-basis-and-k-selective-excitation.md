@@ -5761,6 +5761,88 @@ dotychczasowe load/request/hash guards. Nie nadaje `H_per_A` ani statusu
 kwalifikacji żadnej realizacji FEM/FDM CPU/GPU. Native porównanie nadal
 pozostaje **NOT VERIFIED** do wykonania przez zarządzaną trasę.
 
+(antenna-current-source-fixture-current-display-check)=
+<!-- DOC-ANCHOR:antenna-current-source-fixture-current-display-check -->
+#### Odbiór rzeczywistego snapshotu J w modelu current-source
+
+Hostowy odbiór zachowuje zgodność stage/manifest v1 bez J oraz v2 z wymaganym
+receipt i szóstym payloadem. Mieszane generacje, nieznane polityki, złe SI,
+brak lub obcy plik i błędny SHA oznaczają odmowę, nie automatyczny fallback.
+`scripts/antenna_current_display_fixture_check.py::decode_current_snapshot`
+jest ograniczoną ekstrakcją transportową: sprawdza ordered framing, receipt,
+SHA bundle/charge/source, issuer stable IDs, pełną partycję device/lead,
+kolejność whole-mesh Tet4 oraz bitowo identyczne lokalne XYZ. Nie zastępuje
+pełnego dekodera Rust, walidacji request ani certyfikacji normalizacji MFEM.
+HTTP carriery środka/śladu i J muszą być bitowymi kopiami tego snapshotu.
+
+`compare_current_display_fixture` dodatkowo wymaga exact input digest tego
+przykładu i wszystkich 12 device Tet4. W każdym środku i każdym z 48 lokalnych
+wierzchołków porównuje wektor J ze wzorcem $j\mathbf e_x$, czyli
+$+1\,\mathrm{A\,m^{-2}}$ w signal i $-1\,\mathrm{A\,m^{-2}}$ w return.
+Środki tego konkretnego modelu mają dokładnie reprezentowalne ćwiartkowe
+współrzędne; tu wymagana jest ich zgodność z geometrią. Nie rozszerza się
+tej bitowej reguły na dowolny skew/scale lub arytmetykę long double.
+Sprawdzana jest również równość środka i średniej czterech śladów w granicy
+tolerancji, zgodnie z `antenna-current-display-affine-traces`.
+Całka po każdej ścianie wynika z dokładnej średniej trzech afinicznych śladów
+pomnożonej skalarnie przez canonical wektor powierzchni, jak w
+`antenna-fixture-rt0-face-moment`; porównuje się ją z retained ledgerem i
+sumuje outward w każdym device Tet4. Nie odtwarza się RT0 w nowym solverze.
+
+| Prywatny parametr | Typ/default | SI | Walidacja i zakres | Python/IR |
+|---|---|---|---|---|
+| `payload`, `bundle_bytes`, `receipt` | bytes, bytes, dict / required | $1$ jako nośniki | 2 MiB i 20000 pól na rekord; exact SI/policies/hash, pełna device coverage; częściowy bounded decode | brak nowego publicznego API |
+| `inputs`, `values` | dict / required | jednostki obserwabli powyżej | exact fixed input pin, 12 komórek, snapshot v2; v1 jawnie bez sprawdzenia J | hostowa rekonstrukcja z executed capsule, nie native IR dump |
+| `current_tolerance_apm2` | float / $10^{-8}$ | $\mathrm{A\,m^{-2}}$ | finite, dodatnia, nie bool; norma błędu każdego wektora i affine center relation | próg odbioru tego przykładu, nie solver policy |
+| `flux_tolerance_a` | float / $10^{-8}$ | $\mathrm A$ | finite, dodatnia, nie bool; każdy moment oraz suma outward device Tet4 | próg odbioru tego przykładu, nie certyfikat obwodu |
+| `--write-report` | bool / false | $1$ | zapis tylko po udanym porównaniu i przy niezmienionych SHA źródeł checkera; stały plik `export/V-J-H-comparison.json` pod zweryfikowanym run root | prywatna opcja hostowego odbioru, bez nowego Python/IR |
+
+Realizacja: tylko odbiór FEM CPU/double tego przykładu; FEM GPU nie wykonano,
+FDM CPU/GPU nie produkują wymaganego accepted Tet4 snapshotu. Publiczny
+Python, `ProblemIR`, requested execution i capabilities nie zmieniają się.
+Interpretowane testy syntetycznych bytes dowodzą odmów/orkiestracji, nie
+native wykonania. Wynik zachowuje `physics_qualified=false`, brak kwalifikacji
+trwałej sesji, obwodu, per-A, LLG/FFT; realny receipt i scientific comparison
+muszą pochodzić z właściwej kapsuły zarządzanego buildu.
+
+(antenna-current-source-fixture-native-v-j-h-20261011)=
+<!-- DOC-ANCHOR:antenna-current-source-fixture-native-v-j-h-20261011 -->
+#### Wykonany odbiór FEM CPU/double z 2026-10-11
+
+Terminalny build `1128d9f468ee4b0981387a8cdf448451` ma `succeeded`, exit 0,
+commit `62d9618b2eebec639e52eeea842ffde19525a4bd`, kapsułę
+`164ce78afc59e0e195b82c34d9a959762a420416abf4a6fdf0c91669c5059d57`
+i natywny snapshot
+`ad8075fbd2d058c120537e316de8aff14b7b98563875e0e2668436418cb2e0a2`.
+`scripts/run_managed_antenna_ram.py::observe` potwierdził solver exit 0,
+startup identity, przypięte wejścia, pakiet i izolację runu
+`92cdc1e909c242c58c81f1aa495df435`.
+`scripts/compare_managed_antenna_ram.py::compare` zwrócił PASS dla eksportu
+v2: 16 wartości V, 4 wektorów H, 12 środków i 48 lokalnych śladów J,
+108 geometrycznych momentów RT0 oraz 36 bilansów elementów.
+
+| Obserwabla | Maksymalny zmierzony błąd | Zamrożony próg odbioru |
+|---|---|---|
+| V | $1.1102230246251565\times10^{-16}\,\mathrm V$ | $10^{-8}\,\mathrm V$ |
+| wektor J | $4.440892098500626\times10^{-16}\,\mathrm{A\,m^{-2}}$ | $10^{-8}\,\mathrm{A\,m^{-2}}$ |
+| wektor H | $6.760249178929324\times10^{-9}\,\mathrm{A\,m^{-1}}$ | $10^{-8}\,\mathrm{A\,m^{-1}}+10^{-6}\lVert\mathbf H_{\rm ref}\rVert$ |
+| moment normalny RT0 | $2.220446049250313\times10^{-16}\,\mathrm A$ | $10^{-8}\,\mathrm A$ |
+| suma outward w elemencie | $0\,\mathrm A$ | $10^{-8}\,\mathrm A$ |
+
+Wynik dotyczy dokładnego przykładu, stałego prądu i czterech próbek poza
+źródłem. Nie jest dowodem dla taper, próbek wewnątrz przewodnika, błędu
+pominiętego obwodu ani bazy do LLG/FFT. Pełny raport jest zachowany w
+kanonicznym storage pod tym runem, `export/V-J-H-comparison.json`, wraz
+z SHA bezpośrednich źródeł porównania. SHA solver logu to
+`76e17c20ff1474e9b0f9aa2c126952a0b5d9852a9e35d73ad7736a8c5fd32eb1`,
+a build receipt ma SHA
+`fe2b21e8af2828e5c7d699d0ed7812001672c3de6c449fd05a3f131a5ca3d493`.
+Hostowa rekonstrukcja używa dokładnego skryptu i Python DSL kapsuły;
+nie jest dumpem wykonanego IR. `native_input_pins_recomputed=false`,
+`native_canonical_bundle_redecoded=false`, `physics_qualified=false`,
+`durable_session_storage_qualified=false`, `reuse_LLG_FFT_qualified=false`.
+Rzeczywisty HTTP/cold-load i pełna kwalifikacja pozostają osobnymi bramkami.
+
 (antenna-current-source-fixture-observable-association)=
 #### Związanie obserwabli eksportu z retained bundle
 
@@ -6410,6 +6492,7 @@ evidence and cannot promote a capability lane.
 | `packages/fullmag-py/tests/test_antenna_documented_example.py` | `class AntennaDocumentedExampleTests` | pierwszy skrypt 0950: kopia zgodna z aktualnym przykładem, Python→IR/export/reimport bez solvera; nie standalone ani R3/LLG/FFT/trwałość |
 | `packages/fullmag-py/tests/test_antenna_current_source_example.py` | `test_actual_lowering_binds_both_original_imported_mesh_assets` | rzeczywiste lowering oryginalnych source/target MeshIR, jedna z pięciu interpretowanych kontroli PASS; bez native solve |
 | `scripts/antenna_rt0_fixture_check.py` | `compare_rt0_fixture`, `fields` | częściowa bounded ekstrakcja i niezależna geometria momentów RT0 z zachowanymi wagami; bez pełnego canonical decode i native qualification |
+| `scripts/antenna_current_display_fixture_check.py` | `decode_current_snapshot`, `compare_current_display_fixture` | bounded SHA/geometry/partition binding snapshotu i niezależny fixed J/affine/face-moment check; nie native qualification |
 | `scripts/test_antenna_rt0_failure_diagnostics_source.py` | `test_diagnostic_is_failure_only_and_preserves_exact_continuity_predicate`, `test_failure_identifies_face_and_physical_measurements_at_binary64_precision` | source-only RED→GREEN, 2 PASS; sprawdza niezmieniony predykat i failure diagnostics, nie wykonanie C++ ani kwalifikację |
 | `scripts/test_antenna_rt0_fixture_check.py` | `test_all_geometric_moments_with_permuted_signed_nonunit_dofs` | syntetyczne partial bytes, permutowane DOF i niejednostkowe wagi, 18 interpretowanych regresji PASS; nie certyfikat MFEM normalization |
 | `scripts/compare_managed_antenna_ram.py` | `compare` | dokładny run/capsule/manifest binding, V/H oraz RT0 przed PASS; global qualification pozostaje false |
