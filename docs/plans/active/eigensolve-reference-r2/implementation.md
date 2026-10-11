@@ -809,3 +809,10 @@ Tracked-bias case jeszcze niewykonany. Guard korzysta teraz z dostępnego
 grep i zachowuje obowiązek wykonanego namedPASS; nie usunięto zabezpieczenia
 zero-tests. Fieldreview nadal implemented_pending_ci, bez zamknięcia
 agregacji ani kwalifikacji CPU/GPU.
+
+
+## Potwierdzone kontrakty native i poprawka referencji na wykresie
+
+GHA #38138452216 na3d8c25939bfb3da0ee802c5f8c874ae0832b8da4: cztery CTest PASS: damping admission, phase convention, selected-window oraz typed CPU transport. Positive refinement/negative budget/degenerate cluster fixtures rzeczywiście wykonane. Receipt i log mają SHA w ci-evidence. Search stability nie jest niezależnym count; benchmark dynamic-demag, GPU i kompletność widma nadal NOT VERIFIED.
+
+Filtr wykresu dopuszcza imported reference_frequency razem z frequency i analytic_frequency, bez mieszania jednostek i innych wielkości Hz. Testy obejmują sześć kolejności, bramki unit/xUnit oraz model→ECharts. Review wychwycił konieczność objectContaining dla rzeczywistego bogatszego obiektu renderera. Scoped workflow obejmuje zmienione pliki i regresję; wykonanie oraz browser pozostają NOT VERIFIED.

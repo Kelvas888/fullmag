@@ -5,6 +5,12 @@ import type {
   FrequencyDomainChartSeries,
 } from "@/shared/domain/analysis/frequencyDomainChartModels";
 
+const FREQUENCY_OVERLAY_QUANTITIES = new Set([
+  "frequency",
+  "analytic_frequency",
+  "reference_frequency",
+]);
+
 export function frequencySpectrumRenderModel<
   T extends { dampingRateHz?: number | null; frequencyValue: number; rowIndex: number },
 >(
@@ -134,16 +140,16 @@ export function compatibleFrequencySeries(
     entry.unit === first.unit &&
     entry.xUnit === first.xUnit &&
     (entry.quantity === first.quantity ||
-      isAnalyticFrequencyOverlayPair(first.quantity, entry.quantity))
+      isFrequencyOverlayPair(first.quantity, entry.quantity))
   );
 }
 
-function isAnalyticFrequencyOverlayPair(
+function isFrequencyOverlayPair(
   firstQuantity: string,
   candidateQuantity: string,
 ): boolean {
-  return (firstQuantity === "frequency" && candidateQuantity === "analytic_frequency") ||
-    (firstQuantity === "analytic_frequency" && candidateQuantity === "frequency");
+  return FREQUENCY_OVERLAY_QUANTITIES.has(firstQuantity) &&
+    FREQUENCY_OVERLAY_QUANTITIES.has(candidateQuantity);
 }
 
 export function frequencyYAxisLabel(series: readonly FrequencyDomainChartSeries[]): string {
