@@ -580,6 +580,8 @@ async function applyGlobalQuantityFromCommand(
     };
   }
 
+  const overlayBeforeQuantityPatch =
+    context.analysisFieldOverlay?.getSnapshot() ?? null;
   const patch: VisualizationStatePatch = {
     active_quantity_id: input.activeQuantityId,
     quantity: { active_quantity_id: input.activeQuantityId },
@@ -601,7 +603,13 @@ async function applyGlobalQuantityFromCommand(
   await patchVisualizationState(context, patch, { flush: true });
   // A mode field is the viewport quantity while it is shown (ADR 0054);
   // choosing another quantity leaves the mode visualization.
-  if (context.analysisFieldOverlay?.getSnapshot()) {
+  // The controller replaces its snapshot whenever typed identity, provenance,
+  // revision, or payload changes. Treat that object as the overlay generation
+  // so a late acknowledgement cannot clear a newer field selected meanwhile.
+  if (
+    overlayBeforeQuantityPatch &&
+    context.analysisFieldOverlay?.getSnapshot() === overlayBeforeQuantityPatch
+  ) {
     context.analysisFieldOverlay.clear();
   }
   return { status: "completed" };

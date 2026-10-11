@@ -714,6 +714,27 @@
       "failure": "homogeneous Floquet path reports generic dense identity; expected Floquet Schur identity",
       "log_sha256": "22bc0782bd482064f02dddedb95fd4a0862c887d173c36c8cf39011edb9c8729",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38146649283,
+      "sha": "dabfac3608f8173e3e7c1c89fab67a06719f4b29",
+      "conclusion": "success",
+      "scope": "complete_default_feature_runner_and_scientific_documentation_contracts",
+      "runner_tests_passed": 1604,
+      "runner_tests_ignored": 1,
+      "scientific_contract_tests_passed": 38,
+      "log_sha256": "72499ddf092ad1cb5e9262cc1b8c6ec7299d12cbfdc7b135915e6dc346218f88",
+      "scientific_qualification": "NOT VERIFIED"
+    },
+    {
+      "run_id": 38146649275,
+      "sha": "dabfac3608f8173e3e7c1c89fab67a06719f4b29",
+      "conclusion": "success",
+      "scope": "actual_sweep_publication_final_revision_refs_tracking_and_Floquet_identity",
+      "tests_passed": 27,
+      "native_runtime": "NOT VERIFIED",
+      "log_sha256": "ed0cda56f8232c8e17316f695a8ccf3cae85c9abd632195b832f4e082c066f51",
+      "qualification_claimed": false
     }
   ]
 }

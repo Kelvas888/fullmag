@@ -914,3 +914,12 @@ GHA #38145183697 na e4b8065e2aa544dc15c5d4fcf780a82a52850b08:139 testów/10 plik
 GHA #38145536160 na cf9ca10cd7c96c7680ff12057f235000181606fe FAIL w named Floquet identity regression: zamiast floquet_airbox_cpu_schur_slepc raportowano slepc_multi_shift_invert_production_cpu_dense. Zachowano log awarii; poprawka wymaga następnego CI. Nie jest to wynik fizycznej dyspersji ani dowód braku dynamicznego demagu. P0–P10 pozostają częściowo wdrożone; runtime, zbieżność i kwalifikacja nie zostały przez te testy potwierdzone.
 
 Przyczyna #38145536160: nowa fixture podała floquet_periodic_pair_count w result_json, podczas gdy produkcyjny producent przekazuje go w raw diagnostics_json. Guard poprawnie odmówił promocji bez tej wartości. Fixture teraz odtwarza właściwy kanał i wymaga dodatniego count; produkcji ani bramki nie poluzowano. Ponowne CI wymagane.
+
+
+## Potwierdzona publikacja i kolejny wyścig UI
+
+Na dabfac3608f8173e3e7c1c89fab67a06719f4b29 GHA #38146649283 SUCCESS:1604 runner tests PASS,1 ignored oraz38 scientific contract tests PASS. #38146649275 SUCCESS:27 scoped tests PASS, w tym actualtrackedbias/final artifact hashes/tracking oraz homogeniczna tożsamość Floqueta. Poprzednia awaria fixture pozostaje zapisana. To dowód źródeł/publikacji, nie runtime/nauki.
+
+4241399048: komenda zmiany globalnej wielkości przechwytuje snapshot overlayu przed side effects i await. ACK czyści wyłącznie ten sam snapshot; nowszy typed owner/revision jest zachowany także dla tego samego fieldId. Cztery regresje rzeczywistego CommandRegistry obejmują normal ACK, delayed ACK z nowym ownerem, null-to-new i rejected ACK. Source review PASS; GHA/typecheck/architecture/Doctor oraz browser wymagane. Nie zmieniono endpointów, wire schema ani publicznego store.
+
+Spectrum scope4060116242 pozostaje rzeczywistą luką Python→OutputIR. Zachowanie pola nie rozstrzyga semantyki global/per_sample: istniejąca propozycja publicznego kontraktu z09.10 oczekuje odpowiedzi, dlatego nie wprowadzono arbitralnej odmowy global ani nowego layoutu zasobów. Pozostałe korekty nie czekają na tę decyzję.
