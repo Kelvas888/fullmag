@@ -119,6 +119,21 @@ Sukces kompilacji nie dowodzi precyzji wykonania ani poprawności adaptera.
 Provisioning, terminalny receipt, admission rzeczywistego runtime i nowe
 porównanie naukowe pozostają **NOT VERIFIED**.
 
+Źródłowa ścieżka `just run-managed-boris-nf <job-id> coarse|medium|fine`
+wymaga terminalnego udanego buildu tego samego worktree i aktora, czterech
+trusted dokumentów, zgodnej kapsuły, przypiętych źródeł BORIS i dowodu ABI.
+Uruchamia jeden stały scenariusz N/F w kontenerze CPU z wyłączoną siecią,
+read-only wejściem, ograniczonym eksportem i obowiązkowym rzeczywistym exit 0.
+`just observe-managed-boris-nf <runtime-id>` ponawia cały łańcuch i kontrolę
+zachowanego kontenera oraz payloadów; nie uruchamia nowego solve.
+Publiczny verifier v2 wymaga jawnego kontekstu repozytorium i kanonicznego
+artefaktu. Pole `identity_complete` w przekazanym JSON samo nie daje admission.
+
+Kontrole interpretowane ścieżki runtime po poprawce publikacji: 56 testów i 45 podprzypadków PASS;
+parser oraz validator noty 0970 PASS. Są to dowody źródeł, bez uruchomienia
+BORIS, producenta ABI lub nowego benchmarku. Rzeczywista kwalifikacja nadal
+wymaga provisioningu, terminalnego buildu i wykonania porównań.
+
 ## Dane, zakończenie i retencja
 
 - `storage/runs/<worktree-id>/<capture-id>/source`: kapsuła readonly.

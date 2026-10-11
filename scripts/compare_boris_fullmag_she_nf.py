@@ -370,7 +370,7 @@ def _scale_vector(value: object, factor: float, *, label: str) -> list[float]:
     return [component * factor for component in vector]
 
 
-def normalize_boris_artifact(path: Path) -> NormalizedTransportArtifact:
+def normalize_boris_artifact(path: Path, *, repo_root: Path | None = None) -> NormalizedTransportArtifact:
     """Map BORIS N/F OVFs to one contiguous shared-domain representation.
 
     BORIS' display spin-current expression carries the factor
@@ -382,7 +382,7 @@ def normalize_boris_artifact(path: Path) -> NormalizedTransportArtifact:
     """
 
     root = path if path.is_dir() else path.parent
-    payload = validate_boris_artifact(root)
+    payload = validate_boris_artifact(root, repo_root=repo_root)
     return _normalize_boris_fields(root, payload, source=str(path))
 
 
@@ -651,8 +651,9 @@ def main() -> int:
     parser.add_argument("--boris", type=Path, required=True, help="BORIS summary.json or artifact directory")
     parser.add_argument("--fullmag", type=Path, required=True, help="Fullmag FDM M2 JSON artifact")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--boris-repo-root", type=Path, help="trusted managed BORIS v2 storage context")
     args = parser.parse_args()
-    boris = normalize_boris_artifact(args.boris)
+    boris = normalize_boris_artifact(args.boris, repo_root=args.boris_repo_root)
     fullmag = load_fullmag_m2_artifact(args.fullmag)
     report = compare_transport_artifacts(boris, fullmag)
     args.output.parent.mkdir(parents=True, exist_ok=True)

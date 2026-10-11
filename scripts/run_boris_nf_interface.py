@@ -176,7 +176,12 @@ def capture_runtime_identity(
     return identity
 
 
-def validate_runtime_identity(identity: Mapping[str, object]) -> None:
+def validate_runtime_identity(identity: Mapping[str, object], *, repo_root: Path | None = None,
+                              artifact_root: Path | None = None) -> None:
+    if identity.get("schema_version") == "fullmag.boris.runtime.v2":
+        from run_managed_boris_nf import verify_runtime_identity
+        verify_runtime_identity(identity, repo_root, artifact_root)
+        return
     required = (
         "schema_version",
         "source_manifest_sha256",
@@ -561,16 +566,35 @@ def _resolution_config(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--build-root", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--build-root", type=Path)
+    source.add_argument("--managed-job-id")
+    source.add_argument("--managed-runtime-id")
+    parser.add_argument("--repo-root", type=Path)
+    parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--resolution", choices=("0", "coarse", "medium", "fine"), default="0")
     parser.add_argument("--timeout-s", type=int, default=180)
     parser.add_argument("--transport-tolerance", type=float, default=1.0e-5)
     parser.add_argument("--transport-max-iterations", type=int, default=200)
-    parser.add_argument("--image-digest", default=os.environ.get("FULLMAG_BORIS_IMAGE", DEFAULT_BORIS_IMAGE))
+    parser.add_argument("--image-digest")
     parser.add_argument("--runtime-container", default=os.environ.get("FULLMAG_BORIS_RUNTIME_CONTAINER"))
     args = parser.parse_args()
+    if args.managed_job_id or args.managed_runtime_id:
+        if args.repo_root is None or args.output_dir is not None or args.device != "cpu" or args.runtime_container is not None or args.image_digest is not None:
+            parser.error("managed BORIS requires --repo-root, CPU and resolver-owned outputs; no runtime-container")
+        if args.transport_tolerance != 1e-5 or args.transport_max_iterations != 200 or args.timeout_s != 180:
+            parser.error("managed BORIS permits only fixed scientific defaults")
+        from run_managed_boris_nf import start, observe
+        if args.managed_job_id:
+            if args.resolution not in ("coarse", "medium", "fine"):
+                parser.error("managed BORIS requires explicit coarse/medium/fine resolution")
+            print(start(args.repo_root,args.managed_job_id,args.resolution))
+        else:
+            print(observe(args.repo_root,args.managed_runtime_id))
+        return 0
+    if args.output_dir is None:
+        parser.error("legacy --build-root requires --output-dir; admission still needs trusted proof")
     config = _resolution_config(
         args.resolution,
         args.output_dir,
@@ -582,7 +606,7 @@ def main() -> int:
         args.build_root,
         args.output_dir,
         args.device,
-        image_digest=args.image_digest,
+        image_digest=args.image_digest or os.environ.get("FULLMAG_BORIS_IMAGE", DEFAULT_BORIS_IMAGE),
         timeout_s=args.timeout_s,
         runtime_container=args.runtime_container,
     )

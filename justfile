@@ -131,6 +131,13 @@ runner-boris-image-context boris_source toolchain_image:
 runner-boris-build mode ref="":
     @{{storage_python}} "{{repo_root}}/scripts/local_runner_cli.py" submit --operation build --profile boris-cpu-v1 --source {{quote(mode)}} {{if ref == "" { "" } else { "--ref " + quote(ref) }}}
 
+# Fixed external CPU reference run from a successful receipt; no build/install.
+run-managed-boris-nf job_id resolution:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_boris_nf.py" --repo-root {{quote(repo_root)}} start --job-id {{quote(job_id)}} --resolution {{quote(resolution)}}
+
+observe-managed-boris-nf runtime_id:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_boris_nf.py" --repo-root {{quote(repo_root)}} observe --runtime-id {{quote(runtime_id)}}
+
 runner-configure-build profile image_id:
     {{storage_python}} scripts/local_runner_cli.py configure-build --profile {{quote(profile)}} --image-id {{quote(image_id)}}
 

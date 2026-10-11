@@ -2558,6 +2558,67 @@ pozostają faktyczną bramką preflight: brak FFTW3/X11/TBB odmawia przed compil
 Actual source implementation: scripts/local_runner/boris_cpu.py::run_build,
 validate_abi_outputs, validate_outputs; output membership scripts/local_runner/build_entrypoint.py::required_outputs_for_profile.
 
+(boris-managed-runtime-v2-contract)=
+### E1: trusted managed runtime admission v2
+
+Kontrakt prerejestrowany przed implementacją. Actual source-only, NOT VERIFIED:
+oddzielny BORIS CPU helper
+wiąże authenticated terminal operator job z dokładnie czterema trusted plikami,
+actual binary/source/flags/CPU ABI witness i pinned installed image. Canonical
+build root wynika tylko z returned worktree_id/job_id oraz storage resolvera;
+API worktree_id musi zgadzać się z layout.worktree_id, owner z actual actor.
+Runtime root to fresh resolver-owned katalog o losowym pełnym runtime_id;
+caller JSON nie wybiera arbitrary proof path, komend, środowiska ani mountów.
+FEM-only validate_managed_build oraz sześć pozostałych profili nie zmieniają się.
+
+Fixed coarse/medium/fine N/F zachowuje istniejące parametry, tolerance=1e-5,
+max_iterations=200, CPU -g -1 i timeout180s. New managed run wymaga strict
+actual solver exit=0, stage marker, full native samples i 14 OVF; historyczne
+exit143 lub post-stage StdoutCatcher flush exit1 są odmową nowej ścieżki,
+nie synthetic sukcesem. Fullmag torque conversion refusal pozostaje bez zmian.
+Nie instaluje się pakietów ani nie pobiera obrazu podczas run. Brak dependencies
+lub niezgodna embedded Python wersja/imports oznacza jawną odmowę.
+
+| Internal generated pole / typ | Walidacja i granica | Jednostka / znaczenie |
+|---|---|---|
+| build_job_id, runtime_id / string | 32lowerhex; canonical resolver root; authenticated owning operator job | $1$; locator, nie receipt authority |
+| fullmag.boris.managed_run.v1 / JSON | <=4 MiB UTF8 unique keys finite; source/binary/image/trusted hashes; actual inspected terminal container | $1$; lokalny managed dowód, nie podpisana portable attestacja |
+| fullmag.boris.runtime.v2 / JSON | reopened complete trusted chain poprzez explicit repo_root; caller complete/precision ignored as authority | $1$; provenance only |
+| precision / string | double dopiero po verified actual ABI + same compiler/types/flags build i actual CPU run | $1$; binary64 storage, bez strict IEEE claim z -Ofast |
+| source_files_sha256 / map | full capsule verified; host imports compare frozen files, brak drift | $1$; helper/adapter bindings |
+| scenario.py, scenario.json / bytes | generated exact fixed defaults/resolution; SHA256 before/after run | $1$; scientific input identity |
+| outputs / entries | exact14 OVF + native samples + runtime probe/logs; unique safe members <=32, aggregate <=256 MiB, each <=64 MiB | $1$; heavy payload files, bez JSON arrays |
+| container attestation / JSON | exact image/argv/env/mounts/runc/NVIDIA_VISIBLE_DEVICES=void/noGPU/noNetwork/UID65532/readonly/cap_drop/resource caps | $1$; rzeczywista lane/isolation |
+| summary/runtime/receipt digests / string | external digest framing; no receipt self-hash/cycle; summary recomputed from verified outputs | $1$; immutable closure |
+
+Publication ordering correction preregistered przed kodem, actual SOURCE ONLY:
+per-runtime storage
+lock odmawia parallel/reentrant observe. Final receipt bytes/hash są obliczone
+najpierw; runtime.json i independently recomputed summary.json zapisuje się
+przed terminalnym receipt, który jest jedynym commit point i powstaje LAST.
+Przerwanie przed nim nie zostawia succeeded receipt. Publication I/O failure
+pozostawia osobny resumable nonterminal publication_failed_resources_retained;
+validation failure jest terminal failed_resources_retained. Po commit żaden
+error handler nie nadpisuje sukcesu. Reobserve succeeded bundle jest verify-only,
+bez naprawiania dowodów; identity pin odnosi się do exact final receipt bytes,
+bez checksum cycle. To zmiana lifecycle/provenance, nie tolerancji ani fizyki.
+
+Public validate_boris_artifact i normalize_boris_artifact wymagają dla v2
+jawnego trusted repo/storage context i ponownego otwarcia źródeł/receipt/output
+closure; legacy v1 odmowy pozostają. Brak operatora lub retained evidence
+odmawia zamiast offline allow_incomplete. Complete runtime identity nie oznacza
+science qualification; status nadal diagnostic/NOT VERIFIED aż preregistered
+niezależne residual/interface/convergence kryteria zostaną wykonane.
+Python DSL, ProblemIR, wspólne równania i FDM/FEM CPU/GPU qualification Fullmaga
+pozostają bez zmian. Actual helper scripts/run_managed_boris_nf.py::resolved_boris_build, start,
+observe, verify_runtime_identity wykonuje powyższy source contract. Interpreted
+fixtures nie są trusted runtime proof; operator/image/native benchmark nie
+zostały wykonane. Strict solver exit=0 obejmuje brak historycznych wyjątków.
+Public wrapper scripts/run_boris_nf_interface.py::main udostępnia managed
+job/runtime locators, odmawia caller build/image/output/container overrides.
+Receipts wymagają retained actual container oraz dostępnego operatora; brak
+portable signed admission nie jest zastępowany caller JSON authority.
+
 (source-code-index)=
 ## 8. Source-code index
 
@@ -2567,6 +2628,10 @@ a qualified workload without the validation gates above.
 
 | Claim | Path | Symbol | Responsibility | Evidence |
 |---|---|---|---|---|
+| boris-managed-runtime-publication | scripts/run_managed_boris_nf.py | observe | Exclusive runtime storage lock, full bundle before exact terminal receipt LAST; precommit resumable I/O failure and immutable postcommit verification. | source_only; interpreted crash/reentrant checks, runtime NOT VERIFIED |
+| boris-managed-runtime-admission | scripts/run_managed_boris_nf.py | resolved_boris_build | Authenticated same-actor/worktree terminal job, four trusted hashes, source/ABI/binary/flags/image receipt verification; source only. | source_only; interpreted regressions, native/runtime NOT VERIFIED |
+| boris-managed-runtime-reopen | scripts/run_managed_boris_nf.py | verify_runtime_identity | Explicit trusted repo/root, actual CPU container/output closure, receipt/identity binding and independent summary recomputation; no runtime qualification. | source_only; interpreted regressions, native/runtime NOT VERIFIED |
+| boris-managed-runtime-v2-contract | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:boris-managed-runtime-v2-contract | explicit trusted managed CPU run and public reopen gate | planned_contract; runtime NOT VERIFIED |
 | boris-cpu-abi-build-source | scripts/local_runner/boris_cpu.py | run_build | Fixed actual-source CPU ABI production stages share solver compiler flags/link/environment; no execution proof. | source_only; interpreted guards, no native run |
 | boris-cpu-abi-verifier-source | scripts/local_runner/boris_cpu.py | validate_abi_outputs | Bounded witness/source/flags/same-job observation and exact stage command binding; no runtime identity admission. | source_only; interpreted guards, no native run |
 | boris-cpu-abi-witness-contract | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:boris-cpu-abi-witness-contract | fixed CPU ABI provenance, separate runtime admission gate | planned_contract; no compilation/runtime proof |

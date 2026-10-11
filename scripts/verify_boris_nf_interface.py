@@ -511,14 +511,15 @@ def _require_finite_number(value: object, *, label: str) -> float:
     return float(value)
 
 
-def validate_boris_artifact(root: Path) -> dict[str, object]:
+def validate_boris_artifact(root: Path, *, repo_root: Path | None = None) -> dict[str, object]:
     """Validate a prepared ``fullmag.boris_she_nf.v1`` artifact directory."""
 
     summary_path = root / "summary.json"
     if not summary_path.is_file():
         raise ValueError(f"BORIS artifact is missing {summary_path}")
     try:
-        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+        from run_managed_boris_nf import read_json
+        payload = read_json(summary_path)
     except json.JSONDecodeError as error:
         raise ValueError(f"BORIS artifact summary is not JSON: {error}") from error
     if not isinstance(payload, dict):
@@ -529,7 +530,7 @@ def validate_boris_artifact(root: Path) -> dict[str, object]:
     if not isinstance(runtime, dict) or runtime.get("identity_complete") is not True:
         raise ValueError("BORIS artifact runtime identity is incomplete")
     from run_boris_nf_interface import validate_runtime_identity
-    validate_runtime_identity(runtime)
+    validate_runtime_identity(runtime, repo_root=repo_root, artifact_root=root)
     scenario = payload.get("scenario")
     if not isinstance(scenario, dict) or scenario.get("workload") != "N/F":
         raise ValueError("BORIS artifact scenario workload must be N/F")
@@ -592,8 +593,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifact", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument("--repo-root", type=Path, help="trusted managed BORIS v2 storage context")
     args = parser.parse_args()
-    report = validate_boris_artifact(args.artifact)
+    report = validate_boris_artifact(args.artifact, repo_root=args.repo_root)
     serialized = json.dumps(report, indent=2, sort_keys=True)
     if args.output is None:
         print(serialized)
