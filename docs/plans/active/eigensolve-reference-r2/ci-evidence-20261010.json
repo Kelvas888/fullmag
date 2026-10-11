@@ -357,7 +357,7 @@
       "actual_query_count": 8,
       "actual_monitor_iteration": 7,
       "actual_shift_type": "MAT_SHIFT_NONZERO",
-      "actual_shift_amount": 1.490116119384766e-08,
+      "actual_shift_amount": 1.490116119384766e-8,
       "actual_getter_codes": 0,
       "raw_solver_status": 4,
       "factor_perturbation_measured": false,
@@ -398,6 +398,27 @@
       "sha": "d33822c150d82e48fbbfe97ec72676ced5f547f2",
       "conclusion": "in_progress_at_checkpoint",
       "scope": "modal_phase_selected_window_corrected_fixture",
+      "qualification_claimed": false
+    },
+    {
+      "run_id": 38124461222,
+      "sha": "309910665e025041445c84af9e677d7cb04833c5",
+      "conclusion": "success",
+      "scope": "focused_API_session_and_physical_publication_source_contracts",
+      "session_tests_passed": 83,
+      "session_tests_failed": 0,
+      "session_tests_filtered": 1304,
+      "passed_exact_router_tests": [
+        "router_v2::tests::v2_older_runtime_m_frame_preserves_newer_selected_source_and_bundle",
+        "router_v2::tests::v2_m_publication_bundle_requires_matching_physical_scalar_row"
+      ],
+      "router_tests_passed": 2,
+      "job_id": 114425815572,
+      "job_url": "https://github.com/MateuszZelent/fullmag/actions/runs/38124461222/job/114425815572",
+      "proof": "decoded job logs show exact source SHA, 83 session tests and each named router case actually executed",
+      "managed_runtime": "NOT VERIFIED",
+      "browser": "NOT VERIFIED",
+      "scientific_qualification": "NOT VERIFIED",
       "qualification_claimed": false
     }
   ]
