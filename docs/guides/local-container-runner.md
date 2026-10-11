@@ -168,8 +168,11 @@ Po opisanym provisioningu/readback oraz odrębnym jawnym opt-in operatora
 `just runner-boris-build commit <pełny-SHA-Fullmaga>` zgłasza build do tej samej
 kolejki. Konfiguracja koordynatora wymaga `--enable-boris-cpu`; profil workera
 musi wskazywać niezmienny obraz z przypiętymi źródłami. Aktualizacja operatora
-wymaga opisanej wyżej pauzy i pustego aktywnego slotu. Nie zmieniaj konfiguracji
-ani obrazu w trakcie cudzego buildu.
+wymaga zabezpieczenia kontenerowej blokady claim oraz potwierdzonego zatrzymania
+dokładnie atestowanego koordynatora. Sama pauza i blokada hosta Windows nie
+wykluczają równoczesnego claim po stronie Linux. Nie zmieniaj konfiguracji
+ani obrazu w trakcie cudzego buildu; rzeczywista procedura przejścia pozostaje
+**NOT VERIFIED**.
 
 Worker stosuje stały overlay CPU, kompiluje źródła C++ i sprawdza zależności
 ELF. Receipt wiąże obraz, kapsułę Fullmaga, oryginalne źródła, overlay i binarium.
@@ -192,6 +195,59 @@ Kontrole interpretowane ścieżki runtime po poprawce publikacji: 56 testów i 4
 parser oraz validator noty 0970 PASS. Są to dowody źródeł, bez uruchomienia
 BORIS, producenta ABI lub nowego benchmarku. Rzeczywista kwalifikacja nadal
 wymaga terminalnego buildu BORIS i wykonania porównań.
+
+### Wyłączenie profilu BORIS i odzyskiwanie transakcji offline
+
+`container-disable-boris-cpu` usuwa wyłącznie aktywację `boris-cpu-v1`
+z pary konfiguracji publicznej/prywatnej oraz z katalogu obrazów. Wymaga
+istniejącego, dokładnie atestowanego koordynatora w stanie `exited`, pełnego
+odczytu kolejki bez aktywnych zadań i bez oczekujących zadań BORIS oraz braku
+aktywnych workerów Fullmaga. Oczekujące zadania FEM pozostają w kolejce.
+Polecenie nie zatrzymuje, nie zastępuje ani nie uruchamia kontenera.
+
+```text
+python -B scripts/local_runner_cli.py --worktree <checkout> container-disable-boris-cpu --expected-container-sha256 <sha256-publicznego-pliku> --expected-build-config-sha256 <sha256-katalogu> --expected-boris-entry-sha256 <sha256-wpisu-BORIS>
+```
+
+Wszystkie trzy argumenty są pełnymi hashami SHA-256. Pierwszy oznacza hash
+surowych bajtów `index/local-runner-container.json`, drugi hash surowych bajtów
+`index/local-runner-build-config.json`, a trzeci hash kanonicznego wpisu
+`profiles["boris-cpu-v1"]`, obliczany przez
+`scripts/local_runner/boris_transition.py::entry_sha`. Hash wpisu używa JSON
+z posortowanymi kluczami, separatorami `,` i `:` oraz bez NaN. Nazwa pierwszego
+argumentu nie oznacza identyfikatora kontenera Docker. Nie przekazuj tokenu
+ani pliku prywatnego w argumentach lub logach.
+
+Przed zapisem powstaje prywatny journal
+`index/local-runner-boris-transition/pending.json` z dokładnymi bajtami
+przed/po i tożsamością transakcji oraz kontenera. Zawiera dane prywatnej
+konfiguracji: na Windows katalog otrzymuje ACL bieżącego użytkownika i SYSTEM,
+a na POSIX prawa 0700. Nie publikuj journala. Każdy zapis jest sprawdzany;
+wyjątek powoduje próbę cofnięcia wyłącznie własnych zmian. Przerwana lub
+niedająca się cofnąć transakcja pozostawia `pending.json`, który blokuje
+konfigurację, start, zastąpienie kontenera oraz wybór profilu buildu.
+
+```text
+python -B scripts/local_runner_cli.py --worktree <checkout> container-recover-boris-profile --transaction-id <dokładne-32-znakowe-ID> --direction before
+python -B scripts/local_runner_cli.py --worktree <checkout> container-recover-boris-profile --transaction-id <dokładne-32-znakowe-ID> --direction after
+```
+
+Wybierz jeden kierunek: `before` odtwarza stan sprzed usunięcia, `after`
+domyka usunięcie. Recovery wymaga tej samej zatrzymanej inkarnacji kontenera,
+zgodnego operatora, ważnego journala i bieżących bajtów należących do tej
+transakcji. Obca zmiana blokuje recovery i pozostaje nietknięta. Token,
+obraz koordynatora, port, inne profile i kolejka zadań są zachowywane;
+SQLite nie jest odtwarzane z kopii. Receipt powstaje przed usunięciem pending.
+Synchronizacja plików nie stanowi dowodu odporności Windows na utratę zasilania.
+
+Dowód źródłowy: 14 interpretowanych regresji transakcji i recovery PASS,
+w tym przerwanie po każdym z trzech zapisów w obu kierunkach, obce zmiany,
+niezgodna inkarnacja, aktywne zadania/workery i blokowanie konsumentów pending.
+Rzeczywiste wyłączenie/odzyskanie konfiguracji operatora i przejście starego
+koordynatora na nowy obraz pozostają **NOT VERIFIED**. Próba na prywatnym
+pliku wykazała, że Windows `msvcrt.locking` oraz kontenerowe Linux `flock`
+nie wykluczają się na tym hoście; nie używaj blokady Windows jako dowodu
+zatrzymania kontenerowego claim. Te polecenia obsługują dopiero stan offline.
 
 ## Dane, zakończenie i retencja
 

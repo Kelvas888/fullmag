@@ -41,6 +41,8 @@ def profile_lane(profile):
 
 
 def configure_build(layout, profile, image_digest, *, owner, cpus=2, memory_bytes=8 * 1024**3, call=docker):
+    from local_runner.boris_transition import assert_no_pending
+    assert_no_pending(layout['storage_root'])
     profile_lane(profile)
     if not re.fullmatch('sha256:[a-f0-9]{64}', image_digest):
         raise ValueError('An immutable local image ID is required')
@@ -53,6 +55,8 @@ def configure_build(layout, profile, image_digest, *, owner, cpus=2, memory_byte
     storage = Path(layout['storage_root'])
     path = validate_path(storage / 'index' / 'local-runner-build-config.json', storage)
     with file_lock(storage / 'locks' / 'local-runner-coordinator.lock', 'build configuration'):
+        from local_runner.boris_transition import assert_no_pending
+        assert_no_pending(storage)
         config = json.loads(path.read_text()) if path.exists() else {'schema': 'fullmag.runner-build-config.v1', 'operator': owner, 'profiles': {}}
         if config.get('schema') != 'fullmag.runner-build-config.v1' or config.get('operator') != owner:
             raise ValueError('Build configuration owner/schema mismatch')
@@ -62,6 +66,8 @@ def configure_build(layout, profile, image_digest, *, owner, cpus=2, memory_byte
 
 
 def configured_build(layout, owner, profile):
+    from local_runner.boris_transition import assert_no_pending
+    assert_no_pending(layout['storage_root'])
     profile_lane(profile)
     storage = Path(layout['storage_root'])
     path = validate_path(storage / 'index' / 'local-runner-build-config.json', storage)

@@ -34,6 +34,13 @@ def main(argv=None):
     profile_activation.add_argument('--enable-current-contracts', action='store_true')
     profile_activation.add_argument('--enable-slepc-modal', action='store_true')
     container_config.add_argument('--enable-boris-cpu', action='store_true')
+    disable_boris = sub.add_parser('container-disable-boris-cpu')
+    disable_boris.add_argument('--expected-container-sha256', required=True)
+    disable_boris.add_argument('--expected-build-config-sha256', required=True)
+    disable_boris.add_argument('--expected-boris-entry-sha256', required=True)
+    recovery_boris = sub.add_parser('container-recover-boris-profile')
+    recovery_boris.add_argument('--transaction-id', required=True)
+    recovery_boris.add_argument('--direction', choices=('before', 'after'), required=True)
     replacement = sub.add_parser('container-replace')
     replacement.add_argument('--image-id', required=True)
     sub.add_parser('container-resume')
@@ -95,6 +102,13 @@ def main(argv=None):
                     enable_slepc_modal=args.enable_slepc_modal,
                     enable_boris_cpu=args.enable_boris_cpu,
                 )
+            elif args.action == 'container-disable-boris-cpu':
+                result = container_client.disable_boris_cpu(
+                    layout, owner, args.expected_container_sha256,
+                    args.expected_build_config_sha256, args.expected_boris_entry_sha256)
+            elif args.action == 'container-recover-boris-profile':
+                result = container_client.recover_boris_profile(
+                    layout, owner, args.transaction_id, args.direction)
             elif args.action == 'container-replace':
                 result = container_client.replace(layout, args.image_id, owner=owner)
             elif args.action == 'container-resume':

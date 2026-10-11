@@ -310,6 +310,8 @@ def _validate_secret(secret: Mapping[str, object], storage: Path, operator: str,
 def _load_config(layout: Mapping[str, object], operator: str) -> tuple[Path, Path, dict[str, Any], str]:
     operator = _owner(operator)
     storage = _storage_root(layout)
+    from local_runner.boris_transition import assert_no_pending
+    assert_no_pending(storage)
     public_path, secret_path, _ = _config_paths(layout)
     public = _validate_public(_read_object(public_path, "Container configuration"), storage, operator)
     secret = _read_object(secret_path, "Container secret")
@@ -351,6 +353,8 @@ def configure(
     storage.mkdir(parents=True, exist_ok=True)
     public_path, secret_path, lock_path = _config_paths(layout, create=True)
     with file_lock(lock_path, "local runner container configuration", blocking=True):
+        from local_runner.boris_transition import assert_no_pending
+        assert_no_pending(storage)
         public_exists = public_path.exists()
         secret_exists = secret_path.exists()
         if public_exists != secret_exists:
@@ -948,6 +952,19 @@ def replace(
         raise ContainerClientError("Local runner container lifecycle lock is unavailable") from error
 
 
+def disable_boris_cpu(layout, owner, expected_public_sha256, expected_catalog_sha256, expected_boris_sha256, *, docker_call=None):
+    """Remove only matching BORIS activation from an attested exited coordinator."""
+    from local_runner.boris_transition import disable
+    return disable(layout, owner, expected_public_sha256, expected_catalog_sha256,
+                   expected_boris_sha256, docker_call=docker_call)
+
+
+def recover_boris_profile(layout, owner, transaction_id, direction, *, docker_call=None):
+    """Resolve an exact pending offline transaction without starting Docker."""
+    from local_runner.boris_transition import recover
+    return recover(layout, owner, transaction_id, direction, docker_call=docker_call)
+
+
 install = configure
 
 
@@ -969,6 +986,8 @@ __all__ = [
     "MAX_RESPONSE_BYTES",
     "SECRET_SCHEMA",
     "configure",
+    "disable_boris_cpu",
+    "recover_boris_profile",
     "install",
     "request",
     "replace",
