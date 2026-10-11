@@ -5387,3 +5387,15 @@ fixtures, lecz rzeczywisty pomiar getterów nadal wymaga GHA.
 | source-r2-live-pclu-monitor-getters | backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp | PetscErrorCode capture_floquet_shifted_ksp_progress | Opt-in getter-only live PCLU configuration snapshot before positive convergence or hard EPS error; not actual factor perturbation |
 | source-r2-live-pclu-monitor-serializer | backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp | std::string live_pclu_monitor_observation_json | Cached scalar-only monitor configuration with independent getter errors and nullable values |
 | source-r2-live-pclu-monitor-regressions | backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp | void live_pclu_monitor_observation_serializer_states | Fresh getter-error snapshots, unknown enum and nonfinite serialization regressions; hosted execution pending |
+
+
+### P4 — coverage i adaptive retry po retained discovery
+
+Poprawny child discovery może już zawierać oba clipped endpoint guards
+bez retry. Bramka nie wymusza ponownego solve tylko dlatego, że stary
+publication cap ukrywał guard. Rzeczywista regresja zachowuje kontrolę
+obu endpoints, lokalnego modu, finalnego limitu i search stability.
+Istniejąca oddzielna, rzeczywista fixture64 mode z jednostronnym pool
+zachowuje wymaganie obserwowanego retry i odmowy po wyczerpaniu budżetu.
+Nie zmieniamy jej ani decyzji retry w solverze. Zachowujemy tolerancje,
+bramki residualu i status count_certificate=not_performed.

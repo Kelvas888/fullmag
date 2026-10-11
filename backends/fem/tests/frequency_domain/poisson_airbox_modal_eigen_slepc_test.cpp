@@ -1813,7 +1813,7 @@ void FrequencyWindowRetainsInteriorModesBeforePublicationCap()
           "refinement ncv must follow the bounded policy at the actual split dimension");
 }
 
-void FrequencyWindowRetriesUntilBothClippedEdgesAreCovered()
+void FrequencyWindowCoversBothClippedEdges()
 {
     const WindowSpectrumFixture fixture = make_window_spectrum_fixture(
         {0.35e9, 0.38e9, 0.40e9, 0.42e9,
@@ -1845,11 +1845,7 @@ void FrequencyWindowRetriesUntilBothClippedEdgesAreCovered()
               lower_edge,
               "\"local_accepted_mode_count\":1"),
           "lower refinement edge must recover its in-window mode");
-    check(json_object_after_contains(
-              result.executed_subwindows_json,
-              lower_edge,
-              "\"requested_mode_count\":8,\"retry_count\":1"),
-          "lower refinement edge must grow the request until coverage is certified");
+
 
     const char *upper_edge =
         "\"pass\":\"refinement\",\"subwindow_index\":33,";
@@ -1863,11 +1859,7 @@ void FrequencyWindowRetriesUntilBothClippedEdgesAreCovered()
               upper_edge,
               "\"local_accepted_mode_count\":1"),
           "upper refinement edge must recover its in-window mode");
-    check(json_object_after_contains(
-              result.executed_subwindows_json,
-              upper_edge,
-              "\"requested_mode_count\":8,\"retry_count\":1"),
-          "upper refinement edge must grow the request until coverage is certified");
+
     check(json_object_after_contains(
               result.executed_subwindows_json,
               lower_edge,
@@ -1878,6 +1870,15 @@ void FrequencyWindowRetriesUntilBothClippedEdgesAreCovered()
               upper_edge,
               "\"lower_edge_covered\":true,\"upper_edge_covered\":true"),
           "upper refinement subwindow must certify both interval endpoints independently");
+    for (const char *edge : {lower_edge, upper_edge}) {
+        const std::string observation = json_object_after(result.executed_subwindows_json, edge);
+        const double requested = json_number_after(observation.c_str(), "\"requested_mode_count\":");
+        const double retries = json_number_after(observation.c_str(), "\"retry_count\":");
+        check(requested >= 4.0 && requested <= 8.0 && retries >= 0.0 &&
+                  (retries == 0.0 ? requested == 4.0 : requested > 4.0) &&
+                  contains(observation.c_str(), "\"local_coverage_certified\":true"),
+              "clipped edge discovery must either already cover the endpoints or grow within its request budget");
+    }
 }
 
 void FrequencyWindowUsesCertifiedSignedGuardBelowFundamentalMode()
@@ -3095,7 +3096,7 @@ int main()
         run_case("FrequencyWindowPublishesSelectedSearchStabilityWithoutCount", FrequencyWindowPublishesSelectedSearchStabilityWithoutCount);
         run_case("FrequencyWindowDoesNotRetryWhenOnlyTheGlobalRequestIsSaturated", FrequencyWindowDoesNotRetryWhenOnlyTheGlobalRequestIsSaturated);
         run_case("FrequencyWindowRetainsInteriorModesBeforePublicationCap", FrequencyWindowRetainsInteriorModesBeforePublicationCap);
-        run_case("FrequencyWindowRetriesUntilBothClippedEdgesAreCovered", FrequencyWindowRetriesUntilBothClippedEdgesAreCovered);
+        run_case("FrequencyWindowCoversBothClippedEdges", FrequencyWindowCoversBothClippedEdges);
         run_case("FrequencyWindowFailsClosedWhenMaximumRequestCannotCoverBothEdges", FrequencyWindowFailsClosedWhenMaximumRequestCannotCoverBothEdges);
         run_case("FrequencyWindowCertifiesDegenerateClusterByInvariantSubspace", FrequencyWindowCertifiesDegenerateClusterByInvariantSubspace);
         run_case("FrequencyWindowFailsClosedWhenRequestSplitsDegenerateCluster", FrequencyWindowFailsClosedWhenRequestSplitsDegenerateCluster);
@@ -3136,7 +3137,7 @@ int main()
     FrequencyWindowPublishesSelectedSearchStabilityWithoutCount();
     FrequencyWindowDoesNotRetryWhenOnlyTheGlobalRequestIsSaturated();
     FrequencyWindowRetainsInteriorModesBeforePublicationCap();
-    FrequencyWindowRetriesUntilBothClippedEdgesAreCovered();
+    FrequencyWindowCoversBothClippedEdges();
     FrequencyWindowFailsClosedWhenMaximumRequestCannotCoverBothEdges();
     FrequencyWindowCertifiesDegenerateClusterByInvariantSubspace();
     FrequencyWindowFailsClosedWhenRequestSplitsDegenerateCluster();

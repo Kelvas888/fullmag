@@ -698,3 +698,26 @@ NOT VERIFIED; nie interpretujemy tej odmowy jako błędu common guard.
 P2 monitor na remote66daacf174f8706989d6dddb1ab25b5ec7a3a918.
 Hosted #38087023290 (count/monitor) i #38087026506 (phase/window/admission)
 w toku; drugi ma jeszcze starą tiny fixture i wymaga nowego źródła.
+
+
+## P4 — poprawiona asercja pokrycia clipped edges
+
+Hosted #38087198875 na436547e3c140d11b661bc0d46608077026e2d4e8:
+build, damping admission, phase convention i typed CPU transport PASS.
+Selected-window suite zatrzymała się na wymaganiu retry także wtedy,
+gdy retained discovery już certyfikowało pokrycie obu końców.
+Poprawka zachowuje cztery mody, lokalny count i obydwa endpoint guards;
+request pozostaje ograniczony4..8. Oddzielna rzeczywista fixture64-modowa
+nadal wymaga request8/retry1 i fail-closed po wyczerpaniu limitu.
+Nie zmieniono operatora, tolerancji ani reguł certyfikacji.
+Source review PASS; wykonanie zmienionej fixture w GHA wymagane.
+
+P2: #38087023290 na66daacf174f8706989d6dddb1ab25b5ec7a3a918
+przeszedł2/2 CTest. Actual monitor odczytał8 razy konfigurację PCLU:
+MAT_SHIFT_NONZERO i amount1.490116119384766e-08, getter codes0.
+Raw status4 nie oznacza zaakceptowanego solve. To dowód konfiguracji,
+nie pomiar rzeczywistej perturbacji faktora ani przyczyny błędu.
+
+Focused API #38086656946:78PASS/5FAIL w session suite. Dwa dalsze
+router cases niewykonane. Cztery fixtures wymagają sprawdzenia nośnika
+topologii FEM, piąta bieżącej generacji quantity ledger; naprawa w toku.
