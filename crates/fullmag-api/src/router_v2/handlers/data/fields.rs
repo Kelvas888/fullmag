@@ -5178,7 +5178,7 @@ fn analysis_frequency_response_vector_response(
             )?
         };
     let component = parse_field_component(
-        quantity_id,
+        field_id,
         query.component.as_deref().or(default_component),
         n_comp,
     )?;
@@ -6018,7 +6018,7 @@ fn analysis_eigen_mode_vector_response(
         Some(effective_phase_rad),
     )?;
     let component = parse_field_component(
-        quantity_id,
+        field_id,
         query.component.as_deref().or(default_component),
         n_comp,
     )?;
