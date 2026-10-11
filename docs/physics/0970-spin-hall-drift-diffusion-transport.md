@@ -2398,6 +2398,86 @@ The remaining public charge work includes larger and masked domains,
 convergence and sanitizer gates, cross-backend parity, and the complete
 spin/SHE/M2/M3/FEM paths.
 
+(fem-steady-transport-identity)=
+### Tożsamość naukowego artefaktu FEM steady transport
+
+Surowy `fullmag.fem.steady_spin_transport.v2` zawiera obowiązkowy dla kwalifikacji,
+addytywny blok `modules[].transport_identity` ze schematem
+`fullmag.fem.steady_transport_identity.v1`. Starszy artefakt bez tego bloku pozostaje
+odczytywalny diagnostycznie; checker odmawia kwalifikacji. Blok powstaje z
+`prepared.request` zaakceptowanego przez preflight, a nie z pliku IR wskazanego przez
+odbiorcę. Nie zmienia równań, ABI ani statusu capability. Implementacja źródłowa
+nie jest dowodem realnego wykonania; nowy pakiet i rzeczywisty przebieg managed
+pozostają wymagane.
+
+| Pole / grupa pól | Typ, obowiązek i walidacja | Jednostka SI | Znaczenie i źródło |
+|---|---|---|---|
+| `schema`, `digest_codec`, `mesh_topology_codec` | wymagane, dokładne wersje v1/v1/v3 | $1$ | kontrakt metadanych i encoderów |
+| `request_sha256`, `descriptor_sha256`, `result_sha256` | wymagane `sha256:` + 64 cyfry hex; ponownie obliczane | $1$ | odpowiednio actual request, opublikowany descriptor, cały opublikowany result |
+| `request.module_id`, `current_source_id` | wymagane niepuste identyfikatory | $1$ | właściciel spin i charge source |
+| `mesh_name`, `node_carrier` | wymagane; carrier `ordered_mesh_nodes_u32.v1` | $1$ | kolejność węzłów jest kolejnością carrier wyników; nie arbitralną permutacją |
+| `mesh_topology_sha256` | wymagany canonical topology v3; finite współrzędne | $1$ | pełna kolejność nodes, cells/facets, global ordinals, mesh parts, markers i PBC |
+| `node_count`, `cell_count` | wymagane całkowite dodatnie | $1$ | rozmiar faktycznego carrier; sam count nie potwierdza identity |
+| `execution`, `interface`, `gauge`, `constitutive_model` | wymagane jawne identyfikatory actual request | $1$ | rzeczywista lane, przestrzeń/interface, gauge i M1/M2 |
+| `constitutive_version`, `operator_version`, `physical_residual_version` | wymagane dokładne identyfikatory; zgodne z result | $1$ | zamrożone znaczenie operatora i bilansów |
+| `charge_conductivity_Spm_per_element` | wymagane finite dodatnie, długość cell count | $\mathrm{S\,m^{-1}}$ | actual conductivity każdego elementu |
+| `magnetization` | wymagane finite uporządkowane wektory, długość node count | $1$ | actual kierunki użyte do constitutive solve |
+| `sigma_s_Spm` | wymagane finite dodatnie | $\mathrm{S\,m^{-1}}$ | actual spin conductivity |
+| `sigma_parallel_Spm`, `sigma_perpendicular_Spm`, `sigma_ahe_Spm` | opcjonalne liczby finite, `null` dla M1 | $\mathrm{S\,m^{-1}}$ | actual reciprocal materiał, bez dopisywania M2 do M1 |
+| `polarization_p`, `theta_sh` | wymagane finite, domena publicznego materiału | $1$ | actual charge/spin cross coefficients |
+| `lambda_sf_m`, `lambda_j_m`, `lambda_phi_m` | dodatnie długości lub jawne disabled/null istniejącego request | $\mathrm{m}$ | actual reaction lengths; publiczny `lambda_sf_m` nadal wymaga finite dodatniej wartości |
+| `gamma_e_per_Ts` | wymagane finite dodatnie | $\mathrm{s^{-1}\,T^{-1}}$ | actual gyromagnetic coefficient z planner |
+| `saturation_magnetization_Apm` | wymagane finite dodatnie | $\mathrm{A\,m^{-1}}$ | actual magnetic normalization |
+| `relative_tolerance`, `absolute_tolerance`, `maximum_iterations` | wymagane istniejące linear solver policy | $1$ | actual solver policy, bez dostrajania do wyniku |
+| `charge_dirichlet` | uporządkowane pary MFEM boundary attribute i finite value | $\mathrm{V}$ | actual voltage BC; ID jest markerem, nie nodal index |
+| `spin_dirichlet` | uporządkowane pary MFEM boundary attribute i finite xyz | $\mathrm{V}$ | actual spin-potential BC |
+
+`fullmag.transport_tagged_json.v1` koduje `null`, bool, string, array, object
+oraz liczbę osobnymi tagami `N/T/F/S/A/O/D`. Długości są `u64` little-endian,
+stringi UTF-8, klucze object są sortowane, liczby finite binary64 little-endian,
+a signed zero jest normalizowane. Całkowite wartości powyżej $2^{53}$ są odrzucane
+przez ten encoder; mesh IDs zachowuje oddzielny canonical topology v3 bez tej
+redukcji. SHA-256 ma prefix preimage `fullmag:transport-tagged-json:v1`.
+Tożsamość topology jest wspólna z
+`crates/fullmag-ir/src/mesh_hints.rs::MeshIR::mixed_topology_fingerprint_v3`
+i `packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py::MeshData::topology_fingerprint_v3`.
+
+Publiczny checker generuje stage-first Python przez
+`scripts/verify_transport_public_oracles.py::source`, obniża go przez
+`fullmag.runtime.loader::load_problem_from_script` i porównuje intent
+`current_modules`, `spin_transport_modules`, materiały, magnetization, geometry,
+backend i study z tym samym publicznym fixture. Dla FEM M1 sinh wymaga $L=1\,\mathrm{m}$,
+przekroju $0.1\,\mathrm{m}$ na $0.1\,\mathrm{m}$, $\lambda_{sf}=0.2\,\mathrm{m}$,
+$\sigma=\sigma_s=4\,\mathrm{S\,m^{-1}}$, $P=\theta_{SH}=0$, jawnych existing FEM
+operator IDs i identycznych charge/spin linear policies: tolerance `1e-12`,
+absolute tolerance `0`, max iterations `10000`. Żadna BC ani mesh identity
+nie pochodzi z wyniku solve; marker groups wyprowadza z topology i geometrii.
+Istniejące bramki: max nodal spin error `<1e-3 V`, residual `<1e-10`, bilans `<5%`
+scale flux/reaction, voltage error `<2e-10 V`. Bool/NaN/Inf są odrzucane.
+
+`scripts/run_managed_transport_oracles.py::start` dopuszcza tylko terminalny,
+zweryfikowany pakiet CPU z exact kapsułą źródeł i pinned image. Jedyna komenda
+izolowanego kontenera tworzy publiczny fixture i pełny IR w tmpfs, wykonuje ten
+sam IR oraz emituje jego hash i hash raw artifact do logu Dockera.
+`::observe` ponownie atestuje komendę, mounty, lane, source capsule, pakiet,
+startup stamp oraz zgodność retained files z tym manifestem. Receipt
+`fullmag.managed-transport-oracles.v1` zachowuje source/native/build/image/binary
+identity, IR/artifact/script hashes i actual transport identity. Sam plik receipt
+nie jest dowodem: checker wywołuje ponownie `observe` przed bramką. Brak receipts,
+stary producer lub obca siatka zwracają `not_verified`; przygotowanie zwraca
+`prepared_not_run`. Katalog wyjściowy musi być nowy.
+
+| Lane | Zakres dowodu tego kontraktu | Ograniczenie |
+|---|---|---|
+| FEM CPU | actual metadata + independent M1 finite-lambda sinh checker | real managed execution i nowy pakiet jeszcze niewykonane w tym kroku |
+| FEM GPU | jawne odrzucenie dla tego checkera | brak kwalifikowanego operatora M2 GPU |
+| FDM CPU | istniejące charge bar/sinh oracles, bez zmiany solvera | osobna ścieżka accepted artifact; ta FEM identity nie jest używana |
+| FDM GPU | brak claimu | nie wolno zastąpić rzeczywistego urządzenia CPU fallbackiem |
+
+M2 affine z wyłączonym spin-flip nadal nie przechodzi publicznego authoringu,
+ponieważ publiczny `lambda_sf_m` wymaga finite dodatniej długości. Ten checker
+nie kwalifikuje M2 ani nie zastępuje disabled reaction dużą długością.
+
 (source-code-index)=
 ## 8. Source-code index
 
@@ -2488,6 +2568,12 @@ a qualified workload without the validation gates above.
 | FDM GPU M1 spin-observation parity | backends/fdm/tests/gpu_m1_spin_operator_parity_v1_contract.cpp | main | compare reconstructed typed observations with the CPU owner, including reversed orientation and exact accepted charge traces | managed actual-device CPU--GPU parity PASS |
 | FDM GPU M1 sparse public dispatch | backends/fdm/tests/gpu_m1_spin_sparse_dispatch_v1_contract.cpp | main | prove 1,048,576-cell public dispatch, 512 MiB external envelope, 2 GiB total peak, persistent cache, component-sensitive digest invalidation, NaN rollback and deterministic restore | `just verify-fdm-gpu-m1-spin-native-contract`; actual-device PASS |
 | FDM GPU M1 sparse performance | backends/fdm/tests/gpu_m1_spin_sparse_performance_v1_contract.cu | main | enforce the frozen absolute setup, warm-solve, transfer and whole-context memory budgets on one identified GPU | `just verify-fdm-gpu-m1-spin-sparse-performance-contract`; durable actual-device JSON PASS |
+
+| Kontrakt | Ścieżka | Symbol | Odpowiedzialność i dowód |
+|---|---|---|---|
+| Mandatory raw FEM identity | crates/fullmag-runner/src/native_fem/steady_transport/artifact_identity.rs | actual_transport_identity; tagged_json_digest | hash actual prepared request, full topology v3, descriptor and result; source-only, runtime unverified |
+| Independent public FEM readback | scripts/verify_transport_public_oracles.py | validate_fem_identity; check_fem | exact mesh/intent/operator binding and existing analytical gates; no PASS without managed observation |
+| Fixed managed FEM oracle | scripts/run_managed_transport_oracles.py | start; observe; transport_spec | source/package/container/log-output binding; no builds, runtime unverified |
 
 (scientific-bibliography)=
 ## 9. References

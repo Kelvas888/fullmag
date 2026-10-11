@@ -82,6 +82,7 @@ pub(crate) fn preflight_direct_oersted_pair_budget_for_evaluations(
     Ok(total_pairs)
 }
 
+mod artifact_identity;
 mod descriptor;
 mod direct_oersted_snapshot;
 mod provenance;
@@ -452,7 +453,38 @@ pub(crate) fn execute_native_fem_steady_transport_plans(
             &result,
             field_snapshots.len() as u64 + 1,
         )?);
+        let result_payload = serde_json::json!({
+                "electric_potential_v": result.electric_potential_v,
+                "charge_current_density_xyz_apm2": result.charge_current_density_xyz_apm2,
+                "spin_potential_xyz_v": result.spin_potential_xyz_v,
+                "spin_current_tensor_row_major_qia_apm2": result.spin_current_tensor_row_major_qia_apm2,
+                "torque_xyz_per_s": result.torque_xyz_per_s,
+                "charge_iterations": result.charge_iterations,
+                "charge_relative_residual": result.charge_relative_residual,
+                "net_boundary_current_a": result.net_boundary_current_a,
+                "current_density_volume_average_apm2": result.current_density_volume_average_apm2,
+                "spin_iterations": result.spin_iterations,
+                "spin_relative_residual": result.spin_relative_residual,
+                "boundary_spin_flux_a": result.boundary_spin_flux_a,
+                "reaction_integral_a": result.reaction_integral_a,
+                "angular_momentum_balance_apm2": result.angular_momentum_balance_apm2,
+                "torque_volume_average_per_s": result.torque_volume_average_per_s,
+                "torque_l2_per_s": result.torque_l2_per_s,
+                "diagnostics": result.diagnostics,
+                "constitutive_version": result.constitutive_version,
+                "operator_version": result.operator_version,
+                "physical_residual_version": result.physical_residual_version,
+                "resolved_execution": result.resolved_execution,
+                "resolved_interface": result.resolved_interface,
+            });
+        let descriptor_payload = serde_json::to_value(&resolved.fem_cpu_double)
+            .map_err(|error| RunError { message: format!("serialize transport descriptor identity: {error}") })?;
+        let transport_identity = artifact_identity::actual_transport_identity(
+            &prepared.request, &resolved.module_id, &resolved.current_source_id,
+            &descriptor_payload, &result_payload,
+        )?;
         records.push(serde_json::json!({
+            "transport_identity": transport_identity,
             "module_id": resolved.module_id,
             "current_source_id": resolved.current_source_id,
             "requested_execution": resolved.requested_execution,
@@ -532,30 +564,7 @@ pub(crate) fn execute_native_fem_steady_transport_plans(
                     "diagnostics": view.diagnostics,
                 })
             }),
-            "result": {
-                "electric_potential_v": result.electric_potential_v,
-                "charge_current_density_xyz_apm2": result.charge_current_density_xyz_apm2,
-                "spin_potential_xyz_v": result.spin_potential_xyz_v,
-                "spin_current_tensor_row_major_qia_apm2": result.spin_current_tensor_row_major_qia_apm2,
-                "torque_xyz_per_s": result.torque_xyz_per_s,
-                "charge_iterations": result.charge_iterations,
-                "charge_relative_residual": result.charge_relative_residual,
-                "net_boundary_current_a": result.net_boundary_current_a,
-                "current_density_volume_average_apm2": result.current_density_volume_average_apm2,
-                "spin_iterations": result.spin_iterations,
-                "spin_relative_residual": result.spin_relative_residual,
-                "boundary_spin_flux_a": result.boundary_spin_flux_a,
-                "reaction_integral_a": result.reaction_integral_a,
-                "angular_momentum_balance_apm2": result.angular_momentum_balance_apm2,
-                "torque_volume_average_per_s": result.torque_volume_average_per_s,
-                "torque_l2_per_s": result.torque_l2_per_s,
-                "diagnostics": result.diagnostics,
-                "constitutive_version": result.constitutive_version,
-                "operator_version": result.operator_version,
-                "physical_residual_version": result.physical_residual_version,
-                "resolved_execution": result.resolved_execution,
-                "resolved_interface": result.resolved_interface,
-            }
+            "result": result_payload
         }));
         provenance.push(transport_provenance);
     }
