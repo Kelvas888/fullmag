@@ -721,3 +721,17 @@ nie pomiar rzeczywistej perturbacji faktora ani przyczyny błędu.
 Focused API #38086656946:78PASS/5FAIL w session suite. Dwa dalsze
 router cases niewykonane. Cztery fixtures wymagają sprawdzenia nośnika
 topologii FEM, piąta bieżącej generacji quantity ledger; naprawa w toku.
+
+
+## P10 — pięć stale fixtures session source gate
+
+Wynik78PASS/5FAIL #38086656946 sprawdzono względem aktualnego resolvera.
+Cached FemEigen zachowuje FEM i otrzymał rzeczywisty carrier TET4 z4
+węzłami oraz zgodne12components. Trzy fixtures o dotychczasowym cell
+layout otrzymały jawny FDM metadata dla1/2komórek, zamiast przypadkowego
+FEM admission. Current-generation reconciliation nadal odrzuca niezamówione
+m; pozytywne H_demag jest actual Latest materialization związane z tym
+samym zaakceptowanym fizycznym row/step/time i generation. Oddzielny
+negative stale-generation test pozostał. Produkcji i globalnych helperów
+nie zmieniono. Root diff review PASS, rustfmt parser-only exit0; testy
+wykonuje wyłącznie GHA. Hosted wynik zmienionych fixtures jeszcze wymagany.

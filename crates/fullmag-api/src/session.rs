@@ -4015,13 +4015,14 @@ mod tests {
     #[test]
     fn cached_physical_field_sources_survive_a_later_solver_progress_callback() {
         let mut current = test_current_snapshot();
+        current.fem_mesh = Some(domain_fem_mesh("mesh-generation-1"));
         add_physical_observation(&mut current, 4, Some(4.0e-12));
+        let node_values = vec![[1.0, 0.0, 0.0]; 4];
         let mut latest_fields: LatestFields = serde_json::from_value(json!({
             "H_eff": {
                 "source_step": 4,
                 "source_time_seconds": 4.0e-12,
-                "values": [[1.0, 0.0, 0.0]],
-                "layout": { "grid_cells": [1, 1, 1] }
+                "values": node_values.clone()
             }
         }))
         .expect("physical field fixture");
@@ -4032,6 +4033,11 @@ mod tests {
         let mut preview = preview_field("H_eff");
         preview.source_step = 4;
         preview.source_time_seconds = Some(4.0e-12);
+        preview.original_grid = [4, 1, 1];
+        preview.preview_grid = [4, 1, 1];
+        preview.vector_field_values = node_values.into_iter().flatten().collect();
+        preview.x_chosen_size = 4;
+        preview.applied_x_chosen_size = 4;
         apply_current_live_field_frame(
             &mut current,
             CurrentLiveFieldFrameRequest {
@@ -5291,6 +5297,7 @@ mod tests {
                 "grid_cells": [1, 1, 1]
             }
         }));
+        add_physical_observation(&mut current, 1, Some(1.0e-12));
         let generation_id = domain_generation_id(&current);
         let mut command = session_command("cmd-fields", "compute_fields");
         command.field_materialization_requirements =
@@ -5318,7 +5325,18 @@ mod tests {
             1_700_000_002_000
         ));
 
-        merge_cached_preview_fields(&mut current.preview_cache, vec![preview_field("H_demag")]);
+        let mut latest_fields: LatestFields = serde_json::from_value(json!({
+            "H_demag": {
+                "values": [[1.0, 0.0, 0.0]],
+                "source_step": 1,
+                "source_time_seconds": 1.0e-12,
+                "layout": { "grid_cells": [1, 1, 1] }
+            }
+        }))
+        .expect("current-generation H_demag field");
+        bind_latest_field_observation_frames(&mut current, &mut latest_fields)
+            .expect("H_demag should bind to the current physical row");
+        current.latest_fields = latest_fields;
         assert!(reconcile_dispatched_command_ledger_from_snapshot(
             &mut ledger,
             &current,
@@ -7283,6 +7301,12 @@ mod tests {
     #[test]
     fn effective_field_source_tracks_shared_latest_preview_precedence_without_revision_churn() {
         let mut current = test_current_snapshot();
+        current.metadata = Some(json!({
+            "artifact_layout": {
+                "backend": "fdm",
+                "grid_cells": [1, 1, 1]
+            }
+        }));
         add_physical_observation(&mut current, 52, None);
         current.latest_fields = serde_json::from_value(json!({
             "H_demag": {
@@ -7573,6 +7597,12 @@ mod tests {
     #[test]
     fn latest_field_same_provenance_changed_payload_bumps_once_without_duplicate_churn() {
         let mut current = test_current_snapshot();
+        current.metadata = Some(json!({
+            "artifact_layout": {
+                "backend": "fdm",
+                "grid_cells": [2, 1, 1]
+            }
+        }));
         add_physical_observation(&mut current, 52, None);
         let field = |values: Vec<Vec<f64>>| -> LatestFields {
             serde_json::from_value(json!({
@@ -7626,6 +7656,12 @@ mod tests {
     #[test]
     fn terminal_authoritative_field_frame_replaces_stale_fields_without_replay_churn() {
         let mut current = test_current_snapshot();
+        current.metadata = Some(json!({
+            "artifact_layout": {
+                "backend": "fdm",
+                "grid_cells": [1, 1, 1]
+            }
+        }));
         add_physical_observation(&mut current, 10, None);
         add_physical_observation(&mut current, 11, None);
         current.latest_fields = serde_json::from_value(json!({

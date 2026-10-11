@@ -344,6 +344,61 @@
       "shared_damping_admission_cases_executed": false,
       "receipt_sha256": "8b43bd27f3ba3a8f3015ac4aef30c6cad0c4a33962e17ccff6ac267075cc292a",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38087023290,
+      "sha": "66daacf174f8706989d6dddb1ab25b5ec7a3a918",
+      "conclusion": "success",
+      "scope": "floquet_count_and_live_PCLU_configuration",
+      "passed_ctests": [
+        "fem_modal_eigen_floquet_count_contract",
+        "fem_modal_eigen_live_shift_configuration_contract"
+      ],
+      "actual_query_count": 8,
+      "actual_monitor_iteration": 7,
+      "actual_shift_type": "MAT_SHIFT_NONZERO",
+      "actual_shift_amount": 1.490116119384766e-08,
+      "actual_getter_codes": 0,
+      "raw_solver_status": 4,
+      "factor_perturbation_measured": false,
+      "accepted_scientific_solve": false,
+      "receipt_sha256": "c85fe5658f97d9d7f5e221ab1384b09b5cb3921f38c13a43209005a8fe280a80",
+      "qualification_claimed": false
+    },
+    {
+      "run_id": 38087198875,
+      "sha": "436547e3c140d11b661bc0d46608077026e2d4e8",
+      "conclusion": "failure",
+      "scope": "modal_phase_typed_transport_damping_admission_selected_window",
+      "native_build": "passed",
+      "passed_ctests": [
+        "fem_modal_eigen_phase_convention_contract",
+        "fem_modal_eigen_typed_cpu_transport_contract",
+        "fem_modal_eigen_damping_admission_contract"
+      ],
+      "failed_ctests": [
+        "fem_poisson_airbox_selected_window_contract"
+      ],
+      "failure": "positive clipped-edge fixture demanded retry after retained discovery already covered interval",
+      "receipt_sha256": "9fd67a92d36dc45daf170c19cb8fc69339e65413e9a55811a29f8c876e46b47b",
+      "qualification_claimed": false
+    },
+    {
+      "run_id": 38086656946,
+      "sha": "fab55bab3ed45f82a20bbf150cfa4db5a155d623",
+      "conclusion": "failure",
+      "scope": "focused_API_session_source_contracts",
+      "tests_passed": 78,
+      "tests_failed": 5,
+      "subsequent_router_tests_executed": false,
+      "qualification_claimed": false
+    },
+    {
+      "run_id": 38123800798,
+      "sha": "d33822c150d82e48fbbfe97ec72676ced5f547f2",
+      "conclusion": "in_progress_at_checkpoint",
+      "scope": "modal_phase_selected_window_corrected_fixture",
+      "qualification_claimed": false
     }
   ]
 }
