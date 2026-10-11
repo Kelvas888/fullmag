@@ -196,6 +196,46 @@ parser oraz validator noty 0970 PASS. Są to dowody źródeł, bez uruchomienia
 BORIS, producenta ABI lub nowego benchmarku. Rzeczywista kwalifikacja nadal
 wymaga terminalnego buildu BORIS i wykonania porównań.
 
+### Zatrzymanie atestowanego koordynatora pod blokadą Linux
+
+`container-quiesce` obsługuje przejście dokładnie wskazanego koordynatora do
+stanu `exited`, zachowując pauzę i kolejkę. Najpierw wymaga zakończonego drain:
+API potwierdza pauzę, brak aktywnych zadań i zakończony worker; dodatkowo helper
+sprawdza wszystkie kontenery oraz SQLite tylko do odczytu. Nie czeka na cudzy
+build i nie zatrzymuje workerów. Aktywne lub niepewne zadanie powoduje odmowę.
+
+```text
+python -B scripts/local_runner_cli.py --worktree <checkout> container-quiesce --expected-container-id <pełne-ID> --expected-image-id sha256:<pełne-ID-obrazu> --expected-public-sha256 <hash-publicznego-pliku> --expected-catalog-sha256 <hash-katalogu> --reviewed-source-sha256 <ścieżka=hash>
+```
+
+Powtórz ostatni argument dokładnie dla siedmiu przejrzanych źródeł starego
+obrazu: `fullmag_storage.py`, `local_runner/build_executor.py`,
+`local_runner/coordinator.py`, `local_runner/container_main.py`,
+`local_runner/service.py`, `local_runner/queue.py` i
+`local_runner/container_api.py`. Hashe dotyczą bajtów w starym obrazie;
+bieżący checkout nie stanowi ich dowodu. Duplikaty, brak pliku, obcy hash,
+niezgodna inkarnacja i zmiana konfiguracji są odrzucane przed stop.
+
+Helper `scripts/local_runner/coordinator_lifecycle.py::quiesce_and_stop`
+uzyskuje rzeczywistą blokadę Linux wewnątrz atestowanego kontenera i ponawia
+kontrole pod tą blokadą. Atomowy publiczny receipt poprzedza ARM i żądanie
+stop; zapisuje dokładną tożsamość, nonce/PID blokady i hashe bez tokenu ani
+prywatnych bajtów konfiguracji. Dopiero potwierdzone `exited` oraz zniszczenie
+procesu blokady pozwalają uznać zatrzymanie za wykonane. Helper nie zastępuje
+obrazu i nie aktywuje profilu BORIS.
+
+Niepewny ARM albo stop pozostawia stan wymagający jawnego recovery dokładnie
+tego kontenera. Po ARM proces blokady nie zwalnia jej po EOF ani według wieku.
+Nie zabijaj samego procesu blokady ani nie wznawiaj niepotwierdzonego
+koordynatora. Ponownie sprawdź atestację oraz brak aktywnych zadań, doprowadź
+do potwierdzonego wyjścia tego koordynatora i zachowaj pauzę. Zmiana konfiguracji
+lub kolejki po wyjściu wymaga przeglądu przed restartem.
+
+Dowody: 26 niezależnych interpretowanych regresji helpera PASS. Prywatna
+rzeczywista próba na zamrożonym obrazie potwierdziła HELD, odmowę konkurencyjnego
+Linux `flock` i zwolnienie przed ARM. Rzeczywiste ARM/disconnect oraz lifecycle
+zainstalowanego operatora pozostają **NOT VERIFIED**.
+
 ### Wyłączenie profilu BORIS i odzyskiwanie transakcji offline
 
 `container-disable-boris-cpu` usuwa wyłącznie aktywację `boris-cpu-v1`

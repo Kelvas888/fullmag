@@ -41,6 +41,13 @@ def main(argv=None):
     recovery_boris = sub.add_parser('container-recover-boris-profile')
     recovery_boris.add_argument('--transaction-id', required=True)
     recovery_boris.add_argument('--direction', choices=('before', 'after'), required=True)
+    quiesce = sub.add_parser('container-quiesce')
+    quiesce.add_argument('--expected-container-id', required=True)
+    quiesce.add_argument('--expected-image-id', required=True)
+    quiesce.add_argument('--expected-public-sha256', required=True)
+    quiesce.add_argument('--expected-catalog-sha256', required=True)
+    quiesce.add_argument('--reviewed-source-sha256', action='append', required=True,
+                         metavar='PATH=SHA256')
     replacement = sub.add_parser('container-replace')
     replacement.add_argument('--image-id', required=True)
     sub.add_parser('container-resume')
@@ -109,6 +116,20 @@ def main(argv=None):
             elif args.action == 'container-recover-boris-profile':
                 result = container_client.recover_boris_profile(
                     layout, owner, args.transaction_id, args.direction)
+            elif args.action == 'container-quiesce':
+                from local_runner.coordinator_lifecycle import quiesce_and_stop
+                reviewed = {}
+                for entry in args.reviewed_source_sha256:
+                    parts = entry.split('=', 1)
+                    if len(parts) != 2 or parts[0] in reviewed:
+                        raise ContainerClientError('Unique reviewed source PATH=SHA256 entries are required')
+                    reviewed[parts[0]] = parts[1]
+                result = quiesce_and_stop(
+                    layout, owner, expected_container_id=args.expected_container_id,
+                    expected_image_id=args.expected_image_id,
+                    expected_public_sha256=args.expected_public_sha256,
+                    expected_catalog_sha256=args.expected_catalog_sha256,
+                    expected_source_hashes=reviewed)
             elif args.action == 'container-replace':
                 result = container_client.replace(layout, args.image_id, owner=owner)
             elif args.action == 'container-resume':
