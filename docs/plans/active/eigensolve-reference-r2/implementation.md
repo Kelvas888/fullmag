@@ -752,3 +752,15 @@ Bounded failure observation4096chars umożliwi rozpoznanie ewentualnej
 dalszej awarii bez wielkiego JSONdump. Solver i rzeczywista negative64
 retry fixture nie zostały zmienione. Niezależny source review PASS;
 wykonanie tej wersji pozostaje NOT VERIFIED do kolejnego GHA.
+
+
+## P0/P10 — ścisły authoring modal controls
+
+Dwie nowe uwagi review mają source correction: limity obu liczników
+Python/SceneDocument są zgodne z istniejącym i32::MAX planera, a błędna
+tolerancja nie znika jako brak nadpisania. None/exact-empty UI zachowuje
+omission i alias precedence; generic helper contracts pozostały bez zmian.
+Regresje boundary/types/primary/alias/script oraz doc source map przygotowano.
+Nowy scoped workflow eigensolve-authoring-policy-contracts wykona je w GHA.
+AST/źródła sprawdzone; test execution, browser i native solve pozostają
+niezweryfikowane dla tej poprawki do uzyskania odpowiednich dowodów.

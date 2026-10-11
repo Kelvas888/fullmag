@@ -742,6 +742,35 @@ Kontrakt parsera i przekazywania limitu przechodzi w CI; nie jest to jednak
 dowód wykonania pełnego managed MFEM/SLEPc dla bieżącego C1/A1. Taki dowód
 wymaga osobnego receiptu runtime oraz artefaktów z poprawnym niezerowym `k`.
 
+### Kontrakt walidacji publicznych nadpisań solvera
+
+`FemEigenSolverPolicy` zachowuje tylko jawnie podane nadpisania; `None`
+nie zamienia się w stałą tolerancję ani limit. Poniższa korekta porządkuje
+Python i SceneDocument względem istniejącego kontraktu planera. Jej
+wykonanie i regresje są osobno zapisywane w rejestrze review.
+
+| Parametr | Typ | Domyślna wartość | SI | Walidacja | Znaczenie | Backend support | ProblemIR |
+|---|---|---|---|---|---|---|---|
+| `FemEigenSolverPolicy.residual_tolerance` | `Optional[float]` | `None` | $1$ | Skończona liczba dodatnia; bool i niepoprawny tekst są błędem | Żądana względna tolerancja residualu | FEM CPU/GPU w istniejących natywnych capability; FDM i trasy referencyjne: unsupported; runtime osobno | `problem_meta.runtime_metadata.modal_solver_policy.residual_tolerance` |
+| `FemEigenSolverPolicy.max_outer_iterations` | `Optional[int]` | `None` | $1$ | Całkowity licznik od 1 do $2^{31}-1$; bool, float i overflow są błędem; bez clamp | Żądany limit iteracji EPS | FEM CPU/GPU w istniejących natywnych capability; FDM i trasy referencyjne: unsupported; runtime osobno | `problem_meta.runtime_metadata.modal_solver_policy.max_outer_iterations` |
+| `FemEigenSolverPolicy.max_linear_iterations` | `Optional[int]` | `None` | $1$ | Całkowity licznik od 1 do $2^{31}-1$; bool, float i overflow są błędem; bez clamp | Żądany limit iteracji KSP | FEM CPU/GPU w istniejących natywnych capability; FDM i trasy referencyjne: unsupported; runtime osobno | `problem_meta.runtime_metadata.modal_solver_policy.max_linear_iterations` |
+
+Sceniczne `eigen_solver_max_outer_iterations` i
+`eigen_solver_max_linear_iterations` mapują się odpowiednio na oba
+liczniki tej klasy. Legalny tekst liczbowy z UI zachowuje wartość.
+
+SceneDocument zachowuje dotychczasowy alias
+`eigen_solver_residual_tolerance`: niepuste `eigen_solver_rtol` ma
+pierwszeństwo, brak wartości lub dokładny pusty tekst deleguje do aliasu.
+Niepoprawna jawna wartość nie może znikać jako brak nadpisania. To nie
+zmienia równania, SI, sposobu pomiaru true residual ani domyślnych ustawień
+PETSc/SLEPc. Wymagania natywnej capability pozostają; FDM i referencyjne
+FEM dense/LOBPCG nie uzyskują tych nadpisań przez tę walidację.
+
+Mapowanie źródeł: `packages/fullmag-py/src/fullmag/model/study.py::FemEigenSolverPolicy`,
+`packages/fullmag-py/src/fullmag/runtime/scene_document.py::builder_overrides_from_scene_document`,
+`crates/fullmag-plan/src/fem.rs::eigen_solver_policy`.
+
 ## Current limitations
 
 Stan źródeł dla tej noty należy identyfikować w checkoutcie przez
@@ -1264,3 +1293,12 @@ phase convention i typed CPU transport, oba PASS. Jest to wykonanie małych
 kontraktów SLEPc/PETSc real-double, nie kwalifikacja DE/BV, zbieżności siatki,
 airboxu ani dokładnego damped pencil. Receipt i zakresy są związane z SHA
 w `docs/plans/active/eigensolve-reference-r2/ci-evidence-20261010.json`.
+
+
+### Źródła kontraktu walidacji nadpisań
+
+| Source ID | Path + symbol | Odpowiedzialność |
+|---|---|---|
+| source-python-eigen-policy-validation | `packages/fullmag-py/src/fullmag/model/study.py::class FemEigenSolverPolicy` | Publiczny intent i granice liczników |
+| source-scene-eigen-policy-validation | `packages/fullmag-py/src/fullmag/runtime/scene_document.py::builder_overrides_from_scene_document` | Walidacja odtwarzania sceny i aliasu tolerancji |
+| source-native-eigen-policy-range | `crates/fullmag-plan/src/fem.rs::eigen_solver_policy` | Istniejąca skończona dodatnia tolerancja oraz signed iteration limits |

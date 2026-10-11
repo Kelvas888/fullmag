@@ -43,28 +43,76 @@
     },
     {
       "id": "eq-0600-modal-pencil",
-      "symbols": ["q", "lambda", "B_alpha", "omega", "f"],
-      "sources": ["source-runner-path", "source-plan-eigen"]
+      "symbols": [
+        "q",
+        "lambda",
+        "B_alpha",
+        "omega",
+        "f"
+      ],
+      "sources": [
+        "source-runner-path",
+        "source-plan-eigen"
+      ]
     },
     {
       "id": "eq-0600-floquet-gamma-admission",
-      "symbols": ["k_vector", "k_component", "epsilon_gamma_component"],
-      "sources": ["source-rust-gamma-k-threshold", "source-rust-plan-gamma-k-threshold", "source-rust-gamma-k-classifier", "source-rust-gamma-k-test", "source-rust-native-gamma-k-threshold", "source-rust-native-empty-k-ffi", "source-native-floquet-k-classifier", "source-native-modal-k-route", "source-native-production-cpu-k-guard", "source-native-floquet-admission-test", "source-native-floquet-cabi-route-test", "source-native-floquet-direct-entry-test"]
+      "symbols": [
+        "k_vector",
+        "k_component",
+        "epsilon_gamma_component"
+      ],
+      "sources": [
+        "source-rust-gamma-k-threshold",
+        "source-rust-plan-gamma-k-threshold",
+        "source-rust-gamma-k-classifier",
+        "source-rust-gamma-k-test",
+        "source-rust-native-gamma-k-threshold",
+        "source-rust-native-empty-k-ffi",
+        "source-native-floquet-k-classifier",
+        "source-native-modal-k-route",
+        "source-native-production-cpu-k-guard",
+        "source-native-floquet-admission-test",
+        "source-native-floquet-cabi-route-test",
+        "source-native-floquet-direct-entry-test"
+      ]
     },
     {
       "id": "eq-0600-floquet-mixed-dense-real-split-extent",
-      "symbols": ["q_complex", "n_real", "N_dense"],
-      "sources": ["source-native-floquet-mixed-dense-contract", "source-native-floquet-mixed-dense-test"]
+      "symbols": [
+        "q_complex",
+        "n_real",
+        "N_dense"
+      ],
+      "sources": [
+        "source-native-floquet-mixed-dense-contract",
+        "source-native-floquet-mixed-dense-test"
+      ]
     },
     {
       "id": "eq-0600-p00-reference",
-      "symbols": ["P00", "k", "t"],
-      "sources": ["source-p00"]
+      "symbols": [
+        "P00",
+        "k",
+        "t"
+      ],
+      "sources": [
+        "source-p00"
+      ]
     },
     {
       "id": "eq-eigenmode-branch-degeneracy-policy",
-      "symbols": ["delta_f", "f_r", "f_i", "f_r_prime", "f_i_prime"],
-      "sources": ["source-tracking-frequency-cluster-policy", "source-tracking-frequency-cluster-tests"]
+      "symbols": [
+        "delta_f",
+        "f_r",
+        "f_i",
+        "f_r_prime",
+        "f_i_prime"
+      ],
+      "sources": [
+        "source-tracking-frequency-cluster-policy",
+        "source-tracking-frequency-cluster-tests"
+      ]
     },
     {
       "id": "eq-0600-tiny-reference-metric",
@@ -110,25 +158,120 @@
       "meaning": "Przybliżone FWHM mocy izolowanego bieguna",
       "si_unit": "$\\mathrm{Hz}$"
     },
-    {"id": "q", "latex": "$q$", "meaning": "tangent-plane modal coefficients", "si_unit": "$1$"},
-    {"id": "lambda", "latex": "$\\lambda$", "meaning": "generalized eigenvalue", "si_unit": "$\\mathrm{s^{-1}}$"},
-    {"id": "B_alpha", "latex": "$B_\\alpha$", "meaning": "gyrotropic/mass operator", "si_unit": "$\\mathrm{m^3}$"},
-    {"id": "omega", "latex": "$\\omega$", "meaning": "angular frequency", "si_unit": "$\\mathrm{rad\\,s^{-1}}$"},
-    {"id": "f", "latex": "$f$", "meaning": "cyclic frequency", "si_unit": "$\\mathrm{Hz}$"},
-    {"id": "delta_f", "latex": "$\\delta_f$", "meaning": "complex-frequency distance used for private candidate grouping", "si_unit": "$\\mathrm{Hz}$"},
-    {"id": "f_r", "latex": "$f_r$", "meaning": "real component of complex frequency", "si_unit": "$\\mathrm{Hz}$"},
-    {"id": "f_i", "latex": "$f_i$", "meaning": "imaginary component of complex frequency", "si_unit": "$\\mathrm{Hz}$"},
-    {"id": "f_r_prime", "latex": "$f'_r$", "meaning": "real component of comparison complex frequency", "si_unit": "$\\mathrm{Hz}$"},
-    {"id": "f_i_prime", "latex": "$f'_i$", "meaning": "imaginary component of comparison complex frequency", "si_unit": "$\\mathrm{Hz}$"},
-    {"id": "P00", "latex": "$P_{00}$", "meaning": "thin-film demagnetizing factor", "si_unit": "$1$"},
-    {"id": "k", "latex": "$k$", "meaning": "in-plane wave vector magnitude", "si_unit": "$\\mathrm{rad\\,m^{-1}}$"},
-    {"id": "k_vector", "latex": "$\\mathbf{k}$", "meaning": "selected three-component Bloch/Floquet wavevector", "si_unit": "$\\mathrm{rad\\,m^{-1}}$"},
-    {"id": "k_component", "latex": "$k_i$", "meaning": "wavevector component for $i \\in \\{x,y,z\\}$", "si_unit": "$\\mathrm{rad\\,m^{-1}}$"},
-    {"id": "epsilon_gamma_component", "latex": "$\\varepsilon_{\\Gamma,\\mathrm{comp}}$", "meaning": "closed componentwise Gamma-admission threshold", "si_unit": "$\\mathrm{rad\\,m^{-1}}$"},
-    {"id": "q_complex", "latex": "$q_{\\mathbb{C}}$", "meaning": "number of complex reduced tangent degrees of freedom before real splitting", "si_unit": "$1$"},
-    {"id": "n_real", "latex": "$n_{\\mathbb{R}}$", "meaning": "number of scalar coordinates in the doubled real-split tangent basis", "si_unit": "$1$"},
-    {"id": "N_dense", "latex": "$N_{\\mathrm{dense}}$", "meaning": "scalar entry count of one square real-split $K$, $G$, $M$, or $K_{\\mathrm{demag}}$ matrix", "si_unit": "$1$"},
-    {"id": "t", "latex": "$t$", "meaning": "film thickness", "si_unit": "$\\mathrm{m}$"},
+    {
+      "id": "q",
+      "latex": "$q$",
+      "meaning": "tangent-plane modal coefficients",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "lambda",
+      "latex": "$\\lambda$",
+      "meaning": "generalized eigenvalue",
+      "si_unit": "$\\mathrm{s^{-1}}$"
+    },
+    {
+      "id": "B_alpha",
+      "latex": "$B_\\alpha$",
+      "meaning": "gyrotropic/mass operator",
+      "si_unit": "$\\mathrm{m^3}$"
+    },
+    {
+      "id": "omega",
+      "latex": "$\\omega$",
+      "meaning": "angular frequency",
+      "si_unit": "$\\mathrm{rad\\,s^{-1}}$"
+    },
+    {
+      "id": "f",
+      "latex": "$f$",
+      "meaning": "cyclic frequency",
+      "si_unit": "$\\mathrm{Hz}$"
+    },
+    {
+      "id": "delta_f",
+      "latex": "$\\delta_f$",
+      "meaning": "complex-frequency distance used for private candidate grouping",
+      "si_unit": "$\\mathrm{Hz}$"
+    },
+    {
+      "id": "f_r",
+      "latex": "$f_r$",
+      "meaning": "real component of complex frequency",
+      "si_unit": "$\\mathrm{Hz}$"
+    },
+    {
+      "id": "f_i",
+      "latex": "$f_i$",
+      "meaning": "imaginary component of complex frequency",
+      "si_unit": "$\\mathrm{Hz}$"
+    },
+    {
+      "id": "f_r_prime",
+      "latex": "$f'_r$",
+      "meaning": "real component of comparison complex frequency",
+      "si_unit": "$\\mathrm{Hz}$"
+    },
+    {
+      "id": "f_i_prime",
+      "latex": "$f'_i$",
+      "meaning": "imaginary component of comparison complex frequency",
+      "si_unit": "$\\mathrm{Hz}$"
+    },
+    {
+      "id": "P00",
+      "latex": "$P_{00}$",
+      "meaning": "thin-film demagnetizing factor",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "k",
+      "latex": "$k$",
+      "meaning": "in-plane wave vector magnitude",
+      "si_unit": "$\\mathrm{rad\\,m^{-1}}$"
+    },
+    {
+      "id": "k_vector",
+      "latex": "$\\mathbf{k}$",
+      "meaning": "selected three-component Bloch/Floquet wavevector",
+      "si_unit": "$\\mathrm{rad\\,m^{-1}}$"
+    },
+    {
+      "id": "k_component",
+      "latex": "$k_i$",
+      "meaning": "wavevector component for $i \\in \\{x,y,z\\}$",
+      "si_unit": "$\\mathrm{rad\\,m^{-1}}$"
+    },
+    {
+      "id": "epsilon_gamma_component",
+      "latex": "$\\varepsilon_{\\Gamma,\\mathrm{comp}}$",
+      "meaning": "closed componentwise Gamma-admission threshold",
+      "si_unit": "$\\mathrm{rad\\,m^{-1}}$"
+    },
+    {
+      "id": "q_complex",
+      "latex": "$q_{\\mathbb{C}}$",
+      "meaning": "number of complex reduced tangent degrees of freedom before real splitting",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "n_real",
+      "latex": "$n_{\\mathbb{R}}$",
+      "meaning": "number of scalar coordinates in the doubled real-split tangent basis",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "N_dense",
+      "latex": "$N_{\\mathrm{dense}}$",
+      "meaning": "scalar entry count of one square real-split $K$, $G$, $M$, or $K_{\\mathrm{demag}}$ matrix",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "t",
+      "latex": "$t$",
+      "meaning": "film thickness",
+      "si_unit": "$\\mathrm{m}$"
+    },
     {
       "id": "M_toy",
       "latex": "$M_{\\mathrm{toy}}$",
@@ -466,6 +609,24 @@
       "path": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
       "symbol": "void modal_shared_domain_floquet_mixed_dense_real_split_contract",
       "responsibility": "Exercise caller-owned K/G/M, provider K_demag, full descriptor residuals, dimension rejection, and K sensitivity through the C ABI."
+    },
+    {
+      "id": "source-python-eigen-policy-validation",
+      "path": "packages/fullmag-py/src/fullmag/model/study.py",
+      "symbol": "class FemEigenSolverPolicy",
+      "responsibility": "Preserve explicit modal controls and reject values outside the native signed iteration contract."
+    },
+    {
+      "id": "source-scene-eigen-policy-validation",
+      "path": "packages/fullmag-py/src/fullmag/runtime/scene_document.py",
+      "symbol": "builder_overrides_from_scene_document",
+      "responsibility": "Preserve primary/legacy modal tolerance intent through strict authoring validation."
+    },
+    {
+      "id": "source-native-eigen-policy-range",
+      "path": "crates/fullmag-plan/src/fem.rs",
+      "symbol": "eigen_solver_policy",
+      "responsibility": "Validate existing finite positive tolerance and signed iteration count bounds."
     }
   ],
   "public_api": {
@@ -479,6 +640,36 @@
         "meaning": "maximum accepted modal count",
         "backend_support": "FEM CPU/GPU authoring; runtime-qualified per lane",
         "problem_ir": "studies[].eigenmodes.count"
+      },
+      {
+        "python": "FemEigenSolverPolicy.residual_tolerance",
+        "type": "Optional[float]",
+        "default": "None",
+        "si_unit": "$1$",
+        "validation": "Skończona liczba dodatnia; bool i niepoprawny tekst są błędem",
+        "meaning": "Żądana względna tolerancja residualu",
+        "backend_support": "FEM CPU/GPU w istniejących natywnych capability; FDM i trasy referencyjne: unsupported; runtime osobno",
+        "problem_ir": "problem_meta.runtime_metadata.modal_solver_policy.residual_tolerance"
+      },
+      {
+        "python": "FemEigenSolverPolicy.max_outer_iterations",
+        "type": "Optional[int]",
+        "default": "None",
+        "si_unit": "$1$",
+        "validation": "Całkowity licznik od 1 do $2^{31}-1$; bool, float i overflow są błędem; bez clamp",
+        "meaning": "Żądany limit iteracji EPS",
+        "backend_support": "FEM CPU/GPU w istniejących natywnych capability; FDM i trasy referencyjne: unsupported; runtime osobno",
+        "problem_ir": "problem_meta.runtime_metadata.modal_solver_policy.max_outer_iterations"
+      },
+      {
+        "python": "FemEigenSolverPolicy.max_linear_iterations",
+        "type": "Optional[int]",
+        "default": "None",
+        "si_unit": "$1$",
+        "validation": "Całkowity licznik od 1 do $2^{31}-1$; bool, float i overflow są błędem; bez clamp",
+        "meaning": "Żądany limit iteracji KSP",
+        "backend_support": "FEM CPU/GPU w istniejących natywnych capability; FDM i trasy referencyjne: unsupported; runtime osobno",
+        "problem_ir": "problem_meta.runtime_metadata.modal_solver_policy.max_linear_iterations"
       }
     ]
   }

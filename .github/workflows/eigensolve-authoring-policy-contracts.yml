@@ -1,0 +1,41 @@
+name: eigensolve-authoring-policy-contracts
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['codex/**']
+    paths:
+      - 'packages/fullmag-py/src/fullmag/model/study.py'
+      - 'packages/fullmag-py/src/fullmag/runtime/scene_document.py'
+      - 'packages/fullmag-py/tests/test_api.py'
+      - 'packages/fullmag-py/tests/test_scratch_authoring_ui_roundtrip.py'
+      - 'docs/physics/0600-fem-eigenmodes-linearized-llg*'
+      - '.github/workflows/eigensolve-authoring-policy-contracts.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  modal-authoring-controls:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Preserve exact source identity
+        run: git rev-parse HEAD
+      - name: Install existing authoring dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglu1-mesa
+          python -m pip install 'pytest>=9,<10' -e 'packages/fullmag-py[meshing]'
+      - name: Validate scientific owner and source map
+        run: python -B .agents/skills/scientific-documentation-contract/scripts/validate_scientific_docs.py docs/physics/0600-fem-eigenmodes-linearized-llg.source-map.json --repo-root .
+      - name: Run modal controls construction and scene round-trip regressions
+        run: >-
+          python -B -m pytest -q
+          packages/fullmag-py/tests/test_api.py
+          packages/fullmag-py/tests/test_scratch_authoring_ui_roundtrip.py
+          -k eigen_solver

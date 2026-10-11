@@ -89,6 +89,36 @@ class ProblemApiTests(unittest.TestCase):
         )
         self.assertEqual(fm.FemEigenSolverPolicy().to_ir(), {})
 
+    def test_fem_eigen_solver_iteration_fields_match_native_signed_range(self) -> None:
+        max_iterations = 2_147_483_647
+        for field_name in ("max_outer_iterations", "max_linear_iterations"):
+            with self.subTest(field=field_name, bound="maximum"):
+                policy = fm.FemEigenSolverPolicy(**{field_name: max_iterations})
+                self.assertEqual(getattr(policy, field_name), max_iterations)
+                self.assertEqual(policy.to_ir()[field_name], max_iterations)
+
+            with self.subTest(field=field_name, bound="first out of range"):
+                with self.assertRaisesRegex(ValueError, "native signed iteration limit"):
+                    fm.FemEigenSolverPolicy(**{field_name: max_iterations + 1})
+
+            for invalid_value in (0, -1):
+                with self.subTest(field=field_name, value=invalid_value):
+                    with self.assertRaisesRegex(ValueError, "must be positive"):
+                        fm.FemEigenSolverPolicy(**{field_name: invalid_value})
+
+            for invalid_value in (
+                True,
+                False,
+                1.0,
+                1.5,
+                float("nan"),
+                float("inf"),
+                float("-inf"),
+            ):
+                with self.subTest(field=field_name, value=invalid_value):
+                    with self.assertRaises(TypeError):
+                        fm.FemEigenSolverPolicy(**{field_name: invalid_value})
+
     def test_fem_size_rejects_boolean_values(self) -> None:
         for field_name, kwargs in (
             ("maximum_element_size", {"maximum_element_size": True}),

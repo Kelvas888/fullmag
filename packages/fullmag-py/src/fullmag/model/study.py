@@ -173,6 +173,10 @@ class FrequencyResponseSolverPolicy:
         return policy
 
 
+# The native FEM modal planner bounds both counters by i32::MAX.
+_MAX_FEM_EIGEN_SOLVER_ITERATIONS = (1 << 31) - 1
+
+
 @dataclass(frozen=True, slots=True)
 class FemEigenSolverPolicy:
     """Optional native PETSc/SLEPc controls for FEM modal eigensolves."""
@@ -193,13 +197,17 @@ class FemEigenSolverPolicy:
             object.__setattr__(
                 self,
                 "max_outer_iterations",
-                _positive_int(self.max_outer_iterations, "max_outer_iterations"),
+                _positive_fem_eigen_solver_iterations(
+                    self.max_outer_iterations, "max_outer_iterations"
+                ),
             )
         if self.max_linear_iterations is not None:
             object.__setattr__(
                 self,
                 "max_linear_iterations",
-                _positive_int(self.max_linear_iterations, "max_linear_iterations"),
+                _positive_fem_eigen_solver_iterations(
+                    self.max_linear_iterations, "max_linear_iterations"
+                ),
             )
 
     def to_ir(self) -> dict[str, object]:
@@ -219,6 +227,18 @@ def _positive_int(value: object, field_name: str) -> int:
     if value <= 0:
         raise ValueError(f"{field_name} must be positive")
     return value
+
+
+def _positive_fem_eigen_solver_iterations(value: object, field_name: str) -> int:
+    iterations = _positive_int(value, field_name)
+    if iterations > _MAX_FEM_EIGEN_SOLVER_ITERATIONS:
+        raise ValueError(
+            f"{field_name} must fit the native signed iteration limit "
+            f"(<= {_MAX_FEM_EIGEN_SOLVER_ITERATIONS})"
+        )
+    return iterations
+
+
 SUPPORTED_FIELD_ORIENTATION_PRESETS = {
     "oop_positive",
     "oop_negative",

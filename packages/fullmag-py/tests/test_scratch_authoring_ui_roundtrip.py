@@ -283,12 +283,16 @@ def test_scene_document_renders_eigenmodes_stage_with_nonzero_k_and_floquet_bc()
         1.5,
         0,
         -1,
+        2_147_483_648,
+        2_147_483_647.0,
         float("nan"),
         float("inf"),
         float("-inf"),
         "1.5",
         "0",
         "-1",
+        " ",
+        "2147483648",
         "nan",
         "inf",
     ),
@@ -318,6 +322,120 @@ def test_scene_document_preserves_unset_eigen_solver_iteration_defaults() -> Non
     stage = builder_overrides_from_scene_document(scene)["stages"][1]
     assert stage["eigen_solver_max_outer_iterations"] is None
     assert stage["eigen_solver_max_linear_iterations"] is None
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    (
+        "eigen_solver_max_outer_iterations",
+        "eigen_solver_max_linear_iterations",
+    ),
+)
+@pytest.mark.parametrize("raw_value", (2_147_483_647, "2147483647"))
+def test_scene_document_preserves_native_maximum_eigen_solver_iterations(
+    field_name: str, raw_value: int | str
+) -> None:
+    builder = _builder(backend="fem")
+    builder["stages"].append({"kind": "eigenmodes", field_name: raw_value})
+    scene = build_scene_document_from_builder(builder)
+
+    value = builder_overrides_from_scene_document(scene)["stages"][-1][field_name]
+    assert value == 2_147_483_647
+    assert type(value) is int
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ("eigen_solver_rtol", "eigen_solver_residual_tolerance"),
+)
+@pytest.mark.parametrize(
+    "invalid_value",
+    (
+        True,
+        False,
+        0,
+        -1,
+        0.0,
+        -1.0,
+        float("nan"),
+        float("inf"),
+        float("-inf"),
+        "malformed",
+        "0",
+        "-1",
+        "nan",
+        "inf",
+        "-inf",
+        " ",
+    ),
+)
+def test_scene_document_rejects_invalid_eigen_solver_rtol(
+    field_name: str, invalid_value: object
+) -> None:
+    builder = _builder(backend="fem")
+    builder["stages"].append({"kind": "eigenmodes"})
+    scene = build_scene_document_from_builder(builder)
+    scene["study"]["stages"][-1][field_name] = invalid_value
+
+    with pytest.raises(ValueError, match="eigen_solver_rtol"):
+        builder_overrides_from_scene_document(scene)
+
+
+@pytest.mark.parametrize(
+    ("fields", "expected", "expected_script"),
+    (
+        (
+            {
+                "eigen_solver_rtol": "2e-6",
+                "eigen_solver_residual_tolerance": "3e-6",
+            },
+            2e-6,
+            "solver_rtol=2e-06",
+        ),
+        (
+            {
+                "eigen_solver_rtol": "",
+                "eigen_solver_residual_tolerance": "3e-6",
+            },
+            3e-6,
+            "solver_rtol=3e-06",
+        ),
+        (
+            {"eigen_solver_residual_tolerance": "3e-6"},
+            3e-6,
+            "solver_rtol=3e-06",
+        ),
+    ),
+)
+def test_scene_document_preserves_primary_and_legacy_eigen_solver_rtol_round_trip(
+    fields: dict[str, object], expected: float, expected_script: str
+) -> None:
+    builder = _builder(backend="fem")
+    builder["stages"].append({"kind": "eigenmodes"})
+    scene = build_scene_document_from_builder(builder)
+    scene["study"]["stages"][-1].update(fields)
+
+    stage = builder_overrides_from_scene_document(scene)["stages"][-1]
+    assert stage["eigen_solver_rtol"] == expected
+    assert expected_script in render_scene_document_as_script(scene)
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    ("eigen_solver_rtol", "eigen_solver_residual_tolerance"),
+)
+@pytest.mark.parametrize("raw_value", (None, ""))
+def test_scene_document_omits_unset_eigen_solver_rtol(
+    field_name: str, raw_value: str | None
+) -> None:
+    builder = _builder(backend="fem")
+    builder["stages"].append({"kind": "eigenmodes"})
+    scene = build_scene_document_from_builder(builder)
+    scene["study"]["stages"][-1][field_name] = raw_value
+
+    stage = builder_overrides_from_scene_document(scene)["stages"][-1]
+    assert stage["eigen_solver_rtol"] is None
+    assert "solver_rtol=" not in render_scene_document_as_script(scene)
 
 
 def test_scene_document_rejects_unsupported_stage_instead_of_dropping_it() -> None:

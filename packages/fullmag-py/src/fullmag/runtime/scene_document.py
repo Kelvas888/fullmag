@@ -5,6 +5,7 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from fullmag.model.study import _MAX_FEM_EIGEN_SOLVER_ITERATIONS
 from fullmag.model.output_storage import OutputStorage
 from fullmag.model.execution_profile import ExecutionProfile, ExecutionRequestLayer, _parallel_execution_lane
 from fullmag.runtime.output_storage_lowering import (
@@ -2254,16 +2255,17 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
                     else None
                 ),
                 "eigen_magnetostatic_bc": stage.get("eigen_magnetostatic_bc") or None,
-                "eigen_solver_rtol": _number_or_none(
+                "eigen_solver_rtol": _eigen_solver_rtol_or_none(
                     stage.get("eigen_solver_rtol")
                     if stage.get("eigen_solver_rtol") not in (None, "")
-                    else stage.get("eigen_solver_residual_tolerance")
+                    else stage.get("eigen_solver_residual_tolerance"),
+                    "SceneDocument.study.stages.eigen_solver_rtol",
                 ),
-                "eigen_solver_max_outer_iterations": _positive_integer_or_none(
+                "eigen_solver_max_outer_iterations": _positive_fem_eigen_iterations_or_none(
                     stage.get("eigen_solver_max_outer_iterations"),
                     "SceneDocument.study.stages.eigen_solver_max_outer_iterations",
                 ),
-                "eigen_solver_max_linear_iterations": _positive_integer_or_none(
+                "eigen_solver_max_linear_iterations": _positive_fem_eigen_iterations_or_none(
                     stage.get("eigen_solver_max_linear_iterations"),
                     "SceneDocument.study.stages.eigen_solver_max_linear_iterations",
                 ),
@@ -2375,6 +2377,37 @@ def _positive_integer_or_none(value: object, context: str) -> int | None:
         except ValueError as error:
             raise ValueError(f"{context} must be a positive integer") from error
     return _positive_integer(value, context)
+
+
+def _positive_fem_eigen_iterations_or_none(value: object, context: str) -> int | None:
+    if value is None or (isinstance(value, str) and value == ""):
+        return None
+    if isinstance(value, str):
+        try:
+            value = int(value)
+        except ValueError as error:
+            raise ValueError(f"{context} must be a positive integer") from error
+    result = _positive_integer(value, context)
+    if result > _MAX_FEM_EIGEN_SOLVER_ITERATIONS:
+        raise ValueError(
+            f"{context} must fit the native signed iteration limit "
+            f"(<= {_MAX_FEM_EIGEN_SOLVER_ITERATIONS})"
+        )
+    return result
+
+
+def _eigen_solver_rtol_or_none(value: object, context: str) -> float | None:
+    if value is None or (isinstance(value, str) and value == ""):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{context} must be a finite positive number")
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{context} must be a finite positive number") from error
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError(f"{context} must be a finite positive number")
+    return result
 
 
 def _int_or_none(value: Any) -> int | None:
