@@ -750,6 +750,18 @@
       "log_sha256": "d7ccac1011e46875a5b3cdf857cf50707acf22d64ac7f7407b51b442b07ef113",
       "browser": "NOT VERIFIED",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38147674127,
+      "sha": "cfabf4053cadcddc764185145fcab2376d8c8c47",
+      "conclusion": "failure",
+      "scope": "overlay_ACK_typed_visualization_fixture",
+      "typecheck": "failure:10 nested fixture mismatches against generated API types; older fixture cast hid these",
+      "regression_contracts": "passed",
+      "architecture": "passed",
+      "React_Doctor": "failure:617 diagnostics semantically unchanged",
+      "log_sha256": "0acd8b2331f4fe2f58196918be030c3d62bac4afb26f181128a2a54c66f24461",
+      "qualification_claimed": false
     }
   ]
 }

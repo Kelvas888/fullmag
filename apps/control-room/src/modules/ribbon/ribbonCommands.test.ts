@@ -77,36 +77,41 @@ function visualizationState(revision: number): VisualizationStateResource {
       warnings: [],
     },
     domains: {
-      active_scope: {
-        object_id: null,
-        part_id: null,
-        scope: "full",
-      },
-      topology_mode: "auto",
-      volume_edges_budget: 100_000,
+      active_scope: "full",
     },
     fdm: {
       x_chosen_size: 0,
       y_chosen_size: 0,
     },
-    fem: {},
+    fem: {
+      topology_mode: "auto",
+      volume_edges_budget: 100_000,
+    },
     field_component: "magnitude",
     layers: {
       airbox: {
-        render_mode: "wireframe",
-        show_airbox: false,
-        show_airbox_vectors: false,
+        bounds: { opacity: 1, visible: false },
+        opacity: 0.28,
+        points: { opacity: 1, visible: false },
+        surface: { opacity: 0.28, visible: false },
+        vectors: { density: 50, domain: "auto", visible: false },
+        visible: false,
+        wireframe: { opacity: 1, visible: false },
       },
       bounds: {
+        opacity: 1,
         visible: false,
       },
       points: {
+        opacity: 1,
         visible: false,
       },
       primitives: {
+        opacity: 1,
         visible: true,
       },
-      quantity: {
+      quantity_overlay: {
+        opacity: 1,
         visible: true,
       },
       surface: {
@@ -119,6 +124,11 @@ function visualizationState(revision: number): VisualizationStateResource {
         visible: false,
       },
       wireframe: {
+        opacity: 1,
+        visible: false,
+      },
+      volume_mesh: {
+        opacity: 1,
         visible: false,
       },
     },
@@ -128,7 +138,6 @@ function visualizationState(revision: number): VisualizationStateResource {
       active_quantity_id: "H_eff",
       auto_contrast: true,
       colormap: "viridis",
-      component: "magnitude",
       contrast_max: null,
       contrast_min: null,
       field_component: "magnitude",
@@ -143,11 +152,16 @@ function visualizationState(revision: number): VisualizationStateResource {
     },
     schema_version: 5,
     slice: {
-      axis: "z",
+      airbox_render_mode: "wireframe",
       auto_contrast: true,
+      axis: "z",
       colormap: "viridis",
       component: "magnitude",
       layer_index: 0,
+      mesh_color_scale: "viridis",
+      mesh_filter_expression: "",
+      mesh_quality_metric: "skewness",
+      mesh_shrink_factor: 1,
       mode: "single",
       position_percent: 50,
       projection_include_air_as_zero: false,
@@ -157,6 +171,7 @@ function visualizationState(revision: number): VisualizationStateResource {
       quantity_id: "H_eff",
       render_mode: "heatmap",
       show_airbox: false,
+      show_airbox_vectors: false,
       show_magnetic_texture: true,
       show_mesh: false,
       show_primitives: true,
@@ -167,9 +182,12 @@ function visualizationState(revision: number): VisualizationStateResource {
     slice_layer: 0,
     slice_mode: "single",
     trim: {
-      x: { enabled: false, max_percent: 100, min_percent: 0 },
-      y: { enabled: false, max_percent: 100, min_percent: 0 },
-      z: { enabled: false, max_percent: 100, min_percent: 0 },
+      axes: {
+        x: { enabled: false, max_percent: 100, min_percent: 0 },
+        y: { enabled: false, max_percent: 100, min_percent: 0 },
+        z: { enabled: false, max_percent: 100, min_percent: 0 },
+      },
+      enabled: false,
     },
     vector_density: 50,
     vector_glyphs: false,
