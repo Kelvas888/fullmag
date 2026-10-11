@@ -24,7 +24,12 @@ export function updateTransportRow(value: string, index: number, path: readonly 
 export function transportScopeOptions(scene: SceneResource | null): Array<{ objectId: string; regionId: string; label: string }> {
   return (scene?.objects ?? []).flatMap((object) => [
     { objectId: object.id, regionId: "", label: object.name || object.id },
-    ...(object.regions ?? []).filter((region) => region.enabled !== false).map((region) => ({ objectId: object.id, regionId: region.region_id, label: `${object.name || object.id} / ${region.name || region.region_id}` })),
+    ...(object.regions ?? []).flatMap((region) => {
+      const regionId = region.region_id;
+      return region.enabled !== false && typeof regionId === "string" && regionId.trim()
+        ? [{ objectId: object.id, regionId, label: `${object.name || object.id} / ${region.name || regionId}` }]
+        : [];
+    }),
   ]);
 }
 export const chargeMaterialFields = [["sigma_Spm", "Conductivity", "S/m"], ["sigma_parallel_Spm", "Parallel conductivity", "S/m"], ["sigma_perpendicular_Spm", "Perpendicular conductivity", "S/m"], ["sigma_AHE_Spm", "Anomalous Hall conductivity", "S/m"]] as const;
