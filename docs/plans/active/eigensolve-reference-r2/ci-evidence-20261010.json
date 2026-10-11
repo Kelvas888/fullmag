@@ -853,6 +853,20 @@
       "head_sha_verified_after_ACK": true,
       "private_runtime_attestation": "NOT VERIFIED",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38153749590,
+      "sha": "a848dce7bb842efb701563a4a991138a148fa221",
+      "conclusion": "failure",
+      "scope": "complete_default_feature_runner_with_adaptive_pool_control",
+      "runner_tests_passed": 1614,
+      "runner_tests_failed": 1,
+      "runner_tests_ignored": 1,
+      "failed_test": "dispatch::tests::explicit_cpu_zhang_li_plan_reaches_cpu_preflight",
+      "failure": "existing small-mesh GPU policy also applies to an already CPU resolution and overwrites fallback provenance; threshold environment exposes defect",
+      "new_pool_contracts": "passed",
+      "log_sha256": "73da3113b6c795677a60fb6f11e7a3dec1f8bc897e2e992da098f04ac9de8672",
+      "scientific_qualification": "NOT VERIFIED"
     }
   ]
 }

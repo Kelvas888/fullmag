@@ -920,28 +920,31 @@ fn apply_fem_gpu_plan_constraints(
         }
     }
 
-    if let Some(min_nodes) = should_fallback_to_cpu_for_small_fem_gpu(plan) {
-        if forced_gpu {
-            return Err(RunError {
-                message: format!(
-                    "native FEM GPU execution was requested, but plan has {} nodes below FULLMAG_FEM_GPU_MIN_NODES={} (fallback_reason=fem_gpu_small_mesh_policy)",
-                    plan.mesh.nodes.len(),
-                    min_nodes
-                ),
-            });
+    // GPU admission policy must not invent or overwrite an already resolved CPU fallback.
+    if resolution.engine == FemEngine::NativeGpu {
+        if let Some(min_nodes) = should_fallback_to_cpu_for_small_fem_gpu(plan) {
+            if forced_gpu {
+                return Err(RunError {
+                    message: format!(
+                        "native FEM GPU execution was requested, but plan has {} nodes below FULLMAG_FEM_GPU_MIN_NODES={} (fallback_reason=fem_gpu_small_mesh_policy)",
+                        plan.mesh.nodes.len(),
+                        min_nodes
+                    ),
+                });
+            }
+            let message = format!(
+                "FEM plan has {} nodes, below FULLMAG_FEM_GPU_MIN_NODES={} — falling back to MFEM/libCEED/hypre CPU FEM engine",
+                plan.mesh.nodes.len(),
+                min_nodes
+            );
+            resolution.engine = FemEngine::CpuNative;
+            resolution.fallback = Some(runtime_fallback(
+                fem_engine_id(FemEngine::NativeGpu),
+                fem_engine_id(FemEngine::CpuNative),
+                "fem_gpu_small_mesh_policy",
+                message,
+            ));
         }
-        let message = format!(
-            "FEM plan has {} nodes, below FULLMAG_FEM_GPU_MIN_NODES={} — falling back to MFEM/libCEED/hypre CPU FEM engine",
-            plan.mesh.nodes.len(),
-            min_nodes
-        );
-        resolution.engine = FemEngine::CpuNative;
-        resolution.fallback = Some(runtime_fallback(
-            fem_engine_id(FemEngine::NativeGpu),
-            fem_engine_id(FemEngine::CpuNative),
-            "fem_gpu_small_mesh_policy",
-            message,
-        ));
     }
 
     Ok(FemPlanEngineResolution {
@@ -8985,6 +8988,39 @@ mod tests {
         assert!(!fem_plan_gpu_request_is_forced("auto"));
         assert!(fem_plan_gpu_request_is_forced("gpu"));
         assert!(fem_plan_gpu_request_is_forced("all_in_gpu"));
+    }
+
+    #[test]
+    fn small_mesh_gpu_policy_preserves_existing_cpu_resolution_and_provenance() {
+        let _guard = env_lock().lock().expect("env mutex");
+        let previous_threshold = std::env::var_os("FULLMAG_FEM_GPU_MIN_NODES");
+        unsafe {
+            std::env::set_var("FULLMAG_FEM_GPU_MIN_NODES", "1000000");
+        }
+        // Restore the environment before asserting so failed checks do not leak policy.
+        let outcomes = [None, Some(super::runtime_fallback(
+            "fem_native_gpu", "fem_cpu_native", "earlier_cpu_resolution", "previous decision".into(),
+        ))].into_iter().map(|fallback| {
+            let expected_reason = fallback.as_ref().map(|value| value.reason.clone());
+            let result = apply_fem_gpu_plan_constraints(
+                &canonical_stt_fem_plan("zhang_li.fullmag.v1"),
+                EngineResolution { engine: FemEngine::CpuNative, fallback },
+                false,
+                None,
+            );
+            (expected_reason, result)
+        }).collect::<Vec<_>>();
+        unsafe {
+            match previous_threshold {
+                Some(value) => std::env::set_var("FULLMAG_FEM_GPU_MIN_NODES", value),
+                None => std::env::remove_var("FULLMAG_FEM_GPU_MIN_NODES"),
+            }
+        }
+        for (expected_reason, result) in outcomes {
+            let resolution = result.expect("CPU plan bypasses GPU admission policy");
+            assert_eq!(resolution.engine, FemEngine::CpuNative);
+            assert_eq!(resolution.fallback.as_ref().map(|value| value.reason.as_str()), expected_reason.as_deref());
+        }
     }
 
     #[test]

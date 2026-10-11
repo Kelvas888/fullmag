@@ -3488,3 +3488,8 @@ GHA38149497927 na fdf811f10ba90d87861ceac67a5b81fc385cc6c1: build obrazu i kodu 
 ## Korekta fixture i diagnostyka pięciu native failures
 
 Po analizie artifact11705733979 pattern-mismatch fixture dostał ten sam poprawny FIELD descriptor/digest co inne probes. Dwa rowrestore/primarycleanup probes zachowują dokładne PASS criteria; na FAILURE drukują status, 13 named conjuncts oraz bounded owned JSON snapshots przed/po destroy. Nie osłabiono production guards i nie uznano happybreakdown full/mixed za naprawione. SOURCE diff review PASS, compile i rerun wyłącznie GHA wymagane.
+
+
+## Korekta CPU provenance wykryta w pełnej suite
+
+GHA38153749590 na a848dce7bb842efb701563a4a991138a148fa221:1614 PASS,1 FAIL,1 ignored. Nowe adaptive pool regressions PASS, ale explicit_cpu_zhang_li_plan_reaches_cpu_preflight wykrył istniejącą policy-only lukę: GPU small-mesh policy stosowała się też do resolved CPU i nadpisywała fallback. Guard ogranicza ją do nadal NativeGpu; CPU oraz wcześniejszy fallback zachowane. Deterministyczna regresja wymusza threshold i zachowuje previous host env przed assertions, obejmuje CPU bez fallback oraz CPU z wcześniejszą decyzją. Strict GPU nadal failclosed, legal extended GPU fallback bez zmian. Zakres requested/resolved zgodny z istniejącym0600 i czterema lanes backend masterplan; nie zmieniono fizyki, publicznych tokenów, API/generated ani deklaracji capability. SOURCE/parser PASS, nowy GHA wymagany.
