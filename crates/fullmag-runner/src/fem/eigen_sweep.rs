@@ -1546,6 +1546,12 @@ fn merge_bias_field_sweep_runs_with_terminal(
     }
 
     artifacts.push(json_artifact("eigen/spectrum.v2.json", &spectrum)?);
+    let final_spectrum_revision =
+        published_artifact_sha256(&artifacts, "eigen/spectrum.v2.json")?;
+    bind_bias_field_mode_metadata_to_spectrum_revision(
+        &mut artifacts,
+        &final_spectrum_revision,
+    )?;
     if let Some(spectrum_v3) = spectrum_v3.as_ref() {
         artifacts.push(json_artifact("eigen/spectrum.v3.json", spectrum_v3)?);
     }
@@ -1686,6 +1692,8 @@ fn merge_bias_field_sweep_runs_with_terminal(
         &artifacts,
         &diagnostics,
         sample_count,
+        &tracking_score_source,
+        &modal_overlap_available,
     )?;
     if let Some(artifact_index) = manifest
         .get_mut("artifacts")
@@ -1850,7 +1858,11 @@ fn update_sweep_manifest(
     artifacts: &[AuxiliaryArtifact],
     diagnostics: &serde_json::Value,
     sample_count: usize,
+    tracking_score_source: &serde_json::Value,
+    modal_overlap_available: &serde_json::Value,
 ) -> Result<serde_json::Value, RunError> {
+    let spectrum_revision = published_artifact_sha256(artifacts, "eigen/spectrum.v2.json")?;
+    let branches_revision = published_artifact_sha256(artifacts, "eigen/branches.v2.json")?;
     let mode_metadata_paths: Vec<String> = artifacts
         .iter()
         .filter(|artifact| {
@@ -1882,9 +1894,38 @@ fn update_sweep_manifest(
         object.insert(
             "diagnostics".to_string(),
             serde_json::json!({
-                "tracking_score_source": "seed_only",
-                "modal_overlap_available": false,
+                "tracking_score_source": tracking_score_source,
+                "modal_overlap_available": modal_overlap_available,
             }),
+        );
+        let mut cross_artifact_refs = object
+            .get("cross_artifact_refs")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|reference| {
+                !matches!(
+                    reference.get("relation").and_then(serde_json::Value::as_str),
+                    Some("source_spectrum" | "source_branches")
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        cross_artifact_refs.extend([
+            serde_json::json!({
+                "relation": "source_spectrum",
+                "artifact": "eigen/spectrum.v2.json",
+                "revision": spectrum_revision,
+            }),
+            serde_json::json!({
+                "relation": "source_branches",
+                "artifact": "eigen/branches.v2.json",
+                "revision": branches_revision,
+            }),
+        ]);
+        object.insert(
+            "cross_artifact_refs".to_string(),
+            serde_json::Value::Array(cross_artifact_refs),
         );
         if let Some(artifacts_object) = object
             .get_mut("artifacts")
@@ -1919,6 +1960,41 @@ fn update_sweep_manifest(
         }
     }
     Ok(manifest)
+}
+
+fn bind_bias_field_mode_metadata_to_spectrum_revision(
+    artifacts: &mut [AuxiliaryArtifact],
+    spectrum_revision: &str,
+) -> Result<(), RunError> {
+    for artifact in artifacts.iter_mut().filter(|artifact| {
+        artifact.relative_path.starts_with("eigen/modes/sample_")
+            && artifact.relative_path.ends_with(".json")
+    }) {
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&artifact.bytes).map_err(|error| RunError {
+                message: format!(
+                    "invalid bias-field mode metadata {}: {error}",
+                    artifact.relative_path
+                ),
+            })?;
+        let object = metadata.as_object_mut().ok_or_else(|| RunError {
+            message: format!(
+                "bias-field mode metadata {} must be a JSON object",
+                artifact.relative_path
+            ),
+        })?;
+        object.insert(
+            "source_spectrum_revision".to_string(),
+            serde_json::json!(spectrum_revision),
+        );
+        artifact.bytes = serde_json::to_vec_pretty(&metadata).map_err(|error| RunError {
+            message: format!(
+                "failed to serialize bias-field mode metadata {}: {error}",
+                artifact.relative_path
+            ),
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2071,6 +2147,57 @@ mod native_field_sweep_identity_tests {
                 assert!(native_field_sweep_sample_identity(&[first.clone(), missing], &diagnostic, 4).is_err());
             }
         }
+    }
+
+    #[test]
+    fn sweep_manifest_rebinds_source_refs_and_preserves_other_relations() {
+        let spectrum_bytes = br#"{"schema_version":"eigen_spectrum.v2"}"#.to_vec();
+        let branches_bytes = br#"{"schema_version":"eigen_branches.v2"}"#.to_vec();
+        let artifacts = vec![
+            AuxiliaryArtifact {
+                relative_path: "eigen/spectrum.v2.json".to_string(),
+                bytes: spectrum_bytes,
+            },
+            AuxiliaryArtifact {
+                relative_path: "eigen/branches.v2.json".to_string(),
+                bytes: branches_bytes,
+            },
+        ];
+        let preserved = serde_json::json!({
+            "relation": "source_equilibrium",
+            "artifact": "eigen/metadata/equilibrium.v2.json",
+            "revision": "sha256:equilibrium",
+        });
+        let manifest = serde_json::json!({
+            "cross_artifact_refs": [
+                {"relation": "source_spectrum", "artifact": "eigen/spectrum.v2.json", "revision": "sha256:stale"},
+                preserved.clone(),
+                {"relation": "source_branches", "artifact": "eigen/branches.v2.json", "revision": "sha256:stale"},
+            ],
+        });
+
+        let updated = update_sweep_manifest(
+            manifest,
+            &artifacts,
+            &serde_json::json!({}),
+            1,
+            &serde_json::json!("branch_overlap"),
+            &serde_json::json!(true),
+        )
+        .expect("the final manifest should reference the merged artifacts");
+        let refs = updated["cross_artifact_refs"]
+            .as_array()
+            .expect("cross-artifact references stay an array");
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs[0], preserved);
+        assert_eq!(
+            refs[1]["revision"],
+            published_artifact_sha256(&artifacts, "eigen/spectrum.v2.json").unwrap()
+        );
+        assert_eq!(
+            refs[2]["revision"],
+            published_artifact_sha256(&artifacts, "eigen/branches.v2.json").unwrap()
+        );
     }
 
 }

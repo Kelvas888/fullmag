@@ -1324,6 +1324,20 @@ pub(crate) mod test_support {
                 .expect("final branch artifact is published"),
         )
         .expect("final branch JSON is valid");
+        let final_spectrum_revision = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                artifact_bytes(&merged, "eigen/spectrum.v2.json")
+                    .expect("final spectrum bytes are published")
+            )
+        );
+        let final_branches_revision = format!(
+            "sha256:{:x}",
+            Sha256::digest(
+                artifact_bytes(&merged, "eigen/branches.v2.json")
+                    .expect("final branch bytes are published")
+            )
+        );
         assert_eq!(branches["branches"].as_array().unwrap().len(), 1);
         assert_eq!(branches["branches"][0]["branch_id"], 0);
         assert_eq!(branches["branches"][0]["points"].as_array().unwrap().len(), 2);
@@ -1370,6 +1384,44 @@ pub(crate) mod test_support {
             mode_selection_manifest["artifacts"]["mode_output_selection_path"],
             selection_path
         );
+        assert_eq!(
+            mode_selection_manifest["diagnostics"]["tracking_score_source"],
+            branches["tracking_score_source"]
+        );
+        assert_eq!(
+            mode_selection_manifest["diagnostics"]["modal_overlap_available"],
+            branches["modal_overlap_available"]
+        );
+        assert_eq!(
+            mode_selection_manifest["cross_artifact_refs"],
+            serde_json::json!([
+                {
+                    "relation": "source_spectrum",
+                    "artifact": "eigen/spectrum.v2.json",
+                    "revision": final_spectrum_revision,
+                },
+                {
+                    "relation": "source_branches",
+                    "artifact": "eigen/branches.v2.json",
+                    "revision": final_branches_revision,
+                },
+            ])
+        );
+        assert_eq!(
+            field_sweep["cross_artifact_refs"],
+            serde_json::json!([
+                {
+                    "relation": "source_spectrum",
+                    "artifact": "eigen/spectrum.v2.json",
+                    "revision": final_spectrum_revision,
+                },
+                {
+                    "relation": "source_branches",
+                    "artifact": "eigen/branches.v2.json",
+                    "revision": final_branches_revision,
+                },
+            ])
+        );
         let mode_zero_metadata: Value = serde_json::from_slice(
             artifact_bytes(&merged, "eigen/modes/sample_0000/mode_0000.json")
                 .expect("sample zero selected mode metadata is published"),
@@ -1382,8 +1434,16 @@ pub(crate) mod test_support {
         .expect("sample one selected mode metadata is valid JSON");
         assert_eq!(mode_zero_metadata["requested_fields"], serde_json::json!(["mode"]));
         assert_eq!(
+            mode_zero_metadata["source_spectrum_revision"],
+            final_spectrum_revision
+        );
+        assert_eq!(
             mode_one_metadata["requested_fields"],
             serde_json::json!(["mode_complex"])
+        );
+        assert_eq!(
+            mode_one_metadata["source_spectrum_revision"],
+            final_spectrum_revision
         );
         for payload in mode_output_selection["payloads"].as_array().unwrap() {
             let payload_path = payload["payload_path"].as_str().unwrap();

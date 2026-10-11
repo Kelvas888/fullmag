@@ -8,6 +8,7 @@ on:
       - 'crates/fullmag-runner/src/eigen/output_selection.rs'
       - 'crates/fullmag-runner/src/fem/eigen_output.rs'
       - 'crates/fullmag-runner/src/fem/eigen_path.rs'
+      - 'crates/fullmag-runner/src/fem/eigen_path_artifacts.rs'
       - 'crates/fullmag-runner/src/fem/eigen_sweep.rs'
       - 'crates/fullmag-runner/src/fem/eigen_execution.rs'
       - 'crates/fullmag-runner/src/fem/eigen_native_artifacts.rs'
@@ -40,6 +41,10 @@ jobs:
           grep -F "test fem::eigen_tests::direct_floquet_runtime_control_preserves_pause_and_stop_reasons ... ok" "$RUNNER_TEMP/floquet-control.log"
           cargo test --locked -p fullmag-runner --lib fem::eigen_tests::direct_floquet_pause_and_stop_metadata_match_checkpoint_receipts -- --exact | tee "$RUNNER_TEMP/floquet-terminal.log"
           grep -F "test fem::eigen_tests::direct_floquet_pause_and_stop_metadata_match_checkpoint_receipts ... ok" "$RUNNER_TEMP/floquet-terminal.log"
+      - name: Preserve homogeneous Floquet path solver identity
+        run: |
+          cargo test --locked -p fullmag-runner --lib homogeneous_floquet_schur_samples_define_path_solver_identity -- --nocapture | tee "$RUNNER_TEMP/floquet-identity.log"
+          grep -F "homogeneous_floquet_schur_samples_define_path_solver_identity ... ok" "$RUNNER_TEMP/floquet-identity.log"
       - name: Run actual single-sample writer contract
         run: |
           cargo test --locked -p fullmag-runner --lib fem::eigen_tests::native_eigen_v2_mode_metadata_preserves_operator_provenance -- --exact --nocapture | tee "$RUNNER_TEMP/modal-single-writer.log"

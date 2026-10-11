@@ -896,3 +896,12 @@ Dodatkowy guard poprawności finalizacji: inferred/explicit Completed sweep z li
 4241564409: oba dispersionInspectorpanele przekazują parent frequency-domain run/stage/revision/path i dostępnykcontext do istniejącego point selection builder. Test przepuszcza ref przez createModeFieldOverlayIntent; noowner pozostaje failclosed, bez aliasowania dataset IDs.
 
 4241564400/4405: typed pinnedgroup owner walidowany wmodule manifests; context dismissal jest localuser UIstate wygasającym przy moduletransition. Rootreview usunął effectcopy zgodniez04-state-management, zastępując go guarded stateadjustment/puretransition. Helpers/testsswitch-return oraz ordinarytab pozostają. Source/diff PASS; GHA/typecheck/Doctor/browser wymagane.
+
+
+## Bias revisions i Floquet identity
+
+4240898353/8355: manifest kopiuje actualtracking z branches; final spectrum SHA aktualizuje publishedmode source revision. Final spectrum/branches refs zastępują tylko dawne source refrelations, inne refs zachowane. Existingactualproducer→aggregator i preserveextra regression przygotowane. Raw diagnosticchildcopies/receiptbytes pozostają niemutowane. Source review PASS,GHA wymagane.
+
+4241442703:top-level solveridentity wynika z homogenicznych actualsamplediag producerfields, guarded Full2x2/Floquet/demag/finite nonzerok. Missing/mixed k/schema nie daje promocji. Rootreview poprawił closurelifetimes, niefinitywne samplek i syntheticfixture zastąpiono existingRustdiag-normalizer. Raw C++ oraztranslatorfieldnames sprawdzone; native runtime NOT VERIFIED. Parser/diff PASS,GHA wymagane.
+
+#38144770123 readiness/retention LinuxWindows SUCCESS z actual request timeout regression; poprzedni TypeError FAIL zachowany. Nie restartowano hosta.

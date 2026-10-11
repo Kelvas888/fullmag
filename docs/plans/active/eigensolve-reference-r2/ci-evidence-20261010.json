@@ -681,6 +681,17 @@
       "log_sha256": "dd041bcfa11becffa21e6945cc1d48ede8b9ba82fbb0250a21633e8c316d3114",
       "native_runtime": "NOT VERIFIED",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38144770123,
+      "sha": "bb871609ee012fcf29e7fddec335f48207b13fe9",
+      "conclusion": "success",
+      "scope": "startup_health_actual_transport_and_retention_Linux_Windows",
+      "actual_timeout_override_regression": "passed",
+      "cold_start_and_total_deadline": "passed",
+      "log_sha256": "f7615a6152a945a9bd44aa0f113e352b250550ee12b51dae02ffa992407236fa",
+      "live_host_restarted": false,
+      "qualification_claimed": false
     }
   ]
 }

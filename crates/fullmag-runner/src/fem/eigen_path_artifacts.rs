@@ -1965,6 +1965,174 @@ mod output_publication_tests {
         assert!(manifest["resolved_execution"]["implementation_id"].is_null());
         assert_eq!(manifest["physics"]["phase_convention"], "exp_i_omega_t");
     }
+
+    #[test]
+    fn homogeneous_floquet_schur_samples_define_path_solver_identity() {
+        let mut plan = residual_transport_test_plan();
+        plan.operator.kind = fullmag_ir::EigenOperatorIR::Full2x2;
+        plan.operator.include_demag = true;
+        plan.enable_demag = true;
+        plan.mesh.periodic_boundary_pairs = vec![fullmag_ir::MeshPeriodicBoundaryPairIR {
+            pair_id: "x_faces".into(),
+            source_marker: None,
+            destination_marker: None,
+            marker_a: 1,
+            marker_b: 2,
+            translation: Some([1.0, 0.0, 0.0]),
+            tolerance: None,
+            axis_hint: None,
+            orientation: None,
+            pairing_policy: None,
+        }];
+        plan.mesh.periodic_node_pairs = vec![fullmag_ir::MeshPeriodicNodePairIR {
+            pair_id: "x_faces".into(),
+            node_a: 0,
+            node_b: 1,
+        }];
+        plan.spin_wave_bc = fullmag_ir::SpinWaveBoundaryConditionIR::Config(
+            fullmag_ir::SpinWaveBoundaryConfigIR {
+                kind: fullmag_ir::SpinWaveBoundaryKindIR::Floquet,
+                boundary_pair_id: Some("x_faces".into()),
+                pair_ids: Vec::new(),
+                phase_convention: fullmag_ir::PhaseConventionIR::default(),
+                surface_anisotropy_ks: None,
+                surface_anisotropy_axis: None,
+            },
+        );
+        plan.k_sampling = Some(fullmag_ir::KSamplingIR::Single {
+            k_vector: [1.0e6, 0.0, 0.0],
+        });
+
+        let native_result = serde_json::json!({
+            "solver_adapter": "floquet_airbox_cpu_schur_slepc",
+            "demag_kind": "floquet_airbox",
+            "floquet_periodic_pair_count": 1,
+        });
+        let mut sample_diagnostics = serde_json::json!({
+            "execution_lane": "production_cpu",
+            "frequency_mapping": "frequency_hz = Im(lambda)/(2*pi) for the accepted positive-frequency branch",
+            "production_solver_available": true,
+            "production_native_solver_available": true,
+            "production_gyrotropic_mapping": true,
+            "modal_periodic_pair_contract_available": true,
+            "validation_only": false,
+        });
+        crate::fem::eigen_native_result::merge_poisson_airbox_modal_result_diagnostics(
+            sample_diagnostics
+                .as_object_mut()
+                .expect("native sample diagnostics are an object"),
+            &native_result.to_string(),
+        )
+        .expect("native producer result fields should normalize to the Floquet schema");
+        for (field, expected) in [
+            ("solver_model", "floquet_airbox_cpu_schur_slepc"),
+            ("resolved_solver_family", "floquet_poisson_airbox_schur"),
+            ("spectral_transform", "shift_invert"),
+            ("solver_adapter", "floquet_airbox_cpu_schur_slepc"),
+            ("algebraic_form", "schur_reduced_descriptor"),
+            ("matrix_equation", "L_eff q = lambda B_qq q; phi(q) = -P^-1 A_phiq q"),
+            ("phasor_convention", "exp_plus_i_omega_t"),
+            ("eigenvalue_mapping", "lambda_imag_positive_frequency"),
+            ("demag_kind", "floquet_airbox"),
+            ("execution_lane", "production_cpu"),
+        ] {
+            assert_eq!(sample_diagnostics[field], expected);
+        }
+        let solver_model = crate::eigen::EigenSolverModel::ProductionCpuShiftInvert;
+        let sample = |sample_index| crate::eigen::SingleKSolveResult {
+            sample: crate::eigen::KSampleDescriptor {
+                sample_index,
+                label: None,
+                segment_index: None,
+                path_s: 0.0,
+                t_in_segment: 0.0,
+                k_vector: [1.0e6, 0.0, 0.0],
+            },
+            modes: Vec::new(),
+            relaxation_steps: 0,
+            solver_model,
+            solver_notes: Vec::new(),
+            solver_diagnostics: Some(sample_diagnostics.clone()),
+        };
+        let result = crate::eigen::PathSolveResult {
+            gamma0_rad_s_per_a_m: plan.gyromagnetic_ratio,
+            samples: vec![sample(0), sample(1)],
+            branches: Vec::new(),
+            solver_model,
+            notes: Vec::new(),
+            include_demag: true,
+            dispersion_validation: None,
+            k0_kittel_validation: None,
+            solver_policy: None,
+            dispersion_analytic_reference: None,
+            k0_kittel_periodic_airbox_demag: None,
+        };
+        let selected = BTreeSet::new();
+        let diagnostics = eigen_path_solver_diagnostics(
+            FemEngine::CpuNative,
+            &plan,
+            &result,
+            &selected,
+        );
+        for (field, expected) in [
+            ("solver_model", "floquet_airbox_cpu_schur_slepc"),
+            ("resolved_solver_family", "floquet_poisson_airbox_schur"),
+            ("solver_adapter", "floquet_airbox_cpu_schur_slepc"),
+            ("spectral_transform", "shift_invert"),
+            ("execution_lane", "production_cpu"),
+            ("algebraic_form", "schur_reduced_descriptor"),
+            ("phasor_convention", "exp_plus_i_omega_t"),
+            ("eigenvalue_mapping", "lambda_imag_positive_frequency"),
+            ("demag_kind", "floquet_airbox"),
+        ] {
+            assert_eq!(diagnostics[field], expected);
+        }
+        assert!(diagnostics["solver_family"].is_null());
+        assert_eq!(diagnostics["production_solver_available"], true);
+        assert_eq!(diagnostics["production_native_solver_available"], true);
+        assert_eq!(diagnostics["modal_periodic_pair_contract_available"], true);
+        assert_eq!(diagnostics["floquet_periodic_pair_count"], 1);
+        assert_eq!(diagnostics["validation_only"], false);
+        assert_eq!(
+            diagnostics["sample_solver_diagnostics"][1]["diagnostics"]["solver_adapter"],
+            "floquet_airbox_cpu_schur_slepc"
+        );
+
+        let mut mixed_result = result.clone();
+        mixed_result.samples[1]
+            .solver_diagnostics
+            .as_mut()
+            .unwrap()["solver_adapter"] = serde_json::json!("other_adapter");
+        let mixed_diagnostics = eigen_path_solver_diagnostics(
+            FemEngine::CpuNative,
+            &plan,
+            &mixed_result,
+            &selected,
+        );
+        assert_ne!(
+            mixed_diagnostics["solver_adapter"],
+            "floquet_airbox_cpu_schur_slepc"
+        );
+        assert_ne!(
+            mixed_diagnostics["algebraic_form"],
+            "schur_reduced_descriptor"
+        );
+
+        let mut nonfinite_k_result = result.clone();
+        nonfinite_k_result.samples[1].sample.k_vector[0] = f64::NAN;
+        let nonfinite_k_diagnostics = eigen_path_solver_diagnostics(
+            FemEngine::CpuNative,
+            &plan,
+            &nonfinite_k_result,
+            &selected,
+        );
+        assert_ne!(
+            nonfinite_k_diagnostics["solver_model"],
+            "floquet_airbox_cpu_schur_slepc",
+            "a non-finite actual sample k-vector must not promote Floquet solver identity"
+        );
+    }
+
     #[test]
     fn conflicting_signed_sample_sidecars_fail_before_deduplication() {
         let path = "eigen/metadata/sample_0007/certified_fem_equilibrium_fields.v2.json";
@@ -3383,7 +3551,153 @@ pub(super) fn eigen_path_solver_diagnostics(
             }
         }
     }
+    if let Some(sample_identity) =
+        homogeneous_floquet_cpu_schur_sample_identity(plan, result)
+    {
+        if let Some(object) = diagnostics.as_object_mut() {
+            for field in [
+                "solver_model",
+                "solver_family",
+                "resolved_solver_family",
+                "spectral_transform",
+                "solver_adapter",
+                "execution_lane",
+                "algebraic_form",
+                "matrix_equation",
+                "phasor_convention",
+                "eigenvalue_mapping",
+                "frequency_mapping",
+                "demag_kind",
+                "production_solver_available",
+                "production_native_solver_available",
+                "production_gyrotropic_mapping",
+                "modal_periodic_pair_contract_available",
+                "floquet_periodic_pair_count",
+                "validation_only",
+            ] {
+                object.insert(
+                    field.to_string(),
+                    sample_identity.get(field).cloned().unwrap_or(serde_json::Value::Null),
+                );
+            }
+        }
+    }
     diagnostics
+}
+
+fn homogeneous_floquet_cpu_schur_sample_identity<'a>(
+    plan: &FemEigenPlanIR,
+    result: &'a crate::eigen::PathSolveResult,
+) -> Option<&'a serde_json::Value> {
+    let plan_has_nonzero_k = match plan.k_sampling.as_ref() {
+        Some(fullmag_ir::KSamplingIR::Single { k_vector }) => {
+            k_vector.iter().all(|component| component.is_finite())
+                && k_vector.iter().any(|component| component.abs() > 0.0)
+        }
+        Some(fullmag_ir::KSamplingIR::Path { points, .. }) => {
+            !points.is_empty()
+                && points
+                    .iter()
+                    .all(|point| point.k_vector.iter().all(|component| component.is_finite()))
+                && points.iter().any(|point| {
+                    point
+                        .k_vector
+                        .iter()
+                        .any(|component| component.abs() > 0.0)
+                })
+        }
+        None => false,
+    };
+    if result.solver_model != crate::eigen::EigenSolverModel::ProductionCpuShiftInvert
+        || !result
+            .samples
+            .iter()
+            .all(|sample| sample.solver_model == result.solver_model)
+        || !plan.enable_demag
+        || !plan.operator.include_demag
+        || !plan_has_nonzero_k
+        || !matches!(plan.operator.kind, fullmag_ir::EigenOperatorIR::Full2x2)
+        || !matches!(
+            plan.spin_wave_bc.kind(),
+            fullmag_ir::SpinWaveBoundaryKindIR::Floquet
+        )
+        || !result.samples.iter().any(|sample| {
+            sample
+                .sample
+                .k_vector
+                .iter()
+                .any(|component| component.is_finite() && component.abs() > 0.0)
+        })
+        || !result.samples.iter().all(|sample| {
+            sample
+                .sample
+                .k_vector
+                .iter()
+                .all(|component| component.is_finite())
+        })
+    {
+        return None;
+    }
+
+    let identity_fields = [
+        "solver_model",
+        "solver_family",
+        "resolved_solver_family",
+        "spectral_transform",
+        "solver_adapter",
+        "execution_lane",
+        "algebraic_form",
+        "matrix_equation",
+        "phasor_convention",
+        "eigenvalue_mapping",
+        "frequency_mapping",
+        "demag_kind",
+        "production_solver_available",
+        "production_native_solver_available",
+        "production_gyrotropic_mapping",
+        "modal_periodic_pair_contract_available",
+        "floquet_periodic_pair_count",
+        "validation_only",
+    ];
+    let mut samples = result.samples.iter();
+    let first = samples.next()?.solver_diagnostics.as_ref()?;
+    fn string<'a>(diagnostics: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+        diagnostics.get(field).and_then(serde_json::Value::as_str)
+    }
+    fn boolean(diagnostics: &serde_json::Value, field: &str) -> Option<bool> {
+        diagnostics.get(field).and_then(serde_json::Value::as_bool)
+    }
+    if string(first, "solver_model") != Some("floquet_airbox_cpu_schur_slepc")
+        || string(first, "solver_adapter") != Some("floquet_airbox_cpu_schur_slepc")
+        || string(first, "resolved_solver_family") != Some("floquet_poisson_airbox_schur")
+        || string(first, "spectral_transform") != Some("shift_invert")
+        || string(first, "execution_lane") != Some("production_cpu")
+        || string(first, "algebraic_form") != Some("schur_reduced_descriptor")
+        || string(first, "demag_kind") != Some("floquet_airbox")
+        || boolean(first, "production_solver_available") != Some(true)
+        || boolean(first, "production_native_solver_available") != Some(true)
+        || boolean(first, "production_gyrotropic_mapping") != Some(true)
+        || boolean(first, "modal_periodic_pair_contract_available") != Some(true)
+        || first
+            .get("floquet_periodic_pair_count")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(true, |pair_count| pair_count == 0)
+        || boolean(first, "validation_only") == Some(true)
+    {
+        return None;
+    }
+
+    if samples.any(|sample| {
+        let Some(diagnostics) = sample.solver_diagnostics.as_ref() else {
+            return true;
+        };
+        identity_fields
+            .iter()
+            .any(|field| diagnostics.get(*field) != first.get(*field))
+    }) {
+        return None;
+    }
+    Some(first)
 }
 
 pub(super) fn eigen_path_solver_counter(diagnostics: &serde_json::Value, key: &str) -> u64 {
