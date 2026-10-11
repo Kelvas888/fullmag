@@ -13332,6 +13332,46 @@ fn fem_eigen_floquet_dynamic_demag_requires_explicit_airbox_cpu_path() {
         other => panic!("expected FEM eigen plan, got {other:?}"),
     }
 
+    let mut all_pairs_ir = policy_ir.clone();
+    if let fullmag_ir::StudyIR::Eigenmodes { spin_wave_bc, .. } = &mut all_pairs_ir.study {
+        if let fullmag_ir::SpinWaveBoundaryConditionIR::Config(config) = spin_wave_bc {
+            config.boundary_pair_id = None;
+            config.pair_ids.clear();
+        }
+    }
+    let all_pairs_plan = plan(&all_pairs_ir)
+        .expect("empty Floquet selector means all and must retain native solver controls");
+    let all_pairs_resolution = all_pairs_plan.provenance.fem_eigen_execution_resolution.as_ref().unwrap();
+    assert_eq!(all_pairs_resolution.resolved_engine,
+        fullmag_ir::FemEigenEngineIR::FloquetAirboxCpuSchurSlepc);
+    assert!(!all_pairs_resolution.fallback_used);
+    if let BackendPlanIR::FemEigen(fem) = &all_pairs_plan.backend_plan {
+        assert!(fem.spin_wave_bc.boundary_pair_ids().is_empty());
+        assert_eq!(fem.solver_policy.as_ref().unwrap().max_linear_iterations, Some(4));
+    } else { panic!("expected FEM eigen all-pairs plan"); }
+
+    let mut subset_ir = ir.clone();
+    let subset_mesh = subset_ir.geometry_assets.as_mut().unwrap()
+        .fem_domain_mesh_asset.as_mut().unwrap().mesh.as_mut().unwrap();
+    let mut extra_nodes = subset_mesh.periodic_node_pairs[0].clone();
+    extra_nodes.pair_id = "extra_faces".to_string();
+    subset_mesh.periodic_node_pairs.push(extra_nodes);
+    let mut extra_boundary = subset_mesh.periodic_boundary_pairs[0].clone();
+    extra_boundary.pair_id = "extra_faces".to_string();
+    subset_mesh.periodic_boundary_pairs.push(extra_boundary);
+    for controls in [false, true] {
+        if controls {
+            subset_ir.problem_meta.runtime_metadata.insert(
+                "modal_solver_policy".to_string(),
+                serde_json::json!({"max_linear_iterations": 4}),
+            );
+        }
+        let error = plan(&subset_ir)
+            .expect_err("shared-domain Floquet subset is unsupported even without solver controls");
+        assert!(error.reasons.iter().any(|reason|
+            reason.contains("floquet_airbox_dynamic_demag_pair_selection_unsupported")));
+    }
+
     match planned.backend_plan {
         BackendPlanIR::FemEigen(fem) => {
             assert_eq!(fem.operator.kind, fullmag_ir::EigenOperatorIR::Full2x2);

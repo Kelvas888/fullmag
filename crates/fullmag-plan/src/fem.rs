@@ -1380,10 +1380,13 @@ fn eigen_policy_floquet_pair_sets_match(plan: &FemEigenPlanIR) -> bool {
         .iter()
         .map(|pair| pair.pair_id.as_str())
         .collect::<BTreeSet<_>>();
-    !requested_set.is_empty()
+    // Shared-domain magnetic assembly identifies all mesh periodic pairs.
+    // An empty authoring selector means all; a proper subset needs a separate
+    // assembly realization, unlike the generic scalar Floquet reduction.
+    !node_set.is_empty()
+        && node_set == boundary_set
         && requested_set.len() == requested.len()
-        && requested_set == node_set
-        && requested_set == boundary_set
+        && (requested_set.is_empty() || requested_set == node_set)
 }
 
 fn eigen_policy_floquet_dynamic_demag_path(
@@ -5883,6 +5886,16 @@ pub(crate) fn plan_fem_eigen(
         k0_kittel_validation,
         solver_policy,
     };
+
+    if floquet_airbox_dynamic_demag_cpu_path
+        && !eigen_policy_floquet_pair_sets_match(&fem_plan)
+    {
+        return Err(PlanError {
+            reasons: vec![
+                "floquet_airbox_dynamic_demag_pair_selection_unsupported: shared-domain assembly requires all mesh periodic pairs and matching boundary metadata; use an empty selector (all) or the explicit full pair set; no fallback was selected".to_string(),
+            ],
+        });
+    }
 
     if fem_plan.solver_policy.is_some()
         && !fem_eigen_solver_policy_has_native_path(
