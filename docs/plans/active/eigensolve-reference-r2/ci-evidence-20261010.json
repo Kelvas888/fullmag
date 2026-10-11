@@ -580,6 +580,34 @@
       "browser": "NOT VERIFIED",
       "managed_runtime": "NOT VERIFIED",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38141462905,
+      "sha": "6eba81b9b16bbb59019195096fce7dc6faae66c0",
+      "conclusion": "failure",
+      "scope": "Floquet_control_and_checkpoint_lifecycle",
+      "control_priority_test": "passed",
+      "checkpoint_test": "failed",
+      "failure": "test hardcodes copied partial path without artifacts/ prefix; actual checkpoint receipt records correct path",
+      "log_sha256": "2456efb2f4c95977446524e171a86e0eec11cc45724b8f9948ffae6b157f887e",
+      "qualification_claimed": false
+    },
+    {
+      "run_id": 38141709909,
+      "sha": "0f998d1e1aff3e27eb7a5f9ae39ee88ce291f10e",
+      "conclusion": "failure",
+      "scope": "reference_click_and_global_symbol_budget_source_contracts",
+      "tests_passed": 135,
+      "test_files_passed": 8,
+      "typecheck": "passed",
+      "architecture_hygiene": "passed",
+      "react_doctor": "failure: baseline617 diagnostics; two source positions shifted, semantic diagnostics unchanged",
+      "react_doctor_baseline_run": 38139947223,
+      "react_doctor_semantic_equal": true,
+      "log_sha256": "e02b9c8a435637802000ebca3bbd75873fcd0276c39c1d4dd6113e4786840853",
+      "browser": "NOT VERIFIED",
+      "performance_measurement": "NOT VERIFIED",
+      "qualification_claimed": false
     }
   ]
 }

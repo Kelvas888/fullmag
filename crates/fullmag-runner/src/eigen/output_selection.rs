@@ -436,9 +436,20 @@ pub(crate) fn select_eigen_outputs(
     path_result: &PathSolveResult,
     outputs: &[OutputIR],
 ) -> Result<EigenOutputSelection, OutputSelectionError> {
+    select_eigen_outputs_with_planned_samples(path_result, outputs, &BTreeSet::new())
+}
+
+/// Resolve outputs against a concrete path result while retaining sample
+/// selectors that belong to its declared plan but have not reached the
+/// accepted result prefix yet.
+pub(crate) fn select_eigen_outputs_with_planned_samples(
+    path_result: &PathSolveResult,
+    outputs: &[OutputIR],
+    planned_sample_ids: &BTreeSet<usize>,
+) -> Result<EigenOutputSelection, OutputSelectionError> {
     validate_eigen_mode_fields(outputs)?;
     validate_eigen_spectrum_quantities(outputs)?;
-    let available = AvailableModes::from_result(path_result)?;
+    let available = AvailableModes::from_result(path_result, planned_sample_ids)?;
     let mut selection = EigenOutputSelection::default();
     selection.diagnostics_request = eigen_diagnostics_request(outputs);
     let mut mode_requests = Vec::new();
@@ -496,28 +507,33 @@ pub(crate) fn select_eigen_outputs(
             "indices",
             OutputSelectionError::DuplicateModeIndex,
         )?;
-        for requested_index in &requested_indices {
-            if !available.raw_mode_ids.contains(requested_index) {
-                return Err(OutputSelectionError::UnknownRawModeIndex(
-                    u32::try_from(*requested_index).unwrap_or(u32::MAX),
-                ));
-            }
-        }
-
         let requested_branches = unique_platform_indices(
             &request.branches,
             "branches",
             OutputSelectionError::DuplicateBranchIndex,
         )?;
-        for requested_branch in &requested_branches {
-            if !available.branch_ids.contains(requested_branch) {
-                return Err(OutputSelectionError::UnknownBranch(
-                    u32::try_from(*requested_branch).unwrap_or(u32::MAX),
-                ));
+
+        let sample_ids = available.resolve_sample_selector(request.sample_selector)?;
+        let targets_uncomputed_planned_sample = sample_ids
+            .iter()
+            .any(|sample_index| !available.actual_sample_ids.contains(sample_index));
+        if !targets_uncomputed_planned_sample {
+            for requested_index in &requested_indices {
+                if !available.raw_mode_ids.contains(requested_index) {
+                    return Err(OutputSelectionError::UnknownRawModeIndex(
+                        u32::try_from(*requested_index).unwrap_or(u32::MAX),
+                    ));
+                }
+            }
+            for requested_branch in &requested_branches {
+                if !available.branch_ids.contains(requested_branch) {
+                    return Err(OutputSelectionError::UnknownBranch(
+                        u32::try_from(*requested_branch).unwrap_or(u32::MAX),
+                    ));
+                }
             }
         }
 
-        let sample_ids = available.resolve_sample_selector(request.sample_selector)?;
         selection
             .selected_sample_ids
             .extend(sample_ids.iter().copied());
@@ -590,7 +606,8 @@ struct ModeRequest<'a> {
 
 struct AvailableModes<'a> {
     samples: Vec<&'a crate::eigen::types::SingleKSolveResult>,
-    sample_ids: BTreeSet<usize>,
+    actual_sample_ids: BTreeSet<usize>,
+    selectable_sample_ids: BTreeSet<usize>,
     sample_labels: BTreeMap<String, BTreeSet<usize>>,
     mode_ids: BTreeSet<SampleModeId>,
     raw_mode_ids: BTreeSet<usize>,
@@ -598,9 +615,12 @@ struct AvailableModes<'a> {
 }
 
 impl<'a> AvailableModes<'a> {
-    fn from_result(path_result: &'a PathSolveResult) -> Result<Self, OutputSelectionError> {
+    fn from_result(
+        path_result: &'a PathSolveResult,
+        planned_sample_ids: &BTreeSet<usize>,
+    ) -> Result<Self, OutputSelectionError> {
         let mut samples = Vec::with_capacity(path_result.samples.len());
-        let mut sample_ids = BTreeSet::new();
+        let mut actual_sample_ids = BTreeSet::new();
         let mut sample_labels = BTreeMap::<String, BTreeSet<usize>>::new();
         let mut mode_ids = BTreeSet::new();
         let mut raw_mode_ids = BTreeSet::new();
@@ -608,7 +628,7 @@ impl<'a> AvailableModes<'a> {
 
         for sample in &path_result.samples {
             let sample_index = sample.sample.sample_index;
-            if !sample_ids.insert(sample_index) {
+            if !actual_sample_ids.insert(sample_index) {
                 return Err(OutputSelectionError::DuplicateResultSampleId(sample_index));
             }
             if let Some(label) = sample.sample.label.as_ref() {
@@ -645,6 +665,9 @@ impl<'a> AvailableModes<'a> {
             }
         }
         branch_ids.extend(branch_table_ids.iter().copied());
+
+        let mut selectable_sample_ids = actual_sample_ids.clone();
+        selectable_sample_ids.extend(planned_sample_ids.iter().copied());
 
         for branch in &path_result.branches {
             let mut point_ids = BTreeSet::new();
@@ -691,7 +714,8 @@ impl<'a> AvailableModes<'a> {
 
         Ok(Self {
             samples,
-            sample_ids,
+            actual_sample_ids,
+            selectable_sample_ids,
             sample_labels,
             mode_ids,
             raw_mode_ids,
@@ -704,7 +728,7 @@ impl<'a> AvailableModes<'a> {
         selector: Option<&SampleSelectorIR>,
     ) -> Result<BTreeSet<usize>, OutputSelectionError> {
         let Some(selector) = selector else {
-            return Ok(self.sample_ids.clone());
+            return Ok(self.selectable_sample_ids.clone());
         };
         if selector.is_empty() {
             return Err(OutputSelectionError::EmptySampleSelector);
@@ -719,7 +743,7 @@ impl<'a> AvailableModes<'a> {
                     sample_index as u32,
                 ));
             }
-            if !self.sample_ids.contains(&sample_index) {
+            if !self.selectable_sample_ids.contains(&sample_index) {
                 return Err(OutputSelectionError::UnknownSampleIndex(
                     u32::try_from(sample_index).unwrap_or(u32::MAX),
                 ));
@@ -771,7 +795,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{select_eigen_outputs, EigenDiagnosticsRequest, OutputSelectionError, SampleModeId};
+    use super::{
+        select_eigen_outputs, select_eigen_outputs_with_planned_samples,
+        EigenDiagnosticsRequest, OutputSelectionError, SampleModeId,
+    };
     use crate::eigen::types::{
         EigenSolverModel, KSampleDescriptor, PathSolveResult, SingleKModeResult,
         SingleKSolveResult, TrackedBranch, TrackedBranchPoint,
@@ -1017,6 +1044,180 @@ mod tests {
         assert_eq!(
             selection.field_mode_ids().iter().copied().collect::<Vec<_>>(),
             vec![SampleModeId::new(10, 2), SampleModeId::new(20, 15)]
+        );
+    }
+
+    #[test]
+    fn planned_samples_preserve_partial_prefix_intent_without_fabricating_modes() {
+        let planned_sample_ids = [10, 20, 30].into_iter().collect();
+        let output = |indices, branches, sample_indices| OutputIR::EigenMode {
+            field: "mode".to_string(),
+            all_modes: false,
+            indices,
+            branches,
+            sample_selector: Some(SampleSelectorIR {
+                sample_indices,
+                sample_labels: vec![],
+            }),
+        };
+        let planned_mode = output(vec![99], vec![], vec![30]);
+        let planned_selection = select_eigen_outputs_with_planned_samples(
+            &result(),
+            &[planned_mode.clone()],
+            &planned_sample_ids,
+        )
+        .expect("a future raw mode is unresolved until its planned sample is computed");
+        assert_eq!(
+            planned_selection.field_sample_ids_by_field()["mode"],
+            [30].into_iter().collect()
+        );
+        assert!(planned_selection.field_mode_ids().is_empty());
+        assert_eq!(
+            planned_selection
+                .selected_sample_ids()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![30]
+        );
+
+        let mixed_selection = select_eigen_outputs_with_planned_samples(
+            &result(),
+            &[output(vec![99], vec![], vec![10, 30])],
+            &planned_sample_ids,
+        )
+        .expect("a future target keeps a mixed accepted/pending selector unresolved");
+        assert_eq!(
+            mixed_selection.field_sample_ids_by_field()["mode"],
+            [10, 30].into_iter().collect()
+        );
+        assert!(mixed_selection.field_mode_ids().is_empty());
+
+        let future_branch = select_eigen_outputs_with_planned_samples(
+            &result(),
+            &[output(vec![], vec![99], vec![30])],
+            &planned_sample_ids,
+        )
+        .expect("a future branch is unresolved until its planned sample is computed");
+        assert!(future_branch.field_mode_ids().is_empty());
+
+        let mut empty_prefix = result();
+        empty_prefix.samples.clear();
+        empty_prefix.branches.clear();
+        let empty_prefix_selection = select_eigen_outputs_with_planned_samples(
+            &empty_prefix,
+            &[planned_mode.clone()],
+            &[30].into_iter().collect(),
+        )
+        .expect("an empty accepted prefix can retain the planned sample request");
+        assert!(empty_prefix_selection.field_mode_ids().is_empty());
+        assert_eq!(
+            empty_prefix_selection.field_sample_ids_by_field()["mode"],
+            [30].into_iter().collect()
+        );
+
+        let default_selection = select_eigen_outputs_with_planned_samples(
+            &result(),
+            &[OutputIR::EigenMode {
+                field: "mode".to_string(),
+                all_modes: false,
+                indices: vec![2],
+                branches: vec![],
+                sample_selector: None,
+            }],
+            &planned_sample_ids,
+        )
+        .expect("default selection covers the declared plan");
+        assert_eq!(
+            default_selection
+                .selected_sample_ids()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+        assert!(!default_selection
+            .field_mode_ids()
+            .contains(&SampleModeId::new(30, 2)));
+
+        assert_eq!(
+            select_eigen_outputs_with_planned_samples(
+                &result(),
+                &[output(vec![99], vec![], vec![10])],
+                &planned_sample_ids,
+            )
+            .unwrap_err(),
+            OutputSelectionError::UnknownRawModeIndex(99)
+        );
+        assert_eq!(
+            select_eigen_outputs(
+                &result(),
+                &[output(vec![99], vec![], vec![10])],
+            )
+            .unwrap_err(),
+            OutputSelectionError::UnknownRawModeIndex(99)
+        );
+
+        assert_eq!(
+            select_eigen_outputs_with_planned_samples(
+                &result(),
+                &[output(vec![], vec![99], vec![10])],
+                &planned_sample_ids,
+            )
+            .unwrap_err(),
+            OutputSelectionError::UnknownBranch(99)
+        );
+        assert_eq!(
+            select_eigen_outputs(
+                &result(),
+                &[output(vec![], vec![99], vec![10])],
+            )
+            .unwrap_err(),
+            OutputSelectionError::UnknownBranch(99)
+        );
+
+        let unknown_sample = OutputIR::EigenMode {
+            field: "mode".to_string(),
+            all_modes: false,
+            indices: vec![2],
+            branches: vec![],
+            sample_selector: Some(SampleSelectorIR {
+                sample_indices: vec![99],
+                sample_labels: vec![],
+            }),
+        };
+        assert_eq!(
+            select_eigen_outputs_with_planned_samples(
+                &result(),
+                &[unknown_sample],
+                &planned_sample_ids,
+            )
+            .unwrap_err(),
+            OutputSelectionError::UnknownSampleIndex(99)
+        );
+
+        let mut completed_result = result();
+        completed_result
+            .samples
+            .push(sample(30, Some("Y"), vec![mode(2, None)]));
+        let completed_unknown_mode = select_eigen_outputs_with_planned_samples(
+            &completed_result,
+            &[output(vec![99], vec![], vec![30])],
+            &planned_sample_ids,
+        )
+        .unwrap_err();
+        assert_eq!(
+            completed_unknown_mode,
+            OutputSelectionError::UnknownRawModeIndex(99)
+        );
+        assert_eq!(
+            select_eigen_outputs_with_planned_samples(
+                &completed_result,
+                &[output(vec![], vec![99], vec![30])],
+                &planned_sample_ids,
+            )
+            .unwrap_err(),
+            OutputSelectionError::UnknownBranch(99)
         );
     }
 

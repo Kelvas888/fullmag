@@ -855,3 +855,11 @@ All-mode provenance #38140833390:5 identity tests PASS, w tym nowa named regress
 4241564417: optional selectable default=true zachowuje pozostałe modele; frequency adapter wyłącza reference targets. Sumowany całkowity budget5000targetable linepoints: exact limit włącza symbole,5001wyłącza line symbols. Bez truncation danych lub zmiany scatterformat. Regresje model/helper/ECharts i source review przygotowane; GHA pending, rzeczywisty click/browser i czas renderowania NOT VERIFIED.
 
 API freshness #38141096311:83sessiontests+3exact router cases PASS, w tym actual physical7/progress8 source/status/reason. Brak kwalifikacji browser/runtime.
+
+
+Pause #38141462905:control-priority actual named test PASS; checkpoint metadata test FAIL przy szukaniu copied partial pod błędnie zakodowaną ścieżką bez artifacts/. Źródło checkpointu i jego receipt już stosują artifacts/; fixture teraz odczytuje relative_path z rzeczywistego receipt i nadal sprawdza copied bytes SHA. Nie osłabiono lifecycle/SHA assertions i nie zmieniono produkcji. Ponowne GHA wymagane.
+
+
+UI #38141709909:135 tests/8files PASS; typecheck i architecture PASS. Doctor617 diagnostics nadal FAIL. Porównanie z38139947223: tylko dwa source-location records przesunięte; po usunięciu wyłącznie pól pozycji wszystkie diagnostic payloady identyczne. Brak nowego findinga w tym fragmencie, bez wyłączenia bramki. Browser i pomiar czasu nadal NOT VERIFIED.
+
+Interrupted-prefix follow-up: scoped bias selector zachowuje declared sample IDs poza actualacceptedprefix, z empty field-mode set i bez backingbytes dla pending samples. Unknown raw/branch membership jest odroczone wyłącznie jeśli konkretny request obejmuje pending planned sample; accepted-only oraz completed/ordinarycallers pozostają strict. Root review wymagał również unknownraw99/empty-prefix/branch przypadków; dodano je obok actual tracked-bias regression. Brak fabricated modes/branches i IDs poza planem dalej fail. Parser/diff PASS; GHA wymagane.

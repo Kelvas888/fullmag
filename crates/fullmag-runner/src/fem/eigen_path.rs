@@ -11,7 +11,10 @@ use crate::eigen::diagnostic_artifact::{
     build_eigen_diagnostics_v2, canonical_mass_orthogonality_rows,
     EigenDiagnosticModeRecord, EigenDiagnosticSampleRecord,
 };
-use crate::eigen::output_selection::{select_eigen_outputs, EigenOutputSelection, SampleModeId};
+use crate::eigen::output_selection::{
+    select_eigen_outputs, select_eigen_outputs_with_planned_samples, EigenOutputSelection,
+    SampleModeId,
+};
 use crate::eigen::{KSampleDescriptor, SingleKModeResult, SingleKSolveResult};
 use crate::fem::eigen_capability::native_cpu_modal_window_enabled;
 use crate::fem::eigen_execution_resolution::{FemEigenExecutionLane, PlannedFemEigenExecution};
@@ -1726,6 +1729,31 @@ pub(crate) mod test_support {
         )
         .expect("paused sweep should publish only its accepted tracked prefix");
         assert_eq!(paused_prefix.result.status, RunStatus::Paused);
+        let prefix_selection: Value = serde_json::from_slice(
+            artifact_bytes(&paused_prefix, "eigen/mode_output_selection.v1.json")
+                .expect("paused-prefix field selection index is published"),
+        )
+        .expect("paused-prefix field selection index is valid JSON");
+        assert_eq!(
+            prefix_selection["field_selections"],
+            serde_json::json!([
+                {"field": "mode", "sample_index": 0, "raw_mode_indices": [0]},
+                {"field": "mode_complex", "sample_index": 1, "raw_mode_indices": []},
+            ])
+        );
+        assert_eq!(prefix_selection["payloads"].as_array().unwrap().len(), 1);
+        assert_eq!(prefix_selection["payloads"][0]["field"], "mode");
+        assert_eq!(prefix_selection["payloads"][0]["sample_index"], 0);
+        assert_eq!(prefix_selection["payloads"][0]["raw_mode_index"], 0);
+        let prefix_manifest: Value = serde_json::from_slice(
+            artifact_bytes(&paused_prefix, "frequency_domain/manifest.v1.json")
+                .expect("paused-prefix frequency-domain manifest is preserved"),
+        )
+        .expect("paused-prefix manifest is valid JSON");
+        assert_eq!(
+            prefix_manifest["artifacts"]["mode_output_selection_path"],
+            "eigen/mode_output_selection.v1.json"
+        );
         let prefix_spectrum: Value = serde_json::from_slice(
             artifact_bytes(&paused_prefix, "eigen/spectrum.v2.json")
                 .expect("paused-prefix spectrum is published"),
@@ -2107,7 +2135,17 @@ pub(super) fn track_bias_field_sweep_samples(
         .collect();
     crate::eigen::track_branches(&mut path_result, plan.mode_tracking.as_ref());
 
-    let selection = select_eigen_outputs(&path_result, outputs).map_err(|error| RunError {
+    let planned_sample_ids = plan
+        .bias_field_samples
+        .iter()
+        .map(|sample| sample.sample_index as usize)
+        .collect::<BTreeSet<_>>();
+    let selection = select_eigen_outputs_with_planned_samples(
+        &path_result,
+        outputs,
+        &planned_sample_ids,
+    )
+    .map_err(|error| RunError {
         message: format!("invalid bias-field eigen output selection: {error}"),
     })?;
     let published_mode_ids = selection

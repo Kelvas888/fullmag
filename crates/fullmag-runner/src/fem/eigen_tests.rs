@@ -10385,12 +10385,13 @@ fn direct_floquet_pause_and_stop_metadata_match_checkpoint_receipts() {
             .iter()
             .find(|record| record["source_relative_path"] == "eigen/partial.v1.json")
             .expect("checkpoint receipt covers the terminal partial artifact bytes");
+        let copied_partial_path = format!(
+            "eigen/diagnostics/raw_single_k/sample_0000/{}",
+            partial_record["relative_path"].as_str().expect("receipt records the copied path")
+        );
         let copied_partial = checkpoint_artifacts
             .iter()
-            .find(|artifact| {
-                artifact.relative_path
-                    == "eigen/diagnostics/raw_single_k/sample_0000/eigen/partial.v1.json"
-            })
+            .find(|artifact| artifact.relative_path == copied_partial_path)
             .expect("checkpoint retains the terminal partial artifact");
         assert_eq!(
             partial_record["sha256"],
