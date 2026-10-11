@@ -1,5 +1,27 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Brama rzeczywistego HTTP — wynik negatywny, 2026-10-11:**
+Dodano kontrolowaną receptę `just run-managed-antenna-http-ram` i obserwator,
+używające istniejącego buildu nr 41, osobno przypiętych SHA narzędzi oraz
+sesji tmpfs. Kontener nie publikuje portów hosta, ma sieć `none`, API działa
+wyłącznie na jego loopback; nie zmieniono workspace 3197.
+Po naprawie dokładnego dispatchera `just` i zgodności SHA z Pythonem kontenera
+próby `22b7919f7700414d90ba0919e459fe64` oraz
+`2089836736454d189938c8140dcfb333` wykonały solver z exit 0, ale nie przeszły
+bramy HTTP. Ostatnia odpowiedź endpointu etapu: HTTP 404,
+`missing_antenna_inspection`, `stage has no registered inspection result`.
+API odbierało aktualizacje sesji; zachowana kopia `result.zarr` zawiera jedynie
+`fullmag-run.json` i `output-storage.json`, bez artefaktów anteny.
+Nie ustalono jeszcze wspólnej przyczyny braku artefaktów i końcowego ref.
+Nie przypisywać tego wyłącznie asynchronicznemu publisherowi bez reprodukcji.
+Raport błędu i logi pozostają w storage profilu `managed-antenna-http-ram-cpu`.
+Canonical Rust re-decode przez API, prawdziwe HTTP smokes i cold import
+pozostają **NOT VERIFIED**. Nie rejestrować sztucznych refs, nie zastępować
+próby fixture-em API ani nie wyłączać guardów SessionStore.
+Regresje helpera/launchera: **38 PASS + 7 subtestów**; wcześniejszy łączny
+pakiet readerów, transportu i helpera: **181 PASS + 49 subtestów**.
+Komparator V/J/H poniżej dotyczy odrębnego, zakończonego sukcesem runu bez API.
+
 **Rzeczywisty odbiór V/J/H — 2026-10-11:**
 Build nr 41 `1128d9f468ee4b0981387a8cdf448451` zakończył się
 `succeeded`, exit 0, dla commita `62d9618b2eebec639e52eeea842ffde19525a4bd`.

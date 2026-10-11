@@ -8,6 +8,59 @@ import unittest
 
 
 class StorageShellTests(unittest.TestCase):
+    def antenna_http_shell(self, recipe=None, just_args=None):
+        bash = Path('C:/Program Files/Git/bin/bash.exe') if os.name == 'nt' else Path(shutil.which('bash') or '/missing')
+        if not bash.exists():
+            self.skipTest('Bash unavailable')
+        with tempfile.TemporaryDirectory(prefix='antenna-http-shell-') as temp:
+            root = Path(temp)
+            fake_python = root / 'fake-python'
+            fake_python.write_text('#!/bin/sh\nif [ "$1" = "-c" ]; then exit 0; fi\nprintf "%s\\n" "$@"\n', encoding='utf-8')
+            fake_python.chmod(0o755)
+            repo = Path(__file__).resolve().parents[1]
+            env = {**os.environ, 'FULLMAG_STORAGE_PYTHON': str(fake_python),
+                   'PYTHONDONTWRITEBYTECODE': '1'}
+            if just_args is None:
+                command = [str(bash), str(repo / 'scripts/just_storage_shell.sh'), recipe]
+            else:
+                just = shutil.which('just')
+                if just is None:
+                    self.skipTest('just unavailable')
+                command = [just, '--set', 'storage_python', 'python', *just_args]
+            return subprocess.run(command, cwd=repo, env=env, capture_output=True,
+                                  text=True, timeout=20)
+
+    def test_full_just_antenna_http_start_dispatches_exact_ids(self):
+        ids = ['a' * 32, 'b' * 40, 'c' * 64, 'd' * 64]
+        result = self.antenna_http_shell(just_args=['run-managed-antenna-http-ram', *ids])
+        self.assertEqual(0, result.returncode, result.stderr)
+        arguments = result.stdout.splitlines()
+        self.assertTrue(arguments[0].replace('\\', '/').endswith('/scripts/run_managed_antenna_http_ram.py'))
+        self.assertEqual(['start', '--job-id', ids[0], '--commit', ids[1],
+                          '--source-digest', ids[2], '--native-snapshot-sha256', ids[3]], arguments[3:])
+        self.assertNotIn('fullmag_storage.py', result.stdout)
+
+    def test_full_just_antenna_http_observe_dispatches_literal_root(self):
+        run_root = 'D:/git/fullmag/storage/runs/own gate'
+        result = self.antenna_http_shell(just_args=['observe-managed-antenna-http-ram', run_root])
+        self.assertEqual(0, result.returncode, result.stderr)
+        arguments = result.stdout.splitlines()
+        self.assertTrue(arguments[0].replace('\\', '/').endswith('/scripts/run_managed_antenna_http_ram.py'))
+        self.assertEqual(['observe', '--run-root', run_root], arguments[3:])
+
+    def test_antenna_http_dispatch_rejects_composite_and_internal_commands(self):
+        base = 'python "D:/ignored/scripts/run_managed_antenna_http_ram.py" --repo-root "D:/ignored" '
+        start = base + "start --job-id '" + 'a' * 32 + "' --commit '" + 'b' * 40 + "' --source-digest '" + 'c' * 64 + "' --native-snapshot-sha256 '" + 'd' * 64 + "'"
+        observe = base + "observe --run-root 'D:/git/fullmag/storage/runs/own'"
+        for recipe in (start + '; true', observe + ' && true', observe + '\ntrue',
+                       base + 'execute', start.replace('a' * 32, 'bad-id'),
+                       observe + ' --extra', 'true; ' + start):
+            with self.subTest(recipe=recipe):
+                result = self.antenna_http_shell(recipe=recipe)
+                self.assertEqual(2, result.returncode, result.stderr)
+                self.assertIn('invalid managed antenna HTTP RAM recipe', result.stderr)
+                self.assertEqual('', result.stdout)
+
     def test_broken_python3_alias_falls_back_to_python(self):
         bash = Path('C:/Program Files/Git/bin/bash.exe') if os.name == 'nt' else Path(shutil.which('bash') or '/missing')
         if not bash.exists():

@@ -1,0 +1,274 @@
+"""Interpreted lifecycle/isolation regressions; never compile native tests."""
+import json
+import io
+from pathlib import Path
+import subprocess
+
+import pytest
+from scripts import run_managed_antenna_http_ram as gate
+import run_managed_antenna_ram as ram
+
+
+def test_sha_supports_container_python_without_file_digest(tmp_path, monkeypatch):
+    monkeypatch.delattr(gate.hashlib, "file_digest", raising=False)
+    payload = b"abc" * 30000
+    path = tmp_path / "bounded-tool.py"
+    path.write_bytes(payload)
+    assert gate.sha(path) == gate.hashlib.sha256(payload).hexdigest()
+
+
+def test_http_error_preserves_bounded_real_failure(monkeypatch):
+    class Opener:
+        def open(self, url, timeout):
+            raise gate.HTTPError(url, 404, "missing", {}, io.BytesIO(b"x" * 9000))
+    monkeypatch.setattr(gate, "build_opener", lambda *args: Opener())
+    with pytest.raises(ValueError) as caught:
+        gate.get_json("/missing")
+    assert str(caught.value) == "HTTP 404 at /missing: " + "x" * 4096
+
+
+def document(tmp_path):
+    return gate.http_spec("sha256:" + "a" * 64, tmp_path / "source",
+        tmp_path / "package", tmp_path / "input", tmp_path / "export", tmp_path / "tools")
+
+
+def inspection(spec):
+    service = spec["services"]["antenna"]
+    return [{"Image": service["image"], "Config": {"User": "65532:65532",
+        "Cmd": service["command"], "Entrypoint": [], "WorkingDir": service["working_dir"],
+        "Env": [f"{key}={value}" for key, value in service["environment"].items()],
+        "Labels": {"com.docker.compose.project": "project", "com.docker.compose.service": "antenna"}},
+        "HostConfig": {"NetworkMode": "none", "PortBindings": {}, "ReadonlyRootfs": True,
+            "Privileged": False, "CapDrop": ["ALL"], "SecurityOpt": ["no-new-privileges:true"],
+            "Memory": 2 * 1024**3, "NanoCpus": 2 * 10**9, "PidsLimit": 128,
+            "Tmpfs": {"/tmp": "rw,nosuid,nodev,size=64m", "/ram": "rw,nosuid,nodev,size=768m,mode=1777"}},
+        "Mounts": [{"Type": "bind", "Source": m["source"], "Destination": m["target"],
+                    "RW": not m["read_only"]} for m in service["volumes"]]}]
+
+
+def test_readonly_tools_are_distinct_from_capsule_and_state_is_ram(tmp_path):
+    spec = document(tmp_path)
+    service = spec["services"]["antenna"]
+    assert "ports" not in service and service["network_mode"] == "none"
+    assert [(m["target"], m["read_only"]) for m in service["volumes"]] == [
+        ("/source", True), ("/package", True), ("/input", True),
+        ("/export", False), ("/tools", True)]
+    assert service["environment"]["FULLMAG_API_PORT"] == "8081"
+    assert service["environment"]["FULLMAG_STATE_ROOT"] == "/ram/workspace/.fullmag"
+    assert service["environment"]["FULLMAG_STATE_DIR"] == "/ram/user-state"
+    assert service["command"] == ["python3", "-I", "-B", "/tools/run_managed_antenna_http_ram.py", "execute"]
+
+
+@pytest.mark.parametrize("mutation", ["tools_rw", "ports", "network", "state", "image", "command", "tmpfs"])
+def test_changed_runtime_is_rejected(tmp_path, monkeypatch, mutation):
+    spec = document(tmp_path)
+    observed = inspection(spec)
+    item = observed[0]
+    if mutation == "tools_rw": item["Mounts"][-1]["RW"] = True
+    elif mutation == "ports": item["HostConfig"]["PortBindings"] = {"8081/tcp": [{}]}
+    elif mutation == "network": item["HostConfig"]["NetworkMode"] = "bridge"
+    elif mutation == "state": item["Config"]["Env"].append("FULLMAG_STATE_ROOT=/export")
+    elif mutation == "image": item["Image"] = "sha256:" + "b" * 64
+    elif mutation == "command": item["Config"]["Cmd"] = ["true"]
+    elif mutation == "tmpfs": item["HostConfig"]["Tmpfs"]["/ram"] = "rw,size=2g"
+    monkeypatch.setattr(ram, "docker", lambda *args: json.dumps(observed))
+    with pytest.raises(ValueError):
+        ram.attest("container", spec, "project")
+
+
+def test_exact_runtime_is_attested(tmp_path, monkeypatch):
+    spec = document(tmp_path)
+    observed = inspection(spec)
+    monkeypatch.setattr(ram, "docker", lambda *args: json.dumps(observed))
+    assert ram.attest("container", spec, "project") == observed[0]
+
+
+def test_pin_host_tools_and_reject_tampering(tmp_path):
+    for name in gate.TOOLS:
+        (tmp_path / name).write_bytes(name.encode())
+    manifest = gate.tool_manifest(tmp_path)
+    gate.check_tools(tmp_path, manifest)
+    (tmp_path / gate.TOOLS[1]).write_bytes(b"changed")
+    with pytest.raises(ValueError, match="identity changed"):
+        gate.check_tools(tmp_path, manifest)
+    with pytest.raises(ValueError, match="identity changed"):
+        gate.check_tools(tmp_path, {**manifest, "unowned.py": "a" * 64})
+
+
+def test_tool_manifest_matches_actual_import_dependencies():
+    repo = Path(__file__).resolve().parents[1]
+    manifest = gate.tool_manifest(repo / "scripts")
+    assert set(manifest) == set(gate.TOOLS)
+    assert "antenna_current_source_oracle.py" in manifest
+    assert "run_managed_antenna_ram.py" not in manifest
+
+
+def test_smoke_runs_pinned_tools_with_bounded_timeout(tmp_path, monkeypatch):
+    calls = []
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        kwargs["stdout"].write(json.dumps({"status": "passed", "physics_qualified": False}).encode())
+        return subprocess.CompletedProcess(command, 0)
+    monkeypatch.setattr(gate.subprocess, "run", run)
+    result = gate.smoke("smoke_antenna_inspection_display.py", "stage-000", tmp_path)
+    assert result["status"] == "passed"
+    command, options = calls[0]
+    assert command[-5:] == ["/tools/smoke_antenna_inspection_display.py", "--origin", gate.ORIGIN,
+                           "--stage-id", "stage-000"]
+    assert command[1:4] == ["-I", "-B", "-c"]
+    assert options["timeout"] == 120
+
+
+@pytest.mark.parametrize("result,code", [({"status": "fail", "physics_qualified": False}, 0),
+    ({"status": "passed", "physics_qualified": True}, 0),
+    ({"status": "passed", "physics_qualified": False}, 1),
+    ({"status": "pass", "physics_qualified": False}, 0)])
+def test_smoke_failure_and_scope_promotion_rejected(tmp_path, monkeypatch, result, code):
+    def run(command, **kwargs):
+        kwargs["stdout"].write(json.dumps(result).encode())
+        return subprocess.CompletedProcess(command, code)
+    monkeypatch.setattr(gate.subprocess, "run", run)
+    with pytest.raises(ValueError):
+        gate.smoke("smoke_antenna_inspection_display.py", "stage-000", tmp_path)
+
+
+def test_api_readiness_requires_real_inspection_contract(monkeypatch):
+    class Api:
+        def poll(self): return None
+    calls = []
+    def fetch(path):
+        calls.append(path)
+        route = "/v2/sessions/current/data/antenna/stages/{stage_id}/external-lead-inspection"
+        return {"paths": {route + suffix: {} for suffix in ("", "/display", "/payloads/{payload_kind}")}}
+    monkeypatch.setattr(gate, "get_json", fetch)
+    gate.wait_api(Api())
+    assert calls == ["/v2/platform/openapi.json"]
+
+
+def test_api_exit_fails_before_solver(monkeypatch):
+    class Api:
+        def poll(self): return 1
+    monkeypatch.setattr(gate, "get_json", lambda *args: pytest.fail("dead API must not be read"))
+    with pytest.raises(ValueError, match="exited"):
+        gate.wait_api(Api())
+
+
+def test_timeout_stops_only_owned_api():
+    class Api:
+        def __init__(self): self.calls = []
+        def poll(self): return None
+        def terminate(self): self.calls.append("terminate")
+        def kill(self): self.calls.append("kill")
+        def wait(self, timeout):
+            self.calls.append(("wait", timeout))
+            if "kill" not in self.calls: raise subprocess.TimeoutExpired("owned-api", timeout)
+    api = Api()
+    gate.stop_owned(api)
+    assert api.calls == ["terminate", ("wait", 10), "kill", ("wait", 10)]
+
+
+def test_nonterminal_build_prevents_storage_and_docker(tmp_path, monkeypatch):
+    import fullmag_storage as storage
+    import run_managed_browser as browser
+    def reject(*args): raise ValueError("Managed CPU release must be terminal and successful")
+    monkeypatch.setattr(gate, "resolved", reject)
+    monkeypatch.setattr(storage, "initialize", lambda *args: pytest.fail("no writes"))
+    monkeypatch.setattr(browser, "docker", lambda *args: pytest.fail("no Docker"))
+    with pytest.raises(ValueError, match="terminal"):
+        gate.start(tmp_path, "a" * 32, "b" * 40, "c" * 64, "d" * 64)
+
+
+def retained_gate(tmp_path, monkeypatch):
+    import fullmag_storage as storage
+    import verify_saved_fem_archive_roundtrip as archive
+    root = tmp_path / "runs" / ("1" * 32)
+    root.mkdir(parents=True)
+    for name in ("tools", "input", "export"):
+        (root / name).mkdir()
+    fixture = root / "input/fem_antenna_current_source_inspection.py"
+    fixture.write_bytes(b"fixed")
+    fixtures = {fixture.name: gate.sha(fixture)}
+    monkeypatch.setattr(ram, "FIXTURE_FILES", fixtures)
+    tools = root / "tools"
+    for name in gate.TOOLS:
+        (tools / name).write_bytes(name.encode())
+    tool_digests = gate.tool_manifest(tools)
+    (tools / "manifest.json").write_text(json.dumps({"tools_sha256": tool_digests,
+        "fixture_sha256": fixtures, "solver_capsule_attribution": False}))
+    build, capsule, package = tmp_path / "build", tmp_path / "capsule", tmp_path / "package"
+    (build / "artifacts").mkdir(parents=True)
+    (build / "artifacts/build-receipt.json").write_bytes(b"build receipt")
+    native = {"head_commit_full": "a" * 40, "source_snapshot_sha256": "b" * 64,
+              "source_snapshot_dirty": True}
+    image = "sha256:" + "c" * 64
+    spec = gate.http_spec(image, capsule / "tree", package, root / "input", root / "export", tools)
+    (root / "compose.json").write_text(json.dumps(spec))
+    receipt = {"schema": gate.SCHEMA, "run_root": str(root),
+        "compose_sha256": gate.sha(root / "compose.json"), "managed_job_id": "d" * 32,
+        "source_digest": "e" * 64, "native_source_identity": native, "image_digest": image,
+        "tools_sha256": tool_digests, "tool_manifest_sha256": gate.sha(tools / "manifest.json"),
+        "fixture_sha256": fixtures, "build_receipt_sha256": gate.sha(build / "artifacts/build-receipt.json"),
+        "compose_project": "fullmag-antenna-http-ram-" + root.name, "container_id": "owned"}
+    (root / "receipt.json").write_text(json.dumps(receipt))
+    result = {"schema": gate.SCHEMA, "state": "warm_http_pass", "solver_exit_code": 0,
+        "native_canonical_bundle_redecoded": True, "physics_qualified": False,
+        "durable_session_storage_qualified": False, "reuse_LLG_FFT_qualified": False,
+        "tool_manifest_sha256": receipt["tool_manifest_sha256"]}
+    (root / "export/gate-result.json").write_text(json.dumps(result))
+    for log in ("api.log", "solver.log"):
+        (root / "export" / log).write_text("startup")
+    (root / "export/result.zarr").mkdir()
+    monkeypatch.setattr(storage, "resolve_layout", lambda *args: {"build_root": str(tmp_path)})
+    def resolved(*args):
+        assert args[1:] == ("d" * 32, "a" * 40, "e" * 64, "b" * 64)
+        return {}, build, {"image_digest": image}, {"native_source_identity": native}, capsule, package
+    monkeypatch.setattr(gate, "resolved", resolved)
+    observed = inspection(spec)[0]
+    observed["Config"]["Labels"]["com.docker.compose.project"] = receipt["compose_project"]
+    observed["State"] = {"Status": "exited", "Running": False, "ExitCode": 0,
+                         "OOMKilled": False, "Error": ""}
+    monkeypatch.setattr(ram, "docker", lambda *args: json.dumps([observed]))
+    stamps = []
+    monkeypatch.setattr(archive, "check_stamp", lambda *args, **kwargs: stamps.append((args, kwargs)))
+    return root, receipt, result, observed, stamps
+
+
+def test_terminal_gate_verifies_both_startup_identities(tmp_path, monkeypatch):
+    root, receipt, _, _, stamps = retained_gate(tmp_path, monkeypatch)
+    result = gate.observe(tmp_path, root)
+    assert result["state"] == "warm_http_pass_resources_retained"
+    assert len(stamps) == 2
+    assert all(args[1:] == ("a" * 40, "b" * 64) and kwargs == {"dirty": True}
+               for args, kwargs in stamps)
+    stored = json.loads((root / "receipt.json").read_text())
+    assert stored["cold_archive_import"] == "NOT VERIFIED"
+    assert stored["gate_result_sha256"] == gate.sha(root / "export/gate-result.json")
+
+
+@pytest.mark.parametrize("mutation", ["exit", "oom", "result", "scope", "canonical",
+    "tools", "fixture", "image", "startup"])
+def test_failed_or_tampered_terminal_gate_cannot_pass(tmp_path, monkeypatch, mutation):
+    import verify_saved_fem_archive_roundtrip as archive
+    root, receipt, result, observed, _ = retained_gate(tmp_path, monkeypatch)
+    if mutation == "exit": observed["State"]["ExitCode"] = 1
+    elif mutation == "oom": observed["State"]["OOMKilled"] = True
+    elif mutation == "result": result["state"] = "failed"
+    elif mutation == "scope": result["physics_qualified"] = True
+    elif mutation == "canonical": result["native_canonical_bundle_redecoded"] = False
+    elif mutation == "tools": (root / "tools" / gate.TOOLS[1]).write_bytes(b"changed")
+    elif mutation == "fixture": (root / "input/fem_antenna_current_source_inspection.py").write_bytes(b"changed")
+    elif mutation == "image": receipt["image_digest"] = "sha256:" + "f" * 64
+    elif mutation == "startup":
+        def reject(*args, **kwargs): raise ValueError("startup identity differs")
+        monkeypatch.setattr(archive, "check_stamp", reject)
+    (root / "receipt.json").write_text(json.dumps(receipt))
+    (root / "export/gate-result.json").write_text(json.dumps(result))
+    with pytest.raises(ValueError):
+        gate.observe(tmp_path, root)
+
+
+def test_live_gate_remains_pending_without_success_receipt(tmp_path, monkeypatch):
+    root, _, _, observed, stamps = retained_gate(tmp_path, monkeypatch)
+    observed["State"].update(Status="running", Running=True)
+    assert gate.observe(tmp_path, root)["state"] == "pending"
+    assert not stamps
