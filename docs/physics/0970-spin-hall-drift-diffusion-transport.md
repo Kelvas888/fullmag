@@ -2576,17 +2576,82 @@ Samo przygotowanie lub build obrazu nie zmienia konfiguracji koordynatora.
 | Bazowy import dziesięciu wheels i Agg | PASS; `reviews/boris-python-wheels` | prywatny import, bez solvera |
 | Offline build toolchaina przez `just` | PASS; image `sha256:dd3441d07c3aa19fe1e4a206c2926b42c89899a59bbc517eb890bd99657b079e` | receipt `boris-image-8ea0710662644c49820179099d46fd90/terminal-receipt.json`, status SUCCEEDED_IMAGE_ONLY |
 | Finalny preflight UID 65532 | PASS; `reviews/boris-toolchain-final-image-v3/results/runtime-preflight.json` | readonly, network none, 2 CPU, 1 GiB, 128 pids; dziesięć importów z prywatnego katalogu, niezmieniony NumPy, trzy biblioteki linkera, embedding flags i Agg PNG |
-| BORIS source-image, kompilacja CPU i ABI witness | NOT VERIFIED | wymagane przypięte źródła i terminalny build w zarządzanej kolejce |
+| BORIS source-image i niezależny readback | PASS; szczegóły poniżej | dokładne źródła i toolchain, bez kompilacji solvera |
+| Kompilacja CPU i ABI witness | NOT VERIFIED | wymagany terminalny build w zarządzanej kolejce |
 | Managed runtime, public admission i benchmark | NOT VERIFIED | wymagany kompletny trusted łańcuch source/binary/ABI/runtime i niezależne bramki naukowe |
 | Operator activation | nie wykonano | istniejąca kolejka i profile zachowane |
 
 Receipt buildu ma kwalifikator NONROOT_RUNTIME_PREFLIGHT_AND_BORIS_NOT_VERIFIED;
 osobny późniejszy preflight zamyka jedynie jego część toolchainową i ma
 TOOLCHAIN_ONLY_NOT_SOLVER_QUALIFIED. Nie nadaje identity_complete dla BORIS.
-Następny etap to przypięty source-image, jawna aktywacja operatora przy pustym
+Następny etap po opisanym niżej source-image to jawna aktywacja operatora przy pustym
 aktywnym slocie oraz kompilacja BORIS w tej samej kolejce Fullmag_build_runner.
 Dopiero rzeczywisty witness ABI i managed runtime pozwalają sprawdzać nowy
 benchmark; provisioning nie zastępuje żadnej z tych bramek.
+
+(boris-offline-source-image-provisioning)=
+### E1: przypięty source-image i rzeczywisty readback
+
+`scripts/local_runner/boris_cpu.py::prepare_context` wymaga sześciu jawnych
+wejść CLI: repo-root, boris-source, toolchain-image, toolchain-proof,
+toolchain-context i toolchain-container. Receptura `just` dostarcza repo-root;
+pozostałe pięć argumentów przekazuje operator. `admit_toolchain` odtwarza
+bibliotekowy dependency graph i wheel admission, sprawdza frozen context/lock/
+manifest binding oraz rzeczywisty terminalny kontener: exact image i container
+ID, exit 0, brak OOM/running, UID 65532, readonly rootfs, network none, brak
+privileged/GPU i dokładną komendę preflight. Dowód musi pochodzić z jedynego
+bind mountu `/proof`; ścieżka i SHA256 wskazanego JSON muszą odpowiadać temu
+rzeczywistemu outputowi. Caller JSON lub sam image ID nie zastępują admission.
+
+Checkout BORIS musi być czysty na
+`048503d2ca6475e91b073eb1762ecf9d3634c3e1`. `clean_blob_ids` sprawdza Git blob
+identities z rzeczywistymi clean filters checkoutu, w tym CRLF; capture
+zachowuje oryginalne checkout bytes i przypina ich SHA256, rozmiar i tryb.
+Ponowny odczyt hashów i statusu przed zapisem odmawia drift. `validate_context`
+wymaga exact bounded membership, producer/Dockerfile hashes, source manifest
+oraz toolchain inspect/proof/context/container binding. Nie wykonuje overlay
+CPU ani kompilacji podczas provisioningu.
+
+| Parametr / typ | Domyślnie i walidacja | SI / znaczenie |
+|---|---|---|
+| repo-root / path | required; resolver właściciela worktree | $1$; storage/provenance owner, bez zmiany ProblemIR |
+| boris-source / path | required; prywatny storage, clean pinned Git, brak symlink/gitlink, bounded bytes/files | $1$; oryginalne źródła |
+| toolchain-image / string | required; installed immutable sha256 ID i zgodny inspect | $1$; dokładny toolchain |
+| toolchain-proof / path | required; actual mounted runtime-preflight.json, freeze hashes i qualification TOOLCHAIN_ONLY_NOT_SOLVER_QUALIFIED | $1$; ograniczony dowód narzędzi |
+| toolchain-context / path | required; zamrożony kontekst pod storage/tmp, complete dependency/wheel admission | $1$; inputs provisioningu |
+| toolchain-container / string | required; pełny 64-hex ID zachowanego terminalnego kontenera preflight | $1$; rzeczywisty execution binding |
+| context, tag / path, string | required dla `build_image`; właściciel zgodny, tag `fullmag/boris-cpu:*`, immutable context hashes | $1$; source-image build, nie solver stage |
+
+`Dockerfile.boris-cpu` kopiuje źródła, manifesty i helper do `/opt/fullmag-boris`
+jako USER 65532:65532 i wykonuje tylko `validate-image-source`, czyli
+`verify_source`. `build_image` używa lokalnego aliasu bazy sprawdzonego przed
+oraz po buildzie, `--network none --pull=false`, sprawdza finalny USER i prefiks
+RootFS layers toolchaina. Atomic terminalny receipt ma schema
+fullmag.boris.source-image-build.v1, SUCCEEDED_SOURCE_IMAGE_ONLY oraz
+BORIS_BUILD_AND_RUNTIME_NOT_VERIFIED. native_compilation_executed i
+operator_changed pozostają false. Nie jest to trusted receipt solvera.
+
+Rzeczywisty build przez `just runner-boris-image` zakończył się exit 0 obrazem
+`sha256:545279e00703d60dcaf33d455461ba90e0dea7ec5647e96392bbc9246c21b6a6`,
+z toolchainem `sha256:dd3441d07c3aa19fe1e4a206c2926b42c89899a59bbc517eb890bd99657b079e`.
+Receipt i `root-source-readback.json` są zachowane pod resolverowym
+`windows-native/boris-source-image-b5ffb0df863d47f5b76ff5e2d4af4e2c/`.
+Context SHA256 wynosi
+`5c53c82e963c5c27cca3b706e017652fab5a20c28cc9b02ee00975434a84aced`;
+source-tree SHA256 wynosi
+`0d0d924321c6b0d664f3e862a7a73d7c31a1c4c14d2a7f973b6238e2a58161a6`.
+Readback poza buildem, readonly bez bind mountów i sieci, UID 65532,
+1 CPU/512 MiB/32 pids, rzeczywisty exit 0, wywołał `verify_source` dla
+1133 plików / 26427761 bajtów i odczytał NumPy 2.2.6 oraz Matplotlib 3.8.4.
+Ten dowód ma zakres SOURCE_AND_TOOLCHAIN_ONLY_NOT_SOLVER_QUALIFIED.
+Dziewiętnaście interpretowanych regresji producenta, w tym actual Git CRLF
+clean-filter capture, przeszło; nie stanowią wykonania BORIS.
+
+Public Python/ProblemIR, wszystkie cztery backendy Fullmaga, historyczne
+odmowy v1 i benchmarku oraz tolerancje naukowe pozostają bez zmian.
+Operator nie jest aktywowany i kolejka nie została zmieniona. Kompilacja BORIS,
+CPU ABI witness, solver runtime i nowe porównanie nadal są NOT VERIFIED;
+ciężka kompilacja pozostaje zadaniem tej samej kolejki Fullmag_build_runner.
 
 (boris-cpu-abi-witness-contract)=
 ### E1: prerejestracja produkcyjnego CPU ABI witness
@@ -2712,6 +2777,13 @@ a qualified workload without the validation gates above.
 | boris-offline-toolchain-runtime-preflight | scripts/local_runner/boris_toolchain.py | runtime_preflight | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |
 | boris-offline-toolchain-build-image | scripts/local_runner/boris_toolchain.py | build_image | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |
 | boris-offline-toolchain-contract | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:boris-offline-toolchain-provisioning | Separate observed toolchain provisioning from pending BORIS source, ABI, runtime and scientific qualification. | planned_contract; toolchain evidence only |
+| boris-source-image-admit-toolchain | scripts/local_runner/boris_cpu.py | admit_toolchain | Bind exact source bytes and qualified toolchain inputs or verify offline source-image provenance; no solver qualification. | source_only; source-image only |
+| boris-source-image-clean-blob-ids | scripts/local_runner/boris_cpu.py | clean_blob_ids | Bind exact source bytes and qualified toolchain inputs or verify offline source-image provenance; no solver qualification. | source_only; source-image only |
+| boris-source-image-prepare-context | scripts/local_runner/boris_cpu.py | prepare_context | Bind exact source bytes and qualified toolchain inputs or verify offline source-image provenance; no solver qualification. | source_only; source-image only |
+| boris-source-image-validate-context | scripts/local_runner/boris_cpu.py | validate_context | Bind exact source bytes and qualified toolchain inputs or verify offline source-image provenance; no solver qualification. | source_only; source-image only |
+| boris-source-image-build-image | scripts/local_runner/boris_cpu.py | build_image | Bind exact source bytes and qualified toolchain inputs or verify offline source-image provenance; no solver qualification. | source_only; source-image only |
+| boris-source-image-verify-source | scripts/local_runner/boris_cpu.py | verify_source | Bind exact source bytes and qualified toolchain inputs or verify offline source-image provenance; no solver qualification. | source_only; source-image only |
+| boris-offline-source-image-contract | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:boris-offline-source-image-provisioning | Separate observed source-image build and readback from pending native compile, ABI, solver runtime and benchmark. | planned_contract; source-image only |
 | boris-managed-runtime-publication | scripts/run_managed_boris_nf.py | observe | Exclusive runtime storage lock, full bundle before exact terminal receipt LAST; precommit resumable I/O failure and immutable postcommit verification. | source_only; interpreted crash/reentrant checks, runtime NOT VERIFIED |
 | boris-managed-runtime-admission | scripts/run_managed_boris_nf.py | resolved_boris_build | Authenticated same-actor/worktree terminal job, four trusted hashes, source/ABI/binary/flags/image receipt verification; source only. | source_only; interpreted regressions, native/runtime NOT VERIFIED |
 | boris-managed-runtime-reopen | scripts/run_managed_boris_nf.py | verify_runtime_identity | Explicit trusted repo/root, actual CPU container/output closure, receipt/identity binding and independent summary recomputation; no runtime qualification. | source_only; interpreted regressions, native/runtime NOT VERIFIED |

@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import uuid
+import datetime
 
 PROFILE = "boris-cpu-v1"
 PIN = "048503d2ca6475e91b073eb1762ecf9d3634c3e1"
@@ -37,7 +38,7 @@ def digest(path):
 
 
 def safe_member(root, name):
-    if not isinstance(name, str) or not name or "\\" in name or "\0" in name:
+    if not isinstance(name, str) or not name or "\\" in name or "\0" in name or ":" in name:
         raise ValueError("invalid BORIS source path")
     parts = PurePosixPath(name)
     if parts.is_absolute() or any(p in ("", ".", "..") for p in name.split("/")):
@@ -379,58 +380,263 @@ def validate_abi_outputs(root, artifacts, receipt, proof, cpp):
         raise ValueError("BORIS ABI linker/run differ from solver")
 
 
-def prepare_context(repo, boris_source, image):
-    # Direct script invocation needs the canonical scripts module root.
-    if __package__ in (None, ""):
-        import sys
-        sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+def image_inspect(image):
+    value = json.loads(subprocess.check_output(["docker", "--context", "desktop-linux", "image", "inspect", image], timeout=30))
+    if len(value) != 1 or value[0].get("Id") != image or not value[0].get("RootFS", {}).get("Layers"):
+        raise ValueError("installed immutable toolchain image mismatch")
+    return {key: value[0][key] for key in ("Id", "RootFS", "Config", "Architecture", "Os")}
+
+
+def validate_context(context):
+    value = load_manifest(safe_member(context, "source_context.json"))
+    if value.get("schema") != "fullmag.boris.source-context.v1" or value.get("upstream_commit") != PIN:
+        raise ValueError("BORIS source context identity mismatch")
+    files = value.get("files", [])
+    names = [e["path"] for e in files]
+    if names != sorted(set(names)) or not 1 <= len(files) <= MAX_FILES+10 or sum(e["size"] for e in files) > MAX_SOURCE_BYTES+2*1024**2:
+        raise ValueError("BORIS context membership bound")
+    for entry in files:
+        path = safe_member(context, entry["path"])
+        if path.stat().st_size != entry["size"] or digest(path) != entry["sha256"]:
+            raise ValueError("BORIS image context byte drift")
+    actual = []
+    for base, directories, members in os.walk(context, followlinks=False):
+        if any((Path(base)/name).is_symlink() for name in directories):
+            raise ValueError("BORIS context directory symlink")
+        actual.extend((Path(base)/name).relative_to(context).as_posix() for name in members)
+    if sorted(actual) != sorted([*names, "source_context.json"]):
+        raise ValueError("BORIS context unexpected member")
+    verify_source(context/"source", load_manifest(context/"source_manifest.json"))
+    proof = load_manifest(context/"toolchain_proof.json")
+    if proof.get("qualification") != "TOOLCHAIN_ONLY_NOT_SOLVER_QUALIFIED" or not proof.get("gxx") or not proof.get("readelf") or not proof.get("linker_paths"):
+        raise ValueError("BORIS toolchain runtime proof incomplete")
+    if value.get("producer_sha256") != digest(Path(__file__)) or digest(context/"boris_cpu.py") != digest(Path(__file__)):
+        raise ValueError("BORIS source producer drift")
+    toolchain_context = load_manifest(context/"toolchain_context.json")
+    if proof.get("context_sha256") != digest(context/"toolchain_context.json"):
+        raise ValueError("BORIS toolchain context proof mismatch")
+    container = load_manifest(context/"toolchain_container.json")
+    if container.get("Image") != value.get("toolchain_image") or container.get("State", {}).get("ExitCode") != 0:
+        raise ValueError("BORIS toolchain terminal image binding mismatch")
+    if digest(context/"Dockerfile") != digest(Path(__file__).with_name("Dockerfile.boris-cpu")):
+        raise ValueError("BORIS source Dockerfile differs from reviewed producer")
+    inspection = load_manifest(context/"toolchain_inspect.json")
+    if inspection.get("Id") != value.get("toolchain_image") or not re.fullmatch(r"sha256:[a-f0-9]{64}", value["toolchain_image"]):
+        raise ValueError("BORIS toolchain inspect binding mismatch")
+    return value
+
+
+def admit_toolchain(repo_storage, image, proof_path, toolchain_context, container_id):
+    from fullmag_storage import validate_path
+    from local_runner import boris_toolchain as toolchain
+    context = validate_path(toolchain_context, repo_storage/"tmp", "BORIS toolchain context")
+    manifest = toolchain.load(toolchain.member(context, "context.json"))
+    if manifest.get("schema") != "fullmag.boris.toolchain-context.v1":
+        raise ValueError("BORIS toolchain context schema mismatch")
+    base = manifest["base_image_id"]
+    _, _, selected = toolchain.validate_bundle(context/"bundle", base)
+    toolchain.validate_wheels(context/"wheel-bundle", base)
+    if selected != manifest["selected_packages"]:
+        raise ValueError("BORIS toolchain dependency closure drift")
+    for name, expected in manifest["context_source_sha256"].items():
+        if digest(toolchain.member(context, name)) != expected:
+            raise ValueError("BORIS toolchain source freeze drift")
+    proof = load_manifest(proof_path)
+    if (proof.get("context_sha256") != digest(context/"context.json") or
+            proof.get("lock_sha256") != digest(context/"bundle/packages.lock.json") or
+            proof.get("wheel_manifest_sha256") != digest(context/"wheel-bundle/manifest.json") or
+            manifest["download_freeze_sha256"] != digest(context/"bundle/download-source-freeze.json")):
+        raise ValueError("BORIS toolchain preflight freeze mismatch")
+    if re.fullmatch(r"[a-f0-9]{64}", container_id) is None:
+        raise ValueError("exact terminal toolchain container ID required")
+    values = json.loads(subprocess.check_output(["docker", "--context", "desktop-linux", "container", "inspect", container_id], timeout=30))
+    if len(values) != 1:
+        raise ValueError("toolchain preflight container missing")
+    container = values[0]
+    state, host, config = container["State"], container["HostConfig"], container["Config"]
+    if (container.get("Id") != container_id or container.get("Image") != image or state.get("Status") != "exited" or
+            state.get("ExitCode") != 0 or state.get("OOMKilled") or state.get("Running") or
+            config.get("User") != "65532:65532" or not host.get("ReadonlyRootfs") or
+            host.get("NetworkMode") != "none" or host.get("Privileged") or host.get("DeviceRequests") or
+            container.get("Path") != "python3" or container.get("Args") != ["-B", "/opt/fullmag-boris-toolchain/boris_toolchain.py", "runtime-preflight", "--output-dir", "/proof/results"]):
+        raise ValueError("actual toolchain preflight container is not qualified")
+    mounts = container.get("Mounts", [])
+    if len(mounts) != 1 or mounts[0].get("Type") != "bind" or mounts[0].get("Destination") != "/proof":
+        raise ValueError("toolchain proof mount mismatch")
+    # Docker Desktop may spell a Windows bind as /host_mnt/<drive>/... .
+    source = mounts[0]["Source"].replace("\\", "/")
+    if source.startswith("/host_mnt/") or source.startswith("/run/desktop/mnt/host/"):
+        prefix = "/host_mnt/" if source.startswith("/host_mnt/") else "/run/desktop/mnt/host/"
+        source = source[len(prefix):]; source = source[0]+":"+source[1:]
+    mounted_proof = validate_path(Path(source)/"results/runtime-preflight.json", repo_storage)
+    if mounted_proof.resolve() != proof_path.resolve() or digest(mounted_proof) != digest(proof_path):
+        raise ValueError("toolchain proof is not the actual mounted output")
+    return manifest, container
+
+
+def clean_blob_ids(root, names):
+    # hash-object applies the same clean filters used by Git status. The image
+    # retains exact checkout bytes, including a declared CRLF checkout policy.
+    if any("\n" in name or "\r" in name for name in names):
+        raise ValueError("BORIS source path has line delimiters")
+    result = subprocess.run(["git", "-c", "safe.directory="+str(root), "--no-optional-locks", "-C", str(root), "hash-object", "--stdin-paths"],
+                            input=("\n".join(names)+"\n").encode(), capture_output=True, check=True, timeout=120)
+    ids = result.stdout.decode().splitlines()
+    if len(ids) != len(names) or any(not re.fullmatch(r"[a-f0-9]{40}", oid) for oid in ids):
+        raise ValueError("BORIS clean-filter object identities missing")
+    return dict(zip(names, ids))
+
+
+def prepare_context(repo, boris_source, image, toolchain_proof, toolchain_context, toolchain_container):
     from fullmag_storage import resolve_layout, validate_path
-    if re.fullmatch(r"sha256:[a-f0-9]{64}",image) is None:
-        raise ValueError("immutable installed toolchain image ID required")
-    root=boris_source.resolve(strict=True)
-    if root.is_symlink():
-        raise ValueError("BORIS checkout symlink")
+    if re.fullmatch(r"sha256:[a-f0-9]{64}", image) is None or boris_source.is_symlink():
+        raise ValueError("immutable installed toolchain image and regular checkout required")
+    layout = resolve_layout(repo, "windows-native")
+    storage = Path(layout["storage_root"])
+    root = validate_path(boris_source, storage).resolve(strict=True)
+    proof_path = validate_path(toolchain_proof, storage)
+    proof = load_manifest(proof_path)
+    if proof.get("qualification") != "TOOLCHAIN_ONLY_NOT_SOLVER_QUALIFIED":
+        raise ValueError("actual toolchain runtime proof required")
+    toolchain_manifest, container = admit_toolchain(storage, image, proof_path, toolchain_context, toolchain_container)
+    inspection = image_inspect(image)
     def git(*args):
-        return subprocess.check_output(["git","--no-optional-locks","-C",str(root),*args])
-    if git("rev-parse","HEAD").decode().strip()!=PIN or git("status","--porcelain","--untracked-files=all").strip():
+        return subprocess.check_output(["git", "-c", "safe.directory="+str(root), "--no-optional-locks", "-C", str(root), *args])
+    if git("rev-parse", "HEAD").decode().strip() != PIN or git("status", "--porcelain", "--untracked-files=all").strip():
         raise ValueError("BORIS source must be clean exact pinned checkout")
-    layout=resolve_layout(repo,"windows-native")
-    storage=Path(layout["storage_root"])
-    context=validate_path(storage/"tmp"/("boris-cpu-image-"+uuid.uuid4().hex),storage)
-    context.mkdir(parents=True)
-    entries=[];total=0
-    for item in git("ls-tree","-r","-z","HEAD").split(b"\0"):
-        if not item:continue
-        metadata,name=item.split(b"\t",1);mode,kind,oid=metadata.split()
-        if kind!=b"blob" or mode not in (b"100644",b"100755"):
+    tree = [item for item in git("ls-tree", "-r", "-z", "HEAD").split(b"\0") if item]
+    if not 1 <= len(tree) <= MAX_FILES:
+        raise ValueError("BORIS Git source count exceeds bound")
+    clean_ids = clean_blob_ids(root, [item.split(b"\t", 1)[1].decode("utf-8") for item in tree])
+    entries = []; captured = []; total = 0
+    for item in tree:
+        if not item:
+            continue
+        metadata, name = item.split(b"\t", 1); mode, kind, oid = metadata.split()
+        if kind != b"blob" or mode not in (b"100644", b"100755"):
             raise ValueError("BORIS source gitlink/symlink unsupported")
-        name=name.decode("utf-8");path=safe_member(root,name)
-        size=path.stat().st_size;total+=size
-        if total>MAX_SOURCE_BYTES or len(entries)>=MAX_FILES:
+        name = name.decode("utf-8"); path = safe_member(root, name)
+        size = path.stat().st_size; total += size
+        if total > MAX_SOURCE_BYTES or len(entries) >= MAX_FILES:
             raise ValueError("BORIS context source bound exceeded")
-        data=path.read_bytes()
-        if hashlib.sha1(b"blob "+str(len(data)).encode()+b"\0"+data).hexdigest()!=oid.decode():
+        data = path.read_bytes()
+        if len(data) != size or clean_ids[name] != oid.decode():
             raise ValueError("BORIS source changed during capture")
-        target=context/"source"/name;target.parent.mkdir(parents=True,exist_ok=True);target.write_bytes(data)
-        entries.append(dict(path=name,size=len(data),sha256=hashlib.sha256(data).hexdigest(),mode=mode.decode()))
-    entries.sort(key=lambda e:e["path"])
-    manifest=dict(schema_version="fullmag.boris.image_source.v1",upstream_commit=PIN,files=entries,
-                  source_tree_sha256=hashlib.sha256(canonical(entries)).hexdigest())
-    verify_source(context/"source",manifest)
-    (context/"source_manifest.json").write_bytes(canonical(manifest))
-    shutil.copyfile(Path(__file__).parent/"Dockerfile.boris-cpu",context/"Dockerfile")
-    print(json.dumps(dict(context=str(context),toolchain_image=image,source_tree_sha256=manifest["source_tree_sha256"],qualification="NOT VERIFIED")))
+        captured.append((name, data, mode))
+        entries.append(dict(path=name, size=size, sha256=hashlib.sha256(data).hexdigest(), mode=mode.decode()))
+    # Detect byte changes after clean-filter admission before any snapshot write.
+    for name, data, mode in captured:
+        if digest(safe_member(root, name)) != hashlib.sha256(data).hexdigest():
+            raise ValueError("BORIS checkout changed during capture")
+    if git("status", "--porcelain", "--untracked-files=all").strip():
+        raise ValueError("BORIS checkout became dirty during capture")
+    entries.sort(key=lambda e: e["path"])
+    source_manifest = dict(schema_version="fullmag.boris.image_source.v1", upstream_commit=PIN, files=entries,
+                           source_tree_sha256=hashlib.sha256(canonical(entries)).hexdigest())
+    context = validate_path(storage/"tmp"/("boris-cpu-image-"+uuid.uuid4().hex), storage)
+    context.mkdir(parents=True)
+    for name, data, mode in captured:
+        target = context/"source"/name; target.parent.mkdir(parents=True, exist_ok=True); target.write_bytes(data)
+        target.chmod(0o755 if mode == b"100755" else 0o644)
+    (context/"source_manifest.json").write_bytes(canonical(source_manifest))
+    (context/"toolchain_inspect.json").write_bytes(canonical(inspection))
+    (context/"toolchain_proof.json").write_bytes(proof_path.read_bytes())
+    (context/"toolchain_context.json").write_bytes((toolchain_context/"context.json").read_bytes())
+    (context/"toolchain_container.json").write_bytes(canonical(container))
+    shutil.copyfile(Path(__file__), context/"boris_cpu.py")
+    shutil.copyfile(Path(__file__).with_name("Dockerfile.boris-cpu"), context/"Dockerfile")
+    (context/".dockerignore").write_bytes(b"**\n!Dockerfile\n!boris_cpu.py\n!source_manifest.json\n!source_context.json\n!toolchain_proof.json\n!toolchain_inspect.json\n!toolchain_context.json\n!toolchain_container.json\n!source/\n!source/**\n")
+    files = [dict(path=path.relative_to(context).as_posix(), size=path.stat().st_size, sha256=digest(path)) for path in context.rglob("*") if path.is_file()]
+    files.sort(key=lambda e: e["path"])
+    value = dict(schema="fullmag.boris.source-context.v1", upstream_commit=PIN, toolchain_image=image,
+                 worktree_id=layout["worktree_id"], files=files, producer_sha256=digest(Path(__file__)),
+                 source_tree_sha256=source_manifest["source_tree_sha256"], qualification="SOURCE_CONTEXT_ONLY_NOT_SOLVER_VERIFIED")
+    (context/"source_context.json").write_bytes(canonical(value))
+    validate_context(context)
+    print(json.dumps(dict(context=str(context), context_sha256=digest(context/"source_context.json"), qualification=value["qualification"])))
     return context
 
 
-def main():
-    parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("prepare-image-context",choices=("prepare-image-context",))
-    parser.add_argument("--repo-root",type=Path,required=True)
-    parser.add_argument("--boris-source",type=Path,required=True)
-    parser.add_argument("--toolchain-image",required=True)
-    args=parser.parse_args()
-    prepare_context(args.repo_root,args.boris_source,args.toolchain_image)
+def build_image(repo, context, tag):
+    from fullmag_storage import resolve_layout, validate_path, file_lock
+    layout = resolve_layout(repo, "windows-native"); storage = Path(layout["storage_root"])
+    context = validate_path(context, storage/"tmp", "BORIS source image context")
+    if not context.name.startswith("boris-cpu-image-") or not re.fullmatch(r"fullmag/boris-cpu:[a-z0-9][a-z0-9_.-]{0,100}", tag):
+        raise ValueError("private BORIS source context and tag required")
+    destination = validate_path(Path(layout["build_root"])/("boris-source-image-"+uuid.uuid4().hex), storage)
+    destination.mkdir(parents=True)
+    receipt = dict(schema="fullmag.boris.source-image-build.v1", status="RUNNING", worktree_id=layout["worktree_id"],
+                   context=str(context), native_compilation_executed=False, operator_changed=False, qualification="NOT VERIFIED")
+    try:
+        with file_lock(storage/"locks"/(context.name+".lock"), "BORIS source image provisioning"):
+            value = validate_context(context)
+            if value["worktree_id"] != layout["worktree_id"]:
+                raise ValueError("BORIS context owner mismatch")
+            image = value["toolchain_image"]; inspected = image_inspect(image)
+            if inspected != load_manifest(context/"toolchain_inspect.json"):
+                raise ValueError("BORIS installed toolchain identity drift")
+            alias = "fullmag/boris-cpu-base:"+uuid.uuid4().hex
+            subprocess.run(["docker", "--context", "desktop-linux", "image", "tag", image, alias], check=True, timeout=30)
+            actual_alias = json.loads(subprocess.check_output(["docker", "--context", "desktop-linux", "image", "inspect", alias], timeout=30))
+            if len(actual_alias) != 1 or actual_alias[0]["Id"] != image:
+                raise ValueError("BORIS private local base alias drift")
+            iid = destination/"image-id.txt"
+            command = ["docker", "--context", "desktop-linux", "build", "--network", "none", "--pull=false", "--build-arg", "TOOLCHAIN_IMAGE="+alias, "--iidfile", str(iid), "-t", tag, "-f", str(context/"Dockerfile"), str(context)]
+            receipt.update(toolchain_image=image, base_alias=alias, tag=tag, command=command,
+                           context_sha256=digest(context/"source_context.json"), source_tree_sha256=value["source_tree_sha256"])
+            with (destination/"build.log").open("xb") as output:
+                result = subprocess.run(command, stdout=output, stderr=subprocess.STDOUT)
+            receipt["exit_code"] = result.returncode
+            if result.returncode != 0:
+                raise ValueError("BORIS source image build failed: "+str(destination/"build.log"))
+            identity = iid.read_text().strip()
+            if not re.fullmatch(r"sha256:[a-f0-9]{64}", identity):
+                raise ValueError("BORIS source image ID missing")
+            actual = image_inspect(identity)
+            base_layers = inspected["RootFS"]["Layers"]
+            if actual["Config"].get("User") != "65532:65532" or actual["RootFS"]["Layers"][:len(base_layers)] != base_layers:
+                raise ValueError("BORIS source image user or toolchain layers mismatch")
+            alias_after = json.loads(subprocess.check_output(["docker", "--context", "desktop-linux", "image", "inspect", alias], timeout=30))
+            if len(alias_after) != 1 or alias_after[0]["Id"] != image:
+                raise ValueError("BORIS base alias changed during build")
+            validate_context(context)
+            receipt.update(status="SUCCEEDED_SOURCE_IMAGE_ONLY", image_id=identity, qualification="BORIS_BUILD_AND_RUNTIME_NOT_VERIFIED")
+    except BaseException as error:
+        receipt.update(status="FAILED", error=str(error))
+        raise
+    finally:
+        receipt["finished_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        temporary = destination/"terminal-receipt.tmp"
+        temporary.write_bytes(canonical(receipt)); temporary.replace(destination/"terminal-receipt.json")
+        print(json.dumps(dict(receipt=str(destination/"terminal-receipt.json"), status=receipt["status"], image_id=receipt.get("image_id"))))
 
-if __name__=="__main__":
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("operation", choices=("prepare-image-context", "build-image", "validate-image-source"))
+    parser.add_argument("--repo-root", type=Path)
+    parser.add_argument("--boris-source", type=Path)
+    parser.add_argument("--toolchain-image")
+    parser.add_argument("--toolchain-proof", type=Path)
+    parser.add_argument("--toolchain-context", type=Path)
+    parser.add_argument("--toolchain-container")
+    parser.add_argument("--context", type=Path)
+    parser.add_argument("--tag")
+    args = parser.parse_args()
+    if args.operation == "prepare-image-context":
+        if not all((args.repo_root, args.boris_source, args.toolchain_image, args.toolchain_proof, args.toolchain_context, args.toolchain_container)):
+            parser.error("prepare requires repo-root, boris-source, toolchain-image, toolchain-proof, toolchain-context and toolchain-container")
+        prepare_context(args.repo_root, args.boris_source, args.toolchain_image, args.toolchain_proof, args.toolchain_context, args.toolchain_container)
+    elif args.operation == "build-image":
+        if not all((args.repo_root, args.context, args.tag)):
+            parser.error("build requires repo-root, context and private tag")
+        build_image(args.repo_root, args.context, args.tag)
+    else:
+        verify_source(SOURCE_ROOT, load_manifest(SOURCE_MANIFEST))
+
+
+if __name__ == "__main__":
+    import sys
+    if __package__ in (None, ""):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     main()

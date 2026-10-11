@@ -155,4 +155,109 @@ class BorisCpuAbiTests(unittest.TestCase):
                 else:(args[1]/"logs/boris-cpu-abi-observe.stdout.log").write_bytes(b"x"*4097)
                 with self.assertRaises(ValueError):b.validate_abi_outputs(*args)
 
+class BorisSourceImageTests(unittest.TestCase):
+    def fixture(self, root):
+        source = root/"source"; (source/"Boris").mkdir(parents=True)
+        (source/"Boris/example.cpp").write_bytes(b"source")
+        entries = [dict(path="Boris/example.cpp", size=6, mode="100644", sha256=b.digest(source/"Boris/example.cpp"))]
+        manifest = dict(schema_version="fullmag.boris.image_source.v1", upstream_commit=b.PIN, files=entries,
+                        source_tree_sha256=hashlib.sha256(b.canonical(entries)).hexdigest())
+        (root/"source_manifest.json").write_bytes(b.canonical(manifest))
+        image = "sha256:"+"a"*64
+        context = dict(example="frozen toolchain")
+        (root/"toolchain_context.json").write_bytes(b.canonical(context))
+        proof = dict(qualification="TOOLCHAIN_ONLY_NOT_SOLVER_QUALIFIED", gxx="g++", readelf="readelf", linker_paths={"libtbb.so":"/lib/tbb"}, context_sha256=b.digest(root/"toolchain_context.json"))
+        (root/"toolchain_proof.json").write_bytes(b.canonical(proof))
+        (root/"toolchain_container.json").write_bytes(b.canonical(dict(Image=image, State=dict(ExitCode=0))))
+        (root/"toolchain_inspect.json").write_bytes(b.canonical(dict(Id=image)))
+        (root/"boris_cpu.py").write_bytes(Path(b.__file__).read_bytes())
+        (root/"Dockerfile").write_bytes(Path(b.__file__).with_name("Dockerfile.boris-cpu").read_bytes())
+        files = [dict(path=p.relative_to(root).as_posix(), size=p.stat().st_size, sha256=b.digest(p)) for p in root.rglob("*") if p.is_file()]
+        files.sort(key=lambda e:e["path"])
+        value = dict(schema="fullmag.boris.source-context.v1", upstream_commit=b.PIN, toolchain_image=image,
+                     worktree_id="test", producer_sha256=b.digest(Path(b.__file__)), files=files, source_tree_sha256=manifest["source_tree_sha256"])
+        (root/"source_context.json").write_bytes(b.canonical(value))
+        return value
+
+    def test_clean_git_filter_preserves_crlf_bytes(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp)
+            subprocess.run(["git", "init", str(root)], check=True, capture_output=True)
+            (root/".gitattributes").write_bytes(b"*.cpp text eol=crlf\n")
+            raw=b"line one\r\nline two\r\n"; (root/"example.cpp").write_bytes(raw)
+            ids=b.clean_blob_ids(root,["example.cpp"])
+            canonical=b"line one\nline two\n"
+            self.assertEqual(ids["example.cpp"],hashlib.sha1(b"blob "+str(len(canonical)).encode()+b"\0"+canonical).hexdigest())
+            self.assertEqual((root/"example.cpp").read_bytes(),raw)
+            self.assertNotEqual(ids["example.cpp"],hashlib.sha1(b"blob "+str(len(raw)).encode()+b"\0"+raw).hexdigest())
+
+    def test_frozen_context_rejects_tamper_unlisted_duplicate_escape(self):
+        for case in ("valid", "tamper", "unlisted", "duplicate", "escape"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp:
+                root=Path(temp); value=self.fixture(root)
+                if case=="valid":
+                    self.assertEqual(b.validate_context(root),value)
+                    continue
+                if case=="tamper":(root/"source/Boris/example.cpp").write_bytes(b"changed")
+                elif case=="unlisted":(root/"unexpected").write_bytes(b"new")
+                elif case=="duplicate":
+                    value["files"].append(value["files"][0]);(root/"source_context.json").write_bytes(b.canonical(value))
+                else:
+                    value["files"][0]["path"]="../escape";(root/"source_context.json").write_bytes(b.canonical(value))
+                with self.assertRaises(ValueError):b.validate_context(root)
+
+    def test_source_dockerfile_is_offline_and_has_no_compilation(self):
+        text=Path(b.__file__).with_name("Dockerfile.boris-cpu").read_text()
+        self.assertIn("RUN --network=none python3 -B",text)
+        self.assertIn("USER 65532:65532",text)
+        for forbidden in ("g++", "apt-get", "pip install", "cargo", "cmake"):
+            self.assertNotIn(forbidden,text)
+
+    def test_build_alias_offline_and_layer_prefix_admission(self):
+        import fullmag_storage as storage
+        import contextlib, types
+        for foreign_layers in (False,True):
+            with self.subTest(foreign_layers=foreign_layers), tempfile.TemporaryDirectory() as temp:
+                root=Path(temp);context=root/"tmp/boris-cpu-image-test";context.mkdir(parents=True)
+                value=self.fixture(context); image=value["toolchain_image"]; built="sha256:"+"b"*64
+                layout=dict(storage_root=str(root),build_root=str(root/"builds"),worktree_id="test")
+                base=dict(Id=image,RootFS=dict(Layers=["layer-a"]),Config=dict(User="65532:65532"))
+                (context/"toolchain_inspect.json").write_bytes(b.canonical(base))
+                actual=dict(Id=built,RootFS=dict(Layers=["foreign" if foreign_layers else "layer-a","layer-b"]),Config=dict(User="65532:65532"))
+                commands=[]
+                def run(command,**kwargs):
+                    commands.append(command)
+                    if "build" in command:
+                        self.assertIn("--pull=false",command)
+                        self.assertEqual(command[command.index("--network")+1],"none")
+                        self.assertTrue(command[command.index("--build-arg")+1].startswith("TOOLCHAIN_IMAGE=fullmag/boris-cpu-base:"))
+                        Path(command[command.index("--iidfile")+1]).write_text(built)
+                    return types.SimpleNamespace(returncode=0)
+                with patch.object(storage,"resolve_layout",return_value=layout),patch.object(storage,"validate_path",side_effect=lambda p,*a:Path(p)),patch.object(storage,"file_lock",return_value=contextlib.nullcontext()),patch.object(b,"validate_context",return_value=value),patch.object(b,"image_inspect",side_effect=[base,actual]),patch.object(b.subprocess,"check_output",return_value=json.dumps([dict(Id=image)]).encode()),patch.object(b.subprocess,"run",side_effect=run):
+                    if foreign_layers:
+                        with self.assertRaisesRegex(ValueError,"layers"):
+                            b.build_image(root,context,"fullmag/boris-cpu:test")
+                    else:b.build_image(root,context,"fullmag/boris-cpu:test")
+                receipt=json.loads(next((root/"builds").glob("*/terminal-receipt.json")).read_text())
+                self.assertEqual(receipt["status"],"FAILED" if foreign_layers else "SUCCEEDED_SOURCE_IMAGE_ONLY")
+                self.assertFalse(receipt["native_compilation_executed"])
+                self.assertEqual(len(commands),2)
+
+    def test_failed_admission_has_terminal_receipt_without_docker(self):
+        import fullmag_storage as storage
+        import contextlib
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);context=root/"tmp/boris-cpu-image-test";context.mkdir(parents=True)
+            layout=dict(storage_root=str(root),build_root=str(root/"builds"),worktree_id="test")
+            with patch.object(storage,"resolve_layout",return_value=layout), patch.object(storage,"validate_path",side_effect=lambda p,*a:Path(p)), patch.object(storage,"file_lock",return_value=contextlib.nullcontext()), patch.object(b,"validate_context",side_effect=ValueError("tampered")), patch.object(b.subprocess,"run",side_effect=AssertionError("no Docker mutation")):
+                with self.assertRaisesRegex(ValueError,"tampered"):
+                    b.build_image(root,context,"fullmag/boris-cpu:test")
+            receipts=list((root/"builds").glob("*/terminal-receipt.json"))
+            self.assertEqual(len(receipts),1)
+            receipt=json.loads(receipts[0].read_text())
+            self.assertEqual(receipt["status"],"FAILED")
+            self.assertFalse(receipt["native_compilation_executed"])
+            self.assertFalse(receipt["operator_changed"])
+
 if __name__=="__main__":unittest.main()

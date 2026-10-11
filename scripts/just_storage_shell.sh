@@ -298,6 +298,22 @@ case "${recipe}" in
     ;;
 esac
 
+# Fixed BORIS source capture/provisioning admits immutable toolchain proof.
+case "${recipe}" in
+  *"scripts/local_runner/boris_cpu.py"*)
+    boris_source_pattern="^[^[:space:]]+ \"[^\"]+/scripts/local_runner/boris_cpu.py\" prepare-image-context --repo-root '([^']+)' --boris-source '([^']+)' --toolchain-image '(sha256:[a-f0-9]{64})' --toolchain-proof '([^']+)' --toolchain-context '([^']+)' --toolchain-container '([a-f0-9]{64})'$"
+    if [[ "${recipe}" =~ ${boris_source_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/local_runner/boris_cpu.py" prepare-image-context --repo-root "${repo_root}" --boris-source "${BASH_REMATCH[2]}" --toolchain-image "${BASH_REMATCH[3]}" --toolchain-proof "${BASH_REMATCH[4]}" --toolchain-context "${BASH_REMATCH[5]}" --toolchain-container "${BASH_REMATCH[6]}"
+    fi
+    boris_source_image_pattern="^[^[:space:]]+ \"[^\"]+/scripts/local_runner/boris_cpu.py\" build-image --repo-root '([^']+)' --context '([^']+)' --tag '(fullmag/boris-cpu:[a-z0-9][a-z0-9_.-]{0,100})'$"
+    if [[ "${recipe}" =~ ${boris_source_image_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/local_runner/boris_cpu.py" build-image --repo-root "${repo_root}" --context "${BASH_REMATCH[2]}" --tag "${BASH_REMATCH[3]}"
+    fi
+    echo "[fullmag just] invalid BORIS source provisioning recipe" >&2
+    exit 2
+    ;;
+esac
+
 # Runner actions own their storage preflight and per-job/per-worktree locks.
 # Holding the generic worktree lock while `wait` polls would prevent the
 # coordinator from executing that same worktree's queued job.

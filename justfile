@@ -131,8 +131,12 @@ runner-boris-toolchain-image context tag:
     @{{storage_python}} "{{repo_root}}/scripts/local_runner/boris_toolchain.py" build-image --repo-root {{quote(repo_root)}} --context {{quote(context)}} --tag {{quote(tag)}}
 
 # Capture clean pinned BORIS sources under resolver-owned storage; no build.
-runner-boris-image-context boris_source toolchain_image:
-    @{{storage_python}} "{{repo_root}}/scripts/local_runner/boris_cpu.py" prepare-image-context --repo-root {{quote(repo_root)}} --boris-source {{quote(boris_source)}} --toolchain-image {{quote(toolchain_image)}}
+runner-boris-image-context boris_source toolchain_image toolchain_proof toolchain_context toolchain_container:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/boris_cpu.py" prepare-image-context --repo-root {{quote(repo_root)}} --boris-source {{quote(boris_source)}} --toolchain-image {{quote(toolchain_image)}} --toolchain-proof {{quote(toolchain_proof)}} --toolchain-context {{quote(toolchain_context)}} --toolchain-container {{quote(toolchain_container)}}
+
+# This provisions source bytes only; solver compilation uses runner-boris-build.
+runner-boris-image context tag:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/boris_cpu.py" build-image --repo-root {{quote(repo_root)}} --context {{quote(context)}} --tag {{quote(tag)}}
 
 # External CPU reference uses the same single heavy-build queue after opt-in.
 runner-boris-build mode ref="":

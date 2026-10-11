@@ -129,15 +129,42 @@ TOOLCHAIN_ONLY_NOT_SOLVER_QUALIFIED. Nie aktywowano profilu operatora;
 kolejka i istniejące profile pozostają zachowane. Kontrakt i granice dowodu:
 [nota 0970](../physics/0970-spin-hall-drift-diffusion-transport.md#boris-offline-toolchain-provisioning).
 
-`just runner-boris-image-context <checkout-BORIS> sha256:<image-id-toolchaina>`
-przygotowuje ograniczony kontekst pod resolverowym `storage/tmp`. Wymaga czystego
-checkoutu dokładnie `048503d2ca6475e91b073eb1762ecf9d3634c3e1`, sprawdza każdy
-blob Git i zapisuje manifest SHA-256. Nie pobiera źródeł ani zależności i nie
-buduje obrazu. Wskazany toolchain musi już mieć g++, readelf, Python embedding
-oraz biblioteki developerskie FFTW3, X11 i TBB; sam argument image ID nie jest
-dowodem ich obecności.
+Przypięty source-image wymaga rzeczywistego zachowanego preflight kontenera:
 
-Po odrębnym provisioningu, weryfikacji obrazu oraz jawnym opt-in operatora
+```text
+just runner-boris-image-context <checkout-BORIS> sha256:<toolchain-image-id> <runtime-preflight.json> <toolchain-context> <pełny-container-id>
+just runner-boris-image <zwrócony-source-context> fullmag/boris-cpu:<prywatny-tag>
+```
+
+Receptura przekazuje dodatkowo `--repo-root`; CLI `prepare-image-context`
+wymaga wszystkich sześciu flag. JSON musi odpowiadać rzeczywistemu outputowi
+bind mountu `/proof` terminalnego UID65532 readonly/network-none kontenera,
+z dokładną komendą preflight i exit 0. Helper odtwarza frozen dependency/wheel
+admission oraz wiąże context/lock/manifest, image i pełny container ID.
+Sam image ID lub caller JSON nie dowodzi preflight.
+
+`boris_cpu.py::prepare_context` wymaga czystego checkoutu
+`048503d2ca6475e91b073eb1762ecf9d3634c3e1` pod storage D. Git clean-filter
+identities dopuszczają deklarowaną politykę CRLF; manifest przypina dokładne
+checkout bytes i SHA256 każdego pliku. Kontekst zachowuje źródła, helper,
+Dockerfile i toolchain proof/inspect/context/container. Producent odmawia
+drift, symlinków i nieoczekiwanych plików. Build jest offline, finalny
+USER 65532:65532, z walidacją źródeł w obrazie; nie kompiluje BORIS.
+
+Rzeczywisty build przez `just` ma exit 0 i image
+`sha256:545279e00703d60dcaf33d455461ba90e0dea7ec5647e96392bbc9246c21b6a6`.
+Receipt i osobny `root-source-readback.json` są pod
+`windows-native/boris-source-image-b5ffb0df863d47f5b76ff5e2d4af4e2c/`.
+Niezależny readback UID65532, readonly/network-none, bez bind mountów,
+1 CPU/512 MiB/32 pids, exit 0, sprawdził `verify_source`: 1133 plików,
+26427761 bajtów, source-tree SHA256
+`0d0d924321c6b0d664f3e862a7a73d7c31a1c4c14d2a7f973b6238e2a58161a6`,
+NumPy 2.2.6 i Matplotlib 3.8.4. SUCCEEDED_SOURCE_IMAGE_ONLY oraz
+SOURCE_AND_TOOLCHAIN_ONLY_NOT_SOLVER_QUALIFIED nie oznaczają solver build PASS.
+Dziewiętnaście interpretowanych regresji producenta PASS obejmuje actual
+Git CRLF clean-filter capture; kompilacja, ABI i solver nie zostały wykonane.
+
+Po opisanym provisioningu/readback oraz odrębnym jawnym opt-in operatora
 `just runner-boris-build commit <pełny-SHA-Fullmaga>` zgłasza build do tej samej
 kolejki. Konfiguracja koordynatora wymaga `--enable-boris-cpu`; profil workera
 musi wskazywać niezmienny obraz z przypiętymi źródłami. Aktualizacja operatora
@@ -148,7 +175,7 @@ Worker stosuje stały overlay CPU, kompiluje źródła C++ i sprawdza zależnoś
 ELF. Receipt wiąże obraz, kapsułę Fullmaga, oryginalne źródła, overlay i binarium.
 Sukces kompilacji nie dowodzi precyzji wykonania ani poprawności adaptera.
 Provisioning toolchaina i jego preflight mają powyższy ograniczony dowód PASS.
-BORIS source-image, terminalny build/witness ABI, admission rzeczywistego runtime
+Terminalny build BORIS/witness ABI, admission rzeczywistego runtime
 i nowe porównanie naukowe pozostają **NOT VERIFIED**.
 
 Źródłowa ścieżka `just run-managed-boris-nf <job-id> coarse|medium|fine`
@@ -164,7 +191,7 @@ artefaktu. Pole `identity_complete` w przekazanym JSON samo nie daje admission.
 Kontrole interpretowane ścieżki runtime po poprawce publikacji: 56 testów i 45 podprzypadków PASS;
 parser oraz validator noty 0970 PASS. Są to dowody źródeł, bez uruchomienia
 BORIS, producenta ABI lub nowego benchmarku. Rzeczywista kwalifikacja nadal
-wymaga przypiętego source-image, terminalnego buildu BORIS i wykonania porównań.
+wymaga terminalnego buildu BORIS i wykonania porównań.
 
 ## Dane, zakończenie i retencja
 
