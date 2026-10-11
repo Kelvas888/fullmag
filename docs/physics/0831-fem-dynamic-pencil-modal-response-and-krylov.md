@@ -5399,3 +5399,11 @@ Istniejąca oddzielna, rzeczywista fixture64 mode z jednostronnym pool
 zachowuje wymaganie obserwowanego retry i odmowy po wyczerpaniu budżetu.
 Nie zmieniamy jej ani decyzji retry w solverze. Zachowujemy tolerancje,
 bramki residualu i status count_certificate=not_performed.
+
+
+P4: start refinement zachowuje zależność od rzeczywistego effective request
+base. Regresja `FrequencyWindowCoversBothClippedEdges` zbiera requesty
+base z bounded JSON observations i weryfikuje initial refinement zgodnie
+z istniejącą polityką `solve_poisson_airbox_modal_eigen_cpu_schur`.
+Nominalny seed4 nie jest gwarantowaną wartością wykonania. To korekta
+asercji, bez zmiany operatora, tolerancji, coverage lub independent count.

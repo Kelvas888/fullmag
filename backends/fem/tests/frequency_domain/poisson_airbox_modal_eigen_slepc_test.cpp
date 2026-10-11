@@ -1870,13 +1870,38 @@ void FrequencyWindowCoversBothClippedEdges()
               upper_edge,
               "\"lower_edge_covered\":true,\"upper_edge_covered\":true"),
           "upper refinement subwindow must certify both interval endpoints independently");
+    // Refinement starts above the actual base-pass request, which may have
+    // grown while recovering its guards. Do not assume the nominal seed of 4.
+    double base_request = 0.0;
+    const char *base_cursor = result.executed_subwindows_json;
+    const char *base_anchor = "\"pass\":\"base\",\"subwindow_index\":";
+    while (const char *base_match = std::strstr(base_cursor, base_anchor)) {
+        const std::string base = json_object_after(base_cursor, base_anchor);
+        check(!base.empty(), "base request observation must be a bounded JSON object");
+        const double requested = json_number_after(base.c_str(), "\"requested_mode_count\":");
+        check(requested >= 2.0 && requested <= 4.0,
+              "base request must stay inside this fixture's authored budget");
+        base_request = std::max(base_request, requested);
+        base_cursor = base_match + std::strlen(base_anchor);
+    }
+    check(base_request > 0.0, "refinement must have an observed base-pass request");
+    const double initial_refinement_request = std::min(8.0, std::max(4.0, base_request + 1.0));
     for (const char *edge : {lower_edge, upper_edge}) {
         const std::string observation = json_object_after(result.executed_subwindows_json, edge);
         const double requested = json_number_after(observation.c_str(), "\"requested_mode_count\":");
         const double retries = json_number_after(observation.c_str(), "\"retry_count\":");
-        check(requested >= 4.0 && requested <= 8.0 && retries >= 0.0 &&
-                  (retries == 0.0 ? requested == 4.0 : requested > 4.0) &&
-                  contains(observation.c_str(), "\"local_coverage_certified\":true"),
+        const bool covered_within_budget =
+            requested >= initial_refinement_request && requested <= 8.0 && retries >= 0.0 &&
+            (retries == 0.0 ? requested == initial_refinement_request
+                           : requested > initial_refinement_request) &&
+            contains(observation.c_str(), "\"local_coverage_certified\":true");
+        if (!covered_within_budget) {
+            std::cerr << "clipped-edge request=" << requested << " retries=" << retries
+                      << " base_request=" << base_request
+                      << " initial_refinement_request=" << initial_refinement_request
+                      << " observation=" << observation.substr(0u, 4096u) << '\n';
+        }
+        check(covered_within_budget,
               "clipped edge discovery must either already cover the endpoints or grow within its request budget");
     }
 }

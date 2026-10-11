@@ -735,3 +735,20 @@ samym zaakceptowanym fizycznym row/step/time i generation. Oddzielny
 negative stale-generation test pozostał. Produkcji i globalnych helperów
 nie zmieniono. Root diff review PASS, rustfmt parser-only exit0; testy
 wykonuje wyłącznie GHA. Hosted wynik zmienionych fixtures jeszcze wymagany.
+
+
+## P4 — początek refinement zależy od rzeczywistego base
+
+#38123800798 na d33822c150d82e48fbbfe97ec72676ced5f547f2:
+compile oraz phase/typed transport/damping admission PASS (3/4 CTest).
+Positive clipped-edge fixture przeszła solve, final count i oba endpoint
+guards; zatrzymała się na nowej asercji request/retry. To asercja stale
+nominalnego seed4: production start refinement jest ograniczonym maksimum
+nominalnego seed i actual effective base request+1. Po basegrowth do4
+poprawny refinement może zacząć od5 bez retry. Nowa asercja odczytuje
+każdy actual base request (budżet2..4), wyprowadza initial refinement
+z tej historii i zachowuje cap8, retrygrowth oraz localcoverage cert.
+Bounded failure observation4096chars umożliwi rozpoznanie ewentualnej
+dalszej awarii bez wielkiego JSONdump. Solver i rzeczywista negative64
+retry fixture nie zostały zmienione. Niezależny source review PASS;
+wykonanie tej wersji pozostaje NOT VERIFIED do kolejnego GHA.

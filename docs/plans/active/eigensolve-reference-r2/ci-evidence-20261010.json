@@ -357,7 +357,7 @@
       "actual_query_count": 8,
       "actual_monitor_iteration": 7,
       "actual_shift_type": "MAT_SHIFT_NONZERO",
-      "actual_shift_amount": 1.490116119384766e-8,
+      "actual_shift_amount": 1.490116119384766e-08,
       "actual_getter_codes": 0,
       "raw_solver_status": 4,
       "factor_perturbation_measured": false,
@@ -405,11 +405,21 @@
           "scope": "earlier_checkpoint"
         }
       ],
-      "failure": "native job completed with exit code1; detailed receipt/CTest log not yet decoded",
+      "failure": "FrequencyWindowCoversBothClippedEdges: compound request/retry assertion incorrectly fixes zero-retry refinement seed at4 instead of observed base-pass-dependent policy",
       "job_id": 114423830438,
       "artifact_id": 11696722255,
       "artifact_digest": "sha256:d89e4d7bccb8610f748cc6a2c8b7260bb5597b9199524f724875aeaf58ee4ea5",
-      "detailed_test_results": "NOT VERIFIED"
+      "detailed_test_results": "3/4 CTest passed; selected-window suite stopped at positive clipped-edge fixture",
+      "native_build": "passed",
+      "passed_ctests": [
+        "fem_modal_eigen_phase_convention_contract",
+        "fem_modal_eigen_typed_cpu_transport_contract",
+        "fem_modal_eigen_damping_admission_contract"
+      ],
+      "failed_ctests": [
+        "fem_poisson_airbox_selected_window_contract"
+      ],
+      "receipt_sha256": "f9c1d5907a861aab8d27ae6bc67b3f46a625de2a4d56b34a0aad1054e49c4c29"
     },
     {
       "run_id": 38124461222,
