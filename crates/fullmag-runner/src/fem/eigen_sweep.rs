@@ -818,6 +818,19 @@ fn native_field_sweep_sample_identity(
             NativeFieldSweepSampleIdentity::from_json(sample_diagnostics, context)?
         }
     };
+    for (mode_index, mode) in modes.iter().enumerate().skip(1) {
+        let mode_context = format!("native field sweep sample {sample_index} spectrum mode {mode_index}");
+        let candidate = NativeFieldSweepSampleIdentity::from_json(mode, &mode_context)?;
+        for key in NATIVE_FIELD_SWEEP_SAMPLE_IDENTITY_KEYS {
+            if candidate.get(key) != identity.get(key) {
+                return Err(RunError {
+                    message: format!(
+                        "native field sweep sample {sample_index} has contradictory {key} in spectrum mode {mode_index}"
+                    ),
+                });
+            }
+        }
+    }
     if let (Some(sample_diagnostics), Some(_mode)) = (sample_diagnostics, modes.first()) {
         for key in NATIVE_FIELD_SWEEP_SAMPLE_IDENTITY_KEYS {
             if sample_diagnostics.get(key).is_none() {
@@ -2021,4 +2034,35 @@ mod native_field_sweep_identity_tests {
         .expect_err("mode and sample-level identities must not disagree");
         assert!(error.message.contains("contradictory operator_input_signature_sha256"));
     }
+    #[test]
+    fn every_mode_in_a_field_sweep_sample_must_share_valid_provenance() {
+        let first = identity_values();
+        let diagnostics = diagnostics_for(4, first.clone());
+        let expected = NativeFieldSweepSampleIdentity::from_json(&first, "spectrum mode").unwrap();
+        for diagnostic in [serde_json::json!({}), diagnostics] {
+            assert_eq!(
+                native_field_sweep_sample_identity(&[first.clone(), first.clone()], &diagnostic, 4).unwrap(),
+                expected
+            );
+            for key in NATIVE_FIELD_SWEEP_SAMPLE_IDENTITY_KEYS {
+                let mut contradictory = first.clone();
+                contradictory[key] = serde_json::json!(format!("sha256:{}", "d".repeat(64)));
+                for modes in [
+                    vec![first.clone(), contradictory.clone()],
+                    vec![contradictory.clone(), first.clone()],
+                ] {
+                    assert!(native_field_sweep_sample_identity(&modes, &diagnostic, 4).is_err());
+                }
+                for invalid in [serde_json::Value::Null, serde_json::json!("invalid-digest")] {
+                    let mut later = first.clone();
+                    later[key] = invalid;
+                    assert!(native_field_sweep_sample_identity(&[first.clone(), later], &diagnostic, 4).is_err());
+                }
+                let mut missing = first.clone();
+                missing.as_object_mut().unwrap().remove(key);
+                assert!(native_field_sweep_sample_identity(&[first.clone(), missing], &diagnostic, 4).is_err());
+            }
+        }
+    }
+
 }

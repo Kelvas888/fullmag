@@ -827,3 +827,10 @@ UI #38139947223:114 testów PASS (w tym9 frequencyRenderModels), pełny typechec
 React Doctor baseline assessment: diagnostics.json z #38076746462 i #38139947223 są identyczne (617 wpisów, SHA2562cb699880a6151ccb7818ac1967279b7c1afb6bf2bfa2520d8ae847a255a4030). Nowa poprawka nie dodaje findings. Pełny workflow pozostaje czerwony; nie wyłączono Doctora. Model regressions/typecheck/architecture mają własny PASS; browser nadal NOT VERIFIED.
 
 Field follow-up source fix: merger eigen_sweep zachowuje niepusty mode_output_selection_path z template w final branches.v2. Historyczny template bez pointera nadal go nie publikuje. Root diff względem d1c160: wyłącznie9 dodanych linii/1 zmieniona; dotychczasowa regresja zachowana. Parser/diff PASS; ponowne GHA wymagane.
+
+
+## Kolejna kontrola sweepa i provenance każdego modu
+
+#38140440374 potwierdził poprawiony branches pointer, lecz dalsza paused-prefix regression ujawniła odrzucanie requestu dla przyszłej nieobliczonej próbki1. Naprawa musi zachować planned intent i publikować accepted prefix; invalid poza pełnym planem pozostaje błędem. Nie uznano całej publikacji za zakończoną.
+
+Nowe4241399051 jest zasadne: sample identity wcześniej sprawdzało wyłącznie pierwszy mod i diagnostykę. Dodano ścisłe sprawdzanie trzech hashów każdego dalszego modu przed publikacją, bez zmiany legalnych wartości ani empty-sample fallback. Regresja obejmuje zgodne mody, obie kolejności konfliktu dla każdego hasha, brak/null/malformed w dalszym modzie z diagnostyką i bez. Parser/diff PASS; GHA wykonanie wymagane.

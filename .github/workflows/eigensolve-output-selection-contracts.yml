@@ -32,6 +32,8 @@ jobs:
         run: git rev-parse HEAD
       - name: Run output selection contracts
         run: cargo test --locked -p fullmag-runner --lib eigen::output_selection::tests -- --nocapture
+      - name: Validate provenance across all sweep modes
+        run: cargo test --locked -p fullmag-runner --lib fem::eigen_sweep::native_field_sweep_identity_tests -- --nocapture
       - name: Run actual single-sample writer contract
         run: |
           cargo test --locked -p fullmag-runner --lib fem::eigen_tests::native_eigen_v2_mode_metadata_preserves_operator_provenance -- --exact --nocapture | tee "$RUNNER_TEMP/modal-single-writer.log"

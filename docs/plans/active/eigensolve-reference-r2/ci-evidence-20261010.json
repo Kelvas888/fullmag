@@ -541,6 +541,18 @@
       "react_doctor_baseline_run": 38076746462,
       "react_doctor_diagnostics_equal": true,
       "react_doctor_diagnostics_sha256": "2cb699880a6151ccb7818ac1967279b7c1afb6bf2bfa2520d8ae847a255a4030"
+    },
+    {
+      "run_id": 38140440374,
+      "sha": "37744c3fdf6daabfe4c1d2d9f579ce5be598b047",
+      "conclusion": "failure",
+      "scope": "field_selection_tracked_bias_including_interrupted_prefix",
+      "prior_branch_pointer_assertion": "passed",
+      "output_selection_tests_passed": 15,
+      "actual_single_writer_test_passed": true,
+      "failure": "paused tracked sweep rejects requested future sample1 as unknown; eigen_path.rs1727",
+      "log_sha256": "0754b37a93f75964fae602a12df8aa39a91ff86e96d3237cb18109f12ee0fecd",
+      "qualification_claimed": false
     }
   ]
 }
