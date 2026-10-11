@@ -747,6 +747,22 @@ class ContainerClientTests(unittest.TestCase):
         self.assertEqual({}, json.loads(stop_request.data.decode("utf-8")))
         self.assertNotIn(secret["token"], repr(public))
 
+    def test_authenticated_request_accepts_only_bounded_positive_timeout_overrides(self):
+        self.configure()
+        for requested, expected in [(0.25, 0.25), (1000.0, container_client.HTTP_TIMEOUT_SECONDS)]:
+            with self.subTest(timeout=requested), patch.object(
+                container_client, '_open_url', return_value=FakeHTTPResponse({'ok': True})
+            ) as transport:
+                self.assertEqual({'ok': True}, container_client.request(
+                    self.layout, 'alice', 'GET', '/health', timeout=requested,
+                ))
+                self.assertEqual(expected, transport.call_args.args[1])
+        for invalid in [True, 0, -1, float('inf'), float('nan'), '5']:
+            with self.subTest(timeout=invalid), patch.object(container_client, '_open_url') as transport:
+                with self.assertRaisesRegex(container_client.ContainerClientError, 'positive and finite'):
+                    container_client.request(self.layout, 'alice', 'GET', '/health', timeout=invalid)
+                transport.assert_not_called()
+
     def test_local_http_opener_disables_proxies_and_never_follows_redirects(self):
         proxy_handlers = [
             handler for handler in container_client._LOCAL_OPENER.handlers if isinstance(handler, urllib.request.ProxyHandler)

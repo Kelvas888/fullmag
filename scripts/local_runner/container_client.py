@@ -14,6 +14,7 @@ record contains the API token.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -884,7 +885,7 @@ def _request_path(path: str) -> str:
     return parsed.path
 
 
-def _open_url(request_object: urllib.request.Request, timeout: int):
+def _open_url(request_object: urllib.request.Request, timeout: float):
     return _LOCAL_OPENER.open(request_object, timeout=timeout)
 
 
@@ -894,6 +895,8 @@ def request(
     method: str,
     path: str,
     payload: object | None = None,
+    *,
+    timeout: float | None = None,
 ) -> Any:
     """Perform an authenticated bounded JSON request to the host-local API."""
 
@@ -915,7 +918,14 @@ def request(
         headers["Content-Type"] = "application/json"
     url = f"{public['endpoint']}{path}"
     request_object = urllib.request.Request(url, data=body, headers=headers, method=method)
-    timeout = HTTP_SUBMIT_TIMEOUT_SECONDS if method == "POST" and path == "/jobs" else HTTP_TIMEOUT_SECONDS
+    default_timeout = HTTP_SUBMIT_TIMEOUT_SECONDS if method == "POST" and path == "/jobs" else HTTP_TIMEOUT_SECONDS
+    if timeout is None:
+        timeout = default_timeout
+    elif isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or (isinstance(timeout, float) and not math.isfinite(timeout)) or timeout <= 0:
+        raise ContainerClientError("Runner API timeout must be positive and finite")
+    else:
+        # A caller may shorten the operation deadline, never extend its bound.
+        timeout = float(min(timeout, default_timeout))
     try:
         with _open_url(request_object, timeout) as response:
             length_header = response.headers.get("Content-Length")

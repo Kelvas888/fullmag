@@ -884,3 +884,8 @@ Dodatkowy guard poprawności finalizacji: inferred/explicit Completed sweep z li
 4240898368:shared monotonic deadline60s, perHTTPtimeout5s ograniczony remaining; maks60 attempts,1s waits ograniczone remaining; błędnyprofil kończy natychmiast, brak cleanup/replacement. Fakeclock potwierdza cold-start10s oraz totaldeadline wolnychrequests; AST/source PASS,GHA pending.
 
 4240898364:policy-only correction względem naukowego właściciela0600 i actual shared-domain owner eigen_mass_metric canonical_shared_domain_phases. Empty=all już supported w runtime; explicit proper subset nie jest supported przy assembler unionallpairs i phase graph. Helper rozpoznaje emptyall/fullset; planner dynamiclane odrzuca subset bez względu na obecnośćcontrols. Generic/scalarFloquet filtrowanie pozostaje. Niezależny source review potwierdził invariant; publicplanner emptycontrols/subsetwithwithoutcontrols oraz existinggeneric regressions przygotowane. Runtime/science NOT VERIFIED; nie rozszerzono deklaracji capability do subset.
+
+
+#38144113006 publicplanner workflow SUCCESS:emptyall controls oraz subsetrejectwith/withoutcontrols i genericFloquet PASS. Brak native capability qualification.
+
+#38144011041 FAIL:po2errors/34clienttests naobu platformach; real request nie miał nowego timeout keyword, podczas gdy mocksgo akceptowały. Uzupełniono backwardcompatible keyword-only request timeout z finite/positive validation i clampdoexistingoperationbound. Nowy test przechodzi actualrequest do mocked_open_url, sprawdza appliedtimeout/clamp oraz invalid beztransportu. Nie osłabiono assertions ani autoryzacji/profile matching. Rerunwymagany.

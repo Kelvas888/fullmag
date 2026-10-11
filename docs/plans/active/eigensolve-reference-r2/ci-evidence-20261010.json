@@ -659,6 +659,28 @@
       "log_sha256": "69aaaa141389d095149cfaf7a6230bcc641d2e093f69138ef9769790139c8ba4",
       "host_cleanup_performed": false,
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38144011041,
+      "sha": "1a7087841e4d6bac9591699354068f83add19910",
+      "conclusion": "failure",
+      "scope": "startup_health_client_contracts",
+      "tests_run_per_platform": 34,
+      "errors_per_platform": 2,
+      "failure": "real request signature lacks new timeout keyword; mocked request tests did not cover actual transport entrypoint",
+      "log_sha256": "331ee703eaaaa3a5b6d66cd9fa90a28cebb1f75eb458aeb5ce10f5a6460315ed",
+      "qualification_claimed": false
+    },
+    {
+      "run_id": 38144113006,
+      "sha": "7a0469dbaded0d80921472f2938fa3b1f805e6ae",
+      "conclusion": "success",
+      "scope": "public_Floquet_planner_all_pairs_and_generic_contracts",
+      "named_dynamic_all_pairs_subset_rejection": "passed",
+      "named_generic_Floquet": "passed",
+      "log_sha256": "dd041bcfa11becffa21e6945cc1d48ede8b9ba82fbb0250a21633e8c316d3114",
+      "native_runtime": "NOT VERIFIED",
+      "qualification_claimed": false
     }
   ]
 }
