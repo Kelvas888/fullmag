@@ -863,3 +863,8 @@ Pause #38141462905:control-priority actual named test PASS; checkpoint metadata 
 UI #38141709909:135 tests/8files PASS; typecheck i architecture PASS. Doctor617 diagnostics nadal FAIL. Porównanie z38139947223: tylko dwa source-location records przesunięte; po usunięciu wyłącznie pól pozycji wszystkie diagnostic payloady identyczne. Brak nowego findinga w tym fragmencie, bez wyłączenia bramki. Browser i pomiar czasu nadal NOT VERIFIED.
 
 Interrupted-prefix follow-up: scoped bias selector zachowuje declared sample IDs poza actualacceptedprefix, z empty field-mode set i bez backingbytes dla pending samples. Unknown raw/branch membership jest odroczone wyłącznie jeśli konkretny request obejmuje pending planned sample; accepted-only oraz completed/ordinarycallers pozostają strict. Root review wymagał również unknownraw99/empty-prefix/branch przypadków; dodano je obok actual tracked-bias regression. Brak fabricated modes/branches i IDs poza planem dalej fail. Parser/diff PASS; GHA wymagane.
+
+
+## Retention forced tick 4241442699
+
+Częste terminalne buildy wywołują force tick przed regularnym interval; wcześniej wymuszał execution i przesuwał clock, głodząc runtime. Force teraz zmienia tylko cadence, zachowuje next_automatic_scope gdy runtime_retention_enabled=true. Opt-out nadal execution only, mode preview oraz busy/queue guards nadal blokują automatyczną operację. Mocked preview regression4ticków co60s wymaga execution/runtime/execution/runtime, sprawdza opt-out i preview. AST/diff PASS, GHA retention pending. Nie zmieniono bieżącej polityki hosta, demona ani danych.

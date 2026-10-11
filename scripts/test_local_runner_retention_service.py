@@ -464,6 +464,27 @@ class RetentionServiceTests(unittest.TestCase):
             self.assertEqual(3, preview.call_count)
             self.assertEqual('execution', preview.call_args.kwargs['scope'])
 
+    def test_forced_ticks_alternate_scopes_even_when_builds_finish_before_the_interval(self):
+        self.hub.set_retention_policy({'mode': 'automatic', 'runtime_retention_enabled': True})
+        with patch.object(self.service, 'preview') as preview, \
+                patch('local_runner.retention_service.time.monotonic', return_value=1000.0) as clock:
+            for now in (1000.0, 1060.0, 1120.0, 1180.0):
+                clock.return_value = now
+                self.service.tick(force=True)
+            self.assertEqual(
+                ['execution', 'runtime', 'execution', 'runtime'],
+                [call.kwargs['scope'] for call in preview.call_args_list],
+            )
+            self.assertTrue(all(call.kwargs['automatic'] for call in preview.call_args_list))
+            self.hub.set_retention_policy({'runtime_retention_enabled': False})
+            for now in (1240.0, 1300.0):
+                clock.return_value = now
+                self.service.tick(force=True)
+                self.assertEqual('execution', preview.call_args.kwargs['scope'])
+            self.hub.set_retention_policy({'mode': 'preview'})
+            self.service.tick(force=True)
+            self.assertEqual(6, preview.call_count)
+
     def test_disabling_runtime_during_inventory_cancels_automatic_mutation(self):
         self.hub.set_retention_policy({'mode': 'automatic', 'runtime_retention_enabled': True})
         entered, release = threading.Event(), threading.Event()

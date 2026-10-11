@@ -388,7 +388,7 @@ class RetentionService:
                 return
             self.last_automatic = now
             policy = self.hub.get_retention_policy()
-            scope = self.next_automatic_scope if policy['runtime_retention_enabled'] and not force else 'execution'
+            scope = self.next_automatic_scope if policy['runtime_retention_enabled'] else 'execution'
             self.next_automatic_scope = 'runtime' if scope == 'execution' else 'execution'
             self.preview(automatic=True, scope=scope)
 
