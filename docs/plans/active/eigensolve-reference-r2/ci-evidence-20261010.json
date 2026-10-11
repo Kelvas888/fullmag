@@ -511,6 +511,36 @@
       "qualification_claimed": false,
       "managed_scientific_benchmark": "NOT VERIFIED",
       "gpu": "NOT VERIFIED"
+    },
+    {
+      "run_id": 38139795905,
+      "sha": "14d57a7227ec70718630e5bd9f09097a653a3599",
+      "conclusion": "failure",
+      "scope": "field_selection_actual_tracked_bias_aggregation",
+      "output_selection_tests_passed": 15,
+      "actual_single_writer_test_passed": true,
+      "tracked_bias_aggregation_executed": true,
+      "tracked_bias_aggregation_passed": false,
+      "failure": "final branches.v2.json lacks mode_output_selection_path: actual Null versus expected eigen/mode_output_selection.v1.json at eigen_path.rs:1329; merger rebuilds branch payload and drops field from tracking template",
+      "log_sha256": "46cd2906e909a4500a89ac5cac578731ddfde45fb25a88141eabe66e2a8b0192",
+      "qualification_claimed": false
+    },
+    {
+      "run_id": 38139947223,
+      "sha": "d1c16043544020b5b2d9247306625b569969d95f",
+      "conclusion": "failure",
+      "scope": "frequency_reference_overlay_source_contracts",
+      "focused_tests_passed": 114,
+      "frequency_render_model_tests_passed": 9,
+      "typecheck": "passed",
+      "architecture_hygiene": "passed",
+      "react_doctor": "failure: pre-existing 617 diagnostics exactly equal to baseline38076746462",
+      "browser": "NOT VERIFIED",
+      "log_sha256": "99553034f1765386df5fee71313d713d5963bcb86d7aefb58ce129174e479959",
+      "qualification_claimed": false,
+      "react_doctor_baseline_run": 38076746462,
+      "react_doctor_diagnostics_equal": true,
+      "react_doctor_diagnostics_sha256": "2cb699880a6151ccb7818ac1967279b7c1afb6bf2bfa2520d8ae847a255a4030"
     }
   ]
 }

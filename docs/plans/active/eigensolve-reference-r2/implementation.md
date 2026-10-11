@@ -816,3 +816,14 @@ agregacji ani kwalifikacji CPU/GPU.
 GHA #38138452216 na3d8c25939bfb3da0ee802c5f8c874ae0832b8da4: cztery CTest PASS: damping admission, phase convention, selected-window oraz typed CPU transport. Positive refinement/negative budget/degenerate cluster fixtures rzeczywiście wykonane. Receipt i log mają SHA w ci-evidence. Search stability nie jest niezależnym count; benchmark dynamic-demag, GPU i kompletność widma nadal NOT VERIFIED.
 
 Filtr wykresu dopuszcza imported reference_frequency razem z frequency i analytic_frequency, bez mieszania jednostek i innych wielkości Hz. Testy obejmują sześć kolejności, bramki unit/xUnit oraz model→ECharts. Review wychwycił konieczność objectContaining dla rzeczywistego bogatszego obiektu renderera. Scoped workflow obejmuje zmienione pliki i regresję; wykonanie oraz browser pozostają NOT VERIFIED.
+
+
+## Kolejne terminalne wyniki CI
+
+Field #38139795905:15 selector tests i actual single writer PASS, lecz actual tracked-bias FAIL: final branches metadata nie ma mode_output_selection_path. To rzeczywista niezrealizowana bramka, source correction w toku; nie promowano do completed.
+
+UI #38139947223:114 testów PASS (w tym9 frequencyRenderModels), pełny typecheck i architecture hygiene PASS. Workflow FAIL w React Doctor (9errors,82warnings,score57). Należy ocenić względem wcześniejszej baseline; browser NOT VERIFIED. Zachowano test execution proof niezależnie od czerwonej pełnej bramki.
+
+React Doctor baseline assessment: diagnostics.json z #38076746462 i #38139947223 są identyczne (617 wpisów, SHA2562cb699880a6151ccb7818ac1967279b7c1afb6bf2bfa2520d8ae847a255a4030). Nowa poprawka nie dodaje findings. Pełny workflow pozostaje czerwony; nie wyłączono Doctora. Model regressions/typecheck/architecture mają własny PASS; browser nadal NOT VERIFIED.
+
+Field follow-up source fix: merger eigen_sweep zachowuje niepusty mode_output_selection_path z template w final branches.v2. Historyczny template bez pointera nadal go nie publikuje. Root diff względem d1c160: wyłącznie9 dodanych linii/1 zmieniona; dotychczasowa regresja zachowana. Parser/diff PASS; ponowne GHA wymagane.

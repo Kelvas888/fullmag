@@ -1614,7 +1614,7 @@ fn merge_bias_field_sweep_runs_with_terminal(
         object.insert("tracking_score_source".to_string(), tracking_score_source.clone());
         object.insert("modal_overlap_available".to_string(), modal_overlap_available.clone());
     }
-    let branches_payload = serde_json::json!({
+    let mut branches_payload = serde_json::json!({
         "schema_version": "eigen_branches.v2",
         "solver_model": summary["solver_kind"],
         "tracking_policy_availability": tracking_policy_availability,
@@ -1626,6 +1626,14 @@ fn merge_bias_field_sweep_runs_with_terminal(
         "branches": branches.clone(),
         "diagnostics": branch_diagnostics,
     });
+    if let Some(path) = branch_payload_template
+        .as_ref()
+        .and_then(|value| value.get("mode_output_selection_path"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|path| !path.is_empty())
+    {
+        branches_payload["mode_output_selection_path"] = serde_json::json!(path);
+    }
     artifacts.push(json_artifact("eigen/branches.v2.json", &branches_payload)?);
     artifacts.push(json_artifact(
         "eigen/branches.json",

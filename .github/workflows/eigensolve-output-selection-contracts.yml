@@ -8,6 +8,7 @@ on:
       - 'crates/fullmag-runner/src/eigen/output_selection.rs'
       - 'crates/fullmag-runner/src/fem/eigen_output.rs'
       - 'crates/fullmag-runner/src/fem/eigen_path.rs'
+      - 'crates/fullmag-runner/src/fem/eigen_sweep.rs'
       - 'crates/fullmag-runner/src/fem/eigen_execution.rs'
       - 'crates/fullmag-runner/src/fem/eigen_native_artifacts.rs'
       - 'crates/fullmag-runner/src/fem/eigen_native_window.rs'
