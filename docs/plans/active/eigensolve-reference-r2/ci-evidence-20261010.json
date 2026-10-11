@@ -787,6 +787,21 @@
       "head_sha_verified_after_ACK": true,
       "private_runtime_attestation": "NOT VERIFIED",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38149842014,
+      "sha": "be02a211f0a359dd9e81d90cec5f66bba9a12f4b",
+      "conclusion": "failure",
+      "scope": "postprocessing_definition_history_invalidation",
+      "tests_passed": 177,
+      "test_files": 12,
+      "new_history_regressions_passed": 10,
+      "complete_typecheck": "passed",
+      "architecture": "passed",
+      "React_Doctor": "failure:617 diagnostics semantically unchanged vs38148168315 ignoring only source positions",
+      "log_sha256": "47c6af054f62b37d5d8aa7d3582a37b6587e2604f2a590eea8da3150993d5f3d",
+      "browser": "NOT VERIFIED",
+      "qualification_claimed": false
     }
   ]
 }

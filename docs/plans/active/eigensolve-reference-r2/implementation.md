@@ -940,3 +940,8 @@ Refresh780 timeline entries dał4 nowe actionable findings; rejestr321. Adaptive
 4241893351: import/pin/unpin po successfulACK i session fence czyszczą revision-stale authoringHistory, przed resource invalidation. Noop już istniejącego pinu, rejection i obsolete-session ACK nie czyszczą historii.10 regresji korzysta z rzeczywistego AuthoringHistoryController z poprawnym typed SceneResource; source/diff review PASS, scoped GHA wymagane.
 
 Weryfikacja native:4 zielone modal-phase CTest nie obejmowały mixed dense descriptor ani rtol0 sentinel. Istniejący floquet-modal-slepc dispatch #38149497927 potwierdzony in_progress na exact fdf811f10ba90d87861ceac67a5b81fc385cc6c1. GitHub przyjmuje branch/tag ref, nie bareSHA w dispatch; sourceSHA zweryfikowano po ACK. Brak terminalnego wyniku. Private/runtime loader attestation pozostaje oddzielną bramką fem-cpu-slepc-modal-v1.
+
+
+4241893347: manifest histerezy zachowuje actualresolved source ref względem run root (ta sama baza co existingabsolute stage resolver), zamiast jednej stałej nazwy dla wielu etapów. Decoder/hash i builder używają tego samego źródła. Normalizacja slash oraz sanitizer odmawiają outside/parent/empty. Dwustopniowy test sprawdza stable paths/byte hashes, zmianę revision po zmianie path;4guards zachowują legacyflat jako artifacts/hysteresis_points.json. Pure source tests przygotowane, handler/browser runtime NOT VERIFIED.
+
+#38149842014:177tests/12files PASS,10 nowych history cases i pełny typecheck/architecture PASS. React Doctor617 findings semantycznie zgodne z38148168315 po pominięciu tylko pozycji. Fullworkflow FAIL, nie waiver; source correction history ukończona, browser pending.

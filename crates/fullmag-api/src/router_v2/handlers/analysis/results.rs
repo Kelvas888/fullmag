@@ -22,7 +22,8 @@ use sha2::{Digest, Sha256};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::artifacts::{
-    require_current_live_artifact_dir, try_resolve_artifact_path,
+    require_current_live_artifact_dir, sanitize_artifact_relative_path,
+    try_resolve_artifact_path,
 };
 use crate::error::ApiError;
 use crate::router_v2::handlers::analysis::frequency_domain::{
@@ -1244,23 +1245,23 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
     }
 
     for artifact in super::hysteresis::hysteresis_stage_point_artifacts(state).await? {
+        let source_artifact =
+            resolved_hysteresis_source_artifact_ref(&artifact_dir, &artifact.path)?;
         let file = std::fs::File::open(&artifact.path).map_err(|error| {
             ApiError::internal(format!(
                 "failed to open hysteresis points of stage '{}': {error}",
                 artifact.stage_id
             ))
         })?;
-        let (value, digest) = decode_result_artifact_snapshot(
-            file,
-            "hysteresis_points.json",
-            MAX_RESULT_ARTIFACT_BYTES,
-        )?;
+        let (value, digest) =
+            decode_result_artifact_snapshot(file, &source_artifact, MAX_RESULT_ARTIFACT_BYTES)?;
         let points = serde_json::from_value::<Vec<HysteresisPointSchema>>(value).map_err(
             |error| ApiError::internal(format!("invalid hysteresis points artifact: {error}")),
         )?;
         datasets.push(build_hysteresis_index(
             &points,
             digest,
+            &source_artifact,
             &run_id,
             &artifact.stage_id,
             artifact.lifecycle,
@@ -2022,12 +2023,33 @@ fn build_response_index(
     })
 }
 
+fn resolved_hysteresis_source_artifact_ref(
+    artifact_dir: &Path,
+    resolved_path: &Path,
+) -> Result<String, ApiError> {
+    // The stage resolver accepts absolute stage refs under this same parent run root.
+    let run_root = artifact_dir.parent().unwrap_or(artifact_dir);
+    let relative_path = resolved_path.strip_prefix(run_root).map_err(|_| {
+        ApiError::internal("resolved hysteresis artifact path is outside the active run root")
+    })?;
+    let relative_path = relative_path
+        .to_str()
+        .ok_or_else(|| ApiError::internal("resolved hysteresis artifact path is not valid UTF-8"))?
+        .replace('\\', "/");
+    let sanitized_path = sanitize_artifact_relative_path(&relative_path)?;
+    let sanitized_path = sanitized_path.to_str().ok_or_else(|| {
+        ApiError::internal("sanitized hysteresis artifact path is not valid UTF-8")
+    })?;
+    Ok(sanitized_path.replace('\\', "/"))
+}
+
 /// Hysteresis loops publish their applied-field sweep as an outer axis. The
 /// magnetization points stay on the dedicated hysteresis resources, so the
 /// dataset carries no spectral items.
 fn build_hysteresis_index(
     points: &[HysteresisPointSchema],
     source_digest: String,
+    source_artifact: &str,
     run_id: &str,
     stage_id: &str,
     stage_lifecycle: Option<StageLifecycleState>,
@@ -2076,7 +2098,7 @@ fn build_hysteresis_index(
         items_resource: items_path(run_id, &dataset_id, &sample_id),
     };
     let source_artifacts = vec![AnalysisResultSourceArtifactRef {
-        artifact: "hysteresis_points.json".to_string(),
+        artifact: source_artifact.to_string(),
         revision: source_digest.clone(),
         relation: "adapter_source".to_string(),
     }];
@@ -4953,6 +4975,7 @@ mod tests {
         let index = build_hysteresis_index(
             &points,
             "sha256:abc".to_string(),
+            "hysteresis_points.json",
             "run:1",
             "stage-002",
             Some(StageLifecycleState::Completed),
@@ -4979,6 +5002,137 @@ mod tests {
     }
 
     #[test]
+    fn resolved_hysteresis_source_ref_rejects_paths_outside_run_root() {
+        let run_root = std::path::Path::new("run");
+        let artifact_dir = run_root.join("artifacts");
+        let resolved_path = std::path::Path::new("other-run")
+            .join("stages")
+            .join("stage-000")
+            .join("hysteresis_points.json");
+
+        let error = resolved_hysteresis_source_artifact_ref(&artifact_dir, &resolved_path)
+            .expect_err("a path outside the run root must be rejected");
+        assert_eq!(
+            error.message,
+            "resolved hysteresis artifact path is outside the active run root"
+        );
+    }
+
+    #[test]
+    fn resolved_hysteresis_source_ref_rejects_parent_components() {
+        let run_root = std::path::Path::new("run");
+        let artifact_dir = run_root.join("artifacts");
+        let resolved_path = run_root
+            .join("..")
+            .join("outside")
+            .join("hysteresis_points.json");
+
+        let error = resolved_hysteresis_source_artifact_ref(&artifact_dir, &resolved_path)
+            .expect_err("parent path components must be rejected");
+        assert_eq!(
+            error.message,
+            "artifact path must not contain '..' or root prefixes"
+        );
+    }
+
+    #[test]
+    fn resolved_hysteresis_source_ref_rejects_empty_paths() {
+        let run_root = std::path::Path::new("run");
+        let artifact_dir = run_root.join("artifacts");
+
+        let error = resolved_hysteresis_source_artifact_ref(&artifact_dir, run_root)
+            .expect_err("an empty run-relative path must be rejected");
+        assert_eq!(error.message, "artifact path must not be empty");
+    }
+
+    #[test]
+    fn resolved_hysteresis_source_ref_keeps_flat_artifact_run_relative() {
+        let run_root = std::path::Path::new("run");
+        let artifact_dir = run_root.join("artifacts");
+        let resolved_path = artifact_dir.join("hysteresis_points.json");
+
+        let source_artifact =
+            resolved_hysteresis_source_artifact_ref(&artifact_dir, &resolved_path)
+                .expect("flat artifact ref");
+
+        assert_eq!(source_artifact, "artifacts/hysteresis_points.json");
+    }
+
+    #[test]
+    fn multi_stage_hysteresis_manifests_preserve_resolved_source_paths_and_revisions() {
+        let points: Vec<HysteresisPointSchema> = serde_json::from_value(serde_json::json!([
+            {"point_id": 0, "field_value_mT": 100.0, "m_parallel": 1.0, "m_oop": 0.0,
+             "m_ip": 1.0, "m_avg": [1.0, 0.0, 0.0], "status": "complete"}
+        ]))
+        .expect("hysteresis fixture");
+        let source_bytes = serde_json::to_vec(&points).expect("hysteresis points should serialize");
+        let (_, source_digest) = decode_result_artifact_snapshot(
+            &source_bytes[..],
+            "hysteresis_points.json",
+            MAX_RESULT_ARTIFACT_BYTES,
+        )
+        .expect("hysteresis source digest");
+
+        let run_root = std::path::Path::new("run");
+        let artifact_dir = run_root.join("artifacts");
+        let source_paths = [
+            ("stage-000", "stages/stage-000/hysteresis_points.json"),
+            ("stage-001", "stages/stage-001/hysteresis_points.json"),
+        ];
+        let indices = source_paths.map(|(stage_id, relative_path)| {
+            let resolved_path = run_root.join(relative_path);
+            let source_artifact =
+                resolved_hysteresis_source_artifact_ref(&artifact_dir, &resolved_path)
+                    .expect("resolved stage artifact path");
+            assert_eq!(source_artifact.as_str(), relative_path);
+            build_hysteresis_index(
+                &points,
+                source_digest.clone(),
+                &source_artifact,
+                "run:multi",
+                stage_id,
+                Some(StageLifecycleState::Completed),
+            )
+        });
+
+        for ((_, relative_path), index) in source_paths.iter().zip(&indices) {
+            assert_eq!(
+                index.manifest.source_artifacts[0].artifact.as_str(),
+                *relative_path
+            );
+            assert_eq!(
+                index.manifest.source_artifacts[0].revision.as_str(),
+                source_digest.as_str()
+            );
+            assert_eq!(
+                index.samples[0].source_revision.as_str(),
+                source_digest.as_str()
+            );
+        }
+        assert_ne!(
+            indices[0].manifest.dataset_revision,
+            indices[1].manifest.dataset_revision
+        );
+
+        let moved_path = run_root.join("stages/stage-000/alternate/hysteresis_points.json");
+        let moved_source = resolved_hysteresis_source_artifact_ref(&artifact_dir, &moved_path)
+            .expect("resolved alternate stage artifact path");
+        let moved_index = build_hysteresis_index(
+            &points,
+            source_digest,
+            &moved_source,
+            "run:multi",
+            "stage-000",
+            Some(StageLifecycleState::Completed),
+        );
+        assert_ne!(
+            indices[0].manifest.dataset_revision,
+            moved_index.manifest.dataset_revision,
+            "the resolved source path participates in dataset identity"
+        );
+    }
+
+    #[test]
     fn running_hysteresis_publishes_accepted_axis_values_as_partial_and_revises_on_completion() {
         let points: Vec<HysteresisPointSchema> = serde_json::from_value(serde_json::json!([
             {"point_id": 0, "field_value_mT": 100.0, "m_parallel": 1.0, "m_oop": 0.0,
@@ -4988,6 +5142,7 @@ mod tests {
         let running = build_hysteresis_index(
             &points,
             "sha256:abc".to_string(),
+            "hysteresis_points.json",
             "run:1",
             "stage-002",
             Some(StageLifecycleState::Running),
@@ -5001,6 +5156,7 @@ mod tests {
         let completed = build_hysteresis_index(
             &points,
             "sha256:abc".to_string(),
+            "hysteresis_points.json",
             "run:1",
             "stage-002",
             Some(StageLifecycleState::Completed),
@@ -5034,6 +5190,7 @@ mod tests {
             let index = build_hysteresis_index(
                 &points,
                 "sha256:abc".to_string(),
+                "hysteresis_points.json",
                 "run:1",
                 "stage-002",
                 Some(lifecycle),
@@ -5042,8 +5199,14 @@ mod tests {
             assert_eq!(index.manifest.status.completeness, "partial");
         }
 
-        let missing_lifecycle =
-            build_hysteresis_index(&points, "sha256:abc".to_string(), "run:1", "stage-002", None);
+        let missing_lifecycle = build_hysteresis_index(
+            &points,
+            "sha256:abc".to_string(),
+            "hysteresis_points.json",
+            "run:1",
+            "stage-002",
+            None,
+        );
         assert_eq!(missing_lifecycle.manifest.status.execution, "unknown");
         assert_eq!(missing_lifecycle.manifest.status.completeness, "partial");
     }
@@ -5053,6 +5216,7 @@ mod tests {
         let empty = build_hysteresis_index(
             &[],
             "sha256:empty".to_string(),
+            "hysteresis_points.json",
             "run:1",
             "stage-002",
             Some(StageLifecycleState::Completed),
@@ -5070,6 +5234,7 @@ mod tests {
         let incomplete = build_hysteresis_index(
             &failed_point,
             "sha256:failed-point".to_string(),
+            "hysteresis_points.json",
             "run:1",
             "stage-002",
             Some(StageLifecycleState::Completed),
