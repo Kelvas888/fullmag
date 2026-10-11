@@ -1,5 +1,60 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Checkpoint T15 — 2026-10-11, edycja istniejącego portu; build 45 blocked:**
+Ten wpis aktualizuje stan wcześniejszych checkpointów: edytor istniejącego
+portu jest zaimplementowany, a build nr 45 nie jest już `queued`, lecz `blocked`.
+Poprzedni fragment diagnostyki zapisano w commicie
+`0198274fbbde810ba929e397787b9b9670de16fa`.
+
+`AntennaPortEditor.tsx::AntennaPortEditor` obsługuje transport, identyfikatory
+gałęzi, pary inlet/outlet i jawne signed weights. Umożliwia dodanie pustej
+gałęzi, usunięcie gałęzi, Apply, Revert, Refresh i jawny Rebase.
+Nie tworzy terminali, drive ani fizycznego domknięcia obwodu; nie tworzy
+ani nie usuwa samego portu. Nie zmienia source, schema ani normalization.
+`AntennaPortEditorModel.ts::buildAntennaPortTransaction` korzysta ze wspólnej
+scene-aware walidacji, wymaga dokładnej base revision i emituje wyłącznie
+kanoniczny merge patch `antenna_port_modes`, zachowując pozostałe porty oraz
+nieznane atrybuty. Nie normalizuje wag i nie zamienia pustego inputu na zero.
+ACK waliduje `committedAntennaPortScene` przed publikacją historii i cache;
+`acknowledgeAntennaPortDraft` zachowuje nowszy szkic oraz lokalne klucze wierszy.
+Owner token, session request scope i history generation odcinają stare ACK.
+HTTP 409 i nieprawidłowy ACK nie wywołują automatycznego retry.
+
+`just verify-antenna-port-editor-browser`: **9 scenariuszy PASS** na porcie
+3264. Kontrolowany HTTP używa rzeczywistego klienta, resource hooks, historii
+i komponentu produkcyjnego. Zweryfikowano nieprawidłowe dane, opóźniony ACK,
+nowszy szkic, konflikt rewizji, HTTP 409, błędną normalization/scene_revision,
+reset historii oraz przejście sesji A→B→A. W siedmiu workflow odnotowano
+5–11 żądań oraz 14–34 renderów; przez 700 ms idle nie było nowych żądań
+ani renderów. DOM root, input, fokus, scroll, disabled i opacity pozostają
+stabilne; zero aktywnych animacji opacity oraz błędów strony/konsoli.
+Raport i trzy zrzuty:
+`storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/windows-control-room-browser-fixture/antenna-port-editor-browser/d5c92062702c42bdbd780cdd50a9bdfb/`.
+Pierwsza próba `2bd95b54ad2b49fb8af740aed908a222` pozostała failed:
+niejednoznaczny selektor testu zastąpiono dokładnym selektorem textbox;
+nie zmieniano dostępności komponentu ani nie zaliczono nieudanej próby.
+
+Regresja dotychczasowego inspektora po integracji edytora: **PASS**, receipt
+`antenna-port-diagnostics-browser/588bec62c7df443fb7525fe6d3e84f7c`
+w tym samym katalogu profilu browser. TypeScript źródeł produkcyjnych
+`production-source/e2abd660a35841f982b30223f3691587`, ESLint
+`lint/96003b1f81f9484d9ae99e5307b077c5` oraz API hygiene
+`api-hygiene/7ffc2c1d7e5547e793eeb57ad99b651a`: **PASS**, receipts pod
+`storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/windows-control-room-source-check/`.
+Interpretowany dispatcher: **8 PASS + 10 podtestów**. Niezależne review:
+Required dotyczący kontroli scene_revision poprawiono; finalnie brak
+Required/Blocker. Zapisane testy Vitest nie były kompilowane ani uruchamiane.
+
+Build 45 `fc763cf735b74842bc07fbe92915b6e0` zakończył się stanem
+`blocked` przed kompilacją. Zdrowy koordynator raportował
+`Existing Fullmag container must finish before queued build`; brak runrootu
+i logu kompilacji nie jest dowodem wykonania solvera. Nie zatrzymywano cudzych
+kontenerów ani nie restartowano runnera. Kolejnym krokiem jest bezpieczne
+rozstrzygnięcie blokady kolejki, managed build z przypiętych źródeł oraz
+real warm/cold V/J/H readback. Ten checkpoint nie kwalifikuje backendu,
+pełnego workspace/WebGL, fizycznego obwodu, per-A, LLG ani FFT.
+Workspace 3197 i scena użytkownika pozostają bez zmian; T00–T18 są otwarte.
+
 **Checkpoint T15 — 2026-10-11, diagnostyka referencji portu w UI:**
 `antennaPortValidation.ts::antennaPortValidationMessages` otrzymuje aktualny
 `SceneResource`; wspólną walidację wykorzystują Explorer i `AntennaPortPanel`.
