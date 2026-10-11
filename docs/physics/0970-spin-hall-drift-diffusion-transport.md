@@ -2513,6 +2513,81 @@ Nie zmienia się fizyka, normalizacja, tolerancje ani CPU/GPU qualification.
 validate_runtime_identity, run_boris_case oraz
 scripts/verify_boris_nf_interface.py::validate_boris_artifact.
 
+(boris-offline-toolchain-provisioning)=
+### E1: offline toolchain BORIS i oddzielna bramka solvera
+
+Producent `scripts/local_runner/boris_toolchain.py` oraz
+`Dockerfile.boris-toolchain` przygotowują zależności zewnętrznego BORIS CPU.
+Nie zmieniają Python DSL, ProblemIR, równań transportu, normalizacji ani
+prerejestrowanych tolerancji. Historyczny runtime v1 i wcześniejszy benchmark
+nadal nie mają admission. Kwalifikacja FDM CPU/GPU oraz FEM CPU/GPU Fullmaga
+pozostaje określona przez ich własne bramki; obraz toolchaina jej nie rozszerza.
+
+`dependency_selection` wybiera pełną bibliotekową domkniętą zależność trzech
+korzeni: libfftw3-dev, libx11-dev i libtbb-dev. Dla przypiętego Ubuntu 22.04.5
+jammy amd64 jest to 17 pakietów z zamrożonego zbioru 80 pobranych archiwów.
+`validate_bundle` wiąże wersje, architekturę, Depends/PreDepends, świadków
+pakietów bazowych, podpisane indeksy, URI i SHA256 archiwów. `install_apt`
+wymaga identycznego bazowego inventory, sprawdza symulację bez usunięć lub
+upgrade i instaluje wyłącznie wybrane lokalne archiwa z jawnym cache,
+pustymi źródłami APT i `--no-download --no-upgrade --no-install-recommends`.
+Zależności Python z pobranego zbioru APT nie są instalowane.
+
+Bazowy NumPy 2.2.6 pozostaje pod
+`/usr/local/lib/python3.10/dist-packages/numpy/__init__.py` z niezmienionym SHA256.
+Osobny zamrożony bundle zawiera dziesięć prywatnych wheels: Matplotlib 3.8.4,
+contourpy 1.2.1, kiwisolver 1.4.5, Pillow 10.3.0, fonttools 4.51.0,
+packaging 24.0, pyparsing 3.1.2, python-dateutil 2.9.0.post0, cycler 0.12.1
+oraz six 1.16.0. `validate_wheels` sprawdza release metadata, METADATA,
+wersje, hashe i receipt bazowego importu; `install_wheels` rozpakowuje je bez
+pip i sieci do `/opt/fullmag-boris-python`. Bundle nie zawiera NumPy.
+Wybór wheels Matplotlib 3.8.4 wynika z ich budowania przeciw NumPy 2 przez
+upstream [14]; rozszerzenia zbudowane przeciw NumPy 1 mogą być niezgodne z
+NumPy 2 [15]. Deklaracja minimalnej wersji zależności nie jest dowodem ABI:
+wymagany jest rzeczywisty import i zapis wykresu Agg.
+
+| Parametr operacyjny / typ | Walidacja i pochodzenie | SI / znaczenie |
+|---|---|---|
+| base_image / string | exact sha256 image ID, amd64; inventory i wersje pakietów zgodne z lock | $1$; niezmienna baza |
+| bundle, wheel_bundle / path | prywatny resolver storage; regular files, brak symlinków, zamrożone SHA256 i bounded membership | $1$; offline wejścia |
+| context / path | `prepare_context`; lock, source freeze i hashe helpera/Dockerfile; jawny deny-default kontekst | $1$; powtarzalny build input |
+| tag / string | `build_image`; ograniczony lokalny `fullmag/boris-toolchain:*` | $1$; etykieta, nie tożsamość |
+| image_id / string | rzeczywisty Docker inspect po exit 0; lokalny alias bazy sprawdzony przed i po buildzie, zgodny prefiks RootFS layers | $1$; wynik provisioningu |
+| runtime-preflight.json / JSON | `runtime_preflight`; rzeczywiste wersje i module paths, NumPy hash, linker paths FFTW3/X11/TBB, Python embedding flags oraz SHA256 PNG Agg | $1$; dowód toolchaina, nie solvera |
+
+Obserwowany build wiąże bazę
+`sha256:e360637ea8b00e280efdca7648ee022e6dd16150b10130b734425bb8a65b5aa0`,
+lock SHA256 `8da46421ac443e529b6204493475f159d15329712aadbdd127326c90716095d8`
+i wheel manifest SHA256
+`93c00e46e23b2efe0c15aafb0e4ef1fe0dcd2620887684bd27476b5326842d2c`.
+Osobny preflight zawiera te same bindingi; jego zakres pozostaje toolchainowy.
+
+Kanoniczne wejścia operacyjne to `just runner-boris-toolchain-context` oraz
+`just runner-boris-toolchain-image`. Build używa lokalnego frontendu i
+`--network none --pull=false`; instalacja w obrazie następuje jako USER 0,
+a finalny `USER 65532:65532` nie otrzymuje uprawnień instalacyjnych.
+`build_image` zapisuje terminalny receipt pod resolverowym
+`storage/builds/<worktree-id>/windows-native/boris-image-<id>/`.
+Kontekst i receipt wiążą helper, Dockerfile, bazę, lock oraz wheel manifest.
+Samo przygotowanie lub build obrazu nie zmienia konfiguracji koordynatora.
+
+| Bramka / zakres | Stan obserwowany 2026-10-11 | Ograniczenie dowodu |
+|---|---|---|
+| Bazowy import dziesięciu wheels i Agg | PASS; `reviews/boris-python-wheels` | prywatny import, bez solvera |
+| Offline build toolchaina przez `just` | PASS; image `sha256:dd3441d07c3aa19fe1e4a206c2926b42c89899a59bbc517eb890bd99657b079e` | receipt `boris-image-8ea0710662644c49820179099d46fd90/terminal-receipt.json`, status SUCCEEDED_IMAGE_ONLY |
+| Finalny preflight UID 65532 | PASS; `reviews/boris-toolchain-final-image-v3/results/runtime-preflight.json` | readonly, network none, 2 CPU, 1 GiB, 128 pids; dziesięć importów z prywatnego katalogu, niezmieniony NumPy, trzy biblioteki linkera, embedding flags i Agg PNG |
+| BORIS source-image, kompilacja CPU i ABI witness | NOT VERIFIED | wymagane przypięte źródła i terminalny build w zarządzanej kolejce |
+| Managed runtime, public admission i benchmark | NOT VERIFIED | wymagany kompletny trusted łańcuch source/binary/ABI/runtime i niezależne bramki naukowe |
+| Operator activation | nie wykonano | istniejąca kolejka i profile zachowane |
+
+Receipt buildu ma kwalifikator NONROOT_RUNTIME_PREFLIGHT_AND_BORIS_NOT_VERIFIED;
+osobny późniejszy preflight zamyka jedynie jego część toolchainową i ma
+TOOLCHAIN_ONLY_NOT_SOLVER_QUALIFIED. Nie nadaje identity_complete dla BORIS.
+Następny etap to przypięty source-image, jawna aktywacja operatora przy pustym
+aktywnym slocie oraz kompilacja BORIS w tej samej kolejce Fullmag_build_runner.
+Dopiero rzeczywisty witness ABI i managed runtime pozwalają sprawdzać nowy
+benchmark; provisioning nie zastępuje żadnej z tych bramek.
+
 (boris-cpu-abi-witness-contract)=
 ### E1: prerejestracja produkcyjnego CPU ABI witness
 
@@ -2628,6 +2703,15 @@ a qualified workload without the validation gates above.
 
 | Claim | Path | Symbol | Responsibility | Evidence |
 |---|---|---|---|---|
+| boris-offline-toolchain-dependency-selection | scripts/local_runner/boris_toolchain.py | dependency_selection | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |
+| boris-offline-toolchain-validate-bundle | scripts/local_runner/boris_toolchain.py | validate_bundle | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |
+| boris-offline-toolchain-validate-wheels | scripts/local_runner/boris_toolchain.py | validate_wheels | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |
+| boris-offline-toolchain-prepare-context | scripts/local_runner/boris_toolchain.py | prepare_context | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |
+| boris-offline-toolchain-install-apt | scripts/local_runner/boris_toolchain.py | install_apt | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |
+| boris-offline-toolchain-install-wheels | scripts/local_runner/boris_toolchain.py | install_wheels | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |
+| boris-offline-toolchain-runtime-preflight | scripts/local_runner/boris_toolchain.py | runtime_preflight | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |
+| boris-offline-toolchain-build-image | scripts/local_runner/boris_toolchain.py | build_image | Offline dependency admission, image provenance or bounded toolchain preflight; does not qualify the BORIS solver. | source_only; toolchain evidence only |
+| boris-offline-toolchain-contract | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:boris-offline-toolchain-provisioning | Separate observed toolchain provisioning from pending BORIS source, ABI, runtime and scientific qualification. | planned_contract; toolchain evidence only |
 | boris-managed-runtime-publication | scripts/run_managed_boris_nf.py | observe | Exclusive runtime storage lock, full bundle before exact terminal receipt LAST; precommit resumable I/O failure and immutable postcommit verification. | source_only; interpreted crash/reentrant checks, runtime NOT VERIFIED |
 | boris-managed-runtime-admission | scripts/run_managed_boris_nf.py | resolved_boris_build | Authenticated same-actor/worktree terminal job, four trusted hashes, source/ABI/binary/flags/image receipt verification; source only. | source_only; interpreted regressions, native/runtime NOT VERIFIED |
 | boris-managed-runtime-reopen | scripts/run_managed_boris_nf.py | verify_runtime_identity | Explicit trusted repo/root, actual CPU container/output closure, receipt/identity binding and independent summary recomputation; no runtime qualification. | source_only; interpreted regressions, native/runtime NOT VERIFIED |
@@ -2744,3 +2828,5 @@ a qualified workload without the validation gates above.
     151--167 (1997), DOI: 10.1016/S0168-9274(97)00056-1; the published
     `(2,3,2)` tableaus and L-stability contract define `coupled_imex_ark2`.
 13. BORIS transport sources under `external_solvers/BORIS/Boris`, used as comparative implementation evidence only.
+14. Matplotlib, [release v3.8.4](https://github.com/matplotlib/matplotlib/releases/tag/v3.8.4): wheels built against NumPy 2; dependency provenance only.
+15. NumPy, [Troubleshooting ImportError](https://numpy.org/doc/2.0/user/troubleshooting-importerror.html): NumPy 1/2 extension ABI boundary; not solver qualification.

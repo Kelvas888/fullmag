@@ -98,6 +98,37 @@ Zdrowie API i stan wykonawcy są oddzielne: sprawdzaj `accepting_jobs`,
 backendem Fullmaga. Implementacja źródłowa nie aktywuje go w operatorowym
 katalogu. Istniejące profile i ich receipt zachowują dotychczasowy kontrakt.
 
+Zamrożone bundle zależności przygotowują offline toolchain przez:
+
+```text
+just runner-boris-toolchain-context <bundle-deb> <bundle-wheel> sha256:<base-image-id>
+just runner-boris-toolchain-image <zwrócony-context> fullmag/boris-toolchain:<prywatny-tag>
+```
+
+Producent `scripts/local_runner/boris_toolchain.py` wybiera 17 bibliotekowych
+pakietów APT z locka, sprawdza domknięcie zależności i bazowe inventory, odmawia
+usunięć/upgrade i używa wyłącznie lokalnego cache archiwów. Dziesięć przypiętych
+wheels jest rozpakowywanych bez pip do `/opt/fullmag-boris-python`;
+NumPy 2.2.6 z `/usr/local/lib/python3.10/dist-packages` zachowuje wersję i hash.
+Matplotlib 3.8.4 używa wheels upstream budowanych przeciw NumPy 2;
+rzeczywisty import i Agg stanowią bramkę preflight. Dockerfile.boris-toolchain
+używa lokalnego frontendu, sieci none i finalnego USER 65532:65532.
+Helper sprawdza lokalny alias niezmiennej bazy przed i po buildzie oraz
+prefiks RootFS layers; terminalny receipt wiąże source/context, lock i wheel
+manifest. Konteksty i dowody pozostają w storage D.
+
+Build przez `just` zakończył się 2026-10-11 obrazem
+`sha256:dd3441d07c3aa19fe1e4a206c2926b42c89899a59bbc517eb890bd99657b079e`.
+Receipt `windows-native/boris-image-8ea0710662644c49820179099d46fd90/terminal-receipt.json`
+ma status SUCCEEDED_IMAGE_ONLY. Osobny
+`reviews/boris-toolchain-final-image-v3/results/runtime-preflight.json`
+potwierdza import dziesięciu prywatnych modułów, niezmieniony NumPy, ścieżki
+FFTW3/X11/TBB, Python embedding flags i Agg PNG jako UID 65532, readonly,
+bez sieci, z limitem 2 CPU/1 GiB/128 pids. Jest to
+TOOLCHAIN_ONLY_NOT_SOLVER_QUALIFIED. Nie aktywowano profilu operatora;
+kolejka i istniejące profile pozostają zachowane. Kontrakt i granice dowodu:
+[nota 0970](../physics/0970-spin-hall-drift-diffusion-transport.md#boris-offline-toolchain-provisioning).
+
 `just runner-boris-image-context <checkout-BORIS> sha256:<image-id-toolchaina>`
 przygotowuje ograniczony kontekst pod resolverowym `storage/tmp`. Wymaga czystego
 checkoutu dokładnie `048503d2ca6475e91b073eb1762ecf9d3634c3e1`, sprawdza każdy
@@ -116,8 +147,9 @@ ani obrazu w trakcie cudzego buildu.
 Worker stosuje stały overlay CPU, kompiluje źródła C++ i sprawdza zależności
 ELF. Receipt wiąże obraz, kapsułę Fullmaga, oryginalne źródła, overlay i binarium.
 Sukces kompilacji nie dowodzi precyzji wykonania ani poprawności adaptera.
-Provisioning, terminalny receipt, admission rzeczywistego runtime i nowe
-porównanie naukowe pozostają **NOT VERIFIED**.
+Provisioning toolchaina i jego preflight mają powyższy ograniczony dowód PASS.
+BORIS source-image, terminalny build/witness ABI, admission rzeczywistego runtime
+i nowe porównanie naukowe pozostają **NOT VERIFIED**.
 
 Źródłowa ścieżka `just run-managed-boris-nf <job-id> coarse|medium|fine`
 wymaga terminalnego udanego buildu tego samego worktree i aktora, czterech
@@ -132,7 +164,7 @@ artefaktu. Pole `identity_complete` w przekazanym JSON samo nie daje admission.
 Kontrole interpretowane ścieżki runtime po poprawce publikacji: 56 testów i 45 podprzypadków PASS;
 parser oraz validator noty 0970 PASS. Są to dowody źródeł, bez uruchomienia
 BORIS, producenta ABI lub nowego benchmarku. Rzeczywista kwalifikacja nadal
-wymaga provisioningu, terminalnego buildu i wykonania porównań.
+wymaga przypiętego source-image, terminalnego buildu BORIS i wykonania porównań.
 
 ## Dane, zakończenie i retencja
 

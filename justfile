@@ -123,6 +123,13 @@ runner-once:
 runner-build mode profile="fem-cpu-release" ref="":
     {{storage_python}} scripts/local_runner_cli.py submit --operation build --profile {{quote(profile)}} --source {{quote(mode)}} {{if ref == "" { "" } else { "--ref " + quote(ref) }}}
 
+# Offline external-reference image provisioning; native compilation uses the queue.
+runner-boris-toolchain-context bundle wheel_bundle base_image:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/boris_toolchain.py" prepare-image-context --repo-root {{quote(repo_root)}} --bundle {{quote(bundle)}} --wheel-bundle {{quote(wheel_bundle)}} --base-image {{quote(base_image)}}
+
+runner-boris-toolchain-image context tag:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/boris_toolchain.py" build-image --repo-root {{quote(repo_root)}} --context {{quote(context)}} --tag {{quote(tag)}}
+
 # Capture clean pinned BORIS sources under resolver-owned storage; no build.
 runner-boris-image-context boris_source toolchain_image:
     @{{storage_python}} "{{repo_root}}/scripts/local_runner/boris_cpu.py" prepare-image-context --repo-root {{quote(repo_root)}} --boris-source {{quote(boris_source)}} --toolchain-image {{quote(toolchain_image)}}

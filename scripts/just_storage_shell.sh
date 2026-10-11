@@ -282,6 +282,22 @@ case "${recipe}" in
     ;;
 esac
 
+# Fixed offline BORIS provisioning owns resolver admission and its context lock.
+case "${recipe}" in
+  *"scripts/local_runner/boris_toolchain.py"*)
+    boris_context_pattern="^[^[:space:]]+ \"[^\"]+/scripts/local_runner/boris_toolchain.py\" prepare-image-context --repo-root '([^']+)' --bundle '([^']+)' --wheel-bundle '([^']+)' --base-image '(sha256:[a-f0-9]{64})'$"
+    if [[ "${recipe}" =~ ${boris_context_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/local_runner/boris_toolchain.py" prepare-image-context --repo-root "${repo_root}" --bundle "${BASH_REMATCH[2]}" --wheel-bundle "${BASH_REMATCH[3]}" --base-image "${BASH_REMATCH[4]}"
+    fi
+    boris_image_pattern="^[^[:space:]]+ \"[^\"]+/scripts/local_runner/boris_toolchain.py\" build-image --repo-root '([^']+)' --context '([^']+)' --tag '(fullmag/boris-toolchain:[a-z0-9][a-z0-9_.-]{0,100})'$"
+    if [[ "${recipe}" =~ ${boris_image_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/local_runner/boris_toolchain.py" build-image --repo-root "${repo_root}" --context "${BASH_REMATCH[2]}" --tag "${BASH_REMATCH[3]}"
+    fi
+    echo "[fullmag just] invalid BORIS provisioning recipe" >&2
+    exit 2
+    ;;
+esac
+
 # Runner actions own their storage preflight and per-job/per-worktree locks.
 # Holding the generic worktree lock while `wait` polls would prevent the
 # coordinator from executing that same worktree's queued job.
