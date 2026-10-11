@@ -396,9 +396,20 @@
     {
       "run_id": 38123800798,
       "sha": "d33822c150d82e48fbbfe97ec72676ced5f547f2",
-      "conclusion": "in_progress_at_checkpoint",
+      "conclusion": "failure",
       "scope": "modal_phase_selected_window_corrected_fixture",
-      "qualification_claimed": false
+      "qualification_claimed": false,
+      "observation_history": [
+        {
+          "conclusion": "in_progress_at_checkpoint",
+          "scope": "earlier_checkpoint"
+        }
+      ],
+      "failure": "native job completed with exit code1; detailed receipt/CTest log not yet decoded",
+      "job_id": 114423830438,
+      "artifact_id": 11696722255,
+      "artifact_digest": "sha256:d89e4d7bccb8610f748cc6a2c8b7260bb5597b9199524f724875aeaf58ee4ea5",
+      "detailed_test_results": "NOT VERIFIED"
     },
     {
       "run_id": 38124461222,
