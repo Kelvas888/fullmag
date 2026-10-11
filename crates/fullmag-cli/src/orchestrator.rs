@@ -13694,6 +13694,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         ),
     );
 
+    // Stop the owned publisher only after the canonical terminal state and log
+    // are complete. Its last real HTTP publication must ACK before CLI success.
+    live_workspace.finish_publish()?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {

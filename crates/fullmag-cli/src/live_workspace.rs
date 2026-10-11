@@ -506,6 +506,10 @@ impl LocalLiveWorkspace {
             })
     }
 
+    pub fn finish_publish(&self) -> Result<()> {
+        self.publisher.finish_publish(std::time::Duration::from_secs(600))
+    }
+
     pub fn publish_snapshot(&self) {
         self.publisher.request_publish();
     }
@@ -1469,6 +1473,13 @@ pub(crate) struct CurrentLivePublisher {
     last_request_at: Arc<Mutex<Option<Instant>>>,
     state_source: Arc<Mutex<Option<Arc<Mutex<LocalLiveWorkspaceState>>>>>,
     wake_tx: mpsc::SyncSender<()>,
+    stopping: Arc<AtomicBool>,
+    completion: Arc<Mutex<Option<LivePublisherCompletion>>>,
+}
+
+struct LivePublisherCompletion {
+    receipt: mpsc::Receiver<Result<()>>,
+    worker: std::thread::JoinHandle<()>,
 }
 
 #[derive(Debug, Default)]
@@ -1645,6 +1656,8 @@ impl CurrentLivePublisher {
             last_request_at: Arc::new(Mutex::new(None)),
             state_source: Arc::new(Mutex::new(None)),
             wake_tx,
+            stopping: Arc::new(AtomicBool::new(false)),
+            completion: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1694,15 +1707,18 @@ impl CurrentLivePublisher {
         let worker_diagnostics = Arc::clone(&diagnostics);
         let worker_last_request_at = Arc::clone(&last_request_at);
         let worker_state_source = Arc::clone(&state_source);
+        let stopping = Arc::new(AtomicBool::new(false));
+        let worker_stopping = Arc::clone(&stopping);
+        let (receipt_tx, receipt_rx) = mpsc::sync_channel(1);
         let worker_session_id = session_id.to_string();
         let thread_name = format!("fullmag-live-publisher-{session_id}");
-        std::thread::Builder::new()
+        let worker = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
                 if let Some(barrier) = worker_start_barrier {
                     barrier.wait();
                 }
-                current_live_publisher_loop(
+                let result = current_live_publisher_loop(
                     worker_session_id,
                     worker_pending,
                     worker_sending,
@@ -1718,7 +1734,9 @@ impl CurrentLivePublisher {
                     delta_sink,
                     full_sink,
                     wake_rx,
-                )
+                    worker_stopping,
+                );
+                let _ = receipt_tx.send(result);
             })
             .expect("current live publisher thread should spawn");
 
@@ -1735,7 +1753,32 @@ impl CurrentLivePublisher {
             last_request_at,
             state_source,
             wake_tx,
+            stopping,
+            completion: Arc::new(Mutex::new(Some(LivePublisherCompletion {
+                receipt: receipt_rx, worker,
+            }))),
         }
+    }
+
+    fn finish_publish(&self, timeout: std::time::Duration) -> Result<()> {
+        let mut completion = self.completion.lock()
+            .map_err(|_| anyhow!("live publisher completion lock poisoned"))?;
+        let Some(worker) = completion.as_ref() else {
+            return Ok(()); // API-disabled headless run has no publication owner.
+        };
+        self.stopping.store(true, Ordering::Release);
+        self.pending.store(true, Ordering::Release);
+        match self.wake_tx.try_send(()) {
+            Ok(()) | Err(mpsc::TrySendError::Full(())) => {}
+            Err(mpsc::TrySendError::Disconnected(())) => {}
+        }
+        // The worker receipt follows the final real HTTP ACK, never just enqueue.
+        // Retain the owned handle on timeout; the CLI reports failure rather than success.
+        let published = worker.receipt.recv_timeout(timeout)
+            .map_err(|error| anyhow!("terminal live publication did not finish: {error}"))?;
+        let worker = completion.take().expect("completion owner held under lock");
+        worker.worker.join().map_err(|_| anyhow!("live publisher worker panicked"))?;
+        published
     }
 
     #[cfg(test)]
@@ -1800,6 +1843,9 @@ impl CurrentLivePublisher {
     }
 
     pub fn request_publish(&self) {
+        if self.stopping.load(Ordering::Acquire) {
+            return;
+        }
         self.pending.store(true, Ordering::Release);
         if let Ok(mut requested_at) = self.last_request_at.lock() {
             *requested_at = Some(Instant::now());
@@ -5244,17 +5290,21 @@ fn current_live_publisher_loop(
     delta_sink: LivePublishSink,
     full_sink: LivePublishSink,
     wake_rx: mpsc::Receiver<()>,
-) {
+    stopping: Arc<AtomicBool>,
+) -> Result<()> {
     const LIVENESS_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
     let mut last_publish_at: Option<Instant> = None;
     let mut successful_publish_window = SuccessfulPublishWindow::default();
     let mut slow_publish_count: u64 = 0;
     loop {
+        if stopping.load(Ordering::Acquire) {
+            break;
+        }
         match wake_rx.recv_timeout(LIVENESS_HEARTBEAT_INTERVAL) {
             Ok(()) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if owner_session_lost(&session_id, enable_api_fallback) {
-                    return;
+                    return Err(anyhow!("live publication session owner changed"));
                 }
                 if let Err(error) = publish_idle_liveness_heartbeat(&session_id, &delta_sink) {
                     eprintln!("fullmag live liveness heartbeat warning: {error:#}");
@@ -5269,9 +5319,9 @@ fn current_live_publisher_loop(
         if !coalesce_delay.is_zero() {
             std::thread::sleep(coalesce_delay);
         }
-        while pending.swap(false, Ordering::AcqRel) {
+        while !stopping.load(Ordering::Acquire) && pending.swap(false, Ordering::AcqRel) {
             if owner_session_lost(&session_id, enable_api_fallback) {
-                return;
+                return Err(anyhow!("live publication session owner changed"));
             }
             let min_interval = if fast_mode.load(Ordering::Acquire) {
                 LIVE_PUBLISH_FAST_INTERVAL
@@ -5394,7 +5444,7 @@ fn current_live_publisher_loop(
         }
     }
 
-    if pending.swap(false, Ordering::AcqRel) {
+    if stopping.load(Ordering::Acquire) || pending.swap(false, Ordering::AcqRel) {
         let scalar_publish_error =
             publish_pending_scalar_rows(&session_id, &pending_scalar_rows, &delta_sink).err();
         build_pending_payload_from_workspace(&state_source, &payload, &scalar_gate, &diagnostics);
@@ -5423,6 +5473,23 @@ fn current_live_publisher_loop(
         };
         let mut full_sync =
             |session_id: &str, payload: &CurrentLiveSnapshotPayload| full_sink(session_id, payload);
+        if stopping.load(Ordering::Acquire) {
+            attach_live_publisher_diagnostics(&mut snapshot, &diagnostics);
+            let published = full_sync(&session_id, &snapshot);
+            record_live_publish_diagnostics(
+                &diagnostics, clone_wall_time_ns, elapsed_ns(cycle_start),
+                publish_lag_wall_time_ns,
+            );
+            sending.store(false, Ordering::Release);
+            published?;
+            if let Ok(mut slot) = payload.lock() {
+                acknowledge_terminal_field_publish(&mut slot, &snapshot);
+            }
+            if let Some(error) = scalar_publish_error {
+                return Err(error);
+            }
+            return Ok(());
+        }
         let publish_result = {
             let _publish_nvtx = nvtx_range::Range::new(b"fem.host.publish\0");
             publish_final_snapshot_with_diagnostics(
@@ -5476,6 +5543,7 @@ fn current_live_publisher_loop(
             eprintln!("fullmag final live scalar sync warning: {error:#}");
         }
     }
+    Ok(())
 }
 
 fn owner_session_lost(session_id: &str, enabled: bool) -> bool {
