@@ -1151,14 +1151,10 @@ function FmrWorkflowActions() {
 export function FrequencyDomainDispersionInspectorPanel(
   props: InspectorPanelProps,
 ) {
-  void props;
   const summary = useFrequencyDomainDispersionSummary();
   const kernel = useKernel();
   const selectPoint = (point: EigenDispersionPoint): void => {
-    const ref = buildEigenDispersionPointSelectionRef(point, {
-      calculationMode: "dispersion_modal",
-      resourceRef: ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
-    });
+    const ref = buildEigenDispersionPointSelectionRefFromSelection(point, props.selection);
     kernel.selection.set(
       {
         kind: ref.kind,
@@ -1249,15 +1245,34 @@ export function FrequencyDomainDispersionInspectorPanel(
   );
 }
 
+export function buildEigenDispersionPointSelectionRefFromSelection(
+  point: EigenDispersionPoint,
+  selection: InspectorPanelProps["selection"],
+): ReturnType<typeof buildEigenDispersionPointSelectionRef> {
+  const ownerRef = selection.ref?.type === "frequency-domain"
+    ? selection.ref
+    : null;
+  return buildEigenDispersionPointSelectionRef(point, {
+    analysisRunId: ownerRef?.analysisRunId,
+    analysisStageId: ownerRef?.analysisStageId,
+    artifactRevision: ownerRef?.artifactRevision,
+    artifactPath: ownerRef?.artifactPath,
+    calculationMode: "dispersion_modal",
+    equilibriumId: ownerRef?.equilibriumId,
+    kContextKind: ownerRef?.kContextKind,
+    normalization: ownerRef?.normalization,
+    resourceRef: ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
+    source: ownerRef?.source,
+    studyProduct: ownerRef?.studyProduct,
+    wavevectorKf: ownerRef?.wavevectorKf,
+  });
+}
+
 export function EigenKPathInspectorPanel(props: InspectorPanelProps) {
-  void props;
   const summary = useFrequencyDomainDispersionSummary();
   const kernel = useKernel();
   const selectPoint = (point: EigenDispersionPoint): void => {
-    const ref = buildEigenDispersionPointSelectionRef(point, {
-      calculationMode: "dispersion_modal",
-      resourceRef: ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
-    });
+    const ref = buildEigenDispersionPointSelectionRefFromSelection(point, props.selection);
     kernel.selection.set(
       {
         kind: ref.kind,

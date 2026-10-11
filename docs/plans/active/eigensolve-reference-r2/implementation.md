@@ -889,3 +889,10 @@ Dodatkowy guard poprawności finalizacji: inferred/explicit Completed sweep z li
 #38144113006 publicplanner workflow SUCCESS:emptyall controls oraz subsetrejectwith/withoutcontrols i genericFloquet PASS. Brak native capability qualification.
 
 #38144011041 FAIL:po2errors/34clienttests naobu platformach; real request nie miał nowego timeout keyword, podczas gdy mocksgo akceptowały. Uzupełniono backwardcompatible keyword-only request timeout z finite/positive validation i clampdoexistingoperationbound. Nowy test przechodzi actualrequest do mocked_open_url, sprawdza appliedtimeout/clamp oraz invalid beztransportu. Nie osłabiono assertions ani autoryzacji/profile matching. Rerunwymagany.
+
+
+## Revision handoff i contextual Ribbon
+
+4241564409: oba dispersionInspectorpanele przekazują parent frequency-domain run/stage/revision/path i dostępnykcontext do istniejącego point selection builder. Test przepuszcza ref przez createModeFieldOverlayIntent; noowner pozostaje failclosed, bez aliasowania dataset IDs.
+
+4241564400/4405: typed pinnedgroup owner walidowany wmodule manifests; context dismissal jest localuser UIstate wygasającym przy moduletransition. Rootreview usunął effectcopy zgodniez04-state-management, zastępując go guarded stateadjustment/puretransition. Helpers/testsswitch-return oraz ordinarytab pozostają. Source/diff PASS; GHA/typecheck/Doctor/browser wymagane.

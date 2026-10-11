@@ -49,7 +49,7 @@ import {
   useSessionStatusSelector,
 } from "@/kernel/resources/useSessionStatus";
 import { useSelectionSelector } from "@/kernel/selection/useSelection";
-import { EMPTY_SELECTION } from "@/kernel/selection/selectionTypes";
+import { EMPTY_SELECTION, type Selection } from "@/kernel/selection/selectionTypes";
 import { useAnalysisFieldOverlay } from "@/kernel/visualization/AnalysisFieldOverlayController";
 import { analysisModuleIdForNodeKind } from "@/kernel/analysis-modules/analysisSurfaceRouting";
 import { ANALYSIS_FEATURE_MANIFESTS } from "@/kernel/analysis-modules/analysisModuleManifests";
@@ -383,13 +383,25 @@ export default function RibbonModule({ kernel }: ModuleProps) {
   // choosing another tab dismisses it until a different module's node is selected.
   // Read independently of `selection`, which is only populated on the View and
   // Geometry tabs; the contextual tab must follow every Results selection.
-  const selectedKind = useSelectionSelector((currentSelection) => currentSelection.kind ?? null);
-  const contextModuleId = analysisModuleIdForNodeKind(selectedKind ?? "");
+  const contextModuleId = useSelectionSelector(contextualAnalysisModuleIdForSelection);
   const contextModuleTitle = contextModuleId
     ? ANALYSIS_FEATURE_MANIFESTS.find((manifest) => manifest.id === contextModuleId)?.title ?? null
     : null;
-  const [dismissedContextModuleId, setDismissedContextModuleId] = useState<string | null>(null);
-  const contextTabActive = Boolean(contextModuleTitle) && dismissedContextModuleId !== contextModuleId;
+  const [contextualTabDismissal, setContextualTabDismissal] =
+    useState<ContextualTabDismissalState>(() => ({
+      contextModuleId,
+      dismissed: false,
+    }));
+  if (contextualTabDismissal.contextModuleId !== contextModuleId) {
+    setContextualTabDismissal((state) =>
+      contextualTabDismissalForModuleChange(state, contextModuleId)
+    );
+  }
+  const contextTabActive = contextualRibbonTabIsActive(
+    contextualTabDismissal,
+    contextModuleId,
+    Boolean(contextModuleTitle),
+  );
   const stripActiveTab: RibbonStripTabId = contextTabActive ? ANALYSIS_CONTEXT_TAB_ID : activeTab;
   const stripTabs = useMemo<readonly RibbonStripTabDef[]>(() => {
     if (!contextModuleTitle) return RIBBON_TABS;
@@ -403,10 +415,13 @@ export default function RibbonModule({ kernel }: ModuleProps) {
   const handleTabClick = useCallback(
     (tabId: RibbonStripTabId) => {
       if (tabId === ANALYSIS_CONTEXT_TAB_ID) {
-        setDismissedContextModuleId(null);
+        setContextualTabDismissal({ contextModuleId, dismissed: false });
         return;
       }
-      setDismissedContextModuleId(contextModuleId);
+      setContextualTabDismissal({
+        contextModuleId,
+        dismissed: contextModuleId !== null,
+      });
       setActiveTab(tabId);
     },
     [contextModuleId, setActiveTab],
@@ -553,7 +568,43 @@ export default function RibbonModule({ kernel }: ModuleProps) {
 export const __ribbonModuleTestUtils = {
   ribbonRuntimeStatusEquals,
   selectRibbonRuntimeStatus,
+  contextualAnalysisModuleIdForSelection,
+  contextualRibbonTabIsActive,
+  contextualTabDismissalForModuleChange,
 };
+
+interface ContextualTabDismissalState {
+  contextModuleId: string | null;
+  dismissed: boolean;
+}
+
+function contextualAnalysisModuleIdForSelection(
+  selection: Pick<Selection, "kind" | "ref">,
+): string | null {
+  const ref = selection.ref;
+  if (ref?.type === "analysis-pinned-group") {
+    return ANALYSIS_FEATURE_MANIFESTS.find((manifest) => manifest.id === ref.moduleId)?.id ?? null;
+  }
+  return analysisModuleIdForNodeKind(selection.kind ?? "");
+}
+
+function contextualTabDismissalForModuleChange(
+  state: ContextualTabDismissalState,
+  contextModuleId: string | null,
+): ContextualTabDismissalState {
+  return state.contextModuleId === contextModuleId
+    ? state
+    : { contextModuleId, dismissed: false };
+}
+
+function contextualRibbonTabIsActive(
+  state: ContextualTabDismissalState,
+  contextModuleId: string | null,
+  hasContextModuleTitle: boolean,
+): boolean {
+  return hasContextModuleTitle &&
+    (state.contextModuleId !== contextModuleId || !state.dismissed);
+}
 
 function isGlobalQuantityConfirmationInput(
   input: unknown,
