@@ -764,3 +764,18 @@ Regresje boundary/types/primary/alias/script oraz doc source map przygotowano.
 Nowy scoped workflow eigensolve-authoring-policy-contracts wykona je w GHA.
 AST/źródła sprawdzone; test execution, browser i native solve pozostają
 niezweryfikowane dla tej poprawki do uzyskania odpowiednich dowodów.
+
+
+## Dwie zależności nowych fixture — brak promocji FAIL do PASS
+
+#38135631293 na630b0f85ddcbc0e50d0a999b106ebed5885dab13 zatrzymał
+się na kompilacji nowej diagnostyki std::cerr bez deklaracji iostream.
+Zastąpiono ją istniejącą w tym pliku std::fprintf/cstdio, nadal bounded
+4096 znaków. Testy w tym runie nie zostały wykonane.
+
+#38136752769 nac840ead87b29b6ed802318a3282393fc3c9923aa:76PASS,
+24subtestsPASS,7FAIL,341deselected. Siedem awarii wystąpiło w nowych
+round-trip/omission fixtures przy odwołaniu do niezaimportowanego renderer:
+walidacja wartości i wcześniejsze asercje przeszły. Dodano lokalne importy
+w obu funkcjach, zgodnie z istniejącym stylem. Produkcji i oczekiwań
+nie zmieniono. Obie bramki wymagają kolejnego wykonania w GHA.

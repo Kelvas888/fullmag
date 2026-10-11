@@ -410,6 +410,8 @@ def test_scene_document_rejects_invalid_eigen_solver_rtol(
 def test_scene_document_preserves_primary_and_legacy_eigen_solver_rtol_round_trip(
     fields: dict[str, object], expected: float, expected_script: str
 ) -> None:
+    from fullmag.runtime.script_builder import render_scene_document_as_script
+
     builder = _builder(backend="fem")
     builder["stages"].append({"kind": "eigenmodes"})
     scene = build_scene_document_from_builder(builder)
@@ -428,6 +430,8 @@ def test_scene_document_preserves_primary_and_legacy_eigen_solver_rtol_round_tri
 def test_scene_document_omits_unset_eigen_solver_rtol(
     field_name: str, raw_value: str | None
 ) -> None:
+    from fullmag.runtime.script_builder import render_scene_document_as_script
+
     builder = _builder(backend="fem")
     builder["stages"].append({"kind": "eigenmodes"})
     scene = build_scene_document_from_builder(builder)

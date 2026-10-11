@@ -441,6 +441,30 @@
       "browser": "NOT VERIFIED",
       "scientific_qualification": "NOT VERIFIED",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38135631293,
+      "sha": "630b0f85ddcbc0e50d0a999b106ebed5885dab13",
+      "conclusion": "failure",
+      "scope": "modal_phase_selected_window_fixture",
+      "phase": "native_test_compilation",
+      "failure": "new bounded diagnostics use std::cerr without iostream declaration",
+      "tests_executed": false,
+      "receipt_sha256": "dfc0cbc979c45358c6a820b79d6025d2a98c114ee2578e7a53bfd03541e25432",
+      "qualification_claimed": false
+    },
+    {
+      "run_id": 38136752769,
+      "sha": "c840ead87b29b6ed802318a3282393fc3c9923aa",
+      "conclusion": "failure",
+      "scope": "focused_authoring_policy_contracts",
+      "tests_passed": 76,
+      "tests_failed": 7,
+      "subtests_passed": 24,
+      "tests_deselected": 341,
+      "failure": "two new render round-trip fixtures lack local render_scene_document_as_script import; production validation assertions reached and passed",
+      "log_sha256": "451e55580f9ee778c77c9cc48720d253d4c507f50defc6ccdd997118aa97f541",
+      "qualification_claimed": false
     }
   ]
 }

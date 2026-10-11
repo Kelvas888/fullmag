@@ -1896,10 +1896,11 @@ void FrequencyWindowCoversBothClippedEdges()
                            : requested > initial_refinement_request) &&
             contains(observation.c_str(), "\"local_coverage_certified\":true");
         if (!covered_within_budget) {
-            std::cerr << "clipped-edge request=" << requested << " retries=" << retries
-                      << " base_request=" << base_request
-                      << " initial_refinement_request=" << initial_refinement_request
-                      << " observation=" << observation.substr(0u, 4096u) << '\n';
+            std::fprintf(stderr,
+                         "clipped-edge request=%.17g retries=%.17g base_request=%.17g "
+                         "initial_refinement_request=%.17g observation=%s\n",
+                         requested, retries, base_request, initial_refinement_request,
+                         observation.substr(0u, 4096u).c_str());
         }
         check(covered_within_budget,
               "clipped edge discovery must either already cover the endpoints or grow within its request budget");
