@@ -273,13 +273,13 @@ function antennaCompositionNodes(
       contextCommands: ["workspace.focus-selection"],
     },
     ...portModes.map((mode) => {
-      const status = antennaPortStatus(mode);
+      const status = antennaPortStatus(mode, scene ?? null);
       return {
         id: `${antennaParentId}:port:${encodeURIComponent(mode.id)}`,
         kind: "object.antenna.port" as const,
         label: `Port ${mode.id}`,
         parentId: antennaParentId,
-        badge: `${mode.branches.length} branches${status === "ready" ? "" : " · invalid"}`,
+        badge: `${mode.branches.length} branches${status === "ready" ? " · authoring" : " · invalid"}`,
         icon: "activity" as const,
         objectId,
         objectRole: "antenna" as const,

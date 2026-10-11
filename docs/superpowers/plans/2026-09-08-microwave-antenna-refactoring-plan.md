@@ -1,5 +1,40 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Checkpoint T15 — 2026-10-11, diagnostyka referencji portu w UI:**
+`antennaPortValidation.ts::antennaPortValidationMessages` otrzymuje aktualny
+`SceneResource`; wspólną walidację wykorzystują Explorer i `AntennaPortPanel`.
+Sprawdza jednoznaczny transport static one-way OhmicPoisson, istniejący source,
+przynależność terminali do domeny, parę na jednym obiekcie oraz dodatnią gałąź
+na source. Zachowuje kanoniczną kolejność namespace: current-source observations
+→ lead-preparation extensions → electrical boundaries. Obecny nieprawidłowy
+source nie może zostać zastąpiony poprawnymi historycznymi boundaries.
+Source/preparation wymaga dokładnie jednego jawnego drive dla portu.
+Poprawne referencje są opisane jako `valid authoring references` / `authoring`,
+nie jako kwalifikacja domknięcia prądu, siatki ani pola.
+
+Wykonano `verify-antenna-port-diagnostics-browser` na izolowanym porcie 3263:
+**8 wariantów + stabilność PASS**, 11 żądań GET, 30 renderów, zachowany DOM root,
+fokus i lokalny szkic; zero aktywnych animacji opacity, błędów strony/konsoli
+oraz dodatkowych żądań/renderów przez 700 ms po ustaleniu stanu.
+Raport i dwa wizualnie sprawdzone zrzuty są w
+`storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/windows-control-room-browser-fixture/antenna-port-diagnostics-browser/cc29b41b715241d8b3a1766248a9cc4f/`.
+Pierwsza próba fixture nie zadeklarowała current session, druga miała błędnie
+zakotwiczony selektor względny; obie zostały zachowane jako failed i poprawione,
+nie zaliczone. TypeScript finalnych źródeł, ESLint całego frontendu
+i API hygiene: **PASS**. Receipts source-check:
+`production-source/42ef3e127fe54fc297de8f6c4924aff4`,
+`lint/c36f0b24a72d4ac9ba7477116e6d0825`,
+`api-hygiene/d187219093ad41aa8d9ce14baa4a8960`
+pod `storage/builds/microwave-antenna-latest-2026090-78aaec16ccf52671/windows-control-room-source-check/`.
+Interpretowane regresje dispatchera: **7 PASS + 10 podtestów**.
+Niezależny source review: brak Required/Blocker. Testy Vitest zapisano, lecz
+nie kompilowano ani nie uruchamiano zgodnie z zakazem budowania unit tests.
+
+To kontrolowany HTTP fixture rzeczywistych komponentów, nie odbiór backendu,
+WebGL ani fizyki. Edytor portu nadal wymaga implementacji; nie dodano mutacji,
+nie zmieniono sceny ani workspace 3197. Build 45 nadal `queued`; terminalny ACK,
+canonical V/J/H readback i cold import oraz pełne T00–T18 pozostają otwarte.
+
 **Checkpoint narzędzi odbioru — 2026-10-11, wykonanie natywne nadal otwarte:**
 Dodano jawną receptę `run-managed-antenna-cold-http-ram` i narzędzie
 `scripts/antenna_inspection_cold_import_check.py::verify_cold_import`.

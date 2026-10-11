@@ -56,6 +56,13 @@ class StorageShellTests(unittest.TestCase):
                           '--source-digest', ids[2], '--native-snapshot-sha256', ids[3],
                           '--verify-cold-import'], result.stdout.splitlines()[3:])
 
+    def test_full_just_port_diagnostics_dispatches_fixed_browser_fixture(self):
+        result = self.antenna_http_shell(just_args=['verify-antenna-port-diagnostics-browser'])
+        self.assertEqual(0, result.returncode, result.stderr)
+        arguments = result.stdout.splitlines()
+        self.assertTrue(arguments[0].replace('\\', '/').endswith('/scripts/verify_pinned_dataset_browser.py'))
+        self.assertEqual(['--port', '3263', '--scenario', 'antenna-port-diagnostics'], arguments[3:])
+
     def test_antenna_http_dispatch_rejects_composite_and_internal_commands(self):
         base = 'python "D:/ignored/scripts/run_managed_antenna_http_ram.py" --repo-root "D:/ignored" '
         start = base + "start --job-id '" + 'a' * 32 + "' --commit '" + 'b' * 40 + "' --source-digest '" + 'c' * 64 + "' --native-snapshot-sha256 '" + 'd' * 64 + "'"

@@ -233,12 +233,13 @@ function portDetails(
   if (!mode) {
     return { title: "Antenna port", badge: "missing", rows: [{ label: "Status", value: "Port mode is not present in SceneResource." }] };
   }
-  const validationMessages = antennaPortValidationMessages(mode);
+  const validationMessages = antennaPortValidationMessages(mode, scene);
   return {
     title: `Antenna port ${mode.id}`,
     badge: `${mode.branches.length} branches${validationMessages.length > 0 ? " · invalid" : ""}`,
     rows: [
-      { label: "Validation", value: validationMessages.join("; ") || "ready" },
+      { label: "Validation", value: validationMessages.join("; ") || "valid authoring references" },
+      { label: "Qualification", value: "Authoring only; no current-closure, mesh or field qualification." },
       { label: "ID", value: mode.id, mono: true },
       { label: "Schema", value: mode.schema_version, mono: true },
       { label: "Source object", value: mode.source_object_id, mono: true },
