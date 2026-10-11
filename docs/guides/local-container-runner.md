@@ -465,6 +465,39 @@ Kontener i eksport są zachowane także po błędzie; observer nie startuje
 nowego solve ani nie usuwa zasobów. Utrata RAM po zakończeniu kontenera jest
 zamierzona; eksport nie dowodzi odporności sesji na utratę zasilania.
 
+### Zamrożony obraz koordynatora
+
+`just runner-coordinator-base` pobiera wyłącznie bazę przypiętą digestem w
+`Dockerfile.coordinator`. Jest to jawna operacja sieciowa; zapisuje log i terminalny
+receipt przez resolver. Fizyczny dysk danych Dockera musi być zgodny z polityką
+storage hosta. Przygotowanie i build obrazu pozostają offline.
+
+`just runner-coordinator-context <pełny-SHA-commita>` zamraża dokładne wejścia
+COPY z jawnego commita. Wynik podaje prywatny kontekst oraz SHA256 `context.json`.
+`just runner-coordinator-image-frozen <kontekst> <SHA256-context.json> <tag>`
+wymaga taga `fullmag/build-runner:*`, sprawdza niezmienność kontekstu i lokalnej
+bazy, buduje bez sieci i pull, a następnie odczytuje rzeczywiste pliki z obrazu.
+Dodatkowy COPY manifestu istnieje tylko w wygenerowanym Dockerfile kontekstu.
+
+Helper `scripts/local_runner/coordinator_image.py` używa bounded logs, blokady
+kontekstu i terminalnego receiptu. Regresje interpretowane w
+`scripts/test_coordinator_image.py` nie stanowią dowodu buildu obrazu.
+Receptury nie uruchamiają Application, nie zmieniają operatora, profili ani kolejki
+oraz nie kompilują solvera. `SUCCEEDED_IMAGE_ONLY` oznacza wyłącznie zweryfikowany
+obraz; aktywacja i wycofanie wymagają odrębnych kontroli istniejącego runnera.
+Historyczne `runner-coordinator-image` pozostaje receptą diagnostyczną.
+
+Dowód z 11.10.2026: 24 regresje interpretowane PASS; rzeczywiste receptury
+pobrania bazy, capture commita `96a648d828c6ea152d2dd294cf3407a193ad714f`
+i offline build/readback zakończyły się exit 0. Obraz
+`sha256:d60a214fba8d4b146d9ab09315d5c018e38c7c0a10d30a35369796a5361b723e`
+przeszedł osobny import jako UID 65532, readonly, bez sieci i mountów:
+Python 3.11.15, wszystkie siedem profili katalogu, BORIS domyślnie wyłączony.
+Receipt importu ma SHA256
+`26fa456a074670742a1edd9dc6aaa99f5a37251922879b11cb20151f88713089`.
+To dowód producenta i importów dla wskazanego commita; nie obejmuje późniejszej
+transakcji wycofania profilu ani wdrożenia tego obrazu w działającym runnerze.
+
 ### Pozostałe ograniczenia
 
 - Build/uruchomienie Fullmaga z prywatnej kopii kapsuły i jawnego execution context.

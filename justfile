@@ -65,8 +65,20 @@ runner-image:
 runner-build-image toolchain_image tag="fullmag/local-runner-build:development":
     docker --context desktop-linux build --network none --pull=false --build-arg TOOLCHAIN_IMAGE={{quote(toolchain_image)}} -f scripts/local_runner/Dockerfile.build -t {{quote(tag)}} scripts/local_runner
 
+# Diagnostic legacy producer; use the frozen recipes for deployment evidence.
 runner-coordinator-image:
     docker --context desktop-linux build --network none --pull=false -f scripts/local_runner/Dockerfile.coordinator -t fullmag/build-runner:development scripts
+
+# Explicit network download of only the pinned coordinator base.
+runner-coordinator-base:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/coordinator_image.py" provision-base --repo-root {{quote(repo_root)}}
+
+# Freeze an explicit committed coordinator source without changing the operator.
+runner-coordinator-context ref:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/coordinator_image.py" prepare-image-context --repo-root {{quote(repo_root)}} --source commit --ref {{quote(ref)}}
+
+runner-coordinator-image-frozen context context_sha256 tag:
+    @{{storage_python}} "{{repo_root}}/scripts/local_runner/coordinator_image.py" build-image --repo-root {{quote(repo_root)}} --context {{quote(context)}} --context-sha256 {{quote(context_sha256)}} --tag {{quote(tag)}}
 
 runner-container-configure image_id:
     {{storage_python}} scripts/local_runner_cli.py container-configure --image-id {{quote(image_id)}}

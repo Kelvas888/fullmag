@@ -84,6 +84,26 @@ if is_windows_shell && command -v cygpath >/dev/null 2>&1; then
     bash_executable="$(cygpath -w "${bash_path}")"
   fi
 fi
+# Frozen coordinator provisioning must be admitted before diagnostic markers.
+case "${recipe}" in
+  *"scripts/local_runner/coordinator_image.py"*)
+    coordinator_base_pattern="^[^[:space:]]+ \"[^\"]+/scripts/local_runner/coordinator_image.py\" provision-base --repo-root '([^']+)'$"
+    if [[ "${recipe}" =~ ${coordinator_base_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/local_runner/coordinator_image.py" provision-base --repo-root "${repo_root}"
+    fi
+    coordinator_context_pattern="^[^[:space:]]+ \"[^\"]+/scripts/local_runner/coordinator_image.py\" prepare-image-context --repo-root '([^']+)' --source commit --ref '([a-f0-9]{40})'$"
+    if [[ "${recipe}" =~ ${coordinator_context_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/local_runner/coordinator_image.py" prepare-image-context --repo-root "${repo_root}" --source commit --ref "${BASH_REMATCH[2]}"
+    fi
+    coordinator_image_pattern="^[^[:space:]]+ \"[^\"]+/scripts/local_runner/coordinator_image.py\" build-image --repo-root '([^']+)' --context '([^']+)' --context-sha256 '([a-f0-9]{64})' --tag '(fullmag/build-runner:[a-z0-9][a-z0-9_.-]{0,100})'$"
+    if [[ "${recipe}" =~ ${coordinator_image_pattern} ]]; then
+      exec "${python_cmd}" "${script_dir}/local_runner/coordinator_image.py" build-image --repo-root "${repo_root}" --context "${BASH_REMATCH[2]}" --context-sha256 "${BASH_REMATCH[3]}" --tag "${BASH_REMATCH[4]}"
+    fi
+    echo "[fullmag just] invalid frozen coordinator image recipe" >&2
+    exit 2
+    ;;
+esac
+
 # Admit this fixed helper before generic diagnostic substring handling, so a
 # composite command cannot use a diagnostic marker to bypass its argument check.
 case "${recipe}" in
