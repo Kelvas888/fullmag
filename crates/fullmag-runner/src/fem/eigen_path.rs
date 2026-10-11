@@ -1704,6 +1704,18 @@ pub(crate) mod test_support {
                 || artifact.relative_path.ends_with("demag_element_full.bin")
         }));
 
+        let tracking_outputs = eigen_path_tracking_outputs(&outputs, plan.count);
+        let incomplete_completed = bias_field_native_artifact_pipeline_fixture(
+            &plan, 0, &tracking_outputs,
+        ).expect("accepted sample fixture");
+        let incomplete_error = crate::fem::eigen_sweep::merge_bias_field_sweep_runs(
+            vec![incomplete_completed],
+            plan.bias_field_samples.len(),
+            plan.bias_field_samples[0].equilibrium_policy,
+            plan.bias_field_samples[0].continuation_seed,
+        ).expect_err("a completed sweep must not publish a missing planned sample");
+        assert!(incomplete_error.message.contains("completed bias-field sweep has 1 sample runs"));
+
         let paused_prefix = crate::fem::eigen_sweep::execute_bias_field_sweep_with_publication(
             &plan,
             &outputs,

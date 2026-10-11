@@ -1257,6 +1257,14 @@ fn merge_bias_field_sweep_runs_with_terminal(
         .as_ref()
         .map(|(status, _)| *status)
         .unwrap_or(inferred_sweep_status);
+    if sweep_status == RunStatus::Completed && all_runs.len() != sample_count {
+        return Err(RunError {
+            message: format!(
+                "completed bias-field sweep has {} sample runs but its plan requires {sample_count}",
+                all_runs.len()
+            ),
+        });
+    }
     let sweep_complete = sweep_status == RunStatus::Completed
         && all_runs
             .iter()

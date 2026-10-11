@@ -608,6 +608,34 @@
       "browser": "NOT VERIFIED",
       "performance_measurement": "NOT VERIFIED",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38142110863,
+      "sha": "18768a00c8fcb614073a46410a71a196f7778e5b",
+      "conclusion": "success",
+      "scope": "field_selection_interrupted_prefix_and_Floquet_terminal_source_contracts",
+      "output_selector_tests_passed": 16,
+      "identity_tests_passed": 5,
+      "exact_Floquet_control_and_checkpoint_tests_passed": 2,
+      "actual_single_writer_test_passed": true,
+      "actual_tracked_bias_aggregation_passed": true,
+      "log_sha256": "2ed0f6e7388c6559302899deda7b21fd8f4b94f9cc0e007149e678a7a782f334",
+      "native_C_ABI_interruption": "NOT VERIFIED",
+      "scientific_qualification": "NOT VERIFIED",
+      "qualification_claimed": false
+    },
+    {
+      "run_id": 38142322832,
+      "sha": "c1a07869cbe86bf8b084362a293930cd5cc1d80e",
+      "conclusion": "failure",
+      "scope": "retention_Linux_and_Windows_contracts",
+      "Linux": "success",
+      "Windows": "failure:2older lifecycle tests wait on host Docker info beyond5s",
+      "new_forced_tick_regression": "passed on both platforms",
+      "failure": "fixture inventories real host daemon instead of isolated temp storage; mock only Docker root telemetry in lifecycle fixture, keep inventory and concurrency checks",
+      "log_sha256": "a411fd9b4f738595127cdf12fb21ec35576c365f6a1ff9edf1edaf50a09c06a9",
+      "host_cleanup_performed": false,
+      "qualification_claimed": false
     }
   ]
 }

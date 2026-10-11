@@ -868,3 +868,10 @@ Interrupted-prefix follow-up: scoped bias selector zachowuje declared sample IDs
 ## Retention forced tick 4241442699
 
 Częste terminalne buildy wywołują force tick przed regularnym interval; wcześniej wymuszał execution i przesuwał clock, głodząc runtime. Force teraz zmienia tylko cadence, zachowuje next_automatic_scope gdy runtime_retention_enabled=true. Opt-out nadal execution only, mode preview oraz busy/queue guards nadal blokują automatyczną operację. Mocked preview regression4ticków co60s wymaga execution/runtime/execution/runtime, sprawdza opt-out i preview. AST/diff PASS, GHA retention pending. Nie zmieniono bieżącej polityki hosta, demona ani danych.
+
+
+#38142110863: pełny scoped source workflow SUCCESS:16selector+5identity+2Floquet terminal+1actualwriter+1actualtrackedbias tests PASS. Nie kwalifikuje native C ABI interruption ani fizyki dyspersji.
+
+#38142322832:retention Linux SUCCESS, Windows FAIL w dwóch wcześniejszych fixture oczekujących actualDocker probe; nowa forced-tick regression PASS na obu. Fixture mockuje wyłącznie Docker-root telemetry (osobne admission tests pozostają), nadal rzeczywiste temp inventory/lock/queue i5s bounded join. Zapisano FAIL; rerun wymagany.
+
+Dodatkowy guard poprawności finalizacji: inferred/explicit Completed sweep z liczbą runów inną niż sample_count odmówiony przed publikacją; jawny Paused/Cancelled prefix nadal legalny. Nowa negative regression musi przejść w GHA. To zapobiega ukryciu brakującej próbki po rozszerzeniu selector plan universe.
