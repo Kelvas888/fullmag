@@ -2,12 +2,14 @@ import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
 import { fieldVectorResourceKey } from "@/kernel/api/fieldQueryIdentity";
 import { describe, expect, it } from "vitest";
+import type { FrequencyDomainChartSeries } from "@/shared/domain/analysis/frequencyDomainChartModels";
 import {
   frequencySeriesRenderModel,
   frequencySpectrumRenderModel,
 } from "@/shared/analysis-charts/frequencyRenderModels";
 
 import {
+  frequencyDomainSelectableSeriesPointIndexFromChartEvent,
   frequencyDomainSeriesPointIndexFromChartEvent,
   FrequencyDomainDispersionChart,
   FrequencyDomainResponseChart,
@@ -264,6 +266,98 @@ describe("FrequencyDomainCharts", () => {
     expect(
       frequencyDomainSeriesPointIndexFromChartEvent({ data: "invalid" }),
     ).toBeNull();
+  });
+
+  it("only maps dispersion clicks from matching computed-series identities", () => {
+    const source = {
+      kind: "analysis.frequency_domain" as const,
+      resourceKey: "analysis/frequency-domain/eigen/dispersion",
+      tableId: "frequency-domain:eigen-dispersion",
+    };
+    const seriesFor = (
+      id: string,
+      quantity: string,
+      kind?: "line" | "scatter",
+    ): FrequencyDomainChartSeries => ({
+      id,
+      label: id,
+      points: [{ rowIndex: 0, x: 1, y: 2 }],
+      quantity,
+      source,
+      status: "ready",
+      unit: "GHz",
+      xUnit: "rad/m",
+      ...(kind ? { kind } : {}),
+    });
+    const series = [
+      { ...seriesFor("empty-reference", "reference_frequency"), points: [] },
+      seriesFor("computed-branch", "frequency"),
+      seriesFor("analytic-overlay", "analytic_frequency"),
+      seriesFor("imported-reference", "reference_frequency"),
+      seriesFor("reference-scatter", "reference_frequency", "scatter"),
+    ];
+    const click = (seriesIndex: number, seriesId: string) => ({
+      data: [1, 2, 0],
+      seriesId,
+      seriesIndex,
+    });
+
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        click(0, "computed-branch"),
+        series,
+      ),
+    ).toBe(0);
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        click(1, "analytic-overlay"),
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        click(2, "imported-reference"),
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        click(3, "reference-scatter"),
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        { data: [1, 2, 0], seriesIndex: 0 },
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        { data: [1, 2, 0], seriesId: "", seriesIndex: 0 },
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        { data: [1, 2, 0], seriesId: "computed-branch" },
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        click(0, "analytic-overlay"),
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        click(8, "missing-series"),
+        series,
+      ),
+    ).toBeNull();
+    // Legacy row-only consumers retain their existing event parser contract.
+    expect(frequencyDomainSeriesPointIndexFromChartEvent({ data: [1, 2, 0] })).toBe(0);
   });
 
   it("renders selectable response and dispersion chart point controls", () => {

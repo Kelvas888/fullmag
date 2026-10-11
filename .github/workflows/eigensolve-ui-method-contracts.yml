@@ -6,6 +6,10 @@ on:
     branches: ['codex/**']
     paths:
       - 'apps/control-room/src/shared/analysis-charts/frequencyRenderModels*'
+      - 'apps/control-room/src/shared/analysis-charts/chartRenderer*'
+      - 'apps/control-room/src/modules/inspector/panels/FrequencyDomainCharts*'
+      - 'apps/control-room/src/modules/analysis-plots/useAnalysisPlotsController.ts'
+      - 'apps/control-room/src/modules/analysis-plots/referenceChartQuantity.test.ts'
       - 'apps/control-room/src/shared/domain/analysis/modalDampingObservables*'
       - 'apps/control-room/src/shared/domain/analysis/frequencyDomainChartModels*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/EigenModeInspectorPanel*'
@@ -15,6 +19,10 @@ on:
   pull_request:
     paths:
       - 'apps/control-room/src/shared/analysis-charts/frequencyRenderModels*'
+      - 'apps/control-room/src/shared/analysis-charts/chartRenderer*'
+      - 'apps/control-room/src/modules/inspector/panels/FrequencyDomainCharts*'
+      - 'apps/control-room/src/modules/analysis-plots/useAnalysisPlotsController.ts'
+      - 'apps/control-room/src/modules/analysis-plots/referenceChartQuantity.test.ts'
       - 'apps/control-room/src/shared/domain/analysis/modalDampingObservables*'
       - 'apps/control-room/src/shared/domain/analysis/frequencyDomainChartModels*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/EigenModeInspectorPanel*'
@@ -59,6 +67,9 @@ jobs:
           python -B scripts/fullmag_storage.py run --profile linux-host --
           pnpm --dir apps/control-room exec vitest run
           src/shared/analysis-charts/frequencyRenderModels.test.ts
+          src/shared/analysis-charts/chartRenderer.test.ts
+          src/modules/inspector/panels/FrequencyDomainCharts.test.tsx
+          src/modules/analysis-plots/referenceChartQuantity.test.ts
           src/shared/domain/analysis/modalDampingObservables.test.ts
           src/shared/domain/analysis/phasorConventionAdapter.test.ts
           src/shared/domain/analysis/frequencyDomainChartModels.test.ts

@@ -567,6 +567,19 @@
       "failure": "later independent paused-prefix selection regression still rejects requested future sample1",
       "log_sha256": "da2707402f4140fc40bc62896b90ec82a8d63bfe8d1da84b1959c9236bdce6c4",
       "qualification_claimed": false
+    },
+    {
+      "run_id": 38141096311,
+      "sha": "a35a31078c43b9d75f4e6fc01e5e6c3733d9156a",
+      "conclusion": "success",
+      "scope": "physical_field_freshness_API_source_contracts",
+      "session_tests_passed": 83,
+      "exact_router_tests_passed": 3,
+      "named_freshness_regression": "router_v2::tests::v2_progress_keeps_live_magnetization_at_its_original_observation_step",
+      "log_sha256": "5f29f6f23f4758ef392b41b63d37eca20b4758ef7c5a4780040885f294044562",
+      "browser": "NOT VERIFIED",
+      "managed_runtime": "NOT VERIFIED",
+      "qualification_claimed": false
     }
   ]
 }

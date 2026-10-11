@@ -134,6 +134,8 @@ describe("frequency render models", () => {
         "k-path s",
       );
       expect(model.series.map((entry) => entry.id)).toEqual(order);
+      expect(model.series.filter((entry) => entry.selectable).map((entry) => entry.id))
+        .toEqual(["numerical"]);
     }
     const numericalFirst = frequencySeriesRenderModel(
       [byId.numerical!, byId.analytic!, byId.reference!],

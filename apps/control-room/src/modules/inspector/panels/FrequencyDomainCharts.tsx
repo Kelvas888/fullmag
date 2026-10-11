@@ -6,7 +6,11 @@ import { Eye } from "lucide-react";
 import { EChartsCanvasSurface } from "@/shared/analysis-charts/EChartsCanvasSurface";
 import { ChartExportControls } from "@/shared/analysis-charts/ChartExportControls";
 import type { ChartRendererOwner, ChartRenderModel } from "@/shared/analysis-charts/chartRenderer";
-import { frequencySeriesRenderModel } from "@/shared/analysis-charts/frequencyRenderModels";
+import {
+  compatibleFrequencySeries,
+  frequencySeriesRenderModel,
+  isReferenceChartQuantity,
+} from "@/shared/analysis-charts/frequencyRenderModels";
 
 import type {
   EigenDispersionPoint,
@@ -145,7 +149,10 @@ export function FrequencyDomainDispersionChart({
   onSelectPoint?: (point: EigenDispersionPoint) => void;
 }) {
   const resolvePoint = (event: unknown) => {
-    const rowIndex = frequencyDomainSeriesPointIndexFromChartEvent(event);
+    const rowIndex = frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+      event,
+      model.series,
+    );
     return rowIndex == null ? null : model.points[rowIndex] ?? null;
   };
 
@@ -551,4 +558,39 @@ export function frequencyDomainSeriesPointIndexFromChartEvent(
   return typeof rowIndex === "number" && Number.isInteger(rowIndex)
     ? rowIndex
     : null;
+}
+
+export function frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+  event: unknown,
+  series: readonly FrequencyDomainChartSeries[],
+): number | null {
+  const record = event && typeof event === "object"
+    ? event as { seriesId?: unknown; seriesIndex?: unknown }
+    : null;
+  if (
+    !record ||
+    typeof record.seriesId !== "string" ||
+    record.seriesId.length === 0
+  ) {
+    return null;
+  }
+  if (
+    typeof record.seriesIndex !== "number" ||
+    !Number.isInteger(record.seriesIndex) ||
+    record.seriesIndex < 0
+  ) {
+    return null;
+  }
+
+  const selectedSeries = compatibleFrequencySeries(series)[record.seriesIndex];
+  if (
+    !selectedSeries ||
+    selectedSeries.id !== record.seriesId ||
+    isReferenceChartQuantity(selectedSeries.quantity)
+  ) {
+    return null;
+  }
+
+  const rowIndex = frequencyDomainSeriesPointIndexFromChartEvent(event);
+  return rowIndex != null && rowIndex >= 0 ? rowIndex : null;
 }

@@ -26,6 +26,7 @@ import {
 import type { AnalysisChartCursorPoint } from "@/shared/domain/analysis/chartCursorPoint";
 import type { ChartValueRange } from "./chartTableModel";
 import type { ChartDataPresentationState } from "@/shared/analysis-charts/chartPresentationState";
+import { isReferenceChartQuantity } from "@/shared/analysis-charts/frequencyRenderModels";
 import {
   eigenModeFieldAvailable,
   type FrequencyDomainResultContext,
@@ -295,9 +296,7 @@ function selectionAnalysisSurface(selection: Selection) {
   return analysisSurfaceForSelectionKind(selection.kind);
 }
 
-export function isReferenceChartQuantity(quantity: string): boolean {
-  return quantity === "analytic_frequency" || quantity.startsWith("reference_");
-}
+export { isReferenceChartQuantity };
 
 export function selectedHysteresisStageIdFromSelection(selection: Selection | null): string | null {
   const ref = selection?.ref as { stageId?: string; stageKind?: string; type?: string } | null;

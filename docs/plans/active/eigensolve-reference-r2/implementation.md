@@ -846,3 +846,12 @@ Po wyborze zaakceptowanej observation frame freshness helper aktualizuje teraz n
 Callback zachowuje Pause/Stop w atomic reason; wspólny terminal state steruje RunStatus, completion, diagnostics reason, partial metadata i manifest interrupted/complete=false. Pauza nie staje się Cancelled. Pole i mode-output-selection payloady/provenance zachowane; manifest nie ma self-hash, existing spectrum refs pozostają związane z niemutowanymi bytes. Helper regressions sprawdzają latching, priority, Pause/Stop i checkpoint status/provenance/SHA. Root review poprawił początkową sprzeczną asercję priority; parser/diff PASS. GHA pending, actual native C ABI interruption NOT VERIFIED. Generic boundary progress→RunError jest osobnym otwartym findingiem i nie został przez tę poprawkę ukryty.
 
 All-mode provenance #38140833390:5 identity tests PASS, w tym nowa named regression; całe CI nadal FAIL w odrębnej paused-prefix selection. Awarii nie przemianowano na pełny PASS.
+
+
+## Kliknięcia referencji i wspólny budżet symboli
+
+4241564413: ECharts publikuje stabilne series.id; Inspector handler wymaga zgodności seriesId/index z faktycznie kompatybilnymi seriami i wspólny pure helper wyklucza analytic_frequency/reference_* z wyboru modu. Analysis controller zachowuje publiczny eksport tego samego classifier. Reference serie pozostają widoczne z tooltip/export; legacy row-only parser innych wykresów bez zmian.
+
+4241564417: optional selectable default=true zachowuje pozostałe modele; frequency adapter wyłącza reference targets. Sumowany całkowity budget5000targetable linepoints: exact limit włącza symbole,5001wyłącza line symbols. Bez truncation danych lub zmiany scatterformat. Regresje model/helper/ECharts i source review przygotowane; GHA pending, rzeczywisty click/browser i czas renderowania NOT VERIFIED.
+
+API freshness #38141096311:83sessiontests+3exact router cases PASS, w tym actual physical7/progress8 source/status/reason. Brak kwalifikacji browser/runtime.

@@ -11,6 +11,11 @@ const FREQUENCY_OVERLAY_QUANTITIES = new Set([
   "reference_frequency",
 ]);
 
+/** Reference quantities remain visible but cannot select a computed result. */
+export function isReferenceChartQuantity(quantity: string): boolean {
+  return quantity === "analytic_frequency" || quantity.startsWith("reference_");
+}
+
 export function frequencySpectrumRenderModel<
   T extends { dampingRateHz?: number | null; frequencyValue: number; rowIndex: number },
 >(
@@ -112,6 +117,7 @@ export function frequencySeriesRenderModel(
       kind: entry.kind ?? "line",
       label: entry.label,
       points: entry.points,
+      selectable: !isReferenceChartQuantity(entry.quantity),
       unit: entry.unit,
       yAxis: 0,
     })),

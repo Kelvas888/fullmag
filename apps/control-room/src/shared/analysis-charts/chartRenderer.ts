@@ -19,7 +19,7 @@ import {
 } from "./fullmagChartTokens";
 import type { ChartScientificTrust } from "./chartScientificTrust";
 
-const MAX_INTERACTIVE_LINE_POINTS = 5_000;
+const MAX_TOTAL_INTERACTIVE_LINE_POINTS = 5_000;
 
 export type ChartRenderStatus =
   | "loading"
@@ -63,6 +63,8 @@ export interface ChartRenderSeries {
   kind: "line" | "scatter";
   label: string;
   points: readonly ChartRenderPoint[];
+  /** Whether points may be used as semantic selection targets; defaults to true. */
+  selectable?: boolean;
   unit: string;
   yAxis: number;
 }
@@ -285,6 +287,15 @@ export function chartRenderModelToEChartsOption(
   // Compute Y-axis count from series
   const yAxisCount = chartYAxisCount(model.series);
   const yAxes = model.yAxes.length > 0 ? model.yAxes : [{ label: "", unit: "" }];
+  const selectableLinePointCount = model.series.reduce(
+    (count, series) =>
+      count + (series.kind === "line" && series.selectable !== false
+        ? series.points.length
+        : 0),
+    0,
+  );
+  const linePointTargetsWithinBudget =
+    selectableLinePointCount <= MAX_TOTAL_INTERACTIVE_LINE_POINTS;
 
   // Auto-scale axes
   const xScale = computeXScale(model);
@@ -331,7 +342,9 @@ export function chartRenderModelToEChartsOption(
     series: model.series.map((series, visibleIndex) => {
       const color = chartSeriesColor(series, visibleIndex, palette);
       const linePointHitTargets =
-        series.kind === "line" && series.points.length <= MAX_INTERACTIVE_LINE_POINTS;
+        series.kind === "line" &&
+        series.selectable !== false &&
+        linePointTargetsWithinBudget;
       return {
         // NOTE: No `sampling` property — data is already server-decimated.
         connectNulls: false,
@@ -355,11 +368,11 @@ export function chartRenderModelToEChartsOption(
             ? { color }
             : undefined,
         lineStyle: { color, width: 1.5 },
+        id: series.id,
         name: seriesDisplayName(series, yScales),
         progressive: 0,
-        // Line points are capped to the chart's 5,000 point budget. Transparent
-        // circles provide actual ECharts dataIndex click targets without adding
-        // visible markers at rest. Larger line inputs stay marker-free.
+        // Selectable line points share one chart-wide 5,000-point budget.
+        // Transparent circles provide dataIndex click targets without visible markers.
         showSymbol: series.kind === "scatter" || linePointHitTargets,
         symbol: "circle",
         symbolSize: series.kind === "line" ? 2 : 4,

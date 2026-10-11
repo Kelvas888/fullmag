@@ -40,7 +40,7 @@ describe("chart renderer owner", () => {
     owner.mount({} as HTMLElement);
     owner.update(model);
     expect(chart.setOption).toHaveBeenCalledWith(expect.objectContaining({
-      series: [expect.objectContaining({ data: [[1, 0.25, 7]] })],
+      series: [expect.objectContaining({ id: "mx", data: [[1, 0.25, 7]] })],
     }), false);
   });
 
@@ -100,44 +100,66 @@ describe("chart renderer owner", () => {
     ]);
   });
 
-  it("keeps line point hit targets inside the 5,000 point rendering budget", () => {
-    const points = Array.from({ length: 5_000 }, (_, rowIndex) => ({
-      rowIndex,
-      x: rowIndex,
-      y: rowIndex / 10,
-    }));
+  it("limits selectable line symbols to a chart-wide budget of 5,000 points", () => {
+    const lineSeries = (
+      id: string,
+      pointCount: number,
+      selectable = true,
+    ) => ({
+      ...model.series[0]!,
+      id,
+      label: id,
+      selectable,
+      points: Array.from({ length: pointCount }, (_, rowIndex) => ({
+        rowIndex,
+        x: rowIndex,
+        y: rowIndex / 10,
+      })),
+    });
     const boundedOption = chartRenderModelToEChartsOption({
       ...model,
-      series: [{ ...model.series[0]!, points }],
+      series: [lineSeries("branch-a", 2_500), lineSeries("branch-b", 2_500)],
     });
-    expect(boundedOption.series).toEqual([
+    expect(boundedOption.series).toEqual(expect.arrayContaining([
       expect.objectContaining({
-        data: expect.arrayContaining([[4_999, 499.9, 4_999]]),
+        data: expect.arrayContaining([[2_499, 249.9, 2_499]]),
+        id: "branch-a",
         itemStyle: { color: "transparent" },
         showSymbol: true,
         symbolSize: 2,
       }),
-    ]);
+      expect.objectContaining({
+        data: expect.arrayContaining([[2_499, 249.9, 2_499]]),
+        id: "branch-b",
+        itemStyle: { color: "transparent" },
+        showSymbol: true,
+        symbolSize: 2,
+      }),
+    ]));
 
     const overBudgetOption = chartRenderModelToEChartsOption({
       ...model,
-      series: [{
-        ...model.series[0]!,
-        points: [...points, { rowIndex: 5_000, x: 5_000, y: 500 }],
-      }],
+      series: [lineSeries("branch-a", 2_500), lineSeries("branch-b", 2_501)],
     });
-    expect(overBudgetOption.series).toEqual([
-      expect.objectContaining({
-        showSymbol: false,
-        type: "line",
-      }),
-    ]);
+    expect(overBudgetOption.series).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "branch-a", showSymbol: false, type: "line" }),
+      expect.objectContaining({ id: "branch-b", showSymbol: false, type: "line" }),
+    ]));
+
+    const computedAndReference = chartRenderModelToEChartsOption({
+      ...model,
+      series: [lineSeries("computed", 2_500), lineSeries("reference", 4_000, false)],
+    });
+    expect(computedAndReference.series).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "computed", showSymbol: true }),
+      expect.objectContaining({ id: "reference", showSymbol: false }),
+    ]));
   });
 
   it("renders requested scatter series with symbols and without a connecting line", () => {
     const option = chartRenderModelToEChartsOption({
       ...model,
-      series: [{ ...model.series[0]!, kind: "scatter" }],
+      series: [{ ...model.series[0]!, kind: "scatter", selectable: false }],
     });
 
     expect(option.series).toEqual([
