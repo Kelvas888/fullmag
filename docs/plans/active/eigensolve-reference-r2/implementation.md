@@ -965,3 +965,15 @@ GHA38152887838 na c0baba9d76ebd6be82b08e447a1d3c94e534b923:196tests/14files, ful
 ## Korekta fixture i diagnostyka pięciu native failures
 
 Po analizie artifact11705733979 pattern-mismatch fixture dostał ten sam poprawny FIELD descriptor/digest co inne probes. Dwa rowrestore/primarycleanup probes zachowują dokładne PASS criteria; na FAILURE drukują status, 13 named conjuncts oraz bounded owned JSON snapshots przed/po destroy. Nie osłabiono production guards i nie uznano happybreakdown full/mixed za naprawione. SOURCE diff review PASS, compile i rerun wyłącznie GHA wymagane.
+
+
+Canonical dataset identity4241564392: read-only trace potwierdza alias stageId/artifactRevision w physics-first selection, mimo canonical dataset_id/dataset_revision w Results catalog. Bridge ma zachować obie osobne tożsamości i wymaga pełnego katalogu oraz same-generation source fence; samo run/stage/product matching nie wystarczy do uznania spójności. Brak zmian schema/API w tym kroku, correction nadal pending. Powiązane4225198873 (artifact generation) oraz4240898366 (pagination) pozostają otwarte.
+
+
+## Adaptacyjna pula k: Pause/Stop i częściowe wyniki
+
+4206911469/4224318111 oraz duplicate4241893344: typed control nie redukuje Pause/Stop do bool/RunError. Pause zamyka nowe admission i pozwala aktywnym punktom osiągnąć sample boundary. Stop odbiera już terminalne dzieci bez czekania na aktywne solve, potem kill; valid completed responses przechodzą istniejący validator. Latch przetrwa ostatni drain także przy wszystkich admitted requests.
+
+Publikacja i tracking dotyczą wyłącznie zweryfikowanego canonical contiguous prefix. Gotowe punkty za luką zachowują exact response bytes/raw artifacts w checkpointach; brak prefix nie tworzy synthetic frequencies lub sample provenance. Manifest ma pełny requested point count i rzeczywisty completed prefix count; planned labels/indices zachowują intent bez nieistniejących modów. Source review poprawił slice iterator, moved PathBuf test oraz typed FnMut. Rust parser PASS; lokalnych testów/buildów nie uruchomiono. GHA obejmuje wszystkie3 pool/orchestrator moduły oraz selector regressions.
+
+Native interruption nadal NOT VERIFIED. Odrębny serial worker wait zachowuje wcześniejsze okno Stop-before-reap i wymaga follow-up; portable log paths4241893348 pozostają valid_unfixed. Nie uznajemy tych zaległości za naprawione przy okazji adaptive pool.

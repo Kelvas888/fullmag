@@ -843,6 +843,16 @@
       "browser": "NOT VERIFIED",
       "qualification_claimed": false,
       "log_sha256": "8e3de266345d50229504f7219fea55e074148a1a73096d44bc9017eae95d7e61"
+    },
+    {
+      "run_id": 38153278619,
+      "sha": "9c82dca62c3e12fe0252f509f473e3c6c2cf7586",
+      "conclusion": "pending",
+      "scope": "floquet-modal-slepc_pattern_descriptor_and_row_fault_diagnostics",
+      "dispatch": "bootstrap.yml contract_scope=floquet-modal-slepc",
+      "head_sha_verified_after_ACK": true,
+      "private_runtime_attestation": "NOT VERIFIED",
+      "qualification_claimed": false
     }
   ]
 }

@@ -9,10 +9,10 @@ use crate::types::{AuxiliaryArtifact, LiveParallelExecutionTelemetry, RunError, 
 use fullmag_engine::fem::MeshTopology;
 use fullmag_ir::{FemEigenPlanIR, OutputIR, ParallelExecutionModeIR, ParallelExecutionPolicyIR};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -28,6 +28,42 @@ pub(super) enum ProcessPoolPreparation {
         report: crate::eigen::k_process_pool::ProcessPoolReportV1,
     },
     Interrupted(super::eigen_path::InterruptedSingleK),
+    InterruptedPool {
+        precomputed: HashMap<usize, PrecomputedSingleK>,
+        report: crate::eigen::k_process_pool::ProcessPoolReportV1,
+        action: StepAction,
+        accepted_prefix_len: usize,
+    },
+}
+
+fn accepted_sample_prefix_len(
+    samples: &[crate::eigen::KSampleDescriptor],
+    accepted_sample_indices: &HashSet<usize>,
+) -> usize {
+    samples
+        .iter()
+        .take_while(|sample| accepted_sample_indices.contains(&sample.sample_index))
+        .count()
+}
+
+fn completed_worker_run<'a>(
+    response: &'a crate::fem::eigen_k_worker::EigenKWorkerResponseV1,
+    sample_index: usize,
+) -> Result<&'a crate::fem::eigen_k_worker::EigenKWorkerRunV1, RunError> {
+    let run = response.run.as_ref().ok_or_else(|| RunError {
+        message: response
+            .error
+            .clone()
+            .unwrap_or_else(|| "adaptive worker returned no run payload".into()),
+    })?;
+    if !response.ok || !matches!(run.status, crate::types::RunStatus::Completed) {
+        return Err(RunError {
+            message: response.error.clone().unwrap_or_else(|| {
+                format!("adaptive worker sample {sample_index} did not complete")
+            }),
+        });
+    }
+    Ok(run)
 }
 
 fn parallel_admission_progress(
@@ -452,15 +488,14 @@ pub(super) fn prepare_process_pool_samples(
     )
     .map_err(|message| RunError { message })?;
     let cancellation = Arc::new(AtomicBool::new(false));
-    let admission_stop_requested = Arc::new(AtomicBool::new(false));
     let mut last_admission_publish = None::<Instant>;
     let mut last_admission_reason = None::<String>;
-    let admission_stop_for_callback = Arc::clone(&admission_stop_requested);
-    let mut check_cancel = |event: Option<
+    let mut requested_action = None::<StepAction>;
+    let mut check_control = |event: Option<
         &crate::eigen::k_process_pool::ProcessAdmissionEventV1,
-    >| {
-        if admission_stop_for_callback.load(Ordering::Relaxed) {
-            return true;
+    >| -> StepAction {
+        if requested_action == Some(StepAction::Stop) {
+            return StepAction::Stop;
         }
         if let Some(event) = event {
             let reason_changed = last_admission_reason
@@ -481,47 +516,75 @@ pub(super) fn prepare_process_pool_samples(
                 });
                 last_admission_publish = Some(Instant::now());
                 last_admission_reason = Some(event.reason.clone());
-                if matches!(action, Some(StepAction::Stop | StepAction::Pause)) {
-                    admission_stop_for_callback.store(true, Ordering::Relaxed);
+                match action {
+                    Some(StepAction::Stop) => requested_action = Some(StepAction::Stop),
+                    Some(StepAction::Pause) if requested_action.is_none() => {
+                        requested_action = Some(StepAction::Pause)
+                    }
+                    Some(StepAction::Pause | StepAction::Continue) | None => {}
                 }
             }
-            return admission_stop_for_callback.load(Ordering::Relaxed);
+            return requested_action.unwrap_or(StepAction::Continue);
         }
-        progress.as_deref_mut().is_some_and(|callback| {
-            matches!(
-                callback(fem_eigen::FemEigenProgress {
-                    phase: "admitting_eigen_k_workers",
-                    requested_modes: plan.count as usize,
-                    ..Default::default()
-                }),
-                StepAction::Stop | StepAction::Pause
-            )
-        })
+        let action = progress.as_deref_mut().map_or(StepAction::Continue, |callback| {
+            callback(fem_eigen::FemEigenProgress {
+                phase: "admitting_eigen_k_workers",
+                requested_modes: plan.count as usize,
+                ..Default::default()
+            })
+        });
+        match action {
+            StepAction::Stop => requested_action = Some(StepAction::Stop),
+            StepAction::Pause if requested_action.is_none() => {
+                requested_action = Some(StepAction::Pause)
+            }
+            StepAction::Pause | StepAction::Continue => {}
+        }
+        requested_action.unwrap_or(StepAction::Continue)
     };
-    let pool_result = pool
-        .execute(&requests, cancellation, Some(&mut check_cancel))
+    let pool_outcome = pool
+        .execute(&requests, cancellation, Some(&mut check_control))
         .map_err(|message| RunError { message })?;
-    drop(check_cancel);
-    if let Some(event) = pool_result.report.events.last() {
-        if let Some(callback) = progress.as_deref_mut() {
-            if matches!(
-                callback(parallel_admission_progress(
+    drop(check_control);
+    let (pool_result, mut interrupted_action) = match pool_outcome {
+        crate::eigen::k_process_pool::ProcessPoolOutcome::Completed(result) => (result, None),
+        crate::eigen::k_process_pool::ProcessPoolOutcome::Interrupted { action, partial } => {
+            (partial, Some(action))
+        }
+    };
+    if interrupted_action.is_none() {
+        if let Some(event) = pool_result.report.events.last() {
+            if let Some(callback) = progress.as_deref_mut() {
+                let action = callback(parallel_admission_progress(
                     event,
                     parallel_policy,
                     plan.count as usize,
                     Some(pool_result.report.resolved_workers),
                     true,
-                )),
-                StepAction::Stop | StepAction::Pause
-            ) {
-                return Err(RunError {
-                    message: "adaptive FEM eigen process pool was interrupted by runtime control"
-                        .into(),
-                });
+                ));
+                if matches!(action, StepAction::Stop | StepAction::Pause) {
+                    interrupted_action = Some(action);
+                }
             }
         }
     }
-    for response in pool_result.responses {
+    let crate::eigen::k_process_pool::ProcessPoolResult { responses, report } = pool_result;
+    let completed_sample_indices = responses
+        .iter()
+        .map(|response| response.sample_index)
+        .collect::<HashSet<_>>();
+    let accepted_sample_indices = precomputed
+        .keys()
+        .copied()
+        .chain(completed_sample_indices.iter().copied())
+        .collect::<HashSet<_>>();
+    let accepted_prefix_len = accepted_sample_prefix_len(&samples, &accepted_sample_indices);
+    let accepted_prefix_indices = samples
+        .iter()
+        .take(accepted_prefix_len)
+        .map(|sample| sample.sample_index)
+        .collect::<HashSet<_>>();
+    for response in responses {
         let sample = samples
             .iter()
             .find(|sample| sample.sample_index == response.sample_index)
@@ -531,22 +594,7 @@ pub(super) fn prepare_process_pool_samples(
                     response.sample_index
                 ),
             })?;
-        let run = response.run.as_ref().ok_or_else(|| RunError {
-            message: response
-                .error
-                .clone()
-                .unwrap_or_else(|| "adaptive worker returned no run payload".into()),
-        })?;
-        if !response.ok || !matches!(run.status, crate::types::RunStatus::Completed) {
-            return Err(RunError {
-                message: response.error.clone().unwrap_or_else(|| {
-                    format!(
-                        "adaptive worker sample {} did not complete",
-                        sample.sample_index
-                    )
-                }),
-            });
-        }
+        let run = completed_worker_run(&response, sample.sample_index)?;
         let request = requests
             .iter()
             .find(|request| request.sample_index == response.sample_index)
@@ -580,11 +628,60 @@ pub(super) fn prepare_process_pool_samples(
                 ),
             });
         }
+        if run.final_magnetization.len() != plan.mesh.nodes.len()
+            || run
+                .final_magnetization
+                .iter()
+                .flatten()
+                .any(|value| !value.is_finite())
+        {
+            return Err(RunError {
+                message: format!(
+                    "adaptive worker sample {} returned an invalid final magnetization",
+                    sample.sample_index
+                ),
+            });
+        }
         let artifacts = pool
             .load_artifacts(&response)
             .map_err(|message| RunError { message })?;
         let point_plan =
             super::eigen_path::eigen_path_single_k_point_plan(&worker_plan, sample, false, None)?;
+        if interrupted_action.is_some()
+            && !accepted_prefix_indices.contains(&sample.sample_index)
+        {
+            let checkpoint_root = checkpoint_root.ok_or_else(|| RunError {
+                message: format!(
+                    "adaptive worker sample {} completed beyond the accepted prefix without a raw checkpoint root",
+                    sample.sample_index
+                ),
+            })?;
+            let mut raw_response_artifacts = artifacts;
+            let response_bytes = fs::read(&request.response_path).map_err(|error| RunError {
+                message: format!(
+                    "failed to read completed adaptive worker response for sample {}: {error}",
+                    sample.sample_index
+                ),
+            })?;
+            raw_response_artifacts.push(AuxiliaryArtifact {
+                relative_path: "eigen/diagnostics/adaptive_worker_response.v2.json".to_string(),
+                bytes: response_bytes,
+            });
+            super::single_k_checkpoint::write_raw_single_k_checkpoint(
+                checkpoint_root,
+                sample.sample_index,
+                sample.k_vector,
+                &point_plan,
+                &raw_response_artifacts,
+            )
+            .map_err(|error| RunError {
+                message: format!(
+                    "failed to preserve completed adaptive sample {} beyond the accepted prefix: {error}",
+                    sample.sample_index
+                ),
+            })?;
+            continue;
+        }
         let tracking_reduction = build_reduction_map(
             &tracking_topology,
             &point_plan.spin_wave_bc,
@@ -601,20 +698,6 @@ pub(super) fn prepare_process_pool_samples(
             &tracking_reduction,
             &tracking_metric,
         )?;
-        if run.final_magnetization.len() != plan.mesh.nodes.len()
-            || run
-                .final_magnetization
-                .iter()
-                .flatten()
-                .any(|value| !value.is_finite())
-        {
-            return Err(RunError {
-                message: format!(
-                    "adaptive worker sample {} returned an invalid final magnetization",
-                    sample.sample_index
-                ),
-            });
-        }
         // Artifact and run validation above borrow the response. Transfer the
         // already validated vector instead of keeping and cloning each payload.
         let final_magnetization = response
@@ -637,6 +720,25 @@ pub(super) fn prepare_process_pool_samples(
             });
         }
     }
+    if let Some(action) = interrupted_action {
+        if let Some(missing_sample) = samples[..accepted_prefix_len]
+            .iter()
+            .find(|sample| !precomputed.contains_key(&sample.sample_index))
+        {
+            return Err(RunError {
+                message: format!(
+                    "adaptive interruption accepted prefix includes sample {} without a validated worker result",
+                    missing_sample.sample_index
+                ),
+            });
+        }
+        return Ok(ProcessPoolPreparation::InterruptedPool {
+            precomputed,
+            report,
+            action,
+            accepted_prefix_len,
+        });
+    }
     if precomputed.len() != samples.len() {
         return Err(RunError {
             message: format!(
@@ -648,7 +750,7 @@ pub(super) fn prepare_process_pool_samples(
     }
     Ok(ProcessPoolPreparation::Ready {
         precomputed,
-        report: pool_result.report,
+        report,
     })
 }
 
@@ -682,6 +784,65 @@ mod tests {
             // This test removes only the unique directory it created.
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn accepted_pool_samples_form_only_the_contiguous_planned_prefix() {
+        let samples = (0..4)
+            .map(|sample_index| crate::eigen::KSampleDescriptor {
+                sample_index,
+                label: Some(format!("sample-{sample_index}")),
+                segment_index: Some(0),
+                path_s: sample_index as f64,
+                t_in_segment: sample_index as f64 / 3.0,
+                k_vector: [sample_index as f64, 0.0, 0.0],
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(accepted_sample_prefix_len(&samples, &HashSet::new()), 0);
+        assert_eq!(
+            accepted_sample_prefix_len(&samples, &HashSet::from([0, 2, 3])),
+            1,
+            "completed responses after a missing sample are raw diagnostics, not path samples"
+        );
+        assert_eq!(
+            accepted_sample_prefix_len(&samples, &HashSet::from([0, 1, 2])),
+            3,
+            "the accepted prefix ends at the first planned sample not returned"
+        );
+    }
+
+    #[test]
+    fn genuine_worker_failure_remains_an_error_during_controlled_interruption() {
+        let response = crate::fem::eigen_k_worker::EigenKWorkerResponseV1 {
+            protocol: crate::fem::eigen_k_worker::EIGEN_K_WORKER_PROTOCOL_V2.to_string(),
+            sample_index: 1,
+            worker_request_index: 1,
+            ok: false,
+            worker_executable_sha256: None,
+            worker_build_identity: None,
+            terminal_peak: None,
+            run: Some(crate::fem::eigen_k_worker::EigenKWorkerRunV1 {
+                status: crate::types::RunStatus::Failed,
+                final_magnetization: Vec::new(),
+                plan_sha256: "plan".into(),
+                equilibrium_artifact_sha256: "equilibrium".into(),
+                thread_budget: crate::fem::eigen_k_worker::EigenKWorkerThreadBudgetV1 {
+                    requested_threads: 1,
+                    resolved_threads: 1,
+                    cap_reason: "fixture".into(),
+                    allocation_cpu_cores: 1.0,
+                    host_cpu_cores: 1,
+                },
+                artifacts: Vec::new(),
+            }),
+            error: Some("native worker solve failed".into()),
+        };
+
+        let error = completed_worker_run(&response, 1)
+            .expect_err("a failed worker is not an accepted partial pool result");
+
+        assert!(error.message.contains("native worker solve failed"));
     }
 
     fn bootstrap_fixture_artifacts(payload: &str) -> Vec<AuxiliaryArtifact> {

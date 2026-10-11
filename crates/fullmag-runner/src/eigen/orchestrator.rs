@@ -50,65 +50,14 @@ pub fn run_path_or_single<S: SingleKSolver>(
         });
     }
 
-    let mut sample_results = Vec::with_capacity(sample_descriptors.len());
-    for sample in &sample_descriptors {
-        let solved = solver.solve_single_k(plan, outputs, sample)?;
-        sample_results.push(solved);
-    }
-
-    let solver_model = sample_results
-        .first()
-        .map(|sample| sample.solver_model)
-        .ok_or_else(|| RunError {
-            message: "single-k solve returned no samples".to_string(),
-        })?;
-    if let Some(mixed) = sample_results
-        .iter()
-        .find(|sample| sample.solver_model != solver_model)
-    {
-        return Err(RunError {
-            message: format!(
-                "mixed single-k solver models in k-path aggregation are not supported: first={}, sample_{}={}",
-                solver_model.as_str(),
-                mixed.sample.sample_index,
-                mixed.solver_model.as_str()
-            ),
-        });
-    }
-    let mut notes = vec![format!(
-        "{} sample(s) generated from k_sampling",
-        sample_descriptors.len()
-    )];
-    for note in sample_results
-        .iter()
-        .flat_map(|sample| sample.solver_notes.iter())
-    {
-        if !notes.iter().any(|existing| existing == note) {
-            notes.push(note.clone());
-        }
-    }
-
-    let mut result = PathSolveResult {
-        gamma0_rad_s_per_a_m: plan.gyromagnetic_ratio,
-        samples: sample_results,
-        branches: Vec::new(),
-        solver_model,
-        notes,
-        include_demag: plan.operator.include_demag,
-        dispersion_validation: plan.dispersion_validation.clone(),
-        k0_kittel_validation: plan.k0_kittel_validation.clone(),
-        solver_policy: plan.solver_policy.clone(),
-        dispersion_analytic_reference: plan.dispersion_validation.as_ref().map(|_| {
-            DispersionAnalyticReferenceContext {
-                external_field: plan.external_field.unwrap_or([0.0, 0.0, 0.0]),
-                exchange_stiffness: plan.material.exchange_stiffness,
-                saturation_magnetisation: plan.material.saturation_magnetisation,
-                gyromagnetic_ratio: plan.gyromagnetic_ratio,
-            }
-        }),
-        k0_kittel_periodic_airbox_demag: None,
-    };
-    track_branches(&mut result, mode_tracking);
+    let mut result = solve_path_samples(
+        solver,
+        plan,
+        outputs,
+        &sample_descriptors,
+        sample_descriptors.len(),
+        mode_tracking,
+    )?;
 
     if let Some(output_dir) = output_dir {
         let artifact_identity = artifact_identity.ok_or_else(|| RunError {
@@ -156,13 +105,123 @@ pub fn run_path_or_single<S: SingleKSolver>(
             Some(plan.count as usize),
             Some(plan),
         )
-        .map_err(
-            |error| RunError {
-                message: format!("failed to write frequency-domain eigen manifest: {error}"),
-            },
-        )?;
+        .map_err(|error| RunError {
+            message: format!("failed to write frequency-domain eigen manifest: {error}"),
+        })?;
     }
 
+    Ok(result)
+}
+
+/// Aggregate only a contiguous planned k-sampling prefix, as used after a
+/// controlled adaptive-pool interruption. The full plan remains authoritative
+/// for selectors and provenance; no sample or mode is synthesized here.
+pub(crate) fn run_path_prefix_or_single<S: SingleKSolver>(
+    solver: &S,
+    plan: &FemEigenPlanIR,
+    outputs: &[OutputIR],
+    accepted_prefix_len: usize,
+    mode_tracking: Option<&ModeTrackingIR>,
+) -> Result<PathSolveResult, RunError> {
+    let planned_samples =
+        expand_k_sampling(plan.k_sampling.as_ref()).map_err(|message| RunError { message })?;
+    if accepted_prefix_len == 0 || accepted_prefix_len > planned_samples.len() {
+        return Err(RunError {
+            message: format!(
+                "adaptive interrupted k-path prefix length {accepted_prefix_len} is outside the planned sample range 1..={}",
+                planned_samples.len()
+            ),
+        });
+    }
+    solve_path_samples(
+        solver,
+        plan,
+        outputs,
+        &planned_samples[..accepted_prefix_len],
+        planned_samples.len(),
+        mode_tracking,
+    )
+}
+
+fn solve_path_samples<S: SingleKSolver>(
+    solver: &S,
+    plan: &FemEigenPlanIR,
+    outputs: &[OutputIR],
+    sample_descriptors: &[KSampleDescriptor],
+    planned_sample_count: usize,
+    mode_tracking: Option<&ModeTrackingIR>,
+) -> Result<PathSolveResult, RunError> {
+    if sample_descriptors.is_empty() {
+        return Err(RunError {
+            message: "single-k solve returned no samples".to_string(),
+        });
+    }
+
+    let mut sample_results = Vec::with_capacity(sample_descriptors.len());
+    for sample in sample_descriptors {
+        let solved = solver.solve_single_k(plan, outputs, sample)?;
+        sample_results.push(solved);
+    }
+
+    let solver_model = sample_results
+        .first()
+        .map(|sample| sample.solver_model)
+        .ok_or_else(|| RunError {
+            message: "single-k solve returned no samples".to_string(),
+        })?;
+    if let Some(mixed) = sample_results
+        .iter()
+        .find(|sample| sample.solver_model != solver_model)
+    {
+        return Err(RunError {
+            message: format!(
+                "mixed single-k solver models in k-path aggregation are not supported: first={}, sample_{}={}",
+                solver_model.as_str(),
+                mixed.sample.sample_index,
+                mixed.solver_model.as_str()
+            ),
+        });
+    }
+    let sample_note = if sample_descriptors.len() == planned_sample_count {
+        format!("{} sample(s) generated from k_sampling", sample_descriptors.len())
+    } else {
+        format!(
+            "{} of {} planned k-sampling samples accepted before controlled pool interruption",
+            sample_descriptors.len(),
+            planned_sample_count
+        )
+    };
+    let mut notes = vec![sample_note];
+    for note in sample_results
+        .iter()
+        .flat_map(|sample| sample.solver_notes.iter())
+    {
+        if !notes.iter().any(|existing| existing == note) {
+            notes.push(note.clone());
+        }
+    }
+
+    let mut result = PathSolveResult {
+        gamma0_rad_s_per_a_m: plan.gyromagnetic_ratio,
+        samples: sample_results,
+        branches: Vec::new(),
+        solver_model,
+        notes,
+        include_demag: plan.operator.include_demag,
+        dispersion_validation: plan.dispersion_validation.clone(),
+        k0_kittel_validation: plan.k0_kittel_validation.clone(),
+        solver_policy: plan.solver_policy.clone(),
+        dispersion_analytic_reference: plan.dispersion_validation.as_ref().map(|_| {
+            DispersionAnalyticReferenceContext {
+                external_field: plan.external_field.unwrap_or([0.0, 0.0, 0.0]),
+                exchange_stiffness: plan.material.exchange_stiffness,
+                saturation_magnetisation: plan.material.saturation_magnetisation,
+                gyromagnetic_ratio: plan.gyromagnetic_ratio,
+            }
+        }),
+        k0_kittel_periodic_airbox_demag: None,
+    };
+    track_branches(&mut result, mode_tracking);
     Ok(result)
 }
 
@@ -497,5 +556,56 @@ mod tests {
             .message
             .contains("slepc_multi_shift_invert_production_cpu_dense"));
         assert!(err.message.contains("reference_full_2x2_tangent"));
+    }
+
+    #[test]
+    fn interrupted_path_aggregates_only_the_requested_planned_prefix() {
+        let plan = minimal_plan(Some(KSamplingIR::Path {
+            points: vec![
+                fullmag_ir::KPointIR {
+                    label: Some("G".to_string()),
+                    k_vector: [0.0, 0.0, 0.0],
+                },
+                fullmag_ir::KPointIR {
+                    label: Some("X".to_string()),
+                    k_vector: [1.0e6, 0.0, 0.0],
+                },
+            ],
+            samples_per_segment: vec![2],
+            closed: false,
+        }));
+        let planned = expand_k_sampling(plan.k_sampling.as_ref()).unwrap();
+        assert!(planned.len() > 1, "fixture must contain a future sample");
+
+        let partial = run_path_prefix_or_single(&FakeSolver, &plan, &[], 1, None)
+            .expect("one accepted sample should produce a real partial path");
+
+        assert_eq!(partial.samples.len(), 1);
+        assert_eq!(partial.samples[0].sample.sample_index, planned[0].sample_index);
+        assert_eq!(partial.samples[0].modes.len(), 1);
+        assert!(partial.notes[0].contains(&format!("1 of {} planned", planned.len())));
+    }
+
+    #[test]
+    fn interrupted_path_rejects_an_empty_prefix_without_fabricating_samples() {
+        let plan = minimal_plan(Some(KSamplingIR::Path {
+            points: vec![
+                fullmag_ir::KPointIR {
+                    label: Some("G".to_string()),
+                    k_vector: [0.0, 0.0, 0.0],
+                },
+                fullmag_ir::KPointIR {
+                    label: Some("X".to_string()),
+                    k_vector: [1.0e6, 0.0, 0.0],
+                },
+            ],
+            samples_per_segment: vec![2],
+            closed: false,
+        }));
+
+        let error = run_path_prefix_or_single(&FakeSolver, &plan, &[], 0, None)
+            .expect_err("an empty accepted prefix has no path spectrum to publish");
+
+        assert!(error.message.contains("prefix length 0"));
     }
 }

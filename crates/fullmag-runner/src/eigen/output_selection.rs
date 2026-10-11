@@ -1,4 +1,4 @@
-use crate::eigen::types::PathSolveResult;
+use crate::eigen::types::{KSampleDescriptor, PathSolveResult};
 use fullmag_ir::{
     is_supported_eigen_spectrum_quantity, OutputIR, SampleSelectorIR,
     CANONICAL_EIGEN_SPECTRUM_QUANTITY,
@@ -447,9 +447,58 @@ pub(crate) fn select_eigen_outputs_with_planned_samples(
     outputs: &[OutputIR],
     planned_sample_ids: &BTreeSet<usize>,
 ) -> Result<EigenOutputSelection, OutputSelectionError> {
+    select_eigen_outputs_with_planned_scope(
+        path_result,
+        outputs,
+        planned_sample_ids,
+        &BTreeMap::new(),
+    )
+}
+
+/// Resolve outputs against actual results while retaining exact sample labels
+/// declared by the full k-sampling plan for selectors that target pending work.
+pub(crate) fn select_eigen_outputs_with_planned_sample_descriptors(
+    path_result: &PathSolveResult,
+    outputs: &[OutputIR],
+    planned_samples: &[KSampleDescriptor],
+) -> Result<EigenOutputSelection, OutputSelectionError> {
+    let planned_sample_ids = planned_samples
+        .iter()
+        .map(|sample| sample.sample_index)
+        .collect::<BTreeSet<_>>();
+    let mut planned_sample_labels = BTreeMap::<String, BTreeSet<usize>>::new();
+    for sample in planned_samples {
+        if let Some(label) = sample.label.as_deref() {
+            let label = label.trim();
+            if !label.is_empty() {
+                planned_sample_labels
+                    .entry(label.to_string())
+                    .or_default()
+                    .insert(sample.sample_index);
+            }
+        }
+    }
+    select_eigen_outputs_with_planned_scope(
+        path_result,
+        outputs,
+        &planned_sample_ids,
+        &planned_sample_labels,
+    )
+}
+
+fn select_eigen_outputs_with_planned_scope(
+    path_result: &PathSolveResult,
+    outputs: &[OutputIR],
+    planned_sample_ids: &BTreeSet<usize>,
+    planned_sample_labels: &BTreeMap<String, BTreeSet<usize>>,
+) -> Result<EigenOutputSelection, OutputSelectionError> {
     validate_eigen_mode_fields(outputs)?;
     validate_eigen_spectrum_quantities(outputs)?;
-    let available = AvailableModes::from_result(path_result, planned_sample_ids)?;
+    let available = AvailableModes::from_result(
+        path_result,
+        planned_sample_ids,
+        planned_sample_labels,
+    )?;
     let mut selection = EigenOutputSelection::default();
     selection.diagnostics_request = eigen_diagnostics_request(outputs);
     let mut mode_requests = Vec::new();
@@ -618,6 +667,7 @@ impl<'a> AvailableModes<'a> {
     fn from_result(
         path_result: &'a PathSolveResult,
         planned_sample_ids: &BTreeSet<usize>,
+        planned_sample_labels: &BTreeMap<String, BTreeSet<usize>>,
     ) -> Result<Self, OutputSelectionError> {
         let mut samples = Vec::with_capacity(path_result.samples.len());
         let mut actual_sample_ids = BTreeSet::new();
@@ -654,6 +704,12 @@ impl<'a> AvailableModes<'a> {
                 }
             }
             samples.push(sample);
+        }
+        for (label, sample_ids) in planned_sample_labels {
+            sample_labels
+                .entry(label.clone())
+                .or_default()
+                .extend(sample_ids.iter().copied());
         }
 
         let mut branch_table_ids = BTreeSet::new();
@@ -797,7 +853,8 @@ where
 mod tests {
     use super::{
         select_eigen_outputs, select_eigen_outputs_with_planned_samples,
-        EigenDiagnosticsRequest, OutputSelectionError, SampleModeId,
+        select_eigen_outputs_with_planned_sample_descriptors, EigenDiagnosticsRequest,
+        OutputSelectionError, SampleModeId,
     };
     use crate::eigen::types::{
         EigenSolverModel, KSampleDescriptor, PathSolveResult, SingleKModeResult,
@@ -1218,6 +1275,48 @@ mod tests {
             )
             .unwrap_err(),
             OutputSelectionError::UnknownBranch(99)
+        );
+    }
+
+    #[test]
+    fn planned_sample_labels_preserve_pending_intent_without_creating_payloads() {
+        let planned_samples = vec![
+            sample(10, Some("Gamma"), Vec::new()).sample,
+            sample(20, Some("X"), Vec::new()).sample,
+            sample(30, Some("Y"), Vec::new()).sample,
+            sample(40, Some("Y"), Vec::new()).sample,
+        ];
+        let output = |label: &str| OutputIR::EigenMode {
+            field: "mode".to_string(),
+            all_modes: false,
+            indices: vec![99],
+            branches: vec![],
+            sample_selector: Some(SampleSelectorIR {
+                sample_indices: vec![],
+                sample_labels: vec![label.to_string()],
+            }),
+        };
+
+        let pending = select_eigen_outputs_with_planned_sample_descriptors(
+            &result(),
+            &[output("Y")],
+            &planned_samples,
+        )
+        .expect("declared pending labels retain selector intent");
+        assert_eq!(
+            pending.field_sample_ids_by_field()["mode"],
+            [30, 40].into_iter().collect()
+        );
+        assert!(pending.field_mode_ids().is_empty());
+
+        assert_eq!(
+            select_eigen_outputs_with_planned_sample_descriptors(
+                &result(),
+                &[output("not-declared")],
+                &planned_samples,
+            )
+            .unwrap_err(),
+            OutputSelectionError::UnknownSampleLabel("not-declared".to_string())
         );
     }
 

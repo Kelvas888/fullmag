@@ -12,8 +12,8 @@ use crate::eigen::diagnostic_artifact::{
     EigenDiagnosticModeRecord, EigenDiagnosticSampleRecord,
 };
 use crate::eigen::output_selection::{
-    select_eigen_outputs, select_eigen_outputs_with_planned_samples, EigenOutputSelection,
-    SampleModeId,
+    select_eigen_outputs, select_eigen_outputs_with_planned_sample_descriptors,
+    select_eigen_outputs_with_planned_samples, EigenOutputSelection, SampleModeId,
 };
 use crate::eigen::{KSampleDescriptor, SingleKModeResult, SingleKSolveResult};
 use crate::fem::eigen_capability::native_cpu_modal_window_enabled;
@@ -24,7 +24,7 @@ use crate::fem::eigen_k_pool::{
 };
 use crate::fem::eigen_reduction::{build_reduction_map, ReductionMap};
 use crate::fem_eigen;
-use crate::types::{AuxiliaryArtifact, ExecutedRun, RunError, RunStatus, StepStats};
+use crate::types::{AuxiliaryArtifact, ExecutedRun, RunError, RunStatus, StepAction, StepStats};
 use fullmag_engine::fem::MeshTopology;
 
 /// Public outputs resolved for one path sample, kept separate from the
@@ -224,6 +224,36 @@ fn interrupted_eigen_path_run(
         auxiliary_artifacts: interrupted.diagnostic_artifacts,
         provenance: interrupted.provenance,
     }
+}
+
+fn pool_interruption_status(action: StepAction) -> Result<RunStatus, RunError> {
+    match action {
+        StepAction::Stop => Ok(RunStatus::Cancelled),
+        StepAction::Pause => Ok(RunStatus::Paused),
+        StepAction::Continue => Err(RunError {
+            message: "adaptive FEM eigen pool returned an interruption without a control action"
+                .into(),
+        }),
+    }
+}
+
+fn pool_report_artifact(
+    report: &crate::eigen::k_process_pool::ProcessPoolReportV1,
+) -> Result<AuxiliaryArtifact, RunError> {
+    Ok(AuxiliaryArtifact {
+        relative_path: "eigen/parallel_execution.v1.json".to_string(),
+        bytes: serde_json::to_vec_pretty(report).map_err(|error| RunError {
+            message: format!("failed to serialize adaptive process-pool report: {error}"),
+        })?,
+    })
+}
+
+fn adaptive_pool_interruption_provenance(
+    execution: PlannedFemEigenExecution<'_>,
+) -> crate::ExecutionProvenance {
+    let mut provenance = crate::ExecutionProvenance::default();
+    execution.bind_execution_provenance(&mut provenance);
+    provenance
 }
 
 fn eigen_path_sample_id_prefix(plan: &FemEigenPlanIR) -> &'static str {
@@ -3065,11 +3095,6 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
                     },
                 )?;
             }
-            if k0_kittel_synthetic_demag_factor_enabled(plan) && plan.bias_field_samples.is_empty()
-            {
-                return solve_k0_kittel_synthetic_demag_factor_single_k(plan, sample);
-            }
-
             if let Some(precomputed) = self.precomputed.borrow_mut().remove(&sample.sample_index) {
                 if precomputed.final_magnetization.len() != plan.mesh.nodes.len()
                     || precomputed
@@ -3102,6 +3127,11 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
                 *self.previous_accepted_magnetization.borrow_mut() =
                     Some(precomputed.final_magnetization);
                 return Ok(precomputed.result);
+            }
+
+            if k0_kittel_synthetic_demag_factor_enabled(plan) && plan.bias_field_samples.is_empty()
+            {
+                return solve_k0_kittel_synthetic_demag_factor_single_k(plan, sample);
             }
 
             let source_stage_handoff =
@@ -3486,7 +3516,7 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
         .map_err(|error| RunError {
             message: format!("prepare FEM raw checkpoint attempt: {error}"),
         })?;
-    let (precomputed, parallel_report) =
+    let (precomputed, parallel_report, pool_interruption) =
         if parallel_policy.mode == ParallelExecutionModeIR::Adaptive {
             match prepare_process_pool_samples(
                 execution,
@@ -3503,7 +3533,7 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
                 ProcessPoolPreparation::Ready {
                     precomputed,
                     report,
-                } => (precomputed, Some(report)),
+                } => (precomputed, Some(report), None),
                 ProcessPoolPreparation::Interrupted(interrupted) => {
                     let accepted_magnetization = source_relax_handoff
                         .map(|handoff| handoff.equilibrium_magnetization.clone())
@@ -3514,12 +3544,44 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
                         accepted_magnetization,
                     ));
                 }
+                ProcessPoolPreparation::InterruptedPool {
+                    precomputed,
+                    report,
+                    action,
+                    accepted_prefix_len,
+                } => {
+                    if accepted_prefix_len == 0 {
+                        let interrupted = InterruptedSingleK {
+                            status: pool_interruption_status(action)?,
+                            steps: Vec::new(),
+                            provenance: adaptive_pool_interruption_provenance(execution),
+                            diagnostic_artifacts: vec![pool_report_artifact(&report)?],
+                        };
+                        let accepted_magnetization = source_relax_handoff
+                            .map(|handoff| handoff.equilibrium_magnetization.clone())
+                            .unwrap_or_else(|| plan.equilibrium_magnetization.clone());
+                        return Ok(interrupted_eigen_path_run(
+                            plan,
+                            interrupted,
+                            accepted_magnetization,
+                        ));
+                    }
+                    (
+                        precomputed,
+                        Some(report),
+                        Some((action, accepted_prefix_len)),
+                    )
+                }
             }
         } else {
-            (HashMap::new(), None)
+            (HashMap::new(), None, None)
         };
     let adapter = KSolverAdapter {
-        progress: std::sync::Mutex::new(progress),
+        progress: std::sync::Mutex::new(if pool_interruption.is_some() {
+            None
+        } else {
+            progress
+        }),
         execution,
         engine,
         mode_artifacts: RefCell::new(Vec::new()),
@@ -3534,14 +3596,24 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
         precomputed: RefCell::new(precomputed),
         parallel_report,
     };
-    let mut path_result = match run_path_or_single(
-        &adapter,
-        plan,
-        &tracking_outputs,
-        None, // we collect artifacts manually below
-        None,
-        plan.mode_tracking.as_ref(),
-    ) {
+    let path_solve = match pool_interruption {
+        Some((_, accepted_prefix_len)) => crate::eigen::orchestrator::run_path_prefix_or_single(
+            &adapter,
+            plan,
+            &tracking_outputs,
+            accepted_prefix_len,
+            plan.mode_tracking.as_ref(),
+        ),
+        None => run_path_or_single(
+            &adapter,
+            plan,
+            &tracking_outputs,
+            None, // we collect artifacts manually below
+            None,
+            plan.mode_tracking.as_ref(),
+        ),
+    };
+    let mut path_result = match path_solve {
         Ok(result) => result,
         Err(error) => {
             if let Some(interrupted) = adapter.interrupted_single_k.borrow_mut().take() {
@@ -3584,7 +3656,18 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
     if periodic_airbox_k0_runtime_supported(plan) && engine == FemEngine::NativeGpu {
         path_result.solver_model = crate::eigen::EigenSolverModel::ProductionGpuModalDeviceKrylov;
     }
-    let selection = select_eigen_outputs(&path_result, outputs).map_err(|error| RunError {
+    let selection = if pool_interruption.is_some() {
+        let planned_samples = crate::eigen::expand_k_sampling(plan.k_sampling.as_ref())
+            .map_err(|message| RunError { message })?;
+        select_eigen_outputs_with_planned_sample_descriptors(
+            &path_result,
+            outputs,
+            &planned_samples,
+        )
+    } else {
+        select_eigen_outputs(&path_result, outputs)
+    }
+    .map_err(|error| RunError {
         message: format!("invalid eigen output selection: {error}"),
     })?;
     let has_public_spectrum_output = outputs.iter().any(|output| {
@@ -4175,6 +4258,38 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
         plan,
         outputs,
     );
+    if let Some((_, accepted_prefix_len)) = pool_interruption {
+        if path_result.samples.len() != accepted_prefix_len {
+            return Err(RunError {
+                message: format!(
+                    "adaptive interrupted path produced {} samples for an accepted prefix of {accepted_prefix_len}",
+                    path_result.samples.len()
+                ),
+            });
+        }
+        let requested_frequency_point_count = crate::eigen::expand_k_sampling(
+            plan.k_sampling.as_ref(),
+        )
+        .map_err(|message| RunError { message })?
+        .len();
+        let diagnostics = frequency_domain_manifest
+            .get_mut("diagnostics")
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| RunError {
+                message: "k-path frequency-domain manifest has no diagnostics object".into(),
+            })?;
+        diagnostics.insert("status".into(), serde_json::json!("interrupted"));
+        diagnostics.insert("complete".into(), serde_json::json!(false));
+        diagnostics.insert(
+            "requested_frequency_point_count".into(),
+            serde_json::json!(requested_frequency_point_count),
+        );
+        diagnostics.insert(
+            "completed_frequency_point_count".into(),
+            serde_json::json!(path_result.samples.len()),
+        );
+        diagnostics.insert("interrupted".into(), serde_json::json!(true));
+    }
     let Some(artifacts) = frequency_domain_manifest
         .get_mut("artifacts")
         .and_then(serde_json::Value::as_object_mut)
@@ -4200,21 +4315,24 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
     });
     auxiliary_artifacts.extend(mode_artifacts);
     if let Some(report) = parallel_report {
-        auxiliary_artifacts.push(AuxiliaryArtifact {
-            relative_path: "eigen/parallel_execution.v1.json".to_string(),
-            bytes: serde_json::to_vec_pretty(&report).map_err(|error| RunError {
-                message: format!("failed to serialize adaptive process-pool report: {error}"),
-            })?,
-        });
+        auxiliary_artifacts.push(pool_report_artifact(&report)?);
     }
+
+    let terminal_status = match pool_interruption {
+        Some((action, _)) => pool_interruption_status(action)?,
+        None => RunStatus::Completed,
+    };
+    let mut provenance = crate::ExecutionProvenance::default();
+    execution.bind_execution_provenance(&mut provenance);
+    provenance.execution_engine = format!("multi_k_orchestrator/{}", path_result.solver_model.as_str());
 
     Ok(ExecutedRun {
         result: crate::types::RunResult {
-            status: crate::types::RunStatus::Completed,
+            status: terminal_status,
             steps: vec![],
             final_magnetization,
             completion: Some(crate::relaxation::resolve_stage_completion(
-                crate::types::RunStatus::Completed,
+                terminal_status,
                 None,
                 crate::relaxation::RelaxationCompletionMetrics::default(),
             )),
@@ -4223,11 +4341,7 @@ pub(crate) fn execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
         field_snapshots: Vec::new(),
         field_snapshot_count: 0,
         auxiliary_artifacts,
-        provenance: crate::ExecutionProvenance {
-            execution_engine: format!("multi_k_orchestrator/{}", path_result.solver_model.as_str()),
-            precision: "double".to_string(),
-            ..Default::default()
-        },
+        provenance,
     })
 }
 
@@ -4242,6 +4356,19 @@ mod checkpoint_admission_tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const RAW_BYTES: &[u8] = b"native raw single-k bytes\0keep exact";
+
+    #[test]
+    fn adaptive_pool_control_preserves_pause_and_stop_statuses() {
+        assert_eq!(
+            pool_interruption_status(StepAction::Pause).unwrap(),
+            RunStatus::Paused
+        );
+        assert_eq!(
+            pool_interruption_status(StepAction::Stop).unwrap(),
+            RunStatus::Cancelled
+        );
+        assert!(pool_interruption_status(StepAction::Continue).is_err());
+    }
 
     static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 

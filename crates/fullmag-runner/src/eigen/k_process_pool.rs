@@ -14,6 +14,7 @@ use crate::fem::eigen_k_worker::{
     EigenKWorkerRequestV2, EigenKWorkerResponseV1, EigenKWorkerThreadBudgetV1,
     EIGEN_K_WORKER_HANDSHAKE_V1, EIGEN_K_WORKER_PROTOCOL_V2,
 };
+use crate::types::StepAction;
 use fullmag_ir::{ParallelExecutionModeIR, ParallelExecutionPolicyIR};
 use serde::Serialize;
 use serde_json::Value;
@@ -314,11 +315,71 @@ fn bounded_worker_log_tail(reader: &mut (impl Read + Seek)) -> std::io::Result<V
     Ok(bytes)
 }
 
-fn admission_may_spawn_worker(cancel: &AtomicBool, stop_requested: bool) -> bool {
-    if stop_requested {
-        cancel.store(true, Ordering::Relaxed);
+fn admission_may_spawn_worker(cancel: &AtomicBool, control_action: Option<StepAction>) -> bool {
+    !cancel.load(Ordering::Relaxed) && control_action.is_none()
+}
+
+fn pool_terminal_state(action: StepAction) -> &'static str {
+    match action {
+        StepAction::Continue => "completed",
+        StepAction::Pause => "paused",
+        StepAction::Stop => "cancelled",
     }
-    !cancel.load(Ordering::Relaxed)
+}
+
+fn pool_control_can_finish(action: StepAction, active_workers: usize) -> bool {
+    action == StepAction::Stop || (action == StepAction::Pause && active_workers == 0)
+}
+
+fn adaptive_pool_outcome(
+    action: Option<StepAction>,
+    mut responses: Vec<(usize, EigenKWorkerResponseV1)>,
+    report: ProcessPoolReportV1,
+) -> ProcessPoolOutcome {
+    responses.sort_by_key(|(request_index, _)| *request_index);
+    let result = ProcessPoolResult {
+        responses: responses
+            .into_iter()
+            .map(|(_, response)| response)
+            .collect(),
+        report,
+    };
+    match action {
+        Some(action @ (StepAction::Pause | StepAction::Stop)) => {
+            ProcessPoolOutcome::Interrupted {
+                action,
+                partial: result,
+            }
+        }
+        Some(StepAction::Continue) | None => ProcessPoolOutcome::Completed(result),
+    }
+}
+
+fn requested_control_action(
+    cancel: &AtomicBool,
+    pending_action: &mut Option<StepAction>,
+    check_control: &mut Option<&mut dyn FnMut(Option<&ProcessAdmissionEventV1>) -> StepAction>,
+    event: Option<&ProcessAdmissionEventV1>,
+) -> Option<StepAction> {
+    if *pending_action == Some(StepAction::Stop) {
+        return Some(StepAction::Stop);
+    }
+    let action = if cancel.load(Ordering::Relaxed) {
+        StepAction::Stop
+    } else {
+        check_control
+            .as_deref_mut()
+            .map(|check| check(event))
+            .unwrap_or(StepAction::Continue)
+    };
+    match action {
+        StepAction::Stop => *pending_action = Some(StepAction::Stop),
+        StepAction::Pause => {
+            *pending_action = Some(StepAction::Pause);
+        }
+        StepAction::Continue => {}
+    }
+    *pending_action
 }
 
 fn resolve_worker_executable() -> Result<PathBuf, String> {
@@ -463,6 +524,25 @@ pub(crate) struct ProcessPoolWorkerLogV1 {
 pub(crate) struct ProcessPoolResult {
     pub responses: Vec<EigenKWorkerResponseV1>,
     pub report: ProcessPoolReportV1,
+}
+
+#[derive(Debug)]
+pub(crate) enum ProcessPoolOutcome {
+    Completed(ProcessPoolResult),
+    Interrupted {
+        action: StepAction,
+        partial: ProcessPoolResult,
+    },
+}
+
+#[derive(Debug)]
+enum WorkerWaitOutcome {
+    Completed(EigenKWorkerResponseV1),
+    CompletedInterrupted {
+        action: StepAction,
+        response: EigenKWorkerResponseV1,
+    },
+    Interrupted(StepAction),
 }
 
 /// Best-effort bounded evidence retained in the private pool root even when
@@ -1005,6 +1085,28 @@ impl EigenKProcessPool {
         active.clear();
     }
 
+    fn take_terminal_workers(active: &mut Vec<ActiveWorker>) -> Result<Vec<ActiveWorker>, String> {
+        let mut completed = Vec::new();
+        let mut index = active.len();
+        while index > 0 {
+            index -= 1;
+            if active[index]
+                .child
+                .try_wait()
+                .map_err(|error| {
+                    format!(
+                        "poll eigen k worker {}: {error}",
+                        active[index].request_index
+                    )
+                })?
+                .is_some()
+            {
+                completed.push(active.swap_remove(index));
+            }
+        }
+        Ok(completed)
+    }
+
     fn resolve_thread_budget(
         &self,
         resources: &crate::adaptive_resources::ResourceSnapshot,
@@ -1065,26 +1167,44 @@ impl EigenKProcessPool {
         &self,
         mut worker: ActiveWorker,
         cancel: &Arc<AtomicBool>,
-        should_cancel: &mut Option<&mut dyn FnMut(Option<&ProcessAdmissionEventV1>) -> bool>,
-    ) -> Result<EigenKWorkerResponseV1, String> {
+        pending_action: &mut Option<StepAction>,
+        check_control: &mut Option<&mut dyn FnMut(Option<&ProcessAdmissionEventV1>) -> StepAction>,
+    ) -> Result<WorkerWaitOutcome, String> {
+        let mut pause_requested = false;
         loop {
-            if cancel.load(Ordering::Relaxed)
-                || should_cancel
-                    .as_deref_mut()
-                    .is_some_and(|check| check(None))
-            {
-                let _ = fs::write(&worker.cancel_path, b"cancelled");
-                let _ = worker.child.kill();
-                let _ = worker.child.wait();
-                Self::cap_worker_logs(&worker);
-                return Err("eigen process pool cancelled while waiting for worker".into());
+            if let Some(action) = requested_control_action(
+                cancel,
+                pending_action,
+                check_control,
+                None,
+            ) {
+                match action {
+                    StepAction::Stop => {
+                        let _ = fs::write(&worker.cancel_path, b"cancelled");
+                        let _ = worker.child.kill();
+                        let _ = worker.child.wait();
+                        Self::cap_worker_logs(&worker);
+                        return Ok(WorkerWaitOutcome::Interrupted(action));
+                    }
+                    StepAction::Pause => pause_requested = true,
+                    StepAction::Continue => {}
+                }
             }
             match worker.child.try_wait() {
                 Ok(Some(status)) => {
                     Self::cap_worker_logs(&worker);
                     let response = self.read_response(worker.request_index);
                     return match response {
-                        Ok(response) if status.success() => Ok(response),
+                        Ok(response) if status.success() => {
+                            if pause_requested {
+                                Ok(WorkerWaitOutcome::CompletedInterrupted {
+                                    action: StepAction::Pause,
+                                    response,
+                                })
+                            } else {
+                                Ok(WorkerWaitOutcome::Completed(response))
+                            }
+                        }
                         Ok(_) => Err(format!(
                             "eigen k worker {} exited with {status} despite publishing a response",
                             worker.request_index
@@ -1116,8 +1236,8 @@ impl EigenKProcessPool {
         &self,
         requests: &[EigenKWorkerRequestV2],
         cancel: Arc<AtomicBool>,
-        mut should_cancel: Option<&mut dyn FnMut(Option<&ProcessAdmissionEventV1>) -> bool>,
-    ) -> Result<ProcessPoolResult, String> {
+        mut check_control: Option<&mut dyn FnMut(Option<&ProcessAdmissionEventV1>) -> StepAction>,
+    ) -> Result<ProcessPoolOutcome, String> {
         if requests.is_empty() {
             return Err("eigen process pool received zero requests".into());
         }
@@ -1158,6 +1278,7 @@ impl EigenKProcessPool {
             telemetry_reason: None,
         };
         let mut journal = AdmissionJournalGuard::new(&self.root, &report);
+        let mut pending_action = None;
 
         if self.policy.mode == ParallelExecutionModeIR::Serial {
             let mut responses = Vec::with_capacity(requests.len());
@@ -1165,13 +1286,17 @@ impl EigenKProcessPool {
                 .map(|value| value.get().min(u32::MAX as usize) as u32)
                 .unwrap_or(1);
             for (index, request) in requests.iter().enumerate() {
-                if cancel.load(Ordering::Relaxed)
-                    || should_cancel
-                        .as_deref_mut()
-                        .is_some_and(|check| check(None))
-                {
-                    journal.finish(&report, "cancelled");
-                    return Err("eigen process pool cancelled before worker admission".into());
+                if let Some(action) = requested_control_action(
+                    &cancel,
+                    &mut pending_action,
+                    &mut check_control,
+                    None,
+                ) {
+                    journal.finish(&report, pool_terminal_state(action));
+                    return Ok(ProcessPoolOutcome::Interrupted {
+                        action,
+                        partial: ProcessPoolResult { responses, report },
+                    });
                 }
                 let requested_threads = self.policy.threads_per_worker;
                 let resolved_threads = requested_threads.min(host_cpu_cores).max(1);
@@ -1211,14 +1336,40 @@ impl EigenKProcessPool {
                         host_cpu_cores,
                     },
                 });
-                let response =
-                    self.finish_child_with_cancel(worker, &cancel, &mut should_cancel)?;
+                let (response, after_response_action) = match self.finish_child_with_cancel(
+                    worker,
+                    &cancel,
+                    &mut pending_action,
+                    &mut check_control,
+                )? {
+                    WorkerWaitOutcome::Completed(response) => (response, None),
+                    WorkerWaitOutcome::CompletedInterrupted { action, response } => {
+                        (response, Some(action))
+                    }
+                    WorkerWaitOutcome::Interrupted(action) => {
+                        journal.finish(&report, pool_terminal_state(action));
+                        return Ok(ProcessPoolOutcome::Interrupted {
+                            action,
+                            partial: ProcessPoolResult { responses, report },
+                        });
+                    }
+                };
                 self.validate_terminal_response(request, &response)?;
                 responses.push(response);
                 journal.update(&report);
+                if let Some(action) = after_response_action {
+                    journal.finish(&report, pool_terminal_state(action));
+                    return Ok(ProcessPoolOutcome::Interrupted {
+                        action,
+                        partial: ProcessPoolResult { responses, report },
+                    });
+                }
             }
             journal.finish(&report, "completed");
-            return Ok(ProcessPoolResult { responses, report });
+            return Ok(ProcessPoolOutcome::Completed(ProcessPoolResult {
+                responses,
+                report,
+            }));
         }
 
         let mut sampler = ResourceSampler::new().map_err(|error| {
@@ -1246,18 +1397,34 @@ impl EigenKProcessPool {
         let mut observed_peak = WorkerPeak::default();
 
         while next_request < requests.len() || !active.is_empty() {
-            if cancel.load(Ordering::Relaxed)
-                || should_cancel
-                    .as_deref_mut()
-                    .is_some_and(|check| check(None))
-            {
-                for worker in &active {
-                    let _ = fs::write(&worker.cancel_path, b"cancelled");
-                    sampler.forget_worker(worker.pid);
+            let mut stop_after_terminal_harvest = false;
+            if let Some(action) = requested_control_action(
+                &cancel,
+                &mut pending_action,
+                &mut check_control,
+                None,
+            ) {
+                if pool_control_can_finish(action, active.len()) {
+                    if action == StepAction::Stop && !active.is_empty() {
+                        // Close admission immediately, then reap children that
+                        // are already terminal before killing the remaining
+                        // active workers. No solver is awaited on this path.
+                        stop_after_terminal_harvest = true;
+                    } else {
+                        journal.finish(&report, pool_terminal_state(action));
+                        responses.sort_by_key(|(index, _)| *index);
+                        return Ok(ProcessPoolOutcome::Interrupted {
+                            action,
+                            partial: ProcessPoolResult {
+                                responses: responses
+                                    .into_iter()
+                                    .map(|(_, response)| response)
+                                    .collect(),
+                                report,
+                            },
+                        });
+                    }
                 }
-                Self::terminate_all(&mut active);
-                journal.finish(&report, "cancelled");
-                return Err("eigen process pool cancelled".into());
             }
 
             // Skip proc sampling for children already confirmed terminal.
@@ -1265,7 +1432,7 @@ impl EigenKProcessPool {
             // pend; parent cgroup, allocation, identity, and parse errors fail closed.
             let mut telemetry_resolution_sources = Vec::<String>::new();
             let mut exit_telemetry_timeout = None;
-            for worker in &mut active {
+            for worker in active.iter_mut().filter(|_| !stop_after_terminal_harvest) {
                 // If the child is already terminal, its validated response is
                 // the authoritative peak source; avoid sampling a vanished PID.
                 if worker
@@ -1326,27 +1493,17 @@ impl EigenKProcessPool {
                     }
                 }
             }
-            if let Some(error) = exit_telemetry_timeout {
-                // No admission decision runs after the deadline. Finishing the
-                // journal here records the worker-local /proc source and elapsed
-                // reconciliation duration before ActiveWorker drops reap children.
-                journal.finish(&report, "failed");
-                return Err(error);
-            }
-
-            let mut completed = Vec::new();
-            let mut index = active.len();
-            while index > 0 {
-                index -= 1;
-                if active[index]
-                    .child
-                    .try_wait()
-                    .map_err(|error| error.to_string())?
-                    .is_some()
-                {
-                    completed.push(active.swap_remove(index));
+            if !stop_after_terminal_harvest {
+                if let Some(error) = exit_telemetry_timeout {
+                    // No admission decision runs after the deadline. Finishing the
+                    // journal here records the worker-local /proc source and elapsed
+                    // reconciliation duration before ActiveWorker drops reap children.
+                    journal.finish(&report, "failed");
+                    return Err(error);
                 }
             }
+
+            let completed = Self::take_terminal_workers(&mut active)?;
             for worker in completed {
                 let request_index = worker.request_index;
                 let peak = worker.peak;
@@ -1441,6 +1598,26 @@ impl EigenKProcessPool {
                 }
             }
 
+            if stop_after_terminal_harvest {
+                for worker in &active {
+                    let _ = fs::write(&worker.cancel_path, b"cancelled");
+                    sampler.forget_worker(worker.pid);
+                }
+                Self::terminate_all(&mut active);
+                journal.finish(&report, pool_terminal_state(StepAction::Stop));
+                responses.sort_by_key(|(index, _)| *index);
+                return Ok(ProcessPoolOutcome::Interrupted {
+                    action: StepAction::Stop,
+                    partial: ProcessPoolResult {
+                        responses: responses
+                            .into_iter()
+                            .map(|(_, response)| response)
+                            .collect(),
+                        report,
+                    },
+                });
+            }
+
             // Keep live resource samples and worker counts current after the
             // final admission, including the iteration that reaps the last child.
             {
@@ -1500,7 +1677,8 @@ impl EigenKProcessPool {
                     })
                     .collect::<Vec<_>>();
                 let exit_telemetry_pending = !pending_exit_details.is_empty();
-                let admission_open = worker_admission_open(telemetry_open, exit_telemetry_pending);
+                let admission_open = worker_admission_open(telemetry_open, exit_telemetry_pending)
+                    && pending_action.is_none();
                 let pending_samples = requests.len().saturating_sub(next_request);
                 let decision = if admission_open {
                     admission.decide(
@@ -1580,15 +1758,18 @@ impl EigenKProcessPool {
                 // live callback still sees fresh measurements.  Its caller
                 // throttles these duplicate events to roughly one second and
                 // publishes reason changes immediately.
-                let stop_requested = should_cancel
-                    .as_deref_mut()
-                    .is_some_and(|check| check(Some(&event)));
-                if !admission_may_spawn_worker(&cancel, stop_requested) {
-                    // A callback can request cancellation in the same
-                    // admission iteration that produced a positive budget.
-                    // Close admission before the budget reaches spawn_worker;
-                    // the next loop iteration performs the existing
-                    // cancellation/termination path for active workers.
+                let control_action = requested_control_action(
+                    &cancel,
+                    &mut pending_action,
+                    &mut check_control,
+                    Some(&event),
+                );
+                if !admission_may_spawn_worker(&cancel, control_action) {
+                    // A callback can request control in the same admission
+                    // iteration that produced a positive budget. Close
+                    // admission before that budget reaches spawn_worker; Stop
+                    // tears down active workers and Pause lets them finish at
+                    // the current sample boundary.
                     journal.update(&report);
                     continue;
                 }
@@ -1637,15 +1818,13 @@ impl EigenKProcessPool {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        responses.sort_by_key(|(index, _)| *index);
-        journal.finish(&report, "completed");
-        Ok(ProcessPoolResult {
-            responses: responses
-                .into_iter()
-                .map(|(_, response)| response)
-                .collect(),
-            report,
-        })
+        journal.finish(
+            &report,
+            pending_action
+                .map(pool_terminal_state)
+                .unwrap_or("completed"),
+        );
+        Ok(adaptive_pool_outcome(pending_action, responses, report))
     }
 }
 
@@ -1654,22 +1833,212 @@ mod tests {
     use super::{
         admission_may_spawn_worker, bounded_worker_log_tail,
         classify_permanent_admission_infeasibility,
-        permanent_admission_failure_if_running, PermanentAdmissionInfeasibility,
+        permanent_admission_failure_if_running, pool_control_can_finish, pool_terminal_state,
+        requested_control_action, ActiveWorker, EigenKProcessPool,
+        PermanentAdmissionInfeasibility,
         MAX_WORKER_LOG_BYTES,
     };
     use crate::adaptive_resources::{
         AdaptiveAdmission, ResourceSnapshot, WorkerPeak,
     };
     use fullmag_ir::{ParallelExecutionModeIR, ParallelExecutionPolicyIR};
+    use crate::types::StepAction;
+    use std::cell::Cell;
     use std::io::Cursor;
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     fn adaptive_policy() -> ParallelExecutionPolicyIR {
         ParallelExecutionPolicyIR {
             mode: ParallelExecutionModeIR::Adaptive,
             ..Default::default()
         }
+    }
+
+    struct StopHarvestTempDir(PathBuf);
+
+    impl StopHarvestTempDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "fullmag-k-pool-stop-harvest-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&path).expect("create stop-harvest fixture directory");
+            Self(path)
+        }
+    }
+
+    impl Drop for StopHarvestTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn test_active_worker(
+        root: &Path,
+        request_index: usize,
+        child: std::process::Child,
+    ) -> ActiveWorker {
+        let namespace = root.join(format!("worker-{request_index:06}"));
+        std::fs::create_dir_all(&namespace).expect("create worker namespace");
+        ActiveWorker {
+            request_index,
+            pid: child.id(),
+            child,
+            peak: WorkerPeak::default(),
+            cpu_coverage: super::WorkerCpuCoverage::default(),
+            exit_telemetry_pending: None,
+            stdout_path: namespace.join("stdout.log"),
+            stderr_path: namespace.join("stderr.log"),
+            cancel_path: namespace.join("cancel.flag"),
+            handshake_path: namespace.join("handshake.json"),
+            resolved_threads: 1,
+        }
+    }
+
+    #[test]
+    fn stop_harvests_terminal_child_and_kills_active_child_without_response() {
+        let fixture = StopHarvestTempDir::new();
+        let current_exe = std::env::current_exe().expect("resolve test executable");
+        let mut completed_child = Command::new(&current_exe)
+            .arg("stop_harvest_child_helper")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn immediately completing child");
+        assert!(
+            completed_child
+                .wait()
+                .expect("wait completed fixture child")
+                .success()
+        );
+
+        let completed_namespace = fixture.0.join("worker-000000");
+        std::fs::create_dir_all(&completed_namespace).expect("create completed namespace");
+        std::fs::write(
+            completed_namespace.join("response.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "protocol": super::EIGEN_K_WORKER_PROTOCOL_V2,
+                "sample_index": 17,
+                "worker_request_index": 0,
+                "ok": true,
+            }))
+            .expect("encode terminal worker response"),
+        )
+        .expect("write terminal worker response");
+
+        let ready_path = fixture.0.join("active-child.ready");
+        let active_child = Command::new(&current_exe)
+            .arg("stop_harvest_child_helper")
+            .arg("--nocapture")
+            .env("FULLMAG_K_POOL_STOP_HARVEST_READY", &ready_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn active child without a response");
+        let mut active = vec![
+            test_active_worker(&fixture.0, 0, completed_child),
+            test_active_worker(&fixture.0, 1, active_child),
+        ];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready_path.exists(), "active child must start before Stop");
+        assert!(active[1].child.try_wait().unwrap().is_none());
+
+        let completed = EigenKProcessPool::take_terminal_workers(&mut active)
+            .expect("inspect terminal children without waiting");
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].request_index, 0);
+        assert_eq!(active.len(), 1);
+        let pool = EigenKProcessPool {
+            root: fixture.0.clone(),
+            executable: current_exe,
+            worker_executable_sha256: String::new(),
+            worker_build_identity: serde_json::Value::Null,
+            policy: adaptive_policy(),
+        };
+        let response = pool
+            .finish_child(completed.into_iter().next().unwrap())
+            .expect("retain the already-terminal child response");
+        assert_eq!(response.worker_request_index, 0);
+        assert_eq!(response.sample_index, 17);
+
+        assert!(
+            !fixture.0.join("worker-000001/response.json").exists(),
+            "the still-active child has no fabricated response"
+        );
+        for worker in &active {
+            let _ = std::fs::write(&worker.cancel_path, b"cancelled");
+        }
+        let teardown_started = Instant::now();
+        EigenKProcessPool::terminate_all(&mut active);
+        assert!(active.is_empty(), "Stop teardown must not wait for the solver");
+        assert!(
+            teardown_started.elapsed() < Duration::from_secs(5),
+            "Stop teardown must kill the active child instead of waiting for its solve"
+        );
+    }
+
+    #[test]
+    fn stop_harvest_child_helper() {
+        let Some(ready_path) = std::env::var_os("FULLMAG_K_POOL_STOP_HARVEST_READY") else {
+            return;
+        };
+        std::fs::write(PathBuf::from(ready_path), b"ready").expect("publish child readiness");
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[test]
+    fn adaptive_pool_completion_keeps_latched_pause_and_all_drained_responses() {
+        let response = |request_index: usize, sample_index: usize| {
+            super::EigenKWorkerResponseV1 {
+                protocol: super::EIGEN_K_WORKER_PROTOCOL_V2.into(),
+                sample_index,
+                worker_request_index: request_index,
+                ok: true,
+                worker_executable_sha256: None,
+                worker_build_identity: None,
+                terminal_peak: None,
+                run: None,
+                error: None,
+            }
+        };
+        let report = super::ProcessPoolReportV1 {
+            protocol: super::EIGEN_K_WORKER_PROTOCOL_V2.into(),
+            requested_mode: ParallelExecutionModeIR::Adaptive,
+            resolved_mode: "adaptive_processes".into(),
+            resolved_workers: 2,
+            policy: adaptive_policy(),
+            inputs: Vec::new(),
+            thread_bindings: Vec::new(),
+            cpu_observations: Vec::new(),
+            worker_logs: Vec::new(),
+            events: Vec::new(),
+            events_truncated: false,
+            telemetry_reason: None,
+        };
+
+        let outcome = super::adaptive_pool_outcome(
+            Some(StepAction::Pause),
+            vec![(1, response(1, 31)), (0, response(0, 30))],
+            report,
+        );
+        let super::ProcessPoolOutcome::Interrupted { action, partial } = outcome else {
+            panic!("a latched Pause must survive the final completed-worker drain");
+        };
+        assert_eq!(action, StepAction::Pause);
+        assert_eq!(
+            partial
+                .responses
+                .iter()
+                .map(|response| response.sample_index)
+                .collect::<Vec<_>>(),
+            vec![30, 31]
+        );
     }
 
     fn memory_snapshot(now: Instant, memory_available_bytes: u64) -> ResourceSnapshot {
@@ -1807,15 +2176,16 @@ mod tests {
     #[test]
     fn callback_cancellation_takes_precedence_over_permanent_admission_failure() {
         let cancel = AtomicBool::new(false);
+        let action = StepAction::Pause;
         let failure =
             Some(PermanentAdmissionInfeasibility::MemoryReserveConsumesAllowedBudget {
                 allowed_memory_bytes: 100,
                 reserve_bytes: 100,
             });
-        assert!(!admission_may_spawn_worker(&cancel, true));
-        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!admission_may_spawn_worker(&cancel, Some(action)));
+        assert!(!cancel.load(Ordering::Relaxed));
         assert_eq!(
-            permanent_admission_failure_if_running(failure, &cancel, true, 0, 2),
+            permanent_admission_failure_if_running(failure, &cancel, false, 0, 2),
             None
         );
     }
@@ -2210,13 +2580,61 @@ mod tests {
     #[test]
     fn cancellation_callback_closes_worker_admission_before_spawn() {
         let cancel = AtomicBool::new(false);
-        assert!(!admission_may_spawn_worker(&cancel, true));
-        assert!(cancel.load(Ordering::Relaxed));
+        assert!(!admission_may_spawn_worker(&cancel, Some(StepAction::Stop)));
+        assert!(!cancel.load(Ordering::Relaxed));
 
         let already_cancelled = AtomicBool::new(true);
-        assert!(!admission_may_spawn_worker(&already_cancelled, false));
+        assert!(!admission_may_spawn_worker(&already_cancelled, None));
 
         let active = AtomicBool::new(false);
-        assert!(admission_may_spawn_worker(&active, false));
+        assert!(admission_may_spawn_worker(&active, None));
+    }
+
+    #[test]
+    fn controlled_pause_and_stop_keep_distinct_pool_terminal_states() {
+        let cancel = AtomicBool::new(false);
+        for (action, expected_state) in [
+            (StepAction::Pause, "paused"),
+            (StepAction::Stop, "cancelled"),
+        ] {
+            let mut callback = move |_event: Option<&super::ProcessAdmissionEventV1>| action;
+            let mut callback = Some(
+                &mut callback
+                    as &mut dyn FnMut(Option<&super::ProcessAdmissionEventV1>) -> StepAction,
+            );
+            let mut pending_action = None;
+            assert_eq!(
+                requested_control_action(&cancel, &mut pending_action, &mut callback, None),
+                Some(action)
+            );
+            assert_eq!(pool_terminal_state(action), expected_state);
+            assert!(!admission_may_spawn_worker(&cancel, Some(action)));
+        }
+        assert!(!pool_control_can_finish(StepAction::Pause, 1));
+        assert!(pool_control_can_finish(StepAction::Pause, 0));
+        assert!(pool_control_can_finish(StepAction::Stop, 1));
+    }
+
+    #[test]
+    fn stop_upgrades_a_pending_pause_without_losing_the_terminal_action() {
+        let cancel = AtomicBool::new(false);
+        let callback_action = Cell::new(StepAction::Pause);
+        let mut callback = |_: Option<&super::ProcessAdmissionEventV1>| callback_action.get();
+        let mut callback = Some(
+            &mut callback
+                as &mut dyn FnMut(Option<&super::ProcessAdmissionEventV1>) -> StepAction,
+        );
+        let mut pending_action = None;
+
+        assert_eq!(
+            requested_control_action(&cancel, &mut pending_action, &mut callback, None),
+            Some(StepAction::Pause)
+        );
+        callback_action.set(StepAction::Stop);
+        assert_eq!(
+            requested_control_action(&cancel, &mut pending_action, &mut callback, None),
+            Some(StepAction::Stop)
+        );
+        assert_eq!(pool_terminal_state(pending_action.expect("latched action")), "cancelled");
     }
 }

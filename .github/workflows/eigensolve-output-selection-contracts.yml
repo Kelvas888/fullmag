@@ -6,6 +6,9 @@ on:
     branches: ['codex/**']
     paths:
       - 'crates/fullmag-runner/src/eigen/output_selection.rs'
+      - 'crates/fullmag-runner/src/eigen/k_process_pool.rs'
+      - 'crates/fullmag-runner/src/eigen/orchestrator.rs'
+      - 'crates/fullmag-runner/src/fem/eigen_k_pool.rs'
       - 'crates/fullmag-runner/src/fem/eigen_output.rs'
       - 'crates/fullmag-runner/src/fem/eigen_path.rs'
       - 'crates/fullmag-runner/src/fem/eigen_path_artifacts.rs'
@@ -33,6 +36,11 @@ jobs:
         run: git rev-parse HEAD
       - name: Run output selection contracts
         run: cargo test --locked -p fullmag-runner --lib eigen::output_selection::tests -- --nocapture
+      - name: Preserve adaptive pool control and planned prefix contracts
+        run: |
+          cargo test --locked -p fullmag-runner --lib eigen::k_process_pool::tests -- --nocapture
+          cargo test --locked -p fullmag-runner --lib eigen::orchestrator::tests -- --nocapture
+          cargo test --locked -p fullmag-runner --lib fem::eigen_k_pool::tests -- --nocapture
       - name: Validate provenance across all sweep modes
         run: cargo test --locked -p fullmag-runner --lib fem::eigen_sweep::native_field_sweep_identity_tests -- --nocapture
       - name: Preserve direct Floquet pause and stop lifecycle
