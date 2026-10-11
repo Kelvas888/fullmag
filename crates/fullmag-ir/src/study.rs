@@ -146,6 +146,7 @@ pub enum DriveActivationIR {
 pub enum StudyKindIR {
     #[default]
     Unknown,
+    AntennaFieldSolve,
     TimeEvolution,
     Relaxation,
     Hysteresis,
@@ -1550,9 +1551,22 @@ pub enum EigenDampingPolicyIR {
     Include,
 }
 
+/// Physical solve selection, independent of the authored pipeline node identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct AntennaFieldSolveSelectionIR {
+    pub stage_id: String,
+    pub port_mode_id: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StudyIR {
+    AntennaFieldSolve {
+        sampling: SamplingIR,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        selection: Option<AntennaFieldSolveSelectionIR>,
+    },
     TimeEvolution {
         dynamics: DynamicsIR,
         sampling: SamplingIR,
@@ -1660,10 +1674,25 @@ fn get_default_dynamics() -> &'static DynamicsIR {
 }
 
 impl StudyIR {
+    pub(crate) fn validate_antenna_selection(&self, stages: &[crate::AntennaFieldSolveStageIR]) -> Result<(), String> {
+        let Self::AntennaFieldSolve { selection: Some(selection), .. } = self else { return Ok(()) };
+        let mut matching = stages.iter().filter(|stage| stage.id == selection.stage_id);
+        let stage = matching.next();
+        if selection.stage_id.trim().is_empty()
+            || selection.port_mode_id.trim().is_empty()
+            || matching.next().is_some()
+            || !stage.is_some_and(|stage| stage.port_mode_ids.contains(&selection.port_mode_id))
+        {
+            return Err("antenna_field_solve.selection must reference exactly one declared solve and an included non-empty port mode".into());
+        }
+        Ok(())
+    }
+
     /// Return the stable semantic study family used by resolved execution
     /// plans and activation checks.
     pub const fn kind(&self) -> StudyKindIR {
         match self {
+            Self::AntennaFieldSolve { .. } => StudyKindIR::AntennaFieldSolve,
             Self::TimeEvolution { .. } => StudyKindIR::TimeEvolution,
             Self::Relaxation { .. } => StudyKindIR::Relaxation,
             Self::Eigenmodes { .. } => StudyKindIR::Eigenmodes,
@@ -1679,6 +1708,7 @@ impl StudyIR {
 
     pub fn optional_dynamics(&self) -> Option<&DynamicsIR> {
         match self {
+            StudyIR::AntennaFieldSolve { .. } => None,
             StudyIR::TimeEvolution { dynamics, .. }
             | StudyIR::Eigenmodes { dynamics, .. }
             | StudyIR::FrequencyResponse { dynamics, .. } => Some(dynamics),
@@ -1689,7 +1719,8 @@ impl StudyIR {
 
     pub fn sampling(&self) -> &SamplingIR {
         match self {
-            StudyIR::TimeEvolution { sampling, .. }
+            StudyIR::AntennaFieldSolve { sampling, .. }
+            | StudyIR::TimeEvolution { sampling, .. }
             | StudyIR::Relaxation { sampling, .. }
             | StudyIR::Eigenmodes { sampling, .. }
             | StudyIR::FrequencyResponse { sampling, .. }
@@ -1699,7 +1730,8 @@ impl StudyIR {
 
     pub fn sampling_mut(&mut self) -> &mut SamplingIR {
         match self {
-            StudyIR::TimeEvolution { sampling, .. }
+            StudyIR::AntennaFieldSolve { sampling, .. }
+            | StudyIR::TimeEvolution { sampling, .. }
             | StudyIR::Relaxation { sampling, .. }
             | StudyIR::Eigenmodes { sampling, .. }
             | StudyIR::FrequencyResponse { sampling, .. }
@@ -1709,7 +1741,8 @@ impl StudyIR {
 
     pub fn relaxation(&self) -> Option<RelaxationControlIR> {
         match self {
-            StudyIR::TimeEvolution { .. }
+            StudyIR::AntennaFieldSolve { .. }
+            | StudyIR::TimeEvolution { .. }
             | StudyIR::Eigenmodes { .. }
             | StudyIR::FrequencyResponse { .. }
             | StudyIR::Hysteresis { .. } => None,

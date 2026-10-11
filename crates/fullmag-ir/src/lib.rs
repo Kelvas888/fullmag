@@ -845,13 +845,14 @@ impl ProblemIR {
         validate_spin_transport_modules(self, &mut errors);
         validate_magnetoelastic(self, &mut errors);
         validate_region_owned_semantics(self, &mut errors);
-        if self.regions.is_empty() {
+        let antenna_study = matches!(self.study, StudyIR::AntennaFieldSolve { .. });
+        if !antenna_study && self.regions.is_empty() {
             errors.push("at least one region is required".to_string());
         }
-        if self.materials.is_empty() {
+        if !antenna_study && self.materials.is_empty() {
             errors.push("at least one material is required".to_string());
         }
-        if self.magnets.is_empty() {
+        if !antenna_study && self.magnets.is_empty() {
             errors.push("at least one magnet is required".to_string());
         }
         let has_material_anisotropy = self.materials.iter().any(|material| {
@@ -866,7 +867,7 @@ impl ProblemIR {
                 || material.kc2_field.is_some()
                 || material.kc3_field.is_some()
         });
-        if self.energy_terms.is_empty() && !has_material_anisotropy {
+        if !antenna_study && self.energy_terms.is_empty() && !has_material_anisotropy {
             errors.push("at least one interaction or material anisotropy is required".to_string());
         }
         if matches!(
@@ -1109,6 +1110,20 @@ impl ProblemIR {
             }
         }
         match &self.study {
+            StudyIR::AntennaFieldSolve { sampling, .. } => {
+                if let Err(error) = self.study.validate_antenna_selection(&self.antenna_field_solve_stages) {
+                    errors.push(error);
+                }
+                if !sampling.outputs.is_empty()
+                    || sampling.table_autosave.is_some()
+                    || sampling.stage_autosave.is_some()
+                {
+                    errors.push(
+                        "antenna_field_solve uses stage output requests, not magnetic time sampling"
+                            .to_string(),
+                    );
+                }
+            }
             StudyIR::TimeEvolution { dynamics, .. } => {
                 validate_study_dynamics(dynamics, &mut errors);
                 for output in &self.study.sampling().outputs {

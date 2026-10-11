@@ -3294,14 +3294,14 @@ fn validate_study_pipeline_document(
             document.version
         )));
     }
-    validate_study_pipeline_nodes(&document.nodes)?;
+    validate_study_pipeline_nodes(&document.nodes, &mut BTreeSet::new())?;
     Ok(())
 }
 
 fn validate_study_pipeline_nodes(
     nodes: &[StudyPipelineNode],
+    node_ids: &mut BTreeSet<String>,
 ) -> Result<(), SceneDocumentValidationError> {
-    let mut node_ids = BTreeSet::new();
     for node in nodes {
         match node {
             StudyPipelineNode::Primitive(node) => {
@@ -3360,7 +3360,7 @@ fn validate_study_pipeline_nodes(
                         node.id
                     )));
                 }
-                validate_study_pipeline_nodes(&node.children)?;
+                validate_study_pipeline_nodes(&node.children, node_ids)?;
             }
         }
     }
@@ -3370,6 +3370,69 @@ fn validate_study_pipeline_nodes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pipeline_with_nodes(nodes: Value) -> StudyPipelineDocument {
+        serde_json::from_value(serde_json::json!({
+            "version": "study_pipeline.v1",
+            "nodes": nodes,
+        }))
+        .expect("pipeline fixture must deserialize")
+    }
+
+    #[test]
+    fn study_pipeline_rejects_duplicate_ids_in_different_groups() {
+        let document = pipeline_with_nodes(serde_json::json!([
+            {"node_kind": "group", "id": "first", "label": "First", "children": [
+                {"node_kind": "primitive", "id": "shared", "label": "Solve", "stage_kind": "antenna_field_solve"}
+            ]},
+            {"node_kind": "group", "id": "second", "label": "Second", "children": [
+                {"node_kind": "macro", "id": "shared", "label": "Relax and run", "macro_kind": "relax_run"}
+            ]}
+        ]));
+        let error = validate_study_pipeline_document(&document)
+            .expect_err("IDs must be unique across groups and node kinds");
+        assert_eq!(error.message, "duplicate study pipeline node id 'shared'");
+    }
+
+    #[test]
+    fn study_pipeline_rejects_group_child_id_collision() {
+        let document = pipeline_with_nodes(serde_json::json!([
+            {"node_kind": "group", "id": "shared", "label": "Group", "children": [
+                {"node_kind": "primitive", "id": "shared", "label": "Run", "stage_kind": "run"}
+            ]}
+        ]));
+        let error = validate_study_pipeline_document(&document)
+            .expect_err("a group and its child cannot share an ID");
+        assert_eq!(error.message, "duplicate study pipeline node id 'shared'");
+    }
+
+    #[test]
+    fn study_pipeline_rejects_id_collision_inside_disabled_group() {
+        let document = pipeline_with_nodes(serde_json::json!([
+            {"node_kind": "group", "id": "disabled", "label": "Disabled", "enabled": false, "children": [
+                {"node_kind": "primitive", "id": "shared", "label": "Solve", "stage_kind": "antenna_field_solve", "enabled": false}
+            ]},
+            {"node_kind": "primitive", "id": "shared", "label": "Run", "stage_kind": "run"}
+        ]));
+        let error = validate_study_pipeline_document(&document)
+            .expect_err("disabled authored nodes still reserve their IDs");
+        assert_eq!(error.message, "duplicate study pipeline node id 'shared'");
+    }
+
+    #[test]
+    fn study_pipeline_accepts_globally_distinct_nested_ids() {
+        let document = pipeline_with_nodes(serde_json::json!([
+            {"node_kind": "group", "id": "outer", "label": "Outer", "children": [
+                {"node_kind": "group", "id": "inner", "label": "Inner", "enabled": false, "children": [
+                    {"node_kind": "primitive", "id": "solve", "label": "Solve", "stage_kind": "antenna_field_solve"}
+                ]},
+                {"node_kind": "macro", "id": "relax-run", "label": "Relax and run", "macro_kind": "relax_run"}
+            ]},
+            {"node_kind": "primitive", "id": "run", "label": "Run", "stage_kind": "run"}
+        ]));
+        validate_study_pipeline_document(&document)
+            .expect("distinct IDs remain valid across nested and disabled groups");
+    }
 
     fn valid_generic_swept_prism() -> crate::ScriptBuilderPerGeometryMeshState {
         crate::ScriptBuilderPerGeometryMeshState {

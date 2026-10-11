@@ -10,6 +10,10 @@ use anyhow::{anyhow, Result};
 type LivePublishSink =
     Arc<dyn Fn(&str, &CurrentLiveSnapshotPayload) -> Result<()> + Send + Sync + 'static>;
 
+#[path = "terminal_publication.rs"]
+mod terminal_publication;
+use terminal_publication::TerminalPublication;
+
 use crate::communication_policy::{
     LIVE_PUBLISH_FAST_INTERVAL, LIVE_PUBLISH_MIN_INTERVAL, LIVE_SCALAR_TELEMETRY_INTERVAL,
 };
@@ -508,6 +512,32 @@ impl LocalLiveWorkspace {
 
     pub fn publish_snapshot(&self) {
         self.publisher.request_publish();
+    }
+
+    /// Wait for this immutable terminal snapshot, not for a momentarily idle queue.
+    pub fn publish_terminal_and_wait(&self, timeout: std::time::Duration) -> Result<()> {
+        if !self.publisher.terminal.enabled() {
+            return Ok(());
+        }
+        let state = self.state.lock().map_err(|_| anyhow!("terminal workspace lock poisoned"))?;
+        let mut preview = state.preview_fields.clone();
+        for field in state.pending_preview_fields.to_vec() {
+            if preview.get(&field.quantity).is_none_or(|current| {
+                !preview_field_source_precedence(&field)
+                    .cmp(&preview_field_source_precedence(current))
+                    .is_lt()
+            }) {
+                preview.insert(field);
+            }
+        }
+        let mut snapshot = state.build_publish_payload(true, Some(preview.to_vec()), state.clear_preview_cache);
+        // The serial worker drains the canonical replacement transaction first.
+        // Replaying its generation can make the API skip terminal metadata.
+        snapshot.replace_latest_fields = false;
+        snapshot.field_generation = None;
+        snapshot.latest_fields = Some(state.latest_fields.clone());
+        drop(state);
+        self.publisher.terminal.publish_and_wait(snapshot, timeout, &self.publisher.wake_tx)
     }
 
     pub fn push_log(&self, level: &str, message: impl Into<String>) {
@@ -1469,6 +1499,7 @@ pub(crate) struct CurrentLivePublisher {
     last_request_at: Arc<Mutex<Option<Instant>>>,
     state_source: Arc<Mutex<Option<Arc<Mutex<LocalLiveWorkspaceState>>>>>,
     wake_tx: mpsc::SyncSender<()>,
+    terminal: Arc<TerminalPublication>,
 }
 
 #[derive(Debug, Default)]
@@ -1645,6 +1676,7 @@ impl CurrentLivePublisher {
             last_request_at: Arc::new(Mutex::new(None)),
             state_source: Arc::new(Mutex::new(None)),
             wake_tx,
+            terminal: Arc::new(TerminalPublication::new(false)),
         }
     }
 
@@ -1695,6 +1727,8 @@ impl CurrentLivePublisher {
         let worker_last_request_at = Arc::clone(&last_request_at);
         let worker_state_source = Arc::clone(&state_source);
         let worker_session_id = session_id.to_string();
+        let terminal = Arc::new(TerminalPublication::new(true));
+        let worker_terminal = Arc::clone(&terminal);
         let thread_name = format!("fullmag-live-publisher-{session_id}");
         std::thread::Builder::new()
             .name(thread_name)
@@ -1718,6 +1752,7 @@ impl CurrentLivePublisher {
                     delta_sink,
                     full_sink,
                     wake_rx,
+                    worker_terminal,
                 )
             })
             .expect("current live publisher thread should spawn");
@@ -1735,6 +1770,7 @@ impl CurrentLivePublisher {
             last_request_at,
             state_source,
             wake_tx,
+            terminal,
         }
     }
 
@@ -5244,10 +5280,12 @@ fn current_live_publisher_loop(
     delta_sink: LivePublishSink,
     full_sink: LivePublishSink,
     wake_rx: mpsc::Receiver<()>,
+    terminal: Arc<TerminalPublication>,
 ) {
     const LIVENESS_HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
     let mut last_publish_at: Option<Instant> = None;
     let mut successful_publish_window = SuccessfulPublishWindow::default();
+    let mut has_published = false;
     let mut slow_publish_count: u64 = 0;
     loop {
         match wake_rx.recv_timeout(LIVENESS_HEARTBEAT_INTERVAL) {
@@ -5263,6 +5301,9 @@ fn current_live_publisher_loop(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+        publish_requested_terminal(&terminal, &session_id, enable_api_fallback,
+            &delta_sink, &full_sink, &diagnostics, &mut successful_publish_window,
+            &pending_scalar_rows, &state_source, &payload, &scalar_gate, &mut has_published);
         if owner_session_lost(&session_id, enable_api_fallback) {
             return;
         }
@@ -5270,6 +5311,9 @@ fn current_live_publisher_loop(
             std::thread::sleep(coalesce_delay);
         }
         while pending.swap(false, Ordering::AcqRel) {
+            publish_requested_terminal(&terminal, &session_id, enable_api_fallback,
+                &delta_sink, &full_sink, &diagnostics, &mut successful_publish_window,
+                &pending_scalar_rows, &state_source, &payload, &scalar_gate, &mut has_published);
             if owner_session_lost(&session_id, enable_api_fallback) {
                 return;
             }
@@ -5284,6 +5328,9 @@ fn current_live_publisher_loop(
                     std::thread::sleep(min_interval - elapsed);
                 }
             }
+            // A failed delta may already have accepted its session frame.
+            // After any attempt, an empty API must not be resurrected.
+            has_published = true;
             let scalar_publish_error =
                 publish_pending_scalar_rows(&session_id, &pending_scalar_rows, &delta_sink).err();
             if scalar_publish_error.is_some() {
@@ -5371,6 +5418,7 @@ fn current_live_publisher_loop(
                 }
             }
             if publish_result.succeeded() {
+                has_published = true;
                 if let Ok(mut slot) = payload.lock() {
                     acknowledge_terminal_field_publish(&mut slot, &snapshot);
                 }
@@ -5476,6 +5524,111 @@ fn current_live_publisher_loop(
             eprintln!("fullmag final live scalar sync warning: {error:#}");
         }
     }
+}
+
+fn publish_requested_terminal(
+    terminal: &TerminalPublication,
+    session_id: &str,
+    verify_api_owner: bool,
+    delta_sink: &LivePublishSink,
+    full_sink: &LivePublishSink,
+    diagnostics: &Arc<Mutex<fullmag_runner::LivePublisherDiagnostics>>,
+    successful_publish_window: &mut SuccessfulPublishWindow,
+    pending_scalar_rows: &Arc<Mutex<PendingScalarRows>>,
+    state_source: &Arc<Mutex<Option<Arc<Mutex<LocalLiveWorkspaceState>>>>>,
+    payload: &Arc<Mutex<CurrentLiveSnapshotPayload>>,
+    scalar_gate: &Arc<Mutex<LiveTelemetryPublishGate>>,
+    has_published: &mut bool,
+) {
+    terminal.process(session_id, |identity| {
+        terminal_workspace_owner(state_source, identity)?;
+        Ok(())
+    }, |identity, snapshot| {
+        // Preserve queued scalar history and the existing generation-aware
+        // field replacement before acknowledging the immutable terminal state.
+        build_pending_payload_from_workspace(state_source, payload, scalar_gate, diagnostics);
+        let queued = payload.lock().map_err(|_| anyhow!("terminal pending payload lock poisoned"))?.clone();
+        terminal_payload_owner(&queued, identity)?;
+        let owner = if verify_api_owner {
+            match crate::control_room::capture_terminal_snapshot_owner(session_id, &identity.run_id)? {
+                Some(owner) => Some(owner),
+                None if !*has_published => {
+                    let empty = crate::control_room::TerminalSnapshotOwner {
+                        session_id: session_id.into(), run_id: identity.run_id.clone(),
+                        session_epoch: None, request_scope_epoch: None, require_empty: true,
+                    };
+                    let mut bootstrap = queued.clone();
+                    // Admit ownership before ordered scalar history; inserting
+                    // the latest row first would discard earlier queued rows.
+                    bootstrap.latest_scalar_row = None;
+                    crate::control_room::sync_current_live_terminal_snapshot(session_id, &bootstrap, &empty)?;
+                    *has_published = true;
+                    Some(crate::control_room::capture_terminal_snapshot_owner(session_id, &identity.run_id)?
+                        .ok_or_else(|| anyhow!("terminal bootstrap owner disappeared"))?)
+                }
+                None => return Err(anyhow!("previously published terminal owner disappeared")),
+            }
+        } else { None };
+        let guarded: LivePublishSink = if let Some(owner) = owner.as_ref() {
+            let owner = owner.clone();
+            Arc::new(move |session, snapshot| crate::control_room::sync_current_live_terminal_snapshot(session, snapshot, &owner))
+        } else { Arc::clone(full_sink) };
+        let scalar_sink = if verify_api_owner { &guarded } else { delta_sink };
+        publish_pending_scalar_rows(session_id, pending_scalar_rows, scalar_sink)?;
+        guarded(session_id, &queued)?;
+        *has_published = true;
+        {
+            let mut slot = payload.lock().map_err(|_| anyhow!("terminal pending payload lock poisoned"))?;
+            acknowledge_terminal_field_publish(&mut slot, &queued);
+        }
+        terminal_workspace_owner(state_source, identity)?;
+        // Both paths are full snapshots: a successful session-frame alone
+        // must never acknowledge terminal publication.
+        let mut primary = |owner: &str, payload: &CurrentLiveSnapshotPayload| guarded(owner, payload);
+        let mut fallback = |owner: &str, payload: &CurrentLiveSnapshotPayload| guarded(owner, payload);
+        let result = publish_final_snapshot_with_diagnostics(session_id, snapshot, diagnostics,
+            successful_publish_window, false, &mut primary, &mut fallback);
+        if !result.primary.succeeded() {
+            return Err(result.primary.delta_error.unwrap_or_else(|| anyhow!("terminal snapshot publication failed")));
+        }
+        if let Some(error) = result.authoritative_error {
+            return Err(error);
+        }
+        if let Some(expected) = owner {
+            let actual = crate::control_room::capture_terminal_snapshot_owner(session_id, &identity.run_id)?;
+            if actual.as_ref() != Some(&expected) {
+                return Err(anyhow!("terminal publication owner changed before ACK"));
+            }
+        }
+        Ok(())
+    });
+}
+
+fn terminal_payload_owner(
+    snapshot: &CurrentLiveSnapshotPayload,
+    identity: &terminal_publication::PublicationIdentity,
+) -> Result<()> {
+    let session = snapshot.session.as_ref().ok_or_else(|| anyhow!("terminal queued session absent"))?;
+    let run = snapshot.run.as_ref().ok_or_else(|| anyhow!("terminal queued run absent"))?;
+    if session.session_id != identity.session_id || session.run_id != identity.run_id
+        || run.session_id != identity.session_id || run.run_id != identity.run_id {
+        return Err(anyhow!("terminal queued payload owner changed"));
+    }
+    Ok(())
+}
+
+fn terminal_workspace_owner(
+    state_source: &Arc<Mutex<Option<Arc<Mutex<LocalLiveWorkspaceState>>>>>,
+    identity: &terminal_publication::PublicationIdentity,
+) -> Result<()> {
+    let source = state_source.lock().map_err(|_| anyhow!("terminal state source lock poisoned"))?
+        .clone().ok_or_else(|| anyhow!("terminal state source absent"))?;
+    let state = source.lock().map_err(|_| anyhow!("terminal workspace lock poisoned"))?;
+    if state.session.session_id != identity.session_id || state.session.run_id != identity.run_id
+        || state.run.session_id != identity.session_id || state.run.run_id != identity.run_id {
+        return Err(anyhow!("terminal local workspace owner changed"));
+    }
+    Ok(())
 }
 
 fn owner_session_lost(session_id: &str, enabled: bool) -> bool {

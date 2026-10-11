@@ -1770,6 +1770,57 @@ fn finalize_current_live_apply(
     current: &mut SessionStateResponse,
     flags: CurrentLiveApplyFlags,
 ) -> Result<(), ApiError> {
+    // A standalone inspection has its own owner-bound conductor/sampling
+    // payloads. Neither a previous magnetic frame nor a late runtime frame
+    // may provide magnetic state for this read model.
+    if current
+        .metadata
+        .as_ref()
+        .and_then(|value| value.get("execution_plan"))
+        .and_then(|value| value.get("backend_plan"))
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        == Some("antenna_external_lead_inspection")
+    {
+        let mut removed_quantities: BTreeSet<String> = current
+            .latest_fields
+            .entries()
+            .map(|(quantity, _)| quantity.clone())
+            .chain(
+                current
+                    .preview_cache
+                    .iter()
+                    .map(|(quantity, _)| quantity.clone()),
+            )
+            .chain(current.field_publication_bundles.keys().cloned())
+            .collect();
+        if let Some(state) = current.live_state.as_ref() {
+            if state.latest_step.magnetization.is_some() {
+                removed_quantities.insert("m".to_string());
+            }
+            if let Some(field) = state.latest_step.preview_field.as_ref() {
+                removed_quantities.insert(field.quantity.clone());
+            }
+        }
+        if current.fem_mesh.take().is_some() {
+            bump_mesh_revision(current);
+        }
+        if !removed_quantities.is_empty() || !current.quantities.is_empty() {
+            bump_field_catalog_revision(current);
+        }
+        for quantity in removed_quantities {
+            bump_field_sample_revision(current, &quantity, None);
+        }
+        current.latest_fields = LatestFields::default();
+        current.preview_cache = CachedPreviewFields::default();
+        current.field_publication_bundles.clear();
+        current.live_state = None;
+        current.coupled_checkpoint = None;
+        current.preview = None;
+        current.quantities.clear();
+        // Keep terminal generation history: clearing a display carrier must
+        // not reopen admission for a stale terminal publication.
+    }
     if let Some(run) = current.run.as_ref() {
         current.session.run_id = run.run_id.clone();
         if current.session.artifact_dir.is_empty() {
@@ -4724,6 +4775,111 @@ mod tests {
             solver_profile: None,
             fem_mesh: None,
         })
+    }
+
+    #[test]
+    fn standalone_snapshot_clears_magnetic_carriers_without_clearing_terminal_fence() {
+        let mut current = test_current_snapshot();
+        current.fem_mesh = Some(domain_fem_mesh("old-magnetic-mesh"));
+        current.latest_fields = serde_json::from_value(json!({
+            "m": { "values": [[1.0, 0.0, 0.0]] },
+            "mat_ms": { "values": [800_000.0] }
+        }))
+        .expect("stale magnetic fields");
+        current.preview_cache.insert(preview_field("H_eff"));
+        current.live_state = Some(live_state_with_magnetization(4, vec![1.0, 0.0, 0.0]));
+        current.accepted_terminal_field_generation = Some(CurrentLiveFieldGeneration {
+            run_id: "run-before-inspection".into(),
+            sequence: 4,
+        });
+        current
+            .terminal_field_generations
+            .insert("run-before-inspection".into(), 4);
+        let request: CurrentLiveSnapshotRequest = serde_json::from_value(json!({
+            "session_id": "test-session",
+            "metadata": {
+                "execution_plan": { "backend_plan": { "kind": "antenna_external_lead_inspection" } }
+            }
+        }))
+        .expect("thin inspection snapshot");
+        apply_current_live_snapshot(&mut current, request)
+            .expect("inspection snapshot should apply");
+        assert!(current.fem_mesh.is_none());
+        assert!(current.live_state.is_none());
+        assert_eq!(current.latest_fields.len(), 0);
+        assert!(current.preview_cache.is_empty());
+        assert!(current.preview.is_none());
+        assert!(current.quantities.is_empty());
+        assert!(current.field_publication_bundles.is_empty());
+        assert!(current.mesh_revision > 0);
+        assert!(current.field_catalog_revision > 0);
+        assert!(current.field_quantity_revisions["m"] > 0);
+        assert_eq!(
+            current.terminal_field_generations["run-before-inspection"],
+            4
+        );
+        assert_eq!(
+            current
+                .accepted_terminal_field_generation
+                .as_ref()
+                .unwrap()
+                .sequence,
+            4
+        );
+
+        let revisions = (
+            current.mesh_revision,
+            current.field_catalog_revision,
+            current.field_samples_revision,
+        );
+        finalize_current_live_apply(&mut current, CurrentLiveApplyFlags::default())
+            .expect("unchanged inspection should remain stable");
+        assert_eq!(
+            revisions,
+            (
+                current.mesh_revision,
+                current.field_catalog_revision,
+                current.field_samples_revision
+            )
+        );
+
+        let stale: CurrentLiveFieldFrameRequest = serde_json::from_value(json!({
+            "session_id": "test-session", "replace_latest_fields": true,
+            "clear_preview_cache": true,
+            "field_generation": { "run_id": "run-before-inspection", "sequence": 3 },
+            "latest_fields": {}
+        }))
+        .expect("stale terminal frame");
+        let error = apply_current_live_field_frame(&mut current, stale)
+            .expect_err("inspection transition must not reopen old terminal generations");
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn standalone_read_model_does_not_retain_late_magnetic_runtime_frame() {
+        let mut current = test_current_snapshot();
+        current.metadata = Some(json!({
+            "execution_plan": { "backend_plan": { "kind": "antenna_external_lead_inspection" } }
+        }));
+        let mut late = live_state_with_magnetization(5, vec![1.0, 0.0, 0.0]);
+        late.latest_step.preview_field = Some(preview_field("H_eff"));
+        apply_current_live_runtime_frame(
+            &mut current,
+            CurrentLiveRuntimeFrameRequest {
+                session_id: "test-session".into(),
+                live_state: Some(late),
+                frozen_spins_runtime_status: None,
+                engine_log: None,
+                solver_profile: None,
+                fem_mesh: Some(domain_fem_mesh("late-magnetic-mesh")),
+            },
+        )
+        .expect("runtime frame should leave a nonmagnetic inspection read model");
+        assert!(current.fem_mesh.is_none());
+        assert!(current.live_state.is_none());
+        assert_eq!(current.latest_fields.len(), 0);
+        assert!(current.preview_cache.is_empty());
+        assert!(current.quantities.is_empty());
     }
 
     #[test]

@@ -404,6 +404,18 @@ impl StageTransitionMetadata {
     }
 }
 
+/// Authored identity of one actual execution, separate from its physical IR.
+/// A macro may own several executions; its node ID alone is not unique.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptStageProvenance {
+    pub authored_step_id: String,
+    pub expansion_index: usize,
+    pub ancestor_group_ids: Vec<String>,
+    pub label: String,
+    pub notes: Option<String>,
+    pub source: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedScriptStage {
     pub ir: ProblemIR,
@@ -411,6 +423,7 @@ pub struct ResolvedScriptStage {
     pub entrypoint_kind: String,
     pub action: Option<ResolvedScriptStageAction>,
     pub incoming_transition: Option<StageTransitionMetadata>,
+    pub provenance: Option<ScriptStageProvenance>,
 }
 
 impl ResolvedScriptStage {
@@ -421,6 +434,7 @@ impl ResolvedScriptStage {
             entrypoint_kind: entrypoint_kind.into(),
             action: None,
             incoming_transition: None,
+            provenance: None,
         }
     }
 
@@ -435,6 +449,7 @@ impl ResolvedScriptStage {
             entrypoint_kind: entrypoint_kind.into(),
             action: Some(action),
             incoming_transition: None,
+            provenance: None,
         }
     }
 }

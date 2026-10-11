@@ -318,6 +318,14 @@ fn main() -> Result<()> {
                 serde_json::to_string_pretty(&direct_run_summary(&result, &output_dir))?
             );
         }
+        Command::PrepareRunJson {
+            path,
+            project_id,
+            api_url,
+        } => {
+            let result = accepted_run_transport::prepare_run_json(&path, &project_id, &api_url)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
         Command::RunJson {
             path,
             api_url,
@@ -1852,6 +1860,26 @@ mod tests {
                 submit_only: true,
             } if path == std::path::Path::new("accepted-run.json")
                 && api_url == "http://127.0.0.1:8000"
+        ));
+    }
+
+    #[test]
+    fn cli_prepares_run_identity_without_an_implicit_submit() {
+        let cli = Cli::try_parse_from([
+            "fullmag",
+            "prepare-run-json",
+            "authored-run.json",
+            "--project-id",
+            "project-submit",
+            "--api-url",
+            "http://127.0.0.1:8000",
+        ])
+        .expect("cli parse");
+        assert!(matches!(
+            cli.command,
+            Command::PrepareRunJson { path, project_id, api_url }
+                if path == std::path::Path::new("authored-run.json")
+                    && project_id == "project-submit" && api_url == "http://127.0.0.1:8000"
         ));
     }
 

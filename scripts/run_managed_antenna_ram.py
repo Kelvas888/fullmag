@@ -6,6 +6,7 @@ storage, or promotes an inspection result to an LLG/FFT drive basis.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import shutil
@@ -13,6 +14,7 @@ import uuid
 from pathlib import Path
 
 import fullmag_storage as storage
+from antenna_standalone_fixture import SCRIPT_NAME, standalone_source
 from local_runner.worker_entrypoint import verify_source
 from run_managed_browser import (
     SYSTEM_MOUNT_TARGETS, compose_spec, digest, docker, host_path, read_json,
@@ -38,7 +40,21 @@ def fixture_paths(repo):
     return paths
 
 
-def scientific_spec(image, source, package, inputs, export):
+def fixture_identity(repo, standalone=False):
+    paths = fixture_paths(repo)
+    hashes = dict(FIXTURE_FILES)
+    generated = None
+    if standalone:
+        generated = standalone_source(paths["fem_antenna_current_source_inspection.py"].read_text(encoding="utf-8"))
+        hashes[SCRIPT_NAME] = hashlib.sha256(generated).hexdigest()
+    return paths, hashes, generated
+
+
+def scientific_spec(image, source, package, inputs, export, *, standalone_hash=None):
+    script = SCRIPT_NAME if standalone_hash else "fem_antenna_current_source_inspection.py"
+    script_hash = standalone_hash or FIXTURE_FILES[script]
+    if not re.fullmatch(r"[0-9a-f]{64}", script_hash):
+        raise ValueError("Full fixture digest required")
     spec = compose_spec(image, source, package, export, 3104)
     service = spec["services"].pop("browser")
     spec["services"]["antenna"] = service
@@ -67,8 +83,8 @@ def scientific_spec(image, source, package, inputs, export):
              '[ "$name" != ".fullmag" ] || exit 2; '
              'ln -s "$path" "/ram/workspace/$name"; done; '
              'cd /ram/workspace; set +e; '
-             '/package/bin/fullmag-bin /input/fem_antenna_current_source_inspection.py '
-             '--headless --expect-script-sha256 ' + FIXTURE_FILES["fem_antenna_current_source_inspection.py"] +
+             '/package/bin/fullmag-bin /input/' + script + ' '
+             '--headless --expect-script-sha256 ' + script_hash +
              ' --output-dir /ram/result.zarr > /export/solver.log 2>&1; '
              'solver_code=$?; set -e; '
              'if [ -d /ram/result.zarr ]; then '
@@ -138,10 +154,10 @@ def resolved_build(repo, job_id, commit, source_digest, native_snapshot_sha256):
     return layout, build, context, built, capsule, package
 
 
-def start(repo, job_id, commit, source_digest, native_snapshot_sha256):
+def start(repo, job_id, commit, source_digest, native_snapshot_sha256, *, standalone=False):
     layout, build, context, built, capsule, package = resolved_build(
         repo, job_id, commit, source_digest, native_snapshot_sha256)
-    paths = fixture_paths(repo)
+    paths, hashes, generated = fixture_identity(repo, standalone)
     image = json.loads(docker("image", "inspect", context["image_digest"]))[0]
     if image.get("Id") != context["image_digest"] or image.get("Config", {}).get("Volumes"):
         raise ValueError("Image identity or anonymous volumes invalid")
@@ -158,7 +174,12 @@ def start(repo, job_id, commit, source_digest, native_snapshot_sha256):
         shutil.copyfile(path, target)
         if digest(target) != FIXTURE_FILES[name]:
             raise ValueError("Scientific input changed during staging")
-    spec = scientific_spec(context["image_digest"], capsule / "tree", package, inputs, export)
+    if generated is not None:
+        (inputs / SCRIPT_NAME).write_bytes(generated)
+        if digest(inputs / SCRIPT_NAME) != hashes[SCRIPT_NAME]:
+            raise ValueError("Standalone input changed during staging")
+    spec = scientific_spec(context["image_digest"], capsule / "tree", package, inputs, export,
+                           standalone_hash=hashes.get(SCRIPT_NAME))
     spec_path = root / "compose.json"
     storage.atomic_json(spec_path, spec)
     project = "fullmag-antenna-ram-" + root.name
@@ -169,7 +190,8 @@ def start(repo, job_id, commit, source_digest, native_snapshot_sha256):
         "managed_job_id": job_id, "compose_project": project,
         "native_source_identity": built["native_source_identity"],
         "source_digest": source_digest, "image_digest": context["image_digest"],
-        "fixture_sha256": FIXTURE_FILES, "launcher_sha256": digest(__file__),
+        "fixture_sha256": hashes, "fixture_variant": "standalone" if standalone else "magnetic_probe",
+        "launcher_sha256": digest(__file__),
         "compose_sha256": digest(spec_path),
         "build_receipt_sha256": digest(build / "artifacts/build-receipt.json")}
     receipt_path = root / "receipt.json"
@@ -201,17 +223,24 @@ def observe(repo, root):
             or receipt.get("compose_sha256") != digest(root / "compose.json"):
         raise ValueError("Scientific run identity changed")
     native = receipt["native_source_identity"]
+    variant = receipt.get("fixture_variant", "magnetic_probe")
+    if variant not in ("standalone", "magnetic_probe"):
+        raise ValueError("Unknown scientific fixture variant")
+    if variant == "standalone":
+        _, hashes, _ = fixture_identity(repo, standalone=True)
+    else:
+        hashes = FIXTURE_FILES
     _, build, context, _, capsule, package = resolved_build(repo, receipt["managed_job_id"],
         native["head_commit_full"], receipt["source_digest"], native["source_snapshot_sha256"])
-    for name, expected in FIXTURE_FILES.items():
+    for name, expected in hashes.items():
         path = storage.validate_path(root / "input" / name, root / "input")
         if storage.is_link(path) or digest(path) != expected:
             raise ValueError("Staged scientific input changed")
     if receipt.get("build_receipt_sha256") != digest(build / "artifacts/build-receipt.json") \
             or receipt.get("image_digest") != context["image_digest"] \
-            or receipt.get("fixture_sha256") != FIXTURE_FILES \
+            or receipt.get("fixture_sha256") != hashes \
             or spec != scientific_spec(context["image_digest"], capsule / "tree",
-                package, root / "input", root / "export") \
+                package, root / "input", root / "export", standalone_hash=hashes.get(SCRIPT_NAME)) \
             or receipt.get("compose_project") != "fullmag-antenna-ram-" + root.name:
         raise ValueError("Scientific input/build/spec binding differs")
     observed = attest(receipt["container_id"], spec, receipt["compose_project"])
@@ -249,9 +278,11 @@ if __name__ == "__main__":
     start_parser = sub.add_parser("start")
     for flag in ("job-id", "commit", "source-digest", "native-snapshot-sha256"):
         start_parser.add_argument("--" + flag, required=True)
+    start_parser.add_argument("--standalone", action="store_true")
     sub.add_parser("observe").add_argument("--run-root", type=Path, required=True)
     args = parser.parse_args()
     if args.action == "start":
-        start(args.repo_root, args.job_id, args.commit, args.source_digest, args.native_snapshot_sha256)
+        start(args.repo_root, args.job_id, args.commit, args.source_digest, args.native_snapshot_sha256,
+              standalone=args.standalone)
     else:
         print(json.dumps(observe(args.repo_root, args.run_root)))

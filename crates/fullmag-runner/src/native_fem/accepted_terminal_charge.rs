@@ -13,26 +13,18 @@ use std::ffi::CString;
 pub(super) mod record;
 pub(crate) use record::AcceptedTerminalChargeRecord;
 
-pub(crate) const MAX_PAYLOAD_BYTES: usize = 128 << 20;
+pub(crate) use fullmag_antenna_artifacts::charge::{
+    AcceptedChargeInterface, DIGEST_SCHEMA, MAX_PAYLOAD_BYTES, OPERATOR_VERSION,
+};
 #[cfg(any(feature = "fem-native", feature = "fem-gpu"))]
 const _: () =
     assert!(MAX_PAYLOAD_BYTES == ffi::FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_MAX_PAYLOAD_BYTES);
-pub(crate) const DIGEST_SCHEMA: &str = "accepted_terminal_charge_source.ordered.v1";
-pub(crate) const OPERATOR_VERSION: &str = "fem_accepted_terminal_charge_source.v1";
 
 #[derive(Debug, Clone)]
 pub(crate) struct AcceptedChargeTerminal {
     pub id: String,
     pub boundary_face_vertex_ids: Vec<[u64; 3]>,
     pub requested_outward_current_a: f64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct AcceptedChargeInterface {
-    pub id: String,
-    pub first_face_vertex_ids: [u64; 3],
-    pub second_face_vertex_ids: [u64; 3],
-    pub vertex_pairs: [[u64; 2]; 3],
 }
 
 #[cfg(any(feature = "fem-native", feature = "fem-gpu"))]

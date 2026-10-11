@@ -1187,6 +1187,10 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
             post(handlers::persistence::script_project::from_script),
         )
         .route(
+            "/v2/persistence/projects/:project_id/run-intent",
+            post(handlers::persistence::projects::run_intent_preparation::prepare),
+        )
+        .route(
             "/v2/persistence/projects/:project_id/runs",
             get(handlers::persistence::projects::list_runs)
                 .post(handlers::persistence::projects::submit_run),
@@ -1194,6 +1198,18 @@ pub fn build_v2_router() -> Router<Arc<AppState>> {
         .route(
             "/v2/persistence/projects/:project_id/runs/:run_id",
             get(handlers::persistence::projects::get_run),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/antenna-inspections/:step_id/payloads/:payload_kind",
+            get(handlers::data::accepted_antenna_payload::get_accepted_antenna_payload),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/antenna-inspections/:step_id",
+            get(handlers::data::accepted_antenna_resource::get_accepted_antenna_inspection),
+        )
+        .route(
+            "/v2/persistence/projects/:project_id/runs/:run_id/antenna-inspections",
+            get(handlers::data::accepted_antenna_resource::get_accepted_antenna_catalog),
         )
         .route(
             "/v2/persistence/projects/:project_id/runs/:run_id/solution-sets/:solution_set_id/revisions/:revision",

@@ -265,6 +265,7 @@ import {
   FrequencyResponseSolverStageInspectorPanel,
   FrequencyResponseStageOverviewInspectorPanel,
   FrequencyResponseSweepStageInspectorPanel,
+  StudyStageInspectorRouter,
 } from "./panels/StudyStageInspectorRouter";
 import { resolveFrequencyDomainNodeDetail } from "./panels/frequencyDomainNodeDetails";
 import type {
@@ -1441,6 +1442,12 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
     title: "Study Stage Add Field Drive",
     selectionKinds: ["study.stage.add_field_drive"],
     component: StudyStageAddFieldDriveInspectorPanel,
+  },
+  {
+    id: "study-stage-antenna-field-solve",
+    title: "Antenna Field Solve",
+    selectionKinds: ["study.stage.antenna_field_solve"],
+    component: StudyStageInspectorRouter,
   },
   {
     id: "study-stage-autosave",

@@ -30,37 +30,15 @@ mod input;
 #[cfg(any(feature = "fem-native", feature = "fem-gpu"))]
 pub(crate) use input::with_materialized_external_lead_request;
 
-pub(crate) const MAX_PAYLOAD_BYTES: usize = 128 << 20;
+pub(crate) use fullmag_antenna_artifacts::bundle::{
+    ExternalLeadBoundary, ExternalLeadBranch, ExternalLeadQuadraturePolicy, MAX_PAYLOAD_BYTES,
+};
 #[cfg(any(feature = "fem-native", feature = "fem-gpu"))]
 const _: () =
     assert!(MAX_PAYLOAD_BYTES == ffi::FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_MAX_PAYLOAD_BYTES);
 
 const SCHEMA: &str = "accepted_external_lead_bundle.ordered.v1";
 const OPERATOR: &str = "fem_accepted_external_lead_bundle.v1";
-const SCOPE: &str = "external_electrode_truncation";
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ExternalLeadBoundary {
-    pub vertex_ids: [u64; 3],
-    pub role: u32,
-    pub circuit_id: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct ExternalLeadBranch {
-    pub id: String,
-    pub interface_pair_ids: Vec<String>,
-    pub requested_device_outward_current_a: f64,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ExternalLeadQuadraturePolicy {
-    pub base_quadrature_order: i32,
-    pub maximum_subdivision_depth: i32,
-    pub absolute_tolerance_apm: f64,
-    pub relative_tolerance: f64,
-    pub maximum_source_target_pairs: u64,
-}
 
 #[cfg(any(feature = "fem-native", feature = "fem-gpu"))]
 pub(crate) struct AcceptedExternalLeadRequest<'a> {

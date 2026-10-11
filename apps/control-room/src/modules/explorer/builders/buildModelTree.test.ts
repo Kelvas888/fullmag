@@ -1732,7 +1732,7 @@ describe("buildModelTree", () => {
     );
   });
 
-  it("builds an explicit Add Antenna pipeline instruction node", () => {
+  it("builds an explicit Add Field Drive pipeline instruction node", () => {
     const snapshot = modelTreeSnapshotFromScene({
       objects: [],
       study: {
@@ -1756,7 +1756,7 @@ describe("buildModelTree", () => {
     expect(node).toMatchObject({
       badge: "field drive",
       kind: "study.stage.add_field_drive",
-      label: "Add Antenna 1",
+      label: "Add Field Drive 1",
       stageId: "add-k0-antenna",
       stageIndex: 0,
     });

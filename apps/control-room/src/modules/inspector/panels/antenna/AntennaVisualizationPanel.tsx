@@ -5,9 +5,10 @@ import { useState } from "react";
 import type { SceneResource } from "@/kernel/api/apiTypes";
 import { useSceneResource } from "@/kernel/resources/geometryLifecycleResources";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
+import { useStageExecutionResource } from "@/kernel/resources/studyRuntimeResources";
 import { antennaInspectionDisplayMatchesOwner, useAntennaFieldSolutionResource, useAntennaStageOutputCatalogResource, useAntennaExternalLeadInspectionResource, useAntennaInspectionDisplayResource } from "@/kernel/resources/antennaResources";
 import { useObjectVisualizationController, useObjectVisualizationSelector } from "@/kernel/visualization/useObjectVisualization";
-import { antennaFieldDisplayLabel, type AntennaFieldIntent, type AntennaFieldQuantity } from "@/kernel/visualization/antennaFieldIntent";
+import { antennaFieldDisplayLabel, antennaInspectionIntentMatchesOwner, type AntennaFieldIntent, type AntennaFieldQuantity } from "@/kernel/visualization/antennaFieldIntent";
 import { antennaStageValidationMessages } from "@/shared/domain/physics/antennaStageValidation";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/shared/ui/Select";
 
@@ -22,6 +23,7 @@ import { AntennaFieldBasisPreview } from "./AntennaFieldBasisPreview";
 import { ANTENNA_BASIS_QUANTITIES, type AntennaBasisQuantity } from "./AntennaFieldBasisPreviewModel";
 import { antennaFieldSolutionIdentityStatus, resolveAntennaRuntimeIds } from "./AntennaCompositionRuntime";
 import { ANTENNA_RAW_QUANTITIES, antennaInspectionHasCurrent, antennaVisualizationQuantity } from "./AntennaVisualizationQuantity";
+import { inspectionMatchesRuntimeStage, inspectionSelectionMatchesContext, resolveInspectionRuntimeStage, type InspectionRuntimeSelection } from "./AntennaExternalLeadInspectionModel";
 
 type SceneRead = ReturnType<typeof useSceneResource>;
 
@@ -62,8 +64,15 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
   const ids = resolveAntennaRuntimeIds("solution", stageId, scene);
   const field = useAntennaFieldSolutionResource(ids.solutionId);
   const catalog = useAntennaStageOutputCatalogResource(ids.stageId);
-  const inspection = useAntennaExternalLeadInspectionResource(stageId);
   const owner = useSessionResourceIdentity();
+  const execution = useStageExecutionResource();
+  const [inspectionSelection, setInspectionSelection] = useState<InspectionRuntimeSelection | null>(null);
+  if (inspectionSelection && !inspectionSelectionMatchesContext(inspectionSelection, stageId ?? "", execution.data, owner)) {
+    setInspectionSelection(null);
+  }
+  const mapping = resolveInspectionRuntimeStage(stageId ?? "", execution.data, owner, inspectionSelection);
+  const executionCurrent = execution.status === "ready" && !execution.refreshError;
+  const inspection = useAntennaExternalLeadInspectionResource(mapping.state === "mapped" ? mapping.runtimeStageId : null, { pauseLoad: !executionCurrent });
   const visualization = useObjectVisualizationController();
   const requested = useObjectVisualizationSelector((snapshot) => snapshot.antennaFieldIntent ?? null);
   const displayStatus = useObjectVisualizationSelector((snapshot) => snapshot.antennaFieldDisplayStatus ?? null);
@@ -77,9 +86,11 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
   const ownerMatches = owner && field.data?.session_id === owner.sessionId && field.data?.session_epoch === owner.sessionEpoch && field.data?.request_scope_epoch === owner.requestScopeEpoch;
   const basisAvailable = sceneStatus === "ready" && validation.length === 0 && identity === "ready" && sourceMatches && ownerMatches;
   const raw = inspection.data;
-  const rawOwnerMatches = sceneStatus === "ready" && inspection.status === "ready" && raw?.status === "inspection_only" && raw.manifest?.source_object_id === objectId && raw.runtime_stage_id === stageId && raw.session_id === owner?.sessionId && raw.session_epoch === owner?.sessionEpoch && raw.request_scope_epoch === owner?.requestScopeEpoch && raw.outputs.length === 1 && raw.outputs[0].inspection_ref.content_digest === raw.manifest.content_digest;
+  const rawOwnerMatches = sceneStatus === "ready" && executionCurrent && inspection.status === "ready" && !inspection.refreshError && raw?.status === "inspection_only" &&
+    raw.qualification === "NOT VERIFIED" && raw.field_scope === "external_electrode_truncation" && raw.manifest?.source_object_id === objectId &&
+    inspectionMatchesRuntimeStage(raw, stageId ?? "", mapping, owner) && raw.outputs.length === 1 && raw.outputs[0].inspection_ref.content_digest === raw.manifest.content_digest;
   const rawDisplay = useAntennaInspectionDisplayResource(rawOwnerMatches ? raw : null);
-  const rawAvailable = Boolean(rawOwnerMatches && raw && rawDisplay.status === "ready" && rawDisplay.data && antennaInspectionDisplayMatchesOwner(raw, rawDisplay.data));
+  const rawAvailable = Boolean(rawOwnerMatches && raw && rawDisplay.status === "ready" && !rawDisplay.refreshError && rawDisplay.data && antennaInspectionDisplayMatchesOwner(raw, rawDisplay.data));
   const inspectionMode = displaySource === "inspection" || (!basisAvailable && rawAvailable);
   const available = inspectionMode ? rawAvailable : basisAvailable;
   const ports = inspectionMode ? raw ? [raw.port_mode_id] : [] : field.data?.bases.map((basis) => basis.port_mode_id) ?? [];
@@ -88,7 +99,7 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
     && requested.requestScopeEpoch === owner?.requestScopeEpoch && requested.kind === (inspectionMode ? "inspection" : "basis")
     && requested.contentDigest === (inspectionMode ? raw?.manifest?.content_digest : field.data?.content_digest)
     && requested.solutionId === (inspectionMode ? raw?.output_id : field.data?.solution_id)
-    && (!inspectionMode || (requested.recordContentDigest === raw?.record_content_digest && requested.stageRevision === raw?.stage_revision)) ? requested : null;
+    && (!inspectionMode || (rawOwnerMatches && raw && antennaInspectionIntentMatchesOwner(requested, raw))) ? requested : null;
   const port = ports.includes(preferredPort) ? preferredPort : matchingIntent && ports.includes(matchingIntent.portModeId) ? matchingIntent.portModeId : ports.length === 1 ? ports[0] : "";
   const currentAvailable = rawAvailable && antennaInspectionHasCurrent(rawDisplay.data);
   const effectiveQuantity = antennaVisualizationQuantity(matchingIntent?.quantity ?? quantity, inspectionMode, currentAvailable);
@@ -103,6 +114,7 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
     visualization.setAntennaFieldIntent({
       kind: inspectionMode ? "inspection" : "basis", sessionId: owner.sessionId, sessionEpoch: owner.sessionEpoch, requestScopeEpoch: owner.requestScopeEpoch,
       sourceObjectId: objectId, stageId, solutionId: inspectionMode ? raw?.output_id ?? "" : field.data?.solution_id ?? "",
+      runtimeStageId: inspectionMode ? raw?.runtime_stage_id : undefined, runId: inspectionMode ? raw?.run_id : undefined,
       contentDigest: inspectionMode ? raw?.manifest?.content_digest ?? "" : field.data?.content_digest ?? "",
       recordContentDigest: inspectionMode ? raw?.record_content_digest : undefined, stageRevision: inspectionMode ? raw?.stage_revision : undefined,
       portModeId: selectedPort, quantity: effectiveQuantity, points: active?.points ?? false,
@@ -130,6 +142,16 @@ function AntennaPublishedVisualization({ objectId, stageId, scene, sceneStatus }
       quantitySource={antennaFieldDisplayLabel({ quantity: effectiveQuantity })}
       enabledPassCount={Number(active?.points ?? false) + Number(active?.vectors ?? false) + Number(active?.surface ?? false) + Number(active?.wireframe ?? false)}
       display={<>
+        <Select value={mapping.state === "mapped" ? mapping.runtimeStageId : ""} disabled={!executionCurrent || mapping.candidates.length === 0} onValueChange={(runtimeStageId) => {
+          if (owner && stageId && execution.data && mapping.candidates.some((candidate) => candidate.runtimeStageId === runtimeStageId)) {
+            setInspectionSelection({ authoredStageId: stageId, runtimeStageId, runId: execution.data.run_id, identity: owner });
+            visualization.setAntennaFieldIntent(null);
+          }
+        }}>
+          <SelectTrigger aria-label="Antenna visualization execution"><SelectValue placeholder="Select an inspection execution" /></SelectTrigger>
+          <SelectContent>{mapping.candidates.map((candidate) => <SelectItem key={candidate.runtimeStageId} value={candidate.runtimeStageId}>{candidate.runtimeStageId} · {candidate.status}</SelectItem>)}</SelectContent>
+        </Select>
+        {mapping.state !== "mapped" ? <p role="status">{mapping.message}</p> : null}
         <VisualizationDisplayPassesControl items={[
           { id: "surface", label: "Surface", pressed: active?.surface ?? false, disabled: !surfaceAvailable || !port, onToggle: () => setDisplay({ surface: !active?.surface }) },
           { id: "wireframe", label: "Wireframe", pressed: active?.wireframe ?? false, disabled: !surfaceAvailable || !port, onToggle: () => setDisplay({ wireframe: !active?.wireframe }) },

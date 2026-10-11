@@ -146,6 +146,7 @@ from fullmag.model.study import (
     StageAutosave,
     TableAutosave,
     TimeEvolution,
+    AntennaFieldSolve,
     DEFAULT_RELAXATION_MAX_STEPS,
     DEFAULT_RELAXATION_TORQUE_TOLERANCE_APM,
 )
@@ -3410,7 +3411,7 @@ def _capture_stage(stage_spec: object) -> CapturedStage:
             default_until_seconds=None,
         )
     if isinstance(stage_spec, RunStageSpec):
-        problem = _build_problem()
+        problem = _build_problem(study_kind="time_evolution")
         if not isinstance(problem.study, TimeEvolution):
             raise TypeError("run stage requires a time-evolution study")
         return CapturedStage(
@@ -3877,7 +3878,11 @@ def capture_executed_stages() -> list[CapturedStage]:
 
 def capture_workspace_problem() -> Problem | None:
     """Materialize the current flat-script world without requiring run()/relax()."""
-    if not _capture_binding.current().enabled or not _state._magnets:
+    has_antenna_stage = bool(
+        _state._declared_stages
+        and _state._declared_stages[-1].entrypoint_kind == "flat_antenna_field_solve"
+    )
+    if not _capture_binding.current().enabled or (not _state._magnets and not has_antenna_stage):
         return None
     previous_interactive = _state._interactive
     _state._interactive = True
@@ -4332,7 +4337,7 @@ class StudyStagesBuilder:
             raise ValueError(
                 "antenna field solve requires exactly one H_ant_basis output"
             )
-        problem_before_action = _build_problem()
+        problem_before_action = _build_problem(study_kind="antenna_field_solve")
         _state._antenna_field_solve_stages.append(normalized_definition)
         _state._declared_stages.append(
             CapturedStage(
@@ -9295,7 +9300,7 @@ def _build_relax_llg_dynamics(
 
 def _build_problem(
     *,
-    study_kind: str = "time_evolution",
+    study_kind: str | None = None,
     relax_algorithm: str = "llg_overdamped",
     relax_torque_tolerance: float = DEFAULT_RELAXATION_TORQUE_TOLERANCE_APM,
     relax_torque_tolerance_unit: str = "T",
@@ -9341,10 +9346,17 @@ def _build_problem(
     """Construct a Problem from the current world state."""
     s = _state
 
+    if study_kind is None:
+        study_kind = (
+            "antenna_field_solve"
+            if s._declared_stages and s._declared_stages[-1].entrypoint_kind == "flat_antenna_field_solve"
+            else "time_evolution"
+        )
+
     _validate_current_compute_resources_runtime_intent()
 
     # ── Validate ──
-    if not s._magnets:
+    if not s._magnets and study_kind != "antenna_field_solve":
         raise ValueError("No magnets defined — call fm.geometry(...) first")
 
     # Convert handles to Ferromagnet objects
@@ -9353,9 +9365,9 @@ def _build_problem(
     # Energy terms default to Exchange + Demag, but UI/Python authoring may
     # explicitly remove either contribution from H_eff.
     energy: list = []
-    if s._exchange_enabled:
+    if s._magnets and s._exchange_enabled:
         energy.append(Exchange())
-    if s._demag_enabled:
+    if s._magnets and s._demag_enabled:
         energy.append(Demag(realization=s._demag_realization))
     # Check if any magnet has DMI
     for h in s._magnets:
@@ -9399,7 +9411,7 @@ def _build_problem(
         llg_kwargs["field_refresh"] = FieldRefreshPolicy(
             demag_interval_s=s._demag_interval_s
         )
-    dynamics = LLG(**llg_kwargs)
+    dynamics = None if study_kind == "antenna_field_solve" else LLG(**llg_kwargs)
 
     # Discretization
     disc_kwargs: dict[str, Any] = {}
@@ -9568,6 +9580,8 @@ def _build_problem(
             k_vector=frequency_k_vector,
             dynamics=dynamics,
         )
+    elif study_kind == "antenna_field_solve":
+        study = AntennaFieldSolve()
     elif study_kind == "hysteresis":
         study = hysteresis_spec
     else:
@@ -9630,7 +9644,7 @@ def run(until: float) -> Any:
     if until <= 0.0:
         raise ValueError("run(until) requires a positive stop time")
     from fullmag.runtime import Simulation
-    problem = _build_problem()
+    problem = _build_problem(study_kind="time_evolution")
     if _capture_binding.current().enabled:
         _capture_binding.current().stages.append(
             CapturedStage(

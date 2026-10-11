@@ -1429,6 +1429,173 @@ mod tests {
         assert!(problem.validate().is_ok(), "{:?}", problem.validate());
         (problem, f)
     }
+    fn source_preparation_native_evidence(mesh: &MeshIR) -> crate::NativeFemMeshSpaceEvidence {
+        use crate::preparation::{
+            NativeFemMeshSpaceEvidence, NATIVE_FEM_MESH_SPACE_ABI_VERSION,
+            NATIVE_FEM_MESH_SPACE_PRODUCER_ID, NATIVE_FEM_MESH_SPACE_PRODUCER_VERSION,
+            NATIVE_FEM_MESH_SPACE_SCHEMA_VERSION,
+        };
+        // Synthetic producer evidence tests the receipt contract, not native execution.
+        let fingerprint = |hex: char| format!("sha256:{}", hex.to_string().repeat(64));
+        NativeFemMeshSpaceEvidence {
+            abi_version: NATIVE_FEM_MESH_SPACE_ABI_VERSION,
+            producer_id: NATIVE_FEM_MESH_SPACE_PRODUCER_ID.into(),
+            schema_version: NATIVE_FEM_MESH_SPACE_SCHEMA_VERSION.into(),
+            producer_version: NATIVE_FEM_MESH_SPACE_PRODUCER_VERSION.into(),
+            mesh_matches_canonical_input: true,
+            canonical_mesh_fingerprint: mesh.topology_fingerprint_v6(),
+            topology_fingerprint: fingerprint('8'),
+            marker_map_fingerprint: fingerprint('9'),
+            quality_fingerprint: fingerprint('a'),
+            space_fingerprint: fingerprint('b'),
+            mesh_dimension: 3,
+            fe_family: "H1".into(),
+            fe_order: 1,
+            node_count: mesh.nodes.len() as u64,
+            cell_count: mesh.cell_count() as u64,
+            boundary_element_count: mesh.facet_count() as u64,
+            local_dof_count: mesh.nodes.len() as u64,
+            true_dof_count: mesh.nodes.len() as u64,
+            quality_sample_count: mesh.cell_count() as u64,
+            invalid_cell_count: 0,
+            min_jacobian_determinant: 0.125,
+            max_jacobian_determinant: 0.125,
+        }
+    }
+
+    fn source_preparation(
+        plan: &fullmag_ir::ExecutionPlanIR,
+        native: &crate::NativeFemMeshSpaceEvidence,
+        requested_backend: fullmag_ir::BackendTarget,
+    ) -> Result<crate::PreparationMaterialization, crate::preparation::PreparationPlanError> {
+        crate::PreparationMaterialization::from_antenna_external_lead_inspection_execution_plan(
+            format!("sha256:{}", "a".repeat(64)),
+            7,
+            requested_backend,
+            plan,
+            format!("sha256:{}", "c".repeat(64)),
+            format!("sha256:{}", "d".repeat(64)),
+            native,
+        )
+    }
+
+    #[test]
+    fn source_preparation_binds_combined_mesh_and_h1_space_without_claiming_a_solve() {
+        let (problem, _) = public_inspection_fixture();
+        let plan = crate::plan_antenna_external_lead_inspection(&problem, "stage", "port").unwrap();
+        let fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(inspection) = &plan.backend_plan else {
+            panic!("fixture must resolve an external-lead inspection plan");
+        };
+        let mesh = &inspection.input.combined_mesh;
+        assert!(mesh.cell_count() > inspection.input.original_device_mesh.cell_count());
+        let native = source_preparation_native_evidence(mesh);
+        let prepared = source_preparation(&plan, &native, plan.common.requested_backend).unwrap();
+        assert_eq!(prepared.certificates.len(), 5);
+        assert_eq!(prepared.plan.scene_revision, Some(7));
+        assert!(prepared.plan.source.is_none());
+        assert!(prepared.certificates.iter().all(|certificate| certificate.validate_for(&prepared.plan).is_ok()));
+        let mesh_certificate = prepared.certificates.iter().find(|certificate| {
+            certificate.producer.kind == crate::PreparationProducerKind::Mesh
+        }).unwrap();
+        assert_eq!(mesh_certificate.cell_count, Some(mesh.cell_count() as u64));
+        let source = mesh_certificate.quality.as_ref().unwrap().mesh_source.as_ref().unwrap();
+        assert_eq!(source.canonical_input_mesh_fingerprint, native.canonical_mesh_fingerprint);
+        assert!(source.mesh_build_report_fingerprint.is_none());
+        assert!(source.per_domain_quality_cell_counts.is_empty());
+        let space_certificate = prepared.certificates.iter().find(|certificate| {
+            certificate.producer.kind == crate::PreparationProducerKind::Space
+        }).unwrap();
+        let space = space_certificate.space.as_ref().unwrap();
+        assert_eq!(space.fe_family.as_deref(), Some("H1"));
+        assert_eq!(space.fe_order, Some(1));
+        assert_eq!(space.local_dof_count, Some(mesh.nodes.len() as u64));
+        assert_eq!(space.true_dof_count, Some(mesh.nodes.len() as u64));
+        let original_native = source_preparation_native_evidence(&inspection.input.original_device_mesh);
+        assert!(source_preparation(&plan, &original_native, plan.common.requested_backend)
+            .unwrap_err().to_string().contains("different canonical mesh"));
+    }
+
+    #[test]
+    fn source_preparation_preserves_typed_variant_and_backend_guards() {
+        let (problem, _) = public_inspection_fixture();
+        let plan = crate::plan_antenna_external_lead_inspection(&problem, "stage", "port").unwrap();
+        let fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(inspection) = &plan.backend_plan else {
+            panic!("fixture must resolve an external-lead inspection plan");
+        };
+        let native = source_preparation_native_evidence(&inspection.input.combined_mesh);
+        let mismatch = source_preparation(&plan, &native, fullmag_ir::BackendTarget::Auto).unwrap_err();
+        assert!(mismatch.to_string().contains("requested backend does not match"));
+        let mut wrong_backend = plan.clone();
+        wrong_backend.common.resolved_backend = fullmag_ir::BackendTarget::Fdm;
+        assert!(source_preparation(&wrong_backend, &native, plan.common.requested_backend)
+            .unwrap_err().to_string().contains("requires resolved backend 'fem'"));
+        let mut magnetic_plan = plan.clone();
+        magnetic_plan.backend_plan = fullmag_ir::BackendPlanIR::Fem(fullmag_ir::FemPlanIR::default());
+        assert!(source_preparation(&magnetic_plan, &native, plan.common.requested_backend)
+            .unwrap_err().to_string().contains("requires an external-lead inspection execution plan"));
+        let error = crate::PreparationMaterialization::from_fem_execution_plan(
+            format!("sha256:{}", "a".repeat(64)), 7, plan.common.requested_backend, &plan,
+            format!("sha256:{}", "c".repeat(64)), format!("sha256:{}", "d".repeat(64)), &native,
+        ).unwrap_err();
+        assert!(error.to_string().contains("requires a time-domain FEM execution plan"));
+    }
+
+    #[test]
+    fn source_preparation_rejects_invalid_native_mesh_space_evidence() {
+        let (problem, _) = public_inspection_fixture();
+        let plan = crate::plan_antenna_external_lead_inspection(&problem, "stage", "port").unwrap();
+        let fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(inspection) = &plan.backend_plan else {
+            panic!("fixture must resolve an external-lead inspection plan");
+        };
+        let native = source_preparation_native_evidence(&inspection.input.combined_mesh);
+        for (case, expected) in [
+            ("producer", "unknown ABI or producer identity"),
+            ("order", "resolved 3D H1 order-1 space"),
+            ("dof", "local/true DOFs"),
+            ("jacobian", "quality evidence is incomplete"),
+            ("marker_correspondence", "canonical mesh/marker correspondence"),
+        ] {
+            let mut invalid = native.clone();
+            match case {
+                "producer" => invalid.producer_id = "not-the-native-producer".into(),
+                "order" => invalid.fe_order = 2,
+                "dof" => invalid.true_dof_count -= 1,
+                "jacobian" => invalid.min_jacobian_determinant = 0.0,
+                "marker_correspondence" => invalid.mesh_matches_canonical_input = false,
+                _ => unreachable!(),
+            }
+            let error = source_preparation(&plan, &invalid, plan.common.requested_backend).unwrap_err();
+            assert!(error.to_string().contains(expected), "{case}: {error}");
+        }
+    }
+
+    #[test]
+    fn accepted_source_preparation_retains_run_step_identity_without_live_revision() {
+        use crate::preparation::{PreparationPlanSource, PREPARATION_PLAN_ACCEPTED_RUN_SCHEMA};
+        let (problem, _) = public_inspection_fixture();
+        let plan = crate::plan_antenna_external_lead_inspection(&problem, "stage", "port").unwrap();
+        let fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(inspection) = &plan.backend_plan else {
+            panic!("fixture must resolve an external-lead inspection plan");
+        };
+        let native = source_preparation_native_evidence(&inspection.input.combined_mesh);
+        let source = PreparationPlanSource::accepted_run_step(
+            "antenna-run", format!("sha256:{}", "e".repeat(64)), "antenna-step",
+        ).unwrap();
+        let prepared = crate::PreparationMaterialization::from_antenna_external_lead_inspection_execution_plan_for_accepted_run(
+            format!("sha256:{}", "a".repeat(64)), source.clone(), plan.common.requested_backend,
+            &plan, format!("sha256:{}", "c".repeat(64)), format!("sha256:{}", "d".repeat(64)), &native,
+        ).unwrap();
+        assert_eq!(prepared.plan.schema_version, PREPARATION_PLAN_ACCEPTED_RUN_SCHEMA);
+        assert_eq!(prepared.plan.source, Some(source));
+        assert!(prepared.plan.scene_revision.is_none());
+        assert!(prepared.certificates.iter().all(|certificate| certificate.validate_for(&prepared.plan).is_ok()));
+        let json = serde_json::to_value(&prepared.plan).unwrap();
+        assert!(json.get("scene_revision").is_none());
+        assert_eq!(json["source"]["kind"], "accepted_run_step");
+        assert_eq!(json["source"]["run_id"], "antenna-run");
+        assert_eq!(json["source"]["step_id"], "antenna-step");
+    }
+
     fn reject_public_inspection(problem: &fullmag_ir::ProblemIR, fragment: &str) {
         assert!(problem.validate().is_ok(), "{:?}", problem.validate());
         let error = crate::plan_antenna_field_solve_execution(problem, "stage", "port")
@@ -1436,6 +1603,85 @@ mod tests {
             .to_string();
         assert!(error.contains(fragment), "{error}");
     }
+    #[test]
+    fn standalone_plan_contains_only_resolved_charge_current_and_sampling_input() {
+        let (mut problem, _) = public_inspection_fixture();
+        problem.magnets.clear();
+        problem.materials.clear();
+        problem.regions.clear();
+        problem.energy_terms.clear();
+        problem.study = fullmag_ir::StudyIR::AntennaFieldSolve {
+            selection: None,
+            sampling: fullmag_ir::SamplingIR {
+                outputs: vec![], table_autosave: None, stage_autosave: None,
+            },
+        };
+        let fullmag_ir::GeometryEntryIR::Union { name, .. } = &mut problem.geometry.entries[0] else {
+            panic!("fixture is a disconnected conductor union");
+        };
+        *name = "device-object".into();
+        problem.geometry_assets.as_mut().unwrap().fem_mesh_assets[0].geometry_name = "device-object".into();
+        let plan = crate::plan(&problem).expect("standalone charge-only study must plan without a magnet");
+        let fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(inspection) = &plan.backend_plan else {
+            panic!("standalone source must not enter the magnetic planner");
+        };
+        assert_eq!(inspection.input.stage.id, "stage");
+        assert_eq!(inspection.input.port.id, "port");
+        assert_eq!(inspection.output_id, "inspection-output");
+        assert!(plan.output_plan.outputs.is_empty());
+        assert!(plan.common.material_field_plans.is_empty());
+        assert!(plan.provenance.integrator_resolution.is_none());
+        let json = serde_json::to_value(&plan).unwrap();
+        assert_eq!(json["backend_plan"]["kind"], "antenna_external_lead_inspection");
+        assert!(json["backend_plan"].get("initial_magnetization").is_none());
+        assert!(json["backend_plan"].get("time_stage").is_none());
+        for authored_id in ["stage", "authored-pipeline-node"] {
+            let mut authored = problem.clone();
+            authored.problem_meta.runtime_metadata.insert(
+                "active_stage_id".into(), serde_json::json!(authored_id),
+            );
+            let authored_plan = crate::plan(&authored)
+                .expect("a unique solve definition must not depend on its authored owner ID");
+            assert_eq!(serde_json::to_value(authored_plan).unwrap(), json);
+            assert_eq!(authored.problem_meta.runtime_metadata["active_stage_id"], authored_id);
+        }
+        let mut multiple = problem.clone();
+        let mut other = multiple.antenna_field_solve_stages[0].clone();
+        other.id = "other-definition".into();
+        multiple.antenna_field_solve_stages.push(other);
+        multiple.problem_meta.runtime_metadata.insert(
+            "active_stage_id".into(), serde_json::json!("authored-pipeline-node"),
+        );
+        assert!(crate::plan(&multiple).unwrap_err().to_string().contains("does not exist"));
+        multiple.problem_meta.runtime_metadata.insert(
+            "active_stage_id".into(), serde_json::json!("stage"),
+        );
+        assert_eq!(serde_json::to_value(crate::plan(&multiple).unwrap()).unwrap(), json);
+        let mut selected = multiple.clone();
+        selected.problem_meta.runtime_metadata.insert("active_stage_id".into(), serde_json::json!("other-definition"));
+        let fullmag_ir::StudyIR::AntennaFieldSolve { selection, .. } = &mut selected.study else { unreachable!() };
+        *selection = Some(fullmag_ir::AntennaFieldSolveSelectionIR { stage_id: "stage".into(), port_mode_id: "port".into() });
+        assert_eq!(serde_json::to_value(crate::plan(&selected).unwrap()).unwrap(), json);
+        assert!(crate::antenna_field_solve::plan_antenna_external_lead_inspection(&selected, "other-definition", "port")
+            .unwrap_err().to_string().contains("differs from its canonical study selection"));
+        for (stage_id, port_mode_id) in [("missing", "port"), ("stage", "missing"), (" ", "port"), ("stage", " ")] {
+            let mut invalid = selected.clone();
+            let fullmag_ir::StudyIR::AntennaFieldSolve { selection, .. } = &mut invalid.study else { unreachable!() };
+            *selection = Some(fullmag_ir::AntennaFieldSolveSelectionIR { stage_id: stage_id.into(), port_mode_id: port_mode_id.into() });
+            assert!(crate::plan(&invalid).unwrap_err().to_string().contains("antenna_field_solve.selection"));
+        }
+        let mut ambiguous = problem.clone();
+        ambiguous.antenna_field_solve_stages.push(ambiguous.antenna_field_solve_stages[0].clone());
+        assert!(crate::plan(&ambiguous).unwrap_err().to_string().contains("one field-solve stage"));
+        ambiguous.problem_meta.runtime_metadata.insert(
+            "active_stage_id".into(), serde_json::json!("stage"),
+        );
+        assert!(crate::plan(&ambiguous).unwrap_err().to_string().contains("ambiguous"));
+        let mut gpu = problem;
+        gpu.problem_meta.runtime_metadata.insert("runtime_selection".into(), serde_json::json!({"device": "gpu"}));
+        assert!(crate::plan(&gpu).unwrap_err().to_string().contains("forced device cannot fall back"));
+    }
+
     #[test]
     fn inspection_execution_preserves_original_disconnected_device_and_requested_intent() {
         let (mut problem, f) = public_inspection_fixture();

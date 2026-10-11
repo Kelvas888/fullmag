@@ -1162,7 +1162,10 @@ def _render_scene_document_bootstrap(
                     f"{handle}.mesh(cell_size={_python_literal(tuple(raw_grid['cell']))})"
                 )
 
-    if not handles:
+    if not handles and not any(
+        stage.get("kind") == "antenna_field_solve"
+        for stage in _scene_antenna_stage_sequence(builder)
+    ):
         raise ValueError("SceneDocument export requires at least one magnetic object.")
 
     if builder.get("exchange_enabled") is False:
@@ -2235,6 +2238,15 @@ def _render_shape_expression(entry: Mapping[str, object]) -> str:
             params,
             name=str(entry.get("name") or params.get("name") or "antenna"),
         )
+    elif kind in {"importedgeometry", "imported_geometry"}:
+        path = params.get("source")
+        if not isinstance(path, str) or not path:
+            raise ValueError("ImportedGeometry requires an explicit path")
+        kwargs = [f"source={_python_literal(path)}"]
+        for key in ("scale", "volume", "name"):
+            if params.get(key) is not None:
+                kwargs.append(f"{key}={_python_literal(params[key])}")
+        expression = f"fm.ImportedGeometry({', '.join(kwargs)})"
     elif kind in {"difference", "union", "intersection"}:
         operands = ("base", "tool") if kind == "difference" else ("a", "b")
         operator = {"difference": "-", "union": "+", "intersection": "&"}[kind]
@@ -7199,7 +7211,7 @@ def _render_solver(
     solver_override = _normalize_mapping(overrides.get("solver"))
     if problem.study is None:
         return ["# Solver (not configured)"]
-    dynamics = problem.study.dynamics
+    dynamics = getattr(problem.study, "dynamics", None)
     if dynamics is None:
         return []
     return ["# Solver", _render_solver_call(dynamics, solver_override, surface=surface)]

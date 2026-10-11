@@ -26,6 +26,7 @@ TOOLS = (
     "smoke_antenna_inspection_display.py", "antenna_rt0_fixture_check.py",
     "antenna_current_display_fixture_check.py", "antenna_current_source_oracle.py",
     "antenna_inspection_cold_import_check.py",
+    "antenna_standalone_fixture.py",
 )
 ORIGIN = "http://127.0.0.1:8081"
 MAX_JSON = 4 << 20
@@ -170,12 +171,49 @@ def reject_stale_terminal_owners():
             "nonempty_bootstrap_qualified": False}
 
 
-def execute_in_container(verify_cold_import=False):
+def check_standalone_read_model():
+    before = get_json("/v2/sessions/current/status")
+    fields = get_json("/v2/sessions/current/data/fields")
+    catalog = get_json("/v2/sessions/current/data/quantities")
+    mesh = get_json("/v2/sessions/current/meshing/summary")
+    if fields.get("quantities") != []:
+        raise ValueError("Standalone session exposes spatial magnetic carriers")
+    entries = catalog.get("quantities")
+    if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+        raise ValueError("Standalone quantity catalog is malformed")
+    for quantity in ("m", "H_eff", "H_demag"):
+        matches = [entry for entry in entries if entry.get("id") == quantity]
+        if len(matches) != 1 or any(matches[0].get(key) != "unsupported" for key in
+                ("capability_state", "solver_capability", "materialization_state")) \
+                or any(matches[0].get(key) is not False for key in ("requestable", "materializable")):
+            states = [{key: entry.get(key) for key in (
+                "id", "capability_state", "solver_capability", "materialization_state",
+                "requestable", "materializable", "materialization_reason_code",
+            )} for entry in matches[:2]]
+            raise ValueError("Standalone magnetic quantity state is not rejected: "
+                             + json.dumps(states, sort_keys=True))
+    if any(mesh.get(key) is not None for key in ("mesh_summary", "mesh_quality_summary",
+            "effective_airbox_target", "effective_per_object_targets")):
+        raise ValueError("Standalone session retains a magnetic mesh read-model")
+    after = get_json("/v2/sessions/current/status")
+    if any(after[key] != before[key] for key in ("session", "run", "resources", "lifecycle")):
+        raise ValueError("Standalone read-model changed ownership or revisions during reads")
+    return {"status": "pass", "field_catalog": fields, "mesh_summary": mesh,
+            "unsupported_magnetic_quantities": ["m", "H_eff", "H_demag"],
+            "transition_from_magnetic_session_qualified": False}
+
+
+def execute_in_container(verify_cold_import=False, standalone=False):
     export, tools = Path("/export"), Path("/tools")
     expected = json.loads((tools / "manifest.json").read_text())
     check_tools(tools, expected["tools_sha256"])
     # The container uses -I; admit only the verified, read-only tool directory.
     sys.path.insert(0, str(tools))
+    from antenna_standalone_fixture import SCRIPT_NAME
+    variant = "standalone" if standalone else "magnetic_probe"
+    if expected.get("fixture_variant", "magnetic_probe") != variant:
+        raise ValueError("HTTP fixture variant differs from owned command")
+    script = SCRIPT_NAME if standalone else "fem_antenna_current_source_inspection.py"
     fixture_sha = expected["fixture_sha256"]
     for name, digest in fixture_sha.items():
         path = Path("/input") / name
@@ -208,9 +246,9 @@ def execute_in_container(verify_cold_import=False):
             wait_api(api)
             with (export / "solver.log").open("wb") as log:
                 solve = subprocess.run(["/package/bin/fullmag-bin",
-                    "/input/fem_antenna_current_source_inspection.py", "--headless",
+                    "/input/" + script, "--headless",
                     "--api-port", "8081", "--expect-script-sha256",
-                    fixture_sha["fem_antenna_current_source_inspection.py"],
+                    fixture_sha[script],
                     "--output-dir", "/ram/result.zarr"], stdout=log,
                     stderr=subprocess.STDOUT, timeout=300)
             result["solver_exit_code"] = solve.returncode
@@ -237,6 +275,9 @@ def execute_in_container(verify_cold_import=False):
                 name: smoke(name, "stage-000", export) for name in
                 ("smoke_antenna_external_lead_inspection.py", "smoke_antenna_inspection_display.py")}
             result["terminal_owner_negative_admission"] = reject_stale_terminal_owners()
+            if standalone:
+                result["standalone_read_model"] = check_standalone_read_model()
+                result["fixture_variant"] = "standalone"
             # Both API handlers invoke the full canonical disk loader. The
             # Python smoke itself correctly does not claim native decoding.
             result.update(state="warm_http_pass", runtime_stage_id="stage-000",
@@ -249,6 +290,8 @@ def execute_in_container(verify_cold_import=False):
                 if result["cold_import_result"].get("status") != "pass":
                     raise ValueError("Cold import did not pass its evidence contract")
                 result["cold_archive_import"] = "PASS"
+                if standalone:
+                    result["standalone_cold_read_model"] = check_standalone_read_model()
     except Exception as error:
         result.update(state="failed", error=str(error))
     finally:
@@ -266,9 +309,11 @@ def execute_in_container(verify_cold_import=False):
     return 0 if result["state"] == "warm_http_pass" else 1
 
 
-def http_spec(image, source, package, inputs, export, tools, verify_cold_import=False):
+def http_spec(image, source, package, inputs, export, tools, verify_cold_import=False, *, standalone=False):
     if not isinstance(verify_cold_import, bool):
         raise ValueError("Invalid cold import gate mode")
+    if not isinstance(standalone, bool):
+        raise ValueError("Invalid standalone gate mode")
     import run_managed_antenna_ram as ram
     spec = ram.scientific_spec(image, source, package, inputs, export)
     service = spec["services"]["antenna"]
@@ -278,6 +323,8 @@ def http_spec(image, source, package, inputs, export, tools, verify_cold_import=
     service["command"] = ["python3", "-I", "-B", "/tools/run_managed_antenna_http_ram.py", "execute"]
     if verify_cold_import:
         service["command"].append("--verify-cold-import")
+    if standalone:
+        service["command"].append("--standalone")
     return spec
 
 
@@ -288,13 +335,15 @@ def resolved(repo, job, commit, source, native):
     return storage.resolve_layout(repo, PROFILE), build, context, built, capsule, package
 
 
-def start(repo, job, commit, source_digest, native_digest, verify_cold_import=False):
+def start(repo, job, commit, source_digest, native_digest, verify_cold_import=False, *, standalone=False):
+    if not isinstance(standalone, bool):
+        raise ValueError("Invalid standalone gate mode")
     import fullmag_storage as storage
     import run_managed_antenna_ram as ram
     from run_managed_browser import docker
     layout, build, context, built, capsule, package = resolved(
         repo, job, commit, source_digest, native_digest)
-    fixtures = ram.fixture_paths(repo)
+    fixtures, hashes, generated = ram.fixture_identity(repo, standalone)
     host_tools = repo / "scripts"
     tools_sha = tool_manifest(host_tools)
     image = json.loads(docker("image", "inspect", context["image_digest"]))[0]
@@ -316,9 +365,15 @@ def start(repo, job, commit, source_digest, native_digest, verify_cold_import=Fa
     for name in TOOLS:
         shutil.copyfile(host_tools / name, tools / name)
     check_tools(tools, tools_sha)
+    if generated is not None:
+        (inputs / ram.SCRIPT_NAME).write_bytes(generated)
+        if sha(inputs / ram.SCRIPT_NAME) != hashes[ram.SCRIPT_NAME]:
+            raise ValueError("Standalone fixture changed during staging")
+    variant = {"fixture_variant": "standalone"} if standalone else {}
     storage.atomic_json(tools / "manifest.json", {"tools_sha256": tools_sha,
-        "fixture_sha256": ram.FIXTURE_FILES, "solver_capsule_attribution": False})
-    spec = http_spec(context["image_digest"], capsule / "tree", package, inputs, export, tools, verify_cold_import)
+        "fixture_sha256": hashes, "solver_capsule_attribution": False, **variant})
+    spec = http_spec(context["image_digest"], capsule / "tree", package, inputs, export, tools,
+                     verify_cold_import, standalone=standalone)
     storage.atomic_json(root / "compose.json", spec)
     project = "fullmag-antenna-http-ram-" + root.name
     receipt = {"schema": SCHEMA, "state": "starting", "run_root": str(root),
@@ -327,7 +382,7 @@ def start(repo, job, commit, source_digest, native_digest, verify_cold_import=Fa
         "image_digest": context["image_digest"], "compose_project": project,
         "compose_sha256": sha(root / "compose.json"), "tools_sha256": tools_sha,
         "tool_manifest_sha256": sha(tools / "manifest.json"),
-        "fixture_sha256": ram.FIXTURE_FILES,
+        "fixture_sha256": hashes, **variant,
         "build_receipt_sha256": sha(build / "artifacts/build-receipt.json"),
         "session_storage": "disposable_tmpfs", "qualification": "NOT VERIFIED",
         "physics_qualified": False, "durable_session_storage_qualified": False,
@@ -361,6 +416,12 @@ def observe(repo, root):
             or receipt.get("compose_sha256") != sha(root / "compose.json"):
         raise ValueError("HTTP RAM gate identity changed")
     native = receipt["native_source_identity"]
+    variant = receipt.get("fixture_variant", "magnetic_probe")
+    if variant not in ("standalone", "magnetic_probe"):
+        raise ValueError("Unknown scientific fixture variant")
+    standalone = variant == "standalone"
+    hashes = ram.fixture_identity(repo, True)[1] if standalone else ram.FIXTURE_FILES
+    variant_fields = {"fixture_variant": "standalone"} if standalone else {}
     verify_cold_import = receipt.get("verify_cold_import", False)
     if not isinstance(verify_cold_import, bool):
         raise ValueError("Invalid cold import gate mode")
@@ -371,17 +432,17 @@ def observe(repo, root):
     manifest = read_json(tools / "manifest.json")
     if receipt["tool_manifest_sha256"] != sha(tools / "manifest.json") \
             or manifest != {"tools_sha256": receipt["tools_sha256"],
-                            "fixture_sha256": ram.FIXTURE_FILES, "solver_capsule_attribution": False}:
+                            "fixture_sha256": hashes, "solver_capsule_attribution": False, **variant_fields}:
         raise ValueError("Pinned host-tool manifest differs")
-    for name, expected in ram.FIXTURE_FILES.items():
+    for name, expected in hashes.items():
         if sha(inputs / name) != expected or storage.is_link(inputs / name):
             raise ValueError("Pinned scientific input differs")
     spec = read_json(root / "compose.json")
     if spec != http_spec(context["image_digest"], capsule / "tree", package,
-                         inputs, root / "export", tools, verify_cold_import) \
+                         inputs, root / "export", tools, verify_cold_import, standalone=standalone) \
             or receipt["native_source_identity"] != built["native_source_identity"] \
             or receipt["image_digest"] != context["image_digest"] \
-            or receipt["fixture_sha256"] != ram.FIXTURE_FILES \
+            or receipt["fixture_sha256"] != hashes \
             or receipt["build_receipt_sha256"] != sha(build / "artifacts/build-receipt.json") \
             or receipt["compose_project"] != "fullmag-antenna-http-ram-" + root.name:
         raise ValueError("HTTP gate source/build/spec binding changed")
@@ -404,6 +465,11 @@ def observe(repo, root):
                 or result.get("reuse_LLG_FFT_qualified") is not False \
                 or result.get("tool_manifest_sha256") != receipt["tool_manifest_sha256"]:
             raise ValueError("HTTP gate result is missing or promotes qualification")
+        if standalone and (result.get("fixture_variant") != "standalone" or
+                result.get("standalone_read_model", {}).get("status") != "pass"):
+            raise ValueError("Standalone HTTP read-model evidence is missing")
+        if standalone and verify_cold_import and result.get("standalone_cold_read_model", {}).get("status") != "pass":
+            raise ValueError("Standalone cold read-model evidence is missing")
         for name in ("api.log", "solver.log"):
             check_stamp((export / name).read_text(encoding="utf-8"), native["head_commit_full"],
                 native["source_snapshot_sha256"], dirty=native["source_snapshot_dirty"])
@@ -450,16 +516,19 @@ if __name__ == "__main__":
     for flag in ("job-id", "commit", "source-digest", "native-snapshot-sha256"):
         start_args.add_argument("--" + flag, required=True)
     start_args.add_argument("--verify-cold-import", action="store_true")
+    start_args.add_argument("--standalone", action="store_true")
     sub.add_parser("observe").add_argument("--run-root", type=Path, required=True)
-    sub.add_parser("execute").add_argument("--verify-cold-import", action="store_true")
+    execute_args = sub.add_parser("execute")
+    execute_args.add_argument("--verify-cold-import", action="store_true")
+    execute_args.add_argument("--standalone", action="store_true")
     args = parser.parse_args()
     if args.action == "execute":
-        sys.exit(execute_in_container(args.verify_cold_import))
+        sys.exit(execute_in_container(args.verify_cold_import, args.standalone))
     if args.repo_root is None:
         parser.error("host actions require --repo-root")
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     if args.action == "start":
         start(args.repo_root, args.job_id, args.commit, args.source_digest, args.native_snapshot_sha256,
-              args.verify_cold_import)
+              args.verify_cold_import, standalone=args.standalone)
     else:
         print(json.dumps(observe(args.repo_root, args.run_root)))

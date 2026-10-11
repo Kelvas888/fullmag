@@ -303,7 +303,10 @@ function antennaCompositionNodes(
         antennaResourceId: stage.id,
         antennaResourceKind: "solution" as const,
         status: "warning" as const,
-        contextCommands: ["workspace.focus-selection"],
+        contextCommands: ["study.add-antenna-field-solve-stage", "workspace.focus-selection"],
+        contextCommandInputs: {
+          "study.add-antenna-field-solve-stage": { objectId, stageId: stage.id },
+        },
       };
     }),
     ...projections.map((projection) => ({

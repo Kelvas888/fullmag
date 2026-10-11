@@ -7,7 +7,7 @@ import { useSelectionSelector } from "@/kernel/selection/useSelection";
 import { useObjectVisualizationSelector, useObjectVisualizationController } from "@/kernel/visualization/useObjectVisualization";
 import { antennaDisplayShape, antennaDisplayTopologyShape, buildAntennaFieldOverlayModel } from "../model/antennaFieldOverlayModel";
 import { antennaCurrentTraceShape, buildAntennaCurrentOverlayModel, projectAntennaCurrentOverlayModel } from "../model/antennaCurrentOverlayModel";
-import type { AntennaFieldIntent } from "@/kernel/visualization/antennaFieldIntent";
+import { antennaInspectionIntentMatchesOwner, type AntennaFieldIntent } from "@/kernel/visualization/antennaFieldIntent";
 
 /** One data owner outside the manual R3F root. Binary arrays stay in resource cache / render model. */
 export function useAntennaFieldOverlay() {
@@ -20,17 +20,15 @@ export function useAntennaFieldOverlay() {
     requested.sourceObjectId === selectedObjectId && (requested.points || requested.vectors || requested.surface || requested.wireframe) ? requested : null;
   const solution = useAntennaFieldSolutionResource(intent?.kind === "basis" ? intent.solutionId : null);
   const catalog = useAntennaStageOutputCatalogResource(intent?.kind === "basis" ? intent.stageId : null);
-  const inspection = useAntennaExternalLeadInspectionResource(intent?.kind === "inspection" ? intent.stageId : null);
+  const inspection = useAntennaExternalLeadInspectionResource(intent?.kind === "inspection" ? intent.runtimeStageId ?? null : null);
   const raw = inspection.data;
-  const inspectionOwnerMatches = Boolean(intent?.kind === "inspection" && inspection.status === "ready" && raw &&
-    raw.session_id === intent.sessionId && raw.session_epoch === intent.sessionEpoch && raw.request_scope_epoch === intent.requestScopeEpoch &&
-    raw.runtime_stage_id === intent.stageId && raw.stage_revision === intent.stageRevision && raw.record_content_digest === intent.recordContentDigest &&
-    raw.manifest?.source_object_id === intent.sourceObjectId && raw.manifest.content_digest === intent.contentDigest && raw.port_mode_id === intent.portModeId);
+  const inspectionOwnerMatches = Boolean(intent?.kind === "inspection" && inspection.status === "ready" && !inspection.refreshError && raw &&
+    antennaInspectionIntentMatchesOwner(intent, raw));
   const display = useAntennaInspectionDisplayResource(inspectionOwnerMatches ? raw : null);
   const inspectionPlan = useMemo(() => {
     const data = inspection.data;
     const metadata = display.data;
-    if (!intent || intent.kind !== "inspection" || !inspectionOwnerMatches || !data || display.status !== "ready" || !metadata ||
+    if (!intent || intent.kind !== "inspection" || !inspectionOwnerMatches || !data || display.status !== "ready" || display.refreshError || !metadata ||
         !antennaInspectionDisplayMatchesOwner(data, metadata)) return null;
     const scalar = intent.quantity === "device_potential";
     const current = intent.quantity === "current_density" ? metadata.device_current : null;
@@ -47,7 +45,7 @@ export function useAntennaFieldOverlay() {
       return { data, metadata, count, positionKind, valueKind, positions, values, ownedCurrent: current, topology: scalar || current ? metadata.device_topology : null };
     }
     catch { return null; }
-  }, [intent, inspection.data, inspectionOwnerMatches, display.data, display.status]);
+  }, [intent, inspection.data, inspectionOwnerMatches, display.data, display.status, display.refreshError]);
   const plan = useMemo(() => {
     if (!intent || intent.kind !== "basis" || solution.status !== "ready" || catalog.status !== "ready") return null;
     const data = solution.data;

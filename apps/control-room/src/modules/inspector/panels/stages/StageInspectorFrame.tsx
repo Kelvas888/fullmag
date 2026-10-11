@@ -135,6 +135,10 @@ export function StageInspectorFrame({
         <FieldRow label="Stage" value={stage?.label ?? kindLabel} />
         <FieldRow label="Kind" value={stage?.kind ?? expectedKind} mono />
         <FieldRow label="Stage ID" value={stage?.stageId ?? draft?.stageId ?? "n/a"} mono />
+        {draft?.pipelineNodeId ? <>
+          <FieldRow label="Pipeline effective enabled" value={draft.pipelineEnabled === false ? "no (node or ancestor disabled)" : "yes"} />
+          <FieldRow label="Pipeline group IDs" value={draft.pipelineGroupIds?.join(" / ") || "top level"} mono />
+        </> : null}
         <FieldRow
           label="Status"
           value={stage?.status ?? "draft"}
@@ -174,7 +178,7 @@ export function StageInspectorFrame({
         ) : null}
         <div className="fm-inspector-toolbar">
           <Button
-            disabled={authoringBusy || hasDraftErrors || !draft || !isExpectedDraft}
+            disabled={authoringBusy || hasDraftErrors || !draft || !isExpectedDraft || Boolean(draft.pipelineNodeId)}
             size="sm"
             type="button"
             variant="primary"

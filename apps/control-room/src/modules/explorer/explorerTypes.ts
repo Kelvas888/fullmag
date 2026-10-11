@@ -131,6 +131,7 @@ export type ExplorerNodeKind =
   | "study.stages"
   | "study.stage.action"
   | "study.stage.add_field_drive"
+  | "study.stage.antenna_field_solve"
   | "study.stage.autosave"
   | "study.stage.fft_response"
   | "study.stage.eigenmodes"
@@ -610,6 +611,9 @@ interface ModelTreeStudySnapshot {
 }
 
 export interface ModelTreeStudyStageSnapshot {
+  pipelineNodeId?: string;
+  pipelineEnabled?: boolean;
+  pipelineLabel?: string | null;
   artifactName?: string | null;
   boundaryCondition?: string | null;
   calculationMode?: string | null;

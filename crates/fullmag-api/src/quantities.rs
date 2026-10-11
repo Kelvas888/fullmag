@@ -15,6 +15,19 @@ pub(crate) fn build_quantities(
     scalar_rows: &[ScalarRow],
     _field_location: &str,
 ) -> Vec<QuantityDescriptor> {
+    // The standalone read model carries only the backend discriminant,
+    // not the heavy resolved conductor input required by ExecutionPlanIR.
+    if metadata
+        .and_then(|value| value.get("execution_plan"))
+        .and_then(|value| value.get("backend_plan"))
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        == Some("antenna_external_lead_inspection")
+    {
+        // V/J/H belong to the owner-bound inspection publisher, not to the
+        // magnetic quantity catalog or its interactive preview controls.
+        return Vec::new();
+    }
     let dynamic_supported = metadata
         .and_then(|value| value.get("capabilities"))
         .and_then(|value| serde_json::from_value::<BackendCapabilities>(value.clone()).ok())
@@ -110,6 +123,7 @@ fn scalar_metric_is_active(plan: Option<&ExecutionPlanIR>, metric_key: &str) -> 
         return metric_key != "e_rotated_dmi";
     };
     match &plan.backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => false,
         BackendPlanIR::Fdm(plan) => match metric_key {
             "e_ex" => plan.enable_exchange,
             "e_demag" => plan.enable_demag,
@@ -194,6 +208,14 @@ pub(crate) fn run_manifest_scalar_value(
     metric_key: &str,
     plan: Option<&ExecutionPlanIR>,
 ) -> Option<f64> {
+    if plan.is_some_and(|plan| {
+        matches!(
+            &plan.backend_plan,
+            BackendPlanIR::AntennaExternalLeadInspection(_)
+        )
+    }) {
+        return None;
+    }
     match metric_key {
         "e_ex" => run.and_then(|manifest| manifest.final_e_ex),
         "e_demag" => run.and_then(|manifest| manifest.final_e_demag),
@@ -236,7 +258,9 @@ fn plan_is_rotated_dmi_only(plan: &ExecutionPlanIR) -> bool {
                 && plan.interfacial_dmi.is_none()
                 && plan.bulk_dmi.is_none()
         }
-        BackendPlanIR::FemEigen(_) | BackendPlanIR::FemFrequencyResponse(_) => false,
+        BackendPlanIR::FemEigen(_)
+        | BackendPlanIR::FemFrequencyResponse(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_) => false,
     }
 }
 
@@ -247,7 +271,9 @@ pub(crate) fn extract_fem_mesh_from_metadata(metadata: &Value) -> Option<FemMesh
         BackendPlanIR::Fem(fem) => Some(FemMeshPayload::from(&fem)),
         BackendPlanIR::FemEigen(fem) => Some(FemMeshPayload::from(&fem)),
         BackendPlanIR::FemFrequencyResponse(fem) => Some(FemMeshPayload::from(&fem)),
-        BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => None,
+        BackendPlanIR::Fdm(_)
+        | BackendPlanIR::FdmMultilayer(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_) => None,
     }
 }
 
@@ -331,6 +357,29 @@ mod tests {
                 spec.id.as_str()
             );
         }
+    }
+
+    #[test]
+    fn thin_standalone_inspection_metadata_does_not_offer_magnetic_quantities() {
+        let metadata = serde_json::json!({
+            "execution_plan": { "backend_plan": { "kind": "antenna_external_lead_inspection" } },
+            "capabilities": { "preview_quantities": ["m", "H_eff"] }
+        });
+        let latest_fields = serde_json::from_value(serde_json::json!({
+            "m": { "values": [[1.0, 0.0, 0.0]] },
+            "H_eff": { "values": [[0.0, 1.0, 0.0]] }
+        }))
+        .expect("stale magnetic fields");
+        let quantities = build_quantities(
+            &latest_fields,
+            &CachedPreviewFields::default(),
+            None,
+            Some(&completed_run_manifest()),
+            Some(&metadata),
+            &[],
+            "node",
+        );
+        assert!(quantities.is_empty());
     }
 
     #[test]

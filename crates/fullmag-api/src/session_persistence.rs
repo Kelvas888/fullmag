@@ -1,5 +1,8 @@
 //! Session persistence API handlers — save, load, inspect, checkpoints, recovery.
 
+#[path = "session_persistence_antenna_import.rs"]
+mod antenna_import;
+
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
@@ -1626,6 +1629,7 @@ pub(crate) async fn import_session_commit_with_context(
         ));
     }
 
+    antenna_import::normalize_registered_refs(&mut persisted, &preflight)?;
     normalize_imported_read_only(&mut persisted);
     let import_id = format!(
         "{}-{}",

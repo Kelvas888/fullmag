@@ -8,6 +8,7 @@ import type {
   StageExecutionResource,
 } from "@/kernel/api/apiTypes";
 import type { ActiveLaneCapabilitySnapshot } from "@/kernel/resources/useActiveLaneCapabilities";
+import { readStudyStageSource } from "@/shared/domain/study/studyStageSource";
 import {
   apmFromTesla,
   formatScientific,
@@ -18,6 +19,8 @@ import {
 } from "@/shared/domain/physics/torqueUnits";
 
 interface StudyStageSnapshot {
+  pipelineNodeId?: string;
+  pipelineLabel?: string | null;
   algorithm: string | null;
   energyTolerance: string | null;
   index: number;
@@ -188,7 +191,7 @@ export function studySnapshotFromScene(
   scene: SceneResource | null | undefined,
 ): StudyInspectorSnapshot {
   const study = asRecord(asRecord(scene)?.study);
-  const stages = Array.isArray(study?.stages) ? study.stages : [];
+  const source = readStudyStageSource(study);
 
   return {
     boundary: {
@@ -206,7 +209,11 @@ export function studySnapshotFromScene(
       mode: stringValue(study?.requested_mode, "strict"),
       precision: stringValue(study?.requested_precision, "double"),
     },
-    stages: stages.map((stage, index) => stageSnapshot(stage, index)),
+    stages: source.entries.map((entry, index) => ({
+      ...stageSnapshot(entry.payload, index),
+      ...(entry.queueId ? { stageId: entry.queueId, pipelineNodeId: entry.queueId, pipelineLabel: entry.label, kind: entry.stageKind ?? "unsupported" } : {}),
+      ...(!entry.enabled ? { status: "disabled" } : {}),
+    })),
   };
 }
 
@@ -221,8 +228,12 @@ export function resolveStudyInspectorModel({
   solverStatus,
   stageExecution,
 }: ResolveStudyInspectorModelInput): StudyInspectorModel {
-  const activeStageIndex =
-    stageExecution?.active_stage_index ?? currentRun?.active_stage_index ?? null;
+  const runtimeActiveIndex = stageExecution?.active_stage_index ?? currentRun?.active_stage_index ?? null;
+  const activeRuntimeId = stageExecution?.stages.find((stage) => stage.index === runtimeActiveIndex)?.stage_id;
+  const authoredActiveIndex = snapshot.stages.findIndex((stage) => stage.pipelineNodeId === activeRuntimeId);
+  const activeStageIndex = snapshot.stages.some((stage) => stage.pipelineNodeId)
+    ? authoredActiveIndex >= 0 && activeRuntimeId ? authoredActiveIndex : null
+    : runtimeActiveIndex;
   const selectedStageIndex =
     selectedStageIndexFromId(
       selectedStageRef?.stageId ?? null,
@@ -246,10 +257,12 @@ export function resolveStudyInspectorModel({
   );
 
   const stages = snapshot.stages.map((stage) => {
-    const runtimeRecord = runtimeStageByIndex.get(stage.index) ?? null;
+    const runtimeRecord = stage.pipelineNodeId
+      ? stageExecution?.stages.find((entry) => entry.stage_id === stage.pipelineNodeId) ?? null
+      : runtimeStageByIndex.get(stage.index) ?? null;
     const status =
       runtimeRecord?.status ??
-      stageExecution?.stage_statuses[stage.index] ??
+      (!stage.pipelineNodeId ? stageExecution?.stage_statuses[stage.index] : null) ??
       stage.status;
     const isCompleted = status.toLowerCase() === "completed";
     const stageProgressPercent =
@@ -615,6 +628,7 @@ function formatRate(value: number | null | undefined): string {
 }
 
 function stageLabel(stage: StudyStageSnapshot): string {
+  if (stage.pipelineLabel) return stage.pipelineLabel;
   const base =
     isRelaxStageKind(stage.kind)
       ? "Relax"
@@ -816,10 +830,11 @@ function selectedStageIndexFromId(
   stageExecution: StageExecutionResource | null,
 ): number | null {
   if (!stageId) return null;
-  const index = Number(stageId);
-  if (Number.isInteger(index) && index >= 0) return index;
   const snapshotIndex = stages.findIndex((stage) => stage.stageId === stageId);
   if (snapshotIndex >= 0) return snapshotIndex;
+  if (stages.some((stage) => stage.pipelineNodeId)) return null;
+  const index = Number(stageId);
+  if (Number.isInteger(index) && index >= 0) return index;
   const runtimeIndex = stageExecution?.stages.findIndex(
     (stage) => stage.stage_id === stageId,
   );

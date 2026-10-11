@@ -216,6 +216,86 @@ pub enum AntennaFieldSolveExecutionPlan {
     },
 }
 
+/// Plan raw inspection without constructing a magnetic state or integrator.
+pub fn plan_antenna_external_lead_inspection(
+    problem: &ProblemIR,
+    stage_id: &str,
+    port_mode_id: &str,
+) -> Result<fullmag_ir::ExecutionPlanIR, PlanError> {
+    if let fullmag_ir::StudyIR::AntennaFieldSolve { selection: Some(selection), .. } = &problem.study {
+        if selection.stage_id != stage_id || selection.port_mode_id != port_mode_id {
+            return Err(fail("standalone antenna requested action differs from its canonical study selection"));
+        }
+    }
+    crate::execution_profile_guard::validate_bound_intent(problem).map_err(fail)?;
+    crate::resolve_physics_graph(problem).map_err(|reasons| PlanError { reasons })?;
+    if let Some(resources) = fullmag_ir::ComputeResourcesIR::from_problem(problem).map_err(fail)? {
+        crate::compute_resources::validate_current_runtime_support(&resources)
+            .map_err(|reasons| PlanError { reasons })?;
+    }
+    let AntennaFieldSolveExecutionPlan::ExternalLeadInspection {
+        input, requested_execution, output_id,
+    } = plan_antenna_field_solve_execution(problem, stage_id, port_mode_id)? else {
+        return Err(fail("standalone antenna study requires a typed conservative external-lead inspection source; legacy field-basis execution is not authorized"));
+    };
+    Ok(fullmag_ir::ExecutionPlanIR {
+        common: CommonPlanMeta {
+            ir_version: IR_VERSION.into(),
+            requested_backend: problem.backend_policy.requested_backend,
+            resolved_backend: BackendTarget::Fem,
+            execution_mode: problem.validation_profile.execution_mode,
+            material_field_plans: Vec::new(),
+        },
+        backend_plan: fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(
+            fullmag_ir::AntennaExternalLeadInspectionBackendPlanIR {
+                input, requested_execution, output_id,
+            },
+        ),
+        output_plan: fullmag_ir::OutputPlanIR { outputs: Vec::new() },
+        provenance: ProvenancePlanIR {
+            notes: vec![
+                "antenna_external_lead_inspection_only:no_llg_execution".into(),
+                "dedicated source realization=FEM CPU/double; raw V/J/H inspection only; no per-ampere basis, FFT or LLG qualification".into(),
+            ],
+            ..ProvenancePlanIR::default()
+        },
+    })
+}
+
+pub(crate) fn plan_standalone_antenna(
+    problem: &ProblemIR,
+) -> Result<fullmag_ir::ExecutionPlanIR, PlanError> {
+    if let fullmag_ir::StudyIR::AntennaFieldSolve { selection: Some(selection), .. } = &problem.study {
+        // Selection is part of the canonical, content-owned input. Do not
+        // substitute authored activation metadata when it is malformed.
+        problem.validate().map_err(|reasons| PlanError { reasons })?;
+        return plan_antenna_external_lead_inspection(problem, &selection.stage_id, &selection.port_mode_id);
+    }
+    // Authored pipeline identity is not a physical solve-definition selector.
+    // A sole definition is unambiguous even when its owner has a different ID.
+    // Preserve the legacy exact-ID selector for multi-definition documents.
+    let stage = match problem.antenna_field_solve_stages.as_slice() {
+        [stage] => stage,
+        stages => match crate::util::active_stage_id(problem) {
+            Some(id) => {
+                let mut matching = stages.iter().filter(|stage| stage.id == id);
+                let stage = matching.next().ok_or_else(|| {
+                    fail(format!("standalone antenna active stage '{id}' does not exist"))
+                })?;
+                if matching.next().is_some() {
+                    return Err(fail(format!("standalone antenna active stage '{id}' is ambiguous")));
+                }
+                stage
+            }
+            None => return Err(fail("standalone antenna planning requires one field-solve stage or runtime_metadata.active_stage_id")),
+        },
+    };
+    if stage.port_mode_ids.len() != 1 {
+        return Err(fail("standalone antenna planning requires exactly one selected port mode"));
+    }
+    plan_antenna_external_lead_inspection(problem, &stage.id, &stage.port_mode_ids[0])
+}
+
 pub fn plan_antenna_field_solve_execution(
     problem: &ProblemIR,
     stage_id: &str,

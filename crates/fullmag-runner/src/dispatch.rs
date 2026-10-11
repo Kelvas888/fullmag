@@ -1476,6 +1476,26 @@ pub(crate) fn resolve_with_registry(
 ///
 /// Script-mode orchestration has already paid for planning and must not
 /// rebuild a large FEM plan merely to populate live runtime metadata.
+fn resolve_antenna_inspection_runtime(
+    inspection: &fullmag_ir::AntennaExternalLeadInspectionBackendPlanIR,
+    registry: Option<&RuntimeRegistry>,
+) -> Result<DispatchEngineResolution, RunError> {
+    let resolution = crate::solver_runtime::registry::resolve_antenna_inspection_runtime(
+        inspection, registry,
+    )?;
+    Ok(DispatchEngineResolution {
+        engine: DispatchEngine::Fem(FemEngine::CpuNative),
+        fallback: resolution.fallback,
+        runtime_family: resolution.runtime_family,
+        worker: resolution.worker,
+        resolved_backend: resolution.resolved_backend,
+        resolved_device: resolution.resolved_device,
+        resolved_precision: resolution.resolved_precision,
+        fem_crossover_decision: resolution.fem_crossover_decision,
+    })
+}
+
+/// Resolve the runtime against an already materialized execution plan.
 pub(crate) fn resolve_with_registry_for_plan(
     problem: &ProblemIR,
     plan: &fullmag_ir::ExecutionPlanIR,
@@ -1524,6 +1544,9 @@ pub(crate) fn resolve_with_registry_for_plan(
             }
             BackendPlanIR::FemFrequencyResponse(_) => {
                 resolve_fem_engine_with_registry(problem, registry, explicit_selection, None, false)
+            }
+            BackendPlanIR::AntennaExternalLeadInspection(inspection) => {
+                resolve_antenna_inspection_runtime(inspection, Some(registry))
             }
         },
         None => match &plan.backend_plan {
@@ -1615,6 +1638,9 @@ pub(crate) fn resolve_with_registry_for_plan(
                     resolved_precision: runtime_precision(problem).to_string(),
                     fem_crossover_decision: None,
                 })
+            }
+            BackendPlanIR::AntennaExternalLeadInspection(inspection) => {
+                resolve_antenna_inspection_runtime(inspection, None)
             }
         },
     }
@@ -1824,9 +1850,9 @@ pub fn stage_step_time_frame(
                 StageStepTimeFrame::Absolute
             }
         }
-        BackendPlanIR::FemEigen(_) | BackendPlanIR::FemFrequencyResponse(_) => {
-            StageStepTimeFrame::StageLocal
-        }
+        BackendPlanIR::FemEigen(_)
+        | BackendPlanIR::FemFrequencyResponse(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_) => StageStepTimeFrame::StageLocal,
     };
     Ok(frame)
 }

@@ -593,7 +593,7 @@ const studyTab: RibbonTabContent = {
       tone: "authoring",
       actions: [
         { id: "study.add-relax-stage", icon: icon(Play), label: "Relax", iconColor: "text-emerald-400", splitButton: true, menu: menu("study-relax",  "Relax stage",      ["Overdamped relax", "LLG relax", "Minimizer", "Stop criteria"]) },
-        { id: "study.add-field-drive-stage", icon: icon(RadioTower), label: "Antenna", iconColor: "text-cyan-400", splitButton: true, menu: menu("study-antenna-stage", "Add antenna instruction", ["Global or regional target", "Sinc waveform", "Source FFT", "Stage activation"]) },
+        { id: "study.add-field-drive-stage", icon: icon(RadioTower), label: "Field Drive", iconColor: "text-cyan-400", splitButton: true, menu: menu("study-antenna-stage", "Add prescribed field drive (not a conductor solve)", ["Global or regional target", "Sinc waveform", "Waveform FFT", "Stage activation"]) },
         { id: "study.add-table-autosave-stage", icon: icon(Activity), label: "Table", iconColor: "text-blue-300", splitButton: true, menu: menu("study-table-autosave-stage", "Table autosave instruction", ["ON or OFF", "t_sampling", "Table quantities", "FFT clock diagnostics"]) },
         { id: "study.add-autosave-stage", icon: icon(Save), label: "Autosave", iconColor: "text-lime-300", splitButton: true, menu: menu("study-autosave-stage", "Autosave instruction", ["Enable quantity", "Disable quantity", "Clear all outputs", "Independent cadence"]) },
         { id: "study.add-fft-response-stage", icon: icon(FunctionSquare), label: "FFT", iconColor: "text-violet-300", splitButton: true, menu: menu("study-fft-response-stage", "Response FFT instruction", ["ON or OFF", "Response component", "Window and detrend", "Effective dt and df"]) },

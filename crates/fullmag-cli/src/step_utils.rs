@@ -476,6 +476,9 @@ pub(crate) fn initial_step_update(
     };
 
     match backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            antenna_inspection_step_update(stats, false)
+        }
         BackendPlanIR::Fdm(fdm) => fullmag_runner::StepUpdate {
             coupled_checkpoint: None,
             stats,
@@ -572,6 +575,29 @@ pub(crate) fn initial_step_update(
     }
 }
 
+fn antenna_inspection_step_update(
+    stats: fullmag_runner::StepStats,
+    finished: bool,
+) -> fullmag_runner::StepUpdate {
+    fullmag_runner::StepUpdate {
+        coupled_checkpoint: None,
+        stats,
+        grid: [0, 0, 0],
+        fem_mesh_generation_id: None,
+        magnetization: None,
+        preview_field: None,
+        cached_preview_fields: None,
+        hysteresis_field_m_t: None,
+        hysteresis_point_index: None,
+        hysteresis_settle_step_index: None,
+        hysteresis_settle_step_kind: None,
+        hysteresis_settle_step_method: None,
+        scalar_row_due: false,
+        terminal_field_snapshot: false,
+        finished,
+    }
+}
+
 fn initial_frequency_response_progress_scalars(
     fem: &fullmag_ir::FemFrequencyResponsePlanIR,
 ) -> std::collections::HashMap<String, std::collections::HashMap<String, f64>> {
@@ -636,6 +662,9 @@ pub(crate) fn final_stage_step_update(
         .expect("single step should offset");
 
     Some(match backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            antenna_inspection_step_update(stats, finished)
+        }
         BackendPlanIR::Fdm(fdm) => fullmag_runner::StepUpdate {
             coupled_checkpoint: checkpoint,
             stats,
@@ -736,6 +765,9 @@ pub(crate) fn snapshot_step_update_from_stats(
     finished: bool,
 ) -> fullmag_runner::StepUpdate {
     match backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            antenna_inspection_step_update(stats, finished)
+        }
         BackendPlanIR::Fdm(fdm) => fullmag_runner::StepUpdate {
             coupled_checkpoint: None,
             stats,
@@ -893,6 +925,9 @@ pub(crate) fn validate_imported_magnetization(
     let plan = fullmag_plan::plan(&candidate)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let expected_vectors = match &plan.backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            bail!("antenna inspection does not accept a magnetization import")
+        }
         BackendPlanIR::Fdm(fdm) => fdm.initial_magnetization.len(),
         BackendPlanIR::FdmMultilayer(fdm) => fdm
             .layers
@@ -1062,7 +1097,9 @@ fn planned_fem_mesh_node_count(problem: &ProblemIR) -> Result<Option<usize>> {
         BackendPlanIR::Fem(fem) => Some(fem.mesh.nodes.len()),
         BackendPlanIR::FemEigen(fem) => Some(fem.mesh.nodes.len()),
         BackendPlanIR::FemFrequencyResponse(fem) => Some(fem.mesh.nodes.len()),
-        BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => None,
+        BackendPlanIR::AntennaExternalLeadInspection(_)
+        | BackendPlanIR::Fdm(_)
+        | BackendPlanIR::FdmMultilayer(_) => None,
     })
 }
 
@@ -1122,6 +1159,9 @@ pub(crate) fn continuation_source_from_backend_plan(
     backend_plan: &BackendPlanIR,
 ) -> ContinuationSource {
     match backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => ContinuationSource::Unsupported(
+            "antenna inspection does not define a magnetic continuation carrier".to_string(),
+        ),
         BackendPlanIR::Fdm(plan) => match fdm_continuation_identity(plan) {
             Ok(identity) => ContinuationSource::Fdm(identity),
             Err(error) => ContinuationSource::Unsupported(error.to_string()),
@@ -1294,6 +1334,9 @@ pub(crate) fn resample_continuation_if_cross_backend(
         (ContinuationSource::Fem(_), BackendPlanIR::FdmMultilayer(_)) => {
             // Multi-layer FDM continuation from FEM is not yet supported.
             bail!("FEM → FDM-multilayer cross-backend continuation is not yet supported");
+        }
+        (_, BackendPlanIR::AntennaExternalLeadInspection(_)) => {
+            bail!("antenna inspection does not accept cross-backend magnetization transfer")
         }
         (ContinuationSource::Unsupported(_), _) => unreachable!(),
     }
@@ -1605,7 +1648,8 @@ pub(crate) fn build_interactive_command_stage(
             solve_command.kind = match &base_problem.study {
                 fullmag_ir::StudyIR::Relaxation { .. } => "relax".to_string(),
                 fullmag_ir::StudyIR::TimeEvolution { .. } => "run".to_string(),
-                fullmag_ir::StudyIR::Eigenmodes { .. }
+                fullmag_ir::StudyIR::AntennaFieldSolve { .. }
+                | fullmag_ir::StudyIR::Eigenmodes { .. }
                 | fullmag_ir::StudyIR::FrequencyResponse { .. }
                 | fullmag_ir::StudyIR::Hysteresis { .. } => {
                     anyhow::bail!("interactive 'solve' is not supported for this study kind")

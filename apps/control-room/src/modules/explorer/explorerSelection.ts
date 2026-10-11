@@ -25,6 +25,7 @@ type StudyStageSelectionKind = Extract<
 const STUDY_STAGE_SELECTION_KINDS = new Set<string>([
   "study.stage.action",
   "study.stage.add_field_drive",
+  "study.stage.antenna_field_solve",
   "study.stage.autosave",
   "study.stage.eigenmodes",
   "study.stage.eigenmodes.setup",

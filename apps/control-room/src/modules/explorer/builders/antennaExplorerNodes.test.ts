@@ -20,7 +20,13 @@ describe("antenna composition explorer nodes", () => {
     );
     const solve = node.children?.find((child) => child.kind === "object.antenna")
       ?.children?.find((child) => child.kind === "object.antenna.solution");
-    expect(solve).toMatchObject({ badge: "1 outputs · invalid", status: "warning" });
+    expect(solve).toMatchObject({
+      badge: "1 outputs · invalid", status: "warning",
+      contextCommands: ["study.add-antenna-field-solve-stage", "workspace.focus-selection"],
+      contextCommandInputs: {
+        "study.add-antenna-field-solve-stage": { objectId: "antenna", stageId: "solve-1" },
+      },
+    });
   });
 
   it("marks an incomplete port as warning instead of ready", () => {

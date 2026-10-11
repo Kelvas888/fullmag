@@ -647,24 +647,49 @@ pub(crate) fn scene_document_to_authored_stages(
     })
 }
 
+/// Explicit execution capture with canonical geometry and lead-input producers.
+/// This returns the complete authored graph; selecting a source step, binding
+/// profiles and proving mesh/solver readiness remain caller responsibilities.
+pub(crate) fn scene_document_to_prepared_script_config(
+    repo_root: &Path,
+    workspace_root: &Path,
+    scene_document: &SceneDocument,
+    requested_execution: &fullmag_application::RequestedExecution,
+) -> Result<fullmag_application::script_stage_contract::ScriptExecutionConfig, ApiError> {
+    capture_authored_scene(
+        repo_root,
+        workspace_root,
+        scene_document,
+        requested_execution,
+        SceneCaptureKind::PreparedExecutionConfig,
+    )
+}
+
 #[derive(Clone, Copy)]
 enum SceneCaptureKind {
     ProblemIr,
     ExecutionConfig,
+    PreparedExecutionConfig,
 }
 
 impl SceneCaptureKind {
     fn helper_command(self) -> &'static str {
         match self {
             Self::ProblemIr => "export-scene-ir",
-            Self::ExecutionConfig => "export-scene-config",
+            Self::ExecutionConfig | Self::PreparedExecutionConfig => "export-scene-config",
         }
     }
 
     fn label(self) -> &'static str {
         match self {
             Self::ProblemIr => "ProblemIR",
-            Self::ExecutionConfig => "ScriptExecutionConfig",
+            Self::ExecutionConfig | Self::PreparedExecutionConfig => "ScriptExecutionConfig",
+        }
+    }
+
+    fn append_preparation_args(self, args: &mut Vec<String>) {
+        if matches!(self, Self::PreparedExecutionConfig) {
+            args.push("--materialize-geometry-assets".into());
         }
     }
 }
@@ -697,7 +722,7 @@ fn capture_authored_scene<T: serde::de::DeserializeOwned>(
         )));
     }
 
-    let helper_args = vec![
+    let mut helper_args = vec![
         "-m".to_string(),
         "fullmag.runtime.helper".to_string(),
         kind.helper_command().to_string(),
@@ -714,6 +739,7 @@ fn capture_authored_scene<T: serde::de::DeserializeOwned>(
         "--asset-root".to_string(),
         workspace_root.display().to_string(),
     ];
+    kind.append_preparation_args(&mut helper_args);
     let output = run_python_helper(repo_root, &helper_args);
     let _ = std::fs::remove_file(&scene_path);
     let output = output?;
@@ -1097,6 +1123,24 @@ mod tests {
     use super::*;
     use crate::artifacts::{parse_eigen_dispersion_csv, sanitize_artifact_relative_path};
     use axum::http::StatusCode;
+
+    #[test]
+    fn geometry_materialization_is_explicit_and_only_uses_execution_config_export() {
+        for (kind, command, prepared) in [
+            (SceneCaptureKind::ProblemIr, "export-scene-ir", false),
+            (SceneCaptureKind::ExecutionConfig, "export-scene-config", false),
+            (SceneCaptureKind::PreparedExecutionConfig, "export-scene-config", true),
+        ] {
+            assert_eq!(kind.helper_command(), command);
+            let mut args = vec![command.to_owned()];
+            kind.append_preparation_args(&mut args);
+            assert_eq!(args.len(), if prepared { 2 } else { 1 });
+            assert_eq!(
+                args.iter().any(|arg| arg == "--materialize-geometry-assets"),
+                prepared,
+            );
+        }
+    }
 
     #[tokio::test]
     async fn generated_scene_sync_reexports_new_run_stage_and_preserves_explicit_rewrite() {

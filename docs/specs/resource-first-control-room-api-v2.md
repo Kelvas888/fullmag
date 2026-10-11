@@ -146,6 +146,39 @@ Submit zachowuje ten sam klucz idempotencji. Konflikt blokady nie oznacza
 błędnego payloadu ani przyjęcia nowego runu. Nie wolno omijać blokady,
 zmieniać klucza ani tworzyć zastępczego magazynu w ramach takiego ponowienia.
 
+Przygotowanie tożsamości przed Submit:
+`POST /v2/persistence/projects/{project_id}/run-intent` przyjmuje dokładne
+archiwum `.fms`, `expected_revision`, jawne `RunIntentAuthoring`, skompilowany
+StudyPlan/katalog oraz wiązania asset ID→ścieżka. Zwraca kanoniczny RunIntent
+i fingerprint specyfikacji. Klucz idempotencji nie jest częścią tego
+fingerprintu; oba jawne identyfikatory są zachowane, nie generowane przez API.
+Rewizja jest porównywana wyłącznie z dostarczonym archiwum, nie z najnowszą
+sceną, aktywną sesją ani stanem projektu na dysku. Nieznane pola authoring,
+brak assetu, niespójny Study i konflikt żądanego wykonania powodują odmowę.
+Archiwum ma limit 64 MiB po dekodowaniu oraz odpowiadający limit base64
+sprawdzany przed dekodowaniem; obowiązuje też globalny limit body API.
+
+Operacja nie otwiera accepted-run store, nie zapisuje CAS/journal, nie
+uruchamia meshing/solvera i nie wykonuje admission ani rozpoznania hosta.
+Nie poświadcza istnienia opublikowanego profilu. Submit musi otrzymać ten sam
+zestaw wejść i ponownie sprawdza kontrakty oraz opublikowane wersje profili.
+Sukces przygotowania nie oznacza przyjęcia runu ani naukowej kwalifikacji.
+Stan wdrożenia 2026-10-11: handler/router/OpenAPI zapisane źródłowo; build,
+regeneracja typowanego klienta, integracja UI i prepare→Submit runtime
+pozostają **NOT VERIFIED**.
+
+Produkcyjny konsument CLI przygotowania jest podłączony źródłowo przez
+`fullmag prepare-run-json authored.json --project-id <id> --api-url <origin>`.
+Wejście ma dokładnie kształt ProjectRunIntentRequest, bez gotowego RunIntent.
+Stdout zawiera pięciopolowy ProjectRunSubmitRequest przeznaczony dla jawnego
+późniejszego `fullmag run-json prepared.json --api-url <origin>`. Komenda nie
+zapisuje pliku wyjściowego ani nie wykonuje Submit automatycznie. Kontroluje
+zwrotny project/revision, wszystkie pola RunIntentAuthoring i fingerprint.
+Odczyt pliku oraz poprawnej odpowiedzi HTTP ma limit 96 MiB, odczyt błędu
+HTTP limit 2 KiB. To transport skompilowanych wejść, nie kompilator sceny
+lub skryptu do Study/ProblemIR. Build i wykonanie nowej komendy pozostają
+**NOT VERIFIED**; snapshot joba 66 nie obejmuje tej późniejszej zmiany CLI.
+
 Recovery bieżącej sesji: `GET` i `DELETE /v2/sessions/current/persistence/recovery`
 obejmują wyłącznie snapshot o `session_id` przechwyconej aktywnej sesji.
 Walidacja kontekstu i operacja pozostają pod blokadą zmiany sesji. Usuwanie

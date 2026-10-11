@@ -1,3 +1,6 @@
+pub(crate) mod accepted_antenna_inspection;
+pub(crate) mod accepted_antenna_payload;
+pub(crate) mod accepted_antenna_resource;
 pub mod antenna;
 pub mod antenna_inspection;
 pub mod artifacts;

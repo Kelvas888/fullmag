@@ -1875,6 +1875,72 @@ fn bootstrap_example_validates() {
 }
 
 #[test]
+fn antenna_study_has_no_dynamics_and_preserves_empty_sampling() {
+    let value = serde_json::json!({
+        "kind": "antenna_field_solve", "sampling": {"outputs": []}
+    });
+    let study: StudyIR = serde_json::from_value(value.clone()).unwrap();
+    assert_eq!(study.kind(), StudyKindIR::AntennaFieldSolve);
+    assert!(study.optional_dynamics().is_none());
+    assert!(study.relaxation().is_none());
+    assert_eq!(serde_json::to_value(study).unwrap(), value);
+}
+
+#[test]
+fn only_antenna_study_relaxes_magnetic_inventory_requirements() {
+    let mut ir = ProblemIR::bootstrap_example();
+    ir.magnets.clear();
+    ir.materials.clear();
+    ir.regions.clear();
+    ir.energy_terms.clear();
+    let errors = ir.validate().unwrap_err();
+    assert!(errors.iter().any(|e| e == "at least one magnet is required"));
+    ir.study = StudyIR::AntennaFieldSolve {
+        selection: None,
+        sampling: SamplingIR {
+            outputs: vec![], table_autosave: None, stage_autosave: None,
+        },
+    };
+    // Other authored-source constraints may still reject this bootstrap; the
+    // exemption is scoped to magnetic inventory, not a solver readiness proof.
+    let errors = ir.validate().err().unwrap_or_default();
+    assert!(!errors.iter().any(|e| e == "at least one magnet is required"));
+    assert!(!errors.iter().any(|e| e == "at least one material is required"));
+    assert!(!errors.iter().any(|e| e == "at least one region is required"));
+    assert!(!errors.iter().any(|e| e == "at least one interaction or material anisotropy is required"));
+}
+
+#[test]
+fn antenna_study_selection_is_optional_and_typed() {
+    let legacy = serde_json::json!({"kind": "antenna_field_solve", "sampling": {"outputs": []}});
+    let study: StudyIR = serde_json::from_value(legacy.clone()).unwrap();
+    assert_eq!(serde_json::to_value(study).unwrap(), legacy);
+    let mut selected = legacy;
+    selected["selection"] = serde_json::json!({"stage_id": "solve", "port_mode_id": "port"});
+    let study: StudyIR = serde_json::from_value(selected.clone()).unwrap();
+    assert_eq!(serde_json::to_value(study).unwrap(), selected);
+    for selection in [serde_json::json!({"stage_id": "solve"}), serde_json::json!({"stage_id": "solve", "port_mode_id": "port", "fallback": true}), serde_json::json!("solve")] {
+        selected["selection"] = selection;
+        assert!(serde_json::from_value::<StudyIR>(selected.clone()).is_err());
+    }
+}
+
+#[test]
+fn both_ir_versions_reject_a_missing_antenna_selection_reference() {
+    let study: StudyIR = serde_json::from_value(serde_json::json!({
+        "kind": "antenna_field_solve", "sampling": {"outputs": []},
+        "selection": {"stage_id": "missing", "port_mode_id": "port"}
+    })).unwrap();
+    let mut legacy = ProblemIR::bootstrap_example();
+    legacy.study = study.clone();
+    let mut objects = fullmag_ir::ProblemIRV04::bootstrap_example();
+    objects.study = study;
+    for errors in [legacy.validate().unwrap_err(), objects.validate().unwrap_err()] {
+        assert!(errors.iter().any(|error| error.contains("antenna_field_solve.selection")));
+    }
+}
+
+#[test]
 fn fdm_demag_hints_reject_removed_single_grid_fallback_switch() {
     let legacy = serde_json::json!({
         "strategy": "auto",

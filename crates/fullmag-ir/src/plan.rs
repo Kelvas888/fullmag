@@ -328,11 +328,20 @@ fn resolved_frozen_mask_sha256(mask: &[bool]) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BackendPlanIR {
+    AntennaExternalLeadInspection(AntennaExternalLeadInspectionBackendPlanIR),
     Fdm(FdmPlanIR),
     FdmMultilayer(FdmMultilayerPlanIR),
     Fem(FemPlanIR),
     FemEigen(FemEigenPlanIR),
     FemFrequencyResponse(FemFrequencyResponsePlanIR),
+}
+
+/// A standalone charge/current/Oersted inspection, not a magnetic FEM plan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AntennaExternalLeadInspectionBackendPlanIR {
+    pub input: crate::ResolvedAntennaExternalLeadCurrentInputIR,
+    pub requested_execution: crate::RequestedTransportExecutionIR,
+    pub output_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]

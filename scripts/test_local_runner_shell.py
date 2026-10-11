@@ -56,6 +56,37 @@ class StorageShellTests(unittest.TestCase):
                           '--source-digest', ids[2], '--native-snapshot-sha256', ids[3],
                           '--verify-cold-import'], result.stdout.splitlines()[3:])
 
+    def test_full_just_standalone_gates_dispatch_explicit_variant(self):
+        ids = ['a' * 32, 'b' * 40, 'c' * 64, 'd' * 64]
+        for recipe, helper, flags in (
+            ('run-managed-antenna-standalone-ram', 'run_managed_antenna_ram.py', ['--standalone']),
+            ('run-managed-antenna-standalone-cold-http-ram', 'run_managed_antenna_http_ram.py',
+             ['--verify-cold-import', '--standalone']),
+        ):
+            with self.subTest(recipe=recipe):
+                result = self.antenna_http_shell(just_args=[recipe, *ids])
+                self.assertEqual(0, result.returncode, result.stderr)
+                arguments = result.stdout.splitlines()
+                self.assertTrue(arguments[0].replace('\\', '/').endswith('/scripts/' + helper))
+                self.assertEqual(['start', '--job-id', ids[0], '--commit', ids[1],
+                                  '--source-digest', ids[2], '--native-snapshot-sha256', ids[3],
+                                  *flags], arguments[3:])
+
+    def test_standalone_dispatch_rejects_composite_and_duplicate_flags(self):
+        for helper in ('run_managed_antenna_ram.py', 'run_managed_antenna_http_ram.py'):
+            start = f'python "D:/ignored/scripts/{helper}" --repo-root "D:/ignored" ' + (
+                "start --job-id '" + 'a' * 32 + "' --commit '" + 'b' * 40
+                + "' --source-digest '" + 'c' * 64 + "' --native-snapshot-sha256 '" + 'd' * 64 + "'"
+            )
+            for suffix in (' --standalone; true', ' --standalone && true',
+                           ' --standalone\ntrue', ' --standalone --extra',
+                           ' --standalone --standalone', ' --standalone --verify-cold-import'):
+                with self.subTest(helper=helper, suffix=suffix):
+                    result = self.antenna_http_shell(recipe=start + suffix)
+                    self.assertEqual(2, result.returncode, result.stderr)
+                    self.assertIn('invalid managed antenna', result.stderr)
+                    self.assertEqual('', result.stdout)
+
     def test_full_just_port_diagnostics_dispatches_fixed_browser_fixture(self):
         result = self.antenna_http_shell(just_args=['verify-antenna-port-diagnostics-browser'])
         self.assertEqual(0, result.returncode, result.stderr)

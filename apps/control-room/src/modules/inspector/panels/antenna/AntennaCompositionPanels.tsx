@@ -19,6 +19,7 @@ import { AntennaFieldBasisPreview } from "./AntennaFieldBasisPreview";
 import { AntennaExternalLeadInspectionPanel } from "./AntennaExternalLeadInspectionPanel";
 import { AntennaProjectionDriveComposer } from "./AntennaProjectionDriveComposer";
 import { AntennaSolveTargetsEditor } from "./AntennaSolveTargetsEditor";
+import { AntennaStudyStageComposer } from "./AntennaStudyStageComposer";
 import { AntennaPortEditor } from "./AntennaPortEditor";
 import { AntennaSpectrumComposer } from "./AntennaSpectrumComposer";
 import { MicrostripGeometryEditor } from "./MicrostripGeometryEditor";
@@ -929,6 +930,7 @@ export function AntennaCompositionPanel({
       {kind === "conductor" && objectId ? <AntennaPlacementEditor objectId={objectId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "port" && objectId && resourceId ? <AntennaPortEditor objectId={objectId} portId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
       {kind === "solution" && objectId && resourceId ? <AntennaSolveTargetsEditor key={`targets:${objectId}:${resourceId}`} objectId={objectId} stageId={resourceId} scene={scene.data} status={scene.status} refetch={scene.refetch} /> : null}
+      {kind === "solution" && objectId && resourceId ? <AntennaStudyStageComposer objectId={objectId} stageId={resourceId} scene={scene.data} status={scene.status} /> : null}
       {kind === "solution" && ids.stageId ? <AntennaExternalLeadInspectionPanel authoredStageId={ids.stageId} /> : null}
       {kind === "solution" && fieldSolution.data &&
       model.badge === "ready" &&

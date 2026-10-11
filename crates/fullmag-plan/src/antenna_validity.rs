@@ -106,6 +106,7 @@ fn drive_may_be_active(drive: &SolvedAntennaDriveIR, problem: &ProblemIR) -> boo
 fn study_kind_name(study_kind: StudyKindIR) -> &'static str {
     match study_kind {
         StudyKindIR::Unknown => "unknown",
+        StudyKindIR::AntennaFieldSolve => "antenna_field_solve",
         StudyKindIR::TimeEvolution => "time_evolution",
         StudyKindIR::Relaxation => "relaxation",
         StudyKindIR::Hysteresis => "hysteresis",

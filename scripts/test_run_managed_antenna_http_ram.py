@@ -142,6 +142,90 @@ def test_cold_mode_is_explicit_and_does_not_change_isolation(tmp_path):
         gate.http_spec("image", tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, "yes")
 
 
+def test_standalone_command_is_explicit_and_preserves_isolation(tmp_path):
+    warm = document(tmp_path)
+    standalone = gate.http_spec("sha256:" + "a" * 64, tmp_path / "source",
+        tmp_path / "package", tmp_path / "input", tmp_path / "export", tmp_path / "tools",
+        standalone=True)
+    warm["services"]["antenna"]["command"].append("--standalone")
+    assert standalone == warm
+    with pytest.raises(ValueError, match="standalone gate mode"):
+        gate.http_spec("image", tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, standalone="yes")
+
+
+@pytest.mark.parametrize("mutation", [None, "fields", "missing_catalog", "malformed_catalog",
+    "duplicate_m", "capability", "solver", "materialization", "requestable", "materializable",
+    "mesh", "ownership"])
+def test_standalone_read_model_rejects_magnetic_carriers_and_stale_ownership(monkeypatch, mutation):
+    entries = [{"id": quantity, "capability_state": "unsupported", "solver_capability": "unsupported",
+                "materialization_state": "unsupported", "requestable": False, "materializable": False}
+               for quantity in ("m", "H_eff", "H_demag")]
+    fields, catalog, mesh = {"quantities": []}, {"quantities": entries}, {"revision": 1}
+    if mutation == "fields": fields["quantities"] = [{"quantity_id": "m"}]
+    elif mutation == "missing_catalog": entries.pop()
+    elif mutation == "malformed_catalog": entries.append("m")
+    elif mutation == "duplicate_m": entries.append(dict(entries[0]))
+    elif mutation == "capability": entries[0]["capability_state"] = "supported"
+    elif mutation == "solver": entries[0]["solver_capability"] = "supported"
+    elif mutation == "materialization": entries[0]["materialization_state"] = "complete"
+    elif mutation in ("requestable", "materializable"): entries[0][mutation] = True
+    elif mutation == "mesh": mesh["mesh_summary"] = {"node_count": 4}
+    calls = []
+    def fetch(path):
+        calls.append(path)
+        if path.endswith("/status"):
+            status = terminal_status()
+            if mutation == "ownership" and len(calls) > 1:
+                status["session"]["request_scope_epoch"] = "other:8"
+            return status
+        return {"/v2/sessions/current/data/fields": fields,
+                "/v2/sessions/current/data/quantities": catalog,
+                "/v2/sessions/current/meshing/summary": mesh}[path]
+    monkeypatch.setattr(gate, "get_json", fetch)
+    if mutation is None:
+        result = gate.check_standalone_read_model()
+        assert result["status"] == "pass"
+        assert result["transition_from_magnetic_session_qualified"] is False
+        assert result["field_catalog"] == fields
+        assert len(calls) == 5
+    else:
+        with pytest.raises(ValueError, match="Standalone"):
+            gate.check_standalone_read_model()
+
+
+@pytest.mark.parametrize("mutation", [None, "missing_proof", "wrong_variant", "input", "manifest"])
+def test_standalone_http_observer_requires_bound_input_and_read_model_proof(tmp_path, monkeypatch, mutation):
+    root, receipt, result, observed, _ = retained_gate(tmp_path, monkeypatch)
+    generated = b"standalone fixture"
+    script = root / "input" / ram.SCRIPT_NAME
+    script.write_bytes(generated)
+    hashes = {**receipt["fixture_sha256"], ram.SCRIPT_NAME: gate.sha(script)}
+    monkeypatch.setattr(ram, "fixture_identity", lambda *args, **kwargs: ({}, hashes, generated))
+    manifest = {"tools_sha256": receipt["tools_sha256"], "fixture_sha256": hashes,
+                "solver_capsule_attribution": False, "fixture_variant": "standalone"}
+    if mutation == "manifest": manifest["fixture_variant"] = "magnetic_probe"
+    (root / "tools/manifest.json").write_text(json.dumps(manifest))
+    spec = json.loads((root / "compose.json").read_text())
+    spec["services"]["antenna"]["command"].append("--standalone")
+    observed["Config"]["Cmd"] = spec["services"]["antenna"]["command"]
+    (root / "compose.json").write_text(json.dumps(spec))
+    receipt.update(fixture_variant="standalone", fixture_sha256=hashes,
+                   tool_manifest_sha256=gate.sha(root / "tools/manifest.json"),
+                   compose_sha256=gate.sha(root / "compose.json"))
+    result.update(fixture_variant="standalone", standalone_read_model={"status": "pass"},
+                  tool_manifest_sha256=receipt["tool_manifest_sha256"])
+    if mutation == "missing_proof": result.pop("standalone_read_model")
+    elif mutation == "wrong_variant": result["fixture_variant"] = "magnetic_probe"
+    elif mutation == "input": script.write_bytes(b"changed input")
+    (root / "receipt.json").write_text(json.dumps(receipt))
+    (root / "export/gate-result.json").write_text(json.dumps(result))
+    if mutation is None:
+        assert gate.observe(tmp_path, root)["state"] == "warm_http_pass_resources_retained"
+    else:
+        with pytest.raises(ValueError):
+            gate.observe(tmp_path, root)
+
+
 @pytest.mark.parametrize("mutation", ["tools_rw", "ports", "network", "state", "image", "command", "tmpfs"])
 def test_changed_runtime_is_rejected(tmp_path, monkeypatch, mutation):
     spec = document(tmp_path)

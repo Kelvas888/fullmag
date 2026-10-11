@@ -41,6 +41,10 @@ run-managed-antenna-ram job_id commit source_digest native_snapshot_sha256:
 observe-managed-antenna-ram run_root:
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_ram.py" --repo-root "{{repo_root}}" observe --run-root {{quote(run_root)}}
 
+# Same pinned current input, but no magnetic probe physics or LLG scaffold.
+run-managed-antenna-standalone-ram job_id commit source_digest native_snapshot_sha256:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_ram.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}} --standalone
+
 # Real API publication/read-back: fixed CPU fixture, loopback-only RAM session.
 run-managed-antenna-http-ram job_id commit source_digest native_snapshot_sha256:
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_http_ram.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}}
@@ -48,6 +52,10 @@ run-managed-antenna-http-ram job_id commit source_digest native_snapshot_sha256:
 # Explicit archive round-trip gate in the same disposable RAM ownership boundary.
 run-managed-antenna-cold-http-ram job_id commit source_digest native_snapshot_sha256:
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_http_ram.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}} --verify-cold-import
+
+# Separate source-only API gate; also checks magnetic read-model absence after import.
+run-managed-antenna-standalone-cold-http-ram job_id commit source_digest native_snapshot_sha256:
+    @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_http_ram.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}} --verify-cold-import --standalone
 
 observe-managed-antenna-http-ram run_root:
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_http_ram.py" --repo-root "{{repo_root}}" observe --run-root {{quote(run_root)}}

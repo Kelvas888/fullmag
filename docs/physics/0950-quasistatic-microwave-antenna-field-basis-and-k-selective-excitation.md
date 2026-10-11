@@ -5620,7 +5620,8 @@ odrębnego resource schema/API nie wolno wysyłać tego record jako istniejąceg
 `stage_output_catalog.v1` — stary endpoint pozostaje fail-closed. To kontrakt
 integracji, nie dowód wykonania; runtime i kwalifikacja pozostają otwarte.
 
-Wspólny session shell nadal wymaga planu nośnika magnetyzacji/siatki. Dla
+Historyczny bridge (zastępowany przyrostem standalone poniżej) wymagał
+planu nośnika magnetyzacji/siatki. Dla
 inspection nie może rozwiązywać zwykłego CurrentTransport ani inicjalizować
 LLG. Osobny, jawnie opisany read-model clone zachowuje geometrię, nośniki
 Ms/A/alpha i initial state, a odłącza wykonawczy transport, drives i graf
@@ -5644,8 +5645,55 @@ Session metadata i runtime selection rozpoznają explicit carrier provenance
 i podają `antenna_external_lead_inspection` jako engine, CPU/double/strict oraz
 `NOT VERIFIED`; nie publikują kwalifikacji timestep ani planu nośnika jako
 wykonywanego LLG. Snapshot `m` nie jest wynikiem nowego kroku magnetyzacji.
-Bridge ma właściciela w dedicated CLI stage; jego kryterium usunięcia to
-osobny typed session carrier niewymagający imitacji `ExecutionPlanIR`.
+Bridge miał właściciela w dedicated CLI stage; jego kryterium usunięcia to
+osobny typed session carrier niewymagający imitacji magnetycznego planu.
+
+(antenna-standalone-study-contract)=
+Kontrakt usunięcia bridge jest addytywny: `StudyIR::AntennaFieldSolve`
+serializuje `kind: antenna_field_solve` oraz `sampling`, bez `dynamics`.
+Istniejące `study.stages.add_antenna_field_solve(...)` wybiera tę rodzinę
+explicit stage capture, a nie przez nazwę lub prezentacyjny typ obiektu.
+Wyłącznie ta rodzina może mieć puste `magnets`, magnetyczne `materials`,
+`regions` i `energy_terms`. Geometria, prąd, elektrody, doprowadzenia,
+sampling i ich walidacja pozostają obowiązkowe; niepusta geometria nie jest
+certyfikatem poprawności źródła. Run, Relax i odpowiedź spinowa nadal
+wymagają magnetyka. Eksport sceny bez magnetyka nie dodaje Exchange,
+Demag, initial magnetization ani pozornej dynamiki LLG.
+
+Dedykowany niemagnetyczny wariant `BackendPlanIR` służy wyłącznie
+planowaniu i snapshotom inspection. Zachowuje oryginalny resolved input,
+requested execution i output selector oraz sprawdza ich zgodność przy
+ponownym rozwiązaniu planu. Nie zawiera `initial_magnetization` ani
+neutralnego Zeemana/Heun. Snapshot zawiera geometrię i opublikowane
+V/J/H, nie syntetyczną średnią magnetyzację ani wykonany timestep.
+Zwykły runner LLG odrzuca ten wariant. Fizyczne równania oraz jednostki
+inspection powyżej nie zmieniają się; raw H nie staje się bazą per ampere.
+
+Stan wdrożenia tego przyrostu: **WIP / NOT VERIFIED runtime**.
+Interpretowany regression `test_antenna_standalone_authoring.py` odtwarza
+dotychczasową odmowę bez magnetyka; zielone lowering/round-trip po poprawce
+nie zastąpią buildu, publikacji HTTP ani walidacji numerycznej.
+Realizacją solve pozostaje FEM CPU/double/strict; FEM GPU, FDM CPU i
+FDM GPU nie otrzymują przez ten przyrost własnego solve anteny ani
+cichego fallbacku. Ograniczenia projekcji, LLG i FFT pozostają bez zmian.
+
+| Powierzchnia / parametr | Typ i wartość domyślna | Jednostka | Walidacja i mapowanie |
+|---|---|---|---|
+| `fm.AntennaFieldSolve()` | immutable study, bez argumentów | $1$ | `kind=antenna_field_solve`, `sampling.outputs=[]`, bez dynamics; parametry czasowe nie są przyjmowane |
+| `study.stages.add_antenna_field_solve(...)` | istniejące wymagane `definition` i wybrany port | $1$ dla ID | dotychczasowe tabele definition/port/source obowiązują; capture tej rodziny nie zmienia source ani units |
+| `ProblemIR.study` | tagged `StudyIR::AntennaFieldSolve` | $1$ | brak magnetyka dozwolony tylko dla tej rodziny; planner wymaga rzeczywistej definicji solve i jednego wybranego portu |
+| `BackendPlanIR::AntennaExternalLeadInspection` | resolved input, requested execution, output ID | $1$ dla ID; jednostki pól jak wyżej | zachowane exact input/request/output; ordinary magnetic runner odmawia przed wykonaniem |
+
+Mapowanie źródeł: `packages/fullmag-py/src/fullmag/model/study.py`
++ `AntennaFieldSolve`, `world.py` + `StudyStagesBuilder.add_antenna_field_solve`,
+`crates/fullmag-ir/src/study.rs` + `StudyIR`, `lib.rs` + `ProblemIR::validate`,
+`crates/fullmag-plan/src/antenna_field_solve.rs`
++ `plan_antenna_external_lead_inspection`. Interpretowane testy
+`AntennaStandaloneAuthoringTests` przeszły wraz z round-trip SceneDocument;
+nie wykonują solvera. Testy Rust `antenna_study_has_no_dynamics_and_preserves_empty_sampling`
+oraz `standalone_plan_contains_only_resolved_charge_current_and_sampling_input`
+pozostają niekompilowane. Dla mieszanej sceny z magnetykiem pipeline zachowuje
+autorstwo dynamiki kolejnego Run/Relax; etap inspection sam jej nie wykonuje.
 
 (antenna-current-source-inspection-example)=
 Przykład stage-first `examples/fem_antenna_current_source_inspection.py`

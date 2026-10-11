@@ -1027,6 +1027,9 @@ pub(crate) fn validate_physics_object_problem(problem: &ProblemIRV04) -> Result<
     let mut errors = Vec::new();
     validate_v04_magnetization_constraints(problem, &mut errors);
     crate::validate_antenna_composition(problem, &mut errors);
+    if let Err(error) = problem.study.validate_antenna_selection(&problem.antenna_field_solve_stages) {
+        errors.push(error);
+    }
     if let Some(mesh_semantics) = &problem.mesh_semantics {
         if let Err(mesh_errors) = mesh_semantics.validate() {
             errors.extend(mesh_errors);
@@ -3964,7 +3967,7 @@ pub(crate) fn validate_magnetoelastic(problem: &ProblemIR, errors: &mut Vec<Stri
             let DynamicsIR::Llg { mechanics, .. } = dynamics;
             mechanics.as_ref()
         }),
-        crate::StudyIR::Hysteresis { .. } => None,
+        crate::StudyIR::AntennaFieldSolve { .. } | crate::StudyIR::Hysteresis { .. } => None,
     };
     if mechanics.is_some() && !has_magnetoelastic {
         errors.push("llg.mechanics requires a Magnetoelastic energy term".to_string());

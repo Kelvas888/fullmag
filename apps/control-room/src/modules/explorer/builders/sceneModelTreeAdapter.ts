@@ -15,6 +15,7 @@ import {
   isVisualizationAirboxIdentity,
 } from "@/kernel/selection/selectionTypes";
 import { apmFromTesla } from "@/shared/domain/physics/torqueUnits";
+import { readStudyStageSource } from "@/shared/domain/study/studyStageSource";
 import { resolveRegionMeshLifecycle } from "@/shared/domain/mesh/regionMeshLifecycle";
 import { manifestCarrierOwnershipAliases } from "@/kernel/visualization/visualizationDisplayResolution";
 import type { DomainPresentation } from "@/shared/domain/mesh/domainPresentation";
@@ -184,11 +185,11 @@ export function modelTreeSnapshotWithStageExecution(
       stages: snapshot.study.stages.map((stage, index) => {
         const runtimeStage =
           (stage.stageId ? runtimeByStageId.get(stage.stageId) : undefined) ??
-          stageExecution.stages.find((candidate) => candidate.index === index) ??
-          stageExecution.stages[index] ??
+          (!stage.pipelineNodeId ? stageExecution.stages.find((candidate) => candidate.index === index) : undefined) ??
+          (!stage.pipelineNodeId ? stageExecution.stages[index] : undefined) ??
           null;
         const runtimeStatus =
-          runtimeStage?.status ?? stageExecution.stage_statuses[index] ?? null;
+          runtimeStage?.status ?? (!stage.pipelineNodeId ? stageExecution.stage_statuses[index] : null) ?? null;
         return {
           ...stage,
           stageId: runtimeStage?.stage_id ?? stage.stageId,
@@ -801,9 +802,11 @@ function sceneStudySnapshot(value: unknown): ModelTreeSnapshot["study"] {
     requestedDevice: stringValue(study.requested_device),
     requestedMode: stringValue(study.requested_mode),
     requestedPrecision: stringValue(study.requested_precision),
-    stages: Array.isArray(study.stages)
-      ? study.stages.map(sceneStudyStageSnapshot)
-      : [],
+    stages: readStudyStageSource(study).entries.map((entry, index) => ({
+      ...sceneStudyStageSnapshot(entry.payload, index),
+      ...(entry.queueId ? { stageId: entry.queueId, pipelineNodeId: entry.queueId,
+        pipelineEnabled: entry.enabled, pipelineLabel: entry.label, kind: entry.stageKind ?? "unsupported" } : {}),
+    })),
   };
 }
 

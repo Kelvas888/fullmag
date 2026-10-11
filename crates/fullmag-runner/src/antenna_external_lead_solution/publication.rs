@@ -1,6 +1,7 @@
 //! Publication for the separate inspection-only external-lead carrier.
 //! Trusted local writers: std path checks/rename do not defeat hostile TOCTOU.
 use super::{
+    decode_antenna_inspection_package,
     load_antenna_external_lead_solution, load_antenna_external_lead_solution_manifest,
     solution_manifest_basename, validate_reference, AntennaExternalLeadSolutionArtifact,
     AntennaExternalLeadSolutionManifest, AntennaExternalLeadSolutionRef,
@@ -40,6 +41,22 @@ pub struct PublishedAntennaExternalLeadSolution {
     pub manifest_path: PathBuf,
     pub reused_existing: bool,
 }
+
+/// Restore a retained package through the same immutable publication contract.
+/// The caller must verify its outer CAS digest and execution binding first.
+/// Decoding never runs a solver; invalid bytes cannot create output entries.
+pub fn publish_antenna_inspection_package_atomically(
+    output_root: &Path,
+    bytes: &[u8],
+    expected: &AntennaExternalLeadSolutionRef,
+    interrupt: Option<&AtomicBool>,
+) -> Result<PublishedAntennaExternalLeadSolution, RunError> {
+    cancel(interrupt)?;
+    let artifact = decode_antenna_inspection_package(bytes, expected)?;
+    cancel(interrupt)?;
+    publish_antenna_external_lead_solution_atomically(output_root, &artifact, interrupt)
+}
+
 fn fail(message: impl Into<String>) -> RunError {
     RunError {
         message: message.into(),

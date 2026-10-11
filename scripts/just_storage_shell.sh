@@ -305,10 +305,11 @@ esac
 # link or heavy-build wrapper for them.
 case "${recipe}" in
   *"scripts/run_managed_antenna_http_ram.py"*)
-    antenna_http_ram_start_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_http_ram.py\" --repo-root \"[^\"]+\" start --job-id '([0-9a-f]{32})' --commit '([0-9a-f]{40})' --source-digest '([0-9a-f]{64})' --native-snapshot-sha256 '([0-9a-f]{64})'( --verify-cold-import)?$"
+    antenna_http_ram_start_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_http_ram.py\" --repo-root \"[^\"]+\" start --job-id '([0-9a-f]{32})' --commit '([0-9a-f]{40})' --source-digest '([0-9a-f]{64})' --native-snapshot-sha256 '([0-9a-f]{64})'( --verify-cold-import)?( --standalone)?$"
     if [[ "${recipe}" =~ ${antenna_http_ram_start_pattern} ]]; then
       cold_args=()
       if [[ -n "${BASH_REMATCH[5]}" ]]; then cold_args=(--verify-cold-import); fi
+      if [[ -n "${BASH_REMATCH[6]}" ]]; then cold_args+=(--standalone); fi
       exec "${python_cmd}" "${script_dir}/run_managed_antenna_http_ram.py" --repo-root "${repo_root}" start --job-id "${BASH_REMATCH[1]}" --commit "${BASH_REMATCH[2]}" --source-digest "${BASH_REMATCH[3]}" --native-snapshot-sha256 "${BASH_REMATCH[4]}" "${cold_args[@]}"
     fi
     antenna_http_ram_observe_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_http_ram.py\" --repo-root \"[^\"]+\" observe --run-root '([^']+)'$"
@@ -319,9 +320,11 @@ case "${recipe}" in
     exit 2
     ;;
   *"scripts/run_managed_antenna_ram.py"*)
-    antenna_ram_start_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_ram.py\" --repo-root \"[^\"]+\" start --job-id '([0-9a-f]{32})' --commit '([0-9a-f]{40})' --source-digest '([0-9a-f]{64})' --native-snapshot-sha256 '([0-9a-f]{64})'$"
+    antenna_ram_start_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_ram.py\" --repo-root \"[^\"]+\" start --job-id '([0-9a-f]{32})' --commit '([0-9a-f]{40})' --source-digest '([0-9a-f]{64})' --native-snapshot-sha256 '([0-9a-f]{64})'( --standalone)?$"
     if [[ "${recipe}" =~ ${antenna_ram_start_pattern} ]]; then
-      exec "${python_cmd}" "${script_dir}/run_managed_antenna_ram.py" --repo-root "${repo_root}" start --job-id "${BASH_REMATCH[1]}" --commit "${BASH_REMATCH[2]}" --source-digest "${BASH_REMATCH[3]}" --native-snapshot-sha256 "${BASH_REMATCH[4]}"
+      standalone_args=()
+      if [[ -n "${BASH_REMATCH[5]}" ]]; then standalone_args=(--standalone); fi
+      exec "${python_cmd}" "${script_dir}/run_managed_antenna_ram.py" --repo-root "${repo_root}" start --job-id "${BASH_REMATCH[1]}" --commit "${BASH_REMATCH[2]}" --source-digest "${BASH_REMATCH[3]}" --native-snapshot-sha256 "${BASH_REMATCH[4]}" "${standalone_args[@]}"
     fi
     antenna_ram_observe_pattern="^[^[:space:]]+ \"[^\"]+/scripts/run_managed_antenna_ram.py\" --repo-root \"[^\"]+\" observe --run-root '([^']+)'$"
     if [[ "${recipe}" =~ ${antenna_ram_observe_pattern} ]]; then

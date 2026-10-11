@@ -79,7 +79,7 @@ from fullmag.model.structure import (
     ObjectRegion,
     Region,
 )
-from fullmag.model.study import Eigenmodes, FrequencyResponse, Relaxation, TimeEvolution
+from fullmag.model.study import AntennaFieldSolve, Eigenmodes, FrequencyResponse, Relaxation, TimeEvolution
 from fullmag.model.selection import SelectionDefinition
 
 IR_VERSION = "0.3.0"
@@ -2387,7 +2387,7 @@ class Problem:
     name: str
     magnets: Sequence[Ferromagnet]
     energy: Sequence[EnergyTerm]
-    study: TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse | None = None
+    study: AntennaFieldSolve | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse | None = None
     dynamics: LLG | None = None
     outputs: Sequence[LegacyOutputSpec] | None = None
     discretization: DiscretizationHints | None = None
@@ -2487,9 +2487,9 @@ class Problem:
                 + ", ".join(unknown_ids)
             )
         object.__setattr__(self, "auxiliary_geometry_object_ids", auxiliary_object_ids)
-        if not self.magnets:
+        if not self.magnets and not isinstance(self.study, AntennaFieldSolve):
             raise ValueError("Problem requires at least one magnet")
-        if not self.energy and not any(
+        if not isinstance(self.study, AntennaFieldSolve) and not self.energy and not any(
             _material_has_anisotropy(magnet.material) for magnet in self.magnets
         ):
             raise IncompletePhysicsError(
@@ -3094,7 +3094,7 @@ class Problem:
             hybrid=self.discretization.hybrid,
         )
 
-    def _normalize_study(self) -> TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse:
+    def _normalize_study(self) -> AntennaFieldSolve | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse:
         if self.study is not None and (self.dynamics is not None or self.outputs is not None):
             raise ValueError(
                 "Problem accepts either study=... or the legacy dynamics=... and outputs=... shape, not both"
