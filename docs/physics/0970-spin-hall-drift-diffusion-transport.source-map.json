@@ -27,6 +27,7 @@
     }
   ],
   "equations": [
+    {"id": "spin-current-tensor-display-projections", "symbols": ["Q", "tensor_flow_axis", "tensor_spin_axis", "tensor_component_index", "tensor_frobenius", "tensor_spin_flow_vector"], "sources": ["spin-current-tensor-projection-contract"]},
     {
       "id": "m1-constitutive-block",
       "symbols": ["E", "G", "J_c", "Q", "sigma", "sigma_s", "P", "theta_SH"],
@@ -116,6 +117,11 @@
     }
   ],
   "symbols": [
+    {"id": "tensor_flow_axis", "latex": "$i$", "meaning": "indeks osi przepływu x/y/z jako 0/1/2", "si_unit": "$1$"},
+    {"id": "tensor_spin_axis", "latex": "$a$", "meaning": "indeks polaryzacji spinu x/y/z jako 0/1/2", "si_unit": "$1$"},
+    {"id": "tensor_component_index", "latex": "$c$", "meaning": "indeks komponentu payloadu flow-major", "si_unit": "$1$"},
+    {"id": "tensor_frobenius", "latex": "$N_Q$", "meaning": "norma Frobeniusa wszystkich dziewięciu składowych", "si_unit": "$\\mathrm{A\\,m^{-2}}$"},
+    {"id": "tensor_spin_flow_vector", "latex": "$\\mathbf q_a$", "meaning": "przestrzenny wektor przepływu dla ustalonej polaryzacji spinu", "si_unit": "$\\mathrm{A\\,m^{-2}}$"},
     {"id": "V", "latex": "V", "meaning": "charge electrochemical potential", "si_unit": "\\mathrm{V}"},
     {"id": "b_K", "latex": "b_K", "meaning": "assembled finite-volume charge right-hand side for cell $K$", "si_unit": "\\mathrm{A}"},
     {"id": "K", "latex": "K", "meaning": "deterministic finite-volume cell index", "si_unit": "$1$"},
@@ -173,6 +179,8 @@
     {"id": "seed_m_raw", "latex": "\\mathbf m_{\\mathrm{raw}}", "meaning": "pre-normalization seed vector", "si_unit": "$1$"}
   ],
   "sources": [
+    {"id": "spin-current-tensor-projection-contract", "path": "docs/physics/0970-spin-hall-drift-diffusion-transport.md", "symbol": "DOC-ANCHOR:spin-current-tensor-projection-contract", "responsibility": "Define explicit tensor component, Frobenius, spin-flow vector and post-interpolation semantics.", "evidence_status": "planned_contract"},
+    {"id": "spin-current-tensor-descriptor", "path": "crates/fullmag-quantities/src/catalog.rs", "symbol": "tensor_descriptor", "responsibility": "Publish explicit canonical flow/spin tensor semantics without enabling unqualified preview.", "evidence_status": "implemented_unqualified"},
     {"id": "boris-unit-adapter-v2", "path": "scripts/compare_boris_fullmag_she_nf.py", "symbol": "normalize_boris_artifact", "responsibility": "Map flow-major raw OVFs and exact historical units without promoting solver parity.", "evidence_status": "adapter_fixture_only"},
     {"id": "boris-normal-flux-v2", "path": "scripts/verify_boris_nf_interface.py", "symbol": "compute_interface_slice", "responsibility": "Extract the flow-normal row with all spin polarizations.", "evidence_status": "adapter_fixture_only"},
     {"id": "boris-raw-ovf-regression-v2", "path": "scripts/verify_boris_tensor_adapter.py", "symbol": "main", "responsibility": "Check 8 points, all 72 components, signs, units, history and torque refusal.", "evidence_status": "adapter_fixture_only"},

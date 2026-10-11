@@ -1228,6 +1228,8 @@ fn insert_field_headers(
     let comp_str = match component {
         ComponentSelection::Full => "full".to_string(),
         ComponentSelection::Magnitude => "magnitude".to_string(),
+        ComponentSelection::Frobenius => "frobenius".to_string(),
+        ComponentSelection::SpinFlow(spin) => format!("spin_flow_{}", ["x", "y", "z"][*spin]),
         ComponentSelection::MagnitudeSquared => "magnitude_squared".to_string(),
         ComponentSelection::AbsIndex(i) => format!("abs_c{}", i),
         ComponentSelection::Index(i) => format!("c{}", i),
@@ -2728,7 +2730,8 @@ pub async fn get_field_meta(
         .filter(|field| field.spatial_kind.starts_with("fem_"))
         .map(|field| field.spatial_kind.clone())
         .unwrap_or_else(|| quantity_spatial_domain(quantity_id).to_string());
-    let component = parse_component(query.component.as_deref(), n_comp as usize)?;
+    let component =
+        parse_field_component(quantity_id, query.component.as_deref(), n_comp as usize)?;
     let airbox_carrier = requested_fdm_multilayer_airbox_carrier(
         snapshot,
         &FieldVectorQuery {
@@ -4610,7 +4613,7 @@ async fn get_field_vector_unfenced(
     }
     let n_comp = spec.n_comp as usize;
 
-    let component = parse_component(query.component.as_deref(), n_comp)?;
+    let component = parse_field_component(quantity_id, query.component.as_deref(), n_comp)?;
     let airbox_carrier = requested_fdm_multilayer_airbox_carrier(snapshot, &query, quantity_id)?;
     let multilayer_airbox_scope =
         is_fdm_multilayer_snapshot(snapshot) && query.scope_kind.as_deref() == Some("airbox");
@@ -4964,6 +4967,8 @@ async fn get_field_vector_unfenced(
     let comp_key = match &component {
         ComponentSelection::Full => "full".to_string(),
         ComponentSelection::Magnitude => "magnitude".to_string(),
+        ComponentSelection::Frobenius => "frobenius".to_string(),
+        ComponentSelection::SpinFlow(spin) => format!("spin_flow_{}", ["x", "y", "z"][*spin]),
         ComponentSelection::MagnitudeSquared => "magnitude_squared".to_string(),
         ComponentSelection::AbsIndex(i) => format!("abs_c{}", i),
         ComponentSelection::Index(i) => format!("c{}", i),
@@ -5172,7 +5177,11 @@ fn analysis_frequency_response_vector_response(
                 Some(effective_phase_rad),
             )?
         };
-    let component = parse_component(query.component.as_deref().or(default_component), n_comp)?;
+    let component = parse_field_component(
+        quantity_id,
+        query.component.as_deref().or(default_component),
+        n_comp,
+    )?;
     let (out_n_comp, projected) = project_values(&raw_values, n_comp, &component)?;
     let point_count = raw_values.len() / n_comp;
     let out_grid = [point_count as u32, 1, 1];
@@ -6008,7 +6017,11 @@ fn analysis_eigen_mode_vector_response(
         Some(effective_view),
         Some(effective_phase_rad),
     )?;
-    let component = parse_component(query.component.as_deref().or(default_component), n_comp)?;
+    let component = parse_field_component(
+        quantity_id,
+        query.component.as_deref().or(default_component),
+        n_comp,
+    )?;
     let (out_n_comp, projected) = project_values(&raw_values, n_comp, &component)?;
     let point_count = raw_values.len() / n_comp;
     if u64::try_from(point_count).ok() != Some(source_mesh_identity.node_count) {
@@ -6378,10 +6391,21 @@ fn fem_topology_available(snapshot: &crate::types::SessionStateResponse) -> bool
     })
 }
 
+fn parse_field_component(
+    quantity_id: &str,
+    input: Option<&str>,
+    n_comp: usize,
+) -> Result<ComponentSelection, ApiError> {
+    let tensor = quantity_spec(quantity_id).and_then(|spec| spec.tensor_descriptor());
+    crate::field_projection::parse_quantity_component(input, n_comp, tensor.as_ref())
+}
+
 fn component_label(c: &ComponentSelection) -> String {
     match c {
         ComponentSelection::Full => "full".into(),
         ComponentSelection::Magnitude => "magnitude".into(),
+        ComponentSelection::Frobenius => "frobenius".into(),
+        ComponentSelection::SpinFlow(spin) => format!("spin_flow_{}", ["x", "y", "z"][*spin]),
         ComponentSelection::MagnitudeSquared => "magnitude_squared".into(),
         ComponentSelection::AbsIndex(i) => format!("abs_c{}", i),
         ComponentSelection::Index(i) => format!("c{}", i),
@@ -6716,7 +6740,7 @@ fn orientation_rgba_from_full_values(result: &crate::field_slice::SliceResult) -
     let height = result.y_size as usize;
     let mut rgba = Vec::with_capacity(width * height);
     for pixel in 0..width * height {
-        if result.empty_mask.get(pixel).copied().unwrap_or(1) != 0 || result.n_comp_out < 3 {
+        if result.empty_mask.get(pixel).copied().unwrap_or(1) != 0 || result.n_comp_out != 3 {
             rgba.push([0, 0, 0, 0]);
             continue;
         }
@@ -6733,7 +6757,7 @@ fn magnitude_values_from_full(result: &crate::field_slice::SliceResult) -> Vec<f
     let pixel_count = result.x_size as usize * result.y_size as usize;
     (0..pixel_count)
         .map(|pixel| {
-            if result.empty_mask.get(pixel).copied().unwrap_or(1) != 0 || result.n_comp_out < 3 {
+            if result.empty_mask.get(pixel).copied().unwrap_or(1) != 0 || result.n_comp_out != 3 {
                 return f64::NAN;
             }
             let base = pixel * result.n_comp_out;
@@ -6765,9 +6789,9 @@ fn matrix_response_from_slice(
     let mut rgba = None;
 
     if color_mode == "orientation" {
-        if result.n_comp_out < 3 {
+        if result.n_comp_out != 3 {
             return Err(ApiError::bad_request(
-                "invalid_query: color_mode=orientation requires a vector field with at least 3 components",
+                "invalid_query: color_mode=orientation requires an explicit three-component vector field",
             ));
         }
         let pixels = orientation_rgba_from_full_values(&result);
@@ -6925,9 +6949,9 @@ fn component_for_matrix(
     component: Option<&str>,
 ) -> Result<(String, ComponentSelection), ApiError> {
     if color_mode == "orientation" {
-        if n_comp < 3 {
+        if n_comp != 3 {
             return Err(ApiError::bad_request(
-                "invalid_query: color_mode=orientation requires n_comp >= 3",
+                "invalid_query: color_mode=orientation requires n_comp = 3",
             ));
         }
         return Ok(("orientation".to_string(), ComponentSelection::Full));

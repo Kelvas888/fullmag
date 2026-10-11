@@ -478,6 +478,7 @@ use utoipa::OpenApi;
         crate::schemas::domain::DomainSliceMeshOverlaySegment,
         crate::schemas::quantities::QuantityCatalogResponse,
         crate::schemas::quantities::QuantityCatalogEntry,
+        crate::schemas::quantities::QuantityTensorDescriptor,
         crate::schemas::fields::FieldCatalog,
         crate::schemas::fields::FieldAvailabilityResource,
         crate::schemas::fields::FieldDescriptor,

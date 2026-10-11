@@ -1852,6 +1852,62 @@ outputs. Quantities include `V_electric [V]`, `J_charge [A/m^2]`,
 and transport torque. `Q` uses nine FMVP components with metadata
 `row_major_Q_ia`, flow/spin axes, location, and scope.
 
+(spin-current-tensor-descriptor)=
+Kanoniczny katalog quantities opisuje `spin_current_tensor` dodatkowym,
+opcjonalnym polem `tensor`: `rank=2`, `shape=[3,3]`, `layout=flow_major`,
+`axes=[flow,spin]` i `component_labels=[Q_xx,Q_xy,Q_xz,Q_yx,Q_yy,Q_yz,Q_zx,Q_zy,Q_zz]`.
+Właścicielem jest `crates/fullmag-quantities/src/catalog.rs::tensor_descriptor`;
+`build_wire_catalog` oraz API `QuantityCatalogEntry` przekazują te same dane.
+Opis wynika z kanonicznej tożsamości quantity, nie z liczby komponentów payloadu.
+Starszy JSON bez pola pozostaje czytelny, lecz brak metadanych nie upoważnia do
+interpretowania dziewięciu komponentów jako wektora XYZ. Jednostka pozostaje
+$\mathrm{A\,m^{-2}}$ z katalogu; metadane nie przenoszą ciężkiego tensora.
+
+Ten fragment nie zmienia równań, Python/ProblemIR ani backend support. Istniejący
+API wybór `c0`–`c8` zachowuje kolejność flow-major. Preview 2D/3D pozostaje
+`export_only` do czasu kwalifikacji selectorów, kontrakcji, próbkowania i browser
+regression. Dodanie deskryptora nie jest dowodem działającej wizualizacji.
+
+(spin-current-tensor-projection-contract)=
+Projekcja prezentacyjna tensora nie zmienia zaakceptowanego wyniku transportu.
+Indeksy numeryczne osi x, y, z to odpowiednio 0, 1, 2. Skalar komponentu i
+wektor przepływu dla wybranej polaryzacji mają następujące znaczenie:
+
+```{math}
+:label: spin-current-tensor-display-projections
+c=3i+a,\qquad
+N_Q=\left(\sum_{i=0}^{2}\sum_{a=0}^{2}Q_{ia}^{2}\right)^{1/2},\qquad
+\mathbf q_a=(Q_{0a},Q_{1a},Q_{2a}).
+```
+
+| Symbol | Znaczenie | SI |
+|---|---|---|
+| $i$ | indeks osi przepływu x/y/z jako 0/1/2 | $1$ |
+| $a$ | indeks polaryzacji spinu x/y/z jako 0/1/2 | $1$ |
+| $c$ | indeks komponentu payloadu flow-major | $1$ |
+| $N_Q$ | norma Frobeniusa wszystkich dziewięciu składowych | $\mathrm{A\,m^{-2}}$ |
+| $\mathbf q_a$ | przestrzenny wektor przepływu dla ustalonej polaryzacji spinu | $\mathrm{A\,m^{-2}}$ |
+
+Jawny wybór `component` zawiera obie osie; `frobenius` wybiera normę $N_Q$;
+`spin_flow_vector` wybiera polaryzację i trzy kierunki przestrzennego przepływu.
+Surowy rank-2 carrier pozostaje dziewięcioskładowy i nie jest wejściem XYZ glyph
+ani orientation renderer. Nie opisuje się normy jako mocy lub momentu.
+
+Planar/FEM sampling najpierw interpoluje lub redukuje wszystkie składowe,
+a dopiero potem liczy normę. Norma próbek węzłowych interpolowana jako skalar
+nie jest równoważna normie interpolowanego tensora. Wektor kolumny zachowuje
+orientację flow/spin i znaki; surface flux wymaga rzeczywistej normalnej i
+zgodnego nośnika, nie domyślnego kierunku kamery.
+
+Zapisane ustawienia targetu zawierają jawny rodzaj projekcji oraz jej osie.
+Tożsamość cache/ETag/requestu obejmuje canonical projection token wraz z
+quantity, scope, session i generation/revision. Zmiana projekcji nie rozwiązuje
+transportu i nie tworzy nowej topologii. Brak lub niezgodny descriptor oznacza
+odmowę tensor visualization; brak jednostki nie otrzymuje pustej legendy.
+Bramki preview pozostają zamknięte do czasu rzeczywistego HTTP oraz browser
+proof dziewięciu komponentów, normy, wybranej kolumny i poprawnej interpolacji.
+Stan: kontrakt wdrożenia E10, nie kwalifikacja runtime ani nowej lane.
+
 Telemetry includes scaled residuals, iterations, reason, preconditioner,
 operator revision, balances, stage refreshes, timings, nonlinear iterations,
 and H2D/D2H counts. Provenance records full splitting convention, index order,
@@ -2351,6 +2407,8 @@ a qualified workload without the validation gates above.
 
 | Claim | Path | Symbol | Responsibility | Evidence |
 |---|---|---|---|---|
+| Kontrakt projekcji tensora | docs/physics/0970-spin-hall-drift-diffusion-transport.md | DOC-ANCHOR:spin-current-tensor-projection-contract | komponent, norma i wektor kolumny po interpolacji | planned contract, runtime/UI jeszcze niezweryfikowane |
+| Metadane tensora spinowego | crates/fullmag-quantities/src/catalog.rs | tensor_descriptor | rank, shape, flow/spin axes i 9 etykiet z canonical ID | implementacja; runtime/API jeszcze niezweryfikowane |
 | Adapter BORIS v2 | scripts/compare_boris_fullmag_she_nf.py | normalize_boris_artifact; _concat_qia | flow-major rows i raw-OVF provenance | raw OVF fixture, nie parity solverów |
 | Strumień interfejsu BORIS | scripts/verify_boris_nf_interface.py | compute_interface_slice | wszystkie polaryzacje wiersza z | oba znaki normalnej na fixture |
 | Regresja adaptera BORIS | scripts/verify_boris_tensor_adapter.py | main | 8 punktów N/F, 72 komponenty, jednostki i torque refusal | RED→GREEN, bez solve |

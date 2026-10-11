@@ -249,7 +249,8 @@ fn estimate_planar_sample_bytes(result: &PlanarSampleResult) -> usize {
             + overlay.segments.len()
                 * std::mem::size_of::<crate::planar_sampling::PlanarOverlaySegment>()
     });
-    scalar + vectors + occupancy + source_ids + overlay
+    let components = result.component_values.len() * std::mem::size_of::<f64>();
+    scalar + components + vectors + occupancy + source_ids + overlay
 }
 
 impl JsonResourceCache {
@@ -630,6 +631,8 @@ mod tests {
                 basis_order: 0,
                 integration_order: 0,
             },
+            n_comp: 1,
+            component_values: vec![1.0; value_count],
             scalar_values: vec![1.0; value_count],
             vector_values: None,
             occupancy: vec![Occupancy::Occupied; value_count],
