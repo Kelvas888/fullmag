@@ -1,5 +1,27 @@
 # Plan implementacji refaktoryzacji modułu anten mikrofalowych
 
+**Checkpoint narzędzi odbioru — 2026-10-11, wykonanie natywne nadal otwarte:**
+Dodano jawną receptę `run-managed-antenna-cold-http-ram` i narzędzie
+`scripts/antenna_inspection_cold_import_check.py::verify_cold_import`.
+Po rzeczywistym solve oraz warm HTTP eksportuje oryginalne FMS przez API,
+sprawdza istniejące refs i komplet payloadów, odrzucenie uciętego archiwum
+bez zmiany sesji, ukrywa pierwotny `/ram/result.zarr`, importuje niezmienione
+archiwum i porównuje metadane naukowe oraz SHA-256 wszystkich 12 payloadów.
+Sprawdza odcięcie starego request scope i przywrócenie oryginalnego katalogu.
+Rewizja sesji/etapu nie jest digestem naukowym: po imporcie może się zmienić;
+powiązanie metadata/display wewnątrz każdego odczytu nadal jest wymagane.
+Observer wymaga zachowanego raportu, tożsamości FMS oraz jawnych dowodów;
+błąd cold importu nie może pozostawić sukcesu warm gate.
+Weryfikacja interpretowana: **81 PASS + 10 podtestów**, następnie osobna
+nowa regresja importu wyłącznie przypiętych narzędzi w Pythonie `-I`: **1 PASS**.
+Nie kompilowano testów Rust. Nowe narzędzia są przypinane osobno i nie należą
+do wcześniej zgłoszonej kapsuły nr 45. Build 45 pozostaje `queued`;
+odczyt zdrowia runnera potwierdził inne aktywne zadanie nr 42. Lista zadań
+zwróciła HTTP 500; nie restartowano koordynatora ani cudzych prac.
+Warm/cold runtime, browser/WebGL, kwalifikacja fizyki i trwałego zapisu,
+per-A/LLG/FFT oraz pełne T00–T18 pozostają **NOT VERIFIED / otwarte**.
+Workspace 3197 i scena użytkownika bez zmian.
+
 **Snapshot do odbioru — build nr 45, queued:**
 Po zakończeniu review i zamrożeniu wszystkich writerów zgłoszono
 `fc763cf735b74842bc07fbe92915b6e0` z base

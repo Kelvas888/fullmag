@@ -48,13 +48,24 @@ class StorageShellTests(unittest.TestCase):
         self.assertTrue(arguments[0].replace('\\', '/').endswith('/scripts/run_managed_antenna_http_ram.py'))
         self.assertEqual(['observe', '--run-root', run_root], arguments[3:])
 
+    def test_full_just_antenna_cold_gate_dispatches_explicit_mode(self):
+        ids = ['a' * 32, 'b' * 40, 'c' * 64, 'd' * 64]
+        result = self.antenna_http_shell(just_args=['run-managed-antenna-cold-http-ram', *ids])
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(['start', '--job-id', ids[0], '--commit', ids[1],
+                          '--source-digest', ids[2], '--native-snapshot-sha256', ids[3],
+                          '--verify-cold-import'], result.stdout.splitlines()[3:])
+
     def test_antenna_http_dispatch_rejects_composite_and_internal_commands(self):
         base = 'python "D:/ignored/scripts/run_managed_antenna_http_ram.py" --repo-root "D:/ignored" '
         start = base + "start --job-id '" + 'a' * 32 + "' --commit '" + 'b' * 40 + "' --source-digest '" + 'c' * 64 + "' --native-snapshot-sha256 '" + 'd' * 64 + "'"
         observe = base + "observe --run-root 'D:/git/fullmag/storage/runs/own'"
         for recipe in (start + '; true', observe + ' && true', observe + '\ntrue',
                        base + 'execute', start.replace('a' * 32, 'bad-id'),
-                       observe + ' --extra', 'true; ' + start):
+                       observe + ' --extra', 'true; ' + start,
+                       start + ' --verify-cold-import; true',
+                       start + ' --verify-cold-import --extra',
+                       start + ' --verify-cold-import --verify-cold-import'):
             with self.subTest(recipe=recipe):
                 result = self.antenna_http_shell(recipe=recipe)
                 self.assertEqual(2, result.returncode, result.stderr)

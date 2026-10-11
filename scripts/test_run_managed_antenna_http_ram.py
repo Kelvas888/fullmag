@@ -3,6 +3,8 @@ import json
 import io
 from pathlib import Path
 import subprocess
+import shutil
+import sys
 
 import pytest
 from scripts import run_managed_antenna_http_ram as gate
@@ -130,6 +132,16 @@ def test_readonly_tools_are_distinct_from_capsule_and_state_is_ram(tmp_path):
     assert service["command"] == ["python3", "-I", "-B", "/tools/run_managed_antenna_http_ram.py", "execute"]
 
 
+def test_cold_mode_is_explicit_and_does_not_change_isolation(tmp_path):
+    warm = document(tmp_path)
+    cold = gate.http_spec("sha256:" + "a" * 64, tmp_path / "source",
+        tmp_path / "package", tmp_path / "input", tmp_path / "export", tmp_path / "tools", True)
+    warm["services"]["antenna"]["command"].append("--verify-cold-import")
+    assert cold == warm
+    with pytest.raises(ValueError, match="Invalid cold import gate mode"):
+        gate.http_spec("image", tmp_path, tmp_path, tmp_path, tmp_path, tmp_path, "yes")
+
+
 @pytest.mark.parametrize("mutation", ["tools_rw", "ports", "network", "state", "image", "command", "tmpfs"])
 def test_changed_runtime_is_rejected(tmp_path, monkeypatch, mutation):
     spec = document(tmp_path)
@@ -172,6 +184,16 @@ def test_tool_manifest_matches_actual_import_dependencies():
     assert set(manifest) == set(gate.TOOLS)
     assert "antenna_current_source_oracle.py" in manifest
     assert "run_managed_antenna_ram.py" not in manifest
+
+
+def test_cold_probe_imports_with_only_pinned_tools_in_isolated_python(tmp_path):
+    repo = Path(__file__).resolve().parents[1]
+    for name in gate.TOOLS:
+        shutil.copyfile(repo / "scripts" / name, tmp_path / name)
+    code = "import sys; sys.path.insert(0,sys.argv[1]); import antenna_inspection_cold_import_check"
+    result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(tmp_path)],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stderr
 
 
 def test_smoke_runs_pinned_tools_with_bounded_timeout(tmp_path, monkeypatch):
@@ -343,3 +365,37 @@ def test_live_gate_remains_pending_without_success_receipt(tmp_path, monkeypatch
     observed["State"].update(Status="running", Running=True)
     assert gate.observe(tmp_path, root)["state"] == "pending"
     assert not stamps
+
+
+@pytest.mark.parametrize("mutation", [None, "missing", "durability", "root", "scope", "receipt", "archive"])
+def test_cold_gate_requires_retained_roundtrip_evidence(tmp_path, monkeypatch, mutation):
+    root, receipt, result, observed, _ = retained_gate(tmp_path, monkeypatch)
+    spec = json.loads((root / "compose.json").read_text())
+    spec["services"]["antenna"]["command"].append("--verify-cold-import")
+    observed["Config"]["Cmd"] = spec["services"]["antenna"]["command"]
+    (root / "compose.json").write_text(json.dumps(spec))
+    receipt.update(verify_cold_import=True, compose_sha256=gate.sha(root / "compose.json"))
+    archive = root / "export/antenna-cold.fms"
+    archive.write_bytes(b"archive" * 10)
+    cold = {"status": "pass", "durable_session_storage_qualified": False,
+        "physics_qualified": False, "reuse_LLG_FFT_qualified": False,
+        "api_process_restarted": False, "original_output_restored": True,
+        "original_root_unavailable_during_import_and_reads": True,
+        "old_request_scope_rejected": True, "warm_request_scope": "instance:1",
+        "cold_request_scope": "instance:2",
+        "archive": {"bytes": archive.stat().st_size, "sha256": gate.sha(archive)}}
+    result.update(cold_archive_import="PASS", cold_import_result=cold)
+    if mutation == "missing": result.pop("cold_import_result")
+    elif mutation == "durability": cold["durable_session_storage_qualified"] = True
+    elif mutation == "root": cold["original_root_unavailable_during_import_and_reads"] = False
+    elif mutation == "scope": cold["cold_request_scope"] = cold["warm_request_scope"]
+    elif mutation == "archive": archive.write_bytes(b"changed" * 10)
+    (root / "export/cold-import-result.json").write_text(json.dumps({} if mutation == "receipt" else cold))
+    (root / "receipt.json").write_text(json.dumps(receipt))
+    (root / "export/gate-result.json").write_text(json.dumps(result))
+    if mutation is None:
+        gate.observe(tmp_path, root)
+        assert json.loads((root / "receipt.json").read_text())["cold_archive_import"] == "PASS"
+    else:
+        with pytest.raises(ValueError):
+            gate.observe(tmp_path, root)

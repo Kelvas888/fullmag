@@ -25,6 +25,7 @@ TOOLS = (
     "run_managed_antenna_http_ram.py", "smoke_antenna_external_lead_inspection.py",
     "smoke_antenna_inspection_display.py", "antenna_rt0_fixture_check.py",
     "antenna_current_display_fixture_check.py", "antenna_current_source_oracle.py",
+    "antenna_inspection_cold_import_check.py",
 )
 ORIGIN = "http://127.0.0.1:8081"
 MAX_JSON = 4 << 20
@@ -169,10 +170,12 @@ def reject_stale_terminal_owners():
             "nonempty_bootstrap_qualified": False}
 
 
-def execute_in_container():
+def execute_in_container(verify_cold_import=False):
     export, tools = Path("/export"), Path("/tools")
     expected = json.loads((tools / "manifest.json").read_text())
     check_tools(tools, expected["tools_sha256"])
+    # The container uses -I; admit only the verified, read-only tool directory.
+    sys.path.insert(0, str(tools))
     fixture_sha = expected["fixture_sha256"]
     for name, digest in fixture_sha.items():
         path = Path("/input") / name
@@ -240,8 +243,14 @@ def execute_in_container():
                 native_canonical_bundle_redecoded=True,
                 canonical_decoder_owner="API load_published_antenna_external_lead_solution",
                 inspection_ref=metadata["outputs"][0]["inspection_ref"])
+            if verify_cold_import:
+                from antenna_inspection_cold_import_check import verify_cold_import as check_cold
+                result["cold_import_result"] = check_cold("stage-000", export)
+                if result["cold_import_result"].get("status") != "pass":
+                    raise ValueError("Cold import did not pass its evidence contract")
+                result["cold_archive_import"] = "PASS"
     except Exception as error:
-        result["error"] = str(error)
+        result.update(state="failed", error=str(error))
     finally:
         try:
             stop_owned(api)
@@ -257,7 +266,9 @@ def execute_in_container():
     return 0 if result["state"] == "warm_http_pass" else 1
 
 
-def http_spec(image, source, package, inputs, export, tools):
+def http_spec(image, source, package, inputs, export, tools, verify_cold_import=False):
+    if not isinstance(verify_cold_import, bool):
+        raise ValueError("Invalid cold import gate mode")
     import run_managed_antenna_ram as ram
     spec = ram.scientific_spec(image, source, package, inputs, export)
     service = spec["services"]["antenna"]
@@ -265,6 +276,8 @@ def http_spec(image, source, package, inputs, export, tools):
                                "target": "/tools", "read_only": True})
     service["environment"]["FULLMAG_API_PORT"] = "8081"
     service["command"] = ["python3", "-I", "-B", "/tools/run_managed_antenna_http_ram.py", "execute"]
+    if verify_cold_import:
+        service["command"].append("--verify-cold-import")
     return spec
 
 
@@ -275,7 +288,7 @@ def resolved(repo, job, commit, source, native):
     return storage.resolve_layout(repo, PROFILE), build, context, built, capsule, package
 
 
-def start(repo, job, commit, source_digest, native_digest):
+def start(repo, job, commit, source_digest, native_digest, verify_cold_import=False):
     import fullmag_storage as storage
     import run_managed_antenna_ram as ram
     from run_managed_browser import docker
@@ -305,7 +318,7 @@ def start(repo, job, commit, source_digest, native_digest):
     check_tools(tools, tools_sha)
     storage.atomic_json(tools / "manifest.json", {"tools_sha256": tools_sha,
         "fixture_sha256": ram.FIXTURE_FILES, "solver_capsule_attribution": False})
-    spec = http_spec(context["image_digest"], capsule / "tree", package, inputs, export, tools)
+    spec = http_spec(context["image_digest"], capsule / "tree", package, inputs, export, tools, verify_cold_import)
     storage.atomic_json(root / "compose.json", spec)
     project = "fullmag-antenna-http-ram-" + root.name
     receipt = {"schema": SCHEMA, "state": "starting", "run_root": str(root),
@@ -319,6 +332,7 @@ def start(repo, job, commit, source_digest, native_digest):
         "session_storage": "disposable_tmpfs", "qualification": "NOT VERIFIED",
         "physics_qualified": False, "durable_session_storage_qualified": False,
         "unit_tests_compiled": False}
+    receipt["verify_cold_import"] = verify_cold_import
     try:
         args = ["compose", "-f", str(root / "compose.json"), "--project-name", project]
         docker(*args, "config", "--quiet")
@@ -347,6 +361,9 @@ def observe(repo, root):
             or receipt.get("compose_sha256") != sha(root / "compose.json"):
         raise ValueError("HTTP RAM gate identity changed")
     native = receipt["native_source_identity"]
+    verify_cold_import = receipt.get("verify_cold_import", False)
+    if not isinstance(verify_cold_import, bool):
+        raise ValueError("Invalid cold import gate mode")
     _, build, context, built, capsule, package = resolved(repo, receipt["managed_job_id"],
         native["head_commit_full"], receipt["source_digest"], native["source_snapshot_sha256"])
     tools, inputs = root / "tools", root / "input"
@@ -361,7 +378,7 @@ def observe(repo, root):
             raise ValueError("Pinned scientific input differs")
     spec = read_json(root / "compose.json")
     if spec != http_spec(context["image_digest"], capsule / "tree", package,
-                         inputs, root / "export", tools) \
+                         inputs, root / "export", tools, verify_cold_import) \
             or receipt["native_source_identity"] != built["native_source_identity"] \
             or receipt["image_digest"] != context["image_digest"] \
             or receipt["fixture_sha256"] != ram.FIXTURE_FILES \
@@ -392,10 +409,31 @@ def observe(repo, root):
                 native["source_snapshot_sha256"], dirty=native["source_snapshot_dirty"])
         if not (export / "result.zarr").is_dir() or storage.is_link(export / "result.zarr"):
             raise ValueError("Retained real solver output is absent")
+        if verify_cold_import:
+            cold = result.get("cold_import_result", {})
+            if result.get("cold_archive_import") != "PASS" or cold.get("status") != "pass" \
+                    or any(cold.get(key) is not False for key in
+                        ("durable_session_storage_qualified", "physics_qualified",
+                         "reuse_LLG_FFT_qualified", "api_process_restarted")) \
+                    or any(cold.get(key) is not True for key in
+                        ("original_output_restored", "original_root_unavailable_during_import_and_reads",
+                         "old_request_scope_rejected")):
+                raise ValueError("Required cold import proof is absent or promotes durability")
+            if read_json(export / "cold-import-result.json") != cold \
+                    or cold.get("warm_request_scope") == cold.get("cold_request_scope"):
+                raise ValueError("Retained cold import evidence differs or scope did not rotate")
+            archive_path = export / "antenna-cold.fms"
+            archive = cold.get("archive", {})
+            if storage.is_link(archive_path) or not archive_path.is_file() \
+                    or not 32 < archive_path.stat().st_size <= 32 << 20 \
+                    or archive.get("bytes") != archive_path.stat().st_size \
+                    or archive.get("sha256") != sha(archive_path):
+                raise ValueError("Retained cold archive identity differs")
         receipt.update(state="warm_http_pass_resources_retained", startup_identity="PASS",
             gate_result_sha256=sha(export / "gate-result.json"),
             api_log_sha256=sha(export / "api.log"), solver_log_sha256=sha(export / "solver.log"),
-            native_canonical_bundle_redecoded=True, cold_archive_import="NOT VERIFIED")
+            native_canonical_bundle_redecoded=True,
+            cold_archive_import="PASS" if verify_cold_import else "NOT VERIFIED")
     except Exception as error:
         receipt["error"] = str(error)
         raise
@@ -411,15 +449,17 @@ if __name__ == "__main__":
     start_args = sub.add_parser("start")
     for flag in ("job-id", "commit", "source-digest", "native-snapshot-sha256"):
         start_args.add_argument("--" + flag, required=True)
+    start_args.add_argument("--verify-cold-import", action="store_true")
     sub.add_parser("observe").add_argument("--run-root", type=Path, required=True)
-    sub.add_parser("execute")
+    sub.add_parser("execute").add_argument("--verify-cold-import", action="store_true")
     args = parser.parse_args()
     if args.action == "execute":
-        sys.exit(execute_in_container())
+        sys.exit(execute_in_container(args.verify_cold_import))
     if args.repo_root is None:
         parser.error("host actions require --repo-root")
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     if args.action == "start":
-        start(args.repo_root, args.job_id, args.commit, args.source_digest, args.native_snapshot_sha256)
+        start(args.repo_root, args.job_id, args.commit, args.source_digest, args.native_snapshot_sha256,
+              args.verify_cold_import)
     else:
         print(json.dumps(observe(args.repo_root, args.run_root)))
