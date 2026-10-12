@@ -1098,6 +1098,15 @@
       "failed": 0,
       "receipt_sha256": "5f575404974019060c3dac4da5faa611d4a60d62fddc17a1ea6d279723c63236",
       "evidence": "Actual production budget helper/default/partial/negative atomicity and v20 C ABI rejection for auto/CPU/GPU; includes dedicated CTest, no device solve or scientific qualification."
+    },
+    {
+      "run_id": 38288674955,
+      "sha": "472257d74bcedd20d532b5f60809523c50e19b9a",
+      "conclusion": "success",
+      "scope": "complete_spectrum_scope_source_contracts",
+      "runner_passed": 1618,
+      "runner_ignored": 1,
+      "evidence": "Named legacy/v0.4 scope, complete IR/planner/application/runner, resolver/generic/single-k/path producers, integration callers and API/CLI binary compilation pass. API/UI behavior, native/GPU and science are separate unverified gates."
     }
   ]
 }

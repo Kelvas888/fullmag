@@ -390,7 +390,14 @@ fn exempt_declared_scene_asset_references(snapshot: &mut Value) -> Result<(), St
                 .get("material_ref")
                 .and_then(Value::as_str)
                 .is_some_and(|reference| material_ids.contains(reference));
-            if !has_declared_material {
+            // Match authoring: material belongs to magnetic physics. Auxiliary
+            // geometry may intentionally have no material; legacy omission of
+            // role still means magnet and must retain fail-closed references.
+            let is_magnet = object
+                .get("role")
+                .and_then(Value::as_str)
+                .unwrap_or("magnet") == "magnet";
+            if is_magnet && !has_declared_material {
                 return Err(format!(
                     "scene_document.objects[{index}].material_ref is not a declared material id"
                 ));
@@ -841,6 +848,30 @@ mod tests {
             json!(format!("objects/sha256/{hash}"));
         let inspection = inspect_live_snapshot(&serde_json::to_vec(&value).unwrap());
         assert!(inspection.object_refs.is_err());
+    }
+
+    #[test]
+    fn auxiliary_scene_objects_do_not_require_magnetic_material_refs() {
+        for role in ["airbox", "antenna"] {
+            for material in [None, Some(json!(""))] {
+                let mut value = snapshot();
+                let mut auxiliary = json!({"role": role});
+                if let Some(material) = material {
+                    auxiliary["material_ref"] = material;
+                }
+                value["scene_document"] = json!({
+                    "version": "scene.v2",
+                    "materials": [{"id": "mat:body"}],
+                    "objects": [{"role": "magnet", "material_ref": "mat:body"}, auxiliary]
+                });
+                let inspection = inspect_live_snapshot(&serde_json::to_vec(&value).unwrap());
+                assert!(inspection.object_refs.is_ok(), "{role}: {:?}", inspection.object_refs);
+                assert!(inspection.artifact_refs.is_ok());
+                value["scene_document"]["objects"][0]["material_ref"] = json!("mat:missing");
+                assert!(inspect_live_snapshot(&serde_json::to_vec(&value).unwrap()).object_refs.is_err(),
+                    "an auxiliary object must not exempt an invalid magnet reference");
+            }
+        }
     }
 
     #[test]

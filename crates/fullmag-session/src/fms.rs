@@ -4081,6 +4081,123 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compact_export_preserves_auxiliary_scene_snapshot_and_rejects_invalid_magnet_material() {
+        let (_directory, store, mut session, workspace, profile, base_documents) =
+            pack_fixture(SaveProfile::Compact);
+        session
+            .run_refs
+            .push("runs/run-export/run_manifest.json".to_string());
+        store.commit_run(&test_run("run-export")).unwrap();
+
+        let payload = b"scene snapshot CAS payload";
+        let object_ref = store.cas().put(payload).unwrap();
+        let make_snapshot = |scene_document: serde_json::Value| {
+            let mut snapshot: serde_json::Value =
+                serde_json::from_slice(&live_snapshot_bytes("run-export", &[], Some(&object_ref)))
+                    .unwrap();
+            snapshot["scene_document"] = scene_document;
+            serde_json::to_vec(&snapshot).unwrap()
+        };
+
+        for (role, material_ref) in [
+            ("airbox", None),
+            ("airbox", Some("")),
+            ("antenna", None),
+            ("antenna", Some("")),
+        ] {
+            let mut auxiliary = serde_json::json!({
+                "object_id": format!("{role}-object"),
+                "role": role,
+            });
+            if let Some(material_ref) = material_ref {
+                auxiliary["material_ref"] = serde_json::json!(material_ref);
+            }
+            let scene_document = serde_json::json!({
+                "version": "scene.v2",
+                "materials": [{"id": "mat:body"}],
+                "objects": [
+                    {
+                        "object_id": "body",
+                        "role": "magnet",
+                        "material_ref": "mat:body",
+                    },
+                    auxiliary,
+                ],
+            });
+            let mut documents = base_documents.clone();
+            documents.insert("ui_state.json".to_string(), b"{}".to_vec());
+            documents.insert(
+                "scene_document.json".to_string(),
+                serde_json::to_vec(&scene_document).unwrap(),
+            );
+            documents.insert(
+                "project/current_live_snapshot.json".to_string(),
+                make_snapshot(scene_document),
+            );
+
+            let mut output = Cursor::new(Vec::new());
+            pack_fms(
+                &mut output,
+                &store,
+                &session,
+                &workspace,
+                &profile,
+                &documents,
+                &PackOptions::default(),
+            )
+            .unwrap_or_else(|error| panic!("{role} material_ref {material_ref:?}: {error:#}"));
+            let archive = output.into_inner();
+            {
+                let mut zip = zip::ZipArchive::new(Cursor::new(&archive)).unwrap();
+                let name = format!("objects/sha256/{object_ref}");
+                let mut cas_object = zip.by_name(&name).unwrap();
+                let mut archived_payload = Vec::new();
+                cas_object.read_to_end(&mut archived_payload).unwrap();
+                assert_eq!(archived_payload, payload);
+            }
+            let preflight = preflight_fms(Cursor::new(archive), &[]).unwrap();
+            preflight.reachability.require_complete().unwrap();
+            assert!(preflight.reachability.object_refs.contains(&object_ref));
+        }
+
+        let invalid_scene_document = serde_json::json!({
+            "version": "scene.v2",
+            "materials": [{"id": "mat:body"}],
+            "objects": [{
+                "object_id": "body",
+                "role": "magnet",
+                "material_ref": "mat:missing",
+            }],
+        });
+        let mut documents = base_documents;
+        documents.insert("ui_state.json".to_string(), b"{}".to_vec());
+        documents.insert(
+            "scene_document.json".to_string(),
+            serde_json::to_vec(&invalid_scene_document).unwrap(),
+        );
+        documents.insert(
+            "project/current_live_snapshot.json".to_string(),
+            make_snapshot(invalid_scene_document),
+        );
+        let error = pack_fms(
+            Cursor::new(Vec::new()),
+            &store,
+            &session,
+            &workspace,
+            &profile,
+            &documents,
+            &PackOptions::default(),
+        )
+        .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic
+                .contains("scene_document.objects[0].material_ref is not a declared material id"),
+            "{diagnostic}"
+        );
+    }
+
 }
 
 #[cfg(test)]

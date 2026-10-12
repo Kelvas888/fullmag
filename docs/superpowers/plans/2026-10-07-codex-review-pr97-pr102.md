@@ -3558,7 +3558,7 @@ Nowych 9 uwag pozostaje do oceny względem aktualnych źródeł. Poniższy wpis 
 | Uwaga | Plik | Stan | Zakres dalszej oceny |
 |---|---|---|---|
 | [4247125949](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247125949) | `crates/fullmag-authoring/src/scene.rs` | implemented | Internal lowering dopuszcza Rust-authoring-validated analysis i wyklucza je z ProblemIR. GHA38258939384 SUCCESS62full scene lowering +84authoring/24subtests +3Rust. Unknown physics/study/interface guards zachowane. |
-| [4247310778](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310778) | `crates/fullmag-session/src/typed_documents.rs` | open_pending_source_review | Pomijaj materiał dla pomocniczych obiektów podczas eksportu FMS** |
+| [4247310778](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310778) | `crates/fullmag-session/src/typed_documents.rs` | implemented_pending_ci | Scanner zgodny z authoring: declared material wymagany tylko dla magnetu (missing role=legacy magnet). Airbox/antenna empty/missing materiał nie blokuje FMS. Test prawdziwych4pack_fms ZIP/CAS export +preflight/require_complete i negative invalid magnet; missing-artifact guards zachowane. Source parser PASS; hosted fullsession/FMS CI pending. |
 | [4247310803](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310803) | `scripts/local_runner/ui_dist/src/views/PoliciesView.js` | open_pending_source_review | Przenieś obsługę polityki retencji do kanonicznego UI** |
 | [4247310808](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310808) | `crates/fullmag-authoring/src/validation.rs` | open_pending_source_review | Waliduj adaptive względem zmaterializowanego profilu** |
 | [4247310817](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310817) | `apps/control-room/src/modules/inspector/panels/analysis-results/AnalysisResultInspectorPanel.tsx` | open_pending_source_review | Zachowaj branch tracking score w Inspectorze** |
@@ -3583,3 +3583,10 @@ GHA38246943509 na6265812: 10/12native Floquet CTest PASS, w tym `modal_eigen_bor
 GHA38258939384 na0ba13b: wszystkie3jobs SUCCESS, 62full scene lowering +84authoring +24subtests +3Rust. GHA38288433960 na554d3a:4/4dependency-free native CTest SUCCESS, poprawny v20 envelope w admission; brak dowodu urządzeniowego GPU solve.
 
 CLI direct dependency naprawiona w472257d74bcedd20d532b5f60809523c50e19b9a, lockfile zmieniony wyłącznie na remote o jedną zależność CLI; local lockfile bez zapisów. Pełny scope CI38288674955 uruchomiony; wynik pending. PR97 nadal OPEN; całość celu nie zakończona.
+
+
+### Scope source gate zakończona — GHA 38288674955
+
+Na472257d74bcedd20d532b5f60809523c50e19b9a cała bramka spectrum_scope SUCCESS: named0.3/0.4 wire, completeIR/planner/application/runner, cztery named producer/resolver regressions, integration caller check i API/CLI binaries. Runner1618PASS/1ignored. To dowodzi etapów IR/producers i kompilacji konsumentów; nie zamyka API/UI scope behavior, browser, runtime/GPU ani scientific qualification.
+
+Opt-in factor-phase logging opublikowano ebda5536f95993d86b76ba29f7bf172c3a248cf2; hosted CTest38290669920 uruchomiony na tym SHA, bez zmian tolerance/PC/acceptance. Dwie true-residual failures pozostają open.
