@@ -19599,3 +19599,45 @@ mod eigen_spectrum_quantity_validation_tests {
         assert_eq!(mixed, before);
     }
 }
+
+
+#[test]
+fn eigen_spectrum_distinct_scopes_plan_without_losing_authored_intent() {
+    use fullmag_ir::EigenSpectrumScopeIR;
+    let mut ir = branch_selector_fem_eigen_ir(None);
+    let outputs = vec![
+        fullmag_ir::OutputIR::EigenSpectrum {
+            quantity: "eigenfrequency".into(), scope: Some(EigenSpectrumScopeIR::PerSample),
+        },
+        fullmag_ir::OutputIR::EigenSpectrum {
+            quantity: "eigenfrequency".into(), scope: Some(EigenSpectrumScopeIR::Global),
+        },
+    ];
+    if let fullmag_ir::StudyIR::Eigenmodes { sampling, .. } = &mut ir.study {
+        sampling.outputs = outputs.clone();
+    }
+    let planned = plan(&ir).expect("distinct publication scopes must coexist in one eigenproblem");
+    assert_eq!(planned.output_plan.outputs, outputs);
+    let roundtrip: fullmag_ir::ExecutionPlanIR = serde_json::from_value(
+        serde_json::to_value(&planned).unwrap(),
+    ).unwrap();
+    assert_eq!(roundtrip.output_plan.outputs, outputs);
+}
+
+#[test]
+fn eigen_spectrum_same_effective_scope_remains_duplicate() {
+    use fullmag_ir::EigenSpectrumScopeIR;
+    for scopes in [
+        [None, Some(EigenSpectrumScopeIR::PerSample)],
+        [Some(EigenSpectrumScopeIR::Global), Some(EigenSpectrumScopeIR::Global)],
+    ] {
+        let mut ir = branch_selector_fem_eigen_ir(None);
+        if let fullmag_ir::StudyIR::Eigenmodes { sampling, .. } = &mut ir.study {
+            sampling.outputs = scopes.into_iter().map(|scope| fullmag_ir::OutputIR::EigenSpectrum {
+                quantity: "eigenfrequency".into(), scope,
+            }).collect();
+        }
+        let errors = plan(&ir).expect_err("duplicates of the same effective scope remain invalid");
+        assert!(errors.iter().any(|error| error.contains("declared more than once")), "{errors:?}");
+    }
+}

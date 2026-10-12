@@ -29,6 +29,11 @@ jobs:
           set -o pipefail
           cargo test --locked -p fullmag-ir --test ir_tests eigen_spectrum_scope_is_typed_and_legacy_wire_defaults_to_per_sample -- --exact --nocapture | tee "$RUNNER_TEMP/eigen-spectrum-scope.log"
           grep -F "eigen_spectrum_scope_is_typed_and_legacy_wire_defaults_to_per_sample ... ok" "$RUNNER_TEMP/eigen-spectrum-scope.log"
+      - name: Verify strict public v0.4 root and standalone scope wire adapters
+        run: |
+          set -o pipefail
+          cargo test --locked -p fullmag-ir --test study_v04 spectrum_scope_v04_root_and_standalone_preserve_authoring_intent -- --exact --nocapture | tee "$RUNNER_TEMP/eigen-spectrum-v04.log"
+          grep -F "spectrum_scope_v04_root_and_standalone_preserve_authoring_intent ... ok" "$RUNNER_TEMP/eigen-spectrum-v04.log"
       - name: Run complete IR and planner contracts
         run: cargo test --locked -p fullmag-ir -p fullmag-plan --no-fail-fast
       - name: Run complete application materialization contracts

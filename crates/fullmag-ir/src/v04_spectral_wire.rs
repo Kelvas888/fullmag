@@ -1,7 +1,7 @@
 use crate::eigen_contract::{KPointIR, SampleSelectorIR};
 use crate::study::{
     AutosaveFormatIR, AutosaveLayoutIR, EquilibriumSourceIR, FieldAutosaveIR, KSamplingIR,
-    OutputIR, SamplingIR, SamplingPeriodPolicyIR, StageAutosaveIR, TableAutosaveIR,
+    EigenSpectrumScopeIR, OutputIR, SamplingIR, SamplingPeriodPolicyIR, StageAutosaveIR, TableAutosaveIR,
 };
 use crate::FrequencyResponseOutputIR;
 use serde::de::{DeserializeSeed, SeqAccess, Visitor};
@@ -113,6 +113,8 @@ enum OutputV04Wire {
     },
     EigenSpectrum {
         quantity: String,
+        #[serde(default)]
+        scope: Option<EigenSpectrumScopeIR>,
     },
     EigenMode {
         field: String,
@@ -203,7 +205,7 @@ impl From<OutputV04Wire> for OutputIR {
                 every_seconds,
                 layer,
             },
-            OutputV04Wire::EigenSpectrum { quantity } => Self::EigenSpectrum { quantity },
+            OutputV04Wire::EigenSpectrum { quantity, scope } => Self::EigenSpectrum { quantity, scope },
             OutputV04Wire::EigenMode {
                 field,
                 all_modes,

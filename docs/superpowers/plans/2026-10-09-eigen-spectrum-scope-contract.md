@@ -44,3 +44,10 @@ Etap1 przywraca typed intent w IR: optional enum per_sample/global, brak pola w 
 Etap2 przenosi scope przez outputs selection i writer do distinct spectrum_output_scope w manifest. Nie kolidowac z Poisson certificate spectrum_scope=selected. V3 pozostaje nieusredniona kolekcja; per_sample wskazuje istniejace sample_id resource addresses, global adres kolekcji. Etap3: API/UI wybieraja zasob wedlug authored scope przez istniejacy typowany ResultsAPI; brak nowych bocznych fetch/endpoints. Etap4: actualPython->Rustparse->writer->manifest->Resultsresource regression, hostedRust+UI+browser proof. Sama metadata nie zamyka4060116242.
 
 Wszystkie etapy sa autoryzowana realizacja zaakceptowanej decyzji uzytkownika; sourcefoundation nie jest pelnym wdrozeniem ani kwalifikacja naukowa.
+
+
+### Korekta adaptera0.4 i deduplikacji
+
+CI38243351489 wykryl brak fieldscope w Self::EigenSpectrum w v04_spectral_wire. Ten adapter strict deny_unknown_fields, wiec przed naprawa scope w0.4 byl odrzucany, nie po cichu ignorowany jak w legacySerde. Dodano typed optional scope takze OutputV04Wire i bezstratne przekazanie doOutputIR. Regresje obejmuja standalone/root wszystkich5studytypow, historyczne omission, obie scope i malformed/selected/per_run rejection. Testy0.3 same nie byly wystarczajaca bramka.
+
+Planner deduplikacja quantity-only nie pozwalala dwom scope dotrzec dowritera. Klucz teraz uwzglednia effective scope: per_sample+global legalne, None+explicitper_sample nadalduplicate, global+global duplicate. ActualProblemIR->plan->ExecutionPlanIR roundtrip zachowuje oba authoredoutputs. Nie oznacza to jeszcze writer/API/UI wdrozenia.

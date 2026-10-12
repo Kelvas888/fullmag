@@ -1947,3 +1947,28 @@ fn spectrum_quantity_v04_standalone_and_root_validate_all_five_studies() {
         }
     }
 }
+
+
+#[test]
+fn spectrum_scope_v04_root_and_standalone_preserve_authoring_intent() {
+    for base in all_sampling_v04_studies() {
+        for scope in [None, Some("per_sample"), Some("global")] {
+            let mut output = json!({"kind": "eigen_spectrum", "quantity": "eigenfrequency"});
+            if let Some(scope) = scope { output["scope"] = json!(scope); }
+            let mut study = base.clone();
+            study["sampling"]["outputs"] = json!([output.clone()]);
+            let standalone: StudyIRV04 = serde_json::from_value(study.clone()).unwrap();
+            assert_eq!(serde_json::to_value(&standalone).unwrap()["sampling"]["outputs"][0], output);
+            let root: ProblemIRV04 = serde_json::from_value(problem_value_with_study(study)).unwrap();
+            assert_eq!(serde_json::to_value(&root).unwrap()["study"]["sampling"]["outputs"][0], output);
+        }
+        for scope in [json!("per_run"), json!("selected"), json!(true), json!(3)] {
+            let mut study = base.clone();
+            study["sampling"]["outputs"] = json!([{
+                "kind": "eigen_spectrum", "quantity": "eigenfrequency", "scope": scope,
+            }]);
+            assert!(serde_json::from_value::<StudyIRV04>(study.clone()).is_err());
+            assert!(serde_json::from_value::<ProblemIRV04>(problem_value_with_study(study)).is_err());
+        }
+    }
+}

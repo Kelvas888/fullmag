@@ -1091,3 +1091,6 @@ GHA38240680441 SUCCESS:4actualHTTPdefinition tests,83session,28resultdatasets,3p
 Source scan100constructors, missingfields0 i partialpatterns0. Rustfmtcheck wykazal dawne formatdiffs; nie wykonano masowego formatowania ani lokalnych testow/buildow. Nowy hosted gate: IR+planner+application+runner suites oraz integration callers/API/CLI compile. GHA pending. Manifest/API/UI jeszcze nie korzystaja ze scope; uwaga4060116242 nadal otwarta, stage1 nie jest pelnym wdrozeniem.
 
 NativeFEM ma wlasne writers eigen_output.rs oraz eigen_path_manifest.rs, obok genericmodalmanifest. Stage2 musi objac oba. MultipleSaveSpectrum outputs moga prosic o obie scope; nie wybierac arbitralnie jednej. Oddzielic publication output scope od numerical spectrum_scope=selected.
+
+
+CI38243351489 foundation FAIL przedtestami: Self constructor w strictv04adapter pominięty w source scanOutputIRqualified. Poprawka obejmuje sam typedwirefield i converter, nie tylko scopeNone. Publicv04 standalone/root tests wszystkich5studytypow dodane. Plannerkey uwzglednia scope z legacydefault, actualplan tests zachowuja distinct scopes i rejectduplicates. Source parser PASS; noweHosted gates wymagane.
