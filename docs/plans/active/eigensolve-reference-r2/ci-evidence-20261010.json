@@ -900,6 +900,27 @@
       "tests_passed": 56,
       "log_sha256": "ba3f6e7c923afdf989fbc90284944762bd4d66ac2437fd3ac01056efd1746228",
       "scientific_qualification": "NOT VERIFIED"
+    },
+    {
+      "run_id": 38232017811,
+      "sha": "b2dfb307980271deffc977f4f491e8fe0a691fc5",
+      "conclusion": "success",
+      "scope": "Python_Eigenmodes_solver_policy_actual_script_to_IR",
+      "log_sha256": "7823df524f08dd198881e582a9a9981cb0982c561bf5d2fccafd87590098d959",
+      "qualification_claimed": false,
+      "tests_passed": 84,
+      "subtests_passed": 24,
+      "scientific_qualification": "NOT VERIFIED"
+    },
+    {
+      "run_id": 38232241407,
+      "sha": "ea5d1bf9d83972bbb9a3c6a58b7894a9ba39a121",
+      "conclusion": "success",
+      "scope": "Schur_R4_unique_scientific_source_maps",
+      "log_sha256": "e557215f886eff169fa9b6af9fda3c2fa6e4d38aca35086f5e5492ec8dcf94df",
+      "qualification_claimed": false,
+      "source_maps_validated": 2,
+      "native_runtime": "NOT VERIFIED"
     }
   ]
 }

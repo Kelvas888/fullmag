@@ -1001,3 +1001,10 @@ Source1c398528a762ced690fb09cf00082619c4031bc8:38154212824 SUCCESS (1616runner t
 ## Source maps Schur i R4
 
 4242305951/5957: zastąpiono nieistniejący native test przez FrequencyWindowPublishesSelectedSearchStabilityWithoutCount oraz voiddestroy przez istniejące bool destroy_reusable_floquet_window_state_locked. R4 mapuje unikalny produkcyjny pathowner execute_fem_eigen_path_with_producer_identity_and_parallel_policy zamiast dwóch lokalnych solve_single_k. Zaktualizowano corresponding source-code indices w obu stronach. Dwa standalone source validators PASS; dedykowany hosted gate nie kompiluje testów i nie deklaruje runtime/science.
+
+
+## Native rowfault: niedostępność nie jest false-pomiarem
+
+Real JSON38153278619 ma *_available:false oraz values:null, statusunavailable. Independent source review potwierdził return z borrowed rowrestore przed VecEqual; nie można wywoływać dalszego PETSc na quarantinedgraph tylko dla testu. Fixture teraz wymaga dokładnie tej dostępności w last_true_probe.candidate_operator_diagnostic.live_pc_observation. Scoped negativeconsumer odrzuca missingfields,false/true,true/true i obce/nestedobjects; restoreordering, distinct primary/cleanup errors oraz unsafebefore/afterdestroy zachowane. Positive true/true i recoverable freshLU invariance assertions zachowane. Patternfixture ma dodatkowe failure-only bounded diagnostics, PASScriteria bez zmian. Production/safety/tolerances/operator bez zmian. Root+independent SOURCE review PASS, CPPcompile/runtime pendingGHA. Brak dowodu niezmienności phi po hardfault oraz nauka nadal NOT VERIFIED.
+
+Potwierdzone GHA:38232017811 SUCCESS (84tests,24subtests) dla Python solver_policy;38232241407 SUCCESS dla Schur/R4 maps.

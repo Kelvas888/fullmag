@@ -7512,6 +7512,183 @@ void modal_nonzero_k_floquet_bloch_payload_with_dynamic_demag_k_is_admitted()
     fullmag_fem_frequency_domain_result_destroy(&nearest_result);
 }
 
+std::string copy_json_object(const char *object_begin)
+{
+    if (object_begin == nullptr || *object_begin != '{') {
+        return std::string{};
+    }
+    std::size_t brace_depth = 0u;
+    bool inside_string = false;
+    bool escaped = false;
+    for (const char *cursor = object_begin; *cursor != '\0'; ++cursor) {
+        if (inside_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (*cursor == '\\') {
+                escaped = true;
+            } else if (*cursor == '"') {
+                inside_string = false;
+            }
+            continue;
+        }
+        if (*cursor == '"') {
+            inside_string = true;
+        } else if (*cursor == '{') {
+            ++brace_depth;
+        } else if (*cursor == '}') {
+            if (brace_depth == 0u) {
+                return std::string{};
+            }
+            --brace_depth;
+            if (brace_depth == 0u) {
+                return std::string(object_begin, cursor + 1);
+            }
+        }
+    }
+    return std::string{};
+}
+
+// These test consumers read direct members only, so another diagnostic object
+// cannot satisfy an assertion for the last true-probe observation.
+const char *json_member_after_key(const char *json, const char *key)
+{
+    if (json == nullptr || *json != '{' || key == nullptr || *key == '\0') {
+        return nullptr;
+    }
+    std::size_t depth = 0u;
+    bool inside_string = false;
+    bool escaped = false;
+    for (const char *cursor = json; *cursor != '\0'; ++cursor) {
+        if (inside_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (*cursor == '\\') {
+                escaped = true;
+            } else if (*cursor == '"') {
+                inside_string = false;
+            }
+            continue;
+        }
+        if (*cursor == '"') {
+            if (depth == 1u && std::strncmp(cursor, key, std::strlen(key)) == 0) {
+                const char *value = cursor + std::strlen(key);
+                while (*value == ' ' || *value == '\t' ||
+                       *value == '\r' || *value == '\n') {
+                    ++value;
+                }
+                return value;
+            }
+            inside_string = true;
+        } else if (*cursor == '{' || *cursor == '[') {
+            ++depth;
+        } else if (*cursor == '}' || *cursor == ']') {
+            if (depth == 0u || --depth == 0u) {
+                return nullptr;
+            }
+        }
+    }
+    return nullptr;
+}
+
+std::string json_object_after_key(const char *json, const char *key)
+{
+    return copy_json_object(json_member_after_key(json, key));
+}
+
+bool json_member_has_literal(const char *json, const char *key, const char *literal)
+{
+    const char *value = json_member_after_key(json, key);
+    if (value == nullptr || std::strncmp(value, literal, std::strlen(literal)) != 0) {
+        return false;
+    }
+    value += std::strlen(literal);
+    while (*value == ' ' || *value == '\t' || *value == '\r' || *value == '\n') {
+        ++value;
+    }
+    return *value == ',' || *value == '}';
+}
+
+std::string last_true_probe_live_pc_observation(const char *diagnostics)
+{
+    const std::string failure = json_object_after_key(
+        diagnostics, "\"shifted_ksp_failure_probe\":");
+    const std::string probe = json_object_after_key(
+        failure.c_str(), "\"last_true_probe\":");
+    const std::string candidate = json_object_after_key(
+        probe.c_str(), "\"candidate_operator_diagnostic\":");
+    return json_object_after_key(candidate.c_str(), "\"live_pc_observation\":");
+}
+
+bool row_fault_phi_invariance_unavailable(const char *observation, bool rhs)
+{
+    return json_member_has_literal(observation,
+               rhs ? "\"production_phi_rhs_unchanged_after_observation_available\":"
+                   : "\"production_phi_solution_unchanged_after_observation_available\":",
+               "false") &&
+        json_member_has_literal(observation,
+               rhs ? "\"production_phi_rhs_unchanged_after_observation\":"
+                   : "\"production_phi_solution_unchanged_after_observation\":",
+               "null");
+}
+
+bool row_fault_live_pc_evidence_unavailable(const char *diagnostics)
+{
+    const std::string observation = last_true_probe_live_pc_observation(diagnostics);
+    return json_member_has_literal(observation.c_str(), "\"status\":", "\"unavailable\"") &&
+        json_member_has_literal(observation.c_str(), "\"available\":", "false") &&
+        row_fault_phi_invariance_unavailable(observation.c_str(), true) &&
+        row_fault_phi_invariance_unavailable(observation.c_str(), false);
+}
+
+void verify_row_fault_unavailable_json_consumer()
+{
+    const auto wrap = [](const std::string &observation) {
+        return std::string("{\"shifted_ksp_failure_probe\":{\"last_true_probe\":{") +
+            "\"candidate_operator_diagnostic\":{\"live_pc_observation\":" +
+            observation + "}}}}";
+    };
+    const std::string rhs =
+        "\"production_phi_rhs_unchanged_after_observation_available\":false,"
+        "\"production_phi_rhs_unchanged_after_observation\":null";
+    const std::string solution =
+        "\"production_phi_solution_unchanged_after_observation_available\":false,"
+        "\"production_phi_solution_unchanged_after_observation\":null";
+    const std::string unavailable =
+        "{\"status\":\"unavailable\",\"available\":false," + rhs + "," + solution + "}";
+    check(row_fault_live_pc_evidence_unavailable(wrap(unavailable).c_str()),
+          "row-fault consumer accepts accurately unavailable phi evidence in the last true probe");
+    for (const std::string &pair : {rhs, solution}) {
+        const std::size_t pair_begin = unavailable.find(pair);
+        const std::size_t separator = pair.find(',');
+        for (const std::string &field : {
+                 pair.substr(0u, separator), pair.substr(separator + 1u)}) {
+            std::string missing = unavailable;
+            missing.replace(missing.find(field), field.size(), "\"omitted_phi_field\":null");
+            check(!row_fault_live_pc_evidence_unavailable(wrap(missing).c_str()),
+                  "row-fault consumer rejects each missing phi invariant field");
+        }
+        for (const char *available : {"false", "true"}) {
+            std::string fabricated_pair = pair;
+            fabricated_pair.replace(fabricated_pair.find("false"), 5u, available);
+            fabricated_pair.replace(fabricated_pair.find("null"), 4u, "true");
+            std::string fabricated = unavailable;
+            fabricated.replace(pair_begin, pair.size(), fabricated_pair);
+            check(!row_fault_live_pc_evidence_unavailable(wrap(fabricated).c_str()),
+                  "row-fault consumer rejects unavailable true values and fabricated measured invariance");
+        }
+    }
+    const std::string empty_observation = "{\"status\":\"unavailable\",\"available\":false}";
+    const std::string foreign_sibling = wrap(empty_observation);
+    const std::string outside_scope = foreign_sibling.substr(0u, foreign_sibling.size() - 1u) +
+        ",\"foreign_observation\":" + unavailable + "}";
+    check(!row_fault_live_pc_evidence_unavailable(outside_scope.c_str()),
+          "row-fault consumer rejects phi evidence outside the exact last true-probe scope");
+    const std::string nested_foreign =
+        "{\"status\":\"unavailable\",\"available\":false,\"foreign\":" + unavailable + "}";
+    check(!row_fault_live_pc_evidence_unavailable(wrap(nested_foreign).c_str()),
+          "row-fault consumer rejects phi evidence in a nested foreign object");
+}
+
 void floquet_live_shift_configuration_uses_native_count_fixture()
 {
 #if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
@@ -7565,57 +7742,6 @@ void floquet_live_shift_configuration_uses_native_count_fixture()
             return std::string("<null>");
         }
         return std::string(value, std::min(std::strlen(value), maximum));
-    };
-    const auto copy_json_object = [](const char *object_begin) {
-        if (object_begin == nullptr || *object_begin != '{') {
-            return std::string{};
-        }
-        std::size_t brace_depth = 0u;
-        bool inside_string = false;
-        bool escaped = false;
-        for (const char *cursor = object_begin; *cursor != '\0'; ++cursor) {
-            if (inside_string) {
-                if (escaped) {
-                    escaped = false;
-                } else if (*cursor == '\\') {
-                    escaped = true;
-                } else if (*cursor == '"') {
-                    inside_string = false;
-                }
-                continue;
-            }
-            if (*cursor == '"') {
-                inside_string = true;
-            } else if (*cursor == '{') {
-                ++brace_depth;
-            } else if (*cursor == '}') {
-                if (brace_depth == 0u) {
-                    return std::string{};
-                }
-                --brace_depth;
-                if (brace_depth == 0u) {
-                    return std::string(object_begin, cursor + 1);
-                }
-            }
-        }
-        return std::string{};
-    };
-    const auto json_object_after_key = [&copy_json_object](
-                                           const char *json,
-                                           const char *key) {
-        if (json == nullptr || key == nullptr || key[0] == '\0') {
-            return std::string{};
-        }
-        const char *key_position = std::strstr(json, key);
-        if (key_position == nullptr) {
-            return std::string{};
-        }
-        const char *object_begin = key_position + std::strlen(key);
-        while (*object_begin == ' ' || *object_begin == '\t' ||
-               *object_begin == '\r' || *object_begin == '\n') {
-            ++object_begin;
-        }
-        return copy_json_object(object_begin);
     };
     const int raw_status = static_cast<int>(result.status);
     const std::string error_snapshot = bounded_text(result.error_message, 512u);
@@ -7875,15 +8001,26 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
             contains(
                 borrowed_observation,
                 "\"bounded_pattern_fixture_structural_pattern_match_available\":true,\"bounded_pattern_fixture_structural_pattern_match\":false");
-        check(fixture_result.status == FULLMAG_FEM_FD_SOLVE_ERROR &&
-                  contains(fixture_result.diagnostics_json,
-                           "\"full_explicit_entry_comparison_available\":true") &&
-                  actual_pmat_counts_are_nonzero &&
-                  known_pattern_fixture_is_distinguished &&
-                  contains(
-                      borrowed_observation,
-                      "\"cleanup_attempted\":true,\"cleanup_succeeded_available\":true,\"cleanup_succeeded\":true") &&
-                  contains(fixture_result.result_json, "\"status\":\"solve_error\""),
+        const bool pattern_fixture_contract_observed =
+            fixture_result.status == FULLMAG_FEM_FD_SOLVE_ERROR &&
+            contains(fixture_result.diagnostics_json,
+                     "\"full_explicit_entry_comparison_available\":true") &&
+            actual_pmat_counts_are_nonzero &&
+            known_pattern_fixture_is_distinguished &&
+            contains(
+                borrowed_observation,
+                "\"cleanup_attempted\":true,\"cleanup_succeeded_available\":true,\"cleanup_succeeded\":true") &&
+            contains(fixture_result.result_json, "\"status\":\"solve_error\"");
+        if (!pattern_fixture_contract_observed) {
+            std::fprintf(stderr,
+                         "FAIL-DIAGNOSTICS: pattern_fixture status=%d actual_pmat_counts_are_nonzero=%d "
+                         "known_pattern_fixture_is_distinguished=%d borrowed_observation=%.16384s\n",
+                         static_cast<int>(fixture_result.status),
+                         actual_pmat_counts_are_nonzero ? 1 : 0,
+                         known_pattern_fixture_is_distinguished ? 1 : 0,
+                         borrowed_observation != nullptr ? borrowed_observation : "null");
+        }
+        check(pattern_fixture_contract_observed,
               "owned 2x2 SeqAIJ fixture detects the known 3/4-entry and structural-pattern mismatch without replacing actual-Pmat evidence");
         fullmag_fem_frequency_domain_result_destroy(&fixture_result);
         std::printf(
@@ -7891,6 +8028,7 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
         return;
     }
     if (borrowed_pmat_row_restore_fault_only || borrowed_pmat_primary_cleanup_fault_only) {
+        verify_row_fault_unavailable_json_consumer();
         const ScopedFloquetDiagnosticEnvironment diagnostic_environment{};
         SavedEnvironmentValue fault_environment{
             "FULLMAG_FLOQUET_LIVE_PC_DIAGNOSTIC_FAULT"};
@@ -7910,6 +8048,12 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
         const char *borrowed_observation = fault_result.diagnostics_json != nullptr
             ? std::strstr(fault_result.diagnostics_json, "\"borrowed_pmat_copy\":{")
             : nullptr;
+        const std::string row_fault_live_observation =
+            last_true_probe_live_pc_observation(fault_result.diagnostics_json);
+        // The hard row-restore failure aborts before VecEqual. Do not claim
+        // measured post-fault integrity or make PETSc calls on the unsafe graph.
+        const bool row_fault_live_evidence_unavailable =
+            row_fault_live_pc_evidence_unavailable(fault_result.diagnostics_json);
         const bool row_attempt_order_observed =
             borrowed_pmat_primary_cleanup_fault_only
                 ? contains(
@@ -7947,12 +8091,9 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
                      "\"cleanup_error_code_available\":true") &&
             contains(fault_result.diagnostics_json,
                      "\"reason\":\"matrix_row_restore_failed_diagnostic_graph_quarantined\"") &&
-            contains(fault_result.diagnostics_json,
-                     "\"production_phi_rhs_unchanged_after_observation_available\":true,\"production_phi_rhs_unchanged_after_observation\":true") &&
-            contains(fault_result.diagnostics_json,
-                     "\"production_phi_solution_unchanged_after_observation_available\":true,\"production_phi_solution_unchanged_after_observation\":true") &&
+            row_fault_live_evidence_unavailable &&
             contains(fault_result.result_json, "\"status\":\"solve_error\"");
-        const std::array<std::pair<bool, const char *>, 13> row_contract_checks{{
+        const std::array<std::pair<bool, const char *>, 14> row_contract_checks{{
             {fault_result.status == FULLMAG_FEM_FD_SOLVE_ERROR, "status_solve_error"},
             {contains(fault_result.diagnostics_json,
                       "\"shifted_ksp_failure_probe\":{\"schema_version\":\"shifted_ksp_failure_probe.v1\""),
@@ -7978,12 +8119,11 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
             {contains(fault_result.diagnostics_json,
                       "\"reason\":\"matrix_row_restore_failed_diagnostic_graph_quarantined\""),
              "diagnostic_graph_quarantine_reason"},
-            {contains(fault_result.diagnostics_json,
-                      "\"production_phi_rhs_unchanged_after_observation_available\":true,\"production_phi_rhs_unchanged_after_observation\":true"),
-             "production_phi_rhs_unchanged"},
-            {contains(fault_result.diagnostics_json,
-                      "\"production_phi_solution_unchanged_after_observation_available\":true,\"production_phi_solution_unchanged_after_observation\":true"),
-             "production_phi_solution_unchanged"},
+            {row_fault_live_evidence_unavailable, "scoped_live_pc_evidence_unavailable"},
+            {row_fault_phi_invariance_unavailable(row_fault_live_observation.c_str(), true),
+             "production_phi_rhs_invariance_unavailable"},
+            {row_fault_phi_invariance_unavailable(row_fault_live_observation.c_str(), false),
+             "production_phi_solution_invariance_unavailable"},
             {contains(fault_result.result_json, "\"status\":\"solve_error\""),
              "result_status_solve_error"},
         }};
