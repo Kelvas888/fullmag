@@ -594,7 +594,10 @@ fn select_eigen_outputs_with_planned_scope(
             .any(|sample_index| !available.actual_sample_ids.contains(sample_index));
         if !targets_uncomputed_planned_sample {
             for requested_index in &requested_indices {
-                if !available.raw_mode_ids.contains(requested_index) {
+                if !available.mode_ids.iter().any(|mode_id| {
+                    sample_ids.contains(&mode_id.sample_index)
+                        && mode_id.raw_mode_index == *requested_index
+                }) {
                     return Err(OutputSelectionError::UnknownRawModeIndex(
                         u32::try_from(*requested_index).unwrap_or(u32::MAX),
                     ));
@@ -685,7 +688,6 @@ struct AvailableModes<'a> {
     selectable_sample_ids: BTreeSet<usize>,
     sample_labels: BTreeMap<String, BTreeSet<usize>>,
     mode_ids: BTreeSet<SampleModeId>,
-    raw_mode_ids: BTreeSet<usize>,
     branch_ids: BTreeSet<usize>,
 }
 
@@ -699,7 +701,6 @@ impl<'a> AvailableModes<'a> {
         let mut actual_sample_ids = BTreeSet::new();
         let mut sample_labels = BTreeMap::<String, BTreeSet<usize>>::new();
         let mut mode_ids = BTreeSet::new();
-        let mut raw_mode_ids = BTreeSet::new();
         let mut branch_ids = BTreeSet::new();
 
         for sample in &path_result.samples {
@@ -724,7 +725,6 @@ impl<'a> AvailableModes<'a> {
                         raw_mode_index: mode.raw_mode_index,
                     });
                 }
-                raw_mode_ids.insert(mode.raw_mode_index);
                 if let Some(branch_id) = mode.branch_id {
                     branch_ids.insert(branch_id);
                 }
@@ -800,7 +800,6 @@ impl<'a> AvailableModes<'a> {
             selectable_sample_ids,
             sample_labels,
             mode_ids,
-            raw_mode_ids,
             branch_ids,
         })
     }
@@ -1606,34 +1605,28 @@ mod tests {
     }
 
     #[test]
-    fn valid_sample_with_no_matching_mode_produces_an_explicit_empty_selection() {
-        let selection = select_eigen_outputs(
-            &result(),
-            &[OutputIR::EigenMode {
-                field: "mode".to_string(),
-                all_modes: false,
-                indices: vec![9],
-                branches: vec![],
-                sample_selector: Some(SampleSelectorIR {
-                    sample_indices: vec![20],
-                    sample_labels: vec![],
-                }),
-            }],
-        )
-        .expect("the sample itself is valid even though it has no requested mode");
-
-        assert!(selection.field_mode_ids().is_empty());
-        assert_eq!(
-            selection
-                .selected_sample_ids()
-                .iter()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![20]
-        );
-        assert!(selection
-            .field_mode_ids_for_field("mode")
-            .is_some_and(|mode_ids| mode_ids.is_empty()));
+    fn raw_mode_index_must_exist_in_selected_samples() {
+        for sample_selector in [
+            SampleSelectorIR { sample_indices: vec![20], sample_labels: vec![] },
+            SampleSelectorIR { sample_indices: vec![], sample_labels: vec!["X".into()] },
+        ] {
+            let request = OutputIR::EigenMode {
+                field: "mode".into(), all_modes: false, indices: vec![9],
+                branches: vec![], sample_selector: Some(sample_selector),
+            };
+            assert_eq!(select_eigen_outputs(&result(), &[request]),
+                Err(OutputSelectionError::UnknownRawModeIndex(9)));
+        }
+        // Multiple selected samples form a union, including sparse returned IDs.
+        // A mode need not occur at every k; absent points are not fabricated.
+        let selection = select_eigen_outputs(&result(), &[OutputIR::EigenMode {
+            field: "mode".into(), all_modes: false, indices: vec![9], branches: vec![],
+            sample_selector: Some(SampleSelectorIR {
+                sample_indices: vec![10, 20], sample_labels: vec![],
+            }),
+        }]).unwrap();
+        assert_eq!(selection.field_mode_ids(), &[SampleModeId::new(10, 9)].into_iter().collect());
+        assert!(!selection.contains_field_mode(20, 9));
     }
 
     #[test]

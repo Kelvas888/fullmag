@@ -1144,6 +1144,16 @@
       "python_passed": 84,
       "subtests_passed": 24,
       "evidence": "Full authoring and shared strict-map regressions pass; UI/runtime/science remain separate gates."
+    },
+    {
+      "run_id": 38296613349,
+      "sha": "a484daee9ba8716013ae9a9d46d4798f4bf52aa6",
+      "conclusion": "success",
+      "scope": "positive_phasor_alias_ui_source_contracts",
+      "passed": 244,
+      "test_files": 21,
+      "react_doctor_score": 85,
+      "evidence": "Published positive phasor alias regressions, full frontend typecheck, architecture gate and React Doctor pass; browser/WebGL and scientific runtime unverified."
     }
   ]
 }
