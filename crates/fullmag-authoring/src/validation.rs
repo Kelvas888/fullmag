@@ -3691,13 +3691,14 @@ mod tests {
         profile.defaults.backend = FieldPatch::Value(BackendTarget::Fem);
         profile.defaults.device = FieldPatch::Value(ExecutionDevice::Cpu);
         scene.study.execution_layers[0].request.device = FieldPatch::Value(ExecutionDevice::Auto);
-        let error = validate_scene_document_for_authoring(&scene).expect_err(
-            "adaptive admission must preserve canonical explicit-intent weakening rejection",
-        );
-        assert!(
-            error.message.contains("materialization is invalid"),
-            "{error}"
-        );
+        let error = validate_scene_document_for_authoring(&scene)
+            .expect_err("a Study layer requesting Auto is not explicit FEM CPU adaptive intent");
+        assert!(error.message.contains("unsupported parallel_execution realization"), "{error}");
+        scene.study.execution_layers[0].origin.kind = ExecutionOriginKindIR::Submit;
+        scene.study.execution_layers[0].origin.location = "submit.adaptive".into();
+        let error = validate_scene_document_for_authoring(&scene)
+            .expect_err("Submit must not weaken a pinned explicit CPU profile to Auto");
+        assert!(error.message.contains("materialization is invalid"), "{error}");
     }
 
     #[test]
