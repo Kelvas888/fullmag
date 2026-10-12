@@ -194,9 +194,13 @@ export async function recordAuthoringMutationHistory(
       committedRevision: afterRevision,
       label,
     });
-  } catch {
+  } catch (error) {
     // History is an observability layer; a valid authoring ACK must survive a
-    // malformed or unavailable local history snapshot.
+    // malformed or unavailable local history snapshot. We surface degradation in diagnostics.
+    console.warn?.(
+      "[authoringHistory] Failed to record mutation history entry (history degraded):",
+      error,
+    );
   }
 }
 
