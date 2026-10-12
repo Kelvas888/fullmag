@@ -199,11 +199,12 @@ describe("frequencyDomainChartModels", () => {
     });
   });
 
-  it("does not infer field availability from an unconfirmed mode field id", () => {
+  it("honors explicitly unavailable fields even when a durable field id exists", () => {
     const model = buildEigenSpectrumChartModel(
       jsonResource({
         modes: [{
           frequency_hz: 2.5e9,
+          mode_field_available: false,
           mode_field_id: "analysis:eigen:sample-0000:mode-0001",
           raw_mode_index: 1,
           sample_index: 0,
