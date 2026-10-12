@@ -63,3 +63,8 @@ Kompilacja wykazała duplikat `EigenSpectrumScopeIR` w `study` i `eigen_contract
 Wspólny resolver zbiera zakresy wyłącznie z rzeczywistych `EigenSpectrum` outputs. Legacy omission daje `per_sample`; dwa zakresy są zachowane w stabilnej kolejności. Manifesty generic, native single-k i native path otrzymują addytywne `spectrum_output_scopes`. Pusta lista oznacza brak jawnego żądania spektrum, nawet gdy dyspersja potrzebuje pomocniczego artefaktu widma. Certyfikat numeryczny `spectrum_scope=selected`, selekcja modów i ABI pozostają odrębne.
 
 Regresje uruchamiane wyłącznie w GHA sprawdzają resolver, rzeczywistych trzech producentów, identyfikatory próbek niezerowego k, niezmienione ścieżki modów i bajty artefaktów single-k. Stan: implementacja źródłowa; wynik nowego CI pending. To nie zamyka obsługi API/UI ani komentarza 4060116242; osobno adresowalne zasoby per_sample i kolekcja global wymagają następnego etapu.
+
+
+### Pełna bramka planera — GHA 38246536065
+
+Kompilacja zakresów i oba named wire tests przeszły. Pełny planner: 522 PASS, 2 FAIL. Obydwie porażki były w istniejących fixture’ach: unknown StudyStepKind podawał scalar zamiast kanonicznego tagged object, a test zakazu łączenia synthetic K0 z dispersion_validation miał tylko dwie próbki scenariusza, więc zatrzymywał się na wcześniejszym wymaganiu co najmniej trzech. Skorygowano wejścia testowe, zachowując produkcyjne reguły i dokładne wymaganie docelowego odrzucenia; dodano pełne reasons do komunikatu failure. Nowy pełny CI pending; wynik nie stanowi kwalifikacji fizycznej.

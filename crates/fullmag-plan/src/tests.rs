@@ -11512,8 +11512,8 @@ fn fem_eigen_allows_k0_kittel_synthetic_demag_factor_floquet_path() {
             "max_relative_error": 0.10,
             "frequency_window_hz": {"min": 0.0, "max": 15.0e9},
             "scenarios": [
-                {"geometry": "backward_volume", "branch_id": "branch_0", "sample_indices": [0, 1]},
-                {"geometry": "damon_eshbach", "branch_id": "branch_0", "sample_indices": [0, 1]}
+                {"geometry": "backward_volume", "branch_id": "branch_0", "sample_indices": [0, 1, 2]},
+                {"geometry": "damon_eshbach", "branch_id": "branch_0", "sample_indices": [0, 1, 2]}
             ]
         }),
     );
@@ -11522,7 +11522,7 @@ fn fem_eigen_allows_k0_kittel_synthetic_demag_factor_floquet_path() {
     assert!(err
         .reasons
         .iter()
-        .any(|reason| { reason.contains("dispersion_validation cannot be combined") }));
+        .any(|reason| { reason.contains("dispersion_validation cannot be combined") }), "{err:?}");
 }
 
 fn k0_periodic_airbox_fem_eigen_ir() -> ProblemIR {
