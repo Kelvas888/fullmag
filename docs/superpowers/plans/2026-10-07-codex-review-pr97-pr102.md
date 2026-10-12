@@ -3549,3 +3549,28 @@ Autorytatywny PR97 OPEN na00392a4bacd31a8e378ac1e05a44bc23f2730e85; PR102 CLOSED
 | [4246863076](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4246863076) / #97 | `crates/fullmag-api/src/router_v2/handlers/analysis/frequency_domain.rs` | duplicate_open | Powiazana otwarta uwaga 4225198873. Nie jest uznana za naprawiona. |
 | [4246863082](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4246863082) / #97 | `crates/fullmag-api/src/router_v2/handlers/analysis/results.rs` | duplicate_open | Powiazana otwarta uwaga 4240898359. Nie jest uznana za naprawiona. |
 | [4246863087](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4246863087) / #97 | `apps/runner-console/src/api.js` | duplicate_open | Powiazana otwarta uwaga 4061898648. Nie jest uznana za naprawiona. |
+
+
+## Odświeżenie PR97 — 12.10.2026: 363 komentarze inline
+
+Nowych 9 uwag pozostaje do oceny względem aktualnych źródeł. Poniższy wpis nie oznacza ich naprawy. Stan PR97 OPEN, PR102 CLOSED potwierdzony przez GitHub.
+
+| Uwaga | Plik | Stan | Zakres dalszej oceny |
+|---|---|---|---|
+| [4247125949](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247125949) | `crates/fullmag-authoring/src/scene.rs` | open_pending_source_review | Pomiń `analysis` podczas loweringu sceny** |
+| [4247310778](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310778) | `crates/fullmag-session/src/typed_documents.rs` | open_pending_source_review | Pomijaj materiał dla pomocniczych obiektów podczas eksportu FMS** |
+| [4247310803](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310803) | `scripts/local_runner/ui_dist/src/views/PoliciesView.js` | open_pending_source_review | Przenieś obsługę polityki retencji do kanonicznego UI** |
+| [4247310808](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310808) | `crates/fullmag-authoring/src/validation.rs` | open_pending_source_review | Waliduj adaptive względem zmaterializowanego profilu** |
+| [4247310817](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310817) | `apps/control-room/src/modules/inspector/panels/analysis-results/AnalysisResultInspectorPanel.tsx` | open_pending_source_review | Zachowaj branch tracking score w Inspectorze** |
+| [4247310830](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310830) | `apps/control-room/src/modules/inspector/panels/StudyInspectorPanel.tsx` | open_pending_source_review | Waliduj adaptive względem edytowanych etapów** |
+| [4247536328](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247536328) | `crates/fullmag-runner/src/fem/eigen_policy.rs` | open_pending_source_review | Zachowaj domyślne limity iteracji w K0 GPU** |
+| [4247536336](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247536336) | `packages/fullmag-py/src/fullmag/meshing/mesh_build_report.py` | open_pending_source_review | Raportuj trasę exact-ring jako warstwową** |
+| [4247536345](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247536345) | `apps/control-room/src/modules/ribbon/ribbonCommands.ts` | open_pending_source_review | Subskrybuj układ dla aktywnego stanu komend widoku** |
+
+### Checkpoint kolejnych korekt
+
+- `4516cf41c450673cc6276bb1b54b98e144fd517b`: OutputIR używa istniejącego kanonicznego zakresu eigensolve; usunięto duplikat enum.
+- `9e123c7103855805aee0c1e9a64f895139743edc`: manifesty trzech rzeczywistych producentów zachowują żądane zakresy. API/UI osobno adresowalnego per_sample i kolekcji global pozostają do wdrożenia; nie zamyka 4060116242.
+- `841a3f92dd763e8a8fd129af1edafeb9502b01b9`: regresja planera używa strukturalnego PlanError.reasons.
+- `6265812be7b146f0f70102f1db79414765329490`: cached opt-in obserwacja operatora po sukcesie Floqueta; źródłowy walidator0600 PASS. Hosted CTest38246943509 uruchomiony na dokładnym SHA, wynik pending. Nie naprawia full45/mixed73.
+- `7523deb7ecc2f0c44ed67c99eaa506efd76feb23`: dwa negatywne fixture’y docierają do zamierzonych guardów; produkcyjne reguły bez zmian. CI38247247461 pending.

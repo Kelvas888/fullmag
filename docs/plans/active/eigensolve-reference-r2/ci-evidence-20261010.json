@@ -1011,6 +1011,41 @@
       "receipt_sha256": "f9a5efc4e64011792941b8838c64b45f80dae3f6da4cdf61ba6857c725f0c388",
       "log_sha256": "392d22f5f02dcf37d999ec166876f50ab5107c8809c228b2527f0dddd837dcb3",
       "scientific_qualification": "NOT VERIFIED"
+    },
+    {
+      "run_id": 38243351489,
+      "sha": "cf6f7f597d7f6300d7f90351698d4cd047fc28ab",
+      "conclusion": "failure",
+      "scope": "spectrum_scope_source_contracts",
+      "evidence": "missing scope in strict v0.4 adapter; compile failed"
+    },
+    {
+      "run_id": 38245737002,
+      "sha": "4d74a86d033f968a1d04be4dfcae044b5d4232c2",
+      "conclusion": "failure",
+      "scope": "spectrum_scope_source_contracts",
+      "evidence": "duplicate study/eigen_contract scope types; compile failed"
+    },
+    {
+      "run_id": 38246154059,
+      "sha": "4516cf41c450673cc6276bb1b54b98e144fd517b",
+      "conclusion": "failure",
+      "scope": "spectrum_scope_source_contracts",
+      "evidence": "named wire tests passed; planner regression treated PlanError as iterator; compile failed"
+    },
+    {
+      "run_id": 38246325843,
+      "sha": "9e123c7103855805aee0c1e9a64f895139743edc",
+      "conclusion": "failure",
+      "scope": "spectrum_scope_source_contracts",
+      "evidence": "same PlanError regression compilation failure"
+    },
+    {
+      "run_id": 38246536065,
+      "sha": "841a3f92dd763e8a8fd129af1edafeb9502b01b9",
+      "conclusion": "failure",
+      "scope": "spectrum_scope_source_contracts",
+      "evidence": "named legacy/v0.4 scope tests passed; complete planner 522 passed 2 failed; later producer/application gates skipped"
     }
   ]
 }
