@@ -256,6 +256,23 @@ describe("frequencyDomainChartModels", () => {
     });
   });
 
+  it.each([undefined, null])("derives legacy field transport when the optional availability flag is %s", (availability) => {
+    const fieldId = "analysis:eigen:sample-0003:mode-0001";
+    const model = buildEigenSpectrumChartModel(jsonResource({
+      schema_version: "eigen_spectrum.v2",
+      samples: [{ sample_index: 3, modes: [{
+        frequency_hz: 2.25e9, mode_field_id: fieldId,
+        mode_field_available: availability, raw_mode_index: 1,
+      }] }],
+    }));
+    const point = model.points[0]!;
+    expect(point.modeFieldAvailable).toBe(true);
+    expect(point.modeFieldResourceKey).toBe(fieldVectorResourceKey(fieldId));
+    expect(buildEigenModeSelectionRef(point)).toMatchObject({
+      fieldId, resourceRef: fieldVectorResourceKey(fieldId),
+    });
+  });
+
   it("does not fabricate a spectrum field resource for omitted or unidentified payloads", () => {
     const model = buildEigenSpectrumChartModel(jsonResource({
       modes: [

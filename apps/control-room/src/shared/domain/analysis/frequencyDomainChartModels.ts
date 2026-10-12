@@ -918,7 +918,7 @@ export function readEigenSpectrumPayload(
     const rawModeFieldResourceKey = stringValue(
       item.mode_field_resource_key ?? item.modeFieldResourceKey,
     ) ?? (
-      booleanValue(item.mode_field_available ?? item.modeFieldAvailable) === true && modeFieldId
+      booleanValue(item.mode_field_available ?? item.modeFieldAvailable) !== false && modeFieldId
         ? fieldVectorResourceKey(modeFieldId)
         : null
     );
