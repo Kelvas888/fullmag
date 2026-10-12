@@ -59,6 +59,19 @@ Snapshot obejmuje pliki śledzone i usunięcia. Nowe wejścia trzeba jawnie wska
 python scripts/local_runner_cli.py --worktree <absolutny-worktree> submit --operation build --profile fem-cpu-release --source snapshot --include-untracked <plik-wzgledny>
 ```
 
+Dłuższy jawny wybór można przekazać istniejącej recepcie jako manifest UTF-8 JSON:
+
+```text
+just runner-build snapshot fem-cpu-release "" <absolutny-manifest-json>
+```
+
+Manifest jest tablicą unikalnych, niepustych ścieżek względem checkoutu, np.
+`["crates/fullmag-runtime-control/src/study_completion.rs", "packages/fullmag-py/src/fullmag/runtime/transport_identity.py"]`.
+Klient czyta go raz (do 64 KiB i 1024 wpisów); dotychczasowy mechanizm capture
+sprawdza ścieżki, politykę wyłączeń, zawartość i wyścigi. Manifest nie wybiera
+obrazu, komendy ani mountów. Tryb commit odrzuca ten argument. Domyślne
+wywołanie bez manifestu nadal obejmuje wyłącznie dotychczasowy wybór.
+
 Wstrzymaj edycje wszystkich agentów na czas capture. Zmiana podczas kopiowania
 odrzuca zgłoszenie. Po utworzeniu kapsuły można dalej edytować branch; build
 otrzymuje kopię, a nie późniejszy stan ścieżki. SHA kapsuły i natywna tożsamość

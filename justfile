@@ -132,8 +132,8 @@ runner-once:
     {{storage_python}} scripts/local_runner_cli.py run-once
 
 # Build catalogue: immutable source selection, no user-supplied shell command.
-runner-build mode profile="fem-cpu-release" ref="":
-    {{storage_python}} scripts/local_runner_cli.py submit --operation build --profile {{quote(profile)}} --source {{quote(mode)}} {{if ref == "" { "" } else { "--ref " + quote(ref) }}}
+runner-build mode profile="fem-cpu-release" ref="" untracked_manifest="":
+    {{storage_python}} scripts/local_runner_cli.py submit --operation build --profile {{quote(profile)}} --source {{quote(mode)}} {{if ref == "" { "" } else { "--ref " + quote(ref) }}} {{if untracked_manifest == "" { "" } else { "--include-untracked-from " + quote(untracked_manifest) }}}
 
 # Offline external-reference image provisioning; native compilation uses the queue.
 runner-boris-toolchain-context bundle wheel_bundle base_image:

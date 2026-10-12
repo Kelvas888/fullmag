@@ -20,6 +20,28 @@ from local_runner.container_client import ContainerClientError, CATALOG_PROFILES
 from local_runner.coordinator import CoordinatorError, acknowledge_uncreated, configure_image, configured_image, execute_once, reconcile
 
 
+def read_untracked_manifest(path):
+    """Read explicit source selections once; capture_source owns path policy."""
+    file = Path(path)
+    if not file.is_file():
+        raise SourceError('Untracked manifest must be a regular JSON file')
+    with file.open('rb') as stream:
+        body = stream.read(65537)
+    if not body or len(body) > 65536:
+        raise SourceError('Untracked manifest must contain 1..65536 bytes')
+    try:
+        paths = json.loads(body.decode('utf-8'))
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
+        raise SourceError('Untracked manifest must be a UTF-8 JSON array') from error
+    if not isinstance(paths, list) or len(paths) > 1024 or any(
+        not isinstance(path, str) or not path or '\x00' in path for path in paths
+    ):
+        raise SourceError('Untracked manifest requires at most 1024 nonempty paths')
+    if len(set(paths)) != len(paths):
+        raise SourceError('Untracked manifest paths must be unique')
+    return paths
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--repo-root', '--worktree', dest='repo_root', default=str(Path(__file__).resolve().parents[1]))
@@ -85,6 +107,7 @@ def main(argv=None):
     submit.add_argument('--source', choices=('commit', 'snapshot'), required=True)
     submit.add_argument('--ref')
     submit.add_argument('--include-untracked', action='append', default=[])
+    submit.add_argument('--include-untracked-from', metavar='JSON_FILE')
     submit.add_argument('--request-key', default=None)
     # Do not advertise build/qualification until the corresponding executor is verified.
     submit.add_argument('--operation', choices=('verify-source', 'build'), default='verify-source')
@@ -209,6 +232,11 @@ def main(argv=None):
                 raise QueueError('commit source requires --ref; dirty files are not included')
             if args.source == 'snapshot' and args.ref:
                 raise QueueError('snapshot source cannot accept --ref')
+            if args.include_untracked_from and args.source != 'snapshot':
+                raise QueueError('Untracked manifest requires snapshot source')
+            included = list(args.include_untracked)
+            if args.include_untracked_from:
+                included.extend(read_untracked_manifest(args.include_untracked_from))
             from local_runner.source import capture_source
             initialize(layout)
             capture_id = uuid.uuid4().hex
@@ -222,7 +250,7 @@ def main(argv=None):
                 destination.mkdir(parents=True, exist_ok=False)
                 manifest = capture_source(Path(layout['repo_root']), destination,
                                           mode=args.source, ref=args.ref,
-                                          include_untracked=tuple(args.include_untracked))
+                                          include_untracked=tuple(included))
                 if args.operation == 'build':
                     final_native = native_identity(Path(layout['repo_root']), args.source, manifest['resolved_commit'])
                     if native is not None and native != final_native:
