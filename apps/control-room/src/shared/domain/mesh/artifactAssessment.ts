@@ -1,6 +1,6 @@
 export type ArtifactPresence = "not-built" | "present";
 
-export type ResourceLoadState = "idle" | "loading" | "ready" | "error";
+export type ResourceLoadState = "idle" | "loading" | "ready" | "error" | "stale";
 
 export type ArtifactAssessmentState =
   | "current"

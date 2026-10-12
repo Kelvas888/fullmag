@@ -518,8 +518,8 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
       return false;
     }
     const geometryPayload = geometryDraftChanged
-      ? mergeGeometryDescriptor(existingObject.geometry, editedGeometry.geometry as JsonObject)
-      : existingObject.geometry as JsonObject;
+      ? mergeGeometryDescriptor(existingObject.geometry as unknown as JsonObject, editedGeometry.geometry as JsonObject)
+      : (existingObject.geometry as unknown as JsonObject);
     const operation = objectEditSession.beginApply(editIdentity);
     if (!operation) return false;
     const finishPending = beginPendingOperation();
