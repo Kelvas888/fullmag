@@ -5,13 +5,13 @@ import type { ECharts } from "echarts";
 
 import type { EventBus } from "@/kernel/events/EventBus";
 import type { KernelEventMap } from "@/kernel/events/eventTypes";
+import { InteractiveChartSurface } from "@/shared/analysis-charts/InteractiveChartSurface";
 import {
-  InteractiveChartSurface,
   chartSeriesRenderModel,
-} from "@/shared/analysis-charts/InteractiveChartSurface";
+  type InteractiveChartSurfaceIdentity,
+} from "@/shared/analysis-charts/interactiveChartModel";
 import type { ChartDataPresentationState } from "@/shared/analysis-charts/chartPresentationState";
 import type { ChartSeries } from "@/shared/domain/analysis/chartSeries";
-import type { InteractiveChartSurfaceIdentity } from "@/shared/analysis-charts/InteractiveChartSurface";
 import type {
   ChartResultExportContext,
 } from "@/shared/analysis-charts/chartRenderer";

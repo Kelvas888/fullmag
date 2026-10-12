@@ -26,7 +26,6 @@ vi.mock("@/shared/analysis-charts/InteractiveChartSurface", () => ({
     renderedProvenance.push(surface.provenance);
     return <div />;
   },
-  chartSeriesRenderModel: vi.fn(),
 }));
 
 import { EChartsSurface } from "./EChartsSurface";

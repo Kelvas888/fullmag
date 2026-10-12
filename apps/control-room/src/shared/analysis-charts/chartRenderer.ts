@@ -379,6 +379,7 @@ export function chartRenderModelToEChartsOption(
         progressive: 0,
         // Selectable line points share one chart-wide 5,000-point budget.
         // Transparent circles provide dataIndex click targets without visible markers.
+        silent: series.selectable === false,
         showSymbol: series.kind === "scatter" || linePointHitTargets,
         symbol: "circle",
         symbolSize: series.kind === "line" ? 2 : 4,

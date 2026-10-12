@@ -1043,3 +1043,17 @@ Kanoniczny pipeline4243102022: GHA38233156553 SUCCESS, oba nowe testy rzeczywist
 4243102038: ordinary ECharts merge zachowuje serie nieobecne w nastepnym modelu. Renderer teraz uzywa notMerge=false z replaceMerge=[series], zachowujac inne komponenty i stan zoom. Typ adaptera dopuszcza object options. Nowa regresja wykorzystuje real ECharts SVG SSR, nie mock merge: computed+reference -> computed -> empty, z zachowaniem zoom20..80. Semantyka potwierdzona w upstream https://github.com/apache/echarts/blob/master/src/core/echarts.ts i oficjalnym https://apache.googlesource.com/echarts/+/refs/tags/5.1.2/test/option-replaceMerge.html. Lokalnie tylko source/diff review; GHA oraz browser NOT VERIFIED.
 
 Nowe mounted fixture czeka bounded25x1ms na rzeczywiste session-list/status/definitions admission zamiast zero-only timer flush; assertuje tez obie upstream loader calls i izolacje sessionB. Nie usuwa oczekiwanych licznikow ani testow retention. Wyjasnienie source scheduling wymaga potwierdzenia nastepnym hosted run.
+
+
+## Kolejny przeglad UI: stabilna tozsamosc serii i scatter
+
+4206086557: czyste helpers chartSeriesRenderModel/chartPointFromEChartsClick i identity type przeniesione do interactiveChartModel.ts; komponent TSX nie reexportuje funkcji. Consumers EChartsSurface/liveCharts i testy importuja jawny model.
+
+ECharts replaceMerge zachowuje sloty indeksowe. Handler uzywa teraz exact seriesId gdy obecne; unknown/malformed ID failclosed, fallback seriesIndex tylko przy braku ID. Actual SSR regression A/ref/B -> A/B potwierdza nieciagly index2 i wybor B po source row identity. To jest naprawa zaleznosci usuwania serii4243102038, a nie dowod browser.
+
+4246863072: renderer respektuje selectable=false przez silent=true, zachowujac widoczne scatter symbols. Test potwierdza computed silent=false i reference silent=true. Nowe targeted CI obejmuje piec testow consumers/helper/component; dotychczasowe199PASS na0b2c sa dowodem poprzedniego fragmentu, nie nowego kodu.
+
+Doctor38236984250 wykonal fullscan1998files z powodu braku rozpoznanego featurebranch w CI. Brak suppressed rules; nineerrors i scopedCI setup wymagaja rozstrzygniecia. Nowe uwagiPR97(9) zapisano w rejestrze, w tym potwierdzony Poisson sentinelP1 i otwarte duplikaty dataset identity/artifact generation/live catalog/pagination/runner polling.
+
+
+Pinned Doctor0.9.12 source86198f1/packages/core/src/services/git.ts potwierdza detachedHEAD+brak explicitBase -> null diffSelection -> fullscan. Workflow teraz przekazuje --base PR.base.sha, a dla push origin/default_branch. Full fetch zapewnia historie merge-base; git rev-parse --verify przed skanem failclosed przy niedostepnej bazie. Nie dodano suppression/ignore ani ||true; pelny historyczny wynik617 pozostaje osobnym dowodem. Scoped Doctor wymaga nowego hosted run. Primary source: https://raw.githubusercontent.com/millionco/react-doctor/86198f1/packages/core/src/services/git.ts.

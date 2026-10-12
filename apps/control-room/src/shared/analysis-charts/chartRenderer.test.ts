@@ -54,13 +54,17 @@ describe("chart renderer owner", () => {
         series: [
           ...model.series,
           { ...model.series[0]!, id: "reference", label: "Reference", selectable: false },
+          { ...model.series[0]!, id: "mz", label: "mz" },
         ],
       });
-      expect(seriesIds()).toEqual(["mx", "reference"]);
+      expect(seriesIds()).toEqual(["mx", "reference", "mz"]);
       chart.dispatchAction({ type: "dataZoom", start: 20, end: 80 });
 
-      owner.update(model);
-      expect(seriesIds()).toEqual(["mx"]);
+      owner.update({
+        ...model,
+        series: [...model.series, { ...model.series[0]!, id: "mz", label: "mz" }],
+      });
+      expect(seriesIds()).toEqual(["mx", "mz"]);
       const zoom = chart.getOption().dataZoom as { start: number; end: number }[];
       expect(zoom[0]).toMatchObject({ start: 20, end: 80 });
 
@@ -69,6 +73,20 @@ describe("chart renderer owner", () => {
     } finally {
       owner.dispose();
     }
+  });
+
+  it("keeps reference scatter markers visible without interaction targets", () => {
+    const option = chartRenderModelToEChartsOption({
+      ...model,
+      series: [
+        { ...model.series[0]!, kind: "scatter", id: "computed" },
+        { ...model.series[0]!, kind: "scatter", id: "reference", selectable: false },
+      ],
+    });
+    expect(option.series).toEqual([
+      expect.objectContaining({ id: "computed", silent: false, showSymbol: true, symbolSize: 4 }),
+      expect.objectContaining({ id: "reference", silent: true, showSymbol: true, symbolSize: 4 }),
+    ]);
   });
 
   it("encodes stable semantic row identity in renderer data", () => {
