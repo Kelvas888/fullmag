@@ -1,5 +1,35 @@
 # E9c — granice publicznego Run i analizy odpowiedzi spinowej
 
+## Checkpoint kandydata pionowego E9c — 12.10.2026
+
+Historyczny audyt poniżej opisuje stan przed przygotowaniem poprawki. Kandydat
+v2 obejmuje 14 plików: typed `FiniteKResponseAnalysis`, canonical eksport
+Python, istniejący edytor i inspektory FFT/Run, kontrolę monitorów `m`/`H_drive`,
+stage-local gate źródła oraz walidację błędnych typów/opcji requestu.
+Znana analiza finite-k zachowuje tożsamość niezależnie od edytowalności;
+nieznane payloady pozostają bezstratne i jawnie nierozpoznane, nie Gamma.
+
+Zamrożony patch znajduje się w storage tego worktree, pod
+`reviews/antenna-harmonic-cache-20261012/e9c-vertical-overlay/e9c-vertical-candidate-v2.patch`.
+SHA256: `4ebf898a646e2d7c9a0397dddd4e297a7c867303e00dbe215296563447aa1eb5`.
+Receipt `przekazanie-v2-pl.md` w tym samym katalogu. Wersja v1 zastąpiona.
+Pakiet przekazano integratorowi, bez zapisu do jego checkoutu.
+
+Dowody: rzeczywisty publiczny Python request/export/reimport PASS dla 15/16
+sond i Gamma; rzeczywisty model UI parse/serialize oraz read-only PASS;
+workflow jawnych zegarów PASS (auto-sinc dependency stubbed, niekwalifikowane);
+lint czterech plików 0 błędów/ostrzeżeń; pełny graf własnego frontendu z
+nakładkami TypeScript 0 diagnostyk, bez emit. Focused scientific validator
+overlay PASS_DRAFT_OVERLAY_ONLY. Dwa przeglądy i końcowy delta review
+rozstrzygnęły znalezione błędy prezentacji. `git apply --check -p2` w checkoutcie
+integratora exit 0. To dowody źródeł, nie działania zmienionego workspace.
+
+Rust regresje liczby sond, opcji/komponentów i stage/current/global companion
+zapisane, NIE SKOMPILOWANE / NIE WYKONANE; parser rustfmt PASS. Gate źródła
+nie certyfikuje zaakceptowania artefaktu bazy. Pozostają integracja,
+zarządzany build, realny Run z m/H_drive, Zarr readback, cold API, browser i
+naukowa FFT. Cały plan T00–T18 pozostaje otwarty; ten checkpoint go nie zawęża.
+
 Data: 12.10.2026. Status: **audyt źródłowy częściowy; runtime NOT VERIFIED**.
 Źródła: worktree integratora `antenna-transport-e2e-20261011`, HEAD
 `93682dbbf7acbc4c028f5692ec4a164883b8a3fd` z WIP. Nie zmieniono jego
@@ -183,3 +213,26 @@ Root preimage pozostaje `aee4e4a7e2d89bc17472e2a97a39b025e1d532c38293923313af67c
 ponieważ root zawiera niezależny WIP aktywacji anteny. Root nie zmieniono.
 Pakiet przekazano integratorowi do review; zastosowanie i integracja z jego
 canonical doc WIP pozostają otwarte.
+
+### Potwierdzenie integracji i ostrożny wniosek o cache
+
+Ponowny niezależny odczyt worktree integratora potwierdził zastosowanie
+pakietu: sampling SHA `cc43009db876f5ec9e3a74dd9f4705204a5cc963693f60a027826d1c2d46a355`,
+canonical0950 SHA `a3f7ff27d6f6ed00335357502dc51d0c13ef13d7903b56de8d05079c19c125c1`,
+map SHA `79a07737d5cafffce4875645b013bc02e9de3ba76ebe9bbaaea59eb74576ea99`.
+Wszystkie odpowiadają kandydatom root overlay. Jest to dowód integracji
+źródeł, nie wykonania regresji Rust lub naukowego runtime.
+
+Kontrola `apps/control-room/src/kernel/resources/ResourceRuntimeStore.ts` +
+`ResourceRuntimeStore.ensureLoad` (ścieżka zakończenia load) i
+`resourceState.ts` + `markResourceReady` pokazuje, że udany load przypisuje
+nowe data również przy niezmienionym resolveRevision. Dodatkowo przechowuje
+`settledExternalRevision` niezależnie od revision danych. Sam hook
+`resolveRevision=data.schema_version` nie dowodzi więc, że wykres ignoruje
+odświeżenie. Wymagane jest osobne sprawdzenie zewnętrznej invalidacji i
+tożsamości wybranego punktu między runami; nie zgłaszać zamrożonego UI
+bez takiego dowodu.
+
+Piny tego odczytu: `ResourceRuntimeStore.ts`
+`b8a5f347db8c0ee7e314cbbc14b477b33d248782a4364fc50795a73c15cd3254`;
+`resourceState.ts` `ae18588321dd5c9e4be2b1c16e9f2ab910fa1ca4b653221df2541edfd398a6a5`.
