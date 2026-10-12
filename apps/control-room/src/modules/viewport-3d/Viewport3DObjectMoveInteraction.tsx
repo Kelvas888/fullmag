@@ -75,7 +75,6 @@ export function useViewport3DObjectMoveInteraction({
   const kernel = useKernel();
   const scene = useSceneResource();
   const sceneSnapshotRef = useRef({ data: scene.data, status: scene.status });
-  sceneSnapshotRef.current = { data: scene.data, status: scene.status };
   const moveTool = useObjectMoveTool(kernel.objectMoveTool);
   const sessionIdentity = useSessionResourceIdentity();
   const currentContextRef = useRef<CurrentMoveContext | null>(null);
@@ -96,6 +95,7 @@ export function useViewport3DObjectMoveInteraction({
     : null;
 
   useEffect(() => {
+    sceneSnapshotRef.current = { data: scene.data, status: scene.status };
     currentContextRef.current = {
       moveTargetEligible,
       selectedObjectId,
