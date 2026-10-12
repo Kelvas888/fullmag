@@ -1,0 +1,755 @@
+[
+  {
+    "id": "F01",
+    "priority": "P1",
+    "kind": "L",
+    "title": "Szkic zachowuje starą baseRevision po poprawnym Apply",
+    "sources": [
+      "S01",
+      "S02",
+      "S03",
+      "S21"
+    ],
+    "observation": "Klucz szkicu to mode:objectId. applyGeometryPatch i applyTransformPatch używają draft.baseRevision, a po ACK publikują scenę/feedback bez aktualizacji draftState. Wspólny InspectorEditSession w trybie mutation-owned nie resetuje formularza. Snapshot historii nie zastępuje rewizji użytej w payloadzie.",
+    "impact": "Po pierwszym zapisie drugi zapis z tego samego zamontowanego panelu może dostać 409 mimo braku innego edytora. Pola mogą pokazywać dane lokalne oderwane od nowego bazowego snapshotu.",
+    "reproduction": "Otwórz obiekt w rewizji 10, zmień wymiar, Apply → ACK 11; bez zmiany selekcji zmień wymiar ponownie. Sprawdź base_revision drugiego requestu. R05 odtwarza sam wybór starego draftState, nie montaż React.",
+    "fix": "Wprowadź ACK reducer: przy zachowaniu tożsamości operacji zaktualizuj baseline i baseRevision z committed_scene. Zachowaj wyłącznie edycje wykonane po wysłaniu requestu. Nie resetuj szkicu po dowolnym refetchu.",
+    "acceptance": "Test DOM: trzy kolejne Apply wysyłają kolejno 10,11,12; po każdej odpowiedzi dirty=false. Osobny test zachowania nowszej, jeszcze niewysłanej edycji podczas ACK.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR02",
+      "PR07"
+    ],
+    "acceptance_tests": [
+      "T01",
+      "T54"
+    ]
+  },
+  {
+    "id": "F02",
+    "priority": "P1",
+    "kind": "C",
+    "title": "Udany Retry i Revert nie kończą stanu konfliktu",
+    "sources": [
+      "S01",
+      "S03"
+    ],
+    "observation": "Rebase ustawia revisionConflictPhase=rebased. Ścieżki zapisu istniejącej geometrii i transformacji po sukcesie nie zerują tej fazy. revertDraft aktualizuje draftState i feedback, ale również nie zeruje konfliktu. Wspólne Apply blokuje każdy niepusty revisionConflictPhase.",
+    "impact": "Można otrzymać komunikat sukcesu i jednocześnie pozostać z zablokowanym wspólnym Apply. Revert nie przywraca przewidywalnego stanu gotowości.",
+    "reproduction": "Wywołaj 409, Refetch, Rebase, Retry; po ACK sprawdź wspólną stopkę. Powtórz, zastępując Retry przyciskiem Revert.",
+    "fix": "Zastąp niezależne flagi jednoznaczną maszyną stanów. ACK bieżącej operacji oraz świadome porzucenie szkicu muszą wyzerować konflikt, jego bazę, operation i flagi odświeżenia.",
+    "acceptance": "Testy DOM dla create/geometry/transform: conflict→refetched→rebased→success→clean oraz conflict→revert→clean; brak utraty niespokrewnionych szkiców.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR02",
+      "PR07"
+    ],
+    "acceptance_tests": [
+      "T03",
+      "T04"
+    ]
+  },
+  {
+    "id": "F03",
+    "priority": "P2",
+    "kind": "C",
+    "title": "Dwa poziomy Apply mają różne reguły i nie tworzą atomowej edycji obiektu",
+    "sources": [
+      "S01",
+      "S03",
+      "S25",
+      "S26"
+    ],
+    "observation": "Wspólne Apply blokuje jednoczesną zmianę wymiarów i translacji, prosząc o dwa wpisy historii. Lokalne Apply Geometry/Apply Transform mają mniej restrykcyjne disabled i nie używają wspólnego applyBlockReason.",
+    "impact": "Ten sam formularz ma kilka definicji gotowości. Dwa requesty pozwalają na stan pośredni, w którym wymiar zapisano, a pozycja pozostała stara. To szczególnie nieczytelne przed Build Mesh.",
+    "reproduction": "Zmień size i translation. Porównaj stopkę inspektora z lokalnymi przyciskami; sprawdź historię oraz sytuację, gdy drugi request otrzyma 409.",
+    "fix": "Wspólny ObjectEditSessionController w kernelu i jedna komenda Apply. Dla jednego istniejącego obiektu reużyć patch_object_geometry z geometry, pełnym transform i jednym base_revision. Nie tworzyć ogólnego batcha. Potwierdzić końcowy CAS i brak częściowego zapisu w realnym backendzie. Wieloobiektowy commit jest poza R1/R2.",
+    "acceptance": "T02/T51: radius+translation, pointerup bez HTTP, jeden Apply; jedna zmiana rewizji i co najwyżej jeden deduplikowany wpis Undo, history-degraded przy niedostępnej historii. T52 sprawdza atomowość konkurujących zapisów.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [
+      "Potwierdzono istniejącą ścieżkę geometry+transform w jednym żądaniu i jednej scenie. Nie jest to certyfikat linearizowalności zapisu."
+    ],
+    "pull_requests": [
+      "PR05",
+      "PR07"
+    ],
+    "acceptance_tests": [
+      "T02",
+      "T51",
+      "T52"
+    ]
+  },
+  {
+    "id": "F04",
+    "priority": "P1",
+    "kind": "C",
+    "title": "Gest Move omija historię semantyczną używaną przez inspektor",
+    "sources": [
+      "S01",
+      "S07",
+      "S08",
+      "S09",
+      "S21"
+    ],
+    "observation": "Inspektor opakowuje translację w runAuthoringMutationWithHistory. Produkcyjny commitMove wywołuje commitObjectMoveWorkflow→commitObjectTranslation bez tego wrappera. Niskopoziomowa transakcja nie rejestruje historii.",
+    "impact": "Znaczenie Undo zależy od tego, czy identyczny ruch wykonano myszą, czy wpisując liczby. Samo uruchomienie narzędzia przez CommandRegistry nie zapisuje późniejszego gestu.",
+    "reproduction": "W czystej historii wykonaj Move przez gizmo, następnie Undo; porównaj z translacją przez inspektor. Reprodukcja integracyjna pozostaje do uruchomienia w aplikacji.",
+    "fix": "PR03 zabezpiecza wyłącznie obecny immediate Move w R0 i nie zamyka tej luki historii w R1. PR07 przenosi Move do kernelowego draftu: pointerup nie zapisuje, a Apply używa wspólnej mutacji i historii.",
+    "acceptance": "T25: jeden Apply po dowolnej liczbie gestów daje jeden wpis Undo; same gesty dają zero zapisów i zero wpisów historii serwerowego modelu.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR07",
+      "PR12"
+    ],
+    "acceptance_tests": [
+      "T25"
+    ]
+  },
+  {
+    "id": "F05",
+    "priority": "P1",
+    "kind": "L",
+    "title": "ACK poprzedniego gestu może wyczyścić podgląd następnego",
+    "sources": [
+      "S10",
+      "S09"
+    ],
+    "observation": "createMoveGestureController.end zwalnia aktywny gest przed await onCommit. Można zacząć następny gest. Po ACK pierwszego end bezwarunkowo wywołuje onDraftChange(null), bez sprawdzenia numeru gestu.",
+    "impact": "Nowy preview może zniknąć w trakcie przesuwania. Dodatkowo dwa gesty mogą korzystać z tego samego origin/baseRevision. R01 odtwarza bezpośrednio pierwszą część problemu.",
+    "reproduction": "Opóźnij odpowiedź requestu A. Zakończ gest A, rozpocznij B i przesuń obiekt. Zwróć ACK A przed końcem B. Minimalny test jest w reproductions/reproduce.mjs.",
+    "fix": "R1: podczas zapisu blokować rozpoczęcie kolejnego gestu dla tej transakcji; rawText pozostaje edytowalny. ACK sprawdza epokę/draft/operację i zachowuje wpisy po submit. Test nakładających się gestów zostaje historyczny; nie opisuje kontraktu R1.",
+    "acceptance": "T18: gest B odrzucony w committing/outcome-unknown; po ACK możliwy nowy gest. T54: późniejszy rawText nie jest kasowany.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR03",
+      "PR07"
+    ],
+    "acceptance_tests": [
+      "T18",
+      "T54"
+    ]
+  },
+  {
+    "id": "F06",
+    "priority": "P1",
+    "kind": "R",
+    "title": "Viewport nie przekazuje ogrodzenia sesji do mutacji translacji",
+    "sources": [
+      "S07",
+      "S08",
+      "S09",
+      "S11"
+    ],
+    "observation": "commitObjectTranslation obsługuje sessionScopeKey i isCurrentSessionScope; jego test potwierdza odrzucenie późnego ACK. Produkcyjny workflow Move nie przyjmuje i nie przekazuje tych pól. Sprawdzenie aktywacji przed wysłaniem nie zastępuje kontroli po await.",
+    "impact": "Ryzyko publikacji/inwalidacji ze starej sesji lub nieaktualnego feedbacku. Nie potwierdzono, czy dodatkowe zabezpieczenia klienta API całkowicie neutralizują ten scenariusz.",
+    "reproduction": "W sesji A rozpocznij zapis, przełącz do B, zwróć ACK A. Rejestruj scope requestu, zasoby, feedback i historię B. Nie traktować samego testu helpera jako testu tej integracji.",
+    "fix": "Przenieś istniejący mechanizm scope/generation z inspektora do wspólnej komendy. Kontroluj tę samą tożsamość po każdym await i przed publikacją, feedbackiem oraz wpisem historii.",
+    "acceptance": "Test produkcyjnego hooka z dwiema sesjami: zero publikacji A do B, zero zmian historii B, poprawna możliwość wznowienia obserwacji w A.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR03",
+      "PR06",
+      "PR07"
+    ],
+    "acceptance_tests": [
+      "T05",
+      "T06",
+      "T65"
+    ]
+  },
+  {
+    "id": "F07",
+    "priority": "P2",
+    "kind": "L",
+    "title": "Błąd Move inny niż 409 nie ma lokalnej obsługi w łańcuchu UI",
+    "sources": [
+      "S08",
+      "S09",
+      "S10",
+      "S11"
+    ],
+    "observation": "Workflow ponownie rzuca błędy inne niż revision conflict. endAxisDrag jest wywoływany przez void bez catch w sprawdzonym łańcuchu. Test repozytorium świadomie oczekuje odrzuconej Promise helpera, ale nie bada komunikatu użytkownika.",
+    "impact": "Po błędzie sieci lub 500 użytkownik nie dostaje w tym panelu porównywalnego do 409 mechanizmu naprawy. Istnienie globalnego loggera nie jest recoverable UI.",
+    "reproduction": "Wymuś 500 lub zerwanie połączenia przy pointerup. R03 potwierdza propagację odrzucenia; przeglądarkowy unhandledrejection wymaga testu integracyjnego.",
+    "fix": "Zwracaj typowany wynik success/conflict/rejected/unknown-outcome. Zachowaj szkic i przedstaw Retry/Reconcile/Discard. Po utracie ACK nie powtarzaj mutacji bez identyfikatora intencji.",
+    "acceptance": "Brak unhandledrejection w E2E, zachowane wartości i jasny status, brak podwójnego zapisu przy nieznanym wyniku requestu.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR03",
+      "PR06"
+    ],
+    "acceptance_tests": [
+      "T18",
+      "T65"
+    ]
+  },
+  {
+    "id": "F08",
+    "priority": "P2",
+    "kind": "R",
+    "title": "Rebase oznacza zmianę rewizji, nie scalanie zmian",
+    "sources": [
+      "S02",
+      "S08",
+      "S01"
+    ],
+    "observation": "Oba helpery rebase zachowują payload i podmieniają wyłącznie baseRevision. Formularz geometrii wysyła pełny deskryptor, a ruch przechowuje absolutną translację.",
+    "impact": "Po równoległej edycji możliwe jest nadpisanie cudzej zmiany po świadomym Retry. Nie jest to automatyczny konflikt-free merge i UI nie powinno tak go przedstawiać.",
+    "reproduction": "Edytor A zmienia width, B zmienia height; A dostaje 409 i rebase. Osobno: A przesuwa o delta, B zmienia pozycję; sprawdź, czy Retry utrzymuje absolutny cel czy intencję względną.",
+    "fix": "Three-way merge na grupach semantycznych z D04; promień/średnica to jedna wielkość, quaternion jeden atom. Zmiana rodzaju/usunięcie: jawny konflikt. Delta zachowuje capture baseline; reapply-on-remote wymaga wyboru.",
+    "acceptance": "Testy three-way merge dla rozłącznych i kolidujących zmian; po rebase użytkownik widzi wartości mine/theirs/result.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR07"
+    ],
+    "acceptance_tests": [
+      "T03",
+      "T13"
+    ]
+  },
+  {
+    "id": "F09",
+    "priority": "P2",
+    "kind": "L",
+    "title": "Puste pole współrzędnej jest interpretowane jako zero",
+    "sources": [
+      "S02"
+    ],
+    "observation": "Konwersja przez Number(value) akceptuje pusty tekst i same spacje jako 0. Wymiary wymagające wartości dodatniej są później odrzucane, ale translacja i niektóre offsety mogą przejść.",
+    "impact": "Wyczyszczenie pola podczas edycji może stać się rzeczywistym przemieszczeniem do zera. To różne intencje użytkownika.",
+    "reproduction": "Usuń zawartość Translation X i spróbuj Apply; sprawdź payload. R04 odtwarza semantykę konwersji JavaScript.",
+    "fix": "Rozdziel rawText, parsedValue i parseStatus. trim()===\"\" oznacza empty, nie finite zero. Dodaj parser jednostek z jawnym wymiarem i bez eval.",
+    "acceptance": "Puste/whitespace/NaN/Infinity blokują zapis; jawne 0 przechodzi. Testy 10 nm, 0.01 um, 1e-8 m i niezależności jednostki widoku od danych SI.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR04",
+      "PR07"
+    ],
+    "acceptance_tests": [
+      "T08",
+      "T09",
+      "T56"
+    ]
+  },
+  {
+    "id": "F10",
+    "priority": "P1",
+    "kind": "G",
+    "title": "Rotate i Scale są świadomie wyłączone",
+    "sources": [
+      "S01",
+      "S02",
+      "S07",
+      "S15",
+      "S27",
+      "S28",
+      "S29",
+      "S30"
+    ],
+    "observation": "Pola Rotation i Scale oraz przyciski E/R mają disabled. Serializer transformu wysyła wyłącznie translation. Tooltip odwołuje się do ograniczenia kanonicznego kontraktu nowszego niż ProblemIR 0.3.",
+    "impact": "Workflow wymagany przez użytkownika nie jest kompletny. Obecność trzech pól lub ikon nie oznacza obsługi transformacji ani zgodności wizualizacji z mesherem.",
+    "reproduction": "Zaznacz prymityw i sprawdź inspektor oraz ribbon. Skala importu pliku i transform tekstury magnetyzacji nie są dowodem obsługi skali obiektu.",
+    "fix": "Reużyć istniejące pola; wprowadzić wersjonowaną semantykę pivotu i migrację bez cichej zmiany geometrii. Domknąć Python→ProblemIR→evaluatory→realizacje. Włączać Rotate/Scale osobno po dowodach dla lane/device/precision/geometry.",
+    "acceptance": "Rotate/Scale round-trip UI→scene→export→reload→FEM/FDM. Zgodność bounds i masek; brak pozornej transformacji samego Three.js.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [
+      "Transform3D już ma translation/rotation_quat/scale/pivot. Brak dotyczy domknięcia adapterów, semantyki i kwalifikacji, nie samego istnienia pól. W odczytanym bounds pivot nie uczestniczy w obliczeniu."
+    ],
+    "pull_requests": [
+      "PR13",
+      "PR14",
+      "PR15"
+    ],
+    "acceptance_tests": [
+      "T14",
+      "T64"
+    ]
+  },
+  {
+    "id": "F11",
+    "priority": "P1",
+    "kind": "G",
+    "title": "STL nie ma kompletnej ścieżki importu w sprawdzonym wejściu UI",
+    "sources": [
+      "S12",
+      "S13",
+      "S15",
+      "S18"
+    ],
+    "observation": "Ekran startowy klasyfikuje .stl/.vtk/.msh jako znane, lecz unavailable. Ribbon Geometry nie zapewnia w sprawdzonej definicji kompletnego kreatora Import. Backend ma parser podsumowania STL; pole source polityki meshu jest ścieżką, nie pełnym kreatorem importu.",
+    "impact": "Użytkownik nie przechodzi spójnie przez plik→jednostki→walidację→umieszczenie→obiekt→mesh. Nie oznacza to braku obsługi STL w całym Fullmagu.",
+    "reproduction": "Wybierz STL na ekranie startowym; otrzymasz odmowę. Oddzielnie prześledź ewentualne inne uploady przed deklaracją globalnego braku importu. IMPORT_ACCEPT obejmuje też formaty niedostępne.",
+    "fix": "Jeden asset workflow z capability registry, jawne jednostki i hash, naprawa/kontrola powłoki, preview, atomic commit obiektu. Rozdziel import geometrii, import gotowego meshu i import projektu.",
+    "acceptance": "E2E ASCII/binary STL, jednostki nm/mm, niepoprawna powłoka, anulowanie, ponowny import. Picker proponuje formaty zgodne z aktywną operacją.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR16",
+      "PR17",
+      "PR18"
+    ],
+    "acceptance_tests": [
+      "T27",
+      "T32",
+      "T59"
+    ]
+  },
+  {
+    "id": "F12",
+    "priority": "P2",
+    "kind": "C",
+    "title": "Nieobsługiwany typ geometrii trafia do mylącego formularza wymiarów",
+    "sources": [
+      "S01",
+      "S02"
+    ],
+    "observation": "Formularz ma dedykowane pola Cylinder/Sphere/ArchWaveguide i fallback Size XYZ. buildGeometryDraftPatch akceptuje tylko cztery znane typy; pozostałe zwracają Unsupported editable geometry kind.",
+    "impact": "Obiekt importowany lub złożony może wyglądać jak edytowalny Box, choć zapis geometrii zostanie odrzucony. Wartości domyślne nie stanowią wymiarów rzeczywistego assetu.",
+    "reproduction": "Podaj do inspektora scene-object z geometry_kind spoza dozwolonej czwórki. Porównaj widoczne pola z wynikiem serializeru.",
+    "fix": "Rejestr inspektorów po typie i capability. Imported: source, units, bbox, checks, placement; Boolean: operands i operation; unsupported: jednoznaczny read-only z rzeczywistą metryką.",
+    "acceptance": "Nieznany typ nie pokazuje aktywnych fikcyjnych wymiarów. Znany asset ma właściwy inspektor, a transform pozostaje osobną zdolnością.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR04",
+      "PR12"
+    ],
+    "acceptance_tests": [
+      "T11",
+      "T63"
+    ]
+  },
+  {
+    "id": "F13",
+    "priority": "P2",
+    "kind": "G",
+    "title": "Preview edycji i przesuwania nie reprezentuje całego obiektu",
+    "sources": [
+      "S01",
+      "S10"
+    ],
+    "observation": "Overlay prymitywu publikowany jest dla draft-new, a dla committed jest czyszczony. Podgląd Move jest wireframe box opartym o bounds, także dla walca i innych kształtów.",
+    "impact": "Użytkownik ocenia zmianę geometrii dopiero po zapisie albo widzi jedynie obwiednię. Nie wolno traktować tego jako wiernego preview STL/CSG.",
+    "reproduction": "Zmień radius istniejącego walca bez Apply. Następnie przesuń go; sprawdź, czy preview odpowiada jego powierzchni czy tylko bbox.",
+    "fix": "Wspólny overlay szkicu dla tworzenia i edycji; renderuj transient transform istniejącego proxy. Bounding-box/LOD fallback oznaczaj jawnie, nie jako dokładny kształt.",
+    "acceptance": "Preview reaguje bez mutacji serwera; Revert/Escape odtwarza committed. UI oznacza approximate preview i pokazuje dokładną powierzchnię po jej uzyskaniu.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR07",
+      "PR15",
+      "PR18"
+    ],
+    "acceptance_tests": [
+      "T02",
+      "T23",
+      "T27"
+    ]
+  },
+  {
+    "id": "F14",
+    "priority": "P2",
+    "kind": "G",
+    "title": "Zestaw narzędzi nie spełnia kontraktu precyzyjnego modelera",
+    "sources": [
+      "S09",
+      "S10",
+      "S14",
+      "S15"
+    ],
+    "observation": "Sprawdzony Move działa na pojedynczym obiekcie magnetycznym i osiach XYZ. Snap jest disabled. Brak w tym łańcuchu sterowania pivotem, układem Local/World, uchwytów płaszczyzn i transformacji wieloselekcji.",
+    "impact": "Trudno zbudować układ wielu obiektów, ustawić szczelinę, wyrównać powierzchnie lub obracać wokół wybranego punktu. Nie jest to problem samych ikon.",
+    "reproduction": "Próba ustawienia dolnej powierzchni obiektu na Z=0, zachowania odstępu 20 nm i ruchu dwóch obiektów razem. Sprawdź, które kroki można wykonać bez zewnętrznego skryptu.",
+    "fix": "Wspólny ToolController: selection, constraints, coordinate frame, pivot, snap, numeric delta/absolute, transform intent i preview. Capability rozstrzyga dostępność dla roli/typu.",
+    "acceptance": "Wszystkie operacje dostępne również klawiaturą/liczbowo; multi-edit atomowy. Blokada Camera podczas gestu i jawny powód nieaktywnego narzędzia.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR15"
+    ],
+    "acceptance_tests": [
+      "T23",
+      "T24"
+    ]
+  },
+  {
+    "id": "F15",
+    "priority": "P2",
+    "kind": "R",
+    "title": "Drag korzysta z punktu trafienia zamiast jawnej geometrii przeciągania",
+    "sources": [
+      "S10",
+      "S11"
+    ],
+    "observation": "eventPoint czyta event.point, a ruch bierze różnicę jego jednej współrzędnej. Nie ma wyznaczenia płaszczyzny drag/ray-axis. R3F capture nie zastępuje hit-testu w taki sposób jak DOM.",
+    "impact": "Ryzyko niestabilnego lub zatrzymującego się gestu po opuszczeniu wąskiego uchwytu, przy zmianie trafionego obiektu i osi prawie równoległej do kamery. Nie zmierzono tego w WebGL.",
+    "reproduction": "W prawdziwym WebGL przeciągaj poza uchwyt w ortografii i perspektywie, przez puste tło i inny obiekt; sprawdź monotoniczność delta.",
+    "fix": "Użyć adaptera TransformControls lub własnej projekcji ray-plane z obsługą degeneracji. Nie używać braku point jako współrzędnej [0,0,0]. Rozmiar uchwytu w CSS px, nie wyłącznie world bbox.",
+    "acceptance": "Browser matrix kamer/kątów/DPI; drag ciągły, bez skoków, wygodne hit areas i stabilny rozmiar przy zoom. Test mock pointerów nie wystarcza.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR03",
+      "PR15"
+    ],
+    "acceptance_tests": [
+      "T21",
+      "T22"
+    ]
+  },
+  {
+    "id": "F16",
+    "priority": "P2",
+    "kind": "L",
+    "title": "Kliknięcie uchwytu bez ruchu wysyła mutację",
+    "sources": [
+      "S10"
+    ],
+    "observation": "end zawsze wywołuje onCommit po begin, nawet jeśli translation==origin. Nie ma progu ruchu ani porównania wartości.",
+    "impact": "Niepotrzebny request, potencjalne zwiększenie rewizji i unieważnienie meshu. To, czy backend eliminuje no-op, nie zostało zbadane; frontend go wysyła.",
+    "reproduction": "Pointerdown/pointerup w tej samej pozycji. R02 pokazuje jeden commit z niezmienioną translacją.",
+    "fix": "R0 PR03 tłumi no-op click w immediate path; R1 PR07 pozostawia pointerup jako czystą zmianę draftu. Numeryczna klasyfikacja no-op w SI należy do PR04/PR07 i jest sprawdzana osobno w T56/F09.",
+    "acceptance": "Klik bez ruchu, cancel oraz ruch powrotny do punktu startowego nie mutują sceny i nie tworzą Undo; sensowny ruch poniżej 1 nm nie jest gubiony.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR03",
+      "PR07"
+    ],
+    "acceptance_tests": [
+      "T19"
+    ]
+  },
+  {
+    "id": "F17",
+    "priority": "P2",
+    "kind": "C",
+    "title": "Walidacja miesza brak danych z brakiem problemów",
+    "sources": [
+      "S01",
+      "S02"
+    ],
+    "observation": "Przy pustej tablicy wiadomości panel wyświetla Backend validation: no object issues, niezależnie od statusu loading/error. Agregator przycina listę do pięciu ogólnych tekstów.",
+    "impact": "Użytkownik może dostać fałszywie uspokajający opis, a brakujące problemy nie mają licznika ani ścieżki pola/severity. Sam widoczny badge statusu nie naprawia sprzecznego komunikatu.",
+    "reproduction": "Otwórz obiekt przy niedostępnej walidacji i przy sześciu problemach. Sprawdź status, tekst oraz możliwość odnalezienia wszystkich problemów.",
+    "fix": "Typowana walidacja z revision, targetId, fieldPath, severity, code i total. Stany unknown/loading/stale/error/valid/invalid. Skrót do pełnego Diagnostics.",
+    "acceptance": "No issues tylko dla aktualnego successful response z zerem problemów. 5 z 12 oznaczone z przejściem do pełnej listy. Błąd requestu nie staje się valid.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR04"
+    ],
+    "acceptance_tests": [
+      "T12"
+    ]
+  },
+  {
+    "id": "F18",
+    "priority": "P2",
+    "kind": "L",
+    "title": "Fallback bounds walca ignoruje jego wysokość",
+    "sources": [
+      "S22"
+    ],
+    "observation": "Gdy brak bounds_min/max i size/dimensions, boundsFromGeometry bierze radiusSize(radius), czyli [2r,2r,2r]. height nie uczestniczy w tej gałęzi. Przy braku danych fallback to [1,1,1].",
+    "impact": "Warunkowo niepoprawny framing, skala gizma i ocena gabarytu; dla cienkiego walca błąd osi Z może być duży. Poprawne autorytatywne bounds omijają tę ścieżkę.",
+    "reproduction": "Cylinder r=50 nm, h=10 nm bez bounds i size. R07 daje [100,100,100] nm zamiast [100,100,10] nm.",
+    "fix": "Bounds obliczane przez typowany descriptor i jego transform. Dla unknown brak fikcyjnego metrowego obiektu: pending/unavailable geometry proxy.",
+    "acceptance": "Testy Box/Cylinder/Sphere/Arch/imported: bbox zgodny z geometrią i orientacją. Brak bounds nie powoduje nagłego oddalenia kamery o dziewięć rzędów wielkości.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR04"
+    ],
+    "acceptance_tests": [
+      "T14"
+    ]
+  },
+  {
+    "id": "F19",
+    "priority": "P2",
+    "kind": "L",
+    "title": "Freshness meshu uznaje niespójne rewizje za current",
+    "sources": [
+      "S17"
+    ],
+    "observation": "Kod oznacza stale tylko dla source_scene_revision < sceneRevision; każda inna para liczb daje current. Nie sprawdza w tej ekspresji gotowości zasobów ani równoważności geometrii/polityki.",
+    "impact": "Podczas asynchronicznego odświeżania para scene=10,source=11 może zostać opisana jako aktualna. Jest to błąd predykatu, nie dowód niepoprawnych elementów siatki.",
+    "reproduction": "R06 odtwarza tę parę liczb. W UI opóźnij refetch sceny względem manifestu i zobacz badge.",
+    "fix": "Jeden resolver ArtifactAssessment i oddzielny ResourceLoadState. Przyszła source revision jest inconsistent; brak dowodu unknown. Przejście na serwerowe digesty; legacy resolver konserwatywny i jawnie ograniczony.",
+    "acceptance": "Current wymaga zgodnego, gotowego zestawu dowodów. Future/mixed-generation daje inconsistent, brak danych unknown, nie zielony status.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR08",
+      "PR10"
+    ],
+    "acceptance_tests": [
+      "T42",
+      "T68"
+    ]
+  },
+  {
+    "id": "F20",
+    "priority": "P2",
+    "kind": "R",
+    "title": "Viewport i inspektor stosują różne reguły stale meshu",
+    "sources": [
+      "S17",
+      "S22"
+    ],
+    "observation": "Inspektor porównuje rewizje. objectMeshState viewportu opiera się na obecności obiektu i tagach mesh:dirty/building/failed, a jawne porównanie rewizji wykonuje dla szczególnego CSG preview.",
+    "impact": "Ryzyko rozbieżnych statusów przy opóźnionych tagach lub brakujących danych. Nie wykazano, że backend zawsze publikuje niespójny zestaw; potrzebny test kontraktu.",
+    "reproduction": "Podaj manifest starej sceny i zwykły Box bez tagów dirty; porównaj wyniki obu resolverów. Potem sprawdź realny geometry edit→refetch.",
+    "fix": "Jeden centralny resolver ArtifactCompatibility używany przez drzewo, inspektor, viewport i Run gating. Stan obiektu/meshu ma wynikać z tego samego zestawu rewizji/digestów.",
+    "acceptance": "Brak jednoczesnego current i stale dla tej samej tożsamości. Stary mesh widoczny opcjonalnie, ale zawsze podpisany.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR08",
+      "PR09",
+      "PR10"
+    ],
+    "acceptance_tests": [
+      "T42",
+      "T68"
+    ]
+  },
+  {
+    "id": "F21",
+    "priority": "P2",
+    "kind": "R",
+    "title": "Selekcja najgorszego elementu nie niesie tożsamości meshu",
+    "sources": [
+      "S17",
+      "S23"
+    ],
+    "observation": "selectWorstElement zapisuje elementIndex, centroid i metric, ale nie meshRevision/buildId/generation. Dla porównania inspektor FDM jawnie rozróżnia aktualną komórkę i stary snapshot przez fingerprint/membership.",
+    "impact": "Po rebuild indeks może wskazywać inny element. Ryzyko błędnego highlight/refine, jeśli inne warstwy nie odrzucą starej selekcji.",
+    "reproduction": "Wybierz worst element, przebuduj siatkę, zachowaj selekcję i wykonaj highlight/refine. Sprawdź, czy działa na starej czy nowej topologii.",
+    "fix": "ElementRef={artifactId,generationId,meshRevision,index}; przy nowym meshu selekcja wygasa lub pozostaje wyraźnie read-only snapshotem. Nie mapować po samym indeksie.",
+    "acceptance": "Rebuild nie przekierowuje refinementu na inny element. Wzorzec zabezpieczenia FDM wykorzystać także w FEM.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR10",
+      "PR19"
+    ],
+    "acceptance_tests": [
+      "T43",
+      "T44"
+    ]
+  },
+  {
+    "id": "F22",
+    "priority": "P2",
+    "kind": "R",
+    "title": "Reconciliation utraconego ACK szuka tylko ośmiu ostatnich komend",
+    "sources": [
+      "S20"
+    ],
+    "observation": "reconcileMeshSubmission sortuje kandydatów malejąco po seq i ogranicza ich przez slice(0,8), po czym dopasowuje client_intent_id.",
+    "impact": "Jeżeli poszukiwany intent wypadnie poza okno, UI może pozostać publication-unconfirmed mimo istnienia komendy. To bezpieczniejsze niż duplikowanie budowy, ale utrudnia odzyskanie obserwacji.",
+    "reproduction": "Zasymuluj utracony ACK oraz co najmniej osiem nowszych komend tego rodzaju w kolejce. Sprawdź wynik reconciliation.",
+    "fix": "Backendowy lookup po client_intent_id albo stronicowane wyszukiwanie z jawnym ograniczeniem i diagnostyką. Zachować zasadę: reconnect nigdy sam nie wysyła ponownie build.",
+    "acceptance": "Intent odnaleziony niezależnie od pozycji w historii albo jednoznaczny nieznany wynik z odnośnikiem do jobu; nigdy cicha druga budowa.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR11"
+    ],
+    "acceptance_tests": [
+      "T38",
+      "T39"
+    ]
+  },
+  {
+    "id": "F23",
+    "priority": "P2",
+    "kind": "G",
+    "title": "Zakładka history polityki obiektu jest w praktyce widokiem JSON",
+    "sources": [
+      "S18",
+      "S16",
+      "S17"
+    ],
+    "observation": "ObjectMeshPolicyPanel renderuje w history JSON report/quality/size-field. Osobny globalny MeshDetailsPanel posiada rzeczywistą sekcję historii i restore-to-draft.",
+    "impact": "Istniejące możliwości są rozproszone i etykieta lokalnej zakładki obiecuje inną treść. Nie należy pisać, że historii w projekcie w ogóle nie ma.",
+    "reproduction": "Przejdź Object Mesh→History i Mesh Builds; porównaj zawartość i możliwość dotarcia do budowy danego obiektu.",
+    "fix": "Wspólny history view filtrowany po obiekcie/target, z linkiem do globalnego jobu. Surowy JSON przenieść do Diagnostics/Advanced.",
+    "acceptance": "Z inspektora obiektu można zobaczyć job, receptę, źródłową scenę, wynik, błąd i restore-to-draft bez szukania innej sekcji.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR12"
+    ],
+    "acceptance_tests": [
+      "T25",
+      "T26"
+    ]
+  },
+  {
+    "id": "F24",
+    "priority": "P2",
+    "kind": "G",
+    "title": "Ribbon eksponuje szeroki katalog trwale nieaktywnych funkcji",
+    "sources": [
+      "S15"
+    ],
+    "observation": "Geometry zawiera liczne disabled prymitywy, Union/Subtract/Intersect oraz Camera/Manipulate/Snap. Definitions ma nieaktywne Parameters/Functions/Coordinates. Nie wszystkie nieaktywne akcje mają tak precyzyjny powód jak Rotate/Scale.",
+    "impact": "Widok przypomina kompletny modeler bardziej, niż pozwala rzeczywista funkcjonalność. Trudno odróżnić brak implementacji od nieprawidłowego zaznaczenia.",
+    "reproduction": "Przejrzyj toolbar w pustej i wypełnionej scenie. Skategoryzuj każdą nieaktywną akcję: unsupported, unavailable-context, busy, permission, invalid draft.",
+    "fix": "Dwupoziomowy Create: wspierane typy na wierzchu, pozostałe w jawnej sekcji planowanych funkcji. Akcje budować z tego samego registry/capability co komendy i inspektor.",
+    "acceptance": "Każdy disabled ma czytelną przyczynę; brak martwego aktywnego menu. Odrębnie testować ikony skrótów i rzeczywiste bindings klawiatury.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR07",
+      "PR12",
+      "PR15"
+    ],
+    "acceptance_tests": [
+      "T50",
+      "T63"
+    ]
+  },
+  {
+    "id": "F25",
+    "priority": "P2",
+    "kind": "R",
+    "title": "Rozmiar modułów zwiększa ryzyko rozbieżności polityk UI",
+    "sources": [
+      "S15",
+      "S17",
+      "S18",
+      "S24"
+    ],
+    "observation": "Metadata drzewa wskazuje ok. 139 kB ribbonContributions i ok. 117 kB Viewport3DModule. Odczytane panele łączą formularze, transakcje, zasoby, historię, diagnostykę i renderowanie. To wskaźnik długu, nie pomiar wydajności.",
+    "impact": "Łatwo naprawić jedną drogę Apply lub jeden badge bez zmiany pozostałych. Sam duży plik nie dowodzi spadku FPS ani wycieku pamięci.",
+    "reproduction": "Prześledź jedną mutację translacji i jedną budowę przez wszystkie wejścia. Zmierz render/resource counts istniejącymi skryptami dopiero w uruchomionej aplikacji.",
+    "fix": "Wydziel domain services i selektory najpierw, komponenty widoku później. Nie tworzyć drugiego store sceny ani drugiej historii. Dodać dependency rules i testy kontraktów.",
+    "acceptance": "Inspektor/ribbon/gizmo odwołują się do tego samego command contract; mierzalne brak regresji CPU/GPU/network, a nie tylko mniejsza liczba linii.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR01",
+      "PR07",
+      "PR12"
+    ],
+    "acceptance_tests": [
+      "T49",
+      "T55"
+    ]
+  },
+  {
+    "id": "F26",
+    "priority": "P2",
+    "kind": "R",
+    "title": "Tożsamość szkicu jest zbyt słaba na zmianę typu lub sesji",
+    "sources": [
+      "S01",
+      "S02",
+      "S04"
+    ],
+    "observation": "draftKey zawiera mode i objectId, a nowe prymitywy otrzymują objectId=draft. Nie zawiera primitive kind, session scope ani unikalnego draftId. InspectorModule nie nadaje Panel jawnego key zależnego od sesji.",
+    "impact": "Ryzyko odziedziczenia danych po innym prymitywie lub obiekcie o takim samym ID w innej sesji, o ile rodzic nie wymusi remountu. Nie stwierdzono pełnego zachowania wszystkich tras.",
+    "reproduction": "Zmień Box→Cylinder→Sphere bez opuszczania edytora; powtórz przełączenie sesji z identycznym objectId i aktywnym formularzem. Testować wraz z dirty-selection guard.",
+    "fix": "DraftIdentity={sessionId,epoch,targetId,draftId}; typ prymitywu jest częścią intencji tworzenia. Zmiana targetu rozwiązuje dirty state, nie jest ukrytym resetem.",
+    "acceptance": "Brak przecieku wartości/konfliktów między szkicami; jawne Apply/Discard/Cancel przy zmianie selekcji.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR02",
+      "PR07"
+    ],
+    "acceptance_tests": [
+      "T06",
+      "T07"
+    ]
+  },
+  {
+    "id": "F27",
+    "priority": "P2",
+    "kind": "R",
+    "title": "Historia może zniknąć bez komunikatu po poprawnej mutacji",
+    "sources": [
+      "S21"
+    ],
+    "observation": "captureAuthoringHistoryScene może zwrócić null; recordAuthoringMutationHistory wtedy pomija zapis. Wyjątki history.record są przechwytywane bez sygnalizacji użytkownikowi. Autorzy świadomie traktują historię jako observability layer.",
+    "impact": "Model może być poprawnie zapisany, ale operacja nieodwracalna z UI. To nie powód, by cofać udany ACK; potrzebna jest informacja o zdegradowanej historii.",
+    "reproduction": "Zasymuluj brak before snapshot i błąd history.record przy udanym commit. Sprawdź, czy UI ujawnia brak Undo.",
+    "fix": "R1: best-effort lokalne Undo z widocznym history-degraded, bez drugiego requestu po awarii zapisu historii. Trwały receipt mutacji służy reconciliation, nie jest automatycznie trwałą historią Undo.",
+    "acceptance": "Sukces zapisu nie znika, ale użytkownik widzi, że Undo tej operacji jest niedostępne; telemetria identyfikuje commandId i przyczynę.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR06",
+      "PR12"
+    ],
+    "acceptance_tests": [
+      "T26",
+      "T65"
+    ]
+  },
+  {
+    "id": "F28",
+    "priority": "P2",
+    "kind": "R",
+    "title": "Pierwsza budowa wymaga testu pustych zasobów w dialogu potwierdzenia",
+    "sources": [
+      "S19",
+      "S20",
+      "S24"
+    ],
+    "observation": "computedSnapshot wymaga ready dla summary, latest successful oraz manifest. Kod może działać poprawnie, jeśli backend publikuje ready z pustym payloadem przed pierwszą budową; w audycie nie uruchomiono tego kontraktu.",
+    "impact": "Ryzyko zablokowania pierwszej budowy, gdy któryś zasób poprawnie odpowiada not-built/404. To hipoteza do sprawdzenia, a nie potwierdzony deadlock.",
+    "reproduction": "Nowa sesja FEM, jeden prymityw, brak wcześniejszego meshu i sukcesu; uruchom Build Mesh i zbadaj stany zasobów w dialogu. Istnieje skrypt verify:mesh-build-new-object, ale nie był tu uruchamiany.",
+    "fix": "Zdefiniować not-built jako legalny snapshot bez poprzedniego artefaktu. Odróżnić brak meshu od awarii jego odczytu. Nie obchodzić kontroli scene/policy readiness.",
+    "acceptance": "E2E pierwszej budowy z pustej sesji i po importowanym STL, obok rebuild istniejącego meshu oraz błędu odczytu manifestu.",
+    "status": "not_retested_in_production",
+    "classification_origin": "v1",
+    "v2_notes": [],
+    "pull_requests": [
+      "PR08",
+      "PR11"
+    ],
+    "acceptance_tests": [
+      "T33"
+    ]
+  }
+]

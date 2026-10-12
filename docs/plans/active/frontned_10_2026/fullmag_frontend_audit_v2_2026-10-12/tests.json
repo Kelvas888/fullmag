@@ -1,0 +1,2263 @@
+{
+  "schema_version": "2.0",
+  "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95",
+  "tests": [
+    {
+      "id": "T01",
+      "release": "R1",
+      "scenario": "Dwie kolejne edycje wymiaru jednego Box.",
+      "oracle": "Drugi request używa rewizji po pierwszym ACK.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR01",
+        "PR02"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T02",
+      "release": "R1",
+      "scenario": "Zmiana promienia → drag → pointerup → Revert albo Apply",
+      "oracle": "Pointerup 0 mutation; Revert przywraca wymiar+position; Apply jeden patch_object_geometry z pełnym transform, jedna rewizja i ≤1 Undo.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR01",
+        "PR07"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T03",
+      "release": "R1",
+      "scenario": "409 → refetch → rebase → retry success.",
+      "oracle": "Conflict phase cleared, dirty=false, nowy baseline.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR02",
+        "PR07"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T04",
+      "release": "R1",
+      "scenario": "Revert po konflikcie.",
+      "oracle": "Pola baseline i brak stale conflict banner.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR02",
+        "PR07"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T05",
+      "release": "R1",
+      "scenario": "Zmiana selekcji podczas wysyłania.",
+      "oracle": "ACK nie czyści draftu drugiego obiektu.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR02",
+        "PR06",
+        "PR07"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T06",
+      "release": "R1",
+      "scenario": "A→B→A podczas pending, późny ACK poprzedniej epoki oraz wyścig patch/delete targetu",
+      "oracle": "Późny ACK epoki 1 rozlicza wyłącznie tę samą intencję i nie publikuje sceny, selekcji, historii ani feedbacku do A/epoki 3. Przy delete-wins serwer odrzuca patch kodem TARGET_DELETED; draft pozostaje wyłącznie do eksportu, Apply jest wyłączone, selekcja nie rozwiązuje targetu, historia pozostaje pusta i obiekt nie jest odtwarzany. Przy commit-wins receipt jest rozliczony raz; późniejszy delete ustawia target-missing, bez odtworzenia draftu ani wykonywalnego Undo dla brakującego obiektu.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR02",
+        "PR06",
+        "PR07",
+        "PR05"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T07",
+      "release": "R1",
+      "scenario": "Draft Box→Cylinder przed Create.",
+      "oracle": "Właściwy typ, nowe draftId, jawna decyzja o poprzednich danych.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR02"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T08",
+      "release": "R1",
+      "scenario": "Puste, whitespace, '-', '1e', NaN, infinity.",
+      "oracle": "Stany incomplete/invalid, nigdy niejawne zero.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR04"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T09",
+      "release": "R1",
+      "scenario": "nm/µm/mm/m i zapis scientific notation.",
+      "oracle": "Jeden wynik SI, brak podwójnej konwersji.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR04"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T10",
+      "release": "R1",
+      "scenario": "Ujemny wymiar, zero radius/height.",
+      "oracle": "Inline error i zablokowany commit.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR04"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T11",
+      "release": "R1",
+      "scenario": "Unsupported imported/CSG geometry.",
+      "oracle": "Prawdziwy read-only inspector; bez fałszywego edytora Size.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR04"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T12",
+      "release": "R1",
+      "scenario": "Walidacja loading/error/absent/stale.",
+      "oracle": "Brak zielonego „no issues” bez dowodu.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR04"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T13",
+      "release": "R2-T",
+      "scenario": "Czterowymiarowy quaternion nienormalny/zerowy.",
+      "oracle": "Jawna walidacja/normalizacja według kontraktu.",
+      "scope": [
+        "SPEC",
+        "API",
+        "BROWSER"
+      ],
+      "pull_requests": [
+        "PR13",
+        "PR15"
+      ],
+      "fixture": "fixtures/transform_oracles.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T14",
+      "release": "R2-T",
+      "scenario": "TRS-01: niezerowy pivot + rotation + nonuniform scale",
+      "oracle": "M/punkty/AABB według fixtures/transform_oracles.json; algebra 1e−20 m, linear 1e−14. Produkcyjny path musi niezależnie spełnić oracle.",
+      "scope": [
+        "SPEC",
+        "API",
+        "MANAGED",
+        "PHYSICS"
+      ],
+      "pull_requests": [
+        "PR13",
+        "PR14",
+        "PR15"
+      ],
+      "fixture": "fixtures/transform_oracles.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-MANAGED",
+        "Q-PHYSICS"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T15",
+      "release": "R2-T",
+      "scenario": "Pivot-only change.",
+      "oracle": "World geometry nie zmienia się; deterministyczny round-trip.",
+      "scope": [
+        "SPEC",
+        "API",
+        "BROWSER"
+      ],
+      "pull_requests": [
+        "PR13",
+        "PR14",
+        "PR15"
+      ],
+      "fixture": "fixtures/transform_oracles.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T16",
+      "release": "R1/R2 reject; R3 future",
+      "scenario": "Parent transform/hierarchia w R1/R2, fixture shear dla przyszłej implementacji",
+      "oracle": "R1/R2 jawna odmowa capability; nie uruchamiać niewdrożonej hierarchii. Oracle diag(2,1,1)Rz45 column dot = −1.5 ilustruje brak naiwnego TRS.",
+      "scope": [
+        "SPEC",
+        "API",
+        "BROWSER"
+      ],
+      "pull_requests": [
+        "PR13"
+      ],
+      "fixture": "fixtures/transform_oracles.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T17",
+      "release": "R2-T",
+      "scenario": "Mirror/zero scale.",
+      "oracle": "Fail closed do czasu kwalifikacji kontraktu.",
+      "scope": [
+        "SPEC",
+        "API",
+        "BROWSER"
+      ],
+      "pull_requests": [
+        "PR13",
+        "PR15"
+      ],
+      "fixture": "fixtures/transform_oracles.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T18",
+      "release": "R0/R1",
+      "scenario": "Gesture B podczas nierozstrzygniętego A; osobne kryteria immediate R0 i staged R1",
+      "oracle": "R0: rozpoczęcie gestu B czeka na terminalny wynik A. R1: nowszy raw/patch B pozostaje w draftcie podczas pending A, a ACK A przesuwa baseline i zachowuje/rebase'uje B. Overlap mode nie jest w release.",
+      "scope": [
+        "BROWSER",
+        "WEBGL"
+      ],
+      "pull_requests": [
+        "PR01",
+        "PR03",
+        "PR07"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-BROWSER",
+        "Q-WEBGL"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked",
+      "stage_acceptance": {
+        "R0": "Submit A pozostaje jedynym aktywnym zapisem; BeginGesture B jest zablokowane do ACK albo definitywnego odrzucenia A.",
+        "R1": "Nowsze raw/patch B może pozostać lokalnie queued podczas pending A; ACK A aktualizuje baseline, zachowuje/rebase'uje B i nie uruchamia drugiego Apply."
+      }
+    },
+    {
+      "id": "T19",
+      "release": "R0/R1",
+      "scenario": "Click osi bez ruchu: no-op obecnej ścieżki R0 i czysty draft R1",
+      "oracle": "R0: brak zapisującego requestu i wpisu historii. R1: pointerup nie tworzy dirty draftu ani nie włącza Apply; brak requestu i wpisu historii.",
+      "scope": [
+        "BROWSER",
+        "WEBGL"
+      ],
+      "pull_requests": [
+        "PR03",
+        "PR07"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-BROWSER",
+        "Q-WEBGL"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked",
+      "stage_acceptance": {
+        "R0": "Zero scene writes i zero wpisów historii po kliknięciu osi.",
+        "R1": "Draft pozostaje równy baseline, Apply pozostaje wyłączone, zero scene writes i zero wpisów historii."
+      }
+    },
+    {
+      "id": "T20",
+      "release": "R0/R1/R2-T",
+      "scenario": "Escape / lost capture / pointercancel / unmount podczas Move gesture",
+      "oracle": "R0: commit nie jest wysyłany po cancel. R1: cancel porzuca wyłącznie preview bieżącego gestu i zachowuje wcześniejszy numeric draft; pointerup pozostaje lokalny. We wszystkich ścieżkach cleanup następuje raz, pointer capture jest zwolniony, a OrbitControls odblokowane.",
+      "scope": [
+        "BROWSER",
+        "WEBGL"
+      ],
+      "pull_requests": [
+        "PR03",
+        "PR07",
+        "PR15"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-BROWSER",
+        "Q-WEBGL"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked",
+      "stage_acceptance": {
+        "R0": "Anulowany gest nie wywołuje natychmiastowej mutacji ani wpisu historii; cleanup dokładnie raz.",
+        "R1": "Anulowany gest nie wysyła Apply, usuwa swój preview i zachowuje wcześniejsze edycje draftu; cleanup dokładnie raz.",
+        "R2-T": "Transform tool zachowuje ten sam cancel/teardown contract PR15."
+      }
+    },
+    {
+      "id": "T21",
+      "release": "R0/R1/R2-T",
+      "scenario": "Kamera orthographic/perspective, oś prawie równoległa do ray.",
+      "oracle": "Stabilny solver gestu; brak skoku do starego intersection.",
+      "scope": [
+        "BROWSER",
+        "WEBGL"
+      ],
+      "pull_requests": [
+        "PR03",
+        "PR15",
+        "PR07"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-BROWSER",
+        "Q-WEBGL"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked",
+      "stage_acceptance": {
+        "R0": "Obecny Move używa stabilnego solvera osi dla kamer orthographic/perspective bez skoku do starego intersection.",
+        "R1": "Ten sam solver zmienia tylko wspólny local draft; pointerup nie wysyła mutacji.",
+        "R2-T": "PR15 kwalifikuje solver uchwytów transformu dla zadeklarowanych widoków."
+      }
+    },
+    {
+      "id": "T22",
+      "release": "R0/R1/R2-T",
+      "scenario": "Przeciągnięcie poza obszar osi i viewport.",
+      "oracle": "Kontynuacja lub jawne cancel według ustalonego kontraktu.",
+      "scope": [
+        "BROWSER",
+        "WEBGL"
+      ],
+      "pull_requests": [
+        "PR03",
+        "PR15",
+        "PR07"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-BROWSER",
+        "Q-WEBGL"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked",
+      "stage_acceptance": {
+        "R0": "Drag poza oś/viewport jest kontynuowany albo jawnie anulowany; normalne release wysyła najwyżej jeden commit.",
+        "R1": "Drag aktualizuje draft, pointerup nie wysyła mutacji; cancel nie wysyła Apply i zachowuje wcześniejszy draft.",
+        "R2-T": "PR15 zachowuje te same capture, cancel i teardown granice."
+      }
+    },
+    {
+      "id": "T23",
+      "release": "R2-T",
+      "scenario": "Plane handles XY/XZ/YZ, World vs Local.",
+      "oracle": "Zmieniają tylko dozwolone DOF we właściwej ramie.",
+      "scope": [
+        "BROWSER",
+        "WEBGL"
+      ],
+      "pull_requests": [
+        "PR15"
+      ],
+      "fixture": "fixtures/transform_oracles.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-BROWSER",
+        "Q-WEBGL"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T24",
+      "release": "R2-T",
+      "scenario": "Snap + numeric entry.",
+      "oracle": "Ta sama wynikowa wartość i preview; brak dryfu kumulacyjnego.",
+      "scope": [
+        "BROWSER",
+        "WEBGL"
+      ],
+      "pull_requests": [
+        "PR15"
+      ],
+      "fixture": "fixtures/transform_oracles.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-BROWSER",
+        "Q-WEBGL"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T25",
+      "release": "R1",
+      "scenario": "Move draft → Apply → Undo → Redo",
+      "oracle": "Pointerup bez wpisu historii; Apply ≤1 wpis; Undo/Redo nowe warunkowe mutacje; unknown nie generuje drugiej historii.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR07",
+        "PR12"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T26",
+      "release": "R0/R1",
+      "scenario": "History capture failure.",
+      "oracle": "Udany zapis pozostaje zapisany; nieudany capture historii jest jawnie degraded i nie tworzy fałszywego sukcesu ani Undo/Redo.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR03",
+        "PR06",
+        "PR12",
+        "PR07"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked",
+      "stage_acceptance": {
+        "R0": "Po immediate commit błąd capture jest widoczny jako degraded; zapis nie jest cofany ani przedstawiany jako Undo.",
+        "R1": "Po Apply błąd capture jest widoczny jako degraded; zapis pozostaje, bez fikcyjnego wpisu Undo/Redo."
+      }
+    },
+    {
+      "id": "T27",
+      "release": "R2-I",
+      "scenario": "ASCII STL / binary STL.",
+      "oracle": "Rozpoznanie, units, preview, asset identity, commit.",
+      "scope": [
+        "API",
+        "BROWSER",
+        "MANAGED"
+      ],
+      "pull_requests": [
+        "PR16",
+        "PR17",
+        "PR18"
+      ],
+      "fixture": "fixtures/import_cases.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER",
+        "Q-MANAGED"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T28",
+      "release": "R2-I",
+      "scenario": "STL truncated, counts mismatch, invalid/nonfinite vertex.",
+      "oracle": "Odrzucenie z przyczyną, bez częściowego scene-object.",
+      "scope": [
+        "API",
+        "BROWSER",
+        "MANAGED"
+      ],
+      "pull_requests": [
+        "PR16",
+        "PR18"
+      ],
+      "fixture": "fixtures/import_cases.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER",
+        "Q-MANAGED"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T29",
+      "release": "R2-I",
+      "scenario": "STL open surface/non-manifold/self-intersections.",
+      "oracle": "Rzeczywisty raport checks; brak nieuprawnionej zgody na volume.",
+      "scope": [
+        "API",
+        "BROWSER",
+        "MANAGED"
+      ],
+      "pull_requests": [
+        "PR16",
+        "PR17",
+        "PR18"
+      ],
+      "fixture": "fixtures/import_cases.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER",
+        "Q-MANAGED"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T30",
+      "release": "R2-I",
+      "scenario": "Source units zmienione mm→nm.",
+      "oracle": "Bbox po konwersji czytelny; object scale niezależne.",
+      "scope": [
+        "API",
+        "BROWSER",
+        "MANAGED"
+      ],
+      "pull_requests": [
+        "PR16",
+        "PR17",
+        "PR18"
+      ],
+      "fixture": "fixtures/import_cases.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER",
+        "Q-MANAGED"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T31",
+      "release": "R2-I",
+      "scenario": "Cancel po upload / reconnect.",
+      "oracle": "Brak przypadkowego obiektu; reuse identity zgodnie z retencją.",
+      "scope": [
+        "API",
+        "BROWSER",
+        "MANAGED"
+      ],
+      "pull_requests": [
+        "PR16",
+        "PR17",
+        "PR18"
+      ],
+      "fixture": "fixtures/import_cases.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER",
+        "Q-MANAGED"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T32",
+      "release": "R2-I",
+      "scenario": "Reimport ze zmianą triangulacji.",
+      "oracle": "Regiony nie przypisują się według starego ordinalu.",
+      "scope": [
+        "API",
+        "BROWSER",
+        "MANAGED"
+      ],
+      "pull_requests": [
+        "PR17",
+        "PR18"
+      ],
+      "fixture": "fixtures/import_cases.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER",
+        "Q-MANAGED"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T33",
+      "release": "R1",
+      "scenario": "Pierwszy mesh od pustej sceny.",
+      "oracle": "Absent previous artifact nie blokuje first-build.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR01",
+        "PR08",
+        "PR12"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T34",
+      "release": "R1",
+      "scenario": "Dirty geometry przy Build Mesh.",
+      "oracle": "Apply/Discard/Cancel; zakres modelu jednoznaczny.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR07",
+        "PR11",
+        "PR12"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T35",
+      "release": "R1",
+      "scenario": "Zmiana hmax i Apply bez Build.",
+      "oracle": "Recepta nowa, artefakt stale, bez niejawnego kosztownego jobu.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR08",
+        "PR11",
+        "PR20"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T36",
+      "release": "R1",
+      "scenario": "Apply & Build, szybki double click.",
+      "oracle": "Jeden zapis intencji i jeden build.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR11",
+        "PR20"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T37",
+      "release": "R1",
+      "scenario": "Geometry zmienia się podczas meshowania.",
+      "oracle": "Wynik nie jest oznaczany current bez kompatybilności.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR08",
+        "PR09",
+        "PR11"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T38",
+      "release": "R1",
+      "scenario": "Lost ACK + więcej niż osiem późniejszych jobów.",
+      "oracle": "Lookup właściwego client_intent_id lub jawne unknown; zero duplikatów.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR11"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T39",
+      "release": "R1",
+      "scenario": "Reconnect/reload podczas jobu.",
+      "oracle": "Przywrócenie tej samej obserwacji bez resubmit.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR11",
+        "PR12"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T40",
+      "release": "R1",
+      "scenario": "Failure quality/publication po poprzednim sukcesie.",
+      "oracle": "Retained artifact z prawidłową identity i stale label.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR08",
+        "PR09",
+        "PR11"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T41",
+      "release": "R1",
+      "scenario": "Backend completed, viewport fetch fails.",
+      "oracle": "Retry Loading bez ponownej budowy.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR08",
+        "PR10",
+        "PR11"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T42",
+      "release": "R1",
+      "scenario": "sourceSceneRev > currentSceneRev, brak identity i błąd odczytu",
+      "oracle": "Przyszła rewizja inconsistent; brak identity unknown; load error osobno. Nigdy optymistyczny current.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR08",
+        "PR09",
+        "PR10"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T43",
+      "release": "R1",
+      "scenario": "Worst element → remesh → klik ponownie.",
+      "oracle": "Stale selection nie trafia w nową generację.",
+      "scope": [
+        "BROWSER",
+        "WEBGL"
+      ],
+      "pull_requests": [
+        "PR08",
+        "PR10",
+        "PR19",
+        "PR20"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-BROWSER",
+        "Q-WEBGL"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T44",
+      "release": "R1",
+      "scenario": "Quality metric z rewizji różnej od topologii.",
+      "oracle": "Wstrzymanie koloru lub jawny snapshot, zgodna legenda.",
+      "scope": [
+        "BROWSER",
+        "WEBGL"
+      ],
+      "pull_requests": [
+        "PR08",
+        "PR09",
+        "PR10",
+        "PR19",
+        "PR20"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-BROWSER",
+        "Q-WEBGL"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T45",
+      "release": "R2-Q",
+      "scenario": "SLICE-01 tetra plane z=25nm oraz degeneracje",
+      "oracle": "Trójkąt (0,0,25),(75,0,25),(0,75,25)nm; abs point tolerance 1e−20m, area 1e−28m². Następnie rzeczywisty mixed-family mesh, nie rzut.",
+      "scope": [
+        "BROWSER",
+        "WEBGL",
+        "MANAGED"
+      ],
+      "pull_requests": [
+        "PR19"
+      ],
+      "fixture": "fixtures/slice_oracle.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-BROWSER",
+        "Q-WEBGL",
+        "Q-MANAGED"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T46",
+      "release": "R1",
+      "scenario": "Wireframe/opacity/clipping.",
+      "oracle": "Brak nowych komend build i zapisów modelu.",
+      "scope": [
+        "BROWSER",
+        "WEBGL"
+      ],
+      "pull_requests": [
+        "PR10",
+        "PR19"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-BROWSER",
+        "Q-WEBGL"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T47",
+      "release": "R1",
+      "scenario": "FDM Build Grid po zmianie spacing.",
+      "oracle": "Grid i membership tej samej generacji/fingerprint.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR10",
+        "PR14"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T48",
+      "release": "R1",
+      "scenario": "FDM display stride.",
+      "oracle": "Zmiana wyłącznie próbkowania widoku, nie liczby komórek solvera.",
+      "scope": [
+        "BROWSER",
+        "WEBGL"
+      ],
+      "pull_requests": [
+        "PR10"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-BROWSER",
+        "Q-WEBGL"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T49",
+      "release": "R1",
+      "scenario": "Baseline i powtarzalny stress bez redukcji jakości",
+      "oracle": "Pomiary zgodnie z D14 i PERF-01. Do czasu zebranych danych budgets=null, status not_measured; zero udawanych FPS.",
+      "scope": [
+        "PERFORMANCE",
+        "BROWSER",
+        "WEBGL"
+      ],
+      "pull_requests": [
+        "PR01",
+        "PR19"
+      ],
+      "fixture": "fixtures/performance_scenarios.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-BROWSER",
+        "Q-WEBGL",
+        "Q-PERF"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T50",
+      "release": "R1",
+      "scenario": "Klawiatura, disabled reason, focus dialogs.",
+      "oracle": "Każdy krytyczny workflow bez wyłącznej zależności od myszy/koloru.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR07",
+        "PR12",
+        "PR15",
+        "PR18"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T51",
+      "release": "R1",
+      "scenario": "Niedozwolona geometria + poprawny transform w tym samym payloadzie",
+      "oracle": "Żadne pole nie zmienia kanonicznej sceny, rewizji ani historii; jednoznaczne odrzucenie.",
+      "scope": [
+        "API",
+        "FAULT_INJECTION",
+        "BROWSER"
+      ],
+      "pull_requests": [
+        "PR05"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T52",
+      "release": "R1",
+      "scenario": "Dwaj writerzy z jednym base_revision",
+      "oracle": "Końcowy CAS: dokładnie jeden commit i conflict drugiego; żadna utracona aktualizacja, także po asynchronicznych etapach walidacji.",
+      "scope": [
+        "API",
+        "FAULT_INJECTION",
+        "BROWSER"
+      ],
+      "pull_requests": [
+        "PR05"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T53",
+      "release": "R1",
+      "scenario": "Effect/receipt crash + replay tego samego intent",
+      "oracle": "Jedna zmiana modelu; lookup potwierdza ten sam wynik; crash window nie pozwala drugiej mutacji.",
+      "scope": [
+        "API",
+        "FAULT_INJECTION",
+        "BROWSER"
+      ],
+      "pull_requests": [
+        "PR05",
+        "PR06"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T54",
+      "release": "R1",
+      "scenario": "Wpis rawText po submit przed ACK",
+      "oracle": "Nowa edycja pozostaje w tym samym polu i ma dirty=true; ACK aktualizuje baseline, nie nadpisuje nowszego tekstu.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR02",
+        "PR06",
+        "PR07"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T55",
+      "release": "R1",
+      "scenario": "Object/Airbox stability przy pending/refetch/ACK",
+      "oracle": "Ten sam DOM root, focus i scroll; zero unrelated disabled/opacity zmian i aktywnych opacity animations; request/render counts zapisane.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR01",
+        "PR02",
+        "PR07",
+        "PR12",
+        "PR15",
+        "PR18"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T56",
+      "release": "R1",
+      "scenario": "Wpis numeryczny 1 pm przy bazie 100 nm i klasyfikacja no-op w SI",
+      "oracle": "NUM-01: Lchar=100 nm, a=0 m, b=1 pm i epsilon=8 ulp(Lchar) daje no-op=false; parser zachowuje rozróżnienie valid/incomplete/invalid oraz wartość po konwersji do SI. Ten test nie kwalifikuje snap ani screen-space threshold.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR04",
+        "PR07"
+      ],
+      "fixture": "fixtures/numeric_oracles.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T57",
+      "release": "R1",
+      "scenario": "SSR → hydration → journal restore i unmount",
+      "oracle": "Pierwszy client snapshot zgodny z SSR; brak cross-session draft; remount viewport nie niszczy journal.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR06",
+        "PR07"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T58",
+      "release": "R1",
+      "scenario": "Build Selected z drugim obiektem/interfejsem/airbox",
+      "oracle": "Raport actual scope jest zgodny z potwierdzonym full shared-domain planem; selection context nie udaje local artifact.",
+      "scope": [
+        "API",
+        "BROWSER",
+        "MANAGED"
+      ],
+      "pull_requests": [
+        "PR11"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER",
+        "Q-MANAGED"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T59",
+      "release": "R2-I",
+      "scenario": "Przeniesienie projektu offline na inny host",
+      "oracle": "Oryginalny asset SHA256 i source-unit/version zachowane, brak bezwzględnych ścieżek wymaganych do odtworzenia.",
+      "scope": [
+        "API",
+        "BROWSER",
+        "MANAGED"
+      ],
+      "pull_requests": [
+        "PR17",
+        "PR18"
+      ],
+      "fixture": "fixtures/import_cases.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER",
+        "Q-MANAGED"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T60",
+      "release": "R1",
+      "scenario": "Crash przed/po activation marker + quality optional",
+      "oracle": "Aktywna generacja jest kompletna; stara pozostaje przed markerem; brak optional quality nie unieważnia poprawnej topologii.",
+      "scope": [
+        "API",
+        "BROWSER",
+        "MANAGED"
+      ],
+      "pull_requests": [
+        "PR08",
+        "PR09",
+        "PR10",
+        "PR20"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER",
+        "Q-MANAGED"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T61",
+      "release": "R1",
+      "scenario": "Start run konkuruje z Apply/import/remesh",
+      "oracle": "Backend admission serializuje rozstrzygnięcie; aktywny run nie zostaje zmodyfikowany, local draft pozostaje.",
+      "scope": [
+        "API",
+        "BROWSER",
+        "MANAGED"
+      ],
+      "pull_requests": [
+        "PR05",
+        "PR13"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER",
+        "Q-MANAGED"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T62",
+      "release": "R2-T",
+      "scenario": "Legacy nonzero pivot → pivot-v1 migration",
+      "oracle": "Zachowanie zadeklarowanej world matrix po jawnej migracji; brak automatycznej interpretacji nieznanej legacy semantyki.",
+      "scope": [
+        "SPEC",
+        "API",
+        "BROWSER"
+      ],
+      "pull_requests": [
+        "PR13",
+        "PR14"
+      ],
+      "fixture": "fixtures/transform_oracles.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T63",
+      "release": "R1",
+      "scenario": "API schema/OpenAPI/facade i starszy klient",
+      "oracle": "Nowe typy i kontrolki powiązane z capability; transform full DTO nie resetuje q/p/s; unsupported write odrzucony.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR05",
+        "PR13",
+        "PR16",
+        "PR17"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T64",
+      "release": "R2-T",
+      "scenario": "Macierz FDM CPU/GPU i FEM CPU/GPU",
+      "oracle": "Osobne wyniki points/bounds/occupancy/mesh/physics dla deklarowanych lane i precision; zero silent fallback.",
+      "scope": [
+        "SPEC",
+        "API",
+        "MANAGED",
+        "PHYSICS"
+      ],
+      "pull_requests": [
+        "PR13",
+        "PR14",
+        "PR17"
+      ],
+      "fixture": "fixtures/transform_oracles.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-MANAGED",
+        "Q-PHYSICS"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T65",
+      "release": "R1",
+      "scenario": "Unknown ordinary mutation po reload; receipt expired/indeterminate",
+      "oracle": "Bez ślepego resubmit; owner-scoped lookup; tombstone i brak bezpiecznego dowodu blokują powtórzenie; historia deduplikowana.",
+      "scope": [
+        "API",
+        "FAULT_INJECTION",
+        "BROWSER"
+      ],
+      "pull_requests": [
+        "PR05",
+        "PR06"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T66",
+      "release": "R1",
+      "scenario": "Policy saved → build rejected / scene changed",
+      "oracle": "Nie cofa poprawnego zapisu; komunikat częściowego sukcesu, nowa confirmation po zmianie sceny; zero duplicate job.",
+      "scope": [
+        "API",
+        "FAULT_INJECTION",
+        "BROWSER"
+      ],
+      "pull_requests": [
+        "PR11"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T67",
+      "release": "R1",
+      "scenario": "Geometry→Placement→Mesh Policy / inne object / Start",
+      "oracle": "Ten sam draft przy zmianie view tego obiektu; jawny guard przy zmianie scope; Apply-and-continue nie usuwa post-submit edits.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR07",
+        "PR12"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T68",
+      "release": "R1",
+      "scenario": "Rename-only kontra legacy revision-only freshness",
+      "oracle": "Digest path pozostaje current dla nieistotnej zmiany nazwy; legacy path konserwatywnie stale; jeden resolver we wszystkich panelach/Run.",
+      "scope": [
+        "BROWSER",
+        "API"
+      ],
+      "pull_requests": [
+        "PR08",
+        "PR09",
+        "PR10"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T69",
+      "release": "R2-Q",
+      "scenario": "Metric/family/orientation/invalid elements i refinement",
+      "oracle": "Zgodna generation+metric/version+domain; orientation oddzielna, invalid flags blokują gdy mandatory; refinement tworzy receptę, nie topologię w UI.",
+      "scope": [
+        "API",
+        "BROWSER",
+        "MANAGED"
+      ],
+      "pull_requests": [
+        "PR09",
+        "PR19",
+        "PR20"
+      ],
+      "fixture": "fixtures/mesh_generations.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER",
+        "Q-MANAGED"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T70",
+      "release": "R1",
+      "scenario": "Bramki release/host storage/test restrictions",
+      "oracle": "Żadna blocked gate nie ma PASS; dowody SHA/środowisko; respect unit-compilation ban i managed-runtime ownership.",
+      "scope": [
+        "GOVERNANCE"
+      ],
+      "pull_requests": [
+        "PR12"
+      ],
+      "fixture": "fixtures/authoring_sequences.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-POLICY"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T71",
+      "release": "R2-T",
+      "scenario": "Transform frames a pole world / lokalna anizotropia / reinit",
+      "oracle": "Wynik zgodny z zatwierdzoną notą naukową; nie projektować poprzedniej magnetyzacji bez zakwalifikowanego transferu.",
+      "scope": [
+        "SPEC",
+        "API",
+        "MANAGED",
+        "PHYSICS"
+      ],
+      "pull_requests": [
+        "PR14"
+      ],
+      "fixture": "fixtures/transform_oracles.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-MANAGED",
+        "Q-PHYSICS"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    },
+    {
+      "id": "T72",
+      "release": "R2-I",
+      "scenario": "Limity stage, worker quotas, lease, referenced asset cleanup",
+      "oracle": "Bytes/count checked przed alokacją; cancellation idempotent; expiring stage nie usuwa source referencjonowanego przez projekt.",
+      "scope": [
+        "API",
+        "BROWSER",
+        "MANAGED"
+      ],
+      "pull_requests": [
+        "PR16",
+        "PR17",
+        "PR18"
+      ],
+      "fixture": "fixtures/import_cases.json",
+      "fixture_state": "specification_only_adapter_required",
+      "recipes": [
+        "Q-API",
+        "Q-BROWSER",
+        "Q-MANAGED"
+      ],
+      "evidence": [
+        "commit and source snapshot",
+        "fixture sha256",
+        "expected/actual",
+        "request/receipt/command/generation identities",
+        "runtime lane and precision or not-applicable",
+        "browser trace/screenshot where applicable"
+      ],
+      "status": "planned_not_run",
+      "production_unit_compilation": "blocked_by_repository_policy_until_revoked"
+    }
+  ],
+  "interpretation": "Planning matrix. No production tests executed by this document revision."
+}

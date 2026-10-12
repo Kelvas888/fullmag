@@ -1,0 +1,26 @@
+{
+  "scope": "document package checks, not Fullmag qualification",
+  "mode": "structural_before_manifest",
+  "status": "pass",
+  "checked": {
+    "findings": 28,
+    "sources": 32,
+    "pull_requests": 20,
+    "tests": 72,
+    "questions": 24,
+    "evidence_classes": {
+      "L": 7,
+      "C": 5,
+      "R": 10,
+      "G": 6
+    },
+    "unchanged_historical_reproduction_files": 4,
+    "historical_manifest_sha256": "d635a2619655b71f66685ad86f8069988d12020410f3269764af9688cbe9b3d0",
+    "local_markdown_links": 122,
+    "transition_rows": 24,
+    "markdown_documents": 15,
+    "ui_mockups": 7,
+    "system_diagrams": 4
+  },
+  "errors": []
+}

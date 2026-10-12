@@ -1,0 +1,231 @@
+{
+  "id": "EDIT-01",
+  "kind": "planned_fixture_contract",
+  "object_id": "obj-fixture-001",
+  "scene_revision": 10,
+  "geometry": {
+    "geometry_kind": "Cylinder",
+    "geometry_params": {
+      "radius": 5e-08,
+      "height": 1e-08
+    }
+  },
+  "transform": {
+    "translation": [
+      0,
+      0,
+      0
+    ],
+    "rotation_quat": [
+      0,
+      0,
+      0,
+      1
+    ],
+    "scale": [
+      1,
+      1,
+      1
+    ],
+    "pivot": [
+      0,
+      0,
+      0
+    ]
+  },
+  "events": [
+    {
+      "event": "field-edit",
+      "group": "radius",
+      "value_m": 8e-08
+    },
+    {
+      "event": "pointerup",
+      "draft_translation_m": [
+        3e-07,
+        0,
+        0
+      ],
+      "expected_mutation_count": 0
+    },
+    {
+      "event": "apply",
+      "expected_transaction_kind": "patch_object_geometry",
+      "expected_mutation_count": 1,
+      "expected_scene_revision": 11
+    },
+    {
+      "event": "post-submit-field-edit",
+      "group": "radius",
+      "raw_text": "90 nm",
+      "expected_after_ack": "90 nm remains dirty; baseline radius 80 nm"
+    }
+  ],
+  "concurrency": {
+    "writers": [
+      "A",
+      "B"
+    ],
+    "same_base_revision": 10,
+    "expected": "exactly one commit; other conflict unless one was rejected before admission"
+  },
+  "states": {
+    "unknown_ack": "no new intent; lookup same owner+intent",
+    "session_ABA": {
+      "intent": {
+        "client_intent_id": "intent-session-A-epoch-1",
+        "draft_id": "draft-session-A-epoch-1",
+        "object_id": "obj-fixture-001",
+        "base_scene_revision": 10,
+        "session_id": "A",
+        "kernel_epoch": 1
+      },
+      "events": [
+        {
+          "event": "submit",
+          "client_intent_id": "intent-session-A-epoch-1",
+          "session_id": "A",
+          "kernel_epoch": 1
+        },
+        {
+          "event": "session-switch",
+          "from_session_id": "A",
+          "to_session_id": "B",
+          "kernel_epoch": 2
+        },
+        {
+          "event": "session-switch",
+          "from_session_id": "B",
+          "to_session_id": "A",
+          "kernel_epoch": 3
+        },
+        {
+          "event": "late-ack",
+          "client_intent_id": "intent-session-A-epoch-1",
+          "session_id": "A",
+          "kernel_epoch": 1,
+          "committed_scene_revision": 11
+        }
+      ],
+      "expected": {
+        "reconcile_only_original_owner_and_intent": true,
+        "active_session_id": "A",
+        "active_kernel_epoch": 3,
+        "publish_to_active_epoch_3": false,
+        "active_draft_unchanged": true,
+        "selection_unchanged": true,
+        "current_epoch_feedback": false,
+        "original_intent_history_entries_max": 1
+      }
+    },
+    "target_deleted_pending": {
+      "intent": {
+        "client_intent_id": "intent-delete-race-1",
+        "draft_id": "draft-delete-race-1",
+        "object_id": "obj-fixture-001",
+        "base_scene_revision": 10,
+        "session_id": "A",
+        "kernel_epoch": 1
+      },
+      "branches": {
+        "delete_wins": {
+          "events": [
+            {
+              "event": "submit",
+              "client_intent_id": "intent-delete-race-1",
+              "object_id": "obj-fixture-001",
+              "base_scene_revision": 10
+            },
+            {
+              "event": "remote-delete-committed",
+              "object_id": "obj-fixture-001",
+              "scene_revision": 11
+            },
+            {
+              "event": "patch-result",
+              "status": "rejected",
+              "code": "TARGET_DELETED"
+            }
+          ],
+          "expected": {
+            "phase": "target-missing",
+            "draft_retained_for_export_only": true,
+            "apply_enabled": false,
+            "selection_resolves_target": false,
+            "history_entries": 0,
+            "object_recreated_or_upserted": false
+          }
+        },
+        "commit_wins": {
+          "events": [
+            {
+              "event": "submit",
+              "client_intent_id": "intent-delete-race-1",
+              "object_id": "obj-fixture-001",
+              "base_scene_revision": 10
+            },
+            {
+              "event": "patch-committed",
+              "client_intent_id": "intent-delete-race-1",
+              "scene_revision": 11
+            },
+            {
+              "event": "remote-delete-committed",
+              "object_id": "obj-fixture-001",
+              "scene_revision": 12
+            },
+            {
+              "event": "late-ack",
+              "client_intent_id": "intent-delete-race-1",
+              "committed_scene_revision": 11
+            },
+            {
+              "event": "reconcile-current-scene",
+              "scene_revision": 12,
+              "object_present": false
+            }
+          ],
+          "expected": {
+            "phase": "target-missing",
+            "committed_intent_reconciled_once": true,
+            "selection_resolves_target": false,
+            "draft_resurrected": false,
+            "executable_undo_for_missing_target": false,
+            "object_recreated_or_upserted": false
+          }
+        }
+      }
+    }
+  },
+  "airbox_stability_case": {
+    "base_revision": 20,
+    "baseline_policy": {
+      "padding_m": [
+        1e-06,
+        1e-06,
+        1e-06
+      ],
+      "hmin_m": 5e-09,
+      "hmax_m": 5e-08
+    },
+    "submitted_hmax_m": 8e-08,
+    "post_submit_raw_hmax": "100 nm",
+    "ack_revision": 21,
+    "expected_baseline_hmax_m": 8e-08,
+    "expected_visible_raw_hmax": "100 nm",
+    "expected_dirty_after_ack": true,
+    "unrelated_controls": [
+      "visibility",
+      "opacity",
+      "camera",
+      "collapsible sections"
+    ],
+    "dom_contract": {
+      "same_panel_root": true,
+      "focus_preserved": true,
+      "scroll_top_before": 240,
+      "scroll_top_after": 240,
+      "selection_range_preserved_where_supported": true
+    }
+  }
+}

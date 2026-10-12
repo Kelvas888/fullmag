@@ -1,0 +1,146 @@
+[
+  {
+    "id": "S01",
+    "path": "apps/control-room/src/modules/inspector/panels/GeometryObjectPanel.tsx",
+    "scope": "65–1080; także wcześniejszy odczyt początku",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/GeometryObjectPanel.tsx"
+  },
+  {
+    "id": "S02",
+    "path": "apps/control-room/src/modules/inspector/panels/geometryObjectPanelModel.ts",
+    "scope": "1–660",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/geometryObjectPanelModel.ts"
+  },
+  {
+    "id": "S03",
+    "path": "apps/control-room/src/modules/inspector/InspectorEditSession.tsx",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/InspectorEditSession.tsx"
+  },
+  {
+    "id": "S04",
+    "path": "apps/control-room/src/modules/inspector/InspectorModule.tsx",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/InspectorModule.tsx"
+  },
+  {
+    "id": "S05",
+    "path": "apps/control-room/src/modules/inspector/panels/DedicatedExplorerInspectorPanels.tsx",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/DedicatedExplorerInspectorPanels.tsx"
+  },
+  {
+    "id": "S06",
+    "path": "apps/control-room/src/kernel/authoring/geometryLifecycleCommands.ts",
+    "scope": "1–380",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/kernel/authoring/geometryLifecycleCommands.ts"
+  },
+  {
+    "id": "S07",
+    "path": "apps/control-room/src/kernel/authoring/objectTranslationMutation.ts",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/kernel/authoring/objectTranslationMutation.ts"
+  },
+  {
+    "id": "S08",
+    "path": "apps/control-room/src/kernel/authoring/objectMoveConflictWorkflow.ts",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/kernel/authoring/objectMoveConflictWorkflow.ts"
+  },
+  {
+    "id": "S09",
+    "path": "apps/control-room/src/modules/viewport-3d/Viewport3DObjectMoveInteraction.tsx",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/viewport-3d/Viewport3DObjectMoveInteraction.tsx"
+  },
+  {
+    "id": "S10",
+    "path": "apps/control-room/src/modules/viewport-3d/MoveObjectGizmo.tsx",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/viewport-3d/MoveObjectGizmo.tsx"
+  },
+  {
+    "id": "S11",
+    "path": "apps/control-room/src/modules/viewport-3d/MoveObjectGizmo.test.tsx",
+    "scope": "1–330 / cały zwrócony plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/viewport-3d/MoveObjectGizmo.test.tsx"
+  },
+  {
+    "id": "S12",
+    "path": "apps/control-room/src/modules/start/model/importFormats.ts",
+    "scope": "cały plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/start/model/importFormats.ts"
+  },
+  {
+    "id": "S13",
+    "path": "crates/fullmag-api/src/assets.rs",
+    "scope": "1–250",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/crates/fullmag-api/src/assets.rs"
+  },
+  {
+    "id": "S14",
+    "path": "apps/control-room/src/modules/ribbon/ribbonCommands.ts",
+    "scope": "1–360",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/ribbon/ribbonCommands.ts"
+  },
+  {
+    "id": "S15",
+    "path": "apps/control-room/src/modules/ribbon/ribbonContributions.tsx",
+    "scope": "1–230, 285–426 oraz fragment definicji Mesh",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/ribbon/ribbonContributions.tsx"
+  },
+  {
+    "id": "S16",
+    "path": "apps/control-room/src/modules/inspector/panels/MeshDetailsPanel.tsx",
+    "scope": "1–350",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/MeshDetailsPanel.tsx"
+  },
+  {
+    "id": "S17",
+    "path": "apps/control-room/src/modules/inspector/panels/mesh-details/useMeshDetailsModel.ts",
+    "scope": "1–320, 350–koniec",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/mesh-details/useMeshDetailsModel.ts"
+  },
+  {
+    "id": "S18",
+    "path": "apps/control-room/src/modules/inspector/panels/ObjectMeshPolicyPanel.tsx",
+    "scope": "1–350, 1000–koniec",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/ObjectMeshPolicyPanel.tsx"
+  },
+  {
+    "id": "S19",
+    "path": "apps/control-room/src/modules/overlay/MeshBuildDialog.tsx",
+    "scope": "1–360",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/overlay/MeshBuildDialog.tsx"
+  },
+  {
+    "id": "S20",
+    "path": "apps/control-room/src/kernel/authoring/geometryLifecycleCommandContributions.ts",
+    "scope": "1–250, 500–860",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/kernel/authoring/geometryLifecycleCommandContributions.ts"
+  },
+  {
+    "id": "S21",
+    "path": "apps/control-room/src/kernel/authoring/authoringHistoryMutation.ts",
+    "scope": "1–340 / cały zwrócony plik",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/kernel/authoring/authoringHistoryMutation.ts"
+  },
+  {
+    "id": "S22",
+    "path": "apps/control-room/src/modules/viewport-3d/viewport3dPrimitiveModel.ts",
+    "scope": "1–340, 435–koniec",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/viewport-3d/viewport3dPrimitiveModel.ts"
+  },
+  {
+    "id": "S23",
+    "path": "apps/control-room/src/modules/inspector/panels/fdm-grid/FdmGridInspectorPanel.tsx",
+    "scope": "1–340",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/src/modules/inspector/panels/fdm-grid/FdmGridInspectorPanel.tsx"
+  },
+  {
+    "id": "S24",
+    "path": "apps/control-room/package.json",
+    "scope": "1–120",
+    "url": "https://github.com/MateuszZelent/fullmag/blob/2a3c6becb9c7e111ae1497ec0cd9ac9576acba95/apps/control-room/package.json"
+  }
+]
