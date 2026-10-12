@@ -5,6 +5,7 @@ on:
   push:
     branches: ['codex/**']
     paths:
+      - 'crates/fullmag-authoring/src/adapters.rs'
       - 'packages/fullmag-py/src/fullmag/model/study.py'
       - 'packages/fullmag-py/src/fullmag/runtime/scene_document.py'
       - 'packages/fullmag-py/tests/test_api.py'
@@ -39,3 +40,20 @@ jobs:
           packages/fullmag-py/tests/test_api.py
           packages/fullmag-py/tests/test_scratch_authoring_ui_roundtrip.py
           -k eigen_solver
+
+  scene-solver-policy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Preserve exact source identity
+        run: git rev-parse HEAD
+      - name: Validate actual scene solver policy round-trip
+        run: |
+          set -o pipefail
+          cargo test --locked -p fullmag-authoring --lib eigen_solver_policy -- --nocapture | tee "$RUNNER_TEMP/eigen-scene-policy.log"
+          grep -F "scene_override_preserves_explicit_eigen_solver_policy ... ok" "$RUNNER_TEMP/eigen-scene-policy.log"
+          grep -F "scene_override_omits_unset_eigen_solver_policy_for_legacy_stage ... ok" "$RUNNER_TEMP/eigen-scene-policy.log"
+          grep -F "scene_override_preserves_explicit_eigen_solver_policy_clears_and_mixed_values ... ok" "$RUNNER_TEMP/eigen-scene-policy.log"

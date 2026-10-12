@@ -1022,3 +1022,8 @@ Potwierdzone GHA:38232017811 SUCCESS (84tests,24subtests) dla Python solver_poli
 4243099642: ACK import/pin/unpin uniewaznia definitions i MODEL_SCENE_PATH z rewizja odpowiedzi. Existing history clear i obsolete-session fences zachowane; no-op/reject nie uniewazniaja zasobow. CI rozszerzono o nowy test zasobu. SOURCE review PASS; GHA/typecheck/Doctor oraz browser pozostaja NOT VERIFIED.
 
 Kanoniczny pipeline4243102022: GHA38233156553 SUCCESS, oba nowe testy rzeczywistej materializacji PASS,63filtered. Nie jest to dowod runtime FEM.
+
+
+## Zachowanie solver policy w projekcji sceny
+
+4242140004: Rust scene_document_to_script_builder_overrides przenosi trzy jawnie obecne keys z stage.extra bez zmiany serde_json::Value. Brak key pozostaje omission; null i pusty string zachowuja authored clear. Istniejacy Python script_builder konsumuje te overrides; brak zmian schema/defaultow i PBC/DMI. Trzy rzeczywiste builder-scene-overrides regressions obejmuja explicit values, legacy absence i mixed clears. Rust parser/source review PASS; hosted authoring workflow wymaga wszystkich trzech nazw w logu oraz Python suite. Runtime FEM/science pozostaja NOT VERIFIED.
