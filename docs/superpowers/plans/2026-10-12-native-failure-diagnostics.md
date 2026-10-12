@@ -15,3 +15,12 @@ Poprzedni failure JSON byl uciety do2048 znakow. Nowy failure-only komunikat zac
 Pelny last_true_probe wykazuje recursive residual0, default reason3, true residual3.303550706404569e-10 wobec threshold2.4125808521746334e-14. Actual ratio13693.015524958842; true-residual gate poprawnie odrzuca konwergencje. LivePC residual7.542700548525e-8, exact Pmat entries matched i Frobenius defect0. FreshLU NONZERO i NONE oba okolo5.150782251730459e-16. To lokalizuje roznice zachowania live/fresh solve, lecz nie dowodzi jej przyczyny ani perturbacji faktorow.
 
 Nie zmieniono production operators, fizyki, tolerancji, preconditionera ani kryteriow. KSPGMRESSetBreakdownTolerance nie jest HapTol. Nowy CPP compile/runtime i kwalifikacja naukowa pozostaja NOT VERIFIED. Dalsza naprawa musi wynikac z nowych logow i niezaleznej kontroli live factorization lifecycle.
+
+
+## Nowy dowod pattern i mixed - GHA38237149103
+
+Source01f2112b nadal9/12PASS. Pattern completeJSON8581:statusOK accepted1,4truecriterion pomiary0violations,maxratio0.0019653927028332276. Serializer observer publikuje tylko dla floquet_slepc_solve_failed, mimo cached capture dla innych wynikow. Brak borrowed_pmat_copy przy sukcesie nie dowodzi braku hooka.
+
+Fixture pattern teraz nie stosuje specjalnego FIELD-only override z fault-quarantine cases; zachowuje bazowy historycznyCSR carrier oraz maxlinear1/rtol/target/privatehook i wszystkie mismatch/cleanupguards. To warunek istniejącego hard-nearest testu, a nie pełny model fizyczny. Nowy runtime NOT VERIFIED. Nie zmieniono production solvera ani tolerancji.
+
+Mixed73 kompletneJSON:subwindow1 shift0.6537857698010644Hz, true residual1.8635310157807875e-10/threshold2.4343592418709787e-14, ratio7655.1191941109355, recursive0/defaultreason3/gate0. LivePC relative residual7.838566796905665e-8, fresh NONZERO/NONE1.201422675269101e-16, exactPmat defect0 i cleanup/phi invariants true. Jest to rzeczywisty fail true-residual gate. Sama zgodność wpisów Pmat nie dowodzi zgodności faktorów; numerical rootcause nadal otwarty.

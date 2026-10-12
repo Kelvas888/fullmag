@@ -7927,8 +7927,12 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
         fixture.payload.magnetic_a_qq_csr = magnetic_stiffness.view();
     }
 
+    // The pattern probe retains the baseline legacy CSR carrier and its
+    // one-iteration hard-KSP precondition: the private observer is serialized
+    // only on floquet_slepc_solve_failed. The FIELD-only fault carrier can
+    // converge successfully and hide that evidence without proving a mismatch.
     if (fault_quarantine_only || borrowed_pmat_row_restore_fault_only ||
-        borrowed_pmat_primary_cleanup_fault_only || pattern_mismatch_fixture_only) {
+        borrowed_pmat_primary_cleanup_fault_only) {
         fixture.descriptor.term_presence_mask =
             FULLMAG_FEM_MODAL_LINEARIZATION_TERM_FIELD;
         fixture.descriptor.field_term_digest =
