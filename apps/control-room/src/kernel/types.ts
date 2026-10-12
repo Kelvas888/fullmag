@@ -76,7 +76,7 @@ export interface KernelApi {
   readonly api: ControlRoomApi;
   readonly analysisFieldOverlay: AnalysisFieldOverlayController;
   readonly authoringHistory?: AuthoringHistoryController;
-  readonly objectEditSession?: ObjectEditSessionController<GeometryObjectDraft>;
+  readonly objectEditSession: ObjectEditSessionController<GeometryObjectDraft>;
   readonly pendingForms?: PendingFormRegistry;
   readonly bus: EventBus<KernelEventMap>;
   readonly chartViewportHandoff: ChartViewportHandoffController;
