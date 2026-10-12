@@ -69,9 +69,29 @@ Przyszły zapis żądania musi przypiąć właściciela wykonania, identyfikator
 commit, snapshot i source digest, ścieżkę terminalnego pakietu, kapsułę źródeł,
 storage root, świeży output root, rzeczywiste ścieżki i SHA-256 projektu,
 profilu i budżetu, jawny interpreter obrazu oraz `solve_timeout_seconds`
-w zakresie 1..3600. Nie ustanawiamy tutaj nowego produkcyjnego schema ID:
-format zatwierdza właściciel istniejącej trasy runtime przed wysłaniem.
+w zakresie 1..3600. Istniejący launcher definiuje już schema ID
+`fullmag.accepted-closed-loop-launch.v1`; nie należy tworzyć konkurencyjnego formatu.
 Kontrola musi odrzucać brakujące wartości zamiast uzupełniać je placeholderami.
+
+`scripts/launch_accepted_closed_loop_runtime.py::launch` przyjmuje dokładnie
+14 kluczy: `schema`, `repo_root`, `source_capsule`, `managed_build_run_root`,
+`output_root`, `image`, `commit`, `snapshot`, `source_digest`,
+`solve_timeout_seconds`, `driver`, `project`, `execution_profile`, `resources`.
+Ostatnie cztery są obiektami zawierającymi dokładnie `path` i `sha256`.
+Właściciel jest generowany przez launcher, nie dostarczany jako dodatkowe pole.
+Storage jest rozwiązywany z `repo_root`; interpreter to `/usr/bin/python3`
+w przypiętym obrazie. Obraz wymaga pełnego `sha256:` digest, Linux/amd64.
+Driver musi wskazywać dokładny plik `scripts/verify_accepted_closed_loop_runtime.py`
+z kapsuły, zgodny ścieżką, rozmiarem i hashem z manifestem.
+
+`repo_root` kapsuły żądania jest checkoutem używanym do resolvera storage;
+nie mylić go z flagą `--repo-root` drivera, którą launcher ustawia na
+`/probe/project/worktrees/source/tree`. Wejścia są kopiowane i montowane
+read-only pod `/probe/input`; pakiet pod `/probe/project/storage/import/build/{job}`.
+Tylko dedykowane proof i runs są zapisywalne. Kontener nie ma sieci, portów
+ani GPU; ma 2 CPU, 4 GiB RAM, użytkownika 65532, read-only root i limit 256 PID.
+Nie zastępować publicznego tworzenia projektu wywołaniem z tego offline kontenera:
+projekt musi powstać wcześniej przez zgodne prywatne API i zostać przypięty.
 
 Przed uruchomieniem sprawdzić limit plików: projekt 64 MiB, profil 1 MiB,
 budżet 64 KiB; dodatni rozmiar, absolutna ścieżka, brak symlinków w rodzicach,
@@ -125,6 +145,8 @@ oddzielną bramką po udanym przebiegu i podłączeniu danych do UI.
 - `examples/fem_antenna_closed_loop_nonmagnetic.py::study` — wejście fizyczne.
 - `scripts/verify_accepted_closed_loop_runtime.py::{main,run,validate_budget,one_task,preparation_proof,public_output,fixed_bytes}` — flagi i bramki.
 - `scripts/managed_fem_runtime_package.py::{load_package,runtime_runs_root}` — pakiet i storage.
+- `scripts/launch_accepted_closed_loop_runtime.py::{SCHEMA,launch,attest,image_admission}` — kapsuła i izolacja wykonania.
+- `scripts/test_launch_accepted_closed_loop_runtime.py::Admission` — interpretowane negatywy bez Dockera.
 - `crates/fullmag-cli/src/accepted_script_run.rs::submit_script` — capture i lowering.
 - `crates/fullmag-cli/src/accepted_run_transport.rs::submit_run_request` — publiczne operacje.
 - `crates/fullmag-api/src/schemas/projects.rs::{ProjectCreateRequest,ProjectDocumentResource}` i `router_v2/handlers/persistence/projects.rs::create` — projekt bytes-only.
@@ -138,3 +160,19 @@ Porównanie dziesięciu powyższych plików źródłowych z pełnym commitem
 `67ddd77c9d7bee6459f796788c6ed6fe507cb6f5`: pusty diff, exit code 0.
 Nie jest to terminalna publikacja naukowa ani nowa definicja fizyki;
 równania, jednostki i kwalifikacja operatora pozostają własnością noty 0950.
+
+Uzupełnienie dowodu 2026-10-12: launcher również ma pusty diff względem tego
+commita. Interpretowany unittest jego admission: 10 testów, 9 zaliczonych,
+1 pominięty z powodu braku uprawnienia hosta do symlinków, exit code 0.
+Wywołania Docker są mockowane; ten wynik nie dowodzi działającego kontenera,
+rzeczywistego preflight pakietu ani pola anteny. Pliki tymczasowe były na D.
+
+Interpretowane `scripts/test_verify_accepted_closed_loop_runtime.py::ClosedLoopVerifierTests`:
+18 testów, 17 zaliczonych, 1 pominięty (symlinki), exit code 0.
+Sprawdzono negatywy owner/run/stage/attempt/epoch/revision, state-free bundle,
+budżet, hashe, rozmiar, fingerprint, prywatny klon oraz ograniczanie logów
+małego procesu Pythona. Dwa pliki suite mają pusty diff względem przypiętego commita.
+Test overflow zgłosił `ResourceWarning` dla PID 65344, ponieważ obserwacja
+jest przerywana bez zabijania procesu; kolejna kontrola `Get-Process` nie
+znalazła PID. Nie uznawać samego zielonego unittest za dowód poprawnego
+zarządzania wszystkimi procesami rzeczywistego solvera.
