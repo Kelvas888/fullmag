@@ -1,7 +1,7 @@
 #![allow(non_snake_case)]
 #[allow(unused_imports)]
 use crate::{
-    BackendTarget, DiscretizationHintsIR, ExecutionPrecision, FrequencyExcitationIR,
+    BackendTarget, DiscretizationHintsIR, EigenSpectrumScopeIR, ExecutionPrecision, FrequencyExcitationIR,
     FrequencyResponseOutputIR, FrequencySweepIR, IntegratorChoice, KPointIR,
     MagnetostaticBoundaryConditionIR, MechanicsIR, ModeTrackingIR, RelaxationAlgorithmIR,
     RelaxationControlIR, RequestedFemDemagIR, ResolvedFemDemagIR, SampleSelectorIR,
@@ -1678,19 +1678,6 @@ impl StudyIR {
                 stop: stop.clone(),
             }),
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum EigenSpectrumScopeIR {
-    PerSample,
-    Global,
-}
-
-impl Default for EigenSpectrumScopeIR {
-    fn default() -> Self {
-        Self::PerSample
     }
 }
 

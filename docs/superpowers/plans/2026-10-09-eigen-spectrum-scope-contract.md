@@ -51,3 +51,8 @@ Wszystkie etapy sa autoryzowana realizacja zaakceptowanej decyzji uzytkownika; s
 CI38243351489 wykryl brak fieldscope w Self::EigenSpectrum w v04_spectral_wire. Ten adapter strict deny_unknown_fields, wiec przed naprawa scope w0.4 byl odrzucany, nie po cichu ignorowany jak w legacySerde. Dodano typed optional scope takze OutputV04Wire i bezstratne przekazanie doOutputIR. Regresje obejmuja standalone/root wszystkich5studytypow, historyczne omission, obie scope i malformed/selected/per_run rejection. Testy0.3 same nie byly wystarczajaca bramka.
 
 Planner deduplikacja quantity-only nie pozwalala dwom scope dotrzec dowritera. Klucz teraz uwzglednia effective scope: per_sample+global legalne, None+explicitper_sample nadalduplicate, global+global duplicate. ActualProblemIR->plan->ExecutionPlanIR roundtrip zachowuje oba authoredoutputs. Nie oznacza to jeszcze writer/API/UI wdrozenia.
+
+
+### Kanoniczny typ zakresu — korekta po CI 38245737002
+
+Kompilacja wykazała duplikat `EigenSpectrumScopeIR` w `study` i `eigen_contract`. OutputIR i adapter 0.4 korzystają teraz z istniejącego typu `eigen_contract::EigenSpectrumScopeIR`, wspólnego również z wcześniejszym kontraktem eigensolve. Dodano default `PerSample` na kanonicznym typie; nie zmieniono nazw wire ani intencji authoringu. Usunięto drugi enum zamiast wprowadzać konwersje między identycznymi typami. Weryfikacja wykonania testów pozostaje pending do nowego CI.

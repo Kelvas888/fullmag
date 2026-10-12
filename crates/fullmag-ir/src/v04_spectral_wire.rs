@@ -1,7 +1,7 @@
-use crate::eigen_contract::{KPointIR, SampleSelectorIR};
+use crate::eigen_contract::{EigenSpectrumScopeIR, KPointIR, SampleSelectorIR};
 use crate::study::{
     AutosaveFormatIR, AutosaveLayoutIR, EquilibriumSourceIR, FieldAutosaveIR, KSamplingIR,
-    EigenSpectrumScopeIR, OutputIR, SamplingIR, SamplingPeriodPolicyIR, StageAutosaveIR, TableAutosaveIR,
+    OutputIR, SamplingIR, SamplingPeriodPolicyIR, StageAutosaveIR, TableAutosaveIR,
 };
 use crate::FrequencyResponseOutputIR;
 use serde::de::{DeserializeSeed, SeqAccess, Visitor};

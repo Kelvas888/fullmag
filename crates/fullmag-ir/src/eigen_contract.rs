@@ -55,6 +55,12 @@ pub enum EigenSpectrumScopeIR {
     PerSample,
 }
 
+impl Default for EigenSpectrumScopeIR {
+    fn default() -> Self {
+        Self::PerSample
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ModeTrackingMethodIR {
