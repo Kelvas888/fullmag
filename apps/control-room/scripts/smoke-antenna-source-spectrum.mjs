@@ -25,18 +25,46 @@ try {
   page = await browser.newPage({ viewport: { width: 1280, height: 1000 } });
   page.on("pageerror", (error) => pageErrors.push(error.message));
   page.on("console", (message) => { if (message.type() === "error") consoleErrors.push(message.text()); });
-  for (const scenario of ["ready", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring"]) {
+  const readyScenarios = ["ready", "ready-vector", "ready-unitary"];
+  const malformedMetadata = ["wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha"];
+  const malformedBytes = ["truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"];
+  const binaryDiagnostics = {
+    "truncated-payload": "power count 3 ≠ manifest 4",
+    "nonfinite-payload": "amplitude payload contains a non-finite value",
+    "inconsistent-power": "power payload disagrees with complex amplitudes at k-grid cell 0",
+    "wrong-etag": "antenna payload revision does not match selected manifest",
+    "oversized-body": "byte budget",
+    "oversized-stream": "byte budget",
+  };
+  for (const scenario of [...readyScenarios, "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", ...malformedMetadata, ...malformedBytes]) {
     const location = new URL(url); location.searchParams.set("scenario", scenario);
     await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForFunction(() => window.__antennaSpectrumFixture?.read().calls.some((call) => call.path.endsWith("/output-catalog")) && window.__antennaSpectrumFixture.read().calls.some((call) => call.path.endsWith("/source-spectra/fft")), undefined, { timeout: 60_000 });
-    await page.waitForTimeout(500);
-    if (scenario === "ready") await page.getByRole("grid").waitFor({ timeout: 60_000 });
+    if (malformedMetadata.includes(scenario)) {
+      await page.waitForFunction(() => document.querySelector("main")?.textContent.includes("Antenna spectrum"), undefined, { timeout: 60_000 });
+    } else if (!readyScenarios.includes(scenario) && !malformedBytes.includes(scenario)) {
+      await page.waitForTimeout(500);
+    }
+    if (readyScenarios.includes(scenario)) await page.getByRole("grid").waitFor({ timeout: 60_000 });
+    if (malformedBytes.includes(scenario)) await page.getByRole("alert").waitFor({ timeout: 60_000 });
     const before = await page.evaluate(() => window.__antennaSpectrumFixture.read());
     const sectionCount = await page.locator('section[aria-label="Antenna source spectrum payload"]').count();
     const payloads = before.calls.filter((call) => call.path.includes("/payloads/"));
     const text = await page.locator("main").textContent();
-    const passed = scenario === "ready" ? payloads.length === 4 && sectionCount === 1 && await page.getByRole("gridcell").count() === 4 : payloads.length === 0 && sectionCount === 0;
-    checks.push({ name: `${scenario}: ${scenario === "ready" ? "matched metadata renders four scoped carriers" : "refuses binary reads and payload view"}`, passed, payloadRequests: payloads.length, sectionCount });
+    const gridCells = await page.getByRole("gridcell").count();
+    const ready = readyScenarios.includes(scenario), bytesFailure = malformedBytes.includes(scenario);
+    if (bytesFailure) assert.ok(text.includes(binaryDiagnostics[scenario]), `${scenario} did not report the intended rejection: ${text}`);
+    if (ready) {
+      const unit = scenario === "ready-unitary" ? "(A/m/A)^2" : "(A*m/A)^2";
+      assert.ok(text.includes(`Peak ${scenario === "ready-vector" ? "4.800e+1" : "1.600e+1"} ${unit}`), "Peak power or normalization unit differs from controlled complex amplitudes");
+      assert.ok((await page.getByRole("gridcell").first().getAttribute("aria-label"))?.includes(unit), "Scientific cell tooltip lost power SI unit");
+    }
+    const passed = ready ? payloads.length === 4 && sectionCount === 1 && gridCells === 4
+      : bytesFailure ? payloads.length > 0 && payloads.length <= 4 && gridCells === 0 && text.includes("FFT payload")
+        : payloads.length === 0 && gridCells === 0 && (malformedMetadata.includes(scenario) ? text.includes("Antenna spectrum") : sectionCount === 0);
+    checks.push({ name: `${scenario}: ${ready ? "matched metadata renders four scoped carriers" : bytesFailure ? "refuses corrupt binary grid" : "refuses binary reads and payload view"}`, passed, payloadRequests: payloads.length, sectionCount, gridCells });
+    if (scenario === "oversized-body" || scenario === "oversized-stream") assert.ok(text.includes("byte budget"), "Oversized response was not rejected by transport before decoding");
+    if (scenario === "oversized-stream") assert.equal(before.streamCancelled, true, "Over-budget stream was not cancelled");
     const screenshot = resolve(directory, `${scenario}.png`); await page.screenshot({ path: screenshot, fullPage: true }); screenshots.push(screenshot);
     await page.waitForTimeout(300);
     const after = await page.evaluate(() => window.__antennaSpectrumFixture.read());
@@ -52,8 +80,8 @@ try {
     await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.getByRole("grid").waitFor({ timeout: 60_000 });
     await page.evaluate(() => { window.__spectrumRetainedRoot = document.querySelector(".fm-inspector-panel"); });
-    const baseline = await page.evaluate(() => window.__antennaSpectrumFixture.read());
     for (const fail of [false, true]) {
+      const baseline = await page.evaluate(() => window.__antennaSpectrumFixture.read());
       await page.evaluate((kind) => window.__antennaSpectrumFixture.refresh(kind), kind);
       await page.waitForFunction(() => window.__antennaSpectrumFixture.read().pending === 1, undefined, { timeout: 60_000 });
       await page.waitForTimeout(200);
@@ -81,7 +109,9 @@ try {
         await page.waitForFunction(() => document.querySelector("main")?.textContent.includes("Runtime resultready"), undefined, { timeout: 60_000 });
         await page.getByRole("grid").waitFor({ timeout: 60_000 });
         const rootStable = await page.evaluate(() => window.__spectrumRetainedRoot === document.querySelector(".fm-inspector-panel"));
-        checks.push({ name: `${kind}: confirmed refresh restores FFT`, passed: rootStable && await page.getByRole("gridcell").count() === 4, rootStable });
+        const restored = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+        const confirmedPayloadReads = restored.calls.filter((call) => call.path.includes("/payloads/")).length - baseline.calls.filter((call) => call.path.includes("/payloads/")).length;
+        checks.push({ name: `${kind}: confirmed refresh restores FFT`, passed: rootStable && await page.getByRole("gridcell").count() === 4 && confirmedPayloadReads >= 0 && confirmedPayloadReads <= 4, rootStable, confirmedPayloadReads });
       }
     }
     const beforeIdle = await page.evaluate(() => window.__antennaSpectrumFixture.read());
