@@ -4,6 +4,15 @@ import type {
 } from "@/kernel/api/apiTypes";
 import type { Selection } from "@/kernel/selection/selectionTypes";
 import type { PrimitiveDraft } from "@/kernel/authoring/geometryLifecycleCommands";
+import type { GeometryObjectDraft } from "@/kernel/authoring/object-edit/objectEditTypes";
+export type { GeometryObjectDraft } from "@/kernel/authoring/object-edit/objectEditTypes";
+import {
+  resolveCommittedGeometryObjectDraft,
+} from "@/kernel/authoring/object-edit/objectEditDraftModel";
+export {
+  geometryDraftGeometryEquals,
+  geometryDraftTranslationEquals,
+} from "@/kernel/authoring/object-edit/objectEditDraftModel";
 import { ControlRoomApiError } from "@/kernel/api/ControlRoomApi";
 
 export interface GeometryObjectPanelModel {
@@ -20,26 +29,6 @@ export interface GeometryObjectPanelModel {
   source: string;
 }
 
-export interface GeometryObjectDraft {
-  archHeight: string;
-  baseRevision: number | null;
-  geometryKind: string;
-  height: string;
-  length: string;
-  material: string;
-  mode: "committed" | "draft-new" | "missing";
-  name: string;
-  notes: string;
-  objectId: string;
-  radius: string;
-  region: string;
-  rotation: [string, string, string];
-  scale: [string, string, string];
-  size: [string, string, string];
-  translation: [string, string, string];
-  width: string;
-  z0: string;
-}
 
 export interface GeometryDraftGeometryResult {
   error: string | null;
@@ -85,32 +74,6 @@ function asNumberArray(value: unknown): number[] | null {
     value.every((entry) => typeof entry === "number" && Number.isFinite(entry))
     ? value
     : null;
-}
-
-function formatScientificInput(value: number): string {
-  if (value === 0) return "0";
-  const abs = Math.abs(value);
-  if (abs < 1e-4 || abs >= 1e6) {
-    return value.toExponential().replace(/\.0+e/, "e").replace(/(\.\d*?[1-9])0+e/, "$1e");
-  }
-  return String(value);
-}
-
-function formatNumberInput(value: unknown, fallback: number): string {
-  const numberValue = asNumber(value);
-  return formatScientificInput(numberValue ?? fallback);
-}
-
-function formatVectorInput(
-  value: unknown,
-  fallback: readonly [number, number, number],
-): [string, string, string] {
-  const values = asNumberArray(value);
-  return [
-    formatScientificInput(values?.[0] ?? fallback[0]),
-    formatScientificInput(values?.[1] ?? fallback[1]),
-    formatScientificInput(values?.[2] ?? fallback[2]),
-  ];
 }
 
 function lengthScale(values: readonly number[]): { scale: number; unit: string } {
@@ -225,10 +188,6 @@ function defaultDraftForPrimitive(
   };
 }
 
-function stringOrFallback(value: unknown, fallback: string): string {
-  return asString(value) ?? fallback;
-}
-
 export function resolveGeometryObjectDraft(
   selection: Selection,
   scene: SceneResource | null,
@@ -248,33 +207,11 @@ export function resolveGeometryObjectDraft(
     };
   }
 
-  const geometry = asRecord(object.geometry);
-  const params = asRecord(geometry?.geometry_params);
-  const transform = asRecord(object.transform);
-  const geometryKind =
-    asString(geometry?.geometry_kind) ??
-    asString(geometry?.kind) ??
-    "Box";
-
-  return {
-    archHeight: formatNumberInput(params?.arch_height, 5e-8),
-    baseRevision: revision,
-    geometryKind,
-    height: formatNumberInput(params?.height, 1e-8),
-    length: formatNumberInput(params?.length, 1e-6),
-    material: stringOrFallback(object.material_ref, "unassigned"),
-    mode: "committed",
-    name: stringOrFallback(object.name, objectId),
-    notes: asString(object.notes) ?? "",
+  return resolveCommittedGeometryObjectDraft(scene, objectId) ?? {
+    ...defaultDraftForPrimitive(selection, revision),
+    mode: "missing",
+    notes: "",
     objectId,
-    radius: formatNumberInput(params?.radius, 5e-8),
-    region: stringOrFallback(object.region_name, "unassigned"),
-    rotation: formatVectorInput(transform?.rotation, [0, 0, 0]),
-    scale: formatVectorInput(transform?.scale, [1, 1, 1]),
-    size: formatVectorInput(params?.size ?? params?.dimensions, [1e-7, 1e-7, 1e-8]),
-    translation: formatVectorInput(transform?.translation, [0, 0, 0]),
-    width: formatNumberInput(params?.width, 1e-6),
-    z0: formatNumberInput(params?.z0, 0),
   };
 }
 
@@ -470,15 +407,56 @@ export function buildGeometryDraftPatch(
   };
 }
 
+function persistedTransformVector(
+  transform: JsonRecord | null,
+  field: string,
+  length: number,
+  fallback: readonly number[],
+): { error: string | null; value: number[] } {
+  const value = transform?.[field];
+  if (value === undefined || value === null) {
+    return { error: null, value: [...fallback] };
+  }
+  if (
+    !Array.isArray(value) ||
+    value.length !== length ||
+    !value.every((component) => typeof component === "number" && Number.isFinite(component))
+  ) {
+    return {
+      error: "The existing transform " + field + " must contain " + length + " finite values.",
+      value: [],
+    };
+  }
+  return { error: null, value: [...value] as number[] };
+}
+
 export function buildTransformDraftPatch(
   draft: GeometryObjectDraft,
+  existingTransform?: unknown,
 ): GeometryDraftTransformResult {
   const translation = parseVector(draft.translation, "Translation", false);
   if (translation.error) return { error: translation.error, transform: null };
+  const transform =
+    existingTransform === undefined || existingTransform === null
+      ? null
+      : asRecord(existingTransform);
+  if (existingTransform !== undefined && existingTransform !== null && !transform) {
+    return { error: "The existing object transform is not a valid record.", transform: null };
+  }
+  const rotation = persistedTransformVector(transform, "rotation_quat", 4, [0, 0, 0, 1]);
+  const scale = persistedTransformVector(transform, "scale", 3, [1, 1, 1]);
+  const pivot = persistedTransformVector(transform, "pivot", 3, [0, 0, 0]);
+  const invalid = [rotation, scale, pivot].find((component) => component.error);
+  if (invalid?.error) return { error: invalid.error, transform: null };
 
   return {
     error: null,
-    transform: { translation: translation.value },
+    transform: {
+      pivot: pivot.value,
+      rotation_quat: rotation.value,
+      scale: scale.value,
+      translation: translation.value,
+    },
   };
 }
 

@@ -2,6 +2,7 @@ import type {
   MeshSharedDomainManifestResource,
   SceneResource,
 } from "@/kernel/api/apiTypes";
+import type { GeometryObjectDraft } from "@/kernel/authoring/object-edit/objectEditTypes";
 import {
   isVisualizationAirboxIdentity,
   type Selection,
@@ -202,6 +203,29 @@ function boundsFromMinMax(
   };
 }
 
+function boundsSizeFromParams(
+  geometry: JsonRecord,
+  params: JsonRecord | null,
+): [number, number, number] | null {
+  const kind = lowerGeometryKind(geometry.geometry_kind ?? geometry.kind);
+  const radius = asNumber(params?.radius);
+  const height = asNumber(params?.height);
+  if (kind === "cylinder" && radius !== null && height !== null) {
+    const diameter = Math.max(radius * 2, 1e-12);
+    return [diameter, diameter, Math.max(height, 1e-12)];
+  }
+  if (kind === "sphere" && radius !== null) {
+    const diameter = Math.max(radius * 2, 1e-12);
+    return [diameter, diameter, diameter];
+  }
+  return (
+    asVec3(params?.size) ??
+    asVec3(params?.dimensions) ??
+    radiusSize(params?.radius) ??
+    null
+  );
+}
+
 function boundsFromGeometry(
   geometry: JsonRecord,
   transform: JsonRecord | null,
@@ -214,9 +238,7 @@ function boundsFromGeometry(
   const csgPreview = csgPreviewFromGeometry(geometry);
   const size =
     csgPreview?.boxSize ??
-    asVec3(params?.size) ??
-    asVec3(params?.dimensions) ??
-    radiusSize(params?.radius) ??
+    boundsSizeFromParams(geometry, params) ??
     [1, 1, 1];
   const translation = asVec3(transform?.translation) ?? [0, 0, 0];
   const half: [number, number, number] = [
@@ -507,6 +529,56 @@ export function buildViewport3DPrimitiveRenderModel(
   return {
     objects,
     sceneRevision,
+  };
+}
+
+export function withObjectPlacementDraftPreview(
+  model: Viewport3DPrimitiveRenderModel | null | undefined,
+  draft: GeometryObjectDraft | null,
+  selectedObjectId: string | null,
+): Viewport3DPrimitiveRenderModel | null | undefined {
+  if (
+    !model ||
+    !draft ||
+    draft.mode !== "committed" ||
+    draft.objectId !== selectedObjectId
+  ) {
+    return model;
+  }
+
+  const object = model.objects.find((candidate) => candidate.objectId === draft.objectId);
+  if (!object) return model;
+  const translation = draft.translation.map(Number);
+  if (
+    translation.length !== 3 ||
+    !translation.every(Number.isFinite)
+  ) {
+    return model;
+  }
+  const currentTranslation = object.translation ?? [0, 0, 0];
+  if (translation.every((value, index) => value === currentTranslation[index])) {
+    return model;
+  }
+
+  const delta = translation.map((value, index) => value - currentTranslation[index]);
+  const preview: Viewport3DPrimitiveObject = {
+    ...object,
+    bounds: {
+      ...object.bounds,
+      center: object.bounds.center.map(
+        (value, index) => value + delta[index],
+      ) as [number, number, number],
+    },
+    geometryKey: `${object.geometryKey}|placement-draft:${translation.join(",")}`,
+    translation: translation as [number, number, number],
+  };
+
+  return {
+    ...model,
+    draftOverlay: object.meshState === "mesh-ready" ? preview : model.draftOverlay,
+    objects: model.objects.map((candidate) =>
+      candidate.objectId === draft.objectId ? preview : candidate,
+    ),
   };
 }
 
