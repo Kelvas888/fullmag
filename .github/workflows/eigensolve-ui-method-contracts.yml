@@ -13,6 +13,7 @@ on:
       - 'apps/control-room/src/modules/live-charts/liveChartsPresentation*'
       - 'apps/control-room/src/modules/inspector/panels/FrequencyDomainCharts*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/FrequencyDomainResultInspectors*'
+      - 'apps/control-room/src/modules/inspector/panels/analysis-results/AnalysisResultInspectorPanel*'
       - 'apps/control-room/src/modules/ribbon/RibbonModule*'
       - 'apps/control-room/src/modules/ribbon/ribbonCommands*'
       - 'apps/control-room/src/kernel/analysis-modules/postprocessingCommandContributions*'
@@ -39,6 +40,7 @@ on:
       - 'apps/control-room/src/modules/live-charts/liveChartsPresentation*'
       - 'apps/control-room/src/modules/inspector/panels/FrequencyDomainCharts*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/FrequencyDomainResultInspectors*'
+      - 'apps/control-room/src/modules/inspector/panels/analysis-results/AnalysisResultInspectorPanel*'
       - 'apps/control-room/src/modules/ribbon/RibbonModule*'
       - 'apps/control-room/src/modules/ribbon/ribbonCommands*'
       - 'apps/control-room/src/kernel/analysis-modules/postprocessingCommandContributions*'
@@ -101,6 +103,7 @@ jobs:
           src/modules/live-charts/liveChartsPresentation.test.ts
           src/modules/inspector/panels/FrequencyDomainCharts.test.tsx
           src/modules/inspector/panels/frequency-domain/FrequencyDomainResultInspectors.selection.test.tsx
+          src/modules/inspector/panels/analysis-results/AnalysisResultInspectorPanel.test.tsx
           src/modules/ribbon/RibbonModule.contextualTab.test.ts
           src/modules/ribbon/RibbonModule.layout.test.tsx
           src/modules/ribbon/ribbonCommands.test.ts

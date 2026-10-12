@@ -165,6 +165,7 @@ export function AnalysisResultInspectorPanel({
     { label: "Item", mono: true, value: display(resultRef.itemId) },
     { label: "Item kind", value: display(resultRef.itemKind) },
     { label: "Frequency", unit: "Hz", value: display(itemData?.frequency_hz) },
+    { label: "Tracking score", value: display(itemData?.quality.tracking_score) },
     { label: "Branch", mono: true, value: display(resultRef.branchId ?? itemData?.branch_id) },
     { label: "Branch points", value: display(branchData?.point_count) },
     { label: "Field", mono: true, value: display(resultRef.fieldId ?? itemData?.field_ref?.field_id) },
