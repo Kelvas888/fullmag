@@ -1013,3 +1013,12 @@ Potwierdzone GHA:38232017811 SUCCESS (84tests,24subtests) dla Python solver_poli
 ## Kanoniczne widmo materializowanego pipeline
 
 4243102022: źródłowy producer jest w fullmag-application/script_stage_materialization.rs::eigen_sampling_from. Fallback używa CANONICAL_EIGEN_SPECTRUM_QUANTITY; poprawnego validatora nie poluzowano. Actual StudyPipelineDocument z TD/relax bezprioroutputs dostaje canonical spectrum i przechodzi activeIR.validate; explicit spectrum/mode pozostają identyczne. Source/parser review PASS; dwa namedcases muszą przejść GHA z log guards i pipefail. Nie zmieniono scope ani publicznego schema.
+
+
+## Rewizje zasobow postprocessingu
+
+4243102031: klucz pozostaje stabilny w obrebie sesji; useResource przejmuje invalidation, a scene_revision jest rewizja danych. Mounted tests uzywaja rzeczywistego hooka, controller i runtime store: zachowanie ostatnich danych przy refresh/error, zastosowanie nowej rewizji oraz brak przecieku pomiedzy sesjami.
+
+4243099642: ACK import/pin/unpin uniewaznia definitions i MODEL_SCENE_PATH z rewizja odpowiedzi. Existing history clear i obsolete-session fences zachowane; no-op/reject nie uniewazniaja zasobow. CI rozszerzono o nowy test zasobu. SOURCE review PASS; GHA/typecheck/Doctor oraz browser pozostaja NOT VERIFIED.
+
+Kanoniczny pipeline4243102022: GHA38233156553 SUCCESS, oba nowe testy rzeczywistej materializacji PASS,63filtered. Nie jest to dowod runtime FEM.

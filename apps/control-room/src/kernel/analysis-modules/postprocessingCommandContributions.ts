@@ -1,4 +1,7 @@
-import { ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH } from "@/kernel/api/apiPaths";
+import {
+  ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH,
+  MODEL_SCENE_PATH,
+} from "@/kernel/api/apiPaths";
 import { obsoleteSessionResult } from "@/kernel/commands/commandSessionScope";
 import type { CommandContext, CommandContribution, CommandResult } from "@/kernel/commands/commandTypes";
 import {
@@ -60,6 +63,17 @@ function importDataset(context: CommandContext) {
   return { artifactRevision: ref.artifactRevision, runId: ref.analysisRunId, stageId: ref.analysisStageId };
 }
 
+function invalidatePostprocessingDefinitionMutation(
+  context: CommandContext,
+  sceneRevision: number,
+): void {
+  context.resources?.invalidate(MODEL_SCENE_PATH, sceneRevision);
+  context.resources?.invalidate(
+    ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH,
+    sceneRevision,
+  );
+}
+
 function importDisabledReason(context: CommandContext): string | null {
   if (!context.api) return "Control Room API is not available.";
   if (!importDataset(context)) return "Select a dispersion relation in the Results tree.";
@@ -97,7 +111,7 @@ async function importDispersionReference(context: CommandContext): Promise<Comma
     if (obsoleteAfterWrite) return obsoleteAfterWrite;
     context.authoringHistory?.clear();
     try {
-      context.resources?.invalidate(ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH, created.scene_revision);
+      invalidatePostprocessingDefinitionMutation(context, created.scene_revision);
     } catch {
       return {
         message: `Imported reference ${created.definition.label}. Refresh the results view to see it.`,
@@ -160,7 +174,7 @@ async function pinModeVisualization(context: CommandContext): Promise<CommandRes
   const obsoleteAfterWrite = obsoleteSessionResult(context);
   if (obsoleteAfterWrite) return obsoleteAfterWrite;
   context.authoringHistory?.clear();
-  context.resources?.invalidate(ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH, created.scene_revision);
+  invalidatePostprocessingDefinitionMutation(context, created.scene_revision);
   return { message: `Pinned ${created.definition.label}.`, status: "completed" };
 }
 
@@ -188,7 +202,7 @@ async function unpinDefinition(context: CommandContext): Promise<CommandResult> 
   const obsoleteAfterWrite = obsoleteSessionResult(context);
   if (obsoleteAfterWrite) return obsoleteAfterWrite;
   context.authoringHistory?.clear();
-  context.resources?.invalidate(ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH, removed.scene_revision);
+  invalidatePostprocessingDefinitionMutation(context, removed.scene_revision);
   return { message: "Pinned visualization removed.", status: "completed" };
 }
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useSyncExternalStore } from "react";
+import { useCallback } from "react";
 
 import { ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH } from "../api/apiPaths";
 import type { PostprocessingDefinitionCollectionResource } from "../api/apiTypes";
@@ -19,7 +19,6 @@ interface ResourceHookOptions {
  */
 export function usePostprocessingDefinitionsResource(options: ResourceHookOptions = {}) {
   const { api } = useKernel();
-  const revision = useResourceRevision(ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH);
   const { resourceKey: scopedResourceKey, sessionIdentity } =
     useSessionScopedResourceKey(ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH);
   const load = useCallback(
@@ -30,19 +29,7 @@ export function usePostprocessingDefinitionsResource(options: ResourceHookOption
   return useResource<PostprocessingDefinitionCollectionResource | null>({
     enabled: options.enabled !== false && sessionIdentity !== null,
     load,
-    resourceKey: `${scopedResourceKey}#revision=${String(revision ?? "none")}`,
+    resolveRevision: (data) => data?.scene_revision ?? null,
+    resourceKey: scopedResourceKey,
   });
-}
-
-function useResourceRevision(resourceKey: string) {
-  const { resources } = useKernel();
-  const subscribe = useCallback(
-    (listener: () => void) => resources.subscribe(resourceKey, listener),
-    [resourceKey, resources],
-  );
-  const getSnapshot = useCallback(
-    () => resources.getRevision(resourceKey),
-    [resourceKey, resources],
-  );
-  return useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
 }

@@ -3,7 +3,10 @@ import { describe, expect, it, vi } from "vitest";
 import type { SceneResource } from "@/kernel/api/apiTypes";
 import { AuthoringHistoryController } from "@/kernel/authoring/AuthoringHistoryController";
 
-import { ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH } from "@/kernel/api/apiPaths";
+import {
+  ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH,
+  MODEL_SCENE_PATH,
+} from "@/kernel/api/apiPaths";
 import { MAX_REFERENCE_POINTS } from "@/shared/domain/analysis/referenceImport";
 
 import {
@@ -202,7 +205,7 @@ describe("pin mode visualization command owner deduplication", () => {
 
     expect(result.status).toBe("completed");
     expect(fixture.create).toHaveBeenCalledTimes(1);
-    expect(fixture.invalidate).toHaveBeenCalledTimes(1);
+    expectSceneRevisionInvalidations(fixture.invalidate.mock.calls, 12);
   });
 });
 
@@ -232,7 +235,7 @@ describe("import dispersion reference command bounds", () => {
       }),
       expected_scene_revision: 11,
     }), undefined);
-    expect(fixture.invalidate).toHaveBeenCalledTimes(1);
+    expectSceneRevisionInvalidations(fixture.invalidate.mock.calls, 12);
   });
 
   it.each([
@@ -333,7 +336,11 @@ const scopedCommands = [
 function scopedCommandFixture(commandId: string) {
   let current = true;
   const list = vi.fn().mockResolvedValue({ definitions: [], scene_revision: 11 });
-  const mutation = vi.fn().mockResolvedValue({ definition: { label: "Reference" }, scene_revision: 12 });
+  const mutation = vi.fn().mockResolvedValue(
+    commandId === UNPIN_POSTPROCESSING_DEFINITION_COMMAND
+      ? { scene_revision: 13 }
+      : { definition: { label: "Reference" }, scene_revision: 12 },
+  );
   const invalidate = vi.fn();
   const context = {
     api: { analysis: { postprocessing: { definitions: { list, create: mutation, remove: mutation } } } },
@@ -356,6 +363,16 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function expectSceneRevisionInvalidations(
+  calls: readonly (readonly unknown[])[],
+  sceneRevision: number,
+): void {
+  expect(calls).toEqual([
+    [MODEL_SCENE_PATH, sceneRevision],
+    [ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH, sceneRevision],
+  ]);
+}
+
 describe.each(scopedCommands)("postprocessing command session scope: %s", (commandId) => {
   it("forwards the captured scope to both the read and mutation", async () => {
     const fixture = scopedCommandFixture(commandId);
@@ -370,7 +387,12 @@ describe.each(scopedCommands)("postprocessing command session scope: %s", (comma
         expect.objectContaining({ expected_scene_revision: 11 }), options,
       );
     }
-    expect(fixture.invalidate).toHaveBeenCalledExactlyOnceWith(ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH, 12);
+    const acknowledgedSceneRevision =
+      commandId === UNPIN_POSTPROCESSING_DEFINITION_COMMAND ? 13 : 12;
+    expectSceneRevisionInvalidations(
+      fixture.invalidate.mock.calls,
+      acknowledgedSceneRevision,
+    );
   });
 
   it("does not read or mutate after its captured session has expired", async () => {
@@ -456,11 +478,22 @@ describe.each(scopedCommands)("postprocessing mutation history invalidation: %s"
     const fixture = scopedCommandFixture(commandId);
     const history = seededAuthoringHistory();
     const generation = history.getGeneration();
+    const generationsAtInvalidation: number[] = [];
+    fixture.invalidate.mockImplementation(() => {
+      generationsAtInvalidation.push(history.getGeneration());
+    });
     const result = await fixture.command.run({ ...fixture.context, authoringHistory: history } as never);
     expect(result.status).toBe("completed");
     expect(history.canUndo()).toBe(false);
     expect(history.canRedo()).toBe(false);
     expect(history.getGeneration()).toBe(generation + 1);
+    const acknowledgedSceneRevision =
+      commandId === UNPIN_POSTPROCESSING_DEFINITION_COMMAND ? 13 : 12;
+    expectSceneRevisionInvalidations(
+      fixture.invalidate.mock.calls,
+      acknowledgedSceneRevision,
+    );
+    expect(generationsAtInvalidation).toEqual([generation + 1, generation + 1]);
   });
 
   it("preserves history when the mutation fails before its acknowledgement", async () => {
@@ -476,6 +509,7 @@ describe.each(scopedCommands)("postprocessing mutation history invalidation: %s"
     }
     expect(history.canUndo()).toBe(true);
     expect(history.getGeneration()).toBe(generation);
+    expect(fixture.invalidate).not.toHaveBeenCalled();
   });
 
   it("does not clear history after an acknowledgement for an obsolete session", async () => {
@@ -495,6 +529,7 @@ describe.each(scopedCommands)("postprocessing mutation history invalidation: %s"
     expect((await pending).status).toBe("cancelled");
     expect(history.canUndo()).toBe(true);
     expect(history.getGeneration()).toBe(generation);
+    expect(fixture.invalidate).not.toHaveBeenCalled();
   });
 });
 
@@ -507,4 +542,5 @@ it("does not clear authoring history for an already pinned mode", async () => {
   expect(result.status).toBe("completed");
   expect(fixture.create).not.toHaveBeenCalled();
   expect(history.canUndo()).toBe(true);
+  expect(fixture.invalidate).not.toHaveBeenCalled();
 });
