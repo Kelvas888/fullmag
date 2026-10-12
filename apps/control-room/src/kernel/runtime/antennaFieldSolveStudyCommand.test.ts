@@ -89,34 +89,72 @@ describe("antenna solve Study reference", () => {
     const scene = fixture();
     scene.antenna_field_solve_stages![0].port_mode_ids = ports;
     const before = structuredClone(scene);
-    expect(() => antennaFieldSolveStudyStages(scene, target)).toThrow("exactly one explicit port mode");
+    expect(() => antennaFieldSolveStudyStages(scene, target)).toThrow("exactly one port mode");
     expect(scene).toEqual(before);
   });
 
-  it("enqueues one explicitly chosen port without rewriting a multiport definition", () => {
+  it("refuses even an explicit port choice from an unsupported multiport definition", () => {
     const scene = fixture();
     scene.antenna_field_solve_stages![0].port_mode_ids = ["port-2", "port-1"];
     const before = structuredClone(scene);
-    const next = antennaFieldSolveStudyStages(scene, { ...target, portModeId: "port-2" });
-    expect(next.stages.at(-1)).toEqual({ ...action, port_mode_ids: ["port-2"] });
-    expect(scene).toEqual(before);
-    expect(() => antennaFieldSolveStudyStages(scene, { ...target, portModeId: "foreign" })).toThrow("exactly one explicit port mode");
-    scene.study!.stages = next.stages;
-    expect(antennaFieldSolveStudyStages(scene, { ...target, portModeId: "port-2" }).alreadyAdded).toBe(true);
-    expect(() => antennaFieldSolveStudyStages(scene, { ...target, portModeId: "port-1" })).toThrow("conflicting stage ID");
+    for (const portModeId of ["port-2", "port-1", "foreign"]) {
+      expect(() => antennaFieldSolveStudyStages(scene, { ...target, portModeId })).toThrow("exactly one port mode");
+      expect(scene).toEqual(before);
+    }
   });
 
-  it("deduplicates an existing nested reference regardless of its outer ID without enabling it", () => {
+  it.each([
+    { groupEnabled: true, stageEnabled: false },
+    { groupEnabled: false, stageEnabled: true },
+    { groupEnabled: false, stageEnabled: false },
+  ])("reports an inactive nested reference without enabling it: %j", ({ groupEnabled, stageEnabled }) => {
     const scene = fixture();
     scene.study!.study_pipeline = { version: "study_pipeline.v1", nodes: [{
-      id: "group", node_kind: "group", children: [{
+      id: "group", node_kind: "group", enabled: groupEnabled, children: [{
         id: "imported-stage-000", node_kind: "primitive", stage_kind: "antenna_field_solve",
-        enabled: false, payload: action,
+        enabled: stageEnabled, payload: action,
       }],
     }] };
     const before = structuredClone(scene);
-    expect(antennaFieldSolveStudyStages(scene, target).alreadyAdded).toBe(true);
+    expect(antennaFieldSolveStudyStages(scene, target)).toMatchObject({
+      alreadyAdded: true, existingStageEnabled: false,
+    });
     expect(scene).toEqual(before);
+  });
+
+  it("reports an active nested reference independently of dormant flat stages", () => {
+    const scene = fixture();
+    scene.study!.study_pipeline = { version: "study_pipeline.v1", nodes: [{
+      id: "group", node_kind: "group", children: [{
+        id: "active-solve", node_kind: "primitive", stage_kind: "antenna_field_solve", payload: action,
+      }],
+    }] };
+    expect(antennaFieldSolveStudyStages(scene, target)).toMatchObject({
+      alreadyAdded: true, existingStageEnabled: true,
+    });
+  });
+
+  it("explains disabled ancestry without a transaction, history entry or invalidation", async () => {
+    const before = fixture();
+    before.study!.study_pipeline = { version: "study_pipeline.v1", nodes: [{
+      id: "off-group", node_kind: "group", enabled: false, children: [{
+        id: "solve-node", node_kind: "primitive", stage_kind: "antenna_field_solve", payload: action,
+      }],
+    }] };
+    const original = structuredClone(before);
+    const commitTransaction = vi.fn();
+    const api = { model: { scene: vi.fn(async () => before), commitTransaction } };
+    const resources = new ResourceInvalidationController(new EventBus<KernelEventMap>());
+    const history = new AuthoringHistoryController(api as never, resources);
+    const result = await registry().execute(ADD_ANTENNA_FIELD_SOLVE_STAGE_COMMAND, {
+      api: api as never, authoringHistory: history, resources, input: target, source: "test",
+    });
+    expect(result.status).toBe("completed");
+    expect(result.message).toContain("ancestor group is disabled");
+    expect(commitTransaction).not.toHaveBeenCalled();
+    expect(history.getSnapshot().canUndo).toBe(false);
+    expect(resources.getRevision(MODEL_SCENE_PATH)).toBeNull();
+    expect(before).toEqual(original);
   });
 
   it("refuses a conflicting outer node ID rather than overwriting another stage", () => {

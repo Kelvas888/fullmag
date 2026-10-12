@@ -1,5 +1,6 @@
 import type { JsonObject, SceneResource } from "../api/apiTypes";
 import { readStudyStageSource } from "../../shared/domain/study/studyStageSource";
+import { antennaFieldSolveDefinitionPortError } from "../../shared/domain/study/antennaFieldSolveCapability";
 import {
   MODEL_READINESS_PATH,
   MODEL_SCENE_PATH,
@@ -34,7 +35,7 @@ function solveTarget(context: CommandContext): AntennaSolveTarget | null {
 export function antennaFieldSolveStudyStages(
   scene: SceneResource,
   target: AntennaSolveTarget,
-): { stages: JsonObject[]; alreadyAdded: boolean; studyPipeline?: JsonObject } {
+): { stages: JsonObject[]; alreadyAdded: boolean; existingStageEnabled?: boolean; studyPipeline?: JsonObject } {
   if ((scene.objects ?? []).filter((object) => object.id === target.objectId).length !== 1) {
     throw new Error("The antenna source object is missing or ambiguous.");
   }
@@ -43,6 +44,8 @@ export function antennaFieldSolveStudyStages(
     throw new Error("The field-solve definition is missing, ambiguous, or owned by another object.");
   }
   const definition = definitions[0];
+  const capabilityError = antennaFieldSolveDefinitionPortError(definition.port_mode_ids);
+  if (capabilityError) throw new Error(capabilityError);
   const portModeId = target.portModeId ?? (definition.port_mode_ids.length === 1 ? definition.port_mode_ids[0] : undefined);
   if (!portModeId?.trim() || definition.port_mode_ids.filter((id) => id === portModeId).length !== 1) {
     throw new Error("Field solve requires exactly one explicit port mode from its definition. Select it in the antenna Inspector; no stages were changed.");
@@ -106,7 +109,8 @@ export function antennaFieldSolveStudyStages(
         || payload.port_mode_ids.length !== 1 || payload.port_mode_ids[0] !== portModeId) {
         throw new Error("The study already contains a conflicting antenna reference; no stages were changed.");
       }
-      return { stages, alreadyAdded: true };
+      const entry = source.entries.find((candidate) => candidate.queueId === references[0].id);
+      return { stages, alreadyAdded: true, existingStageEnabled: entry?.enabled === true };
     }
     const nodeId = `antenna-field-solve:${encodeURIComponent(definition.id)}`;
     if (nodes.some((node) => node.id === nodeId)) throw new Error("The study already contains a conflicting pipeline node ID.");
@@ -157,7 +161,9 @@ export const addAntennaFieldSolveStudyCommand: CommandContribution = {
         return { status: "failed", message: "Scene revision is unavailable; refresh the scene and retry." };
       }
       const next = antennaFieldSolveStudyStages(scene, target);
-      if (next.alreadyAdded) return { status: "completed", message: "Field solve is already in Study; no stages changed." };
+      if (next.alreadyAdded) return { status: "completed", message: next.existingStageEnabled === false
+        ? "Field solve is already in Study, but the stage or an ancestor group is disabled. Enable it explicitly in Study to execute it; no stages changed."
+        : "Field solve is already in Study; no stages changed." };
       const response = await context.api!.model.commitTransaction({
         kind: "merge_patch", base_revision: revision,
         merge_patch: { study: next.studyPipeline ? { study_pipeline: next.studyPipeline } : { stages: next.stages } },

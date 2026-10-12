@@ -24,7 +24,7 @@ function fixture(): SceneResource {
     scene: { id: "A", name: "fixture", authoring_schema: "fixture", source_of_truth: "fixture" }, revision: 7,
     antenna_field_solve_stages: [{
       id: "solve", source_object_id: "source", current_transport_id: "current",
-      port_mode_ids: ["port-1", "port-2"], model: "quasistatic_conduction_biot_savart3d",
+      port_mode_ids: ["port-2"], model: "quasistatic_conduction_biot_savart3d",
       oersted_realization: "direct_tetra_quadrature", conductor_mesh_policy: "quadrature",
       field_sampling_domain: { kind: "global" }, target_refs: [{ kind: "global" }],
       solver_policy: "direct", outputs: [{ id: "H_ant", quantity: "H" }],
@@ -50,7 +50,7 @@ describe("antenna Study composer scoped command and stable controls", () => {
       await act(async () => root.render(<AntennaStudyStageComposer objectId="source" stageId="solve" scene={scene} status="ready" />));
       const pick = findElement(container, (element) => element.tagName === "SELECT", "port selector");
       const button = findElement(container, (element) => element.tagName === "BUTTON" && element.textContent === "Add Field Solve to Study", "enqueue button");
-      expect(button.disabled).toBe(true);
+      expect(button.disabled).toBe(false);
       pick.value = "port-2";
       await act(async () => { pick.dispatchEvent(new TestEvent("change", { bubbles: true })); });
       await act(async () => { button.dispatchEvent(new TestEvent("click", { bubbles: true })); });
@@ -67,6 +67,13 @@ describe("antenna Study composer scoped command and stable controls", () => {
       expect(pick.disabled).toBe(false);
       expect(button.disabled).toBe(false);
       expect(container.textContent).toContain("Reference added");
+      const unsupported = structuredClone(scene);
+      unsupported.antenna_field_solve_stages![0].port_mode_ids = ["port-1", "port-2"];
+      await act(async () => root.render(<AntennaStudyStageComposer objectId="source" stageId="solve" scene={unsupported} status="ready" />));
+      expect(findElement(container, (element) => element.tagName === "SELECT", "port selector")).toBe(pick);
+      expect(container.textContent).toContain("exactly one port mode");
+      expect(container.textContent).not.toContain("Reference added");
+      expect(button.disabled).toBe(true);
     } finally { await act(async () => root.unmount()); dom.restore(); }
   });
 
@@ -89,8 +96,28 @@ describe("antenna Study composer scoped command and stable controls", () => {
       await act(async () => { finish({ status: "completed", message: "Old session ACK" }); });
       expect(container.textContent).not.toContain("Old session ACK");
       const pick = findElement(container, (element) => element.tagName === "SELECT", "port selector");
-      expect(pick.value).toBe("");
+      expect(pick.value).toBe("port-2");
       expect(pick.disabled).toBe(true);
+    } finally { await act(async () => root.unmount()); dom.restore(); }
+  });
+
+  it("shows the capability refusal and cannot enqueue a multiport definition", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    try {
+      const scene = fixture();
+      scene.antenna_field_solve_stages![0].port_mode_ids = ["port-1", "port-2"];
+      const before = structuredClone(scene);
+      await act(async () => root.render(<AntennaStudyStageComposer objectId="source" stageId="solve" scene={scene} status="ready" />));
+      const pick = findElement(container, (element) => element.tagName === "SELECT", "port selector");
+      const button = findElement(container, (element) => element.tagName === "BUTTON" && element.textContent === "Add Field Solve to Study", "enqueue button");
+      expect(container.textContent).toContain("exactly one port mode");
+      expect(pick.disabled).toBe(true);
+      expect(button.disabled).toBe(true);
+      await act(async () => { button.dispatchEvent(new TestEvent("click", { bubbles: true })); });
+      expect(mocks.execute).not.toHaveBeenCalled();
+      expect(scene).toEqual(before);
     } finally { await act(async () => root.unmount()); dom.restore(); }
   });
 });

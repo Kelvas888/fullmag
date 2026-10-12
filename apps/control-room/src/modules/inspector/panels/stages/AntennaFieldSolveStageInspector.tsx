@@ -5,6 +5,7 @@ import { FieldRow } from "../../primitives/FieldRow";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 import { StageInspectorFrame, type StageInspectorFrameProps } from "./StageInspectorFrame";
 import { antennaFieldSolvePortReferences } from "../StudyStageAuthoringModel";
+import { antennaFieldSolveDefinitionPortError } from "@/shared/domain/study/antennaFieldSolveCapability";
 
 export function AntennaFieldSolveStageInspector(props: StageInspectorFrameProps) {
   const raw = props.draft?.kind === "antenna_field_solve" ? props.draft.rawStage : null;
@@ -12,6 +13,7 @@ export function AntennaFieldSolveStageInspector(props: StageInspectorFrameProps)
   const matches = (props.scene?.antenna_field_solve_stages ?? [])
     .filter((definition) => definition.id === definitionId);
   const definition = matches.length === 1 ? matches[0] : null;
+  const capabilityError = definition ? antennaFieldSolveDefinitionPortError(definition.port_mode_ids) : null;
   const authoredPorts = antennaFieldSolvePortReferences(raw ?? undefined);
   const selectedPorts = (props.scene?.antenna_port_modes ?? [])
     .filter((port) => port.id === authoredPorts[0]);
@@ -31,6 +33,7 @@ export function AntennaFieldSolveStageInspector(props: StageInspectorFrameProps)
         {!definition || !portsMatch ? (
           <FeedbackBanner kind="error" message="The field-solve definition is missing, ambiguous, or its selected ports no longer match. Repair the antenna references before execution." />
         ) : null}
+        {capabilityError ? <FeedbackBanner kind="error" message={capabilityError} /> : null}
         <FieldRow label="Model" value={definition?.model ?? "unresolved"} mono />
         <FieldRow label="Oersted realization" value={definition?.oersted_realization ?? "unresolved"} mono />
         <FieldRow label="Solver policy" value={definition?.solver_policy ?? "unresolved"} />
