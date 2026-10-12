@@ -3565,7 +3565,7 @@ Nowych 9 uwag pozostaje do oceny względem aktualnych źródeł. Poniższy wpis 
 | [4247310830](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310830) | `apps/control-room/src/modules/inspector/panels/StudyInspectorPanel.tsx` | open_pending_source_review | Waliduj adaptive względem edytowanych etapów** |
 | [4247536328](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247536328) | `crates/fullmag-runner/src/fem/eigen_policy.rs` | implemented_pending_gpu_runtime | Native adapter zachowuje omitted GPU budget defaults, CPU PETSc sentinel i explicit positive intent; signed negative rejected atomically before cast. GHA38288433960 SUCCESS4/4CTest, dedicated policy helper plus actual v20 C ABI all targets. GPU device solve NOT VERIFIED; attestation guard unchanged. |
 | [4247536336](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247536336) | `packages/fullmag-py/src/fullmag/meshing/mesh_build_report.py` | open_pending_source_review | Raportuj trasę exact-ring jako warstwową** |
-| [4247536345](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247536345) | `apps/control-room/src/modules/ribbon/ribbonCommands.ts` | open_pending_source_review | Subskrybuj układ dla aktywnego stanu komend widoku** |
+| [4247536345](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247536345) | `apps/control-room/src/modules/ribbon/ribbonCommands.ts` | implemented_pending_ci | Subskrybuj układ dla aktywnego stanu komend widoku** | Dwa wąskie selektory pól layoutu +memo dependencies; realny ReactDOM test mutuje tylko viewport composition 3D→Chart→split i sprawdza aktywne przyciski. Bramka UI obejmuje nowy test; runtime browser pending.
 
 ### Checkpoint kolejnych korekt
 

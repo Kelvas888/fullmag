@@ -102,6 +102,7 @@ jobs:
           src/modules/inspector/panels/FrequencyDomainCharts.test.tsx
           src/modules/inspector/panels/frequency-domain/FrequencyDomainResultInspectors.selection.test.tsx
           src/modules/ribbon/RibbonModule.contextualTab.test.ts
+          src/modules/ribbon/RibbonModule.layout.test.tsx
           src/modules/ribbon/ribbonCommands.test.ts
           src/kernel/analysis-modules/postprocessingCommandContributions.test.ts
           src/kernel/analysis-modules/postprocessingDefinitions.test.ts

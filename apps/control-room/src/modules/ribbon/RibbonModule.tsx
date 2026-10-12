@@ -177,6 +177,12 @@ export default function RibbonModule({ kernel }: ModuleProps) {
   const [pendingGlobalQuantity, setPendingGlobalQuantity] =
     useState<ApplyGlobalQuantityInput | null>(null);
   const activeTab = useLayoutSelector((layout) => layout.activeModuleTab);
+  const activeViewportMainModuleId = useLayoutSelector(
+    (layout) => layout.activeViewportMainModuleId,
+  );
+  const viewportCompanion = useLayoutSelector(
+    (layout) => layout.viewportCompanion ?? null,
+  );
   const { setActiveTab } = useLayoutActions();
   const selection = useSelectionSelector((currentSelection) =>
     activeTab === "view" || activeTab === "geometry"
@@ -431,6 +437,10 @@ export default function RibbonModule({ kernel }: ModuleProps) {
     () => {
       void commandVersion;
       void objectMoveToolState;
+      // Active command state reads the live layout from commandContext.
+      // These narrow subscriptions invalidate this memo when the composition changes.
+      void activeViewportMainModuleId;
+      void viewportCompanion;
       const buildContext = {
         activeAnalysisField,
         api: kernel.api,
@@ -458,6 +468,7 @@ export default function RibbonModule({ kernel }: ModuleProps) {
     },
     [
       activeAnalysisField,
+      activeViewportMainModuleId,
       activeTab,
       contextTabActive,
       commandContext,
@@ -480,6 +491,7 @@ export default function RibbonModule({ kernel }: ModuleProps) {
       visualization,
       visualizationSnapshot,
       visualizationState.data,
+      viewportCompanion,
     ],
   );
   const groups = tabContent?.groups ?? [];
