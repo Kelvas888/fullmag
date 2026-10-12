@@ -102,7 +102,7 @@ export function AntennaFieldLayer({ model, colors, tracker, sessionIdentity }: {
     topologyRevision: `sample-carrier:${model.intent.contentDigest}`,
   } : null, [model]);
   if (!model || !geometries || !materials || !rgb) return null;
-  return <group name="antenna-scientific-field" userData={{ quantity: model.intent.quantity, label: antennaFieldDisplayLabel(model.intent), normalization: model.intent.kind === "basis" ? "per_ampere" : "raw_authored_current", sampleCount: model.count, minimum: model.minimum, maximum: model.maximum }}>
+  return <group name="antenna-scientific-field" userData={{ quantity: model.intent.quantity, label: antennaFieldDisplayLabel(model.intent), normalization: model.intent.kind === "basis" || model.intent.quantity.endsWith("_per_ampere") ? "per_ampere" : "raw_authored_current", sampleCount: model.count, minimum: model.minimum, maximum: model.maximum }}>
     {model.intent.surface && geometries.surface && materials.surfaceMaterial ? <mesh name="antenna-field-surface" geometry={geometries.surface} material={materials.surfaceMaterial} dispose={null} /> : null}
     {model.intent.wireframe && geometries.wireframe && materials.wireMaterial ? <lineSegments name="antenna-field-wireframe" geometry={geometries.wireframe} material={materials.wireMaterial} dispose={null} /> : null}
     {model.intent.points ? <points name="antenna-field-samples" geometry={geometries.geometry} material={materials.material} dispose={null} /> : null}
