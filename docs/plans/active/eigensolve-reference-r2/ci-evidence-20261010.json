@@ -1107,6 +1107,18 @@
       "runner_passed": 1618,
       "runner_ignored": 1,
       "evidence": "Named legacy/v0.4 scope, complete IR/planner/application/runner, resolver/generic/single-k/path producers, integration callers and API/CLI binary compilation pass. API/UI behavior, native/GPU and science are separate unverified gates."
+    },
+    {
+      "run_id": 38291115523,
+      "sha": "172760a3938db5a565c7b6ef05ad86a6ab82b661",
+      "conclusion": "success",
+      "scope": "complete_fms_and_api_source_contracts",
+      "session_fms_passed": 242,
+      "api_session_passed": 83,
+      "results_passed": 28,
+      "postprocessing_passed": 4,
+      "field_cases_passed": 3,
+      "evidence": "Actual ZIP/CAS auxiliary geometry export and preflight complete graph, invalid magnet material fail-closed; typed snapshot scanner and full session library regression. No browser or scientific qualification."
     }
   ]
 }

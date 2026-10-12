@@ -187,16 +187,29 @@ fn validate_scene_document_with_mode(
         .parallel_execution
         .validate()
         .map_err(SceneDocumentValidationError::new)?;
-    if scene.study.parallel_execution.mode == fullmag_ir::ParallelExecutionModeIR::Adaptive
-        && (!scene.study.requested_backend.eq_ignore_ascii_case("fem")
-            || !scene.study.requested_device.eq_ignore_ascii_case("cpu"))
-    {
-        return Err(SceneDocumentValidationError::new(
-            concat!(
+    if scene.study.parallel_execution.mode == fullmag_ir::ParallelExecutionModeIR::Adaptive {
+        let explicit_fem_cpu = if let Some(profile) = scene.study.execution_profile.as_ref() {
+            let materialized = fullmag_ir::materialize_execution_request(
+                Some(profile.clone()),
+                scene.study.execution_layers.clone(),
+            )
+            .map_err(|error| {
+                SceneDocumentValidationError::new(format!(
+                    "study.execution_profile materialization is invalid: {error}"
+                ))
+            })?;
+            materialized.requested.backend == fullmag_ir::BackendTarget::Fem
+                && materialized.requested.device == fullmag_ir::ExecutionDevice::Cpu
+        } else {
+            scene.study.requested_backend.eq_ignore_ascii_case("fem")
+                && scene.study.requested_device.eq_ignore_ascii_case("cpu")
+        };
+        if !explicit_fem_cpu {
+            return Err(SceneDocumentValidationError::new(concat!(
                 "unsupported parallel_execution realization: adaptive mode requires ",
-                "requested_backend='fem' and requested_device='cpu' for independent eigen k execution",
-            ),
-        ));
+                "effective requested_backend='fem' and requested_device='cpu' for independent eigen k execution",
+            )));
+        }
     }
     if let Some(Some(pbc)) = &scene.study.pbc {
         if pbc.demag != fullmag_ir::FdmDemagPeriodicityIR::TruncatedImages
@@ -3596,6 +3609,95 @@ mod tests {
         scene.study.requested_device = "cpu".to_string();
         validate_scene_document_for_authoring(&scene)
             .expect("explicit FEM CPU adaptive authoring should remain valid");
+    }
+
+    #[test]
+    fn adaptive_parallel_execution_uses_materialized_profile_instead_of_stale_legacy_lane() {
+        use fullmag_ir::{
+            BackendTarget, ExecutionDevice, ExecutionProfileIR, ExecutionRequestPatchIR,
+            FieldPatch, ParallelExecutionModeIR,
+        };
+        let mut scene = SceneDocument::default();
+        scene.study.parallel_execution.mode = ParallelExecutionModeIR::Adaptive;
+        scene.study.requested_backend = "fdm".into();
+        scene.study.requested_device = "gpu".into();
+        scene.study.execution_profile = Some(ExecutionProfileIR {
+            defaults: ExecutionRequestPatchIR {
+                backend: FieldPatch::Value(BackendTarget::Fem),
+                device: FieldPatch::Value(ExecutionDevice::Cpu),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let before = scene.clone();
+        validate_scene_document_for_authoring(&scene)
+            .expect("profile FEM CPU must override stale legacy scene fields");
+        assert_eq!(scene, before, "admission must not rewrite authored intent");
+        scene.study.requested_backend = "fem".into();
+        scene.study.requested_device = "cpu".into();
+        for (backend, device) in [
+            (BackendTarget::Fdm, ExecutionDevice::Cpu),
+            (BackendTarget::Fem, ExecutionDevice::Gpu),
+            (BackendTarget::Auto, ExecutionDevice::Cpu),
+        ] {
+            let profile = scene.study.execution_profile.as_mut().unwrap();
+            profile.defaults.backend = FieldPatch::Value(backend);
+            profile.defaults.device = FieldPatch::Value(device);
+            let error = validate_scene_document_for_authoring(&scene).expect_err(
+                "stale FEM CPU fields cannot legalize a different effective profile lane",
+            );
+            assert!(
+                error
+                    .message
+                    .contains("unsupported parallel_execution realization"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_parallel_execution_replays_layers_and_preserves_weakening_guard() {
+        use fullmag_ir::{
+            BackendTarget, ExecutionDevice, ExecutionFieldOriginIR, ExecutionOriginKindIR,
+            ExecutionProfileIR, ExecutionRequestLayerIR, ExecutionRequestPatchIR, FieldPatch,
+            ParallelExecutionModeIR,
+        };
+        let mut scene = SceneDocument::default();
+        scene.study.parallel_execution.mode = ParallelExecutionModeIR::Adaptive;
+        scene.study.execution_profile = Some(ExecutionProfileIR {
+            defaults: ExecutionRequestPatchIR {
+                backend: FieldPatch::Value(BackendTarget::Auto),
+                device: FieldPatch::Value(ExecutionDevice::Auto),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        scene.study.execution_layers = vec![ExecutionRequestLayerIR {
+            origin: ExecutionFieldOriginIR {
+                kind: ExecutionOriginKindIR::Study,
+                location: "study.adaptive".into(),
+            },
+            request: ExecutionRequestPatchIR {
+                backend: FieldPatch::Value(BackendTarget::Fem),
+                device: FieldPatch::Value(ExecutionDevice::Cpu),
+                ..Default::default()
+            },
+        }];
+        let before = scene.clone();
+        validate_scene_document_for_authoring(&scene)
+            .expect("explicit FEM CPU layer can narrow authored Auto defaults");
+        assert_eq!(scene, before);
+        let profile = scene.study.execution_profile.as_mut().unwrap();
+        profile.defaults.backend = FieldPatch::Value(BackendTarget::Fem);
+        profile.defaults.device = FieldPatch::Value(ExecutionDevice::Cpu);
+        scene.study.execution_layers[0].request.device = FieldPatch::Value(ExecutionDevice::Auto);
+        let error = validate_scene_document_for_authoring(&scene).expect_err(
+            "adaptive admission must preserve canonical explicit-intent weakening rejection",
+        );
+        assert!(
+            error.message.contains("materialization is invalid"),
+            "{error}"
+        );
     }
 
     #[test]

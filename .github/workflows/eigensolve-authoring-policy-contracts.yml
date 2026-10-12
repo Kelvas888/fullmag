@@ -6,6 +6,9 @@ on:
     branches: ['codex/**']
     paths:
       - 'crates/fullmag-authoring/src/adapters.rs'
+      - 'crates/fullmag-authoring/src/validation.rs'
+      - 'crates/fullmag-ir/src/execution_profile*.rs'
+      - 'crates/fullmag-application/src/execution_profile.rs'
       - 'packages/fullmag-py/src/fullmag/model/study.py'
       - 'packages/fullmag-py/src/fullmag/runtime/scene_document.py'
       - 'packages/fullmag-py/src/fullmag/runtime/scene_document_ir.py'
@@ -60,6 +63,29 @@ jobs:
           python -m pip install 'pytest>=9,<10' -e 'packages/fullmag-py[meshing]'
       - name: Run complete canonical scene lowering contracts including postprocessing metadata
         run: python -B -m pytest -v packages/fullmag-py/tests/test_scene_document_problem_ir.py
+
+  adaptive-profile-admission:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUST_MIN_STACK: 16777216
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Preserve exact source identity
+        run: git rev-parse HEAD
+      - name: Verify effective profile lane and immutable authoring intent
+        run: |
+          set -o pipefail
+          cargo test --locked -p fullmag-authoring --lib adaptive_parallel_execution -- --nocapture | tee "$RUNNER_TEMP/adaptive-profile.log"
+          grep -F "adaptive_parallel_execution_uses_materialized_profile_instead_of_stale_legacy_lane ... ok" "$RUNNER_TEMP/adaptive-profile.log"
+          grep -F "adaptive_parallel_execution_replays_layers_and_preserves_weakening_guard ... ok" "$RUNNER_TEMP/adaptive-profile.log"
+          grep -F "adaptive_parallel_execution_requires_explicit_fem_cpu_lane ... ok" "$RUNNER_TEMP/adaptive-profile.log"
+      - name: Run complete authoring validation contracts
+        run: cargo test --locked -p fullmag-authoring --lib --no-fail-fast
+      - name: Preserve public application materialization replay contracts
+        run: cargo test --locked -p fullmag-application --test execution_profile_materialization --no-fail-fast
 
   scene-solver-policy:
     runs-on: ubuntu-latest

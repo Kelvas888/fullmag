@@ -8,6 +8,8 @@ pub mod eigen_contract;
 pub mod execution;
 pub mod parallel_execution;
 pub mod execution_profile;
+
+pub mod execution_profile_materialization;
 pub mod frequency_response_contract;
 pub mod mechanics;
 pub mod mesh_assets;
@@ -47,6 +49,11 @@ pub use eigen_contract::*;
 pub use execution::*;
 pub use parallel_execution::*;
 pub use execution_profile::*;
+
+pub use execution_profile_materialization::{
+    materialize_execution_request, materialize_referenced_execution,
+    validate_execution_materialization,
+};
 pub use frequency_response_contract::*;
 pub use mechanics::*;
 pub use mesh_assets::*;

@@ -1104,3 +1104,8 @@ Nie jest to jeszcze konfiguracja działającej usługi ani dowód enforcement.
 
 Root/config/topology ownership, service scheduler/preparation wiring, owner lifecycle
 i runtime recovery są nadal otwartymi bramkami E2. Service cap pozostaje 1.
+
+
+## Wspólna normalizacja authoring — ADR0057
+
+Scoped korekta ownership z E1: pure replay execution profile/layers jest współdzielony przez IR core, a application re-exportuje te same funkcje i nadal wiąże ProblemIR, rozstrzyga capability oraz steruje submit/runtime. Algorytm precedence, origins i immutable hashes pozostaje bez zmian. Authoring adaptive waliduje efektywne requested intent, zamiast stale legacy fields sceny. Nie ma zmiany wire, fizyki ani nowego GPU fallback. [ADR0057](../adr/0057-shared-execution-intent-normalization.md) określa zakres i bramki; implementacja/runtime wymagają osobnych dowodów.
