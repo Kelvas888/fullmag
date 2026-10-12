@@ -1702,6 +1702,54 @@ pub(crate) fn validate_field_drives(problem: &ProblemIR, errors: &mut Vec<String
     }
 }
 
+#[cfg(test)]
+#[test]
+fn finite_k_request_rejects_invalid_count_types_and_ranges() {
+    let mut problem = ProblemIR::bootstrap_example();
+    for count in [
+        serde_json::json!(true), serde_json::json!("128"),
+        serde_json::json!(4.5), serde_json::json!(-1),
+        serde_json::json!(3), serde_json::json!(2049),
+    ] {
+        problem.problem_meta.runtime_metadata.insert("spin_wave_response".into(), serde_json::json!({
+            "schema_version": "spin_wave_response.request.v1", "analysis": "finite_k", "probe_count": count,
+        }));
+        let mut errors = Vec::new();
+        validate_spin_wave_response_request(&problem, &mut errors);
+        assert!(errors.iter().any(|error| error.contains("probe_count")), "{errors:?}");
+    }
+    for count in [4, 15, 16, 2048] {
+        problem.problem_meta.runtime_metadata.insert("spin_wave_response".into(), serde_json::json!({
+            "schema_version": "spin_wave_response.request.v1", "analysis": "finite_k", "probe_count": count,
+        }));
+        let mut errors = Vec::new();
+        validate_spin_wave_response_request(&problem, &mut errors);
+        assert!(!errors.iter().any(|error| error.contains("probe_count")), "{errors:?}");
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn finite_k_request_rejects_ignored_gamma_options_and_nonstring_components() {
+    let mut problem = ProblemIR::bootstrap_example();
+    for key in ["detrend", "window", "weighting", "susceptibility_floor_fraction"] {
+        let mut request = serde_json::json!({ "schema_version": "spin_wave_response.request.v1", "analysis": "finite_k" });
+        request[key] = serde_json::Value::Null;
+        problem.problem_meta.runtime_metadata.insert("spin_wave_response".into(), request);
+        let mut errors = Vec::new();
+        validate_spin_wave_response_request(&problem, &mut errors);
+        assert!(errors.iter().any(|error| error.contains(&format!("Gamma option '{key}'"))), "{errors:?}");
+    }
+    for component in [serde_json::json!(["mx"]), serde_json::json!({"value": "mx"}), serde_json::json!(true), serde_json::Value::Null] {
+        problem.problem_meta.runtime_metadata.insert("spin_wave_response".into(), serde_json::json!({
+            "schema_version": "spin_wave_response.request.v1", "analysis": "finite_k", "response_component": component,
+        }));
+        let mut errors = Vec::new();
+        validate_spin_wave_response_request(&problem, &mut errors);
+        assert!(errors.iter().any(|error| error.contains("response_component must be a string")), "{errors:?}");
+    }
+}
+
 pub(crate) fn validate_spin_wave_response_request(problem: &ProblemIR, errors: &mut Vec<String>) {
     let Some(request) = problem
         .problem_meta
@@ -1731,6 +1779,9 @@ pub(crate) fn validate_spin_wave_response_request(problem: &ProblemIR, errors: &
         .get("response_component")
         .and_then(|value| value.as_str())
         .unwrap_or("my");
+    if request.get("response_component").is_some_and(|value| !value.is_string()) {
+        errors.push("runtime_metadata.spin_wave_response.response_component must be a string".into());
+    }
     if analysis == Some("gamma") && !matches!(response_component, "my" | "mz") {
         errors.push("runtime_metadata.spin_wave_response.response_component must be my or mz for transverse S_Gamma".into());
     } else if analysis == Some("finite_k") && !matches!(response_component, "mx" | "my" | "mz") {
@@ -1767,12 +1818,30 @@ pub(crate) fn validate_spin_wave_response_request(problem: &ProblemIR, errors: &
             .push("gamma spin-wave analysis requires an enabled global uniform field drive".into());
     }
     if analysis == Some("finite_k") {
-        if request
-            .get("probe_count")
-            .and_then(|value| value.as_u64())
-            .is_some_and(|value| !(4..=2048).contains(&value))
-        {
+        for key in ["detrend", "window", "weighting", "susceptibility_floor_fraction"] {
+            if request.contains_key(key) {
+                errors.push(format!("finite_k does not support Gamma option '{key}'; preprocessing is fixed to first-snapshot subtraction and Hann windows"));
+            }
+        }
+        if request.get("probe_count").is_some_and(|value| {
+            value.as_u64().is_none_or(|count| !(4..=2048).contains(&count))
+        }) {
             errors.push("finite_k spin-wave analysis probe_count must be in 4..=2048".into());
+        }
+        for key in ["analysis_x_min_m", "analysis_x_max_m"] {
+            if request.get(key).is_some_and(|value| {
+                value.as_f64().is_none_or(|bound| !bound.is_finite())
+            }) {
+                errors.push(format!("finite_k {key} must be a finite number in metres"));
+            }
+        }
+        if let (Some(lower), Some(upper)) = (
+            request.get("analysis_x_min_m").and_then(|value| value.as_f64()),
+            request.get("analysis_x_max_m").and_then(|value| value.as_f64()),
+        ) {
+            if upper <= lower {
+                errors.push("finite_k analysis_x_max_m must exceed analysis_x_min_m".into());
+            }
         }
         if !problem.field_drives.iter().any(|drive| {
             drive.enabled
@@ -1781,8 +1850,10 @@ pub(crate) fn validate_spin_wave_response_request(problem: &ProblemIR, errors: &
                         drive.spatial_profile,
                         FieldSpatialProfileIR::GeometryMask { .. }
                     ))
+        }) && !problem.solved_antenna_drives.iter().any(|drive| {
+            drive.peak_current_a.is_finite() && drive.peak_current_a != 0.0
         }) {
-            errors.push("finite_k spin-wave analysis requires an enabled localized field drive target or geometry mask".into());
+            errors.push("finite_k spin-wave analysis requires a localized field drive or a nonzero solved antenna drive".into());
         }
     }
 }

@@ -5235,7 +5235,17 @@
       "symbol": "class RigidTransform",
       "responsibility": "Istniejący wspólny right-handed rigid transform; plane object-frame v2 pozostaje planned.",
       "evidence_status": "source_only"
-    }
+    },
+    {"id": "antenna-finite-k-authoring-contract", "path": "docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md", "symbol": "DOC-ANCHOR:antenna-finite-k-authoring-monitor-contract", "responsibility": "Projekt E9c: typed request i rzeczywiste monitory m/H_drive, bez kwalifikacji runtime.", "evidence_status": "planned_contract"},
+    {"id": "antenna-finite-k-python-request", "path": "packages/fullmag-py/src/fullmag/model/study.py", "symbol": "class FiniteKResponseAnalysis", "responsibility": "Walidacja parametrów SI i canonical runtime metadata finite-k.", "evidence_status": "source_only"},
+    {"id": "antenna-finite-k-ir-count-regression", "path": "crates/fullmag-ir/src/validation.rs", "symbol": "finite_k_request_rejects_invalid_count_types_and_ranges", "responsibility": "Zapisana regresja typów i zakresu liczby sond; test Rust niekompilowany i niewykonany.", "evidence_status": "source_only"},
+    {"id": "antenna-finite-k-ui-monitors", "path": "apps/control-room/src/modules/inspector/panels/stages/studyWorkflowState.ts", "symbol": "validateStudyWorkflow", "responsibility": "Finite-k sprawdza field outputs m/H_drive i zgodność zadanych zegarów; nie zastępuje readback artefaktów.", "evidence_status": "source_only"},
+    {"id": "antenna-finite-k-active-source", "path": "crates/fullmag-plan/src/lib.rs", "symbol": "has_active_finite_k_source", "responsibility": "Stage-local gate lokalnego lub solved źródła; accepted basis sprawdzana osobno runtime.", "evidence_status": "source_only"},
+    {"id": "antenna-finite-k-active-source-regression", "path": "crates/fullmag-plan/src/lib.rs", "symbol": "finite_k_source_gate_respects_antenna_stage_and_current", "responsibility": "Zapisany test aktywacji, companion i prądu; NOT COMPILED/NOT RUN.", "evidence_status": "source_only"},
+    {"id": "antenna-finite-k-options-regression", "path": "crates/fullmag-ir/src/validation.rs", "symbol": "finite_k_request_rejects_ignored_gamma_options_and_nonstring_components", "responsibility": "Zapisany test Gamma-only options i niełańcuchowych komponentów; NOT COMPILED/NOT RUN.", "evidence_status": "source_only"},
+    {"id": "antenna-finite-k-scene-roundtrip", "path": "packages/fullmag-py/src/fullmag/runtime/script_builder.py", "symbol": "_render_scene_stage_bootstrap", "responsibility": "SceneDocument eksportuje wszystkie parametry finite-k i odrzuca ignorowane parametry Gamma; interpretowany roundtrip bez solvera.", "evidence_status": "source_only"},
+    {"id": "antenna-finite-k-runtime-solved-source", "path": "crates/fullmag-runner/src/spin_wave_sampling.rs", "symbol": "requested_finite_k_artifacts", "responsibility": "Istniejący reader dopuszcza niezerową aktywną solved basis; walidacja artefaktów i monitory pozostają wymagane.", "evidence_status": "source_only"},
+    {"id": "antenna-finite-k-resolved-activation", "path": "crates/fullmag-runner/src/time_events.rs", "symbol": "resolved_solved_antenna_drive_is_active", "responsibility": "Canonical stage activation współdzielona z accepted antenna execution; nie kwalifikuje basis.", "evidence_status": "source_only"}
   ],
   "public_api": {
     "parameters": [
@@ -5818,7 +5828,11 @@
         "meaning": "selects the immutable per-ampere field basis used by source-spectrum analysis",
         "backend_support": "immutable FEM antenna asset; multi-port assets require explicit selection",
         "problem_ir": "antenna_spectrum_requests[].port_mode_id"
-      }
+      },
+      {"python": "FiniteKResponseAnalysis.response_component", "type": "str", "default": "my", "si_unit": "$1$", "validation": "mx/my/mz; niełańcuchowy request IR odrzucony", "meaning": "komponent m i tego samego H_drive", "backend_support": "authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported", "problem_ir": "problem_meta.runtime_metadata.spin_wave_response.response_component"},
+      {"python": "FiniteKResponseAnalysis.probe_count", "type": "int", "default": "128", "si_unit": "$1$", "validation": "int nie bool; 4..2048; odd/even dozwolone", "meaning": "liczba sond przekrojowych x", "backend_support": "authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported", "problem_ir": "problem_meta.runtime_metadata.spin_wave_response.probe_count"},
+      {"python": "FiniteKResponseAnalysis.analysis_x_min_m", "type": "float | None", "default": "None", "si_unit": "$\\mathrm{m}$", "validation": "None pomijane; inne float conversion, nie bool, finite; przy obu max > min", "meaning": "dolna granica przekrojów, None oznacza inferencję domeny", "backend_support": "authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported", "problem_ir": "problem_meta.runtime_metadata.spin_wave_response.analysis_x_min_m"},
+      {"python": "FiniteKResponseAnalysis.analysis_x_max_m", "type": "float | None", "default": "None", "si_unit": "$\\mathrm{m}$", "validation": "None pomijane; inne float conversion, nie bool, finite; przy obu max > min", "meaning": "górna granica przekrojów, None oznacza inferencję domeny", "backend_support": "authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported", "problem_ir": "problem_meta.runtime_metadata.spin_wave_response.analysis_x_max_m"}
     ]
   }
 }

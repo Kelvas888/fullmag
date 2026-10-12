@@ -3489,7 +3489,12 @@ pub(crate) fn plan_fem(
             .iter()
             .any(|term| matches!(term, fullmag_ir::EnergyTermIR::ThermalNoise { .. })),
         has_mqs_antenna_field_source(problem) || has_prescribed_zeeman_mask_source(problem),
-        !problem.field_drives.is_empty(),
+        problem.field_drives.iter().any(|drive| crate::util::field_drive_is_active(drive, problem))
+            || problem.solved_antenna_drives.iter().any(|drive| {
+                drive.peak_current_a.is_finite()
+                    && drive.peak_current_a != 0.0
+                    && crate::util::drive_activation_is_active(&drive.activation, problem)
+            }),
         !problem.spin_transport_modules.is_empty(),
         &mut errors,
     );

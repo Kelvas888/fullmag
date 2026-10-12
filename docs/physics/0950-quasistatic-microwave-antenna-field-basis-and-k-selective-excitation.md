@@ -7556,6 +7556,112 @@ FDM CPU/GPU: obecny request reader nieobsługiwany. FEM CPU/GPU: wspólny
 postprocessor, ale oba runtime'y i parytet nadal niezakwalifikowane.
 Naprawa nie kwalifikuje snapshotów, anteny, meshu, cold HTTP ani UI.
 
+(antenna-finite-k-authoring-monitor-contract)=
+### Kontrakt authoring i monitorów finite-k — projekt E9c
+
+Status: kontrakt projektowanej poprawki, bez kwalifikacji runtime. Analiza
+odpowiedzi finite-k nie jest FFT samego pola anteny i nie jest automatycznie
+podatnością magnetyczną. Istniejący reader przetwarza osobno wybrany komponent
+magnetyzacji oraz ten sam komponent `H_drive`; nie zastępuje wektora źródła
+jego modułem. Preprocessing odejmuje pierwszą próbkę, a okna przestrzeni
+i czasu są Hann. Nie należy przenosić do tego modelu Gamma `detrend=linear`.
+
+Walidacja finite-k odrzuca jawnie opcje Gamma `detrend`, `window`,
+`weighting` i `susceptibility_floor_fraction`, zamiast przyjmować je bez
+wykonania. Podany `response_component` musi być łańcuchem `mx`, `my` albo
+`mz`; wartość domyślna `my` obowiązuje tylko przy braku klucza. Niełańcuchowa
+wartość nie jest normalizowana do `my`. Metadane legacy absorberów pozostają
+odrębne od tych opcji i nie stają się przez to maską zastosowaną w FFT.
+
+Projektowany typowany request zachowuje istniejący klucz
+`ProblemIR.problem_meta.runtime_metadata.spin_wave_response` i wersję
+`spin_wave_response.request.v1`. Nie dodaje alternatywnego modelu fizyki ani
+endpointu. Publiczna sygnatura i jej eksport muszą zostać zweryfikowane
+przed opisaniem ich jako działającego API. Dotychczasowe wywołanie Gamma
+zachowuje domyślne parametry i zachowanie.
+
+| Klucz requestu | Typ i domyślność | Jednostka SI | Walidacja i znaczenie |
+|---|---|---|---|
+| `analysis` | string, jawne `finite_k` | $1$ | Wybór analizy przestrzennej odpowiedzi, nie Gamma. |
+| `response_component` | string, `my` | $1$ | `mx`, `my` albo `mz`; określa też komponent próbkowanego źródła. |
+| `probe_count` | integer, 128 | $1$ | 4..2048; bool nie jest liczbą próbek. Nieparzyste liczby są dozwolone. |
+| `analysis_x_min_m` | optional real, inferencja domeny magnetycznej | $\mathrm{m}$ | Skończona dolna granica przekrojów. |
+| `analysis_x_max_m` | optional real, inferencja domeny magnetycznej | $\mathrm{m}$ | Skończona górna granica; po rozwiązaniu obu granic max > min. |
+
+Kandydat API `fm.FiniteKResponseAnalysis` ma dokładnie cztery parametry:
+
+| Parametr Python | Typ | Default | SI | Walidacja | Znaczenie | Backend | ProblemIR |
+|---|---|---|---|---|---|---|---|
+| `FiniteKResponseAnalysis.response_component` | `str` | `my` | $1$ | mx/my/mz; niełańcuchowy request IR odrzucony | komponent m i tego samego H_drive | authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported | `problem_meta.runtime_metadata.spin_wave_response.response_component` |
+| `FiniteKResponseAnalysis.probe_count` | `int` | `128` | $1$ | int nie bool; 4..2048; odd/even dozwolone | liczba sond przekrojowych x | authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported | `problem_meta.runtime_metadata.spin_wave_response.probe_count` |
+| `FiniteKResponseAnalysis.analysis_x_min_m` | `float | None` | `None` | $\mathrm{m}$ | None pomijane; inne float conversion, nie bool, finite; przy obu max > min | dolna granica przekrojów, None oznacza inferencję domeny | authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported | `problem_meta.runtime_metadata.spin_wave_response.analysis_x_min_m` |
+| `FiniteKResponseAnalysis.analysis_x_max_m` | `float | None` | `None` | $\mathrm{m}$ | None pomijane; inne float conversion, nie bool, finite; przy obu max > min | górna granica przekrojów, None oznacza inferencję domeny | authoring source-only; FEM tet4/f64 niezakwalifikowany; FDM unsupported | `problem_meta.runtime_metadata.spin_wave_response.analysis_x_max_m` |
+
+`response_component="my"`, `probe_count=128`, `analysis_x_min_m=None`,
+`analysis_x_max_m=None`. `to_runtime_metadata` wpisuje dwa stałe klucze
+`schema_version` i `analysis`, przekazuje komponent i liczbę sond oraz
+pomija granice `None`. Podane granice normalizuje przez `float`; odrzuca
+bool, wartości nieskończone i NaN. Konwersja niepoprawnych typów zgłasza
+TypeError/ValueError; nieprawidłowy zakres liczby sond i kolejność obu
+granic zgłaszają ValueError. Liczba sond musi być int, nie bool.
+
+`StudyStagesBuilder.fft_response` przyjmuje ten obiekt jako argument
+`response_component`; zwykły string nadal wybiera Gamma. Dla obiektu
+finite-k domyślne argumenty Gamma są zachowane wyłącznie dla zgodności
+sygnatury, nie są serializowane ani wykonywane; inne ich wartości są
+odrzucane. `enabled=False` usuwa request dla następnych etapów.
+`stage_id` określa tożsamość akcji, nie zmienia parametrów FFT. Interpretowany
+test odtworzenia skryptu potwierdza request dla 15/16 sond i Gamma; nie jest
+to dowód przejścia native IR/planner ani wykonania Run.
+
+Inferencja zakresu nie stanowi gwarancji poprawnych przekrojów: reader
+odrzuca nieważne wiersze operatora. `excluded_absorber_ranges_m` w obecnej
+implementacji jest metadanymi wyniku, nie zastosowaną maską FFT; UI nie może
+przedstawiać go jako skutecznego wyłączenia absorberów.
+
+Monitor czasowy wymaga dwóch rzeczywistych outputów pól, `m` i `H_drive`.
+Tabela skalarnych my/mz ani końcowy snapshot nie zastępują tych outputów.
+UI kontroluje aktywne deklaracje obu monitorów przed konkretnym Run oraz
+zgodność ich kadencji; OFF/clearAll usuwa ich gotowość. Reader kontroluje
+rzeczywiste osie czasu i wymaga zgodności próbek obu pól. Nie wolno
+samoczynnie włączać fizyki, dodawać pozornego RegionalFieldDrive ani ukrywać
+kosztu dodatkowego zapisu.
+
+| Realizacja | Stan analizy finite-k i warunek |
+|---|---|
+| FDM CPU | Unsupported w obecnym readerze; jawna odmowa, bez fallbacku. |
+| FDM GPU | Unsupported w obecnym readerze; jawna odmowa, bez fallbacku CPU/FEM. |
+| FEM CPU | Ograniczona ścieżka x/tet4/f64; runtime całego workflow pozostaje niekwalifikowany. |
+| FEM GPU | Obecność wspólnego readera nie dowodzi wykonania na GPU; workflow niekwalifikowany. |
+
+Mapowanie istniejących źródeł: `crates/fullmag-runner/src/spin_wave_sampling.rs`
+— `requested_finite_k_artifacts`, `dynamic_structure_factor_1d_with_axes`;
+`packages/fullmag-py/src/fullmag/model/study.py` — `FiniteKResponseAnalysis`;
+`packages/fullmag-py/src/fullmag/world.py` — `StudyStagesBuilder.fft_response`;
+`packages/fullmag-py/src/fullmag/runtime/script_builder.py` — `_render_stages`, `_render_scene_stage_bootstrap`;
+`apps/control-room/src/modules/inspector/panels/stages/studyWorkflowState.ts`
+— `validateStudyWorkflow`. Symbole kandydata authoring nie dowodzą
+ukończenia integracji ani runtime.
+
+| Kontrakt kandydata | Ścieżka + symbol | Dowód i ograniczenie |
+|---|---|---|
+| Aktywne źródło bieżącego etapu | `crates/fullmag-plan/src/lib.rs` + `has_active_finite_k_source` | Prąd skończony i niezerowy oraz aktywacja; nie certyfikuje przyjęcia artefaktu bazy. |
+| Regresja źródła | `crates/fullmag-plan/src/lib.rs` + `finite_k_source_gate_respects_antenna_stage_and_current` | Zapisany test helpera; niekompilowany i niewykonany. |
+| Opcje i typy requestu | `crates/fullmag-ir/src/validation.rs` + `validate_spin_wave_response_request` | Jawna odmowa ignorowanych Gamma-only opcji i non-string komponentu. |
+| Regresja opcji i typów | `crates/fullmag-ir/src/validation.rs` + `finite_k_request_rejects_ignored_gamma_options_and_nonstring_components` | Zapisany test; niekompilowany i niewykonany. |
+
+Bramki: Python request i eksport round-trip, UI parse/edit/serialize,
+walidacja aktywności drive i outputów, rzeczywisty Run z odczytem obu Zarr,
+analiza wyników oraz browser qualification. Testy zapisane, lecz niewykonane,
+nie zamykają żadnej bramki runtime ani urządzenia.
+
+Eksport SceneDocument zachowuje `analysis`, `response_component`, `probe_count`
+oraz obie granice SI finite-k. Parametry finite-k przekazane do Gamma oraz
+nieznane analizy lub pola są odrzucane zamiast pomijane. Reader
+`requested_finite_k_artifacts` uwzględnia niezerową solved basis aktywną
+w bieżącym stage przez `resolved_solved_antenna_drive_is_active`; nie zastępuje
+to walidacji accepted basis, rzeczywistych monitorów ani kwalifikacji runtime.
+
 (antenna-scientific-bibliography)=
 ## 14. References
 

@@ -92,6 +92,7 @@ from fullmag.model.study import (
     Eigenmodes,
     FieldAutosave,
     FieldOnly,
+    FiniteKResponseAnalysis,
     FrequencyResponse,
     Hysteresis,
     RelaxStop,
@@ -2071,32 +2072,57 @@ def _render_scene_stage_bootstrap(
         parts: list[str] = []
         if enabled:
             request = stage.get("request")
+            if request is not None and not isinstance(request, Mapping):
+                raise ValueError("SceneDocument fft_response request must be an object")
             request = request if isinstance(request, Mapping) else {}
-            _reject_unrendered_scene_nested_fields(
-                request,
-                context="fft_response_request",
-                rendered_fields={
-                    "schema_version",
-                    "analysis",
-                    "response_component",
-                    "weighting",
-                    "detrend",
-                    "window",
-                    "susceptibility_floor_fraction",
-                },
-            )
-            if request.get("weighting", "Ms_times_lumped_volume") != "Ms_times_lumped_volume":
-                raise ValueError(
-                    "SceneDocument fft_response weighting is not represented by the public scene DSL"
+            analysis = request.get("analysis", "gamma")
+            if analysis == "finite_k":
+                allowed = {
+                    "schema_version", "analysis", "response_component",
+                    "probe_count", "analysis_x_min_m", "analysis_x_max_m",
+                }
+                _reject_unrendered_scene_nested_fields(
+                    request, context="fft_response_request", rendered_fields=allowed,
                 )
-            parts.append(_python_literal(str(request.get("response_component") or "my")))
-            for key, default in (("detrend", "linear"), ("window", "hann")):
-                value = request.get(key, default)
-                if value != default:
-                    parts.append(f"{key}={_python_literal(value)}")
-            floor = _finite_number(request.get("susceptibility_floor_fraction"))
-            if floor is not None and floor != 1e-6:
-                parts.append(f"susceptibility_floor_fraction={_python_literal(floor)}")
+                if request.get("schema_version", "spin_wave_response.request.v1") != "spin_wave_response.request.v1":
+                    raise ValueError("unsupported finite-k request schema_version")
+                model = FiniteKResponseAnalysis(
+                    **{key: value for key, value in request.items() if key not in {"schema_version", "analysis"}}
+                )
+                args = [
+                    f"{key}={_python_literal(value)}"
+                    for key, value in model.to_runtime_metadata().items()
+                    if key not in {"schema_version", "analysis"}
+                ]
+                parts.append(f"fm.FiniteKResponseAnalysis({', '.join(args)})")
+            elif analysis == "gamma":
+                _reject_unrendered_scene_nested_fields(
+                    request,
+                    context="fft_response_request",
+                    rendered_fields={
+                        "schema_version",
+                        "analysis",
+                        "response_component",
+                        "weighting",
+                        "detrend",
+                        "window",
+                        "susceptibility_floor_fraction",
+                    },
+                )
+                if request.get("weighting", "Ms_times_lumped_volume") != "Ms_times_lumped_volume":
+                    raise ValueError(
+                        "SceneDocument fft_response weighting is not represented by the public scene DSL"
+                    )
+                parts.append(_python_literal(str(request.get("response_component") or "my")))
+                for key, default in (("detrend", "linear"), ("window", "hann")):
+                    value = request.get(key, default)
+                    if value != default:
+                        parts.append(f"{key}={_python_literal(value)}")
+                floor = _finite_number(request.get("susceptibility_floor_fraction"))
+                if floor is not None and floor != 1e-6:
+                    parts.append(f"susceptibility_floor_fraction={_python_literal(floor)}")
+            else:
+                raise ValueError(f"unsupported FFT response analysis '{analysis}'")
         else:
             parts.append("enabled=False")
         if stage_id is not None:
@@ -7605,20 +7631,42 @@ def _render_stages(
                 call_parts = []
                 if bool(stage.action.get("enabled", True)):
                     request = _normalize_mapping(stage.action.get("request"))
-                    call_parts.append(
-                        _py_repr(str(request.get("response_component") or "my"))
-                    )
-                    detrend = str(request.get("detrend") or "linear")
-                    window = str(request.get("window") or "hann")
-                    floor = float(request.get("susceptibility_floor_fraction", 1e-6))
-                    if detrend != "linear":
-                        call_parts.append(f"detrend={_py_repr(detrend)}")
-                    if window != "hann":
-                        call_parts.append(f"window={_py_repr(window)}")
-                    if floor != 1e-6:
-                        call_parts.append(
-                            f"susceptibility_floor_fraction={_py_number(floor)}"
+                    analysis = request.get("analysis", "gamma")
+                    if analysis == "finite_k":
+                        allowed = {
+                            "schema_version", "analysis", "response_component",
+                            "probe_count", "analysis_x_min_m", "analysis_x_max_m",
+                        }
+                        if set(request) - allowed:
+                            raise ValueError("unsupported finite-k request keys cannot be exported losslessly")
+                        if request.get("schema_version", "spin_wave_response.request.v1") != "spin_wave_response.request.v1":
+                            raise ValueError("unsupported finite-k request schema_version")
+                        model = FiniteKResponseAnalysis(
+                            **{key: value for key, value in request.items() if key not in {"schema_version", "analysis"}}
                         )
+                        args = [
+                            f"{key}={_py_literal(value)}"
+                            for key, value in model.to_runtime_metadata().items()
+                            if key not in {"schema_version", "analysis"}
+                        ]
+                        call_parts.append(f"fm.FiniteKResponseAnalysis({', '.join(args)})")
+                    elif analysis == "gamma":
+                        call_parts.append(
+                            _py_repr(str(request.get("response_component") or "my"))
+                        )
+                        detrend = str(request.get("detrend") or "linear")
+                        window = str(request.get("window") or "hann")
+                        floor = float(request.get("susceptibility_floor_fraction", 1e-6))
+                        if detrend != "linear":
+                            call_parts.append(f"detrend={_py_repr(detrend)}")
+                        if window != "hann":
+                            call_parts.append(f"window={_py_repr(window)}")
+                        if floor != 1e-6:
+                            call_parts.append(
+                                f"susceptibility_floor_fraction={_py_number(floor)}"
+                            )
+                    else:
+                        raise ValueError(f"unsupported FFT response analysis '{analysis}'")
                 else:
                     call_parts.append("enabled=False")
                 if stage.stage_id is not None:

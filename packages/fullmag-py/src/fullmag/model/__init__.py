@@ -205,6 +205,7 @@ from .structure import (
     RegionTextureOverride,
 )
 from .study import Eigenmodes, FieldAutosave, FloquetBC, FrequencyResponse, FrequencyResponseSolverPolicy, GammaResponseAnalysis, PeriodicBC, RelaxStop, Relaxation, StageAutosave, TableAutosave, FieldOnly, TimeEvolution, FieldOrientation, MeasurementAxis, HysteresisAngularVariant, HysteresisAngularFamily, SaturationProbe, HysteresisStorage, MinorLoop, FieldSegment, PiecewiseFieldSchedule, FieldWindow, AdaptiveRefinement, SettleStep, RelaxStep, MinimizeStep, DynamicsSettleStep, SettleBranch, SettlePipeline, SettleTree, Hysteresis
+from .study import FiniteKResponseAnalysis
 from .eigen import (
     BiasFieldSweep,
     DispersionValidationScenario,
@@ -236,6 +237,7 @@ __all__ = [
     "StageAutosave",
     "TableAutosave",
     "GammaResponseAnalysis",
+    "FiniteKResponseAnalysis",
     "UniaxialAnisotropy",
     "AdaptiveTimestep",
     "AntennaFieldSource",

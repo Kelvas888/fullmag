@@ -139,6 +139,7 @@ from fullmag.model.study import (
     PiecewiseFieldSchedule,
     FrequencyResponseSolverPolicy,
     GammaResponseAnalysis,
+    FiniteKResponseAnalysis,
     RelaxStop,
     Relaxation,
     SaturationProbe,
@@ -4541,7 +4542,7 @@ class StudyStagesBuilder:
 
     def fft_response(
         self,
-        response_component: str = "my",
+        response_component: str | FiniteKResponseAnalysis = "my",
         *,
         enabled: bool = True,
         detrend: str = "linear",
@@ -4549,17 +4550,22 @@ class StudyStagesBuilder:
         susceptibility_floor_fraction: float = 1e-6,
         stage_id: str | None = None,
     ) -> "StudyStagesBuilder":
-        """Enable or disable k=0 response FFT analysis for subsequent stages."""
+        """Configure Gamma or typed finite-k response analysis for subsequent stages."""
         resolved_id = self._allocate_stage_id("fft-response", stage_id)
         problem_before_action = _build_problem()
         request: dict[str, object] | None
         if enabled:
-            request = GammaResponseAnalysis(
-                response_component=response_component,
-                detrend=detrend,
-                window=window,
-                susceptibility_floor_fraction=susceptibility_floor_fraction,
-            ).to_runtime_metadata()
+            if isinstance(response_component, FiniteKResponseAnalysis):
+                if detrend != "linear" or window != "hann" or susceptibility_floor_fraction != 1e-6:
+                    raise ValueError("finite-k analysis does not accept Gamma preprocessing options")
+                request = response_component.to_runtime_metadata()
+            else:
+                request = GammaResponseAnalysis(
+                    response_component=response_component,
+                    detrend=detrend,
+                    window=window,
+                    susceptibility_floor_fraction=susceptibility_floor_fraction,
+                ).to_runtime_metadata()
             _state._extra_runtime_metadata["spin_wave_response"] = request
         else:
             request = None
