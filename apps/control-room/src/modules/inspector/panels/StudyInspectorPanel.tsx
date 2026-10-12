@@ -42,6 +42,7 @@ import type {
   SolverStatusResource,
   StageExecutionResource,
 } from "@/kernel/api/apiTypes";
+import type { ResourceResult } from "@/kernel/resources/resourceTypes";
 import {
   shouldLoadRuntimeCurrentRun,
   shouldLoadRuntimeCommandQueue,
@@ -1547,6 +1548,7 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
             dispatch({ type: "setSelectedCommandId", commandId })
           }
           runCommand={runCommand}
+          stageExecution={scopedStageExecution}
           stepValue={
             solverStatus.data?.step_index ?? currentRun.data?.total_steps ?? "n/a"
           }
@@ -1725,22 +1727,84 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
 
 type StudyCommandRunner = (commandId: string, input?: unknown) => void;
 type StudyCommandDisabledReason = (commandId: string) => string | null;
+type StageExecutionResourceState = Pick<
+  ResourceResult<StageExecutionResource | null>,
+  "data" | "error" | "refreshError" | "status"
+>;
+
+function stageExecutionFeedback(
+  resource: StageExecutionResourceState | null | undefined,
+): { kind: "error" | "warning"; message: string } | null {
+  if (!resource) return null;
+  const hasScopedSnapshot = resource.data !== null;
+  const errorMessage = resource.error?.message ?? resource.refreshError?.message;
+  const detail = errorMessage ? ` ${errorMessage}` : "";
+
+  if (resource.status === "error") {
+    return hasScopedSnapshot
+      ? {
+          kind: "warning",
+          message: `Stage telemetry refresh failed. Showing the last confirmed telemetry for the current session/run scope.${detail}`,
+        }
+      : {
+          kind: "error",
+          message: `Stage telemetry refresh failed. No snapshot is available for the current session/run scope.${detail}`,
+        };
+  }
+
+  if (resource.status === "stale") {
+    if (resource.error || resource.refreshError) {
+      return hasScopedSnapshot
+        ? {
+            kind: "warning",
+            message: `Stage telemetry refresh failed. Showing the last confirmed telemetry for the current session/run scope.${detail}`,
+          }
+        : {
+            kind: "error",
+            message: `Stage telemetry refresh failed. No snapshot is available for the current session/run scope.${detail}`,
+          };
+    }
+
+    return hasScopedSnapshot
+      ? {
+          kind: "warning",
+          message:
+            "Stage telemetry is stale. Showing the last confirmed snapshot while refresh is pending.",
+        }
+      : {
+          kind: "warning",
+          message:
+            "Stage telemetry is stale, but no snapshot matches the current session/run scope.",
+        };
+  }
+
+  return null;
+}
 
 export function StudyRuntimeSection({
   commandDisabledReason,
   model,
   onOpenCommand,
   runCommand,
+  stageExecution,
   stepValue,
 }: {
   commandDisabledReason: StudyCommandDisabledReason;
   model: StudyInspectorModel;
   onOpenCommand: (commandId: string) => void;
   runCommand: StudyCommandRunner;
+  stageExecution?: StageExecutionResourceState | null;
   stepValue: ReactNode;
 }) {
+  const telemetryFeedback = stageExecutionFeedback(stageExecution);
   return (
     <InspectorGroup title="Runtime" badge={model.runtime.state}>
+      {telemetryFeedback ? (
+        <FeedbackBanner
+          kind={telemetryFeedback.kind}
+          message={telemetryFeedback.message}
+        />
+      ) : null}
       <FieldRow label="Run" value={model.runtime.runId} />
       <FieldRow label="Active stage" value={model.runtime.activeStageLabel} />
       {model.runtime.runtimeProvenance ? (

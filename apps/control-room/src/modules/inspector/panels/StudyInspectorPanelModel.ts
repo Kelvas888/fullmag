@@ -69,8 +69,8 @@ export interface StageExecutionScope {
 /**
  * Prevent a retained resource snapshot from crossing a resource lifecycle
  * boundary. Calls without a scope remain compatible with model-only callers;
- * Ready scoped data matches its scope. Stale data requires the complete
- * session, epoch, and run identity tuple.
+ * ready scoped data matches its scope. Stale and failed-refresh snapshots
+ * require the complete session, epoch, and run identity tuple.
  */
 export function stageExecutionForCurrentScope(
   stageExecution: StageExecutionResource | null,
@@ -85,12 +85,20 @@ export function stageExecutionForCurrentScope(
     scope.expectedSessionEpoch === undefined;
   if (hasNoScope) return stageExecution;
   if (scope.scopeReady === false) return null;
-  if (scope.resourceStatus !== "ready" && scope.resourceStatus !== "stale") {
+  if (
+    scope.resourceStatus !== "ready" &&
+    scope.resourceStatus !== "stale" &&
+    scope.resourceStatus !== "error"
+  ) {
     return null;
   }
 
   const scoped = stageExecution;
-  if (scope.scopeReady === true || scope.resourceStatus === "stale") {
+  if (
+    scope.scopeReady === true ||
+    scope.resourceStatus === "stale" ||
+    scope.resourceStatus === "error"
+  ) {
     const hasRunId = Object.prototype.hasOwnProperty.call(scoped, "run_id");
     const expectedSessionId = scope.expectedSessionId;
     const expectedSessionEpoch = scope.expectedSessionEpoch;

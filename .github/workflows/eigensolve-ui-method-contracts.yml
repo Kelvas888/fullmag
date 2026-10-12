@@ -24,6 +24,8 @@ on:
       - 'apps/control-room/src/modules/analysis-plots/referenceChartQuantity.test.ts'
       - 'apps/control-room/src/shared/domain/analysis/modalDampingObservables*'
       - 'apps/control-room/src/shared/domain/analysis/phasorConventionAdapter*'
+      - 'apps/control-room/src/shared/domain/analysis/referenceImport*'
+      - 'apps/control-room/src/modules/inspector/panels/StudyInspectorPanel*'
       - 'apps/control-room/src/shared/domain/analysis/frequencyDomainChartModels*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/EigenModeInspectorPanel*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/EigenBranchInspectorPanel*'
@@ -51,6 +53,8 @@ on:
       - 'apps/control-room/src/modules/analysis-plots/referenceChartQuantity.test.ts'
       - 'apps/control-room/src/shared/domain/analysis/modalDampingObservables*'
       - 'apps/control-room/src/shared/domain/analysis/phasorConventionAdapter*'
+      - 'apps/control-room/src/shared/domain/analysis/referenceImport*'
+      - 'apps/control-room/src/modules/inspector/panels/StudyInspectorPanel*'
       - 'apps/control-room/src/shared/domain/analysis/frequencyDomainChartModels*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/EigenModeInspectorPanel*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/EigenBranchInspectorPanel*'
@@ -114,6 +118,9 @@ jobs:
           src/modules/analysis-plots/referenceChartQuantity.test.ts
           src/shared/domain/analysis/modalDampingObservables.test.ts
           src/shared/domain/analysis/phasorConventionAdapter.test.ts
+          src/shared/domain/analysis/referenceImport.test.ts
+          src/modules/inspector/panels/StudyInspectorPanelModel.test.ts
+          src/modules/inspector/panels/StudyInspectorPanel.test.tsx
           src/shared/domain/analysis/frequencyDomainChartModels.test.ts
           src/modules/inspector/panels/frequency-domain/EigenModeInspectorPanel.test.tsx
           src/modules/inspector/panels/frequency-domain/EigenBranchInspectorPanel.test.tsx

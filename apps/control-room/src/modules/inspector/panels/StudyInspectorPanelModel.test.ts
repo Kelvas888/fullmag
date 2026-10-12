@@ -224,7 +224,7 @@ describe("StudyInspectorPanelModel", () => {
     expect(model.runtime.torqueDiagnostic).toContain("max_torque_Apm");
   });
 
-  it("keeps ready and stale stage telemetry only for the exact current identity", () => {
+  it("keeps ready, stale, and failed-refresh stage telemetry only for the exact current identity", () => {
     const stageExecution: StageExecutionResource = {
       revision: 5,
       runtime_state: "running",
@@ -249,13 +249,13 @@ describe("StudyInspectorPanelModel", () => {
     });
 
     expect(stageExecutionForCurrentScope(stageExecution)).toBe(stageExecution);
-    for (const resourceStatus of ["ready", "stale"] as const) {
+    for (const resourceStatus of ["ready", "stale", "error"] as const) {
       expect(
         stageExecutionForCurrentScope(stageExecution, scope(resourceStatus)),
       ).toBe(stageExecution);
     }
 
-    for (const resourceStatus of ["idle", "loading", "error"] as const) {
+    for (const resourceStatus of ["idle", "loading"] as const) {
       expect(
         stageExecutionForCurrentScope(stageExecution, scope(resourceStatus)),
       ).toBeNull();
@@ -266,11 +266,18 @@ describe("StudyInspectorPanelModel", () => {
     expect(stageExecutionForCurrentScope(stageExecution, scope(undefined))).toBeNull();
     expect(stageExecutionForCurrentScope(null, scope("ready"))).toBeNull();
     expect(stageExecutionForCurrentScope(null, scope("stale"))).toBeNull();
+    expect(stageExecutionForCurrentScope(null, scope("error"))).toBeNull();
     expect(stageExecutionForCurrentScope(null, scope("loading"))).toBeNull();
     expect(
       stageExecutionForCurrentScope(
         stageExecution,
         scope("stale", { scopeReady: false }),
+      ),
+    ).toBeNull();
+    expect(
+      stageExecutionForCurrentScope(
+        stageExecution,
+        scope("error", { scopeReady: false }),
       ),
     ).toBeNull();
 
@@ -279,7 +286,7 @@ describe("StudyInspectorPanelModel", () => {
       { ...stageExecution, session_epoch: "session-1@2" },
       { ...stageExecution, run_id: "run-2" },
     ];
-    for (const resourceStatus of ["ready", "stale"] as const) {
+    for (const resourceStatus of ["ready", "stale", "error"] as const) {
       for (const overrides of [
         { expectedSessionId: "session-2" },
         { expectedSessionEpoch: "session-1@2" },
@@ -310,7 +317,7 @@ describe("StudyInspectorPanelModel", () => {
     }
 
     const noCurrentRun = { ...stageExecution, run_id: null };
-    for (const resourceStatus of ["ready", "stale"] as const) {
+    for (const resourceStatus of ["ready", "stale", "error"] as const) {
       expect(
         stageExecutionForCurrentScope(
           noCurrentRun,
@@ -321,12 +328,87 @@ describe("StudyInspectorPanelModel", () => {
     const missingExpectedRunScope: StageExecutionScope = {
       expectedSessionId: "session-1",
       expectedSessionEpoch: "session-1@1",
-      resourceStatus: "stale",
+      resourceStatus: "error",
       scopeReady: true,
     };
     expect(
       stageExecutionForCurrentScope(stageExecution, missingExpectedRunScope),
     ).toBeNull();
+  });
+
+  it("projects the last confirmed progress, metric, and parallel execution after a scoped refresh error", () => {
+    const snapshot = studySnapshotFromScene({
+      study: {
+        stages: [{ kind: "run", stage_id: "stage-1" }],
+      },
+    } as never);
+    const parallelExecution = {
+      completed_workers: 2,
+      failed_workers: 0,
+      total_workers: 4,
+    } as never;
+    const lastGoodStageExecution = {
+      active_stage_index: 0,
+      active_stage_kind: "run",
+      completed_stage_indexes: [],
+      revision: 17,
+      run_id: "run-1",
+      runtime_state: "running",
+      session_epoch: "session-1@1",
+      session_id: "session-1",
+      stage_statuses: ["running"],
+      stages: [
+        {
+          index: 0,
+          metric_name: "steps",
+          metric_value: 37,
+          parallel_execution: parallelExecution,
+          progress_detail: "Last confirmed worker progress",
+          progress_label: "Step 37 of 100",
+          progress_percent: 37,
+          stage_id: "stage-1",
+          status: "running",
+          threshold: 100,
+        },
+      ],
+      total_stages: 1,
+    } as unknown as StageExecutionResource;
+    const scopedStageExecution = stageExecutionForCurrentScope(
+      lastGoodStageExecution,
+      {
+        expectedRunId: "run-1",
+        expectedSessionEpoch: "session-1@1",
+        expectedSessionId: "session-1",
+        resourceStatus: "error",
+        scopeReady: true,
+      },
+    );
+    const model = resolveStudyInspectorModel({
+      currentRun: null,
+      selectedStageRef: {
+        nodeId: "model:study:stages:stage:stage-1",
+        stageId: "stage-1",
+        stageIndex: 0,
+      },
+      snapshot,
+      solverStatus: null,
+      stageExecution: scopedStageExecution,
+    });
+
+    expect(scopedStageExecution).toBe(lastGoodStageExecution);
+    expect(model.selectedStage).toMatchObject({
+      parallelExecution,
+      progressDetail: "Last confirmed worker progress",
+      progressLabel: "Step 37 of 100",
+      progressPercent: 37,
+      runtimeMetric: {
+        name: "steps",
+        rawValue: 37,
+        threshold: "100",
+        value: "37",
+      },
+      stageId: "stage-1",
+    });
   });
 
   it("projects stage authoring, boundary policy, runtime progress, and max torque", () => {
