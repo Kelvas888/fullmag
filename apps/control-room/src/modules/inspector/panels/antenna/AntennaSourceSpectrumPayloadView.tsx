@@ -168,9 +168,9 @@ function decodePayloads(
   | { kind: "error"; error: Error }
   | { kind: "ready"; value: DecodedPayloads } {
   const resources = [kU, kV, amplitudes, power];
-  const error = resources.find((resource) => resource.status === "error");
-  if (error?.status === "error") {
-    return { kind: "error", error: error.error ?? new Error("binary request failed") };
+  const error = resources.find((resource) => resource.status === "error" || resource.error || resource.refreshError);
+  if (error) {
+    return { kind: "error", error: error.error ?? error.refreshError ?? new Error("binary request failed") };
   }
   if (resources.some((resource) => resource.status === "idle" || resource.status === "loading" || resource.status === "stale")) {
     return { kind: "pending" };

@@ -20,7 +20,7 @@ import { AntennaCompositionPanel } from "@/modules/inspector/panels/antenna/Ante
 
 const SCENARIOS = ["ready", "ready-vector", "ready-unitary", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring", "wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha", "truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"] as const;
 const subscribe = () => () => {};
-type RefreshKind = "metadata" | "catalog";
+type RefreshKind = "metadata" | "catalog" | "power";
 interface Evidence { scenario: string; calls: { path: string; scope: string | null }[]; unexpected: string[]; pending: number; streamCancelled: boolean; snapshots: Record<RefreshKind, { status: string; hasData: boolean; error: string | null }>; }
 declare global { interface Window { __antennaSpectrumFixture?: { read(): Evidence; refresh(kind: RefreshKind): void; release(fail?: boolean): void; }; } }
 
@@ -58,6 +58,8 @@ function makeFixture() {
   const diagnosticRecorder = new DiagnosticRecorderController({ diagnostics });
   const metadataPath = DATA_ANTENNA_SOURCE_SPECTRUM_PATH.replace("{output_id}", "fft");
   const catalogPath = DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH.replace("{stage_id}", "solve");
+  const powerPath = DATA_ANTENNA_SOURCE_SPECTRUM_PAYLOAD_PATH.replace("{output_id}", "fft").replace("{payload_kind}", "power");
+  const powerKey = `${powerPath}#${antennaSpectrumPayloadEtag(spectrum, "power")}`;
   let heldPath: string | null = null, refreshRevision = 1;
   let pending: { release(fail: boolean): void } | null = null;
   let streamCancelled = false;
@@ -71,16 +73,17 @@ function makeFixture() {
     if (calls.length > 30 || request.method !== "GET") throw new Error("Spectrum fixture request budget/method violated");
     if (scope && scope !== sessionRequestScopeKey({ sessionId: owner.session_id, sessionEpoch: owner.session_epoch, requestScopeEpoch: owner.request_scope_epoch })) throw new Error("Foreign request owner");
     if (path === heldPath) {
-      return new Promise<Response>((resolve, reject) => {
+      const failed = await new Promise<boolean>((resolve, reject) => {
         const onAbort = () => { pending = null; reject(new DOMException("Aborted", "AbortError")); };
         pending = { release: (fail) => {
           request.signal.removeEventListener("abort", onAbort);
           pending = null; heldPath = null;
-          resolve(fail ? json({ error: "Fixture refresh rejected", code: "invalid_antenna_spectrum" }, 422) : json(path === metadataPath ? spectrum : catalog));
+          resolve(fail);
         } };
         if (request.signal.aborted) onAbort();
         else request.signal.addEventListener("abort", onAbort, { once: true });
       });
+      if (failed) return json({ error: "Fixture refresh rejected", code: "invalid_antenna_spectrum" }, 422);
     }
     if (path === SESSIONS_PATH) return json({ schema_version: "1.0", sessions: [{ session_id: owner.session_id, name: "Fixture", status: "completed", current: true }] });
     if (path === SESSION_STATUS_PATH) return json({ api_contract_version: "1.0.0", runtime_bundle_version: "fixture", session: { ...owner, name: "Fixture", created_at: "fixture", workspace_root: "fixture" }, resources: { scene_revision: 1 }, capabilities: {}, lifecycle: { solver: "completed", session_resource: "tombstoned", connectivity: "connected", commandability: "read_only" } });
@@ -114,18 +117,18 @@ function makeFixture() {
     unexpected.push(path); throw new Error(`Unexpected spectrum GET ${path}`);
   } });
   const snapshot = (kind: RefreshKind) => {
-    const path = kind === "metadata" ? metadataPath : catalogPath;
+    const path = kind === "metadata" ? metadataPath : kind === "catalog" ? catalogPath : powerKey;
     const key = sessionScopedResourceKey({ sessionId: owner.session_id, sessionEpoch: owner.session_epoch, requestScopeEpoch: owner.request_scope_epoch }, path);
     const value = sharedResourceRuntimeStore.getSnapshot(resourceRuntimeKeyForClientScope(key, api.resourceCacheScope));
     return { status: value.status, hasData: value.data !== null, error: value.error?.message ?? value.refreshError?.message ?? null };
   };
   return { kernel: { api, bus, resources, diagnostics, diagnosticRecorder } as unknown as KernelApi, control: {
-    read: () => ({ scenario, calls: [...calls], unexpected: [...unexpected], pending: pending ? 1 : 0, streamCancelled, snapshots: { metadata: snapshot("metadata"), catalog: snapshot("catalog") } }),
+    read: () => ({ scenario, calls: [...calls], unexpected: [...unexpected], pending: pending ? 1 : 0, streamCancelled, snapshots: { metadata: snapshot("metadata"), catalog: snapshot("catalog"), power: snapshot("power") } }),
     refresh: (kind: RefreshKind) => {
-      if (kind !== "metadata" && kind !== "catalog") throw new Error("Unknown fixed refresh resource");
+      if (kind !== "metadata" && kind !== "catalog" && kind !== "power") throw new Error("Unknown fixed refresh resource");
       if (pending || heldPath) throw new Error("A refresh is already pending");
-      heldPath = kind === "metadata" ? metadataPath : catalogPath;
-      resources.invalidate(heldPath, ++refreshRevision);
+      heldPath = kind === "metadata" ? metadataPath : kind === "catalog" ? catalogPath : powerPath;
+      resources.invalidate(kind === "power" ? powerKey : heldPath, ++refreshRevision);
     },
     release: (fail = false) => { if (!pending) throw new Error("No held refresh to release"); pending.release(fail); },
   } };

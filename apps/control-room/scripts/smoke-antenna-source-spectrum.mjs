@@ -46,7 +46,7 @@ try {
       await page.waitForTimeout(500);
     }
     if (readyScenarios.includes(scenario)) await page.getByRole("grid").waitFor({ timeout: 60_000 });
-    if (malformedBytes.includes(scenario)) await page.getByRole("alert").waitFor({ timeout: 60_000 });
+    if (malformedBytes.includes(scenario)) await page.locator('section[aria-label="Antenna source spectrum payload"]').getByRole("alert").waitFor({ timeout: 60_000 });
     const before = await page.evaluate(() => window.__antennaSpectrumFixture.read());
     const sectionCount = await page.locator('section[aria-label="Antenna source spectrum payload"]').count();
     const payloads = before.calls.filter((call) => call.path.includes("/payloads/"));
@@ -120,6 +120,62 @@ try {
     assert.equal(afterIdle.calls.length, beforeIdle.calls.length, `${kind} refresh error polls while settled`);
     assert.deepEqual(afterIdle.unexpected, []);
     assert.ok(afterIdle.calls.length <= 18);
+  }
+  {
+    const location = new URL(url); location.searchParams.set("scenario", "ready");
+    await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.getByRole("grid").waitFor({ timeout: 60_000 });
+    await page.evaluate(() => { window.__spectrumRetainedRoot = document.querySelector(".fm-inspector-panel"); });
+    const baseline = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+    const otherCalls = (value) => value.calls.filter((call) => !call.path.endsWith("/payloads/power"));
+    assert.equal(await page.evaluate(() => Boolean(window.__spectrumRetainedRoot)), true, "Inspector root is missing");
+    for (const fail of [true, false]) {
+      const before = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+      await page.evaluate(() => window.__antennaSpectrumFixture.refresh("power"));
+      await page.waitForFunction(() => window.__antennaSpectrumFixture.read().pending === 1, undefined, { timeout: 60_000 });
+      await page.waitForFunction(() => !document.querySelector('[role="gridcell"]'), undefined, { timeout: 60_000 });
+      const pending = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+      assert.equal(pending.snapshots.power.hasData, true, "Power refresh must retain the last-good cache");
+      assert.equal(pending.calls.length, before.calls.length + 1, "Power refresh must issue exactly one GET");
+      assert.deepEqual(otherCalls(pending), otherCalls(baseline), "Power refresh reread unrelated resources");
+      if (!fail) {
+        assert.equal(pending.snapshots.power.status, "stale");
+        assert.equal(pending.snapshots.power.error, "Fixture refresh rejected");
+        await page.locator('section[aria-label="Antenna source spectrum payload"]').getByRole("alert").waitFor({ timeout: 60_000 });
+        const pendingText = await page.locator("main").textContent();
+        assert.ok(pendingText.includes("FFT payload unavailable: Fixture refresh rejected"));
+        assert.ok(!pendingText.includes("Loading binary FFT payloads"), "Retained refresh failure was replaced by loading");
+      }
+      const rootStable = await page.evaluate(() => window.__spectrumRetainedRoot === document.querySelector(".fm-inspector-panel"));
+      checks.push({ name: `power pending before ${fail ? "error" : "ACK"}: no current grid`, passed: rootStable && await page.getByRole("gridcell").count() === 0, rootStable });
+      await page.evaluate((fail) => window.__antennaSpectrumFixture.release(fail), fail);
+      await page.waitForFunction((fail) => {
+        const value = window.__antennaSpectrumFixture.read();
+        return value.pending === 0 && value.snapshots.power.status === (fail ? "error" : "ready");
+      }, fail, { timeout: 60_000 });
+      if (fail) {
+        await page.locator('section[aria-label="Antenna source spectrum payload"]').getByRole("alert").waitFor({ timeout: 60_000 });
+        assert.ok((await page.locator("main").textContent()).includes("FFT payload unavailable: Fixture refresh rejected"), "Retained power error lost its diagnostic");
+        assert.equal(await page.getByRole("gridcell").count(), 0);
+      } else {
+        await page.getByRole("grid").waitFor({ timeout: 60_000 });
+        assert.equal(await page.getByRole("gridcell").count(), 4);
+      }
+      const settled = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+      assert.equal(settled.calls.length, before.calls.length + 1);
+      assert.deepEqual(otherCalls(settled), otherCalls(baseline));
+      assert.equal(settled.snapshots.metadata.status, "ready");
+      assert.equal(settled.snapshots.catalog.status, "ready");
+      assert.equal(settled.snapshots.power.hasData, true);
+      assert.deepEqual(settled.unexpected, []);
+      const settledRootStable = await page.evaluate(() => window.__spectrumRetainedRoot === document.querySelector(".fm-inspector-panel"));
+      checks.push({ name: `power ${fail ? "error diagnostic" : "ACK restores grid"}`, passed: settledRootStable, rootStable: settledRootStable });
+      evidence.push({ ...settled, phase: fail ? "power-error" : "power-ACK", panelText: await page.locator("main").textContent() });
+      const screenshot = resolve(directory, `power-${fail ? "error" : "ACK"}.png`); await page.screenshot({ path: screenshot, fullPage: true }); screenshots.push(screenshot);
+      await page.waitForTimeout(300);
+      assert.equal((await page.evaluate(() => window.__antennaSpectrumFixture.read())).calls.length, settled.calls.length, "Power refresh polls while settled");
+    }
+    assert.ok((await page.evaluate(() => window.__antennaSpectrumFixture.read())).calls.length <= 15);
   }
   assert.deepEqual(pageErrors, []);
   assert.deepEqual(consoleErrors, []);
