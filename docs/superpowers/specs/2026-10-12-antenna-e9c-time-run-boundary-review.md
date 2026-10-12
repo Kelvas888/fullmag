@@ -236,3 +236,42 @@ bez takiego dowodu.
 Piny tego odczytu: `ResourceRuntimeStore.ts`
 `b8a5f347db8c0ee7e314cbbc14b477b33d248782a4364fc50795a73c15cd3254`;
 `resourceState.ts` `ae18588321dd5c9e4be2b1c16e9f2ab910fa1ca4b653221df2541edfd398a6a5`.
+
+### Kolejny checkpoint: invalidacja, tożsamość i kwalifikacja konsumenta
+
+Poprawka invalidacji Gamma/DSF została zintegrowana przez właściciela
+checkoutu w commicie `6125df565c6afaacc8663279e884f28c793dce12`.
+Autor tego raportu potwierdził zgodność mostka i zapisanego testu z pakietem;
+interpretowana kontrola rzeczywistych klas nie zastępuje Vitest ani browser.
+
+`ResourceRuntimeStore.ensureLoad`: dwa syntetyczne payloady z tą samą
+schema_version przy external revision 17 → 18 przyjęły nowe dane;
+powtórzenie 18 nie uruchomiło kolejnego load. Legacy wybór DSF dla dwóch
+artefaktów i tych samych indeksów ma identyczne node/item/sample identity,
+lecz kopiuje różne f/k. Legacy Inspector jawnie nie udostępnia pola:
+nie wykazano zamiany pól ani stale browser. Kanoniczna funkcja
+`useAnalysisResultProjectionController.ts` +
+`analysisResultProjectionMatchesSelection` zaakceptowała zgodny zestaw
+i odrzuciła dziewięć mismatch/missing przypadków; uruchomiono dokładnie
+wyciętą czystą funkcję, nie hook ani endpoint.
+
+Kontrola `antennaFieldOverlayModel.ts` + `antennaDisplayShape` na syntetycznych
+deskryptorach: 6 poprawnych konfiguracji i 18 odmów unit/byte-count/hash.
+Pełny `antennaClosedLoopInspectionModel.ts` parser/owner: 3 akceptacje
+i 16 odmów. Są to kontrole metadanych, nie realnych bajtów bundle ani solvera.
+
+Zidentyfikowano niejednoznaczność diagnostyki: istniejące
+`closed_loop_v2::require_qualified` nie ma callsite; konsumenci nadal
+odrzucają v2 przez dalszy schemat v1/ready. Nie potwierdzono bypassu.
+Przekazano storage-only propozycję jawnej odmowy, cztery niewykonane testy
+Rust oraz minimalną notę 0950/source-map. Kod patch v3 SHA256:
+`27e2eac6d74daf43c16e0ce466ab426196d75b84b4e320066da590d61fe46a1b`;
+dokumentacja patch v2 SHA256:
+`c91933fb4416b7e2d0247718d6e5848db173c5030c53dbd9defa619b136a174f`.
+Obie kontrole zastosowania PASS; focused validator overlay PASS;
+suite kontraktu dokumentacji: 33 interpretowane testy OK.
+
+Pakiet pozostaje propozycją do review, nie zintegrowaną kwalifikacją.
+Pełne valid-v1/v2 public-loader runtime, cold HTTP, UI, LLG i naukowe
+bramki T00–T18 pozostają otwarte. E9c14 nadal czeka na integrację po B02;
+ponownie potwierdzono 14/14 zgodnych preimages, nie wykonanie funkcjonalności.
