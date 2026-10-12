@@ -68,3 +68,8 @@ Regresje uruchamiane wyłącznie w GHA sprawdzają resolver, rzeczywistych trzec
 ### Pełna bramka planera — GHA 38246536065
 
 Kompilacja zakresów i oba named wire tests przeszły. Pełny planner: 522 PASS, 2 FAIL. Obydwie porażki były w istniejących fixture’ach: unknown StudyStepKind podawał scalar zamiast kanonicznego tagged object, a test zakazu łączenia synthetic K0 z dispersion_validation miał tylko dwie próbki scenariusza, więc zatrzymywał się na wcześniejszym wymaganiu co najmniej trzech. Skorygowano wejścia testowe, zachowując produkcyjne reguły i dokładne wymaganie docelowego odrzucenia; dodano pełne reasons do komunikatu failure. Nowy pełny CI pending; wynik nie stanowi kwalifikacji fizycznej.
+
+
+### Bramka integracyjna CLI — GHA 38247247461
+
+Po korekcie fixture’ów pełne IR/planner/application/runner oraz named scope producers przeszły. Końcowy cargo check API/CLI zatrzymał się na istniejących referencjach `fullmag_quantities` w CLI bez direct dependency manifestu. Dodano istniejący crate workspace do manifestu i wyłącznie odpowiadającą zależność lockfile pakietu CLI. Brak aktualizacji wersji lub nowych pakietów; lokalny lockfile zachowano, zdalny zaktualizowano względem dokładnego rodzica. Nowy pełny CI pending; API/UI semantyka zakresów oraz kwalifikacja naukowa wciąż niezamknięte.

@@ -1236,6 +1236,7 @@ dependencies = [
  "fullmag-engine",
  "fullmag-ir",
  "fullmag-plan",
+ "fullmag-quantities",
  "fullmag-runner",
  "fullmag-runtime-control",
  "fullmag-session",
