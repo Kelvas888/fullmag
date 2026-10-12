@@ -156,3 +156,45 @@ Każda pozycja ma status **odczyt source-only**, bez wykonanego testu numeryczne
 Przegląd nie publikuje nowego API, nie daje wykonalnego przykładu i nie zastępuje
 pełnej noty z `.source-map.json` wymaganej przez scientific-documentation-contract.
 T17 i naukowe bramki całego modułu pozostają otwarte.
+
+## Uzupełnienie: wykonany niezależny oracle, nie backend
+
+Dodano `scripts/antenna_harmonic_macrospin_oracle.py` + `harmonic_response`
+oraz `diagnostic`. Odczyt produkcji powyżej nadal jest source-only; późniejsze
+wykonanie dotyczy **wyłącznie niezależnego narzędzia referencyjnego**.
+Istniejący `scripts/antenna_macrospin_oracle.py` opisuje pole współliniowe,
+dlatego nie zastępuje nowego oracle poprzecznej odpowiedzi harmonicznej.
+
+Wzór wyprowadzono bez macierzy Fullmaga z Gilbert LLG wokół +z. Niezależny
+przegląd matematyczny potwierdził wzór, znak precesji, granicę statycznego
+przechylenia i konwersję sinusa. Numeryczna kontrola używa pełnego 3D LLG
+z iloczynami wektorowymi, nie tej samej macierzy 2×2; wyniki są w granicy
+małego sygnału, nie w nieliniowym reżimie dużych wymuszeń.
+
+Parametry zadano w kodzie przed wykonaniem, bez dopasowywania do danych native:
+bias 10000 A/m, gamma0 221100 m/(A s), alpha 0.05/0.2,
+omega/(gamma0 H0) 0.5/1/1.4, względne pola rzędu 1e-6,
+20 czasów zaniku przed pomiarem i 8 pełnych okresów pomiaru. RK4 wykonuje
+128 i 256 kroków na okres; wymagany spadek błędu po zagęszczeniu,
+błąd względny wektora zespolonego ≤2e-6 i defekt normy ≤1e-10.
+Te tolerancje kontrolują tylko oracle. Przyszła bramka Fullmaga musi osobno
+ustalić kryteria przestrzenne i czasowe odpowiednie dla konkretnego backendu.
+
+Wykonanie `python -B scripts/antenna_harmonic_macrospin_oracle.py`: exit 0,
+`PASS_ORACLE_ONLY`. Pięć kontroli obejmuje DC tilt, znak bez tłumienia,
+sinusoidalną fazę dla obu znaków amplitudy, fazę kołową w rezonansie
+i odmowę osobliwego rezonansu bez tłumienia. Trzy porównania z 3D LLG dały:
+
+| alpha; omega/(gamma0 H0) | Błąd względny, 128 kroków | Błąd względny, 256 kroków |
+|---|---|---|
+| 0.05; 0.5 | 4.03886483723612e-7 | 2.5161049684600134e-8 |
+| 0.05; 1.0 | 9.653026703594529e-7 | 5.964799756288254e-8 |
+| 0.2; 1.4 | 4.169118665674755e-8 | 2.5480382275333263e-9 |
+
+Pełne wyniki i parametry zapisano pod resolverowym storage tego worktree:
+`reviews/antenna-harmonic-oracle-20261012/receipt.json`. SHA-256 źródła oracle:
+`3f4fdd97d4cd65720c138337a4b5e5304b8b19e3a7d7aece164a62b227416098`.
+Nie uruchomiono native, browser ani kompilacji testów jednostkowych.
+Nie porównano jeszcze żadnego wyniku Fullmaga z tym oracle.
+Narzędzie nie obsługuje wymiany, demag, anizotropii, meshu ani portów anteny
+i nie kwalifikuje żadnego z czterech backendów. T17 pozostaje otwarte.
