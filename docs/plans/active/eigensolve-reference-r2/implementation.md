@@ -989,3 +989,10 @@ GHA38153749590 na a848dce7bb842efb701563a4a991138a148fa221:1614 PASS,1 FAIL,1 ig
 Source1c398528a762ced690fb09cf00082619c4031bc8:38154212824 SUCCESS (1616runner tests,1ignored,38scientific contracts). Adaptive38153749586 SUCCESS:56scoped tests. Native38153278619 FAIL:7/12PASS,5FAIL; poprawka patternfixture nie zamknęła testu. Rowfault diagnostic checks rhs/solution unchanged są false; nie dowodzi to jeszcze rzeczywistej mutacji, dopóki nie rozróżnimy unavailable od mismatch.
 
 4060116242: przyjęta decyzja użytkownika per_sample=indywidualnie adresowalne widmo każdego k, global=kolekcja sweepa; planowane wdrożenie/publication contract nadal otwarte. Nie uśredniać różnych k, nie migrować historycznych artefaktów bez jawnego versioned contract. Starsze zapisy o braku odpowiedzi są historyczne. [Checkpoint audytowy](../../../superpowers/plans/external-review-checkpoint-20261011.md) określa zakres źródeł i pozostałe ograniczenia.
+
+
+## Nowy P1: solver_policy w Python lowering
+
+4243102016: publiczny obiekt przechowywał ustawienia, lecz Eigenmodes.to_ir ich nie emitował. Dodano istniejące policy.to_ir z omission dla None. Actual study.stages.add_eigenmodes→load_problem_from_script→IR regression obejmuje rtol i oba limity; pasuje do hosted -k eigen_solver. Source/AST PASS, GHA pending. Nie zmieniono defaultów ani kryteriów residualu.
+
+4242140004 opisuje innego konsumenta: rustową projekcję SceneDocument→script_builder overrides. Ta luka nie została zamknięta poprawką Python.to_ir. Native rowfault availability/null diagnoza potwierdzona independentsource review; brak pomiaru nie oznacza fizycznej mutacji. Poprawka fixture ma zachować wszystkie fault/quarantine guards i positive measured assertions.

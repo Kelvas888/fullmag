@@ -6057,6 +6057,44 @@ class ProblemApiTests(unittest.TestCase):
             policy,
         )
 
+    def test_eigen_solver_policy_lowers_from_python_stage(self) -> None:
+        script = """
+        import fullmag as fm
+
+        study = fm.study("eigenmodes_solver_policy")
+        study.engine("fem")
+        study.device("cpu", precision="double")
+        body = study.geometry(fm.Box(size=(2e-7, 2e-7, 1e-8), name="film"), name="film")
+        body.Ms = 800e3
+        body.Aex = 13e-12
+        body.m = fm.init.UniformMagnetization((1.0, 0.0, 0.0))
+        study.stages.add_eigenmodes(
+            count=4,
+            include_demag=False,
+            solver_rtol=2.5e-6,
+            solver_max_outer_iterations=17,
+            solver_max_linear_iterations=29,
+        )
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            script_path = Path(tmp_dir) / "eigenmodes_solver_policy.py"
+            script_path.write_text(textwrap.dedent(script), encoding="utf-8")
+            loaded = fm.load_problem_from_script(script_path, lightweight_assets=True)
+
+        expected_policy = {
+            "residual_tolerance": 2.5e-6,
+            "max_outer_iterations": 17,
+            "max_linear_iterations": 29,
+        }
+        study = loaded.stages[0].problem.study
+        self.assertEqual(study.solver_policy.to_ir(), expected_policy)
+        self.assertEqual(study.to_ir()["solver_policy"], expected_policy)
+        self.assertNotIn(
+            "solver_policy",
+            fm.Eigenmodes(outputs=[fm.SaveSpectrum()]).to_ir(),
+        )
+
     def test_frequency_response_accepts_uppercase_max_iterations_alias(self) -> None:
         script = """
         import fullmag as fm

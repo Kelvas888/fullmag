@@ -1226,6 +1226,8 @@ class Eigenmodes:
             payload["mode_tracking"] = self.mode_tracking.to_ir()
         if self.bias_field_sweep is not None:
             payload["bias_field_sweep"] = self.bias_field_sweep.to_ir()
+        if self.solver_policy is not None:
+            payload["solver_policy"] = self.solver_policy.to_ir()
         return payload
 
 
