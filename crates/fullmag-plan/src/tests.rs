@@ -19638,6 +19638,6 @@ fn eigen_spectrum_same_effective_scope_remains_duplicate() {
             }).collect();
         }
         let errors = plan(&ir).expect_err("duplicates of the same effective scope remain invalid");
-        assert!(errors.iter().any(|error| error.contains("declared more than once")), "{errors:?}");
+        assert!(errors.reasons.iter().any(|error| error.contains("declared more than once")), "{errors:?}");
     }
 }
