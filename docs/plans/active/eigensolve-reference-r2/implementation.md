@@ -996,3 +996,8 @@ Source1c398528a762ced690fb09cf00082619c4031bc8:38154212824 SUCCESS (1616runner t
 4243102016: publiczny obiekt przechowywał ustawienia, lecz Eigenmodes.to_ir ich nie emitował. Dodano istniejące policy.to_ir z omission dla None. Actual study.stages.add_eigenmodes→load_problem_from_script→IR regression obejmuje rtol i oba limity; pasuje do hosted -k eigen_solver. Source/AST PASS, GHA pending. Nie zmieniono defaultów ani kryteriów residualu.
 
 4242140004 opisuje innego konsumenta: rustową projekcję SceneDocument→script_builder overrides. Ta luka nie została zamknięta poprawką Python.to_ir. Native rowfault availability/null diagnoza potwierdzona independentsource review; brak pomiaru nie oznacza fizycznej mutacji. Poprawka fixture ma zachować wszystkie fault/quarantine guards i positive measured assertions.
+
+
+## Source maps Schur i R4
+
+4242305951/5957: zastąpiono nieistniejący native test przez FrequencyWindowPublishesSelectedSearchStabilityWithoutCount oraz voiddestroy przez istniejące bool destroy_reusable_floquet_window_state_locked. R4 mapuje unikalny produkcyjny pathowner execute_fem_eigen_path_with_producer_identity_and_parallel_policy zamiast dwóch lokalnych solve_single_k. Zaktualizowano corresponding source-code indices w obu stronach. Dwa standalone source validators PASS; dedykowany hosted gate nie kompiluje testów i nie deklaruje runtime/science.

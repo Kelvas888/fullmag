@@ -420,9 +420,9 @@ check; żaden z nich nie zastępuje managed runtime ani dowodu fizycznego.
 | backends/fem/cpu/frequency_domain/poisson_airbox_schur_matshell.cpp | PetscErrorCode production_split_schur_matmult | Produkcyjna akcja MatShell Schura. |
 | backends/fem/cpu/frequency_domain/poisson_airbox_schur_matshell.cpp | void write_production_schur_diagnostics | Serializacja metryk nullable. |
 | backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp | with_operator_diagnostics | Przeniesienie diagnostyki adaptera. |
-| backends/fem/tests/frequency_domain/poisson_airbox_modal_eigen_slepc_test.cpp | void FrequencyWindowPublishesCompleteCertificateForSyntheticFixture | Przygotowana regresja natywna. |
+| backends/fem/tests/frequency_domain/poisson_airbox_modal_eigen_slepc_test.cpp | void FrequencyWindowPublishesSelectedSearchStabilityWithoutCount | Przygotowana regresja natywna. |
 | scripts/test_poisson_airbox_schur_observability_source.py | main | Interpretowany check źródeł. |
 | backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp | FloquetSharedDomainSparseModalSolveContext::FloquetSharedDomainSparseModalSolveContext | Własność kontekstu reuse jednego okna bez globalnego cache. |
 | backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp | SLEPcTinyGyrotropicModalEigenResult solve_sparse_modal_spectrum_for_request | Przekazanie kontekstu do podokien natywnego Floqueta. |
-| backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp | void destroy_reusable_floquet_window_state | Niszczenie bezpiecznego stanu PETSc; unsafe EPS zachowuje graf do końca procesu. |
+| backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp | bool destroy_reusable_floquet_window_state_locked | Niszczenie bezpiecznego stanu PETSc; unsafe EPS zachowuje graf do końca procesu. |
 | scripts/test_floquet_window_context_reuse_source.py | main | Interpretowany check reuse, zgodności wejścia i trzyshiftowej normalizacji. |

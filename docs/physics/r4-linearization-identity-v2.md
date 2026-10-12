@@ -538,7 +538,7 @@ sidecara dla deklarowanego identity kończy się błędem fail-closed.
 | exact certificate preimage | crates/fullmag-runner/src/types.rs + recomputed_fem_linearization_certificate_preimage_bytes | FEM CPU | source + prepared regression |
 | sidecar publication | crates/fullmag-runner/src/fem/eigen_native_artifacts.rs + native_modal_artifacts | FEM CPU | source-visible; runtime NOT VERIFIED |
 | final state paths in identity | crates/fullmag-runner/src/fem/eigen_native_artifacts.rs + state_artifact_paths | FEM CPU | source-visible; runtime NOT VERIFIED |
-| path sample-index forwarding | crates/fullmag-runner/src/fem/eigen_path.rs + solve_single_k | FEM CPU | source-visible; runtime NOT VERIFIED |
+| path sample-index forwarding (production path owner and its adapter) | crates/fullmag-runner/src/fem/eigen_path.rs + execute_fem_eigen_path_with_producer_identity_and_parallel_policy | FEM CPU | source-visible; runtime NOT VERIFIED |
 | signed sample remap | crates/fullmag-runner/src/fem/eigen_path_artifacts.rs + remap_single_k_mode_artifacts | FEM CPU | source-visible; runtime NOT VERIFIED |
 | manifest family selectors | crates/fullmag-runner/src/fem/eigen_path_manifest.rs + eigen_path_state_metadata_paths | FEM CPU | source-visible |
 | single-k R4 arrays | crates/fullmag-runner/src/fem/eigen_output.rs + sample_scoped_signed_sidecar_paths | FEM CPU | source-visible; runtime NOT VERIFIED |

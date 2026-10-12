@@ -301,8 +301,8 @@
     {
       "id": "path-sample-index-forwarding",
       "path": "crates/fullmag-runner/src/fem/eigen_path.rs",
-      "symbol": "solve_single_k",
-      "responsibility": "Przekazuje rzeczywisty indeks próbki do modalnego producenta przed publikacją signed sidecarów."
+      "symbol": "execute_fem_eigen_path_with_producer_identity_and_parallel_policy",
+      "responsibility": "Właściciel wykonania ścieżki i jego lokalny adapter przekazują rzeczywisty indeks próbki do modalnego producenta przed publikacją signed sidecarów; kotwica obejmuje adapter produkcyjny zamiast odrębnego helpera testowego."
     },
     {
       "id": "signed-sample-remap",
