@@ -1,0 +1,158 @@
+# T17 — granica podłączenia anteny do odpowiedzi harmonicznej
+
+Data: 12.10.2026. Odczyt źródeł: `ca59ab9bca0b1962ba20a302f8738ce56e12af4c`.
+Status: **przegląd source-only; T17 OTWARTE**. Nie jest to publikacyjna
+nota fizyczna ani kwalifikacja wykonania. Nie uruchomiono solvera, przeglądarki
+ani testów jednostkowych. Nie zmieniono produkcji ani odmów wykonania.
+
+## Uzgodnienie prac
+
+Integrator w wątku `01a12a56-002e-7660-8424-c7e07fb0907a` zachowuje własność
+produkcji backend/UI i czterech plików przekazanych z poprawką M04. Ten przegląd
+jest niezależnym odczytem T17, uzgodnionym z integratorem; nie upoważnia do
+równoległej modyfikacji tych plików. Dowody browser FFT nie kwalifikują T17.
+
+## Potwierdzone granice
+
+| Warstwa | Stan odczytany z kodu | Konsekwencja |
+|---|---|---|
+| CLI | `prepare_solved_antenna_drive_activation` odrzuca aktywne solved antenna drives dla `FemEigen` i `FemFrequencyResponse` | Nie wystarczy usunąć odmowy: brak dalszego kontraktu |
+| IR | `FrequencyExcitationIR` zawiera jeden `field_au_per_m: [f64; 3]` i `phase_rad` | Nie reprezentuje przestrzennej bazy A/m/A ani jej tożsamości/projekcji |
+| Plan | `FemFrequencyResponsePlanIR` nie ma pola `solved_antenna_drive_bases` | Plan czasowy i częstotliwościowy nie mają obecnie równoważnego nośnika anteny |
+| Runner | `build_native_production_payload` rzutuje wspólny wektor excitation na lokalne bazy styczne i tworzy real/imag z cos/sin fazy | Istnieje nośnik zespolonego wymuszenia, ale nie binder przestrzennej anteny |
+| Native | `LinearizedDynamicPencil::apply_Aomega` realizuje znak zależny od konwencji; CPU solver zachowuje oba składniki RHS | Podstawy operatora istnieją; nie dowodzi to poprawności antenowego RHS |
+| Pomocniczy plan demag | `frequency_response_demag_backend_plan` tworzy `FemPlanIR` z pustymi bazami anteny | To plan dostawcy demag, nie dowód, że należy do niego wkleić dynamiczną antenę |
+
+Komunikat odmowy CLI mówi tylko o FEM time-evolution, chociaż wcześniejsza gałąź
+dopuszcza również `Fdm`. Jest to niespójność diagnostyki, **nie dowód obsługi
+FDM frequency response**. Naprawa komunikatu pozostaje po stronie integratora.
+
+## Konwencja fazy i zakres wniosku
+
+Źródło nadrzędne: `docs/physics/frequency_domain_solver_physics.md`, sekcje
+„Physical Goal” i „Magnetic-Only Frequency Response”. Runner przekazuje
+`FrequencyDomainPhaseConvention::ExpIOmegaT` do natywnego żądania.
+
+Dla tej konwencji rekonstrukcja rzeczywistego sygnału ma postać
+$H(t)=\operatorname{Re}[\widehat H\exp(i\omega t)]$.
+Obecny evaluator czasowy stosuje $\sin(2\pi f t+\phi)+c$.
+Zatem dla skalarnego prądu $I(t)=I_a[\sin(\omega t+\phi)+c]$ kandydatem
+na **sam składnik AC** jest $\widehat I=I_a\exp[i(\phi-\pi/2)]$,
+a składowa DC wynosi $I_a c$. Dla realnej bazy Tier 1 zachodzi
+$\widehat{\mathbf H}(\mathbf r)=\widehat I\mathbf h(\mathbf r)$.
+To tożsamość algebraiczna, nie wdrożony adapter ani dowód runtime.
+
+| Symbol | Znaczenie | Jednostka SI |
+|---|---|---|
+| $t$ | czas | $\mathrm{s}$ |
+| $f$, $\omega=2\pi f$ | częstotliwość i pulsacja | $\mathrm{Hz}$, $\mathrm{rad\,s^{-1}}$ |
+| $i$, $c$ | jednostka urojona i offset waveform | $1$, $1$ |
+| $\phi$ | faza sinusoidy | $\mathrm{rad}$ |
+| $I_a$, $\widehat I$ | skala prądu i amplituda zespolona AC | $\mathrm{A}$ |
+| $\mathbf r$ | pozycja | $\mathrm{m}$ |
+| $\mathbf h$ | realna baza pola na jednostkę prądu | $\mathrm{A\,m^{-1}\,A^{-1}}$ |
+| $H$, $\widehat H$, $\widehat{\mathbf H}$ | pole rzeczywiste i amplitudy zespolone | $\mathrm{A\,m^{-1}}$ |
+
+Offset musi wejść do jawnie zweryfikowanego pola równowagi albo zostać odrzucony;
+nie wolno dopisać go do harmonicznego RHS. Pulse/sinc/piecewise nie są jednym
+phasorem bez osobnego kontraktu transformacji. Konwencji przestrzennej Floqueta
+nie wolno utożsamiać z konwencją czasową. Dla `exp(-iωt)` amplituda tego samego
+rzeczywistego sygnału byłaby sprzężona; obecny odczyt potwierdza plus w runnerze.
+
+Odczyt projekcji pola **nie zamyka** dowodu znaku momentu, współczynnika
+żyromagnetycznego, masy FEM ani jednostek natywnego RHS. Przed podłączeniem
+anteny trzeba prześledzić cały adapter field→torque/operator; nie mnożyć przez
+$\mu_0$ lub gamma na podstawie samej nazwy `drive_real`.
+
+## Kolejność wdrożenia przekazana integratorowi
+
+### Dodatkowy przegląd: pole nie jest automatycznie RHS momentu
+
+Prześledzony wycinek to FEM CPU, nie wszystkie warianty demag/Floquet/GPU.
+Pięć plików tej ścieżki (`frequency_response.rs`, `api.cpp`,
+`driven_response_solver.cpp`, `operator_terms.cpp`, `mfem_linearized_operator.cpp`)
+miało identyczne SHA w checkoutcie integratora w chwili tego odczytu.
+
+| Krok | Ścieżka + symbol | Rzeczywista operacja |
+|---|---|---|
+| Pole → tangent | `crates/fullmag-runner/src/frequency_response.rs` + `build_native_production_payload` | dot z e1/e2, faza cos/sin; brak mnożenia przez gamma i obrotu precesyjnego w budowie drive |
+| ABI → request | `backends/fem/src/api.cpp` + `fullmag_fem_frequency_domain_solve_driven_response_from_c_abi` | przypisanie `mfem_drive_real/imag` do `mfem_validation_problem.drive_real/imag` |
+| Request → solver | `backends/fem/src/frequency_domain/driven_response_solver.cpp` + `solve_mfem_production_cpu_problem` | przekazanie drive po ewentualnej projekcji ograniczeń okresowych |
+| Solver → RHS | `backends/fem/cpu/frequency_domain/production_cpu_driven_response.cpp` + `solve_production_cpu_driven_response` | `rhs[row]=drive_real`, `rhs[row+n]=drive_imag` |
+| Pole operatora → precesja | `backends/fem/cpu/frequency_domain/mfem_linearized_operator.cpp` + `apply_mfem_linearized_cpu_operator`; `backends/fem/src/frequency_domain/operator_terms.cpp` + `apply_tangent_precession_operator` | $(h_1,h_2)\mapsto(\gamma_0 h_2,-\gamma_0 h_1)$ |
+| Masa i adapter | `backends/fem/src/frequency_domain/operator_terms.cpp` + `apply_tangent_frequency_mass_operator`; `driven_response_solver.cpp` + `apply_mfem_production_cpu_canonical_pencil` | masa $(q_1+\alpha q_2,q_2-\alpha q_1)$; adapter ma $L=-S$, $B_\alpha=-M$ |
+
+To wskazuje **potencjalny błąd jednostek/obrotu wymuszenia w istniejącej ścieżce
+uniform excitation**, niezależny od brakującego bindera anteny. Natywny solver
+traktuje drive jak gotowy algebraiczny RHS, a publiczny runner buduje go jak pole.
+Nie jest to jeszcze potwierdzony błąd runtime; nie wykonano niezależnego oracle.
+Nie poprawiać przez bezwarunkowe skopiowanie helpera precesji: trzeba najpierw
+uzgodnić znak całego operatora, w tym adaptera legacy, i rekonstrukcję odpowiedzi.
+
+Uzupełniające symbole: $h_1,h_2$ to składowe pola w bazie stycznej
+[$\mathrm{A\,m^{-1}}$], $q_1,q_2$ to składowe perturbacji jednostkowej
+magnetyzacji [$1$], $\gamma_0$ to dodatni współczynnik precesji dla pola H
+[$\mathrm{m\,A^{-1}\,s^{-1}}$], $\alpha$ to tłumienie Gilberta [$1$],
+$S,M$ to wyjścia legacy operatora precesji i masy, $L,B_\alpha$ to ich
+adaptery w pencil. Ich działania na $q$ mają jednostki odpowiednio
+$\mathrm{s^{-1}},1,\mathrm{s^{-1}},1$. Obrót pola przez gamma daje
+$\mathrm{s^{-1}}$, nie $\mathrm{A\,m^{-1}}$.
+
+**Bramka przed T17:** niezależny macrospin bez exchange/demag/anisotropii,
+pole równowagi dodatnie wzdłuż z, niewielkie wymuszenie poprzeczne x; sprawdzić
+granicę małej częstotliwości (tilt w kierunku x, skala H_AC/H_DC), fazę obu
+komponentów i skończoną częstotliwość przy kilku alpha. Oracle musi wynikać z
+LLG, nie z tej samej macierzy, którą testujemy. Porównać również z time-domain
+po transjencie. Sam mały residual algebraiczny nie sprawdza fizycznego RHS.
+
+1. Uzupełnić kanoniczną notę 0950 i właściciela frequency-domain o kontrakt
+   harmonicznej anteny, pełne mapowanie Python→IR oraz normalizację per-current.
+   Nie tworzyć drugiej fizyki w UI ani równoległego solvera anten RF.
+2. Zaprojektować nośnik spatial source w IR/planie: przyjęte rozwiązanie, signed
+   current normalization, projekcja target/mesh, scalar AC, faza, provenance.
+   Wyraźnie oddzielić pole równowagi od dynamicznego RHS i od operatora eigen.
+3. Dodać binder przyjętej bazy do RHS, zachowujący lokalne indeksy magnetycznych
+   węzłów, orientację baz stycznych i ograniczenia okresowe. Odrzucać stale/missing
+   projection, mismatch częstotliwości i nieobsługiwany waveform, bez fallbacku.
+4. Prześledzić i zweryfikować natywną normalizację field→RHS. Dopiero wtedy
+   zintegrować z istniejącym solverem; nie zastępować tego uniform excitation
+   ani dense-reference wynikiem produkcyjnym.
+5. Dodać Python/UI/eksport na tym samym kontrakcie: źródło antenowe, AC amplitude
+   w A, faza i jej konwencja, sweep Hz, target, równowaga, normalizacja wyników,
+   jawne unsupported capability. FFT źródła pozostaje osobnym podwęzłem.
+6. Zapisać i następnie wykonać dopuszczone bramki: algebra faz 0/π/2/π i offset;
+   przestrzennie niejednorodna baza; odrzucenia; macrospin z niezależnym oracle;
+   zgodność amplitudy i fazy z time-domain po zaniku transjentu; bilans jednostek
+   i residual; round-trip; backend provenance; browser regresje Inspectorów.
+7. Usunąć odmowę `FemFrequencyResponse` wyłącznie dla kwalifikowanego wycinka
+   po rzeczywistym wykonaniu. Nie usuwać odmowy dynamicznego drive w eigen.
+
+FEM CPU i FEM GPU wymagają odrębnych dowodów wykonania tej integracji.
+FDM CPU/GPU nie uzyskują obsługi frequency response przez analogię do LLG.
+Żaden z tych czterech torów nie został tutaj zakwalifikowany dla T17.
+Nie deklarować S21 bez modelu detektora/portów; source FFT nie jest odpowiedzią
+magnetyzacji ani gwarancją wzbudzenia modu.
+
+## Mapa źródeł i zamrożenie odczytu
+
+SHA-256 odnoszą się do bajtów plików worktree (nie do Git blob IDs).
+Każda pozycja ma status **odczyt source-only**, bez wykonanego testu numerycznego.
+
+| Ścieżka | Symbol / sekcja | SHA-256 |
+|---|---|---|
+| `crates/fullmag-cli/src/orchestrator.rs` | `prepare_solved_antenna_drive_activation` | `4e0bb1e13ba94427263e54c7dbd49645902f11dd3e641b35302ac3704e80abf2` |
+| `crates/fullmag-ir/src/frequency_response_contract.rs` | `FrequencyExcitationIR` | `d5f119b1b63eaa78a985e107c1c97fc11d7cf5779475283635246171811bb232` |
+| `crates/fullmag-ir/src/plan.rs` | `FemFrequencyResponsePlanIR` | `d76f62224c238b16f9616c60075b40d9159533506376aa06a0828c81eac11658` |
+| `crates/fullmag-runner/src/time_dependence.rs` | `evaluate_time_dependence` | `4c18efa6caf790c0399ffc0353e77b978059a755775b86ef051406d944194360` |
+| `crates/fullmag-runner/src/frequency_response.rs` | `build_native_production_payload`, `frequency_response_demag_backend_plan`, `try_execute_fem_frequency_response_native_production_cpu` | `7757d437e4f226563634191ab38661892419959e149e45549c737df9e4317364` |
+| `backends/fem/src/frequency_domain/linearized_dynamic_pencil.cpp` | `LinearizedDynamicPencil::apply_Aomega`, `apply_Aomega_real_split` | `df5e1ad4563af7dfd4783251a107534df359a6326352dd12e30d8e694c18e523` |
+| `backends/fem/cpu/frequency_domain/production_cpu_driven_response.cpp` | `drive_real`/`drive_imag` RHS i wybór `angular_frequency_sign` | `6da912799e8f0d5d409ccaeef26e821c4cf11e1f965f7aec77d6eb987f5dc736` |
+| `docs/physics/frequency_domain_solver_physics.md` | Physical Goal; Magnetic-Only Frequency Response | `f480033e5935ce8edd3a5cda10d39e5d09654d72f779091e871802b28d635f5a` |
+| `backends/fem/src/api.cpp` | `fullmag_fem_frequency_domain_solve_driven_response_from_c_abi`, mapowanie `mfem_drive_*` | `007aa017426f85f23bdf172499c2f43f67e1fa1ec39c0112c3268d502021c609` |
+| `backends/fem/src/frequency_domain/driven_response_solver.cpp` | `solve_mfem_production_cpu_problem`, `apply_mfem_production_cpu_canonical_pencil` | `f1f58c88efff81b1d89d3d21e0eae310ae28adfeafe23232cb231b98c4da8c84` |
+| `backends/fem/src/frequency_domain/operator_terms.cpp` | `apply_tangent_precession_operator`, `apply_tangent_frequency_mass_operator` | `2a339c974eb87c046d2ef6faa89eb57945312e71558c721895f734b40fdfef4f` |
+| `backends/fem/cpu/frequency_domain/mfem_linearized_operator.cpp` | `apply_mfem_linearized_cpu_operator` | `7924421eb7203592cdecbfc984928dc8542373d54d8bbe9deb976e99d8459713` |
+
+Przegląd nie publikuje nowego API, nie daje wykonalnego przykładu i nie zastępuje
+pełnej noty z `.source-map.json` wymaganej przez scientific-documentation-contract.
+T17 i naukowe bramki całego modułu pozostają otwarte.
