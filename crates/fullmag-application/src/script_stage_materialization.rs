@@ -1268,7 +1268,7 @@ fn eigen_sampling_from(base: &fullmag_ir::SamplingIR, mode_count: u32) -> fullma
         )
     }) {
         outputs.push(fullmag_ir::OutputIR::EigenSpectrum {
-            quantity: "spectrum".to_string(),
+            quantity: fullmag_ir::CANONICAL_EIGEN_SPECTRUM_QUANTITY.to_string(),
         });
     }
     fullmag_ir::SamplingIR {
@@ -3610,6 +3610,100 @@ mod pipeline_eigen_solver_policy_tests {
             .map(serde_json::from_value::<fullmag_ir::FemEigenSolverPolicyIR>)
             .transpose()
             .expect("materialized solver policy should match its typed IR model")
+    }
+
+    fn eigenmode_pipeline_stage(base: ProblemIR) -> ResolvedScriptStage {
+        let config = ScriptExecutionConfig {
+            ir: base,
+            shared_geometry_assets: None,
+            default_until_seconds: None,
+            study_pipeline: Some(StudyPipelineDocument {
+                version: "study_pipeline.v1".to_string(),
+                nodes: vec![StudyPipelineNode::Primitive {
+                    id: "eigenmodes".to_string(),
+                    label: "Eigenmodes".to_string(),
+                    enabled: true,
+                    notes: None,
+                    source: None,
+                    stage_kind: "eigenmodes".to_string(),
+                    payload: BTreeMap::new(),
+                }],
+            }),
+            stages: Vec::new(),
+        };
+        let mut stages = materialize_script_stages_with_output_policy_bounded(
+            config,
+            fullmag_ir::configure_project_autosave_policy,
+            1,
+        )
+        .expect("eigenmodes pipeline should materialize");
+        assert_eq!(stages.len(), 1, "expected exactly one pipeline stage");
+        stages.remove(0)
+    }
+
+    #[test]
+    fn pipeline_eigenmodes_without_prior_eigen_outputs_use_canonical_spectrum() {
+        let time_evolution = time_evolution_base();
+        let relaxation = materialize_pipeline_relax(&time_evolution, &BTreeMap::new())
+            .expect("time-evolution base should materialize a relaxation stage");
+
+        for (base_kind, base) in [
+            ("time-evolution", &time_evolution),
+            ("relaxation", &relaxation.ir),
+        ] {
+            assert!(
+                base.study.sampling().outputs.iter().all(|output| !matches!(
+                    output,
+                    fullmag_ir::OutputIR::EigenSpectrum { .. }
+                        | fullmag_ir::OutputIR::EigenMode { .. }
+                        | fullmag_ir::OutputIR::DispersionCurve { .. }
+                )),
+                "{base_kind} base should not contain prior eigen outputs"
+            );
+
+            let stage = eigenmode_pipeline_stage((*base).clone());
+            let fullmag_ir::StudyIR::Eigenmodes { sampling, .. } = &stage.ir.study else {
+                panic!("{base_kind} base should materialize an eigenmodes stage");
+            };
+            assert_eq!(
+                sampling.outputs,
+                vec![fullmag_ir::OutputIR::EigenSpectrum {
+                    quantity: fullmag_ir::CANONICAL_EIGEN_SPECTRUM_QUANTITY.to_string(),
+                }],
+                "{base_kind} base should receive only the canonical spectrum fallback"
+            );
+            stage.ir.validate().unwrap_or_else(|errors| {
+                panic!("{base_kind} fallback should produce valid active IR: {errors:?}")
+            });
+        }
+    }
+
+    #[test]
+    fn pipeline_eigenmodes_preserve_explicit_eigen_outputs() {
+        let explicit_outputs = vec![
+            fullmag_ir::OutputIR::EigenSpectrum {
+                quantity: fullmag_ir::CANONICAL_EIGEN_SPECTRUM_QUANTITY.to_string(),
+            },
+            fullmag_ir::OutputIR::EigenMode {
+                field: "mode".to_string(),
+                all_modes: false,
+                indices: vec![1],
+                branches: Vec::new(),
+                sample_selector: None,
+            },
+        ];
+        let mut base = time_evolution_base();
+        let fullmag_ir::StudyIR::TimeEvolution { sampling, .. } = &mut base.study else {
+            unreachable!("time_evolution_base returns a time-evolution study");
+        };
+        sampling.outputs = explicit_outputs.clone();
+
+        let stage = eigenmode_pipeline_stage(base);
+        let fullmag_ir::StudyIR::Eigenmodes { sampling, .. } = &stage.ir.study else {
+            panic!("time-evolution base should materialize an eigenmodes stage");
+        };
+        assert_eq!(sampling.outputs, explicit_outputs);
+        stage.ir.validate().expect("explicit canonical eigen outputs remain valid");
     }
 
     #[test]

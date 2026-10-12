@@ -1008,3 +1008,8 @@ Source1c398528a762ced690fb09cf00082619c4031bc8:38154212824 SUCCESS (1616runner t
 Real JSON38153278619 ma *_available:false oraz values:null, statusunavailable. Independent source review potwierdził return z borrowed rowrestore przed VecEqual; nie można wywoływać dalszego PETSc na quarantinedgraph tylko dla testu. Fixture teraz wymaga dokładnie tej dostępności w last_true_probe.candidate_operator_diagnostic.live_pc_observation. Scoped negativeconsumer odrzuca missingfields,false/true,true/true i obce/nestedobjects; restoreordering, distinct primary/cleanup errors oraz unsafebefore/afterdestroy zachowane. Positive true/true i recoverable freshLU invariance assertions zachowane. Patternfixture ma dodatkowe failure-only bounded diagnostics, PASScriteria bez zmian. Production/safety/tolerances/operator bez zmian. Root+independent SOURCE review PASS, CPPcompile/runtime pendingGHA. Brak dowodu niezmienności phi po hardfault oraz nauka nadal NOT VERIFIED.
 
 Potwierdzone GHA:38232017811 SUCCESS (84tests,24subtests) dla Python solver_policy;38232241407 SUCCESS dla Schur/R4 maps.
+
+
+## Kanoniczne widmo materializowanego pipeline
+
+4243102022: źródłowy producer jest w fullmag-application/script_stage_materialization.rs::eigen_sampling_from. Fallback używa CANONICAL_EIGEN_SPECTRUM_QUANTITY; poprawnego validatora nie poluzowano. Actual StudyPipelineDocument z TD/relax bezprioroutputs dostaje canonical spectrum i przechodzi activeIR.validate; explicit spectrum/mode pozostają identyczne. Source/parser review PASS; dwa namedcases muszą przejść GHA z log guards i pipefail. Nie zmieniono scope ani publicznego schema.
