@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   PROBLEM_IR_03_RIGID_TRANSFORM_REASON,
   createMoveGestureController,
+  isMoveCommitPending,
   installMoveGestureTerminalListeners,
   moveAxisPointerHandlers,
 } from "./MoveObjectGizmo";
@@ -39,7 +40,9 @@ describe("MoveObjectGizmo", () => {
 
     expect(release).toHaveBeenCalledWith(4);
     expect(onCommit).toHaveBeenCalledTimes(1);
-    expect(onCommit).toHaveBeenCalledWith("magnet-x", [6e-9, 2e-9, 3e-9], 17);
+    expect(onCommit).toHaveBeenCalledWith("magnet-x", [6e-9, 2e-9, 3e-9], 17, {
+      lockHeldByGesture: true,
+    });
     expect(onDraftChange).toHaveBeenLastCalledWith(null);
   });
 
@@ -62,6 +65,58 @@ describe("MoveObjectGizmo", () => {
       origin: [0, 0, 0],
       translation: [0, 7e-9, 0],
     });
+  });
+
+  it("clears a no-op click without sending a commit", async () => {
+    const onCommit = vi.fn();
+    const onDraftChange = vi.fn();
+    const controller = createMoveGestureController({
+      baseRevision: 3,
+      objectId: "stationary-magnet",
+      onCommit,
+      onDraftChange,
+      origin: [1e-9, 2e-9, 3e-9],
+    });
+
+    controller.begin("x", 2, [0, 0, 0], vi.fn(), vi.fn());
+    await controller.end(2);
+
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(onDraftChange).toHaveBeenLastCalledWith(null);
+  });
+
+  it("blocks another gesture until the first move promise settles", async () => {
+    let resolveCommit: ((result: boolean) => void) | undefined;
+    const onCommit = vi.fn(() => new Promise<boolean>((resolve) => {
+      resolveCommit = resolve;
+    }));
+    const first = createMoveGestureController({
+      baseRevision: 1,
+      objectId: "magnet-a",
+      onCommit,
+      onDraftChange: vi.fn(),
+      origin: [0, 0, 0],
+    });
+    const secondCapture = vi.fn();
+    const second = createMoveGestureController({
+      baseRevision: 1,
+      objectId: "magnet-b",
+      onCommit,
+      onDraftChange: vi.fn(),
+      origin: [0, 0, 0],
+    });
+
+    first.begin("x", 1, [0, 0, 0], vi.fn(), vi.fn());
+    first.move(1, [1e-9, 0, 0]);
+    const pending = first.end(1);
+    expect(isMoveCommitPending(onCommit)).toBe(true);
+    second.begin("y", 2, [0, 0, 0], secondCapture, vi.fn());
+
+    expect(secondCapture).not.toHaveBeenCalled();
+    expect(onCommit).toHaveBeenCalledOnce();
+    resolveCommit?.(true);
+    await pending;
+    expect(isMoveCommitPending(onCommit)).toBe(false);
   });
 
   it("explicitly cancels once, clears the draft, restores OrbitControls, and sends no request", () => {
@@ -177,6 +232,32 @@ describe("MoveObjectGizmo", () => {
 
     expect(releasePointerCapture).toHaveBeenCalledOnce();
     expect(onCommit).not.toHaveBeenCalled();
+  });
+
+  it("handles a rejected pointerup promise without leaving a commit lock or unhandled rejection", async () => {
+    const onCommit = vi.fn().mockRejectedValue(new Error("network"));
+    const controller = createMoveGestureController({
+      baseRevision: 1,
+      objectId: "rejected-magnet",
+      onCommit,
+      onDraftChange: vi.fn(),
+      origin: [0, 0, 0],
+    });
+    const handlers = moveAxisPointerHandlers(controller, "x");
+    const event = {
+      point: { x: 0, y: 0, z: 0 },
+      pointerId: 11,
+      stopPropagation: vi.fn(),
+      target: { releasePointerCapture: vi.fn(), setPointerCapture: vi.fn() },
+    } as never;
+
+    handlers.onPointerDown(event);
+    handlers.onPointerMove({ ...event, point: { x: 1e-9, y: 0, z: 0 } } as never);
+    expect(() => handlers.onPointerUp(event)).not.toThrow();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(onCommit).toHaveBeenCalledOnce();
+    expect(isMoveCommitPending(onCommit)).toBe(false);
   });
 
   it("publishes the exact canonical-contract reason for Rotate and Scale", () => {

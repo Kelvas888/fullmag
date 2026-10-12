@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useKernel } from "@/kernel/KernelContext";
+import { createCommandContext } from "@/kernel/commands/commandContext";
 import {
   commitObjectMoveWorkflow,
   rebaseObjectMoveConflict,
@@ -12,20 +13,57 @@ import { useObjectMoveTool } from "@/kernel/authoring/ObjectMoveToolController";
 import type { ObjectTranslation } from "@/kernel/authoring/objectTranslationMutation";
 import { Button } from "@/shared/ui/Button";
 import { useSceneResource } from "@/kernel/resources/geometryLifecycleResources";
+import {
+  sessionRequestScopeKey,
+  sessionResourceIdentityKey,
+  type SessionResourceIdentity,
+} from "@/kernel/resources/sessionResourceIdentity";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { useSelectionSelector } from "@/kernel/selection/useSelection";
+import { selectionSnapshotEquals, type Selection } from "@/kernel/selection/selectionTypes";
 
-import { Viewport3DMoveToolLayer } from "./MoveObjectGizmo";
+import {
+  isMoveCommitPending,
+  tryAcquireMoveCommit,
+  type MoveCommitLockToken,
+  type MoveCommitHandler,
+  Viewport3DMoveToolLayer,
+} from "./MoveObjectGizmo";
 import { buildViewport3DPrimitiveRenderModel } from "./viewport3dPrimitiveModel";
 
 interface ActiveMoveIdentity {
   activationId: number;
+  sessionIdentityKey: string | null;
+  selection: Selection;
+  selectionEpoch: number;
+}
+
+interface CurrentMoveContext {
+  moveTargetEligible: boolean;
+  selectedObjectId: string | null;
   sessionId: string | null;
+  sessionIdentity: SessionResourceIdentity | null;
+  sessionIdentityKey: string | null;
+  sessionScopeKey: string | null;
+}
+
+interface MoveRequestFence {
+  activationId: number;
+  objectId: string;
+  selection: Selection;
+  selectionEpoch: number;
+  sessionIdentity: SessionResourceIdentity;
+  sessionIdentityKey: string;
+  sessionScopeKey: string;
 }
 
 export interface Viewport3DMoveConflict extends ObjectMoveConflict {
   activationId: number;
+  selection: Selection;
   sessionId: string | null;
+  sessionIdentityKey: string | null;
+  sessionScopeKey: string;
+  selectionEpoch: number;
 }
 
 export function useViewport3DObjectMoveInteraction({
@@ -45,21 +83,53 @@ export function useViewport3DObjectMoveInteraction({
 }) {
   const kernel = useKernel();
   const moveTool = useObjectMoveTool(kernel.objectMoveTool);
+  const sessionIdentity = useSessionResourceIdentity();
+  const currentContextRef = useRef<CurrentMoveContext | null>(null);
+  const sessionIdentityKey = sessionIdentity
+    ? sessionResourceIdentityKey(sessionIdentity)
+    : null;
+  const sessionScopeKey = sessionRequestScopeKey(sessionIdentity);
   const activationIdentityRef = useRef<ActiveMoveIdentity | null>(null);
+  const selectionEpochRef = useRef(0);
+  const selectionSnapshotRef = useRef(kernel.selection.get());
+  const [selectionEpoch, setSelectionEpoch] = useState(0);
+  const selectedSnapshot = useSelectionSelector((selection) => selection);
   const [moveConflict, setMoveConflict] =
     useState<Viewport3DMoveConflict | null>(null);
+  const [moveStatus, setMoveStatus] = useState<{
+    error: string | null;
+    historyDegraded: boolean;
+    sessionIdentityKey: string | null;
+  }>({ error: null, historyDegraded: false, sessionIdentityKey: null });
+  const moveError = moveStatus.sessionIdentityKey === sessionIdentityKey
+    ? moveStatus.error
+    : null;
+  const moveHistoryDegraded = moveStatus.sessionIdentityKey === sessionIdentityKey &&
+    moveStatus.historyDegraded;
   const [moveDraftResetRevision, setMoveDraftResetRevision] = useState(0);
 
-  const expire = useCallback(() => {
-    activationIdentityRef.current = null;
-    setMoveConflict(null);
-    setMoveDraftResetRevision((revision) => revision + 1);
-    kernel.objectMoveTool.clear();
-  }, [kernel.objectMoveTool]);
+  useEffect(() => {
+    currentContextRef.current = {
+      moveTargetEligible,
+      selectedObjectId,
+      sessionId,
+      sessionIdentity,
+      sessionIdentityKey,
+      sessionScopeKey,
+    };
+  });
+
   const expireCanonicalActivation = useCallback(() => {
     activationIdentityRef.current = null;
     kernel.objectMoveTool.clear();
   }, [kernel.objectMoveTool]);
+
+  useEffect(() => kernel.selection.subscribe((selection) => {
+    if (selectionSnapshotEquals(selectionSnapshotRef.current, selection)) return;
+    selectionSnapshotRef.current = selection;
+    selectionEpochRef.current += 1;
+    setSelectionEpoch(selectionEpochRef.current);
+  }), [kernel.selection]);
 
   useEffect(() => {
     if (!moveTool) {
@@ -68,7 +138,8 @@ export function useViewport3DObjectMoveInteraction({
     }
     if (
       moveTool.objectId !== selectedObjectId ||
-      !moveTargetEligible
+      !moveTargetEligible ||
+      (sessionIdentity !== null && sessionId !== sessionIdentity.sessionId)
     ) {
       expireCanonicalActivation();
       return;
@@ -77,21 +148,36 @@ export function useViewport3DObjectMoveInteraction({
     if (!activeIdentity || activeIdentity.activationId !== moveTool.activationId) {
       activationIdentityRef.current = {
         activationId: moveTool.activationId,
-        sessionId,
+        sessionIdentityKey,
+        selection: kernel.selection.get(),
+        selectionEpoch: selectionEpochRef.current,
       };
       return;
     }
-    if (activeIdentity.sessionId === null && sessionId !== null) {
-      activeIdentity.sessionId = sessionId;
+    const selection = kernel.selection.get();
+    if (
+      activeIdentity.sessionIdentityKey === null &&
+      sessionIdentityKey !== null &&
+      activeIdentity.selectionEpoch === selectionEpochRef.current &&
+      selectionSnapshotEquals(activeIdentity.selection, selection)
+    ) {
+      activeIdentity.sessionIdentityKey = sessionIdentityKey;
       return;
     }
-    if (activeIdentity.sessionId !== sessionId) expireCanonicalActivation();
+    if (
+      activeIdentity.sessionIdentityKey !== sessionIdentityKey ||
+      activeIdentity.selectionEpoch !== selectionEpochRef.current ||
+      !selectionSnapshotEquals(activeIdentity.selection, selection)
+    ) expireCanonicalActivation();
   }, [
     expireCanonicalActivation,
+    kernel.selection,
     moveTargetEligible,
     moveTool,
     selectedObjectId,
     sessionId,
+    sessionIdentityKey,
+    sessionIdentity,
   ]);
 
   useEffect(
@@ -101,60 +187,193 @@ export function useViewport3DObjectMoveInteraction({
     [kernel.objectMoveTool],
   );
 
-  const targetIsCurrent = useCallback(
-    (objectId: string, activationId: number) =>
-      moveTool?.activationId === activationId &&
-      moveTool.objectId === objectId &&
-      selectedObjectId === objectId &&
-      moveTargetEligible &&
-      activationIdentityRef.current?.sessionId === sessionId,
-    [moveTargetEligible, moveTool, selectedObjectId, sessionId],
-  );
-  const activeMoveConflict =
-    moveConflict &&
-    moveTool?.activationId === moveConflict.activationId &&
-    moveTool.objectId === moveConflict.objectId &&
-    selectedObjectId === moveConflict.objectId &&
-    moveTargetEligible &&
-    moveConflict.sessionId === sessionId
-      ? moveConflict
-      : null;
+  const isCurrentSessionScope = useCallback((fence: MoveRequestFence) => {
+    const current = currentContextRef.current;
+    if (
+      !current ||
+      current.sessionScopeKey !== fence.sessionScopeKey ||
+      current.sessionIdentityKey !== fence.sessionIdentityKey
+    ) return false;
+    const registryScope = kernel.commands?.getSessionScopeKey?.();
+    return registryScope === undefined || registryScope === fence.sessionScopeKey;
+  }, [kernel.commands]);
 
+  const isMoveRequestCurrent = useCallback((fence: MoveRequestFence) => {
+    const current = currentContextRef.current;
+    const active = activationIdentityRef.current;
+    const selected = kernel.selection.get();
+    const activeTool = kernel.objectMoveTool.getSnapshot();
+    return Boolean(
+      current &&
+      current.moveTargetEligible &&
+      current.selectedObjectId === fence.objectId &&
+      current.sessionId === fence.sessionIdentity.sessionId &&
+      current.sessionIdentityKey === fence.sessionIdentityKey &&
+      current.sessionScopeKey === fence.sessionScopeKey &&
+      isCurrentSessionScope(fence) &&
+      activeTool?.activationId === fence.activationId &&
+      activeTool.objectId === fence.objectId &&
+      active?.activationId === fence.activationId &&
+      active.sessionIdentityKey === fence.sessionIdentityKey &&
+      active.selectionEpoch === fence.selectionEpoch &&
+      selectionEpochRef.current === fence.selectionEpoch &&
+      selectionSnapshotEquals(active.selection, selected) &&
+      selectionSnapshotEquals(fence.selection, selected) &&
+      selected.objectId === fence.objectId
+    );
+  }, [isCurrentSessionScope, kernel.objectMoveTool, kernel.selection]);
+
+  const commitMoveRef = useRef<MoveCommitHandler | null>(null);
   const commitMove = useCallback(async (
     objectId: string,
     translation: ObjectTranslation,
     baseRevision: number,
+    lock?: MoveCommitLockToken,
   ) => {
-    const activationId = moveTool?.activationId;
-    if (activationId === undefined || !targetIsCurrent(objectId, activationId)) {
-      expire();
+    const activeTool = kernel.objectMoveTool.getSnapshot();
+    const current = currentContextRef.current;
+    const activeIdentity = activationIdentityRef.current;
+    const selection = kernel.selection.get();
+    const activationId = activeTool?.activationId;
+    if (
+      activationId === undefined ||
+      !current?.sessionIdentity ||
+      !current.sessionIdentityKey ||
+      !current.sessionScopeKey ||
+      current.sessionId !== current.sessionIdentity.sessionId ||
+      current.selectedObjectId !== objectId ||
+      !current.moveTargetEligible ||
+      activeTool.objectId !== objectId ||
+      !activeIdentity ||
+      activeIdentity.activationId !== activationId ||
+      activeIdentity.sessionIdentityKey !== current.sessionIdentityKey ||
+      activeIdentity.selectionEpoch !== selectionEpochRef.current ||
+      !selectionSnapshotEquals(activeIdentity.selection, selection) ||
+      selection.objectId !== objectId
+    ) return false;
+
+    const fence: MoveRequestFence = {
+      activationId,
+      objectId,
+      selection,
+      selectionEpoch: selectionEpochRef.current,
+      sessionIdentity: current.sessionIdentity,
+      sessionIdentityKey: current.sessionIdentityKey,
+      sessionScopeKey: current.sessionScopeKey,
+    };
+    const handler = commitMoveRef.current;
+    const releaseCommit = lock?.lockHeldByGesture
+      ? null
+      : handler
+        ? tryAcquireMoveCommit(handler)
+        : null;
+    if (!lock?.lockHeldByGesture && !releaseCommit) return false;
+    if (lock?.lockHeldByGesture && (!handler || !isMoveCommitPending(handler))) {
       return false;
     }
-    return commitObjectMoveWorkflow({
-      api: kernel.api,
-      baseRevision,
-      objectId,
-      onAcknowledged: () => {
-        setMoveConflict(null);
-        setMoveDraftResetRevision((revision) => revision + 1);
-      },
-      onConflict: (conflict) => {
-        if (targetIsCurrent(objectId, activationId)) {
-          setMoveConflict({ ...conflict, activationId, sessionId });
-        }
-      },
-      resources: kernel.resources,
-      translation,
-    });
-  }, [expire, kernel.api, kernel.resources, moveTool?.activationId, sessionId, targetIsCurrent]);
+
+    setMoveStatus((previous) => ({
+      error: null,
+      historyDegraded:
+        previous.sessionIdentityKey === fence.sessionIdentityKey &&
+        previous.historyDegraded,
+      sessionIdentityKey: fence.sessionIdentityKey,
+    }));
+    try {
+      const historyContext = createCommandContext("ribbon", kernel, {
+        isCurrentSessionScope: () => isCurrentSessionScope(fence),
+        sessionScopeKey: fence.sessionScopeKey,
+      });
+      const committed = await commitObjectMoveWorkflow({
+        api: kernel.api,
+        baseRevision,
+        historyContext,
+        isCurrentRequest: () => isMoveRequestCurrent(fence),
+        isCurrentSessionScope: () => isCurrentSessionScope(fence),
+        objectId,
+        onAcknowledged: () => {
+          if (!isMoveRequestCurrent(fence)) return;
+          setMoveConflict(null);
+          setMoveStatus((previous) => ({
+            error: null,
+            historyDegraded:
+              previous.sessionIdentityKey === fence.sessionIdentityKey &&
+              previous.historyDegraded,
+            sessionIdentityKey: fence.sessionIdentityKey,
+          }));
+          setMoveDraftResetRevision((revision) => revision + 1);
+        },
+        onConflict: (conflict) => {
+          if (!isMoveRequestCurrent(fence)) return;
+          setMoveStatus((previous) => ({
+            error: null,
+            historyDegraded:
+              previous.sessionIdentityKey === fence.sessionIdentityKey &&
+              previous.historyDegraded,
+            sessionIdentityKey: fence.sessionIdentityKey,
+          }));
+          setMoveConflict({
+            ...conflict,
+            activationId,
+            selection: fence.selection,
+            selectionEpoch: fence.selectionEpoch,
+            sessionId: fence.sessionIdentity.sessionId,
+            sessionIdentityKey: fence.sessionIdentityKey,
+            sessionScopeKey: fence.sessionScopeKey,
+          });
+        },
+        onHistoryDegraded: () => {
+          if (isMoveRequestCurrent(fence)) {
+            setMoveStatus((previous) => ({
+              error: previous.sessionIdentityKey === fence.sessionIdentityKey
+                ? previous.error
+                : null,
+              historyDegraded: true,
+              sessionIdentityKey: fence.sessionIdentityKey,
+            }));
+          }
+        },
+        resources: kernel.resources,
+        sessionScopeKey: fence.sessionScopeKey,
+        translation,
+      });
+      return committed && isMoveRequestCurrent(fence);
+    } catch (error) {
+      if (isMoveRequestCurrent(fence)) {
+        setMoveStatus((previous) => ({
+          error: error instanceof Error ? error.message : String(error),
+          historyDegraded:
+            previous.sessionIdentityKey === fence.sessionIdentityKey &&
+            previous.historyDegraded,
+          sessionIdentityKey: fence.sessionIdentityKey,
+        }));
+      }
+      return false;
+    } finally {
+      releaseCommit?.();
+    }
+  }, [isCurrentSessionScope, isMoveRequestCurrent, kernel]);
+  useEffect(() => {
+    commitMoveRef.current = commitMove;
+  }, [commitMove]);
+
+  const activeMoveConflict = moveConflict &&
+    moveTool?.activationId === moveConflict.activationId &&
+    moveTool.objectId === moveConflict.objectId &&
+    selectedObjectId === moveConflict.objectId &&
+    moveTargetEligible &&
+    sessionId === moveConflict.sessionId &&
+    sessionIdentityKey === moveConflict.sessionIdentityKey &&
+    sessionScopeKey === moveConflict.sessionScopeKey &&
+    selectionEpoch === moveConflict.selectionEpoch &&
+    selectionSnapshotEquals(selectedSnapshot, moveConflict.selection)
+    ? moveConflict
+    : null;
 
   const refetchMoveScene = useCallback(() => {
-    if (!activeMoveConflict) {
-      expire();
-      return;
-    }
+    if (!activeMoveConflict) return;
     sceneRefetch();
-  }, [activeMoveConflict, expire, sceneRefetch]);
+  }, [activeMoveConflict, sceneRefetch]);
 
   const rebaseMove = useCallback(() => {
     if (
@@ -166,7 +385,11 @@ export function useViewport3DObjectMoveInteraction({
     setMoveConflict({
       ...rebaseObjectMoveConflict(activeMoveConflict, sceneRevision),
       activationId: activeMoveConflict.activationId,
+      selection: activeMoveConflict.selection,
       sessionId: activeMoveConflict.sessionId,
+      sessionIdentityKey: activeMoveConflict.sessionIdentityKey,
+      sessionScopeKey: activeMoveConflict.sessionScopeKey,
+      selectionEpoch: activeMoveConflict.selectionEpoch,
     });
   }, [activeMoveConflict, sceneRevision, sceneStatus]);
 
@@ -175,13 +398,12 @@ export function useViewport3DObjectMoveInteraction({
       !activeMoveConflict ||
       activeMoveConflict.phase !== "rebased"
     ) {
-      if (moveConflict) expire();
       return;
     }
     const retry = { ...activeMoveConflict, phase: "retrying" as const };
     setMoveConflict(retry);
     await commitMove(retry.objectId, retry.translation, retry.baseRevision);
-  }, [activeMoveConflict, commitMove, expire, moveConflict]);
+  }, [activeMoveConflict, commitMove]);
 
   const canRebase = Boolean(
     activeMoveConflict?.phase === "conflict" &&
@@ -195,6 +417,8 @@ export function useViewport3DObjectMoveInteraction({
     commitMove,
     moveConflict: activeMoveConflict,
     moveDraftResetRevision,
+    moveError,
+    moveHistoryDegraded,
     moveToolObjectId: moveTool?.objectId ?? null,
     rebaseMove,
     refetchMoveScene,
@@ -208,45 +432,57 @@ export function Viewport3DMoveConflictPanel({
 }: {
   interaction: ReturnType<typeof useViewport3DObjectMoveInteraction>;
 }) {
-  const { moveConflict } = interaction;
-  if (!moveConflict) return null;
+  const { moveConflict, moveError, moveHistoryDegraded } = interaction;
+  if (!moveConflict && !moveError && !moveHistoryDegraded) return null;
   return (
     <aside
       className="fm-viewport-3d__move-conflict"
-      data-move-conflict={moveConflict.phase}
+      aria-live="polite"
+      data-move-conflict={moveConflict?.phase ?? "none"}
+      data-move-history={moveHistoryDegraded ? "degraded" : "ready"}
     >
-      <span>Scene changed. The move draft is preserved.</span>
-      <Button
-        disabled={
-          moveConflict.phase !== "conflict" ||
-          interaction.sceneStatus === "loading" ||
-          interaction.sceneStatus === "stale"
-        }
-        size="sm"
-        type="button"
-        variant="ghost"
-        onClick={interaction.refetchMoveScene}
-      >
-        Refetch Scene
-      </Button>
-      <Button
-        disabled={!interaction.canRebase}
-        size="sm"
-        type="button"
-        variant="ghost"
-        onClick={interaction.rebaseMove}
-      >
-        Rebase Draft
-      </Button>
-      <Button
-        disabled={moveConflict.phase !== "rebased"}
-        size="sm"
-        type="button"
-        variant="primary"
-        onClick={() => void interaction.retryMove()}
-      >
-        Retry Move
-      </Button>
+      {moveConflict ? (
+        <>
+          <span>Scene changed. The move draft is preserved.</span>
+          <Button
+            disabled={
+              moveConflict.phase !== "conflict" ||
+              interaction.sceneStatus === "loading" ||
+              interaction.sceneStatus === "stale"
+            }
+            size="sm"
+            type="button"
+            variant="ghost"
+            onClick={interaction.refetchMoveScene}
+          >
+            Refetch Scene
+          </Button>
+          <Button
+            disabled={!interaction.canRebase}
+            size="sm"
+            type="button"
+            variant="ghost"
+            onClick={interaction.rebaseMove}
+          >
+            Rebase Draft
+          </Button>
+          <Button
+            disabled={moveConflict.phase !== "rebased"}
+            size="sm"
+            type="button"
+            variant="primary"
+            onClick={() => void interaction.retryMove()}
+          >
+            Retry Move
+          </Button>
+        </>
+      ) : null}
+      {moveError ? <span role="alert">Move failed: {moveError}</span> : null}
+      {moveHistoryDegraded ? (
+        <span role="alert">
+          The move was saved, but Undo/Redo history could not capture it. History is degraded for this change.
+        </span>
+      ) : null}
     </aside>
   );
 }

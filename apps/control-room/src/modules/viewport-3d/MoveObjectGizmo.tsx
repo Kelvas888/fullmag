@@ -14,6 +14,31 @@ export { PROBLEM_IR_03_RIGID_TRANSFORM_REASON } from "@/kernel/authoring/objectT
 export type MoveAxis = "x" | "y" | "z";
 export type Translation3 = [number, number, number];
 
+export interface MoveCommitLockToken {
+  lockHeldByGesture: true;
+}
+
+export type MoveCommitHandler = (
+  objectId: string,
+  translation: Translation3,
+  baseRevision: number,
+  lock?: MoveCommitLockToken,
+) => Promise<boolean | void> | boolean | void;
+
+const pendingMoveCommits = new WeakSet<MoveCommitHandler>();
+
+export function isMoveCommitPending(handler: MoveCommitHandler): boolean {
+  return pendingMoveCommits.has(handler);
+}
+
+export function tryAcquireMoveCommit(
+  handler: MoveCommitHandler,
+): (() => void) | null {
+  if (pendingMoveCommits.has(handler)) return null;
+  pendingMoveCommits.add(handler);
+  return () => pendingMoveCommits.delete(handler);
+}
+
 const FALLBACK_MOVE_GIZMO_COLORS: Viewport3DColors = {
   accent: 0x89b4fa,
   background: 0x11111b,
@@ -33,11 +58,7 @@ export interface MoveDraft {
 interface MoveGestureControllerOptions {
   baseRevision: number;
   objectId: string;
-  onCommit: (
-    objectId: string,
-    translation: Translation3,
-    baseRevision: number,
-  ) => Promise<boolean | void> | boolean | void;
+  onCommit: MoveCommitHandler;
   onDraftChange: (draft: MoveDraft | null) => void;
   onGestureActiveChange?: (active: boolean) => void;
   origin: Translation3;
@@ -72,6 +93,7 @@ export function createMoveGestureController({
       setPointerCapture: (pointerId: number) => void,
       releasePointerCapture: (pointerId: number) => void,
     ): void {
+      if (isMoveCommitPending(onCommit)) return;
       if (active) cancelActive(false);
       active = { axis, pointerId, releasePointerCapture, start: [...point] };
       translation = [...origin];
@@ -87,8 +109,20 @@ export function createMoveGestureController({
     async end(pointerId: number): Promise<void> {
       if (!active || active.pointerId !== pointerId) return;
       releaseActiveCapture();
-      const committed = await onCommit(objectId, [...translation], baseRevision);
-      if (committed !== false) onDraftChange(null);
+      if (translation.every((coordinate, index) => coordinate === origin[index])) {
+        onDraftChange(null);
+        return;
+      }
+      const releaseCommit = tryAcquireMoveCommit(onCommit);
+      if (!releaseCommit) return;
+      try {
+        const committed = await onCommit(objectId, [...translation], baseRevision, {
+          lockHeldByGesture: true,
+        });
+        if (committed !== false) onDraftChange(null);
+      } finally {
+        releaseCommit();
+      }
     },
     move(pointerId: number, point: Translation3): void {
       if (!active || active.pointerId !== pointerId) return;
@@ -232,7 +266,7 @@ export function moveAxisPointerHandlers(
     onPointerMove: (event: ThreeEvent<PointerEvent>) =>
       moveAxisDrag(controller, event),
     onPointerUp: (event: ThreeEvent<PointerEvent>) =>
-      void endAxisDrag(controller, event),
+      void endAxisDrag(controller, event).catch(() => undefined),
   };
 }
 

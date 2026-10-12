@@ -29,6 +29,7 @@ import { RIBBON_COMMANDS } from "@/modules/ribbon/ribbonCommands";
 import { Viewport3DObjectMoveResourceSurface } from "@/modules/viewport-3d/Viewport3DObjectMoveInteraction";
 
 import { ObjectMoveToolController } from "./ObjectMoveToolController";
+import { commitObjectMoveWorkflow } from "./objectMoveConflictWorkflow";
 
 // The scene hook reads the session-scoped key once identity is confirmed.
 const SESSION_A_SCENE_KEY = sessionScopedResourceKey(
@@ -110,6 +111,9 @@ describe("mounted viewport object move integration", () => {
         object_id: "magnet-a",
         transform: { translation: [5e-9, 0, 0] },
       });
+      expect(commitTransaction.mock.calls[0]?.[1]).toEqual({
+        sessionScopeKey: "session=session-a&epoch=session-a%401&request_scope_epoch=test-api%3Asession-a",
+      });
       expect(conflictPanel(mounted.container)).not.toBeNull();
       expect(fixture.invalidate).not.toHaveBeenCalled();
       expect(surface(mounted.container).getAttribute("data-scene-status")).toBe("ready");
@@ -155,6 +159,54 @@ describe("mounted viewport object move integration", () => {
       expect(surface(mounted.container).getAttribute("data-draft-reset-revision")).toBe("1");
       expect(surface(mounted.container).getAttribute("data-orbit-blocked")).toBe("false");
     } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("blocks a second gesture and ignores a late ACK after selection A to B to A", async () => {
+    const pendingAck = deferred<{ scene_revision: number }>();
+    const commitTransaction = vi.fn(() => pendingAck.promise);
+    const fixture = createFixture({ commitTransaction });
+    selectObject(fixture.selection, "magnet-a");
+    const mounted = await hydrateFixture(fixture);
+    try {
+      await activateMove(fixture, SCENE_A_41);
+      const firstAxis = moveAxis(mounted.container, "x", "magnet-a");
+      installPointerCapture(firstAxis);
+      await act(async () => {
+        firstAxis.dispatchEvent(pointerEvent("pointerdown", 13, [0, 0, 0]));
+        firstAxis.dispatchEvent(pointerEvent("pointermove", 13, [4e-9, 0, 0]));
+        firstAxis.dispatchEvent(pointerEvent("pointerup", 13, [4e-9, 0, 0]));
+        await Promise.resolve();
+      });
+      expect(commitTransaction).toHaveBeenCalledOnce();
+
+      await act(async () => selectObject(fixture.selection, "magnet-b"));
+      await act(async () => selectObject(fixture.selection, "magnet-a"));
+      await activateMove(fixture, SCENE_A_41);
+      const secondAxis = moveAxis(mounted.container, "x", "magnet-a");
+      const secondCapture = vi.fn();
+      Object.assign(secondAxis, {
+        releasePointerCapture: vi.fn(),
+        setPointerCapture: secondCapture,
+      });
+      await act(async () => {
+        secondAxis.dispatchEvent(pointerEvent("pointerdown", 14, [0, 0, 0]));
+      });
+
+      expect(secondCapture).not.toHaveBeenCalled();
+      expect(commitTransaction).toHaveBeenCalledOnce();
+      expect(surface(mounted.container).getAttribute("data-draft-reset-revision")).toBe("0");
+
+      pendingAck.resolve({ scene_revision: 42 });
+      await flushResource();
+
+      expect(fixture.objectMoveTool.getSnapshot()?.objectId).toBe("magnet-a");
+      expect(surface(mounted.container).getAttribute("data-draft-reset-revision")).toBe("0");
+      expect(conflictPanel(mounted.container)).toBeNull();
+      expect(commitTransaction).toHaveBeenCalledOnce();
+    } finally {
+      pendingAck.resolve({ scene_revision: 42 });
       await mounted.cleanup();
     }
   });
@@ -238,6 +290,62 @@ describe("mounted viewport object move integration", () => {
     } finally {
       await mounted.cleanup();
     }
+  });
+});
+
+describe("object move conflict workflow", () => {
+  it("commits even when the before-scene history capture is unavailable and reports degraded history", async () => {
+    const commitTransaction = vi.fn().mockResolvedValue({ scene_revision: 8 });
+    const history = {
+      getGeneration: () => 0,
+      getSnapshot: () => ({ canRedo: false, canUndo: false, redoLabel: null, undoLabel: null, pending: false }),
+      record: vi.fn(),
+    };
+    const api = {
+      model: {
+        commitTransaction,
+        scene: vi.fn().mockRejectedValue(new Error("scene unavailable")),
+      },
+    };
+    const onAcknowledged = vi.fn();
+    const onConflict = vi.fn();
+    const onHistoryDegraded = vi.fn();
+
+    const committed = await commitObjectMoveWorkflow({
+      api: api as never,
+      baseRevision: 7,
+      historyContext: {
+        api: api as never,
+        authoringHistory: history as never,
+        isCurrentSessionScope: () => true,
+        resourceData: {},
+        selection: undefined,
+        sessionScopeKey: "session=session-a&epoch=session-a%401&request_scope_epoch=api%3A1",
+      },
+      isCurrentSessionScope: () => true,
+      objectId: "magnet-a",
+      onAcknowledged,
+      onConflict,
+      onHistoryDegraded,
+      resources: { invalidate: vi.fn() } as never,
+      sessionScopeKey: "session=session-a&epoch=session-a%401&request_scope_epoch=api%3A1",
+      translation: [2e-9, 0, 0],
+    });
+
+    expect(committed).toBe(true);
+    expect(commitTransaction).toHaveBeenCalledWith(
+      {
+        base_revision: 7,
+        kind: "commit_object_transform",
+        object_id: "magnet-a",
+        transform: { translation: [2e-9, 0, 0] },
+      },
+      { sessionScopeKey: "session=session-a&epoch=session-a%401&request_scope_epoch=api%3A1" },
+    );
+    expect(onAcknowledged).toHaveBeenCalledOnce();
+    expect(onConflict).not.toHaveBeenCalled();
+    expect(onHistoryDegraded).toHaveBeenCalledOnce();
+    expect(history.record).not.toHaveBeenCalled();
   });
 });
 
