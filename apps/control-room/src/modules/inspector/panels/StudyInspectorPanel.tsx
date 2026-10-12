@@ -1548,7 +1548,7 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
             dispatch({ type: "setSelectedCommandId", commandId })
           }
           runCommand={runCommand}
-          stageExecution={scopedStageExecution}
+          stageExecution={stageExecution}
           stepValue={
             solverStatus.data?.step_index ?? currentRun.data?.total_steps ?? "n/a"
           }
