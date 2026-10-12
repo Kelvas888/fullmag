@@ -259,3 +259,90 @@ SHA native writera podano w poprzedniej mapie; źródło nie zmieniło się.
 API odczytano, ale endpointów tutaj nie wywołano, OpenAPI nie regenerowano,
 browser/native/unit build nie wykonano. Mapowanie nie jest dowodem zgodności
 archiwum konkretnego run ani ukończenia API/UI anteny.
+
+## Uzupełnienie: publiczna trasa harmoniczna i brak integracji anteny
+
+Odczyt 12.10.2026 z worktree integratora
+`D:/git/fullmag/worktrees/antenna-transport-e2e-20261011`, HEAD
+`93682dbbf7acbc4c028f5692ec4a164883b8a3fd`. Checkout zawiera WIP;
+poniższe SHA-256 opisują odczytane pliki, nie sam commit.
+To audyt źródeł i propozycja integracji, nie nowa nota fizyczna ani
+kwalifikacja runtime. Zakres uzgodniony z integratorem: bez zmian w jego
+checkoutcie, comparatora, zmian znaków/gamma oraz kolejki/builda.
+
+| Granica | Ścieżka + symbol | Potwierdzony stan |
+|---|---|---|
+| Publiczny Python | `packages/fullmag-py/src/fullmag/model/study.py` + `FrequencyResponse.to_ir` | `excitation` zawiera jednorodny `field_au_per_m` i `phase_rad`, bez referencji do przestrzennej bazy anteny |
+| IR | `crates/fullmag-ir/src/frequency_response_contract.rs` + `FrequencyExcitationIR` | ten sam wektor i faza; brak harmonicznego źródła antenowego |
+| Plan | `crates/fullmag-ir/src/plan.rs` + `FemFrequencyResponsePlanIR` | brak carrier'a rozwiązanej bazy anteny; istniejącego `ResolvedSolvedAntennaDriveBasisIR` nie należy zastępować fikcyjnym planem czasowym |
+| Aktywacja CLI | `crates/fullmag-cli/src/orchestrator.rs` + `prepare_solved_antenna_drive_activation`, `attach_solved_antenna_drive_bases` | aktywna baza odrzucana dla `FemFrequencyResponse`; materializacja obejmuje plany czasowe FEM/FDM |
+| Wymuszenie runnera | `crates/fullmag-runner/src/frequency_response.rs` + `build_native_production_payload` | projekcja jednorodnego wektora na lokalne tangent frames, z fazą; nie ładowanie przestrzennego pola anteny |
+| ABI | `crates/fullmag-runner/src/native_fem/frequency_domain.rs` + `solve_native_driven_frequency_response_impl` | request ustawia `DRIVE_UNSPECIFIED`, `require_nonzero_rhs=0`; ta obserwacja nie dowodzi poprawności lub błędu fizycznego RHS |
+| Natywny writer | `backends/fem/src/frequency_domain/driven_response_solver.cpp` + `write_owned_response_manifest`, `write_mfem_validation_artifacts` | ownership session/run/stage/runtime; point wskazuje payload ścieżką, deklaruje layout i `excitation_provenance.kind=field`. Nazwa funkcji zawierająca validation nie oznacza wyłącznie reference lane |
+
+Wykonano izolowany probe publicznego autora: `fm.FrequencyResponse` z jednym
+punktem 1 GHz, wektorem `(1,2,3)` i fazą `0.375`, z `fm.SaveResponse('m_complex')`.
+Assert sprawdził dokładnie dwie właściwości serializowanego `excitation`:
+`field_au_per_m=[1.0,2.0,3.0]` i `phase_rad=0.375`.
+Wynik `PASS_AUTHORING_ONLY`, exit code 0; `solver_executed=false`.
+Nie jest to dowód kompletnego authoring→plan→runtime ani odpowiedzi anteny.
+
+### Kolejność minimalnej kompletnej integracji
+
+1. **Jawne źródło harmoniczne Python→IR→plan→UI.** Zachować istniejące
+   wymuszenie jednorodne; dodać jawny wybór rozwiązanej anteny i projekcji.
+   Kryterium: publiczny autor oraz eksport UI odtwarzają identyczne źródło,
+   a nie tylko opis tekstowy. Dokładne nazwy nowych parametrów wymagają
+   projektu kontraktu — nie są istniejącym API.
+2. **Walidacja semantyki częstotliwości i aktywacji.** `all_time_evolution`
+   nie aktywuje automatycznie FMR. Rozstrzygnąć relację częstotliwości
+   sinusoidy do punktów sweepu; nie nadpisywać jej milcząco ani nie traktować
+   DC, pulse/sinc/samples jako równoważnego phasora. Kryterium: jawne zasady
+   i odmowy dla niezgodnych kombinacji, zachowanie requested intent.
+3. **Materializacja przestrzennego źródła.** Reużyć walidowany
+   `crates/fullmag-ir/src/antenna_field_solution.rs` +
+   `load_solved_antenna_drive_basis_projected`; zapewnić zgodny target,
+   maskę, mapping i topology identity. Obecne
+   `materialize_fem_solved_antenna_drives_v03` przyjmuje plan czasowy,
+   więc nie podłączać go przez sztuczny `FemPlanIR`. Kryterium: prawdziwa
+   baza z artefaktu, jawny prąd peak i faza oraz poprawna kolejność compact
+   magnetic nodes; odrzucenie niezgodnego/starego assetu.
+4. **Kontrakt operatora/RHS.** Podłączyć przestrzenne wymuszenie zgodnie
+   z jednostkami i konwencją istniejącego operatora. Pole tangent nie jest
+   automatycznie dowodem poprawnego torque RHS. Kryterium: niezależny
+   oracle i rzeczywiste native wykonanie; żadnego dobierania znaków/gamma
+   do oczekiwanej krzywej. Dotychczasowy oracle nie kwalifikuje tego kroku.
+5. **Input→manifest→point→payload.** Ustanowić kanoniczną tożsamość
+   rzeczywistych real/imag drive bytes wraz ze źródłem, port mode,
+   projekcją, targetem, indeksami/frame, częstotliwością, fazą i normalizacją.
+   Powiązać ją z digestem faktycznych bytes odpowiedzi i publikacją spójnego
+   zestawu. Kryterium: walidator wykrywa podmianę wejścia, punktu lub payloadu;
+   session/run/stage ownership ani ścieżka pliku nie zastępują tego dowodu.
+6. **Publiczne wykonanie i frontend.** Dodać wybór źródła w istniejącym
+   authoring/Inspector, capability i round-trip; dopiero prawdziwy artefakt
+   sprawdzić przez istniejące v2 meta/binary i widoki complex/real/imag.
+   Kryterium: udokumentowane żądania i runtime/browser receipts, w tym
+   faza/komponenty oraz invalidation. Fixture-only ani parser PASS nie zamykają T17.
+
+Usunięcie wyłącznie odmowy CLI, dodanie pola provenance po wykonaniu lub
+podstawienie artefaktu reference nie realizuje tej ścieżki. Propozycja nie
+redukuje T17 do jednego punktu: pojedynczy zgodny punkt może być pierwszym
+testem integracyjnym, lecz nie zastępuje kwalifikacji sweepu i całego planu.
+
+### Zamrożone źródła tego uzupełnienia
+
+| Ścieżka z tabeli powyżej | SHA-256 |
+|---|---|
+| `packages/fullmag-py/src/fullmag/model/study.py` | `d52d2d2ffe33d2e7eda7f527afbe9765632bc780fb2c8d1830a7626a9e61fea9` |
+| `crates/fullmag-ir/src/frequency_response_contract.rs` | `d5f119b1b63eaa78a985e107c1c97fc11d7cf5779475283635246171811bb232` |
+| `crates/fullmag-ir/src/plan.rs` | `1137094e9facb154396de5fdd6e35767159b0e8add657bdb8907a659953ade6d` |
+| `crates/fullmag-cli/src/orchestrator.rs` | `2af1b66f082fe61f4169f7e4364453a6fc14eda2e98a9a475c0c9b0a8a8cfa7d` |
+| `crates/fullmag-runner/src/frequency_response.rs` | `7757d437e4f226563634191ab38661892419959e149e45549c737df9e4317364` |
+| `crates/fullmag-runner/src/native_fem/frequency_domain.rs` | `a641452851b13f0929658907fa3eae220488096f16d5847bf4bcb09be6fd8717` |
+| `backends/fem/src/frequency_domain/driven_response_solver.cpp` | `f1f58c88efff81b1d89d3d21e0eae310ae28adfeafe23232cb231b98c4da8c84` |
+
+Historyczna sekcja cache powyżej opisuje stan przed poprawką. Aktualny
+checkpoint integracji cache znajduje się w
+`2026-10-12-fmr-cache-integration-checkpoint.md`: patch zastosowany przez
+integratora i zweryfikowany hashami; regresja HTTP jeszcze bez wykonania.
+Nie utożsamiać tego z zamknięciem naukowego input/output association.
