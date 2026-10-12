@@ -1,0 +1,113 @@
+# E9c — granice publicznego Run i analizy odpowiedzi spinowej
+
+Data: 12.10.2026. Status: **audyt źródłowy częściowy; runtime NOT VERIFIED**.
+Źródła: worktree integratora `antenna-transport-e2e-20261011`, HEAD
+`93682dbbf7acbc4c028f5692ec4a164883b8a3fd` z WIP. Nie zmieniono jego
+plików, nie uruchomiono buildu, solvera, HTTP ani przeglądarki.
+Ten dokument nie zastępuje canonical physics note ani pełnej kwalifikacji E9c.
+
+## Rzeczywista trasa i potwierdzone granice
+
+| Warstwa | Źródło + symbol | Odczytany kontrakt |
+|---|---|---|
+| Python | `packages/fullmag-py/src/fullmag/world.py` + `StudyStagesBuilder.fft_response` | konfiguruje wyłącznie Γ przez `GammaResponseAnalysis.to_runtime_metadata`; nie jest autorem finite-k |
+| Alternatywny autor | `apps/control-room/src/modules/start/model/templateScripts.ts` + `spin-wave-dispersion` w katalogu szablonów | używa publicznego `study.runtime_metadata` z `analysis=finite_k`, probe count, zakresem x i absorberami; brak typed finite-k builder nie oznacza braku możliwości zapisania requestu |
+| UI FFT | `apps/control-room/src/modules/inspector/panels/StudyStageAuthoringModel.ts` + gałęzie `fft_response` | edytowalny request jest Γ; nieobsługiwany raw request zachowywany przez read-only/rawRequest, nie wolno go milcząco zamienić na Γ |
+| Zapis pola | `crates/fullmag-plan/src/validate.rs` + `validate_executable_outputs`; `crates/fullmag-plan/src/fem.rs` + wywołanie tej funkcji | `H_drive` dopuszczone przy `!problem.field_drives.is_empty()`; solved antenna drive nie jest uwzględniony w tym booleanie |
+| Native źródło | `crates/fullmag-runner/src/native_fem.rs` + `pack_native_regional_field_drives` | baza anteny mnożona przez peak current i pakowana wraz z regional drives; to obecność implementacji, nie dowód zapisania snapshotu |
+| Postprocessing | `crates/fullmag-runner/src/spin_wave_sampling.rs` + `requested_finite_k_artifacts` | tylko `BackendPlanIR::Fem`, aktywny regional lub solved antenna drive; tet4, co najmniej cztery saved snapshots, full nodal float64 `m` i `H_drive` z tym samym czasem |
+| Sampling | ten sam plik + `build_p1_x_cross_section_operator`, `read_native_fem_zarr_component` | średnia przekroju P1 wzdłuż x, dodatnia masa magnetyczna; SoA chunk, planowana liczba węzłów, samples.csv o 8 kolumnach |
+| Γ odmowa | `crates/fullmag-runner/src/spin_wave_response.rs` + `append_requested_spin_wave_artifacts` | root WIP odrzuca Γ dla aktywnej solved antenna; nie utożsamiać tego z brakiem finite-k ani z wynikami anteny |
+| FFT | `crates/fullmag-runner/src/spin_wave_sampling.rs` + `dynamic_structure_factor_1d_with_axes` | osobne transformacje odpowiedzi i źródła; odjęcie pierwszego snapshotu, Hann w czasie i przestrzeni, jawna konwencja fazy i normalizacja |
+| HTTP | `crates/fullmag-api/src/router_v2/handlers/analysis/spin_wave_response.rs` + `get_dynamic_structure_factor` | istniejący `/v2/sessions/current/analysis/spin-wave/dynamic-structure-factor.v1`, bound do 4096 komórek; pozostaje artifact_ref |
+| Klient/UI | `apps/control-room/src/kernel/api/ControlRoomApi.ts` + `analysis.spinWave.dynamicStructureFactor`; `AnalysisPlotsView` + `DynamicStructureFactorView` | istnieje klient i widok `dynamics.s-k-f`; nie trzeba tworzyć nowego endpointu ani modala dla podstawowego wyniku |
+
+## Problemy wymagające rozwiązania przed realnym E9c
+
+1. **Antenna-only H_drive output.** Publiczny planner odrzuca wymagany
+   snapshot bez regional field drive. Naprawić canonical availability i
+   walidację zgodnie z rzeczywistym źródłem. Fikcyjny regional drive nie jest
+   poprawnym obejściem. Weryfikacja: authored antenna-only Run z `m` oraz
+   `H_drive` przechodzi planowanie, a nieaktywne/niezgodne źródło ma jawną odmowę.
+2. **Szablon dyspersji nie odpowiada możliwości analizatora.** Wybiera
+   `study.engine("fdm")`, zapisuje `m`, ustawia finite-k metadata i nie zapisuje
+   `H_drive`. Analizator wymaga FEM i obu snapshotów. Nie znaleziono dopięcia
+   monitorów przez samo finite-k metadata w odczytanych planner/runner sources.
+   Dalszy przegląd monitor pipeline jest wymagany przed pełnym wnioskiem.
+   Docelowo zgodny publiczny workflow albo jawna capability odmowa przed Run;
+   nie cichy backend fallback ani tylko zmiana etykiety szablonu.
+3. **Konfiguracja nie jest wykonywalnym dowodem.** Sprawdzić właściwy
+   stage-local/absolute czas, wspólną regularną cadence, float64, topology i
+   zakres magnetyczny w rzeczywistym zapisie. Postprocessing jest wykonywany
+   po finish pipeline, więc brak snapshotów może ujawnić się dopiero po Run.
+4. **Źródło i odpowiedź to odrębne obserwable.** Reader używa tego samego
+   `response_component` dla `m` i `H_drive`. To ograniczenie projekcji, nie
+   automatycznie pełna podatność wektorowa. Potrzebny naukowy kontrakt źródła
+   i test przypadku z różnymi osiami wzbudzenia/odpowiedzi; nie dopisywać
+   interpretacji susceptibility na podstawie samej macierzy power.
+5. **Absorbery i okna.** `excluded_absorber_ranges_m` jest kopiowane do
+   artefaktu po FFT; samo pole nie wycina próbek. Wyłączenie wymaga poprawnego
+   `analysis_x_min_m/max_m`. Obecny FFT używa Hann na sztywno; metadata
+   `window_space/window_time` nie dowodzi wyboru innego okna. UI musi pokazywać
+   rzeczywiste resolved sampling, nie tylko requested metadata.
+6. **Cold archive/API/UI i niezależna analiza.** Potwierdzić trwały artefakt
+   z prawdziwego Run, źródło snapshotów i tożsamość run/stage/meshu, wykonać
+   niezależną FFT tych samych danych, następnie cold HTTP i browser. Obecność
+   klienta, zapisane fixture oraz testy źródeł nie zamykają tych bramek.
+
+FDM CPU/GPU: obecny analizator finite-k jawnie nie obsługuje tych planów.
+FEM CPU/GPU: ścieżka źródłowa jest FEM, ale nie wykonano kwalifikacji żadnego
+device; nie wywodzić parytetu z jednego wspólnego postprocessora. Mixed-cell
+FEM nie spełnia obecnego wymagania tet4 tego readera.
+
+## Piny odczytanych plików WIP (SHA-256)
+
+| Ścieżka | SHA-256 |
+|---|---|
+| `crates/fullmag-plan/src/fem.rs` | `4e4c25a7d1069049a39d4113efaf33e57914cef9b7dd820fc87d67227674ac0f` |
+| `crates/fullmag-plan/src/validate.rs` | `2a207b340950607801355243cd7708eed183fff43eac565ce14a3190990e4ad0` |
+| `crates/fullmag-runner/src/spin_wave_sampling.rs` | `aee4e4a7e2d89bc17472e2a97a39b025e1d532c38293923313af67ccd0f3d4a5` |
+| `crates/fullmag-runner/src/spin_wave_response.rs` | `cb529673dfc5407c2317a7d7d25f954da69d876adeb9a3d29fb549259e5b04b4` |
+| `apps/control-room/src/modules/start/model/templateScripts.ts` | `5dec7345a4106a8a1a19af3168614b45fc885da3ad28c64dd2109ea769fd20c2` |
+| `apps/control-room/src/modules/inspector/panels/StudyStageAuthoringModel.ts` | `68da44d05c2ddf883ab06b4791ec0bd0a14c654e96654003d02763792ba241dc` |
+| `packages/fullmag-py/src/fullmag/world.py` | `bcda4ff26eaba77a7db8d31852417bca87878c1c0dc78ce80be0c4d26d36407a` |
+
+Integrator otrzymał problemy 1–2. Uzupełnienie pełnego monitor wiring,
+eksportu, resource hooks i naukowej association pozostaje otwarte.
+
+## Uzupełnienie: wykonywalna reprodukcja granicy eksportu
+
+Wykonano bez solvera rzeczywistą funkcję
+`packages/fullmag-py/src/fullmag/runtime/script_builder.py` + `_render_stages`.
+Wejściem był minimalny obiekt etapu z `action.kind=fft_response`,
+`enabled=true`, `stage_id=response` i requestem
+`analysis=finite_k`, `response_component=my`, `probe_count=32`,
+zakresem x od 0 do 1 µm oraz schematem `spin_wave_response.request.v1`.
+Wywołanie `surface=study`, `overrides={}` zwróciło:
+
+```python
+# Stages
+study.stages.fft_response("my", stage_id="response")
+```
+
+Assert potwierdził obecność wywołania i brak `finite_k`/`probe_count`.
+Exit code 0, status `REPRODUCED_EXPORT_BOUNDARY`, `solver_executed=false`.
+Renderer w gałęzi `fft_response` nie sprawdza `request.analysis` i nie zachowuje
+parametrów finite-k; publiczny `StudyStagesBuilder.fft_response` konfiguruje Γ.
+To potwierdzony problem **tej granicy renderera**, nie dowód wykonania całej
+ścieżki UI export ani tego, że każde wejście UI dochodzi do tej gałęzi.
+Potrzebna jest walidacja end-to-end z rzeczywistym authored pipeline.
+
+Najmniejsza bezpieczna naprawa musi jawnie zachować request w kanonicznym
+publicznym eksporcie lub odrzucić nieobsługiwany rodzaj z diagnozą; nie może
+generować innej analizy bez ostrzeżenia. Docelowy typed finite-k authoring
+nadal pozostaje wymaganiem pełnego workflow, nie należy zastąpić go samą odmową.
+
+Dodatkowy odczyt monitorów: `crates/fullmag-runner/src/schedules.rs` +
+`collect_field_schedules` tworzy zegary wyłącznie z przekazanych `OutputIR`
+i waliduje quantity przez canonical catalog. Nie tworzy `H_drive` na podstawie
+requestu finite-k. `crates/fullmag-runner/src/native_fem.rs` +
+`fem_preview_observable` mapuje `HDrive` na native `H_DRIVE`; to nie jest
+automatyczna deklaracja zapisu ani dowód pełnego monitor pipeline.
+Nie zmieniono writera ani polityki output. Reprodukcję i ograniczenia
+przekazano integratorowi; runtime, cold HTTP i browser nadal NOT VERIFIED.
