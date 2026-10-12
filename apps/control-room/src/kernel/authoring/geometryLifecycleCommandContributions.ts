@@ -570,11 +570,12 @@ function currentMeshRevision(context: CommandContext): number | null {
 }
 
 function authoritativeMeshCommandRevision(detail: CommandDetailResource): number {
-  return detail.resource_invalidations!.find((entry) => {
+  const matching = detail.resource_invalidations?.find((entry) => {
     const key = entry.resource_key;
     return key === "meshing/shared-domain/manifest" || key === "data/domain/topology" ||
       (key.startsWith("meshing/objects/") && key.endsWith("/topology"));
-  })!.revision;
+  });
+  return matching?.revision ?? 0;
 }
 
 function invalidateMeshBuildStatus(context: CommandContext, revision: string | number): void {
