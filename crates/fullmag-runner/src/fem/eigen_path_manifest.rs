@@ -302,6 +302,8 @@ pub(super) fn build_eigen_path_frequency_domain_manifest(
         "schema_version": "frequency_domain_manifest.v1",
         "analysis_family": "magnetic_frequency_domain",
         "study_product": "modal_eigen",
+        "spectrum_output_scopes":
+            crate::eigen::output_selection::eigen_spectrum_output_scopes(outputs),
         "revision": format!(
             "eigen:{}:{}:{}",
             result.solver_model.as_str(),

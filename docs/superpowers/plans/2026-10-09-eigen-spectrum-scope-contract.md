@@ -56,3 +56,10 @@ Planner deduplikacja quantity-only nie pozwalala dwom scope dotrzec dowritera. K
 ### Kanoniczny typ zakresu — korekta po CI 38245737002
 
 Kompilacja wykazała duplikat `EigenSpectrumScopeIR` w `study` i `eigen_contract`. OutputIR i adapter 0.4 korzystają teraz z istniejącego typu `eigen_contract::EigenSpectrumScopeIR`, wspólnego również z wcześniejszym kontraktem eigensolve. Dodano default `PerSample` na kanonicznym typie; nie zmieniono nazw wire ani intencji authoringu. Usunięto drugi enum zamiast wprowadzać konwersje między identycznymi typami. Weryfikacja wykonania testów pozostaje pending do nowego CI.
+
+
+### Etap 2 — zakresy żądane w manifestach producentów
+
+Wspólny resolver zbiera zakresy wyłącznie z rzeczywistych `EigenSpectrum` outputs. Legacy omission daje `per_sample`; dwa zakresy są zachowane w stabilnej kolejności. Manifesty generic, native single-k i native path otrzymują addytywne `spectrum_output_scopes`. Pusta lista oznacza brak jawnego żądania spektrum, nawet gdy dyspersja potrzebuje pomocniczego artefaktu widma. Certyfikat numeryczny `spectrum_scope=selected`, selekcja modów i ABI pozostają odrębne.
+
+Regresje uruchamiane wyłącznie w GHA sprawdzają resolver, rzeczywistych trzech producentów, identyfikatory próbek niezerowego k, niezmienione ścieżki modów i bajty artefaktów single-k. Stan: implementacja źródłowa; wynik nowego CI pending. To nie zamyka obsługi API/UI ani komentarza 4060116242; osobno adresowalne zasoby per_sample i kolekcja global wymagają następnego etapu.

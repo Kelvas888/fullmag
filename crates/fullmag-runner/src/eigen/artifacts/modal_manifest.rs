@@ -13,7 +13,9 @@ use crate::eigen::types::{
 use crate::eigen::diagnostic_artifact::{
     build_eigen_diagnostics_v2, canonical_mass_orthogonality_rows, EigenDiagnosticSampleRecord,
 };
-use crate::eigen::output_selection::eigen_diagnostics_request;
+use crate::eigen::output_selection::{
+    eigen_diagnostics_request, eigen_spectrum_output_scopes,
+};
 use fullmag_ir::OutputIR;
 use serde::Serialize;
 use std::fs;
@@ -690,9 +692,12 @@ pub fn write_frequency_domain_eigen_manifest_with_outputs(
         linearization_state_sha256,
         periodic_mesh_certificate_sha256,
     };
+    let mut manifest_value = serde_json::to_value(&manifest).unwrap();
+    manifest_value["spectrum_output_scopes"] =
+        serde_json::json!(eigen_spectrum_output_scopes(outputs));
     fs::write(
         manifest_dir.join("manifest.v1.json"),
-        serde_json::to_vec_pretty(&manifest).unwrap(),
+        serde_json::to_vec_pretty(&manifest_value).unwrap(),
     )?;
     let _ = write_frequency_domain_field_sweep_artifact(base_dir, result, identity)?;
     let _ = write_kittel_fit_artifact_with_identity(base_dir, result, identity)?;

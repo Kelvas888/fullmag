@@ -1,6 +1,6 @@
 use crate::eigen::types::{KSampleDescriptor, PathSolveResult};
 use fullmag_ir::{
-    is_supported_eigen_spectrum_quantity, OutputIR, SampleSelectorIR,
+    is_supported_eigen_spectrum_quantity, EigenSpectrumScopeIR, OutputIR, SampleSelectorIR,
     CANONICAL_EIGEN_SPECTRUM_QUANTITY,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -431,6 +431,32 @@ pub(crate) fn validate_eigen_spectrum_quantities(
     Ok(())
 }
 
+/// Collects the authored spectrum scopes represented by the requested outputs.
+///
+/// Legacy requests with no explicit scope retain their effective per-sample
+/// behavior. Multiple distinct requests are represented as a deterministic
+/// union; non-spectrum outputs do not imply a spectrum request.
+pub(crate) fn eigen_spectrum_output_scopes(outputs: &[OutputIR]) -> Vec<&'static str> {
+    let mut has_per_sample = false;
+    let mut has_global = false;
+    for output in outputs {
+        match output.effective_eigen_spectrum_scope() {
+            Some(EigenSpectrumScopeIR::PerSample) => has_per_sample = true,
+            Some(EigenSpectrumScopeIR::Global) => has_global = true,
+            None => {}
+        }
+    }
+
+    let mut scopes = Vec::new();
+    if has_per_sample {
+        scopes.push("per_sample");
+    }
+    if has_global {
+        scopes.push("global");
+    }
+    scopes
+}
+
 /// Resolve all eigen-related outputs against the supplied path result.
 pub(crate) fn select_eigen_outputs(
     path_result: &PathSolveResult,
@@ -852,7 +878,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        select_eigen_outputs, select_eigen_outputs_with_planned_samples,
+        eigen_spectrum_output_scopes, select_eigen_outputs, select_eigen_outputs_with_planned_samples,
         select_eigen_outputs_with_planned_sample_descriptors, EigenDiagnosticsRequest,
         OutputSelectionError, SampleModeId,
     };
@@ -860,7 +886,74 @@ mod tests {
         EigenSolverModel, KSampleDescriptor, PathSolveResult, SingleKModeResult,
         SingleKSolveResult, TrackedBranch, TrackedBranchPoint,
     };
-    use fullmag_ir::{OutputIR, SampleSelectorIR};
+    use fullmag_ir::{EigenSpectrumScopeIR, OutputIR, SampleSelectorIR};
+
+    #[test]
+    fn spectrum_output_scope_union_preserves_authored_and_legacy_requests() {
+        let spectrum = |scope| OutputIR::EigenSpectrum {
+            quantity: "eigenfrequency".to_string(),
+            scope,
+        };
+
+        assert_eq!(
+            eigen_spectrum_output_scopes(&[spectrum(Some(
+                EigenSpectrumScopeIR::PerSample
+            ))]),
+            vec!["per_sample"]
+        );
+        assert_eq!(
+            eigen_spectrum_output_scopes(&[spectrum(Some(EigenSpectrumScopeIR::Global))]),
+            vec!["global"]
+        );
+        assert_eq!(
+            eigen_spectrum_output_scopes(&[spectrum(None)]),
+            vec!["per_sample"],
+            "legacy output omission should retain effective per-sample scope"
+        );
+        assert_eq!(
+            eigen_spectrum_output_scopes(&[
+                spectrum(Some(EigenSpectrumScopeIR::Global)),
+                spectrum(Some(EigenSpectrumScopeIR::PerSample)),
+            ]),
+            vec!["per_sample", "global"],
+            "distinct authored scopes should be represented together"
+        );
+
+        let dispersion_only = [OutputIR::DispersionCurve {
+            name: "dispersion".to_string(),
+            include_branch_table: true,
+        }];
+        assert!(
+            eigen_spectrum_output_scopes(&dispersion_only).is_empty(),
+            "a dispersion request may publish spectrum support artifacts without requesting a spectrum"
+        );
+
+        let mode = OutputIR::EigenMode {
+            field: "mode".to_string(),
+            all_modes: false,
+            indices: vec![2],
+            branches: vec![],
+            sample_selector: Some(SampleSelectorIR {
+                sample_indices: vec![10],
+                sample_labels: vec![],
+            }),
+        };
+        let baseline = select_eigen_outputs(
+            &result(),
+            &[spectrum(None), mode.clone()],
+        )
+        .expect("legacy spectrum request should select outputs");
+        let with_both_scopes = select_eigen_outputs(
+            &result(),
+            &[
+                spectrum(Some(EigenSpectrumScopeIR::Global)),
+                spectrum(Some(EigenSpectrumScopeIR::PerSample)),
+                mode,
+            ],
+        )
+        .expect("both scope requests should preserve output selection");
+        assert_eq!(with_both_scopes, baseline);
+    }
 
     fn mode(raw_mode_index: usize, branch_id: Option<usize>) -> SingleKModeResult {
         SingleKModeResult {

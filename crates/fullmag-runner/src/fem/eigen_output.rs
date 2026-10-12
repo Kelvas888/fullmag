@@ -3300,6 +3300,8 @@ pub(super) fn write_eigen_v2_bundle_with_outputs(
         "schema_version": "frequency_domain_manifest.v1",
         "analysis_family": "magnetic_frequency_domain",
         "study_product": "modal_eigen",
+        "spectrum_output_scopes":
+            crate::eigen::output_selection::eigen_spectrum_output_scopes(outputs),
         "equilibrium_identity": summary_payload
             .get("solver_diagnostics")
             .and_then(|value| value.get("equilibrium_artifact_sha256"))

@@ -5235,6 +5235,10 @@ fn native_eigen_v2_mode_metadata_preserves_operator_provenance() {
         .find(|artifact| artifact.relative_path == "frequency_domain/manifest.v1.json")
         .and_then(|artifact| serde_json::from_slice::<serde_json::Value>(&artifact.bytes).ok())
         .expect("frequency-domain manifest must be emitted");
+    assert_eq!(manifest["spectrum_output_scopes"], serde_json::json!([]));
+    assert!(artifacts
+        .iter()
+        .any(|artifact| artifact.relative_path == "eigen/spectrum.v2.json"));
     assert_eq!(
         manifest["equilibrium_identity"],
         provenance["equilibrium_artifact_sha256"]
@@ -5518,6 +5522,70 @@ fn native_eigen_v2_mode_metadata_preserves_operator_provenance() {
         unresolved_branch_artifacts[0].bytes,
         unresolved_branch_before
     );
+
+    let scoped_outputs = [
+        OutputIR::EigenSpectrum {
+            quantity: "eigenfrequency".to_string(),
+            scope: Some(fullmag_ir::EigenSpectrumScopeIR::PerSample),
+        },
+        OutputIR::EigenSpectrum {
+            quantity: "eigenfrequency".to_string(),
+            scope: Some(fullmag_ir::EigenSpectrumScopeIR::Global),
+        },
+        OutputIR::EigenMode {
+            field: "mode".to_string(),
+            all_modes: false,
+            indices: vec![0],
+            branches: Vec::new(),
+            sample_selector: None,
+        },
+    ];
+    let mut scoped_artifacts = vec![
+        json_artifact("eigen/modes/mode_0000.json", &legacy_mode)
+            .expect("legacy mode artifact should serialize for scoped output"),
+    ];
+    write_eigen_v2_bundle_with_outputs(
+        &plan,
+        &summary,
+        &BTreeSet::from([0_u32]),
+        &mut scoped_artifacts,
+        0,
+        &scoped_outputs,
+        false,
+    )
+    .expect("native single-k writer should preserve both spectrum output scopes");
+    let scoped_manifest = scoped_artifacts
+        .iter()
+        .find(|artifact| artifact.relative_path == "frequency_domain/manifest.v1.json")
+        .and_then(|artifact| serde_json::from_slice::<serde_json::Value>(&artifact.bytes).ok())
+        .expect("scoped native manifest should be valid JSON");
+    assert_eq!(
+        scoped_manifest["spectrum_output_scopes"],
+        serde_json::json!(["per_sample", "global"])
+    );
+    for path in [
+        "eigen/spectrum.v2.json",
+        "eigen/spectrum.v3.json",
+        "eigen/branches.v2.json",
+        "eigen/mode_output_selection.v1.json",
+    ] {
+        let baseline_bytes = artifacts
+            .iter()
+            .find(|artifact| artifact.relative_path == path)
+            .unwrap_or_else(|| panic!("baseline writer should emit {path}"))
+            .bytes
+            .clone();
+        let scoped_bytes = scoped_artifacts
+            .iter()
+            .find(|artifact| artifact.relative_path == path)
+            .unwrap_or_else(|| panic!("scoped writer should emit {path}"))
+            .bytes
+            .clone();
+        assert_eq!(
+            scoped_bytes, baseline_bytes,
+            "adding spectrum scopes must not change artifact bytes at {path}"
+        );
+    }
 }
 
 #[test]
@@ -11641,6 +11709,10 @@ fn relaxed_path_source_fixture_handoff_is_reused_for_each_nonzero_k_sample_witho
             quantity: "eigenfrequency".to_string(),
             scope: None,
         },
+        OutputIR::EigenSpectrum {
+            quantity: "eigenfrequency".to_string(),
+            scope: Some(fullmag_ir::EigenSpectrumScopeIR::Global),
+        },
         OutputIR::DispersionCurve {
             name: "dispersion".to_string(),
             include_branch_table: true,
@@ -11747,11 +11819,15 @@ fn relaxed_path_source_fixture_handoff_is_reused_for_each_nonzero_k_sample_witho
         samples.iter().zip(expected_k_vectors).enumerate()
     {
         assert_eq!(sample["sample_index"].as_u64(), Some(sample_index as u64));
+        assert_eq!(
+            sample["sample_id"],
+            format!("k-path-sample-{sample_index:04}")
+        );
         assert_eq!(sample["k_vector"], serde_json::json!(k_vector));
         let modes = sample["modes"]
             .as_array()
             .expect("each published path sample should retain its modes");
-        assert!(!modes.is_empty());
+        assert_eq!(modes.len(), plan.count as usize);
         assert!(modes.iter().all(|mode| {
             mode
                 .get("relax_to_eigen_handoff_sha256")
@@ -11759,4 +11835,14 @@ fn relaxed_path_source_fixture_handoff_is_reused_for_each_nonzero_k_sample_witho
                 == Some(handoff_sha256)
         }));
     }
+    let frequency_domain_manifest = run
+        .auxiliary_artifacts
+        .iter()
+        .find(|artifact| artifact.relative_path == "frequency_domain/manifest.v1.json")
+        .and_then(|artifact| serde_json::from_slice::<serde_json::Value>(&artifact.bytes).ok())
+        .expect("the real path publisher should emit a frequency-domain manifest");
+    assert_eq!(
+        frequency_domain_manifest["spectrum_output_scopes"],
+        serde_json::json!(["per_sample", "global"])
+    );
 }

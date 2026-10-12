@@ -38,6 +38,13 @@ jobs:
         run: cargo test --locked -p fullmag-ir -p fullmag-plan --no-fail-fast
       - name: Run complete application materialization contracts
         run: cargo test --locked -p fullmag-application --lib --no-fail-fast
+      - name: Verify scope metadata at actual generic single-k and path producers
+        run: |
+          set -o pipefail
+          for test_name in spectrum_output_scope_union_preserves_authored_and_legacy_requests generic_manifest_reports_the_union_of_requested_spectrum_scopes native_eigen_v2_mode_metadata_preserves_operator_provenance relaxed_path_source_fixture_handoff_is_reused_for_each_nonzero_k_sample_without_per_sample_relaxation; do
+            cargo test --locked -p fullmag-runner --lib "$test_name" -- --nocapture | tee "$RUNNER_TEMP/$test_name.log"
+            grep -F "$test_name ... ok" "$RUNNER_TEMP/$test_name.log"
+          done
       - name: Run complete runner contracts
         run: cargo test --locked -p fullmag-runner --lib --no-fail-fast
       - name: Compile integration callers and API CLI binaries

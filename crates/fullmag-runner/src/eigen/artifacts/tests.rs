@@ -1010,6 +1010,7 @@ fn generic_diagnostics_writer_uses_flags_and_does_not_publish_a_spectrum() {
         "/v2/sessions/current/analysis/frequency-domain/eigen/diagnostics.v2"
     );
     assert!(manifest["artifacts"]["spectrum_v2_path"].is_null());
+    assert_eq!(manifest["spectrum_output_scopes"], serde_json::json!([]));
     assert!(manifest["artifacts"]["mode_metadata_paths"]
         .as_array()
         .unwrap()
@@ -1042,6 +1043,100 @@ fn generic_diagnostics_writer_uses_flags_and_does_not_publish_a_spectrum() {
     assert_eq!(diagnostics["tangent_leakage"]["status"], "available");
     assert_eq!(diagnostics["tangent_leakage"]["data"]["records"][0]["mean_abs"], 3.0e-12);
     assert_eq!(diagnostics["orthogonality"]["status"], "not_requested");
+}
+
+#[test]
+fn generic_manifest_reports_the_union_of_requested_spectrum_scopes() {
+    let result = sample_result();
+    let spectrum = |scope: Option<fullmag_ir::EigenSpectrumScopeIR>| {
+        fullmag_ir::OutputIR::EigenSpectrum {
+            quantity: "eigenfrequency".to_string(),
+            scope,
+        }
+    };
+    let mode = fullmag_ir::OutputIR::EigenMode {
+        field: "mode".to_string(),
+        all_modes: false,
+        indices: vec![0],
+        branches: Vec::new(),
+        sample_selector: None,
+    };
+    let cases: Vec<(&str, Vec<fullmag_ir::OutputIR>, Value)> = vec![
+        (
+            "per-sample",
+            vec![
+                spectrum(Some(fullmag_ir::EigenSpectrumScopeIR::PerSample)),
+                mode.clone(),
+            ],
+            serde_json::json!(["per_sample"]),
+        ),
+        (
+            "global",
+            vec![
+                spectrum(Some(fullmag_ir::EigenSpectrumScopeIR::Global)),
+                mode.clone(),
+            ],
+            serde_json::json!(["global"]),
+        ),
+        (
+            "legacy-per-sample",
+            vec![spectrum(None), mode.clone()],
+            serde_json::json!(["per_sample"]),
+        ),
+        (
+            "both-scopes",
+            vec![
+                spectrum(Some(fullmag_ir::EigenSpectrumScopeIR::Global)),
+                spectrum(Some(fullmag_ir::EigenSpectrumScopeIR::PerSample)),
+                mode.clone(),
+            ],
+            serde_json::json!(["per_sample", "global"]),
+        ),
+        (
+            "dispersion-without-spectrum-request",
+            vec![
+                fullmag_ir::OutputIR::DispersionCurve {
+                    name: "dispersion".to_string(),
+                    include_branch_table: true,
+                },
+                mode,
+            ],
+            serde_json::json!([]),
+        ),
+    ];
+
+    let mut expected_mode_paths = None;
+    for (case, outputs, expected_scopes) in cases {
+        let temp = TempDirGuard::new(&format!("spectrum-scope-{case}"));
+        write_frequency_domain_eigen_manifest_with_outputs(
+            &temp.path,
+            &result,
+            &artifact_identity(),
+            &outputs,
+            Some(1),
+            None,
+        )
+        .expect("generic frequency-domain manifest should write");
+        let manifest: Value = serde_json::from_slice(
+            &std::fs::read(temp.path.join("frequency_domain/manifest.v1.json"))
+                .expect("generic frequency-domain manifest should exist"),
+        )
+        .expect("generic frequency-domain manifest should be valid JSON");
+
+        assert_eq!(
+            manifest["spectrum_output_scopes"], expected_scopes,
+            "wrong requested spectrum scope set for {case}"
+        );
+        let mode_paths = manifest["artifacts"]["mode_metadata_paths"].clone();
+        if let Some(expected) = expected_mode_paths.as_ref() {
+            assert_eq!(
+                &mode_paths, expected,
+                "scope metadata must not change selected mode paths for {case}"
+            );
+        } else {
+            expected_mode_paths = Some(mode_paths);
+        }
+    }
 }
 
 #[test]
