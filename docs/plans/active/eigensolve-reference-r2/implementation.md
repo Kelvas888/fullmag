@@ -1072,3 +1072,10 @@ GHA38238266747 na116575d9 SUCCESS:236tests20files, fulltypecheck/architecture PA
 ## Retained Plot3D po bledzie refresh
 
 4246863047: error hook moze zachowac ostatni dobry envelope. Handoff teraz dopuszcza ready/stale/error, lecz nadal wymaga ready artifact envelope oraz kompletnej zgodnosci manifest owner/session/run/stage/artifact set/rewizji i point mode metadata. Initial error bez danych, missing artifact lub obcy owner pozostaja niedopuszczalne. Test obejmuje9status combos i stale/error negative guards. Source review PASS, nowy hostedCI i browser pending; nie zmieniono viewport ani renderera WebGL.
+
+GHA38239150905 na f6389eadd SUCCESS:239tests21files, typy/architektura/scopedDoctor PASS. Retained handoff4246863047 potwierdzony kontraktowo; browser pozostaje NOT VERIFIED.
+
+
+## Wyczerpanie rewizji definicji
+
+4246863048: checked_add po istniejących guardach scene revision i owner, przed replacement/commit. HTTP409 kod postprocessing_definition_revision_overflow bez panic/wrap. Real router tests importują serde-roundtrip authoring-validated scene z definitionMAX, PATCH409 i GET potwierdzają niezmieniony label/revision/scene; nearMAX PATCH zwiększa doMAX i scene4->5 dokładnie raz. Istniejące400owner/id i409scene nie zmienione. Parser/source review PASS; dedykowany hosted module job i named log guards wymagane.

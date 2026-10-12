@@ -11,6 +11,34 @@ async fn seeded_app(revision: u64) -> axum::Router {
     build_v2_router().with_state(state)
 }
 
+async fn seeded_app_with_definition_revision(
+    scene_revision: u64,
+    definition_revision: u64,
+) -> axum::Router {
+    let state = test_app_state_with_live_session().await;
+    let mut scene = sample_scene_document();
+    scene.revision = scene_revision;
+
+    let mut definition: fullmag_authoring::ScenePostprocessingDefinition =
+        serde_json::from_value(mode_visualization("viz-boundary"))
+            .expect("the postprocessing fixture should deserialize");
+    definition.revision = definition_revision;
+    scene.analysis.postprocessing_definitions.push(definition);
+
+    let scene: fullmag_authoring::SceneDocument = serde_json::from_value(
+        serde_json::to_value(scene).expect("the imported scene should serialize"),
+    )
+    .expect("the imported scene should deserialize with its u64 revision intact");
+    fullmag_authoring::validate_scene_document_for_authoring(&scene)
+        .expect("the imported scene with a boundary definition revision should be legal");
+
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.scene_document = Some(scene);
+        snapshot.session.script_path.clear();
+    }
+    build_v2_router().with_state(state)
+}
+
 fn mode_visualization(definition_id: &str) -> serde_json::Value {
     serde_json::json!({
         "definition_id": definition_id,
@@ -127,6 +155,76 @@ async fn postprocessing_definition_crud_is_revisioned_and_saved_in_the_scene() {
 
     let (status, _) = send(&app, "GET", &format!("{DEFINITIONS}/viz-1"), None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn postprocessing_definition_revision_overflow_conflicts_without_mutating_the_scene() {
+    let app = seeded_app_with_definition_revision(4, u64::MAX).await;
+    let mut updated_definition = mode_visualization("viz-boundary");
+    updated_definition["label"] = serde_json::json!("Updated label");
+
+    let (status, error) = send(
+        &app,
+        "PATCH",
+        &format!("{DEFINITIONS}/viz-boundary"),
+        Some(serde_json::json!({
+            "expected_scene_revision": 4,
+            "definition": updated_definition
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_eq!(
+        error["code"],
+        "postprocessing_definition_revision_overflow"
+    );
+
+    let (status, persisted) = send(&app, "GET", DEFINITIONS, None).await;
+    assert_eq!(status, StatusCode::OK, "{persisted}");
+    assert_eq!(persisted["scene_revision"].as_u64(), Some(4));
+    assert_eq!(persisted["count"], 1);
+    assert_eq!(
+        persisted["definitions"][0]["revision"].as_u64(),
+        Some(u64::MAX)
+    );
+    assert_eq!(
+        persisted["definitions"][0]["label"],
+        "Branch 1 · ky +15 rad/um · 12.025 GHz"
+    );
+}
+
+#[tokio::test]
+async fn postprocessing_definition_revision_near_max_increments_once() {
+    let app = seeded_app_with_definition_revision(4, u64::MAX - 1).await;
+    let mut updated_definition = mode_visualization("viz-boundary");
+    updated_definition["label"] = serde_json::json!("Updated label");
+
+    let (status, patched) = send(
+        &app,
+        "PATCH",
+        &format!("{DEFINITIONS}/viz-boundary"),
+        Some(serde_json::json!({
+            "expected_scene_revision": 4,
+            "definition": updated_definition
+        })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{patched}");
+    assert_eq!(
+        patched["definition"]["revision"].as_u64(),
+        Some(u64::MAX)
+    );
+    assert_eq!(patched["definition"]["label"], "Updated label");
+    assert_eq!(patched["scene_revision"].as_u64(), Some(5));
+
+    let (status, persisted) = send(&app, "GET", DEFINITIONS, None).await;
+    assert_eq!(status, StatusCode::OK, "{persisted}");
+    assert_eq!(persisted["scene_revision"].as_u64(), Some(5));
+    assert_eq!(
+        persisted["definitions"][0]["revision"].as_u64(),
+        Some(u64::MAX)
+    );
+    assert_eq!(persisted["definitions"][0]["label"], "Updated label");
 }
 
 #[tokio::test]

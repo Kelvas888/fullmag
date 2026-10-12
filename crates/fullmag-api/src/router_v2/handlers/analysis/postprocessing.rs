@@ -133,7 +133,12 @@ pub async fn patch_postprocessing_definition(
             "postprocessing_definition_owner_changed: module_id cannot change",
         ));
     }
-    let next_revision = existing.revision + 1;
+    let next_revision = existing.revision.checked_add(1).ok_or_else(|| {
+        ApiError::conflict_with_code(
+            "postprocessing_definition_revision_overflow",
+            "postprocessing definition revision cannot be incremented",
+        )
+    })?;
     let mut next = ScenePostprocessingDefinition::from(request.definition);
     next.revision = next_revision;
     *existing = next;

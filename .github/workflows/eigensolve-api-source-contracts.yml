@@ -11,6 +11,8 @@ on:
       - 'crates/fullmag-api/src/router_v2/handlers/data/fields.rs'
       - 'crates/fullmag-api/src/router_v2/handlers/data/quantities.rs'
       - 'crates/fullmag-api/src/router_v2/handlers/analysis/results.rs'
+      - 'crates/fullmag-api/src/router_v2/handlers/analysis/postprocessing.rs'
+      - 'crates/fullmag-api/src/router_v2/tests/postprocessing_definitions.rs'
 
 permissions:
   contents: read
@@ -43,3 +45,21 @@ jobs:
         run: |
           cargo test --locked -p fullmag-api --bin fullmag-api router_v2::tests::v2_progress_keeps_live_magnetization_at_its_original_observation_step -- --exact | tee "$RUNNER_TEMP/field-freshness.log"
           grep -F "test router_v2::tests::v2_progress_keeps_live_magnetization_at_its_original_observation_step ... ok" "$RUNNER_TEMP/field-freshness.log"
+
+  postprocessing-revision-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RUST_MIN_STACK: 16777216
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Preserve exact source identity
+        run: git rev-parse HEAD
+      - name: Validate real HTTP postprocessing revision mutations
+        run: |
+          set -o pipefail
+          cargo test --locked -p fullmag-api --bin fullmag-api router_v2::tests::postprocessing_definitions:: -- --nocapture | tee "$RUNNER_TEMP/postprocessing-revisions.log"
+          grep -F "postprocessing_definition_revision_overflow_conflicts_without_mutating_the_scene ... ok" "$RUNNER_TEMP/postprocessing-revisions.log"
+          grep -F "postprocessing_definition_revision_near_max_increments_once ... ok" "$RUNNER_TEMP/postprocessing-revisions.log"
