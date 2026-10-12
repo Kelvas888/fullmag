@@ -9717,10 +9717,65 @@ void modal_poisson_airbox_tail_gpu_shift_invert_action_writes_artifact()
     fullmag_fem_frequency_domain_result_destroy(&result);
 }
 
+void modal_poisson_iteration_policy_preserves_lane_defaults()
+{
+    for (const auto target : {fd::ModalExecutionTarget::auto_select,
+             fd::ModalExecutionTarget::production_cpu, fd::ModalExecutionTarget::production_gpu}) {
+        fd::ModalEigenRequest request{};
+        request.execution_target = target;
+        const bool gpu = target == fd::ModalExecutionTarget::production_gpu;
+        fd::PoissonAirboxEigenBlockProblem problem{};
+        const auto default_outer = problem.max_outer_iterations;
+        const auto default_linear = problem.max_linear_iterations;
+        check(fd::apply_poisson_airbox_iteration_policy(problem, request) &&
+                  problem.max_outer_iterations == (gpu ? default_outer : 0u) &&
+                  problem.max_linear_iterations == (gpu ? default_linear : 0u),
+              "omitted GPU budgets preserve native defaults while CPU retains PETSc sentinels");
+        for (const auto budgets : {std::array<int, 2>{97, 211},
+                 std::array<int, 2>{0, 211}, std::array<int, 2>{97, 0}}) {
+            problem = fd::PoissonAirboxEigenBlockProblem{};
+            request.max_outer_iterations = budgets[0];
+            request.max_linear_iterations = budgets[1];
+            check(fd::apply_poisson_airbox_iteration_policy(problem, request) &&
+                      problem.max_outer_iterations == (gpu && budgets[0] == 0
+                          ? default_outer : static_cast<std::uint32_t>(budgets[0])) &&
+                      problem.max_linear_iterations == (gpu && budgets[1] == 0
+                          ? default_linear : static_cast<std::uint32_t>(budgets[1])),
+                  "explicit and partial budgets preserve authored values independently");
+        }
+        for (const auto budgets : {std::array<int, 2>{-1, 211},
+                 std::array<int, 2>{97, -1},
+                 std::array<int, 2>{std::numeric_limits<int>::min(), 0}}) {
+            problem = fd::PoissonAirboxEigenBlockProblem{};
+            request.max_outer_iterations = budgets[0];
+            request.max_linear_iterations = budgets[1];
+            check(!fd::apply_poisson_airbox_iteration_policy(problem, request) &&
+                      problem.max_outer_iterations == default_outer &&
+                      problem.max_linear_iterations == default_linear,
+                  "invalid signed policy fails atomically before unsigned conversion");
+            FullmagFemModalEigenRequest abi_request = base_request();
+            abi_request.execution_target = static_cast<fullmag_fem_modal_execution_target>(target);
+            abi_request.poisson_airbox_block_enabled = 1;
+            abi_request.max_outer_iterations = budgets[0];
+            abi_request.max_linear_iterations = budgets[1];
+            auto result = fullmag_fem_modal_eigen_solve(&abi_request);
+            check(result.status == FULLMAG_FEM_FD_VALIDATION_ERROR && result.mode_count == 0u &&
+                      contains(result.diagnostics_json, "poisson_airbox_iteration_budget_invalid"),
+                  "actual C ABI rejects negative budgets before device or matrix admission");
+            fullmag_fem_frequency_domain_result_destroy(&result);
+        }
+    }
+    std::printf("PASS: modal_poisson_iteration_policy_preserves_lane_defaults\n");
+}
+
 } // namespace
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && std::strcmp(argv[1], "--poisson-iteration-policy") == 0) {
+        modal_poisson_iteration_policy_preserves_lane_defaults();
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--modal-damping-admission") == 0) {
 #if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
         modal_damping_policy_tokens_and_nonshared_matrices();
@@ -9880,6 +9935,7 @@ int main(int argc, char **argv)
         std::fprintf(stderr, "FAIL: unknown modal eigen contract test argument\n");
         return 2;
     }
+    modal_poisson_iteration_policy_preserves_lane_defaults();
     modal_shared_domain_provider_terminal_status_fails_closed();
 #if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
     modal_shared_domain_damping_policy_fails_before_all_aliases();

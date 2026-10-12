@@ -992,6 +992,8 @@ add_fem_source_facade_contract(
     fem_modal_eigen_contract
     tests/frequency_domain/modal_eigen_contract_test.cpp
 )
+add_test(NAME fem_modal_eigen_poisson_iteration_policy_contract
+    COMMAND $<TARGET_FILE:fem_modal_eigen_contract> --poisson-iteration-policy)
 # Isolate the generic provider contract while preserving the full modal suite.
 add_custom_target(fem_modal_eigen_generic_mass_refill_contract
     DEPENDS fem_modal_eigen_contract)

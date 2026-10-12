@@ -2111,6 +2111,26 @@ FrequencyDomainContractResult solve_tiny_validation_modal_problem(
 
 } // namespace
 
+bool apply_poisson_airbox_iteration_policy(
+    PoissonAirboxEigenBlockProblem &problem,
+    const ModalEigenRequest &request) noexcept
+{
+    if (request.max_outer_iterations < 0 || request.max_linear_iterations < 0) {
+        return false;
+    }
+    const bool preserve_omitted =
+        request.execution_target == ModalExecutionTarget::production_gpu;
+    if (request.max_outer_iterations != 0 || !preserve_omitted) {
+        problem.max_outer_iterations =
+            static_cast<std::uint32_t>(request.max_outer_iterations);
+    }
+    if (request.max_linear_iterations != 0 || !preserve_omitted) {
+        problem.max_linear_iterations =
+            static_cast<std::uint32_t>(request.max_linear_iterations);
+    }
+    return true;
+}
+
 FrequencyDomainContractResult solve_modal_eigen_contract(
     const ModalEigenRequest &request) noexcept
 {
@@ -2127,6 +2147,13 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
             "modal_eigen",
             "native FEM modal_eigen request uses an unknown enum value",
             "unknown_modal_enum",
+            request.operator_request.operator_diagnostics_json);
+    }
+    if (request.poisson_airbox_block_enabled != 0 &&
+        (request.max_outer_iterations < 0 || request.max_linear_iterations < 0)) {
+        return validation_error_result(
+            "modal_eigen", "Poisson-airbox iteration budgets must be non-negative",
+            "poisson_airbox_iteration_budget_invalid",
             request.operator_request.operator_diagnostics_json);
     }
     const char *damping_policy = request.operator_request.damping_policy;
@@ -2639,10 +2666,12 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
         }
         problem.requested_mode_count =
             static_cast<std::uint32_t>(request.requested_mode_count);
-        problem.max_outer_iterations =
-            static_cast<std::uint32_t>(request.max_outer_iterations);
-        problem.max_linear_iterations =
-            static_cast<std::uint32_t>(request.max_linear_iterations);
+        if (!apply_poisson_airbox_iteration_policy(problem, request)) {
+            return validation_error_result(
+                "modal_eigen", "Poisson-airbox iteration budgets must be non-negative",
+                "poisson_airbox_iteration_budget_invalid",
+                request.operator_request.operator_diagnostics_json);
+        }
         problem.production_shared_domain =
             request.poisson_airbox_shared_domain_enabled != 0;
         problem.cancel_user_data = request.cancel_user_data;

@@ -1325,3 +1325,13 @@ Fixture pattern musi spelniac obecny descriptor R4 (FIELD-only carrier), miec po
 | Source ID | Path + symbol | Odpowiedzialność |
 |---|---|---|
 | source-floquet-success-observation | `backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp::floquet_shifted_ksp_diagnostics_json_fields` | Eksport cached opt-in obserwacji po sukcesie bez zmiany acceptance |
+
+
+### K0 GPU — sentinel limitów iteracji C ABI
+
+Brak jawnego limitu EPS/KSP ma w C ABI wartość `0`. Dla `production_gpu` adapter Poisson zachowuje wówczas istniejące defaults problemu; dodatnie limity pozostają jawnym intent. Dla CPU zero nadal dochodzi do dotychczasowego mechanizmu `PETSC_DEFAULT`. Nie ujednolicać tych realizacji przez wspólny hardkodowany limit. Ujemne wartości należy odrzucić przed unsigned cast, bez clamp i bez zmiany targetu. Fizyczny operator, residual i ABI pozostają bez zmian. Regresja adaptera oraz rzeczywistego C ABI admission nie dowodzi urządzeniowego solve GPU; runtime/GPU kwalifikacja nadal NOT VERIFIED.
+
+
+| Source ID | Path + symbol | Odpowiedzialność |
+|---|---|---|
+| source-poisson-iteration-policy | `backends/fem/src/frequency_domain/modal_eigen_solver.cpp::apply_poisson_airbox_iteration_policy` | Sentinel omission GPU/CPU i atomowe odrzucenie ujemnych budżetów |

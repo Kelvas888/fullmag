@@ -5,6 +5,14 @@
 
 namespace fullmag::fem::frequency_domain {
 
+struct PoissonAirboxEigenBlockProblem;
+
+// Resolve only omitted GPU budgets; CPU retains its PETSc zero sentinel.
+// Invalid signed budgets fail without partially modifying the problem.
+bool apply_poisson_airbox_iteration_policy(
+    PoissonAirboxEigenBlockProblem &problem,
+    const ModalEigenRequest &request) noexcept;
+
 FrequencyDomainContractResult solve_modal_eigen_contract(
     const ModalEigenRequest &request) noexcept;
 
