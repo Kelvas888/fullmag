@@ -2631,7 +2631,12 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
                 (std::strcmp(problem.assembly_kind, "mfem_weak_form_shared_domain") == 0
                      ? "k0_poisson_airbox_cpu_schur_slepc"
                      : "k0_poisson_airbox_cpu_full_coupled_slepc");
-        problem.residual_tolerance = request.residual_tolerance;
+        // Zero is the public ABI sentinel for an omitted residual policy.
+        // Keep the Poisson problem's existing default; explicit nonzero values,
+        // including invalid ones, remain subject to the adapter validator.
+        if (request.residual_tolerance != 0.0) {
+            problem.residual_tolerance = request.residual_tolerance;
+        }
         problem.requested_mode_count =
             static_cast<std::uint32_t>(request.requested_mode_count);
         problem.max_outer_iterations =

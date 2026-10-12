@@ -1057,3 +1057,10 @@ Doctor38236984250 wykonal fullscan1998files z powodu braku rozpoznanego featureb
 
 
 Pinned Doctor0.9.12 source86198f1/packages/core/src/services/git.ts potwierdza detachedHEAD+brak explicitBase -> null diffSelection -> fullscan. Workflow teraz przekazuje --base PR.base.sha, a dla push origin/default_branch. Full fetch zapewnia historie merge-base; git rev-parse --verify przed skanem failclosed przy niedostepnej bazie. Nie dodano suppression/ignore ani ||true; pelny historyczny wynik617 pozostaje osobnym dowodem. Scoped Doctor wymaga nowego hosted run. Primary source: https://raw.githubusercontent.com/millionco/react-doctor/86198f1/packages/core/src/services/git.ts.
+
+
+## Domyslna tolerancja K0 Poisson
+
+4246863053: exactzero ABI nie nadpisuje juz initialized default PoissonAirboxEigenBlockProblem. Nie wprowadzono nowego literal threshold, nie zmieniono Rust omission ani IR. Explicitnonzero nadal trafia do walidatora, w tym negative/NaN/infinity. Nota0600 powstala przed implementacja i standalone source map validator PASS.
+
+Actual modal C ABI tail regression obejmuje defaultzero, explicit0, iterationonly64/64, explicitnondefault2*existingdefault, publishedoriginaldescriptorthreshold i acceptedmode residual. Invalidnegative/nonfinite musza dac validationerror0modes. Weryfikacja przez istniejacy modal-phase-slepc/fem_modal_eigen_typed_cpu_transport_contract, ktory rzeczywiscie wywoluje ten tail niezaleznie od wczesniejszych bledow pelnego modal45. Nie deklarowac PASS z pendingbuild ani nauki z synthetic fixture.

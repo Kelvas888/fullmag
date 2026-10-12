@@ -1302,3 +1302,12 @@ w `docs/plans/active/eigensolve-reference-r2/ci-evidence-20261010.json`.
 | source-python-eigen-policy-validation | `packages/fullmag-py/src/fullmag/model/study.py::class FemEigenSolverPolicy` | Publiczny intent i granice liczników |
 | source-scene-eigen-policy-validation | `packages/fullmag-py/src/fullmag/runtime/scene_document.py::builder_overrides_from_scene_document` | Walidacja odtwarzania sceny i aliasu tolerancji |
 | source-native-eigen-policy-range | `crates/fullmag-plan/src/fem.rs::eigen_solver_policy` | Istniejąca skończona dodatnia tolerancja oraz signed iteration limits |
+
+
+### K0 Poisson: domyslna tolerancja na granicy adaptera
+
+ABI modal request uzywa residual_tolerance=0 jako sentinela braku jawnej polityki. To dotyczy takze zadania podajacego tylko limity iteracji. PoissonAirboxEigenBlockProblem jest juz rozwiazanym kontraktem numerycznym: ma istniejaca domyslna wartosc1e-10 i wymaga skonczonej dodatniej tolerancji. Adapter modal_eigen_solver.cpp musi pozostawic te domyslna wartosc dla ABI0; jawna wartosc niezerowa musi byc zachowana i podlegac walidacji. Nie rozszerzac sentinel na NaN, infinity ani wartosci ujemne.
+
+Nie zmienia to fizyki dynamicznego demag K0, rownania LLG, jednostek SI ani kryterium residualu. Requested intent w Python/IR pozostaje omission; adapter rozwiazuje jedynie sentinel dla konkretnej sciezki K0 Poisson. Nie dodawac alternatywnej domyslnej wartosci w Rust ani hardkodowanej tolerancji w launcherze.
+
+Weryfikacja wymagana: rzeczywisty modal C ABI Poisson-tail solve dla0 oraz jawnej dodatniej tolerancji, takze0 z jawnymi limitami iteracji. Invalid nonzero musi nadal byc odrzucone. Native compile/runtime i kwalifikacja fizyczna pozostaja NOT VERIFIED do hosted gate; source validator nie dowodzi solve.

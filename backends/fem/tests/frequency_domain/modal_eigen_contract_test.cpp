@@ -1,5 +1,6 @@
 #include "cpu/frequency_domain/mfem_modal_operator_payload.hpp"
 #include "cpu/frequency_domain/contour_interval_solver.hpp"
+#include "cpu/frequency_domain/poisson_airbox_modal_eigen.hpp"
 #include "cpu/frequency_domain/floquet_airbox_operator.hpp"
 #include "cpu/frequency_domain/modal_shared_domain_provider_status.hpp"
 #include "cpu/frequency_domain/operators/poisson_airbox_shared_domain.hpp"
@@ -9364,6 +9365,71 @@ void modal_poisson_airbox_tail_payload_resolves_augmented_gauge_schur_solver()
     }
     check(poisson_typed_values_finite,
           "modal Poisson-airbox typed lambda, q, phi, and residual remain finite");
+
+    const double default_poisson_tolerance =
+        fd::PoissonAirboxEigenBlockProblem{}.residual_tolerance;
+    check(extract_json_number(
+              result.diagnostics_json,
+              "\"modal_original_unscaled_full_descriptor_threshold\":",
+              "poisson_explicit_residual_threshold") == request.residual_tolerance,
+          "the explicit Poisson residual policy reaches its original-descriptor acceptance threshold");
+    struct PoissonResidualPolicyCase {
+        const char *name;
+        double requested_tolerance;
+        int max_outer_iterations;
+        int max_linear_iterations;
+        double expected_tolerance;
+    };
+    const std::array<PoissonResidualPolicyCase, 4> policy_cases{{
+        {"omitted_policy_abi_zero", FullmagFemModalEigenRequest{}.residual_tolerance,
+         0, 0, default_poisson_tolerance},
+        {"explicit_abi_zero", 0.0, 0, 0, default_poisson_tolerance},
+        {"iteration_only_policy", 0.0, 64, 64, default_poisson_tolerance},
+        {"explicit_nondefault_policy", 2.0 * default_poisson_tolerance,
+         0, 0, 2.0 * default_poisson_tolerance},
+    }};
+    for (const auto &policy_case : policy_cases) {
+        FullmagFemModalEigenRequest policy_request = request;
+        policy_request.residual_tolerance = policy_case.requested_tolerance;
+        policy_request.max_outer_iterations = policy_case.max_outer_iterations;
+        policy_request.max_linear_iterations = policy_case.max_linear_iterations;
+        FullmagFemFrequencyDomainResult policy_result =
+            fullmag_fem_modal_eigen_solve(&policy_request);
+        if (policy_result.status != FULLMAG_FEM_FD_OK) {
+            std::fprintf(stderr,
+                         "FAIL-DIAGNOSTICS: Poisson residual policy case=%s status=%d error=%.512s diagnostics=%.16384s\n",
+                         policy_case.name, static_cast<int>(policy_result.status),
+                         policy_result.error_message != nullptr ? policy_result.error_message : "null",
+                         policy_result.diagnostics_json != nullptr ? policy_result.diagnostics_json : "null");
+        }
+        check(policy_result.status == FULLMAG_FEM_FD_OK && policy_result.mode_count == 1u &&
+                  policy_result.mode_residuals != nullptr &&
+                  std::isfinite(policy_result.mode_residuals[0]) &&
+                  policy_result.mode_residuals[0] <= policy_case.expected_tolerance,
+              "Poisson C ABI default and explicit residual policies retain certified accepted modes");
+        check(extract_json_number(
+                  policy_result.diagnostics_json,
+                  "\"modal_original_unscaled_full_descriptor_threshold\":",
+                  policy_case.name) == policy_case.expected_tolerance,
+              "Poisson C ABI resolves only zero to the existing default and preserves explicit tolerance");
+        check(policy_request.residual_tolerance == policy_case.requested_tolerance,
+              "Poisson default resolution preserves the public request's zero sentinel");
+        fullmag_fem_frequency_domain_result_destroy(&policy_result);
+    }
+    for (const double invalid_tolerance : {
+             -default_poisson_tolerance, std::numeric_limits<double>::quiet_NaN(),
+             std::numeric_limits<double>::infinity()}) {
+        FullmagFemModalEigenRequest invalid_request = request;
+        invalid_request.residual_tolerance = invalid_tolerance;
+        FullmagFemFrequencyDomainResult invalid_result =
+            fullmag_fem_modal_eigen_solve(&invalid_request);
+        check(invalid_result.status == FULLMAG_FEM_FD_VALIDATION_ERROR &&
+                  contains(invalid_result.diagnostics_json,
+                           "poisson_airbox_eigen_invalid_tolerance_or_frequency") &&
+                  invalid_result.mode_count == 0u,
+              "Poisson C ABI rejects explicit negative and nonfinite tolerances without default normalization");
+        fullmag_fem_frequency_domain_result_destroy(&invalid_result);
+    }
 #else
     check(result.status == FULLMAG_FEM_FD_UNAVAILABLE,
           "modal Poisson-airbox tail payload must require SLEPc when unavailable");
