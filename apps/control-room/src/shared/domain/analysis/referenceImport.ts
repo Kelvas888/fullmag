@@ -71,48 +71,256 @@ export function isReferencePointPairs(value: unknown): value is readonly Referen
   return referencePointPairsValidationError(value) === null;
 }
 
-function splitLine(line: string, header = false): string[] {
-  // Header names may contain single spaces ("k (rad/um)"); COMSOL separates
-  // header columns with runs of spaces, data columns with any whitespace.
-  const delimiter = line.includes("\t")
-    ? "\t"
-    : line.includes(";")
-      ? ";"
-      : line.includes(",")
-        ? ","
-        : header
-          ? /\s{2,}/
-          : /\s+/;
-  const delimiterForCount = typeof delimiter === "string"
-    ? delimiter
-    : new RegExp(delimiter.source, "g");
-  let columnCount = 1;
-  if (typeof delimiterForCount === "string") {
-    if (delimiterForCount.length > 0) {
-      for (
-        let index = line.indexOf(delimiterForCount);
-        index >= 0;
-        index = line.indexOf(delimiterForCount, index + delimiterForCount.length)
-      ) {
-        columnCount += 1;
-        if (columnCount > MAX_REFERENCE_COLUMNS) {
-          throw new RangeError(`Reference tables may contain at most ${MAX_REFERENCE_COLUMNS} columns.`);
-        }
+type ReferenceDelimiter = "\t" | ";" | ",";
+
+interface ReferenceInputRecord {
+  text: string;
+  commentHeader: string | null;
+}
+
+function delimiterCountOutsideQuotes(line: string, delimiter: ReferenceDelimiter): number {
+  let count = 0;
+  let inQuotes = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index]!;
+    if (character === "\"") {
+      if (inQuotes && line[index + 1] === "\"") {
+        index += 1;
+      } else {
+        inQuotes = !inQuotes;
       }
-    }
-  } else {
-    while (delimiterForCount.exec(line) !== null) {
-      columnCount += 1;
-      if (columnCount > MAX_REFERENCE_COLUMNS) {
-        throw new RangeError(`Reference tables may contain at most ${MAX_REFERENCE_COLUMNS} columns.`);
-      }
+    } else if (!inQuotes && character === delimiter) {
+      count += 1;
     }
   }
-  return line.split(delimiter).map((cell) => cell.trim().replace(/^"|"$/g, ""));
+  return count;
+}
+
+function detectDelimitedSeparator(
+  records: readonly string[],
+): ReferenceDelimiter | undefined {
+  for (const delimiter of ["\t", ";", ","] as const) {
+    if (records.some((record) => delimiterCountOutsideQuotes(record, delimiter) > 0)) {
+      return delimiter;
+    }
+  }
+  return undefined;
+}
+
+function parseDelimitedLine(line: string, delimiter: ReferenceDelimiter): string[] {
+  const cells: string[] = [];
+  let cell = "";
+  let inQuotes = false;
+  let closedQuote = false;
+
+  const pushCell = (): void => {
+    if (cells.length >= MAX_REFERENCE_COLUMNS) {
+      throw new RangeError(
+        "Reference tables may contain at most " + MAX_REFERENCE_COLUMNS + " columns.",
+      );
+    }
+    cells.push(cell.trim());
+    cell = "";
+    closedQuote = false;
+  };
+
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index]!;
+    if (inQuotes) {
+      if (character === "\"") {
+        if (line[index + 1] === "\"") {
+          cell += "\"";
+          index += 1;
+        } else {
+          inQuotes = false;
+          closedQuote = true;
+        }
+      } else {
+        cell += character;
+      }
+      continue;
+    }
+
+    if (closedQuote) {
+      if (character === delimiter) {
+        pushCell();
+      } else if (!/\s/.test(character)) {
+        throw new SyntaxError("Reference tables contain a malformed quoted CSV field.");
+      }
+      continue;
+    }
+
+    if (character === delimiter) {
+      pushCell();
+    } else if (character === "\"") {
+      if (cell.trim().length > 0) {
+        throw new SyntaxError("Reference tables contain a malformed quoted CSV field.");
+      }
+      cell = "";
+      inQuotes = true;
+    } else {
+      cell += character;
+    }
+  }
+
+  if (inQuotes) {
+    throw new SyntaxError("Reference tables contain an unterminated quoted CSV field.");
+  }
+  if (cells.length >= MAX_REFERENCE_COLUMNS) {
+    throw new RangeError(
+      "Reference tables may contain at most " + MAX_REFERENCE_COLUMNS + " columns.",
+    );
+  }
+  cells.push(cell.trim());
+  return cells;
+}
+
+function splitLine(
+  line: string,
+  header = false,
+  selectedDelimiter?: ReferenceDelimiter,
+): string[] {
+  const delimiter = selectedDelimiter ?? detectDelimitedSeparator([line]);
+  if (delimiter) return parseDelimitedLine(line, delimiter);
+
+  return parseWhitespaceLine(line, header);
+}
+
+function parseWhitespaceLine(line: string, header: boolean): string[] {
+  const cells: string[] = [];
+  let cell = "";
+  let inQuotes = false;
+  let closedQuote = false;
+  const minimumSeparatorLength = header ? 2 : 1;
+
+  const pushCell = (): void => {
+    if (cells.length >= MAX_REFERENCE_COLUMNS) {
+      throw new RangeError(
+        "Reference tables may contain at most " + MAX_REFERENCE_COLUMNS + " columns.",
+      );
+    }
+    cells.push(cell.trim());
+    cell = "";
+    closedQuote = false;
+  };
+
+  for (let index = 0; index < line.length; index += 1) {
+    const character = line[index]!;
+    if (inQuotes) {
+      if (character === "\"") {
+        if (line[index + 1] === "\"") {
+          cell += "\"";
+          index += 1;
+        } else {
+          inQuotes = false;
+          closedQuote = true;
+        }
+      } else {
+        cell += character;
+      }
+      continue;
+    }
+
+    if (/\s/.test(character)) {
+      let end = index + 1;
+      while (end < line.length && /\s/.test(line[end]!)) end += 1;
+      const whitespaceRun = line.slice(index, end);
+      if (whitespaceRun.length >= minimumSeparatorLength) {
+        pushCell();
+      } else if (!closedQuote) {
+        cell += whitespaceRun;
+      }
+      index = end - 1;
+      continue;
+    }
+
+    if (closedQuote) {
+      throw new SyntaxError("Reference tables contain a malformed quoted CSV field.");
+    }
+    if (character === "\"") {
+      if (cell.trim().length > 0) {
+        throw new SyntaxError("Reference tables contain a malformed quoted CSV field.");
+      }
+      cell = "";
+      inQuotes = true;
+    } else {
+      cell += character;
+    }
+  }
+
+  if (inQuotes) {
+    throw new SyntaxError("Reference tables contain an unterminated quoted CSV field.");
+  }
+  if (cells.length >= MAX_REFERENCE_COLUMNS) {
+    throw new RangeError(
+      "Reference tables may contain at most " + MAX_REFERENCE_COLUMNS + " columns.",
+    );
+  }
+  cells.push(cell.trim());
+  return cells;
+}
+
+function quoteStateAfterLine(line: string, inQuotes: boolean): boolean {
+  for (let index = 0; index < line.length; index += 1) {
+    if (line[index] !== "\"") continue;
+    if (inQuotes && line[index + 1] === "\"") {
+      index += 1;
+    } else {
+      inQuotes = !inQuotes;
+    }
+  }
+  return inQuotes;
+}
+
+function splitReferenceRecords(text: string): ReferenceInputRecord[] {
+  const records: ReferenceInputRecord[] = [];
+  let commentHeader: string | null = null;
+  let record = "";
+  let inQuotes = false;
+  let physicalLineCount = 0;
+  let lineStart = 0;
+
+  while (lineStart < text.length) {
+    physicalLineCount += 1;
+    if (physicalLineCount > MAX_REFERENCE_PHYSICAL_LINES) {
+      throw new RangeError(
+        "Reference tables may contain at most " +
+          MAX_REFERENCE_PHYSICAL_LINES.toLocaleString("en-US") +
+          " physical lines.",
+      );
+    }
+    const newline = text.indexOf("\n", lineStart);
+    const lineEnd = newline < 0 ? text.length : newline;
+    const rawLine = text.slice(lineStart, lineEnd).replace(/\r$/, "");
+    lineStart = newline < 0 ? text.length : newline + 1;
+
+    const trimmedLine = rawLine.trim();
+    if (!inQuotes && record.length === 0) {
+      if (!trimmedLine) continue;
+      if (trimmedLine.startsWith("%") || trimmedLine.startsWith("#")) {
+        commentHeader = trimmedLine.replace(/^[%#]\s*/, "");
+        continue;
+      }
+    }
+
+    if (record.length > 0) record += "\n";
+    record += rawLine;
+    inQuotes = quoteStateAfterLine(rawLine, inQuotes);
+    if (!inQuotes) {
+      if (record.trim()) records.push({ text: record, commentHeader });
+      record = "";
+    }
+  }
+
+  if (inQuotes) {
+    throw new SyntaxError("Reference tables contain an unterminated quoted CSV field.");
+  }
+  if (record.trim()) records.push({ text: record, commentHeader });
+  return records;
 }
 
 /**
- * Reads CSV, TSV or whitespace tables. COMSOL `%` and `#` comment lines are
+ * Reads CSV, TSV or whitespace tables. COMSOL percent/hash comment lines are
  * skipped; the last comment line before the data provides column names when
  * the file has no plain header row.
  */
@@ -120,58 +328,59 @@ export function parseReferenceTable(text: string): ReferenceTable {
   if (typeof text !== "string") throw new TypeError("Reference table content must be text.");
   if (text.length > MAX_REFERENCE_TEXT_CHARACTERS) {
     throw new RangeError(
-      `Reference table text may not exceed ${MAX_REFERENCE_TEXT_CHARACTERS.toLocaleString("en-US")} characters.`,
+      "Reference table text may not exceed " +
+        MAX_REFERENCE_TEXT_CHARACTERS.toLocaleString("en-US") +
+        " characters.",
     );
   }
+
+  const records = splitReferenceRecords(text);
+  const selectedDelimiter = detectDelimitedSeparator(records.map((record) => record.text));
   let columns: string[] = [];
-  let lastComment: string[] = [];
   const rows: number[][] = [];
   let skippedRowCount = 0;
-  let physicalLineCount = 0;
   let nonCommentRecordCount = 0;
-  let lineStart = 0;
-  while (lineStart < text.length) {
-    physicalLineCount += 1;
-    if (physicalLineCount > MAX_REFERENCE_PHYSICAL_LINES) {
-      throw new RangeError(
-        `Reference tables may contain at most ${MAX_REFERENCE_PHYSICAL_LINES.toLocaleString("en-US")} physical lines.`,
-      );
-    }
-    const newline = text.indexOf("\n", lineStart);
-    const lineEnd = newline < 0 ? text.length : newline;
-    const rawLine = text.slice(lineStart, lineEnd).replace(/\r$/, "");
-    lineStart = newline < 0 ? text.length : newline + 1;
-    const line = rawLine.trim();
-    if (!line) continue;
-    if (line.startsWith("%") || line.startsWith("#")) {
-      lastComment = splitLine(line.replace(/^[%#]\s*/, ""), true);
-      continue;
-    }
+
+  for (const record of records) {
     nonCommentRecordCount += 1;
     if (nonCommentRecordCount > MAX_REFERENCE_DATA_ROWS + 1) {
       throw new RangeError(
-        `Reference tables may contain one header and at most ${MAX_REFERENCE_DATA_ROWS.toLocaleString("en-US")} data rows.`,
+        "Reference tables may contain one header and at most " +
+          MAX_REFERENCE_DATA_ROWS.toLocaleString("en-US") +
+          " data rows.",
       );
     }
-    const cells = splitLine(line);
+
+    const line = record.text.trim();
+    let commentColumns: string[] = [];
+    if (record.commentHeader !== null) {
+      try {
+        commentColumns = splitLine(record.commentHeader, true);
+      } catch (error) {
+        if (!(error instanceof SyntaxError)) throw error;
+      }
+    }
+    const cells = splitLine(line, false, selectedDelimiter);
     const hasEmptyCell = cells.some((cell) => cell.trim().length === 0);
     const values: number[] = hasEmptyCell ? [] : cells.map((cell) => Number(cell));
     if (!hasEmptyCell && values.every((value) => Number.isFinite(value))) {
       if (columns.length === 0) {
-        columns = lastComment.length === values.length
-          ? lastComment
-          : values.map((_, index) => `Column ${index + 1}`);
+        columns = commentColumns.length === values.length
+          ? commentColumns
+          : values.map((_, index) => "Column " + (index + 1));
       }
       if (values.length === columns.length) {
         if (rows.length >= MAX_REFERENCE_DATA_ROWS) {
           throw new RangeError(
-            `Reference tables may contain at most ${MAX_REFERENCE_DATA_ROWS.toLocaleString("en-US")} numeric data rows.`,
+            "Reference tables may contain at most " +
+              MAX_REFERENCE_DATA_ROWS.toLocaleString("en-US") +
+              " numeric data rows.",
           );
         }
         rows.push(values);
       } else skippedRowCount += 1;
     } else if (rows.length === 0 && columns.length === 0) {
-      columns = splitLine(line, true);
+      columns = splitLine(line, true, selectedDelimiter);
     } else {
       skippedRowCount += 1;
     }

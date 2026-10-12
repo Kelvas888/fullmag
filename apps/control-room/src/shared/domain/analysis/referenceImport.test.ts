@@ -34,13 +34,75 @@ describe("reference import", () => {
     expect(table.skippedRowCount).toBe(1);
   });
 
+  it("parses quoted CSV headers, escaped quotes, and separators inside fields", () => {
+    const table = parseReferenceTable(
+      '"k (rad/m)","frequency, ""GHz"""' + "\n" + '1,2' + "\n" + '3,4' + "\n",
+    );
+
+    expect(table.columns).toEqual(["k (rad/m)", 'frequency, "GHz"']);
+    expect(table.rows).toEqual([[1, 2], [3, 4]]);
+    expect(table.skippedRowCount).toBe(0);
+  });
+
+  it("detects semicolon separators outside quoted CSV fields", () => {
+    const table = parseReferenceTable(
+      '"k; axis";"frequency, GHz"' + "\n" + '1;2' + "\n" + '3;4' + "\n",
+    );
+
+    expect(table.columns).toEqual(["k; axis", "frequency, GHz"]);
+    expect(table.rows).toEqual([[1, 2], [3, 4]]);
+    expect(table.skippedRowCount).toBe(0);
+  });
+
+  it("keeps a multiline quoted header in one logical CSV record", () => {
+    const table = parseReferenceTable(
+      '"k (rad/m)","frequency,' + "\n" + 'GHz"' + "\n" + '1,2' + "\n" + '3,4' + "\n",
+    );
+
+    expect(table.columns).toEqual(["k (rad/m)", "frequency,\nGHz"]);
+    expect(table.rows).toEqual([[1, 2], [3, 4]]);
+    expect(table.skippedRowCount).toBe(0);
+  });
+
+  it("rejects malformed and unterminated quoted CSV fields", () => {
+    expect(() => parseReferenceTable('s,f' + "\n" + '1,"2"x' + "\n" + '3,4' + "\n"))
+      .toThrow(/malformed quoted CSV/);
+    expect(() => parseReferenceTable('s,f' + "\n" + '1,"2' + "\n" + '3,4' + "\n"))
+      .toThrow(/unterminated quoted CSV/);
+  });
+
   it("skips empty CSV cells without treating explicit zero as missing", () => {
     const table = parseReferenceTable(
-      "s,f,g\n1,2,3\n4,,6\n7,8,\n9,   ,11\n12,0,14\n",
+      "s,f,g\n1,2,3\n4,,6\n7,8,\n9,   ,11\n12,0,14\n13,\"\",15\n",
     );
     expect(table.columns).toEqual(["s", "f", "g"]);
     expect(table.rows).toEqual([[1, 2, 3], [12, 0, 14]]);
-    expect(table.skippedRowCount).toBe(3);
+    expect(table.skippedRowCount).toBe(4);
+  });
+
+  it("keeps quoted fields intact in whitespace tables and rejects malformed quotes", () => {
+    const table = parseReferenceTable("% k path  frequency GHz" + "\n" + "1  2" + "\n" + "3  4" + "\n");
+    expect(table.columns).toEqual(["k path", "frequency GHz"]);
+    expect(table.rows).toEqual([[1, 2], [3, 4]]);
+
+    const descriptiveComment = parseReferenceTable(
+      "% Description: " + '"Eigenfrequency"' + "\n" + "1,2" + "\n" + "3,4" + "\n",
+    );
+    expect(descriptiveComment.columns).toEqual(["Column 1", "Column 2"]);
+    expect(descriptiveComment.rows).toEqual([[1, 2], [3, 4]]);
+
+    const quotedHeader = parseReferenceTable(
+      '"k path"  "frequency GHz"' + "\n" + "1  2" + "\n" + "3  4" + "\n",
+    );
+    expect(quotedHeader.columns).toEqual(["k path", "frequency GHz"]);
+    expect(quotedHeader.rows).toEqual([[1, 2], [3, 4]]);
+
+    const singleCellRows = parseReferenceTable('"1 2"' + "\n" + '"3 4"' + "\n");
+    expect(singleCellRows.columns).toEqual(["1 2"]);
+    expect(singleCellRows.rows).toEqual([]);
+    expect(singleCellRows.skippedRowCount).toBe(1);
+
+    expect(() => parseReferenceTable('"a"x')).toThrow(/malformed quoted CSV/);
   });
 
   it("converts the mapped columns to SI and sorts along the path", () => {
