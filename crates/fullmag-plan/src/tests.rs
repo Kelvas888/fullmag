@@ -7583,6 +7583,7 @@ fn rotated_interfacial_dmi_rejects_eigen_and_frequency_domain_execution() {
             stage_autosave: None,
             outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -11089,6 +11090,7 @@ fn fem_eigen_backend_with_mesh_asset_plans_successfully() {
             outputs: vec![
                 fullmag_ir::OutputIR::EigenSpectrum {
                     quantity: "eigenfrequency".to_string(),
+                    scope: None,
                 },
                 fullmag_ir::OutputIR::EigenMode {
                     field: "mode".to_string(),
@@ -11262,6 +11264,7 @@ fn fem_eigen_carries_k0_kittel_validation_from_runtime_metadata() {
             stage_autosave: None,
             outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -11476,6 +11479,7 @@ fn fem_eigen_allows_k0_kittel_synthetic_demag_factor_floquet_path() {
             stage_autosave: None,
             outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -11660,6 +11664,7 @@ fn k0_periodic_airbox_fem_eigen_ir() -> ProblemIR {
             stage_autosave: None,
             outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -11729,6 +11734,7 @@ fn branch_selector_fem_eigen_ir(k_sampling: Option<fullmag_ir::KSamplingIR>) -> 
     *magnetostatic_bc = fullmag_ir::MagnetostaticBoundaryConditionIR::Open;
     sampling.outputs = vec![fullmag_ir::OutputIR::EigenSpectrum {
         quantity: "eigenfrequency".to_string(),
+        scope: None,
     }];
     ir
 }
@@ -11779,6 +11785,7 @@ fn set_eigen_mode_outputs(ir: &mut ProblemIR, outputs: Vec<fullmag_ir::OutputIR>
     };
     sampling.outputs = vec![fullmag_ir::OutputIR::EigenSpectrum {
         quantity: "eigenfrequency".to_string(),
+        scope: None,
     }];
     sampling.outputs.extend(outputs);
 }
@@ -12656,6 +12663,7 @@ fn fem_eigen_shared_domain_region_samples_equilibrium_once_per_object() {
             stage_autosave: None,
             outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -12757,6 +12765,7 @@ fn fem_eigen_backend_interfacial_dmi_defaults_interface_normal_to_z_in_strict_mo
             stage_autosave: None,
             outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -12863,6 +12872,7 @@ fn fem_eigen_auto_demag_resolves_to_poisson_robin_on_shared_domain_mesh_with_air
             stage_autosave: None,
             outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -12966,6 +12976,7 @@ fn fem_eigen_periodic_bc_requires_periodic_node_pairs() {
             stage_autosave: None,
             outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -13063,6 +13074,7 @@ fn fem_eigen_periodic_bc_with_pairs_plans_successfully() {
             stage_autosave: None,
             outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -13157,6 +13169,7 @@ fn fem_eigen_floquet_bc_with_pairs_and_k_sampling_plans_successfully() {
             stage_autosave: None,
             outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -13277,6 +13290,7 @@ fn fem_eigen_floquet_dynamic_demag_requires_explicit_airbox_cpu_path() {
             stage_autosave: None,
             outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -13675,6 +13689,7 @@ fn fem_eigen_surface_anisotropy_requires_positive_ks_and_axis() {
             stage_autosave: None,
             outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -19534,6 +19549,7 @@ mod eigen_spectrum_quantity_validation_tests {
     fn spectrum(quantity: &str) -> OutputIR {
         OutputIR::EigenSpectrum {
             quantity: quantity.to_string(),
+            scope: None,
         }
     }
 

@@ -4999,6 +4999,7 @@ fn eigenmodes_with_spectrum_and_mode_outputs_validate() {
             outputs: vec![
                 OutputIR::EigenSpectrum {
                     quantity: "eigenfrequency".to_string(),
+                    scope: None,
                 },
                 OutputIR::EigenMode {
                     field: "mode".to_string(),
@@ -5114,7 +5115,8 @@ fn eigenmodes_k0_kittel_validation_runtime_metadata_deserializes_to_typed_ir() {
             table_autosave: None,
             stage_autosave: None,
             outputs: vec![OutputIR::EigenSpectrum {
-                quantity: "eigenfrequency".to_string()
+                quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -5208,7 +5210,8 @@ fn eigenmodes_closed_k_path_sample_count_and_segment_length_validate() {
             stage_autosave: None,
             outputs: vec![
                 OutputIR::EigenSpectrum {
-                    quantity: "eigenfrequency".to_string()
+                    quantity: "eigenfrequency".to_string(),
+                    scope: None,
                 },
                 OutputIR::DispersionCurve {
                     name: "dispersion".to_string(),
@@ -5263,7 +5266,8 @@ fn eigenmodes_rejects_closed_k_path_with_open_segment_count() {
             table_autosave: None,
             stage_autosave: None,
             outputs: vec![OutputIR::EigenSpectrum {
-                quantity: "eigenfrequency".to_string()
+                quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,
@@ -6235,6 +6239,7 @@ fn eigenmodes_accept_and_retain_diagnostics_only_and_mixed_outputs() {
         diagnostics.clone(),
         OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         },
     ];
     if let StudyIR::Eigenmodes { sampling, .. } = &mut ir.study {
@@ -8879,4 +8884,72 @@ fn eigen_spectrum_quantity_is_semantically_canonical_and_raw_wire_round_trips() 
             "expected {expected:?}, got {errors:?}"
         );
     }
+}
+
+#[test]
+fn eigen_spectrum_scope_is_typed_and_legacy_wire_defaults_to_per_sample() {
+    let legacy = serde_json::to_value(
+        eigenmodes_problem_with_spectrum_quantity("eigenfrequency"),
+    )
+    .unwrap();
+    assert!(legacy["study"]["sampling"]["outputs"][0]
+        .get("scope")
+        .is_none());
+
+    let decoded_legacy: ProblemIR = serde_json::from_value(legacy.clone())
+        .expect("legacy spectrum output without scope remains readable");
+    decoded_legacy.validate().expect("legacy spectrum scope remains semantically valid");
+    let legacy_output = decoded_legacy
+        .study
+        .sampling()
+        .outputs
+        .first()
+        .expect("spectrum output should exist");
+    assert_eq!(
+        legacy_output.effective_eigen_spectrum_scope(),
+        Some(EigenSpectrumScopeIR::PerSample)
+    );
+    assert_eq!(
+        serde_json::to_value(&decoded_legacy).unwrap(),
+        legacy,
+        "legacy wire form without scope must round-trip unchanged"
+    );
+
+    for (wire_scope, expected_scope) in [
+        ("per_sample", EigenSpectrumScopeIR::PerSample),
+        ("global", EigenSpectrumScopeIR::Global),
+    ] {
+        let mut encoded = legacy.clone();
+        encoded["study"]["sampling"]["outputs"][0]["scope"] =
+            serde_json::Value::String(wire_scope.to_string());
+        let decoded: ProblemIR = serde_json::from_value(encoded.clone())
+            .expect("supported scope should deserialize through ProblemIR");
+        decoded.validate().expect("supported authored scope remains semantically valid");
+        let output = decoded
+            .study
+            .sampling()
+            .outputs
+            .first()
+            .expect("spectrum output should exist");
+        assert_eq!(
+            output.effective_eigen_spectrum_scope(),
+            Some(expected_scope),
+            "scope {wire_scope:?} should remain effective"
+        );
+        assert_eq!(
+            serde_json::to_value(&decoded).unwrap(),
+            encoded,
+            "explicit scope {wire_scope:?} should round-trip unchanged"
+        );
+    }
+
+    let mut unknown_scope = legacy;
+    unknown_scope["study"]["sampling"]["outputs"][0]["scope"] =
+        serde_json::Value::String("per_run".to_string());
+    let error = serde_json::from_value::<ProblemIR>(unknown_scope)
+        .expect_err("unknown explicit spectrum scope must not be silently discarded");
+    assert!(
+        error.to_string().contains("unknown variant"),
+        "expected an enum deserialization error, got {error}"
+    );
 }

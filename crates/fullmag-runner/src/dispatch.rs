@@ -6457,6 +6457,7 @@ mod tests {
     fn k_path_public_mode_indices_follow_requested_dispersion_outputs() {
         let no_dispersion = vec![OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }];
         assert_eq!(
             eigen_path_public_mode_indices(&no_dispersion, 2),
@@ -6534,7 +6535,8 @@ mod tests {
             legacy_fem_eigen_execution(FemEngine::CpuNative),
             &plan,
             &[OutputIR::EigenSpectrum {
-                quantity: "eigenfrequency".to_string()
+                quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         )
         .expect_err("provided equilibrium without a certified handoff must fail closed");
@@ -8360,7 +8362,8 @@ mod tests {
             legacy_fem_eigen_execution(FemEngine::CpuNative),
             &plan,
             &[OutputIR::EigenSpectrum {
-                quantity: "eigenfrequency".to_string()
+                quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         )
         .expect("K0-3a synthetic demag factor path should bypass Floquet dynamic-demag guard");
@@ -8751,7 +8754,8 @@ mod tests {
             &plan,
             &[
                 OutputIR::EigenSpectrum {
-                    quantity: "eigenfrequency".to_string()
+                    quantity: "eigenfrequency".to_string(),
+                    scope: None,
                 },
                 OutputIR::DispersionCurve {
                     name: "dispersion".to_string(),

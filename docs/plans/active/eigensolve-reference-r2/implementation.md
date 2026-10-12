@@ -1079,3 +1079,15 @@ GHA38239150905 na f6389eadd SUCCESS:239tests21files, typy/architektura/scopedDoc
 ## Wyczerpanie rewizji definicji
 
 4246863048: checked_add po istniejących guardach scene revision i owner, przed replacement/commit. HTTP409 kod postprocessing_definition_revision_overflow bez panic/wrap. Real router tests importują serde-roundtrip authoring-validated scene z definitionMAX, PATCH409 i GET potwierdzają niezmieniony label/revision/scene; nearMAX PATCH zwiększa doMAX i scene4->5 dokładnie raz. Istniejące400owner/id i409scene nie zmienione. Parser/source review PASS; dedykowany hosted module job i named log guards wymagane.
+
+
+GHA38240680441 SUCCESS:4actualHTTPdefinition tests,83session,28resultdatasets,3physicalfieldcases. GHA38238582251 SUCCESS4/4nativeCTest: damping admission, phase convention, selected-window stability/count-unavailable oraz typedCPUtransport zawierający nowe K0policycase. Potwierdza poprawki4246863048/3053 w zakresach kontraktów. Pełny Floquet i nauka NOT VERIFIED; nowy pattern carrier pending38241463969.
+
+
+## Fundament typed scope w IR
+
+4060116242 etap1: OutputIR::EigenSpectrum zachowuje optional scope enum per_sample/global. Historical omission nadal serialize omission, effective defaultper_sample; unknownexplicit serde error. Rzeczywisty ProblemIR roundtrip zachowuje oba scope i przechodzi semantic validation. Legacy literal constructors95 dostaly scopeNone; authored output clones bez zmian. Nie zmieniono nativeABI/solverow ani wyboru backend/device.
+
+Source scan100constructors, missingfields0 i partialpatterns0. Rustfmtcheck wykazal dawne formatdiffs; nie wykonano masowego formatowania ani lokalnych testow/buildow. Nowy hosted gate: IR+planner+application+runner suites oraz integration callers/API/CLI compile. GHA pending. Manifest/API/UI jeszcze nie korzystaja ze scope; uwaga4060116242 nadal otwarta, stage1 nie jest pelnym wdrozeniem.
+
+NativeFEM ma wlasne writers eigen_output.rs oraz eigen_path_manifest.rs, obok genericmodalmanifest. Stage2 musi objac oba. MultipleSaveSpectrum outputs moga prosic o obie scope; nie wybierac arbitralnie jednej. Oddzielic publication output scope od numerical spectrum_scope=selected.

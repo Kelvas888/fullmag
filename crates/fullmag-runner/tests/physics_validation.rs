@@ -956,6 +956,7 @@ fn fem_eigen_smoke_completes_without_errors() {
     let outputs = vec![
         OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         },
         OutputIR::EigenMode {
             field: "mode".to_string(),
@@ -1150,6 +1151,7 @@ fn macrospin_kittel_frequency_order_of_magnitude() {
 
     let outputs = vec![OutputIR::EigenSpectrum {
         quantity: "eigenfrequency".to_string(),
+        scope: None,
     }];
 
     let result = fullmag_runner::run_reference_fem_eigen(&plan, &outputs)
@@ -1227,6 +1229,7 @@ fn fem_eigen_modes_are_non_trivial() {
     let outputs = vec![
         OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         },
         OutputIR::EigenMode {
             field: "mode".to_string(),
@@ -1340,6 +1343,7 @@ fn dense_eigen_exports_relative_residuals() {
         &[
             OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             },
             OutputIR::EigenMode {
                 field: "mode".to_string(),
@@ -1448,6 +1452,7 @@ fn dense_eigen_exports_tangent_leakage() {
         &[
             OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             },
             OutputIR::EigenMode {
                 field: "mode".to_string(),
@@ -1529,6 +1534,7 @@ fn dense_eigen_frequency_units_are_hz_and_rad_s() {
         &[
             OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             },
             OutputIR::EigenMode {
                 field: "mode".to_string(),
@@ -1640,6 +1646,7 @@ fn fem_eigen_frequency_is_stable_across_resolutions() {
         };
         let outputs = vec![OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }];
         let result = fullmag_runner::run_reference_fem_eigen(&plan, &outputs)
             .expect("FEM eigen convergence run must succeed");
@@ -1731,6 +1738,7 @@ fn fem_eigen_periodic_k_zero_runs_with_periodic_node_pairs() {
         &plan,
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
     )
     .expect("periodic k=0 FEM eigen solve should execute");
@@ -1808,6 +1816,7 @@ fn fem_eigen_floquet_runs_with_phase_aware_metadata() {
         &plan,
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
     )
     .expect("floquet FEM eigen solve should execute");
@@ -1892,6 +1901,7 @@ fn fem_eigen_full_2x2_floquet_executes_nonidentity_tangent_frame_transport() {
         &[
             OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             },
             OutputIR::EigenMode {
                 field: "mode".to_string(),
@@ -2023,6 +2033,7 @@ fn fem_eigen_scalar_floquet_still_rejects_nonidentity_tangent_frame_transport() 
         &plan,
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
     )
     .expect_err("scalar Floquet modal path must reject nonidentity tangent-frame transport");
@@ -2087,6 +2098,7 @@ fn fem_eigen_damping_include_emits_nonzero_imaginary_frequency() {
         &plan,
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
     )
     .expect("damped FEM eigen solve should execute");
@@ -2156,6 +2168,7 @@ fn fem_eigen_surface_anisotropy_runs_and_reports_term() {
         &plan,
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
     )
     .expect("surface anisotropy FEM eigen solve should execute");
@@ -2238,6 +2251,7 @@ fn fem_eigen_floquet_exchange_only_is_reciprocal_for_plus_minus_k() {
             &plan,
             &[OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         )
         .expect("floquet exchange-only FEM eigen solve should execute");
@@ -2325,6 +2339,7 @@ fn fem_eigen_full_2x2_floquet_exchange_dispersion_matches_analytic() {
             &plan,
             &[OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         )
         .expect("full2x2 Floquet exchange-only FEM eigen solve should execute");
@@ -2425,6 +2440,7 @@ fn fem_eigen_floquet_bulk_dmi_is_nonreciprocal_for_plus_minus_k() {
             &plan,
             &[OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         )
         .expect("floquet bulk DMI FEM eigen solve should execute");
@@ -2513,6 +2529,7 @@ fn fem_eigen_demag_lowers_frequency() {
 
     let outputs = vec![OutputIR::EigenSpectrum {
         quantity: "eigenfrequency".to_string(),
+        scope: None,
     }];
 
     let result_no_demag = fullmag_runner::run_reference_fem_eigen(&make_plan(false), &outputs)
@@ -2620,6 +2637,7 @@ fn fem_eigen_poisson_robin_demag_runs_on_shared_domain_mesh() {
 
     let outputs = [OutputIR::EigenSpectrum {
         quantity: "eigenfrequency".to_string(),
+        scope: None,
     }];
 
     let result = fullmag_runner::run_reference_fem_eigen(&plan, &outputs)
@@ -2703,6 +2721,7 @@ fn eigen_bc_free_baseline() {
         &plan,
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
     )
     .expect("Free BC eigen solve must succeed");
@@ -2814,6 +2833,7 @@ fn eigen_bc_pinned_higher_frequency() {
         &make_plan(false),
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
     )
     .expect("Free BC eigen solve must succeed");
@@ -2822,6 +2842,7 @@ fn eigen_bc_pinned_higher_frequency() {
         &make_plan(true),
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
     );
 
@@ -2929,6 +2950,7 @@ fn eigen_bc_periodic_requires_pairs_error() {
         &plan,
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
     );
 
@@ -3022,6 +3044,7 @@ fn eigen_bc_periodic_k_zero_matches_free() {
         &make_plan(false),
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
     )
     .expect("Free BC must succeed");
@@ -3030,6 +3053,7 @@ fn eigen_bc_periodic_k_zero_matches_free() {
         &make_plan(true),
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
     )
     .expect("Periodic k=0 must succeed");
@@ -3116,6 +3140,7 @@ fn floquet_k0_equals_periodic() {
 
     let outputs = [OutputIR::EigenSpectrum {
         quantity: "eigenfrequency".to_string(),
+        scope: None,
     }];
     let periodic = fullmag_runner::run_reference_fem_eigen(
         &make_plan(fullmag_ir::SpinWaveBoundaryKindIR::Periodic),
@@ -3241,6 +3266,7 @@ fn fem_eigen_path_writes_v2_dispersion_artifacts() {
         &[
             OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             },
             OutputIR::EigenMode {
                 field: "mode".to_string(),
@@ -3728,6 +3754,7 @@ fn fem_eigen_path_executes_full_2x2_nonzero_k_floquet_phase_reduction() {
         &[
             OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             },
             OutputIR::EigenMode {
                 field: "mode".to_string(),
@@ -3878,6 +3905,7 @@ fn fem_eigen_path_rejects_floquet_dynamic_demag_before_sample_solves() {
         &plan,
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
     )
     .expect_err("modal Floquet k-path with demag must reject before sample solves");
@@ -3966,6 +3994,7 @@ fn fem_eigen_path_frequency_window_writes_window_diagnostics() {
         &plan,
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
     )
     .expect("path frequency-window eigensolve should not panic or fail");
@@ -4070,6 +4099,7 @@ fn fem_eigen_single_k_dispersion_request_writes_v2_dispersion_artifact() {
         &[
             OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             },
             OutputIR::DispersionCurve {
                 name: "dispersion".to_string(),

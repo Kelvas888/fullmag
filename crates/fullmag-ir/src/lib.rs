@@ -2982,7 +2982,7 @@ for output in &study.sampling().outputs {
                 ));
             }
         }
-        OutputIR::EigenSpectrum { quantity } => {
+        OutputIR::EigenSpectrum { quantity, .. } => {
             if quantity.trim().is_empty() {
                 errors.push("eigen_spectrum quantity must not be empty".to_string());
             } else if !is_supported_eigen_spectrum_quantity(quantity) {

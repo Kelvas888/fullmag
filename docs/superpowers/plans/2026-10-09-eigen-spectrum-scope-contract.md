@@ -33,3 +33,14 @@ Obecny manifest zawiera pojedyncze spectrum_v2_path/resource_key. W wariancie os
 ## Weryfikacja wyłącznie GitHub Actions
 
 V03/V04 default i obie wartości, invalid/null rejection, Python atomicity i skrypt round-trip, plan retention, legalne mieszane outputs, real global/per-sample writers dla co najmniej dwóch próbek, single-k native/reference i bias-field; indeks/manifest membership/stable order/identity; API resource i Inspector/chart model; wymagany browser proof zmiany zachowania UI. Sukces fixture lub źródłowego parsera nie kwalifikuje dyspersji fizycznie.
+
+
+## Aktualna lokalizacja utraty i wdrozenie - 12.10.2026
+
+SaveSpectrum.to_ir emituje scope; OutputIR::EigenSpectrum ma tylko quantity i serde ignoruje authored scope. To nie jest argument native ModalEigenRequest. Zgodnie z0600, k pozostaje parametrem osobnego operatora; scope nie zmienia fizyki/damping/residual ani nie agreguje czestotliwosci.
+
+Etap1 przywraca typed intent w IR: optional enum per_sample/global, brak pola w historicalwire pozostaje omission z efektywnym defaultper_sample. Unknown explicit value musi byc odrzucona. Callers tylko mechanical preservation; nigdy nie przepisac global na default przy rekonstrukcji OutputIR. PublicPython juzpoprawny, nativeABI bez zmian.
+
+Etap2 przenosi scope przez outputs selection i writer do distinct spectrum_output_scope w manifest. Nie kolidowac z Poisson certificate spectrum_scope=selected. V3 pozostaje nieusredniona kolekcja; per_sample wskazuje istniejace sample_id resource addresses, global adres kolekcji. Etap3: API/UI wybieraja zasob wedlug authored scope przez istniejacy typowany ResultsAPI; brak nowych bocznych fetch/endpoints. Etap4: actualPython->Rustparse->writer->manifest->Resultsresource regression, hostedRust+UI+browser proof. Sama metadata nie zamyka4060116242.
+
+Wszystkie etapy sa autoryzowana realizacja zaakceptowanej decyzji uzytkownika; sourcefoundation nie jest pelnym wdrozeniem ani kwalifikacja naukowa.

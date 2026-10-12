@@ -2125,6 +2125,7 @@ mod tests {
                 stage_autosave: None,
                 outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                     quantity: "eigenfrequency".to_string(),
+                    scope: None,
                 }],
             },
         };

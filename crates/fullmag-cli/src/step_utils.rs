@@ -6059,6 +6059,7 @@ mod tests {
         sampling.outputs = vec![
             fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "spectrum".to_string(),
+                scope: None,
             },
             fullmag_ir::OutputIR::EigenMode {
                 field: "mode".to_string(),
@@ -6245,6 +6246,7 @@ mod tests {
         let mut sampling = eigen_ir.study.sampling().clone();
         sampling.outputs = vec![fullmag_ir::OutputIR::EigenSpectrum {
             quantity: "spectrum".to_string(),
+            scope: None,
         }];
         eigen_ir.study = fullmag_ir::StudyIR::Eigenmodes {
             dynamics,
@@ -6310,6 +6312,7 @@ mod tests {
                 },
                 fullmag_ir::OutputIR::EigenSpectrum {
                     quantity: "spectrum".to_string(),
+                    scope: None,
                 },
                 fullmag_ir::OutputIR::EigenMode {
                     field: "mode".to_string(),
@@ -6413,6 +6416,7 @@ mod tests {
         sampling.outputs = vec![
             fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "spectrum".to_string(),
+                scope: None,
             },
             fullmag_ir::OutputIR::EigenMode {
                 field: "mode".to_string(),

@@ -1269,6 +1269,7 @@ fn eigen_sampling_from(base: &fullmag_ir::SamplingIR, mode_count: u32) -> fullma
     }) {
         outputs.push(fullmag_ir::OutputIR::EigenSpectrum {
             quantity: fullmag_ir::CANONICAL_EIGEN_SPECTRUM_QUANTITY.to_string(),
+            scope: None,
         });
     }
     fullmag_ir::SamplingIR {
@@ -3669,6 +3670,7 @@ mod pipeline_eigen_solver_policy_tests {
                 sampling.outputs,
                 vec![fullmag_ir::OutputIR::EigenSpectrum {
                     quantity: fullmag_ir::CANONICAL_EIGEN_SPECTRUM_QUANTITY.to_string(),
+                    scope: None,
                 }],
                 "{base_kind} base should receive only the canonical spectrum fallback"
             );
@@ -3683,6 +3685,7 @@ mod pipeline_eigen_solver_policy_tests {
         let explicit_outputs = vec![
             fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: fullmag_ir::CANONICAL_EIGEN_SPECTRUM_QUANTITY.to_string(),
+                scope: None,
             },
             fullmag_ir::OutputIR::EigenMode {
                 field: "mode".to_string(),

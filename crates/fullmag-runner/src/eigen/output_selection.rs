@@ -420,7 +420,7 @@ pub(crate) fn validate_eigen_spectrum_quantities(
     outputs: &[OutputIR],
 ) -> Result<(), OutputSelectionError> {
     for output in outputs {
-        if let OutputIR::EigenSpectrum { quantity } = output {
+        if let OutputIR::EigenSpectrum { quantity, .. } = output {
             if !is_supported_eigen_spectrum_quantity(quantity) {
                 return Err(OutputSelectionError::UnsupportedSpectrumQuantity(
                     quantity.clone(),
@@ -956,6 +956,7 @@ mod tests {
         for quantity in ["", "eigenvalue", "amplitude", "frequency_hz"] {
             let outputs = [OutputIR::EigenSpectrum {
                 quantity: quantity.to_string(),
+                scope: None,
             }];
             let before = outputs.clone();
 
@@ -970,6 +971,7 @@ mod tests {
 
         let outputs = [OutputIR::EigenSpectrum {
             quantity: " eigenfrequency ".to_string(),
+            scope: None,
         }];
         let selection = select_eigen_outputs(&path_result, &outputs).unwrap();
         assert!(selection.has_spectrum_output());
@@ -982,6 +984,7 @@ mod tests {
             &[
                 OutputIR::EigenSpectrum {
                     quantity: "eigenfrequency".to_string(),
+                    scope: None,
                 },
                 OutputIR::DispersionCurve {
                     name: " bands ".to_string(),

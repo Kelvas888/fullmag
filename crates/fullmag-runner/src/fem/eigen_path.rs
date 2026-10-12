@@ -716,6 +716,7 @@ pub(crate) mod test_support {
         let outputs = vec![
             OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".into(),
+                scope: None,
             },
             OutputIR::DispersionCurve {
                 name: "dispersion".into(),

@@ -87,7 +87,7 @@ fn output_name(output: &OutputIR) -> String {
         OutputIR::Snapshot {
             field, component, ..
         } => format!("{field}:{component}"),
-        OutputIR::EigenSpectrum { quantity } => quantity.clone(),
+        OutputIR::EigenSpectrum { quantity, .. } => quantity.clone(),
         OutputIR::EigenMode { field, .. } => field.clone(),
         OutputIR::FrequencyResponseOutput { .. } => "frequency_response".into(),
         OutputIR::EigenDiagnostics { .. } => "eigen_diagnostics".into(),

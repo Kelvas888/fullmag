@@ -1829,6 +1829,7 @@ mod output_publication_tests {
                 &plan,
                 &[OutputIR::EigenSpectrum {
                     quantity: "eigenfrequency".to_string(),
+                    scope: None,
                 }],
                 &plan.equilibrium_magnetization,
                 &reduction,
@@ -2639,6 +2640,7 @@ pub(in crate::fem) fn eigen_path_tracking_outputs(outputs: &[OutputIR], mode_cou
     {
         tracking_outputs.push(OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         });
     }
 

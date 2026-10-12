@@ -6118,6 +6118,7 @@ pub(crate) fn plan_fem_frequency_response(
             stage_autosave: None,
             outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         },
         mode_tracking: None,

@@ -959,7 +959,7 @@ pub(crate) fn validate_eigen_outputs(
         matches!(k_sampling, Some(KSamplingIR::Path { .. })) || gamma_bias_field_sweep;
     for output in outputs {
         match output {
-            OutputIR::EigenSpectrum { quantity } => {
+            OutputIR::EigenSpectrum { quantity, .. } => {
                 if !fullmag_ir::is_supported_eigen_spectrum_quantity(quantity) {
                     errors.push(format!(
                         "eigen_spectrum quantity '{quantity}' is unsupported; supported quantity is '{}'",

@@ -7004,6 +7004,7 @@ fn eigen_path_single_k_floquet_shared_domain_production_summary_artifacts(
         plan,
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
         &plan.equilibrium_magnetization,
         &empty_reduction,
@@ -7082,6 +7083,7 @@ pub(super) fn canonical_production_shift_invert_summary_for_path_test(
         plan,
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
         &plan.equilibrium_magnetization,
         &empty_reduction,
@@ -9923,6 +9925,7 @@ fn cpu_full_2x2_frequency_window_uses_native_modal_artifact_path() {
         &[
             OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             },
             OutputIR::EigenMode {
                 field: "mode".to_string(),
@@ -10003,6 +10006,7 @@ fn native_modal_artifact_limitations_follow_executed_operator_payload() {
             &plan,
             &[OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
             &equilibrium,
             &reduction,
@@ -10419,6 +10423,7 @@ fn cpu_full_2x2_nonzero_floquet_window_uses_native_bloch_payload_artifact_path()
         &[
             OutputIR::EigenSpectrum {
                 quantity: "eigenfrequency".to_string(),
+                scope: None,
             },
             OutputIR::EigenMode {
                 field: "mode".to_string(),
@@ -10525,6 +10530,7 @@ fn cpu_full_2x2_frequency_window_progress_and_provenance_report_shift_invert() {
         &plan,
         &[OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }],
         &mut progress,
     )
@@ -11083,6 +11089,7 @@ fn spectrum_quantity_manual_single_k_planned_entry_rejects_before_callbacks() {
         .expect("bounded single-k CPU resolution should produce a planned execution");
     let outputs = [OutputIR::EigenSpectrum {
         quantity: "frequency_hz".to_string(),
+        scope: None,
     }];
     let before = outputs.clone();
     let callback_count = std::sync::atomic::AtomicUsize::new(0);
@@ -11492,6 +11499,7 @@ fn reference_include_method_evidence_reaches_spectrum_v2_diagnostics_and_manifes
     .expect("the small in-memory plan should create an accepted-equilibrium fixture");
     let outputs = [OutputIR::EigenSpectrum {
         quantity: "eigenfrequency".to_string(),
+        scope: None,
     }];
 
     let run = execute_fem_eigen_inner(
@@ -11631,6 +11639,7 @@ fn relaxed_path_source_fixture_handoff_is_reused_for_each_nonzero_k_sample_witho
     let outputs = [
         OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         },
         OutputIR::DispersionCurve {
             name: "dispersion".to_string(),

@@ -1,0 +1,41 @@
+name: eigensolve-spectrum-scope-contracts
+on:
+  workflow_dispatch:
+  push:
+    branches: ['codex/eigensolve-dispersion-plan-20260912']
+    paths:
+      - 'crates/fullmag-ir/**'
+      - 'crates/fullmag-plan/**'
+      - 'crates/fullmag-application/**'
+      - 'crates/fullmag-runner/**'
+      - 'crates/fullmag-cli/**'
+      - '.github/workflows/eigensolve-spectrum-scope-contracts.yml'
+permissions:
+  contents: read
+jobs:
+  scope-source-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      RUST_MIN_STACK: 16777216
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Preserve exact source identity
+        run: git rev-parse HEAD
+      - name: Verify authored scopes and unchanged legacy ProblemIR wire format
+        run: |
+          set -o pipefail
+          cargo test --locked -p fullmag-ir --test ir_tests eigen_spectrum_scope_is_typed_and_legacy_wire_defaults_to_per_sample -- --exact --nocapture | tee "$RUNNER_TEMP/eigen-spectrum-scope.log"
+          grep -F "eigen_spectrum_scope_is_typed_and_legacy_wire_defaults_to_per_sample ... ok" "$RUNNER_TEMP/eigen-spectrum-scope.log"
+      - name: Run complete IR and planner contracts
+        run: cargo test --locked -p fullmag-ir -p fullmag-plan --no-fail-fast
+      - name: Run complete application materialization contracts
+        run: cargo test --locked -p fullmag-application --lib --no-fail-fast
+      - name: Run complete runner contracts
+        run: cargo test --locked -p fullmag-runner --lib --no-fail-fast
+      - name: Compile integration callers and API CLI binaries
+        run: |
+          cargo check --locked -p fullmag-runner --tests
+          cargo check --locked -p fullmag-cli -p fullmag-api --bins

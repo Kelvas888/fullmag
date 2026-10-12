@@ -1681,6 +1681,19 @@ impl StudyIR {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EigenSpectrumScopeIR {
+    PerSample,
+    Global,
+}
+
+impl Default for EigenSpectrumScopeIR {
+    fn default() -> Self {
+        Self::PerSample
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OutputIR {
@@ -1719,6 +1732,8 @@ pub enum OutputIR {
     },
     EigenSpectrum {
         quantity: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scope: Option<EigenSpectrumScopeIR>,
     },
     EigenMode {
         field: String,
@@ -1764,6 +1779,16 @@ pub enum OutputIR {
         #[serde(skip_serializing_if = "Option::is_none")]
         component: Option<String>,
     },
+}
+
+impl OutputIR {
+    /// Returns the effective spectrum scope, defaulting legacy outputs to per-sample.
+    pub fn effective_eigen_spectrum_scope(&self) -> Option<EigenSpectrumScopeIR> {
+        match self {
+            Self::EigenSpectrum { scope, .. } => Some(scope.unwrap_or_default()),
+            _ => None,
+        }
+    }
 }
 
 fn default_include_branch_table() -> bool {
