@@ -296,13 +296,13 @@ export function magneticParametersDraftFromResource(
   material: MaterialResource | null | undefined,
 ): MagneticParametersDraft {
   return {
-    aex: formatOptionalNumber(material?.properties.Aex),
-    alpha: formatRequiredNumber(material?.properties.alpha, 0.01),
-    dind: formatOptionalNumber(material?.properties.Dind),
-    dbulk: formatOptionalNumber(material?.properties.Dbulk),
+    aex: formatOptionalNumber(material?.properties?.Aex),
+    alpha: formatRequiredNumber(material?.properties?.alpha, 0.01),
+    dind: formatOptionalNumber(material?.properties?.Dind),
+    dbulk: formatOptionalNumber(material?.properties?.Dbulk),
     materialName: material?.name ?? "",
     materialRef: normalizeMaterialRef(materialRef ?? "") ?? "",
-    ms: formatOptionalNumber(material?.properties.Ms),
+    ms: formatOptionalNumber(material?.properties?.Ms),
   };
 }
 
@@ -314,11 +314,11 @@ export function materialParametersDraftKey(
     normalizeMaterialRef(materialRef ?? "") ?? "",
     material?.id ?? "missing",
     material?.name ?? "",
-    formatOptionalNumber(material?.properties.Ms),
-    formatOptionalNumber(material?.properties.Aex),
-    formatRequiredNumber(material?.properties.alpha, 0.01),
-    formatOptionalNumber(material?.properties.Dind),
-    formatOptionalNumber(material?.properties.Dbulk),
+    formatOptionalNumber(material?.properties?.Ms),
+    formatOptionalNumber(material?.properties?.Aex),
+    formatRequiredNumber(material?.properties?.alpha, 0.01),
+    formatOptionalNumber(material?.properties?.Dind),
+    formatOptionalNumber(material?.properties?.Dbulk),
   ].join(":");
 }
 
@@ -353,7 +353,7 @@ export function magneticParameterMaterialResourceFromSceneResource(
   scene: Pick<SceneResource, "materials" | "revision" | "scene_revision">,
 ): MaterialResource | null {
   const material = scene.materials?.find((candidate) => candidate.id === materialId);
-  if (!material || !material.id || typeof material.name !== "string") return null;
+  if (!material || !material.id || typeof material.name !== "string" || !material.properties) return null;
   const properties = material.properties;
   const aex = properties.Aex;
   const dbulk = properties.Dbulk;

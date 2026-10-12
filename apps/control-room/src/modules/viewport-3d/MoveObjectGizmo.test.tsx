@@ -200,6 +200,7 @@ describe("MoveObjectGizmo", () => {
       origin: [0, 0, 0],
     });
     controller.begin("x", 3, [0, 0, 0], vi.fn(), release);
+    controller.move(3, [1e-9, 0, 0]);
 
     await expect(controller.end(3)).rejects.toThrow("network");
 

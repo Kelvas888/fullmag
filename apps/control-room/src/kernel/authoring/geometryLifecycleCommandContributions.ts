@@ -652,6 +652,8 @@ function meshCommandKindMatches(actual: string, expected: ObservableMeshCommandK
   return actual === expected || (expected === "mesh_build" && actual === "remesh");
 }
 
+const MAX_RECONCILE_MESH_COMMANDS = 8;
+
 async function reconcileMeshSubmission(
   api: MeshCommandApi,
   operation: MeshBuildOperation,
@@ -661,7 +663,8 @@ async function reconcileMeshSubmission(
   const candidates = queue.commands.filter((entry) =>
     meshCommandKindMatches(entry.kind, operation.commandKind),
   )
-    .sort((left, right) => right.seq - left.seq);
+    .sort((left, right) => right.seq - left.seq)
+    .slice(0, MAX_RECONCILE_MESH_COMMANDS);
   for (const entry of candidates) {
     const detail = requestOptions
       ? await api.detail(entry.command_id, requestOptions)
