@@ -1119,6 +1119,17 @@
       "postprocessing_passed": 4,
       "field_cases_passed": 3,
       "evidence": "Actual ZIP/CAS auxiliary geometry export and preflight complete graph, invalid magnet material fail-closed; typed snapshot scanner and full session library regression. No browser or scientific qualification."
+    },
+    {
+      "run_id": 38290669920,
+      "sha": "ebda5536f95993d86b76ba29f7bf172c3a248cf2",
+      "conclusion": "failure",
+      "scope": "bounded_native_floquet_factor_logging",
+      "passed": 10,
+      "failed": 2,
+      "receipt_sha256": "d5580cdcd6e318beec55ad36b6009db419d5d9acbc4b49c11c8be15c470c74d4",
+      "native_log_sha256": "ca08ba4ef8e1def49e440405e939389a1f4a23d6823a8d576eaf0d023d8b0d8b",
+      "evidence": "Mat logging active; actual live Inode LU shift observed in both failed cases. Fresh numeric/ordering comparison and rootcause remain unverified; no tolerance changes."
     }
   ]
 }

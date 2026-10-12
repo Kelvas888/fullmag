@@ -61,3 +61,10 @@ Następny bounded hosted experiment: potwierdzić logging Mat, znaczniki fazy li
 Hosted floquet-modal-slepc profil żąda `PETSC_OPTIONS=-info :mat:self` i prywatnych znaczników live_setup/fresh_setup. Istniejące EPSSetUp/KSPSetUp pozostają wywołane dokładnie raz z tymi samymi argumentami/guardami. Znaczniki używają wyłącznie fprintf/fflush, nie PETSc query; end oznacza powrót call, nie poprawność solve. Konfigurację loggingu zapisuje receipt jako requested, nie observed. Następny actual CTest/log potwierdzi dostępność Mat logging oraz shift_nz tries/amount. Brak logu nie może być uznany za zero shift.
 
 Składnię i filtr potwierdzono w pinned [PETSc3.24.6 verboseinfo.c](https://raw.githubusercontent.com/petsc/petsc/v3.24.6/src/sys/info/verboseinfo.c). Mechanizm nie zmienia fizyki ani tolerancji i nie stanowi kwalifikacji. Odczyt dodatkowych matrix metadata/PCView pozostaje dalszym krokiem zależnym od wyniku tego logu.
+
+
+## Obserwowany actual shift — GHA 38290669920
+
+Na ebda5536f95993d86b76ba29f7bf172c3a248cf2 logging jest aktywne: 8130 MatInfo lines, 1468 phase lines (failure replay duplikuje część logu). Pełna bramka nadal10/12. W live_setup scope full case45 i mixed case74 (poprzednio73) `MatLUFactorNumeric_SeqAIJ_Inode` raportuje1shift_nz try i actualamount1.49012e-08. Bezpośrednio przed nim FactorLU wykrywa1inode obejmujący4wiersze. Jest9shift events w całym logu, żaden we fresh_setup scope; część pozostałych pochodzi z innego testu64.
+
+To wspiera hipotezę różnicy actual factorization, ale nie dowodzi jeszcze zero shift fresh ani przyczyny różnicy metadata/ordering. Potrzebne potwierdzenie numeric fresh logging i właściwej pary faktorów; nie zmieniono acceptance, tolerancji czy PC. Raw receipt/log hashes i bounded phase events zapisano w evidence `floquet-factor-shift-observation-38290669920.json`. Scientific/rootcause nadal NOT VERIFIED.
