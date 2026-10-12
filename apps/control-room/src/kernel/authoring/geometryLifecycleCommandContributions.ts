@@ -661,7 +661,7 @@ async function reconcileMeshSubmission(
   const candidates = queue.commands.filter((entry) =>
     meshCommandKindMatches(entry.kind, operation.commandKind),
   )
-    .sort((left, right) => right.seq - left.seq).slice(0, 8);
+    .sort((left, right) => right.seq - left.seq);
   for (const entry of candidates) {
     const detail = requestOptions
       ? await api.detail(entry.command_id, requestOptions)

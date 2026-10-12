@@ -3510,7 +3510,7 @@ function Viewport3DOrbitDebugSlider({
   value: number;
 }) {
   return (
-    <label className="fm-viewport-3d__orbit-debug-field">
+    <div className="fm-viewport-3d__orbit-debug-field">
       <span>{label}</span>
       <output>{value.toFixed(3)}</output>
       <input
@@ -3526,6 +3526,6 @@ function Viewport3DOrbitDebugSlider({
         onPointerDown={onInteractionStart}
         onPointerUp={onInteractionEnd}
       />
-    </label>
+    </div>
   );
 }

@@ -108,6 +108,10 @@ import {
   type DecodedTopology,
 } from "../api/codecs";
 import { ControlRoomApiError } from "../api/ControlRoomApi";
+import {
+  resolveArtifactAssessment,
+  type ArtifactAssessment,
+} from "@/shared/domain/mesh/artifactAssessment";
 import { useKernel } from "../KernelContext";
 import type { ResourceInvalidationController } from "./ResourceInvalidationController";
 import {
@@ -1965,3 +1969,36 @@ function resolveRevisionProperty(
 
   return null;
 }
+
+/**
+ * Single shared artifact assessment selector across Control Room (PR08/PR10/D06).
+ */
+export function useMeshArtifactAssessment(
+  options: ResourceHookOptions = {},
+): ArtifactAssessment {
+  const scene = useSceneResource(options);
+  const manifest = useMeshSharedDomainManifestResource(options);
+  const activeBuild = useMeshBuildCurrent(options);
+  const latestBuild = useMeshBuildLatestSuccessful(options);
+  const summary = useMeshSummaryResource(options);
+
+  return useMemo(() => {
+    return resolveArtifactAssessment({
+      activeBuild: activeBuild.data?.active_build,
+      latestBuild: latestBuild.data?.last_success,
+      manifest: manifest.data as Record<string, unknown> | null | undefined,
+      resourceLoadState: manifest.status,
+      sceneRevision: scene.data?.revision ?? scene.data?.scene_revision,
+      statusMeshRevision: summary.data?.revision,
+    });
+  }, [
+    activeBuild.data?.active_build,
+    latestBuild.data?.last_success,
+    manifest.data,
+    manifest.status,
+    scene.data?.revision,
+    scene.data?.scene_revision,
+    summary.data?.revision,
+  ]);
+}
+
