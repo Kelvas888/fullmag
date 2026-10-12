@@ -72,11 +72,7 @@ export function rebaseGeometryObjectDraft(
     const isDirty = Array.isArray(draftVal)
       ? JSON.stringify(draftVal) !== JSON.stringify(baseVal)
       : draftVal !== baseVal;
-    if (isDirty) {
-      (merged as Record<string, unknown>)[field] = draftVal;
-    } else {
-      (merged as Record<string, unknown>)[field] = targetVal;
-    }
+    Object.assign(merged, { [field]: isDirty ? draftVal : targetVal });
   }
   return merged;
 }

@@ -115,7 +115,7 @@ export function useViewport3DObjectMoveInteraction({
   }, [kernel.objectMoveTool]);
 
   useEffect(() => kernel.selection.subscribe((selection) => {
-    if (selectionSnapshotEquals(selectionSnapshotRef.current, selection)) return;
+    if (selectionSnapshotRef.current && selectionSnapshotEquals(selectionSnapshotRef.current, selection)) return;
     selectionSnapshotRef.current = selection;
     selectionEpochRef.current += 1;
     forceSelectionRender((revision) => revision + 1);
