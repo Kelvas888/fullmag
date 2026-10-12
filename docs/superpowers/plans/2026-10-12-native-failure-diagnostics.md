@@ -38,3 +38,10 @@ Pełne modal45 i mixed73 pozostają prawdziwymi porażkami true-residual gate. T
 ## Regresja budżetów K0 GPU — GHA 38248502096
 
 Native compilation przeszła; 2/4 CTest fail w nowej fixture admission. Produkcyjny helper sentinel policy działa, lecz test dla strict GPU używał legacy return-by-value C ABI, który prawidłowo zatrzymuje GPU na wymaganiu caller-sized result v20 attestation. Fixture teraz korzysta z istniejącego v20 envelope dla wszystkich trzech targetów i zachowuje dokładny powód odrzucenia negative budgets. Nie osłabiono wymogu attestation, availability ani GPU fallback; dodano failure-only bounded log. Kolejne hosted CTest pending; urządzeniowy GPU solve nadal NOT VERIFIED.
+
+
+## Potwierdzenie eksportu sukcesu — GHA 38246943509
+
+Artefakty dowodzą kompilacji i 10/12 CTest PASS na6265812be7b146f0f70102f1db79414765329490. Pattern sukcesu, opt-out, unavailable fresh-LU i guardy prywatnego mismatch przeszły. Pozostają wyłącznie fem_modal_eigen_contract oraz fem_modal_eigen_mixed_dense_contract (true-residual failures). Poprzedni wynik9/12 zastąpiono nowym dowodem; nie nazwać całego native suite zielonym. Receipt SHA256e6ca02ed415d1da23c71a51777e71d412e348dca8e21ed5c5da3098079b88a22; logSHA256b9af77228f89f7d33af8ab56b15003334a96885f9b4cc0c58eed399307d0549a.
+
+GHA38288433960 na554d3a49bfbd03b143d373644d92675a18a2661e:4/4dependency-free C ABI CTest PASS, w tym policy admission z v20 dlaGPU. Receipt SHA2565f575404974019060c3dac4da5faa611d4a60d62fddc17a1ea6d279723c63236. To nie jest GPU urządzeniowy solve.

@@ -3557,13 +3557,13 @@ Nowych 9 uwag pozostaje do oceny względem aktualnych źródeł. Poniższy wpis 
 
 | Uwaga | Plik | Stan | Zakres dalszej oceny |
 |---|---|---|---|
-| [4247125949](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247125949) | `crates/fullmag-authoring/src/scene.rs` | implemented_pending_ci | Internal scene lowerer dopuszcza authoring-validated nonphysical analysis, ale nie przenosi go do ProblemIR. Rust typed deny_unknown_fields + semantic validator przed capture_authored_scene/export-scene-ir pozostają granicą walidacji; nie duplikowano walidatora w Python. Pełny lowering z definicją oraz strict negative unknown physics/study/interface cases, hosted full scene lowering module. Python AST PASS; runtime CI pending. |
+| [4247125949](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247125949) | `crates/fullmag-authoring/src/scene.rs` | implemented | Internal lowering dopuszcza Rust-authoring-validated analysis i wyklucza je z ProblemIR. GHA38258939384 SUCCESS62full scene lowering +84authoring/24subtests +3Rust. Unknown physics/study/interface guards zachowane. |
 | [4247310778](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310778) | `crates/fullmag-session/src/typed_documents.rs` | open_pending_source_review | Pomijaj materiał dla pomocniczych obiektów podczas eksportu FMS** |
 | [4247310803](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310803) | `scripts/local_runner/ui_dist/src/views/PoliciesView.js` | open_pending_source_review | Przenieś obsługę polityki retencji do kanonicznego UI** |
 | [4247310808](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310808) | `crates/fullmag-authoring/src/validation.rs` | open_pending_source_review | Waliduj adaptive względem zmaterializowanego profilu** |
 | [4247310817](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310817) | `apps/control-room/src/modules/inspector/panels/analysis-results/AnalysisResultInspectorPanel.tsx` | open_pending_source_review | Zachowaj branch tracking score w Inspectorze** |
 | [4247310830](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310830) | `apps/control-room/src/modules/inspector/panels/StudyInspectorPanel.tsx` | open_pending_source_review | Waliduj adaptive względem edytowanych etapów** |
-| [4247536328](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247536328) | `crates/fullmag-runner/src/fem/eigen_policy.rs` | implemented_pending_ci_and_gpu | Adapter K0 zachowuje istniejące GPU defaults przy exact zero, CPU zachowuje PETSc sentinel; explicit positive bez clamp, signed negative rejected przed unsigned cast. Wspólny production helper + partial/default/atomic rejection cases oraz actual C ABI dla trzech targetów. Dedicated CTest w hosted native-modal. Source-map0600 i Python AST gate; native compile pending, device solve GPU NOT VERIFIED. |
+| [4247536328](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247536328) | `crates/fullmag-runner/src/fem/eigen_policy.rs` | implemented_pending_gpu_runtime | Native adapter zachowuje omitted GPU budget defaults, CPU PETSc sentinel i explicit positive intent; signed negative rejected atomically before cast. GHA38288433960 SUCCESS4/4CTest, dedicated policy helper plus actual v20 C ABI all targets. GPU device solve NOT VERIFIED; attestation guard unchanged. |
 | [4247536336](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247536336) | `packages/fullmag-py/src/fullmag/meshing/mesh_build_report.py` | open_pending_source_review | Raportuj trasę exact-ring jako warstwową** |
 | [4247536345](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247536345) | `apps/control-room/src/modules/ribbon/ribbonCommands.ts` | open_pending_source_review | Subskrybuj układ dla aktywnego stanu komend widoku** |
 
@@ -3574,3 +3574,12 @@ Nowych 9 uwag pozostaje do oceny względem aktualnych źródeł. Poniższy wpis 
 - `841a3f92dd763e8a8fd129af1edafeb9502b01b9`: regresja planera używa strukturalnego PlanError.reasons.
 - `6265812be7b146f0f70102f1db79414765329490`: cached opt-in obserwacja operatora po sukcesie Floqueta; źródłowy walidator0600 PASS. Hosted CTest38246943509 uruchomiony na dokładnym SHA, wynik pending. Nie naprawia full45/mixed73.
 - `7523deb7ecc2f0c44ed67c99eaa506efd76feb23`: dwa negatywne fixture’y docierają do zamierzonych guardów; produkcyjne reguły bez zmian. CI38247247461 pending.
+
+
+### Potwierdzone wyniki — 12.10.2026
+
+GHA38246943509 na6265812: 10/12native Floquet CTest PASS, w tym `modal_eigen_borrowed_pmat_pattern_mismatch_fixture` z opt-in success observer. Full modal i mixed-dense pozostają FAIL z true-residual rejection; nie rozluźniono tolerance ani completeness. Receipt/source identities i SHA logów zapisano w canonical CI evidence.
+
+GHA38258939384 na0ba13b: wszystkie3jobs SUCCESS, 62full scene lowering +84authoring +24subtests +3Rust. GHA38288433960 na554d3a:4/4dependency-free native CTest SUCCESS, poprawny v20 envelope w admission; brak dowodu urządzeniowego GPU solve.
+
+CLI direct dependency naprawiona w472257d74bcedd20d532b5f60809523c50e19b9a, lockfile zmieniony wyłącznie na remote o jedną zależność CLI; local lockfile bez zapisów. Pełny scope CI38288674955 uruchomiony; wynik pending. PR97 nadal OPEN; całość celu nie zakończona.

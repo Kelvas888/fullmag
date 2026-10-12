@@ -1046,6 +1046,58 @@
       "conclusion": "failure",
       "scope": "spectrum_scope_source_contracts",
       "evidence": "named legacy/v0.4 scope tests passed; complete planner 522 passed 2 failed; later producer/application gates skipped"
+    },
+    {
+      "run_id": 38246943509,
+      "sha": "6265812be7b146f0f70102f1db79414765329490",
+      "conclusion": "failure",
+      "scope": "bounded_native_floquet_slepc_contracts",
+      "passed": 10,
+      "failed": 2,
+      "failed_tests": [
+        "fem_modal_eigen_contract",
+        "fem_modal_eigen_mixed_dense_contract"
+      ],
+      "evidence": "Pattern success observer, row cleanup/quarantine and Gamma admission pass; two real true-residual failures remain.",
+      "receipt_sha256": "e6ca02ed415d1da23c71a51777e71d412e348dca8e21ed5c5da3098079b88a22",
+      "native_log_sha256": "b9af77228f89f7d33af8ab56b15003334a96885f9b4cc0c58eed399307d0549a"
+    },
+    {
+      "run_id": 38247247461,
+      "sha": "7523deb7ecc2f0c44ed67c99eaa506efd76feb23",
+      "conclusion": "failure",
+      "scope": "spectrum_scope_source_contracts",
+      "evidence": "IR/planner/application/runner including actual three producer regressions and runner integration compilation pass; final API/CLI binaries fail because CLI lacks direct fullmag-quantities dependency."
+    },
+    {
+      "run_id": 38248502096,
+      "sha": "3b424eb3dc35844cab221edfcaa540bcb003e928",
+      "conclusion": "failure",
+      "scope": "dependency_free_native_modal_cabi",
+      "passed": 2,
+      "failed": 2,
+      "evidence": "Compile passed; new negative GPU fixture used legacy ABI and hit correct v20 attestation requirement; corrected fixture uses sized envelope, no production guard weakened."
+    },
+    {
+      "run_id": 38258939384,
+      "sha": "0ba13b00592b741e847bd612126b2f373afbed7c",
+      "conclusion": "success",
+      "scope": "scene_postprocessing_lowering_and_authoring_controls",
+      "scene_lowering_passed": 62,
+      "authoring_passed": 84,
+      "subtests_passed": 24,
+      "rust_passed": 3,
+      "evidence": "Full lowering of authoring-validated SceneDocument with postprocessing; strict unknown/unlowered semantics and existing authoring policy checks."
+    },
+    {
+      "run_id": 38288433960,
+      "sha": "554d3a49bfbd03b143d373644d92675a18a2661e",
+      "conclusion": "success",
+      "scope": "dependency_free_native_modal_cabi",
+      "passed": 4,
+      "failed": 0,
+      "receipt_sha256": "5f575404974019060c3dac4da5faa611d4a60d62fddc17a1ea6d279723c63236",
+      "evidence": "Actual production budget helper/default/partial/negative atomicity and v20 C ABI rejection for auto/CPU/GPU; includes dedicated CTest, no device solve or scientific qualification."
     }
   ]
 }
