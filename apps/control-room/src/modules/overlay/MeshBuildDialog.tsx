@@ -231,7 +231,8 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
       !runtimeStatus ||
       !isReadyOrNotBuilt(summary) ||
       !isReadyOrNotBuilt(latestBuild) ||
-      !isReadyOrNotBuilt(manifest)
+      !isReadyOrNotBuilt(manifest) ||
+      !isReadyOrNotBuilt(sharedQuality)
     ) {
       return null;
     }
@@ -262,6 +263,7 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
     manifest,
     sharedQuality.status,
     sharedQuality.data,
+    sharedQuality.error,
     objectId,
     requestedPolicy,
     requestedPolicyKey,

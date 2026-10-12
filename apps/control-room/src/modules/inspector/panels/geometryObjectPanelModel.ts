@@ -50,9 +50,35 @@ export function isPrimitiveDraftRevisionConflict(error: unknown): boolean {
 
 export function rebaseGeometryObjectDraft(
   draft: GeometryObjectDraft,
-  baseRevision: number | null,
+  target: GeometryObjectDraft | number | null,
+  baseline?: GeometryObjectDraft | null,
 ): GeometryObjectDraft {
-  return { ...draft, baseRevision };
+  if (typeof target === "number" || target === null) {
+    return { ...draft, baseRevision: target };
+  }
+  const merged: GeometryObjectDraft = {
+    ...target,
+    baseRevision: target.baseRevision,
+  };
+  if (!baseline) {
+    return { ...draft, baseRevision: target.baseRevision };
+  }
+  const fields = Object.keys(draft) as (keyof GeometryObjectDraft)[];
+  for (const field of fields) {
+    if (field === "baseRevision") continue;
+    const draftVal = draft[field];
+    const baseVal = baseline[field];
+    const targetVal = target[field];
+    const isDirty = Array.isArray(draftVal)
+      ? JSON.stringify(draftVal) !== JSON.stringify(baseVal)
+      : draftVal !== baseVal;
+    if (isDirty) {
+      (merged as Record<string, unknown>)[field] = draftVal;
+    } else {
+      (merged as Record<string, unknown>)[field] = targetVal;
+    }
+  }
+  return merged;
 }
 
 function asRecord(value: unknown): JsonRecord | null {

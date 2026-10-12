@@ -59,6 +59,34 @@ describe("resolveGeometryObjectPanelModel", () => {
       baseRevision: 13,
     });
   });
+
+  it("performs 3-way rebase preserving local dirty fields while taking concurrent target edits", () => {
+    const baseline = resolveGeometryObjectDraft(
+      { ...baseSelection, kind: "builder.primitive", nodeId: "geometry:draft:box", objectId: null, ref: null },
+      { objects: [], revision: 12 },
+    );
+    // User edited size locally
+    const dirty = {
+      ...baseline,
+      size: ["2e-7", "2e-7", "2e-8"] as [string, string, string],
+    };
+    // Concurrent change on server updated translation and baseRevision
+    const target = {
+      ...baseline,
+      baseRevision: 13,
+      translation: ["5e-8", "0", "0"] as [string, string, string],
+    };
+
+    const rebased = rebaseGeometryObjectDraft(dirty, target, baseline);
+    expect(rebased).toEqual({
+      ...baseline,
+      baseRevision: 13,
+      // Local edit preserved
+      size: ["2e-7", "2e-7", "2e-8"],
+      // Server concurrent edit preserved
+      translation: ["5e-8", "0", "0"],
+    });
+  });
   it("reads committed object data from SceneDocument", () => {
     const model = resolveGeometryObjectPanelModel(baseSelection, {
       objects: [

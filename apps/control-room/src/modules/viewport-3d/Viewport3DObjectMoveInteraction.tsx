@@ -28,8 +28,8 @@ import {
   tryAcquireMoveCommit,
   type MoveCommitLockToken,
   type MoveCommitHandler,
-  Viewport3DMoveToolLayer,
-} from "./MoveObjectGizmo";
+} from "./moveCommitLock";
+import { Viewport3DMoveToolLayer } from "./MoveObjectGizmo";
 import {
   buildViewport3DPrimitiveRenderModel,
   withObjectPlacementDraftPreview,
@@ -84,7 +84,10 @@ export function useViewport3DObjectMoveInteraction({
   const sessionScopeKey = sessionRequestScopeKey(sessionIdentity);
   const activationIdentityRef = useRef<ActiveMoveIdentity | null>(null);
   const selectionEpochRef = useRef(0);
-  const selectionSnapshotRef = useRef(kernel.selection.get());
+  const selectionSnapshotRef = useRef<ReturnType<typeof kernel.selection.get> | null>(null);
+  if (selectionSnapshotRef.current === null) {
+    selectionSnapshotRef.current = kernel.selection.get();
+  }
   const [, forceSelectionRender] = useState(0);
   const [moveStatus, setMoveStatus] = useState<{
     error: string | null;

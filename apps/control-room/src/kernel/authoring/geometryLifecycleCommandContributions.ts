@@ -517,6 +517,7 @@ function invalidateObjectMeshResources(
   objectId: string,
   revision: string | number,
 ): void {
+  context.resources?.invalidate(MESHING_BUILDS_PATH, revision);
   context.resources?.invalidate(MESHING_BUILDS_CURRENT_PATH, revision);
   context.resources?.invalidate(MODEL_READINESS_PATH, revision);
   context.resources?.invalidate(MESHING_SUMMARY_PATH, revision);

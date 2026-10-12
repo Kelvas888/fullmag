@@ -353,26 +353,27 @@ export function magneticParameterMaterialResourceFromSceneResource(
   scene: Pick<SceneResource, "materials" | "revision" | "scene_revision">,
 ): MaterialResource | null {
   const material = scene.materials?.find((candidate) => candidate.id === materialId);
-  if (!material || !material.id || typeof material.name !== "string" || !material.properties) return null;
+  if (!material || !material.id || typeof material.name !== "string") return null;
   const properties = material.properties;
-  const aex = properties.Aex;
-  const dbulk = properties.Dbulk;
-  const dind = properties.Dind;
-  const ms = properties.Ms;
-  const alpha = properties.alpha;
+  const aex = properties?.Aex;
+  const dbulk = properties?.Dbulk;
+  const dind = properties?.Dind;
+  const ms = properties?.Ms;
+  const alpha = typeof properties?.alpha === "number" && Number.isFinite(properties.alpha)
+    ? properties.alpha
+    : 0.01;
   if (!isOptionalFiniteNumber(aex) || !isOptionalFiniteNumber(dbulk)
-    || !isOptionalFiniteNumber(dind) || !isOptionalFiniteNumber(ms)
-    || typeof alpha !== "number" || !Number.isFinite(alpha)) {
+    || !isOptionalFiniteNumber(dind) || !isOptionalFiniteNumber(ms)) {
     return null;
   }
   const resource: MaterialResource = {
     id: material.id,
     name: material.name,
     properties: {
-      Aex: aex,
-      Dbulk: dbulk,
-      Dind: dind,
-      Ms: ms,
+      Aex: aex ?? null,
+      Dbulk: dbulk ?? null,
+      Dind: dind ?? null,
+      Ms: ms ?? null,
       alpha,
     },
     scene_revision: scene.scene_revision ?? scene.revision ?? 0,

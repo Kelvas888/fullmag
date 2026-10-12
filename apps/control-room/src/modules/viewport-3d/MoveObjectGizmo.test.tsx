@@ -1,14 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  PROBLEM_IR_03_RIGID_TRANSFORM_REASON,
   createMoveGestureController,
-  isMoveCommitPending,
   installMoveGestureTerminalListeners,
   moveAxisPointerHandlers,
 } from "./MoveObjectGizmo";
+import { isMoveCommitPending } from "./moveCommitLock";
 import { SIMULATION_PREPARATION_PATH } from "@/kernel/api/apiPaths";
-import { commitObjectTranslation } from "@/kernel/authoring/objectTranslationMutation";
+import {
+  commitObjectTranslation,
+  PROBLEM_IR_03_RIGID_TRANSFORM_REASON,
+} from "@/kernel/authoring/objectTranslationMutation";
 
 describe("MoveObjectGizmo", () => {
   it("keeps pointer movement local and commits the final SI translation once", async () => {

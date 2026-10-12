@@ -190,6 +190,7 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
     sessionScopeKey: currentSessionScopeKey,
   });
   const pendingOperationId = useRef(0);
+  const preConflictBaselineRef = useRef<GeometryObjectDraft | null>(null);
   const pending =
     (pendingState.pending &&
       pendingState.draftKey === draftKey &&
@@ -432,6 +433,8 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
             transform: transformPayload,
           }, requestOptions);
           if (historyContext.isCurrentSessionScope() !== false && acknowledgeCommittedDraft()) {
+            objectEditSession.clear();
+            preConflictBaselineRef.current = null;
             selectionController.set(
               {
                 kind: "object.root",
@@ -464,11 +467,13 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
         historyContext.sessionScopeKey,
         api.resourceCacheScope,
       );
+      preConflictBaselineRef.current = null;
       setFeedback({ kind: "success", message: "Object draft committed." });
       return true;
     } catch (error) {
       if (isCurrentMutationContext?.() === false) return false;
       if (isPrimitiveDraftRevisionConflict(error)) {
+        preConflictBaselineRef.current = baseDraft;
         setConflictOperation("create");
         setRevisionConflictPhase("conflict");
         setConflictBaseRevision(draft.baseRevision);
@@ -489,8 +494,9 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
   }
 
   function rebaseAfterConflict(): void {
+    const baseline = preConflictBaselineRef.current;
     updateDraft((current) =>
-      rebaseGeometryObjectDraft(current, baseDraft.baseRevision),
+      rebaseGeometryObjectDraft(current, baseDraft, baseline),
     );
     setRevisionConflictPhase("rebased");
     setFeedback({ kind: "error", message: "Draft rebased to the latest scene revision. Review and retry Apply." });
@@ -571,12 +577,14 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
         api.resourceCacheScope,
       );
       if (!currentEpoch) return false;
+      preConflictBaselineRef.current = null;
       setFeedback({ kind: "success", message: "Geometry and placement committed." });
       return true;
     } catch (error) {
       const operationIsCurrent = objectEditSession.reject(operation);
       if (!operationIsCurrent || isCurrentMutationContext?.() === false) return false;
       if (isPrimitiveDraftRevisionConflict(error)) {
+        preConflictBaselineRef.current = baseDraft;
         setConflictOperation("geometry");
         setRevisionConflictPhase("conflict");
         setConflictBaseRevision(draft.baseRevision);
