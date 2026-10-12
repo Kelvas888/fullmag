@@ -1027,3 +1027,19 @@ Kanoniczny pipeline4243102022: GHA38233156553 SUCCESS, oba nowe testy rzeczywist
 ## Zachowanie solver policy w projekcji sceny
 
 4242140004: Rust scene_document_to_script_builder_overrides przenosi trzy jawnie obecne keys z stage.extra bez zmiany serde_json::Value. Brak key pozostaje omission; null i pusty string zachowuja authored clear. Istniejacy Python script_builder konsumuje te overrides; brak zmian schema/defaultow i PBC/DMI. Trzy rzeczywiste builder-scene-overrides regressions obejmuja explicit values, legacy absence i mixed clears. Rust parser/source review PASS; hosted authoring workflow wymaga wszystkich trzech nazw w logu oraz Python suite. Runtime FEM/science pozostaja NOT VERIFIED.
+
+
+## Dowody hosted CI 12.10.2026
+
+38236056590 SUCCESS: trzy Rust scene override regressions oraz84Python tests/24subtests PASS. Luka4242140004 zamknieta w zakresie source roundtrip.
+
+38233264045:9/12CTest PASS, pozostaja fullmodal, patternmismatch oraz mixeddense. Oba rowrestore fault/quarantine tests PASS; nie zmieniono production operators/tolerances. Nadal brak pelnej native kwalifikacji.
+
+38235835993:196UItests PASS, dwa nowe mounted resource tests FAIL (brak admission initial definitions request); typecheck/architecture PASS, Doctor FAIL. Poprawka4243102031 nadal wymaga naprawy regression fixture i ponownego hosted gate. Browser pozostaje NOT VERIFIED.
+
+
+## Usuwanie serii referencyjnych z renderera
+
+4243102038: ordinary ECharts merge zachowuje serie nieobecne w nastepnym modelu. Renderer teraz uzywa notMerge=false z replaceMerge=[series], zachowujac inne komponenty i stan zoom. Typ adaptera dopuszcza object options. Nowa regresja wykorzystuje real ECharts SVG SSR, nie mock merge: computed+reference -> computed -> empty, z zachowaniem zoom20..80. Semantyka potwierdzona w upstream https://github.com/apache/echarts/blob/master/src/core/echarts.ts i oficjalnym https://apache.googlesource.com/echarts/+/refs/tags/5.1.2/test/option-replaceMerge.html. Lokalnie tylko source/diff review; GHA oraz browser NOT VERIFIED.
+
+Nowe mounted fixture czeka bounded25x1ms na rzeczywiste session-list/status/definitions admission zamiast zero-only timer flush; assertuje tez obie upstream loader calls i izolacje sessionB. Nie usuwa oczekiwanych licznikow ani testow retention. Wyjasnienie source scheduling wymaga potwierdzenia nastepnym hosted run.

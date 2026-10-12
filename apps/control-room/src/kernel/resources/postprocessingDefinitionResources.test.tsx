@@ -38,6 +38,8 @@ interface DefinitionsLoadOptions {
 type DefinitionsLoader = (
   options: DefinitionsLoadOptions,
 ) => Promise<PostprocessingDefinitionCollectionResource>;
+type SessionListLoader = () => Promise<SessionListResource>;
+type SessionStatusLoader = () => Promise<LiveStatusResource>;
 
 const SESSION_A: SessionIdentityFixture = {
   requestScopeEpoch: "api-instance:a",
@@ -111,12 +113,18 @@ function makeKernel(
 ) {
   const bus = new EventBus<KernelEventMap>();
   const resources = new ResourceInvalidationController(bus);
+  const listSessions = vi.fn<SessionListLoader>(async () =>
+    sessionListFixture(getSession()),
+  );
+  const loadSessionStatus = vi.fn<SessionStatusLoader>(async () =>
+    statusFixture(getSession()),
+  );
   const kernel = {
     api: {
       sessions: {
-        list: async () => sessionListFixture(getSession()),
+        list: listSessions,
         current: {
-          status: async () => statusFixture(getSession()),
+          status: loadSessionStatus,
         },
       },
       analysis: {
@@ -131,7 +139,45 @@ function makeKernel(
     }),
     resources,
   } as unknown as KernelApi;
-  return { kernel, resources };
+  return { kernel, listSessions, loadSessionStatus, resources };
+}
+
+interface MockCallTracker {
+  mock: { calls: unknown[] };
+}
+
+async function waitForSessionAdmission(
+  loaders: {
+    definitions: MockCallTracker;
+    sessionList: MockCallTracker;
+    sessionStatus: MockCallTracker;
+  },
+  expectedCalls: {
+    definitions: number;
+    sessionList: number;
+    sessionStatus: number;
+  },
+): Promise<void> {
+  for (
+    let pass = 0;
+    pass < 25 &&
+    loaders.definitions.mock.calls.length < expectedCalls.definitions;
+    pass += 1
+  ) {
+    // Session collection, status, and the scoped resource each start in a
+    // later React commit, so give each effect a positive timer tick to run.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+  }
+
+  expect(loaders.sessionList.mock.calls).toHaveLength(expectedCalls.sessionList);
+  expect(loaders.sessionStatus.mock.calls).toHaveLength(
+    expectedCalls.sessionStatus,
+  );
+  expect(loaders.definitions.mock.calls).toHaveLength(
+    expectedCalls.definitions,
+  );
 }
 
 function Probe() {
@@ -162,7 +208,7 @@ function mountProbe(kernel: KernelApi) {
   };
 }
 
-async function flushResourceWork(advanceMs = 0): Promise<void> {
+async function flushResourceWork(advanceMs = 1): Promise<void> {
   for (let pass = 0; pass < 6; pass += 1) {
     await act(async () => {
       await vi.advanceTimersByTimeAsync(advanceMs);
@@ -180,11 +226,22 @@ describe("postprocessing definitions resource revisions", () => {
       .mockResolvedValueOnce(definitionsFixture(11, "definitions-revision-11"))
       .mockReturnValueOnce(revision12.promise)
       .mockReturnValueOnce(revision13.promise);
-    const { kernel, resources } = makeKernel(() => SESSION_A, listDefinitions);
+    const { kernel, listSessions, loadSessionStatus, resources } = makeKernel(
+      () => SESSION_A,
+      listDefinitions,
+    );
     const mounted = mountProbe(kernel);
 
     try {
       await act(async () => mounted.render());
+      await waitForSessionAdmission(
+        {
+          definitions: listDefinitions,
+          sessionList: listSessions,
+          sessionStatus: loadSessionStatus,
+        },
+        { definitions: 1, sessionList: 1, sessionStatus: 1 },
+      );
       await flushResourceWork();
 
       expect(listDefinitions).toHaveBeenCalledTimes(1);
@@ -242,11 +299,22 @@ describe("postprocessing definitions resource revisions", () => {
         ? sessionBDefinitions.promise
         : Promise.resolve(definitionsFixture(11, "definitions-session-a")),
     );
-    const { kernel, resources } = makeKernel(() => currentSession, listDefinitions);
+    const { kernel, listSessions, loadSessionStatus, resources } = makeKernel(
+      () => currentSession,
+      listDefinitions,
+    );
     const mounted = mountProbe(kernel);
 
     try {
       await act(async () => mounted.render());
+      await waitForSessionAdmission(
+        {
+          definitions: listDefinitions,
+          sessionList: listSessions,
+          sessionStatus: loadSessionStatus,
+        },
+        { definitions: 1, sessionList: 1, sessionStatus: 1 },
+      );
       await flushResourceWork();
 
       expect(listDefinitions).toHaveBeenCalledTimes(1);
@@ -256,11 +324,25 @@ describe("postprocessing definitions resource revisions", () => {
       expect(mounted.container.textContent).toContain("definitions-session-a");
 
       currentSession = SESSION_B;
+      const expectedSessionListCalls = listSessions.mock.calls.length + 1;
+      const expectedSessionStatusCalls = loadSessionStatus.mock.calls.length + 1;
       await act(async () => {
         resources.invalidate(SESSIONS_PATH, 2);
         resources.invalidate(SESSION_STATUS_RESOURCE_KEY, 2);
       });
-      await flushResourceWork(2);
+      await waitForSessionAdmission(
+        {
+          definitions: listDefinitions,
+          sessionList: listSessions,
+          sessionStatus: loadSessionStatus,
+        },
+        {
+          definitions: 2,
+          sessionList: expectedSessionListCalls,
+          sessionStatus: expectedSessionStatusCalls,
+        },
+      );
+      await flushResourceWork();
 
       expect(listDefinitions).toHaveBeenCalledTimes(2);
       expect(listDefinitions.mock.calls[1]?.[0].sessionScopeKey).toContain(

@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { init } from "echarts";
 import { describe, expect, it, vi } from "vitest";
 import { chartRenderModelToEChartsOption, createChartRendererOwner, type ChartRendererEngine, type ChartRenderModel } from "./chartRenderer";
 import { DEFAULT_CHART_TOKENS } from "./fullmagChartTokens";
@@ -34,6 +35,42 @@ describe("chart renderer owner", () => {
     expect(chart.dispose).toHaveBeenCalledTimes(1);
   });
 
+  it("removes unpinned reference series in real ECharts while retaining the zoom", () => {
+    const chart = init(null, undefined, {
+      height: 320,
+      renderer: "svg",
+      ssr: true,
+      width: 640,
+    });
+    const owner = createChartRendererOwner({ init: () => chart });
+    const seriesIds = () => {
+      const option = chart.getOption() as { series: { id: string }[] };
+      return option.series.filter(Boolean).map((series) => series.id);
+    };
+    try {
+      owner.mount({} as HTMLElement);
+      owner.update({
+        ...model,
+        series: [
+          ...model.series,
+          { ...model.series[0]!, id: "reference", label: "Reference", selectable: false },
+        ],
+      });
+      expect(seriesIds()).toEqual(["mx", "reference"]);
+      chart.dispatchAction({ type: "dataZoom", start: 20, end: 80 });
+
+      owner.update(model);
+      expect(seriesIds()).toEqual(["mx"]);
+      const zoom = chart.getOption().dataZoom as { start: number; end: number }[];
+      expect(zoom[0]).toMatchObject({ start: 20, end: 80 });
+
+      owner.update({ ...model, series: [], status: "empty" });
+      expect(seriesIds()).toEqual([]);
+    } finally {
+      owner.dispose();
+    }
+  });
+
   it("encodes stable semantic row identity in renderer data", () => {
     const chart = { dispose: vi.fn(), getDataURL: vi.fn(), resize: vi.fn(), setOption: vi.fn() };
     const owner = createChartRendererOwner({ init: () => chart });
@@ -41,7 +78,7 @@ describe("chart renderer owner", () => {
     owner.update(model);
     expect(chart.setOption).toHaveBeenCalledWith(expect.objectContaining({
       series: [expect.objectContaining({ id: "mx", data: [[1, 0.25, 7]] })],
-    }), false);
+    }), { notMerge: false, replaceMerge: ["series"] });
   });
 
   it("keeps dimensionless axes unscaled, enables ECharts aria and removes the bottom slider", () => {

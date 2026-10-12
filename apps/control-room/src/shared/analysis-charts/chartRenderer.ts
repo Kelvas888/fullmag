@@ -127,7 +127,10 @@ export interface ChartRendererInstance {
   off?(name: ChartRendererEventName, listener: (event: unknown) => void): void;
   on?(name: ChartRendererEventName, listener: (event: unknown) => void): void;
   resize(): void;
-  setOption(option: EChartsOption, notMerge?: boolean): void;
+  setOption(
+    option: EChartsOption,
+    options?: boolean | { notMerge?: boolean; replaceMerge?: string | string[] },
+  ): void;
 }
 
 export interface ChartRendererEngine {
@@ -196,7 +199,10 @@ export function createChartRendererOwner(
     },
     update(model, tokens) {
       if (!disposed && chart)
-        chart.setOption(chartRenderModelToEChartsOption(model, tokens), false);
+        chart.setOption(chartRenderModelToEChartsOption(model, tokens), {
+          notMerge: false,
+          replaceMerge: ["series"],
+        });
     },
   };
 }

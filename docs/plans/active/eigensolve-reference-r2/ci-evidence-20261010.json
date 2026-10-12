@@ -921,6 +921,46 @@
       "qualification_claimed": false,
       "source_maps_validated": 2,
       "native_runtime": "NOT VERIFIED"
+    },
+    {
+      "run_id": 38236056590,
+      "sha": "83109c49a70dc03468b5deff31f9abe95a183784",
+      "conclusion": "success",
+      "scope": "actual_Rust_scene_solver_overrides_and_Python_authoring",
+      "rust_tests_passed": 3,
+      "python_tests_passed": 84,
+      "python_subtests_passed": 24,
+      "log_sha256": "c875e926c4537a6f36da93a7a2f2127b5b04912d35d8a2696a94f7a5e24ea145",
+      "scientific_qualification": "NOT VERIFIED"
+    },
+    {
+      "run_id": 38233264045,
+      "sha": "ad12a2a200e4bab7d41053955e8ad9283bc6a3f2",
+      "conclusion": "failure",
+      "scope": "floquet_modal_slepc_contract",
+      "tests_passed": 9,
+      "tests_failed": 3,
+      "remaining": [
+        "fem_modal_eigen_contract",
+        "modal_eigen_borrowed_pmat_pattern_mismatch_fixture",
+        "fem_modal_eigen_mixed_dense_contract"
+      ],
+      "receipt_sha256": "2ee2a3a09e92f5e3b6ac7768b59d1662b1f9a11db2fee0f124b75c3c6f35902b",
+      "log_sha256": "89fa4633de0dd0fd3230f155c4794fe5c78e3488ab0adb9372f52e77fb376d72",
+      "scientific_qualification": "NOT VERIFIED"
+    },
+    {
+      "run_id": 38235835993,
+      "sha": "3557bfe7dc009d9a483346b4501ca7d023de0efe",
+      "conclusion": "failure",
+      "scope": "postprocessing_revision_hooks_commands_and_existing_UI_contracts",
+      "tests_passed": 196,
+      "tests_failed": 2,
+      "typecheck": "PASS",
+      "architecture": "PASS",
+      "react_doctor": "FAIL",
+      "browser": "NOT VERIFIED",
+      "failed_log_sha256": "9c9e56ee6ddd7710bd9f643717d2a2a47e3bc22e35709a6e30322fe45ec4614e"
     }
   ]
 }
