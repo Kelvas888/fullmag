@@ -639,6 +639,12 @@
       "path": "backends/fem/src/frequency_domain/modal_eigen_solver.cpp",
       "symbol": "apply_poisson_airbox_iteration_policy",
       "responsibility": "Retain omitted GPU defaults and CPU PETSc sentinels; reject signed negative iteration budgets before conversion."
+    },
+    {
+      "id": "source-floquet-factor-phase-log",
+      "path": "backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp",
+      "symbol": "emit_floquet_factor_phase_marker",
+      "responsibility": "Opt-in text phase boundaries around existing live/fresh setup calls; no PETSc queries or acceptance changes."
     }
   ],
   "public_api": {

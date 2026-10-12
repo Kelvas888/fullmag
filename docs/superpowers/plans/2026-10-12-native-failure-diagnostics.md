@@ -45,3 +45,19 @@ Native compilation przeszła; 2/4 CTest fail w nowej fixture admission. Produkcy
 Artefakty dowodzą kompilacji i 10/12 CTest PASS na6265812be7b146f0f70102f1db79414765329490. Pattern sukcesu, opt-out, unavailable fresh-LU i guardy prywatnego mismatch przeszły. Pozostają wyłącznie fem_modal_eigen_contract oraz fem_modal_eigen_mixed_dense_contract (true-residual failures). Poprzedni wynik9/12 zastąpiono nowym dowodem; nie nazwać całego native suite zielonym. Receipt SHA256e6ca02ed415d1da23c71a51777e71d412e348dca8e21ed5c5da3098079b88a22; logSHA256b9af77228f89f7d33af8ab56b15003334a96885f9b4cc0c58eed399307d0549a.
 
 GHA38288433960 na554d3a49bfbd03b143d373644d92675a18a2661e:4/4dependency-free C ABI CTest PASS, w tym policy admission z v20 dlaGPU. Receipt SHA2565f575404974019060c3dac4da5faa611d4a60d62fddc17a1ea6d279723c63236. To nie jest GPU urządzeniowy solve.
+
+
+## Następny falsyfikowalny pomiar faktorów — 12.10.2026
+
+Dwa aktualne JSON-y na6265812 potwierdzają Pmat4x4/16entries: exact structure/value match i Frobenius defect0. LivePC relative residual: full45=7.5427005485e-8, mixed73=7.8385667969e-8; freshLU odpowiednio3.2583845792e-16 i2.3115593840e-16. Zadawany `MAT_SHIFT_NONZERO` około1.4901161194e-8 nie dowodzi rzeczywiście zastosowanego przesunięcia.
+
+Hipoteza, nie potwierdzona przyczyna: liveLU uruchamia conditional shift po małym pivocie symbolic/numeric ordering, freshLU na późniejszym duplikacie nie. W pinned PETSc3.24.6 `MatPivotCheck_nz` (`include/petsc/private/matimpl.h`) uruchamia actual shift zależnie od pivotu i row sum. Numeric LU (`src/mat/impls/aij/seq/aijfact.c`, inode.c) ma istniejące PetscInfo z liczbą shift_nz tries i actual shift_amount. Getter konfiguracji nie mierzy tej decyzji.
+
+Następny bounded hosted experiment: potwierdzić logging Mat, znaczniki fazy liveEPSSetUp/freshKSPSetUp, odczyt metadata/ordering i actual shift log. Nie resetować livePC, nie zmieniać faktorów, tolerance ani acceptance. MatDuplicate kopiuje również inode/diagonal/compressed-row metadata; nie zakładać, że fresh wyłącza inode. Brak logu nie oznacza zerowego shift, dopóki logging nie zostanie zweryfikowany. Różnica actual shift/ordering wspiera hipotezę; równość ją falsyfikuje. Wówczas kolejny pomiar to prywatne cztery jednostkowe RHS i rekonstrukcja efektywnego inverse action. Pomiary niezaimplementowane; rootcause/science nadal NOT VERIFIED.
+
+
+### Wdrożony pierwszy krok pomiaru — runtime pending
+
+Hosted floquet-modal-slepc profil żąda `PETSC_OPTIONS=-info :mat:self` i prywatnych znaczników live_setup/fresh_setup. Istniejące EPSSetUp/KSPSetUp pozostają wywołane dokładnie raz z tymi samymi argumentami/guardami. Znaczniki używają wyłącznie fprintf/fflush, nie PETSc query; end oznacza powrót call, nie poprawność solve. Konfigurację loggingu zapisuje receipt jako requested, nie observed. Następny actual CTest/log potwierdzi dostępność Mat logging oraz shift_nz tries/amount. Brak logu nie może być uznany za zero shift.
+
+Składnię i filtr potwierdzono w pinned [PETSc3.24.6 verboseinfo.c](https://raw.githubusercontent.com/petsc/petsc/v3.24.6/src/sys/info/verboseinfo.c). Mechanizm nie zmienia fizyki ani tolerancji i nie stanowi kwalifikacji. Odczyt dodatkowych matrix metadata/PCView pozostaje dalszym krokiem zależnym od wyniku tego logu.

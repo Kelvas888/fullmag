@@ -1335,3 +1335,13 @@ Brak jawnego limitu EPS/KSP ma w C ABI wartość `0`. Dla `production_gpu` adapt
 | Source ID | Path + symbol | Odpowiedzialność |
 |---|---|---|
 | source-poisson-iteration-policy | `backends/fem/src/frequency_domain/modal_eigen_solver.cpp::apply_poisson_airbox_iteration_policy` | Sentinel omission GPU/CPU i atomowe odrzucenie ujemnych budżetów |
+
+
+### Prywatny pomiar actual LU shift w hosted CPU Floquet
+
+Diagnostyczny profil może włączyć klasę Mat w PetscInfo (`-info :mat:self`) oraz fazowe znaczniki tekstowe przed i po live EPSSetUp i fresh KSPSetUp. Znaczniki nie odczytują PETSc state i nie dowodzą sukcesu; są tylko granicami czasowymi logu. Nie zmieniają parametrów solvera, macierzy, tolerancji, ownership, ABI ani completeness. Brak linii o actual shift nie oznacza zero, dopóki dostępność loggingu nie jest potwierdzona. Mechanizm jest prywatny/opt-in; inne profile i normalny runtime pozostają bez loggingu. Device/science qualification nadal NOT VERIFIED.
+
+
+| Source ID | Path + symbol | Odpowiedzialność |
+|---|---|---|
+| source-floquet-factor-phase-log | `backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp::emit_floquet_factor_phase_marker` | Opt-in fazy istniejącego setup bez PETSc queries i zmian acceptance |

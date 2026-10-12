@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -29,6 +30,17 @@
 
 namespace fullmag::fem::frequency_domain {
 namespace {
+
+#if FULLMAG_FEM_WITH_SLEPC
+void emit_floquet_factor_phase_marker(const char *phase) noexcept
+{
+    const char *enabled = std::getenv("FULLMAG_FLOQUET_FACTOR_PHASE_LOG");
+    if (enabled != nullptr && std::strcmp(enabled, "1") == 0) {
+        std::fprintf(stderr, "FULLMAG_FLOQUET_FACTOR_PHASE phase=%s\n", phase);
+        std::fflush(stderr);
+    }
+}
+#endif
 
 // Shared by always-available diagnostics and the optional PETSc implementation.
 constexpr double kFloquetShiftedGmresBreakdownTolerance = 2.0;
@@ -2606,7 +2618,9 @@ PetscErrorCode prepare_candidate_owned_pmat_copy_and_lu(
                 workspace->live_pc_owned_pmat_ksp, PETSC_FALSE);
         }
         if (error == PETSC_SUCCESS) {
+            (void)emit_floquet_factor_phase_marker("fresh_setup_begin");
             error = KSPSetUp(workspace->live_pc_owned_pmat_ksp);
+            (void)emit_floquet_factor_phase_marker("fresh_setup_end");
         }
         if (error != PETSC_SUCCESS) {
             observation.fresh_ksp_setup_error_code_available = true;
@@ -7766,7 +7780,10 @@ solve_floquet_shared_domain_sparse_modal_spectrum_reusing_context(
     // Configure the ST operator before allocating callback work vectors. This
     // makes the workspaces match the actual shifted system, not its
     // preconditioner approximation.
-    if (EPSSetUp(eps) != 0) {
+    (void)emit_floquet_factor_phase_marker("live_setup_begin");
+    const PetscErrorCode live_setup_error = EPSSetUp(eps);
+    (void)emit_floquet_factor_phase_marker("live_setup_end");
+    if (live_setup_error != 0) {
         result.status = "solve_error";
         result.unsupported_reason = "floquet_slepc_setup_failed";
         state->invalidated = true;
