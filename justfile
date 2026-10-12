@@ -48,6 +48,10 @@ run-managed-antenna-http-ram job_id commit source_digest native_snapshot_sha256 
 observe-managed-antenna-http-ram run_root:
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_antenna_http_ram.py" --repo-root "{{repo_root}}" observe --run-root {{quote(run_root)}}
 
+# No-build public accepted full-3D inspection from a pinned managed capsule.
+verify-api-accepted-closed-loop-runtime request request_sha256:
+    @{{storage_python}} "{{repo_root}}/scripts/launch_accepted_closed_loop_runtime.py" --request {{quote(request)}} --request-sha256 {{quote(request_sha256)}}
+
 # Fixed public FEM transport oracle from an already verified CPU package.
 run-managed-transport-oracles job_id commit source_digest native_snapshot_sha256:
     @{{storage_python}} "{{repo_root}}/scripts/run_managed_transport_oracles.py" --repo-root "{{repo_root}}" start --job-id {{quote(job_id)}} --commit {{quote(commit)}} --source-digest {{quote(source_digest)}} --native-snapshot-sha256 {{quote(native_snapshot_sha256)}}

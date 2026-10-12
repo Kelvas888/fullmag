@@ -1846,7 +1846,7 @@ fn study_mechanics(problem: &ProblemIR) -> Option<&fullmag_ir::MechanicsIR> {
                 mechanics.as_ref()
             })
         }
-        fullmag_ir::StudyIR::Hysteresis { .. } => None,
+        fullmag_ir::StudyIR::Hysteresis { .. } | fullmag_ir::StudyIR::FieldOnly { .. } => None,
     }
 }
 

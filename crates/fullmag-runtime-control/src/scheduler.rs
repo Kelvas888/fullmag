@@ -98,7 +98,8 @@ pub fn accepted_run_has_scheduler_ready_task(store: &SessionStore, run_id: &RunI
         {
             continue;
         }
-        if inputs_are_automatically_resolvable(run_id.as_str(), &study_step.inputs, &catalog)? {
+        if crate::study_completion::dependencies_ready(store, &accepted, study_step)?
+            && inputs_are_automatically_resolvable(run_id.as_str(), &study_step.inputs, &catalog)? {
             return Ok(true);
         }
     }
@@ -254,7 +255,8 @@ fn schedule_next_ready_accepted_task_with_admission(
         {
             continue;
         }
-        if !inputs_are_automatically_resolvable(run_id.as_str(), &study_step.inputs, &catalog)? {
+        if !crate::study_completion::dependencies_ready(store, &accepted, study_step)?
+            || !inputs_are_automatically_resolvable(run_id.as_str(), &study_step.inputs, &catalog)? {
             continue;
         }
 
@@ -319,7 +321,7 @@ fn schedule_next_ready_accepted_task_with_admission(
             store,
             &mut coordinator,
             WorkerEventEnvelope {
-                schema_version: WORKER_PROTOCOL_SCHEMA.into(),
+                schema_version: prepare.schema_version.clone(),
                 message_id: prepared_message_id,
                 sequence: 1,
                 claim: claim.identity(),

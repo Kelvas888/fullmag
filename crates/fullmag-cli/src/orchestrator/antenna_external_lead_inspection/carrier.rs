@@ -3,7 +3,7 @@ use anyhow::{bail, Context, Result};
 use fullmag_ir::{
     BackendPlanIR, BackendTarget, DynamicsIR, EnergyTermIR, ExecutionPlanIR,
     MaterialParameterNameIR, ProblemIR, RequestedTransportExecutionIR,
-    ResolvedAntennaExternalLeadCurrentInputIR, SamplingIR, StudyIR,
+    ResolvedAntennaExternalLeadCurrentInputIR, ResolvedAntennaClosedLoopCurrentInputIR, SamplingIR, StudyIR,
 };
 use fullmag_plan::{plan_antenna_field_solve_execution, AntennaFieldSolveExecutionPlan};
 
@@ -116,6 +116,11 @@ pub(crate) fn plan_carrier(
         } if &resolved == input && &requested_execution == requested && output_id == output => {}
         _ => bail!("external-lead inspection carrier differs from the actual selected input, execution or output"),
     }
+    if matches!(problem.study, StudyIR::FieldOnly { .. }) {
+        let mut plan = fullmag_plan::plan_antenna_field_only_carrier(problem, &input.stage.id, &input.port.id)?;
+        plan.provenance.notes.push(CARRIER_NOTE.into());
+        return Ok(plan);
+    }
     let carrier = snapshot_problem(problem);
     let mut plan = fullmag_plan::plan(&carrier)
         .context("planning external-lead inspection mesh/initial-state carrier")?;
@@ -126,6 +131,43 @@ pub(crate) fn plan_carrier(
         bail!("external-lead inspection carrier requires the existing FEM mesh/material planner without fallback");
     }
     plan.provenance.notes.push(CARRIER_NOTE.into());
+    plan.provenance.notes.push("inspection carrier has no solver realization; dedicated source realization is FEM CPU/double, requested execution remains separate".into());
+    Ok(plan)
+}
+
+pub(crate) fn plan_closed_loop_carrier(
+    problem: &ProblemIR,
+    input: &ResolvedAntennaClosedLoopCurrentInputIR,
+    requested: &RequestedTransportExecutionIR,
+    output: &str,
+) -> Result<ExecutionPlanIR> {
+    // Re-resolve the unsanitized authored problem first. Clearing physics must
+    // never turn a stale or otherwise rejected source into an accepted input.
+    match plan_antenna_field_solve_execution(problem, &input.stage.id, &input.port.id)
+        .context("re-resolving closed-loop inspection before carrier planning")?
+    {
+        AntennaFieldSolveExecutionPlan::ClosedLoopInspection {
+            input: resolved,
+            requested_execution,
+            output_id,
+        } if &resolved == input && &requested_execution == requested && output_id == output => {}
+        _ => bail!("closed-loop inspection carrier differs from the actual selected input, execution or output"),
+    }
+    if matches!(problem.study, StudyIR::FieldOnly { .. }) {
+        let mut plan = fullmag_plan::plan_antenna_field_only_carrier(problem, &input.stage.id, &input.port.id)?;
+        plan.provenance.notes.push("antenna_closed_loop_inspection_carrier_only:no_llg_execution".into());
+        return Ok(plan);
+    }
+    let carrier = snapshot_problem(problem);
+    let mut plan = fullmag_plan::plan(&carrier)
+        .context("planning closed-loop inspection mesh/initial-state carrier")?;
+    if plan.common.requested_backend != BackendTarget::Fem
+        || plan.common.resolved_backend != BackendTarget::Fem
+        || !matches!(&plan.backend_plan, BackendPlanIR::Fem(_))
+    {
+        bail!("closed-loop inspection carrier requires the existing FEM mesh/material planner without fallback");
+    }
+    plan.provenance.notes.push("antenna_closed_loop_inspection_carrier_only:no_llg_execution".into());
     plan.provenance.notes.push("inspection carrier has no solver realization; dedicated source realization is FEM CPU/double, requested execution remains separate".into());
     Ok(plan)
 }

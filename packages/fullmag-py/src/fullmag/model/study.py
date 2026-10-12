@@ -617,6 +617,25 @@ def _serialize_spin_wave_bc(value: SpinWaveBoundarySpec) -> str | dict[str, obje
 
 
 @dataclass(frozen=True, slots=True)
+class FieldOnly:
+    """Static field-stage authoring without magnetic state or dynamics.
+
+    Results are owned by explicit antenna solve stages and their carriers,
+    rather than time-dependent magnetization sampling.
+    """
+
+    outputs: Sequence[TimeOutputSpec] = ()
+    constraints: Sequence[FrozenSpins] = ()
+
+    def __post_init__(self) -> None:
+        if self.outputs or self.constraints:
+            raise ValueError("FieldOnly uses stage-owned outputs and has no magnetic constraints")
+
+    def to_ir(self) -> dict[str, object]:
+        return {"kind": "field_only", "sampling": {"outputs": []}}
+
+
+@dataclass(frozen=True, slots=True)
 class TimeEvolution:
     dynamics: LLG
     outputs: Sequence[TimeOutputSpec]

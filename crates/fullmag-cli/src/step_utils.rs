@@ -476,6 +476,14 @@ pub(crate) fn initial_step_update(
     };
 
     match backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => fullmag_runner::StepUpdate {
+            coupled_checkpoint: None, stats, grid: [0, 0, 0], fem_mesh_generation_id,
+            magnetization: None, preview_field: None, cached_preview_fields: None,
+            hysteresis_field_m_t: None, hysteresis_point_index: None,
+            hysteresis_settle_step_index: None, hysteresis_settle_step_kind: None,
+            hysteresis_settle_step_method: None, scalar_row_due: false,
+            terminal_field_snapshot: false, finished: false,
+        },
         BackendPlanIR::Fdm(fdm) => fullmag_runner::StepUpdate {
             coupled_checkpoint: None,
             stats,
@@ -636,6 +644,7 @@ pub(crate) fn final_stage_step_update(
         .expect("single step should offset");
 
     Some(match backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => return None,
         BackendPlanIR::Fdm(fdm) => fullmag_runner::StepUpdate {
             coupled_checkpoint: checkpoint,
             stats,
@@ -736,6 +745,12 @@ pub(crate) fn snapshot_step_update_from_stats(
     finished: bool,
 ) -> fullmag_runner::StepUpdate {
     match backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => {
+            let mut update = initial_step_update(backend_plan, fem_mesh_generation_id);
+            update.stats = stats;
+            update.finished = finished;
+            update
+        }
         BackendPlanIR::Fdm(fdm) => fullmag_runner::StepUpdate {
             coupled_checkpoint: None,
             stats,
@@ -893,6 +908,7 @@ pub(crate) fn validate_imported_magnetization(
     let plan = fullmag_plan::plan(&candidate)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let expected_vectors = match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => bail!("field_only cannot import magnetic state"),
         BackendPlanIR::Fdm(fdm) => fdm.initial_magnetization.len(),
         BackendPlanIR::FdmMultilayer(fdm) => fdm
             .layers
@@ -1059,6 +1075,7 @@ pub(crate) fn apply_continuation_initial_state(
 fn planned_fem_mesh_node_count(problem: &ProblemIR) -> Result<Option<usize>> {
     let plan = fullmag_plan::plan(problem).map_err(|error| anyhow::anyhow!(error.to_string()))?;
     Ok(match plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => None,
         BackendPlanIR::Fem(fem) => Some(fem.mesh.nodes.len()),
         BackendPlanIR::FemEigen(fem) => Some(fem.mesh.nodes.len()),
         BackendPlanIR::FemFrequencyResponse(fem) => Some(fem.mesh.nodes.len()),
@@ -1122,6 +1139,7 @@ pub(crate) fn continuation_source_from_backend_plan(
     backend_plan: &BackendPlanIR,
 ) -> ContinuationSource {
     match backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => ContinuationSource::Unsupported("field_only has no magnetic continuation state"),
         BackendPlanIR::Fdm(plan) => match fdm_continuation_identity(plan) {
             Ok(identity) => ContinuationSource::Fdm(identity),
             Err(error) => ContinuationSource::Unsupported(error.to_string()),
@@ -1196,6 +1214,7 @@ pub(crate) fn resample_continuation_if_cross_backend(
         .map_err(|e| anyhow::anyhow!("pre-plan for cross-backend transfer failed: {}", e))?;
 
     match (source, &next_plan.backend_plan) {
+        (_, BackendPlanIR::AntennaFieldOnly(_)) => bail!("field_only cannot receive magnetic continuation state"),
         (ContinuationSource::Fdm(_), BackendPlanIR::Fem(_))
         | (ContinuationSource::Fdm(_), BackendPlanIR::FemEigen(_))
         | (ContinuationSource::Fdm(_), BackendPlanIR::FemFrequencyResponse(_)) => {
@@ -1605,7 +1624,8 @@ pub(crate) fn build_interactive_command_stage(
             solve_command.kind = match &base_problem.study {
                 fullmag_ir::StudyIR::Relaxation { .. } => "relax".to_string(),
                 fullmag_ir::StudyIR::TimeEvolution { .. } => "run".to_string(),
-                fullmag_ir::StudyIR::Eigenmodes { .. }
+                fullmag_ir::StudyIR::FieldOnly { .. }
+                | fullmag_ir::StudyIR::Eigenmodes { .. }
                 | fullmag_ir::StudyIR::FrequencyResponse { .. }
                 | fullmag_ir::StudyIR::Hysteresis { .. } => {
                     anyhow::bail!("interactive 'solve' is not supported for this study kind")

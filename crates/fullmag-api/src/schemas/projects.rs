@@ -55,7 +55,7 @@ pub(crate) struct ProjectRunSubmitRequest {
     pub archive_base64: String,
     /// Versioned `run_intent.v1` object; parsed and validated by the application contract.
     pub run_intent: BTreeMap<String, serde_json::Value>,
-    /// Versioned `study_plan.v2` object with typed steps, references and runner controls.
+    /// Versioned `study_plan.v1/v2/v3/v4`; v4 adds typed inspection operations and captured source.
     pub study_plan: BTreeMap<String, serde_json::Value>,
     /// Immutable study catalog: legacy v1, or v2 with pinned execution profiles and field origins.
     pub study_problem_catalog: BTreeMap<String, serde_json::Value>,

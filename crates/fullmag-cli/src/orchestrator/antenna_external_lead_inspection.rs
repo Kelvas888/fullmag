@@ -16,13 +16,15 @@ use std::sync::atomic::AtomicBool;
 
 pub(super) const STAGE_OUTPUT_NAME: &str = "antenna_external_lead_stage_output.v1.json";
 mod carrier;
-pub(super) use carrier::plan_carrier;
+pub(super) use carrier::{plan_carrier, plan_closed_loop_carrier};
 
 pub(super) fn is_carrier(plan: &fullmag_ir::ExecutionPlanIR) -> bool {
     plan.provenance
         .notes
         .iter()
-        .any(|note| note == "antenna_external_lead_inspection_carrier_only:no_llg_execution")
+        .any(|note| matches!(note.as_str(),
+            "antenna_external_lead_inspection_carrier_only:no_llg_execution"
+            | "antenna_closed_loop_inspection_carrier_only:no_llg_execution"))
 }
 
 fn read_record(path: &Path) -> Result<Vec<u8>> {

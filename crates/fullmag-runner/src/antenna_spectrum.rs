@@ -2331,6 +2331,7 @@ mod tests {
             }
         }
         AntennaFieldSolutionSamples {
+            sample_carrier: None,
             solution_id: "solution".into(),
             source_object_id: "antenna".into(),
             port_mode_id: "port".into(),
@@ -2420,6 +2421,7 @@ mod tests {
             })
             .collect();
         let samples = AntennaFieldSolutionSamples {
+            sample_carrier: None,
             solution_id: "solution".into(),
             source_object_id: "antenna".into(),
             port_mode_id: "port".into(),
@@ -2498,6 +2500,7 @@ mod tests {
             request.sampling_plane.extent_u_m = 0.5 * scale_m;
             request.sampling_plane.extent_v_m = 0.5 * scale_m;
             let samples = AntennaFieldSolutionSamples {
+                sample_carrier: None,
                 solution_id: "solution".into(),
                 source_object_id: "antenna".into(),
                 port_mode_id: "port".into(),
@@ -2595,6 +2598,7 @@ mod tests {
             [0.0, 0.0, 1.0],
         ];
         let samples = AntennaFieldSolutionSamples {
+            sample_carrier: None,
             solution_id: "solution".into(),
             source_object_id: "antenna".into(),
             port_mode_id: "port".into(),
@@ -2632,6 +2636,7 @@ mod tests {
         request.sampling_plane.extent_u_m = 0.1;
         request.sampling_plane.extent_v_m = 0.1;
         let samples = AntennaFieldSolutionSamples {
+            sample_carrier: None,
             solution_id: "solution".into(),
             source_object_id: "antenna".into(),
             port_mode_id: "port".into(),

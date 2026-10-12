@@ -326,6 +326,7 @@ pub(crate) fn resolve_with_registry(
 ) -> Result<DispatchEngineResolution, RunError> {
     match registry {
         Some(registry) => match &plan.backend_plan {
+            BackendPlanIR::AntennaFieldOnly(_) => Err(crate::field_only_plan_not_executable_as_llg()),
             BackendPlanIR::Fdm(fdm) => {
                 resolve_fdm_engine_with_registry(problem, registry, explicit_selection, Some(fdm))
             }
@@ -360,6 +361,7 @@ pub(crate) fn resolve_with_registry(
             }
         },
         None => match &plan.backend_plan {
+            BackendPlanIR::AntennaFieldOnly(_) => Err(crate::field_only_plan_not_executable_as_llg()),
             BackendPlanIR::Fdm(fdm) => {
                 let resolution = resolve_fdm_engine_for_plan_with_trail(problem, fdm)?;
                 Ok(DispatchEngineResolution {

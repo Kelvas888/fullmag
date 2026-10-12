@@ -16,6 +16,7 @@ use fullmag_ir::*;
 mod antenna_composition;
 mod antenna_current_source;
 mod antenna_field_solve;
+mod antenna_field_only;
 mod antenna_projection;
 mod antenna_validity;
 mod antenna_zeeman;
@@ -51,7 +52,8 @@ mod validate;
 pub mod boundary_geometry;
 
 pub use antenna_composition::{bind_antenna_field_solve, bind_antenna_field_solve_v03};
-pub use antenna_current_source::materialize_antenna_external_lead_current_input;
+pub use antenna_field_only::plan_antenna_field_only_carrier;
+pub use antenna_current_source::{materialize_antenna_external_lead_current_input, materialize_antenna_closed_loop_current_input};
 pub use antenna_field_solve::{plan_antenna_field_solve_execution, AntennaFieldSolveExecutionPlan};
 pub use antenna_projection::resolve_fem_antenna_projection_mask;
 pub use antenna_validity::{
@@ -117,6 +119,7 @@ pub use study_catalog::{
 pub use study_lowering::{
     lower_study_plan, StudyExecutionPlan, StudyLoweringError, StudyStepExecutionPlan,
     StudyStepLoweringStatus, STUDY_EXECUTION_PLAN_SCHEMA, STUDY_EXECUTION_PLAN_SCHEMA_V1,
+    STUDY_EXECUTION_PLAN_SCHEMA_V2,
 };
 pub use surface_selectors::{resolve_fem_surface_selector, ResolvedFemSurfaceSelector};
 pub use util::generate_random_unit_vectors;
@@ -144,6 +147,17 @@ pub fn plan(problem: &ProblemIR) -> Result<ExecutionPlanIR, PlanError> {
     execution_profile_guard::validate_bound_intent(problem).map_err(|reason| PlanError {
         reasons: vec![reason],
     })?;
+    if matches!(problem.study, fullmag_ir::StudyIR::FieldOnly { .. }) {
+        let stage_id = util::active_stage_id(problem).ok_or_else(|| PlanError {
+            reasons: vec!["field_only requires an explicitly selected antenna stage; drafts are not executable".into()],
+        })?;
+        let stage = problem.antenna_field_solve_stages.iter().find(|stage| stage.id == stage_id)
+            .ok_or_else(|| PlanError { reasons: vec!["field_only selected antenna stage is missing".into()] })?;
+        if stage.port_mode_ids.len() != 1 {
+            return Err(PlanError { reasons: vec!["field_only requires exactly one selected port mode".into()] });
+        }
+        return plan_antenna_field_only_carrier(problem, stage_id, &stage.port_mode_ids[0]);
+    }
     if sampling::has_unresolved_auto_sampling(problem) {
         let context = if util::active_stage_id(problem).is_none() {
             "runtime_metadata.active_stage_id and an enabled active sinc drive"
@@ -293,3 +307,5 @@ pub fn plan_antenna_field_solve(
 
 #[cfg(test)]
 mod tests;
+
+pub use study_lowering::{validate_closed_loop_operation, STUDY_EXECUTION_PLAN_SCHEMA_V4};

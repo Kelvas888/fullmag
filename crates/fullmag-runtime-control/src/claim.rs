@@ -19,6 +19,8 @@ pub fn commit_claimed_task_admission(
     claim: &TaskClaim,
 ) -> Result<fullmag_session::TaskAdmissionCommitDisposition> {
     commit_claimed_task_admission_with(store, task, claim, |lease| {
+        let _writer = store.write_transaction()?;
+        crate::study_completion::require_task_dependencies_locked(store, &claim.run_id, claim.task_id.as_str())?;
         store.commit_task_admission(lease)
     })
 }
@@ -35,7 +37,9 @@ pub fn commit_claimed_task_admission_with_host(
     request: &fullmag_session::host_resource_ledger::HostReservationRequest,
 ) -> Result<fullmag_session::TaskAdmissionCommitDisposition> {
     commit_claimed_task_admission_with(store, task, claim, |lease| {
-        ledger.commit_task_admission(request, store, lease)
+        ledger.commit_task_admission_checked(request, store, lease, || {
+            crate::study_completion::require_task_dependencies_locked(store, &claim.run_id, claim.task_id.as_str())
+        })
     })
 }
 
@@ -216,6 +220,12 @@ pub(crate) fn claimed_task_resource_compatibility(
                 study_step.step_id
             )
         })?;
+    if matches!(study_step.kind, fullmag_authoring::StudyStepKind::ClosedLoopInspection { .. }) {
+        if claim.lease.kind != ResourceKind::Cpu {
+            return Ok(ClaimedTaskResourceCompatibility::Incompatible("inspection realizes auto only on a CPU resource".into()));
+        }
+        crate::study_inspection::inspection_bundle_budget(claim)?;
+    }
     let compatibility = solver_resource_compatibility(
         &task_request.device,
         &claim.lease.kind,

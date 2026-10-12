@@ -92,12 +92,28 @@ class AntennaPortBranch:
 
 
 @dataclass(frozen=True, slots=True)
+class AntennaSourceCutRt0:
+    source_cut_ref: str
+    orientation: str = "minus_outward"
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "source_cut_ref", require_non_empty(self.source_cut_ref, "source_cut_ref"))
+        if self.orientation != "minus_outward":
+            raise ValueError("source-cut RT0 normalization requires minus_outward orientation")
+
+    def to_ir(self) -> dict[str, str]:
+        return {"kind": "source_cut_rt0", "source_cut_ref": self.source_cut_ref, "orientation": self.orientation}
+
+
+@dataclass(frozen=True, slots=True)
 class AntennaPortMode:
     id: str
     source_object_id: str
     current_transport_id: str
     branches: tuple[AntennaPortBranch, ...]
     normalization_current_a: float = 1.0
+    schema_version: str = ANTENNA_PORT_MODE_SCHEMA_VERSION
+    normalization: AntennaSourceCutRt0 | None = None
 
     def __init__(
         self,
@@ -107,7 +123,18 @@ class AntennaPortMode:
         current_transport_id: str,
         branches: Sequence[AntennaPortBranch],
         normalization_current_a: float = 1.0,
+        schema_version: str = ANTENNA_PORT_MODE_SCHEMA_VERSION,
+        normalization: AntennaSourceCutRt0 | None = None,
     ) -> None:
+        if schema_version not in {ANTENNA_PORT_MODE_SCHEMA_VERSION, "antenna_port_mode.v3"}:
+            raise ValueError("unsupported antenna port mode schema_version")
+        if schema_version == "antenna_port_mode.v3":
+            if not isinstance(normalization, AntennaSourceCutRt0):
+                raise ValueError("antenna port mode v3 requires typed source-cut RT0 normalization")
+        elif normalization is not None:
+            raise ValueError("antenna port mode v2 cannot use source-cut normalization")
+        object.__setattr__(self, "schema_version", schema_version)
+        object.__setattr__(self, "normalization", normalization)
         object.__setattr__(self, "id", require_non_empty(id, "antenna_port_mode.id"))
         object.__setattr__(
             self,
@@ -152,7 +179,8 @@ class AntennaPortMode:
 
     def to_ir(self) -> dict[str, object]:
         return {
-            "schema_version": ANTENNA_PORT_MODE_SCHEMA_VERSION,
+            "schema_version": self.schema_version,
+            **({"normalization": self.normalization.to_ir()} if self.normalization is not None else {}),
             "id": self.id,
             "source_object_id": self.source_object_id,
             "current_transport_id": self.current_transport_id,

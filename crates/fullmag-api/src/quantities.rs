@@ -110,6 +110,7 @@ fn scalar_metric_is_active(plan: Option<&ExecutionPlanIR>, metric_key: &str) -> 
         return metric_key != "e_rotated_dmi";
     };
     match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(_) => false,
         BackendPlanIR::Fdm(plan) => match metric_key {
             "e_ex" => plan.enable_exchange,
             "e_demag" => plan.enable_demag,
@@ -236,7 +237,7 @@ fn plan_is_rotated_dmi_only(plan: &ExecutionPlanIR) -> bool {
                 && plan.interfacial_dmi.is_none()
                 && plan.bulk_dmi.is_none()
         }
-        BackendPlanIR::FemEigen(_) | BackendPlanIR::FemFrequencyResponse(_) => false,
+        BackendPlanIR::AntennaFieldOnly(_) | BackendPlanIR::FemEigen(_) | BackendPlanIR::FemFrequencyResponse(_) => false,
     }
 }
 
@@ -244,6 +245,7 @@ pub(crate) fn extract_fem_mesh_from_metadata(metadata: &Value) -> Option<FemMesh
     let execution_plan =
         serde_json::from_value::<ExecutionPlanIR>(metadata.get("execution_plan")?.clone()).ok()?;
     match execution_plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(plan) => Some(fullmag_runner::StageFemMeshAsset::build_from_antenna_field_only_plan(&plan).payload),
         BackendPlanIR::Fem(fem) => Some(FemMeshPayload::from(&fem)),
         BackendPlanIR::FemEigen(fem) => Some(FemMeshPayload::from(&fem)),
         BackendPlanIR::FemFrequencyResponse(fem) => Some(FemMeshPayload::from(&fem)),

@@ -97,6 +97,7 @@ fn balanced_port_mode_is_composition_only_and_round_trips() {
             },
         ],
         normalization_current_a: 1.0,
+        normalization: None,
     });
 
     assert!(problem.validate().is_ok());
@@ -131,6 +132,7 @@ fn port_mode_rejects_unbalanced_or_missing_terminal_references() {
             },
         ],
         normalization_current_a: 1.0,
+        normalization: None,
     });
 
     let errors = problem.validate().unwrap_err();

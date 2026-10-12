@@ -106,6 +106,7 @@ fn drive_may_be_active(drive: &SolvedAntennaDriveIR, problem: &ProblemIR) -> boo
 fn study_kind_name(study_kind: StudyKindIR) -> &'static str {
     match study_kind {
         StudyKindIR::Unknown => "unknown",
+        StudyKindIR::FieldOnly => "field_only",
         StudyKindIR::TimeEvolution => "time_evolution",
         StudyKindIR::Relaxation => "relaxation",
         StudyKindIR::Hysteresis => "hysteresis",
@@ -462,6 +463,7 @@ mod tests {
     fn validity_resolves_stable_object_id_through_its_geometry_binding() {
         let mut problem = ProblemIR::bootstrap_example();
         problem.geometry.entries[0] = GeometryEntryIR::MicrostripAntenna {
+            r#loop: None,
             name: "layout_geometry".into(),
             length_m: 1.0e-5,
             thickness_m: 1.0e-7,

@@ -579,10 +579,20 @@ impl HostResourceLedger {
         store: &SessionStore,
         lease: &FmsResourceLease,
     ) -> Result<TaskAdmissionCommitDisposition> {
+        self.commit_task_admission_checked(request, store, lease, || Ok(()))
+    }
+
+    /// Validate application readiness under host-before-store locks, before
+    /// any tentative reservation or admission, including exact replay.
+    pub fn commit_task_admission_checked(
+        &self, request: &HostReservationRequest, store: &SessionStore,
+        lease: &FmsResourceLease, validate: impl FnOnce() -> Result<()>,
+    ) -> Result<TaskAdmissionCommitDisposition> {
         let _host_writer = self.writer.acquire()?;
         let _store_writer = store.write_transaction()?;
         let canonical_store_id = Self::store_id(store.root())?;
         validate_request_matches_store_claim(request, lease, &canonical_store_id)?;
+        validate()?;
 
         let mut document = self.read_document_locked()?;
         request.validate(&document.policy)?;
@@ -2728,4 +2738,29 @@ mod tests {
             .to_string()
             .contains("sum overflowed"));
     }
+
+    #[test]
+    fn checked_admission_failure_and_replay_publish_nothing_under_host_store_locks() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = SessionStore::open(directory.path().join("store")).unwrap();
+        let other_store = SessionStore::open_existing(store.root().to_path_buf()).unwrap();
+        let (policy, mut request, _, _, mut lease) = worker_release_fixture();
+        request.identity.store_id = HostResourceLedger::store_id(store.root()).unwrap();
+        lease.state = FmsResourceLeaseState::Active; lease.released_at = None; lease.heartbeat_sequence = 0;
+        let ledger = HostResourceLedger::initialize(ledger_root(directory.path()), policy.clone()).unwrap();
+        let other_ledger = HostResourceLedger::open(ledger_root(directory.path()), policy).unwrap();
+        let before = ledger.read().unwrap();
+        for _ in 0..2 {
+            let result = ledger.commit_task_admission_checked(&request, &store, &lease, || {
+                assert!(other_store.write_transaction().is_err());
+                assert!(other_ledger.reserve(&request).is_err());
+                anyhow::bail!("dependency changed before exact admission/replay")
+            });
+            assert!(result.unwrap_err().to_string().contains("dependency changed"));
+            assert_eq!(ledger.read().unwrap(), before);
+            assert!(store.read_run_catalog(&lease.run_id).unwrap().is_none());
+            assert!(store.read_resource_lease(&lease.run_id, &lease.resource_id, &lease.lease_token).unwrap().is_none());
+        }
+    }
+
 }

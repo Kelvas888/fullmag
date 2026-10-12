@@ -196,6 +196,9 @@ pub(crate) fn execution_plan_log_lines(
         stage.entrypoint_kind
     )];
     match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(carrier) => {
+            lines.push(format!("  field-only: source={} sampling_points={} magnetic_dofs=0", carrier.source_object_id, carrier.field_sampling.positions_xyz_m.len()));
+        }
         BackendPlanIR::Fdm(fdm) => {
             let extent = [
                 fdm.grid.cells[0] as f64 * fdm.cell_size[0],
@@ -320,6 +323,7 @@ pub(crate) fn current_artifact_layout(
     plan: &ExecutionPlanIR,
 ) -> serde_json::Value {
     match &plan.backend_plan {
+        BackendPlanIR::AntennaFieldOnly(carrier) => serde_json::json!({"backend": "fem", "stage_kind": "antenna_field_solve", "magnetization": null, "source_mesh_name": carrier.source_mesh.mesh_name, "field_sampling": carrier.field_sampling}),
         BackendPlanIR::Fdm(fdm) => {
             let total_cells = fdm.grid.cells[0] as usize
                 * fdm.grid.cells[1] as usize

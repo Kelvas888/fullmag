@@ -8,13 +8,14 @@ use crate::script_stage_contract::{
     ResolvedScriptStage, ResolvedScriptStageAction, ScriptAntennaAuthoringInventory,
     ScriptExecutionConfig, ScriptExecutionStageAction, StageTransitionKind, StageTransitionMetadata,
     StageTransitionReason, StateTransferOperatorKind, StudyPipelineDocument, StudyPipelineNode,
+    ScriptStageProvenance,
 };
 use anyhow::{bail, Context, Result};
 use fullmag_ir::{
     OutputDataFormatIR, OutputIR, OutputStorageIR, ProblemIR, RegionalFieldDriveIR, TableAutosaveIR,
 };
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn resolve_script_until_seconds(
     ir: &ProblemIR,
@@ -33,7 +34,7 @@ pub fn resolve_script_until_seconds(
         ),
         fullmag_ir::StudyIR::Eigenmodes { .. } => Ok(0.0),
         fullmag_ir::StudyIR::FrequencyResponse { .. } => Ok(0.0),
-        fullmag_ir::StudyIR::Hysteresis { .. } => Ok(0.0),
+        fullmag_ir::StudyIR::Hysteresis { .. } | fullmag_ir::StudyIR::FieldOnly { .. } => Ok(0.0),
     }
 }
 
@@ -223,6 +224,13 @@ mod canonical_relaxation_time_tests {
         )
         .unwrap();
         assert_eq!(stages.len(), 2);
+        let first = stages[0].provenance.as_ref().unwrap();
+        let second = stages[1].provenance.as_ref().unwrap();
+        assert_eq!(first.authored_step_id, "first");
+        assert_eq!(first.expansion_index, 0);
+        assert_eq!(first.ancestor_group_ids, vec!["outer"]);
+        assert_eq!(second.authored_step_id, "second");
+        assert_eq!(second.ancestor_group_ids, vec!["outer", "inner"]);
 
         let error = materialize_script_stages_with_output_policy_bounded(
             pipeline_config(nodes),
@@ -262,6 +270,87 @@ mod canonical_relaxation_time_tests {
         )
         .unwrap();
         assert_eq!(stages.len(), 1);
+        assert_eq!(stages[0].provenance.as_ref().unwrap().authored_step_id, "enabled");
+        assert!(stages[0].provenance.as_ref().unwrap().ancestor_group_ids.is_empty());
+    }
+
+    #[test]
+    fn macro_captures_distinct_expansions_and_authored_source() {
+        let config = pipeline_config(vec![StudyPipelineNode::Macro {
+            id: "macro".into(),
+            label: "Relax then Run".into(),
+            enabled: true,
+            notes: Some("Authored note".into()),
+            source: Some("script.py:12".into()),
+            macro_kind: "relax_run".into(),
+            config: BTreeMap::from([("run_until_seconds".into(), serde_json::json!(1e-12))]),
+        }]);
+        let stages = materialize_script_stages_with_output_policy_bounded(
+            config, fullmag_ir::configure_project_autosave_policy, 2,
+        ).unwrap();
+        assert_eq!(stages.len(), 2);
+        for (index, stage) in stages.iter().enumerate() {
+            let source = stage.provenance.as_ref().unwrap();
+            assert_eq!(source.authored_step_id, "macro");
+            assert_eq!(source.expansion_index, index);
+            assert_eq!(source.label, "Relax then Run");
+            assert_eq!(source.notes.as_deref(), Some("Authored note"));
+            assert_eq!(source.source.as_deref(), Some("script.py:12"));
+            assert!(source.ancestor_group_ids.is_empty());
+            assert_eq!(stage.ir.problem_meta.runtime_metadata["active_stage_id"], "macro");
+        }
+    }
+
+    #[test]
+    fn group_provenance_does_not_leak_into_siblings() {
+        let inner = StudyPipelineNode::Group {
+            id: "inner".into(), label: "inner".into(), enabled: true,
+            notes: None, source: None, collapsed: false,
+            children: vec![relax_primitive("nested")],
+        };
+        let outer = StudyPipelineNode::Group {
+            id: "outer".into(), label: "outer".into(), enabled: true,
+            notes: None, source: None, collapsed: false,
+            children: vec![inner, relax_primitive("outer-sibling")],
+        };
+        let stages = materialize_script_stages_with_output_policy_bounded(
+            pipeline_config(vec![outer, relax_primitive("root-sibling")]),
+            fullmag_ir::configure_project_autosave_policy, 3,
+        ).unwrap();
+        assert_eq!(stages.len(), 3);
+        assert_eq!(stages[0].provenance.as_ref().unwrap().ancestor_group_ids, vec!["outer", "inner"]);
+        assert_eq!(stages[1].provenance.as_ref().unwrap().ancestor_group_ids, vec!["outer"]);
+        assert!(stages[2].provenance.as_ref().unwrap().ancestor_group_ids.is_empty());
+    }
+
+    #[test]
+    fn pipeline_rejects_ambiguous_authored_ids_before_expansion() {
+        let group = |id: &str, enabled, children| StudyPipelineNode::Group {
+            id: id.into(), label: id.into(), enabled,
+            notes: None, source: None, collapsed: false, children,
+        };
+        for nodes in [
+            vec![relax_primitive("same"), relax_primitive("same")],
+            vec![group("same", true, vec![relax_primitive("same")])],
+            vec![
+                group("left", true, vec![relax_primitive("same")]),
+                group("right", true, vec![relax_primitive("same")]),
+            ],
+            vec![
+                group("disabled", false, vec![relax_primitive("same")]),
+                relax_primitive("same"),
+            ],
+        ] {
+            let error = materialize_script_stages_with_output_policy_bounded(
+                pipeline_config(nodes), fullmag_ir::configure_project_autosave_policy, 3,
+            ).unwrap_err();
+            assert!(error.to_string().contains("duplicate study pipeline node id 'same'"));
+        }
+        let error = materialize_script_stages_with_output_policy_bounded(
+            pipeline_config(vec![group("disabled", false, vec![relax_primitive(" ")])]),
+            fullmag_ir::configure_project_autosave_policy, 1,
+        ).unwrap_err();
+        assert!(error.to_string().contains("study pipeline node ids must not be empty"));
     }
 }
 
@@ -625,6 +714,11 @@ fn classify_stage_transition(
 
 fn classify_action_stage_transition(action: &ResolvedScriptStageAction) -> StageTransitionMetadata {
     match action {
+        ResolvedScriptStageAction::AntennaClosedLoopInspection { .. } => StageTransitionMetadata::boundary(
+            StageTransitionKind::AntennaClosedLoopInspection,
+            StageTransitionReason::AntennaClosedLoopInspection,
+            None,
+        ),
         ResolvedScriptStageAction::AntennaExternalLeadInspection { .. } => StageTransitionMetadata::boundary(
             StageTransitionKind::AntennaExternalLeadInspection,
             StageTransitionReason::AntennaExternalLeadInspection,
@@ -748,6 +842,11 @@ fn resolve_antenna_field_solve_action(
                 plan,
             }
         }
+        fullmag_plan::AntennaFieldSolveExecutionPlan::ClosedLoopInspection {
+            input, requested_execution, output_id,
+        } => ResolvedScriptStageAction::AntennaClosedLoopInspection {
+            input, requested_execution, output_id,
+        },
         fullmag_plan::AntennaFieldSolveExecutionPlan::ExternalLeadInspection {
             input,
             requested_execution,
@@ -1019,6 +1118,7 @@ fn materialize_study_pipeline(
             document.version
         );
     }
+    validate_pipeline_node_ids(&document.nodes, &mut BTreeSet::new())?;
     let mut stages = Vec::new();
     let mut current_ir = base_ir.clone();
     current_ir.problem_meta.runtime_metadata.insert(
@@ -1032,8 +1132,32 @@ fn materialize_study_pipeline(
         default_until_seconds,
         &mut stages,
         expansion_budget,
+        &[],
     )?;
     Ok(stages)
+}
+
+fn validate_pipeline_node_ids(
+    nodes: &[StudyPipelineNode],
+    seen: &mut BTreeSet<String>,
+) -> Result<()> {
+    for node in nodes {
+        let id = match node {
+            StudyPipelineNode::Primitive { id, .. }
+            | StudyPipelineNode::Macro { id, .. }
+            | StudyPipelineNode::Group { id, .. } => id,
+        };
+        if id.trim().is_empty() {
+            bail!("study pipeline node ids must not be empty");
+        }
+        if !seen.insert(id.clone()) {
+            bail!("duplicate study pipeline node id '{id}'");
+        }
+        if let StudyPipelineNode::Group { children, .. } = node {
+            validate_pipeline_node_ids(children, seen)?;
+        }
+    }
+    Ok(())
 }
 
 fn walk_study_pipeline_nodes(
@@ -1043,6 +1167,7 @@ fn walk_study_pipeline_nodes(
     default_until_seconds: Option<f64>,
     out: &mut Vec<ResolvedScriptStage>,
     expansion_budget: &mut Option<StageExpansionBudget>,
+    ancestor_group_ids: &[String],
 ) -> Result<()> {
     for node in nodes {
         match node {
@@ -1052,7 +1177,8 @@ fn walk_study_pipeline_nodes(
                 stage_kind,
                 payload,
                 label,
-                ..
+                notes,
+                source,
             } => {
                 if !enabled {
                     continue;
@@ -1066,6 +1192,14 @@ fn walk_study_pipeline_nodes(
                 )
                 .with_context(|| format!("failed to materialize study pipeline node '{label}'"))?
                 {
+                    stage.provenance = Some(ScriptStageProvenance {
+                        authored_step_id: id.clone(),
+                        expansion_index: 0,
+                        ancestor_group_ids: ancestor_group_ids.to_vec(),
+                        label: label.clone(),
+                        notes: notes.clone(),
+                        source: source.clone(),
+                    });
                     stage
                         .ir
                         .problem_meta
@@ -1083,7 +1217,8 @@ fn walk_study_pipeline_nodes(
                 macro_kind,
                 label,
                 config,
-                ..
+                notes,
+                source,
             } => {
                 if !enabled {
                     continue;
@@ -1096,7 +1231,15 @@ fn walk_study_pipeline_nodes(
                     expansion_budget.as_ref(),
                 )
                 .with_context(|| format!("failed to materialize study pipeline node '{label}'"))?;
-                for stage in &mut stages {
+                for (expansion_index, stage) in stages.iter_mut().enumerate() {
+                    stage.provenance = Some(ScriptStageProvenance {
+                        authored_step_id: id.clone(),
+                        expansion_index,
+                        ancestor_group_ids: ancestor_group_ids.to_vec(),
+                        label: label.clone(),
+                        notes: notes.clone(),
+                        source: source.clone(),
+                    });
                     stage
                         .ir
                         .problem_meta
@@ -1108,11 +1251,13 @@ fn walk_study_pipeline_nodes(
                 out.extend(stages);
             }
             StudyPipelineNode::Group {
-                enabled, children, ..
+                id, enabled, children, ..
             } => {
                 if !enabled {
                     continue;
                 }
+                let mut ancestors = ancestor_group_ids.to_vec();
+                ancestors.push(id.clone());
                 walk_study_pipeline_nodes(
                     children,
                     current_ir,
@@ -1120,6 +1265,7 @@ fn walk_study_pipeline_nodes(
                     default_until_seconds,
                     out,
                     expansion_budget,
+                    &ancestors,
                 )?;
             }
         }
@@ -1794,6 +1940,7 @@ fn frequency_response_sampling_from(base: &fullmag_ir::SamplingIR) -> fullmag_ir
 
 fn normalize_stage_sampling(ir: &mut ProblemIR) {
     match &mut ir.study {
+        fullmag_ir::StudyIR::FieldOnly { .. } => {}
         fullmag_ir::StudyIR::TimeEvolution { sampling, .. }
         | fullmag_ir::StudyIR::Relaxation { sampling, .. }
         | fullmag_ir::StudyIR::Hysteresis { sampling, .. } => {

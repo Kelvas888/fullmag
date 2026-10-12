@@ -223,6 +223,11 @@ pub struct ScriptExecutionStage {
 
 #[derive(Debug, Clone)]
 pub enum ResolvedScriptStageAction {
+    AntennaClosedLoopInspection {
+        input: fullmag_ir::ResolvedAntennaClosedLoopCurrentInputIR,
+        requested_execution: fullmag_ir::RequestedTransportExecutionIR,
+        output_id: String,
+    },
     AntennaExternalLeadInspection {
         input: fullmag_ir::ResolvedAntennaExternalLeadCurrentInputIR,
         requested_execution: fullmag_ir::RequestedTransportExecutionIR,
@@ -294,6 +299,7 @@ pub enum ResolvedScriptStageAction {
 #[serde(rename_all = "snake_case")]
 pub enum StageTransitionKind {
     ContinueInPlace,
+    AntennaClosedLoopInspection,
     AntennaExternalLeadInspection,
     AntennaFieldSolve,
     AntennaSourceSpectrum,
@@ -310,6 +316,7 @@ pub enum StageTransitionKind {
 #[serde(rename_all = "snake_case")]
 pub enum StageTransitionReason {
     SameRuntimeContext,
+    AntennaClosedLoopInspection,
     AntennaExternalLeadInspection,
     AntennaFieldSolve,
     AntennaSourceSpectrum,
@@ -390,6 +397,7 @@ impl StageTransitionMetadata {
         }
         match self.kind {
             StageTransitionKind::ContinueInPlace => "continues",
+            StageTransitionKind::AntennaClosedLoopInspection => "closed-loop inspection computed",
             StageTransitionKind::AntennaExternalLeadInspection => "antenna inspection computed",
             StageTransitionKind::AntennaFieldSolve => "field basis solved",
             StageTransitionKind::AntennaSourceSpectrum => "source spectrum computed",
@@ -404,6 +412,18 @@ impl StageTransitionMetadata {
     }
 }
 
+/// Authored identity of one actual execution, separate from its physical IR.
+/// A macro may own several executions; its node ID alone is not unique.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptStageProvenance {
+    pub authored_step_id: String,
+    pub expansion_index: usize,
+    pub ancestor_group_ids: Vec<String>,
+    pub label: String,
+    pub notes: Option<String>,
+    pub source: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResolvedScriptStage {
     pub ir: ProblemIR,
@@ -411,6 +431,7 @@ pub struct ResolvedScriptStage {
     pub entrypoint_kind: String,
     pub action: Option<ResolvedScriptStageAction>,
     pub incoming_transition: Option<StageTransitionMetadata>,
+    pub provenance: Option<ScriptStageProvenance>,
 }
 
 impl ResolvedScriptStage {
@@ -421,6 +442,7 @@ impl ResolvedScriptStage {
             entrypoint_kind: entrypoint_kind.into(),
             action: None,
             incoming_transition: None,
+            provenance: None,
         }
     }
 
@@ -435,6 +457,7 @@ impl ResolvedScriptStage {
             entrypoint_kind: entrypoint_kind.into(),
             action: Some(action),
             incoming_transition: None,
+            provenance: None,
         }
     }
 }
@@ -442,6 +465,17 @@ impl ResolvedScriptStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_stage_constructors_have_no_authored_provenance() {
+        let ir = ProblemIR::bootstrap_example();
+        assert!(ResolvedScriptStage::solver(ir.clone(), 1e-12, "direct").provenance.is_none());
+        assert!(ResolvedScriptStage::synthetic(
+            ir, "save", ResolvedScriptStageAction::SaveState {
+                artifact_name: "snapshot".into(), format: None, dataset: None,
+            },
+        ).provenance.is_none());
+    }
 
     #[test]
     fn execution_config_defaults_inventory_without_activating_definitions() {

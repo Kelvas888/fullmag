@@ -6,6 +6,7 @@
 //! policy, so every entry point can use the same Create/Open/Save/Save As/
 //! Close semantics.
 
+mod antenna_inspection_bundle;
 mod application;
 mod coordinator;
 mod declared_execution;
@@ -14,15 +15,23 @@ mod execution_profile;
 mod execution_profile_binding;
 mod file_repository;
 mod preparation;
+mod closed_loop_preparation;
+mod script_pipeline_acceptance;
 mod project;
 mod repository;
 mod run_spec;
+mod script_pipeline_compilation;
 pub mod script_stage_contract;
 pub mod script_stage_materialization;
 mod study_artifact;
 mod study_execution_materialization;
 mod task_execution;
 
+pub use antenna_inspection_bundle::{
+    decode_antenna_inspection_bundle, encode_antenna_inspection_bundle, AntennaInspectionBundle,
+    ANTENNA_INSPECTION_BUNDLE_CODEC_ID, ANTENNA_INSPECTION_BUNDLE_CODEC_VERSION,
+    ANTENNA_INSPECTION_BUNDLE_MAX_BYTES,
+};
 pub use application::{
     ActiveExecution, ActiveExecutionPolicy, ApplicationError, CloseRequest, CloseResult,
     CreateProjectRequest, DirtyClosePolicy, DocumentMode, DocumentView, OpenProjectResult,
@@ -42,7 +51,7 @@ pub use execution::{
     TaskClaim, TaskId, TaskLifecycle, TaskReadiness, TaskRecord, WorkerCommand,
     WorkerCommandEnvelope, WorkerCommandInbox, WorkerEvent, WorkerEventEnvelope,
     WorkerInboxCheckpoint, WorkerProtocolLedger, LEGACY_RESOLVED_TASK_INPUT_SCHEMA,
-    RESOLVED_TASK_INPUT_SCHEMA, RETRY_DECISION_SCHEMA, WORKER_INBOX_SCHEMA, WORKER_PROTOCOL_SCHEMA,
+    CLOSED_LOOP_RESOLVED_TASK_INPUT_SCHEMA, CLOSED_LOOP_WORKER_PROTOCOL_SCHEMA, RESOLVED_TASK_INPUT_SCHEMA, RETRY_DECISION_SCHEMA, WORKER_INBOX_SCHEMA, WORKER_PROTOCOL_SCHEMA,
 };
 pub use execution_profile::{
     materialize_execution_request, materialize_referenced_execution,
@@ -50,6 +59,8 @@ pub use execution_profile::{
 };
 pub use execution_profile_binding::bind_materialized_execution;
 pub use file_repository::{FileProjectRepository, FileRepositoryError};
+pub use closed_loop_preparation::{AcceptedPreparationProof, AcceptedPreparationReceipt, ClosedLoopPreparationPlan, ClosedLoopPreparationReceipt, CLOSED_LOOP_PREPARATION_SCHEMA, CLOSED_LOOP_PREPARATION_BINDING_SCHEMA};
+pub use script_pipeline_acceptance::{compile_accepted_closed_loop_pipeline, validate_accepted_script_pipeline_source, validate_script_source_assets, AcceptedScriptPipeline, SCRIPT_PIPELINE_SOURCE_ASSET_ID, SCRIPT_PIPELINE_SOURCE_SCHEMA};
 pub use preparation::{
     materialize_fdm_preparation_from_problem, materialize_fem_preparation_from_problem,
     AcceptedRunPreparationSource, PreparationBinding, PreparationMaterializationError,
@@ -70,6 +81,10 @@ pub use run_spec::{
     ImmutableAssetReference, ProjectSnapshot, RequestedExecution, RequestedResourceBudget,
     RunDependency, RunId, RunIntent, RunIntentLedger, RunSpecError, RunSpecification, StudyId,
     StudyReference, SubmitDisposition, SubmitReceipt, RUN_INTENT_SCHEMA, RUN_SPEC_SCHEMA,
+};
+pub use script_pipeline_compilation::{
+    materialize_script_pipeline_with_output_policy_bounded, CompiledScriptExecution,
+    ScriptPipelineCompilation, ScriptPipelineNodeBinding, ScriptPipelineNodeKind,
 };
 pub use study_artifact::{
     decode_magnetization_field_semantics, decode_study_artifact, decode_study_artifact_bytes,

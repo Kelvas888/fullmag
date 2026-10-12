@@ -1021,6 +1021,7 @@ fn public_m1_fem_run_fixture() -> (fullmag_ir::ProblemIR, fullmag_runner::FemMes
         constitutive_version: "transport_constitutive.one_way.fullmag.v1".into(),
     }];
     match &mut problem.study {
+        StudyIR::FieldOnly { .. } => panic!("magnetic fixture cannot use FieldOnly"),
         StudyIR::TimeEvolution { sampling, .. }
         | StudyIR::Relaxation { sampling, .. }
         | StudyIR::Eigenmodes { sampling, .. }

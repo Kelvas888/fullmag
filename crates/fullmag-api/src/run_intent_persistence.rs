@@ -218,6 +218,16 @@ fn commit_validated_run_intent_with_optional_backlog_limit(
             );
         }
     }
+    if study.schema_version==fullmag_authoring::STUDY_PLAN_SCHEMA_VERSION_V4 {
+        let bytes=asset_payloads.get(fullmag_application::SCRIPT_PIPELINE_SOURCE_ASSET_ID).context("v4 Submit requires captured compiler source")?;
+        let source=fullmag_application::validate_accepted_script_pipeline_source(study,catalog,bytes)?;
+        fullmag_application::validate_script_source_assets(&intent.specification,&source,|hash,maximum| {
+            let reference=intent.specification.immutable_assets.iter().find(|asset|asset.content_sha256==hash).context("captured source ref missing")?;
+            let bytes=asset_payloads.get(&reference.asset_id).context("captured source bytes missing")?;
+            if bytes.len() as u64>maximum { bail!("captured source byte bound differs from Submit bytes"); }
+            Ok(bytes.clone())
+        })?;
+    }
     // Every store mutation below (CAS blobs, intent publication, replay
     // verification) must belong to ONE writer lease.  The lease is re-entrant
     // on this thread, but separate short leases let two concurrent identical
@@ -442,7 +452,7 @@ mod tests {
         PrimitiveStageNode, StudyDiscretizationReference, StudyExecutionProfileReference,
         StudyModelReference, StudyPipelineDocument, StudyPipelineNode, StudyPipelineNodeSource,
         StudyPlanMigrationDefaults, StudyPrimitiveStageKind, StudySolverConfigReference,
-        STUDY_PLAN_SCHEMA_VERSION,
+        STUDY_PLAN_SCHEMA_VERSION_V2,
     };
     use fullmag_ir::ProblemIR;
     use fullmag_plan::lower_study_plan_with_catalog;
@@ -638,7 +648,7 @@ mod tests {
             ProjectSnapshot::from_envelope(&definition).unwrap(),
             StudyReference {
                 study_id: StudyId::parse("study-main").unwrap(),
-                plan_version: STUDY_PLAN_SCHEMA_VERSION.into(),
+                plan_version: STUDY_PLAN_SCHEMA_VERSION_V2.into(),
                 plan_sha256: study.canonical_sha256().unwrap(),
             },
             fullmag_session::canonical_json_sha256(&catalog_value),
@@ -883,7 +893,7 @@ mod tests {
             ProjectSnapshot::from_envelope(&definition).unwrap(),
             StudyReference {
                 study_id: StudyId::parse("study-lease").unwrap(),
-                plan_version: STUDY_PLAN_SCHEMA_VERSION.into(),
+                plan_version: STUDY_PLAN_SCHEMA_VERSION_V2.into(),
                 plan_sha256: study.canonical_sha256().unwrap(),
             },
             fullmag_session::canonical_json_sha256(&catalog_value),

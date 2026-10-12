@@ -26,10 +26,13 @@ mod live_workspace;
 mod nvtx_range;
 mod orchestrator;
 mod python_bridge;
+mod script_source_capture;
+mod accepted_script_run;
 mod run_manifest;
 mod runtime_service_client;
 mod runtime_supervisor;
 mod saved_fem_snapshot_gate;
+mod accepted_inspection_cold_load;
 mod scratch_runtime;
 mod script_inspect;
 mod script_launch;
@@ -109,6 +112,9 @@ fn main() -> Result<()> {
                     "status": "ready", "owner": owner,
                 }))?
             );
+        }
+        Command::Runtime(RuntimeCommand::VerifySavedInspection { store, project_id, run_id, task_id, attempt_id, ownership_epoch, object_ref }) => {
+            accepted_inspection_cold_load::verify(&store, &project_id, &run_id, &task_id, &attempt_id, ownership_epoch, &object_ref)?;
         }
         Command::Runtime(RuntimeCommand::VerifySavedFemSnapshot {
             store,
@@ -317,6 +323,10 @@ fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&direct_run_summary(&result, &output_dir))?
             );
+        }
+        Command::RunScriptAccepted { script, project, execution_profile, resources, idempotency_key, api_url, submit_only } => {
+            let result=accepted_script_run::submit_script(&script,&project,&execution_profile,&resources,&idempotency_key,&api_url,submit_only)?;
+            println!("{}",serde_json::to_string_pretty(&result)?);
         }
         Command::RunJson {
             path,

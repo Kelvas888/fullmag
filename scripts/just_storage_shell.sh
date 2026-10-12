@@ -86,6 +86,14 @@ if is_windows_shell && command -v cygpath >/dev/null 2>&1; then
 fi
 # Frozen coordinator provisioning must be admitted before diagnostic markers.
 case "${recipe}" in
+  *"scripts/launch_accepted_closed_loop_runtime.py"*)
+    closed_loop_pattern="^[^[:space:]]+ \"[^\"]+/scripts/launch_accepted_closed_loop_runtime.py\" --request '([^']+)' --request-sha256 '([0-9a-f]{64})'$"
+    if [[ ! "${recipe}" =~ ${closed_loop_pattern} ]]; then
+      echo "[fullmag just] invalid closed-loop runtime recipe" >&2
+      exit 2
+    fi
+    exec "${python_cmd}" "${script_dir}/launch_accepted_closed_loop_runtime.py" --request "${BASH_REMATCH[1]}" --request-sha256 "${BASH_REMATCH[2]}"
+    ;;
   *"scripts/local_runner/coordinator_image.py"*)
     coordinator_base_pattern="^[^[:space:]]+ \"[^\"]+/scripts/local_runner/coordinator_image.py\" provision-base --repo-root '([^']+)'$"
     if [[ "${recipe}" =~ ${coordinator_base_pattern} ]]; then

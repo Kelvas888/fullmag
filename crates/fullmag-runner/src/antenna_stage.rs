@@ -1303,6 +1303,7 @@ mod tests {
             port_mode_id: "common".into(),
             solution_id: solution_id.into(),
             field_solution: crate::AntennaFieldSolutionSamples {
+                sample_carrier: None,
                 solution_id: solution_id.into(),
                 source_object_id: "antenna".into(),
                 port_mode_id: "common".into(),

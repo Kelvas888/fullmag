@@ -146,6 +146,7 @@ pub enum DriveActivationIR {
 pub enum StudyKindIR {
     #[default]
     Unknown,
+    FieldOnly,
     TimeEvolution,
     Relaxation,
     Hysteresis,
@@ -1553,6 +1554,9 @@ pub enum EigenDampingPolicyIR {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StudyIR {
+    FieldOnly {
+        sampling: SamplingIR,
+    },
     TimeEvolution {
         dynamics: DynamicsIR,
         sampling: SamplingIR,
@@ -1664,6 +1668,7 @@ impl StudyIR {
     /// plans and activation checks.
     pub const fn kind(&self) -> StudyKindIR {
         match self {
+            Self::FieldOnly { .. } => StudyKindIR::FieldOnly,
             Self::TimeEvolution { .. } => StudyKindIR::TimeEvolution,
             Self::Relaxation { .. } => StudyKindIR::Relaxation,
             Self::Eigenmodes { .. } => StudyKindIR::Eigenmodes,
@@ -1684,12 +1689,14 @@ impl StudyIR {
             | StudyIR::FrequencyResponse { dynamics, .. } => Some(dynamics),
             StudyIR::Relaxation { dynamics, .. } => dynamics.as_ref(),
             StudyIR::Hysteresis { .. } => Some(get_default_dynamics()),
+            StudyIR::FieldOnly { .. } => None,
         }
     }
 
     pub fn sampling(&self) -> &SamplingIR {
         match self {
-            StudyIR::TimeEvolution { sampling, .. }
+            StudyIR::FieldOnly { sampling }
+            | StudyIR::TimeEvolution { sampling, .. }
             | StudyIR::Relaxation { sampling, .. }
             | StudyIR::Eigenmodes { sampling, .. }
             | StudyIR::FrequencyResponse { sampling, .. }
@@ -1699,7 +1706,8 @@ impl StudyIR {
 
     pub fn sampling_mut(&mut self) -> &mut SamplingIR {
         match self {
-            StudyIR::TimeEvolution { sampling, .. }
+            StudyIR::FieldOnly { sampling }
+            | StudyIR::TimeEvolution { sampling, .. }
             | StudyIR::Relaxation { sampling, .. }
             | StudyIR::Eigenmodes { sampling, .. }
             | StudyIR::FrequencyResponse { sampling, .. }
@@ -1709,7 +1717,8 @@ impl StudyIR {
 
     pub fn relaxation(&self) -> Option<RelaxationControlIR> {
         match self {
-            StudyIR::TimeEvolution { .. }
+            StudyIR::FieldOnly { .. }
+            | StudyIR::TimeEvolution { .. }
             | StudyIR::Eigenmodes { .. }
             | StudyIR::FrequencyResponse { .. }
             | StudyIR::Hysteresis { .. } => None,

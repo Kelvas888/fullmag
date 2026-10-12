@@ -11,6 +11,7 @@ use crate::{
 
 pub const ANTENNA_NORMALIZATION_CURRENT_A: f64 = 1.0;
 pub const ANTENNA_PORT_MODE_SCHEMA_VERSION_V2: &str = "antenna_port_mode.v2";
+pub const ANTENNA_PORT_MODE_SCHEMA_VERSION_V3: &str = "antenna_port_mode.v3";
 pub const ANTENNA_PORT_MIGRATION_REQUIRES_TERMINAL_PAIRS: &str =
     "antenna_port_migration_requires_terminal_pairs";
 /// Versioned execution policy for the direct tetrahedral Biot--Savart lane.
@@ -67,6 +68,35 @@ pub struct CpwWidthStationIR {
 pub struct AntennaConductorPartIR {
     pub id: String,
     pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct MicrostripClosedLoopIR {
+    pub enabled: bool,
+    pub inlet_connection_length_m: f64,
+    pub inlet_connection_width_m: f64,
+    pub inlet_connection_offset_v_m: f64,
+    pub inlet_connection_part_id: String,
+    pub inlet_connection_conductivity_s_per_m: f64,
+    pub outlet_connection_length_m: f64,
+    pub outlet_connection_width_m: f64,
+    pub outlet_connection_offset_v_m: f64,
+    pub outlet_connection_part_id: String,
+    pub outlet_connection_conductivity_s_per_m: f64,
+}
+impl MicrostripClosedLoopIR {
+    pub(crate) fn validation_errors(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if !self.enabled || !nonempty(&self.inlet_connection_part_id) || !nonempty(&self.outlet_connection_part_id)
+            || self.inlet_connection_part_id==self.outlet_connection_part_id
+            || [self.inlet_connection_length_m,self.inlet_connection_width_m,self.inlet_connection_conductivity_s_per_m,
+                self.outlet_connection_length_m,self.outlet_connection_width_m,self.outlet_connection_conductivity_s_per_m].iter().any(|value| !value.is_finite() || *value<=0.0)
+            || !self.inlet_connection_offset_v_m.is_finite() || !self.outlet_connection_offset_v_m.is_finite() {
+            errors.push("microstrip loop requires explicit finite bridge geometry, conductivity and distinct part IDs".into());
+        }
+        errors
+    }
 }
 
 /// Local inlet/outlet face selectors for one conductor body.
@@ -323,6 +353,11 @@ pub struct AntennaPortBranchV2IR {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum AntennaPortNormalizationIR {
+    SourceCutRt0 { source_cut_ref: String, orientation: String },
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct AntennaPortModeIR {
     pub schema_version: String,
@@ -330,6 +365,8 @@ pub struct AntennaPortModeIR {
     pub source_object_id: String,
     pub current_transport_id: String,
     pub branches: Vec<AntennaPortBranchV2IR>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalization: Option<AntennaPortNormalizationIR>,
     #[serde(default = "default_normalization_current_a")]
     pub normalization_current_a: f64,
 }
@@ -379,6 +416,7 @@ pub fn import_legacy_antenna_port_mode(
         current_transport_id: legacy.current_transport_id,
         branches,
         normalization_current_a: legacy.normalization_current_a,
+        normalization: None,
     })
 }
 
@@ -718,7 +756,11 @@ fn validate_v2_port_structure(
     prefix: &str,
     errors: &mut Vec<String>,
 ) {
-    if port.schema_version != ANTENNA_PORT_MODE_SCHEMA_VERSION_V2 {
+    let closed_loop = port.schema_version == ANTENNA_PORT_MODE_SCHEMA_VERSION_V3;
+    if closed_loop && !matches!(&port.normalization,Some(AntennaPortNormalizationIR::SourceCutRt0 {source_cut_ref,orientation}) if nonempty(source_cut_ref) && orientation=="minus_outward") {
+        errors.push(format!("{prefix}.normalization requires an explicit source_cut_rt0 reference with minus_outward orientation"));
+    }
+    if port.schema_version != ANTENNA_PORT_MODE_SCHEMA_VERSION_V2 && !closed_loop {
         errors.push(format!(
             "{prefix}.schema_version must equal '{ANTENNA_PORT_MODE_SCHEMA_VERSION_V2}'"
         ));
@@ -748,7 +790,7 @@ fn validate_v2_port_structure(
                 "{branch_prefix} requires two different non-empty terminal selectors"
             ));
         }
-        if !branch.signed_weight.is_finite() || branch.signed_weight == 0.0 {
+        if !branch.signed_weight.is_finite() || (!closed_loop && branch.signed_weight == 0.0) {
             errors.push(format!(
                 "{branch_prefix}.signed_weight must be finite and non-zero"
             ));
@@ -761,17 +803,46 @@ fn validate_v2_port_structure(
             }
         }
     }
-    if total_weight.abs() > 1.0e-12 || (positive_weight - 1.0).abs() > 1.0e-12 || !has_negative {
+    if !closed_loop && (total_weight.abs() > 1.0e-12 || (positive_weight - 1.0).abs() > 1.0e-12 || !has_negative) {
         errors.push(format!(
             "{prefix}.branches must have positive weights summing to 1 and all weights summing to zero"
         ));
     }
 
-    let Some(definition) = definition else {
+    if !closed_loop && port.normalization.is_some() {
+        errors.push(format!("{prefix}.normalization source-cut contract requires explicit v3"));
+    }
+    let Some(definition) = definition else { return; };
+    if closed_loop {
+        if let Some(crate::StructuredCurrentClosureIR::ClosedGeometry {schema_version, source_cuts, ..}) = &definition.structured_current_closure {
+            if schema_version!="structured_current_closure.v2" || !matches!(&port.normalization, Some(AntennaPortNormalizationIR::SourceCutRt0 {source_cut_ref, orientation})
+                if source_cuts.len()==1 && source_cut_ref==&source_cuts[0].source_cut_id && orientation=="minus_outward") {
+                errors.push(format!("{prefix} pending v3 requires its exact authored coincident source cut"));
+            }
+            return;
+        }
+        let Some(crate::ConservativeCurrentSourceIR::ClosedGeometryPotentialJump(source)) = &definition.conservative_current_source else {
+            errors.push(format!("{prefix} v3 requires its prepared closed-loop source")); return;
+        };
+        let crate::ConservativeCurrentClosureIR::ClosedGeometry {source_cuts, ..} = &source.closure else { return; };
+        if !matches!(&port.normalization, Some(AntennaPortNormalizationIR::SourceCutRt0 {source_cut_ref, orientation})
+            if source_cuts.len()==1 && source_cut_ref==&source_cuts[0].id && orientation=="minus_outward") {
+            errors.push(format!("{prefix}.normalization must select its actual cut and minus_outward RT0 current"));
+        }
+        if source.object_id!=port.source_object_id || port.branches.len()!=2 {
+            errors.push(format!("{prefix} requires exactly two observed signal/return branches of the same source owner"));
+        }
+        for branch in &port.branches {
+            let inlet = source.terminal_observations.iter().find(|obs| obs.id==branch.inlet_terminal_ref);
+            let outlet = source.terminal_observations.iter().find(|obs| obs.id==branch.outlet_terminal_ref);
+            if !matches!((inlet, outlet), (Some(a),Some(b)) if a.part_id==b.part_id && a.selector=="local_u_min" && b.selector=="local_u_max") {
+                errors.push(format!("{prefix} branch '{}' requires actual inlet/outlet observations on the same part", branch.id));
+            }
+        }
         return;
-    };
+    }
     let authored_terminals = if let Some(source) = &definition.conservative_current_source {
-        let crate::ConservativeCurrentSourceIR::ExternalLeadCurrent { drives, .. } = source;
+        let crate::ConservativeCurrentSourceIR::ExternalLeadCurrent { drives, .. } = source else { errors.push(format!("{prefix} prepared closed-loop source requires explicit port v3")); return; };
         Some((drives, source.terminal_observations().iter()
             .map(|observation| (observation.id.as_str(), observation.object_id.as_str()))
             .collect::<std::collections::BTreeMap<_, _>>()))
@@ -1019,7 +1090,7 @@ fn validate_stage_current_view_ref(
                 definition: Some(definition),
                 ..
             } if name == &stage.current_transport_id
-                && (definition.conservative_current_source.is_some() || definition.external_lead_preparation.is_some())
+                && (definition.conservative_current_source.is_some() || definition.external_lead_preparation.is_some() || matches!(&definition.structured_current_closure, Some(crate::StructuredCurrentClosureIR::ClosedGeometry {schema_version, ..}) if schema_version=="structured_current_closure.v2"))
         )
     });
     if !has_typed_source {
@@ -1362,7 +1433,7 @@ pub(crate) fn validate_antenna_composition_v03(problem: &ProblemIR, errors: &mut
         && problem.solved_antenna_drives.is_empty()
         && problem.antenna_spectrum_requests.is_empty()
         && !problem.current_modules.iter().any(|module| matches!(module,
-            CurrentModuleIR::CurrentTransport { definition: Some(definition), .. } if definition.conservative_current_source.is_some() || definition.external_lead_preparation.is_some()))
+            CurrentModuleIR::CurrentTransport { definition: Some(definition), .. } if definition.conservative_current_source.is_some() || definition.external_lead_preparation.is_some() || matches!(&definition.structured_current_closure, Some(crate::StructuredCurrentClosureIR::ClosedGeometry {schema_version, ..}) if schema_version=="structured_current_closure.v2")))
     {
         return;
     }
@@ -2075,7 +2146,7 @@ mod tests {
         let crate::ConservativeCurrentSourceIR::ExternalLeadCurrent {
             terminal_observations,
             ..
-        } = &mut source;
+        } = &mut source else { unreachable!("legacy current-source fixture") };
         terminal_observations[0].id = "signal-in".into();
         terminal_observations[1].id = "signal-out".into();
         terminal_observations.extend([

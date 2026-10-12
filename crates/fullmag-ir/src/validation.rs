@@ -2269,7 +2269,7 @@ pub(crate) fn validate_current_modules(problem: &ProblemIR, errors: &mut Vec<Str
             } => {
                 if definition
                     .as_ref()
-                    .is_some_and(|definition| definition.conservative_current_source.is_some())
+                    .is_some_and(|definition| definition.conservative_current_source.is_some() || matches!(&definition.structured_current_closure, Some(crate::StructuredCurrentClosureIR::ClosedGeometry {schema_version,..}) if schema_version=="structured_current_closure.v2"))
                     && (*model != CurrentTransportModelIR::OhmicPoisson
                         || *coupling != crate::TransportCouplingIR::OneWay
                         || time_envelope.is_some())
@@ -2456,6 +2456,18 @@ fn validate_charge_transport_definition(
     errors: &mut Vec<String>,
 ) {
     let prefix = format!("current_modules[{index}] current_transport");
+    let prepared_loop = matches!(&definition.conservative_current_source, Some(crate::ConservativeCurrentSourceIR::ClosedGeometryPotentialJump(_)));
+    let authored_loop = matches!(&definition.structured_current_closure, Some(crate::StructuredCurrentClosureIR::ClosedGeometry {schema_version, ..}) if schema_version=="structured_current_closure.v2");
+    let closed_loop = prepared_loop || authored_loop;
+    if closed_loop {
+        let whole=definition.materials.len()==1 && definition.materials[0].region.region_id.is_none();
+        let parts=definition.materials.len()==4 && definition.materials.iter().all(|assignment|assignment.region.region_id.is_some())
+            && definition.materials.iter().map(|assignment|assignment.region.region_id.as_ref()).collect::<BTreeSet<_>>().len()==4;
+        if definition.domain.len()!=1 || definition.domain[0].region_id.is_some() || !(whole||parts)
+            || definition.materials.iter().any(|assignment|assignment.region.object_id!=definition.domain[0].object_id) {
+            errors.push(format!("{prefix} closed loop requires one complete owner and either one whole-object material or four distinct parts"));
+        }
+    }
     if let Some(preparation) = &definition.external_lead_preparation {
         errors.extend(preparation.validation_errors(&format!("{prefix}.external_lead_preparation")));
         if reciprocal || !definition.boundaries.is_empty()
@@ -2482,11 +2494,12 @@ fn validate_charge_transport_definition(
         errors.extend(source.validation_errors(&format!("{prefix}.conservative_current_source")));
         if reciprocal
             || !definition.boundaries.is_empty()
-            || definition.gauge != crate::ChargePotentialGaugeIR::TerminalReference
+            || definition.gauge != if prepared_loop { crate::ChargePotentialGaugeIR::ZeroMean } else { crate::ChargePotentialGaugeIR::TerminalReference }
             || definition.conservative_current_view.is_some()
             || definition.structured_current_closure.is_some()
+            || definition.external_lead_preparation.is_some()
         {
-            errors.push(format!("{prefix}.conservative_current_source requires one-way transport, empty boundaries, terminal_reference gauge and no other source/view"));
+            errors.push(format!("{prefix}.conservative_current_source requires one-way transport, empty boundaries, source-specific gauge (v1 terminal_reference; v2 zero_mean) and no other source/view"));
         }
         if !matches!(
             requested_backend,
@@ -2522,12 +2535,17 @@ fn validate_charge_transport_definition(
                 "{prefix}.structured_current_closure supports one-way ohmic transport only"
             ));
         }
-        if requested_backend == crate::BackendTarget::Fem {
+        if !authored_loop && requested_backend == crate::BackendTarget::Fem {
             errors.push(format!(
                 "{prefix}.structured_current_closure requires FDM discretization"
             ));
         }
-        if definition.solver.operator_version != "fv_charge_harmonic_source_cut_v1" {
+        if authored_loop {
+            if !matches!(requested_backend, crate::BackendTarget::Fem | crate::BackendTarget::Auto) || definition.gauge!=crate::ChargePotentialGaugeIR::ZeroMean || !definition.boundaries.is_empty()
+                || definition.solver.engine!="cg" || definition.solver.operator_version!="fem_charge_conforming_h1_p1.transparent.v1" {
+                errors.push(format!("{prefix}.structured closure v2 requires pending FEM H1 cg zero_mean with empty boundaries"));
+            }
+        } else if definition.solver.operator_version != "fv_charge_harmonic_source_cut_v1" {
             errors.push(format!(
                 "{prefix}.structured_current_closure requires solver.operator_version='fv_charge_harmonic_source_cut_v1'"
             ));
@@ -2570,7 +2588,7 @@ fn validate_charge_transport_definition(
                 "{prefix}.materials[{material_index}] anisotropic conductivity is valid only for magnetoresistive_poisson"
             ));
         }
-        if !definition.domain.contains(&assignment.region) {
+        if !definition.domain.contains(&assignment.region) && !(closed_loop && definition.domain.iter().any(|region| region.object_id==assignment.region.object_id && region.region_id.is_none())) {
             errors.push(format!(
                 "{prefix}.materials[{material_index}].region must belong to the authored charge domain"
             ));
@@ -2582,7 +2600,7 @@ fn validate_charge_transport_definition(
             .iter()
             .filter(|assignment| &assignment.region == region)
             .count();
-        if assignments != 1 {
+        if assignments != 1 && !(closed_loop && region.region_id.is_none() && definition.materials.iter().all(|assignment| assignment.region.object_id==region.object_id && assignment.region.region_id.is_some())) {
             errors.push(format!(
                 "{prefix} each charge domain region requires exactly one material assignment"
             ));
@@ -3964,7 +3982,7 @@ pub(crate) fn validate_magnetoelastic(problem: &ProblemIR, errors: &mut Vec<Stri
             let DynamicsIR::Llg { mechanics, .. } = dynamics;
             mechanics.as_ref()
         }),
-        crate::StudyIR::Hysteresis { .. } => None,
+        crate::StudyIR::Hysteresis { .. } | crate::StudyIR::FieldOnly { .. } => None,
     };
     if mechanics.is_some() && !has_magnetoelastic {
         errors.push("llg.mechanics requires a Magnetoelastic energy term".to_string());

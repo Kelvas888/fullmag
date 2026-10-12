@@ -4,6 +4,10 @@
 //! it never discovers files by scanning an output directory. Scalar values
 //! use a small SI-valued envelope with their quantity and unit named.
 
+use crate::antenna_inspection_bundle::{
+    decode_antenna_inspection_bundle, AntennaInspectionBundle, ANTENNA_INSPECTION_BUNDLE_CODEC_ID,
+    ANTENNA_INSPECTION_BUNDLE_CODEC_VERSION, ANTENNA_INSPECTION_BUNDLE_MAX_BYTES,
+};
 use crate::execution::{ExecutionError, ResolvedStudyArtifact};
 use fullmag_quantities::fem_state_field::FemP1MagnetizationFieldSemantics;
 use serde::{Deserialize, Serialize};
@@ -21,6 +25,7 @@ pub const MAGNETIZATION_STATE_IDENTITY_SCHEMA: &str = "magnetization_state.v1";
 pub enum DecodedStudyArtifact {
     MagnetizationState(MagnetizationStateArtifact),
     Scalar(StudyScalarArtifact),
+    AntennaClosedLoopInspection(AntennaInspectionBundle),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -126,6 +131,10 @@ pub fn decode_study_artifact(
         ) => decode_magnetization_state(bytes).map(DecodedStudyArtifact::MagnetizationState),
         ("scalar", STUDY_SCALAR_CODEC_ID, STUDY_SCALAR_CODEC_VERSION) => {
             decode_scalar(bytes).map(DecodedStudyArtifact::Scalar)
+        }
+        ("artifact", ANTENNA_INSPECTION_BUNDLE_CODEC_ID, ANTENNA_INSPECTION_BUNDLE_CODEC_VERSION) => {
+            decode_antenna_inspection_bundle(bytes, ANTENNA_INSPECTION_BUNDLE_MAX_BYTES)
+                .map(DecodedStudyArtifact::AntennaClosedLoopInspection)
         }
         _ => Err(invalid("unsupported study artifact codec")),
     }
@@ -857,6 +866,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("do not match"));
+    }
+
+    #[test]
+    fn inspection_bundle_registry_requires_exact_artifact_codec_tuple() {
+        // Structural framing fixture only; the runner must reject it as physical evidence.
+        let path = "antenna/field_solutions/output/a.bin";
+        let payload = vec![1u8, 2, 3];
+        let manifest = serde_json::to_vec(&json!({
+            "schema_version": "antenna_field_solution.v2", "status": "inspection_only",
+            "solution_id": "output", "payloads": {"a": {
+                "path": path, "byte_length": payload.len(),
+                "sha256": study_artifact_content_sha256(&payload),
+            }},
+        })).unwrap();
+        let payloads = std::collections::BTreeMap::from([(path.to_owned(), payload)]);
+        let bytes = crate::antenna_inspection_bundle::encode_antenna_inspection_bundle(
+            &manifest, &payloads, 4096,
+        ).unwrap();
+        assert!(matches!(decode_bytes("artifact", ANTENNA_INSPECTION_BUNDLE_CODEC_ID,
+            ANTENNA_INSPECTION_BUNDLE_CODEC_VERSION, &bytes).unwrap(),
+            DecodedStudyArtifact::AntennaClosedLoopInspection(_)));
+        assert!(decode_bytes("state", ANTENNA_INSPECTION_BUNDLE_CODEC_ID, "v1", &bytes).is_err());
+        assert!(decode_bytes("artifact", ANTENNA_INSPECTION_BUNDLE_CODEC_ID, "v2", &bytes).is_err());
     }
 
     #[test]

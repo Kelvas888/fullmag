@@ -91,6 +91,7 @@ from fullmag.model.study import (
     DEFAULT_TABLE_AUTOSAVE_QUANTITIES,
     Eigenmodes,
     FieldAutosave,
+    FieldOnly,
     FrequencyResponse,
     Hysteresis,
     RelaxStop,
@@ -7199,7 +7200,7 @@ def _render_solver(
     solver_override = _normalize_mapping(overrides.get("solver"))
     if problem.study is None:
         return ["# Solver (not configured)"]
-    dynamics = problem.study.dynamics
+    dynamics = getattr(problem.study, "dynamics", None)
     if dynamics is None:
         return []
     return ["# Solver", _render_solver_call(dynamics, solver_override, surface=surface)]
@@ -7635,6 +7636,8 @@ def _render_stages(
             lines.append(
                 f"study.stages.add_hysteresis_sweep({', '.join(_render_hysteresis_stage_args(study))})"
             )
+            continue
+        if isinstance(study, FieldOnly):
             continue
         stage_dynamics = stage.problem.study.dynamics
         dynamics_signature = (
@@ -9596,6 +9599,7 @@ def _export_auxiliary_geometry_entry(
         "geometry_params": geometry_params,
         "bounds_min": list(bounds_min) if bounds_min is not None else None,
         "bounds_max": list(bounds_max) if bounds_max is not None else None,
+        "mesh": _export_geometry_mesh_entry(name, problem),
         "visualization_hint": hint,
     }
 
@@ -9845,13 +9849,13 @@ def _normalize_bounds_pair(
 
 
 def _study_outputs(
-    study: TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse,
+    study: FieldOnly | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse,
 ) -> Sequence[object]:
     return tuple(study.outputs)
 
 
 def _study_table_autosave(
-    study: TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse,
+    study: FieldOnly | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse,
 ) -> TableAutosave | None:
     table_autosave = getattr(study, "_table_autosave", None)
     return table_autosave if isinstance(table_autosave, TableAutosave) else None

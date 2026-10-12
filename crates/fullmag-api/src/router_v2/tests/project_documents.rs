@@ -700,7 +700,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         PrimitiveStageNode, StudyDiscretizationReference, StudyExecutionProfileReference,
         StudyModelReference, StudyOutputPort, StudyPipelineDocument, StudyPipelineNode,
         StudyPipelineNodeSource, StudyPlan, StudyPlanMigrationDefaults, StudyPortDataKind,
-        StudyPrimitiveStageKind, StudySolverConfigReference, STUDY_PLAN_SCHEMA_VERSION,
+        StudyPrimitiveStageKind, StudySolverConfigReference, STUDY_PLAN_SCHEMA_VERSION_V2,
     };
     use fullmag_ir::ProblemIR;
     use fullmag_plan::{
@@ -807,7 +807,7 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
         ProjectSnapshot::from_envelope(&definition).unwrap(),
         StudyReference {
             study_id: StudyId::parse("study-submit").unwrap(),
-            plan_version: STUDY_PLAN_SCHEMA_VERSION.into(),
+            plan_version: STUDY_PLAN_SCHEMA_VERSION_V2.into(),
             plan_sha256: study.canonical_sha256().unwrap(),
         },
         fullmag_session::canonical_json_sha256(&catalog_value),

@@ -1,5 +1,13 @@
 use crate::antenna_spectrum::FieldTetraBvh;
 pub(crate) mod direct_quadrature;
+pub(crate) mod closed_loop_v2;
+mod closed_loop_public_inspection;
+pub use closed_loop_public_inspection::{load_published_antenna_closed_loop_inspection, verify_antenna_closed_loop_inspection_bytes, LoadedAntennaClosedLoopInspection};
+pub(crate) mod closed_loop_execution;
+pub use closed_loop_execution::execute_antenna_closed_loop_inspection;
+pub(crate) mod direct_quadrature_v2;
+pub(crate) mod closed_loop_identity_v2;
+pub(crate) mod closed_loop_balance_v2;
 pub use direct_quadrature::AntennaQuadratureEvidenceRef;
 use direct_quadrature::{DirectOerstedSnapshot, DirectQuadratureEvidence, EVIDENCE_SCHEMA};
 use crate::types::{AuxiliaryArtifact, RunError};
@@ -71,9 +79,9 @@ pub(crate) struct AntennaFieldSolutionInput {
     pub bases: Vec<AntennaFieldBasisInput>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct AntennaSampleCarrier {
+pub struct AntennaSampleCarrier {
     pub domain: FieldTargetIR,
     pub carrier_kind: String,
     pub location: String,
@@ -311,6 +319,9 @@ fn parse_verified_manifest(
 pub(crate) fn verify_antenna_field_solution_manifest(
     manifest_bytes: &[u8],
 ) -> Result<(), RunError> {
+    if closed_loop_v2::is_v2(manifest_bytes) {
+        return closed_loop_v2::payload_lengths(manifest_bytes).map(|_| ());
+    }
     parse_verified_manifest(manifest_bytes).map(|_| ())
 }
 
@@ -319,6 +330,9 @@ pub(crate) fn verify_antenna_field_solution_manifest(
 pub(crate) fn antenna_field_solution_payload_lengths(
     manifest_bytes: &[u8],
 ) -> Result<BTreeMap<String, usize>, RunError> {
+    if closed_loop_v2::is_v2(manifest_bytes) {
+        return closed_loop_v2::payload_lengths(manifest_bytes);
+    }
     let (_, manifest) = parse_verified_manifest(manifest_bytes)?;
     let mut lengths = BTreeMap::new();
     let prefix = format!("antenna/field_solutions/{}/", manifest.solution_id);
@@ -520,6 +534,9 @@ fn verify_field_solution_payloads(
     payloads: &[AuxiliaryArtifact],
     require_exact_payload_set: bool,
 ) -> Result<(), RunError> {
+    if closed_loop_v2::is_v2(manifest_bytes) {
+        return closed_loop_v2::verify(manifest_bytes, payloads, require_exact_payload_set);
+    }
     antenna_field_solution_payload_lengths(manifest_bytes)?;
     let (_, manifest) = parse_verified_manifest(manifest_bytes)?;
     let mut expected_paths = BTreeSet::from([
@@ -1194,6 +1211,7 @@ pub struct AntennaFieldSolutionAsset {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AntennaFieldSolutionSamples {
+    pub sample_carrier: Option<AntennaSampleCarrier>,
     pub solution_id: String,
     pub source_object_id: String,
     pub port_mode_id: String,
@@ -1314,6 +1332,7 @@ pub fn load_antenna_field_solution_samples(
         })
         .transpose()?;
     Ok(AntennaFieldSolutionSamples {
+        sample_carrier: manifest.sample_carrier.clone(),
         solution_id: manifest.solution_id,
         source_object_id: manifest.source_object_id,
         port_mode_id: port_mode_id.to_string(),

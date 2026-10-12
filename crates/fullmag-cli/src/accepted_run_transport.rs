@@ -27,6 +27,12 @@ pub(crate) fn submit_run_json(path: &Path, api_url: &str, submit_only: bool) -> 
         .with_context(|| format!("reading accepted-run submit request {}", path.display()))?;
     let request: Value = serde_json::from_slice(&request_bytes)
         .with_context(|| format!("parsing accepted-run submit request {}", path.display()))?;
+    submit_run_request(&request, api_url, submit_only)
+}
+
+pub(crate) fn submit_run_request(request: &Value, api_url: &str, submit_only: bool) -> Result<Value> {
+    let encoded=serde_json::to_vec(request)?;
+    if encoded.is_empty() || encoded.len() as u64>MAX_SUBMIT_REQUEST_BYTES { bail!("accepted-run request exceeds public JSON transport limit"); }
     let project_id = request
         .pointer("/run_intent/specification/snapshot/project_id")
         .and_then(Value::as_str)

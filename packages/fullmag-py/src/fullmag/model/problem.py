@@ -79,7 +79,7 @@ from fullmag.model.structure import (
     ObjectRegion,
     Region,
 )
-from fullmag.model.study import Eigenmodes, FrequencyResponse, Relaxation, TimeEvolution
+from fullmag.model.study import Eigenmodes, FieldOnly, FrequencyResponse, Relaxation, TimeEvolution
 from fullmag.model.selection import SelectionDefinition
 
 IR_VERSION = "0.3.0"
@@ -186,6 +186,7 @@ def _fem_cache_contract_identity(
 
     identity: dict[str, object] = {
         "source_snapshot_sha256": _fem_verified_source_snapshot_sha256(),
+        "antenna_bridge_realization": "exact_identity_noop.v1",
         "source_compatibility_epoch": "fullmag.fem.meshing.production-closure.2026-08-31.v1",
         "gmsh_version": MIXED_SHARED_GMSH_VERSION,
         "gmsh_threads": 1,
@@ -701,6 +702,7 @@ def _fem_mesh_cache_key(
     mesh_workflow: dict[str, object] | None = None,
     per_object_recipes: Mapping[str, PerObjectMeshRecipe] | None = None,
     object_id: str | None = None,
+    _coincident_closure: object | None = None,
 ) -> str:
     payload = {
         "version": _FEM_MESH_CACHE_VERSION,
@@ -715,6 +717,8 @@ def _fem_mesh_cache_key(
         },
         "cache_identity": _fem_cache_contract_identity(),
     }
+    if _coincident_closure is not None:
+        payload["coincident_closure"] = _coincident_closure.to_ir()
     return sha256(
         json.dumps(
             payload,
@@ -869,6 +873,7 @@ def build_geometry_assets_for_request(
         tuple[object, list[dict[str, object]], object | None]
     ] | None = None,
     _realized_object_mesh_sink: dict[str, object] | None = None,
+    _coincident_closures: Mapping[str, object] | None = None,
 ) -> dict[str, Any] | None:
     if discretization is None:
         return None
@@ -889,6 +894,9 @@ def build_geometry_assets_for_request(
         geometry_object_ids=geometry_object_ids,
         fdm_only=fdm_only,
     )
+    if _coincident_closures:
+        from fullmag.runtime.transport_identity import tagged_json_digest
+        asset_cache_key += tagged_json_digest({name: closure.to_ir() for name, closure in _coincident_closures.items()})
     if _realized_object_mesh_sink is None and asset_cache is not None and asset_cache_key in asset_cache:
         cached = asset_cache[asset_cache_key]
         return copy.deepcopy(cached) if _copy_cached_assets else cached
@@ -1055,6 +1063,7 @@ def build_geometry_assets_for_request(
                         mesh_workflow=mesh_workflow,
                         per_object_recipes=per_object_recipes,
                         object_id=(geometry_object_ids or {}).get(geometry.geometry_name),
+                        _coincident_closure=(_coincident_closures or {}).get(geometry.geometry_name),
                     )
                     cache_path = (
                         fem_mesh_cache_dir.joinpath(f"{mesh_cache_key}.npz")
@@ -1094,12 +1103,14 @@ def build_geometry_assets_for_request(
                             mesh_workflow=mesh_workflow,
                             per_object_recipes=dict(per_object_recipes or {}),
                             object_id=(geometry_object_ids or {}).get(geometry.geometry_name),
+                            _coincident_closure=(_coincident_closures or {}).get(geometry.geometry_name),
                         )
-                        mesh = _drop_degenerate_tetrahedra(
-                            mesh,
-                            context=f"Generated FEM mesh for '{geometry.geometry_name}'",
-                            fallbacks_triggered=[],
-                        )
+                        if geometry.geometry_name not in (_coincident_closures or {}):
+                            mesh = _drop_degenerate_tetrahedra(
+                                mesh,
+                                context=f"Generated FEM mesh for '{geometry.geometry_name}'",
+                                fallbacks_triggered=[],
+                            )
                         if cache_path is not None and not imported_surface_only:
                             _save_fem_mesh_cache_atomically(mesh, cache_path)
                             emit_progress(
@@ -2387,7 +2398,7 @@ class Problem:
     name: str
     magnets: Sequence[Ferromagnet]
     energy: Sequence[EnergyTerm]
-    study: TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse | None = None
+    study: FieldOnly | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse | None = None
     dynamics: LLG | None = None
     outputs: Sequence[LegacyOutputSpec] | None = None
     discretization: DiscretizationHints | None = None
@@ -2487,9 +2498,17 @@ class Problem:
                 + ", ".join(unknown_ids)
             )
         object.__setattr__(self, "auxiliary_geometry_object_ids", auxiliary_object_ids)
-        if not self.magnets:
+        field_only = isinstance(self.study, FieldOnly)
+        if not self.magnets and not field_only:
             raise ValueError("Problem requires at least one magnet")
-        if not self.energy and not any(
+        if field_only:
+            if not self.auxiliary_geometries:
+                raise ValueError("FieldOnly requires explicitly authored non-magnetic geometry")
+            if self.magnets or self.energy or self.field_drives or self.solved_antenna_drives:
+                raise ValueError("FieldOnly cannot contain magnetic state, energy or LLG drives")
+            if self.spin_torque is not None or self.spin_torques or self.spin_transports or self.magnetization_constraints:
+                raise ValueError("FieldOnly cannot contain magnetic torque, spin transport or constraints")
+        if not field_only and not self.energy and not any(
             _material_has_anisotropy(magnet.material) for magnet in self.magnets
         ):
             raise IncompletePhysicsError(
@@ -2977,6 +2996,12 @@ class Problem:
         if physics_objects:
             result["physics_objects"] = physics_objects
         if include_geometry_assets:
+            from fullmag.runtime.antenna_coincident_materialization import materialize_antenna_coincident_loops
+
+            materialize_antenna_coincident_loops(
+                self, result, geometries=geometries, discretization=discretization,
+                mesh_workflow=mesh_workflow, runtime_device_override=runtime_device_override,
+            )
             from fullmag.runtime.antenna_lead_materialization import materialize_antenna_lead_preparations
 
             materialize_antenna_lead_preparations(
@@ -3094,7 +3119,7 @@ class Problem:
             hybrid=self.discretization.hybrid,
         )
 
-    def _normalize_study(self) -> TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse:
+    def _normalize_study(self) -> FieldOnly | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse:
         if self.study is not None and (self.dynamics is not None or self.outputs is not None):
             raise ValueError(
                 "Problem accepts either study=... or the legacy dynamics=... and outputs=... shape, not both"
