@@ -1345,3 +1345,8 @@ Diagnostyczny profil może włączyć klasę Mat w PetscInfo (`-info :mat:self`)
 | Source ID | Path + symbol | Odpowiedzialność |
 |---|---|---|
 | source-floquet-factor-phase-log | `backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp::emit_floquet_factor_phase_marker` | Opt-in fazy istniejącego setup bez PETSc queries i zmian acceptance |
+
+
+## Alias dodatniej konwencji fazora w obserwablach UI — PR97/4248159364
+
+Token `exp_plus_i_omega_t` używany przez Poisson-airbox oznacza tę samą dodatnią konwencję czasową co `exp_i_omega_t`. Wspólny `phasorConventionAdapter.ts::phasorAdapter` interpretuje oba z tym samym znakiem zaniku i kierunkiem animacji; `modalDampingObservables.ts::modalDampingObservables` akceptuje dokładnie oba tokeny oraz istniejącą konwencję ujemną. Nie zmienia to częstotliwości solvera, równania ani wzorów linewidth/Q/lifetime. Testy porównują alias dla zaniku, wzrostu i zera; nieznane tokeny nadal dają unavailable. Dowód runtime/przeglądarki pozostaje NOT VERIFIED.

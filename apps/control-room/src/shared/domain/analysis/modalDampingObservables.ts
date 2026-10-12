@@ -96,7 +96,9 @@ export function modalDampingObservables(
 function isPhasorConvention(
   value: string | null,
 ): value is PhasorConvention {
-  return value === "exp_i_omega_t" || value === "exp_minus_i_omega_t";
+  return value === "exp_i_omega_t" ||
+    value === "exp_plus_i_omega_t" ||
+    value === "exp_minus_i_omega_t";
 }
 
 function unavailableObservables(): ModalDampingObservables {

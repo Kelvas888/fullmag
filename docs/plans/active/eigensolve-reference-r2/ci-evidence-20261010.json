@@ -1130,6 +1130,20 @@
       "receipt_sha256": "d5580cdcd6e318beec55ad36b6009db419d5d9acbc4b49c11c8be15c470c74d4",
       "native_log_sha256": "ca08ba4ef8e1def49e440405e939389a1f4a23d6823a8d576eaf0d023d8b0d8b",
       "evidence": "Mat logging active; actual live Inode LU shift observed in both failed cases. Fresh numeric/ordering comparison and rootcause remain unverified; no tolerance changes."
+    },
+    {
+      "run_id": 38296088416,
+      "sha": "c888e65823a216b1e0b25f0c2fedf3c68df54265",
+      "conclusion": "success",
+      "scope": "strict_parallel_policy_and_effective_profile_authoring",
+      "authoring_passed": 135,
+      "application_replay_passed": 10,
+      "policy_shape_passed": 2,
+      "adaptive_named_passed": 3,
+      "scene_lowering_passed": 62,
+      "python_passed": 84,
+      "subtests_passed": 24,
+      "evidence": "Full authoring and shared strict-map regressions pass; UI/runtime/science remain separate gates."
     }
   ]
 }

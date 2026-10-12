@@ -24,6 +24,12 @@ describe("modalDampingObservables", () => {
     },
   );
 
+  it.each([2, -2, 0, -0])("preserves every observable for the published positive alias (%s)", (imaginaryHz) => {
+    expect(modalDampingObservables(10, imaginaryHz, "exp_plus_i_omega_t")).toEqual(
+      modalDampingObservables(10, imaginaryHz, "exp_i_omega_t"),
+    );
+  });
+
   it("retains signed growth without producing linewidth, Q, or lifetime", () => {
     expect(modalDampingObservables(10, -2, "exp_i_omega_t")).toEqual({
       decayRateHz: -2,
