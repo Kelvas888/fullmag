@@ -11,7 +11,7 @@ import {
   recordAuthoringMutationHistory,
   runAuthoringMutationWithHistory,
 } from "@/kernel/authoring/authoringHistoryMutation";
-import type { SceneResource } from "@/kernel/api/apiTypes";
+import type { MaterialResource, SceneResource } from "@/kernel/api/apiTypes";
 import { useKernel } from "@/kernel/KernelContext";
 import {
   publishCommittedSceneResource,
