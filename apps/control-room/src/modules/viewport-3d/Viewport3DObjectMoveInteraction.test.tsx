@@ -150,6 +150,7 @@ function createFixture() {
     selection,
   } as unknown as KernelApi;
   return {
+    commands,
     commitTransaction,
     invalidate,
     kernel,

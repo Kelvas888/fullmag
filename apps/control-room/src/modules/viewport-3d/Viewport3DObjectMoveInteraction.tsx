@@ -230,6 +230,7 @@ export function useViewport3DObjectMoveInteraction({
       current.sessionId !== current.sessionIdentity.sessionId ||
       current.selectedObjectId !== objectId ||
       !current.moveTargetEligible ||
+      !activeTool ||
       activeTool.objectId !== objectId ||
       !activeIdentity ||
       activeIdentity.activationId !== activationId ||
@@ -404,7 +405,7 @@ export function Viewport3DObjectMoveResourceSurface() {
         moveToolObjectId={interaction.moveToolObjectId}
         onCommit={interaction.commitMove}
         onGestureActiveChange={setOrbitBlocked}
-        primitiveModel={primitiveModelWithPlacementDraft}
+        primitiveModel={primitiveModelWithPlacementDraft ?? null}
         selectedObjectId={selectedObjectId}
       />
       <Viewport3DMoveStatus error={interaction.moveError} />

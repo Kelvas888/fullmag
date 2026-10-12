@@ -1017,14 +1017,14 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
     return all.filter((entry) => {
       if (!entry.meshTarget || entry.meshTarget === "all") return true;
       if (entry.meshTarget === `object:${objectId}`) return true;
-      const objectSnapshots = asRecord(entry.snapshot?.objects);
+      const objectSnapshots = asRecord(entry.canonicalPolicySnapshot?.objects);
       return objectSnapshots ? Object.hasOwn(objectSnapshots, objectId) : false;
     });
   }, [buildHistory.data?.history, objectId]);
 
   const onRestoreBuildToDraft = useCallback((entry: MeshBuildHistoryEntry) => {
     if (!objectId) return;
-    const objectSnapshots = asRecord(entry.snapshot?.objects);
+    const objectSnapshots = asRecord(entry.canonicalPolicySnapshot?.objects);
     if (!objectSnapshots || !Object.hasOwn(objectSnapshots, objectId)) {
       setFeedback({
         kind: "error",
@@ -1357,7 +1357,7 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
                 Showing build history entries affecting this object.
               </span>
               <Button
-                variant="outline"
+                variant="secondary"
                 size="sm"
                 onClick={() =>
                   kernel.selection.set(

@@ -1735,7 +1735,7 @@ export default function Viewport3DModule({
         <WorkspaceRenderProfiler id="Viewport3DModule">
         <Viewport3DFrame
       {...sceneModel}
-      primitiveModel={primitiveModelWithPlacementDraft}
+      primitiveModel={primitiveModelWithPlacementDraft ?? null}
       clientReady={clientReady}
       colors={colors}
       cameraDialogOpen={commandState.widgets.cameraDialogOpen}

@@ -244,16 +244,16 @@ describe("MoveObjectGizmo", () => {
       origin: [0, 0, 0],
     });
     const handlers = moveAxisPointerHandlers(controller, "x");
-    const event = {
+    const event: Record<string, unknown> = {
       point: { x: 0, y: 0, z: 0 },
       pointerId: 11,
       stopPropagation: vi.fn(),
       target: { releasePointerCapture: vi.fn(), setPointerCapture: vi.fn() },
-    } as never;
+    };
 
-    handlers.onPointerDown(event);
+    handlers.onPointerDown(event as never);
     handlers.onPointerMove({ ...event, point: { x: 1e-9, y: 0, z: 0 } } as never);
-    expect(() => handlers.onPointerUp(event)).not.toThrow();
+    expect(() => handlers.onPointerUp(event as never)).not.toThrow();
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     expect(onCommit).toHaveBeenCalledOnce();
