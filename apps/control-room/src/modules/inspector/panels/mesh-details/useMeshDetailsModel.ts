@@ -551,7 +551,7 @@ export function useMeshDetailsModel(
       );
       kernel.layout.setActiveTab("mesh");
     },
-    [kernel],
+    [kernel, manifest.data?.generation_id, manifest.data?.mesh_id, summary.data?.revision],
   );
   const selectQualityMetric = useCallback(
     (metric: MeshQualityMetric["id"]) => {
