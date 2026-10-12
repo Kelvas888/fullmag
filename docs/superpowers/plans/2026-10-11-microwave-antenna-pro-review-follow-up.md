@@ -215,3 +215,18 @@ Przekazanie do callera:
 2. Dla poprawnego manifestu przekazać dokładne wyliczone rozmiary jako `maxResponseBytes` czterech istniejących hooks. Zachować owner/digest/ETag i aktualność; ten kodek nie zastępuje `antennaSpectrumIdentityStatus` ani byte validation. Nie dopuścić, by odświeżenie błędu ponownie wyświetliło retained FFT.
 3. Osobno ustalić i wdrożyć politykę łącznego kosztu interaktywnego odczytu oraz dużych wyników. Dokładna długość zgodna z ogromnym manifestem ogranicza nadmiar odpowiedzi, ale nie jest bezpiecznym budżetem pamięci przeglądarki. Bez tej polityki luka pełnej alokacji pozostaje otwarta; nie dodano arbitralnego cap ani redukcji jakości.
 4. Przed browser qualification zastąpić celowo syntetyczne descriptor semantics w fixture kanonicznymi, zachowując stare receipts. Uruchomić odmowy metadata bez numeric GET oraz błędów stream/bytes bez grid, sukces scalar/vector/normalizacji, stale/ACK/error i root stability na snapshotcie integratora. Wymagany GREEN jest osobny od statycznej kontroli nowego pliku; native FFT, HTTP backend E2E i T10/T14/T15 pozostają otwarte.
+
+## T18: naprawa kotwic neutralnych artefaktów w 0950
+
+Standalone `validate_scientific_docs.py` na HEAD `12cd3623d693c1a18f12151cfa625a5c2ed694de` zwrócił dla 0950 exit 1 i cztery błędy deklaracji, dla niezmienionej 0980 exit 0. Rzeczywiste definicje przeniesiono do neutralnego crate, natomiast mapa i tekstowy indeks nadal wskazywały dawne pliki runnera. Po przeczytaniu nowych deklaracji i ich konsumentów zmieniono wyłącznie osiem ścieżek: cztery w adjacent source-map i cztery zgodne wiersze źródłowego indeksu Markdown.
+
+| Symbol | Właściciel deklaracji po ekstrakcji |
+|---|---|
+| `AntennaExternalLeadSolutionManifest` | `crates/fullmag-antenna-artifacts/src/solution.rs` |
+| `validate_source_topology` | `crates/fullmag-antenna-artifacts/src/bundle.rs` |
+| `AcceptedTerminalChargeRecord` | `crates/fullmag-antenna-artifacts/src/charge.rs` |
+| `self_consistent_hash_does_not_bypass_structural_or_current_gates` | `crates/fullmag-antenna-artifacts/src/charge.rs` |
+
+Powtórna skupiona walidacja 0950: **exit 0**, diff check 0. SHA-256 poprawionej noty `aea05eac47ec95381fa557bd600b5a95db6782a6055afbd0d2cb277f0998514b`, source-map `ed74e5c7e21b6cd58df7d91a6cccbc240019b0e6c4cd029127c76a07f49aa9e3`. Nie zmieniono równań, tabel parametrów, jednostek, odpowiedzialności symboli, statusów dowodowych ani capabilities. Nie uruchomiono contract unit tests z powodu aktualnego zakazu; Sphinx/render/publication i naukowe bramki pozostają otwarte. Strukturalny GREEN nie dowodzi kompletności T18 ani fizycznej poprawności modułu.
+
+Równoległy wątek zatwierdził ten zakres wyłącznie w naszym checkoutcie. Jego nota i aktualny freeze dla próby actual24 pozostały nietknięte; później integrator przeniesie cztery hunki mapy i indeksu, bez nadpisania swojego WIP ani zmiany immutable pinów. Przekazał również informację o własnym browser FFT GREEN 14/14; jest to osobny receipt jego snapshotu, nie dowód naszego niezmienionego produkcyjnego UI ani native FFT.

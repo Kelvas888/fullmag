@@ -6289,7 +6289,7 @@ evidence and cannot promote a capability lane.
 | `crates/fullmag-cli/src/orchestrator/antenna_external_lead_inspection.rs` | `write_record` | bounded no-overwrite stage record i anulowanie; trzy niewykonane regresje |
 | `crates/fullmag-cli/src/orchestrator/antenna_external_lead_inspection/carrier.rs` | `plan_carrier` | jawny non-executable carrier bridge, source re-resolution przed sanitizacją; trzy niewykonane regresje |
 | `crates/fullmag-cli/src/orchestrator.rs` | `current_live_metadata`, `session_runtime_selection_for_problem` | engine inspection bez fałszywej LLG/timestep kwalifikacji; source-only |
-| `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `AntennaExternalLeadSolutionManifest` | thin raw V/RT0/H inspection schema, requested/resolved execution i pięć binary refs; source-only |
+| `crates/fullmag-antenna-artifacts/src/solution.rs` | `AntennaExternalLeadSolutionManifest` | thin raw V/RT0/H inspection schema, requested/resolved execution i pięć binary refs; source-only |
 | `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `build_antenna_external_lead_solution` | alternatywna ścieżka retained bytes: actual input, exact decode i request binding, bez dodatkowego solve |
 | `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `load_antenna_external_lead_solution` | solver-free bounded decode, bitowe H/xyz/device V checks; nie freshness lub authentication |
 | `crates/fullmag-runner/src/antenna_external_lead_solution.rs` | `LoadedAntennaExternalLeadSolution::device_display` | retained device XYZ/Tet4 projection, exact ownership; runtime niewykonany |
@@ -6393,8 +6393,8 @@ evidence and cannot promote a capability lane.
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/record.rs` | `decode_bundle` | wrapper zachowujący odmowy: preflight, owned decode i rzeczywisty request binding; source-only |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/record.rs` | `decode_owned_bundle` | bounded standalone reader, exact nested bytes/SHA, retained ledger i recursive refinement bound; source-only |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/record.rs` | `validate_bundle_request` | osobny binding rzeczywistego charge/closure/roles/branches/target/policy bez phantom request; source-only |
-| `crates/fullmag-runner/src/native_fem/accepted_external_lead/record.rs` | `validate_source_topology` | actual face-connected graph i typed interfaces, bijekcja H1 labels, complete role/support; source-only |
-| `crates/fullmag-runner/src/native_fem/accepted_terminal_charge/record.rs` | `AcceptedTerminalChargeRecord` | retained references/residuals/gauges/omitted rows i exact charge bytes; source-only |
+| `crates/fullmag-antenna-artifacts/src/bundle.rs` | `validate_source_topology` | actual face-connected graph i typed interfaces, bijekcja H1 labels, complete role/support; source-only |
+| `crates/fullmag-antenna-artifacts/src/charge.rs` | `AcceptedTerminalChargeRecord` | retained references/residuals/gauges/omitted rows i exact charge bytes; source-only |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/bundle_tests.rs` | `owned_bundle_retains_exact_nested_bytes_and_physical_ledgers_without_request` | exact retention źródła/pola/charge oraz physical DTO bez request; niekompilowana |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/bundle_tests.rs` | `owned_integrity_accepts_changed_intent_but_real_request_binding_refuses_it` | separate integrity/request freshness dla fully rehashed zmiany target/policy/closure; niekompilowana |
 | `crates/fullmag-runner/src/native_fem/accepted_external_lead/bundle_tests.rs` | `owned_rehashed_source_corruption_and_degenerate_geometry_are_rejected` | odmowy rehashed source corruption i degeneracji po valid baseline; niekompilowana |
@@ -6466,7 +6466,7 @@ evidence and cannot promote a capability lane.
 | `crates/fullmag-fem-sys/src/lib.rs` | `fullmag_fem_accepted_terminal_charge_request_v1` | Rust repr(C), append-only FFI i production layout assertions |
 | `crates/fullmag-runner/src/native_fem/accepted_terminal_charge.rs` | `solve_accepted_terminal_charge` | jeden call, bounded input/output, hash z tych samych bytes i request binding; prywatny niepodłączony adapter |
 | `crates/fullmag-runner/src/native_fem/accepted_terminal_charge/record.rs` | `decode_accepted_terminal_charge_record` | independent typed decoder, structural map/current gates i pełne consumption; nie numerical qualification |
-| `crates/fullmag-runner/src/native_fem/accepted_terminal_charge/record.rs` | `self_consistent_hash_does_not_bypass_structural_or_current_gates` | source codec regression corrupt rehashed counts/maps/scalars/text; niekompilowana |
+| `crates/fullmag-antenna-artifacts/src/charge.rs` | `self_consistent_hash_does_not_bypass_structural_or_current_gates` | source codec regression corrupt rehashed counts/maps/scalars/text; niekompilowana |
 | `backends/fem/tests/charge_transport_abi_contract.cpp` | `void accepted_charge_abi_headers_policies_and_gpu_fail_atomically` | source ABI header/policy/GPU/capacity i atomowość; niekompilowana |
 | `backends/fem/tests/charge_transport_abi_contract.cpp` | `void accepted_charge_abi_mesh_and_descriptors_fail_closed` | source ABI CSR/boundary/material/IDs/selector/periodic odmowy; niekompilowana |
 | `backends/fem/tests/charge_transport_abi_contract.cpp` | `void accepted_charge_truncated_result_keeps_prefix_and_canary_untouched` | source ABI truncated prefix i no-write canary; niekompilowana |

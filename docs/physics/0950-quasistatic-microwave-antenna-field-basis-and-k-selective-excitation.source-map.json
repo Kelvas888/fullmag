@@ -384,7 +384,7 @@
     {"id": "antenna-external-inspection-cleanup-regression", "path": "crates/fullmag-runner/src/antenna_external_lead_solution/publication.rs", "symbol": "interrupted_write_and_cleanup_preserve_foreign_entries", "responsibility": "Cancel/own-file-only temporary cleanup; niekompilowana.", "evidence_status": "source_only"},
     {
       "id": "antenna-external-inspection-manifest",
-      "path": "crates/fullmag-runner/src/antenna_external_lead_solution.rs",
+      "path": "crates/fullmag-antenna-artifacts/src/solution.rs",
       "symbol": "AntennaExternalLeadSolutionManifest",
       "responsibility": "Osobny thin inspection-only manifest z raw V/RT0/H bundle, input pins i requested/resolved execution; bez per-ampere reinterpretacji.",
       "evidence_status": "source_only"
@@ -809,14 +809,14 @@
     },
     {
       "id": "antenna-external-bundle-physical-topology",
-      "path": "crates/fullmag-runner/src/native_fem/accepted_external_lead/record.rs",
+      "path": "crates/fullmag-antenna-artifacts/src/bundle.rs",
       "symbol": "validate_source_topology",
       "responsibility": "Complete device/lead ownership i role, opposite interface sides w jednym physical ordering, graph actual faces+typed interfaces, bijekcja H1 labels i pełny support każdego komponentu; source-only.",
       "evidence_status": "source_only"
     },
     {
       "id": "antenna-owned-charge-retained-metadata",
-      "path": "crates/fullmag-runner/src/native_fem/accepted_terminal_charge/record.rs",
+      "path": "crates/fullmag-antenna-artifacts/src/charge.rs",
       "symbol": "AcceptedTerminalChargeRecord",
       "responsibility": "Owned exact charge bytes/maps z zachowanymi reference terminals, component residuals, gauge IDs i omitted constraints; nie niezależne odtworzenie rank proof.",
       "evidence_status": "source_only"
@@ -1411,7 +1411,7 @@
     },
     {
       "id": "antenna-accepted-charge-record-codec-test",
-      "path": "crates/fullmag-runner/src/native_fem/accepted_terminal_charge/record.rs",
+      "path": "crates/fullmag-antenna-artifacts/src/charge.rs",
       "symbol": "self_consistent_hash_does_not_bypass_structural_or_current_gates",
       "responsibility": "Source synthetic codec corruption regression nawet z ponownie przeliczonym hashem; niekompilowana.",
       "evidence_status": "source_only"
