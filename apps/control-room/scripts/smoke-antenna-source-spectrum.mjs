@@ -47,6 +47,50 @@ try {
     if (scenario === "invalid-authoring") assert.ok(text.includes("transverse spectrum requires equilibrium_ref"), "Negative fixture did not reach authoring validation");
     evidence.push({ ...before, panelText: text });
   }
+  for (const kind of ["metadata", "catalog"]) {
+    const location = new URL(url); location.searchParams.set("scenario", "ready");
+    await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
+    await page.getByRole("grid").waitFor({ timeout: 60_000 });
+    await page.evaluate(() => { window.__spectrumRetainedRoot = document.querySelector(".fm-inspector-panel"); });
+    const baseline = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+    for (const fail of [false, true]) {
+      await page.evaluate((kind) => window.__antennaSpectrumFixture.refresh(kind), kind);
+      await page.waitForFunction(() => window.__antennaSpectrumFixture.read().pending === 1, undefined, { timeout: 60_000 });
+      await page.waitForTimeout(200);
+      const inspect = async (phase) => {
+        const current = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+        const sectionCount = await page.locator('section[aria-label="Antenna source spectrum payload"]').count();
+        const rootStable = await page.evaluate(() => window.__spectrumRetainedRoot === document.querySelector(".fm-inspector-panel"));
+        const payloadRequests = current.calls.filter((call) => call.path.includes("/payloads/")).length;
+        const panelText = await page.locator("main").textContent();
+        const diagnosticVisible = phase !== "refresh-error" || panelText.includes(current.snapshots[kind].error);
+        const passed = sectionCount === 0 && rootStable && diagnosticVisible && payloadRequests === baseline.calls.filter((call) => call.path.includes("/payloads/")).length;
+        assert.equal(current.snapshots[kind].hasData, true, "Refresh fixture did not retain last-good production data");
+        checks.push({ name: `${kind} ${phase}: retained data is not a current FFT view`, passed, sectionCount, rootStable, diagnosticVisible, payloadRequests, snapshot: current.snapshots[kind] });
+        evidence.push({ ...current, phase: `${kind}-${phase}`, panelText });
+        const screenshot = resolve(directory, `${kind}-${phase}.png`); await page.screenshot({ path: screenshot, fullPage: true }); screenshots.push(screenshot);
+      };
+      await inspect(fail ? "pending-before-error" : "pending");
+      await page.evaluate((fail) => window.__antennaSpectrumFixture.release(fail), fail);
+      await page.waitForFunction(() => window.__antennaSpectrumFixture.read().pending === 0, undefined, { timeout: 60_000 });
+      if (fail) {
+        await page.waitForFunction((kind) => window.__antennaSpectrumFixture.read().snapshots[kind].status === "error" && Boolean(window.__antennaSpectrumFixture.read().snapshots[kind].error), kind, { timeout: 60_000 });
+        await inspect("refresh-error");
+      } else {
+        await page.waitForFunction((kind) => window.__antennaSpectrumFixture.read().snapshots[kind].status === "ready", kind, { timeout: 60_000 });
+        await page.waitForFunction(() => document.querySelector("main")?.textContent.includes("Runtime resultready"), undefined, { timeout: 60_000 });
+        await page.getByRole("grid").waitFor({ timeout: 60_000 });
+        const rootStable = await page.evaluate(() => window.__spectrumRetainedRoot === document.querySelector(".fm-inspector-panel"));
+        checks.push({ name: `${kind}: confirmed refresh restores FFT`, passed: rootStable && await page.getByRole("gridcell").count() === 4, rootStable });
+      }
+    }
+    const beforeIdle = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+    await page.waitForTimeout(300);
+    const afterIdle = await page.evaluate(() => window.__antennaSpectrumFixture.read());
+    assert.equal(afterIdle.calls.length, beforeIdle.calls.length, `${kind} refresh error polls while settled`);
+    assert.deepEqual(afterIdle.unexpected, []);
+    assert.ok(afterIdle.calls.length <= 18);
+  }
   assert.deepEqual(pageErrors, []);
   assert.deepEqual(consoleErrors, []);
   assert.ok(checks.every((check) => check.passed), "Unconfirmed or invalid source FFT mounted/read binary payloads");

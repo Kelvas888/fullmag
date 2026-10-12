@@ -10,16 +10,19 @@ import type { KernelEventMap } from "@/kernel/events/eventTypes";
 import { KernelContext } from "@/kernel/KernelContext";
 import { DiagnosticRecorderController } from "@/kernel/performance/diagnostic-recorder/DiagnosticRecorderController";
 import { ResourceInvalidationController } from "@/kernel/resources/ResourceInvalidationController";
+import { sharedResourceRuntimeStore } from "@/kernel/resources/ResourceRuntimeStore";
+import { resourceRuntimeKeyForClientScope } from "@/kernel/resources/resourceClientScope";
 import { antennaSpectrumPayloadEtag } from "@/kernel/resources/antennaResources";
-import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
+import { sessionRequestScopeKey, sessionScopedResourceKey } from "@/kernel/resources/sessionResourceIdentity";
 import { EMPTY_SELECTION } from "@/kernel/selection/selectionTypes";
 import type { KernelApi } from "@/kernel/types";
 import { AntennaCompositionPanel } from "@/modules/inspector/panels/antenna/AntennaCompositionPanels";
 
 const SCENARIOS = ["ready", "foreign-digest", "foreign-request", "foreign-catalog", "missing-catalog", "invalid-authoring"] as const;
 const subscribe = () => () => {};
-interface Evidence { scenario: string; calls: { path: string; scope: string | null }[]; unexpected: string[]; }
-declare global { interface Window { __antennaSpectrumFixture?: { read(): Evidence }; } }
+type RefreshKind = "metadata" | "catalog";
+interface Evidence { scenario: string; calls: { path: string; scope: string | null }[]; unexpected: string[]; pending: number; snapshots: Record<RefreshKind, { status: string; hasData: boolean; error: string | null }>; }
+declare global { interface Window { __antennaSpectrumFixture?: { read(): Evidence; refresh(kind: RefreshKind): void; release(fail?: boolean): void; }; } }
 
 function makeFixture() {
   const scenario = new URL(window.location.href).searchParams.get("scenario") ?? "ready";
@@ -43,15 +46,29 @@ function makeFixture() {
   const diagnosticRecorder = new DiagnosticRecorderController({ diagnostics });
   const metadataPath = DATA_ANTENNA_SOURCE_SPECTRUM_PATH.replace("{output_id}", "fft");
   const catalogPath = DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH.replace("{stage_id}", "solve");
+  let heldPath: string | null = null, refreshRevision = 1;
+  let pending: { release(fail: boolean): void } | null = null;
   const payloadPrefix = DATA_ANTENNA_SOURCE_SPECTRUM_PAYLOAD_PATH.replace("{output_id}", "fft").split("{payload_kind}")[0];
   const headers = { "x-api-contract-version": "1.0.0", "x-fullmag-api-instance": "11111111-1111-4111-8111-111111111111" };
-  const json = (value: unknown) => new Response(JSON.stringify(value), { headers: { ...headers, "content-type": "application/json" } });
+  const json = (value: unknown, status = 200) => new Response(JSON.stringify(value), { status, headers: { ...headers, "content-type": "application/json" } });
   const api = new ControlRoomApi({ baseUrl: "http://spectrum.fixture.invalid", expectedApiInstance: headers["x-fullmag-api-instance"], diagnostics, maxGetRetries: 0, fetchImpl: async (input, init) => {
     const request = new Request(input, init), path = new URL(request.url).pathname;
     const scope = request.headers.get("x-fullmag-session-scope");
     calls.push({ path, scope });
     if (calls.length > 30 || request.method !== "GET") throw new Error("Spectrum fixture request budget/method violated");
     if (scope && scope !== sessionRequestScopeKey({ sessionId: owner.session_id, sessionEpoch: owner.session_epoch, requestScopeEpoch: owner.request_scope_epoch })) throw new Error("Foreign request owner");
+    if (path === heldPath) {
+      return new Promise<Response>((resolve, reject) => {
+        const onAbort = () => { pending = null; reject(new DOMException("Aborted", "AbortError")); };
+        pending = { release: (fail) => {
+          request.signal.removeEventListener("abort", onAbort);
+          pending = null; heldPath = null;
+          resolve(fail ? json({ error: "Fixture refresh rejected", code: "invalid_antenna_spectrum" }, 422) : json(path === metadataPath ? spectrum : catalog));
+        } };
+        if (request.signal.aborted) onAbort();
+        else request.signal.addEventListener("abort", onAbort, { once: true });
+      });
+    }
     if (path === SESSIONS_PATH) return json({ schema_version: "1.0", sessions: [{ session_id: owner.session_id, name: "Fixture", status: "completed", current: true }] });
     if (path === SESSION_STATUS_PATH) return json({ api_contract_version: "1.0.0", runtime_bundle_version: "fixture", session: { ...owner, name: "Fixture", created_at: "fixture", workspace_root: "fixture" }, resources: { scene_revision: 1 }, capabilities: {}, lifecycle: { solver: "completed", session_resource: "tombstoned", connectivity: "connected", commandability: "read_only" } });
     if (path === MODEL_SCENE_PATH) return json(scene);
@@ -66,7 +83,22 @@ function makeFixture() {
     }
     unexpected.push(path); throw new Error(`Unexpected spectrum GET ${path}`);
   } });
-  return { kernel: { api, bus, resources, diagnostics, diagnosticRecorder } as unknown as KernelApi, control: { read: () => ({ scenario, calls: [...calls], unexpected: [...unexpected] }) } };
+  const snapshot = (kind: RefreshKind) => {
+    const path = kind === "metadata" ? metadataPath : catalogPath;
+    const key = sessionScopedResourceKey({ sessionId: owner.session_id, sessionEpoch: owner.session_epoch, requestScopeEpoch: owner.request_scope_epoch }, path);
+    const value = sharedResourceRuntimeStore.getSnapshot(resourceRuntimeKeyForClientScope(key, api.resourceCacheScope));
+    return { status: value.status, hasData: value.data !== null, error: value.error?.message ?? value.refreshError?.message ?? null };
+  };
+  return { kernel: { api, bus, resources, diagnostics, diagnosticRecorder } as unknown as KernelApi, control: {
+    read: () => ({ scenario, calls: [...calls], unexpected: [...unexpected], pending: pending ? 1 : 0, snapshots: { metadata: snapshot("metadata"), catalog: snapshot("catalog") } }),
+    refresh: (kind: RefreshKind) => {
+      if (kind !== "metadata" && kind !== "catalog") throw new Error("Unknown fixed refresh resource");
+      if (pending || heldPath) throw new Error("A refresh is already pending");
+      heldPath = kind === "metadata" ? metadataPath : catalogPath;
+      resources.invalidate(heldPath, ++refreshRevision);
+    },
+    release: (fail = false) => { if (!pending) throw new Error("No held refresh to release"); pending.release(fail); },
+  } };
 }
 
 function MountedFixture() {
