@@ -4373,11 +4373,17 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract()
     payload_only_request.completeness_policy = 0;
     FullmagFemFrequencyDomainResult payload_only_result =
         fullmag_fem_modal_eigen_solve(&payload_only_request);
+    const char *payload_only_diagnostics = payload_only_result.diagnostics_json != nullptr
+        ? payload_only_result.diagnostics_json : "<null>";
+    const std::size_t payload_only_diagnostics_length = std::strlen(payload_only_diagnostics);
     const std::string payload_only_failure =
         "payload-only shared-domain Floquet routing must certify its sparse descriptor; status=" +
         std::to_string(static_cast<int>(payload_only_result.status)) +
-        " diagnostics=" + std::string(payload_only_result.diagnostics_json != nullptr
-            ? payload_only_result.diagnostics_json : "<null>").substr(0u, 2048u) +
+        " error=" + std::string(payload_only_result.error_message != nullptr
+            ? payload_only_result.error_message : "<null>").substr(0u, 512u) +
+        " diagnostics_length=" + std::to_string(payload_only_diagnostics_length) +
+        " diagnostics_truncated=" + (payload_only_diagnostics_length > 131072u ? "true" : "false") +
+        " diagnostics=" + std::string(payload_only_diagnostics).substr(0u, 131072u) +
         " result=" + std::string(payload_only_result.result_json != nullptr
             ? payload_only_result.result_json : "<null>").substr(0u, 2048u);
     check(payload_only_result.status == FULLMAG_FEM_FD_OK &&
@@ -7963,6 +7969,22 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
         const char *borrowed_observation = fixture_result.diagnostics_json != nullptr
             ? std::strstr(fixture_result.diagnostics_json, "\"borrowed_pmat_copy\":{")
             : nullptr;
+        if (borrowed_observation == nullptr) {
+            const char *diagnostics = fixture_result.diagnostics_json != nullptr
+                ? fixture_result.diagnostics_json : "null";
+            const std::size_t diagnostic_length = std::strlen(diagnostics);
+            std::fprintf(stderr,
+                         "FAIL-DIAGNOSTICS: pattern_fixture borrowed_observation_present=0 status=%d "
+                         "error=%.512s diagnostics_length=%zu diagnostics_truncated=%d\n"
+                         "pattern_fixture_diagnostics=%.131072s\npattern_fixture_result=%.2048s\n",
+                         static_cast<int>(fixture_result.status),
+                         fixture_result.error_message != nullptr
+                             ? fixture_result.error_message : "null",
+                         diagnostic_length, diagnostic_length > 131072u ? 1 : 0,
+                         diagnostics,
+                         fixture_result.result_json != nullptr
+                             ? fixture_result.result_json : "null");
+        }
         check(borrowed_observation != nullptr,
               "bounded pattern fixture evidence is scoped to the borrowed-Pmat object");
         const double actual_rows = extract_json_number(
