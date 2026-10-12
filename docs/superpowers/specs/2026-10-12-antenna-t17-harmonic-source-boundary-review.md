@@ -198,3 +198,64 @@ Nie uruchomiono native, browser ani kompilacji testów jednostkowych.
 Nie porównano jeszcze żadnego wyniku Fullmaga z tym oracle.
 Narzędzie nie obsługuje wymiany, demag, anizotropii, meshu ani portów anteny
 i nie kwalifikuje żadnego z czterech backendów. T17 pozostaje otwarte.
+
+## Mapa istniejących artefaktów → publiczne API
+
+Odczyt przy `a193ccc7bd49886b6bf6fd2fa9d1dce0f5e6dfcd`. Zgodnie z ustaleniem
+integratora nie dodano comparatora ani wymyślonego manifestu. Nie ma jeszcze
+potwierdzonego kompletnego artefaktu harmonicznej odpowiedzi anteny do porównania.
+Poniżej jest rzeczywisty kontrakt istniejącego writera, nie deklaracja T17 PASS.
+
+| Warstwa / tożsamość | Źródło + symbol | Semantyka odczytana |
+|---|---|---|
+| Trwały manifest `frequency_domain/manifest.v1.json` | native `driven_response_solver.cpp` + `write_mfem_validation_artifacts` | `physics.llg_gamma0_si`, `llg_alpha`, `phase_convention`, `frequency_units=Hz`, `field_units=A_per_m`, `normalization=linear_response_tangent`; artifact paths |
+| Sweep `response/magnetic_response_sweep.v2.json` | ten sam writer | `complete`, completed count, `points[]`, ścieżki point/payload; direct harmonic response |
+| Point `response/frequency_points/frequency_NNNN.json` | ten sam writer + `build_response_point_series_json` | `m_complex` jest listą par real/imag surowych DOFs odpowiedzi; nie automatycznie XYZ. `phase_rad` w wierszu to faza odpowiedzi, a faza źródła jest w `excitation_provenance.phase_rad` |
+| XYZ i tangent | ten sam writer | XYZ powstaje tylko przy dostępnym frame/nodes i layout 2 tangent DOFs na node / 3 pełne DOFs. XYZ Zarr `<f8`, shape `[N,3,2]`, interleaved real/imag; tangent to osobny payload i osobna baza |
+| Aktualny katalog artefaktów | `crates/fullmag-api/src/session.rs` + `current_artifact_dir`; `artifacts.rs` + `require_current_live_artifact_dir` | najpierw artifact_dir aktualnego run, potem session; brak workspace/directory jest odmową. Ten odczyt nie kwalifikuje ścieżki historycznych runów |
+| Sweep HTTP | `analysis/frequency_domain.rs` + `get_frequency_domain_response_magnetic_sweep` | `/v2/sessions/current/analysis/frequency-domain/response/magnetic-sweep`; preferuje v2, potem v1 |
+| Point HTTP | ten sam moduł + `get_frequency_domain_response_frequency_point` | `/v2/sessions/current/analysis/frequency-domain/response/frequency-points/{index}`; ścieżka z sweep lub convention fallback |
+| Field meta HTTP | ten sam moduł + `get_frequency_domain_response_field_meta` | `/v2/sessions/current/analysis/frequency-domain/response/field/{index}/meta`; field ID `analysis:frequency-response:frequency-NNNN`, quantity `delta_m`, basis/encoding/views i resource_key |
+| Binary HTTP | `data/fields.rs` + `analysis_frequency_response_vector_response` | `/v2/sessions/current/data/fields/{field_id}/samples/vector`; manifest→sweep→point→fallback wybiera payload; decoder finite LE f64 complex pairs, kontrola zadeklarowanej liczby wartości |
+| Widoki binary | `data/fields.rs` + `analysis_complex_component_view_values` | `complex/full` zachowuje pary i 2×component_count; real/imag/abs/phase zwracają projekcję. `phase_rotated_real` to Re(z exp(i phase)), a nie pełny phasor do comparatora |
+
+`FrequencyDomainFieldResource` nie ma osobnych pól units, normalization ani
+phasor convention. Nie wolno wywodzić ich z nazwy `delta_m`: przyszły comparator
+musi powiązać manifest.physics z point, payload i prerejestrowanym wejściem.
+Nie wolno zastąpić tego zaufaniem do diagnostyki residual lub scalara amplitude.
+W szczególności komponentowe abs usuwa informację o znaku/fazie; `m_complex`
+w JSON wymaga jawnej rekonstrukcji frame, podczas gdy globalny XYZ payload
+ma tę rekonstrukcję już wykonaną. Brak frame nie uprawnia do traktowania tangent
+e1/e2 jako osi x/y.
+
+### Ryzyko tożsamości meta/binary przed kwalifikacją
+
+`frequency_domain_field_content_digest` hashuje kolejno długość serialized
+metadata (LE u64), metadata, długość payload (LE u64) i rzeczywiste payloadbytes.
+Meta revision/content_digest jest więc digestem **metadata + payload**, nie
+samego pliku, mimo węższego komentarza w typie.
+
+Binary `analysis_payload_revision` używa natomiast domain_generation XOR
+byte_len i rolling hash ścieżki. ETag budowany jest z field ID, tego revision,
+view/component i fazy. W tym algorytmie zmiana bajtów przy tej samej
+generacji, ścieżce i długości **nie zmienia revision/ETag**. Jest to źródłowo
+potwierdzona luka association/cache; nie wykonano HTTP reprodukcji.
+Nie narzucać identycznego ETag dla raw complex i transformowanych widoków:
+potrzebne są wspólna tożsamość źródła oraz osobna tożsamość reprezentacji.
+Integrator otrzymał ustalenie; produkcja nie została zmieniona.
+
+### Zamrożenie odczytu dodatkowej mapy
+
+| Ścieżka | Symbol | SHA-256 |
+|---|---|---|
+| `crates/fullmag-api/src/router_v2/handlers/analysis/frequency_domain.rs` | `get_frequency_domain_response_field_meta`, `frequency_domain_field_content_digest` | `3f463bacf550afce46f857a91e04d65a244bbbddfa4037e736a4d19ef73f67b9` |
+| `crates/fullmag-api/src/router_v2/handlers/data/fields.rs` | `analysis_frequency_response_vector_response`, `analysis_payload_revision`, `analysis_complex_component_view_values` | `335935aadafab915d2ae13588fb29637ee6244578c9ad9f6697bd346566f54bd` |
+| `crates/fullmag-api/src/artifacts.rs` | `require_current_live_artifact_dir`, `try_resolve_artifact_path` | `5b0e899d7a8c289402959818adfd4d787be39a4bf2e76e5763fdcc37e99a7796` |
+| `crates/fullmag-api/src/session.rs` | `current_artifact_dir` | `44a46462e9707a070723435fadee558ec69c1f4171923126289b39fcc1298f0a` |
+| `crates/fullmag-api/src/router_v2/mod.rs` | routes response magnetic-sweep/frequency-points/field-meta | `8910ac4c6c9274d737531bd518b8eec51d98cd63b4c1442c4e42f936c11865fa` |
+| `docs/specs/frequency-domain-artifacts-v2.md` | native FEM response metadata contract | `a1bd9d6319e198d5b959c0aeaa60ab9c27d929c77d2a0353a9ec1a21c72f3bfc` |
+
+SHA native writera podano w poprzedniej mapie; źródło nie zmieniło się.
+API odczytano, ale endpointów tutaj nie wywołano, OpenAPI nie regenerowano,
+browser/native/unit build nie wykonano. Mapowanie nie jest dowodem zgodności
+archiwum konkretnego run ani ukończenia API/UI anteny.
