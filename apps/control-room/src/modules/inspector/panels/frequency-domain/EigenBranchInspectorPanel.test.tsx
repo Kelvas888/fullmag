@@ -192,8 +192,8 @@ describe("EigenBranchInspectorPanel point model", () => {
     );
     expect(baseline).not.toBeNull();
 
-    for (const resourceStatus of ["ready", "stale"]) {
-      for (const manifestStatus of ["ready", "stale"]) {
+    for (const resourceStatus of ["ready", "stale", "error"]) {
+      for (const manifestStatus of ["ready", "stale", "error"]) {
         expect(
           buildEigenBranchModePlotHandoff(
             "acoustic", baselinePoint, resourceStatus, artifact,
@@ -202,7 +202,7 @@ describe("EigenBranchInspectorPanel point model", () => {
         ).toEqual(baseline);
       }
     }
-    for (const unavailableStatus of ["idle", "loading", "error"]) {
+    for (const unavailableStatus of ["idle", "loading"]) {
       expect(
         buildEigenBranchModePlotHandoff(
           "acoustic", baselinePoint, unavailableStatus, artifact,
@@ -215,6 +215,25 @@ describe("EigenBranchInspectorPanel point model", () => {
           unavailableStatus, modalManifestOwner,
         ),
       ).toBeNull();
+    }
+    for (const retainedStatus of ["stale", "error"]) {
+      expect(buildEigenBranchModePlotHandoff(
+        "acoustic", baselinePoint, retainedStatus, null,
+        retainedStatus, modalManifestOwner,
+      )).toBeNull();
+      expect(buildEigenBranchModePlotHandoff(
+        "acoustic", baselinePoint, retainedStatus, artifact,
+        retainedStatus, null,
+      )).toBeNull();
+      expect(buildEigenBranchModePlotHandoff(
+        "acoustic", baselinePoint, retainedStatus, { ...artifact, status: "missing" },
+        retainedStatus, modalManifestOwner,
+      )).toBeNull();
+      expect(buildEigenBranchModePlotHandoff(
+        "acoustic", baselinePoint, retainedStatus, artifact,
+        retainedStatus,
+        buildEigenBranchResultManifestOwner(modalManifestResource({ session_id: "other-session" })),
+      )).toBeNull();
     }
     for (const changedOwner of [
       { session_id: "other-session" },

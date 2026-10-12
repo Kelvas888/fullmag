@@ -1064,3 +1064,11 @@ Pinned Doctor0.9.12 source86198f1/packages/core/src/services/git.ts potwierdza d
 4246863053: exactzero ABI nie nadpisuje juz initialized default PoissonAirboxEigenBlockProblem. Nie wprowadzono nowego literal threshold, nie zmieniono Rust omission ani IR. Explicitnonzero nadal trafia do walidatora, w tym negative/NaN/infinity. Nota0600 powstala przed implementacja i standalone source map validator PASS.
 
 Actual modal C ABI tail regression obejmuje defaultzero, explicit0, iterationonly64/64, explicitnondefault2*existingdefault, publishedoriginaldescriptorthreshold i acceptedmode residual. Invalidnegative/nonfinite musza dac validationerror0modes. Weryfikacja przez istniejacy modal-phase-slepc/fem_modal_eigen_typed_cpu_transport_contract, ktory rzeczywiscie wywoluje ten tail niezaleznie od wczesniejszych bledow pelnego modal45. Nie deklarowac PASS z pendingbuild ani nauki z synthetic fixture.
+
+
+GHA38238266747 na116575d9 SUCCESS:236tests20files, fulltypecheck/architecture PASS, scopedDoctor explicitbase206files7remainingissues PASS. To potwierdza nowy fragment interakcji/SSR oraz scoped setup; nie oznacza naprawy617fullscan issues ani browser kwalifikacji. NativeK0 i failurediag pending odrebneGHA.
+
+
+## Retained Plot3D po bledzie refresh
+
+4246863047: error hook moze zachowac ostatni dobry envelope. Handoff teraz dopuszcza ready/stale/error, lecz nadal wymaga ready artifact envelope oraz kompletnej zgodnosci manifest owner/session/run/stage/artifact set/rewizji i point mode metadata. Initial error bez danych, missing artifact lub obcy owner pozostaja niedopuszczalne. Test obejmuje9status combos i stale/error negative guards. Source review PASS, nowy hostedCI i browser pending; nie zmieniono viewport ani renderera WebGL.

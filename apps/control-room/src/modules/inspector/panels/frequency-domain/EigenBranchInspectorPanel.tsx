@@ -597,10 +597,10 @@ function useEigenBranchSummary(selection: InspectorPanelProps["selection"]) {
   };
 }
 
-// A stale hook retains its last successful envelope. Availability and owner
-// identity are checked separately before creating a plot command.
+// Stale and failed-refresh hooks retain their last successful envelope.
+// Availability and owner identity are checked separately before plotting.
 function hasReadyOrRetainedSnapshot(status: string): boolean {
-  return status === "ready" || status === "stale";
+  return status === "ready" || status === "stale" || status === "error";
 }
 
 function isNonEmptyString(value: unknown): value is string {
