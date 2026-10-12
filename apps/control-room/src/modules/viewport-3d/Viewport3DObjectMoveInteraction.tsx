@@ -85,9 +85,6 @@ export function useViewport3DObjectMoveInteraction({
   const activationIdentityRef = useRef<ActiveMoveIdentity | null>(null);
   const selectionEpochRef = useRef(0);
   const selectionSnapshotRef = useRef<ReturnType<typeof kernel.selection.get> | null>(null);
-  if (selectionSnapshotRef.current === null) {
-    selectionSnapshotRef.current = kernel.selection.get();
-  }
   const [, forceSelectionRender] = useState(0);
   const [moveStatus, setMoveStatus] = useState<{
     error: string | null;
@@ -114,12 +111,17 @@ export function useViewport3DObjectMoveInteraction({
     kernel.objectMoveTool.clear();
   }, [kernel.objectMoveTool]);
 
-  useEffect(() => kernel.selection.subscribe((selection) => {
-    if (selectionSnapshotRef.current && selectionSnapshotEquals(selectionSnapshotRef.current, selection)) return;
-    selectionSnapshotRef.current = selection;
-    selectionEpochRef.current += 1;
-    forceSelectionRender((revision) => revision + 1);
-  }), [kernel.selection]);
+  useEffect(() => {
+    if (selectionSnapshotRef.current === null) {
+      selectionSnapshotRef.current = kernel.selection.get();
+    }
+    return kernel.selection.subscribe((selection) => {
+      if (selectionSnapshotRef.current && selectionSnapshotEquals(selectionSnapshotRef.current, selection)) return;
+      selectionSnapshotRef.current = selection;
+      selectionEpochRef.current += 1;
+      forceSelectionRender((revision) => revision + 1);
+    });
+  }, [kernel.selection]);
 
   useEffect(() => {
     if (!moveTool) {
