@@ -8,6 +8,7 @@ on:
       - 'crates/fullmag-authoring/src/adapters.rs'
       - 'crates/fullmag-authoring/src/validation.rs'
       - 'crates/fullmag-ir/src/execution_profile*.rs'
+      - 'crates/fullmag-ir/src/parallel_execution.rs'
       - 'crates/fullmag-application/src/execution_profile.rs'
       - 'packages/fullmag-py/src/fullmag/model/study.py'
       - 'packages/fullmag-py/src/fullmag/runtime/scene_document.py'
@@ -82,6 +83,12 @@ jobs:
           grep -F "adaptive_parallel_execution_uses_materialized_profile_instead_of_stale_legacy_lane ... ok" "$RUNNER_TEMP/adaptive-profile.log"
           grep -F "adaptive_parallel_execution_replays_layers_and_preserves_weakening_guard ... ok" "$RUNNER_TEMP/adaptive-profile.log"
           grep -F "adaptive_parallel_execution_requires_explicit_fem_cpu_lane ... ok" "$RUNNER_TEMP/adaptive-profile.log"
+      - name: Reject malformed scheduling policy shapes at shared IR boundary
+        run: |
+          set -o pipefail
+          cargo test --locked -p fullmag-ir --lib parallel_policy_ -- --nocapture | tee "$RUNNER_TEMP/parallel-policy-shapes.log"
+          grep -F "parallel_policy_requires_map_and_preserves_defaults_and_roundtrip ... ok" "$RUNNER_TEMP/parallel-policy-shapes.log"
+          grep -F "parallel_policy_rejects_duplicate_fields_in_raw_json ... ok" "$RUNNER_TEMP/parallel-policy-shapes.log"
       - name: Run complete authoring validation contracts
         run: cargo test --locked -p fullmag-authoring --lib --no-fail-fast
       - name: Preserve public application materialization replay contracts
