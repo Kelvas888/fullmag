@@ -346,9 +346,9 @@ FrequencyDomainStatus assemble_floquet_bloch_scalar_tangent_source(
         // Assemble the element-local bilinear action directly.  The previous
         // implementation assembled one global LinearForm per tangent column;
         // that made O(N_tangent) global passes over the mesh and hid the
-        // actual source stencil.  These entries are exactly the two MFEM
-        // forms used by the old path, with the tangent basis and Ms factor
-        // expanded in the trial shape function.
+        // actual source stencil. Ms is a separate nodal material coefficient:
+        // interpolate Ms_h before multiplying the tangent field; do not
+        // interpolate the nodal products Ms_j * q_j.
         for (int element = 0; element < element_count; ++element) {
             if (request.magnetic_element_mask != nullptr &&
                 request.magnetic_element_mask[static_cast<std::size_t>(element)] == 0u) {
@@ -360,8 +360,22 @@ FrequencyDomainStatus assemble_floquet_bloch_scalar_tangent_source(
                 request.scalar_space->GetFE(element);
             mfem::ElementTransformation *transformation =
                 mesh->GetElementTransformation(element);
+            int quadrature_order = 2 * finite_element->GetOrder();
+            if (has_saturation_field) {
+                // The shifted source contains Ms_h * N_test * N_trial.
+                // Match the shared-domain positive P1 tet5/prism4 policy and
+                // use at least 3*p otherwise. Higher-order/curved geometry
+                // still requires its own convergence qualification.
+                quadrature_order = 3 * finite_element->GetOrder();
+                const int minimum_order = finite_element->GetGeomType() ==
+                    mfem::Geometry::TETRAHEDRON ? 5 :
+                    (finite_element->GetGeomType() == mfem::Geometry::PRISM ? 4 : 0);
+                if (quadrature_order < minimum_order) {
+                    quadrature_order = minimum_order;
+                }
+            }
             const mfem::IntegrationRule &rule = mfem::IntRules.Get(
-                finite_element->GetGeomType(), 2 * finite_element->GetOrder());
+                finite_element->GetGeomType(), quadrature_order);
             mfem::Vector shape(dofs.Size());
             mfem::DenseMatrix physical_dshape(dofs.Size(), 3);
             for (int point_index = 0; point_index < rule.GetNPoints(); ++point_index) {
@@ -372,6 +386,23 @@ FrequencyDomainStatus assemble_floquet_bloch_scalar_tangent_source(
                 const double weight = transformation->Weight() * point.weight;
                 if (!std::isfinite(weight)) {
                     return FrequencyDomainStatus::operator_error;
+                }
+                double saturation_magnetization = request.saturation_magnetization_a_per_m;
+                if (has_saturation_field) {
+                    saturation_magnetization = 0.0;
+                    // Coefficient interpolation uses ALL element DOFs, even
+                    // when their tangent amplitudes are inactive or reduced.
+                    for (int local = 0; local < dofs.Size(); ++local) {
+                        const int node = dofs[local] >= 0 ? dofs[local] : -1 - dofs[local];
+                        if (node < 0 || node >= dof_count || !std::isfinite(shape[local])) {
+                            return FrequencyDomainStatus::operator_error;
+                        }
+                        saturation_magnetization += shape[local] *
+                            request.saturation_magnetization_field[static_cast<std::size_t>(node)];
+                    }
+                    if (!std::isfinite(saturation_magnetization)) {
+                        return FrequencyDomainStatus::operator_error;
+                    }
                 }
                 for (int local_test = 0; local_test < dofs.Size(); ++local_test) {
                     const int test_node = dofs[local_test] >= 0
@@ -398,11 +429,7 @@ FrequencyDomainStatus assemble_floquet_bloch_scalar_tangent_source(
                         if (output_node >= output_node_count) {
                             return FrequencyDomainStatus::operator_error;
                         }
-                        const double saturation_magnetization =
-                            request.saturation_magnetization_field != nullptr
-                                ? request.saturation_magnetization_field[
-                                      static_cast<std::size_t>(trial_node)]
-                                : request.saturation_magnetization_a_per_m;
+
                         if (!std::isfinite(saturation_magnetization) ||
                             !std::isfinite(shape[local_test]) ||
                             !std::isfinite(shape[local_trial])) {

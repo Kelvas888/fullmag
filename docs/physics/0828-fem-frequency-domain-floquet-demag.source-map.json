@@ -56,7 +56,9 @@
       "sources": [
         "source-full-bloch-contract",
         "source-shared-domain",
-        "source-floquet-dynamic-demag-k"
+        "source-floquet-dynamic-demag-k",
+        "source-nodal-ms-floquet-contract",
+        "source-nodal-ms-floquet-assembly"
       ]
     },
     {
@@ -72,7 +74,9 @@
       ],
       "sources": [
         "source-full-bloch-contract",
-        "source-shared-domain"
+        "source-shared-domain",
+        "source-nodal-ms-floquet-contract",
+        "source-nodal-ms-floquet-assembly"
       ]
     },
     {
@@ -683,6 +687,34 @@
       "symbol": "native_floquet_pair_sets_match",
       "responsibility": "Require exact nonempty requested/node/boundary Floquet pair-ID sets before dynamic-demag native admission.",
       "evidence_status": "source_visible_runtime_not_verified"
+    },
+    {
+      "id": "source-nodal-ms-floquet-contract",
+      "path": "docs/physics/0828-fem-frequency-domain-floquet-demag.md",
+      "symbol": "DOC-ANCHOR:nodal-ms-floquet-source",
+      "responsibility": "Separate P1 material interpolation from tangent amplitudes; quadrature order and independent heterogeneous source gates.",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "source-nodal-ms-floquet-assembly",
+      "path": "backends/fem/cpu/frequency_domain/floquet_bloch_scalar.cpp",
+      "symbol": "assemble_floquet_bloch_scalar_tangent_source",
+      "responsibility": "Assemble nodal material coefficient and tangent source with preserved Bloch representation/sign/mask/reduction.",
+      "evidence_status": "correction_in_progress_runtime_not_verified"
+    },
+    {
+      "id": "source-nodal-ms-floquet-moments",
+      "path": "backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp",
+      "symbol": "floquet_bloch_scalar_heterogeneous_source_moment_contract",
+      "responsibility": "Independent tet/prism analytic moments, full and shifted envelopes; material remains on inactive tangent nodes.",
+      "evidence_status": "source_prepared_native_ci_pending"
+    },
+    {
+      "id": "source-nodal-ms-floquet-gamma",
+      "path": "backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp",
+      "symbol": "floquet_bloch_scalar_heterogeneous_source_k0_consistency",
+      "responsibility": "Compare heterogeneous Gamma source and reciprocal feedback to K0 shared-domain assembly.",
+      "evidence_status": "source_prepared_native_ci_pending"
     }
   ],
   "public_api": {

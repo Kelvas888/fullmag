@@ -17,6 +17,8 @@ on:
       - 'native/cmake/FindFullmagMfem.cmake'
       - 'backends/fem/CMakeLists.txt'
       - 'backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp'
+      - 'backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp'
+      - 'backends/fem/cpu/frequency_domain/floquet_bloch_scalar.cpp'
       - 'backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.hpp'
       - 'backends/fem/cpu/frequency_domain/operators/poisson_airbox_shared_domain.cpp'
       - 'backends/fem/cpu/frequency_domain/operators/poisson_airbox_shared_domain.hpp'
@@ -33,6 +35,7 @@ on:
         default: positive-mass
         options:
           - positive-mass
+          - floquet-source-moments
           - floquet-modal-slepc
           - generic-modal-slepc
           - floquet-count-slepc

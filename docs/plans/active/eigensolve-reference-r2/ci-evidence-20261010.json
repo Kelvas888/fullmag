@@ -1154,6 +1154,39 @@
       "test_files": 21,
       "react_doctor_score": 85,
       "evidence": "Published positive phasor alias regressions, full frontend typecheck, architecture gate and React Doctor pass; browser/WebGL and scientific runtime unverified."
+    },
+    {
+      "run_id": 38297537720,
+      "sha": "6cae503d97617dab27b31eac0ec98a138cee5984",
+      "scope": "ribbon_layout_react_regression",
+      "passed": 245,
+      "test_files": 22,
+      "conclusion": "success",
+      "evidence": "Scoped contract CI verified; native GPU/browser/scientific qualification remains separate."
+    },
+    {
+      "run_id": 38297896837,
+      "sha": "ad7d508721fe37725e970021b3331217c4e72764",
+      "scope": "result_tracking_score_ui_regression",
+      "passed": 247,
+      "test_files": 23,
+      "conclusion": "success",
+      "evidence": "Scoped contract CI verified; native GPU/browser/scientific qualification remains separate."
+    },
+    {
+      "run_id": 38297238378,
+      "sha": "c3038906371a3f73d0ea5aa10de5d7bfc4814739",
+      "scope": "selected_sample_raw_mode_contract",
+      "selection_passed": 18,
+      "conclusion": "success",
+      "evidence": "Scoped contract CI verified; native GPU/browser/scientific qualification remains separate."
+    },
+    {
+      "run_id": 38296088382,
+      "sha": "c888e65823a216b1e0b25f0c2fedf3c68df54265",
+      "scope": "complete_spectrum_scope_source_contracts",
+      "conclusion": "success",
+      "evidence": "Scoped contract CI verified; native GPU/browser/scientific qualification remains separate."
     }
   ]
 }

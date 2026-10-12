@@ -871,3 +871,33 @@ wybiórczych par i nie zmienia phase convention. Dotyczy native FEM CPU;
 FEM GPU nie uzyskuje dzięki temu fallbacku ani kwalifikacji. FDM nie dotyczy.
 Publiczne Python/ProblemIR zachowują pair_ids. Wykonanie nowych regresji
 runnera i managed/numerical qualification pozostaje NOT VERIFIED.
+
+
+## Korekta współczynnika nodalnego Ms — PR97/4248159278
+
+(nodal-ms-floquet-source)=
+
+W równaniach `eq-0828-full-bloch-demag` i `eq-0828-full-bloch-weak` materiałowy współczynnik Ms i amplituda tangentowa są interpolowane oddzielnie. Dla nodalnego P1 współczynnika obowiązuje $M_{s,h}(x)=\sum_l M_{s,l}N_l(x)$, a amplituda to $\delta m_h(x)=\sum_{j,c}q_{jc}e_c(j)N_j(x)$. Iloczyn tych interpolantów stanowi źródło; nie jest nim interpolacja węzłowego iloczynu Ms i amplitudy.
+
+| Symbol | Znaczenie | Jednostka SI |
+|---|---|---|
+| $M_{s,h}$, $M_{s,l}$ | interpolowany współczynnik i jego wartości węzłowe | $\mathrm{A/m}$ |
+| $N_l$, $N_j$ | funkcje kształtu skalarnego elementu | $1$ |
+| $q_{jc}$ | amplituda tangentowa w węźle j, składowa c | $1$ |
+| $e_c(j)$ | jednostkowa rama tangentowa węzła próbnego | $1$ |
+| $x$ | punkt kwadratury | $\mathrm m$ |
+
+Korekta źródłowa `floquet_bloch_scalar.cpp::assemble_floquet_bloch_scalar_tangent_source`: interpolować Ms ze wszystkich lokalnych DOF jeden raz w punkcie kwadratury i użyć tej wartości w każdej kolumnie źródła, zachowując ramy, orientacje, maskę, redukcję i znak operatora. Redukcja amplitud nie redukuje pola materiałowego. Dla nodalnego Ms zastosować co najmniej istniejącą politykę shared-domain: tet4 order5, prism6 order4; shifted-envelope zawiera dodatkowy iloczyn funkcji kształtu i wymaga wyższego stopnia niż dawny order2. Uniform Ms zachowuje dotychczasowy kontrakt. Request nie przyjmuje DG0; nie dodaje się ani nie deklaruje jego obsługi.
+
+Korekta dotyczy S i pochodnych bloków sprzężeń/Schur, nie zmienia bezpośrednio P, Aqq ani Bqq. Niezależne regresje muszą objąć momenty heterogenicznego źródła (real/imaginary, tet4/prism6, obie reprezentacje) i limit k=0 względem istniejącego assemblera. Wyższe rzędy/zakrzywiona geometria oraz runtime/naukowa kwalifikacja pozostają NOT VERIFIED. Implementacja i regresje źródłowe przygotowane; natywny profil CI `floquet-source-moments` musi wykonać istniejący selector `fem_floquet_bloch_scalar_contract`. Ta nota nie dowodzi wykonania solvera.
+
+
+### Indeks źródeł korekty nodalnego Ms
+
+| ID | Path + symbol | Dowód |
+|---|---|---|
+| source-nodal-ms-floquet-contract | `docs/physics/0828-fem-frequency-domain-floquet-demag.md` + `DOC-ANCHOR:nodal-ms-floquet-source` | plan korekty, nie kwalifikacja |
+| source-nodal-ms-floquet-assembly | `backends/fem/cpu/frequency_domain/floquet_bloch_scalar.cpp` + `assemble_floquet_bloch_scalar_tangent_source` | implementacja/regresje w toku, runtime NOT VERIFIED |
+
+| source-nodal-ms-floquet-moments | `backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp` + `floquet_bloch_scalar_heterogeneous_source_moment_contract` | source prepared, native CI pending |
+| source-nodal-ms-floquet-gamma | `backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp` + `floquet_bloch_scalar_heterogeneous_source_k0_consistency` | source prepared, native CI pending |

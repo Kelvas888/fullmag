@@ -309,6 +309,21 @@ CONTRACT_PROFILES["floquet-count-slepc"]["qualification_scope"] = (
 _ORCHESTRATION_DEADLINE: float | None = None
 
 
+CONTRACT_PROFILES["floquet-source-moments"] = {
+    **CONTRACT_PROFILES["positive-mass"],
+    "slug": "fem-floquet-source-moments-contract",
+    "schema": "fullmag.ci.fem.floquet_source_moments_contract.v1",
+    "preflight_schema": "fullmag.ci.fem.floquet_source_moments_preflight.v1",
+    "qualification_scope": "mfem_cpu_nodal_material_source_assembly_contract_only",
+    "tests": [{
+        "name": "fem_floquet_bloch_scalar_contract",
+        "source_suffix": "backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp",
+        "marker": "PASS: floquet_heterogeneous_nodal_ms_moments_and_gamma_consistency",
+        "compile_definitions": ["-DFULLMAG_HAS_MFEM_STACK=1"],
+    }],
+}
+
+
 def _contract_profile(profile_id: str) -> dict[str, Any]:
     try:
         return CONTRACT_PROFILES[profile_id]

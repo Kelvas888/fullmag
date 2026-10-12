@@ -2100,3 +2100,14 @@ znaczenia NEV/NCV/MPD: [dokumentacja SLEPc EPSGetDimensions](https://slepc.upv.e
 | source-k0-eps-dimensions-format | backends/fem/cpu/frequency_domain/poisson_airbox_schur_matshell.hpp + format_poisson_airbox_eps_dimensions_json | Signed nullable wymiary odczytane, bez setterów/getterów w formatterze |
 | source-k0-subwindow-termination-test | backends/fem/tests/frequency_domain/poisson_airbox_schur_matshell_test.cpp + main | Regresja actual formattera wymiarów; niekompilowana |
 | source-gamma-query-trial | scripts/de_gamma_krylov_trial.py + validate_gamma_krylov_trial | Zachowanie opcjonalnych rzeczywistych wymiarów osobno dla każdego podokna |
+
+
+### Indeks źródeł korekty nodalnego Ms
+
+| ID | Path + symbol | Dowód |
+|---|---|---|
+| source-nodal-ms-floquet-contract | `docs/physics/0828-fem-frequency-domain-floquet-demag.md` + `DOC-ANCHOR:nodal-ms-floquet-source` | plan korekty, nie kwalifikacja |
+| source-nodal-ms-floquet-assembly | `backends/fem/cpu/frequency_domain/floquet_bloch_scalar.cpp` + `assemble_floquet_bloch_scalar_tangent_source` | implementacja/regresje w toku, runtime NOT VERIFIED |
+
+| source-nodal-ms-floquet-moments | `backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp` + `floquet_bloch_scalar_heterogeneous_source_moment_contract` | source prepared, native CI pending |
+| source-nodal-ms-floquet-gamma | `backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp` + `floquet_bloch_scalar_heterogeneous_source_k0_consistency` | source prepared, native CI pending |
