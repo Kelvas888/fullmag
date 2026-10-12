@@ -38,6 +38,8 @@ _SCENE_DOCUMENT_FIELDS = frozenset(
         "study",
         "outputs",
         "editor",
+        # Rust authoring validates this non-physical Results metadata before lowering.
+        "analysis",
         "selections",
         "magnetization_constraints",
         "spin_torques",
@@ -281,7 +283,12 @@ def scene_document_to_problem_ir(
     requested_mode: str,
     source_root: str | Path | None = None,
 ) -> dict[str, object]:
-    """Return the canonical, geometry-light ProblemIR for a SceneDocument."""
+    """Return the canonical, geometry-light ProblemIR for a SceneDocument.
+
+    The caller must pass a SceneDocument validated by Rust authoring. Its
+    non-physical analysis Results metadata is intentionally excluded from
+    ProblemIR.
+    """
 
     with _capture_scene_document(
         scene_document,

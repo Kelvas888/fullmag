@@ -8,6 +8,8 @@ on:
       - 'crates/fullmag-authoring/src/adapters.rs'
       - 'packages/fullmag-py/src/fullmag/model/study.py'
       - 'packages/fullmag-py/src/fullmag/runtime/scene_document.py'
+      - 'packages/fullmag-py/src/fullmag/runtime/scene_document_ir.py'
+      - 'packages/fullmag-py/tests/test_scene_document_problem_ir.py'
       - 'packages/fullmag-py/tests/test_api.py'
       - 'packages/fullmag-py/tests/test_scratch_authoring_ui_roundtrip.py'
       - 'docs/physics/0600-fem-eigenmodes-linearized-llg*'
@@ -40,6 +42,24 @@ jobs:
           packages/fullmag-py/tests/test_api.py
           packages/fullmag-py/tests/test_scratch_authoring_ui_roundtrip.py
           -k eigen_solver
+
+  scene-analysis-lowering:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Preserve exact source identity
+        run: git rev-parse HEAD
+      - name: Install existing scene lowering dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libglu1-mesa
+          python -m pip install 'pytest>=9,<10' -e 'packages/fullmag-py[meshing]'
+      - name: Run complete canonical scene lowering contracts including postprocessing metadata
+        run: python -B -m pytest -v packages/fullmag-py/tests/test_scene_document_problem_ir.py
 
   scene-solver-policy:
     runs-on: ubuntu-latest

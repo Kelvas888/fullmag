@@ -43,6 +43,35 @@ def _assert_output_storage_source_stem_contract(
     assert reference_runtime["output_storage_source_stem"] == reference_stem
 
 
+def _validated_postprocessing_analysis() -> dict[str, object]:
+    """Fixture matching the non-physical shape accepted by Rust authoring."""
+    return {
+        "postprocessing_definitions": [
+            {
+                "definition_id": "dispersion-mode-1",
+                "revision": 2,
+                "module_id": "analysis.dispersion",
+                "module_version": "0.1.0",
+                "definition_schema": "analysis.dispersion.mode_visualization.v1",
+                "node_kind": "analysis.dispersion.mode_visualization",
+                "label": "Branch 1 · ky +15 rad/um · 12.025 GHz",
+                "data_ref": {
+                    "run_id": "run-1",
+                    "dataset_id": "modal-k-path",
+                    "dataset_revision": "r7",
+                    "sample_id": "sample-0006",
+                    "item_id": "mode-0001",
+                },
+                "settings": {
+                    "placement": "beside",
+                    "part": "real",
+                    "component": "y",
+                },
+            }
+        ]
+    }
+
+
 def test_rotated_dmi_without_exchange_round_trips_for_fully_periodic_3d() -> None:
     pbc = {
         "axes": ["periodic", "periodic", "periodic"],
@@ -138,6 +167,7 @@ film.alpha.absorbing_boundary(total_width=40e-9, ramp_width=20e-9, max_damping=0
     scene["magnetization_constraints"] = [
         constraint.to_ir(selections=[selection])
     ]
+    scene["analysis"] = _validated_postprocessing_analysis()
 
     problem_ir = scene_document_to_problem_ir(
         scene,
@@ -857,6 +887,7 @@ def test_scene_document_problem_ir_rejects_unlowered_semantics(
     message: str,
 ) -> None:
     scene = _minimal_scene_document(tmp_path)
+    scene["analysis"] = _validated_postprocessing_analysis()
     if "study" in patch:
         scene["study"].update(patch["study"])
     else:

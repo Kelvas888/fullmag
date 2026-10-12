@@ -3557,7 +3557,7 @@ Nowych 9 uwag pozostaje do oceny względem aktualnych źródeł. Poniższy wpis 
 
 | Uwaga | Plik | Stan | Zakres dalszej oceny |
 |---|---|---|---|
-| [4247125949](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247125949) | `crates/fullmag-authoring/src/scene.rs` | open_pending_source_review | Pomiń `analysis` podczas loweringu sceny** |
+| [4247125949](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247125949) | `crates/fullmag-authoring/src/scene.rs` | implemented_pending_ci | Internal scene lowerer dopuszcza authoring-validated nonphysical analysis, ale nie przenosi go do ProblemIR. Rust typed deny_unknown_fields + semantic validator przed capture_authored_scene/export-scene-ir pozostają granicą walidacji; nie duplikowano walidatora w Python. Pełny lowering z definicją oraz strict negative unknown physics/study/interface cases, hosted full scene lowering module. Python AST PASS; runtime CI pending. |
 | [4247310778](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310778) | `crates/fullmag-session/src/typed_documents.rs` | open_pending_source_review | Pomijaj materiał dla pomocniczych obiektów podczas eksportu FMS** |
 | [4247310803](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310803) | `scripts/local_runner/ui_dist/src/views/PoliciesView.js` | open_pending_source_review | Przenieś obsługę polityki retencji do kanonicznego UI** |
 | [4247310808](https://github.com/MateuszZelent/fullmag/pull/97#discussion_r4247310808) | `crates/fullmag-authoring/src/validation.rs` | open_pending_source_review | Waliduj adaptive względem zmaterializowanego profilu** |
