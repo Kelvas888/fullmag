@@ -33,3 +33,8 @@ Próba pozostawienia pattern na historycznym CSR carrier była błędna: bieżą
 Cztery rzeczywiste wywołania C ABI w prywatnym teście obejmują opt-out success bez diagnostyki, opt-in success z pomiarem, successful pattern probe z rozróżnieniem prywatnej struktury 3/4 względem zgodnej rzeczywistej Pmat i successful solve z niedostępnym fresh-LU probe. Kontrole porównują lambda oraz residual przy istniejącej tolerancji, zachowanie phi RHS/solution, cleanup, niezerowy kod błędu unavailable setup i null residuals. Nowy hosted native compile/runtime: pending.
 
 Pełne modal45 i mixed73 pozostają prawdziwymi porażkami true-residual gate. Ta korekta nie rozwiązuje ich przyczyny i nie zamyka kwalifikacji numerycznej lub naukowej.
+
+
+## Regresja budżetów K0 GPU — GHA 38248502096
+
+Native compilation przeszła; 2/4 CTest fail w nowej fixture admission. Produkcyjny helper sentinel policy działa, lecz test dla strict GPU używał legacy return-by-value C ABI, który prawidłowo zatrzymuje GPU na wymaganiu caller-sized result v20 attestation. Fixture teraz korzysta z istniejącego v20 envelope dla wszystkich trzech targetów i zachowuje dokładny powód odrzucenia negative budgets. Nie osłabiono wymogu attestation, availability ani GPU fallback; dodano failure-only bounded log. Kolejne hosted CTest pending; urządzeniowy GPU solve nadal NOT VERIFIED.

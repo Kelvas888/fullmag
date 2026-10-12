@@ -9758,11 +9758,24 @@ void modal_poisson_iteration_policy_preserves_lane_defaults()
             abi_request.poisson_airbox_block_enabled = 1;
             abi_request.max_outer_iterations = budgets[0];
             abi_request.max_linear_iterations = budgets[1];
-            auto result = fullmag_fem_modal_eigen_solve(&abi_request);
+            FullmagFemFrequencyDomainResultV20 envelope{};
+            envelope.abi_version = FULLMAG_FEM_FREQUENCY_DOMAIN_RESULT_V20_ABI_VERSION;
+            envelope.struct_size = sizeof(envelope);
+            check(fullmag_fem_modal_eigen_solve_v20(&abi_request, &envelope) == FULLMAG_FEM_OK,
+                  "caller-sized v20 envelope admits all requested targets before budget validation");
+            const auto &result = envelope.scientific_result_v18;
+            if (result.status != FULLMAG_FEM_FD_VALIDATION_ERROR ||
+                !contains(result.diagnostics_json, "poisson_airbox_iteration_budget_invalid")) {
+                std::fprintf(stderr,
+                    "FAIL-DIAGNOSTICS: Poisson budget target=%u outer=%d linear=%d status=%d error=%.512s diagnostics=%.4096s\n",
+                    static_cast<unsigned>(target), budgets[0], budgets[1], static_cast<int>(result.status),
+                    result.error_message != nullptr ? result.error_message : "null",
+                    result.diagnostics_json != nullptr ? result.diagnostics_json : "null");
+            }
             check(result.status == FULLMAG_FEM_FD_VALIDATION_ERROR && result.mode_count == 0u &&
                       contains(result.diagnostics_json, "poisson_airbox_iteration_budget_invalid"),
                   "actual C ABI rejects negative budgets before device or matrix admission");
-            fullmag_fem_frequency_domain_result_destroy(&result);
+            fullmag_fem_frequency_domain_result_v20_destroy(&envelope);
         }
     }
     std::printf("PASS: modal_poisson_iteration_policy_preserves_lane_defaults\n");
