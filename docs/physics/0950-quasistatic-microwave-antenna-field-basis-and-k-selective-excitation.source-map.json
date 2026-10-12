@@ -29,6 +29,9 @@
     }
   ],
   "symbols": [
+    {"id":"finite_k_shift_indices","latex":"$N,j,s_j,q_j$","meaning":"liczba sond, indeks osi, podpisany koszyk i nieprzesunięty indeks DFT","si_unit":"$1$"},
+    {"id":"finite_k_shift_spacing","latex":"$\\Delta x$","meaning":"dodatni odstęp sond przestrzennych","si_unit":"$\\mathrm m$"},
+    {"id":"finite_k_shift_axis","latex":"$k_j$","meaning":"podpisana liczba falowa","si_unit":"$\\mathrm{rad\\,m^{-1}}$"},
     {"id":"current_display_cell","latex":"$K,\\lvert K\\rvert,dV$","meaning":"owned Tet4, jego objętość i dodatnia miara całkowania","si_unit":"$\\mathrm{m^3}$"},
     {"id":"current_display_index","latex":"$a$","meaning":"lokalny indeks wierzchołka $0,1,2,3$ w kolejności MFEM elementu","si_unit":"$1$"},
     {"id":"current_display_positions","latex":"$\\mathbf v_{K,a},\\mathbf x,\\mathbf x_K^c$","meaning":"wierzchołki, punkt fizyczny i barycentrum komórki","si_unit":"$\\mathrm m$"},
@@ -152,6 +155,7 @@
     {"id": "P_max", "latex": "$P_{\\max}$", "meaning": "versioned maximum direct-Oersted pair count", "si_unit": "$1$"}
   ],
   "equations": [
+    {"id":"antenna-finite-k-shift-map","symbols":["finite_k_shift_indices","finite_k_shift_spacing","finite_k_shift_axis"],"sources":["finite-k-shift-helper","finite-k-shift-regression"]},
     {"id":"antenna-current-display-affine-traces","symbols":["current_display_cell","current_display_index","current_display_positions","current_display_values"],"sources":["antenna-current-display-contract","antenna-current-display-native","antenna-rt0-stable-current"]},
     {"id":"antenna-straight-lead-layer-map","symbols":["straight_lead_indices","straight_lead_positions","straight_lead_length","straight_lead_layers","straight_lead_direction","straight_lead_norm"],"sources":["antenna-straight-lead-preparation-contract","antenna-straight-lead-preparation-owner","antenna-straight-lead-preparation-check"]},
     {"id":"antenna-duffy-source-map","symbols":["duffy_positions","duffy_edges","duffy_parameters"],"sources":["antenna-duffy-native","antenna-duffy-model","antenna-duffy-document"]},
@@ -207,6 +211,8 @@
     }
   ],
   "sources": [
+    {"id":"finite-k-shift-helper","path":"crates/fullmag-runner/src/spin_wave_sampling.rs","symbol":"dynamic_structure_factor_1d_with_axes","responsibility":"Mapowanie signed osi k do nieprzesuniętych koszyków DFT; bez zmiany fazy lub normalizacji."},
+    {"id":"finite-k-shift-regression","path":"crates/fullmag-runner/src/spin_wave_sampling.rs","symbol":"finite_k_shift_matches_direct_dft_for_odd_even_signed_and_zero_k","responsibility":"Zapisana regresja rzeczywistego helpera ±k/DC i odd/even; niekompilowana."},
     {"id":"antenna-current-display-contract","path":"docs/physics/0950-quasistatic-microwave-antenna-field-basis-and-k-selective-excitation.md","symbol":"DOC-ANCHOR:antenna-owned-current-display-snapshot","responsibility":"Same-owner J carrier, cell-local traces, SI, pins i granice; bez capability promotion.","evidence_status":"planned_contract"},
     {"id":"antenna-current-display-native","path":"backends/fem/cpu/mfem/workflows/antenna_field_solve/accepted_external_lead_source.cpp","symbol":"sample_current_display","responsibility":"Cold native sampling tego samego accepted AffineRt0Element, centers/traces bez drugiego solve; source-only.","evidence_status":"source_only"},
     {"id":"antenna-current-display-size","path":"backends/fem/cpu/mfem/workflows/antenna_field_solve/accepted_external_lead_source.cpp","symbol":"accepted_external_lead_current_display_payload_size","responsibility":"Exact framed size i actual device-cell ownership przed charge solve; source-only.","evidence_status":"source_only"},

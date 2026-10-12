@@ -6568,6 +6568,46 @@ evidence and cannot promote a capability lane.
 | `crates/fullmag-runner/src/native_fem/steady_transport/direct_oersted_snapshot.rs` | `owns_twelve_complete_targets_without_json_truncation`, `refuses_mutated_headers_bindings_and_work` | zapisane niekompilowane regresje 12 targetów i 15 odmów; brak runtime dowodu |
 | `scripts/test_direct_oersted_snapshot_source.py` | `test_export_copies_same_direct_result_before_publishing_length` | source/layout regresje, 12-record model większy od 1024 bytes, nie native proof |
 
+(antenna-finite-k-shift-contract)=
+### Kontrakt porządku koszyków przestrzennych finite-k
+
+Analiza odpowiedzi czasowej zachowuje konwencję
+`exp[-i(k*x-2*pi*f*t)]`, odejmowanie pierwszego snapshotu, oba okna Hann
+i dotychczasową normalizację. Naprawa dotyczy tylko przypisania koszyków do
+osi, nie fizyki wymuszenia, gamma ani kierunku propagacji.
+
+```{math}
+:label: antenna-finite-k-shift-map
+s_j=j-\lfloor N/2\rfloor,\qquad
+k_j=\frac{2\pi s_j}{N\Delta x},\qquad
+q_j=s_j\bmod N=(j+\lceil N/2\rceil)\bmod N.
+```
+
+| Symbol | Znaczenie | Jednostka SI |
+|---|---|---|
+| $N,j,s_j,q_j$ | liczba sond, indeks osi, podpisany koszyk i nieprzesunięty indeks DFT | $1$ |
+| $\Delta x$ | dodatni odstęp sond przestrzennych | $\mathrm m$ |
+| $k_j$ | podpisana liczba falowa | $\mathrm{rad\,m^{-1}}$ |
+
+Wymagane jest $N\ge4$; indeksy $j,q_j$ należą do 0..N−1.
+Reszta modulo ma być nieujemna. Równoważność wynika z dodania N do
+`j-floor(N/2)`: `N-floor(N/2)=ceil(N/2)`. Dla parzystego N stary i nowy
+offset są równe; dla nieparzystego stary offset przypisywał widmo o jeden
+koszyk obok etykiety. Nie ograniczać API do parzystych rozmiarów.
+
+Źródło: `crates/fullmag-runner/src/spin_wave_sampling.rs` +
+`dynamic_structure_factor_1d_with_axes`; regresja tego rzeczywistego helpera:
+`finite_k_shift_matches_direct_dft_for_odd_even_signed_and_zero_k`.
+Test ma porównywać zespolone wartości i power z bezpośrednią sumą DFT dla
+obu znaków k i DC oraz odd/even N. Zapis testu nie oznacza jego wykonania.
+
+Publiczne Python/ProblemIR, parametry, schema artefaktu, planner i waveform
+pozostają bez zmian. Obecny request finite-k to runtime metadata opisane
+w audycie E9c; typed authoring i pełny round-trip nie są tą poprawką domknięte.
+FDM CPU/GPU: obecny request reader nieobsługiwany. FEM CPU/GPU: wspólny
+postprocessor, ale oba runtime'y i parytet nadal niezakwalifikowane.
+Naprawa nie kwalifikuje snapshotów, anteny, meshu, cold HTTP ani UI.
+
 (antenna-scientific-bibliography)=
 ## 14. References
 

@@ -111,3 +111,75 @@ requestu finite-k. `crates/fullmag-runner/src/native_fem.rs` +
 automatyczna deklaracja zapisu ani dowód pełnego monitor pipeline.
 Nie zmieniono writera ani polityki output. Reprodukcję i ograniczenia
 przekazano integratorowi; runtime, cold HTTP i browser nadal NOT VERIFIED.
+
+## Uzupełnienie: osie FFT i semantyka maski sond
+
+W `crates/fullmag-runner/src/spin_wave_sampling.rs` +
+`dynamic_structure_factor_1d_with_axes` etykieta signed bin wynosi
+`index - floor(N/2)`, lecz payload wybierany jest przez
+`(index + floor(N/2)) % N`. Dla nieparzystego N te permutacje nie odpowiadają
+sobie. Publiczny reader dopuszcza probe_count w 4..=2048 bez wymagania parzystości.
+
+Wykonana niezależna kontrola indeksów w Pythonie (exit 0, bez native) dała:
+
+| N | Permutacja źródłowa | Permutacja zgodna z etykietami | Zgodność |
+|---|---|---|---|
+| 4 | 2,3,0,1 | 2,3,0,1 | tak |
+| 5 | 2,3,4,0,1 | 3,4,0,1,2 | nie |
+| 7 | 3,4,5,6,0,1,2 | 4,5,6,0,1,2,3 | nie |
+| 8 | 4,5,6,7,0,1,2,3 | 4,5,6,7,0,1,2,3 | tak |
+
+To potwierdza błąd mapowania źródłowego. Przed zamknięciem wymagany jest
+wykonywalny regression na rzeczywistej funkcji FFT, z dodatnim/ujemnym k,
+DC i nieparzystym N; nie wolno zamknąć problemu przez ograniczenie publicznego
+probe_count do parzystych wartości. Poprawka permutacji musi zachować istniejącą
+konwencję fazy, normalizację i poprawne parzyste przypadki.
+
+Osobna obserwacja semantyczna: `requested_finite_k_artifacts` tworzy
+`invalid_probe_mask` z przestrzennych wierszy operatora, a API
+`crates/fullmag-api/src/router_v2/handlers/analysis/spin_wave_response.rs` +
+`bound_dynamic_structure_factor` ogranicza maskę indeksami osi k.
+Frontend `apps/control-room/src/modules/analysis-plots/dynamicStructureFactorModel.ts`
++ `hasConsistentGrid`, `dynamicStructureFactorPointSelection` interpretuje ją jako
+maskę koszyków k. Sonda x i koszyk Fouriera nie mają relacji jeden-do-jednego.
+Obecny reader odrzuca każdą invalid row przed FFT, więc dla aktualnie generowanego
+wyniku maska zawiera tylko false: nie jest to dowód występującego dziś błędnego
+ukrywania wyników. Jest to niespójność kontraktu, którą należy rozstrzygnąć
+przed obsługą częściowo nieprawidłowych sond, bez arbitralnego maskowania k.
+
+Hook `apps/control-room/src/kernel/resources/spinWaveResources.ts` +
+`useDynamicStructureFactorResource` używa session-scoped resource key,
+typed API i `schema_version` jako resolveRevision. To dowód istniejącej
+trasy klienta, nie tożsamości bytes wyniku lub poprawnej invalidacji między runami;
+pełna kontrola resource lifecycle pozostaje otwarta.
+
+Dodatkowe SHA odczytu: API `spin_wave_response.rs`
+`485a529be45099efdb8fa07b9613ed6fdf7f695f6cb6bc748a6076684261f4e6`;
+frontend `dynamicStructureFactorModel.ts`
+`1e2e7e10315030dbf7481dad876dd9131845bcaacde569b05b06a11881b93e53`.
+SHA sampling pozostaje zgodne z tabelą powyżej.
+
+### Izolowany kandydat poprawki odd-N
+
+Na przydział integratora zapisano zmianę produkcyjną wyłącznie offsetu:
+`space_count / 2` → `space_count.div_ceil(2)`. Regresja rzeczywistego helpera
+`finite_k_shift_matches_direct_dft_for_odd_even_signed_and_zero_k` obejmuje
+N=15/16 i signed k=-3/0/+3: direct complex DFT, power, peak, axis,
+phase_convention i normalization. Testy Rust zapisano, lecz nie kompilowano.
+
+Doc-first kontrakt i mapa źródeł w canonical 0950; focused validator PASS.
+`rustfmt --edition 2021 --emit stdout` parser PASS (bez zapisu formatowania).
+Niezależna kontrola NumPy sześciu przypadków PASS; maksymalna różnica zespolona
+`7.815970093361102e-14`, wszystkie signed peaks zgodne. Nie jest to wykonanie
+helpera Rust ani kwalifikacja runtime.
+
+Patch storage `reviews/antenna-harmonic-cache-20261012/finite-k-odd-shift.patch`
+w resolverowym build root tego worktree, SHA-256
+`a3228943665690620515a8550548da12fc3b1df2a0f570c84087e8b8cd36bb06`.
+Own preimage `fb0d5264c89104e22e46adc627ea98a0a0215afc95981086762338ffb0d41d27`;
+own after `c380f0dfaffe8f86373bbb799e336d191d51134a3647fa8054a5304a523c76db`.
+Root preimage pozostaje `aee4e4a7e2d89bc17472e2a97a39b025e1d532c38293923313af67ccd0f3d4a5`;
+`git apply --check` na nim PASS. Own after nie jest expected root after,
+ponieważ root zawiera niezależny WIP aktywacji anteny. Root nie zmieniono.
+Pakiet przekazano integratorowi do review; zastosowanie i integracja z jego
+canonical doc WIP pozostają otwarte.
