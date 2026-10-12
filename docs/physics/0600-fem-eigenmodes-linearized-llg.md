@@ -1311,3 +1311,17 @@ ABI modal request uzywa residual_tolerance=0 jako sentinela braku jawnej polityk
 Nie zmienia to fizyki dynamicznego demag K0, rownania LLG, jednostek SI ani kryterium residualu. Requested intent w Python/IR pozostaje omission; adapter rozwiazuje jedynie sentinel dla konkretnej sciezki K0 Poisson. Nie dodawac alternatywnej domyslnej wartosci w Rust ani hardkodowanej tolerancji w launcherze.
 
 Weryfikacja wymagana: rzeczywisty modal C ABI Poisson-tail solve dla0 oraz jawnej dodatniej tolerancji, takze0 z jawnymi limitami iteracji. Invalid nonzero musi nadal byc odrzucone. Native compile/runtime i kwalifikacja fizyczna pozostaja NOT VERIFIED do hosted gate; source validator nie dowodzi solve.
+
+
+### Opt-in obserwacja operatora po udanym Floquet solve
+
+Prywatny pattern-mismatch hook mierzy osobny probe, a nie uszkadza operatora produkcyjnego i nie powinien wymuszac solve_error. Poprzedni failure-only eksport pomijal cached observer przy statusOK. Sukces z opt-in requested candidate diagnostic moze addytywnie publikowac neutralne candidate_operator_observation przez istniejacy serializer floquet_candidate_operator_diagnostic.v1. Nie nazywac go failure probe przy udanym solve. Opt-out nie publikuje nowego pola; dotychczasowy shifted_ksp_failure_probe pozostaje bez zmian.
+
+Eksport korzysta wylacznie z juz zmierzonych cached danych. Nie dodawac PETSc queries po solve lub quarantine, nie zmieniac macierzy, skalowania, tolerancji, ABI ani certyfikatu kompletnosci. Brak pomiaru nadal wymaga unavailable/null, a nie true lub zero. Widocznosc observer nie dowodzi kwalifikacji fizycznej solvera.
+
+Fixture pattern musi spelniac obecny descriptor R4 (FIELD-only carrier), miec poprawny solve/accepted mode, exact scoped mismatch3/4 i cleanup oraz zgodnosc solveroutput z opt-in control przy dotychczasowej tolerancji. Opt-out success musi nie miec neutralnego pola. Row/PCApply hard-fault i failure-probe guards zachowac. GHA/runtime nowego eksportu pending; pelne happy-breakdown failures nie sa tym naprawione.
+
+
+| Source ID | Path + symbol | Odpowiedzialność |
+|---|---|---|
+| source-floquet-success-observation | `backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp::floquet_shifted_ksp_diagnostics_json_fields` | Eksport cached opt-in obserwacji po sukcesie bez zmiany acceptance |

@@ -24,3 +24,12 @@ Source01f2112b nadal9/12PASS. Pattern completeJSON8581:statusOK accepted1,4truec
 Fixture pattern teraz nie stosuje specjalnego FIELD-only override z fault-quarantine cases; zachowuje bazowy historycznyCSR carrier oraz maxlinear1/rtol/target/privatehook i wszystkie mismatch/cleanupguards. To warunek istniejącego hard-nearest testu, a nie pełny model fizyczny. Nowy runtime NOT VERIFIED. Nie zmieniono production solvera ani tolerancji.
 
 Mixed73 kompletneJSON:subwindow1 shift0.6537857698010644Hz, true residual1.8635310157807875e-10/threshold2.4343592418709787e-14, ratio7655.1191941109355, recursive0/defaultreason3/gate0. LivePC relative residual7.838566796905665e-8, fresh NONZERO/NONE1.201422675269101e-16, exactPmat defect0 i cleanup/phi invariants true. Jest to rzeczywisty fail true-residual gate. Sama zgodność wpisów Pmat nie dowodzi zgodności faktorów; numerical rootcause nadal otwarty.
+
+
+## Korekta wniosków po GHA 38241463969
+
+Próba pozostawienia pattern na historycznym CSR carrier była błędna: bieżący R4 odrzucił descriptor przed EPS. Przywrócono prawidłowy FIELD-only carrier, a przyczynę braku danych usunięto w serializerze. Po udanym opt-in solve neutralne `candidate_operator_observation` publikuje wyłącznie cached pomiar. Failure-only eksport pozostaje bez zmian. Nie wprowadzono dodatkowych PETSc queries ani zmiany fizyki, tolerancji czy acceptance.
+
+Cztery rzeczywiste wywołania C ABI w prywatnym teście obejmują opt-out success bez diagnostyki, opt-in success z pomiarem, successful pattern probe z rozróżnieniem prywatnej struktury 3/4 względem zgodnej rzeczywistej Pmat i successful solve z niedostępnym fresh-LU probe. Kontrole porównują lambda oraz residual przy istniejącej tolerancji, zachowanie phi RHS/solution, cleanup, niezerowy kod błędu unavailable setup i null residuals. Nowy hosted native compile/runtime: pending.
+
+Pełne modal45 i mixed73 pozostają prawdziwymi porażkami true-residual gate. Ta korekta nie rozwiązuje ich przyczyny i nie zamyka kwalifikacji numerycznej lub naukowej.

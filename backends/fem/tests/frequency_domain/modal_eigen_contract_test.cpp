@@ -7927,12 +7927,10 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
         fixture.payload.magnetic_a_qq_csr = magnetic_stiffness.view();
     }
 
-    // The pattern probe retains the baseline legacy CSR carrier and its
-    // one-iteration hard-KSP precondition: the private observer is serialized
-    // only on floquet_slepc_solve_failed. The FIELD-only fault carrier can
-    // converge successfully and hide that evidence without proving a mismatch.
+    // These private probes use the admissible FIELD descriptor. A successful
+    // pattern solve publishes its cached observer without requiring a failure.
     if (fault_quarantine_only || borrowed_pmat_row_restore_fault_only ||
-        borrowed_pmat_primary_cleanup_fault_only) {
+        borrowed_pmat_primary_cleanup_fault_only || pattern_mismatch_fixture_only) {
         fixture.descriptor.term_presence_mask =
             FULLMAG_FEM_MODAL_LINEARIZATION_TERM_FIELD;
         fixture.descriptor.field_term_digest =
@@ -7960,20 +7958,74 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
         const ScopedFloquetDiagnosticEnvironment diagnostic_environment{};
         SavedEnvironmentValue fault_environment{
             "FULLMAG_FLOQUET_LIVE_PC_DIAGNOSTIC_FAULT"};
-        const bool fault_ready = diagnostic_environment.ready &&
-            set_floquet_diagnostic_environment(
-                fault_environment.name, "pattern_mismatch_fixture") == 0;
-        check(fault_ready,
-              "enable the private bounded pattern-mismatch fixture during opt-in diagnostics");
+        check(diagnostic_environment.ready,
+              "enable the private successful Floquet observer in the pattern process");
         FullmagFemModalEigenRequest fixture_request = request;
         fixture_request.max_linear_iterations = 1;
+        FullmagFemFrequencyDomainResult opt_out_result{};
+        {
+            const ScopedFloquetDiagnosticEnvironment opt_out_environment{};
+            check(opt_out_environment.ready &&
+                      set_floquet_diagnostic_environment(opt_out_environment.dense_oracle.name, "") == 0 &&
+                      set_floquet_diagnostic_environment(opt_out_environment.schur_action.name, "") == 0,
+                  "disable both private observer opt-ins for the successful control");
+            opt_out_result = fullmag_fem_modal_eigen_solve(&fixture_request);
+        }
+        check(opt_out_result.status == FULLMAG_FEM_FD_OK &&
+                  !contains(opt_out_result.diagnostics_json, "\"candidate_operator_observation\":") &&
+                  !contains(opt_out_result.diagnostics_json, "\"shifted_ksp_failure_probe\":"),
+              "opt-out successful solve publishes neither a private observer nor a failure probe");
+        FullmagFemFrequencyDomainResult control_result =
+            fullmag_fem_modal_eigen_solve(&fixture_request);
+        const std::string control_observation = json_object_after_key(
+            control_result.diagnostics_json, "\"candidate_operator_observation\":");
+        const std::string control_live_pc = json_object_after_key(
+            control_observation.c_str(), "\"live_pc_observation\":");
+        check(control_result.status == FULLMAG_FEM_FD_OK &&
+                  json_member_has_literal(control_observation.c_str(), "\"requested\":", "true") &&
+                  json_member_has_literal(control_observation.c_str(), "\"sample_available\":", "true") &&
+                  json_member_has_literal(control_live_pc.c_str(), "\"status\":", "\"measured\"") &&
+                  json_member_has_literal(control_live_pc.c_str(), "\"available\":", "true") &&
+                  contains(control_live_pc.c_str(),
+                      "\"production_phi_rhs_unchanged_after_observation_available\":true,\"production_phi_rhs_unchanged_after_observation\":true") &&
+                  contains(control_live_pc.c_str(),
+                      "\"production_phi_solution_unchanged_after_observation_available\":true,\"production_phi_solution_unchanged_after_observation\":true") &&
+                  !contains(control_result.diagnostics_json, "\"shifted_ksp_failure_probe\":"),
+              "successful opt-in control publishes a measured cached live-PC observer under its neutral key");
+        const auto solver_agrees_with_control = [&](const FullmagFemFrequencyDomainResult &candidate) {
+            if (candidate.status != FULLMAG_FEM_FD_OK || candidate.mode_count != 1u ||
+                control_result.mode_count != 1u || candidate.mode_lambda == nullptr ||
+                control_result.mode_lambda == nullptr || candidate.mode_residuals == nullptr ||
+                !std::isfinite(candidate.mode_residuals[0]) || candidate.mode_residuals[0] < 0.0 ||
+                candidate.mode_residuals[0] > fixture_request.residual_tolerance) {
+                return false;
+            }
+            const double scale = std::hypot(control_result.mode_lambda[0].real,
+                                             control_result.mode_lambda[0].imag);
+            const double defect = std::hypot(
+                candidate.mode_lambda[0].real - control_result.mode_lambda[0].real,
+                candidate.mode_lambda[0].imag - control_result.mode_lambda[0].imag);
+            return std::isfinite(scale) && scale > 0.0 && std::isfinite(defect) &&
+                defect / scale <= fixture_request.residual_tolerance;
+        };
+        check(solver_agrees_with_control(opt_out_result),
+              "private opt-in observation preserves the successful solver result at the existing residual tolerance");
+        fullmag_fem_frequency_domain_result_destroy(&opt_out_result);
+        check(set_floquet_diagnostic_environment(
+                  fault_environment.name, "pattern_mismatch_fixture") == 0,
+              "enable the private bounded pattern-mismatch fixture during opt-in diagnostics");
         FullmagFemFrequencyDomainResult fixture_result =
             fullmag_fem_modal_eigen_solve(&fixture_request);
         fault_environment.restore();
 
-        const char *borrowed_observation = fixture_result.diagnostics_json != nullptr
-            ? std::strstr(fixture_result.diagnostics_json, "\"borrowed_pmat_copy\":{")
-            : nullptr;
+        const std::string pattern_observation = json_object_after_key(
+            fixture_result.diagnostics_json, "\"candidate_operator_observation\":");
+        const std::string pattern_live_pc = json_object_after_key(
+            pattern_observation.c_str(), "\"live_pc_observation\":");
+        const std::string pattern_borrowed_pmat = json_object_after_key(
+            pattern_live_pc.c_str(), "\"borrowed_pmat_copy\":");
+        const char *borrowed_observation = pattern_borrowed_pmat.empty()
+            ? nullptr : pattern_borrowed_pmat.c_str();
         if (borrowed_observation == nullptr) {
             const char *diagnostics = fixture_result.diagnostics_json != nullptr
                 ? fixture_result.diagnostics_json : "null";
@@ -8029,15 +8081,22 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
                 borrowed_observation,
                 "\"bounded_pattern_fixture_structural_pattern_match_available\":true,\"bounded_pattern_fixture_structural_pattern_match\":false");
         const bool pattern_fixture_contract_observed =
-            fixture_result.status == FULLMAG_FEM_FD_SOLVE_ERROR &&
-            contains(fixture_result.diagnostics_json,
+            solver_agrees_with_control(fixture_result) &&
+            contains(borrowed_observation,
                      "\"full_explicit_entry_comparison_available\":true") &&
+            contains(borrowed_observation,
+                     "\"nnz_match_available\":true,\"nnz_match\":true") &&
+            contains(borrowed_observation,
+                     "\"structural_pattern_match_available\":true,\"structural_pattern_match\":true") &&
+            contains(borrowed_observation,
+                     "\"values_equal_available\":true,\"values_equal\":true") &&
             actual_pmat_counts_are_nonzero &&
             known_pattern_fixture_is_distinguished &&
             contains(
                 borrowed_observation,
                 "\"cleanup_attempted\":true,\"cleanup_succeeded_available\":true,\"cleanup_succeeded\":true") &&
-            contains(fixture_result.result_json, "\"status\":\"solve_error\"");
+            contains(fixture_result.result_json, "\"status\":\"ok\"") &&
+            !contains(fixture_result.diagnostics_json, "\"shifted_ksp_failure_probe\":");
         if (!pattern_fixture_contract_observed) {
             std::fprintf(stderr,
                          "FAIL-DIAGNOSTICS: pattern_fixture status=%d actual_pmat_counts_are_nonzero=%d "
@@ -8049,6 +8108,40 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
         }
         check(pattern_fixture_contract_observed,
               "owned 2x2 SeqAIJ fixture detects the known 3/4-entry and structural-pattern mismatch without replacing actual-Pmat evidence");
+        check(set_floquet_diagnostic_environment(fault_environment.name, "fresh_setup") == 0,
+              "inject only an unavailable private fresh-LU measurement after a successful solve");
+        FullmagFemFrequencyDomainResult unavailable_result =
+            fullmag_fem_modal_eigen_solve(&fixture_request);
+        fault_environment.restore();
+        const std::string unavailable_observation = json_object_after_key(
+            unavailable_result.diagnostics_json, "\"candidate_operator_observation\":");
+        const std::string unavailable_live_pc = json_object_after_key(
+            unavailable_observation.c_str(), "\"live_pc_observation\":");
+        const std::string unavailable_borrowed = json_object_after_key(
+            unavailable_live_pc.c_str(), "\"borrowed_pmat_copy\":");
+        const double unavailable_setup_error = extract_json_number(
+            unavailable_borrowed.c_str(), "\"fresh_ksp_setup_error_code\":",
+            "unavailable_private_fresh_setup_error");
+        check(solver_agrees_with_control(unavailable_result) &&
+                  std::isfinite(unavailable_setup_error) && unavailable_setup_error != 0.0 &&
+                  json_member_has_literal(unavailable_borrowed.c_str(),
+                      "\"fresh_solver_reason\":", "\"injected_fresh_lu_setup_failure\"") &&
+                  json_member_has_literal(unavailable_borrowed.c_str(),
+                      "\"fresh_ksp_setup_error_code_available\":", "true") &&
+                  json_member_has_literal(unavailable_borrowed.c_str(),
+                      "\"fresh_ksp_setup_available\":", "false") &&
+                  json_member_has_literal(unavailable_borrowed.c_str(),
+                      "\"fresh_solve_available\":", "false") &&
+                  contains(unavailable_borrowed.c_str(),
+                      "\"fresh_pmat_relative_residual_available\":false,\"fresh_pmat_relative_residual\":null") &&
+                  contains(unavailable_borrowed.c_str(),
+                      "\"fresh_shifted_operator_relative_residual_available\":false,\"fresh_shifted_operator_relative_residual\":null") &&
+                  contains(unavailable_borrowed.c_str(),
+                      "\"cleanup_attempted\":true,\"cleanup_succeeded_available\":true,\"cleanup_succeeded\":true") &&
+                  !contains(unavailable_result.diagnostics_json, "\"shifted_ksp_failure_probe\":"),
+              "successful private observation preserves unavailable fresh-LU values as null without changing acceptance");
+        fullmag_fem_frequency_domain_result_destroy(&unavailable_result);
+        fullmag_fem_frequency_domain_result_destroy(&control_result);
         fullmag_fem_frequency_domain_result_destroy(&fixture_result);
         std::printf(
             "PASS: modal_eigen_borrowed_pmat_pattern_mismatch_fixture_probe\n");

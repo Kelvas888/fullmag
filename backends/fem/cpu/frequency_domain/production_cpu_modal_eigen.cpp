@@ -1172,6 +1172,13 @@ std::string floquet_shifted_ksp_diagnostics_json_fields(
             candidate_operator_diagnostic_json(
                 probe.candidate_operator_diagnostic) + "}}";
     }
+    // Publish only the cached opt-in observation after a successful solve.
+    // Its diagnostic availability does not certify physics or alter acceptance.
+    if (result.ok && result.shifted_ksp_failure_probe.candidate_operator_diagnostic.requested) {
+        json += ",\"candidate_operator_observation\":" +
+            candidate_operator_diagnostic_json(
+                result.shifted_ksp_failure_probe.candidate_operator_diagnostic);
+    }
     // Sparse nearest success already publishes these configuration fields.
     // Window and nearest failure need them here; emit each key exactly once.
     if (include_basic_fields) {

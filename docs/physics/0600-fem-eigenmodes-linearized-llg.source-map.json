@@ -627,6 +627,12 @@
       "path": "crates/fullmag-plan/src/fem.rs",
       "symbol": "eigen_solver_policy",
       "responsibility": "Validate existing finite positive tolerance and signed iteration count bounds."
+    },
+    {
+      "id": "source-floquet-success-observation",
+      "path": "backends/fem/cpu/frequency_domain/production_cpu_modal_eigen.cpp",
+      "symbol": "floquet_shifted_ksp_diagnostics_json_fields",
+      "responsibility": "Export cached opted-in candidate operator observation after successful solve without modifying acceptance or failure diagnostic semantics."
     }
   ],
   "public_api": {
