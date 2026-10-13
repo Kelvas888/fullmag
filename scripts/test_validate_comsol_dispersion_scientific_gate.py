@@ -1847,7 +1847,9 @@ class ScientificGateTests(unittest.TestCase):
             report = gate.validate_case(case_dir, "c1", parameters_path=PARAMETERS, kpath_path=KPATH)
         self.assertEqual(report["campaign_contract_status"], "pass", report["reasons"][:12])
         airbox_check = report["checks"]["airbox_convergence"]
-        self.assertEqual(airbox_check["status"], "pass", report["reasons"][:12])
+        self.assertEqual(airbox_check["status"], "not_verified", report["reasons"][:12])
+        self.assertEqual(airbox_check["numeric_status"], "pass", report["reasons"][:12])
+        self.assertEqual(airbox_check["physical_identity_status"], "not_verified")
         self.assertTrue(airbox_check["adjacent_comparisons"])
         self.assertTrue(all(
             item["comparison_reference"] == "adjacent_airbox_boundary_sweep"
@@ -1923,9 +1925,11 @@ class ScientificGateTests(unittest.TestCase):
                  str(case_dir), "--case", "c0", "--parameters", str(PARAMETERS)],
                 capture_output=True, text=True, encoding="utf-8", check=False,
             )
-            self.assertEqual(process.returncode, 0, process.stderr)
+            self.assertEqual(process.returncode, 1, process.stderr)
             report = json.loads(process.stdout)
-            self.assertEqual(report["status"], "qualified")
+            self.assertEqual(report["status"], "not_qualified")
+            self.assertEqual(report["checks"]["mesh_convergence"]["numeric_status"], "pass")
+            self.assertEqual(report["checks"]["mesh_convergence"]["physical_identity_status"], "not_verified")
             self.assertEqual(report["checks"]["modal_field_phase"]["status"], "pass")
             self.assertEqual(report["checks"]["modal_potential_phase"]["status"], "not_applicable")
             self.assertIn("eigen/spectrum.v2.json", report["artifact_bindings"])
@@ -1943,7 +1947,12 @@ class ScientificGateTests(unittest.TestCase):
             self.assertEqual(potential_check["gauge_status"], "not_applicable")
             self.assertEqual(potential_check["applicability_status"], "validated_demag_disabled")
             self.assertIn("does not solve a dynamic scalar potential", potential_check["reason"])
-            self.assertEqual(report["status"], "qualified")
+            self.assertEqual(report["campaign_contract_status"], "pass")
+            self.assertEqual(report["checks"]["mesh_convergence"]["numeric_status"], "pass")
+            self.assertEqual(report["checks"]["mesh_convergence"]["physical_identity_status"], "not_verified")
+            self.assertEqual(report["checks"]["mode_count_convergence"]["numeric_status"], "pass")
+            self.assertEqual(report["checks"]["mode_count_convergence"]["physical_identity_status"], "not_verified")
+            self.assertEqual(report["status"], "not_qualified")
 
     def test_c0_contradictory_demag_metadata_prevents_not_applicable_potential_status(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2140,6 +2149,70 @@ class ScientificGateTests(unittest.TestCase):
                 changed["execution_plan"]["backend_plan"][field] = changed_value
                 self.assertNotEqual(gate._backend_signature(original, vary=vary), gate._backend_signature(changed, vary=vary))
 
+    def test_cross_run_numeric_agreement_and_producer_claims_do_not_verify_mode_identity(self):
+        for producer_claim in (False, True):
+            with self.subTest(producer_claim=producer_claim), tempfile.TemporaryDirectory() as directory:
+                case_dir = _make_case(Path(directory), "c1")
+                evidence_path = case_dir / gate.EVIDENCE_RELATIVE_PATH
+                evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+                section = evidence["convergence"]["mode_count"]
+                baseline_root = section["runs"]["baseline"]["root"]
+                check_root = section["runs"]["check"]["root"]
+                self.assertNotIn("mode_fields", section["runs"]["baseline"]["artifacts"])
+                self.assertNotIn("mode_fields", section["runs"]["check"]["artifacts"])
+                baseline_spectrum = json.loads(
+                    (case_dir / baseline_root / "eigen/spectrum.v2.json").read_text(encoding="utf-8")
+                )
+                baseline_branches = json.loads(
+                    (case_dir / baseline_root / "eigen/branches.v2.json").read_text(encoding="utf-8")
+                )["branches"]
+                check_spectrum_path = case_dir / check_root / "eigen/spectrum.v2.json"
+                check_branches_path = case_dir / check_root / "eigen/branches.v2.json"
+                check_spectrum = json.loads(check_spectrum_path.read_text(encoding="utf-8"))
+                check_branches = json.loads(check_branches_path.read_text(encoding="utf-8"))["branches"]
+                baseline_frequencies = {
+                    (sample["sample_index"], mode["raw_mode_index"]): mode["frequency_real_hz"]
+                    for sample in baseline_spectrum["samples"]
+                    for mode in sample["modes"]
+                }
+                for sample in check_spectrum["samples"]:
+                    for mode in sample["modes"]:
+                        key = (sample["sample_index"], mode["raw_mode_index"])
+                        if key in baseline_frequencies:
+                            mode["frequency_real_hz"] = baseline_frequencies[key]
+                baseline_branch_ids = {branch["branch_id"] for branch in baseline_branches}
+                for branch in check_branches:
+                    for point in branch["points"]:
+                        key = (point["sample_index"], point["raw_mode_index"])
+                        if branch["branch_id"] in baseline_branch_ids and key in baseline_frequencies:
+                            point["frequency_real_hz"] = baseline_frequencies[key]
+                _write_json(check_spectrum_path, check_spectrum)
+                _write_json(check_branches_path, {"branches": check_branches})
+                section["runs"]["check"] = _bundle_descriptor(case_dir, check_root)
+                if producer_claim:
+                    section["cross_run_mode_matching"] = {
+                        "status": "pass",
+                        "matches": [{
+                            "sample_index": 0,
+                            "branch_id": 0,
+                            "left_mode_field_sha256": "sha256:" + "0" * 64,
+                            "right_mode_field_sha256": "sha256:" + "1" * 64,
+                        }],
+                    }
+                _write_json(evidence_path, evidence)
+                baseline_point = baseline_branches[0]["points"][0]
+                check_point = check_branches[0]["points"][0]
+                self.assertEqual(baseline_branches[0]["branch_id"], check_branches[0]["branch_id"])
+                self.assertEqual(baseline_point["frequency_real_hz"], check_point["frequency_real_hz"])
+                report = gate.validate_case(case_dir, "c1", parameters_path=PARAMETERS, kpath_path=KPATH)
+                check = report["checks"]["mode_count_convergence"]
+                self.assertEqual(check["numeric_status"], "pass", report["reasons"][:12])
+                self.assertTrue(all(value == 0.0 for value in check["relative_changes"].values()))
+                self.assertEqual(check["physical_identity_status"], "not_verified")
+                self.assertEqual(check["status"], "not_verified")
+                self.assertIn("run-local branch_id and frequency", check["physical_identity_reason"])
+                self.assertEqual(report["status"], "not_qualified")
+
     def test_primary_and_comparison_schema_versions_are_required(self):
         for scope in ("primary", "comparison"):
             for payload in ("spectrum", "branches", "manifest"):
@@ -2245,7 +2318,8 @@ class ScientificGateTests(unittest.TestCase):
             self.assertEqual(report["status"], "not_qualified")
             self.assertEqual(report["checks"]["mesh_convergence"]["status"], "fail")
             self.assertTrue(any("increments grow" in reason for reason in report["reasons"]))
-            self.assertTrue(all(check["status"] == "pass" for check in report["checks"]["mesh_convergence"]["adjacent_comparisons"]))
+            self.assertTrue(all(check["numeric_status"] == "pass" for check in report["checks"]["mesh_convergence"]["adjacent_comparisons"]))
+            self.assertTrue(all(check["physical_identity_status"] == "not_verified" for check in report["checks"]["mesh_convergence"]["adjacent_comparisons"]))
 
     def test_campaign_contract_pass_cannot_qualify_inconsistent_tracking_replay(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2257,7 +2331,7 @@ class ScientificGateTests(unittest.TestCase):
                         parameters_path=PARAMETERS, kpath_path=KPATH,
                     )
                     self.assertEqual(results[case]["campaign_contract_status"], "pass", results[case]["reasons"][:8])
-                    self.assertEqual(results[case]["status"], "qualified" if case == "c0" else "not_qualified")
+                    self.assertEqual(results[case]["status"], "not_qualified")
                     self.assertEqual(results[case]["checks"]["primary_search_parameters"]["status"], "pass")
                     self.assertEqual(results[case]["checks"]["primary_window_completeness"]["status"], "pass")
                     if case == "c0":
@@ -2511,7 +2585,13 @@ class ScientificGateTests(unittest.TestCase):
             }):
                 report = gate.validate_case(case_dir,"c1",parameters_path=PARAMETERS,kpath_path=KPATH)
             self.assertEqual(report["checks"]["tracking_assignment_replay"]["status"],"pass")
-            self.assertEqual(report["status"],"qualified",report["reasons"])
+            potential = report["checks"]["modal_potential_phase"]
+            self.assertEqual(potential["status"], "not_verified")
+            self.assertEqual(potential["gauge_status"], "not_verified")
+            self.assertIn("independently replayable gauge constraint", potential["gauge_reason"])
+            self.assertTrue(any("modal_potential_phase" in reason and "not_verified" in reason
+                                for reason in report["reasons"]))
+            self.assertEqual(report["status"],"not_qualified",report["reasons"])
 
     def test_complete_steps_without_full_candidate_scope_cannot_qualify(self):
         from unittest.mock import patch

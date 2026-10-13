@@ -4333,6 +4333,13 @@ def _validate_convergence_path(bundle, primary, label, reasons):
             reasons.append(f"{label} sample {index} wavevector differs from the primary path")
 
 
+_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON = (
+    "Cross-run physical mode identity is NOT VERIFIED: the gate has no independently "
+    "replayed, hash-bound mode-field matcher and no validated policy for identical- or cross-mesh matching. "
+    "Equal run-local branch_id and frequency are numeric diagnostics, not physical identity."
+)
+
+
 def _validate_convergence_pair(
     case_dir: Path,
     evidence: Mapping[str, Any] | None,
@@ -4348,23 +4355,48 @@ def _validate_convergence_pair(
     section = convergence.get(key) if isinstance(convergence, Mapping) else None
     if key == "airbox" and case == "c0":
         if isinstance(section, Mapping) and section.get("status") == "not_applicable" and isinstance(section.get("reason"), str) and section["reason"].strip():
-            return _new_check("not_applicable", reason=section["reason"])
+            return _new_check(
+                "not_applicable",
+                numeric_status="not_applicable",
+                physical_identity_status="not_applicable",
+                reason=section["reason"],
+            )
         reasons.append("c0 airbox convergence must be explicitly marked not_applicable with a reason")
-        return _new_check("missing")
+        return _new_check(
+            "missing",
+            numeric_status="missing",
+            physical_identity_status="not_verified",
+            physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
+        )
     if not isinstance(section, Mapping):
         reasons.append(f"missing convergence.{key} evidence")
-        return _new_check("missing")
+        return _new_check(
+            "missing",
+            numeric_status="missing",
+            physical_identity_status="not_verified",
+            physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
+        )
     if section.get("status") != "pass":
         reasons.append(f"convergence.{key} is not explicitly marked pass")
     runs = section.get("runs")
     if not isinstance(runs, Mapping):
         reasons.append(f"convergence.{key} is missing numeric run bundles")
-        return _new_check("missing")
+        return _new_check(
+            "missing",
+            numeric_status="missing",
+            physical_identity_status="not_verified",
+            physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
+        )
     left_name, right_name = (("coarse", "fine") if key in {"mesh", "airbox"} else ("baseline", "check"))
     left = _load_numeric_bundle(case_dir, runs.get(left_name), f"convergence.{key}.{left_name}", reasons, require_demag=case in PATH_CASES)
     right = _load_numeric_bundle(case_dir, runs.get(right_name), f"convergence.{key}.{right_name}", reasons, require_demag=case in PATH_CASES)
     if left is None or right is None:
-        return _new_check("fail")
+        return _new_check(
+            "fail",
+            numeric_status="fail",
+            physical_identity_status="not_verified",
+            physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
+        )
     _validate_convergence_coverage(left, case, f"convergence.{key}.{left_name}", reasons)
     _validate_convergence_coverage(right, case, f"convergence.{key}.{right_name}", reasons)
     _validate_convergence_path(left, primary_bundle, f"convergence.{key}.{left_name}", reasons)
@@ -4406,7 +4438,12 @@ def _validate_convergence_pair(
     comparisons = section.get("comparisons")
     if not isinstance(comparisons, list):
         reasons.append(f"convergence.{key}.comparisons is missing")
-        return _new_check("fail")
+        return _new_check(
+            "fail",
+            numeric_status="fail",
+            physical_identity_status="not_verified",
+            physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
+        )
     expected_pairs = {(sample, band) for sample in (EXPECTED_CONTROL_SAMPLES if case in PATH_CASES else (0,)) for band in range(EXPECTED_TARGET_BANDS if case in PATH_CASES else 1)}
     observed_pairs: set[tuple[int, int]] = set()
     errors: list[float] = []
@@ -4470,8 +4507,22 @@ def _validate_convergence_pair(
     if missing:
         reasons.append(f"convergence.{key} is missing {len(missing)} required sample/band comparisons")
     maximum = max(errors, default=math.inf)
+    numeric_status = (
+        "pass"
+        if len(reasons) == reason_count
+        and section.get("status") == "pass"
+        and not missing
+        and errors
+        and maximum <= (AIRBOX_CONVERGENCE_RELATIVE_TOLERANCE if key == "airbox" else CONVERGENCE_RELATIVE_TOLERANCE)
+        else "fail"
+    )
+    physical_identity_status = "not_verified"
+    status = numeric_status if numeric_status != "pass" else physical_identity_status
     return _new_check(
-        "pass" if len(reasons) == reason_count and section.get("status") == "pass" and not missing and errors and maximum <= (AIRBOX_CONVERGENCE_RELATIVE_TOLERANCE if key == "airbox" else CONVERGENCE_RELATIVE_TOLERANCE) else "fail",
+        status,
+        numeric_status=numeric_status,
+        physical_identity_status=physical_identity_status,
+        physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
         relative_changes=changes,
         comparison_count=len(comparisons),
         expected_comparison_count=len(expected_pairs),
@@ -4502,7 +4553,13 @@ def _validate_convergence(
     runs = section.get("runs") if isinstance(section, Mapping) else None
     if not isinstance(runs, Mapping) or any(not isinstance(runs.get(name), Mapping) for name in ("coarse", "medium", "fine")):
         reasons.append(f"missing convergence.{key} three-level evidence: coarse, medium, fine numeric bundles are required")
-        return _new_check("fail", required_level_count=3)
+        return _new_check(
+            "fail",
+            numeric_status="fail",
+            physical_identity_status="not_verified",
+            physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
+            required_level_count=3,
+        )
     initial_reason_count = len(reasons)
     checks = []
     for left_name, right_name in (("coarse", "medium"), ("medium", "fine")):
@@ -4524,8 +4581,23 @@ def _validate_convergence(
     for pair in sorted(first.keys() & second.keys()):
         if second[pair] > first[pair] + trend_margin:
             reasons.append(f"convergence.{key} sample/band {pair} increments grow from {first[pair]:.6g} to {second[pair]:.6g}")
+    numeric_status = (
+        "pass"
+        if len(reasons) == initial_reason_count
+        and all(check.get("numeric_status") == "pass" for check in checks)
+        else "fail"
+    )
+    physical_identity_status = (
+        "pass"
+        if all(check.get("physical_identity_status") == "pass" for check in checks)
+        else "not_verified"
+    )
+    status = numeric_status if numeric_status != "pass" else physical_identity_status
     return _new_check(
-        "pass" if len(reasons) == initial_reason_count and all(check["status"] == "pass" for check in checks) else "fail",
+        status,
+        numeric_status=numeric_status,
+        physical_identity_status=physical_identity_status,
+        physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
         required_level_count=3,
         adjacent_comparisons=checks,
         trend_margin=trend_margin,

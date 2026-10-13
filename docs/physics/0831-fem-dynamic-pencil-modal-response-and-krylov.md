@@ -4930,6 +4930,19 @@ zweryfikowaną tożsamość/overlap pozostaje osobną otwartą bramką
 (review 4080421130); do jej zamknięcia porównania zbieżności nie stanowią
 kwalifikacji ciągłości fizycznych pasm.
 
+Aktualna bramka rozdziela `numeric_status` od `physical_identity_status`.
+Zachowuje częstotliwości, progi i trend trzech poziomów jako diagnostykę
+numeryczną; bez niezależnego hash-bound replayu pól wynik fizycznej tożsamości
+pozostaje `not_verified`, również przy zerowym błędzie częstotliwości.
+Deklaracja producenta i jednakowe run-local ID nie zmieniają tego stanu.
+Niezagnieżdżone siatki wymagają jawnego wspólnego projector/common-refinement;
+identyczne i zagnieżdżone siatki nadal wymagają kompletnego inwentarza pól,
+zweryfikowanego transferu i polityki degeneracji. Matcher nie jest jeszcze
+zaimplementowany. Nie wprowadzono progu overlap ani nowej fizyki, Python→IR
+i requested/resolved execution pozostają bez zmian. FEM CPU: source guard,
+CI pending i science NOT VERIFIED; FEM GPU bez kwalifikacji; FDM CPU/GPU
+nie dotyczy tej bramki artefaktów FEM.
+
 | Source ID | Plik | Symbol | Zakres dowodu |
 | --- | --- | --- | --- |
 | source-comsol-quality-admitted-spectrum-ranking | scripts/validate_comsol_dispersion_scientific_gate.py | _validate_spectrum | Zachowuje osobny zbiór dodatnich modów, które przechodzą _validate_modal_quality, do rankingu w każdej próbce. |
