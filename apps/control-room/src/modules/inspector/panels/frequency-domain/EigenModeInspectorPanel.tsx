@@ -24,6 +24,7 @@ import { formatFrequencyHz } from "@/shared/domain/analysis/frequencyUnits";
 import {
   finiteModalScalar,
   modalDampingObservables,
+  resolveModalPhasorConvention,
   type ModalDampingObservables,
 } from "@/shared/domain/analysis/modalDampingObservables";
 import { Button } from "@/shared/ui/Button";
@@ -428,7 +429,7 @@ function useEigenModeSummary(selection: InspectorPanelProps["selection"]) {
   const manifest = useFrequencyDomainManifestResource();
   const manifestPayload = record(frequencyDomainManifestPayload(manifest.data));
   const physics = record(manifestPayload?.physics);
-  const rawPhasorConvention = stringValue(physics?.phase_convention);
+  const rawPhasorConvention = resolveModalPhasorConvention(modePayload, physics);
   const damping = modalDampingObservables(
     frequencyHz,
     imaginaryFrequencyHz,

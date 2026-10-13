@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { modalDampingObservables } from "./modalDampingObservables";
+import { modalDampingObservables, resolveModalPhasorConvention } from "./modalDampingObservables";
 
 describe("modalDampingObservables", () => {
   it.each([
@@ -129,5 +129,39 @@ describe("modalDampingObservables", () => {
     expect(overflowingQuality.linewidthFwhmHz).toBe(2 * Number.MIN_VALUE);
     expect(overflowingQuality.qualityFactor).toBeNull();
     expect(overflowingQuality.lifetimeSeconds).toBeNull();
+  });
+});
+
+describe("selected modal phasor provenance", () => {
+  it("computes decay for a positive-alias mode in a mixed sweep", () => {
+    const convention = resolveModalPhasorConvention(
+      { phasor_convention: "exp_plus_i_omega_t" }, { phase_convention: "mixed" },
+    );
+    expect(modalDampingObservables(10, 2, convention)).toMatchObject({
+      stability: "decaying", decayRateHz: 2, linewidthFwhmHz: 4, qualityFactor: 2.5,
+    });
+  });
+  it("keeps the selected negative convention even when the manifest is positive", () => {
+    const convention = resolveModalPhasorConvention(
+      { metadata: { phasor_convention: "exp_minus_i_omega_t" } },
+      { phase_convention: "exp_i_omega_t" },
+    );
+    expect(modalDampingObservables(10, 2, convention)).toMatchObject({
+      stability: "growing", decayRateHz: -2, linewidthFwhmHz: null,
+    });
+  });
+  it.each([null, false, "unknown", "not_applicable_real_reference"])(
+    "does not replace explicit unsupported mode convention %s with a manifest sign",
+    (phasor_convention) => {
+      const convention = resolveModalPhasorConvention(
+        { phasor_convention }, { phase_convention: "exp_i_omega_t" },
+      );
+      expect(modalDampingObservables(10, 2, convention).stability).toBe("not available");
+    },
+  );
+  it("preserves the legacy homogeneous manifest without inventing a mixed sign", () => {
+    expect(resolveModalPhasorConvention({}, { phase_convention: "exp_plus_i_omega_t" }))
+      .toBe("exp_plus_i_omega_t");
+    expect(resolveModalPhasorConvention(null, { phase_convention: "mixed" })).toBeNull();
   });
 });

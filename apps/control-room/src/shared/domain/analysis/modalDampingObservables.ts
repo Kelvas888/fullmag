@@ -93,6 +93,32 @@ export function modalDampingObservables(
   };
 }
 
+/** A selected producer convention wins over a heterogeneous sweep manifest. */
+export function resolveModalPhasorConvention(
+  modePayload: unknown,
+  manifestPhysics: unknown,
+): PhasorConvention | null {
+  const asRecord = (value: unknown): Record<string, unknown> | null =>
+    value !== null && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, unknown> : null;
+  const mode = asRecord(modePayload);
+  const metadata = asRecord(mode?.metadata);
+  const physics = asRecord(manifestPhysics);
+  for (const source of [mode, metadata]) {
+    if (source && Object.hasOwn(source, "phasor_convention")) {
+      const value = source.phasor_convention;
+      // An explicit unsupported producer value must not borrow another sign.
+      return typeof value === "string" && isPhasorConvention(value) ? value : null;
+    }
+  }
+  if (physics && Object.hasOwn(physics, "phasor_convention")) {
+    const value = physics.phasor_convention;
+    return typeof value === "string" && isPhasorConvention(value) ? value : null;
+  }
+  const legacy = physics?.phase_convention;
+  return typeof legacy === "string" && isPhasorConvention(legacy) ? legacy : null;
+}
+
 function isPhasorConvention(
   value: string | null,
 ): value is PhasorConvention {
