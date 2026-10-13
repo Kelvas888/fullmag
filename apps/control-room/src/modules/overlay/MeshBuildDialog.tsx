@@ -24,7 +24,7 @@ import {
   useMeshSummaryResource,
 } from "@/kernel/resources/geometryLifecycleResources";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
-import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
+import { resolveSessionAuthoringDiscretization } from "@/kernel/resources/sessionDiscretization";
 import type { JsonObject } from "@/kernel/api/apiTypes";
 import type { KernelApi } from "@/kernel/types";
 import { diffMeshPolicies } from "@/shared/domain/mesh/meshPolicyDiff";
@@ -113,7 +113,7 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
     { enabled: state.open, isEqual: meshBuildDialogRuntimeStatusEquals },
   );
   const lane = resolveMeshBuildDialogLane(
-    resolveSessionDiscretization(runtimeStatus),
+    resolveSessionAuthoringDiscretization(runtimeStatus),
   );
   const explicitFemLane = shouldLoadMeshBuildDialogFemResources(
     state.open,

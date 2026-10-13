@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 
 import { activeLaneCapabilityFixture } from "./activeLaneCapabilityFixture.testSupport";
 import {
+  describeSessionAuthoringDiscretization,
+  resolveSessionAuthoringDiscretization,
   hasSessionActiveLaneDeclaration,
   resolveSessionDiscretization,
   type SessionDiscretizationStatus,
@@ -91,5 +93,34 @@ describe("resolveSessionDiscretization", () => {
     expect(
       resolveSessionDiscretization({ domainDiscretization: "fdm" }),
     ).toBe("fdm");
+  });
+});
+
+
+describe("accepted model method", () => {
+  it.each(["fem", "fdm"])("keeps authored %s editable without runtime resolution", (method) => {
+    const status = { capabilities: { active_lane: { authored: { backend: method, discretization: method }, resolved: null } }, domain: { discretization: method === "fem" ? "fdm" : "fem" } };
+    expect(resolveSessionAuthoringDiscretization(status)).toBe(method);
+    expect(resolveSessionDiscretization(status)).toBeNull();
+  });
+
+  it("keeps current model FEM distinct from a retained FDM run", () => {
+    const status = { capabilities: { active_lane: { authored: { backend: "fem", discretization: "fem" }, resolved: { discretization: "fdm" } } } };
+    expect(resolveSessionAuthoringDiscretization(status)).toBe("fem");
+    expect(resolveSessionDiscretization(status)).toBe("fdm");
+  });
+
+  it.each([null, { backend: "auto", discretization: "auto" }])("does not infer model method from runtime when authored is %j", (authored) => {
+    expect(describeSessionAuthoringDiscretization({ capabilities: { active_lane: { authored, resolved: { discretization: "fem" } } }, domain: { discretization: "fdm" } })).toMatchObject({ method: null, state: "missing" });
+  });
+
+  it("distinguishes loading and conflicting published identity", () => {
+    expect(describeSessionAuthoringDiscretization(null).state).toBe("loading");
+    expect(describeSessionAuthoringDiscretization({ capabilities: { active_lane: { authored: { backend: "fem", discretization: "fdm" } } } })).toMatchObject({ method: null, state: "conflict" });
+  });
+
+  it("accepts explicit legacy backend identities without accepting arbitrary tokens", () => {
+    expect(resolveSessionAuthoringDiscretization({ capabilities: { active_lane: { authored: { backend: "cpu-fem", discretization: "fem" } } } })).toBe("fem");
+    expect(describeSessionAuthoringDiscretization({ capabilities: { active_lane: { authored: { backend: "mystery-fem", discretization: "fem" } } } }).state).toBe("conflict");
   });
 });

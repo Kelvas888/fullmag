@@ -11,7 +11,7 @@ import {
 import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
 import {
   hasSessionActiveLaneDeclaration,
-  resolveSessionDiscretization,
+  resolveSessionAuthoringDiscretization,
 } from "../resources/sessionDiscretization";
 
 type JsonRecord = Record<string, unknown>;
@@ -150,7 +150,7 @@ export function requiresSharedDomainMeshForLivePreparation(
   const typedStatus =
     laneStatus as Parameters<typeof hasSessionActiveLaneDeclaration>[0];
   const laneDeclared = hasSessionActiveLaneDeclaration(typedStatus);
-  const lane = resolveSessionDiscretization(typedStatus);
+  const lane = resolveSessionAuthoringDiscretization(typedStatus);
   return laneDeclared
     ? lane === "fem"
     : capabilities?.explicit_topology === true || lane === "fem";

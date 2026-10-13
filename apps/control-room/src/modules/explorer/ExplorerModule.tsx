@@ -61,7 +61,7 @@ import {
 } from "@/kernel/resources/studyRuntimeResources";
 import {
   projectFlatActiveLaneDiscretization,
-  resolveSessionDiscretization,
+  resolveSessionAuthoringDiscretization,
   type SessionDiscretizationCapabilitiesProjection,
 } from "@/kernel/resources/sessionDiscretization";
 import { WorkspaceRenderProfiler } from "@/kernel/performance/reactRenderProfiler";
@@ -227,7 +227,7 @@ function selectExplorerModelRuntimeStatus(status: {
   };
 }
 
-function explorerModelRuntimeStatusEquals(
+export function explorerModelRuntimeStatusEquals(
   previous: ExplorerModelRuntimeStatus | null,
   next: ExplorerModelRuntimeStatus | null,
 ): boolean {
@@ -240,6 +240,10 @@ function explorerModelRuntimeStatusEquals(
       previous.capabilities,
       "active_lane",
     ) === Object.prototype.hasOwnProperty.call(next.capabilities, "active_lane") &&
+    Object.prototype.hasOwnProperty.call(previous.capabilities.active_lane ?? {}, "authored") ===
+      Object.prototype.hasOwnProperty.call(next.capabilities.active_lane ?? {}, "authored") &&
+    previous.capabilities.active_lane?.authored?.backend === next.capabilities.active_lane?.authored?.backend &&
+    previous.capabilities.active_lane?.authored?.discretization === next.capabilities.active_lane?.authored?.discretization &&
     previous.capabilities.active_lane?.resolved?.discretization ===
       next.capabilities.active_lane?.resolved?.discretization &&
     Object.prototype.hasOwnProperty.call(
@@ -267,7 +271,7 @@ export function resolveExplorerModelDiscretization({
   activeLaneDiscretization: string | null | undefined;
   domainDiscretization: string | null | undefined;
 }): "fdm" | "fem" | null {
-  return resolveSessionDiscretization({
+  return resolveSessionAuthoringDiscretization({
     ...(activeLaneDiscretization !== undefined
       ? { capabilities: { active_lane_discretization: activeLaneDiscretization } }
       : {}),
@@ -413,7 +417,7 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
     selectExplorerModelRuntimeStatus,
     { enabled: modelTabActive, isEqual: explorerModelRuntimeStatusEquals },
   );
-  const modelDiscretization = resolveSessionDiscretization(sessionStatusData);
+  const modelDiscretization = resolveSessionAuthoringDiscretization(sessionStatusData);
   const modelResource = useSceneResource({ enabled: modelTabActive });
   const domainMeta = useDomainMetaResource({ enabled: modelTabActive });
   const fdmMultilayerLayout = useFdmMultilayerLayoutResource({

@@ -1,4 +1,4 @@
-import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
+import { resolveSessionAuthoringDiscretization } from "@/kernel/resources/sessionDiscretization";
 
 export interface StatusBarRunReadback {
   requested_backend?: string | null;
@@ -19,6 +19,7 @@ export interface StatusBarRunReadback {
 export interface StatusBarMethodReadback {
   capabilities?: {
     active_lane?: {
+      authored?: { discretization?: string; backend?: string } | null;
       requested?: { discretization?: string; backend?: string };
       resolved?: { discretization?: string } | null;
     } | null;
@@ -46,7 +47,7 @@ export function statusBarMethodModelsEqual(
 export function buildStatusBarMethodModel(
   status: StatusBarMethodReadback | null | undefined,
 ): StatusBarMethodModel {
-  const method = resolveSessionDiscretization(status);
+  const method = resolveSessionAuthoringDiscretization(status);
   const requested = status?.capabilities?.active_lane?.requested;
   const request = normalizeToken(requested?.discretization ?? requested?.backend)?.toLowerCase();
   if (method) {
@@ -54,7 +55,7 @@ export function buildStatusBarMethodModel(
       label: method.toUpperCase(),
       state: "resolved",
       method,
-      title: `Simulation method: ${method.toUpperCase()}. Requested: ${request ?? "unavailable"}. Engine execution is shown separately.`,
+      title: `Model method: ${method.toUpperCase()}. Requested: ${request ?? "unavailable"}. Engine execution is shown separately.`,
     };
   }
   if (request === "fdm" || request === "fem" || request === "auto") {

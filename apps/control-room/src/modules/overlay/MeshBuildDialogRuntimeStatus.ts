@@ -58,6 +58,10 @@ export function meshBuildDialogRuntimeStatusEquals(
       previous.capabilities,
       "active_lane",
     ) === Object.prototype.hasOwnProperty.call(next.capabilities, "active_lane") &&
+    Object.prototype.hasOwnProperty.call(previousActiveLane ?? {}, "authored") ===
+      Object.prototype.hasOwnProperty.call(nextActiveLane ?? {}, "authored") &&
+    previousActiveLane?.authored?.backend === nextActiveLane?.authored?.backend &&
+    previousActiveLane?.authored?.discretization === nextActiveLane?.authored?.discretization &&
     previousActiveLane?.resolved?.discretization ===
       nextActiveLane?.resolved?.discretization &&
     Object.prototype.hasOwnProperty.call(

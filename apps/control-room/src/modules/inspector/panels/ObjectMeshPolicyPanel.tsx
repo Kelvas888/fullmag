@@ -23,7 +23,7 @@ import {
   useObjectMeshSizeFieldResource,
   useObjectTopologyResource,
 } from "@/kernel/resources/geometryLifecycleResources";
-import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
+import { resolveSessionAuthoringDiscretization } from "@/kernel/resources/sessionDiscretization";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 import {
   sessionRequestScopeKey,
@@ -840,7 +840,7 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
   const { api, commands, resources } = kernel;
   const sessionScopeKey = sessionRequestScopeKey(useSessionResourceIdentity());
   const sessionDiscretization = useSessionStatusSelector(
-    (status) => resolveSessionDiscretization(status.data),
+    (status) => resolveSessionAuthoringDiscretization(status.data),
   );
   const meshLane = resolveMeshInspectorLane(sessionDiscretization);
   const explicitFdm = meshLane === "fdm";

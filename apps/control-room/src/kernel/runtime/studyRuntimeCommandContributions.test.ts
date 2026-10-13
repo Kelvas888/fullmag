@@ -271,6 +271,7 @@ function runtimeResourceData({
         active_lane: {
           ...activeLaneCapabilityFixture(),
           operations: activeLaneOperations,
+          authored: { ...activeLaneCapabilityFixture().authored, backend: discretization, discretization },
           resolved: {
             backend: discretization,
             device: "cpu",

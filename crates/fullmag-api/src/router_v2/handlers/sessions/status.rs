@@ -515,15 +515,29 @@ fn active_lane_capability_snapshot(
     snapshot: &SessionStateResponse,
     is_fem: bool,
 ) -> ActiveLaneCapabilitySnapshot {
+    // Authoring identity belongs to the accepted scene, not the last run.
+    // A missing runtime/capability resolution must not hide the model method.
+    let scene_study = snapshot.scene_document.as_ref().map(|scene| &scene.study);
+    let authored_intent_source = if scene_study.is_some() {
+        "scene.study.requested_execution"
+    } else {
+        "problem_ir.runtime_selection"
+    };
+    let authored_backend = scene_study
+        .map(|study| study.requested_backend.as_str())
+        .unwrap_or(snapshot.session.requested_backend.as_str());
     let authored = ActiveLaneIdentity {
-        backend: snapshot.session.requested_backend.clone(),
-        discretization: normalize_lane_discretization(
-            &snapshot.session.requested_backend,
-            if is_fem { "fem" } else { "fdm" },
-        ),
-        device: snapshot.session.authored_requested_device.clone(),
-        precision: snapshot.session.requested_precision.clone(),
-        mode: snapshot.session.requested_mode.clone(),
+        backend: authored_backend.to_string(),
+        discretization: normalize_lane_discretization(authored_backend, "unknown"),
+        device: scene_study
+            .map(|study| study.requested_device.clone())
+            .unwrap_or_else(|| snapshot.session.authored_requested_device.clone()),
+        precision: scene_study
+            .map(|study| study.requested_precision.clone())
+            .unwrap_or_else(|| snapshot.session.requested_precision.clone()),
+        mode: scene_study
+            .map(|study| study.requested_mode.clone())
+            .unwrap_or_else(|| snapshot.session.requested_mode.clone()),
     };
     let requested = ActiveLaneIdentity {
         backend: snapshot.session.requested_backend.clone(),
@@ -607,7 +621,7 @@ fn active_lane_capability_snapshot(
                 kind: "unavailable".into(),
                 capability_profile_version: None,
                 engine_id: None,
-                authored_intent: "problem_ir.runtime_selection".into(),
+                authored_intent: authored_intent_source.into(),
                 effective_request: "session.runtime_resolution".into(),
             },
             qualification: ActiveLaneQualification {
@@ -632,7 +646,7 @@ fn active_lane_capability_snapshot(
                 kind: "planner".into(),
                 capability_profile_version: Some(planner.capability_profile_version.clone()),
                 engine_id: Some(planner.engine_id.as_str().to_string()),
-                authored_intent: "problem_ir.runtime_selection".into(),
+                authored_intent: authored_intent_source.into(),
                 effective_request: "session.runtime_resolution".into(),
             },
             qualification: ActiveLaneQualification {
@@ -662,7 +676,7 @@ fn active_lane_capability_snapshot(
             kind: "planner".into(),
             capability_profile_version: Some(planner.capability_profile_version.clone()),
             engine_id: Some(planner.engine_id.as_str().to_string()),
-            authored_intent: "problem_ir.runtime_selection".into(),
+            authored_intent: authored_intent_source.into(),
             effective_request: "session.runtime_resolution".into(),
         },
         qualification: ActiveLaneQualification {

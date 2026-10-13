@@ -230,3 +230,10 @@ describe("simulation method before the first engine run", () => {
 it("does not claim a running engine has not started while run metadata is unavailable", () => {
   expect(buildStatusBarEngineModel(null, "running")).toMatchObject({ label: "Engine metadata pending", detail: "run in progress", state: "pending" });
 });
+
+
+it("shows accepted FEM before engine resolution and independently of the last FDM run", () => {
+  expect(buildStatusBarMethodModel({ capabilities: { active_lane: { authored: { backend: "fem", discretization: "fem" }, resolved: null } }, domain: { discretization: "fdm" } })).toMatchObject({ label: "FEM", method: "fem" });
+  expect(buildStatusBarMethodModel({ capabilities: { active_lane: { authored: { backend: "fem", discretization: "fem" }, resolved: { discretization: "fdm" } } } })).toMatchObject({ label: "FEM", method: "fem" });
+  expect(buildStatusBarEngineModel(null).label).toBe("Engine not started");
+});

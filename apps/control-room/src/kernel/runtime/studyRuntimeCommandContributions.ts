@@ -77,7 +77,7 @@ import {
 import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
 import {
   hasSessionActiveLaneDeclaration,
-  resolveSessionDiscretization,
+  resolveSessionAuthoringDiscretization,
 } from "../resources/sessionDiscretization";
 import {
   sessionRequestScopeKey,
@@ -620,7 +620,7 @@ function meshReadyStatus(status: string): boolean {
 }
 
 export function requiresExplicitMesh(status: LiveStatusResource): boolean {
-  const lane = resolveSessionDiscretization(status);
+  const lane = resolveSessionAuthoringDiscretization(status);
   return hasSessionActiveLaneDeclaration(status)
     ? lane === "fem"
     : status.capabilities.explicit_topology || lane === "fem";

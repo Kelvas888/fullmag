@@ -1185,15 +1185,14 @@ async fn model_readiness_reports_all_empty_scene_blockers_in_stable_order() {
             .map(|check| check["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vec![
-            "geometry",
-            "material",
-            "texture",
-            "interactions",
-            "discretization",
-            "study",
+            "method", "domain", "geometry", "material", "texture",
+            "interactions", "discretization", "study", "execution",
         ]
     );
     assert_eq!(body["blockers"][0], "Add at least one magnetic object.");
+    assert_eq!(body["checks"][0]["state"], "complete");
+    assert_eq!(body["checks"][1]["state"], "complete");
+    assert!(body["checks"][1]["reason"].as_str().unwrap().contains("after geometry is added"));
     assert_eq!(body["capabilities"]["move"]["available"], true);
     assert_eq!(body["capabilities"]["rotate"]["available"], false);
     assert_eq!(
@@ -1277,6 +1276,7 @@ async fn model_readiness_blocks_material_without_ms() {
         .find(|check| check["id"] == "material")
         .unwrap();
     assert_eq!(material["state"], "blocked");
+    assert_eq!(material["target_resource"], "model/objects/body");
     assert_eq!(
         material["reason"],
         "missing Ms material property for object 'body'"
@@ -1323,6 +1323,7 @@ async fn model_readiness_blocks_material_without_aex() {
         .find(|check| check["id"] == "material")
         .unwrap();
     assert_eq!(material["state"], "blocked");
+    assert_eq!(material["target_resource"], "model/objects/body");
     assert_eq!(
         material["reason"],
         "missing Aex material property for object 'body'"
@@ -50880,3 +50881,118 @@ mod session_scope;
 
 #[path = "tests/workspace_items.rs"]
 mod workspace_items;
+
+
+#[tokio::test]
+async fn status_keeps_accepted_fem_method_without_runtime_capabilities() {
+    let state = test_app_state_with_live_session().await;
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        let mut scene = sample_scene_document_with_stage(serde_json::json!({
+            "entrypoint_kind": "flat_relax", "kind": "relax",
+            "algorithm": "projected_gradient_bb", "stage_id": "relax-1"
+        }));
+        scene.study.requested_backend = "fem".into();
+        scene.study.requested_device = "auto".into();
+        snapshot.scene_document = Some(scene);
+        snapshot.capabilities = None;
+        snapshot.session.resolved_backend = None;
+        snapshot.session.resolved_device = None;
+        snapshot.session.resolved_precision = None;
+        snapshot.session.resolved_mode = None;
+    }
+    let response = build_v2_router().with_state(state).oneshot(
+        Request::builder().uri("/v2/sessions/current/status").body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["capabilities"]["active_lane"]["authored"]["backend"], "fem");
+    assert_eq!(body["capabilities"]["active_lane"]["authored"]["discretization"], "fem");
+    assert_eq!(body["capabilities"]["active_lane"]["authored"]["device"], "auto");
+    assert_eq!(body["capabilities"]["active_lane"]["source"]["authored_intent"], "scene.study.requested_execution");
+    assert!(body["capabilities"]["active_lane"]["resolved"].is_null());
+}
+
+#[tokio::test]
+async fn readiness_routes_missing_object_assignments_to_the_object() {
+    let state = test_app_state_with_live_session().await;
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        let mut scene = sample_scene_document_with_stage(serde_json::json!({
+            "entrypoint_kind": "flat_relax", "kind": "relax",
+            "algorithm": "projected_gradient_bb", "stage_id": "relax-1"
+        }));
+        scene.study.requested_backend = "fem".into();
+        scene.objects[0].magnetization_ref = None;
+        scene.objects[0].physics_stack.clear();
+        snapshot.scene_document = Some(scene);
+    }
+    let response = build_v2_router().with_state(state).oneshot(
+        Request::builder().uri("/v2/sessions/current/model/readiness").body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    for id in ["texture", "interactions"] {
+        let check = body["checks"].as_array().unwrap().iter().find(|check| check["id"] == id).unwrap();
+        assert_eq!(check["state"], "blocked");
+        assert_eq!(check["target_resource"], "model/objects/body");
+    }
+}
+
+
+#[tokio::test]
+async fn created_model_method_survives_partial_runtime_readback_for_both_methods() {
+    for method in ["fem", "fdm"] {
+        let state = test_app_state();
+        let app = build_v2_router().with_state(state.clone());
+        let created = app.clone().oneshot(Request::builder().method("POST").uri("/v2/sessions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({"name": "First model", "backend": method, "device": "cpu", "precision": "double"}).to_string())).unwrap()
+        ).await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+            snapshot.capabilities = None;
+            snapshot.session.resolved_device = None;
+        }
+        let status = app.clone().oneshot(Request::builder().uri("/v2/sessions/current/status").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status = body_json(status).await;
+        assert_eq!(status["capabilities"]["active_lane"]["authored"]["discretization"], method);
+        assert!(status["capabilities"]["active_lane"]["resolved"].is_null());
+        let readiness = app.oneshot(Request::builder().uri("/v2/sessions/current/model/readiness").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(readiness.status(), StatusCode::OK);
+        let readiness = body_json(readiness).await;
+        assert_eq!(readiness["checks"][0]["id"], "method");
+        assert_eq!(readiness["checks"][0]["state"], "complete");
+        assert_eq!(readiness["checks"][1]["id"], "domain");
+        assert_eq!(readiness["checks"][1]["state"], "complete");
+    }
+}
+
+#[tokio::test]
+async fn manual_domain_outside_blocks_readiness_and_mesh_command_before_queueing() {
+    let state = test_app_state_with_live_session().await;
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        let mut scene = sample_scene_document_with_stage(serde_json::json!({
+            "entrypoint_kind": "flat_relax", "kind": "relax", "algorithm": "projected_gradient_bb", "stage_id": "relax-1"
+        }));
+        scene.study.requested_backend = "fem".into();
+        scene.study.universe_mesh = Some(serde_json::from_value(serde_json::json!({
+            "mode": "manual", "size": [1e-12, 1e-12, 1e-12], "center": [0.0, 0.0, 0.0]
+        })).unwrap());
+        snapshot.scene_document = Some(scene);
+    }
+    let app = build_v2_router().with_state(state.clone());
+    let readiness = app.clone().oneshot(Request::builder().uri("/v2/sessions/current/model/readiness").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(readiness.status(), StatusCode::OK);
+    let readiness = body_json(readiness).await;
+    let domain = readiness["checks"].as_array().unwrap().iter().find(|check| check["id"] == "domain").unwrap();
+    assert_eq!(domain["state"], "blocked");
+    assert_eq!(domain["target_resource"], "meshing/policies/universe");
+    assert!(domain["reason"].as_str().unwrap().contains("outside"));
+    let command = app.oneshot(Request::builder().method("POST").uri("/v2/sessions/current/simulation/commands")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::json!({"kind": "mesh_build"}).to_string())).unwrap()
+    ).await.unwrap();
+    assert_eq!(command.status(), StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body_bytes(command).await).contains("outside"));
+    assert!(state.current_control_queue.lock().await.is_empty());
+}
