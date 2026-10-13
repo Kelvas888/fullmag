@@ -77,6 +77,7 @@ import {
 import type { CommandRegistry } from "@/kernel/commands/CommandRegistry";
 import type { CommandContext } from "@/kernel/commands/commandTypes";
 import { SESSION_STATUS_RESOURCE_KEY } from "@/kernel/resources/useSessionStatus";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import {
   resolveActiveLaneOperation,
   type ActiveLaneCapabilitySnapshot,
@@ -788,12 +789,7 @@ function ribbonDiscretization(context: RibbonBuildContext): RibbonDiscretization
   // null while unresolved), which then fails closed below.
   if (context.sessionStatus === undefined) return "fem";
   if (context.sessionStatus === null) return "unknown";
-  const value = context.sessionStatus.domain?.discretization
-    ?.trim()
-    .toLowerCase();
-  if (value === "fdm") return "fdm";
-  if (value === "fem") return "fem";
-  return "unknown";
+  return resolveSessionDiscretization(context.sessionStatus) ?? "unknown";
 }
 
 function buildGeometryTabContent(

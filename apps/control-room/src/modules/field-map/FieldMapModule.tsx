@@ -15,6 +15,7 @@ import {
   usePlanarVectorResource,
 } from "@/kernel/resources/planarFieldResources";
 import { useDomainMetaResource } from "@/kernel/resources/geometryLifecycleResources";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 import { useSessionScopedResourceKey } from "@/kernel/resources/useSessionScopedResourceKey";
 import { useSelectionSelector } from "@/kernel/selection/useSelection";
@@ -85,7 +86,7 @@ function useFieldMapModuleController() {
   }, [canonicalSourceKind, canonicalSourceMonitorId]);
   const domain = useDomainMetaResource({ enabled: active });
   const runtime = useSessionStatusSelector(
-    (status) => status.data?.domain.discretization ?? null,
+    (status) => resolveSessionDiscretization(status.data),
     { enabled: active },
   );
   const selectedFieldContext = useSelectionSelector((selection) => {

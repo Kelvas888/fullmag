@@ -60,6 +60,7 @@ import {
 } from "./authoringHistoryMutation";
 import { awaitMeshBuildConfirmation, type MeshBuildConfirmCommandId } from "./meshBuildConfirmation";
 import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
+import { resolveSessionAuthoringDiscretization } from "../resources/sessionDiscretization";
 
 function deleteObjectBlockedReason(context: CommandContext, ignoreReservation = false): string | null {
   const controller = context.objectEditSession;
@@ -241,7 +242,7 @@ export const FDM_MESH_COMMAND_NOT_APPLICABLE_REASON =
   "FEM mesh commands are not applicable to an FDM structured-grid session.";
 
 export const UNKNOWN_MESH_COMMAND_LANE_REASON =
-  "Session discretization is unresolved; FEM mesh commands remain unavailable until an explicit FEM lane is published.";
+  "Choose FEM or FDM in Study settings. If a method is already selected, review session diagnostics before building a mesh.";
 
 /**
  * Resolve the current command lane from the session-status resource only.
@@ -259,7 +260,8 @@ export function resolveMeshCommandLane(
 
 function meshCommandLane(context: CommandContext): MeshCommandLane {
   const status = asRecord(resourceData(context, SESSION_STATUS_RESOURCE_KEY));
-  return resolveMeshCommandLane(asRecord(status?.domain)?.discretization);
+  const payload = asRecord(status?.data ?? status);
+  return resolveMeshCommandLane(resolveSessionAuthoringDiscretization(payload));
 }
 
 function femMeshCommandDisabledReason(context: CommandContext): string | null {
@@ -273,7 +275,7 @@ export const FEM_GRID_COMMAND_NOT_APPLICABLE_REASON =
   "Build Grid is only applicable to an FDM structured-grid session.";
 
 export const UNKNOWN_GRID_COMMAND_LANE_REASON =
-  "Session discretization is unresolved; Build Grid remains unavailable until an explicit FDM lane is published.";
+  "Choose FDM in Study settings to build a structured grid. If FDM is already selected, review session diagnostics.";
 
 function fdmGridBuildDisabledReason(context: CommandContext): string | null {
   if (!context.api) return "Control-room API is unavailable.";

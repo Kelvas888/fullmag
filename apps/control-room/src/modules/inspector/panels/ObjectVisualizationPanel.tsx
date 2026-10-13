@@ -41,6 +41,7 @@ import {
   type ViewportTargetRenderingPreferences,
 } from "@/kernel/visualization/ObjectVisualizationController";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import {
   shouldLoadRuntimeMeshManifest,
   useFieldCatalogResource,
@@ -263,7 +264,9 @@ function useObjectVisualizationPanelState(
       isEqual: objectVisualizationManifestStatusEquals,
     },
   );
-  const lane = resolveObjectVisualizationLane(manifestStatus?.domain.discretization);
+  const lane = resolveObjectVisualizationLane(
+    resolveSessionDiscretization(manifestStatus),
+  );
   const fdmMultilayerLayout = useFdmMultilayerLayoutResource({
     enabled: lane === "fdm",
   });

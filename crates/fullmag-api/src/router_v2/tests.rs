@@ -1187,15 +1187,14 @@ async fn model_readiness_reports_all_empty_scene_blockers_in_stable_order() {
             .map(|check| check["id"].as_str().unwrap())
             .collect::<Vec<_>>(),
         vec![
-            "geometry",
-            "material",
-            "texture",
-            "interactions",
-            "discretization",
-            "study",
+            "method", "domain", "geometry", "material", "texture",
+            "interactions", "discretization", "study", "execution",
         ]
     );
     assert_eq!(body["blockers"][0], "Add at least one magnetic object.");
+    assert_eq!(body["checks"][0]["state"], "complete");
+    assert_eq!(body["checks"][1]["state"], "complete");
+    assert!(body["checks"][1]["reason"].as_str().unwrap().contains("after geometry is added"));
     assert_eq!(body["capabilities"]["move"]["available"], true);
     assert_eq!(body["capabilities"]["rotate"]["available"], false);
     assert_eq!(
@@ -1279,6 +1278,7 @@ async fn model_readiness_blocks_material_without_ms() {
         .find(|check| check["id"] == "material")
         .unwrap();
     assert_eq!(material["state"], "blocked");
+    assert_eq!(material["target_resource"], "model/objects/body");
     assert_eq!(
         material["reason"],
         "missing Ms material property for object 'body'"
@@ -1325,6 +1325,7 @@ async fn model_readiness_blocks_material_without_aex() {
         .find(|check| check["id"] == "material")
         .unwrap();
     assert_eq!(material["state"], "blocked");
+    assert_eq!(material["target_resource"], "model/objects/body");
     assert_eq!(
         material["reason"],
         "missing Aex material property for object 'body'"
@@ -1551,6 +1552,157 @@ async fn create_scratch_session_accepts_explicit_fdm_and_fem_cpu_double_requests
     assert_eq!(body["status"]["effective_execution"]["precision"], "double");
     assert!(body["status"].get("fallback").is_some());
     assert!(body["status"]["fallback"].is_null());
+}
+
+#[tokio::test]
+async fn scratch_session_status_and_domain_meta_follow_resolved_lane_before_mesh_materializes() {
+    let state = test_app_state();
+    let app = build_v2_router().with_state(state.clone());
+
+    let created = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/sessions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"name":"Scratch FEM lane","backend":"fem","device":"cpu","precision":"double"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(created.status(), StatusCode::CREATED);
+    {
+        let guard = state.current_live_state.read().await;
+        let snapshot = guard.as_ref().expect("scratch session is active");
+        let capabilities = snapshot
+            .capabilities
+            .as_ref()
+            .expect("scratch FEM publishes lane capabilities");
+        assert_eq!(snapshot.session.resolved_backend.as_deref(), Some("fem"));
+        assert!(snapshot.session.resolved_runtime_family.is_none());
+        assert!(snapshot.session.resolved_engine_id.is_none());
+        assert_eq!(capabilities.engine_id.as_str(), "fem_cpu_native");
+        assert_eq!(
+            crate::router_v2::handlers::sessions::status::domain_generation_revision(snapshot),
+            0
+        );
+    }
+
+    let fem_status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fem_status.status(), StatusCode::OK);
+    let fem_status = body_json(fem_status).await;
+    assert_eq!(fem_status["domain"]["discretization"], "fem");
+    assert_eq!(fem_status["domain"]["cell_count"], 0);
+    assert_eq!(
+        fem_status["capabilities"]["active_lane"]["resolved"]["discretization"],
+        "fem"
+    );
+    assert_eq!(
+        fem_status["resources"]["domain_generation_id"],
+        "fem:unmaterialized"
+    );
+    assert_eq!(fem_status["resources"]["topology_revision"], 0);
+
+    let fem_domain = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/data/domain/meta")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fem_domain.status(), StatusCode::OK);
+    let fem_domain = body_json(fem_domain).await;
+    assert_eq!(fem_domain["discretization"], "fem");
+    assert_eq!(fem_domain["generation_id"], "fem:unmaterialized");
+    assert_eq!(fem_domain["grid"], serde_json::Value::Null);
+    assert_eq!(
+        fem_domain["counts"],
+        serde_json::json!({
+            "cells": null,
+            "nodes": null,
+            "elements": null,
+            "boundary_faces": null
+        })
+    );
+    assert_eq!(fem_domain["bounds"]["min"], serde_json::json!([0.0, 0.0, 0.0]));
+    assert_eq!(fem_domain["bounds"]["max"], serde_json::json!([0.0, 0.0, 0.0]));
+
+    let replaced = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/sessions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"name":"Scratch FDM lane","backend":"fdm","device":"cpu","precision":"double","replace_current":true}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(replaced.status(), StatusCode::CREATED);
+    {
+        let guard = state.current_live_state.read().await;
+        let snapshot = guard.as_ref().expect("replacement scratch session is active");
+        let capabilities = snapshot
+            .capabilities
+            .as_ref()
+            .expect("scratch FDM publishes lane capabilities");
+        assert_eq!(snapshot.session.resolved_backend.as_deref(), Some("fdm"));
+        assert!(snapshot.session.resolved_runtime_family.is_none());
+        assert!(snapshot.session.resolved_engine_id.is_none());
+        assert_eq!(capabilities.engine_id.as_str(), "fdm_cpu_reference");
+    }
+
+    let fdm_status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fdm_status.status(), StatusCode::OK);
+    let fdm_status = body_json(fdm_status).await;
+    assert_eq!(fdm_status["domain"]["discretization"], "fdm");
+    assert_eq!(fdm_status["domain"]["cell_count"], 0);
+    assert_ne!(
+        fdm_status["resources"]["domain_generation_id"],
+        "fem:unmaterialized"
+    );
+
+    let fdm_domain = app
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/data/domain/meta")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fdm_domain.status(), StatusCode::OK);
+    let fdm_domain = body_json(fdm_domain).await;
+    assert_eq!(fdm_domain["discretization"], "fdm");
+    assert_eq!(fdm_domain["counts"]["cells"], 0);
+    assert_eq!(fdm_domain["grid"], serde_json::Value::Null);
 }
 
 #[tokio::test]
@@ -4051,6 +4203,158 @@ async fn domain_meta_returns_json_with_session() {
     assert_eq!(json["coordinate_system"], "cartesian");
     assert!(json["bounds"].is_object());
     assert!(json["counts"].is_object());
+}
+
+#[tokio::test]
+async fn domain_status_and_meta_preserve_built_fem_and_explicit_fdm_with_retained_mesh() {
+    let state = test_app_state_with_live_session().await;
+    {
+        let mut guard = state.current_live_state.write().await;
+        let snapshot = guard.as_mut().expect("fixture session is active");
+        snapshot.session.requested_backend = "fem".into();
+        snapshot.session.resolved_backend = Some("fem".into());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.mesh_revision = 17;
+        snapshot.metadata = None;
+    }
+    let app = build_v2_router().with_state(state.clone());
+
+    let fem_status_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fem_status_response.status(), StatusCode::OK);
+    let fem_status = body_json(fem_status_response).await;
+    assert_eq!(fem_status["domain"]["discretization"], "fem");
+    assert_eq!(fem_status["domain"]["cell_count"], 1);
+    assert_eq!(fem_status["resources"]["domain_generation_id"], "42");
+    assert_eq!(fem_status["resources"]["topology_revision"], 17);
+
+    let fem_domain_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/data/domain/meta")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fem_domain_response.status(), StatusCode::OK);
+    let fem_domain = body_json(fem_domain_response).await;
+    assert_eq!(fem_domain["discretization"], "fem");
+    assert_eq!(fem_domain["generation_id"], "42");
+    assert_eq!(fem_domain["counts"]["nodes"], 4);
+    assert_eq!(fem_domain["counts"]["elements"], 1);
+    assert_eq!(fem_domain["counts"]["boundary_faces"], 1);
+    assert_eq!(fem_domain["grid"], serde_json::Value::Null);
+    for key in ["min", "max"] {
+        for coordinate in fem_domain["bounds"][key]
+            .as_array()
+            .expect("FEM bounds are three-vectors")
+        {
+            assert!(coordinate.as_f64().is_some_and(f64::is_finite));
+        }
+    }
+
+    let mut empty_fem_mesh = sample_fem_mesh_payload();
+    empty_fem_mesh.nodes.clear();
+    empty_fem_mesh.cells = fullmag_ir::FemConnectivityIR::from_tet4(Vec::new());
+    empty_fem_mesh.facets = fullmag_ir::FemFacetConnectivityIR::from_tri3(Vec::new());
+    empty_fem_mesh.element_markers.clear();
+    empty_fem_mesh.boundary_markers.clear();
+    {
+        let mut guard = state.current_live_state.write().await;
+        let snapshot = guard.as_mut().expect("fixture session is active");
+        snapshot.session.requested_backend = "fem".into();
+        snapshot.session.resolved_backend = Some("fem".into());
+        snapshot.fem_mesh = Some(empty_fem_mesh);
+        snapshot.metadata = None;
+    }
+
+    let empty_fem_domain_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/data/domain/meta")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(empty_fem_domain_response.status(), StatusCode::OK);
+    let empty_fem_domain = body_json(empty_fem_domain_response).await;
+    assert_eq!(empty_fem_domain["discretization"], "fem");
+    assert_eq!(empty_fem_domain["counts"]["nodes"], 0);
+    assert_eq!(empty_fem_domain["counts"]["elements"], 0);
+    assert_eq!(empty_fem_domain["counts"]["boundary_faces"], 0);
+    assert_eq!(empty_fem_domain["bounds"]["min"], serde_json::json!([0.0, 0.0, 0.0]));
+    assert_eq!(empty_fem_domain["bounds"]["max"], serde_json::json!([0.0, 0.0, 0.0]));
+
+    {
+        let mut guard = state.current_live_state.write().await;
+        let snapshot = guard.as_mut().expect("fixture session is active");
+        snapshot.session.requested_backend = "fdm".into();
+        snapshot.session.resolved_backend = Some("fdm".into());
+        snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        snapshot.metadata = Some(serde_json::json!({
+            "artifact_layout": {
+                "backend": "fdm",
+                "grid_cells": [4, 3, 2],
+                "origin_m": [0.0, 0.0, 0.0],
+                "cell_size": [1.0, 1.0, 1.0]
+            },
+            "execution_plan": {
+                "backend_plan": {
+                    "kind": "fdm",
+                    "grid_certificate": {
+                        "grid_fingerprint": "fdm-retained-mesh-grid"
+                    }
+                }
+            }
+        }));
+    }
+
+    let fdm_status_response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fdm_status_response.status(), StatusCode::OK);
+    let fdm_status = body_json(fdm_status_response).await;
+    assert_eq!(fdm_status["domain"]["discretization"], "fdm");
+    assert_eq!(fdm_status["domain"]["cell_count"], 24);
+    assert_eq!(
+        fdm_status["resources"]["domain_generation_id"],
+        "fdm-retained-mesh-grid"
+    );
+
+    let fdm_domain_response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/data/domain/meta")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(fdm_domain_response.status(), StatusCode::OK);
+    let fdm_domain = body_json(fdm_domain_response).await;
+    assert_eq!(fdm_domain["discretization"], "fdm");
+    assert_eq!(fdm_domain["generation_id"], "fdm-retained-mesh-grid");
+    assert_eq!(fdm_domain["counts"]["cells"], 24);
+    assert_eq!(fdm_domain["grid"]["shape"], serde_json::json!([4, 3, 2]));
 }
 
 #[tokio::test]
@@ -11614,9 +11918,18 @@ async fn fdm_grid_refresh_command_is_queued_for_atomic_runtime_replan() {
 async fn fdm_grid_refresh_command_rejects_non_fdm_sessions_without_queueing() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.session.resolved_backend = Some("fem".into());
+        snapshot.session.requested_backend = "fdm".into();
+        snapshot.session.explicit_selection = true;
         snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        let mut scene = snapshot
+            .scene_document
+            .take()
+            .unwrap_or_else(sample_scene_document);
+        scene.study.requested_backend = "fdm".into();
+        snapshot.scene_document = Some(scene);
         snapshot.metadata = Some(serde_json::json!({
-            "execution_plan": { "backend_plan": { "kind": "fem" } }
+            "artifact_layout": { "backend": "fdm" }
         }));
     }
     let app = build_v2_router().with_state(state.clone());
@@ -11646,6 +11959,139 @@ async fn fdm_grid_refresh_command_rejects_non_fdm_sessions_without_queueing() {
         ledger.back().map(|record| record.status),
         Some(CommandLifecycleState::Rejected)
     );
+    assert!(ledger
+        .back()
+        .and_then(|record| record.command.mesh_options.as_ref())
+        .and_then(|options| options.get("scene_problem_patch"))
+        .is_some());
+}
+
+#[tokio::test]
+async fn fdm_grid_refresh_rejects_unknown_or_automatic_lane_without_artifact_fallback() {
+    let cases = [
+        (
+            "resolved unknown",
+            Some("unknown"),
+            Some("fdm"),
+            "fdm",
+        ),
+        ("resolved auto", Some("auto"), Some("fdm"), "fdm"),
+        ("plan unknown", None, Some("unknown"), "fdm"),
+        ("plan auto", None, Some("auto"), "fdm"),
+        ("requested auto", None, None, "auto"),
+    ];
+
+    for (case, resolved_backend, plan_backend_kind, requested_backend) in cases {
+        let state = test_app_state_with_live_session().await;
+        if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+            snapshot.session.resolved_backend = resolved_backend.map(str::to_string);
+            snapshot.session.requested_backend = requested_backend.into();
+            snapshot.session.explicit_selection = true;
+            let mut scene = snapshot
+                .scene_document
+                .take()
+                .unwrap_or_else(sample_scene_document);
+            scene.study.requested_backend = "fdm".into();
+            snapshot.scene_document = Some(scene);
+
+            let mut metadata = serde_json::json!({
+                "artifact_layout": { "backend": "fdm" }
+            });
+            if let Some(kind) = plan_backend_kind {
+                metadata["execution_plan"] = serde_json::json!({
+                    "backend_plan": { "kind": kind }
+                });
+            }
+            snapshot.metadata = Some(metadata);
+        }
+        let app = build_v2_router().with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/sessions/current/simulation/commands")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"kind":"fdm_grid_refresh"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "case: {case}");
+        let json = body_json(response).await;
+        assert_eq!(json["accepted"], false, "case: {case}: {json}");
+        assert!(state.current_control_queue.lock().await.is_empty(), "case: {case}");
+        assert_eq!(
+            state
+                .current_command_ledger
+                .lock()
+                .await
+                .back()
+                .map(|record| record.status),
+            Some(CommandLifecycleState::Rejected),
+            "case: {case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fdm_grid_refresh_uses_active_plan_or_explicit_request_without_resolved_backend() {
+    let cases = [
+        (
+            "active execution plan",
+            "auto",
+            false,
+            serde_json::json!({
+                "execution_plan": { "backend_plan": { "kind": "fdm" } },
+                "artifact_layout": { "backend": "fem" }
+            }),
+        ),
+        (
+            "explicit requested backend",
+            "fdm",
+            true,
+            serde_json::json!({ "artifact_layout": { "backend": "fem" } }),
+        ),
+    ];
+
+    for (case, requested_backend, explicit_selection, metadata) in cases {
+        let state = test_app_state_with_live_session().await;
+        if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+            snapshot.session.status = "awaiting_command".into();
+            snapshot.live_state = None;
+            snapshot.stage_execution = None;
+            snapshot.session.resolved_backend = None;
+            snapshot.session.requested_backend = requested_backend.into();
+            snapshot.session.explicit_selection = explicit_selection;
+            let mut scene = snapshot
+                .scene_document
+                .take()
+                .unwrap_or_else(sample_scene_document);
+            scene.study.requested_backend = "fdm".into();
+            snapshot.scene_document = Some(scene);
+            snapshot.metadata = Some(metadata);
+            crate::session::refresh_runtime_status(snapshot);
+        }
+        let app = build_v2_router().with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/sessions/current/simulation/commands")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"kind":"fdm_grid_refresh"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "case: {case}");
+        let json = body_json(response).await;
+        assert_eq!(json["accepted"], true, "case: {case}: {json}");
+        assert_eq!(state.current_control_queue.lock().await.len(), 1, "case: {case}");
+    }
 }
 
 #[tokio::test]
@@ -38894,6 +39340,101 @@ async fn topological_charge_computes_uniform_fdm_grid_without_fem_mesh() {
 }
 
 #[tokio::test]
+async fn topological_charge_uses_fdm_field_topology_with_retained_fem_mesh() {
+    let state = test_app_state_with_live_session().await;
+    let scene = sample_scene_document();
+    let object_id = scene.objects[0].id.clone();
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.scene_document = Some(scene);
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.metadata = Some(serde_json::json!({
+            "execution_plan": { "backend_plan": { "kind": "fdm" } }
+        }));
+        snapshot.live_state = Some(LiveState {
+            status: "running".into(),
+            updated_at_unix_ms: 1_700_000_000_789,
+            latest_step: StepUpdateView {
+                step: 1,
+                time: 0.0,
+                dt: 1.0e-13,
+                pseudo_time_s: None,
+                e_ex: 0.0,
+                e_demag: 0.0,
+                e_ext: 0.0,
+                e_ani: 0.0,
+                e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
+                e_total: 0.0,
+                max_dm_dt: 0.0,
+                max_h_eff: 0.0,
+                max_h_demag: 0.0,
+                max_torque_Apm: 0.0,
+                max_torque_T: 0.0,
+                max_torque_all_Apm: 0.0,
+                frozen_reference_max_drift: 0.0,
+                active_dof_count: 0,
+                frozen_dof_count: 0,
+                free_dof_count: 0,
+                wall_time_ns: 100,
+                grid: [3, 3, 1],
+                fem_mesh_generation_id: None,
+                fem_mesh: None,
+                magnetization: Some(vec![
+                    0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0,
+                ]),
+                per_object_scalars: Default::default(),
+                field_materialization_states: Vec::new(),
+                preview_field: None,
+                finished: false,
+            },
+        });
+        snapshot.field_quantity_revisions.insert("m".to_string(), 9);
+    }
+
+    let app = build_v2_router().with_state(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/v2/sessions/current/analysis/extensions/objects/{object_id}/topological-charge"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["status"], "ready");
+    assert_eq!(json["provenance"]["discretization"], "fdm");
+    assert_eq!(json["provenance"]["field_storage_domain"], "fdm_cell_centered");
+    assert!(json["provenance"]["mesh_revision"].is_null());
+    assert_eq!(json["provenance"]["field_revision"], "9");
+    assert_eq!(json["provenance"]["source_kind"], "current_live");
+    assert_eq!(json["resolved_support"]["plane"], "xy");
+    assert_eq!(json["quality"]["total_vertex_count"], 9);
+    assert_eq!(json["quality"]["valid_vertex_count"], 9);
+    assert_eq!(json["quality"]["total_triangle_count"], 8);
+    assert_eq!(json["quality"]["valid_triangle_count"], 8);
+    assert_eq!(json["quality"]["connected_component_count"], 1);
+    assert_eq!(json["quality"]["boundary_edge_count"], 8);
+    assert_eq!(json["quality"]["boundary_loop_count"], 1);
+    assert_eq!(json["quality"]["euler_characteristic"], 1);
+    assert_eq!(json["quality"]["boundary_max_deviation_rad"], 0.0);
+    assert!(json["charge"].as_f64().unwrap().abs() < 1.0e-6);
+    assert_eq!(json["trust"], "qualified");
+    assert_eq!(json["nearest_integer"], 0);
+    assert_eq!(json["integer_error"], 0.0);
+    assert!(json["computed_at_unix_ms"]
+        .as_u64()
+        .is_some_and(|value| value > 0));
+    assert!(json["warnings"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn topological_charge_cache_key_tracks_field_revision() {
     let state = test_app_state_with_live_session().await;
     let scene = sample_scene_document();
@@ -50369,3 +50910,118 @@ mod session_scope;
 
 #[path = "tests/workspace_items.rs"]
 mod workspace_items;
+
+
+#[tokio::test]
+async fn status_keeps_accepted_fem_method_without_runtime_capabilities() {
+    let state = test_app_state_with_live_session().await;
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        let mut scene = sample_scene_document_with_stage(serde_json::json!({
+            "entrypoint_kind": "flat_relax", "kind": "relax",
+            "algorithm": "projected_gradient_bb", "stage_id": "relax-1"
+        }));
+        scene.study.requested_backend = "fem".into();
+        scene.study.requested_device = "auto".into();
+        snapshot.scene_document = Some(scene);
+        snapshot.capabilities = None;
+        snapshot.session.resolved_backend = None;
+        snapshot.session.resolved_device = None;
+        snapshot.session.resolved_precision = None;
+        snapshot.session.resolved_mode = None;
+    }
+    let response = build_v2_router().with_state(state).oneshot(
+        Request::builder().uri("/v2/sessions/current/status").body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    assert_eq!(body["capabilities"]["active_lane"]["authored"]["backend"], "fem");
+    assert_eq!(body["capabilities"]["active_lane"]["authored"]["discretization"], "fem");
+    assert_eq!(body["capabilities"]["active_lane"]["authored"]["device"], "auto");
+    assert_eq!(body["capabilities"]["active_lane"]["source"]["authored_intent"], "scene.study.requested_execution");
+    assert!(body["capabilities"]["active_lane"]["resolved"].is_null());
+}
+
+#[tokio::test]
+async fn readiness_routes_missing_object_assignments_to_the_object() {
+    let state = test_app_state_with_live_session().await;
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        let mut scene = sample_scene_document_with_stage(serde_json::json!({
+            "entrypoint_kind": "flat_relax", "kind": "relax",
+            "algorithm": "projected_gradient_bb", "stage_id": "relax-1"
+        }));
+        scene.study.requested_backend = "fem".into();
+        scene.objects[0].magnetization_ref = None;
+        scene.objects[0].physics_stack.clear();
+        snapshot.scene_document = Some(scene);
+    }
+    let response = build_v2_router().with_state(state).oneshot(
+        Request::builder().uri("/v2/sessions/current/model/readiness").body(Body::empty()).unwrap()
+    ).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = body_json(response).await;
+    for id in ["texture", "interactions"] {
+        let check = body["checks"].as_array().unwrap().iter().find(|check| check["id"] == id).unwrap();
+        assert_eq!(check["state"], "blocked");
+        assert_eq!(check["target_resource"], "model/objects/body");
+    }
+}
+
+
+#[tokio::test]
+async fn created_model_method_survives_partial_runtime_readback_for_both_methods() {
+    for method in ["fem", "fdm"] {
+        let state = test_app_state();
+        let app = build_v2_router().with_state(state.clone());
+        let created = app.clone().oneshot(Request::builder().method("POST").uri("/v2/sessions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::json!({"name": "First model", "backend": method, "device": "cpu", "precision": "double"}).to_string())).unwrap()
+        ).await.unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+            snapshot.capabilities = None;
+            snapshot.session.resolved_device = None;
+        }
+        let status = app.clone().oneshot(Request::builder().uri("/v2/sessions/current/status").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status = body_json(status).await;
+        assert_eq!(status["capabilities"]["active_lane"]["authored"]["discretization"], method);
+        assert!(status["capabilities"]["active_lane"]["resolved"].is_null());
+        let readiness = app.oneshot(Request::builder().uri("/v2/sessions/current/model/readiness").body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(readiness.status(), StatusCode::OK);
+        let readiness = body_json(readiness).await;
+        assert_eq!(readiness["checks"][0]["id"], "method");
+        assert_eq!(readiness["checks"][0]["state"], "complete");
+        assert_eq!(readiness["checks"][1]["id"], "domain");
+        assert_eq!(readiness["checks"][1]["state"], "complete");
+    }
+}
+
+#[tokio::test]
+async fn manual_domain_outside_blocks_readiness_and_mesh_command_before_queueing() {
+    let state = test_app_state_with_live_session().await;
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        let mut scene = sample_scene_document_with_stage(serde_json::json!({
+            "entrypoint_kind": "flat_relax", "kind": "relax", "algorithm": "projected_gradient_bb", "stage_id": "relax-1"
+        }));
+        scene.study.requested_backend = "fem".into();
+        scene.study.universe_mesh = Some(serde_json::from_value(serde_json::json!({
+            "mode": "manual", "size": [1e-12, 1e-12, 1e-12], "center": [0.0, 0.0, 0.0]
+        })).unwrap());
+        snapshot.scene_document = Some(scene);
+    }
+    let app = build_v2_router().with_state(state.clone());
+    let readiness = app.clone().oneshot(Request::builder().uri("/v2/sessions/current/model/readiness").body(Body::empty()).unwrap()).await.unwrap();
+    assert_eq!(readiness.status(), StatusCode::OK);
+    let readiness = body_json(readiness).await;
+    let domain = readiness["checks"].as_array().unwrap().iter().find(|check| check["id"] == "domain").unwrap();
+    assert_eq!(domain["state"], "blocked");
+    assert_eq!(domain["target_resource"], "meshing/policies/universe");
+    assert!(domain["reason"].as_str().unwrap().contains("outside"));
+    let command = app.oneshot(Request::builder().method("POST").uri("/v2/sessions/current/simulation/commands")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(serde_json::json!({"kind": "mesh_build"}).to_string())).unwrap()
+    ).await.unwrap();
+    assert_eq!(command.status(), StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&body_bytes(command).await).contains("outside"));
+    assert!(state.current_control_queue.lock().await.is_empty());
+}

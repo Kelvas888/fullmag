@@ -139,6 +139,23 @@ try {
     );
   }
   const screenshotFiles = [];
+  const simulationMethod = page.getByLabel("Simulation method", { exact: true });
+  await simulationMethod.waitFor({ state: "visible", timeout: 30_000 });
+  await page.waitForFunction(() =>
+    document.querySelector('[aria-label="Simulation method"]')?.getAttribute("data-method") === "fem",
+  );
+  assert((await simulationMethod.innerText()).trim() === "FEM", "The bottom-right method indicator must identify the FEM session.");
+  const methodScreenshot = "simulation-method-status-bar.png";
+  await page.locator(".fm-status-bar").screenshot({ path: resolve(outputDir, methodScreenshot) });
+  screenshotFiles.push(methodScreenshot);
+  await writeFile(resolve(outputDir, "simulation-method-status-bar-proof.json"), JSON.stringify({
+    schema: "fullmag_simulation_method_browser_proof_v1",
+    method: await simulationMethod.getAttribute("data-method"),
+    visibleLabel: await simulationMethod.innerText(),
+    qualification: "production_status_bar_with_mock_api_legacy_fem_status",
+    real_backend_verified: false,
+  }, null, 2));
+  await qualifyFirstRunGuideRouting(page, inspector, screenshotFiles, fixture);
   await qualifyExplorerKeyboardNavigation(page);
   await qualifyInspectorRoutingMatrix(page, inspector, screenshotFiles, fixture);
   await qualifyMagneticTextureMutationStability(page, inspector, fixture);
@@ -981,7 +998,9 @@ async function qualifyObjectMoveGestureAndSharedApply(page, inspector, fixture, 
   // The inner half overlaps the primitive, whose pointer handler stops propagation.
   // Hit the exposed outer shaft with native input, then drag from the captured handle.
   startWorld[0] += axisLength * 0.9;
-  endWorld[0] += axisLength * 1.15;
+  // Use a longer native drag so the readiness header cannot reduce the
+  // projected movement below the unchanged production 3 px threshold.
+  endWorld[0] += axisLength * 1.5;
   const startPoint = projectViewportWorldPoint(initialDiagnostics, startWorld);
   const endPoint = projectViewportWorldPoint(initialDiagnostics, endWorld);
   assertProjectedPointInCanvas(initialDiagnostics, startPoint, "X-axis drag start");
@@ -1614,9 +1633,12 @@ async function qualifyPhysicsScopeExclusivity(page, inspector, fixture) {
     )
     .waitFor({ state: "visible", timeout: 5_000 });
   await page.waitForTimeout(200);
+  // A delayed viewport client ACK records display observation; it does not
+  // mutate authored physics. Keep every other mutation in this guard assertion.
   const guardRequests = fixture.requests
     .slice(requestStart)
-    .filter((request) => /^(PATCH|POST|PUT|DELETE) /.test(request));
+    .filter((request) => /^(PATCH|POST|PUT|DELETE) /.test(request) &&
+      request !== "POST /v2/sessions/current/visualization/client-acks");
   assert(
     guardRequests.length === 0,
     `Rotated DMI guard emitted a mutation: ${JSON.stringify(guardRequests)}.`,
@@ -1664,7 +1686,8 @@ async function qualifyPhysicsScopeExclusivity(page, inspector, fixture) {
   await page.waitForTimeout(200);
   const inverseRequests = fixture.requests
     .slice(inverseRequestStart)
-    .filter((request) => /^(PATCH|POST|PUT|DELETE) /.test(request));
+    .filter((request) => /^(PATCH|POST|PUT|DELETE) /.test(request) &&
+      request !== "POST /v2/sessions/current/visualization/client-acks");
   assert(
     inverseRequests.length === 0,
     `Object DMI inverse guard emitted a mutation: ${JSON.stringify(inverseRequests)}.`,
@@ -1996,17 +2019,24 @@ async function expandInspectorNode(page, nodeId) {
     );
   }
   if ((await node.getAttribute("aria-expanded")) !== "false") return;
-  const branch = node.locator(".fm-explorer-tree-row__branch");
-  if (await branch.count()) {
-    await branch.click();
-  } else {
-    await node.dblclick();
+  // Expansion can change while model defaults/selection reveal settle. The
+  // keyboard contract expands a collapsed row without closing an open one.
+  await node.focus();
+  await node.press("ArrowRight");
+  try {
+    await page.waitForFunction(
+      (id) => document.querySelector(`[data-node-id="${id}"]`)?.getAttribute("aria-expanded") === "true",
+      nodeId,
+      { timeout: 60_000 },
+    );
+  } catch (error) {
+    const state = await node.evaluate((row) => ({
+      expanded: row.getAttribute("aria-expanded"),
+      focused: document.activeElement === row,
+      label: row.textContent?.trim(),
+    }));
+    throw new Error(`Explorer node ${nodeId} did not expand: ${JSON.stringify(state)}. ${error}`);
   }
-  await page.waitForFunction(
-    (id) => document.querySelector(`[data-node-id="${id}"]`)?.getAttribute("aria-expanded") === "true",
-    nodeId,
-    { timeout: 60_000 },
-  );
 }
 
 async function assertHealthyViewportCanvas(page, label) {
@@ -2536,7 +2566,17 @@ async function installInspectorFixtureApi(page, fixture) {
         rotate: { available: true, reason: null },
         scale: { available: true, reason: null },
       },
-      checks: [],
+      checks: [
+        { id: "method", label: "Simulation method", state: "complete", target_resource: "model/study" },
+        { id: "domain", label: "Domain policy", state: "complete", target_resource: "meshing/policies/universe", reason: "Automatic domain follows authored geometry." },
+        { id: "geometry", label: "Geometry", state: "complete", target_resource: "model/scene" },
+        { id: "material", label: "Material", state: "blocked", target_resource: "model/objects/film", reason: "Assign a material to Film." },
+        { id: "texture", label: "Initial magnetization", state: "complete", target_resource: "model/objects/film" },
+        { id: "interactions", label: "Interactions", state: "complete", target_resource: "model/objects/film" },
+        { id: "discretization", label: "Discretization", state: "complete", target_resource: fixture.fdmBuildGridMode ? "model/study" : "meshing/builds/current" },
+        { id: "study", label: "Study", state: "blocked", target_resource: "model/study", reason: "Add a study stage." },
+        { id: "execution", label: "Execution request", state: "complete", target_resource: "model/study", reason: "Device support is checked during preparation for each run." },
+      ],
       ready_to_export: true,
       ready_to_run: false,
       scene_revision: fixture.revision,
@@ -3362,4 +3402,31 @@ function inspectorFrequencyResponseSweep() {
     schema_version: "frequency_domain_response_sweep.v2",
     status: "ready",
   };
+}
+
+
+async function qualifyFirstRunGuideRouting(page, inspector, screenshotFiles, fixture) {
+  const guide = page.getByTestId("scratch-authoring-guide");
+  await guide.waitFor({ state: "visible", timeout: 30_000 });
+  const material = guide.locator('[data-check-id="material"]');
+  await material.getByRole("button", { name: "Material", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector(".fm-inspector__title")?.textContent === "Material Assignment");
+  assert(await inspector.locator(".fm-inspector-panel").count(), "Guide material action must mount the existing Inspector.");
+  await guide.locator('[data-check-id="domain"]').getByRole("button", { name: "Configure domain", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector(".fm-inspector__title")?.textContent === "Universe");
+  assert(!(await inspector.innerText()).includes("Session discretization is unresolved"), "Known FEM must not require engine resolution to edit Universe.");
+  const webgl = await assertHealthyViewportCanvas(page, "First-run guide navigation");
+  const screenshot = "first-run-guide-domain.png";
+  await page.screenshot({ path: resolve(outputDir, screenshot) });
+  screenshotFiles.push(screenshot);
+  await writeFile(resolve(outputDir, "first-run-guide-proof.json"), JSON.stringify({
+    schema: "fullmag_first_run_guide_browser_proof_v1", scene_revision: fixture.revision,
+    guide_revision: await guide.getAttribute("data-readiness-revision"),
+    actions: ["material -> existing Film Material Assignment", "complete domain -> existing Universe"],
+    check_ids: await guide.locator("[data-check-id]").evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-check-id"))),
+    webgl, screenshot, qualification: "production_workspace_with_mock_api", real_backend_verified: false,
+  }, null, 2));
+  await guide.getByRole("button", { name: "Hide steps", exact: true }).click();
+  assert(!(await guide.getByRole("list", { name: "Model readiness checklist" }).count()), "Hide steps must release workspace space for expert navigation.");
+  await assertHealthyViewportCanvas(page, "Collapsed first-run guide");
 }

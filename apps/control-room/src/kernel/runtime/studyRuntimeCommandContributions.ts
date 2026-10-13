@@ -76,6 +76,10 @@ import {
 } from "../persistence/controlRoomUiState";
 import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
 import {
+  hasSessionActiveLaneDeclaration,
+  resolveSessionAuthoringDiscretization,
+} from "../resources/sessionDiscretization";
+import {
   sessionRequestScopeKey,
   sessionResourceIdentityFromStatus,
 } from "../resources/sessionResourceIdentity";
@@ -615,11 +619,11 @@ function meshReadyStatus(status: string): boolean {
   );
 }
 
-function requiresExplicitMesh(status: LiveStatusResource): boolean {
-  return (
-    status.capabilities.explicit_topology ||
-    status.domain.discretization.toLowerCase() === "fem"
-  );
+export function requiresExplicitMesh(status: LiveStatusResource): boolean {
+  const lane = resolveSessionAuthoringDiscretization(status);
+  return hasSessionActiveLaneDeclaration(status)
+    ? lane === "fem"
+    : status.capabilities.explicit_topology || lane === "fem";
 }
 
 function asRecord(value: unknown): JsonRecord | null {

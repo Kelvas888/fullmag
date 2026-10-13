@@ -18,6 +18,7 @@ import {
   VISUALIZATION_STATE_PATH,
 } from "@/kernel/api/apiPaths";
 import { SESSION_STATUS_RESOURCE_KEY } from "@/kernel/resources/useSessionStatus";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import { resolveActiveLaneOperation } from "@/kernel/resources/useActiveLaneCapabilities";
 import { beginPlanarMonitorDraft } from "@/kernel/workspace/crossSectionWorkspace";
 import {
@@ -1123,9 +1124,7 @@ function ribbonInteractionDiscretization(
   if (rawResource === undefined) return "fem";
   const resource = asRecord(rawResource);
   const status = asRecord(resource?.data ?? resource);
-  return normalizeInteractionDiscretization(
-    asRecord(status?.domain)?.discretization,
-  );
+  return normalizeInteractionDiscretization(resolveSessionDiscretization(status));
 }
 
 function airboxCommandDisabledReason(context: CommandContext): string | null {

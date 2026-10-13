@@ -423,20 +423,23 @@ export function studyRuntimeProvenanceFromCurrentRun(
       precision: runtimeProvenanceValue(authored?.precision, unavailable),
     },
     effective: {
-      backend: runtimeProvenanceValue(effective?.backend ?? currentRun?.requested_backend, unavailable),
-      device: runtimeProvenanceValue(effective?.device ?? currentRun?.requested_device, unavailable),
-      mode: runtimeProvenanceValue(effective?.mode ?? currentRun?.requested_mode, unavailable),
+      backend: runtimeProvenanceValue(currentRun?.requested_backend ?? effective?.backend, unavailable),
+      device: runtimeProvenanceValue(currentRun?.requested_device ?? effective?.device, unavailable),
+      mode: runtimeProvenanceValue(currentRun?.requested_mode ?? effective?.mode, unavailable),
       precision: runtimeProvenanceValue(
-        effective?.precision ?? currentRun?.requested_precision,
+        currentRun?.requested_precision ?? effective?.precision,
         unavailable,
       ),
     },
     resolved: {
-      backend: runtimeProvenanceValue(resolved?.backend ?? currentRun?.resolved_backend, unresolved),
-      device: runtimeProvenanceValue(resolved?.device ?? currentRun?.resolved_device, unresolved),
-      mode: runtimeProvenanceValue(resolved?.mode ?? currentRun?.resolved_mode, unresolved),
+      backend: runtimeProvenanceValue(currentRun ? currentRun.resolved_backend : resolved?.backend, unresolved),
+      device: runtimeProvenanceValue(
+        currentRun?.resolved_device,
+        unresolved,
+      ),
+      mode: runtimeProvenanceValue(currentRun ? currentRun.resolved_mode : null, unresolved),
       precision: runtimeProvenanceValue(
-        resolved?.precision ?? currentRun?.resolved_precision,
+        currentRun ? currentRun.resolved_precision : null,
         unresolved,
       ),
       runtimeFamily: runtimeProvenanceValue(
