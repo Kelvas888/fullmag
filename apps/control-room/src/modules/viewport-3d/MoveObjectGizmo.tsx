@@ -2,6 +2,7 @@
 
 import type { ThreeEvent } from "@react-three/fiber";
 import { useEffect, useMemo, useState } from "react";
+import { Plane, Vector3, type Ray } from "three";
 
 import type {
   Viewport3DPrimitiveRenderModel,
@@ -58,6 +59,7 @@ export function createMoveGestureController({
   let active:
     | {
         axis: MoveAxis;
+        dragPlane: Plane | null;
         pointerId: number;
         releasePointerCapture: (pointerId: number) => void;
         start: Translation3;
@@ -75,19 +77,35 @@ export function createMoveGestureController({
       point: Translation3,
       setPointerCapture: (pointerId: number) => void,
       releasePointerCapture: (pointerId: number) => void,
+      ray?: Ray,
     ): void {
       if (active || isMoveCommitPending(onCommit)) return;
       if (onBeginGesture && !onBeginGesture()) return;
       try {
         setPointerCapture(pointerId);
       } catch {
+        try {
+          releasePointerCapture(pointerId);
+        } catch {
+          // R3F may have registered capture before native capture failed.
+        }
         if (onBeginGesture) onGestureActiveChange?.(false);
         return;
       }
-      active = { axis, pointerId, releasePointerCapture, start: [...point] };
+      active = {
+        axis, pointerId, releasePointerCapture, start: [...point],
+        dragPlane: ray
+          ? new Plane().setFromNormalAndCoplanarPoint(ray.direction, new Vector3(...point))
+          : null,
+      };
       translation = [...origin];
       onGestureActiveChange?.(true);
       publish();
+    },
+    cancelPointer(pointerId: number): boolean {
+      if (!active || active.pointerId !== pointerId) return false;
+      cancelActive(true);
+      return true;
     },
     cancel(): boolean {
       if (!active) return false;
@@ -112,8 +130,13 @@ export function createMoveGestureController({
         releaseCommit();
       }
     },
-    move(pointerId: number, point: Translation3): void {
+    move(pointerId: number, point: Translation3, ray?: Ray): void {
       if (!active || active.pointerId !== pointerId) return;
+      if (ray && active.dragPlane) {
+        const intersection = ray.intersectPlane(active.dragPlane, new Vector3());
+        if (!intersection) return;
+        point = [intersection.x, intersection.y, intersection.z];
+      }
       const axisIndex = active.axis === "x" ? 0 : active.axis === "y" ? 1 : 2;
       translation = [...origin];
       translation[axisIndex] += point[axisIndex] - active.start[axisIndex];
@@ -237,10 +260,17 @@ export function installMoveGestureTerminalListeners(
       keyboardEvent.preventDefault();
     }
   };
+  const onPointerTerminated = (event: Event) => {
+    controller.cancelPointer((event as PointerEvent).pointerId);
+  };
   target.addEventListener("keydown", onKeyDown);
+  target.addEventListener("pointercancel", onPointerTerminated, true);
+  target.addEventListener("lostpointercapture", onPointerTerminated, true);
   return () => {
     controller.cancel();
     target.removeEventListener("keydown", onKeyDown);
+    target.removeEventListener("pointercancel", onPointerTerminated, true);
+    target.removeEventListener("lostpointercapture", onPointerTerminated, true);
   };
 }
 
@@ -331,6 +361,7 @@ function beginAxisDrag(
   controller.begin(axis, event.pointerId, eventPoint(event), (pointerId) =>
     target.setPointerCapture(pointerId),
     (pointerId) => target.releasePointerCapture(pointerId),
+    event.ray,
   );
 }
 
@@ -339,7 +370,7 @@ function moveAxisDrag(
   event: ThreeEvent<PointerEvent>,
 ): void {
   event.stopPropagation();
-  controller.move(event.pointerId, eventPoint(event));
+  controller.move(event.pointerId, eventPoint(event), event.ray);
 }
 
 async function endAxisDrag(

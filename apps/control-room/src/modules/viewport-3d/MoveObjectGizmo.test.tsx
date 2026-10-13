@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { Ray, Vector3 } from "three";
 
 import {
   createMoveGestureController,
@@ -46,6 +47,47 @@ describe("MoveObjectGizmo", () => {
       lockHeldByGesture: true,
     });
     expect(onDraftChange).toHaveBeenLastCalledWith(null);
+  });
+
+  it("uses the live ray beyond the captured shaft instead of a stale intersection", async () => {
+    const onCommit = vi.fn().mockResolvedValue(true);
+    const controller = createMoveGestureController({
+      baseRevision: 1, objectId: "ray-magnet", onCommit,
+      onDraftChange: vi.fn(), origin: [0, 0, 0],
+    });
+    controller.begin("x", 7, [0, 0, 0], vi.fn(), vi.fn(),
+      new Ray(new Vector3(0, 0, 1), new Vector3(0, 0, -1)));
+    controller.move(7, [0, 0, 0],
+      new Ray(new Vector3(35e-9, 0, 1), new Vector3(0, 0, -1)));
+    await controller.end(7);
+    expect(onCommit).toHaveBeenCalledWith("ray-magnet", [35e-9, 0, 0], 1, {
+      lockHeldByGesture: true,
+    });
+  });
+
+  it("fences native pointer cancellation and releases the reservation once", () => {
+    const onCommit = vi.fn();
+    const release = vi.fn();
+    const onGestureActiveChange = vi.fn();
+    const controller = createMoveGestureController({
+      baseRevision: 1, objectId: "cancel-magnet", onCommit,
+      onDraftChange: vi.fn(), onGestureActiveChange, origin: [0, 0, 0],
+    });
+    const target = new EventTarget();
+    const cleanup = installMoveGestureTerminalListeners(controller, target);
+    controller.begin("x", 7, [0, 0, 0], vi.fn(), release);
+    const unrelated = new Event("pointercancel");
+    Object.defineProperty(unrelated, "pointerId", { value: 8 });
+    target.dispatchEvent(unrelated);
+    expect(release).not.toHaveBeenCalled();
+    const cancelled = new Event("lostpointercapture");
+    Object.defineProperty(cancelled, "pointerId", { value: 7 });
+    target.dispatchEvent(cancelled);
+    target.dispatchEvent(cancelled);
+    expect(release).toHaveBeenCalledExactlyOnceWith(7);
+    expect(onGestureActiveChange.mock.calls).toEqual([[true], [false]]);
+    expect(onCommit).not.toHaveBeenCalled();
+    cleanup();
   });
 
   it("does not capture or publish a preview when the session rejects a gesture reservation", () => {
@@ -101,7 +143,7 @@ describe("MoveObjectGizmo", () => {
     expect(onGestureActiveChange).toHaveBeenCalledExactlyOnceWith(false);
     expect(onDraftChange).not.toHaveBeenCalled();
     expect(onCommit).not.toHaveBeenCalled();
-    expect(release).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledExactlyOnceWith(1);
     controller.begin("x", 2, [0, 0, 0], vi.fn(), release);
     controller.move(2, [3e-9, 0, 0]);
     await controller.end(2);
@@ -275,8 +317,8 @@ describe("MoveObjectGizmo", () => {
         listener: null,
       };
       const target = {
-        addEventListener: vi.fn((_type: string, listener: EventListenerOrEventListenerObject) => {
-          keydown.listener = listener as (event: Event) => void;
+        addEventListener: vi.fn((type: string, listener: EventListenerOrEventListenerObject) => {
+          if (type === "keydown") keydown.listener = listener as (event: Event) => void;
         }),
         removeEventListener: vi.fn(),
       } as never;
