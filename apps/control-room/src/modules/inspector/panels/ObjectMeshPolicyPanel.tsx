@@ -271,9 +271,11 @@ function ObjectMeshPolicySummarySection({
 export function FdmObjectMeshPolicySection({
   objectId,
   resources,
+  onRebuildGrid,
 }: {
   objectId: string | null | undefined;
   resources: FdmObjectMeshInspectorResources;
+  onRebuildGrid?: () => void;
 }) {
   const model = useMemo(
     () =>
@@ -318,6 +320,18 @@ export function FdmObjectMeshPolicySection({
           }
         />
         <FieldRow label="Grid fingerprint" value={model.gridFingerprint ?? "not materialized"} mono />
+        {onRebuildGrid ? (
+          <div className="flex justify-end pt-2">
+            <Button
+              size="sm"
+              type="button"
+              variant="secondary"
+              onClick={onRebuildGrid}
+            >
+              Re-voxelize / Build Grid
+            </Button>
+          </div>
+        ) : null}
       </InspectorGroup>
     </div>
   );
@@ -1267,11 +1281,27 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
   const activeTab = useInspectorActiveTab();
   const jsonError = objectMeshPolicyJsonError(draft.configText);
 
+  const executeFdmGridBuild = useCallback(async () => {
+    try {
+      const result = await commands.execute("grid.build-fdm", operationContext);
+      setFeedback({
+        kind: result.status === "completed" ? "success" : result.status === "failed" ? "error" : "warning",
+        message: result.message ?? (result.status === "completed"
+          ? "FDM grid refresh completed."
+          : result.status === "failed" ? "FDM grid refresh failed."
+          : "FDM grid refresh was not submitted."),
+      });
+    } catch (error) {
+      setFeedback({ kind: "error", message: errorMessage(error) });
+    }
+  }, [commands, operationContext]);
+
   if (explicitFdm) {
     return (
       <FdmObjectMeshPolicySection
         objectId={objectId}
         resources={fdmMeshResources}
+        onRebuildGrid={executeFdmGridBuild}
       />
     );
   }
