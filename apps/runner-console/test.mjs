@@ -175,6 +175,7 @@ class MockElement {
     this.id = id;
     this.innerHTML = '';
     this.children = [];
+    this.style = {};
     const classes = new Set();
     this.classList = {
       add: (...c) => c.forEach(x => classes.add(x)),
