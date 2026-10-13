@@ -1294,7 +1294,7 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
     } catch (error) {
       setFeedback({ kind: "error", message: errorMessage(error) });
     }
-  }, [commands, commandContext]);
+  }, [commands, commandContext, setFeedback]);
 
   if (explicitFdm) {
     return (
