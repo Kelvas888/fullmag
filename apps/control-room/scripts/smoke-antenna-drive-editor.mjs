@@ -110,6 +110,17 @@ try {
   checks.push({ continuous_pending_ack_monitor: monitored });
   await shot('02-ack-retained-draft');
   checks.push('doublewrite guard; retained newer draft; real history; stable root/focus/scroll; unrelated controls unchanged');
+  await page.waitForFunction(() => { const button = [...document.querySelectorAll('[data-testid="drive-editor"] button')].find(button => button.textContent.trim() === 'Save drive'); return Boolean(button && !button.disabled); });
+  const previousRevision = (await read()).scene.revision;
+  await save().click();
+  await pending();
+  const second = await read();
+  assert.equal(posts(second), 2, 'Preserved draft can be submitted again');
+  assert.equal(second.calls.filter(call => call.method === 'POST').at(-1).body.merge_patch.solved_antenna_drives[0].peak_current_a, 0.02);
+  await page.evaluate(() => window.__antennaDriveEditorFixture.release());
+  await page.waitForFunction(revision => { const state = window.__antennaDriveEditorFixture.read(); return state.scene.revision > revision && state.scene.solved_antenna_drives[0].peak_current_a === 0.02; }, previousRevision);
+  assert.equal(await peak().inputValue(), '0.02');
+  checks.push('retained draft submitted a second time and committed canonically');
   for (const change of ['session', 'drive']) {
     await fresh(); await peak().fill('0.01'); await save().click(); await pending();
     if (change === 'session') {

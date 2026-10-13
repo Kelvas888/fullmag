@@ -198,7 +198,7 @@ export function SolvedAntennaDriveEditor({ driveId, scene, status, refetch }: Pr
       if (!isCurrent()) return;
       const committed = resolveCommitted(response);
       const acknowledged = solvedDriveDraft(committed.solved_antenna_drives!.find((item) => item.id === driveId)!);
-      publishCommittedSceneResource(resources, committed, response.scene_revision, undefined, false, scope, api.resourceCacheScope);
+      publishCommittedSceneResource(resources, committed, response.scene_revision, undefined, true, scope, api.resourceCacheScope);
       resources.invalidate(MODEL_READINESS_PATH, response.scene_revision);
       setFeedbackState({ id: driveId, message: "Antenna drive committed." });
       setLocal((current) => acknowledgeSolvedDriveDraft(current, driveId, draft, acknowledged));
