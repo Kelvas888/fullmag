@@ -9018,6 +9018,10 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
 
     if (!count_certificate_only) {
         FullmagFemFrequencyDomainResult result = fullmag_fem_modal_eigen_solve(&request);
+        if (result.status != FULLMAG_FEM_FD_OK) {
+            print_bounded_cabi_modal_result(
+                "shared-domain Floquet nearest-frequency fixture failure", result);
+        }
         check(result.status == FULLMAG_FEM_FD_OK,
               "shared-domain Floquet nearest-frequency fixture should reach production SLEPc");
         check(contains(result.resolved_engine_id, "floquet_airbox_cpu_schur_slepc"),
