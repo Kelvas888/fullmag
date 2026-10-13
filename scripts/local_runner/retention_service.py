@@ -1,4 +1,6 @@
 """Nonblocking administrative retention commands owned by one coordinator."""
+from datetime import datetime, timezone
+import math
 from pathlib import Path
 import re
 import threading
@@ -7,9 +9,30 @@ import uuid
 from contextlib import contextmanager
 
 from fullmag_storage import validate_path
+from local_runner import retention
 from local_runner.retention_executor import apply_execution_plan
 from local_runner.retention import PreviewCancelled
-from local_runner.retention_persistence import failure_fields, read_document, write_document
+from local_runner.retention_persistence import (
+    MANIFEST_SCHEMA,
+    _read_small_object,
+    failure_fields,
+    read_document,
+    write_document,
+)
+
+
+_MAX_PLAN_LIST_ITEMS = 100
+_PLAN_ID = re.compile(r'plan-[a-f0-9]{8,32}\Z')
+_RETENTION_SCOPES = frozenset(('execution', 'sources', 'runtime'))
+
+
+def _is_finite_number(value):
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
 
 
 class RetentionService:
@@ -53,6 +76,161 @@ class RetentionService:
             kind='operation' if operation else 'plan',
             scope=record.get('scope'),
         )
+
+    @staticmethod
+    def _list_timestamp(value):
+        if _is_finite_number(value):
+            try:
+                return float(value)
+            except OverflowError:
+                return 0.0
+        if isinstance(value, str) and len(value) <= 64:
+            try:
+                parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.timestamp()
+            except (OverflowError, OSError, ValueError):
+                pass
+        return 0.0
+
+    def _list_metadata_record(self, storage, plan_id, *, operation=False):
+        if not isinstance(plan_id, str) or _PLAN_ID.fullmatch(plan_id) is None:
+            return None
+        kind = 'operation' if operation else 'plan'
+        path = self._path(plan_id, operation=operation)
+        document = _read_small_object(storage, path)
+        schema = document.get('storage_schema')
+        if schema is None:
+            record = document
+        elif schema == MANIFEST_SCHEMA:
+            scope = document.get('scope')
+            if (document.get('kind') != kind or document.get('plan_id') != plan_id
+                    or scope not in _RETENTION_SCOPES):
+                return None
+            payload = document.get('payload')
+            if (not isinstance(payload, dict) or payload.get('plan_id') != plan_id
+                    or payload.get('scope') != scope):
+                return None
+            record = payload
+        else:
+            return None
+        if record.get('plan_id') != plan_id:
+            return None
+        scope = record.get('scope')
+        if scope is not None and scope not in _RETENTION_SCOPES:
+            return None
+        return record
+
+    @staticmethod
+    def _list_document_directory(storage, name):
+        try:
+            return retention._checked_child(storage, ('index', name), kind='directory')
+        except retention._PathIssue as error:
+            if error.reason == 'missing_run_path':
+                return None
+            raise
+
+    @staticmethod
+    def _list_document_ids(directory):
+        if directory is None:
+            return
+        for path in directory.iterdir():
+            match = re.fullmatch(r'(plan-[a-f0-9]{8,32})\.json', path.name)
+            if match is not None:
+                yield match.group(1)
+
+    @staticmethod
+    def _plan_document_exists(storage, plan_id):
+        try:
+            retention._checked_child(
+                storage, ('index', 'retention-plans', plan_id + '.json'), kind='file'
+            )
+        except retention._PathIssue as error:
+            if error.reason == 'missing_run_path':
+                return False
+            # Unsafe or unreadable plan paths must not cause a duplicate entry
+            # from the operation directory.
+            return True
+        return True
+
+    @classmethod
+    def _plan_summary(cls, plan_id, *records):
+        merged = {}
+        for record in records:
+            if record is not None:
+                merged.update(record)
+        summary = {'plan_id': plan_id}
+        scope = merged.get('scope')
+        if scope in _RETENTION_SCOPES:
+            summary['scope'] = scope
+        status = merged.get('status')
+        if isinstance(status, str) and 0 < len(status) <= 64:
+            summary['status'] = status
+        applied = merged.get('applied')
+        if isinstance(applied, bool):
+            summary['applied'] = applied
+        for key in ('created_at', 'started_at', 'finished_at'):
+            value = merged.get(key)
+            if (isinstance(value, str) and len(value) <= 64) or (
+                _is_finite_number(value)
+            ):
+                summary[key] = value
+        for key in (
+            'candidates_count', 'retained_count', 'estimated_reclaimed_bytes',
+            'reclaimed_bytes', 'removed_logical_bytes',
+        ):
+            value = merged.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and 0 <= value and len(str(value)) <= 128:
+                summary[key] = value
+            elif isinstance(value, float) and _is_finite_number(value) and value >= 0:
+                summary[key] = value
+        return summary
+
+    def list(self):
+        """List bounded plan summaries without reconciling or loading inventory parts."""
+        storage = retention._canonical_storage(self.storage)
+        plan_directory = self._list_document_directory(storage, 'retention-plans')
+        operation_directory = self._list_document_directory(storage, 'retention-operations')
+        items = []
+        total = 0
+
+        def add(plan_id, plan_record, operation_record=None):
+            nonlocal total
+            if plan_record is None and operation_record is None:
+                return
+            summary = self._plan_summary(plan_id, plan_record, operation_record)
+            total += 1
+            items.append(summary)
+            items.sort(
+                key=lambda item: (self._list_timestamp(item.get('created_at')), item['plan_id']),
+                reverse=True,
+            )
+            if len(items) > _MAX_PLAN_LIST_ITEMS:
+                items.pop()
+
+        for plan_id in self._list_document_ids(plan_directory):
+            try:
+                plan_record = self._list_metadata_record(storage, plan_id)
+            except Exception:
+                plan_record = None
+            try:
+                operation_record = self._list_metadata_record(storage, plan_id, operation=True)
+            except Exception:
+                operation_record = None
+            add(plan_id, plan_record, operation_record)
+
+        for plan_id in self._list_document_ids(operation_directory):
+            if self._plan_document_exists(storage, plan_id):
+                continue
+            try:
+                operation_record = self._list_metadata_record(storage, plan_id, operation=True)
+            except Exception:
+                operation_record = None
+            add(plan_id, None, operation_record)
+
+        return {'items': items, 'total': total}
+
     def get(self, plan_id):
         with self.lock:
             operation_path = self._path(plan_id, operation=True)

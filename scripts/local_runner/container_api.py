@@ -129,6 +129,7 @@ class APICallbacks:
     alerts: Callable[[], object] | None = None
     events: Callable[[dict], object] | None = None
     retention_plan_preview: Callable[..., object] | None = None
+    retention_plan_list: Callable[[], object] | None = None
     retention_plan_apply: Callable[[str], object] | None = None
     retention_plan_cancel: Callable[[str], object] | None = None
     retention_plan_get: Callable[[str], object] | None = None
@@ -159,6 +160,7 @@ class APICallbacks:
             "alerts",
             "events",
             "retention_plan_preview",
+            "retention_plan_list",
             "retention_plan_apply",
             "retention_plan_cancel",
             "retention_plan_get",
@@ -621,9 +623,11 @@ class _RunnerAPIHandler(BaseHTTPRequestHandler):
             else:
                 self._error(503, "retention_unavailable")
         elif parts == ["api", "v1", "retention", "plans"]:
-            if self.server.callbacks.retention_plan_preview is not None:
-                self._invoke(self.server.callbacks.retention_plan_preview)
+            if self.server.callbacks.retention_plan_list is not None:
+                self._invoke(self.server.callbacks.retention_plan_list)
             elif self.server.callbacks.retention is not None:
+                # Compatibility for older coordinators: retention is a
+                # read-only inventory callback. Preview remains POST-only.
                 self._invoke(self.server.callbacks.retention)
             else:
                 self._error(503, "retention_unavailable")
@@ -856,6 +860,7 @@ def _coerce_callbacks(callbacks: APICallbacks | Mapping[str, Callable[..., objec
                 alerts=callbacks.get("alerts"),
                 events=callbacks.get("events"),
                 retention_plan_preview=callbacks.get("retention_plan_preview"),
+                retention_plan_list=callbacks.get("retention_plan_list"),
                 retention_plan_apply=callbacks.get("retention_plan_apply"),
                 retention_plan_cancel=callbacks.get("retention_plan_cancel"),
                 retention_plan_get=callbacks.get("retention_plan_get"),

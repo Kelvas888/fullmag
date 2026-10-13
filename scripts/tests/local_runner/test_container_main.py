@@ -51,6 +51,14 @@ class LiveThread:
 
 
 class ContainerMainTests(unittest.TestCase):
+    def test_retention_plan_list_is_bound_to_the_retention_service(self):
+        app = self.app()
+        listed = {'items': [], 'total': 0}
+        with patch.object(app.retention_service, 'list', return_value=listed) as list_plans, \
+                patch.object(app.retention_service, 'preview', side_effect=AssertionError('GET must not preview')):
+            self.assertEqual(listed, app.retention_plan_list())
+        list_plans.assert_called_once_with()
+
     def test_retention_busy_defers_build_dispatch(self):
         app = self.app()
         app.retention_service.thread = LiveThread()

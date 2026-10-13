@@ -55,6 +55,99 @@ class RetentionServiceTests(unittest.TestCase):
             )
         self.assertFalse(self.service.busy)
 
+    def test_list_is_bounded_read_only_and_uses_persisted_summaries_after_restart(self):
+        for index in range(105):
+            plan_id = f'plan-{index + 1:08x}'
+            self.service._save(
+                {
+                    'plan_id': plan_id,
+                    'scope': 'execution',
+                    'status': 'preview',
+                    'applied': False,
+                    'created_at': float(index),
+                    'candidates_count': index,
+                    'retained_count': 0,
+                    'candidates': [],
+                }
+            )
+        self.service._save(
+            {
+                'plan_id': 'plan-deadbeef',
+                'scope': 'execution',
+                'status': 'planning',
+                'applied': False,
+                'created_at': 5.5,
+            }
+        )
+        with patch('local_runner.retention_persistence.INLINE_JSON_BYTES', 1):
+            self.service._save(
+                {
+                    'plan_id': 'plan-00000069',
+                    'scope': 'execution',
+                    'status': 'applied',
+                    'applied': False,
+                    'created_at': 104.0,
+                    'candidates_count': 104,
+                    'retained_count': 0,
+                    'candidates': [{'private_inventory_marker': 'raw-candidate-detail'}],
+                }
+            )
+            self.service._save(
+                {
+                    'plan_id': 'plan-00000069',
+                    'scope': 'execution',
+                    'status': 'applied',
+                    'applied': True,
+                    'finished_at': 105.0,
+                    'reclaimed_bytes': 0,
+                    'items': [
+                        {'private_operation_marker': 'raw-operation-detail'},
+                        {'private_operation_marker': 'raw-active-item'},
+                    ],
+                },
+                operation=True,
+            )
+
+        restarted = RetentionService(
+            self.hub, self.queue, {'storage_root': str(self.root)},
+            owner='operator', call=lambda _: '', stream_logs=self.stream_logs,
+        )
+
+        def snapshot():
+            return {
+                path.relative_to(self.root).as_posix(): (path.stat().st_mtime_ns, path.read_bytes())
+                for path in self.root.rglob('*')
+                if path.is_file()
+            }
+
+        before = snapshot()
+        with patch.object(restarted, 'get', side_effect=AssertionError('list must not reconcile')), \
+                patch('local_runner.retention_service.read_document',
+                      side_effect=AssertionError('list must not load persisted inventory')), \
+                patch('local_runner.retention_persistence._read_regular_bytes',
+                      side_effect=AssertionError('list must not load persisted array parts')):
+            first = restarted.list()
+            second = restarted.list()
+        after = snapshot()
+
+        self.assertEqual(before, after)
+        self.assertEqual(first, second)
+        self.assertEqual(106, first['total'])
+        self.assertEqual(100, len(first['items']))
+        self.assertEqual('plan-00000069', first['items'][0]['plan_id'])
+        self.assertEqual('applied', first['items'][0]['status'])
+        self.assertTrue(first['items'][0]['applied'])
+        self.assertEqual(
+            'planning',
+            next(item for item in first['items'] if item['plan_id'] == 'plan-deadbeef')['status'],
+        )
+        self.assertNotIn('candidates', first['items'][0])
+        self.assertNotIn('items', first['items'][0])
+        encoded = json.dumps(first)
+        self.assertNotIn('private_inventory_marker', encoded)
+        self.assertNotIn('private_operation_marker', encoded)
+        self.assertNotIn('plan-00000005', {item['plan_id'] for item in first['items']})
+
     def test_preview_is_async_and_durable_and_apply_is_idempotent(self):
         entered = threading.Event()
         release = threading.Event()

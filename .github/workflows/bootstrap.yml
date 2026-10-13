@@ -796,6 +796,10 @@ jobs:
         run: python -B scripts/test_local_runner_container_client.py -v
       - name: Run execution and runtime retention regressions
         run: python -B -m unittest discover -s scripts -p 'test_local_runner_retention*.py' -v
+      - name: Run retention HTTP routing and coordinator binding regressions
+        run: |
+          python -B -m unittest discover -s scripts/tests/local_runner -p test_container_api.py -v
+          python -B -m unittest discover -s scripts/tests/local_runner -p test_container_main.py -v
       - name: Run archive receipt and verified runtime tombstone regressions
         if: ${{ !cancelled() }}
         run: python -B scripts/test_local_runner_archive_receipt.py -v

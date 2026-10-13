@@ -61,6 +61,66 @@ class ContainerAPITests(unittest.TestCase):
         self.assertEqual('sources', self.json_body(response)['scope'])
         self.assertIn(('preview', body), self.calls)
 
+    def test_retention_plan_get_repeats_read_only_list_without_preview(self):
+        listed = {'items': [{'plan_id': 'plan-01234567', 'status': 'preview'}], 'total': 1}
+
+        def list_plans():
+            self.calls.append(('retention_plan_list',))
+            return listed
+
+        def preview(*_args):
+            self.calls.append(('preview',))
+            raise AssertionError('GET must not create a preview')
+
+        self.server.callbacks = replace(
+            self.server.callbacks,
+            retention_plan_list=list_plans,
+            retention_plan_preview=preview,
+        )
+        for _ in range(2):
+            status, _, response = self.request('GET', '/api/v1/retention/plans')
+            self.assertEqual(200, status)
+            self.assertEqual(listed, self.json_body(response))
+        self.assertEqual([('retention_plan_list',), ('retention_plan_list',)], self.calls)
+
+    def test_retention_plan_get_uses_read_only_legacy_fallback_not_preview(self):
+        legacy = {'candidates': [], 'retained': []}
+
+        def legacy_retention():
+            self.calls.append(('retention',))
+            return legacy
+
+        def preview(*_args):
+            self.calls.append(('preview',))
+            raise AssertionError('GET must not create a preview')
+
+        self.server.callbacks = replace(
+            self.server.callbacks,
+            retention_plan_list=None,
+            retention=legacy_retention,
+            retention_plan_preview=preview,
+        )
+        status, _, response = self.request('GET', '/api/v1/retention/plans')
+        self.assertEqual(200, status)
+        self.assertEqual(legacy, self.json_body(response))
+        self.assertEqual([('retention',)], self.calls)
+
+    def test_retention_plan_get_fails_closed_without_a_read_only_callback(self):
+        def preview(*_args):
+            self.calls.append(('preview',))
+            raise AssertionError('GET must not create a preview')
+
+        self.server.callbacks = replace(
+            self.server.callbacks,
+            retention=None,
+            retention_plan_list=None,
+            retention_plan_preview=preview,
+        )
+        status, _, response = self.request('GET', '/api/v1/retention/plans')
+        self.assertEqual(503, status)
+        self.assertEqual('retention_unavailable', self.json_body(response)['error'])
+        self.assertEqual([], self.calls)
+
     def test_legacy_preview_cannot_silently_ignore_a_new_scope(self):
         status, _, response = self.request('POST', '/api/v1/retention/plans', body={'scope': 'runtime'})
         self.assertEqual(503, status)
