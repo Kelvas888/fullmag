@@ -1155,12 +1155,14 @@ def _execute_contract(args: Any) -> int:
         receipt["diagnostic_configuration"] = {
             "floquet_dense_oracle_enabled": dense_oracle_enabled,
             "floquet_factor_phase_logging_requested": dense_oracle_enabled,
+            "floquet_factor_matrix_snapshot_requested": dense_oracle_enabled,
             "petsc_info_options_requested": "-info :mat:self" if dense_oracle_enabled else None,
             "scope": "bounded native fixture diagnosis; not production qualification",
         }
         if dense_oracle_enabled:
             container_environment.append(("FULLMAG_FLOQUET_DENSE_ORACLE", "1"))
             container_environment.append(("FULLMAG_FLOQUET_FACTOR_PHASE_LOG", "1"))
+            container_environment.append(("FULLMAG_FLOQUET_FACTOR_MATRIX_SNAPSHOT", "1"))
             container_environment.append(("PETSC_OPTIONS", "-info :mat:self"))
         _write_json(receipt_path, receipt)
         library_dir = f"{INSTALL_PREFIX}/lib"

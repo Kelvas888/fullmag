@@ -32,6 +32,162 @@ namespace fullmag::fem::frequency_domain {
 namespace {
 
 #if FULLMAG_FEM_WITH_SLEPC
+// Public PETSc v3.24.6 getters only; no row/array leases or factor setup.
+// This opt-in observes input matrices, not LU factors or scientific invariance.
+bool emit_floquet_factor_matrix_snapshot(const char *phase, Mat matrix) noexcept
+{
+    const char *enabled = std::getenv("FULLMAG_FLOQUET_FACTOR_MATRIX_SNAPSHOT");
+    const char *dense = std::getenv("FULLMAG_FLOQUET_DENSE_ORACLE");
+    const char *action = std::getenv("FULLMAG_FLOQUET_SCHUR_ACTION_DIAGNOSTIC");
+    const bool diagnostic_requested = (dense != nullptr && std::strcmp(dense, "1") == 0) ||
+        (action != nullptr && std::strcmp(action, "1") == 0);
+    if (enabled == nullptr || std::strcmp(enabled, "1") != 0 || !diagnostic_requested) {
+        return false;
+    }
+    if (fullmag::fem::runtime::petsc_slepc_process_is_unsafe_locked()) {
+        return false; // Never query the quarantined graph.
+    }
+    PetscInt rows = -1, columns = -1, row_begin = -1, row_end = -1;
+    MatType matrix_type = nullptr;
+    const PetscErrorCode size_error = matrix != nullptr
+        ? MatGetSize(matrix, &rows, &columns) : PETSC_ERR_ARG_NULL;
+    const PetscErrorCode type_error = matrix != nullptr
+        ? MatGetType(matrix, &matrix_type) : PETSC_ERR_ARG_NULL;
+    char type_copy[64] = {};
+    bool type_available = type_error == PETSC_SUCCESS && matrix_type != nullptr;
+    if (type_available) {
+        const std::size_t length = std::strlen(matrix_type);
+        type_available = length < sizeof(type_copy);
+        for (std::size_t i = 0; type_available && i < length; ++i) {
+            const char c = matrix_type[i];
+            if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                  (c >= '0' && c <= '9') || c == '_')) {
+                type_available = false;
+            }
+        }
+        if (type_available) {
+            std::memcpy(type_copy, matrix_type, length + 1);
+        }
+    }
+    const bool applicable = size_error == PETSC_SUCCESS && rows == 4 && columns == 4;
+    PetscErrorCode ownership_error = PETSC_ERR_ARG_WRONGSTATE;
+    PetscErrorCode values_error = PETSC_ERR_ARG_WRONGSTATE;
+    PetscErrorCode diagonal_error = PETSC_ERR_ARG_WRONGSTATE;
+    PetscErrorCode state_error = PETSC_ERR_ARG_WRONGSTATE;
+    PetscBool missing_diagonal = PETSC_FALSE;
+    PetscInt first_missing_diagonal = -1;
+    PetscObjectState nonzero_state = 0;
+    PetscScalar values[16] = {};
+    bool getters_attempted = false;
+    bool values_attempted = false;
+    if (applicable) {
+        getters_attempted = true;
+        ownership_error = MatGetOwnershipRange(matrix, &row_begin, &row_end);
+        diagonal_error = MatMissingDiagonal(matrix, &missing_diagonal, &first_missing_diagonal);
+        state_error = MatGetNonzeroState(matrix, &nonzero_state);
+        if (ownership_error == PETSC_SUCCESS && row_begin == 0 && row_end == 4) {
+            values_attempted = true;
+            const PetscInt indices[4] = {0, 1, 2, 3};
+            values_error = MatGetValues(matrix, 4, indices, 4, indices, values);
+        }
+    }
+    const bool values_available = getters_attempted && values_error == PETSC_SUCCESS;
+    const bool measured = applicable && type_available && values_available &&
+        diagonal_error == PETSC_SUCCESS && state_error == PETSC_SUCCESS;
+    char json[8192] = {};
+    std::size_t used = 0;
+    bool overflow = false;
+    const auto append = [&](const char *format, auto... arguments) {
+        if (overflow) {
+            return;
+        }
+        const int written = std::snprintf(json + used, sizeof(json) - used, format, arguments...);
+        if (written < 0 || static_cast<std::size_t>(written) >= sizeof(json) - used) {
+            overflow = true;
+            return;
+        }
+        used += static_cast<std::size_t>(written);
+    };
+    append("{\"schema\":\"fullmag.floquet-factor-matrix-snapshot.v1\",\"phase\":\"%s\","
+           "\"status\":\"%s\",\"applicable_n4\":%s,\"size_available\":%s,\"rows\":%lld,\"columns\":%lld,"
+           "\"type_available\":%s,\"type\":", phase,
+           measured ? "measured" : (size_error == PETSC_SUCCESS && !applicable ? "not_applicable" : "unavailable"),
+           applicable ? "true" : "false", size_error == PETSC_SUCCESS ? "true" : "false",
+           static_cast<long long>(rows), static_cast<long long>(columns), type_available ? "true" : "false");
+    if (type_available) {
+        append("\"%s\"", type_copy);
+    } else {
+        append("null");
+    }
+    append(",\"size_error_available\":%s,\"type_error_available\":%s,"
+           "\"ownership_error_available\":%s,\"values_error_available\":%s,"
+           "\"diagonal_error_available\":%s,\"nonzero_state_error_available\":%s,"
+           "\"values_attempted\":%s,\"sample_scope\":\"first_capture_per_workspace\"",
+           matrix != nullptr ? "true" : "false", matrix != nullptr ? "true" : "false",
+           getters_attempted ? "true" : "false", values_attempted ? "true" : "false",
+           getters_attempted ? "true" : "false", getters_attempted ? "true" : "false",
+           values_attempted ? "true" : "false");
+    append(",\"getters_attempted\":%s,\"size_error\":%d,\"type_error\":%d,"
+           "\"ownership_error\":%d,\"values_error\":%d,\"diagonal_error\":%d,\"nonzero_state_error\":%d,"
+           "\"values_available\":%s,\"missing_diagonal_available\":%s,\"missing_diagonal\":",
+           getters_attempted ? "true" : "false", static_cast<int>(size_error), static_cast<int>(type_error),
+           static_cast<int>(ownership_error), static_cast<int>(values_error), static_cast<int>(diagonal_error),
+           static_cast<int>(state_error), values_available ? "true" : "false",
+           getters_attempted && diagonal_error == PETSC_SUCCESS ? "true" : "false");
+    if (getters_attempted && diagonal_error == PETSC_SUCCESS) {
+        append("%s,\"first_missing_diagonal\":", missing_diagonal == PETSC_TRUE ? "true" : "false");
+        if (missing_diagonal == PETSC_TRUE) {
+            append("%lld", static_cast<long long>(first_missing_diagonal));
+        } else {
+            append("null");
+        }
+    } else {
+        append("null,\"first_missing_diagonal\":null");
+    }
+    append(",\"nonzero_state_available\":%s,\"nonzero_state\":",
+           getters_attempted && state_error == PETSC_SUCCESS ? "true" : "false");
+    if (getters_attempted && state_error == PETSC_SUCCESS) {
+        append("%lld", static_cast<long long>(nonzero_state));
+    } else {
+        append("null");
+    }
+    append(",\"nonzero_state_scope\":\"same_matrix_only\",\"real_byte_count\":%zu,"
+           "\"raw_encoding\":\"native_memory_order_hex\",\"ordering_available\":false,\"ordering\":null,\"entries\":[",
+           sizeof(PetscReal));
+    if (values_available) {
+        for (int index = 0; index < 16; ++index) {
+            const PetscReal real = PetscRealPart(values[index]);
+            const PetscReal imaginary = PetscImaginaryPart(values[index]);
+            char real_hex[2 * sizeof(PetscReal) + 1] = {};
+            char imaginary_hex[2 * sizeof(PetscReal) + 1] = {};
+            unsigned char real_bytes[sizeof(PetscReal)] = {};
+            unsigned char imaginary_bytes[sizeof(PetscReal)] = {};
+            std::memcpy(real_bytes, &real, sizeof(real));
+            std::memcpy(imaginary_bytes, &imaginary, sizeof(imaginary));
+            for (std::size_t byte = 0; byte < sizeof(PetscReal); ++byte) {
+                std::snprintf(real_hex + 2 * byte, 3, "%02x", static_cast<unsigned int>(real_bytes[byte]));
+                std::snprintf(imaginary_hex + 2 * byte, 3, "%02x", static_cast<unsigned int>(imaginary_bytes[byte]));
+            }
+            const bool real_finite = std::isfinite(static_cast<double>(real));
+            const bool imaginary_finite = std::isfinite(static_cast<double>(imaginary));
+            append("%s{\"row\":%d,\"column\":%d,\"diagonal\":%s,\"real_finite\":%s,\"imaginary_finite\":%s,\"real\":",
+                   index == 0 ? "" : ",", index / 4, index % 4, index / 4 == index % 4 ? "true" : "false",
+                   real_finite ? "true" : "false", imaginary_finite ? "true" : "false");
+            if (real_finite) append("%.17g", static_cast<double>(real)); else append("null");
+            append(",\"imaginary\":");
+            if (imaginary_finite) append("%.17g", static_cast<double>(imaginary)); else append("null");
+            append(",\"real_raw_hex\":\"%s\",\"imaginary_raw_hex\":\"%s\"}", real_hex, imaginary_hex);
+        }
+    }
+    append("],\"truncated\":false}");
+    if (overflow) {
+        std::fprintf(stderr, "FULLMAG_FLOQUET_FACTOR_MATRIX_SNAPSHOT {\"phase\":\"%s\",\"status\":\"unavailable\",\"reason\":\"bounded_json_overflow\",\"truncated\":true}\n", phase);
+    } else {
+        std::fprintf(stderr, "FULLMAG_FLOQUET_FACTOR_MATRIX_SNAPSHOT %s\n", json);
+    }
+    std::fflush(stderr);
+    return true;
+}
 void emit_floquet_factor_phase_marker(const char *phase) noexcept
 {
     const char *enabled = std::getenv("FULLMAG_FLOQUET_FACTOR_PHASE_LOG");
@@ -1745,6 +1901,8 @@ struct FloquetCandidateOperatorDiagnosticWorkspace {
     Mat borrowed_pmat_pattern_fixture_copied = nullptr;
     Mat borrowed_pmat_pattern_fixture_reference = nullptr;
     Mat live_pc_owned_pmat_copy = nullptr;
+    bool pmat_before_duplicate_snapshot_emitted = false;
+    bool pmat_before_fresh_setup_snapshot_emitted = false;
     KSP live_pc_owned_pmat_ksp = nullptr;
     Vec live_pc_owned_pmat_solution = nullptr;
 };
@@ -2438,6 +2596,10 @@ PetscErrorCode prepare_candidate_owned_pmat_copy_and_lu(
                 &observation, PETSC_ERR_LIB, "injected_borrowed_pmat_copy_failure");
             break;
         }
+        if (!workspace->pmat_before_duplicate_snapshot_emitted) {
+            workspace->pmat_before_duplicate_snapshot_emitted = emit_floquet_factor_matrix_snapshot(
+                "B_live_pc_pmat_before_duplicate", borrowed_pmat);
+        }
         error = MatDuplicate(
             borrowed_pmat, MAT_COPY_VALUES, &workspace->live_pc_owned_pmat_copy);
         if (error != PETSC_SUCCESS) {
@@ -2618,6 +2780,10 @@ PetscErrorCode prepare_candidate_owned_pmat_copy_and_lu(
                 workspace->live_pc_owned_pmat_ksp, PETSC_FALSE);
         }
         if (error == PETSC_SUCCESS) {
+            if (!workspace->pmat_before_fresh_setup_snapshot_emitted) {
+                workspace->pmat_before_fresh_setup_snapshot_emitted = emit_floquet_factor_matrix_snapshot(
+                    "C_owned_copy_before_fresh_setup", workspace->live_pc_owned_pmat_copy);
+            }
             (void)emit_floquet_factor_phase_marker("fresh_setup_begin");
             error = KSPSetUp(workspace->live_pc_owned_pmat_ksp);
             (void)emit_floquet_factor_phase_marker("fresh_setup_end");
@@ -7780,6 +7946,8 @@ solve_floquet_shared_domain_sparse_modal_spectrum_reusing_context(
     // Configure the ST operator before allocating callback work vectors. This
     // makes the workspaces match the actual shifted system, not its
     // preconditioner approximation.
+    (void)emit_floquet_factor_matrix_snapshot(
+        "A_shifted_pmat_before_live_setup", shifted_preconditioner);
     (void)emit_floquet_factor_phase_marker("live_setup_begin");
     const PetscErrorCode live_setup_error = EPSSetUp(eps);
     (void)emit_floquet_factor_phase_marker("live_setup_end");

@@ -5407,3 +5407,63 @@ base z bounded JSON observations i weryfikuje initial refinement zgodnie
 z istniejącą polityką `solve_poisson_airbox_modal_eigen_cpu_schur`.
 Nominalny seed4 nie jest gwarantowaną wartością wykonania. To korekta
 asercji, bez zmiany operatora, tolerancji, coverage lub independent count.
+
+(c04-factor-matrix-phase-snapshots)=
+<!-- DOC-ANCHOR:c04-factor-matrix-phase-snapshots -->
+
+### C04 — ograniczone snapshoty macierzy wejściowych faktoryzacji
+
+Prywatna diagnostyka FEM CPU/PETSc wymaga jednocześnie
+`FULLMAG_FLOQUET_FACTOR_MATRIX_SNAPSHOT=1` oraz istniejącego opt-in
+`FULLMAG_FLOQUET_DENSE_ORACLE=1` lub
+`FULLMAG_FLOQUET_SCHUR_ACTION_DIAGNOSTIC=1`. Nie jest parametrem Python ani
+ProblemIR. Nie zmienia operatora, tolerancji, opcji faktoryzacji lub decyzji
+acceptance. Dla FDM CPU/GPU i FEM GPU nie stanowi dowodu wykonania ani parytetu.
+
+`emit_floquet_factor_matrix_snapshot` odczytuje publicznymi getterami PETSc
+macierz wejściową $4\times4$: A przed live `EPSSetUp`, B przed pierwszym
+`MatDuplicate` live Pmat, C przed pierwszym fresh `KSPSetUp` owned copy.
+B/C są próbkowane raz na workspace; nie oznaczają automatycznie ostatniego
+callbacku ani LU factor matrix. Funkcja nie otwiera row/array lease i nie
+odpyta graphu po kwarantannie. JSON stderr jest ograniczony do 8192 B,
+przechowuje 16 wartości, real/imaginary raw bytes w natywnej kolejności
+pamięci, finite flags, diagonal flags, structural missing-diagonal,
+typ/wymiary/własność oraz nonzero-state i niezależną dostępność błędów.
+Strukturalne brakowanie diagonali różni się od jej liczbowego zera.
+Nonzero-state wolno porównywać wyłącznie dla tego samego obiektu macierzy.
+Ordering jest jawnie unavailable; nie używamy prywatnych getterów.
+
+Snapshoty nie zawierają object ID, copy-origin ani attempt binding.
+**Pairing A/B/C pozostaje NOT VERIFIED.** Podobne wartości lub kolejność
+markerów nie dowodzą, że A/B to ten sam obiekt, ani że C pochodzi z konkretnego
+B. Nie wyciągamy z nich przyczynowej diagnozy shiftu. Publiczny getter może
+materializować wewnętrzne metadata; sam source-only audit nie dowodzi zerowego
+wpływu obserwatora na runtime.
+
+Hosted `floquet-modal-slepc` włącza tę diagnostykę. Po wykonaniu kontraktu,
+również po failed CTest, `parse_log` z
+`scripts/ci/parse_floquet_factor_matrix_snapshots.py` zapisuje hash-bound
+raport odczytanego logu. Wymaga dla dwóch rzeczywistych fixtures
+`fem_modal_eigen_contract` i `fem_modal_eigen_mixed_dense_contract`
+pomierzonych A/B/C, pełnych 16 pozycji, finite wartości i poprawnych getterów.
+Brak, malformed, unavailable, not-applicable lub obcięcie nie zastępują
+pomiaru. Kompletność pomiaru może dać wyłącznie `measured_unpaired`;
+`pairing_status` oraz `scientific_qualification` pozostają `NOT VERIFIED`.
+Powtórzenia stderr przez CTest bez test-ID nie służą coverage; raport liczy je
+jawnie jako unscoped i nie przypisuje do konkretnej próby. Parser nie zmienia
+wyniku CTest ani natywnego receipt. Kod jest źródłowo
+zintegrowany; nowe native wykonanie oraz porównanie z obserwatorem wyłączonym
+pozostają **NOT VERIFIED**.
+
+C05 jest oddzielną bramką: hard-fault restore ordering i kwarantanna mogą mieć
+PASS bezpieczeństwa, lecz unavailable/null post-fault phi invariance nie są
+dowodem niezmienności produkcyjnych Vec. Snapshoty C04 tej bramki nie zamykają.
+
+| Ścieżka | Symbol | Zakres dowodu |
+|---|---|---|
+| `backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp` | `bool emit_floquet_factor_matrix_snapshot` | Opt-in getter-only A/B/C; native wykonanie pending |
+| `scripts/ci/parse_floquet_factor_matrix_snapshots.py` | `validate_snapshot`, `parse_log` | Odczyt rzeczywistych ograniczonych markerów; brak pomiaru nie PASS |
+| `scripts/ci/run_fem_positive_mass_contract.py` | `_execute_contract` | Włączenie diagnostyki w hosted Floquet profile |
+| `.github/workflows/fem-positive-mass-contract.yml` | `fem-positive-mass-contract` | Krok Record C04 matrix measurements even after failed CTest: raport `always()`, bez zmiany natywnego wyniku |
+
+| `docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md` | `DOC-ANCHOR:c04-factor-matrix-phase-snapshots` | Kontrakt C04, pairing i kwalifikacja pozostają NOT VERIFIED |

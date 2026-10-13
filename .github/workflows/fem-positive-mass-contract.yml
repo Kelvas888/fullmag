@@ -57,6 +57,15 @@ jobs:
         id: contract
         run: python3 scripts/ci/run_fem_positive_mass_contract.py --contract-profile "${{ inputs.contract_profile || 'positive-mass' }}"
 
+      - name: Record C04 matrix measurements even after failed CTest
+        if: always() && steps.contract.outputs.evidence_dir != '' && inputs.contract_profile == 'floquet-modal-slepc'
+        env:
+          C04_EVIDENCE_DIR: ${{ steps.contract.outputs.evidence_dir }}
+        run: |
+          python3 scripts/ci/parse_floquet_factor_matrix_snapshots.py \
+            --log "$C04_EVIDENCE_DIR/native-build-and-ctest.log" \
+            --output "$C04_EVIDENCE_DIR/factor-matrix-snapshots.report.json"
+
       - name: Upload contract receipt and logs
         if: always() && steps.contract.outputs.evidence_dir != ''
         uses: actions/upload-artifact@v7
