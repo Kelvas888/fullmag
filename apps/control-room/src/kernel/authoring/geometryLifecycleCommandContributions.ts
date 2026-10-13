@@ -107,7 +107,8 @@ function sessionRequestOptions(
 }
 
 function sceneBaseRevision(context: CommandContext): number | null {
-  const revision = asRecord(resourceData(context, MODEL_SCENE_PATH))?.revision;
+  const scene = asRecord(resourceData(context, MODEL_SCENE_PATH));
+  const revision = scene?.revision ?? scene?.scene_revision;
   return typeof revision === "number" && Number.isFinite(revision)
     ? revision
     : null;
@@ -1327,7 +1328,7 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
     scope: "workspace",
     isEnabled: (context) => fdmGridBuildDisabledReason(context) === null,
     disabledReason: fdmGridBuildDisabledReason,
-    run: (context) => {
+    run: async (context) => {
       const disabledReason = fdmGridBuildDisabledReason(context);
       if (disabledReason) {
         return { message: disabledReason, status: "failed" };
@@ -1340,9 +1341,18 @@ export const GEOMETRY_LIFECYCLE_COMMANDS: CommandContribution[] = [
           status: "failed",
         };
       }
+      const confirmation = await awaitMeshBuildConfirmation(context, "grid.build-fdm", {
+        ...asRecord(context.input),
+        kind: "fdm_grid_refresh",
+        reason: "explicit_build_grid",
+        scene_revision: sceneRevision,
+      });
+      if (!confirmation.confirmed) {
+        return { status: "cancelled" };
+      }
       return runFdmGridRefreshOperation(context, {
         kind: "fdm_grid_refresh",
-        precondition: { scene_revision: sceneRevision },
+        precondition: confirmation.precondition ?? { scene_revision: sceneRevision },
         reason: "explicit_build_grid",
       });
     },
