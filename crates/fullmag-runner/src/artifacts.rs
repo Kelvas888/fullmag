@@ -1964,6 +1964,320 @@ fn finalize_provenance_files(
     Ok(())
 }
 
+fn frequency_publication_owner(
+    problem: &fullmag_ir::ProblemIR,
+) -> std::io::Result<Option<crate::artifact_generation::PublicationOwner>> {
+    let metadata = &problem.problem_meta.runtime_metadata;
+    let owner_value = |key: &str| {
+        metadata
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+    };
+    match (
+        owner_value("producer_run_id"),
+        owner_value("producer_stage_id"),
+        owner_value("producer_stage_kind"),
+    ) {
+        (Some(run_id), Some(stage_id), Some(stage_kind)) => {
+            Ok(Some(crate::artifact_generation::PublicationOwner {
+                run_id: run_id.into(),
+                stage_id: stage_id.into(),
+                stage_kind: stage_kind.into(),
+            }))
+        }
+        (None, None, None)
+            if [
+                "producer_run_id",
+                "producer_stage_id",
+                "producer_stage_kind",
+            ]
+            .iter()
+            .all(|key| !metadata.contains_key(*key)) =>
+        {
+            Ok(None)
+        }
+        _ => Err(Error::new(
+            ErrorKind::InvalidData,
+            "incomplete frequency-domain publication owner",
+        )),
+    }
+}
+
+fn validate_immutable_generation_references(
+    member_bytes: &[(String, Vec<u8>)],
+) -> std::io::Result<()> {
+    let member_paths = member_bytes
+        .iter()
+        .map(|(path, _)| path.as_str())
+        .collect::<BTreeSet<_>>();
+    let member_payload = |relative: &str| {
+        member_bytes
+            .iter()
+            .find(|(path, _)| path == relative)
+            .map(|(_, bytes)| bytes.as_slice())
+    };
+    let require_member = |relative: &str, context: &str| -> std::io::Result<()> {
+        if relative.trim().is_empty() || !member_paths.contains(relative) {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("{context} references missing immutable generation member '{relative}'"),
+            ));
+        }
+        Ok(())
+    };
+    let require_safe_store_path = |relative: &str, context: &str| -> std::io::Result<()> {
+        if relative.trim().is_empty()
+            || relative.starts_with('/')
+            || relative.contains('\\')
+            || relative
+                .split('/')
+                .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("{context} is not a canonical relative store path: '{relative}'"),
+            ));
+        }
+        Ok(())
+    };
+
+    let metadata_bytes = member_payload("metadata.json").ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidData,
+            "immutable FEM eigen publication is missing metadata.json",
+        )
+    })?;
+    let metadata: serde_json::Value = serde_json::from_slice(metadata_bytes).map_err(|error| {
+        Error::new(
+            ErrorKind::InvalidData,
+            format!("immutable FEM eigen metadata is invalid JSON: {error}"),
+        )
+    })?;
+    let assets = metadata
+        .get("material_field_assets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "immutable FEM eigen metadata is missing material_field_assets",
+            )
+        })?;
+    for (index, asset) in assets.iter().enumerate() {
+        let asset = asset.as_object().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("metadata.material_field_assets[{index}] must be an object"),
+            )
+        })?;
+        match asset.get("artifact_path") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(relative)) => {
+                require_member(relative, &format!("metadata.material_field_assets[{index}]"))?;
+            }
+            Some(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    format!(
+                        "metadata.material_field_assets[{index}].artifact_path must be a path or null"
+                    ),
+                ));
+            }
+        }
+    }
+
+    if let Some(manifest_bytes) = member_payload("frequency_domain/manifest.v1.json") {
+        let manifest: serde_json::Value =
+            serde_json::from_slice(manifest_bytes).map_err(|error| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("immutable frequency-domain manifest is invalid JSON: {error}"),
+                )
+            })?;
+        let artifacts = manifest
+            .get("artifacts")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "immutable frequency-domain manifest is missing artifacts object",
+                )
+            })?;
+        let zarr_store_path = match artifacts.get("mode_field_zarr_store_path") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(relative)) => {
+                require_safe_store_path(relative, "manifest.artifacts.mode_field_zarr_store_path")?;
+                Some(relative.as_str())
+            }
+            Some(_) => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "manifest.artifacts.mode_field_zarr_store_path must be a directory path or null",
+                ));
+            }
+        };
+        for (name, value) in artifacts {
+            if name == "mode_field_zarr_store_path" {
+                // This field identifies a Zarr directory, not a single member.
+                // Its concrete closure is checked below against the supplied bytes.
+                continue;
+            }
+            if name.ends_with("_path") {
+                match value {
+                    serde_json::Value::Null => {}
+                    serde_json::Value::String(relative) => {
+                        require_member(relative, &format!("manifest.artifacts.{name}"))?;
+                    }
+                    _ => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("manifest.artifacts.{name} must be a path or null"),
+                        ));
+                    }
+                }
+            } else if name.ends_with("_paths") {
+                match value {
+                    serde_json::Value::Null => {}
+                    serde_json::Value::Array(paths) => {
+                        for (index, path) in paths.iter().enumerate() {
+                            let relative = path.as_str().ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::InvalidData,
+                                    format!("manifest.artifacts.{name}[{index}] must be a path"),
+                                )
+                            })?;
+                            require_member(
+                                relative,
+                                &format!("manifest.artifacts.{name}[{index}]"),
+                            )?;
+                        }
+                    }
+                    _ => {
+                        return Err(Error::new(
+                            ErrorKind::InvalidData,
+                            format!("manifest.artifacts.{name} must be a path list or null"),
+                        ));
+                    }
+                }
+            }
+        }
+
+        if let Some(store_path) = zarr_store_path {
+            for suffix in [".zgroup", ".zattrs"] {
+                let relative = format!("{store_path}/{suffix}");
+                require_member(
+                    &relative,
+                    "manifest.artifacts.mode_field_zarr_store_path",
+                )?;
+            }
+            let mode_metadata_paths = artifacts
+                .get("mode_metadata_paths")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        "Zarr mode-field store requires manifest.artifacts.mode_metadata_paths",
+                    )
+                })?;
+            let store_prefix = format!("{store_path}/");
+            for (index, mode_path) in mode_metadata_paths.iter().enumerate() {
+                let mode_path = mode_path.as_str().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("manifest.artifacts.mode_metadata_paths[{index}] must be a path"),
+                    )
+                })?;
+                let mode_bytes = member_payload(mode_path).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("mode metadata member '{mode_path}' disappeared from generation"),
+                    )
+                })?;
+                let mode: serde_json::Value = serde_json::from_slice(mode_bytes).map_err(|error| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("immutable mode metadata '{mode_path}' is invalid JSON: {error}"),
+                    )
+                })?;
+                if mode.get("storage_format").and_then(serde_json::Value::as_str) != Some("zarr")
+                    || mode.get("zarr_store_path").and_then(serde_json::Value::as_str)
+                        != Some(store_path)
+                {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("mode metadata '{mode_path}' does not bind to the manifest Zarr store"),
+                    ));
+                }
+                let array_path = mode
+                    .get("zarr_array_path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::InvalidData,
+                            format!("mode metadata '{mode_path}' is missing zarr_array_path"),
+                        )
+                    })?;
+                let array_relative = array_path.strip_prefix(&store_prefix).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidData,
+                        format!("mode metadata '{mode_path}' array path is outside its Zarr store"),
+                    )
+                })?;
+                let array_components = array_relative.split('/').collect::<Vec<_>>();
+                if array_components.is_empty()
+                    || array_components
+                        .iter()
+                        .any(|component| component.is_empty() || matches!(*component, "." | "..") || component.contains('\\'))
+                {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("mode metadata '{mode_path}' has a non-canonical Zarr array path"),
+                    ));
+                }
+                let mut group_path = store_path.to_string();
+                for component in array_components.iter().take(array_components.len() - 1) {
+                    group_path.push('/');
+                    group_path.push_str(component);
+                    require_member(
+                        &format!("{group_path}/.zgroup"),
+                        &format!("mode metadata '{mode_path}' Zarr group"),
+                    )?;
+                }
+                for suffix in [".zarray", ".zattrs"] {
+                    let relative = format!("{array_path}/{suffix}");
+                    require_member(&relative, &format!("mode metadata '{mode_path}'"))?;
+                }
+                let chunk_path = mode
+                    .get("zarr_chunk_path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::InvalidData,
+                            format!("mode metadata '{mode_path}' is missing zarr_chunk_path"),
+                        )
+                    })?;
+                if !chunk_path.starts_with(&format!("{array_path}/")) {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        format!("mode metadata '{mode_path}' chunk path is outside its Zarr array"),
+                    ));
+                }
+                require_member(chunk_path, &format!("mode metadata '{mode_path}'"))?;
+                let compatibility_path = mode
+                    .get("compatibility_binary_payload_path")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::InvalidData,
+                            format!("mode metadata '{mode_path}' is missing compatibility_binary_payload_path"),
+                        )
+                    })?;
+                require_member(compatibility_path, &format!("mode metadata '{mode_path}'"))?;
+            }
+        }
+    }
+    Ok(())
+}
 pub(crate) fn write_artifacts(
     output_dir: &Path,
     problem: &fullmag_ir::ProblemIR,
@@ -1973,12 +2287,27 @@ pub(crate) fn write_artifacts(
 ) -> std::io::Result<()> {
     // Serialize final writes before any member is changed. No stale lease is
     // automatically removed: recovery requires checking its active owner.
-    let _frequency_publication_lease = if executed.auxiliary_artifacts.iter().any(|artifact| {
+    let has_frequency_generation_artifacts = executed.auxiliary_artifacts.iter().any(|artifact| {
         artifact.relative_path.starts_with("eigen/") || artifact.relative_path.starts_with("response/")
-    }) {
-        // Do not mutate legacy root bytes if a v2 current selector would keep
-        // readers pinned to a different immutable publication.
-        crate::artifact_generation::ensure_legacy_publication_allowed(output_dir)?;
+    });
+    let immutable_fem_eigen_publication = matches!(
+        &plan.backend_plan,
+        BackendPlanIR::FemEigen(_)
+    ) && executed
+        .auxiliary_artifacts
+        .iter()
+        .any(|artifact| artifact.relative_path.starts_with("eigen/"));
+    let immutable_producer = if immutable_fem_eigen_publication {
+        frequency_publication_owner(problem)?
+    } else {
+        None
+    };
+    let frequency_publication_lease = if has_frequency_generation_artifacts {
+        if !immutable_fem_eigen_publication {
+            // Other artifact producers remain on the mutable v1 path. Do not
+            // let them shadow a v2 selector.
+            crate::artifact_generation::ensure_legacy_publication_allowed(output_dir)?;
+        }
         Some(crate::artifact_generation::PublicationLease::acquire(output_dir)?)
     } else {
         None
@@ -2013,7 +2342,15 @@ pub(crate) fn write_artifacts(
         .unwrap_or(serde_json::Value::Null);
     let mesh_metadata = mesh_runtime_metadata(plan);
     let region_realization_revisions = region_realization_revisions_metadata(problem);
-    let material_field_assets = write_material_field_artifacts(output_dir, plan)?;
+    let prepared_immutable_material_artifacts = if immutable_fem_eigen_publication {
+        Some(build_material_field_artifacts(plan)?)
+    } else {
+        None
+    };
+    let material_field_assets = match prepared_immutable_material_artifacts.as_ref() {
+        Some(prepared) => prepared.metadata_assets.clone(),
+        None => write_material_field_artifacts(output_dir, plan)?,
+    };
     validate_execution_provenance_for_artifacts(plan, &execution_provenance)?;
     let execution_resolution =
         final_execution_resolution_provenance(problem, plan, &execution_provenance)?;
@@ -2081,9 +2418,11 @@ pub(crate) fn write_artifacts(
     };
     let metadata_path = output_dir.join("metadata.json");
     let metadata_bytes = serialize_run_metadata(&metadata)?;
-    let mut metadata_file = BufWriter::new(fs::File::create(&metadata_path)?);
-    metadata_file.write_all(&metadata_bytes)?;
-    metadata_file.flush()?;
+    if !immutable_fem_eigen_publication {
+        let mut metadata_file = BufWriter::new(fs::File::create(&metadata_path)?);
+        metadata_file.write_all(&metadata_bytes)?;
+        metadata_file.flush()?;
+    }
 
     if let Some(spin_torque) = spin_torque_provenance {
         let path = output_dir.join("physics/spin_torque_provenance.v1.json");
@@ -2226,18 +2565,36 @@ pub(crate) fn write_artifacts(
     if let Some(artifact) = physics_graph_artifact {
         auxiliary_artifacts.push(artifact);
     }
-    for artifact in &auxiliary_artifacts {
-        let artifact_path = output_dir.join(&artifact.relative_path);
-        if let Some(parent) = artifact_path.parent() {
-            fs::create_dir_all(parent)?;
+    if !immutable_fem_eigen_publication {
+        for artifact in &auxiliary_artifacts {
+            let artifact_path = output_dir.join(&artifact.relative_path);
+            if let Some(parent) = artifact_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(artifact_path, &artifact.bytes)?;
         }
-        fs::write(artifact_path, &artifact.bytes)?;
     }
 
-    if should_write_plan_periodic_pairs_artifact(plan, executed) {
-        write_periodic_pairs_artifact(output_dir, plan, problem_source_scene_revision(problem))?;
-    }
-    write_fem_supercell_node_geometry_artifact(output_dir, problem, plan)?;
+    let periodic_pairs_artifact = if should_write_plan_periodic_pairs_artifact(plan, executed) {
+        if immutable_fem_eigen_publication {
+            build_periodic_pairs_artifact(plan, problem_source_scene_revision(problem))?
+        } else {
+            write_periodic_pairs_artifact(
+                output_dir,
+                plan,
+                problem_source_scene_revision(problem),
+            )?;
+            None
+        }
+    } else {
+        None
+    };
+    let node_geometry_artifact = if immutable_fem_eigen_publication {
+        build_fem_supercell_node_geometry_artifact(problem, plan)?
+    } else {
+        write_fem_supercell_node_geometry_artifact(output_dir, problem, plan)?;
+        None
+    };
     write_static_pbc_demag_seam_diagnostics_artifact(
         output_dir,
         problem,
@@ -2254,13 +2611,48 @@ pub(crate) fn write_artifacts(
         &execution_provenance,
     )?;
 
-    if auxiliary_artifacts.iter().any(|artifact| {
+    if immutable_fem_eigen_publication {
+        let lease = frequency_publication_lease.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                "immutable FEM eigen publication is missing its writer lease",
+            )
+        })?;
+        let mut member_bytes = auxiliary_artifacts
+            .into_iter()
+            .map(|artifact| (artifact.relative_path, artifact.bytes))
+            .collect::<Vec<_>>();
+        member_bytes.push(("metadata.json".to_string(), metadata_bytes));
+        if let Some(prepared) = prepared_immutable_material_artifacts {
+            member_bytes.extend(
+                prepared
+                    .files
+                    .into_iter()
+                    .map(|artifact| (artifact.relative_path, artifact.bytes)),
+            );
+        }
+        if let Some(artifact) = periodic_pairs_artifact {
+            member_bytes.push((artifact.relative_path, artifact.bytes));
+        }
+        if let Some(artifact) = node_geometry_artifact {
+            member_bytes.push((artifact.relative_path, artifact.bytes));
+        }
+        validate_immutable_generation_references(&member_bytes)?;
+        crate::artifact_generation::publish_immutable_with_lease(
+            output_dir,
+            immutable_producer,
+            member_bytes,
+            lease,
+        )?;
+    } else if auxiliary_artifacts.iter().any(|artifact| {
         artifact.relative_path.starts_with("eigen/")
             || artifact.relative_path.starts_with("response/")
     }) {
-        let mut members = auxiliary_artifacts.iter()
+        let members = auxiliary_artifacts
+            .iter()
             .map(|artifact| artifact.relative_path.clone())
-            .collect::<std::collections::BTreeSet<_>>();
+            .collect::<BTreeSet<_>>();
+        let mut members = members;
         members.insert("metadata.json".to_string());
         if should_write_plan_periodic_pairs_artifact(plan, executed) {
             members.insert("mesh/periodic_pairs.v1.json".to_string());
@@ -2272,25 +2664,11 @@ pub(crate) fn write_artifacts(
         {
             members.insert("mesh/node_geometry.v1.json".to_string());
         }
-        let metadata = &problem.problem_meta.runtime_metadata;
-        let owner_value = |key: &str| metadata.get(key)
-            .and_then(serde_json::Value::as_str)
-            .filter(|value| !value.trim().is_empty());
-        let producer = match (
-            owner_value("producer_run_id"),
-            owner_value("producer_stage_id"),
-            owner_value("producer_stage_kind"),
-        ) {
-            (Some(run_id), Some(stage_id), Some(stage_kind)) => Some(
-                crate::artifact_generation::PublicationOwner {
-                    run_id: run_id.into(), stage_id: stage_id.into(), stage_kind: stage_kind.into(),
-                }),
-            (None, None, None) if ["producer_run_id", "producer_stage_id", "producer_stage_kind"]
-                .iter().all(|key| !metadata.contains_key(*key)) => None,
-            _ => return Err(Error::new(ErrorKind::InvalidData,
-                "incomplete frequency-domain publication owner")),
-        };
-        crate::artifact_generation::publish(output_dir, producer, members)?;
+        crate::artifact_generation::publish(
+            output_dir,
+            frequency_publication_owner(problem)?,
+            members,
+        )?;
     }
 
     Ok(())
@@ -2513,6 +2891,7 @@ fn build_material_field_artifacts(
 ) -> std::io::Result<PreparedMaterialFieldArtifacts> {
     match &plan.backend_plan {
         BackendPlanIR::Fem(fem) => build_fem_material_field_artifacts(plan, fem),
+        BackendPlanIR::FemEigen(fem) => build_fem_eigen_material_field_artifacts(plan, fem),
         BackendPlanIR::FdmMultilayer(multilayer) => {
             build_fdm_multilayer_material_field_artifacts(multilayer)
         }
@@ -2551,9 +2930,38 @@ fn build_fem_material_field_artifacts(
     plan: &fullmag_ir::ExecutionPlanIR,
     fem: &fullmag_ir::FemPlanIR,
 ) -> std::io::Result<PreparedMaterialFieldArtifacts> {
+    build_fem_material_field_artifacts_with_values(
+        plan,
+        &fem.mesh_name,
+        &fem.mesh,
+        |field_plan| fem_material_field_values(fem, field_plan),
+    )
+}
+
+fn build_fem_eigen_material_field_artifacts(
+    plan: &fullmag_ir::ExecutionPlanIR,
+    fem: &fullmag_ir::FemEigenPlanIR,
+) -> std::io::Result<PreparedMaterialFieldArtifacts> {
+    build_fem_material_field_artifacts_with_values(
+        plan,
+        &fem.mesh_name,
+        &fem.mesh,
+        |field_plan| fem_eigen_material_field_values(fem, field_plan),
+    )
+}
+
+fn build_fem_material_field_artifacts_with_values<'values>(
+    plan: &fullmag_ir::ExecutionPlanIR,
+    mesh_name: &str,
+    mesh: &fullmag_ir::MeshIR,
+    mut values_for: impl FnMut(
+        &fullmag_ir::MaterialFieldPlan,
+    ) -> Option<(&'values [f64], fullmag_ir::MaterialFieldLocationIR)>,
+) -> std::io::Result<PreparedMaterialFieldArtifacts> {
     let mut prepared = PreparedMaterialFieldArtifacts::default();
+    let mesh_generation_id = solver_mesh_signature(mesh);
     for field_plan in &plan.common.material_field_plans {
-        let Some((values, location)) = fem_material_field_values(fem, field_plan) else {
+        let Some((values, location)) = values_for(field_plan) else {
             continue;
         };
         if values.is_empty() {
@@ -2573,8 +2981,8 @@ fn build_fem_material_field_artifacts(
             parameter: field_plan.parameter,
             owner_object_id: field_plan.object_id.clone(),
             source_region_id: None,
-            mesh_id: fem.mesh_name.clone(),
-            mesh_generation_id: solver_mesh_signature(&fem.mesh),
+            mesh_id: mesh_name.to_string(),
+            mesh_generation_id: mesh_generation_id.clone(),
             location,
             component_count: 1,
             unit: material_field_unit(field_plan.parameter).to_string(),
@@ -3253,6 +3661,21 @@ fn fem_material_field_values<'a>(
             .a_element_field
             .as_deref()
             .map(|values| (values, Element)),
+        _ => None,
+    }
+}
+
+fn fem_eigen_material_field_values<'a>(
+    fem: &'a fullmag_ir::FemEigenPlanIR,
+    field_plan: &fullmag_ir::MaterialFieldPlan,
+) -> Option<(&'a [f64], fullmag_ir::MaterialFieldLocationIR)> {
+    use fullmag_ir::MaterialFieldLocationIR::Node;
+    use fullmag_ir::MaterialParameterNameIR::{Aex, Alpha, Ms};
+
+    match (field_plan.parameter, field_plan.realization_location) {
+        (Ms, Node) => fem.material.ms_field.as_deref().map(|values| (values, Node)),
+        (Aex, Node) => fem.material.a_field.as_deref().map(|values| (values, Node)),
+        (Alpha, Node) => fem.material.alpha_field.as_deref().map(|values| (values, Node)),
         _ => None,
     }
 }
@@ -7281,6 +7704,518 @@ mod tests {
             auxiliary_artifacts: Vec::new(),
             provenance,
         }
+    }
+
+    fn test_fem_eigen_execution_plan() -> ExecutionPlanIR {
+        ExecutionPlanIR {
+            common: CommonPlanMeta {
+                ir_version: "v0".to_string(),
+                requested_backend: fullmag_ir::BackendTarget::Fem,
+                resolved_backend: fullmag_ir::BackendTarget::Fem,
+                execution_mode: ExecutionMode::Strict,
+                material_field_plans: vec![MaterialFieldPlan {
+                    object_id: "free".to_string(),
+                    parameter: MaterialParameterNameIR::Ms,
+                    source_kind: MaterialFieldSourceKind::Override,
+                    realization_location: MaterialFieldLocationIR::Node,
+                    requires_sampling: false,
+                    requires_mesh_revision: false,
+                    warnings: Vec::new(),
+                    realization_method: Some("immutable_generation_fixture".to_string()),
+                    statistics: None,
+                }],
+            },
+            backend_plan: BackendPlanIR::FemEigen(fullmag_ir::FemEigenPlanIR {
+                mesh_name: "unit_tet".to_string(),
+                mesh_source: Some("meshes/unit_tet.msh".to_string()),
+                mesh: MeshIR {
+                    mesh_name: "unit_tet".to_string(),
+                    nodes: vec![
+                        [0.0, 0.0, 0.0],
+                        [1.0, 0.0, 0.0],
+                        [0.0, 1.0, 0.0],
+                        [0.0, 0.0, 1.0],
+                    ],
+                    cells: fullmag_ir::FemConnectivityIR::from_tet4(vec![[0, 1, 2, 3]]),
+                    element_markers: vec![1],
+                    facets: fullmag_ir::FemFacetConnectivityIR::from_tri3(vec![[0, 1, 2]]),
+                    boundary_markers: vec![1],
+                    periodic_boundary_pairs: Vec::new(),
+                    periodic_node_pairs: Vec::new(),
+                    per_domain_quality: HashMap::new(),
+                },
+                object_segments: vec![FemObjectSegmentIR {
+                    object_id: "free".to_string(),
+                    geometry_id: Some("pillar".to_string()),
+                    node_start: 0,
+                    node_count: 4,
+                    element_start: 0,
+                    element_count: 1,
+                    boundary_face_start: 0,
+                    boundary_face_count: 1,
+                }],
+                mesh_parts: Vec::new(),
+                mesh_build_report: None,
+                domain_mesh_mode: FemDomainMeshModeIR::MergedMagneticMesh,
+                domain_frame: None,
+                fe_order: 1,
+                hmax: 0.4,
+                equilibrium_magnetization: vec![[1.0, 0.0, 0.0]; 4],
+                material: MaterialIR {
+                    name: "Py".to_string(),
+                    saturation_magnetisation: 800e3,
+                    exchange_stiffness: 13e-12,
+                    damping: 0.02,
+                    uniaxial_anisotropy: None,
+                    anisotropy_axis: None,
+                    uniaxial_anisotropy_k2: None,
+                    cubic_anisotropy_kc1: None,
+                    cubic_anisotropy_kc2: None,
+                    cubic_anisotropy_kc3: None,
+                    cubic_anisotropy_axis1: None,
+                    cubic_anisotropy_axis2: None,
+                    ms_field: Some(vec![800e3; 4]),
+                    a_field: None,
+                    alpha_field: None,
+                    ku_field: None,
+                    ku2_field: None,
+                    kc1_field: None,
+                    kc2_field: None,
+                    kc3_field: None,
+                    interfacial_dmi: None,
+                    bulk_dmi: None,
+                    dind_field: None,
+                    dbulk_field: None,
+                },
+                operator: fullmag_ir::EigenOperatorConfigIR {
+                    kind: fullmag_ir::EigenOperatorIR::LinearizedLlg,
+                    include_demag: false,
+                },
+                count: 2,
+                target: fullmag_ir::EigenTargetIR::FrequencyWindow {
+                    frequency_min_hz: 1.0e8,
+                    frequency_max_hz: 5.0e9,
+                },
+                equilibrium: fullmag_ir::EquilibriumSourceIR::RelaxedInitialState,
+                k_sampling: Some(fullmag_ir::KSamplingIR::Single {
+                    k_vector: [0.0, 0.0, 0.0],
+                }),
+                bias_field_samples: Vec::new(),
+                normalization: fullmag_ir::EigenNormalizationIR::UnitL2,
+                damping_policy: fullmag_ir::EigenDampingPolicyIR::Include,
+                enable_exchange: true,
+                enable_demag: false,
+                interfacial_dmi: None,
+                dmi_interface_normal: None,
+                bulk_dmi: None,
+                external_field: None,
+                gyromagnetic_ratio: 2.211e5,
+                precision: ExecutionPrecision::Double,
+                exchange_bc: ExchangeBoundaryCondition::Neumann,
+                spin_wave_bc: fullmag_ir::SpinWaveBoundaryConditionIR::default(),
+                demag_realization: None,
+                air_box_config: None,
+                mode_tracking: None,
+                dispersion_validation: None,
+                k0_kittel_validation: None,
+                solver_policy: None,
+            }),
+            output_plan: OutputPlanIR {
+                outputs: Vec::new(),
+            },
+            provenance: ProvenancePlanIR {
+                notes: Vec::new(),
+                integrator_resolution: None,
+                fem_eigen_execution_resolution: None,
+                physics_graph: None,
+            },
+        }
+    }
+
+    fn test_fem_eigen_generation_artifacts(spectrum: &[u8]) -> Vec<crate::types::AuxiliaryArtifact> {
+        let store = "eigen/mode_fields.zarr";
+        let array = "eigen/mode_fields.zarr/sample_0000/mode_0000/vector_xyz_complex";
+        let chunk = format!("{array}/0.0.0");
+        let compatibility = "eigen/mode_fields/sample_0000/mode_0000/vector.bin";
+        let mode_metadata_path = "eigen/modes/sample_0000/mode_0000.json";
+        let manifest = serde_json::json!({
+            "schema_version": "frequency_domain_manifest.v1",
+            "artifacts": {
+                "solver_diagnostics_path": "eigen/diagnostics/solver.v1.json",
+                "spectrum_v2_path": "eigen/spectrum.v2.json",
+                "mode_field_zarr_store_path": store,
+                "mode_metadata_paths": [mode_metadata_path],
+            }
+        });
+        let mode_metadata = serde_json::json!({
+            "storage_format": "zarr",
+            "zarr_store_path": store,
+            "zarr_array_path": array,
+            "zarr_chunk_path": chunk,
+            "compatibility_binary_payload_path": compatibility,
+        });
+        vec![
+            crate::types::AuxiliaryArtifact {
+                relative_path: "eigen/spectrum.json".to_string(),
+                bytes: spectrum.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: "eigen/spectrum.v2.json".to_string(),
+                bytes: spectrum.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: "eigen/diagnostics/solver.v1.json".to_string(),
+                bytes: br#"{"status":"ready"}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: mode_metadata_path.to_string(),
+                bytes: serde_json::to_vec(&mode_metadata).unwrap(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: format!("{store}/.zgroup"),
+                bytes: br#"{"zarr_format":2}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: format!("{store}/.zattrs"),
+                bytes: br#"{}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: format!("{store}/sample_0000/.zgroup"),
+                bytes: br#"{"zarr_format":2}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: format!("{store}/sample_0000/mode_0000/.zgroup"),
+                bytes: br#"{"zarr_format":2}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: format!("{array}/.zarray"),
+                bytes: br#"{"zarr_format":2}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: format!("{array}/.zattrs"),
+                bytes: br#"{}"#.to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: chunk,
+                bytes: b"mode data chunk".to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: compatibility.to_string(),
+                bytes: b"compatibility mode payload".to_vec(),
+            },
+            crate::types::AuxiliaryArtifact {
+                relative_path: "frequency_domain/manifest.v1.json".to_string(),
+                bytes: serde_json::to_vec_pretty(&manifest).unwrap(),
+            },
+        ]
+    }
+    fn assert_immutable_fem_eigen_references_resolve(
+        output_dir: &Path,
+        capture: &crate::artifact_generation::GenerationCapture,
+    ) {
+        assert!(capture.is_immutable());
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &capture.read_member(output_dir, "metadata.json").unwrap(),
+        )
+        .unwrap();
+        let material_assets = metadata["material_field_assets"]
+            .as_array()
+            .expect("metadata carries material field references");
+        assert_eq!(material_assets.len(), 1);
+        for asset in material_assets {
+            let relative = asset["artifact_path"]
+                .as_str()
+                .expect("material asset has a path");
+            assert!(capture.commit.content.members.contains_key(relative));
+            let _: serde_json::Value =
+                serde_json::from_slice(&capture.read_member(output_dir, relative).unwrap())
+                    .expect("material field member resolves and parses");
+        }
+
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &capture
+                .read_member(output_dir, "frequency_domain/manifest.v1.json")
+                .unwrap(),
+        )
+        .unwrap();
+        let artifacts = manifest["artifacts"]
+            .as_object()
+            .expect("manifest artifacts are an object");
+        for (name, value) in artifacts {
+            if name == "mode_field_zarr_store_path" {
+                if let Some(store) = value.as_str() {
+                    for suffix in [".zgroup", ".zattrs"] {
+                        capture
+                            .read_member(output_dir, &format!("{store}/{suffix}"))
+                            .expect("Zarr directory resolves to its root metadata members");
+                    }
+                }
+            } else if name.ends_with("_path") {
+                if let Some(relative) = value.as_str() {
+                    assert!(capture.commit.content.members.contains_key(relative));
+                    capture.read_member(output_dir, relative).unwrap();
+                }
+            } else if name.ends_with("_paths") {
+                if let Some(paths) = value.as_array() {
+                    for relative in paths.iter().filter_map(serde_json::Value::as_str) {
+                        assert!(capture.commit.content.members.contains_key(relative));
+                        capture.read_member(output_dir, relative).unwrap();
+                        if name == "mode_metadata_paths" {
+                            let mode: serde_json::Value = serde_json::from_slice(
+                                &capture.read_member(output_dir, relative).unwrap(),
+                            )
+                            .unwrap();
+                            if let Some(array_path) = mode
+                                .get("zarr_array_path")
+                                .and_then(serde_json::Value::as_str)
+                            {
+                                let store = mode["zarr_store_path"].as_str().unwrap();
+                                let relative = array_path
+                                    .strip_prefix(&format!("{store}/"))
+                                    .expect("mode array path is inside its store");
+                                let components = relative.split('/').collect::<Vec<_>>();
+                                let mut group = store.to_string();
+                                for component in components.iter().take(components.len() - 1) {
+                                    group.push('/');
+                                    group.push_str(component);
+                                    capture
+                                        .read_member(output_dir, &format!("{group}/.zgroup"))
+                                        .expect("Zarr parent group resolves");
+                                }
+                                for suffix in [".zarray", ".zattrs"] {
+                                    capture
+                                        .read_member(output_dir, &format!("{array_path}/{suffix}"))
+                                        .expect("mode array descriptors resolve");
+                                }
+                            }
+                            for field in ["zarr_chunk_path", "compatibility_binary_payload_path"] {
+                                if let Some(path) = mode.get(field).and_then(serde_json::Value::as_str) {
+                                    capture
+                                        .read_member(output_dir, path)
+                                        .expect("mode payload references resolve");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn fem_eigen_writer_publishes_two_immutable_generations_and_preserves_legacy_root() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let output_dir = std::env::temp_dir().join(format!(
+            "fullmag-fem-eigen-v2-writer-{}-{suffix}",
+            std::process::id()
+        ));
+        let sentinels = [
+            ("metadata.json", b"legacy metadata sentinel".as_slice()),
+            (
+                "material-fields/free_ms_node.json",
+                b"legacy material sentinel".as_slice(),
+            ),
+            ("eigen/spectrum.json", b"legacy eigen sentinel".as_slice()),
+            (
+                "frequency_domain/manifest.v1.json",
+                b"legacy frequency manifest sentinel".as_slice(),
+            ),
+        ];
+        for (relative, _) in sentinels {
+            let path = output_dir.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        for (relative, bytes) in sentinels {
+            fs::write(output_dir.join(relative), bytes).unwrap();
+        }
+
+        let mut problem = fem_execution_problem("cpu", ExecutionMode::Strict);
+        for (key, value) in [
+            ("producer_run_id", "writer-run"),
+            ("producer_stage_id", "eigen-stage"),
+            ("producer_stage_kind", "eigenmodes"),
+        ] {
+            problem
+                .problem_meta
+                .runtime_metadata
+                .insert(key.to_string(), serde_json::json!(value));
+        }
+        let expected_owner = crate::artifact_generation::PublicationOwner {
+            run_id: "writer-run".to_string(),
+            stage_id: "eigen-stage".to_string(),
+            stage_kind: "eigenmodes".to_string(),
+        };
+        let plan = test_fem_eigen_execution_plan();
+        let provenance = ExecutionProvenance {
+            execution_engine: "fem_eigen_cpu_baseline".to_string(),
+            precision: "double".to_string(),
+            ..ExecutionProvenance::default()
+        };
+        let summary = ArtifactPipelineSummary::default();
+        let mut first_run = final_execution_test_run(provenance.clone());
+        first_run.auxiliary_artifacts = test_fem_eigen_generation_artifacts(b"spectrum generation one");
+        write_artifacts(&output_dir, &problem, &plan, &first_run, Some(&summary))
+            .expect("first FEM eigen v2 publication should accept a streamed summary");
+
+        let first_capture = crate::artifact_generation::capture(&output_dir)
+            .unwrap()
+            .expect("first immutable generation should be current");
+        assert_immutable_fem_eigen_references_resolve(&output_dir, &first_capture);
+        assert_eq!(first_capture.commit.content.producer.as_ref(), Some(&expected_owner));
+        let first_generation_id = first_capture.commit.generation_id.clone();
+        let first_member_bytes = first_capture
+            .commit
+            .content
+            .members
+            .keys()
+            .map(|relative| {
+                (
+                    relative.clone(),
+                    first_capture.read_member(&output_dir, relative).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (relative, bytes) in &sentinels {
+            assert_eq!(fs::read(output_dir.join(relative)).unwrap(), bytes.to_vec());
+        }
+
+        let mut second_run = final_execution_test_run(provenance.clone());
+        second_run.auxiliary_artifacts =
+            test_fem_eigen_generation_artifacts(b"spectrum generation two");
+        write_artifacts(&output_dir, &problem, &plan, &second_run, Some(&summary))
+            .expect("second FEM eigen v2 publication should advance the current pointer");
+
+        let second_capture = crate::artifact_generation::capture(&output_dir)
+            .unwrap()
+            .expect("second immutable generation should be current");
+        assert_ne!(second_capture.commit.generation_id, first_generation_id);
+        assert_immutable_fem_eigen_references_resolve(&output_dir, &second_capture);
+        assert_eq!(second_capture.commit.content.producer.as_ref(), Some(&expected_owner));
+        assert_eq!(
+            second_capture.read_member(&output_dir, "eigen/spectrum.json").unwrap(),
+            b"spectrum generation two".to_vec()
+        );
+
+        let first_generation_name = first_generation_id
+            .strip_prefix("sha256:")
+            .expect("generation ID has canonical digest prefix");
+        let first_generation_dir = output_dir
+            .join("frequency_domain/generations")
+            .join(first_generation_name);
+        for (relative, bytes) in &first_member_bytes {
+            assert_eq!(
+                fs::read(first_generation_dir.join(relative)).unwrap(),
+                *bytes,
+                "old immutable member {relative} must remain byte-identical",
+            );
+        }
+
+        for (relative, bytes) in sentinels {
+            assert_eq!(fs::read(output_dir.join(relative)).unwrap(), bytes);
+        }
+
+        let pointer_path = output_dir.join(crate::artifact_generation::IMMUTABLE_COMMIT_PATH);
+        let pointer_before_failure = fs::read(&pointer_path).unwrap();
+
+        let mut invalid_owner_problem = problem.clone();
+        invalid_owner_problem
+            .problem_meta
+            .runtime_metadata
+            .remove("producer_stage_id");
+        let mut invalid_owner_run = final_execution_test_run(provenance.clone());
+        invalid_owner_run.auxiliary_artifacts =
+            test_fem_eigen_generation_artifacts(b"spectrum with invalid owner");
+        let owner_error = write_artifacts(
+            &output_dir,
+            &invalid_owner_problem,
+            &plan,
+            &invalid_owner_run,
+            Some(&summary),
+        )
+        .expect_err("partial producer ownership must fail before publication");
+        assert!(owner_error
+            .to_string()
+            .contains("incomplete frequency-domain publication owner"));
+        assert_eq!(fs::read(&pointer_path).unwrap(), pointer_before_failure);
+        assert_eq!(
+            crate::artifact_generation::capture(&output_dir)
+                .unwrap()
+                .unwrap()
+                .commit,
+            second_capture.commit
+        );
+        for (relative, bytes) in &sentinels {
+            assert_eq!(fs::read(output_dir.join(relative)).unwrap(), bytes.to_vec());
+        }
+
+        let mut failed_run = final_execution_test_run(provenance.clone());
+        failed_run.auxiliary_artifacts =
+            test_fem_eigen_generation_artifacts(b"spectrum rejected generation");
+        failed_run
+            .auxiliary_artifacts
+            .push(crate::types::AuxiliaryArtifact {
+                relative_path: "../outside.json".to_string(),
+                bytes: b"must never be written".to_vec(),
+            });
+        let error = write_artifacts(&output_dir, &problem, &plan, &failed_run, Some(&summary))
+            .expect_err("invalid member closure must fail before changing the current pointer");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(error.to_string().contains("generation member path"));
+        assert_eq!(fs::read(&pointer_path).unwrap(), pointer_before_failure);
+        assert_eq!(
+            crate::artifact_generation::capture(&output_dir)
+                .unwrap()
+                .unwrap()
+                .commit,
+            second_capture.commit
+        );
+        for (relative, bytes) in sentinels {
+            assert_eq!(fs::read(output_dir.join(relative)).unwrap(), bytes);
+        }
+        assert!(!output_dir
+            .join(".frequency-domain-publication.lease")
+            .exists());
+
+        let mut missing_reference_run = final_execution_test_run(provenance);
+        missing_reference_run.auxiliary_artifacts =
+            test_fem_eigen_generation_artifacts(b"spectrum with missing reference");
+        let manifest_artifact = missing_reference_run
+            .auxiliary_artifacts
+            .iter_mut()
+            .find(|artifact| artifact.relative_path == "frequency_domain/manifest.v1.json")
+            .expect("fixture has a frequency-domain manifest");
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_artifact.bytes).unwrap();
+        manifest["artifacts"]["solver_diagnostics_path"] =
+            serde_json::json!("eigen/diagnostics/missing.v1.json");
+        manifest_artifact.bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+        let missing_reference_error = write_artifacts(
+            &output_dir,
+            &problem,
+            &plan,
+            &missing_reference_run,
+            Some(&summary),
+        )
+        .expect_err("a missing manifest member must fail before advancing the generation");
+        assert_eq!(missing_reference_error.kind(), ErrorKind::InvalidData);
+        assert!(missing_reference_error
+            .to_string()
+            .contains("manifest.artifacts.solver_diagnostics_path references missing immutable generation member 'eigen/diagnostics/missing.v1.json'"));
+        assert_eq!(fs::read(&pointer_path).unwrap(), pointer_before_failure);
+        assert_eq!(
+            crate::artifact_generation::capture(&output_dir)
+                .unwrap()
+                .unwrap()
+                .commit,
+            second_capture.commit
+        );
+        for (relative, bytes) in sentinels {
+            assert_eq!(fs::read(output_dir.join(relative)).unwrap(), bytes);
+        }
+
+        fs::remove_dir_all(output_dir).expect("temporary FEM eigen output should be removed");
     }
 
     #[test]

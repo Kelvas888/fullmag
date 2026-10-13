@@ -45,6 +45,13 @@ jobs:
             cargo test --locked -p fullmag-runner --lib "$test_name" -- --nocapture | tee "$RUNNER_TEMP/$test_name.log"
             grep -F "$test_name ... ok" "$RUNNER_TEMP/$test_name.log"
           done
+      - name: Verify immutable FEM eigen producer and legacy protection
+        run: |
+          set -o pipefail
+          for test_name in fem_eigen_writer_publishes_two_immutable_generations_and_preserves_legacy_root write_artifacts_refuses_eigen_auxiliary_when_immutable_generation_marker_exists; do
+            cargo test --locked -p fullmag-runner --lib "$test_name" -- --nocapture | tee "$RUNNER_TEMP/$test_name.log"
+            grep -F "$test_name ... ok" "$RUNNER_TEMP/$test_name.log"
+          done
       - name: Run complete runner contracts
         run: cargo test --locked -p fullmag-runner --lib --no-fail-fast
       - name: Compile integration callers and API CLI binaries

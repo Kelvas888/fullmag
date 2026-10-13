@@ -102,8 +102,16 @@ Read-only core i terminalne attestation zostały zweryfikowane w GitHub Actions
 shared reader 4 testy na każdym systemie, inspector 49 na Ubuntu / 48 na Windows
 oraz Python reader 19 na każdym systemie. Obejmuje to kontrakty v1/v2, zgodność
 bajtów, owner mismatch, brak/uszkodzenie członka i zmianę selektora.
-Writer v2 pozostaje nieaktywny: projekcja pól analysis/results musi przekazywać
-expected_artifact_generation_id wymagany przez binarny endpoint. Te same bajty
-payloadu mogą mieć link bez tego parametru; tożsamość dopisuje read-model z
-captured generation, bez zmiany hash-verified payloadu lub polityki null-owner.
-Runtime i naukowa kwalifikacja pozostają NOT VERIFIED.
+Projekcja pól analysis/results dopisuje expected_artifact_generation_id z
+captured generation, bez mutacji hash-verified payloadu i polityki null-owner.
+API38465944333 na f47299d562da7468cadfa4b848e80af76c762bd5 potwierdza publiczny
+catalog->items->binary odczyt exact values/header oraz stale-link409. UI38462801139
+potwierdza typed query i odmowę niezgodnego response generation.
+
+Bieżący source checkpoint przełącza FemEigen z eigen auxiliary outputs na v2;
+producer tests i pełna runner suite muszą potwierdzić tę zmianę w GitHub Actions.
+Metadata, material files i mode/manifest closure trafiają do generation; legacy
+root aliases pozostają nienaruszone. Owned payloads są przenoszone do publishera
+bez dodatkowego pełnego clone. Legacy pozostałych realizacji pozostaje v1 i
+odrzuca próbę zasłonięcia istniejącego v2. Source activation nie jest dowodem
+wykonania konkretnego managed joba. Runtime, browser i nauka NOT VERIFIED.
