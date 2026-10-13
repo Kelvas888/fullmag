@@ -13,6 +13,7 @@ import {
 import type { ChartDataPresentationState } from "@/shared/analysis-charts/chartPresentationState";
 import type { ChartSeries } from "@/shared/domain/analysis/chartSeries";
 import type {
+  ChartRenderModel,
   ChartResultExportContext,
 } from "@/shared/analysis-charts/chartRenderer";
 import type { ChartExportRequest } from "@/shared/analysis-charts/chartExport";
@@ -40,6 +41,7 @@ interface EChartsSurfaceProps {
   bus?: EventBus<KernelEventMap>;
   chartId?: string;
   dataStatus?: string;
+  dataExportModel?: ChartRenderModel;
   descriptorId?: string;
   displayUnits?: Readonly<Record<string, string>>;
   exportProvenance?: ChartResultExportContext;
@@ -62,6 +64,7 @@ function EChartsSurfaceImpl({
   bus,
   chartId,
   dataStatus,
+  dataExportModel,
   descriptorId,
   displayUnits,
   exportProvenance,
@@ -122,6 +125,7 @@ function EChartsSurfaceImpl({
     <InteractiveChartSurface
       allSeries={allSeries}
       dataStatus={dataStatus}
+      dataExportModel={dataExportModel}
       diagnostics={{
         instanceCreated: (chart) => {
           recordChartInstanceCreated();

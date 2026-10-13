@@ -10,6 +10,9 @@ on:
       - 'apps/control-room/src/shared/analysis-charts/InteractiveChartSurface*'
       - 'apps/control-room/src/shared/analysis-charts/interactiveChartModel.ts'
       - 'apps/control-room/src/modules/analysis-plots/components/EChartsSurface*'
+      - 'apps/control-room/src/modules/analysis-plots/components/AnalysisResultProjectionSurface*'
+      - 'apps/control-room/src/modules/analysis-plots/useAnalysisResultProjectionController*'
+      - 'apps/control-room/src/shared/domain/analysis/results/projectionModels*'
       - 'apps/control-room/src/modules/live-charts/liveChartsPresentation*'
       - 'apps/control-room/src/modules/inspector/panels/FrequencyDomainCharts*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/FrequencyDomainResultInspectors*'
@@ -42,6 +45,9 @@ on:
       - 'apps/control-room/src/shared/analysis-charts/InteractiveChartSurface*'
       - 'apps/control-room/src/shared/analysis-charts/interactiveChartModel.ts'
       - 'apps/control-room/src/modules/analysis-plots/components/EChartsSurface*'
+      - 'apps/control-room/src/modules/analysis-plots/components/AnalysisResultProjectionSurface*'
+      - 'apps/control-room/src/modules/analysis-plots/useAnalysisResultProjectionController*'
+      - 'apps/control-room/src/shared/domain/analysis/results/projectionModels*'
       - 'apps/control-room/src/modules/live-charts/liveChartsPresentation*'
       - 'apps/control-room/src/modules/inspector/panels/FrequencyDomainCharts*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/FrequencyDomainResultInspectors*'
@@ -110,6 +116,9 @@ jobs:
           src/shared/analysis-charts/InteractiveChartSurface.export.test.tsx
           src/modules/analysis-plots/components/EChartsSurface.test.tsx
           src/modules/analysis-plots/components/EChartsSurface.export.test.tsx
+          src/modules/analysis-plots/components/AnalysisResultProjectionSurface.test.tsx
+          src/modules/analysis-plots/useAnalysisResultProjectionController.test.ts
+          src/shared/domain/analysis/results/projectionModels.test.ts
           src/modules/live-charts/liveChartsPresentation.test.ts
           src/modules/inspector/panels/FrequencyDomainCharts.test.tsx
           src/modules/inspector/panels/frequency-domain/FrequencyDomainResultInspectors.selection.test.tsx
