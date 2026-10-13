@@ -73,7 +73,8 @@ import { useLayoutSelector } from "@/kernel/layout/useLayout";
 import { manifestRenderableCarriers } from "@/modules/viewport-3d/public";
 
 import type { InspectorPanelProps } from "../inspectorTypes";
-import { AntennaVisualizationView, isAntennaVisualizationObject } from "./antenna/AntennaVisualizationPanel";
+import { AntennaVisualizationView } from "./antenna/AntennaVisualizationPanel";
+import { isAntennaVisualizationObject } from "./antenna/AntennaVisualizationObjectModel";
 import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 import {
   ScientificInspectorContext,
