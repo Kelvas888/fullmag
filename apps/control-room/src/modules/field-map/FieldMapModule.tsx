@@ -16,6 +16,7 @@ import {
 } from "@/kernel/resources/planarFieldResources";
 import { useDomainMetaResource } from "@/kernel/resources/geometryLifecycleResources";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
+import { useSessionScopedResourceKey } from "@/kernel/resources/useSessionScopedResourceKey";
 import { useSelectionSelector } from "@/kernel/selection/useSelection";
 import { resolveVisualizationTargetFromSelection } from "@/kernel/visualization/ObjectVisualizationController";
 import {
@@ -49,9 +50,11 @@ import {
   type PlanarRenderEvidence,
 } from "./model/fieldMapEvidence";
 import { PlanarSurface } from "./renderer/PlanarSurface";
+import { useRetainedPlanarFrame } from "./hooks/useRetainedPlanarFrame";
 
 function useFieldMapModuleController() {
   const { layout, visualizationSync } = useKernel();
+  const { resourceKey: sessionFrameKey, sessionIdentity } = useSessionScopedResourceKey("planar-render-frame");
   const [pinned, setPinned] = useState<readonly [number, number] | null>(null);
   const [renderEvidence, setRenderEvidence] =
     useState<PlanarRenderEvidence | null>(null);
@@ -244,7 +247,7 @@ function useFieldMapModuleController() {
       },
     });
   }, [visualizationSync]);
-  const renderModel = useMemo(() => {
+  const freshRenderModel = useMemo(() => {
     if (!meta.data || !scalar.data || !frame || !presentationPlanar) return null;
     const scalarValues = decodeFieldVector(scalar.data.data).values;
     const vectorValues = vectors.data
@@ -300,6 +303,48 @@ function useFieldMapModuleController() {
       vectors: vectorValues,
     });
   }, [canonicalPlanar?.resolution.vector_budget, effectiveWireframeStyle, frame, mask.data, meshOverlay.data, meta.data, presentationPlanar, scalar.data, vectors.data]);
+  // LR-10: rewizja próbki jest częścią klucza zasobu, więc każda nowa rewizja
+  // tworzy świeży wpis store bez danych. Bez retencji rodzic renderował wtedy
+  // FieldMapStatus zamiast PlanarSurface, a cleanup zwalniał renderer i worker
+  // oraz czyścił canvas — obraz mapy 2D znikał przy każdym odświeżeniu.
+  // Trzymamy ostatnią zgodną klatkę, ale wyłącznie dla tej samej semantycznej
+  // tożsamości widoku: zmiana monitora, wielkości, komponentu, rozdzielczości,
+  // snapshotu czy etapu odrzuca retencję, zamiast pokazywać cudzy raster.
+  const planarViewIdentityKey = useMemo(
+    () =>
+      JSON.stringify({
+        sessionFrameKey,
+        domainGenerationId: domain.data?.generation_id ?? null,
+        defaultSlice: canonicalPlanar?.default_slice ?? null,
+        vectorBudget: canonicalPlanar?.resolution.vector_budget ?? 0,
+        component: canonicalPlanar?.component ?? null,
+        quality: canonicalPlanar?.quality ?? null,
+        quantityId: canonicalPlanar?.quantity_id ?? null,
+        resolution: [
+          canonicalPlanar?.resolution.width ?? 0,
+          canonicalPlanar?.resolution.height ?? 0,
+        ],
+        snapshotId: selectedFieldContext.snapshotId ?? null,
+        sourceId: canonicalSourceMonitorId ?? null,
+        sourceKind: canonicalSourceKind ?? null,
+        stageId: selectedFieldContext.stageId ?? null,
+        viewScope: canonicalPlanar?.view_scope ?? null,
+      }),
+    [
+      sessionFrameKey,
+      domain.data?.generation_id,
+      canonicalPlanar,
+      canonicalSourceKind,
+      canonicalSourceMonitorId,
+      selectedFieldContext.snapshotId,
+      selectedFieldContext.stageId,
+    ],
+  );
+  const renderModel = useRetainedPlanarFrame(
+    sessionIdentity === null ? null : planarViewIdentityKey,
+    freshRenderModel,
+    meta.data?.source ? JSON.stringify(meta.data.source) : null,
+  );
   const pinnedAxisState = useMemo(() => {
     if (!renderModel || !probe.data) return null;
     const axisFrame = {
@@ -422,7 +467,6 @@ export default function FieldMapModule() {
     canonicalPlanar,
     canonicalSampleError,
     evidence,
-    frame,
     mask,
     meshOverlay,
     meta,
@@ -475,10 +519,10 @@ export default function FieldMapModule() {
       />
     );
   }
-  if (meta.status === "ready" && (!meta.data || !scalar.data)) {
+  if (meta.status === "ready" && (!meta.data || !scalar.data) && !renderModel) {
     return <FieldMapStatus message="No planar field is published for this revision." />;
   }
-  if (!meta.data || !scalar.data || !frame || !renderModel) {
+  if (!renderModel) {
     return <FieldMapStatus message="Loading planar field…" planarStatus="loading" />;
   }
 
@@ -528,7 +572,7 @@ export default function FieldMapModule() {
         <strong>{plan.quantityId}</strong>
         <span>{presentationPlanar.component}</span>
         <span>{renderModel.display.legendUnit}</span>
-        {surfaceProjectionStatus(meta.data) === "ambiguous" ? (
+        {meta.data && surfaceProjectionStatus(meta.data) === "ambiguous" ? (
           <span className="fm-field-map__diagnostic" role="status">
             Ambiguous surface: {meta.data.overlap_count} overlaps,{" "}
             {meta.data.fold_count} folds

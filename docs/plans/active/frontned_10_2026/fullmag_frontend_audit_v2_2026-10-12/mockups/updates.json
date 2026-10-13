@@ -1,0 +1,217 @@
+[
+  {
+    "id": "01_geometry",
+    "release_label": "R1 / STAGED AUTHORING",
+    "annotation": "Pointerup updates draft only. Create / Apply writes once. Rotate, Scale, Pivot, Snap and Import remain gated.",
+    "changes": [
+      {
+        "before": "DESIGN PROPOSAL  ·  DEMO DATA",
+        "after": "V2 PROPOSAL  ·  DEMO DATA"
+      },
+      {
+        "before": "Import…",
+        "after": "Import R2"
+      },
+      {
+        "before": "Rotate",
+        "after": "Rot. R2"
+      },
+      {
+        "before": "Scale",
+        "after": "Scale R2"
+      },
+      {
+        "before": "Pivot",
+        "after": "Pivot R2"
+      },
+      {
+        "before": "Snap",
+        "after": "Off / R2"
+      },
+      {
+        "before": "FULLMAG AUDIT  /  11 OCT 2026",
+        "after": "FULLMAG PLAN V2 / 12 OCT 2026"
+      },
+      {
+        "before": "Workplane: XY   •   Anchor: center   •   Snap: 5 nm",
+        "after": "View grid: XY   •   Anchor: center   •   Snap: OFF"
+      },
+      {
+        "before": "No backend change until Create Object.",
+        "after": "No model write until Create Object."
+      }
+    ],
+    "original_sha256": "412bd82bec299c414c2cd42a430f95ca2b7f1ffbc39bfe515326309f03626c32",
+    "method": "precise text edits and added annotation; original drawing preserved"
+  },
+  {
+    "id": "02_transform",
+    "release_label": "R2-T / PROPOSED, NOT QUALIFIED",
+    "annotation": "Extrinsic XYZ: R = Rz Ry Rx. Canonical pivot-v1 requires migration + lane qualification. No pointerup commit.",
+    "changes": [
+      {
+        "before": "DESIGN PROPOSAL  ·  DEMO DATA",
+        "after": "V2 PROPOSAL  ·  DEMO DATA"
+      },
+      {
+        "before": "FULLMAG AUDIT  /  11 OCT 2026",
+        "after": "FULLMAG PLAN V2 / 12 OCT 2026"
+      },
+      {
+        "before": "Stale / rebuild required",
+        "after": "Assess after Apply"
+      },
+      {
+        "before": "Rotation  /  Euler XYZ",
+        "after": "Rotation / extrinsic XYZ"
+      },
+      {
+        "before": "SNAPPING",
+        "after": "SNAPPING / OFF BY DEFAULT"
+      },
+      {
+        "before": "Move step",
+        "after": "Move step (when on)"
+      },
+      {
+        "before": "Angle step",
+        "after": "Angle step (when on)"
+      },
+      {
+        "before": "Mesh becomes stale after Apply",
+        "after": "Geometry edits require a mesh check"
+      }
+    ],
+    "original_sha256": "90953ca4dedf4293d29c70aa93a6efbc2b05fe915aa9800f1fbb0220678e9456",
+    "method": "precise text edits and added annotation; original drawing preserved"
+  },
+  {
+    "id": "03_import",
+    "release_label": "R2-I / STAGED ASSET",
+    "annotation": "Stage is not a scene object. Unknown checks block volume / occupancy. Source bytes remain versioned in the project.",
+    "changes": [
+      {
+        "before": "DESIGN PROPOSAL  ·  DEMO DATA",
+        "after": "V2 PROPOSAL  ·  DEMO DATA"
+      },
+      {
+        "before": "FULLMAG AUDIT  /  11 OCT 2026",
+        "after": "FULLMAG PLAN V2 / 12 OCT 2026"
+      }
+    ],
+    "original_sha256": "d6d5647ce6336ed0f070d2eb3f89390a04ad21001f1a79ab824c657517fc8323",
+    "method": "precise text edits and added annotation; original drawing preserved"
+  },
+  {
+    "id": "04_mesh_policy",
+    "release_label": "R1 / RECIPE + BUILD SAGA",
+    "annotation": "Apply Policy and Build are separate steps. Build Selected is a selection context for the confirmed FEM shared domain.",
+    "changes": [
+      {
+        "before": "DESIGN PROPOSAL  ·  DEMO DATA",
+        "after": "V2 PROPOSAL  ·  DEMO DATA"
+      },
+      {
+        "before": "Build Mesh",
+        "after": "Build FEM"
+      },
+      {
+        "before": "Build All",
+        "after": "Domain"
+      },
+      {
+        "before": "FULLMAG AUDIT  /  11 OCT 2026",
+        "after": "FULLMAG PLAN V2 / 12 OCT 2026"
+      },
+      {
+        "before": "Applies policy, then confirms the build",
+        "after": "Save policy, then confirm build"
+      }
+    ],
+    "original_sha256": "c2ff27bab228f447d5b6c4cad8db2b2a137e86b23578b4bbe5b3b1e5c91a7735",
+    "method": "precise text edits and added annotation; original drawing preserved"
+  },
+  {
+    "id": "05_rebuild",
+    "release_label": "R1 / GENERATION PUBLICATION",
+    "annotation": "Policy saved + build rejected is a partial outcome. Activate only complete mandatory resources. Retry Loading never rebuilds.",
+    "changes": [
+      {
+        "before": "DESIGN PROPOSAL  ·  DEMO DATA",
+        "after": "V2 PROPOSAL  ·  DEMO DATA"
+      },
+      {
+        "before": "Build Mesh",
+        "after": "Build FEM"
+      },
+      {
+        "before": "Build All",
+        "after": "Domain"
+      },
+      {
+        "before": "FULLMAG AUDIT  /  11 OCT 2026",
+        "after": "FULLMAG PLAN V2 / 12 OCT 2026"
+      },
+      {
+        "before": "Quality",
+        "after": "Checks"
+      },
+      {
+        "before": "Waiting for generation",
+        "after": "Mandatory topology / gates"
+      },
+      {
+        "before": "Awaiting artifact identity",
+        "after": "Atomic generation activation"
+      },
+      {
+        "before": "No estimated completion time available.",
+        "after": "Optional metrics may arrive separately."
+      }
+    ],
+    "original_sha256": "9cdd4d19cc09ddf9eadde7348688b170b3d92a5bd5225e74becf14bbb94bcc1b",
+    "method": "precise text edits and added annotation; original drawing preserved"
+  },
+  {
+    "id": "06_quality",
+    "release_label": "R2-Q / GENERATION-BOUND INSPECTION",
+    "annotation": "Demo gamma is not a new metric definition. Metric version + generation must match. Refinement changes recipe, not local topology.",
+    "changes": [
+      {
+        "before": "DESIGN PROPOSAL  ·  DEMO DATA",
+        "after": "V2 PROPOSAL  ·  DEMO DATA"
+      },
+      {
+        "before": "FULLMAG AUDIT  /  11 OCT 2026",
+        "after": "FULLMAG PLAN V2 / 12 OCT 2026"
+      },
+      {
+        "before": "Refinement requires an explicit new build",
+        "after": "Refine recipe, then Apply and Build"
+      },
+      {
+        "before": "Refine Selected…",
+        "after": "Refine Recipe…"
+      }
+    ],
+    "original_sha256": "8c709c59e53e0869f84eb27396708f5d26ba8d1062ec4c326487e3bf14bd2fc3",
+    "method": "precise text edits and added annotation; original drawing preserved"
+  },
+  {
+    "id": "07_fdm",
+    "release_label": "R1 / FDM PLAN OWNER",
+    "annotation": "Grid descriptor + membership + fingerprint form one generation. Display stride never changes the solver discretization.",
+    "changes": [
+      {
+        "before": "DESIGN PROPOSAL  ·  DEMO DATA",
+        "after": "V2 PROPOSAL  ·  DEMO DATA"
+      },
+      {
+        "before": "FULLMAG AUDIT  /  11 OCT 2026",
+        "after": "FULLMAG PLAN V2 / 12 OCT 2026"
+      }
+    ],
+    "original_sha256": "7bec6b44d5ca69c94a6c50591be6d1c6b03d93700f719308b2c2fc5f21d0caba",
+    "method": "precise text edits and added annotation; original drawing preserved"
+  }
+]

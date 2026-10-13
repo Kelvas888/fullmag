@@ -53,6 +53,8 @@ pub struct CurrentRunResource {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_dmi_energy: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_rotated_dmi_energy: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub final_total_energy: Option<f64>,
     pub artifact_dir: String,
     pub requested_backend: String,
@@ -121,6 +123,8 @@ pub struct StageExecutionRecordResource {
     pub mesh_revision: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_step: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at_unix_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -402,6 +406,8 @@ pub struct CommandStatusResource {
     pub command_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_intent_id: Option<String>,
     pub seq: u64,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -473,6 +479,14 @@ pub struct CommandDetailResource {
     pub dispatched_at_unix_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at_unix_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_step: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_step: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_time_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at_unix_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]

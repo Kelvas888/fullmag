@@ -25,18 +25,89 @@ param(
 
   [switch]$BuildOnly,
 
+  [ValidateSet("fullmag-session", "fullmag-api", "fullmag-cli", "fullmag-runner")]
+  [string]$TestPackage,
+
+  [ValidatePattern("^[A-Za-z0-9_:.-]*$")]
+  [string]$TestFilter = "",
+
   [Alias("skip_local_changes")]
   [switch]$SkipLocalChanges,
 
-  [ValidateRange(1, 65535)]
-  [int]$WebPort = 3100
+  [ValidateRange(0, 65535)]
+  [int]$WebPort = 0
 )
 
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
+if ($TestPackage -and ($BuildMode -ne "true" -or -not $BuildOnly)) {
+  throw "Targeted FEM tests require -BuildMode true -BuildOnly"
+}
+
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$RepoDriveRoot = [System.IO.Path]::GetPathRoot($RepoRoot)
+$StorageAdapter = Join-Path $RepoRoot "scripts\windows\fullmag_storage.ps1"
+if (-not (Test-Path -LiteralPath $StorageAdapter -PathType Leaf)) {
+  throw "Fullmag Windows storage adapter is missing: $StorageAdapter"
+}
+. $StorageAdapter
+
+function Resolve-FullmagWindowsAutoDevice {
+  $nvidiaSmi = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
+  if (-not $nvidiaSmi) {
+    return "cpu"
+  }
+  try {
+    & $nvidiaSmi.Path -L 2>$null | Out-Null
+    return if ($LASTEXITCODE -eq 0) { "gpu" } else { "cpu" }
+  }
+  catch {
+    return "cpu"
+  }
+}
+
+# The storage profile follows the resolved execution lane.  Keep the user's
+# requested value in $RequestedDevice for the runtime manifest, while auto and
+# cpu intentionally share the CPU build/cache profile.
+$StorageDevice = if ($Device -eq "gpu") {
+  "gpu"
+} elseif ($Device -eq "cpu") {
+  "cpu"
+} else {
+  Resolve-FullmagWindowsAutoDevice
+}
+$StorageProfile = "windows-fem-$StorageDevice"
+
+if ($env:FULLMAG_STORAGE_MANAGED_ENTRY -ne "1") {
+  $managedArguments = @(
+    "-BuildMode", $BuildMode,
+    "-Frontend", $Frontend,
+    "-Backend", $Backend,
+    "-Device", $Device,
+    "-RunMode", $RunMode,
+    "-WebPort", $WebPort.ToString()
+  )
+  if ($ScriptPath) { $managedArguments += @("-ScriptPath", $ScriptPath) }
+  if ($OutputDir) { $managedArguments += @("-OutputDir", $OutputDir) }
+  if ($BuildOnly) { $managedArguments += "-BuildOnly" }
+  if ($TestPackage) { $managedArguments += @("-TestPackage", $TestPackage) }
+  if ($TestFilter) { $managedArguments += @("-TestFilter", $TestFilter) }
+  if ($SkipLocalChanges) { $managedArguments += "-SkipLocalChanges" }
+  $managedExitCode = Invoke-FullmagStorageManagedScript `
+    -RepoRoot $RepoRoot -Profile $StorageProfile -ScriptPath $PSCommandPath `
+    -Arguments $managedArguments
+  exit $managedExitCode
+}
+
+$StorageLayout = Resolve-FullmagStorageLayout -RepoRoot $RepoRoot -Profile $StorageProfile
+Set-FullmagStorageEnvironment -Layout $StorageLayout
+$WorkspaceNamespace = [string]$StorageLayout.worktree_id
+$CacheRoot = [string]$StorageLayout.cache_root
+$BuildRoot = [string]$StorageLayout.build_root
+$TempRoot = [string]$StorageLayout.temp_root
+$FrontendRoot = Join-Path ([string]$StorageLayout.frontend_root) "fem-$StorageDevice"
+$DefaultFemCpuImage = "fullmag/fem-cpu:windows-local-$WorkspaceNamespace"
+$DefaultFemGpuImage = "fullmag/fem-gpu:windows-local-$WorkspaceNamespace"
 $CudaBaseImage = if ($env:FULLMAG_CUDA_BASE_IMAGE) {
   $env:FULLMAG_CUDA_BASE_IMAGE
 } else {
@@ -49,46 +120,40 @@ function Resolve-AbsolutePath {
   return [System.IO.Path]::GetFullPath($Path)
 }
 
-function Get-WorkspaceNamespace {
-  param([Parameter(Mandatory = $true)][string]$Path)
-  $normalized = (Resolve-AbsolutePath $Path).TrimEnd("\").ToLowerInvariant()
-  $bytes = [System.Text.Encoding]::UTF8.GetBytes($normalized)
-  $hasher = [System.Security.Cryptography.SHA256]::Create()
-  try {
-    $digest = ([BitConverter]::ToString($hasher.ComputeHash($bytes))).Replace("-", "").ToLowerInvariant()
-  }
-  finally {
-    $hasher.Dispose()
-  }
-  $slug = [System.IO.Path]::GetFileName($normalized) -replace "[^a-z0-9._-]", "-"
-  if (-not $slug) { $slug = "repo" }
-  return "$slug-$($digest.Substring(0, 16))"
-}
+function Resolve-HostWebPort {
+  param([Parameter(Mandatory = $true)][int]$RequestedPort)
 
-$WorkspaceNamespace = Get-WorkspaceNamespace $RepoRoot
-$defaultCacheRoot = Join-Path $RepoDriveRoot ("fullmag-cache\$WorkspaceNamespace")
-$defaultBuildRoot = Join-Path $RepoDriveRoot ("fullmag-build\$WorkspaceNamespace")
-$defaultTempRoot = Join-Path $RepoDriveRoot ("fullmag-tmp\$WorkspaceNamespace")
-$DefaultFemCpuImage = "fullmag/fem-cpu:windows-local-$WorkspaceNamespace"
-$DefaultFemGpuImage = "fullmag/fem-gpu:windows-local-$WorkspaceNamespace"
+  if ($RequestedPort -gt 0) {
+    return $RequestedPort
+  }
 
-function Require-ExternalBuildPath {
-  param(
-    [Parameter(Mandatory = $true)][string]$Path,
-    [Parameter(Mandatory = $true)][string]$Label
-  )
-  $resolved = (Resolve-AbsolutePath $Path).TrimEnd("\")
-  $repo = $RepoRoot.TrimEnd("\")
-  if (-not [System.IO.Path]::IsPathRooted($resolved)) {
-    throw "$Label must be an absolute Windows path, got $resolved"
+  $python = Get-Command "python" -ErrorAction SilentlyContinue
+  if (-not $python) {
+    throw "Python is required to select an available Windows FEM web port"
   }
-  if ($resolved -eq [System.IO.Path]::GetPathRoot($resolved).TrimEnd("\")) {
-    throw "$Label must not use a drive root directly, got $resolved"
+  $portHelper = Join-Path $RepoRoot "scripts\control_room_port.py"
+  if (-not (Test-Path -LiteralPath $portHelper -PathType Leaf)) {
+    throw "Control Room port helper is missing: $portHelper"
   }
-  if ($resolved.Equals($repo, [System.StringComparison]::OrdinalIgnoreCase) -or
-      $resolved.StartsWith($repo + "\", [System.StringComparison]::OrdinalIgnoreCase)) {
-    throw "$Label must be outside the repository, got $resolved"
+
+  # The container always listens on 3100; only the host-side published port
+  # needs to move.  Keep 3100 reserved for the long-lived Control Room lane:
+  # Docker Desktop port reservations are not always visible to a Windows
+  # socket bind probe launched through the managed Python runner.
+  $candidatePorts = 3101..3199
+  $helperArguments = @($portHelper, "pick", "0.0.0.0") + [string[]]($candidatePorts | ForEach-Object { $_.ToString() })
+  $portOutput = @(& $python.Source @helperArguments 2>&1)
+  $portExitCode = $LASTEXITCODE
+  $selectedPort = ($portOutput -join [Environment]::NewLine).Trim()
+  if ($portExitCode -ne 0 -or $selectedPort -notmatch '^\d+$') {
+    throw "Could not select an available Windows FEM web port from 3101-3199: $selectedPort"
   }
+  $resolvedPort = [int]$selectedPort
+  if ($resolvedPort -lt 3101 -or $resolvedPort -gt 3199) {
+    throw "Control Room port helper returned an unsafe Windows FEM web port: $resolvedPort"
+  }
+  Write-Host "Selected available Windows FEM host web port: $resolvedPort" -ForegroundColor DarkCyan
+  return $resolvedPort
 }
 
 function Ensure-Directory {
@@ -318,11 +383,7 @@ if ($LASTEXITCODE -ne 0 -or $dockerOsType -ne "linux") {
 Write-Host "[Fullmag] Docker Desktop engine: $dockerOsType" -ForegroundColor DarkCyan
 $RequestedDevice = $Device
 if ($Device -eq "auto") {
-  $nvidiaSmi = Get-Command "nvidia-smi" -ErrorAction SilentlyContinue
-  if ($nvidiaSmi) {
-    & $nvidiaSmi.Path -L 2>$null | Out-Null
-  }
-  $Device = if ($nvidiaSmi -and $LASTEXITCODE -eq 0) { "gpu" } else { "cpu" }
+  $Device = $StorageDevice
   Write-Host "Resolved FEM device auto -> $Device"
 }
 if ($Device -eq "gpu") {
@@ -332,28 +393,32 @@ if ($Device -eq "gpu") {
   Invoke-External "nvidia-smi" @("-L")
 }
 
-$CacheRoot = if ($env:FULLMAG_WINDOWS_CACHE_ROOT) {
-  Resolve-AbsolutePath $env:FULLMAG_WINDOWS_CACHE_ROOT
-} else {
-  $defaultCacheRoot
-}
-$BuildRoot = if ($env:FULLMAG_WINDOWS_BUILD_ROOT) {
-  Resolve-AbsolutePath $env:FULLMAG_WINDOWS_BUILD_ROOT
-} else {
-  $defaultBuildRoot
-}
-$TempRoot = if ($env:FULLMAG_WINDOWS_TEMP_ROOT) {
-  Resolve-AbsolutePath $env:FULLMAG_WINDOWS_TEMP_ROOT
-} else {
-  $defaultTempRoot
-}
 $RuntimeKey = "fem-$Device"
-$StateRoot = Join-Path $CacheRoot "state\$RuntimeKey"
-$CargoHome = Join-Path $CacheRoot "cargo"
-$RustupHome = Join-Path $CacheRoot "rustup"
-$PnpmRoot = Join-Path $CacheRoot "pnpm"
-$NodeModulesRoot = Join-Path $CacheRoot "node-modules"
-$ControlRoomNodeModulesRoot = Join-Path $CacheRoot "control-room-node-modules"
+$BuildStorageRoot = [string]$StorageLayout.build_storage_root
+$StateRoot = if ($env:FULLMAG_WINDOWS_STATE_ROOT) {
+  Resolve-AbsolutePath $env:FULLMAG_WINDOWS_STATE_ROOT
+} else {
+  Join-Path ([string]$StorageLayout.runtime_root) $RuntimeKey
+}
+$LinuxCacheRoot = Join-Path $CacheRoot "fem-$Device"
+$CargoHome = Join-Path $LinuxCacheRoot "cargo"
+$RustupHome = Join-Path $LinuxCacheRoot "rustup"
+$PnpmRoot = Join-Path $LinuxCacheRoot "pnpm"
+$FrontendRoot = if ($env:FULLMAG_WINDOWS_FRONTEND_ROOT) {
+  Resolve-AbsolutePath $env:FULLMAG_WINDOWS_FRONTEND_ROOT
+} else {
+  Join-Path ([string]$StorageLayout.frontend_root) "fem-$Device"
+}
+$NodeModulesRoot = if ($env:FULLMAG_WINDOWS_NODE_MODULES_ROOT) {
+  Resolve-AbsolutePath $env:FULLMAG_WINDOWS_NODE_MODULES_ROOT
+} else {
+  Join-Path $FrontendRoot "node_modules"
+}
+$ControlRoomNodeModulesRoot = if ($env:FULLMAG_WINDOWS_CONTROL_ROOM_NODE_MODULES_ROOT) {
+  Resolve-AbsolutePath $env:FULLMAG_WINDOWS_CONTROL_ROOM_NODE_MODULES_ROOT
+} else {
+  Join-Path $FrontendRoot "apps\control-room\node_modules"
+}
 $TargetKey = if ($Device -eq "gpu") { $CudaCacheKey } else { "fem-cpu" }
 $TargetRoot = Join-Path $BuildRoot "cargo-targets\$TargetKey"
 $ComposeFile = Join-Path $RepoRoot "compose.windows.yaml"
@@ -373,8 +438,31 @@ $RuntimeImage = if ($Device -eq "gpu") {
   }
 }
 
-foreach ($path in @($CacheRoot, $BuildRoot, $TempRoot, $StateRoot, $CargoHome, $RustupHome, $PnpmRoot, $NodeModulesRoot, $ControlRoomNodeModulesRoot, $TargetRoot)) {
-  Require-ExternalBuildPath $path "Fullmag build/cache path"
+# Compose must execute the same image selected for build/reuse and provenance.
+# Without this export its YAML default silently selects the shared image tag.
+if ($Device -eq "gpu") {
+  $env:FULLMAG_WINDOWS_FEM_GPU_IMAGE = $RuntimeImage
+} else {
+  $env:FULLMAG_WINDOWS_FEM_CPU_IMAGE = $RuntimeImage
+}
+
+foreach ($item in @(
+    @{ Path = $BuildRoot; Label = "FULLMAG_WINDOWS_BUILD_ROOT" },
+    @{ Path = $CacheRoot; Label = "FULLMAG_WINDOWS_CACHE_ROOT" },
+    @{ Path = $TempRoot; Label = "FULLMAG_WINDOWS_TEMP_ROOT" },
+    @{ Path = $StateRoot; Label = "FULLMAG_WINDOWS_STATE_ROOT" },
+    @{ Path = $LinuxCacheRoot; Label = "FEM Linux cache root" },
+    @{ Path = $CargoHome; Label = "FEM Cargo home" },
+    @{ Path = $RustupHome; Label = "FEM Rustup home" },
+    @{ Path = $PnpmRoot; Label = "FEM pnpm root" },
+    @{ Path = $FrontendRoot; Label = "FEM frontend root" },
+    @{ Path = $NodeModulesRoot; Label = "FEM node_modules root" },
+    @{ Path = $ControlRoomNodeModulesRoot; Label = "FEM Control Room node_modules root" },
+    @{ Path = $TargetRoot; Label = "FEM Cargo target root" }
+  )) {
+  $null = Assert-FullmagStoragePath -Layout $StorageLayout -Path $item.Path -Label $item.Label -Parent $BuildStorageRoot
+}
+foreach ($path in @($CacheRoot, $BuildRoot, $TempRoot, $StateRoot, $LinuxCacheRoot, $CargoHome, $RustupHome, $PnpmRoot, $FrontendRoot, $NodeModulesRoot, $ControlRoomNodeModulesRoot, $TargetRoot)) {
   Ensure-Directory $path
 }
 if (-not (Test-Path -LiteralPath $ComposeFile -PathType Leaf)) {
@@ -384,19 +472,62 @@ if (-not (Test-Path -LiteralPath $ComposeFile -PathType Leaf)) {
 $env:FULLMAG_WINDOWS_REPO = To-ComposePath $RepoRoot
 $env:FULLMAG_WINDOWS_STATE_ROOT = To-ComposePath $StateRoot
 $env:FULLMAG_WINDOWS_BUILD_ROOT = To-ComposePath $BuildRoot
-$env:FULLMAG_WINDOWS_CACHE_ROOT = To-ComposePath $CacheRoot
+$env:FULLMAG_WINDOWS_CACHE_ROOT = To-ComposePath $LinuxCacheRoot
 $env:FULLMAG_WINDOWS_TEMP_ROOT = To-ComposePath $TempRoot
 $env:FULLMAG_WINDOWS_CARGO_HOME = To-ComposePath $CargoHome
 $env:FULLMAG_WINDOWS_RUSTUP_HOME = To-ComposePath $RustupHome
 $env:FULLMAG_WINDOWS_PNPM_ROOT = To-ComposePath $PnpmRoot
 $env:FULLMAG_WINDOWS_NODE_MODULES_ROOT = To-ComposePath $NodeModulesRoot
 $env:FULLMAG_WINDOWS_CONTROL_ROOM_NODE_MODULES_ROOT = To-ComposePath $ControlRoomNodeModulesRoot
+$env:FULLMAG_WINDOWS_FRONTEND_ROOT = To-ComposePath $FrontendRoot
+Write-Host "Windows FEM host web port request: $WebPort" -ForegroundColor DarkCyan
+$WebPort = Resolve-HostWebPort -RequestedPort $WebPort
 $env:FULLMAG_WINDOWS_WEB_PORT = $WebPort.ToString()
+Write-Host "Windows FEM host web port selected: $WebPort" -ForegroundColor DarkCyan
 $containerWebPort = 3100
+$containerFrontendLinkCommand = @'
+set -euo pipefail
+frontend_root=/fullmag-frontend
+frontend_app=/workspace/apps/control-room
+mkdir -p "$frontend_root" "$frontend_root/next/default" "$frontend_root/next/audit" "$frontend_root/out" "$frontend_root/artifacts" "$frontend_root/storybook-static"
+ensure_managed_link() {
+  local source="$1"
+  local target="$2"
+  if [ -L "$source" ]; then
+    if [ "$(readlink -f "$source")" != "$(readlink -f "$target")" ]; then
+      echo "managed frontend link points outside its assigned storage: $source" >&2
+      exit 2
+    fi
+  elif [ -e "$source" ]; then
+    echo "managed frontend path is a real directory; inventory it before replacing: $source" >&2
+    exit 2
+  else
+    ln -s "$target" "$source"
+  fi
+}
+ensure_managed_link "$frontend_app/.fullmag-frontend" "$frontend_root"
+ensure_managed_link "$frontend_app/.next" "$frontend_root/next/default"
+ensure_managed_link "$frontend_app/.next-audit" "$frontend_root/next/audit"
+ensure_managed_link "$frontend_app/out" "$frontend_root/out"
+ensure_managed_link "$frontend_app/.artifacts" "$frontend_root/artifacts"
+ensure_managed_link "$frontend_app/storybook-static" "$frontend_root/storybook-static"
+'@
+if ($Frontend -eq "dev") {
+  $containerFrontendLinkCommand += "`nmkdir -p `"`$frontend_root/next/dev-$containerWebPort`"`nensure_managed_link `"`$frontend_app/.next-control-room-$containerWebPort`" `"`$frontend_root/next/dev-$containerWebPort`"`n"
+}
 $env:COMPOSE_PROJECT_NAME = $ComposeProjectName
-$identityPython = Get-Command "python" -ErrorAction SilentlyContinue
-if (-not $identityPython) {
-  throw "Python is required to capture the exact Fullmag source identity"
+$identityPythonPath = if ($env:FULLMAG_IDENTITY_PYTHON) {
+  $env:FULLMAG_IDENTITY_PYTHON
+} else {
+  $identityPython = Get-Command "python" -ErrorAction SilentlyContinue
+  if ($identityPython) { $identityPython.Path } else { $null }
+}
+if (-not $identityPythonPath -or -not (Test-Path -LiteralPath $identityPythonPath -PathType Leaf)) {
+  throw "Python is required to capture the exact Fullmag source identity; set FULLMAG_IDENTITY_PYTHON to a Python executable"
+}
+& $identityPythonPath --version *> $null
+if ($LASTEXITCODE -ne 0) {
+  throw "Python at $identityPythonPath is not runnable; set FULLMAG_IDENTITY_PYTHON to a Python executable"
 }
 $previousGitOptionalLocks = $env:GIT_OPTIONAL_LOCKS
 $identityOutput = $null
@@ -407,7 +538,7 @@ try {
   # with the launcher over .git/index.lock.  Restore the caller's setting
   # immediately after the capture; mandatory Git locks remain unaffected.
   $env:GIT_OPTIONAL_LOCKS = "0"
-  $identityOutput = (& $identityPython.Path (Join-Path $RepoRoot "scripts\capture_source_snapshot_identity.py") --repo-root $RepoRoot --ignore-non-runtime-dirty | Out-String)
+  $identityOutput = (& $identityPythonPath (Join-Path $RepoRoot "scripts\capture_source_snapshot_identity.py") --repo-root $RepoRoot --ignore-non-runtime-dirty | Out-String)
   $identityExitCode = $LASTEXITCODE
 }
 finally {
@@ -529,32 +660,54 @@ try {
     }
     Write-Host "Acquired Fullmag Windows build lock"
     Invoke-DockerImageBuild
-    $buildCommand = if ($Device -eq "gpu") { @"
+    $testFeatureArgs = if ($TestPackage -eq "fullmag-session") {
+      ""
+    } elseif ($Device -eq "gpu") {
+      "--features 'cuda fem-gpu'"
+    } else {
+      "--features fem-gpu"
+    }
+    $buildCommand = if ($TestPackage) { @"
 set -euo pipefail
 cd /workspace
+mkdir -p /workspace/.fullmag-build/cargo-targets/$TargetKey/mesh-tests /tmp/fullmag-windows
+rustup toolchain install nightly --profile minimal --no-self-update
+export CARGO_TARGET_DIR=/workspace/.fullmag-build/cargo-targets/$TargetKey/mesh-tests
+export CARGO_INCREMENTAL=0
+export PYTHONPATH=/workspace/packages/fullmag-py/src
+export FULLMAG_FEM_EXECUTION=$Device
+export FULLMAG_RELAX_DEVICE=$Device
+cargo +nightly test --locked -p '$TestPackage' --no-default-features $testFeatureArgs '$TestFilter' -- --nocapture
+"@
+    } elseif ($Device -eq "gpu") { @"
+set -euo pipefail
+cd /workspace
+__FRONTEND_LINKS__
 mkdir -p /workspace/.fullmag-build/cargo-targets/$TargetKey /workspace/.fullmag-cache /workspace/.fullmag-cargo /workspace/.fullmag-rustup /tmp/fullmag-windows
 rustup toolchain install nightly --profile minimal --no-self-update
 if [ ! -f /workspace/apps/control-room/node_modules/.bin/next ]; then
   pnpm --dir /workspace/apps/control-room install --frozen-lockfile
 fi
-FULLMAG_CUDA_BASE_IMAGE=$CudaBaseImage FULLMAG_CARGO_TARGET_ROOT=/workspace/.fullmag-build/cargo-targets/$TargetKey CARGO_TARGET_ROOT=/workspace/.fullmag-build/cargo-targets/$TargetKey FULLMAG_FORCE_LOCAL_FEM_GPU=1 make $makeTarget
+FULLMAG_CUDA_BASE_IMAGE=$CudaBaseImage FULLMAG_WINDOWS_CONTAINER_MANAGED=1 FULLMAG_CARGO_TARGET_DIR=/workspace/.fullmag-build/cargo-targets/$TargetKey CARGO_TARGET_DIR=/workspace/.fullmag-build/cargo-targets/$TargetKey FULLMAG_CARGO_TARGET_ROOT=/workspace/.fullmag-build/cargo-targets/$TargetKey CARGO_TARGET_ROOT=/workspace/.fullmag-build/cargo-targets/$TargetKey FULLMAG_FORCE_LOCAL_FEM_GPU=1 make $makeTarget
 test -x /workspace/.fullmag/local/bin/fullmag
 grep -Fxq cuda-fem-gpu /workspace/.fullmag/local/launcher-build-mode
 "@
     } else { @"
 set -euo pipefail
 cd /workspace
+__FRONTEND_LINKS__
 mkdir -p /workspace/.fullmag-build/cargo-targets/$TargetKey /workspace/.fullmag-cache /workspace/.fullmag-cargo /workspace/.fullmag-rustup /tmp/fullmag-windows
 rustup toolchain install nightly --profile minimal --no-self-update
 if [ ! -f /workspace/apps/control-room/node_modules/.bin/next ]; then
   pnpm --dir /workspace/apps/control-room install --frozen-lockfile
 fi
-FULLMAG_CARGO_TARGET_ROOT=/workspace/.fullmag-build/cargo-targets/$TargetKey CARGO_TARGET_ROOT=/workspace/.fullmag-build/cargo-targets/$TargetKey FULLMAG_FORCE_LOCAL_FEM_CPU=1 make $makeTarget
+FULLMAG_WINDOWS_CONTAINER_MANAGED=1 FULLMAG_CARGO_TARGET_DIR=/workspace/.fullmag-build/cargo-targets/$TargetKey CARGO_TARGET_DIR=/workspace/.fullmag-build/cargo-targets/$TargetKey FULLMAG_CARGO_TARGET_ROOT=/workspace/.fullmag-build/cargo-targets/$TargetKey CARGO_TARGET_ROOT=/workspace/.fullmag-build/cargo-targets/$TargetKey FULLMAG_FORCE_LOCAL_FEM_CPU=1 make $makeTarget
 test -x /workspace/.fullmag/local/bin/fullmag
 grep -Fxq fem-cpu /workspace/.fullmag/local/launcher-build-mode
 "@ }
     # PowerShell here-strings use CRLF on Windows; bash treats the trailing
     # carriage return in `pipefail` as part of the option name.
+    $buildCommand = $buildCommand.Replace("__FRONTEND_LINKS__", $containerFrontendLinkCommand)
     $buildCommand = $buildCommand.Replace("`r`n", "`n").Replace("`r", "`n")
     # Pass a single ASCII-safe argument through Docker/Compose. Directly
     # forwarding a multiline PowerShell string can corrupt shell option names
@@ -563,6 +716,10 @@ grep -Fxq fem-cpu /workspace/.fullmag/local/launcher-build-mode
     $buildCommandBase64 = [Convert]::ToBase64String($buildCommandBytes)
     $buildCommandPayload = "printf '%s' '$buildCommandBase64' | base64 --decode | bash"
     Invoke-DockerCompose @("run", "--rm", "--no-deps", $ServiceName, "bash", "-lc", $buildCommandPayload)
+    if ($TestPackage) {
+      Write-Host "Windows FEM $Device targeted tests completed: $TestPackage $TestFilter"
+      exit 0
+    }
   } elseif (-not (Test-Path -LiteralPath $RuntimeBinaryPath -PathType Leaf) -or
       -not (Test-Path -LiteralPath $RuntimeApiPath -PathType Leaf)) {
     throw "Container-local FEM $Device launcher is missing at $StateRoot\local\bin\fullmag; rerun with build=True"
@@ -661,6 +818,7 @@ grep -Fxq fem-cpu /workspace/.fullmag/local/launcher-build-mode
     "run", "--rm", "--no-deps", "--service-ports"
   )
   foreach ($entry in @(
+    "FULLMAG_WEB_PUBLIC_PORT=$WebPort",
     "FULLMAG_FEM_EXECUTION=$Device",
     "FULLMAG_RELAX_DEVICE=$Device",
     "FULLMAG_SP4_DEVICE=$Device",
@@ -726,8 +884,18 @@ grep -Fxq fem-cpu /workspace/.fullmag/local/launcher-build-mode
   # process boundary and used to overwrite PYTHONPATH with only the source
   # package.  That hid `_fullmag_core.so`, forcing every v2 cache hit through
   # the expensive Python full audit on the Windows bind mount.
-  $runCommand = "set -euo pipefail; cd /workspace; export PYTHONPATH=/workspace/packages/fullmag-py/src:/workspace/.fullmag/local; exec /workspace/.fullmag/local/bin/fullmag $quotedCli"
-  $runArguments += $runCommand
+  $runCommand = @"
+set -euo pipefail
+cd /workspace
+$containerFrontendLinkCommand
+export PYTHONPATH=/workspace/packages/fullmag-py/src:/workspace/.fullmag/local
+exec /workspace/.fullmag/local/bin/fullmag $quotedCli
+"@
+  $runCommand = $runCommand.Replace("`r`n", "`n").Replace("`r", "`n")
+  $runCommandBytes = [System.Text.Encoding]::UTF8.GetBytes($runCommand)
+  $runCommandBase64 = [Convert]::ToBase64String($runCommandBytes)
+  $runCommandPayload = "printf '%s' '$runCommandBase64' | base64 --decode | bash"
+  $runArguments += $runCommandPayload
   Invoke-DockerCompose $runArguments
 }
 finally {

@@ -1,0 +1,25 @@
+digraph G {
+graph [bgcolor="#f7f9fc", fontname="DejaVu Sans", fontsize=20, fontcolor="#182e47", labelloc=t, labeljust=l, pad=0.4, nodesep=0.45, ranksep=0.75, splines=polyline, dpi=125];
+node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=12, fillcolor="#e6edf5", color="#adc1d7", fontcolor="#142941", penwidth=1.2, margin="0.19,0.15"];
+edge [fontname="DejaVu Sans", fontsize=10, color="#6e89a7", fontcolor="#415c78", arrowsize=0.75, penwidth=1.2];
+rankdir=LR;
+
+label="D04 / IMPORT AND REIMPORT V2 — PROPOSED\nVersioned source; no implicit object; no ordinal-based region rebinding";
+file [label="User file\nsource bytes + explicit units"];
+stage [label="Owned stage / lease\nallocated → uploading → uploaded\nbyte/count limits before allocation"];
+checks [label="checking → checked / invalid\nfinite + manifold + orientation\nself-intersection / mode checks"];
+preview [label="Version-keyed binary preview\nnot a solver mesh"];
+mode [label="construction-only OR\nqualified FEM volume / FDM occupancy\nunknown is never pass"];
+asset [label="Immutable asset version\noriginal hash + settings/checker version\nportable project includes source bytes"];
+attach [label="Atomic attach / reimport intent\nbase_revision + expected old version\nsame object ID only for reimport"];
+regions [label="Semantic region comparison\nunresolved / orphaned explicitly\nno transfer by triangle ordinal"];
+scene [label="Committed object + source version\nnew geometry assessment\nexplicit Build when appropriate"];
+cancel [label="Cancelled / expired stage\nrelease owned unreferenced data\nnever delete referenced source"];
+file->stage;stage->checks;checks->preview;checks->mode;mode->asset;asset->attach;
+attach->regions [label="reimport"];
+regions->scene [label="accepted mapping / explicit unresolved"];
+attach->scene [label="new object"];
+stage->cancel [label="cancel / expiry"];
+checks->cancel [label="cancel"];
+
+}

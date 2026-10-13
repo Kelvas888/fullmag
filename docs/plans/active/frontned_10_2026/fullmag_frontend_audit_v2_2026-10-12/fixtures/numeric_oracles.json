@@ -1,0 +1,72 @@
+{
+  "id": "NUM-01",
+  "kind": "specification_oracle_not_production_parser",
+  "default_unit": "nm",
+  "valid": [
+    {
+      "raw": "100 nm",
+      "expected_si": 1e-07
+    },
+    {
+      "raw": "0,1 um",
+      "expected_si": 1e-07
+    },
+    {
+      "raw": "1e-7 m",
+      "expected_si": 1e-07
+    },
+    {
+      "raw": "100",
+      "expected_si": 1e-07
+    },
+    {
+      "raw": "-0.001 nm",
+      "expected_si": -1e-12
+    },
+    {
+      "raw": "0.1 µm",
+      "expected_si": 1e-07
+    },
+    {
+      "raw": "0.1 μm",
+      "expected_si": 1e-07
+    }
+  ],
+  "empty": [
+    "",
+    "   "
+  ],
+  "incomplete": [
+    "-",
+    "+",
+    ".",
+    ",",
+    "1e",
+    "1e-"
+  ],
+  "invalid": [
+    "NaN",
+    "Infinity",
+    "0x10",
+    "1,2.3",
+    "1 000",
+    "2*10",
+    "3 kg",
+    "1e--2"
+  ],
+  "no_op": {
+    "Lchar_m": 1e-07,
+    "ulp_multiplier": 8,
+    "a_m": 0,
+    "b_m": 1e-12,
+    "expected_noop": false
+  },
+  "snap": {
+    "enabled_by_default": false,
+    "initial_translation_step_m": 1e-09,
+    "initial_angle_step_deg": 1,
+    "initial_scale_step": 0.01,
+    "rounding": "nearest multiple; exact half ties away from zero; computed from gesture start",
+    "reason": "proposed UX contract, not measured optimum"
+  }
+}

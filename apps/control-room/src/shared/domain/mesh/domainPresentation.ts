@@ -281,7 +281,7 @@ function finiteTuple3Unknown(value: unknown): [number, number, number] | null {
   return Array.isArray(value) ? finiteTuple3(value) : null;
 }
 
-function authoredObjectBounds(value: unknown): DomainBounds3 | null {
+export function authoredObjectBounds(value: unknown): DomainBounds3 | null {
   const object = recordValue(value);
   if (!object) return null;
   const geometry = recordValue(object.geometry);

@@ -1123,7 +1123,7 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
           color: surfaceMaterialColor,
           opacity: surfaceOpacity,
           vertexColors: usesInstanceColors,
-          ...materialProfile.magneticSurface,
+          toneMapped: materialProfile.magneticSurface.toneMapped,
           ...surfaceMaterialPolicyProps(surfaceOpacity),
         }),
       ),
@@ -1199,6 +1199,20 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
     }
 
     let colorChanged = false;
+    // Instance colors are enabled by Three.js independently of vertexColors.
+    // Drop the previous quantity's attribute when no compatible buffer exists.
+    if (!usesInstanceColors && surface.instanceColor !== null) {
+      surface.instanceColor = null;
+      colorRevisionRef.current = null;
+      const mountedSurfaceMaterial = surface.material;
+      if (
+        mountedSurfaceMaterial === surfaceMaterial &&
+        mountedSurfaceMaterial instanceof MeshBasicMaterial
+      ) {
+        mountedSurfaceMaterial.needsUpdate = true;
+      }
+      colorChanged = true;
+    }
     if (usesInstanceColors && surfaceColors) {
       const colorRevision = resolveFdmCuboidColorUploadRevision(
         preparedInstances,
@@ -1236,6 +1250,8 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
         previousAdoption?.scalarBuffer !== surfaceColors ||
         previousAdoption?.sessionIdentity?.sessionEpoch !==
           sessionIdentity?.sessionEpoch ||
+        previousAdoption?.sessionIdentity?.requestScopeEpoch !==
+          sessionIdentity?.requestScopeEpoch ||
         previousAdoption?.sessionIdentity?.sessionId !== sessionIdentity?.sessionId;
       if (colorChanged || adoptionIdentityChanged) {
         recordSurfaceAdoption();
@@ -1249,6 +1265,7 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
     invalidate,
     preparedInstances,
     recordSurfaceAdoption,
+    surfaceMaterial,
     fieldBufferId,
     sessionIdentity,
     surfaceColors,

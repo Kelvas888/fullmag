@@ -1,0 +1,278 @@
+"use client";
+
+import { useCallback } from "react";
+
+import type {
+  ProjectBatchCasesQuery,
+  ProjectBatchCasesResource,
+  ProjectBatchListQuery,
+  ProjectBatchListResource,
+  ProjectBatchSubmitRequest,
+  ProjectBatchSubmitResource,
+} from "../api/apiTypes";
+import { useKernel } from "../KernelContext";
+import { useResource } from "./useResource";
+
+const DEFAULT_PAGE_LIMIT = 50;
+const MAX_PAGE_LIMIT = 100;
+
+export function projectBatchesResourcePrefix(projectId: string): string {
+  return `project-batches:${encodeURIComponent(projectId)}:`;
+}
+
+export function projectBatchesResourceKey(
+  projectId: string,
+  query: ProjectBatchListQuery = {},
+): string {
+  return `${projectBatchesResourcePrefix(projectId)}limit:${resolvePageLimit(query.limit)}:cursor:${encodeURIComponent(query.cursor ?? "first")}`;
+}
+
+export function projectBatchCasesResourceKey(
+  projectId: string,
+  batchId: string,
+  query: ProjectBatchCasesQuery = {},
+): string {
+  return `project-batch-cases:${encodeURIComponent(projectId)}:${encodeURIComponent(batchId)}:limit:${resolvePageLimit(query.limit)}:cursor:${encodeURIComponent(query.cursor ?? "first")}`;
+}
+
+export function validateProjectBatchesEnvelope(
+  data: ProjectBatchListResource,
+  projectId: string,
+  query: ProjectBatchListQuery = {},
+): ProjectBatchListResource {
+  const cursor = query.cursor ?? null;
+  const limit = resolvePageLimit(query.limit);
+  if (
+    data.project_id !== projectId ||
+    !Array.isArray(data.batches) ||
+    data.batches.length > limit
+  ) {
+    throw new Error("Batch list does not match the requested project page.");
+  }
+
+  const ids = new Set<string>();
+  for (const batch of data.batches) {
+    if (
+      !isNonEmptyString(batch.batch_id) ||
+      ids.has(batch.batch_id) ||
+      !isNonEmptyString(batch.accepted_at) ||
+      !Number.isFinite(Date.parse(batch.accepted_at)) ||
+      !/^[a-f0-9]{64}$/i.test(batch.manifest_sha256) ||
+      !isPositiveSafeInteger(batch.case_count) ||
+      !isNonNegativeSafeInteger(batch.published_case_count) ||
+      batch.published_case_count > batch.case_count ||
+      !isExpansionState(batch.expansion_state) ||
+      !isFailurePolicy(batch.failure_policy) ||
+      (batch.max_parallel_cases != null && !isPositiveSafeInteger(batch.max_parallel_cases))
+    ) {
+      throw new Error("Batch list contains a malformed or duplicate summary.");
+    }
+    if (
+      (batch.expansion_state === "pending" && batch.published_case_count !== 0) ||
+      (batch.expansion_state === "complete" && batch.published_case_count !== batch.case_count) ||
+      (batch.expansion_state === "stopped" && (
+        batch.failure_policy !== "stop_admission" ||
+        batch.published_case_count === 0 ||
+        batch.published_case_count === batch.case_count
+      ))
+    ) {
+      throw new Error("Batch expansion state does not match its published prefix.");
+    }
+    ids.add(batch.batch_id);
+  }
+
+  validatePageCursor(data.next_cursor, cursor, data.batches.at(-1)?.batch_id);
+  return data;
+}
+
+export function validateProjectBatchCasesEnvelope(
+  data: ProjectBatchCasesResource,
+  batchId: string,
+  query: ProjectBatchCasesQuery = {},
+): ProjectBatchCasesResource {
+  const cursor = query.cursor ?? null;
+  const limit = resolvePageLimit(query.limit);
+  if (
+    data.batch_id !== batchId ||
+    !Array.isArray(data.axes) ||
+    data.axes.length === 0 ||
+    !Array.isArray(data.cases) ||
+    data.cases.length > limit
+  ) {
+    throw new Error("Batch cases do not match the requested batch page.");
+  }
+
+  const axisNames = new Set<string>();
+  for (const axis of data.axes) {
+    if (
+      !isNonEmptyString(axis.name) ||
+      axisNames.has(axis.name) ||
+      !isNonEmptyString(axis.canonical_unit)
+    ) {
+      throw new Error("Batch case page contains malformed or duplicate axis metadata.");
+    }
+    axisNames.add(axis.name);
+  }
+
+  const ids = new Set<string>();
+  for (const item of data.cases) {
+    if (
+      !isNonEmptyString(item.case_id) ||
+      ids.has(item.case_id) ||
+      !isNonEmptyString(item.planned_run_id) ||
+      !isRecord(item.parameter_tuple) ||
+      !matchesParameterTuple(item.parameter_tuple, axisNames) ||
+      !isBatchCaseState(item.state)
+    ) {
+      throw new Error("Batch case page contains a malformed or duplicate identity.");
+    }
+    ids.add(item.case_id);
+  }
+
+  validatePageCursor(data.next_cursor, cursor, data.cases.at(-1)?.case_id);
+  return data;
+}
+
+export function useProjectBatchesResource(
+  projectId: string,
+  query: ProjectBatchListQuery = {},
+) {
+  const { api } = useKernel();
+  const cursor = query.cursor ?? null;
+  const limit = resolvePageLimit(query.limit);
+  const load = useCallback(
+    ({ signal }: { signal: AbortSignal }) =>
+      api.persistence.projects.listBatches(
+        projectId,
+        { cursor, limit },
+        { signal },
+      ).then((data) => validateProjectBatchesEnvelope(data, projectId, { cursor, limit })),
+    [api, cursor, limit, projectId],
+  );
+
+  return useResource<ProjectBatchListResource>({
+    abortStaleInflight: true,
+    load,
+    resourceKey: projectBatchesResourceKey(projectId, { cursor, limit }),
+  });
+}
+
+export function useProjectBatchCasesResource(
+  projectId: string,
+  batchId: string | null,
+  query: ProjectBatchCasesQuery = {},
+) {
+  const { api } = useKernel();
+  const cursor = query.cursor ?? null;
+  const limit = resolvePageLimit(query.limit);
+  const load = useCallback(
+    ({ signal }: { signal: AbortSignal }) => {
+      if (!batchId) return Promise.reject(new Error("A batch must be selected."));
+      return api.persistence.projects.listBatchCases(
+        projectId,
+        batchId,
+        { cursor, limit },
+        { signal },
+      ).then((data) => validateProjectBatchCasesEnvelope(data, batchId, { cursor, limit }));
+    },
+    [api, batchId, cursor, limit, projectId],
+  );
+
+  return useResource<ProjectBatchCasesResource>({
+    abortStaleInflight: true,
+    enabled: batchId !== null,
+    load,
+    resourceKey: batchId
+      ? projectBatchCasesResourceKey(projectId, batchId, { cursor, limit })
+      : `project-batch-cases:${encodeURIComponent(projectId)}:none`,
+  });
+}
+
+let localInvalidationSequence = 0;
+
+function nextLocalInvalidationRevision(): string {
+  localInvalidationSequence += 1;
+  return `project-batch-local:${Date.now()}:${localInvalidationSequence}`;
+}
+
+export function useSubmitProjectBatch(projectId: string) {
+  const { api, resources } = useKernel();
+  return useCallback(
+    async (request: ProjectBatchSubmitRequest): Promise<ProjectBatchSubmitResource> => {
+      const accepted = await api.persistence.projects.submitBatch(projectId, request);
+      resources.invalidatePrefix(
+        projectBatchesResourcePrefix(projectId),
+        nextLocalInvalidationRevision(),
+      );
+      return accepted;
+    },
+    [api, projectId, resources],
+  );
+}
+
+function resolvePageLimit(limit: number | null | undefined): number {
+  const resolved = limit ?? DEFAULT_PAGE_LIMIT;
+  if (!Number.isInteger(resolved) || resolved < 1 || resolved > MAX_PAGE_LIMIT) {
+    throw new Error(`Project batch page limit must be from 1 to ${MAX_PAGE_LIMIT}.`);
+  }
+  return resolved;
+}
+
+function validatePageCursor(
+  nextCursor: string | null | undefined,
+  requestedCursor: string | null,
+  lastItemId: string | undefined,
+): void {
+  if (nextCursor == null) return;
+  if (
+    !isNonEmptyString(nextCursor) ||
+    nextCursor === requestedCursor ||
+    nextCursor !== lastItemId
+  ) {
+    throw new Error("Project batch page cursor did not advance from its last item.");
+  }
+}
+
+function isExpansionState(
+  value: unknown,
+): value is "pending" | "expanding" | "complete" | "stopped" {
+  return value === "pending" || value === "expanding" || value === "complete" || value === "stopped";
+}
+
+function isFailurePolicy(
+  value: unknown,
+): value is "continue_independent" | "stop_admission" {
+  return value === "continue_independent" || value === "stop_admission";
+}
+
+function isBatchCaseState(
+  value: unknown,
+): value is "pending_expansion" | "pending_materialization" {
+  return value === "pending_expansion" || value === "pending_materialization";
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) > 0;
+}
+
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && Number(value) >= 0;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function matchesParameterTuple(
+  tuple: Record<string, unknown>,
+  axisNames: ReadonlySet<string>,
+): boolean {
+  const entries = Object.entries(tuple);
+  return entries.length === axisNames.size && entries.every(
+    ([name, value]) => axisNames.has(name) && typeof value === "number" && Number.isFinite(value),
+  );
+}

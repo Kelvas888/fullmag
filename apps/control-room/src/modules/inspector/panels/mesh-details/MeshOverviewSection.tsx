@@ -38,7 +38,12 @@ export function MeshOverviewSection({
 }) {
   return (
     <InspectorGroup title={title} badge={buildStatus} collapsible defaultOpen>
-      {meshIsStale ? (
+      {meshFreshness === "inconsistent" ? (
+        <FeedbackBanner
+          kind="warning"
+          message="Solver mesh metadata is inconsistent with the active scene revision (future source scene revision detected). Refetching scene data or rebuilding the shared-domain mesh is recommended."
+        />
+      ) : meshIsStale ? (
         <FeedbackBanner
           kind="warning"
           message="Solver mesh was built from an older scene revision. Rebuild the shared-domain mesh to synchronize inspector data with backend solver state."

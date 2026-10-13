@@ -4,7 +4,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SIMULATION_PREPARATION_PATH } from "../api/apiPaths";
-import type { SimulationPreparationResource } from "../api/apiTypes";
+import type {
+  LiveStatusResource,
+  SimulationPreparationResource,
+} from "../api/apiTypes";
 import { ControlRoomApiError } from "../api/ControlRoomApi";
 import { EventBus } from "../events/EventBus";
 import type { KernelEventMap } from "../events/eventTypes";
@@ -13,6 +16,8 @@ import { DiagnosticRecorderController } from "../performance/diagnostic-recorder
 import { updateRealtimeCommunicationPolicy } from "../realtime/communicationPolicy";
 import type { ResourceResult } from "./resourceTypes";
 import { ResourceInvalidationController } from "./ResourceInvalidationController";
+import { resetSharedResourceRuntimeStoreForTests } from "./ResourceRuntimeStore";
+import { sessionScopedResourceKey } from "./sessionResourceIdentity";
 import { useSimulationPreparation } from "./useSimulationPreparation";
 
 interface Deferred<TData> {
@@ -27,6 +32,7 @@ afterEach(() => {
   updateRealtimeCommunicationPolicy({});
   vi.useRealTimers();
   vi.restoreAllMocks();
+  resetSharedResourceRuntimeStoreForTests();
 });
 
 function deferred<TData>(): Deferred<TData> {
@@ -63,6 +69,18 @@ function preparationFixture(revision: number): SimulationPreparationResource {
   };
 }
 
+function statusFixture(): LiveStatusResource {
+  return {
+    resources: { simulation_preparation_revision: 0 },
+    session: {
+      session_epoch: "session-1@1700000000000",
+      session_id: "session-1",
+      request_scope_epoch: "api-instance:1",
+    },
+    solver: { state: "awaiting_command" },
+  } as LiveStatusResource;
+}
+
 function makeKernel(
   preparation: (options?: { signal?: AbortSignal }) => Promise<SimulationPreparationResource>,
 ) {
@@ -70,7 +88,24 @@ function makeKernel(
   const resources = new ResourceInvalidationController(bus);
   return {
     kernel: {
-      api: { simulation: { preparation } },
+      api: {
+        sessions: {
+          current: { status: async () => statusFixture() },
+          // Session identity is confirmed against the session collection.
+          list: async () => ({
+            schema_version: "2.0.0",
+            sessions: [
+              {
+                current: true,
+                name: "session-1",
+                session_id: "session-1",
+                status: "running",
+              },
+            ],
+          }),
+        },
+        simulation: { preparation },
+      },
       bus,
       diagnosticRecorder: new DiagnosticRecorderController({
         config: { enabled: false },
@@ -139,9 +174,13 @@ describe("useSimulationPreparation", () => {
           </KernelContext.Provider>,
         );
       });
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1);
-      });
+      // Session identity (status + session collection) enables the scoped
+      // hook in a later React commit; advance the fake clock past each hop.
+      for (let index = 0; index < 4; index += 1) {
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(1);
+        });
+      }
 
       expect(load).toHaveBeenCalledTimes(1);
       expect(resultSnapshot(observations.at(-1)!)).toMatchObject({
@@ -191,7 +230,7 @@ describe("useSimulationPreparation", () => {
     await act(async () => {
       root.render(
         <KernelContext.Provider value={kernel}>
-          <Probe observations={observations} />
+          <Probe observations={observations} requiredRevision={1} />
         </KernelContext.Provider>,
       );
     });
@@ -235,7 +274,7 @@ describe("useSimulationPreparation", () => {
     await act(async () => {
       root.render(
         <KernelContext.Provider value={kernel}>
-          <Probe observations={observations} />
+        <Probe observations={observations} requiredRevision={7} />
         </KernelContext.Provider>,
       );
     });
@@ -243,9 +282,12 @@ describe("useSimulationPreparation", () => {
     expect(resultSnapshot(observations[0]!)).toMatchObject({
       data: null,
       revision: 7,
-      status: "loading",
+      status: "idle",
     });
     await waitFor(() => load.mock.calls.length === 1, "revision 7 did not load");
+    expect(
+      observations.some((observation) => observation.status === "loading"),
+    ).toBe(true);
     await act(async () => {
       revision7.resolve(preparationFixture(7));
       await revision7.promise;
@@ -315,7 +357,14 @@ describe("useSimulationPreparation", () => {
       {
         cause: "preparation unavailable",
         errorName: "Error",
-        resourceKey: SIMULATION_PREPARATION_PATH,
+        resourceKey: sessionScopedResourceKey(
+          {
+            requestScopeEpoch: "api-instance:1",
+            sessionEpoch: "session-1@1700000000000",
+            sessionId: "session-1",
+          },
+          SIMULATION_PREPARATION_PATH,
+        ),
         revision: 9,
         situation: "Loading runtime resource through the v2 resource hook",
         source: "resource-hook",
@@ -372,7 +421,7 @@ describe("useSimulationPreparation", () => {
       await act(async () => {
         root.render(
           <KernelContext.Provider value={kernel}>
-            <Probe observations={clientObservations} />
+          <Probe observations={clientObservations} requiredRevision={11} />
           </KernelContext.Provider>,
         );
       });
@@ -381,13 +430,13 @@ describe("useSimulationPreparation", () => {
         data: null,
         error: null,
         revision: null,
-        status: "loading",
+        status: "idle",
       });
       expect(resultSnapshot(clientObservations[0]!)).toEqual({
         data: null,
         error: null,
         revision: 11,
-        status: "loading",
+        status: "idle",
       });
       await waitFor(() => load.mock.calls.length === 1, "request did not start");
       expect(signal?.aborted).toBe(false);
