@@ -4020,3 +4020,10 @@ Commit22cd5536b7c9b293e72f1e567cb0a69a36bf851f dodal warunkowe bounded C ABI/JSO
 G3 activation blockers: terminal build_artifact_attestation (manifest.rs395-422) musi czytac metadata bytes z captured generation, bo immutable writer pomija root alias. run_de_100nm_pilot i validate_serial_adaptive_probe oraz ich physical-potential/KSP/state-closure helpers jeszcze migruja; main verifier/replay helpers rowniez w toku. Writer NIEAKTYWNY. UI canonical hysteresis dataset/pin identity w toku.
 
 Uzgodniono canonical status4060016735 na implemented na podstawie rzeczywistego testu i obu source callers; nie zaliczono GPU runtime. Headerowe liczby rejestru odnosza sie do historycznego snapshotu statusow. Aktualnie pobrane401inline i51review nie zastępuja rozpatrzenia wszystkich niezamknietych pozycji. PR97 OPEN/CONFLICTING/DIRTY na exact2545e267; PR102 CLOSED. Nie zamykamy PR97 przed poprawkami i wymaganymi bramkami.
+
+
+### Potwierdzona bramka konsumentow G3
+
+[Artifact38446567685](https://github.com/MateuszZelent/fullmag/actions/runs/38446567685), exact2545e2676fb499ae20eb328acc322f8a8f494bbb: SUCCESS wszystkie3joby. Artifact consumer:143tests/162subtests PASS,5wybranych verifier contracts PASS,211tests/70subtests PASS w root/plot/DE/parity/benchmark suite. Terminal-artifact-attestation Ubuntu i Windows SUCCESS. Final-fence valid A-to-B oraz malformed-selector cases sa osobnymi regresjami; nie oslabiono readera, bindingu ani science gates. Reference38445514496 exactd7d3c8 pozostaje SUCCESS292tests/174subtests i8named A1 guards.
+
+G3 nie jest zamkniete: niezaleznie pozostaja migracje primary verifier/replay, runtime pilot/serial-probe oraz terminalne attestation generation-aware przed aktywacja immutable writera. Native38446013239 exact22cd5536 potwierdzony zywy job115464493531; wynik pending. UI canonical hysteresis/pin identity nadal w realizacji. PR97 nadal OPEN/CONFLICTING; ten checkpoint nie zatwierdza merge ani fizycznej kwalifikacji.
