@@ -187,3 +187,9 @@ Bieżący etap nie zamyka całego R0/R1; audyt pozostaje w dokumentacji PR150.
 - PR04: payload/preview/equality/rebase/ACK/refresh/reset i gest korzystają z kernelowej metadata jednostek. Invalid raw zachowuje lastValidSI wyłącznie dla preview; payload blokowany. Selektor per pole/osię korzysta z istniejących prymitywów Inspectora. Unit-only nie oznacza dirty także dla nowego obiektu.
 - Niezależny review źródeł konsumentów i integracji bez dalszych actionable findings; zgłoszone P1 import General i P2 create raw comparison poprawiono. Architecture/API hygiene oraz parser smoke PASS; diff-check PASS. Nie uruchamiano lokalnie testów, typecheck ani builda. Wykonanie nowych regresji i browser proof pozostaje CI, nie deklarujemy PASS przed wynikiem.
 - Pełne R0/R1 i ordinary durable receipts/generation qualification pozostają oddzielnym niezakończonym zakresem. Użytkownik żąda merge bieżącego etapu; merge dopiero po wymaganych kontrolach.
+
+## CI6b314 — native observer correction
+
+- HEAD6b314c031e28cbc12aa3de8fe7ecf22ca257be6e: React Doctor, contract/storage guards, Python, generated API, inspector-actions browser, FDM i API hygiene PASS. Control-room/Rust jeszcze trwają.
+- Browserfixture: viewport/WebGL memory/topology audit PASS, staged Move + enabled shared Apply osiągnięte. Następna asercja nativePointerDowns FAIL, bo observer na canvas bubble jest celowo blokowany produkcyjnym capture stopImmediatePropagation. Pomiar przeniesiony do document capture z event.target===rzeczywisty canvas, event.isTrusted i button===0; rygor liczby gestów i zero HTTP pozostaje. Parser node --check i diff-check PASS; nowy browser execution pending.
+- Source stage jednostek2eb18644a i batch task identity6b314c031 zapisane; master3857b9f02123e97448a2b32e6dd8982f78935593 włączony bez konfliktu. Worktree czysty przed tym pomiarem, cudzy dirty main zachowany. Opis PR zaktualizowany po jawnej zgodzie użytkownika.

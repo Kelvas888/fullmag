@@ -963,9 +963,13 @@ async function qualifyObjectMoveGestureAndSharedApply(page, inspector, fixture, 
   const canvas = page.locator(".fm-viewport-3d canvas").first();
   await canvas.evaluate((node, statsKey) => {
     const stats = { nativePointerDowns: 0 };
-    node.addEventListener("pointerdown", () => {
-      stats.nativePointerDowns += 1;
-    });
+    // Observe before the production canvas capture handler stops Orbit input.
+    // Count only trusted native left-button events targeting this actual canvas.
+    document.addEventListener("pointerdown", (event) => {
+      if (event.target === node && event.isTrusted && event.button === 0) {
+        stats.nativePointerDowns += 1;
+      }
+    }, true);
     Object.defineProperty(window, statsKey, {
       configurable: true,
       value: stats,
