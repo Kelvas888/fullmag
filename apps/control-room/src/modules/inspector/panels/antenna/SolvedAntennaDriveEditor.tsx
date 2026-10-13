@@ -15,6 +15,7 @@ import { FormField } from "../../primitives/FormField";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 import {
   buildSolvedDrive,
+  resolveCommittedSolvedDriveScene,
   acknowledgeSolvedDriveDraft,
   antennaRunStageIds,
   changeSolvedDriveWaveformKind,
@@ -177,20 +178,8 @@ export function SolvedAntennaDriveEditor({ driveId, scene, status, refetch }: Pr
         kind: "merge_patch" as const,
         merge_patch: { solved_antenna_drives: drives as unknown as JsonObject[] },
       };
-      const resolveCommitted = (result: AuthoringTransactionResponse): SceneResource => {
-        const committed = result.committed_scene;
-        const matches = committed?.solved_antenna_drives?.filter((item) => item.id === driveId) ?? [];
-        if (!committed || committed.scene?.id !== identity.sessionId || committed.revision !== result.scene_revision ||
-          !Number.isSafeInteger(result.scene_revision) || result.scene_revision <= revision || matches.length !== 1) {
-          throw new Error("Drive ACK did not provide the current committed scene. Refresh before saving again.");
-        }
-        const expected = solvedDriveDraft(updated);
-        const actual = solvedDriveDraft(matches[0]);
-        if ((Object.keys(expected) as Array<keyof SolvedDriveDraft>).some((field) => expected[field] !== actual[field])) {
-          throw new Error("Drive ACK changed the submitted parameters. Refresh before saving again.");
-        }
-        return committed;
-      };
+      const resolveCommitted = (result: AuthoringTransactionResponse) =>
+        resolveCommittedSolvedDriveScene(result, updated, identity.sessionId, revision);
       const response = await runAuthoringMutationWithHistory({
         api, authoringHistory, selection, resourceData: { [MODEL_SCENE_PATH]: scene },
         sessionScopeKey: scope, isCurrentSessionScope: isCurrent,
