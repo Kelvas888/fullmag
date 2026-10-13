@@ -411,12 +411,31 @@ def test_load_campaign_fences_v2_after_all_campaign_rows_are_parsed(tmp_path, mo
     _publish_v2_generation(case)
 
     def change_generation_during_validation(*args, **kwargs):
-        marker = case / "frequency_domain/generation.v2.json"
-        marker.write_bytes(marker.read_bytes() + b" ")
+        # Publish a distinct, valid immutable generation. Corrupting the
+        # selector would exercise canonical parsing, not the current fence.
+        member = case / "eigen/spectrum.v3.json"
+        member.write_bytes(member.read_bytes() + b" ")
+        _publish_v2_generation(case)
         return {"status": "pass"}
 
     monkeypatch.setattr(plotting, "validate_rows", change_generation_during_validation)
     with pytest.raises(ValueError, match="generation changed"):
+        plotting.load_campaign(batch)
+
+
+
+def test_load_campaign_fails_closed_on_noncanonical_current_marker(tmp_path, monkeypatch):
+    batch = _write_batch(tmp_path)
+    case = _artifact_dir(batch)
+    _publish_v2_generation(case)
+
+    def corrupt_marker_during_validation(*args, **kwargs):
+        marker = case / "frequency_domain/generation.v2.json"
+        marker.write_bytes(marker.read_bytes() + b" ")
+        return {"status": "pass"}
+
+    monkeypatch.setattr(plotting, "validate_rows", corrupt_marker_during_validation)
+    with pytest.raises(ValueError, match="generation commit is not canonical"):
         plotting.load_campaign(batch)
 
 
