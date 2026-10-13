@@ -1,8 +1,12 @@
-import { useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 
 import { MODEL_READINESS_PATH, MODEL_SCENE_PATH } from "@/kernel/api/apiPaths";
-import type { JsonObject, SceneResource } from "@/kernel/api/apiTypes";
+import type { AuthoringTransactionResponse, JsonObject, SceneResource } from "@/kernel/api/apiTypes";
+import { runAuthoringMutationWithHistory } from "@/kernel/authoring/authoringHistoryMutation";
 import { useKernel } from "@/kernel/KernelContext";
+import { publishCommittedSceneResource } from "@/kernel/resources/geometryLifecycleResources";
+import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
+import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { Button } from "@/shared/ui/Button";
 
 import { FeedbackBanner } from "../../primitives/FeedbackBanner";
@@ -11,6 +15,7 @@ import { FormField } from "../../primitives/FormField";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 import {
   buildSolvedDrive,
+  acknowledgeSolvedDriveDraft,
   antennaRunStageIds,
   changeSolvedDriveWaveformKind,
   solvedDriveDraft,
@@ -40,13 +45,31 @@ interface RevisionConflict {
 }
 
 export function SolvedAntennaDriveEditor({ driveId, scene, status, refetch }: Props) {
-  const { api, resources } = useKernel();
+  const { api, resources, commands, authoringHistory, selection } = useKernel();
+  const identity = useSessionResourceIdentity();
+  const scope = sessionRequestScopeKey(identity);
+  const key = JSON.stringify([scope, driveId]);
+  const [ownerState, setOwnerState] = useState({ key, token: {} });
+  const context = ownerState.key === key ? ownerState : { key, token: {} };
+  const owner = useRef<object | null>(null);
+  const inflight = useRef<object | null>(null);
+  useLayoutEffect(() => {
+    owner.current = context.token;
+    return () => { owner.current = null; };
+  }, [context.token]);
   const drive = scene?.solved_antenna_drives?.find((item) => item.id === driveId);
   const initial = drive ? solvedDriveDraft(drive) : null;
   const [local, setLocal] = useState<LocalDraft | null>(null);
   const [pending, setPending] = useState(false);
   const [conflictState, setConflictState] = useState<RevisionConflict | null>(null);
   const [feedbackState, setFeedbackState] = useState<{ id: string; message: string } | null>(null);
+  if (ownerState.key !== key) {
+    setOwnerState(context);
+    setLocal(null);
+    setConflictState(null);
+    setFeedbackState(null);
+    setPending(false);
+  }
   const draft = local?.id === driveId && initial
     ? {
         ...initial,
@@ -74,7 +97,8 @@ export function SolvedAntennaDriveEditor({ driveId, scene, status, refetch }: Pr
     ? local.dirtyKeys.filter((key) =>
         local.editedAgainst[key] !== initial[key] && local.draft[key] !== initial[key])
     : [];
-  const canSave = status === "ready" && validRevision && !pending &&
+  const canSave = Boolean(scope && identity && scene?.scene?.id === identity.sessionId) &&
+    status === "ready" && validRevision && !pending &&
     locallyConflictingKeys.length === 0 && (!conflict || conflictPhase === "rebased");
   const comparisonKeys = conflict && initial
     ? (Object.keys(draft ?? initial) as Array<keyof SolvedDriveDraft>).filter((key) =>
@@ -130,7 +154,14 @@ export function SolvedAntennaDriveEditor({ driveId, scene, status, refetch }: Pr
   }
 
   async function save() {
-    if (!drive || !draft || !canSave || typeof revision !== "number") return;
+    if (!drive || !draft || !canSave || typeof revision !== "number" || !scope || !identity || inflight.current) return;
+    const operation = {};
+    const ownerToken = context.token;
+    const historyGeneration = authoringHistory?.getGeneration?.();
+    const isCurrent = () => owner.current === ownerToken && commands.getSessionScopeKey() === scope &&
+      (historyGeneration === undefined || authoringHistory?.getGeneration?.() === historyGeneration);
+    if (!isCurrent()) return;
+    inflight.current = operation;
     setPending(true);
     setFeedbackState(null);
     try {
@@ -141,17 +172,39 @@ export function SolvedAntennaDriveEditor({ driveId, scene, status, refetch }: Pr
         throw new Error("Selected activation stage is not a Run stage in the current study.");
       }
       const drives = scene!.solved_antenna_drives!.map((item) => item.id === driveId ? updated : item);
-      const response = await api.model.commitTransaction({
+      const transaction = {
         base_revision: revision,
-        kind: "merge_patch",
+        kind: "merge_patch" as const,
         merge_patch: { solved_antenna_drives: drives as unknown as JsonObject[] },
-      });
-      resources.invalidate(MODEL_SCENE_PATH, response.scene_revision);
+      };
+      const resolveCommitted = (result: AuthoringTransactionResponse): SceneResource => {
+        const committed = result.committed_scene;
+        const matches = committed?.solved_antenna_drives?.filter((item) => item.id === driveId) ?? [];
+        if (!committed || committed.scene?.id !== identity.sessionId || committed.revision !== result.scene_revision ||
+          !Number.isSafeInteger(result.scene_revision) || result.scene_revision <= revision || matches.length !== 1) {
+          throw new Error("Drive ACK did not provide the current committed scene. Refresh before saving again.");
+        }
+        const expected = solvedDriveDraft(updated);
+        const actual = solvedDriveDraft(matches[0]);
+        if ((Object.keys(expected) as Array<keyof SolvedDriveDraft>).some((field) => expected[field] !== actual[field])) {
+          throw new Error("Drive ACK changed the submitted parameters. Refresh before saving again.");
+        }
+        return committed;
+      };
+      const response = await runAuthoringMutationWithHistory({
+        api, authoringHistory, selection, resourceData: { [MODEL_SCENE_PATH]: scene },
+        sessionScopeKey: scope, isCurrentSessionScope: isCurrent,
+      }, `Edit antenna drive ${driveId}`, () => api.model.commitTransaction(transaction, { sessionScopeKey: scope }), resolveCommitted);
+      if (!isCurrent()) return;
+      const committed = resolveCommitted(response);
+      const acknowledged = solvedDriveDraft(committed.solved_antenna_drives!.find((item) => item.id === driveId)!);
+      publishCommittedSceneResource(resources, committed, response.scene_revision, undefined, false, scope, api.resourceCacheScope);
       resources.invalidate(MODEL_READINESS_PATH, response.scene_revision);
       setFeedbackState({ id: driveId, message: "Antenna drive committed." });
-      setLocal(null);
+      setLocal((current) => acknowledgeSolvedDriveDraft(current, driveId, draft, acknowledged));
       setConflictState(null);
     } catch (error) {
+      if (!isCurrent()) return;
       const statusCode = (error as { status?: number })?.status;
       if (statusCode === 409) {
         setConflictState({ id: driveId, baseRevision: revision, baseDraft: initial!, phase: "conflict" });
@@ -160,7 +213,8 @@ export function SolvedAntennaDriveEditor({ driveId, scene, status, refetch }: Pr
         setFeedbackState({ id: driveId, message: error instanceof Error ? error.message : String(error) });
       }
     } finally {
-      setPending(false);
+      if (inflight.current === operation) inflight.current = null;
+      if (owner.current === ownerToken && commands.getSessionScopeKey() === scope) setPending(false);
     }
   }
 

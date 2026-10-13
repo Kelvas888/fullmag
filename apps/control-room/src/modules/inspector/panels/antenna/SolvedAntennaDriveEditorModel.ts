@@ -20,6 +20,30 @@ export interface SolvedDriveDraft {
   stageIds: string;
 }
 
+export interface SolvedDriveLocalDraft {
+  id: string;
+  draft: SolvedDriveDraft;
+  dirtyKeys: Array<keyof SolvedDriveDraft>;
+  editedAgainst: Partial<SolvedDriveDraft>;
+}
+
+/** Preserve edits made after submission and rebase them onto acknowledged values. */
+export function acknowledgeSolvedDriveDraft(
+  current: SolvedDriveLocalDraft | null, driveId: string,
+  submitted: SolvedDriveDraft, acknowledged: SolvedDriveDraft,
+): SolvedDriveLocalDraft | null {
+  if (!current || current.id !== driveId) return current;
+  const dirtyKeys = current.dirtyKeys.filter((key) =>
+    current.draft[key] !== submitted[key] && current.draft[key] !== acknowledged[key]);
+  if (!dirtyKeys.length) return null;
+  return {
+    ...current,
+    draft: { ...acknowledged, ...Object.fromEntries(dirtyKeys.map((key) => [key, current.draft[key]])) },
+    dirtyKeys,
+    editedAgainst: Object.fromEntries(dirtyKeys.map((key) => [key, acknowledged[key]])),
+  };
+}
+
 export const waveformDefaults = {
   frequencyHz: "1000000000",
   phaseRad: "0",
