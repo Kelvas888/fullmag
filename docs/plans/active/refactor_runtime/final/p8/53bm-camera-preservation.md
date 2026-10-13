@@ -92,10 +92,14 @@ jest w toku. To nie jest PASS ani dowód poprawności produkcyjnego restartu.
   stanu. Wymagane są potwierdzona remoteCamera oraz lastRemoteRevision,
   oprócz braku dirty/sync/error. Dla sessionless workspace pozostaje jawne
   camera=null. Regresja tej odmowy jest w realizacji.
-- P1 backend: camera-only PATCH nie zwiększa selection.revision będącej
-  rewizją visualization resource. Świeży scope i GET ograniczają ryzyko
-  podczas tego restartu, ale nie dowodzą invalidacji innych klientów.
-  Osobna poprawka rewizji pozostaje otwarta.
+- Wycofany P1 backend (ponowny audyt 13.10.2026): camera-only PATCH
+  zwiększa `selection.revision`. `patch_visualization_state` zawsze
+  wywołuje `apply_display_patch_to_state`, także dla pustego display patch;
+  ta funkcja bezwarunkowo zwiększa rewizję. Następnie handler publikuje ją
+  w realtime i odpowiedzi. Pełny przepływ w `display.rs:261`, `:352`,
+  `:409`, `:1819`, `:2020` potwierdziło niezależne review źródeł.
+  Wcześniejszy finding pomijał to wywołanie; nie wymaga poprawki backendu.
+  Rzeczywista synchronizacja kilku klientów nadal NOT VERIFIED.
 - P2 backend: orthographic_scale=null w PATCH jest interpretowane jak brak
   pola przez Option<f64>. Świeży backend ma domyślnie null, ale ACK/readback
   musi odmówić publikacji, jeśli docelowy stan nie zgadza się z capture.
@@ -216,3 +220,50 @@ Próba jest terminalnie FAILED, exit 1; wszystkie 19 procesów ma
 `waited=true`. Nie należy ponawiać jej jako żywego procesu ani uznawać za
 PASS. Diagnoza obserwacji gotowości i rzeczywisty restart kamery pozostają
 otwarte; żadna sesja użytkownika na 3197 nie została zatrzymana.
+
+### Diagnoza utraty obserwacji gotowości — 13.10.2026
+
+Prześledzono `readiness_frame` w
+`crates/fullmag-cli/src/control_room/development_workspace_probe.rs`.
+Wyjątek może pochodzić z odczytu consumer status przez prywatny kanał
+ownera API, odczytu pending restart slot albo zegara. Niezgodność
+`require_ready_identity` sama zwraca `Ok(None)` i nie tłumaczy terminalnego
+`readiness_observation_unconfirmed`. Consumer status nie używa HTTP:
+`OwnedDevelopmentApi::consumer_control` wysyła uwierzytelnione żądanie TCP
+na loopback, z limitem odpowiedzi 2 sekundy. Nie ustalono jeszcze, która
+z tych granic zawiodła w próbie `7b9184b3b1a4452dbe359867c0d98245`.
+
+Dodano do lokalnego kodu konteksty tych trzech granic i zapis łańcucha
+błędu na stderr. Zachowano terminalny wynik `unknown`, protokół stdout,
+warunki dopuszczenia restartu oraz istniejące timeouty. Statyczne review
+nie wykazało P0/P1 ani logowania owner tokenu/payloadu żądania.
+To diagnostyka, nie potwierdzona naprawa ani dowód zachowania kamery.
+
+Zarządzany build diagnostyki zakończył się przed kompilacją: exit 1,
+`2026-10-13T19:44:11.321932+00:00`, log
+`native-build-923110612a3a42899917c3770a8bafe6.log` w istniejącym profilu
+`windows-native-fdm-cpu-dev`. Przyczyna:
+`Source inventory differs from request fingerprints` podczas capture.
+Istniejący `capture_for_build` ponawia wyłącznie wyścigi źródeł do trzech
+prób; nie zwiększano limitu ani nie omijano kontroli. Sam komunikat nie
+rozstrzyga jeszcze przyczyny rozbieżności. Diagnostyka Rust pozostaje
+niezweryfikowana przez kompilację i rzeczywisty odczyt błędu.
+
+Następne żądanie buildu zakończyło oczekiwanie na slot ciężkiej pracy
+po 120 sekundach, exit 2, przed rozpoczęciem kompilacji
+(`Bounded wait expired before starting`). Oba nasze żądania są terminalne;
+nie uruchomiono równoległego wykonawcy i nie zatrzymywano obcych procesów.
+Następny krok: odróżnić zmiany plików od deterministycznej rozbieżności
+inventory/fingerprint, a po uzyskaniu slotu zbudować diagnostykę i ponowić
+prywatną próbę kamery. P8-53 i cały plan pozostają otwarte.
+
+Odczytowa kontrola inventory w kolejnym kroku zakończyła się exit 0:
+backend i dependencies miały odpowiednio zgodne pary hashów
+`d98cca6bbc0717e3b8412092871102cd3168d77801041deeaf289807f1f45049`
+oraz `e329a2b68344dbbec936f25fea9fc436fc9aee42183ace12644bb309a53386b6`,
+bez zmienionych/brakujących plików między tymi odczytami. To chwilowa
+obserwacja checkoutu, bez zapisu snapshotu, a nie dowód wcześniejszej
+przyczyny ani udanego buildu. Nie znaleziono deterministycznej rozbieżności
+filtrów przy tych wejściach. Slot ciężkiej pracy zajmował w tym czasie
+aktywny managed FEM GPU build-only z worktree `fem-script-launch-20261013`;
+jego procesów ani blokad nie zmieniano.
