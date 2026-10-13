@@ -59,6 +59,11 @@ SOURCE_PATHS = (
     "scripts/verify_development_handoff.py",
     "scripts/fullmag_storage.py",
     "scripts/windows/runtime_bundle.py",
+    "scripts/windows/compiler_inputs.py",
+    "scripts/windows/build_snapshot.py",
+    "scripts/windows/volatile_build_storage.py",
+    "scripts/test_windows_compiler_inputs.py",
+    "scripts/test_windows_development_compiler_inputs.py",
     "scripts/windows/development_status.py",
     "scripts/windows/watch_backend.py",
     "scripts/windows/workspace_backend_identity.py",
@@ -127,6 +132,7 @@ def run(repo_root: str) -> int:
         try:
             env = {**os.environ, **layout["env"],
                    "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUTF8": "1",
+                   "FULLMAG_TEST_TEMP_ROOT": str(fixtures),
                    "TEMP": str(fixtures), "TMP": str(fixtures), "TMPDIR": str(fixtures)}
             command = [sys.executable, "-m", "unittest", "discover", "-s", "scripts",
                        "-p", "test_*development_*.py", "-v"]
