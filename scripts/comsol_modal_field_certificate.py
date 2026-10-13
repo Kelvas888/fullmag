@@ -21,9 +21,12 @@ import hashlib
 import json
 import math
 from pathlib import Path, PurePosixPath
+import re
 import stat
 import struct
 from typing import Any, Mapping, Sequence
+
+import frequency_domain_generation
 
 
 CERTIFICATE_SCHEMA = "fullmag.comsol-modal-field-certificate.v1"
@@ -45,6 +48,10 @@ EXPECTED_PAYLOAD_ENCODING = "f64_interleaved_real_imag_xyz"
 EXPECTED_BINARY_LAYOUT = "complex_f64_pairs_little_endian"
 EXPECTED_INDEXING = "full_domain_node_order"
 EXPECTED_COMPONENT_BASIS = "global_xyz"
+_CAPTURE_UNSET = object()
+_MODE_MEMBER_PATTERN = re.compile(
+    r"^eigen/modes/sample_([0-9]{4,})/mode_([0-9]{4,})\.json$"
+)
 
 
 def _finite(value: object) -> bool:
@@ -95,10 +102,211 @@ def _file_record(path: Path, data: bytes, case_dir: Path) -> dict[str, Any]:
     return {"path": relative, "size_bytes": len(data), "sha256": _sha256_bytes(data)}
 
 
+def _validate_root_components(root: Path) -> None:
+    """Reject links in the captured root path before any marker lookup."""
+    root = Path(root)
+    if not root.is_absolute():
+        raise ValueError("artifact root must be absolute")
+    parts = root.parts
+    current = Path(root.anchor)
+    for component in parts[1:]:
+        current = current / component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return
+        except OSError as error:
+            raise ValueError(f"artifact root path cannot be inspected: {current}: {error}") from error
+        if stat.S_ISLNK(info.st_mode) or bool(getattr(info, "st_file_attributes", 0) & 0x400):
+            raise ValueError(f"artifact root traverses a symlink or reparse point: {current}")
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError(f"artifact root component is not a directory: {current}")
+
+class ArtifactBundleReader:
+    """Read one captured generation or a legacy case through a shared byte cache.
+
+    Nested certificate, field-loader, and replay callers pass the same reader so
+    a logical member is verified and read once, then every consumer parses those
+    exact bytes. A legacy bundle stays readable but has no generation binding.
+    """
+
+    def __init__(self, root: Path, *, generation_capture: object = _CAPTURE_UNSET) -> None:
+        self.root = Path(root).absolute()
+        _validate_root_components(self.root)
+        self._source_root = self.root
+        self._current_fence_status = "pending"
+        self.generation = (
+            frequency_domain_generation.capture(self.root)
+            if generation_capture is _CAPTURE_UNSET
+            else generation_capture
+        )
+        if self.generation is not None:
+            if not isinstance(self.generation, frequency_domain_generation.GenerationCapture):
+                raise ValueError("invalid frequency-domain generation capture")
+            if self.generation.root != self.root.resolve():
+                raise ValueError("frequency-domain generation capture belongs to another root")
+        self._raw: dict[str, bytes] = {}
+        self._records: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _logical(relative: object) -> str:
+        if not isinstance(relative, str) or not relative or "\\" in relative or ":" in relative or "\x00" in relative:
+            raise ValueError("artifact path is not a canonical logical path")
+        parsed = PurePosixPath(relative)
+        if (
+            parsed.is_absolute()
+            or parsed.as_posix() != relative
+            or any(part in {"", ".", ".."} for part in relative.split("/"))
+        ):
+            raise ValueError("artifact path is not a canonical logical path")
+        return relative
+
+    def logical_path(self, relative: str) -> Path:
+        logical = self._logical(relative)
+        return self.root.joinpath(*PurePosixPath(logical).parts)
+
+    def has_member(self, relative: str) -> bool:
+        logical = self._logical(relative)
+        if self.generation is not None:
+            return logical in self.generation.members
+        path = self.logical_path(logical)
+        reasons: list[str] = []
+        safe = _safe_relative_path(self.root, logical, "artifact member", reasons)
+        return safe is not None and _regular_file(path)
+
+    def iter_members(self, prefix: str) -> tuple[str, ...]:
+        if self.generation is None:
+            return ()
+        return self.generation.iter_members(prefix)
+
+    def read_bytes(self, relative: str, *, maximum_bytes: int | None = None) -> bytes:
+        logical = self._logical(relative)
+        if maximum_bytes is not None and (
+            isinstance(maximum_bytes, bool)
+            or not isinstance(maximum_bytes, int)
+            or maximum_bytes < 0
+        ):
+            raise ValueError("artifact byte bound must be a nonnegative integer")
+        cached = self._raw.get(logical)
+        if cached is not None:
+            if maximum_bytes is not None and len(cached) > maximum_bytes:
+                raise ValueError(f"artifact member exceeds reader byte budget: {logical}")
+            return cached
+        if self.generation is not None:
+            data = self.generation.read_member(logical, maximum_bytes=maximum_bytes)
+        else:
+            path = self.logical_path(logical)
+            reasons: list[str] = []
+            safe = _safe_relative_path(self.root, logical, "artifact member", reasons)
+            if safe is None or not _regular_file(safe):
+                raise FileNotFoundError(f"artifact member is missing or unsafe: {logical}")
+            with safe.open("rb") as stream:
+                if maximum_bytes is None:
+                    data = stream.read()
+                else:
+                    if isinstance(maximum_bytes, bool) or not isinstance(maximum_bytes, int) or maximum_bytes < 0:
+                        raise ValueError("artifact byte bound must be a nonnegative integer")
+                    data = stream.read(maximum_bytes + 1)
+                    if len(data) > maximum_bytes:
+                        raise ValueError(f"artifact member exceeds reader byte budget: {logical}")
+        self._raw[logical] = data
+        self._records[logical] = {
+            "path": logical,
+            "size_bytes": len(data),
+            "sha256": _sha256_bytes(data),
+        }
+        return data
+
+    def record_for(self, relative: str) -> dict[str, Any]:
+        logical = self._logical(relative)
+        record = self._records.get(logical)
+        if record is None:
+            raise ValueError(f"artifact member has not been read: {logical}")
+        return dict(record)
+
+    def read_json(
+        self,
+        relative: str,
+        *,
+        maximum_bytes: int = frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+    ) -> Any:
+        data = self.read_bytes(relative, maximum_bytes=maximum_bytes)
+        try:
+            return json.loads(data.decode("utf-8"))
+        except (UnicodeError, ValueError) as error:
+            raise ValueError(f"artifact JSON is not valid bounded UTF-8 JSON: {relative}: {error}") from error
+
+    def generation_descriptor(self) -> dict[str, Any]:
+        capture = self.generation
+        if capture is None:
+            return {
+                "generation_binding_status": (
+                    "stale" if self._current_fence_status == "stale" else "not_verified"
+                ),
+                "generation_id": None,
+                "schema_version": None,
+                "immutable": False,
+                "marker_path": None,
+                "marker_sha256": None,
+                "producer": None,
+                "current_fence_status": self._current_fence_status,
+            }
+        producer = capture.producer
+        return {
+            "generation_binding_status": (
+                "stale"
+                if self._current_fence_status == "stale"
+                else ("immutable_verified" if capture.is_immutable() else "byte_verified_mutable")
+            ),
+            "current_fence_status": self._current_fence_status,
+            "generation_id": capture.generation_id,
+            "schema_version": capture.schema_version,
+            "immutable": capture.is_immutable(),
+            "marker_path": capture.marker_path,
+            "marker_sha256": capture.marker_sha256,
+            "producer": (
+                {
+                    "run_id": producer.run_id,
+                    "stage_id": producer.stage_id,
+                    "stage_kind": producer.stage_kind,
+                }
+                if producer is not None
+                else None
+            ),
+        }
+
+    def ensure_current(self) -> None:
+        try:
+            current = frequency_domain_generation.capture(self._source_root)
+        except (OSError, ValueError):
+            self._current_fence_status = "stale"
+            raise
+        if self.generation is None:
+            if current is not None:
+                self._current_fence_status = "stale"
+                raise frequency_domain_generation.GenerationError(
+                    "frequency-domain generation appeared during artifact read"
+                )
+            self._current_fence_status = "no_generation_marker"
+            return
+        if (
+            current is None
+            or current.marker_sha256 != self.generation.marker_sha256
+            or current.generation_id != self.generation.generation_id
+            or current.schema_version != self.generation.schema_version
+            or current.root != self.generation.root
+        ):
+            self._current_fence_status = "stale"
+            raise frequency_domain_generation.GenerationError(
+                "frequency-domain generation changed during artifact read"
+            )
+        self._current_fence_status = "current"
+
+
 def _safe_relative_path(
     root: Path, raw: object, label: str, reasons: list[str]
 ) -> Path | None:
-    if not isinstance(raw, str) or not raw or "\\" in raw or "\x00" in raw:
+    if not isinstance(raw, str) or not raw or "\\" in raw or ":" in raw or "\x00" in raw:
         reasons.append(f"{label} is not a canonical relative POSIX path")
         return None
     relative = PurePosixPath(raw)
@@ -125,16 +333,25 @@ def _read_json(
     case_dir: Path,
     file_hashes: dict[str, dict[str, Any]],
     reasons: list[str],
+    reader: ArtifactBundleReader | None = None,
 ) -> dict[str, Any] | None:
-    if not _regular_file(path):
-        reasons.append(f"{label} is missing or is not a regular file: {path}")
-        return None
     try:
-        data = path.read_bytes()
-    except OSError as error:
+        if reader is not None:
+            relative = path.relative_to(case_dir).as_posix()
+            data = reader.read_bytes(
+                relative,
+                maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+            )
+            record = reader.record_for(relative)
+        else:
+            if not _regular_file(path):
+                reasons.append(f"{label} is missing or is not a regular file: {path}")
+                return None
+            data = path.read_bytes()
+            record = _file_record(path, data, case_dir)
+    except (OSError, ValueError) as error:
         reasons.append(f"{label} cannot be read: {error}")
         return None
-    record = _file_record(path, data, case_dir)
     file_hashes[record["path"]] = record
     try:
         value = json.loads(data.decode("utf-8"))
@@ -154,16 +371,30 @@ def _read_bytes(
     case_dir: Path,
     file_hashes: dict[str, dict[str, Any]],
     reasons: list[str],
+    maximum_bytes: int,
+    reader: ArtifactBundleReader | None = None,
 ) -> bytes | None:
-    if not _regular_file(path):
-        reasons.append(f"{label} is missing or is not a regular file: {path}")
+    if not _integer(maximum_bytes) or maximum_bytes < 0:
+        reasons.append(f"{label} expected byte bound is invalid")
         return None
     try:
-        data = path.read_bytes()
-    except OSError as error:
+        if reader is not None:
+            relative = path.relative_to(case_dir).as_posix()
+            data = reader.read_bytes(relative, maximum_bytes=maximum_bytes)
+            record = reader.record_for(relative)
+        else:
+            if not _regular_file(path):
+                reasons.append(f"{label} is missing or is not a regular file: {path}")
+                return None
+            with path.open("rb") as stream:
+                data = stream.read(maximum_bytes + 1)
+            if len(data) > maximum_bytes:
+                reasons.append(f"{label} exceeds expected byte count {maximum_bytes}")
+                return None
+            record = _file_record(path, data, case_dir)
+    except (OSError, ValueError) as error:
         reasons.append(f"{label} cannot be read: {error}")
         return None
-    record = _file_record(path, data, case_dir)
     file_hashes[record["path"]] = record
     return data
 
@@ -256,19 +487,28 @@ def _selected_mode_paths(
     case_dir: Path,
     selections: list[tuple[int, int]] | None,
     reasons: list[str],
+    reader: ArtifactBundleReader | None = None,
 ) -> tuple[list[tuple[Path, tuple[int, int] | None]], str]:
     if selections is None:
+        if reader is not None and reader.generation is not None:
+            paths: list[tuple[Path, tuple[int, int] | None]] = []
+            for logical in reader.iter_members("eigen/modes"):
+                match = _MODE_MEMBER_PATTERN.fullmatch(logical)
+                if match is None:
+                    continue
+                paths.append((reader.logical_path(logical), (int(match.group(1)), int(match.group(2)))))
+            if not paths:
+                reasons.append("no declared mode metadata found under eigen/modes/sample_*/mode_*.json")
+            return paths, "discovered_generation_members"
         return [(path, None) for path in _discover_mode_paths(case_dir, reasons)], "discovered_all"
     paths: list[tuple[Path, tuple[int, int] | None]] = []
     for sample_index, raw_mode_index in selections:
-        path = (
-            case_dir
-            / "eigen"
-            / "modes"
-            / f"sample_{sample_index:04d}"
-            / f"mode_{raw_mode_index:04d}.json"
+        relative = (
+            f"eigen/modes/sample_{sample_index:04d}/mode_{raw_mode_index:04d}.json"
         )
-        if not _regular_file(path):
+        path = reader.logical_path(relative) if reader is not None else case_dir.joinpath(*PurePosixPath(relative).parts)
+        present = reader.has_member(relative) if reader is not None else _regular_file(path)
+        if not present:
             reasons.append(
                 f"selected mode ({sample_index}, {raw_mode_index}) metadata is missing: {path}"
             )
@@ -537,6 +777,7 @@ def _validate_mode(
     contract: Mapping[str, Any],
     phase_tolerance: float,
     hashes: dict[str, dict[str, Any]],
+    reader: ArtifactBundleReader | None = None,
 ) -> dict[str, Any]:
     label = path.as_posix()
     local: list[str] = []
@@ -565,20 +806,34 @@ def _validate_mode(
         if relative_payload != expected_payload:
             local.append(f"{label} payload path does not match its sample/raw mode identity")
             relative_payload = None
-    payload_path = (
-        _safe_relative_path(case_dir, relative_payload, f"{label}.payload_path", local)
-        if relative_payload is not None
-        else None
-    )
+    payload_path = None
+    if relative_payload is not None:
+        payload_path = (
+            reader.logical_path(relative_payload)
+            if reader is not None
+            else _safe_relative_path(case_dir, relative_payload, f"{label}.payload_path", local)
+        )
     expected_bytes = node_count * 6 * struct.calcsize("<d")
     data = (
-        _read_bytes(payload_path, label=f"{label}.vector.bin", case_dir=case_dir, file_hashes=hashes, reasons=local)
+        _read_bytes(
+            payload_path,
+            label=f"{label}.vector.bin",
+            case_dir=case_dir,
+            file_hashes=hashes,
+            reasons=local,
+            maximum_bytes=expected_bytes,
+            reader=reader,
+        )
         if payload_path is not None
         else None
     )
     vectors: list[tuple[complex, complex, complex]] = []
     if data is not None:
-        actual = _file_record(payload_path, data, case_dir)
+        actual = (
+            reader.record_for(relative_payload)
+            if reader is not None and relative_payload is not None
+            else _file_record(payload_path, data, case_dir)
+        )
         report.update({"vector_path": actual["path"], "vector_size_bytes": len(data), "vector_sha256": actual["sha256"]})
         if len(data) != expected_bytes:
             local.append(f"{label}.vector.bin length {len(data)} does not equal expected {expected_bytes}")
@@ -662,6 +917,8 @@ def validate_modal_field_certificate(
     selected_modes: Sequence[object] | None = None,
     metadata_path: Path | None = None,
     phase_tolerance: float = DEFAULT_PHASE_TOLERANCE,
+    bundle_reader: ArtifactBundleReader | None = None,
+    final_fence: bool = True,
 ) -> dict[str, Any]:
     """Validate selected exported mode fields and return a JSON report.
 
@@ -672,7 +929,7 @@ def validate_modal_field_certificate(
     a gate should pass its explicit branch-table selections.
     """
 
-    case_dir = Path(case_dir)
+    case_dir = Path(case_dir).absolute()
     reasons: list[str] = []
     hashes: dict[str, dict[str, Any]] = {}
     if mode_selections is not None and selected_modes is not None:
@@ -702,11 +959,32 @@ def validate_modal_field_certificate(
         "validated_mode_count": 0,
         "modes": [],
         "file_hashes": [],
+        "artifact_generation": {
+            "generation_binding_status": "not_verified",
+            "generation_id": None,
+            "schema_version": None,
+            "immutable": False,
+            "marker_path": None,
+            "marker_sha256": None,
+            "producer": None,
+        },
         "reasons": reasons,
     }
     if not _regular_directory(case_dir):
         reasons.append(f"case directory is missing or unsafe: {case_dir}")
         return base
+
+    reader = bundle_reader
+    if reader is None:
+        try:
+            reader = ArtifactBundleReader(case_dir)
+        except (OSError, ValueError) as error:
+            reasons.append(f"frequency-domain artifact generation capture failed: {error}")
+            return base
+    elif reader.root != case_dir.absolute():
+        reasons.append("artifact bundle reader belongs to another case directory")
+        return base
+    base["artifact_generation"] = reader.generation_descriptor()
 
     native_metadata = (
         Path(metadata_path) if metadata_path is not None else case_dir / "metadata.json"
@@ -717,12 +995,26 @@ def validate_modal_field_certificate(
     except ValueError:
         reasons.append("native metadata.json must be contained in case_dir")
         return base
-    native_metadata = _safe_relative_path(
-        case_dir, relative_metadata.as_posix(), "native metadata.json", reasons
-    )
+    logical_metadata = relative_metadata.as_posix()
+    try:
+        native_metadata = (
+            reader.logical_path(logical_metadata)
+            if reader.generation is not None
+            else _safe_relative_path(case_dir, logical_metadata, "native metadata.json", reasons)
+        )
+    except ValueError as error:
+        reasons.append(f"native metadata.json path is invalid: {error}")
+        return base
     if native_metadata is None:
         return base
-    metadata = _read_json(native_metadata, label="native metadata.json", case_dir=case_dir, file_hashes=hashes, reasons=reasons)
+    metadata = _read_json(
+        native_metadata,
+        label="native metadata.json",
+        case_dir=case_dir,
+        file_hashes=hashes,
+        reasons=reasons,
+        reader=reader,
+    )
     backend_plan: Mapping[str, Any] | None = None
     contract: dict[str, Any] = {"selected_pairs": [], "requested_pair_ids": [], "node_pair_ids": [], "boundary_pair_ids": [], "missing_pair_ids": []}
     node_count: int | None = None
@@ -743,11 +1035,18 @@ def validate_modal_field_certificate(
                 base["backend_plan"] = {"mesh_node_count": node_count, "spin_wave_bc_kind": contract.get("kind")}
                 base["pair_contract"] = _pair_report(contract)
 
-    paths, selection_policy = _selected_mode_paths(case_dir, normalized, reasons)
+    paths, selection_policy = _selected_mode_paths(case_dir, normalized, reasons, reader)
     base["selection_policy"] = selection_policy
     for index, (path, expected) in enumerate(paths):
         local_reasons: list[str] = []
-        mode = _read_json(path, label=f"mode metadata {path}", case_dir=case_dir, file_hashes=hashes, reasons=local_reasons)
+        mode = _read_json(
+            path,
+            label=f"mode metadata {path}",
+            case_dir=case_dir,
+            file_hashes=hashes,
+            reasons=local_reasons,
+            reader=reader,
+        )
         if mode is None:
             report = {"metadata_path": path.relative_to(case_dir).as_posix(), "status": "fail", "reasons": local_reasons, "phase_checks": []}
         elif node_count is None:
@@ -762,6 +1061,7 @@ def validate_modal_field_certificate(
                 contract=contract,
                 phase_tolerance=float(phase_tolerance),
                 hashes=hashes,
+                reader=reader,
             )
         base["modes"].append(report)
         reasons.extend(f"{report['metadata_path']}: {item}" for item in report.get("reasons", []))
@@ -771,6 +1071,12 @@ def validate_modal_field_certificate(
     base["file_hashes"] = [hashes[key] for key in sorted(hashes)]
     if not base["modes"]:
         reasons.append("no modal fields were available for independent certification")
+    if final_fence:
+        try:
+            reader.ensure_current()
+        except (OSError, ValueError) as error:
+            reasons.append(f"frequency-domain artifact generation final fence failed: {error}")
+        base["artifact_generation"] = reader.generation_descriptor()
     if (
         base["modes"]
         and all(item.get("status") == "pass" for item in base["modes"])
@@ -792,6 +1098,8 @@ def validate_modal_potential_phase_certificate(
     *,
     mode_selections: Sequence[object] | None = None,
     phase_tolerance: float = DEFAULT_PHASE_TOLERANCE,
+    bundle_reader: ArtifactBundleReader | None = None,
+    final_fence: bool = True,
 ) -> dict[str, Any]:
     """Replay exported full-node scalar-potential Floquet seams from disk.
 
@@ -803,7 +1111,7 @@ def validate_modal_potential_phase_certificate(
     VERIFIED until that evidence is published.
     """
 
-    case_dir = Path(case_dir)
+    case_dir = Path(case_dir).absolute()
     reasons: list[str] = []
     hashes: dict[str, dict[str, Any]] = {}
     selections = _normalize_selections(mode_selections, reasons)
@@ -838,6 +1146,15 @@ def validate_modal_potential_phase_certificate(
         "validated_mode_count": 0,
         "modes": [],
         "file_hashes": [],
+        "artifact_generation": {
+            "generation_binding_status": "not_verified",
+            "generation_id": None,
+            "schema_version": None,
+            "immutable": False,
+            "marker_path": None,
+            "marker_sha256": None,
+            "producer": None,
+        },
         "reasons": reasons,
     }
     if selections is None:
@@ -846,11 +1163,26 @@ def validate_modal_potential_phase_certificate(
     if not _regular_directory(case_dir):
         reasons.append(f"case directory is missing or unsafe: {case_dir}")
         return base
-    if not _regular_directory(case_dir / "eigen"):
+    reader = bundle_reader
+    if reader is None:
+        try:
+            reader = ArtifactBundleReader(case_dir)
+        except (OSError, ValueError) as error:
+            reasons.append(f"frequency-domain artifact generation capture failed: {error}")
+            return base
+    elif reader.root != case_dir.absolute():
+        reasons.append("artifact bundle reader belongs to another case directory")
+        return base
+    base["artifact_generation"] = reader.generation_descriptor()
+    if reader.generation is None and not _regular_directory(case_dir / "eigen"):
         reasons.append("potential phase replay requires the published eigen artifact directory")
         return base
 
-    metadata_path = _safe_relative_path(case_dir, "metadata.json", "native metadata.json", reasons)
+    metadata_path = (
+        reader.logical_path("metadata.json")
+        if reader.generation is not None
+        else _safe_relative_path(case_dir, "metadata.json", "native metadata.json", reasons)
+    )
     metadata = (
         _read_json(
             metadata_path,
@@ -858,6 +1190,7 @@ def validate_modal_potential_phase_certificate(
             case_dir=case_dir,
             file_hashes=hashes,
             reasons=reasons,
+            reader=reader,
         )
         if metadata_path is not None
         else None
@@ -897,7 +1230,7 @@ def validate_modal_potential_phase_certificate(
 
     contract_invalid = bool(reasons)
 
-    paths, _selection_policy = _selected_mode_paths(case_dir, selections, reasons)
+    paths, _selection_policy = _selected_mode_paths(case_dir, selections, reasons, reader)
     selection_paths_complete = len(paths) == len(selections)
     mode_reports: list[dict[str, Any]] = []
     any_phase_failure = False
@@ -926,6 +1259,7 @@ def validate_modal_potential_phase_certificate(
             case_dir=case_dir,
             file_hashes=hashes,
             reasons=local,
+            reader=reader,
         )
         if mode is None or node_count is None or backend_plan is None:
             local.append("mode metadata or source mesh is unavailable for potential replay")
@@ -960,11 +1294,15 @@ def validate_modal_potential_phase_certificate(
             f"eigen/mode_fields/sample_{expected_selection[0]:04d}/"
             f"mode_{expected_selection[1]:04d}/physical_potential.v1.json"
         )
-        manifest_path = _safe_relative_path(
-            case_dir,
-            manifest_relative,
-            f"{relative_mode}.physical_potential_manifest",
-            local,
+        manifest_path = (
+            reader.logical_path(manifest_relative)
+            if reader.generation is not None
+            else _safe_relative_path(
+                case_dir,
+                manifest_relative,
+                f"{relative_mode}.physical_potential_manifest",
+                local,
+            )
         )
         manifest = (
             _read_json(
@@ -973,13 +1311,14 @@ def validate_modal_potential_phase_certificate(
                 case_dir=case_dir,
                 file_hashes=hashes,
                 reasons=local,
+                reader=reader,
             )
             if manifest_path is not None
             else None
         )
         if manifest is None:
             all_modes_phase_pass = False
-            if manifest_path is None or manifest_path.exists():
+            if manifest_path is None or reader.has_member(manifest_relative):
                 mode_report["status"] = "fail"
             mode_reports.append(mode_report)
             reasons.extend(f"{relative_mode}: {reason}" for reason in local)
@@ -1039,11 +1378,16 @@ def validate_modal_potential_phase_certificate(
         if not _integer(payload_count) or int(payload_count) != node_count:
             local.append("physical potential payload node count does not match the source mesh")
 
-        payload_path = _safe_relative_path(
-            case_dir,
-            expected_payload_relative,
-            f"{relative_mode}.potential_full.bin",
-            local,
+        expected_bytes = node_count * 2 * struct.calcsize("<d")
+        payload_path = (
+            reader.logical_path(expected_payload_relative)
+            if reader.generation is not None
+            else _safe_relative_path(
+                case_dir,
+                expected_payload_relative,
+                f"{relative_mode}.potential_full.bin",
+                local,
+            )
         )
         payload = (
             _read_bytes(
@@ -1052,14 +1396,19 @@ def validate_modal_potential_phase_certificate(
                 case_dir=case_dir,
                 file_hashes=hashes,
                 reasons=local,
+                maximum_bytes=expected_bytes,
+                reader=reader,
             )
             if payload_path is not None
             else None
         )
         values: list[complex] = []
-        expected_bytes = node_count * 2 * struct.calcsize("<d")
         if payload is not None:
-            actual = _file_record(payload_path, payload, case_dir)
+            actual = (
+                reader.record_for(expected_payload_relative)
+                if reader.generation is not None
+                else _file_record(payload_path, payload, case_dir)
+            )
             mode_report.update(
                 {
                     "potential_path": actual["path"],
@@ -1238,6 +1587,17 @@ def validate_modal_potential_phase_certificate(
     else:
         base["status"] = "not_verified"
     base["file_hashes"] = [hashes[key] for key in sorted(hashes)]
+    fence_failed = False
+    if final_fence:
+        try:
+            reader.ensure_current()
+        except (OSError, ValueError) as error:
+            fence_failed = True
+            reasons.append(f"frequency-domain artifact generation final fence failed: {error}")
+        base["artifact_generation"] = reader.generation_descriptor()
+    if fence_failed:
+        base["status"] = "fail"
+        base["phase_status"] = "fail"
     return base
 
 
@@ -1248,6 +1608,8 @@ def validate_comsol_modal_field_certificate(
     selected_modes: Sequence[object] | None = None,
     metadata_path: Path | None = None,
     phase_tolerance: float = DEFAULT_PHASE_TOLERANCE,
+    bundle_reader: ArtifactBundleReader | None = None,
+    final_fence: bool = True,
 ) -> dict[str, Any]:
     """Alias for callers using the COMSOL gate name."""
     return validate_modal_field_certificate(
@@ -1256,6 +1618,8 @@ def validate_comsol_modal_field_certificate(
         selected_modes=selected_modes,
         metadata_path=metadata_path,
         phase_tolerance=phase_tolerance,
+        bundle_reader=bundle_reader,
+        final_fence=final_fence,
     )
 
 

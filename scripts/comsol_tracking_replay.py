@@ -3,13 +3,13 @@
 Metric and full-path assignment certificates are separate. Even a complete
 assignment replay retains NOT VERIFIED for overall scientific qualification.
 """
-import hashlib
 import json
 import math
 from pathlib import Path
 
 import numpy as np
 
+from comsol_modal_field_certificate import ArtifactBundleReader
 from comsol_tracking_fields import load_tracking_fields
 from comsol_tracking_assignment import maximum_weight_assignment
 from comsol_tracking_clusters import frequency_group_candidates
@@ -362,23 +362,44 @@ def replay_recorded_frames(metric, modes, branches, samples, *, candidate_branch
             "qualification": "NOT VERIFIED"}
 
 
-def replay_tracking_fields(case_dir, *, selected_branch_ids=None, expected_hashes=None):
+def replay_tracking_fields(
+    case_dir,
+    *,
+    selected_branch_ids=None,
+    expected_hashes=None,
+    bundle_reader=None,
+):
     """Replay all candidates; selected IDs identify the comparison, not a filter."""
-    root = Path(case_dir)
-    report = {"status": "missing", "qualification": "NOT VERIFIED", "reasons": []}
+    root = Path(case_dir).absolute()
+    report = {
+        "status": "missing",
+        "qualification": "NOT VERIFIED",
+        "reasons": [],
+        "artifact_generation": {
+            "generation_binding_status": "not_verified",
+            "generation_id": None,
+            "schema_version": None,
+            "immutable": False,
+            "marker_path": None,
+            "marker_sha256": None,
+            "producer": None,
+        },
+    }
+    reader = None
+    final_fence_failed = False
     try:
+        reader = bundle_reader if bundle_reader is not None else ArtifactBundleReader(root)
+        if reader.root != root.absolute():
+            raise ValueError("artifact bundle reader belongs to another case directory")
+        report["artifact_generation"] = reader.generation_descriptor()
         inputs = {}
         hashes = []
         for relative in ("eigen/spectrum.v2.json", "eigen/branches.v2.json"):
-            path = root / relative
-            for candidate in (path, *path.parents):
-                if candidate.is_symlink() or (hasattr(candidate, "is_junction") and candidate.is_junction()):
-                    raise ValueError("tracking control input is a link")
-                if candidate == root:
-                    break
-            data = path.read_bytes()
-            inputs[relative] = json.loads(data)
-            hashes.append({"path": relative, "sha256": "sha256:" + hashlib.sha256(data).hexdigest()})
+            inputs[relative] = reader.read_json(relative)
+            hashes.append({
+                "path": relative,
+                "sha256": reader.record_for(relative)["sha256"],
+            })
         spectrum = inputs["eigen/spectrum.v2.json"]
         branches = inputs["eigen/branches.v2.json"]
         candidate_branch_ids = {}
@@ -402,11 +423,23 @@ def replay_tracking_fields(case_dir, *, selected_branch_ids=None, expected_hashe
             # callers select a subset for their scientific comparison.
         selections = spectrum_candidate_selections(spectrum["samples"])
         for sample, raw in selections:
-            for relative in (f"eigen/modes/sample_{sample:04d}/mode_{raw:04d}.json",
-                             f"eigen/mode_fields/sample_{sample:04d}/mode_{raw:04d}/vector.bin"):
-                if not (root / relative).is_file():
+            required = (
+                f"eigen/modes/sample_{sample:04d}/mode_{raw:04d}.json",
+                f"eigen/mode_fields/sample_{sample:04d}/mode_{raw:04d}/vector.bin",
+            )
+            for relative in required:
+                if not reader.has_member(relative):
+                    if reader.generation is not None:
+                        raise ValueError(
+                            f"tracking field is not a member of the captured generation: {relative}"
+                        )
                     raise FileNotFoundError(f"tracking field payload missing: {relative}")
-        fields = load_tracking_fields(root, selections)
+        fields = load_tracking_fields(
+            root,
+            selections,
+            bundle_reader=reader,
+            final_fence=False,
+        )
         bind_candidate_fields(spectrum["samples"], fields["modes"])
         bound_hashes = hashes + fields["file_hashes"]
         if expected_hashes is not None:
@@ -418,10 +451,19 @@ def replay_tracking_fields(case_dir, *, selected_branch_ids=None, expected_hashe
                                         candidate_branch_ids=candidate_branch_ids)
         report.update(file_hashes=bound_hashes, reasons=[], replayed_branch_scope="all_candidates",
             selected_branch_ids=sorted(selected_branch_ids) if selected_branch_ids is not None else None,
+            artifact_generation=reader.generation_descriptor(),
             candidate_field_coverage={"status": "pass", "exported_candidate_count": len(selections),
                                       "solver_spectral_completeness": "NOT VERIFIED"})
+        try:
+            reader.ensure_current()
+        except (OSError, ValueError):
+            final_fence_failed = True
+            raise
+        report["artifact_generation"] = reader.generation_descriptor()
     except (OSError, ValueError, TypeError, KeyError, IndexError, OverflowError, AttributeError) as error:
         report["reasons"] = [str(error)]
         # Missing fields fail closed without pretending the replay executed.
-        report["status"] = "missing" if isinstance(error, OSError) else "fail"
+        report["status"] = "fail" if final_fence_failed else ("missing" if isinstance(error, OSError) else "fail")
+        if reader is not None:
+            report["artifact_generation"] = reader.generation_descriptor()
     return report

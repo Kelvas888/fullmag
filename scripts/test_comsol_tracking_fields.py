@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import numpy as np
 
+from frequency_domain_generation import GenerationCapture
 from comsol_mesh_identity import mesh_topology_fingerprint_v3
 from comsol_tracking_fields import load_tracking_fields
 from comsol_modal_field_certificate import validate_modal_field_certificate
@@ -54,6 +55,38 @@ def write_tracking_fixture(root):
     return mode_path, envelope
 
 
+def publish_v2_generation(root, *, exclude=()):
+    files = {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+        and not path.relative_to(root).as_posix().startswith("frequency_domain/")
+        and path.relative_to(root).as_posix() not in exclude
+    }
+    members = {
+        logical: {"byte_length": len(data), "sha256": "sha256:" + hashlib.sha256(data).hexdigest()}
+        for logical, data in sorted(files.items())
+    }
+    content = {
+        "schema_version": "frequency_domain_artifact_generation.v2",
+        "producer": {"run_id": "fixture-run", "stage_id": "eigen", "stage_kind": "eigensolve"},
+        "members": members,
+    }
+    canonical = json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    generation_id = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    generation_root = root / "frequency_domain/generations" / generation_id[7:]
+    for logical, data in files.items():
+        target = generation_root.joinpath(*logical.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    marker = json.dumps({"generation_id": generation_id, "content": content},
+                        ensure_ascii=False, indent=2).encode("utf-8")
+    marker_path = root / "frequency_domain/generation.v2.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_bytes(marker)
+    return generation_id
+
+
 class TrackingFieldTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -65,6 +98,27 @@ class TrackingFieldTests(unittest.TestCase):
         result = load_tracking_fields(self.root, [(0, 7)])
         np.testing.assert_allclose(result["modes"][(0, 7)]["envelope"], self.envelope, atol=1e-14)
         self.assertEqual(result["qualification"], "NOT VERIFIED")
+        self.assertEqual(result["artifact_generation"]["generation_binding_status"], "not_verified")
+
+    def test_shared_v2_reader_reads_each_member_once_across_certificate_and_loader(self):
+        generation_id = publish_v2_generation(self.root)
+        counts = {}
+        original = GenerationCapture.read_member
+
+        def counted_read(capture, relative, maximum_bytes=None):
+            counts[relative] = counts.get(relative, 0) + 1
+            return original(capture, relative, maximum_bytes=maximum_bytes)
+
+        with patch.object(GenerationCapture, "read_member", counted_read):
+            result = load_tracking_fields(self.root, [(0, 7)])
+
+        self.assertEqual(result["artifact_generation"]["generation_binding_status"], "immutable_verified")
+        self.assertEqual(result["artifact_generation"]["generation_id"], generation_id)
+        self.assertEqual(counts, {
+            "metadata.json": 1,
+            "eigen/modes/sample_0000/mode_0007.json": 1,
+            "eigen/mode_fields/sample_0000/mode_0007/vector.bin": 1,
+        })
 
     def test_coherent_declared_mesh_digest_cannot_replace_geometry(self):
         mode = json.loads(self.mode_path.read_text())

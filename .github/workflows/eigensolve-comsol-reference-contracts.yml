@@ -13,6 +13,10 @@ on:
       - 'scripts/test_comsol_signed_k_replay.py'
       - 'scripts/comsol_modal_field_certificate.py'
       - 'scripts/test_comsol_modal_field_certificate.py'
+      - 'scripts/comsol_tracking_fields.py'
+      - 'scripts/test_comsol_tracking_fields.py'
+      - 'scripts/comsol_tracking_replay.py'
+      - 'scripts/test_comsol_tracking_replay.py'
       - 'scripts/validate_comsol_dispersion_scientific_gate.py'
       - 'scripts/test_validate_comsol_dispersion_scientific_gate.py'
       - 'scripts/compare_comsol_a1_frequency_reference.py'
@@ -56,6 +60,8 @@ jobs:
           python -B -m pytest -q
           scripts/test_validate_comsol_dispersion_scientific_gate.py
           scripts/test_comsol_modal_field_certificate.py
+          scripts/test_comsol_tracking_fields.py
+          scripts/test_comsol_tracking_replay.py
           scripts/test_comsol_cross_run_matching.py
           scripts/test_comsol_signed_k_replay.py
           scripts/test_compare_comsol_a1_frequency_reference.py

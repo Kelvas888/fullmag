@@ -162,6 +162,73 @@ def write_full_potential(case_dir: Path, values: list[complex], *, k=None) -> tu
     return manifest_path, payload_path
 
 
+def publish_v2_generation(case_dir: Path, *, exclude: tuple[str, ...] = ()) -> str:
+    """Write a Rust-canonical v2 fixture from the current legacy-shaped files."""
+    files = {
+        path.relative_to(case_dir).as_posix(): path.read_bytes()
+        for path in case_dir.rglob("*")
+        if path.is_file()
+        and not path.relative_to(case_dir).as_posix().startswith("frequency_domain/")
+        and path.relative_to(case_dir).as_posix() not in exclude
+    }
+    members = {
+        logical: {
+            "byte_length": len(data),
+            "sha256": "sha256:" + hashlib.sha256(data).hexdigest(),
+        }
+        for logical, data in sorted(files.items())
+    }
+    content = {
+        "schema_version": "frequency_domain_artifact_generation.v2",
+        "producer": {"run_id": "fixture-run", "stage_id": "eigen", "stage_kind": "eigensolve"},
+        "members": members,
+    }
+    canonical = json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    generation_id = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    generation_root = case_dir / "frequency_domain/generations" / generation_id[7:]
+    for logical, data in files.items():
+        target = generation_root.joinpath(*logical.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    marker = json.dumps(
+        {"generation_id": generation_id, "content": content},
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+    marker_path = case_dir / "frequency_domain/generation.v2.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_bytes(marker)
+    return generation_id
+
+
+def publish_v1_generation(case_dir: Path) -> str:
+    files = {
+        path.relative_to(case_dir).as_posix(): path.read_bytes()
+        for path in case_dir.rglob("*")
+        if path.is_file()
+        and not path.relative_to(case_dir).as_posix().startswith("frequency_domain/")
+    }
+    content = {
+        "schema_version": "frequency_domain_artifact_generation.v1",
+        "producer": {"run_id": "fixture-run", "stage_id": "eigen", "stage_kind": "eigensolve"},
+        "members": {
+            logical: {
+                "byte_length": len(data),
+                "sha256": "sha256:" + hashlib.sha256(data).hexdigest(),
+            }
+            for logical, data in sorted(files.items())
+        },
+    }
+    canonical = json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    generation_id = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    marker = json.dumps({"generation_id": generation_id, "content": content},
+                        ensure_ascii=False, indent=2).encode("utf-8")
+    marker_path = case_dir / "frequency_domain/generation.v1.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_bytes(marker)
+    return generation_id
+
+
 def good_potential_values(k=(math.pi / 2.0, 0.0, 0.0)) -> list[complex]:
     coordinates = [
         (0.0, 0.0, 0.0),
@@ -206,6 +273,173 @@ def test_good_selected_raw_mode_is_certified_and_hashes_real_files(tmp_path: Pat
     assert hashes["eigen/mode_fields/sample_0000/mode_0007/vector.bin"] == (
         f"sha256:{hashlib.sha256(vector_path.read_bytes()).hexdigest()}"
     )
+    assert report["artifact_generation"]["generation_binding_status"] == "not_verified"
+
+
+def test_reader_rejects_windows_drive_and_ads_logical_paths_without_capturing(tmp_path: Path, monkeypatch) -> None:
+    module = load_module()
+    case_dir, _ = write_case(tmp_path, vectors=good_vectors(), raw_mode_index=7)
+    capture_calls = []
+    monkeypatch.setattr(
+        module.frequency_domain_generation,
+        "capture",
+        lambda root: capture_calls.append(root),
+    )
+
+    reader = module.ArtifactBundleReader(case_dir, generation_capture=None)
+
+    assert capture_calls == []
+    for invalid in ("C:metadata.json", "metadata.json:payload"):
+        with pytest.raises(ValueError, match="canonical logical path"):
+            reader.logical_path(invalid)
+        reasons = []
+        assert module._safe_relative_path(case_dir, invalid, "test member", reasons) is None
+        assert reasons
+
+
+def test_legacy_capture_reports_stale_if_generation_appears_before_final_fence(tmp_path: Path, monkeypatch) -> None:
+    module = load_module()
+    case_dir, _ = write_case(tmp_path, vectors=good_vectors(), raw_mode_index=7)
+    reader = module.ArtifactBundleReader(case_dir, generation_capture=None)
+    monkeypatch.setattr(module.frequency_domain_generation, "capture", lambda root: object())
+
+    with pytest.raises(module.frequency_domain_generation.GenerationError, match="appeared"):
+        reader.ensure_current()
+
+    descriptor = reader.generation_descriptor()
+    assert descriptor["generation_binding_status"] == "stale"
+    assert descriptor["current_fence_status"] == "stale"
+
+def test_explicit_legacy_capture_still_rejects_symlink_root(tmp_path: Path) -> None:
+    module = load_module()
+    case_dir, _ = write_case(tmp_path, vectors=good_vectors(), raw_mode_index=7)
+    linked_root = tmp_path / "case-link"
+    try:
+        linked_root.symlink_to(case_dir, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("directory symlinks are unavailable on this host")
+
+    with pytest.raises(ValueError, match="symlink or reparse point"):
+        module.ArtifactBundleReader(linked_root, generation_capture=None)
+
+def test_v2_metadata_path_with_ads_syntax_returns_failure_report(tmp_path: Path) -> None:
+    module = load_module()
+    case_dir, _ = write_case(tmp_path, vectors=good_vectors(), raw_mode_index=7)
+    publish_v2_generation(case_dir)
+
+    report = module.validate_modal_field_certificate(
+        case_dir,
+        mode_selections=[(0, 7)],
+        metadata_path=case_dir / "metadata.json:alternate",
+    )
+
+    assert report["status"] == "fail"
+    assert report["qualification"] == "NOT VERIFIED"
+    assert report["file_hashes"] == []
+    assert any("native metadata.json path is invalid" in reason for reason in report["reasons"])
+
+def test_v2_reads_declared_logical_members_and_caches_each_member_once(tmp_path: Path, monkeypatch) -> None:
+    module = load_module()
+    case_dir, vector_path = write_case(tmp_path, vectors=good_vectors(), raw_mode_index=7)
+    expected_vector = vector_path.read_bytes()
+    generation_id = publish_v2_generation(case_dir)
+    # Legacy-shaped files remain present, but v2 logical bytes are authoritative.
+    vector_path.write_bytes(b"stale legacy bytes")
+    counts: dict[str, int] = {}
+    original = module.ArtifactBundleReader.read_bytes
+
+    def counted_read(reader, relative, *, maximum_bytes=None):
+        if relative not in reader._raw:
+            counts[relative] = counts.get(relative, 0) + 1
+        return original(reader, relative, maximum_bytes=maximum_bytes)
+
+    monkeypatch.setattr(module.ArtifactBundleReader, "read_bytes", counted_read)
+    report = module.validate_modal_field_certificate(case_dir, mode_selections=[(0, 7)])
+
+    assert report["status"] == "pass", report
+    assert report["artifact_generation"]["generation_binding_status"] == "immutable_verified"
+    assert report["artifact_generation"]["generation_id"] == generation_id
+    assert report["artifact_generation"]["schema_version"] == "frequency_domain_artifact_generation.v2"
+    assert report["artifact_generation"]["immutable"] is True
+    hashes = {item["path"]: item for item in report["file_hashes"]}
+    assert hashes["eigen/mode_fields/sample_0000/mode_0007/vector.bin"]["sha256"] == (
+        "sha256:" + hashlib.sha256(expected_vector).hexdigest()
+    )
+    assert all(not path.startswith("frequency_domain/generations/") for path in hashes)
+    assert counts == {
+        "metadata.json": 1,
+        "eigen/modes/sample_0000/mode_0007.json": 1,
+        "eigen/mode_fields/sample_0000/mode_0007/vector.bin": 1,
+    }
+
+
+def test_oversized_vector_read_is_bounded_by_expected_node_payload(tmp_path: Path, monkeypatch) -> None:
+    module = load_module()
+    case_dir, vector_path = write_case(tmp_path, vectors=good_vectors(), raw_mode_index=7)
+    vector_path.write_bytes(vector_path.read_bytes() + b"extra")
+    bounds = {}
+    original = module.ArtifactBundleReader.read_bytes
+
+    def bounded_read(reader, relative, *, maximum_bytes=None):
+        if relative.endswith("/vector.bin"):
+            bounds[relative] = maximum_bytes
+        return original(reader, relative, maximum_bytes=maximum_bytes)
+
+    monkeypatch.setattr(module.ArtifactBundleReader, "read_bytes", bounded_read)
+    report = module.validate_modal_field_certificate(case_dir, mode_selections=[(0, 7)])
+
+    relative = "eigen/mode_fields/sample_0000/mode_0007/vector.bin"
+    assert report["status"] == "fail"
+    assert bounds[relative] == 4 * 6 * 8
+    assert any("vector.bin cannot be read" in reason for reason in report["reasons"])
+
+def test_corrupt_v2_marker_never_falls_back_to_valid_legacy_files(tmp_path: Path) -> None:
+    module = load_module()
+    case_dir, _ = write_case(tmp_path, vectors=good_vectors(), raw_mode_index=7)
+    marker_path = case_dir / "frequency_domain/generation.v2.json"
+    marker_path.parent.mkdir(parents=True)
+    marker_path.write_text("{}", encoding="utf-8")
+
+    report = module.validate_modal_field_certificate(case_dir, mode_selections=[(0, 7)])
+
+    assert report["status"] == "fail"
+    assert report["artifact_generation"]["generation_binding_status"] == "not_verified"
+    assert any("capture failed" in reason for reason in report["reasons"])
+
+
+def test_v1_members_remain_byte_verified_but_are_reported_mutable(tmp_path: Path) -> None:
+    module = load_module()
+    case_dir, _ = write_case(tmp_path, vectors=good_vectors(), raw_mode_index=7)
+    generation_id = publish_v1_generation(case_dir)
+
+    report = module.validate_modal_field_certificate(case_dir, mode_selections=[(0, 7)])
+
+    assert report["status"] == "pass", report
+    assert report["artifact_generation"]["generation_id"] == generation_id
+    assert report["artifact_generation"]["schema_version"] == "frequency_domain_artifact_generation.v1"
+    assert report["artifact_generation"]["generation_binding_status"] == "byte_verified_mutable"
+    assert report["artifact_generation"]["immutable"] is False
+
+
+def test_generation_switch_during_modal_validation_fails_final_fence(tmp_path: Path, monkeypatch) -> None:
+    module = load_module()
+    case_dir, _ = write_case(tmp_path, vectors=good_vectors(), raw_mode_index=7)
+    generation_id = publish_v2_generation(case_dir)
+    original = module._validate_mode
+
+    def switch_after_mode(*args, **kwargs):
+        result = original(*args, **kwargs)
+        (case_dir / "frequency_domain/generation.v2.json").write_text("{}", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(module, "_validate_mode", switch_after_mode)
+    report = module.validate_modal_field_certificate(case_dir, mode_selections=[(0, 7)])
+
+    assert report["status"] == "fail"
+    assert report["artifact_generation"]["generation_id"] == generation_id
+    assert report["artifact_generation"]["generation_binding_status"] == "stale"
+    assert report["artifact_generation"]["current_fence_status"] == "stale"
+    assert any("final fence failed" in reason for reason in report["reasons"])
 
 
 def test_full_physical_potential_replays_phase_but_does_not_claim_gauge(tmp_path: Path) -> None:
@@ -231,6 +465,47 @@ def test_full_physical_potential_replays_phase_but_does_not_claim_gauge(tmp_path
     )
     assert report["modes"][0]["phase_checks"][0]["relative_residual"] < 1.0e-8
 
+
+def test_v2_potential_certificate_reads_only_logical_generation_members(tmp_path: Path) -> None:
+    module = load_module()
+    case_dir, _ = write_case(tmp_path, vectors=good_vectors(), raw_mode_index=7)
+    write_full_potential(case_dir, good_potential_values())
+    generation_id = publish_v2_generation(case_dir)
+
+    report = module.validate_modal_potential_phase_certificate(
+        case_dir,
+        mode_selections=[(0, 7)],
+    )
+
+    assert report["phase_status"] == "pass", report
+    assert report["status"] == "not_verified"
+    assert report["artifact_generation"]["generation_id"] == generation_id
+    assert report["artifact_generation"]["generation_binding_status"] == "immutable_verified"
+    paths = {item["path"] for item in report["file_hashes"]}
+    assert "eigen/mode_fields/sample_0000/mode_0007/physical_potential.v1.json" in paths
+    assert "eigen/mode_fields/sample_0000/mode_0007/potential_full.bin" in paths
+
+
+def test_oversized_potential_read_is_bounded_by_expected_node_payload(tmp_path: Path, monkeypatch) -> None:
+    module = load_module()
+    case_dir, _ = write_case(tmp_path, vectors=good_vectors(), raw_mode_index=7)
+    _, payload_path = write_full_potential(case_dir, good_potential_values())
+    payload_path.write_bytes(payload_path.read_bytes() + b"extra")
+    bounds = {}
+    original = module.ArtifactBundleReader.read_bytes
+
+    def bounded_read(reader, relative, *, maximum_bytes=None):
+        if relative.endswith("/potential_full.bin"):
+            bounds[relative] = maximum_bytes
+        return original(reader, relative, maximum_bytes=maximum_bytes)
+
+    monkeypatch.setattr(module.ArtifactBundleReader, "read_bytes", bounded_read)
+    report = module.validate_modal_potential_phase_certificate(case_dir, mode_selections=[(0, 7)])
+
+    relative = "eigen/mode_fields/sample_0000/mode_0007/potential_full.bin"
+    assert report["phase_status"] == "fail"
+    assert bounds[relative] == 4 * 2 * 8
+    assert any("potential_full.bin cannot be read" in reason for reason in report["reasons"])
 
 def test_identically_zero_full_potential_is_uninformative_not_a_physics_failure(tmp_path: Path) -> None:
     module = load_module()

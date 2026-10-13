@@ -4,46 +4,53 @@ This reader validates fields/geometry/metric, not branch assignment or physics.
 It never turns successful input validation into a scientific qualification.
 """
 from pathlib import Path
-import hashlib
 import json
 
 import numpy as np
 
-from comsol_modal_field_certificate import validate_modal_field_certificate, DEFAULT_PHASE_TOLERANCE
+from comsol_modal_field_certificate import (
+    ArtifactBundleReader,
+    DEFAULT_PHASE_TOLERANCE,
+    validate_modal_field_certificate,
+)
 from comsol_mesh_identity import mesh_topology_fingerprint_v3
 from comsol_magnetic_support import magnetic_element_indices, tet4_cells
 from comsol_tracking_metric import Tet4TrackingMetric
 
 
-def load_tracking_fields(case_dir, mode_selections, *, phase_tolerance=DEFAULT_PHASE_TOLERANCE):
+def load_tracking_fields(
+    case_dir,
+    mode_selections,
+    *,
+    phase_tolerance=DEFAULT_PHASE_TOLERANCE,
+    bundle_reader=None,
+    final_fence=True,
+):
     """Read exactly the certificate-bound bytes, or raise ValueError.
 
     Caller must still bind these mode IDs, frequencies and k to the spectrum
     and replay the recorded branch edges. Returned envelopes are full XYZ.
     """
-    root = Path(case_dir)
+    root = Path(case_dir).absolute()
     if not mode_selections:
         raise ValueError("explicit nonempty tracking mode selections required")
+    reader = bundle_reader if bundle_reader is not None else ArtifactBundleReader(root)
     certificate = validate_modal_field_certificate(
-        root, mode_selections=mode_selections, phase_tolerance=phase_tolerance
+        root,
+        mode_selections=mode_selections,
+        phase_tolerance=phase_tolerance,
+        bundle_reader=reader,
+        final_fence=False,
     )
     if certificate["status"] != "pass":
         raise ValueError("tracking field phase certificate failed: " + "; ".join(certificate["reasons"]))
     hashes = {item["path"]: item["sha256"] for item in certificate["file_hashes"]}
 
     def bound_bytes(relative):
-        # Reject links again: they may have changed since certification.
-        relative_path = Path(relative)
-        if relative_path.is_absolute() or ".." in relative_path.parts or relative not in hashes:
+        if relative not in hashes:
             raise ValueError("uncertified tracking input path")
-        path = root / relative_path
-        for candidate in (path, *path.parents):
-            if candidate.is_symlink() or (hasattr(candidate, "is_junction") and candidate.is_junction()):
-                raise ValueError("tracking input path became a link")
-            if candidate == root:
-                break
-        data = path.read_bytes()
-        if "sha256:" + hashlib.sha256(data).hexdigest() != hashes[relative]:
+        data = reader.read_bytes(relative)
+        if reader.record_for(relative)["sha256"] != hashes[relative]:
             raise ValueError("tracking input changed after phase certification")
         return data
 
@@ -72,5 +79,13 @@ def load_tracking_fields(case_dir, mode_selections, *, phase_tolerance=DEFAULT_P
         modes[key] = {"envelope": envelope, "k_vector_rad_per_m": report["k_vector_rad_per_m"],
                       "frequency_real_hz": mode.get("frequency_real_hz"),
                       "frequency_imag_hz": mode.get("frequency_imag_hz")}
-    return {"metric": metric, "modes": modes, "file_hashes": certificate["file_hashes"],
-            "source_mesh_topology_sha256": fingerprint, "qualification": "NOT VERIFIED"}
+    if final_fence:
+        reader.ensure_current()
+    return {
+        "metric": metric,
+        "modes": modes,
+        "file_hashes": certificate["file_hashes"],
+        "source_mesh_topology_sha256": fingerprint,
+        "artifact_generation": reader.generation_descriptor(),
+        "qualification": "NOT VERIFIED",
+    }

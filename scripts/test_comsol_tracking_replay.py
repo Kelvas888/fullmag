@@ -8,11 +8,13 @@ import unittest
 
 import numpy as np
 
+from frequency_domain_generation import GenerationCapture
 from comsol_tracking_metric import Tet4TrackingMetric
+import comsol_tracking_replay as replay_module
 from comsol_tracking_replay import replay_recorded_frames, replay_tracking_fields, _frequency_score, verify_global_prediction
 from comsol_tracking_global import reconstruct_global_assignment
 from test_validate_comsol_dispersion_scientific_gate import _tracking_fixture_payload
-from test_comsol_tracking_fields import write_tracking_fixture
+from test_comsol_tracking_fields import publish_v2_generation, write_tracking_fixture
 
 
 class TrackingReplayTests(unittest.TestCase):
@@ -386,6 +388,89 @@ class TrackingReplayDiskTests(unittest.TestCase):
         self.assertEqual(result["qualification"], "NOT VERIFIED")
         self.assertTrue(any(item["path"] == "eigen/branches.v2.json" for item in result["file_hashes"]))
 
+    def test_v2_replay_shares_one_reader_and_reads_each_declared_member_once(self):
+        self.write_pair_path()
+        generation_id = publish_v2_generation(self.root)
+        counts = {}
+        original_read = GenerationCapture.read_member
+        original_reader = replay_module.ArtifactBundleReader
+        reader_sessions = []
+
+        class CountingReader(original_reader):
+            def __init__(self, *args, **kwargs):
+                reader_sessions.append(self)
+                super().__init__(*args, **kwargs)
+
+        def counted_read(capture, relative, maximum_bytes=None):
+            counts[relative] = counts.get(relative, 0) + 1
+            return original_read(capture, relative, maximum_bytes=maximum_bytes)
+
+        with patch("comsol_tracking_replay.ArtifactBundleReader", CountingReader), \
+             patch.object(GenerationCapture, "read_member", counted_read):
+            result = replay_tracking_fields(self.root, selected_branch_ids=[0])
+
+        self.assertEqual(result["status"], "pass", result)
+        self.assertEqual(len(reader_sessions), 1)
+        self.assertEqual(result["artifact_generation"]["generation_binding_status"], "immutable_verified")
+        self.assertEqual(result["artifact_generation"]["generation_id"], generation_id)
+        self.assertEqual(set(counts.values()), {1})
+        self.assertEqual(set(counts), {
+            "eigen/spectrum.v2.json",
+            "eigen/branches.v2.json",
+            "metadata.json",
+            "eigen/modes/sample_0000/mode_0009.json",
+            "eigen/modes/sample_0001/mode_0002.json",
+            "eigen/modes/sample_0002/mode_0007.json",
+            "eigen/mode_fields/sample_0000/mode_0009/vector.bin",
+            "eigen/mode_fields/sample_0001/mode_0002/vector.bin",
+            "eigen/mode_fields/sample_0002/mode_0007/vector.bin",
+        })
+
+    def test_v2_does_not_fall_back_to_present_legacy_field_missing_from_manifest(self):
+        self.write_pair_path()
+        publish_v2_generation(
+            self.root,
+            exclude=("eigen/mode_fields/sample_0001/mode_0002/vector.bin",),
+        )
+
+        result = replay_tracking_fields(self.root, selected_branch_ids=[0])
+
+        self.assertEqual(result["status"], "fail", result)
+        self.assertTrue(any("not a member" in reason for reason in result["reasons"]))
+
+    def test_v2_current_generation_change_after_replay_fails_final_fence(self):
+        self.write_pair_path()
+        publish_v2_generation(self.root)
+        original_replay = replay_module.replay_recorded_frames
+
+        def change_marker_after_replay(*args, **kwargs):
+            result = original_replay(*args, **kwargs)
+            (self.root / "frequency_domain/generation.v2.json").write_text("{}", encoding="utf-8")
+            return result
+
+        with patch("comsol_tracking_replay.replay_recorded_frames", change_marker_after_replay):
+            result = replay_tracking_fields(self.root, selected_branch_ids=[0])
+
+        self.assertEqual(result["status"], "fail", result)
+        self.assertTrue(any("generation" in reason for reason in result["reasons"]))
+        self.assertEqual(result["artifact_generation"]["generation_binding_status"], "stale")
+        self.assertEqual(result["artifact_generation"]["current_fence_status"], "stale")
+
+    def test_final_fence_oserror_is_fail_with_stale_binding(self):
+        self.write_pair_path()
+        publish_v2_generation(self.root)
+
+        def fail_final_fence(reader):
+            reader._current_fence_status = "stale"
+            raise OSError("simulated final marker fence read failure")
+
+        with patch.object(replay_module.ArtifactBundleReader, "ensure_current", fail_final_fence):
+            result = replay_tracking_fields(self.root, selected_branch_ids=[0])
+
+        self.assertEqual(result["status"], "fail", result)
+        self.assertEqual(result["artifact_generation"]["generation_binding_status"], "stale")
+        self.assertEqual(result["artifact_generation"]["current_fence_status"], "stale")
+        self.assertTrue(any("simulated final marker fence read failure" in reason for reason in result["reasons"]))
     def write_pair_path(self):
         original = json.loads(self.mode_path.read_text())
         nodes = np.array(json.loads((self.root / "metadata.json").read_text())[
