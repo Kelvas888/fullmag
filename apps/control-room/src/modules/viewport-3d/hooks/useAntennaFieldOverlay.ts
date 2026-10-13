@@ -1,13 +1,15 @@
 "use client";
 
 import { useEffect, useMemo } from "react";
+import { isClosedLoopDisplay } from "@/kernel/resources/antennaClosedLoopInspectionModel";
+import { useClosedLoopAntennaOverlay } from "./useClosedLoopAntennaOverlay";
 import { antennaFieldPayloadEtag, antennaInspectionDisplayMatchesOwner, useAntennaFieldSolutionPayloadResource, useAntennaFieldSolutionResource, useAntennaStageOutputCatalogResource, useAntennaExternalLeadInspectionResource, useAntennaInspectionDisplayResource, useAntennaInspectionDisplayPayloadResource } from "@/kernel/resources/antennaResources";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
 import { useSelectionSelector } from "@/kernel/selection/useSelection";
 import { useObjectVisualizationSelector, useObjectVisualizationController } from "@/kernel/visualization/useObjectVisualization";
 import { antennaDisplayShape, antennaDisplayTopologyShape, buildAntennaFieldOverlayModel } from "../model/antennaFieldOverlayModel";
 import { antennaCurrentTraceShape, buildAntennaCurrentOverlayModel, projectAntennaCurrentOverlayModel } from "../model/antennaCurrentOverlayModel";
-import type { AntennaFieldIntent } from "@/kernel/visualization/antennaFieldIntent";
+import { antennaInspectionIntentMatchesOwner, type AntennaFieldIntent } from "@/kernel/visualization/antennaFieldIntent";
 
 /** One data owner outside the manual R3F root. Binary arrays stay in resource cache / render model. */
 export function useAntennaFieldOverlay() {
@@ -20,17 +22,16 @@ export function useAntennaFieldOverlay() {
     requested.sourceObjectId === selectedObjectId && (requested.points || requested.vectors || requested.surface || requested.wireframe) ? requested : null;
   const solution = useAntennaFieldSolutionResource(intent?.kind === "basis" ? intent.solutionId : null);
   const catalog = useAntennaStageOutputCatalogResource(intent?.kind === "basis" ? intent.stageId : null);
-  const inspection = useAntennaExternalLeadInspectionResource(intent?.kind === "inspection" ? intent.stageId : null);
+  const inspection = useAntennaExternalLeadInspectionResource(intent?.kind === "inspection" ? intent.runtimeStageId ?? null : null);
   const raw = inspection.data;
-  const inspectionOwnerMatches = Boolean(intent?.kind === "inspection" && inspection.status === "ready" && raw &&
-    raw.session_id === intent.sessionId && raw.session_epoch === intent.sessionEpoch && raw.request_scope_epoch === intent.requestScopeEpoch &&
-    raw.runtime_stage_id === intent.stageId && raw.stage_revision === intent.stageRevision && raw.record_content_digest === intent.recordContentDigest &&
-    raw.manifest?.source_object_id === intent.sourceObjectId && raw.manifest.content_digest === intent.contentDigest && raw.port_mode_id === intent.portModeId);
+  const inspectionOwnerMatches = Boolean(intent?.kind === "inspection" && inspection.status === "ready" && !inspection.refreshError && raw &&
+    antennaInspectionIntentMatchesOwner(intent, raw));
   const display = useAntennaInspectionDisplayResource(inspectionOwnerMatches ? raw : null);
+  const closedOverlay = useClosedLoopAntennaOverlay(intent, inspectionOwnerMatches ? raw : null, display.status === "ready" && !display.refreshError ? display.data : null);
   const inspectionPlan = useMemo(() => {
     const data = inspection.data;
     const metadata = display.data;
-    if (!intent || intent.kind !== "inspection" || !inspectionOwnerMatches || !data || display.status !== "ready" || !metadata ||
+    if (!intent || intent.kind !== "inspection" || !inspectionOwnerMatches || !data || display.status !== "ready" || display.refreshError || !metadata || isClosedLoopDisplay(metadata) ||
         !antennaInspectionDisplayMatchesOwner(data, metadata)) return null;
     const scalar = intent.quantity === "device_potential";
     const current = intent.quantity === "current_density" ? metadata.device_current : null;
@@ -47,7 +48,7 @@ export function useAntennaFieldOverlay() {
       return { data, metadata, count, positionKind, valueKind, positions, values, ownedCurrent: current, topology: scalar || current ? metadata.device_topology : null };
     }
     catch { return null; }
-  }, [intent, inspection.data, inspectionOwnerMatches, display.data, display.status]);
+  }, [intent, inspection.data, inspectionOwnerMatches, display.data, display.status, display.refreshError]);
   const plan = useMemo(() => {
     if (!intent || intent.kind !== "basis" || solution.status !== "ready" || catalog.status !== "ready") return null;
     const data = solution.data;
@@ -136,15 +137,15 @@ export function useAntennaFieldOverlay() {
     catch (error) { return { model: null, error: error instanceof Error ? error.message : String(error) }; }
   }, [intent, plan, positions.data, positions.status, field.data, field.status, inspectionPlan, inspectionPositions.data, inspectionPositions.status, inspectionField.data, inspectionField.status, inspectionTopology.data, inspectionTopology.status,
     currentDevicePositions.data, currentDevicePositions.status, currentTracePositions.data, currentTracePositions.status, currentTraceValues.data, currentTraceValues.status, currentCarrier]);
-  const model = result?.model ?? null;
-  const error = result?.error ?? solution.error?.message ?? catalog.error?.message ?? inspection.error?.message ?? display.error?.message ?? positions.error?.message ?? field.error?.message ?? inspectionPositions.error?.message ?? inspectionField.error?.message ?? inspectionTopology.error?.message ?? currentDevicePositions.error?.message ?? currentTracePositions.error?.message ?? currentTraceValues.error?.message;
+  const model = closedOverlay.active ? closedOverlay.model : result?.model ?? null;
+  const error = closedOverlay.error ?? result?.error ?? solution.error?.message ?? catalog.error?.message ?? inspection.error?.message ?? display.error?.message ?? positions.error?.message ?? field.error?.message ?? inspectionPositions.error?.message ?? inspectionField.error?.message ?? inspectionTopology.error?.message ?? currentDevicePositions.error?.message ?? currentTracePositions.error?.message ?? currentTraceValues.error?.message;
   const metadataReady = intent?.kind === "inspection" ? inspection.status === "ready" && display.status === "ready" : solution.status === "ready" && catalog.status === "ready";
   const status = useMemo(() => !intent ? null : model ? {
-    intentKey: JSON.stringify(intent), status: "ready" as const, reason: model.surfaceVectorValues ? "Owned SI RT0 J: cell centers and cell-local exterior traces; vector interpolated before magnitude; no nodal average" : model.surfaceTriangles ? "Complete pinned SI device Tet4 carrier and nodal V; exterior surface derived from actual cell connectivity" : "Complete pinned SI sample carrier; no surface interpolation", sampleCount: model.count, minimum: model.minimum, maximum: model.maximum,
+    intentKey: JSON.stringify(intent), status: "ready" as const, reason: model.surfaceVectorValues && intent.quantity.startsWith("magnetic_field") ? "Owned sampling Tet4 H: Cartesian vector interpolated before magnitude; conductor geometry is separate" : model.surfaceVectorValues ? "Owned SI J: cell centers and cell-local exterior traces; vector interpolated before magnitude; no nodal average" : model.surfaceTriangles ? "Complete pinned SI device Tet4 carrier and nodal V; exterior surface derived from actual cell connectivity" : "Complete pinned SI sample carrier; no surface interpolation", sampleCount: model.count, minimum: model.minimum, maximum: model.maximum,
   } : {
-    intentKey: JSON.stringify(intent), status: error || (metadataReady && !plan && !inspectionPlan) ? "unavailable" as const : "loading" as const,
-    reason: error ?? (metadataReady && !plan && !inspectionPlan ? "Incompatible identity, port, layout, units, cardinality or display memory limit. No field was rendered." : "Loading complete, revision-checked sample payloads"),
-  }, [intent, model, error, metadataReady, plan, inspectionPlan]);
+    intentKey: JSON.stringify(intent), status: error || (metadataReady && !plan && !inspectionPlan && !closedOverlay.plan) ? "unavailable" as const : "loading" as const,
+    reason: error ?? (metadataReady && !plan && !inspectionPlan && !closedOverlay.plan ? "Incompatible identity, port, layout, units, cardinality or display memory limit. No field was rendered." : "Loading complete, revision-checked sample payloads"),
+  }, [intent, model, error, metadataReady, plan, inspectionPlan, closedOverlay.plan]);
   useEffect(() => { controller.setAntennaFieldDisplayStatus(status); }, [controller, status]);
   useEffect(() => () => controller.setAntennaFieldDisplayStatus(null), [controller]);
   return model;

@@ -4,7 +4,7 @@ import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { useThree } from "@react-three/fiber";
 import { BufferGeometry, ShaderMaterial, SRGBColorSpace, Vector2, Vector3, WebGLRenderTarget } from "three";
 import { ControlRoomApi } from "@/kernel/api/ControlRoomApi";
-import { DATA_ANTENNA_FIELD_SOLUTION_PATH, DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH, DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, MODEL_SCENE_PATH, SESSIONS_PATH, SESSION_STATUS_PATH } from "@/kernel/api/apiPaths";
+import { DATA_ANTENNA_FIELD_SOLUTION_PATH, DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH, DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, MODEL_SCENE_PATH, SESSIONS_PATH, SESSION_STATUS_PATH, SIMULATION_STAGES_EXECUTION_PATH } from "@/kernel/api/apiPaths";
 import type { AntennaFieldSolutionResource, AntennaExternalLeadInspectionResource, AntennaInspectionDisplayResource, SceneResource } from "@/kernel/api/apiTypes";
 import { RequestDiagnosticsController } from "@/kernel/api/RequestDiagnosticsController";
 import { EventBus } from "@/kernel/events/EventBus";
@@ -58,7 +58,7 @@ function makeFixture() {
   if (scenario === "cardinality") solution.bases[0].magnetic_field_per_ampere.value_count = 27;
   if (scenario === "multiport") solution.bases.push({ ...solution.bases[0], port_mode_id: "port-two" });
   const inspection: AntennaExternalLeadInspectionResource = {
-    ...owner, schema_version: "antenna_external_lead_stage_output.v1", resource_id: "fixture-inspection", run_id: "fixture-run", runtime_stage_id: "solve", stage_revision: 1,
+    ...owner, schema_version: "antenna_external_lead_stage_output.v1", resource_id: "fixture-inspection", run_id: "fixture-run", runtime_stage_id: "runtime-solve-001", stage_revision: 1,
     record_content_digest: digest, stage_id: "solve", stage_kind: "antenna_external_lead_inspection", output_id: "inspection", port_mode_id: "port",
     status: "inspection_only", field_scope: "external_electrode_truncation", qualification: "NOT VERIFIED", resolved_action: "inspection_only",
     outputs: [{ kind: "inspection_only", manifest_ref: "fixture-only", payload_units: {}, reused_existing: false, inspection_ref: { content_digest: digest, output_id: "inspection", stage_id: "solve" } }],
@@ -113,7 +113,7 @@ function makeFixture() {
       return { layout, unit, scalar_type, value_count: data.byteLength / (scalar_type === "uint32_le" ? 4 : 8), byte_count: data.byteLength, sha256: [...hash].map((byte) => byte.toString(16).padStart(2, "0")).join(""), path: `fixture-only/${kind}.bin` };
     };
     const display: AntennaInspectionDisplayResource = {
-      ...owner, schema_version: "antenna_inspection_display.v1", resource_id: "fixture-display", run_id: inspection.run_id, runtime_stage_id: "solve", stage_revision: 1,
+      ...owner, schema_version: "antenna_inspection_display.v1", resource_id: "fixture-display", run_id: inspection.run_id, runtime_stage_id: "runtime-solve-001", stage_revision: 1,
       record_content_digest: digest, content_digest: digest, source_object_id: "antenna", status: "inspection_only", qualification: "NOT VERIFIED", field_scope: "external_electrode_truncation", normalization: "raw_authored_current",
       capabilities: { display: true, per_ampere_basis: false, llg_drive: false, source_fft: false, current_density: false }, device_node_count: 10, device_cell_count: 4,
       sampling_carrier: inspection.manifest!.sampling_carrier,
@@ -170,15 +170,19 @@ function makeFixture() {
     if (calls.length > 80 || request.method !== "GET") throw new Error("Fixture budget/method violation");
     if (url.pathname === SESSIONS_PATH) return json({ schema_version: "1.0", sessions: [{ session_id: owner.session_id, name: "Fixture", current: true, status: "idle" }] });
     if (url.pathname === SESSION_STATUS_PATH) return json({ session: { ...owner, name: "Fixture", created_at: "fixture", workspace_root: "fixture" }, resources: { scene_revision: 1 }, capabilities: {}, lifecycle: { solver: "idle", session_resource: "active", connectivity: "connected", commandability: "writable" } });
+    if (url.pathname === SIMULATION_STAGES_EXECUTION_PATH) {
+      const stages = isInspection ? [{ stage_id: "runtime-solve-001", antenna_solve_stage_id: "solve", index: 0, status: "completed", converged: false, kind: "study_pipeline_antenna_field_solve", label: "Fixture antenna solve", artifact_refs: [] }] : [];
+      return json({ ...owner, run_id: "fixture-run", revision: 1, runtime_state: "completed", total_stages: stages.length, stages, stage_statuses: stages.map((stage) => stage.status), completed_stage_indexes: [] });
+    }
     if (url.pathname === MODEL_SCENE_PATH) return json(scene);
     if (url.pathname === metadataPath) return isInspection ? new Response("{}", { status: 404, headers }) : json(solution);
     if (url.pathname === catalogPath) return json({ ...owner, stage_id: "solve", status: "ready", outputs: [{ output_id: "solution", solution_ref: { asset_id: solution.asset_id, content_digest: digest, stage_id: "solve" } }] });
-    if (url.pathname === path(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, "stage_id", "solve")) { if (isInspection) await displayMetadata(); return isInspection ? json(inspection) : new Response("{}", { status: 404, headers }); }
-    if (url.pathname === path(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, "stage_id", "solve")) {
+    if (url.pathname === path(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, "stage_id", "runtime-solve-001")) { if (isInspection) await displayMetadata(); return isInspection ? json(inspection) : new Response("{}", { status: 404, headers }); }
+    if (url.pathname === path(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, "stage_id", "runtime-solve-001")) {
       if (!isInspection || url.searchParams.get("content_digest") !== digest) throw new Error("Unexpected display metadata contract");
       return json(await displayMetadata());
     }
-    const inspectionPrefix = path(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, "stage_id", "solve").split("{payload_kind}")[0];
+    const inspectionPrefix = path(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, "stage_id", "runtime-solve-001").split("{payload_kind}")[0];
     if (url.pathname.startsWith(inspectionPrefix)) {
       const kind = url.pathname.slice(inspectionPrefix.length) as keyof typeof rawPayloads;
       if (!isInspection || !Object.hasOwn(rawPayloads, kind) || url.searchParams.get("content_digest") !== digest) throw new Error("Unexpected inspection payload contract");

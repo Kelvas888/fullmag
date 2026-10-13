@@ -139,7 +139,7 @@ try {
   await page.waitForFunction(() => window.__antennaFieldCanvas?.().pointCount === 10);
   await root.getByRole("button", { name: "Toggle Vectors", exact: true }).click();
   await page.waitForFunction(() => window.__antennaFieldCanvas?.().glyphCount === 10);
-  assert.ok((await root.innerText()).includes("Raw authored-current H [A/m], inspection only"));
+  assert.ok((await root.innerText()).includes("Raw recorded drive Inspection Oersted field H [A/m], inspection only"));
   assert.ok((await root.innerText()).includes("NOT VERIFIED"));
   await shot("09-inspection-raw-H");
   const rawCalls = (await page.evaluate(() => window.__antennaVisualizationFixture.read())).calls;
@@ -172,7 +172,7 @@ try {
   assert.equal(canvas.quantity, "device_potential"); assert.equal(canvas.glyphCount, 0);
   assert.equal(canvas.lost, false); assert.ok(canvas.width > 0 && canvas.height > 0);
   assert.ok(Number.isFinite(canvas.colorMinimum) && Number.isFinite(canvas.colorMaximum) && canvas.colorMinimum >= 0 && canvas.colorMaximum <= 1);
-  assert.ok((await root.innerText()).includes("Raw authored-current V [V], inspection only"));
+  assert.ok((await root.innerText()).includes("Raw recorded drive Electric potential V [V], inspection only"));
   await root.getByRole("radio", { name: "Shaded + Wireframe", exact: true }).click();
   await page.waitForFunction(() => window.__antennaFieldCanvas?.().pointCount === 0 && window.__antennaFieldCanvas?.().surfaceTriangles === 12 && window.__antennaFieldCanvas?.().wireframeEdges === 18);
   await shot("10-inspection-raw-V-device-Tet4");
