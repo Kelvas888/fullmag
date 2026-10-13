@@ -247,7 +247,7 @@ describe("viewport3dPrimitiveModel", () => {
       scene as never,
       "box",
     )!;
-    const draft = { ...canonicalDraft, translation: ["7", "8", "9"] };
+    const draft: typeof canonicalDraft = { ...canonicalDraft, translation: ["7", "8", "9"] };
 
     expect(withObjectPlacementDraftPreview(model, draft, "another-object")).toBe(model);
     expect(
