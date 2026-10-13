@@ -498,6 +498,40 @@ class NonSharedOperatorReplayTests(unittest.TestCase):
             self.assertNotIn("mesh_payload", report.exact_refs_verified)
             self.assertEqual(report.scientific_qualification, "NOT_VERIFIED")
 
+    def test_captured_reader_does_not_fall_back_to_root_mesh_shadow(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            _bundle(root)
+            _rewrite_legacy_without_mesh_ref(root)
+            mesh_relative = "eigen/metadata/sample_0003/nonshared_source/source_mesh.json"
+            mesh_path = root / Path(mesh_relative)
+            self.assertTrue(mesh_path.is_file())
+            member_bytes = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file() and path != mesh_path
+            }
+            read_paths: list[str] = []
+
+            def captured_read(relative: str, maximum_bytes: int | None) -> bytes:
+                read_paths.append(relative)
+                if relative not in member_bytes:
+                    raise NonSharedReplayError(f"captured member is absent: {relative}")
+                raw = member_bytes[relative]
+                if maximum_bytes is not None and len(raw) > maximum_bytes:
+                    raise NonSharedReplayError(f"captured member exceeds its byte limit: {relative}")
+                return raw
+
+            with self.assertRaisesRegex(NonSharedReplayError, "captured member is absent"):
+                replay_nonshared_operator(
+                    root,
+                    sample_index=3,
+                    read_bytes=captured_read,
+                    has_member=lambda relative: relative in member_bytes,
+                )
+            self.assertIn(mesh_relative, read_paths)
+            self.assertTrue(mesh_path.is_file())
+
     def test_malformed_embedding_with_consistent_rehash_stays_custom_error(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

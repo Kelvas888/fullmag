@@ -22,7 +22,7 @@ from pathlib import Path
 import re
 import struct
 import sys
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -65,6 +65,7 @@ NATIVE_INPUT_DIAGNOSTICS_REFS_FIELD = (
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 _RAW_SOURCE_SNAPSHOT_RE = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_JSON_DEPTH = 128
+_MAX_REPLAY_JSON_BYTES = 4 * 1024 * 1024
 _REL_TOL = 5.0e-11
 _ABS_TOL = 1.0e-12
 
@@ -430,23 +431,81 @@ def _require_sample_path(relative: Any, sample_index: int, label: str) -> str:
     return relative
 
 
-def _read_relative(root: Path, relative: Any, label: str) -> tuple[bytes, str]:
+def _read_relative(
+    root: Path,
+    relative: Any,
+    label: str,
+    *,
+    read_bytes: Callable[[str, int | None], bytes] | None = None,
+    maximum_bytes: int | None = _MAX_REPLAY_JSON_BYTES,
+) -> tuple[bytes, str]:
     path, normalized = _safe_relative_path(root, relative, label)
     try:
-        raw = path.read_bytes()
+        if read_bytes is None:
+            with path.open("rb") as stream:
+                raw = (
+                    stream.read(maximum_bytes + 1)
+                    if maximum_bytes is not None
+                    else stream.read()
+                )
+        else:
+            raw = read_bytes(normalized, maximum_bytes)
     except OSError as error:
         raise NonSharedReplayError(f"{label}: cannot read {normalized}") from error
+    except ValueError as error:
+        if isinstance(error, NonSharedReplayError):
+            raise
+        raise NonSharedReplayError(f"{label}: cannot read {normalized}: {error}") from error
+    if type(raw) is not bytes:
+        _fail(f"{label}: reader did not return exact bytes")
+    if maximum_bytes is not None and len(raw) > maximum_bytes:
+        _fail(f"{label}: byte read limit exceeded for {normalized}")
     return raw, normalized
 
 
-def _read_optional_relative(root: Path, relative: Any, label: str) -> tuple[bytes, str] | None:
+def _read_optional_relative(
+    root: Path,
+    relative: Any,
+    label: str,
+    *,
+    read_bytes: Callable[[str, int | None], bytes] | None = None,
+    has_member: Callable[[str], bool] | None = None,
+    maximum_bytes: int | None = _MAX_REPLAY_JSON_BYTES,
+) -> tuple[bytes, str] | None:
     path, normalized = _safe_relative_path(root, relative, label)
-    if not path.exists():
-        return None
+    if read_bytes is None:
+        if not path.exists():
+            return None
+    else:
+        if has_member is None:
+            _fail(f"{label}: captured reader requires member lookup")
+        try:
+            if not has_member(normalized):
+                return None
+        except (OSError, ValueError) as error:
+            raise NonSharedReplayError(
+                f"{label}: cannot inspect captured member {normalized}: {error}"
+            ) from error
     try:
-        raw = path.read_bytes()
+        if read_bytes is None:
+            with path.open("rb") as stream:
+                raw = (
+                    stream.read(maximum_bytes + 1)
+                    if maximum_bytes is not None
+                    else stream.read()
+                )
+        else:
+            raw = read_bytes(normalized, maximum_bytes)
     except OSError as error:
         raise NonSharedReplayError(f"{label}: cannot read {normalized}") from error
+    except ValueError as error:
+        if isinstance(error, NonSharedReplayError):
+            raise
+        raise NonSharedReplayError(f"{label}: cannot read {normalized}: {error}") from error
+    if type(raw) is not bytes:
+        _fail(f"{label}: reader did not return exact bytes")
+    if maximum_bytes is not None and len(raw) > maximum_bytes:
+        _fail(f"{label}: byte read limit exceeded for {normalized}")
     return raw, normalized
 
 
@@ -471,8 +530,20 @@ def _check_ref_shape(ref: Any, label: str, *, namespace_required: bool = False) 
     return ref
 
 
-def _read_ref(root: Path, ref: Mapping[str, Any], label: str) -> tuple[bytes, dict[str, Any]]:
-    raw, _ = _read_relative(root, ref["path"], f"{label}.path")
+def _read_ref(
+    root: Path,
+    ref: Mapping[str, Any],
+    label: str,
+    *,
+    read_bytes: Callable[[str, int | None], bytes] | None = None,
+) -> tuple[bytes, dict[str, Any]]:
+    raw, _ = _read_relative(
+        root,
+        ref["path"],
+        f"{label}.path",
+        read_bytes=read_bytes,
+        maximum_bytes=min(ref["byte_length"], _MAX_REPLAY_JSON_BYTES),
+    )
     if len(raw) != ref["byte_length"]:
         _fail(f"{label}: byte length mismatch")
     actual = raw_sha256(raw)
@@ -570,6 +641,8 @@ def _validate_mesh_payload_ref(
     identity: Mapping[str, Any],
     sample_index: int,
     label: str,
+    *,
+    read_bytes: Callable[[str, int | None], bytes] | None = None,
 ) -> bytes:
     """Validate the exact mesh bytes and their binding to one computed sample."""
 
@@ -588,7 +661,7 @@ def _validate_mesh_payload_ref(
     expected_sha = _digest(identity["mesh_payload_sha256"], "identity.mesh_payload_sha256")
     if ref.get("semantic_signature") != expected_sha:
         _fail(f"{label}.semantic_signature: does not match identity.mesh_payload_sha256")
-    raw, _ = _read_ref(root, ref, label)
+    raw, _ = _read_ref(root, ref, label, read_bytes=read_bytes)
     if raw_sha256(raw) != expected_sha:
         _fail(f"{label}: raw SHA-256 does not match identity.mesh_payload_sha256")
     return raw
@@ -610,7 +683,12 @@ def _validate_build_identity(value: Any, label: str) -> Mapping[str, Any]:
 
 
 def _validate_plan_snapshot(
-    root: Path, value: Any, label: str, *, sample_index: int | None = None
+    root: Path,
+    value: Any,
+    label: str,
+    *,
+    sample_index: int | None = None,
+    read_bytes: Callable[[str, int | None], bytes] | None = None,
 ) -> Mapping[str, Any] | None:
     """Validate the producer plan bytes referenced by the non-shared record."""
 
@@ -628,7 +706,7 @@ def _validate_plan_snapshot(
     _digest(value["framed_sha256"], f"{label}.framed_sha256")
     if sample_index is not None:
         _require_sample_path(value["path"], sample_index, f"{label}.path")
-    raw, _ = _read_relative(root, value["path"], f"{label}.path")
+    raw, _ = _read_relative(root, value["path"], f"{label}.path", read_bytes=read_bytes)
     if raw_sha256(raw) != value["raw_sha256"]:
         _fail(f"{label}: raw SHA-256 mismatch")
     # Producer plan snapshots are exact JSON bytes.  Their framed digest uses
@@ -824,7 +902,12 @@ def _validate_operator_input(
     return k_vector, alpha, pair_count
 
 
-def _validate_physical_refs(root: Path, refs: Any) -> bool:
+def _validate_physical_refs(
+    root: Path,
+    refs: Any,
+    *,
+    read_bytes: Callable[[str, int | None], bytes] | None = None,
+) -> bool:
     if refs is None:
         return False
     if not isinstance(refs, Mapping):
@@ -838,7 +921,7 @@ def _validate_physical_refs(root: Path, refs: Any) -> bool:
     for key, kind in kinds.items():
         ref = refs[key]
         _check_ref_shape(ref, f"physical_source.{key}", namespace_required=True)
-        raw, _ = _read_ref(root, ref, f"physical_source.{key}")
+        raw, _ = _read_ref(root, ref, f"physical_source.{key}", read_bytes=read_bytes)
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError as error:
@@ -868,6 +951,8 @@ def replay_nonshared_operator(
     identity_preimage_path: Path | None = None,
     source_state_path: Path | None = None,
     operator_diagnostics: Mapping[str, Any] | None = None,
+    read_bytes: Callable[[str, int | None], bytes] | None = None,
+    has_member: Callable[[str], bool] | None = None,
 ) -> NonSharedOperatorReplayReport:
     """Replay one published sample under ``root``.
 
@@ -891,7 +976,9 @@ def replay_nonshared_operator(
     _require_sample_path(identity_rel_string, sample_index, "operator identity path")
     _require_sample_path(identity_preimage_rel_string, sample_index, "operator identity preimage path")
     _require_sample_path(source_state_rel_string, sample_index, "source state path")
-    identity_raw, _ = _read_relative(root, identity_rel_string, "operator identity path")
+    identity_raw, _ = _read_relative(
+        root, identity_rel_string, "operator identity path", read_bytes=read_bytes
+    )
     identity = _json_object(identity_raw, "operator identity")
     _fields(identity, _IDENTITY_REQUIRED, "operator identity")
     if identity["schema_version"] != IDENTITY_SCHEMA or identity["variant"] != "nonshared_floquet":
@@ -908,7 +995,12 @@ def replay_nonshared_operator(
         _integer(identity["source_mesh_node_count"], "identity.source_mesh_node_count", 1)
     if identity["sample_index"] != sample_index:
         _fail("operator identity: sample_index mismatch")
-    identity_preimage_raw, _ = _read_relative(root, identity_preimage_rel_string, "operator identity preimage path")
+    identity_preimage_raw, _ = _read_relative(
+        root,
+        identity_preimage_rel_string,
+        "operator identity preimage path",
+        read_bytes=read_bytes,
+    )
     identity_digest = _validate_identity_preimage(identity, identity_preimage_raw)
     identity_refs = identity["exact_replay_refs"]
     _validate_refs_object(identity_refs, "identity.exact_replay_refs")
@@ -925,6 +1017,7 @@ def replay_nonshared_operator(
             identity,
             sample_index,
             "identity.exact_replay_refs.mesh_payload",
+            read_bytes=read_bytes,
         )
     if identity_refs["physical_source"] is not None:
         for ref_name, ref in identity_refs["physical_source"].items():
@@ -932,7 +1025,9 @@ def replay_nonshared_operator(
                 ref["path"], sample_index, f"identity.exact_replay_refs.physical_source.{ref_name}.path"
             )
 
-    source_state_raw, _ = _read_relative(root, source_state_rel_string, "source state path")
+    source_state_raw, _ = _read_relative(
+        root, source_state_rel_string, "source state path", read_bytes=read_bytes
+    )
     source_state = _json_object(source_state_raw, "source state")
     _fields(source_state, _SOURCE_REQUIRED, "source state")
     if source_state["schema_version"] != SOURCE_STATE_SCHEMA or source_state["variant"] != "nonshared_floquet":
@@ -950,16 +1045,26 @@ def replay_nonshared_operator(
     if source_state["sample_index"] != sample_index:
         _fail("source state: sample_index mismatch")
     identity_plan_snapshot = _validate_plan_snapshot(
-        root, identity["producer_plan_snapshot"], "identity.producer_plan_snapshot", sample_index=sample_index
+        root,
+        identity["producer_plan_snapshot"],
+        "identity.producer_plan_snapshot",
+        sample_index=sample_index,
+        read_bytes=read_bytes,
     )
     source_plan_snapshot = _validate_plan_snapshot(
-        root, source_state.get("producer_plan_snapshot"), "source_state.producer_plan_snapshot", sample_index=sample_index
+        root,
+        source_state.get("producer_plan_snapshot"),
+        "source_state.producer_plan_snapshot",
+        sample_index=sample_index,
+        read_bytes=read_bytes,
     )
     source_preimage_ref = identity_refs.get("source_state")
     _check_ref_shape(source_preimage_ref, "identity.exact_replay_refs.source_state")
     if source_preimage_ref["schema_version"] != SOURCE_STATE_PREIMAGE_SCHEMA:
         _fail("source state ref: unsupported schema")
-    source_preimage_raw, _ = _read_ref(root, source_preimage_ref, "source state preimage")
+    source_preimage_raw, _ = _read_ref(
+        root, source_preimage_ref, "source state preimage", read_bytes=read_bytes
+    )
     source_preimage = _json_object(source_preimage_raw, "source state preimage")
     _same_typed_json(source_preimage, _replace_empty_digest(source_state, "content_sha256", "source state"), "source state preimage")
     source_state_digest = _digest(source_state["content_sha256"], "source_state.content_sha256")
@@ -977,10 +1082,18 @@ def replay_nonshared_operator(
         _fail("operator input ref: unsupported schema")
     if matrix_ref["schema_version"] != MATRIX_PENCIL_PREIMAGE_SCHEMA:
         _fail("matrix pencil ref: unsupported schema")
-    operator_raw, operator_input = _read_ref(root, operator_ref, "operator input")
-    matrix_raw, matrix = _read_ref(root, matrix_ref, "matrix pencil")
+    operator_raw, operator_input = _read_ref(
+        root, operator_ref, "operator input", read_bytes=read_bytes
+    )
+    matrix_raw, matrix = _read_ref(
+        root, matrix_ref, "matrix pencil", read_bytes=read_bytes
+    )
     operator_plan_snapshot = _validate_plan_snapshot(
-        root, operator_input["producer_plan_snapshot"], "operator_input.producer_plan_snapshot", sample_index=sample_index
+        root,
+        operator_input["producer_plan_snapshot"],
+        "operator_input.producer_plan_snapshot",
+        sample_index=sample_index,
+        read_bytes=read_bytes,
     )
     if identity_plan_snapshot != source_plan_snapshot or identity_plan_snapshot != operator_plan_snapshot:
         _fail("producer plan snapshot is not bound across identity/source/operator")
@@ -1048,7 +1161,9 @@ def replay_nonshared_operator(
     _require_sample_path(identity["mesh_payload_path"], sample_index, "mesh payload")
     expected_mesh_sha = _digest(identity["mesh_payload_sha256"], "identity.mesh_payload_sha256")
     if mesh_payload_ref_raw is None:
-        mesh_raw, _ = _read_relative(root, identity["mesh_payload_path"], "mesh payload")
+        mesh_raw, _ = _read_relative(
+            root, identity["mesh_payload_path"], "mesh payload", read_bytes=read_bytes
+        )
     else:
         mesh_raw = mesh_payload_ref_raw
     if raw_sha256(mesh_raw) != expected_mesh_sha:
@@ -1057,7 +1172,9 @@ def replay_nonshared_operator(
         None if mesh_payload_ref is not None else "mesh_payload_not_in_exact_replay_refs"
     )
 
-    physical_verified = _validate_physical_refs(root, identity_refs["physical_source"])
+    physical_verified = _validate_physical_refs(
+        root, identity_refs["physical_source"], read_bytes=read_bytes
+    )
     source_qualified = bool(identity["source_replay_qualified"])
     if source_qualified and identity_plan_snapshot is None:
         _fail("source replay is qualified but producer plan snapshot is absent")
@@ -1084,6 +1201,8 @@ def replay_nonshared_operator(
             identity=identity,
             operator_input=operator_input,
             embedding=embedding,
+            read_bytes=read_bytes,
+            has_member=has_member,
         )
         if operator_diagnostics is None:
             gaps.append("native_input_diagnostics_not_published")
@@ -1221,9 +1340,17 @@ def _validate_native_input_diagnostics_external_refs(
     preimage_path: str,
     final_raw: bytes,
     preimage_raw: bytes,
+    read_bytes: Callable[[str, int | None], bytes] | None = None,
+    has_member: Callable[[str], bool] | None = None,
 ) -> None:
     solver_path = "eigen/diagnostics/solver.v1.json"
-    solver_read = _read_optional_relative(root, solver_path, "solver diagnostics path")
+    solver_read = _read_optional_relative(
+        root,
+        solver_path,
+        "solver diagnostics path",
+        read_bytes=read_bytes,
+        has_member=has_member,
+    )
     if solver_read is None:
         _fail("native input diagnostics: external raw reference is not published")
     solver_raw, _ = solver_read
@@ -1277,16 +1404,26 @@ def _load_and_validate_native_input_diagnostics(
     identity: Mapping[str, Any],
     operator_input: Mapping[str, Any],
     embedding: str,
+    read_bytes: Callable[[str, int | None], bytes] | None = None,
+    has_member: Callable[[str], bool] | None = None,
 ) -> dict[str, Any] | None:
     prefix = _sample_prefix(sample_index) + "nonshared_source/"
     final_path = prefix + NATIVE_INPUT_DIAGNOSTICS_FILENAME
     preimage_path = prefix + NATIVE_INPUT_DIAGNOSTICS_PREIMAGE_FILENAME
-    final_read = _read_optional_relative(root, final_path, "native input diagnostics path")
+    final_read = _read_optional_relative(
+        root,
+        final_path,
+        "native input diagnostics path",
+        read_bytes=read_bytes,
+        has_member=has_member,
+    )
     if final_read is None:
         preimage_read = _read_optional_relative(
             root,
             preimage_path,
             "native input diagnostics preimage path",
+            read_bytes=read_bytes,
+            has_member=has_member,
         )
         if preimage_read is not None:
             _fail(
@@ -1296,6 +1433,8 @@ def _load_and_validate_native_input_diagnostics(
             root,
             "eigen/diagnostics/solver.v1.json",
             "solver diagnostics path",
+            read_bytes=read_bytes,
+            has_member=has_member,
         )
         if solver_read is not None:
             solver_payload = _json_object(solver_read[0], "solver diagnostics")
@@ -1347,7 +1486,12 @@ def _load_and_validate_native_input_diagnostics(
         final[NATIVE_INPUT_DIAGNOSTICS_DIGEST_FIELD],
         "native input diagnostics.preimage_sha256",
     )
-    preimage_read = _read_relative(root, preimage_path, "native input diagnostics preimage path")
+    preimage_read = _read_relative(
+        root,
+        preimage_path,
+        "native input diagnostics preimage path",
+        read_bytes=read_bytes,
+    )
     preimage_raw, _ = preimage_read
     preimage = _json_object(preimage_raw, "native input diagnostics preimage")
     _same_typed_json(
@@ -1404,6 +1548,8 @@ def _load_and_validate_native_input_diagnostics(
         preimage_path=preimage_path,
         final_raw=final_raw,
         preimage_raw=preimage_raw,
+        read_bytes=read_bytes,
+        has_member=has_member,
     )
     return final
 

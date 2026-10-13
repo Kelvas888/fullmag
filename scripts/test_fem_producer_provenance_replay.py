@@ -722,6 +722,55 @@ class ProducerProvenanceReplayTests(unittest.TestCase):
         finally:
             temp.cleanup()
 
+    def test_reader_callback_binds_every_producer_input_and_reads_each_once(self) -> None:
+        temp, paths = self._bundle()
+        try:
+            source_mesh = _mesh()
+            paths.source_mesh_path.write_bytes(
+                json.dumps(source_mesh, separators=(",", ":")).encode("utf-8")
+            )
+            root = Path(paths.producer_root)
+            captured = {
+                path.relative_to(root).as_posix(): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
+            reads: dict[str, int] = {}
+
+            def read_captured(path: Path, maximum_bytes: int) -> bytes:
+                try:
+                    relative = Path(path).relative_to(root).as_posix()
+                except ValueError as error:
+                    raise ProducerProvenanceReplayError(
+                        "producer replay requested a path outside the captured root"
+                    ) from error
+                reads[relative] = reads.get(relative, 0) + 1
+                if relative not in captured:
+                    raise ProducerProvenanceReplayError(
+                        f"producer replay requested a nonmember: {relative}"
+                    )
+                raw = captured[relative]
+                if len(raw) > maximum_bytes:
+                    raise ProducerProvenanceReplayError(
+                        f"producer replay member exceeds its bound: {relative}"
+                    )
+                return raw
+
+            report = replay_producer_provenance(
+                paths,
+                expected_source_run_id="run-1",
+                expected_source_stage_id="relaxation-1",
+                expected_source_stage_kind="relaxation",
+                expected_source_snapshot_sha256=SOURCE_SNAPSHOT,
+                read_bytes=read_captured,
+            )
+            self.assertEqual(report.status, SOURCE_REPLAY_QUALIFIED)
+            self.assertTrue(reads)
+            self.assertTrue(all(count == 1 for count in reads.values()))
+            self.assertIn("eigen/metadata/sample_0000/producer_provenance.v1.json", reads)
+        finally:
+            temp.cleanup()
+
     def test_main_shared_routing_replays_real_producer_bundle(self) -> None:
         temp, _, manifest = self._shared_routing_bundle()
         try:

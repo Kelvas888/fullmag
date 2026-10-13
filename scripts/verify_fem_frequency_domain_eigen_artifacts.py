@@ -11,6 +11,8 @@ import math
 import sys
 from pathlib import Path
 
+from comsol_modal_field_certificate import ArtifactBundleReader
+import frequency_domain_generation
 from fem_linearization_identity_replay import (
     IdentityReplayError, replay_identity_preimage, strict_json_object,
 )
@@ -167,33 +169,125 @@ R4_DISCOVERY_STATUSES = {
     "payload_replay_pending",
 }
 
+MAX_PRIMARY_DISPERSION_CSV_BYTES = 16 * 1024 * 1024
+
 
 def fail(message: str) -> None:
     raise SystemExit(f"invalid frequency-domain eigen artifacts:\n{message}")
 
 
-def load_json(path: Path) -> dict:
-    require_file(path)
+def _logical_bundle_path(path: Path, bundle_reader: ArtifactBundleReader) -> str:
+    """Map a root-visible path back to its captured logical member spelling."""
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = bundle_reader.root / candidate
     try:
-        value = json.loads(path.read_text())
-    except json.JSONDecodeError as error:
+        relative = candidate.relative_to(bundle_reader.root)
+        logical = relative.as_posix()
+        bundle_reader.logical_path(logical)
+    except (ValueError, OSError) as error:
+        fail(f"artifact path is not a safe logical bundle member: {path}: {error}")
+    return logical
+
+
+def _read_artifact_bytes(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    bundle_reader: ArtifactBundleReader | None = None,
+    name: str = "artifact",
+) -> bytes:
+    """Read bounded bytes, using the captured reader whenever one is supplied."""
+    if bundle_reader is not None:
+        logical = _logical_bundle_path(path, bundle_reader)
+        try:
+            return bundle_reader.read_bytes(logical, maximum_bytes=maximum_bytes)
+        except (OSError, ValueError) as error:
+            fail(f"cannot read {name} {logical}: {error}")
+    try:
+        with Path(path).open("rb") as stream:
+            data = stream.read(maximum_bytes + 1)
+    except OSError as error:
+        fail(f"cannot read {name} {path}: {error}")
+    if len(data) > maximum_bytes:
+        fail(f"{name} exceeds the {maximum_bytes}-byte read budget: {path}")
+    return data
+
+
+def _verified_member_size(
+    path: Path,
+    *,
+    bundle_reader: ArtifactBundleReader,
+    name: str,
+) -> int:
+    logical = _logical_bundle_path(path, bundle_reader)
+    if bundle_reader.generation is not None:
+        try:
+            return bundle_reader.generation.verify_member(logical).byte_length
+        except (OSError, ValueError) as error:
+            fail(f"cannot verify {name} generation member {logical}: {error}")
+    require_file(path, bundle_reader)
+    try:
+        return path.stat().st_size
+    except OSError as error:
+        fail(f"cannot inspect {name} {logical}: {error}")
+
+
+def load_json(
+    path: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> dict:
+    require_file(path, bundle_reader)
+    raw = _read_artifact_bytes(
+        path,
+        maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+        bundle_reader=bundle_reader,
+        name="JSON artifact",
+    )
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
         fail(f"invalid JSON artifact {path}: {error}")
     if not isinstance(value, dict):
         fail(f"JSON artifact {path} must be an object")
     return value
 
 
-def require_file(path: Path) -> None:
+def require_file(
+    path: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
+    if bundle_reader is not None:
+        logical = _logical_bundle_path(path, bundle_reader)
+        try:
+            if bundle_reader.has_member(logical):
+                return
+        except (OSError, ValueError) as error:
+            fail(f"invalid artifact member {logical}: {error}")
+        fail(f"missing required artifact generation member: {logical}")
     if not path.is_file():
         fail(f"missing required artifact: {path}")
 
 
-def require_bundle_path(root: Path, value: object, name: str) -> tuple[str, Path]:
+def require_bundle_path(
+    root: Path,
+    value: object,
+    name: str,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> tuple[str, Path]:
     """Resolve an artifact path without permitting escape from the bundle."""
     relative_path = require_non_empty_string(value, name)
     candidate = Path(relative_path)
     if candidate.is_absolute() or ".." in candidate.parts:
         fail(f"{name} must be a relative path inside the artifact bundle")
+    if bundle_reader is not None:
+        try:
+            logical_path = bundle_reader.logical_path(relative_path)
+            if not bundle_reader.has_member(relative_path):
+                fail(f"{name} is not a member of the captured artifact generation")
+        except (OSError, ValueError) as error:
+            fail(f"{name} is not a safe captured artifact path: {error}")
+        return relative_path, logical_path
     root_resolved = root.resolve()
     resolved = (root / candidate).resolve()
     try:
@@ -204,7 +298,26 @@ def require_bundle_path(root: Path, value: object, name: str) -> tuple[str, Path
     return relative_path, resolved
 
 
-def sha256_file_token(path: Path) -> str:
+def sha256_file_token(
+    path: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> str:
+    if bundle_reader is not None:
+        logical = _logical_bundle_path(path, bundle_reader)
+        try:
+            record = bundle_reader.record_for(logical)
+        except ValueError:
+            _read_artifact_bytes(
+                path,
+                maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+                bundle_reader=bundle_reader,
+                name="hashed artifact",
+            )
+            try:
+                record = bundle_reader.record_for(logical)
+            except ValueError as error:
+                fail(f"cannot obtain verified artifact digest for {logical}: {error}")
+        return str(record["sha256"])
     return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 
 
@@ -852,6 +965,7 @@ def _declared_r4_sidecar_paths(
     artifacts: dict,
     key: str,
     filename: str,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[int, tuple[str, Path]] | None:
     """Resolve one optional R4 plural sidecar array.
 
@@ -872,7 +986,10 @@ def _declared_r4_sidecar_paths(
     result: dict[int, tuple[str, Path]] = {}
     for index, item in enumerate(value):
         relative_path, artifact_path = require_bundle_path(
-            root, item, f"manifest.artifacts.{key}[{index}]"
+            root,
+            item,
+            f"manifest.artifacts.{key}[{index}]",
+            bundle_reader,
         )
         sample_index = _r4_sidecar_sample_index(
             relative_path,
@@ -915,6 +1032,7 @@ def _declared_nonshared_native_input_diagnostics_paths(
     root: Path,
     artifacts: dict,
     computed_sample_indices: set[int] | None,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[str, object]:
     """Validate the additive final-C-ABI pair independently of old sidecars.
 
@@ -963,7 +1081,10 @@ def _declared_nonshared_native_input_diagnostics_paths(
         paths: dict[int, tuple[str, Path]] = {}
         for position, item in enumerate(declared):
             relative, artifact_path = require_bundle_path(
-                root, item, f"manifest.artifacts.{key}[{position}]"
+                root,
+                item,
+                f"manifest.artifacts.{key}[{position}]",
+                bundle_reader,
             )
             sample_index = _native_input_diagnostics_sample_index(
                 relative, filename, f"manifest.artifacts.{key}[{position}]"
@@ -986,7 +1107,7 @@ def _declared_nonshared_native_input_diagnostics_paths(
                 )
         elif alias_value is not None:
             alias_relative, alias_path = require_bundle_path(
-                root, alias_value, f"manifest.artifacts.{alias}"
+                root, alias_value, f"manifest.artifacts.{alias}", bundle_reader
             )
             alias_sample = _native_input_diagnostics_sample_index(
                 alias_relative, filename, f"manifest.artifacts.{alias}"
@@ -1035,7 +1156,13 @@ def _declared_nonshared_native_input_diagnostics_paths(
         preimage_relative, _preimage_path = preimage_paths[sample_index]
         try:
             final = strict_json_object(
-                final_path.read_bytes(), "native-input diagnostic manifest sidecar"
+                _read_artifact_bytes(
+                    final_path,
+                    maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+                    bundle_reader=bundle_reader,
+                    name="native-input diagnostic manifest sidecar",
+                ),
+                "native-input diagnostic manifest sidecar",
             )
         except (IdentityReplayError, OSError) as error:
             fail(f"native-input diagnostic manifest sidecar is invalid: {error}")
@@ -1074,10 +1201,18 @@ def _declared_nonshared_native_input_diagnostics_paths(
 
 
 def _legacy_state_sample_indices(
-    root: Path, artifacts: dict, schema: str
+    root: Path,
+    artifacts: dict,
+    schema: str,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> set[int]:
     """Return the sample indices of one existing v7/v6 or v8/v7 pair."""
-    pairs = _state_path_pairs(root, {"artifacts": artifacts}, schema=schema)
+    pairs = _state_path_pairs(
+        root,
+        {"artifacts": artifacts},
+        schema=schema,
+        bundle_reader=bundle_reader,
+    )
     indices: set[int] = set()
     for _, _, _, sample_key in pairs:
         if sample_key == "":
@@ -1193,6 +1328,7 @@ def validate_r4_signed_sidecars(
     root: Path,
     artifacts: object,
     computed_sample_indices: set[int] | None = None,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[str, object]:
     """Validate R4 sidecar discovery and family/sample binding.
 
@@ -1243,6 +1379,7 @@ def validate_r4_signed_sidecars(
             artifacts,
             key,
             R4_SIGNED_SIDECAR_DEFINITIONS[key][0],
+            bundle_reader,
         )
         for key in present
     }
@@ -1252,6 +1389,7 @@ def validate_r4_signed_sidecars(
     identity_preimages = _declared_r4_sidecar_paths(
         root, artifacts, R4_IDENTITY_PREIMAGE_KEY,
         "linearization_identity_preimage.v1.json",
+        bundle_reader,
     )
     new_sidecars = {
         key: declared.get(key) or {}
@@ -1315,12 +1453,23 @@ def validate_r4_signed_sidecars(
     for sample_index, (_, preimage_path) in (identity_preimages or {}).items():
         identity_path = identity_v2[sample_index][1]
         try:
-            identity_bytes = identity_path.read_bytes()
+            identity_bytes = _read_artifact_bytes(
+                identity_path,
+                maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+                bundle_reader=bundle_reader,
+                name="linearization identity",
+            )
             identity = strict_json_object(identity_bytes, "identity")
             if require_non_negative_int(identity.get("sample_index"), "identity.sample_index") != sample_index:
                 fail("linearization identity sample_index must match its canonical sidecar path")
             identity_digests[str(sample_index)] = replay_identity_preimage(
-                identity_bytes, preimage_path.read_bytes(),
+                identity_bytes,
+                _read_artifact_bytes(
+                    preimage_path,
+                    maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+                    bundle_reader=bundle_reader,
+                    name="linearization identity preimage",
+                ),
             )
             equilibrium_digests[str(sample_index)] = replay_equilibrium_identity_preimages(identity_bytes)
         except (IdentityReplayError, OSError) as error:
@@ -1340,7 +1489,7 @@ def validate_r4_signed_sidecars(
         )
     if _state_family_has_paths(artifacts, state_schema):
         expected_state_samples = _legacy_state_sample_indices(
-            root, artifacts, state_schema
+            root, artifacts, state_schema, bundle_reader
         )
         if set(accepted_sample_indices) != expected_state_samples:
             fail(
@@ -1419,6 +1568,7 @@ def validate_producer_provenance_discovery(
     root: Path,
     artifacts: dict,
     computed_sample_indices: set[int] | None,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[str, object]:
     """Bind additive producer paths to actual samples without qualifying payloads.
 
@@ -1427,12 +1577,19 @@ def validate_producer_provenance_discovery(
     singular alias is rejected before any physical replay can use the paths.
     """
     paths = _declared_r4_sidecar_paths(
-        root, artifacts, "producer_provenance_v1_paths", "producer_provenance.v1.json"
+        root,
+        artifacts,
+        "producer_provenance_v1_paths",
+        "producer_provenance.v1.json",
+        bundle_reader,
     )
     singular = artifacts.get("producer_provenance_v1_path")
     if singular is not None:
         relative, _ = require_bundle_path(
-            root, singular, "manifest.artifacts.producer_provenance_v1_path"
+            root,
+            singular,
+            "manifest.artifacts.producer_provenance_v1_path",
+            bundle_reader,
         )
         index = _r4_sidecar_sample_index(
             relative, "producer_provenance.v1.json",
@@ -1460,6 +1617,7 @@ def validate_producer_provenance_discovery(
 
 def validate_consumer_plan_exact_replay(
     root: Path, artifacts: dict, computed_sample_indices: set[int] | None,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[str, object]:
     """Bind raw consumer plan bytes to identity, without qualifying IR or assembly.
 
@@ -1468,11 +1626,17 @@ def validate_consumer_plan_exact_replay(
     the retained bytes, including their original field order and whitespace.
     """
     paths = _declared_r4_sidecar_paths(
-        root, artifacts, "consumer_plan_snapshot_v1_paths", "consumer_plan_snapshot.v1.json"
+        root,
+        artifacts,
+        "consumer_plan_snapshot_v1_paths",
+        "consumer_plan_snapshot.v1.json",
+        bundle_reader,
     ) or {}
     singular = artifacts.get("consumer_plan_snapshot_v1_path")
     if singular is not None:
-        relative, _ = require_bundle_path(root, singular, "consumer_plan_snapshot_v1_path")
+        relative, _ = require_bundle_path(
+            root, singular, "consumer_plan_snapshot_v1_path", bundle_reader
+        )
         index = _r4_sidecar_sample_index(relative, "consumer_plan_snapshot.v1.json", "consumer plan alias")
         if index not in paths or paths[index][0] != relative:
             fail("consumer plan singular path must belong to its plural sample set")
@@ -1483,16 +1647,33 @@ def validate_consumer_plan_exact_replay(
     if computed_sample_indices is not None and set(paths) != computed_sample_indices:
         fail("consumer plan sample index set must match computed spectrum samples")
     identities = _declared_r4_sidecar_paths(
-        root, artifacts, R4_IDENTITY_SIDECAR_KEY, "linearization_identity.v2.json"
+        root,
+        artifacts,
+        R4_IDENTITY_SIDECAR_KEY,
+        "linearization_identity.v2.json",
+        bundle_reader,
     ) or {}
     if set(paths) != set(identities):
         fail("consumer plan sample index set must match linearization identities")
     digests = {}
     for index, (_, plan_path) in paths.items():
-        raw = plan_path.read_bytes()
+        raw = _read_artifact_bytes(
+            plan_path,
+            maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+            bundle_reader=bundle_reader,
+            name="exact consumer plan",
+        )
         try:
             strict_json_object(raw, "exact consumer plan")
-            identity = strict_json_object(identities[index][1].read_bytes(), "linearization identity")
+            identity = strict_json_object(
+                _read_artifact_bytes(
+                    identities[index][1],
+                    maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+                    bundle_reader=bundle_reader,
+                    name="linearization identity",
+                ),
+                "linearization identity",
+            )
         except IdentityReplayError as error:
             fail(f"consumer plan replay sample {index}: {error}")
         if type(identity.get("sample_index")) is not int or identity["sample_index"] != index:
@@ -1508,12 +1689,13 @@ def validate_consumer_plan_exact_replay(
 
 def validate_nonshared_operator_replay(
     root: Path, artifacts: dict, computed_sample_indices: set[int] | None,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[str, object]:
     """Replay declared nonshared samples without qualifying native FEM assembly."""
     from fem_nonshared_operator_replay import NonSharedReplayError, replay_nonshared_operator
 
     native_input_coverage = _declared_nonshared_native_input_diagnostics_paths(
-        root, artifacts, computed_sample_indices
+        root, artifacts, computed_sample_indices, bundle_reader
     )
 
     families = (
@@ -1524,7 +1706,9 @@ def validate_nonshared_operator_replay(
     paths = {}
     for family in families:
         key = f"{family}_v1_paths"
-        declared = _declared_r4_sidecar_paths(root, artifacts, key, f"{family}.v1.json") or {}
+        declared = _declared_r4_sidecar_paths(
+            root, artifacts, key, f"{family}.v1.json", bundle_reader
+        ) or {}
         alias = artifacts.get(f"{family}_v1_path")
         if alias is not None and (len(declared) != 1 or alias != next(iter(declared.values()))[0]):
             fail(f"manifest.artifacts.{family}_v1_path differs from its single-sample array")
@@ -1558,6 +1742,16 @@ def validate_nonshared_operator_replay(
                 identity_path=Path(paths[families[0]][index][0]),
                 identity_preimage_path=Path(paths[families[1]][index][0]),
                 source_state_path=Path(paths[families[2]][index][0]),
+                read_bytes=(
+                    None
+                    if bundle_reader is None
+                    else lambda relative, maximum_bytes: bundle_reader.read_bytes(
+                        relative, maximum_bytes=maximum_bytes
+                    )
+                ),
+                has_member=(
+                    None if bundle_reader is None else bundle_reader.has_member
+                ),
             )
         except NonSharedReplayError as error:
             fail(f"nonshared operator replay sample {index}: {error}")
@@ -1576,7 +1770,11 @@ def validate_nonshared_operator_replay(
     }
 
 
-def validate_producer_payload_replay(root: Path, manifest: dict) -> dict[str, object]:
+def validate_producer_payload_replay(
+    root: Path,
+    manifest: dict,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> dict[str, object]:
     """Replay producer payloads when v2 identity is available, independently of assembly.
 
     This source-only gate neither validates the modal assembly family nor
@@ -1587,22 +1785,36 @@ def validate_producer_payload_replay(root: Path, manifest: dict) -> dict[str, ob
     root = root.resolve()
     artifacts = manifest.get("artifacts", {})
     producers = _declared_r4_sidecar_paths(
-        root, artifacts, "producer_provenance_v1_paths", "producer_provenance.v1.json"
+        root,
+        artifacts,
+        "producer_provenance_v1_paths",
+        "producer_provenance.v1.json",
+        bundle_reader,
     )
     if not producers:
         return {"status": "NOT_VERIFIED", "reason": "producer provenance absent"}
     identities = _declared_r4_sidecar_paths(
-        root, artifacts, R4_IDENTITY_SIDECAR_KEY, "linearization_identity.v2.json"
+        root,
+        artifacts,
+        R4_IDENTITY_SIDECAR_KEY,
+        "linearization_identity.v2.json",
+        bundle_reader,
     )
     if not identities:
         return {"status": "NOT_VERIFIED", "reason": "shared identity absent; nonshared replay required"}
     preimages = _declared_r4_sidecar_paths(
-        root, artifacts, R4_IDENTITY_PREIMAGE_KEY, "linearization_identity_preimage.v1.json"
+        root,
+        artifacts,
+        R4_IDENTITY_PREIMAGE_KEY,
+        "linearization_identity_preimage.v1.json",
+        bundle_reader,
     )
     if not preimages:
         return {"status": "NOT_VERIFIED", "reason": "identity exact preimage absent"}
-    pairs = _state_path_pairs(root, manifest, schema="v8") or _state_path_pairs(
-        root, manifest, schema="v7"
+    pairs = _state_path_pairs(
+        root, manifest, schema="v8", bundle_reader=bundle_reader
+    ) or _state_path_pairs(
+        root, manifest, schema="v7", bundle_reader=bundle_reader
     )
     if not pairs:
         return {"status": "NOT_VERIFIED", "reason": "equilibrium/state artifacts absent"}
@@ -1619,14 +1831,23 @@ def validate_producer_payload_replay(root: Path, manifest: dict) -> dict[str, ob
     for index, (_, producer_path) in producers.items():
         identity_path = identities[index][1]
         try:
-            identity = strict_json_object(identity_path.read_bytes(), "linearization identity")
+            identity = strict_json_object(
+                _read_artifact_bytes(
+                    identity_path,
+                    maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+                    bundle_reader=bundle_reader,
+                    name="linearization identity",
+                ),
+                "linearization identity",
+            )
         except IdentityReplayError as error:
             fail(f"producer payload replay sample {index}: {error}")
         if type(identity.get("sample_index")) is not int:
             fail("producer replay identity sample_index must be an integer")
         require_equal(identity.get("sample_index"), index, "producer replay identity sample_index")
         relative, eq_path, state_path = state_by_index[index]
-        eq, state = load_json(eq_path), load_json(state_path)
+        eq = load_json(eq_path, bundle_reader)
+        state = load_json(state_path, bundle_reader)
         for prefix, path, payload in (
             ("equilibrium_artifact", eq_path, eq), ("linearization_state", state_path, state),
         ):
@@ -1639,7 +1860,9 @@ def validate_producer_payload_replay(root: Path, manifest: dict) -> dict[str, ob
             ("certified_fields", "certified_fields_path"),
             ("recomputed_certificate", "recomputed_certificate_path"),
         ):
-            payload_paths[name] = require_bundle_path(root, identity.get(field), field)[1]
+            payload_paths[name] = require_bundle_path(
+                root, identity.get(field), field, bundle_reader
+            )[1]
         try:
             report = replay_producer_provenance(
                 ProducerArtifactPaths(
@@ -1651,6 +1874,16 @@ def validate_producer_payload_replay(root: Path, manifest: dict) -> dict[str, ob
                 expected_source_stage_id=identity.get("source_stage_id"),
                 expected_source_stage_kind=identity.get("source_stage_kind"),
                 expected_source_snapshot_sha256=identity.get("consumer_source_snapshot_sha256"),
+                read_bytes=(
+                    None
+                    if bundle_reader is None
+                    else lambda path, maximum_bytes: _read_artifact_bytes(
+                        path,
+                        maximum_bytes=maximum_bytes,
+                        bundle_reader=bundle_reader,
+                        name="producer replay member",
+                    )
+                ),
             )
         except ProducerProvenanceReplayError as error:
             fail(f"producer payload replay sample {index}: {error}")
@@ -1663,7 +1896,11 @@ def validate_producer_payload_replay(root: Path, manifest: dict) -> dict[str, ob
 
 
 def _declared_state_paths(
-    root: Path, artifacts: object, stem: str, filename: str
+    root: Path,
+    artifacts: object,
+    stem: str,
+    filename: str,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> list[tuple[str, Path, str]]:
     if not isinstance(artifacts, dict):
         return []
@@ -1675,7 +1912,10 @@ def _declared_state_paths(
         fail(f"manifest.artifacts.{singular_key} and {plural_key} are ambiguous")
     if singular is not None:
         relative_path, artifact_path = require_bundle_path(
-            root, singular, f"manifest.artifacts.{singular_key}"
+            root,
+            singular,
+            f"manifest.artifacts.{singular_key}",
+            bundle_reader,
         )
         require_equal(
             relative_path,
@@ -1696,7 +1936,10 @@ def _declared_state_paths(
     sample_keys: set[str] = set()
     for index, item in enumerate(plural):
         relative_path, artifact_path = require_bundle_path(
-            root, item, f"manifest.artifacts.{plural_key}[{index}]"
+            root,
+            item,
+            f"manifest.artifacts.{plural_key}[{index}]",
+            bundle_reader,
         )
         sample_key = _state_sample_key(relative_path, filename)
         if sample_key in sample_keys:
@@ -1709,7 +1952,13 @@ def _declared_state_paths(
     return result
 
 
-def _state_path_pairs(root: Path, manifest: dict, *, schema: str) -> list[tuple[str, Path, Path, str]]:
+def _state_path_pairs(
+    root: Path,
+    manifest: dict,
+    *,
+    schema: str,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> list[tuple[str, Path, Path, str]]:
     artifacts = manifest.get("artifacts")
     if schema == "v8":
         equilibrium_stem, equilibrium_filename = (
@@ -1730,9 +1979,11 @@ def _state_path_pairs(root: Path, manifest: dict, *, schema: str) -> list[tuple[
             "linearization_state.v6.json",
         )
     equilibria = _declared_state_paths(
-        root, artifacts, equilibrium_stem, equilibrium_filename
+        root, artifacts, equilibrium_stem, equilibrium_filename, bundle_reader
     )
-    states = _declared_state_paths(root, artifacts, state_stem, state_filename)
+    states = _declared_state_paths(
+        root, artifacts, state_stem, state_filename, bundle_reader
+    )
     if bool(equilibria) != bool(states):
         fail(
             f"manifest.artifacts {schema} equilibrium/state paths must be "
@@ -1789,6 +2040,7 @@ def validate_equilibrium_artifacts(
     solver_diagnostics: dict | None = None,
     *,
     computed_sample_indices: set[int] | None = None,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[str, object]:
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict):
@@ -1801,16 +2053,19 @@ def validate_equilibrium_artifacts(
         root,
         artifacts,
         computed_sample_indices=computed_sample_indices,
+        bundle_reader=bundle_reader,
     )
     r4_discovery["producer_provenance_discovery"] = validate_producer_provenance_discovery(
-        root, artifacts, computed_sample_indices,
+        root, artifacts, computed_sample_indices, bundle_reader,
     )
     r4_discovery["consumer_plan_replay"] = validate_consumer_plan_exact_replay(
-        root, artifacts, computed_sample_indices,
+        root, artifacts, computed_sample_indices, bundle_reader,
     )
-    r4_discovery["producer_payload_replay"] = validate_producer_payload_replay(root, manifest)
+    r4_discovery["producer_payload_replay"] = validate_producer_payload_replay(
+        root, manifest, bundle_reader
+    )
     r4_discovery["nonshared_operator_replay"] = validate_nonshared_operator_replay(
-        root, artifacts, computed_sample_indices,
+        root, artifacts, computed_sample_indices, bundle_reader,
     )
     def has_declared_path(keys: tuple[str, ...]) -> bool:
         return any(
@@ -1847,12 +2102,14 @@ def validate_equilibrium_artifacts(
     if has_v8 and has_v7:
         fail("manifest.artifacts cannot mix v8/v7 and legacy v7/v6 state paths")
     if has_v8:
-        pairs = _state_path_pairs(root, manifest, schema="v8")
+        pairs = _state_path_pairs(
+            root, manifest, schema="v8", bundle_reader=bundle_reader
+        )
         expected_equilibrium_sha = manifest.get("equilibrium_artifact_sha256")
         expected_state_sha = manifest.get("linearization_state_sha256")
         for index, (relative, equilibrium_path, state_path, sample_key) in enumerate(pairs):
-            equilibrium = load_json(equilibrium_path)
-            state = load_json(state_path)
+            equilibrium = load_json(equilibrium_path, bundle_reader)
+            state = load_json(state_path, bundle_reader)
             expected_eq = expected_equilibrium_sha if len(pairs) == 1 else None
             expected_state = expected_state_sha if len(pairs) == 1 else None
             validate_equilibrium_artifact_v8_payload(equilibrium, expected_eq)
@@ -1872,7 +2129,7 @@ def validate_equilibrium_artifacts(
             fail("v8/v7 artifacts require linearization_handoff diagnostics")
         return r4_discovery
     if has_v7:
-        validate_equilibrium_artifact_v7(root, manifest)
+        validate_equilibrium_artifact_v7(root, manifest, bundle_reader)
         has_v7_state = any(
             key in artifacts
             for key in (
@@ -1882,12 +2139,14 @@ def validate_equilibrium_artifacts(
         )
         if not has_v7_state:
             return r4_discovery
-        pairs = _state_path_pairs(root, manifest, schema="v7")
+        pairs = _state_path_pairs(
+            root, manifest, schema="v7", bundle_reader=bundle_reader
+        )
         expected_equilibrium_sha = manifest.get("equilibrium_artifact_sha256")
         expected_state_sha = manifest.get("linearization_state_sha256")
         for relative, equilibrium_path, state_path, sample_key in pairs:
-            equilibrium = load_json(equilibrium_path)
-            state = load_json(state_path)
+            equilibrium = load_json(equilibrium_path, bundle_reader)
+            state = load_json(state_path, bundle_reader)
             expected_eq = expected_equilibrium_sha if len(pairs) == 1 else None
             expected_state = expected_state_sha if len(pairs) == 1 else None
             validate_equilibrium_artifact_v7_payload(equilibrium, expected_eq)
@@ -1906,19 +2165,24 @@ def validate_equilibrium_artifacts(
     return r4_discovery
 
 
-def validate_equilibrium_artifact_v7(root: Path, manifest: dict) -> None:
+def validate_equilibrium_artifact_v7(
+    root: Path,
+    manifest: dict,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
     paths = _declared_state_paths(
         root,
         manifest.get("artifacts"),
         "equilibrium_artifact_v7",
         "equilibrium_artifact.v7.json",
+        bundle_reader,
     )
     if not paths:
         return
     expected_content_sha256 = manifest.get("equilibrium_artifact_sha256")
     for _, artifact_path, _ in paths:
         validate_equilibrium_artifact_v7_payload(
-            load_json(artifact_path),
+            load_json(artifact_path, bundle_reader),
             expected_content_sha256 if len(paths) == 1 else None,
         )
 
@@ -2232,10 +2496,20 @@ def require_tracking_method(value: object, name: str, allowed: set[str]) -> str:
     return method
 
 
-def require_mode_payload(root: Path, relative_path: str, name: str) -> int:
+def require_mode_payload(
+    root: Path,
+    relative_path: str,
+    name: str,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> int:
     path = root / relative_path
-    require_file(path)
-    size = path.stat().st_size
+    if bundle_reader is None:
+        require_file(path)
+        size = path.stat().st_size
+    else:
+        size = _verified_member_size(
+            path, bundle_reader=bundle_reader, name=f"{name} payload"
+        )
     if size <= 0:
         fail(f"{name} payload must not be empty")
     if size % 8 != 0:
@@ -2252,20 +2526,21 @@ def require_mode_zarr_payload(
     sample_count: int,
     expected_payload_value_count: int,
     name: str,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> int:
     zarray_path = root / array_path / ".zarray"
     zattrs_path = root / array_path / ".zattrs"
     chunk_path = root / array_path / "0.0.0"
-    require_file(zarray_path)
-    require_file(zattrs_path)
-    require_file(chunk_path)
-    zarray = load_json(zarray_path)
+    require_file(zarray_path, bundle_reader)
+    require_file(zattrs_path, bundle_reader)
+    require_file(chunk_path, bundle_reader)
+    zarray = load_json(zarray_path, bundle_reader)
     require_equal(zarray.get("zarr_format"), 2, f"{name}.zarray.zarr_format")
     require_equal(zarray.get("shape"), [sample_count, 3, 2], f"{name}.zarray.shape")
     require_equal(zarray.get("chunks"), [max(sample_count, 1), 3, 2], f"{name}.zarray.chunks")
     require_equal(zarray.get("dtype"), "<f8", f"{name}.zarray.dtype")
     require_equal(zarray.get("order"), "C", f"{name}.zarray.order")
-    zattrs = load_json(zattrs_path)
+    zattrs = load_json(zattrs_path, bundle_reader)
     require_equal(zattrs.get("quantity_id"), "delta_m", f"{name}.zattrs.quantity_id")
     require_equal(zattrs.get("unit"), "1", f"{name}.zattrs.unit")
     require_equal(
@@ -2293,22 +2568,30 @@ def require_mode_zarr_payload(
         ["real", "imag"],
         f"{name}.zattrs.complex_order",
     )
-    size = chunk_path.stat().st_size
+    if bundle_reader is None:
+        size = chunk_path.stat().st_size
+    else:
+        size = _verified_member_size(
+            chunk_path, bundle_reader=bundle_reader, name=f"{name} chunk"
+        )
     expected_size = expected_payload_value_count * 8
     if size != expected_size:
         fail(f"{name} Zarr chunk byte size: got {size}, expected {expected_size}")
     return size // 8
 
 
-def require_mode_zarr_store(root: Path) -> None:
+def require_mode_zarr_store(
+    root: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
     store_root = root / mode_zarr_store_path()
     zgroup_path = store_root / ".zgroup"
     zattrs_path = store_root / ".zattrs"
-    require_file(zgroup_path)
-    require_file(zattrs_path)
-    zgroup = load_json(zgroup_path)
+    require_file(zgroup_path, bundle_reader)
+    require_file(zattrs_path, bundle_reader)
+    zgroup = load_json(zgroup_path, bundle_reader)
     require_equal(zgroup.get("zarr_format"), 2, "mode_fields.zarr/.zgroup.zarr_format")
-    zattrs = load_json(zattrs_path)
+    zattrs = load_json(zattrs_path, bundle_reader)
     require_equal(
         zattrs.get("fullmag_kind"),
         "frequency_domain_mode_field_store",
@@ -2884,6 +3167,7 @@ def validate_mode_summary(
     manifest_mode_resources: set[str],
     requested_window_hz: list[float] | None,
     require_zarr_mode_fields: bool,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> tuple[int, int, float, float, float, float]:
     raw_mode_index = require_non_negative_int(mode.get("raw_mode_index"), "mode.raw_mode_index")
     expected_field_id = mode_field_id(sample_index, raw_mode_index)
@@ -2938,7 +3222,7 @@ def validate_mode_summary(
     metadata_path = nested_mode_path(sample_index, raw_mode_index)
     if manifest_mode_paths and metadata_path not in manifest_mode_paths:
         fail(f"manifest.artifacts.mode_metadata_paths missing {metadata_path}")
-    metadata = load_json(root / metadata_path)
+    metadata = load_json(root / metadata_path, bundle_reader)
     require_equal(metadata.get("sample_index"), sample_index, f"{metadata_path}.sample_index")
     require_equal(
         metadata.get("raw_mode_index"),
@@ -3012,6 +3296,7 @@ def validate_mode_summary(
             ),
             payload_value_count,
             f"mode {sample_index}/{raw_mode_index}",
+            bundle_reader,
         )
         require_equal(
             zarr_payload_value_count,
@@ -3022,6 +3307,7 @@ def validate_mode_summary(
         root,
         mode_payload_path(sample_index, raw_mode_index),
         f"mode {sample_index}/{raw_mode_index}",
+        bundle_reader,
     )
     require_equal(
         metadata.get("payload_value_count"),
@@ -4032,11 +4318,12 @@ def validate_production_modal_k_path_scope(
 def validate_reference_full_2x2_floquet_mode_metadata(
     root: Path,
     mode_metadata_paths: set[str],
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     if not mode_metadata_paths:
         fail("manifest.artifacts.mode_metadata_paths must not be empty")
     for metadata_path in sorted(mode_metadata_paths):
-        metadata = load_json(root / metadata_path)
+        metadata = load_json(root / metadata_path, bundle_reader)
         if metadata.get("solver_model") == "cpu_full_2x2_phase_reduced_floquet":
             return
     fail(
@@ -4111,19 +4398,32 @@ def vector_distance(
     return math.sqrt(sum((left - right) ** 2 for left, right in zip(lhs, rhs)))
 
 
-def dispersion_k_sampling_sources(root: Path) -> list[tuple[str, dict]]:
+def dispersion_k_sampling_sources(
+    root: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> list[tuple[str, dict]]:
     sources: list[tuple[str, dict]] = []
     path_metadata_path = root / "eigen" / "dispersion" / "path.json"
-    if path_metadata_path.is_file():
-        path_metadata = load_json(path_metadata_path)
+    path_metadata_exists = (
+        bundle_reader.has_member("eigen/dispersion/path.json")
+        if bundle_reader is not None
+        else path_metadata_path.is_file()
+    )
+    if path_metadata_exists:
+        path_metadata = load_json(path_metadata_path, bundle_reader)
         sampling = path_metadata.get("sampling", path_metadata)
         if not isinstance(sampling, dict):
             fail("eigen/dispersion/path.json sampling metadata must be an object")
         sources.append(("eigen/dispersion/path.json", sampling))
 
     execution_metadata_path = root / "metadata.json"
-    if execution_metadata_path.is_file():
-        execution_metadata = load_json(execution_metadata_path)
+    execution_metadata_exists = (
+        bundle_reader.has_member("metadata.json")
+        if bundle_reader is not None
+        else execution_metadata_path.is_file()
+    )
+    if execution_metadata_exists:
+        execution_metadata = load_json(execution_metadata_path, bundle_reader)
         plan = execution_metadata.get("execution_plan", {}).get("backend_plan")
         if isinstance(plan, dict):
             sampling = plan.get("k_sampling")
@@ -4139,11 +4439,12 @@ def validate_dispersion_k_sampling_path(
     known_samples: dict[int, tuple[float, tuple[float, float, float], str]],
     *,
     require_path_metadata: bool = False,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     path_metadata_path = root / "eigen" / "dispersion" / "path.json"
     if require_path_metadata:
-        require_file(path_metadata_path)
-    for source_name, sampling in dispersion_k_sampling_sources(root):
+        require_file(path_metadata_path, bundle_reader)
+    for source_name, sampling in dispersion_k_sampling_sources(root, bundle_reader):
         if sampling.get("kind") != "path":
             continue
         points = require_object_list(
@@ -4547,10 +4848,11 @@ def validate_exchange_only_analytic_dispersion(
     known_modes: dict[tuple[int, int], tuple[float, float, float, float]],
     known_samples: dict[int, tuple[float, tuple[float, float, float], str]],
     branch_ids_by_mode: dict[tuple[int, int], int],
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     metadata_path = root / "metadata.json"
-    require_file(metadata_path)
-    metadata = load_json(metadata_path)
+    require_file(metadata_path, bundle_reader)
+    metadata = load_json(metadata_path, bundle_reader)
     plan = metadata.get("execution_plan", {}).get("backend_plan")
     if not isinstance(plan, dict):
         fail("metadata.execution_plan.backend_plan is required for exchange-only analytic dispersion")
@@ -4645,13 +4947,19 @@ def validate_k0_kittel_summary_artifacts(
     tolerance: float,
     *,
     require_demag: bool = False,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     summary_path = root / "validation/kittel_k0_pbc/summary.v1.json"
-    if not summary_path.exists():
+    summary_exists = (
+        bundle_reader.has_member("validation/kittel_k0_pbc/summary.v1.json")
+        if bundle_reader is not None
+        else summary_path.exists()
+    )
+    if not summary_exists:
         return
     points_path = root / "validation/kittel_k0_pbc/points.v1.csv"
-    require_file(points_path)
-    summary = load_json(summary_path)
+    require_file(points_path, bundle_reader)
+    summary = load_json(summary_path, bundle_reader)
     summary_name = "validation/kittel_k0_pbc/summary.v1.json"
     require_equal(
         summary.get("schema_version"),
@@ -4680,7 +4988,9 @@ def validate_k0_kittel_summary_artifacts(
         if effective_magnetisation <= 0.0:
             fail(f"{summary_name}.demag.effective_magnetisation_A_per_m must be positive")
         if demag_kind == "periodic_airbox_k0":
-            eigen_summary = load_json(root / "eigen/metadata/eigen_summary.json")
+            eigen_summary = load_json(
+                root / "eigen/metadata/eigen_summary.json", bundle_reader
+            )
             equilibrium_source = eigen_summary.get("equilibrium_source")
             if not isinstance(equilibrium_source, dict):
                 fail(
@@ -4702,7 +5012,9 @@ def validate_k0_kittel_summary_artifacts(
                     "eigen_summary.relaxation_steps must be positive for periodic_airbox_k0 "
                     "unless eigen_summary.equilibrium_source.handoff=stage_continuation"
                 )
-            solver_diagnostics = load_json(root / "eigen/diagnostics/solver.v1.json")
+            solver_diagnostics = load_json(
+                root / "eigen/diagnostics/solver.v1.json", bundle_reader
+            )
             if solver_diagnostics.get("solver_adapter") not in {
                 "k0_poisson_airbox_cpu_full_coupled_slepc",
                 "k0_poisson_airbox_cpu_schur_slepc",
@@ -4814,7 +5126,9 @@ def validate_k0_kittel_summary_artifacts(
                 True,
                 f"{summary_name}.demag.production_periodic_airbox_claim",
             )
-            validate_k0_kittel_demag_convergence_table(root, tolerance)
+            validate_k0_kittel_demag_convergence_table(
+                root, tolerance, bundle_reader
+            )
         else:
             require_equal(
                 demag.get("production_periodic_airbox_claim"),
@@ -4859,7 +5173,16 @@ def validate_k0_kittel_summary_artifacts(
             f"{summary_name}.max_relative_frequency_error"
         )
 
-    reader = csv.DictReader(points_path.read_text().splitlines())
+    points_raw = _read_artifact_bytes(
+        points_path,
+        maximum_bytes=MAX_PRIMARY_DISPERSION_CSV_BYTES,
+        bundle_reader=bundle_reader,
+        name="Kittel validation points CSV",
+    )
+    try:
+        reader = csv.DictReader(points_raw.decode("utf-8").splitlines())
+    except UnicodeError as error:
+        fail(f"Kittel validation points CSV is not UTF-8: {error}")
     required_columns = {
         "field_index",
         "H0_A_per_m",
@@ -4954,10 +5277,23 @@ def validate_k0_kittel_summary_artifacts(
         )
 
 
-def validate_k0_kittel_demag_convergence_table(root: Path, tolerance: float) -> None:
+def validate_k0_kittel_demag_convergence_table(
+    root: Path,
+    tolerance: float,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
     convergence_path = root / "validation/kittel_k0_pbc/convergence.v1.csv"
-    require_file(convergence_path)
-    reader = csv.DictReader(convergence_path.read_text().splitlines())
+    require_file(convergence_path, bundle_reader)
+    convergence_raw = _read_artifact_bytes(
+        convergence_path,
+        maximum_bytes=MAX_PRIMARY_DISPERSION_CSV_BYTES,
+        bundle_reader=bundle_reader,
+        name="Kittel convergence CSV",
+    )
+    try:
+        reader = csv.DictReader(convergence_raw.decode("utf-8").splitlines())
+    except UnicodeError as error:
+        fail(f"Kittel convergence CSV is not UTF-8: {error}")
     required_columns = {
         "case_id",
         "demag_kind",
@@ -5018,10 +5354,11 @@ def validate_k0_kittel_field_sweep(
     *,
     require_demag: bool = False,
     require_periodic_airbox_demag: bool = False,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     metadata_path = root / "metadata.json"
-    require_file(metadata_path)
-    metadata = load_json(metadata_path)
+    require_file(metadata_path, bundle_reader)
+    metadata = load_json(metadata_path, bundle_reader)
     plan = metadata.get("execution_plan", {}).get("backend_plan")
     if not isinstance(plan, dict):
         fail("metadata.execution_plan.backend_plan is required for k0 Kittel field sweep")
@@ -5165,13 +5502,21 @@ def validate_k0_kittel_field_sweep(
             "k0 Kittel field sweep max relative error is too large "
             f"for branch {best_branch_id}: got {best_branch_error:.6g}, expected <= {tolerance:.6g}"
         )
-    validate_k0_kittel_summary_artifacts(root, tolerance, require_demag=require_demag)
+    validate_k0_kittel_summary_artifacts(
+        root,
+        tolerance,
+        require_demag=require_demag,
+        bundle_reader=bundle_reader,
+    )
 
 
-def validate_gpu_modal_k0_kittel_provenance(root: Path) -> None:
+def validate_gpu_modal_k0_kittel_provenance(
+    root: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
     manifest_path = root / "frequency_domain" / "manifest.v1.json"
-    require_file(manifest_path)
-    manifest = load_json(manifest_path)
+    require_file(manifest_path, bundle_reader)
+    manifest = load_json(manifest_path, bundle_reader)
     require_equal(
         manifest.get("study_product"),
         "modal_eigen",
@@ -5263,8 +5608,8 @@ def validate_gpu_modal_k0_kittel_provenance(root: Path) -> None:
         )
 
     summary_path = root / "validation/kittel_k0_pbc/summary.v1.json"
-    require_file(summary_path)
-    summary = load_json(summary_path)
+    require_file(summary_path, bundle_reader)
+    summary = load_json(summary_path, bundle_reader)
     solver = summary.get("solver")
     if not isinstance(solver, dict):
         fail("validation/kittel_k0_pbc/summary.v1.json.solver must be an object")
@@ -5289,8 +5634,11 @@ def validate_gpu_modal_k0_kittel_provenance(root: Path) -> None:
         )
 
 
-def validate_gpu_modal_k0_periodic_airbox_provenance(root: Path) -> None:
-    manifest = load_json(root / "frequency_domain/manifest.v1.json")
+def validate_gpu_modal_k0_periodic_airbox_provenance(
+    root: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
+    manifest = load_json(root / "frequency_domain/manifest.v1.json", bundle_reader)
     requested = manifest.get("requested_execution")
     resolved = manifest.get("resolved_execution")
     if not isinstance(requested, dict) or not isinstance(resolved, dict):
@@ -5321,7 +5669,7 @@ def validate_gpu_modal_k0_periodic_airbox_provenance(root: Path) -> None:
     if "cpu" in engine.lower():
         fail("manifest.resolved_execution.engine must not contain a CPU solver for strict GPU K0 demag")
 
-    solver = load_json(root / "eigen/diagnostics/solver.v1.json")
+    solver = load_json(root / "eigen/diagnostics/solver.v1.json", bundle_reader)
     if solver.get("solver_adapter") not in {
         "k0_poisson_airbox_gpu_petsc_slepc",
         "k0_poisson_airbox_gpu_modal_device_krylov",
@@ -5373,9 +5721,12 @@ def validate_gpu_modal_k0_periodic_airbox_provenance(root: Path) -> None:
         require_equal(diagnostics.get("full_residual_certified"), True, f"{prefix}.full_residual_certified")
 
 
-def validate_cpu_modal_k0_periodic_airbox_provenance(root: Path) -> None:
+def validate_cpu_modal_k0_periodic_airbox_provenance(
+    root: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
     """Validate a fresh CPU P1 artifact without accepting Kittel metadata."""
-    manifest = load_json(root / "frequency_domain/manifest.v1.json")
+    manifest = load_json(root / "frequency_domain/manifest.v1.json", bundle_reader)
     requested = manifest.get("requested_execution")
     resolved = manifest.get("resolved_execution")
     if not isinstance(requested, dict) or not isinstance(resolved, dict):
@@ -5409,7 +5760,7 @@ def validate_cpu_modal_k0_periodic_airbox_provenance(root: Path) -> None:
     if validation.get("k0_kittel_validation") is not None:
         fail("production CPU artifact must not carry analytical Kittel validation metadata")
 
-    solver = load_json(root / "eigen/diagnostics/solver.v1.json")
+    solver = load_json(root / "eigen/diagnostics/solver.v1.json", bundle_reader)
     if solver.get("solver_adapter") not in {
         "k0_poisson_airbox_cpu_full_coupled_slepc",
         "k0_poisson_airbox_cpu_schur_slepc",
@@ -5452,16 +5803,19 @@ def validate_cpu_modal_k0_periodic_airbox_provenance(root: Path) -> None:
         require_equal(diagnostics.get("full_residual_certified"), True, f"{prefix}.full_residual_certified")
 
 
-def validate_k0_periodic_airbox_production_provenance(root: Path) -> None:
-    manifest = load_json(root / "frequency_domain/manifest.v1.json")
+def validate_k0_periodic_airbox_production_provenance(
+    root: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
+    manifest = load_json(root / "frequency_domain/manifest.v1.json", bundle_reader)
     requested = manifest.get("requested_execution")
     if not isinstance(requested, dict):
         fail("K0 production provenance requires manifest.requested_execution")
     device = requested.get("device")
     if device == "cpu":
-        validate_cpu_modal_k0_periodic_airbox_provenance(root)
+        validate_cpu_modal_k0_periodic_airbox_provenance(root, bundle_reader)
     elif device == "gpu":
-        validate_gpu_modal_k0_periodic_airbox_provenance(root)
+        validate_gpu_modal_k0_periodic_airbox_provenance(root, bundle_reader)
         validation = manifest.get("validation")
         if not isinstance(validation, dict):
             fail("manifest.validation must be an object for GPU K0 production provenance")
@@ -5802,17 +6156,18 @@ def validate_low_k_de_bv_analytic_dispersion(
     known_samples: dict[int, tuple[float, tuple[float, float, float], str]],
     branch_ids_by_mode: dict[tuple[int, int], int],
     dispersion_rows_by_mode: dict[tuple[int, int], dict[str, str]],
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     metadata_path = root / "metadata.json"
-    require_file(metadata_path)
-    metadata = load_json(metadata_path)
+    require_file(metadata_path, bundle_reader)
+    metadata = load_json(metadata_path, bundle_reader)
     plan = metadata.get("execution_plan", {}).get("backend_plan")
     if not isinstance(plan, dict):
         fail("metadata.execution_plan.backend_plan is required for DE/BV analytic dispersion")
     validation = plan.get("dispersion_validation")
     if not isinstance(validation, dict):
         fail("metadata.execution_plan.backend_plan.dispersion_validation must be an object")
-    manifest = load_json(root / "frequency_domain/manifest.v1.json")
+    manifest = load_json(root / "frequency_domain/manifest.v1.json", bundle_reader)
     manifest_validation = manifest.get("validation", {}).get("dispersion_validation")
     if not isinstance(manifest_validation, dict):
         fail("manifest.validation.dispersion_validation must be an object")
@@ -6107,10 +6462,20 @@ def validate_dispersion(
     overlap_by_mode: dict[tuple[int, int], float],
     *,
     require_stable_ids: bool,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[tuple[int, int], dict[str, str]]:
     path = root / "eigen/dispersion.csv"
-    require_file(path)
-    reader = csv.DictReader(path.read_text().splitlines())
+    require_file(path, bundle_reader)
+    raw = _read_artifact_bytes(
+        path,
+        maximum_bytes=MAX_PRIMARY_DISPERSION_CSV_BYTES,
+        bundle_reader=bundle_reader,
+        name="eigen/dispersion.csv",
+    )
+    try:
+        reader = csv.DictReader(raw.decode("utf-8").splitlines())
+    except UnicodeError as error:
+        fail(f"eigen/dispersion.csv is not UTF-8: {error}")
     rows = list(reader)
     required_columns = {
         "sample_index",
@@ -6330,6 +6695,7 @@ def validate_typed_modal_field_sweep(
     known_modes: dict[tuple[int, int], tuple[float, float, float, float]],
     known_mode_summaries: dict[tuple[int, int], dict],
     branch_ids_by_mode: dict[tuple[int, int], int],
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     """Validate the optional A1S native modal field-sweep envelope.
 
@@ -6357,7 +6723,10 @@ def validate_typed_modal_field_sweep(
             )
         return
     relative_path, path = require_bundle_path(
-        root, artifact_path, "manifest.artifacts.field_sweep_v1_path"
+        root,
+        artifact_path,
+        "manifest.artifacts.field_sweep_v1_path",
+        bundle_reader,
     )
     require_equal(relative_path, "eigen/field_sweep.v1.json", "manifest.artifacts.field_sweep_v1_path")
     resources = manifest.get("resources")
@@ -6370,7 +6739,7 @@ def validate_typed_modal_field_sweep(
             "/v2/sessions/current/analysis/frequency-domain/eigen/field-sweep.v1",
             "manifest.resources.field_sweep_resource_key",
         )
-    field_sweep = load_json(path)
+    field_sweep = load_json(path, bundle_reader)
     prefix = "field_sweep"
     require_equal(field_sweep.get("schema_version"), "eigen/field_sweep.v1", f"{prefix}.schema_version")
     require_non_empty_string(field_sweep.get("artifact_id"), f"{prefix}.artifact_id")
@@ -6379,11 +6748,15 @@ def validate_typed_modal_field_sweep(
         fail(f"{prefix}.source must be an object")
     require_equal(source.get("kind"), "modal_eigensolve", f"{prefix}.source.kind")
     source_artifact, source_path = require_bundle_path(
-        root, source.get("artifact"), f"{prefix}.source.artifact"
+        root, source.get("artifact"), f"{prefix}.source.artifact", bundle_reader
     )
     require_equal(source_artifact, "eigen/spectrum.v2.json", f"{prefix}.source.artifact")
     source_revision = require_sha256_token(source.get("revision"), f"{prefix}.source.revision")
-    require_equal(source_revision, sha256_file_token(source_path), f"{prefix}.source.revision")
+    require_equal(
+        source_revision,
+        sha256_file_token(source_path, bundle_reader),
+        f"{prefix}.source.revision",
+    )
     require_equal(field_sweep.get("source_revision"), source_revision, f"{prefix}.source_revision")
     for name in ["run_id", "stage_id", "scope_id", "runtime_id"]:
         require_non_empty_string(field_sweep.get(name), f"{prefix}.{name}")
@@ -6477,10 +6850,19 @@ def validate_typed_modal_field_sweep(
         expected_path = required_refs.get(relation)
         if expected_path is None:
             fail(f"{ref_prefix}.relation is not a supported modal source relation")
-        artifact, ref_path = require_bundle_path(root, reference.get("artifact"), f"{ref_prefix}.artifact")
+        artifact, ref_path = require_bundle_path(
+            root,
+            reference.get("artifact"),
+            f"{ref_prefix}.artifact",
+            bundle_reader,
+        )
         require_equal(artifact, expected_path, f"{ref_prefix}.artifact")
         revision = require_sha256_token(reference.get("revision"), f"{ref_prefix}.revision")
-        require_equal(revision, sha256_file_token(ref_path), f"{ref_prefix}.revision")
+        require_equal(
+            revision,
+            sha256_file_token(ref_path, bundle_reader),
+            f"{ref_prefix}.revision",
+        )
     if seen_ref_relations != set(required_refs):
         fail(f"{prefix}.cross_artifact_refs must contain spectrum and branches source refs")
 
@@ -6592,9 +6974,14 @@ def validate_typed_modal_field_sweep(
             require_non_empty_string(mode.get("mode_field_id"), f"{mode_prefix}.mode_field_id")
             require_non_empty_string(known_mode_summaries[mode_key].get("mode_field_id"), f"{mode_prefix}.source_mode_field_id")
             covered_field_modes.add(mode_key)
-            metadata_rel, metadata_path = require_bundle_path(root, mode.get("mode_artifact_path"), f"{mode_prefix}.mode_artifact_path")
+            metadata_rel, metadata_path = require_bundle_path(
+                root,
+                mode.get("mode_artifact_path"),
+                f"{mode_prefix}.mode_artifact_path",
+                bundle_reader,
+            )
             require_equal(metadata_rel, nested_mode_path(sample_index, raw_mode_index), f"{mode_prefix}.mode_artifact_path")
-            metadata = load_json(metadata_path)
+            metadata = load_json(metadata_path, bundle_reader)
             expected_summary = known_mode_summaries[mode_key]
             require_equal(mode.get("mode_field_id"), expected_summary.get("mode_field_id"), f"{mode_prefix}.mode_field_id")
             # Field-sweep omits HTTP transport while mode/spectrum bundles may still use it.
@@ -6778,7 +7165,11 @@ def main(argv: list[str] | None = None) -> int:
             "--require-production-modal-k-path and "
             "--require-production-gamma-k-path are mutually exclusive"
         )
-    root = Path(args.root)
+    try:
+        bundle_reader = ArtifactBundleReader(Path(args.root))
+    except (OSError, ValueError) as error:
+        fail(f"cannot capture frequency-domain artifact generation: {error}")
+    root = bundle_reader.root
     for relative_path in [
         "eigen/spectrum.v2.json",
         "eigen/branches.v2.json",
@@ -6786,16 +7177,18 @@ def main(argv: list[str] | None = None) -> int:
         "eigen/metadata/eigen_summary.json",
         "frequency_domain/manifest.v1.json",
     ]:
-        require_file(root / relative_path)
+        require_file(root / relative_path, bundle_reader)
 
-    spectrum = load_json(root / "eigen/spectrum.v2.json")
-    branches = load_json(root / "eigen/branches.v2.json")
+    spectrum = load_json(root / "eigen/spectrum.v2.json", bundle_reader)
+    branches = load_json(root / "eigen/branches.v2.json", bundle_reader)
     legacy_branches_path = root / "eigen/branches.json"
-    if legacy_branches_path.exists():
-        validate_tracking_alias(branches, load_json(legacy_branches_path))
-    summary = load_json(root / "eigen/metadata/eigen_summary.json")
-    manifest = load_json(root / "frequency_domain/manifest.v1.json")
-    solver_diagnostics = load_json(root / "eigen/diagnostics/solver.v1.json")
+    if bundle_reader.has_member("eigen/branches.json"):
+        validate_tracking_alias(branches, load_json(legacy_branches_path, bundle_reader))
+    summary = load_json(root / "eigen/metadata/eigen_summary.json", bundle_reader)
+    manifest = load_json(root / "frequency_domain/manifest.v1.json", bundle_reader)
+    solver_diagnostics = load_json(
+        root / "eigen/diagnostics/solver.v1.json", bundle_reader
+    )
 
     require_equal(spectrum.get("schema_version"), "eigen_spectrum.v2", "spectrum.schema_version")
     require_equal(branches.get("schema_version"), "eigen_branches.v2", "branches.schema_version")
@@ -6818,6 +7211,7 @@ def main(argv: list[str] | None = None) -> int:
         manifest,
         solver_diagnostics,
         computed_sample_indices=computed_sample_indices,
+        bundle_reader=bundle_reader,
     )
     report_r4_discovery(r4_discovery)
     if args.require_r4_replay:
@@ -6835,7 +7229,7 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(manifest_diagnostics, dict):
         fail("manifest.diagnostics must be an object")
     require_tracking_summary(manifest_diagnostics, "manifest.diagnostics")
-    require_file(root / "eigen/diagnostics/solver.v1.json")
+    require_file(root / "eigen/diagnostics/solver.v1.json", bundle_reader)
     require_equal(
         solver_diagnostics.get("schema_version"),
         "frequency_domain_modal_solver_diagnostics.v1",
@@ -6900,7 +7294,7 @@ def main(argv: list[str] | None = None) -> int:
             mode_zarr_store_path(),
             "manifest.artifacts.mode_field_zarr_store_path",
         )
-        require_mode_zarr_store(root)
+        require_mode_zarr_store(root, bundle_reader)
         require_zarr_mode_fields = True
     elif (
         mode_field_storage_format == "binary_compatibility_exports"
@@ -7000,6 +7394,7 @@ def main(argv: list[str] | None = None) -> int:
                 manifest_mode_resources,
                 requested_window_hz,
                 require_zarr_mode_fields,
+                bundle_reader,
             )
             known_modes[(known_sample_index, known_raw_mode_index)] = (
                 known_frequency_hz,
@@ -7041,7 +7436,9 @@ def main(argv: list[str] | None = None) -> int:
         "solver_diagnostics.mode_count",
     )
     if args.require_reference_full_2x2_floquet:
-        validate_reference_full_2x2_floquet_mode_metadata(root, manifest_mode_paths)
+        validate_reference_full_2x2_floquet_mode_metadata(
+            root, manifest_mode_paths, bundle_reader
+        )
     validate_dispersion_k_sampling_path(
         root,
         known_samples,
@@ -7049,6 +7446,7 @@ def main(argv: list[str] | None = None) -> int:
             args.require_reference_full_2x2_floquet
             or args.require_production_modal_k_path
         ),
+        bundle_reader=bundle_reader,
     )
     validate_production_k_path_samples(
         known_samples,
@@ -7212,6 +7610,7 @@ def main(argv: list[str] | None = None) -> int:
             args.require_production_modal_k_path
             or args.require_production_gamma_k_path
         ),
+        bundle_reader=bundle_reader,
     )
     validate_typed_modal_field_sweep(
         root,
@@ -7220,6 +7619,7 @@ def main(argv: list[str] | None = None) -> int:
         known_modes,
         known_mode_summaries,
         branch_ids_by_mode,
+        bundle_reader,
     )
 
     if args.require_reference_full_2x2_floquet:
@@ -7234,6 +7634,7 @@ def main(argv: list[str] | None = None) -> int:
             known_modes,
             known_samples,
             branch_ids_by_mode,
+            bundle_reader,
         )
     if args.require_exchange_only_reciprocal_dispersion:
         validate_exchange_only_reciprocal_dispersion(
@@ -7249,13 +7650,14 @@ def main(argv: list[str] | None = None) -> int:
             branch_ids_by_mode,
             require_demag=args.require_k0_kittel_demag,
             require_periodic_airbox_demag=args.require_k0_kittel_periodic_airbox_demag,
+            bundle_reader=bundle_reader,
         )
     if args.require_gpu_modal_k0_kittel_provenance:
-        validate_gpu_modal_k0_kittel_provenance(root)
+        validate_gpu_modal_k0_kittel_provenance(root, bundle_reader)
     if args.require_gpu_modal_k0_periodic_airbox_provenance:
-        validate_gpu_modal_k0_periodic_airbox_provenance(root)
+        validate_gpu_modal_k0_periodic_airbox_provenance(root, bundle_reader)
     if args.require_k0_periodic_airbox_production:
-        validate_k0_periodic_airbox_production_provenance(root)
+        validate_k0_periodic_airbox_production_provenance(root, bundle_reader)
         if args.require_gpu_modal_k0_periodic_airbox_production:
             requested_execution = manifest.get("requested_execution")
             if not isinstance(requested_execution, dict):
@@ -7272,6 +7674,7 @@ def main(argv: list[str] | None = None) -> int:
             known_samples,
             branch_ids_by_mode,
             dispersion_rows_by_mode,
+            bundle_reader,
         )
 
     validate_eigen_summary(
@@ -7279,6 +7682,15 @@ def main(argv: list[str] | None = None) -> int:
         known_modes,
         known_mode_summaries,
         requested_window_hz,
+    )
+    try:
+        bundle_reader.ensure_current()
+    except (OSError, ValueError) as error:
+        fail(f"artifact generation changed or became unreadable during verification: {error}")
+    print(
+        "artifact_generation: "
+        + json.dumps(bundle_reader.generation_descriptor(), sort_keys=True),
+        file=sys.stderr,
     )
     return 0
 

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import csv
+from contextlib import redirect_stderr
 import hashlib
 import io
 import json
@@ -14,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -673,6 +675,59 @@ def run_validator(root: Path, *args: str) -> subprocess.CompletedProcess[str]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+
+
+def install_artifact_generation(
+    root: Path,
+    *,
+    schema: str,
+    omit_members: set[str] | None = None,
+) -> tuple[str, dict[str, bytes]]:
+    omitted = omit_members or set()
+    payloads = {
+        path.relative_to(root).as_posix(): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+    payloads = {name: raw for name, raw in payloads.items() if name not in omitted}
+    members = {
+        name: {
+            "byte_length": len(raw),
+            "sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
+        }
+        for name, raw in sorted(payloads.items())
+    }
+    body = {
+        "schema_version": schema,
+        "producer": {
+            "run_id": "run-generation-test",
+            "stage_id": "stage-eigen",
+            "stage_kind": "eigenmodes",
+        },
+        "members": members,
+    }
+    canonical = json.dumps(
+        body, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    generation_id = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    marker = json.dumps(
+        {"generation_id": generation_id, "content": body},
+        ensure_ascii=False,
+        indent=2,
+        allow_nan=False,
+    ).encode("utf-8")
+    if schema == "frequency_domain_artifact_generation.v2":
+        member_root = root / "frequency_domain" / "generations" / generation_id[7:]
+        for relative, raw in payloads.items():
+            path = member_root.joinpath(*relative.split("/"))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(raw)
+        marker_path = root / "frequency_domain" / "generation.v2.json"
+    else:
+        marker_path = root / "frequency_domain" / "generation.v1.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_bytes(marker)
+    return generation_id, payloads
 
 
 def equilibrium_artifact_v7_digest(artifact: dict[str, object]) -> str:
@@ -2186,6 +2241,115 @@ def test_validator_accepts_eigen_artifact_bundle(tmp_path: Path) -> None:
     result = run_validator(tmp_path)
 
     assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_validator_uses_one_cached_immutable_generation_for_alias_and_csv_reads(
+    tmp_path: Path,
+) -> None:
+    write_eigen_fixture(tmp_path)
+    generation_id, payloads = install_artifact_generation(
+        tmp_path, schema="frequency_domain_artifact_generation.v2"
+    )
+    (tmp_path / "eigen" / "spectrum.v2.json").write_text("stale root alias")
+
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import verify_fem_frequency_domain_eigen_artifacts as validator
+    from comsol_modal_field_certificate import ArtifactBundleReader
+
+    original_init = ArtifactBundleReader.__init__
+    original_read_bytes = ArtifactBundleReader.read_bytes
+    reader_count = 0
+    uncached_reads: dict[str, int] = {}
+
+    def counted_init(self, *args, **kwargs):
+        nonlocal reader_count
+        reader_count += 1
+        original_init(self, *args, **kwargs)
+
+    def counted_read(self, relative: str, *, maximum_bytes: int | None = None) -> bytes:
+        if relative not in self._raw:
+            uncached_reads[relative] = uncached_reads.get(relative, 0) + 1
+        return original_read_bytes(self, relative, maximum_bytes=maximum_bytes)
+
+    stderr = io.StringIO()
+    with patch.object(ArtifactBundleReader, "__init__", counted_init), patch.object(
+        ArtifactBundleReader, "read_bytes", counted_read
+    ), redirect_stderr(stderr):
+        result = validator.main([str(tmp_path)])
+
+    assert result == 0, stderr.getvalue()
+    assert reader_count == 1
+    assert uncached_reads
+    assert all(count == 1 for count in uncached_reads.values())
+    assert uncached_reads["eigen/dispersion.csv"] == 1
+    assert "immutable_verified" in stderr.getvalue()
+    assert generation_id in stderr.getvalue()
+    assert "eigen/spectrum.v2.json" in payloads
+
+
+def test_validator_keeps_v1_capture_byte_verified_but_mutable(tmp_path: Path) -> None:
+    write_eigen_fixture(tmp_path)
+    install_artifact_generation(
+        tmp_path, schema="frequency_domain_artifact_generation.v1"
+    )
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert '"generation_binding_status": "byte_verified_mutable"' in result.stderr
+    assert '"immutable": false' in result.stderr
+
+
+def test_validator_rejects_missing_v2_member_even_when_root_alias_exists(
+    tmp_path: Path,
+) -> None:
+    write_eigen_fixture(tmp_path)
+    install_artifact_generation(
+        tmp_path,
+        schema="frequency_domain_artifact_generation.v2",
+        omit_members={"eigen/spectrum.v2.json"},
+    )
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "missing required artifact generation member" in result.stderr
+
+
+def test_corrupt_v2_marker_does_not_fall_back_to_valid_v1(tmp_path: Path) -> None:
+    write_eigen_fixture(tmp_path)
+    install_artifact_generation(
+        tmp_path, schema="frequency_domain_artifact_generation.v1"
+    )
+    marker = tmp_path / "frequency_domain" / "generation.v2.json"
+    marker.write_bytes(b"{\"generation_id\":")
+
+    result = run_validator(tmp_path)
+
+    assert result.returncode != 0
+    assert "generation" in result.stderr.lower()
+
+
+def test_validator_fails_if_final_generation_fence_errors(tmp_path: Path) -> None:
+    write_eigen_fixture(tmp_path)
+    install_artifact_generation(
+        tmp_path, schema="frequency_domain_artifact_generation.v2"
+    )
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    import verify_fem_frequency_domain_eigen_artifacts as validator
+    from comsol_modal_field_certificate import ArtifactBundleReader
+
+    stderr = io.StringIO()
+
+    def fail_fence(self) -> None:
+        raise OSError("injected final fence failure")
+
+    with patch.object(ArtifactBundleReader, "ensure_current", fail_fence), redirect_stderr(
+        stderr
+    ), unittest.TestCase().assertRaises(SystemExit) as raised:
+        validator.main([str(tmp_path)])
+    assert "during verification" in str(raised.exception)
+    assert "injected final fence failure" in str(raised.exception)
 
 
 def test_validator_accepts_closed_k_path_sampling_metadata(tmp_path: Path) -> None:
@@ -5836,6 +6000,34 @@ def test_validator_accepts_gpu_modal_k0_kittel_provenance(
     write_k0_kittel_field_sweep_metadata(tmp_path)
     write_k0_kittel_summary_and_points(tmp_path, fields, frequencies)
     mark_gpu_modal_k0_kittel_fixture(tmp_path)
+
+    result = run_validator(
+        tmp_path,
+        "--require-k0-kittel-field-sweep",
+        "--require-gpu-modal-k0-kittel-provenance",
+    )
+
+    assert result.returncode == 0, result.stderr + result.stdout
+
+
+def test_validator_accepts_gpu_kittel_v2_without_root_summary_alias(
+    tmp_path: Path,
+) -> None:
+    fields = (20e-3 / MU0, 50e-3 / MU0, 100e-3 / MU0)
+    frequencies = tuple(k0_kittel_expected_frequency_hz(field) for field in fields)
+    write_eigen_fixture(tmp_path)
+    expand_reference_floquet_fixture_to_k_path(
+        tmp_path,
+        frequencies_hz=frequencies,
+        k_vectors_rad_m=((0.0, 0.0, 0.0),) * len(fields),
+    )
+    write_k0_kittel_field_sweep_metadata(tmp_path)
+    write_k0_kittel_summary_and_points(tmp_path, fields, frequencies)
+    mark_gpu_modal_k0_kittel_fixture(tmp_path)
+    install_artifact_generation(
+        tmp_path, schema="frequency_domain_artifact_generation.v2"
+    )
+    (tmp_path / "validation/kittel_k0_pbc/summary.v1.json").unlink()
 
     result = run_validator(
         tmp_path,

@@ -19,7 +19,7 @@ from pathlib import Path
 import re
 import struct
 import sys
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -29,11 +29,10 @@ try:
     from comsol_mesh_identity import mesh_topology_fingerprint_v3
     from fem_accepted_recomputed_replay import (
         AcceptedRecomputedReplayReport,
-        ArtifactPaths,
         ReplaySourceContext,
         SCIENTIFIC_QUALIFICATION_NOT_VERIFIED,
-        load_json_artifact,
-        replay_artifact_paths,
+        certificate_preimage_from_identity,
+        replay_accepted_recomputed_payloads,
     )
     from fem_equilibrium_field_replay import ValidationError
     from fem_equilibrium_identity_replay import (
@@ -51,11 +50,10 @@ except ModuleNotFoundError:  # pragma: no cover - package import fallback
     from scripts.comsol_mesh_identity import mesh_topology_fingerprint_v3
     from scripts.fem_accepted_recomputed_replay import (
         AcceptedRecomputedReplayReport,
-        ArtifactPaths,
         ReplaySourceContext,
         SCIENTIFIC_QUALIFICATION_NOT_VERIFIED,
-        load_json_artifact,
-        replay_artifact_paths,
+        certificate_preimage_from_identity,
+        replay_accepted_recomputed_payloads,
     )
     from scripts.fem_equilibrium_field_replay import ValidationError
     from scripts.fem_equilibrium_identity_replay import (
@@ -85,6 +83,7 @@ SOURCE_REPLAY_QUALIFIED = "qualified_payload_replay"
 SOURCE_REPLAY_REJECTED = "rejected"
 
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
+_MAX_REPLAY_JSON_BYTES = 4 * 1024 * 1024
 _RAW_SOURCE_SNAPSHOT_RE = re.compile(r"[0-9a-f]{64}\Z")
 _PROVENANCE_FIELDS = frozenset(
     {
@@ -287,17 +286,39 @@ def _framed_sha256(namespace: str, raw: bytes) -> str:
     return _sha256(framed)
 
 
-def _read_bytes(path: Path, label: str) -> bytes:
+def _read_bytes(
+    path: Path,
+    label: str,
+    *,
+    read_bytes: Callable[[Path, int], bytes] | None = None,
+    maximum_bytes: int = _MAX_REPLAY_JSON_BYTES,
+) -> bytes:
     try:
-        return path.read_bytes()
-    except OSError as error:
+        if read_bytes is None:
+            with path.open("rb") as stream:
+                raw = stream.read(maximum_bytes + 1)
+        else:
+            raw = read_bytes(path, maximum_bytes)
+    except (OSError, ValueError) as error:
+        if isinstance(error, ProducerProvenanceReplayError):
+            raise
         raise ProducerProvenanceReplayError(
             f"cannot read {label} at {path}: {error}"
         ) from error
+    if type(raw) is not bytes:
+        _fail(f"{label}: reader did not return exact bytes")
+    if len(raw) > maximum_bytes:
+        _fail(f"{label}: exceeds the {maximum_bytes}-byte read budget")
+    return raw
 
 
-def _load_object(path: Path, label: str) -> tuple[Mapping[str, Any], bytes]:
-    raw = _read_bytes(path, label)
+def _load_object(
+    path: Path,
+    label: str,
+    *,
+    read_bytes: Callable[[Path, int], bytes] | None = None,
+) -> tuple[Mapping[str, Any], bytes]:
+    raw = _read_bytes(path, label, read_bytes=read_bytes)
     try:
         value = strict_json_object(raw, label)
     except IdentityReplayError as error:
@@ -802,8 +823,14 @@ def _canonical_axis(material: Mapping[str, Any]) -> list[float]:
     return [0.0 if value == 0.0 else value for value in result]
 
 
-def _load_m0(path: Path) -> tuple[list[list[float]], bytes, str | None]:
-    value, raw = _load_object(path, "equilibrium magnetization artifact")
+def _load_m0(
+    path: Path,
+    *,
+    read_bytes: Callable[[Path, int], bytes] | None = None,
+) -> tuple[list[list[float]], bytes, str | None]:
+    value, raw = _load_object(
+        path, "equilibrium magnetization artifact", read_bytes=read_bytes
+    )
     artifact_schema: str | None = None
     if "m0" in value:
         schema = value.get("schema_version")
@@ -840,6 +867,7 @@ def replay_producer_provenance(
     expected_source_stage_id: str,
     expected_source_stage_kind: str,
     expected_source_snapshot_sha256: str,
+    read_bytes: Callable[[Path, int], bytes] | None = None,
 ) -> ProducerReplayReport:
     """Replay one real FEM producer bundle and return a source-bound context.
 
@@ -866,7 +894,11 @@ def replay_producer_provenance(
         "expected_source_snapshot_sha256",
     )
 
-    provenance, provenance_raw = _load_object(paths.provenance_path, "producer provenance sidecar")
+    provenance, provenance_raw = _load_object(
+        paths.provenance_path,
+        "producer provenance sidecar",
+        read_bytes=read_bytes,
+    )
     build, plan_snapshot, payloads, _ = _validate_provenance(
         provenance,
         expected_source_run_id=expected_source_run_id,
@@ -878,7 +910,11 @@ def replay_producer_provenance(
     if paths.producer_plan_path is None:
         plan_raw = expected_plan_raw
     else:
-        plan_raw = _read_bytes(paths.producer_plan_path, "producer plan exact bytes")
+        plan_raw = _read_bytes(
+            paths.producer_plan_path,
+            "producer plan exact bytes",
+            read_bytes=read_bytes,
+        )
         if plan_raw != expected_plan_raw:
             _fail("producer plan file bytes do not match producer_plan_snapshot.preimage_json")
     try:
@@ -895,10 +931,14 @@ def replay_producer_provenance(
         _fail("producer provenance source mesh digest does not match the source plan mesh")
 
     if paths.source_mesh_path is not None:
-        external_mesh, _ = _load_object(paths.source_mesh_path, "source mesh artifact")
+        external_mesh, _ = _load_object(
+            paths.source_mesh_path, "source mesh artifact", read_bytes=read_bytes
+        )
         _same_json(external_mesh, mesh, "source mesh artifact vs producer plan mesh")
 
-    m0, m0_raw, equilibrium_artifact_schema = _load_m0(paths.equilibrium_magnetization_path)
+    m0, m0_raw, equilibrium_artifact_schema = _load_m0(
+        paths.equilibrium_magnetization_path, read_bytes=read_bytes
+    )
     node_count = len(mesh.get("nodes", []))
     if node_count <= 0 or len(m0) != node_count:
         _fail("source mesh node count and equilibrium magnetization length differ")
@@ -913,8 +953,14 @@ def replay_producer_provenance(
         mesh=fingerprint_mesh,
     )
 
-    identity_raw = _read_bytes(paths.identity_path, "linearization identity")
-    identity_preimage_raw = _read_bytes(paths.identity_preimage_path, "linearization identity preimage sidecar")
+    identity_raw = _read_bytes(
+        paths.identity_path, "linearization identity", read_bytes=read_bytes
+    )
+    identity_preimage_raw = _read_bytes(
+        paths.identity_preimage_path,
+        "linearization identity preimage sidecar",
+        read_bytes=read_bytes,
+    )
     try:
         identity_content_sha256 = replay_identity_preimage(identity_raw, identity_preimage_raw)
     except IdentityReplayError as error:
@@ -969,10 +1015,15 @@ def replay_producer_provenance(
             if not candidate.is_absolute():
                 _fail(f"payload_paths.{name} must be an absolute copied-payload path")
             resolved = candidate
-        payload_raw = _read_bytes(resolved, f"{name} payload")
+        payload_raw = _read_bytes(
+            resolved, f"{name} payload", read_bytes=read_bytes
+        )
         if _sha256(payload_raw) != raw_digest:
             _fail(f"{name} payload raw bytes do not match producer provenance")
-        payload, _ = _load_object(resolved, f"{name} payload")
+        try:
+            payload = strict_json_object(payload_raw, f"{name} payload")
+        except IdentityReplayError as error:
+            raise ProducerProvenanceReplayError(str(error)) from error
         if payload.get("content_sha256") != content_digest:
             _fail(f"{name} payload content digest does not match producer provenance")
         resolved_payloads[name] = resolved
@@ -994,14 +1045,12 @@ def replay_producer_provenance(
         payload_raw_sha256=payload_digests,
     )
 
-    replay_report = replay_artifact_paths(
-        ArtifactPaths(
-            accepted_fields=resolved_payloads["accepted_fields"],
-            certified_fields=resolved_payloads["certified_fields"],
-            recomputed_certificate=resolved_payloads["recomputed_certificate"],
-        ),
+    replay_report = replay_accepted_recomputed_payloads(
+        payload_values["accepted_fields"],
+        payload_values["certified_fields"],
+        payload_values["recomputed_certificate"],
         source=source_context_placeholder,
-        identity_path=paths.identity_path,
+        certificate_preimage=certificate_preimage_from_identity(identity),
     )
     if not replay_report.payload_replay_qualified:
         _fail("accepted/certified/recomputed payload replay did not close all exact gates")
