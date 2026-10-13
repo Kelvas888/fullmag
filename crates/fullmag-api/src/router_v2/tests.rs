@@ -11913,9 +11913,18 @@ async fn fdm_grid_refresh_command_is_queued_for_atomic_runtime_replan() {
 async fn fdm_grid_refresh_command_rejects_non_fdm_sessions_without_queueing() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.session.resolved_backend = Some("fem".into());
+        snapshot.session.requested_backend = "fdm".into();
+        snapshot.session.explicit_selection = true;
         snapshot.fem_mesh = Some(sample_fem_mesh_payload());
+        let mut scene = snapshot
+            .scene_document
+            .take()
+            .unwrap_or_else(sample_scene_document);
+        scene.study.requested_backend = "fdm".into();
+        snapshot.scene_document = Some(scene);
         snapshot.metadata = Some(serde_json::json!({
-            "execution_plan": { "backend_plan": { "kind": "fem" } }
+            "artifact_layout": { "backend": "fdm" }
         }));
     }
     let app = build_v2_router().with_state(state.clone());
@@ -11945,6 +11954,135 @@ async fn fdm_grid_refresh_command_rejects_non_fdm_sessions_without_queueing() {
         ledger.back().map(|record| record.status),
         Some(CommandLifecycleState::Rejected)
     );
+    assert!(ledger
+        .back()
+        .and_then(|record| record.command.mesh_options.as_ref())
+        .and_then(|options| options.get("scene_problem_patch"))
+        .is_some());
+}
+
+#[tokio::test]
+async fn fdm_grid_refresh_rejects_unknown_or_automatic_lane_without_artifact_fallback() {
+    let cases = [
+        (
+            "resolved unknown",
+            Some("unknown"),
+            Some("fdm"),
+            "fdm",
+        ),
+        ("resolved auto", Some("auto"), Some("fdm"), "fdm"),
+        ("plan unknown", None, Some("unknown"), "fdm"),
+        ("plan auto", None, Some("auto"), "fdm"),
+        ("requested auto", None, None, "auto"),
+    ];
+
+    for (case, resolved_backend, plan_backend_kind, requested_backend) in cases {
+        let state = test_app_state_with_live_session().await;
+        if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+            snapshot.session.resolved_backend = resolved_backend.map(str::to_string);
+            snapshot.session.requested_backend = requested_backend.into();
+            snapshot.session.explicit_selection = true;
+            let mut scene = snapshot
+                .scene_document
+                .take()
+                .unwrap_or_else(sample_scene_document);
+            scene.study.requested_backend = "fdm".into();
+            snapshot.scene_document = Some(scene);
+
+            let mut metadata = serde_json::json!({
+                "artifact_layout": { "backend": "fdm" }
+            });
+            if let Some(kind) = plan_backend_kind {
+                metadata["execution_plan"] = serde_json::json!({
+                    "backend_plan": { "kind": kind }
+                });
+            }
+            snapshot.metadata = Some(metadata);
+        }
+        let app = build_v2_router().with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/sessions/current/simulation/commands")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"kind":"fdm_grid_refresh"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "case: {case}");
+        let json = body_json(response).await;
+        assert_eq!(json["accepted"], false, "case: {case}: {json}");
+        assert!(state.current_control_queue.lock().await.is_empty(), "case: {case}");
+        assert_eq!(
+            state
+                .current_command_ledger
+                .lock()
+                .await
+                .back()
+                .map(|record| record.status),
+            Some(CommandLifecycleState::Rejected),
+            "case: {case}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn fdm_grid_refresh_uses_active_plan_or_explicit_request_without_resolved_backend() {
+    let cases = [
+        (
+            "active execution plan",
+            "auto",
+            false,
+            serde_json::json!({
+                "execution_plan": { "backend_plan": { "kind": "fdm" } },
+                "artifact_layout": { "backend": "fem" }
+            }),
+        ),
+        (
+            "explicit requested backend",
+            "fdm",
+            true,
+            serde_json::json!({ "artifact_layout": { "backend": "fem" } }),
+        ),
+    ];
+
+    for (case, requested_backend, explicit_selection, metadata) in cases {
+        let state = test_app_state_with_live_session().await;
+        if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+            snapshot.session.resolved_backend = None;
+            snapshot.session.requested_backend = requested_backend.into();
+            snapshot.session.explicit_selection = explicit_selection;
+            let mut scene = snapshot
+                .scene_document
+                .take()
+                .unwrap_or_else(sample_scene_document);
+            scene.study.requested_backend = "fdm".into();
+            snapshot.scene_document = Some(scene);
+            snapshot.metadata = Some(metadata);
+        }
+        let app = build_v2_router().with_state(state.clone());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v2/sessions/current/simulation/commands")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"kind":"fdm_grid_refresh"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK, "case: {case}");
+        let json = body_json(response).await;
+        assert_eq!(json["accepted"], true, "case: {case}: {json}");
+        assert_eq!(state.current_control_queue.lock().await.len(), 1, "case: {case}");
+    }
 }
 
 #[tokio::test]
@@ -39145,6 +39283,101 @@ async fn topological_charge_computes_uniform_fdm_grid_without_fem_mesh() {
     assert_eq!(response.status(), StatusCode::OK);
     let json = body_json(response).await;
     assert_eq!(json["status"], "ready");
+    assert_eq!(json["provenance"]["field_revision"], "9");
+    assert_eq!(json["provenance"]["source_kind"], "current_live");
+    assert_eq!(json["resolved_support"]["plane"], "xy");
+    assert_eq!(json["quality"]["total_vertex_count"], 9);
+    assert_eq!(json["quality"]["valid_vertex_count"], 9);
+    assert_eq!(json["quality"]["total_triangle_count"], 8);
+    assert_eq!(json["quality"]["valid_triangle_count"], 8);
+    assert_eq!(json["quality"]["connected_component_count"], 1);
+    assert_eq!(json["quality"]["boundary_edge_count"], 8);
+    assert_eq!(json["quality"]["boundary_loop_count"], 1);
+    assert_eq!(json["quality"]["euler_characteristic"], 1);
+    assert_eq!(json["quality"]["boundary_max_deviation_rad"], 0.0);
+    assert!(json["charge"].as_f64().unwrap().abs() < 1.0e-6);
+    assert_eq!(json["trust"], "qualified");
+    assert_eq!(json["nearest_integer"], 0);
+    assert_eq!(json["integer_error"], 0.0);
+    assert!(json["computed_at_unix_ms"]
+        .as_u64()
+        .is_some_and(|value| value > 0));
+    assert!(json["warnings"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn topological_charge_uses_fdm_field_topology_with_retained_fem_mesh() {
+    let state = test_app_state_with_live_session().await;
+    let scene = sample_scene_document();
+    let object_id = scene.objects[0].id.clone();
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.scene_document = Some(scene);
+        snapshot.fem_mesh = Some(sample_scoped_fem_mesh_payload());
+        snapshot.metadata = Some(serde_json::json!({
+            "execution_plan": { "backend_plan": { "kind": "fdm" } }
+        }));
+        snapshot.live_state = Some(LiveState {
+            status: "running".into(),
+            updated_at_unix_ms: 1_700_000_000_789,
+            latest_step: StepUpdateView {
+                step: 1,
+                time: 0.0,
+                dt: 1.0e-13,
+                pseudo_time_s: None,
+                e_ex: 0.0,
+                e_demag: 0.0,
+                e_ext: 0.0,
+                e_ani: 0.0,
+                e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
+                e_total: 0.0,
+                max_dm_dt: 0.0,
+                max_h_eff: 0.0,
+                max_h_demag: 0.0,
+                max_torque_Apm: 0.0,
+                max_torque_T: 0.0,
+                max_torque_all_Apm: 0.0,
+                frozen_reference_max_drift: 0.0,
+                active_dof_count: 0,
+                frozen_dof_count: 0,
+                free_dof_count: 0,
+                wall_time_ns: 100,
+                grid: [3, 3, 1],
+                fem_mesh_generation_id: None,
+                fem_mesh: None,
+                magnetization: Some(vec![
+                    0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0,
+                    0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0,
+                ]),
+                per_object_scalars: Default::default(),
+                field_materialization_states: Vec::new(),
+                preview_field: None,
+                finished: false,
+            },
+        });
+        snapshot.field_quantity_revisions.insert("m".to_string(), 9);
+    }
+
+    let app = build_v2_router().with_state(state);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!(
+                    "/v2/sessions/current/analysis/extensions/objects/{object_id}/topological-charge"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["status"], "ready");
+    assert_eq!(json["provenance"]["discretization"], "fdm");
+    assert_eq!(json["provenance"]["field_storage_domain"], "fdm_cell_centered");
+    assert!(json["provenance"]["mesh_revision"].is_null());
     assert_eq!(json["provenance"]["field_revision"], "9");
     assert_eq!(json["provenance"]["source_kind"], "current_live");
     assert_eq!(json["resolved_support"]["plane"], "xy");
