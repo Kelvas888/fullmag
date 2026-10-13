@@ -160,13 +160,23 @@ def _write_batch(tmp_path: Path) -> Path:
     return batch
 
 
+def _is_generation_control_file(relative: str) -> bool:
+    return (
+        relative in {
+            "frequency_domain/generation.v1.json",
+            "frequency_domain/generation.v2.json",
+        }
+        or relative.startswith("frequency_domain/generations/")
+    )
+
+
 def _publish_v2_generation(case: Path, *, omitted=()) -> str:
     omitted = set(omitted)
     files = {
         path.relative_to(case).as_posix(): path.read_bytes()
         for path in case.rglob("*")
         if path.is_file()
-        and not path.relative_to(case).as_posix().startswith("frequency_domain/")
+        and not _is_generation_control_file(path.relative_to(case).as_posix())
         and path.relative_to(case).as_posix() not in omitted
     }
     members = {
@@ -218,7 +228,7 @@ def _publish_v1_generation(case: Path) -> str:
         path.relative_to(case).as_posix(): path.read_bytes()
         for path in case.rglob("*")
         if path.is_file()
-        and not path.relative_to(case).as_posix().startswith("frequency_domain/")
+        and not _is_generation_control_file(path.relative_to(case).as_posix())
     }
     content = {
         "schema_version": "frequency_domain_artifact_generation.v1",
