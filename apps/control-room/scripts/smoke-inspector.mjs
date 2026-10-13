@@ -2019,17 +2019,24 @@ async function expandInspectorNode(page, nodeId) {
     );
   }
   if ((await node.getAttribute("aria-expanded")) !== "false") return;
-  const branch = node.locator(".fm-explorer-tree-row__branch");
-  if (await branch.locator("svg").count()) {
-    await branch.locator("svg").click();
-  } else {
-    await node.dblclick();
+  // Expansion can change while model defaults/selection reveal settle. The
+  // keyboard contract expands a collapsed row without closing an open one.
+  await node.focus();
+  await node.press("ArrowRight");
+  try {
+    await page.waitForFunction(
+      (id) => document.querySelector(`[data-node-id="${id}"]`)?.getAttribute("aria-expanded") === "true",
+      nodeId,
+      { timeout: 60_000 },
+    );
+  } catch (error) {
+    const state = await node.evaluate((row) => ({
+      expanded: row.getAttribute("aria-expanded"),
+      focused: document.activeElement === row,
+      label: row.textContent?.trim(),
+    }));
+    throw new Error(`Explorer node ${nodeId} did not expand: ${JSON.stringify(state)}. ${error}`);
   }
-  await page.waitForFunction(
-    (id) => document.querySelector(`[data-node-id="${id}"]`)?.getAttribute("aria-expanded") === "true",
-    nodeId,
-    { timeout: 60_000 },
-  );
 }
 
 async function assertHealthyViewportCanvas(page, label) {
