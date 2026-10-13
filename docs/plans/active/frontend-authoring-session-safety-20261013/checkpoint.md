@@ -90,3 +90,35 @@ Bieżący etap nie zamyka całego R0/R1; audyt pozostaje w dokumentacji PR150.
 - Wykonanie regresji i rzeczywisty API recovery NOT VERIFIED. Usunięcie limitu
   nie dowodzi lookup poza listą serwera ani reload portability; te kontrakty
   pozostają do osobnego audytu backendu/receipts.
+
+## Otwarte review paneli — P1 metadata Create
+
+- Recovery mesh zapisane w e4dbb3b1164b7db8916699ed57914385c24bae00.
+- General/Geometry Apply używają wspólnego kontrolera i zachowują nowszą
+  geometrię/translation; po identity ACK geometry przyjmuje kanoniczną rewizję.
+  Zmiany paneli pozostają niezapisane do domknięcia review.
+- Review wykazał P1: Name/Material/Region edytowane podczas Create ACK są
+  pomijane przez geometry-only reconciler i znikają przy activate(createdDraft).
+  Wyłączenie tych pól nie jest przyjętą naprawą: D04 §4 wymaga edytowalnych
+  innych surowych formularzy podczas commit, bez target-wide disabled.
+- Istniejący ObjectPatchRequest / patchObjectTransaction umożliwia zapis name,
+  notes, material_ref i region_name pojedynczego obiektu; geometry Apply nadal
+  musi użyć osobnego PatchObjectGeometry z geometrią i pełnym Transform3D.
+- Wymagana naprawa: zachować raw metadata w kernel-owned committed draft,
+  przenieść je do właściwego ownera/panelu, uwzględnić dirty oraz istniejące
+  operacje metadata, zachować post-submit delta przy obu ACK. Samo dodanie
+  metadata do reconcillera bez UI/persistence nie usuwa P1.
+- Browser worker rozszerza smoke-inspector.mjs o native mouse drag z projekcją
+  istniejących diagnostyk kamery i produkcyjnego gizmo. Mock API zostanie jawnie
+  oznaczone; ten dowód nie zastępuje real backend/generation qualification.
+- Brak PR dla etapu; merge niedopuszczalny przed usunięciem P1 i wymaganymi
+  dowodami. Cel pozostaje active; nie ma globalnej blokady postępu.
+
+## Checkpoint — metadata ACK i surowe wpisy (2026-10-13)
+
+- Geometry udostępnia metadata istniejącego obiektu i zapisuje je przez istniejący `patch_object`; geometria/pełny TRS nadal używa pojedynczego `patch_object_geometry` z rewizją ACK metadanych.
+- Jedna rezerwacja Apply obejmuje oba kroki. Częściowy sukces metadanych i błąd geometrii pozostawia niezapisaną geometrię z potwierdzoną rewizją do retry bez ponownego zapisu metadanych.
+- Reconciler zachowuje późniejsze raw wpisy geometrii, name/notes/material/region. Publikacja tej samej skończonej rewizji nie normalizuje nowszego semantycznie równoważnego tekstu.
+- Regresje źródłowe obejmują transfer create, geometry failure/retry, metadata-only oraz edycję podczas drugiego ACK. Review Geometry/helper: brak nowych actionable findings.
+- Architecture hygiene: PASS; API hygiene: PASS; `git diff --check`: PASS; `node --check apps/control-room/scripts/smoke-inspector.mjs`: PASS. Nie kompilowano ani nie wykonywano testów jednostkowych/DOM. Browser/WebGL, rzeczywiste API i generacja: NOT VERIFIED.
+- General i rozszerzenie browser smoke są osobnymi fragmentami, nadal wymagają końcowego review i integracji. Pełny R0/R1 nie jest zakończony.
