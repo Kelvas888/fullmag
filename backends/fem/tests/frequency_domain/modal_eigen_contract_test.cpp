@@ -5960,6 +5960,86 @@ void modal_frequency_window_production_payload_contour_accepts_multiple_modes()
           "multi-mode contour C ABI destroy releases and clears typed buffers");
 }
 
+void textured_tet4_nodal_tangent_lift_reports_interior_normal_component()
+{
+    constexpr std::uint64_t node_count = 4u;
+    const double diagonal = std::sqrt(0.5);
+    const double equilibrium_xyz[] = {
+        0.0, 0.0, 1.0,
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        diagonal, 0.0, diagonal,
+    };
+    fd::TangentFrameNode tangent_frames[node_count]{};
+    fd::TangentFrameDiagnostics frame_diagnostics{};
+    check(
+        fd::build_tangent_frame(
+            equilibrium_xyz, node_count, tangent_frames, &frame_diagnostics) ==
+            fd::FrequencyDomainStatus::ok,
+        "textured Tet4 nodal unit magnetizations produce tangent frames");
+
+    const double tangent_coordinates[] = {
+        1.0, 0.0,
+        1.0, 0.0,
+        1.0, 0.0,
+        1.0, 0.0,
+    };
+    double lifted_delta_xyz[3u * node_count]{};
+    fd::lift_tangent_to_full(
+        tangent_frames, tangent_coordinates, node_count, lifted_delta_xyz);
+
+    constexpr double nodal_roundoff_bound =
+        128.0 * std::numeric_limits<double>::epsilon();
+    double max_nodal_normal_component = 0.0;
+    for (std::uint64_t node = 0u; node < node_count; ++node) {
+        const double nodal_normal_component = fd::dot3(
+            tangent_frames[node].m, lifted_delta_xyz + 3u * node);
+        check(
+            std::isfinite(nodal_normal_component) &&
+                std::abs(nodal_normal_component) <= nodal_roundoff_bound,
+            "the lifted P1 perturbation is tangent at every node to roundoff");
+        max_nodal_normal_component = std::max(
+            max_nodal_normal_component, std::abs(nodal_normal_component));
+    }
+
+    // At the Tet4 barycenter, all four P1 shape functions are exactly 1/4.
+    constexpr double shape_value = 0.25;
+    double interpolated_m0[3]{};
+    double interpolated_delta[3]{};
+    for (std::uint64_t node = 0u; node < node_count; ++node) {
+        for (std::uint64_t axis = 0u; axis < 3u; ++axis) {
+            interpolated_m0[axis] +=
+                shape_value * equilibrium_xyz[3u * node + axis];
+            interpolated_delta[axis] +=
+                shape_value * lifted_delta_xyz[3u * node + axis];
+        }
+    }
+    const double interpolated_m0_norm =
+        std::sqrt(fd::dot3(interpolated_m0, interpolated_m0));
+    check(
+        std::isfinite(interpolated_m0_norm) && interpolated_m0_norm > 0.0,
+        "textured Tet4 interpolated m0 is finite and nonzero");
+    for (double &component : interpolated_m0) {
+        component /= interpolated_m0_norm;
+    }
+    const double interior_normal_component =
+        fd::dot3(interpolated_m0, interpolated_delta);
+    check(
+        std::isfinite(interior_normal_component) &&
+            std::abs(interior_normal_component) > nodal_roundoff_bound,
+        "the normalized interior m0 reports the expected nonzero P1 approximation component");
+
+    // Record this pointwise component as the nodal P1 interpolation approximation;
+    // it is not a solver rejection or a pointwise-tangency acceptance criterion.
+    std::fprintf(
+        stdout,
+        "MEASURE: g6_textured_tet4_nodal_tangent_lift "
+        "nodal_max_abs_normal=%.17g interior_normal_component=%.17g "
+        "classification=nodal_P1_approximation_not_solver_failure\n",
+        max_nodal_normal_component,
+        interior_normal_component);
+}
+
 void modal_gamma_cabi_route_preserves_authored_k()
 {
     namespace fd = fullmag::fem::frequency_domain;
@@ -10530,6 +10610,12 @@ int main(int argc, char **argv)
         return 3;
 #endif
     }
+    if (argc == 2 &&
+        std::strcmp(argv[1], "--textured-tet4-nodal-tangent-lift") == 0) {
+        textured_tet4_nodal_tangent_lift_reports_interior_normal_component();
+        std::printf("PASS: textured_tet4_nodal_tangent_lift\n");
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--poisson-iteration-policy") == 0) {
         modal_poisson_iteration_policy_preserves_lane_defaults();
         return 0;
@@ -10708,6 +10794,7 @@ int main(int argc, char **argv)
         return 2;
     }
     modal_poisson_iteration_policy_preserves_lane_defaults();
+    textured_tet4_nodal_tangent_lift_reports_interior_normal_component();
     modal_shared_domain_provider_terminal_status_fails_closed();
 #if FULLMAG_HAS_MFEM_STACK && FULLMAG_FEM_WITH_SLEPC
     modal_shared_domain_damping_policy_fails_before_all_aliases();

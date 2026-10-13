@@ -6028,3 +6028,51 @@ FDM CPU/GPU nie dotyczy. Publiczny Python DSL, ProblemIR i operator bez zmian.
 | `scripts/validate_comsol_dispersion_scientific_gate.py` | `_cross_run_field_match_diagnostic` | Rzeczywiste pola, inventory i descriptor-bound metadane |
 | `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_convergence_field_match_rejects_loader_metadata_hash_rebound` | Odrzucenie podmiany metadata pomiędzy loaderami |
 | `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_convergence_field_match_uses_fields_across_swapped_raw_ids_and_rejects_orthogonal_loss` | Zamienione raw IDs i utrata tożsamości pola |
+
+
+(g6-textured-nodal-p1-probe)=
+## G6 — teksturowany test nodalnej styczności P1
+
+Regresja `textured_tet4_nodal_tangent_lift_reports_interior_normal_component`
+używa produkcyjnych ram i liftu dla czterech różnych jednostkowych spinów.
+Nie zmienia discretization: perturbacja jest styczna do spinów w węzłach,
+a następnie interpolowana P1. W barycentrum mierzy składową normalną względem
+znormalizowanego interpolowanego m0:
+
+```{math}
+:label: eq-g6-textured-nodal-probe
+\delta\mathbf m_h=\sum_i N_i T_i q_i,\qquad
+\eta=\frac{\sum_iN_i\mathbf m_i}{\|\sum_iN_i\mathbf m_i\|}
+\cdot\delta\mathbf m_h.
+```
+
+| Symbol | Znaczenie | SI |
+|---|---|---|
+| $\delta\mathbf m_h$ | Interpolowana nodalnie styczna perturbacja | $1$ |
+| $N_i$ | Funkcja kształtu P1, w barycentrum Tet4 równa jednej czwartej | $1$ |
+| $T_i$ | Produkcyjna rama styczna węzła | $1$ |
+| $q_i$ | Dwie współrzędne perturbacji w ramie stycznej | $1$ |
+| $\mathbf m_i$ | Jednostkowy spin równowagi w węźle | $1$ |
+| $\eta$ | Punktowa składowa normalna interpolowanej perturbacji | $1$ |
+
+Test sprawdza nodal tangency do roundoff i niezerowe eta w tej konkretnej
+teksturze. Raport `classification=nodal_P1_approximation_not_solver_failure`
+nie jest kryterium odrzucenia modu. Niezerowa składowa w interior nie dowodzi
+błędu nodalnego manifoldu; dowodzi, że nie wolno przypisać mu automatycznie
+punktowej styczności do normalized interpolant. Próg roundoff nie jest
+residualem ani progiem częstotliwości solvera.
+
+Niezależny weak discrete LLG/Poisson directional derivative pozostaje
+NOT VERIFIED: fixture składa liniowe macierze, lecz nie udostępnia niezależnego
+nieliniowego weak RHS z tą samą projekcją i potencjałem. Porównanie masy lub
+syntetycznych prostych energii nie zastępuje takiego oracle. Zmiana na
+pochodną punktowo znormalizowanego interpolantu wymagałaby osobnej decyzji
+obejmującej wszystkie interakcje i gradienty; ten etap jej nie wprowadza.
+
+FEM CPU: source regression added, hosted runtime pending; scientific
+qualification NOT VERIFIED. FEM GPU bez dowodu; FDM CPU/GPU nie dotyczy.
+Python DSL, ProblemIR, operatory i progi solvera pozostają bez zmian.
+
+| Źródło | Symbol | Zakres |
+|---|---|---|
+| `backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp` | `void textured_tet4_nodal_tangent_lift_reports_interior_normal_component` | Nodalna styczność i jawny interior probe, bez JVP qualification |

@@ -895,6 +895,20 @@
         "source-g6-cross-run-matcher",
         "source-g6-cross-run-alternative"
       ]
+    },
+    {
+      "id": "eq-g6-textured-nodal-probe",
+      "symbols": [
+        "g6_probe_delta",
+        "g6_probe_shape",
+        "g6_probe_frame",
+        "g6_probe_coordinates",
+        "g6_probe_equilibrium",
+        "g6_probe_normal"
+      ],
+      "sources": [
+        "source-g6-textured-nodal-probe"
+      ]
     }
   ],
   "symbols": [
@@ -2102,6 +2116,42 @@
       "id": "g6_cross_floor",
       "latex": "$\\tau_o$",
       "meaning": "Jawny dodatni próg podobieństwa pola",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g6_probe_delta",
+      "latex": "\\delta\\mathbf m_h",
+      "meaning": "Interpolowana nodalnie styczna perturbacja",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g6_probe_shape",
+      "latex": "N_i",
+      "meaning": "Funkcja kształtu P1, w barycentrum Tet4 równa jednej czwartej",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g6_probe_frame",
+      "latex": "T_i",
+      "meaning": "Produkcyjna rama styczna węzła",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g6_probe_coordinates",
+      "latex": "q_i",
+      "meaning": "Dwie współrzędne perturbacji w ramie stycznej",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g6_probe_equilibrium",
+      "latex": "\\mathbf m_i",
+      "meaning": "Jednostkowy spin równowagi w węźle",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g6_probe_normal",
+      "latex": "\\eta",
+      "meaning": "Punktowa składowa normalna interpolowanej perturbacji",
       "si_unit": "$1$"
     }
   ],
@@ -4503,6 +4553,12 @@
       "path": "scripts/test_validate_comsol_dispersion_scientific_gate.py",
       "symbol": "test_convergence_field_match_uses_fields_across_swapped_raw_ids_and_rejects_orthogonal_loss",
       "responsibility": "Use actual fields across raw IDs and reject lost field inventory"
+    },
+    {
+      "id": "source-g6-textured-nodal-probe",
+      "path": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
+      "symbol": "void textured_tet4_nodal_tangent_lift_reports_interior_normal_component",
+      "responsibility": "Measure nodal tangency and interior P1 approximation without claiming weak JVP"
     }
   ],
   "public_api": {
