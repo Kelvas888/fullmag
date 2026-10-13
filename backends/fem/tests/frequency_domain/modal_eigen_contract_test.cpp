@@ -8418,6 +8418,21 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
             fixture.descriptor.linearization_state_digest;
     }
 
+    // Derive search intervals from the native FIELD descriptor, rather than
+    // the retired caller-dense 0.16 Hz carrier. Dynamic demag is nonnegative;
+    // gamma0 (H + Ms)/(2 pi) provides the same energy upper scale used by
+    // the independent contour fixture. These are search bounds, not a
+    // frequency-accuracy assertion for the damped production operator.
+    constexpr double two_pi = 2.0 * 3.14159265358979323846;
+    const double field_frequency_hz = fixture.payload.gamma0_m_per_a_s *
+        fixture.h_eff[2] / two_pi;
+    const double energy_upper_frequency_hz = fixture.payload.gamma0_m_per_a_s *
+        (fixture.h_eff[2] + fixture.payload.uniform_saturation_magnetisation_a_per_m) /
+        two_pi;
+    check(std::isfinite(field_frequency_hz) && field_frequency_hz > 0.0 &&
+              std::isfinite(energy_upper_frequency_hz) &&
+              energy_upper_frequency_hz > field_frequency_hz,
+          "native Floquet search bounds use the positive descriptor field and material scales");
     // The shared-domain production path assembles native A_qq from this
     // descriptor; it does not consume a caller CSR carrier or dense K/G.
     // Count-certificate cases instead bind the native FIELD/DEMAG terms.
@@ -8427,7 +8442,7 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
     request.target_kind = "nearest_frequency";
     request.target_frequency_hz = count_certificate_only
         ? fixture.reference_frequency_hz
-        : 0.16;
+        : field_frequency_hz;
     request.frequency_min_hz = 0.0;
     request.frequency_max_hz = 0.0;
     request.eigensolver_family = 1;
@@ -9138,8 +9153,8 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
                       upper_factor * fixture.reference_frequency_hz,
               "physical count window brackets the oracle band with its sole midpoint below it");
     } else {
-        window_request.frequency_min_hz = 0.05;
-        window_request.frequency_max_hz = 0.30;
+        window_request.frequency_min_hz = 0.90 * field_frequency_hz;
+        window_request.frequency_max_hz = 1.03 * energy_upper_frequency_hz;
     }
     window_request.requested_mode_count = 1;
     window_request.completeness_policy = 0;
@@ -9328,8 +9343,8 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
     // reaches its legal dimension limit.
     FullmagFemModalEigenRequest dimension_limited_one_request = request;
     dimension_limited_one_request.target_kind = "frequency_window";
-    dimension_limited_one_request.frequency_min_hz = 0.15;
-    dimension_limited_one_request.frequency_max_hz = 0.17;
+    dimension_limited_one_request.frequency_min_hz = window_request.frequency_min_hz;
+    dimension_limited_one_request.frequency_max_hz = window_request.frequency_max_hz;
     dimension_limited_one_request.requested_mode_count = 1;
     dimension_limited_one_request.completeness_policy = 0;
     FullmagFemFrequencyDomainResult dimension_limited_one_result =
@@ -9390,8 +9405,8 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
     // claim that the requested count exists in the band or certify coverage.
     FullmagFemModalEigenRequest underfilled_request = request;
     underfilled_request.target_kind = "frequency_window";
-    underfilled_request.frequency_min_hz = 0.15;
-    underfilled_request.frequency_max_hz = 0.17;
+    underfilled_request.frequency_min_hz = window_request.frequency_min_hz;
+    underfilled_request.frequency_max_hz = window_request.frequency_max_hz;
     underfilled_request.requested_mode_count = 100;
     underfilled_request.completeness_policy = 0;
     FullmagFemFrequencyDomainResult underfilled_result =
