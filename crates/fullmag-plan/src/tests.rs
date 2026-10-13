@@ -19641,3 +19641,141 @@ fn eigen_spectrum_same_effective_scope_remains_duplicate() {
         assert!(errors.reasons.iter().any(|error| error.contains("declared more than once")), "{errors:?}");
     }
 }
+
+#[test]
+fn fem_eigen_branch_tracking_rejects_prism_topologies_in_planner_guard() {
+    let path = fullmag_ir::KSamplingIR::Path {
+        points: vec![
+            fullmag_ir::KPointIR {
+                label: Some("Gamma".to_string()),
+                k_vector: [0.0, 0.0, 0.0],
+            },
+            fullmag_ir::KPointIR {
+                label: Some("X".to_string()),
+                k_vector: [1.0e7, 0.0, 0.0],
+            },
+        ],
+        samples_per_segment: vec![2],
+        closed: false,
+    };
+    for include_tet in [false, true] {
+        let mut mesh = valid_mixed_certificate_asset()
+            .mesh
+            .expect("existing mixed fixture has typed connectivity");
+        // Exercise the early family-admission guard, not a physical remeshing
+        // or an execution certificate for the extracted connectivity.
+        let retained = mesh
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(_, cell)| {
+                cell.cell_type == fullmag_ir::FemCellTypeIR::Prism6
+                    || (include_tet && cell.cell_type == fullmag_ir::FemCellTypeIR::Tet4)
+            })
+            .map(|(index, cell)| {
+                (
+                    cell.cell_type,
+                    cell.nodes.to_vec(),
+                    cell.global_ordinal,
+                    mesh.cells.mesh_parts[index],
+                    mesh.element_markers[index],
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut cells = fullmag_ir::FemConnectivityIR {
+            types: Vec::new(),
+            offsets: vec![0],
+            nodes: Vec::new(),
+            global_ordinals: Vec::new(),
+            mesh_parts: Vec::new(),
+        };
+        let mut markers = Vec::new();
+        for (kind, nodes, ordinal, part, marker) in retained {
+            cells.types.push(kind);
+            cells.nodes.extend(nodes);
+            cells.offsets.push(cells.nodes.len() as u32);
+            cells.global_ordinals.push(ordinal);
+            cells.mesh_parts.push(part);
+            markers.push(marker);
+        }
+        mesh.cells = cells;
+        mesh.element_markers = markers;
+        for sampling in [
+            fullmag_ir::KSamplingIR::Single {
+                k_vector: [0.0, 0.0, 0.0],
+            },
+            path.clone(),
+        ] {
+            let ir = branch_selector_fem_eigen_ir(Some(sampling));
+            let reason = crate::mesh::reject_unsupported_mixed_topology(&ir, &mesh, None)
+                .expect_err("prism6 eigen intent must fail before a tetra-only tracking consumer");
+            assert!(
+                reason.contains("fem_typed_topology_unsupported_before_backend"),
+                "{reason}"
+            );
+            assert!(reason.contains("prism6"), "{reason}");
+            let expected_families = if include_tet {
+                "actual_topology=cells=[prism6,tet4]"
+            } else {
+                "actual_topology=cells=[prism6]"
+            };
+            assert!(reason.contains(expected_families), "{reason}");
+            assert!(reason.contains("fallback=none"), "{reason}");
+        }
+    }
+}
+
+#[test]
+fn fem_eigen_branch_tracking_rejects_certified_mixed_eigen_study() {
+    let mut ir = mixed_cpu_relaxation_ir(
+        fullmag_ir::RelaxationAlgorithmIR::ProjectedGradientBb,
+        fullmag_ir::RequestedFemDemagIR::PoissonRobin,
+    );
+    let asset = ir
+        .geometry_assets
+        .as_ref()
+        .expect("mixed fixture has geometry assets")
+        .fem_domain_mesh_asset
+        .as_ref()
+        .expect("mixed fixture has a certified shared-domain asset");
+    let mesh = asset.mesh.as_ref().expect("fixture has inline mixed mesh");
+    crate::mesh::reject_unsupported_mixed_topology(&ir, mesh, asset.build_report.as_ref())
+        .expect("control: certified mixed relaxation remains admitted");
+    ir.study = branch_selector_fem_eigen_ir(Some(fullmag_ir::KSamplingIR::Single {
+        k_vector: [0.0, 0.0, 0.0],
+    }))
+    .study;
+    let reason = crate::mesh::reject_unsupported_mixed_topology(&ir, mesh, asset.build_report.as_ref())
+        .expect_err("a valid topology certificate does not admit the unsupported eigen study");
+    assert!(reason.contains("fem_mixed_p1_scope_rejected"), "{reason}");
+    assert!(reason.contains("unsupported_study"), "{reason}");
+    assert!(reason.contains("fallback=none"), "{reason}");
+}
+
+#[test]
+fn fem_eigen_branch_tracking_tetra_single_and_path_remain_plannable() {
+    let path = fullmag_ir::KSamplingIR::Path {
+        points: vec![
+            fullmag_ir::KPointIR {
+                label: Some("Gamma".to_string()),
+                k_vector: [0.0, 0.0, 0.0],
+            },
+            fullmag_ir::KPointIR {
+                label: Some("X".to_string()),
+                k_vector: [1.0e7, 0.0, 0.0],
+            },
+        ],
+        samples_per_segment: vec![2],
+        closed: false,
+    };
+    for sampling in [
+        fullmag_ir::KSamplingIR::Single {
+            k_vector: [0.0, 0.0, 0.0],
+        },
+        path,
+    ] {
+        let planned = plan(&branch_selector_fem_eigen_ir(Some(sampling)))
+            .expect("existing tetra-only Single and Path eigen lanes remain legal");
+        assert!(matches!(planned.backend_plan, BackendPlanIR::FemEigen(_)));
+    }
+}

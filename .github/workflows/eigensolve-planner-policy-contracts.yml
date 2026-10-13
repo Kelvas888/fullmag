@@ -29,3 +29,10 @@ jobs:
           grep -F "test tests::fem_eigen_floquet_bc_with_pairs_and_k_sampling_plans_successfully ... ok" "$RUNNER_TEMP/floquet-generic.log"
       - name: Validate existing public solver policy controls
         run: cargo test --locked -p fullmag-plan --lib fem_eigen_modal_solver_policy -- --nocapture
+      - name: Preserve tetra-only eigen tracking admission
+        run: |
+          set -o pipefail
+          cargo test --locked -p fullmag-plan --lib fem_eigen_branch_tracking_ -- --nocapture | tee "$RUNNER_TEMP/eigen-tracking-topology.log"
+          grep -F "test tests::fem_eigen_branch_tracking_rejects_prism_topologies_in_planner_guard ... ok" "$RUNNER_TEMP/eigen-tracking-topology.log"
+          grep -F "test tests::fem_eigen_branch_tracking_rejects_certified_mixed_eigen_study ... ok" "$RUNNER_TEMP/eigen-tracking-topology.log"
+          grep -F "test tests::fem_eigen_branch_tracking_tetra_single_and_path_remain_plannable ... ok" "$RUNNER_TEMP/eigen-tracking-topology.log"
