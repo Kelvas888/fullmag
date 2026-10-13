@@ -288,6 +288,24 @@ try {
     assert.equal(rejected.sampleCount, 0); assert.equal(rejected.surfaceTriangles, 0); assert.equal(rejected.paletteTextures, 0); assert.equal(rejected.lost, false);
   }
   checks.push("J rejects mixed archive generations and wrong SI before reads; correctly hashed but foreign trace coordinates or nonfinite J never produce a scientific surface");
+  await open("tensor-table");
+  const matrices = page.getByRole("table", { name: /Flow-major tensor sample/ });
+  await matrices.first().getByRole("cell", { name: "Q_zz", exact: true }).waitFor();
+  assert.equal(await matrices.count(), 2);
+  for (const label of ["Q_xx", "Q_xy", "Q_xz", "Q_yx", "Q_yy", "Q_yz", "Q_zx", "Q_zy", "Q_zz"]) assert.equal(await matrices.first().getByRole("cell", { name: label, exact: true }).count(), 1);
+  for (const axis of ["X", "Y", "Z"]) { assert.equal(await matrices.first().getByRole("columnheader", { name: `Spin ${axis}`, exact: true }).count(), 1); assert.equal(await matrices.first().getByRole("rowheader", { name: `Flow ${axis}`, exact: true }).count(), 1); }
+  assert.deepEqual(await matrices.nth(0).locator("tbody td").allTextContents(), ["1", "-2", "3", "-4", "5", "-6", "7", "-8", "9"]);
+  assert.deepEqual(await matrices.nth(1).locator("tbody td").allTextContents(), ["-10", "11", "-12", "13", "-14", "15", "-16", "17", "-18"]);
+  assert.equal((await matrices.nth(0).locator("tfoot td").innerText()).trim(), "16.8819 fixture-unit");
+  assert.equal((await matrices.nth(1).locator("tfoot td").innerText()).trim(), "42.7083 fixture-unit");
+  assert.ok((await matrices.nth(0).locator("caption").innerText()).includes("node 7"));
+  assert.ok((await matrices.nth(1).locator("caption").innerText()).includes("node 19"));
+  assert.deepEqual((await page.evaluate(() => window.__antennaVisualizationFixture.read())).unexpected, []);
+  const tensorRegion = page.getByRole("region", { name: "Tensor field sample matrices" });
+  await tensorRegion.scrollIntoViewIfNeeded();
+  const tensorShot = resolve(directory, "14-tensor-nine-components.png");
+  await tensorRegion.screenshot({ path: tensorShot }); screenshots.push(tensorShot);
+  checks.push("Actual debug table renders two complete3x3flow-major matrices, all nine values, Frobenius and provider unit through canonical quantity resource; synthetic UI only");
   assert.deepEqual(errors, []);
 } catch (error) { failure = error.stack ?? String(error); }
 finally { if (browser) await browser.close(); }

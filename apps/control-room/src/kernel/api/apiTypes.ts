@@ -47,8 +47,17 @@ export type FieldCatalogResource = components["schemas"]["FieldCatalog"];
 export type FieldAvailabilityResource =
   components["schemas"]["FieldAvailabilityResource"];
 export type FieldMetaResource = components["schemas"]["FieldMeta"];
-export type QuantityCatalogResource =
-  components["schemas"]["QuantityCatalogResponse"];
+/** Pending managed export: schemas/quantities.rs::QuantityTensorDescriptor/QuantityCatalogEntry. */
+export interface QuantityTensorDescriptor {
+  rank: number;
+  shape: number[];
+  layout: string;
+  axes: string[];
+  component_labels: string[];
+}
+export type QuantityCatalogResource = Omit<components["schemas"]["QuantityCatalogResponse"], "quantities"> & {
+  quantities: (components["schemas"]["QuantityCatalogEntry"] & { tensor?: QuantityTensorDescriptor | null })[];
+};
 export interface FieldAvailabilityQuery {
   target_id?: string | null;
   scope_kind?: string | null;

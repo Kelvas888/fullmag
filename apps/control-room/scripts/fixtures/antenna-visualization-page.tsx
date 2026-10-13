@@ -4,7 +4,7 @@ import { useEffect, useMemo, useSyncExternalStore } from "react";
 import { useThree } from "@react-three/fiber";
 import { BufferGeometry, ShaderMaterial, SRGBColorSpace, Vector2, Vector3, WebGLRenderTarget } from "three";
 import { ControlRoomApi } from "@/kernel/api/ControlRoomApi";
-import { DATA_ANTENNA_FIELD_SOLUTION_PATH, DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH, DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, MODEL_SCENE_PATH, SESSIONS_PATH, SESSION_STATUS_PATH, SIMULATION_STAGES_EXECUTION_PATH } from "@/kernel/api/apiPaths";
+import { DATA_ANTENNA_FIELD_SOLUTION_PATH, DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH, DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_DISPLAY_PATH, DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH, MODEL_SCENE_PATH, SESSIONS_PATH, SESSION_STATUS_PATH, SIMULATION_STAGES_EXECUTION_PATH, DATA_QUANTITIES_PATH } from "@/kernel/api/apiPaths";
 import type { AntennaFieldSolutionResource, AntennaExternalLeadInspectionResource, AntennaInspectionDisplayResource, SceneResource } from "@/kernel/api/apiTypes";
 import { RequestDiagnosticsController } from "@/kernel/api/RequestDiagnosticsController";
 import { EventBus } from "@/kernel/events/EventBus";
@@ -25,6 +25,9 @@ import { VectorGlyphDerivedBufferCacheProvider } from "@/modules/viewport-3d/lay
 import { Viewport3DResourceTracker } from "@/modules/viewport-3d/viewport3dDiagnostics";
 import { buildObjectExplorerNode } from "@/modules/explorer/builders/objectExplorerNodes";
 import { resolveInspectorRoute } from "@/modules/inspector/inspectorRouteCatalog";
+import { VisualizationDebugSampleTable } from "@/modules/inspector/panels/visualization-debug/VisualizationDebugSampleTable";
+import type { VisualizationDebugPanelModel } from "@/modules/inspector/panels/visualization-debug/VisualizationDebugPanelModel";
+import { buildFieldVectorDebugSamples } from "@/modules/viewport-3d/model/scanFieldVectorDebugStatistics";
 
 const instance = "55555555-5555-4555-8555-555555555555";
 const owner = { session_id: "antenna-viz-fixture", session_epoch: "antenna-viz-fixture@1", request_scope_epoch: `${instance}:1` };
@@ -174,6 +177,7 @@ function makeFixture() {
       const stages = isInspection ? [{ stage_id: "runtime-solve-001", antenna_solve_stage_id: "solve", index: 0, status: "completed", converged: false, kind: "study_pipeline_antenna_field_solve", label: "Fixture antenna solve", artifact_refs: [] }] : [];
       return json({ ...owner, run_id: "fixture-run", revision: 1, runtime_state: "completed", total_stages: stages.length, stages, stage_statuses: stages.map((stage) => stage.status), completed_stage_indexes: [] });
     }
+    if (url.pathname === DATA_QUANTITIES_PATH && scenario === "tensor-table") return json({ schema_version: "tensor-fixture.v1", quantities: [{ id: "spin_current_tensor", tensor: { rank: 2, shape: [3, 3], layout: "flow_major", axes: ["flow", "spin"], component_labels: ["Q_xx", "Q_xy", "Q_xz", "Q_yx", "Q_yy", "Q_yz", "Q_zx", "Q_zy", "Q_zz"] } }] });
     if (url.pathname === MODEL_SCENE_PATH) return json(scene);
     if (url.pathname === metadataPath) return isInspection ? new Response("{}", { status: 404, headers }) : json(solution);
     if (url.pathname === catalogPath) return json({ ...owner, stage_id: "solve", status: "ready", outputs: [{ output_id: "solution", solution_ref: { asset_id: solution.asset_id, content_digest: digest, stage_id: "solve" } }] });
@@ -278,13 +282,20 @@ function FieldViewport() {
   </div>;
 }
 
+function TensorSampleTableFixture() {
+  const samples = buildFieldVectorDebugSamples({ nComp: 9, pointCount: 2, nodeIndices: new Uint32Array([7, 19]), values: Float64Array.from([1, -2, 3, -4, 5, -6, 7, -8, 9, -10, 11, -12, 13, -14, 15, -16, 17, -18]) }).samples;
+  const model = { viewports: [{ carriers: [{ carrierId: "tensor-fixture", observations: [{ query: { quantityId: "spin_current_tensor", component: "full" }, backendMeta: { unit: "fixture-unit" }, carrier: { samples } }] }] }] } as unknown as VisualizationDebugPanelModel;
+  return <section aria-label="Synthetic tensor table fixture"><h2>Tensor sample table · controlled data</h2><VisualizationDebugSampleTable model={model} /></section>;
+}
+
 function MountedFixture() {
   const fixture = useMemo(() => makeFixture(), []);
   useEffect(() => { window.__antennaVisualizationFixture = fixture.control; return () => { delete window.__antennaVisualizationFixture; }; }, [fixture]);
   const legacy = new URL(window.location.href).searchParams.has("legacy");
   const kind = legacy ? "object.visualization" : "object.antenna.visualization";
   const Panel = resolveInspectorRoute(kind)!.component;
-  return <KernelContext.Provider value={fixture.kernel}><FieldViewport /><Panel selection={{ ...EMPTY_SELECTION, kind, objectId: "antenna", ref: { type: "scene-object", kind, nodeId: "model:object:antenna:visualization", objectId: "antenna", visualizationTargetId: "object:antenna" } }} /></KernelContext.Provider>;
+  const tensorTable = new URL(window.location.href).searchParams.get("scenario") === "tensor-table";
+  return <KernelContext.Provider value={fixture.kernel}><FieldViewport /><Panel selection={{ ...EMPTY_SELECTION, kind, objectId: "antenna", ref: { type: "scene-object", kind, nodeId: "model:object:antenna:visualization", objectId: "antenna", visualizationTargetId: "object:antenna" } }} />{tensorTable ? <TensorSampleTableFixture /> : null}</KernelContext.Provider>;
 }
 
 export default function AntennaVisualizationFixturePage() {
