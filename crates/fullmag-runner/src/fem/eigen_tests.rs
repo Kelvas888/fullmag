@@ -4659,11 +4659,22 @@ fn all_active_planned_entrypoints_preserve_exact_k0_dispatch_and_persisted_prove
             "{route} must not re-enter the generic FEM resolver"
         );
 
-        let metadata: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(output_dir.join("metadata.json"))
-                .expect("entrypoint must persist metadata.json"),
-        )
-        .expect("metadata.json must contain valid JSON");
+        let generation = crate::artifact_generation::capture(&output_dir)
+            .expect("entrypoint generation marker must be readable")
+            .expect("FEM eigen entrypoint must publish an artifact generation");
+        assert!(
+            generation.is_immutable(),
+            "FEM eigen metadata must be read from the immutable v2 generation"
+        );
+        assert!(
+            !output_dir.join("metadata.json").exists(),
+            "immutable FEM eigen publication must not depend on a mutable root metadata alias"
+        );
+        let metadata_bytes = generation
+            .read_member(&output_dir, "metadata.json")
+            .expect("entrypoint generation must contain captured metadata.json");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&metadata_bytes).expect("captured metadata.json must be valid JSON");
         let provenance = &metadata["execution_provenance"];
         assert_eq!(provenance["execution_engine"], "fem_eigen_cpu_baseline");
         assert_eq!(

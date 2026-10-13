@@ -48,7 +48,7 @@ jobs:
       - name: Verify immutable FEM eigen producer and legacy protection
         run: |
           set -o pipefail
-          for test_name in fem_eigen_writer_publishes_two_immutable_generations_and_preserves_legacy_root write_artifacts_refuses_eigen_auxiliary_when_immutable_generation_marker_exists; do
+          for test_name in fem_eigen_writer_publishes_two_immutable_generations_and_preserves_legacy_root write_artifacts_refuses_eigen_auxiliary_when_immutable_generation_marker_exists all_active_planned_entrypoints_preserve_exact_k0_dispatch_and_persisted_provenance; do
             cargo test --locked -p fullmag-runner --lib "$test_name" -- --nocapture | tee "$RUNNER_TEMP/$test_name.log"
             grep -F "$test_name ... ok" "$RUNNER_TEMP/$test_name.log"
           done
