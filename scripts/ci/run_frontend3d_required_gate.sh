@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+#
+# CI qualification entry point.  The managed-fem gate is deliberately bound
+# to the dedicated Linux runner label; it is not an interactive WSL step and
+# must not be satisfied by the Windows-local Docker Desktop route without a
+# separately verified storage/receipt adapter.
 set -euo pipefail
 
 gate="${1:-}"
@@ -19,8 +24,17 @@ run_gate() {
   case "$current_gate" in
     rust-quantity-api-cli-contracts)
       cargo test -p fullmag-quantities --no-fail-fast
+      cargo test -p fullmag-plan --test magnetization_textures_v2_parity --test mumax3_texture_compatibility --no-fail-fast
       cargo test -p fullmag-runner quantities --no-fail-fast
-      cargo test -p fullmag-api router_v2 --no-fail-fast
+      cargo test -p fullmag-api --bin fullmag-api quantities::tests --no-fail-fast
+      # Keep cross-layer rDMI regressions in the standard source/unit gate;
+      # these do not claim managed FEM or CUDA physics qualification.
+      cargo test -p fullmag-plan -p fullmag-engine -p fullmag-runner -p fullmag-api -p fullmag-authoring rotated --no-fail-fast
+      cargo test -p fullmag-authoring manual_universe --no-fail-fast
+      cargo test -p fullmag-runner capabilities::tests --no-fail-fast
+      # Debug-build router tests hold very large async futures on the stack;
+      # the default 2 MiB test-thread stack overflows.
+      RUST_MIN_STACK=16777216 cargo test -p fullmag-api router_v2 --no-fail-fast
       cargo test -p fullmag-cli interactive_runtime_host --no-fail-fast
       ;;
     generated-api-determinism)
@@ -28,7 +42,8 @@ run_gate() {
       git diff --exit-code -- \
         apps/control-room/src/kernel/api/generated/openapi-v2.json \
         apps/control-room/src/kernel/api/generated/openapi-v2-types.ts \
-        apps/control-room/src/kernel/api/generated/openapi-v2-client.ts
+        apps/control-room/src/kernel/api/generated/openapi-v2-client.ts \
+        apps/control-room/src/kernel/api/generated/openapi-v2-paths.ts
       ;;
     architecture-api-hygiene)
       ./scripts/ci-resource-first-gates.sh --strict
@@ -69,12 +84,15 @@ run_gate() {
     browser-fixture-proof-manifest)
       node apps/control-room/scripts/write-browser-fixture-proof-manifest.mjs
       ;;
-    browser-fixture-smoke)
+    browser-fixture-pre-proof)
       run_gate browser-fixture-proof-identity
       run_gate browser-fixture-source-snapshot
       pnpm --dir apps/control-room run audit:viewport-3d-memory-churn
       pnpm --dir apps/control-room run audit:viewport-3d-fem-topology-uploads
       run_gate browser-fixture-source-verify
+      ;;
+    browser-fixture-smoke)
+      run_gate browser-fixture-pre-proof
       run_gate browser-fixture-proof-manifest
       run_gate browser-fixture-source-verify-post-write
       ;;

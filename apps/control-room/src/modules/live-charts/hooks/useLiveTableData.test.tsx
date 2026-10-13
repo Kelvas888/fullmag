@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
+import type { ChartTableWindow } from "@/shared/domain/analysis/chartDataPlan";
 
 import {
   shouldLoadLiveTableRows,
   shouldPauseLiveTableRows,
   liveTableUnsupportedReason,
   liveTableReducer,
+  shouldReplaceLiveTableSnapshot,
 } from "./useLiveTableData";
 
 describe("useLiveTableData", () => {
@@ -31,5 +33,136 @@ describe("useLiveTableData", () => {
       queryKey: "fixed:0:3",
       table: next,
     });
+  });
+
+  it("advances the follow cursor for the empty raw [1,2] delta and retains row one", () => {
+    const columns = [{ column_id: "step", label: "Step", unit: "1" }];
+    const currentValues = new Float64Array([4]);
+    const currentTable: ChartTableWindow = {
+      columnCount: 1,
+      columns,
+      cursorEnd: 1,
+      cursorStart: 1,
+      resyncRequired: false,
+      revision: 1,
+      rowCount: 1,
+      schemaRevision: 1,
+      tableId: "default",
+      totalRows: 1,
+      values: currentValues,
+    };
+    const emptyDelta: ChartTableWindow = {
+      ...currentTable,
+      cursorEnd: 2,
+      cursorStart: 1,
+      revision: 2,
+      rowCount: 0,
+      totalRows: 2,
+      values: new Float64Array(0),
+    };
+    const initial = {
+      cursor: 1,
+      queryKey: "follow",
+      table: currentTable,
+    };
+
+    const advanced = liveTableReducer(initial, {
+      queryKey: "follow",
+      table: emptyDelta,
+    });
+
+    expect(advanced.cursor).toBe(2);
+    expect(advanced.table).toMatchObject({
+      cursorEnd: 2,
+      rowCount: 1,
+      totalRows: 2,
+    });
+    expect(advanced.table?.values).toBe(currentValues);
+
+    const resync: ChartTableWindow = {
+      ...emptyDelta,
+      cursorEnd: 1,
+      cursorStart: 1,
+      resyncRequired: true,
+      revision: 1,
+      totalRows: 1,
+    };
+    const reset = liveTableReducer(advanced, {
+      queryKey: "follow",
+      table: resync,
+    });
+
+    expect(reset.cursor).toBe(1);
+    expect(reset.table).toBe(resync);
+    expect(reset.table?.rowCount).toBe(0);
+  });
+
+  it("replaces sparse-cursor snapshot windows instead of merging their decimated rows", () => {
+    const makeSnapshot = (cursorStart: number, cursorEnd: number): ChartTableWindow => ({
+      columnCount: 1,
+      columns: [{ column_id: "step", label: "step", unit: "1" }],
+      cursorEnd,
+      cursorStart,
+      resyncRequired: false,
+      revision: cursorEnd,
+      rowCount: 800,
+      schemaRevision: 1,
+      tableId: "default",
+      totalRows: cursorEnd,
+      values: new Float64Array(800),
+    });
+    const initialTable = makeSnapshot(5_001, 10_000);
+    const nextTable = makeSnapshot(5_002, 10_001);
+    const initial = { cursor: 10_000, queryKey: "fullDecimated", table: initialTable };
+
+    expect(liveTableReducer(initial, {
+      queryKey: "fullDecimated",
+      replace: true,
+      table: nextTable,
+    })).toMatchObject({
+      cursor: 10_001,
+      queryKey: "fullDecimated",
+      table: nextTable,
+    });
+  });
+
+  it("keeps a tail-row snapshot at its requested N-row bound", () => {
+    const requestedRows = 120;
+    const makeSnapshot = (cursorStart: number, cursorEnd: number): ChartTableWindow => ({
+      columnCount: 1,
+      columns: [{ column_id: "step", label: "step", unit: "1" }],
+      cursorEnd,
+      cursorStart,
+      resyncRequired: false,
+      revision: cursorEnd,
+      rowCount: requestedRows,
+      schemaRevision: 1,
+      tableId: "default",
+      totalRows: cursorEnd,
+      values: new Float64Array(requestedRows),
+    });
+    const initialTable = makeSnapshot(8_881, 9_000);
+    const nextTable = makeSnapshot(8_882, 9_001);
+    const initial = { cursor: 9_000, queryKey: "tailRows", table: initialTable };
+
+    const result = liveTableReducer(initial, {
+      queryKey: "tailRows",
+      replace: shouldReplaceLiveTableSnapshot({ mode: "tailRows", rows: requestedRows }),
+      table: nextTable,
+    });
+
+    expect(result.table).toBe(nextTable);
+    expect(result.table?.rowCount).toBe(requestedRows);
+    expect(result.table?.rowCount).toBeLessThanOrEqual(requestedRows);
+  });
+
+  it.each([
+    [{ mode: "fullDecimated" }, true],
+    [{ mode: "fixed", fromSI: 1, toSI: 2 }, true],
+    [{ mode: "tailTime", durationS: 1 }, true],
+    [{ mode: "tailRows", rows: 100 }, true],
+    [{ mode: "follow" }, false],
+  ] as const)("classifies %o as a %s snapshot update", (range, replace) => {
+    expect(shouldReplaceLiveTableSnapshot(range)).toBe(replace);
   });
 });

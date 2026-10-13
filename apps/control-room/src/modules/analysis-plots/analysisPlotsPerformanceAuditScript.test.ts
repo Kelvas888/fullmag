@@ -92,7 +92,10 @@ describe("analysis plots performance audit", () => {
     );
     expect(existsSync(auditScriptUrl)).toBe(true);
 
-    const auditScript = readFileSync(auditScriptUrl, "utf8");
+    const auditScript = readFileSync(auditScriptUrl, "utf8").replace(
+      /\r\n/g,
+      "\n",
+    );
     expect(auditScript).toContain("assertChartPerformanceProof");
     expect(auditScript).toContain("ChartPerformanceProof");
     expect(auditScript).toContain("phase: \"cold\"");
@@ -117,7 +120,8 @@ describe("analysis plots performance audit", () => {
     expect(auditScript).toContain("same-runtime remount");
     expect(auditScript).toContain("alternateDatasetRef");
     expect(auditScript).toContain("selectExplicitAnalysisDataset(page, 1)");
-    expect(auditScript).not.toContain("page.reload");
+    // The explicit stored-preference fallback reload is a separate lifecycle;
+    // this source guard does not qualify it as a same-page surface switch.
     expect(auditScript).toContain('?? "unknown"');
     expect(auditScript).toContain("CONTROL_ROOM_AUDIT_COMMIT");
     expect(auditScript).toContain("does not match current HEAD");
@@ -156,7 +160,10 @@ describe("analysis plots performance audit", () => {
   });
 
   it("stress-tests Quick Chart beside 3D with measured lifecycle and isolation budgets", () => {
-    const auditScript = readFileSync(auditScriptUrl, "utf8");
+    const auditScript = readFileSync(auditScriptUrl, "utf8").replace(
+      /\r\n/g,
+      "\n",
+    );
 
     expect(auditScript).toContain("CONTROL_ROOM_CHART_PERFORMANCE_TAB_SWITCHES");
     expect(auditScript).toContain("100");

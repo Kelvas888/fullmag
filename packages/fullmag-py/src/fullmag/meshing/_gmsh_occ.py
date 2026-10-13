@@ -7,6 +7,7 @@ import math
 from fullmag.model.geometry import (
     ArchWaveguide,
     Box,
+    CPWAntennaLayout,
     Cylinder,
     Difference,
     Ellipse,
@@ -14,6 +15,7 @@ from fullmag.model.geometry import (
     Geometry,
     ImportedGeometry,
     Intersection,
+    MicrostripAntennaLayout,
     Translate,
     Union,
 )
@@ -114,7 +116,17 @@ def is_occ_compatible(geometries: list[Geometry]) -> bool:
             return False
         if isinstance(geometry, Cylinder):
             continue
-        if isinstance(geometry, (Box, Ellipsoid, Ellipse, ArchWaveguide)):
+        if isinstance(
+            geometry,
+            (
+                Box,
+                Ellipsoid,
+                Ellipse,
+                ArchWaveguide,
+                MicrostripAntennaLayout,
+                CPWAntennaLayout,
+            ),
+        ):
             continue
         if isinstance(geometry, Translate):
             if not is_occ_compatible([geometry.geometry]):
@@ -226,6 +238,7 @@ def _configure_axis_periodic_surfaces(
             raise ValueError(
                 f"unsupported periodic_pair_ids entry {pair_id!r}; expected x_faces, y_faces, or z_faces"
             )
+        axis_label = ("x", "y", "z")[axis]
         if span[axis] <= tol:
             raise ValueError(f"periodic pair '{pair_id}' has zero domain span")
         min_surfaces = [
@@ -306,6 +319,7 @@ def _configure_axis_periodic_surfaces(
                     "slave_tag": int(slave_tag),
                     "marker_a": int(master_tag),
                     "marker_b": int(slave_tag),
+                    "axis_hint": axis_label,
                     "translation": list(translation),
                     "tolerance_m": tol,
                 }
@@ -1005,6 +1019,9 @@ def generate_shared_domain_mesh_via_occ(
             selector_resolution=report.selector_resolution,
             boundary_layer_result=report.boundary_layer_result,
             orphan_entities=orphan_entities,
+            algorithm_3d_requested=report.algorithm_3d_requested,
+            algorithm_3d_effective=report.algorithm_3d_effective,
+            algorithm_3d_fallback_reason=report.algorithm_3d_fallback_reason,
         )
     finally:
         gmsh.finalize()

@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import importlib.util
 import math
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import ModuleType
 from uuid import uuid4
 
 from fullmag.model import Problem, Relaxation, StageAutosave, TableAutosave, TimeEvolution
+from fullmag.model.antenna_inventory import AntennaAuthoringInventory
+from fullmag.runtime.output_storage_lowering import configure_problem_ir_autosave
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +31,8 @@ class LoadedStage:
         execution_precision,
         script_source: str,
         source_root: str | Path | None = None,
+        source_stem: str | None = None,
+        until_seconds: float | None = None,
         asset_cache: dict[str, dict[str, object] | None] | None = None,
         include_geometry_assets: bool = True,
         study_pipeline: dict[str, object] | None = None,
@@ -43,10 +47,11 @@ class LoadedStage:
             script_source=script_source,
             source_root=source_root,
             entrypoint_kind=self.entrypoint_kind,
-            asset_cache=asset_cache,
-            include_geometry_assets=include_geometry_assets,
-            study_pipeline=study_pipeline,
-            _copy_cached_geometry_assets=_copy_cached_geometry_assets,
+              asset_cache=asset_cache,
+              include_geometry_assets=include_geometry_assets,
+              study_pipeline=study_pipeline,
+              runtime_device_override=runtime_device_override,
+              _copy_cached_geometry_assets=_copy_cached_geometry_assets,
         )
         study = ir.get("study")
         sampling = study.get("sampling") if isinstance(study, dict) else None
@@ -56,6 +61,25 @@ class LoadedStage:
             sampling["table_autosave"] = self.table_autosave.to_ir()
         if self.autosave is not None:
             sampling["stage_autosave"] = self.autosave.to_ir()
+        problem_meta = ir.get("problem_meta")
+        runtime_metadata = (
+            problem_meta.get("runtime_metadata") if isinstance(problem_meta, dict) else None
+        )
+        if isinstance(runtime_metadata, dict) and source_root is not None:
+            runtime_metadata["output_storage_source_dir"] = str(Path(source_root).resolve())
+            if source_stem:
+                runtime_metadata["output_storage_source_stem"] = source_stem
+        if isinstance(runtime_metadata, dict):
+            configure_problem_ir_autosave(
+                ir,
+                runtime_metadata.get("output_storage"),
+                until_seconds=(
+                    until_seconds
+                    if until_seconds is not None
+                    else self.default_until_seconds
+                ),
+                output_every_seconds=self.output_every_seconds,
+            )
         if self.stage_id is not None:
             runtime_metadata = ir.get("problem_meta", {}).get("runtime_metadata")
             if not isinstance(runtime_metadata, dict):
@@ -142,21 +166,38 @@ class LoadedProblem:
     stages: tuple[LoadedStage, ...] = ()
     workspace_problem: Problem | None = None
     auto_execute_stages: bool = False
+    antenna_inventory: AntennaAuthoringInventory = field(default_factory=AntennaAuthoringInventory)
 
     def pipeline_base_problem(self, problem: Problem | None = None) -> Problem:
         """Return persistent problem state before ordered action stages run."""
-        candidate = problem or self.problem
+        candidate = self.antenna_inventory.execution_base(problem or self.problem)
         introduced_ids: set[str] = set()
+        introduced_antenna_drive_ids: set[str] = set()
+        introduced_projection_ids: set[str] = set()
+        introduced_spectrum_ids: set[str] = set()
         for stage in self.stages:
             action = stage.action
-            if not isinstance(action, dict) or action.get("kind") != "add_field_drive":
+            if not isinstance(action, dict):
                 continue
-            drive = action.get("drive")
-            drive_id = getattr(drive, "id", None)
-            if drive_id is None and isinstance(drive, dict):
-                drive_id = drive.get("id")
-            if isinstance(drive_id, str):
-                introduced_ids.add(drive_id)
+            kind = action.get("kind")
+            if kind == "add_field_drive":
+                drive = action.get("drive")
+                drive_id = getattr(drive, "id", None)
+                if drive_id is None and isinstance(drive, dict):
+                    drive_id = drive.get("id")
+                if isinstance(drive_id, str):
+                    introduced_ids.add(drive_id)
+            elif kind == "add_solved_antenna_drive":
+                drive = action.get("drive")
+                projection = action.get("projection")
+                if isinstance(drive, dict) and isinstance(drive.get("id"), str):
+                    introduced_antenna_drive_ids.add(drive["id"])
+                if isinstance(projection, dict) and isinstance(projection.get("id"), str):
+                    introduced_projection_ids.add(projection["id"])
+            elif kind == "antenna_source_spectrum":
+                request = action.get("request")
+                if isinstance(request, dict) and isinstance(request.get("id"), str):
+                    introduced_spectrum_ids.add(request["id"])
         base_stage_problem = self.stages[0].problem if self.stages else None
         study = candidate.study
         runtime_metadata = dict(candidate.runtime_metadata)
@@ -182,6 +223,18 @@ class LoadedProblem:
             field_drives=tuple(
                 drive for drive in candidate.field_drives if drive.id not in introduced_ids
             ),
+            antenna_target_projections=tuple(
+                projection for projection in candidate.antenna_target_projections
+                if projection.id not in introduced_projection_ids
+            ),
+            solved_antenna_drives=tuple(
+                drive for drive in candidate.solved_antenna_drives
+                if drive.id not in introduced_antenna_drive_ids
+            ),
+            antenna_spectrum_requests=tuple(
+                request for request in candidate.antenna_spectrum_requests
+                if request.id not in introduced_spectrum_ids
+            ),
             runtime_metadata=runtime_metadata,
             study=study,
         )
@@ -200,22 +253,33 @@ class LoadedProblem:
         asset_cache: dict[str, dict[str, object] | None] | None = None,
         include_geometry_assets: bool = True,
         runtime_device_override: str | None = None,
+        source_root: str | Path | None = None,
         _copy_cached_geometry_assets: bool = True,
     ) -> dict[str, object]:
         study_pipeline = self.study_pipeline_document()
         base_problem = self.pipeline_base_problem()
+        effective_source_root = (
+            Path(source_root) if source_root is not None else self.source_path.parent
+        )
         ir = base_problem.to_ir(
             requested_backend=requested_backend,
             execution_mode=execution_mode,
             execution_precision=execution_precision,
             script_source=self.script_source,
-            source_root=self.source_path.parent,
+            source_root=effective_source_root,
             entrypoint_kind=self.entrypoint_kind,
-            asset_cache=asset_cache,
-            include_geometry_assets=include_geometry_assets,
-            study_pipeline=study_pipeline,
-            _copy_cached_geometry_assets=_copy_cached_geometry_assets,
+              asset_cache=asset_cache,
+              include_geometry_assets=include_geometry_assets,
+              study_pipeline=study_pipeline,
+              runtime_device_override=runtime_device_override,
+              _copy_cached_geometry_assets=_copy_cached_geometry_assets,
         )
+        runtime_metadata = ir.get("problem_meta", {}).get("runtime_metadata")
+        if isinstance(runtime_metadata, dict):
+            runtime_metadata["output_storage_source_dir"] = str(
+                self.source_path.parent.resolve()
+            )
+            runtime_metadata["output_storage_source_stem"] = self.source_path.stem
         workspace_problem = (
             self.pipeline_base_problem(self.workspace_problem)
             if self.workspace_problem is not None
@@ -231,7 +295,7 @@ class LoadedProblem:
             execution_mode=execution_mode,
             execution_precision=execution_precision,
             script_source=self.script_source,
-            source_root=self.source_path.parent,
+            source_root=effective_source_root,
             entrypoint_kind="flat_workspace",
             asset_cache=asset_cache,
             include_geometry_assets=False,
@@ -266,6 +330,15 @@ def load_problem_from_script(
         spec.loader.exec_module(module)
         script_source = source_path.read_text(encoding="utf-8")
         workspace_problem = world.capture_workspace_problem()
+        extracted_entrypoint_kind = None
+        if workspace_problem is None and not world.capture_executed_stages():
+            # build() can author declarations itself. Keep capture alive until
+            # it returns, and use its returned Problem rather than ambient world.
+            workspace_problem, extracted_entrypoint_kind = _extract_problem(module)
+        execution_problem = workspace_problem
+        antenna_inventory = world.capture_antenna_authoring_inventory()
+        if workspace_problem is not None:
+            workspace_problem = antenna_inventory.merge_into(workspace_problem)
         declared_stages = world.capture_declared_stages()
         captured_stages = world.finish_script_capture()
         if captured_stages:
@@ -292,6 +365,7 @@ def load_problem_from_script(
                 stages=loaded_stages,
                 workspace_problem=workspace_problem,
                 auto_execute_stages=True,
+                antenna_inventory=antenna_inventory,
             )
 
         if declared_stages and workspace_problem is not None:
@@ -309,36 +383,29 @@ def load_problem_from_script(
                 for stage in declared_stages
             )
             return LoadedProblem(
-                problem=workspace_problem,
+                problem=execution_problem,
                 source_path=source_path,
                 script_source=script_source,
-                entrypoint_kind="flat_workspace",
-                default_until_seconds=None,
+                entrypoint_kind=extracted_entrypoint_kind or "flat_workspace",
+                default_until_seconds=_extract_default_until(module) if extracted_entrypoint_kind else None,
                 stages=loaded_stages,
                 workspace_problem=workspace_problem,
                 auto_execute_stages=False,
+                antenna_inventory=antenna_inventory,
             )
 
         if workspace_problem is not None:
             return LoadedProblem(
-                problem=workspace_problem,
+                problem=execution_problem,
                 source_path=source_path,
                 script_source=script_source,
-                entrypoint_kind="flat_workspace",
-                default_until_seconds=None,
+                entrypoint_kind=extracted_entrypoint_kind or "flat_workspace",
+                default_until_seconds=_extract_default_until(module) if extracted_entrypoint_kind else None,
                 stages=(),
                 workspace_problem=workspace_problem,
+                antenna_inventory=antenna_inventory,
             )
 
-        problem, entrypoint_kind = _extract_problem(module)
-        return LoadedProblem(
-            problem=problem,
-            source_path=source_path,
-            script_source=script_source,
-            entrypoint_kind=entrypoint_kind,
-            default_until_seconds=_extract_default_until(module),
-            stages=(),
-        )
     finally:
         world.finish_script_capture()
 

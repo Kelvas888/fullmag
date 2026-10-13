@@ -10,8 +10,14 @@ from fullmag.model.discretization import FEM, PerObjectMeshRecipe
 from fullmag.model.geometry import ArchWaveguide, Box, Geometry
 
 from ._gmsh_fields import resolve_effective_algorithm_3d
-from ._gmsh_swept import classify_sweepability
-from ._gmsh_types import AirboxOptions, MeshOptions
+from ._gmsh_swept import (
+    _SCOPED_LAYER_PLANE_PROOF_KEY,
+    _SCOPED_LAYER_PLANE_PROOF_TOKEN,
+    _has_component_scoped_size_fields,
+    _supports_scoped_layer_partitioned_box,
+    classify_sweepability,
+)
+from ._gmsh_types import AirboxOptions, MeshOptions, resolve_mesh_size_controls
 from ._mesh_targets import (
     MeshOperationStatus,
     ResolvedSharedObjectTarget,
@@ -31,6 +37,7 @@ def _build_shared_domain_build_report(
     mesh_workflow: Mapping[str, object] | None,
     per_object_recipes: dict[str, PerObjectMeshRecipe] | None,
     size_fields: list[dict[str, object]],
+    lower_bound_fields: list[dict[str, object]] | None = None,
     region_markers: list[dict[str, object]],
     build_mode: str,
     fallbacks_triggered: list[str],
@@ -39,6 +46,9 @@ def _build_shared_domain_build_report(
     boundary_layer_result: Mapping[str, object] | None = None,
     orphan_entities: list[dict[str, object]] | None = None,
     magnetic_submesh_signatures: list[dict[str, object]] | None = None,
+    algorithm_3d_requested: int | None = None,
+    algorithm_3d_effective: int | None = None,
+    algorithm_3d_fallback_reason: str | None = None,
 ) -> SharedDomainBuildReport:
     resolved = resolve_shared_domain_targets(
         geometries, hints,
@@ -89,6 +99,30 @@ def _build_shared_domain_build_report(
         boundary_layer_result=boundary_layer_result,
         mesh_workflow=mesh_workflow,
     )
+    # Some semantic downgrades are reported by the operation planner rather
+    # than by a low-level exception/fallback marker.  In particular, an
+    # ArchWaveguide requested as swept/prism is deliberately realized through
+    # the component-aware tetrahedral route.  Promote that explicit status to
+    # the aggregate report so callers cannot treat the build as exact merely
+    # because no exception was raised.
+    degraded = degraded or any(
+        status.kind == "swept_prism" and status.status == "fallback"
+        for status in operation_statuses
+    )
+    if algorithm_3d_requested is None:
+        algorithm_3d_requested = int(mesh_options.algorithm_3d)
+    if algorithm_3d_effective is None or algorithm_3d_fallback_reason is None:
+        resolved_algorithm, resolved_reason = resolve_effective_algorithm_3d(
+            mesh_options,
+            # A shared-domain airbox normally installs at least one background
+            # field before the common option application.  Preserve that fact
+            # in reports created by fallback/frozen paths as well.
+            preexisting_field_ids=[1] if airbox is not None else None,
+        )
+        if algorithm_3d_effective is None:
+            algorithm_3d_effective = int(resolved_algorithm)
+        if algorithm_3d_fallback_reason is None:
+            algorithm_3d_fallback_reason = resolved_reason
     thin_film_diagnostics = _build_thin_film_diagnostics(
         geometries,
         mesh_options,
@@ -110,28 +144,80 @@ def _build_shared_domain_build_report(
                         if not region.get("enabled", True):
                             continue
                         mesh_policy = region.get("mesh_policy")
-                        if not mesh_policy or mesh_policy.get("maximum_element_size") is None:
+                        if not mesh_policy or not any(
+                            mesh_policy.get(key) is not None
+                            for key in (
+                                "maximum_element_size",
+                                "minimum_element_size",
+                                "hmin",
+                            )
+                        ):
                             continue
                         authored_regions_count += 1
 
-    realized_regions_count = 0
-    for field_desc in (size_fields or []):
-        if not isinstance(field_desc, dict):
-            continue
-        params = field_desc.get("params")
-        if not isinstance(params, dict):
-            continue
-        if params.get("Source") == "region_mesh_policy" and field_desc.get("_gmsh_status") == "applied":
-            realized_regions_count += 1
+    region_outcomes: dict[str, dict[str, bool]] = {}
+    for role, descriptors in (
+        ("upper_target", size_fields or []),
+        ("lower_bound", lower_bound_fields or []),
+    ):
+        for field_desc in descriptors:
+            if not isinstance(field_desc, dict):
+                continue
+            params = field_desc.get("params")
+            if not isinstance(params, dict) or params.get("Source") != "region_mesh_policy":
+                continue
+            region_id = params.get("RegionId")
+            if not isinstance(region_id, str) or not region_id:
+                continue
+            region_outcomes.setdefault(region_id, {})[role] = (
+                field_desc.get("_gmsh_status") == "applied"
+            )
 
-    size_fields_realized = _realized_size_field_report(size_fields)
+    realized_regions_count = 0
+    if isinstance(mesh_workflow, Mapping):
+        raw_mesh_opts = mesh_workflow.get("mesh_options")
+        patch = raw_mesh_opts.get("scene_problem_patch") if isinstance(raw_mesh_opts, Mapping) else None
+        object_regions = patch.get("object_regions") if isinstance(patch, Mapping) else None
+        if isinstance(object_regions, list):
+            for index, region in enumerate(object_regions):
+                if not isinstance(region, Mapping) or not region.get("enabled", True):
+                    continue
+                mesh_policy = region.get("mesh_policy")
+                if not isinstance(mesh_policy, Mapping):
+                    continue
+                has_upper = mesh_policy.get("maximum_element_size") is not None
+                has_lower = any(
+                    mesh_policy.get(key) is not None
+                    for key in ("minimum_element_size", "hmin")
+                )
+                if not (has_upper or has_lower):
+                    continue
+                owner = region.get("owner_object")
+                region_id = str(
+                    region.get("region_id")
+                    or region.get("name")
+                    or f"{owner}:{index}"
+                )
+                outcomes = region_outcomes.get(region_id, {})
+                if (
+                    (not has_upper or outcomes.get("upper_target", False))
+                    and (not has_lower or outcomes.get("lower_bound", False))
+                ):
+                    realized_regions_count += 1
+
+    size_fields_realized = _realized_size_field_report(
+        size_fields,
+        lower_bound_fields=lower_bound_fields,
+    )
     return SharedDomainBuildReport(
         build_mode=build_mode,
         fallbacks_triggered=list(fallbacks_triggered),
         effective_airbox_target=resolved.airbox,
         effective_per_object_targets=per_object_targets,
         region_markers=[dict(region) for region in region_markers],
-        used_size_field_kinds=_unique_size_field_kinds(size_fields),
+        used_size_field_kinds=_unique_size_field_kinds(
+            [*(size_fields or []), *(lower_bound_fields or [])]
+        ),
         size_fields_realized=size_fields_realized,
         operation_statuses=operation_statuses,
         thin_film_diagnostics=thin_film_diagnostics,
@@ -140,15 +226,29 @@ def _build_shared_domain_build_report(
         ],
         selector_resolution=[dict(item) for item in selector_resolution or []],
         orphan_entities=[dict(item) for item in orphan_entities or []],
+        algorithm_3d_requested=algorithm_3d_requested,
+        algorithm_3d_effective=algorithm_3d_effective,
+        algorithm_3d_fallback_reason=algorithm_3d_fallback_reason,
         degraded=degraded,
         authored_regions_count=authored_regions_count,
         realized_regions_count=realized_regions_count,
     )
 
 
-def _realized_size_field_report(size_fields: list[dict[str, object]]) -> list[dict[str, object]]:
+def _realized_size_field_report(
+    size_fields: list[dict[str, object]],
+    *,
+    lower_bound_fields: list[dict[str, object]] | None = None,
+) -> list[dict[str, object]]:
     realized: list[dict[str, object]] = []
-    for index, field_desc in enumerate(size_fields, start=1):
+    descriptors = [
+        ("upper_target", f"sf{index}", field_desc)
+        for index, field_desc in enumerate(size_fields or [], start=1)
+    ] + [
+        ("lower_bound", f"lb{index}", field_desc)
+        for index, field_desc in enumerate(lower_bound_fields or [], start=1)
+    ]
+    for role, field_id, field_desc in descriptors:
         if not isinstance(field_desc, dict):
             continue
         kind = field_desc.get("kind")
@@ -163,7 +263,8 @@ def _realized_size_field_report(size_fields: list[dict[str, object]]) -> list[di
         )
         realized.append(
             {
-                "id": f"sf{index}",
+                "id": field_id,
+                "role": role,
                 "kind": kind,
                 "target": str(target) if target is not None else None,
                 "status": str(field_desc.get("_gmsh_status", "requested")),
@@ -228,7 +329,15 @@ def _shared_domain_swept_fallback_reason(
         and isinstance(geometries[0], ArchWaveguide)
         and build_mode in {"component_aware", "concatenated_stl_fallback"}
     ):
-        return None
+        # The shared-domain STL/component routes always ask Gmsh for a
+        # tetrahedral volume mesh.  An ArchWaveguide may be sweepable as a
+        # thin ribbon, but it is not realized as a native prism6 in these
+        # routes.  Keep the downgrade explicit so a requested
+        # ``swept_prism`` cannot be mistaken for a strict prism realization.
+        return (
+            "ArchWaveguide swept request is realized by layered surface-"
+            "constrained tetrahedra; prism6 topology is not preserved"
+        )
     if (
         geometry_count == 1
         and isinstance(geometries[0], Box)
@@ -371,7 +480,14 @@ def _build_mesh_operation_statuses(
             )
         )
 
-    actual_algorithm, fallback_reason = resolve_effective_algorithm_3d(opts)
+    actual_algorithm, fallback_reason = resolve_effective_algorithm_3d(
+        opts,
+        # Shared-domain airbox construction installs its grading field before
+        # this report is assembled.  Keep the report aligned with the actual
+        # application-time decision even for frozen/fallback paths.
+        preexisting_field_ids=[1] if airbox is not None else None,
+    )
+    resolved_controls = resolve_mesh_size_controls(opts)
     statuses.append(
         MeshOperationStatus(
             kind="algorithm_3d",
@@ -381,7 +497,16 @@ def _build_mesh_operation_statuses(
             requested_method=_algorithm_3d_name(opts.algorithm_3d),
             actual_method=_algorithm_3d_name(actual_algorithm),
             reason=fallback_reason,
-            details={"size_field_count": len(opts.size_fields)},
+            details={
+                "size_field_count": len(opts.size_fields),
+                "resolved_curvature_samples": int(
+                    resolved_controls["resolved_size_from_curvature"]
+                ),
+                "resolved_narrow_region_count": int(
+                    resolved_controls["resolved_narrow_regions"]
+                ),
+                "preexisting_background_field_count": 1 if airbox is not None else 0,
+            },
         )
     )
 
@@ -496,25 +621,113 @@ def _build_mesh_operation_statuses(
 
     requested_swept = _requested_swept_method(opts)
     requested_thin_film = _requested_thin_film_method(opts)
+    requested_sweep_direction = opts.sweep_direction or "auto"
     if requested_thin_film is not None:
+        exact_box_layers = build_mode == "single_geometry_geo_layered_box"
         for geometry in geometries:
             sweepability = classify_sweepability(geometry)
             scope = getattr(geometry, "geometry_name", type(geometry).__name__)
+            exact_ring_layers = (
+                build_mode == "single_geometry_geo_ring"
+                and _supports_scoped_layer_partitioned_box(
+                    geometry,
+                    airbox=airbox,
+                )
+            )
+            scoped_layer_partitioning = (
+                (exact_box_layers or exact_ring_layers)
+                and _has_component_scoped_size_fields(opts)
+                and _supports_scoped_layer_partitioned_box(
+                    geometry,
+                    airbox=airbox,
+                )
+            )
+            expected_layer_partitions = int(opts.through_thickness_elements or 6)
+            layer_plane_proof = next(
+                (
+                    config.get(_SCOPED_LAYER_PLANE_PROOF_KEY)
+                    for config in [*opts.size_fields, *opts.lower_bound_fields]
+                    if isinstance(config, Mapping)
+                    and isinstance(config.get(_SCOPED_LAYER_PLANE_PROOF_KEY), Mapping)
+                ),
+                None,
+            )
+            layer_planes_realized = (
+                scoped_layer_partitioning
+                and isinstance(layer_plane_proof, Mapping)
+                and layer_plane_proof.get("_verification_token")
+                is _SCOPED_LAYER_PLANE_PROOF_TOKEN
+                and layer_plane_proof.get("verification") == "passed"
+                and layer_plane_proof.get("geometry_name") == str(scope)
+                and layer_plane_proof.get("requested_layer_partitions")
+                == expected_layer_partitions
+                and layer_plane_proof.get("resolved_layer_partitions")
+                == expected_layer_partitions
+                and layer_plane_proof.get("exact_plane_count")
+                == expected_layer_partitions + 1
+                and layer_plane_proof.get("all_magnetic_nodes_on_requested_planes") is True
+                and layer_plane_proof.get("no_magnetic_tetrahedra_cross_requested_planes") is True
+                and isinstance(layer_plane_proof.get("layer_planes_m"), list)
+                and len(layer_plane_proof["layer_planes_m"])
+                == expected_layer_partitions + 1
+            )
             statuses.append(
                 MeshOperationStatus(
                     kind="thin_film",
                     scope=str(scope),
                     requested=True,
-                    status="applied" if sweepability.sweepable else "skipped",
+                    status=(
+                        ("applied" if layer_planes_realized else "requested")
+                        if scoped_layer_partitioning
+                        else (
+                            "applied"
+                            if exact_box_layers
+                            or exact_ring_layers
+                            or sweepability.sweepable
+                            else "skipped"
+                        )
+                    ),
                     requested_method=requested_thin_film,
                     actual_method=(
-                        "feature_aware_tetrahedral" if sweepability.sweepable else "free_tetrahedral"
+                        "geo_layer_partitioned_tetrahedral" if scoped_layer_partitioning else
+                        ("geo_layered_tetrahedral" if exact_box_layers else
+                         ("feature_aware_tetrahedral" if sweepability.sweepable else "free_tetrahedral"))
                     ),
-                    reason=None if sweepability.sweepable else sweepability.reason,
+                    reason=(
+                        None
+                        if exact_box_layers or exact_ring_layers or sweepability.sweepable
+                        else sweepability.reason
+                    ),
                     details={
                         "build_mode": build_mode,
                         "through_thickness_elements": opts.through_thickness_elements,
+                        "requested_sweep_direction": requested_sweep_direction,
+                        "resolved_sweep_direction": (
+                            "z" if exact_box_layers or exact_ring_layers else
+                            ("xyz"[sweepability.thin_axis] if sweepability.thin_axis is not None else None)
+                        ),
                         "airbox_present": airbox is not None,
+                        **(
+                            {
+                                "resolved_layer_partitions": (
+                                    layer_plane_proof["resolved_layer_partitions"]
+                                    if layer_planes_realized
+                                    else None
+                                ),
+                                "resolved_layer_planes_m": (
+                                    list(layer_plane_proof["layer_planes_m"])
+                                    if layer_planes_realized
+                                    else None
+                                ),
+                                "layer_planes_realized": bool(layer_planes_realized),
+                                "layer_plane_verification": (
+                                    "verified" if layer_planes_realized else "pending"
+                                ),
+                                "layer_mesh_mode": "unstructured_tetrahedra_per_layer_volume",
+                            }
+                            if scoped_layer_partitioning
+                            else {}
+                        ),
                     },
                 )
             )
@@ -535,7 +748,11 @@ def _build_mesh_operation_statuses(
                         requested_method=requested_swept,
                         actual_method="free_tetrahedral",
                         reason=sweepability.reason,
-                        details={"build_mode": build_mode},
+                        details={
+                            "build_mode": build_mode,
+                            "requested_sweep_direction": requested_sweep_direction,
+                            "resolved_sweep_direction": None,
+                        },
                     )
                 )
             elif fallback_reason is not None:
@@ -552,6 +769,12 @@ def _build_mesh_operation_statuses(
                             "build_mode": build_mode,
                             "fallbacks_triggered": list(fallbacks_triggered),
                             "through_thickness_elements": opts.through_thickness_elements,
+                            "requested_sweep_direction": requested_sweep_direction,
+                            "resolved_sweep_direction": (
+                                "xyz"[sweepability.thin_axis]
+                                if sweepability.thin_axis is not None
+                                else None
+                            ),
                         },
                     )
                 )
@@ -571,6 +794,12 @@ def _build_mesh_operation_statuses(
                         details={
                             "build_mode": build_mode,
                             "through_thickness_elements": opts.through_thickness_elements,
+                            "requested_sweep_direction": requested_sweep_direction,
+                            "resolved_sweep_direction": (
+                                "xyz"[sweepability.thin_axis]
+                                if sweepability.thin_axis is not None
+                                else None
+                            ),
                         },
                     )
                 )
@@ -613,7 +842,7 @@ def _build_thin_film_diagnostics(
     swept_fallback_scopes = {
         status.scope
         for status in operation_statuses
-        if status.kind == "swept_prism" and status.status == "fallback"
+        if status.kind in {"swept_prism", "thin_film"} and status.status == "fallback"
     }
     for geometry in geometries:
         name = getattr(geometry, "geometry_name", type(geometry).__name__)
@@ -645,9 +874,13 @@ def _build_thin_film_diagnostics(
         warnings: list[str] = []
         if opts.through_thickness_elements is not None and opts.through_thickness_elements < 4:
             warnings.append("requested through-thickness layer count is below 4")
-        if estimated_layers is not None and estimated_layers < 4:
+        layer_planes_are_realized = actual_method in {
+            "geo_layered_tetrahedral",
+            "geo_layer_partitioned_tetrahedral",
+        }
+        if not layer_planes_are_realized and estimated_layers is not None and estimated_layers < 4:
             warnings.append("estimated layers from maximum element size across thickness is below 4")
-        if hmax_ratio is not None and hmax_ratio > 0.5:
+        if not layer_planes_are_realized and hmax_ratio is not None and hmax_ratio > 0.5:
             warnings.append("maximum element size is too large relative to thin-film thickness")
         if opts.smoothing_steps == 0:
             warnings.append("smoothing is disabled for a thin-film mesh")
@@ -658,7 +891,13 @@ def _build_thin_film_diagnostics(
         ):
             warnings.append("thin-film object is using free tetrahedral meshing")
         if str(name) in swept_fallback_scopes:
-            warnings.append("requested swept/prism meshing fell back to free tetrahedral")
+            if requested_thin_film is not None and actual_method == "free_tetrahedral":
+                warnings.append(
+                    "requested layered thin-film tetrahedral meshing fell back to free "
+                    "tetrahedral; requested through-thickness layer planes were not realized"
+                )
+            else:
+                warnings.append("requested swept/prism meshing fell back to free tetrahedral")
         if not warnings and not sweepability.sweepable:
             continue
         diagnostics.append(

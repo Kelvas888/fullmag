@@ -2,7 +2,10 @@ import type { resolveObjectMagneticTexturePanelModel } from "./ObjectMagneticTex
 
 interface AuthoringScriptSyncApi {
   model: {
-    syncAuthoringScript: (request: Record<string, never>) => Promise<unknown>;
+    syncAuthoringScript: (
+      request: Record<string, never>,
+      options?: { sessionScopeKey?: string },
+    ) => Promise<unknown>;
   };
 }
 
@@ -10,11 +13,21 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Best-effort script sync after an authoring change. For a session whose
+ * script is a user file the API writes only the managed canonical copy and
+ * leaves the user's source untouched, so this never rewrites user files.
+ */
 export async function syncAuthoringScriptBestEffort(
   api: AuthoringScriptSyncApi,
+  sessionScopeKey?: string | null,
 ): Promise<string | null> {
   try {
-    await api.model.syncAuthoringScript({});
+    if (sessionScopeKey) {
+      await api.model.syncAuthoringScript({}, { sessionScopeKey });
+    } else {
+      await api.model.syncAuthoringScript({});
+    }
     return null;
   } catch (error) {
     return errorMessage(error);

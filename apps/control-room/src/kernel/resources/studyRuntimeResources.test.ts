@@ -1,16 +1,20 @@
-import { readFileSync } from "node:fs";
+import { readFileSync as readSourceFileSync } from "node:fs";
 
 import { describe, expect, it } from "vitest";
 
 import {
   ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_EIGEN_FIELD_SWEEP_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_EIGEN_MODE_PATH,
   ANALYSIS_FREQUENCY_DOMAIN_EIGEN_MODE_FIELD_META_PATH,
   ANALYSIS_FREQUENCY_DOMAIN_EIGEN_SPECTRUM_V2_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_FMR_KITTEL_FIT_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_FMR_PEAKS_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_FMR_RESONANCE_FITS_PATH,
   ANALYSIS_FREQUENCY_DOMAIN_MANIFEST_V1_PATH,
   ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_MAGNETIC_SWEEP_PATH,
   ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_CANCEL_REQUESTED_V1_PATH,
   ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_PROGRESS_V1_PATH,
-  ANALYSIS_EIGEN_MODE_V2_PATH,
   ANALYSIS_FREQUENCY_RESPONSE_MAGNETIC_SWEEP_V1_PATH,
   ANALYSIS_HYSTERESIS_ADAPTIVE_REFINEMENT_PATH,
   ANALYSIS_HYSTERESIS_BOOKMARKS_PATH,
@@ -30,6 +34,7 @@ import {
   MESHING_PERIODIC_PAIRS_PATH,
   MESHING_SUMMARY_PATH,
   MODEL_SCENE_PATH,
+  MODEL_READINESS_PATH,
   PERSISTENCE_CHECKPOINTS_PATH,
   SIMULATION_RUN_CURRENT_PATH,
   SIMULATION_RUN_PATH,
@@ -37,15 +42,22 @@ import {
   DATA_TABLE_ROWS_PATH,
   DATA_TABLES_PATH,
 } from "../api/apiPaths";
-import type { LiveStatusResource } from "../api/apiTypes";
+import type {
+  LiveStatusResource,
+  StageExecutionResource,
+} from "../api/apiTypes";
+import { ControlRoomApiError } from "../api/ControlRoomApi";
 import { activeLaneCapabilityFixture } from "./activeLaneCapabilityFixture.testSupport";
 
 import {
   STUDY_RUNTIME_CONTROL_RESOURCE_KEYS,
+  readyCommandResourceData,
+  frequencyDomainJsonArtifactRevision,
   frequencyDomainManifestRevision,
   frequencyDomainSweepProgressRevision,
   frequencyDomainTextArtifactRevision,
   fieldMetaFreshnessRevision,
+  ignoreMissingResource,
   resolveHysteresisExecutionTreeResourceKey,
   resolveFieldMetaResourceKey,
   runtimeCommandControlSessionStatusEquals,
@@ -58,6 +70,9 @@ import {
   shouldLoadRuntimeMeshSummary,
   shouldLoadRuntimeScalars,
   shouldLoadRuntimeStageExecution,
+  selectStageExecutionSessionIdentity,
+  stageExecutionMatchesSessionIdentity,
+  stageExecutionSessionIdentityEquals,
   studyRuntimeCommandSessionStatusEquals,
 } from "./studyRuntimeResources";
 
@@ -156,6 +171,11 @@ const FREQUENCY_DOMAIN_MANIFEST = {
 
 const studyRuntimeResourcesUrl = new URL("./studyRuntimeResources.ts", import.meta.url);
 
+// Source-contract assertions use "\n" fragments; normalize CRLF checkouts.
+function readFileSync(url: URL, encoding: "utf8"): string {
+  return readSourceFileSync(url, encoding).replace(/\r\n/g, "\n");
+}
+
 const baseResources: LiveStatusResource["resources"] = {
   artifact_revision: 0,
   artifacts_revision: 0,
@@ -169,6 +189,7 @@ const baseResources: LiveStatusResource["resources"] = {
   fields_revision: 0,
   mesh_build_revision: 0,
   mesh_revision: 0,
+  mode_composition_revision: 0,
   region_coefficients_revision: 0,
   region_initial_state_revision: 0,
   region_membership_revision: 0,
@@ -198,13 +219,42 @@ function statusWith({
   run?: LiveStatusResource["run"];
   sessionEpoch?: string;
   sessionId?: string;
-} = {}): Pick<
-  LiveStatusResource,
-  "capabilities" | "domain" | "resources" | "run" | "session"
-> {
+} = {}): LiveStatusResource {
+  const activeLane = activeLaneCapabilityFixture();
+  activeLane.authored = { ...activeLane.authored, discretization };
+  activeLane.requested = { ...activeLane.requested, discretization };
+  activeLane.resolved = {
+    ...(activeLane.resolved ?? activeLane.requested),
+    discretization,
+  };
   return {
+    api_contract_version: "2.0.0",
+    runtime_bundle_version: "test-fixture",
+    display: {
+      active_quantity_id: "magnetization",
+      auto_contrast: true,
+      colormap: "viridis",
+      field_component: "magnitude",
+      max_points: 1000,
+      slice_layer: 0,
+      slice_mode: "xy",
+      vector_density: 1,
+      vector_glyphs: false,
+      view_mode: "2d",
+      x_chosen_size: 1,
+      y_chosen_size: 1,
+    },
+    energies: {},
+    lifecycle: {
+      commandability: "allowed",
+      connectivity: "connected",
+      session_resource: "active",
+      solver: "idle",
+    },
+    metrics: { total_steps: 0, uptime_seconds: 0 },
+    solver: { state: "idle" },
     capabilities: {
-      active_lane: activeLaneCapabilityFixture(),
+      active_lane: activeLane,
       algorithms_available: [],
       binary_fields: true,
       cell_fields: true,
@@ -229,6 +279,7 @@ function statusWith({
       name: "Test session",
       session_epoch:
         sessionEpoch ?? `${sessionId}@2026-05-29T00:00:00.000Z`,
+      request_scope_epoch: `test-api:${sessionId}`,
       session_id: sessionId,
       workspace_root: "/tmp/fullmag-test",
     },
@@ -236,6 +287,51 @@ function statusWith({
 }
 
 describe("study runtime command resource bundles", () => {
+  it("loads model readiness into both production command resource bundles", () => {
+    const source = readFileSync(studyRuntimeResourcesUrl, "utf8");
+    const fullBundle = source.slice(
+      source.indexOf("export function useStudyRuntimeCommandResourceData"),
+      source.indexOf("export function useRuntimeCommandControlResourceData"),
+    );
+    const controlBundle = source.slice(
+      source.indexOf("export function useRuntimeCommandControlResourceData"),
+      source.indexOf("export function useObjectMetricsResource"),
+    );
+
+    expect(fullBundle).toContain("useModelReadinessResource");
+    expect(fullBundle).toContain("buildRuntimeCommandControlResourceData");
+    expect(controlBundle).toContain("useModelReadinessResource");
+    expect(controlBundle).toContain("buildRuntimeCommandControlResourceData");
+    expect(STUDY_RUNTIME_CONTROL_RESOURCE_KEYS).toContain(MODEL_READINESS_PATH);
+  });
+
+  it("withholds a retained readiness snapshot while its production resource is stale", () => {
+    const retained = {
+      blockers: [],
+      checks: [],
+      ready_to_export: true,
+      ready_to_run: true,
+      scene_revision: 3,
+    };
+
+    expect(readyCommandResourceData(retained, "ready")).toBe(retained);
+    expect(readyCommandResourceData(retained, "stale")).toBeNull();
+    expect(readyCommandResourceData(retained, "loading")).toBeNull();
+    expect(readyCommandResourceData(retained, "error")).toBeNull();
+  });
+  it("treats a missing frequency-domain artifact as missing while surfacing other failures", () => {
+    expect(
+      ignoreMissingResource<unknown>(
+        new ControlRoomApiError("FMR peaks artifact is not available", 404),
+      ),
+    ).toBeNull();
+    expect(() =>
+      ignoreMissingResource<unknown>(
+        new ControlRoomApiError("frequency-domain artifact failed", 500),
+      ),
+    ).toThrow("frequency-domain artifact failed");
+  });
+
   it("measures the sampled solver trace at load and commit without polling", () => {
     const source = readFileSync(studyRuntimeResourcesUrl, "utf8");
     const profileHook = source.slice(
@@ -377,6 +473,21 @@ describe("study runtime command resource bundles", () => {
       resources: { commands_revision: 2, scene_revision: 8 },
       sessionId: "session-new",
     }) as LiveStatusResource;
+
+    expect(runtimeCommandControlSessionStatusEquals(previous, next)).toBe(false);
+  });
+
+  it("treats resolved lane changes as runtime command control changes with stale DomainMeta", () => {
+    const previous = statusWith({ discretization: "fdm" }) as LiveStatusResource;
+    const next = statusWith({ discretization: "fdm" }) as LiveStatusResource;
+    next.capabilities.active_lane = {
+      ...next.capabilities.active_lane,
+      resolved: {
+        ...next.capabilities.active_lane.requested,
+        discretization: "fem",
+      },
+    };
+    next.domain.discretization = "fdm";
 
     expect(runtimeCommandControlSessionStatusEquals(previous, next)).toBe(false);
   });
@@ -529,6 +640,82 @@ describe("study runtime command resource bundles", () => {
     expect(hookSource).toContain("resourceKey");
   });
 
+  it("scopes simulation and checkpoint resources to the active session", () => {
+    const source = readFileSync(studyRuntimeResourcesUrl, "utf8");
+    const simulationHooks = source.slice(
+      source.indexOf("export function useCommandQueueResource"),
+      source.indexOf("export function useArtifactsResource"),
+    );
+    const checkpointHooks = source.slice(
+      source.indexOf("export function useCheckpointCatalogResource"),
+      source.indexOf("export function useEngineLogResource"),
+    );
+
+    expect(source).toContain(
+      'import { useSessionScopedResourceKey } from "./useSessionScopedResourceKey"',
+    );
+    expect(simulationHooks).toContain(
+      "useSessionScopedResourceKey(\n    SIMULATION_COMMANDS_PATH",
+    );
+    expect(simulationHooks).toContain(
+      "enabled: Boolean(commandId) && sessionIdentity !== null",
+    );
+    expect(simulationHooks).toContain(
+      "enabled: enabled && Boolean(runId) && sessionIdentity !== null",
+    );
+    expect(checkpointHooks).toContain(
+      "useSessionScopedResourceKey(\n    PERSISTENCE_CHECKPOINTS_PATH",
+    );
+    expect(checkpointHooks).toContain(
+      "enabled: Boolean(checkpointId) && sessionIdentity !== null",
+    );
+  });
+
+  it("scopes field, scalar and table data resources to the active session", () => {
+    const source = readFileSync(studyRuntimeResourcesUrl, "utf8");
+    const dataHooks = source.slice(
+      source.indexOf("export function useArtifactsResource"),
+      source.indexOf("export function useCheckpointCatalogResource"),
+    );
+
+    expect(dataHooks).toContain("useSessionScopedResourceKey");
+    expect(dataHooks).toContain("unscopedResourceKey");
+    expect(dataHooks).toContain("enabled: enabled && sessionIdentity !== null");
+    expect(dataHooks).toContain("#binary");
+    expect(dataHooks).toContain("DATA_FIELDS_PATH");
+    // Row hooks derive their unscoped key through the shared helper, which
+    // is the single place that expands DATA_TABLE_ROWS_PATH.
+    expect(dataHooks).toContain("tableRowsResourceKey(");
+    expect(source).toContain(
+      "DATA_TABLE_ROWS_PATH.replace(\"{table_id}\", tableId)",
+    );
+  });
+
+  it("uses one session-scoped wrapper for analysis and diagnostics families", () => {
+    const source = readFileSync(studyRuntimeResourcesUrl, "utf8");
+    const analysisHooks = source.slice(
+      source.indexOf("export function useHysteresisPointsResource"),
+      source.indexOf("export function useFieldCatalogResource"),
+    );
+    const diagnosticsHooks = source.slice(
+      source.indexOf("export function useEngineLogResource"),
+      source.indexOf("export function useModelReadinessResource"),
+    );
+
+    expect(source).toContain("function useSessionScopedResource<TData>");
+    expect(source).toContain(
+      "enabled: enabled && sessionIdentity !== null",
+    );
+    expect(analysisHooks).toContain("useSessionScopedResource<");
+    expect(diagnosticsHooks).toContain("useSessionScopedResource<");
+    expect(diagnosticsHooks).toContain(
+      "resourceKey: DIAGNOSTICS_ENGINE_LOG_PATH",
+    );
+    expect(diagnosticsHooks).toContain(
+      "resourceKey: DIAGNOSTICS_SOLVER_PROFILE_PATH",
+    );
+  });
+
   it("exposes the magnetic response sweep artifact as an optional runtime resource", () => {
     const source = readFileSync(studyRuntimeResourcesUrl, "utf8");
     const hookSource = source.slice(
@@ -542,6 +729,23 @@ describe("study runtime command resource bundles", () => {
     expect(hookSource).toContain(
       "resourceKey: ANALYSIS_FREQUENCY_RESPONSE_MAGNETIC_SWEEP_V1_PATH",
     );
+  });
+
+  it("keeps CPU and GPU telemetry global to the host", () => {
+    const source = readFileSync(studyRuntimeResourcesUrl, "utf8");
+    const gpuHook = source.slice(
+      source.indexOf("export function useGpuTelemetryResource"),
+      source.indexOf("export function useCpuTelemetryResource"),
+    );
+    const cpuHook = source.slice(
+      source.indexOf("export function useCpuTelemetryResource"),
+      source.indexOf("export function useSolverProfileResource"),
+    );
+
+    expect(gpuHook).toContain("return useResource<GpuTelemetryResource>");
+    expect(cpuHook).toContain("return useResource<CpuTelemetryResource>");
+    expect(gpuHook).not.toContain("useSessionScopedResource");
+    expect(cpuHook).not.toContain("useSessionScopedResource");
   });
 
   it("exposes the frequency-domain family manifest as a revision-gated analysis resource", () => {
@@ -578,6 +782,85 @@ describe("study runtime command resource bundles", () => {
         statusWith({ resources: { stages_revision: 4 } }),
       ),
     ).toBe(true);
+  });
+
+  it("revises identical frequency-domain bytes when artifact ownership changes", () => {
+    const base = {
+      schema_version: "frequency_domain_text_artifact.v1", status: "ready",
+      artifact_path: "eigen/dispersion.csv", resource_key: ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
+      content_type: "text/csv; charset=utf-8", text: "sample_index,frequency_hz\n0,1e9\n",
+      missing_reason: null, session_id: "session-a", run_id: "run-a", stage_id: "stage-a",
+      mesh_generation_id: "mesh-a", artifact_set_id: "set-a", revision: "same-revision", content_digest: "same-digest",
+    };
+    const textRevision = frequencyDomainTextArtifactRevision(base);
+    const jsonRevision = frequencyDomainJsonArtifactRevision(base);
+    for (const key of ["session_id", "run_id", "stage_id", "mesh_generation_id", "artifact_set_id"] as const) {
+      expect(frequencyDomainTextArtifactRevision({ ...base, [key]: "other" })).not.toBe(textRevision);
+      expect(frequencyDomainJsonArtifactRevision({ ...base, [key]: "other" })).not.toBe(jsonRevision);
+    }
+    expect(frequencyDomainTextArtifactRevision({ ...base, revision: "new-revision" })).not.toBe(textRevision);
+    expect(frequencyDomainTextArtifactRevision({ ...base, content_digest: "new-digest" })).not.toBe(textRevision);
+    expect(frequencyDomainTextArtifactRevision({ ...base, session_id: "a|b", run_id: "c" })).not.toBe(
+      frequencyDomainTextArtifactRevision({ ...base, session_id: "a", run_id: "b|c" }),
+    );
+    expect(frequencyDomainJsonArtifactRevision({ ...base, session_id: "a:b", run_id: "c" })).not.toBe(
+      frequencyDomainJsonArtifactRevision({ ...base, session_id: "a", run_id: "b:c" }),
+    );
+  });
+
+  it("revises frequency-domain artifacts when generation membership changes and distinguishes legacy omission", () => {
+    const base = {
+      schema_version: "frequency_domain_text_artifact.v1",
+      status: "ready",
+      artifact_path: "eigen/dispersion.csv",
+      resource_key: ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
+      content_type: "text/csv; charset=utf-8",
+      text: "sample_index,frequency_hz\n0,1e9\n",
+      missing_reason: null,
+      session_id: "session-a",
+      run_id: "run-a",
+      stage_id: "stage-a",
+      mesh_generation_id: "mesh-a",
+      artifact_set_id: "same-artifact-folder",
+      revision: "same-revision",
+      content_digest: "same-payload-hash",
+    };
+    const generationA = {
+      ...base,
+      generation_id: "generation-a",
+      generation_status: "member_verified_owner_bound" as const,
+    };
+    const generationB = { ...generationA, generation_id: "generation-b" };
+
+    expect(frequencyDomainTextArtifactRevision(generationB)).not.toBe(
+      frequencyDomainTextArtifactRevision(generationA),
+    );
+    expect(frequencyDomainJsonArtifactRevision(generationB)).not.toBe(
+      frequencyDomainJsonArtifactRevision(generationA),
+    );
+    expect(
+      frequencyDomainTextArtifactRevision({
+        ...generationA,
+        generation_status: "member_verified_unbound",
+      }),
+    ).not.toBe(frequencyDomainTextArtifactRevision(generationA));
+
+    const missingGenerationStatus = {
+      ...base,
+      generation_id: undefined,
+      generation_status: undefined,
+    };
+    const explicitlyLegacy = {
+      ...base,
+      generation_id: undefined,
+      generation_status: "legacy_unverified" as const,
+    };
+    expect(frequencyDomainTextArtifactRevision(missingGenerationStatus)).not.toBe(
+      frequencyDomainTextArtifactRevision(explicitlyLegacy),
+    );
+    expect(frequencyDomainJsonArtifactRevision(missingGenerationStatus)).not.toBe(
+      frequencyDomainJsonArtifactRevision(explicitlyLegacy),
+    );
   });
 
   it("changes frequency-domain text artifact revision when dispersion CSV contents change", () => {
@@ -657,8 +940,9 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<MeshPeriodicPairsResource>",
     );
     expect(hookSource).toContain(
-      "resourceKey: MESHING_PERIODIC_PAIRS_PATH",
+      "useSessionScopedResourceKey(\n    MESHING_PERIODIC_PAIRS_PATH",
     );
+    expect(hookSource).toContain("resourceKey,");
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
     );
@@ -861,7 +1145,9 @@ describe("study runtime command resource bundles", () => {
     expect(hookSource).toContain(
       "ignoreMissingResource<HysteresisPointsResource>",
     );
-    expect(hookSource).toContain("useResource<HysteresisPointsResource | null>");
+    expect(hookSource).toContain(
+      "useSessionScopedResource<HysteresisPointsResource | null>",
+    );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
     );
@@ -879,7 +1165,9 @@ describe("study runtime command resource bundles", () => {
     expect(hookSource).toContain(
       "ignoreMissingResource<HysteresisMetricsResource>",
     );
-    expect(hookSource).toContain("useResource<HysteresisMetricsResource | null>");
+    expect(hookSource).toContain(
+      "useSessionScopedResource<HysteresisMetricsResource | null>",
+    );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
     );
@@ -898,7 +1186,7 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<HysteresisSaturationResource>",
     );
     expect(hookSource).toContain(
-      "useResource<HysteresisSaturationResource | null>",
+      "useSessionScopedResource<HysteresisSaturationResource | null>",
     );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
@@ -918,7 +1206,7 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<HysteresisAdaptiveRefinementResource>",
     );
     expect(hookSource).toContain(
-      "useResource<HysteresisAdaptiveRefinementResource | null>",
+      "useSessionScopedResource<HysteresisAdaptiveRefinementResource | null>",
     );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
@@ -938,7 +1226,7 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<HysteresisBranchesResource>",
     );
     expect(hookSource).toContain(
-      "useResource<HysteresisBranchesResource | null>",
+      "useSessionScopedResource<HysteresisBranchesResource | null>",
     );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
@@ -958,7 +1246,7 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<HysteresisMinorLoopsResource>",
     );
     expect(hookSource).toContain(
-      "useResource<HysteresisMinorLoopsResource | null>",
+      "useSessionScopedResource<HysteresisMinorLoopsResource | null>",
     );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
@@ -978,7 +1266,7 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<HysteresisReversalFieldsResource>",
     );
     expect(hookSource).toContain(
-      "useResource<HysteresisReversalFieldsResource | null>",
+      "useSessionScopedResource<HysteresisReversalFieldsResource | null>",
     );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
@@ -998,7 +1286,7 @@ describe("study runtime command resource bundles", () => {
       "ignoreMissingResource<HysteresisSettleTraceResource>",
     );
     expect(hookSource).toContain(
-      "useResource<HysteresisSettleTraceResource | null>",
+      "useSessionScopedResource<HysteresisSettleTraceResource | null>",
     );
     expect(hookSource).toContain(
       "resolveRevision: (data) => data?.revision ?? null",
@@ -1019,12 +1307,12 @@ describe("study runtime command resource bundles", () => {
     ).toBeTruthy();
     expect(ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_PROGRESS_V1_PATH).toBeTruthy();
     expect(ANALYSIS_FREQUENCY_DOMAIN_EIGEN_MODE_FIELD_META_PATH).toBeTruthy();
-    expect(ANALYSIS_EIGEN_MODE_V2_PATH).toBeTruthy();
+    expect(ANALYSIS_FREQUENCY_DOMAIN_EIGEN_MODE_PATH).toBeTruthy();
     expect(hookSource).toMatch(/frequencyDomain\.eigenSpectrumV2/);
     expect(hookSource).toMatch(/frequencyDomain\.eigenBranchesV2/);
     expect(hookSource).toMatch(/frequencyDomain\.eigenDiagnosticsV2/);
     expect(hookSource).toMatch(/frequencyDomain\.eigenDispersion/);
-    expect(hookSource).toMatch(/analysis\.eigen\s*\.modeV2/);
+    expect(hookSource).toMatch(/frequencyDomain\s*\.eigenMode/);
     expect(hookSource).toMatch(/frequencyDomain\.responseMagneticSweep/);
     expect(hookSource).toMatch(/frequencyDomain\s*\.responseCancelRequestedV1/);
     expect(hookSource).toMatch(/frequencyDomain\.responseProgressV1/);
@@ -1047,7 +1335,7 @@ describe("study runtime command resource bundles", () => {
     expect(hookSource).toContain(
       "ANALYSIS_FREQUENCY_DOMAIN_EIGEN_MODE_FIELD_META_PATH",
     );
-    expect(hookSource).toContain("ANALYSIS_EIGEN_MODE_V2_PATH");
+    expect(hookSource).toContain("ANALYSIS_FREQUENCY_DOMAIN_EIGEN_MODE_PATH");
   });
 
   it("keeps frequency-domain resource hooks free of raw v2 endpoint strings", () => {
@@ -1061,6 +1349,126 @@ describe("study runtime command resource bundles", () => {
 
     expect(hookSource).not.toContain(frequencyDomainFamilyPath);
   });
+
+  it("retains identity from stale status data and accepts an explicit no-run identity", () => {
+    const statusData = statusWith({
+      run: null,
+      sessionEpoch: "epoch-current",
+      sessionId: "session-current",
+    });
+    const identity = selectStageExecutionSessionIdentity({
+      data: statusData,
+      status: "ready",
+    });
+
+    expect(identity).toEqual({
+      runId: null,
+      sessionEpoch: "epoch-current",
+      sessionId: "session-current",
+    });
+    expect(
+      selectStageExecutionSessionIdentity({
+        data: statusData,
+        status: "stale",
+      }),
+    ).toEqual(identity);
+    expect(
+      selectStageExecutionSessionIdentity({
+        data: statusData,
+        status: "error",
+      }),
+    ).toEqual(identity);
+    expect(
+      selectStageExecutionSessionIdentity({
+        data: null,
+        status: "error",
+      }),
+    ).toBeNull();
+    expect(
+      selectStageExecutionSessionIdentity({
+        data: statusData,
+        status: "loading",
+      }),
+    ).toBeNull();
+    expect(
+      selectStageExecutionSessionIdentity({
+        data: statusWith({ sessionId: "  " }),
+        status: "ready",
+      }),
+    ).toBeNull();
+
+    const activeRun = {
+      run_id: "run-current",
+    } as NonNullable<LiveStatusResource["run"]>;
+    expect(
+      selectStageExecutionSessionIdentity({
+        data: statusWith({ run: activeRun }),
+        status: "ready",
+      })?.runId,
+    ).toBe("run-current");
+  });
+
+  it(
+    "matches stage execution only to the exact session, epoch, and run tuple",
+    () => {
+      const identity = {
+        runId: "run-current",
+        sessionEpoch: "epoch-current",
+        sessionId: "session-current",
+      };
+      const execution: StageExecutionResource = {
+        active_stage_index: null,
+        active_stage_kind: null,
+        completed_stage_indexes: [],
+        revision: 4,
+        run_id: "run-current",
+        runtime_state: "running",
+        session_epoch: "epoch-current",
+        session_id: "session-current",
+        stage_statuses: [],
+        stages: [],
+        total_stages: 0,
+      };
+
+      expect(stageExecutionMatchesSessionIdentity(execution, identity)).toBe(
+        true,
+      );
+      expect(
+        stageExecutionMatchesSessionIdentity(
+          { ...execution, session_id: "session-old" },
+          identity,
+        ),
+      ).toBe(false);
+      expect(
+        stageExecutionMatchesSessionIdentity(
+          { ...execution, session_epoch: "epoch-old" },
+          identity,
+        ),
+      ).toBe(false);
+      expect(
+        stageExecutionMatchesSessionIdentity(
+          { ...execution, run_id: "run-old" },
+          identity,
+        ),
+      ).toBe(false);
+      const noRunIdentity = { ...identity, runId: null };
+      expect(
+        stageExecutionMatchesSessionIdentity(
+          { ...execution, run_id: null },
+          noRunIdentity,
+        ),
+      ).toBe(true);
+      expect(
+        stageExecutionMatchesSessionIdentity(execution, noRunIdentity),
+      ).toBe(false);
+      expect(
+        stageExecutionSessionIdentityEquals(identity, {
+          ...identity,
+          sessionEpoch: "epoch-old",
+        }),
+      ).toBe(false);
+    },
+  );
 
   it("does not load stage execution for idle command controls", () => {
     expect(
@@ -1114,7 +1522,7 @@ describe("study runtime command resource bundles", () => {
     ).toBe(true);
   });
 
-  it("loads shared-domain manifest when FEM or explicit topology has a mesh or domain revision", () => {
+  it("loads shared-domain manifest for FEM with a mesh or domain revision", () => {
     expect(
       shouldLoadRuntimeMeshManifest(
         true,
@@ -1156,7 +1564,76 @@ describe("study runtime command resource bundles", () => {
           resources: { mesh_revision: 5 },
         }),
       ),
-    ).toBe(true);
+    ).toBe(false);
+  });
+
+  it("uses the active FEM lane when the legacy domain field still says FDM", () => {
+    const status = statusWith({ resources: { mesh_revision: 5 } });
+    status.domain.discretization = "fdm";
+    status.capabilities.active_lane = {
+      ...status.capabilities.active_lane,
+      authored: { ...status.capabilities.active_lane.authored, discretization: "fem" },
+      requested: { ...status.capabilities.active_lane.requested, discretization: "fem" },
+      resolved: {
+        ...(status.capabilities.active_lane.resolved ??
+          status.capabilities.active_lane.requested),
+        discretization: "fem",
+      },
+    };
+
+    expect(shouldLoadRuntimeMeshManifest(true, status)).toBe(true);
+  });
+
+  it("fails closed for an unresolved active lane instead of using requested FEM", () => {
+    const status = statusWith({ resources: { mesh_revision: 5 } });
+    status.domain.discretization = "fdm";
+    status.capabilities.active_lane = {
+      ...status.capabilities.active_lane,
+      requested: { ...status.capabilities.active_lane.requested, discretization: "fem" },
+      resolved: null,
+    };
+
+    expect(shouldLoadRuntimeMeshManifest(true, status)).toBe(false);
+  });
+
+  it("fails closed when the active lane field is present but null", () => {
+    const status = statusWith({ resources: { mesh_revision: 5 } });
+    status.domain.discretization = "fdm";
+    status.capabilities = {
+      ...status.capabilities,
+      active_lane: null,
+    } as unknown as typeof status.capabilities;
+
+    expect(shouldLoadRuntimeMeshManifest(true, status)).toBe(false);
+  });
+
+  it("lets a declared lane override stale explicit-topology flags", () => {
+    const activeFdm = statusWith({
+      discretization: "fdm",
+      explicitTopology: true,
+      resources: { mesh_revision: 5 },
+    });
+    activeFdm.domain.discretization = "fem";
+    expect(shouldLoadRuntimeMeshManifest(true, activeFdm)).toBe(false);
+
+    const unresolved = statusWith({
+      discretization: "fem",
+      explicitTopology: true,
+      resources: { mesh_revision: 5 },
+    });
+    unresolved.capabilities.active_lane = null as never;
+    expect(shouldLoadRuntimeMeshManifest(true, unresolved)).toBe(false);
+  });
+
+  it("keeps the legacy explicit-topology gate only when no lane was projected", () => {
+    const legacy = statusWith({
+      discretization: "fem",
+      explicitTopology: true,
+      resources: { mesh_revision: 5 },
+    });
+    delete (legacy.capabilities as unknown as Record<string, unknown>).active_lane;
+
+    expect(shouldLoadRuntimeMeshManifest(true, legacy)).toBe(true);
   });
 
   it("loads current run and scalar resources only after status points at data", () => {
@@ -1235,5 +1712,60 @@ describe("study runtime command resource bundles", () => {
     expect(DATA_TABLE_ROWS_PATH).toBe(
       ["", "v2", "sessions", "current", "data", "tables", "{table_id}", "rows"].join("/"),
     );
+  });
+
+  it("exposes dedicated field-sweep and FMR hooks with status-gated resource keys", () => {
+    const source = readFileSync(studyRuntimeResourcesUrl, "utf8");
+    const hookSource = source.slice(
+      source.indexOf("export function useFrequencyDomainEigenFieldSweepResource"),
+      source.indexOf("export function useHysteresisPointsResource"),
+    );
+
+    expect(ANALYSIS_FREQUENCY_DOMAIN_EIGEN_FIELD_SWEEP_PATH).toBeTruthy();
+    expect(ANALYSIS_FREQUENCY_DOMAIN_FMR_PEAKS_PATH).toBeTruthy();
+    expect(ANALYSIS_FREQUENCY_DOMAIN_FMR_RESONANCE_FITS_PATH).toBeTruthy();
+    expect(ANALYSIS_FREQUENCY_DOMAIN_FMR_KITTEL_FIT_PATH).toBeTruthy();
+    expect(hookSource).toMatch(/frequencyDomain\s*\.\s*eigenFieldSweep/);
+    expect(hookSource).toMatch(/frequencyDomain\s*\.\s*fmrPeaks/);
+    expect(hookSource).toMatch(/frequencyDomain\s*\.\s*fmrResonanceFits/);
+    expect(hookSource).toMatch(/frequencyDomain\s*\.\s*fmrKittelFit/);
+    expect(hookSource).toContain("ANALYSIS_FREQUENCY_DOMAIN_EIGEN_FIELD_SWEEP_PATH");
+    expect(hookSource).toContain("ANALYSIS_FREQUENCY_DOMAIN_FMR_PEAKS_PATH");
+    expect(hookSource).toContain("ANALYSIS_FREQUENCY_DOMAIN_FMR_RESONANCE_FITS_PATH");
+    expect(hookSource).toContain("ANALYSIS_FREQUENCY_DOMAIN_FMR_KITTEL_FIT_PATH");
+    expect(hookSource).toContain("shouldLoadFrequencyDomainManifest(enabled, sessionStatus)");
+    expect(hookSource).toContain("ignoreMissingResource<FrequencyDomainJsonArtifactResource>");
+  });
+
+  it("changes dedicated frequency-domain artifact revisions when payload identity or reason changes", () => {
+    const baseArtifact = {
+      artifact_path: "frequency-domain/fmr/peaks.json",
+      content_digest: "sha256:one",
+      missing_reason: null,
+      resource_key: ANALYSIS_FREQUENCY_DOMAIN_FMR_PEAKS_PATH,
+      revision: "artifact-revision-1",
+      schema_version: "frequency_domain_json_artifact.v1",
+      status: "partial",
+    };
+    const revision = frequencyDomainJsonArtifactRevision(baseArtifact);
+
+    expect(
+      frequencyDomainJsonArtifactRevision({
+        ...baseArtifact,
+        missing_reason: "Only the first peak was published.",
+      }),
+    ).not.toBe(revision);
+    expect(
+      frequencyDomainJsonArtifactRevision({
+        ...baseArtifact,
+        revision: "artifact-revision-2",
+      }),
+    ).not.toBe(revision);
+    expect(
+      frequencyDomainJsonArtifactRevision({
+        ...baseArtifact,
+        content_digest: "sha256:two",
+      }),
+    ).not.toBe(revision);
   });
 });

@@ -40,7 +40,11 @@ fn default_adaptive_tolerance_mode() -> String {
 pub struct ScriptBuilderSolverState {
     #[serde(default = "default_solver_integrator")]
     pub integrator: String,
-    #[serde(default = "default_solver_timestep")]
+    /// A payload that omits the field means "no fixed step was authored"; the
+    /// `Default` value below only seeds new empty scenes. Filling `1e-13` on
+    /// deserialization would combine a fixed step with adaptive controls and
+    /// invent a step the original script never had.
+    #[serde(default)]
     pub fixed_timestep: String,
     #[serde(default)]
     pub dt_initial: String,
@@ -54,6 +58,10 @@ pub struct ScriptBuilderSolverState {
     pub adaptive_timestep: Option<ScriptBuilderAdaptiveTimestepState>,
     #[serde(default)]
     pub demag_interval_s: String,
+    /// Gyromagnetic ratio in rad/(s*T) when the authored study sets one that
+    /// differs from the canonical default; empty means "use the default".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub gamma: String,
     #[serde(default = "default_solver_relax_algorithm")]
     pub relax_algorithm: String,
     #[serde(default = "default_solver_torque_tol")]
@@ -75,6 +83,7 @@ impl Default for ScriptBuilderSolverState {
             max_err: String::new(),
             adaptive_timestep: None,
             demag_interval_s: String::new(),
+            gamma: String::new(),
             relax_algorithm: default_solver_relax_algorithm(),
             torque_tolerance: default_solver_torque_tol(),
             energy_tolerance: default_solver_energy_tol(),
@@ -188,8 +197,8 @@ impl Default for ScriptBuilderMeshState {
             smoothing_steps: default_mesh_smoothing(),
             optimize: String::new(),
             optimize_iterations: default_mesh_opt_iters(),
-            compute_quality: false,
-            per_element_quality: false,
+            compute_quality: true,
+            per_element_quality: true,
             interface_hmax: None,
             interface_thickness: None,
             transition_distance: None,
@@ -328,6 +337,7 @@ pub enum StudyPrimitiveStageKind {
     Eigenmodes,
     FrequencyResponse,
     Hysteresis,
+    AntennaFieldSolve,
     ChangeDevice,
     AddFieldDrive,
     RemoveFieldDrive,
@@ -348,6 +358,7 @@ impl StudyPrimitiveStageKind {
         Self::Eigenmodes,
         Self::FrequencyResponse,
         Self::Hysteresis,
+        Self::AntennaFieldSolve,
         Self::ChangeDevice,
         Self::AddFieldDrive,
         Self::RemoveFieldDrive,
@@ -486,6 +497,7 @@ pub enum ScriptBuilderMagneticInteractionKind {
     Exchange,
     Demag,
     InterfacialDmi,
+    RotatedInterfacialDmi,
     BulkDmi,
     UniaxialAnisotropy,
 }
@@ -747,6 +759,7 @@ pub struct ScriptBuilderGeometryEntry {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ScriptBuilderDriveState {
     pub current_a: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -758,6 +771,7 @@ pub struct ScriptBuilderDriveState {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ScriptBuilderCurrentModuleState {
     pub kind: String,
     pub name: String,
@@ -770,6 +784,7 @@ pub struct ScriptBuilderCurrentModuleState {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ScriptBuilderExcitationAnalysisState {
     pub source: String,
     pub method: String,
@@ -840,9 +855,19 @@ pub struct ScriptBuilderState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_device: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_precision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requested_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_threads: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_execution: Option<fullmag_ir::ParallelExecutionPolicyIR>,
+    #[serde(default)]
+    pub pbc: Option<fullmag_ir::FdmPeriodicityIR>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fem_demag_solver_policy: Option<fullmag_ir::FemLinearSolverPolicy>,
     #[serde(default = "default_true")]
@@ -855,6 +880,8 @@ pub struct ScriptBuilderState {
     pub fdm: Option<ScriptBuilderFdmState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_field: Option<[f64; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotated_interfacial_dmi: Option<f64>,
     pub solver: ScriptBuilderSolverState,
     pub mesh: ScriptBuilderMeshState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -865,6 +892,14 @@ pub struct ScriptBuilderState {
     pub stages: Vec<ScriptBuilderStageState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub study_pipeline: Option<StudyPipelineDocument>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_autosave: Option<fullmag_ir::TableAutosaveIR>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_storage: Option<fullmag_ir::OutputStorageIR>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_profile: Option<fullmag_ir::ExecutionProfileIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub execution_layers: Vec<fullmag_ir::ExecutionRequestLayerIR>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_state: Option<ScriptBuilderInitialState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -885,8 +920,31 @@ pub struct ScriptBuilderState {
     pub spin_torques: Vec<crate::SceneSpinTorque>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub oersted_terms: Vec<crate::SceneOerstedField>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antenna_port_modes: Vec<fullmag_ir::AntennaPortModeIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antenna_field_solve_stages: Vec<fullmag_ir::AntennaFieldSolveStageIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antenna_target_projections: Vec<fullmag_ir::AntennaTargetProjectionRefIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub solved_antenna_drives: Vec<fullmag_ir::SolvedAntennaDriveIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antenna_spectrum_requests: Vec<fullmag_ir::AntennaSpectrumRequestIR>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub excitation_analysis: Option<ScriptBuilderExcitationAnalysisState>,
+}
+
+impl Default for ScriptBuilderState {
+    /// An empty builder: every field takes its serde default. Master's
+    /// `session_persistence` test calls this and no impl existed.
+    fn default() -> Self {
+        serde_json::from_value(serde_json::json!({
+            "revision": 0,
+            "solver": {},
+            "mesh": {}
+        }))
+        .expect("an empty script builder state deserializes from serde defaults")
+    }
 }
 
 fn default_inherit_mesh_mode() -> String {
@@ -916,7 +974,7 @@ const fn default_adaptive_mesh_max_passes() -> u32 {
 // --- ScriptBuilderSolverState defaults ---
 
 fn default_solver_integrator() -> String {
-    "rkf45".to_string()
+    "rk45".to_string()
 }
 
 fn default_solver_timestep() -> String {
@@ -979,9 +1037,41 @@ mod tests {
     #[test]
     fn solver_defaults_match_canonical_relax_defaults() {
         let defaults = ScriptBuilderSolverState::default();
+        assert_eq!(defaults.integrator, "rk45");
         assert_eq!(defaults.relax_algorithm, "llg_overdamped");
         assert_eq!(defaults.torque_tolerance, "1e-4");
         assert_eq!(defaults.max_relax_steps, "5000");
+    }
+
+    #[test]
+    fn solver_payload_without_fixed_timestep_does_not_gain_one() {
+        let adaptive: ScriptBuilderSolverState = serde_json::from_value(serde_json::json!({
+            "integrator": "rk45",
+            "dt_initial": "1e-15",
+            "dt_max": "1e-11",
+            "max_err": "1e-5"
+        }))
+        .unwrap();
+        assert_eq!(adaptive.fixed_timestep, "");
+        assert_eq!(adaptive.gamma, "");
+        let serialized = serde_json::to_value(&adaptive).unwrap();
+        assert!(serialized.get("gamma").is_none());
+        // A new empty scene still starts from the canonical fixed step.
+        assert_eq!(ScriptBuilderSolverState::default().fixed_timestep, "1e-13");
+    }
+
+    #[test]
+    fn solver_gamma_survives_a_serde_round_trip() {
+        let solver: ScriptBuilderSolverState = serde_json::from_value(serde_json::json!({
+            "integrator": "heun",
+            "fixed_timestep": "1e-15",
+            "gamma": "233728.481992"
+        }))
+        .unwrap();
+        let again: ScriptBuilderSolverState =
+            serde_json::from_value(serde_json::to_value(&solver).unwrap()).unwrap();
+        assert_eq!(again.gamma, "233728.481992");
+        assert_eq!(again.fixed_timestep, "1e-15");
     }
 
     #[test]

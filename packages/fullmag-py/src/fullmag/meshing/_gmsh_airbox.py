@@ -33,17 +33,25 @@ from ._gmsh_types import (
     MeshData,
     MeshOptions,
     MeshQualityReport,
+    MeshValidationError,
     MixedLayerTopologyCertificate,
+    _PREVALIDATED_MIXED_CERTIFICATE_TOKEN,
     MIXED_INTERFACE_MARKER,
     MIXED_QUALITY_METRIC,
     MIXED_SHARED_GEO_STRATEGY,
     MIXED_SHARED_GMSH_VERSION,
     SUPPORTED_VOLUME_ELEMENTS,
+    _build_mixed_topology_workspace,
+    _build_mixed_topology_workspace_from_native,
+    _bind_mixed_certificate_evidence,
+    _bounds_relative_error,
     _cluster_coordinate_planes,
     _mixed_mesh_conformity_diagnostics,
+    _mixed_certificate_evidence_payload,
     _mixed_deterministic_inputs,
-    _recompute_mixed_certificate_evidence,
-    _validate_mixed_pyramid_bases,
+    _recompute_and_bind_mixed_certificate_evidence,
+    _require_mixed_topology_workspace,
+    _validate_and_create_prevalidated_mixed_certificate,
 )
 from ._gmsh_infra import _import_gmsh, _configure_gmsh_threads, _GmshProgressLogger
 from ._gmsh_extraction import _extract_quality_metrics
@@ -51,6 +59,46 @@ from ._gmsh_extraction import _extract_quality_metrics
 
 _MIXED_SHARED_GEO_STRATEGY = MIXED_SHARED_GEO_STRATEGY
 _MIXED_SHARED_GMSH_VERSION = MIXED_SHARED_GMSH_VERSION
+
+# A thin transition shell at the film target can make a large airbox target
+# pathological: the geometric field then keeps the fine target over most of
+# the far-air volume before it is allowed to grow.  Only a genuinely large
+# jump is eligible for the bounded shell expansion below.  Smaller jumps keep
+# the historical shell dimensions and therefore retain their existing mesh
+# contract.
+_MIXED_TRANSITION_SHELL_EXPANSION_RATIO = 4.0
+
+
+def _mixed_transition_shell_parameters(
+    *,
+    h_outer: float,
+    h_inner: float,
+    hmax: float,
+    clearance_limit: float,
+    grading_ratio: float,
+) -> tuple[float, float]:
+    """Resolve the mixed-domain shell thickness and outer target size.
+
+    When the far-air target is at least four times the film/interface target,
+    absorb that jump in the conforming shell and start the far-air field one
+    requested grading step below ``h_outer``.  The expansion is disabled when
+    the airbox cannot contain the shell; then the pre-existing thin-shell
+    policy is preserved exactly.
+    """
+    base_target = max(float(h_inner), float(hmax))
+    if (
+        math.isfinite(float(h_outer))
+        and math.isfinite(base_target)
+        and math.isfinite(float(clearance_limit))
+        and base_target > 0.0
+        and float(h_outer) >= _MIXED_TRANSITION_SHELL_EXPANSION_RATIO * base_target
+        and float(h_outer) <= float(clearance_limit)
+    ):
+        growth = float(grading_ratio)
+        if not math.isfinite(growth) or growth <= 1.0:
+            growth = 1.0
+        return float(h_outer), max(base_target, float(h_outer) / growth)
+    return min(base_target, float(clearance_limit)), base_target
 
 
 def _add_geo_box_surface_loop(
@@ -366,15 +414,17 @@ def _add_conforming_swept_box_airbox_geo(
     if not math.isfinite(h_inner) or h_inner <= 0.0:
         raise ValueError("mixed shared-domain airbox minimum element size must be positive")
     clearance = 0.5 * (outer_size - body_size)
-    shell_thickness = min(
-        max(float(h_inner), float(hmax_scaled)),
-        0.5 * float(np.min(clearance)),
+    shell_thickness, shell_outer_mesh_size = _mixed_transition_shell_parameters(
+        h_outer=h_outer,
+        h_inner=h_inner,
+        hmax=hmax_scaled,
+        clearance_limit=0.5 * float(np.min(clearance)),
+        grading_ratio=float(airbox.grading_ratio),
     )
     if not math.isfinite(shell_thickness) or shell_thickness <= 0.0:
         raise ValueError("mixed shared-domain transition shell has no positive thickness")
     shell_min = body_min - shell_thickness
     shell_max = body_max + shell_thickness
-    shell_outer_mesh_size = max(float(h_inner), float(hmax_scaled))
 
     outer_surfaces, outer_loop = _add_geo_box_surface_loop(
         gmsh,
@@ -495,6 +545,204 @@ def _gmsh_require_triangular_shell_interface(
     return count
 
 
+def _native_mixed_certificate_evidence(
+    mesh: MeshData,
+    *,
+    workspace: Any | None = None,
+    requested_axis: int,
+    requested_layers: int,
+    magnetic_bounds_min_m: tuple[float, float, float],
+    magnetic_bounds_max_m: tuple[float, float, float],
+    airbox_bounds_min_m: tuple[float, float, float],
+    airbox_bounds_max_m: tuple[float, float, float],
+    outer_boundary_marker: int,
+) -> tuple[dict[str, object], str] | None:
+    """Run the optional Rust/Rayon certifier and bind authored CAD values."""
+    from fullmag import _core
+
+    native = _core.certify_mixed_mesh_arrays(
+        mesh=mesh,
+        metadata={"mesh_name": "mixed-shared-domain"},
+        certificate=None,
+        require_native=False,
+    )
+    if native is None:
+        return None
+    if workspace is not None and (
+        native.topology_fingerprint_v3 != workspace.topology_fingerprint_v3
+    ):
+        raise RuntimeError("native mixed certificate topology fingerprint is stale")
+
+    role_markers = {
+        str(role): {
+            int(marker)
+            for role_value, marker in zip(
+                mesh.facet_roles.tolist(),
+                mesh.boundary_markers.tolist(),
+                strict=True,
+            )
+            if str(role_value) == role
+        }
+        for role in ("material_interface", "exterior")
+    }
+    if role_markers["material_interface"] != {MIXED_INTERFACE_MARKER}:
+        raise RuntimeError(
+            "native mixed certificate requires material-interface marker "
+            f"{MIXED_INTERFACE_MARKER}"
+        )
+    if role_markers["exterior"] != {int(outer_boundary_marker)}:
+        raise RuntimeError(
+            "native mixed certificate outer-boundary marker disagrees with authored mesh"
+        )
+
+    evidence = dict(native.evidence)
+    count_fields = (
+        "cell_family_counts_by_marker",
+        "cell_family_counts_by_part",
+        "facet_family_counts_by_role_marker",
+    )
+    for field in count_fields:
+        value = evidence.get(field)
+        if not isinstance(value, dict):
+            raise RuntimeError(f"native mixed certificate field {field} is invalid")
+        evidence[field] = {
+            str(outer_key): {
+                str(inner_key): int(inner_value)
+                for inner_key, inner_value in inner_value_map.items()
+            }
+            for outer_key, inner_value_map in value.items()
+            if isinstance(inner_value_map, dict)
+        }
+
+    planes = tuple(float(value) for value in evidence["magnetic_plane_coordinates_m"])
+    plane_tolerance = float(evidence["plane_tolerance_m"])
+    # Compare native plane clustering against the compact Python geometric
+    # view.  This touches only nodes belonging to the magnetic prism region;
+    # it does not materialize per-cell Python records.
+    # Expand only boolean ownership masks over the CSR connectivity.  The
+    # previous implementation repeated the variable-length UTF-32 part names
+    # for every node entry, creating a large temporary string array solely to
+    # select magnetic/transition nodes.  The masks preserve the exact entry
+    # ordering while avoiding that allocation and its string comparisons.
+    cell_node_counts = np.diff(mesh.cell_offsets)
+    magnetic_entries = np.repeat(mesh.cell_mesh_parts == "magnetic", cell_node_counts)
+    transition_entries = np.repeat(
+        mesh.cell_mesh_parts == "transition_air", cell_node_counts
+    )
+    magnetic_nodes = np.unique(
+        mesh.cell_nodes[magnetic_entries]
+    )
+    if not len(magnetic_nodes):
+        raise RuntimeError("native mixed certificate mesh has no magnetic nodes")
+    python_planes, python_plane_tolerance = _cluster_coordinate_planes(
+        mesh.nodes[magnetic_nodes], requested_axis
+    )
+    workspace_planes = (
+        tuple(float(value) for value in workspace.magnetic_layer_coordinates)
+        if workspace is not None
+        else tuple(float(value) for value in python_planes)
+    )
+    workspace_plane_tolerance = (
+        float(workspace.magnetic_layer_tolerance)
+        if workspace is not None
+        else float(python_plane_tolerance)
+    )
+    if len(planes) != requested_layers + 1 or not np.allclose(
+        planes,
+        workspace_planes,
+        rtol=0.0,
+        atol=max(plane_tolerance, workspace_plane_tolerance),
+    ):
+        raise RuntimeError(
+            "native mixed certificate magnetic planes disagree with requested sweep axis"
+        )
+    if not math.isclose(
+        plane_tolerance,
+        workspace_plane_tolerance,
+        rel_tol=1.0e-12,
+        abs_tol=1.0e-30,
+    ):
+        raise RuntimeError("native mixed certificate plane tolerance is stale")
+
+    transition_nodes = np.unique(
+        mesh.cell_nodes[transition_entries]
+    )
+    if not len(transition_nodes):
+        raise RuntimeError("native mixed certificate mesh parts are incomplete")
+    realized_magnetic_min = np.min(mesh.nodes[magnetic_nodes], axis=0)
+    realized_magnetic_max = np.max(mesh.nodes[magnetic_nodes], axis=0)
+    realized_airbox_min = np.min(mesh.nodes, axis=0)
+    realized_airbox_max = np.max(mesh.nodes, axis=0)
+    magnetic_bounds_error = _bounds_relative_error(
+        realized_magnetic_min,
+        realized_magnetic_max,
+        magnetic_bounds_min_m,
+        magnetic_bounds_max_m,
+    )
+    airbox_bounds_error = _bounds_relative_error(
+        realized_airbox_min,
+        realized_airbox_max,
+        airbox_bounds_min_m,
+        airbox_bounds_max_m,
+    )
+    if magnetic_bounds_error > 1.0e-8 or airbox_bounds_error > 1.0e-8:
+        raise RuntimeError(
+            "native mixed certificate realized bounds do not match authored CAD bounds"
+        )
+    expected_magnetic_volume = float(
+        np.prod(np.asarray(magnetic_bounds_max_m) - np.asarray(magnetic_bounds_min_m))
+    )
+    expected_shared_volume = float(
+        np.prod(np.asarray(airbox_bounds_max_m) - np.asarray(airbox_bounds_min_m))
+    )
+    magnetic_volume = float(evidence["magnetic_volume_m3"])
+    shared_volume = float(evidence["shared_domain_volume_m3"])
+    evidence.update(
+        {
+            "magnetic_plane_coordinates_m": planes,
+            "plane_tolerance_m": plane_tolerance,
+            "expected_magnetic_volume_m3": expected_magnetic_volume,
+            "magnetic_relative_volume_error": abs(
+                magnetic_volume - expected_magnetic_volume
+            )
+            / expected_magnetic_volume,
+            "expected_shared_domain_volume_m3": expected_shared_volume,
+            "shared_domain_relative_volume_error": abs(
+                shared_volume - expected_shared_volume
+            )
+            / expected_shared_volume,
+            "magnetic_bounds_relative_error": magnetic_bounds_error,
+            "airbox_bounds_relative_error": airbox_bounds_error,
+        }
+    )
+    shell_offsets = np.concatenate(
+        [
+            realized_magnetic_min
+            - np.min(mesh.nodes[transition_nodes], axis=0),
+            np.max(mesh.nodes[transition_nodes], axis=0)
+            - realized_magnetic_max,
+        ]
+    )
+    shell_thickness = float(np.mean(shell_offsets))
+    if np.any(shell_offsets <= 0.0) or not np.allclose(
+        shell_offsets, shell_thickness, rtol=1.0e-10, atol=1.0e-15
+    ):
+        raise RuntimeError("native mixed certificate transition shell is not uniform")
+    if not math.isclose(
+        float(evidence["transition_shell_thickness_m"]),
+        shell_thickness,
+        rel_tol=1.0e-12,
+        abs_tol=1.0e-30,
+    ):
+        raise RuntimeError("native mixed certificate transition shell evidence is stale")
+    if requested_axis not in (0, 1, 2):
+        raise ValueError("mixed certificate requested sweep axis must be 0, 1, or 2")
+    # Keep the Rust-computed fingerprint alongside the evidence.  Recomputing
+    # the v3 fingerprint in Python would serialize millions of CSR scalars
+    # one-by-one and undo the native fast path's performance gain.
+    return evidence, str(native.topology_fingerprint_v3)
+
+
 def _attach_mixed_layer_topology_certificate(
     mesh: MeshData,
     *,
@@ -507,6 +755,7 @@ def _attach_mixed_layer_topology_certificate(
     cell_mesh_parts: np.ndarray,
     outer_boundary_marker: int,
     effective_gmsh_thread_count: int,
+    requested_direction: str | None = None,
 ) -> MeshData:
     """Validate and bind ``mixed_layer_topology_certificate.v1``."""
     mesh = MeshData(
@@ -525,8 +774,7 @@ def _attach_mixed_layer_topology_certificate(
         cell_mesh_parts=cell_mesh_parts,
         quality=mesh.quality,
         per_domain_quality=mesh.per_domain_quality,
-    ).oriented_copy()
-    mesh.validate_strict(require_positive_orientation=True)
+    )
     families = set(mesh.cell_types.tolist())
     if families != {"prism6", "pyramid5", "tet4"}:
         raise RuntimeError(
@@ -542,37 +790,136 @@ def _attach_mixed_layer_topology_certificate(
     ):
         raise RuntimeError("mixed shared-domain realization violated magnetic/air markers")
 
-    magnetic_ordinals = np.flatnonzero(mesh.element_markers == 1)
-    magnetic_nodes = np.unique(
-        np.concatenate([mesh.cell_node_ids(int(index)) for index in magnetic_ordinals])
-    )
-    planes, plane_tolerance = _cluster_coordinate_planes(
-        mesh.nodes[magnetic_nodes], requested_axis
-    )
-    realized_layers = len(planes) - 1
-    if realized_layers != requested_layers:
-        raise RuntimeError(
-            f"mixed shared-domain realization requested {requested_layers} layers "
-            f"but resolved {realized_layers}"
-        )
-    _validate_mixed_pyramid_bases(mesh, interface_marker=MIXED_INTERFACE_MARKER)
     magnetic_bounds_min_m = tuple(float(-0.5 * value) for value in body_size_m)
     magnetic_bounds_max_m = tuple(float(0.5 * value) for value in body_size_m)
+
+    # Prefer one native pass.  It validates structural/geometry/conformity
+    # evidence in Rayon and avoids constructing millions of Python face and
+    # volume objects.  If an older/source-only runtime has no extension (or
+    # Gmsh returned a cell orientation that needs the historical repair), the
+    # fully checked Python path below remains fail-closed.
+    native_evidence: dict[str, object] | None = None
+    native_fingerprint: str | None = None
+    native_error: Exception | None = None
     try:
-        evidence = _recompute_mixed_certificate_evidence(
+        native_result = _native_mixed_certificate_evidence(
             mesh,
-            sweep_axis=requested_axis,
-            interface_marker=MIXED_INTERFACE_MARKER,
-            outer_boundary_marker=outer_boundary_marker,
+            requested_axis=requested_axis,
+            requested_layers=requested_layers,
             magnetic_bounds_min_m=magnetic_bounds_min_m,
             magnetic_bounds_max_m=magnetic_bounds_max_m,
             airbox_bounds_min_m=airbox_bounds_min_m,
             airbox_bounds_max_m=airbox_bounds_max_m,
+            outer_boundary_marker=outer_boundary_marker,
         )
-    except ValueError as exc:
-        raise RuntimeError(
-            f"mixed shared-domain authored CAD bounds validation failed: {exc}"
-        ) from exc
+        if native_result is not None:
+            native_evidence, native_fingerprint = native_result
+    except (RuntimeError, ValueError) as exc:
+        native_error = exc
+
+    if native_evidence is None:
+        # Preserve the existing orientation repair and strict Python fallback
+        # for source-only runtimes and meshes rejected by the first native
+        # preflight because of an invertible entity ordering.
+        mesh = mesh.oriented_copy()
+        mesh.validate_strict(require_positive_orientation=True)
+        workspace = _build_mixed_topology_workspace(
+            mesh,
+            sweep_axis=requested_axis,
+            interface_marker=MIXED_INTERFACE_MARKER,
+        )
+        context = _require_mixed_topology_workspace(
+            mesh,
+            workspace,
+            sweep_axis=requested_axis,
+            interface_marker=MIXED_INTERFACE_MARKER,
+            _actual_topology_fingerprint_v3=workspace.topology_fingerprint_v3,
+        )
+        planes = workspace.magnetic_layer_coordinates
+        plane_tolerance = workspace.magnetic_layer_tolerance
+        realized_layers = len(planes) - 1
+        if realized_layers != requested_layers:
+            raise RuntimeError(
+                f"mixed shared-domain realization requested {requested_layers} layers "
+                f"but resolved {realized_layers}"
+            )
+        # Retry native certification after the orientation repair.  A genuine
+        # semantic/geometry error is allowed to propagate from this second
+        # call; only a missing extension selects the Python recomputation.
+        if native_error is not None:
+            native_result = _native_mixed_certificate_evidence(
+                mesh,
+                workspace=workspace,
+                requested_axis=requested_axis,
+                requested_layers=requested_layers,
+                magnetic_bounds_min_m=magnetic_bounds_min_m,
+                magnetic_bounds_max_m=magnetic_bounds_max_m,
+                airbox_bounds_min_m=airbox_bounds_min_m,
+                airbox_bounds_max_m=airbox_bounds_max_m,
+                outer_boundary_marker=outer_boundary_marker,
+            )
+            if native_result is not None:
+                native_evidence, native_fingerprint = native_result
+        if native_evidence is None:
+            try:
+                canonical_evidence = _recompute_and_bind_mixed_certificate_evidence(
+                    mesh,
+                    sweep_axis=requested_axis,
+                    interface_marker=MIXED_INTERFACE_MARKER,
+                    outer_boundary_marker=outer_boundary_marker,
+                    magnetic_bounds_min_m=magnetic_bounds_min_m,
+                    magnetic_bounds_max_m=magnetic_bounds_max_m,
+                    airbox_bounds_min_m=airbox_bounds_min_m,
+                    airbox_bounds_max_m=airbox_bounds_max_m,
+                    workspace=workspace,
+                    _bound_context=context,
+                )
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"mixed shared-domain authored CAD bounds validation failed: {exc}"
+                ) from exc
+        else:
+            canonical_evidence = _bind_mixed_certificate_evidence(
+                mesh,
+                native_evidence,
+                workspace=workspace,
+                _bound_context=context,
+            )
+    else:
+        planes = tuple(
+            float(value) for value in native_evidence["magnetic_plane_coordinates_m"]
+        )
+        plane_tolerance = float(native_evidence["plane_tolerance_m"])
+        realized_layers = len(planes) - 1
+        if realized_layers != requested_layers:
+            raise RuntimeError(
+                f"mixed shared-domain realization requested {requested_layers} layers "
+                f"but resolved {realized_layers}"
+            )
+        if native_fingerprint is None:
+            raise RuntimeError("native mixed certificate fingerprint is missing")
+        workspace = _build_mixed_topology_workspace_from_native(
+            mesh,
+            sweep_axis=requested_axis,
+            interface_marker=MIXED_INTERFACE_MARKER,
+            topology_fingerprint_v3=native_fingerprint,
+            magnetic_layer_coordinates=planes,
+            magnetic_layer_tolerance=plane_tolerance,
+        )
+        context = _require_mixed_topology_workspace(
+            mesh,
+            workspace,
+            sweep_axis=requested_axis,
+            interface_marker=MIXED_INTERFACE_MARKER,
+            _actual_topology_fingerprint_v3=native_fingerprint,
+        )
+        canonical_evidence = _bind_mixed_certificate_evidence(
+            mesh,
+            native_evidence,
+            workspace=workspace,
+            _bound_context=context,
+        )
+    evidence = canonical_evidence.evidence
     conformity = {
         name: int(evidence[name])
         for name in (
@@ -589,13 +936,30 @@ def _attach_mixed_layer_topology_certificate(
             interface_marker=MIXED_INTERFACE_MARKER,
             outer_boundary_marker=outer_boundary_marker,
         )
-        raise RuntimeError(
+        raise MeshValidationError(
             "mixed shared-domain conformity validation failed: "
             f"{conformity}; diagnostics={diagnostics}"
         )
+    topology_fingerprint_v3 = workspace.topology_fingerprint_v3
+    authored_direction = (
+        requested_direction
+        if requested_direction in {"auto", "x", "y", "z"}
+        else "xyz"[requested_axis]
+    )
+    if requested_direction is not None and requested_direction not in {
+        "auto", "x", "y", "z"
+    }:
+        raise ValueError(
+            "mixed layer topology requested direction must be one of "
+            "'auto', 'x', 'y', or 'z'"
+        )
+    if authored_direction != "auto" and authored_direction != "xyz"[requested_axis]:
+        raise ValueError(
+            "mixed layer topology requested direction disagrees with resolved axis"
+        )
     certificate = MixedLayerTopologyCertificate(
         certificate_status="accepted",
-        requested_sweep_direction="xyz"[requested_axis],
+        requested_sweep_direction=authored_direction,
         resolved_sweep_direction="xyz"[requested_axis],
         requested_layer_count=requested_layers,
         realized_layer_count=realized_layers,
@@ -607,31 +971,23 @@ def _attach_mixed_layer_topology_certificate(
         airbox_bounds_max_m=airbox_bounds_max_m,
         quality_metric=MIXED_QUALITY_METRIC,
         topology_fingerprint_version="v3",
-        topology_fingerprint=mesh.topology_fingerprint_v3(),
+        topology_fingerprint=topology_fingerprint_v3,
         gmsh_version=gmsh_version,
         strategy=_MIXED_SHARED_GEO_STRATEGY,
         effective_gmsh_thread_count=effective_gmsh_thread_count,
         deterministic_inputs=_mixed_deterministic_inputs(),
         fallbacks_triggered=(),
-        **evidence,
+        **_mixed_certificate_evidence_payload(evidence),
     )
-    return MeshData(
-        nodes=mesh.nodes,
-        cell_types=mesh.cell_types,
-        cell_offsets=mesh.cell_offsets,
-        cell_nodes=mesh.cell_nodes,
-        element_markers=mesh.element_markers,
-        facet_types=mesh.facet_types,
-        facet_roles=mesh.facet_roles,
-        facet_offsets=mesh.facet_offsets,
-        facet_nodes=mesh.facet_nodes,
-        boundary_markers=mesh.boundary_markers,
-        cell_global_ordinals=mesh.cell_global_ordinals,
-        facet_global_ordinals=mesh.facet_global_ordinals,
-        cell_mesh_parts=mesh.cell_mesh_parts,
-        quality=mesh.quality,
-        per_domain_quality=mesh.per_domain_quality,
-        mixed_layer_topology_certificate=certificate,
+    validation = _validate_and_create_prevalidated_mixed_certificate(
+        mesh,
+        certificate=certificate,
+        canonical_evidence=canonical_evidence,
+    )
+    return MeshData._from_prevalidated_mixed_certificate(
+        mesh_without_certificate=mesh,
+        validation=validation,
+        token=_PREVALIDATED_MIXED_CERTIFICATE_TOKEN,
     )
 
 

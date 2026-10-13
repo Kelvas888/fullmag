@@ -1,4 +1,8 @@
 import type {
+  AnalysisResultDatasetSummaryResource,
+  PostprocessingDefinition,
+} from "@/kernel/api/apiTypes";
+import type {
   ArtifactResource,
   CurrentRunResource,
   CurrentTransportListResource,
@@ -6,7 +10,9 @@ import type {
   FrequencyDomainJsonArtifactResource,
   FrequencyDomainManifestResource,
   FrequencyDomainTextArtifactResource,
+  ObservationFrameListResource,
   PlanarMonitorCollectionResource,
+  SceneResource,
   TableListResource,
 } from "@/kernel/api/apiTypes";
 import type { AnalysisFieldOverlayState } from "@/kernel/visualization/AnalysisFieldOverlayController";
@@ -16,6 +22,10 @@ import type { PinnedQuickChart } from "@/kernel/workspace/quickChartWorkspace";
 import type { ExplorerNode, ExplorerNodeStatus } from "../explorerTypes";
 import type { RuntimeResourceSnapshot } from "./runtimeExplorerSnapshot";
 export interface ExplorerTreeResources {
+  /** User-created Results nodes saved with the project (ADR 0054). */
+  analysisDefinitions?: readonly PostprocessingDefinition[] | null;
+  /** Typed results catalog of the current run; drives catalog-only families. */
+  analysisDatasets?: readonly AnalysisResultDatasetSummaryResource[] | null;
   resultContextContractGaps?: readonly string[];
   resultContextRunId?: string | null;
   activeAnalysisFieldOverlay?: AnalysisFieldOverlayState | null;
@@ -26,11 +36,14 @@ export interface ExplorerTreeResources {
   frequencyDomainManifest?: FrequencyDomainManifestResource | null;
   frequencyDomainResponseSweep?: FrequencyDomainJsonArtifactResource | null;
   frequencyDomainSpectrum?: FrequencyDomainJsonArtifactResource | null;
+  observationFrames?: RuntimeResourceSnapshot<ObservationFrameListResource>;
+  pinnedObservationFrameId?: string | null;
   pinnedQuickChart?: PinnedQuickChart | null;
   tableCatalog?: RuntimeResourceSnapshot<TableListResource>;
 }
 
 export type ModelTreeResources = ExplorerTreeResources & {
+  scene?: SceneResource | null;
   currentTransports?: CurrentTransportListResource | null;
   frozenSpins?: FrozenSpinsCollectionResource | null;
   planarMonitorDraft?: PlanarMonitorDraft | null;

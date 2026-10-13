@@ -449,8 +449,9 @@ async function assertCanvasHasFidelity(page) {
     });
   }
   const sample = await page.evaluate(async (encodedPng) => {
-    const response = await fetch(`data:image/png;base64,${encodedPng}`);
-    const bitmap = await createImageBitmap(await response.blob());
+    // Decode locally: the application CSP intentionally disallows data: fetches.
+    const bytes = Uint8Array.from(atob(encodedPng), (character) => character.charCodeAt(0));
+    const bitmap = await createImageBitmap(new Blob([bytes], { type: "image/png" }));
     const target = new OffscreenCanvas(bitmap.width, bitmap.height);
     const context = target.getContext("2d");
     if (!context) return null;
@@ -894,7 +895,7 @@ async function installBrowserAuditInstrumentation(page) {
 }
 
 async function installFdmFixtureApi(page, fixture, requests) {
-  await page.route("**/v2/sessions/current/**", async (route) => {
+  await page.route("**/v2/**", async (route) => {
     const request = route.request();
     const requestUrl = new URL(request.url());
     requests.push(`${request.method()} ${requestUrl.pathname}`);
@@ -904,6 +905,31 @@ async function installFdmFixtureApi(page, fixture, requests) {
     }
 
     const path = requestUrl.pathname;
+    if (path === "/v2/sessions") {
+      await fulfillJson(route, {
+        schema_version: "session-list.v1",
+        sessions: [{
+          current: true,
+          name: "FDM memory churn fixture",
+          session_id: "fdm-memory-churn-fixture",
+          status: "running",
+        }],
+      });
+      return;
+    }
+    if (path === "/v2/platform/health") {
+      await fulfillJson(route, {
+        active_session: true,
+        api_contract_version: "v2",
+        status: "ok",
+        uptime_seconds: 1,
+      });
+      return;
+    }
+    if (path === "/v2/platform/capabilities") {
+      await fulfillJson(route, { engines: [], profile_version: "fixture.v1" });
+      return;
+    }
     if (path === "/v2/sessions/current/status") {
       await fulfillJson(route, fdmStatusFixture(fixture));
       return;
@@ -1398,6 +1424,7 @@ function fdmStatusFixture(fixture) {
     session: {
       created_at: "0",
       name: "fdm-memory-churn-fixture",
+      request_scope_epoch: "fdm-memory-churn-fixture-scope@0",
       session_epoch: "fdm-memory-churn-fixture@0",
       session_id: "fdm-memory-churn-fixture",
       workspace_root: "/tmp/fullmag-fdm-memory-fixture",

@@ -1,20 +1,15 @@
 "use client";
 
-import { useMemo, useState, useSyncExternalStore } from "react";
+import { useCallback, useMemo, useState, useSyncExternalStore } from "react";
 
 import type { LiveStatusResource } from "@/kernel/api/apiTypes";
 import {
-  MESHING_BUILDS_CURRENT_PATH,
   MESHING_BUILDS_LATEST_SUCCESSFUL_PATH,
   MESHING_CAPABILITIES_PATH,
-  MESHING_SHARED_DOMAIN_MANIFEST_PATH,
   MESHING_SUMMARY_PATH,
   MODEL_GEOMETRY_CAPABILITIES_PATH,
-  MODEL_GEOMETRY_VALIDATION_PATH,
+  MODEL_SCENE_PATH,
   PERSISTENCE_CHECKPOINTS_PATH,
-  SIMULATION_COMMANDS_PATH,
-  SIMULATION_SOLVER_STATUS_PATH,
-  SIMULATION_STAGES_EXECUTION_PATH,
   VISUALIZATION_STATE_PATH,
 } from "@/kernel/api/apiPaths";
 import type { ModuleProps } from "@/kernel/types";
@@ -39,11 +34,13 @@ import {
   shouldLoadRuntimeMeshSummary,
   shouldLoadRuntimeCommandQueue,
   shouldLoadRuntimeStageExecution,
+  buildRuntimeCommandControlResourceData,
   useCommandQueueResource,
   useCommandDetailResource,
   useCheckpointCatalogResource,
   useFieldCatalogResource,
   useQuantityCatalogResource,
+  useModelReadinessResource,
   useSolverStatusResource,
   useStageExecutionResource,
 } from "@/kernel/resources/studyRuntimeResources";
@@ -52,19 +49,19 @@ import {
   useSessionStatusSelector,
 } from "@/kernel/resources/useSessionStatus";
 import { useSelectionSelector } from "@/kernel/selection/useSelection";
-import { EMPTY_SELECTION } from "@/kernel/selection/selectionTypes";
+import { EMPTY_SELECTION, type Selection } from "@/kernel/selection/selectionTypes";
+import { useAnalysisFieldOverlay } from "@/kernel/visualization/AnalysisFieldOverlayController";
+import { analysisModuleIdForNodeKind } from "@/kernel/analysis-modules/analysisSurfaceRouting";
+import { ANALYSIS_FEATURE_MANIFESTS } from "@/kernel/analysis-modules/analysisModuleManifests";
 import {
   EMPTY_OBJECT_VISUALIZATION_SNAPSHOT,
   useObjectVisualizationController,
   useObjectVisualizationSelector,
 } from "@/kernel/visualization/useObjectVisualization";
 import { useVisualizationStateResource } from "@/kernel/visualization/useVisualizationStateResource";
+import { ScratchAuthoringGuide } from "@/kernel/authoring/ScratchAuthoringGuide";
 import { CommandDetailDialog } from "@/shared/runtime/CommandDetailDialog";
 import { Button } from "@/shared/ui/Button";
-import {
-  isMeshBuildConfirmCommandId,
-  requestMeshBuildConfirmation,
-} from "@/kernel/authoring/meshBuildConfirmation";
 import {
   Dialog,
   DialogClose,
@@ -76,6 +73,7 @@ import {
 } from "@/shared/ui/Dialog";
 
 import {
+  buildAnalysisContextTabContent,
   buildRibbonTabContent,
   resolveRibbonVisualizationTarget,
 } from "./ribbonContributions";
@@ -89,7 +87,12 @@ import {
 } from "./ribbonResourcePolicy";
 import { RibbonGroupsRow } from "./RibbonGroupsRow";
 import { RibbonTabStrip } from "./RibbonTabStrip";
-import { RIBBON_TABS } from "./ribbonTypes";
+import {
+  ANALYSIS_CONTEXT_TAB_ID,
+  RIBBON_TABS,
+  type RibbonStripTabDef,
+  type RibbonStripTabId,
+} from "./ribbonTypes";
 
 type RibbonRuntimeStatus = {
   capabilities: Pick<
@@ -175,9 +178,17 @@ export default function RibbonModule({ kernel }: ModuleProps) {
   const [pendingGlobalQuantity, setPendingGlobalQuantity] =
     useState<ApplyGlobalQuantityInput | null>(null);
   const activeTab = useLayoutSelector((layout) => layout.activeModuleTab);
+  const activeViewportMainModuleId = useLayoutSelector(
+    (layout) => layout.activeViewportMainModuleId,
+  );
+  const viewportCompanion = useLayoutSelector(
+    (layout) => layout.viewportCompanion ?? null,
+  );
   const { setActiveTab } = useLayoutActions();
   const selection = useSelectionSelector((currentSelection) =>
-    activeTab === "view" ? currentSelection : EMPTY_SELECTION,
+    activeTab === "view" || activeTab === "geometry" || activeTab === "mesh"
+      ? currentSelection
+      : EMPTY_SELECTION,
   );
   const visualization = useObjectVisualizationController();
   const visualizationSnapshot = useObjectVisualizationSelector((snapshot) =>
@@ -186,9 +197,19 @@ export default function RibbonModule({ kernel }: ModuleProps) {
   const needsGeometryResources =
     activeTab === "geometry" || activeTab === "mesh";
   const needsRuntimeResources = ribbonTabNeedsRuntimeResources(activeTab);
+  const modelReadiness = useModelReadinessResource({ enabled: true });
+  const needsGuideMeshResources = Boolean(
+    modelReadiness.data?.checks.some(
+      (check) =>
+        check.id === "discretization" &&
+        check.state !== "complete" &&
+        check.target_resource === "meshing/builds/current",
+    ),
+  );
   const needsMeshResources =
     activeTab === "mesh" ||
     needsRuntimeResources ||
+    needsGuideMeshResources ||
     (activeTab === "view" && selection.ref?.type === "mesh-part");
   const needsVisualizationResources = activeTab === "view";
   const visualizationState = useVisualizationStateResource({
@@ -201,10 +222,10 @@ export default function RibbonModule({ kernel }: ModuleProps) {
     enabled: needsVisualizationResources,
   });
   const geometryCapabilities = useGeometryCapabilitiesResource({
-    enabled: needsGeometryResources || needsRuntimeResources,
+    enabled: needsGeometryResources || needsRuntimeResources || needsGuideMeshResources,
   });
   const geometryValidation = useGeometryValidationResource({
-    enabled: needsGeometryResources || needsRuntimeResources,
+    enabled: needsGeometryResources || needsRuntimeResources || needsGuideMeshResources,
   });
   const needsSessionStatusResources = ribbonTabNeedsSessionStatusResources(
     activeTab,
@@ -242,7 +263,12 @@ export default function RibbonModule({ kernel }: ModuleProps) {
     enabled: needsMeshResources,
   });
   const scene = useSceneResource({
-    enabled: activeTab === "view" && selection.ref?.type === "mesh-part",
+    enabled:
+      activeTab === "geometry" ||
+      activeTab === "mesh" ||
+      activeTab === "physics" ||
+      needsGuideMeshResources ||
+      (activeTab === "view" && selection.ref?.type === "mesh-part"),
   });
   const sceneObjectIds = useMemo(
     () => visualizationSceneObjectIds(scene.data),
@@ -281,6 +307,11 @@ export default function RibbonModule({ kernel }: ModuleProps) {
     () => kernel.commands.getVersion(),
     () => kernel.commands.getVersion(),
   );
+  const objectMoveToolState = useSyncExternalStore(
+    (listener) => kernel.objectMoveTool.subscribe(listener),
+    () => kernel.objectMoveTool.getSnapshot(),
+    () => null,
+  );
 
   const visualizationTarget = useMemo(
     () =>
@@ -297,27 +328,29 @@ export default function RibbonModule({ kernel }: ModuleProps) {
     () =>
       createCommandContext("ribbon", kernel, {
         resourceData: {
-          [MESHING_BUILDS_CURRENT_PATH]: meshBuildCurrent.data,
+          ...buildRuntimeCommandControlResourceData({
+            commandQueue: needsRuntimeResources ? commandQueue.data : null,
+            geometryValidation: geometryValidation.data,
+            meshBuildCurrent: meshBuildCurrent.data,
+            meshManifest: meshManifest.data,
+            modelReadinessData: modelReadiness.data,
+            modelReadinessStatus: modelReadiness.status,
+            sessionStatus: needsSessionStatusResources
+              ? sessionStatusData
+              : null,
+            solverStatus: needsRuntimeResources ? solverStatus.data : null,
+            stageExecution: needsRuntimeResources ? stageExecution.data : null,
+          }),
+          [SESSION_STATUS_RESOURCE_KEY]: needsSessionStatusResources
+            ? sessionStatusData
+            : null,
           [MESHING_BUILDS_LATEST_SUCCESSFUL_PATH]: meshBuildLatest.data,
-          [MESHING_SHARED_DOMAIN_MANIFEST_PATH]: meshManifest.data,
           [MESHING_CAPABILITIES_PATH]: meshCapabilities.data,
           [MESHING_SUMMARY_PATH]: meshSummary.data,
           [MODEL_GEOMETRY_CAPABILITIES_PATH]: geometryCapabilities.data,
-          [MODEL_GEOMETRY_VALIDATION_PATH]: geometryValidation.data,
+          [MODEL_SCENE_PATH]: scene.status === "ready" ? scene.data : null,
           [PERSISTENCE_CHECKPOINTS_PATH]: needsRuntimeResources
             ? checkpointCatalog.data
-            : null,
-          [SIMULATION_COMMANDS_PATH]: needsRuntimeResources
-            ? commandQueue.data
-            : null,
-          [SIMULATION_SOLVER_STATUS_PATH]: needsRuntimeResources
-            ? solverStatus.data
-            : null,
-          [SIMULATION_STAGES_EXECUTION_PATH]: needsRuntimeResources
-            ? stageExecution.data
-            : null,
-          [SESSION_STATUS_RESOURCE_KEY]: needsSessionStatusResources
-            ? sessionStatusData
             : null,
           [VISUALIZATION_STATE_PATH]: visualizationState.data,
         },
@@ -337,6 +370,10 @@ export default function RibbonModule({ kernel }: ModuleProps) {
       meshCapabilities.data,
       meshManifest.data,
       meshSummary.data,
+      scene.data,
+      scene.status,
+      modelReadiness.data,
+      modelReadiness.status,
       needsSessionStatusResources,
       sessionStatusData,
       solverStatus.data,
@@ -346,10 +383,76 @@ export default function RibbonModule({ kernel }: ModuleProps) {
     ],
   );
 
+  const activeOverlay = useAnalysisFieldOverlay(kernel.analysisFieldOverlay);
+  const activeAnalysisFieldId = activeOverlay?.fieldId ?? null;
+  const activeAnalysisFieldLabel = activeOverlay?.label ?? null;
+  const activeAnalysisField = useMemo(
+    () =>
+      activeAnalysisFieldId
+        ? { fieldId: activeAnalysisFieldId, label: activeAnalysisFieldLabel ?? activeAnalysisFieldId }
+        : null,
+    [activeAnalysisFieldId, activeAnalysisFieldLabel],
+  );
+
+  // Contextual tab of the analysis module that owns the selected Results node
+  // (ADR 0054). It is shown, and active, whenever such a node is selected;
+  // choosing another tab dismisses it until a different module's node is selected.
+  // Read independently of `selection`, which is only populated on the View and
+  // Geometry tabs; the contextual tab must follow every Results selection.
+  const contextModuleId = useSelectionSelector(contextualAnalysisModuleIdForSelection);
+  const contextModuleTitle = contextModuleId
+    ? ANALYSIS_FEATURE_MANIFESTS.find((manifest) => manifest.id === contextModuleId)?.title ?? null
+    : null;
+  const [contextualTabDismissal, setContextualTabDismissal] =
+    useState<ContextualTabDismissalState>(() => ({
+      contextModuleId,
+      dismissed: false,
+    }));
+  if (contextualTabDismissal.contextModuleId !== contextModuleId) {
+    setContextualTabDismissal((state) =>
+      contextualTabDismissalForModuleChange(state, contextModuleId)
+    );
+  }
+  const contextTabActive = contextualRibbonTabIsActive(
+    contextualTabDismissal,
+    contextModuleId,
+    Boolean(contextModuleTitle),
+  );
+  const stripActiveTab: RibbonStripTabId = contextTabActive ? ANALYSIS_CONTEXT_TAB_ID : activeTab;
+  const stripTabs = useMemo<readonly RibbonStripTabDef[]>(() => {
+    if (!contextModuleTitle) return RIBBON_TABS;
+    const resultsIndex = RIBBON_TABS.findIndex((tab) => tab.id === "results");
+    return [
+      ...RIBBON_TABS.slice(0, resultsIndex + 1),
+      { contextual: true, id: ANALYSIS_CONTEXT_TAB_ID, label: contextModuleTitle },
+      ...RIBBON_TABS.slice(resultsIndex + 1),
+    ];
+  }, [contextModuleTitle]);
+  const handleTabClick = useCallback(
+    (tabId: RibbonStripTabId) => {
+      if (tabId === ANALYSIS_CONTEXT_TAB_ID) {
+        setContextualTabDismissal({ contextModuleId, dismissed: false });
+        return;
+      }
+      setContextualTabDismissal({
+        contextModuleId,
+        dismissed: contextModuleId !== null,
+      });
+      setActiveTab(tabId);
+    },
+    [contextModuleId, setActiveTab],
+  );
+
   const tabContent = useMemo(
     () => {
       void commandVersion;
-      return buildRibbonTabContent(activeTab, {
+      void objectMoveToolState;
+      // Active command state reads the live layout from commandContext.
+      // These narrow subscriptions invalidate this memo when the composition changes.
+      void activeViewportMainModuleId;
+      void viewportCompanion;
+      const buildContext = {
+        activeAnalysisField,
         api: kernel.api,
         commandContext,
         commands: kernel.commands,
@@ -368,12 +471,19 @@ export default function RibbonModule({ kernel }: ModuleProps) {
         visualization,
         visualizationSnapshot,
         visualizationState: visualizationState.data,
-      });
+      };
+      return contextTabActive
+        ? buildAnalysisContextTabContent(buildContext)
+        : buildRibbonTabContent(activeTab, buildContext);
     },
     [
+      activeAnalysisField,
+      activeViewportMainModuleId,
       activeTab,
+      contextTabActive,
       commandContext,
       commandVersion,
+      objectMoveToolState,
       fieldCatalog.data,
       quantityCatalog.data,
       kernel.api,
@@ -391,6 +501,7 @@ export default function RibbonModule({ kernel }: ModuleProps) {
       visualization,
       visualizationSnapshot,
       visualizationState.data,
+      viewportCompanion,
     ],
   );
   const groups = tabContent?.groups ?? [];
@@ -401,15 +512,6 @@ export default function RibbonModule({ kernel }: ModuleProps) {
       isGlobalQuantityConfirmationInput(input)
     ) {
       setPendingGlobalQuantity(input);
-      return;
-    }
-    if (isMeshBuildConfirmCommandId(actionId)) {
-      requestMeshBuildConfirmation(kernel.bus, {
-        commandId: actionId,
-        input,
-        source: "ribbon",
-        sourceDetail: "ribbon-action",
-      });
       return;
     }
     void kernel.commands.execute(actionId, commandContext, input);
@@ -433,15 +535,20 @@ export default function RibbonModule({ kernel }: ModuleProps) {
     <WorkspaceRenderProfiler id="RibbonModule">
       <div className="fm-ribbon">
       <RibbonTabStrip
-        activeTabId={activeTab}
-        tabs={RIBBON_TABS}
-        onTabClick={setActiveTab}
+        activeTabId={stripActiveTab}
+        tabs={stripTabs}
+        onTabClick={handleTabClick}
       />
       <RibbonGroupsRow
         groups={groups}
-        activeTabId={activeTab}
+        activeTabId={stripActiveTab}
         onAction={handleAction}
         onCommandDetail={setSelectedCommandId}
+      />
+      <ScratchAuthoringGuide
+        commandContext={commandContext}
+        kernel={kernel}
+        readiness={modelReadiness}
       />
       <CommandDetailDialog
         commandId={selectedCommandId}
@@ -488,7 +595,43 @@ export default function RibbonModule({ kernel }: ModuleProps) {
 export const __ribbonModuleTestUtils = {
   ribbonRuntimeStatusEquals,
   selectRibbonRuntimeStatus,
+  contextualAnalysisModuleIdForSelection,
+  contextualRibbonTabIsActive,
+  contextualTabDismissalForModuleChange,
 };
+
+interface ContextualTabDismissalState {
+  contextModuleId: string | null;
+  dismissed: boolean;
+}
+
+function contextualAnalysisModuleIdForSelection(
+  selection: Pick<Selection, "kind" | "ref">,
+): string | null {
+  const ref = selection.ref;
+  if (ref?.type === "analysis-pinned-group") {
+    return ANALYSIS_FEATURE_MANIFESTS.find((manifest) => manifest.id === ref.moduleId)?.id ?? null;
+  }
+  return analysisModuleIdForNodeKind(selection.kind ?? "");
+}
+
+function contextualTabDismissalForModuleChange(
+  state: ContextualTabDismissalState,
+  contextModuleId: string | null,
+): ContextualTabDismissalState {
+  return state.contextModuleId === contextModuleId
+    ? state
+    : { contextModuleId, dismissed: false };
+}
+
+function contextualRibbonTabIsActive(
+  state: ContextualTabDismissalState,
+  contextModuleId: string | null,
+  hasContextModuleTitle: boolean,
+): boolean {
+  return hasContextModuleTitle &&
+    (state.contextModuleId !== contextModuleId || !state.dismissed);
+}
 
 function isGlobalQuantityConfirmationInput(
   input: unknown,

@@ -66,6 +66,22 @@ describe("LayoutController", () => {
     expect(listener).toHaveBeenCalledTimes(1);
   });
 
+  it("applies the kernel-owned frequency-domain Results preset without a second shell", () => {
+    const { controller } = setup();
+    controller.setPanelVisible("left", false);
+    controller.setPanelVisible("right", false);
+    controller.setPanelVisible("bottom", false);
+
+    controller.applyPreset("workspace.results.frequency-domain");
+
+    expect(controller.get()).toMatchObject({
+      activeModuleTab: "results",
+      activeViewportMainModuleId: "analysis-plots",
+      focusedSlot: "panel-left",
+      panelVisible: { left: true, right: true, bottom: true },
+    });
+  });
+
   it("setActiveViewportMainModule() changes center viewport surface and emits layout-changed", () => {
     const { bus, controller } = setup();
     const listener = vi.fn();
@@ -152,5 +168,30 @@ describe("LayoutController", () => {
     unsub();
     controller.setActiveTab("results");
     expect(listener).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows a companion surface beside the active one and never the same module twice", () => {
+    const { controller } = setup();
+    controller.setActiveViewportMainModule("analysis-plots");
+    controller.setViewportCompanion({ moduleId: "viewport-3d", placement: "beside" });
+    expect(controller.get().viewportCompanion).toEqual({ moduleId: "viewport-3d", placement: "beside" });
+
+    // Making the companion the active surface closes the split.
+    controller.setActiveViewportMainModule("viewport-3d");
+    expect(controller.get().viewportCompanion).toBeNull();
+
+    controller.setViewportCompanion({ moduleId: "viewport-3d", placement: "below" });
+    expect(controller.get().viewportCompanion).toBeNull();
+  });
+
+  it("notifies only when the companion actually changes", () => {
+    const { controller } = setup();
+    const listener = vi.fn();
+    controller.setActiveViewportMainModule("analysis-plots");
+    controller.subscribe(listener);
+    controller.setViewportCompanion({ moduleId: "viewport-3d", placement: "beside" });
+    controller.setViewportCompanion({ moduleId: "viewport-3d", placement: "beside" });
+    controller.setViewportCompanion(null);
+    expect(listener).toHaveBeenCalledTimes(2);
   });
 });

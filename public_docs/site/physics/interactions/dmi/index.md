@@ -9,14 +9,17 @@ owner: fullmag-public-docs
 (public-docs-physics-interactions-dmi-root)=
 # Dzyaloshinskii–Moriya interaction
 
-Fullmag distinguishes interfacial and bulk Dzyaloshinskii–Moriya interaction (DMI). They have
+Fullmag exposes three distinct Dzyaloshinskii–Moriya interaction (DMI) variants:
+conventional interfacial DMI, isotropic bulk DMI, and rotated interfacial DMI. They have
 different symmetry, field operators, natural boundary terms, and backend restrictions.
+Boundary conditions and validation are cross-cutting pages, not additional DMI variants.
 
 ```{toctree}
 :maxdepth: 1
 
 interfacial
 bulk
+rotated-interfacial
 boundary-conditions
 validation
 ```
@@ -132,7 +135,7 @@ body.Ku1 = 4.7e5
 body.anisU = (0.0, 0.0, 1.0)
 body.dind = 3.0e-3  # J/m^2
 study.demag(realization="poisson_robin")
-study.stages.add_relax(stage_id="relax", algorithm="llg_overdamped", max_steps=500, tolT=1.0e-6)
+study.stages.add_relax(stage_id="relax", algorithm="llg_overdamped", dt=5.0e-13, max_steps=500, tolT=1.0e-6)
 ```
 
 The study facade already supports material-owned interfacial DMI. It must not be documented as
@@ -192,6 +195,29 @@ the magnetization while leaving the grid stencil unchanged.
 3. A. N. Bogdanov and D. A. Yablonskii, *Soviet Physics JETP* **68**, 101 (1989).
 
 (physics-dmi-source-code-index)=
+
+## Control Room crosswalk
+
+This is a navigation page; the selected interaction or foundation is configured by its linked Python API and object/stage editor. The category itself has no standalone control. frontend support is not implemented applies to physical parameters without a matching control. See {doc}/frontend/capability-register; do not infer UI support from backend or Python availability.
+
+## Python/API crosswalk
+
+The linked Python API page is authoritative for exact functions, arguments, units, and failure semantics. If this page is a foundation or category overview, runnable Python is 
+ot applicable here and must be taken from the terminal API page.
+
+## Bibliography and source scope
+
+Use the scientific bibliography and source-code index on the linked terminal page. This block adds no new equation or unverified implementation claim.
+
+## Round-trip and failure semantics
+
+Requested intent preserves the authored model, coefficients, orientations, targets, and execution request. Resolved execution records the selected solver, device, precision, discretization, and capability decision. Validation errors reject malformed or contradictory data before runtime. Unsupported combinations fail closed and are not silently omitted or converted to another interaction.
+
+(physics-dmi-implementation-mapping)=
+## Implementation mapping
+
+Python owns authoring and serialization, ProblemIR owns canonical intent, planners own legality and realization selection, and backend kernels own numerical evaluation.
+
 ## Source-code index
 
 | Repository path | Stable symbol / area | Responsibility |
@@ -207,11 +233,3 @@ the magnetization while leaving the grid stencil unchanged.
 | `backends/fem/gpu/cuda/interactions` | `DMI kernels` | FEM GPU realization |
 
 (physics-dmi-round-trip-and-failure-semantics)=
-## Round-trip and failure semantics
-
-Requested intent preserves the authored model, coefficients, orientations, targets, and execution request. Resolved execution records the selected solver, device, precision, discretization, and capability decision. Validation errors reject malformed or contradictory data before runtime. Unsupported combinations fail closed and are not silently omitted or converted to another interaction.
-
-(physics-dmi-implementation-mapping)=
-## Implementation mapping
-
-Python owns authoring and serialization, ProblemIR owns canonical intent, planners own legality and realization selection, and backend kernels own numerical evaluation.

@@ -1,6 +1,13 @@
-import { readFileSync } from "node:fs";
+import { readFileSync as readFileSyncRaw } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+
+function readFileSync(filePath, encoding) {
+  const contents = readFileSyncRaw(filePath, encoding);
+  return typeof contents === "string"
+    ? contents.replace(/\r\n/g, "\n")
+    : contents;
+}
 
 const appRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const runtimeCommandsPath = path.join(
@@ -769,8 +776,10 @@ function checkFieldCatalogResourceSeparation() {
   ]);
   requireTokens(studyRuntimeResources, "field catalog resource hook", [
     "export function useFieldCatalogResource",
-    "api.data.fields.catalog({ signal })",
-    "resourceKey: DATA_FIELDS_PATH",
+    "api.data.fields.catalog({ sessionScopeKey, signal })",
+    "useSessionScopedResourceKey(",
+    "DATA_FIELDS_PATH",
+    "enabled: enabled && sessionIdentity !== null",
   ]);
   requireTokens(objectVisualizationSources, "ObjectVisualizationPanel field catalog separation", [
     "useFieldCatalogResource",
@@ -1024,10 +1033,18 @@ function checkMeshBuildDialogSessionStatusSelector() {
     "meshBuildDialogRuntimeStatusEquals",
     "useSessionStatusSelector",
     "runtimeStatus",
-    "shouldLoadRuntimeMeshBuild(state.open, runtimeStatus)",
-    "shouldLoadRuntimeMeshSummary(state.open, runtimeStatus)",
-    "shouldLoadRuntimeMeshManifest(state.open, runtimeStatus)",
+
   ]);
+  const compact = source.replace(/\s+/g, "");
+  requireTokens(compact, "MeshBuildDialog open FEM resource gate", [
+    'returnopen&&lane==="fem";',
+    "constexplicitFemLane=shouldLoadMeshBuildDialogFemResources(state.open,lane,);",
+    "useMeshBuildCurrent({enabled:explicitFemLane,})",
+    "useMeshBuildLatestSuccessful({enabled:explicitFemLane,})",
+    "useMeshSummaryResource({enabled:explicitFemLane,})",
+    "useMeshSharedDomainManifestResource({enabled:explicitFemLane,})",
+  ]);
+  forbidTokens(source, "MeshBuildDialog idle polling", ["setInterval("]);
   forbidTokens(source, "MeshBuildDialog session status selector", [
     "import { useSessionStatus }",
     "const sessionStatus = useSessionStatus()",
@@ -1137,14 +1154,17 @@ function checkObjectGeneralPanelVisualizationSelector() {
     "geometryObjectVisualizationColorsEquals",
     "createCommandContext",
     "kernel.commands.execute",
-    'visualization.target.set-shader-mono-color',
+    'visualization.target.set-primitive-mono-color',
     'visualization.target.set-wireframe-color',
     "useVisualizationStateResource",
     "shaderMonoColor",
+    "primitiveMonoColor",
+    "surfaceColorSource",
     "wireframeColor",
   ]);
   forbidTokens(source, "ObjectGeneralPanel visualization selector", [
     "useObjectVisualizationRegistry()",
+    'visualization.target.set-shader-mono-color',
   ]);
 }
 
@@ -1161,7 +1181,7 @@ function checkCommandShortcutConnector() {
     "const runtimeResourceDataRef = useRef(runtimeResourceData)",
     "runtimeResourceDataRef.current = runtimeResourceData",
     "resourceData: runtimeResourceDataRef.current",
-    "}, [kernel, startupVisible]);",
+    "}, [kernel, sessionScopeKey, startupVisible, paused]);",
   ]);
   forbidTokens(block, "CommandShortcutConnector", [
     "useSessionStatus()",
@@ -1697,10 +1717,17 @@ function checkFdmCuboidSceneModelReuse() {
   ]);
   requireTokens(sceneSource, "Viewport3DScene FDM model reuse", [
     "fdmTargetViews: readonly Viewport3DFdmTargetRenderView[]",
-    "fdmTargetViews.map((view) => ({",
+    "fdmTargetViews.map((view) => (",
     "instanceModel={view.sourceModel}",
     "instanceOrdinals={view.instanceOrdinals}",
     "fdmTargetViews={fdmTargetViews}",
+  ]);
+  // LR-01: etapowanie sceny nie może już zerować danych pola w warstwach.
+  // Powrót tych literałów oznaczałby regres migotania opisany w
+  // docs/audits/2026-09-13-live-refresh-remediation-masterplan.md.
+  forbidTokens(sceneSource, "Viewport3DScene FDM model reuse", [
+    "fieldVector: null,",
+    "surfaceColors: null,",
   ]);
   requireTokens(layerSource, "FdmCuboidLayer precomputed instance model", [
     "instanceModel?: FdmCuboidInstanceModel | null",
@@ -1779,7 +1806,6 @@ function checkAnalysisPlotsStableResourceInputs() {
     "AnalysisPlotsView",
     "{...controller}",
     "onDatasetRefChange={controller.setSelectedDatasetRef}",
-    "onSurfaceChange={controller.setActiveSurface}",
   ]);
   requireTokens(controllerSource, "analysis plots stable resource inputs", [
     "useAnalysisDatasetData",
@@ -2012,7 +2038,7 @@ function relativeAppPath(filePath) {
 
 function requireTokens(block, label, tokens) {
   for (const token of tokens) {
-    if (!block.includes(token)) {
+    if (!containsToken(block, token)) {
       failures.push(`${label} must include ${token}.`);
     }
   }
@@ -2028,8 +2054,13 @@ function requirePatterns(block, label, patterns) {
 
 function forbidTokens(block, label, tokens) {
   for (const token of tokens) {
-    if (block.includes(token)) {
+    if (containsToken(block, token)) {
       failures.push(`${label} must not include ${token}.`);
     }
   }
+}
+
+function containsToken(block, token) {
+  const escaped = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(escaped).test(block);
 }

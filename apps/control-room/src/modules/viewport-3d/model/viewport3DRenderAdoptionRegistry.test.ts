@@ -12,7 +12,7 @@ function createViewport3DRenderAdoptionRegistry(
     sessionEpoch: "test-session@1000",
     sessionId: "test-session",
   } as const;
-  let currentSessionIdentity: typeof testSessionIdentity | { sessionEpoch: string; sessionId: string } | null = testSessionIdentity;
+  let currentSessionIdentity: Parameters<typeof registry.setSessionIdentity>[0] = testSessionIdentity;
   registry.setSessionIdentity(testSessionIdentity);
   return {
     ...registry,
@@ -42,6 +42,77 @@ function createViewport3DRenderAdoptionRegistry(
 }
 
 describe("viewport3DRenderAdoptionRegistry", () => {
+  it("signals renderer adoption without requiring Visualization Debug demand", () => {
+    const registry = createViewport3DRenderAdoptionRegistry();
+    const listener = vi.fn();
+    registry.subscribeActive(listener);
+
+    registry.recordSurfaceAdoption({
+      byteLength: 496,
+      carrierId: "part:frozen",
+      fieldBufferId: "fem:frozen_spins:63",
+      resourceKey: "field:frozen_spins:63",
+      scalarBufferKey: "scalar:frozen_spins:63",
+    });
+
+    expect(listener).toHaveBeenCalledOnce();
+    expect(registry.latestActiveAdoption({
+      sessionEpoch: "test-session@1000",
+      sessionId: "test-session",
+    })).toMatchObject({
+      fieldBufferId: "fem:frozen_spins:63",
+      kind: "surface",
+      resourceKey: "field:frozen_spins:63",
+    });
+    expect(registry.snapshot("object:frozen")).toEqual([]);
+  });
+
+  it("replays an existing renderer adoption to a late scene subscriber", () => {
+    const registry = createViewport3DRenderAdoptionRegistry();
+    registry.recordSurfaceAdoption({
+      byteLength: 496,
+      carrierId: "part:frozen",
+      fieldBufferId: "fem:frozen_spins:63",
+      resourceKey: "field:frozen_spins:63",
+      scalarBufferKey: "scalar:frozen_spins:63",
+    });
+    const listener = vi.fn();
+
+    registry.subscribeActive(listener);
+
+    expect(listener).toHaveBeenCalledOnce();
+  });
+
+
+  it("returns the newest active render receipt without requiring debug demand", () => {
+    const registry = createViewport3DRenderAdoptionRegistry();
+    registry.recordSurfaceAdoption({
+      byteLength: 12,
+      carrierId: "part:a",
+      fieldBufferId: "field-old",
+      resourceKey: "field:frozen_spins:old",
+      scalarBufferKey: "scalar-old",
+      targetId: "object:a",
+    });
+    registry.recordSurfaceAdoption({
+      byteLength: 12,
+      carrierId: "part:a",
+      fieldBufferId: "field-current",
+      resourceKey: "field:frozen_spins:current",
+      scalarBufferKey: "scalar-current",
+      targetId: "object:a",
+    });
+
+    expect(registry.latestActiveAdoption({
+      sessionEpoch: "test-session@1000",
+      sessionId: "test-session",
+    })).toMatchObject({
+      fieldBufferId: "field-current",
+      resourceKey: "field:frozen_spins:current",
+      targetId: "object:a",
+    });
+  });
+
   it("fails closed with a typed unavailable result when session identity is missing", () => {
     const registry = createUnscopedViewport3DRenderAdoptionRegistry();
     registry.retainDemand("airbox");
@@ -192,11 +263,28 @@ describe("viewport3DRenderAdoptionRegistry", () => {
     expect(registry.getLifecycleStats().rejectedAdoptionCount).toBe(1);
   });
 
+  it("rejects a late buffer after reopening the same scientific session", () => {
+    const registry = createViewport3DRenderAdoptionRegistry();
+    registry.retainDemand("airbox");
+    const oldIdentity = { sessionEpoch: "session-1@1000", sessionId: "session-1", requestScopeEpoch: "api:1" };
+    registry.setSessionIdentity(oldIdentity);
+    expect(registry.recordVectorAdoption({
+      byteLength: 96, carrierId: "airbox", fieldBufferId: "field-old",
+      sessionIdentity: oldIdentity, targetId: "airbox", vectorBuildKey: "old-vector",
+    })).toEqual({ status: "adopted" });
+    registry.setSessionIdentity({ ...oldIdentity, requestScopeEpoch: "api:2" });
+    expect(registry.snapshot("airbox")).toEqual([]);
+    expect(registry.recordVectorAdoption({
+      byteLength: 96, carrierId: "airbox", fieldBufferId: "field-late",
+      sessionIdentity: oldIdentity, targetId: "airbox", vectorBuildKey: "late-vector",
+    })).toEqual({ reason: "session-identity-mismatch", status: "unavailable" });
+  });
+
   it("uses the explicitly validated registry session identity for an FDM target buffer", async () => {
     const { buildViewport3DTargetFieldBuffer } = await import("./viewport3DTargetFieldBuffer");
     const registry = createViewport3DRenderAdoptionRegistry();
     registry.retainDemand("airbox");
-    registry.setSessionIdentity({ sessionEpoch: "session-7@1000", sessionId: "session-7" });
+    registry.setSessionIdentity({ sessionEpoch: "session-7@1000", sessionId: "session-7", requestScopeEpoch: "test-api:7" });
     const buffer = buildViewport3DTargetFieldBuffer({
       domain: { domainGenerationId: "fdm-1", meshTopologyHash: "grid-1", meshTopologyRevision: "1", pointCount: 1 },
       fieldVector: {
@@ -213,7 +301,7 @@ describe("viewport3DRenderAdoptionRegistry", () => {
       },
       query: { component: "full", scope_kind: "airbox" },
       resourceKey: "field-vector:H_demag:airbox",
-      sessionIdentity: { sessionEpoch: "session-7@1000", sessionId: "session-7" },
+      sessionIdentity: { sessionEpoch: "session-7@1000", sessionId: "session-7", requestScopeEpoch: "test-api:7" },
       targetIds: ["airbox"],
     });
 

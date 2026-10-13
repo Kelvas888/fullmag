@@ -45,19 +45,32 @@ CANONICAL_NATIVE_MOUNT = Path("/mnt/fullmag-zfn2-native")
 CANONICAL_NATIVE_BACKING_IMAGE = Path(
     "/zfn2/mateuszz/git/fullmag/build-volumes/fullmag-native.ext4"
 )
+LOCAL_D_NATIVE_BACKING_IMAGE = Path("/mnt/d/git/fullmag/fullmag-native.ext4")
 MANAGED_STORAGE_HELPER = REPO_ROOT / "scripts/lib/managed_fem_runtime_storage.sh"
 TOPOLOGY_FINGERPRINT = re.compile(r"sha256:[0-9a-f]{64}")
 SHA256 = re.compile(r"[0-9a-f]{64}")
 SCALAR_CSV_SERIALIZATION_RTOL = 1.0e-15
 DIMENSIONLESS_RECOMPUTATION_ATOL = 16.0 * sys.float_info.epsilon
 MAX_MAGNETIZATION_NORM_DEFECT = 1.0e-9
-MIXED_QUALITY_METRIC = "tetra_decomposition_scaled_jacobian.v1"
+MIXED_QUALITY_METRIC = "mixed_topology_scaled_jacobian.v1"
 MIXED_SCALED_JACOBIAN_P05_MIN = 0.1
 REQUIRED_NATIVE_LIBRARIES = ("fullmag_fem", "mfem", "hypre", "libceed")
 
 
 class ExecutionError(RuntimeError):
     """Raised when the mixed SP4 matrix cannot complete exactly as planned."""
+
+
+def _native_backing_image() -> Path:
+    profile = os.environ.get("FULLMAG_NATIVE_STORAGE_PROFILE", "canonical")
+    if profile == "canonical":
+        return CANONICAL_NATIVE_BACKING_IMAGE
+    if profile == "local-d":
+        return LOCAL_D_NATIVE_BACKING_IMAGE
+    raise ExecutionError(
+        "unsupported FULLMAG_NATIVE_STORAGE_PROFILE: "
+        f"{profile} (expected canonical or local-d)"
+    )
 
 
 Launch = Callable[
@@ -154,10 +167,13 @@ def _validate_durable_storage(
     durable_root: Path,
     *,
     mount_view: Path = CANONICAL_NATIVE_MOUNT,
-    expected_backing_image: Path = CANONICAL_NATIVE_BACKING_IMAGE,
+    expected_backing_image: Path | None = None,
     loop_sysfs_root: Path = Path("/sys/block"),
 ) -> None:
     """Require the canonical loop-backed ext4 storage contract."""
+
+    if expected_backing_image is None:
+        expected_backing_image = _native_backing_image()
 
     try:
         durable_root.relative_to(mount_view)
@@ -354,6 +370,7 @@ def collect_execution_cases(
 def _environment(spec: dict[str, object], max_steps: int) -> dict[str, str]:
     return {
         "FULLMAG_SP4_PHASE": str(spec["phase"]),
+        "FULLMAG_SP4_COMPATIBILITY": "native",
         "FULLMAG_SP4_TOPOLOGY_VARIANT": str(spec["topology_variant"]),
         "FULLMAG_SP4_LAYERS": str(spec["layers"]),
         "FULLMAG_SP4_MESH": str(spec["mesh_level"]),
@@ -1039,9 +1056,13 @@ def _validate_certificate(certificate: dict[str, object], layers: int) -> None:
     missing = required_fields - set(certificate)
     if missing:
         raise ExecutionError(f"mixed topology certificate is incomplete: {sorted(missing)}")
-    if certificate.get("requested_sweep_direction") != certificate.get("resolved_sweep_direction"):
+    requested_direction = certificate.get("requested_sweep_direction")
+    resolved_direction = certificate.get("resolved_sweep_direction")
+    if requested_direction != "auto" and requested_direction != resolved_direction:
         raise ExecutionError("mixed topology certificate changed sweep direction")
-    if certificate.get("requested_sweep_direction") not in {"x", "y", "z"}:
+    if requested_direction not in {"auto", "x", "y", "z"} or resolved_direction not in {
+        "x", "y", "z"
+    }:
         raise ExecutionError("mixed topology certificate sweep direction is invalid")
     if certificate.get("topology_fingerprint_version") != "v3":
         raise ExecutionError("mixed topology certificate fingerprint version must be v3")

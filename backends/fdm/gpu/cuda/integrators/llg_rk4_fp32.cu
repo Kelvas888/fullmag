@@ -18,6 +18,9 @@ namespace fdm {
 extern void launch_exchange_field_fp32(Context &ctx);
 extern void launch_demag_field_fp32(Context &ctx);
 extern void launch_effective_field_fp32(Context &ctx, double evaluation_time);
+extern bool launch_effective_field_and_base_llg_rhs_fp32(
+    Context &ctx, double evaluation_time, DeviceVectorField &rhs_out,
+    cudaStream_t stream);
 extern double launch_exchange_energy_fp32(Context &ctx);
 extern double launch_demag_energy_fp32(Context &ctx);
 extern double launch_external_energy_fp32(Context &ctx);
@@ -28,6 +31,7 @@ extern double reduce_max_norm_fp32(Context &ctx, const void *vx, const void *vy,
 extern double reduce_max_cross_norm_fp32(Context &ctx,
     const void *ax, const void *ay, const void *az,
     const void *bx, const void *by, const void *bz, uint64_t n);
+extern void launch_project_frozen_fp32(Context &ctx, cudaStream_t stream);
 
 // Reuse the LLG RHS kernel declared in llg_fp32.cu
 extern __global__ void llg_rhs_fp32_kernel(
@@ -97,6 +101,7 @@ static void copy_field_d2d_fp32(DeviceVectorField &dst, const DeviceVectorField 
 static bool compute_rhs_into_fp32(Context &ctx, DeviceVectorField &rhs_out,
     int n, int grid, float gamma_bar, float alpha, double evaluation_time)
 {
+    launch_project_frozen_fp32(ctx, nullptr);
     if (ctx.enable_exchange) {
         launch_exchange_field_fp32(ctx);
         if (poll_interrupt(ctx)) {
@@ -111,25 +116,34 @@ static bool compute_rhs_into_fp32(Context &ctx, DeviceVectorField &rhs_out,
             return false;
         }
     }
-    launch_effective_field_fp32(ctx, evaluation_time);
-    if (poll_interrupt(ctx)) {
-        abort_step_after_interrupt(ctx, false);
-        return false;
+    const bool fuse_local_pipeline =
+        !ctx.local_pipeline_force_unfused_for_testing &&
+        !ctx.has_zhang_li_stt && !ctx.has_slonczewski_stt && !ctx.has_sot;
+    if (fuse_local_pipeline) {
+        if (!launch_effective_field_and_base_llg_rhs_fp32(
+                ctx, evaluation_time, rhs_out, nullptr)) return false;
+    } else {
+        launch_effective_field_fp32(ctx, evaluation_time);
+        if (poll_interrupt(ctx)) {
+            abort_step_after_interrupt(ctx, false);
+            return false;
+        }
+        llg_rhs_fp32_kernel<<<grid, 256>>>(
+            static_cast<const float*>(ctx.m.x),
+            static_cast<const float*>(ctx.m.y),
+            static_cast<const float*>(ctx.m.z),
+            static_cast<const float*>(ctx.work.x),
+            static_cast<const float*>(ctx.work.y),
+            static_cast<const float*>(ctx.work.z),
+            static_cast<float*>(rhs_out.x),
+            static_cast<float*>(rhs_out.y),
+            static_cast<float*>(rhs_out.z),
+            n, gamma_bar, alpha, ctx.disable_precession ? 1 : 0,
+            stt_params_from_ctx(ctx), sot_params_from_ctx(ctx));
+        context_note_local_pipeline_unfused_rhs(ctx);
+        fullmag_fdm_note_llg_rhs_torque_device_launch(
+            ctx, "RK4 fp32 LLG RHS launch");
     }
-
-    llg_rhs_fp32_kernel<<<grid, 256>>>(
-        static_cast<const float*>(ctx.m.x),
-        static_cast<const float*>(ctx.m.y),
-        static_cast<const float*>(ctx.m.z),
-        static_cast<const float*>(ctx.work.x),
-        static_cast<const float*>(ctx.work.y),
-        static_cast<const float*>(ctx.work.z),
-        static_cast<float*>(rhs_out.x),
-        static_cast<float*>(rhs_out.y),
-        static_cast<float*>(rhs_out.z),
-        n, gamma_bar, alpha, ctx.disable_precession ? 1 : 0,
-        stt_params_from_ctx(ctx), sot_params_from_ctx(ctx));
-    fullmag_fdm_note_llg_rhs_torque_device_launch(ctx, "RK4 fp32 LLG RHS launch");
     if (poll_interrupt(ctx)) {
         abort_step_after_interrupt(ctx, false);
         return false;
@@ -195,6 +209,7 @@ void launch_rk4_step_fp32(Context &ctx, double dt, fullmag_fdm_step_stats *stats
         static_cast<const float*>(ctx.k4.x), static_cast<const float*>(ctx.k4.y), static_cast<const float*>(ctx.k4.z),
         static_cast<float*>(ctx.m.x), static_cast<float*>(ctx.m.y), static_cast<float*>(ctx.m.z),
         n, dt_f / 6.0f);
+    launch_project_frozen_fp32(ctx, nullptr);
     if (abort_step_from_tmp(ctx, false)) return;
 
     context_stage_accepted_step(ctx, dt);

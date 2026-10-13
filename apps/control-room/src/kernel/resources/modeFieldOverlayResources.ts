@@ -1,0 +1,344 @@
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+
+import type { FrequencyDomainFieldResource } from "../api/apiTypes";
+import { useKernel } from "../KernelContext";
+import type { ResourceResult, ResourceStatus } from "./resourceTypes";
+import {
+  isAnalysisResultFieldOverlayIntent,
+  validateAnalysisResultFieldResponseMetadata,
+} from "../visualization/AnalysisResultFieldOverlayIntent";
+import {
+  type ModeFieldOverlayIntent,
+  type ModeFieldOverlayTopologyIdentity,
+  type ResolvedModeFieldOverlayMetadata,
+  modeFieldOverlayArtifactGenerationMatches,
+  resolveModeFieldOverlayMetadata,
+} from "../visualization/ModeFieldOverlayIntent";
+import {
+  ModeFieldOverlayIntentController,
+  type ModeFieldOverlayIntentSnapshot,
+} from "../visualization/ModeFieldOverlayIntentController";
+import { sessionRequestScopeKey } from "./sessionResourceIdentity";
+import { useSessionResourceIdentity } from "./useSessionStatus";
+
+import { useFrequencyDomainEigenModeFieldMetaResource } from "./studyRuntimeResources";
+
+export interface ModeFieldOverlayResource {
+  readonly binaryResourceKey: string | null;
+  readonly error: Error | null;
+  readonly metadata: ResolvedModeFieldOverlayMetadata | null;
+  readonly metadataStatus: ResourceStatus;
+  readonly status: ResourceStatus;
+}
+
+const MODE_FIELD_METADATA_INVALID = new Error(
+  "Mode-field metadata is incomplete, stale, or not a global complex XYZ field.",
+);
+
+function modeFieldArtifactGenerationError(
+  metadata: FrequencyDomainFieldResource,
+): Error | null {
+  const generationId =
+    typeof metadata.generation_id === "string" &&
+    metadata.generation_id.trim().length > 0
+      ? metadata.generation_id
+      : null;
+  const status = metadata.generation_status ?? "legacy_unverified";
+  if (status === "member_verified_unbound") {
+    return new Error(
+      "Mode-field artifact is member_verified_unbound and cannot be joined to the viewport.",
+    );
+  }
+  if (
+    (status === "member_verified_owner_bound" && generationId === null) ||
+    (status === "legacy_unverified" && generationId !== null) ||
+    (status !== "member_verified_owner_bound" && status !== "legacy_unverified")
+  ) {
+    return new Error("Mode-field artifact generation identity is incomplete or inconsistent.");
+  }
+  return null;
+}
+
+export function resolveModeFieldOverlayMetadataRevision(
+  intent: ModeFieldOverlayIntent,
+  metadata: FrequencyDomainFieldResource,
+): string {
+  return JSON.stringify({
+    artifactRevision: intent.artifactRevision,
+    artifactPath: metadata.artifact_path,
+    artifactGenerationId: metadata.generation_id ?? null,
+    artifactGenerationStatus: metadata.generation_status ?? null,
+    contentDigest: metadata.content_digest ?? null,
+    metadataRevision: metadata.revision ?? null,
+    metadataStatus: metadata.status,
+  });
+}
+
+/**
+ * Keeps the metadata gate ahead of the shared binary field data plane. A
+ * consumer may request `binaryResourceKey` only after this adapter returns a
+ * ready, provenance- and topology-bound metadata result.
+ */
+export function resolveModeFieldOverlayResource(
+  intent: ModeFieldOverlayIntent | null | undefined,
+  resource: Pick<
+    ResourceResult<FrequencyDomainFieldResource | null>,
+    "data" | "error" | "revision" | "status"
+  >,
+): ModeFieldOverlayResource {
+  if (!intent) {
+    return {
+      binaryResourceKey: null,
+      error: null,
+      metadata: null,
+      metadataStatus: "idle",
+      status: "idle",
+    };
+  }
+
+  if (resource.status !== "ready" || resource.data === null) {
+    return {
+      binaryResourceKey: null,
+      error: resource.error,
+      metadata: null,
+      metadataStatus: resource.status,
+      status: resource.status,
+    };
+  }
+
+  const generationError = modeFieldArtifactGenerationError(resource.data);
+  if (generationError) {
+    return {
+      binaryResourceKey: null,
+      error: generationError,
+      metadata: null,
+      metadataStatus: resource.status,
+      status: "error",
+    };
+  }
+
+  const metadata = resolveModeFieldOverlayMetadata(
+    intent,
+    resource.data,
+    resource.revision,
+  );
+  if (!metadata) {
+    return {
+      binaryResourceKey: null,
+      error: MODE_FIELD_METADATA_INVALID,
+      metadata: null,
+      metadataStatus: resource.status,
+      status: "error",
+    };
+  }
+
+  return {
+    binaryResourceKey: `data/fields/${encodeURIComponent(metadata.fieldId)}`,
+    error: null,
+    metadata,
+    metadataStatus: resource.status,
+    status: "ready",
+  };
+}
+
+/**
+ * Temporary index bridge over the generated metadata facade. The caller owns
+ * only the stable intent; the legacy sample/mode indices never leave this
+ * resource-hook boundary and cannot become overlay/cache identity.
+ */
+export function useModeFieldOverlayResource(
+  intent: ModeFieldOverlayIntent | null | undefined,
+  { enabled = true }: { enabled?: boolean } = {},
+): ModeFieldOverlayResource {
+  const sessionIdentity = useSessionResourceIdentity();
+  const metadataResource = useFrequencyDomainEigenModeFieldMetaResource(
+    intent?.sampleIndex,
+    intent?.modeIndex,
+    { enabled: enabled && Boolean(intent) && sessionIdentity !== null },
+  );
+  return useMemo(
+    () => resolveModeFieldOverlayResource(intent, metadataResource),
+    [intent, metadataResource],
+  );
+}
+
+export type ModeFieldOverlayMetadataResource = ResourceResult<
+  FrequencyDomainFieldResource | null
+>;
+
+/**
+ * Owns the mounted viewport's complete metadata -> binary demand. Both facade
+ * requests share the controller's AbortSignal, so clear, supersede and
+ * unmount cancel whichever stage is active before a snapshot can be exposed.
+ */
+export function useModeFieldOverlayIntentResource({
+  enabled = true,
+  intent,
+  topology,
+}: {
+  enabled?: boolean;
+  intent: ModeFieldOverlayIntent | null | undefined;
+  topology: ModeFieldOverlayTopologyIdentity | null;
+}): ModeFieldOverlayIntentSnapshot {
+  const { api, diagnosticRecorder } = useKernel();
+  const sessionIdentity = useSessionResourceIdentity();
+  const sessionScope = sessionRequestScopeKey(sessionIdentity);
+  const [controller] = useState(() => new ModeFieldOverlayIntentController());
+  const subscribe = useCallback(
+    (listener: () => void) => controller.subscribe(listener),
+    [controller],
+  );
+  const getSnapshot = useCallback(() => controller.getSnapshot(), [controller]);
+  const snapshot = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+  const hasIntent = Boolean(intent);
+  const hasSession = Boolean(sessionScope);
+  const hasTopology = topology !== null;
+  const topologyIdentityComplete = Boolean(
+    topology?.domainGenerationId &&
+      topology.meshTopologyHash &&
+      topology.meshTopologyRevision !== null &&
+      Number.isInteger(topology.pointCount) &&
+      topology.pointCount > 0,
+  );
+  const controllerHasError = snapshot.error !== null;
+  const controllerErrorName = snapshot.error?.name
+    ? snapshot.error.name.slice(0, 80)
+    : null;
+  const controllerErrorMessage = snapshot.error?.message?.slice(0, 160) ?? null;
+  const lastDiagnosticRef = useRef<{
+    controllerHasError: boolean;
+    controllerErrorName: string | null;
+    controllerErrorMessage: string | null;
+    controllerStatus: ModeFieldOverlayIntentSnapshot["status"];
+    enabled: boolean;
+    hasIntent: boolean;
+    hasSession: boolean;
+    hasTopology: boolean;
+    topologyIdentityComplete: boolean;
+  } | null>(null);
+
+  useEffect(() => {
+    const next = {
+      controllerHasError,
+      controllerErrorName,
+      controllerErrorMessage,
+      controllerStatus: snapshot.status,
+      enabled,
+      hasIntent,
+      hasSession,
+      hasTopology,
+      topologyIdentityComplete,
+    };
+    const previous = lastDiagnosticRef.current;
+    if (
+      previous &&
+      previous.controllerErrorName === next.controllerErrorName &&
+      previous.controllerErrorMessage === next.controllerErrorMessage &&
+      previous.controllerHasError === next.controllerHasError &&
+      previous.controllerStatus === next.controllerStatus &&
+      previous.enabled === next.enabled &&
+      previous.hasIntent === next.hasIntent &&
+      previous.hasSession === next.hasSession &&
+      previous.hasTopology === next.hasTopology &&
+      previous.topologyIdentityComplete === next.topologyIdentityComplete
+    ) {
+      return;
+    }
+    lastDiagnosticRef.current = next;
+    diagnosticRecorder.mark(
+      "viewport-3d.mode-field-overlay.resource-state",
+      next,
+      "viewport-3d",
+    );
+  }, [
+    controllerErrorName,
+    controllerErrorMessage,
+    controllerHasError,
+    diagnosticRecorder,
+    enabled,
+    hasIntent,
+    hasSession,
+    hasTopology,
+    snapshot.status,
+    topologyIdentityComplete,
+  ]);
+
+  useEffect(() => {
+    if (!enabled || !intent || !topology || !sessionScope) {
+      controller.clear();
+      return;
+    }
+
+    void controller.activate(
+      intent,
+      {
+        loadMetadata: async (activeIntent, signal) => {
+          if (isAnalysisResultFieldOverlayIntent(activeIntent)) {
+            const metadata = resolveModeFieldOverlayMetadata(
+              activeIntent,
+              activeIntent.fieldRef,
+              activeIntent.fieldRevision,
+            );
+            if (!metadata) {
+              throw new Error(
+                "Analysis result field reference failed validation.",
+              );
+            }
+            return {
+              data: activeIntent.fieldRef,
+              revision: activeIntent.fieldRevision,
+            };
+          }
+          const data = await api.analysis.frequencyDomain.eigenModeFieldMeta(
+            activeIntent.sampleIndex,
+            activeIntent.modeIndex,
+            { sessionScopeKey: sessionScope, signal },
+          );
+          return {
+            data,
+            revision: resolveModeFieldOverlayMetadataRevision(activeIntent, data),
+          };
+        },
+        loadBinary: async (metadata, signal) => {
+          const response = await api.data.fields.vector(
+            metadata.fieldId,
+            metadata.binaryQuery,
+            { sessionScopeKey: sessionScope, signal },
+          );
+          if (response.status !== "ready") {
+            throw new Error(
+              `Mode field binary resource returned ${response.status}.`,
+            );
+          }
+          if (
+            isAnalysisResultFieldOverlayIntent(metadata.intent) &&
+            !validateAnalysisResultFieldResponseMetadata(
+              metadata.intent,
+              response.responseMetadata,
+            )
+          ) {
+            throw new Error(
+              "Analysis result field binary revision failed validation.",
+            );
+          }
+          if (
+            !modeFieldOverlayArtifactGenerationMatches(
+              metadata,
+              response.responseMetadata.artifactGenerationId,
+            )
+          ) {
+            throw new Error(
+              "Mode-field artifact generation header is missing or does not match its committed member.",
+            );
+          }
+          return response.data;
+        },
+      },
+      topology,
+    );
+
+    return () => controller.clear();
+  }, [api, controller, enabled, intent, sessionScope, topology]);
+
+  return snapshot;
+}

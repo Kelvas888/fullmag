@@ -5,10 +5,20 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import math
 import sys
 from pathlib import Path
+
+from comsol_modal_field_certificate import ArtifactBundleReader
+import frequency_domain_generation
+from fem_linearization_identity_replay import (
+    IdentityReplayError, replay_identity_preimage, strict_json_object,
+)
+from fem_equilibrium_identity_replay import (
+    EquilibriumIdentityReplayError, replay_equilibrium_identity_preimages,
+)
 
 
 TWO_PI = 2.0 * math.pi
@@ -35,21 +45,32 @@ ALLOWED_MODAL_ALGEBRAIC_FORMS = {
     "gyrotropic_generalized",
     "k0_macrospin_field_generalized_to_gyrotropic_modal",
     "full_coupled_poisson_airbox_augmented_gauge",
+    "schur_reduced_descriptor",
 }
 ALLOWED_TRACKING_SCORE_SUMMARY_SOURCES = {
     "seed_only",
     "frequency_score_fallback",
     "modal_overlap_weighted_score",
+    "modal_overlap_unweighted_score",
+    "modal_subspace_transport_score",
+    "modal_overlap_unavailable",
     "mixed_modal_overlap_and_frequency_fallback",
+    "mixed_modal_tracking_methods",
 }
 ALLOWED_TRACKING_SCORE_POINT_SOURCES = {
     "seed",
     "frequency_score_fallback",
     "modal_overlap_weighted_score",
+    "modal_overlap_unweighted_score",
+    "modal_subspace_transport_score",
+    "modal_overlap_unavailable",
 }
 TRACKING_SOURCES_REQUIRING_MODAL_OVERLAP = {
     "modal_overlap_weighted_score",
+    "modal_overlap_unweighted_score",
+    "modal_subspace_transport_score",
     "mixed_modal_overlap_and_frequency_fallback",
+    "mixed_modal_tracking_methods",
 }
 PRODUCTION_MODAL_K_PATH_SUMMARY_TRACKING_SOURCES = {
     "modal_overlap_weighted_score",
@@ -85,18 +106,276 @@ REFERENCE_FULL_2X2_FLOQUET_REJECTION_CONTRACTS = {
     },
 }
 
+# R4 discovery binds paths and sample coverage. The additive own-identity
+# preimage is replayed exactly when published; full physical payload replay
+# remains a separate, explicitly unqualified gate.
+R4_SIGNED_SIDECAR_DEFINITIONS = {
+    "accepted_fem_equilibrium_fields_v1_paths": (
+        "accepted_fem_equilibrium_fields.v1.json",
+        "v7",
+    ),
+    "accepted_fem_equilibrium_fields_v2_paths": (
+        "accepted_fem_equilibrium_fields.v2.json",
+        "v8",
+    ),
+    "linearization_identity_v2_paths": (
+        "linearization_identity.v2.json",
+        "v8",
+    ),
+    "certified_fem_equilibrium_fields_v1_paths": (
+        "certified_fem_equilibrium_fields.v1.json",
+        "v7",
+    ),
+    "certified_fem_equilibrium_fields_v2_paths": (
+        "certified_fem_equilibrium_fields.v2.json",
+        "v8",
+    ),
+    "recomputed_fem_linearization_certificate_v1_paths": (
+        "recomputed_fem_linearization_certificate.v1.json",
+        "v7",
+    ),
+    "recomputed_fem_linearization_certificate_v2_paths": (
+        "recomputed_fem_linearization_certificate.v2.json",
+        "v8",
+    ),
+}
+
+R4_ACCEPTED_SIDECAR_KEYS = (
+    "accepted_fem_equilibrium_fields_v1_paths",
+    "accepted_fem_equilibrium_fields_v2_paths",
+)
+R4_IDENTITY_SIDECAR_KEY = "linearization_identity_v2_paths"
+R4_IDENTITY_PREIMAGE_KEY = "linearization_identity_preimage_v1_paths"
+R4_NEW_SIDECAR_KEYS = (
+    "certified_fem_equilibrium_fields_v1_paths",
+    "certified_fem_equilibrium_fields_v2_paths",
+    "recomputed_fem_linearization_certificate_v1_paths",
+    "recomputed_fem_linearization_certificate_v2_paths",
+)
+R4_SIDECAR_FAMILY = {
+    "accepted_fem_equilibrium_fields_v1_paths": "v1",
+    "accepted_fem_equilibrium_fields_v2_paths": "v2",
+    "certified_fem_equilibrium_fields_v1_paths": "v1",
+    "certified_fem_equilibrium_fields_v2_paths": "v2",
+    "recomputed_fem_linearization_certificate_v1_paths": "v1",
+    "recomputed_fem_linearization_certificate_v2_paths": "v2",
+}
+
+R4_DISCOVERY_STATUSES = {
+    "historical",
+    "missing_accepted",
+    "missing_identity",
+    "missing_recomputed",
+    "payload_replay_pending",
+}
+
+MAX_PRIMARY_DISPERSION_CSV_BYTES = 16 * 1024 * 1024
+
 
 def fail(message: str) -> None:
     raise SystemExit(f"invalid frequency-domain eigen artifacts:\n{message}")
 
 
-def load_json(path: Path) -> dict:
-    return json.loads(path.read_text())
+def _logical_bundle_path(path: Path, bundle_reader: ArtifactBundleReader) -> str:
+    """Map a root-visible path back to its captured logical member spelling."""
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = bundle_reader.root / candidate
+    try:
+        relative = candidate.relative_to(bundle_reader.root)
+        logical = relative.as_posix()
+        bundle_reader.logical_path(logical)
+    except (ValueError, OSError) as error:
+        fail(f"artifact path is not a safe logical bundle member: {path}: {error}")
+    return logical
 
 
-def require_file(path: Path) -> None:
+def _read_artifact_bytes(
+    path: Path,
+    *,
+    maximum_bytes: int,
+    bundle_reader: ArtifactBundleReader | None = None,
+    name: str = "artifact",
+) -> bytes:
+    """Read bounded bytes, using the captured reader whenever one is supplied."""
+    if bundle_reader is not None:
+        logical = _logical_bundle_path(path, bundle_reader)
+        try:
+            return bundle_reader.read_bytes(logical, maximum_bytes=maximum_bytes)
+        except (OSError, ValueError) as error:
+            fail(f"cannot read {name} {logical}: {error}")
+    try:
+        with Path(path).open("rb") as stream:
+            data = stream.read(maximum_bytes + 1)
+    except OSError as error:
+        fail(f"cannot read {name} {path}: {error}")
+    if len(data) > maximum_bytes:
+        fail(f"{name} exceeds the {maximum_bytes}-byte read budget: {path}")
+    return data
+
+
+def _verified_member_size(
+    path: Path,
+    *,
+    bundle_reader: ArtifactBundleReader,
+    name: str,
+) -> int:
+    logical = _logical_bundle_path(path, bundle_reader)
+    if bundle_reader.generation is not None:
+        try:
+            return bundle_reader.generation.verify_member(logical).byte_length
+        except (OSError, ValueError) as error:
+            fail(f"cannot verify {name} generation member {logical}: {error}")
+    require_file(path, bundle_reader)
+    try:
+        return path.stat().st_size
+    except OSError as error:
+        fail(f"cannot inspect {name} {logical}: {error}")
+
+
+def load_json(
+    path: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> dict:
+    require_file(path, bundle_reader)
+    raw = _read_artifact_bytes(
+        path,
+        maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+        bundle_reader=bundle_reader,
+        name="JSON artifact",
+    )
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        fail(f"invalid JSON artifact {path}: {error}")
+    if not isinstance(value, dict):
+        fail(f"JSON artifact {path} must be an object")
+    return value
+
+
+def require_file(
+    path: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
+    if bundle_reader is not None:
+        logical = _logical_bundle_path(path, bundle_reader)
+        try:
+            if bundle_reader.has_member(logical):
+                return
+        except (OSError, ValueError) as error:
+            fail(f"invalid artifact member {logical}: {error}")
+        fail(f"missing required artifact generation member: {logical}")
     if not path.is_file():
         fail(f"missing required artifact: {path}")
+
+
+def require_bundle_path(
+    root: Path,
+    value: object,
+    name: str,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> tuple[str, Path]:
+    """Resolve an artifact path without permitting escape from the bundle."""
+    relative_path = require_non_empty_string(value, name)
+    candidate = Path(relative_path)
+    if candidate.is_absolute() or ".." in candidate.parts:
+        fail(f"{name} must be a relative path inside the artifact bundle")
+    if bundle_reader is not None:
+        try:
+            logical_path = bundle_reader.logical_path(relative_path)
+            if not bundle_reader.has_member(relative_path):
+                fail(f"{name}: {relative_path} is not a member of the captured artifact generation")
+        except (OSError, ValueError) as error:
+            fail(f"{name} is not a safe captured artifact path: {error}")
+        return relative_path, logical_path
+    root_resolved = root.resolve()
+    resolved = (root / candidate).resolve()
+    try:
+        resolved.relative_to(root_resolved)
+    except ValueError:
+        fail(f"{name} escapes the artifact bundle")
+    require_file(resolved)
+    return relative_path, resolved
+
+
+def sha256_file_token(
+    path: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> str:
+    if bundle_reader is not None:
+        logical = _logical_bundle_path(path, bundle_reader)
+        try:
+            record = bundle_reader.record_for(logical)
+        except ValueError:
+            _read_artifact_bytes(
+                path,
+                maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+                bundle_reader=bundle_reader,
+                name="hashed artifact",
+            )
+            try:
+                record = bundle_reader.record_for(logical)
+            except ValueError as error:
+                fail(f"cannot obtain verified artifact digest for {logical}: {error}")
+        return str(record["sha256"])
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def serde_json_compact_bytes(value: object) -> bytes:
+    """Serialize JSON with the compact, key-sorted serde_json::Value form."""
+
+    def encode(item: object) -> str:
+        if item is None:
+            return "null"
+        if item is True:
+            return "true"
+        if item is False:
+            return "false"
+        if isinstance(item, int):
+            return str(item)
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                fail("field_sweep canonical digest contains a non-finite number")
+            rendered = repr(item)
+            if "e" in rendered:
+                mantissa, exponent = rendered.split("e", 1)
+                sign = ""
+                if exponent[0] in "+-":
+                    sign, exponent = exponent[0], exponent[1:]
+                exponent_value = int(f"{sign}{exponent}")
+                if -5 <= exponent_value < 0:
+                    digits = mantissa.replace(".", "").lstrip("-")
+                    prefix = "-" if mantissa.startswith("-") else ""
+                    zero_count = -exponent_value - 1
+                    rendered = f"{prefix}0.{('0' * zero_count)}{digits}"
+                else:
+                    rendered = f"{mantissa}e{sign}{int(exponent)}"
+            return rendered
+        if isinstance(item, str):
+            return json.dumps(item, ensure_ascii=False)
+        if isinstance(item, list):
+            return "[" + ",".join(encode(entry) for entry in item) + "]"
+        if isinstance(item, dict):
+            if not all(isinstance(key, str) for key in item):
+                fail("field_sweep canonical digest requires string object keys")
+            return "{" + ",".join(
+                f"{json.dumps(key, ensure_ascii=False)}:{encode(item[key])}"
+                for key in sorted(item)
+            ) + "}"
+        fail("field_sweep canonical digest contains a non-JSON value")
+
+    return encode(value).encode("utf-8")
+
+
+def canonical_artifact_self_digest(artifact: dict, name: str) -> str:
+    normalized = dict(artifact)
+    normalized["revision"] = ""
+    normalized["content_sha256"] = ""
+    try:
+        canonical_bytes = serde_json_compact_bytes(normalized)
+    except (TypeError, ValueError) as error:
+        fail(f"{name} cannot be canonically serialized: {error}")
+    return "sha256:" + hashlib.sha256(canonical_bytes).hexdigest()
 
 
 def require_equal(actual: object, expected: object, name: str) -> None:
@@ -145,6 +424,1769 @@ def require_sha256_token(value: object, name: str) -> str:
     return token
 
 
+def equilibrium_artifact_v7_digest(artifact: dict) -> str:
+    preimage = dict(artifact)
+    preimage.pop("content_sha256", None)
+    preimage.pop("equilibrium_id", None)
+    try:
+        canonical_bytes = serde_json_compact_bytes(preimage)
+    except (TypeError, ValueError) as error:
+        fail(
+            "equilibrium_artifact cannot be canonically serialized for "
+            f"content_sha256 validation: {error}"
+        )
+    return "sha256:" + hashlib.sha256(canonical_bytes).hexdigest()
+
+
+def equilibrium_artifact_v8_digest(artifact: dict) -> str:
+    """Return the v8 content digest without changing the frozen v7 helper."""
+    preimage = dict(artifact)
+    preimage.pop("content_sha256", None)
+    preimage.pop("equilibrium_id", None)
+    try:
+        canonical_bytes = serde_json_compact_bytes(preimage)
+    except (TypeError, ValueError) as error:
+        fail(
+            "equilibrium_artifact_v8 cannot be canonically serialized for "
+            f"content_sha256 validation: {error}"
+        )
+    return "sha256:" + hashlib.sha256(canonical_bytes).hexdigest()
+
+
+def linearization_state_v7_digest(state: dict) -> str:
+    """Return the canonical content digest used by LinearizationState.v7."""
+    preimage = dict(state)
+    preimage.pop("content_sha256", None)
+    preimage.pop("linearization_state_id", None)
+    try:
+        canonical_bytes = serde_json_compact_bytes(preimage)
+    except (TypeError, ValueError) as error:
+        fail(
+            "LinearizationState.v7 cannot be canonically serialized for "
+            f"content_sha256 validation: {error}"
+        )
+    return "sha256:" + hashlib.sha256(canonical_bytes).hexdigest()
+
+
+CANONICAL_EQUILIBRIUM_MATERIAL_IDENTITY_KIND = "canonical_equilibrium_material.v2"
+CANONICAL_EQUILIBRIUM_MATERIAL_PROVENANCE_SCOPE = "materialization_plan"
+V8_MATERIAL_IDENTITY_FIELDS = (
+    "material_signature",
+    "material_identity_kind",
+    "material_provenance_signature",
+    "material_provenance_scope",
+)
+
+
+def validate_canonical_equilibrium_material_identity(
+    payload: dict, name: str
+) -> tuple[str, str]:
+    """Validate the four-field v8/v7 canonical/raw material identity contract."""
+    if not isinstance(payload, dict):
+        fail(f"{name} must be an object")
+    canonical_signature = require_sha256_token(
+        payload.get("material_signature"), f"{name}.material_signature"
+    )
+    require_equal(
+        payload.get("material_identity_kind"),
+        CANONICAL_EQUILIBRIUM_MATERIAL_IDENTITY_KIND,
+        f"{name}.material_identity_kind",
+    )
+    provenance_signature = require_sha256_token(
+        payload.get("material_provenance_signature"),
+        f"{name}.material_provenance_signature",
+    )
+    require_equal(
+        payload.get("material_provenance_scope"),
+        CANONICAL_EQUILIBRIUM_MATERIAL_PROVENANCE_SCOPE,
+        f"{name}.material_provenance_scope",
+    )
+    return canonical_signature, provenance_signature
+
+
+def _reject_v8_material_identity_fields(payload: dict, name: str) -> None:
+    for field_name in V8_MATERIAL_IDENTITY_FIELDS[1:]:
+        if field_name in payload:
+            fail(
+                f"{name}.{field_name} is not allowed in the frozen legacy "
+                "schema"
+            )
+
+
+def _require_non_negative_finite_number(value: object, name: str) -> float:
+    if isinstance(value, bool):
+        fail(f"{name} must be a finite number")
+    number = require_finite_number(value, name)
+    if number < 0.0:
+        fail(f"{name} must be non-negative")
+    return number
+
+
+def validate_equilibrium_artifact_v7_payload(
+    artifact: dict, expected_content_sha256: object | None = None
+) -> None:
+    """Validate an equilibrium v7 payload independently of its bundle path."""
+    if not isinstance(artifact, dict):
+        fail("equilibrium_artifact must be an object")
+    schema_version = artifact.get("schema_version")
+    if schema_version == "equilibrium_artifact.v6":
+        fail(
+            "equilibrium_artifact_v6_uncertified: rerun relaxation or migrate "
+            "with source completion evidence"
+        )
+    if isinstance(artifact, dict):
+        _reject_v8_material_identity_fields(artifact, "equilibrium_artifact")
+    require_equal(
+        schema_version,
+        "equilibrium_artifact.v7",
+        "equilibrium_artifact.schema_version",
+    )
+    accepted_for_linearization = require_boolean(
+        artifact.get("accepted_for_linearization"),
+        "equilibrium_artifact.accepted_for_linearization",
+    )
+    require_equal(
+        accepted_for_linearization,
+        True,
+        "equilibrium_artifact.accepted_for_linearization",
+    )
+    certificate = artifact.get("acceptance_certificate")
+    if not isinstance(certificate, dict):
+        fail("equilibrium_artifact.acceptance_certificate must be an object")
+    criterion = certificate.get("criterion")
+    expected = {
+        "torque": ("max_torque_apm", "A/m", "torque"),
+        "energy": ("total_energy_plateau_range_j", "J", "energy"),
+    }.get(criterion)
+    if expected is None:
+        fail("equilibrium_artifact.acceptance_certificate.criterion is invalid")
+    metric_kind, unit, stop_reason = expected
+    require_equal(
+        certificate.get("metric_kind"),
+        metric_kind,
+        "equilibrium_artifact.acceptance_certificate.metric_kind",
+    )
+    require_equal(
+        certificate.get("unit"),
+        unit,
+        "equilibrium_artifact.acceptance_certificate.unit",
+    )
+    require_equal(
+        certificate.get("stop_reason"),
+        stop_reason,
+        "equilibrium_artifact.acceptance_certificate.stop_reason",
+    )
+    require_equal(
+        certificate.get("status"),
+        "completed",
+        "equilibrium_artifact.acceptance_certificate.status",
+    )
+    converged = require_boolean(
+        certificate.get("converged"),
+        "equilibrium_artifact.acceptance_certificate.converged",
+    )
+    require_equal(
+        converged,
+        True,
+        "equilibrium_artifact.acceptance_certificate.converged",
+    )
+    metric_value = _require_non_negative_finite_number(
+        certificate.get("metric_value"),
+        "equilibrium_artifact.acceptance_certificate.metric_value",
+    )
+    threshold = _require_non_negative_finite_number(
+        certificate.get("threshold"),
+        "equilibrium_artifact.acceptance_certificate.threshold",
+    )
+    if metric_value > threshold:
+        fail(
+            "equilibrium_artifact.acceptance_certificate.metric_value must "
+            "satisfy its non-negative threshold"
+        )
+    completion_sha256 = require_sha256_token(
+        certificate.get("completion_sha256"),
+        "equilibrium_artifact.acceptance_certificate.completion_sha256",
+    )
+    require_equal(
+        artifact.get("completion_sha256"),
+        completion_sha256,
+        "equilibrium_artifact.completion_sha256",
+    )
+    content_sha256 = require_sha256_token(
+        artifact.get("content_sha256"),
+        "equilibrium_artifact.content_sha256",
+    )
+    require_equal(
+        content_sha256,
+        equilibrium_artifact_v7_digest(artifact),
+        "equilibrium_artifact.content_sha256",
+    )
+    if expected_content_sha256 is not None:
+        expected_content_sha256 = require_sha256_token(
+            expected_content_sha256,
+            "expected_content_sha256",
+        )
+        require_equal(
+            content_sha256,
+            expected_content_sha256,
+            "expected_content_sha256",
+        )
+    require_equal(
+        artifact.get("equilibrium_id"),
+        "equilibrium_artifact.v7:" + content_sha256.removeprefix("sha256:"),
+        "equilibrium_artifact.equilibrium_id",
+    )
+    observables = artifact.get("observables")
+    if not isinstance(observables, dict):
+        fail("equilibrium_artifact.observables must be an object")
+    for field_name in ["max_torque_Apm", "max_torque_T", "max_torque_relative"]:
+        _require_non_negative_finite_number(
+            observables.get(field_name),
+            f"equilibrium_artifact.observables.{field_name}",
+        )
+    integrity = artifact.get("representation_integrity")
+    if not isinstance(integrity, dict):
+        fail("equilibrium_artifact.representation_integrity must be an object")
+    _require_non_negative_finite_number(
+        integrity.get("m0_norm_tolerance"),
+        "equilibrium_artifact.representation_integrity.m0_norm_tolerance",
+    )
+
+
+def validate_equilibrium_artifact_v8_payload(
+    artifact: dict, expected_content_sha256: object | None = None
+) -> None:
+    """Validate v8 and its canonical/raw equilibrium material identity."""
+    if not isinstance(artifact, dict):
+        fail("equilibrium_artifact must be an object")
+    require_equal(
+        artifact.get("schema_version"),
+        "equilibrium_artifact.v8",
+        "equilibrium_artifact.schema_version",
+    )
+    require_equal(
+        require_boolean(
+            artifact.get("accepted_for_linearization"),
+            "equilibrium_artifact.accepted_for_linearization",
+        ),
+        True,
+        "equilibrium_artifact.accepted_for_linearization",
+    )
+    certificate = artifact.get("acceptance_certificate")
+    if not isinstance(certificate, dict):
+        fail("equilibrium_artifact.acceptance_certificate must be an object")
+    expected = {
+        "torque": ("max_torque_apm", "A/m", "torque"),
+        "energy": ("total_energy_plateau_range_j", "J", "energy"),
+    }.get(certificate.get("criterion"))
+    if expected is None:
+        fail("equilibrium_artifact.acceptance_certificate.criterion is invalid")
+    metric_kind, unit, stop_reason = expected
+    require_equal(
+        certificate.get("metric_kind"),
+        metric_kind,
+        "equilibrium_artifact.acceptance_certificate.metric_kind",
+    )
+    require_equal(
+        certificate.get("unit"), unit,
+        "equilibrium_artifact.acceptance_certificate.unit",
+    )
+    require_equal(
+        certificate.get("stop_reason"), stop_reason,
+        "equilibrium_artifact.acceptance_certificate.stop_reason",
+    )
+    require_equal(
+        certificate.get("status"), "completed",
+        "equilibrium_artifact.acceptance_certificate.status",
+    )
+    require_equal(
+        require_boolean(
+            certificate.get("converged"),
+            "equilibrium_artifact.acceptance_certificate.converged",
+        ),
+        True,
+        "equilibrium_artifact.acceptance_certificate.converged",
+    )
+    metric_value = _require_non_negative_finite_number(
+        certificate.get("metric_value"),
+        "equilibrium_artifact.acceptance_certificate.metric_value",
+    )
+    threshold = _require_non_negative_finite_number(
+        certificate.get("threshold"),
+        "equilibrium_artifact.acceptance_certificate.threshold",
+    )
+    if metric_value > threshold:
+        fail(
+            "equilibrium_artifact.acceptance_certificate.metric_value must "
+            "satisfy its non-negative threshold"
+        )
+    completion_sha256 = require_sha256_token(
+        certificate.get("completion_sha256"),
+        "equilibrium_artifact.acceptance_certificate.completion_sha256",
+    )
+    require_equal(
+        artifact.get("completion_sha256"), completion_sha256,
+        "equilibrium_artifact.completion_sha256",
+    )
+    content_sha256 = require_sha256_token(
+        artifact.get("content_sha256"),
+        "equilibrium_artifact.content_sha256",
+    )
+    require_equal(
+        content_sha256,
+        equilibrium_artifact_v8_digest(artifact),
+        "equilibrium_artifact.content_sha256",
+    )
+    if expected_content_sha256 is not None:
+        require_equal(
+            content_sha256,
+            require_sha256_token(expected_content_sha256, "expected_content_sha256"),
+            "expected_content_sha256",
+        )
+    require_equal(
+        artifact.get("equilibrium_id"),
+        "equilibrium_artifact.v8:" + content_sha256.removeprefix("sha256:"),
+        "equilibrium_artifact.equilibrium_id",
+    )
+    observables = artifact.get("observables")
+    if not isinstance(observables, dict):
+        fail("equilibrium_artifact.observables must be an object")
+    for field_name in ["max_torque_Apm", "max_torque_T", "max_torque_relative"]:
+        _require_non_negative_finite_number(
+            observables.get(field_name),
+            f"equilibrium_artifact.observables.{field_name}",
+        )
+    integrity = artifact.get("representation_integrity")
+    if not isinstance(integrity, dict):
+        fail("equilibrium_artifact.representation_integrity must be an object")
+    _require_non_negative_finite_number(
+        integrity.get("m0_norm_tolerance"),
+        "equilibrium_artifact.representation_integrity.m0_norm_tolerance",
+    )
+    validate_canonical_equilibrium_material_identity(
+        artifact, "equilibrium_artifact"
+    )
+
+
+def validate_linearization_state_v7_payload(
+    state: dict,
+    equilibrium: dict,
+    expected_content_sha256: object | None = None,
+) -> None:
+    """Validate v7 state and bind canonical material to the v8 source."""
+    if not isinstance(state, dict):
+        fail("linearization_state must be an object")
+    require_equal(
+        state.get("schema_version"),
+        "LinearizationState.v7",
+        "linearization_state.schema_version",
+    )
+    require_equal(
+        require_boolean(
+            state.get("accepted_for_frequency_operator"),
+            "linearization_state.accepted_for_frequency_operator",
+        ),
+        True,
+        "linearization_state.accepted_for_frequency_operator",
+    )
+    if not isinstance(equilibrium, dict):
+        fail("linearization_state source equilibrium must be an object")
+    require_equal(
+        equilibrium.get("schema_version"),
+        "equilibrium_artifact.v8",
+        "linearization_state.source_equilibrium_schema",
+    )
+    equilibrium_digest = require_sha256_token(
+        equilibrium.get("content_sha256"),
+        "equilibrium_artifact.content_sha256",
+    )
+    equilibrium_id = require_non_empty_string(
+        equilibrium.get("equilibrium_id"),
+        "equilibrium_artifact.equilibrium_id",
+    )
+    require_equal(
+        state.get("source_equilibrium_artifact"),
+        equilibrium_digest,
+        "linearization_state.source_equilibrium_artifact",
+    )
+    require_equal(
+        state.get("source_equilibrium_id"),
+        equilibrium_id,
+        "linearization_state.source_equilibrium_id",
+    )
+    content_sha256 = require_sha256_token(
+        state.get("content_sha256"),
+        "linearization_state.content_sha256",
+    )
+    require_equal(
+        content_sha256,
+        linearization_state_v7_digest(state),
+        "linearization_state.content_sha256",
+    )
+    if expected_content_sha256 is not None:
+        require_equal(
+            content_sha256,
+            require_sha256_token(
+                expected_content_sha256, "expected_linearization_state_sha256"
+            ),
+            "expected_linearization_state_sha256",
+        )
+    require_equal(
+        state.get("linearization_state_id"),
+        "LinearizationState.v7:" + content_sha256.removeprefix("sha256:"),
+        "linearization_state.linearization_state_id",
+    )
+    equilibrium_material_signature, _ = validate_canonical_equilibrium_material_identity(
+        equilibrium, "equilibrium_artifact"
+    )
+    state_material_signature, _ = validate_canonical_equilibrium_material_identity(
+        state, "linearization_state"
+    )
+    require_equal(
+        state_material_signature,
+        equilibrium_material_signature,
+        "linearization_state.material_signature",
+    )
+
+
+def validate_linearization_state_v6_payload(
+    state: dict,
+    equilibrium: dict,
+    expected_content_sha256: object | None = None,
+) -> None:
+    """Validate the frozen legacy v6 state binding without v8 identity fields."""
+    if not isinstance(state, dict):
+        fail("linearization_state must be an object")
+    require_equal(
+        state.get("schema_version"),
+        "LinearizationState.v6",
+        "linearization_state.schema_version",
+    )
+    _reject_v8_material_identity_fields(state, "linearization_state")
+    require_equal(
+        require_boolean(
+            state.get("accepted_for_frequency_operator"),
+            "linearization_state.accepted_for_frequency_operator",
+        ),
+        True,
+        "linearization_state.accepted_for_frequency_operator",
+    )
+    if not isinstance(equilibrium, dict):
+        fail("linearization_state source equilibrium must be an object")
+    require_equal(
+        equilibrium.get("schema_version"),
+        "equilibrium_artifact.v7",
+        "linearization_state.source_equilibrium_schema",
+    )
+    equilibrium_digest = require_sha256_token(
+        equilibrium.get("content_sha256"),
+        "equilibrium_artifact.content_sha256",
+    )
+    equilibrium_id = require_non_empty_string(
+        equilibrium.get("equilibrium_id"),
+        "equilibrium_artifact.equilibrium_id",
+    )
+    require_equal(
+        state.get("source_equilibrium_artifact"),
+        equilibrium_digest,
+        "linearization_state.source_equilibrium_artifact",
+    )
+    require_equal(
+        state.get("source_equilibrium_id"),
+        equilibrium_id,
+        "linearization_state.source_equilibrium_id",
+    )
+    content_sha256 = require_sha256_token(
+        state.get("content_sha256"),
+        "linearization_state.content_sha256",
+    )
+    require_equal(
+        content_sha256,
+        linearization_state_v7_digest(state),
+        "linearization_state.content_sha256",
+    )
+    if expected_content_sha256 is not None:
+        require_equal(
+            content_sha256,
+            require_sha256_token(
+                expected_content_sha256, "expected_linearization_state_sha256"
+            ),
+            "expected_linearization_state_sha256",
+        )
+    require_equal(
+        state.get("linearization_state_id"),
+        "LinearizationState.v6:" + content_sha256.removeprefix("sha256:"),
+        "linearization_state.linearization_state_id",
+    )
+
+
+def _state_sample_key(relative_path: str, filename: str) -> str:
+    normalized = Path(relative_path).as_posix()
+    prefix = "eigen/metadata/"
+    if not normalized.startswith(prefix) or not normalized.endswith(filename):
+        fail(
+            f"state artifact path must be under eigen/metadata and end with "
+            f"{filename}"
+        )
+    middle = normalized[len(prefix) : -len(filename)]
+    if middle.endswith("/"):
+        middle = middle[:-1]
+    return middle
+
+
+def _r4_sidecar_sample_index(relative_path: str, filename: str, name: str) -> int:
+    """Return the canonical sample index from one R4 sidecar path.
+
+    The path is part of the signed multi-k manifest contract.  Keep this
+    check stricter than the generic bundle-path resolver: accepting an
+    arbitrary directory below ``eigen/metadata`` would make the sample
+    binding ambiguous, even when the file itself exists.
+    """
+    normalized = Path(relative_path).as_posix()
+    if relative_path != normalized:
+        fail(f"{name} must use canonical forward-slash separators")
+    prefix = "eigen/metadata/sample_"
+    suffix = f"/{filename}"
+    if not normalized.startswith(prefix) or not normalized.endswith(suffix):
+        fail(
+            f"{name} must use eigen/metadata/sample_NNNN/{filename}"
+        )
+    token = normalized[len(prefix) : -len(suffix)]
+    if not token.isdigit():
+        fail(f"{name} has an invalid sample index")
+    sample_index = int(token)
+    if token != f"{sample_index:04d}":
+        fail(f"{name} must use the canonical sample_{sample_index:04d} directory")
+    return sample_index
+
+
+def _declared_r4_sidecar_paths(
+    root: Path,
+    artifacts: dict,
+    key: str,
+    filename: str,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> dict[int, tuple[str, Path]] | None:
+    """Resolve one optional R4 plural sidecar array.
+
+    ``None`` means that a historical manifest does not know this key.  An
+    explicitly present empty list is valid for a newer spectrum-only
+    manifest.  Non-empty arrays are required to contain existing canonical
+    paths, one path per sample index, without traversal or duplicates.
+    """
+    if key not in artifacts:
+        return None
+    value = artifacts[key]
+    if not isinstance(value, list):
+        fail(f"manifest.artifacts.{key} must be a list")
+    if any(not isinstance(item, str) for item in value):
+        fail(f"manifest.artifacts.{key} must be a list of paths")
+    if len(set(value)) != len(value):
+        fail(f"manifest.artifacts.{key} must not contain duplicate paths")
+    result: dict[int, tuple[str, Path]] = {}
+    for index, item in enumerate(value):
+        relative_path, artifact_path = require_bundle_path(
+            root,
+            item,
+            f"manifest.artifacts.{key}[{index}]",
+            bundle_reader,
+        )
+        sample_index = _r4_sidecar_sample_index(
+            relative_path,
+            filename,
+            f"manifest.artifacts.{key}[{index}]",
+        )
+        if sample_index in result:
+            fail(
+                f"manifest.artifacts.{key} contains duplicate sample index "
+                f"{sample_index}"
+            )
+        result[sample_index] = (relative_path, artifact_path)
+    return result
+
+
+def _native_input_diagnostics_sample_index(
+    relative_path: str, filename: str, name: str
+) -> int:
+    """Return the sample index from the nested native-input sidecar path."""
+    normalized = Path(relative_path).as_posix()
+    if relative_path != normalized:
+        fail(f"{name} must use canonical forward-slash separators")
+    prefix = "eigen/metadata/sample_"
+    suffix = f"/nonshared_source/{filename}"
+    if not normalized.startswith(prefix) or not normalized.endswith(suffix):
+        fail(
+            f"{name} must use "
+            f"eigen/metadata/sample_NNNN/nonshared_source/{filename}"
+        )
+    token = normalized[len(prefix) : -len(suffix)]
+    if not token.isdigit():
+        fail(f"{name} has an invalid sample index")
+    sample_index = int(token)
+    if token != f"{sample_index:04d}":
+        fail(f"{name} must use the canonical sample_{sample_index:04d} directory")
+    return sample_index
+
+
+def _declared_nonshared_native_input_diagnostics_paths(
+    root: Path,
+    artifacts: dict,
+    computed_sample_indices: set[int] | None,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> dict[str, object]:
+    """Validate the additive final-C-ABI pair independently of old sidecars.
+
+    The three historical non-shared sidecar arrays are intentionally not
+    consulted here.  This keeps old manifests readable while making any
+    explicitly declared native-input pair fail closed on partial coverage,
+    wrong nesting, duplicate paths, or a sidecar whose own binding fields do
+    not name the manifest path and sample.
+    """
+    definitions = (
+        (
+            "nonshared_floquet_native_input_diagnostics_v1_paths",
+            "native_input_operator_diagnostics.v1.json",
+            "nonshared_floquet_native_input_diagnostics_v1_path",
+        ),
+        (
+            "nonshared_floquet_native_input_diagnostics_preimage_v1_paths",
+            "native_input_operator_diagnostics_preimage.v1.json",
+            "nonshared_floquet_native_input_diagnostics_preimage_v1_path",
+        ),
+    )
+    present = [key in artifacts for key, _, _ in definitions]
+    aliases_present = [alias in artifacts for _, _, alias in definitions]
+    if not any(present) and not any(aliases_present):
+        return {
+            "status": "historical",
+            "reason": "native-input diagnostic path arrays are absent",
+            "sample_indices": [],
+            "structural_complete": False,
+            "qualification": "NOT_VERIFIED",
+        }
+    if present != [True, True]:
+        fail(
+            "manifest.artifacts native-input diagnostic path arrays must "
+            "declare both final and preimage families together"
+        )
+    paths_by_key: dict[str, dict[int, tuple[str, Path]]] = {}
+    for key, filename, alias in definitions:
+        declared = artifacts[key]
+        if not isinstance(declared, list):
+            fail(f"manifest.artifacts.{key} must be a list")
+        if any(not isinstance(item, str) for item in declared):
+            fail(f"manifest.artifacts.{key} must be a list of paths")
+        if len(set(declared)) != len(declared):
+            fail(f"manifest.artifacts.{key} must not contain duplicate paths")
+        paths: dict[int, tuple[str, Path]] = {}
+        for position, item in enumerate(declared):
+            relative, artifact_path = require_bundle_path(
+                root,
+                item,
+                f"manifest.artifacts.{key}[{position}]",
+                bundle_reader,
+            )
+            sample_index = _native_input_diagnostics_sample_index(
+                relative, filename, f"manifest.artifacts.{key}[{position}]"
+            )
+            if sample_index in paths:
+                fail(
+                    f"manifest.artifacts.{key} contains duplicate sample index "
+                    f"{sample_index}"
+                )
+            paths[sample_index] = (relative, artifact_path)
+        if list(paths) != sorted(paths):
+            fail(f"manifest.artifacts.{key} must be ordered by sample index")
+        paths_by_key[key] = paths
+        alias_value = artifacts.get(alias)
+        if alias not in artifacts:
+            if len(paths) == 1:
+                fail(
+                    f"manifest.artifacts.{alias} is required for a complete "
+                    "single-sample native-input pair"
+                )
+        elif alias_value is not None:
+            alias_relative, alias_path = require_bundle_path(
+                root, alias_value, f"manifest.artifacts.{alias}", bundle_reader
+            )
+            alias_sample = _native_input_diagnostics_sample_index(
+                alias_relative, filename, f"manifest.artifacts.{alias}"
+            )
+            if len(paths) != 1 or alias_sample not in paths:
+                fail(
+                    f"manifest.artifacts.{alias} must be null unless its "
+                    "plural family contains exactly one sample"
+                )
+            if paths[alias_sample][0] != alias_relative or paths[alias_sample][1] != alias_path:
+                fail(
+                    f"manifest.artifacts.{alias} differs from its plural "
+                    "sample set"
+                )
+        elif len(paths) == 1:
+            fail(
+                f"manifest.artifacts.{alias} cannot be null for a complete "
+                "single-sample native-input pair"
+            )
+
+    final_key, preimage_key = (definitions[0][0], definitions[1][0])
+    final_paths = paths_by_key[final_key]
+    preimage_paths = paths_by_key[preimage_key]
+    if set(final_paths) != set(preimage_paths):
+        fail(
+            "manifest.artifacts native-input final and preimage sample "
+            "index sets must match"
+        )
+    sample_indices = set(final_paths)
+    if computed_sample_indices is not None and sample_indices != computed_sample_indices:
+        fail(
+            "manifest.artifacts native-input diagnostic sample index set "
+            "must match computed spectrum samples"
+        )
+    if not sample_indices:
+        return {
+            "status": "historical",
+            "reason": "native-input diagnostic path arrays are explicitly empty",
+            "sample_indices": [],
+            "structural_complete": False,
+            "qualification": "NOT_VERIFIED",
+        }
+
+    for sample_index in sorted(sample_indices):
+        final_relative, final_path = final_paths[sample_index]
+        preimage_relative, _preimage_path = preimage_paths[sample_index]
+        try:
+            final = strict_json_object(
+                _read_artifact_bytes(
+                    final_path,
+                    maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+                    bundle_reader=bundle_reader,
+                    name="native-input diagnostic manifest sidecar",
+                ),
+                "native-input diagnostic manifest sidecar",
+            )
+        except (IdentityReplayError, OSError) as error:
+            fail(f"native-input diagnostic manifest sidecar is invalid: {error}")
+        require_equal(
+            final.get("nonshared_floquet_native_input_diagnostics_schema"),
+            "nonshared_floquet_native_input_diagnostics.v1",
+            "native-input diagnostic sidecar schema",
+        )
+        final_sample_index = final.get(
+            "nonshared_floquet_native_input_diagnostics_sample_index"
+        )
+        if type(final_sample_index) is not int:
+            fail("native-input diagnostic sidecar sample_index must be an integer")
+        require_equal(
+            final_sample_index,
+            sample_index,
+            "native-input diagnostic sidecar sample_index",
+        )
+        require_equal(
+            final.get("nonshared_floquet_native_input_diagnostics_path"),
+            final_relative,
+            "native-input diagnostic sidecar path binding",
+        )
+        require_equal(
+            final.get("nonshared_floquet_native_input_diagnostics_preimage_path"),
+            preimage_relative,
+            "native-input diagnostic sidecar preimage binding",
+        )
+    return {
+        "status": "path_coverage_complete",
+        "reason": "native-input diagnostic arrays and sidecar bindings cover every computed sample",
+        "sample_indices": sorted(sample_indices),
+        "structural_complete": True,
+        "qualification": "NOT_VERIFIED",
+    }
+
+
+def _legacy_state_sample_indices(
+    root: Path,
+    artifacts: dict,
+    schema: str,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> set[int]:
+    """Return the sample indices of one existing v7/v6 or v8/v7 pair."""
+    pairs = _state_path_pairs(
+        root,
+        {"artifacts": artifacts},
+        schema=schema,
+        bundle_reader=bundle_reader,
+    )
+    indices: set[int] = set()
+    for _, _, _, sample_key in pairs:
+        if sample_key == "":
+            sample_index = 0
+        else:
+            token = sample_key.removeprefix("sample_")
+            if not token.isdigit() or token != f"{int(token):04d}":
+                fail(
+                    f"manifest.artifacts {schema} state paths have an invalid "
+                    f"sample key {sample_key!r}"
+                )
+            sample_index = int(token)
+        if sample_index in indices:
+            fail(
+                f"manifest.artifacts {schema} state paths contain duplicate "
+                f"sample index {sample_index}"
+            )
+        indices.add(sample_index)
+    return indices
+
+
+def _r4_discovery_result(
+    status: str,
+    reason: str,
+    *,
+    accepted_family: str | None = None,
+    accepted_sample_indices: set[int] | None = None,
+    identity_sample_indices: set[int] | None = None,
+    missing_recomputed_keys: list[str] | None = None,
+    computed_sample_indices: set[int] | None = None,
+    identity_content_sha256_by_sample: dict[str, str] | None = None,
+    equilibrium_preimage_sha256_by_sample: dict[str, dict[str, str]] | None = None,
+) -> dict[str, object]:
+    if status not in R4_DISCOVERY_STATUSES:
+        raise ValueError(f"unknown R4 discovery status: {status}")
+    return {
+        "status": status,
+        "reason": reason,
+        "accepted_family": accepted_family,
+        "accepted_sample_indices": sorted(accepted_sample_indices or set()),
+        "identity_sample_indices": sorted(identity_sample_indices or set()),
+        "missing_recomputed_keys": sorted(missing_recomputed_keys or []),
+        "computed_sample_indices": (
+            None
+            if computed_sample_indices is None
+            else sorted(computed_sample_indices)
+        ),
+        "identity_content_digest_status": (
+            "verified_exact_preimage"
+            if identity_content_sha256_by_sample else "unverified_missing_preimage"
+        ),
+        "identity_content_sha256_by_sample": dict(identity_content_sha256_by_sample or {}),
+        "equilibrium_preimage_digest_status": (
+            "verified_five_exact_preimages"
+            if equilibrium_preimage_sha256_by_sample else "unverified_missing_preimage"
+        ),
+        "equilibrium_preimage_sha256_by_sample": dict(equilibrium_preimage_sha256_by_sample or {}),
+    }
+
+
+def _state_family_has_paths(artifacts: dict, schema: str) -> bool:
+    if schema == "v8":
+        keys = (
+            "equilibrium_artifact_v8_path",
+            "equilibrium_artifact_v8_paths",
+            "linearization_state_v7_path",
+            "linearization_state_v7_paths",
+        )
+    else:
+        keys = (
+            "equilibrium_artifact_v7_path",
+            "equilibrium_artifact_v7_paths",
+            "linearization_state_v6_path",
+            "linearization_state_v6_paths",
+        )
+    return any(
+        key in artifacts and artifacts.get(key) not in (None, "", [])
+        for key in keys
+    )
+
+
+def _computed_sample_indices_from_spectrum(spectrum: object) -> set[int]:
+    """Return every sample the path producer actually published.
+
+    The path producers in ``fem/eigen_path.rs`` and
+    ``fem/eigen_output.rs`` (with the modal manifest adapter in
+    ``eigen/artifacts/modal_manifest.rs``) publish ``sample_count`` and
+    explicit ``sample_index`` records.  Use those records as the coverage
+    contract; never infer a contiguous range from the largest index or from
+    selected mode fields.  ``eigen/artifacts/common.rs`` only carries the
+    source-revision helpers and is not the spectrum payload producer.
+    """
+    if not isinstance(spectrum, dict):
+        fail("eigen/spectrum.v2.json must be an object")
+    samples = require_object_list(spectrum.get("samples"), "spectrum.samples")
+    sample_count = require_non_negative_int(
+        spectrum.get("sample_count"), "spectrum.sample_count"
+    )
+    require_equal(sample_count, len(samples), "spectrum.sample_count")
+    indices: set[int] = set()
+    for position, sample in enumerate(samples):
+        sample_index = require_non_negative_int(
+            sample.get("sample_index"),
+            f"spectrum.samples[{position}].sample_index",
+        )
+        if sample_index in indices:
+            fail(f"spectrum.samples contains duplicate sample_index {sample_index}")
+        indices.add(sample_index)
+    return indices
+
+
+def validate_r4_signed_sidecars(
+    root: Path,
+    artifacts: object,
+    computed_sample_indices: set[int] | None = None,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> dict[str, object]:
+    """Validate R4 sidecar discovery and family/sample binding.
+
+    Historical manifests omit all R4 keys and remain valid.  A producer may
+    publish an accepted sidecar family before the identity-v2 producer is
+    available; that state is reported as ``missing_identity`` rather than
+    being treated as a certified result.  This function validates only path
+    identity and family/sample-set consistency; when supplied, the explicit
+    spectrum sample set is the complete computed-sample contract. Published
+    exact identity preimages are checked cryptographically. Accepted/recomputed
+    physical field replay and linked source/state checks remain separate gates.
+    """
+    if not isinstance(artifacts, dict):
+        return _r4_discovery_result(
+            "historical",
+            "R4 sidecar arrays are absent from a historical manifest",
+            computed_sample_indices=computed_sample_indices,
+        )
+    keys = tuple(R4_SIGNED_SIDECAR_DEFINITIONS)
+    present = [key for key in keys if key in artifacts]
+    preimage_present = R4_IDENTITY_PREIMAGE_KEY in artifacts
+    if not present and not preimage_present:
+        return _r4_discovery_result(
+            "historical",
+            "R4 sidecar arrays are absent from a historical manifest",
+            computed_sample_indices=computed_sample_indices,
+        )
+    old_keys = (*R4_ACCEPTED_SIDECAR_KEYS, R4_IDENTITY_SIDECAR_KEY)
+    new_present = [key for key in R4_NEW_SIDECAR_KEYS if key in artifacts]
+    missing_old = [key for key in old_keys if key not in artifacts]
+    if missing_old:
+        fail(
+            "manifest.artifacts R4 signed sidecars must declare all plural "
+            f"arrays; missing {', '.join(missing_old)}"
+        )
+    if new_present:
+        missing_new = [key for key in R4_NEW_SIDECAR_KEYS if key not in artifacts]
+        if missing_new:
+            fail(
+                "manifest.artifacts R4 certified/recomputed sidecars must "
+                "declare all four plural arrays; missing "
+                f"{', '.join(missing_new)}"
+            )
+
+    declared = {
+        key: _declared_r4_sidecar_paths(
+            root,
+            artifacts,
+            key,
+            R4_SIGNED_SIDECAR_DEFINITIONS[key][0],
+            bundle_reader,
+        )
+        for key in present
+    }
+    accepted_v1 = declared.get("accepted_fem_equilibrium_fields_v1_paths") or {}
+    accepted_v2 = declared.get("accepted_fem_equilibrium_fields_v2_paths") or {}
+    identity_v2 = declared.get(R4_IDENTITY_SIDECAR_KEY) or {}
+    identity_preimages = _declared_r4_sidecar_paths(
+        root, artifacts, R4_IDENTITY_PREIMAGE_KEY,
+        "linearization_identity_preimage.v1.json",
+        bundle_reader,
+    )
+    new_sidecars = {
+        key: declared.get(key) or {}
+        for key in R4_NEW_SIDECAR_KEYS
+    }
+    missing_declared_new_keys = [
+        key for key in R4_NEW_SIDECAR_KEYS if not new_sidecars[key]
+    ]
+
+    if not accepted_v1 and not accepted_v2:
+        if identity_v2 or identity_preimages or any(new_sidecars.values()):
+            fail(
+                "manifest.artifacts R4 identity/certified/recomputed sidecars "
+                "cannot be declared without an accepted FEM equilibrium "
+                "sidecar family"
+            )
+        return _r4_discovery_result(
+            "missing_accepted",
+            "R4 accepted FEM equilibrium sidecars are missing",
+            identity_sample_indices=set(identity_v2),
+            missing_recomputed_keys=missing_declared_new_keys,
+            computed_sample_indices=computed_sample_indices,
+        )
+    if accepted_v1 and accepted_v2:
+        fail(
+            "manifest.artifacts R4 sidecars mix accepted FEM equilibrium "
+            "field families v1 and v2"
+        )
+    accepted_family = "v1" if accepted_v1 else "v2"
+    accepted_sample_indices = set(accepted_v1 or accepted_v2)
+    if (
+        computed_sample_indices is not None
+        and accepted_sample_indices != set(computed_sample_indices)
+    ):
+        fail(
+            "manifest.artifacts accepted FEM equilibrium sidecar sample index "
+            "set must match the computed spectrum sample index set"
+        )
+    required_new_keys = [
+        key for key in R4_NEW_SIDECAR_KEYS
+        if R4_SIDECAR_FAMILY[key] == accepted_family
+    ]
+    missing_recomputed_keys = [
+        key for key in required_new_keys if not new_sidecars[key]
+    ]
+    if identity_v2 and set(accepted_sample_indices) != set(identity_v2):
+        fail(
+            "manifest.artifacts accepted fields and linearization identity "
+            "sample index sets must match"
+        )
+    # Historical bundles omit the additive exact-preimage array. Once it is
+    # declared beside actual identities it must cover the complete sample set.
+    if identity_preimages is not None:
+        if set(identity_preimages) != set(identity_v2):
+            fail("manifest.artifacts identity preimage and identity sample index sets must match")
+        if identity_v2 and set(identity_preimages) != accepted_sample_indices:
+            fail("manifest.artifacts identity preimage sample index set must match accepted fields")
+
+    identity_digests: dict[str, str] = {}
+    equilibrium_digests: dict[str, dict[str, str]] = {}
+    for sample_index, (_, preimage_path) in (identity_preimages or {}).items():
+        identity_path = identity_v2[sample_index][1]
+        try:
+            identity_bytes = _read_artifact_bytes(
+                identity_path,
+                maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+                bundle_reader=bundle_reader,
+                name="linearization identity",
+            )
+            identity = strict_json_object(identity_bytes, "identity")
+            if require_non_negative_int(identity.get("sample_index"), "identity.sample_index") != sample_index:
+                fail("linearization identity sample_index must match its canonical sidecar path")
+            identity_digests[str(sample_index)] = replay_identity_preimage(
+                identity_bytes,
+                _read_artifact_bytes(
+                    preimage_path,
+                    maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+                    bundle_reader=bundle_reader,
+                    name="linearization identity preimage",
+                ),
+            )
+            equilibrium_digests[str(sample_index)] = replay_equilibrium_identity_preimages(identity_bytes)
+        except (IdentityReplayError, OSError) as error:
+            fail(f"sample {sample_index} identity exact preimage replay failed: {error}")
+        except EquilibriumIdentityReplayError as error:
+            fail(f"sample {sample_index} equilibrium exact preimage replay failed: {error}")
+
+    # Keep the already-existing state-pair binding when those sidecars are
+    # declared, but do not turn their absence into a new R4 qualification
+    # failure while the producer migration is still in progress.
+    state_schema = "v7" if accepted_v1 else "v8"
+    opposite_state_schema = "v8" if accepted_v1 else "v7"
+    if _state_family_has_paths(artifacts, opposite_state_schema):
+        fail(
+            "manifest.artifacts accepted fields and state paths use mixed "
+            "schema families"
+        )
+    if _state_family_has_paths(artifacts, state_schema):
+        expected_state_samples = _legacy_state_sample_indices(
+            root, artifacts, state_schema, bundle_reader
+        )
+        if set(accepted_sample_indices) != expected_state_samples:
+            fail(
+                "manifest.artifacts accepted fields and state sample "
+                "index sets must match"
+            )
+
+    for key, paths in new_sidecars.items():
+        if not paths:
+            continue
+        expected_family = R4_SIDECAR_FAMILY[key]
+        if expected_family != accepted_family:
+            fail(
+                "manifest.artifacts R4 certified/recomputed sidecar "
+                f"{key} uses family {expected_family}, but accepted fields "
+                f"use family {accepted_family}"
+            )
+        if set(paths) != accepted_sample_indices:
+            fail(
+                "manifest.artifacts R4 certified/recomputed sidecar "
+                f"{key} sample index set must match accepted fields"
+            )
+
+    if not identity_v2 and missing_recomputed_keys:
+        return _r4_discovery_result(
+            "missing_recomputed",
+            "R4 linearization identity v2 and certified/recomputed sidecar "
+            "arrays are missing or empty; accepted field payload replay is "
+            "not verified",
+            accepted_family=accepted_family,
+            accepted_sample_indices=accepted_sample_indices,
+            missing_recomputed_keys=missing_recomputed_keys,
+            computed_sample_indices=computed_sample_indices,
+            identity_content_sha256_by_sample=identity_digests,
+            equilibrium_preimage_sha256_by_sample=equilibrium_digests,
+        )
+    if not identity_v2:
+        return _r4_discovery_result(
+            "missing_identity",
+            "R4 linearization identity v2 sidecars are missing; accepted "
+            "field payload replay is not verified",
+            accepted_family=accepted_family,
+            accepted_sample_indices=accepted_sample_indices,
+            missing_recomputed_keys=missing_recomputed_keys,
+            computed_sample_indices=computed_sample_indices,
+            identity_content_sha256_by_sample=identity_digests,
+            equilibrium_preimage_sha256_by_sample=equilibrium_digests,
+        )
+    if missing_recomputed_keys:
+        return _r4_discovery_result(
+            "missing_recomputed",
+            "R4 certified/recomputed sidecar arrays are missing or empty; "
+            "accepted field payload replay is not verified",
+            accepted_family=accepted_family,
+            accepted_sample_indices=accepted_sample_indices,
+            identity_sample_indices=set(identity_v2),
+            missing_recomputed_keys=missing_recomputed_keys,
+            computed_sample_indices=computed_sample_indices,
+            identity_content_sha256_by_sample=identity_digests,
+            equilibrium_preimage_sha256_by_sample=equilibrium_digests,
+        )
+    return _r4_discovery_result(
+        "payload_replay_pending",
+        "R4 sidecar paths are structurally consistent; source payload replay "
+        "is reported separately and independent operator replay remains pending",
+        accepted_family=accepted_family,
+        accepted_sample_indices=accepted_sample_indices,
+        identity_sample_indices=set(identity_v2),
+        computed_sample_indices=computed_sample_indices,
+        identity_content_sha256_by_sample=identity_digests,
+        equilibrium_preimage_sha256_by_sample=equilibrium_digests,
+    )
+
+
+def validate_producer_provenance_discovery(
+    root: Path,
+    artifacts: dict,
+    computed_sample_indices: set[int] | None,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> dict[str, object]:
+    """Bind additive producer paths to actual samples without qualifying payloads.
+
+    Shared and non-shared operators use the same immutable producer record.
+    Historical absence is reported, while partial coverage or a conflicting
+    singular alias is rejected before any physical replay can use the paths.
+    """
+    paths = _declared_r4_sidecar_paths(
+        root,
+        artifacts,
+        "producer_provenance_v1_paths",
+        "producer_provenance.v1.json",
+        bundle_reader,
+    )
+    singular = artifacts.get("producer_provenance_v1_path")
+    if singular is not None:
+        relative, _ = require_bundle_path(
+            root,
+            singular,
+            "manifest.artifacts.producer_provenance_v1_path",
+            bundle_reader,
+        )
+        index = _r4_sidecar_sample_index(
+            relative, "producer_provenance.v1.json",
+            "manifest.artifacts.producer_provenance_v1_path",
+        )
+        if not paths or index not in paths or paths[index][0] != relative:
+            fail("producer provenance singular path must belong to its plural sample set")
+    if not paths:
+        return {
+            "status": "unverified_missing_producer_provenance",
+            "sample_indices": [],
+            "payload_replay_status": "NOT_VERIFIED",
+        }
+    indices = list(paths)
+    if indices != sorted(indices):
+        fail("producer provenance paths must be ordered by sample_index")
+    if computed_sample_indices is not None and set(indices) != computed_sample_indices:
+        fail("producer provenance sample index set must match computed spectrum samples")
+    return {
+        "status": "producer_paths_bound",
+        "sample_indices": indices,
+        "payload_replay_status": "NOT_VERIFIED",
+    }
+
+
+def validate_consumer_plan_exact_replay(
+    root: Path, artifacts: dict, computed_sample_indices: set[int] | None,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> dict[str, object]:
+    """Bind raw consumer plan bytes to identity, without qualifying IR or assembly.
+
+    The sidecar is the original compact serde_json plan, not an envelope.
+    Parsing checks duplicate keys and non-finite values; hashing always uses
+    the retained bytes, including their original field order and whitespace.
+    """
+    paths = _declared_r4_sidecar_paths(
+        root,
+        artifacts,
+        "consumer_plan_snapshot_v1_paths",
+        "consumer_plan_snapshot.v1.json",
+        bundle_reader,
+    ) or {}
+    singular = artifacts.get("consumer_plan_snapshot_v1_path")
+    if singular is not None:
+        relative, _ = require_bundle_path(
+            root, singular, "consumer_plan_snapshot_v1_path", bundle_reader
+        )
+        index = _r4_sidecar_sample_index(relative, "consumer_plan_snapshot.v1.json", "consumer plan alias")
+        if index not in paths or paths[index][0] != relative:
+            fail("consumer plan singular path must belong to its plural sample set")
+    if not paths:
+        return {"status": "NOT_VERIFIED", "reason": "exact consumer plan bytes absent"}
+    if list(paths) != sorted(paths):
+        fail("consumer plan paths must be ordered by sample_index")
+    if computed_sample_indices is not None and set(paths) != computed_sample_indices:
+        fail("consumer plan sample index set must match computed spectrum samples")
+    identities = _declared_r4_sidecar_paths(
+        root,
+        artifacts,
+        R4_IDENTITY_SIDECAR_KEY,
+        "linearization_identity.v2.json",
+        bundle_reader,
+    ) or {}
+    if set(paths) != set(identities):
+        fail("consumer plan sample index set must match linearization identities")
+    digests = {}
+    for index, (_, plan_path) in paths.items():
+        raw = _read_artifact_bytes(
+            plan_path,
+            maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+            bundle_reader=bundle_reader,
+            name="exact consumer plan",
+        )
+        try:
+            strict_json_object(raw, "exact consumer plan")
+            identity = strict_json_object(
+                _read_artifact_bytes(
+                    identities[index][1],
+                    maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+                    bundle_reader=bundle_reader,
+                    name="linearization identity",
+                ),
+                "linearization identity",
+            )
+        except IdentityReplayError as error:
+            fail(f"consumer plan replay sample {index}: {error}")
+        if type(identity.get("sample_index")) is not int or identity["sample_index"] != index:
+            fail("consumer plan identity sample_index differs from its canonical path")
+        digest = "sha256:" + hashlib.sha256(raw).hexdigest()
+        require_equal(identity.get("consumer_plan_snapshot_sha256"), digest, "consumer plan raw digest")
+        digests[str(index)] = digest
+    return {
+        "status": "consumer_plan_exact_bytes_replayed", "raw_sha256_by_sample": digests,
+        "plan_semantics_status": "NOT_VERIFIED", "operator_replay_status": "NOT_VERIFIED",
+    }
+
+
+def validate_nonshared_operator_replay(
+    root: Path, artifacts: dict, computed_sample_indices: set[int] | None,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> dict[str, object]:
+    """Replay declared nonshared samples without qualifying native FEM assembly."""
+    from fem_nonshared_operator_replay import NonSharedReplayError, replay_nonshared_operator
+
+    native_input_coverage = _declared_nonshared_native_input_diagnostics_paths(
+        root, artifacts, computed_sample_indices, bundle_reader
+    )
+
+    families = (
+        "nonshared_floquet_operator_identity",
+        "nonshared_floquet_operator_identity_preimage",
+        "nonshared_floquet_source_state",
+    )
+    paths = {}
+    for family in families:
+        key = f"{family}_v1_paths"
+        declared = _declared_r4_sidecar_paths(
+            root, artifacts, key, f"{family}.v1.json", bundle_reader
+        ) or {}
+        alias = artifacts.get(f"{family}_v1_path")
+        if alias is not None and (len(declared) != 1 or alias != next(iter(declared.values()))[0]):
+            fail(f"manifest.artifacts.{family}_v1_path differs from its single-sample array")
+        if list(declared) != sorted(declared):
+            fail(f"manifest.artifacts.{key} must be ordered by sample index")
+        paths[family] = declared
+    if not any(paths.values()):
+        if any(f"{family}_v1_paths" in artifacts for family in families):
+            fail("explicit nonshared operator replay arrays must cover computed samples")
+        return {
+            "status": "NOT_VERIFIED",
+            "reason": "nonshared exact sidecar declarations absent",
+            "native_input_diagnostics": native_input_coverage,
+        }
+    indices = set(paths[families[0]])
+    if not indices or any(set(paths[family]) != indices for family in families):
+        fail("nonshared operator replay sidecars have incomplete sample coverage")
+    if computed_sample_indices is not None and indices != computed_sample_indices:
+        fail("nonshared operator replay sidecars differ from computed sample coverage")
+    native_indices = set(native_input_coverage["sample_indices"])
+    if native_input_coverage["structural_complete"] and native_indices != indices:
+        fail(
+            "manifest.artifacts native-input diagnostic sample index set must "
+            "match nonshared operator replay samples"
+        )
+    reports = {}
+    for index in sorted(indices):
+        try:
+            report = replay_nonshared_operator(
+                root, sample_index=index,
+                identity_path=Path(paths[families[0]][index][0]),
+                identity_preimage_path=Path(paths[families[1]][index][0]),
+                source_state_path=Path(paths[families[2]][index][0]),
+                read_bytes=(
+                    None
+                    if bundle_reader is None
+                    else lambda relative, maximum_bytes: bundle_reader.read_bytes(
+                        relative, maximum_bytes=maximum_bytes
+                    )
+                ),
+                has_member=(
+                    None if bundle_reader is None else bundle_reader.has_member
+                ),
+            )
+        except NonSharedReplayError as error:
+            fail(f"nonshared operator replay sample {index}: {error}")
+        reports[str(index)] = report.as_dict()
+        if native_input_coverage["structural_complete"] and "native_input_diagnostics" not in report.exact_refs_verified:
+            fail(
+                f"nonshared operator replay sample {index} did not verify the "
+                "declared native-input diagnostic sidecar"
+            )
+    return {
+        "status": "nonshared_exact_operator_relations_replayed",
+        "reports_by_sample": reports,
+        "native_input_diagnostics": native_input_coverage,
+        "native_operator_replay_status": "NOT_VERIFIED",
+        "scientific_qualification": "NOT_VERIFIED",
+    }
+
+
+def validate_producer_payload_replay(
+    root: Path,
+    manifest: dict,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> dict[str, object]:
+    """Replay producer payloads when v2 identity is available, independently of assembly.
+
+    This source-only gate neither validates the modal assembly family nor
+    replaces the later equilibrium/state validators or operator replay.
+    Nonshared bundles without this identity need their separate source-state
+    replay; no shared identity is inferred or fabricated for them.
+    """
+    root = root.resolve()
+    artifacts = manifest.get("artifacts", {})
+    producers = _declared_r4_sidecar_paths(
+        root,
+        artifacts,
+        "producer_provenance_v1_paths",
+        "producer_provenance.v1.json",
+        bundle_reader,
+    )
+    if not producers:
+        return {"status": "NOT_VERIFIED", "reason": "producer provenance absent"}
+    identities = _declared_r4_sidecar_paths(
+        root,
+        artifacts,
+        R4_IDENTITY_SIDECAR_KEY,
+        "linearization_identity.v2.json",
+        bundle_reader,
+    )
+    if not identities:
+        return {"status": "NOT_VERIFIED", "reason": "shared identity absent; nonshared replay required"}
+    preimages = _declared_r4_sidecar_paths(
+        root,
+        artifacts,
+        R4_IDENTITY_PREIMAGE_KEY,
+        "linearization_identity_preimage.v1.json",
+        bundle_reader,
+    )
+    if not preimages:
+        return {"status": "NOT_VERIFIED", "reason": "identity exact preimage absent"}
+    pairs = _state_path_pairs(
+        root, manifest, schema="v8", bundle_reader=bundle_reader
+    ) or _state_path_pairs(
+        root, manifest, schema="v7", bundle_reader=bundle_reader
+    )
+    if not pairs:
+        return {"status": "NOT_VERIFIED", "reason": "equilibrium/state artifacts absent"}
+    state_by_index = {
+        (_r4_sidecar_sample_index(relative, eq.name, "producer replay equilibrium path") if key else 0): (relative, eq, state)
+        for relative, eq, state, key in pairs
+    }
+    if set(producers) != set(identities) or set(producers) != set(preimages) or set(producers) != set(state_by_index):
+        fail("producer payload replay sample coverage differs from identity/equilibrium/state")
+    from fem_producer_provenance_replay import (
+        ProducerArtifactPaths, ProducerProvenanceReplayError, replay_producer_provenance,
+    )
+    reports = {}
+    for index, (_, producer_path) in producers.items():
+        identity_path = identities[index][1]
+        try:
+            identity = strict_json_object(
+                _read_artifact_bytes(
+                    identity_path,
+                    maximum_bytes=frequency_domain_generation.DEFAULT_MAX_JSON_BYTES,
+                    bundle_reader=bundle_reader,
+                    name="linearization identity",
+                ),
+                "linearization identity",
+            )
+        except IdentityReplayError as error:
+            fail(f"producer payload replay sample {index}: {error}")
+        if type(identity.get("sample_index")) is not int:
+            fail("producer replay identity sample_index must be an integer")
+        require_equal(identity.get("sample_index"), index, "producer replay identity sample_index")
+        relative, eq_path, state_path = state_by_index[index]
+        eq = load_json(eq_path, bundle_reader)
+        state = load_json(state_path, bundle_reader)
+        for prefix, path, payload in (
+            ("equilibrium_artifact", eq_path, eq), ("linearization_state", state_path, state),
+        ):
+            require_equal(identity.get(prefix + "_path"), path.relative_to(root).as_posix(), prefix + " replay path")
+            require_equal(identity.get(prefix + "_sha256"), payload.get("content_sha256"), prefix + " replay content")
+            require_equal(identity.get(prefix + "_schema"), payload.get("schema_version"), prefix + " replay schema")
+        payload_paths = {}
+        for name, field in (
+            ("accepted_fields", "accepted_fields_path"),
+            ("certified_fields", "certified_fields_path"),
+            ("recomputed_certificate", "recomputed_certificate_path"),
+        ):
+            payload_paths[name] = require_bundle_path(
+                root, identity.get(field), field, bundle_reader
+            )[1]
+        try:
+            report = replay_producer_provenance(
+                ProducerArtifactPaths(
+                    producer_root=root.resolve(), provenance_path=producer_path,
+                    equilibrium_magnetization_path=eq_path, identity_path=identity_path,
+                    identity_preimage_path=preimages[index][1], payload_paths=payload_paths,
+                ),
+                expected_source_run_id=identity.get("source_run_id"),
+                expected_source_stage_id=identity.get("source_stage_id"),
+                expected_source_stage_kind=identity.get("source_stage_kind"),
+                expected_source_snapshot_sha256=identity.get("consumer_source_snapshot_sha256"),
+                read_bytes=(
+                    None
+                    if bundle_reader is None
+                    else lambda path, maximum_bytes: _read_artifact_bytes(
+                        path,
+                        maximum_bytes=maximum_bytes,
+                        bundle_reader=bundle_reader,
+                        name="producer replay member",
+                    )
+                ),
+            )
+        except ProducerProvenanceReplayError as error:
+            fail(f"producer payload replay sample {index}: {error}")
+        reports[str(index)] = {
+            "status": report.status, "identity_content_sha256": report.identity_content_sha256,
+            "producer_sidecar_raw_sha256": report.sidecar_raw_sha256,
+            "scientific_qualification": report.scientific_qualification,
+        }
+    return {"status": "source_payloads_replayed", "samples": reports, "operator_replay_status": "NOT_VERIFIED"}
+
+
+def _declared_state_paths(
+    root: Path,
+    artifacts: object,
+    stem: str,
+    filename: str,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> list[tuple[str, Path, str]]:
+    if not isinstance(artifacts, dict):
+        return []
+    singular_key = stem + "_path"
+    plural_key = stem + "_paths"
+    singular = artifacts.get(singular_key)
+    plural = artifacts.get(plural_key)
+    if singular is not None and plural is not None:
+        fail(f"manifest.artifacts.{singular_key} and {plural_key} are ambiguous")
+    if singular is not None:
+        relative_path, artifact_path = require_bundle_path(
+            root,
+            singular,
+            f"manifest.artifacts.{singular_key}",
+            bundle_reader,
+        )
+        require_equal(
+            relative_path,
+            f"eigen/metadata/{filename}",
+            f"manifest.artifacts.{singular_key}",
+        )
+        return [(relative_path, artifact_path, "")]
+    if plural is None:
+        return []
+    if (
+        not isinstance(plural, list)
+        or not plural
+        or any(not isinstance(item, str) for item in plural)
+        or len(set(plural)) != len(plural)
+    ):
+        fail(f"manifest.artifacts.{plural_key} must be a non-empty unique list")
+    result: list[tuple[str, Path, str]] = []
+    sample_keys: set[str] = set()
+    for index, item in enumerate(plural):
+        relative_path, artifact_path = require_bundle_path(
+            root,
+            item,
+            f"manifest.artifacts.{plural_key}[{index}]",
+            bundle_reader,
+        )
+        sample_key = _state_sample_key(relative_path, filename)
+        if sample_key in sample_keys:
+            fail(
+                f"manifest.artifacts.{plural_key} contains duplicate sample key "
+                f"{sample_key!r}"
+            )
+        sample_keys.add(sample_key)
+        result.append((relative_path, artifact_path, sample_key))
+    return result
+
+
+def _state_path_pairs(
+    root: Path,
+    manifest: dict,
+    *,
+    schema: str,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> list[tuple[str, Path, Path, str]]:
+    artifacts = manifest.get("artifacts")
+    if schema == "v8":
+        equilibrium_stem, equilibrium_filename = (
+            "equilibrium_artifact_v8",
+            "equilibrium_artifact.v8.json",
+        )
+        state_stem, state_filename = (
+            "linearization_state_v7",
+            "linearization_state.v7.json",
+        )
+    else:
+        equilibrium_stem, equilibrium_filename = (
+            "equilibrium_artifact_v7",
+            "equilibrium_artifact.v7.json",
+        )
+        state_stem, state_filename = (
+            "linearization_state_v6",
+            "linearization_state.v6.json",
+        )
+    equilibria = _declared_state_paths(
+        root, artifacts, equilibrium_stem, equilibrium_filename, bundle_reader
+    )
+    states = _declared_state_paths(
+        root, artifacts, state_stem, state_filename, bundle_reader
+    )
+    if bool(equilibria) != bool(states):
+        fail(
+            f"manifest.artifacts {schema} equilibrium/state paths must be "
+            "declared together"
+        )
+    if not equilibria:
+        return []
+    equilibrium_by_key = {sample_key: (relative, path) for relative, path, sample_key in equilibria}
+    state_by_key = {sample_key: (relative, path) for relative, path, sample_key in states}
+    if set(equilibrium_by_key) != set(state_by_key):
+        fail(
+            f"manifest.artifacts {schema} equilibrium/state sample filename keys "
+            "do not match"
+        )
+    return [
+        (equilibrium_by_key[key][0], equilibrium_by_key[key][1], state_by_key[key][1], key)
+        for key in sorted(equilibrium_by_key)
+    ]
+
+
+def validate_linearization_handoff_diagnostics(
+    payload: object, *, expected_equilibrium_schema: str, expected_state_schema: str, name: str
+) -> bool:
+    if not isinstance(payload, dict) or "linearization_handoff" not in payload:
+        return False
+    handoff = payload.get("linearization_handoff")
+    if not isinstance(handoff, dict):
+        fail(f"{name}.linearization_handoff must be an object")
+    require_equal(
+        handoff.get("equilibrium_artifact_schema"),
+        expected_equilibrium_schema,
+        f"{name}.linearization_handoff.equilibrium_artifact_schema",
+    )
+    require_equal(
+        handoff.get("linearization_state_schema"),
+        expected_state_schema,
+        f"{name}.linearization_handoff.linearization_state_schema",
+    )
+    if "accepted_for_frequency_operator" in handoff:
+        require_equal(
+            require_boolean(
+                handoff.get("accepted_for_frequency_operator"),
+                f"{name}.linearization_handoff.accepted_for_frequency_operator",
+            ),
+            True,
+            f"{name}.linearization_handoff.accepted_for_frequency_operator",
+        )
+    return True
+
+
+def validate_equilibrium_artifacts(
+    root: Path,
+    manifest: dict,
+    solver_diagnostics: dict | None = None,
+    *,
+    computed_sample_indices: set[int] | None = None,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> dict[str, object]:
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return _r4_discovery_result(
+            "historical",
+            "R4 sidecar arrays are absent from a historical manifest",
+            computed_sample_indices=computed_sample_indices,
+        )
+    r4_discovery = validate_r4_signed_sidecars(
+        root,
+        artifacts,
+        computed_sample_indices=computed_sample_indices,
+        bundle_reader=bundle_reader,
+    )
+    r4_discovery["producer_provenance_discovery"] = validate_producer_provenance_discovery(
+        root, artifacts, computed_sample_indices, bundle_reader,
+    )
+    r4_discovery["consumer_plan_replay"] = validate_consumer_plan_exact_replay(
+        root, artifacts, computed_sample_indices, bundle_reader,
+    )
+    r4_discovery["producer_payload_replay"] = validate_producer_payload_replay(
+        root, manifest, bundle_reader
+    )
+    r4_discovery["nonshared_operator_replay"] = validate_nonshared_operator_replay(
+        root, artifacts, computed_sample_indices, bundle_reader,
+    )
+    def has_declared_path(keys: tuple[str, ...]) -> bool:
+        return any(
+            key in artifacts
+            and artifacts.get(key) is not None
+            and artifacts.get(key) != []
+            for key in keys
+        )
+
+    v8_keys = {
+        "equilibrium_artifact_v8_path",
+        "equilibrium_artifact_v8_paths",
+        "linearization_state_v7_path",
+        "linearization_state_v7_paths",
+    }
+    v7_keys = {
+        "equilibrium_artifact_v7_path",
+        "equilibrium_artifact_v7_paths",
+        "linearization_state_v6_path",
+        "linearization_state_v6_paths",
+    }
+    for key in v8_keys | v7_keys:
+        if key not in artifacts:
+            continue
+        value = artifacts.get(key)
+        if key.endswith("_paths"):
+            if not isinstance(value, list):
+                fail(f"manifest.artifacts.{key} must be a list")
+        elif not isinstance(value, str) or not value.strip():
+            fail(f"manifest.artifacts.{key} must be a non-empty path")
+
+    has_v8 = has_declared_path(tuple(v8_keys))
+    has_v7 = has_declared_path(tuple(v7_keys))
+    if has_v8 and has_v7:
+        fail("manifest.artifacts cannot mix v8/v7 and legacy v7/v6 state paths")
+    if has_v8:
+        pairs = _state_path_pairs(
+            root, manifest, schema="v8", bundle_reader=bundle_reader
+        )
+        expected_equilibrium_sha = manifest.get("equilibrium_artifact_sha256")
+        expected_state_sha = manifest.get("linearization_state_sha256")
+        for index, (relative, equilibrium_path, state_path, sample_key) in enumerate(pairs):
+            equilibrium = load_json(equilibrium_path, bundle_reader)
+            state = load_json(state_path, bundle_reader)
+            expected_eq = expected_equilibrium_sha if len(pairs) == 1 else None
+            expected_state = expected_state_sha if len(pairs) == 1 else None
+            validate_equilibrium_artifact_v8_payload(equilibrium, expected_eq)
+            validate_linearization_state_v7_payload(state, equilibrium, expected_state)
+        handoff_found = False
+        for name, payload in (
+            ("manifest.diagnostics", manifest.get("diagnostics")),
+            ("solver_diagnostics", solver_diagnostics),
+        ):
+            handoff_found = validate_linearization_handoff_diagnostics(
+                payload,
+                expected_equilibrium_schema="equilibrium_artifact.v8",
+                expected_state_schema="LinearizationState.v7",
+                name=name,
+            ) or handoff_found
+        if not handoff_found:
+            fail("v8/v7 artifacts require linearization_handoff diagnostics")
+        return r4_discovery
+    if has_v7:
+        validate_equilibrium_artifact_v7(root, manifest, bundle_reader)
+        has_v7_state = any(
+            key in artifacts
+            for key in (
+                "linearization_state_v6_path",
+                "linearization_state_v6_paths",
+            )
+        )
+        if not has_v7_state:
+            return r4_discovery
+        pairs = _state_path_pairs(
+            root, manifest, schema="v7", bundle_reader=bundle_reader
+        )
+        expected_equilibrium_sha = manifest.get("equilibrium_artifact_sha256")
+        expected_state_sha = manifest.get("linearization_state_sha256")
+        for relative, equilibrium_path, state_path, sample_key in pairs:
+            equilibrium = load_json(equilibrium_path, bundle_reader)
+            state = load_json(state_path, bundle_reader)
+            expected_eq = expected_equilibrium_sha if len(pairs) == 1 else None
+            expected_state = expected_state_sha if len(pairs) == 1 else None
+            validate_equilibrium_artifact_v7_payload(equilibrium, expected_eq)
+            validate_linearization_state_v6_payload(state, equilibrium, expected_state)
+        handoff_found = False
+        for name, payload in (
+            ("manifest.diagnostics", manifest.get("diagnostics")),
+            ("solver_diagnostics", solver_diagnostics),
+        ):
+            handoff_found = validate_linearization_handoff_diagnostics(
+                payload,
+                expected_equilibrium_schema="equilibrium_artifact.v7",
+                expected_state_schema="LinearizationState.v6",
+                name=name,
+            ) or handoff_found
+    return r4_discovery
+
+
+def validate_equilibrium_artifact_v7(
+    root: Path,
+    manifest: dict,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
+    paths = _declared_state_paths(
+        root,
+        manifest.get("artifacts"),
+        "equilibrium_artifact_v7",
+        "equilibrium_artifact.v7.json",
+        bundle_reader,
+    )
+    if not paths:
+        return
+    expected_content_sha256 = manifest.get("equilibrium_artifact_sha256")
+    for _, artifact_path, _ in paths:
+        validate_equilibrium_artifact_v7_payload(
+            load_json(artifact_path, bundle_reader),
+            expected_content_sha256 if len(paths) == 1 else None,
+        )
+
+
 def validate_periodic_mesh_certificate(
     certificate: object,
     *,
@@ -172,6 +2214,13 @@ def validate_periodic_mesh_certificate(
         certificate.get("magnetic_pair_map_sha256"),
         f"{name}.magnetic_pair_map_sha256",
     )
+
+
+def report_r4_discovery(result: dict[str, object]) -> None:
+    """Report the separate, currently unverified R4 replay gate."""
+    status = require_non_empty_string(result.get("status"), "R4 discovery.status")
+    reason = require_non_empty_string(result.get("reason"), "R4 discovery.reason")
+    print(f"R4 replay NOT VERIFIED [{status}]: {reason}", file=sys.stderr)
 
 
 def require_finite_number(value: object, name: str) -> float:
@@ -225,7 +2274,7 @@ def median(values: list[float]) -> float:
 
 
 def require_non_negative_int(value: object, name: str) -> int:
-    if not isinstance(value, int) or value < 0:
+    if type(value) is not int or value < 0:
         fail(f"{name} must be a non-negative integer")
     return value
 
@@ -298,11 +2347,111 @@ def require_mode_field_handoff(
     expected_field_id = mode_field_id(sample_index, raw_mode_index)
     expected_resource_key = mode_field_resource_key(expected_field_id)
     require_equal(payload.get("mode_field_id"), expected_field_id, f"{name}.mode_field_id")
+    if payload.get("mode_field_resource_key") is not None:
+        require_equal(
+            payload.get("mode_field_resource_key"),
+            expected_resource_key,
+            f"{name}.mode_field_resource_key",
+        )
+
+
+def expected_mode_id(sample_index: int, raw_mode_index: int) -> str:
+    return f"sample-{sample_index:04d}/mode-{raw_mode_index:04d}"
+
+
+def validate_artifact_mode_identity(
+    payload: dict,
+    name: str,
+    sample_index: int,
+    raw_mode_index: int,
+    sample_ids_by_index: dict[int, str],
+    *,
+    required: bool = False,
+) -> None:
+    publishes_identity = "sample_id" in payload or "mode_id" in payload
+    if not required and not publishes_identity:
+        return
+    expected_sample_id = sample_ids_by_index.get(sample_index)
+    if expected_sample_id is None:
+        fail(
+            f"{name}.sample_id cannot be verified because spectrum sample "
+            f"{sample_index} has no stable sample_id"
+        )
+    require_equal(payload.get("sample_id"), expected_sample_id, f"{name}.sample_id")
     require_equal(
-        payload.get("mode_field_resource_key"),
-        expected_resource_key,
-        f"{name}.mode_field_resource_key",
+        payload.get("mode_id"),
+        expected_mode_id(sample_index, raw_mode_index),
+        f"{name}.mode_id",
     )
+
+
+def validate_json_mode_field_availability(
+    payload: dict,
+    name: str,
+    sample_index: int,
+    raw_mode_index: int,
+) -> bool:
+    if "mode_field_available" in payload:
+        available = require_boolean(
+            payload.get("mode_field_available"),
+            f"{name}.mode_field_available",
+        )
+    else:
+        # Current durable artifacts omit transport routes. An explicit false
+        # remains authoritative; legacy availability follows the stable ID.
+        available = payload.get("mode_field_id") is not None
+    expected_field_id = mode_field_id(sample_index, raw_mode_index)
+    resource_key = payload.get("mode_field_resource_key")
+    if available:
+        require_mode_field_handoff(payload, name, sample_index, raw_mode_index)
+    else:
+        field_id = payload.get("mode_field_id")
+        if field_id is not None:
+            require_equal(field_id, expected_field_id, f"{name}.mode_field_id")
+        if resource_key is not None:
+            fail(
+                f"{name}.mode_field_resource_key must be null when "
+                "mode_field_available is false"
+            )
+    return available
+
+
+def require_csv_boolean(value: object, name: str) -> bool:
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    fail(f"{name} must be the CSV boolean 'true' or 'false'")
+
+
+def validate_csv_mode_field_availability(
+    row: dict[str, str],
+    name: str,
+    sample_index: int,
+    raw_mode_index: int,
+    expected_available: bool,
+    *,
+    has_explicit_availability: bool,
+) -> None:
+    available = (
+        require_csv_boolean(row.get("mode_field_available"), f"{name}.mode_field_available")
+        if has_explicit_availability
+        else expected_available
+    )
+    require_equal(available, expected_available, f"{name}.mode_field_available")
+    expected_field_id = mode_field_id(sample_index, raw_mode_index)
+    field_id = row.get("mode_field_id", "").strip()
+    resource_key = row.get("mode_field_resource_key", "").strip()
+    if available:
+        require_mode_field_handoff(row, name, sample_index, raw_mode_index)
+    else:
+        if field_id:
+            require_equal(field_id, expected_field_id, f"{name}.mode_field_id")
+        if resource_key:
+            fail(
+                f"{name}.mode_field_resource_key must be empty when "
+                "mode_field_available is false"
+            )
 
 
 def require_tracking_summary(payload: dict, name: str) -> None:
@@ -347,10 +2496,20 @@ def require_tracking_method(value: object, name: str, allowed: set[str]) -> str:
     return method
 
 
-def require_mode_payload(root: Path, relative_path: str, name: str) -> int:
+def require_mode_payload(
+    root: Path,
+    relative_path: str,
+    name: str,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> int:
     path = root / relative_path
-    require_file(path)
-    size = path.stat().st_size
+    if bundle_reader is None:
+        require_file(path)
+        size = path.stat().st_size
+    else:
+        size = _verified_member_size(
+            path, bundle_reader=bundle_reader, name=f"{name} payload"
+        )
     if size <= 0:
         fail(f"{name} payload must not be empty")
     if size % 8 != 0:
@@ -367,20 +2526,21 @@ def require_mode_zarr_payload(
     sample_count: int,
     expected_payload_value_count: int,
     name: str,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> int:
     zarray_path = root / array_path / ".zarray"
     zattrs_path = root / array_path / ".zattrs"
     chunk_path = root / array_path / "0.0.0"
-    require_file(zarray_path)
-    require_file(zattrs_path)
-    require_file(chunk_path)
-    zarray = load_json(zarray_path)
+    require_file(zarray_path, bundle_reader)
+    require_file(zattrs_path, bundle_reader)
+    require_file(chunk_path, bundle_reader)
+    zarray = load_json(zarray_path, bundle_reader)
     require_equal(zarray.get("zarr_format"), 2, f"{name}.zarray.zarr_format")
     require_equal(zarray.get("shape"), [sample_count, 3, 2], f"{name}.zarray.shape")
     require_equal(zarray.get("chunks"), [max(sample_count, 1), 3, 2], f"{name}.zarray.chunks")
     require_equal(zarray.get("dtype"), "<f8", f"{name}.zarray.dtype")
     require_equal(zarray.get("order"), "C", f"{name}.zarray.order")
-    zattrs = load_json(zattrs_path)
+    zattrs = load_json(zattrs_path, bundle_reader)
     require_equal(zattrs.get("quantity_id"), "delta_m", f"{name}.zattrs.quantity_id")
     require_equal(zattrs.get("unit"), "1", f"{name}.zattrs.unit")
     require_equal(
@@ -408,22 +2568,30 @@ def require_mode_zarr_payload(
         ["real", "imag"],
         f"{name}.zattrs.complex_order",
     )
-    size = chunk_path.stat().st_size
+    if bundle_reader is None:
+        size = chunk_path.stat().st_size
+    else:
+        size = _verified_member_size(
+            chunk_path, bundle_reader=bundle_reader, name=f"{name} chunk"
+        )
     expected_size = expected_payload_value_count * 8
     if size != expected_size:
         fail(f"{name} Zarr chunk byte size: got {size}, expected {expected_size}")
     return size // 8
 
 
-def require_mode_zarr_store(root: Path) -> None:
+def require_mode_zarr_store(
+    root: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
     store_root = root / mode_zarr_store_path()
     zgroup_path = store_root / ".zgroup"
     zattrs_path = store_root / ".zattrs"
-    require_file(zgroup_path)
-    require_file(zattrs_path)
-    zgroup = load_json(zgroup_path)
+    require_file(zgroup_path, bundle_reader)
+    require_file(zattrs_path, bundle_reader)
+    zgroup = load_json(zgroup_path, bundle_reader)
     require_equal(zgroup.get("zarr_format"), 2, "mode_fields.zarr/.zgroup.zarr_format")
-    zattrs = load_json(zattrs_path)
+    zattrs = load_json(zattrs_path, bundle_reader)
     require_equal(
         zattrs.get("fullmag_kind"),
         "frequency_domain_mode_field_store",
@@ -481,6 +2649,54 @@ def require_mode_metadata_summaries(metadata: dict, metadata_path: str) -> None:
         sample_count,
         f"{metadata_path}.component_summary.imag_sample_count",
     )
+
+
+def require_mode_source_mesh_identity(
+    metadata: dict,
+    metadata_path: str,
+    sample_count: int,
+) -> None:
+    identity = metadata.get("source_mesh_identity")
+    if not isinstance(identity, dict):
+        fail(f"{metadata_path}.source_mesh_identity must be an object")
+    require_non_empty_string(
+        identity.get("mesh_id"),
+        f"{metadata_path}.source_mesh_identity.mesh_id",
+    )
+    topology_fingerprint = require_sha256_token(
+        identity.get("topology_fingerprint"),
+        f"{metadata_path}.source_mesh_identity.topology_fingerprint",
+    )
+    source_mesh_topology_sha256 = metadata.get("source_mesh_topology_sha256")
+    if source_mesh_topology_sha256 is not None:
+        require_equal(
+            require_sha256_token(
+                source_mesh_topology_sha256,
+                f"{metadata_path}.source_mesh_topology_sha256",
+            ),
+            topology_fingerprint,
+            f"{metadata_path}.source_mesh_topology_sha256 vs source_mesh_identity.topology_fingerprint",
+        )
+    require_equal(
+        identity.get("indexing"),
+        "full_domain_node_order",
+        f"{metadata_path}.source_mesh_identity.indexing",
+    )
+    require_equal(
+        identity.get("node_count"),
+        sample_count,
+        f"{metadata_path}.source_mesh_identity.node_count",
+    )
+    if identity.get("mesh_generation_id") is not None:
+        require_non_empty_string(
+            identity.get("mesh_generation_id"),
+            f"{metadata_path}.source_mesh_identity.mesh_generation_id",
+        )
+    if identity.get("mesh_revision") is not None:
+        require_non_negative_int(
+            identity.get("mesh_revision"),
+            f"{metadata_path}.source_mesh_identity.mesh_revision",
+        )
 
 
 def require_mode_field_metadata(
@@ -616,10 +2832,14 @@ def validate_manifest_physics(manifest: dict) -> None:
         "manifest.physics.analysis_family",
     )
     phase_convention = physics.get("phase_convention")
-    if phase_convention not in {"exp_i_omega_t", "exp_minus_i_omega_t"}:
+    if phase_convention not in {
+        "exp_i_omega_t",
+        "exp_plus_i_omega_t",
+        "exp_minus_i_omega_t",
+    }:
         fail(
-            "manifest.physics.phase_convention must be exp_i_omega_t "
-            "or exp_minus_i_omega_t"
+            "manifest.physics.phase_convention must be exp_i_omega_t, "
+            "exp_plus_i_omega_t, or exp_minus_i_omega_t"
         )
     require_equal(
         physics.get("frequency_units"),
@@ -635,6 +2855,32 @@ def validate_manifest_physics(manifest: dict) -> None:
         physics.get("normalization"),
         "manifest.physics.normalization",
     )
+    validation = manifest.get("validation")
+    if isinstance(validation, dict):
+        frequency_source = validation.get("dispersion_frequency_source")
+        reference_model = validation.get("dispersion_reference_model")
+        comparison_source = "numeric_modal_solver_with_analytic_comparison"
+        if frequency_source == comparison_source:
+            require_non_empty_string(
+                reference_model,
+                "manifest.validation.dispersion_reference_model",
+            )
+        elif frequency_source == "numeric_modal_solver" and reference_model is not None:
+            fail(
+                "manifest.validation.dispersion_reference_model must be null "
+                "for numeric_modal_solver without a comparison"
+            )
+
+
+def validate_mode_gamma_matches_constants(mode: dict, constants: dict, name: str) -> None:
+    """Bind modal gamma provenance to the execution constants, not merely to its SI conversion."""
+    for field in ("gamma0_rad_s_per_A_m", "gamma_rad_s_T", "mu0_T_m_per_A"):
+        actual = require_finite_number(mode.get(field), f"{name}.{field}")
+        expected = require_finite_number(constants.get(field), f"execution.constants.{field}")
+        if actual <= 0 or expected <= 0:
+            fail(f"{name}.{field} and execution.constants.{field} must be positive")
+        require_close(actual, expected, f"{name}.{field} vs execution constants",
+                      relative_tolerance=1e-12, absolute_tolerance=0.0)
 
 
 def validate_mode_diagnostics_fields(
@@ -642,6 +2888,17 @@ def validate_mode_diagnostics_fields(
     payload_path: str,
     frequency_hz: float,
 ) -> None:
+    relax_to_eigen_handoff_sha256 = payload.get("relax_to_eigen_handoff_sha256")
+    source_mesh_topology_sha256 = payload.get("source_mesh_topology_sha256")
+    if relax_to_eigen_handoff_sha256 is not None or source_mesh_topology_sha256 is not None:
+        require_sha256_token(
+            relax_to_eigen_handoff_sha256,
+            f"{payload_path}.relax_to_eigen_handoff_sha256",
+        )
+        require_sha256_token(
+            source_mesh_topology_sha256,
+            f"{payload_path}.source_mesh_topology_sha256",
+        )
     frequency_imag_hz = require_finite_number(
         payload.get("frequency_imag_hz"),
         f"{payload_path}.frequency_imag_hz",
@@ -836,6 +3093,8 @@ def require_mode_metadata_matches_summary(
     for field_name in [
         "phasor_convention",
         "eigenvalue_mapping",
+        "relax_to_eigen_handoff_sha256",
+        "source_mesh_topology_sha256",
     ]:
         require_equal(
             metadata.get(field_name),
@@ -870,6 +3129,8 @@ def require_eigen_summary_mode_matches_spectrum(
     for field_name in [
         "phasor_convention",
         "eigenvalue_mapping",
+        "relax_to_eigen_handoff_sha256",
+        "source_mesh_topology_sha256",
     ]:
         require_equal(
             mode.get(field_name),
@@ -906,16 +3167,27 @@ def validate_mode_summary(
     manifest_mode_resources: set[str],
     requested_window_hz: list[float] | None,
     require_zarr_mode_fields: bool,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> tuple[int, int, float, float, float, float]:
     raw_mode_index = require_non_negative_int(mode.get("raw_mode_index"), "mode.raw_mode_index")
     expected_field_id = mode_field_id(sample_index, raw_mode_index)
     expected_resource_key = mode_field_resource_key(expected_field_id)
-    require_equal(mode.get("mode_field_id"), expected_field_id, "mode.mode_field_id")
-    require_equal(
-        mode.get("mode_field_resource_key"),
-        expected_resource_key,
-        "mode.mode_field_resource_key",
+    has_field_id = mode.get("mode_field_id") is not None
+    has_resource_key = mode.get("mode_field_resource_key") is not None
+    if has_resource_key and not has_field_id:
+        fail("mode.mode_field_id is required for a legacy mode field resource key")
+    field_available = (
+        require_boolean(mode.get("mode_field_available"), "mode.mode_field_available")
+        if "mode_field_available" in mode else has_field_id
     )
+    if field_available:
+        require_mode_field_handoff(mode, "mode", sample_index, raw_mode_index)
+    else:
+        if has_field_id:
+            require_equal(mode.get("mode_field_id"), expected_field_id, "mode.mode_field_id")
+        if has_resource_key:
+            fail("mode.mode_field_resource_key must be null when mode.mode_field_available is false"
+            )
     frequency_hz = require_finite_number(mode.get("frequency_hz"), "mode.frequency_hz")
     require_frequency_inside_window(frequency_hz, requested_window_hz, "mode.frequency_hz")
     frequency_real_hz = require_finite_number(mode.get("frequency_real_hz"), "mode.frequency_real_hz")
@@ -937,10 +3209,20 @@ def validate_mode_summary(
     validate_mode_diagnostics_fields(mode, "mode", frequency_hz)
     require_non_empty_string(mode.get("dominant_polarization"), "mode.dominant_polarization")
 
+    if not field_available:
+        return (
+            sample_index,
+            raw_mode_index,
+            frequency_hz,
+            frequency_real_hz,
+            frequency_imag_hz,
+            angular_frequency_rad_per_s,
+        )
+
     metadata_path = nested_mode_path(sample_index, raw_mode_index)
     if manifest_mode_paths and metadata_path not in manifest_mode_paths:
         fail(f"manifest.artifacts.mode_metadata_paths missing {metadata_path}")
-    metadata = load_json(root / metadata_path)
+    metadata = load_json(root / metadata_path, bundle_reader)
     require_equal(metadata.get("sample_index"), sample_index, f"{metadata_path}.sample_index")
     require_equal(
         metadata.get("raw_mode_index"),
@@ -948,11 +3230,12 @@ def validate_mode_summary(
         f"{metadata_path}.raw_mode_index",
     )
     require_equal(metadata.get("mode_field_id"), expected_field_id, f"{metadata_path}.mode_field_id")
-    require_equal(
-        metadata.get("mode_field_resource_key"),
-        expected_resource_key,
-        f"{metadata_path}.mode_field_resource_key",
-    )
+    if metadata.get("mode_field_resource_key") is not None:
+        require_equal(
+            metadata.get("mode_field_resource_key"),
+            expected_resource_key,
+            f"{metadata_path}.mode_field_resource_key",
+        )
     metadata_frequency_hz = require_finite_number(
         metadata.get("frequency_hz"),
         f"{metadata_path}.frequency_hz",
@@ -980,6 +3263,14 @@ def validate_mode_summary(
     require_mode_metadata_matches_summary(mode, metadata, metadata_path)
     validate_mode_diagnostics_fields(metadata, metadata_path, frequency_hz)
     require_mode_metadata_summaries(metadata, metadata_path)
+    require_mode_source_mesh_identity(
+        metadata,
+        metadata_path,
+        require_non_negative_int(
+            metadata.get("mode_field_sample_count"),
+            f"{metadata_path}.mode_field_sample_count",
+        ),
+    )
     require_mode_field_metadata(
         metadata,
         metadata_path,
@@ -1005,6 +3296,7 @@ def validate_mode_summary(
             ),
             payload_value_count,
             f"mode {sample_index}/{raw_mode_index}",
+            bundle_reader,
         )
         require_equal(
             zarr_payload_value_count,
@@ -1015,6 +3307,7 @@ def validate_mode_summary(
         root,
         mode_payload_path(sample_index, raw_mode_index),
         f"mode {sample_index}/{raw_mode_index}",
+        bundle_reader,
     )
     require_equal(
         metadata.get("payload_value_count"),
@@ -1106,6 +3399,7 @@ def validate_eigen_summary(
             spectrum_mode,
             summary_mode_path,
         )
+        validate_mode_gamma_matches_constants(mode, constants, summary_mode_path)
         validate_mode_diagnostics_fields(
             mode,
             summary_mode_path,
@@ -1144,6 +3438,10 @@ def validate_solver_window_diagnostics(
     *,
     require_window: bool,
 ) -> list[float] | None:
+    if diagnostics.get("target_kind") == "nearest_frequency":
+        if require_window:
+            fail("solver diagnostics require a frequency_window target")
+        return None
     if "window_completeness" not in diagnostics:
         if require_window:
             fail("solver_diagnostics.window_completeness is required")
@@ -1208,8 +3506,132 @@ def validate_solver_window_diagnostics(
                 f"solver_diagnostics.window_completeness.{key}",
             )
 
+    top_level_subwindows = diagnostics.get("subwindows")
+    if top_level_subwindows is None and "sample_solver_diagnostics" in diagnostics:
+        sample_diagnostics = require_object_list(
+            diagnostics.get("sample_solver_diagnostics"),
+            "solver_diagnostics.sample_solver_diagnostics",
+        )
+        sample_count = require_non_negative_int(
+            diagnostics.get("sample_count"),
+            "solver_diagnostics.sample_count",
+        )
+        if not sample_diagnostics or len(sample_diagnostics) != sample_count:
+            fail(
+                "solver_diagnostics.sample_solver_diagnostics must contain one entry "
+                "per field/k sample"
+            )
+        seen_sample_indices: set[int] = set()
+        valid_sample_statuses = {"ok", "unavailable", "validation_error", "operator_error", "solve_error"}
+        for sample_position, sample in enumerate(sample_diagnostics):
+            sample_name = f"solver_diagnostics.sample_solver_diagnostics[{sample_position}]"
+            sample_index = require_non_negative_int(
+                sample.get("sample_index"),
+                f"{sample_name}.sample_index",
+            )
+            if sample_index in seen_sample_indices:
+                fail(f"{sample_name}.sample_index must be unique")
+            seen_sample_indices.add(sample_index)
+            executed = sample.get("diagnostics")
+            if not isinstance(executed, dict):
+                fail(f"{sample_name}.diagnostics must be an object")
+            if "requested_window_hz" in executed:
+                sample_requested = require_frequency_pair(
+                    executed.get("requested_window_hz"),
+                    f"{sample_name}.diagnostics.requested_window_hz",
+                )
+                require_close(sample_requested[0], requested[0], f"{sample_name}.diagnostics.requested_window_hz[0]")
+                require_close(sample_requested[1], requested[1], f"{sample_name}.diagnostics.requested_window_hz[1]")
+            subwindows = require_object_list(
+                executed.get("subwindows"),
+                f"{sample_name}.diagnostics.subwindows",
+            )
+            if not subwindows:
+                fail(f"{sample_name}.diagnostics.subwindows must not be empty")
+            seen_subwindow_indices: set[int] = set()
+            for subwindow_position, subwindow in enumerate(subwindows):
+                name = f"{sample_name}.diagnostics.subwindows[{subwindow_position}]"
+                subwindow_index = require_non_negative_int(
+                    subwindow.get("subwindow_index"),
+                    f"{name}.subwindow_index",
+                )
+                if subwindow_index in seen_subwindow_indices:
+                    fail(f"{name}.subwindow_index must be unique within its sample")
+                seen_subwindow_indices.add(subwindow_index)
+                shift_frequency_hz = require_finite_number(
+                    subwindow.get("shift_frequency_hz"),
+                    f"{name}.shift_frequency_hz",
+                )
+                if shift_frequency_hz < requested[0] or shift_frequency_hz > requested[1]:
+                    fail(f"{name}.shift_frequency_hz must be inside requested_window_hz")
+                if subwindow.get("status") not in valid_sample_statuses:
+                    fail(f"{name}.status is invalid")
+                require_non_negative_int(
+                    subwindow.get("converged_eigenpair_count"),
+                    f"{name}.converged_eigenpair_count",
+                )
+                candidate_mode_count = None
+                if "candidate_mode_count" in subwindow:
+                    candidate_mode_count = require_non_negative_int(
+                        subwindow.get("candidate_mode_count"),
+                        f"{name}.candidate_mode_count",
+                    )
+                candidate_count_kind = subwindow.get("candidate_mode_count_kind")
+                raw_ritz_in_window_count = None
+                if candidate_count_kind is not None:
+                    if candidate_count_kind != "raw_ritz_in_window":
+                        fail(f"{name}.candidate_mode_count_kind is invalid")
+                    raw_ritz_in_window_count = require_non_negative_int(
+                        subwindow.get("raw_ritz_in_window_count"),
+                        f"{name}.raw_ritz_in_window_count",
+                    )
+                    if candidate_mode_count != raw_ritz_in_window_count:
+                        fail(
+                            f"{name}.candidate_mode_count must match "
+                            "raw_ritz_in_window_count"
+                        )
+                accepted_mode_count = require_non_negative_int(
+                    subwindow.get("accepted_mode_count"),
+                    f"{name}.accepted_mode_count",
+                )
+                for counter_name in (
+                    "action_residual_evaluated_count",
+                    "reconstructed_mode_count",
+                    "full_residual_accepted_count",
+                ):
+                    if counter_name in subwindow:
+                        require_non_negative_int(
+                            subwindow.get(counter_name), f"{name}.{counter_name}"
+                        )
+                if (
+                    candidate_mode_count is not None
+                    and accepted_mode_count > candidate_mode_count
+                ):
+                    fail(f"{name}.accepted_mode_count must not exceed candidate_mode_count")
+                if (
+                    raw_ritz_in_window_count is not None
+                    and accepted_mode_count > raw_ritz_in_window_count
+                ):
+                    fail(
+                        f"{name}.accepted_mode_count must not exceed "
+                        "raw_ritz_in_window_count"
+                    )
+                accepted_frequencies = subwindow.get("accepted_frequencies_hz")
+                if not isinstance(accepted_frequencies, list):
+                    fail(f"{name}.accepted_frequencies_hz must be a list")
+                if len(accepted_frequencies) != accepted_mode_count:
+                    fail(f"{name}.accepted_frequencies_hz must match accepted_mode_count")
+                for frequency_position, frequency in enumerate(accepted_frequencies):
+                    value = require_finite_number(
+                        frequency,
+                        f"{name}.accepted_frequencies_hz[{frequency_position}]",
+                    )
+                    if value < 0.0:
+                        fail(f"{name}.accepted_frequencies_hz must be non-negative")
+        return requested
+
     subwindows = require_object_list(
-        diagnostics.get("subwindows"),
+        top_level_subwindows,
         "solver_diagnostics.subwindows",
     )
     if not subwindows:
@@ -1896,11 +4318,12 @@ def validate_production_modal_k_path_scope(
 def validate_reference_full_2x2_floquet_mode_metadata(
     root: Path,
     mode_metadata_paths: set[str],
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     if not mode_metadata_paths:
         fail("manifest.artifacts.mode_metadata_paths must not be empty")
     for metadata_path in sorted(mode_metadata_paths):
-        metadata = load_json(root / metadata_path)
+        metadata = load_json(root / metadata_path, bundle_reader)
         if metadata.get("solver_model") == "cpu_full_2x2_phase_reduced_floquet":
             return
     fail(
@@ -1975,19 +4398,32 @@ def vector_distance(
     return math.sqrt(sum((left - right) ** 2 for left, right in zip(lhs, rhs)))
 
 
-def dispersion_k_sampling_sources(root: Path) -> list[tuple[str, dict]]:
+def dispersion_k_sampling_sources(
+    root: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> list[tuple[str, dict]]:
     sources: list[tuple[str, dict]] = []
     path_metadata_path = root / "eigen" / "dispersion" / "path.json"
-    if path_metadata_path.is_file():
-        path_metadata = load_json(path_metadata_path)
+    path_metadata_exists = (
+        bundle_reader.has_member("eigen/dispersion/path.json")
+        if bundle_reader is not None
+        else path_metadata_path.is_file()
+    )
+    if path_metadata_exists:
+        path_metadata = load_json(path_metadata_path, bundle_reader)
         sampling = path_metadata.get("sampling", path_metadata)
         if not isinstance(sampling, dict):
             fail("eigen/dispersion/path.json sampling metadata must be an object")
         sources.append(("eigen/dispersion/path.json", sampling))
 
     execution_metadata_path = root / "metadata.json"
-    if execution_metadata_path.is_file():
-        execution_metadata = load_json(execution_metadata_path)
+    execution_metadata_exists = (
+        bundle_reader.has_member("metadata.json")
+        if bundle_reader is not None
+        else execution_metadata_path.is_file()
+    )
+    if execution_metadata_exists:
+        execution_metadata = load_json(execution_metadata_path, bundle_reader)
         plan = execution_metadata.get("execution_plan", {}).get("backend_plan")
         if isinstance(plan, dict):
             sampling = plan.get("k_sampling")
@@ -2003,11 +4439,12 @@ def validate_dispersion_k_sampling_path(
     known_samples: dict[int, tuple[float, tuple[float, float, float], str]],
     *,
     require_path_metadata: bool = False,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     path_metadata_path = root / "eigen" / "dispersion" / "path.json"
     if require_path_metadata:
-        require_file(path_metadata_path)
-    for source_name, sampling in dispersion_k_sampling_sources(root):
+        require_file(path_metadata_path, bundle_reader)
+    for source_name, sampling in dispersion_k_sampling_sources(root, bundle_reader):
         if sampling.get("kind") != "path":
             continue
         points = require_object_list(
@@ -2236,6 +4673,37 @@ def validate_production_k_path_solver_subwindows(
             )
 
 
+def validate_assignment_ambiguity_metric(diagnostics: dict, prefix: str) -> None:
+    metric_fields = (
+        "ambiguous_assignment_count",
+        "ambiguous_assignment_count_available",
+        "ambiguous_assignment_count_unavailable_reason",
+    )
+    if not any(field in diagnostics for field in metric_fields):
+        return
+    available = diagnostics.get("ambiguous_assignment_count_available")
+    if not isinstance(available, bool):
+        fail(f"{prefix}.ambiguous_assignment_count_available must be boolean")
+    count = diagnostics.get("ambiguous_assignment_count")
+    reason = diagnostics.get("ambiguous_assignment_count_unavailable_reason")
+    if available:
+        require_non_negative_int(count, f"{prefix}.ambiguous_assignment_count")
+        if reason not in (None, ""):
+            fail(
+                f"{prefix}.ambiguous_assignment_count_unavailable_reason must be "
+                "null or empty when the metric is available"
+            )
+    else:
+        if count is not None:
+            fail(
+                f"{prefix}.ambiguous_assignment_count must be null when unavailable"
+            )
+        require_non_empty_string(
+            reason,
+            f"{prefix}.ambiguous_assignment_count_unavailable_reason",
+        )
+
+
 def validate_production_modal_k_path_branch_tracking(
     manifest_diagnostics: dict,
     branches: dict,
@@ -2380,10 +4848,11 @@ def validate_exchange_only_analytic_dispersion(
     known_modes: dict[tuple[int, int], tuple[float, float, float, float]],
     known_samples: dict[int, tuple[float, tuple[float, float, float], str]],
     branch_ids_by_mode: dict[tuple[int, int], int],
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     metadata_path = root / "metadata.json"
-    require_file(metadata_path)
-    metadata = load_json(metadata_path)
+    require_file(metadata_path, bundle_reader)
+    metadata = load_json(metadata_path, bundle_reader)
     plan = metadata.get("execution_plan", {}).get("backend_plan")
     if not isinstance(plan, dict):
         fail("metadata.execution_plan.backend_plan is required for exchange-only analytic dispersion")
@@ -2478,13 +4947,19 @@ def validate_k0_kittel_summary_artifacts(
     tolerance: float,
     *,
     require_demag: bool = False,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     summary_path = root / "validation/kittel_k0_pbc/summary.v1.json"
-    if not summary_path.exists():
+    summary_exists = (
+        bundle_reader.has_member("validation/kittel_k0_pbc/summary.v1.json")
+        if bundle_reader is not None
+        else summary_path.exists()
+    )
+    if not summary_exists:
         return
     points_path = root / "validation/kittel_k0_pbc/points.v1.csv"
-    require_file(points_path)
-    summary = load_json(summary_path)
+    require_file(points_path, bundle_reader)
+    summary = load_json(summary_path, bundle_reader)
     summary_name = "validation/kittel_k0_pbc/summary.v1.json"
     require_equal(
         summary.get("schema_version"),
@@ -2513,7 +4988,9 @@ def validate_k0_kittel_summary_artifacts(
         if effective_magnetisation <= 0.0:
             fail(f"{summary_name}.demag.effective_magnetisation_A_per_m must be positive")
         if demag_kind == "periodic_airbox_k0":
-            eigen_summary = load_json(root / "eigen/metadata/eigen_summary.json")
+            eigen_summary = load_json(
+                root / "eigen/metadata/eigen_summary.json", bundle_reader
+            )
             equilibrium_source = eigen_summary.get("equilibrium_source")
             if not isinstance(equilibrium_source, dict):
                 fail(
@@ -2535,37 +5012,74 @@ def validate_k0_kittel_summary_artifacts(
                     "eigen_summary.relaxation_steps must be positive for periodic_airbox_k0 "
                     "unless eigen_summary.equilibrium_source.handoff=stage_continuation"
                 )
-            solver_diagnostics = load_json(root / "eigen/diagnostics/solver.v1.json")
-            require_equal(
-                solver_diagnostics.get("solver_adapter"),
-                "k0_poisson_airbox_cpu_full_coupled_slepc",
-                "solver_diagnostics.solver_adapter",
+            solver_diagnostics = load_json(
+                root / "eigen/diagnostics/solver.v1.json", bundle_reader
             )
-            require_equal(
-                solver_diagnostics.get("solver_model"),
+            if solver_diagnostics.get("solver_adapter") not in {
                 "k0_poisson_airbox_cpu_full_coupled_slepc",
-                "solver_diagnostics.solver_model",
-            )
-            require_equal(
-                solver_diagnostics.get("resolved_solver_family"),
+                "k0_poisson_airbox_cpu_schur_slepc",
+                "k0_poisson_airbox_gpu_petsc_slepc",
+                "k0_poisson_airbox_gpu_modal_device_krylov",
+            }:
+                fail(
+                    "solver_diagnostics.solver_adapter must be a certified "
+                    "CPU or GPU K0 periodic-airbox adapter"
+                )
+            if solver_diagnostics.get("solver_model") not in {
+                "k0_poisson_airbox_cpu_full_coupled_slepc",
+                "k0_poisson_airbox_cpu_schur_slepc",
+                "k0_poisson_airbox_gpu_petsc_slepc",
+                "k0_poisson_airbox_gpu_modal_device_krylov",
+            }:
+                fail("solver_diagnostics.solver_model is not a certified K0 periodic-airbox model")
+            if solver_diagnostics.get("resolved_solver_family") not in {
                 "k0_poisson_airbox_full_coupled",
-                "solver_diagnostics.resolved_solver_family",
-            )
+                "k0_poisson_airbox_schur",
+                "device_resident_arnoldi_shift_invert",
+            }:
+                fail("solver_diagnostics.resolved_solver_family is not a certified K0 periodic-airbox family")
             require_equal(
                 solver_diagnostics.get("demag_kind"),
                 "periodic_airbox_k0",
                 "solver_diagnostics.demag_kind",
             )
-            require_equal(
-                solver_diagnostics.get("assembly_kind"),
-                "mfem_weak_form_shared_domain",
-                "solver_diagnostics.assembly_kind",
-            )
-            require_equal(
+            assembly_kind = solver_diagnostics.get("assembly_kind")
+            if assembly_kind is None:
+                sampled = require_object_list(
+                    solver_diagnostics.get("sample_solver_diagnostics"),
+                    "solver_diagnostics.sample_solver_diagnostics",
+                )
+                if not sampled:
+                    fail("solver_diagnostics.assembly_kind is required")
+                sampled_assembly_kinds: list[object] = []
+                for sample_position, sample in enumerate(sampled):
+                    sample_payload = sample.get("diagnostics")
+                    if not isinstance(sample_payload, dict):
+                        fail(
+                            "solver_diagnostics.sample_solver_diagnostics"
+                            f"[{sample_position}].diagnostics must be an object"
+                        )
+                    sampled_assembly_kinds.append(sample_payload.get("assembly_kind"))
+                if any(
+                    value != "mfem_weak_form_shared_domain"
+                    for value in sampled_assembly_kinds
+                ):
+                    fail(
+                        "every sampled solver diagnostic must use "
+                        "assembly_kind=mfem_weak_form_shared_domain"
+                    )
+            else:
+                require_equal(
+                    assembly_kind,
+                    "mfem_weak_form_shared_domain",
+                    "solver_diagnostics.assembly_kind",
+                )
+            gauge_policy = require_non_empty_string(
                 demag.get("gauge_policy"),
-                "mean_zero_augmented",
                 f"{summary_name}.demag.gauge_policy",
             )
+            if gauge_policy not in {"none", "mean_zero_augmented"}:
+                fail(f"{summary_name}.demag.gauge_policy is invalid")
             phi_dof_count = require_non_negative_int(
                 demag.get("phi_dof_count"),
                 f"{summary_name}.demag.phi_dof_count",
@@ -2576,10 +5090,15 @@ def validate_k0_kittel_summary_artifacts(
                 demag.get("augmented_phi_dof_count"),
                 f"{summary_name}.demag.augmented_phi_dof_count",
             )
-            if augmented_phi_dof_count <= phi_dof_count:
+            if gauge_policy == "mean_zero_augmented" and augmented_phi_dof_count <= phi_dof_count:
                 fail(
                     f"{summary_name}.demag.augmented_phi_dof_count must exceed "
                     f"{summary_name}.demag.phi_dof_count for mean-zero gauge"
+                )
+            if gauge_policy == "none" and augmented_phi_dof_count != phi_dof_count:
+                fail(
+                    f"{summary_name}.demag.augmented_phi_dof_count must equal "
+                    f"{summary_name}.demag.phi_dof_count when no gauge is present"
                 )
             poisson_residual = require_finite_number(
                 demag.get("poisson_constraint_relative_residual"),
@@ -2607,7 +5126,9 @@ def validate_k0_kittel_summary_artifacts(
                 True,
                 f"{summary_name}.demag.production_periodic_airbox_claim",
             )
-            validate_k0_kittel_demag_convergence_table(root, tolerance)
+            validate_k0_kittel_demag_convergence_table(
+                root, tolerance, bundle_reader
+            )
         else:
             require_equal(
                 demag.get("production_periodic_airbox_claim"),
@@ -2652,7 +5173,16 @@ def validate_k0_kittel_summary_artifacts(
             f"{summary_name}.max_relative_frequency_error"
         )
 
-    reader = csv.DictReader(points_path.read_text().splitlines())
+    points_raw = _read_artifact_bytes(
+        points_path,
+        maximum_bytes=MAX_PRIMARY_DISPERSION_CSV_BYTES,
+        bundle_reader=bundle_reader,
+        name="Kittel validation points CSV",
+    )
+    try:
+        reader = csv.DictReader(points_raw.decode("utf-8").splitlines())
+    except UnicodeError as error:
+        fail(f"Kittel validation points CSV is not UTF-8: {error}")
     required_columns = {
         "field_index",
         "H0_A_per_m",
@@ -2747,10 +5277,23 @@ def validate_k0_kittel_summary_artifacts(
         )
 
 
-def validate_k0_kittel_demag_convergence_table(root: Path, tolerance: float) -> None:
+def validate_k0_kittel_demag_convergence_table(
+    root: Path,
+    tolerance: float,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
     convergence_path = root / "validation/kittel_k0_pbc/convergence.v1.csv"
-    require_file(convergence_path)
-    reader = csv.DictReader(convergence_path.read_text().splitlines())
+    require_file(convergence_path, bundle_reader)
+    convergence_raw = _read_artifact_bytes(
+        convergence_path,
+        maximum_bytes=MAX_PRIMARY_DISPERSION_CSV_BYTES,
+        bundle_reader=bundle_reader,
+        name="Kittel convergence CSV",
+    )
+    try:
+        reader = csv.DictReader(convergence_raw.decode("utf-8").splitlines())
+    except UnicodeError as error:
+        fail(f"Kittel convergence CSV is not UTF-8: {error}")
     required_columns = {
         "case_id",
         "demag_kind",
@@ -2811,10 +5354,11 @@ def validate_k0_kittel_field_sweep(
     *,
     require_demag: bool = False,
     require_periodic_airbox_demag: bool = False,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     metadata_path = root / "metadata.json"
-    require_file(metadata_path)
-    metadata = load_json(metadata_path)
+    require_file(metadata_path, bundle_reader)
+    metadata = load_json(metadata_path, bundle_reader)
     plan = metadata.get("execution_plan", {}).get("backend_plan")
     if not isinstance(plan, dict):
         fail("metadata.execution_plan.backend_plan is required for k0 Kittel field sweep")
@@ -2958,13 +5502,21 @@ def validate_k0_kittel_field_sweep(
             "k0 Kittel field sweep max relative error is too large "
             f"for branch {best_branch_id}: got {best_branch_error:.6g}, expected <= {tolerance:.6g}"
         )
-    validate_k0_kittel_summary_artifacts(root, tolerance, require_demag=require_demag)
+    validate_k0_kittel_summary_artifacts(
+        root,
+        tolerance,
+        require_demag=require_demag,
+        bundle_reader=bundle_reader,
+    )
 
 
-def validate_gpu_modal_k0_kittel_provenance(root: Path) -> None:
+def validate_gpu_modal_k0_kittel_provenance(
+    root: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
     manifest_path = root / "frequency_domain" / "manifest.v1.json"
-    require_file(manifest_path)
-    manifest = load_json(manifest_path)
+    require_file(manifest_path, bundle_reader)
+    manifest = load_json(manifest_path, bundle_reader)
     require_equal(
         manifest.get("study_product"),
         "modal_eigen",
@@ -3056,8 +5608,8 @@ def validate_gpu_modal_k0_kittel_provenance(root: Path) -> None:
         )
 
     summary_path = root / "validation/kittel_k0_pbc/summary.v1.json"
-    require_file(summary_path)
-    summary = load_json(summary_path)
+    require_file(summary_path, bundle_reader)
+    summary = load_json(summary_path, bundle_reader)
     solver = summary.get("solver")
     if not isinstance(solver, dict):
         fail("validation/kittel_k0_pbc/summary.v1.json.solver must be an object")
@@ -3080,6 +5632,197 @@ def validate_gpu_modal_k0_kittel_provenance(root: Path) -> None:
             "validation/kittel_k0_pbc/summary.v1.json.solver.solver_algorithm "
             "must match manifest.resolved_execution.solver_algorithm"
         )
+
+
+def validate_gpu_modal_k0_periodic_airbox_provenance(
+    root: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
+    manifest = load_json(root / "frequency_domain/manifest.v1.json", bundle_reader)
+    requested = manifest.get("requested_execution")
+    resolved = manifest.get("resolved_execution")
+    if not isinstance(requested, dict) or not isinstance(resolved, dict):
+        fail("GPU periodic-airbox provenance requires requested/resolved execution objects")
+    require_equal(requested.get("backend"), "fem", "manifest.requested_execution.backend")
+    require_equal(requested.get("device"), "gpu", "manifest.requested_execution.device")
+    require_equal(requested.get("precision"), "double", "manifest.requested_execution.precision")
+    require_equal(requested.get("include_demag"), True, "manifest.requested_execution.include_demag")
+    require_equal(resolved.get("backend"), "fem", "manifest.resolved_execution.backend")
+    require_equal(resolved.get("device"), "gpu", "manifest.resolved_execution.device")
+    require_equal(resolved.get("native_backend"), "native_gpu", "manifest.resolved_execution.native_backend")
+    require_equal(
+        resolved.get("reference_or_production"),
+        "production",
+        "manifest.resolved_execution.reference_or_production",
+    )
+    if resolved.get("solver_algorithm") not in {
+        "k0_poisson_airbox_gpu_petsc_slepc",
+        "k0_poisson_airbox_gpu_modal_device_krylov",
+    }:
+        fail("manifest.resolved_execution.solver_algorithm must identify a GPU K0 PETSc/SLEPc adapter")
+    require_equal(
+        resolved.get("device_residency"),
+        "gpu_device_resident",
+        "manifest.resolved_execution.device_residency",
+    )
+    engine = require_non_empty_string(resolved.get("engine"), "manifest.resolved_execution.engine")
+    if "cpu" in engine.lower():
+        fail("manifest.resolved_execution.engine must not contain a CPU solver for strict GPU K0 demag")
+
+    solver = load_json(root / "eigen/diagnostics/solver.v1.json", bundle_reader)
+    if solver.get("solver_adapter") not in {
+        "k0_poisson_airbox_gpu_petsc_slepc",
+        "k0_poisson_airbox_gpu_modal_device_krylov",
+    }:
+        fail("solver_diagnostics.solver_adapter must identify a GPU K0 PETSc/SLEPc adapter")
+    require_equal(solver.get("execution_lane"), "production_gpu", "solver_diagnostics.execution_lane")
+    require_equal(solver.get("demag_kind"), "periodic_airbox_k0", "solver_diagnostics.demag_kind")
+    require_equal(solver.get("algebraic_form"), "schur_reduced_descriptor", "solver_diagnostics.algebraic_form")
+    require_equal(solver.get("matrix_equation"), "L_eff q = lambda B_qq q; phi(q) = -P^-1 A_phiq q", "solver_diagnostics.matrix_equation")
+    require_equal(solver.get("spectral_transform"), "shift_invert", "solver_diagnostics.spectral_transform")
+    require_equal(
+        solver.get("production_periodic_airbox_claim"),
+        True,
+        "solver_diagnostics.production_periodic_airbox_claim",
+    )
+    samples = require_object_list(
+        solver.get("sample_solver_diagnostics"),
+        "solver_diagnostics.sample_solver_diagnostics",
+    )
+    if not samples:
+        fail("GPU periodic-airbox provenance requires executed per-sample native diagnostics")
+    for sample_index, sample in enumerate(samples):
+        diagnostics = sample.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            fail(f"solver_diagnostics.sample_solver_diagnostics[{sample_index}].diagnostics must be an object")
+        prefix = f"solver_diagnostics.sample_solver_diagnostics[{sample_index}].diagnostics"
+        if diagnostics.get("solver_adapter") not in {
+            "k0_poisson_airbox_gpu_petsc_slepc",
+            "k0_poisson_airbox_gpu_modal_device_krylov",
+        }:
+            fail(f"{prefix}.solver_adapter must identify a GPU K0 PETSc/SLEPc adapter")
+        require_equal(diagnostics.get("assembly_kind"), "mfem_weak_form_shared_domain", f"{prefix}.assembly_kind")
+        require_equal(diagnostics.get("demag_kind"), "periodic_airbox_k0", f"{prefix}.demag_kind")
+        require_equal(diagnostics.get("algebraic_form"), "schur_reduced_descriptor", f"{prefix}.algebraic_form")
+        require_equal(diagnostics.get("matrix_equation"), "L_eff q = lambda B_qq q; phi(q) = -P^-1 A_phiq q", f"{prefix}.matrix_equation")
+        require_equal(diagnostics.get("spectral_transform"), "shift_invert", f"{prefix}.spectral_transform")
+        spectral = diagnostics.get("spectral")
+        if isinstance(spectral, dict):
+            require_equal(spectral.get("spectral_scalar_mode"), "real_split", f"{prefix}.spectral.spectral_scalar_mode")
+        require_equal(diagnostics.get("persistent_solver_context"), True, f"{prefix}.persistent_solver_context")
+        require_equal(diagnostics.get("gpu_device_resident_modal_eigensolver"), True, f"{prefix}.gpu_device_resident_modal_eigensolver")
+        require_equal(diagnostics.get("scalable_selected_spectrum"), True, f"{prefix}.scalable_selected_spectrum")
+        require_equal(diagnostics.get("production_implication"), True, f"{prefix}.production_implication")
+        require_equal(diagnostics.get("validation_only"), False, f"{prefix}.validation_only")
+        require_equal(diagnostics.get("cpu_fallback"), "disabled", f"{prefix}.cpu_fallback")
+        require_equal(diagnostics.get("fallback_used"), False, f"{prefix}.fallback_used")
+        require_equal(diagnostics.get("per_iteration_h2d_transfer_count"), 0, f"{prefix}.per_iteration_h2d_transfer_count")
+        require_equal(diagnostics.get("per_iteration_d2h_transfer_count"), 0, f"{prefix}.per_iteration_d2h_transfer_count")
+        require_equal(diagnostics.get("full_residual_certified"), True, f"{prefix}.full_residual_certified")
+
+
+def validate_cpu_modal_k0_periodic_airbox_provenance(
+    root: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
+    """Validate a fresh CPU P1 artifact without accepting Kittel metadata."""
+    manifest = load_json(root / "frequency_domain/manifest.v1.json", bundle_reader)
+    requested = manifest.get("requested_execution")
+    resolved = manifest.get("resolved_execution")
+    if not isinstance(requested, dict) or not isinstance(resolved, dict):
+        fail("CPU periodic-airbox provenance requires requested/resolved execution objects")
+    require_equal(requested.get("backend"), "fem", "manifest.requested_execution.backend")
+    require_equal(requested.get("device"), "cpu", "manifest.requested_execution.device")
+    require_equal(requested.get("precision"), "double", "manifest.requested_execution.precision")
+    require_equal(requested.get("include_demag"), True, "manifest.requested_execution.include_demag")
+    require_equal(resolved.get("backend"), "fem", "manifest.resolved_execution.backend")
+    require_equal(resolved.get("device"), "cpu", "manifest.resolved_execution.device")
+    require_equal(resolved.get("native_backend"), "native_cpu", "manifest.resolved_execution.native_backend")
+    require_equal(
+        resolved.get("reference_or_production"),
+        "production",
+        "manifest.resolved_execution.reference_or_production",
+    )
+    if resolved.get("solver_algorithm") not in {
+        "k0_poisson_airbox_cpu_full_coupled_slepc",
+        "k0_poisson_airbox_cpu_schur_slepc",
+    }:
+        fail("manifest.resolved_execution.solver_algorithm must identify a CPU K0 PETSc/SLEPc adapter")
+    require_equal(
+        resolved.get("device_residency"),
+        "host",
+        "manifest.resolved_execution.device_residency",
+    )
+    require_equal(resolved.get("fallback_used"), False, "manifest.resolved_execution.fallback_used")
+    validation = manifest.get("validation")
+    if not isinstance(validation, dict):
+        fail("manifest.validation must be an object")
+    if validation.get("k0_kittel_validation") is not None:
+        fail("production CPU artifact must not carry analytical Kittel validation metadata")
+
+    solver = load_json(root / "eigen/diagnostics/solver.v1.json", bundle_reader)
+    if solver.get("solver_adapter") not in {
+        "k0_poisson_airbox_cpu_full_coupled_slepc",
+        "k0_poisson_airbox_cpu_schur_slepc",
+    }:
+        fail("solver_diagnostics.solver_adapter must identify a CPU K0 PETSc/SLEPc adapter")
+    require_equal(solver.get("execution_lane"), "production_cpu", "solver_diagnostics.execution_lane")
+    require_equal(solver.get("demag_kind"), "periodic_airbox_k0", "solver_diagnostics.demag_kind")
+    require_equal(solver.get("algebraic_form"), "schur_reduced_descriptor", "solver_diagnostics.algebraic_form")
+    require_equal(
+        solver.get("matrix_equation"),
+        "L_eff q = lambda B_qq q; phi(q) = -P^-1 A_phiq q",
+        "solver_diagnostics.matrix_equation",
+    )
+    require_equal(solver.get("spectral_transform"), "shift_invert", "solver_diagnostics.spectral_transform")
+    require_equal(
+        solver.get("production_periodic_airbox_claim"),
+        True,
+        "solver_diagnostics.production_periodic_airbox_claim",
+    )
+    samples = require_object_list(
+        solver.get("sample_solver_diagnostics"),
+        "solver_diagnostics.sample_solver_diagnostics",
+    )
+    if not samples:
+        fail("CPU periodic-airbox provenance requires executed per-sample native diagnostics")
+    for sample_index, sample in enumerate(samples):
+        diagnostics = sample.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            fail(f"solver_diagnostics.sample_solver_diagnostics[{sample_index}].diagnostics must be an object")
+        prefix = f"solver_diagnostics.sample_solver_diagnostics[{sample_index}].diagnostics"
+        if diagnostics.get("solver_adapter") not in {
+            "k0_poisson_airbox_cpu_full_coupled_slepc",
+            "k0_poisson_airbox_cpu_schur_slepc",
+        }:
+            fail(f"{prefix}.solver_adapter must identify a CPU K0 PETSc/SLEPc adapter")
+        require_equal(diagnostics.get("assembly_kind"), "mfem_weak_form_shared_domain", f"{prefix}.assembly_kind")
+        require_equal(diagnostics.get("demag_kind"), "periodic_airbox_k0", f"{prefix}.demag_kind")
+        require_equal(diagnostics.get("spectral_transform"), "shift_invert", f"{prefix}.spectral_transform")
+        require_equal(diagnostics.get("fallback_used"), False, f"{prefix}.fallback_used")
+        require_equal(diagnostics.get("full_residual_certified"), True, f"{prefix}.full_residual_certified")
+
+
+def validate_k0_periodic_airbox_production_provenance(
+    root: Path,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
+    manifest = load_json(root / "frequency_domain/manifest.v1.json", bundle_reader)
+    requested = manifest.get("requested_execution")
+    if not isinstance(requested, dict):
+        fail("K0 production provenance requires manifest.requested_execution")
+    device = requested.get("device")
+    if device == "cpu":
+        validate_cpu_modal_k0_periodic_airbox_provenance(root, bundle_reader)
+    elif device == "gpu":
+        validate_gpu_modal_k0_periodic_airbox_provenance(root, bundle_reader)
+        validation = manifest.get("validation")
+        if not isinstance(validation, dict):
+            fail("manifest.validation must be an object for GPU K0 production provenance")
+        if validation.get("k0_kittel_validation") is not None:
+            fail("production GPU artifact must not carry analytical Kittel validation metadata")
+    else:
+        fail("K0 production provenance requires requested device cpu or gpu")
 
 
 def validate_exchange_only_reciprocal_dispersion(
@@ -3140,6 +5883,51 @@ def vector_dot(
     return sum(left * right for left, right in zip(lhs, rhs))
 
 
+def p00_demag_factor(k_norm: float, film_thickness_m: float) -> float:
+    """Stable slab P00; dimensionless argument k*t, with the Kittel limit."""
+    if not math.isfinite(k_norm) or k_norm < 0.0:
+        raise ValueError("k_norm must be finite and non-negative")
+    if not math.isfinite(film_thickness_m) or film_thickness_m <= 0.0:
+        raise ValueError("film_thickness_m must be finite and positive")
+    kd = k_norm * film_thickness_m
+    if not math.isfinite(kd):
+        raise ValueError("k*t must be finite")
+    if kd < 1.0e-4:
+        return kd * (0.5 + kd * (-1.0 / 6.0 + kd * (1.0 / 24.0 + kd * (-1.0 / 120.0 + kd / 720.0))))
+    return 1.0 + math.expm1(-kd) / kd
+
+
+def require_kalinikos_slab_n0_material_and_bias(
+    plan: dict, material: dict, magnetization_direction: tuple[float, float, float]
+) -> None:
+    """Reject physics omitted by the homogeneous, field-aligned slab oracle."""
+    bias_direction = unit_vector(require_vector3(plan.get("external_field"), "external_field"), "external_field")
+    if vector_dot(bias_direction, magnetization_direction) < 1.0 - 1.0e-6:
+        fail("Kalinikos n=0 requires bias aligned with equilibrium magnetization")
+    for field in ("interfacial_dmi", "bulk_dmi"):
+        value = plan.get(field)
+        if value is not None and require_finite_number(value, field) != 0.0:
+            fail(f"Kalinikos n=0 does not include {field}")
+    for field in ("uniaxial_anisotropy", "uniaxial_anisotropy_k2", "cubic_anisotropy_kc1", "cubic_anisotropy_kc2", "cubic_anisotropy_kc3"):
+        value = material.get(field)
+        if value is not None and require_finite_number(value, field) != 0.0:
+            fail(f"Kalinikos n=0 does not include {field}")
+    for field, scalar in (("ms_field", "saturation_magnetisation"), ("a_field", "exchange_stiffness")):
+        values = material.get(field)
+        if values is not None:
+            if not isinstance(values, list) or not values:
+                fail(f"Kalinikos n=0 requires a nonempty uniform {field}")
+            expected = require_finite_number(material.get(scalar), scalar)
+            for value in values:
+                if not math.isclose(require_finite_number(value, field), expected, rel_tol=1e-12, abs_tol=0.0):
+                    fail(f"Kalinikos n=0 requires uniform {field} matching {scalar}")
+    for field in ("ku_field", "ku2_field", "kc1_field", "kc2_field", "kc3_field", "dind_field", "dbulk_field"):
+        values = material.get(field)
+        if values is not None:
+            if not isinstance(values, list) or any(require_finite_number(value, field) != 0.0 for value in values):
+                fail(f"Kalinikos n=0 does not include {field}")
+
+
 def kalinikos_slab_n0_frequency_hz(
     *,
     k_norm: float,
@@ -3157,11 +5945,7 @@ def kalinikos_slab_n0_frequency_hz(
         * k_norm
         / (MU0 * saturation_magnetisation_a_per_m)
     )
-    if k_norm == 0.0:
-        p_factor = 0.0
-    else:
-        kd = k_norm * film_thickness_m
-        p_factor = 1.0 - (1.0 - math.exp(-kd)) / kd
+    p_factor = p00_demag_factor(k_norm, film_thickness_m)
     common = bias_field_a_per_m + exchange_field
     if geometry == "damon_eshbach":
         factor_a = common + saturation_magnetisation_a_per_m * (1.0 - p_factor)
@@ -3208,6 +5992,150 @@ def require_int_list(value: object, name: str) -> list[int]:
     return value
 
 
+def validate_tracking_alias(branches: dict, alias: dict) -> None:
+    """Check the common contract; legacy schema/diagnostic envelopes may differ."""
+    keys = ["branches", "solver_model"]
+    if "tracking_policy_availability" in branches or "tracking_policy_availability" in alias:
+        keys.extend(["tracking_method", "overlap_floor", "frequency_window_hz", "tracking_policy_availability"])
+    for key in keys:
+        require_equal(alias.get(key), branches.get(key), f"branches.json alias {key}")
+
+
+def validate_tracking_edge_provenance(branches: dict, sample_order: list[int]) -> None:
+    """Validate optional assignment evidence without qualifying a subspace as pair overlap."""
+    positions = {sample: position for position, sample in enumerate(sample_order)}
+    policies = []
+    missing = False
+    for branch in require_object_list(branches.get("branches"), "branches.branches"):
+        branch_id = require_non_negative_int(branch.get("branch_id"), "branch_id")
+        points = require_object_list(branch.get("points"), "branch.points")
+        by_sample = {require_non_negative_int(point.get("sample_index"), "branch point.sample_index"): point
+                     for point in points}
+        if len(by_sample) != len(points) and any(point.get("tracking_edge") is not None for point in points):
+            fail("tracking_edge branch cannot contain duplicate sample points")
+        for point in points:
+            edge = point.get("tracking_edge")
+            if edge is None:
+                missing = True
+                continue  # historical artifact: no edge evidence is claimed
+            if not isinstance(edge, dict):
+                fail("tracking_edge must be an object or null")
+            policy = edge.get("policy")
+            if not isinstance(policy, dict):
+                fail("tracking_edge.policy must be an object")
+            method = policy.get("method")
+            if method not in {"overlap_greedy", "overlap_hungarian"}:
+                fail("tracking_edge.policy.method is unsupported")
+            floor = require_finite_number(policy.get("overlap_floor"), "tracking_edge.overlap_floor")
+            if not 0 <= floor <= 1:
+                fail("tracking_edge.overlap_floor must be in [0, 1]")
+            window = policy.get("frequency_window_hz")
+            if window is not None and require_finite_number(window, "tracking_edge.frequency_window_hz") <= 0:
+                fail("tracking_edge.frequency_window_hz must be positive")
+            max_gap = require_non_negative_int(policy.get("max_branch_gap"), "tracking_edge.max_branch_gap")
+            policies.append(policy)
+            require_equal(edge.get("score_source"), point.get("tracking_score_source"), "tracking_edge.score_source")
+            transition = edge.get("transition")
+            source = edge.get("score_source")
+            sample = require_non_negative_int(point.get("sample_index"), "tracking_edge sample")
+            if sample not in positions:
+                fail("tracking_edge current sample is unknown")
+            gap = require_non_negative_int(edge.get("skipped_sample_count"), "tracking_edge.skipped_sample_count")
+            metric = edge.get("metric")
+            if metric not in {"consistent_p1_tet4_cartesian_nodal_envelope", "diagonal_nodal_mass",
+                              "euclidean", "unavailable"}:
+                fail("tracking_edge.metric is unsupported")
+            if transition in {"seed", "new_branch"}:
+                require_equal(source, "seed" if transition == "seed" else "modal_overlap_unavailable",
+                              "tracking_edge seed/restart source")
+                if transition == "seed" and positions[sample] != 0:
+                    fail("tracking_edge seed must belong to the first sample")
+                if transition == "new_branch" and positions[sample] == 0:
+                    fail("tracking_edge new_branch cannot be an initial seed")
+                if points[0] is not point or edge.get("previous_sample_index") is not None or \
+                        edge.get("previous_raw_mode_index") is not None or gap or edge.get("subspace") is not None:
+                    fail("tracking_edge seed/restart cannot claim a predecessor or subspace")
+                require_equal(metric, "unavailable", "tracking_edge seed metric")
+                if point.get("overlap_prev") is not None:
+                    fail("tracking_edge seed/restart cannot claim pair overlap")
+                continue
+            previous = require_non_negative_int(edge.get("previous_sample_index"), "tracking_edge.previous_sample_index")
+            previous_raw = require_non_negative_int(edge.get("previous_raw_mode_index"), "tracking_edge.previous_raw_mode_index")
+            if previous not in positions or positions[previous] >= positions[sample]:
+                fail("tracking_edge predecessor must be an earlier known sample")
+            if any(positions[previous] < positions[retained] < positions[sample]
+                   for retained in by_sample if retained in positions):
+                fail("tracking_edge predecessor cannot skip a retained branch point")
+            require_equal(gap, positions[sample] - positions[previous] - 1, "tracking_edge gap")
+            if gap > max_gap:
+                fail("tracking_edge gap exceeds recorded policy")
+            if previous in by_sample:
+                require_equal(previous_raw, by_sample[previous].get("raw_mode_index"), "tracking_edge predecessor raw mode")
+            # Output selection may omit the predecessor; never invent an endpoint from the retained array.
+            subspace = edge.get("subspace")
+            if transition == "pair":
+                if subspace is not None:
+                    fail("tracking_edge pair cannot claim a subspace")
+                if source == "frequency_score_fallback":
+                    require_equal(metric, "unavailable", "tracking_edge fallback metric")
+                    if point.get("overlap_prev") is not None:
+                        fail("tracking_edge frequency fallback cannot claim pair overlap")
+                elif source in {"modal_overlap_weighted_score", "modal_overlap_unweighted_score"}:
+                    expected_metrics = {"consistent_p1_tet4_cartesian_nodal_envelope", "diagonal_nodal_mass"} \
+                        if source == "modal_overlap_weighted_score" else {"euclidean"}
+                    if metric not in expected_metrics:
+                        fail("tracking_edge pair metric disagrees with score source")
+                    overlap = require_finite_number(point.get("overlap_prev"), "tracking_edge pair overlap")
+                    if not floor <= overlap <= 1:
+                        fail("tracking_edge pair overlap violates recorded floor")
+                else:
+                    fail("tracking_edge pair source is unsupported")
+                continue
+            if transition not in {"degenerate_to_degenerate", "split_to_degenerate", "degenerate_to_split"}:
+                fail("tracking_edge transition is unsupported")
+            require_equal(source, "modal_subspace_transport_score", "tracking_edge subspace source")
+            if metric == "unavailable" or point.get("overlap_prev") is not None or not isinstance(subspace, dict):
+                fail("tracking_edge subspace requires a metric and separate principal-angle evidence")
+            rank = require_non_negative_int(subspace.get("rank"), "tracking_edge subspace rank")
+            if rank < 2:
+                fail("tracking_edge subspace rank must be at least two")
+            arrays = {}
+            for key in ("branch_ids", "previous_raw_mode_indices", "current_raw_mode_indices"):
+                values = subspace.get(key)
+                if not isinstance(values, list) or len(values) != rank:
+                    fail(f"tracking_edge subspace {key} must match rank")
+                arrays[key] = [require_non_negative_int(value, key) for value in values]
+                if len(set(arrays[key])) != rank:
+                    fail(f"tracking_edge subspace {key} must be unique")
+            if branch_id not in arrays["branch_ids"]:
+                fail("tracking_edge subspace does not contain current branch")
+            slot = arrays["branch_ids"].index(branch_id)
+            require_equal(arrays["previous_raw_mode_indices"][slot], previous_raw, "tracking_edge subspace predecessor raw mode")
+            if point.get("raw_mode_index") not in arrays["current_raw_mode_indices"]:
+                fail("tracking_edge subspace does not contain current raw mode")
+            cosines = subspace.get("principal_cosines")
+            if not isinstance(cosines, list) or len(cosines) != rank:
+                fail("tracking_edge principal cosines must match rank")
+            cosines = [require_finite_number(value, "tracking_edge principal cosine") for value in cosines]
+            if any(not 0 <= value <= 1 for value in cosines):
+                fail("tracking_edge principal cosines must be in [0, 1]")
+            minimum = require_finite_number(subspace.get("principal_minimum"), "tracking_edge principal minimum")
+            require_close(minimum, min(cosines), "tracking_edge principal minimum", absolute_tolerance=1e-12)
+            if minimum < floor:
+                fail("tracking_edge principal minimum violates recorded floor")
+            for key in ("previous_cluster", "current_cluster"):
+                require_non_negative_int(subspace.get(key), key)
+    availability = branches.get("tracking_policy_availability")
+    if policies and availability is None:
+        fail("tracking_edge evidence requires tracking_policy_availability")
+    if availability is not None:
+        complete = bool(policies) and not missing and all(policy == policies[0] for policy in policies)
+        require_equal(availability, "complete" if complete else "missing_or_mixed", "tracking policy availability")
+        for key in ("tracking_method", "overlap_floor", "frequency_window_hz"):
+            policy_key = "method" if key == "tracking_method" else key
+            require_equal(branches.get(key), policies[0].get(policy_key) if complete else None, key)
+
+
 def require_branch_id(value: object, name: str) -> int:
     if isinstance(value, int) and value >= 0:
         return value
@@ -3228,17 +6156,18 @@ def validate_low_k_de_bv_analytic_dispersion(
     known_samples: dict[int, tuple[float, tuple[float, float, float], str]],
     branch_ids_by_mode: dict[tuple[int, int], int],
     dispersion_rows_by_mode: dict[tuple[int, int], dict[str, str]],
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     metadata_path = root / "metadata.json"
-    require_file(metadata_path)
-    metadata = load_json(metadata_path)
+    require_file(metadata_path, bundle_reader)
+    metadata = load_json(metadata_path, bundle_reader)
     plan = metadata.get("execution_plan", {}).get("backend_plan")
     if not isinstance(plan, dict):
         fail("metadata.execution_plan.backend_plan is required for DE/BV analytic dispersion")
     validation = plan.get("dispersion_validation")
     if not isinstance(validation, dict):
         fail("metadata.execution_plan.backend_plan.dispersion_validation must be an object")
-    manifest = load_json(root / "frequency_domain/manifest.v1.json")
+    manifest = load_json(root / "frequency_domain/manifest.v1.json", bundle_reader)
     manifest_validation = manifest.get("validation", {}).get("dispersion_validation")
     if not isinstance(manifest_validation, dict):
         fail("manifest.validation.dispersion_validation must be an object")
@@ -3269,11 +6198,9 @@ def validate_low_k_de_bv_analytic_dispersion(
             "analytic_thin_film_de_bv_reference_not_fem_demag_k",
             "manifest.validation.dynamic_demag_operator_source",
         )
-    elif reference_model not in (None, ""):
-        fail(
-            "manifest.validation.dispersion_reference_model must be empty for "
-            "numeric modal solver DE/BV comparison artifacts"
-        )
+    else:
+        require_equal(reference_model, "kalinikos_slab_n0", "manifest.validation.dispersion_reference_model")
+        require_equal(dynamic_demag_source, "numeric_modal_solver", "manifest.validation.dynamic_demag_operator_source")
     require_equal(
         canonical_dispersion_validation(
             manifest_validation,
@@ -3299,14 +6226,12 @@ def validate_low_k_de_bv_analytic_dispersion(
         validation.get("frequency_window_hz"),
         "metadata.execution_plan.backend_plan.dispersion_validation.frequency_window_hz",
     )
-    if frequency_window_hz[1] > 5.0e9:
-        fail("DE/BV low-k analytic dispersion frequency window must not exceed 5 GHz")
     max_k = require_finite_number(
         validation.get("max_k_rad_per_m"),
         "metadata.execution_plan.backend_plan.dispersion_validation.max_k_rad_per_m",
     )
-    if max_k <= 0.0 or max_k > 3.0e6:
-        fail("DE/BV low-k analytic dispersion max_k_rad_per_m must be in (0, 3e6]")
+    if max_k <= 0.0:
+        fail("DE/BV low-k analytic dispersion max_k_rad_per_m must be positive")
     film_thickness = require_finite_number(
         validation.get("film_thickness_m"),
         "metadata.execution_plan.backend_plan.dispersion_validation.film_thickness_m",
@@ -3368,6 +6293,7 @@ def validate_low_k_de_bv_analytic_dispersion(
     )
     if abs(vector_dot(magnetization_direction, film_normal)) > 1.0e-6:
         fail("DE/BV low-k analytic dispersion requires in-plane equilibrium magnetization")
+    require_kalinikos_slab_n0_material_and_bias(plan, material, magnetization_direction)
 
     scenarios = require_object_list(
         validation.get("scenarios"),
@@ -3403,6 +6329,7 @@ def validate_low_k_de_bv_analytic_dispersion(
             fail(f"DE/BV scenario {geometry} requires at least three samples")
         branch_errors: list[float] = []
         nonzero_samples = 0
+        frequency_points: list[tuple[float, float, float, int]] = []
         for sample_index in sample_indices:
             if sample_index not in known_samples:
                 fail(f"DE/BV scenario {geometry} references unknown sample_index {sample_index}")
@@ -3456,6 +6383,7 @@ def validate_low_k_de_bv_analytic_dispersion(
             )
             relative_error = abs(frequency_hz - expected_hz) / max(abs(expected_hz), 1.0)
             branch_errors.append(relative_error)
+            frequency_points.append((k_norm, frequency_hz, expected_hz, sample_index))
             row = dispersion_rows_by_mode.get(mode_key)
             if row is None:
                 fail(
@@ -3500,6 +6428,19 @@ def validate_low_k_de_bv_analytic_dispersion(
             )
         if nonzero_samples < 2:
             fail(f"DE/BV scenario {geometry} requires at least two nonzero k samples")
+        frequency_points.sort(key=lambda point: (point[0], point[3]))
+        for left, right in zip(frequency_points, frequency_points[1:]):
+            expected_delta = right[2] - left[2]
+            observed_delta = right[1] - left[1]
+            continuity_error = abs(observed_delta - expected_delta) / max(
+                abs(left[2]), abs(right[2]), 1.0
+            )
+            if continuity_error > max_relative_error:
+                fail(
+                    f"DE/BV low-k frequency continuity error is too large for {geometry} "
+                    f"between sample_index {left[3]} and {right[3]}: "
+                    f"got {continuity_error:.6g}, expected <= {max_relative_error:.6g}"
+                )
         branch_error = max(branch_errors)
         if branch_error > max_relative_error:
             fail(
@@ -3513,14 +6454,28 @@ def validate_low_k_de_bv_analytic_dispersion(
 def validate_dispersion(
     root: Path,
     known_modes: dict[tuple[int, int], tuple[float, float, float, float]],
+    known_mode_summaries: dict[tuple[int, int], dict],
     known_samples: dict[int, tuple[float, tuple[float, float, float], str]],
+    sample_ids_by_index: dict[int, str],
     branch_ids_by_mode: dict[tuple[int, int], int],
     tracking_sources_by_mode: dict[tuple[int, int], str],
     overlap_by_mode: dict[tuple[int, int], float],
+    *,
+    require_stable_ids: bool,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[tuple[int, int], dict[str, str]]:
     path = root / "eigen/dispersion.csv"
-    require_file(path)
-    reader = csv.DictReader(path.read_text().splitlines())
+    require_file(path, bundle_reader)
+    raw = _read_artifact_bytes(
+        path,
+        maximum_bytes=MAX_PRIMARY_DISPERSION_CSV_BYTES,
+        bundle_reader=bundle_reader,
+        name="eigen/dispersion.csv",
+    )
+    try:
+        reader = csv.DictReader(raw.decode("utf-8").splitlines())
+    except UnicodeError as error:
+        fail(f"eigen/dispersion.csv is not UTF-8: {error}")
     rows = list(reader)
     required_columns = {
         "sample_index",
@@ -3538,8 +6493,11 @@ def validate_dispersion(
         "overlap_score",
         "tracking_score_source",
         "mode_field_id",
-        "mode_field_resource_key",
     }
+    identity_columns = {"sample_id", "mode_id", "mode_field_available"}
+    publishes_identity_columns = bool(identity_columns.intersection(reader.fieldnames or []))
+    if require_stable_ids or publishes_identity_columns:
+        required_columns.update(identity_columns)
     missing = required_columns.difference(reader.fieldnames or [])
     if missing:
         fail(f"eigen/dispersion.csv missing columns: {sorted(missing)!r}")
@@ -3573,6 +6531,14 @@ def validate_dispersion(
                 "eigen/dispersion.csv references unknown sample "
                 f"sample={sample_index}"
             )
+        validate_artifact_mode_identity(
+            row,
+            f"dispersion row {row_index}",
+            sample_index,
+            raw_mode_index,
+            sample_ids_by_index,
+            required=require_stable_ids,
+        )
         expected_path_s, expected_k_vector, expected_label = sample_metadata
         path_s = require_finite_number(
             float(row["path_s_rad_per_m"]),
@@ -3636,10 +6602,13 @@ def validate_dispersion(
             f"dispersion row {row_index}.tracking_score_source",
         )
         overlap_score_text = row.get("overlap_score", "").strip()
-        if tracking_score_source == "modal_overlap_weighted_score" and not overlap_score_text:
+        if tracking_score_source in {
+            "modal_overlap_weighted_score",
+            "modal_overlap_unweighted_score",
+        } and not overlap_score_text:
             fail(
                 f"dispersion row {row_index}.overlap_score must be present "
-                "for modal_overlap_weighted_score"
+                f"for {tracking_score_source}"
             )
         if overlap_score_text:
             overlap_score = require_finite_number(
@@ -3661,17 +6630,19 @@ def validate_dispersion(
                     f"dispersion row {row_index}.overlap_score",
                     absolute_tolerance=1.0e-12,
                 )
-        expected_field_id = mode_field_id(sample_index, raw_mode_index)
-        expected_resource_key = mode_field_resource_key(expected_field_id)
-        require_equal(
-            row.get("mode_field_id"),
-            expected_field_id,
-            f"dispersion row {row_index}.mode_field_id",
+        expected_field_available = validate_json_mode_field_availability(
+            known_mode_summaries[mode_key],
+            f"spectrum mode {sample_index}/{raw_mode_index}",
+            sample_index,
+            raw_mode_index,
         )
-        require_equal(
-            row.get("mode_field_resource_key"),
-            expected_resource_key,
-            f"dispersion row {row_index}.mode_field_resource_key",
+        validate_csv_mode_field_availability(
+            row,
+            f"dispersion row {row_index}",
+            sample_index,
+            raw_mode_index,
+            expected_field_available,
+            has_explicit_availability="mode_field_available" in (reader.fieldnames or []),
         )
         frequency_hz = require_finite_number(
             float(row["frequency_hz"]),
@@ -3715,6 +6686,326 @@ def validate_dispersion(
     if missing_mode_keys:
         fail(f"missing dispersion rows for modes: {sorted(missing_mode_keys)!r}")
     return rows_by_mode
+
+
+def validate_typed_modal_field_sweep(
+    root: Path,
+    manifest: dict,
+    solver_diagnostics: dict,
+    known_modes: dict[tuple[int, int], tuple[float, float, float, float]],
+    known_mode_summaries: dict[tuple[int, int], dict],
+    branch_ids_by_mode: dict[tuple[int, int], int],
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> None:
+    """Validate the optional A1S native modal field-sweep envelope.
+
+    This is deliberately stricter than the v2 transport decoder: discovering a
+    field-sweep artifact in the manifest means the on-disk source graph, every
+    mode reference and every completion claim must be scientifically usable.
+    """
+    def declares_bias_field_sweep(value: object) -> bool:
+        return (
+            isinstance(value, dict)
+            and isinstance(value.get("field_sweep"), dict)
+            and value["field_sweep"].get("kind") == "bias_field_sweep"
+        )
+
+    declared = any(
+        declares_bias_field_sweep(value)
+        for value in [manifest, manifest.get("diagnostics"), solver_diagnostics]
+    )
+    artifact_path = manifest.get("artifacts", {}).get("field_sweep_v1_path")
+    if artifact_path is None:
+        if declared:
+            fail(
+                "manifest.artifacts.field_sweep_v1_path is required for a declared "
+                "bias_field_sweep"
+            )
+        return
+    relative_path, path = require_bundle_path(
+        root,
+        artifact_path,
+        "manifest.artifacts.field_sweep_v1_path",
+        bundle_reader,
+    )
+    require_equal(relative_path, "eigen/field_sweep.v1.json", "manifest.artifacts.field_sweep_v1_path")
+    resources = manifest.get("resources")
+    if not isinstance(resources, dict):
+        fail("manifest.resources must be an object")
+    # Exact manifests carry durable paths; validate a legacy transport key only if present.
+    if resources.get("field_sweep_resource_key") is not None:
+        require_equal(
+            resources.get("field_sweep_resource_key"),
+            "/v2/sessions/current/analysis/frequency-domain/eigen/field-sweep.v1",
+            "manifest.resources.field_sweep_resource_key",
+        )
+    field_sweep = load_json(path, bundle_reader)
+    prefix = "field_sweep"
+    require_equal(field_sweep.get("schema_version"), "eigen/field_sweep.v1", f"{prefix}.schema_version")
+    require_non_empty_string(field_sweep.get("artifact_id"), f"{prefix}.artifact_id")
+    source = field_sweep.get("source")
+    if not isinstance(source, dict):
+        fail(f"{prefix}.source must be an object")
+    require_equal(source.get("kind"), "modal_eigensolve", f"{prefix}.source.kind")
+    source_artifact, source_path = require_bundle_path(
+        root, source.get("artifact"), f"{prefix}.source.artifact", bundle_reader
+    )
+    require_equal(source_artifact, "eigen/spectrum.v2.json", f"{prefix}.source.artifact")
+    source_revision = require_sha256_token(source.get("revision"), f"{prefix}.source.revision")
+    require_equal(
+        source_revision,
+        sha256_file_token(source_path, bundle_reader),
+        f"{prefix}.source.revision",
+    )
+    require_equal(field_sweep.get("source_revision"), source_revision, f"{prefix}.source_revision")
+    for name in ["run_id", "stage_id", "scope_id", "runtime_id"]:
+        require_non_empty_string(field_sweep.get(name), f"{prefix}.{name}")
+    self_revision = require_sha256_token(
+        field_sweep.get("revision"), f"{prefix}.revision"
+    )
+    content_sha256 = require_sha256_token(
+        field_sweep.get("content_sha256"), f"{prefix}.content_sha256"
+    )
+
+    status = require_non_empty_string(field_sweep.get("status"), f"{prefix}.status")
+    if status not in {"complete", "partial", "interrupted", "corrupt"}:
+        fail(f"{prefix}.status is invalid")
+    complete = require_boolean(field_sweep.get("complete"), f"{prefix}.complete")
+    interrupted = require_boolean(field_sweep.get("interrupted"), f"{prefix}.interrupted")
+    stop_reason = field_sweep.get("stop_reason")
+    if stop_reason is not None:
+        require_non_empty_string(stop_reason, f"{prefix}.stop_reason")
+    if complete:
+        require_equal(status, "complete", f"{prefix}.status")
+        require_equal(interrupted, False, f"{prefix}.interrupted")
+        require_equal(stop_reason, None, f"{prefix}.stop_reason")
+    elif status == "interrupted":
+        require_equal(interrupted, True, f"{prefix}.interrupted")
+        require_non_empty_string(stop_reason, f"{prefix}.stop_reason")
+    elif interrupted:
+        fail(f"{prefix}.interrupted requires status='interrupted'")
+    if not complete and ("promotion_binding" in field_sweep or "promotion" in field_sweep):
+        fail(f"{prefix} must not carry a promotion binding when incomplete")
+
+    requested_sample_count = require_non_negative_int(
+        field_sweep.get("requested_sample_count"), f"{prefix}.requested_sample_count"
+    )
+    completed_sample_count = require_non_negative_int(
+        field_sweep.get("completed_sample_count"), f"{prefix}.completed_sample_count"
+    )
+    samples = require_object_list(field_sweep.get("samples"), f"{prefix}.samples")
+    if complete:
+        require_equal(requested_sample_count, len(samples), f"{prefix}.requested_sample_count")
+        require_equal(completed_sample_count, len(samples), f"{prefix}.completed_sample_count")
+    elif requested_sample_count < len(samples):
+        fail(f"{prefix}.requested_sample_count must cover all published samples")
+
+    scan_axis = field_sweep.get("scan_axis")
+    if not isinstance(scan_axis, dict):
+        fail(f"{prefix}.scan_axis must be an object")
+    require_equal(scan_axis.get("kind"), "bias_field", f"{prefix}.scan_axis.kind")
+    require_equal(scan_axis.get("coordinate"), "bias_field_a_per_m", f"{prefix}.scan_axis.coordinate")
+    require_equal(scan_axis.get("unit"), "A/m", f"{prefix}.scan_axis.unit")
+    units = field_sweep.get("units")
+    if not isinstance(units, dict):
+        fail(f"{prefix}.units must be an object")
+    for field_name, expected in [
+        ("frequency", "Hz"),
+        ("angular_frequency", "rad/s"),
+        ("bias_field", "A/m"),
+        ("bias_field_display", "mu0 H (T)"),
+    ]:
+        require_equal(units.get(field_name), expected, f"{prefix}.units.{field_name}")
+
+    topology = field_sweep.get("topology")
+    if not isinstance(topology, dict):
+        fail(f"{prefix}.topology must be an object")
+    for field_name in ["mesh_id", "topology_revision", "indexing", "sample_axis", "mode_axis"]:
+        require_non_empty_string(topology.get(field_name), f"{prefix}.topology.{field_name}")
+    require_equal(topology.get("indexing"), "sample_index_then_raw_mode_index", f"{prefix}.topology.indexing")
+    require_equal(topology.get("sample_axis"), "sample_id", f"{prefix}.topology.sample_axis")
+    require_equal(topology.get("mode_axis"), "mode_id", f"{prefix}.topology.mode_axis")
+    node_count = topology.get("node_count")
+    if node_count is not None:
+        require_non_negative_int(node_count, f"{prefix}.topology.node_count")
+    for execution_name in ["requested_execution", "resolved_execution"]:
+        execution = field_sweep.get(execution_name)
+        if not isinstance(execution, dict):
+            fail(f"{prefix}.{execution_name} must be an object")
+        for field_name in ["backend", "device", "precision", "execution_mode", "engine", "status"]:
+            require_non_empty_string(execution.get(field_name), f"{prefix}.{execution_name}.{field_name}")
+
+    references = require_object_list(field_sweep.get("cross_artifact_refs"), f"{prefix}.cross_artifact_refs")
+    required_refs = {
+        "source_spectrum": "eigen/spectrum.v2.json",
+        "source_branches": "eigen/branches.v2.json",
+    }
+    seen_ref_relations: set[str] = set()
+    for index, reference in enumerate(references):
+        ref_prefix = f"{prefix}.cross_artifact_refs[{index}]"
+        relation = require_non_empty_string(reference.get("relation"), f"{ref_prefix}.relation")
+        if relation in seen_ref_relations:
+            fail(f"{prefix}.cross_artifact_refs contains duplicate relation {relation!r}")
+        seen_ref_relations.add(relation)
+        expected_path = required_refs.get(relation)
+        if expected_path is None:
+            fail(f"{ref_prefix}.relation is not a supported modal source relation")
+        artifact, ref_path = require_bundle_path(
+            root,
+            reference.get("artifact"),
+            f"{ref_prefix}.artifact",
+            bundle_reader,
+        )
+        require_equal(artifact, expected_path, f"{ref_prefix}.artifact")
+        revision = require_sha256_token(reference.get("revision"), f"{ref_prefix}.revision")
+        require_equal(
+            revision,
+            sha256_file_token(ref_path, bundle_reader),
+            f"{ref_prefix}.revision",
+        )
+    if seen_ref_relations != set(required_refs):
+        fail(f"{prefix}.cross_artifact_refs must contain spectrum and branches source refs")
+
+    seen_sample_ids: set[str] = set()
+    seen_sample_indices: set[int] = set()
+    completed_from_rows = 0
+    known_branch_ids = set(branch_ids_by_mode.values())
+    covered_modes: set[tuple[int, int]] = set()
+    covered_field_modes: set[tuple[int, int]] = set()
+    for sample_position, sample in enumerate(samples):
+        sample_prefix = f"{prefix}.samples[{sample_position}]"
+        sample_id = require_non_empty_string(sample.get("sample_id"), f"{sample_prefix}.sample_id")
+        if sample_id in seen_sample_ids:
+            fail(f"{prefix}.samples contains duplicate sample_id {sample_id!r}")
+        seen_sample_ids.add(sample_id)
+        sample_index = require_non_negative_int(sample.get("sample_index"), f"{sample_prefix}.sample_index")
+        if sample_index in seen_sample_indices:
+            fail(f"{prefix}.samples contains duplicate sample_index {sample_index}")
+        seen_sample_indices.add(sample_index)
+        require_equal(sample_id, f"bias-field-sample-{sample_index:04d}", f"{sample_prefix}.sample_id")
+        if sample_index not in {sample_key[0] for sample_key in known_modes}:
+            fail(f"{sample_prefix}.sample_index does not resolve in spectrum")
+        require_equal(sample.get("scan_axis"), scan_axis, f"{sample_prefix}.scan_axis")
+        for field_name, scale in [("bias_field_a_per_m", 1.0), ("bias_field_mu0_t", MU0)]:
+            values = sample.get(field_name)
+            if not isinstance(values, list) or len(values) != 3:
+                fail(f"{sample_prefix}.{field_name} must be a length-3 array")
+            for component_index, value in enumerate(values):
+                finite = require_finite_number(value, f"{sample_prefix}.{field_name}[{component_index}]")
+                if field_name == "bias_field_mu0_t":
+                    source_value = require_finite_number(
+                        sample["bias_field_a_per_m"][component_index],
+                        f"{sample_prefix}.bias_field_a_per_m[{component_index}]",
+                    )
+                    require_close(finite, source_value * scale, f"{sample_prefix}.{field_name}[{component_index}]", absolute_tolerance=1.0e-12)
+        sample_topology = sample.get("topology")
+        if not isinstance(sample_topology, dict):
+            fail(f"{sample_prefix}.topology must be an object")
+        require_equal(sample_topology, topology, f"{sample_prefix}.topology")
+        sample_status = require_non_empty_string(sample.get("status"), f"{sample_prefix}.status")
+        if sample_status not in {"complete", "partial", "interrupted", "corrupt"}:
+            fail(f"{sample_prefix}.status is invalid")
+        if sample_status == "complete":
+            completed_from_rows += 1
+            for handoff in [
+                "equilibrium_artifact_sha256",
+                "linearization_state_sha256",
+                "operator_input_signature_sha256",
+            ]:
+                require_sha256_token(sample.get(handoff), f"{sample_prefix}.{handoff}")
+        sample_stop_reason = sample.get("stop_reason")
+        if sample_status in {"partial", "interrupted", "corrupt"}:
+            require_non_empty_string(sample_stop_reason, f"{sample_prefix}.stop_reason")
+        elif sample_stop_reason is not None:
+            fail(f"{sample_prefix}.stop_reason must be null for a complete sample")
+        branch_ids = sample.get("branch_ids")
+        if not isinstance(branch_ids, list):
+            fail(f"{sample_prefix}.branch_ids must be an integer list")
+        sample_branch_ids: set[int] = set()
+        for branch_position, branch_id in enumerate(branch_ids):
+            numeric_branch_id = require_non_negative_int(branch_id, f"{sample_prefix}.branch_ids[{branch_position}]")
+            if numeric_branch_id in sample_branch_ids:
+                fail(f"{sample_prefix}.branch_ids contains duplicate branch_id")
+            sample_branch_ids.add(numeric_branch_id)
+            if numeric_branch_id not in known_branch_ids:
+                fail(f"{sample_prefix}.branch_ids references an unknown branch")
+        modes = require_object_list(sample.get("modes"), f"{sample_prefix}.modes")
+        for mode_position, mode in enumerate(modes):
+            mode_prefix = f"{sample_prefix}.modes[{mode_position}]"
+            require_equal(mode.get("sample_id"), sample_id, f"{mode_prefix}.sample_id")
+            raw_mode_index = require_non_negative_int(mode.get("raw_mode_index"), f"{mode_prefix}.raw_mode_index")
+            mode_key = (sample_index, raw_mode_index)
+            if mode_key not in known_modes:
+                fail(f"{mode_prefix}.raw_mode_index does not resolve in spectrum")
+            if mode_key in covered_modes:
+                fail(f"{prefix}.samples contains duplicate sample/mode mapping {mode_key!r}")
+            covered_modes.add(mode_key)
+            require_equal(mode.get("mode_id"), f"sample-{sample_index:04d}/mode-{raw_mode_index:04d}", f"{mode_prefix}.mode_id")
+            expected_branch_id = branch_ids_by_mode.get(mode_key)
+            require_equal(mode.get("branch_id"), expected_branch_id, f"{mode_prefix}.branch_id")
+            if expected_branch_id not in sample_branch_ids:
+                fail(f"{mode_prefix}.branch_id is absent from {sample_prefix}.branch_ids")
+            expected_frequency, _, _, expected_omega = known_modes[mode_key]
+            require_close(
+                require_finite_number(mode.get("frequency_hz"), f"{mode_prefix}.frequency_hz"),
+                expected_frequency,
+                f"{mode_prefix}.frequency_hz",
+            )
+            require_close(
+                require_finite_number(mode.get("angular_frequency_rad_per_s"), f"{mode_prefix}.angular_frequency_rad_per_s"),
+                expected_omega,
+                f"{mode_prefix}.angular_frequency_rad_per_s",
+                absolute_tolerance=1.0e-3,
+            )
+            require_equal(mode.get("source_revision"), source_revision, f"{mode_prefix}.source_revision")
+            require_equal(mode.get("status"), sample_status, f"{mode_prefix}.status")
+            if mode.get("residual_relative_l2") is not None:
+                residual = require_finite_number(mode.get("residual_relative_l2"), f"{mode_prefix}.residual_relative_l2")
+                if residual < 0.0:
+                    fail(f"{mode_prefix}.residual_relative_l2 must be non-negative")
+            field_status = mode.get("field_status")
+            if field_status is None:
+                field_status = "ready" if mode.get("mode_field_id") is not None else "spectrum-only"
+            if field_status == "spectrum-only":
+                for reference_name in ["mode_field_id", "mode_field_resource_key", "mode_artifact_path"]:
+                    require_equal(mode.get(reference_name), None, f"{mode_prefix}.{reference_name}")
+                continue
+            require_equal(field_status, "ready", f"{mode_prefix}.field_status")
+            require_non_empty_string(mode.get("mode_field_id"), f"{mode_prefix}.mode_field_id")
+            require_non_empty_string(known_mode_summaries[mode_key].get("mode_field_id"), f"{mode_prefix}.source_mode_field_id")
+            covered_field_modes.add(mode_key)
+            metadata_rel, metadata_path = require_bundle_path(
+                root,
+                mode.get("mode_artifact_path"),
+                f"{mode_prefix}.mode_artifact_path",
+                bundle_reader,
+            )
+            require_equal(metadata_rel, nested_mode_path(sample_index, raw_mode_index), f"{mode_prefix}.mode_artifact_path")
+            metadata = load_json(metadata_path, bundle_reader)
+            expected_summary = known_mode_summaries[mode_key]
+            require_equal(mode.get("mode_field_id"), expected_summary.get("mode_field_id"), f"{mode_prefix}.mode_field_id")
+            # Field-sweep omits HTTP transport while mode/spectrum bundles may still use it.
+            if mode.get("mode_field_resource_key") is not None:
+                require_equal(mode.get("mode_field_resource_key"), mode_field_resource_key(mode_field_id(sample_index, raw_mode_index)), f"{mode_prefix}.mode_field_resource_key")
+            require_equal(metadata.get("mode_field_id"), mode.get("mode_field_id"), f"{mode_prefix}.mode_field_id")
+            require_equal(metadata.get("component_basis"), "global_xyz", f"{mode_prefix}.component_basis")
+            require_equal(metadata.get("value_kind"), "complex_spatial_vector", f"{mode_prefix}.value_kind")
+            require_finite_number(mode.get("residual_relative_l2"), f"{mode_prefix}.residual_relative_l2")
+    require_equal(completed_sample_count, completed_from_rows, f"{prefix}.completed_sample_count")
+    visualizable_modes = {
+        mode_key
+        for mode_key, mode_summary in known_mode_summaries.items()
+        if mode_summary.get("mode_field_id") is not None
+    }
+    if complete and covered_field_modes != visualizable_modes:
+        fail(f"{prefix}.complete requires every visualizable spectrum mode to resolve in the field sweep")
+    expected_self_digest = canonical_artifact_self_digest(field_sweep, prefix)
+    require_equal(
+        content_sha256,
+        expected_self_digest,
+        f"{prefix}.content_sha256",
+    )
+    require_equal(self_revision, expected_self_digest, f"{prefix}.revision")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -3813,12 +7104,46 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--require-gpu-modal-k0-periodic-airbox-provenance",
+        action="store_true",
+        help=(
+            "require strict production GPU K0 periodic-airbox modal execution, "
+            "persistent device Krylov residency, zero iterative vector transfers, "
+            "full residual certification, and no CPU fallback"
+        ),
+    )
+    parser.add_argument(
+        "--require-k0-periodic-airbox-production",
+        action="store_true",
+        help=(
+            "require a fresh CPU or GPU P1 periodic-airbox modal artifact "
+            "without analytical Kittel metadata"
+        ),
+    )
+    parser.add_argument(
+        "--require-gpu-modal-k0-periodic-airbox-production",
+        action="store_true",
+        help=(
+            "require a fresh GPU P1 periodic-airbox modal artifact without "
+            "analytical Kittel metadata"
+        ),
+    )
+    parser.add_argument(
         "--require-low-k-de-bv-analytic-dispersion",
         action="store_true",
         help=(
             "require realistic thin-film low-k Damon-Eshbach and "
-            "backward-volume dispersion scenarios with |k| <= 3e6 rad/m, "
-            "frequency window <= 5 GHz, and Kalinikos n=0 analytic agreement"
+            "backward-volume dispersion scenarios within the homogeneous thin-film "
+            "Kalinikos n=0 model applicability, with analytic agreement"
+        ),
+    )
+    parser.add_argument(
+        "--require-r4-replay",
+        action="store_true",
+        help=(
+            "require the accepted/recomputed FEM equilibrium and linearization "
+            "identity replay gate; this remains unavailable until its payload "
+            "consumer is implemented"
         ),
     )
     return parser.parse_args(argv)
@@ -3828,6 +7153,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     if args.require_k0_kittel_periodic_airbox_demag:
         args.require_k0_kittel_demag = True
+    if args.require_gpu_modal_k0_periodic_airbox_provenance:
+        args.require_k0_kittel_periodic_airbox_demag = True
+        args.require_k0_kittel_demag = True
+    if args.require_gpu_modal_k0_periodic_airbox_production:
+        args.require_k0_periodic_airbox_production = True
     if args.require_k0_kittel_demag:
         args.require_k0_kittel_field_sweep = True
     if args.require_production_modal_k_path and args.require_production_gamma_k_path:
@@ -3835,7 +7165,11 @@ def main(argv: list[str] | None = None) -> int:
             "--require-production-modal-k-path and "
             "--require-production-gamma-k-path are mutually exclusive"
         )
-    root = Path(args.root)
+    try:
+        bundle_reader = ArtifactBundleReader(Path(args.root))
+    except (OSError, ValueError) as error:
+        fail(f"cannot capture frequency-domain artifact generation: {error}")
+    root = bundle_reader.root
     for relative_path in [
         "eigen/spectrum.v2.json",
         "eigen/branches.v2.json",
@@ -3843,22 +7177,48 @@ def main(argv: list[str] | None = None) -> int:
         "eigen/metadata/eigen_summary.json",
         "frequency_domain/manifest.v1.json",
     ]:
-        require_file(root / relative_path)
+        require_file(root / relative_path, bundle_reader)
 
-    spectrum = load_json(root / "eigen/spectrum.v2.json")
-    branches = load_json(root / "eigen/branches.v2.json")
-    summary = load_json(root / "eigen/metadata/eigen_summary.json")
-    manifest = load_json(root / "frequency_domain/manifest.v1.json")
-    solver_diagnostics = load_json(root / "eigen/diagnostics/solver.v1.json")
+    spectrum = load_json(root / "eigen/spectrum.v2.json", bundle_reader)
+    branches = load_json(root / "eigen/branches.v2.json", bundle_reader)
+    legacy_branches_path = root / "eigen/branches.json"
+    if bundle_reader.has_member("eigen/branches.json"):
+        validate_tracking_alias(branches, load_json(legacy_branches_path, bundle_reader))
+    summary = load_json(root / "eigen/metadata/eigen_summary.json", bundle_reader)
+    manifest = load_json(root / "frequency_domain/manifest.v1.json", bundle_reader)
+    solver_diagnostics = load_json(
+        root / "eigen/diagnostics/solver.v1.json", bundle_reader
+    )
 
     require_equal(spectrum.get("schema_version"), "eigen_spectrum.v2", "spectrum.schema_version")
     require_equal(branches.get("schema_version"), "eigen_branches.v2", "branches.schema_version")
+    spectrum_diagnostics_summary = spectrum.get("diagnostics_summary")
+    if spectrum_diagnostics_summary is not None:
+        if not isinstance(spectrum_diagnostics_summary, dict):
+            fail("spectrum.diagnostics_summary must be an object")
+        validate_assignment_ambiguity_metric(
+            spectrum_diagnostics_summary, "spectrum.diagnostics_summary"
+        )
     require_equal(
         manifest.get("schema_version"),
         "frequency_domain_manifest.v1",
         "manifest.schema_version",
     )
     require_equal(manifest.get("stage_kind"), "eigenmodes", "manifest.stage_kind")
+    computed_sample_indices = _computed_sample_indices_from_spectrum(spectrum)
+    r4_discovery = validate_equilibrium_artifacts(
+        root,
+        manifest,
+        solver_diagnostics,
+        computed_sample_indices=computed_sample_indices,
+        bundle_reader=bundle_reader,
+    )
+    report_r4_discovery(r4_discovery)
+    if args.require_r4_replay:
+        fail(
+            "R4 replay NOT VERIFIED "
+            f"[{r4_discovery['status']}]: {r4_discovery['reason']}"
+        )
     validate_manifest_physics(manifest)
     require_equal(
         manifest.get("artifacts", {}).get("solver_diagnostics_path"),
@@ -3869,7 +7229,7 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(manifest_diagnostics, dict):
         fail("manifest.diagnostics must be an object")
     require_tracking_summary(manifest_diagnostics, "manifest.diagnostics")
-    require_file(root / "eigen/diagnostics/solver.v1.json")
+    require_file(root / "eigen/diagnostics/solver.v1.json", bundle_reader)
     require_equal(
         solver_diagnostics.get("schema_version"),
         "frequency_domain_modal_solver_diagnostics.v1",
@@ -3934,15 +7294,23 @@ def main(argv: list[str] | None = None) -> int:
             mode_zarr_store_path(),
             "manifest.artifacts.mode_field_zarr_store_path",
         )
-        require_mode_zarr_store(root)
+        require_mode_zarr_store(root, bundle_reader)
         require_zarr_mode_fields = True
     elif (
         mode_field_storage_format == "binary_compatibility_exports"
         and (
             args.require_low_k_de_bv_analytic_dispersion
             or args.require_k0_kittel_demag
+            or args.require_k0_periodic_airbox_production
         )
     ):
+        require_equal(
+            manifest.get("artifacts", {}).get("mode_field_zarr_store_path"),
+            None,
+            "manifest.artifacts.mode_field_zarr_store_path",
+        )
+        require_zarr_mode_fields = False
+    elif mode_field_storage_format == "none":
         require_equal(
             manifest.get("artifacts", {}).get("mode_field_zarr_store_path"),
             None,
@@ -3974,6 +7342,8 @@ def main(argv: list[str] | None = None) -> int:
     known_modes: dict[tuple[int, int], tuple[float, float, float, float]] = {}
     known_mode_summaries: dict[tuple[int, int], dict] = {}
     known_samples: dict[int, tuple[float, tuple[float, float, float], str]] = {}
+    sample_ids_by_index: dict[int, str] = {}
+    sample_indices_by_id: dict[str, int] = {}
     published_mode_counts: list[int] = []
     for sample_position, sample in enumerate(samples):
         sample_index = require_non_negative_int(
@@ -3997,6 +7367,15 @@ def main(argv: list[str] | None = None) -> int:
         if not isinstance(label, str):
             fail(f"spectrum.samples[{sample_position}].label must be a string or null")
         known_samples[sample_index] = (path_s, k_vector, label)
+        if "sample_id" in sample or args.require_production_modal_k_path or args.require_production_gamma_k_path:
+            sample_id = require_non_empty_string(
+                sample.get("sample_id"),
+                f"spectrum.samples[{sample_position}].sample_id",
+            )
+            if sample_id in sample_indices_by_id and sample_indices_by_id[sample_id] != sample_index:
+                fail(f"duplicate spectrum sample_id {sample_id!r}")
+            sample_ids_by_index[sample_index] = sample_id
+            sample_indices_by_id[sample_id] = sample_index
         modes = require_object_list(sample.get("modes"), f"spectrum.samples[{sample_position}].modes")
         published_mode_counts.append(len(modes))
         for mode in modes:
@@ -4015,6 +7394,7 @@ def main(argv: list[str] | None = None) -> int:
                 manifest_mode_resources,
                 requested_window_hz,
                 require_zarr_mode_fields,
+                bundle_reader,
             )
             known_modes[(known_sample_index, known_raw_mode_index)] = (
                 known_frequency_hz,
@@ -4025,6 +7405,17 @@ def main(argv: list[str] | None = None) -> int:
             known_mode_summaries[(known_sample_index, known_raw_mode_index)] = mode
     if not known_modes:
         fail("spectrum.samples must include at least one mode")
+    if mode_field_storage_format == "none":
+        if manifest_mode_paths or manifest_mode_resources:
+            fail("spectrum-only manifest must not declare mode metadata paths or field resources")
+        for (sample_index, raw_mode_index), mode in known_mode_summaries.items():
+            if validate_json_mode_field_availability(
+                mode,
+                f"spectrum mode {sample_index}/{raw_mode_index}",
+                sample_index,
+                raw_mode_index,
+            ):
+                fail("spectrum-only manifest must not publish available mode fields")
     spectrum_mode_count = require_non_negative_int(
         spectrum.get("mode_count"),
         "spectrum.mode_count",
@@ -4045,7 +7436,9 @@ def main(argv: list[str] | None = None) -> int:
         "solver_diagnostics.mode_count",
     )
     if args.require_reference_full_2x2_floquet:
-        validate_reference_full_2x2_floquet_mode_metadata(root, manifest_mode_paths)
+        validate_reference_full_2x2_floquet_mode_metadata(
+            root, manifest_mode_paths, bundle_reader
+        )
     validate_dispersion_k_sampling_path(
         root,
         known_samples,
@@ -4053,6 +7446,7 @@ def main(argv: list[str] | None = None) -> int:
             args.require_reference_full_2x2_floquet
             or args.require_production_modal_k_path
         ),
+        bundle_reader=bundle_reader,
     )
     validate_production_k_path_samples(
         known_samples,
@@ -4070,6 +7464,7 @@ def main(argv: list[str] | None = None) -> int:
         require_production_gamma_k_path=args.require_production_gamma_k_path,
     )
 
+    validate_tracking_edge_provenance(branches, list(known_samples))
     branch_modes: set[tuple[int, int]] = set()
     branch_ids_by_mode: dict[tuple[int, int], int] = {}
     tracking_sources_by_mode: dict[tuple[int, int], str] = {}
@@ -4079,6 +7474,9 @@ def main(argv: list[str] | None = None) -> int:
     if not isinstance(branch_diagnostics, dict):
         fail("branches.diagnostics must be an object")
     require_tracking_summary(branch_diagnostics, "branches.diagnostics")
+    validate_assignment_ambiguity_metric(
+        branch_diagnostics, "branches.diagnostics"
+    )
     for branch_index, branch in enumerate(require_object_list(branches.get("branches"), "branches.branches")):
         branch_id = require_non_negative_int(branch.get("branch_id"), f"branches[{branch_index}].branch_id")
         for point in require_object_list(branch.get("points"), f"branches[{branch_index}].points"):
@@ -4088,6 +7486,17 @@ def main(argv: list[str] | None = None) -> int:
                 "branch point.raw_mode_index",
             )
             branch_mode_key = (sample_index, raw_mode_index)
+            validate_artifact_mode_identity(
+                point,
+                "branch point",
+                sample_index,
+                raw_mode_index,
+                sample_ids_by_index,
+                required=(
+                    args.require_production_modal_k_path
+                    or args.require_production_gamma_k_path
+                ),
+            )
             branch_modes.add(branch_mode_key)
             existing_branch_id = branch_ids_by_mode.get(branch_mode_key)
             if existing_branch_id is not None and existing_branch_id != branch_id:
@@ -4105,8 +7514,11 @@ def main(argv: list[str] | None = None) -> int:
             if tracking_confidence < 0.0 or tracking_confidence > 1.0:
                 fail("branch point.tracking_confidence must be in [0, 1]")
             overlap_prev = point.get("overlap_prev")
-            if tracking_source == "modal_overlap_weighted_score" and overlap_prev is None:
-                fail("branch point.overlap_prev is required for modal_overlap_weighted_score")
+            if tracking_source in {
+                "modal_overlap_weighted_score",
+                "modal_overlap_unweighted_score",
+            } and overlap_prev is None:
+                fail(f"branch point.overlap_prev is required for {tracking_source}")
             if overlap_prev is not None:
                 overlap_by_mode[branch_mode_key] = require_finite_number(
                     overlap_prev,
@@ -4121,13 +7533,25 @@ def main(argv: list[str] | None = None) -> int:
                         "branch point.tracking_confidence",
                         absolute_tolerance=1.0e-12,
                     )
-            require_mode_field_handoff(
-                point,
-                "branch point",
-                sample_index,
-                raw_mode_index,
-            )
             if branch_mode_key in known_modes:
+                spectrum_mode = known_mode_summaries[branch_mode_key]
+                spectrum_field_available = validate_json_mode_field_availability(
+                    spectrum_mode,
+                    f"spectrum mode {sample_index}/{raw_mode_index}",
+                    sample_index,
+                    raw_mode_index,
+                )
+                branch_field_available = validate_json_mode_field_availability(
+                    point,
+                    "branch point",
+                    sample_index,
+                    raw_mode_index,
+                )
+                require_equal(
+                    branch_field_available,
+                    spectrum_field_available,
+                    "branch point.mode_field_available",
+                )
                 frequency_hz = require_finite_number(
                     point.get("frequency_hz"),
                     "branch point.frequency_hz",
@@ -4176,10 +7600,26 @@ def main(argv: list[str] | None = None) -> int:
     dispersion_rows_by_mode = validate_dispersion(
         root,
         known_modes,
+        known_mode_summaries,
         known_samples,
+        sample_ids_by_index,
         branch_ids_by_mode,
         tracking_sources_by_mode,
         overlap_by_mode,
+        require_stable_ids=(
+            args.require_production_modal_k_path
+            or args.require_production_gamma_k_path
+        ),
+        bundle_reader=bundle_reader,
+    )
+    validate_typed_modal_field_sweep(
+        root,
+        manifest,
+        solver_diagnostics,
+        known_modes,
+        known_mode_summaries,
+        branch_ids_by_mode,
+        bundle_reader,
     )
 
     if args.require_reference_full_2x2_floquet:
@@ -4194,6 +7634,7 @@ def main(argv: list[str] | None = None) -> int:
             known_modes,
             known_samples,
             branch_ids_by_mode,
+            bundle_reader,
         )
     if args.require_exchange_only_reciprocal_dispersion:
         validate_exchange_only_reciprocal_dispersion(
@@ -4209,9 +7650,23 @@ def main(argv: list[str] | None = None) -> int:
             branch_ids_by_mode,
             require_demag=args.require_k0_kittel_demag,
             require_periodic_airbox_demag=args.require_k0_kittel_periodic_airbox_demag,
+            bundle_reader=bundle_reader,
         )
     if args.require_gpu_modal_k0_kittel_provenance:
-        validate_gpu_modal_k0_kittel_provenance(root)
+        validate_gpu_modal_k0_kittel_provenance(root, bundle_reader)
+    if args.require_gpu_modal_k0_periodic_airbox_provenance:
+        validate_gpu_modal_k0_periodic_airbox_provenance(root, bundle_reader)
+    if args.require_k0_periodic_airbox_production:
+        validate_k0_periodic_airbox_production_provenance(root, bundle_reader)
+        if args.require_gpu_modal_k0_periodic_airbox_production:
+            requested_execution = manifest.get("requested_execution")
+            if not isinstance(requested_execution, dict):
+                fail("GPU K0 production provenance requires requested execution metadata")
+            require_equal(
+                requested_execution.get("device"),
+                "gpu",
+                "manifest.requested_execution.device",
+            )
     if args.require_low_k_de_bv_analytic_dispersion:
         validate_low_k_de_bv_analytic_dispersion(
             root,
@@ -4219,6 +7674,7 @@ def main(argv: list[str] | None = None) -> int:
             known_samples,
             branch_ids_by_mode,
             dispersion_rows_by_mode,
+            bundle_reader,
         )
 
     validate_eigen_summary(
@@ -4226,6 +7682,15 @@ def main(argv: list[str] | None = None) -> int:
         known_modes,
         known_mode_summaries,
         requested_window_hz,
+    )
+    try:
+        bundle_reader.ensure_current()
+    except (OSError, ValueError) as error:
+        fail(f"artifact generation changed or became unreadable during verification: {error}")
+    print(
+        "artifact_generation: "
+        + json.dumps(bundle_reader.generation_descriptor(), sort_keys=True),
+        file=sys.stderr,
     )
     return 0
 

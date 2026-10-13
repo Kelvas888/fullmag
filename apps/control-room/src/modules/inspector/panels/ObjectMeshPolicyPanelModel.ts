@@ -39,6 +39,10 @@ export interface ObjectMeshPolicyDraft {
   cornerMaximumElementSize: string;
   cornerTransitionDistance: string;
   configText: string;
+  /** Last JSON projection shared by the structured and advanced editors. */
+  syncedConfigText?: string;
+  /** True after either editor has committed a validated JSON projection. */
+  configSynchronized?: boolean;
   curvatureFactor: string;
   edgeMaximumElementSize: string;
   edgeThickness: string;
@@ -70,8 +74,6 @@ export interface ObjectMeshPolicyDraft {
   source: string;
   smoothingSteps: string;
   sweepFaceMeshing: string;
-  sweepDestination: string;
-  sweepSource: string;
   calibrateFor: string;
   sizePreset: string;
   sizeFactor: string;
@@ -218,16 +220,28 @@ export function validateObjectMeshTopologyCapabilities(
   draft: ObjectMeshPolicyDraft,
   capabilities: ObjectMeshTopologyCapabilities,
 ): string | null {
-  const rawConfig = parseConfig(draft.configText);
   const built = buildObjectMeshPolicyReplaceRequest(draft);
-  const rawRequestsMixed = rawConfig.ok && requestsExactLayeredPrism(rawConfig.value);
-  const builtRequestsMixed =
-    "request" in built &&
-    built.request.config !== null &&
-    requestsExactLayeredPrism(built.request.config ?? {});
-  if (!rawRequestsMixed && !builtRequestsMixed) return null;
-  if (capabilities.layeredPrism.enabled) return null;
-  return `Exact layered prism authoring is unavailable: ${capabilities.layeredPrism.reason}`;
+  const builtConfig = "request" in built ? built.request.config : null;
+  if (!builtConfig || !requestsExactLayeredPrism(builtConfig)) return null;
+  if (!capabilities.layeredPrism.enabled) {
+    return `Exact layered prism authoring is unavailable: ${capabilities.layeredPrism.reason}`;
+  }
+  const requestedLayerCounts = [builtConfig.through_thickness_elements].filter(
+    (value): value is number => typeof value === "number" && Number.isInteger(value),
+  );
+  const supportedLayerCounts = new Set(
+    capabilities.layeredPrism.supportedLayerCounts,
+  );
+  if (
+    requestedLayerCounts.some(
+      (layerCount) => !supportedLayerCounts.has(layerCount),
+    )
+  ) {
+    return `Exact layered prism supports ${capabilities.layeredPrism.supportedLayerCounts.join(
+      ", ",
+    )} through-thickness elements.`;
+  }
+  return null;
 }
 
 export function formatObjectMeshPolicyConfig(
@@ -237,16 +251,41 @@ export function formatObjectMeshPolicyConfig(
   return JSON.stringify(config, null, 2);
 }
 
+const LAYERED_MESH_POLICY_KEYS = [
+  "element_family",
+  "exact_layer_count",
+  "mesh_strategy",
+  "order",
+  "sweep_direction",
+  "sweep_face_meshing",
+  "through_thickness_distribution",
+  "through_thickness_element_ratio",
+  "through_thickness_elements",
+  "through_thickness_symmetric",
+  "topology",
+  "transition_policy",
+] as const;
+
+export function clearObjectMeshStrategyFromConfig(configText: string): string {
+  const parsed = parseConfig(configText);
+  if (!parsed.ok) return configText;
+  const value = { ...parsed.value };
+  for (const key of LAYERED_MESH_POLICY_KEYS) delete value[key];
+  return formatObjectMeshPolicyConfig(value);
+}
+
 export function draftFromObjectMeshPolicyResource(
   resource: MeshObjectConfigResource,
   options: {
     effectiveTarget?: JsonObject | null | undefined;
+    authoredOnly?: boolean;
   } = {},
 ): ObjectMeshPolicyDraft {
+  const inherited = !options.authoredOnly && resource.config == null;
   const config = {
-    ...defaultObjectMeshPolicyConfig(),
-    ...targetConfigFromEffectiveObject(options.effectiveTarget),
-    ...(resource.effective_config ?? {}),
+    ...(inherited ? defaultObjectMeshPolicyConfig() : {}),
+    ...(inherited ? targetConfigFromEffectiveObject(options.effectiveTarget) : {}),
+    ...(inherited ? resource.effective_config ?? {} : {}),
     ...(resource.config ?? {}),
   };
   const manualBox = readManualBoxSizeField(config.size_fields);
@@ -288,6 +327,7 @@ export function draftFromObjectMeshPolicyResource(
     ),
     calibrateFor: readStringText(config.calibrate_for),
     configText: formatObjectMeshPolicyConfig(resource.config),
+    syncedConfigText: formatObjectMeshPolicyConfig(resource.config),
     curvatureFactor: readNumberText(config.curvature_factor),
     edgeMaximumElementSize: readNumberText(config.edge_maximum_element_size),
     edgeThickness: readNumberText(config.edge_thickness),
@@ -328,8 +368,6 @@ export function draftFromObjectMeshPolicyResource(
     sizePreset: readStringText(config.size_preset),
     smoothingSteps: readNumberText(config.smoothing_steps),
     sweepFaceMeshing: readStringText(config.sweep_face_meshing),
-    sweepDestination: readStringText(config.sweep_destination),
-    sweepSource: readStringText(config.sweep_source),
     throughThicknessDistribution: readStringText(
       config.through_thickness_distribution,
     ),
@@ -411,7 +449,79 @@ function targetConfigFromEffectiveObject(
   return config;
 }
 
-export function buildObjectMeshPolicyReplaceRequest({
+export function objectMeshPolicyJsonError(configText: string): string | null {
+  const parsed = parseConfig(configText);
+  return parsed.ok ? null : parsed.error;
+}
+
+function synchronizeObjectMeshPolicyJson(draft: ObjectMeshPolicyDraft): ObjectMeshPolicyDraft {
+  if (draft.syncedConfigText === undefined || draft.configText === draft.syncedConfigText) return draft;
+  const previous = parseConfig(draft.syncedConfigText);
+  const next = parseConfig(draft.configText);
+  if (!previous.ok || !next.ok) return draft;
+  const project = (config: JsonObject) => draftFromObjectMeshPolicyResource({ object_id: "", config, revision: 0 }, { authoredOnly: true });
+  const previousFields = project(previous.value);
+  const nextFields = project(next.value);
+  const changes: Partial<ObjectMeshPolicyDraft> = {};
+  for (const key of Object.keys(nextFields) as (keyof ObjectMeshPolicyDraft)[]) {
+    if (["configText", "syncedConfigText", "configSynchronized", "present"].includes(key)) continue;
+    if (!Object.is(previousFields[key], nextFields[key])) {
+      Object.assign(changes, { [key]: nextFields[key] });
+    }
+  }
+  return { ...draft, ...changes, syncedConfigText: draft.configText, configSynchronized: true };
+}
+
+export function updateObjectMeshPolicyDraft(
+  draft: ObjectMeshPolicyDraft,
+  patch: Partial<ObjectMeshPolicyDraft>,
+): ObjectMeshPolicyDraft {
+  const next = { ...synchronizeObjectMeshPolicyJson(draft), ...patch };
+  if (Object.keys(patch).length === 1 && patch.configText !== undefined) {
+    return synchronizeObjectMeshPolicyJson(next);
+  }
+  // Presets may update JSON and structured controls together as one transaction.
+  const formDraft = { ...next, syncedConfigText: next.configText, configSynchronized: false };
+  const result = buildObjectMeshPolicyFormRequest(formDraft);
+  if ("error" in result || !result.request?.config) return formDraft;
+  const previous = buildObjectMeshPolicyFormRequest(draft);
+  const parsed = parseConfig(draft.configText);
+  let config = result.request.config;
+  if (patch.configText === undefined && parsed.ok && "request" in previous && previous.request?.config) {
+    config = { ...parsed.value };
+    const before = previous.request.config;
+    const after = result.request.config;
+    for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+      if (JSON.stringify(before[key]) === JSON.stringify(after[key])) continue;
+      if (Object.hasOwn(after, key)) config[key] = after[key]!;
+      else delete config[key];
+    }
+  }
+  const configText = formatObjectMeshPolicyConfig(config);
+  return { ...formDraft, configText, syncedConfigText: configText, configSynchronized: true };
+}
+
+export function buildObjectMeshPolicyReplaceRequest(
+  draft: ObjectMeshPolicyDraft,
+): ReturnType<typeof buildObjectMeshPolicyFormRequest> {
+  const synchronized = synchronizeObjectMeshPolicyJson(draft);
+  const result = buildObjectMeshPolicyFormRequest(synchronized.configSynchronized ? { ...synchronized, meshStrategy: "" } : synchronized);
+  if (!synchronized.configSynchronized || "error" in result || !result.request) return result;
+  if (!synchronized.present) return result;
+  const parsed = parseConfig(synchronized.configText);
+  if (!parsed.ok) return { error: parsed.error };
+  const config = { ...parsed.value };
+  for (const key of ["compute_quality", "per_element_quality", "exact_layer_count", "through_thickness_symmetric"]) {
+    if (config[key] !== undefined && config[key] !== null && typeof config[key] !== "boolean") {
+      return { error: key + " must be a boolean." };
+    }
+  }
+  delete config.sweep_source;
+  delete config.sweep_destination;
+  return { request: { config } };
+}
+
+function buildObjectMeshPolicyFormRequest({
   cornerExtent,
   cornerMaximumElementSize,
   cornerTransitionDistance,
@@ -470,8 +580,6 @@ export function buildObjectMeshPolicyReplaceRequest({
   sizeFactor,
   sizeFromCurvature,
   sweepFaceMeshing,
-  sweepDestination,
-  sweepSource,
   throughThicknessDistribution,
   throughThicknessElementRatio,
   throughThicknessElements,
@@ -490,6 +598,26 @@ export function buildObjectMeshPolicyReplaceRequest({
   const config = parseConfig(configText);
   if (!config.ok) return { error: config.error };
   const value = { ...config.value };
+  delete value.sweep_source;
+  delete value.sweep_destination;
+  const preserveRawLayeredPrism =
+    value.mesh_strategy === "swept_prism" && !meshStrategy.trim();
+  const preserveRawLayeredPrismField = (key: string, text: string): boolean =>
+    preserveRawLayeredPrism &&
+    !text.trim() &&
+    Object.prototype.hasOwnProperty.call(value, key);
+  const advancedSource = value.source;
+  if (
+    source.trim() ||
+    (advancedSource !== undefined &&
+      advancedSource !== null &&
+      advancedSource !== "")
+  ) {
+    return {
+      error:
+        "Per-object mesh source is unavailable; use the study-level imported mesh route.",
+    };
+  }
 
   const numericFields: Array<[
     key: string,
@@ -551,6 +679,14 @@ export function buildObjectMeshPolicyReplaceRequest({
   ];
 
   for (const [key, text, label, integer, allowZero] of numericFields) {
+    if (preserveRawLayeredPrismField(key, text)) continue;
+    if (
+      key === "through_thickness_elements" &&
+      !text.trim() &&
+      Object.prototype.hasOwnProperty.call(value, key)
+    ) {
+      continue;
+    }
     const parsed = parsePositiveNumber(text, label, integer, allowZero);
     if (!parsed.ok) return { error: parsed.error };
     applyOptionalNumber(value, key, parsed.value);
@@ -594,27 +730,58 @@ export function buildObjectMeshPolicyReplaceRequest({
     cornerTransitionDistanceValue.value,
   );
 
-  applyOptionalString(value, "mesh_strategy", meshStrategy);
-  applyOptionalString(value, "topology", topology);
-  applyOptionalString(value, "transition_policy", transitionPolicy);
+  if (
+    meshStrategy.trim() ||
+    !Object.prototype.hasOwnProperty.call(value, "mesh_strategy")
+  ) {
+    applyOptionalString(value, "mesh_strategy", meshStrategy);
+  }
+  applyOptionalString(
+    value,
+    "topology",
+    topology,
+    preserveRawLayeredPrismField("topology", topology),
+  );
+  applyOptionalString(
+    value,
+    "transition_policy",
+    transitionPolicy,
+    preserveRawLayeredPrismField("transition_policy", transitionPolicy),
+  );
   applyOptionalString(value, "optimize", optimize);
   applyOptionalString(value, "source", source);
   applyOptionalString(
     value,
     "through_thickness_distribution",
     throughThicknessDistribution,
+    preserveRawLayeredPrismField(
+      "through_thickness_distribution",
+      throughThicknessDistribution,
+    ),
   );
-  applyOptionalString(value, "sweep_face_meshing", sweepFaceMeshing);
-  applyOptionalString(value, "sweep_source", sweepSource);
-  applyOptionalString(value, "sweep_destination", sweepDestination);
+  applyOptionalString(
+    value,
+    "sweep_face_meshing",
+    sweepFaceMeshing,
+    preserveRawLayeredPrismField("sweep_face_meshing", sweepFaceMeshing),
+  );
   applyOptionalString(value, "calibrate_for", calibrateFor);
   applyOptionalString(value, "size_preset", sizePreset);
   applyOptionalBoolean(
     value,
     "through_thickness_symmetric",
     throughThicknessSymmetric,
+    preserveRawLayeredPrismField(
+      "through_thickness_symmetric",
+      throughThicknessSymmetric,
+    ),
   );
-  applyOptionalBoolean(value, "exact_layer_count", exactLayerCount);
+  if (
+    exactLayerCount.trim() ||
+    !Object.prototype.hasOwnProperty.call(value, "exact_layer_count")
+  ) {
+    applyOptionalBoolean(value, "exact_layer_count", exactLayerCount);
+  }
   if (meshStrategy === "swept_prism") {
     const layerCount = value.through_thickness_elements;
     if (
@@ -739,6 +906,7 @@ function draftRecordsEqual(
 ): boolean {
   const keys = new Set([...Object.keys(left), ...Object.keys(right)]);
   for (const key of keys) {
+    if (key === "syncedConfigText" || key === "configSynchronized") continue;
     if (key === "configText") {
       if (!jsonTextEquivalent(left[key], right[key])) return false;
     } else if (!draftValueEquivalent(left[key], right[key])) {
@@ -929,11 +1097,15 @@ function applyManualBoxSizeField(
   if (draft.enabled) {
     const parsed = parseManualBoxSizeField(draft);
     if (!parsed.ok) return parsed;
+    const original = asRecord(fields.find((entry) => isEditableManualBoxSizeField(entry, draft.source)));
+    const params = { ...asRecord(original?.params), ...parsed.params };
+    delete params.Source;
     nextFields.push({
+      ...original,
       kind: "Box",
       source: OBJECT_POLICY_MANUAL_BOX_SOURCE,
-      params: parsed.params,
-    });
+      params,
+    } as JsonValue);
   }
 
   if (nextFields.length === 0) {
@@ -970,10 +1142,14 @@ function applyObjectCoreRelaxationSizeField(
   if (draft.enabled) {
     const parsed = parseObjectCoreRelaxationSizeField(draft);
     if (!parsed.ok) return parsed;
+    const original = asRecord(fields.find((entry) => asRecord(entry)?.kind === OBJECT_CORE_RELAXATION_KIND));
+    const extraParams = { ...asRecord(original?.params) };
+    for (const key of ["GeometryName", "core_maximum_element_size", "edge_distance", "edge_maximum_element_size", "sampling_edge", "sampling_surface", "surface_distance", "surface_maximum_element_size"]) delete extraParams[key];
     nextFields.push({
+      ...original,
       kind: OBJECT_CORE_RELAXATION_KIND,
-      params: parsed.params,
-    });
+      params: { ...extraParams, ...parsed.params },
+    } as JsonValue);
   }
 
   if (nextFields.length === 0) {
@@ -1150,9 +1326,9 @@ function readNumberText(value: unknown): string {
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (!trimmed) return "";
-    return Number.isFinite(Number(trimmed)) ? trimmed : "";
+    return trimmed;
   }
-  return "";
+  return value == null ? "" : JSON.stringify(value);
 }
 
 function readTransitionDistanceText(value: unknown): string {
@@ -1374,9 +1550,13 @@ function applyOptionalString(
   config: JsonObject,
   key: string,
   value: string,
+  preserveExistingWhenBlank = false,
 ): void {
   const trimmed = value.trim();
   if (!trimmed) {
+    if (preserveExistingWhenBlank && Object.prototype.hasOwnProperty.call(config, key)) {
+      return;
+    }
     delete config[key];
     return;
   }
@@ -1388,9 +1568,13 @@ function applyOptionalBoolean(
   config: JsonObject,
   key: string,
   value: string,
+  preserveExistingWhenBlank = false,
 ): void {
   const trimmed = value.trim();
   if (!trimmed) {
+    if (preserveExistingWhenBlank && Object.prototype.hasOwnProperty.call(config, key)) {
+      return;
+    }
     delete config[key];
     return;
   }

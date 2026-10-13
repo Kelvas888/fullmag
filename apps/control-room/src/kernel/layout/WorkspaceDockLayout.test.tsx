@@ -14,8 +14,11 @@ import { RealtimeConnectionController } from "../realtime/RealtimeConnectionCont
 import { RealtimeInvalidationBridge } from "../realtime/RealtimeInvalidationBridge";
 import { ResourceInvalidationController } from "../resources/ResourceInvalidationController";
 import { SelectionController } from "../selection/SelectionController";
+import { ObjectMoveToolController } from "../authoring/ObjectMoveToolController";
+import { ObjectEditSessionController } from "../authoring/object-edit/ObjectEditSessionController";
 import type { KernelApi } from "../types";
 import { AnalysisFieldOverlayController } from "../visualization/AnalysisFieldOverlayController";
+import { ModeCompositionController } from "../visualization/ModeCompositionController";
 import { ChartViewportHandoffController } from "@/kernel/visualization/ChartViewportHandoffController";
 import { CameraRegistryController } from "../visualization/CameraRegistryController";
 import { ObjectVisualizationController } from "../visualization/ObjectVisualizationController";
@@ -23,6 +26,7 @@ import { VisualizationDebugController } from "../visualization/VisualizationDebu
 import { VisualizationRegistrySyncController } from "../visualization/VisualizationRegistrySyncController";
 
 import { LayoutController } from "./LayoutController";
+import { WorkspaceStartupInteractionContext } from "./SimulationStartupOverlay";
 import { WorkspaceDockLayout } from "./WorkspaceDockLayout";
 
 function TestModule() {
@@ -47,6 +51,14 @@ function makeKernel(): KernelApi {
     }),
     layout: new LayoutController(bus),
     modules: new ModuleRegistry(),
+    objectEditSession: new ObjectEditSessionController(),
+    objectMoveTool: new ObjectMoveToolController(),
+    modeComposition: new ModeCompositionController({
+      getActiveModeComposition: (options) =>
+        api.visualization.modeComposition.active(options),
+      patchActiveModeComposition: (patch, options) =>
+        api.visualization.modeComposition.patch(patch, options),
+    }),
     realtime: new RealtimeInvalidationBridge(resources),
     realtimeConnection: new RealtimeConnectionController(),
     resources,
@@ -94,5 +106,39 @@ describe("WorkspaceDockLayout", () => {
     expect(html).toContain("data-dock-hydration-pending=\"true\"");
     expect(html).toContain("data-slot-id=\"viewport-main\"");
     expect(html).toContain("data-slot-id=\"viewport-aux\"");
+  });
+
+  it("inerts underlying dock panels while startup blocks interaction", () => {
+    const html = renderToStaticMarkup(
+      <KernelContext.Provider value={makeKernel()}>
+        <WorkspaceStartupInteractionContext.Provider value>
+          <WorkspaceDockLayout />
+        </WorkspaceStartupInteractionContext.Provider>
+      </KernelContext.Provider>,
+    );
+
+    expect(html).toContain("inert");
+    expect(html).not.toContain('data-startup-diagnostics="visible"');
+  });
+
+  it("lifts the existing diagnostics panel without mounting a second slot", () => {
+    const kernel = makeKernel();
+    kernel.layout.openBottomPanel("diagnostics");
+
+    const html = renderToStaticMarkup(
+      <KernelContext.Provider value={kernel}>
+        <WorkspaceStartupInteractionContext.Provider value>
+          <WorkspaceDockLayout />
+        </WorkspaceStartupInteractionContext.Provider>
+      </KernelContext.Provider>,
+    );
+
+    expect(html).toContain('data-startup-diagnostics="visible"');
+    expect(html.match(/data-slot-id="panel-bottom"/g)).toHaveLength(1);
+    const bottomPanelTag = html.match(
+      /<div[^>]*class="fm-workspace-bottom-panel"[^>]*>/,
+    )?.[0];
+    expect(bottomPanelTag).toContain('data-startup-diagnostics="visible"');
+    expect(bottomPanelTag).not.toContain("inert");
   });
 });

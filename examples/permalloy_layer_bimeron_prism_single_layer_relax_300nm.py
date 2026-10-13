@@ -35,7 +35,7 @@ study.engine("fem")
 study.device("gpu", precision="double")
 study.universe(
     mode="auto",
-    size=(2.8e-6, 2.1e-6, 1.2e-6),
+    size=(2.1e-6, 2.0e-6, 1.0e-6),
     center=(0.0, 0.0, 0.0),
     padding=(0.0, 0.0, 0.0),
 )
@@ -66,6 +66,7 @@ layer.m = fm.texture.bimeron(
 layer.mesh.thin_film(
     maximum_element_size=20 * NM,
     minimum_element_size=1.6 * NM,
+    interface_maximum_element_size=10 * NM,
     order=1,
     layers=1,
     topology="prismatic",
@@ -74,7 +75,6 @@ layer.mesh.thin_film(
 )
 
 # Interactions, mesh, and solver
-# study.exchange()
 study.demag(realization="poisson_robin")
 study.objects.mesh.defaults(
     algorithm_2d=6,

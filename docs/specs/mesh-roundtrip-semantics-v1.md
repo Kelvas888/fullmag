@@ -32,6 +32,8 @@ Render controls can affect what is displayed in viewport only; they are not allo
 - `universe_mesh_config` is the source of truth for universe/airbox policy.
 - `per_object_mesh_config` is the source of truth for object-level mesh overrides.
 
+Manual outer-domain policy must contain finite positive size; optional center retains the existing origin convention. Accepted `study.universe_mesh` takes precedence over a retained `scene.universe` projection. An authored body outside manual bounds blocks mesh build and solver run until bounds or placement are corrected; authoring edits remain allowed. Automatic policy may remain geometry-dependent before the first object. It does not require an executing engine. See [ADR 0053](../adr/0053-authoring-method-and-first-run-domain.md) for model method versus run resolution and readiness ownership.
+
 ### 3.2 Derived solver level
 
 - `solver_mesh` is a derived artifact/reference, not a replacement for authoring intent.
@@ -56,6 +58,34 @@ session-scoped v2 meshing resources under `/v2/sessions/current/meshing/...`:
 - `render_only_controls_do_not_change_solver_domain`.
 
 These resources remain thin and revisioned; heavy geometry stays on binary topology lanes.
+
+### Stage continuation and modal handoff
+
+An implicit Study transition may reuse a field only when the source and target
+carry the same canonical discretization identity. For FEM this means the full
+`sha256:` topology fingerprint, including node ordering, typed connectivity,
+markers, boundary facets and periodic pairs. For FDM it additionally means the
+same origin, cell counts, cell size, active mask, region mask and grid
+certificate fingerprint. Equal vector length or equal node count is not an
+identity proof.
+
+The normal `relax -> dynamics/eigen/frequency-response` path is fail-closed:
+
+- an unsupported transition is rejected before planning or state mutation;
+- FDM-to-FEM is rejected unless a dedicated, explicit backend-transfer stage is
+  selected;
+- FEM-to-FEM with changed topology is rejected rather than interpolated;
+- FDM-to-FDM direct reuse is legal only for an identical structured grid;
+- adaptive remeshing of `SharedDomainMeshWithAir` is rejected until an
+  airbox-preserving remesher and transfer certificate exist.
+
+An explicit remesh or backend-transfer operation may produce a new realization,
+but it must publish source and target identities plus transfer provenance. It
+must never be represented as ordinary continuation.
+
+Stage history publishes `mesh_generation_id`, `mesh_topology_fingerprint` and,
+when owned by the stage, `mesh_revision`. A missing legacy value means
+`unknown`; it must not be synthesized from a mesh name or element counts.
 
 ## 5. Round-Trip Contract
 

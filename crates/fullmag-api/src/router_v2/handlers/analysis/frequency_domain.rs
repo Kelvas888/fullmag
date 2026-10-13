@@ -1,19 +1,24 @@
 //! Frequency-domain analysis family manifest and artifact resource endpoints.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::Read,
+    path::{Path as FsPath, PathBuf},
+    sync::Arc,
+};
 
 use axum::extract::{Path, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use utoipa::ToSchema;
+use sha2::{Digest, Sha256};
+use utoipa::{PartialSchema, ToSchema};
 
 use crate::artifacts::{
-    read_json_artifact_value, read_text_artifact_value, require_current_live_artifact_dir,
-    try_resolve_artifact_path,
+    read_json_artifact_value, require_current_live_artifact_dir, try_resolve_artifact_path,
 };
 use crate::error::ApiError;
-use crate::types::AppState;
+use crate::types::{AppState, SessionStateResponse};
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FrequencyDomainAvailabilitySummaryResource {
@@ -125,14 +130,691 @@ pub struct FrequencyDomainManifestResource {
     pub result_manifest: Option<FrequencyDomainJsonArtifactResource>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FrequencyDomainArtifactGenerationStatus {
+    /// Legacy artifact without a generation commit; content is not membership-verified.
+    LegacyUnverified,
+    /// Exact member bytes match the commit, but no declared owner is bound to this request.
+    MemberVerifiedUnbound,
+    /// Exact member bytes match the commit and the declared run and stage match this request.
+    MemberVerifiedOwnerBound,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FrequencyDomainJsonArtifactResource {
     pub schema_version: String,
     pub status: String,
     pub artifact_path: String,
     pub resource_key: String,
-    pub payload: Option<Value>,
+    pub payload: Option<FrequencyDomainJsonArtifactPayload>,
+    /// Content-addressed revision of the immutable JSON artifact bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// Committed publication containing this member; only consumed member bytes are verified.
+    /// Absent for legacy artifacts without a generation receipt, which remain unverified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+    /// Verification state for a returned artifact member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_status: Option<FrequencyDomainArtifactGenerationStatus>,
+    /// SHA-256 digest of the immutable JSON artifact bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
+    /// Opaque identity of the canonical artifact directory shared by its files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_set_id: Option<String>,
+    /// Actual session that owns the current immutable artifact directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// Actual run that owns the current immutable artifact directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    /// Actual stage that published the artifact, when available in live state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_id: Option<String>,
+    /// Runtime mesh generation bound to the publishing stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_generation_id: Option<String>,
     pub missing_reason: Option<String>,
+}
+
+/// Typed control-plane payloads published by the frequency-domain artifact
+/// family.  The enum is intentionally untagged so the JSON body remains
+/// backward compatible with the existing artifact files: the artifact's
+/// `schema_version` remains the discriminator on the wire.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum FrequencyDomainJsonArtifactPayload {
+    Manifest(FrequencyDomainManifestArtifactPayload),
+    SpectrumV3(FrequencyDomainSpectrumV3ArtifactPayload),
+    Spectrum(FrequencyDomainSpectrumArtifactPayload),
+    Branches(FrequencyDomainBranchesArtifactPayload),
+    FieldSweep(FrequencyDomainFieldSweepArtifactPayload),
+    Diagnostics(FrequencyDomainDiagnosticsArtifactPayload),
+    Mode(FrequencyDomainModeArtifactPayload),
+    ResponseSweep(FrequencyDomainResponseSweepArtifactPayload),
+    ResponsePoint(FrequencyDomainResponsePointPayload),
+    FmrPeaks(FrequencyDomainFmrPeaksArtifactPayload),
+    ResonanceFits(FrequencyDomainResonanceFitsArtifactPayload),
+    KittelFit(FrequencyDomainKittelFitArtifactPayload),
+}
+
+/// Forward-compatible JSON members preserved beside the documented payload
+/// fields. Its schema deliberately permits arbitrary values.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FrequencyDomainArtifactExtras(pub BTreeMap<String, Value>);
+
+impl PartialSchema for FrequencyDomainArtifactExtras {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        utoipa::openapi::ObjectBuilder::new()
+            .additional_properties(Some(
+                utoipa::openapi::schema::AdditionalProperties::FreeForm(true),
+            ))
+            .into()
+    }
+}
+
+impl ToSchema for FrequencyDomainArtifactExtras {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainManifestArtifactPayload {
+    pub schema_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_family: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub study_product: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solve_succeeded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spectrum_completeness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_identity: Option<FrequencyDomainCandidateIdentityPayload>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainSpectrumArtifactPayload {
+    pub schema_version: String,
+    pub samples: Vec<FrequencyDomainSpectrumSamplePayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solve_succeeded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spectrum_completeness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_identity: Option<FrequencyDomainCandidateIdentityPayload>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainCandidateIdentityPayload {
+    pub schema_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equilibrium_artifact_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    #[schema(value_type = Object)]
+    pub source_identity: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainSpectrumSamplePayload {
+    /// Stable sample identity; `sample_index` is presentation order only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modes: Option<Vec<FrequencyDomainSpectrumModePayload>>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainSpectrumModePayload {
+    /// Stable mode identity within a spectrum sample.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_mode_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_hz: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_real_hz: Option<f64>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+/// Per-object modal-spectrum contract. Unlike `eigen_spectrum.v2`, this
+/// version owns stable sample/mode identities and component participation.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainSpectrumV3ArtifactPayload {
+    pub schema_version: String,
+    pub samples: Vec<FrequencyDomainSpectrumV3SamplePayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solve_succeeded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spectrum_completeness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_identity: Option<FrequencyDomainCandidateIdentityPayload>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainSpectrumV3SamplePayload {
+    pub sample_id: String,
+    pub sample_index: u64,
+    pub modes: Vec<FrequencyDomainSpectrumV3ModePayload>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainSpectrumV3ModePayload {
+    pub mode_id: String,
+    pub raw_mode_index: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<u64>,
+    pub frequency_hz: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_field_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_field_resource_key: Option<String>,
+    /// Explicit availability; absent values use legacy reference checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_field_available: Option<bool>,
+    /// Missing solver evidence remains unavailable, never an inferred zero.
+    pub residual_relative_l2: Option<f64>,
+    pub component_participation: FrequencyDomainModalParticipationPayload,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainModalParticipationPayload {
+    pub schema_version: String,
+    pub definition_id: String,
+    pub status: FrequencyDomainModalParticipationStatus,
+    pub quantity_id: String,
+    pub quantity_symbol: String,
+    pub unit: String,
+    pub component_basis: String,
+    pub integration_method: String,
+    pub qualification: String,
+    pub provenance: FrequencyDomainModalParticipationProvenancePayload,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub global: Option<FrequencyDomainModalParticipationFractionsPayload>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub objects: Vec<FrequencyDomainModalObjectParticipationPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable: Option<FrequencyDomainModalParticipationUnavailablePayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FrequencyDomainModalParticipationStatus {
+    Ready,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainModalParticipationProvenancePayload {
+    pub solver_device: String,
+    pub observable_lane: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_mesh_identity: Option<FrequencyDomainModeSourceMeshIdentityPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainModalParticipationFractionsPayload {
+    pub total: f64,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainModalObjectParticipationPayload {
+    pub object_id: String,
+    pub total_fraction: f64,
+    pub components: FrequencyDomainModalParticipationFractionsPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainModalParticipationUnavailablePayload {
+    pub reason_code: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainBranchesArtifactPayload {
+    pub schema_version: String,
+    pub branches: Vec<FrequencyDomainBranchPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<FrequencyDomainTrackingDiagnosticsPayload>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainBranchPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub points: Option<Vec<FrequencyDomainBranchPointPayload>>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainBranchPointPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_mode_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_hz: Option<f64>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainTrackingDiagnosticsPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracking_score_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modal_overlap_available: Option<bool>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainFieldSweepAxisPayload {
+    pub kind: String,
+    pub coordinate: String,
+    pub unit: String,
+    pub display_conversions: Vec<FrequencyDomainFieldSweepDisplayConversionPayload>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainFieldSweepDisplayConversionPayload {
+    pub name: String,
+    pub unit: String,
+    pub scale: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainFieldSweepSourcePayload {
+    pub kind: String,
+    pub artifact: String,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainFieldSweepUnitsPayload {
+    pub frequency: String,
+    pub angular_frequency: String,
+    pub bias_field: String,
+    pub bias_field_display: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_amplitude: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linewidth: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub q_factor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub covariance: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainFieldSweepTopologyPayload {
+    pub mesh_id: String,
+    pub topology_revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_generation_id: Option<String>,
+    pub indexing: String,
+    pub sample_axis: String,
+    pub mode_axis: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node_count: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainFieldSweepExecutionPayload {
+    pub backend: String,
+    pub device: String,
+    pub precision: String,
+    pub execution_mode: String,
+    pub engine: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub implementation_id: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_used: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainFieldSweepReferencePayload {
+    pub relation: String,
+    pub artifact: String,
+    pub revision: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainFieldSweepModePayload {
+    pub sample_id: String,
+    pub mode_id: String,
+    pub raw_mode_index: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_id: Option<u64>,
+    pub frequency_hz: f64,
+    pub angular_frequency_rad_per_s: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_artifact_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_field_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_field_resource_key: Option<String>,
+    /// Explicit availability; absent values use legacy reference checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode_field_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual_relative_l2: Option<f64>,
+    pub source_revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field_status: Option<String>,
+    pub status: String,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainFieldSweepArtifactPayload {
+    pub schema_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<FrequencyDomainFieldSweepSourcePayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_sample_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_sample_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_axis: Option<FrequencyDomainFieldSweepAxisPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub units: Option<FrequencyDomainFieldSweepUnitsPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<FrequencyDomainFieldSweepTopologyPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_execution: Option<FrequencyDomainFieldSweepExecutionPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_execution: Option<FrequencyDomainFieldSweepExecutionPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub samples: Option<Vec<FrequencyDomainFieldSweepSamplePayload>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cross_artifact_refs: Option<Vec<FrequencyDomainFieldSweepReferencePayload>>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainFieldSweepSamplePayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bias_field_a_per_m: Option<[f64; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bias_field_mu0_t: Option<[f64; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_axis: Option<FrequencyDomainFieldSweepAxisPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub equilibrium_artifact_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub linearization_state_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_input_signature_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topology: Option<FrequencyDomainFieldSweepTopologyPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_ids: Option<Vec<u64>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modes: Option<Vec<FrequencyDomainFieldSweepModePayload>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<String>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainDiagnosticsArtifactPayload {
+    pub schema_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted: Option<bool>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainModeSourceMeshIdentityPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_generation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_revision: Option<u64>,
+    pub topology_fingerprint: String,
+    pub indexing: String,
+    pub node_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainModeArtifactPayload {
+    pub schema_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_mode_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_hz: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component_basis: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_mesh_identity: Option<FrequencyDomainModeSourceMeshIdentityPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_spectrum_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub engine_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solve_succeeded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spectrum_completeness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub candidate_identity: Option<FrequencyDomainCandidateIdentityPayload>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainResponseSweepArtifactPayload {
+    pub schema_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub points: Option<Vec<FrequencyDomainResponsePointPayload>>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainResponsePointPayload {
+    /// Stable response-point identity; `frequency_index` is presentation order only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub point_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_index: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_hz: Option<f64>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainFmrPeaksArtifactPayload {
+    pub schema_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peaks: Option<Vec<FrequencyDomainFmrPeakPayload>>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainFmrPeakPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_hz: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainResonanceFitsArtifactPayload {
+    pub schema_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fits: Option<Vec<FrequencyDomainResonanceFitPayload>>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainResonanceFitPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fit_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peak_frequency_hz: Option<f64>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainKittelFitArtifactPayload {
+    pub schema_version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validation_status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub points: Option<Vec<FrequencyDomainKittelFitPointPayload>>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FrequencyDomainKittelFitPointPayload {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub solved_frequency_hz: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_frequency_error: Option<f64>,
+    #[serde(flatten)]
+    pub extra: FrequencyDomainArtifactExtras,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -143,6 +825,28 @@ pub struct FrequencyDomainTextArtifactResource {
     pub resource_key: String,
     pub content_type: String,
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// Committed publication containing this member; only consumed member bytes are verified.
+    /// Absent for legacy artifacts without a generation receipt, which remain unverified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+    /// Verification state for a returned artifact member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_status: Option<FrequencyDomainArtifactGenerationStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
+    /// Opaque identity of the canonical artifact directory shared by its files.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_set_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_generation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path_metadata: Option<FrequencyDomainKPathMetadataResource>,
     pub missing_reason: Option<String>,
@@ -177,6 +881,18 @@ pub struct FrequencyDomainFieldResource {
     pub field_id: String,
     pub artifact_path: String,
     pub resource_key: String,
+    /// Content-addressed revision of the returned field metadata and immutable payload member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
+    /// SHA-256 digest of the field metadata and exact payload member identity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_digest: Option<String>,
+    /// Committed publication containing this exact field member; absent for legacy artifacts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+    /// Membership verification state for the returned field member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_status: Option<FrequencyDomainArtifactGenerationStatus>,
     pub source_family: String,
     pub quantity: String,
     pub value_kind: String,
@@ -429,13 +1145,15 @@ impl From<fullmag_runner::FrequencyDomainManifest> for FrequencyDomainManifestRe
 )]
 pub async fn get_frequency_domain_manifest_v1(
     State(state): State<Arc<AppState>>,
-) -> Json<FrequencyDomainManifestResource> {
+) -> Result<Json<FrequencyDomainManifestResource>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let mut manifest: FrequencyDomainManifestResource =
         fullmag_runner::frequency_domain_manifest_v1().into();
     manifest.response_progress = response_progress_resource(&state).await.ok();
     manifest.response_cancel_requested = response_cancel_requested_resource(&state).await.ok();
     manifest.result_manifest = frequency_domain_result_manifest_resource(&state).await.ok();
-    Json(manifest)
+    crate::validate_current_live_request_context(&state, &request_context).await?;
+    Ok(Json(manifest))
 }
 
 async fn frequency_domain_result_manifest_resource(
@@ -477,6 +1195,24 @@ pub async fn get_frequency_domain_eigen_spectrum_v2(
 
 #[utoipa::path(
     get,
+    path = "/v2/sessions/current/analysis/frequency-domain/eigen/spectrum.v3",
+    responses((status = 200, description = "Frequency-domain eigen spectrum v3 resource with per-object component participation", body = FrequencyDomainJsonArtifactResource)),
+    tag = "analysis"
+)]
+pub async fn get_frequency_domain_eigen_spectrum_v3(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<FrequencyDomainJsonArtifactResource>, ApiError> {
+    json_artifact_resource(
+        &state,
+        "frequency_domain_eigen_spectrum.v3",
+        "eigen/spectrum.v3.json",
+        "/v2/sessions/current/analysis/frequency-domain/eigen/spectrum.v3",
+    )
+    .await
+}
+
+#[utoipa::path(
+    get,
     path = "/v2/sessions/current/analysis/frequency-domain/eigen/branches.v2",
     responses((status = 200, description = "Frequency-domain eigen branches v2 resource", body = FrequencyDomainJsonArtifactResource)),
     tag = "analysis"
@@ -495,6 +1231,24 @@ pub async fn get_frequency_domain_eigen_branches_v2(
 
 #[utoipa::path(
     get,
+    path = "/v2/sessions/current/analysis/frequency-domain/eigen/field-sweep",
+    responses((status = 200, description = "Frequency-domain eigen field sweep resource", body = FrequencyDomainJsonArtifactResource)),
+    tag = "analysis"
+)]
+pub async fn get_frequency_domain_eigen_field_sweep(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<FrequencyDomainJsonArtifactResource>, ApiError> {
+    json_artifact_resource(
+        &state,
+        "frequency_domain_eigen_field_sweep_resource.v1",
+        "eigen/field_sweep.v1.json",
+        "/v2/sessions/current/analysis/frequency-domain/eigen/field-sweep",
+    )
+    .await
+}
+
+#[utoipa::path(
+    get,
     path = "/v2/sessions/current/analysis/frequency-domain/eigen/dispersion",
     responses((status = 200, description = "Frequency-domain eigen dispersion CSV resource", body = FrequencyDomainTextArtifactResource)),
     tag = "analysis"
@@ -502,29 +1256,72 @@ pub async fn get_frequency_domain_eigen_branches_v2(
 pub async fn get_frequency_domain_eigen_dispersion(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<FrequencyDomainTextArtifactResource>, ApiError> {
-    let Json(mut resource) = text_artifact_resource(
-        &state,
-        "frequency_domain_eigen_dispersion.v1",
+    let mut captured =
+        capture_frequency_domain_artifact_set(&state, &["eigen/dispersion.csv"]).await?;
+    captured.bind_artifact_path("eigen/dispersion.csv")?;
+    let csv_snapshot = super::results::read_result_artifact_bytes_snapshot_in_generation(
+        &captured.artifact_dir,
         "eigen/dispersion.csv",
-        "/v2/sessions/current/analysis/frequency-domain/eigen/dispersion",
-        "text/csv; charset=utf-8",
-    )
-    .await?;
-    let artifact_dir = require_current_live_artifact_dir(&state).await?;
-    if try_resolve_artifact_path(&artifact_dir, "eigen/dispersion/path.json")?.is_some() {
-        let path_metadata =
-            read_dispersion_path_metadata_resource(&artifact_dir, "eigen/dispersion/path.json")?;
-        if let Some(text) = resource.text.as_deref() {
-            validate_dispersion_path_metadata_against_csv(&path_metadata, text).map_err(
-                |error| {
-                    ApiError::internal(format!(
-                        "invalid eigen/dispersion/path.json against eigen/dispersion.csv: {error}"
-                    ))
-                },
-            )?;
-        }
-        resource.path_metadata = Some(path_metadata);
+        captured.generation.as_ref(),
+        super::results::MAX_RESULT_ARTIFACT_BYTES,
+    )?
+    .map(|(bytes, digest)| {
+        String::from_utf8(bytes)
+            .map(|text| (text, digest))
+            .map_err(|error| ApiError::internal(format!("failed to read text artifact: {error}")))
+    })
+    .transpose()?;
+    captured.bind_artifact_path("eigen/dispersion/path.json")?;
+    let path_metadata = read_dispersion_path_metadata_resource(
+        &captured.artifact_dir,
+        "eigen/dispersion/path.json",
+        captured.generation.as_ref(),
+    )?;
+    captured.bind_artifact_path("eigen/dispersion.csv")?;
+    if let (Some((text, _)), Some(path_metadata)) = (csv_snapshot.as_ref(), path_metadata.as_ref())
+    {
+        validate_dispersion_path_metadata_against_csv(path_metadata, text).map_err(|error| {
+            ApiError::internal(format!(
+                "invalid eigen/dispersion/path.json against eigen/dispersion.csv: {error}"
+            ))
+        })?;
     }
+    let (text, content_digest) = csv_snapshot
+        .map(|(text, digest)| (Some(text), Some(digest)))
+        .unwrap_or((None, None));
+    let ready = text.is_some();
+    let resource = FrequencyDomainTextArtifactResource {
+        schema_version: "frequency_domain_eigen_dispersion.v1".to_string(),
+        status: if ready { "ready" } else { "missing" }.to_string(),
+        artifact_path: "eigen/dispersion.csv".to_string(),
+        resource_key: "/v2/sessions/current/analysis/frequency-domain/eigen/dispersion".to_string(),
+        content_type: "text/csv; charset=utf-8".to_string(),
+        text,
+        revision: content_digest.clone(),
+        generation_id: ready
+            .then(|| {
+                captured
+                    .generation
+                    .as_ref()
+                    .map(|generation| generation.commit.generation_id.clone())
+            })
+            .flatten(),
+        generation_status: ready.then(|| captured.generation_status()).flatten(),
+        artifact_set_id: ready.then(|| captured.artifact_set_id.clone()).flatten(),
+        session_id: ready
+            .then(|| captured.identity.session_id.clone())
+            .flatten(),
+        run_id: ready.then(|| captured.identity.run_id.clone()).flatten(),
+        stage_id: ready.then(|| captured.identity.stage_id.clone()).flatten(),
+        mesh_generation_id: ready
+            .then(|| captured.identity.mesh_generation_id.clone())
+            .flatten(),
+        content_digest,
+        path_metadata,
+        missing_reason: (!ready)
+            .then(|| "artifact is not present in the active workspace".to_string()),
+    };
+    validate_current_frequency_domain_artifact_set(&state, &captured).await?;
     Ok(Json(resource))
 }
 
@@ -548,6 +1345,33 @@ pub async fn get_frequency_domain_eigen_diagnostics_v2(
 
 #[utoipa::path(
     get,
+    path = "/v2/sessions/current/analysis/frequency-domain/eigen/modes/{sample_index}/{mode_index}",
+    params(
+        ("sample_index" = u32, Path, description = "K-path sample index"),
+        ("mode_index" = u32, Path, description = "Raw mode index within the sample"),
+    ),
+    responses((status = 200, description = "Revisioned frequency-domain eigen mode resource", body = FrequencyDomainJsonArtifactResource)),
+    tag = "analysis"
+)]
+pub async fn get_frequency_domain_eigen_mode(
+    State(state): State<Arc<AppState>>,
+    Path((sample_index, mode_index)): Path<(u32, u32)>,
+) -> Result<Json<FrequencyDomainJsonArtifactResource>, ApiError> {
+    let artifact_path = eigen_mode_artifact_path(sample_index, mode_index);
+    let resource_key = format!(
+        "/v2/sessions/current/analysis/frequency-domain/eigen/modes/{sample_index}/{mode_index}"
+    );
+    json_artifact_resource(
+        &state,
+        "frequency_domain_eigen_mode_resource.v1",
+        &artifact_path,
+        &resource_key,
+    )
+    .await
+}
+
+#[utoipa::path(
+    get,
     path = "/v2/sessions/current/analysis/frequency-domain/eigen/mode-field/{sample_index}/{mode_index}/meta",
     params(
         ("sample_index" = u32, Path, description = "K-path sample index"),
@@ -560,17 +1384,29 @@ pub async fn get_frequency_domain_eigen_mode_field_meta(
     State(state): State<Arc<AppState>>,
     Path((sample_index, mode_index)): Path<(u32, u32)>,
 ) -> Result<Json<FrequencyDomainFieldResource>, ApiError> {
-    let artifact_dir = require_current_live_artifact_dir(&state).await?;
-    let artifact_path =
-        eigen_mode_field_preferred_payload_path(&artifact_dir, sample_index, mode_index)?;
+    let mut captured = capture_frequency_domain_artifact_set(&state, &[]).await?;
+    let artifact_dir = captured.artifact_dir.clone();
+    let generation = captured.generation.as_ref();
+    let artifact_path = eigen_mode_field_preferred_payload_path(
+        &artifact_dir,
+        sample_index,
+        mode_index,
+        generation,
+    )?;
     let field_id = format!(
         "analysis:eigen:sample-{:04}:mode-{:04}",
         sample_index, mode_index
     );
-    let metadata =
-        eigen_mode_field_metadata(&artifact_dir, sample_index, mode_index, &artifact_path)?;
+    let metadata = eigen_mode_field_metadata(
+        &artifact_dir,
+        sample_index,
+        mode_index,
+        &artifact_path,
+        generation,
+    )?;
     field_resource(
         &state,
+        &mut captured,
         "frequency_domain_mode_field.v1",
         &field_id,
         &artifact_path,
@@ -578,6 +1414,60 @@ pub async fn get_frequency_domain_eigen_mode_field_meta(
         "analysis/eigen",
         "delta_m",
         metadata,
+    )
+    .await
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/sessions/current/analysis/frequency-domain/fmr/peaks",
+    responses((status = 200, description = "Frequency-domain FMR peaks resource", body = FrequencyDomainJsonArtifactResource)),
+    tag = "analysis"
+)]
+pub async fn get_frequency_domain_fmr_peaks(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<FrequencyDomainJsonArtifactResource>, ApiError> {
+    json_artifact_resource(
+        &state,
+        "frequency_domain_fmr_peaks_resource.v1",
+        "fmr/peaks.v1.json",
+        "/v2/sessions/current/analysis/frequency-domain/fmr/peaks",
+    )
+    .await
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/sessions/current/analysis/frequency-domain/fmr/resonance-fits",
+    responses((status = 200, description = "Frequency-domain FMR resonance fits resource", body = FrequencyDomainJsonArtifactResource)),
+    tag = "analysis"
+)]
+pub async fn get_frequency_domain_fmr_resonance_fits(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<FrequencyDomainJsonArtifactResource>, ApiError> {
+    json_artifact_resource(
+        &state,
+        "frequency_domain_fmr_resonance_fits_resource.v1",
+        "fmr/resonance_fits.v1.json",
+        "/v2/sessions/current/analysis/frequency-domain/fmr/resonance-fits",
+    )
+    .await
+}
+
+#[utoipa::path(
+    get,
+    path = "/v2/sessions/current/analysis/frequency-domain/fmr/kittel-fit",
+    responses((status = 200, description = "Frequency-domain FMR Kittel fit resource", body = FrequencyDomainJsonArtifactResource)),
+    tag = "analysis"
+)]
+pub async fn get_frequency_domain_fmr_kittel_fit(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<FrequencyDomainJsonArtifactResource>, ApiError> {
+    json_artifact_resource(
+        &state,
+        "frequency_domain_fmr_kittel_fit_resource.v1",
+        "fmr/kittel_fit.v1.json",
+        "/v2/sessions/current/analysis/frequency-domain/fmr/kittel-fit",
     )
     .await
 }
@@ -630,26 +1520,29 @@ pub async fn get_frequency_domain_response_cancel_requested_v1(
 async fn response_cancel_requested_resource(
     state: &Arc<AppState>,
 ) -> Result<FrequencyDomainSweepProgressResource, ApiError> {
+    let request_context = crate::capture_current_live_request_context(state).await?;
     let artifact_dir = require_current_live_artifact_dir(&state).await?;
     if try_resolve_artifact_path(&artifact_dir, "response/cancel_requested.v1.json")?.is_none() {
         return Err(ApiError::not_found(
             "frequency-domain response cancel-requested progress artifact is missing",
         ));
     }
-    serde_json::from_value::<FrequencyDomainSweepProgressResource>(read_json_artifact_value(
-        &artifact_dir,
-        "response/cancel_requested.v1.json",
-    )?)
+    let progress = serde_json::from_value::<FrequencyDomainSweepProgressResource>(
+        read_json_artifact_value(&artifact_dir, "response/cancel_requested.v1.json")?,
+    )
     .map_err(|error| {
         ApiError::internal(format!(
             "invalid response cancel-requested progress artifact: {error}"
         ))
-    })
+    })?;
+    crate::validate_current_live_request_context(state, &request_context).await?;
+    Ok(progress)
 }
 
 async fn response_progress_resource(
     state: &Arc<AppState>,
 ) -> Result<FrequencyDomainSweepProgressResource, ApiError> {
+    let request_context = crate::capture_current_live_request_context(state).await?;
     let artifact_dir = require_current_live_artifact_dir(&state).await?;
     if try_resolve_artifact_path(&artifact_dir, "response/progress.v1.json")?.is_some() {
         let progress = serde_json::from_value::<FrequencyDomainSweepProgressResource>(
@@ -658,60 +1551,42 @@ async fn response_progress_resource(
         .map_err(|error| {
             ApiError::internal(format!("invalid response progress artifact: {error}"))
         })?;
+        crate::validate_current_live_request_context(state, &request_context).await?;
         return Ok(progress);
     }
 
-    let sweep_path = [
-        "response/magnetic_response_sweep.v2.json",
-        "response/magnetic_response_sweep.v1.json",
-    ]
-    .into_iter()
-    .find_map(|path| {
-        try_resolve_artifact_path(&artifact_dir, path)
-            .ok()
-            .flatten()
-            .map(|_| path)
-    });
-    let sweep_payload =
-        sweep_path.and_then(|path| read_json_artifact_value(&artifact_dir, path).ok());
+    let captured = capture_frequency_domain_artifact_set(
+        state,
+        &["response/magnetic_response_sweep.v2.json"],
+    )
+    .await?;
+    let artifact_dir = &captured.artifact_dir;
+    let generation = captured.generation.as_ref();
+    // Progress is intentionally mutable, but recheck after capturing the
+    // result generation so a newly written live progress file still wins.
+    if try_resolve_artifact_path(artifact_dir, "response/progress.v1.json")?.is_some() {
+        let progress = serde_json::from_value::<FrequencyDomainSweepProgressResource>(
+            read_json_artifact_value(artifact_dir, "response/progress.v1.json")?,
+        )
+        .map_err(|error| {
+            ApiError::internal(format!("invalid response progress artifact: {error}"))
+        })?;
+        validate_current_frequency_domain_artifact_set(state, &captured).await?;
+        return Ok(progress);
+    }
+
+    let artifacts = response_progress_artifact_snapshot(artifact_dir, generation)?;
+    let sweep_path = artifacts.sweep_path.as_deref();
+    let sweep_payload = artifacts.sweep_payload.as_ref();
     let frequency_range_hz = sweep_payload
-        .as_ref()
         .and_then(response_sweep_frequency_range_hz);
     let total_frequency_points = sweep_payload
-        .as_ref()
         .map(response_sweep_total_frequency_points)
         .unwrap_or(0);
-    let frequency_points = response_frequency_point_artifacts(&artifact_dir)?;
-    let completed_frequency_points = frequency_points.len() as u64;
-    let current_frequency_hz = frequency_points
-        .last()
-        .and_then(|path| read_json_artifact_value(&artifact_dir, path).ok())
-        .and_then(|payload| response_frequency_point_hz(&payload));
-    let frequency_domain_manifest_payload =
-        if try_resolve_artifact_path(&artifact_dir, "frequency_domain/manifest.v1.json")?.is_some()
-        {
-            read_json_artifact_value(&artifact_dir, "frequency_domain/manifest.v1.json").ok()
-        } else {
-            None
-        };
-    let legacy_manifest_payload =
-        if try_resolve_artifact_path(&artifact_dir, "response/artifact_manifest.json")?.is_some() {
-            read_json_artifact_value(&artifact_dir, "response/artifact_manifest.json").ok()
-        } else {
-            None
-        };
-    let manifest_payload = frequency_domain_manifest_payload
-        .as_ref()
-        .or(legacy_manifest_payload.as_ref());
-    let manifest_path = manifest_payload.map(|payload| {
-        if payload.get("schema_version").and_then(Value::as_str)
-            == Some("frequency_domain_manifest.v1")
-        {
-            "frequency_domain/manifest.v1.json".to_string()
-        } else {
-            "response/artifact_manifest.json".to_string()
-        }
-    });
+    let completed_frequency_points = artifacts.frequency_points.len() as u64;
+    let current_frequency_hz = artifacts.current_frequency_hz;
+    let manifest_payload = artifacts.manifest_payload.as_ref();
+    let manifest_path = artifacts.manifest_path.clone();
     let total_frequency_points = manifest_payload
         .and_then(|payload| {
             payload
@@ -756,7 +1631,7 @@ async fn response_progress_resource(
                 && completed_frequency_points == total_frequency_points
         });
     let partial_artifacts_available = written_frequency_point_artifacts > 0 || sweep_path.is_some();
-    let state = if interrupted {
+    let progress_state = if interrupted {
         "interrupted"
     } else if unavailable {
         "unavailable"
@@ -782,7 +1657,7 @@ async fn response_progress_resource(
         "schema_version": "frequency_domain_sweep_progress.v1",
         "status": status.clone(),
         "complete": complete,
-        "state": state,
+        "state": progress_state,
         "total_frequency_points": total_frequency_points,
         "completed_frequency_points": completed_frequency_points,
         "written_frequency_point_artifacts": written_frequency_point_artifacts,
@@ -794,10 +1669,10 @@ async fn response_progress_resource(
     })
     .to_string();
 
-    Ok(FrequencyDomainSweepProgressResource {
+    let progress = FrequencyDomainSweepProgressResource {
         schema_version: "frequency_domain_sweep_progress.v1".to_string(),
         status,
-        state: state.to_string(),
+        state: progress_state.to_string(),
         complete,
         total_frequency_points,
         completed_frequency_points,
@@ -815,7 +1690,66 @@ async fn response_progress_resource(
                 .then(|| "response sweep progress artifacts are not present".to_string())
         },
         progress_json: Some(progress_json),
-    })
+    };
+    validate_current_frequency_domain_artifact_set(state, &captured).await?;
+    Ok(progress)
+}
+
+#[derive(Debug, Default)]
+struct ResponseProgressArtifactSnapshot {
+    sweep_path: Option<String>,
+    sweep_payload: Option<Value>,
+    frequency_points: Vec<String>,
+    current_frequency_hz: Option<f64>,
+    manifest_path: Option<String>,
+    manifest_payload: Option<Value>,
+}
+
+fn response_progress_artifact_snapshot(
+    artifact_dir: &FsPath,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<ResponseProgressArtifactSnapshot, ApiError> {
+    let mut snapshot = ResponseProgressArtifactSnapshot::default();
+    for artifact_path in [
+        "response/magnetic_response_sweep.v2.json",
+        "response/magnetic_response_sweep.v1.json",
+    ] {
+        if let Some((payload, _)) = super::results::read_result_artifact_snapshot_in_generation(
+            artifact_dir,
+            artifact_path,
+            generation,
+        )? {
+            snapshot.sweep_path = Some(artifact_path.to_string());
+            snapshot.sweep_payload = Some(payload);
+            break;
+        }
+    }
+    snapshot.frequency_points = response_frequency_point_artifacts(artifact_dir, generation)?;
+    if let Some(artifact_path) = snapshot.frequency_points.last() {
+        snapshot.current_frequency_hz = super::results::read_result_artifact_snapshot_in_generation(
+            artifact_dir,
+            artifact_path,
+            generation,
+        )?
+        .and_then(|(payload, _)| response_frequency_point_hz(&payload));
+    }
+
+    for artifact_path in [
+        "frequency_domain/manifest.v1.json",
+        "response/artifact_manifest.json",
+    ] {
+        if let Some((payload, _)) = super::results::read_result_artifact_snapshot_in_generation(
+            artifact_dir,
+            artifact_path,
+            generation,
+        )? {
+            snapshot.manifest_path = Some(artifact_path.to_string());
+            snapshot.manifest_payload = Some(payload);
+            break;
+        }
+    }
+    super::results::ensure_generation_capture_current(artifact_dir, generation)?;
+    Ok(snapshot)
 }
 
 #[utoipa::path(
@@ -836,6 +1770,12 @@ pub async fn get_frequency_domain_response_solver_diagnostics_v1(
     .await
 }
 
+#[utoipa::path(
+    get,
+    path = "/v2/sessions/current/analysis/frequency-domain/response/diagnostics.v1",
+    responses((status = 200, description = "Frequency-domain response diagnostics compatibility resource", body = FrequencyDomainJsonArtifactResource)),
+    tag = "analysis"
+)]
 pub async fn get_frequency_domain_response_diagnostics_v1(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<FrequencyDomainJsonArtifactResource>, ApiError> {
@@ -859,19 +1799,28 @@ pub async fn get_frequency_domain_response_frequency_point(
     State(state): State<Arc<AppState>>,
     Path(frequency_index): Path<u32>,
 ) -> Result<Json<FrequencyDomainJsonArtifactResource>, ApiError> {
-    let artifact_dir = require_current_live_artifact_dir(&state).await?;
-    let artifact_path =
-        response_frequency_point_artifact_path_from_sweep(&artifact_dir, frequency_index)?
-            .unwrap_or_else(|| {
-                format!(
-                    "response/frequency_points/frequency_{:04}.json",
-                    frequency_index
-                )
-            });
-    json_artifact_resource(
+    let mut captured = capture_frequency_domain_artifact_set(
         &state,
+        &["response/magnetic_response_sweep.v2.json"],
+    )
+    .await?;
+    let artifact_path = response_frequency_point_artifact_path_from_sweep(
+        &captured.artifact_dir,
+        frequency_index,
+        captured.generation.as_ref(),
+    )?
+    .unwrap_or_else(|| {
+        format!(
+            "response/frequency_points/frequency_{:04}.json",
+            frequency_index
+        )
+    });
+    captured.bind_artifact_path(&artifact_path)?;
+    json_artifact_resource_first_existing_with_context(
+        &state,
+        captured,
         "frequency_domain_response_frequency_point.v1",
-        &artifact_path,
+        &[artifact_path.as_str()],
         &format!(
             "/v2/sessions/current/analysis/frequency-domain/response/frequency-points/{}",
             frequency_index
@@ -883,13 +1832,22 @@ pub async fn get_frequency_domain_response_frequency_point(
 fn response_frequency_point_artifact_path_from_sweep(
     artifact_dir: &std::path::Path,
     frequency_index: u32,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<Option<String>, ApiError> {
-    response_sweep_linked_path(
+    let Some((sweep, _)) = super::results::read_result_artifact_snapshot_in_generation(
         artifact_dir,
+        "response/magnetic_response_sweep.v2.json",
+        generation,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(response_sweep_linked_path_from_value(
+        &sweep,
         frequency_index,
         "frequency_point_artifact_path",
         "frequency_point_artifact_paths",
-    )
+    ))
 }
 
 #[utoipa::path(
@@ -903,28 +1861,37 @@ pub async fn get_frequency_domain_response_field_meta(
     State(state): State<Arc<AppState>>,
     Path(frequency_index): Path<u32>,
 ) -> Result<Json<FrequencyDomainFieldResource>, ApiError> {
-    let artifact_dir = require_current_live_artifact_dir(&state).await?;
-    let frequency_point_artifact_path =
-        response_frequency_point_artifact_path_from_sweep(&artifact_dir, frequency_index)?
-            .unwrap_or_else(|| {
-                format!(
-                    "response/frequency_points/frequency_{:04}.json",
-                    frequency_index
-                )
-            });
-    let point_metadata =
-        response_field_payload_metadata(&artifact_dir, &frequency_point_artifact_path)?;
+    let mut captured = capture_frequency_domain_artifact_set(&state, &[]).await?;
+    let artifact_dir = captured.artifact_dir.clone();
+    let generation = captured.generation.as_ref();
+    let frequency_point_artifact_path = response_frequency_point_artifact_path_from_sweep(
+        &artifact_dir,
+        frequency_index,
+        generation,
+    )?
+    .unwrap_or_else(|| {
+        format!(
+            "response/frequency_points/frequency_{:04}.json",
+            frequency_index
+        )
+    });
+    let point_metadata = response_field_payload_metadata(
+        &artifact_dir,
+        &frequency_point_artifact_path,
+        generation,
+    )?;
     let artifact_path = if let Some(path) =
-        response_field_payload_path_from_manifest(&artifact_dir, frequency_index)?
+        response_field_payload_path_from_manifest(&artifact_dir, frequency_index, generation)?
     {
         path
     } else if let Some(path) =
-        response_field_payload_path_from_sweep(&artifact_dir, frequency_index)?
+        response_field_payload_path_from_sweep(&artifact_dir, frequency_index, generation)?
     {
         path
     } else if let Some(path) = response_field_payload_path_from_point_artifact(
         &artifact_dir,
         &frequency_point_artifact_path,
+        generation,
     )? {
         path
     } else {
@@ -944,6 +1911,7 @@ pub async fn get_frequency_domain_response_field_meta(
     );
     field_resource(
         &state,
+        &mut captured,
         "frequency_domain_response_field.v1",
         &field_id,
         &artifact_path,
@@ -971,11 +1939,16 @@ fn analysis_field_vector_resource_key(
 fn response_field_payload_path_from_manifest(
     artifact_dir: &std::path::Path,
     frequency_index: u32,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<Option<String>, ApiError> {
-    if try_resolve_artifact_path(artifact_dir, "frequency_domain/manifest.v1.json")?.is_none() {
+    let Some((manifest, _)) = super::results::read_result_artifact_snapshot_in_generation(
+        artifact_dir,
+        "frequency_domain/manifest.v1.json",
+        generation,
+    )?
+    else {
         return Ok(None);
-    }
-    let manifest = read_json_artifact_value(artifact_dir, "frequency_domain/manifest.v1.json")?;
+    };
     Ok(manifest
         .get("resources")
         .and_then(|resources| resources.get("response_field_resources"))
@@ -999,23 +1972,30 @@ fn response_field_payload_path_from_manifest(
 fn response_field_payload_path_from_sweep(
     artifact_dir: &std::path::Path,
     frequency_index: u32,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<Option<String>, ApiError> {
     response_sweep_linked_path(
         artifact_dir,
         frequency_index,
         "response_field_payload_path",
         "response_field_payload_paths",
+        generation,
     )
 }
 
 fn response_field_payload_path_from_point_artifact(
     artifact_dir: &std::path::Path,
     frequency_point_artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<Option<String>, ApiError> {
-    if try_resolve_artifact_path(artifact_dir, frequency_point_artifact_path)?.is_none() {
+    let Some((payload, _)) = super::results::read_result_artifact_snapshot_in_generation(
+        artifact_dir,
+        frequency_point_artifact_path,
+        generation,
+    )?
+    else {
         return Ok(None);
-    }
-    let payload = read_json_artifact_value(artifact_dir, frequency_point_artifact_path)?;
+    };
     payload
         .get("field_payload_path")
         .and_then(Value::as_str)
@@ -1034,13 +2014,30 @@ fn response_sweep_linked_path(
     frequency_index: u32,
     point_field: &str,
     list_field: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<Option<String>, ApiError> {
-    if try_resolve_artifact_path(artifact_dir, "response/magnetic_response_sweep.v2.json")?
-        .is_none()
-    {
+    let Some((sweep, _)) = super::results::read_result_artifact_snapshot_in_generation(
+        artifact_dir,
+        "response/magnetic_response_sweep.v2.json",
+        generation,
+    )?
+    else {
         return Ok(None);
-    }
-    let sweep = read_json_artifact_value(artifact_dir, "response/magnetic_response_sweep.v2.json")?;
+    };
+    Ok(response_sweep_linked_path_from_value(
+        &sweep,
+        frequency_index,
+        point_field,
+        list_field,
+    ))
+}
+
+fn response_sweep_linked_path_from_value(
+    sweep: &Value,
+    frequency_index: u32,
+    point_field: &str,
+    list_field: &str,
+) -> Option<String> {
     if let Some(path) = sweep
         .get("points")
         .and_then(Value::as_array)
@@ -1059,14 +2056,14 @@ fn response_sweep_linked_path(
             })
         })
     {
-        return Ok(Some(path));
+        return Some(path);
     }
-    Ok(sweep
+    sweep
         .get(list_field)
         .and_then(Value::as_array)
         .and_then(|paths| paths.get(frequency_index as usize))
         .and_then(Value::as_str)
-        .map(str::to_string))
+        .map(str::to_string)
 }
 
 async fn json_artifact_resource(
@@ -1085,31 +2082,1025 @@ async fn json_artifact_resource_first_existing(
     artifact_paths: &[&str],
     resource_key: &str,
 ) -> Result<Json<FrequencyDomainJsonArtifactResource>, ApiError> {
-    let artifact_dir = require_current_live_artifact_dir(state).await?;
+    let captured = capture_frequency_domain_artifact_set(state, artifact_paths).await?;
+    json_artifact_resource_first_existing_with_context(
+        state,
+        captured,
+        schema_version,
+        artifact_paths,
+        resource_key,
+    )
+    .await
+}
+
+async fn json_artifact_resource_first_existing_with_context(
+    state: &Arc<AppState>,
+    mut captured: FrequencyDomainArtifactSetCapture,
+    schema_version: &str,
+    artifact_paths: &[&str],
+    resource_key: &str,
+) -> Result<Json<FrequencyDomainJsonArtifactResource>, ApiError> {
     for artifact_path in artifact_paths {
-        if try_resolve_artifact_path(&artifact_dir, artifact_path)?.is_some() {
-            return Ok(Json(FrequencyDomainJsonArtifactResource {
+        captured.bind_artifact_path(artifact_path)?;
+        if let Some((payload_value, content_digest)) =
+            super::results::read_result_artifact_snapshot_in_generation(
+                &captured.artifact_dir,
+                artifact_path,
+                captured.generation.as_ref(),
+            )?
+        {
+            let payload = decode_frequency_domain_artifact_payload(artifact_path, payload_value)?;
+            let response = Json(FrequencyDomainJsonArtifactResource {
                 schema_version: schema_version.to_string(),
                 status: "ready".to_string(),
                 artifact_path: (*artifact_path).to_string(),
                 resource_key: resource_key.to_string(),
-                payload: Some(read_json_artifact_value(&artifact_dir, artifact_path)?),
+                payload: Some(payload),
+                revision: Some(content_digest.clone()),
+                generation_id: captured
+                    .generation
+                    .as_ref()
+                    .map(|generation| generation.commit.generation_id.clone()),
+                generation_status: captured.generation_status(),
+                content_digest: Some(content_digest),
+                artifact_set_id: captured.artifact_set_id.clone(),
+                session_id: captured.identity.session_id.clone(),
+                run_id: captured.identity.run_id.clone(),
+                stage_id: captured.identity.stage_id.clone(),
+                mesh_generation_id: captured.identity.mesh_generation_id.clone(),
                 missing_reason: None,
-            }));
+            });
+            validate_current_frequency_domain_artifact_set(state, &captured).await?;
+            return Ok(response);
         }
     }
-    Ok(Json(FrequencyDomainJsonArtifactResource {
+    let missing_path = artifact_paths.first().copied().unwrap_or_default();
+    captured.bind_artifact_path(missing_path)?;
+    let response = Json(FrequencyDomainJsonArtifactResource {
         schema_version: schema_version.to_string(),
         status: "missing".to_string(),
-        artifact_path: artifact_paths
-            .first()
-            .copied()
-            .unwrap_or_default()
-            .to_string(),
+        artifact_path: missing_path.to_string(),
         resource_key: resource_key.to_string(),
         payload: None,
+        revision: None,
+        generation_id: None,
+        generation_status: None,
+        content_digest: None,
+        artifact_set_id: None,
+        session_id: None,
+        run_id: None,
+        stage_id: None,
+        mesh_generation_id: None,
         missing_reason: Some("artifact is not present in the active workspace".to_string()),
-    }))
+    });
+    validate_current_frequency_domain_artifact_set(state, &captured).await?;
+    Ok(response)
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FrequencyDomainLiveArtifactIdentity {
+    session_id: Option<String>,
+    run_id: Option<String>,
+    stage_id: Option<String>,
+    mesh_generation_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FrequencyDomainCapturedStageIdentity {
+    stage_id: Option<String>,
+    kind: Option<String>,
+    mesh_generation_id: Option<String>,
+    artifact_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct FrequencyDomainCapturedLiveIdentity {
+    session_id: String,
+    run_id: Option<String>,
+    stages: Vec<FrequencyDomainCapturedStageIdentity>,
+    active_stage_index: Option<usize>,
+    latest_mesh_generation_id: Option<String>,
+    mesh_generation_id: Option<String>,
+}
+
+impl FrequencyDomainCapturedLiveIdentity {
+    fn from_snapshot(snapshot: &SessionStateResponse) -> Self {
+        let (stages, active_stage_index) = snapshot
+            .stage_execution
+            .as_ref()
+            .map(|execution| {
+                (
+                    execution
+                        .stages
+                        .iter()
+                        .map(|stage| FrequencyDomainCapturedStageIdentity {
+                            stage_id: stage.stage_id.clone(),
+                            kind: stage.kind.clone(),
+                            mesh_generation_id: stage.mesh_generation_id.clone(),
+                            artifact_refs: stage.artifact_refs.clone(),
+                        })
+                        .collect(),
+                    execution.active_stage_index,
+                )
+            })
+            .unwrap_or_default();
+        Self {
+            session_id: snapshot.session.session_id.clone(),
+            run_id: snapshot
+                .run
+                .as_ref()
+                .map(|run| run.run_id.clone())
+                .or_else(|| Some(snapshot.session.run_id.clone())),
+            stages,
+            active_stage_index,
+            latest_mesh_generation_id: snapshot
+                .live_state
+                .as_ref()
+                .and_then(|live| live.latest_step.fem_mesh_generation_id.clone()),
+            mesh_generation_id: snapshot
+                .fem_mesh
+                .as_ref()
+                .and_then(|mesh| mesh.generation_id.clone()),
+        }
+    }
+
+    fn artifact_identity(&self, artifact_path: &str) -> FrequencyDomainLiveArtifactIdentity {
+        let expected_kind_fragment = if artifact_path.starts_with("eigen/") {
+            Some("eigen")
+        } else if artifact_path.starts_with("response/") {
+            Some("frequency")
+        } else {
+            None
+        };
+        let stage = self
+            .stages
+            .iter()
+            .rev()
+            .find(|stage| {
+                stage.artifact_refs.iter().any(|reference| {
+                    reference == artifact_path || reference.ends_with(artifact_path)
+                })
+            })
+            .or_else(|| {
+                expected_kind_fragment.and_then(|fragment| {
+                    self.stages.iter().rev().find(|stage| {
+                        stage
+                            .kind
+                            .as_deref()
+                            .is_some_and(|kind| kind.contains(fragment))
+                    })
+                })
+            })
+            .or_else(|| {
+                self.active_stage_index
+                    .and_then(|index| self.stages.get(index))
+            });
+        FrequencyDomainLiveArtifactIdentity {
+            session_id: Some(self.session_id.clone()),
+            run_id: self.run_id.clone(),
+            stage_id: stage.and_then(|stage| stage.stage_id.clone()),
+            mesh_generation_id: stage
+                .and_then(|stage| stage.mesh_generation_id.clone())
+                .or_else(|| self.latest_mesh_generation_id.clone())
+                .or_else(|| self.mesh_generation_id.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FrequencyDomainArtifactSetCapture {
+    request_context: crate::types::CurrentLiveRequestContext,
+    artifact_dir: PathBuf,
+    artifact_set_id: Option<String>,
+    generation: Option<fullmag_runner::artifact_generation::GenerationCapture>,
+    live_identity: FrequencyDomainCapturedLiveIdentity,
+    artifact_path: String,
+    identity: FrequencyDomainLiveArtifactIdentity,
+}
+
+impl FrequencyDomainArtifactSetCapture {
+    fn bind_artifact_path(&mut self, artifact_path: &str) -> Result<(), ApiError> {
+        self.artifact_path = artifact_path.to_string();
+        self.identity = self.live_identity.artifact_identity(artifact_path);
+        super::results::validate_generation_producer(
+            self.generation.as_ref(),
+            self.identity.run_id.as_deref(),
+            self.identity.stage_id.as_deref(),
+        )
+    }
+
+    fn generation_status(&self) -> Option<FrequencyDomainArtifactGenerationStatus> {
+        let Some(generation) = self.generation.as_ref() else {
+            return Some(FrequencyDomainArtifactGenerationStatus::LegacyUnverified);
+        };
+        if !generation
+            .commit
+            .content
+            .members
+            .contains_key(&self.artifact_path)
+        {
+            return None;
+        }
+        let owner_bound = generation
+            .commit
+            .content
+            .producer
+            .as_ref()
+            .is_some_and(|producer| {
+                self.identity.run_id.as_deref() == Some(producer.run_id.as_str())
+                    && self.identity.stage_id.as_deref() == Some(producer.stage_id.as_str())
+            });
+        Some(if owner_bound {
+            FrequencyDomainArtifactGenerationStatus::MemberVerifiedOwnerBound
+        } else {
+            FrequencyDomainArtifactGenerationStatus::MemberVerifiedUnbound
+        })
+    }
+}
+
+pub(crate) fn validate_frequency_domain_field_artifact_owner(
+    snapshot: &SessionStateResponse,
+    artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<(), ApiError> {
+    let identity = FrequencyDomainCapturedLiveIdentity::from_snapshot(snapshot)
+        .artifact_identity(artifact_path);
+    super::results::validate_generation_producer(
+        generation,
+        identity.run_id.as_deref(),
+        identity.stage_id.as_deref(),
+    )
+}
+
+fn canonical_frequency_domain_artifact_root(
+    artifact_root: &FsPath,
+) -> Result<(PathBuf, Option<String>), ApiError> {
+    let canonical = match std::fs::canonicalize(artifact_root) {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((artifact_root.to_path_buf(), None));
+        }
+        Err(error) => {
+            return Err(ApiError::internal(format!(
+                "failed to resolve active frequency-domain artifact directory: {error}"
+            )));
+        }
+    };
+    let canonical_path = canonical.to_string_lossy();
+    let artifact_set_id = format!("sha256:{:x}", Sha256::digest(canonical_path.as_bytes()));
+    Ok((canonical, Some(artifact_set_id)))
+}
+
+async fn capture_frequency_domain_artifact_set(
+    state: &Arc<AppState>,
+    artifact_paths: &[&str],
+) -> Result<FrequencyDomainArtifactSetCapture, ApiError> {
+    let request_context = crate::capture_current_live_request_context(state).await?;
+    let session_epoch = state
+        .current_live_session_epoch
+        .load(std::sync::atomic::Ordering::Acquire);
+    let current = state.current_live_state.read().await;
+    let snapshot = current
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(snapshot, &request_context, session_epoch)?;
+    let artifact_root = crate::session::current_artifact_dir(snapshot)
+        .ok_or_else(|| ApiError::not_found("no artifact directory for the active workspace"))?;
+    let (artifact_dir, artifact_set_id) = canonical_frequency_domain_artifact_root(&artifact_root)?;
+    let generation =
+        fullmag_runner::artifact_generation::capture(&artifact_dir).map_err(|error| {
+            ApiError::internal(format!(
+                "invalid frequency-domain artifact generation: {error}"
+            ))
+        })?;
+    let live_identity = FrequencyDomainCapturedLiveIdentity::from_snapshot(snapshot);
+    let artifact_path = artifact_paths.first().copied().unwrap_or_default();
+    let identity = live_identity.artifact_identity(artifact_path);
+    if !artifact_path.is_empty() {
+        super::results::validate_generation_producer(
+            generation.as_ref(),
+            identity.run_id.as_deref(),
+            identity.stage_id.as_deref(),
+        )?;
+    }
+    Ok(FrequencyDomainArtifactSetCapture {
+        request_context,
+        artifact_dir,
+        artifact_set_id,
+        generation,
+        live_identity,
+        artifact_path: artifact_path.to_string(),
+        identity,
+    })
+}
+
+async fn validate_current_frequency_domain_artifact_set(
+    state: &Arc<AppState>,
+    captured: &FrequencyDomainArtifactSetCapture,
+) -> Result<(), ApiError> {
+    let session_epoch = state
+        .current_live_session_epoch
+        .load(std::sync::atomic::Ordering::Acquire);
+    let current = state.current_live_state.read().await;
+    let snapshot = current
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(snapshot, &captured.request_context, session_epoch)?;
+    let artifact_root = crate::session::current_artifact_dir(snapshot)
+        .ok_or_else(|| ApiError::not_found("no artifact directory for the active workspace"))?;
+    let (artifact_dir, artifact_set_id) = canonical_frequency_domain_artifact_root(&artifact_root)?;
+    let live_identity = FrequencyDomainCapturedLiveIdentity::from_snapshot(snapshot);
+    if artifact_dir != captured.artifact_dir
+        || artifact_set_id != captured.artifact_set_id
+        || live_identity.artifact_identity(&captured.artifact_path) != captured.identity
+    {
+        return Err(ApiError::conflict("frequency_domain_artifact_set_stale"));
+    }
+    super::results::ensure_generation_capture_current(
+        &captured.artifact_dir, captured.generation.as_ref(),
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) async fn capture_frequency_domain_artifact_set_for_test(
+    state: &Arc<AppState>,
+    artifact_paths: &[&str],
+) -> Result<FrequencyDomainArtifactSetCapture, ApiError> {
+    capture_frequency_domain_artifact_set(state, artifact_paths).await
+}
+
+#[cfg(test)]
+pub(crate) async fn validate_frequency_domain_artifact_set_for_test(
+    state: &Arc<AppState>,
+    captured: &FrequencyDomainArtifactSetCapture,
+) -> Result<(), ApiError> {
+    validate_current_frequency_domain_artifact_set(state, captured).await
+}
+
+pub(crate) fn decode_frequency_domain_artifact_payload(
+    artifact_path: &str,
+    value: Value,
+) -> Result<FrequencyDomainJsonArtifactPayload, ApiError> {
+    let object = value.as_object().ok_or_else(|| {
+        ApiError::internal(format!(
+            "frequency-domain artifact '{}' must contain a JSON object payload",
+            artifact_path
+        ))
+    })?;
+    let schema_version = object
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ApiError::internal(format!(
+                "frequency-domain artifact '{}' is missing string schema_version",
+                artifact_path
+            ))
+        })?
+        .to_string();
+    let (allowed_schemas, payload) = if artifact_path == "frequency_domain/manifest.v1.json" {
+        (
+            &["frequency_domain_manifest.v1" as &str][..],
+            serde_json::from_value::<FrequencyDomainManifestArtifactPayload>(value)
+                .map(FrequencyDomainJsonArtifactPayload::Manifest),
+        )
+    } else if artifact_path == "eigen/spectrum.v2.json" {
+        (
+            &["eigen_spectrum.v2" as &str][..],
+            serde_json::from_value::<FrequencyDomainSpectrumArtifactPayload>(value)
+                .map(FrequencyDomainJsonArtifactPayload::Spectrum),
+        )
+    } else if artifact_path == "eigen/spectrum.v3.json" {
+        (
+            &["eigen_spectrum.v3" as &str][..],
+            serde_json::from_value::<FrequencyDomainSpectrumV3ArtifactPayload>(value)
+                .map(FrequencyDomainJsonArtifactPayload::SpectrumV3),
+        )
+    } else if artifact_path == "eigen/branches.v2.json" {
+        (
+            &["eigen_branches.v2" as &str][..],
+            serde_json::from_value::<FrequencyDomainBranchesArtifactPayload>(value)
+                .map(FrequencyDomainJsonArtifactPayload::Branches),
+        )
+    } else if artifact_path == "eigen/field_sweep.v1.json" {
+        (
+            &["eigen/field_sweep.v1" as &str][..],
+            serde_json::from_value::<FrequencyDomainFieldSweepArtifactPayload>(value)
+                .map(FrequencyDomainJsonArtifactPayload::FieldSweep),
+        )
+    } else if artifact_path == "eigen/diagnostics.v2.json"
+        || artifact_path == "eigen/diagnostics/solver.v1.json"
+    {
+        (
+            &[
+                "frequency_domain_modal_solver_diagnostics.v1",
+                "frequency_domain_modal_solver_diagnostics.v2",
+            ][..],
+            serde_json::from_value::<FrequencyDomainDiagnosticsArtifactPayload>(value)
+                .map(FrequencyDomainJsonArtifactPayload::Diagnostics),
+        )
+    } else if artifact_path.starts_with("eigen/modes/") {
+        (
+            &["eigen_mode.v2" as &str][..],
+            serde_json::from_value::<FrequencyDomainModeArtifactPayload>(value)
+                .map(FrequencyDomainJsonArtifactPayload::Mode),
+        )
+    } else if artifact_path == "response/magnetic_response_sweep.v1.json"
+        || artifact_path == "response/magnetic_response_sweep.v2.json"
+    {
+        (
+            &["magnetic_response_sweep.v1", "magnetic_response_sweep.v2"][..],
+            serde_json::from_value::<FrequencyDomainResponseSweepArtifactPayload>(value)
+                .map(FrequencyDomainJsonArtifactPayload::ResponseSweep),
+        )
+    } else if artifact_path.starts_with("response/frequency_points/") {
+        (
+            &["frequency_response_point.v1" as &str][..],
+            serde_json::from_value::<FrequencyDomainResponsePointPayload>(value)
+                .map(FrequencyDomainJsonArtifactPayload::ResponsePoint),
+        )
+    } else if artifact_path == "response/diagnostics/solver.v1.json"
+        || artifact_path == "response/diagnostics.v1.json"
+    {
+        (
+            &[
+                "frequency_domain_response_diagnostics.v1",
+                "frequency_domain_response_diagnostics.v2",
+            ][..],
+            serde_json::from_value::<FrequencyDomainDiagnosticsArtifactPayload>(value)
+                .map(FrequencyDomainJsonArtifactPayload::Diagnostics),
+        )
+    } else if artifact_path == "fmr/peaks.v1.json" {
+        (
+            &["fmr/peaks.v1" as &str][..],
+            serde_json::from_value::<FrequencyDomainFmrPeaksArtifactPayload>(value)
+                .map(FrequencyDomainJsonArtifactPayload::FmrPeaks),
+        )
+    } else if artifact_path == "fmr/resonance_fits.v1.json" {
+        (
+            &["fmr/resonance_fits.v1" as &str][..],
+            serde_json::from_value::<FrequencyDomainResonanceFitsArtifactPayload>(value)
+                .map(FrequencyDomainJsonArtifactPayload::ResonanceFits),
+        )
+    } else if artifact_path == "fmr/kittel_fit.v1.json" {
+        (
+            &["fmr/kittel_fit.v1" as &str][..],
+            serde_json::from_value::<FrequencyDomainKittelFitArtifactPayload>(value)
+                .map(FrequencyDomainJsonArtifactPayload::KittelFit),
+        )
+    } else {
+        return Err(ApiError::internal(format!(
+            "unsupported frequency-domain JSON artifact path '{}', refusing untyped payload",
+            artifact_path
+        )));
+    };
+
+    if !allowed_schemas.contains(&schema_version.as_str()) {
+        return Err(ApiError::internal(format!(
+            "frequency-domain artifact '{}' has unsupported schema_version '{}', expected one of {}",
+            artifact_path,
+            schema_version,
+            allowed_schemas.join(", ")
+        )));
+    }
+
+    let payload = payload.map_err(|error| {
+        ApiError::internal(format!(
+            "invalid typed frequency-domain artifact '{}': {error}",
+            artifact_path
+        ))
+    })?;
+    if let FrequencyDomainJsonArtifactPayload::SpectrumV3(spectrum) = &payload {
+        validate_frequency_domain_spectrum_v3(spectrum)?;
+    }
+    if let FrequencyDomainJsonArtifactPayload::FieldSweep(field_sweep) = &payload {
+        validate_frequency_domain_field_sweep(field_sweep)?;
+    }
+    Ok(payload)
+}
+
+// Persisted field identity does not require an HTTP route. Legacy readers may
+// still carry a transport key, but a key without an identity remains invalid.
+fn modal_field_has_reference(
+    field_id: Option<&str>,
+    transport_key: Option<&str>,
+) -> Result<bool, ApiError> {
+    match (field_id, transport_key) {
+        (Some(field_id), None) if !field_id.trim().is_empty() => Ok(true),
+        (Some(field_id), Some(key)) if !field_id.trim().is_empty() && !key.trim().is_empty() => {
+            Ok(true)
+        }
+        (None, None) => Ok(false),
+        _ => Err(ApiError::internal(
+            "eigen field sweep mode has an invalid field identity or orphan transport key",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod durable_field_reference_tests {
+    use super::modal_field_has_reference;
+
+    #[test]
+    fn durable_field_identity_keeps_payload_available_without_transport() {
+        assert!(
+            modal_field_has_reference(
+                Some("analysis:eigen:sample-0000:mode-0000"),
+                None
+            )
+            .unwrap()
+        );
+        assert!(
+            modal_field_has_reference(
+                Some("field:legacy"),
+                Some("/v2/sessions/current/data/fields/legacy")
+            )
+            .unwrap()
+        );
+        assert!(!modal_field_has_reference(None, None).unwrap());
+        assert!(modal_field_has_reference(None, Some("/route")).is_err());
+        assert!(modal_field_has_reference(Some(""), None).is_err());
+        assert!(modal_field_has_reference(Some("field:owned"), Some(" ")).is_err());
+    }
+}
+
+fn validate_frequency_domain_field_sweep(
+    field_sweep: &FrequencyDomainFieldSweepArtifactPayload,
+) -> Result<(), ApiError> {
+    let has_typed_contract = field_sweep.source.is_some()
+        || field_sweep.source_revision.is_some()
+        || field_sweep.revision.is_some()
+        || field_sweep.scan_axis.is_some()
+        || field_sweep.units.is_some()
+        || field_sweep.topology.is_some()
+        || field_sweep.requested_execution.is_some()
+        || field_sweep.resolved_execution.is_some()
+        || field_sweep.cross_artifact_refs.is_some();
+    if !has_typed_contract {
+        return Ok(());
+    }
+
+    let Some(source) = field_sweep.source.as_ref() else {
+        return Err(ApiError::internal(
+            "eigen field sweep is missing typed source provenance",
+        ));
+    };
+    let Some(source_revision) = field_sweep.source_revision.as_ref() else {
+        return Err(ApiError::internal(
+            "eigen field sweep is missing source_revision",
+        ));
+    };
+    let Some(revision) = field_sweep.revision.as_ref() else {
+        return Err(ApiError::internal(
+            "eigen field sweep is missing dataset revision",
+        ));
+    };
+    let Some(requested_sample_count) = field_sweep.requested_sample_count else {
+        return Err(ApiError::internal(
+            "eigen field sweep is missing requested_sample_count",
+        ));
+    };
+    let Some(completed_sample_count) = field_sweep.completed_sample_count else {
+        return Err(ApiError::internal(
+            "eigen field sweep is missing completed_sample_count",
+        ));
+    };
+    let Some(scan_axis) = field_sweep.scan_axis.as_ref() else {
+        return Err(ApiError::internal(
+            "eigen field sweep is missing typed scan_axis",
+        ));
+    };
+    let Some(units) = field_sweep.units.as_ref() else {
+        return Err(ApiError::internal(
+            "eigen field sweep is missing typed units",
+        ));
+    };
+    let Some(topology) = field_sweep.topology.as_ref() else {
+        return Err(ApiError::internal(
+            "eigen field sweep is missing typed topology",
+        ));
+    };
+    let Some(requested_execution) = field_sweep.requested_execution.as_ref() else {
+        return Err(ApiError::internal(
+            "eigen field sweep is missing requested_execution provenance",
+        ));
+    };
+    let Some(resolved_execution) = field_sweep.resolved_execution.as_ref() else {
+        return Err(ApiError::internal(
+            "eigen field sweep is missing resolved_execution provenance",
+        ));
+    };
+    let Some(samples) = field_sweep.samples.as_ref() else {
+        return Err(ApiError::internal(
+            "eigen field sweep is missing typed samples",
+        ));
+    };
+    let Some(cross_artifact_refs) = field_sweep.cross_artifact_refs.as_ref() else {
+        return Err(ApiError::internal(
+            "eigen field sweep is missing cross_artifact_refs",
+        ));
+    };
+
+    if source.kind.trim().is_empty()
+        || source.artifact.trim().is_empty()
+        || source.revision.trim().is_empty()
+        || source_revision.trim().is_empty()
+        || revision.trim().is_empty()
+    {
+        return Err(ApiError::internal(
+            "eigen field sweep has incomplete source or revision provenance",
+        ));
+    }
+    if source.revision != *source_revision {
+        return Err(ApiError::internal(
+            "eigen field sweep source revision does not match source provenance",
+        ));
+    }
+    if completed_sample_count > requested_sample_count {
+        return Err(ApiError::internal(
+            "eigen field sweep completed_sample_count exceeds requested_sample_count",
+        ));
+    }
+    if field_sweep.complete == Some(true)
+        && (completed_sample_count != requested_sample_count
+            || samples.len() as u64 != completed_sample_count)
+    {
+        return Err(ApiError::internal(
+            "complete eigen field sweep has inconsistent sample counts",
+        ));
+    }
+
+    validate_field_sweep_axis(scan_axis, "eigen field sweep scan_axis")?;
+    if units.frequency.trim().is_empty()
+        || units.angular_frequency.trim().is_empty()
+        || units.bias_field.trim().is_empty()
+        || units.bias_field_display.trim().is_empty()
+    {
+        return Err(ApiError::internal(
+            "eigen field sweep has incomplete units metadata",
+        ));
+    }
+    validate_field_sweep_topology(topology, "eigen field sweep topology")?;
+    validate_field_sweep_execution(requested_execution, "requested_execution")?;
+    validate_field_sweep_execution(resolved_execution, "resolved_execution")?;
+
+    let mut sample_ids = BTreeSet::new();
+    let mut mode_ids = BTreeSet::new();
+    for sample in samples {
+        let Some(sample_id) = sample.sample_id.as_ref() else {
+            return Err(ApiError::internal(
+                "eigen field sweep contains a sample without sample_id",
+            ));
+        };
+        if sample_id.trim().is_empty() || !sample_ids.insert(sample_id) {
+            return Err(ApiError::internal(
+                "eigen field sweep contains missing or duplicate sample_id",
+            ));
+        }
+        if let Some(axis) = sample.scan_axis.as_ref() {
+            validate_field_sweep_axis(axis, "eigen field sweep sample scan_axis")?;
+        }
+        if let Some(field) = sample.bias_field_a_per_m {
+            if field.iter().any(|value| !value.is_finite()) {
+                return Err(ApiError::internal(
+                    "eigen field sweep contains non-finite bias_field_a_per_m",
+                ));
+            }
+        }
+        if let Some(field) = sample.bias_field_mu0_t {
+            if field.iter().any(|value| !value.is_finite()) {
+                return Err(ApiError::internal(
+                    "eigen field sweep contains non-finite bias_field_mu0_t",
+                ));
+            }
+        }
+        if let Some(sample_topology) = sample.topology.as_ref() {
+            validate_field_sweep_topology(sample_topology, "eigen field sweep sample topology")?;
+        }
+        if let Some(modes) = sample.modes.as_ref() {
+            for mode in modes {
+                if mode.sample_id != *sample_id || mode.mode_id.trim().is_empty() {
+                    return Err(ApiError::internal(
+                        "eigen field sweep mode has invalid sample or mode identity",
+                    ));
+                }
+                if !mode_ids.insert((sample_id, &mode.mode_id)) {
+                    return Err(ApiError::internal(
+                        "eigen field sweep contains duplicate mode_id",
+                    ));
+                }
+                if !mode.frequency_hz.is_finite()
+                    || !mode.angular_frequency_rad_per_s.is_finite()
+                    || mode.source_revision.trim().is_empty()
+                    || mode.status.trim().is_empty()
+                {
+                    return Err(ApiError::internal(
+                        "eigen field sweep contains invalid mode metadata",
+                    ));
+                }
+                if mode.source_revision != *source_revision {
+                    return Err(ApiError::internal(
+                        "eigen field sweep mode source revision does not match dataset source_revision",
+                    ));
+                }
+                if let Some(residual) = mode.residual_relative_l2 {
+                    if !residual.is_finite() || residual < 0.0 {
+                        return Err(ApiError::internal(
+                            "eigen field sweep contains invalid residual_relative_l2",
+                        ));
+                    }
+                }
+                let has_field_reference = modal_field_has_reference(
+                    mode.mode_field_id.as_deref(), mode.mode_field_resource_key.as_deref(),
+                )?;
+                let has_mode_artifact = match &mode.mode_artifact_path {
+                    Some(path) if !path.trim().is_empty() => true,
+                    None => false,
+                    Some(_) => {
+                        return Err(ApiError::internal(
+                            "eigen field sweep mode mode_artifact_path must not be empty",
+                        ));
+                    }
+                };
+                if has_field_reference != has_mode_artifact {
+                    return Err(ApiError::internal(
+                        "eigen field sweep mode artifact path and field reference must be published together",
+                    ));
+                }
+                if let Some(field_status) = mode.field_status.as_ref() {
+                    if field_status.trim().is_empty() {
+                        return Err(ApiError::internal(
+                            "eigen field sweep mode field_status must not be empty",
+                        ));
+                    }
+                    let normalized_status = field_status.trim().to_ascii_lowercase();
+                    if (normalized_status == "spectrum-only" && has_field_reference)
+                        || (normalized_status == "ready" && !has_field_reference)
+                    {
+                        return Err(ApiError::internal(
+                            "eigen field sweep mode field_status contradicts field availability",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    for reference in cross_artifact_refs {
+        if reference.relation.trim().is_empty()
+            || reference.artifact.trim().is_empty()
+            || reference.revision.trim().is_empty()
+        {
+            return Err(ApiError::internal(
+                "eigen field sweep contains incomplete cross-artifact reference",
+            ));
+        }
+        if reference.relation == "source_spectrum" && reference.revision != *source_revision {
+            return Err(ApiError::internal(
+                "eigen field sweep source_spectrum revision does not match source_revision",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_field_sweep_axis(
+    axis: &FrequencyDomainFieldSweepAxisPayload,
+    label: &str,
+) -> Result<(), ApiError> {
+    if axis.kind.trim().is_empty()
+        || axis.coordinate.trim().is_empty()
+        || axis.unit.trim().is_empty()
+    {
+        return Err(ApiError::internal(format!(
+            "{label} has incomplete identity"
+        )));
+    }
+    for conversion in &axis.display_conversions {
+        if conversion.name.trim().is_empty()
+            || conversion.unit.trim().is_empty()
+            || !conversion.scale.is_finite()
+            || conversion.scale == 0.0
+        {
+            return Err(ApiError::internal(format!(
+                "{label} contains invalid display conversion"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_field_sweep_topology(
+    topology: &FrequencyDomainFieldSweepTopologyPayload,
+    label: &str,
+) -> Result<(), ApiError> {
+    if topology.mesh_id.trim().is_empty()
+        || topology.topology_revision.trim().is_empty()
+        || topology.indexing.trim().is_empty()
+        || topology.sample_axis.trim().is_empty()
+        || topology.mode_axis.trim().is_empty()
+    {
+        return Err(ApiError::internal(format!(
+            "{label} has incomplete identity"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_field_sweep_execution(
+    execution: &FrequencyDomainFieldSweepExecutionPayload,
+    label: &str,
+) -> Result<(), ApiError> {
+    if execution.backend.trim().is_empty()
+        || execution.device.trim().is_empty()
+        || execution.precision.trim().is_empty()
+        || execution.execution_mode.trim().is_empty()
+        || execution.engine.trim().is_empty()
+        || execution.status.trim().is_empty()
+        || execution
+            .implementation_id
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+        || execution
+            .fallback_reason
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(ApiError::internal(format!(
+            "eigen field sweep {label} has incomplete execution provenance"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_frequency_domain_spectrum_v3(
+    spectrum: &FrequencyDomainSpectrumV3ArtifactPayload,
+) -> Result<(), ApiError> {
+    let mut sample_ids = BTreeSet::new();
+    let mut mode_ids = BTreeSet::new();
+    for sample in &spectrum.samples {
+        if sample.sample_id.trim().is_empty() || !sample_ids.insert(&sample.sample_id) {
+            return Err(ApiError::internal(
+                "eigen spectrum v3 contains missing or duplicate sample_id",
+            ));
+        }
+        for mode in &sample.modes {
+            if mode.mode_id.trim().is_empty() || !mode_ids.insert(&mode.mode_id) {
+                return Err(ApiError::internal(
+                    "eigen spectrum v3 contains missing or duplicate mode_id",
+                ));
+            }
+            if !mode.frequency_hz.is_finite() {
+                return Err(ApiError::internal(
+                    "eigen spectrum v3 contains non-finite frequency_hz",
+                ));
+            }
+            if mode
+                .residual_relative_l2
+                .is_some_and(|residual| !residual.is_finite() || residual < 0.0)
+            {
+                return Err(ApiError::internal(
+                    "eigen spectrum v3 contains invalid residual_relative_l2",
+                ));
+            }
+            modal_field_has_reference(
+                mode.mode_field_id.as_deref(),
+                mode.mode_field_resource_key.as_deref(),
+            )?;
+            validate_modal_participation(&mode.component_participation)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_modal_participation(
+    participation: &FrequencyDomainModalParticipationPayload,
+) -> Result<(), ApiError> {
+    if participation.schema_version != "modal_component_participation.v1"
+        || participation.definition_id != "volume_weighted_complex_l2_fraction.v1"
+        || participation.quantity_id.trim().is_empty()
+        || participation.quantity_symbol.trim().is_empty()
+        || participation.unit.trim().is_empty()
+        || participation.component_basis != "global_cartesian_xyz"
+        || participation.integration_method.trim().is_empty()
+        || participation.qualification.trim().is_empty()
+        || participation.provenance.solver_device.trim().is_empty()
+        || participation.provenance.observable_lane.trim().is_empty()
+    {
+        return Err(ApiError::internal(
+            "eigen spectrum v3 has invalid modal component participation metadata",
+        ));
+    }
+
+    match participation.status {
+        FrequencyDomainModalParticipationStatus::Ready => {
+            let Some(global) = participation.global.as_ref() else {
+                return Err(ApiError::internal(
+                    "ready modal component participation is missing global fractions",
+                ));
+            };
+            if participation.objects.is_empty() || participation.unavailable.is_some() {
+                return Err(ApiError::internal(
+                    "ready modal component participation has inconsistent availability fields",
+                ));
+            }
+            if participation
+                .provenance
+                .source_mesh_identity
+                .as_ref()
+                .is_none()
+            {
+                return Err(ApiError::internal(
+                    "ready modal component participation is missing source mesh identity",
+                ));
+            }
+            let tolerance = modal_participation_sum_tolerance(participation.objects.len());
+            validate_modal_participation_fractions(global, tolerance)?;
+            if (global.total - 1.0).abs() > tolerance {
+                return Err(ApiError::internal(
+                    "ready modal component participation global total must equal one",
+                ));
+            }
+            let mut object_ids = BTreeSet::new();
+            let mut object_total = 0.0;
+            let mut object_components = [0.0; 3];
+            for object in &participation.objects {
+                if object.object_id.trim().is_empty()
+                    || !object_ids.insert(&object.object_id)
+                    || !object.total_fraction.is_finite()
+                    || object.total_fraction < 0.0
+                {
+                    return Err(ApiError::internal(
+                        "ready modal component participation has invalid object coverage",
+                    ));
+                }
+                validate_modal_participation_fractions(&object.components, tolerance)?;
+                if (object.components.total - object.total_fraction).abs() > tolerance {
+                    return Err(ApiError::internal(
+                        "ready modal component participation object total does not match total_fraction",
+                    ));
+                }
+                object_total += object.total_fraction;
+                object_components[0] += object.components.x;
+                object_components[1] += object.components.y;
+                object_components[2] += object.components.z;
+            }
+            if (object_total - global.total).abs() > tolerance {
+                return Err(ApiError::internal(
+                    "ready modal component participation object totals do not match global total",
+                ));
+            }
+            if (object_components[0] - global.x).abs() > tolerance
+                || (object_components[1] - global.y).abs() > tolerance
+                || (object_components[2] - global.z).abs() > tolerance
+            {
+                return Err(ApiError::internal(
+                    "ready modal component participation object components do not match global components",
+                ));
+            }
+        }
+        FrequencyDomainModalParticipationStatus::Unavailable => {
+            let Some(unavailable) = participation.unavailable.as_ref() else {
+                return Err(ApiError::internal(
+                    "unavailable modal component participation is missing its reason",
+                ));
+            };
+            if participation.global.is_some()
+                || !participation.objects.is_empty()
+                || unavailable.reason_code != "component_participation_unavailable"
+                || unavailable.detail.trim().is_empty()
+            {
+                return Err(ApiError::internal(
+                    "unavailable modal component participation has inconsistent fields",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_modal_participation_fractions(
+    fractions: &FrequencyDomainModalParticipationFractionsPayload,
+    tolerance: f64,
+) -> Result<(), ApiError> {
+    if [fractions.total, fractions.x, fractions.y, fractions.z]
+        .into_iter()
+        .any(|value| !value.is_finite() || value < 0.0)
+    {
+        return Err(ApiError::internal(
+            "modal component participation fractions must be finite and non-negative",
+        ));
+    }
+    if (fractions.x + fractions.y + fractions.z - fractions.total).abs() > tolerance {
+        return Err(ApiError::internal(
+            "modal component participation component fractions must sum to total",
+        ));
+    }
+    Ok(())
+}
+
+fn modal_participation_sum_tolerance(object_count: usize) -> f64 {
+    128.0 * f64::EPSILON * (3_usize.saturating_mul(object_count)).max(1) as f64
 }
 
 fn response_sweep_total_frequency_points(payload: &Value) -> u64 {
@@ -1189,7 +3180,73 @@ fn response_frequency_point_hz(payload: &Value) -> Option<f64> {
 
 fn response_frequency_point_artifacts(
     artifact_dir: &std::path::Path,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<Vec<String>, ApiError> {
+    if let Some(generation) = generation {
+        if let Some((sweep, _)) = super::results::read_result_artifact_snapshot_in_generation(
+            artifact_dir,
+            "response/magnetic_response_sweep.v2.json",
+            Some(generation),
+        )? {
+            if let Some(raw_paths) = sweep.get("frequency_point_artifact_paths") {
+                let raw_paths = raw_paths.as_array().ok_or_else(|| {
+                    ApiError::conflict(
+                        "frequency_domain_response_sweep_point_links_malformed",
+                    )
+                })?;
+                let mut seen = BTreeSet::new();
+                let mut linked_paths = Vec::with_capacity(raw_paths.len());
+                for raw_path in raw_paths {
+                    let path = raw_path.as_str().ok_or_else(|| {
+                        ApiError::conflict(
+                            "frequency_domain_response_sweep_point_link_malformed",
+                        )
+                    })?;
+                    crate::artifacts::sanitize_artifact_relative_path(path).map_err(|_| {
+                        ApiError::conflict(
+                            "frequency_domain_response_sweep_point_link_unsafe",
+                        )
+                    })?;
+                    if !generation.commit.content.members.contains_key(path) {
+                        return Err(ApiError::conflict(
+                            "frequency_domain_response_sweep_point_link_not_in_generation",
+                        ));
+                    }
+                    if !seen.insert(path) {
+                        return Err(ApiError::conflict(
+                            "frequency_domain_response_sweep_point_link_duplicate",
+                        ));
+                    }
+                    linked_paths.push(path.to_string());
+                }
+                verify_response_frequency_point_members(
+                    artifact_dir,
+                    generation,
+                    &linked_paths,
+                )?;
+                return Ok(linked_paths);
+            }
+        }
+
+        const PREFIX: &str = "response/frequency_points/";
+        let mut paths = generation
+            .commit
+            .content
+            .members
+            .keys()
+            .filter_map(|path| {
+                let remainder = path.strip_prefix(PREFIX)?;
+                (!remainder.is_empty()
+                    && !remainder.contains('/')
+                    && remainder.ends_with(".json"))
+                .then(|| path.clone())
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        verify_response_frequency_point_members(artifact_dir, generation, &paths)?;
+        return Ok(paths);
+    }
+
     if try_resolve_artifact_path(artifact_dir, "response/magnetic_response_sweep.v2.json")?
         .is_some()
     {
@@ -1243,11 +3300,38 @@ fn response_frequency_point_artifacts(
     Ok(paths)
 }
 
+fn verify_response_frequency_point_members(
+    artifact_dir: &std::path::Path,
+    generation: &fullmag_runner::artifact_generation::GenerationCapture,
+    paths: &[String],
+) -> Result<(), ApiError> {
+    for path in paths {
+        generation.verify_member(artifact_dir, path).map_err(|error| {
+            if generation.ensure_current(artifact_dir).is_err() {
+                ApiError::conflict("frequency_domain_artifact_generation_stale")
+            } else {
+                ApiError::conflict(format!(
+                    "frequency_domain_artifact_generation_member_mismatch: {path}: {error}"
+                ))
+            }
+        })?;
+    }
+    super::results::ensure_generation_capture_current(artifact_dir, Some(generation))
+}
+
 fn read_dispersion_path_metadata_resource(
     artifact_dir: &std::path::Path,
     artifact_path: &str,
-) -> Result<FrequencyDomainKPathMetadataResource, ApiError> {
-    let value = read_json_artifact_value(artifact_dir, artifact_path)?;
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<Option<FrequencyDomainKPathMetadataResource>, ApiError> {
+    let Some((value, _)) = super::results::read_result_artifact_snapshot_in_generation(
+        artifact_dir,
+        artifact_path,
+        generation,
+    )?
+    else {
+        return Ok(None);
+    };
     let normalized = if value.get("sampling").is_some() {
         value
     } else {
@@ -1258,7 +3342,7 @@ fn read_dispersion_path_metadata_resource(
             .map_err(|error| ApiError::internal(format!("invalid {artifact_path}: {error}")))?;
     normalize_and_validate_dispersion_path_metadata(&mut resource)
         .map_err(|error| ApiError::internal(format!("invalid {artifact_path}: {error}")))?;
-    Ok(resource)
+    Ok(Some(resource))
 }
 
 fn normalize_and_validate_dispersion_path_metadata(
@@ -1504,40 +3588,9 @@ fn parse_dispersion_csv_path_samples(
     Ok(samples)
 }
 
-async fn text_artifact_resource(
-    state: &Arc<AppState>,
-    schema_version: &str,
-    artifact_path: &str,
-    resource_key: &str,
-    content_type: &str,
-) -> Result<Json<FrequencyDomainTextArtifactResource>, ApiError> {
-    let artifact_dir = require_current_live_artifact_dir(state).await?;
-    if try_resolve_artifact_path(&artifact_dir, artifact_path)?.is_some() {
-        return Ok(Json(FrequencyDomainTextArtifactResource {
-            schema_version: schema_version.to_string(),
-            status: "ready".to_string(),
-            artifact_path: artifact_path.to_string(),
-            resource_key: resource_key.to_string(),
-            content_type: content_type.to_string(),
-            text: Some(read_text_artifact_value(&artifact_dir, artifact_path)?),
-            path_metadata: None,
-            missing_reason: None,
-        }));
-    }
-    Ok(Json(FrequencyDomainTextArtifactResource {
-        schema_version: schema_version.to_string(),
-        status: "missing".to_string(),
-        artifact_path: artifact_path.to_string(),
-        resource_key: resource_key.to_string(),
-        content_type: content_type.to_string(),
-        text: None,
-        path_metadata: None,
-        missing_reason: Some("artifact is not present in the active workspace".to_string()),
-    }))
-}
-
 async fn field_resource(
     state: &Arc<AppState>,
+    captured: &mut FrequencyDomainArtifactSetCapture,
     schema_version: &str,
     field_id: &str,
     artifact_path: &str,
@@ -1546,15 +3599,35 @@ async fn field_resource(
     quantity: &str,
     metadata: Option<FrequencyDomainFieldMetadata>,
 ) -> Result<Json<FrequencyDomainFieldResource>, ApiError> {
-    let artifact_dir = require_current_live_artifact_dir(state).await?;
-    let present = try_resolve_artifact_path(&artifact_dir, artifact_path)?.is_some();
+    captured.bind_artifact_path(artifact_path)?;
+    let artifact_dir = &captured.artifact_dir;
     let metadata = metadata.unwrap_or_default();
-    Ok(Json(FrequencyDomainFieldResource {
+    let content_digest = frequency_domain_field_content_digest(
+        artifact_dir,
+        artifact_path,
+        &metadata,
+        captured.generation.as_ref(),
+    )?;
+    let present = content_digest.is_some();
+    let generation_id = present
+        .then(|| captured.generation.as_ref().map(|g| g.commit.generation_id.clone()))
+        .flatten();
+    let resource_key = generation_id.as_deref().map_or_else(
+        || resource_key.to_string(),
+        |generation_id| {
+            format!("{resource_key}&expected_artifact_generation_id={generation_id}")
+        },
+    );
+    let response = Json(FrequencyDomainFieldResource {
         schema_version: schema_version.to_string(),
         status: if present { "ready" } else { "missing" }.to_string(),
         field_id: field_id.to_string(),
         artifact_path: artifact_path.to_string(),
-        resource_key: resource_key.to_string(),
+        resource_key,
+        revision: content_digest.clone(),
+        content_digest,
+        generation_id,
+        generation_status: present.then(|| captured.generation_status()).flatten(),
         source_family: source_family.to_string(),
         quantity: quantity.to_string(),
         value_kind: metadata.value_kind,
@@ -1585,12 +3658,19 @@ async fn field_resource(
         available_views: metadata.available_views,
         default_view: metadata.default_view,
         default_phase_rad: metadata.default_phase_rad,
-        missing_reason: (!present)
-            .then(|| "field payload is not present in the active workspace".to_string()),
-    }))
+        missing_reason: (!present).then(|| {
+            if captured.generation.is_some() {
+                "field payload is not present in the active artifact generation".to_string()
+            } else {
+                "field payload is not present in the active workspace".to_string()
+            }
+        }),
+    });
+    validate_current_frequency_domain_artifact_set(state, captured).await?;
+    Ok(response)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 struct FrequencyDomainFieldMetadata {
     value_kind: String,
     component_basis: Option<String>,
@@ -1620,6 +3700,101 @@ struct FrequencyDomainFieldMetadata {
     available_views: Vec<String>,
     default_view: String,
     default_phase_rad: Option<f64>,
+}
+
+fn frequency_domain_field_content_digest(
+    artifact_dir: &std::path::Path,
+    artifact_path: &str,
+    metadata: &FrequencyDomainFieldMetadata,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<Option<String>, ApiError> {
+    let metadata = serde_json::to_vec(metadata).map_err(|error| {
+        ApiError::internal(format!(
+            "failed to serialize frequency-domain field metadata '{}': {error}",
+            artifact_path
+        ))
+    })?;
+    let mut digest = Sha256::new();
+    if let Some(generation) = generation {
+        let Some(member) = generation.commit.content.members.get(artifact_path) else {
+            return Ok(None);
+        };
+        generation.verify_member(artifact_dir, artifact_path).map_err(|error| {
+            if generation.ensure_current(artifact_dir).is_err() {
+                ApiError::conflict("frequency_domain_artifact_generation_stale")
+            } else {
+                ApiError::conflict(format!(
+                    "frequency_domain_artifact_generation_member_mismatch: {artifact_path}: {error}"
+                ))
+            }
+        })?;
+        digest.update(b"fullmag.frequency-domain-field-resource.committed.v1\0");
+        digest.update((metadata.len() as u64).to_le_bytes());
+        digest.update(metadata);
+        digest.update(member.byte_length.to_le_bytes());
+        digest.update(member.sha256.as_bytes());
+        return Ok(Some(format!("sha256:{:x}", digest.finalize())));
+    }
+
+    let Some(resolved) = try_resolve_artifact_path(artifact_dir, artifact_path)? else {
+        return Ok(None);
+    };
+    let file = std::fs::File::open(&resolved).map_err(|error| {
+        ApiError::internal(format!(
+            "failed to read frequency-domain field payload '{}': {error}",
+            artifact_path
+        ))
+    })?;
+    let file_metadata = file.metadata().map_err(|error| {
+        ApiError::internal(format!(
+            "failed to inspect frequency-domain field payload '{}': {error}",
+            artifact_path
+        ))
+    })?;
+    if !file_metadata.is_file() {
+        return Err(ApiError::internal(format!(
+            "frequency-domain field payload '{artifact_path}' is not a regular file"
+        )));
+    }
+    let byte_length = file_metadata.len();
+    let read_limit = byte_length.checked_add(1).ok_or_else(|| {
+        ApiError::internal(format!(
+            "frequency-domain field payload '{artifact_path}' length cannot be bounded"
+        ))
+    })?;
+    digest.update((metadata.len() as u64).to_le_bytes());
+    digest.update(metadata);
+    digest.update(byte_length.to_le_bytes());
+    let mut reader = file.take(read_limit);
+    let mut buffer = [0u8; 65536];
+    let mut measured_length = 0u64;
+    loop {
+        let count = reader.read(&mut buffer).map_err(|error| {
+            ApiError::internal(format!(
+                "failed to hash frequency-domain field payload '{artifact_path}': {error}"
+            ))
+        })?;
+        if count == 0 {
+            break;
+        }
+        measured_length = measured_length.checked_add(count as u64).ok_or_else(|| {
+            ApiError::internal(format!(
+                "frequency-domain field payload '{artifact_path}' length overflow"
+            ))
+        })?;
+        if measured_length > byte_length {
+            return Err(ApiError::internal(format!(
+                "frequency-domain field payload '{artifact_path}' changed while being hashed"
+            )));
+        }
+        digest.update(&buffer[..count]);
+    }
+    if measured_length != byte_length {
+        return Err(ApiError::internal(format!(
+            "frequency-domain field payload '{artifact_path}' changed while being hashed"
+        )));
+    }
+    Ok(Some(format!("sha256:{:x}", digest.finalize())))
 }
 
 impl Default for FrequencyDomainFieldMetadata {
@@ -1735,11 +3910,21 @@ fn copy_storage_metadata(
 fn response_field_payload_metadata(
     artifact_dir: &std::path::Path,
     frequency_point_artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<FrequencyDomainFieldMetadata, ApiError> {
-    if try_resolve_artifact_path(artifact_dir, frequency_point_artifact_path)?.is_none() {
+    let Some((payload, _)) = super::results::read_result_artifact_snapshot_in_generation(
+        artifact_dir,
+        frequency_point_artifact_path,
+        generation,
+    )?
+    else {
+        if generation.is_some() {
+            return Err(ApiError::conflict(
+                "frequency_domain_artifact_generation_field_metadata_missing",
+            ));
+        }
         return Ok(FrequencyDomainFieldMetadata::default());
-    }
-    let payload = read_json_artifact_value(artifact_dir, frequency_point_artifact_path)?;
+    };
     let mut metadata = FrequencyDomainFieldMetadata::default();
     metadata.value_kind = payload
         .get("value_kind")
@@ -1887,14 +4072,24 @@ fn eigen_mode_field_metadata(
     sample_index: u32,
     mode_index: u32,
     artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<Option<FrequencyDomainFieldMetadata>, ApiError> {
     let mode_artifact_path = format!(
         "eigen/modes/sample_{:04}/mode_{:04}.json",
         sample_index, mode_index
     );
-    let mode_metadata =
-        eigen_mode_field_metadata_from_mode_artifact(artifact_dir, &mode_artifact_path)?;
-    let payload_metadata = eigen_mode_field_payload_metadata(artifact_dir, artifact_path)?;
+    let mode_metadata = eigen_mode_field_metadata_from_mode_artifact(
+        artifact_dir,
+        &mode_artifact_path,
+        generation,
+    )?;
+    let payload_metadata =
+        eigen_mode_field_payload_metadata(artifact_dir, artifact_path, generation)?;
+    if generation.is_some() && mode_metadata.is_none() && payload_metadata.is_some() {
+        return Err(ApiError::conflict(
+            "frequency_domain_artifact_generation_field_metadata_missing",
+        ));
+    }
     if mode_metadata.is_none() && payload_metadata.is_some() {
         return Err(ApiError::internal(format!(
             "eigen mode field payload '{}' is present but metadata '{}' is missing",
@@ -1935,7 +4130,7 @@ fn eigen_mode_field_metadata(
         "eigen mode field",
         metadata.complex_pair_count,
         metadata.payload_value_count,
-        try_resolve_artifact_path(artifact_dir, artifact_path)?.is_some(),
+        field_artifact_present(artifact_dir, artifact_path, generation)?,
     )?;
     validate_available_views(
         &mode_artifact_path,
@@ -1968,13 +4163,17 @@ fn eigen_mode_field_preferred_payload_path(
     artifact_dir: &std::path::Path,
     sample_index: u32,
     mode_index: u32,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<String, ApiError> {
     let mode_artifact_path = eigen_mode_artifact_path(sample_index, mode_index);
-    if try_resolve_artifact_path(artifact_dir, &mode_artifact_path)?.is_some() {
-        let mode = read_json_artifact_value(artifact_dir, &mode_artifact_path)?;
+    if let Some((mode, _)) = super::results::read_result_artifact_snapshot_in_generation(
+        artifact_dir,
+        &mode_artifact_path,
+        generation,
+    )? {
         for field in ["zarr_chunk_path", "compatibility_binary_payload_path"] {
             if let Some(path) = mode.get(field).and_then(Value::as_str) {
-                if try_resolve_artifact_path(artifact_dir, path)?.is_some() {
+                if field_artifact_present(artifact_dir, path, generation)? {
                     return Ok(path.to_string());
                 }
             }
@@ -1989,22 +4188,16 @@ fn eigen_mode_field_preferred_payload_path(
 fn eigen_mode_field_metadata_from_mode_artifact(
     artifact_dir: &std::path::Path,
     mode_artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<Option<FrequencyDomainFieldMetadata>, ApiError> {
-    let Some(path) = try_resolve_artifact_path(artifact_dir, mode_artifact_path)? else {
+    let Some((payload, _)) = super::results::read_result_artifact_snapshot_in_generation(
+        artifact_dir,
+        mode_artifact_path,
+        generation,
+    )?
+    else {
         return Ok(None);
     };
-    let payload: Value = serde_json::from_slice(&std::fs::read(&path).map_err(|error| {
-        ApiError::internal(format!(
-            "failed to read eigen mode field metadata '{}': {}",
-            mode_artifact_path, error
-        ))
-    })?)
-    .map_err(|error| {
-        ApiError::internal(format!(
-            "invalid eigen mode field metadata JSON '{}': {}",
-            mode_artifact_path, error
-        ))
-    })?;
     let mut metadata = FrequencyDomainFieldMetadata::default();
     metadata.value_kind = payload
         .get("value_kind")
@@ -2059,18 +4252,26 @@ fn eigen_mode_field_metadata_from_mode_artifact(
 fn eigen_mode_field_payload_metadata(
     artifact_dir: &std::path::Path,
     artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<Option<FrequencyDomainFieldMetadata>, ApiError> {
-    let Some(path) = try_resolve_artifact_path(artifact_dir, artifact_path)? else {
-        return Ok(None);
+    let byte_count = if let Some(generation) = generation {
+        let Some(member) = generation.commit.content.members.get(artifact_path) else {
+            return Ok(None);
+        };
+        member.byte_length
+    } else {
+        let Some(path) = try_resolve_artifact_path(artifact_dir, artifact_path)? else {
+            return Ok(None);
+        };
+        std::fs::metadata(&path)
+            .map_err(|error| {
+                ApiError::internal(format!(
+                    "failed to read eigen mode field payload metadata '{}': {}",
+                    artifact_path, error
+                ))
+            })?
+            .len()
     };
-    let byte_count = std::fs::metadata(&path)
-        .map_err(|error| {
-            ApiError::internal(format!(
-                "failed to read eigen mode field payload metadata '{}': {}",
-                artifact_path, error
-            ))
-        })?
-        .len();
     if byte_count % 8 != 0 {
         return Err(ApiError::internal(format!(
             "invalid eigen mode field payload byte count in '{}'",
@@ -2092,6 +4293,21 @@ fn eigen_mode_field_payload_metadata(
     metadata.complex_pair_count = Some(payload_value_count / 2);
     metadata.payload_value_count = Some(payload_value_count);
     Ok(Some(metadata))
+}
+
+fn field_artifact_present(
+    artifact_dir: &std::path::Path,
+    artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<bool, ApiError> {
+    if let Some(generation) = generation {
+        return Ok(generation
+            .commit
+            .content
+            .members
+            .contains_key(artifact_path));
+    }
+    Ok(try_resolve_artifact_path(artifact_dir, artifact_path)?.is_some())
 }
 
 fn validate_component_count(
@@ -2230,4 +4446,352 @@ fn validate_complex_payload_counts(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod spectrum_residual_tests {
+    use super::*;
+
+    #[test]
+    fn artifact_generation_status_uses_explicit_wire_values() {
+        for (status, expected) in [
+            (
+                FrequencyDomainArtifactGenerationStatus::LegacyUnverified,
+                "legacy_unverified",
+            ),
+            (
+                FrequencyDomainArtifactGenerationStatus::MemberVerifiedUnbound,
+                "member_verified_unbound",
+            ),
+            (
+                FrequencyDomainArtifactGenerationStatus::MemberVerifiedOwnerBound,
+                "member_verified_owner_bound",
+            ),
+        ] {
+            let encoded = serde_json::to_string(&status).unwrap();
+            assert_eq!(encoded, format!("\"{expected}\""));
+            assert_eq!(
+                serde_json::from_str::<FrequencyDomainArtifactGenerationStatus>(&encoded).unwrap(),
+                status
+            );
+        }
+    }
+
+    fn spectrum() -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "eigen_spectrum.v3",
+            "samples": [{
+                "sample_id": "sample:0", "sample_index": 0,
+                "modes": [{
+                    "mode_id": "mode:0", "raw_mode_index": 0,
+                    "frequency_hz": 9.3e9,
+                    "component_participation": {
+                        "schema_version": "modal_component_participation.v1",
+                        "definition_id": "volume_weighted_complex_l2_fraction.v1",
+                        "status": "unavailable", "quantity_id": "magnetization",
+                        "quantity_symbol": "m", "unit": "1",
+                        "component_basis": "global_cartesian_xyz",
+                        "integration_method": "unavailable",
+                        "qualification": "NOT VERIFIED",
+                        "provenance": {"solver_device": "cpu", "observable_lane": "fem"},
+                        "unavailable": {
+                            "reason_code": "component_participation_unavailable",
+                            "detail": "No exported mode field"
+                        }
+                    }
+                }]
+            }]
+        })
+    }
+
+    #[test]
+    fn spectrum_v3_rejects_non_boolean_mode_field_availability() {
+        let mut input = spectrum();
+        input["samples"][0]["modes"][0]["mode_field_available"] = serde_json::json!("false");
+        assert!(decode_frequency_domain_artifact_payload("eigen/spectrum.v3.json", input).is_err());
+    }
+
+    #[test]
+    fn missing_and_null_residual_remain_unavailable() {
+        for explicit_null in [false, true] {
+            let mut input = spectrum();
+            if explicit_null {
+                input["samples"][0]["modes"][0]["residual_relative_l2"] = Value::Null;
+            }
+            let parsed: FrequencyDomainSpectrumV3ArtifactPayload =
+                serde_json::from_value(input).unwrap();
+            assert_eq!(parsed.samples[0].modes[0].residual_relative_l2, None);
+            assert!(validate_frequency_domain_spectrum_v3(&parsed).is_ok());
+            let output = serde_json::to_value(&parsed).unwrap();
+            assert!(output["samples"][0]["modes"][0]["residual_relative_l2"].is_null());
+        }
+    }
+
+    #[test]
+    fn measured_residual_is_preserved_and_invalid_values_are_rejected() {
+        let mut input = spectrum();
+        input["samples"][0]["modes"][0]["residual_relative_l2"] = serde_json::json!(2e-9);
+        let mut parsed: FrequencyDomainSpectrumV3ArtifactPayload =
+            serde_json::from_value(input).unwrap();
+        assert_eq!(parsed.samples[0].modes[0].residual_relative_l2, Some(2e-9));
+        assert!(validate_frequency_domain_spectrum_v3(&parsed).is_ok());
+        for invalid in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            parsed.samples[0].modes[0].residual_relative_l2 = Some(invalid);
+            assert!(validate_frequency_domain_spectrum_v3(&parsed).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod response_progress_generation_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct TempArtifactRoot(PathBuf);
+
+    impl TempArtifactRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "response-progress-generation-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for TempArtifactRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn json_bytes(value: Value) -> Vec<u8> {
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    fn generation_with_two_frequency_points(
+        root: &TempArtifactRoot,
+        sweep: Value,
+    ) -> fullmag_runner::artifact_generation::GenerationCapture {
+        super::super::results::write_immutable_result_generation_for_test(
+            &root.0,
+            [
+                (
+                    "response/magnetic_response_sweep.v2.json".to_string(),
+                    json_bytes(sweep),
+                ),
+                (
+                    "response/frequency_points/frequency_0000.json".to_string(),
+                    json_bytes(serde_json::json!({"frequency_hz": 10.0})),
+                ),
+                (
+                    "response/frequency_points/frequency_0001.json".to_string(),
+                    json_bytes(serde_json::json!({"frequency_hz": 20.0})),
+                ),
+            ],
+            None,
+        )
+    }
+
+    fn assert_progress_snapshot_conflict(
+        result: Result<ResponseProgressArtifactSnapshot, ApiError>,
+    ) {
+        let error = match result {
+            Ok(_) => panic!("invalid generation-backed point set must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn progress_fallback_reads_v2_snapshot_and_ignores_stale_root_aliases() {
+        let root = TempArtifactRoot::new();
+        let linked_point = "response/frequency_points/frequency_0001.json";
+        let generation = super::super::results::write_immutable_result_generation_for_test(
+            &root.0,
+            [
+                (
+                    "response/magnetic_response_sweep.v2.json".to_string(),
+                    json_bytes(serde_json::json!({
+                        "points": [{"frequency_hz": 10.0}, {"frequency_hz": 20.0}],
+                        "frequency_point_artifact_paths": [linked_point]
+                    })),
+                ),
+                (
+                    linked_point.to_string(),
+                    json_bytes(serde_json::json!({"frequency_hz": 20.0})),
+                ),
+                (
+                    "frequency_domain/manifest.v1.json".to_string(),
+                    json_bytes(serde_json::json!({
+                        "schema_version": "frequency_domain_manifest.v1",
+                        "requested_frequency_point_count": 3,
+                        "diagnostics": {
+                            "completed_frequency_point_count": 1,
+                            "written_frequency_point_artifacts": 1
+                        }
+                    })),
+                ),
+            ],
+            None,
+        );
+
+        let committed = response_progress_artifact_snapshot(&root.0, Some(&generation)).unwrap();
+        assert_eq!(
+            committed.sweep_path.as_deref(),
+            Some("response/magnetic_response_sweep.v2.json")
+        );
+        assert_eq!(
+            response_sweep_frequency_range_hz(committed.sweep_payload.as_ref().unwrap()),
+            Some((10.0, 20.0))
+        );
+        assert_eq!(committed.frequency_points, vec![linked_point]);
+        assert_eq!(committed.current_frequency_hz, Some(20.0));
+        assert_eq!(
+            committed.manifest_path.as_deref(),
+            Some("frequency_domain/manifest.v1.json")
+        );
+
+        for (path, value) in [
+            (
+                "response/magnetic_response_sweep.v2.json",
+                serde_json::json!({
+                    "points": [{"frequency_hz": 999.0}],
+                    "frequency_point_artifact_paths": [linked_point]
+                }),
+            ),
+            (linked_point, serde_json::json!({"frequency_hz": 999.0})),
+            (
+                "frequency_domain/manifest.v1.json",
+                serde_json::json!({"schema_version":"stale", "complete":true}),
+            ),
+            (
+                "response/frequency_points/frequency_9999.json",
+                serde_json::json!({"frequency_hz": 9999.0}),
+            ),
+        ] {
+            let path = root.0.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, json_bytes(value)).unwrap();
+        }
+
+        let still_committed =
+            response_progress_artifact_snapshot(&root.0, Some(&generation)).unwrap();
+        assert_eq!(still_committed.sweep_payload, committed.sweep_payload);
+        assert_eq!(still_committed.frequency_points, vec![linked_point]);
+        assert_eq!(still_committed.current_frequency_hz, Some(20.0));
+        assert_eq!(still_committed.manifest_payload, committed.manifest_payload);
+    }
+
+    #[test]
+    fn progress_fallback_enumerates_only_v2_members_and_keeps_v1_membership() {
+        let root = TempArtifactRoot::new();
+        let indexed_point = "response/frequency_points/frequency_0000.json";
+        let generation = super::super::results::write_immutable_result_generation_for_test(
+            &root.0,
+            [
+                (
+                    "response/magnetic_response_sweep.v2.json".to_string(),
+                    json_bytes(serde_json::json!({"points":[{"frequency_hz": 1.0}]})),
+                ),
+                (
+                    indexed_point.to_string(),
+                    json_bytes(serde_json::json!({"frequency_hz": 1.0})),
+                ),
+            ],
+            None,
+        );
+        let uncommitted_point = root.0.join("response/frequency_points/frequency_0001.json");
+        std::fs::create_dir_all(uncommitted_point.parent().unwrap()).unwrap();
+        std::fs::write(
+            &uncommitted_point,
+            json_bytes(serde_json::json!({"frequency_hz": 2.0})),
+        )
+        .unwrap();
+
+        let v2 = response_progress_artifact_snapshot(&root.0, Some(&generation)).unwrap();
+        assert_eq!(v2.frequency_points, vec![indexed_point]);
+        assert_eq!(v2.current_frequency_hz, Some(1.0));
+
+        let v1_root = TempArtifactRoot::new();
+        let v1_point = "response/frequency_points/frequency_0000.json";
+        let point_bytes = json_bytes(serde_json::json!({"frequency_hz": 3.0}));
+        super::super::results::write_result_generation_for_test(
+            &v1_root.0,
+            v1_point,
+            &point_bytes,
+            None,
+        );
+        let v1_generation = fullmag_runner::artifact_generation::capture(&v1_root.0)
+            .unwrap()
+            .expect("v1 fixture should capture");
+        let stale_extra = v1_root.0.join("response/frequency_points/frequency_0001.json");
+        std::fs::write(
+            &stale_extra,
+            json_bytes(serde_json::json!({"frequency_hz": 4.0})),
+        )
+        .unwrap();
+
+        let v1 = response_progress_artifact_snapshot(&v1_root.0, Some(&v1_generation)).unwrap();
+        assert_eq!(v1.frequency_points, vec![v1_point]);
+        assert_eq!(v1.current_frequency_hz, Some(3.0));
+    }
+
+    #[test]
+    fn progress_fallback_rejects_malformed_duplicate_and_unlisted_point_links() {
+        let valid_point = "response/frequency_points/frequency_0000.json";
+        let invalid_links = [
+            serde_json::json!("not-an-array"),
+            serde_json::json!([valid_point, 20]),
+            serde_json::json!(["../outside.json"]),
+            serde_json::json!(["response/frequency_points/not-published.json"]),
+            serde_json::json!([valid_point, valid_point]),
+        ];
+
+        for links in invalid_links {
+            let root = TempArtifactRoot::new();
+            let generation = generation_with_two_frequency_points(
+                &root,
+                serde_json::json!({
+                    "points": [{"frequency_hz": 10.0}, {"frequency_hz": 20.0}],
+                    "frequency_point_artifact_paths": links
+                }),
+            );
+            assert_progress_snapshot_conflict(response_progress_artifact_snapshot(
+                &root.0,
+                Some(&generation),
+            ));
+        }
+    }
+
+    #[test]
+    fn progress_fallback_verifies_every_enumerated_point_before_counting() {
+        for remove_member in [false, true] {
+            let root = TempArtifactRoot::new();
+            let generation = generation_with_two_frequency_points(
+                &root,
+                serde_json::json!({
+                    "points": [{"frequency_hz": 10.0}, {"frequency_hz": 20.0}]
+                }),
+            );
+            let first_point = root
+                .0
+                .join("frequency_domain/generations")
+                .join(generation.commit.generation_id.strip_prefix("sha256:").unwrap())
+                .join("response/frequency_points/frequency_0000.json");
+            if remove_member {
+                std::fs::remove_file(first_point).unwrap();
+            } else {
+                let mut corrupted = std::fs::read(&first_point).unwrap();
+                corrupted[0] ^= 1;
+                std::fs::write(first_point, corrupted).unwrap();
+            }
+
+            assert_progress_snapshot_conflict(response_progress_artifact_snapshot(
+                &root.0,
+                Some(&generation),
+            ));
+        }
+    }
 }

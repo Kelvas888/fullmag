@@ -36,7 +36,7 @@ build_time = os.environ.get("FULLMAG_DOCS_BUILD_TIME")
 if not build_time:
     build_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 html_context = {"fem_docs_build_time": build_time}
-exclude_patterns = ["_build", "internal", "generated", "README.md"]
+exclude_patterns = ["_build", "internal", "generated", "README.md", "**/PAGE_TEMPLATE.md"]
 source_suffix = {".md": "markdown", ".rst": "restructuredtext"}
 
 myst_enable_extensions = [
@@ -60,8 +60,9 @@ html_css_files = [
     "fullmag-docs.css",
     "page-last-modified.css",
     "documentation-changelog.css",
+    "fullmag-embed.css",
 ]
-html_js_files = ["status-navigation.js"]
+html_js_files = ["status-navigation.js", "fullmag-embed.js"]
 
 page_last_modified_label = "Last changes:"
 page_last_modified_format = "%H:%M %d.%m.%Y"

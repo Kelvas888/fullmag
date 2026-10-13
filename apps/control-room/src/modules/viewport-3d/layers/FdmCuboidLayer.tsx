@@ -1046,12 +1046,7 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
   const adoptionOwnerId = `fdm-cuboid-surface:${useId()}`;
   const recordSurfaceAdoption = useCallback(() => {
     if (!adoptionRegistry || !surfaceColors) return;
-    lastAdoptedSurfaceRef.current = {
-      fieldBufferId,
-      sessionIdentity,
-      scalarBuffer: surfaceColors,
-    };
-    recordFdmCuboidSurfaceAdoption({
+    const adoption = recordFdmCuboidSurfaceAdoption({
       carrierId,
       fieldBufferId,
       ownerId: adoptionOwnerId,
@@ -1059,6 +1054,20 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
       sessionIdentity,
       scalarBuffer: surfaceColors,
     });
+    lastAdoptedSurfaceRef.current =
+      adoption.fieldBufferId && sessionIdentity &&
+        adoptionRegistry.hasActiveAdoption({
+          fieldBufferId: adoption.fieldBufferId,
+          resourceKey: adoption.resourceKey,
+          sessionEpoch: sessionIdentity.sessionEpoch,
+          sessionId: sessionIdentity.sessionId,
+        })
+        ? {
+            fieldBufferId,
+            sessionIdentity,
+            scalarBuffer: surfaceColors,
+          }
+        : null;
   }, [
     adoptionOwnerId,
     adoptionRegistry,
@@ -1114,7 +1123,7 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
           color: surfaceMaterialColor,
           opacity: surfaceOpacity,
           vertexColors: usesInstanceColors,
-          ...materialProfile.magneticSurface,
+          toneMapped: materialProfile.magneticSurface.toneMapped,
           ...surfaceMaterialPolicyProps(surfaceOpacity),
         }),
       ),
@@ -1126,6 +1135,7 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
       usesInstanceColors,
     ],
   );
+  const surfaceMaterialRef = useRef<MeshBasicMaterial>(null);
   const wireframePolicy = RENDER_POLICIES.featureEdges;
   const wireframeColor = wireframeColorFromSettings(renderSettings, colors.wire);
   const wireframeOpacity = renderPlan.wireframe.opacity;
@@ -1190,6 +1200,20 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
     }
 
     let colorChanged = false;
+    // Instance colors are enabled by Three.js independently of vertexColors.
+    // Drop the previous quantity's attribute when no compatible buffer exists.
+    if (!usesInstanceColors && surface.instanceColor !== null) {
+      surface.instanceColor = null;
+      colorRevisionRef.current = null;
+      const mountedSurfaceMaterial = surface.material;
+      if (
+        mountedSurfaceMaterial === surfaceMaterial &&
+        mountedSurfaceMaterial instanceof MeshBasicMaterial
+      ) {
+        mountedSurfaceMaterial.needsUpdate = true;
+      }
+      colorChanged = true;
+    }
     if (usesInstanceColors && surfaceColors) {
       const colorRevision = resolveFdmCuboidColorUploadRevision(
         preparedInstances,
@@ -1220,6 +1244,17 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
           "fullmag.viewport3d.uploadFdmCuboidColors",
           colorStartMark,
         );
+      }
+      const previousAdoption = lastAdoptedSurfaceRef.current;
+      const adoptionIdentityChanged =
+        previousAdoption?.fieldBufferId !== fieldBufferId ||
+        previousAdoption?.scalarBuffer !== surfaceColors ||
+        previousAdoption?.sessionIdentity?.sessionEpoch !==
+          sessionIdentity?.sessionEpoch ||
+        previousAdoption?.sessionIdentity?.requestScopeEpoch !==
+          sessionIdentity?.requestScopeEpoch ||
+        previousAdoption?.sessionIdentity?.sessionId !== sessionIdentity?.sessionId;
+      if (colorChanged || adoptionIdentityChanged) {
         recordSurfaceAdoption();
       }
     }
@@ -1231,6 +1266,9 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
     invalidate,
     preparedInstances,
     recordSurfaceAdoption,
+    surfaceMaterial,
+    fieldBufferId,
+    sessionIdentity,
     surfaceColors,
     surfaceRef,
     tracker,
@@ -1275,7 +1313,11 @@ const FdmCuboidSurfacePass = memo(function FdmCuboidSurfacePass({
         renderOrder={surfacePolicy.renderOrder}
         visible={renderPlan.surface.visible}
       >
-        <primitive attach="material" object={surfaceMaterial} />
+        <primitive
+          ref={surfaceMaterialRef}
+          attach="material"
+          object={surfaceMaterial}
+        />
       </instancedMesh>
       <instancedMesh
         args={[geometry, undefined, renderCount]}

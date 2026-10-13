@@ -277,7 +277,7 @@ study.fem_demag_solver(
     rtol=1.0e-10,
     max_iterations=500,
 )
-study.stages.add_relax(stage_id="equilibrium", tolT=1.0e-6)
+study.stages.add_relax(stage_id="equilibrium", dt=5.0e-13, tolT=1.0e-6)
 ```
 
 | Public value | Meaning | Validation consequence |
@@ -403,3 +403,10 @@ fem-poisson-airbox
 fem-bem
 periodic-demag
 ```
+## Control Room crosswalk
+
+This is a navigation page; use the terminal page named by the selected stage or solver. The category itself has no standalone editor. Numerical parameters without a matching control are not implemented in the frontend. Do not infer frontend support from Python or backend availability. See {doc}/frontend/capability-register for the current register and exact source owner.
+
+## Source-code index
+
+This is a navigation page and introduces no standalone implementation symbol. The exact source-code index is maintained by the selected terminal page.

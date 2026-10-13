@@ -6,10 +6,13 @@ on:
     branches: [master, main]
     paths:
       - "public_docs/site/**"
+      - "public_docs/site/python-api/**"
       - "public_docs/fullmag_profesjonalna_dokumentacja_architektura.md"
       - "docs/physics/**"
       - "docs/audits/**"
       - "packages/fullmag-py/**"
+      - "crates/fullmag-plan/src/magnetization_textures_v2.rs"
+      - "external_solvers/3"
       - "scripts/public_docs_information_architecture.py"
       - "scripts/check_public_docs_information_architecture.py"
       - "scripts/test_public_docs_information_architecture.py"
@@ -20,10 +23,13 @@ on:
   pull_request:
     paths:
       - "public_docs/site/**"
+      - "public_docs/site/python-api/**"
       - "public_docs/fullmag_profesjonalna_dokumentacja_architektura.md"
       - "docs/physics/**"
       - "docs/audits/**"
       - "packages/fullmag-py/**"
+      - "crates/fullmag-plan/src/magnetization_textures_v2.rs"
+      - "external_solvers/3"
       - "scripts/public_docs_information_architecture.py"
       - "scripts/check_public_docs_information_architecture.py"
       - "scripts/test_public_docs_information_architecture.py"
@@ -52,6 +58,7 @@ jobs:
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          submodules: recursive
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -73,6 +80,7 @@ jobs:
         run: |
           python -m unittest scripts/test_check_public_doc_examples.py -v
           python scripts/check_public_doc_examples.py --root public_docs/site
+          python -m unittest scripts/test_documentation_changelog_tabs.py -v
 
       - name: Resolve scientific documentation diff base
         id: docs-diff
@@ -107,7 +115,7 @@ jobs:
           DOCS_DIFF_BASE: ${{ steps.docs-diff.outputs.base }}
         run: |
           set -euo pipefail
-          map_files="$(git diff --name-only "$DOCS_DIFF_BASE" HEAD -- docs/audits public_docs/site/physics public_docs/site/python-api | grep -E '\\.source-map\\.json$' || true)"
+          map_files="$(git diff --name-only "$DOCS_DIFF_BASE" HEAD -- docs/audits public_docs/site | grep -E '\\.source-map\\.json$' || true)"
           if [[ -z "$map_files" ]]; then
             echo "No changed scientific source maps; changed-page validation already ran."
             exit 0
@@ -153,14 +161,16 @@ jobs:
           test -s "$changes_dir/changes.html"
           mkdir -p "$published_dir"
           cp -a "$changes_dir/." "$published_dir/"
+          cp "$changes_dir/changes.html" "$published_dir/index.html"
           grep --fixed-strings --quiet "development" "$published_dir/changes.html"
+          grep --fixed-strings --quiet "Automatically generated list of changes" "$published_dir/index.html"
 
       - name: Validate rendered scientific documentation
         env:
           DOCS_DIFF_BASE: ${{ steps.docs-diff.outputs.base }}
         run: |
           set -euo pipefail
-          map_files="$(git diff --name-only "$DOCS_DIFF_BASE" HEAD -- public_docs/site/physics public_docs/site/python-api | grep -E '\\.source-map\\.json$' || true)"
+          map_files="$(git diff --name-only "$DOCS_DIFF_BASE" HEAD -- public_docs/site | grep -E '\\.source-map\\.json$' || true)"
           if [[ -z "$map_files" ]]; then
             echo "No changed public scientific source maps; rendered changed-page validation already ran."
             exit 0
@@ -211,7 +221,7 @@ jobs:
         env:
           DMI_URL: https://fullmag.mzelent.pl/physics/interactions/dmi/index.html
           CHANGELOG_URL: https://fullmag.mzelent.pl/changelog/index.html
-          VERSION_CHANGES_URL: https://fullmag.mzelent.pl/version-changes/changes.html
+          VERSION_CHANGES_URL: https://fullmag.mzelent.pl/version-changes/index.html
         run: |
           set -euo pipefail
           dmi_page="$(mktemp)"
@@ -229,7 +239,7 @@ jobs:
               "$DMI_URL" --output "$dmi_page" \
               && grep --fixed-strings --quiet "Dzyaloshinskii" "$dmi_page" \
               && grep --fixed-strings --quiet \
-                "Fullmag distinguishes interfacial and bulk" "$dmi_page"; then
+                "Fullmag exposes three distinct" "$dmi_page"; then
               dmi_ok=true
             fi
 
@@ -237,7 +247,12 @@ jobs:
               --connect-timeout 10 --max-time 30 \
               "$CHANGELOG_URL" --output "$changelog_page" \
               && grep --fixed-strings --quiet "Documentation changelog" "$changelog_page" \
-              && grep --fixed-strings --quiet "Recent documentation changes" "$changelog_page" \
+              && grep --fixed-strings --quiet "Two change histories" "$changelog_page" \
+              && grep --fixed-strings --quiet "fm-changelog-tab-panel--documentation" "$changelog_page" \
+              && grep --fixed-strings --quiet "fm-changelog-tab-panel--code" "$changelog_page" \
+              && grep --fixed-strings --quiet "Latest documentation change" "$changelog_page" \
+              && grep --fixed-strings --quiet "Latest code change" "$changelog_page" \
+              && test "$(grep --count --fixed-strings "fm-changelog-summary__time" "$changelog_page")" -ge 2 \
               && grep --fixed-strings --quiet "/commit/${GITHUB_SHA}" "$changelog_page"; then
               changelog_ok=true
             fi
@@ -245,7 +260,8 @@ jobs:
             if curl --fail --silent --show-error --location \
               --connect-timeout 10 --max-time 30 \
               "$VERSION_CHANGES_URL" --output "$version_page" \
-              && grep --fixed-strings --quiet "development" "$version_page"; then
+              && grep --fixed-strings --quiet "development" "$version_page" \
+              && grep --fixed-strings --quiet "Automatically generated list of changes" "$version_page"; then
               version_ok=true
             fi
 

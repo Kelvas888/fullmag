@@ -123,14 +123,23 @@ def test_task13_sources_wire_exact_stable_ranges_and_opt_in_build() -> None:
     assert "--cfg fullmag_enable_nvtx" in exporter
     assert '"nvtx_enabled"' in exporter
     clean = "cargo +nightly clean -p fullmag-build-info"
-    build = "cargo +nightly build"
+    build = "cargo +nightly -Z checksum-freshness build"
     assert clean in exporter
     assert exporter.index(clean) < exporter.index(build)
     assert "inherited RUSTFLAGS contains fullmag_enable_nvtx" in exporter
     assert "only_native_lib_dir" in exporter
+    stale_native_clean = (
+        'find target/release/build -maxdepth 1 -type d -name "fullmag-fem-sys-*"'
+    )
+    assert stale_native_clean in exporter
     stale_guard = "stale fullmag-fem-sys native artifacts remain after targeted clean"
     assert stale_guard in exporter
-    assert exporter.index(clean) < exporter.index(stale_guard) < exporter.index(build)
+    assert (
+        exporter.index(clean)
+        < exporter.index(stale_native_clean)
+        < exporter.index(stale_guard)
+        < exporter.index(build)
+    )
     assert "validate_nvtx_artifact" in exporter
     assert "validate_nvtx_symbol_contract" in exporter
     assert "nm -D --defined-only" in exporter
@@ -155,18 +164,28 @@ def test_task13_sources_wire_exact_stable_ranges_and_opt_in_build() -> None:
     assert "#endif" in guarded_wrappers
 
     dockerfile = sources["docker/fem-gpu/Dockerfile"]
-    assert (
-        "FULLMAG_NSIGHT_SYSTEMS_ROOT=/opt/nvidia/nsight-compute/2024.1.1/host/target-linux-x64"
-        in dockerfile
-    )
-    assert "PATH=${FULLMAG_NSIGHT_SYSTEMS_ROOT}:${PATH}" in dockerfile
-    assert "RUN nsys --version && ncu --version" in dockerfile
+    assert "2024.1.1" not in dockerfile
+    assert "command -v nsys" in dockerfile
+    assert "command -v ncu" in dockerfile
+    assert "profiler tools are optional" in dockerfile
+    assert "RUN nsys --version && ncu --version" not in dockerfile
 
     assert "mod nvtx_range;" in (REPO_ROOT / "crates/fullmag-cli/src/main.rs").read_text(
         encoding="utf-8"
     )
     assert "mod nvtx_range" not in sources["crates/fullmag-cli/src/orchestrator.rs"]
     assert "mod nvtx_range" not in sources["crates/fullmag-cli/src/live_workspace.rs"]
+
+
+def test_native_fem_cargo_build_propagates_release_and_parallelism_to_cmake() -> None:
+    sys_build = (REPO_ROOT / "crates/fullmag-fem-sys/build.rs").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'std::env::var("PROFILE")' in sys_build
+    assert '"-DCMAKE_BUILD_TYPE={}"' in sys_build
+    assert 'std::env::var("NUM_JOBS")' in sys_build
+    assert '.arg("--parallel")' in sys_build
 
 
 def test_preview_nvtx_range_is_owned_until_snapshot_materialization_finishes() -> None:
@@ -325,11 +344,10 @@ def test_capture_uses_typed_v2_fixture_and_matching_environment() -> None:
     command = capture._fixture_command(Path("/tmp/compute"))
     fixture_index = command.index("--fixture-manifest")
     environment_index = command.index("--fixture-environment")
-    assert command[fixture_index + 1].endswith(
-        "examples/assets/fem_performance/box500_airbox_exchange_demag_v2.fixture.json"
-    )
-    assert command[environment_index + 1].endswith(
-        "benchmarks/fem-gpu/accepted/rtx4080-sm89/nsight-v2-environment.json"
+    assert Path(command[fixture_index + 1]).resolve() == capture.FIXTURE_MANIFEST.resolve()
+    assert (
+        Path(command[environment_index + 1]).resolve()
+        == capture.FIXTURE_ENVIRONMENT.resolve()
     )
 
 
@@ -669,7 +687,7 @@ def test_ncu_passes_are_individually_bounded_to_top_five_kernels() -> None:
     top = capture.top_kernel_names(kernel_rows)
     commands = capture.build_ncu_commands(
         top,
-        ["fullmag", "run-json", "fixture.json"],
+        ["fullmag", "run-problem-json-direct", "fixture.json"],
         Path("ncu"),
     )
 

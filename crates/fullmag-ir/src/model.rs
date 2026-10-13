@@ -8,7 +8,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-use crate::ImportedGeometryScaleIR;
+use crate::{
+    AntennaConductorPartIR, AntennaRigidTransformIR, AntennaTerminalFaceSelectorsIR,
+    CpwWidthStationIR, ImportedGeometryScaleIR, MicrostripWidthStationIR,
+};
 
 // ── Problem metadata ──────────────────────────────────────────────────────────
 
@@ -75,6 +78,30 @@ pub enum GeometryEntryIR {
         #[serde(default)]
         z0: f64,
     },
+    #[serde(rename = "microstrip")]
+    MicrostripAntenna {
+        name: String,
+        length_m: f64,
+        thickness_m: f64,
+        conductivity_s_per_m: f64,
+        transform: AntennaRigidTransformIR,
+        stations: Vec<MicrostripWidthStationIR>,
+        return_width_m: f64,
+        return_offset_m: f64,
+        conductors: Vec<AntennaConductorPartIR>,
+        terminal_faces: BTreeMap<String, AntennaTerminalFaceSelectorsIR>,
+    },
+    #[serde(rename = "cpw")]
+    CpwAntenna {
+        name: String,
+        length_m: f64,
+        thickness_m: f64,
+        conductivity_s_per_m: f64,
+        transform: AntennaRigidTransformIR,
+        stations: Vec<CpwWidthStationIR>,
+        conductors: Vec<AntennaConductorPartIR>,
+        terminal_faces: BTreeMap<String, AntennaTerminalFaceSelectorsIR>,
+    },
     Ellipsoid {
         name: String,
         radii: [f64; 3],
@@ -118,6 +145,8 @@ impl GeometryEntryIR {
             | Self::Cylinder { name, .. }
             | Self::SinWaveguide { name, .. }
             | Self::ArchWaveguide { name, .. }
+            | Self::MicrostripAntenna { name, .. }
+            | Self::CpwAntenna { name, .. }
             | Self::Ellipsoid { name, .. }
             | Self::Sphere { name, .. }
             | Self::Ellipse { name, .. }
@@ -451,6 +480,41 @@ pub struct MaterialIR {
     pub dind_field: Option<Vec<f64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dbulk_field: Option<Vec<f64>>,
+}
+
+/// Non-physical zero/default material scaffold for programmatic plan builders.
+/// A resolved execution plan must overwrite the scalar material parameters;
+/// this implementation only makes `FemPlanIR::default()` ergonomic for tests
+/// and runtime probe construction.
+impl Default for MaterialIR {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            saturation_magnetisation: 0.0,
+            exchange_stiffness: 0.0,
+            damping: 0.0,
+            uniaxial_anisotropy: None,
+            uniaxial_anisotropy_k2: None,
+            anisotropy_axis: None,
+            cubic_anisotropy_kc1: None,
+            cubic_anisotropy_kc2: None,
+            cubic_anisotropy_kc3: None,
+            cubic_anisotropy_axis1: None,
+            cubic_anisotropy_axis2: None,
+            ms_field: None,
+            a_field: None,
+            alpha_field: None,
+            ku_field: None,
+            ku2_field: None,
+            kc1_field: None,
+            kc2_field: None,
+            kc3_field: None,
+            interfacial_dmi: None,
+            bulk_dmi: None,
+            dind_field: None,
+            dbulk_field: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

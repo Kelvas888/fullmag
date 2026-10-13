@@ -1,0 +1,316 @@
+#pragma once
+
+#include "frequency_domain/modal_eigen_request.hpp"
+#include "frequency_domain/mesh_symmetry_certificate.hpp"
+#include "frequency_domain/tangent_frame.hpp"
+
+#include <cstdint>
+#include <array>
+#include <complex>
+#include <string>
+#include <vector>
+
+#ifndef FULLMAG_HAS_MFEM_STACK
+#define FULLMAG_HAS_MFEM_STACK 0
+#endif
+
+#if FULLMAG_HAS_MFEM_STACK
+#include "cpu/frequency_domain/floquet_airbox_operator.hpp"
+#include <mfem.hpp>
+#endif
+
+namespace fullmag::fem {
+struct FemMeshRuntimeState;
+}
+
+namespace fullmag::fem::frequency_domain {
+
+struct FloquetAirboxDynamicDemagKResult;
+
+struct PoissonAirboxK0DemagProbeAssembly {
+    std::vector<double> q_global_y{};
+    std::vector<double> q_global_z{};
+    std::vector<double> h_functional_global_y{};
+    std::vector<double> h_functional_global_z{};
+    double magnetization_integral_global_y_a_per_m_m3 = 0.0;
+    double magnetization_integral_global_z_a_per_m_m3 = 0.0;
+    double magnetic_energy_scale_global_y_j = 0.0;
+    double magnetic_energy_scale_global_z_j = 0.0;
+    double magnetic_volume_m3 = 0.0;
+    double mu0_t_m_a = 0.0;
+    char outer_boundary_kind[32]{};
+    double robin_beta = 0.0;
+    bool global_y_observable = false;
+    bool global_z_observable = false;
+};
+
+/*
+ * Backend-owned complex CSR storage for the phase-reduced Floquet pencil.
+ * The arrays are intentionally independent from CsrMatrixView: the latter
+ * is a real ABI carrier, while a nonzero-k operator has genuine complex
+ * entries before its real-split SLEPc view is formed.  Keeping ownership here
+ * makes it possible to assemble and solve a large shared-domain problem
+ * without materialising a dense dynamic-demagnetisation block.
+ */
+struct PoissonAirboxSharedDomainComplexCsrMatrix {
+    std::uint64_t row_count = 0;
+    std::uint64_t column_count = 0;
+    std::vector<std::uint32_t> row_offsets{};
+    std::vector<std::uint32_t> column_indices{};
+    std::vector<std::complex<double>> values{};
+};
+
+#if FULLMAG_HAS_MFEM_STACK
+
+enum class PoissonAirboxBoundaryKind : std::uint32_t {
+    robin,
+    dirichlet,
+    pure_neumann,
+};
+
+enum class PoissonAirboxPureNeumannGaugePolicy : std::uint32_t {
+    mean_zero_augmented,
+    require_invertible,
+};
+
+struct PoissonAirboxSharedDomainCsrMatrix {
+    std::uint64_t row_count = 0;
+    std::uint64_t column_count = 0;
+    std::vector<std::uint32_t> row_offsets{};
+    std::vector<std::uint32_t> column_indices{};
+    std::vector<double> values{};
+
+    CsrMatrixView view() const noexcept
+    {
+        return CsrMatrixView{
+            row_count,
+            column_count,
+            row_offsets.data(),
+            static_cast<std::uint64_t>(row_offsets.size()),
+            column_indices.data(),
+            static_cast<std::uint64_t>(column_indices.size()),
+            values.data(),
+            static_cast<std::uint64_t>(values.size())};
+    }
+};
+
+struct FloquetDescriptorPeriodicPair {
+    std::uint64_t node_a = 0;
+    std::uint64_t node_b = 0;
+    std::array<double, 3> translation_m{};
+    bool magnetic_active = false;
+};
+
+/*
+ * Backend-owned shared-domain P1 assembly contract.
+ *
+ * The scalar FE space and all tangent fields are built from one MFEM mesh.
+ * The magnetic A_qq input is the accepted static-restoring linearization
+ * already assembled by the canonical magnetic operator path; this module
+ * owns the scalar Poisson block, reciprocal couplings, gyrotropic B_qq,
+ * class reduction, BC/gauge policy, and the immutable operator digest.
+ *
+ * A node-pair list is deliberately not accepted.  Both scalar_reduced_node
+ * and magnetic_reduced_node must describe complete equivalence classes.
+ */
+struct PoissonAirboxSharedDomainAssemblyRequest {
+    mfem::FiniteElementSpace *scalar_space = nullptr;
+    const TangentFrameNode *tangent_frames = nullptr;
+    std::uint64_t tangent_frame_count = 0;
+
+    const std::uint8_t *magnetic_element_mask = nullptr;
+    std::uint64_t magnetic_element_count = 0;
+    const double *saturation_magnetization_a_per_m = nullptr;
+    std::uint64_t saturation_magnetization_count = 0;
+    double uniform_saturation_magnetization_a_per_m = 0.0;
+    // Private opt-in for the energy-Hessian Gilbert mass.  Descriptor alpha
+    // is carried through this request without activating damping by default.
+    bool include_gilbert_damping = false;
+    const double *alpha_per_node = nullptr;
+    std::uint64_t alpha_per_node_count = 0;
+    double uniform_alpha = 0.0;
+    double gamma0_m_per_a_s = 0.0;
+    double mu0_T_m_A = 0.0;
+
+    const CsrMatrixView *magnetic_a_qq_csr = nullptr;
+    /* Optional full-q -> phase-reduced-q constraint.  When supplied, the
+       magnetic A_qq and B_qq blocks are projected as C^H A C and C^H B C;
+       the real k=0 reduction remains the default when it is null. */
+    const mfem::ComplexSparseMatrix *magnetic_phase_constraint = nullptr;
+
+    const std::uint32_t *scalar_reduced_node = nullptr;
+    std::uint64_t scalar_reduced_node_count = 0;
+    const std::uint32_t *magnetic_reduced_node = nullptr;
+    std::uint64_t magnetic_reduced_node_count = 0;
+    bool equivalence_classes_complete = false;
+
+    PoissonAirboxBoundaryKind boundary_kind = PoissonAirboxBoundaryKind::pure_neumann;
+    PoissonAirboxPureNeumannGaugePolicy pure_neumann_gauge_policy =
+        PoissonAirboxPureNeumannGaugePolicy::mean_zero_augmented;
+    double robin_beta = 0.0;
+    mfem::Array<int> *robin_boundary_marker = nullptr;
+};
+
+struct PoissonAirboxSharedDomainAssemblyResult {
+    FrequencyDomainStatus status = FrequencyDomainStatus::unavailable;
+    char error_message[256]{};
+
+    std::uint64_t q_dof_count = 0;
+    std::uint64_t phi_dof_count = 0;
+    std::uint64_t full_q_dof_count = 0;
+    std::uint64_t full_phi_dof_count = 0;
+
+    PoissonAirboxSharedDomainCsrMatrix a_qq{};
+    PoissonAirboxSharedDomainCsrMatrix a_qphi{};
+    PoissonAirboxSharedDomainCsrMatrix a_phiq{};
+    PoissonAirboxSharedDomainCsrMatrix p{};
+    PoissonAirboxSharedDomainCsrMatrix b_qq{};
+    PoissonAirboxSharedDomainComplexCsrMatrix floquet_a_qq{};
+    PoissonAirboxSharedDomainComplexCsrMatrix floquet_b_qq{};
+    PoissonAirboxSharedDomainComplexCsrMatrix floquet_p{};
+    PoissonAirboxSharedDomainComplexCsrMatrix floquet_a_qphi{};
+    PoissonAirboxSharedDomainComplexCsrMatrix floquet_a_phiq{};
+    // Full-field inputs retained for an independent descriptor/seam check
+    // after the reduced SLEPc solve. These are transient solve data and are
+    // not exported as a second persistent copy of the operator.
+    PoissonAirboxSharedDomainCsrMatrix floquet_full_a_qq{};
+    PoissonAirboxSharedDomainCsrMatrix floquet_full_b_qq{};
+    // Geometric consistent P1 inner product, positive on the active magnetic
+    // tangent space (full-mesh air rows may be zero), including periodic members,
+    // and its C^H M C
+    // phase-reduced complex CSR form. This is not gyrotropic B_qq and carries
+    // no Ms/gamma weighting.
+    PoissonAirboxSharedDomainCsrMatrix floquet_full_positive_tangent_mass{};
+    PoissonAirboxSharedDomainComplexCsrMatrix floquet_positive_tangent_mass{};
+    FloquetAirboxSharedDomainBlockResult floquet_full_field_blocks{};
+    std::vector<TangentFrameNode> floquet_tangent_frames{};
+    std::vector<FloquetDescriptorPeriodicPair> floquet_periodic_pairs{};
+    std::array<double, 3> floquet_k_rad_per_m{};
+    std::vector<double> floquet_uniform_transverse_probe_q_y{};
+    std::vector<double> floquet_uniform_transverse_probe_q_z{};
+    PoissonAirboxK0DemagProbeAssembly k0_demag_probe{};
+    bool floquet_sparse_operator_ready = false;
+    std::vector<double> phi_mean_weights{};
+    std::vector<std::uint32_t> dirichlet_dofs{};
+    char boundary_kind[32]{};
+    char gauge_policy[32]{};
+    char assembly_kind[64]{};
+    char operator_digest[65]{};
+    // Human-readable provenance emitted from the same magnetic-element
+    // quadrature traversal that contributes the immutable operator digest.
+    // This is backend-owned C++ state and is intentionally outside every
+    // public C ABI structure.
+    std::string quadrature_provenance_json{};
+};
+
+/* Shared descriptor contract used by the public ABI boundary and the native
+ * shared-domain importer before any MFEM operator is assembled. */
+FrequencyDomainStatus validate_linearization_descriptor_contract(
+    const FullmagFemModalLinearizationDescriptor &descriptor,
+    std::uint64_t expected_node_count,
+    char error_message[256]) noexcept;
+
+/* Complete native shared-domain handoff validation.  This is the single
+ * backend-owned gate used by both the public C ABI and the direct C++
+ * importer.  It validates the descriptor and its payload state binding,
+ * the append-only v6 relation views/preimage, and the magnetic/airbox cell
+ * marker map before any MFEM object or operator is constructed. */
+struct ModalSharedDomainValidationResult {
+    char canonical_preimage_sha256[96]{};
+    char canonical_map_binding_sha256[96]{};
+    char magnetic_class_digest_sha256[96]{};
+    char scalar_class_digest_sha256[96]{};
+    std::uint32_t certificate_binding_status = 0;
+};
+
+/*
+ * Compute the native canonical reduction-map binding carried by the existing
+ * append-only v18 `mesh_certificate_map_binding_digest` field.
+ *
+ * The scalar mesh order is authoritative global-node order.  Because ABI v18
+ * has no compact-to-global index array, magnetic compact nodes have exactly
+ * the prefix order [0, magnetic_node_count); every remaining entry in the
+ * full magnetic reduction map is UINT32_MAX.  The digest binds that explicit
+ * order contract, ordered element markers, exact part/status identities, the
+ * accepted v6 canonical class IDs, and both supplied reduction maps.
+ */
+FrequencyDomainStatus compute_modal_shared_domain_map_binding_digest(
+    const FullmagFemModalSharedDomainPayload &payload,
+    const MeshSymmetryCertificateV6Binding &accepted_v6_binding,
+    std::uint64_t magnetic_node_count,
+    std::string &out_digest,
+    char error_message[256]) noexcept;
+
+FrequencyDomainStatus validate_modal_shared_domain_payload_contract(
+    const FullmagFemModalSharedDomainPayload &payload,
+    std::uint64_t expected_node_count,
+    ModalSharedDomainValidationResult *out_validation,
+    char error_message[256]) noexcept;
+
+/* Internal modal adapter over the canonical Context mesh admission contract.
+ * It preserves the typed mesh order and derived periodic classes without
+ * maintaining a second, weaker mesh validator in the frequency-domain path. */
+bool import_modal_shared_domain_mesh(
+    const fullmag_fem_mesh_desc &mesh,
+    fullmag::fem::FemMeshRuntimeState &out_mesh,
+    std::string &error);
+
+/*
+ * Assemble the magnetic energy-Hessian block from the accepted backend-neutral
+ * linearization descriptor.  This is intentionally a backend-owned producer:
+ * the runner may describe the accepted state and physical terms, but it must
+ * not materialize A_qq and pass a synthetic CSR into the shared-domain path.
+ *
+ * The current producer covers exchange, total static h_eff0 curvature, and
+ * constant first-order uniaxial anisotropy; managed qualification remains separate.
+ * Its static-field Hessian projects between both accepted nodal tangent frames and is
+ * available only when h_eff0 is parallel to m0 within the declared tolerance.
+ * Dynamic demagnetization is deliberately not an A_qq term: the native
+ * shared-domain A_qphi P^{-1} A_phiq coupling owns that response.  A DEMAG
+ * descriptor therefore supplies only a provider signature bound to its
+ * operator-input identity, never an independent local weak form here.
+ *
+ * The optional append-only material view supplies one scalar A_ex without
+ * carrying graph endpoints.  The payload importer must separately prove that
+ * the descriptor and B_qq consume one accepted tangent-frame/state source.
+ * This helper has no payload-side state digest to compare and must not infer
+ * equality.
+ * Unsupported local terms fail closed until their native weak forms are added.
+ */
+FrequencyDomainStatus assemble_native_magnetic_a_qq(
+    const FullmagFemModalLinearizationDescriptor &descriptor,
+    mfem::FiniteElementSpace *scalar_space,
+    const std::uint8_t *magnetic_element_mask,
+    std::uint64_t magnetic_element_count,
+    PoissonAirboxSharedDomainCsrMatrix *out_a_qq,
+    char error_message[256],
+    const FullmagFemModalExchangeMaterialView *exchange_material_view = nullptr,
+    const TangentFrameNode *accepted_tangent_frames = nullptr,
+    std::uint64_t accepted_tangent_frame_count = 0,
+    double accepted_max_transverse_field_a_per_m = -1.0) noexcept;
+
+/* Import and assemble the versioned public shared-domain modal payload.  The
+ * returned CSR buffers own their storage and remain valid until the result is
+ * destroyed by the caller.  When a k-vector and Floquet pair graph are
+ * supplied, the same accepted payload is also used to build the phase-aware
+ * shared-domain blocks.  `materialize_dense_floquet` keeps the old bounded
+ * dynamic-demagnetization oracle available for diagnostics, while `false`
+ * returns only owned sparse complex blocks for the production MatShell path.
+ * The nonzero-k route deliberately keeps its phase-reduced blocks separate
+ * from the legacy real k=0 CSR representation. */
+FrequencyDomainStatus assemble_poisson_airbox_shared_domain_payload(
+    const FullmagFemModalSharedDomainPayload &payload,
+    PoissonAirboxSharedDomainAssemblyResult *out_result,
+    const FrequencyDomainFloquetPeriodicPair *floquet_periodic_pairs = nullptr,
+    std::uint64_t floquet_periodic_pair_count = 0,
+    const std::array<double, 3> *floquet_k_rad_per_m = nullptr,
+    FloquetAirboxDynamicDemagKResult *out_floquet_dynamic_demag_k = nullptr,
+    bool materialize_dense_floquet = true) noexcept;
+
+FrequencyDomainStatus assemble_poisson_airbox_shared_domain(
+    const PoissonAirboxSharedDomainAssemblyRequest &request,
+    PoissonAirboxSharedDomainAssemblyResult *out_result) noexcept;
+
+#endif
+
+} // namespace fullmag::fem::frequency_domain

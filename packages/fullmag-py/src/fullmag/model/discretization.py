@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from numbers import Integral, Real
 from typing import Any, Literal, Sequence
 
-from fullmag._validation import as_vector3, require_positive
+from fullmag._validation import (
+    as_vector3,
+    parse_finite_float,
+    require_finite,
+    require_positive,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +41,7 @@ class FDMGrid:
 # ---------------------------------------------------------------------------
 _DEMAG_STRATEGIES = ("auto", "single_grid", "multilayer_convolution")
 _DEMAG_MODES = ("auto", "two_d_stack", "three_d")
+_DEMAG_FFT_BACKENDS = ("auto", "rustfft", "fftw", "mkl", "cufft")
 _FEM_LINEAR_SOLVERS = ("CG", "GMRES")
 _FEM_PRECONDITIONERS = ("AMG", "JACOBI", "NONE")
 
@@ -54,6 +61,8 @@ class FDMDemag:
             ``"three_d"`` for full 3-D stacks.
         common_cells: Explicit 3-D common convolution grid size.
         common_cells_xy: Explicit 2-D common grid (for ``two_d_stack``).
+        fft_backend: Requested FFT realization. Unsupported realizations are
+            preserved in IR and rejected fail-closed by capability planning.
         explain: Print a human-readable plan summary before running.
 
     Example::
@@ -70,6 +79,7 @@ class FDMDemag:
     common_cells: tuple[int, int, int] | None = None
     common_cells_xy: tuple[int, int] | None = None
     common_cell_size: tuple[float, float, float] | None = None
+    fft_backend: Literal["auto", "rustfft", "fftw", "mkl", "cufft"] = "auto"
     # Compatibility-only input. It is never lowered because silent fallback
     # is not a public execution contract.
     allow_single_grid_fallback: bool | None = field(default=None, repr=False)
@@ -89,6 +99,11 @@ class FDMDemag:
         if self.mode not in _DEMAG_MODES:
             raise ValueError(
                 f"mode must be one of {_DEMAG_MODES!r}, got {self.mode!r}"
+            )
+        if self.fft_backend not in _DEMAG_FFT_BACKENDS:
+            raise ValueError(
+                f"fft_backend must be one of {_DEMAG_FFT_BACKENDS!r}, "
+                f"got {self.fft_backend!r}"
             )
         if self.common_cells is not None and self.common_cells_xy is not None:
             raise ValueError("cannot specify both 'common_cells' and 'common_cells_xy'")
@@ -127,6 +142,7 @@ class FDMDemag:
         ir: dict[str, object] = {
             "strategy": self.strategy,
             "mode": self.mode,
+            "fft_backend": self.fft_backend,
         }
         if self.common_cells is not None:
             ir["common_cells"] = list(self.common_cells)
@@ -189,6 +205,9 @@ class FemLinearSolverPolicy:
 # ---------------------------------------------------------------------------
 # FDM discretization hints (top-level)
 # ---------------------------------------------------------------------------
+_FDM_PROJECTION_POLICIES = ("unit_sphere",)
+
+
 @dataclass(frozen=True, slots=True)
 class FDM:
     """FDM discretization hints with per-magnet native grid support.
@@ -215,6 +234,7 @@ class FDM:
     default_cell: tuple[float, float, float] | None = None
     per_magnet: dict[str, FDMGrid] | None = None
     demag: FDMDemag | None = None
+    projection_policy: str | None = None  # projected-RK state constraint; None = qualified default
     boundary_correction: str | None = None  # "none" | "volume" (T0) | "full" (T1)
     boundary_phi_floor: float | None = None  # min volume fraction for stability (default 0.05)
     boundary_delta_min: float | None = None  # min δ for T1 ECB stencil stability [m] (default 0.1*min(dx,dy,dz))
@@ -227,6 +247,7 @@ class FDM:
         default_cell: Sequence[float] | None = None,
         per_magnet: dict[str, FDMGrid] | None = None,
         demag: FDMDemag | None = None,
+        projection_policy: str | None = None,
         boundary_correction: str | None = None,
         boundary_phi_floor: float | None = None,
         boundary_delta_min: float | None = None,
@@ -252,6 +273,13 @@ class FDM:
                     raise TypeError("per_magnet values must be FDMGrid instances")
         object.__setattr__(self, "per_magnet", per_magnet)
         object.__setattr__(self, "demag", demag)
+
+        if projection_policy is not None and projection_policy not in _FDM_PROJECTION_POLICIES:
+            raise ValueError(
+                f"projection_policy must be one of {_FDM_PROJECTION_POLICIES!r}, "
+                f"got {projection_policy!r}"
+            )
+        object.__setattr__(self, "projection_policy", projection_policy)
 
         # Validate boundary correction
         _BOUNDARY_CORRECTIONS = ("none", "volume", "full")
@@ -308,6 +336,8 @@ class FDM:
             ir["boundary_phi_floor"] = self.boundary_phi_floor
         if self.boundary_delta_min is not None:
             ir["boundary_delta_min"] = self.boundary_delta_min
+        if self.projection_policy is not None:
+            ir["projection_policy"] = self.projection_policy
         return ir
 
 
@@ -349,6 +379,12 @@ class SweepDistribution:
             raise TypeError("num_layers must be an integer element-layer count")
         if self.num_layers < 1:
             raise ValueError(f"num_layers must be >= 1, got {self.num_layers}")
+        growth_rate = parse_finite_float(
+            self.growth_rate,
+            "/distribution/growth_rate",
+            positive=True,
+        )
+        object.__setattr__(self, "growth_rate", float(growth_rate))
         if self.kind != "uniform" and self.growth_rate <= 0.0:
             raise ValueError(
                 f"growth_rate must be > 0 for {self.kind!r} distribution, "
@@ -457,6 +493,8 @@ class FEM:
         )
         if resolved_maximum_element_size is None:
             raise TypeError("FEM requires maximum_element_size")
+        if isinstance(maximum_element_size, bool) or isinstance(hmax, bool):
+            raise TypeError("maximum_element_size must be a real number, not bool")
         if hmax is not None and maximum_element_size is not None:
             if float(hmax) != float(maximum_element_size):
                 raise ValueError("hmax must match maximum_element_size when both are provided")
@@ -473,8 +511,9 @@ class FEM:
         return self.maximum_element_size
 
     def __post_init__(self) -> None:
-        if self.order < 1:
-            raise ValueError("order must be >= 1")
+        if isinstance(self.order, bool) or not isinstance(self.order, Integral) or self.order < 1:
+            raise ValueError("order must be an integer >= 1")
+        object.__setattr__(self, "order", int(self.order))
         require_positive(self.maximum_element_size, "maximum_element_size")
         if self.mesh is not None and not self.mesh.strip():
             raise ValueError("mesh must not be empty when provided")
@@ -578,6 +617,64 @@ class MeshSizeControls:
         }
 
 
+_MESH_SIZE_CALIBRATIONS = (
+    "general_physics",
+    "micromagnetics_static",
+    "micromagnetics_relaxation",
+    "micromagnetics_frequency_domain",
+    "magnetostatics_dominated",
+    "imported_surface_cleanup",
+)
+_MESH_SIZE_PRESETS = (
+    "extremely_fine",
+    "extra_fine",
+    "finer",
+    "fine",
+    "normal",
+    "coarse",
+    "coarser",
+    "extra_coarse",
+    "extremely_coarse",
+)
+_MESH_SIZE_PRESET_ALIASES = {
+    "extra fine": "extra_fine",
+    "extra_fine": "extra_fine",
+    "extremely fine": "extremely_fine",
+    "extremely_fine": "extremely_fine",
+    "extrafine": "extra_fine",
+    "extremelyfine": "extremely_fine",
+    "very fine": "extra_fine",
+    "very_fine": "extra_fine",
+    "coarser_mesh": "coarser",
+    "extra coarse": "extra_coarse",
+    "extra_coarse": "extra_coarse",
+    "extremely coarse": "extremely_coarse",
+    "extremely_coarse": "extremely_coarse",
+    "extracoarse": "extra_coarse",
+    "extremelycoarse": "extremely_coarse",
+}
+
+
+def _normalize_mesh_recipe_vocabulary(
+    field_name: str,
+    value: str | None,
+    supported: tuple[str, ...],
+    aliases: dict[str, str] | None = None,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a string or None")
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    if not normalized:
+        return None
+    if aliases is not None:
+        normalized = aliases.get(normalized, normalized)
+    if normalized not in supported:
+        raise ValueError(f"{field_name} must be one of {supported!r}, got {value!r}")
+    return normalized
+
+
 @dataclass(frozen=True, slots=True)
 class PerObjectMeshRecipe:
     """Full mesh recipe for a single ferromagnetic object.
@@ -649,8 +746,8 @@ class PerObjectMeshRecipe:
     exact_layer_count: bool | None = None
 
     # ── quality assessment ──
-    compute_quality: bool = False
-    per_element_quality: bool = False
+    compute_quality: bool | None = None
+    per_element_quality: bool | None = None
 
     # ── extra size fields (appended to global list) ──
     size_fields: list[dict[str, Any]] = field(default_factory=list)
@@ -659,6 +756,125 @@ class PerObjectMeshRecipe:
     operations: list[MeshOperation] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        if self.source is not None:
+            raise ValueError(
+                "per-object mesh source is unavailable; use FEM(mesh=...) for "
+                "the supported study-level imported mesh route"
+            )
+
+        object.__setattr__(
+            self,
+            "calibrate_for",
+            _normalize_mesh_recipe_vocabulary(
+                "calibrate_for", self.calibrate_for, _MESH_SIZE_CALIBRATIONS
+            ),
+        )
+        object.__setattr__(
+            self,
+            "size_preset",
+            _normalize_mesh_recipe_vocabulary(
+                "size_preset",
+                self.size_preset,
+                _MESH_SIZE_PRESETS,
+                _MESH_SIZE_PRESET_ALIASES,
+            ),
+        )
+
+        if self.order is not None:
+            if isinstance(self.order, bool) or not isinstance(self.order, Integral):
+                raise TypeError("order must be an integer")
+            object.__setattr__(self, "order", int(self.order))
+
+        for field_name in ("algorithm_2d", "algorithm_3d"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise TypeError(f"{field_name} must be an integer")
+            object.__setattr__(self, field_name, int(value))
+
+        if not isinstance(self.through_thickness_symmetric, bool):
+            raise TypeError("through_thickness_symmetric must be a boolean")
+
+        for field_name in (
+            "maximum_element_size",
+            "minimum_element_size",
+            "hmax",
+            "hmin",
+        ):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise TypeError(f"{field_name} must be a positive number")
+            require_positive(value, field_name)
+
+        effective_maximum = (
+            self.maximum_element_size
+            if self.maximum_element_size is not None
+            else self.hmax
+        )
+        effective_minimum = (
+            self.minimum_element_size
+            if self.minimum_element_size is not None
+            else self.hmin
+        )
+        if (
+            effective_minimum is not None
+            and effective_maximum is not None
+            and effective_minimum > effective_maximum
+        ):
+            raise ValueError(
+                "minimum_element_size/hmin must not exceed maximum_element_size/hmax"
+            )
+
+        for field_name in (
+            "size_factor",
+            "curvature_factor",
+            "growth_rate",
+            "narrow_region_resolution",
+            "boundary_layer_thickness",
+            "boundary_layer_stretching",
+            "through_thickness_element_ratio",
+        ):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise TypeError(f"{field_name} must be a positive number")
+            require_positive(value, field_name)
+
+        for field_name in ("size_from_curvature", "narrow_regions"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise TypeError(f"{field_name} must be an integer")
+            if value < 0:
+                raise ValueError(f"{field_name} must be >= 0")
+            object.__setattr__(self, field_name, int(value))
+
+        for field_name in ("optimize_iters", "boundary_layer_count"):
+            value = getattr(self, field_name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, Integral):
+                raise TypeError(f"{field_name} must be an integer")
+            if value < 1:
+                raise ValueError(f"{field_name} must be >= 1")
+            object.__setattr__(self, field_name, int(value))
+            object.__setattr__(self, field_name, int(value))
+
+        if self.smoothing_steps is not None:
+            if isinstance(self.smoothing_steps, bool) or not isinstance(
+                self.smoothing_steps, Integral
+            ):
+                raise TypeError("smoothing_steps must be an integer")
+            if self.smoothing_steps < 0:
+                raise ValueError("smoothing_steps must be >= 0")
+            object.__setattr__(self, "smoothing_steps", int(self.smoothing_steps))
+            object.__setattr__(self, "smoothing_steps", int(self.smoothing_steps))
+
         if self.through_thickness_elements is not None:
             if (
                 isinstance(self.through_thickness_elements, bool)
@@ -699,6 +915,10 @@ class PerObjectMeshRecipe:
             self.exact_layer_count, bool
         ):
             raise TypeError("exact_layer_count must be bool")
+        for field_name in ("compute_quality", "per_element_quality"):
+            value = getattr(self, field_name)
+            if value is not None and not isinstance(value, bool):
+                raise TypeError(f"{field_name} must be bool")
 
         if self.topology == "tetrahedral" and any(
             value is not None
@@ -810,15 +1030,19 @@ class PerObjectMeshRecipe:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True, slots=True)
 class SharedMeshAssemblyPolicy:
-    """Controls how per-object recipes are assembled into one shared-domain mesh.
+    """Shared-domain assembly policy accepted by the public authoring API.
 
-    Attributes:
-        interface_hmax_factor: Size factor at domain interfaces relative to
-            the local object maximum element size (< 1 = finer at boundaries).
-        enforce_conforming: Require a conforming mesh (shared vertices at
-            domain boundaries) via OCC ``fragment``.
-        airbox_hmax_factor: Element size in the airbox as a multiple of the
-            global maximum element size.  Larger = coarser airbox.
+    The shared-domain generator currently has one canonical realization: the
+    default conforming policy.  Non-default values are rejected by the
+    realization entry point until their typed lowering is implemented.  This
+    is intentional fail-closed behaviour; a caller must never be told that a
+    policy was applied when the generator ignored one of its fields.
+
+    ``interface_hmax_factor`` and ``airbox_hmax_factor`` therefore describe
+    the reserved policy vocabulary, while ``enforce_conforming`` records the
+    only currently supported mode.  See
+    :func:`fullmag.meshing.asset_pipeline._validate_shared_mesh_assembly_policy`
+    for the realization guard.
     """
 
     interface_hmax_factor: float = 0.5
@@ -826,10 +1050,16 @@ class SharedMeshAssemblyPolicy:
     airbox_hmax_factor: float = 3.0
 
     def __post_init__(self) -> None:
+        for field_name in ("interface_hmax_factor", "airbox_hmax_factor"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise TypeError(f"{field_name} must be a real number")
+            require_finite(value, field_name)
+        if not isinstance(self.enforce_conforming, bool):
+            raise TypeError("enforce_conforming must be a boolean")
         if not 0.0 < self.interface_hmax_factor <= 1.0:
             raise ValueError("interface_hmax_factor must be in (0, 1]")
-        if self.airbox_hmax_factor <= 0.0:
-            raise ValueError("airbox_hmax_factor must be positive")
+        require_positive(self.airbox_hmax_factor, "airbox_hmax_factor")
 
     def to_ir(self) -> dict[str, object]:
         return {

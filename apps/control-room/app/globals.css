@@ -1,12 +1,16 @@
-@import "tailwindcss";
+@import "tailwindcss" source(none);
+@source "./";
+@source "../src";
 @import "../src/design/styles/tailwind-theme.css";
 @import "../src/design/styles/tokens.css" layer(fm-tokens);
 @import "../src/design/styles/theme.css" layer(fm-tokens);
+@import "../src/design/styles/start-screen.tokens.css" layer(fm-tokens);
 @import "../src/design/styles/base.css" layer(fm-base);
 @import "../src/design/styles/layout.css" layer(fm-base);
 @import "../src/design/styles/slots.css" layer(fm-base);
 @import "../src/design/styles/dropdown.css" layer(fm-primitives);
 @import "../src/design/styles/dialog.css" layer(fm-primitives);
+@import "../src/design/styles/dialog-new-problem.css" layer(fm-primitives);
 @import "../src/design/styles/dialog-mesh-build.css" layer(fm-primitives);
 @import "../src/design/styles/dialog-data-preview.css" layer(fm-primitives);
 @import "../src/design/styles/dialog-simulation-startup.css" layer(fm-primitives);
@@ -21,6 +25,7 @@
 @import "../src/design/styles/ribbon.css" layer(fm-components);
 @import "../src/design/styles/explorer.css" layer(fm-components);
 @import "../src/design/styles/inspector.css" layer(fm-modules);
+@import "../src/design/styles/inspector-antenna.css" layer(fm-modules);
 @import "../src/design/styles/inspector-sinc.css" layer(fm-modules);
 @import "../src/design/styles/inspector-topological-charge.css" layer(fm-modules);
 @import "../src/design/styles/inspector-hysteresis.css" layer(fm-modules);
@@ -33,6 +38,7 @@
 @import "../src/design/styles/viewport-3d.css" layer(fm-modules);
 @import "../src/design/styles/field-map.css" layer(fm-modules);
 @import "../src/design/styles/analysis-plots.css" layer(fm-modules);
+@import "../src/design/styles/results-dataset-browser.css" layer(fm-modules);
 @import "../src/design/styles/live-charts.css" layer(fm-modules);
 @import "../src/design/styles/footer.css" layer(fm-modules);
 @import "../src/design/styles/footer-command-audit.css" layer(fm-modules);

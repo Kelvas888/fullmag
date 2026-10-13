@@ -3,26 +3,20 @@
 //! All methods are `impl ExchangeLlgProblem` — Rust allows splitting impls
 //! across multiple files within the same crate.
 
-use crate::vector::{add, cross, norm, normalized, scale};
+use crate::vector::{add, cross, norm, scale};
 use crate::{
-    AdaptiveAttemptDecision, AdaptiveAttemptReason, AdaptiveAttemptRecord, CoupledImexArk2Stage,
-    CoupledImexArk2Tableau, EvaluationRequest, ExchangeLlgProblem, ExchangeLlgState,
-    ExchangeLlgStateSoA, ExternalStageTerms, FftWorkspace, IntegratorBuffers, Result,
-    RhsEvaluation, StepReport, Vector3, VectorFieldSoA,
+    AdaptiveAttemptDecision, AdaptiveAttemptReason, AdaptiveAttemptRecord, AdaptiveStepController,
+    AdaptiveStepDecision, CoupledImexArk2Stage, CoupledImexArk2Tableau, EvaluationRequest,
+    ExchangeLlgProblem, ExchangeLlgState, ExchangeLlgStateSoA, ExternalStageTerms, FftWorkspace,
+    IntegratorBuffers, Result, RhsEvaluation, StepReport, Vector3, VectorFieldSoA,
 };
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum AdaptiveDecision {
-    Accepted(f64),
-    Retry(f64),
-    DtMinExhausted,
-    NonFinite(crate::EngineErrorCode),
-    RetryLimitExhausted,
-}
+type AdaptiveDecision = AdaptiveStepDecision;
 
+#[cfg(test)]
 fn decide_adaptive_step(
     order_est: i32,
     dt: f64,
@@ -30,60 +24,19 @@ fn decide_adaptive_step(
     previous_error: Option<f64>,
     cfg: crate::AdaptiveStepConfig,
 ) -> AdaptiveDecision {
-    if error.is_nan() {
-        return AdaptiveDecision::NonFinite(crate::EngineErrorCode::NaNValue);
-    }
-    if error.is_infinite() {
-        return AdaptiveDecision::NonFinite(crate::EngineErrorCode::InfiniteValue);
-    }
-    if error > 1.0 && dt <= cfg.dt_min {
-        return AdaptiveDecision::DtMinExhausted;
-    }
-    let accepted = error <= 1.0;
-    let raw_ratio = if error == 0.0 {
-        cfg.growth_limit
-    } else {
-        let scale = 1.0 / f64::from(order_est + 1);
-        if accepted {
-            previous_error.filter(|value| *value > 0.0).map_or_else(
-                || cfg.headroom * error.powf(-scale),
-                |previous| cfg.headroom * error.powf(-0.7 * scale) * previous.powf(0.4 * scale),
-            )
-        } else {
-            cfg.headroom * error.powf(-scale)
-        }
-    };
-    let next =
-        (dt * raw_ratio.clamp(cfg.shrink_limit, cfg.growth_limit)).clamp(cfg.dt_min, cfg.dt_max);
-    if accepted {
-        AdaptiveDecision::Accepted(next)
-    } else if next < dt {
-        AdaptiveDecision::Retry(next)
-    } else {
-        let decreased = dt.next_down();
-        if decreased > 0.0 && decreased >= cfg.dt_min {
-            AdaptiveDecision::Retry(decreased)
-        } else {
-            AdaptiveDecision::DtMinExhausted
-        }
-    }
+    AdaptiveStepController::new(order_est, cfg, previous_error).decide(dt, error)
 }
 
 fn decide_adaptive_attempt(
-    order_est: i32,
     dt: f64,
     error: f64,
-    previous_error: Option<f64>,
-    cfg: crate::AdaptiveStepConfig,
     rhs_evals: u32,
     bufs: &mut IntegratorBuffers,
+    controller: &mut AdaptiveStepController,
 ) -> AdaptiveDecision {
     #[cfg(test)]
     bufs.record_adaptive_attempt_for_tests(dt);
-    let mut decision = decide_adaptive_step(order_est, dt, error, previous_error, cfg);
-    if matches!(decision, AdaptiveDecision::Retry(_)) && bufs.adaptive_retry_budget_exhausted() {
-        decision = AdaptiveDecision::RetryLimitExhausted;
-    }
+    let decision = controller.decide(dt, error);
     let (published_decision, reason, dt_next) = match decision {
         AdaptiveDecision::Accepted(next) => (
             AdaptiveAttemptDecision::Accepted,
@@ -112,6 +65,7 @@ fn decide_adaptive_attempt(
         ),
     };
     bufs.record_adaptive_attempt(AdaptiveAttemptRecord {
+        controller_policy_version: controller.policy_version(),
         attempt: 0,
         dt_attempt: dt,
         normalized_error: error,
@@ -138,6 +92,22 @@ impl AttemptRhsCounter {
     fn finish(self) -> u32 {
         self.count
     }
+}
+
+fn tag_abm3_step(
+    mut report: StepReport,
+    startup_step: bool,
+    history_reset_this_step: bool,
+    history_resets_total: u64,
+) -> StepReport {
+    report.abm3 = Some(crate::Abm3StepTelemetry {
+        schema_version: crate::FDM_ABM3_STEP_TELEMETRY_SCHEMA_VERSION,
+        startup_step,
+        history_reset_this_step,
+        history_resets_total,
+        rhs_evaluations: if startup_step { 3 } else { 2 },
+    });
+    report
 }
 
 #[cfg(feature = "parallel")]
@@ -211,6 +181,17 @@ mod adaptive_decision_tests {
             panic!("finite rejection must retry");
         };
         assert!(next < dt);
+    }
+
+    #[test]
+    fn adaptive_controller_treats_one_ulp_above_dt_min_as_exhausted() {
+        let cfg = test_config();
+        let just_above_min = f64::from_bits(cfg.dt_min.to_bits() + 1);
+        assert!(just_above_min > cfg.dt_min);
+        assert_eq!(
+            decide_adaptive_step(4, just_above_min, 4.0, None, cfg),
+            AdaptiveDecision::DtMinExhausted
+        );
     }
 
     #[test]
@@ -369,6 +350,55 @@ mod adaptive_decision_tests {
     }
 
     #[test]
+    fn finite_error_reduction_uses_active_free_cells_for_aos_and_soa() {
+        let grid = crate::GridShape::new(4, 1, 1).expect("valid grid");
+        let mut problem = crate::ExchangeLlgProblem::with_terms_and_mask(
+            grid,
+            crate::CellSize::new(1.0, 1.0, 1.0).expect("valid cell size"),
+            crate::MaterialParameters::new(1.0, 1.0e-30, 0.1).expect("valid material"),
+            crate::LlgConfig::new(1.0, crate::TimeIntegrator::RK23).expect("valid LLG config"),
+            crate::EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                ..Default::default()
+            },
+            Some(vec![true, false, true, true]),
+        )
+        .expect("masked problem");
+        problem.frozen_spins = Some(
+            crate::FrozenSpinsState::from_checkpoint(
+                vec![false, false, false, true],
+                vec![[1.0, 0.0, 0.0]; 4],
+                1,
+                2,
+                1,
+            )
+            .expect("frozen state"),
+        );
+
+        let mut buffers = problem.create_integrator_buffers();
+        buffers.k[0][0] = [0.25, 0.0, 0.0];
+        buffers.k[0][1] = [f64::NAN, 0.0, 0.0];
+        buffers.k[0][2] = [1.5, 0.0, 0.0];
+        buffers.k[0][3] = [9.0, 0.0, 0.0];
+        buffers.soa.k[0]
+            .x
+            .copy_from_slice(&[0.25, f64::NAN, 1.5, 9.0]);
+        buffers.soa.k[0].y.fill(0.0);
+        buffers.soa.k[0].z.fill(0.0);
+
+        let weighted_stages = [(0usize, 1.0)];
+        assert_eq!(
+            problem.max_error_norm_buf(&weighted_stages, &mut buffers, 1.0, 4),
+            1.5
+        );
+        assert_eq!(
+            problem.max_error_norm_soa_buf(&weighted_stages, &mut buffers, 1.0, 4),
+            1.5
+        );
+    }
+
+    #[test]
     fn direct_cpu_entry_points_record_injected_retry_dt() {
         for integrator in [crate::TimeIntegrator::RK23, crate::TimeIntegrator::RK45] {
             let problem = adaptive_test_problem(integrator);
@@ -456,6 +486,477 @@ mod adaptive_decision_tests {
             );
             assert_eq!(persistent_soa.time_seconds, report.dt_used);
         }
+    }
+
+    #[test]
+    fn adaptive_retry_reuses_thermal_counter_draw_and_scales_it_to_new_dt() {
+        let mut retry_problem = adaptive_test_problem(crate::TimeIntegrator::RK23);
+        retry_problem.temperature = 300.0;
+        retry_problem.thermal_dt = 0.2;
+        retry_problem.thermal_seed = 0x5eed;
+        let mut retry_state = retry_problem
+            .uniform_state([1.0, 0.0, 0.0])
+            .expect("retry state");
+        let mut retry_ws = retry_problem.create_workspace();
+        let mut retry_bufs = retry_problem.create_integrator_buffers();
+        retry_bufs.set_adaptive_error_script_for_tests([4.0, 0.0]);
+        retry_problem
+            .step_with_buffers_evaluation(
+                &mut retry_state,
+                1.0,
+                &mut retry_ws,
+                &mut retry_bufs,
+                crate::EvaluationRequest::Minimal,
+            )
+            .expect("retrying thermal step");
+
+        let mut clean_problem = adaptive_test_problem(crate::TimeIntegrator::RK23);
+        clean_problem.temperature = 300.0;
+        clean_problem.thermal_dt = 0.2;
+        clean_problem.thermal_seed = 0x5eed;
+        let mut clean_state = clean_problem
+            .uniform_state([1.0, 0.0, 0.0])
+            .expect("clean state");
+        let mut clean_ws = clean_problem.create_workspace();
+        let mut clean_bufs = clean_problem.create_integrator_buffers();
+        clean_bufs.set_adaptive_error_script_for_tests([0.0]);
+        clean_problem
+            .step_with_buffers_evaluation(
+                &mut clean_state,
+                0.2,
+                &mut clean_ws,
+                &mut clean_bufs,
+                crate::EvaluationRequest::Minimal,
+            )
+            .expect("clean thermal step");
+
+        assert_eq!(retry_state, clean_state);
+        assert_eq!(retry_problem.thermal_step(), 1);
+        assert_eq!(clean_problem.thermal_step(), 1);
+        assert_eq!(
+            retry_problem
+                .transactional_state_digest(&retry_state)
+                .expect("retry digest"),
+            clean_problem
+                .transactional_state_digest(&clean_state)
+                .expect("clean digest")
+        );
+    }
+
+    #[test]
+    fn failed_adaptive_attempt_preserves_transactional_digest_and_rng_interval() {
+        let problem = adaptive_test_problem(crate::TimeIntegrator::RK45);
+        let mut state = problem.uniform_state([1.0, 0.0, 0.0]).expect("state");
+        let mut workspace = problem.create_workspace();
+        let mut buffers = problem.create_integrator_buffers();
+        buffers.set_adaptive_error_script_for_tests([0.0]);
+        problem
+            .step_with_buffers_evaluation(
+                &mut state,
+                1.0e-6,
+                &mut workspace,
+                &mut buffers,
+                crate::EvaluationRequest::Minimal,
+            )
+            .expect("accepted FSAL seed step");
+        let before = problem
+            .transactional_state_digest(&state)
+            .expect("state digest");
+        let thermal_before = problem.thermal_step();
+        buffers.set_adaptive_error_script_for_tests([f64::NAN]);
+        let error = problem
+            .step_with_buffers_evaluation(
+                &mut state,
+                1.0e-6,
+                &mut workspace,
+                &mut buffers,
+                crate::EvaluationRequest::Minimal,
+            )
+            .expect_err("injected non-finite adaptive error");
+
+        assert_eq!(error.code(), crate::EngineErrorCode::NaNValue);
+        assert_eq!(
+            problem
+                .transactional_state_digest(&state)
+                .expect("post-failure digest"),
+            before
+        );
+        assert_eq!(problem.thermal_step(), thermal_before);
+    }
+
+    #[test]
+    fn abm_failure_before_commit_preserves_magnetization_time_and_history_digest() {
+        let problem = crate::ExchangeLlgProblem::with_terms(
+            crate::GridShape::new(1, 1, 1).expect("grid"),
+            crate::CellSize::new(1.0, 1.0, 1.0).expect("cell"),
+            crate::MaterialParameters::new(1.0, 1.0e-30, 0.1).expect("material"),
+            crate::LlgConfig::new(100.0, crate::TimeIntegrator::ABM3).expect("LLG"),
+            crate::EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                ..Default::default()
+            },
+        );
+        let dt = 1.0e-3;
+
+        let mut aos = problem.uniform_state([1.0, 0.0, 0.0]).expect("AoS state");
+        let mut aos_ws = problem.create_workspace();
+        let mut aos_bufs = problem.create_integrator_buffers();
+        for _ in 0..3 {
+            problem
+                .abm3_step_buf(
+                    &mut aos,
+                    dt,
+                    &mut aos_ws,
+                    &mut aos_bufs,
+                    crate::EvaluationRequest::Minimal,
+                )
+                .expect("ABM startup step");
+        }
+        aos.magnetization_mut()[0] = [f64::NAN; 3];
+        let aos_before = problem
+            .transactional_state_digest(&aos)
+            .expect("AoS digest");
+        let error = problem
+            .abm3_step_buf(
+                &mut aos,
+                dt,
+                &mut aos_ws,
+                &mut aos_bufs,
+                crate::EvaluationRequest::Minimal,
+            )
+            .expect_err("non-finite candidate must fail before commit");
+        assert_eq!(error.code(), crate::EngineErrorCode::NaNValue);
+        assert_eq!(
+            problem
+                .transactional_state_digest(&aos)
+                .expect("AoS post-failure digest"),
+            aos_before
+        );
+
+        let mut buffer_soa = problem
+            .uniform_state([1.0, 0.0, 0.0])
+            .expect("buffer SoA state");
+        let mut buffer_soa_ws = problem.create_workspace();
+        let mut buffer_soa_bufs = problem.create_integrator_buffers();
+        for _ in 0..3 {
+            problem
+                .abm3_step_soa_buf(
+                    &mut buffer_soa,
+                    dt,
+                    &mut buffer_soa_ws,
+                    &mut buffer_soa_bufs,
+                    crate::EvaluationRequest::Minimal,
+                )
+                .expect("SoA startup step");
+        }
+        buffer_soa.magnetization_mut()[0] = [f64::NAN; 3];
+        let buffer_soa_before = buffer_soa.transactional_state_digest();
+        let error = problem
+            .abm3_step_soa_buf(
+                &mut buffer_soa,
+                dt,
+                &mut buffer_soa_ws,
+                &mut buffer_soa_bufs,
+                crate::EvaluationRequest::Minimal,
+            )
+            .expect_err("non-finite SoA candidate must fail before commit");
+        assert_eq!(error.code(), crate::EngineErrorCode::NaNValue);
+        assert_eq!(buffer_soa.transactional_state_digest(), buffer_soa_before);
+
+        let mut persistent_soa = problem
+            .uniform_state([1.0, 0.0, 0.0])
+            .expect("persistent SoA state")
+            .to_soa();
+        let mut persistent_ws = problem.create_workspace();
+        let mut persistent_bufs = problem.create_integrator_buffers();
+        for _ in 0..3 {
+            problem
+                .abm3_step_soa_state_buf(
+                    &mut persistent_soa,
+                    dt,
+                    &mut persistent_ws,
+                    &mut persistent_bufs,
+                    crate::EvaluationRequest::Minimal,
+                )
+                .expect("persistent SoA startup step");
+        }
+        persistent_soa.magnetization.x[0] = f64::NAN;
+        persistent_soa.magnetization.y[0] = f64::NAN;
+        persistent_soa.magnetization.z[0] = f64::NAN;
+        let persistent_before = persistent_soa.transactional_state_digest();
+        let error = problem
+            .abm3_step_soa_state_buf(
+                &mut persistent_soa,
+                dt,
+                &mut persistent_ws,
+                &mut persistent_bufs,
+                crate::EvaluationRequest::Minimal,
+            )
+            .expect_err("persistent SoA non-finite candidate must fail before commit");
+        assert_eq!(error.code(), crate::EngineErrorCode::NaNValue);
+        assert_eq!(
+            persistent_soa.transactional_state_digest(),
+            persistent_before
+        );
+    }
+
+    #[test]
+    fn abm3_restarts_history_before_using_changed_dt() {
+        let problem = crate::ExchangeLlgProblem::with_terms(
+            crate::GridShape::new(1, 1, 1).expect("grid"),
+            crate::CellSize::new(1.0, 1.0, 1.0).expect("cell"),
+            crate::MaterialParameters::new(1.0, 1.0e-30, 0.1).expect("material"),
+            crate::LlgConfig::new(100.0, crate::TimeIntegrator::ABM3).expect("LLG"),
+            crate::EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                ..Default::default()
+            },
+        );
+        let startup_dt = 1.0e-3;
+        let changed_dt = 1.01e-3;
+
+        let mut aos = problem.uniform_state([1.0, 0.0, 0.0]).expect("AoS state");
+        let mut aos_ws = problem.create_workspace();
+        let mut aos_bufs = problem.create_integrator_buffers();
+        for _ in 0..3 {
+            problem
+                .abm3_step_buf(
+                    &mut aos,
+                    startup_dt,
+                    &mut aos_ws,
+                    &mut aos_bufs,
+                    crate::EvaluationRequest::Minimal,
+                )
+                .expect("AoS startup step");
+        }
+        assert!(aos.abm_history.is_ready());
+        problem
+            .abm3_step_buf(
+                &mut aos,
+                changed_dt,
+                &mut aos_ws,
+                &mut aos_bufs,
+                crate::EvaluationRequest::Minimal,
+            )
+            .expect("AoS restart step");
+        assert_eq!(aos.abm_history.startup_steps, 1);
+        assert!(aos.abm_history.f_n_minus_1.is_none());
+        assert_eq!(aos.abm_history.last_dt, changed_dt);
+
+        let mut buffer_soa = problem
+            .uniform_state([1.0, 0.0, 0.0])
+            .expect("buffer SoA state");
+        let mut buffer_soa_ws = problem.create_workspace();
+        let mut buffer_soa_bufs = problem.create_integrator_buffers();
+        for _ in 0..3 {
+            problem
+                .abm3_step_soa_buf(
+                    &mut buffer_soa,
+                    startup_dt,
+                    &mut buffer_soa_ws,
+                    &mut buffer_soa_bufs,
+                    crate::EvaluationRequest::Minimal,
+                )
+                .expect("buffer SoA startup step");
+        }
+        assert!(buffer_soa.abm_history.is_ready());
+        problem
+            .abm3_step_soa_buf(
+                &mut buffer_soa,
+                changed_dt,
+                &mut buffer_soa_ws,
+                &mut buffer_soa_bufs,
+                crate::EvaluationRequest::Minimal,
+            )
+            .expect("buffer SoA restart step");
+        assert_eq!(buffer_soa.abm_history.startup_steps, 1);
+        assert!(buffer_soa.abm_history.f_n_minus_1.is_none());
+        assert_eq!(buffer_soa.abm_history.last_dt, changed_dt);
+
+        let mut persistent_soa = problem
+            .uniform_state([1.0, 0.0, 0.0])
+            .expect("persistent SoA state")
+            .to_soa();
+        let mut persistent_soa_ws = problem.create_workspace();
+        let mut persistent_soa_bufs = problem.create_integrator_buffers();
+        for _ in 0..3 {
+            problem
+                .abm3_step_soa_state_buf(
+                    &mut persistent_soa,
+                    startup_dt,
+                    &mut persistent_soa_ws,
+                    &mut persistent_soa_bufs,
+                    crate::EvaluationRequest::Minimal,
+                )
+                .expect("persistent SoA startup step");
+        }
+        assert!(persistent_soa.abm_history.is_ready());
+        problem
+            .abm3_step_soa_state_buf(
+                &mut persistent_soa,
+                changed_dt,
+                &mut persistent_soa_ws,
+                &mut persistent_soa_bufs,
+                crate::EvaluationRequest::Minimal,
+            )
+            .expect("persistent SoA restart step");
+        assert_eq!(persistent_soa.abm_history.startup_steps, 1);
+        assert!(persistent_soa.abm_history.f_n_minus_1.is_none());
+        assert_eq!(persistent_soa.abm_history.last_dt, changed_dt);
+    }
+
+    fn max_rhs_relative_error(actual: &[crate::Vector3], expected: &[crate::Vector3]) -> f64 {
+        actual
+            .iter()
+            .zip(expected)
+            .flat_map(|(actual, expected)| actual.iter().zip(expected))
+            .map(|(actual, expected)| (actual - expected).abs() / expected.abs().max(1.0))
+            .fold(0.0, f64::max)
+    }
+
+    fn accepted_rhs_aos(
+        problem: &crate::ExchangeLlgProblem,
+        magnetization: &[crate::Vector3],
+        time_seconds: f64,
+    ) -> Vec<crate::Vector3> {
+        let n = magnetization.len();
+        let mut workspace = problem.create_workspace();
+        let mut h_eff = vec![[0.0; 3]; n];
+        let mut h_scratch = vec![[0.0; 3]; n];
+        let mut rhs = vec![[0.0; 3]; n];
+        problem.compute_step_observables_at_time(
+            magnetization,
+            &mut workspace,
+            &mut h_eff,
+            &mut h_scratch,
+            &mut rhs,
+            crate::EvaluationRequest::Minimal,
+            time_seconds,
+        );
+        rhs
+    }
+
+    fn accepted_rhs_soa(
+        problem: &crate::ExchangeLlgProblem,
+        magnetization: &crate::VectorFieldSoA,
+        time_seconds: f64,
+    ) -> crate::VectorFieldSoA {
+        let mut workspace = problem.create_workspace();
+        let mut h_eff = crate::VectorFieldSoA::zeros(magnetization.len());
+        let mut rhs = crate::VectorFieldSoA::zeros(magnetization.len());
+        problem.effective_field_into_soa_ws_at_time(
+            magnetization,
+            &mut workspace,
+            &mut h_eff,
+            time_seconds,
+        );
+        problem.llg_rhs_soa_into(magnetization, &h_eff, &mut rhs);
+        rhs
+    }
+
+    #[test]
+    fn abm3_full_step_history_stores_rhs_at_accepted_corrected_state() {
+        let problem = crate::ExchangeLlgProblem::with_terms(
+            crate::GridShape::new(1, 1, 1).expect("grid"),
+            crate::CellSize::new(1.0, 1.0, 1.0).expect("cell"),
+            crate::MaterialParameters::new(1.0, 1.0e-30, 0.1).expect("material"),
+            crate::LlgConfig::new(100.0, crate::TimeIntegrator::ABM3).expect("LLG"),
+            crate::EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                external_field: Some([0.0, 1.0, 0.0]),
+                ..Default::default()
+            },
+        );
+        let dt = 1.0e-3;
+
+        let mut aos = problem.uniform_state([1.0, 0.0, 0.0]).expect("AoS state");
+        let mut aos_ws = problem.create_workspace();
+        let mut aos_bufs = problem.create_integrator_buffers();
+        for _ in 0..4 {
+            problem
+                .abm3_step_buf(
+                    &mut aos,
+                    dt,
+                    &mut aos_ws,
+                    &mut aos_bufs,
+                    crate::EvaluationRequest::Minimal,
+                )
+                .expect("AoS ABM3 step");
+        }
+        let aos_expected = accepted_rhs_aos(&problem, &aos.magnetization, aos.time_seconds);
+        let aos_error = max_rhs_relative_error(
+            aos.abm_history.f_n().expect("AoS accepted RHS history"),
+            &aos_expected,
+        );
+
+        let mut buffer_soa = problem
+            .uniform_state([1.0, 0.0, 0.0])
+            .expect("buffer-SoA state");
+        let mut buffer_soa_ws = problem.create_workspace();
+        let mut buffer_soa_bufs = problem.create_integrator_buffers();
+        for _ in 0..4 {
+            problem
+                .abm3_step_soa_buf(
+                    &mut buffer_soa,
+                    dt,
+                    &mut buffer_soa_ws,
+                    &mut buffer_soa_bufs,
+                    crate::EvaluationRequest::Minimal,
+                )
+                .expect("buffer-SoA ABM3 step");
+        }
+        let buffer_soa_m = crate::VectorFieldSoA::from_aos(&buffer_soa.magnetization);
+        let buffer_soa_expected =
+            accepted_rhs_soa(&problem, &buffer_soa_m, buffer_soa.time_seconds).gather_to_aos();
+        let buffer_soa_error = max_rhs_relative_error(
+            buffer_soa
+                .abm_history
+                .f_n()
+                .expect("buffer-SoA accepted RHS history"),
+            &buffer_soa_expected,
+        );
+
+        let mut persistent_soa = problem
+            .uniform_state([1.0, 0.0, 0.0])
+            .expect("persistent-SoA state")
+            .to_soa();
+        let mut persistent_soa_ws = problem.create_workspace();
+        let mut persistent_soa_bufs = problem.create_integrator_buffers();
+        for _ in 0..4 {
+            problem
+                .abm3_step_soa_state_buf(
+                    &mut persistent_soa,
+                    dt,
+                    &mut persistent_soa_ws,
+                    &mut persistent_soa_bufs,
+                    crate::EvaluationRequest::Minimal,
+                )
+                .expect("persistent-SoA ABM3 step");
+        }
+        let persistent_soa_expected = accepted_rhs_soa(
+            &problem,
+            &persistent_soa.magnetization,
+            persistent_soa.time_seconds,
+        )
+        .gather_to_aos();
+        let persistent_soa_error = max_rhs_relative_error(
+            &persistent_soa
+                .abm_history
+                .f_n()
+                .expect("persistent-SoA accepted RHS history")
+                .gather_to_aos(),
+            &persistent_soa_expected,
+        );
+
+        assert!(
+            aos_error <= 1.0e-13 && buffer_soa_error <= 1.0e-13 && persistent_soa_error <= 1.0e-13,
+            "ABM3 history must store the accepted corrected endpoint RHS: \
+             AoS={aos_error:.3e}, buffer-SoA={buffer_soa_error:.3e}, \
+             persistent-SoA={persistent_soa_error:.3e}"
+        );
     }
 
     #[test]
@@ -577,6 +1078,43 @@ mod adaptive_decision_tests {
     }
 
     #[test]
+    fn rk45_soa_buffer_reuses_aos_fsal_storage_after_warmup() {
+        let problem = adaptive_test_problem(crate::TimeIntegrator::RK45);
+        let mut state = problem
+            .uniform_state([1.0, 0.0, 0.0])
+            .expect("SoA-buffer state");
+        let mut ws = problem.create_workspace();
+        let mut bufs = problem.create_integrator_buffers();
+
+        problem
+            .rk45_step_soa_buf(
+                &mut state,
+                1.0e-6,
+                &mut ws,
+                &mut bufs,
+                crate::EvaluationRequest::Minimal,
+            )
+            .expect("first buffer-SoA RK45 step");
+        let (fsal_ptr, fsal_capacity) = {
+            let fsal = state.k_fsal.as_ref().expect("FSAL cache after first step");
+            (fsal.as_ptr(), fsal.capacity())
+        };
+
+        problem
+            .rk45_step_soa_buf(
+                &mut state,
+                1.0e-6,
+                &mut ws,
+                &mut bufs,
+                crate::EvaluationRequest::Minimal,
+            )
+            .expect("second buffer-SoA RK45 step");
+        let fsal = state.k_fsal.as_ref().expect("FSAL cache after second step");
+        assert_eq!(fsal.as_ptr(), fsal_ptr);
+        assert_eq!(fsal.capacity(), fsal_capacity);
+    }
+
+    #[test]
     fn cpu_controller_matches_task6_golden_vectors_and_zero_error_growth_limit() {
         let cfg = crate::AdaptiveStepConfig {
             max_error: 1.0,
@@ -612,6 +1150,11 @@ mod adaptive_decision_tests {
 }
 
 impl ExchangeLlgProblem {
+    #[inline]
+    fn project_stage(&self, vector: Vector3) -> Result<Vector3> {
+        self.dynamics.projection_policy.project(vector)
+    }
+
     /// Transactional explicit partition of canonical ARS(2,3,2). The coupled
     /// transport owner supplies stage-consistent implicit spin/charge terms;
     /// this method never substitutes Heun for the public coupled integrator.
@@ -652,7 +1195,8 @@ impl ExchangeLlgProblem {
         )?;
 
         for i in 0..n {
-            bufs.m_stage[i] = normalized(add(bufs.m0[i], scale(bufs.k[0][i], GAMMA * dt)))?;
+            bufs.m_stage[i] =
+                self.project_stage(add(bufs.m0[i], scale(bufs.k[0][i], GAMMA * dt)))?;
         }
         self.restore_frozen_reference(&mut bufs.m_stage[..n]);
         self.effective_field_into_ws_at_time(
@@ -676,7 +1220,7 @@ impl ExchangeLlgProblem {
         )?;
 
         for i in 0..n {
-            bufs.delta[i] = normalized(add(
+            bufs.delta[i] = self.project_stage(add(
                 bufs.m0[i],
                 scale(
                     add(scale(bufs.k[0][i], DELTA), scale(bufs.k[1][i], 1.0 - DELTA)),
@@ -701,7 +1245,7 @@ impl ExchangeLlgProblem {
         )?;
 
         for i in 0..n {
-            bufs.delta[i] = normalized(add(
+            bufs.delta[i] = self.project_stage(add(
                 bufs.m0[i],
                 scale(
                     add(scale(bufs.k[1][i], 1.0 - GAMMA), scale(bufs.k[2][i], GAMMA)),
@@ -860,7 +1404,7 @@ impl ExchangeLlgProblem {
         )?;
 
         for i in 0..n {
-            bufs.m_stage[i] = normalized(add(bufs.m0[i], scale(bufs.k[0][i], dt)))?;
+            bufs.m_stage[i] = self.project_stage(add(bufs.m0[i], scale(bufs.k[0][i], dt)))?;
         }
         self.restore_frozen_reference(&mut bufs.m_stage[..n]);
 
@@ -878,7 +1422,7 @@ impl ExchangeLlgProblem {
         // `delta` owns the corrected candidate until the coupled solve and
         // final observables have both succeeded.
         for i in 0..n {
-            bufs.delta[i] = normalized(add(
+            bufs.delta[i] = self.project_stage(add(
                 bufs.m0[i],
                 scale(add(bufs.k[0][i], bufs.k[1][i]), 0.5 * dt),
             ))?;
@@ -989,12 +1533,12 @@ impl ExchangeLlgProblem {
                 .zip(m0.par_iter())
                 .zip(k0.par_iter())
                 .try_for_each(|((s, m), k)| -> Result<()> {
-                    *s = normalized(add(*m, scale(*k, dt)))?;
+                    *s = self.project_stage(add(*m, scale(*k, dt)))?;
                     Ok(())
                 })?;
             #[cfg(not(feature = "parallel"))]
             for i in 0..n {
-                stage[i] = normalized(add(m0[i], scale(k0[i], dt)))?;
+                stage[i] = self.project_stage(add(m0[i], scale(k0[i], dt)))?;
             }
         }
 
@@ -1021,12 +1565,12 @@ impl ExchangeLlgProblem {
                 .zip(k0.par_iter())
                 .zip(k1.par_iter())
                 .try_for_each(|(((m, m0), k0), k1)| -> Result<()> {
-                    *m = normalized(add(*m0, scale(add(*k0, *k1), 0.5 * dt)))?;
+                    *m = self.project_stage(add(*m0, scale(add(*k0, *k1), 0.5 * dt)))?;
                     Ok(())
                 })?;
             #[cfg(not(feature = "parallel"))]
             for i in 0..n {
-                mag[i] = normalized(add(m0[i], scale(add(k0[i], k1[i]), 0.5 * dt)))?;
+                mag[i] = self.project_stage(add(m0[i], scale(add(k0[i], k1[i]), 0.5 * dt)))?;
             }
         }
         self.restore_frozen_reference(&mut state.magnetization[..n]);
@@ -1060,7 +1604,7 @@ impl ExchangeLlgProblem {
         self.llg_rhs_soa_into(&bufs.soa.m0, &bufs.soa.h_eff, &mut bufs.soa.k[0]);
 
         for i in 0..n {
-            let predicted = normalized([
+            let predicted = self.project_stage([
                 bufs.soa.m0.x[i] + dt * bufs.soa.k[0].x[i],
                 bufs.soa.m0.y[i] + dt * bufs.soa.k[0].y[i],
                 bufs.soa.m0.z[i] + dt * bufs.soa.k[0].z[i],
@@ -1079,7 +1623,7 @@ impl ExchangeLlgProblem {
         self.llg_rhs_soa_into(&bufs.soa.m_stage, &bufs.soa.h_eff, &mut bufs.soa.k[1]);
 
         for i in 0..n {
-            state.magnetization[i] = normalized([
+            state.magnetization[i] = self.project_stage([
                 bufs.soa.m0.x[i] + 0.5 * dt * (bufs.soa.k[0].x[i] + bufs.soa.k[1].x[i]),
                 bufs.soa.m0.y[i] + 0.5 * dt * (bufs.soa.k[0].y[i] + bufs.soa.k[1].y[i]),
                 bufs.soa.m0.z[i] + 0.5 * dt * (bufs.soa.k[0].z[i] + bufs.soa.k[1].z[i]),
@@ -1131,12 +1675,12 @@ impl ExchangeLlgProblem {
                 .zip(m0.par_iter())
                 .zip(kj.par_iter())
                 .try_for_each(|((s, m), k)| -> Result<()> {
-                    *s = normalized(add(*m, scale(*k, 0.5 * dt)))?;
+                    *s = self.project_stage(add(*m, scale(*k, 0.5 * dt)))?;
                     Ok(())
                 })?;
             #[cfg(not(feature = "parallel"))]
             for i in 0..n {
-                stage[i] = normalized(add(m0[i], scale(kj[i], 0.5 * dt)))?;
+                stage[i] = self.project_stage(add(m0[i], scale(kj[i], 0.5 * dt)))?;
             }
         }
         self.restore_frozen_reference(&mut bufs.m_stage[..n]);
@@ -1161,12 +1705,12 @@ impl ExchangeLlgProblem {
                 .zip(m0.par_iter())
                 .zip(kj.par_iter())
                 .try_for_each(|((s, m), k)| -> Result<()> {
-                    *s = normalized(add(*m, scale(*k, 0.5 * dt)))?;
+                    *s = self.project_stage(add(*m, scale(*k, 0.5 * dt)))?;
                     Ok(())
                 })?;
             #[cfg(not(feature = "parallel"))]
             for i in 0..n {
-                stage[i] = normalized(add(m0[i], scale(kj[i], 0.5 * dt)))?;
+                stage[i] = self.project_stage(add(m0[i], scale(kj[i], 0.5 * dt)))?;
             }
         }
         self.restore_frozen_reference(&mut bufs.m_stage[..n]);
@@ -1191,12 +1735,12 @@ impl ExchangeLlgProblem {
                 .zip(m0.par_iter())
                 .zip(kj.par_iter())
                 .try_for_each(|((s, m), k)| -> Result<()> {
-                    *s = normalized(add(*m, scale(*k, dt)))?;
+                    *s = self.project_stage(add(*m, scale(*k, dt)))?;
                     Ok(())
                 })?;
             #[cfg(not(feature = "parallel"))]
             for i in 0..n {
-                stage[i] = normalized(add(m0[i], scale(kj[i], dt)))?;
+                stage[i] = self.project_stage(add(m0[i], scale(kj[i], dt)))?;
             }
         }
         self.restore_frozen_reference(&mut bufs.m_stage[..n]);
@@ -1221,7 +1765,7 @@ impl ExchangeLlgProblem {
             mag.par_iter_mut()
                 .enumerate()
                 .try_for_each(|(i, m)| -> Result<()> {
-                    *m = normalized(add(
+                    *m = self.project_stage(add(
                         m0[i],
                         scale(
                             add(add(k0[i], scale(k1[i], 2.0)), add(scale(k2[i], 2.0), k3[i])),
@@ -1232,7 +1776,7 @@ impl ExchangeLlgProblem {
                 })?;
             #[cfg(not(feature = "parallel"))]
             for i in 0..n {
-                mag[i] = normalized(add(
+                mag[i] = self.project_stage(add(
                     m0[i],
                     scale(
                         add(add(k0[i], scale(k1[i], 2.0)), add(scale(k2[i], 2.0), k3[i])),
@@ -1272,7 +1816,7 @@ impl ExchangeLlgProblem {
         self.llg_rhs_soa_into(&bufs.soa.m0, &bufs.soa.h_eff, &mut bufs.soa.k[0]);
 
         for i in 0..n {
-            let stage = normalized([
+            let stage = self.project_stage([
                 bufs.soa.m0.x[i] + 0.5 * dt * bufs.soa.k[0].x[i],
                 bufs.soa.m0.y[i] + 0.5 * dt * bufs.soa.k[0].y[i],
                 bufs.soa.m0.z[i] + 0.5 * dt * bufs.soa.k[0].z[i],
@@ -1290,7 +1834,7 @@ impl ExchangeLlgProblem {
         self.llg_rhs_soa_into(&bufs.soa.m_stage, &bufs.soa.h_eff, &mut bufs.soa.k[1]);
 
         for i in 0..n {
-            let stage = normalized([
+            let stage = self.project_stage([
                 bufs.soa.m0.x[i] + 0.5 * dt * bufs.soa.k[1].x[i],
                 bufs.soa.m0.y[i] + 0.5 * dt * bufs.soa.k[1].y[i],
                 bufs.soa.m0.z[i] + 0.5 * dt * bufs.soa.k[1].z[i],
@@ -1308,7 +1852,7 @@ impl ExchangeLlgProblem {
         self.llg_rhs_soa_into(&bufs.soa.m_stage, &bufs.soa.h_eff, &mut bufs.soa.k[2]);
 
         for i in 0..n {
-            let stage = normalized([
+            let stage = self.project_stage([
                 bufs.soa.m0.x[i] + dt * bufs.soa.k[2].x[i],
                 bufs.soa.m0.y[i] + dt * bufs.soa.k[2].y[i],
                 bufs.soa.m0.z[i] + dt * bufs.soa.k[2].z[i],
@@ -1333,7 +1877,7 @@ impl ExchangeLlgProblem {
                 + (2.0 * bufs.soa.k[2].y[i] + bufs.soa.k[3].y[i]);
             let weighted_z = (bufs.soa.k[0].z[i] + 2.0 * bufs.soa.k[1].z[i])
                 + (2.0 * bufs.soa.k[2].z[i] + bufs.soa.k[3].z[i]);
-            state.magnetization[i] = normalized([
+            state.magnetization[i] = self.project_stage([
                 bufs.soa.m0.x[i] + dt6 * weighted_x,
                 bufs.soa.m0.y[i] + dt6 * weighted_y,
                 bufs.soa.m0.z[i] + dt6 * weighted_z,
@@ -1390,6 +1934,8 @@ impl ExchangeLlgProblem {
         evaluation: EvaluationRequest,
     ) -> Result<StepReport> {
         let cfg = self.dynamics.adaptive;
+        let mut adaptive_controller =
+            AdaptiveStepController::new(2, cfg, state.adaptive_previous_error);
         let mut dt = if self.dynamics.adaptive_enabled {
             dt.min(cfg.dt_max).max(cfg.dt_min)
         } else {
@@ -1400,6 +1946,7 @@ impl ExchangeLlgProblem {
         bufs.m0[..n].copy_from_slice(&state.magnetization);
 
         loop {
+            self.set_thermal_dt_for_attempt(dt);
             let mut rhs_evals = AttemptRhsCounter::default();
             // k1 = f(t, m0)
             self.effective_field_into_ws_at_time(&bufs.m0[..n], ws, &mut bufs.h_eff[..n], t0);
@@ -1420,12 +1967,12 @@ impl ExchangeLlgProblem {
                     .zip(m0.par_iter())
                     .zip(kj.par_iter())
                     .try_for_each(|((s, m), k)| -> Result<()> {
-                        *s = normalized(add(*m, scale(*k, f)))?;
+                        *s = self.project_stage(add(*m, scale(*k, f)))?;
                         Ok(())
                     })?;
                 #[cfg(not(feature = "parallel"))]
                 for i in 0..n {
-                    stage[i] = normalized(add(m0[i], scale(kj[i], f)))?;
+                    stage[i] = self.project_stage(add(m0[i], scale(kj[i], f)))?;
                 }
             }
             self.restore_frozen_reference(&mut bufs.m_stage[..n]);
@@ -1452,12 +1999,12 @@ impl ExchangeLlgProblem {
                     .zip(m0.par_iter())
                     .zip(kj.par_iter())
                     .try_for_each(|((s, m), k)| -> Result<()> {
-                        *s = normalized(add(*m, scale(*k, f)))?;
+                        *s = self.project_stage(add(*m, scale(*k, f)))?;
                         Ok(())
                     })?;
                 #[cfg(not(feature = "parallel"))]
                 for i in 0..n {
-                    stage[i] = normalized(add(m0[i], scale(kj[i], f)))?;
+                    stage[i] = self.project_stage(add(m0[i], scale(kj[i], f)))?;
                 }
             }
             self.restore_frozen_reference(&mut bufs.m_stage[..n]);
@@ -1493,7 +2040,7 @@ impl ExchangeLlgProblem {
                             ),
                             dt,
                         );
-                        *s = normalized(add(*m, *d))?;
+                        *s = self.project_stage(add(*m, *d))?;
                         Ok(())
                     })?;
                 #[cfg(not(feature = "parallel"))]
@@ -1505,7 +2052,7 @@ impl ExchangeLlgProblem {
                         ),
                         dt,
                     );
-                    stage[i] = normalized(add(m0[i], delta[i]))?;
+                    stage[i] = self.project_stage(add(m0[i], delta[i]))?;
                 }
             }
 
@@ -1541,13 +2088,11 @@ impl ExchangeLlgProblem {
             let normalized_error = error / thr;
             let decision = if self.dynamics.adaptive_enabled {
                 decide_adaptive_attempt(
-                    2,
                     dt,
                     normalized_error,
-                    state.adaptive_previous_error,
-                    cfg,
                     rhs_evals.finish(),
                     bufs,
+                    &mut adaptive_controller,
                 )
             } else {
                 AdaptiveDecision::Accepted(dt)
@@ -1566,8 +2111,11 @@ impl ExchangeLlgProblem {
                     evaluation,
                     state.time_seconds,
                 );
-                state.adaptive_previous_error =
-                    self.dynamics.adaptive_enabled.then_some(normalized_error);
+                state.adaptive_previous_error = if self.dynamics.adaptive_enabled {
+                    adaptive_controller.previous_error()
+                } else {
+                    None
+                };
                 let mut report = eval.into_step_report(state.time_seconds, dt, false);
                 report.suggested_next_dt = self.dynamics.adaptive_enabled.then_some(dt_next);
                 return Ok(report);
@@ -1606,6 +2154,8 @@ impl ExchangeLlgProblem {
         evaluation: EvaluationRequest,
     ) -> Result<StepReport> {
         let cfg = self.dynamics.adaptive;
+        let mut adaptive_controller =
+            AdaptiveStepController::new(2, cfg, state.adaptive_previous_error);
         let mut dt = if self.dynamics.adaptive_enabled {
             dt.min(cfg.dt_max).max(cfg.dt_min)
         } else {
@@ -1616,13 +2166,14 @@ impl ExchangeLlgProblem {
         bufs.soa.m0.scatter_from_aos(&state.magnetization);
 
         loop {
+            self.set_thermal_dt_for_attempt(dt);
             let mut rhs_evals = AttemptRhsCounter::default();
             self.effective_field_into_soa_ws_at_time(&bufs.soa.m0, ws, &mut bufs.soa.h_eff, t0);
             self.llg_rhs_soa_into(&bufs.soa.m0, &bufs.soa.h_eff, &mut bufs.soa.k[0]);
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i] + 0.5 * dt * bufs.soa.k[0].x[i],
                     bufs.soa.m0.y[i] + 0.5 * dt * bufs.soa.k[0].y[i],
                     bufs.soa.m0.z[i] + 0.5 * dt * bufs.soa.k[0].z[i],
@@ -1641,7 +2192,7 @@ impl ExchangeLlgProblem {
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i] + 0.75 * dt * bufs.soa.k[1].x[i],
                     bufs.soa.m0.y[i] + 0.75 * dt * bufs.soa.k[1].y[i],
                     bufs.soa.m0.z[i] + 0.75 * dt * bufs.soa.k[1].z[i],
@@ -1669,7 +2220,7 @@ impl ExchangeLlgProblem {
                 let weighted_z = (2.0 / 9.0) * bufs.soa.k[0].z[i]
                     + (1.0 / 3.0) * bufs.soa.k[1].z[i]
                     + (4.0 / 9.0) * bufs.soa.k[2].z[i];
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i] + dt * weighted_x,
                     bufs.soa.m0.y[i] + dt * weighted_y,
                     bufs.soa.m0.z[i] + dt * weighted_z,
@@ -1704,13 +2255,11 @@ impl ExchangeLlgProblem {
             let normalized_error = error / thr;
             let decision = if self.dynamics.adaptive_enabled {
                 decide_adaptive_attempt(
-                    2,
                     dt,
                     normalized_error,
-                    state.adaptive_previous_error,
-                    cfg,
                     rhs_evals.finish(),
                     bufs,
+                    &mut adaptive_controller,
                 )
             } else {
                 AdaptiveDecision::Accepted(dt)
@@ -1730,8 +2279,11 @@ impl ExchangeLlgProblem {
                     evaluation,
                     state.time_seconds,
                 );
-                state.adaptive_previous_error =
-                    self.dynamics.adaptive_enabled.then_some(normalized_error);
+                state.adaptive_previous_error = if self.dynamics.adaptive_enabled {
+                    adaptive_controller.previous_error()
+                } else {
+                    None
+                };
                 let mut report = eval.into_step_report(state.time_seconds, dt, false);
                 report.suggested_next_dt = self.dynamics.adaptive_enabled.then_some(dt_next);
                 return Ok(report);
@@ -1773,6 +2325,8 @@ impl ExchangeLlgProblem {
         evaluation: EvaluationRequest,
     ) -> Result<StepReport> {
         let cfg = self.dynamics.adaptive;
+        let mut adaptive_controller =
+            AdaptiveStepController::new(4, cfg, state.adaptive_previous_error);
         let mut dt = if self.dynamics.adaptive_enabled {
             dt.min(cfg.dt_max).max(cfg.dt_min)
         } else {
@@ -1816,6 +2370,7 @@ impl ExchangeLlgProblem {
         const E7: f64 = -1.0 / 40.0;
 
         loop {
+            self.set_thermal_dt_for_attempt(dt);
             let mut rhs_evals = AttemptRhsCounter::default();
             // Stage 1 — FSAL: reuse k7 from previous accepted step
             let reusable_fsal = (!dynamic_oersted).then(|| state.k_fsal.as_ref()).flatten();
@@ -1841,12 +2396,12 @@ impl ExchangeLlgProblem {
                     .zip(m0.par_iter())
                     .zip(k0.par_iter())
                     .try_for_each(|((s, m), k)| -> Result<()> {
-                        *s = normalized(add(*m, scale(*k, f)))?;
+                        *s = self.project_stage(add(*m, scale(*k, f)))?;
                         Ok(())
                     })?;
                 #[cfg(not(feature = "parallel"))]
                 for i in 0..n {
-                    stage[i] = normalized(add(m0[i], scale(k0[i], f)))?;
+                    stage[i] = self.project_stage(add(m0[i], scale(k0[i], f)))?;
                 }
             }
             self.restore_frozen_reference(&mut bufs.m_stage[..n]);
@@ -1873,7 +2428,7 @@ impl ExchangeLlgProblem {
                     .zip(m0.par_iter())
                     .enumerate()
                     .try_for_each(|(i, (s, m))| -> Result<()> {
-                        *s = normalized(add(
+                        *s = self.project_stage(add(
                             *m,
                             scale(add(scale(k0[i], A31), scale(k1[i], A32)), dt),
                         ))?;
@@ -1881,7 +2436,7 @@ impl ExchangeLlgProblem {
                     })?;
                 #[cfg(not(feature = "parallel"))]
                 for i in 0..n {
-                    stage[i] = normalized(add(
+                    stage[i] = self.project_stage(add(
                         m0[i],
                         scale(add(scale(k0[i], A31), scale(k1[i], A32)), dt),
                     ))?;
@@ -1911,7 +2466,7 @@ impl ExchangeLlgProblem {
                     .zip(m0.par_iter())
                     .enumerate()
                     .try_for_each(|(i, (s, m))| -> Result<()> {
-                        *s = normalized(add(
+                        *s = self.project_stage(add(
                             *m,
                             scale(
                                 add(add(scale(k0[i], A41), scale(k1[i], A42)), scale(k2[i], A43)),
@@ -1922,7 +2477,7 @@ impl ExchangeLlgProblem {
                     })?;
                 #[cfg(not(feature = "parallel"))]
                 for i in 0..n {
-                    stage[i] = normalized(add(
+                    stage[i] = self.project_stage(add(
                         m0[i],
                         scale(
                             add(add(scale(k0[i], A41), scale(k1[i], A42)), scale(k2[i], A43)),
@@ -1960,7 +2515,7 @@ impl ExchangeLlgProblem {
                     .zip(m0.par_iter())
                     .enumerate()
                     .try_for_each(|(i, (s, m))| -> Result<()> {
-                        *s = normalized(add(
+                        *s = self.project_stage(add(
                             *m,
                             scale(
                                 add(
@@ -1974,7 +2529,7 @@ impl ExchangeLlgProblem {
                     })?;
                 #[cfg(not(feature = "parallel"))]
                 for i in 0..n {
-                    stage[i] = normalized(add(
+                    stage[i] = self.project_stage(add(
                         m0[i],
                         scale(
                             add(
@@ -2016,7 +2571,7 @@ impl ExchangeLlgProblem {
                     .zip(m0.par_iter())
                     .enumerate()
                     .try_for_each(|(i, (s, m))| -> Result<()> {
-                        *s = normalized(add(
+                        *s = self.project_stage(add(
                             *m,
                             scale(
                                 add(
@@ -2033,7 +2588,7 @@ impl ExchangeLlgProblem {
                     })?;
                 #[cfg(not(feature = "parallel"))]
                 for i in 0..n {
-                    stage[i] = normalized(add(
+                    stage[i] = self.project_stage(add(
                         m0[i],
                         scale(
                             add(
@@ -2075,7 +2630,7 @@ impl ExchangeLlgProblem {
                     .zip(m0.par_iter())
                     .enumerate()
                     .try_for_each(|(i, (s, m))| -> Result<()> {
-                        *s = normalized(add(
+                        *s = self.project_stage(add(
                             *m,
                             scale(
                                 add(
@@ -2089,7 +2644,7 @@ impl ExchangeLlgProblem {
                     })?;
                 #[cfg(not(feature = "parallel"))]
                 for i in 0..n {
-                    stage[i] = normalized(add(
+                    stage[i] = self.project_stage(add(
                         m0[i],
                         scale(
                             add(
@@ -2129,13 +2684,11 @@ impl ExchangeLlgProblem {
             let normalized_error = error / thr;
             let decision = if self.dynamics.adaptive_enabled {
                 decide_adaptive_attempt(
-                    4,
                     dt,
                     normalized_error,
-                    state.adaptive_previous_error,
-                    cfg,
                     rhs_evals.finish(),
                     bufs,
+                    &mut adaptive_controller,
                 )
             } else {
                 AdaptiveDecision::Accepted(dt)
@@ -2161,8 +2714,11 @@ impl ExchangeLlgProblem {
                     evaluation,
                     state.time_seconds,
                 );
-                state.adaptive_previous_error =
-                    self.dynamics.adaptive_enabled.then_some(normalized_error);
+                state.adaptive_previous_error = if self.dynamics.adaptive_enabled {
+                    adaptive_controller.previous_error()
+                } else {
+                    None
+                };
                 let mut report = eval.into_step_report(state.time_seconds, dt, false);
                 report.suggested_next_dt = self.dynamics.adaptive_enabled.then_some(dt_next);
                 return Ok(report);
@@ -2201,6 +2757,8 @@ impl ExchangeLlgProblem {
         evaluation: EvaluationRequest,
     ) -> Result<StepReport> {
         let cfg = self.dynamics.adaptive;
+        let mut adaptive_controller =
+            AdaptiveStepController::new(4, cfg, state.adaptive_previous_error);
         let mut dt = if self.dynamics.adaptive_enabled {
             dt.min(cfg.dt_max).max(cfg.dt_min)
         } else {
@@ -2243,6 +2801,7 @@ impl ExchangeLlgProblem {
         const E7: f64 = -1.0 / 40.0;
 
         loop {
+            self.set_thermal_dt_for_attempt(dt);
             let mut rhs_evals = AttemptRhsCounter::default();
             let reusable_fsal = (!dynamic_oersted).then(|| state.k_fsal.as_ref()).flatten();
             if let Some(fsal) = reusable_fsal {
@@ -2254,7 +2813,7 @@ impl ExchangeLlgProblem {
             }
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i] + dt * A21 * bufs.soa.k[0].x[i],
                     bufs.soa.m0.y[i] + dt * A21 * bufs.soa.k[0].y[i],
                     bufs.soa.m0.z[i] + dt * A21 * bufs.soa.k[0].z[i],
@@ -2273,7 +2832,7 @@ impl ExchangeLlgProblem {
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i] + dt * (A31 * bufs.soa.k[0].x[i] + A32 * bufs.soa.k[1].x[i]),
                     bufs.soa.m0.y[i] + dt * (A31 * bufs.soa.k[0].y[i] + A32 * bufs.soa.k[1].y[i]),
                     bufs.soa.m0.z[i] + dt * (A31 * bufs.soa.k[0].z[i] + A32 * bufs.soa.k[1].z[i]),
@@ -2292,7 +2851,7 @@ impl ExchangeLlgProblem {
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i]
                         + dt * (A41 * bufs.soa.k[0].x[i]
                             + A42 * bufs.soa.k[1].x[i]
@@ -2320,7 +2879,7 @@ impl ExchangeLlgProblem {
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i]
                         + dt * (A51 * bufs.soa.k[0].x[i]
                             + A52 * bufs.soa.k[1].x[i]
@@ -2351,7 +2910,7 @@ impl ExchangeLlgProblem {
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i]
                         + dt * (A61 * bufs.soa.k[0].x[i]
                             + A62 * bufs.soa.k[1].x[i]
@@ -2385,7 +2944,7 @@ impl ExchangeLlgProblem {
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i]
                         + dt * (B1 * bufs.soa.k[0].x[i]
                             + B3 * bufs.soa.k[2].x[i]
@@ -2430,13 +2989,11 @@ impl ExchangeLlgProblem {
             let normalized_error = error / thr;
             let decision = if self.dynamics.adaptive_enabled {
                 decide_adaptive_attempt(
-                    4,
                     dt,
                     normalized_error,
-                    state.adaptive_previous_error,
-                    cfg,
                     rhs_evals.finish(),
                     bufs,
+                    &mut adaptive_controller,
                 )
             } else {
                 AdaptiveDecision::Accepted(dt)
@@ -2452,7 +3009,9 @@ impl ExchangeLlgProblem {
                 } else if let Some(fsal) = &mut state.k_fsal {
                     bufs.soa.k[6].gather_into_aos(fsal);
                 } else {
-                    state.k_fsal = Some(bufs.soa.k[6].gather_to_aos());
+                    let mut fsal = vec![[0.0; 3]; n];
+                    bufs.soa.k[6].gather_into_aos(&mut fsal);
+                    state.k_fsal = Some(fsal);
                 }
                 let eval = self.compute_step_observables_at_time(
                     &state.magnetization,
@@ -2463,8 +3022,11 @@ impl ExchangeLlgProblem {
                     evaluation,
                     state.time_seconds,
                 );
-                state.adaptive_previous_error =
-                    self.dynamics.adaptive_enabled.then_some(normalized_error);
+                state.adaptive_previous_error = if self.dynamics.adaptive_enabled {
+                    adaptive_controller.previous_error()
+                } else {
+                    None
+                };
                 let mut report = eval.into_step_report(state.time_seconds, dt, false);
                 report.suggested_next_dt = self.dynamics.adaptive_enabled.then_some(dt_next);
                 return Ok(report);
@@ -2507,9 +3069,10 @@ impl ExchangeLlgProblem {
     ) -> Result<StepReport> {
         let n = state.magnetization.len();
         let t0 = state.time_seconds;
+        let dt_changed = state.abm_history.requires_restart_for_dt(dt);
 
         // During startup, fall back to Heun to build history
-        if !state.abm_history.is_ready() {
+        if dt_changed || !state.abm_history.is_ready() {
             bufs.m0[..n].copy_from_slice(&state.magnetization);
 
             // k1 = f(t, m0)
@@ -2529,12 +3092,12 @@ impl ExchangeLlgProblem {
                     .zip(m0.par_iter())
                     .zip(k0.par_iter())
                     .try_for_each(|((s, m), k)| -> Result<()> {
-                        *s = normalized(add(*m, scale(*k, dt)))?;
+                        *s = self.project_stage(add(*m, scale(*k, dt)))?;
                         Ok(())
                     })?;
                 #[cfg(not(feature = "parallel"))]
                 for i in 0..n {
-                    stage[i] = normalized(add(m0[i], scale(k0[i], dt)))?;
+                    stage[i] = self.project_stage(add(m0[i], scale(k0[i], dt)))?;
                 }
             }
 
@@ -2554,53 +3117,49 @@ impl ExchangeLlgProblem {
 
             // corrected = normalize(m0 + dt/2 * (k1 + k2))
             {
-                let (mag, m0, k0, k1) = (
-                    &mut state.magnetization[..n],
+                let (stage, m0, k0, k1) = (
+                    &mut bufs.m_stage[..n],
                     &bufs.m0[..n],
                     &bufs.k[0][..n],
                     &bufs.k[1][..n],
                 );
                 #[cfg(feature = "parallel")]
-                mag.par_iter_mut()
+                stage
+                    .par_iter_mut()
                     .zip(m0.par_iter())
                     .zip(k0.par_iter())
                     .zip(k1.par_iter())
                     .try_for_each(|(((m, m0), k0), k1)| -> Result<()> {
-                        *m = normalized(add(*m0, scale(add(*k0, *k1), 0.5 * dt)))?;
+                        *m = self.project_stage(add(*m0, scale(add(*k0, *k1), 0.5 * dt)))?;
                         Ok(())
                     })?;
                 #[cfg(not(feature = "parallel"))]
                 for i in 0..n {
-                    mag[i] = normalized(add(m0[i], scale(add(k0[i], k1[i]), 0.5 * dt)))?;
+                    stage[i] =
+                        self.project_stage(add(m0[i], scale(add(k0[i], k1[i]), 0.5 * dt)))?;
                 }
             }
-            self.restore_frozen_reference(&mut state.magnetization[..n]);
-            state.time_seconds += dt;
-
-            // Store RHS at accepted point for history
-            self.effective_field_into_ws_at_time(
-                state.magnetization(),
-                ws,
-                &mut bufs.h_eff[..n],
-                t0 + dt,
-            );
-            self.llg_rhs_from_fields_with_direct_torques_into(
-                state.magnetization(),
-                &bufs.h_eff[..n],
-                &mut bufs.k[0][..n],
-            );
-            state.abm_history.push(bufs.k[0][..n].to_vec(), dt);
+            self.restore_frozen_reference(&mut bufs.m_stage[..n]);
+            let accepted_time = t0 + dt;
 
             let eval = self.compute_step_observables_at_time(
-                &state.magnetization,
+                &bufs.m_stage[..n],
                 ws,
                 &mut bufs.h_eff,
                 &mut bufs.h_scratch,
                 &mut bufs.rhs,
                 evaluation,
-                state.time_seconds,
+                accepted_time,
             );
-            return Ok(eval.into_step_report(state.time_seconds, dt, false));
+            state.magnetization[..n].copy_from_slice(&bufs.m_stage[..n]);
+            state.time_seconds = accepted_time;
+            state.abm_history.push_copy_from_slice(&bufs.rhs[..n], dt);
+            return Ok(tag_abm3_step(
+                eval.into_step_report(accepted_time, dt, false),
+                true,
+                dt_changed,
+                state.abm_history.history_resets,
+            ));
         }
 
         // --- Full ABM3 step ---
@@ -2623,7 +3182,7 @@ impl ExchangeLlgProblem {
                         add(scale(f_n[i], 23.0 / 12.0), scale(f_n1[i], -16.0 / 12.0)),
                         scale(f_n2[i], 5.0 / 12.0),
                     );
-                    *s = normalized(add(*m, scale(pred, dt)))?;
+                    *s = self.project_stage(add(*m, scale(pred, dt)))?;
                     Ok(())
                 })?;
             #[cfg(not(feature = "parallel"))]
@@ -2632,7 +3191,7 @@ impl ExchangeLlgProblem {
                     add(scale(f_n[i], 23.0 / 12.0), scale(f_n1[i], -16.0 / 12.0)),
                     scale(f_n2[i], 5.0 / 12.0),
                 );
-                stage[i] = normalized(add(m0[i], scale(pred, dt)))?;
+                stage[i] = self.project_stage(add(m0[i], scale(pred, dt)))?;
             }
         }
 
@@ -2645,15 +3204,12 @@ impl ExchangeLlgProblem {
             &mut bufs.k[0][..n],
         );
 
-        // Adams–Moulton corrector → state.magnetization
+        // Adams–Moulton corrector → trial candidate
         {
-            let (mag, m0, k0) = (
-                &mut state.magnetization[..n],
-                &bufs.m0[..n],
-                &bufs.k[0][..n],
-            );
+            let (stage, m0, k0) = (&mut bufs.m_stage[..n], &bufs.m0[..n], &bufs.k[0][..n]);
             #[cfg(feature = "parallel")]
-            mag.par_iter_mut()
+            stage
+                .par_iter_mut()
                 .zip(m0.par_iter())
                 .enumerate()
                 .try_for_each(|(i, (m, m0))| -> Result<()> {
@@ -2661,7 +3217,7 @@ impl ExchangeLlgProblem {
                         add(scale(k0[i], 5.0 / 12.0), scale(f_n[i], 8.0 / 12.0)),
                         scale(f_n1[i], -1.0 / 12.0),
                     );
-                    *m = normalized(add(*m0, scale(corr, dt)))?;
+                    *m = self.project_stage(add(*m0, scale(corr, dt)))?;
                     Ok(())
                 })?;
             #[cfg(not(feature = "parallel"))]
@@ -2670,25 +3226,30 @@ impl ExchangeLlgProblem {
                     add(scale(k0[i], 5.0 / 12.0), scale(f_n[i], 8.0 / 12.0)),
                     scale(f_n1[i], -1.0 / 12.0),
                 );
-                mag[i] = normalized(add(m0[i], scale(corr, dt)))?;
+                stage[i] = self.project_stage(add(m0[i], scale(corr, dt)))?;
             }
         }
-        self.restore_frozen_reference(&mut state.magnetization[..n]);
-        state.time_seconds += dt;
-
-        // Push f_star (k[0]) into history
-        state.abm_history.push(bufs.k[0][..n].to_vec(), dt);
+        self.restore_frozen_reference(&mut bufs.m_stage[..n]);
+        let accepted_time = t0 + dt;
 
         let eval = self.compute_step_observables_at_time(
-            &state.magnetization,
+            &bufs.m_stage[..n],
             ws,
             &mut bufs.h_eff,
             &mut bufs.h_scratch,
             &mut bufs.rhs,
             evaluation,
-            state.time_seconds,
+            accepted_time,
         );
-        Ok(eval.into_step_report(state.time_seconds, dt, false))
+        state.magnetization[..n].copy_from_slice(&bufs.m_stage[..n]);
+        state.time_seconds = accepted_time;
+        state.abm_history.push_copy_from_slice(&bufs.rhs[..n], dt);
+        Ok(tag_abm3_step(
+            eval.into_step_report(accepted_time, dt, false),
+            false,
+            false,
+            state.abm_history.history_resets,
+        ))
     }
 
     pub(crate) fn abm3_step_soa_buf(
@@ -2701,22 +3262,25 @@ impl ExchangeLlgProblem {
     ) -> Result<StepReport> {
         let n = state.magnetization.len();
         let t0 = state.time_seconds;
+        let dt_changed = state.abm_history.requires_restart_for_dt(dt);
 
-        if !state.abm_history.is_ready() {
-            let report = self.heun_step_soa_buf(state, dt, ws, bufs, evaluation)?;
+        if dt_changed || !state.abm_history.is_ready() {
+            let mut trial_state = state.clone();
+            if dt_changed {
+                trial_state.abm_history.restart();
+            }
+            let report = self.heun_step_soa_buf(&mut trial_state, dt, ws, bufs, evaluation)?;
+            trial_state
+                .abm_history
+                .push_copy_from_slice(&bufs.rhs[..n], dt);
+            *state = trial_state;
 
-            bufs.soa.m0.scatter_from_aos(&state.magnetization);
-            self.effective_field_into_soa_ws_at_time(
-                &bufs.soa.m0,
-                ws,
-                &mut bufs.soa.h_eff,
-                t0 + dt,
-            );
-            self.llg_rhs_soa_into(&bufs.soa.m0, &bufs.soa.h_eff, &mut bufs.soa.k[0]);
-            bufs.soa.k[0].gather_into_aos(&mut bufs.k[0][..n]);
-            state.abm_history.push_copy_from_slice(&bufs.k[0][..n], dt);
-
-            return Ok(report);
+            return Ok(tag_abm3_step(
+                report,
+                true,
+                dt_changed,
+                state.abm_history.history_resets,
+            ));
         }
 
         bufs.soa.m0.scatter_from_aos(&state.magnetization);
@@ -2731,7 +3295,7 @@ impl ExchangeLlgProblem {
                 + (5.0 / 12.0) * bufs.soa.k[3].y[i];
             let pred_z = (23.0 / 12.0) * bufs.soa.k[1].z[i] - (16.0 / 12.0) * bufs.soa.k[2].z[i]
                 + (5.0 / 12.0) * bufs.soa.k[3].z[i];
-            let stage = normalized([
+            let stage = self.project_stage([
                 bufs.soa.m0.x[i] + dt * pred_x,
                 bufs.soa.m0.y[i] + dt * pred_y,
                 bufs.soa.m0.z[i] + dt * pred_z,
@@ -2756,27 +3320,42 @@ impl ExchangeLlgProblem {
                 - (1.0 / 12.0) * bufs.soa.k[2].y[i];
             let corr_z = (5.0 / 12.0) * bufs.soa.k[0].z[i] + (8.0 / 12.0) * bufs.soa.k[1].z[i]
                 - (1.0 / 12.0) * bufs.soa.k[2].z[i];
-            state.magnetization[i] = normalized([
+            let corrected = self.project_stage([
                 bufs.soa.m0.x[i] + dt * corr_x,
                 bufs.soa.m0.y[i] + dt * corr_y,
                 bufs.soa.m0.z[i] + dt * corr_z,
             ])?;
+            bufs.soa.m_stage.x[i] = corrected[0];
+            bufs.soa.m_stage.y[i] = corrected[1];
+            bufs.soa.m_stage.z[i] = corrected[2];
         }
-        state.time_seconds += dt;
 
+        let accepted_time = t0 + dt;
+        let eval = {
+            let soa = &mut bufs.soa;
+            let (rhs_slots, scratch_slots) = soa.k.split_at_mut(1);
+            self.compute_step_observables_soa_parts(
+                &soa.m_stage,
+                ws,
+                &mut soa.h_eff,
+                &mut rhs_slots[0],
+                &mut scratch_slots[0],
+                evaluation,
+                accepted_time,
+            )
+        };
         bufs.soa.k[0].gather_into_aos(&mut bufs.k[0][..n]);
+        bufs.soa
+            .m_stage
+            .gather_into_aos(&mut state.magnetization[..n]);
+        state.time_seconds = accepted_time;
         state.abm_history.push_copy_from_slice(&bufs.k[0][..n], dt);
-
-        let eval = self.compute_step_observables_at_time(
-            &state.magnetization,
-            ws,
-            &mut bufs.h_eff,
-            &mut bufs.h_scratch,
-            &mut bufs.rhs,
-            evaluation,
-            state.time_seconds,
-        );
-        Ok(eval.into_step_report(state.time_seconds, dt, false))
+        Ok(tag_abm3_step(
+            eval.into_step_report(accepted_time, dt, false),
+            false,
+            false,
+            state.abm_history.history_resets,
+        ))
     }
 
     pub(crate) fn heun_step_soa_state_buf(
@@ -2795,7 +3374,7 @@ impl ExchangeLlgProblem {
         self.llg_rhs_soa_into(&bufs.soa.m0, &bufs.soa.h_eff, &mut bufs.soa.k[0]);
 
         for i in 0..n {
-            let predicted = normalized([
+            let predicted = self.project_stage([
                 bufs.soa.m0.x[i] + dt * bufs.soa.k[0].x[i],
                 bufs.soa.m0.y[i] + dt * bufs.soa.k[0].y[i],
                 bufs.soa.m0.z[i] + dt * bufs.soa.k[0].z[i],
@@ -2814,7 +3393,7 @@ impl ExchangeLlgProblem {
         self.llg_rhs_soa_into(&bufs.soa.m_stage, &bufs.soa.h_eff, &mut bufs.soa.k[1]);
 
         for i in 0..n {
-            let corrected = normalized([
+            let corrected = self.project_stage([
                 bufs.soa.m0.x[i] + 0.5 * dt * (bufs.soa.k[0].x[i] + bufs.soa.k[1].x[i]),
                 bufs.soa.m0.y[i] + 0.5 * dt * (bufs.soa.k[0].y[i] + bufs.soa.k[1].y[i]),
                 bufs.soa.m0.z[i] + 0.5 * dt * (bufs.soa.k[0].z[i] + bufs.soa.k[1].z[i]),
@@ -2851,7 +3430,7 @@ impl ExchangeLlgProblem {
         self.llg_rhs_soa_into(&bufs.soa.m0, &bufs.soa.h_eff, &mut bufs.soa.k[0]);
 
         for i in 0..n {
-            let stage = normalized([
+            let stage = self.project_stage([
                 bufs.soa.m0.x[i] + 0.5 * dt * bufs.soa.k[0].x[i],
                 bufs.soa.m0.y[i] + 0.5 * dt * bufs.soa.k[0].y[i],
                 bufs.soa.m0.z[i] + 0.5 * dt * bufs.soa.k[0].z[i],
@@ -2869,7 +3448,7 @@ impl ExchangeLlgProblem {
         self.llg_rhs_soa_into(&bufs.soa.m_stage, &bufs.soa.h_eff, &mut bufs.soa.k[1]);
 
         for i in 0..n {
-            let stage = normalized([
+            let stage = self.project_stage([
                 bufs.soa.m0.x[i] + 0.5 * dt * bufs.soa.k[1].x[i],
                 bufs.soa.m0.y[i] + 0.5 * dt * bufs.soa.k[1].y[i],
                 bufs.soa.m0.z[i] + 0.5 * dt * bufs.soa.k[1].z[i],
@@ -2887,7 +3466,7 @@ impl ExchangeLlgProblem {
         self.llg_rhs_soa_into(&bufs.soa.m_stage, &bufs.soa.h_eff, &mut bufs.soa.k[2]);
 
         for i in 0..n {
-            let stage = normalized([
+            let stage = self.project_stage([
                 bufs.soa.m0.x[i] + dt * bufs.soa.k[2].x[i],
                 bufs.soa.m0.y[i] + dt * bufs.soa.k[2].y[i],
                 bufs.soa.m0.z[i] + dt * bufs.soa.k[2].z[i],
@@ -2912,7 +3491,7 @@ impl ExchangeLlgProblem {
                 + (2.0 * bufs.soa.k[2].y[i] + bufs.soa.k[3].y[i]);
             let weighted_z = (bufs.soa.k[0].z[i] + 2.0 * bufs.soa.k[1].z[i])
                 + (2.0 * bufs.soa.k[2].z[i] + bufs.soa.k[3].z[i]);
-            let updated = normalized([
+            let updated = self.project_stage([
                 bufs.soa.m0.x[i] + dt6 * weighted_x,
                 bufs.soa.m0.y[i] + dt6 * weighted_y,
                 bufs.soa.m0.z[i] + dt6 * weighted_z,
@@ -2941,26 +3520,27 @@ impl ExchangeLlgProblem {
         bufs: &mut IntegratorBuffers,
         evaluation: EvaluationRequest,
     ) -> Result<StepReport> {
-        if !self.dynamics.adaptive_enabled {
-            let mut aos = state.to_aos();
-            let report = self.rk23_step_soa_buf(&mut aos, dt, ws, bufs, evaluation)?;
-            *state = aos.to_soa();
-            return Ok(report);
-        }
         let cfg = self.dynamics.adaptive;
-        let mut dt = dt.min(cfg.dt_max).max(cfg.dt_min);
+        let mut adaptive_controller =
+            AdaptiveStepController::new(2, cfg, state.adaptive_previous_error);
+        let mut dt = if self.dynamics.adaptive_enabled {
+            dt.min(cfg.dt_max).max(cfg.dt_min)
+        } else {
+            dt
+        };
         let n = state.magnetization.len();
         let t0 = state.time_seconds;
         bufs.soa.m0.copy_from(&state.magnetization);
 
         loop {
+            self.set_thermal_dt_for_attempt(dt);
             let mut rhs_evals = AttemptRhsCounter::default();
             self.effective_field_into_soa_ws_at_time(&bufs.soa.m0, ws, &mut bufs.soa.h_eff, t0);
             self.llg_rhs_soa_into(&bufs.soa.m0, &bufs.soa.h_eff, &mut bufs.soa.k[0]);
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i] + 0.5 * dt * bufs.soa.k[0].x[i],
                     bufs.soa.m0.y[i] + 0.5 * dt * bufs.soa.k[0].y[i],
                     bufs.soa.m0.z[i] + 0.5 * dt * bufs.soa.k[0].z[i],
@@ -2979,7 +3559,7 @@ impl ExchangeLlgProblem {
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i] + 0.75 * dt * bufs.soa.k[1].x[i],
                     bufs.soa.m0.y[i] + 0.75 * dt * bufs.soa.k[1].y[i],
                     bufs.soa.m0.z[i] + 0.75 * dt * bufs.soa.k[1].z[i],
@@ -3007,7 +3587,7 @@ impl ExchangeLlgProblem {
                 let weighted_z = (2.0 / 9.0) * bufs.soa.k[0].z[i]
                     + (1.0 / 3.0) * bufs.soa.k[1].z[i]
                     + (4.0 / 9.0) * bufs.soa.k[2].z[i];
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i] + dt * weighted_x,
                     bufs.soa.m0.y[i] + dt * weighted_y,
                     bufs.soa.m0.z[i] + dt * weighted_z,
@@ -3042,13 +3622,11 @@ impl ExchangeLlgProblem {
             let normalized_error = error / thr;
             let decision = if self.dynamics.adaptive_enabled {
                 decide_adaptive_attempt(
-                    2,
                     dt,
                     normalized_error,
-                    state.adaptive_previous_error,
-                    cfg,
                     rhs_evals.finish(),
                     bufs,
+                    &mut adaptive_controller,
                 )
             } else {
                 AdaptiveDecision::Accepted(dt)
@@ -3064,8 +3642,11 @@ impl ExchangeLlgProblem {
                     evaluation,
                     state.time_seconds,
                 );
-                state.adaptive_previous_error =
-                    self.dynamics.adaptive_enabled.then_some(normalized_error);
+                state.adaptive_previous_error = if self.dynamics.adaptive_enabled {
+                    adaptive_controller.previous_error()
+                } else {
+                    None
+                };
                 let mut report = eval.into_step_report(state.time_seconds, dt, false);
                 report.suggested_next_dt = self.dynamics.adaptive_enabled.then_some(dt_next);
                 return Ok(report);
@@ -3103,14 +3684,14 @@ impl ExchangeLlgProblem {
         bufs: &mut IntegratorBuffers,
         evaluation: EvaluationRequest,
     ) -> Result<StepReport> {
-        if !self.dynamics.adaptive_enabled {
-            let mut aos = state.to_aos();
-            let report = self.rk45_step_soa_buf(&mut aos, dt, ws, bufs, evaluation)?;
-            *state = aos.to_soa();
-            return Ok(report);
-        }
         let cfg = self.dynamics.adaptive;
-        let mut dt = dt.min(cfg.dt_max).max(cfg.dt_min);
+        let mut adaptive_controller =
+            AdaptiveStepController::new(4, cfg, state.adaptive_previous_error);
+        let mut dt = if self.dynamics.adaptive_enabled {
+            dt.min(cfg.dt_max).max(cfg.dt_min)
+        } else {
+            dt
+        };
         let n = state.magnetization.len();
         let t0 = state.time_seconds;
         let dynamic_oersted = self
@@ -3148,6 +3729,7 @@ impl ExchangeLlgProblem {
         const E7: f64 = -1.0 / 40.0;
 
         loop {
+            self.set_thermal_dt_for_attempt(dt);
             let mut rhs_evals = AttemptRhsCounter::default();
             let reusable_fsal = (!dynamic_oersted).then(|| state.k_fsal.as_ref()).flatten();
             if let Some(fsal) = reusable_fsal {
@@ -3159,7 +3741,7 @@ impl ExchangeLlgProblem {
             }
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i] + dt * A21 * bufs.soa.k[0].x[i],
                     bufs.soa.m0.y[i] + dt * A21 * bufs.soa.k[0].y[i],
                     bufs.soa.m0.z[i] + dt * A21 * bufs.soa.k[0].z[i],
@@ -3178,7 +3760,7 @@ impl ExchangeLlgProblem {
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i] + dt * (A31 * bufs.soa.k[0].x[i] + A32 * bufs.soa.k[1].x[i]),
                     bufs.soa.m0.y[i] + dt * (A31 * bufs.soa.k[0].y[i] + A32 * bufs.soa.k[1].y[i]),
                     bufs.soa.m0.z[i] + dt * (A31 * bufs.soa.k[0].z[i] + A32 * bufs.soa.k[1].z[i]),
@@ -3197,7 +3779,7 @@ impl ExchangeLlgProblem {
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i]
                         + dt * (A41 * bufs.soa.k[0].x[i]
                             + A42 * bufs.soa.k[1].x[i]
@@ -3225,7 +3807,7 @@ impl ExchangeLlgProblem {
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i]
                         + dt * (A51 * bufs.soa.k[0].x[i]
                             + A52 * bufs.soa.k[1].x[i]
@@ -3256,7 +3838,7 @@ impl ExchangeLlgProblem {
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i]
                         + dt * (A61 * bufs.soa.k[0].x[i]
                             + A62 * bufs.soa.k[1].x[i]
@@ -3290,7 +3872,7 @@ impl ExchangeLlgProblem {
             rhs_evals.record();
 
             for i in 0..n {
-                let stage = normalized([
+                let stage = self.project_stage([
                     bufs.soa.m0.x[i]
                         + dt * (B1 * bufs.soa.k[0].x[i]
                             + B3 * bufs.soa.k[2].x[i]
@@ -3335,13 +3917,11 @@ impl ExchangeLlgProblem {
             let normalized_error = error / thr;
             let decision = if self.dynamics.adaptive_enabled {
                 decide_adaptive_attempt(
-                    4,
                     dt,
                     normalized_error,
-                    state.adaptive_previous_error,
-                    cfg,
                     rhs_evals.finish(),
                     bufs,
+                    &mut adaptive_controller,
                 )
             } else {
                 AdaptiveDecision::Accepted(dt)
@@ -3364,8 +3944,11 @@ impl ExchangeLlgProblem {
                     evaluation,
                     state.time_seconds,
                 );
-                state.adaptive_previous_error =
-                    self.dynamics.adaptive_enabled.then_some(normalized_error);
+                state.adaptive_previous_error = if self.dynamics.adaptive_enabled {
+                    adaptive_controller.previous_error()
+                } else {
+                    None
+                };
                 let mut report = eval.into_step_report(state.time_seconds, dt, false);
                 report.suggested_next_dt = self.dynamics.adaptive_enabled.then_some(dt_next);
                 return Ok(report);
@@ -3405,20 +3988,26 @@ impl ExchangeLlgProblem {
     ) -> Result<StepReport> {
         let n = state.magnetization.len();
         let t0 = state.time_seconds;
+        let dt_changed = state.abm_history.requires_restart_for_dt(dt);
 
-        if !state.abm_history.is_ready() {
-            let report = self.heun_step_soa_state_buf(state, dt, ws, bufs, evaluation)?;
+        if dt_changed || !state.abm_history.is_ready() {
+            let mut trial_state = state.clone();
+            if dt_changed {
+                trial_state.abm_history.restart();
+            }
+            let report =
+                self.heun_step_soa_state_buf(&mut trial_state, dt, ws, bufs, evaluation)?;
+            trial_state
+                .abm_history
+                .push_copy_from_soa(&bufs.soa.k[0], dt);
+            *state = trial_state;
 
-            self.effective_field_into_soa_ws_at_time(
-                &state.magnetization,
-                ws,
-                &mut bufs.soa.h_eff,
-                t0 + dt,
-            );
-            self.llg_rhs_soa_into(&state.magnetization, &bufs.soa.h_eff, &mut bufs.soa.k[0]);
-            state.abm_history.push_copy_from_soa(&bufs.soa.k[0], dt);
-
-            return Ok(report);
+            return Ok(tag_abm3_step(
+                report,
+                true,
+                dt_changed,
+                state.abm_history.history_resets,
+            ));
         }
 
         bufs.soa.m0.copy_from(&state.magnetization);
@@ -3443,7 +4032,7 @@ impl ExchangeLlgProblem {
                 + (5.0 / 12.0) * bufs.soa.k[3].y[i];
             let pred_z = (23.0 / 12.0) * bufs.soa.k[1].z[i] - (16.0 / 12.0) * bufs.soa.k[2].z[i]
                 + (5.0 / 12.0) * bufs.soa.k[3].z[i];
-            let stage = normalized([
+            let stage = self.project_stage([
                 bufs.soa.m0.x[i] + dt * pred_x,
                 bufs.soa.m0.y[i] + dt * pred_y,
                 bufs.soa.m0.z[i] + dt * pred_z,
@@ -3468,27 +4057,38 @@ impl ExchangeLlgProblem {
                 - (1.0 / 12.0) * bufs.soa.k[2].y[i];
             let corr_z = (5.0 / 12.0) * bufs.soa.k[0].z[i] + (8.0 / 12.0) * bufs.soa.k[1].z[i]
                 - (1.0 / 12.0) * bufs.soa.k[2].z[i];
-            let updated = normalized([
+            let updated = self.project_stage([
                 bufs.soa.m0.x[i] + dt * corr_x,
                 bufs.soa.m0.y[i] + dt * corr_y,
                 bufs.soa.m0.z[i] + dt * corr_z,
             ])?;
-            state.magnetization.x[i] = updated[0];
-            state.magnetization.y[i] = updated[1];
-            state.magnetization.z[i] = updated[2];
+            bufs.soa.m_stage.x[i] = updated[0];
+            bufs.soa.m_stage.y[i] = updated[1];
+            bufs.soa.m_stage.z[i] = updated[2];
         }
-        state.time_seconds += dt;
-
+        let accepted_time = t0 + dt;
+        let eval = {
+            let soa = &mut bufs.soa;
+            let (rhs_slots, scratch_slots) = soa.k.split_at_mut(1);
+            self.compute_step_observables_soa_parts(
+                &soa.m_stage,
+                ws,
+                &mut soa.h_eff,
+                &mut rhs_slots[0],
+                &mut scratch_slots[0],
+                evaluation,
+                accepted_time,
+            )
+        };
+        state.magnetization.copy_from(&bufs.soa.m_stage);
+        state.time_seconds = accepted_time;
         state.abm_history.push_copy_from_soa(&bufs.soa.k[0], dt);
-
-        let eval = self.compute_step_observables_soa(
-            &state.magnetization,
-            ws,
-            bufs,
-            evaluation,
-            state.time_seconds,
-        );
-        Ok(eval.into_step_report(state.time_seconds, dt, false))
+        Ok(tag_abm3_step(
+            eval.into_step_report(accepted_time, dt, false),
+            false,
+            false,
+            state.abm_history.history_resets,
+        ))
     }
 
     fn compute_step_observables_soa(
@@ -3499,26 +4099,45 @@ impl ExchangeLlgProblem {
         evaluation: EvaluationRequest,
         time_seconds: f64,
     ) -> RhsEvaluation {
+        let soa = &mut bufs.soa;
+        let (rhs_slots, scratch_slots) = soa.k.split_at_mut(1);
+        self.compute_step_observables_soa_parts(
+            magnetization,
+            ws,
+            &mut soa.h_eff,
+            &mut rhs_slots[0],
+            &mut scratch_slots[0],
+            evaluation,
+            time_seconds,
+        )
+    }
+
+    fn compute_step_observables_soa_parts(
+        &self,
+        magnetization: &VectorFieldSoA,
+        ws: &mut FftWorkspace,
+        h_eff: &mut VectorFieldSoA,
+        rhs_out: &mut VectorFieldSoA,
+        h_scratch: &mut VectorFieldSoA,
+        evaluation: EvaluationRequest,
+        time_seconds: f64,
+    ) -> RhsEvaluation {
         match evaluation {
             EvaluationRequest::Minimal => self.compute_step_observables_soa_minimal(
                 magnetization,
                 ws,
-                &mut bufs.soa.h_eff,
-                &mut bufs.soa.k[0],
+                h_eff,
+                rhs_out,
                 time_seconds,
             ),
-            EvaluationRequest::Full => {
-                let soa = &mut bufs.soa;
-                let (rhs_slots, scratch_slots) = soa.k.split_at_mut(1);
-                self.compute_step_observables_soa_full(
-                    magnetization,
-                    ws,
-                    &mut soa.h_eff,
-                    &mut rhs_slots[0],
-                    &mut scratch_slots[0],
-                    time_seconds,
-                )
-            }
+            EvaluationRequest::Full => self.compute_step_observables_soa_full(
+                magnetization,
+                ws,
+                h_eff,
+                rhs_out,
+                h_scratch,
+                time_seconds,
+            ),
         }
     }
 
@@ -3555,10 +4174,13 @@ impl ExchangeLlgProblem {
             (0.0, 0.0)
         };
 
-        let external_energy_joules = if self.has_external_zeeman_source() {
+        let external_energy_joules = if self.has_external_zeeman_source()
+            || self.regional_field_drives.iter().any(|drive| drive.enabled)
+        {
             h_scratch.fill_zero();
             self.external_field_add_into_soa(h_scratch);
-            self.oersted_field_add_into_soa(h_scratch);
+            self.oersted_field_add_into_soa_at_time(h_scratch, time_seconds);
+            self.regional_field_drives_add_into_soa_at_time(h_scratch, time_seconds);
             let energy = self.full_field_energy_from_soa(magnetization, h_scratch);
             add_soa_into(h_eff, h_scratch);
             energy
@@ -3571,7 +4193,6 @@ impl ExchangeLlgProblem {
         self.interfacial_dmi_field_add_into_soa(magnetization, h_eff);
         self.bulk_dmi_field_add_into_soa(magnetization, h_eff);
         self.thermal_field_add_into_soa(h_eff);
-        self.oersted_field_add_into_soa_at_time(h_eff, time_seconds);
 
         let mel_energy_joules = self.magnetoelastic_energy_soa(magnetization);
         let ani_energy_joules = self.anisotropy_energy_from_soa(magnetization);
@@ -3640,6 +4261,15 @@ impl ExchangeLlgProblem {
     // -----------------------------------------------------------------------
     // Error norm from buffer-indexed k-stages
     // -----------------------------------------------------------------------
+    #[inline]
+    fn is_error_cell_active(&self, index: usize) -> bool {
+        self.is_active(index)
+            && !self
+                .frozen_spins
+                .as_ref()
+                .is_some_and(|frozen| frozen.is_frozen(index))
+    }
+
     pub(crate) fn max_error_norm_buf(
         &self,
         weighted_stages: &[(usize, f64)],
@@ -3657,6 +4287,9 @@ impl ExchangeLlgProblem {
         let rtol = cfg.rtol;
 
         let compute_err = |i: usize| -> f64 {
+            if !self.is_error_cell_active(i) {
+                return 0.0;
+            }
             let mut err = [0.0, 0.0, 0.0];
             for &(k_idx, w) in weighted_stages {
                 err[0] += w * bufs.k[k_idx][i][0];
@@ -3713,6 +4346,9 @@ impl ExchangeLlgProblem {
         let rtol = cfg.rtol;
 
         let compute_err = |i: usize| -> f64 {
+            if !self.is_error_cell_active(i) {
+                return 0.0;
+            }
             let mut err = [0.0, 0.0, 0.0];
             for &(k_idx, w) in weighted_stages {
                 err[0] += w * bufs.soa.k[k_idx].x[i];

@@ -3,6 +3,9 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
+from fullmag.runtime.loader import load_problem_from_script
 
 ROOT = Path(__file__).resolve().parents[3]
 EXAMPLE = ROOT / "examples" / "permalloy_layer_bimeron_prism_single_layer_relax_300nm.py"
@@ -47,6 +50,7 @@ def test_bimeron_example_contains_only_one_centered_layer_and_one_prism_layer() 
     mesh_keywords = {keyword.arg: keyword.value for keyword in thin_film.keywords if keyword.arg}
     assert ast.unparse(mesh_keywords["maximum_element_size"]) == "20 * NM"
     assert ast.unparse(mesh_keywords["minimum_element_size"]) == "1.6 * NM"
+    assert ast.unparse(mesh_keywords["interface_maximum_element_size"]) == "10 * NM"
     assert ast.literal_eval(mesh_keywords["layers"]) == 1
     assert ast.literal_eval(mesh_keywords["topology"]) == "prismatic"
     assert ast.literal_eval(mesh_keywords["exact_layers"]) is True
@@ -70,6 +74,15 @@ def test_bimeron_minimization_uses_accepted_step_table_autosave() -> None:
     )
 
 
+def test_bimeron_example_uses_default_exchange_and_configured_demag() -> None:
+    tree = ast.parse(EXAMPLE.read_text(encoding="utf-8"), filename=str(EXAMPLE))
+
+    assert not _calls(tree, "exchange")
+    assert not _calls(tree, "disable_exchange")
+    assert not _calls(tree, "disable_demag")
+    assert len(_calls(tree, "demag")) == 1
+
+
 def test_bimeron_example_uses_the_qualified_shared_domain_mesh_route() -> None:
     tree = ast.parse(EXAMPLE.read_text(encoding="utf-8"), filename=str(EXAMPLE))
 
@@ -85,3 +98,14 @@ def test_bimeron_example_uses_the_qualified_shared_domain_mesh_route() -> None:
     assert isinstance(keywords["optimize"], ast.Constant)
     assert keywords["optimize"].value is None
     assert ast.literal_eval(keywords["optimize_iterations"]) == 0
+
+
+def test_bimeron_example_accepts_uniform_uniaxial_mixed_p1_before_geometry_assets() -> None:
+    loaded = load_problem_from_script(EXAMPLE, lightweight_assets=True)
+    problem_ir = loaded.problem.to_ir(include_geometry_assets=False)
+
+    term_kinds = [term["kind"] for term in problem_ir["energy_terms"]]
+    assert "exchange" in term_kinds
+    assert "demag" in term_kinds
+    assert problem_ir["materials"][0]["uniaxial_anisotropy"] == pytest.approx(1.0e5)
+    assert problem_ir["materials"][0]["anisotropy_axis"] == [0.0, 0.0, 1.0]

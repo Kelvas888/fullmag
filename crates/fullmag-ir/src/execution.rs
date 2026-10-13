@@ -34,6 +34,62 @@ pub enum ExecutionPrecision {
     Double,
 }
 
+/// Fully resolved numeric policy for the production CUDA FDM lane.
+///
+/// The public execution precision selects one of the two supported policies;
+/// arbitrary mixed-precision combinations are intentionally not representable
+/// until they have an independent qualification contract.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdmPrecisionPolicyIR {
+    pub storage: ExecutionPrecision,
+    pub compute: ExecutionPrecision,
+    pub fft: ExecutionPrecision,
+    pub reduction: ExecutionPrecision,
+    pub realization_id: String,
+}
+
+impl FdmPrecisionPolicyIR {
+    pub const FULL_DOUBLE_REALIZATION_ID: &'static str =
+        "fullmag.fdm.cuda.precision.full_double.v1";
+    pub const SINGLE_STORAGE_FP64_REDUCTION_REALIZATION_ID: &'static str =
+        "fullmag.fdm.cuda.precision.single_storage_fp64_reduction.v1";
+
+    pub fn resolve(requested: ExecutionPrecision) -> Self {
+        match requested {
+            ExecutionPrecision::Single => Self {
+                storage: ExecutionPrecision::Single,
+                compute: ExecutionPrecision::Single,
+                fft: ExecutionPrecision::Single,
+                reduction: ExecutionPrecision::Double,
+                realization_id: Self::SINGLE_STORAGE_FP64_REDUCTION_REALIZATION_ID.to_string(),
+            },
+            ExecutionPrecision::Double => Self::default(),
+        }
+    }
+
+    pub fn validate_for(&self, requested: ExecutionPrecision) -> Result<(), String> {
+        let expected = Self::resolve(requested);
+        if self != &expected {
+            return Err(format!(
+                "fdm_precision_policy_mismatch: requested={requested:?} resolved={self:?} expected={expected:?}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for FdmPrecisionPolicyIR {
+    fn default() -> Self {
+        Self {
+            storage: ExecutionPrecision::Double,
+            compute: ExecutionPrecision::Double,
+            fft: ExecutionPrecision::Double,
+            reduction: ExecutionPrecision::Double,
+            realization_id: Self::FULL_DOUBLE_REALIZATION_ID.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionDevice {
@@ -52,6 +108,35 @@ pub enum IntegratorChoice {
     Rk23,
     Rk45,
     Abm3,
+}
+
+/// FDM projected-RK state constraint policy.
+///
+/// The policy is carried in the resolved plan so that the CPU/GPU realizations
+/// cannot silently disagree about whether intermediate RK states are
+/// normalized.  `unit_sphere` is currently the only qualified realization.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum FdmProjectionPolicyIR {
+    #[default]
+    UnitSphere,
+}
+
+impl FdmProjectionPolicyIR {
+    pub const UNIT_SPHERE_REALIZATION_VERSION: &'static str =
+        "fullmag.fdm.rk_projection.unit_sphere.v1";
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnitSphere => "unit_sphere",
+        }
+    }
+
+    pub const fn realization_version(self) -> &'static str {
+        match self {
+            Self::UnitSphere => Self::UNIT_SPHERE_REALIZATION_VERSION,
+        }
+    }
 }
 
 // ── Relaxation algorithm ──────────────────────────────────────────────────────
@@ -311,11 +396,24 @@ impl FdmPeriodicityIR {
             ExecutionPrecision::Single => 4_u64,
             ExecutionPrecision::Double => 8_u64,
         };
-        // Six complex kernel spectra plus six complex work buffers.
-        let estimated_bytes = padded_cells
+        // Three real-domain buffers plus six half-spectrum kernels and six
+        // half-spectrum work buffers.
+        let spectral_x = padded_counts[0] / 2 + 1;
+        let spectral_cells = spectral_x
+            .checked_mul(padded_counts[1])
+            .and_then(|value| value.checked_mul(padded_counts[2]))
+            .ok_or_else(|| "FDM half-spectrum cell count overflow".to_string())?;
+        let real_buffer_bytes = padded_cells
+            .checked_mul(3)
+            .and_then(|value| value.checked_mul(bytes_per_value))
+            .ok_or_else(|| "FDM real workspace byte estimate overflow".to_string())?;
+        let spectral_buffer_bytes = spectral_cells
             .checked_mul(12)
             .and_then(|value| value.checked_mul(2))
             .and_then(|value| value.checked_mul(bytes_per_value))
+            .ok_or_else(|| "FDM spectral workspace byte estimate overflow".to_string())?;
+        let estimated_bytes = real_buffer_bytes
+            .checked_add(spectral_buffer_bytes)
             .ok_or_else(|| "FDM periodic workspace byte estimate overflow".to_string())?;
         const MAX_PERIODIC_WORKSPACE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
         if estimated_bytes > MAX_PERIODIC_WORKSPACE_BYTES {
@@ -562,7 +660,10 @@ mod tests {
         assert_eq!(resolved.resolved_image_counts, [0, 0, 0]);
         assert_eq!(resolved.padded_counts, [64, 32, 8]);
         assert_eq!(resolved.image_terms, 1);
-        assert_eq!(resolved.estimated_bytes, 64 * 32 * 8 * 12 * 2 * 8);
+        assert_eq!(
+            resolved.estimated_bytes,
+            64 * 32 * 8 * 3 * 8 + (64 / 2 + 1) * 32 * 8 * 12 * 2 * 8
+        );
         assert_eq!(resolved.kernel, "newell_truncated_images_fft");
     }
 
@@ -577,7 +678,10 @@ mod tests {
             .expect("periodic truncated-images policy should resolve");
         assert_eq!(resolved.padded_counts, [4, 6, 4]);
         assert_eq!(resolved.image_terms, 3);
-        assert_eq!(resolved.estimated_bytes, 4 * 6 * 4 * 12 * 2 * 4);
+        assert_eq!(
+            resolved.estimated_bytes,
+            4 * 6 * 4 * 3 * 4 + (4 / 2 + 1) * 6 * 4 * 12 * 2 * 4
+        );
     }
 
     #[test]

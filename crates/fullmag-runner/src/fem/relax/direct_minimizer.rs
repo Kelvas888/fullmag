@@ -86,6 +86,8 @@ pub(crate) fn execute_direct_minimizer(
                         let request = display_selection.preview_request();
                         preview_handoff.request_preview(
                             backend,
+                            engine,
+                            plan,
                             &request,
                             node_count,
                             current_stats.step,
@@ -177,6 +179,7 @@ pub(crate) fn execute_direct_minimizer(
                         hysteresis_settle_step_kind: None,
                         hysteresis_settle_step_method: None,
                         scalar_row_due: preview_due && preview_targets_global_scalar,
+                        terminal_field_snapshot: false,
                         finished: false,
                     });
                     if preview_due {
@@ -238,15 +241,28 @@ pub(crate) fn execute_direct_minimizer(
         let artifact_metrics = artifacts.record_scalar(&accepted_stats)?;
         apply_artifact_enqueue_metrics(&mut accepted_stats, artifact_metrics);
         for name in artifacts.due_accepted_step_fields(accepted_stats.step, false) {
-            let snapshot = backend.begin_field_snapshot(
-                &name,
-                accepted_stats.step,
-                accepted_stats.time,
-                accepted_stats.dt,
-            )?;
-            let artifact_metrics = artifacts.record_native_fem_field_snapshot(snapshot)?;
+            let artifact_metrics = if engine == FemEngine::CpuNative
+                && super::snapshots::is_antenna_field_snapshot(&name)
+            {
+                artifacts.record_field_snapshot(super::snapshots::build_antenna_field_snapshot(
+                    plan,
+                    &name,
+                    accepted_stats.step,
+                    accepted_stats.time,
+                    accepted_stats.dt,
+                )?)?
+            } else {
+                let snapshot = backend.begin_field_snapshot(
+                    &name,
+                    accepted_stats.step,
+                    accepted_stats.time,
+                    accepted_stats.dt,
+                )?;
+                artifacts.record_native_fem_field_snapshot(snapshot)?
+            };
             apply_artifact_enqueue_metrics(&mut accepted_stats, artifact_metrics);
         }
+        artifacts.record_solver_step(&accepted_stats);
         steps.push(accepted_stats.clone());
         latest_stats = Some(accepted_stats.clone());
         current_stats = accepted_stats;
@@ -294,6 +310,8 @@ pub(crate) fn execute_direct_minimizer(
                 let request = selection.preview_request();
                 preview_handoff.request_preview(
                     backend,
+                    engine,
+                    plan,
                     &request,
                     node_count,
                     current_stats.step,
@@ -374,6 +392,7 @@ pub(crate) fn execute_direct_minimizer(
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: preview_due && preview_targets_global_scalar,
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {

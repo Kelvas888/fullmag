@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace fullmag::fem {
 
@@ -41,25 +42,93 @@ void debug_checkpoint(const char *stage)
     std::fflush(stderr);
 }
 
+class PoissonSetupAttempt final {
+public:
+    explicit PoissonSetupAttempt(Context &ctx) : ctx_(ctx) {}
+
+    ~PoissonSetupAttempt()
+    {
+        if (!committed_) {
+            ++ctx_.poisson_demag.operator_lifecycle.failed_setup_count;
+        }
+    }
+
+    void commit() noexcept { committed_ = true; }
+
+private:
+    Context &ctx_;
+    bool committed_ = false;
+};
+
+bool poisson_resources_present(const Context &ctx)
+{
+    const auto &poisson = ctx.poisson_demag;
+    return poisson.ready ||
+        poisson.potential_fec != nullptr ||
+        poisson.potential_fes != nullptr ||
+        poisson.gf_potential != nullptr ||
+        poisson.poisson_bilinear != nullptr ||
+        poisson.poisson_bc_op != nullptr ||
+        poisson.rhs_workspace != nullptr ||
+        poisson.solution_vec != nullptr ||
+        poisson.recovery_workspace != nullptr ||
+        poisson.periodic_workspace != nullptr ||
+        poisson.hypre_workspace != nullptr ||
+        poisson.gpu_workspace != nullptr;
+}
+
 } // namespace
 
 bool context_initialize_poisson(Context &ctx, std::string &error)
 {
+    const bool had_previous_resources = poisson_resources_present(ctx);
+    const auto previous_solver_kind = ctx.demag.solver.solver;
+    const auto previous_preconditioner_kind = ctx.demag.solver.preconditioner;
+    PoissonDemagRuntimeState previous_poisson;
+    if (had_previous_resources) {
+        previous_poisson = std::move(ctx.poisson_demag);
+        ctx.poisson_demag = {};
+        ctx.poisson_demag.boundary_marker = previous_poisson.boundary_marker;
+        ctx.poisson_demag.robin_beta_mode = previous_poisson.robin_beta_mode;
+        ctx.poisson_demag.robin_beta_factor = previous_poisson.robin_beta_factor;
+        ctx.poisson_demag.gpu_demag_mode = previous_poisson.gpu_demag_mode;
+    }
+    PoissonSetupAttempt setup_attempt(ctx);
+    const auto rollback_setup = [&]() {
+        context_destroy_poisson(ctx);
+        if (had_previous_resources) {
+            ctx.poisson_demag = std::move(previous_poisson);
+        }
+    };
     try {
         debug_checkpoint("context_initialize_poisson:enter");
         auto *mesh = static_cast<mfem::Mesh *>(ctx.mfem_context.mesh);
         if (mesh == nullptr) {
             error = "MFEM mesh is null — cannot initialize Poisson demag";
+            rollback_setup();
             return false;
         }
 
-        // The micromagnetic state remains nodal P1.  Open-boundary Poisson
-        // demag uses an independent quadratic scalar-potential space so edge
-        // DOFs can resolve the thin-film surface charge.  The legacy static
-        // periodic reduction is node-class based and therefore remains P1
-        // until periodic P2 equivalence classes are implemented explicitly.
+        // The micromagnetic state remains nodal P1.  On meshes made only from
+        // MFEM elements with quadratic H1 support, open-boundary Poisson demag
+        // uses an independent quadratic scalar-potential space so edge DOFs
+        // can resolve the thin-film surface charge.  MFEM's H1 pyramid basis
+        // currently aborts for order > 1, however.  Mixed prism/pyramid/tet
+        // meshes therefore resolve to the compatible P1 potential space; this
+        // is an explicit topology policy, not a silent downgrade.  The legacy
+        // static periodic reduction is node-class based and remains P1 until
+        // periodic P2 equivalence classes are implemented explicitly.
+        bool has_pyramid = false;
+        for (int element = 0; element < mesh->GetNE(); ++element) {
+            if (mesh->GetElementBaseGeometry(element) == mfem::Geometry::PYRAMID) {
+                has_pyramid = true;
+                break;
+            }
+        }
+        const bool periodic_reduction =
+            demag_periodic_poisson_reduction_requested(ctx);
         const int potential_order =
-            demag_periodic_poisson_reduction_requested(ctx) ? 1 : 2;
+            periodic_reduction || has_pyramid ? 1 : 2;
         auto *potential_fec = new mfem::H1_FECollection(
             potential_order,
             mesh->Dimension());
@@ -89,17 +158,17 @@ bool context_initialize_poisson(Context &ctx, std::string &error)
                 *potential_fes,
                 *poisson_bilinear,
                 error)) {
-            context_destroy_poisson(ctx);
+            rollback_setup();
             return false;
         }
 
         if (!initialize_demag_periodic_poisson_reduction(ctx, error)) {
-            context_destroy_poisson(ctx);
+            rollback_setup();
             return false;
         }
 
         if (!initialize_demag_poisson_rhs_workspace(ctx, *potential_fes, error)) {
-            context_destroy_poisson(ctx);
+            rollback_setup();
             return false;
         }
         ctx.poisson_demag.solution_vec =
@@ -112,7 +181,26 @@ bool context_initialize_poisson(Context &ctx, std::string &error)
             return false;
         }
 
+        ctx.poisson_demag.operator_lifecycle.active_key =
+            make_poisson_operator_dependency_key(ctx, *mesh, use_device);
+        ctx.poisson_demag.operator_lifecycle.setup_count += 1u;
+        ctx.poisson_demag.operator_lifecycle.setup_complete = true;
         ctx.poisson_demag.ready = true;
+        setup_attempt.commit();
+        if (had_previous_resources) {
+            PoissonDemagRuntimeState committed_poisson =
+                std::move(ctx.poisson_demag);
+            const auto requested_solver_kind = ctx.demag.solver.solver;
+            const auto requested_preconditioner_kind =
+                ctx.demag.solver.preconditioner;
+            ctx.poisson_demag = std::move(previous_poisson);
+            ctx.demag.solver.solver = previous_solver_kind;
+            ctx.demag.solver.preconditioner = previous_preconditioner_kind;
+            context_destroy_poisson(ctx);
+            ctx.demag.solver.solver = requested_solver_kind;
+            ctx.demag.solver.preconditioner = requested_preconditioner_kind;
+            ctx.poisson_demag = std::move(committed_poisson);
+        }
         debug_checkpoint("context_initialize_poisson:done");
         return true;
     } catch (const std::exception &ex) {
@@ -120,7 +208,7 @@ bool context_initialize_poisson(Context &ctx, std::string &error)
     } catch (...) {
         error = "Poisson demag initialization failed with an unknown error";
     }
-    context_destroy_poisson(ctx);
+    rollback_setup();
     return false;
 }
 
@@ -152,6 +240,7 @@ void context_destroy_poisson(Context &ctx)
     ctx.poisson_demag.last_recovered_field_energy_joules = 0.0;
     ctx.poisson_demag.ess_tdof_list.clear();
     ctx.poisson_demag.ready = false;
+    ctx.poisson_demag.operator_lifecycle = {};
 }
 #endif
 

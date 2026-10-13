@@ -391,9 +391,13 @@ void validation_matrix_documents_scope_and_runtime_boundary() {
             matrix.find("## Runtime Artifact Acceptance Commands") != std::string::npos &&
             matrix.find("## Environment Boundary") != std::string::npos,
         "validation matrix must separate local gates, required physics fixtures, runtime artifact commands, and environment boundary");
-    check(
+    const bool runtime_open_boundary =
         matrix.find("Rows marked runtime-open\nhave scripted gates or artifact validators") !=
-            std::string::npos,
+            std::string::npos ||
+        matrix.find("Rows marked runtime-open\r\nhave scripted gates or artifact validators") !=
+            std::string::npos;
+    check(
+        runtime_open_boundary,
         "validation matrix must keep runtime-open execution separate from local contracts");
 }
 
@@ -498,8 +502,9 @@ void progress_report_summary_matches_contract_closed_scope() {
             std::string::npos,
         "progress report introduction must describe the current contract-closed modularization scope");
     check(
-        progress.find("produkcyjna kwalifikacja runtime MFEM/libCEED i fixture numeryczne pozostaja osobnymi gate'ami") !=
-            std::string::npos,
+        progress.find("Produkcyjna") != std::string::npos &&
+            progress.find("kwalifikacja runtime MFEM/libCEED i fixture numeryczne pozostaja osobnymi") !=
+                std::string::npos,
         "progress report introduction must keep production runtime qualification separate");
     check(
         progress.find("pierwszy maly wycinek") == std::string::npos &&

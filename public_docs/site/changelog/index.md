@@ -11,8 +11,18 @@ orphan: true
 (public-docs-documentation-changelog)=
 # Documentation changelog
 
+The **Last changes** date above refers to this page’s own source file. The **Latest documentation change** below is generated from the current repository history each time the site is published.
+
 ```{versionadded} development
 This public page and the accompanying Sphinx version-change index were added to make documentation evolution directly inspectable.
+```
+
+```{versionchanged} development
+The changelog now exposes separate Documentation and GitHub / code tabs, each with its own latest-change timestamp and history. The version-change report is published at the directory entry point and retains the full generated report at `changes.html`.
+```
+
+```{versionchanged} development
+The 5 October 2026 documentation update corrected the getting-started, Control Room, installation, and architecture guides against the current implementation. The Documentation tab links the exact commit and changed pages.
 ```
 
 FullMag exposes two complementary change records:
@@ -28,14 +38,16 @@ The Git-backed list answers “what changed in the documentation and when?”. T
 release notes for solver binaries or scientific qualification receipts.
 
 <div class="fm-changelog-page-links">
-  <a class="fm-changelog-page-link" href="../version-changes/index.html">Open Sphinx version-change index</a>
-  <a class="fm-changelog-page-link" href="https://github.com/MateuszZelent/fullmag/commits/master/public_docs/site">Open complete documentation history on GitHub</a>
+  <a class="fm-changelog-page-link" href="../version-changes/index.html">Open Sphinx version-change report</a>
 </div>
 
-## Recent documentation changes
+## Two change histories
 
-```{documentation-changelog}
-:limit: 80
+The tabs use separate Git scopes. **Documentation** covers commits that change the public Sphinx source and its documentation contract. **GitHub / code** covers the remaining repository code history and links every entry to its commit on GitHub.
+
+```{documentation-changelog-tabs}
+:documentation-limit: 80
+:code-limit: 40
 :show-paths:
 ```
 
@@ -65,3 +77,11 @@ The documentation workflow builds the native Sphinx `changes` builder after the 
 and publishes its output under `/version-changes/`. A documentation change is therefore visible
 both through Git history and, when it affects a public contract, through an explicit semantic
 change directive.
+
+## Bibliography
+
+No independent scientific model is introduced by this navigation page. Use the bibliography on the selected terminal page; this statement is an explicit applicability boundary, not an omitted reference.
+
+## Source-code index
+
+This is a navigation page and introduces no standalone implementation symbol. The exact source-code index is maintained by the selected terminal page.

@@ -3,6 +3,7 @@ target/
 dist/
 build/
 native/build*/
+apps/desktop/src-tauri/gen/
 *.o
 *.so
 *.a
@@ -16,6 +17,8 @@ native/build*/
 !.github/**/*.md
 *.zip
 *.patch
+*.orig
+*.rej
 *.tar.gz
 *.egg-info/
 *.egg
@@ -26,7 +29,22 @@ native/build*/
 # === Node / pnpm ===
 node_modules/
 .pnpm-store/
+# The root workspace is pnpm-owned; npm lockfiles belong only to nested
+# projects that explicitly declare npm as their package manager.
+/package-lock.json
 .next/
+.fullmag-frontend/
+# Managed compatibility links are files to Git on Linux; slash-only directory
+# patterns do not ignore them. Their targets live in external project storage.
+/.fullmag
+/target
+/node_modules
+/apps/control-room/node_modules
+/apps/control-room/.fullmag-frontend
+/apps/control-room/out
+/apps/control-room/.artifacts
+/apps/control-room/storybook-static
+/apps/control-room/public/docs/
 storybook-static/
 out/
 *.tsbuildinfo
@@ -67,14 +85,22 @@ Thumbs.db
 
 # === Logs ===
 *.log
+!docs/plans/**/reproductions/*.log
 
 # === Data & artifacts ===
 artifacts/
+!crates/fullmag-runner/src/eigen/artifacts/
+!crates/fullmag-runner/src/eigen/artifacts/*.rs
 *.zarr/
 # data/
 tmp/
 coverage/
 .fullmag/
+# Windows Docker build/cache mounts are external state, never source files.
+.fullmag-build/
+.fullmag-cache/
+.fullmag-cargo/
+.fullmag-rustup/
 docs/raports/
 docs/reports/*
 !docs/reports/fullmag_native_fem_magnetoelastic_frequency_audit.md
@@ -101,11 +127,15 @@ apps/control-room/target-host/*
 target_agent/*
 target_tmp/debug/*
 target_host/*
+targets/
 apps/control-room/.next-audit/*
 
 # === Agent worktrees ===
 .worktrees/
 worktrees/
+
+# Canonical Windows project storage (the main checkout owns its worktrees).
+/storage/
 
 public_docs/_build/
 tests/vlad/
@@ -115,6 +145,8 @@ public_docs/site/
 .worktrees_old/
 
 # Local Windows build/cache outputs; keep these outside the repository.
+/.impl-racetrack/
+/Codex-Usage/
 /build-contract-wave2/
 /build-target-*/
 /build-volumes/
@@ -130,3 +162,12 @@ cargo-targets/
 pnpm-store/
 playwright-browsers/
 *.diff
+/patch.tmp
+antenna-implementation-target/
+storage/
+task-storage/
+.rotated-review/
+.target*
+.tmp*
+.codex*
+target-tracking-fix/

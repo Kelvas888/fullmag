@@ -10,6 +10,13 @@ import {
   statusRefreshIntervalMs,
 } from "../realtime/communicationPolicy";
 
+import { useSimulationPreparationSessionScope } from "./useSessionStatus";
+import { sessionScopedResourceKey } from "./sessionResourceIdentity";
+import {
+  preparationMinimumRevision,
+  preparationPublicationState,
+  preparationRetryKey,
+} from "./simulationPreparationPublication";
 import { useResource } from "./useResource";
 
 function resolvePreparationRevision(data: SimulationPreparationResource) {
@@ -24,61 +31,95 @@ export function useSimulationPreparation({
   requiredRevision?: number | null;
 } = {}) {
   const { api, resources } = useKernel();
+  const { sessionIdentity, preparationRevision } = useSimulationPreparationSessionScope();
+  const resourceKey = sessionIdentity
+    ? sessionScopedResourceKey(sessionIdentity, SIMULATION_PREPARATION_PATH)
+    : SIMULATION_PREPARATION_PATH;
+  const publication = preparationPublicationState(preparationRevision, requiredRevision);
+  const minimumRevision = preparationMinimumRevision(preparationRevision, requiredRevision);
+  const effectiveEnabled = enabled && sessionIdentity !== null && publication !== "absent";
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.simulation.preparation({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.simulation.preparation({ sessionScopeKey, signal }),
     [api],
   );
 
   const preparation = useResource<SimulationPreparationResource>({
-    enabled,
+    enabled: effectiveEnabled,
+    pauseLoad: publication === "unknown",
     load,
     minRefetchIntervalMs: statusRefreshIntervalMs(),
     resolveRevision: resolvePreparationRevision,
-    resourceKey: SIMULATION_PREPARATION_PATH,
+    resourceKey,
   });
-  const retriedRequiredRevision = useRef<number | null>(null);
+  const retriedPublication = useRef<string | null>(null);
+  const refreshedPublication = useRef<string | null>(null);
+  const retryKey = preparationRetryKey(resourceKey, minimumRevision);
+  const requestRefetch = preparation.refetch;
+  const refetch = useCallback(() => {
+    if (!effectiveEnabled || publication !== "published") return;
+    requestRefetch();
+  }, [effectiveEnabled, publication, requestRefetch]);
 
   useEffect(() => {
-    if (!enabled || requiredRevision === null || requiredRevision <= 0) return;
-    if ((preparation.data?.revision ?? 0) >= requiredRevision) return;
-    const currentRevision = resources.getRevision(SIMULATION_PREPARATION_PATH);
+    if (!effectiveEnabled || minimumRevision === null) return;
+    if ((preparation.data?.revision ?? 0) >= minimumRevision) return;
+    const currentRevision = resources.getRevision(resourceKey);
     if (
-      currentRevision === requiredRevision ||
-      (typeof currentRevision === "number" && currentRevision > requiredRevision)
+      currentRevision === minimumRevision ||
+      (typeof currentRevision === "number" && currentRevision > minimumRevision)
     ) {
+      // A transport revision is not proof that the loaded preparation meets the minimum.
+      if (preparation.status === "ready" && refreshedPublication.current !== retryKey) {
+        refreshedPublication.current = retryKey;
+        refetch();
+      }
       return;
     }
-    resources.invalidate(SIMULATION_PREPARATION_PATH, requiredRevision);
-  }, [enabled, preparation.data?.revision, requiredRevision, resources]);
+    resources.invalidate(resourceKey, minimumRevision);
+  }, [
+    effectiveEnabled,
+    preparation.data?.revision,
+    preparation.status,
+    minimumRevision,
+    refetch,
+    retryKey,
+    resourceKey,
+    resources,
+  ]);
 
   useEffect(() => {
     const loadedRevision = preparation.data?.revision ?? 0;
     if (
-      !enabled ||
-      requiredRevision === null ||
-      requiredRevision <= 0 ||
-      loadedRevision >= requiredRevision ||
+      !effectiveEnabled ||
+      publication !== "published" ||
+      minimumRevision === null ||
+      retryKey === null ||
+      loadedRevision >= minimumRevision ||
       preparation.status !== "error" ||
       !isTransientPreparationLoadError(preparation.error) ||
-      retriedRequiredRevision.current === requiredRevision
+      retriedPublication.current === retryKey
     ) {
       return;
     }
 
-    retriedRequiredRevision.current = requiredRevision;
-    const timeoutId = setTimeout(preparation.refetch, errorRetryDelayMs());
+    const timeoutId = setTimeout(() => {
+      retriedPublication.current = retryKey;
+      refetch();
+    }, errorRetryDelayMs());
     return () => clearTimeout(timeoutId);
   }, [
-    enabled,
+    effectiveEnabled,
     preparation.data?.revision,
     preparation.error,
-    preparation.refetch,
     preparation.status,
-    requiredRevision,
+    publication,
+    minimumRevision,
+    refetch,
+    retryKey,
   ]);
 
-  return preparation;
+  return { ...preparation, refetch };
 }
 
 function isTransientPreparationLoadError(error: Error | null): boolean {

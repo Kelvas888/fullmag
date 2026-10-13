@@ -852,6 +852,7 @@ pub(crate) fn run_planned_hysteresis_with_live_preview(
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: true,
+                terminal_field_snapshot: false,
                 finished: point_idx == sweep_values_mT.len() - 1,
             });
         }
@@ -3273,6 +3274,7 @@ fn hysteresis_progress_update(
         hysteresis_settle_step_kind: Some(hysteresis_settle_step_kind(step).to_string()),
         hysteresis_settle_step_method: Some(hysteresis_settle_step_method(step).to_string()),
         scalar_row_due: false,
+        terminal_field_snapshot: false,
         finished: false,
     }
 }
@@ -5895,6 +5897,7 @@ mod tests {
                 boundary_correction: None,
                 boundary_phi_floor: None,
                 boundary_delta_min: None,
+                projection_policy: None,
             }),
             fem: None,
             hybrid: None,
@@ -5971,6 +5974,8 @@ mod tests {
             beta: 0.05,
             lande_g: Some(2.0),
         }];
+        let torque_payload = serde_json::to_value(&problem.spin_torque_modules[0])
+            .expect("serialize canonical torque payload");
         problem.physics_graph = Some(serde_json::json!({
             "schema_version": "physics_graph.v1",
             "scene_revision": 49,
@@ -5984,7 +5989,7 @@ mod tests {
                 "authored_state": "authored",
                 "capability": "reference_executable",
                 "source_path": "/spin_torque_modules/0",
-                "family_payload": {"kind": "zhang_li"}
+                "family_payload": torque_payload
             }],
             "edges": []
         }));
@@ -6032,6 +6037,8 @@ mod tests {
         } else {
             panic!("exact hysteresis fixture must have a settle sequence")
         }
+        let torque_payload = serde_json::to_value(&problem.spin_torque_modules[0])
+            .expect("serialize canonical torque payload");
         problem.physics_graph = Some(serde_json::json!({
             "schema_version": "physics_graph.v1",
             "scene_revision": 51,
@@ -6046,7 +6053,7 @@ mod tests {
                     "authored_state": "authored",
                     "capability": "reference_executable",
                     "source_path": "/spin_torque_modules/0",
-                    "family_payload": {"kind": "zhang_li"}
+                    "family_payload": torque_payload
                 },
                 {
                     "id": "drive:global",
@@ -6347,6 +6354,7 @@ mod tests {
             hysteresis_settle_step_kind: None,
             hysteresis_settle_step_method: None,
             scalar_row_due: false,
+            terminal_field_snapshot: false,
             finished: false,
         };
 
@@ -6539,10 +6547,12 @@ mod tests {
             enable_demag: false,
             external_field: None,
             antenna_zeeman_masks: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
             field_drives: Vec::new(),
             field_drive_geometry_masks: Vec::new(),
             time_stage: Default::default(),
             current_modules: Vec::new(),
+            charge_transport_plans: Vec::new(),
             spin_transport_plans: Vec::new(),
             gyromagnetic_ratio: 2.211e5,
             precision: fullmag_ir::ExecutionPrecision::Double,
@@ -6555,6 +6565,7 @@ mod tests {
             demag_realization: None,
             air_box_config: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             dmi_interface_normal: None,
             bulk_dmi: None,
             dind_field: None,

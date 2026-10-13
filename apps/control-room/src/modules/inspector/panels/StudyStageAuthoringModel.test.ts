@@ -220,6 +220,44 @@ describe("StudyStageAuthoringModel", () => {
     });
   });
 
+  it("serializes an ordered 15-point K0 bias-field sweep in canonical A/m", () => {
+    const draft = {
+      ...createDefaultStudyStageDraft("eigenmodes", 0),
+      biasFieldContinuationSeed: "initial_state",
+      biasFieldEquilibriumPolicy: "continuation",
+      biasFieldSamplesApm: Array.from(
+        { length: 15 },
+        (_, index) => `${40_000 + index * 1_000}, 0, 0`,
+      ).join("\n"),
+      bc: "periodic",
+      dampingPolicy: "ignore",
+      includeDemag: true,
+      kVector: "0, 0, 0",
+      magnetostaticBc: "periodic_airbox_k0",
+    };
+
+    const stage = studyStageDraftToSceneStage(draft);
+
+    expect(stage).toMatchObject({
+      bias_field_sweep: {
+        continuation_seed: "initial_state",
+        equilibrium_policy: "continuation",
+        ordering: "declared",
+      },
+      eigen_bias_field_sweep: {
+        continuation_seed: "initial_state",
+        equilibrium_policy: "continuation",
+        ordering: "declared",
+      },
+    });
+    expect(
+      (stage.bias_field_sweep as { samples_a_per_m: number[][] }).samples_a_per_m,
+    ).toHaveLength(15);
+    expect(
+      (stage.bias_field_sweep as { samples_a_per_m: number[][] }).samples_a_per_m[14],
+    ).toEqual([54_000, 0, 0]);
+  });
+
   it("serializes an add-field-drive instruction with the complete antenna payload", () => {
     const draft = createDefaultStudyStageDraft("add_field_drive", 1);
 
@@ -336,7 +374,7 @@ describe("StudyStageAuthoringModel", () => {
       entrypoint_kind: "flat_run",
       kind: "run",
       stage_id: "excite",
-      until_seconds: 2e-9,
+      until_seconds: "2e-9",
     });
   });
 
@@ -497,7 +535,7 @@ describe("StudyStageAuthoringModel", () => {
       entrypoint_kind: "flat_run",
       kind: "run",
       stage_id: "legacy-run",
-      until_seconds: 2e-9,
+      until_seconds: "2e-9",
     });
   });
 
@@ -560,10 +598,10 @@ describe("StudyStageAuthoringModel", () => {
       algorithm: "llg_overdamped",
       demag_interval_s: 2e-12,
       energy_tolerance_j: 1e-20,
-      fixed_timestep: 1e-13,
+      fixed_timestep: "1e-13",
       integrator: "rk45",
       max_relaxation_time_s: 4e-9,
-      max_steps: 50000,
+      max_steps: "50000",
       torque_tolerance_apm: 1e-4,
     });
 
@@ -578,7 +616,7 @@ describe("StudyStageAuthoringModel", () => {
     });
     expect(direct).toMatchObject({
       algorithm: "projected_gradient_bb",
-      max_steps: 50000,
+      max_steps: "50000",
       torque_tolerance_apm: 1e-4,
     });
     expect(direct).not.toHaveProperty("demag_interval_s");
@@ -850,6 +888,72 @@ describe("StudyStageAuthoringModel", () => {
       message:
         "llg_overdamped is not advertised by the active session capabilities.",
       severity: "error",
+    });
+  });
+
+  it("rejects unavailable K0 periodic-airbox prerequisites", () => {
+    const draft = {
+      ...createDefaultStudyStageDraft("eigenmodes", 0),
+      bc: "periodic", deviceTarget: "gpu", dampingPolicy: "ignore",
+      frequencyMax: "2e9", frequencyMin: "1e9", includeDemag: true,
+      kVector: "0,0,0", magnetostaticBc: "periodic_airbox_k0", target: "frequency_window",
+    };
+    const messages = validateStudyStageDraft(draft, {
+      acceptedEquilibriumReady: false, backend: "fem", device: "gpu", mode: "strict",
+      periodicCertificateReady: false, sharedDomainMeshReady: false, strictGpuReady: false,
+    }).map((issue) => issue.message);
+    expect(messages).toEqual(expect.arrayContaining([
+      "periodic_airbox_k0 requires a shared-domain mesh.",
+      "periodic_airbox_k0 requires a periodic certificate.",
+      "periodic_airbox_k0 requires an accepted equilibrium.",
+      "Strict GPU K0 modal demag prerequisites are unavailable.",
+    ]));
+  });
+
+  it("uses the requested global GPU intent for K0 strict readiness", () => {
+    const draft = {
+      ...createDefaultStudyStageDraft("eigenmodes", 0),
+      bc: "periodic",
+      dampingPolicy: "ignore",
+      frequencyMax: "2e9",
+      frequencyMin: "1e9",
+      includeDemag: true,
+      kVector: "0,0,0",
+      magnetostaticBc: "periodic_airbox_k0",
+      target: "frequency_window",
+    };
+
+    expect(
+      validateStudyStageDraft(draft, {
+        acceptedEquilibriumReady: true,
+        backend: "fem",
+        device: "gpu",
+        mode: "strict",
+        periodicCertificateReady: true,
+        sharedDomainMeshReady: true,
+        strictGpuReady: false,
+      }),
+    ).toContainEqual({
+      message: "Strict GPU K0 modal demag prerequisites are unavailable.",
+      severity: "error",
+    });
+  });
+
+  it("serializes the canonical K0 periodic-airbox demag intent for eigenmodes", () => {
+    const stage = studyStageDraftToSceneStage({
+      ...createDefaultStudyStageDraft("eigenmodes", 0),
+      bc: "periodic",
+      dampingPolicy: "ignore",
+      includeDemag: true,
+      kVector: "0,0,0",
+      magnetostaticBc: "periodic_airbox_k0",
+      stageId: "k0-modal",
+    });
+
+    expect(stage).toMatchObject({
+      eigen_magnetostatic_bc: "periodic_airbox_k0",
+      include_demag: true,
+      magnetostatic_bc: "periodic_airbox_k0",
     });
   });
 
@@ -1342,7 +1446,7 @@ describe("StudyStageAuthoringModel", () => {
               integrator: "rk45",
               kind: "relax",
               max_relaxation_time_s: 5e-9,
-              max_steps: 1000,
+              max_steps: "1000",
               relax_alpha: 0.7,
               stage_id: "relax-1",
               torque_tolerance_apm: 1e-6,
@@ -1386,7 +1490,7 @@ describe("StudyStageAuthoringModel", () => {
               entrypoint_kind: "flat_run",
               kind: "run",
               stage_id: "run-2",
-              until_seconds: 3e-9,
+              until_seconds: "3e-9",
             },
           ],
         },
@@ -1394,7 +1498,48 @@ describe("StudyStageAuthoringModel", () => {
     });
   });
 
-  it("serializes fixed relax dt as a numeric timestep", () => {
+  it.each(["1e-12", " 1e-12 ", "0.000000000001"])(
+    "saves Run duration %s as canonical scene text and round-trips it",
+    (untilSeconds) => {
+      const run = {
+        ...createDefaultStudyStageDraft("run", 0),
+        untilSeconds,
+      };
+      const stage = studyStageDraftToSceneStage(run);
+
+      expect(stage.until_seconds).toBe("1e-12");
+      expect(buildStudyStagesMergePatch([run], 6)).toMatchObject({
+        base_revision: 6,
+        merge_patch: {
+          study: { stages: [{ kind: "run", until_seconds: "1e-12" }] },
+        },
+      });
+      expect(createStudyStageDraft(stage, 0).untilSeconds).toBe("1e-12");
+    },
+  );
+
+  it.each(["", "0", "-1e-12", "Infinity", "NaN", "1e309"])(
+    "rejects invalid Run duration %s before saving scene text",
+    (untilSeconds) => {
+      expect(() =>
+        buildStudyStagesMergePatch([
+          { ...createDefaultStudyStageDraft("run", 0), untilSeconds },
+        ]),
+      ).toThrow("until_seconds must be a positive finite number.");
+    },
+  );
+
+  it("carries the scene revision when saving a newly authored Relax stage", () => {
+    const relax = createDefaultStudyStageDraft("relax", 0);
+
+    expect(buildStudyStagesMergePatch([relax], 17)).toMatchObject({
+      kind: "merge_patch",
+      base_revision: 17,
+      merge_patch: { study: { stages: [{ kind: "relax" }] } },
+    });
+  });
+
+  it("serializes fixed relax dt as canonical scene text", () => {
     expect(
       studyStageDraftToSceneStage({
         ...createDefaultStudyStageDraft("relax", 0),
@@ -1402,9 +1547,35 @@ describe("StudyStageAuthoringModel", () => {
         timestepMode: "fixed",
       }),
     ).toMatchObject({
-      fixed_timestep: 5e-15,
+      fixed_timestep: "5e-15",
     });
   });
+
+  it.each(["0", "-1", "1.5", "Infinity", "NaN"])(
+    "rejects invalid Relax max_steps %s before saving scene text",
+    (maxSteps) => {
+      expect(() =>
+        buildStudyStagesMergePatch([
+          { ...createDefaultStudyStageDraft("relax", 0), maxSteps },
+        ]),
+      ).toThrow("max_steps must be a positive integer.");
+    },
+  );
+
+  it.each(["0", "-1e-15", "Infinity", "NaN", "1e309"])(
+    "rejects invalid fixed Relax timestep %s before saving scene text",
+    (dt) => {
+      expect(() =>
+        buildStudyStagesMergePatch([
+          {
+            ...createDefaultStudyStageDraft("relax", 0),
+            dt,
+            timestepMode: "fixed",
+          },
+        ]),
+      ).toThrow("fixed_timestep must be a positive finite number.");
+    },
+  );
 
   it("serializes spectral authoring options with Python DSL vocabulary", () => {
     expect(
@@ -1492,6 +1663,7 @@ describe("StudyStageAuthoringModel", () => {
       eigen_include_demag: false,
       eigen_k_sampling: { points: 5 },
       eigen_k_vector: [0, 1, -1],
+      eigen_magnetostatic_bc: "open",
       eigen_normalization: "unit_max_amplitude",
       eigen_operator: "linearized_llg",
       eigen_spin_wave_bc: { axes: ["x"], kind: "periodic" },
@@ -1503,6 +1675,7 @@ describe("StudyStageAuthoringModel", () => {
       include_demag: false,
       k_sampling: { points: 5 },
       k_vector: [0, 1, -1],
+      magnetostatic_bc: "open",
       kind: "eigenmodes",
       normalization: "unit_max_amplitude",
       operator: "linearized_llg",

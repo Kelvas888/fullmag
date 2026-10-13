@@ -738,6 +738,9 @@ pub fn physics_graph_realization_provenance(
     }
     let executed = executed_module_ids.iter().collect::<BTreeSet<_>>();
     let (topology_fingerprint, realizations) = match backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            return Err(vec!["antenna inspection does not execute the magnetic physics-graph realization pipeline".into()]);
+        }
         BackendPlanIR::Fem(plan) => (
             plan.mesh.topology_fingerprint_v6(),
             realize_fem_modules(plan, &modules, &executed),
@@ -1387,6 +1390,7 @@ fn backend_lane(backend_plan: &BackendPlanIR) -> BackendTarget {
         BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => BackendTarget::Fdm,
         BackendPlanIR::Fem(_)
         | BackendPlanIR::FemEigen(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_)
         | BackendPlanIR::FemFrequencyResponse(_) => BackendTarget::Fem,
     }
 }
@@ -1403,6 +1407,10 @@ fn parse_backend_lane(value: &str) -> Result<BackendTarget, String> {
 
 fn mesh_revision(backend_plan: &BackendPlanIR) -> Result<u64, Vec<String>> {
     let value = match backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(plan) => serde_json::json!({
+            "backend": "antenna_external_lead_inspection",
+            "mesh": plan.input.combined_mesh,
+        }),
         BackendPlanIR::Fdm(plan) => serde_json::json!({
             "backend": "fdm",
             "origin_m": plan.origin_m,
@@ -1634,13 +1642,17 @@ mod tests {
             requested_common_cell_size: None,
             grid_certificate: Some(certificate),
             layers,
+            frozen_spins: None,
             enable_exchange: false,
             enable_demag: false,
+            fft: None,
             external_field: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             gyromagnetic_ratio: 1.0,
             precision: fullmag_ir::ExecutionPrecision::Double,
+            precision_policy: fullmag_ir::FdmPrecisionPolicyIR::default(),
             exchange_bc: fullmag_ir::ExchangeBoundaryCondition::Neumann,
             periodicity: None,
             resolved_periodic_images: None,

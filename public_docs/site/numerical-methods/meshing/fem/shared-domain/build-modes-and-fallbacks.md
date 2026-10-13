@@ -14,6 +14,132 @@ source_of_truth: "Asset-pipeline dispatch, meshing fallback tests, build report 
 (public-docs-numerical-methods-meshing-fem-shared-domain-build-modes-and-fallbacks)=
 # Shared-domain build modes and fallback semantics
 
+(build-modes-problem-statement)=
+## Problem statement
+
+The asset pipeline resolves one FEM object preview/source mesh. It is distinct from shared-domain topology realization and should not be used to infer an effective fallback policy.
+
+(build-modes-governing-equations)=
+## Governing equations
+
+```{math}
+:label: eq-build-target-contract
+
+h_{max}=h_{recipe}\succ h_{per\_geometry}\succ h_{default}\succ h_{FEM}.
+```
+
+(build-modes-symbols-and-si-units)=
+## Symbols and SI units
+
+| Token | Meaning | SI unit |
+| --- | --- | --- |
+| $h_{max}$ | effective preview element-size target | $\mathrm{m}$ |
+| $h_{recipe}$ | per-object recipe target | $\mathrm{m}$ |
+| $h_{FEM}$ | FEM hint target | $\mathrm{m}$ |
+
+(build-modes-assumptions-and-validity)=
+## Assumptions and validity
+
+The precedence relation is stated in the function docstring. It applies to the preview target of this function, not a proof of shared-domain fallback behavior.
+
+(build-modes-python-api)=
+## Python API
+
+### Complete public signature and IR matrix
+
+The following rows are the exhaustive public-signature contract for this page; each row mirrors one public_api.parameters entry in the source map.
+
+| Python | Type | Default | SI unit | Validation | Meaning | Backend support | ProblemIR |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| study.build_domain_mesh() | zero-argument method | n/a | $1$ | accepts no public arguments; capture marks the request without invoking Gmsh, ordinary execution reaches SDK-backed realization | shared-domain materialization request | FEM CPU/GPU capability-gated | runtime_metadata.mesh_workflow.default_mesh.build_requested |
+
+
+
+`realize_fem_mesh_asset(...)` is internal. Public scripts request shared-domain materialization with zero-argument `StudyBuilder.build_domain_mesh()`, which sets `build_requested` before the SDK-backed realization boundary.
+
+| Python | Type | Default | SI unit | Validation | Meaning | Backend support | ProblemIR |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `StudyBuilder.build_domain_mesh()` | no public arguments | n/a | $1$ | sets `build_requested`; capture stops before Gmsh and ordinary execution may require the Gmsh Python SDK | shared-domain build request | FEM CPU/GPU capability-gated | `runtime_metadata.mesh_workflow.default_mesh.build_requested` |
+
+```python
+# %%
+import fullmag as fm
+
+# %%
+nm = 1.0e-9
+study = fm.study("build_mode_contract")
+study.engine("fem")
+study.device("cpu", precision="double")
+study.mode("strict")
+study.universe(mode="manual", size=(240 * nm, 140 * nm, 100 * nm), center=(0.0, 0.0, 0.0), padding=(0.0, 0.0, 0.0))
+study.universe.mesh(maximum_element_size=30 * nm, minimum_element_size=5 * nm)
+film = study.geometry(fm.Box(size=(100 * nm, 50 * nm, 5 * nm), name="film"), name="film")
+film.mesh(maximum_element_size=8 * nm, minimum_element_size=4 * nm)
+film.Ms = 800.0e3
+film.Aex = 13.0e-12
+film.alpha = 0.02
+film.m = fm.texture.uniform(1.0, 0.0, 0.0)
+study.exchange()
+study.demag(realization="poisson_robin")
+try:
+    study.build_domain_mesh()
+except RuntimeError as exc:
+    if "Gmsh Python SDK is required for FEM meshing" not in str(exc):
+        raise
+    print(f"Mesh realization unavailable in this environment: {exc}")
+study.stages.add_relax(stage_id="equilibrium", dt=5.0e-13, max_steps=1)
+```
+
+(build-modes-problem-ir)=
+## ProblemIR
+
+Authoring lowers workflow metadata and policy; `target.hmax`, source choice and mesh data are resolved execution values. A loaded mesh or generated mesh is provenance that must be retained separately.
+
+(build-modes-round-trip-and-failure-semantics)=
+## Round-trip and failure semantics
+
+**Requested intent** is geometry plus hints/workflow. **Resolved execution** is the selected target and generated or loaded mesh. **Validation errors** include unsupported surface-only imported geometry and zero tetrahedral elements. **Unsupported combinations** reject with `ValueError`; this function does not silently create a solver-eligible mesh from a surface preview.
+
+(build-modes-discrete-realization)=
+## Discrete realization
+
+FEM CPU/GPU can consume a valid volume artifact subject to solver capability. FDM CPU/GPU are not applicable to this FEM asset pipeline.
+
+(build-modes-implementation-mapping)=
+## Implementation mapping
+
+`StudyBuilder.build_domain_mesh` owns the public request; `_build_problem` and `Problem.to_ir` lower requested workflow and assets; `realize_fem_mesh_asset` is object-preview realization, while `realize_fem_domain_mesh_asset_from_components_with_report` owns shared-domain build modes and `_build_shared_domain_build_report` owns requested/effective/fallback provenance. Planner/runtime are downstream and do not retroactively change authored intent.
+
+(build-modes-validation)=
+## Validation
+
+Require nonzero tetrahedral elements and inspect `target.source`; validate any reported fallback in its responsible shared-domain route. No GPU runtime execution is claimed.
+
+(build-modes-limitations)=
+## Limitations
+
+This function is not the universal build-mode planner and does not qualify a surface preview for solver use.
+
+(build-modes-scientific-bibliography)=
+## Scientific bibliography
+
+Geuzaine and Remacle, *IJNME* 79 (2009), [doi:10.1002/nme.2579](https://doi.org/10.1002/nme.2579).
+
+(build-modes-source-code-index)=
+## Contract source-code index
+
+| ID | Path | Symbol | Responsibility | Evidence |
+| --- | --- | --- | --- | --- |
+| fem_asset | packages/fullmag-py/src/fullmag/meshing/asset_pipeline.py | realize_fem_mesh_asset | FEM asset realization and volume checks | source-inspected |
+| public_study | packages/fullmag-py/src/fullmag/world.py | study | public study entry point | source-inspected |
+| build_request | packages/fullmag-py/src/fullmag/world.py | class StudyBuilder | public `StudyBuilder.build_domain_mesh` request | source-inspected |
+| problem_lowering | packages/fullmag-py/src/fullmag/world.py | _build_problem | builder-state lowering | source-inspected |
+| problem_ir | packages/fullmag-py/src/fullmag/model/problem.py | class Problem | ProblemIR and geometry-asset serialization | source-inspected |
+| domain_realization | packages/fullmag-py/src/fullmag/meshing/asset_pipeline.py | realize_fem_domain_mesh_asset_from_components_with_report | shared-domain build-mode realization | source-inspected |
+| build_report | packages/fullmag-py/src/fullmag/meshing/mesh_build_report.py | _build_shared_domain_build_report | requested/effective/fallback provenance | source-inspected |
+| planner | crates/fullmag-plan/src/lib.rs | plan | ProblemIR planning and compatibility | source-inspected, runtime-unverified |
+| runtime | crates/fullmag-runner/src/lib.rs | run_planned_problem | planned runtime dispatch | source-inspected, device-unverified |
+
 **Last changes: 12:31 24.08.2026**
 
 Build mode is part of numerical provenance. A production report distinguishes requested strategy, normalized plan, actual generator, fallback/degradation reason and realized topology.
@@ -141,7 +267,6 @@ film.mesh(
     minimum_element_size=4 * nm,
     maximum_element_size=8 * nm,
     order=1,
-    compute_quality=True,
 )
 film.Ms = 800.0e3
 film.Aex = 13.0e-12
@@ -150,6 +275,7 @@ film.m = fm.texture.uniform(1.0, 0.0, 0.0)
 study.exchange()
 study.demag(realization="poisson_robin")
 study.build_domain_mesh()
+study.stages.add_relax(stage_id="equilibrium", dt=5.0e-13, max_steps=10_000, tolT=1.0e-6)
 # In strict mode, an unsupported exact request must fail instead of returning
 # an unreported tetrahedral substitute.
 ```
@@ -212,11 +338,15 @@ Implementation map reviewed against commit `5db00ccf0113b9756fec2d46feb36ade762b
 
 ## Related documentation
 
-- [Swept meshes](../../swept-meshes.html)
-- [Assembly and conformity](assembly-and-conformity.html)
+- [Swept meshes](../../swept-meshes.md)
+- [Assembly and conformity](assembly-and-conformity.md)
 
 ## References
 
 - C. Geuzaine and J.-F. Remacle, “Gmsh: a three-dimensional finite element mesh generator with built-in pre- and post-processing facilities,” *International Journal for Numerical Methods in Engineering* **79** (2009), 1309–1331, [doi:10.1002/nme.2579](https://doi.org/10.1002/nme.2579).
 - C. Abert, “Micromagnetics and spintronics: models and numerical methods,” *European Physical Journal B* **92**, 120 (2019), [doi:10.1140/epjb/e2019-90599-6](https://doi.org/10.1140/epjb/e2019-90599-6).
 - Gmsh reference manual, mesh algorithms, size fields, extrusion and physical groups: [gmsh.info/doc/texinfo](https://gmsh.info/doc/texinfo/).
+## Source-code index
+
+- Python contract source: `packages/fullmag-py/src/fullmag/model/discretization.py` and `packages/fullmag-py/src/fullmag/world.py`, where applicable. Runtime realization is owned by the relevant `backends/fdm` or `backends/fem` implementation; the page must not claim a symbol not named in its implementation mapping.
+

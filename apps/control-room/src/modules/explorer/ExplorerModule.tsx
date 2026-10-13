@@ -1,5 +1,7 @@
 "use client";
 
+import { useAnalysisResultDatasetCatalogResource } from "@/kernel/resources/analysisResultResources";
+import { usePostprocessingDefinitionsResource } from "@/kernel/resources/postprocessingDefinitionResources";
 import { useEffect, useMemo, useRef } from "react";
 import {
   ChevronsDownUp,
@@ -59,8 +61,14 @@ import {
   useSolverProfileResource,
   useSolverStatusResource,
 } from "@/kernel/resources/studyRuntimeResources";
+import {
+  projectFlatActiveLaneDiscretization,
+  resolveSessionAuthoringDiscretization,
+  type SessionDiscretizationCapabilitiesProjection,
+} from "@/kernel/resources/sessionDiscretization";
 import { WorkspaceRenderProfiler } from "@/kernel/performance/reactRenderProfiler";
 import { usePhysicsGraphResource } from "@/kernel/resources/physicsGraphResources";
+import { useObservationFrameListResource } from "@/kernel/resources/observationFrameResources";
 import { useCurrentTransportsResource } from "@/kernel/resources/spinAuthoringResources";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 import {
@@ -90,6 +98,7 @@ import {
 import type { ModuleProps } from "@/kernel/types";
 import { useCrossSectionWorkspaceSelector } from "@/kernel/workspace/useCrossSectionWorkspace";
 import { useQuickChartWorkspaceSelector } from "@/kernel/workspace/useQuickChartWorkspace";
+import { useObservationSourceWorkspaceSelector } from "@/kernel/workspace/useObservationSourceWorkspace";
 import { usePlanarMonitorsResource } from "@/kernel/resources/planarMonitorResources";
 import { useFrozenSpinsCollectionResource } from "@/kernel/resources/frozenSpinsResources";
 import {
@@ -182,7 +191,8 @@ function qualityStatus(value: unknown): string | null {
 }
 
 type ExplorerModelRuntimeStatus = {
-  capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology">;
+  capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology"> &
+    SessionDiscretizationCapabilitiesProjection;
   domain: Pick<LiveStatusResource["domain"], "discretization">;
   resources: Pick<
     LiveStatusResource["resources"],
@@ -194,9 +204,19 @@ function selectExplorerModelRuntimeStatus(status: {
   data: LiveStatusResource | null;
 }): ExplorerModelRuntimeStatus | null {
   if (!status.data) return null;
+  const sourceCapabilities = status.data.capabilities;
+  const flatLane = projectFlatActiveLaneDiscretization(sourceCapabilities);
+  const hasActiveLane = Object.prototype.hasOwnProperty.call(
+    sourceCapabilities ?? {},
+    "active_lane",
+  );
   return {
     capabilities: {
-      explicit_topology: status.data.capabilities.explicit_topology,
+      explicit_topology: status.data.capabilities?.explicit_topology ?? false,
+      ...(hasActiveLane
+        ? { active_lane: sourceCapabilities?.active_lane ?? null }
+        : {}),
+      ...(flatLane ? { active_lane_discretization: flatLane.value } : {}),
     },
     domain: {
       discretization: status.data.domain.discretization,
@@ -209,7 +229,7 @@ function selectExplorerModelRuntimeStatus(status: {
   };
 }
 
-function explorerModelRuntimeStatusEquals(
+export function explorerModelRuntimeStatusEquals(
   previous: ExplorerModelRuntimeStatus | null,
   next: ExplorerModelRuntimeStatus | null,
 ): boolean {
@@ -218,12 +238,47 @@ function explorerModelRuntimeStatusEquals(
   return (
     previous.capabilities.explicit_topology ===
       next.capabilities.explicit_topology &&
+    Object.prototype.hasOwnProperty.call(
+      previous.capabilities,
+      "active_lane",
+    ) === Object.prototype.hasOwnProperty.call(next.capabilities, "active_lane") &&
+    Object.prototype.hasOwnProperty.call(previous.capabilities.active_lane ?? {}, "authored") ===
+      Object.prototype.hasOwnProperty.call(next.capabilities.active_lane ?? {}, "authored") &&
+    previous.capabilities.active_lane?.authored?.backend === next.capabilities.active_lane?.authored?.backend &&
+    previous.capabilities.active_lane?.authored?.discretization === next.capabilities.active_lane?.authored?.discretization &&
+    previous.capabilities.active_lane?.resolved?.discretization ===
+      next.capabilities.active_lane?.resolved?.discretization &&
+    Object.prototype.hasOwnProperty.call(
+      previous.capabilities,
+      "active_lane_discretization",
+    ) ===
+      Object.prototype.hasOwnProperty.call(
+        next.capabilities,
+        "active_lane_discretization",
+      ) &&
+    previous.capabilities.active_lane_discretization ===
+      next.capabilities.active_lane_discretization &&
     previous.domain.discretization === next.domain.discretization &&
     previous.resources.mesh_build_revision ===
       next.resources.mesh_build_revision &&
     previous.resources.mesh_revision === next.resources.mesh_revision &&
     previous.resources.stages_revision === next.resources.stages_revision
   );
+}
+
+export function resolveExplorerModelDiscretization({
+  activeLaneDiscretization,
+  domainDiscretization,
+}: {
+  activeLaneDiscretization: string | null | undefined;
+  domainDiscretization: string | null | undefined;
+}): "fdm" | "fem" | null {
+  return resolveSessionAuthoringDiscretization({
+    ...(activeLaneDiscretization !== undefined
+      ? { capabilities: { active_lane_discretization: activeLaneDiscretization } }
+      : {}),
+    domain: { discretization: domainDiscretization },
+  });
 }
 
 function planarMonitorTargetCapabilitiesFromResources({
@@ -304,6 +359,9 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
   );
   const objectExtensionActivation = useObjectExtensionActivationSnapshot();
   const pinnedQuickChart = useQuickChartWorkspaceSelector((state) => state.pinned);
+  const pinnedObservationSource = useObservationSourceWorkspaceSelector(
+    (state) => state.pinned,
+  );
   const selectedNodeId = useSelectionSelector((selection) => selection.nodeId);
   const selectedRef = useSelectionSelector((selection) => selection.ref);
   const resultContextRunId = useExplorerStoreSelector(
@@ -361,21 +419,17 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
     selectExplorerModelRuntimeStatus,
     { enabled: modelTabActive, isEqual: explorerModelRuntimeStatusEquals },
   );
+  const modelDiscretization = resolveSessionAuthoringDiscretization(sessionStatusData);
   const modelResource = useSceneResource({ enabled: modelTabActive });
   const domainMeta = useDomainMetaResource({ enabled: modelTabActive });
   const fdmMultilayerLayout = useFdmMultilayerLayoutResource({
-    enabled:
-      modelTabActive &&
-      sessionStatusData?.domain.discretization.toLowerCase() === "fdm",
+    enabled: modelTabActive && modelDiscretization === "fdm",
   });
   const universeMeshPolicy = useUniverseMeshPolicyResource({
-    enabled:
-      modelTabActive &&
-      sessionStatusData?.domain.discretization.toLowerCase() === "fem",
+    enabled: modelTabActive && modelDiscretization === "fem",
   });
   const fdmRegionMembership = useFdmRegionMembershipResource({
-    enabled:
-      modelTabActive && sessionStatusData?.domain.discretization.toLowerCase() === "fdm",
+    enabled: modelTabActive && modelDiscretization === "fdm",
   });
   const modelRegions = useModelRegionsResource({ enabled: modelTabActive });
   const regionIds = useMemo(
@@ -467,6 +521,10 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
   });
   const resolvedResultContextRunId = reconciledResultContextRunId;
   const resultContextIsCurrent = resolvedResultContextRunId === currentRunId;
+  const observationFrames = useObservationFrameListResource({
+    enabled: resultsResourceActive && resultContextIsCurrent,
+    runId: resultContextIsCurrent ? resolvedResultContextRunId : null,
+  });
   const resultContextRun = useResultContextRunResource(
     resultContextIsCurrent ? null : resolvedResultContextRunId,
     { enabled: resultsResourceActive },
@@ -499,6 +557,12 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
     : "Analysis overlay rebind command is unavailable.";
   const frequencyDomainSpectrum = useFrequencyDomainEigenSpectrumResource({
     enabled: activeTab === "results" || modeVisualizationResourceActive,
+  });
+  const analysisDefinitions = usePostprocessingDefinitionsResource({
+    enabled: activeTab === "results",
+  });
+  const analysisDatasetCatalog = useAnalysisResultDatasetCatalogResource(currentRunId, {
+    enabled: activeTab === "results",
   });
   const frequencyDomainBranches = useFrequencyDomainEigenBranchesResource({
     enabled: activeTab === "results",
@@ -550,7 +614,7 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
   );
   const planarMonitorTargetCapabilities = useMemo(
     () => planarMonitorTargetCapabilitiesFromResources({
-      discretization: sessionStatusData?.domain.discretization,
+      discretization: modelDiscretization,
       fdmMembership: fdmRegionMembership,
       femTopologyReady: manifest.status === "ready" && manifest.data !== null,
       regions: modelRegions,
@@ -562,7 +626,7 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
       manifest.status,
       modelRegions,
       modelResource,
-      sessionStatusData?.domain.discretization,
+      modelDiscretization,
     ],
   );
 
@@ -616,12 +680,7 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
           domainMeta: domainMeta.data,
           fdmMultilayerLayout: fdmMultilayerLayout.data,
           fdmMultilayerLayoutStatus: fdmMultilayerLayout.status,
-          domainDiscretization:
-            sessionStatusData?.domain.discretization.toLowerCase() === "fdm"
-              ? "fdm"
-              : sessionStatusData?.domain.discretization.toLowerCase() === "fem"
-                ? "fem"
-                : null,
+          domainDiscretization: modelDiscretization,
           domainPresentationStatus,
           domainPresentation,
         }),
@@ -633,7 +692,9 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
       record(activeBuild.data?.active_build),
       normalizeMeshPipelineStatus(activeBuild.data?.mesh_pipeline_status),
     );
-    const latestSuccessfulBuildRecord = record(latestSuccessfulBuild.data);
+    const latestSuccessfulBuildRecord = record(
+      latestSuccessfulBuild.data?.last_success,
+    );
     const latestBuildProvenance = record(latestSuccessfulBuildRecord?.provenance);
     const modelResourceRecord = record(modelResource.data);
     const semanticTargetCatalog = buildSemanticRenderTargetCatalog({
@@ -650,9 +711,14 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
       domainMeshMode: manifest.data?.domain_mesh_mode,
       generationId: manifest.data?.generation_id,
       latestBuildSourceSceneRevision:
-        revisionValue(latestBuildProvenance?.scene_revision),
+        revisionValue(
+          latestBuildProvenance?.scene_revision ??
+            latestSuccessfulBuildRecord?.source_scene_revision,
+        ),
       latestBuildStatus: stringValue(latestSuccessfulBuildRecord?.status),
-      lastError: activeBuild.data?.last_build_error,
+      lastError:
+        activeBuild.data?.last_build_error ??
+        latestSuccessfulBuild.data?.last_build_error,
       manifestSourceSceneRevision: manifest.data?.source_scene_revision,
       meshName: manifest.data?.mesh_name,
       meshRevision: meshSummary.data?.revision ?? manifest.data?.revision,
@@ -689,9 +755,9 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
           }],
     );
     const femAirbox =
-      sessionStatusData?.domain.discretization.toLowerCase() === "fem"
+      modelDiscretization === "fem"
         ? resolveCurrentFemAirboxEvidence({
-            currentMeshRevision: sessionStatusData.resources.mesh_revision,
+            currentMeshRevision: sessionStatusData?.resources.mesh_revision ?? null,
             manifest: { data: manifest.data, status: manifest.status },
             policy: {
               data: universeMeshPolicy.data,
@@ -716,6 +782,7 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
               activeAnalysisFieldOverlay,
               currentTransports: currentTransports.data,
               frozenSpins: frozenSpins.data,
+              scene: modelResource.data,
               frequencyDomainManifest: frequencyDomainManifest.data,
               frequencyDomainResponseSweep: frequencyDomainResponseSweep.data,
               frequencyDomainSpectrum: frequencyDomainSpectrum.data,
@@ -726,6 +793,8 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
           )
         : buildExplorerTree(activeTab, {
               activeAnalysisFieldOverlay,
+              analysisDefinitions: analysisDefinitions.data?.definitions ?? null,
+              analysisDatasets: resultContextIsCurrent ? analysisDatasetCatalog.data?.items ?? null : null,
     artifacts: resultContextIsCurrent ? runtimeSnapshot.source.artifacts : undefined,
               resultContextContractGaps,
               resultContextRunId: resolvedResultContextRunId,
@@ -734,6 +803,13 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
               frequencyDomainManifest: resultContextIsCurrent ? frequencyDomainManifest.data : null,
               frequencyDomainResponseSweep: resultContextIsCurrent ? frequencyDomainResponseSweep.data : null,
               frequencyDomainSpectrum: resultContextIsCurrent ? frequencyDomainSpectrum.data : null,
+              observationFrames: resultContextIsCurrent
+                ? runtimeResourceSnapshot(observationFrames)
+                : undefined,
+              pinnedObservationFrameId:
+                pinnedObservationSource?.runId === resolvedResultContextRunId
+                  ? pinnedObservationSource.frameId
+                  : null,
               pinnedQuickChart,
     tableCatalog: resultContextIsCurrent ? runtimeSnapshot.source.tableCatalog : undefined,
               currentRun: resultsRun.data,
@@ -743,6 +819,8 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
     activeBuild.data,
     latestSuccessfulBuild.data,
     activeTab,
+    analysisDatasetCatalog.data,
+    analysisDefinitions.data,
     crossSections,
     currentTransports.data,
     frozenSpins.data,
@@ -759,6 +837,7 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
     universeMeshPolicy.data,
     universeMeshPolicy.status,
     sessionStatusData,
+    modelDiscretization,
     fdmRegionMembership.data,
     fdmRegionMembership.status,
     modelCouplings.data,
@@ -783,6 +862,8 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
     frequencyDomainResponseSweep.data,
     frequencyDomainSpectrum.data,
     pinnedQuickChart,
+    pinnedObservationSource,
+    observationFrames,
     resultContextContractGaps,
     resultContextIsCurrent,
     resolvedResultContextRunId,
@@ -843,7 +924,10 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
       baseNodes,
     );
     if (!currentNode) {
-      if (selectedRef?.type === "postprocessing") {
+      if (
+        selectedRef?.type === "postprocessing" ||
+        selectedRef?.type === "observation-frame"
+      ) {
         kernel.selection.clear("explorer");
       }
       return;
@@ -939,11 +1023,15 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
           kernel={kernel}
           moduleId={moduleId}
           nodes={nodes}
+          sceneResourceData={
+            modelResource.status === "ready" ? modelResource.data : null
+          }
           tabId={activeTab}
         />
         <footer className="fm-explorer-toolbar">
           <button
             className="fm-explorer-toolbar__action"
+            aria-label="Expand all explorer nodes"
             title="Expand All"
             type="button"
             onClick={() => {
@@ -955,6 +1043,7 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
           </button>
           <button
             className="fm-explorer-toolbar__action"
+            aria-label="Collapse all explorer nodes"
             title="Collapse All"
             type="button"
             onClick={() => {
@@ -966,6 +1055,7 @@ export default function ExplorerModule({ kernel, moduleId }: ModuleProps) {
           </button>
           <button
             className="fm-explorer-toolbar__action"
+            aria-label="Refresh explorer"
             title="Refresh"
             type="button"
             onClick={() => {

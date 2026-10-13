@@ -42,9 +42,20 @@ pub async fn get_scalars(
     State(state): State<Arc<AppState>>,
     Query(query): Query<ScalarsQuery>,
 ) -> Result<Json<ScalarWindow>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let guard = state.current_live_state.read().await;
-    let all_rows = guard.as_ref().map(|s| &s.scalar_rows[..]).unwrap_or(&[]);
-    let revision = guard.as_ref().map(|s| s.scalar_revision).unwrap_or(0);
+    let snapshot = guard
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(
+        snapshot,
+        &request_context,
+        state
+            .current_live_session_epoch
+            .load(std::sync::atomic::Ordering::Acquire),
+    )?;
+    let all_rows = &snapshot.scalar_rows[..];
+    let revision = snapshot.scalar_revision;
     let total = all_rows.len() as u64;
 
     let since = query.since_revision.unwrap_or(0) as usize;
@@ -53,6 +64,13 @@ pub async fn get_scalars(
     } else {
         &[]
     };
+    // Filter diagnostics before tail/limit selection. Original revision and
+    // source cursor offsets are preserved; persisted rows are not rewritten.
+    let physical_window: Vec<_> = window
+        .iter()
+        .filter(|row| row.is_physical_observation())
+        .collect();
+    let window = &physical_window[..];
     let window = if query.tail.unwrap_or(false) {
         let limit = query.limit.unwrap_or(1) as usize;
         let start = window.len().saturating_sub(limit);
@@ -82,6 +100,7 @@ pub async fn get_scalars(
         "e_ext",
         "e_ani",
         "e_dmi",
+        "e_rotated_dmi",
         "e_total",
         "max_dm_dt",
         "max_h_eff",
@@ -124,6 +143,7 @@ pub async fn get_scalars(
                     "e_ext" => r.e_ext,
                     "e_ani" => r.e_ani,
                     "e_dmi" => r.e_dmi,
+                    "e_rotated_dmi" => r.e_rotated_dmi.unwrap_or(0.0),
                     "e_total" => r.e_total,
                     "max_dm_dt" => r.max_dm_dt,
                     "max_h_eff" => r.max_h_eff,
@@ -137,27 +157,22 @@ pub async fn get_scalars(
         .collect();
 
     let returned = rows.len() as u64;
-    let observation_frames = guard
-        .as_ref()
-        .map(|snapshot| {
-            let generation_id = domain_generation_id(snapshot);
-            window
-                .iter()
-                .map(|row| {
-                    row.observation_frame.clone().unwrap_or_else(|| {
-                        AcceptedObservationFrameRef::for_snapshot(
-                            &snapshot.session.session_id,
-                            snapshot.session.started_at_unix_ms,
-                            generation_id.clone(),
-                            snapshot.mesh_revision,
-                            row.step,
-                            Some(row.time),
-                        )
-                    })
-                })
-                .collect()
+    let generation_id = domain_generation_id(snapshot);
+    let observation_frames = window
+        .iter()
+        .map(|row| {
+            row.observation_frame.clone().unwrap_or_else(|| {
+                AcceptedObservationFrameRef::for_snapshot(
+                    &snapshot.session.session_id,
+                    snapshot.session.started_at_unix_ms,
+                    generation_id.clone(),
+                    snapshot.mesh_revision,
+                    row.step,
+                    Some(row.time),
+                )
+            })
         })
-        .unwrap_or_default();
+        .collect();
 
     Ok(Json(ScalarWindow {
         revision,

@@ -7,10 +7,25 @@ import {
   AirboxMeshTopologyLanePanel,
   AirboxOverviewLanePanel,
 } from "./panels/airbox/AirboxInspectorLanePanel";
+import { PinnedVisualizationsInspectorPanel } from "./panels/analysis-results/PinnedVisualizationsInspectorPanel";
 import { FdmMultilayerAirboxTargetPanel } from "./panels/airbox/FdmMultilayerAirboxTargetPanel";
 import { AirboxVisualizationDebugInspectorPanel } from "./panels/airbox/AirboxVisualizationDebugInspectorPanel";
 import { AntennaObjectPanel } from "./panels/AntennaObjectPanel";
+import { AntennaVisualizationPanel } from "./panels/antenna/AntennaVisualizationPanel";
+import { AntennaGeometryPanel } from "./panels/antenna/AntennaGeometryPanel";
+import {
+  AntennaConductorPanel,
+  AntennaPortPanel,
+  AntennaProjectionPanel,
+  AntennaSolutionPanel,
+  AntennaSpectrumPanel,
+  SolvedAntennaDrivePanel,
+} from "./panels/antenna/AntennaCompositionPanels";
 import { QuickChartInspectorPanel } from "./panels/QuickChartInspectorPanel";
+import {
+  ObservationFrameInspectorPanel,
+  ObservationFramesOverviewPanel,
+} from "./panels/ObservationFrameInspectorPanel";
 import { BoundaryFacesOverviewPanel } from "./panels/boundary-faces/BoundaryFacesOverviewPanel";
 import { CouplingInspectorPanel } from "./panels/CouplingInspectorPanel";
 import {
@@ -51,6 +66,8 @@ import { EigenModeInspectorPanel } from "./panels/frequency-domain/EigenModeInsp
 import { FmrModalSpectrumInspectorPanel } from "./panels/frequency-domain/FmrModalSpectrumInspectorPanel";
 import { FmrResponseSweepInspectorPanel } from "./panels/frequency-domain/FmrResponseSweepInspectorPanel";
 import { FieldQuantityInspectorPanel } from "./panels/FieldQuantityInspectorPanel";
+import { AnalysisResultInspectorPanel } from "./panels/analysis-results/AnalysisResultInspectorPanel";
+import { MaterializedDatasetInspectorPanel } from "./panels/MaterializedDatasetInspectorPanel";
 import { FrozenSpinsInspectorPanel } from "./panels/constraint/FrozenSpinsInspectorPanel";
 import { MeshPartVisualizationPanel } from "./panels/MeshPartVisualizationPanel";
 import { ModeVisualizationOverviewPanel } from "./panels/mode-visualization/ModeVisualizationOverviewPanel";
@@ -93,6 +110,7 @@ import {
   DispersionResponseFieldAtKResultInspector,
   DynamicsResultInspector,
   HysteresisResultInspector,
+  LegacyTimeDomainResultInspector,
   ResonanceDrivenPeaksResultInspector,
   ResonanceDrivenSpectrumResultInspector,
   ResonanceDrivenStageResultInspector,
@@ -248,6 +266,7 @@ import {
   FrequencyResponseSolverStageInspectorPanel,
   FrequencyResponseStageOverviewInspectorPanel,
   FrequencyResponseSweepStageInspectorPanel,
+  StudyStageInspectorRouter,
 } from "./panels/StudyStageInspectorRouter";
 import { resolveFrequencyDomainNodeDetail } from "./panels/frequencyDomainNodeDetails";
 import type {
@@ -336,6 +355,8 @@ export const FREQUENCY_DOMAIN_INSPECTOR_SELECTION_KINDS = [
   "results.frequency_domain.comparison",
   "results.frequency_domain.exports",
   "results.dynamics.root",
+  "results.time_domain.spectral_feature",
+  "results.time_domain.dsf_point",
   "results.resonance.root",
   "results.resonance.modal.stage",
   "results.resonance.driven.stage",
@@ -465,6 +486,8 @@ const FREQUENCY_DOMAIN_NAMED_PANELS: Partial<
   "results.frequency_response.diagnostics":
     FrequencyResponseDiagnosticsInspectorPanel,
   "results.dynamics.root": DynamicsResultInspector,
+  "results.time_domain.spectral_feature": LegacyTimeDomainResultInspector,
+  "results.time_domain.dsf_point": LegacyTimeDomainResultInspector,
   "results.resonance.root": ResonanceOverviewResultInspector,
   "results.resonance.modal.stage": ResonanceModalStageResultInspector,
   "results.resonance.driven.stage": ResonanceDrivenStageResultInspector,
@@ -558,7 +581,7 @@ const OBJECT_VISUALIZATION_DEBUG_OWNER: VisualizationDebugInspectorOwner = {
   capabilityDescription:
     "Object-scoped FEM viewport snapshots, field carriers, and exact transport metadata",
   id: "object.visualization.debug",
-  targetLabel: "Magnetic object target",
+  targetLabel: "Object target",
   title: "Object Visualization Debug",
 };
 
@@ -658,6 +681,24 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
     title: "Quick Chart",
     selectionKinds: ["results.quick_chart"],
     component: QuickChartInspectorPanel,
+  },
+  {
+    id: "observation-frames-overview",
+    title: "State Snapshots",
+    selectionKinds: ["results.observation_frames.root"],
+    component: ObservationFramesOverviewPanel,
+  },
+  {
+    id: "pinned-visualizations",
+    title: "Pinned Visualizations",
+    selectionKinds: ["results.pinned_visualizations.root"],
+    component: PinnedVisualizationsInspectorPanel,
+  },
+  {
+    id: "observation-frame",
+    title: "Observation Frame",
+    selectionKinds: ["results.observation_frame"],
+    component: ObservationFrameInspectorPanel,
   },
   {
     id: "session-root",
@@ -877,9 +918,51 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
   },
   {
     id: "antenna-object",
-    title: "Antenna",
-    selectionKinds: ["object.antenna"],
+    title: "Regional field drive",
+    selectionKinds: ["object.antenna", "object.antenna.regional"],
     component: AntennaObjectPanel,
+  },
+  {
+    id: "antenna-geometry",
+    title: "Antenna geometry",
+    selectionKinds: ["object.antenna.geometry"],
+    component: AntennaGeometryPanel,
+  },
+  {
+    id: "antenna-conductor",
+    title: "Antenna conductor",
+    selectionKinds: ["object.antenna.conductor"],
+    component: AntennaConductorPanel,
+  },
+  {
+    id: "antenna-port",
+    title: "Antenna port",
+    selectionKinds: ["object.antenna.port"],
+    component: AntennaPortPanel,
+  },
+  {
+    id: "antenna-solution",
+    title: "Antenna field solve",
+    selectionKinds: ["object.antenna.solution"],
+    component: AntennaSolutionPanel,
+  },
+  {
+    id: "antenna-projection",
+    title: "Antenna target projection",
+    selectionKinds: ["object.antenna.projection"],
+    component: AntennaProjectionPanel,
+  },
+  {
+    id: "antenna-drive",
+    title: "Solved antenna drive",
+    selectionKinds: ["object.antenna.drive"],
+    component: SolvedAntennaDrivePanel,
+  },
+  {
+    id: "antenna-spectrum",
+    title: "Antenna spectrum",
+    selectionKinds: ["object.antenna.spectrum"],
+    component: AntennaSpectrumPanel,
   },
   {
     id: "airbox-overview",
@@ -916,6 +999,12 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
     title: "Visualization",
     selectionKinds: ["object.visualization"],
     component: ObjectVisualizationPanel,
+  },
+  {
+    id: "antenna-visualization",
+    title: "Antenna Visualization",
+    selectionKinds: ["object.antenna.visualization"],
+    component: AntennaVisualizationPanel,
   },
   {
     id: "mesh-part-visualization",
@@ -1362,6 +1451,12 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
     component: StudyStageAddFieldDriveInspectorPanel,
   },
   {
+    id: "study-stage-antenna-field-solve",
+    title: "Antenna Field Solve",
+    selectionKinds: ["study.stage.antenna_field_solve"],
+    component: StudyStageInspectorRouter,
+  },
+  {
     id: "study-stage-autosave",
     title: "Study Stage Autosave",
     selectionKinds: ["study.stage.autosave"],
@@ -1410,6 +1505,18 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
     component: StudyStageSaveStateInspectorPanel,
   },
   ...frequencyDomainPanels,
+  {
+    id: "analysis-result",
+    title: "Analysis result",
+    selectionKinds: ["analysis.result", "results.hysteresis.dataset"],
+    component: AnalysisResultInspectorPanel,
+  },
+  {
+    id: "materialized-dataset",
+    title: "Materialized Dataset",
+    selectionKinds: ["results.materialized_dataset"],
+    component: MaterializedDatasetInspectorPanel,
+  },
   {
     id: "field-quantity",
     title: "Field Quantity",

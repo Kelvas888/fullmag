@@ -51,12 +51,12 @@ inline bool fsal_unknown_identity(const FsalEndpointIdentity &identity) {
 }
 
 inline FsalReuseDecision rhs_allows_fsal_reuse(const FsalReuseInput &input) {
-    if (!input.cache_valid)
-        return {false, FULLMAG_FDM_FSAL_INVALIDATION_CACHE_EMPTY};
     if (input.temperature > 0.0)
         return {false, FULLMAG_FDM_FSAL_INVALIDATION_THERMAL_ACTIVE};
     if (input.waveform_discontinuity)
         return {false, FULLMAG_FDM_FSAL_INVALIDATION_WAVEFORM_DISCONTINUITY};
+    if (!input.cache_valid)
+        return {false, FULLMAG_FDM_FSAL_INVALIDATION_CACHE_EMPTY};
     if (fsal_unknown_identity(input.cached) || fsal_unknown_identity(input.requested))
         return {false, FULLMAG_FDM_FSAL_INVALIDATION_UNKNOWN_IDENTITY};
     if (input.cached.accepted_state_revision != input.requested.accepted_state_revision)
@@ -111,6 +111,15 @@ inline FsalReuseDecision rhs_allows_fsal_reuse(const Context &ctx, double dt) {
     input.cached = context_cached_fsal_identity(ctx);
     input.requested = context_current_fsal_identity(ctx, dt);
     return rhs_allows_fsal_reuse(input);
+}
+
+inline bool context_should_use_adaptive_device_graph(const Context &ctx) {
+    return ctx.adaptive_enabled &&
+           ctx.stats_mode == FULLMAG_FDM_STATS_NONE &&
+           ctx.temperature <= 0.0 &&
+           !(ctx.has_oersted_field && ctx.oersted_time_dep_kind != 0) &&
+           !ctx.gpu_transport_rhs.active &&
+           !ctx.gpu_transport_test_force_adaptive_retry;
 }
 
 inline void context_record_fsal_invalidation(

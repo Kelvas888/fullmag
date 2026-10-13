@@ -4,6 +4,17 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* Export only the public C ABI when building the Windows shared library. */
+#if defined(_WIN32)
+#if defined(FULLMAG_FEM_BUILD_SHARED)
+#define FULLMAG_FEM_API __declspec(dllexport)
+#else
+#define FULLMAG_FEM_API __declspec(dllimport)
+#endif
+#else
+#define FULLMAG_FEM_API
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -14,7 +25,7 @@ extern "C" {
 #define FULLMAG_FEM_ERR_INTERNAL -3
 #define FULLMAG_FEM_ERR_INTERRUPTED -4
 
-#define FULLMAG_FEM_REGIONAL_FIELD_DRIVE_ABI_VERSION 2u
+#define FULLMAG_FEM_REGIONAL_FIELD_DRIVE_ABI_VERSION 3u
 
 typedef enum {
     FULLMAG_FEM_PRECISION_SINGLE = 1,
@@ -128,6 +139,7 @@ typedef enum {
     FULLMAG_FEM_SPATIAL_PROFILE_SINC = 1,
     FULLMAG_FEM_SPATIAL_PROFILE_GEOMETRY_MASK = 2,
     FULLMAG_FEM_SPATIAL_PROFILE_GAUSSIAN_PLANE_WAVE = 3,
+    FULLMAG_FEM_SPATIAL_PROFILE_PREPROJECTED_NODAL = 4,
 } fullmag_fem_spatial_profile_kind;
 
 typedef enum {
@@ -251,6 +263,8 @@ typedef struct {
     double gaussian_sigma_y_m;
     double gaussian_wavelength_m;
     double gaussian_carrier_phase_rad;
+    const double *preprojected_h_xyz_a_per_m;
+    uint64_t preprojected_h_value_count;
 } fullmag_fem_spatial_profile_desc;
 
 typedef struct {
@@ -465,6 +479,51 @@ typedef struct {
     uint64_t periodic_boundary_pair_markers_len;
 } fullmag_fem_mesh_desc;
 
+/*
+ * Stateless MFEM mesh/function-space preparation.
+ *
+ * The producer imports the canonical mesh, builds and validates an MFEM Mesh
+ * and H1 FiniteElementSpace, and returns versioned evidence. It must not
+ * initialize a solver Context or configure a runtime device.
+ */
+#define FULLMAG_FEM_MESH_SPACE_PREPARATION_ABI_VERSION 1u
+#define FULLMAG_FEM_MESH_SPACE_PREPARATION_PRODUCER_ID "fullmag.mfem.mesh_space"
+#define FULLMAG_FEM_MESH_SPACE_PREPARATION_SCHEMA_VERSION "mfem_mesh_space_evidence.v1"
+#define FULLMAG_FEM_MESH_SPACE_PREPARATION_PRODUCER_VERSION "1"
+#define FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY 65u
+
+#define FULLMAG_FEM_FE_FAMILY_H1 1u
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    const fullmag_fem_mesh_desc *mesh;
+    uint32_t fe_order;
+    uint32_t reserved_flags;
+} fullmag_fem_mesh_space_preparation_request_v1;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t mesh_dimension;
+    uint32_t fe_family;
+    uint32_t fe_order;
+    uint32_t mesh_matches_canonical_input;
+    uint64_t node_count;
+    uint64_t cell_count;
+    uint64_t boundary_element_count;
+    uint64_t local_dof_count;
+    uint64_t true_dof_count;
+    uint64_t quality_sample_count;
+    uint64_t invalid_cell_count;
+    double min_jacobian_determinant;
+    double max_jacobian_determinant;
+    char topology_fingerprint[FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY];
+    char marker_map_fingerprint[FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY];
+    char quality_fingerprint[FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY];
+    char space_fingerprint[FULLMAG_FEM_MESH_SPACE_PREPARATION_FINGERPRINT_CAPACITY];
+} fullmag_fem_mesh_space_preparation_evidence_v1;
+
 #define FULLMAG_FEM_MESH_ABI_LAYOUT_VERSION 1u
 #define FULLMAG_FEM_MESH_ABI_FIELD_COUNT 30u
 #define FULLMAG_FEM_MESH_ABI_FINGERPRINT_CAPACITY 96u
@@ -493,7 +552,7 @@ typedef struct {
     fullmag_fem_mesh_abi_layout layout;
 } fullmag_fem_mesh_abi_record;
 
-extern const fullmag_fem_mesh_abi_record fullmag_fem_mesh_abi_record_v1;
+extern FULLMAG_FEM_API const fullmag_fem_mesh_abi_record fullmag_fem_mesh_abi_record_v1;
 
 typedef struct {
     double saturation_magnetisation;
@@ -705,6 +764,17 @@ typedef struct {
     const double *frozen_reference_xyz;
     uint64_t frozen_reference_len;
 } fullmag_fem_plan_desc;
+
+/* Versioned plan wrapper for physics extensions that cannot be appended to the
+   unversioned legacy descriptor without breaking existing binary clients. */
+#define FULLMAG_FEM_PLAN_DESC_V2_ABI_VERSION 2u
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    fullmag_fem_plan_desc base;
+    int has_rotated_interfacial_dmi;
+    double rotated_interfacial_dmi_constant; /* D_21 = D_32 (J/m^2) */
+} fullmag_fem_plan_desc_v2;
 
 /*
  * Standalone M1 steady charge/spin transport ABI.
@@ -932,6 +1002,30 @@ typedef struct {
     char diagnostics_json[1024];
 } fullmag_fem_steady_transport_rt0_result_v1;
 
+/* Optional charge payload from the SAME solve as the RT0 result. New entry
+ * points below preserve every existing request/result layout. Vertex order
+ * belongs to the RT0 mesh, including volumetric leads; V is in volts, xyz in
+ * metres. On any error all published lengths and the source digest are reset.
+ * This payload does not certify prescribed integral port currents. */
+#define FULLMAG_FEM_STEADY_TRANSPORT_RT0_CHARGE_SNAPSHOT_ABI_VERSION 1u
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved_flags;
+    uint64_t struct_size;
+    double *electric_potential_v;
+    uint64_t electric_potential_v_capacity;
+    uint64_t electric_potential_v_len;
+    uint64_t *stable_vertex_ids;
+    uint64_t stable_vertex_ids_capacity;
+    uint64_t stable_vertex_ids_len;
+    double *vertex_xyz_m;
+    uint64_t vertex_xyz_m_capacity;
+    uint64_t vertex_xyz_m_len;
+    char stable_vertex_id_version[FULLMAG_FEM_STEADY_TRANSPORT_RT0_STRING_CAPACITY];
+    char source_view_identity_digest[FULLMAG_FEM_STEADY_TRANSPORT_RT0_DIGEST_CAPACITY];
+    char error_message[256];
+} fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1;
+
 /* Direct OE-F1 evaluation on the exact immutable RT0 view produced by the
  * closure-aware transport extension.  This is a new symbol; the RT0 result
  * above remains byte-for-byte stable. */
@@ -967,6 +1061,57 @@ typedef struct {
     char error_message[256];
     char diagnostics_json[1024];
 } fullmag_fem_steady_transport_rt0_oersted_result_v1;
+
+/* Append-only companion to OE-F1. Caller-owned, disjoint writable records
+ * retain the exact input xyz, raw H and final target ledger from the SAME
+ * solve. Existing OE-F1 layouts and their 1024-byte summary are unchanged.
+ * On failure sufficiently sized non-null outputs have zero published lengths;
+ * undersized headers are not written and no output may be consumed on error.
+ * Record bytes beyond a zero published length are not results.
+ * This evidence is not a rigorous error bound or a per-ampere certificate. */
+#define FULLMAG_FEM_DIRECT_OERSTED_SNAPSHOT_ABI_VERSION 1u
+#define FULLMAG_FEM_DIRECT_OERSTED_SNAPSHOT_MAX_TARGETS 1000000u
+typedef struct {
+    double target_xyz_m[3];
+    double h_xyz_apm[3];
+    double estimated_error_apm;
+    double tolerance_apm;
+    double roundoff_indicator_apm;
+    uint64_t final_leaf_count;
+    uint64_t kernel_evaluations;
+    uint64_t ledger_leaf_visits;
+} fullmag_fem_direct_oersted_target_record_v1;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved_flags;
+    uint64_t struct_size;
+    fullmag_fem_direct_oersted_target_record_v1 *target_records;
+    uint64_t target_records_capacity;
+    uint64_t target_records_len;
+    uint64_t source_target_pairs;
+    uint64_t refined_pairs;
+    uint64_t unconverged_pair_count;
+    double maximum_pair_error_apm;
+    uint64_t kernel_evaluations;
+    uint64_t ledger_leaf_visits;
+    int32_t base_quadrature_order;
+    int32_t maximum_subdivision_depth;
+    double absolute_tolerance_apm;
+    double relative_tolerance;
+    double relative_scale_floor_apm;
+    uint64_t maximum_source_target_pairs;
+    uint64_t maximum_final_leaves_per_target;
+    uint64_t maximum_kernel_evaluations;
+    uint64_t maximum_ledger_leaf_visits;
+    char schema_version[FULLMAG_FEM_STEADY_TRANSPORT_RT0_STRING_CAPACITY];
+    char operator_version[FULLMAG_FEM_STEADY_TRANSPORT_RT0_STRING_CAPACITY];
+    char quadrature_scope[32];
+    char estimated_error_policy[FULLMAG_FEM_STEADY_TRANSPORT_RT0_STRING_CAPACITY];
+    char roundoff_indicator_policy[FULLMAG_FEM_STEADY_TRANSPORT_RT0_STRING_CAPACITY];
+    char source_view_identity_digest[FULLMAG_FEM_STEADY_TRANSPORT_RT0_DIGEST_CAPACITY];
+    char error_message[256];
+} fullmag_fem_direct_oersted_snapshot_result_v1;
 
 /* Mixed H(curl) x H1 OE-F2 evaluation on the exact immutable RT0 view.  This
  * is an append-only wrapper: the nested RT0 request/result and all legacy
@@ -1057,6 +1202,251 @@ typedef struct {
     char diagnostics_json[1024];
 } fullmag_fem_steady_transport_result_v1;
 
+/*
+ * Standalone Ohmic charge-only FEM solve.  This is an append-only ABI and
+ * does not reinterpret or extend the charge/spin transport v1 layouts.
+ * The implementation reuses the existing conforming H1/P1 charge operator,
+ * but never evaluates the spin equation.
+ */
+#define FULLMAG_FEM_CHARGE_TRANSPORT_ABI_VERSION 1u
+#define FULLMAG_FEM_CHARGE_TRANSPORT_CONSTITUTIVE_VERSION \
+    "transport_constitutive.one_way.fullmag.v1"
+#define FULLMAG_FEM_CHARGE_TRANSPORT_OPERATOR_VERSION \
+    "fem_charge_conforming_h1_p1.transparent.v1"
+#define FULLMAG_FEM_CHARGE_TRANSPORT_PHYSICAL_RESIDUAL_VERSION \
+    "charge_balance_integrated_l2.v1"
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved_flags;
+    uint64_t struct_size;
+    fullmag_fem_steady_transport_execution_lane execution_lane;
+    fullmag_fem_steady_transport_charge_gauge charge_gauge;
+    const char *constitutive_version;
+    const char *operator_version;
+    const char *physical_residual_version;
+    fullmag_fem_mesh_desc mesh;
+    const double *charge_conductivity_spm_per_element;
+    uint64_t charge_conductivity_spm_per_element_len;
+    double relative_tolerance;
+    double absolute_tolerance;
+    uint32_t maximum_iterations;
+    const uint32_t *dirichlet_boundary_attributes;
+    const double *dirichlet_boundary_values_v;
+    uint64_t dirichlet_boundary_count;
+} fullmag_fem_charge_transport_request_v1;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved_flags;
+    uint64_t struct_size;
+    double *electric_potential_v;
+    uint64_t electric_potential_v_capacity;
+    uint64_t electric_potential_v_len;
+    double *charge_current_density_xyz_apm2;
+    uint64_t charge_current_density_xyz_apm2_capacity;
+    uint64_t charge_current_density_xyz_apm2_len;
+    int charge_converged;
+    uint32_t charge_iterations;
+    double charge_relative_residual;
+    double net_boundary_current_a;
+    double current_density_volume_average_apm2[3];
+    char error_message[256];
+    char diagnostics_json[1024];
+} fullmag_fem_charge_transport_result_v1;
+
+/* Append-only charge result extension. The v1 prefix remains byte-for-byte
+ * stable; one current integral is returned for each requested Dirichlet
+ * boundary attribute in request order. */
+typedef struct {
+    fullmag_fem_charge_transport_result_v1 base;
+    double *dirichlet_boundary_currents_a;
+    uint64_t dirichlet_boundary_currents_a_capacity;
+    uint64_t dirichlet_boundary_currents_a_len;
+} fullmag_fem_charge_transport_result_v2;
+
+/* Prescribed signed outward terminal currents. V1/V2 fixed-potential calls
+ * retain their original layouts and semantics. The embedded V1 request has
+ * no Dirichlet attributes; terminal faces and currents are specified here.
+ * Offsets delimit nonempty per-terminal groups in boundary_attributes.
+ * One gauge terminal index is returned per connected conductor component. */
+#define FULLMAG_FEM_CHARGE_TERMINAL_CURRENT_ABI_VERSION 3u
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved_flags;
+    uint64_t struct_size;
+    fullmag_fem_charge_transport_request_v1 base;
+    const uint64_t *terminal_attribute_offsets;
+    uint64_t terminal_attribute_offsets_len;
+    const uint32_t *terminal_boundary_attributes;
+    uint64_t terminal_boundary_attributes_len;
+    const double *requested_outward_currents_a;
+    uint64_t terminal_count;
+} fullmag_fem_charge_transport_request_v3;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved_flags;
+    uint64_t struct_size;
+    fullmag_fem_charge_transport_result_v1 base;
+    double *terminal_voltages_v;
+    uint64_t terminal_voltages_v_capacity;
+    uint64_t terminal_voltages_v_len;
+    double *measured_outward_currents_a;
+    uint64_t measured_outward_currents_a_capacity;
+    uint64_t measured_outward_currents_a_len;
+    uint32_t *gauge_terminal_indices;
+    uint64_t gauge_terminal_indices_capacity;
+    uint64_t gauge_terminal_indices_len;
+} fullmag_fem_charge_transport_result_v3;
+
+/* One current-driven owned H1/material/RT0 record. This does not certify
+ * closure or publish H; all previous charge/RT0 layouts remain unchanged. */
+#define FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_ABI_VERSION 1u
+#define FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_TEXT_CAPACITY 96u
+#define FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_MAX_PAYLOAD_BYTES (UINT64_C(128) << 20)
+#define FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_LAYOUT_FINGERPRINT \
+    "fullmag:fem-accepted-terminal-charge:abi:v1:canonical-owned-record"
+
+typedef struct {
+    const char *id;
+    const uint64_t *boundary_face_vertex_ids;
+    uint64_t face_count;
+    double requested_outward_current_a;
+} fullmag_fem_accepted_terminal_charge_terminal_v1;
+
+typedef struct {
+    const char *id;
+    uint64_t first_face_vertex_ids[3];
+    uint64_t second_face_vertex_ids[3];
+    uint64_t vertex_pairs[3][2];
+} fullmag_fem_accepted_terminal_charge_interface_v1;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved_flags;
+    uint64_t struct_size;
+    fullmag_fem_steady_transport_execution_lane execution_lane;
+    uint32_t reserved_execution;
+    fullmag_fem_mesh_desc mesh;
+    fullmag_fem_steady_transport_rt0_stable_vertex_identities_v1 stable_vertex_identities;
+    const double *conductivity_spm_per_element;
+    uint64_t conductivity_spm_per_element_len;
+    const fullmag_fem_accepted_terminal_charge_terminal_v1 *terminals;
+    uint64_t terminal_count;
+    const fullmag_fem_accepted_terminal_charge_interface_v1 *interfaces;
+    uint64_t interface_count;
+    double absolute_jump_tolerance_v;
+    double relative_jump_tolerance;
+    double algebraic_relative_tolerance;
+    uint32_t maximum_iterations;
+    uint32_t reserved_solver;
+} fullmag_fem_accepted_terminal_charge_request_v1;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved_flags;
+    uint64_t struct_size;
+    uint8_t *canonical_payload;
+    uint64_t canonical_payload_capacity;
+    uint64_t canonical_payload_len;
+    char digest_schema[FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_TEXT_CAPACITY];
+    char operator_version[FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_TEXT_CAPACITY];
+    char layout_fingerprint[FULLMAG_FEM_ACCEPTED_TERMINAL_CHARGE_TEXT_CAPACITY];
+    char content_sha256[65];
+    char error_message[256];
+} fullmag_fem_accepted_terminal_charge_result_v1;
+
+/* One current-driven charge -> finite device+lead source -> H bundle.
+ * Scope is external_electrode_truncation, never a full closed circuit.
+ * J is represented by owned RT0 face-flux moments, not legacy nodal raw J. */
+#define FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_ABI_VERSION 1u
+#define FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY 96u
+#define FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_MAX_PAYLOAD_BYTES (UINT64_C(128) << 20)
+#define FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_LAYOUT_FINGERPRINT \
+    "fullmag:fem-accepted-external-lead:abi:v1:canonical-owned-bundle"
+#define FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_BOUNDARY_INSULATING 1u
+#define FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_BOUNDARY_OUTER_ELECTRODE 2u
+#define FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_BOUNDARY_DEVICE_INTERFACE 3u
+
+typedef struct {
+    uint64_t vertex_ids[3];
+    uint32_t role;
+    uint32_t reserved;
+    const char *circuit_id;
+} fullmag_fem_accepted_external_lead_boundary_v1;
+
+typedef struct {
+    const char *id;
+    const char *const *interface_pair_ids;
+    uint64_t interface_pair_count;
+    double requested_device_outward_current_a;
+} fullmag_fem_accepted_external_lead_branch_v1;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved_flags;
+    uint64_t struct_size;
+    fullmag_fem_accepted_terminal_charge_request_v1 charge;
+    const char *closure_revision;
+    const uint64_t *device_vertex_ids;
+    uint64_t device_vertex_count;
+    const uint64_t *lead_vertex_ids;
+    uint64_t lead_vertex_count;
+    const fullmag_fem_accepted_external_lead_boundary_v1 *boundary_faces;
+    uint64_t boundary_face_count;
+    const fullmag_fem_accepted_external_lead_branch_v1 *branches;
+    uint64_t branch_count;
+    const double *target_xyz_m;
+    uint64_t target_count;
+    int32_t base_quadrature_order;
+    int32_t maximum_subdivision_depth;
+    double absolute_tolerance_apm;
+    double relative_tolerance;
+    uint64_t maximum_source_target_pairs;
+} fullmag_fem_accepted_external_lead_request_v1;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved_flags;
+    uint64_t struct_size;
+    uint8_t *canonical_payload;
+    uint64_t canonical_payload_capacity;
+    uint64_t canonical_payload_len;
+    char digest_schema[FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY];
+    char operator_version[FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY];
+    char layout_fingerprint[FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY];
+    char content_sha256[65];
+    char error_message[256];
+} fullmag_fem_accepted_external_lead_result_v1;
+
+/* Same legacy canonical bundle plus device-cell J sampled from its live RT0.
+ * Both caller buffers must be disjoint and bounded; failures publish neither.
+ * The unchanged v1 request is used with this independently versioned result. */
+#define FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_DISPLAY_ABI_VERSION 2u
+#define FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_DISPLAY_LAYOUT_FINGERPRINT \
+    "fullmag:fem-accepted-external-lead:abi:v2:owned-current-display"
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved_flags;
+    uint64_t struct_size;
+    uint8_t *canonical_payload;
+    uint64_t canonical_payload_capacity;
+    uint64_t canonical_payload_len;
+    char digest_schema[FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY];
+    char operator_version[FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY];
+    char layout_fingerprint[FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY];
+    char content_sha256[65];
+    char error_message[256];
+    uint8_t *current_display_payload;
+    uint64_t current_display_payload_capacity;
+    uint64_t current_display_payload_len;
+    char current_display_digest_schema[FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY];
+    char current_display_operator_version[FULLMAG_FEM_ACCEPTED_EXTERNAL_LEAD_TEXT_CAPACITY];
+    char current_display_content_sha256[65];
+} fullmag_fem_accepted_external_lead_result_v2;
+
 typedef struct {
     uint64_t step;
     double time_seconds;
@@ -1142,7 +1532,95 @@ typedef struct {
     uint64_t demag_potential_true_dof_count;
     double demag_variational_energy_joules;
     double demag_recovered_field_energy_joules;
+    /* Append-only CPU RK minimal-journal performance telemetry. */
+    uint64_t rk_transaction_cpu_snapshot_allocation_count;
+    uint64_t rk_transaction_peak_rss_bytes;
 } fullmag_fem_step_stats;
+
+/*
+ * Versioned CPU explicit-RK accepted-endpoint cache telemetry.  This is an
+ * additive query rather than an extension of fullmag_fem_step_stats so older
+ * callers never receive writes past the struct they allocated.
+ */
+#define FULLMAG_FEM_ENDPOINT_CACHE_TELEMETRY_V1_ABI_VERSION 1u
+
+typedef enum {
+    FULLMAG_FEM_ENDPOINT_REFRESH_NOT_EVALUATED = 0,
+    FULLMAG_FEM_ENDPOINT_REFRESH_CACHE_HIT = 1,
+    FULLMAG_FEM_ENDPOINT_REFRESH_NON_FSAL_TABLEAU = 2,
+    FULLMAG_FEM_ENDPOINT_REFRESH_CANDIDATE_STATE_MISMATCH = 3,
+    FULLMAG_FEM_ENDPOINT_REFRESH_ENDPOINT_TIME_MISMATCH = 4,
+    FULLMAG_FEM_ENDPOINT_REFRESH_DYNAMIC_SOURCE_CHANGED = 5,
+    FULLMAG_FEM_ENDPOINT_REFRESH_TRANSPORT_SOURCE_CHANGED = 6,
+    FULLMAG_FEM_ENDPOINT_REFRESH_PROJECTION_MISMATCH = 7,
+    FULLMAG_FEM_ENDPOINT_REFRESH_CACHE_UNAVAILABLE = 8,
+} fullmag_fem_endpoint_refresh_reason;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint64_t final_rhs_evaluations;
+    uint64_t extra_poisson_solves;
+    uint64_t endpoint_cache_hits;
+    uint64_t endpoint_refreshes;
+    uint64_t accepted_step_wall_time_ns;
+    uint32_t available;
+    uint32_t final_refresh_reason;
+    uint32_t cache_state_valid;
+    uint32_t cache_time_valid;
+    uint32_t cache_dynamic_sources_valid;
+    uint32_t cache_transport_valid;
+    uint32_t cache_projection_valid;
+} fullmag_fem_endpoint_cache_telemetry_v1;
+
+#define FULLMAG_FEM_REPRESENTATION_RECEIPT_V1_ABI_VERSION 1u
+
+typedef enum {
+    FULLMAG_FEM_REPRESENTATION_SPACE_LOCAL_NODE_AOS = 1,
+} fullmag_fem_representation_space;
+
+typedef enum {
+    FULLMAG_FEM_MATERIAL_LOCATION_SCALAR = 1,
+    FULLMAG_FEM_MATERIAL_LOCATION_NODAL_P1 = 2,
+    FULLMAG_FEM_MATERIAL_LOCATION_ELEMENT_DG0 = 3,
+} fullmag_fem_material_location;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t state_space;
+    uint32_t ms_location;
+    uint32_t a_location;
+    uint32_t reserved0;
+    uint64_t local_node_count;
+    uint64_t true_node_count;
+    uint64_t periodic_map_revision;
+    uint64_t representation_copy_count;
+    uint64_t gather_scatter_bytes;
+    uint64_t invalid_space_assertion_count;
+    uint64_t hot_loop_representation_copy_count;
+    uint64_t hot_loop_gather_scatter_bytes;
+} fullmag_fem_representation_receipt_v1;
+
+/*
+ * Append-only native local-node index map.  The MFEM true-DOF extent is
+ * reported separately from the core periodic-class extent; this ABI does not
+ * claim that either numbering is the other one.  The map-copy entrypoint
+ * returns caller-owned u32 arrays with exact lengths declared by the receipt.
+ */
+#define FULLMAG_FEM_LOCAL_NODE_MAP_V1_ABI_VERSION 1u
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t state_space;
+    uint32_t reserved0;
+    uint64_t local_node_count;
+    uint64_t mfem_local_dof_count;
+    uint64_t mfem_true_dof_count;
+    uint64_t core_periodic_class_count;
+    uint64_t core_periodic_map_revision;
+} fullmag_fem_local_node_map_v1;
 
 #define FULLMAG_FEM_ACCEPTED_ENERGY_PROOF_V1_ABI_VERSION 1u
 
@@ -1183,6 +1661,40 @@ typedef struct {
     uint32_t rhs_evaluations;
     int32_t estimator_order;
 } fullmag_fem_solver_attempt_record_v1;
+
+#define FULLMAG_FEM_SOLVER_ATTEMPT_RECORD_V2_ABI_VERSION 2u
+
+typedef enum {
+    FULLMAG_FEM_SOLVER_ERROR_NORM_NONE = 0,
+    FULLMAG_FEM_SOLVER_ERROR_NORM_MAX = 1,
+    FULLMAG_FEM_SOLVER_ERROR_NORM_MASS_WEIGHTED_RMS = 2,
+} fullmag_fem_solver_error_norm_type;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint64_t attempt;
+    uint64_t target_step;
+    double time_seconds;
+    double dt_attempt_seconds;
+    double eta;
+    double max_norm_defect;
+    double max_spin_rotation;
+    uint32_t decision;
+    uint32_t reason;
+    double dt_next_seconds;
+    uint32_t demag_solve_count;
+    uint32_t demag_linear_iterations;
+    double demag_linear_residual;
+    uint32_t rhs_evaluations;
+    int32_t estimator_order;
+    uint32_t error_norm_type;
+    uint64_t active_node_count;
+    double active_measure;
+    double normalization_denominator;
+    double max_scaled_error;
+    double weighted_rms_error;
+} fullmag_fem_solver_attempt_record_v2;
 
 typedef struct {
     char name[128];
@@ -1287,6 +1799,29 @@ typedef enum {
     FULLMAG_FEM_FREQUENCY_DOMAIN_PHASE_EXP_I_OMEGA_T = 0,
     FULLMAG_FEM_FREQUENCY_DOMAIN_PHASE_EXP_MINUS_I_OMEGA_T = 1,
 } fullmag_fem_frequency_domain_phase_convention;
+
+typedef enum {
+    FULLMAG_FEM_MODAL_EXECUTION_AUTO = 0,
+    FULLMAG_FEM_MODAL_EXECUTION_PRODUCTION_CPU = 1,
+    FULLMAG_FEM_MODAL_EXECUTION_PRODUCTION_GPU = 2,
+    FULLMAG_FEM_MODAL_EXECUTION_VALIDATION = 3,
+} fullmag_fem_modal_execution_target;
+
+typedef enum {
+    FULLMAG_FEM_MODAL_SCALAR_REAL_SPLIT = 0,
+    FULLMAG_FEM_MODAL_SCALAR_COMPLEX_DOUBLE = 1,
+} fullmag_fem_modal_scalar_representation;
+
+typedef enum {
+    FULLMAG_FEM_MODAL_RESULT_TANGENT_Q = 0,
+    FULLMAG_FEM_MODAL_RESULT_CARTESIAN_DELTA_M = 1,
+    FULLMAG_FEM_MODAL_RESULT_TANGENT_Q_AND_CARTESIAN_DELTA_M = 2,
+} fullmag_fem_modal_result_field_representation;
+
+typedef enum {
+    FULLMAG_FEM_MODAL_SPECTRAL_TRANSFORM_AUTO = 0,
+    FULLMAG_FEM_MODAL_SPECTRAL_TRANSFORM_SHIFT_INVERT = 1,
+} fullmag_fem_modal_spectral_transform_kind;
 
 typedef enum {
     FULLMAG_FEM_FREQUENCY_DOMAIN_DRIVE_UNSPECIFIED = 0,
@@ -1514,7 +2049,17 @@ typedef struct {
     char *artifact_manifest_path;
 } fullmag_fem_frequency_domain_solve_result;
 
-#define FULLMAG_FEM_FREQUENCY_DOMAIN_ABI_VERSION 12u
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_LEGACY_ABI_VERSION 12u
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_PRIOR_ABI_VERSION 13u
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_PREVIOUS_ABI_VERSION 14u
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_V15_ABI_VERSION 15u
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_V16_ABI_VERSION 16u
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_V17_ABI_VERSION 17u
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_V18_ABI_VERSION 18u
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_ABI_VERSION 19u
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_RESULT_ABI_VERSION 18u
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_RESULT_V20_ABI_VERSION 20u
+#define FULLMAG_FEM_MODAL_GPU_ATTESTATION_V1_ABI_VERSION 1u
 
 typedef enum {
     FULLMAG_FEM_FD_OK = 0,
@@ -1525,6 +2070,44 @@ typedef enum {
     FULLMAG_FEM_FD_ARTIFACT_ERROR = 5,
     FULLMAG_FEM_FD_INTERRUPTED = 6,
 } FullmagFemFrequencyDomainStatus;
+
+typedef enum {
+    FULLMAG_FEM_MODAL_GPU_MEASUREMENT_UNSPECIFIED = 0,
+    FULLMAG_FEM_MODAL_GPU_MEASUREMENT_MEASURED = 1,
+    FULLMAG_FEM_MODAL_GPU_MEASUREMENT_UNAVAILABLE = 2,
+    FULLMAG_FEM_MODAL_GPU_MEASUREMENT_FAILED = 3,
+} FullmagFemModalGpuMeasurementState;
+
+typedef enum {
+    FULLMAG_FEM_MODAL_GPU_FALLBACK_UNSPECIFIED = 0,
+    FULLMAG_FEM_MODAL_GPU_FALLBACK_NONE = 1,
+    FULLMAG_FEM_MODAL_GPU_FALLBACK_ATTEMPTED = 2,
+} FullmagFemModalGpuFallbackState;
+
+typedef enum {
+    FULLMAG_FEM_MODAL_OPERATOR_UNSPECIFIED = 0,
+    FULLMAG_FEM_MODAL_OPERATOR_MATRIX_FREE_SCHUR_CUDA = 1,
+    FULLMAG_FEM_MODAL_OPERATOR_MATERIALIZED_VALIDATION_CUDA = 2,
+} FullmagFemModalOperatorKind;
+
+typedef enum {
+    FULLMAG_FEM_MODAL_HYPRE_MEMORY_UNSPECIFIED = 0,
+    FULLMAG_FEM_MODAL_HYPRE_MEMORY_HOST = 1,
+    FULLMAG_FEM_MODAL_HYPRE_MEMORY_DEVICE = 2,
+    FULLMAG_FEM_MODAL_HYPRE_MEMORY_UNIFIED = 3,
+} FullmagFemModalHypreMemoryLocation;
+
+typedef enum {
+    FULLMAG_FEM_MODAL_HYPRE_EXEC_UNSPECIFIED = 0,
+    FULLMAG_FEM_MODAL_HYPRE_EXEC_HOST = 1,
+    FULLMAG_FEM_MODAL_HYPRE_EXEC_DEVICE = 2,
+} FullmagFemModalHypreExecutionPolicy;
+
+#define FULLMAG_FEM_MODAL_GPU_COVERAGE_SETUP UINT64_C(1)
+#define FULLMAG_FEM_MODAL_GPU_COVERAGE_FULLMAG_HOT_LOOP UINT64_C(2)
+#define FULLMAG_FEM_MODAL_GPU_COVERAGE_OBJECT_GRAPH UINT64_C(4)
+#define FULLMAG_FEM_MODAL_GPU_COVERAGE_SCALAR_TELEMETRY UINT64_C(8)
+#define FULLMAG_FEM_MODAL_GPU_COVERAGE_EXPORT UINT64_C(16)
 
 typedef struct {
     uint32_t abi_version;
@@ -1554,6 +2137,236 @@ typedef struct {
     uint64_t values_len;
 } FullmagFemCsrMatrixView;
 
+/*
+ * Append-only v6 periodic certificate handoff used by the shared-domain
+ * modal boundary.  These records intentionally use fixed-width integer
+ * fields and pointers only; the C++ verifier converts them to its
+ * backend-neutral MeshSymmetryCertificateV6* model before any MFEM assembly.
+ */
+typedef struct {
+    uint64_t source_node;
+    uint64_t destination_node;
+    uint32_t axis_mask;
+    uint32_t kind;
+} FullmagFemModalCertificateV6Relation;
+
+typedef struct {
+    uint32_t region_id;
+    uint32_t part_role;
+} FullmagFemModalCertificateV6RegionRole;
+
+typedef struct {
+    uint64_t canonical_class_id;
+    uint64_t member_count;
+    const char *sha256;
+} FullmagFemModalCertificateV6ClassDigest;
+
+typedef struct {
+    uint32_t view_kind;
+    uint32_t part_role;
+    const char *part_identity;
+    const char *topology_fingerprint;
+    uint64_t node_count;
+    const uint32_t *region_ids;
+    const uint32_t *boundary_axis_masks;
+    const FullmagFemModalCertificateV6RegionRole *region_roles;
+    uint64_t region_role_count;
+    const FullmagFemModalCertificateV6Relation *generator_relations;
+    uint64_t generator_relation_count;
+    const FullmagFemModalCertificateV6Relation *closure_relations;
+    uint64_t closure_relation_count;
+    uint8_t require_complete_closure;
+    const uint64_t *expected_class_ids;
+    uint64_t expected_class_id_count;
+    const FullmagFemModalCertificateV6ClassDigest *expected_class_digests;
+    uint64_t expected_class_digest_count;
+} FullmagFemModalCertificateV6View;
+
+typedef struct {
+    const char *schema_version;
+    FullmagFemModalCertificateV6View mesh_magnetic;
+    FullmagFemModalCertificateV6View payload_magnetic;
+    FullmagFemModalCertificateV6View mesh_scalar;
+    FullmagFemModalCertificateV6View payload_scalar;
+} FullmagFemModalCertificateV6BindingRequest;
+
+/*
+ * Append-only backend-neutral physical handoff for the native modal
+ * linearization.  This descriptor names the accepted state and term views;
+ * it deliberately does not carry a preassembled A_qq matrix or solver/UI
+ * policy.  ABI v18 producers must provide the complete v1 descriptor.
+ */
+#define FULLMAG_FEM_MODAL_LINEARIZATION_DESCRIPTOR_V1_ABI_VERSION 1u
+#define FULLMAG_FEM_MODAL_LINEARIZATION_DESCRIPTOR_SCHEMA \
+    "modal_linearization_descriptor.v1"
+#define FULLMAG_FEM_MODAL_EXCHANGE_MATERIAL_VIEW_V1_ABI_VERSION 1u
+#define FULLMAG_FEM_MODAL_EXCHANGE_MATERIAL_VIEW_SCHEMA \
+    "modal_exchange_material_view.v1"
+#define FULLMAG_FEM_MODAL_EXCHANGE_MATERIAL_KIND_AEX 1u
+#define FULLMAG_FEM_MODAL_LINEARIZATION_TERM_EXCHANGE (1u << 0)
+#define FULLMAG_FEM_MODAL_LINEARIZATION_TERM_FIELD (1u << 1)
+#define FULLMAG_FEM_MODAL_LINEARIZATION_TERM_ANISOTROPY (1u << 2)
+#define FULLMAG_FEM_MODAL_LINEARIZATION_TERM_DMI (1u << 3)
+#define FULLMAG_FEM_MODAL_LINEARIZATION_TERM_DEMAG (1u << 4)
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved0;
+    uint64_t struct_size;
+    const char *schema_version;
+    uint64_t node_count;
+    uint64_t tangent_dof_count;
+    const char *coordinate_unit;
+    const char *magnetisation_unit;
+    const char *time_unit;
+    const char *frequency_unit;
+    const char *angular_frequency_unit;
+    const char *linearization_state_digest;
+    const char *equilibrium_digest;
+    const char *exchange_term_digest;
+    const char *field_term_digest;
+    const char *anisotropy_term_digest;
+    const char *dmi_term_digest;
+    const char *demag_term_digest;
+    const char *operator_input_digest;
+    const char *demag_provider_signature;
+    uint32_t term_presence_mask;
+    uint32_t reserved_contract_flags;
+    const double *tangent_frame_xyz;
+    uint64_t tangent_frame_xyz_count;
+    const double *equilibrium_m0_xyz;
+    uint64_t equilibrium_m0_xyz_count;
+    const double *effective_field_h_eff0_xyz;
+    uint64_t effective_field_h_eff0_xyz_count;
+    const double *external_field_h_ext0_xyz;
+    uint64_t external_field_h_ext0_xyz_count;
+    const double *alpha_per_node;
+    uint64_t alpha_per_node_count;
+    const double *uniaxial_axis_xyz;
+    uint64_t uniaxial_axis_xyz_count;
+    const double *uniaxial_anisotropy_field_a_per_m;
+    uint64_t uniaxial_anisotropy_field_count;
+    const double *saturation_magnetisation_a_per_m;
+    uint64_t saturation_magnetisation_count;
+    double uniform_saturation_magnetisation_a_per_m;
+    const fullmag_fem_frequency_domain_exchange_edge *exchange_edges;
+    uint64_t exchange_edge_count;
+    const fullmag_fem_frequency_domain_dmi_element *dmi_elements;
+    uint64_t dmi_element_count;
+    const double *dmi_lumped_mass;
+    uint64_t dmi_lumped_mass_count;
+    const double *dmi_ms_field;
+    uint64_t dmi_ms_field_count;
+    double dmi_uniform_ms;
+} FullmagFemModalLinearizationDescriptor;
+
+/*
+ * Append-only scalar material carrier for the v18 modal shared-domain path.
+ * It carries no node endpoints: native MFEM assembly owns topology and
+ * quadrature.  The older exchange_edges view remains validation-only
+ * compatibility until producers publish this sidecar.
+ */
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved0;
+    uint64_t struct_size;
+    const char *schema_version;
+    uint32_t material_kind;
+    uint32_t reserved1;
+    double exchange_stiffness_j_per_m;
+} FullmagFemModalExchangeMaterialView;
+
+/*
+ * Versioned native modal payload for the physical shared-domain Poisson
+ * airbox lane.  The payload is append-only and is referenced by the modal
+ * request; all pointed-to storage remains owned by the caller for the
+ * duration of fullmag_fem_modal_eigen_solve().
+ */
+typedef struct {
+    uint32_t abi_version;
+    /* The payload prefix must cover each identity field consumed by the
+       requested modal ABI before any pointed-to tail is dereferenced. */
+    uint32_t struct_size;
+    const fullmag_fem_mesh_desc *mesh;
+    const double *equilibrium_m0_xyz;
+    uint64_t equilibrium_m0_xyz_count;
+    const double *saturation_magnetisation_a_per_m;
+    uint64_t saturation_magnetisation_count;
+    double uniform_saturation_magnetisation_a_per_m;
+    double gamma0_m_per_a_s;
+    FullmagFemCsrMatrixView magnetic_a_qq_csr;
+    const uint32_t *scalar_reduced_node;
+    uint64_t scalar_reduced_node_count;
+    const uint32_t *magnetic_reduced_node;
+    uint64_t magnetic_reduced_node_count;
+    uint64_t magnetic_pair_count;
+    uint64_t airbox_pair_count;
+    const char *boundary_kind;
+    double robin_beta;
+    uint32_t boundary_marker;
+    const char *equilibrium_digest;
+    const char *mesh_certificate_digest;
+    const char *mesh_certificate_schema;
+    /* v15: exact accepted LinearizationState.v6 identity. */
+    const char *linearization_state_digest;
+    /* v16: accepted equilibrium fields consumed by native linearization. */
+    const double *linearization_m0_xyz;
+    uint64_t linearization_m0_xyz_count;
+    const double *linearization_h_eff0_xyz;
+    uint64_t linearization_h_eff0_xyz_count;
+    const double *linearization_h_demag0_xyz;
+    uint64_t linearization_h_demag0_xyz_count;
+    const double *linearization_phi0;
+    uint64_t linearization_phi0_count;
+    const char *equilibrium_id;
+    const char *mesh_snapshot_id;
+    const char *material_snapshot_id;
+    const char *physics_snapshot_id;
+    const char *boundary_snapshot_id;
+    const char *producer_run_id;
+    const char *equilibrium_content_sha256;
+    const char *demag_model;
+    double m0_norm_tolerance;
+    /* Frozen v16 field retained only to preserve the historical ABI prefix.
+       ABI v19 producers set it to zero and native code never treats it as an
+       equilibrium-acceptance threshold. */
+    double equilibrium_torque_relative_tolerance;
+    /* v16 append-only certificate binding.  Every identity is required by
+       the modal boundary before the payload may enter a shared-domain solve. */
+    const char *mesh_certificate_map_binding_digest;
+    const char *boundary_gauge_digest;
+    uint64_t bias_field_sample_index;
+    const char *bias_field_sample_id;
+    const char *bias_field_sample_signature;
+    const char *magnetic_part_identity;
+    const char *airbox_part_identity;
+    /* v17: canonical certificate preimage binding.  These fields are
+       append-only and may only be read when struct_size covers this tail. */
+    const char *mesh_generation_identity;
+    const char *canonical_preimage;
+    uint64_t canonical_preimage_len;
+    const char *canonical_preimage_sha256;
+    const char *magnetic_class_digest_sha256;
+    const char *scalar_class_digest_sha256;
+    uint32_t certificate_binding_status;
+    const char *certificate_binding_reason;
+    /* Append-only v6 relation views.  The modal boundary must reject a
+       payload whose prefix does not cover this pointer or whose views cannot
+       be verified against the canonical binding digest. */
+    const FullmagFemModalCertificateV6BindingRequest *certificate_binding_v6;
+    /* v18: backend-neutral physical linearization descriptor. */
+    const FullmagFemModalLinearizationDescriptor *linearization_descriptor;
+    /* v18 append-only scalar material carrier for native exchange. */
+    const FullmagFemModalExchangeMaterialView *exchange_material_view;
+    /* v19: immutable user-owned relaxation acceptance certificate. */
+    const char *acceptance_criterion;
+    const char *acceptance_metric_kind;
+    const char *acceptance_unit;
+    double acceptance_metric_value;
+    double acceptance_threshold;
+    const char *acceptance_certificate_sha256;
+} FullmagFemModalSharedDomainPayload;
+
 typedef struct {
     uint32_t abi_version;
     FullmagFemLinearizedOperatorRequest operator_request;
@@ -1569,7 +2382,7 @@ typedef struct {
     int write_partial_artifacts;
     int completeness_policy;
     int eigensolver_family;
-    int spectral_transform_kind;
+    fullmag_fem_modal_spectral_transform_kind spectral_transform_kind;
     void *cancel_user_data;
     int (*cancel_requested)(void *user_data);
     void *progress_user_data;
@@ -1625,6 +2438,18 @@ typedef struct {
     const char *poisson_airbox_assembly_kind;
     const double *dynamic_demag_k_tangent_matrix_row_major;
     uint64_t dynamic_demag_k_tangent_matrix_value_count;
+    /* v15+ append-only tail gate.  A known ABI version at or above v15
+       requires this byte count to cover every field consumed by that version;
+       callers must not rely on an implicit full-size default. */
+    uint64_t struct_size;
+    fullmag_fem_modal_execution_target execution_target;
+    fullmag_fem_modal_scalar_representation scalar_representation;
+    fullmag_fem_modal_result_field_representation result_field_representation;
+    uint32_t reserved_modal_contract_flags;
+    const FullmagFemModalSharedDomainPayload *shared_domain_payload;
+    /* v17: producer expectations for the canonical certificate binding. */
+    const char *mesh_generation_identity;
+    const char *canonical_preimage_sha256;
 } FullmagFemModalEigenRequest;
 
 typedef struct {
@@ -1646,13 +2471,515 @@ typedef struct {
 } FullmagFemDrivenResponseRequest;
 
 typedef struct {
+    double real;
+    double imag;
+} FullmagFemComplex64;
+
+typedef struct {
     uint32_t abi_version;
     FullmagFemFrequencyDomainStatus status;
     char *error_message;
     char *diagnostics_json;
     char *result_json;
     char *artifact_manifest_path;
+    uint64_t mode_count;
+    uint64_t q_dof_count;
+    uint64_t phi_dof_count;
+    uint64_t mode_lambda_count;
+    uint64_t mode_q_complex_count;
+    uint64_t mode_phi_complex_count;
+    uint64_t mode_delta_m_xyz_complex_count;
+    uint64_t mode_residual_count;
+    uint64_t mode_cluster_id_count;
+    FullmagFemComplex64 *mode_lambda;
+    FullmagFemComplex64 *mode_q_complex;
+    FullmagFemComplex64 *mode_phi_complex;
+    FullmagFemComplex64 *mode_delta_m_xyz_complex;
+    double *mode_residuals;
+    uint64_t *mode_cluster_ids;
+    fullmag_fem_modal_execution_target resolved_execution_target;
+    fullmag_fem_modal_scalar_representation resolved_scalar_representation;
+    fullmag_fem_modal_spectral_transform_kind resolved_spectral_transform_kind;
+    uint32_t result_flags;
+    uint64_t struct_size;
+    /* v16 append-only executed-path provenance. */
+    uint32_t resolved_fallback_state;
+    char *resolved_engine_id;
+    char *resolved_fallback_reason;
+    /* v17: resolved canonical certificate binding provenance. */
+    char *resolved_canonical_preimage_sha256;
+    uint32_t resolved_certificate_binding_status;
+    char *resolved_certificate_binding_reason;
 } FullmagFemFrequencyDomainResult;
+
+/* Caller-sized GPU execution evidence. V1 is deliberately complete-prefix:
+   readers reject a shorter record before dereferencing any tail field. */
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t measurement_state;
+    uint32_t fallback_state;
+    uint64_t measurement_coverage_flags;
+    uint32_t device_residency_verified;
+    uint32_t production_shared_domain;
+    uint32_t validation_only;
+    uint32_t operator_kind;
+    uint32_t hypre_memory_location;
+    uint32_t hypre_execution_policy;
+    uint32_t compute_capability_major;
+    uint32_t compute_capability_minor;
+    uint32_t cuda_driver_version;
+    uint32_t cuda_runtime_version;
+    char *device_name;
+    char *mfem_version;
+    char *hypre_version;
+    char *petsc_version;
+    char *slepc_version;
+    char *petsc_vec_type;
+    char *petsc_matrix_type;
+    char *matshell_vec_type;
+    char *slepc_bv_type;
+    char *eps_type;
+    char *st_type;
+    char *ksp_type;
+    char *poisson_pc_type;
+    char *shift_pc_type;
+    char *last_invalidation_reason;
+    uint8_t device_uuid[16];
+    uint8_t object_graph_sha256[32];
+    uint8_t native_trace_sha256[32];
+    uint8_t source_snapshot_sha256[32];
+    uint8_t runtime_manifest_sha256[32];
+    uint8_t mesh_identity_sha256[32];
+    uint8_t equilibrium_sha256[32];
+    uint8_t certificate_sha256[32];
+    uint8_t linearization_sha256[32];
+    uint8_t material_sha256[32];
+    uint8_t physics_sha256[32];
+    uint8_t boundary_sha256[32];
+    uint8_t gauge_sha256[32];
+    uint8_t operator_terms_sha256[32];
+    uint8_t solver_policy_sha256[32];
+    uint8_t operator_key_sha256[32];
+    uint8_t target_key_sha256[32];
+    uint8_t session_context_sha256[32];
+    uint64_t setup_h2d_count;
+    uint64_t setup_h2d_bytes;
+    uint64_t hot_loop_computational_h2d_count;
+    uint64_t hot_loop_computational_h2d_bytes;
+    uint64_t hot_loop_computational_d2h_count;
+    uint64_t hot_loop_computational_d2h_bytes;
+    uint64_t hot_loop_scalar_telemetry_d2h_count;
+    uint64_t hot_loop_scalar_telemetry_d2h_bytes;
+    uint64_t hot_loop_full_vector_crossings;
+    uint64_t hot_loop_computational_host_syncs;
+    uint64_t hot_loop_scalar_telemetry_syncs;
+    uint64_t hot_loop_allocations;
+    uint64_t export_d2h_count;
+    uint64_t export_d2h_bytes;
+    uint64_t device_memory_baseline_bytes;
+    uint64_t device_memory_peak_bytes;
+    uint64_t device_memory_final_bytes;
+    uint64_t operator_dimension;
+    uint64_t operator_apply_count;
+    uint64_t poisson_solve_count;
+    uint64_t poisson_iteration_count;
+    uint64_t eps_iteration_count;
+    uint64_t eps_restart_count;
+    int64_t eps_converged_reason;
+    uint64_t operator_state_generation;
+    uint64_t target_state_generation;
+    uint64_t operator_reuse_count;
+    uint64_t target_rebuild_count;
+    uint64_t invalidation_flags;
+} FullmagFemModalGpuAttestationV1;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    FullmagFemFrequencyDomainResult scientific_result_v18;
+    FullmagFemModalGpuAttestationV1 *gpu_attestation;
+} FullmagFemFrequencyDomainResultV20;
+
+#define FULLMAG_FEM_MODAL_GPU_ATTESTATION_V1_FIELD_LIST(X) \
+    X(abi_version) X(struct_size) X(measurement_state) X(fallback_state) \
+    X(measurement_coverage_flags) X(device_residency_verified) \
+    X(production_shared_domain) X(validation_only) X(operator_kind) \
+    X(hypre_memory_location) X(hypre_execution_policy) \
+    X(compute_capability_major) X(compute_capability_minor) \
+    X(cuda_driver_version) X(cuda_runtime_version) X(device_name) \
+    X(mfem_version) X(hypre_version) X(petsc_version) X(slepc_version) \
+    X(petsc_vec_type) X(petsc_matrix_type) X(matshell_vec_type) \
+    X(slepc_bv_type) X(eps_type) X(st_type) X(ksp_type) X(poisson_pc_type) \
+    X(shift_pc_type) X(last_invalidation_reason) X(device_uuid) \
+    X(object_graph_sha256) X(native_trace_sha256) X(source_snapshot_sha256) \
+    X(runtime_manifest_sha256) X(mesh_identity_sha256) X(equilibrium_sha256) \
+    X(certificate_sha256) X(linearization_sha256) X(material_sha256) \
+    X(physics_sha256) X(boundary_sha256) X(gauge_sha256) \
+    X(operator_terms_sha256) X(solver_policy_sha256) X(operator_key_sha256) \
+    X(target_key_sha256) X(session_context_sha256) X(setup_h2d_count) \
+    X(setup_h2d_bytes) X(hot_loop_computational_h2d_count) \
+    X(hot_loop_computational_h2d_bytes) X(hot_loop_computational_d2h_count) \
+    X(hot_loop_computational_d2h_bytes) X(hot_loop_scalar_telemetry_d2h_count) \
+    X(hot_loop_scalar_telemetry_d2h_bytes) X(hot_loop_full_vector_crossings) \
+    X(hot_loop_computational_host_syncs) X(hot_loop_scalar_telemetry_syncs) \
+    X(hot_loop_allocations) X(export_d2h_count) X(export_d2h_bytes) \
+    X(device_memory_baseline_bytes) X(device_memory_peak_bytes) \
+    X(device_memory_final_bytes) X(operator_dimension) X(operator_apply_count) \
+    X(poisson_solve_count) X(poisson_iteration_count) X(eps_iteration_count) \
+    X(eps_restart_count) X(eps_converged_reason) X(operator_state_generation) \
+    X(target_state_generation) X(operator_reuse_count) X(target_rebuild_count) \
+    X(invalidation_flags)
+
+#define FULLMAG_FEM_MODAL_GPU_ATTESTATION_V1_COUNT_ONE(member) + 1u
+#define FULLMAG_FEM_MODAL_GPU_ATTESTATION_V1_FIELD_COUNT \
+    (0u FULLMAG_FEM_MODAL_GPU_ATTESTATION_V1_FIELD_LIST( \
+        FULLMAG_FEM_MODAL_GPU_ATTESTATION_V1_COUNT_ONE))
+
+typedef enum {
+    FULLMAG_FEM_MODAL_CERTIFICATE_BINDING_UNSPECIFIED = 0,
+    FULLMAG_FEM_MODAL_CERTIFICATE_BINDING_ACCEPTED = 1,
+    FULLMAG_FEM_MODAL_CERTIFICATE_BINDING_UNVERIFIABLE = 2,
+    FULLMAG_FEM_MODAL_CERTIFICATE_BINDING_INVALID = 3,
+} fullmag_fem_modal_certificate_binding_status;
+
+/*
+ * Modal ABI manifest order.  These lists are append-only contract metadata:
+ * every entry names one directly addressable public member of the matching
+ * modal envelope.  `fullmag_fem_frequency_domain_abi_layout` publishes the
+ * corresponding sizeof/offsetof sequence below for C++/Rust ABI checks.
+ */
+#define FULLMAG_FEM_MODAL_LINEARIZED_OPERATOR_REQUEST_FIELD_LIST(X) \
+    X(abi_version) \
+    X(mesh_asset_id) \
+    X(equilibrium_source_kind) \
+    X(gamma_rad_s_T) \
+    X(mu0_T_m_A) \
+    X(alpha) \
+    X(include_exchange) \
+    X(include_demag) \
+    X(demag_realization) \
+    X(damping_policy) \
+    X(spin_wave_bc_kind) \
+    X(k_vector_rad_m) \
+    X(k_vector_len) \
+    X(operator_diagnostics_json)
+
+#define FULLMAG_FEM_MODAL_EIGEN_REQUEST_FIELD_LIST(X) \
+    X(abi_version) \
+    X(operator_request) \
+    X(requested_mode_count) \
+    X(target_kind) \
+    X(target_frequency_hz) \
+    X(frequency_min_hz) \
+    X(frequency_max_hz) \
+    X(residual_tolerance) \
+    X(max_outer_iterations) \
+    X(max_linear_iterations) \
+    X(output_directory) \
+    X(write_partial_artifacts) \
+    X(completeness_policy) \
+    X(eigensolver_family) \
+    X(spectral_transform_kind) \
+    X(cancel_user_data) \
+    X(cancel_requested) \
+    X(progress_user_data) \
+    X(progress_callback) \
+    X(tiny_validation_enabled) \
+    X(tiny_validation_tangent_dof_count) \
+    X(tiny_validation_stiffness_matrix_row_major) \
+    X(tiny_validation_mass_matrix_row_major) \
+    X(tiny_validation_stiffness_diagonal) \
+    X(tiny_validation_mass_diagonal) \
+    X(mfem_operator_enabled) \
+    X(mfem_tangent_dof_count) \
+    X(mfem_stiffness_matrix_row_major) \
+    X(mfem_gyrotropic_matrix_row_major) \
+    X(mfem_mass_matrix_row_major) \
+    X(mfem_linearized_pencil_dependency_digest) \
+    X(mfem_linearized_pencil_gamma0_m_per_a_s) \
+    X(mfem_sparse_operator_enabled) \
+    X(mfem_sparse_stiffness_csr) \
+    X(mfem_sparse_gyrotropic_csr) \
+    X(mfem_sparse_mass_csr) \
+    X(has_floquet_k_vector) \
+    X(floquet_k_vector_rad_per_m) \
+    X(phase_convention) \
+    X(mfem_floquet_periodic_pairs) \
+    X(mfem_floquet_periodic_pair_count) \
+    X(poisson_airbox_block_enabled) \
+    X(poisson_airbox_q_dof_count) \
+    X(poisson_airbox_phi_dof_count) \
+    X(poisson_airbox_a_qq_csr) \
+    X(poisson_airbox_a_qphi_csr) \
+    X(poisson_airbox_a_phiq_csr) \
+    X(poisson_airbox_a_phiphi_csr) \
+    X(poisson_airbox_b_qq_csr) \
+    X(poisson_airbox_phi_mean_weights) \
+    X(poisson_airbox_phi_mean_weights_count) \
+    X(poisson_airbox_target_frequency_hz) \
+    X(poisson_airbox_expected_reference_frequency_hz) \
+    X(poisson_airbox_periodic_mesh_certificate_schema) \
+    X(poisson_airbox_magnetic_pair_count) \
+    X(poisson_airbox_airbox_pair_count) \
+    X(poisson_airbox_shift_invert_action_enabled) \
+    X(poisson_airbox_shift_invert_action_device) \
+    X(poisson_airbox_shift_sigma_real) \
+    X(poisson_airbox_shift_sigma_imag) \
+    X(poisson_airbox_shift_action_vector_real) \
+    X(poisson_airbox_shift_action_vector_imag) \
+    X(poisson_airbox_shift_action_vector_count) \
+    X(poisson_airbox_outer_boundary_kind) \
+    X(poisson_airbox_robin_beta) \
+    X(poisson_airbox_gauge_policy) \
+    X(poisson_airbox_gauge_reason) \
+    X(poisson_airbox_assembly_kind) \
+    X(dynamic_demag_k_tangent_matrix_row_major) \
+    X(dynamic_demag_k_tangent_matrix_value_count) \
+    X(struct_size) \
+    X(execution_target) \
+    X(scalar_representation) \
+    X(result_field_representation) \
+    X(reserved_modal_contract_flags) \
+    X(shared_domain_payload) \
+    X(mesh_generation_identity) \
+    X(canonical_preimage_sha256)
+
+#define FULLMAG_FEM_MODAL_SHARED_DOMAIN_PAYLOAD_FIELD_LIST(X) \
+    X(abi_version) \
+    X(struct_size) \
+    X(mesh) \
+    X(equilibrium_m0_xyz) \
+    X(equilibrium_m0_xyz_count) \
+    X(saturation_magnetisation_a_per_m) \
+    X(saturation_magnetisation_count) \
+    X(uniform_saturation_magnetisation_a_per_m) \
+    X(gamma0_m_per_a_s) \
+    X(magnetic_a_qq_csr) \
+    X(scalar_reduced_node) \
+    X(scalar_reduced_node_count) \
+    X(magnetic_reduced_node) \
+    X(magnetic_reduced_node_count) \
+    X(magnetic_pair_count) \
+    X(airbox_pair_count) \
+    X(boundary_kind) \
+    X(robin_beta) \
+    X(boundary_marker) \
+    X(equilibrium_digest) \
+    X(mesh_certificate_digest) \
+    X(mesh_certificate_schema) \
+    X(linearization_state_digest) \
+    X(linearization_m0_xyz) \
+    X(linearization_m0_xyz_count) \
+    X(linearization_h_eff0_xyz) \
+    X(linearization_h_eff0_xyz_count) \
+    X(linearization_h_demag0_xyz) \
+    X(linearization_h_demag0_xyz_count) \
+    X(linearization_phi0) \
+    X(linearization_phi0_count) \
+    X(equilibrium_id) \
+    X(mesh_snapshot_id) \
+    X(material_snapshot_id) \
+    X(physics_snapshot_id) \
+    X(boundary_snapshot_id) \
+    X(producer_run_id) \
+    X(equilibrium_content_sha256) \
+    X(demag_model) \
+    X(m0_norm_tolerance) \
+    X(equilibrium_torque_relative_tolerance) \
+    X(mesh_certificate_map_binding_digest) \
+    X(boundary_gauge_digest) \
+    X(bias_field_sample_index) \
+    X(bias_field_sample_id) \
+    X(bias_field_sample_signature) \
+    X(magnetic_part_identity) \
+    X(airbox_part_identity) \
+    X(mesh_generation_identity) \
+    X(canonical_preimage) \
+    X(canonical_preimage_len) \
+    X(canonical_preimage_sha256) \
+    X(magnetic_class_digest_sha256) \
+    X(scalar_class_digest_sha256) \
+    X(certificate_binding_status) \
+    X(certificate_binding_reason) \
+    X(certificate_binding_v6)
+
+#define FULLMAG_FEM_MODAL_FREQUENCY_DOMAIN_RESULT_FIELD_LIST(X) \
+    X(abi_version) \
+    X(status) \
+    X(error_message) \
+    X(diagnostics_json) \
+    X(result_json) \
+    X(artifact_manifest_path) \
+    X(mode_count) \
+    X(q_dof_count) \
+    X(phi_dof_count) \
+    X(mode_lambda_count) \
+    X(mode_q_complex_count) \
+    X(mode_phi_complex_count) \
+    X(mode_delta_m_xyz_complex_count) \
+    X(mode_residual_count) \
+    X(mode_cluster_id_count) \
+    X(mode_lambda) \
+    X(mode_q_complex) \
+    X(mode_phi_complex) \
+    X(mode_delta_m_xyz_complex) \
+    X(mode_residuals) \
+    X(mode_cluster_ids) \
+    X(resolved_execution_target) \
+    X(resolved_scalar_representation) \
+    X(resolved_spectral_transform_kind) \
+    X(result_flags) \
+    X(struct_size) \
+    X(resolved_fallback_state) \
+    X(resolved_engine_id) \
+    X(resolved_fallback_reason) \
+    X(resolved_canonical_preimage_sha256) \
+    X(resolved_certificate_binding_status) \
+    X(resolved_certificate_binding_reason)
+
+#define FULLMAG_FEM_MODAL_CSR_MATRIX_VIEW_FIELD_LIST(X) \
+    X(row_count) \
+    X(column_count) \
+    X(row_offsets) \
+    X(row_offsets_len) \
+    X(column_indices) \
+    X(column_indices_len) \
+    X(values) \
+    X(values_len)
+
+/* Nested v6 certificate records are public C ABI types as well.  Keep these
+   field lists append-only so the v2 manifest can prove their cross-language
+   sizeof/offsetof contract without dereferencing caller-owned arrays. */
+#define FULLMAG_FEM_MODAL_CERTIFICATE_V6_RELATION_FIELD_LIST(X) \
+    X(source_node) \
+    X(destination_node) \
+    X(axis_mask) \
+    X(kind)
+
+#define FULLMAG_FEM_MODAL_CERTIFICATE_V6_REGION_ROLE_FIELD_LIST(X) \
+    X(region_id) \
+    X(part_role)
+
+#define FULLMAG_FEM_MODAL_CERTIFICATE_V6_CLASS_DIGEST_FIELD_LIST(X) \
+    X(canonical_class_id) \
+    X(member_count) \
+    X(sha256)
+
+#define FULLMAG_FEM_MODAL_CERTIFICATE_V6_VIEW_FIELD_LIST(X) \
+    X(view_kind) \
+    X(part_role) \
+    X(part_identity) \
+    X(topology_fingerprint) \
+    X(node_count) \
+    X(region_ids) \
+    X(boundary_axis_masks) \
+    X(region_roles) \
+    X(region_role_count) \
+    X(generator_relations) \
+    X(generator_relation_count) \
+    X(closure_relations) \
+    X(closure_relation_count) \
+    X(require_complete_closure) \
+    X(expected_class_ids) \
+    X(expected_class_id_count) \
+    X(expected_class_digests) \
+    X(expected_class_digest_count)
+
+#define FULLMAG_FEM_MODAL_CERTIFICATE_V6_BINDING_REQUEST_FIELD_LIST(X) \
+    X(schema_version) \
+    X(mesh_magnetic) \
+    X(payload_magnetic) \
+    X(mesh_scalar) \
+    X(payload_scalar)
+
+#define FULLMAG_FEM_MODAL_LINEARIZATION_DESCRIPTOR_FIELD_LIST(X) \
+    X(abi_version) \
+    X(reserved0) \
+    X(struct_size) \
+    X(schema_version) \
+    X(node_count) \
+    X(tangent_dof_count) \
+    X(coordinate_unit) \
+    X(magnetisation_unit) \
+    X(time_unit) \
+    X(frequency_unit) \
+    X(angular_frequency_unit) \
+    X(linearization_state_digest) \
+    X(equilibrium_digest) \
+    X(exchange_term_digest) \
+    X(field_term_digest) \
+    X(anisotropy_term_digest) \
+    X(dmi_term_digest) \
+    X(demag_term_digest) \
+    X(operator_input_digest) \
+    X(demag_provider_signature) \
+    X(term_presence_mask) \
+    X(reserved_contract_flags) \
+    X(tangent_frame_xyz) \
+    X(tangent_frame_xyz_count) \
+    X(equilibrium_m0_xyz) \
+    X(equilibrium_m0_xyz_count) \
+    X(effective_field_h_eff0_xyz) \
+    X(effective_field_h_eff0_xyz_count) \
+    X(external_field_h_ext0_xyz) \
+    X(external_field_h_ext0_xyz_count) \
+    X(alpha_per_node) \
+    X(alpha_per_node_count) \
+    X(uniaxial_axis_xyz) \
+    X(uniaxial_axis_xyz_count) \
+    X(uniaxial_anisotropy_field_a_per_m) \
+    X(uniaxial_anisotropy_field_count) \
+    X(saturation_magnetisation_a_per_m) \
+    X(saturation_magnetisation_count) \
+    X(uniform_saturation_magnetisation_a_per_m) \
+    X(exchange_edges) \
+    X(exchange_edge_count) \
+    X(dmi_elements) \
+    X(dmi_element_count) \
+    X(dmi_lumped_mass) \
+    X(dmi_lumped_mass_count) \
+    X(dmi_ms_field) \
+    X(dmi_ms_field_count) \
+    X(dmi_uniform_ms)
+
+#define FULLMAG_FEM_MODAL_EXCHANGE_MATERIAL_VIEW_FIELD_LIST(X) \
+    X(abi_version) \
+    X(reserved0) \
+    X(struct_size) \
+    X(schema_version) \
+    X(material_kind) \
+    X(reserved1) \
+    X(exchange_stiffness_j_per_m)
+
+#define FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER(name) + 1
+enum {
+    FULLMAG_FEM_MODAL_LINEARIZED_OPERATOR_REQUEST_FIELD_COUNT =
+        0 FULLMAG_FEM_MODAL_LINEARIZED_OPERATOR_REQUEST_FIELD_LIST(FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER),
+    FULLMAG_FEM_MODAL_EIGEN_REQUEST_FIELD_COUNT =
+        0 FULLMAG_FEM_MODAL_EIGEN_REQUEST_FIELD_LIST(FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER),
+    FULLMAG_FEM_MODAL_SHARED_DOMAIN_PAYLOAD_FIELD_COUNT =
+        0 FULLMAG_FEM_MODAL_SHARED_DOMAIN_PAYLOAD_FIELD_LIST(FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER),
+    FULLMAG_FEM_MODAL_FREQUENCY_DOMAIN_RESULT_FIELD_COUNT =
+        0 FULLMAG_FEM_MODAL_FREQUENCY_DOMAIN_RESULT_FIELD_LIST(FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER),
+    FULLMAG_FEM_MODAL_CSR_MATRIX_VIEW_FIELD_COUNT =
+        0 FULLMAG_FEM_MODAL_CSR_MATRIX_VIEW_FIELD_LIST(FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER),
+    FULLMAG_FEM_MODAL_CERTIFICATE_V6_RELATION_FIELD_COUNT =
+        0 FULLMAG_FEM_MODAL_CERTIFICATE_V6_RELATION_FIELD_LIST(FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER),
+    FULLMAG_FEM_MODAL_CERTIFICATE_V6_REGION_ROLE_FIELD_COUNT =
+        0 FULLMAG_FEM_MODAL_CERTIFICATE_V6_REGION_ROLE_FIELD_LIST(FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER),
+    FULLMAG_FEM_MODAL_CERTIFICATE_V6_CLASS_DIGEST_FIELD_COUNT =
+        0 FULLMAG_FEM_MODAL_CERTIFICATE_V6_CLASS_DIGEST_FIELD_LIST(FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER),
+    FULLMAG_FEM_MODAL_CERTIFICATE_V6_VIEW_FIELD_COUNT =
+        0 FULLMAG_FEM_MODAL_CERTIFICATE_V6_VIEW_FIELD_LIST(FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER),
+    FULLMAG_FEM_MODAL_CERTIFICATE_V6_BINDING_REQUEST_FIELD_COUNT =
+        0 FULLMAG_FEM_MODAL_CERTIFICATE_V6_BINDING_REQUEST_FIELD_LIST(FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER),
+    FULLMAG_FEM_MODAL_LINEARIZATION_DESCRIPTOR_FIELD_COUNT =
+        0 FULLMAG_FEM_MODAL_LINEARIZATION_DESCRIPTOR_FIELD_LIST(FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER),
+    FULLMAG_FEM_MODAL_EXCHANGE_MATERIAL_VIEW_FIELD_COUNT =
+        0 FULLMAG_FEM_MODAL_EXCHANGE_MATERIAL_VIEW_FIELD_LIST(FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER),
+};
+#undef FULLMAG_FEM_ABI_FIELD_COUNT_MEMBER
 
 typedef struct {
     uint64_t availability_request_size;
@@ -1703,7 +3030,139 @@ typedef struct {
     uint64_t driven_response_request_periodic_airbox_coupled_block_drive_real_value_count_offset;
     uint64_t solve_result_size;
     uint64_t solve_result_artifact_manifest_path_offset;
+    /* Legacy modal manifest fields are retained in the v1 envelope.  New
+       complete manifests use fullmag_fem_frequency_domain_modal_abi_layout_v2
+       below; removing these fields would break existing Rust/C consumers. */
+    uint64_t modal_abi_schema;
+    uint64_t modal_abi_version;
+    uint64_t modal_eigen_request_size;
+    uint64_t modal_eigen_request_struct_size_offset;
+    uint64_t modal_eigen_request_shared_domain_payload_offset;
+    uint64_t modal_shared_domain_payload_size;
+    uint64_t modal_shared_domain_payload_struct_size_offset;
+    uint64_t modal_shared_domain_payload_mesh_certificate_digest_offset;
+    uint64_t modal_shared_domain_payload_map_binding_digest_offset;
+    uint64_t modal_shared_domain_payload_bias_field_sample_id_offset;
+    uint64_t modal_frequency_domain_result_size;
+    uint64_t modal_frequency_domain_result_struct_size_offset;
+    uint64_t modal_frequency_domain_result_resolved_engine_id_offset;
+    uint64_t modal_csr_matrix_view_size;
+    uint64_t modal_csr_matrix_view_values_len_offset;
+    uint64_t modal_eigen_request_abi_version_offset;
+    uint64_t modal_eigen_request_operator_request_offset;
+    uint64_t modal_eigen_request_spectral_transform_kind_offset;
+    uint64_t modal_eigen_request_execution_target_offset;
+    uint64_t modal_eigen_request_scalar_representation_offset;
+    uint64_t modal_eigen_request_result_field_representation_offset;
+    uint64_t modal_shared_domain_payload_abi_version_offset;
+    uint64_t modal_shared_domain_payload_mesh_offset;
+    uint64_t modal_shared_domain_payload_magnetic_a_qq_csr_offset;
+    uint64_t modal_shared_domain_payload_scalar_reduced_node_offset;
+    uint64_t modal_shared_domain_payload_magnetic_reduced_node_offset;
+    uint64_t modal_shared_domain_payload_magnetic_pair_count_offset;
+    uint64_t modal_shared_domain_payload_airbox_pair_count_offset;
+    uint64_t modal_shared_domain_payload_boundary_marker_offset;
+    uint64_t modal_shared_domain_payload_mesh_certificate_schema_offset;
+    uint64_t modal_shared_domain_payload_equilibrium_digest_offset;
+    uint64_t modal_shared_domain_payload_linearization_state_digest_offset;
+    uint64_t modal_shared_domain_payload_boundary_gauge_digest_offset;
+    uint64_t modal_shared_domain_payload_bias_field_sample_index_offset;
+    uint64_t modal_shared_domain_payload_bias_field_sample_signature_offset;
+    uint64_t modal_shared_domain_payload_magnetic_part_identity_offset;
+    uint64_t modal_shared_domain_payload_airbox_part_identity_offset;
+    uint64_t modal_frequency_domain_result_abi_version_offset;
+    uint64_t modal_frequency_domain_result_status_offset;
+    uint64_t modal_frequency_domain_result_error_message_offset;
+    uint64_t modal_frequency_domain_result_mode_lambda_offset;
+    uint64_t modal_frequency_domain_result_resolved_execution_target_offset;
+    uint64_t modal_frequency_domain_result_resolved_scalar_representation_offset;
+    uint64_t modal_frequency_domain_result_resolved_spectral_transform_kind_offset;
+    uint64_t modal_frequency_domain_result_resolved_fallback_state_offset;
+    uint64_t modal_frequency_domain_result_resolved_fallback_reason_offset;
+    uint64_t modal_csr_matrix_view_row_count_offset;
+    uint64_t modal_csr_matrix_view_column_count_offset;
+    uint64_t modal_csr_matrix_view_row_offsets_offset;
+    uint64_t modal_csr_matrix_view_row_offsets_len_offset;
+    uint64_t modal_csr_matrix_view_column_indices_offset;
+    uint64_t modal_csr_matrix_view_column_indices_len_offset;
+    uint64_t modal_csr_matrix_view_values_offset;
 } fullmag_fem_frequency_domain_abi_layout;
+
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_MODAL_ABI_LAYOUT_V2 2u
+typedef struct {
+    uint32_t abi_version;
+    uint32_t reserved0;
+    uint64_t struct_size;
+    uint64_t modal_abi_schema;
+    uint64_t modal_eigen_request_size;
+    uint64_t modal_linearized_operator_request_size;
+    uint64_t modal_shared_domain_payload_size;
+    uint64_t modal_frequency_domain_result_size;
+    uint64_t modal_csr_matrix_view_size;
+    uint64_t modal_eigen_request_field_count;
+    uint64_t modal_eigen_request_field_offsets[128];
+    uint64_t modal_linearized_operator_request_field_count;
+    uint64_t modal_linearized_operator_request_field_offsets[32];
+    uint64_t modal_shared_domain_payload_field_count;
+    uint64_t modal_shared_domain_payload_field_offsets[128];
+    uint64_t modal_frequency_domain_result_field_count;
+    uint64_t modal_frequency_domain_result_field_offsets[64];
+    uint64_t modal_csr_matrix_view_field_count;
+    uint64_t modal_csr_matrix_view_field_offsets[8];
+    uint64_t modal_certificate_v6_relation_size;
+    uint64_t modal_certificate_v6_relation_field_count;
+    uint64_t modal_certificate_v6_relation_field_offsets[8];
+    uint64_t modal_certificate_v6_region_role_size;
+    uint64_t modal_certificate_v6_region_role_field_count;
+    uint64_t modal_certificate_v6_region_role_field_offsets[4];
+    uint64_t modal_certificate_v6_class_digest_size;
+    uint64_t modal_certificate_v6_class_digest_field_count;
+    uint64_t modal_certificate_v6_class_digest_field_offsets[8];
+    uint64_t modal_certificate_v6_view_size;
+    uint64_t modal_certificate_v6_view_field_count;
+    uint64_t modal_certificate_v6_view_field_offsets[32];
+    uint64_t modal_certificate_v6_binding_request_size;
+    uint64_t modal_certificate_v6_binding_request_field_count;
+    uint64_t modal_certificate_v6_binding_request_field_offsets[8];
+} fullmag_fem_frequency_domain_modal_abi_layout_v2;
+
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_MODAL_ABI_LAYOUT_V3 3u
+typedef struct {
+    /* v2 remains the legacy V17-prefix manifest.  This wrapper publishes the
+       V18 payload tail and its descriptor offsets without changing v2.  The
+       caller supplies `v2.struct_size >= sizeof(v3)` as the wrapper prefix
+       guard; the returned nested v2 record reports its own sizeof(v2). */
+    fullmag_fem_frequency_domain_modal_abi_layout_v2 v2;
+    uint64_t modal_linearization_descriptor_size;
+    uint64_t modal_linearization_descriptor_field_count;
+    uint64_t modal_linearization_descriptor_field_offsets[128];
+    uint64_t modal_exchange_material_view_size;
+    uint64_t modal_exchange_material_view_field_count;
+    uint64_t modal_exchange_material_view_field_offsets[16];
+} fullmag_fem_frequency_domain_modal_abi_layout_v3;
+
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_MODAL_ABI_LAYOUT_V4 4u
+typedef struct {
+    /* v3 remains the frozen V18 descriptor/material manifest.  This wrapper
+       publishes the six append-only V19 acceptance-certificate fields. */
+    fullmag_fem_frequency_domain_modal_abi_layout_v3 v3;
+    uint64_t modal_acceptance_certificate_field_count;
+    uint64_t modal_acceptance_certificate_field_offsets[8];
+} fullmag_fem_frequency_domain_modal_abi_layout_v4;
+
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_MODAL_ABI_LAYOUT_V5 5u
+typedef struct {
+    /* v4 remains the frozen request/shared-payload v19 manifest. */
+    fullmag_fem_frequency_domain_modal_abi_layout_v4 v4;
+    uint64_t modal_frequency_domain_result_v20_size;
+    uint64_t modal_frequency_domain_result_v20_align;
+    uint64_t modal_frequency_domain_result_v20_field_count;
+    uint64_t modal_frequency_domain_result_v20_field_offsets[4];
+    uint64_t modal_gpu_attestation_v1_size;
+    uint64_t modal_gpu_attestation_v1_align;
+    uint64_t modal_gpu_attestation_v1_field_count;
+    uint64_t modal_gpu_attestation_v1_field_offsets[128];
+} fullmag_fem_frequency_domain_modal_abi_layout_v5;
 
 typedef struct {
     uint64_t h2d_bytes;
@@ -1737,7 +3196,18 @@ typedef enum {
     FULLMAG_FEM_GPU_DEMAG_UNSPECIFIED = 0,
     FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_POISSON = 1,
     FULLMAG_FEM_GPU_DEMAG_HYBRID_CPU_POISSON = 2,
+    FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_FEM_BEM = 3,
 } fullmag_fem_gpu_demag_mode;
+
+/*
+ * Public policy for the native FEM GPU RK preflight. Compatibility preserves
+ * the existing executable hybrid/operator-acceleration lanes; strict_device
+ * must resolve every required operator to the device before a step begins.
+ */
+typedef enum {
+    FULLMAG_FEM_GPU_EXECUTION_REQUEST_COMPATIBILITY = 0,
+    FULLMAG_FEM_GPU_EXECUTION_REQUEST_STRICT_DEVICE = 1,
+} fullmag_fem_gpu_execution_request_v1;
 
 typedef struct {
     int allocated;
@@ -1808,6 +3278,113 @@ typedef struct {
     uint64_t hot_loop_compute_host_sync_count;
 } fullmag_fem_gpu_execution_receipt_v1;
 
+/*
+ * Append-only Fredkin-Koehler FEM/BEM operator provenance.  The query reports
+ * the operator that was actually assembled/uploaded for the current backend
+ * handle; it never infers readiness from the requested plan alone.
+ */
+#define FULLMAG_FEM_DEMAG_FEM_BEM_PROVENANCE_V1_ABI_VERSION 1u
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t available;
+    uint32_t reserved;
+    char operator_mode[64];
+    char operator_fingerprint[256];
+    uint64_t boundary_node_count;
+    uint64_t boundary_triangle_count;
+    uint64_t near_block_count;
+    uint64_t far_block_count;
+    uint64_t near_entry_count;
+    uint64_t far_row_count;
+    uint32_t max_rank;
+    uint32_t reserved2;
+    double relative_error_estimate;
+    uint64_t resident_bytes;
+    uint64_t device_bytes;
+    uint64_t operator_build_count;
+    uint64_t operator_upload_count;
+    uint64_t apply_count;
+} fullmag_fem_demag_fem_bem_provenance_v1;
+
+/*
+ * Append-only host-owned performance snapshot.  The physical counters include
+ * rejected and failed attempts; accepted counters include all attempts that
+ * belong to a committed logical step, including retries.  A snapshot is
+ * published atomically at commit and therefore never exposes an active attempt.
+ */
+#define FULLMAG_FEM_GPU_PERFORMANCE_SNAPSHOT_V1_ABI_VERSION 1u
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t available;
+    uint32_t execution_class;
+    uint32_t precision;
+    uint32_t integrator;
+    int32_t device_ordinal;
+    uint64_t completed_step;
+    uint64_t completed_execution_id;
+    uint64_t completed_operator_id;
+    uint64_t completed_attempt_count;
+    uint64_t rejected_attempt_count;
+    uint64_t failed_attempt_count;
+
+    uint64_t physical_rhs_evaluations;
+    uint64_t physical_exchange_applies;
+    uint64_t physical_exchange_launches;
+    uint64_t physical_exchange_nnz_visited;
+    uint64_t physical_demag_solves;
+    uint64_t physical_demag_iterations;
+    uint64_t physical_demag_rhs_norm_evaluations;
+    uint64_t physical_demag_stage_energy_evaluations;
+    uint64_t physical_normalization_launches;
+    uint64_t physical_normalization_readbacks;
+    uint64_t physical_adaptive_readbacks;
+    uint64_t physical_control_fences;
+    uint64_t physical_endpoint_cache_hits;
+    uint64_t physical_endpoint_cache_misses;
+    uint64_t physical_endpoint_cache_invalidations;
+    uint64_t physical_device_to_device_bytes;
+    uint64_t physical_control_d2h_bytes;
+    uint64_t physical_bulk_d2h_bytes;
+    double physical_demag_rhs_norm_sum;
+    double physical_demag_stage_energy_sum_joules;
+
+    uint64_t accepted_rhs_evaluations;
+    uint64_t accepted_exchange_applies;
+    uint64_t accepted_exchange_launches;
+    uint64_t accepted_exchange_nnz_visited;
+    uint64_t accepted_demag_solves;
+    uint64_t accepted_demag_iterations;
+    uint64_t accepted_demag_rhs_norm_evaluations;
+    uint64_t accepted_demag_stage_energy_evaluations;
+    uint64_t accepted_normalization_launches;
+    uint64_t accepted_normalization_readbacks;
+    uint64_t accepted_adaptive_readbacks;
+    uint64_t accepted_control_fences;
+    uint64_t accepted_endpoint_cache_hits;
+    uint64_t accepted_endpoint_cache_misses;
+    uint64_t accepted_endpoint_cache_invalidations;
+    uint64_t accepted_device_to_device_bytes;
+    uint64_t accepted_control_d2h_bytes;
+    uint64_t accepted_bulk_d2h_bytes;
+    double accepted_demag_rhs_norm_sum;
+    double accepted_demag_stage_energy_sum_joules;
+
+    uint64_t physical_exchange_elapsed_ns;
+    uint64_t physical_demag_assemble_elapsed_ns;
+    uint64_t physical_demag_recover_elapsed_ns;
+    uint64_t physical_demag_energy_elapsed_ns;
+    uint64_t physical_rhs_elapsed_ns;
+    uint64_t accepted_exchange_elapsed_ns;
+    uint64_t accepted_demag_assemble_elapsed_ns;
+    uint64_t accepted_demag_recover_elapsed_ns;
+    uint64_t accepted_demag_energy_elapsed_ns;
+    uint64_t accepted_rhs_elapsed_ns;
+} fullmag_fem_gpu_performance_snapshot_v1;
+
 typedef struct fullmag_fem_backend fullmag_fem_backend;
 typedef struct fullmag_fem_field_snapshot fullmag_fem_field_snapshot;
 typedef struct fullmag_fem_preview_snapshot fullmag_fem_preview_snapshot;
@@ -1823,44 +3400,108 @@ typedef struct {
     fullmag_fem_snapshot_scalar_type scalar_type;
 } fullmag_fem_snapshot_desc;
 
-int fullmag_fem_is_available(void);
-int fullmag_fem_solve_steady_transport_v1(
+FULLMAG_FEM_API int fullmag_fem_is_available(void);
+FULLMAG_FEM_API int fullmag_fem_solve_steady_transport_v1(
     const fullmag_fem_steady_transport_request_v1 *request,
     fullmag_fem_steady_transport_result_v1 *result
 );
-int fullmag_fem_solve_steady_transport_m2_v1(
+FULLMAG_FEM_API int fullmag_fem_solve_charge_transport_v1(
+    const fullmag_fem_charge_transport_request_v1 *request,
+    fullmag_fem_charge_transport_result_v1 *result
+);
+
+FULLMAG_FEM_API int fullmag_fem_solve_charge_transport_v2(
+    const fullmag_fem_charge_transport_request_v1 *request,
+    fullmag_fem_charge_transport_result_v2 *result
+);
+FULLMAG_FEM_API int fullmag_fem_solve_charge_transport_v3(
+    const fullmag_fem_charge_transport_request_v3 *request,
+    fullmag_fem_charge_transport_result_v3 *result
+);
+FULLMAG_FEM_API int fullmag_fem_solve_accepted_terminal_charge_v1(
+    const fullmag_fem_accepted_terminal_charge_request_v1 *request,
+    fullmag_fem_accepted_terminal_charge_result_v1 *result
+);
+FULLMAG_FEM_API int fullmag_fem_solve_accepted_external_lead_field_v1(
+    const fullmag_fem_accepted_external_lead_request_v1 *request,
+    fullmag_fem_accepted_external_lead_result_v1 *result
+);
+FULLMAG_FEM_API int fullmag_fem_solve_accepted_external_lead_field_v2(
+    const fullmag_fem_accepted_external_lead_request_v1 *request,
+    fullmag_fem_accepted_external_lead_result_v2 *result
+);
+FULLMAG_FEM_API int fullmag_fem_solve_steady_transport_m2_v1(
     const fullmag_fem_steady_transport_m2_request_v1 *request,
     fullmag_fem_steady_transport_result_v1 *result
 );
-int fullmag_fem_solve_steady_transport_rt0_v1(
+FULLMAG_FEM_API int fullmag_fem_solve_steady_transport_rt0_v1(
     const fullmag_fem_steady_transport_rt0_request_v1 *request,
     fullmag_fem_steady_transport_rt0_result_v1 *result
 );
-int fullmag_fem_solve_steady_transport_rt0_oersted_v1(
+FULLMAG_FEM_API int fullmag_fem_solve_steady_transport_rt0_oersted_v1(
     const fullmag_fem_steady_transport_rt0_oersted_request_v1 *request,
     fullmag_fem_steady_transport_rt0_oersted_result_v1 *result
 );
-int fullmag_fem_solve_steady_transport_rt0_oersted_vector_potential_v1(
+FULLMAG_FEM_API int fullmag_fem_solve_steady_transport_rt0_oersted_vector_potential_v1(
     const fullmag_fem_steady_transport_rt0_oersted_vector_potential_request_v1 *request,
     fullmag_fem_steady_transport_rt0_oersted_vector_potential_result_v1 *result
 );
-int fullmag_fem_get_availability_info(fullmag_fem_availability_info *out_info);
-int fullmag_fem_get_frequency_domain_availability_info(
+FULLMAG_FEM_API int fullmag_fem_solve_steady_transport_rt0_with_charge_snapshot_v1(
+    const fullmag_fem_steady_transport_rt0_request_v1 *request,
+    fullmag_fem_steady_transport_rt0_result_v1 *result,
+    fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge_snapshot
+);
+FULLMAG_FEM_API int fullmag_fem_solve_steady_transport_rt0_oersted_with_charge_snapshot_v1(
+    const fullmag_fem_steady_transport_rt0_oersted_request_v1 *request,
+    fullmag_fem_steady_transport_rt0_oersted_result_v1 *result,
+    fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge_snapshot
+);
+FULLMAG_FEM_API int fullmag_fem_solve_steady_transport_rt0_oersted_with_snapshots_v1(
+    const fullmag_fem_steady_transport_rt0_oersted_request_v1 *request,
+    fullmag_fem_steady_transport_rt0_oersted_result_v1 *result,
+    fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge_snapshot,
+    fullmag_fem_direct_oersted_snapshot_result_v1 *quadrature_snapshot
+);
+FULLMAG_FEM_API int fullmag_fem_solve_steady_transport_rt0_oersted_vector_potential_with_charge_snapshot_v1(
+    const fullmag_fem_steady_transport_rt0_oersted_vector_potential_request_v1 *request,
+    fullmag_fem_steady_transport_rt0_oersted_vector_potential_result_v1 *result,
+    fullmag_fem_steady_transport_rt0_charge_snapshot_result_v1 *charge_snapshot
+);
+FULLMAG_FEM_API int fullmag_fem_get_availability_info(fullmag_fem_availability_info *out_info);
+FULLMAG_FEM_API int fullmag_fem_get_frequency_domain_availability_info(
     const fullmag_fem_frequency_domain_availability_request *request,
     fullmag_fem_frequency_domain_availability_info *out_info
 );
-int fullmag_fem_get_frequency_domain_dependency_info(
+FULLMAG_FEM_API int fullmag_fem_get_frequency_domain_dependency_info(
     fullmag_fem_frequency_domain_dependency_info *out_info
 );
-int fullmag_fem_get_frequency_domain_abi_layout(
+FULLMAG_FEM_API int fullmag_fem_get_frequency_domain_abi_layout(
     fullmag_fem_frequency_domain_abi_layout *out_layout
 );
-int fullmag_fem_get_mesh_abi_layout(fullmag_fem_mesh_abi_layout *out_layout);
-int fullmag_fem_frequency_domain_initial_sweep_progress(
+FULLMAG_FEM_API int fullmag_fem_get_frequency_domain_modal_abi_layout_v2(
+    fullmag_fem_frequency_domain_modal_abi_layout_v2 *out_layout
+);
+FULLMAG_FEM_API int fullmag_fem_get_frequency_domain_modal_abi_layout_v3(
+    fullmag_fem_frequency_domain_modal_abi_layout_v3 *out_layout
+);
+FULLMAG_FEM_API int fullmag_fem_get_frequency_domain_modal_abi_layout_v4(
+    fullmag_fem_frequency_domain_modal_abi_layout_v4 *out_layout
+);
+FULLMAG_FEM_API int fullmag_fem_get_frequency_domain_modal_abi_layout_v5(
+    fullmag_fem_frequency_domain_modal_abi_layout_v5 *out_layout
+);
+FULLMAG_FEM_API int fullmag_fem_get_mesh_abi_layout(fullmag_fem_mesh_abi_layout *out_layout);
+FULLMAG_FEM_API int fullmag_fem_prepare_mesh_space_v1(
+    const fullmag_fem_mesh_space_preparation_request_v1 *request,
+    fullmag_fem_mesh_space_preparation_evidence_v1 *out_evidence,
+    char *error_message,
+    uint64_t error_message_capacity
+);
+FULLMAG_FEM_API int fullmag_fem_frequency_domain_initial_sweep_progress(
     uint64_t total_frequency_points,
     fullmag_fem_frequency_domain_sweep_progress *out_progress
 );
-int fullmag_fem_frequency_domain_interrupted_sweep_progress(
+FULLMAG_FEM_API int fullmag_fem_frequency_domain_interrupted_sweep_progress(
     uint64_t total_frequency_points,
     uint64_t completed_frequency_points,
     uint64_t written_frequency_point_artifacts,
@@ -1868,7 +3509,7 @@ int fullmag_fem_frequency_domain_interrupted_sweep_progress(
     const char *latest_artifact_manifest_path,
     fullmag_fem_frequency_domain_sweep_progress *out_progress
 );
-int fullmag_fem_frequency_domain_cancelling_sweep_progress(
+FULLMAG_FEM_API int fullmag_fem_frequency_domain_cancelling_sweep_progress(
     uint64_t total_frequency_points,
     uint64_t completed_frequency_points,
     uint64_t written_frequency_point_artifacts,
@@ -1876,7 +3517,7 @@ int fullmag_fem_frequency_domain_cancelling_sweep_progress(
     const char *latest_artifact_manifest_path,
     fullmag_fem_frequency_domain_sweep_progress *out_progress
 );
-int fullmag_fem_frequency_domain_completed_sweep_progress(
+FULLMAG_FEM_API int fullmag_fem_frequency_domain_completed_sweep_progress(
     uint64_t total_frequency_points,
     uint64_t completed_frequency_points,
     uint64_t written_frequency_point_artifacts,
@@ -1884,104 +3525,160 @@ int fullmag_fem_frequency_domain_completed_sweep_progress(
     const char *latest_artifact_manifest_path,
     fullmag_fem_frequency_domain_sweep_progress *out_progress
 );
-int fullmag_fem_frequency_domain_solve_driven_response(
+#define FULLMAG_FEM_FREQUENCY_DOMAIN_ARTIFACT_IDENTITY_V1 1u
+/* Separate metadata ABI: existing driven-response request layouts stay intact.
+ * Strings are borrowed NUL-terminated UTF-8 and must remain valid during calls.
+ * Set abi_version to V1 and struct_size to sizeof(this structure).
+ */
+typedef struct FullmagFemFrequencyDomainArtifactIdentityV1 {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    const char *session_id;
+    const char *run_id;
+    const char *stage_id;
+    const char *runtime_id;
+} FullmagFemFrequencyDomainArtifactIdentityV1;
+
+FULLMAG_FEM_API int fullmag_fem_frequency_domain_validate_artifact_identity_v1(
+    const FullmagFemFrequencyDomainArtifactIdentityV1 *identity
+);
+FULLMAG_FEM_API int fullmag_fem_frequency_domain_solve_driven_response_with_identity_v1(
+    const fullmag_fem_frequency_domain_driven_response_request *request,
+    const FullmagFemFrequencyDomainArtifactIdentityV1 *identity,
+    fullmag_fem_frequency_domain_apply_with_potential_callback mfem_apply_demag_tangent_with_potential,
+    fullmag_fem_frequency_domain_solve_result *out_result
+);
+
+FULLMAG_FEM_API int fullmag_fem_frequency_domain_solve_driven_response(
     const fullmag_fem_frequency_domain_driven_response_request *request,
     fullmag_fem_frequency_domain_solve_result *out_result
 );
-int fullmag_fem_frequency_domain_solve_driven_response_v9(
+FULLMAG_FEM_API int fullmag_fem_frequency_domain_solve_driven_response_v9(
     const fullmag_fem_frequency_domain_driven_response_request *request,
     fullmag_fem_frequency_domain_apply_with_potential_callback mfem_apply_demag_tangent_with_potential,
     fullmag_fem_frequency_domain_solve_result *out_result
 );
-int fullmag_fem_frequency_domain_solve_driven_response_v10(
+FULLMAG_FEM_API int fullmag_fem_frequency_domain_solve_driven_response_v10(
     const fullmag_fem_frequency_domain_driven_response_request *request,
     fullmag_fem_frequency_domain_apply_with_potential_callback mfem_apply_demag_tangent_with_potential,
     fullmag_fem_frequency_domain_solve_result *out_result
 );
-void fullmag_fem_frequency_domain_solve_result_release(
+FULLMAG_FEM_API void fullmag_fem_frequency_domain_solve_result_release(
     fullmag_fem_frequency_domain_solve_result *result
 );
-FullmagFemFrequencyDomainResult fullmag_fem_modal_eigen_solve(
+FULLMAG_FEM_API FullmagFemFrequencyDomainResult fullmag_fem_modal_eigen_solve(
     const FullmagFemModalEigenRequest *request
 );
-FullmagFemFrequencyDomainResult fullmag_fem_driven_response_solve(
+FULLMAG_FEM_API int fullmag_fem_modal_eigen_solve_v20(
+    const FullmagFemModalEigenRequest *request,
+    FullmagFemFrequencyDomainResultV20 *out_result
+);
+FULLMAG_FEM_API void fullmag_fem_frequency_domain_result_v20_destroy(
+    FullmagFemFrequencyDomainResultV20 *result
+);
+FULLMAG_FEM_API int fullmag_fem_modal_eigen_gpu_runtime_finalize(void);
+FULLMAG_FEM_API FullmagFemFrequencyDomainResult fullmag_fem_driven_response_solve(
     const FullmagFemDrivenResponseRequest *request
 );
-void fullmag_fem_frequency_domain_result_destroy(
+FULLMAG_FEM_API void fullmag_fem_frequency_domain_result_destroy(
     FullmagFemFrequencyDomainResult *result
 );
 
-fullmag_fem_backend *fullmag_fem_backend_create(
+FULLMAG_FEM_API fullmag_fem_backend *fullmag_fem_backend_create(
     const fullmag_fem_plan_desc *plan
 );
 
-fullmag_fem_backend *fullmag_fem_backend_create_v2(
+FULLMAG_FEM_API fullmag_fem_backend *fullmag_fem_backend_create_v2(
     const fullmag_fem_plan_desc *plan,
     const fullmag_fem_adaptive_config_v2 *adaptive_config
 );
 
-int fullmag_fem_get_regional_field_drive_abi_layout(
+FULLMAG_FEM_API fullmag_fem_backend *fullmag_fem_backend_create_v3(
+    const fullmag_fem_plan_desc_v2 *plan,
+    const fullmag_fem_adaptive_config_v2 *adaptive_config
+);
+
+FULLMAG_FEM_API int fullmag_fem_get_regional_field_drive_abi_layout(
     fullmag_fem_regional_field_drive_abi_layout *out_layout
 );
 
-int fullmag_fem_backend_begin_stage(
+FULLMAG_FEM_API int fullmag_fem_backend_begin_stage(
     fullmag_fem_backend *handle,
     double stage_start_time_s
 );
+FULLMAG_FEM_API int fullmag_fem_backend_begin_stage_v2(
+    fullmag_fem_backend *handle,
+    double segment_start_time_s,
+    double waveform_origin_time_s
+);
 
-int fullmag_fem_backend_reconfigure_regional_field_drives(
+FULLMAG_FEM_API int fullmag_fem_backend_set_gpu_execution_request_v1(
+    fullmag_fem_backend *handle,
+    fullmag_fem_gpu_execution_request_v1 request
+);
+
+FULLMAG_FEM_API int fullmag_fem_backend_reconfigure_regional_field_drives(
     fullmag_fem_backend *handle,
     const fullmag_fem_regional_field_drive_desc *drives,
     uint64_t drive_count,
     double stage_start_time_s
 );
 
-int fullmag_fem_backend_invalidate_fsal(fullmag_fem_backend *handle);
+FULLMAG_FEM_API int fullmag_fem_backend_invalidate_fsal(fullmag_fem_backend *handle);
 
 /* Install or clear the append-only CPU stage Oersted callback. Passing NULL
  * clears the hook and invalidates FSAL. The callback is never used by the
  * GPU RK path. */
-int fullmag_fem_backend_set_stage_oersted_callback_v1(
+FULLMAG_FEM_API int fullmag_fem_backend_set_stage_oersted_callback_v1(
     fullmag_fem_backend *handle,
     const fullmag_fem_stage_oersted_callback_v1 *callback);
 
 /* Install or clear the append-only CPU reciprocal transport torque callback.
  * Passing NULL clears the hook and invalidates FSAL. */
-int fullmag_fem_backend_set_stage_transport_callback_v1(
+FULLMAG_FEM_API int fullmag_fem_backend_set_stage_transport_callback_v1(
     fullmag_fem_backend *handle,
     const fullmag_fem_stage_transport_callback_v1 *callback);
 
-int fullmag_fem_backend_step(
+FULLMAG_FEM_API int fullmag_fem_backend_step(
     fullmag_fem_backend *handle,
     double dt_seconds,
     fullmag_fem_step_stats *out_stats
 );
 
-int fullmag_fem_backend_relax_step(
+FULLMAG_FEM_API int fullmag_fem_backend_relax_step(
     fullmag_fem_backend *handle,
     fullmag_fem_relax_algorithm algorithm,
     fullmag_fem_step_stats *out_stats
 );
 
-int fullmag_fem_backend_set_interrupt_poll(
+FULLMAG_FEM_API int fullmag_fem_backend_set_interrupt_poll(
     fullmag_fem_backend *handle,
     fullmag_fem_interrupt_poll_fn poll_fn,
     void *user_data
 );
 
-int fullmag_fem_backend_set_step_profile(
+FULLMAG_FEM_API int fullmag_fem_backend_set_step_profile(
     fullmag_fem_backend *handle,
     int enabled
 );
 
-int fullmag_fem_backend_copy_field_f64(
+FULLMAG_FEM_API int fullmag_fem_backend_copy_field_f64(
     fullmag_fem_backend *handle,
     fullmag_fem_observable observable,
     double *out_xyz,
     uint64_t out_len
 );
 
-int fullmag_fem_backend_average_m_for_nodes_f64(
+/* Internal scientific handoff: copy the magnetic-domain LLG field, never the
+ * full-domain visualization field used by the public observable API. */
+FULLMAG_FEM_API int fullmag_fem_backend_copy_linearization_field_f64(
+    fullmag_fem_backend *handle,
+    fullmag_fem_observable observable,
+    double *out_xyz,
+    uint64_t out_len
+);
+
+FULLMAG_FEM_API int fullmag_fem_backend_average_m_for_nodes_f64(
     fullmag_fem_backend *handle,
     const uint32_t *node_indices,
     uint64_t node_count,
@@ -1999,7 +3696,7 @@ int fullmag_fem_backend_average_m_for_nodes_f64(
  * CPU-only or host-only observables fall back to the synchronous host field
  * copy path while preserving the same payload layout.
  */
-fullmag_fem_field_snapshot *fullmag_fem_backend_begin_field_snapshot(
+FULLMAG_FEM_API fullmag_fem_field_snapshot *fullmag_fem_backend_begin_field_snapshot(
     fullmag_fem_backend *handle,
     fullmag_fem_observable observable
 );
@@ -2011,7 +3708,7 @@ fullmag_fem_field_snapshot *fullmag_fem_backend_begin_field_snapshot(
  * AoS f64 layout as field snapshots. GPU-backed observables use the same
  * private staging/pinned-host path as field snapshots.
  */
-fullmag_fem_preview_snapshot *fullmag_fem_backend_begin_preview_snapshot(
+FULLMAG_FEM_API fullmag_fem_preview_snapshot *fullmag_fem_backend_begin_preview_snapshot(
     fullmag_fem_backend *handle,
     fullmag_fem_observable observable
 );
@@ -2020,7 +3717,7 @@ fullmag_fem_preview_snapshot *fullmag_fem_backend_begin_preview_snapshot(
  * Wait for a native FEM field snapshot and expose the owned payload pointer.
  * The returned pointer remains valid until the snapshot handle is destroyed.
  */
-int fullmag_fem_field_snapshot_wait(
+FULLMAG_FEM_API int fullmag_fem_field_snapshot_wait(
     fullmag_fem_field_snapshot *snapshot,
     const void **out_data,
     uint64_t *out_len_bytes,
@@ -2031,7 +3728,7 @@ int fullmag_fem_field_snapshot_wait(
  * Wait for a native FEM preview snapshot and expose the owned payload pointer.
  * The returned pointer remains valid until the snapshot handle is destroyed.
  */
-int fullmag_fem_preview_snapshot_wait(
+FULLMAG_FEM_API int fullmag_fem_preview_snapshot_wait(
     fullmag_fem_preview_snapshot *snapshot,
     const void **out_data,
     uint64_t *out_len_bytes,
@@ -2042,18 +3739,18 @@ int fullmag_fem_preview_snapshot_wait(
  * Return nonzero when a native FEM preview snapshot can be consumed without
  * blocking in `fullmag_fem_preview_snapshot_wait`.
  */
-int fullmag_fem_preview_snapshot_ready(fullmag_fem_preview_snapshot *snapshot);
+FULLMAG_FEM_API int fullmag_fem_preview_snapshot_ready(fullmag_fem_preview_snapshot *snapshot);
 
 /*
  * Return nonzero when a native FEM field snapshot can be consumed without
  * blocking in `fullmag_fem_field_snapshot_wait`.
  */
-int fullmag_fem_field_snapshot_ready(fullmag_fem_field_snapshot *snapshot);
+FULLMAG_FEM_API int fullmag_fem_field_snapshot_ready(fullmag_fem_field_snapshot *snapshot);
 
-void fullmag_fem_field_snapshot_destroy(fullmag_fem_field_snapshot *snapshot);
-void fullmag_fem_preview_snapshot_destroy(fullmag_fem_preview_snapshot *snapshot);
+FULLMAG_FEM_API void fullmag_fem_field_snapshot_destroy(fullmag_fem_field_snapshot *snapshot);
+FULLMAG_FEM_API void fullmag_fem_preview_snapshot_destroy(fullmag_fem_preview_snapshot *snapshot);
 
-int fullmag_fem_backend_upload_magnetization_f64(
+FULLMAG_FEM_API int fullmag_fem_backend_upload_magnetization_f64(
     fullmag_fem_backend *handle,
     const double *m_xyz,
     uint64_t len
@@ -2070,7 +3767,7 @@ int fullmag_fem_backend_upload_magnetization_f64(
  * uses the backend's fresh demag solver path rather than frozen-field cache
  * reuse.
  */
-int fullmag_fem_backend_apply_demag_tangent_f64(
+FULLMAG_FEM_API int fullmag_fem_backend_apply_demag_tangent_f64(
     fullmag_fem_backend *handle,
     const double *delta_m_xyz,
     uint64_t delta_m_len,
@@ -2078,7 +3775,7 @@ int fullmag_fem_backend_apply_demag_tangent_f64(
     uint64_t out_len
 );
 
-int fullmag_fem_backend_apply_demag_tangent_with_potential_f64(
+FULLMAG_FEM_API int fullmag_fem_backend_apply_demag_tangent_with_potential_f64(
     fullmag_fem_backend *handle,
     const double *delta_m_xyz,
     uint64_t delta_m_len,
@@ -2088,75 +3785,178 @@ int fullmag_fem_backend_apply_demag_tangent_with_potential_f64(
     uint64_t out_phi_len
 );
 
-int fullmag_fem_backend_snapshot_stats(
+FULLMAG_FEM_API int fullmag_fem_backend_snapshot_stats(
     fullmag_fem_backend *handle,
     fullmag_fem_step_stats *out_stats
 );
 
-int fullmag_fem_backend_solver_attempt_count_v1(
+FULLMAG_FEM_API int fullmag_fem_backend_snapshot_endpoint_cache_telemetry_v1(
+    fullmag_fem_backend *handle,
+    fullmag_fem_endpoint_cache_telemetry_v1 *out_telemetry
+);
+
+FULLMAG_FEM_API int fullmag_fem_backend_snapshot_representation_receipt_v1(
+    fullmag_fem_backend *handle,
+    fullmag_fem_representation_receipt_v1 *out_receipt
+);
+
+/*
+ * Snapshot the complete native local-node index map metadata from one live
+ * backend handle.  The caller must initialize abi_version and struct_size;
+ * the function writes the output only after the MFEM and periodic maps have
+ * both passed their fail-closed validation.
+ */
+FULLMAG_FEM_API int fullmag_fem_backend_snapshot_local_node_map_v1(
+    fullmag_fem_backend *handle,
+    fullmag_fem_local_node_map_v1 *out_map
+);
+
+/*
+ * Copy the complete native local-node index maps.  Every length must exactly
+ * match the metadata from the same handle and expected_revision must equal
+ * core_periodic_map_revision.  No output array is written when validation
+ * fails.  Arrays are respectively canonical-node -> MFEM local DOF,
+ * local-node -> core periodic class, and core class -> representative node;
+ * the caller must provide distinct non-overlapping output buffers.
+ */
+FULLMAG_FEM_API int fullmag_fem_backend_copy_local_node_map_v1(
+    fullmag_fem_backend *handle,
+    uint64_t expected_revision,
+    uint32_t *local_to_mfem_dof,
+    uint64_t local_to_mfem_dof_len,
+    uint32_t *local_to_core_class,
+    uint64_t local_to_core_class_len,
+    uint32_t *class_representatives,
+    uint64_t class_representatives_len
+);
+
+/*
+ * Copy a bounded chunk of the actual finalized MFEM vertex coordinates from
+ * one live backend handle.  The caller supplies the expected complete node
+ * and cell counts, a node range, and an output length in doubles (exactly
+ * node_count * 3).  The producer validates the live scalar H1/P1 space and
+ * the coordinates against the handle's canonical Context before writing.
+ * This is a cold terminal snapshot API: callers must exclude concurrent
+ * solver/context mutation and must consume every chunk before publishing a
+ * digest.  It exposes a projection, not a complete MeshIR/v3 artifact.
+ */
+FULLMAG_FEM_API int fullmag_fem_backend_copy_local_node_geometry_v1(
+    fullmag_fem_backend *handle,
+    uint64_t expected_total_nodes,
+    uint64_t expected_total_cells,
+    uint64_t first_node,
+    uint64_t node_count,
+    double *out_nodes_xyz,
+    uint64_t out_nodes_xyz_len
+);
+
+/*
+ * Copy a bounded chunk of actual MFEM cell geometry/connectivity.  Each cell
+ * occupies nine u32 values: the stable Fullmag cell type followed by eight
+ * vertex slots; unused slots are zero.  The output length is exactly
+ * cell_count * 9.  The same cold terminal and caller-owned snapshot rules as
+ * the node projection apply.
+ */
+FULLMAG_FEM_API int fullmag_fem_backend_copy_local_cell_geometry_v1(
+    fullmag_fem_backend *handle,
+    uint64_t expected_total_nodes,
+    uint64_t expected_total_cells,
+    uint64_t first_cell,
+    uint64_t cell_count,
+    uint32_t *out_cells,
+    uint64_t out_cells_len
+);
+
+FULLMAG_FEM_API int fullmag_fem_backend_solver_attempt_count_v1(
     fullmag_fem_backend *handle,
     uint64_t *out_count
 );
 
-int fullmag_fem_backend_copy_solver_attempts_v1(
+FULLMAG_FEM_API int fullmag_fem_backend_copy_solver_attempts_v1(
     fullmag_fem_backend *handle,
     fullmag_fem_solver_attempt_record_v1 *out_records,
     uint64_t capacity,
     uint64_t *out_count
 );
 
-int fullmag_fem_backend_take_accepted_energy_proof_v1(
+FULLMAG_FEM_API int fullmag_fem_backend_copy_solver_attempts_v2(
+    fullmag_fem_backend *handle,
+    fullmag_fem_solver_attempt_record_v2 *out_records,
+    uint64_t capacity,
+    uint64_t *out_count
+);
+
+FULLMAG_FEM_API int fullmag_fem_backend_take_accepted_energy_proof_v1(
     fullmag_fem_backend *handle,
     fullmag_fem_accepted_energy_proof_v1 *out_proof
 );
 
-int fullmag_fem_backend_stage_completion(
+FULLMAG_FEM_API int fullmag_fem_backend_stage_completion(
     fullmag_fem_backend *handle,
     fullmag_fem_stage_completion *out_completion
 );
 
-int fullmag_fem_backend_get_device_info(
+FULLMAG_FEM_API int fullmag_fem_backend_get_device_info(
     fullmag_fem_backend *handle,
     fullmag_fem_device_info *out_info
 );
 
-int fullmag_fem_get_runtime_build_info(
+FULLMAG_FEM_API int fullmag_fem_get_runtime_build_info(
     fullmag_fem_runtime_build_info *out_info
 );
-int fullmag_fem_get_runtime_build_info_v2(
+FULLMAG_FEM_API int fullmag_fem_get_runtime_build_info_v2(
     fullmag_fem_runtime_build_info_v2 *out_info
 );
 
-int fullmag_fem_backend_get_transfer_audit(
+FULLMAG_FEM_API int fullmag_fem_backend_get_transfer_audit(
     fullmag_fem_backend *handle,
     fullmag_fem_transfer_audit *out_audit
 );
 
-int fullmag_fem_backend_get_gpu_state_info(
+FULLMAG_FEM_API int fullmag_fem_backend_get_gpu_state_info(
     fullmag_fem_backend *handle,
     fullmag_fem_gpu_state_info *out_info
 );
 
-int fullmag_fem_backend_get_gpu_rk_plan_info(
+FULLMAG_FEM_API int fullmag_fem_backend_get_gpu_rk_plan_info(
     fullmag_fem_backend *handle,
     fullmag_fem_gpu_rk_plan_info *out_info
 );
 
-int fullmag_fem_backend_gpu_execution_receipt_v1(
+/*
+ * Validate the complete native GPU RK operator plan before a stage starts.
+ * This is intentionally separate from the descriptive plan-info query: strict
+ * callers need the same mask-level validation used by the CUDA step preflight.
+ */
+FULLMAG_FEM_API int fullmag_fem_backend_validate_strict_gpu_rk_plan(
+    fullmag_fem_backend *handle
+);
+
+FULLMAG_FEM_API int fullmag_fem_backend_gpu_execution_receipt_v1(
     fullmag_fem_backend *handle,
     fullmag_fem_gpu_execution_receipt_v1 *out_receipt
 );
 
-int fullmag_fem_backend_upload_strain(
+FULLMAG_FEM_API int fullmag_fem_backend_demag_fem_bem_provenance_v1(
+    fullmag_fem_backend *handle,
+    fullmag_fem_demag_fem_bem_provenance_v1 *out_provenance
+);
+
+FULLMAG_FEM_API int fullmag_fem_backend_gpu_performance_snapshot_v1(
+    fullmag_fem_backend *handle,
+    fullmag_fem_gpu_performance_snapshot_v1 *out_snapshot
+);
+
+FULLMAG_FEM_API int fullmag_fem_backend_upload_strain(
     fullmag_fem_backend *handle,
     const double *strain_voigt,
     uint64_t len,
     int uniform
 );
 
-const char *fullmag_fem_backend_last_error(fullmag_fem_backend *handle);
+FULLMAG_FEM_API const char *fullmag_fem_backend_last_error(fullmag_fem_backend *handle);
 
-void fullmag_fem_backend_destroy(fullmag_fem_backend *handle);
+FULLMAG_FEM_API void fullmag_fem_backend_destroy(fullmag_fem_backend *handle);
 
 /* ── GPU Dense Generalized Eigenvalue Solver (Etap A4) ────────────────────
  *
@@ -2185,7 +3985,7 @@ typedef struct {
     uint32_t      reason_len;         /* capacity of out_reason buffer (including null) */
 } fullmag_fem_eigen_dense_desc;
 
-int fullmag_fem_eigen_dense(fullmag_fem_eigen_dense_desc *desc);
+FULLMAG_FEM_API int fullmag_fem_eigen_dense(fullmag_fem_eigen_dense_desc *desc);
 
 #ifdef __cplusplus
 }

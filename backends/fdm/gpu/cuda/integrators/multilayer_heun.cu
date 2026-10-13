@@ -6,6 +6,8 @@
  */
 
 #include "context.hpp"
+#include "../interactions/dmi_boundary.cuh"
+#include "fsal_policy.hpp"
 
 #include <cuda_runtime.h>
 #include <cmath>
@@ -68,11 +70,16 @@ __global__ void multilayer_llg_rhs_kernel(
     double cubic_axis2_z,
     int has_interfacial_dmi,
     double dmi_d_interfacial,
+    int has_rotated_interfacial_dmi,
+    double dmi_d_rotated_interfacial,
     int has_bulk_dmi,
     double dmi_d_bulk,
     uint32_t nx,
     uint32_t ny,
     uint32_t nz,
+    int periodic_x,
+    int periodic_y,
+    int periodic_z,
     double inv_2dx,
     double inv_2dy,
     double inv_2dz,
@@ -137,30 +144,45 @@ __global__ void multilayer_llg_rhs_kernel(
         h1 += g1 * cubic_axis1_y + g2 * cubic_axis2_y + g3 * c3y;
         h2 += g1 * cubic_axis1_z + g2 * cubic_axis2_z + g3 * c3z;
     }
-    if ((has_interfacial_dmi || has_bulk_dmi) && ms > 0.0) {
+    if ((has_interfacial_dmi || has_rotated_interfacial_dmi || has_bulk_dmi) && ms > 0.0) {
         const uint64_t plane = static_cast<uint64_t>(nx) * ny;
         const uint32_t iz = static_cast<uint32_t>(idx / plane);
         const uint64_t rem = idx - static_cast<uint64_t>(iz) * plane;
         const uint32_t iy = static_cast<uint32_t>(rem / nx);
         const uint32_t ix = static_cast<uint32_t>(rem - static_cast<uint64_t>(iy) * nx);
 
-        uint64_t xm = ix > 0 ? idx - 1 : idx;
-        uint64_t xp = ix + 1 < nx ? idx + 1 : idx;
-        uint64_t ym = iy > 0 ? idx - nx : idx;
-        uint64_t yp = iy + 1 < ny ? idx + nx : idx;
-        uint64_t zm = iz > 0 ? idx - plane : idx;
-        uint64_t zp = iz + 1 < nz ? idx + plane : idx;
+        uint64_t xm = ix > 0 ? idx - 1 : (periodic_x && nx > 1 ? idx + nx - 1 : idx);
+        uint64_t xp = ix + 1 < nx ? idx + 1 : (periodic_x && nx > 1 ? idx - nx + 1 : idx);
+        uint64_t ym = iy > 0 ? idx - nx : (periodic_y && ny > 1 ? idx + plane - nx : idx);
+        uint64_t yp = iy + 1 < ny ? idx + nx : (periodic_y && ny > 1 ? idx - plane + nx : idx);
+        uint64_t zm = iz > 0 ? idx - plane : (periodic_z && nz > 1 ? idx + plane * (nz - 1) : idx);
+        uint64_t zp = iz + 1 < nz ? idx + plane : (periodic_z && nz > 1 ? idx - plane * (nz - 1) : idx);
+
+        bool missing_xm = ix == 0 && !periodic_x;
+        bool missing_xp = ix + 1 == nx && !periodic_x;
+        bool missing_ym = iy == 0 && !periodic_y;
+        bool missing_yp = iy + 1 == ny && !periodic_y;
+        bool missing_zm = iz == 0 && !periodic_z;
+        bool missing_zp = iz + 1 == nz && !periodic_z;
 
         if (active_mask) {
-            if (active_mask[xm] == 0) xm = idx;
-            if (active_mask[xp] == 0) xp = idx;
-            if (active_mask[ym] == 0) ym = idx;
-            if (active_mask[yp] == 0) yp = idx;
-            if (active_mask[zm] == 0) zm = idx;
-            if (active_mask[zp] == 0) zp = idx;
+            missing_xm = missing_xm || active_mask[xm] == 0;
+            missing_xp = missing_xp || active_mask[xp] == 0;
+            missing_ym = missing_ym || active_mask[ym] == 0;
+            missing_yp = missing_yp || active_mask[yp] == 0;
+            missing_zm = missing_zm || active_mask[zm] == 0;
+            missing_zp = missing_zp || active_mask[zp] == 0;
+            if (missing_xm) xm = idx;
+            if (missing_xp) xp = idx;
+            if (missing_ym) ym = idx;
+            if (missing_yp) yp = idx;
+            if (missing_zm) zm = idx;
+            if (missing_zp) zp = idx;
         }
 
         const double dmi_pf = 2.0 / (MU0 * ms);
+        const DmiMissingFaces missing{
+            missing_xp, missing_xm, missing_yp, missing_ym, missing_zp, missing_zm};
         if (has_interfacial_dmi) {
             const double dmz_dx =
                 (static_cast<double>(mz[xp]) - static_cast<double>(mz[xm])) * inv_2dx;
@@ -173,6 +195,25 @@ __global__ void multilayer_llg_rhs_kernel(
             h0 += dmi_pf * dmi_d_interfacial * dmz_dx;
             h1 += dmi_pf * dmi_d_interfacial * dmz_dy;
             h2 -= dmi_pf * dmi_d_interfacial * (dmx_dx + dmy_dy);
+            add_interfacial_dmi_boundary_correction(
+                m0, m1, m2, dmi_pf, dmi_d_interfacial, inv_2dx, inv_2dy,
+                missing, h0, h1, h2);
+        }
+        if (has_rotated_interfacial_dmi) {
+            const double dmz_dx =
+                (static_cast<double>(mz[xp]) - static_cast<double>(mz[xm])) * inv_2dx;
+            const double dmy_dy =
+                (static_cast<double>(my[yp]) - static_cast<double>(my[ym])) * inv_2dy;
+            const double dmx_dy =
+                (static_cast<double>(mx[yp]) - static_cast<double>(mx[ym])) * inv_2dy;
+            const double dmx_dx =
+                (static_cast<double>(mx[xp]) - static_cast<double>(mx[xm])) * inv_2dx;
+            h0 += dmi_pf * dmi_d_rotated_interfacial * (dmz_dx - dmy_dy);
+            h1 += dmi_pf * dmi_d_rotated_interfacial * dmx_dy;
+            h2 -= dmi_pf * dmi_d_rotated_interfacial * dmx_dx;
+            add_rotated_interfacial_dmi_boundary_correction(
+                m0, m1, m2, dmi_pf, dmi_d_rotated_interfacial, inv_2dx, inv_2dy,
+                missing, h0, h1, h2);
         }
         if (has_bulk_dmi) {
             const double dmz_dy =
@@ -190,6 +231,9 @@ __global__ void multilayer_llg_rhs_kernel(
             h0 -= dmi_pf * dmi_d_bulk * (dmz_dy - dmy_dz);
             h1 -= dmi_pf * dmi_d_bulk * (dmx_dz - dmz_dx);
             h2 -= dmi_pf * dmi_d_bulk * (dmy_dx - dmx_dy);
+            add_bulk_dmi_boundary_correction(
+                m0, m1, m2, dmi_pf, dmi_d_bulk, inv_2dx, inv_2dy, inv_2dz,
+                missing, h0, h1, h2);
         }
     }
     if (enable_exchange) {
@@ -383,11 +427,16 @@ bool save_original_and_predict(Context &ctx, double dt, const char *operation) {
             layer.cubic_axis2[2],
             ctx.has_interfacial_dmi ? 1 : 0,
             ctx.D_interfacial,
+            ctx.has_rotated_interfacial_dmi ? 1 : 0,
+            ctx.D_rotated_interfacial,
             ctx.has_bulk_dmi ? 1 : 0,
             ctx.D_bulk,
             layer.native_grid.nx,
             layer.native_grid.ny,
             layer.native_grid.nz,
+            ctx.periodic_x ? 1 : 0,
+            ctx.periodic_y ? 1 : 0,
+            ctx.periodic_z ? 1 : 0,
             0.5 / layer.native_grid.dx,
             0.5 / layer.native_grid.dy,
             0.5 / layer.native_grid.dz,
@@ -474,11 +523,16 @@ bool correct_from_predicted(Context &ctx, double dt, const char *operation) {
             layer.cubic_axis2[2],
             ctx.has_interfacial_dmi ? 1 : 0,
             ctx.D_interfacial,
+            ctx.has_rotated_interfacial_dmi ? 1 : 0,
+            ctx.D_rotated_interfacial,
             ctx.has_bulk_dmi ? 1 : 0,
             ctx.D_bulk,
             layer.native_grid.nx,
             layer.native_grid.ny,
             layer.native_grid.nz,
+            ctx.periodic_x ? 1 : 0,
+            ctx.periodic_y ? 1 : 0,
+            ctx.periodic_z ? 1 : 0,
             0.5 / layer.native_grid.dx,
             0.5 / layer.native_grid.dy,
             0.5 / layer.native_grid.dz,
@@ -561,8 +615,8 @@ void launch_multilayer_heun_step_impl(
         if (!ctx.last_error.empty()) return;
     }
 
-    ctx.step_count++;
-    ctx.current_time += dt;
+    context_stage_accepted_step(ctx, dt);
+    fullmag_fdm_note_multilayer_rhs_device_execution(ctx);
     fullmag_fdm_fill_step_stats_metadata(ctx, stats, dt);
 }
 

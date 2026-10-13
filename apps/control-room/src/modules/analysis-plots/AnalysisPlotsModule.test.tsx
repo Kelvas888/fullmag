@@ -1796,12 +1796,15 @@ describe("AnalysisPlotsView", () => {
       ref: {
         calculationMode: "fmr_response",
         fieldId: "analysis:frequency-response:frequency-0042",
+        frequencyHz: 12.5e9,
         frequencyIndex: 7,
         kind: "results.frequency_response.frequency_point",
         nodeId:
           "analysis:charts:frequency-domain:response-sweep:point:analysis.frequency-domain:response:amplitude:0",
         observableId: "mx",
         resourceRef: ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_MAGNETIC_SWEEP_PATH,
+        representation: "complex-vector-xyz",
+        source: "frequency-response",
         type: "frequency-domain",
       },
     });
@@ -1856,12 +1859,15 @@ describe("AnalysisPlotsView", () => {
         artifactPath: ANALYSIS_FREQUENCY_DOMAIN_EIGEN_SPECTRUM_V2_PATH,
         calculationMode: "free_modes",
         fieldId: "analysis:eigen:sample-0000:mode-0001",
+        frequencyHz: 9.5e9,
         kind: "results.eigen.mode",
         modeIndex: 1,
         nodeId:
           "analysis:charts:frequency-domain:eigen-spectrum:point:analysis.frequency-domain:eigen:spectrum:frequency:0",
         resourceRef: analysisFieldVectorResourceKey("analysis:eigen:sample-0000:mode-0001"),
+        representation: "complex-vector-xyz",
         sampleIndex: 0,
+        source: "eigen-mode",
         type: "frequency-domain",
       },
     });
@@ -1871,13 +1877,14 @@ describe("AnalysisPlotsView", () => {
     const dispersionModel = buildEigenDispersionChartModel({
       status: "ready",
       text: [
-        "sample_index,raw_mode_index,branch_id,path_s_rad_per_m,frequency_hz,mode_field_id,mode_field_resource_key",
-        `4,5,acoustic,78539816.33974482,12.5e9,analysis:eigen:sample-0004:mode-0005,${analysisFieldVectorResourceKey("analysis:eigen:sample-0004:mode-0005")}`,
+        "sample_index,raw_mode_index,branch_id,path_s_rad_per_m,frequency_hz,mode_field_id,mode_field_resource_key,sample_id,mode_id,kx_rad_per_m,ky_rad_per_m,kz_rad_per_m",
+        `4,5,acoustic,78539816.33974482,12.5e9,analysis:eigen:sample-0004:mode-0005,${analysisFieldVectorResourceKey("analysis:eigen:sample-0004:mode-0005")},k-path-sample-0004,sample-0004-mode-0005,-2e7,1e7,0`,
       ].join("\n"),
     });
 
     const selection = frequencyDomainSelectionFromPoint({
       dispersionModel,
+      artifactRevision: "revision-current",
       point: {
         label: "Branch acoustic",
         point: { rowIndex: 0, x: 78539816.33974482, y: 12.5 },
@@ -1903,10 +1910,16 @@ describe("AnalysisPlotsView", () => {
         "analysis:charts:frequency-domain:eigen-dispersion:point:analysis.frequency-domain:eigen:dispersion:acoustic:0",
       objectId: null,
       ref: {
+        artifactRevision: "revision-current",
+        sampleId: "k-path-sample-0004",
+        modeId: "sample-0004-mode-0005",
+        wavevectorKf: [-2e7, 1e7, 0],
+        kPathCoordinateRadPerM: 78539816.33974482,
         artifactPath: ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
         branchId: "acoustic",
         calculationMode: "dispersion_modal",
         fieldId: "analysis:eigen:sample-0004:mode-0005",
+        frequencyHz: 12.5e9,
         kind: "results.eigen.mode",
         modeIndex: 5,
         nodeId:
@@ -1914,7 +1927,9 @@ describe("AnalysisPlotsView", () => {
         resourceRef: analysisFieldVectorResourceKey(
           "analysis:eigen:sample-0004:mode-0005",
         ),
+        representation: "complex-vector-xyz",
         sampleIndex: 4,
+        source: "eigen-mode",
         type: "frequency-domain",
       },
     });

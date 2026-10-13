@@ -28,6 +28,13 @@ struct CpuThreadRuntimeState {
     int requested_omp_threads = 1;
     int effective_omp_threads = 1;
     int cap_reason = 0;
+    // The native FEM runtime owns this process-level OpenMP safety policy.
+    // These fields are published only after configure_fem_host_runtime_threads
+    // has applied the policy, so provenance cannot confuse the default value
+    // with an executed configuration.
+    bool dynamic_threads_disabled = false;
+    bool nested_parallelism_disabled = false;
+    int max_active_parallel_levels = 0;
 };
 
 enum CpuThreadCapReason {
@@ -68,7 +75,10 @@ int auto_cpu_thread_cap_reason_for_context(const Context &ctx, int requested_thr
  *
  * The context fields become the source of truth for telemetry and downstream
  * demag recovery loops; when OpenMP is compiled in, the runtime thread count is
- * also pushed into `omp_set_num_threads`.
+ * also pushed into `omp_set_num_threads`. Auto mode additionally exports the
+ * capped CPU count as `OMP_NUM_THREADS` before MFEM/Hypre initialization so
+ * libraries that snapshot their process-level OpenMP budget observe the same
+ * limit.
  *
  * It does not choose MFEM devices, manage contexts, execute steps, or publish
  * solver metrics.

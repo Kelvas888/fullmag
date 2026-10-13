@@ -8,10 +8,10 @@
 #include "cpu/mfem/interactions/exchange_field.hpp"
 
 #include "context.hpp"
+#include "cpu/mfem/interactions/operator_dependency.hpp"
 #include "cpu/mfem/runtime/interrupt.hpp"
 #include "cpu/mfem/interactions/exchange_mass_projection.hpp"
 #include "cpu/mfem/runtime/aos_field.hpp"
-#include "cpu/mfem/runtime/mfem_host_access.hpp"
 #include "cpu/mfem/runtime/mfem_device.hpp"
 #include "gpu/cuda/transfer/transfer_audit.hpp"
 
@@ -26,20 +26,7 @@
 namespace fullmag::fem {
 
 #if FULLMAG_HAS_MFEM_STACK
-namespace {
-
 constexpr int kInterruptPollStride = 256;
-
-void copy_host_vector_to_mfem(const std::vector<double> &src, mfem::Vector &dst, bool use_device) {
-    dst.SetSize(static_cast<int>(src.size()));
-    dst.UseDevice(use_device);
-    double *host = audited_host_write(dst);
-    for (size_t i = 0; i < src.size(); ++i) {
-        host[static_cast<int>(i)] = src[i];
-    }
-}
-
-} // namespace
 
 bool compute_exchange_for_magnetization(
     Context &ctx,
@@ -52,6 +39,26 @@ bool compute_exchange_for_magnetization(
 {
     if (!ctx.mfem_context.ready) {
         error = "MFEM exchange requested before MFEM context initialization";
+        return false;
+    }
+    if (!ctx.exchange.mfem.operator_lifecycle.setup_complete) {
+        error = "MFEM exchange operator dependencies are invalid; setup must be rebuilt before apply";
+        return false;
+    }
+    auto *mesh = ctx.mfem_context.mesh;
+    if (mesh == nullptr) {
+        error = "MFEM exchange operator dependencies cannot be checked without a mesh";
+        return false;
+    }
+    const auto current_key = make_exchange_operator_dependency_key(
+        ctx,
+        *mesh,
+        mfem::Device::IsEnabled());
+    if (current_key != ctx.exchange.mfem.operator_lifecycle.active_key) {
+        ++ctx.exchange.mfem.operator_lifecycle.invalidation_count;
+        ctx.exchange.mfem.operator_lifecycle.setup_complete = false;
+        ctx.exchange.mfem.ready = false;
+        error = "MFEM exchange operator dependencies changed; setup must be rebuilt before apply";
         return false;
     }
 
@@ -78,11 +85,10 @@ bool compute_exchange_for_magnetization(
         ctx.transfer_audit.audit,
         TransferAuditScopeKind::ExchangeInterop);
 
-    const bool use_device = mfem::Device::IsEnabled();
-    unpack_aos_to_existing_components(m_xyz, ctx.mfem_context.m_x, ctx.mfem_context.m_y, ctx.mfem_context.m_z);
-    copy_host_vector_to_mfem(ctx.mfem_context.m_x, *gf_mx, use_device);
-    copy_host_vector_to_mfem(ctx.mfem_context.m_y, *gf_my, use_device);
-    copy_host_vector_to_mfem(ctx.mfem_context.m_z, *gf_mz, use_device);
+    if (!copy_local_node_aos_to_mfem_state(ctx, m_xyz, error)) {
+        error = "MFEM exchange state adapter failed: " + error;
+        return false;
+    }
 
     double exchange_energy_accum = 0.0;
     double component_energy = 0.0;

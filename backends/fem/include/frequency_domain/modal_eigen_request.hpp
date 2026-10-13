@@ -2,12 +2,46 @@
 
 #include "frequency_domain/frequency_domain_contract.hpp"
 #include "frequency_domain/mode_kinematics.hpp"
+#include "fullmag_fem.h"
 
 #include <cstdint>
 
 namespace fullmag::fem::frequency_domain {
 
-constexpr std::uint32_t kFrequencyDomainAbiVersion = 12;
+struct FloquetSharedDomainSparseModalOperator;
+
+constexpr std::uint32_t kFrequencyDomainLegacyAbiVersion = 12;
+constexpr std::uint32_t kFrequencyDomainPriorAbiVersion = 13;
+constexpr std::uint32_t kFrequencyDomainPreviousAbiVersion = 14;
+constexpr std::uint32_t kFrequencyDomainV15AbiVersion = 15;
+constexpr std::uint32_t kFrequencyDomainV16AbiVersion = 16;
+constexpr std::uint32_t kFrequencyDomainV17AbiVersion = 17;
+constexpr std::uint32_t kFrequencyDomainV18AbiVersion = 18;
+constexpr std::uint32_t kFrequencyDomainAbiVersion = 19;
+
+enum class ModalExecutionTarget : std::uint32_t {
+    auto_select = 0,
+    production_cpu = 1,
+    production_gpu = 2,
+    // Resolved-result lane only; public requests must use an execution lane.
+    validation = 3,
+};
+
+enum class ModalScalarRepresentation : std::uint32_t {
+    real_split = 0,
+    complex_double = 1,
+};
+
+enum class ModalResultFieldRepresentation : std::uint32_t {
+    tangent_q = 0,
+    cartesian_delta_m = 1,
+    tangent_q_and_cartesian_delta_m = 2,
+};
+
+enum class ModalSpectralTransformKind : std::uint32_t {
+    auto_select = 0,
+    shift_invert = 1,
+};
 
 struct LinearizedOperatorRequest {
     std::uint32_t abi_version = kFrequencyDomainAbiVersion;
@@ -64,7 +98,8 @@ struct ModalEigenRequest {
     int write_partial_artifacts = 0;
     int completeness_policy = 0;
     int eigensolver_family = 0;
-    int spectral_transform_kind = 0;
+    ModalSpectralTransformKind spectral_transform_kind =
+        ModalSpectralTransformKind::auto_select;
     void *cancel_user_data = nullptr;
     int (*cancel_requested)(void *user_data) = nullptr;
     void *progress_user_data = nullptr;
@@ -92,6 +127,10 @@ struct ModalEigenRequest {
     CsrMatrixView mfem_sparse_stiffness_csr{};
     CsrMatrixView mfem_sparse_gyrotropic_csr{};
     CsrMatrixView mfem_sparse_mass_csr{};
+    /* Internal native owner for nonzero-k shared-domain Floquet solves.  It
+       is deliberately outside the public ABI prefix and is populated only
+       after the payload importer has assembled all phase-reduced blocks. */
+    const FloquetSharedDomainSparseModalOperator *floquet_shared_domain_operator = nullptr;
     bool has_floquet_k_vector = false;
     double floquet_k_vector_rad_per_m[3] = {0.0, 0.0, 0.0};
     FrequencyDomainPhaseConvention phase_convention =
@@ -125,8 +164,22 @@ struct ModalEigenRequest {
     const char *poisson_airbox_gauge_policy = nullptr;
     const char *poisson_airbox_gauge_reason = nullptr;
     const char *poisson_airbox_assembly_kind = nullptr;
+    // Optional native airbox contribution for a nonzero-k Floquet modal
+    // request.  Values are a dense real-split tangent matrix in exactly the
+    // same reduced coordinates and units as mfem_stiffness_matrix_row_major;
+    // the provider must include the complex Bloch phase and scalar-potential
+    // elimination before handing it across this ABI.  A null pointer and zero
+    // count mean that dynamic demagnetization is unavailable, never k=0.
     const double *dynamic_demag_k_tangent_matrix_row_major = nullptr;
     std::uint64_t dynamic_demag_k_tangent_matrix_value_count = 0;
+    ModalExecutionTarget execution_target = ModalExecutionTarget::auto_select;
+    ModalScalarRepresentation scalar_representation = ModalScalarRepresentation::complex_double;
+    ModalResultFieldRepresentation result_field_representation =
+        ModalResultFieldRepresentation::tangent_q;
+    /* Physical shared-domain mesh/material/equilibrium payload.  This is
+       intentionally separate from the legacy synthetic CSR descriptor. */
+    int poisson_airbox_shared_domain_enabled = 0;
+    const FullmagFemModalSharedDomainPayload *poisson_airbox_shared_domain_payload = nullptr;
 };
 
 struct DrivenResponseContractRequest {

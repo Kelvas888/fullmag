@@ -12,17 +12,20 @@
  */
 
 #include "context.hpp"
-#include "adaptive_step_decision.hpp"
-
+#include "adaptive_controller.cuh"
+#include "../interactions/regional_field_drive.cuh"
 #include <cuda_runtime.h>
+#include <math_constants.h>
 #include <cmath>
+#include <limits>
+#include <math_constants.h>
 
 namespace fullmag {
 namespace fdm {
 
 extern void set_cuda_error(Context &ctx, const char *operation, cudaError_t err);
 
-static constexpr double MU0 = 4.0 * M_PI * 1e-7;
+static constexpr double MU0 = 4.0 * kFullmagPi * 1e-7;
 static constexpr int REDUCTION_BLOCK_SIZE = 256;
 
 template <typename T>
@@ -99,38 +102,195 @@ __global__ void reduce_max_blocks_kernel(const double *input, double *output, ui
     }
 }
 
+__global__ void reduce_max_metric_triplet_blocks_kernel(
+    const double *input,
+    double *output,
+    uint64_t n,
+    uint64_t metric_stride)
+{
+    __shared__ double shared[3][REDUCTION_BLOCK_SIZE];
+    const uint64_t global =
+        static_cast<uint64_t>(blockIdx.x) * blockDim.x * 2ULL + threadIdx.x;
+    const uint64_t other = global + blockDim.x;
+
+    for (int metric = 0; metric < 3; ++metric) {
+        const double *metric_input = input + metric * metric_stride;
+        double local_max = -1.0e300;
+        if (global < n) local_max = metric_input[global];
+        if (other < n) local_max = fmax(local_max, metric_input[other]);
+        shared[metric][threadIdx.x] = local_max;
+    }
+    __syncthreads();
+
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride) {
+            for (int metric = 0; metric < 3; ++metric) {
+                shared[metric][threadIdx.x] = fmax(
+                    shared[metric][threadIdx.x],
+                    shared[metric][threadIdx.x + stride]);
+            }
+        }
+        __syncthreads();
+    }
+
+    if (threadIdx.x == 0) {
+        for (int metric = 0; metric < 3; ++metric) {
+            output[metric * metric_stride + blockIdx.x] = shared[metric][0];
+        }
+    }
+}
+
 __global__ void adaptive_error_policy_kernel(
     const double *max_error_sq,
-    double *policy_out,
+    const double *max_norm_defect,
+    const double *max_spin_rotation,
+    AdaptiveDeviceControl *policy_out,
+    fullmag_fdm_adaptive_attempt_v1 *attempt_trace,
     double dt,
-    double adaptive_threshold,
     double adaptive_dt_min,
     double adaptive_dt_max,
     double adaptive_safety,
     double adaptive_growth_limit,
     double adaptive_shrink_limit,
-    double exponent)
+    int has_norm_tolerance,
+    double norm_tolerance,
+    int has_max_spin_rotation,
+    double max_spin_rotation_limit,
+    double exponent,
+    int order_est,
+    int canonical_controller,
+    double previous_error,
+    int has_previous_error,
+    uint32_t rejected_attempts,
+    int force_retry)
 {
-    double max_sq = max_error_sq != nullptr ? max_error_sq[0] : 0.0;
-    double error = max_sq > 0.0 ? sqrt(max_sq) : 0.0;
-    double dt_candidate = dt;
-    if (error > 0.0) {
-        dt_candidate = adaptive_safety * dt * pow(adaptive_threshold / error, exponent);
-        double ratio = dt_candidate / dt;
-        ratio = fmin(ratio, adaptive_growth_limit);
-        ratio = fmax(ratio, adaptive_shrink_limit);
-        dt_candidate = dt * ratio;
-        dt_candidate = fmin(dt_candidate, adaptive_dt_max);
-        dt_candidate = fmax(dt_candidate, adaptive_dt_min);
+    const double input_previous_error = previous_error;
+    const uint32_t input_has_previous_error = has_previous_error != 0 ? 1U : 0U;
+    evaluate_adaptive_error_policy_device(
+        max_error_sq != nullptr ? max_error_sq[0] : 0.0,
+        max_norm_defect != nullptr ? max_norm_defect[0] : 0.0,
+        max_spin_rotation != nullptr ? max_spin_rotation[0] : 0.0,
+        has_norm_tolerance,
+        norm_tolerance,
+        has_max_spin_rotation,
+        max_spin_rotation_limit,
+        policy_out,
+        attempt_trace,
+        dt,
+        adaptive_dt_min,
+        adaptive_dt_max,
+        adaptive_safety,
+        adaptive_growth_limit,
+        adaptive_shrink_limit,
+        exponent,
+        order_est,
+        canonical_controller,
+        previous_error,
+        has_previous_error,
+        rejected_attempts,
+        force_retry);
+    policy_out->decision_input_previous_error = input_previous_error;
+    policy_out->decision_input_has_previous_error = input_has_previous_error;
+    policy_out->last_max_norm_defect =
+        max_norm_defect != nullptr ? max_norm_defect[0] : 0.0;
+    policy_out->last_max_spin_rotation_radians =
+        max_spin_rotation != nullptr ? max_spin_rotation[0] : 0.0;
+    if (rejected_attempts == 0) {
+        policy_out->max_attempt_error = policy_out->embedded_error;
+        policy_out->max_attempt_norm_defect = policy_out->last_max_norm_defect;
+        policy_out->max_attempt_spin_rotation_radians =
+            policy_out->last_max_spin_rotation_radians;
     } else {
-        dt_candidate = adaptive_dt_max;
+        policy_out->max_attempt_error = fmax(
+            policy_out->max_attempt_error,
+            policy_out->embedded_error);
+        policy_out->max_attempt_norm_defect = fmax(
+            policy_out->max_attempt_norm_defect,
+            policy_out->last_max_norm_defect);
+        policy_out->max_attempt_spin_rotation_radians = fmax(
+            policy_out->max_attempt_spin_rotation_radians,
+            policy_out->last_max_spin_rotation_radians);
     }
-    // A failed attempt at the lower bound is terminal: dt_min_exhausted.
-    double accepted = error <= adaptive_threshold ? 1.0
-        : (dt <= adaptive_dt_min ? -1.0 : 0.0);
-    policy_out[0] = error;
-    policy_out[1] = dt_candidate;
-    policy_out[2] = accepted;
+}
+
+__global__ void adaptive_error_policy_loop_kernel(
+    const double *max_error_sq,
+    const double *max_norm_defect,
+    const double *max_spin_rotation,
+    AdaptiveDeviceControl *control,
+    fullmag_fdm_adaptive_attempt_v1 *attempt_trace,
+    double adaptive_dt_min,
+    double adaptive_dt_max,
+    double adaptive_safety,
+    double adaptive_growth_limit,
+    double adaptive_shrink_limit,
+    int has_norm_tolerance,
+    double norm_tolerance,
+    int has_max_spin_rotation,
+    double max_spin_rotation_limit,
+    double exponent,
+    int order_est,
+    int canonical_controller,
+    cudaGraphConditionalHandle loop_handle)
+{
+    const uint32_t attempt = control->next_rejected_attempts;
+    const double input_previous_error = control->previous_error;
+    const uint32_t input_has_previous_error = control->has_previous_error;
+    evaluate_adaptive_error_policy_loop_device(
+        max_error_sq != nullptr ? max_error_sq[0] : 0.0,
+        max_norm_defect != nullptr ? max_norm_defect[0] : 0.0,
+        max_spin_rotation != nullptr ? max_spin_rotation[0] : 0.0,
+        has_norm_tolerance,
+        norm_tolerance,
+        has_max_spin_rotation,
+        max_spin_rotation_limit,
+        control,
+        attempt_trace,
+        adaptive_dt_min,
+        adaptive_dt_max,
+        adaptive_safety,
+        adaptive_growth_limit,
+        adaptive_shrink_limit,
+        exponent,
+        order_est,
+        canonical_controller,
+        0,
+        loop_handle);
+    control->decision_input_previous_error = input_previous_error;
+    control->decision_input_has_previous_error = input_has_previous_error;
+    control->last_max_norm_defect =
+        max_norm_defect != nullptr ? max_norm_defect[0] : 0.0;
+    control->last_max_spin_rotation_radians =
+        max_spin_rotation != nullptr ? max_spin_rotation[0] : 0.0;
+    if (attempt == 0) {
+        control->max_attempt_error = control->embedded_error;
+        control->max_attempt_norm_defect = control->last_max_norm_defect;
+        control->max_attempt_spin_rotation_radians =
+            control->last_max_spin_rotation_radians;
+    } else {
+        control->max_attempt_error = fmax(
+            control->max_attempt_error,
+            control->embedded_error);
+        control->max_attempt_norm_defect = fmax(
+            control->max_attempt_norm_defect,
+            control->last_max_norm_defect);
+        control->max_attempt_spin_rotation_radians = fmax(
+            control->max_attempt_spin_rotation_radians,
+            control->last_max_spin_rotation_radians);
+    }
+}
+
+static const char *adaptive_device_reason_id(uint32_t reason) {
+    switch (reason) {
+        case ADAPTIVE_DEVICE_REASON_WITHIN_TOLERANCE: return "within_tolerance";
+        case ADAPTIVE_DEVICE_REASON_ERROR_ABOVE_TOLERANCE: return "error_above_tolerance";
+        case ADAPTIVE_DEVICE_REASON_DT_MIN_EXHAUSTED: return "dt_min_exhausted";
+        case ADAPTIVE_DEVICE_REASON_INVALID_TIMESTEP: return "invalid_timestep";
+        case ADAPTIVE_DEVICE_REASON_INVALID_CURRENT_ERROR: return "invalid_current_error";
+        case ADAPTIVE_DEVICE_REASON_INVALID_PREVIOUS_ERROR: return "invalid_previous_error";
+        case ADAPTIVE_DEVICE_REASON_RETRY_LIMIT_EXHAUSTED: return "retry_limit_exhausted";
+        default: return "invalid_decision_reason";
+    }
 }
 
 template <typename Scalar>
@@ -599,7 +759,15 @@ __global__ void external_energy_blocks_kernel(
     const Scalar *oe_x,
     const Scalar *oe_y,
     const Scalar *oe_z,
-    double oe_scale)
+    double oe_scale,
+    const Scalar *regional_drive_x,
+    const Scalar *regional_drive_y,
+    const Scalar *regional_drive_z,
+    const RegionalFieldDriveParams *regional_drive_params,
+    const double *regional_drive_points,
+    uint32_t regional_drive_count,
+    uint64_t regional_drive_cell_count,
+    double evaluation_time_s)
 {
     __shared__ double shared[REDUCTION_BLOCK_SIZE];
     uint64_t idx = static_cast<uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -616,6 +784,15 @@ __global__ void external_energy_blocks_kernel(
             field_y += oe_scale * to_f64(oe_y[idx]);
             field_z += oe_scale * to_f64(oe_z[idx]);
         }
+        field_x += regional_field_drive_component(
+            regional_drive_x, regional_drive_params, regional_drive_points,
+            regional_drive_count, regional_drive_cell_count, idx, evaluation_time_s);
+        field_y += regional_field_drive_component(
+            regional_drive_y, regional_drive_params, regional_drive_points,
+            regional_drive_count, regional_drive_cell_count, idx, evaluation_time_s);
+        field_z += regional_field_drive_component(
+            regional_drive_z, regional_drive_params, regional_drive_points,
+            regional_drive_count, regional_drive_cell_count, idx, evaluation_time_s);
         double mdoth =
             to_f64(mx[idx]) * field_x + to_f64(my[idx]) * field_y + to_f64(mz[idx]) * field_z;
         energy += coeff * phi_i * mdoth;
@@ -787,6 +964,7 @@ AdaptiveErrorPolicy reduce_adaptive_error_policy(
     Context &ctx,
     double *device_values,
     uint64_t n,
+    uint64_t metric_stride,
     double dt,
     double exponent)
 {
@@ -806,68 +984,46 @@ AdaptiveErrorPolicy reduce_adaptive_error_policy(
     uint64_t current = n;
     while (current > 1) {
         uint64_t blocks = (current + REDUCTION_BLOCK_SIZE * 2 - 1) / (REDUCTION_BLOCK_SIZE * 2);
-        reduce_max_blocks_kernel<<<static_cast<unsigned int>(blocks), REDUCTION_BLOCK_SIZE, 0, stream>>>(
-            src,
-            dst,
-            current);
+        reduce_max_metric_triplet_blocks_kernel<<<
+            static_cast<unsigned int>(blocks), REDUCTION_BLOCK_SIZE, 0, stream>>>(
+            src, dst, current, metric_stride);
         current = blocks;
         double *tmp = src;
         src = dst;
         dst = tmp;
     }
 
-    if (ctx.adaptive_canonical_controller) {
-        double max_sq = 0.0;
-        cudaError_t err = cudaMemcpyAsync(&max_sq, src, sizeof(double), cudaMemcpyDeviceToHost, stream);
-        if (err != cudaSuccess) {
-            set_cuda_error(ctx, "cudaMemcpyAsync(reduce_adaptive_error_policy)", err);
-            context_end_compute_stream_work(ctx, "reduce_adaptive_error_policy");
-            return policy;
-        }
-        err = cudaStreamSynchronize(stream);
-        if (err != cudaSuccess) {
-            set_cuda_error(ctx, "cudaStreamSynchronize(reduce_adaptive_error_policy)", err);
-            context_end_compute_stream_work(ctx, "reduce_adaptive_error_policy");
-            return policy;
-        }
-        fullmag_fdm_record_control_scalar_d2h(ctx, sizeof(double));
-        fullmag_fdm_record_control_scalar_host_sync(ctx);
-        if (!context_end_compute_stream_work(ctx, "reduce_adaptive_error_policy")) return policy;
-        policy.error = max_sq > 0.0 ? std::sqrt(max_sq) : 0.0;
-        fullmag_fdm_record_hot_loop_host_compute(ctx);
-        const int order_est = exponent == 0.2 ? 4 : 2;
-        const auto decision = adaptive::decide_adaptive_step(
-            {order_est, ctx.adaptive_dt_min, ctx.adaptive_dt_max, ctx.adaptive_safety,
-             ctx.adaptive_growth_limit, ctx.adaptive_shrink_limit},
-            {dt, policy.error, ctx.adaptive_previous_error, ctx.adaptive_has_previous_error});
-        policy.dt_candidate = decision.dt_next;
-        policy.accepted = decision.kind == adaptive::AdaptiveDecisionKind::accepted ? 1 : 0;
-        policy.dt_min_exhausted =
-            decision.reason == adaptive::AdaptiveDecisionReason::dt_min_exhausted;
-        if (policy.accepted) {
-            ctx.adaptive_has_previous_error = policy.error > 0.0;
-            ctx.adaptive_previous_error = policy.error > 0.0 ? policy.error : 0.0;
-        }
-        if (decision.kind == adaptive::AdaptiveDecisionKind::failed && !policy.dt_min_exhausted) {
-            ctx.last_error = adaptive::adaptive_decision_reason_id(decision.reason);
-        }
-        return policy;
-    }
-
+    const int force_retry = ctx.gpu_transport_test_force_adaptive_retry ? 1 : 0;
+    ctx.gpu_transport_test_force_adaptive_retry = false;
+    const int order_est = exponent == 0.2 ? 4 : 2;
     adaptive_error_policy_kernel<<<1, 1, 0, stream>>>(
         src,
+        src + metric_stride,
+        src + 2 * metric_stride,
         ctx.adaptive_policy_scratch,
+        ctx.adaptive_attempt_trace_device,
         dt,
-        1.0,
         ctx.adaptive_dt_min,
         ctx.adaptive_dt_max,
         ctx.adaptive_safety,
         ctx.adaptive_growth_limit,
         ctx.adaptive_shrink_limit,
-        exponent);
+        ctx.has_adaptive_norm_tolerance ? 1 : 0,
+        ctx.adaptive_norm_tolerance,
+        ctx.has_adaptive_max_spin_rotation ? 1 : 0,
+        ctx.adaptive_max_spin_rotation,
+        exponent,
+        order_est,
+        ctx.adaptive_canonical_controller ? 1 : 0,
+        ctx.adaptive_previous_error,
+        ctx.adaptive_has_previous_error ? 1 : 0,
+        ctx.adaptive_rejected_attempts,
+        force_retry);
 
-    double host_values[3] = {0.0, dt, 0.0};
-    cudaError_t err = cudaMemcpyAsync(&host_values, ctx.adaptive_policy_scratch, 3 * sizeof(double), cudaMemcpyDeviceToHost, stream);
+    AdaptiveDeviceControl host_control{};
+    cudaError_t err = cudaMemcpyAsync(
+        &host_control, ctx.adaptive_policy_scratch, sizeof(host_control),
+        cudaMemcpyDeviceToHost, stream);
     if (err != cudaSuccess) {
         set_cuda_error(ctx, "cudaMemcpyAsync(reduce_adaptive_error_policy)", err);
         context_end_compute_stream_work(ctx, "reduce_adaptive_error_policy");
@@ -879,16 +1035,114 @@ AdaptiveErrorPolicy reduce_adaptive_error_policy(
         context_end_compute_stream_work(ctx, "reduce_adaptive_error_policy");
         return policy;
     }
-    fullmag_fdm_record_control_scalar_d2h(ctx, 3 * sizeof(double));
+    fullmag_fdm_record_control_scalar_d2h(ctx, sizeof(host_control));
     fullmag_fdm_record_control_scalar_host_sync(ctx);
     if (!context_end_compute_stream_work(ctx, "reduce_adaptive_error_policy")) {
         return policy;
     }
-    policy.error = host_values[0];
-    policy.dt_candidate = host_values[1];
-    policy.accepted = host_values[2] >= 0.5 ? 1 : 0;
-    policy.dt_min_exhausted = host_values[2] < -0.5;
+    fullmag_fdm_note_operator_device_execution(
+        ctx, FULLMAG_FDM_OPERATOR_REDUCTION);
+    policy.error = host_control.error;
+    policy.dt_candidate = host_control.dt_candidate;
+    policy.ratio = host_control.ratio;
+    policy.accepted = host_control.decision == ADAPTIVE_DEVICE_DECISION_ACCEPTED ? 1 : 0;
+    policy.dt_min_exhausted =
+        host_control.reason == ADAPTIVE_DEVICE_REASON_DT_MIN_EXHAUSTED;
+    policy.failed = host_control.decision == ADAPTIVE_DEVICE_DECISION_FAILED;
+    policy.reason = host_control.reason;
+    policy.rejected_attempts = host_control.next_rejected_attempts;
+    ctx.adaptive_rejected_attempts = host_control.next_rejected_attempts;
+    if (host_control.decision == ADAPTIVE_DEVICE_DECISION_ACCEPTED ||
+        host_control.decision == ADAPTIVE_DEVICE_DECISION_FAILED) {
+        ctx.adaptive_attempt_trace_count = host_control.attempt_index + 1;
+    }
+    if (policy.accepted && ctx.adaptive_canonical_controller) {
+        ctx.adaptive_has_previous_error = host_control.has_previous_error != 0;
+        ctx.adaptive_previous_error = host_control.previous_error;
+    }
+    if (host_control.decision == ADAPTIVE_DEVICE_DECISION_FAILED &&
+        !policy.dt_min_exhausted) {
+        ctx.last_error = adaptive_device_reason_id(host_control.reason);
+    }
+    if (host_control.decision != ADAPTIVE_DEVICE_DECISION_RETRY) {
+        context_record_adaptive_numerics_terminal(
+            ctx, host_control, order_est);
+    }
     return policy;
+}
+
+bool enqueue_adaptive_error_policy_device_loop(
+    Context &ctx,
+    double *device_values,
+    uint64_t n,
+    uint64_t metric_stride,
+    double exponent,
+    cudaGraphConditionalHandle loop_handle)
+{
+    if (device_values == nullptr || n == 0 ||
+        ctx.adaptive_policy_scratch == nullptr) {
+        ctx.last_error = "adaptive_device_loop_scratch_unavailable";
+        return false;
+    }
+    if (!context_begin_compute_stream_work(
+            ctx, "enqueue_adaptive_error_policy_device_loop")) {
+        return false;
+    }
+    cudaStream_t stream = context_compute_stream(ctx);
+    double *src = device_values;
+    double *dst = ctx.reduction_scratch_aux;
+    uint64_t current = n;
+    while (current > 1) {
+        const uint64_t blocks =
+            (current + REDUCTION_BLOCK_SIZE * 2 - 1) /
+            (REDUCTION_BLOCK_SIZE * 2);
+        reduce_max_metric_triplet_blocks_kernel<<<
+            static_cast<unsigned int>(blocks),
+            REDUCTION_BLOCK_SIZE,
+            0,
+            stream>>>(src, dst, current, metric_stride);
+        current = blocks;
+        double *temporary = src;
+        src = dst;
+        dst = temporary;
+    }
+    const int order_est = exponent == 0.2 ? 4 : 2;
+    adaptive_error_policy_loop_kernel<<<1, 1, 0, stream>>>(
+        src,
+        src + metric_stride,
+        src + 2 * metric_stride,
+        ctx.adaptive_policy_scratch,
+        ctx.adaptive_attempt_trace_device,
+        ctx.adaptive_dt_min,
+        ctx.adaptive_dt_max,
+        ctx.adaptive_safety,
+        ctx.adaptive_growth_limit,
+        ctx.adaptive_shrink_limit,
+        ctx.has_adaptive_norm_tolerance ? 1 : 0,
+        ctx.adaptive_norm_tolerance,
+        ctx.has_adaptive_max_spin_rotation ? 1 : 0,
+        ctx.adaptive_max_spin_rotation,
+        exponent,
+        order_est,
+        ctx.adaptive_canonical_controller ? 1 : 0,
+        loop_handle);
+    const cudaError_t launch_error = cudaGetLastError();
+    if (launch_error != cudaSuccess) {
+        set_cuda_error(
+            ctx,
+            "adaptive_error_policy_loop_kernel",
+            launch_error);
+        context_end_compute_stream_work(
+            ctx, "enqueue_adaptive_error_policy_device_loop");
+        return false;
+    }
+    if (!context_end_compute_stream_work(
+            ctx, "enqueue_adaptive_error_policy_device_loop")) {
+        return false;
+    }
+    fullmag_fdm_note_operator_device_execution(
+        ctx, FULLMAG_FDM_OPERATOR_REDUCTION);
+    return true;
 }
 
 double reduce_max_norm_fp64(Context &ctx, const void *vx, const void *vy, const void *vz, uint64_t n) {
@@ -921,6 +1175,10 @@ template <typename Scalar>
 __global__ void cross_max_norm_blocks_kernel(
     const Scalar *ax, const Scalar *ay, const Scalar *az,
     const Scalar *bx, const Scalar *by, const Scalar *bz,
+    const uint8_t *active_mask,
+    const uint8_t *frozen_mask,
+    int has_active_mask,
+    int has_frozen_mask,
     double *block_out,
     uint64_t n)
 {
@@ -930,6 +1188,10 @@ __global__ void cross_max_norm_blocks_kernel(
 
     double local_max = 0.0;
     for (; idx < n; idx += stride) {
+        if ((has_active_mask && active_mask[idx] == 0) ||
+            (has_frozen_mask && frozen_mask[idx] != 0)) {
+            continue;
+        }
         double a0 = to_f64(ax[idx]), a1 = to_f64(ay[idx]), a2 = to_f64(az[idx]);
         double b0 = to_f64(bx[idx]), b1 = to_f64(by[idx]), b2 = to_f64(bz[idx]);
         double cx = a1 * b2 - a2 * b1;
@@ -962,6 +1224,10 @@ double reduce_max_cross_norm_fp64(Context &ctx,
     cross_max_norm_blocks_kernel<<<static_cast<unsigned int>(blocks), REDUCTION_BLOCK_SIZE>>>(
         static_cast<const double *>(ax), static_cast<const double *>(ay), static_cast<const double *>(az),
         static_cast<const double *>(bx), static_cast<const double *>(by), static_cast<const double *>(bz),
+        ctx.active_mask,
+        ctx.frozen_mask,
+        ctx.has_active_mask ? 1 : 0,
+        ctx.has_frozen_mask ? 1 : 0,
         ctx.reduction_scratch, n);
     double max_norm_sq = finalize_max_reduction(ctx, ctx.reduction_scratch, blocks);
     return std::sqrt(max_norm_sq);
@@ -975,6 +1241,10 @@ double reduce_max_cross_norm_fp32(Context &ctx,
     cross_max_norm_blocks_kernel<<<static_cast<unsigned int>(blocks), REDUCTION_BLOCK_SIZE>>>(
         static_cast<const float *>(ax), static_cast<const float *>(ay), static_cast<const float *>(az),
         static_cast<const float *>(bx), static_cast<const float *>(by), static_cast<const float *>(bz),
+        ctx.active_mask,
+        ctx.frozen_mask,
+        ctx.has_active_mask ? 1 : 0,
+        ctx.has_frozen_mask ? 1 : 0,
         ctx.reduction_scratch, n);
     double max_norm_sq = finalize_max_reduction(ctx, ctx.reduction_scratch, blocks);
     return std::sqrt(max_norm_sq);
@@ -1121,15 +1391,18 @@ double reduce_demag_energy_fp32(Context &ctx) {
 }
 
 double reduce_external_energy_fp64(Context &ctx) {
-    if (!ctx.has_external_field && !ctx.has_oersted_field) {
+    const bool has_external_profile =
+        ctx.has_static_external_field_profile || ctx.has_oersted_field;
+    if (!ctx.has_external_field && !has_external_profile &&
+        ctx.regional_field_drive_count == 0) {
         return 0.0;
     }
     uint64_t blocks = launch_grid_for(ctx.cell_count);
     int has_vf = (ctx.boundary_tier > 0 && ctx.volume_fraction != nullptr) ? 1 : 0;
     double coeff = -MU0 * ctx.Ms * ctx.dx * ctx.dy * ctx.dz;
-    const auto *oe_x = ctx.has_oersted_field ? static_cast<const double *>(ctx.h_oe_static.x) : nullptr;
-    const auto *oe_y = ctx.has_oersted_field ? static_cast<const double *>(ctx.h_oe_static.y) : nullptr;
-    const auto *oe_z = ctx.has_oersted_field ? static_cast<const double *>(ctx.h_oe_static.z) : nullptr;
+    const auto *oe_x = has_external_profile ? static_cast<const double *>(ctx.h_oe_static.x) : nullptr;
+    const auto *oe_y = has_external_profile ? static_cast<const double *>(ctx.h_oe_static.y) : nullptr;
+    const auto *oe_z = has_external_profile ? static_cast<const double *>(ctx.h_oe_static.z) : nullptr;
     external_energy_blocks_kernel<<<static_cast<unsigned int>(blocks), REDUCTION_BLOCK_SIZE>>>(
         static_cast<const double *>(ctx.m.x),
         static_cast<const double *>(ctx.m.y),
@@ -1145,20 +1418,31 @@ double reduce_external_energy_fp64(Context &ctx) {
         oe_x,
         oe_y,
         oe_z,
-        ctx.has_static_external_field_profile ? 1.0 : oersted_field_scale(ctx, ctx.current_time));
+        ctx.has_static_external_field_profile ? 1.0 : oersted_field_scale(ctx, ctx.current_time),
+        static_cast<const double *>(ctx.regional_field_drive_x),
+        static_cast<const double *>(ctx.regional_field_drive_y),
+        static_cast<const double *>(ctx.regional_field_drive_z),
+        ctx.regional_field_drive_params,
+        ctx.regional_field_drive_points,
+        ctx.regional_field_drive_count,
+        ctx.cell_count,
+        ctx.current_time);
     return finalize_sum_reduction(ctx, ctx.reduction_scratch, blocks);
 }
 
 double reduce_external_energy_fp32(Context &ctx) {
-    if (!ctx.has_external_field && !ctx.has_oersted_field) {
+    const bool has_external_profile =
+        ctx.has_static_external_field_profile || ctx.has_oersted_field;
+    if (!ctx.has_external_field && !has_external_profile &&
+        ctx.regional_field_drive_count == 0) {
         return 0.0;
     }
     uint64_t blocks = launch_grid_for(ctx.cell_count);
     int has_vf = (ctx.boundary_tier > 0 && ctx.volume_fraction != nullptr) ? 1 : 0;
     double coeff = -MU0 * ctx.Ms * ctx.dx * ctx.dy * ctx.dz;
-    const auto *oe_x = ctx.has_oersted_field ? static_cast<const float *>(ctx.h_oe_static.x) : nullptr;
-    const auto *oe_y = ctx.has_oersted_field ? static_cast<const float *>(ctx.h_oe_static.y) : nullptr;
-    const auto *oe_z = ctx.has_oersted_field ? static_cast<const float *>(ctx.h_oe_static.z) : nullptr;
+    const auto *oe_x = has_external_profile ? static_cast<const float *>(ctx.h_oe_static.x) : nullptr;
+    const auto *oe_y = has_external_profile ? static_cast<const float *>(ctx.h_oe_static.y) : nullptr;
+    const auto *oe_z = has_external_profile ? static_cast<const float *>(ctx.h_oe_static.z) : nullptr;
     external_energy_blocks_kernel<<<static_cast<unsigned int>(blocks), REDUCTION_BLOCK_SIZE>>>(
         static_cast<const float *>(ctx.m.x),
         static_cast<const float *>(ctx.m.y),
@@ -1174,11 +1458,20 @@ double reduce_external_energy_fp32(Context &ctx) {
         oe_x,
         oe_y,
         oe_z,
-        ctx.has_static_external_field_profile ? 1.0 : oersted_field_scale(ctx, ctx.current_time));
+        ctx.has_static_external_field_profile ? 1.0 : oersted_field_scale(ctx, ctx.current_time),
+        static_cast<const float *>(ctx.regional_field_drive_x),
+        static_cast<const float *>(ctx.regional_field_drive_y),
+        static_cast<const float *>(ctx.regional_field_drive_z),
+        ctx.regional_field_drive_params,
+        ctx.regional_field_drive_points,
+        ctx.regional_field_drive_count,
+        ctx.cell_count,
+        ctx.current_time);
     return finalize_sum_reduction(ctx, ctx.reduction_scratch, blocks);
 }
 
 double reduce_uniaxial_anisotropy_energy_fp64(Context &ctx) {
+    ++ctx.endpoint_field_cache.energy_reduction_count;
     if (!ctx.has_uniaxial_anisotropy) {
         return 0.0;
     }
@@ -1205,6 +1498,7 @@ double reduce_uniaxial_anisotropy_energy_fp64(Context &ctx) {
 }
 
 double reduce_uniaxial_anisotropy_energy_fp32(Context &ctx) {
+    ++ctx.endpoint_field_cache.energy_reduction_count;
     if (!ctx.has_uniaxial_anisotropy) {
         return 0.0;
     }
@@ -1274,13 +1568,13 @@ __global__ void cubic_anisotropy_energy_blocks_kernel(
     if (threadIdx.x == 0) block_out[blockIdx.x] = shared[0];
 }
 
-// --- DMI energy kernel (interfacial + bulk) ---
+// --- DMI energy kernel (interfacial + rotated interfacial + bulk) ---
 template <typename Scalar>
 __global__ void dmi_energy_blocks_kernel(
     const Scalar *mx, const Scalar *my, const Scalar *mz,
     double *block_out, uint64_t n, double coeff,
-    int has_interfacial, int has_bulk,
-    double D_int, double D_bulk,
+    int has_interfacial, int has_rotated_interfacial, int has_bulk,
+    double D_int, double D_rotated_int, double D_bulk,
     int nx, int ny, int nz,
     int periodic_x, int periodic_y, int periodic_z,
     double inv_2dx, double inv_2dy, double inv_2dz,
@@ -1358,6 +1652,27 @@ __global__ void dmi_energy_blocks_kernel(
             energy += coeff * D_int * (mmz * (dmx_dx + dmy_dy) - mmx * dmz_dx - mmy * dmz_dy);
         }
 
+        if (has_rotated_interfacial) {
+            const double sx = 2.0 * coeff * inv_2dx;
+            const double sy = 2.0 * coeff * inv_2dy;
+            if ((periodic_x || ix + 1 < nx) &&
+                (!has_active_mask || active_mask[xp] != 0)) {
+                const double right_x = to_f64(mx[xp]);
+                const double right_z = to_f64(mz[xp]);
+                energy += D_rotated_int * sx *
+                    (0.5 * (mmz + right_z) * (right_x - mmx) -
+                     0.5 * (mmx + right_x) * (right_z - mmz));
+            }
+            if ((periodic_y || iy + 1 < ny) &&
+                (!has_active_mask || active_mask[yp] != 0)) {
+                const double right_x = to_f64(mx[yp]);
+                const double right_y = to_f64(my[yp]);
+                energy += D_rotated_int * sy *
+                    (0.5 * (mmx + right_x) * (right_y - mmy) -
+                     0.5 * (mmy + right_y) * (right_x - mmx));
+            }
+        }
+
         if (has_bulk) {
             // E_bulk = D * m · (curl m) * V
             double dmz_dy = (to_f64(mz[yp]) - to_f64(mz[ym])) * inv_2dy;
@@ -1383,6 +1698,7 @@ __global__ void dmi_energy_blocks_kernel(
 }
 
 double reduce_cubic_anisotropy_energy_fp64(Context &ctx) {
+    ++ctx.endpoint_field_cache.energy_reduction_count;
     if (!ctx.has_cubic_anisotropy) return 0.0;
     uint64_t blocks = launch_grid_for(ctx.cell_count);
     int has_vf = (ctx.boundary_tier > 0 && ctx.volume_fraction != nullptr) ? 1 : 0;
@@ -1400,6 +1716,7 @@ double reduce_cubic_anisotropy_energy_fp64(Context &ctx) {
 }
 
 double reduce_cubic_anisotropy_energy_fp32(Context &ctx) {
+    ++ctx.endpoint_field_cache.energy_reduction_count;
     if (!ctx.has_cubic_anisotropy) return 0.0;
     uint64_t blocks = launch_grid_for(ctx.cell_count);
     int has_vf = (ctx.boundary_tier > 0 && ctx.volume_fraction != nullptr) ? 1 : 0;
@@ -1417,7 +1734,9 @@ double reduce_cubic_anisotropy_energy_fp32(Context &ctx) {
 }
 
 double reduce_dmi_energy_fp64(Context &ctx) {
-    if (!ctx.has_interfacial_dmi && !ctx.has_bulk_dmi) return 0.0;
+    ++ctx.endpoint_field_cache.energy_reduction_count;
+    if (!ctx.has_interfacial_dmi && !ctx.has_rotated_interfacial_dmi &&
+        !ctx.has_bulk_dmi) return 0.0;
     uint64_t blocks = launch_grid_for(ctx.cell_count);
     double coeff = ctx.dx * ctx.dy * ctx.dz;
     dmi_energy_blocks_kernel<<<static_cast<unsigned int>(blocks), REDUCTION_BLOCK_SIZE>>>(
@@ -1425,8 +1744,10 @@ double reduce_dmi_energy_fp64(Context &ctx) {
         static_cast<const double *>(ctx.m.y),
         static_cast<const double *>(ctx.m.z),
         ctx.reduction_scratch, ctx.cell_count, coeff,
-        ctx.has_interfacial_dmi ? 1 : 0, ctx.has_bulk_dmi ? 1 : 0,
-        ctx.D_interfacial, ctx.D_bulk,
+        ctx.has_interfacial_dmi ? 1 : 0,
+        ctx.has_rotated_interfacial_dmi ? 1 : 0,
+        ctx.has_bulk_dmi ? 1 : 0,
+        ctx.D_interfacial, ctx.D_rotated_interfacial, ctx.D_bulk,
         static_cast<int>(ctx.nx), static_cast<int>(ctx.ny), static_cast<int>(ctx.nz),
         ctx.periodic_x ? 1 : 0, ctx.periodic_y ? 1 : 0, ctx.periodic_z ? 1 : 0,
         0.5 / ctx.dx, 0.5 / ctx.dy, 0.5 / ctx.dz,
@@ -1436,7 +1757,9 @@ double reduce_dmi_energy_fp64(Context &ctx) {
 }
 
 double reduce_dmi_energy_fp32(Context &ctx) {
-    if (!ctx.has_interfacial_dmi && !ctx.has_bulk_dmi) return 0.0;
+    ++ctx.endpoint_field_cache.energy_reduction_count;
+    if (!ctx.has_interfacial_dmi && !ctx.has_rotated_interfacial_dmi &&
+        !ctx.has_bulk_dmi) return 0.0;
     uint64_t blocks = launch_grid_for(ctx.cell_count);
     double coeff = ctx.dx * ctx.dy * ctx.dz;
     dmi_energy_blocks_kernel<<<static_cast<unsigned int>(blocks), REDUCTION_BLOCK_SIZE>>>(
@@ -1444,8 +1767,10 @@ double reduce_dmi_energy_fp32(Context &ctx) {
         static_cast<const float *>(ctx.m.y),
         static_cast<const float *>(ctx.m.z),
         ctx.reduction_scratch, ctx.cell_count, coeff,
-        ctx.has_interfacial_dmi ? 1 : 0, ctx.has_bulk_dmi ? 1 : 0,
-        ctx.D_interfacial, ctx.D_bulk,
+        ctx.has_interfacial_dmi ? 1 : 0,
+        ctx.has_rotated_interfacial_dmi ? 1 : 0,
+        ctx.has_bulk_dmi ? 1 : 0,
+        ctx.D_interfacial, ctx.D_rotated_interfacial, ctx.D_bulk,
         static_cast<int>(ctx.nx), static_cast<int>(ctx.ny), static_cast<int>(ctx.nz),
         ctx.periodic_x ? 1 : 0, ctx.periodic_y ? 1 : 0, ctx.periodic_z ? 1 : 0,
         0.5 / ctx.dx, 0.5 / ctx.dy, 0.5 / ctx.dz,

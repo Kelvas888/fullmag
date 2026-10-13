@@ -36,7 +36,12 @@ bool gpu_runtime_coefficients_allocate(
         !gpu_device_allocate_double(materials.kc3, node_count, device_bytes, error) ||
         !gpu_device_allocate_u8(mesh_regions.magnetic_node_mask, node_count, device_bytes, error) ||
         !gpu_device_allocate_u32(mesh_regions.periodic_reduced_node, node_count, device_bytes, error) ||
-        !gpu_device_allocate_u32(mesh_regions.periodic_representative_nodes, node_count, device_bytes, error)) {
+        !gpu_device_allocate_u32(mesh_regions.periodic_representative_nodes, node_count, device_bytes, error) ||
+        !gpu_device_allocate_u32(
+            mesh_regions.periodic_reduced_representative_nodes,
+            node_count,
+            device_bytes,
+            error)) {
         return false;
     }
     mesh_metrics.node_count = node_count;
@@ -70,12 +75,16 @@ void gpu_runtime_coefficients_free(
     gpu_device_free_u8(mesh_regions.stt_active_element_mask);
     mesh_regions.stt_active_element_count = 0;
     gpu_device_free_u8(mesh_regions.frozen_mask);
+    gpu_device_free_u8(mesh_regions.free_node_mask);
+    mesh_regions.free_node_mask_count = 0;
     mesh_regions.frozen_node_count = 0;
     gpu_device_free_double(mesh_regions.frozen_reference_x);
     gpu_device_free_double(mesh_regions.frozen_reference_y);
     gpu_device_free_double(mesh_regions.frozen_reference_z);
     gpu_device_free_u32(mesh_regions.periodic_reduced_node);
     gpu_device_free_u32(mesh_regions.periodic_representative_nodes);
+    gpu_device_free_u32(mesh_regions.periodic_reduced_representative_nodes);
+    mesh_regions.periodic_reduced_node_count = 0;
 }
 
 } // namespace fullmag::fem

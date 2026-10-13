@@ -26,9 +26,11 @@ if(FULLMAG_ENABLE_CUDA)
         gpu/cuda/transport/spin/sparse_solver.cu
         gpu/cuda/runtime/context.cu
         gpu/cuda/runtime/llg_checkpoint.cpp
+        gpu/cuda/runtime/workspace_dependency_identity.cpp
         gpu/cuda/runtime/telemetry.cu
         gpu/cuda/runtime/device_info.cpp
         gpu/cuda/runtime/streams.cu
+        gpu/cuda/runtime/adaptive_graph.cu
         gpu/cuda/runtime/reductions_fp64.cu
         gpu/cuda/interactions/exchange_fp64.cu
         gpu/cuda/interactions/exchange_fp32.cu
@@ -93,7 +95,9 @@ string(REPLACE ";" "," FDM_GPU_BUILD_FLAGS_IDENTITY "${FDM_GPU_BUILD_FLAGS_IDENT
 string(SHA256 FDM_GPU_TRANSPORT_BUILD_DIGEST
     "${FDM_GPU_CONTEXT_SHA256};${FDM_GPU_CHARGE_SOLVER_SHA256};${FDM_GPU_CHARGE_SOLVER_HEADER_SHA256};${FDM_GPU_SPIN_SOLVER_SHA256};${FDM_GPU_SPIN_SOLVER_HEADER_SHA256};${FDM_GPU_SPIN_SPARSE_SOLVER_SHA256};${FDM_GPU_SPIN_SPARSE_SOLVER_HEADER_SHA256};${FDM_GPU_SPIN_MEMORY_POLICY_SHA256};${FDM_GPU_SPIN_MEMORY_POLICY_HEADER_SHA256};${FDM_GPU_CHARGE_CHECKPOINT_SHA256};${FDM_GPU_CHARGE_CHECKPOINT_HEADER_SHA256};${FDM_GPU_SPIN_CHECKPOINT_SHA256};${FDM_GPU_SPIN_CHECKPOINT_HEADER_SHA256};${FDM_GPU_LAYOUT_SHA256};${FDM_GPU_CHECKPOINT_SHA256};${FDM_GPU_HEADER_SHA256};${FDM_GPU_BUILD_FLAGS_IDENTITY}"
 )
-target_compile_definitions(fullmag_fdm PRIVATE
+# Only context.cu consumes the transport build identity. Applying this value
+# to the entire target recompiles every CUDA unit whenever its digest changes.
+set_property(SOURCE gpu/cuda/transport/context.cu APPEND PROPERTY COMPILE_DEFINITIONS
     FULLMAG_FDM_GPU_TRANSPORT_BUILD_DIGEST_HEX="${FDM_GPU_TRANSPORT_BUILD_DIGEST}"
 )
 
@@ -165,6 +169,15 @@ target_include_directories(fullmag_fdm
 if(FULLMAG_ENABLE_CUDA)
     target_compile_definitions(fullmag_fdm PRIVATE FULLMAG_HAS_CUDA=1)
 
+    # CUDA 13's CCCL requires the conforming MSVC preprocessor.  NVCC passes
+    # host compiler options separately, so spell out both language paths.
+    if(MSVC)
+        target_compile_options(fullmag_fdm PRIVATE
+            $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+            $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+        )
+    endif()
+
     # Architecture targets: Ampere, Ada Lovelace, Hopper
     set_target_properties(fullmag_fdm PROPERTIES
         CUDA_ARCHITECTURES "80;86;89;90"
@@ -232,7 +245,13 @@ if(FULLMAG_ENABLE_CUDA)
     target_include_directories(fdm_frozen_spins_cuda_runtime_contract PRIVATE
         ${CMAKE_SOURCE_DIR}/include
     )
-    target_link_libraries(fdm_frozen_spins_cuda_runtime_contract PRIVATE fullmag_fdm)
+    target_compile_definitions(fdm_frozen_spins_cuda_runtime_contract PRIVATE
+        FULLMAG_HAS_CUDA=1
+    )
+    target_link_libraries(fdm_frozen_spins_cuda_runtime_contract PRIVATE
+        fullmag_fdm
+        CUDA::cudart
+    )
     add_test(NAME fdm_frozen_spins_cuda_runtime_contract COMMAND fdm_frozen_spins_cuda_runtime_contract)
 endif()
 
@@ -322,8 +341,32 @@ add_executable(fdm_fsal_retry_transaction_contract
 target_include_directories(fdm_fsal_retry_transaction_contract PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(fdm_fsal_retry_transaction_contract PRIVATE fullmag_fdm)
+if(FULLMAG_ENABLE_CUDA)
+    target_compile_definitions(fdm_fsal_retry_transaction_contract PRIVATE FULLMAG_FDM_CONTRACT_HAS_CUDA=1)
+else()
+    target_compile_definitions(fdm_fsal_retry_transaction_contract PRIVATE FULLMAG_FDM_CONTRACT_HAS_CUDA=0)
+endif()
 add_test(NAME fdm_fsal_retry_transaction_contract
     COMMAND fdm_fsal_retry_transaction_contract)
+
+if(FULLMAG_ENABLE_CUDA)
+    add_executable(fdm_dmi_boundary_cuda_runtime
+        tests/dmi_boundary_cuda_runtime.cpp)
+    target_include_directories(fdm_dmi_boundary_cuda_runtime PRIVATE
+        ${CMAKE_SOURCE_DIR}/include)
+    target_link_libraries(fdm_dmi_boundary_cuda_runtime PRIVATE fullmag_fdm)
+    add_test(NAME fdm_dmi_boundary_cuda_runtime
+        COMMAND fdm_dmi_boundary_cuda_runtime)
+
+    add_executable(fdm_fsal_thermal_cuda_runtime_contract
+        tests/fsal_thermal_cuda_runtime.cpp)
+    target_include_directories(fdm_fsal_thermal_cuda_runtime_contract PRIVATE
+        ${CMAKE_SOURCE_DIR}/include)
+    target_link_libraries(fdm_fsal_thermal_cuda_runtime_contract PRIVATE fullmag_fdm)
+    add_test(NAME fdm_fsal_thermal_cuda_runtime_contract
+        COMMAND fdm_fsal_thermal_cuda_runtime_contract)
+endif()
 
 add_executable(prescribed_sot_contract tests/prescribed_sot_contract.cpp)
 target_include_directories(prescribed_sot_contract PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -746,6 +789,30 @@ if(FULLMAG_ENABLE_CUDA)
     target_link_libraries(smoke_context PRIVATE fullmag_fdm)
     add_test(NAME fdm_smoke_context COMMAND smoke_context)
 
+    add_executable(endpoint_cache_cuda_runtime
+        tests/endpoint_cache_cuda_runtime.cpp)
+    target_link_libraries(endpoint_cache_cuda_runtime PRIVATE fullmag_fdm)
+    add_test(NAME fdm_endpoint_cache_cuda_runtime
+        COMMAND endpoint_cache_cuda_runtime)
+
+    add_executable(local_pipeline_fusion_cuda_contract
+        tests/local_pipeline_fusion_cuda_contract.cu)
+    target_include_directories(local_pipeline_fusion_cuda_contract PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(local_pipeline_fusion_cuda_contract PRIVATE fullmag_fdm)
+    target_compile_definitions(local_pipeline_fusion_cuda_contract PRIVATE
+        FULLMAG_HAS_CUDA=1)
+    add_test(NAME fdm_local_pipeline_fusion_cuda_contract
+        COMMAND local_pipeline_fusion_cuda_contract)
+
+    add_executable(local_pipeline_fusion_cuda_benchmark
+        tests/local_pipeline_fusion_cuda_benchmark.cu)
+    target_include_directories(local_pipeline_fusion_cuda_benchmark PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(local_pipeline_fusion_cuda_benchmark PRIVATE fullmag_fdm)
+    target_compile_definitions(local_pipeline_fusion_cuda_benchmark PRIVATE
+        FULLMAG_HAS_CUDA=1)
+
     add_executable(exchange_fp64_parity tests/exchange_fp64_parity.cu)
     target_link_libraries(exchange_fp64_parity PRIVATE fullmag_fdm)
     add_test(NAME fdm_exchange_fp64_parity COMMAND exchange_fp64_parity)
@@ -775,6 +842,19 @@ if(FULLMAG_ENABLE_CUDA)
     add_executable(adaptive_error_reduction_contract tests/adaptive_error_reduction_contract.cpp)
     add_test(NAME fdm_adaptive_error_reduction_contract COMMAND adaptive_error_reduction_contract)
 
+    add_executable(adaptive_conditional_graph_contract
+        tests/adaptive_conditional_graph_contract.cu)
+    target_include_directories(adaptive_conditional_graph_contract PRIVATE
+        ${CMAKE_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/gpu/cuda/runtime)
+    target_link_libraries(adaptive_conditional_graph_contract PRIVATE
+        fullmag_fdm)
+    target_compile_definitions(adaptive_conditional_graph_contract PRIVATE
+        FULLMAG_HAS_CUDA=1)
+    add_test(NAME fdm_adaptive_conditional_graph_contract
+        COMMAND adaptive_conditional_graph_contract)
+
     add_executable(stats_mode_contract tests/stats_mode_contract.cpp)
     add_test(NAME fdm_stats_mode_contract COMMAND stats_mode_contract)
 
@@ -785,7 +865,8 @@ if(FULLMAG_ENABLE_CUDA)
     add_test(NAME fdm_async_snapshot_contract COMMAND async_snapshot_contract)
 
     add_executable(multilayer_create_v2_contract tests/multilayer_create_v2_contract.cpp)
-    target_link_libraries(multilayer_create_v2_contract PRIVATE fullmag_fdm)
+    target_link_libraries(multilayer_create_v2_contract PRIVATE
+        fullmag_fdm CUDA::cudart)
     set_target_properties(multilayer_create_v2_contract PROPERTIES
         BUILD_RPATH "$<TARGET_FILE_DIR:fullmag_fdm>"
     )

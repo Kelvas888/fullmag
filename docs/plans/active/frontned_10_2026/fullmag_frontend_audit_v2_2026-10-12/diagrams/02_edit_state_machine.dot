@@ -1,0 +1,43 @@
+digraph G {
+graph [bgcolor="#f7f9fc", fontname="DejaVu Sans", fontsize=20, fontcolor="#182e47", labelloc=t, labeljust=l, pad=0.4, nodesep=0.45, ranksep=0.75, splines=polyline, dpi=125];
+node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=12, fillcolor="#e6edf5", color="#adc1d7", fontcolor="#142941", penwidth=1.2, margin="0.19,0.15"];
+edge [fontname="DejaVu Sans", fontsize=10, color="#6e89a7", fontcolor="#415c78", arrowsize=0.75, penwidth=1.2];
+rankdir=LR;
+
+label="D02 / OBJECT EDIT V2 — PROPOSED\nPointerup never commits; complete event table in D04";
+clean [label="clean\nbaseline current"];
+valid [label="editing-valid\nlocal values + preview"];
+invalid [label="editing-invalid\nraw text retained"];
+commit [label="committing\nimmutable submitted snapshot\nnew rawText allowed / new gesture blocked"];
+conflict [label="conflict\nbase / local / remote"];
+recon [label="reconciling\nfetch + semantic choice"];
+reject [label="rejected\nknown no effect"];
+unknown [label="outcome-unknown\nno blind resubmit"];
+missing [label="target-missing\nretain raw for export"];
+suspend [label="suspended\nowner/epoch preserved"];
+clean->valid [label="edit"];
+valid->invalid [label="incomplete / invalid"];
+invalid->valid [label="correct input"];
+valid->valid [label="gesture end / pointerup\n0 HTTP mutation"];
+valid->clean [label="Revert"];
+valid->commit [label="Apply + guards"];
+invalid->invalid [label="Apply refused"];
+commit->clean [label="ACK / no newer edits"];
+commit->valid [label="ACK / newer valid edits"];
+commit->invalid [label="ACK / newer incomplete raw"];
+commit->conflict [label="409 no effect"];
+conflict->recon [label="fetch remote"];
+recon->valid [label="explicit semantic merge"];
+recon->missing [label="remote deletion"];
+commit->reject [label="known rejection"];
+reject->valid [label="correct / retry new intent"];
+commit->unknown [label="lost ACK / uncertain 5xx"];
+unknown->recon [label="PROPOSED receipt lookup\ncapability + same owner"];
+recon->clean [label="confirmed commit\nno newer edits"];
+recon->reject [label="receipt rejected"];
+valid->suspend [label="scope exit handled"];
+suspend->recon [label="return / validate identity"];
+note [shape=note,label="gesture idle / armed / dragging is orthogonal\nEscape during drag restores startDraft only\nOld epoch ACK cannot touch current UI"];
+commit->note [style=dashed,arrowhead=none];
+
+}

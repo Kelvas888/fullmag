@@ -13,10 +13,37 @@ use crate::live_workspace::LocalLiveWorkspace;
 use crate::terminal_logs::{terminal_logger, TerminalLogSource};
 use crate::types::*;
 
+mod development_active_run_probe;
+mod development_consumer_probe;
+mod development_workspace_probe;
+
 pub(crate) const LOCALHOST_HTTP_HOST: &str = "localhost";
 pub(crate) const LOOPBACK_V4_OCTETS: [u8; 4] = [127, 0, 0, 1];
 
+// Keep the internal API target on IPv4 on Windows.  `localhost` may resolve
+// to an unrelated IPv6 listener (for example WSL or Docker port forwarding)
+// before the native Fullmag API bound to 127.0.0.1 gets a chance to answer.
+#[cfg(windows)]
+const DEFAULT_API_HOST: &str = "127.0.0.1";
+#[cfg(not(windows))]
+const DEFAULT_API_HOST: &str = LOCALHOST_HTTP_HOST;
+
 static RESOLVED_API_PORT: OnceLock<u16> = OnceLock::new();
+
+/// Private manager input is legal only for a fresh development authoring hub.
+/// Check before preparing a script or touching startup state.
+pub(crate) fn development_restore_requested(dev_mode: bool, has_script: bool) -> Result<bool> {
+    match std::env::var_os("FULLMAG_DEVELOPMENT_RESTORE_STDIN") {
+        None => Ok(false),
+        Some(value) if value == "1" => {
+            if !dev_mode || has_script {
+                bail!("private development restore requires development UI without a script");
+            }
+            Ok(true)
+        }
+        Some(_) => bail!("invalid private development restore configuration"),
+    }
+}
 
 #[cfg(windows)]
 const EXE_SUFFIX: &str = ".exe";
@@ -27,8 +54,20 @@ pub(crate) fn api_port() -> u16 {
     *RESOLVED_API_PORT.get().expect("API port not yet resolved")
 }
 
+fn api_host_from_configured(configured: Option<&str>) -> String {
+    configured
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .unwrap_or(DEFAULT_API_HOST)
+        .to_string()
+}
+
+fn api_host() -> String {
+    api_host_from_configured(std::env::var("FULLMAG_API_HOST").ok().as_deref())
+}
+
 pub(crate) fn api_base_url() -> String {
-    format!("http://localhost:{}", api_port())
+    format!("http://{}:{}", api_host(), api_port())
 }
 
 pub(crate) fn swagger_ui_url() -> String {
@@ -74,6 +113,24 @@ fn web_public_url(port: u16) -> String {
     format!("http://{formatted_host}:{port}")
 }
 
+fn frontend_public_url(listen_port: u16) -> std::io::Result<String> {
+    let port = match std::env::var("FULLMAG_WEB_PUBLIC_PORT") {
+        Ok(value) => value
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0 && value.bytes().all(|byte| byte.is_ascii_digit()))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("FULLMAG_WEB_PUBLIC_PORT must contain digits in the range 1-65535, got '{value}'"),
+                )
+            })?,
+        Err(std::env::VarError::NotPresent) => listen_port,
+        Err(error) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, error)),
+    };
+    Ok(web_public_url(port))
+}
+
 pub(crate) fn internal_live_api_url(path: &str) -> String {
     format!(
         "{}/v1/internal/live/current/{}",
@@ -90,6 +147,12 @@ pub(crate) fn resolve_api_port() -> Result<u16> {
             .with_context(|| format!("FULLMAG_API_PORT must be a valid u16 port, got '{raw}'"))?;
         if port == 0 {
             return Ok(0);
+        }
+        if std::env::var_os("FULLMAG_ATTACHED_SESSION_ID").is_some() {
+            // The scratch supervisor already verified this API before spawning
+            // the attached child.  Re-reading the large OpenAPI document here
+            // races with the first live snapshot on busy local Windows hosts.
+            return Ok(port);
         }
         if api_bridge_is_ready(port) || port_is_bindable(port) {
             return Ok(port);
@@ -242,12 +305,323 @@ impl<P: GuardedProcess> Drop for BootstrapProcessGuard<P> {
     }
 }
 
+fn emit_owner_probe_process_started(api_pid: u32, api_port: u16) -> Result<()> {
+    let mut output = std::io::stdout().lock();
+    serde_json::to_writer(
+        &mut output,
+        &serde_json::json!({
+            "schema":"fullmag.development-cli-owner-progress.v1",
+            "event":"owned_api_started",
+            "api_pid":api_pid,
+            "api_port":api_port,
+        }),
+    )?;
+    output.write_all(b"\n")?;
+    output.flush()?;
+    Ok(())
+}
+
+/// Wait for the exact committed API child without allowing guard Drop to turn
+/// an unknown result into a force termination.
 pub(crate) struct ControlRoomGuard {
     web_port: Option<u16>,
-    api_child: Option<Box<dyn GuardedProcess>>,
+    api_child: Option<GuardedApiProcess>,
     frontend_child: Option<Box<dyn GuardedProcess>>,
     terminal_failure_lifetime: Option<Box<dyn FnOnce()>>,
     stop_frontend_on_drop: bool,
+    development_restart_origin: Option<String>,
+}
+
+enum GuardedApiProcess {
+    Native(ChildProcess),
+    Development(crate::development_api_supervisor::DevelopmentApiSupervisor),
+    #[cfg(test)]
+    Test(Box<dyn GuardedProcess>),
+}
+
+/// One validated UI intent consumed by the private native restart coordinator.
+/// Candidate paths and accepted-store configuration are deliberately absent.
+pub(crate) struct DevelopmentRestartInput<'a> {
+    pub(crate) request: &'a fullmag_session::development_restart_transport::RestartRequest,
+    pub(crate) candidate_bundle_root: &'a Path,
+}
+
+pub(crate) enum DevelopmentRestartProgress {
+    CandidatePreparationStarted {
+        helper_pid: u32,
+        api_instance_id: String,
+        ready_build_id: String,
+        ready_source_sha256: String,
+    },
+    HandoffStaged {
+        helper_pid: u32,
+    },
+    OldApiExited {
+        pid: u32,
+        exit_code: Option<i32>,
+    },
+    RestorePreparationHelperWaited {
+        helper_pid: u32,
+    },
+    Replacement(crate::development_api_replacement::ReplacementLaunchEvent),
+}
+
+/// A replacement is ready only after the candidate owns the restored authoring
+/// state and the completion acknowledgement has reopened admission.
+pub(crate) struct CompletedDevelopmentRestart {
+    pub(crate) old_api_instance_id: String,
+    pub(crate) old_session_id: Option<String>,
+    pub(crate) old_session_epoch: u64,
+    pub(crate) new_api_instance_id: String,
+    pub(crate) session_id: Option<String>,
+    pub(crate) session_epoch: u64,
+    pub(crate) scene_document_sha256: String,
+    pub(crate) editor: serde_json::Value,
+    pub(crate) workspace: serde_json::Value,
+    pub(crate) project_document: serde_json::Value,
+    pub(crate) accepted: fullmag_session::store::DevelopmentHandoffCommit,
+    pub(crate) staged_acknowledgement: serde_json::Value,
+    pub(crate) commit_acknowledgement: Option<serde_json::Value>,
+    pub(crate) stage_helper_pid: u32,
+    pub(crate) readback_helper_pid: Option<u32>,
+    pub(crate) restore_helper_pid: u32,
+    pub(crate) old_api_terminal: std::process::ExitStatus,
+    pub(crate) completion: serde_json::Value,
+    pub(crate) replacement: crate::development_api_replacement::DevelopmentReplacementReceipt,
+}
+
+struct ColdIdleReservation {
+    proof: Option<fullmag_runtime_control::development_cold_idle::ColdIdleProof>,
+    retain_fence: bool,
+}
+
+impl ColdIdleReservation {
+    fn new(proof: fullmag_runtime_control::development_cold_idle::ColdIdleProof) -> Self {
+        Self {
+            proof: Some(proof),
+            retain_fence: false,
+        }
+    }
+
+    fn proof(&self) -> Result<&fullmag_runtime_control::development_cold_idle::ColdIdleProof> {
+        self.proof
+            .as_ref()
+            .context("cold idle reservation was already consumed")
+    }
+
+    fn retain_fence(&mut self) {
+        self.retain_fence = true;
+    }
+
+    fn abort_before_commit(&mut self) -> Result<()> {
+        self.retain_fence = true;
+        self.proof
+            .take()
+            .context("cold idle reservation was already consumed")?
+            .release_fence()
+    }
+
+    fn release_kernel_guards_retaining_fence(&mut self) {
+        self.retain_fence = true;
+        drop(self.proof.take());
+    }
+}
+
+impl Drop for ColdIdleReservation {
+    fn drop(&mut self) {
+        let Some(proof) = self.proof.take() else {
+            return;
+        };
+        if !self.retain_fence {
+            if let Err(error) = proof.release_fence() {
+                terminal_logger().emit(
+                    TerminalLogSource::Cli,
+                    format!("precommit cold idle abort could not confirm fence release: {error:#}"),
+                );
+            }
+        }
+    }
+}
+
+fn restart_lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn restart_canonical_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == value)
+}
+
+fn validate_development_restart_request(
+    request: &fullmag_session::development_restart_transport::RestartRequest,
+) -> Result<()> {
+    use fullmag_session::development_restart_transport::RESTART_REQUEST_SCHEMA;
+
+    if request.schema != RESTART_REQUEST_SCHEMA
+        || !restart_canonical_uuid(&request.request_id)
+        || !restart_lower_hex(&request.status_token_sha256, 64)
+        || !restart_canonical_uuid(&request.old_api_instance_id)
+        || !restart_lower_hex(&request.generation_id, 32)
+    {
+        bail!("development restart request has invalid identity pins");
+    }
+    if request.session_id.as_ref().is_some_and(|session_id| {
+        session_id.is_empty()
+            || session_id.len() > 512
+            || session_id.bytes().any(|byte| byte.is_ascii_control())
+    }) || (request.session_id.is_none() && request.session_epoch != 0)
+        || (request.session_id.is_some() && request.session_epoch == 0)
+    {
+        bail!("development restart request has invalid session pins");
+    }
+    if !request.editor.is_object()
+        || !request.workspace.is_object()
+        || !request.project_document.is_object()
+    {
+        bail!("development restart request must contain all three UI objects");
+    }
+    let request_value = serde_json::to_value(request)
+        .context("unable to encode development restart request for size validation")?;
+    if fullmag_session::canonical_json_bytes(&request_value).len() > 32 * 1024 * 1024 {
+        bail!("development restart request exceeds the 32 MiB transport limit");
+    }
+    Ok(())
+}
+
+fn validate_restart_acquisition(
+    request: &fullmag_session::development_restart_transport::RestartRequest,
+    old_api_instance_id: &str,
+    acquisition: &crate::development_api_owner::AuthoringAcquisition,
+) -> Result<(Option<String>, u64)> {
+    let workspace = acquisition.workspace();
+    let observed = match workspace.get("state").and_then(serde_json::Value::as_str) {
+        Some("no_session") => {
+            if workspace
+                .get("session_epoch")
+                .and_then(serde_json::Value::as_u64)
+                != Some(0)
+            {
+                bail!("empty acquired workspace has an invalid session epoch");
+            }
+            (None, 0)
+        }
+        Some("session") => {
+            let identity = workspace
+                .get("identity")
+                .and_then(serde_json::Value::as_object)
+                .context("acquired workspace identity is missing")?;
+            if identity
+                .get("api_instance_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(old_api_instance_id)
+            {
+                bail!("acquired workspace is pinned to another API instance");
+            }
+            let session_id = identity
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .context("acquired session identity is missing")?;
+            if session_id.is_empty()
+                || session_id.len() > 512
+                || session_id.bytes().any(|byte| byte.is_ascii_control())
+                || !workspace
+                    .get("scene_sha256")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| restart_lower_hex(value, 64))
+            {
+                bail!("acquired workspace session identity is invalid");
+            }
+            let epoch = identity
+                .get("session_epoch")
+                .and_then(serde_json::Value::as_u64)
+                .context("acquired session epoch is missing")?;
+            (Some(session_id.to_owned()), epoch)
+        }
+        _ => bail!("acquired workspace has an unknown state"),
+    };
+    if request.old_api_instance_id.as_str() != old_api_instance_id
+        || request.session_id.as_deref() != observed.0.as_deref()
+        || request.session_epoch != observed.1
+    {
+        bail!("restart request no longer matches the acquired authoring identity");
+    }
+    Ok(observed)
+}
+
+fn emit_replacement_probe_progress(
+    event: crate::development_api_replacement::ReplacementLaunchEvent,
+) {
+    use crate::development_api_replacement::ReplacementLaunchEvent;
+    let mut frame = match event {
+        ReplacementLaunchEvent::CandidateOwnerHelperWaited { pid } => serde_json::json!({
+            "event":"candidate_owner_helper_waited", "pid":pid,"waited":true,"exit_code":0
+        }),
+        ReplacementLaunchEvent::ApiStarted { pid, port } => serde_json::json!({
+            "event":"replacement_api_started", "pid":pid,"api_port":port,"waited":false
+        }),
+    };
+    frame["schema"] = serde_json::json!("fullmag.development-cli-replacement-progress.v1");
+    println!("{frame}");
+}
+
+fn emit_development_restart_probe_progress(event: DevelopmentRestartProgress) {
+    match event {
+        DevelopmentRestartProgress::CandidatePreparationStarted {
+            helper_pid,
+            api_instance_id,
+            ready_build_id,
+            ready_source_sha256,
+        } => {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "schema":"fullmag.development-cli-candidate-preparation-progress.v1",
+                    "event":"started",
+                    "helper_pid":helper_pid,
+                    "api_instance_id":api_instance_id,
+                    "ready_build_id":ready_build_id,
+                    "ready_source_sha256":ready_source_sha256,
+                })
+            );
+            let _ = std::io::stdout().flush();
+        }
+        DevelopmentRestartProgress::HandoffStaged { .. } => {}
+        DevelopmentRestartProgress::OldApiExited { pid, exit_code } => println!(
+            "{}",
+            serde_json::json!({
+                "schema":"fullmag.development-cli-owned-api-exit.v1",
+                "api_pid":pid,"waited":true,"exit_code":exit_code,
+                "durable_commit_reconciled":true,
+            })
+        ),
+        DevelopmentRestartProgress::RestorePreparationHelperWaited { helper_pid } => println!(
+            "{}",
+            serde_json::json!({
+                "schema":"fullmag.development-cli-replacement-progress.v1",
+                "event":"restore_preparation_helper_waited","pid":helper_pid,
+                "waited":true,"exit_code":0,
+            })
+        ),
+        DevelopmentRestartProgress::Replacement(event) => emit_replacement_probe_progress(event),
+    }
+}
+
+impl GuardedProcess for GuardedApiProcess {
+    fn terminate(&mut self) {
+        match self {
+            Self::Native(child) => child.terminate(),
+            Self::Development(supervisor) => {
+                if let Err(error) = supervisor.shutdown() {
+                    terminal_logger().emit(TerminalLogSource::Cli,
+                        format!("development API shutdown outcome is unknown; process retained: {error:#}"));
+                }
+            }
+            #[cfg(test)]
+            Self::Test(child) => child.terminate(),
+        }
+    }
 }
 
 impl ControlRoomGuard {
@@ -258,6 +632,7 @@ impl ControlRoomGuard {
             frontend_child: None,
             terminal_failure_lifetime: None,
             stop_frontend_on_drop: false,
+            development_restart_origin: None,
         }
     }
 
@@ -269,13 +644,449 @@ impl ControlRoomGuard {
         let stop_frontend_on_drop = frontend_child.is_some();
         Self {
             web_port: Some(web_port),
-            api_child: api_child
-                .map(|child| Box::new(ChildProcess(child)) as Box<dyn GuardedProcess>),
+            api_child: api_child.map(|child| GuardedApiProcess::Native(ChildProcess(child))),
             frontend_child: frontend_child
                 .map(|child| Box::new(ChildProcess(child)) as Box<dyn GuardedProcess>),
             terminal_failure_lifetime: None,
             stop_frontend_on_drop,
+            development_restart_origin: None,
         }
+    }
+
+    pub(crate) fn adopt_development_owner(
+        &mut self,
+        owner: crate::development_api_owner::OwnedDevelopmentApi,
+    ) -> Result<()> {
+        match self.api_child.as_ref() {
+            Some(GuardedApiProcess::Native(child)) if child.0.id() == owner.child_pid() => {}
+            _ => bail!("development supervisor requires the exact owned API child"),
+        }
+        let Some(GuardedApiProcess::Native(child)) = self.api_child.take() else {
+            bail!("owned development API changed before adoption");
+        };
+        let supervisor =
+            crate::development_api_supervisor::DevelopmentApiSupervisor::new(child.0, owner)?;
+        self.api_child = Some(GuardedApiProcess::Development(supervisor));
+        Ok(())
+    }
+
+    fn development_supervisor_mut(
+        &mut self,
+    ) -> Result<&mut crate::development_api_supervisor::DevelopmentApiSupervisor> {
+        match self.api_child.as_mut() {
+            Some(GuardedApiProcess::Development(supervisor)) => Ok(supervisor),
+            _ => bail!("development API supervisor is not adopted"),
+        }
+    }
+
+    pub(crate) fn development_restart_scope(&self) -> Option<(PathBuf, String, String, String)> {
+        match self.api_child.as_ref() {
+            Some(GuardedApiProcess::Development(supervisor))
+                if supervisor.state()
+                    == crate::development_api_supervisor::DevelopmentApiSupervisorState::Running =>
+            {
+                Some(supervisor.owner().restart_transport_scope())
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn start_development_candidate_preparation(
+        &self,
+        root: &Path,
+        identity: crate::development_api_owner::CandidatePreparationIdentity,
+    ) -> Result<crate::development_api_owner::CandidatePreparationJob> {
+        match self.api_child.as_ref() {
+            Some(GuardedApiProcess::Development(supervisor))
+                if supervisor.state()
+                    == crate::development_api_supervisor::DevelopmentApiSupervisorState::Running =>
+            {
+                supervisor
+                    .owner()
+                    .start_candidate_preparation(root, identity)
+            }
+            _ => bail!("candidate preparation requires the running owned API"),
+        }
+    }
+
+    pub(crate) fn poll_development_candidate_preparation(
+        &self,
+        root: &Path,
+        job: &mut crate::development_api_owner::CandidatePreparationJob,
+    ) -> crate::development_api_owner::CandidatePreparationPoll {
+        match self.api_child.as_ref() {
+            Some(GuardedApiProcess::Development(supervisor))
+                if supervisor.state()
+                    == crate::development_api_supervisor::DevelopmentApiSupervisorState::Running
+                    && supervisor.owner().api_instance_id() == job.identity.api_instance_id =>
+            {
+                supervisor.owner().poll_candidate_preparation(root, job)
+            }
+            _ => {
+                job.cancel();
+                match job.drain_after_cancel() {
+                    Ok(true) => {
+                        crate::development_api_owner::CandidatePreparationPoll::Unavailable {
+                            helper_pid: job.helper_pid(),
+                        }
+                    }
+                    Ok(false) if job.cleanup_unconfirmed() => match job.helper_pid() {
+                        Some(helper_pid) => {
+                            crate::development_api_owner::CandidatePreparationPoll::Unconfirmed {
+                                helper_pid,
+                            }
+                        }
+                        None => {
+                            crate::development_api_owner::CandidatePreparationPoll::Unavailable {
+                                helper_pid: None,
+                            }
+                        }
+                    },
+                    Ok(false) | Err(_) => match job.helper_pid() {
+                        Some(helper_pid) => {
+                            crate::development_api_owner::CandidatePreparationPoll::Pending {
+                                helper_pid,
+                            }
+                        }
+                        None => {
+                            crate::development_api_owner::CandidatePreparationPoll::Unavailable {
+                                helper_pid: None,
+                            }
+                        }
+                    },
+                }
+            }
+        }
+    }
+
+    pub(crate) fn development_consumer_status(
+        &self,
+    ) -> Result<crate::development_api_owner::ConsumerReadinessStatus> {
+        match self.api_child.as_ref() {
+            Some(GuardedApiProcess::Development(supervisor))
+                if supervisor.state()
+                    == crate::development_api_supervisor::DevelopmentApiSupervisorState::Running =>
+            {
+                supervisor.owner().consumer_status()
+            }
+            _ => bail!("consumer readiness requires the running owned API"),
+        }
+    }
+
+    pub(crate) fn confirm_development_consumer_readiness(
+        &self,
+        candidate: Option<&crate::development_api_owner::SelectedDevelopmentCandidate>,
+    ) -> Result<crate::development_api_owner::ConsumerReadinessStatus> {
+        match self.api_child.as_ref() {
+            Some(GuardedApiProcess::Development(supervisor))
+                if supervisor.state()
+                    == crate::development_api_supervisor::DevelopmentApiSupervisorState::Running =>
+            {
+                supervisor.owner().confirm_consumer_readiness(candidate)
+            }
+            _ => bail!("consumer readiness requires the running owned API"),
+        }
+    }
+
+    pub(crate) fn restart_failure_is_precommit(&self, old_api_instance_id: &str) -> bool {
+        match self.api_child.as_ref() {
+            Some(GuardedApiProcess::Development(supervisor)) => {
+                supervisor.owner().api_instance_id() == old_api_instance_id
+                    && matches!(
+                        supervisor.state(),
+                        crate::development_api_supervisor::DevelopmentApiSupervisorState::Running
+                            | crate::development_api_supervisor::DevelopmentApiSupervisorState::CommitNotSent
+                    )
+            }
+            _ => false,
+        }
+    }
+
+    pub(crate) fn restart_failed_after_precommit_exit(&self, old_api_instance_id: &str) -> bool {
+        matches!(self.api_child.as_ref(), Some(GuardedApiProcess::Development(supervisor))
+            if supervisor.owner().api_instance_id() == old_api_instance_id
+                && supervisor.state() == crate::development_api_supervisor::DevelopmentApiSupervisorState::ExitedBeforeCommit)
+    }
+
+    pub(crate) fn retains_unknown_development_custody(&self) -> bool {
+        matches!(self.api_child.as_ref(), Some(GuardedApiProcess::Development(supervisor))
+            if supervisor.is_outcome_unknown())
+    }
+
+    pub(crate) fn enable_development_restart_transport(&mut self, web_port: u16) -> Result<()> {
+        if web_port == 0 || self.development_restart_scope().is_none() {
+            bail!("development restart transport requires an owned managed API and UI port");
+        }
+        self.development_restart_origin = Some(format!("http://localhost:{web_port}"));
+        Ok(())
+    }
+
+    fn replace_with_committed_candidate(
+        &mut self,
+        repo_root: &Path,
+        prepared: &crate::development_api_owner::PreparedDevelopmentRestore,
+        api_port: u16,
+        log: fs::File,
+        observe: impl FnMut(crate::development_api_replacement::ReplacementLaunchEvent),
+    ) -> Result<crate::development_api_replacement::DevelopmentReplacementReceipt> {
+        let restart_origin = self.development_restart_origin.clone();
+        let mut restored = crate::development_api_replacement::launch_committed_replacement(
+            self.development_supervisor_mut()?,
+            repo_root,
+            prepared,
+            api_port,
+            log,
+            restart_origin.as_deref(),
+            observe,
+        )?;
+        self.api_child = Some(GuardedApiProcess::Development(restored.supervisor));
+        restored.receipt.completion = self
+            .development_supervisor_mut()?
+            .complete_restored_handoff(&mut restored.acquisition, prepared)?;
+        Ok(restored.receipt)
+    }
+
+    /// Execute one validated UI intent while retaining custody of the exact
+    /// development API process. The candidate and accepted-store roots are
+    /// supplied only by the native launcher, never by the request payload.
+    pub(crate) fn restart_development_api(
+        &mut self,
+        repo_root: &Path,
+        input: DevelopmentRestartInput<'_>,
+        timeout: Duration,
+        observe: impl FnMut(DevelopmentRestartProgress),
+    ) -> Result<CompletedDevelopmentRestart> {
+        self.restart_development_api_inner(repo_root, input, timeout, false, || Ok(()), observe)
+    }
+
+    pub(crate) fn restart_development_api_with_quiescence(
+        &mut self,
+        repo_root: &Path,
+        input: DevelopmentRestartInput<'_>,
+        timeout: Duration,
+        quiesce_observers: impl FnMut() -> Result<()>,
+        observe: impl FnMut(DevelopmentRestartProgress),
+    ) -> Result<CompletedDevelopmentRestart> {
+        self.restart_development_api_inner(
+            repo_root,
+            input,
+            timeout,
+            false,
+            quiesce_observers,
+            observe,
+        )
+    }
+
+    /// The only acknowledgement-discarding coordinator entry point is a
+    /// managed diagnostic probe. Production request consumers use the normal
+    /// one-shot method above.
+    pub(crate) fn restart_development_api_lost_ack_probe(
+        &mut self,
+        repo_root: &Path,
+        input: DevelopmentRestartInput<'_>,
+        timeout: Duration,
+        observe: impl FnMut(DevelopmentRestartProgress),
+    ) -> Result<CompletedDevelopmentRestart> {
+        if std::env::var("FULLMAG_DEVELOPMENT_OWNER_PROBE").as_deref() != Ok("1")
+            || std::env::var("FULLMAG_DEVELOPMENT_OWNER_PROBE_LOST_ACK").as_deref() != Ok("1")
+            || std::env::var("FULLMAG_DEVELOPMENT_OWNER_PROBE_REPLACEMENT").as_deref() != Ok("1")
+        {
+            bail!("lost-ack restart requires the managed native replacement probe");
+        }
+        self.restart_development_api_inner(repo_root, input, timeout, true, || Ok(()), observe)
+    }
+
+    fn restart_development_api_inner(
+        &mut self,
+        repo_root: &Path,
+        input: DevelopmentRestartInput<'_>,
+        timeout: Duration,
+        discard_acknowledgement: bool,
+        mut quiesce_observers: impl FnMut() -> Result<()>,
+        mut observe: impl FnMut(DevelopmentRestartProgress),
+    ) -> Result<CompletedDevelopmentRestart> {
+        validate_development_restart_request(input.request)?;
+        if !input.candidate_bundle_root.is_absolute() {
+            bail!("replacement candidate must be selected by the native launcher");
+        }
+
+        let (old_api_instance_id, mut acquisition) = {
+            let supervisor = self.development_supervisor_mut()?;
+            if supervisor.state()
+                != crate::development_api_supervisor::DevelopmentApiSupervisorState::Running
+            {
+                bail!("development restart requires the running owned API supervisor");
+            }
+            let owner = supervisor.owner();
+            let old_api_instance_id = owner.api_instance_id().to_owned();
+            if old_api_instance_id.as_str() != input.request.old_api_instance_id.as_str() {
+                bail!("restart request is pinned to another API instance");
+            }
+            let nonce = uuid::Uuid::new_v4().to_string();
+            (old_api_instance_id, owner.acquire(&nonce)?)
+        };
+
+        let (old_session_id, old_session_epoch) =
+            validate_restart_acquisition(input.request, &old_api_instance_id, &acquisition)?;
+        let frontend_payload = serde_json::json!({
+            "api_instance_id": old_api_instance_id,
+            "session_id": old_session_id,
+            "session_epoch": old_session_epoch,
+            "editor": input.request.editor,
+            "workspace": input.request.workspace,
+            "project_document": input.request.project_document,
+        });
+        let staged =
+            acquisition.stage_handoff(repo_root, input.candidate_bundle_root, &frontend_payload)?;
+        if staged.acknowledgement["binding"]["generation_id"].as_str()
+            != Some(input.request.generation_id.as_str())
+            || staged.acknowledgement["binding"]["api_instance_id"].as_str()
+                != Some(old_api_instance_id.as_str())
+        {
+            bail!("restart request generation does not match the acquired API owner");
+        }
+        observe(DevelopmentRestartProgress::HandoffStaged {
+            helper_pid: staged.helper_pid,
+        });
+
+        let state_root = runtime_state_root(repo_root);
+        let store_root = fullmag_runtime_control::accepted_store::configured_submit_store_root(
+            repo_root,
+            &state_root,
+        )
+        .context("development restart requires the configured scoped accepted store")?;
+        let proof = acquisition.acquire_cold_idle(&staged, &store_root)?;
+        let mut reservation = ColdIdleReservation::new(proof);
+        // Both authoring admission and accepted work are frozen before an
+        // observer can acknowledge idle pause. A refusal releases only this
+        // uncommitted reservation and leaves computation untouched.
+        if let Err(error) = quiesce_observers() {
+            if let Err(abort_error) = reservation.abort_before_commit() {
+                self.development_supervisor_mut()?.retain_unknown_outcome();
+                return Err(error.context(format!(
+                    "observer pause refused and precommit fence abort is unconfirmed: {abort_error:#}"
+                )));
+            }
+            return Err(error);
+        }
+
+        let outcome = {
+            let supervisor = self.development_supervisor_mut()?;
+            reservation.retain_fence();
+            if discard_acknowledgement {
+                supervisor.commit_and_wait_lost_ack_probe(
+                    repo_root,
+                    &mut acquisition,
+                    &staged,
+                    reservation.proof()?,
+                    &store_root,
+                    timeout,
+                )
+            } else {
+                supervisor.commit_and_wait(
+                    repo_root,
+                    &mut acquisition,
+                    &staged,
+                    reservation.proof()?,
+                    &store_root,
+                    timeout,
+                )
+            }
+        };
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let state = self.development_supervisor_mut()?.state();
+                let definitely_unsent = matches!(
+                    state,
+                    crate::development_api_supervisor::DevelopmentApiSupervisorState::Running
+                        | crate::development_api_supervisor::DevelopmentApiSupervisorState::CommitNotSent
+                        | crate::development_api_supervisor::DevelopmentApiSupervisorState::ExitedBeforeCommit
+                );
+                if definitely_unsent {
+                    if let Err(release_error) = reservation.abort_before_commit() {
+                        self.development_supervisor_mut()?.retain_unknown_outcome();
+                        return Err(error.context(format!(
+                            "cold commit was not sent, but explicit fence abort was not confirmed: {release_error:#}"
+                        )));
+                    }
+                }
+                return Err(error);
+            }
+        };
+        observe(DevelopmentRestartProgress::OldApiExited {
+            pid: self.development_supervisor_mut()?.owner().child_pid(),
+            exit_code: outcome.terminal.code(),
+        });
+
+        let prepared = self
+            .development_supervisor_mut()?
+            .prepare_committed_restore(
+                repo_root,
+                &acquisition,
+                &staged,
+                reservation.proof()?,
+                &store_root,
+                outcome.acknowledgement.as_ref(),
+            )?;
+        observe(DevelopmentRestartProgress::RestorePreparationHelperWaited {
+            helper_pid: prepared.helper_pid(),
+        });
+        let editor = prepared.editor().clone();
+        let workspace = prepared.workspace().clone();
+        let project_document = prepared.project_document().clone();
+        let old_api_terminal = outcome.terminal;
+        let accepted = outcome.accepted;
+        let commit_acknowledgement = outcome.acknowledgement;
+        let readback_helper_pid = outcome.readback_helper_pid;
+        let stage_helper_pid = staged.helper_pid;
+        let staged_acknowledgement = staged.acknowledgement.clone();
+        let restore_helper_pid = prepared.helper_pid();
+
+        // The API exit and accepted record are now confirmed. Release only the
+        // kernel reservations before starting the replacement; the durable
+        // fence remains until its authenticated completion acknowledgement.
+        drop(acquisition);
+        reservation.release_kernel_guards_retaining_fence();
+
+        let replacement_log_path = fullmag_session::repository_path::checked_path(
+            &state_root,
+            &format!("development-restart-{}.log", uuid::Uuid::new_v4().simple()),
+        )?;
+        let replacement_log = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(replacement_log_path)
+            .context("unable to create the replacement API log")?;
+        let replacement = self.replace_with_committed_candidate(
+            repo_root,
+            &prepared,
+            api_port(),
+            replacement_log,
+            |event| observe(DevelopmentRestartProgress::Replacement(event)),
+        )?;
+
+        Ok(CompletedDevelopmentRestart {
+            old_api_instance_id,
+            old_session_id,
+            old_session_epoch,
+            new_api_instance_id: replacement.api_instance_id.clone(),
+            session_id: replacement.session_id.clone(),
+            session_epoch: replacement.session_epoch,
+            scene_document_sha256: replacement.scene_sha256.clone(),
+            editor,
+            workspace,
+            project_document,
+            accepted,
+            staged_acknowledgement,
+            commit_acknowledgement,
+            stage_helper_pid,
+            readback_helper_pid,
+            restore_helper_pid,
+            old_api_terminal,
+            completion: replacement.completion.clone(),
+            replacement,
+        })
     }
 
     pub fn retain_terminal_failure_until_close(&mut self, wait_for_close: impl FnOnce() + 'static) {
@@ -292,10 +1103,11 @@ impl ControlRoomGuard {
     ) -> Self {
         Self {
             web_port: None,
-            api_child,
+            api_child: api_child.map(GuardedApiProcess::Test),
             frontend_child,
             terminal_failure_lifetime: None,
             stop_frontend_on_drop: false,
+            development_restart_origin: None,
         }
     }
 }
@@ -341,8 +1153,71 @@ fn packaged_install_root(self_exe: &Path) -> Option<PathBuf> {
         return None;
     }
     let install_root = bin_dir.parent()?.to_path_buf();
-    (install_root.join(".fullmag").is_dir() || install_root.join("web").is_dir())
-        .then_some(install_root)
+    (install_root.join(".fullmag").is_dir()
+        || install_root.join("web").is_dir()
+        || fullmag_runtime_control::python_runtime::packaged_windows_python(&install_root)
+            .is_some())
+    .then_some(install_root)
+}
+
+/// Return the writable per-user state directory used by the launcher.
+///
+/// Source checkouts keep the historical `.fullmag` directory in the checkout,
+/// while installed bundles must never try to write beside binaries under
+/// `Program Files` (or another read-only prefix).  `FULLMAG_STATE_ROOT` is an
+/// explicit escape hatch for managed deployments and tests.
+pub(crate) fn runtime_state_root(root: &Path) -> PathBuf {
+    if let Some(configured) = fullmag_runtime_control::python_runtime::validated_state_override(
+        std::env::var_os("FULLMAG_STATE_ROOT").map(PathBuf::from),
+    )
+    .expect("Fullmag state configuration is invalid")
+    {
+        return configured;
+    }
+    if let Some(state) = fullmag_runtime_control::python_runtime::packaged_windows_state_root(root)
+        .expect("Windows package requires a configured per-user state directory")
+    {
+        return state;
+    }
+
+    let packaged = std::env::current_exe()
+        .ok()
+        .and_then(|path| packaged_install_root(&path))
+        .is_some_and(|install_root| install_root == root);
+    if !packaged {
+        return root.join(".fullmag");
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            return PathBuf::from(local_app_data).join("Fullmag");
+        }
+        if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+            return PathBuf::from(user_profile)
+                .join("AppData")
+                .join("Local")
+                .join("Fullmag");
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        if let Some(state_home) = std::env::var_os("XDG_STATE_HOME") {
+            return PathBuf::from(state_home).join("fullmag");
+        }
+        if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+            return PathBuf::from(data_home).join("fullmag");
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home)
+                .join(".local")
+                .join("state")
+                .join("fullmag");
+        }
+    }
+
+    std::env::temp_dir().join("fullmag")
 }
 
 #[cfg(test)]
@@ -354,6 +1229,7 @@ mod control_room_guard_tests {
     use std::thread;
     use std::time::Duration;
 
+    use super::command_exists;
     use super::{
         api_openapi_response_is_compatible, browser_control_room_assets, browser_open_args,
         control_room_launch_signature, packaged_install_root, wait_for_api_ready,
@@ -405,6 +1281,12 @@ mod control_room_guard_tests {
                 "http://172.17.101.240:3100/".to_string(),
             ]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_windows_command_lookup_finds_cmd() {
+        assert!(command_exists("cmd.exe"));
     }
 
     #[test]
@@ -509,7 +1391,11 @@ mod control_room_guard_tests {
             identity.worktree_state,
             identity.source_snapshot_sha256,
         );
-        assert!(api_openapi_response_is_compatible(&current));
+        if identity.source_snapshot_sha256 == "unknown" {
+            assert!(!api_openapi_response_is_compatible(&current));
+        } else {
+            assert!(api_openapi_response_is_compatible(&current));
+        }
 
         let foreign = current.replacen(identity.git_commit, &"0".repeat(40), 1);
         assert!(!api_openapi_response_is_compatible(&foreign));
@@ -531,7 +1417,7 @@ mod control_room_guard_tests {
     }
 
     #[test]
-    fn startup_wait_accepts_health_ready_api_before_contract_probe_finishes() {
+    fn startup_wait_rejects_health_only_api_without_contract() {
         let listener = TcpListener::bind((std::net::Ipv4Addr::from(super::LOOPBACK_V4_OCTETS), 0))
             .expect("readiness fixture should bind");
         listener
@@ -557,10 +1443,14 @@ mod control_room_guard_tests {
                 }
             }
         });
-        let mut child = TestCommand::new("sh")
-            .args(["-c", "sleep 2"])
-            .spawn()
-            .expect("readiness fixture child should start");
+        let mut child = if cfg!(windows) {
+            TestCommand::new("cmd.exe")
+                .args(["/C", "ping -n 3 127.0.0.1 > NUL"])
+                .spawn()
+        } else {
+            TestCommand::new("sh").args(["-c", "sleep 2"]).spawn()
+        }
+        .expect("readiness fixture child should start");
 
         let result = wait_for_api_ready(port, &mut child, Duration::from_millis(500));
 
@@ -570,18 +1460,15 @@ mod control_room_guard_tests {
         let _ = server.join();
 
         assert!(
-            result.is_ok(),
-            "health-ready API must not be blocked by the optional contract probe: {result:?}"
+            result.is_err(),
+            "health-only API must not be accepted as a compatible runtime: {result:?}"
         );
     }
 
     #[test]
     fn packaged_install_root_is_derived_from_bin_executable() {
-        let root = std::env::temp_dir().join(format!(
-            "fullmag-packaged-root-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let root =
+            std::env::temp_dir().join(format!("fullmag-packaged-root-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("bin")).unwrap();
         std::fs::create_dir_all(root.join(".fullmag")).unwrap();
@@ -611,9 +1498,8 @@ mod control_room_guard_tests {
 
         let error = browser_control_room_assets(&root, true).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("apps/control-room/dev-server.mjs"));
+        let error_text = error.to_string().replace('\\', "/");
+        assert!(error_text.contains("apps/control-room/dev-server.mjs"));
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -635,6 +1521,27 @@ mod control_room_guard_tests {
         assert_eq!(web_dir, root.join("apps/control-room"));
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn packaged_static_control_room_uses_bundled_web_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "fullmag-control-room-packaged-v2-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let web = root.join(".fullmag").join("local").join("web");
+        std::fs::create_dir_all(&web).unwrap();
+        std::fs::write(web.join("index.html"), "static").unwrap();
+        std::fs::write(web.join("dev-server.mjs"), "server").unwrap();
+
+        let (web_dir, static_root, _, available) =
+            browser_control_room_assets(&root, false).unwrap();
+
+        assert_eq!(web_dir, web);
+        assert_eq!(static_root, web);
+        assert_eq!(available, command_exists("node"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 pub(crate) struct ControlPlaneReady {
@@ -643,6 +1550,17 @@ pub(crate) struct ControlPlaneReady {
     pub web_port: u16,
     pub api_child: Option<std::process::Child>,
     pub frontend_child: Option<std::process::Child>,
+    pub development_owner: Option<crate::development_api_owner::OwnerLaunch>,
+}
+
+fn control_room_node_program(root: &Path, dev_mode: bool) -> Option<PathBuf> {
+    if !dev_mode {
+        let bundled = root.join("bin").join(format!("node{EXE_SUFFIX}"));
+        if bundled.is_file() {
+            return Some(bundled);
+        }
+    }
+    command_exists("node").then(|| PathBuf::from("node"))
 }
 
 fn browser_control_room_assets(
@@ -651,8 +1569,29 @@ fn browser_control_room_assets(
 ) -> Result<(PathBuf, PathBuf, PathBuf, bool)> {
     // The v2 Control Room is the only supported runtime frontend. Legacy paths
     // remain reference material and must never be selected by the launcher.
-    let v2_dir = root.join("apps").join("control-room");
-    let dev_server = v2_dir.join("dev-server.mjs");
+    let mut v2_dir = root.join("apps").join("control-room");
+    let mut dev_server = v2_dir.join("dev-server.mjs");
+    // Installed bundles keep only the exported web tree.  The small Node
+    // wrapper is staged beside it so static Control Room startup does not
+    // depend on the build checkout being present on the target machine.
+    if !dev_mode && !dev_server.is_file() {
+        for candidate in [
+            root.join("web").join("dev-server.mjs"),
+            root.join(".fullmag")
+                .join("local")
+                .join("web")
+                .join("dev-server.mjs"),
+        ] {
+            if candidate.is_file() {
+                v2_dir = candidate
+                    .parent()
+                    .expect("dev-server candidate should have a parent")
+                    .to_path_buf();
+                dev_server = candidate;
+                break;
+            }
+        }
+    }
     if dev_mode && !dev_server.is_file() {
         bail!(
             "canonical Control Room frontend is unavailable: expected {}",
@@ -660,16 +1599,20 @@ fn browser_control_room_assets(
         );
     }
     let repo_local_static_web_root = root.join(".fullmag").join("local").join("web");
-    let repo_built_static_web_root = v2_dir.join("out");
+    let repo_built_static_web_root = if v2_dir.ends_with("web") {
+        v2_dir.clone()
+    } else {
+        v2_dir.join("out")
+    };
     let static_web_root = if repo_local_static_web_root.join("index.html").is_file() {
         repo_local_static_web_root
     } else {
         repo_built_static_web_root
     };
     let external_control_room_available = if dev_mode {
-        command_exists("node") && dev_server.is_file()
+        control_room_node_program(root, dev_mode).is_some() && dev_server.is_file()
     } else {
-        command_exists("node")
+        control_room_node_program(root, dev_mode).is_some()
             && dev_server.is_file()
             && static_web_root.join("index.html").is_file()
     };
@@ -682,17 +1625,33 @@ fn browser_control_room_assets(
 }
 
 pub(crate) fn bootstrap_control_plane(
-    _session_id: &str,
+    session_id: &str,
     dev_mode: bool,
     requested_port: Option<u16>,
     live_workspace: Option<&LocalLiveWorkspace>,
 ) -> Result<ControlPlaneReady> {
+    let restore_from_stdin = development_restore_requested(dev_mode, live_workspace.is_some())?;
     let root = repo_root();
-    let log_dir = root.join(".fullmag").join("logs");
-    let url_file = root.join(".fullmag").join("control-room-url.txt");
-    let (web_dir, static_web_root, mode_file, external_control_room_available) =
+    let state_root = runtime_state_root(&root);
+    let log_dir = state_root.join("logs");
+    let url_file = state_root.join("control-room-url.txt");
+    let listen_port_file = state_root.join("control-room-listen-port.txt");
+    let log_suffix = session_id
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .collect::<String>();
+    let log_suffix = if log_suffix.is_empty() {
+        "session".to_string()
+    } else {
+        log_suffix
+    };
+    let api_log_path = log_dir.join(format!("fullmag-api-{log_suffix}.log"));
+    let web_log_path = log_dir.join(format!("control-room-{log_suffix}.log"));
+    let (web_dir, static_web_root, _mode_file, external_control_room_available) =
         browser_control_room_assets(&root, dev_mode)?;
+    let mode_file = state_root.join("control-room-mode.txt");
     fs::create_dir_all(&log_dir)?;
+    prune_control_room_logs(&log_dir);
 
     let stream_api_logs_to_terminal = dev_mode
         || std::env::var("FULLMAG_API_LOG_TO_TERMINAL")
@@ -711,36 +1670,47 @@ pub(crate) fn bootstrap_control_plane(
             })
             .unwrap_or(false);
 
+    let web_port = resolve_web_port(requested_port, &listen_port_file)?;
+    let mut development_owner = None;
     let api_child = if api_port() != 0 && api_bridge_is_ready(api_port()) {
+        if restore_from_stdin {
+            bail!("private development restore requires a newly owned API; refusing API reuse");
+        }
         terminal_logger().emit(
             TerminalLogSource::Api,
             format!("reusing fullmag-api on :{} ...", api_port()),
         );
         None
     } else {
+        development_owner = crate::development_api_owner::OwnerLaunch::from_environment(
+            dev_mode,
+            live_workspace.is_some(),
+        )?;
         terminal_logger().emit(
             TerminalLogSource::Api,
             format!("starting fullmag-api on :{} ...", api_port()),
         );
-        let api_log = fs::File::create(log_dir.join("fullmag-api.log"))
-            .context("failed to create api log")?;
+        let api_log = fs::File::create(&api_log_path).context("failed to create api log")?;
         let api_err = api_log.try_clone()?;
         if stream_api_logs_to_terminal {
             terminal_logger().emit(
                 TerminalLogSource::Api,
-                "streaming fullmag-api logs to terminal in compact labeled mode (full log still saved to .fullmag/logs/fullmag-api.log)",
+                format!(
+                    "streaming fullmag-api logs to terminal in compact labeled mode (full log still saved to {})",
+                    api_log_path.display()
+                ),
             );
         } else {
             terminal_logger().emit(
                 TerminalLogSource::Api,
-                format!(
-                    "fullmag-api logs: {}",
-                    log_dir.join("fullmag-api.log").display()
-                ),
+                format!("fullmag-api logs: {}", api_log_path.display()),
             );
         }
 
         let self_exe = std::env::current_exe().unwrap_or_default();
+        let restart_origin = development_owner
+            .as_ref()
+            .map(|_| format!("http://localhost:{web_port}"));
         let mut api_child = BootstrapProcessGuard::new(ChildProcess(spawn_fullmag_api(
             &root,
             &self_exe,
@@ -748,6 +1718,9 @@ pub(crate) fn bootstrap_control_plane(
             api_err,
             external_control_room_available,
             stream_api_logs_to_terminal,
+            restore_from_stdin,
+            development_owner.as_ref().map(|owner| owner.token()),
+            restart_origin.as_deref(),
         )?));
         wait_for_api_ready(
             api_port(),
@@ -764,10 +1737,10 @@ pub(crate) fn bootstrap_control_plane(
         live_workspace.publish_snapshot();
     }
 
-    let web_port = resolve_web_port(requested_port, &url_file)?;
     let desired_signature = control_room_launch_signature(dev_mode, &api_base_url());
 
     if external_control_room_available {
+        let public_url = frontend_public_url(web_port)?;
         let web_cache_dir = web_dir.join(".next");
         let current_mode = fs::read_to_string(&mode_file).ok();
 
@@ -791,8 +1764,8 @@ pub(crate) fn bootstrap_control_plane(
                 TerminalLogSource::Web,
                 format!("starting control room on :{} ...", web_port),
             );
-            let web_log = fs::File::create(log_dir.join("control-room.log"))
-                .context("failed to create frontend log")?;
+            let web_log =
+                fs::File::create(&web_log_path).context("failed to create frontend log")?;
             let web_err = web_log.try_clone()?;
             let terminal_log_file = if stream_web_logs_to_terminal {
                 Some(
@@ -804,7 +1777,9 @@ pub(crate) fn bootstrap_control_plane(
                 None
             };
 
-            let mut command = ProcessCommand::new("node");
+            let node_program = control_room_node_program(&root, dev_mode)
+                .context("Control Room Node runtime is unavailable")?;
+            let mut command = ProcessCommand::new(node_program);
             command
                 .args([
                     "dev-server.mjs",
@@ -822,16 +1797,16 @@ pub(crate) fn bootstrap_control_plane(
             if stream_web_logs_to_terminal {
                 terminal_logger().emit(
                     TerminalLogSource::Web,
-                    "streaming control room logs to terminal in compact labeled mode (full log still saved to .fullmag/logs/control-room.log)",
+                    format!(
+                        "streaming control room logs to terminal in compact labeled mode (full log still saved to {})",
+                        web_log_path.display()
+                    ),
                 );
                 command.stdout(Stdio::piped()).stderr(Stdio::piped());
             } else {
                 terminal_logger().emit(
                     TerminalLogSource::Web,
-                    format!(
-                        "control room logs: {}",
-                        log_dir.join("control-room.log").display()
-                    ),
+                    format!("control room logs: {}", web_log_path.display()),
                 );
                 command.stdout(web_log).stderr(web_err);
             }
@@ -858,17 +1833,19 @@ pub(crate) fn bootstrap_control_plane(
             }
             frontend_child = Some(child);
 
-            let _ = fs::write(&url_file, web_public_url(web_port));
             let _ = fs::write(&mode_file, &desired_signature);
 
             let bootstrap_deadline = Instant::now() + Duration::from_secs(90);
-            while Instant::now() < bootstrap_deadline {
+            let frontend_ready = loop {
+                if Instant::now() >= bootstrap_deadline {
+                    break false;
+                }
                 if frontend_is_ready_for_bootstrap(web_port) {
-                    break;
+                    break true;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            if !frontend_is_ready_for_bootstrap(web_port) {
+            };
+            if !frontend_ready {
                 bail!("control room did not become ready on :{}", web_port);
             }
         } else {
@@ -878,12 +1855,16 @@ pub(crate) fn bootstrap_control_plane(
             );
         }
 
+        let _ = fs::write(&url_file, &public_url);
+        let _ = fs::write(&listen_port_file, web_port.to_string());
+
         return Ok(ControlPlaneReady {
             api_port: api_port(),
-            web_url: format!("{}/", web_public_url(web_port)),
+            web_url: format!("{public_url}/"),
             web_port,
             api_child: api_child.map(|child| child.release().0),
             frontend_child: frontend_child.map(|child| child.release().0),
+            development_owner,
         });
     }
 
@@ -901,12 +1882,49 @@ pub(crate) fn bootstrap_control_plane(
             web_port,
             api_child: api_child.map(|child| child.release().0),
             frontend_child: None,
+            development_owner,
         });
     }
 
     bail!(
         "control room dev mode requires the canonical Control Room frontend at apps/control-room/dev-server.mjs; run `just build-static-control-room` and omit `--dev`, or install the Control Room dependencies"
     )
+}
+
+fn prune_control_room_logs(log_dir: &Path) {
+    let retention_days = std::env::var("FULLMAG_LOG_RETENTION_DAYS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(14)
+        .clamp(1, 3650);
+    let cutoff = std::time::SystemTime::now()
+        .checked_sub(Duration::from_secs(retention_days.saturating_mul(86_400)));
+    let Ok(entries) = fs::read_dir(log_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_session_log = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                (name.starts_with("fullmag-api-") || name.starts_with("control-room-"))
+                    && name.ends_with(".log")
+            });
+        if !is_session_log {
+            continue;
+        }
+        let should_remove = cutoff
+            .zip(
+                fs::metadata(&path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok(),
+            )
+            .is_some_and(|(cutoff, modified)| modified < cutoff);
+        if should_remove {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 pub(crate) fn open_in_browser(ready: &ControlPlaneReady) {
@@ -990,14 +2008,23 @@ fn find_fullmag_ui_binary() -> Result<PathBuf> {
 pub(crate) fn open_in_tauri(
     ready: &ControlPlaneReady,
     intent: &str,
+    api_instance_id: &str,
 ) -> Result<std::process::Child> {
+    let instance = uuid::Uuid::parse_str(api_instance_id).context("invalid API instance pin")?;
+    if instance.is_nil() || instance.to_string() != api_instance_id {
+        bail!("API instance pin must be a canonical nonzero UUID");
+    }
+    let ui_url = format!(
+        "{}workspace?fullmag_api_instance={api_instance_id}",
+        ready.web_url.trim_end_matches('/').to_owned() + "/"
+    );
     let ui_exe = find_fullmag_ui_binary()?;
     let mut command = ProcessCommand::new(&ui_exe);
     command
-        .env("FULLMAG_UI_URL", &ready.web_url)
+        .env("FULLMAG_UI_URL", ui_url)
         .env(
             "FULLMAG_API_BASE",
-            format!("http://localhost:{}/", ready.api_port),
+            format!("http://{}:{}/", api_host(), ready.api_port),
         )
         .env("FULLMAG_LAUNCH_INTENT", intent)
         .stdin(Stdio::null())
@@ -1015,18 +2042,40 @@ pub(crate) fn spawn_control_room(
     dev_mode: bool,
     requested_port: Option<u16>,
     live_workspace: &LocalLiveWorkspace,
+    ui_plan: crate::script_launch::UiPlan,
 ) -> Result<(
     u16,
     Option<std::process::Child>,
     Option<std::process::Child>,
 )> {
+    use crate::script_launch::UiPlan;
     let ready =
         bootstrap_control_plane(session_id, dev_mode, requested_port, Some(live_workspace))?;
-    open_in_browser(&ready);
+    match ui_plan {
+        UiPlan::Browser | UiPlan::None => open_in_browser(&ready),
+        // The launching host opens its own window for this API.
+        UiPlan::DesktopHost => {}
+        UiPlan::DesktopSelf => {
+            let root = repo_root();
+            let opened = fullmag_runtime_control::application_attach::prepare_for_authoring(
+                &root,
+                &runtime_state_root(&root),
+                ready.api_port,
+            )
+            .map_err(anyhow::Error::from)
+            .and_then(|binding| open_in_tauri(&ready, "workspace", binding.api_instance_id()));
+            if let Err(error) = opened {
+                eprintln!(
+                    "[fullmag] could not open the desktop window ({error:#}); opening the browser"
+                );
+                open_in_browser(&ready);
+            }
+        }
+    }
     Ok((ready.web_port, ready.api_child, ready.frontend_child))
 }
 
-fn resolve_web_port(requested: Option<u16>, url_file: &Path) -> Result<u16> {
+fn resolve_web_port(requested: Option<u16>, listen_port_file: &Path) -> Result<u16> {
     const CANDIDATE_PORTS: &[u16] = &[3000, 3001, 3002, 3003, 3004, 3005, 3010];
 
     if let Some(port) = requested {
@@ -1038,16 +2087,10 @@ fn resolve_web_port(requested: Option<u16>, url_file: &Path) -> Result<u16> {
         );
     }
 
-    if let Ok(stored) = fs::read_to_string(url_file) {
-        let stored = stored.trim();
-        if let Some(port_str) = stored.rsplit(':').next() {
-            if let Ok(port) = port_str.parse::<u16>() {
-                if port_is_listening(port) {
-                    return Ok(port);
-                }
-                if port_is_bindable(port) {
-                    return Ok(port);
-                }
+    if let Ok(stored) = fs::read_to_string(listen_port_file) {
+        if let Ok(port) = stored.trim().parse::<u16>() {
+            if port != 0 && (port_is_listening(port) || port_is_bindable(port)) {
+                return Ok(port);
             }
         }
     }
@@ -1171,27 +2214,63 @@ fn frontend_is_ready_with_timeout(port: u16, timeout: Duration) -> bool {
 }
 
 fn stop_control_room_frontend_processes(port: u16) {
-    let hosts = [
-        "0.0.0.0".to_string(),
-        std::net::Ipv4Addr::from(LOOPBACK_V4_OCTETS).to_string(),
-        LOCALHOST_HTTP_HOST.to_string(),
-    ];
-    for host in hosts {
-        for pattern in [
-            format!("next dev --hostname {host} --port {port}"),
-            format!("next dev .*--hostname {host}.*--port {port}"),
-            format!("next dev .*--hostname {host}.*-p {port}"),
-            format!("next dev .*--port {port}"),
-            format!("next dev .*-p {port}"),
-            format!("node dev-server.mjs --hostname {host} --port {port}"),
-            format!("node dev-server.mjs .*--hostname {host}.*--port {port}"),
-        ] {
-            let _ = ProcessCommand::new("pkill")
-                .args(["-f", &pattern])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+    #[cfg(windows)]
+    {
+        let needle = format!(":{port}");
+        if let Ok(output) = ProcessCommand::new("netstat")
+            .args(["-ano", "-p", "tcp"])
+            .stdin(Stdio::null())
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut pids = std::collections::BTreeSet::new();
+            for line in text.lines() {
+                let fields = line.split_whitespace().collect::<Vec<_>>();
+                if fields.len() >= 5
+                    && fields[0].eq_ignore_ascii_case("TCP")
+                    && fields[1].contains(&needle)
+                    && fields[3].eq_ignore_ascii_case("LISTENING")
+                {
+                    if let Ok(pid) = fields[4].parse::<u32>() {
+                        pids.insert(pid);
+                    }
+                }
+            }
+            for pid in pids {
+                let _ = ProcessCommand::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let hosts = [
+            "0.0.0.0".to_string(),
+            std::net::Ipv4Addr::from(LOOPBACK_V4_OCTETS).to_string(),
+            LOCALHOST_HTTP_HOST.to_string(),
+        ];
+        for host in hosts {
+            for pattern in [
+                format!("next dev --hostname {host} --port {port}"),
+                format!("next dev .*--hostname {host}.*--port {port}"),
+                format!("next dev .*--hostname {host}.*-p {port}"),
+                format!("next dev .*--port {port}"),
+                format!("next dev .*-p {port}"),
+                format!("node dev-server.mjs --hostname {host} --port {port}"),
+                format!("node dev-server.mjs .*--hostname {host}.*--port {port}"),
+            ] {
+                let _ = ProcessCommand::new("pkill")
+                    .args(["-f", &pattern])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            }
         }
     }
 
@@ -1223,10 +2302,27 @@ pub(crate) fn api_is_ready(port: u16) -> bool {
 }
 
 fn api_bridge_is_ready(port: u16) -> bool {
+    api_bridge_is_ready_with_identity(port, false)
+}
+
+// A freshly spawned API may be compiled directly with `cargo run` and thus
+// have an unknown source snapshot.  It is still safe to accept that child
+// when its commit matches the launcher and the complete API contract matches;
+// reuse of an already listening process remains strict and fail-closed.
+fn api_bridge_is_ready_for_startup(port: u16) -> bool {
+    api_bridge_is_ready_with_identity(port, true)
+}
+
+fn api_bridge_is_ready_with_identity(port: u16, allow_unknown_snapshot: bool) -> bool {
     if !api_is_ready(port) {
         return false;
     }
-    if !api_openapi_is_compatible(port) {
+    let openapi_ready = if allow_unknown_snapshot {
+        api_openapi_is_compatible_with_identity(port, true)
+    } else {
+        api_openapi_is_compatible(port)
+    };
+    if !openapi_ready {
         return false;
     }
 
@@ -1262,12 +2358,20 @@ fn api_bridge_is_ready(port: u16) -> bool {
 }
 
 fn api_openapi_is_compatible(port: u16) -> bool {
+    api_openapi_is_compatible_with_identity(port, false)
+}
+
+fn api_openapi_is_compatible_with_identity(port: u16, allow_unknown_snapshot: bool) -> bool {
     let addr = std::net::SocketAddr::from((LOOPBACK_V4_OCTETS, port));
     let mut stream = match std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500)) {
         Ok(stream) => stream,
         Err(_) => return false,
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
+    // The v2 document is intentionally comprehensive and can exceed half a
+    // megabyte on a local Windows checkout.  Keep the compatibility probe
+    // bounded, but allow the full response to arrive before rejecting a
+    // healthy API as incompatible.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_millis(750)));
     if stream
         .write_all(b"GET /v2/platform/openapi.json HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -1276,10 +2380,19 @@ fn api_openapi_is_compatible(port: u16) -> bool {
         return false;
     }
     let mut response = String::new();
-    stream.read_to_string(&mut response).is_ok() && api_openapi_response_is_compatible(&response)
+    stream.read_to_string(&mut response).is_ok()
+        && api_openapi_response_is_compatible_with_identity(&response, allow_unknown_snapshot)
 }
 
+#[cfg(test)]
 fn api_openapi_response_is_compatible(response: &str) -> bool {
+    api_openapi_response_is_compatible_with_identity(response, false)
+}
+
+fn api_openapi_response_is_compatible_with_identity(
+    response: &str,
+    allow_unknown_snapshot: bool,
+) -> bool {
     const REQUIRED_STAGE_KINDS: [&str; 5] = [
         "add_field_drive",
         "remove_field_drive",
@@ -1309,7 +2422,7 @@ fn api_openapi_response_is_compatible(response: &str) -> bool {
     else {
         return false;
     };
-    if !api_build_identity_is_compatible(&document) {
+    if !api_build_identity_is_compatible_with_unknown(&document, allow_unknown_snapshot) {
         return false;
     }
 
@@ -1323,7 +2436,10 @@ fn api_openapi_response_is_compatible(response: &str) -> bool {
         })
 }
 
-fn api_build_identity_is_compatible(document: &serde_json::Value) -> bool {
+fn api_build_identity_is_compatible_with_unknown(
+    document: &serde_json::Value,
+    allow_unknown_snapshot: bool,
+) -> bool {
     let Some(remote) = document
         .get("x-fullmag-build-identity")
         .and_then(serde_json::Value::as_object)
@@ -1344,13 +2460,15 @@ fn api_build_identity_is_compatible(document: &serde_json::Value) -> bool {
         return false;
     }
 
-    let local_snapshot_is_known = local.source_snapshot_sha256 != "unknown";
-    let remote_snapshot_is_known = remote_snapshot != "unknown";
-    if local_snapshot_is_known || remote_snapshot_is_known {
-        return remote_snapshot == local.source_snapshot_sha256;
+    // A health check plus the commit is not enough for reuse: two dirty
+    // worktrees can share the same HEAD while compiling different API code.
+    // Unknown snapshots therefore fail closed and force a fresh API process.
+    if local.source_snapshot_sha256 == "unknown" || remote_snapshot == "unknown" {
+        return allow_unknown_snapshot
+            && local.source_snapshot_sha256 == "unknown"
+            && remote_snapshot == "unknown";
     }
-
-    true
+    remote_snapshot == local.source_snapshot_sha256
 }
 
 pub(crate) fn current_live_api_client() -> &'static reqwest::blocking::Client {
@@ -1377,8 +2495,57 @@ pub(crate) fn sync_current_live_snapshot(
     session_id: &str,
     payload: &CurrentLiveSnapshotPayload,
 ) -> Result<()> {
-    current_live_snapshot_api_client()
-        .post(internal_live_api_url("snapshot"))
+    sync_current_live_snapshot_with_owner(session_id, payload, None)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct TerminalSnapshotOwner {
+    pub session_id: String,
+    pub run_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_epoch: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_scope_epoch: Option<String>,
+    pub require_empty: bool,
+}
+
+pub(crate) fn capture_terminal_snapshot_owner(session_id: &str, run_id: &str) -> Result<Option<TerminalSnapshotOwner>> {
+    let response = current_live_api_client().get(format!("{}/v2/sessions/current/status", api_base_url()))
+        .send().context("terminal owner status request failed")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND { return Ok(None); }
+    let status: serde_json::Value = response.error_for_status()
+        .context("terminal owner status unavailable")?.json().context("terminal owner status malformed")?;
+    terminal_snapshot_owner_from_status(&status, session_id, run_id).map(Some)
+}
+
+fn terminal_snapshot_owner_from_status(status: &serde_json::Value, session_id: &str, run_id: &str) -> Result<TerminalSnapshotOwner> {
+    if session_id.is_empty() || run_id.is_empty()
+        || status.pointer("/session/session_id").and_then(serde_json::Value::as_str) != Some(session_id)
+        || status.pointer("/run/run_id").and_then(serde_json::Value::as_str) != Some(run_id) {
+        bail!("terminal publication current session/run owner changed");
+    }
+    let scope = status.pointer("/session/request_scope_epoch").and_then(serde_json::Value::as_str)
+        .context("terminal request scope missing")?;
+    let (instance, counter) = scope.rsplit_once(':').context("terminal request scope malformed")?;
+    if instance.is_empty() { bail!("terminal request scope instance missing"); }
+    let epoch: u64 = counter.parse().context("terminal request scope counter malformed")?;
+    Ok(TerminalSnapshotOwner { session_id: session_id.into(), run_id: run_id.into(),
+        session_epoch: Some(epoch), request_scope_epoch: Some(scope.into()), require_empty: false })
+}
+
+pub(crate) fn sync_current_live_terminal_snapshot(session_id: &str, payload: &CurrentLiveSnapshotPayload,
+    owner: &TerminalSnapshotOwner) -> Result<()> {
+    if owner.session_id != session_id { bail!("terminal snapshot owner/session mismatch"); }
+    sync_current_live_snapshot_with_owner(session_id, payload, Some(owner))
+}
+
+fn sync_current_live_snapshot_with_owner(session_id: &str, payload: &CurrentLiveSnapshotPayload,
+    owner: Option<&TerminalSnapshotOwner>) -> Result<()> {
+    let mut request = current_live_snapshot_api_client().post(internal_live_api_url("snapshot"));
+    if let Some(owner) = owner {
+        request = request.header("x-fullmag-terminal-owner", serde_json::to_string(owner)?);
+    }
+    request
         .json(&CurrentLiveSnapshotRequest {
             session_id,
             session: payload.session.as_ref(),
@@ -1389,6 +2556,7 @@ pub(crate) fn sync_current_live_snapshot(
             simulation_preparation: payload.simulation_preparation.as_ref(),
             run: payload.run.as_ref(),
             live_state: payload.live_state.as_ref(),
+            frozen_spins_runtime_status: payload.frozen_spins_runtime_status.as_ref(),
             latest_scalar_row: payload.latest_scalar_row.as_ref(),
             latest_fields: payload.latest_fields.as_ref(),
             replace_latest_fields: payload.replace_latest_fields,
@@ -1404,6 +2572,45 @@ pub(crate) fn sync_current_live_snapshot(
         .error_for_status()
         .context("current live snapshot endpoint returned error")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod terminal_snapshot_owner_tests {
+    use super::*;
+
+    fn status(scope: &str) -> serde_json::Value {
+        serde_json::json!({
+            "session": { "session_id": "session", "session_epoch": "scientific-epoch",
+                "request_scope_epoch": scope },
+            "run": { "run_id": "run" }
+        })
+    }
+
+    #[test]
+    fn pins_atomic_counter_from_request_scope_not_scientific_epoch() {
+        let owner = terminal_snapshot_owner_from_status(&status("instance:17"), "session", "run").unwrap();
+        assert_eq!(owner.session_epoch, Some(17));
+        assert_eq!(owner.request_scope_epoch.as_deref(), Some("instance:17"));
+        assert!(!owner.require_empty);
+    }
+
+    #[test]
+    fn invalid_owner_or_scope_is_rejected() {
+        for scope in ["", "instance", ":17", "instance:invalid"] {
+            assert!(terminal_snapshot_owner_from_status(&status(scope), "session", "run").is_err());
+        }
+        assert!(terminal_snapshot_owner_from_status(&status("instance:17"), "other", "run").is_err());
+        assert!(terminal_snapshot_owner_from_status(&status("instance:17"), "session", "other").is_err());
+    }
+
+    #[test]
+    fn empty_admission_omits_unobserved_epoch_fields() {
+        let owner = TerminalSnapshotOwner { session_id: "session".into(), run_id: "run".into(),
+            session_epoch: None, request_scope_epoch: None, require_empty: true };
+        assert_eq!(serde_json::to_value(owner).unwrap(), serde_json::json!({
+            "session_id": "session", "run_id": "run", "require_empty": true
+        }));
+    }
 }
 
 fn sync_current_live_session_frame(
@@ -1438,6 +2645,7 @@ fn sync_current_live_runtime_frame(
         .json(&CurrentLiveRuntimeFrameRequest {
             session_id,
             live_state: payload.live_state.as_ref(),
+            frozen_spins_runtime_status: payload.frozen_spins_runtime_status.as_ref(),
             engine_log: payload.engine_log.as_deref(),
             solver_profile: payload.solver_profile.as_ref(),
             fem_mesh: payload.fem_mesh.as_ref(),
@@ -1503,6 +2711,7 @@ fn payload_has_current_live_delta(payload: &CurrentLiveSnapshotPayload) -> bool 
         || payload.latest_scalar_row.is_some()
         || payload_routes_to_current_live_session_frame(payload)
         || payload.live_state.is_some()
+        || payload.frozen_spins_runtime_status.is_some()
         || payload.engine_log.is_some()
         || payload.solver_profile.is_some()
         || payload.fem_mesh.is_some()
@@ -1550,6 +2759,7 @@ where
     }
 
     if payload.live_state.is_some()
+        || payload.frozen_spins_runtime_status.is_some()
         || payload.engine_log.is_some()
         || payload.solver_profile.is_some()
         || payload.fem_mesh.is_some()
@@ -1599,6 +2809,8 @@ mod live_delta_routing_tests {
         CurrentLiveSnapshotPayload {
             session_status: Some("running".to_string()),
             latest_scalar_row: Some(CurrentLiveScalarRow {
+                kind: fullmag_quantities::StepDataKind::PhysicalObservation,
+                solver_progress: None,
                 step: 1,
                 time: 0.0,
                 solver_dt: 0.0,
@@ -1616,6 +2828,7 @@ mod live_delta_routing_tests {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 1.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -1770,9 +2983,13 @@ pub(crate) fn spawn_fullmag_api(
     stderr: fs::File,
     disable_static_control_room: bool,
     stream_logs_to_terminal: bool,
+    restore_from_stdin: bool,
+    development_owner_token: Option<&str>,
+    development_restart_origin: Option<&str>,
 ) -> Result<std::process::Child> {
     let packaged_root = packaged_install_root(self_exe);
     let runtime_root = packaged_root.clone().unwrap_or_else(|| root.to_path_buf());
+    let state_root = runtime_state_root(&runtime_root);
     let sibling_api = self_exe.with_file_name(format!("fullmag-api{EXE_SUFFIX}"));
     let web_static_dir = {
         let candidates = [
@@ -1801,31 +3018,9 @@ pub(crate) fn spawn_fullmag_api(
             .join("local")
             .join("bin")
             .join(format!("fullmag-api{EXE_SUFFIX}")),
-        root.join(".fullmag")
-            .join("target")
-            .join("release")
-            .join(format!("fullmag-api{EXE_SUFFIX}")),
-        root.join(".fullmag")
-            .join("target")
-            .join("debug")
-            .join(format!("fullmag-api{EXE_SUFFIX}")),
-        root.join("target")
-            .join("release")
-            .join(format!("fullmag-api{EXE_SUFFIX}")),
-        root.join("target")
-            .join("debug")
-            .join(format!("fullmag-api{EXE_SUFFIX}")),
-        root.join("target")
-            .join("x86_64-pc-windows-msvc")
-            .join("release")
-            .join(format!("fullmag-api{EXE_SUFFIX}")),
-        root.join("target")
-            .join("x86_64-pc-windows-msvc")
-            .join("debug")
-            .join(format!("fullmag-api{EXE_SUFFIX}")),
     ];
 
-    if let Some(path) = candidates.iter().find(|candidate| candidate.exists()) {
+    if let Some(path) = candidates.iter().find(|candidate| candidate.is_file()) {
         let mut command = ProcessCommand::new(path);
         let terminal_log_file = if stream_logs_to_terminal {
             Some(
@@ -1840,8 +3035,27 @@ pub(crate) fn spawn_fullmag_api(
             .current_dir(&runtime_root)
             .env("FULLMAG_API_PORT", api_port().to_string())
             .env("FULLMAG_REPO_ROOT", &runtime_root)
+            .env("FULLMAG_STATE_ROOT", &state_root)
             .env("FULLMAG_WEB_STATIC_DIR", &web_static_dir)
-            .stdin(Stdio::null());
+            .env_remove("FULLMAG_DEVELOPMENT_OWNER_TOKEN")
+            .env_remove("FULLMAG_DEVELOPMENT_RESTART_COORDINATOR")
+            .env_remove("FULLMAG_DEVELOPMENT_RESTART_UI_ORIGIN")
+            // The manager supplies bounded, verified input and closes its pipe.
+            // API validation and its deadline remain authoritative; the CLI
+            // must not consume or transform the canonical scene on the way.
+            .stdin(if restore_from_stdin {
+                Stdio::inherit()
+            } else {
+                Stdio::null()
+            });
+        if let Some(token) = development_owner_token {
+            command.env("FULLMAG_DEVELOPMENT_OWNER_TOKEN", token);
+            if let Some(origin) = development_restart_origin {
+                command
+                    .env("FULLMAG_DEVELOPMENT_RESTART_COORDINATOR", "1")
+                    .env("FULLMAG_DEVELOPMENT_RESTART_UI_ORIGIN", origin);
+            }
+        }
         if stream_logs_to_terminal {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
         } else {
@@ -1861,47 +3075,14 @@ pub(crate) fn spawn_fullmag_api(
         return Ok(child);
     }
 
-    if packaged_root.is_some() {
-        bail!(
-            "fullmag-api binary missing from packaged install rooted at {}",
-            runtime_root.display()
-        );
-    }
-
-    let mut command = ProcessCommand::new("cargo");
-    let terminal_log_file = if stream_logs_to_terminal {
-        Some(
-            stdout
-                .try_clone()
-                .context("failed to clone api log file for terminal streaming")?,
-        )
+    let install_hint = if packaged_root.is_some() {
+        format!("packaged install rooted at {}", runtime_root.display())
     } else {
-        None
+        "the configured Fullmag build output".to_string()
     };
-    command
-        .args(["run", "-p", "fullmag-api"])
-        .current_dir(root)
-        .env("FULLMAG_API_PORT", api_port().to_string())
-        .env("FULLMAG_REPO_ROOT", root)
-        .env("FULLMAG_WEB_STATIC_DIR", &web_static_dir)
-        .stdin(Stdio::null());
-    if stream_logs_to_terminal {
-        command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    } else {
-        command.stdout(stdout).stderr(stderr);
-    }
-    configure_child_process(&mut command);
-    configure_repo_local_library_env(&mut command, root, None);
-    if disable_static_control_room {
-        command.env("FULLMAG_DISABLE_STATIC_CONTROL_ROOM", "1");
-    }
-    let mut child = command
-        .spawn()
-        .context("failed to spawn fullmag-api via cargo")?;
-    if let Some(log_file) = terminal_log_file {
-        terminal_logger().attach_child(&mut child, TerminalLogSource::Api, log_file)?;
-    }
-    Ok(child)
+    bail!(
+        "fullmag-api binary is missing from {install_hint}; build fullmag-api beside the CLI before starting the runtime"
+    )
 }
 
 #[cfg(unix)]
@@ -1980,6 +3161,15 @@ fn terminate_child_process(child: &mut std::process::Child) {
             let _ = libc::kill(-pgid, libc::SIGKILL);
         }
     }
+    #[cfg(windows)]
+    {
+        let _ = ProcessCommand::new("taskkill")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -2025,13 +3215,21 @@ fn configure_repo_local_library_env(
 
 fn wait_for_api_ready(port: u16, child: &mut std::process::Child, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
+    let mut health_seen = false;
+    let mut next_contract_probe = Instant::now();
     loop {
-        // A newly spawned API is considered live once its health endpoint
-        // responds.  Contract validation remains mandatory for reusing an
-        // existing process, but OpenAPI generation and the internal snapshot
-        // probe can legitimately lag while the runtime is under startup load.
-        if api_is_ready(port) {
-            return Ok(());
+        // A newly spawned API must pass both liveness and the complete API
+        // contract.  Health alone can be served by an unrelated stale process
+        // on the requested port.  Source snapshots are strict when present;
+        // direct ad-hoc `cargo run` builds may legitimately report `unknown`.
+        if !health_seen {
+            health_seen = api_is_ready(port);
+        }
+        if health_seen && Instant::now() >= next_contract_probe {
+            if api_bridge_is_ready_for_startup(port) {
+                return Ok(());
+            }
+            next_contract_probe = Instant::now() + Duration::from_millis(500);
         }
         if let Some(status) = child
             .try_wait()
@@ -2049,8 +3247,1597 @@ fn wait_for_api_ready(port: u16, child: &mut std::process::Child, timeout: Durat
     }
 }
 
+/// Explicit initialization of a new scoped store; existing data are refused.
+pub(crate) fn initialize_scoped_accepted_store() -> Result<()> {
+    if !cfg!(windows)
+        || std::env::var("FULLMAG_NATIVE_RUNTIME_ACTIVE").as_deref() != Ok("1")
+        || std::env::var("FULLMAG_STORAGE_PROFILE").as_deref() != Ok("windows-native-fdm-cpu-dev")
+    {
+        bail!("scoped accepted-store initialization requires managed native development");
+    }
+    let scope = std::env::var("FULLMAG_ACCEPTED_STORE_SCOPE")
+        .context("scoped accepted-store initialization requires an explicit scope")?;
+    let uuid = uuid::Uuid::parse_str(&scope).context("invalid accepted-store scope")?;
+    if uuid.is_nil() || uuid.to_string() != scope {
+        bail!("invalid accepted-store scope");
+    }
+    let _launch = crate::development_api_owner::OwnerLaunch::from_environment(true, false)?
+        .context("scoped accepted-store initialization requires managed source identity")?;
+    let repo = repo_root();
+    let root = fullmag_runtime_control::accepted_store::configured_submit_store_root(
+        &repo,
+        &runtime_state_root(&repo),
+    )
+    .context("scoped accepted-store configuration is invalid")?;
+    let runs =
+        fullmag_runtime_control::accepted_store::writable_product_state_path(&PathBuf::from(
+            std::env::var_os("FULLMAG_RUNS_ROOT").context("managed runs root is missing")?,
+        ))
+        .context("managed runs root is invalid")?;
+    let relative = format!("workspaces/{scope}/session-store");
+    if root != runs.join(&relative) {
+        bail!("scoped accepted-store root differs from managed runs");
+    }
+    if root.try_exists()? {
+        bail!("scoped accepted-store already exists; initialization refused");
+    }
+    let checked = fullmag_session::repository_path::create_new_directory(&runs, &relative)
+        .context("scoped accepted-store exclusive creation failed")?;
+    // Initialization is explicit and only follows exclusive creation of a new
+    // leaf. A partial failure is retained; no automatic retry or data cleanup.
+    let store = fullmag_session::SessionStore::open(checked.clone())?;
+    drop(store);
+    let binding = fullmag_runtime_control::accepted_store::store_binding(&checked)
+        .context("initialized accepted-store binding is invalid")?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema":"fullmag.scoped-accepted-store-initialization.v1", "scope":scope,"binding":binding,
+        })
+    );
+    Ok(())
+}
+
+/// Managed diagnostic only: own an empty API, exercise the production CLI
+/// owner client, and wait for that child. Never opens a frontend or desktop.
+/// Managed parent owns the replacement API and has already waited its old API.
+/// This probe exercises the production private client, not process supervision.
+pub(crate) fn verify_development_completion_owner() -> Result<()> {
+    if std::env::var("FULLMAG_DEVELOPMENT_OWNER_PROBE").as_deref() != Ok("1") {
+        bail!("development completion verification requires the managed owner probe");
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Input {
+        schema: String,
+        api_pid: u32,
+        api_port: u16,
+        api_instance_id: String,
+        old_api_instance_id: String,
+        commit_sha256: String,
+        candidate_bundle_id: String,
+        candidate_manifest_sha256: String,
+        expected_scene_sha256: String,
+        #[serde(deserialize_with = "present_session_id")]
+        expected_session_id: Option<String>,
+        expected_session_epoch: u64,
+    }
+    fn present_session_id<'de, D: serde::Deserializer<'de>>(
+        d: D,
+    ) -> std::result::Result<Option<String>, D::Error> {
+        serde::Deserialize::deserialize(d)
+    }
+    let mut input = Vec::new();
+    std::io::stdin().take(4097).read_to_end(&mut input)?;
+    if input.len() > 4096 {
+        bail!("development completion probe input exceeds its limit");
+    }
+    let input: Input = serde_json::from_slice(&input)?;
+    if input.schema != "fullmag.development-cli-completion-request.v1" {
+        bail!("unknown development completion probe schema");
+    }
+    let (launch, helper_pid) =
+        crate::development_api_owner::OwnerLaunch::from_probe_environment_for_candidate(
+            &repo_root(),
+            &input.candidate_bundle_id,
+            &input.candidate_manifest_sha256,
+        )?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema":"fullmag.development-cli-candidate-owner-progress.v1",
+            "helper_pid":helper_pid, "helper_waited":true, "helper_exit_code":0
+        })
+    );
+    let launcher_build_matches_api = launch.expects_launcher_build();
+    let owner = launch.confirm(input.api_pid, input.api_port, &input.api_instance_id)?;
+    let mut acquired = owner.acquire(&uuid::Uuid::new_v4().to_string())?;
+    let workspace = acquired.workspace().clone();
+    let (session_id, epoch, digest) = if workspace["state"] == "no_session" {
+        (
+            None,
+            workspace["session_epoch"].as_u64(),
+            fullmag_session::canonical_json_sha256(&serde_json::Value::Null),
+        )
+    } else {
+        (
+            workspace["identity"]["session_id"]
+                .as_str()
+                .map(str::to_owned),
+            workspace["identity"]["session_epoch"].as_u64(),
+            workspace["scene_sha256"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+        )
+    };
+    if session_id != input.expected_session_id
+        || epoch != Some(input.expected_session_epoch)
+        || digest != input.expected_scene_sha256
+    {
+        bail!("replacement acquisition differs from the parent's pinned restore");
+    }
+    let root = repo_root();
+    let store_root = fullmag_runtime_control::accepted_store::configured_submit_store_root(
+        &root,
+        &runtime_state_root(&root),
+    )
+    .context("completion probe requires its configured accepted store")?;
+    let raw_commit = fullmag_session::repository_path::read_bounded_regular_file(
+        &store_root,
+        "development/HANDOFF-COMMIT.json",
+        16 * 1024,
+    )?;
+    if fullmag_session::hex_sha256(&raw_commit) != input.commit_sha256 {
+        bail!("completion probe commit differs from its parent's accepted record");
+    }
+    let commit: fullmag_session::store::DevelopmentHandoffCommit =
+        serde_json::from_slice(&raw_commit)?;
+    if commit.api_instance_id != input.old_api_instance_id {
+        bail!("completion probe identifies another old API");
+    }
+    let acknowledgement = acquired.complete_cold_handoff(
+        &commit,
+        &input.commit_sha256,
+        &input.candidate_bundle_id,
+        &input.candidate_manifest_sha256,
+    )?;
+    let mut next = owner.acquire(&uuid::Uuid::new_v4().to_string())?;
+    if next.workspace() != &workspace {
+        bail!("next acquisition did not preserve the completed authoring scene");
+    }
+    let candidate = PathBuf::from(
+        std::env::var_os("FULLMAG_PROJECT_STORAGE_ROOT")
+            .context("next idle probe requires managed storage")?,
+    )
+    .join("runtimes")
+    .join(std::env::var("FULLMAG_WORKTREE_ID")?)
+    .join("native-bundles")
+    .join(&input.candidate_bundle_id);
+    let staged = next.stage_handoff(
+        &root,
+        &candidate,
+        &serde_json::json!({
+            "api_instance_id":input.api_instance_id, "session_id":input.expected_session_id,
+            "session_epoch":input.expected_session_epoch, "editor":{"probe":"next-cold-idle"},
+            "workspace":{}, "project_document":{}
+        }),
+    )?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema":"fullmag.development-cli-next-idle-progress.v1",
+            "helper_pid":staged.helper_pid, "helper_waited":true, "helper_exit_code":0
+        })
+    );
+    let nonce = staged.acknowledgement["acquisition_nonce"]
+        .as_str()
+        .context("next acquisition staging has no nonce")?;
+    let wrong =
+        fullmag_runtime_control::development_cold_idle::PinnedApiBuildIdentity::from_pinned_build(
+            &"0".repeat(40),
+            &"0".repeat(64),
+        )?;
+    if fullmag_runtime_control::development_cold_idle::cold_idle_for_api_with_build(
+        input.api_port,
+        &input.api_instance_id,
+        &store_root,
+        launch.token(),
+        nonce,
+        &wrong,
+    )
+    .is_ok()
+    {
+        bail!("next cold idle accepted a mismatched build identity");
+    }
+    if !launcher_build_matches_api
+        && fullmag_runtime_control::development_cold_idle::cold_idle_for_api(
+            input.api_port,
+            &input.api_instance_id,
+            &store_root,
+            launch.token(),
+            nonce,
+        )
+        .is_ok()
+    {
+        bail!("default cold idle accepted an API from another launcher build");
+    }
+    let store = fullmag_session::SessionStore::open_existing(store_root.clone())?;
+    if store.read_development_idle_fence()?.is_some() {
+        bail!("mismatched build reservation published an admission fence");
+    }
+    let idle = next.acquire_cold_idle(&staged, &store_root)?;
+    if idle.verify_for_api(input.api_port, &input.api_instance_id)?
+        != acknowledgement["accepted_store_binding"]
+            .as_str()
+            .unwrap_or_default()
+    {
+        bail!("next cold idle proof changed accepted-store binding");
+    }
+    idle.release_fence()?; // Explicit abort of this next reservation; no new commit.
+    next.abort()?;
+    if store.read_development_idle_fence()?.is_some() {
+        bail!("explicit next idle abort retained admission fence");
+    }
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema":"fullmag.development-cli-completion-check.v1", "api_pid":input.api_pid,
+            "api_instance_id":input.api_instance_id, "acknowledgement":acknowledgement,
+            "launcher_build_matches_api":launcher_build_matches_api,
+            "checks":["native-completion-owner-confirmed", "native-completion-held-restore-pinned", "native-completion-acknowledgement-validated",
+                "native-next-acquisition-scene-preserved", "native-next-wrong-build-refused-before-fencing",
+                "native-next-staged-cold-idle-reservation", "native-next-idle-proof-rechecked-api-binding",
+                "native-next-idle-explicit-abort"]
+        })
+    );
+    Ok(())
+}
+
+pub(crate) fn verify_development_restart_consumer() -> Result<()> {
+    match std::env::var("FULLMAG_DEVELOPMENT_RESTART_PROBE_CASE").as_deref() {
+        Ok("empty" | "scene") => verify_development_api_owner(),
+        Ok("readiness") => development_consumer_probe::verify(),
+        Ok("active-run" | "active-run-paused") => development_active_run_probe::verify(),
+        Ok("browser-workspace") => development_workspace_probe::verify(),
+        Ok("preparation-faults") => {
+            crate::development_api_owner::verify_candidate_preparation_faults(&repo_root())
+        }
+        _ => bail!("native restart consumer requires an explicit managed case"),
+    }
+}
+
+fn verify_owned_restart_consumer(
+    root: &Path,
+    guard: &mut ControlRoomGuard,
+    old_pid: u32,
+    old_instance: &str,
+) -> Result<()> {
+    use fullmag_session::development_restart_transport as transport;
+    let scene_case =
+        std::env::var("FULLMAG_DEVELOPMENT_RESTART_PROBE_CASE").as_deref() == Ok("scene");
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let url = format!("http://127.0.0.1:{}", api_port());
+    let before_scene = if scene_case {
+        client.post(format!("{url}/v2/sessions"))
+            .header("x-fullmag-api-instance", old_instance)
+            .json(&serde_json::json!({"name":"Native consumer model", "backend":"fdm", "device":"cpu", "precision":"double"}))
+            .send()?.error_for_status()?;
+        Some(
+            client
+                .get(format!("{url}/v2/sessions/current/model/scene"))
+                .header("x-fullmag-api-instance", old_instance)
+                .send()?
+                .error_for_status()?
+                .json::<serde_json::Value>()?,
+        )
+    } else {
+        None
+    };
+    let mut acquisition = guard
+        .development_supervisor_mut()?
+        .owner()
+        .acquire(&uuid::Uuid::new_v4().to_string())?;
+    let identity = acquisition.workspace()["identity"].clone();
+    let session_id = identity["session_id"].as_str().map(str::to_owned);
+    let session_epoch = if scene_case {
+        identity["session_epoch"]
+            .as_u64()
+            .context("probe scene has no epoch")?
+    } else {
+        0
+    };
+    acquisition.confirm_held()?;
+    acquisition.abort()?;
+    let (storage, worktree, _, _) = guard
+        .development_restart_scope()
+        .context("consumer fixture lost owner scope")?;
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let editor = serde_json::json!({"source":"unsaved native consumer draft", "cursor":17});
+    let workspace = serde_json::json!({"inspector":false, "selection":["draft-object"]});
+    let project_document = serde_json::json!({"unsaved":true, "name":"Distinct project draft"});
+    let submitted = serde_json::json!({"schema":transport::RESTART_REQUEST_SCHEMA,
+        "request_id":request_id, "session_id":session_id, "session_epoch":session_epoch,
+        "editor":editor, "workspace":workspace, "project_document":project_document});
+    let accepted = client
+        .post(format!("{url}/v2/platform/development-restart-requests"))
+        .header("x-fullmag-api-instance", old_instance)
+        .header("Origin", "http://localhost:3197")
+        .bearer_auth(&token)
+        .json(&submitted)
+        .send()?;
+    if accepted.status().as_u16() != 202 {
+        bail!(
+            "native consumer request was not accepted: {}",
+            accepted.status()
+        );
+    }
+    let mut scratch = Some(crate::scratch_runtime::spawn(
+        api_port(),
+        std::env::current_exe()?,
+        None,
+        old_instance.to_owned(),
+    ));
+    let mut attach = None;
+    let mut pump = crate::development_restart::NativeRestartPump::default();
+    pump.step_observed(
+        root,
+        guard,
+        &mut attach,
+        &mut scratch,
+        emit_development_restart_probe_progress,
+    )?;
+    let token_sha = fullmag_session::hex_sha256(token.as_bytes());
+    let result_deadline = Instant::now() + Duration::from_secs(145);
+    let result = loop {
+        if let Some(result) = transport::read_result(&storage, &worktree, &request_id, &token_sha)?
+        {
+            break result;
+        }
+        if Instant::now() >= result_deadline {
+            bail!("native consumer did not publish its terminal result before the diagnostic deadline");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        pump.step_observed(
+            root,
+            guard,
+            &mut attach,
+            &mut scratch,
+            emit_development_restart_probe_progress,
+        )?;
+    };
+    if result.state != transport::RestartResultState::Ready
+        || result.editor.as_ref() != Some(&editor)
+        || result.workspace.as_ref() != Some(&workspace)
+        || result.project_document.as_ref() != Some(&project_document)
+    {
+        bail!(
+            "native consumer did not restore the exact UI payload: {:?}",
+            result.state
+        );
+    }
+    let new_instance = result
+        .new_api_instance_id
+        .as_deref()
+        .context("consumer result has no replacement pin")?;
+    if new_instance == old_instance {
+        bail!("native consumer reused its old API identity");
+    }
+    if scene_case
+        && (result.session_id.is_none()
+            || result.session_id == session_id
+            || result.session_epoch != Some(1))
+    {
+        bail!("native consumer did not create a fresh authoring session");
+    }
+    if !scene_case && (result.session_id.is_some() || result.session_epoch != Some(0)) {
+        bail!("native consumer did not preserve the empty workspace");
+    }
+    let evidence = pump
+        .last_execution
+        .clone()
+        .context("native consumer lost execution evidence")?;
+    pump.step_observed(
+        root,
+        guard,
+        &mut attach,
+        &mut scratch,
+        emit_development_restart_probe_progress,
+    )?;
+    if transport::read_result(&storage, &worktree, &request_id, &token_sha)?.as_ref()
+        != Some(&result)
+        || pump.last_execution.as_ref() != Some(&evidence)
+    {
+        bail!("native consumer repeated an immutable request");
+    }
+    if client
+        .get(format!("{url}/v2/platform/development-backend"))
+        .header("x-fullmag-api-instance", old_instance)
+        .send()?
+        .status()
+        .as_u16()
+        != 409
+    {
+        bail!("replacement API accepted its stale predecessor pin");
+    }
+    let public_result: serde_json::Value = client
+        .get(format!(
+            "{url}/v2/platform/development-restart-requests/{request_id}"
+        ))
+        .bearer_auth(&token)
+        .send()?
+        .error_for_status()?
+        .json()?;
+    if public_result["state"] != "ready" || public_result["editor"] != editor {
+        bail!("replacement HTTP did not expose the exact terminal payload");
+    }
+    if let Some(before) = before_scene {
+        let restored: serde_json::Value = client
+            .get(format!("{url}/v2/sessions/current/model/scene"))
+            .header("x-fullmag-api-instance", new_instance)
+            .send()?
+            .error_for_status()?
+            .json()?;
+        if restored != before {
+            bail!("native consumer changed the canonical authoring scene");
+        }
+        client
+            .put(format!("{url}/v2/sessions/current/model/scene"))
+            .header("x-fullmag-api-instance", new_instance)
+            .json(&restored)
+            .send()?
+            .error_for_status()?;
+    } else {
+        client.post(format!("{url}/v2/sessions"))
+            .header("x-fullmag-api-instance", new_instance)
+            .json(&serde_json::json!({"name":"New after empty restart", "backend":"fdm", "device":"cpu", "precision":"double"}))
+            .send()?.error_for_status()?;
+    }
+    // Explicit cleanup of this fixture only; no compute was submitted.
+    drop(attach.take());
+    if let Some(observer) = scratch.as_mut() {
+        let pause = observer.pause_if_idle(Duration::from_secs(2))?;
+        observer.shutdown_paused(pause)?;
+    }
+    drop(scratch.take());
+    let supervisor = guard.development_supervisor_mut()?;
+    supervisor.shutdown()?;
+    let terminal = supervisor
+        .terminal_status()
+        .context("replacement fixture was not waited")?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema":"fullmag.development-cli-restart-consumer-check.v1", "status":"passed",
+            "api_pid":evidence["api_pid"], "old_api_pid":old_pid,
+            "replacement_exit_code":terminal.code(), "helper_processes":evidence["helper_processes"],
+            "session_id":result.session_id,"session_epoch":result.session_epoch,
+            "checks":{"durable_request_consumed":true, "exact_ui_payload_restored":true,
+                "fresh_api_identity":true,"duplicate_request_not_reexecuted":true,
+                "old_api_pin_rejected":true,"restored_authoring_editable":true,"replacement_waited":true},
+        })
+    );
+    Ok(())
+}
+
+pub(crate) fn verify_development_api_owner() -> Result<()> {
+    if std::env::var("FULLMAG_DEVELOPMENT_OWNER_PROBE").as_deref() != Ok("1") {
+        bail!("development API owner verification requires an explicit managed fixture");
+    }
+    let lose_commit_ack = match std::env::var_os("FULLMAG_DEVELOPMENT_OWNER_PROBE_LOST_ACK") {
+        None => false,
+        Some(value) if value == "1" => true,
+        Some(_) => bail!("invalid lost-ack owner probe configuration"),
+    };
+    let launch_replacement = match std::env::var_os("FULLMAG_DEVELOPMENT_OWNER_PROBE_REPLACEMENT") {
+        None => false,
+        Some(value) if value == "1" => true,
+        Some(_) => bail!("invalid native replacement probe configuration"),
+    };
+    let consumer_probe = std::env::var_os("FULLMAG_DEVELOPMENT_RESTART_PROBE_CASE").is_some();
+    init_api_port()?;
+    let launch = crate::development_api_owner::OwnerLaunch::from_environment(true, false)?
+        .context("development API owner verification requires managed dev configuration")?;
+    if crate::development_api_owner::OwnerLaunch::from_environment(false, false)?.is_some()
+        || crate::development_api_owner::OwnerLaunch::from_environment(true, true)?.is_some()
+    {
+        bail!("development owner must be disabled for static and scripted workspaces");
+    }
+    let root = repo_root();
+    let state_root = runtime_state_root(&root);
+    let base_store = PathBuf::from(
+        std::env::var_os("FULLMAG_RUNS_ROOT").context("owner fixture runs root is missing")?,
+    )
+    .join("session-store");
+    use fullmag_runtime_control::accepted_store::scoped_submit_store_root;
+    let expected_base =
+        fullmag_runtime_control::accepted_store::writable_product_state_path(&base_store)
+            .context("owner fixture base store is invalid")?;
+    if scoped_submit_store_root(&base_store, None).as_ref() != Some(&expected_base) {
+        bail!("unscoped accepted-store location changed");
+    }
+    for invalid in [
+        "../outside",
+        "00000000-0000-0000-0000-000000000000",
+        "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA",
+        "",
+    ] {
+        if scoped_submit_store_root(&base_store, Some(invalid.into())).is_some() {
+            bail!("invalid accepted-store scope resolved to a writable root");
+        }
+    }
+    let log_path = fullmag_session::repository_path::checked_path(
+        &state_root,
+        &format!("owner-probe-{}.log", uuid::Uuid::new_v4().simple()),
+    )?;
+    let log = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(log_path)?;
+    let error_log = log.try_clone()?;
+    let mut child = BootstrapProcessGuard::new(ChildProcess(spawn_fullmag_api(
+        &root,
+        &std::env::current_exe()?,
+        log,
+        error_log,
+        true,
+        false,
+        false,
+        Some(launch.token()),
+        consumer_probe.then_some("http://localhost:3197"),
+    )?));
+    let pid = child.process_mut().0.id();
+    emit_owner_probe_process_started(pid, api_port())?;
+    wait_for_api_ready(
+        api_port(),
+        &mut child.process_mut().0,
+        Duration::from_secs(30),
+    )?;
+    let client = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    let url = format!("http://127.0.0.1:{}", api_port());
+    let response = client
+        .get(format!("{url}/v2/platform/development-backend"))
+        .send()?
+        .error_for_status()?;
+    let instance = response
+        .headers()
+        .get("x-fullmag-api-instance")
+        .context("owned API v2 resource lacks an instance pin")?
+        .to_str()?
+        .to_owned();
+    if launch
+        .confirm(pid.wrapping_add(1), api_port(), &instance)
+        .is_ok()
+    {
+        bail!("development owner accepted a different child PID");
+    }
+    let foreign = crate::development_api_owner::OwnerLaunch::from_environment(true, false)?
+        .context("managed fixture lost its owner configuration")?;
+    if foreign.confirm(pid, api_port(), &instance).is_ok() {
+        bail!("development owner accepted a different token");
+    }
+    let owner = launch.confirm(pid, api_port(), &instance)?;
+    if consumer_probe {
+        let mut guard = ControlRoomGuard::active(api_port(), Some(child.release().0), None);
+        guard.adopt_development_owner(owner)?;
+        guard.enable_development_restart_transport(3197)?;
+        return verify_owned_restart_consumer(&root, &mut guard, pid, &instance);
+    }
+    if owner.acquire("invalid").is_ok() {
+        bail!("development owner accepted an invalid acquisition nonce");
+    }
+    let mut acquisition = owner.acquire(&uuid::Uuid::new_v4().to_string())?;
+    if acquisition.workspace() != &serde_json::json!({"state":"no_session", "session_epoch":0}) {
+        bail!("development owner fixture is not an empty API");
+    }
+    acquisition.confirm_held()?;
+    acquisition.confirm_held()?;
+    let candidate = std::path::PathBuf::from(
+        std::env::var_os("FULLMAG_DEVELOPMENT_OWNER_PROBE_CANDIDATE")
+            .context("owned CLI probe requires a verified candidate bundle")?,
+    );
+    let empty_staged = acquisition.stage_handoff(
+        &root,
+        &candidate,
+        &serde_json::json!({
+            "api_instance_id":instance, "session_id":null, "session_epoch":0,
+            "editor":{"probe":"empty"}, "workspace":{}, "project_document":{}
+        }),
+    )?;
+    if empty_staged.acknowledgement["workspace_state"] != "no_session" {
+        bail!("empty CLI capsule staging returned a session");
+    }
+    let empty_checked = acquisition.revalidate_staged_handoff(&root, &empty_staged)?;
+    if empty_checked.acknowledgement != empty_staged.acknowledgement {
+        bail!("empty capsule commit preparation changed its acknowledgement");
+    }
+    let accepted_store =
+        fullmag_runtime_control::accepted_store::configured_submit_store_root(&root, &state_root)
+            .context("owned CLI probe requires its isolated accepted store")?;
+    let empty_idle = acquisition.acquire_cold_idle(&empty_checked, &accepted_store)?;
+    empty_idle.verify_current()?;
+    empty_idle.release_fence()?; // Explicit fixture abort while API admission remains frozen.
+    acquisition.confirm_held()?;
+    let create = serde_json::json!({"name":"CLI owner fixture", "backend":"fdm",
+                                  "device":"cpu", "precision":"double"});
+    let frozen = client
+        .post(format!("{url}/v2/sessions"))
+        .json(&create)
+        .send()?;
+    if frozen.status().as_u16() != 409 {
+        bail!("development owner acquisition did not freeze mutation admission");
+    }
+    acquisition.abort()?;
+    if client
+        .post(format!("{url}/v2/sessions"))
+        .json(&create)
+        .send()?
+        .status()
+        .as_u16()
+        != 201
+    {
+        bail!("development owner abort did not reopen mutation admission");
+    }
+    let mut scene: serde_json::Value = client
+        .get(format!("{url}/v2/sessions/current/model/scene"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    // Exercise canonical asset rebasing through the real old/new API handoff.
+    let asset_path = state_root.join("owner-fixture-initial.ovf");
+    std::fs::write(&asset_path, b"# OOMMF OVF 2.0\n# Segment count: 1\n# Begin: Segment\n# Begin: Header\n# meshtype: rectangular\n# meshunit: m\n# valuedim: 3\n# valuelabels: m_x m_y m_z\n# valueunits: 1 1 1\n# xmin: 0\n# ymin: 0\n# zmin: 0\n# xmax: 1e-9\n# ymax: 1e-9\n# zmax: 1e-9\n# xbase: 5e-10\n# ybase: 5e-10\n# zbase: 5e-10\n# xstepsize: 1e-9\n# ystepsize: 1e-9\n# zstepsize: 1e-9\n# xnodes: 1\n# ynodes: 1\n# znodes: 1\n# End: Header\n# Begin: Data Text\n1 0 0\n# End: Data Text\n# End: Segment\n")?;
+    scene["magnetization_assets"] = serde_json::json!([{
+        "id": "owner-fixture-initial", "name": "Owner fixture initial M", "kind": "sampled",
+        "source_path": asset_path, "source_format": "ovf"
+    }]);
+    client
+        .put(format!("{url}/v2/sessions/current/model/scene"))
+        .json(&scene)
+        .send()?
+        .error_for_status()?;
+    let scene: serde_json::Value = client
+        .get(format!("{url}/v2/sessions/current/model/scene"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let mut acquisition = owner.acquire(&uuid::Uuid::new_v4().to_string())?;
+    if acquisition.workspace().get("scene_document") != Some(&scene) {
+        bail!("development owner did not preserve the canonical authoring scene");
+    }
+    let identity = acquisition.workspace()["identity"].clone();
+    let scene_staged = acquisition.stage_handoff(
+        &root,
+        &candidate,
+        &serde_json::json!({
+            "api_instance_id":instance, "session_id":identity["session_id"],
+            "session_epoch":identity["session_epoch"], "editor":{"probe":"scene"},
+            "workspace":{}, "project_document":{}
+        }),
+    )?;
+    if scene_staged.acknowledgement["workspace_state"] != "session" {
+        bail!("canonical scene CLI capsule staging lost its session");
+    }
+    let scene_checked = acquisition.revalidate_staged_handoff(&root, &scene_staged)?;
+    if scene_checked.acknowledgement != scene_staged.acknowledgement {
+        bail!("scene capsule commit preparation changed its acknowledgement");
+    }
+    let scene_idle = acquisition.acquire_cold_idle(&scene_checked, &accepted_store)?;
+    scene_idle.verify_current()?;
+    scene_idle.release_fence()?; // Explicit fixture abort, never failure-path cleanup.
+    acquisition.confirm_held()?;
+    let service_config_path = std::env::var_os("FULLMAG_DEVELOPMENT_OWNER_PROBE_SERVICE_CONFIG")
+        .context("owned CLI probe requires its isolated service configuration")?;
+    let service_config = fullmag_session::runtime_service::RuntimeServiceConfig::read(
+        &std::path::PathBuf::from(service_config_path),
+    )?;
+    let service_owner = fullmag_runtime_control::runtime_service_client::probe(
+        &service_config.store_root,
+        &service_config.target_id,
+        5,
+    )?;
+    let unbound_error = acquisition
+        .drain_global_idle(&scene_staged, &service_owner, &service_config, 5)
+        .err()
+        .context("global idle drain accepted a store not bound to this API")?;
+    if !unbound_error
+        .to_string()
+        .contains("API accepted-store binding mismatch")
+    {
+        bail!("global idle refusal did not reach the API store binding check: {unbound_error}");
+    }
+    if acquisition.confirm_held().is_ok() {
+        bail!("failed global idle handoff retained a usable acquisition");
+    }
+    drop(acquisition);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let response = client
+            .put(format!("{url}/v2/sessions/current/model/scene"))
+            .json(&scene)
+            .send()?;
+        if response.status().is_success() {
+            break;
+        }
+        if response.status().as_u16() != 409 || Instant::now() >= deadline {
+            bail!("development owner disconnect did not reopen mutation admission");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Confirmations must not extend the API's absolute acquisition lifetime.
+    // Observe the real deadline in this owned production fixture, without
+    // altering a running user's workspace or overriding server timeouts.
+    let mut expiring = owner.acquire(&uuid::Uuid::new_v4().to_string())?;
+    let expiry_started = Instant::now();
+    while expiry_started.elapsed() < Duration::from_secs(31) {
+        if expiring.confirm_held().is_err() {
+            if expiry_started.elapsed() < Duration::from_secs(28) {
+                bail!("development owner acquisition expired before its hold deadline");
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    if expiring.confirm_held().is_ok() {
+        bail!("development owner confirmation renewed an expired acquisition");
+    }
+    // The earlier successful PUT advanced the canonical scene revision.
+    // Read it back so an optimistic-revision conflict cannot masquerade as
+    // admission remaining frozen after expiry.
+    let current_scene: serde_json::Value = client
+        .get(format!("{url}/v2/sessions/current/model/scene"))
+        .send()?
+        .error_for_status()?
+        .json()?;
+    let reopened = client
+        .put(format!("{url}/v2/sessions/current/model/scene"))
+        .json(&current_scene)
+        .send()?;
+    if !reopened.status().is_success() {
+        bail!(
+            "expired development owner acquisition did not reopen admission: {}",
+            reopened.status()
+        );
+    }
+    let mut foreign_staging = owner.acquire(&uuid::Uuid::new_v4().to_string())?;
+    let foreign_error = foreign_staging
+        .drain_global_idle(&scene_staged, &service_owner, &service_config, 5)
+        .err()
+        .context("global idle handoff accepted staging from another acquisition")?;
+    if !foreign_error
+        .to_string()
+        .contains("staged handoff does not belong to this API acquisition")
+        || foreign_staging.confirm_held().is_ok()
+    {
+        bail!("global idle handoff accepted staging from another acquisition");
+    }
+    let mut foreign_commit = owner.acquire(&uuid::Uuid::new_v4().to_string())?;
+    let commit_error = foreign_commit
+        .revalidate_staged_handoff(&root, &scene_staged)
+        .err()
+        .context("commit preparation accepted staging from another acquisition")?;
+    if !commit_error
+        .to_string()
+        .contains("staged handoff does not belong to this API acquisition")
+        || foreign_commit.confirm_held().is_ok()
+    {
+        bail!("commit preparation retained a foreign acquisition");
+    }
+    let mut rejection_helpers = Vec::new();
+    for case in [
+        "missing_fence",
+        "snapshot",
+        "target",
+        "candidate",
+        "candidate_manifest",
+        "handoff",
+    ] {
+        let mut probe_acquisition = owner.acquire(&uuid::Uuid::new_v4().to_string())?;
+        let probe_identity = probe_acquisition.workspace()["identity"].clone();
+        let probe_staged = probe_acquisition.stage_handoff(
+            &root,
+            &candidate,
+            &serde_json::json!({
+                "api_instance_id":instance,"session_id":probe_identity["session_id"],
+                "session_epoch":probe_identity["session_epoch"],"editor":{"probe":"scene"},
+                "workspace":{},"project_document":{},
+            }),
+        )?;
+        rejection_helpers
+            .push(serde_json::json!({"pid":probe_staged.helper_pid,"waited":true,"exit_code":0}));
+        let idle = if case == "missing_fence" {
+            None
+        } else {
+            Some(probe_acquisition.acquire_cold_idle(&probe_staged, &accepted_store)?)
+        };
+        probe_acquisition.probe_rejected_cold_commit(&probe_staged, case)?;
+        let store = fullmag_session::SessionStore::open_existing(accepted_store.clone())?;
+        if store.read_development_handoff_commit()?.is_some() {
+            bail!("rejected API commit published acceptance");
+        }
+        if let Some(idle) = idle {
+            idle.release_fence()?;
+        } // Explicit fixture abort after confirmed rejection.
+        if client
+            .get(format!("{url}/v2/sessions/current/model/scene"))
+            .send()?
+            .status()
+            .as_u16()
+            != 200
+        {
+            bail!("rejected cold commit did not reopen authoring admission");
+        }
+    }
+    let mut guarded_api = ControlRoomGuard::active(api_port(), Some(child.release().0), None);
+    guarded_api.adopt_development_owner(owner)?;
+    let mut native_replacement = serde_json::Value::Null;
+    let (
+        accepted,
+        committed_handoff,
+        commit_acknowledgement,
+        readback_helper_pid,
+        final_stage_helper_pid,
+        terminal,
+    ) = if launch_replacement {
+        let request = fullmag_session::development_restart_transport::RestartRequest {
+            schema: fullmag_session::development_restart_transport::RESTART_REQUEST_SCHEMA
+                .to_owned(),
+            request_id: uuid::Uuid::new_v4().to_string(),
+            status_token_sha256: "d".repeat(64),
+            old_api_instance_id: instance.clone(),
+            generation_id: scene_staged.acknowledgement["binding"]["generation_id"]
+                .as_str()
+                .context("scene staging has no generation pin")?
+                .to_owned(),
+            session_id: scene_staged.acknowledgement["binding"]["session_id"]
+                .as_str()
+                .map(str::to_owned),
+            session_epoch: scene_staged.acknowledgement["binding"]["session_epoch"]
+                .as_u64()
+                .context("scene staging has no session epoch")?,
+            editor: serde_json::json!({"probe":"scene"}),
+            workspace: serde_json::json!({}),
+            project_document: serde_json::json!({}),
+        };
+        let input = DevelopmentRestartInput {
+            request: &request,
+            candidate_bundle_root: &candidate,
+        };
+        let restarted = if lose_commit_ack {
+            guarded_api.restart_development_api_lost_ack_probe(
+                &root,
+                input,
+                Duration::from_secs(20),
+                emit_development_restart_probe_progress,
+            )?
+        } else {
+            guarded_api.restart_development_api(
+                &root,
+                input,
+                Duration::from_secs(20),
+                emit_development_restart_probe_progress,
+            )?
+        };
+        let readback_helper_pid = restarted
+            .readback_helper_pid
+            .context("managed commit probe must observe the waited readback helper")?;
+        let exposed_scene: serde_json::Value = client
+            .get(format!("{url}/v2/sessions/current/model/scene"))
+            .header("x-fullmag-api-instance", &restarted.new_api_instance_id)
+            .send()?
+            .error_for_status()?
+            .json()?;
+        if fullmag_session::canonical_json_sha256(&exposed_scene) != restarted.scene_document_sha256
+        {
+            bail!("native replacement HTTP exposed a different authoring scene");
+        }
+        if client
+            .put(format!("{url}/v2/sessions/current/model/scene"))
+            .header("x-fullmag-api-instance", &restarted.new_api_instance_id)
+            .json(&exposed_scene)
+            .send()?
+            .status()
+            .as_u16()
+            != 200
+        {
+            bail!("native replacement completion did not reopen authoring mutation");
+        }
+        let replacement_supervisor = guarded_api.development_supervisor_mut()?;
+        replacement_supervisor.shutdown()?; // Only this fixture, no compute was submitted.
+        let replacement_terminal = replacement_supervisor
+            .terminal_status()
+            .context("native replacement fixture shutdown has no waited terminal outcome")?;
+        native_replacement = serde_json::json!({
+            "schema":"fullmag.development-cli-native-replacement-check.v1",
+            "restored_scene_document":exposed_scene,
+            "receipt":restarted.replacement, "waited":true,"exit_code":replacement_terminal.code(),
+            "termination_reason":"owned verifier replacement cleanup; no compute submitted",
+            "checks":["native-supervisor-prepares-accepted-capsule", "native-supervisor-spawns-sealed-candidate",
+                "native-supervisor-confirms-fresh-owner", "native-supervisor-restores-exact-authoring",
+                "native-supervisor-completes-admission", "native-supervisor-http-mutation-reopened",
+                "native-supervisor-waits-replacement-fixture"]
+        });
+        (
+            restarted.accepted,
+            restarted.staged_acknowledgement,
+            restarted.commit_acknowledgement,
+            readback_helper_pid,
+            restarted.stage_helper_pid,
+            restarted.old_api_terminal,
+        )
+    } else {
+        let mut final_acquisition = guarded_api
+            .development_supervisor_mut()?
+            .owner()
+            .acquire(&uuid::Uuid::new_v4().to_string())?;
+        let final_identity = final_acquisition.workspace()["identity"].clone();
+        let final_staged = final_acquisition.stage_handoff(
+            &root,
+            &candidate,
+            &serde_json::json!({
+                "api_instance_id":instance,"session_id":final_identity["session_id"],
+                "session_epoch":final_identity["session_epoch"],"editor":{"probe":"scene"},
+                "workspace":{},"project_document":{},
+            }),
+        )?;
+        let final_idle = final_acquisition.acquire_cold_idle(&final_staged, &accepted_store)?;
+        let outcome = {
+            let supervisor = guarded_api.development_supervisor_mut()?;
+            if lose_commit_ack {
+                supervisor.commit_and_wait_lost_ack_probe(
+                    &root,
+                    &mut final_acquisition,
+                    &final_staged,
+                    &final_idle,
+                    &accepted_store,
+                    Duration::from_secs(20),
+                )?
+            } else {
+                supervisor.commit_and_wait(
+                    &root,
+                    &mut final_acquisition,
+                    &final_staged,
+                    &final_idle,
+                    &accepted_store,
+                    Duration::from_secs(20),
+                )?
+            }
+        };
+        println!(
+            "{}",
+            serde_json::json!({
+                "schema":"fullmag.development-cli-owned-api-exit.v1", "api_pid":pid,
+                "waited":true,"exit_code":outcome.terminal.code(),"durable_commit_reconciled":true,
+            })
+        );
+        let helper_pid = outcome
+            .readback_helper_pid
+            .context("managed commit probe must observe the waited readback helper")?;
+        drop(final_idle); // Kernel reservations release; durable fence remains closed.
+        (
+            outcome.accepted,
+            final_staged.acknowledgement,
+            outcome.acknowledgement,
+            helper_pid,
+            final_staged.helper_pid,
+            outcome.terminal,
+        )
+    };
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema":"fullmag.development-cli-owner-check.v1", "api_pid":pid,
+            "native_replacement":native_replacement,
+            "api_instance_id":instance, "api_waited":true,
+            "accepted_store_binding":fullmag_runtime_control::accepted_store::store_binding(&accepted_store),
+            "commit_acknowledgement_observed":commit_acknowledgement.is_some(),
+            "commit_reconciliation":"durable_record_confirmed_after_owned_api_exit",
+            "durable_commit_reconciled":true,
+            "graceful_commit":commit_acknowledgement,
+            "durable_commit":{
+                "schema":accepted.schema,
+                "api_instance_id":accepted.api_instance_id,
+                "acquisition_nonce":accepted.acquisition_nonce,
+                "handoff_id":accepted.handoff_id,
+                "snapshot_sha256":accepted.snapshot_sha256,
+                "target_build_id":accepted.target_build_id,
+                "accepted_store_binding":accepted.accepted_store_binding,
+            },
+            "committed_handoff":committed_handoff,
+            "graceful_exit":true,"durable_fence_retained":!launch_replacement,
+            "capsule_receipt_state":"staged",
+            "commit_rejection_helpers":rejection_helpers,
+            "handoffs":[empty_staged.acknowledgement,scene_staged.acknowledgement],
+            "stage_helpers":[
+                {"pid":empty_staged.helper_pid,"waited":true,"exit_code":0},
+                {"pid":scene_staged.helper_pid,"waited":true,"exit_code":0},
+                {"pid":empty_checked.helper_pid,"waited":true,"exit_code":0},
+                {"pid":scene_checked.helper_pid,"waited":true,"exit_code":0},
+                {"pid":final_stage_helper_pid,"waited":true,"exit_code":0},
+                {"pid":readback_helper_pid,"waited":true,"exit_code":0}
+            ],
+            "api_exit_code":terminal.code(), "checks":["production-supervisor-owned-api-custody",
+            "production-supervisor-commit-exit-reconciled", "owned-api-discovery",
+            "static-script-owner-disabled", "unscoped-store-location-preserved",
+            "invalid-scoped-store-no-fallback", "foreign-child-refused", "foreign-token-refused",
+            "invalid-acquisition-nonce-refused", "empty-authoring-acquired", "http-admission-frozen",
+            "abort-reopened-admission", "canonical-scene-acquired", "disconnect-reopened-admission",
+            "held-confirmation-preserves-freeze", "confirmation-does-not-renew-expiry",
+            "expired-confirmation-refused", "expired-acquisition-reopens-admission",
+            "empty-capsule-production-stdin-consumer", "scene-capsule-production-stdin-consumer",
+            "empty-capsule-precommit-readback", "scene-capsule-precommit-readback",
+            "empty-staged-bound-api-cold-idle", "scene-staged-bound-api-cold-idle",
+            "global-idle-unbound-api-store-refused", "failed-global-idle-invalidates-acquisition",
+            "global-idle-foreign-staging-refused", "precommit-foreign-staging-invalidates-acquisition",
+            "cold-commit-private-api-consumer", "cold-commit-owned-api-graceful-exit",
+            "cold-commit-exit-matches-durable-acceptance", "cold-commit-drop-retains-fence",
+            "cold-commit-missing-fence-refused", "cold-commit-wrong-snapshot-refused",
+            "cold-commit-wrong-target-refused", "cold-commit-foreign-candidate-refused",
+            "cold-commit-changed-candidate-manifest-refused",
+            "cold-commit-foreign-capsule-refused"]
+        })
+    );
+    Ok(())
+}
+
+/// Managed verifier only: accept an opaque handoff reference in its own store.
+/// This proves the durable latch, not capsule validation or process shutdown.
+pub(crate) fn verify_development_handoff_commit(
+    store_root: &Path,
+    corrupt_root: &Path,
+) -> Result<()> {
+    if std::env::var("FULLMAG_DEVELOPMENT_HANDOFF_COMMIT_PROBE").as_deref() != Ok("1") {
+        bail!("development handoff commit verification requires an explicit managed fixture");
+    }
+    let store = fullmag_session::SessionStore::open_existing(store_root.to_path_buf())?;
+    let owner = uuid::Uuid::new_v4().simple().to_string();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let fence = store.acquire_development_idle_fence(&owner, &nonce)?;
+    let api = uuid::Uuid::new_v4().to_string();
+    let handoff = uuid::Uuid::new_v4().to_string();
+    let snapshot = "a".repeat(64);
+    let target = "b".repeat(64);
+    let binding = fullmag_runtime_control::accepted_store::store_binding(store_root)
+        .context("handoff commit fixture binding is invalid")?;
+    let wrong_binding = "0".repeat(64);
+    for (selected_api, selected_handoff, selected_snapshot, selected_target, selected_binding) in [
+        (
+            "invalid",
+            handoff.as_str(),
+            snapshot.as_str(),
+            target.as_str(),
+            binding.as_str(),
+        ),
+        (
+            api.as_str(),
+            "00000000-0000-0000-0000-000000000000",
+            snapshot.as_str(),
+            target.as_str(),
+            binding.as_str(),
+        ),
+        (
+            api.as_str(),
+            handoff.as_str(),
+            "bad",
+            target.as_str(),
+            binding.as_str(),
+        ),
+        (
+            api.as_str(),
+            handoff.as_str(),
+            snapshot.as_str(),
+            "bad",
+            binding.as_str(),
+        ),
+        (
+            api.as_str(),
+            handoff.as_str(),
+            snapshot.as_str(),
+            target.as_str(),
+            "bad",
+        ),
+        (
+            api.as_str(),
+            handoff.as_str(),
+            snapshot.as_str(),
+            target.as_str(),
+            wrong_binding.as_str(),
+        ),
+    ] {
+        if store
+            .accept_development_handoff(
+                &fence,
+                selected_api,
+                selected_handoff,
+                selected_snapshot,
+                selected_target,
+                selected_binding,
+            )
+            .is_ok()
+            || store.read_development_handoff_commit()?.is_some()
+        {
+            bail!("invalid handoff commit identity was published");
+        }
+    }
+    let mut foreign_fence = fence.clone();
+    foreign_fence.nonce = uuid::Uuid::new_v4().to_string();
+    if store
+        .accept_development_handoff(&foreign_fence, &api, &handoff, &snapshot, &target, &binding)
+        .is_ok()
+    {
+        bail!("handoff commit accepted another admission fence");
+    }
+    let record =
+        store.accept_development_handoff(&fence, &api, &handoff, &snapshot, &target, &binding)?;
+    if store.read_development_handoff_commit()?.as_ref() != Some(&record)
+        || store
+            .accept_development_handoff(&fence, &api, &handoff, &snapshot, &target, &binding)
+            .is_ok()
+        || store.release_development_idle_fence(&fence).is_ok()
+        || store.read_development_idle_fence()?.as_ref() != Some(&fence)
+    {
+        bail!("accepted handoff did not retain its one-shot durable fence");
+    }
+    drop(store);
+    let reopened = fullmag_session::SessionStore::open_existing(store_root.to_path_buf())?;
+    if reopened.read_development_handoff_commit()?.as_ref() != Some(&record)
+        || reopened.release_development_idle_fence(&fence).is_ok()
+    {
+        bail!("handoff acceptance did not survive store reopen");
+    }
+    if std::fs::canonicalize(store_root)? == std::fs::canonicalize(corrupt_root)? {
+        bail!("corrupt commit fixture must use its own distinct store");
+    }
+    let corrupt = fullmag_session::SessionStore::open_existing(corrupt_root.to_path_buf())?;
+    let corrupt_fence =
+        corrupt.acquire_development_idle_fence(&owner, &uuid::Uuid::new_v4().to_string())?;
+    let corrupt_path = fullmag_session::repository_path::checked_path(
+        corrupt_root,
+        "development/HANDOFF-COMMIT.json",
+    )?;
+    let mut corrupt_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(corrupt_path)?;
+    use std::io::Write;
+    corrupt_file.write_all(b"{incomplete fixture publication")?;
+    corrupt_file.sync_all()?;
+    drop(corrupt_file);
+    let corrupt_binding = fullmag_runtime_control::accepted_store::store_binding(corrupt_root)
+        .context("corrupt fixture binding is invalid")?;
+    if corrupt.read_development_handoff_commit().is_ok()
+        || corrupt
+            .release_development_idle_fence(&corrupt_fence)
+            .is_ok()
+        || corrupt
+            .accept_development_handoff(
+                &corrupt_fence,
+                &api,
+                &handoff,
+                &snapshot,
+                &target,
+                &corrupt_binding,
+            )
+            .is_ok()
+        || corrupt.read_development_idle_fence()?.as_ref() != Some(&corrupt_fence)
+    {
+        bail!("corrupt commit publication did not retain its durable fence");
+    }
+    let completion_checks = verify_development_completion_storage(&reopened, &record)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema":"fullmag.development-handoff-commit-check.v1", "accepted":true,
+            "invalid_identities_refused":true,"foreign_fence_refused":true,
+            "repeat_refused":true,"abort_release_refused":true,"reopen_preserved":true,
+            "corrupt_publication_refused":true,"corrupt_abort_release_refused":true,
+            "record_sha256":fullmag_session::canonical_json_sha256(&serde_json::to_value(&record)?),
+            "completion_storage_checks":completion_checks,
+        })
+    );
+    Ok(())
+}
+
+/// Exercise the production journal only in the explicitly managed disposable
+/// commit fixture. These synthetic pins do not prove live replacement readiness.
+fn verify_development_completion_storage(
+    store: &fullmag_session::SessionStore,
+    commit: &fullmag_session::store::DevelopmentHandoffCommit,
+) -> Result<Vec<&'static str>> {
+    use fullmag_session::store::DevelopmentReplacementIdentity;
+    let replacement = DevelopmentReplacementIdentity {
+        api_instance_id: uuid::Uuid::new_v4().to_string(),
+        session_id: Some("completion-fixture-session".into()),
+        session_epoch: 1,
+        scene_document_sha256: "c".repeat(64),
+        target_build_id: commit.target_build_id.clone(),
+        accepted_store_binding: commit.accepted_store_binding.clone(),
+    };
+    for change in 0..5 {
+        let mut invalid = replacement.clone();
+        match change {
+            0 => invalid.api_instance_id = commit.api_instance_id.clone(),
+            1 => invalid.session_epoch = 0,
+            2 => invalid.scene_document_sha256 = "invalid".into(),
+            3 => invalid.target_build_id = "d".repeat(64),
+            _ => invalid.accepted_store_binding = "e".repeat(64),
+        }
+        if store
+            .prepare_development_handoff_completion(commit, &invalid)
+            .is_ok()
+            || store.read_development_handoff_completion()?.is_some()
+        {
+            bail!("invalid development completion identity was published");
+        }
+    }
+    let launch =
+        fullmag_session::runtime_service::RuntimeServiceLaunchGuard::try_acquire(store.root())?
+            .context("completion fixture launch guard is already held")?;
+    if store
+        .prepare_development_handoff_completion(commit, &replacement)
+        .is_ok()
+        || store.read_development_handoff_completion()?.is_some()
+    {
+        bail!("completion ignored an active launch reservation");
+    }
+    drop(launch);
+    let startup =
+        fullmag_session::runtime_service_startup::RuntimeServiceStartupGuard::try_acquire(
+            store.root(),
+        )?
+        .context("completion fixture startup guard is already held")?;
+    if store
+        .prepare_development_handoff_completion(commit, &replacement)
+        .is_ok()
+        || store.read_development_handoff_completion()?.is_some()
+    {
+        bail!("completion ignored an active direct startup reservation");
+    }
+    drop(startup);
+    let authorization = store.prepare_development_handoff_completion(commit, &replacement)?;
+    if store.prepare_development_handoff_completion(commit, &replacement)? != authorization
+        || store.assert_development_admission_open().is_ok()
+        || store.release_development_idle_fence(&commit.fence).is_ok()
+        || store
+            .acquire_development_idle_fence("other-owner", "other-nonce")
+            .is_ok()
+    {
+        bail!("pending completion did not retain its admission gates");
+    }
+    let mut foreign = authorization.clone();
+    foreign.replacement.api_instance_id = uuid::Uuid::new_v4().to_string();
+    if store
+        .finish_development_handoff_completion(&foreign)
+        .is_ok()
+        || store.read_development_handoff_completion()?.as_ref() != Some(&authorization)
+    {
+        bail!("foreign completion changed the pending authorization");
+    }
+    let history_relative = format!(
+        "development/completion-authorizations/{}.json",
+        commit.handoff_id
+    );
+    let history = fullmag_session::repository_path::checked_path(store.root(), &history_relative)?;
+    let original_history = std::fs::read(&history)?;
+    std::fs::write(&history, b"{corrupt fixture history")?;
+    if store
+        .prepare_development_handoff_completion(commit, &replacement)
+        .is_ok()
+        || store
+            .finish_development_handoff_completion(&authorization)
+            .is_ok()
+        || std::fs::read(&history)? != b"{corrupt fixture history"
+        || store.assert_development_admission_open().is_ok()
+    {
+        bail!("corrupt completion history was overwritten or opened admission");
+    }
+    std::fs::write(&history, original_history)?; // Restore only the fixture's own bytes.
+                                                 // Simulate interruption between pending and history publication. Only the
+                                                 // fixture's own history is removed; prepare must recover from exact pending.
+    std::fs::remove_file(&history)?;
+    if store
+        .finish_development_handoff_completion(&authorization)
+        .is_ok()
+        || store.assert_development_admission_open().is_ok()
+        || store.prepare_development_handoff_completion(commit, &replacement)? != authorization
+    {
+        bail!("missing completion history was not recovered explicitly");
+    }
+    // Simulate both retirement boundaries. Pending alone must still fence all
+    // work and service startup after a process/store reopen.
+    let commit_path = fullmag_session::repository_path::checked_path(
+        store.root(),
+        "development/HANDOFF-COMMIT.json",
+    )?;
+    std::fs::remove_file(&commit_path)?;
+    if store.assert_development_admission_open().is_ok() {
+        bail!("commit retirement reopened admission early");
+    }
+    let fence_path = fullmag_session::repository_path::checked_path(
+        store.root(),
+        "development/ADMISSION-FENCE.json",
+    )?;
+    std::fs::remove_file(&fence_path)?;
+    let reopened = fullmag_session::SessionStore::open_existing(store.root().to_path_buf())?;
+    if reopened.assert_development_admission_open().is_ok()
+        || fullmag_session::runtime_service::RuntimeServiceOwner::acquire(
+            &reopened,
+            "completion-probe",
+        )
+        .is_ok()
+    {
+        bail!("pending journal alone did not fence admission and service startup");
+    }
+    reopened.finish_development_handoff_completion(&authorization)?;
+    reopened.assert_development_admission_open()?;
+    let history_bytes = std::fs::read(&history)?;
+    if reopened.read_development_handoff_commit()?.is_some()
+        || reopened.read_development_idle_fence()?.is_some()
+        || reopened.read_development_handoff_completion()?.is_some()
+        || reopened.finish_development_handoff_completion(&authorization)? != authorization
+        || std::fs::read(&history)? != history_bytes
+    {
+        bail!("completion did not preserve immutable history and reopen admission");
+    }
+    let pending_path = fullmag_session::repository_path::checked_path(
+        store.root(),
+        "development/HANDOFF-COMPLETION.json",
+    )?;
+    let mut malformed = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending_path)?;
+    malformed.write_all(b"{interrupted completion fixture")?;
+    malformed.sync_all()?;
+    drop(malformed);
+    if reopened.assert_development_admission_open().is_ok()
+        || reopened
+            .acquire_development_idle_fence("other-owner", "other-nonce")
+            .is_ok()
+        || reopened
+            .finish_development_handoff_completion(&authorization)
+            .is_ok()
+    {
+        bail!("malformed pending completion was treated as open admission");
+    }
+    std::fs::remove_file(&pending_path)?; // Only this deliberately malformed fixture.
+    let next_fence = reopened.acquire_development_idle_fence(
+        &uuid::Uuid::new_v4().simple().to_string(),
+        &uuid::Uuid::new_v4().to_string(),
+    )?;
+    if reopened
+        .finish_development_handoff_completion(&authorization)
+        .is_ok()
+        || reopened.read_development_idle_fence()?.as_ref() != Some(&next_fence)
+    {
+        bail!("old completion affected a newer restart fence");
+    }
+    let next = reopened.accept_development_handoff(
+        &next_fence,
+        &replacement.api_instance_id,
+        &uuid::Uuid::new_v4().to_string(),
+        &"f".repeat(64),
+        &commit.target_build_id,
+        &commit.accepted_store_binding,
+    )?;
+    let mut next_replacement = replacement;
+    next_replacement.api_instance_id = uuid::Uuid::new_v4().to_string();
+    next_replacement.session_id = Some("completion-fixture-second-session".into());
+    let next_authorization =
+        reopened.prepare_development_handoff_completion(&next, &next_replacement)?;
+    reopened.finish_development_handoff_completion(&next_authorization)?;
+    reopened.assert_development_admission_open()?;
+    if reopened
+        .read_development_handoff_completion_authorization(&commit.handoff_id)?
+        .as_ref()
+        != Some(&authorization)
+        || reopened
+            .read_development_handoff_completion_authorization(&next.handoff_id)?
+            .as_ref()
+            != Some(&next_authorization)
+    {
+        bail!("repeated restart did not preserve both authorization records");
+    }
+    Ok(vec![
+        "invalid-replacement-refused",
+        "startup-reservation-refused",
+        "pending-admission-and-abort-fenced",
+        "foreign-finish-refused",
+        "corrupt-history-preserved",
+        "missing-history-explicit-recovery",
+        "commit-retirement-still-fenced",
+        "pending-only-reopen-and-startup-fenced",
+        "partial-retirement-explicit-finish",
+        "idempotent-readonly-finish",
+        "malformed-pending-refused",
+        "newer-restart-preserved",
+        "two-complete-store-cycles",
+    ])
+}
+
+/// Managed verifier only: drain the explicitly selected isolated service.
+/// The production client's exact owner/config/fence validation is exercised;
+/// this receipt makes no claim about API shutdown or a workspace replacement.
+pub(crate) fn verify_development_service_drain(config_path: &std::path::Path) -> Result<()> {
+    if std::env::var("FULLMAG_DEVELOPMENT_SERVICE_DRAIN_PROBE").as_deref() != Ok("1") {
+        bail!("development service drain verification requires an explicit managed fixture");
+    }
+    let config = fullmag_session::runtime_service::RuntimeServiceConfig::read(config_path)?;
+    let owner = fullmag_runtime_control::runtime_service_client::probe(
+        &config.store_root,
+        &config.target_id,
+        5,
+    )?;
+    let proof =
+        fullmag_runtime_control::runtime_service_client::drain_idle_confirmed(&owner, &config, 10)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema":"fullmag.development-service-idle-check.v1",
+            "service_pid":proof.owner.pid, "state":proof.owner.state,
+            "owner_sha256":fullmag_session::canonical_json_sha256(&serde_json::to_value(&proof.owner)?),
+            "children":proof.owner.children, "fence_nonce":proof.admission_fence.nonce,
+            "fence_sha256":fullmag_session::canonical_json_sha256(
+                &serde_json::to_value(&proof.admission_fence)?),
+        })
+    );
+    Ok(())
+}
+
+/// Exercise the production reservation and direct service startup in a managed
+/// fixture. No live API is shut down or replaced by this diagnostic.
+pub(crate) fn verify_development_cold_idle(config_path: &Path) -> Result<()> {
+    if std::env::var("FULLMAG_DEVELOPMENT_COLD_IDLE_PROBE").as_deref() != Ok("1") {
+        bail!("development cold idle verification requires an explicit managed fixture");
+    }
+    let config = fullmag_session::runtime_service::RuntimeServiceConfig::read(config_path)?;
+    let owner = uuid::Uuid::new_v4().simple().to_string();
+    let nonce = uuid::Uuid::new_v4().to_string();
+    // Concurrent first acquisition must leave one complete stable descriptor,
+    // never an empty inode that poisons subsequent service startup.
+    if config
+        .store_root
+        .join("runtime-services/STARTUP-GATE.lock")
+        .exists()
+    {
+        bail!("cold idle concurrency fixture requires an uninitialized startup gate");
+    }
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let mut contenders = Vec::new();
+    for _ in 0..8 {
+        let barrier = barrier.clone();
+        let root = config.store_root.clone();
+        contenders.push(std::thread::spawn(move || -> Result<bool> {
+            barrier.wait();
+            match fullmag_session::runtime_service_startup::RuntimeServiceStartupGuard::try_acquire(
+                &root,
+            ) {
+                Ok(Some(guard)) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    drop(guard);
+                    Ok(true)
+                }
+                Ok(None) => Ok(false),
+                Err(error)
+                    if error
+                        .downcast_ref::<fullmag_session::StoreWriterBusy>()
+                        .is_some() =>
+                {
+                    Ok(false)
+                }
+                Err(error) => Err(error),
+            }
+        }));
+    }
+    let mut acquired = 0;
+    let mut contention_error = None;
+    for contender in contenders {
+        match contender.join() {
+            Ok(Ok(true)) => acquired += 1,
+            Ok(Ok(false)) => {}
+            Ok(Err(error)) => contention_error = Some(error),
+            Err(_) => contention_error = Some(anyhow::anyhow!("cold startup contender panicked")),
+        }
+    }
+    if let Some(error) = contention_error {
+        return Err(error);
+    }
+    if acquired == 0 {
+        bail!("cold startup fixture did not acquire the initial gate");
+    }
+    let proof = fullmag_runtime_control::development_cold_idle::acquire_cold_idle_fence(
+        &config.store_root,
+        &owner,
+        &nonce,
+    )?;
+    proof.verify_current()?;
+    let fence = proof.admission_fence.clone();
+    let service = std::env::current_exe()?.with_file_name(if cfg!(windows) {
+        "fullmag-runtime-service.exe"
+    } else {
+        "fullmag-runtime-service"
+    });
+    let blocked_start = |expected: &str| -> Result<serde_json::Value> {
+        let log_path =
+            config_path.with_file_name(format!("cold-start-{}.log", uuid::Uuid::new_v4()));
+        let stderr = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&log_path)?;
+        let mut command = ProcessCommand::new(&service);
+        command
+            .arg("--config")
+            .arg(config_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x0800_0000);
+        }
+        let mut child = BootstrapProcessGuard::new(ChildProcess(command.spawn()?));
+        let pid = child.process_mut().0.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.process_mut().0.try_wait()? {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!("cold idle fixture service did not terminate before the deadline");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        };
+        child.release();
+        if std::fs::metadata(&log_path)?.len() > 65536 {
+            bail!("cold idle fixture stderr exceeded its bound");
+        }
+        let stderr = std::fs::read_to_string(&log_path)?;
+        if status.success() || !stderr.contains(expected) {
+            bail!("cold idle fixture did not refuse the specific protected startup");
+        }
+        Ok(serde_json::json!({"pid":pid,"waited":true,"exit_code":status.code()}))
+    };
+    let reserved = blocked_start("runtime service startup is reserved by another operation")?;
+    proof.verify_current()?;
+    drop(proof);
+    let fenced =
+        blocked_start("runtime service startup refused while development admission is closed")?;
+    let store = fullmag_session::SessionStore::open_existing(config.store_root.clone())?;
+    if store.read_development_idle_fence()?.as_ref() != Some(&fence) {
+        bail!("cold idle fixture lost the durable fence after reservation drop");
+    }
+    // Explicit fixture abort, never an implicit failure-path cleanup.
+    store.release_development_idle_fence(&fence)?;
+    let repeated = fullmag_runtime_control::development_cold_idle::acquire_cold_idle_fence(
+        &config.store_root,
+        &owner,
+        &uuid::Uuid::new_v4().to_string(),
+    )?;
+    repeated.release_fence()?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "schema":"fullmag.development-cold-idle-check.v1",
+            "children":[reserved,fenced], "fence_nonce":nonce,
+            "fence_sha256":fullmag_session::canonical_json_sha256(&serde_json::to_value(&fence)?),
+            "explicit_abort":true,"reacquired":true,
+        "initialization_contenders":8,"initialization_acquired":acquired,
+        })
+    );
+    Ok(())
+}
+
 pub(crate) fn which_opener() -> Result<String> {
-    let candidates: &[&str] = if is_wsl_environment() {
+    let candidates: &[&str] = if cfg!(windows) {
+        &["cmd.exe"]
+    } else if is_wsl_environment() {
         &[
             "wslview",
             "cmd.exe",
@@ -2096,6 +4883,18 @@ fn browser_open_args(opener: &str, url: &str) -> Vec<String> {
     vec![url.to_string()]
 }
 
+#[cfg(windows)]
+pub(crate) fn command_exists(cmd: &str) -> bool {
+    ProcessCommand::new("where.exe")
+        .arg(cmd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(not(windows))]
 pub(crate) fn command_exists(cmd: &str) -> bool {
     ProcessCommand::new("which")
         .arg(cmd)
@@ -2107,8 +4906,18 @@ pub(crate) fn command_exists(cmd: &str) -> bool {
 }
 
 pub(crate) fn repo_root() -> PathBuf {
+    if let Some(root) = std::env::current_exe().ok().and_then(|executable| {
+        fullmag_runtime_control::python_runtime::packaged_windows_root(&executable)
+    }) {
+        return root;
+    }
     if let Some(root) = std::env::var_os("FULLMAG_REPO_ROOT") {
         return PathBuf::from(root);
+    }
+    if let Ok(self_exe) = std::env::current_exe() {
+        if let Some(install_root) = packaged_install_root(&self_exe) {
+            return install_root;
+        }
     }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()

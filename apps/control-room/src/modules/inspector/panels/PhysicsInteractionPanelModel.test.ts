@@ -12,6 +12,8 @@ import {
   interactionSelectOptions,
   isWritableObjectInteraction,
   isWritableStudyInteraction,
+  interactionMutationKey,
+  physicsInteractionDraftDirty,
 } from "./PhysicsInteractionPanelModel";
 
 describe("PhysicsInteractionPanelModel", () => {
@@ -23,6 +25,7 @@ describe("PhysicsInteractionPanelModel", () => {
       "current_transport",
       "spin_torque",
       "interfacial_dmi",
+      "rotated_interfacial_dmi",
       "bulk_dmi",
       "uniaxial_anisotropy",
       "cubic_anisotropy",
@@ -63,6 +66,31 @@ describe("PhysicsInteractionPanelModel", () => {
         present: true,
       },
       storage: "object_interaction",
+    });
+  });
+
+  it("authors Exchange on the explicit object without changing the global Study switch", () => {
+    const draft = draftFromInteractionResource("exchange", {
+      ...defaultObjectInteractionResource("waveguide", "exchange"),
+      enabled: true,
+      present: true,
+    });
+    expect(isWritableObjectInteraction("exchange", "waveguide")).toBe(true);
+    expect(isWritableObjectInteraction("demag", "waveguide")).toBe(false);
+    expect(buildInteractionApplyPatch(draft, null, "waveguide")).toEqual({
+      patch: { enabled: true, params: {}, present: true },
+      storage: "object_interaction",
+    });
+    expect(buildInteractionApplyPatch({ ...draft, enabled: false }, null, "waveguide")).toEqual({
+      patch: { enabled: false, params: {}, present: true },
+      storage: "object_interaction",
+    });
+    expect(buildInteractionApplyPatch({ ...draft, present: false }, null, "waveguide")).toEqual({
+      error: "Exchange is required and cannot be removed.",
+    });
+    expect(buildInteractionApplyPatch(draft)).toEqual({
+      patch: { study: { exchange_enabled: true } },
+      storage: "study",
     });
   });
 
@@ -107,6 +135,29 @@ describe("PhysicsInteractionPanelModel", () => {
       patch: { study: { external_field: [0.01, 0, -0.002] } },
       storage: "study",
     });
+
+    const rotated = draftFromStudyScene("rotated_interfacial_dmi", {
+      ...scene,
+      study: { ...scene.study, rotated_interfacial_dmi: -0.003 },
+    } as unknown as SceneResource);
+    expect(rotated).toMatchObject({
+      enabled: true,
+      present: true,
+      values: { d: "-0.003" },
+    });
+    expect(buildInteractionApplyPatch(rotated)).toEqual({
+      patch: { study: { rotated_interfacial_dmi: -0.003 } },
+      storage: "study",
+    });
+    expect(
+      draftFromStudyScene("rotated_interfacial_dmi", scene),
+    ).toMatchObject({ enabled: false, present: false });
+    expect(
+      draftFromStudyScene("rotated_interfacial_dmi", {
+        ...scene,
+        study: { ...scene.study, rotated_interfacial_dmi: "0" },
+      } as unknown as SceneResource),
+    ).toMatchObject({ enabled: true, present: true, values: { d: "0" } });
   });
 
   it("rejects deferred backend terms before hitting the API", () => {
@@ -131,6 +182,63 @@ describe("PhysicsInteractionPanelModel", () => {
     });
   });
 
+  it("fails closed before applying rotated DMI over an active object-scoped DMI", () => {
+    for (const kind of ["interfacial_dmi", "bulk_dmi"] as const) {
+      const scene = {
+        objects: [
+          {
+            id: "free-layer",
+            physics_stack: [{ kind, enabled: true }],
+          },
+        ],
+        revision: 7,
+        study: {},
+      } as unknown as SceneResource;
+
+      const result = buildInteractionApplyPatch(
+        {
+          enabled: true,
+          id: "rotated_interfacial_dmi",
+          present: true,
+          values: { d: "0.003" },
+        },
+        scene,
+      );
+
+      expect(result).toEqual({
+        error:
+          `Rotated interfacial DMI conflicts with active object-scoped ${kind}. ` +
+          "Disable or remove the object-scoped DMI before applying the study-level term.",
+      });
+      expect("patch" in result).toBe(false);
+    }
+  });
+
+  it("fails closed before applying object-scoped interfacial DMI over active rotated DMI", () => {
+    const scene = {
+      objects: [],
+      revision: 7,
+      study: { rotated_interfacial_dmi: -0.003 },
+    } as unknown as SceneResource;
+
+    const result = buildInteractionApplyPatch(
+      {
+        enabled: true,
+        id: "interfacial_dmi",
+        present: true,
+        values: { dind: "0.003" },
+      },
+      scene,
+    );
+
+    expect(result).toEqual({
+      error:
+        "Object-scoped interfacial_dmi conflicts with active study-level rotated interfacial DMI. " +
+        "Disable or remove the study-level term before applying the object-scoped DMI.",
+    });
+    expect("patch" in result).toBe(false);
+  });
+
   it("uses stable draft keys for scene-backed global settings", () => {
     const draft = draftFromStudyScene("demag", {
       study: { demag_realization: "poisson_dirichlet" },
@@ -138,5 +246,51 @@ describe("PhysicsInteractionPanelModel", () => {
 
     expect(draftKeyForInteraction("body", draft)).toContain("demag");
     expect(draftKeyForInteraction("body", draft)).toContain("poisson_dirichlet");
+  });
+
+  it("scopes interaction mutations by session, target, region, and interaction", () => {
+    expect(
+      interactionMutationKey({
+        interactionId: "demag",
+        objectId: "body",
+        regionId: "region:body",
+        sessionId: "session-1",
+      }),
+    ).toBe("session-1:region:body:demag");
+    expect(
+      interactionMutationKey({
+        interactionId: "exchange",
+        objectId: "body",
+        regionId: null,
+        sessionId: "session-1",
+      }),
+    ).toBe("session-1:object:body:exchange");
+  });
+
+  it("compares interaction drafts semantically instead of serializing key order", () => {
+    const base = {
+      enabled: true,
+      id: "uniaxial_anisotropy" as const,
+      present: true,
+      values: { axis: ["1", "0", "0"], ku1: "1200" },
+    };
+    expect(
+      physicsInteractionDraftDirty(
+        { ...base, values: { ku1: "1200.0", axis: ["1.0", "0", "0"] } },
+        base,
+      ),
+    ).toBe(false);
+    expect(
+      physicsInteractionDraftDirty(
+        { ...base, values: { ...base.values, ku1: "1201" } },
+        base,
+      ),
+    ).toBe(true);
+    expect(
+      physicsInteractionDraftDirty(
+        { ...base, values: { ...base.values, ku1: "" } },
+        { ...base, values: { ...base.values, ku1: "0" } },
+      ),
+    ).toBe(true);
   });
 });

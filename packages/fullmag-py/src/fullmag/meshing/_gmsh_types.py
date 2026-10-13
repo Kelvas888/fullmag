@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 import hashlib
 import itertools
 import json
@@ -9,10 +9,14 @@ import math
 import operator
 from pathlib import Path
 import struct
-from typing import Any
-
+from types import MappingProxyType
+from typing import Any, Mapping
+from weakref import WeakSet
 import numpy as np
 from numpy.typing import NDArray
+
+from fullmag._validation import parse_bool, parse_finite_float, parse_integer
+from fullmag.model.discretization import _MESH_SIZE_PRESET_ALIASES
 
 
 FEM_TOPOLOGY_VOLUME_EPS = 1.0e-30 / 6.0
@@ -22,7 +26,7 @@ FEM_EXACT_LAYER_PLANE_REL_TOLERANCE = 1.0e-8
 MIXED_SHARED_GMSH_VERSION = "4.15.2"
 MIXED_SHARED_GEO_STRATEGY = "shared_geo_extrusion_partitioned_pyramid_tet.v2"
 MIXED_INTERFACE_MARKER = 10
-MIXED_QUALITY_METRIC = "tetra_decomposition_scaled_jacobian.v1"
+MIXED_QUALITY_METRIC = "mixed_topology_scaled_jacobian.v1"
 MIXED_SCALED_JACOBIAN_P05_MIN = 0.1
 MIXED_PYRAMID_APEX_SCALE_STEP = 0.001
 MIXED_PYRAMID_APEX_SCALE_MAX = 1.25
@@ -31,6 +35,49 @@ FEM_CELL_ARITIES = {"tet4": 4, "prism6": 6, "pyramid5": 5, "hex8": 8}
 FEM_FACET_ARITIES = {"tri3": 3, "quad4": 4}
 FEM_FACET_ROLES = {"exterior", "material_interface", "periodic_seam"}
 VTK_CELL_TYPES = {"tet4": 10, "hex8": 12, "prism6": 13, "pyramid5": 14}
+
+
+class MeshValidationError(RuntimeError):
+    """Fail-closed rejection of an invalid realized mesh."""
+
+
+class MixedPeriodicTopologyError(ValueError):
+    """Typed early rejection for a mixed/non-tetrahedral periodic request."""
+
+    code = "mixed_periodic_topology_unsupported"
+    pointer = "/mesh_options/periodic_pair_ids"
+
+    def __init__(self, *, strategy: str | None, context: str) -> None:
+        self.strategy = strategy
+        self.context = context
+        rendered = strategy if strategy is not None else "auto"
+        super().__init__(
+            f"{self.code} at {self.pointer}: {context} requests "
+            f"mesh_strategy={rendered!r} with periodic pairs, but the mixed/non-tet "
+            "periodic certificate is not implemented; use free_tetrahedral or "
+            "remove periodic_pair_ids"
+        )
+
+
+def validate_periodic_mesh_options(options: "MeshOptions", *, context: str) -> None:
+    """Reject periodic requests before a swept mixed mesh reaches Gmsh.
+
+    The native and typed validators intentionally support periodic topology
+    only for tet4/tri3.  Swept prism/hex routes (including ``auto`` with an
+    explicit layer count) produce a non-tet topology, so accepting the request
+    and failing only during extraction would leave the DSL/UI contract split
+    from the generator contract.
+    """
+    if not options.periodic_pair_ids:
+        return
+    strategy = options.mesh_strategy
+    swept = strategy in {"swept_prism", "swept_hex"} or (
+        strategy in {None, "auto"}
+        and options.through_thickness_elements is not None
+        and options.through_thickness_elements > 0
+    )
+    if swept:
+        raise MixedPeriodicTopologyError(strategy=strategy, context=context)
 
 
 def _mixed_deterministic_inputs() -> dict[str, object]:
@@ -221,20 +268,6 @@ _MESH_SIZE_PRESET_DEFAULTS: dict[str, dict[str, float]] = {
     "extremely_coarse": {"growth_rate": 2.4, "curvature_factor": 1.5, "narrow_region_resolution": 0.1},
 }
 
-_MESH_SIZE_PRESET_ALIASES = {
-    "extra fine": "extra_fine",
-    "extremely fine": "extremely_fine",
-    "extrafine": "extra_fine",
-    "extremelyfine": "extremely_fine",
-    "very_fine": "extra_fine",
-    "coarser_mesh": "coarser",
-    "extra coarse": "extra_coarse",
-    "extracoarse": "extra_coarse",
-    "extremely coarse": "extremely_coarse",
-    "extremelycoarse": "extremely_coarse",
-}
-
-
 @dataclass(frozen=True, slots=True)
 class MeshOptions:
     """Advanced mesh generation options passed through to Gmsh.
@@ -257,6 +290,9 @@ class MeshOptions:
     optimize: str | None = None
     optimize_iters: int = 1
     size_fields: list[dict[str, Any]] = field(default_factory=list)
+    # Scoped minimum-size floors have different eligibility from upper targets
+    # and are composed through the lower-bound branch of the Gmsh field stack.
+    lower_bound_fields: list[dict[str, Any]] = field(default_factory=list)
     compute_quality: bool = True
     per_element_quality: bool = True
     # Boundary-layer extrusion settings (None = disabled)
@@ -275,26 +311,186 @@ class MeshOptions:
     through_thickness_element_ratio: float | None = None  # grading ratio for non-uniform distribution
     through_thickness_symmetric: bool = False  # mirror distribution about mid-plane
     sweep_face_meshing: str | None = None  # "triangular" → prisms, "quadrilateral" → hexes
+    # Requested extrusion axis. ``auto`` is resolved from the geometry by the
+    # swept generator; an explicit axis is carried through the typed options
+    # boundary instead of being silently reconstructed from dimensions.
+    sweep_direction: str | None = None  # "auto" | "x" | "y" | "z"
     sweep_source: str | None = None  # "auto" | face selector hint
     sweep_destination: str | None = None  # "auto" | face selector hint
     periodic_pair_ids: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
+        # ``MeshOptions`` is the typed boundary between authoring metadata and
+        # Gmsh.  Normalize only values accepted by the contract; in
+        # particular, do not let ``int(3.9)`` or ``bool`` silently select a
+        # different mesh recipe.
+        object.__setattr__(
+            self,
+            "algorithm_2d",
+            int(parse_integer(self.algorithm_2d, "/mesh_options/algorithm_2d", minimum=1)),
+        )
+        object.__setattr__(
+            self,
+            "algorithm_3d",
+            int(parse_integer(self.algorithm_3d, "/mesh_options/algorithm_3d", minimum=1)),
+        )
+
+        def optional_positive(name: str, value: object) -> float | None:
+            return parse_finite_float(
+                value,
+                f"/mesh_options/{name}",
+                positive=True,
+                allow_none=True,
+            )
+
+        def optional_integer(name: str, value: object, minimum: int) -> int | None:
+            return parse_integer(
+                value,
+                f"/mesh_options/{name}",
+                minimum=minimum,
+                allow_none=True,
+            )
+
+        def required_positive(name: str, value: object) -> float:
+            parsed = parse_finite_float(
+                value,
+                f"/mesh_options/{name}",
+                positive=True,
+            )
+            return float(parsed)
+
+        object.__setattr__(self, "hmin", optional_positive("hmin", self.hmin))
+        object.__setattr__(self, "size_factor", required_positive("size_factor", self.size_factor))
+        object.__setattr__(
+            self,
+            "size_from_curvature",
+            int(parse_integer(self.size_from_curvature, "/mesh_options/size_from_curvature", minimum=0)),
+        )
+        object.__setattr__(
+            self,
+            "curvature_factor",
+            optional_positive("curvature_factor", self.curvature_factor),
+        )
+        normalized_growth_rate = optional_positive("growth_rate", self.growth_rate)
+        if normalized_growth_rate is not None and normalized_growth_rate <= 1.0:
+            raise TypedValidationError(
+                code="numeric_range_error",
+                pointer="/mesh_options/growth_rate",
+                message="growth_rate must be greater than 1.0; use null to disable grading",
+                value=normalized_growth_rate,
+            )
+        object.__setattr__(self, "growth_rate", normalized_growth_rate)
+        object.__setattr__(
+            self,
+            "narrow_regions",
+            int(parse_integer(self.narrow_regions, "/mesh_options/narrow_regions", minimum=0)),
+        )
+        object.__setattr__(
+            self,
+            "narrow_region_resolution",
+            optional_positive("narrow_region_resolution", self.narrow_region_resolution),
+        )
+        object.__setattr__(
+            self,
+            "smoothing_steps",
+            int(parse_integer(self.smoothing_steps, "/mesh_options/smoothing_steps", minimum=0)),
+        )
+        object.__setattr__(
+            self,
+            "optimize_iters",
+            int(parse_integer(self.optimize_iters, "/mesh_options/optimize_iters", minimum=1)),
+        )
+        for name in (
+            "boundary_layer_count",
+            "through_thickness_elements",
+        ):
+            object.__setattr__(
+                self,
+                name,
+                optional_integer(name, getattr(self, name), 1),
+            )
+        for name in (
+            "boundary_layer_thickness",
+            "boundary_layer_stretching",
+            "through_thickness_element_ratio",
+        ):
+            object.__setattr__(self, name, optional_positive(name, getattr(self, name)))
+        object.__setattr__(
+            self,
+            "through_thickness_symmetric",
+            bool(parse_bool(
+                self.through_thickness_symmetric,
+                "/mesh_options/through_thickness_symmetric",
+            )),
+        )
+        for name in ("compute_quality", "per_element_quality"):
+            object.__setattr__(
+                self,
+                name,
+                bool(parse_bool(getattr(self, name), f"/mesh_options/{name}")),
+            )
+
+        for name in (
+            "boundary_layer_target_surface_tags",
+            "boundary_layer_target_curve_tags",
+        ):
+            raw_tags = getattr(self, name)
+            if raw_tags is None:
+                continue
+            if not isinstance(raw_tags, (list, tuple)):
+                raise TypeError(f"/mesh_options/{name} must be a list of integers")
+            object.__setattr__(
+                self,
+                name,
+                [
+                    int(parse_integer(tag, f"/mesh_options/{name}/{index}", minimum=1))
+                    for index, tag in enumerate(raw_tags)
+                ],
+            )
+        for name in (
+            "boundary_layer_target_surface_selectors",
+            "boundary_layer_target_curve_selectors",
+        ):
+            raw_selectors = getattr(self, name)
+            if raw_selectors is None:
+                continue
+            if not isinstance(raw_selectors, (list, tuple)):
+                raise TypeError(f"/mesh_options/{name} must be a list of mappings")
+            if not all(isinstance(item, Mapping) for item in raw_selectors):
+                raise TypeError(f"/mesh_options/{name} entries must be mappings")
+            object.__setattr__(self, name, [dict(item) for item in raw_selectors])
+
+        if self.optimize is not None:
+            if not isinstance(self.optimize, str) or not self.optimize.strip():
+                raise ValueError("/mesh_options/optimize must be a non-empty string or None")
+            object.__setattr__(self, "optimize", self.optimize.strip())
+        for name, choices in (
+            (
+                "mesh_strategy",
+                {None, "auto", "free_tetrahedral", "thin_film_tetrahedral", "swept_prism", "swept_hex"},
+            ),
+            ("through_thickness_distribution", {None, "fixed", "linear", "exponential"}),
+            ("sweep_face_meshing", {None, "triangular", "quadrilateral"}),
+            ("sweep_direction", {None, "auto", "x", "y", "z"}),
+        ):
+            value = getattr(self, name)
+            if value is not None and (not isinstance(value, str) or value not in choices):
+                raise ValueError(f"/mesh_options/{name} has unsupported value {value!r}")
+        for name in ("sweep_source", "sweep_destination"):
+            value = getattr(self, name)
+            if value is not None:
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(f"/mesh_options/{name} must be a non-empty string or None")
+                object.__setattr__(self, name, value.strip())
+        if not isinstance(self.periodic_pair_ids, (list, tuple)):
+            raise TypeError("/mesh_options/periodic_pair_ids must be a list of strings")
+
         calibration = _normalize_mesh_size_calibration(self.calibrate_for)
         preset = _normalize_mesh_size_preset(self.size_preset)
         if self.calibrate_for is not None:
             object.__setattr__(self, "calibrate_for", calibration)
         if self.size_preset is not None:
             object.__setattr__(self, "size_preset", preset)
-        if self.curvature_factor is not None:
-            if not math.isfinite(self.curvature_factor) or self.curvature_factor <= 0.0:
-                raise ValueError("curvature_factor must be a positive finite float")
-        if self.narrow_region_resolution is not None:
-            if (
-                not math.isfinite(self.narrow_region_resolution)
-                or self.narrow_region_resolution <= 0.0
-            ):
-                raise ValueError("narrow_region_resolution must be a positive finite float")
         normalized_pair_ids: list[str] = []
         for pair_id in self.periodic_pair_ids:
             if not isinstance(pair_id, str) or not pair_id.strip():
@@ -484,6 +680,24 @@ class AirboxOptions:
     maximum_element_size: float | None = None
     minimum_element_size: float | None = None
 
+    def __post_init__(self) -> None:
+        # ``grading_ratio`` is a multiplicative layer-to-layer growth law for
+        # the typed FEM airbox.  Values at or below one used to be accepted and
+        # then silently disabled the field in the Gmsh builder, producing a
+        # result different from the requested policy.
+        ratio = parse_finite_float(
+            self.grading_ratio,
+            "/study_universe/airbox_growth_rate",
+            positive=True,
+            allow_numeric_string=True,
+        )
+        if ratio <= 1.0:
+            raise ValueError(
+                "study_universe.airbox_growth_rate must be greater than 1.0; "
+                "use the default or provide a larger ratio"
+            )
+        object.__setattr__(self, "grading_ratio", float(ratio))
+
 
 @dataclass(frozen=True, slots=True)
 class SizeFieldData:
@@ -545,6 +759,10 @@ class MeshRealizationReport:
     requested_order: int
     resolved_order: int
     fallbacks_triggered: tuple[str, ...] = ()
+    # ``requested_axis`` is retained as the concrete axis used by historical
+    # consumers.  This optional field preserves the authored intent when the
+    # caller requested classifier-driven ``auto`` resolution.
+    requested_direction: str | None = None
     schema_version: str = "mesh_realization_report.v1"
 
     def __post_init__(self) -> None:
@@ -568,6 +786,10 @@ class MeshRealizationReport:
             raise ValueError("mesh realization report has invalid requested axis")
         if self.resolved_axis not in {"x", "y", "z"}:
             raise ValueError("mesh realization report has invalid resolved axis")
+        requested_direction = self.requested_direction or self.requested_axis
+        if requested_direction not in {"auto", "x", "y", "z"}:
+            raise ValueError("mesh realization report has invalid requested direction")
+        object.__setattr__(self, "requested_direction", requested_direction)
         normalized_fallbacks: list[str] = []
         for item in self.fallbacks_triggered:
             if not isinstance(item, str) or not item.strip():
@@ -586,7 +808,11 @@ class MeshRealizationReport:
             self.resolved_axis,
             self.resolved_order,
         )
-        if not normalized_fallbacks and requested != resolved:
+        if (
+            not normalized_fallbacks
+            and requested_direction != "auto"
+            and requested != resolved
+        ):
             raise ValueError(
                 "mesh realization report requested/resolved fields must match "
                 "when no fallback was triggered"
@@ -603,6 +829,7 @@ class MeshRealizationReport:
             "resolved_axis": self.resolved_axis,
             "requested_order": self.requested_order,
             "resolved_order": self.resolved_order,
+            "requested_direction": self.requested_direction,
             "fallbacks_triggered": list(self.fallbacks_triggered),
         }
 
@@ -622,6 +849,11 @@ class MeshRealizationReport:
             requested_order=payload.get("requested_order", 0),  # type: ignore[arg-type]
             resolved_order=payload.get("resolved_order", 0),  # type: ignore[arg-type]
             fallbacks_triggered=tuple(raw_fallbacks),  # type: ignore[arg-type]
+            requested_direction=(
+                str(payload["requested_direction"])
+                if payload.get("requested_direction") is not None
+                else None
+            ),
         )
 
 
@@ -682,11 +914,13 @@ class MixedLayerTopologyCertificate:
             )
         if self.certificate_status != "accepted":
             raise ValueError("mixed layer topology certificate must be accepted")
-        if self.requested_sweep_direction not in {"x", "y", "z"} or (
+        if self.requested_sweep_direction not in {"auto", "x", "y", "z"} or (
             self.resolved_sweep_direction not in {"x", "y", "z"}
         ):
             raise ValueError("mixed layer topology certificate has an invalid sweep direction")
-        if self.requested_sweep_direction != self.resolved_sweep_direction:
+        if self.requested_sweep_direction != "auto" and (
+            self.requested_sweep_direction != self.resolved_sweep_direction
+        ):
             raise ValueError("strict mixed layer topology cannot change sweep direction")
         for name, value in (
             ("requested_layer_count", self.requested_layer_count),
@@ -968,6 +1202,157 @@ class MixedLayerTopologyCertificate:
         )
 
 
+def _certificate_payload_sha256(
+    certificate: MixedLayerTopologyCertificate,
+) -> str:
+    encoded = json.dumps(
+        certificate.to_dict(),
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+@dataclass(frozen=True)
+class _PrevalidatedMixedCertificate:
+    certificate: MixedLayerTopologyCertificate
+    topology_fingerprint_v3: str
+    certificate_payload_sha256: str
+    canonical_evidence: "_CanonicalMixedCertificateEvidence"
+    _validation_token: object = field(repr=False, compare=False)
+
+
+_PREVALIDATED_MIXED_CERTIFICATE_TOKEN = object()
+
+
+@dataclass(frozen=True, eq=False)
+class _TrustedTopologyFingerprintV3Context:
+    mesh_without_certificate: "MeshData" = field(repr=False, compare=False)
+    topology_fingerprint_v3: str
+    _capability: object = field(repr=False, compare=False)
+    # The ordinary test/public private path binds this to ``None`` and keeps
+    # its historical Python fingerprint re-check.  The native fast path
+    # stores a compact content guard so the constructor can detect mutation
+    # without hashing the full canonical topology byte stream twice.
+    mesh_mutation_guard_sha256: str | None = None
+
+
+@dataclass(frozen=True, eq=False)
+class _TrustedNativePreflightReceiptProof:
+    mesh_without_certificate: "MeshData" = field(repr=False, compare=False)
+    certificate: MixedLayerTopologyCertificate
+    topology_context: _TrustedTopologyFingerprintV3Context
+    certificate_payload_sha256: str
+    counts: Mapping[str, int]
+    _capability: object = field(repr=False, compare=False)
+
+
+_TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY = object()
+_MINTED_TRUSTED_TOPOLOGY_FINGERPRINT_CONTEXTS: WeakSet[
+    _TrustedTopologyFingerprintV3Context
+] = WeakSet()
+_MINTED_TRUSTED_NATIVE_PREFLIGHT_RECEIPT_PROOFS: WeakSet[
+    _TrustedNativePreflightReceiptProof
+] = WeakSet()
+
+
+def _trusted_mesh_mutation_guard_sha256(mesh: "MeshData") -> str:
+    """Hash the exact native-wire arrays for a cheap post-preflight guard.
+
+    This is not the semantic topology fingerprint.  It only closes the small
+    in-process window between native preflight and trusted construction.  The
+    native preflight remains authoritative for structural validation and the
+    canonical v3 fingerprint; this guard avoids repeating the much slower
+    Python field-by-field v3 encoder on the same arrays.
+    """
+    digest = hashlib.sha256(b"fullmag:trusted-mesh-mutation-guard:v1")
+    fields_to_guard = (
+        ("nodes", mesh.nodes),
+        ("cell_types", mesh.cell_types),
+        ("cell_offsets", mesh.cell_offsets),
+        ("cell_nodes", mesh.cell_nodes),
+        ("element_markers", mesh.element_markers),
+        ("facet_types", mesh.facet_types),
+        ("facet_roles", mesh.facet_roles),
+        ("facet_offsets", mesh.facet_offsets),
+        ("facet_nodes", mesh.facet_nodes),
+        ("boundary_markers", mesh.boundary_markers),
+        ("cell_global_ordinals", mesh.cell_global_ordinals),
+        ("facet_global_ordinals", mesh.facet_global_ordinals),
+        ("cell_mesh_parts", mesh.cell_mesh_parts),
+    )
+    for name, value in fields_to_guard:
+        array = np.ascontiguousarray(np.asarray(value))
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(array.dtype.str.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(
+            np.asarray(array.shape, dtype="<u8").tobytes(order="C")
+        )
+        digest.update(memoryview(array).cast("B"))
+    metadata = {
+        "periodic_boundary_pairs": list(mesh.periodic_boundary_pairs),
+        "periodic_node_pairs": list(mesh.periodic_node_pairs),
+        "periodic_mesh_certificate": mesh.periodic_mesh_certificate,
+        "realization_report": (
+            mesh.realization_report.to_dict()
+            if mesh.realization_report is not None
+            else None
+        ),
+    }
+    digest.update(
+        json.dumps(
+            metadata,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    )
+    return digest.hexdigest()
+
+
+def _owned_vertex_identity(value: object, node_count: int) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"schema_version", "issuer", "vertex_ids"}:
+        raise ValueError("vertex_identity requires exactly schema_version, issuer and vertex_ids")
+    if value["schema_version"] != "mesh_vertex_identity.v1" or value["issuer"] != "gmsh_node_tags.v1":
+        raise ValueError("unsupported mesh vertex identity schema or issuer")
+    raw = value["vertex_ids"]
+    if not isinstance(raw, (tuple, list, np.ndarray)) or (isinstance(raw, np.ndarray) and raw.ndim != 1):
+        raise ValueError("vertex_identity.vertex_ids must be an ordered integer sequence")
+    if len(raw) != node_count:
+        raise ValueError("vertex_identity vertex count must match mesh nodes")
+    ids: list[int] = []
+    for item in raw:
+        if isinstance(item, (bool, np.bool_)) or not isinstance(item, (int, np.integer)):
+            raise ValueError("vertex_identity IDs must be exact integers, not bool or coerced values")
+        identity = operator.index(item)
+        if not 0 < identity <= (1 << 64) - 1:
+            raise ValueError("vertex_identity IDs must be positive u64 integers")
+        ids.append(identity)
+    if len(set(ids)) != len(ids):
+        raise ValueError("vertex_identity IDs must be unique")
+    return MappingProxyType({
+        "schema_version": "mesh_vertex_identity.v1",
+        "issuer": "gmsh_node_tags.v1",
+        "vertex_ids": tuple(ids),
+    })
+
+
+def _vertex_identity_to_dict(value: Mapping[str, object] | None) -> dict[str, object] | None:
+    if value is None:
+        return None
+    return {
+        "schema_version": value["schema_version"],
+        "issuer": value["issuer"],
+        "vertex_ids": list(value["vertex_ids"]),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class MeshData:
     """Canonical typed variable-arity FEM topology in CSR layout."""
@@ -994,9 +1379,14 @@ class MeshData:
     per_domain_quality: dict[int, MeshQualityReport] | None = None
     realization_report: MeshRealizationReport | None = None
     mixed_layer_topology_certificate: MixedLayerTopologyCertificate | None = None
+    # Retained mesh-owner labels, not authentication or a solved-field certificate.
+    vertex_identity: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "nodes", np.asarray(self.nodes, dtype=np.float64))
+        object.__setattr__(
+            self, "vertex_identity", _owned_vertex_identity(self.vertex_identity, len(self.nodes))
+        )
         object.__setattr__(self, "cell_types", np.asarray(self.cell_types, dtype=np.str_))
         object.__setattr__(self, "cell_offsets", np.asarray(self.cell_offsets, dtype=np.int64))
         object.__setattr__(self, "cell_nodes", np.asarray(self.cell_nodes, dtype=np.int32))
@@ -1038,6 +1428,22 @@ class MeshData:
             raise TypeError(
                 "mixed_layer_topology_certificate must be a MixedLayerTopologyCertificate"
             )
+
+        # A native mixed certificate is emitted only after the Rust bridge has
+        # parsed and validated the complete typed CSR mesh (including node
+        # references, arities, ordinals, mesh parts, facet roles, orientation,
+        # degeneracy, conformity, and the certificate evidence).  Repeating
+        # the Python per-cell/per-facet validation here is therefore redundant
+        # for the accepted production path and costs several seconds for the
+        # large SP4 mesh.  Keep the ordinary Python validation as the
+        # fail-closed fallback when the optional extension is unavailable or
+        # rejects the certificate.
+        if (
+            self.mixed_layer_topology_certificate is not None
+            and self._native_mixed_certificate_valid()
+        ):
+            self._validate_realization_report()
+            return
         self.validate()
         self._validate_realization_report()
         self._validate_mixed_layer_topology_certificate()
@@ -1066,14 +1472,273 @@ class MeshData:
                 f"does not match actual layer count {actual_layers}"
             )
 
+    @classmethod
+    def _from_prevalidated_mixed_certificate(
+        cls,
+        *,
+        mesh_without_certificate: "MeshData",
+        validation: _PrevalidatedMixedCertificate,
+        token: object,
+    ) -> "MeshData":
+        if token is not _PREVALIDATED_MIXED_CERTIFICATE_TOKEN:
+            raise ValueError("prevalidated mixed certificate token is invalid")
+        if mesh_without_certificate.mixed_layer_topology_certificate is not None:
+            raise ValueError("prevalidated mixed certificate requires an unsigned mesh")
+        if not isinstance(validation, _PrevalidatedMixedCertificate):
+            raise TypeError("prevalidated mixed certificate has invalid validation evidence")
+        if validation._validation_token is not _PREVALIDATED_MIXED_CERTIFICATE_TOKEN:
+            raise ValueError("prevalidated mixed certificate proof is not validated")
+        certificate = validation.certificate
+        carrier = validation.canonical_evidence
+        if (
+            not isinstance(carrier, _CanonicalMixedCertificateEvidence)
+            or carrier not in _MINTED_CANONICAL_MIXED_EVIDENCE
+            or carrier._capability is not _CANONICAL_MIXED_EVIDENCE_CAPABILITY
+        ):
+            raise ValueError("prevalidated mixed certificate evidence is not canonical")
+        context = _require_mixed_topology_workspace(
+            mesh_without_certificate,
+            carrier.context.workspace,
+            sweep_axis={"x": 0, "y": 1, "z": 2}[
+                certificate.resolved_sweep_direction
+            ],
+            interface_marker=certificate.interface_marker,
+            _bound_context=carrier.context,
+        )
+        # The prevalidated carrier is minted only after the native (or
+        # reference) topology fingerprint has been bound to this exact mesh.
+        # Re-running the Python byte-by-byte hash here duplicates a linear
+        # pass over the large SP4 CSR arrays and provides no additional
+        # protection over that identity-bound carrier.
+        actual_fingerprint = validation.topology_fingerprint_v3
+        if (
+            context.actual_topology_fingerprint_v3 != actual_fingerprint
+            or context.workspace.topology_fingerprint_v3 != actual_fingerprint
+            or validation.topology_fingerprint_v3 != actual_fingerprint
+        ):
+            raise ValueError(
+                "prevalidated mixed certificate topology fingerprint does not match mesh"
+            )
+        if (
+            certificate.topology_fingerprint_version != "v3"
+            or certificate.topology_fingerprint != actual_fingerprint
+        ):
+            raise ValueError(
+                "prevalidated mixed certificate topology fingerprint is stale"
+            )
+        if (
+            _certificate_payload_sha256(certificate)
+            != validation.certificate_payload_sha256
+        ):
+            raise ValueError("prevalidated mixed certificate payload digest is stale")
+        mesh_without_certificate._validate_mixed_layer_topology_certificate_evidence(
+            certificate,
+            carrier.evidence,
+            workspace=context.workspace,
+            _bound_context=context,
+        )
+
+        result = object.__new__(cls)
+        for descriptor in fields(cls):
+            value = (
+                certificate
+                if descriptor.name == "mixed_layer_topology_certificate"
+                else getattr(mesh_without_certificate, descriptor.name)
+            )
+            object.__setattr__(result, descriptor.name, value)
+        return result
+
+    @classmethod
+    def _from_trusted_native_preflight_receipt(
+        cls,
+        *,
+        mesh_without_certificate: "MeshData",
+        certificate: MixedLayerTopologyCertificate,
+        proof: _TrustedNativePreflightReceiptProof,
+    ) -> "MeshData":
+        if mesh_without_certificate.mixed_layer_topology_certificate is not None:
+            raise ValueError("trusted receipt construction requires an unsigned mesh")
+        if not isinstance(certificate, MixedLayerTopologyCertificate):
+            raise TypeError("trusted receipt certificate has an invalid type")
+        if not isinstance(proof, _TrustedNativePreflightReceiptProof):
+            raise TypeError("trusted native preflight proof has an invalid type")
+        if proof not in _MINTED_TRUSTED_NATIVE_PREFLIGHT_RECEIPT_PROOFS:
+            raise ValueError("trusted native preflight proof is not owner-minted")
+        if proof._capability is not _TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY:
+            raise ValueError("trusted native preflight proof capability is invalid")
+        if (
+            proof.mesh_without_certificate is not mesh_without_certificate
+            or proof.certificate is not certificate
+        ):
+            raise ValueError("trusted native preflight proof identity is stale")
+        context = proof.topology_context
+        if (
+            not isinstance(context, _TrustedTopologyFingerprintV3Context)
+            or context not in _MINTED_TRUSTED_TOPOLOGY_FINGERPRINT_CONTEXTS
+            or context._capability
+            is not _TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY
+            or context.mesh_without_certificate is not mesh_without_certificate
+        ):
+            raise ValueError("trusted topology fingerprint context is invalid")
+        current_counts = {
+            "nodes": mesh_without_certificate.n_nodes,
+            "cells": mesh_without_certificate.n_elements,
+            "facets": mesh_without_certificate.n_boundary_faces,
+        }
+        if dict(proof.counts) != current_counts:
+            raise ValueError("trusted native preflight proof counts are stale")
+        if context.mesh_mutation_guard_sha256 is None:
+            current_topology_fingerprint_v3 = (
+                mesh_without_certificate.topology_fingerprint_v3()
+            )
+        else:
+            current_guard = _trusted_mesh_mutation_guard_sha256(
+                mesh_without_certificate
+            )
+            if current_guard != context.mesh_mutation_guard_sha256:
+                raise ValueError("trusted native preflight proof topology is stale")
+            # The native preflight bound this identity and the mutation guard
+            # above confirms that the Python object still carries the exact
+            # arrays that were preflighted.
+            current_topology_fingerprint_v3 = context.topology_fingerprint_v3
+        if (
+            context.topology_fingerprint_v3 != current_topology_fingerprint_v3
+            or certificate.topology_fingerprint_version != "v3"
+            or certificate.topology_fingerprint
+            != current_topology_fingerprint_v3
+        ):
+            raise ValueError("trusted native preflight proof topology is stale")
+        if proof.certificate_payload_sha256 != _certificate_payload_sha256(certificate):
+            raise ValueError("trusted native preflight proof certificate is stale")
+
+        result = object.__new__(cls)
+        for descriptor in fields(cls):
+            value = (
+                certificate
+                if descriptor.name == "mixed_layer_topology_certificate"
+                else getattr(mesh_without_certificate, descriptor.name)
+            )
+            object.__setattr__(result, descriptor.name, value)
+        return result
+
     def _validate_mixed_layer_topology_certificate(self) -> None:
         certificate = self.mixed_layer_topology_certificate
         if certificate is None:
             return
+
+        # The production certificate is minted by the native mixed-mesh
+        # certifier when the managed runtime ships the optional extension.  A
+        # Python re-computation of every cell Jacobian is both redundant and
+        # prohibitively expensive for the large SP4 mesh (hundreds of
+        # thousands of cells).  Let the same native engine validate the
+        # complete certificate before falling back to the legacy Python audit
+        # used by source-only/development runtimes.
+        from fullmag import _core
+
+        native = _core.certify_mixed_mesh_arrays(
+            mesh=self,
+            metadata={},
+            certificate=certificate.to_dict(),
+            require_native=False,
+        )
+        if native is not None and native.validated_claimed_certificate:
+            if native.topology_fingerprint_v3 != certificate.topology_fingerprint:
+                raise ValueError(
+                    "native mixed layer topology certificate fingerprint is stale"
+                )
+            expected_payload = _certificate_payload_sha256(certificate)
+            if native.certificate_payload_sha256 != expected_payload:
+                raise ValueError(
+                    "native mixed layer topology certificate payload is stale"
+                )
+            return
+
+        # Keep the legacy Python audit as the diagnostic fallback for a
+        # rejected certificate.  Besides supporting source-only runtimes,
+        # this preserves the field-specific validation errors used by callers
+        # and tests.  The slow path is only entered for invalid/tampered
+        # certificates; valid production meshes return above.
+
+        axis = {"x": 0, "y": 1, "z": 2}[certificate.resolved_sweep_direction]
+        actual_topology_fingerprint_v3 = (
+            self._validate_mixed_layer_topology_certificate_topology(certificate)
+        )
+        workspace = _build_mixed_topology_workspace(
+            self,
+            sweep_axis=axis,
+            interface_marker=certificate.interface_marker,
+            _topology_fingerprint_v3=actual_topology_fingerprint_v3,
+        )
+        context = _require_mixed_topology_workspace(
+            self,
+            workspace,
+            sweep_axis=axis,
+            interface_marker=certificate.interface_marker,
+            _actual_topology_fingerprint_v3=actual_topology_fingerprint_v3,
+        )
+        self._validate_mixed_layer_topology_certificate_binding(
+            certificate,
+            workspace=workspace,
+            validate_topology=False,
+            _bound_context=context,
+        )
+        evidence = _recompute_mixed_certificate_evidence(
+            self,
+            sweep_axis=axis,
+            interface_marker=certificate.interface_marker,
+            outer_boundary_marker=certificate.outer_boundary_marker,
+            magnetic_bounds_min_m=certificate.magnetic_bounds_min_m,
+            magnetic_bounds_max_m=certificate.magnetic_bounds_max_m,
+            airbox_bounds_min_m=certificate.airbox_bounds_min_m,
+            airbox_bounds_max_m=certificate.airbox_bounds_max_m,
+            workspace=workspace,
+            _bound_context=context,
+        )
+        self._validate_mixed_layer_topology_certificate_evidence(
+            certificate,
+            evidence,
+            workspace=workspace,
+            _bound_context=context,
+        )
+
+    def _validate_mixed_layer_topology_certificate_binding(
+        self,
+        certificate: MixedLayerTopologyCertificate,
+        *,
+        workspace: "_MixedTopologyWorkspace | None" = None,
+        validate_topology: bool = True,
+        _bound_context: "_BoundMixedTopologyContext | None" = None,
+    ) -> None:
+        if validate_topology:
+            self._validate_mixed_layer_topology_certificate_topology(certificate)
+        context = _bound_context
+        if workspace is not None:
+            context = _require_mixed_topology_workspace(
+                self,
+                workspace,
+                sweep_axis={"x": 0, "y": 1, "z": 2}[
+                    certificate.resolved_sweep_direction
+                ],
+                interface_marker=certificate.interface_marker,
+                _bound_context=_bound_context,
+            )
+        _validate_mixed_pyramid_bases(
+            self,
+            interface_marker=certificate.interface_marker,
+            workspace=workspace,
+            _bound_context=context,
+        )
+
+    def _validate_mixed_layer_topology_certificate_topology(
+        self,
+        certificate: MixedLayerTopologyCertificate,
+        *,
+        topology_fingerprint_v3: str | None = None,
+    ) -> str:
         if certificate.topology_fingerprint_version == "v2":
             expected = self.topology_fingerprint_v2()
         elif certificate.topology_fingerprint_version == "v3":
-            expected = self.topology_fingerprint_v3()
+            expected = topology_fingerprint_v3 or self.topology_fingerprint_v3()
         else:
             raise ValueError(
                 "mixed layer topology certificate has an unsupported topology fingerprint version"
@@ -1083,24 +1748,60 @@ class MeshData:
                 "mixed layer topology certificate topology fingerprint is stale: "
                 f"certificate={certificate.topology_fingerprint}, actual={expected}"
             )
-        _validate_mixed_pyramid_bases(
-            self,
-            interface_marker=certificate.interface_marker,
-        )
-        evidence = _recompute_mixed_certificate_evidence(
-            self,
-            sweep_axis={"x": 0, "y": 1, "z": 2}[certificate.resolved_sweep_direction],
-            interface_marker=certificate.interface_marker,
-            outer_boundary_marker=certificate.outer_boundary_marker,
-            magnetic_bounds_min_m=certificate.magnetic_bounds_min_m,
-            magnetic_bounds_max_m=certificate.magnetic_bounds_max_m,
-            airbox_bounds_min_m=certificate.airbox_bounds_min_m,
-            airbox_bounds_max_m=certificate.airbox_bounds_max_m,
-        )
+        if certificate.topology_fingerprint_version == "v3":
+            return expected
+        return topology_fingerprint_v3 or self.topology_fingerprint_v3()
+
+    def _validate_mixed_layer_topology_certificate_evidence(
+        self,
+        certificate: MixedLayerTopologyCertificate,
+        evidence: Mapping[str, object],
+        *,
+        workspace: "_MixedTopologyWorkspace | None" = None,
+        _bound_context: "_BoundMixedTopologyContext | None" = None,
+    ) -> None:
+        if workspace is not None:
+            _require_mixed_topology_workspace(
+                self,
+                workspace,
+                sweep_axis={"x": 0, "y": 1, "z": 2}[
+                    certificate.resolved_sweep_direction
+                ],
+                interface_marker=certificate.interface_marker,
+                _bound_context=_bound_context,
+            )
         for name, actual in evidence.items():
             claimed = getattr(certificate, name)
-            if isinstance(actual, dict):
-                matches = claimed == actual
+            # Match the cross-language binary64 contract in physics note 0106.
+            # Only these dimensionless fields get an epsilon-scale floor;
+            # dimensional determinants keep their SI-scale absolute tolerance.
+            absolute_tolerance = (
+                16 * np.finfo(np.float64).eps
+                if name in {
+                    "scaled_jacobian_minima_by_family",
+                    "scaled_jacobian_p05_by_family",
+                    "magnetic_relative_volume_error",
+                    "shared_domain_relative_volume_error",
+                }
+                else 1.0e-30
+            )
+            if isinstance(actual, Mapping):
+                if name in {
+                    "jacobian_minima_m3_by_family",
+                    "scaled_jacobian_minima_by_family",
+                    "scaled_jacobian_p05_by_family",
+                }:
+                    matches = set(claimed) == set(actual) and all(
+                        math.isfinite(float(claimed[key]))
+                        and math.isfinite(float(value))
+                        and math.isclose(
+                            float(claimed[key]), float(value),
+                            rel_tol=1.0e-12, abs_tol=absolute_tolerance,
+                        )
+                        for key, value in actual.items()
+                    )
+                else:
+                    matches = claimed == actual
             elif isinstance(actual, tuple):
                 matches = len(claimed) == len(actual) and np.allclose(
                     claimed, actual, rtol=0.0, atol=max(
@@ -1111,18 +1812,31 @@ class MeshData:
                 matches = claimed == actual
             else:
                 matches = math.isclose(
-                    float(claimed), float(actual), rel_tol=1.0e-12, abs_tol=1.0e-30
+                    float(claimed), float(actual), rel_tol=1.0e-12,
+                    abs_tol=absolute_tolerance,
                 )
             if not matches:
                 raise ValueError(f"mixed layer topology certificate {name} is stale")
-        axis = {"x": 0, "y": 1, "z": 2}[certificate.resolved_sweep_direction]
-        magnetic_ordinals = np.flatnonzero(self.element_markers == 1)
-        if not len(magnetic_ordinals):
-            raise ValueError("mixed layer topology certificate requires magnetic marker 1")
-        magnetic_nodes = np.unique(
-            np.concatenate([self.cell_node_ids(int(index)) for index in magnetic_ordinals])
-        )
-        planes, tolerance = _cluster_coordinate_planes(self.nodes[magnetic_nodes], axis)
+        if workspace is None:
+            axis = {"x": 0, "y": 1, "z": 2}[
+                certificate.resolved_sweep_direction
+            ]
+            magnetic_ordinals = np.flatnonzero(self.element_markers == 1)
+            if not len(magnetic_ordinals):
+                raise ValueError(
+                    "mixed layer topology certificate requires magnetic marker 1"
+                )
+            magnetic_nodes = np.unique(
+                np.concatenate([
+                    self.cell_node_ids(int(index)) for index in magnetic_ordinals
+                ])
+            )
+            planes, tolerance = _cluster_coordinate_planes(
+                self.nodes[magnetic_nodes], axis
+            )
+        else:
+            planes = workspace.magnetic_layer_coordinates
+            tolerance = workspace.magnetic_layer_tolerance
         if len(planes) != certificate.realized_layer_count + 1 or not np.allclose(
             planes,
             certificate.magnetic_plane_coordinates_m,
@@ -1130,7 +1844,16 @@ class MeshData:
             atol=max(tolerance, certificate.plane_tolerance_m),
         ):
             raise ValueError("mixed layer topology certificate magnetic planes are stale")
-        if _cell_counts_by_marker(self) != certificate.cell_family_counts_by_marker:
+        native_compact_workspace = (
+            workspace is not None
+            and not workspace.cell_nodes_per_ordinal
+            and not workspace.canonical_faces_per_cell
+        )
+        if (
+            not native_compact_workspace
+            and _cell_counts_by_marker(self)
+            != certificate.cell_family_counts_by_marker
+        ):
             raise ValueError("mixed layer topology certificate cell marker counts are stale")
         parts = certificate.cell_family_counts_by_part
         if set(parts) != {"magnetic", "transition_air", "far_air"}:
@@ -1148,8 +1871,13 @@ class MeshData:
             family != "tet4" for family in parts["far_air"]
         ):
             raise ValueError("mixed layer topology certificate transition partition is stale")
-        if _facet_counts_by_role_marker(self) != certificate.facet_family_counts_by_role_marker:
+        if (
+            not native_compact_workspace
+            and _facet_counts_by_role_marker(self)
+            != certificate.facet_family_counts_by_role_marker
+        ):
             raise ValueError("mixed layer topology certificate facet counts are stale")
+
     def topology_fingerprint_v2(self) -> str:
         payload = {
             "nodes": self.nodes.tolist(),
@@ -1323,6 +2051,7 @@ class MeshData:
         per_domain_quality: dict[int, MeshQualityReport] | None = None,
         realization_report: MeshRealizationReport | None = None,
         mixed_layer_topology_certificate: MixedLayerTopologyCertificate | None = None,
+        vertex_identity: Mapping[str, object] | None = None,
     ) -> "MeshData":
         """Normalize the explicit legacy tet4/tri3 boundary into canonical CSR."""
         tet = np.asarray(elements, dtype=np.int32)
@@ -1355,6 +2084,7 @@ class MeshData:
             per_domain_quality=per_domain_quality,
             realization_report=realization_report,
             mixed_layer_topology_certificate=mixed_layer_topology_certificate,
+            vertex_identity=vertex_identity,
             cell_mesh_parts=np.asarray([], dtype=np.str_),
         )
 
@@ -1495,7 +2225,20 @@ class MeshData:
         *,
         require_positive_orientation: bool = True,
         eps_volume: float | None = None,
+        _evidence_coordinate_scale_to_m: float | None = None,
     ) -> None:
+        # Certified mixed meshes already carry native per-cell Jacobian
+        # evidence.  Re-running this check in a Python loop is prohibitively
+        # expensive for the production SP4 mesh, while the native certifier
+        # performs the same geometry/degeneracy/orientation checks in Rayon.
+        # Keep the historical loop as a strict fallback for source-only
+        # runtimes, custom epsilon policies, and uncertified meshes.
+        if (
+            require_positive_orientation
+            and eps_volume is None
+            and self._native_mixed_certificate_valid()
+        ):
+            return
         self.validate()
         if not np.all(np.isfinite(self.nodes)):
             raise ValueError("mesh nodes must be finite")
@@ -1525,17 +2268,154 @@ class MeshData:
                 volume_context = (
                     " (degenerate tetra volume)" if cell_type == "tet4" else ""
                 )
+                evidence = (
+                    self._tet4_strict_failure_evidence(
+                        index,
+                        coordinates,
+                        float(determinants[0]),
+                        resolved_eps,
+                        coordinate_scale_to_m=_evidence_coordinate_scale_to_m,
+                    )
+                    if cell_type == "tet4"
+                    else ""
+                )
                 raise ValueError(
                     f"mesh CSR cell {index} global ordinal {int(self.cell_global_ordinals[index])} "
                     f"has degenerate {cell_type} Jacobian{volume_context} "
-                    f"{minimum_abs:.6e} <= eps {resolved_eps:.6e}"
+                    f"{minimum_abs:.6e} <= eps {resolved_eps:.6e}{evidence}"
                 )
             if require_positive_orientation and np.any(determinants < 0.0):
+                minimum_determinant = float(np.min(determinants))
+                evidence = (
+                    self._tet4_strict_failure_evidence(
+                        index,
+                        coordinates,
+                        minimum_determinant,
+                        resolved_eps,
+                        coordinate_scale_to_m=_evidence_coordinate_scale_to_m,
+                    )
+                    if cell_type == "tet4"
+                    else ""
+                )
                 raise ValueError(
                     f"mesh CSR cell {index} global ordinal {int(self.cell_global_ordinals[index])} "
                     f"has negative {cell_type} Jacobian "
-                    f"{float(np.min(determinants)):.6e}"
+                    f"{minimum_determinant:.6e}{evidence}"
                 )
+
+    def _tet4_strict_failure_evidence(
+        self,
+        index: int,
+        coordinates: NDArray[np.float64],
+        determinant: float,
+        epsilon: float,
+        *,
+        coordinate_scale_to_m: float | None,
+    ) -> str:
+        """Format bounded evidence for one rejected tet without guessing its owner."""
+        node_indices = [int(node) for node in self.cell_node_ids(index)]
+        scale_to_m: float | None = None
+        scale_cubed = 1.0
+        if coordinate_scale_to_m is not None:
+            try:
+                candidate_scale = float(coordinate_scale_to_m)
+                candidate_scale_cubed = candidate_scale**3
+            except (OverflowError, TypeError, ValueError):
+                candidate_scale = float("nan")
+                candidate_scale_cubed = float("nan")
+            if (
+                np.isfinite(candidate_scale)
+                and candidate_scale > 0.0
+                and np.isfinite(candidate_scale_cubed)
+            ):
+                scale_to_m = candidate_scale
+                scale_cubed = candidate_scale_cubed
+
+        raw_coordinates = np.asarray(coordinates, dtype=np.float64)
+        raw_edge_lengths = np.linalg.norm(
+            raw_coordinates[:, np.newaxis, :] - raw_coordinates[np.newaxis, :, :],
+            axis=2,
+        )[np.triu_indices(4, k=1)]
+        if scale_to_m is not None:
+            scaled_coordinates = raw_coordinates * scale_to_m
+            scaled_edges = raw_edge_lengths * scale_to_m
+            scaled_determinant = determinant * scale_cubed
+            scaled_epsilon = epsilon * scale_cubed
+            if (
+                np.all(np.isfinite(scaled_coordinates))
+                and np.all(np.isfinite(scaled_edges))
+                and np.isfinite(scaled_determinant)
+                and np.isfinite(scaled_epsilon)
+            ):
+                evidence_coordinates = scaled_coordinates
+                edge_lengths = scaled_edges
+                determinant = scaled_determinant
+                epsilon = scaled_epsilon
+                coordinate_label = "coordinates_m"
+                determinant_label = "determinant_m3"
+                epsilon_label = "epsilon_m3"
+                edge_min_label = "edge_min_m"
+                edge_max_label = "edge_max_m"
+                diameter_label = "diameter_m"
+            else:
+                scale_to_m = None
+        if scale_to_m is None:
+            evidence_coordinates = raw_coordinates
+            edge_lengths = raw_edge_lengths
+            coordinate_label = "coordinates_mesh_units"
+            determinant_label = "determinant_mesh_units3"
+            epsilon_label = "epsilon_mesh_units3"
+            edge_min_label = "edge_min_mesh_units"
+            edge_max_label = "edge_max_mesh_units"
+            diameter_label = "diameter_mesh_units"
+
+        coordinates_text = "[" + ", ".join(
+            "[" + ", ".join(f"{float(value):.9e}" for value in row) + "]"
+            for row in evidence_coordinates
+        ) + "]"
+        marker = int(self.element_markers[index])
+        return (
+            "; tet4 evidence: "
+            f"node_indices={node_indices}; "
+            f"{coordinate_label}={coordinates_text}; "
+            f"{determinant_label}={determinant:.9e}; "
+            f"{epsilon_label}={epsilon:.9e}; "
+            f"{edge_min_label}={float(np.min(edge_lengths)):.9e}; "
+            f"{edge_max_label}={float(np.max(edge_lengths)):.9e}; "
+            f"{diameter_label}={float(np.max(edge_lengths)):.9e}; "
+            f"element_marker={marker}"
+        )
+
+    def _native_mixed_certificate_valid(self) -> bool:
+        """Return whether the native certifier accepted this exact mesh.
+
+        ``False`` deliberately means "use the reference Python path" rather
+        than treating an unavailable extension as an error.  Certificate
+        construction and ``MeshData`` initialization retain their existing
+        fail-closed behavior; this helper only avoids duplicating an already
+        accepted geometry pass in performance-sensitive serialization paths.
+        """
+        certificate = self.mixed_layer_topology_certificate
+        if certificate is None:
+            return False
+        try:
+            from fullmag import _core
+
+            native = _core.certify_mixed_mesh_arrays(
+                mesh=self,
+                metadata={},
+                certificate=certificate.to_dict(),
+                require_native=False,
+            )
+        except (ImportError, RuntimeError, TypeError, ValueError):
+            return False
+        if native is None or not native.validated_claimed_certificate:
+            return False
+        return (
+            native.topology_fingerprint_v3 == certificate.topology_fingerprint
+            and native.certificate_payload_sha256
+            == _certificate_payload_sha256(certificate)
+        )
 
     def oriented_copy(self) -> "MeshData":
         if self.n_elements == 0:
@@ -1584,6 +2464,7 @@ class MeshData:
             per_domain_quality=self.per_domain_quality,
             realization_report=self.realization_report,
             mixed_layer_topology_certificate=self.mixed_layer_topology_certificate,
+            vertex_identity=self.vertex_identity,
         )
 
     def save(self, path: str | Path) -> None:
@@ -1594,6 +2475,7 @@ class MeshData:
                 json.dumps(
                     {
                         "mesh_name": target.stem,
+                        "vertex_identity": _vertex_identity_to_dict(self.vertex_identity),
                         "nodes": self.nodes.tolist(),
                         "cell_types": self.cell_types.tolist(),
                         "cell_offsets": self.cell_offsets.tolist(),
@@ -1634,6 +2516,7 @@ class MeshData:
         np.savez_compressed(
             target,
             nodes=self.nodes,
+            vertex_identity_json=np.asarray(json.dumps(_vertex_identity_to_dict(self.vertex_identity))),
             cell_types=self.cell_types,
             cell_offsets=self.cell_offsets,
             cell_nodes=self.cell_nodes,
@@ -1865,6 +2748,10 @@ class MeshData:
                 )
         payload = {name: data[name] for name in data.files if not name.endswith("_json")}
         payload.update(
+            vertex_identity=(
+                json.loads(str(data["vertex_identity_json"]))
+                if "vertex_identity_json" in data.files else None
+            ),
             periodic_boundary_pairs=periodic_boundary_pairs,
             periodic_node_pairs=periodic_node_pairs,
             periodic_mesh_certificate=periodic_mesh_certificate,
@@ -1887,6 +2774,7 @@ class MeshData:
             raise ValueError("mesh payload contains both legacy and v2 topology")
         common = dict(
             nodes=payload["nodes"],
+            vertex_identity=payload.get("vertex_identity"),
             element_markers=payload["element_markers"],
             boundary_markers=payload["boundary_markers"],
             periodic_boundary_pairs=[dict(pair) for pair in payload.get("periodic_boundary_pairs", [])],
@@ -1931,9 +2819,25 @@ class MeshData:
             cell_mesh_parts=payload.get("cell_mesh_parts", np.asarray([], dtype=np.str_)),
         )
 
+    def statistics_ir(self, mesh_name: str) -> dict[str, object] | None:
+        if not (
+            np.all(self.cell_types == "tet4")
+            and np.all(self.facet_types == "tri3")
+        ):
+            return None
+        return _mesh_statistics_report_to_ir(
+            _build_mesh_statistics_report(self, mesh_name)
+        )
+
     def to_ir(self, mesh_name: str) -> dict[str, object]:
-        mesh = self.oriented_copy()
-        mesh.validate_strict(require_positive_orientation=True)
+        # Native mixed certification proves positive orientation, so avoid a
+        # second Python pass over every cell merely to discover that no
+        # reorientation is needed.  Uncertified/source-only meshes retain the
+        # legacy orientation and strict-validation behavior.
+        native_mixed_valid = self._native_mixed_certificate_valid()
+        mesh = self if native_mixed_valid else self.oriented_copy()
+        if not native_mixed_valid:
+            mesh.validate_strict(require_positive_orientation=True)
         ir: dict[str, object] = {
             "mesh_name": mesh_name,
             "nodes": mesh.nodes.tolist(),
@@ -1988,10 +2892,9 @@ class MeshData:
                     }
                     for marker, q in mesh.per_domain_quality.items()
             }
-        if np.all(mesh.cell_types == "tet4") and np.all(mesh.facet_types == "tri3"):
-            ir["mesh_statistics"] = _mesh_statistics_report_to_ir(
-                _build_mesh_statistics_report(mesh, mesh_name)
-            )
+        mesh_statistics = mesh.statistics_ir(mesh_name)
+        if mesh_statistics is not None:
+            ir["mesh_statistics"] = mesh_statistics
         return ir
 
 
@@ -2152,6 +3055,500 @@ _MIXED_CELL_LOCAL_FACETS: dict[str, tuple[tuple[int, ...], ...]] = {
     ),
 }
 
+# Canonical physical edges derived from the oriented local faces.  Do not use
+# all node pairs for prism/pyramid/hex quality: diagonals are not mesh edges
+# and would inflate ``cell.max_edge`` and aspect-ratio diagnostics.
+_MIXED_CELL_LOCAL_EDGES: dict[str, tuple[tuple[int, int], ...]] = {
+    family: tuple(
+        sorted(
+            {
+                tuple(sorted((face[index], face[(index + 1) % len(face)])))
+                for face in facets
+                for index in range(len(face))
+            }
+        )
+    )
+    for family, facets in _MIXED_CELL_LOCAL_FACETS.items()
+}
+
+
+@dataclass(frozen=True)
+class _MixedTopologyWorkspace:
+    topology_fingerprint_v3: str
+    sweep_axis: int
+    interface_marker: int
+    cell_nodes_per_ordinal: tuple[NDArray[np.int32], ...]
+    canonical_faces_per_cell: tuple[tuple[tuple[int, ...], ...], ...]
+    face_owners: Mapping[tuple[int, ...], tuple[int, ...]]
+    cell_family_ordinals: Mapping[str, tuple[int, ...]]
+    cell_signed_volumes: NDArray[np.float64]
+    cell_absolute_volumes: NDArray[np.float64]
+    pyramid_base_classification: Mapping[tuple[int, ...], bool]
+    magnetic_layer_coordinates: tuple[float, ...]
+    magnetic_layer_tolerance: float
+
+
+@dataclass(frozen=True, eq=False)
+class _BoundMixedTopologyContext:
+    mesh: MeshData = field(repr=False, compare=False)
+    workspace: _MixedTopologyWorkspace
+    actual_topology_fingerprint_v3: str
+    sweep_axis: int
+    interface_marker: int
+    _capability: object = field(repr=False, compare=False)
+
+
+_BOUND_MIXED_TOPOLOGY_CAPABILITY = object()
+_MINTED_BOUND_MIXED_TOPOLOGY_CONTEXTS: WeakSet[_BoundMixedTopologyContext] = (
+    WeakSet()
+)
+
+
+@dataclass(frozen=True, eq=False)
+class _CanonicalMixedCertificateEvidence:
+    evidence: Mapping[str, object]
+    context: _BoundMixedTopologyContext
+    _capability: object = field(repr=False, compare=False)
+
+
+_CANONICAL_MIXED_EVIDENCE_CAPABILITY = object()
+_MINTED_CANONICAL_MIXED_EVIDENCE: WeakSet[
+    _CanonicalMixedCertificateEvidence
+] = WeakSet()
+
+
+def _build_mixed_topology_workspace(
+    mesh: MeshData,
+    *,
+    sweep_axis: int,
+    interface_marker: int,
+    _topology_fingerprint_v3: str | None = None,
+) -> _MixedTopologyWorkspace:
+    cell_nodes_per_ordinal_list: list[NDArray[np.int32]] = []
+    for ordinal in range(mesh.n_elements):
+        cell = mesh.cell_node_ids(ordinal)
+        cell.setflags(write=False)
+        cell_nodes_per_ordinal_list.append(cell)
+    cell_nodes_per_ordinal = tuple(cell_nodes_per_ordinal_list)
+    canonical_faces_per_cell = tuple(
+        tuple(
+            tuple(sorted(int(cell[index]) for index in local_face))
+            for local_face in _MIXED_CELL_LOCAL_FACETS[str(family)]
+        )
+        for family, cell in zip(
+            mesh.cell_types.tolist(), cell_nodes_per_ordinal, strict=True
+        )
+    )
+    face_owners = {
+        face: tuple(owners)
+        for face, owners in _mixed_face_adjacency(
+            mesh,
+            canonical_faces_per_cell=canonical_faces_per_cell,
+        ).items()
+    }
+    family_ordinals: dict[str, list[int]] = {}
+    signed_volumes = np.zeros(mesh.n_elements, dtype=np.float64)
+    absolute_volumes = np.zeros(mesh.n_elements, dtype=np.float64)
+    for ordinal, (family, cell) in enumerate(zip(
+        mesh.cell_types.tolist(), cell_nodes_per_ordinal, strict=True
+    )):
+        family_ordinals.setdefault(str(family), []).append(ordinal)
+        coordinates = mesh.nodes[cell]
+        signed, absolute = _mixed_cell_signed_and_absolute_volume(
+            str(family), coordinates
+        )
+        signed_volumes[ordinal] = signed
+        absolute_volumes[ordinal] = absolute
+
+    interface_quads = {
+        tuple(sorted(int(node) for node in mesh.facet_node_ids(ordinal)))
+        for ordinal, (family, role, marker) in enumerate(zip(
+            mesh.facet_types.tolist(),
+            mesh.facet_roles.tolist(),
+            mesh.boundary_markers.tolist(),
+            strict=True,
+        ))
+        if family == "quad4"
+        and role == "material_interface"
+        and int(marker) == interface_marker
+    }
+    pyramid_bases = {
+        tuple(sorted(int(cell[index]) for index in (0, 1, 2, 3)))
+        for ordinal in family_ordinals.get("pyramid5", [])
+        for cell in (cell_nodes_per_ordinal[ordinal],)
+    }
+    magnetic_ordinals = np.flatnonzero(mesh.element_markers == 1)
+    if len(magnetic_ordinals):
+        magnetic_nodes = np.unique(np.concatenate([
+            cell_nodes_per_ordinal[int(ordinal)] for ordinal in magnetic_ordinals
+        ]))
+        magnetic_planes, magnetic_tolerance = _cluster_coordinate_planes(
+            mesh.nodes[magnetic_nodes], sweep_axis
+        )
+    else:
+        magnetic_planes = ()
+        magnetic_tolerance = FEM_EXACT_LAYER_PLANE_ABS_TOLERANCE_M
+    signed_volumes.setflags(write=False)
+    absolute_volumes.setflags(write=False)
+    return _MixedTopologyWorkspace(
+        topology_fingerprint_v3=(
+            _topology_fingerprint_v3 or mesh.topology_fingerprint_v3()
+        ),
+        sweep_axis=sweep_axis,
+        interface_marker=interface_marker,
+        cell_nodes_per_ordinal=cell_nodes_per_ordinal,
+        canonical_faces_per_cell=canonical_faces_per_cell,
+        face_owners=MappingProxyType(face_owners),
+        cell_family_ordinals=MappingProxyType({
+            family: tuple(ordinals)
+            for family, ordinals in sorted(family_ordinals.items())
+        }),
+        cell_signed_volumes=signed_volumes,
+        cell_absolute_volumes=absolute_volumes,
+        pyramid_base_classification=MappingProxyType({
+            face: face in interface_quads for face in sorted(pyramid_bases)
+        }),
+        magnetic_layer_coordinates=magnetic_planes,
+        magnetic_layer_tolerance=magnetic_tolerance,
+    )
+
+
+def _build_mixed_topology_workspace_from_native(
+    mesh: MeshData,
+    *,
+    sweep_axis: int,
+    interface_marker: int,
+    topology_fingerprint_v3: str,
+    magnetic_layer_coordinates: tuple[float, ...],
+    magnetic_layer_tolerance: float,
+) -> _MixedTopologyWorkspace:
+    """Create the small binding workspace after native certification.
+
+    The native certifier already owns the expensive per-cell geometry and face
+    audit.  Python only needs an identity-bound carrier for certificate
+    construction; retaining millions of Python face/volume objects here would
+    turn a linear Rust pass back into the historical multi-minute bottleneck.
+    The full workspace builder remains the fail-closed fallback when the
+    optional extension is unavailable.
+    """
+    if not isinstance(topology_fingerprint_v3, str) or not topology_fingerprint_v3:
+        raise ValueError("native mixed topology fingerprint must be non-empty")
+    if sweep_axis not in (0, 1, 2):
+        raise ValueError("mixed topology workspace sweep axis must be 0, 1, or 2")
+    if not math.isfinite(float(magnetic_layer_tolerance)) or magnetic_layer_tolerance <= 0.0:
+        raise ValueError("native mixed topology plane tolerance must be positive")
+
+    # Pyramid base classification is the only topology detail consumed by the
+    # binding checks.  It is bounded by the transition shell, unlike the full
+    # cell/face adjacency workspace.
+    interface_quads = {
+        tuple(sorted(int(node) for node in mesh.facet_node_ids(ordinal)))
+        for ordinal, (family, role, marker) in enumerate(zip(
+            mesh.facet_types.tolist(),
+            mesh.facet_roles.tolist(),
+            mesh.boundary_markers.tolist(),
+            strict=True,
+        ))
+        if family == "quad4"
+        and role == "material_interface"
+        and int(marker) == interface_marker
+    }
+    pyramid_bases: dict[tuple[int, ...], bool] = {}
+    for ordinal in np.flatnonzero(mesh.cell_types == "pyramid5"):
+        cell = mesh.cell_node_ids(int(ordinal))
+        base = tuple(sorted(int(cell[index]) for index in (0, 1, 2, 3)))
+        pyramid_bases[base] = base in interface_quads
+
+    empty_f64 = np.zeros(0, dtype=np.float64)
+    empty_f64.setflags(write=False)
+    return _MixedTopologyWorkspace(
+        topology_fingerprint_v3=topology_fingerprint_v3,
+        sweep_axis=sweep_axis,
+        interface_marker=interface_marker,
+        cell_nodes_per_ordinal=(),
+        canonical_faces_per_cell=(),
+        face_owners=MappingProxyType({}),
+        cell_family_ordinals=MappingProxyType({}),
+        cell_signed_volumes=empty_f64,
+        cell_absolute_volumes=empty_f64,
+        pyramid_base_classification=MappingProxyType(pyramid_bases),
+        magnetic_layer_coordinates=tuple(float(value) for value in magnetic_layer_coordinates),
+        magnetic_layer_tolerance=float(magnetic_layer_tolerance),
+    )
+
+
+def _require_mixed_topology_workspace(
+    mesh: MeshData,
+    workspace: _MixedTopologyWorkspace,
+    *,
+    sweep_axis: int | None = None,
+    interface_marker: int | None = None,
+    _bound_context: _BoundMixedTopologyContext | None = None,
+    _actual_topology_fingerprint_v3: str | None = None,
+) -> _BoundMixedTopologyContext:
+    if not isinstance(workspace, _MixedTopologyWorkspace):
+        raise TypeError("mixed topology workspace has an invalid type")
+    if _bound_context is not None:
+        if (
+            not isinstance(_bound_context, _BoundMixedTopologyContext)
+            or _bound_context not in _MINTED_BOUND_MIXED_TOPOLOGY_CONTEXTS
+        ):
+            raise ValueError("mixed topology bound context is not owner-minted")
+        if (
+            _bound_context._capability is not _BOUND_MIXED_TOPOLOGY_CAPABILITY
+            or _bound_context.mesh is not mesh
+            or _bound_context.workspace is not workspace
+        ):
+            raise ValueError("mixed topology bound context is invalid")
+        if sweep_axis is not None and _bound_context.sweep_axis != sweep_axis:
+            raise ValueError("mixed topology workspace sweep axis does not match")
+        if (
+            interface_marker is not None
+            and _bound_context.interface_marker != interface_marker
+        ):
+            raise ValueError("mixed topology workspace interface marker does not match")
+        return _bound_context
+    actual_fingerprint = (
+        _actual_topology_fingerprint_v3 or mesh.topology_fingerprint_v3()
+    )
+    if workspace.topology_fingerprint_v3 != actual_fingerprint:
+        raise ValueError("mixed topology workspace topology fingerprint is stale")
+    if sweep_axis is not None and workspace.sweep_axis != sweep_axis:
+        raise ValueError("mixed topology workspace sweep axis does not match")
+    if interface_marker is not None and workspace.interface_marker != interface_marker:
+        raise ValueError("mixed topology workspace interface marker does not match")
+    context = _BoundMixedTopologyContext(
+        mesh=mesh,
+        workspace=workspace,
+        actual_topology_fingerprint_v3=actual_fingerprint,
+        sweep_axis=workspace.sweep_axis,
+        interface_marker=workspace.interface_marker,
+        _capability=_BOUND_MIXED_TOPOLOGY_CAPABILITY,
+    )
+    _MINTED_BOUND_MIXED_TOPOLOGY_CONTEXTS.add(context)
+    return context
+
+
+def _immutable_mixed_certificate_evidence(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({
+            str(key): _immutable_mixed_certificate_evidence(item)
+            for key, item in value.items()
+        })
+    if isinstance(value, list):
+        return tuple(_immutable_mixed_certificate_evidence(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_immutable_mixed_certificate_evidence(item) for item in value)
+    return value
+
+
+def _mixed_certificate_evidence_payload(
+    evidence: Mapping[str, object],
+) -> dict[str, object]:
+    def mutable(value: object) -> object:
+        if isinstance(value, Mapping):
+            return {str(key): mutable(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(mutable(item) for item in value)
+        return value
+
+    return {str(key): mutable(value) for key, value in evidence.items()}
+
+
+def _validate_and_create_prevalidated_mixed_certificate(
+    mesh_without_certificate: MeshData,
+    *,
+    certificate: MixedLayerTopologyCertificate,
+    canonical_evidence: _CanonicalMixedCertificateEvidence,
+) -> _PrevalidatedMixedCertificate:
+    if mesh_without_certificate.mixed_layer_topology_certificate is not None:
+        raise ValueError("prevalidated mixed certificate requires an unsigned mesh")
+    if not isinstance(canonical_evidence, _CanonicalMixedCertificateEvidence):
+        raise TypeError("mixed certificate evidence requires a canonical carrier")
+    if canonical_evidence not in _MINTED_CANONICAL_MIXED_EVIDENCE:
+        raise ValueError("mixed certificate evidence carrier is not owner-minted")
+    if canonical_evidence._capability is not _CANONICAL_MIXED_EVIDENCE_CAPABILITY:
+        raise ValueError("mixed certificate evidence carrier is not canonical")
+    context = canonical_evidence.context
+    workspace = context.workspace
+    mesh_without_certificate._validate_mixed_layer_topology_certificate_binding(
+        certificate,
+        workspace=workspace,
+        validate_topology=False,
+        _bound_context=context,
+    )
+    mesh_without_certificate._validate_mixed_layer_topology_certificate_topology(
+        certificate,
+        topology_fingerprint_v3=workspace.topology_fingerprint_v3,
+    )
+    mesh_without_certificate._validate_mixed_layer_topology_certificate_evidence(
+        certificate,
+        canonical_evidence.evidence,
+        workspace=workspace,
+        _bound_context=context,
+    )
+    return _PrevalidatedMixedCertificate(
+        certificate=certificate,
+        topology_fingerprint_v3=workspace.topology_fingerprint_v3,
+        certificate_payload_sha256=_certificate_payload_sha256(certificate),
+        canonical_evidence=canonical_evidence,
+        _validation_token=_PREVALIDATED_MIXED_CERTIFICATE_TOKEN,
+    )
+
+
+def _bind_trusted_topology_fingerprint_v3(
+    *,
+    mesh_without_certificate: MeshData,
+    _receipt_capability: object,
+) -> _TrustedTopologyFingerprintV3Context:
+    """Compute one identity-bound Python topology fingerprint for trusted load."""
+    if _receipt_capability is not _TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY:
+        raise ValueError("trusted receipt capability is invalid")
+    if mesh_without_certificate.mixed_layer_topology_certificate is not None:
+        raise ValueError("trusted topology context requires an unsigned mesh")
+    context = _TrustedTopologyFingerprintV3Context(
+        mesh_without_certificate=mesh_without_certificate,
+        topology_fingerprint_v3=mesh_without_certificate.topology_fingerprint_v3(),
+        _capability=_TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY,
+    )
+    _MINTED_TRUSTED_TOPOLOGY_FINGERPRINT_CONTEXTS.add(context)
+    return context
+
+
+def _bind_trusted_topology_fingerprint_v3_from_native(
+    *,
+    mesh_without_certificate: MeshData,
+    native_preflight: object,
+    _receipt_capability: object,
+) -> _TrustedTopologyFingerprintV3Context:
+    """Bind a trusted topology context to an already completed native proof.
+
+    ``preflight_mixed_mesh_arrays`` computes the canonical v3 fingerprint in
+    Rust while validating the complete typed CSR payload.  The trusted loader
+    can therefore carry that identity forward instead of recomputing the
+    Python byte stream.  A compact content guard is retained for the narrow
+    in-process interval between preflight and signed ``MeshData`` creation;
+    it detects mutation without weakening the native structural proof.
+    """
+    from fullmag._core import NativeMixedPreflightResult
+
+    if _receipt_capability is not _TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY:
+        raise ValueError("trusted receipt capability is invalid")
+    if mesh_without_certificate.mixed_layer_topology_certificate is not None:
+        raise ValueError("trusted topology context requires an unsigned mesh")
+    if not isinstance(native_preflight, NativeMixedPreflightResult):
+        raise TypeError("native preflight result has an invalid type")
+    actual_counts = {
+        "nodes": mesh_without_certificate.n_nodes,
+        "cells": mesh_without_certificate.n_elements,
+        "facets": mesh_without_certificate.n_boundary_faces,
+    }
+    if native_preflight.counts != actual_counts:
+        raise ValueError("native preflight mesh counts do not match the mesh")
+    fingerprint = native_preflight.topology_fingerprint_v3
+    if (
+        not isinstance(fingerprint, str)
+        or not fingerprint.startswith("sha256:")
+        or len(fingerprint) != len("sha256:") + 64
+        or any(character not in "0123456789abcdef" for character in fingerprint[7:])
+    ):
+        raise ValueError("native preflight topology fingerprint is invalid")
+    context = _TrustedTopologyFingerprintV3Context(
+        mesh_without_certificate=mesh_without_certificate,
+        topology_fingerprint_v3=fingerprint,
+        _capability=_TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY,
+        mesh_mutation_guard_sha256=_trusted_mesh_mutation_guard_sha256(
+            mesh_without_certificate
+        ),
+    )
+    _MINTED_TRUSTED_TOPOLOGY_FINGERPRINT_CONTEXTS.add(context)
+    return context
+
+
+def _mint_trusted_native_preflight_receipt_proof(
+    *,
+    mesh_without_certificate: MeshData,
+    certificate: MixedLayerTopologyCertificate,
+    native_preflight: object,
+    topology_context: _TrustedTopologyFingerprintV3Context,
+    expected_topology_fingerprint_v3: str,
+    expected_certificate_payload_sha256: str,
+    expected_counts: Mapping[str, int],
+    _receipt_capability: object,
+) -> _TrustedNativePreflightReceiptProof:
+    """Mint the narrow proof consumed only after trusted-cache receipt checks."""
+    from fullmag._core import NativeMixedPreflightResult
+
+    if _receipt_capability is not _TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY:
+        raise ValueError("trusted receipt capability is invalid")
+    if mesh_without_certificate.mixed_layer_topology_certificate is not None:
+        raise ValueError("trusted native preflight proof requires an unsigned mesh")
+    if not isinstance(certificate, MixedLayerTopologyCertificate):
+        raise TypeError("trusted receipt certificate has an invalid type")
+    if not isinstance(native_preflight, NativeMixedPreflightResult):
+        raise TypeError("native preflight result has an invalid type")
+    if (
+        not isinstance(topology_context, _TrustedTopologyFingerprintV3Context)
+        or topology_context not in _MINTED_TRUSTED_TOPOLOGY_FINGERPRINT_CONTEXTS
+        or topology_context._capability
+        is not _TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY
+        or topology_context.mesh_without_certificate is not mesh_without_certificate
+    ):
+        raise ValueError("trusted topology fingerprint context is invalid")
+
+    actual_counts = {
+        "nodes": mesh_without_certificate.n_nodes,
+        "cells": mesh_without_certificate.n_elements,
+        "facets": mesh_without_certificate.n_boundary_faces,
+    }
+    normalized_expected_counts = {
+        str(name): int(value) for name, value in expected_counts.items()
+    }
+    if normalized_expected_counts != actual_counts:
+        raise ValueError("trusted receipt mesh counts do not match the mesh")
+    if native_preflight.counts != actual_counts:
+        raise ValueError("native preflight mesh counts do not match the mesh")
+
+    actual_fingerprint = topology_context.topology_fingerprint_v3
+    expected_fingerprint = (
+        expected_topology_fingerprint_v3
+        if expected_topology_fingerprint_v3.startswith("sha256:")
+        else f"sha256:{expected_topology_fingerprint_v3}"
+    )
+    native_fingerprint = (
+        native_preflight.topology_fingerprint_v3
+        if native_preflight.topology_fingerprint_v3.startswith("sha256:")
+        else f"sha256:{native_preflight.topology_fingerprint_v3}"
+    )
+    if actual_fingerprint != expected_fingerprint:
+        raise ValueError("trusted receipt topology fingerprint does not match the mesh")
+    if native_fingerprint != expected_fingerprint:
+        raise ValueError("native preflight topology fingerprint does not match receipt")
+    if certificate.topology_fingerprint_version != "v3" or (
+        certificate.topology_fingerprint != actual_fingerprint
+    ):
+        raise ValueError("trusted receipt certificate topology fingerprint is stale")
+
+    actual_payload_sha256 = _certificate_payload_sha256(certificate)
+    expected_payload_sha256 = (
+        expected_certificate_payload_sha256
+        if expected_certificate_payload_sha256.startswith("sha256:")
+        else f"sha256:{expected_certificate_payload_sha256}"
+    )
+    if actual_payload_sha256 != expected_payload_sha256:
+        raise ValueError("trusted receipt certificate payload digest is stale")
+
+    proof = _TrustedNativePreflightReceiptProof(
+        mesh_without_certificate=mesh_without_certificate,
+        certificate=certificate,
+        topology_context=topology_context,
+        certificate_payload_sha256=actual_payload_sha256,
+        counts=MappingProxyType(actual_counts),
+        _capability=_TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY,
+    )
+    _MINTED_TRUSTED_NATIVE_PREFLIGHT_RECEIPT_PROOFS.add(proof)
+    return proof
+
 
 def _mixed_face_frequencies(
     faces: list[tuple[int, ...]],
@@ -2166,15 +3563,27 @@ def _mixed_mesh_conformity_counts(
     tolerance: float,
     interface_marker: int = MIXED_INTERFACE_MARKER,
     outer_boundary_marker: int | None = None,
+    workspace: _MixedTopologyWorkspace | None = None,
+    _bound_context: _BoundMixedTopologyContext | None = None,
 ) -> dict[str, int]:
-    adjacency: dict[tuple[int, ...], list[tuple[int, str]]] = {}
-    for ordinal, family in enumerate(mesh.cell_types.tolist()):
-        cell = mesh.cell_node_ids(ordinal)
-        for local_face in _MIXED_CELL_LOCAL_FACETS[str(family)]:
-            key = tuple(sorted(int(cell[index]) for index in local_face))
-            adjacency.setdefault(key, []).append(
-                (int(mesh.element_markers[ordinal]), str(family))
-            )
+    workspace_was_built = workspace is None
+    resolved_workspace = workspace or _build_mixed_topology_workspace(
+        mesh,
+        sweep_axis=0,
+        interface_marker=interface_marker,
+    )
+    context = _require_mixed_topology_workspace(
+        mesh,
+        resolved_workspace,
+        interface_marker=interface_marker,
+        _bound_context=_bound_context,
+        _actual_topology_fingerprint_v3=(
+            resolved_workspace.topology_fingerprint_v3
+            if workspace_was_built
+            else None
+        ),
+    )
+    adjacency = resolved_workspace.face_owners
 
     explicit: dict[tuple[int, ...], list[int]] = {}
     exterior: list[tuple[int, ...]] = []
@@ -2199,14 +3608,17 @@ def _mixed_mesh_conformity_counts(
             interfaces.append(key)
             if (
                 len(owners) != 2
-                or {marker for marker, _ in owners} != {0, 1}
+                or {int(mesh.element_markers[owner]) for owner in owners} != {0, 1}
                 or int(mesh.boundary_markers[ordinal]) != interface_marker
             ):
                 nonconforming += 1
 
     nonmanifold = sum(1 for owners in adjacency.values() if len(owners) > 2)
     same_side_two_owner_faces = _mixed_same_side_two_owner_face_count(
-        mesh, tolerance=tolerance
+        mesh,
+        tolerance=tolerance,
+        workspace=resolved_workspace,
+        _bound_context=context,
     )
     exterior_frequencies = _mixed_face_frequencies(exterior)
     interface_frequencies = _mixed_face_frequencies(interfaces)
@@ -2220,7 +3632,8 @@ def _mixed_mesh_conformity_counts(
         1
         for key, owners in adjacency.items()
         if len(owners) == 2
-        and owners[0][0] != owners[1][0]
+        and int(mesh.element_markers[owners[0]])
+        != int(mesh.element_markers[owners[1]])
         and interface_frequencies[key] != 1
     )
     nonconforming += sum(
@@ -2251,21 +3664,47 @@ def _mixed_mesh_conformity_counts(
 
 
 def _mixed_same_side_two_owner_face_count(
-    mesh: MeshData, *, tolerance: float
+    mesh: MeshData,
+    *,
+    tolerance: float,
+    workspace: _MixedTopologyWorkspace | None = None,
+    _bound_context: _BoundMixedTopologyContext | None = None,
 ) -> int:
     """Count shared faces whose two owner interiors lie on the same plane side."""
-    return len(_mixed_same_side_two_owner_face_details(mesh, tolerance=tolerance))
+    if workspace is not None:
+        context = _require_mixed_topology_workspace(
+            mesh,
+            workspace,
+            _bound_context=_bound_context,
+        )
+    else:
+        context = None
+    return len(_mixed_same_side_two_owner_face_details(
+        mesh,
+        tolerance=tolerance,
+        workspace=workspace,
+        _bound_context=context,
+    ))
 
 
 def _mixed_same_side_two_owner_face_details(
-    mesh: MeshData, *, tolerance: float
+    mesh: MeshData,
+    *,
+    tolerance: float,
+    workspace: _MixedTopologyWorkspace | None = None,
+    _bound_context: _BoundMixedTopologyContext | None = None,
 ) -> list[tuple[tuple[int, ...], list[int], list[float]]]:
-    adjacency: dict[tuple[int, ...], list[int]] = {}
-    for ordinal, family in enumerate(mesh.cell_types.tolist()):
-        cell = mesh.cell_node_ids(ordinal)
-        for local_face in _MIXED_CELL_LOCAL_FACETS[str(family)]:
-            key = tuple(sorted(int(cell[index]) for index in local_face))
-            adjacency.setdefault(key, []).append(ordinal)
+    if workspace is not None:
+        _require_mixed_topology_workspace(
+            mesh,
+            workspace,
+            _bound_context=_bound_context,
+        )
+    adjacency = (
+        workspace.face_owners
+        if workspace is not None
+        else _mixed_face_adjacency(mesh)
+    )
 
     issues: list[tuple[tuple[int, ...], list[int], list[float]]] = []
     for face, owners in adjacency.items():
@@ -2283,7 +3722,7 @@ def _mixed_same_side_two_owner_face_details(
                 normal = candidate / candidate_norm
                 break
         if normal is None:
-            issues.append((face, owners, [0.0, 0.0]))
+            issues.append((face, list(owners), [0.0, 0.0]))
             continue
         face_scale = max(
             float(np.linalg.norm(right - left))
@@ -2295,7 +3734,11 @@ def _mixed_same_side_two_owner_face_details(
         )
         distances: list[float] = []
         for owner in owners:
-            owner_nodes = mesh.cell_node_ids(owner)
+            owner_nodes = (
+                workspace.cell_nodes_per_ordinal[owner]
+                if workspace is not None
+                else mesh.cell_node_ids(owner)
+            )
             opposite_nodes = [int(node) for node in owner_nodes if int(node) not in face]
             if not opposite_nodes:
                 distances.append(0.0)
@@ -2309,7 +3752,7 @@ def _mixed_same_side_two_owner_face_details(
             and abs(distances[1]) > side_tolerance
             and distances[0] * distances[1] > 0.0
         ):
-            issues.append((face, owners, distances))
+            issues.append((face, list(owners), distances))
     return issues
 
 
@@ -2466,49 +3909,122 @@ def _mixed_mesh_conformity_diagnostics(
     return diagnostics
 
 
-def _mixed_cell_volume(family: str, coordinates: NDArray[np.float64]) -> float:
-    def tet(indices: tuple[int, int, int, int]) -> float:
-        points = coordinates[list(indices)]
-        return abs(float(np.linalg.det(np.stack(
-            [points[1] - points[0], points[2] - points[0], points[3] - points[0]],
-            axis=1,
-        )))) / 6.0
+_MIXED_CELL_TETRA_DECOMPOSITIONS = {
+    "tet4": ((0, 1, 2, 3),),
+    "prism6": ((0, 1, 2, 3), (1, 2, 3, 4), (2, 3, 4, 5)),
+    "pyramid5": ((0, 1, 2, 4), (0, 2, 3, 4)),
+    "hex8": (
+        (0, 1, 3, 4),
+        (1, 2, 3, 6),
+        (1, 3, 4, 6),
+        (1, 4, 5, 6),
+        (3, 4, 6, 7),
+    ),
+}
 
+
+def _mixed_cell_signed_and_absolute_volume(
+    family: str,
+    coordinates: NDArray[np.float64],
+) -> tuple[float, float]:
+    try:
+        decompositions = _MIXED_CELL_TETRA_DECOMPOSITIONS[family]
+    except KeyError as error:
+        raise ValueError(
+            f"mixed shared-domain certificate does not support {family}"
+        ) from error
+    signed_tetra_volumes = tuple(
+        float(np.linalg.det(np.stack(
+            [
+                coordinates[indices[1]] - coordinates[indices[0]],
+                coordinates[indices[2]] - coordinates[indices[0]],
+                coordinates[indices[3]] - coordinates[indices[0]],
+            ],
+            axis=1,
+        ))) / 6.0
+        for indices in decompositions
+    )
+    return sum(signed_tetra_volumes), sum(abs(value) for value in signed_tetra_volumes)
+
+
+def _mixed_reference_derivative_samples(family: str) -> NDArray[np.float64]:
+    """Return the fixed order-2 reference derivatives for one cell family."""
+    q = 1.0 / math.sqrt(3.0)
     if family == "tet4":
-        return tet((0, 1, 2, 3))
+        return np.asarray(
+            [[[-1.0, -1.0, -1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]],
+            dtype=np.float64,
+        )
     if family == "prism6":
-        return sum(tet(indices) for indices in ((0, 1, 2, 3), (1, 2, 3, 4), (2, 3, 4, 5)))
+        triangle_points = (
+            (1.0 / 6.0, 1.0 / 6.0),
+            (2.0 / 3.0, 1.0 / 6.0),
+            (1.0 / 6.0, 2.0 / 3.0),
+        )
+        return np.asarray(
+            [
+                [
+                    [-(1 - t) / 2, -(1 - t) / 2, -(1 - r - s) / 2],
+                    [(1 - t) / 2, 0.0, -r / 2],
+                    [0.0, (1 - t) / 2, -s / 2],
+                    [-(1 + t) / 2, -(1 + t) / 2, (1 - r - s) / 2],
+                    [(1 + t) / 2, 0.0, r / 2],
+                    [0.0, (1 + t) / 2, s / 2],
+                ]
+                for t in (-q, q)
+                for r, s in triangle_points
+            ],
+            dtype=np.float64,
+        )
     if family == "pyramid5":
-        return tet((0, 1, 2, 4)) + tet((0, 2, 3, 4))
-    raise ValueError(f"mixed shared-domain certificate does not support {family}")
+        qt = math.sqrt(10.0) / 15.0
+        return np.asarray(
+            [
+                [
+                    [-(1 - s) * (1 - t) / 4, -(1 - r) * (1 - t) / 4, -(1 - r) * (1 - s) / 4],
+                    [(1 - s) * (1 - t) / 4, -(1 + r) * (1 - t) / 4, -(1 + r) * (1 - s) / 4],
+                    [(1 + s) * (1 - t) / 4, (1 + r) * (1 - t) / 4, -(1 + r) * (1 + s) / 4],
+                    [-(1 + s) * (1 - t) / 4, (1 - r) * (1 - t) / 4, -(1 - r) * (1 + s) / 4],
+                    [0.0, 0.0, 1.0],
+                ]
+                for t in (1.0 / 3.0 - qt, 1.0 / 3.0 + qt)
+                for r in (-q, q)
+                for s in (-q, q)
+            ],
+            dtype=np.float64,
+        )
+    raise ValueError(f"mixed quality metric does not support {family}")
 
 
 def _mixed_cell_scaled_jacobians(
     family: str, coordinates: NDArray[np.float64]
 ) -> NDArray[np.float64]:
-    decompositions = {
-        "tet4": ((0, 1, 2, 3),),
-        "prism6": ((0, 1, 2, 3), (1, 2, 3, 4), (2, 3, 4, 5)),
-        "pyramid5": ((0, 1, 2, 4), (0, 2, 3, 4)),
-    }[family]
+    """Evaluate the normalized mapped Jacobian in the native topology."""
     values: list[float] = []
-    for indices in decompositions:
-        points = coordinates[list(indices)]
-        matrix = np.stack(
-            [points[1] - points[0], points[2] - points[0], points[3] - points[0]],
-            axis=1,
-        )
+    for derivatives in _mixed_reference_derivative_samples(family):
+        matrix = coordinates.T @ derivatives
         denominator = float(np.prod(np.linalg.norm(matrix, axis=0)))
         values.append(abs(float(np.linalg.det(matrix))) / denominator if denominator else 0.0)
     return np.asarray(values, dtype=np.float64)
 
 
-def _mixed_face_adjacency(mesh: MeshData) -> dict[tuple[int, ...], list[int]]:
+def _mixed_face_adjacency(
+    mesh: MeshData,
+    *,
+    canonical_faces_per_cell: tuple[tuple[tuple[int, ...], ...], ...] | None = None,
+) -> dict[tuple[int, ...], list[int]]:
     adjacency: dict[tuple[int, ...], list[int]] = {}
-    for ordinal, family in enumerate(mesh.cell_types.tolist()):
-        cell = mesh.cell_node_ids(ordinal)
-        for local_face in _MIXED_CELL_LOCAL_FACETS[str(family)]:
-            key = tuple(sorted(int(cell[index]) for index in local_face))
+    if canonical_faces_per_cell is None:
+        canonical_faces_per_cell = tuple(
+            tuple(
+                tuple(sorted(int(cell[index]) for index in local_face))
+                for local_face in _MIXED_CELL_LOCAL_FACETS[str(family)]
+            )
+            for ordinal, family in enumerate(mesh.cell_types.tolist())
+            for cell in (mesh.cell_node_ids(ordinal),)
+        )
+    for ordinal, faces in enumerate(canonical_faces_per_cell):
+        for key in faces:
             adjacency.setdefault(key, []).append(ordinal)
     return adjacency
 
@@ -2517,7 +4033,23 @@ def _validate_mixed_pyramid_bases(
     mesh: MeshData,
     *,
     interface_marker: int,
+    workspace: _MixedTopologyWorkspace | None = None,
+    _bound_context: _BoundMixedTopologyContext | None = None,
 ) -> None:
+    if workspace is not None:
+        _require_mixed_topology_workspace(
+            mesh,
+            workspace,
+            interface_marker=interface_marker,
+            _bound_context=_bound_context,
+        )
+        classification = workspace.pyramid_base_classification
+        if not classification or not all(classification.values()):
+            raise ValueError(
+                "mixed layer topology certificate pyramid bases must be exact quad4 "
+                f"material-interface facets with marker {interface_marker}"
+            )
+        return
     interface_quads = {
         tuple(sorted(int(node) for node in mesh.facet_node_ids(ordinal)))
         for ordinal, (family, role, marker) in enumerate(zip(
@@ -2567,6 +4099,8 @@ def _recompute_mixed_certificate_evidence(
     magnetic_bounds_max_m: tuple[float, float, float],
     airbox_bounds_min_m: tuple[float, float, float],
     airbox_bounds_max_m: tuple[float, float, float],
+    workspace: _MixedTopologyWorkspace | None = None,
+    _bound_context: _BoundMixedTopologyContext | None = None,
 ) -> dict[str, object]:
     if mesh.cell_mesh_parts.shape != (mesh.n_elements,):
         raise ValueError("mixed layer topology certificate requires per-cell mesh parts")
@@ -2587,12 +4121,29 @@ def _recompute_mixed_certificate_evidence(
     if set(part_counts) != set(allowed) or not all(part_counts[part] for part in allowed):
         raise ValueError("mixed layer topology certificate mesh parts are incomplete")
 
-    volumes = np.zeros(mesh.n_elements, dtype=np.float64)
+    workspace_was_built = workspace is None
+    resolved_workspace = workspace or _build_mixed_topology_workspace(
+        mesh,
+        sweep_axis=sweep_axis,
+        interface_marker=interface_marker,
+    )
+    context = _require_mixed_topology_workspace(
+        mesh,
+        resolved_workspace,
+        sweep_axis=sweep_axis,
+        interface_marker=interface_marker,
+        _bound_context=_bound_context,
+        _actual_topology_fingerprint_v3=(
+            resolved_workspace.topology_fingerprint_v3
+            if workspace_was_built
+            else None
+        ),
+    )
+    volumes = resolved_workspace.cell_absolute_volumes
     jacobians: dict[str, list[float]] = {}
     scaled: dict[str, list[float]] = {}
     for ordinal, family in enumerate(mesh.cell_types.tolist()):
-        coordinates = mesh.nodes[mesh.cell_node_ids(ordinal)]
-        volumes[ordinal] = _mixed_cell_volume(family, coordinates)
+        coordinates = mesh.nodes[resolved_workspace.cell_nodes_per_ordinal[ordinal]]
         jacobians.setdefault(family, []).extend(
             _cell_jacobian_determinants(family, coordinates).tolist()
         )
@@ -2606,10 +4157,12 @@ def _recompute_mixed_certificate_evidence(
     magnetic = mesh.cell_mesh_parts == "magnetic"
     transition = mesh.cell_mesh_parts == "transition_air"
     magnetic_nodes = np.unique(np.concatenate([
-        mesh.cell_node_ids(int(index)) for index in np.flatnonzero(magnetic)
+        resolved_workspace.cell_nodes_per_ordinal[int(index)]
+        for index in np.flatnonzero(magnetic)
     ]))
     transition_nodes = np.unique(np.concatenate([
-        mesh.cell_node_ids(int(index)) for index in np.flatnonzero(transition)
+        resolved_workspace.cell_nodes_per_ordinal[int(index)]
+        for index in np.flatnonzero(transition)
     ]))
     magnetic_bounds = (np.min(mesh.nodes[magnetic_nodes], axis=0), np.max(mesh.nodes[magnetic_nodes], axis=0))
     transition_bounds = (np.min(mesh.nodes[transition_nodes], axis=0), np.max(mesh.nodes[transition_nodes], axis=0))
@@ -2634,7 +4187,7 @@ def _recompute_mixed_certificate_evidence(
     ):
         raise ValueError("mixed layer topology certificate transition shell thickness is not uniform")
 
-    adjacency = _mixed_face_adjacency(mesh)
+    adjacency = resolved_workspace.face_owners
     shell_faces = [
         key for key, owners in adjacency.items()
         if len(owners) == 2
@@ -2642,7 +4195,8 @@ def _recompute_mixed_certificate_evidence(
     ]
     if not shell_faces or any(len(face) != 3 for face in shell_faces):
         raise ValueError("mixed layer topology certificate transition shell interface is not tri3")
-    planes, plane_tolerance = _cluster_coordinate_planes(mesh.nodes[magnetic_nodes], sweep_axis)
+    planes = resolved_workspace.magnetic_layer_coordinates
+    plane_tolerance = resolved_workspace.magnetic_layer_tolerance
     magnetic_volume = float(np.sum(volumes[magnetic]))
     shared_volume = float(np.sum(volumes))
     expected_magnetic = float(np.prod(
@@ -2656,6 +4210,8 @@ def _recompute_mixed_certificate_evidence(
         tolerance=plane_tolerance,
         interface_marker=interface_marker,
         outer_boundary_marker=outer_boundary_marker,
+        workspace=resolved_workspace,
+        _bound_context=context,
     )
     return {
         "magnetic_plane_coordinates_m": planes,
@@ -2680,6 +4236,91 @@ def _recompute_mixed_certificate_evidence(
         "marker_coverage_complete": True,
         **conformity,
     }
+
+
+def _recompute_and_bind_mixed_certificate_evidence(
+    mesh: MeshData,
+    *,
+    sweep_axis: int,
+    interface_marker: int,
+    outer_boundary_marker: int,
+    magnetic_bounds_min_m: tuple[float, float, float],
+    magnetic_bounds_max_m: tuple[float, float, float],
+    airbox_bounds_min_m: tuple[float, float, float],
+    airbox_bounds_max_m: tuple[float, float, float],
+    workspace: _MixedTopologyWorkspace | None = None,
+    _bound_context: _BoundMixedTopologyContext | None = None,
+) -> _CanonicalMixedCertificateEvidence:
+    if workspace is None:
+        workspace = _build_mixed_topology_workspace(
+            mesh,
+            sweep_axis=sweep_axis,
+            interface_marker=interface_marker,
+        )
+        context = _require_mixed_topology_workspace(
+            mesh,
+            workspace,
+            sweep_axis=sweep_axis,
+            interface_marker=interface_marker,
+            _actual_topology_fingerprint_v3=workspace.topology_fingerprint_v3,
+        )
+    else:
+        context = _require_mixed_topology_workspace(
+            mesh,
+            workspace,
+            sweep_axis=sweep_axis,
+            interface_marker=interface_marker,
+            _bound_context=_bound_context,
+        )
+    evidence = _recompute_mixed_certificate_evidence(
+        mesh,
+        sweep_axis=sweep_axis,
+        interface_marker=interface_marker,
+        outer_boundary_marker=outer_boundary_marker,
+        magnetic_bounds_min_m=magnetic_bounds_min_m,
+        magnetic_bounds_max_m=magnetic_bounds_max_m,
+        airbox_bounds_min_m=airbox_bounds_min_m,
+        airbox_bounds_max_m=airbox_bounds_max_m,
+        workspace=workspace,
+        _bound_context=context,
+    )
+    immutable_evidence = _immutable_mixed_certificate_evidence(evidence)
+    if not isinstance(immutable_evidence, Mapping):
+        raise TypeError("mixed certificate evidence must be a mapping")
+    carrier = _CanonicalMixedCertificateEvidence(
+        evidence=immutable_evidence,
+        context=context,
+        _capability=_CANONICAL_MIXED_EVIDENCE_CAPABILITY,
+    )
+    _MINTED_CANONICAL_MIXED_EVIDENCE.add(carrier)
+    return carrier
+
+
+def _bind_mixed_certificate_evidence(
+    mesh: MeshData,
+    evidence: Mapping[str, object],
+    *,
+    workspace: _MixedTopologyWorkspace,
+    _bound_context: _BoundMixedTopologyContext,
+) -> _CanonicalMixedCertificateEvidence:
+    """Bind evidence produced by an independently validated native engine."""
+    context = _require_mixed_topology_workspace(
+        mesh,
+        workspace,
+        sweep_axis=workspace.sweep_axis,
+        interface_marker=workspace.interface_marker,
+        _bound_context=_bound_context,
+    )
+    immutable_evidence = _immutable_mixed_certificate_evidence(evidence)
+    if not isinstance(immutable_evidence, Mapping):
+        raise TypeError("mixed certificate evidence must be a mapping")
+    carrier = _CanonicalMixedCertificateEvidence(
+        evidence=immutable_evidence,
+        context=context,
+        _capability=_CANONICAL_MIXED_EVIDENCE_CAPABILITY,
+    )
+    _MINTED_CANONICAL_MIXED_EVIDENCE.add(carrier)
+    return carrier
 
 
 def _rebuild_mixed_layer_topology_certificate(
@@ -2740,19 +4381,47 @@ def _validate_typed_csr(
         raise ValueError(f"{kind}_offsets must be monotone")
     if int(offsets[-1]) != len(nodes):
         raise ValueError(f"{kind}_offsets final value must match {kind}_nodes length")
-    for index, item_type in enumerate(types.tolist()):
-        expected = arities.get(item_type)
-        if expected is None:
-            raise ValueError(f"unknown {kind} type: {item_type}")
-        start, stop = int(offsets[index]), int(offsets[index + 1])
-        if stop - start != expected:
-            raise ValueError(
-                f"{kind} {index} type {item_type} has wrong arity {stop - start}; expected {expected}"
-            )
-        item_nodes = nodes[start:stop]
-        if np.any(item_nodes < 0) or np.any(item_nodes >= node_count):
-            raise ValueError(f"{kind} {index} contains invalid node index")
-        if len(set(int(node) for node in item_nodes)) != expected:
+
+    # This validation runs for every MeshData construction, including the
+    # 800k-cell SP4 artifact load path.  Keep the same fail-closed checks and
+    # diagnostics, but operate on contiguous NumPy blocks instead of a Python
+    # loop over every cell/facet.
+    expected_arities = np.zeros(types.shape, dtype=np.int64)
+    recognized = np.zeros(types.shape, dtype=np.bool_)
+    for item_type, arity in arities.items():
+        selected = types == item_type
+        expected_arities[selected] = int(arity)
+        recognized |= selected
+    unknown = np.flatnonzero(~recognized)
+    if unknown.size:
+        index = int(unknown[0])
+        raise ValueError(f"unknown {kind} type: {types[index]}")
+
+    lengths = np.diff(offsets)
+    wrong_arity = np.flatnonzero(lengths != expected_arities)
+    if wrong_arity.size:
+        index = int(wrong_arity[0])
+        raise ValueError(
+            f"{kind} {index} type {types[index]} has wrong arity "
+            f"{int(lengths[index])}; expected {int(expected_arities[index])}"
+        )
+
+    invalid_nodes = np.flatnonzero((nodes < 0) | (nodes >= node_count))
+    if invalid_nodes.size:
+        index = int(np.searchsorted(offsets[1:], int(invalid_nodes[0]), side="right"))
+        raise ValueError(f"{kind} {index} contains invalid node index")
+
+    for arity in np.unique(expected_arities):
+        item_indices = np.flatnonzero(expected_arities == arity)
+        if not item_indices.size:
+            continue
+        width = int(arity)
+        starts = offsets[item_indices]
+        block = nodes[starts[:, np.newaxis] + np.arange(width, dtype=np.int64)]
+        sorted_block = np.sort(block, axis=1)
+        duplicate_rows = np.flatnonzero(np.any(np.diff(sorted_block, axis=1) == 0, axis=1))
+        if duplicate_rows.size:
+            index = int(item_indices[int(duplicate_rows[0])])
             raise ValueError(f"{kind} {index} contains duplicate node indices")
 
 
@@ -2765,7 +4434,7 @@ def _validate_global_ordinals(
         raise ValueError(f"{kind}_global_ordinals must have shape ({kind} count,)")
     if np.any(ordinals < 0):
         raise ValueError(f"{kind}_global_ordinals must be non-negative")
-    if len(set(int(value) for value in ordinals)) != item_count:
+    if np.unique(ordinals).size != item_count:
         raise ValueError(f"{kind}_global_ordinals must be unique")
 
 
@@ -3417,6 +5086,7 @@ def _infer_axis_aligned_periodic_pairs(
                 "pair_id": pair_id,
                 "marker_a": marker_a,
                 "marker_b": marker_b,
+                "axis_hint": axis_label,
                 "translation": translation,
                 "tolerance_m": tol,
             }
@@ -3463,3 +5133,8 @@ class SharedDomainMeshResult:
     selector_resolution: list[dict[str, object]] = field(default_factory=list)
     boundary_layer_result: dict[str, object] | None = None
     orphan_entities: list[dict[str, object]] = field(default_factory=list)
+    # Truth from the final Gmsh application, including fallbacks caused by
+    # fields installed before ``MeshOptions`` is applied.
+    algorithm_3d_requested: int | None = None
+    algorithm_3d_effective: int | None = None
+    algorithm_3d_fallback_reason: str | None = None

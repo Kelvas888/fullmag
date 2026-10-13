@@ -15,6 +15,7 @@ import type { FdmDomainPresentation } from "@/shared/domain/mesh/domainPresentat
 import {
   ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
   ANALYSIS_FREQUENCY_DOMAIN_EIGEN_SPECTRUM_V2_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_MANIFEST_V1_PATH,
   ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_MAGNETIC_SWEEP_PATH,
   ANALYSIS_HYSTERESIS_POINT_PATH,
   ANALYSIS_HYSTERESIS_SETTLE_TRACE_PATH,
@@ -40,6 +41,7 @@ import {
   modelTreeSnapshotFromScene,
   modelTreeSnapshotWithStageExecution,
 } from "./sceneModelTreeAdapter";
+import { resolveExplorerDomainLane } from "./meshExplorerNodes";
 
 describe("Explorer node contract", () => {
   it("preserves a valid node and its exported kind", () => {
@@ -63,6 +65,39 @@ describe("Explorer node contract", () => {
         parentId: "model:objects",
       }),
     ).toThrow("Explorer node requires a non-empty id");
+  });
+});
+
+describe("Explorer domain lane resolution", () => {
+  it("uses the resolved FEM lane over stale FDM DomainMeta presentation", () => {
+    const snapshot = modelTreeSnapshotFromScene({} as SceneResource, {
+      domainDiscretization: "fem",
+      domainPresentation: fdmExplorerPresentation(),
+    });
+
+    expect(resolveExplorerDomainLane(snapshot)).toBe("fem");
+  });
+
+  it("keeps explicit unresolved mode ahead of stale FDM artifact presentation", () => {
+    const snapshot = modelTreeSnapshotFromScene({} as SceneResource, {
+      domainMeta: {
+        discretization: "fdm",
+      } as DomainMetaResource,
+      domainDiscretization: null,
+      domainPresentation: fdmExplorerPresentation(),
+    });
+
+    expect(snapshot.domainDiscretization).toBeNull();
+    expect(resolveExplorerDomainLane(snapshot)).toBe("unresolved");
+  });
+
+  it("keeps the legacy artifact fallback when no resolved lane is supplied", () => {
+    const snapshot = modelTreeSnapshotFromScene({} as SceneResource, {
+      domainPresentation: fdmExplorerPresentation(),
+    });
+
+    expect(Object.prototype.hasOwnProperty.call(snapshot, "domainDiscretization")).toBe(false);
+    expect(resolveExplorerDomainLane(snapshot)).toBe("fdm");
   });
 });
 
@@ -649,13 +684,23 @@ describe("buildModelTree", () => {
       "session.root",
       "definitions.root",
       "model.planar.monitors",
-      "universe.root",
       "objects.root",
     ]) {
       expect(nodes.find((node) => node.kind === kind), kind).toMatchObject({
         selectable: false,
       });
     }
+  });
+
+  it("keeps the Universe root selectable for domain authoring", () => {
+    const nodes = flattenExplorerNodes(buildModelTree({
+      domainDiscretization: "fem",
+      objects: [{ id: "film", label: "Film" }],
+    }));
+
+    expect(nodes.find((node) => node.kind === "universe.root")).toMatchObject({
+      selectable: true,
+    });
   });
 
   it("marks Boundary Faces ready when the shared mesh is realized", () => {
@@ -868,6 +913,46 @@ describe("buildModelTree", () => {
     ).toMatchObject({
       badge: "stale",
       status: "mesh-stale",
+    });
+  });
+
+  it("keeps the published mesh identity visible after a failed candidate", () => {
+    const flattened = flattenExplorerNodes(
+      buildModelTree({
+        domainDiscretization: "fem",
+        mesh: {
+          lastError: "mesher rejected the candidate",
+          latestBuildStatus: "completed",
+          manifestSourceSceneRevision: 14,
+          meshName: "published-mesh",
+          meshRevision: 7,
+          sourceSceneRevision: 15,
+        },
+      }),
+    );
+
+    expect(flattened.find((node) => node.id === "model:mesh")).toMatchObject({
+      badge: "failed · retained published-mesh",
+      status: "mesh-failed",
+    });
+    expect(flattened.find((node) => node.id === "model:mesh:builds")).toMatchObject({
+      badge: "failed · retained rev 7",
+      status: "mesh-failed",
+    });
+
+    const unresolved = flattenExplorerNodes(
+      buildModelTree({
+        domainDiscretization: "fem",
+        mesh: {
+          lastError: "mesher rejected the candidate",
+          meshName: "unverified-mesh",
+          meshRevision: 8,
+        },
+      }),
+    );
+    expect(unresolved.find((node) => node.id === "model:mesh")).toMatchObject({
+      badge: "failed",
+      status: "mesh-failed",
     });
   });
 
@@ -1681,7 +1766,7 @@ describe("buildModelTree", () => {
     );
   });
 
-  it("builds an explicit Add Antenna pipeline instruction node", () => {
+  it("builds an explicit Add Field Drive pipeline instruction node", () => {
     const snapshot = modelTreeSnapshotFromScene({
       objects: [],
       study: {
@@ -1705,7 +1790,7 @@ describe("buildModelTree", () => {
     expect(node).toMatchObject({
       badge: "field drive",
       kind: "study.stage.add_field_drive",
-      label: "Add Antenna 1",
+      label: "Add Field Drive 1",
       stageId: "add-k0-antenna",
       stageIndex: 0,
     });
@@ -1909,6 +1994,7 @@ describe("buildModelTree", () => {
         frequencyDomainManifest: {
           ...FREQUENCY_DOMAIN_MANIFEST,
           result_manifest: {
+            artifact_path: "frequency_domain/manifest.v1.json",
             payload: {
               equilibrium_identity: "equilibrium-r4",
               requested_execution: { boundary_context: "finite_open" },
@@ -1917,6 +2003,8 @@ describe("buildModelTree", () => {
               stage_label: "Eigenmodes",
               study_product: "modal_eigen",
             },
+            resource_key: ANALYSIS_FREQUENCY_DOMAIN_MANIFEST_V1_PATH,
+            schema_version: "frequency_domain_manifest.v1",
             status: "ready",
           },
         } as FrequencyDomainManifestResource,
@@ -1956,6 +2044,7 @@ describe("buildModelTree", () => {
         frequencyDomainManifest: {
           ...FREQUENCY_DOMAIN_MANIFEST,
           result_manifest: {
+            artifact_path: "frequency_domain/manifest.v1.json",
             payload: {
               equilibrium_identity: "equilibrium-r4",
               requested_execution: { boundary_context: "finite_open" },
@@ -1963,6 +2052,8 @@ describe("buildModelTree", () => {
               stage_id: "eigen-stage",
               study_product: "modal_eigen",
             },
+            resource_key: ANALYSIS_FREQUENCY_DOMAIN_MANIFEST_V1_PATH,
+            schema_version: "frequency_domain_manifest.v1",
             status: "ready",
           },
         } as FrequencyDomainManifestResource,
@@ -2072,6 +2163,7 @@ describe("buildModelTree", () => {
         frequencyDomainManifest: {
           ...FREQUENCY_DOMAIN_MANIFEST,
           result_manifest: {
+            artifact_path: "frequency_domain/manifest.v1.json",
             payload: {
               resources: {
                 response_field_resources: [
@@ -2082,6 +2174,9 @@ describe("buildModelTree", () => {
                 ],
               },
             },
+            resource_key: ANALYSIS_FREQUENCY_DOMAIN_MANIFEST_V1_PATH,
+            schema_version: "frequency_domain_manifest.v1",
+            status: "ready",
           },
         } as FrequencyDomainManifestResource,
       }),
@@ -2114,6 +2209,7 @@ describe("buildModelTree", () => {
         frequencyDomainManifest: {
           ...FREQUENCY_DOMAIN_MANIFEST,
           result_manifest: {
+            artifact_path: "frequency_domain/manifest.v1.json",
             payload: {
               resources: {
                 response_field_resources: [
@@ -2124,6 +2220,8 @@ describe("buildModelTree", () => {
                 ],
               },
             },
+            resource_key: ANALYSIS_FREQUENCY_DOMAIN_MANIFEST_V1_PATH,
+            schema_version: "frequency_domain_manifest.v1",
             status: "ready",
           },
         } as FrequencyDomainManifestResource,
@@ -3139,6 +3237,7 @@ describe("buildModelTree", () => {
         frequencyDomainManifest: {
           ...FREQUENCY_DOMAIN_MANIFEST,
           result_manifest: {
+            artifact_path: "frequency_domain/manifest.v1.json",
             payload: {
               equilibrium_identity: "equilibrium-r5",
               requested_execution: { boundary_context: "floquet_periodic" },
@@ -3147,6 +3246,8 @@ describe("buildModelTree", () => {
               stage_label: "Driven k sweep",
               study_product: "driven_response",
             },
+            resource_key: ANALYSIS_FREQUENCY_DOMAIN_MANIFEST_V1_PATH,
+            schema_version: "frequency_domain_manifest.v1",
             status: "ready",
           },
         } as FrequencyDomainManifestResource,
@@ -3516,6 +3617,7 @@ describe("buildModelTree", () => {
       buildModelTree({ domainPresentation: fdmExplorerPresentation() }),
     );
     expect(nodes.find((node) => node.id === "model:mesh")).toMatchObject({
+      contextCommands: ["grid.build-fdm", "workspace.focus-selection"],
       kind: "mesh.root",
       label: "Mesh",
     });
@@ -3531,6 +3633,7 @@ describe("buildModelTree", () => {
       "model:mesh:mask", "model:mesh:provenance", "model:mesh:region:region%3Acore",
     ]));
     expect(nodes.find((node) => node.id === "model:mesh")?.contextCommands).toEqual([
+      "grid.build-fdm",
       "workspace.focus-selection",
     ]);
     for (const nodeId of [
@@ -3580,7 +3683,7 @@ describe("buildModelTree", () => {
       domainPresentationStatus: "error",
     }));
     expect(nodes.find((node) => node.id === "model:mesh")).toMatchObject({
-      kind: "mesh.root", status: "degraded", contextCommands: ["workspace.focus-selection"],
+      kind: "mesh.root", status: "degraded", contextCommands: ["grid.build-fdm", "workspace.focus-selection"],
     });
     expect(nodes.map((node) => node.kind)).not.toEqual(expect.arrayContaining([
       "mesh.unassigned", "airbox.root", "boundary-faces.root",
@@ -3901,6 +4004,11 @@ describe("buildModelTree", () => {
       kind: "airbox.root",
       label: "Airbox",
       status: "mesh-stale",
+    });
+    expect(
+      nodes.find((node) => node.id === "model:mesh:shared-domain"),
+    ).toMatchObject({
+      contextCommands: ["grid.build-fdm"],
     });
     expect(nodes.find((node) => node.id === "model:mesh")).toMatchObject({
       kind: "mesh.root",

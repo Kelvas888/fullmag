@@ -1,5 +1,8 @@
 # Subagent-driven development progress
 
+Simulation preparation failure diagnostics Task 1: complete (working-tree evidence; 31/31 focused tests, typecheck, independent re-review approved; no commit by policy).
+Simulation preparation failure diagnostics Task 2: complete (working-tree evidence; mounted 12/12, typecheck, independent re-review approved; browser gate delegated to Task 3; no commit by policy).
+
 ## Plan: Solver audit remediation (2026-08-22)
 
 - Worktree: `D:\\git\\fullmag`
@@ -357,6 +360,31 @@ source-layout and FEM physics-validation failures.
   `carrier_fingerprint`. Nadal nie jest to świeży managed runtime ani dowód
   browser/WebGL z aktywną sesją.
 
+## Plan: Scratch simulation authoring (2026-08-23)
+
+- Worktree: `D:\git\fullmag\worktrees\scratch-authoring-ui`
+- Branch: `codex/scratch-authoring-ui`
+- Source plan: `docs/superpowers/plans/2026-08-23-scratch-simulation-authoring.md`
+- Plan commits: `b5454c822`, `ae2e800cc`
+
+| Task | Status | Implementer | Review |
+|---:|---|---|---|
+| 1 | complete (`ccf27947e..1e7805a08`) | `scratch_task1_impl` | spec clean; quality approved after three fix waves |
+| 2 | complete (`b7588f8a6..cad851bf2`) | `scratch_task2_impl` | spec clean; quality approved after one fix wave; full typecheck retains 6 baseline errors outside task |
+| 3 | complete (`1d16fdecf..2d7ffcd43`) | `scratch_task3_impl` + `scratch_task3_fix` | approved after two fix waves; typed session list, distinct loading/error/no-session, canonical invalidation and real AppMenu/EmptyWorkspace/Ctrl+N integration verified; 50/50 Task 3 regression, independent 25/25 |
+| 4 | complete (`3eb5cf186`, `48f9915bc`, `2f16f09f2`, `28fda14de`, `e7d6fcda9`, `3b9fa3919`) | `scratch_task4_impl` | definitively approved after five review waves; canonical readiness/material/object set, production Run providers, bounded invalidation and final ACK revisions verified |
+| 5 | complete (`1f2674a6d`, `f2762e998`, `05475556b`) | `scratch_task5_impl` | approved after two review waves; revision-safe primitive draft, real DOM conflict recovery and overlay isolation/lifecycle verified; browser/WebGL deferred only to mandatory Task 15 gate |
+| 6 | complete (`30b65e027`, `4df823171`, `9f3c346f8`) | `scratch_task6_impl` | approved after two review waves; mounted KernelContext Move flow, complete pointer lifecycle and stale activation/session cleanup verified; browser/WebGL deferred only to Task 15 |
+| 7 | complete (`0486448be`) | `scratch_task7_fix` | approved: real KernelContext/resource harness 12/12, targeted ESLint clean, TSC no Task7 errors |
+| 8 | pending | — | — |
+| 9 | pending | — | — |
+| 10 | pending | — | — |
+| 11 | pending | — | — |
+| 12 | pending | — | — |
+| 13 | pending | — | — |
+| 14 | pending | — | — |
+| 15 | pending | — | — |
+
 ## Plan: produkcyjny redesign mapy pola 2D (2026-08-18)
 
 - Worktree/branch: `/home/kkingstoun/git/fullmag/fullmag`, `master`.
@@ -365,3 +393,812 @@ source-layout and FEM physics-validation failures.
 - Task 1 FDM midplane RED: complete (commit `b1464b481`, expected RED `z=0.0` vs `-0.5`, independent review approved).
 - Task 2 cell-centered FDM default slice: complete (commits `a750062ca`, `d47029f97`; overflow RED then source tests 15/15 and endpoint 1/1 pass; independent re-review approved).
 - Task 3 source parity: complete (commit `48ed0c3f6`; field meta/vector/planar revision, generation, stats and payload parity; focused 1/1 pass; independent re-review approved).
+
+Task mixed-P1 local interactions 1: complete (working-tree scope, final review clean; 3 Rust exact tests and managed focused native contract passed).
+
+## Plan: FEM meshing production remediation (2026-08-27)
+
+- Worktree: `/home/kkingstoun/git/fullmag/fullmag-worktrees/fem-meshing-production-remediation-20260827`
+- Branch: `codex/fem-meshing-production-remediation-20260827`
+- Frozen base/master: `5ac37c7a8c4715cff7fdf197caede15f94665d9e`
+- Source plan SHA-256: `fd1e3be2008fe18e1ab21cfaad4b976dbef06cf7d213339f283a4d4eb3b9a7fc`
+- Commit policy: task-scoped commits on this branch for safe periodic rebase; no push or integration.
+
+| Task | Status | Implementer | Review | Master sync |
+|---:|---|---|---|---|
+| 0 | complete; Gate 0 PASS | root | baseline evidence matrix in `fem-meshing-task-0-report.md` | equal to master |
+| 1 | complete; Gate 1 PASS (`d6a4ad670..170e4f17a`) | `fem_mesh_task1_impl` + `fem_mesh_task1_fix` | approved after three fix waves; source maps 9/9, validator 28/28, execute smoke 9/9 | local master unchanged at `5ac37c7a8` |
+| 2 | pending | — | — | pending |
+| 3 | pending | — | — | pending |
+| 4 | pending | — | — | pending |
+| 5 | pending | — | — | pending |
+| 6 | pending | — | — | pending |
+| 7 | pending | — | — | pending |
+| 8 | pending | — | — | pending |
+| 9 | pending | — | — | pending |
+| 10 | pending | — | — | pending |
+| 11 | pending | — | — | pending |
+| 12 | pending | — | — | pending |
+
+## Plan: FEM mixed-mesh performance and certification (2026-08-27)
+
+- Worktree/branch: `/home/kkingstoun/git/fullmag/fullmag`, `master` (jawnie zatwierdzony przez użytkownika).
+- Source plan: `docs/superpowers/plans/2026-08-27-fem-mixed-mesh-performance-and-certification.md`.
+- Commit policy: task-scoped working-tree evidence; no automatic commit, stage or push.
+
+| Task | Status | Implementer | Review |
+|---:|---|---|---|
+| 0 | complete (working-tree evidence; benchmark import side-effect and tuple return fixed; 30/30 tests) | `mixed_task0_benchmark_import` + `mixed_task0_review_fix` | approved after isolation fix wave; corrected production baseline still requires runtime execution |
+| 1 | source/spec complete; production `BLOCKED_MESHER_QUALITY` | `mixed_task1_root_cause` | source approved after two fix waves; exact SP4 `Relocate3D,niter=1` leaves a strict-degenerate tet4, so N=10 and production receipt are not passed |
+| 2 | implemented (focused working-tree evidence; exact-SP4 performance gate deferred by small-first strategy) | `mixed_task2_implement` | approved after fail-closed mutation and benchmark-evidence fix waves; 54 benchmark/qualification tests plus focused certificate/trust/public-fixture gates pass |
+| 3 | current-state audit pending | — | — |
+| 4 | current-state audit pending | — | — |
+| 5 | blocked by Task 1 production gate | — | — |
+| 6 | blocked by Task 1 production gate | — | — |
+| 7 | blocked by Task 1 production gate | — | — |
+| 8 | blocked by Task 1 production gate | — | — |
+| 9 | blocked by Task 1 production gate | — | — |
+| 10 | blocked by Task 1 production gate | — | — |
+| 11 | blocked by Task 1 production gate | — | — |
+
+Small-first repair diagnostic: complete (working-tree evidence). The real-Gmsh
+microfixture in `scripts/fem_mixed_tet_repair_microfixture.py` uses 161 nodes,
+101 tet4, one prism6 and one pyramid5. The thresholded default repair changes
+only the defective cavity (`101 -> 100` tet4, strict degenerates `1 -> 0`),
+preserves 96 control tet topology keys and raw hybrid connectivity, and is
+deterministic across 10 fresh runs. Independent re-review approved 7/7 tests,
+ruff, lifecycle restoration and the real-Gmsh audit. This is not OCC/SP4 or
+production-runtime qualification; medium and canonical scenarios remain
+deferred until a versioned repair-policy design is approved.
+## Plan: Public Sphinx documentation standardization (2026-08-31)
+
+- Worktree: C:\git\fullmag\fullmag
+- Branch: master (subagent implementation explicitly requested by user)
+- Plan: .superpowers/sdd/public-docs-standardization/plan.md
+- Commit policy: no automatic commit, stage, or push; task-scoped working-tree evidence.
+- Baseline: strict Sphinx build PASS for 228 pages; 101 source maps = 78 PASS / 23 FAIL.
+
+| Task | Status | Implementer | Review |
+|---:|---|---|---|
+| 1 | dispatch attempted | pending notification | pending |
+| 2 | dispatch attempted | pending notification | pending |
+| 3 | dispatch attempted | pending notification | pending |
+| 4 | dispatch attempted | pending notification | pending |
+| 5 | dispatch attempted | pending notification | pending |
+| 6 | dispatch attempted | pending notification | pending |
+| 7 | dispatch attempted | pending notification | pending |
+
+## Plan: FEM meshing production closure (2026-08-31)
+
+- Worktree: `C:\git\fullmag\fullmag`.
+- Branch: `master`; the current dirty shared checkout is the user-authorized implementation input.
+- Source plan: `docs/superpowers/plans/2026-08-31-fem-meshing-production-closure-masterplan.md`.
+- Commit policy: no automatic commit, stage, stash, reset, push, or cleanup; task-scoped working-tree evidence and independent review.
+- Worktree policy: work in place because the active dirty snapshot is authoritative; a clean linked worktree would omit required in-flight changes.
+- Phase-0 observation (historical initial read): `HEAD e4f653cfaa4505b8659b1ad173b7aec2b67aaad5`, `master...origin/master [0/0]`, no merge/rebase/index lock, `0` staged, `116` unstaged, `8` untracked.
+- Phase-0 source identity (prequalification only): `adfe4772bb06e20854d30ab64a6f18dd88e5b35e621a037132fd1a030d82cacd`; dirty-content identity `0680f9ea7b4dbfa1b96c4f48972c845d04c6e37e229e7fe9dd16efacc77d3d0f`.
+- Release rule: dirty evidence may support engineering/prequalification only; final sealed qualification still requires stable clean source before/after.
+
+### Phase-0 refresh (2026-08-31, current checkout)
+
+- The earlier observation above is retained as historical context. An external
+  user commit `a1de38b4d7dad275dccbdbfd937b757d6ca7ee99` subsequently updated
+  public Sphinx documentation and is now synchronized with `origin/master`.
+  The current refresh is on `master` at `HEAD a1de38b4d7dad275dccbdbfd937b757d6ca7ee99`,
+  with `master...origin/master [0/0]`, no merge/rebase/cherry-pick/revert/bisect
+  marker, no unmerged index entries and no `.git/index.lock`.
+- Current `git status --porcelain=v1 --untracked-files=all` counts are `0`
+  staged, `66` unstaged and `29` untracked paths. This is explicitly a dirty
+  prequalification input, never a release-qualified source state.
+- WP-00.1 source-only preflight is implemented and independently reviewed
+  `Approved`. GREEN evidence: `python scripts/test_prepare_fem_meshing_qualification.py`
+  (`35` tests, `OK`, `1` platform-only skip), Python `py_compile` and scoped
+  `git diff --check` passed. The focused pytest helper suite remains
+  `NOT VERIFIED` because host Python has no `pytest` module.
+- Current external evidence root is
+  `C:\git\fullmag\.fullmag-evidence\fem-meshing-production\2026-08-31-wp00-1-preflight-v11`.
+  It contains the two generated preflight JSON artifacts plus the observational
+  toolchain inventory and historical evidence index. Snapshot identity is
+  recorded in `source-snapshot-before.v1.json`; scope status is
+  `prepared` for S13/box/bbox/mixed_p1/FEM CPU+forced GPU/double.
+- No managed build, runtime, commit, stage, stash, reset, clean, push, process
+  termination or cache pruning was performed. WP-00.4 remains pending until a
+  managed run exists and can receive a before/after drift seal.
+
+| Work package | Status | Implementer | Review |
+|---:|---|---|---|
+| WP-00.1 source-freeze preflight | complete | implemented | Approved (v7) |
+| WP-00.2 qualification-scope schema | complete (prepared only) | preflight artifact | covered by WP-00.1 review |
+| WP-00.3 evidence namespace/toolchain inventory | complete (observation only) | Phase-0 artifact | not a runtime qualification |
+| WP-00.4 post-run drift seal | pending | - | - |
+| WP-01..WP-03 policy and round-trip | pending decisions | - | - |
+| WP-04..WP-10 meshing, quality, certificate, cache | pending decisions/dependencies | - | - |
+| WP-11..WP-13 Windows and managed CPU/GPU | pending dependencies | - | - |
+| WP-14..WP-16 API, WebGL, performance | pending dependencies | - | - |
+| WP-17 sealed receipt/capability | pending all prior gates | - | - |
+| WP-18..WP-23 remaining contract/runtime closure | pending decisions/dependencies | - | - |
+
+### Kontynuacja realizacji planu — 2026-08-31 (source closure pass)
+
+Zakres wykonany w tej sesji pozostaje zmianą roboczą na wspólnym checkoutcie; nie wykonano
+stage/commit/push/reset/stash/clean ani zatrzymywania procesów. Aktualny odczyt kontrolny:
+
+```text
+repo: C:\\git\\fullmag\\fullmag
+branch: master...origin/master [0/0]
+HEAD: d6a8cef166e18a87e183df95a8250649e2db1cac
+status entries: 134 (0 staged, 98 unstaged, 36 untracked)
+MERGE_HEAD: absent
+index.lock: absent (during two equal status reads)
+source snapshot: DIRTY / prequalification only
+```
+
+#### Domknięte źródłowo kontrakty meshera
+
+- `FM-MESH-001/007/008`: pomiar sąsiedniego wzrostu rozmiaru po pełnych ścianach,
+  family/region/mesh-role/zone summaries, percentyle, worst ordinals i structured
+  threshold failures; krawędzie prism/pyramid/hex są fizycznymi krawędziami, nie pełnymi
+  kombinacjami węzłów.
+- `FM-MESH-003/018/029`: authored/resolved sweep direction (`auto|x|y|z`), fail-closed
+  named face selectors, ambiguity/no-overlap component identity oraz jawne statusy fallbacku.
+- `FM-MESH-004/019/026`: ścisłe finite scalar/int/bool/vector parsing, odrzucenie
+  fractional/bool/non-finite coercion i nieaktywnego `growth_rate <= 1` także w typed
+  `AirboxOptions`.
+- `FM-MESH-028/034`: pełne physical-tag coverage, duplicate/missing/extra mapping oraz
+  length/finite/order guards dla wszystkich kanałów Gmsh quality.
+- `FM-MESH-032/033`: typed family dispatch (`tet4`, `prism6`, `pyramid5`, `hex8`) z
+  jawnie ograniczonym legacy tet4 view oraz blokadą publikacji starej jakości po mutacji
+  connectivity.
+- `FM-MESH-035/036/038`: FMMQ v2 fixed-layout writer/verifier, canonical identity,
+  family ranges, ordinal/checksum/digest checks, API preflight/manifest binding,
+  verify-before-publish, fsync + atomic replace oraz raport requested/effective Gmsh
+  `Algorithm3D` uwzględniający pola generowane i pre-existing airbox.
+- `FM-MESH-037`: standalone preview route odrzuca przekazane `study_universe`; solver
+  mesh z airboxem musi przejść przez shared-domain entry point.
+- `FM-MESH-023/024/025`: niezaimplementowane non-default assembly policies i mesh
+  operations są odrzucane przed Gmsh zamiast udawać realizację.
+
+#### Dowody uruchomione po tej zmianie
+
+```text
+python scripts/test_fmmq_v2.py                                      9/9 PASS
+python scripts/test_fem_quality_typed_dispatch.py                  26/26 PASS
+python -m unittest discover -s packages/fullmag-py/tests             284 PASS, 31 skipped
+python -m py_compile (zmienione moduły meshing)                     PASS
+cargo check -p fullmag-api -p fullmag-ir                             PASS
+cargo test -p fullmag-api fmmq_canonical_json...                     1/1 PASS
+frontend meshQualityDataCodec targeted Vitest                     5/5 PASS
+pnpm --dir apps/control-room typecheck                               PASS
+git diff --check                                                     PASS
+```
+
+`cargo check` ma wyłącznie istniejące ostrzeżenie `resolve_with_registry` (`dead_code`).
+Frontendowe `pnpm exec vitest` nie było używane, ponieważ lokalny Corepack odmawia
+weryfikacji podpisu pnpm; test został uruchomiony bezpośrednio przez repozytoryjny Vitest.
+
+#### Nadal otwarte i celowo niepromowane
+
+- Python FMMQ producer nie korzysta jeszcze z jednego wspólnego Rust quality engine dla
+  wszystkich family metrics; native certifier/preflight nie jest pełnym quality oracle.
+- Brak macierzy cache invalidation/concurrency, Rayon/Gmsh determinism oraz cold/warm
+  performance C1/C2/W1/R1/X1 na aktualnym snapshotcie.
+- Brak stabilnego clean source before/after i samodzielnego sealed `production-receipt.v2`.
+- Brak świeżego managed Windows FEM CPU/GPU runtime, forced-device/no-fallback, manifestów,
+  API live resource i rzeczywistego browser/WebGL proof; S1–S13 pozostają `NOT VERIFIED`.
+- Pozostają niezaimplementowane lub niezakwalifikowane: `swept_hex`, mixed-periodic pełnej
+  semantyki, geometry-dependent prism poza dozwolonym Box, sphere exact realization,
+  preview projection parity i capability/documentation promotion.
+
+Status programu po tej sesji: `source implementation = substantially closed`,
+`production qualification = NOT QUALIFIED`. Powyższe testy nie są dowodem managed runtime,
+GPU ani przeglądarki.
+
+#### Korekta końcowej bariery persystencji — 2026-08-31
+
+Pierwsze uruchomienie testów persystencji wykazało błąd w nowo dodanym flushu:
+`os.fsync` na Windows nie przyjmuje uchwytu otwartego wyłącznie do odczytu
+(`OSError: [Errno 9] Bad file descriptor`). Poprawiono `_fsync_file`, aby otwierał
+tymczasowy artefakt przez `r+b`, co odpowiada wymaganiu `FlushFileBuffers` i nie zmienia
+atomowego modelu publikacji.
+
+Po poprawce:
+
+```text
+test_mesh_persistence.py                         24 PASS, 1 NOT RUN (brak gmsh/trimesh)
+test_mesh_artifact_trust.py                      23 PASS, 1 skipped
+test_meshing_fallbacks.py                        27 PASS
+```
+
+Jedyny nieprzechodzący przypadek persystencji to celowo wykonywany realny shared-domain
+mesh, który wymaga lokalnych pakietów `gmsh` i `trimesh`; test zatrzymuje się na braku
+zależności, a nie na asercji kontraktu. Nie maskowano tego przez zmianę testu.
+
+#### Kontynuacja cache/periodic contract — 2026-08-31
+
+- Per-object FEM `.npz` cache jest publikowany przez unikalny katalog tymczasowy,
+  `r+b`/`fsync`, `os.replace` i barierę katalogu. Przerwany writer nie nadpisuje
+  poprzedniego artefaktu i nie wystawia częściowego archiwum.
+- Klucz cache wiąże teraz także digest bajtów importowanej geometrii, source snapshot,
+  wersję Gmsh/repair/certifier, schema/topology fingerprint i jawny source compatibility
+  epoch. Shared-domain identity korzysta z tego samego kontraktu.
+- Uszkodzone per-object i shared-domain entries są przenoszone do namespaced
+  `quarantine/` z unikalną nazwą i skrótem przyczyny zamiast cichego overwrite.
+  Rename jest warunkowany niezmienionym `stat`, aby ograniczyć race z atomowym writerem.
+- Mixed/non-tet periodic request (`swept_prism`, `swept_hex` albo auto z warstwami) ma
+  typed `mixed_periodic_topology_unsupported` i jest odrzucany przed Gmsh zarówno w
+  `generate_mesh`, jak i w shared-domain plannerze. Tetrahedral periodic route pozostaje
+  osobnym, wspieranym kontraktem.
+- Native `fullmag-ir` ma osobny lekki `validate_mixed_mesh_semantics` używany przez
+  `fullmag-py-core` preflight. Sprawdza legalny part/family/marker, jednoznaczne role,
+  owner count i interface marker, a opcjonalne expected markers z certyfikatu wiążą
+  cache reload z tym samym markerem bez uruchamiania pełnych redukcji jakości.
+
+Dowody dla tej kontynuacji:
+
+```text
+ProblemApiTests cache subset                                      5/5 PASS
+LayeredMeshDslValidationTests::mixed_periodic...                  1/1 PASS
+python -m unittest discover -s packages/fullmag-py/tests -p test_meshing.py
+                                                                  285 PASS, 31 skipped
+python -m py_compile (problem/_gmsh_types/_gmsh_generators/asset_pipeline)
+                                                                  PASS
+cargo test -p fullmag-ir native_semantic_preflight_rejects_wrong_interface_marker
+                                                                  1/1 PASS
+```
+
+#### Kontynuacja Windows isolation/Nsight contract — 2026-08-31
+
+- Domyślne ścieżki cache/build/temp oraz nazwy projektu Compose i tagi lokalnych
+  obrazów w launcherach Windows są namespacowane skrótem kanonicznej ścieżki
+  repozytorium. Jawne `FULLMAG_WINDOWS_*_ROOT` pozostają świadomym override'em
+  właściciela. Eliminuje to kolizję kilku worktree przy wspólnym `C:\fullmag-*`.
+- Dockerfile `fem-gpu` nie wymaga już obecności ani konkretnej wersji Nsight przy
+  budowie obrazu. `nsys`/`ncu` są opcjonalnymi narzędziami capture-time; ich
+  dostępność i uprawnienia nadal są sprawdzane fail-closed przez harness
+  `capture_fem_gpu_nsight.py` przed profilem.
+- Uodporniono kontrakt testowy ścieżek fixture na separator Windows oraz usunięto
+  przestarzałe założenie o stałym poleceniu `cargo +nightly build`.
+
+Dowody źródłowe:
+
+```text
+Windows launcher contract (no-arg functions)                         PASS
+Nsight source/fixture contract (no-arg functions)                    PASS
+PowerShell parser: run_fullmag.ps1/run_fullmag_wsl.ps1/setup_fullmag.ps1 PASS
+```
+
+Nie wykonano w tej sesji rebuilda managed `fem-gpu` ani capture: aktywne kontenery
+GPU/CPU i wspólny checkout należą do innych uruchomień, a pełny runtime proof
+pozostaje `NOT VERIFIED` zgodnie z bramkami S1–S13.
+
+#### Izolacja Compose i bezpieczny cleanup — 2026-08-31
+
+- Usunięto z meshingowych recipe globalne `COMPOSE_PROJECT_NAME=fullmag`. Każdy
+  managed Compose call wylicza teraz nazwę z kanonicznego repo root przez
+  `scripts/resolve_fullmag_compose_project.sh`; dopuszczony jest jawny override
+  `FULLMAG_COMPOSE_PROJECT_NAME` po walidacji znaków.
+- `ensure-managed-fem-runtime` oraz exporter nie uruchamiają już destrukcyjnego
+  prune domyślnie (`FULLMAG_RUNTIME_PRUNE=0`). Dodano osobną recipe
+  `just prune-managed-fem-runtimes`, która zawsze wykonuje dry-run, a usuwanie
+  wymaga jawnego `apply=1`. Ochrona active/in-use pozostaje po stronie prunera.
+
+Dowody:
+
+```text
+managed Compose namespace source contract                                  PASS
+runtime cleanup opt-in/dry-run contract                                     PASS
+no-arg Windows + Nsight source contracts                                    PASS
+```
+
+Lock edge-case hardening:
+
+- cache lock creation uses a restrictive mode and handles partial writes;
+- malformed metadata is reclaimed only after the stale-age budget, so a reader
+  cannot mistake the owner's O_EXCL-to-JSON publication window for a dead lock;
+- a regression test confirms that a fresh partial lock times out without being
+  quarantined or allowing a second writer.
+
+```text
+ProblemApiTests cache/lock subset (including fresh partial metadata)          9/9 PASS
+```
+
+#### Truthful sweep fallback and bbox-tie determinism — 2026-08-31
+
+- Shared-domain `ArchWaveguide` builds that receive a `swept_prism` request are
+  now reported as `fallback` with `actual_method=free_tetrahedral` and an
+  explicit reason that `prism6` topology is not preserved.  The previous
+  `applied/layered_surface_tetrahedral` status could be read as a strict swept
+  realization even though the component-aware STL route asks Gmsh for tets.
+- The aggregate shared-domain report also raises `degraded=true` for this
+  explicit semantic fallback; a status entry can no longer say `fallback`
+  while the top-level report remains apparently exact.
+- The body-only swept-cylinder compatibility route still returns its historical
+  tet4 view, but now carries a durable `MeshRealizationReport` binding the
+  requested `prism6`/`hex8` intent to resolved `tet4`, resolved z-layer count,
+  linear order, and explicit fallback markers.  This keeps old callers working
+  without hiding the topology conversion in provenance.
+- Surface bbox matching retains the full min-envelope and now sorts matching
+  entities by complete bounding box and tag.  Distance-field target lists are
+  deduplicated and sorted before being handed to Gmsh, removing dependence on
+  unspecified entity iteration order for equal-distance/tie surfaces.
+- Added a real two-thread cache-writer regression: a second publisher cannot
+  enter while the first owner holds the lock, and fresh partial lock metadata is
+  still never reclaimed.
+
+Evidence:
+
+```text
+python -m unittest discover -s packages/fullmag-py/tests -p 'test_meshing.py'  288 PASS, 31 skipped
+python -m unittest packages/fullmag-py/tests/test_api.py -k fem_cache_writer  2 PASS
+python -m py_compile (swept/fields/report + updated tests)                     PASS
+```
+
+The bbox fixture proves deterministic target selection only; it does not yet
+prove continuity of a real Gmsh field map or a no-regression runtime fingerprint.
+Managed CPU/GPU/browser qualification and the full cold/warm determinism matrix
+remain `NOT VERIFIED`.
+
+#### Cross-platform mesh-source path normalization — 2026-08-31
+
+The flat authoring API now stores `domain_mesh` and
+`frozen_magnetic_submesh` paths with portable forward separators.  This keeps
+Windows-generated IR and Script Builder round-trips byte-stable with POSIX
+fixtures while preserving absolute/relative path meaning.  Empty raw sources
+are rejected before `Path` can turn them into the misleading `.` path.
+
+#### Rust/API qualification pass after source closure — 2026-08-31
+
+- Usunięto wyłącznie zdublowany import `MixedLayerTopologyCertificateV1IR` w
+  `crates/fullmag-ir/tests/mixed_certificate_parallel.rs`. Był to błąd kompilacji
+  testu w bieżącym, współdzielonym checkoutcie; nie zmieniał semantyki certyfikatu.
+- `cargo test -p fullmag-ir` przechodzi w całości: 98 testów unit, 223 testy IR,
+  16 testów równoległego certyfikatu oraz wszystkie pozostałe binaria integracyjne
+  i doctesty — 0 failures.
+- `cargo test -p fullmag-plan` przechodzi w całości: 442 testy biblioteki oraz
+  wszystkie testy integracyjne i doctesty — 0 failures.
+- Meshingowa część API została zweryfikowana osobną bramką:
+  `cargo test -p fullmag-api mesh` — 140/140 PASS oraz
+  `cargo test -p fullmag-api fmmq` — 2/2 PASS.
+- `scripts.test_benchmark_fem_mixed_mesh_pipeline` uruchomione z jawnie dodanym
+  `scripts` do `PYTHONPATH`: 33/33 PASS.
+
+Pełne `cargo test -p fullmag-api` nie jest jeszcze zielone, ale jego 10 porażek nie
+pochodzi z meshingowej bramki: cztery testy field-state kończą się na pustym/
+niepoprawnym `.fullmag/local/python/bin/python` (Windows error 193), a sześć
+pozostałych dotyczy niezależnych, równoległych zmian Frozen Spins/session persistence.
+Osobny hostowy Python nie ma `gmsh`, `trimesh`, `h5py` ani `zarr`, dlatego nie
+zastępuję nim managed runtime i nie maskuję brakujących zależności.
+
+Stan programu pozostaje bez zmiany: source contracts meshingu są szeroko zamknięte,
+lecz managed FEM CPU/GPU, API live resource na aktualnym artefakcie, browser/WebGL,
+macierz cold/warm/determinism i sealed production receipt nadal mają status
+`NOT VERIFIED`; produkt nie jest globalnie `QUALIFIED`.
+
+#### Finalny odczyt kontrolny tej sesji — 2026-08-31
+
+Współdzielony checkout został w międzyczasie przesunięty przez zewnętrzny commit do
+`532e99c04` (`docs: avoid geometry source anchor collision`). Nie wykonywałem na nim
+commit/stage/reset/stash/clean. Odczyt końcowy: `master...origin/master`, 152 wpisy
+dirty (0 staged), brak `.git/index.lock`; `git diff --check` nie zgłasza błędów
+whitespace poza przewidywanymi ostrzeżeniami LF/CRLF. Każdy przyszły runtime receipt
+musi przeliczyć source identity ponownie po ustabilizowaniu wszystkich tych zmian.
+
+#### Windows-only orchestration naming correction — 2026-08-31
+
+Normalna trasa FEM nie wymaga WSL. `just` uruchomiony z PowerShell używa Git Bash
+wyłącznie jako interpretera receptury, a sama trasa wykonawcza przechodzi przez
+Windows PowerShell do `docker.exe`/Docker Desktop Linux. Nie ma wywołania
+`wsl.exe`, nie ma WSL-owego checkoutu i nie ma drugiego właściciela indeksu Git.
+
+Dodano kanoniczny `scripts/windows/run_fullmag_fem.ps1` i skierowano do niego
+`just windows-build`, `just fullmag` oraz komunikaty bind-mountów Compose. Dawny
+`run_fullmag_wsl.ps1` pozostaje tylko implementacją kompatybilności dla starszych
+wywołań; jego nazwa nie opisuje już wymaganego środowiska. Aktualna kwalifikacja
+runtime nadal wymaga działającego Docker Desktop i nie została przez tę zmianę
+automatycznie uznana za `QUALIFIED`.
+
+Evidence:
+
+```text
+PowerShell parser for scripts/windows/run_fullmag_fem.ps1                   PASS
+Windows launcher contract functions (30)                                   PASS
+run_fullmag_fem.ps1 -BuildMode invalid forwards to legacy validation         PASS
+```
+
+#### Phase-0 source-only preflight repeatability — 2026-08-31
+
+Na aktualnym checkoutcie wykonano dwie niezależne migawki z
+`--ignore-non-runtime-dirty`; oba przebiegi zwróciły
+`source_snapshot_sha256=83f73b1c89141fed451963b4fa40475292dadd800d8a3ed7709b6fb6b30ea2c8`.
+Przygotowano również tymczasowy, pusty evidence root poza repozytorium dla scope
+S13 (`Box + bbox + mixed_p1 + double`, lane `fem_cpu` i `fem_gpu_forced`).
+Artefakt jest prequalification input, nie release receipt, ponieważ checkout nadal
+ma zmiany dirty i nie ma aktualnego managed runtime manifestu.
+
+#### FMMQ v2 full adjacency channel — 2026-08-31
+
+`AdjacentSizeGrowthReport` zachowuje teraz pełny kanał `pair_ordinals`/`pair_ratios`
+w zwartej postaci, podczas gdy `worst_pairs` nadal jest ograniczone do listy
+diagnostycznej. `build_fmmq_v2_spec` publikuje wszystkie ocenione pary i sortuje je
+kanonicznie po ordinalach, niezależnie od porządku ratio w raporcie. Dzięki temu
+duże siatki nie tracą obowiązkowego `adjacent_size_growth.v1`, a JSON raportu nie
+powiela całego sąsiedztwa.
+
+Evidence:
+
+```text
+python scripts/test_fmmq_v2.py                  10/10 PASS
+python scripts/test_fem_quality_typed_dispatch.py 38/38 PASS
+```
+
+## Windows-only CI boundary clarification — 2026-08-31
+
+- User-facing Windows build/run does not require WSL or `wsl.exe`; FEM crosses
+  only the Docker Desktop Linux-container boundary and FDM stays native.
+- The existing `frontend-3d-managed-fem` workflow label
+  `[self-hosted, linux, x64, fem-managed]` denotes a Linux self-hosted runner,
+  not WSL. It remains separate because the managed receipt contract currently
+  validates ext4/loop-device storage via `findmnt` and durable runtime mounts.
+- A future Windows-hosted managed gate is allowed only after a tested
+  Windows-path/Docker Desktop storage adapter; changing the runner label alone
+  is explicitly not considered a qualification.
+- Repository guidance now labels the `/zfn2` + loop/ext4 instructions as the
+  dedicated Linux-runner policy; they no longer imply that a Windows checkout
+  must be owned or mounted by WSL.
+
+### Windows managed storage adapter decision — 2026-08-31
+
+`ext4` is a provenance policy of the current Linux exporter, not a requirement
+of meshing or FEM numerics. The planned Windows equivalent is an explicit
+`windows-folder-v1` profile (for example `C:\fullmag-managed` or
+`FULLMAG_WINDOWS_MANAGED_ROOT`) with local-volume/path identity, junction/UNC
+escape rejection, per-worktree namespace, write/free-space probe, owner
+metadata, and same-volume staging/promotion. Docker Linux scratch may remain in
+the container/volume; the Windows folder can own the immutable bundle, receipt,
+and evidence. The managed CI label must not move until this adapter and its
+restart/concurrency tests are qualified.
+
+## Post-mesh growth publication gate — 2026-08-31
+
+`packages/fullmag-py/src/fullmag/meshing/remesh_cli.py` previously measured a
+declared `growth_rate`, but still published the mesh when the measured face
+neighbor ratio exceeded the allowed value or when no pair could be evaluated.
+The payload path now calls `validate_adjacent_size_growth`, so both cases fail
+closed with `MeshGrowthValidationError` before topology or FMMQ publication.
+
+Evidence:
+
+```text
+PYTHONPATH=scripts;packages/fullmag-py/src
+python -m unittest scripts.test_fem_quality_typed_dispatch -v   28/28 PASS
+```
+
+#### Managed runtime prune is dry-run by default — 2026-08-31
+
+`ensure-managed-fem-runtime` pozostaje nie-destrukcyjne domyślnie
+(`FULLMAG_RUNTIME_PRUNE=0`), a osobny przepis `prune-managed-fem-runtimes`
+wykonuje najpierw inventory/dry-run i dopiero po `apply=1` ustawia
+`FULLMAG_RUNTIME_DRY_RUN=0`. Dodatkowo sam
+`scripts/prune_managed_fem_runtimes.sh` ma domyślnie `FULLMAG_RUNTIME_DRY_RUN=1`,
+więc bezpośredni caller nie usunie generacji bez jawnej zgody.
+
+Evidence:
+
+```text
+static prune default contract test                                      PASS
+justfile ensure/prune dry-run contract tests                             PASS (source-level)
+live destructive-prune test                                             NOT VERIFIED on this Windows host (bash/WSL unavailable)
+```
+
+#### Status inventory after source-only closure pass — 2026-08-31
+
+Zaktualizowano indeks masterplanu zgodnie z obecnym kodem: `FM-MESH-003/004/007/008/017/026/027/029`
+mają częściową naprawę; `FM-MESH-009/028/032/033/034/035/036/038` oraz `FM-QUAL-005` mają
+implementację bez kwalifikacji; `FM-MESH-022/037` mają jawne fail-closed behavior, lecz nie
+pełny capability contract; `FM-OPS-008/013` są częściowo zamknięte. Żaden z tych punktów nie
+został oznaczony jako `CLOSED`, ponieważ obecny checkout nie ma świeżego managed CPU/GPU,
+browser/WebGL ani sealed production receipt.
+
+Potwierdzone testy źródłowe:
+
+```text
+scripts.test_fem_quality_typed_dispatch                         28/28 PASS
+scripts/test_fmmq_v2.py                                         10/10 PASS
+packages/fullmag-py/tests/test_meshing.py                       289 PASS, 31 skipped
+prune default/just dry-run source contracts                    PASS
+```
+
+#### Root package-manager contract — 2026-08-31
+
+Usunięto wyłącznie śledzony root `package-lock.json`, który kolidował z deklaracją
+`pnpm@10.8.1` i powodował ostrzeżenie VS Code o wielu lockfile'ach. Lockfile
+`external_solvers/amumax/frontend/package-lock.json` pozostaje nietknięty jako
+własność nested projektu. Root `.gitignore` blokuje ponowne dodanie npm lockfile'a,
+a `scripts/ci/contract_guard.sh` kończy się błędem, jeśli taki plik wróci albo
+zniknie kanoniczny `pnpm-lock.yaml`.
+
+`setup_fullmag.ps1 -InstallMissing` provisionuje teraz `COREPACK_HOME` i wymaga
+dokładnie `pnpm@10.8.1` w tym samym path, którego używa launcher. Nadal nie ma
+live proof clean first run/offline reuse/wrong-version na pełnym Windows host,
+więc OPS-014 pozostaje `PARTIALLY_FIXED`, nie `CLOSED`.
+
+Evidence:
+
+```text
+root package-manager contract (no root package-lock, pnpm lock present)       PASS
+Windows launcher/setup lock contract (31 checks)                              PASS
+PowerShell parser for setup_fullmag.ps1                                        PASS
+git diff --check for lockfile guard                                           PASS
+```
+
+## Evidence manifest path and digest hardening — 2026-08-31
+
+`scripts/verify_fem_meshing_production.py` now resolves native, managed and
+browser artifact paths under the manifest directory and rejects `..` traversal,
+absolute paths outside the evidence root, and symlink/junction escapes.  Stages
+may additionally declare `<field>_sha256` (or `artifact_sha256`), which is
+verified against the file before the stage is accepted.  Existing manifests
+without digest fields remain readable for the legacy `evidence.v1` contract.
+
+The growth publication gate was also moved ahead of topology and quality
+artifact creation.  A rejected post-mesh ratio therefore leaves no partial
+artifact behind.
+
+Evidence:
+
+```text
+python -m py_compile scripts/verify_fem_meshing_production.py \
+  scripts/test_verify_fem_meshing_production_manifest.py                 PASS
+manifest focused tests (5)                                               PASS
+PYTHONPATH=scripts;packages/fullmag-py/src
+python -m unittest scripts.test_fem_quality_typed_dispatch -v   28/28 PASS
+```
+
+#### FMMQ v2 publication namespace hardening — 2026-08-31
+
+FMMQ v2 carriers no longer share one fixed `mesh_name-quality-v2.fmmq` path.
+The producer derives a deterministic SHA-256 filename token from the complete
+canonical identity (topology, policy, revision, family table and sidecar
+identity).  Atomic replace remains the publication primitive, while distinct
+concurrent remesh identities now have independent destination paths and cannot
+overwrite one another's evidence.  Re-publishing the same identity remains
+idempotent.  The meshing suite covers two revisions under one mesh name and
+confirms both files remain readable.
+
+Evidence:
+
+```text
+scripts/test_fmmq_v2.py                                      10/10 PASS
+packages/fullmag-py/tests/test_meshing.py                    293 PASS, 31 skipped
+```
+
+#### Structured meshing quality failures — 2026-08-31
+
+Quality publication and extraction failures now expose the same
+`mesh_quality_failure.v2` envelope instead of forcing API/CI callers to parse
+exception text. Threshold, non-finite metric, adjacent-growth, physical-tag
+coverage and topology-mutation failures expose a stable code/pointer/metric
+shape plus bounded details; threshold failures retain policy/topology/evidence
+identity when supplied by the caller.
+
+Evidence:
+
+```text
+scripts.test_fem_quality_typed_dispatch                         28/28 PASS
+packages/fullmag-py/tests/test_meshing.py                       293 PASS, 31 skipped
+python -m py_compile (quality/extraction/asset pipeline)         PASS
+```
+
+#### Native material-interface owner guard — 2026-08-31
+
+The MFEM mesh builder now applies the same-side material-interface invariant at
+the native boundary-collection boundary: a declared material interface must
+have exactly two volume owners and their canonical cell markers must differ.
+This prevents a typed interface from connecting two cells in the same material
+domain, while preserving the existing rule that interface facets are not
+published as MFEM boundary elements.  The mixed-P1 native contract adds a
+regression for equal owner markers.  Native compilation/runtime execution is
+`NOT VERIFIED` on this Windows host because the MFEM managed build is not
+available locally.
+
+#### Mixed-periodic public-route boundary — 2026-08-31
+
+The public Python generator and `MeshData.validate()` now share an explicit
+fail-closed boundary for mixed/non-tetrahedral periodic requests. Swept mixed
+options are rejected before Gmsh import, and a mixed `MeshData` carrying
+periodic pairs, a periodic certificate, or `periodic_seam` roles is rejected
+unless a future end-to-end certificate is present. The low-level native MFEM
+builder still understands an already-validated seam facet as a boundary
+attribute; that is not yet mixed-periodic node-pair support. Full native/Rust
+CPU/GPU parity remains `NOT VERIFIED`.
+
+Evidence:
+
+```text
+CARGO_TARGET_DIR=C:\\git\\fullmag\\build\\cargo-targets\\fem-meshing-ir
+cargo test -p fullmag-ir --lib --no-fail-fast                         98/98 PASS
+```
+
+The same external target also passed the planner contract suite, including
+mixed-topology device gating and mesh-asset policy lowering:
+
+```text
+cargo test -p fullmag-plan --lib --no-fail-fast                      442/442 PASS
+```
+## Plan: FEM K0 eigensolve Poisson-airbox CPU/GPU i Control Room — odzyskany ledger recovery
+
+- Worktree źródłowy: `/home/kkingstoun/git/fullmag/fullmag/.worktrees/eigensolve-k0-demag-recovery`
+- Branch źródłowy: `codex/eigensolve-k0-demag`
+- Source plan: `docs/plans/active/fd_sovler_masterplan/27_fem_k0_eigensolve_production_completion_and_control_room.md`
+- Poniższe wpisy zachowują stan udokumentowany na branchu recovery przed
+  integracją; nie zastępują świeżej kwalifikacji scalonego `master`.
+
+N1b canonical map binding: complete source-level, independent review approved;
+managed MFEM/runtime proof remains open.
+
+N1c runner linearization descriptor: complete source-level, independent
+re-review approved after fixing full-global `3N` importer semantics, runner FFI
+envelope tests and validation-only `A_qq` oracle. `certificate_binding_v6`
+remains `NULL`, aggregate gate remains closed, and N1d owns the full typed v6
+preimage/relation producer.
+
+N1d runner-owned certificate v6 producer: complete source-level, final
+independent re-review `SPEC APPROVED / QUALITY APPROVED`. The canonical IR
+producer separates magnetic-prefix and global-scalar evidence; the runner
+regenerates and compares the complete accepted certificate, constructs all four
+owned views, byte-aligns the native preimage and
+`shared_domain_map_binding.v1`, validates the trusted ordered multi-part
+registry for one physical magnetic object plus airbox, and keeps all nested ABI
+v18 pointers alive. The real-plan-like fixture covers `body +
+hole_transition_refinement + air` with magnetic markers 1/2, shared nodes,
+x/y edge/corner closure and open z. Fresh focused evidence recorded on recovery:
+IR 6/6, `modal_v6_` 8/8, `shared_domain` 13/13, `native_fem` 22/22, routing 1/1,
+no-default and fem-native no-link checks PASS. Managed MFEM/CUDA runtime proof
+remained open and belonged to N1e/integration.
+
+N1e periodic-antidot eigen script slice: complete source-level, final
+independent re-review `SPEC APPROVED / QUALITY APPROVED`. Added the separate
+`examples/fem_periodic_antidot_relax_eigenmodes.py` without changing the
+frequency-driven FMR example. Canonical Python export proves CPU
+`relax -> eigenmodes` and GPU `relax -> change_device -> eigenmodes` with
+devices `[cpu,gpu,gpu]`, strict/double, `full_2x2`, K0,
+`periodic_airbox_k0`, bounded window and spectrum/dispersion/mode outputs.
+Recorded recovery evidence: Python 7/7 plus 5 subtests, canonical pipeline and
+public CPU/GPU run-config PASS, three focused Rust typed producer/CPU
+routing/strict GPU rejection tests each real 1/1, py_compile and diff-check
+PASS. Managed MFEM solve remained open at that checkpoint.
+
+Task 3 (GPU K0 B_qq compile blocker): complete (commit `f6f018c4c`, independent
+spec/quality review approved with no findings; source contract and diff-check
+pass). Fresh managed GREEN remained the next integration gate.
+
+Task 4 (CLI Eigenmodes bias_field_sweep merge blocker): complete (commit
+`7766c1231`, independent spec/quality review approved with no findings; focused
+regression, cargo check, rustfmt, and diff-check pass). Fresh managed GREEN
+remained the next integration gate.
+
+Task 11 (N1a mixed-P1 native A_qq): complete (commits `50b3a3b5..78050779c`,
+independent spec/quality review approved with no Critical/Important findings;
+focused MFEM container contract exit 0). Authoritative managed runtime
+qualification remained open at that checkpoint.
+
+Task A2-RI (canonical realtime invalidation for frequency-domain resources):
+complete source-level (four frontend files, no solver/API schema changes),
+independent review `APPROVE` with no Critical/Important/Minor findings. The
+canonical key catalog covers eigen branches/dispersion/diagnostics, response
+sweep/progress/cancel/diagnostics/frequency-point/field-meta and existing
+manifest/spectrum/field-sweep/FMR/mode-field resources. Indexed paths are strict
+non-negative `u32`, artifact aliases converge to hook keys, and
+`resource.updated`/`resource.batch_changed` tests cover sibling isolation and
+compatibility diagnostics routing. Recorded recovery verification: Vitest
+93/93 and Control Room typecheck pass; targeted ESLint and diff-check were green
+in the independent review. Managed/native/browser qualification was not claimed.
+
+Task N2-CW1 (CPU frequency-window completion certificate): complete source-level
+and focused-contract level; independent remediation re-review `APPROVE` with no
+findings. The CPU Schur frequency-window path runs base and refinement shift
+schedules, compares frequencies, physical cluster ranks and invariant-subspace
+overlap, requires positive coverage margins, and fails closed on disagreement,
+truncation, cancellation or incomplete schedules. Focused container evidence
+recorded on recovery passed the positive, rank-two degeneracy, split-cluster
+disagreement, empty failure and cancellation cases; documentation validation
+was green (21/21). Managed runtime, full legacy monolithic binary, GPU parity
+and production qualification remained explicitly open.
+
+# Plan: FEM GPU performance remediation implementation (2026-09-01)
+
+- Worktree: `C:\git\fullmag\worktrees\fem-gpu-performance-remediation-implementation-20260901`
+- Branch: `codex/fem-gpu-performance-remediation-implementation-20260901`
+- Immutable base at worktree creation: `c3f49db708868f3649a3e894416d230269718920`
+- Commit policy: no commit, push, reset, stash, or cleanup performed.
+
+## Baseline ledger
+
+- `git status --short`: worktree contains only the task-scoped source,
+  contract, Rust ABI, and performance-documentation changes listed below; the
+  unrelated dirty main checkout was not modified.
+- `git diff --check`: no whitespace errors; Git emitted only the expected
+  LF/CRLF conversion warnings.
+- `just --list`: exit `0`.
+- The performance package manifest contains all 31 finding IDs and records
+  `verified_commit=c3f49db708868f3649a3e894416d230269718920`, with managed GPU
+  runtime still `NOT VERIFIED`.
+- The repository has a documented `rebuild-fem-runtime`/`ensure-managed-fem-runtime`
+  container route. No host-side FEM build was used as qualification evidence.
+
+## Current task status
+
+| Task | Source state | Qualification state |
+|---:|---|---|
+| 1 | unified transactional GPU performance snapshot, C ABI/Rust layout, attempt telemetry | managed compile/receipt pending |
+| 2 | single HYPRE device-policy owner and conditional residual-validation resolver | managed compile/runtime pending |
+| 3 | typed FieldOnly mode, fused/split demag recovery selection, timing hooks | parity/timing/managed pending |
+| 4 | deferred RK normalization and typed attempt packet | CUDA compile/rollback proof pending |
+| 5 | cosine/min rotation reduction and error-policy resolver | method specializations/managed parity pending |
+| 6 | endpoint token and fail-closed FSAL policy | DP54/periodic parity pending |
+| 7 | explicit metric mode and resolved `has_external_field` composition | typed reductions/output-mask integration pending |
+| 8 | row scale, fused XYZ exchange, deterministic CSR builder/planner types | qualified accuracy mode/planner wiring pending |
+| 9 | reduced periodic CSR/mass/lift and projection guards | energy/Armijo/PBC parity and complexity receipt pending |
+| 10 | deterministic exchange planner resolver (fail-closed) | benchmark/profile/capability wiring pending |
+| 11 | diagonal preconditioner builder/resolver (fail-closed) | NCG/PG-BB integration and qualification pending |
+| 12 | documentation/matrix corrections and explicit evidence boundaries | managed/scientific/production gates pending |
+
+The source changes intentionally do not promote unqualified advanced profiles,
+partial assembly, preconditioners, or periodic FSAL to a public validated
+capability. The remaining evidence lanes must be run on a clean source identity
+after the managed runtime can be rebuilt.
+
+## Verification wave (2026-09-02)
+
+- Canonical Windows FEM route passed: `just windows-build backend=fem
+  device=gpu frontend=static` exited `0` using Docker Desktop, CUDA `12.6.85`,
+  and the RTX 4080 SUPER (`sm_89`). This is compile/package evidence, not an
+  immutable managed-runtime receipt.
+- Seven focused CUDA/C++ contracts passed in the same GPU image: performance
+  snapshot ABI, HYPRE validation policy, exchange operator, demag FieldOnly,
+  adaptive error policy, RK attempt packet, and relaxation preconditioner.
+- Rust ABI and provenance-contract checks passed: `fullmag-fem-sys` 1/1 and
+  runner performance-snapshot filters 3/3.
+- `git diff --check` reported no whitespace errors (only expected LF/CRLF
+  conversion warnings); `just --list` exited `0`; manifest metrics match all
+  11 documented files; the manifest contains all 31 finding IDs.
+- Targeted `rustfmt --edition 2021 --check` for the three changed Rust files
+  passed. A whole-workspace `cargo fmt --all -- --check` still reports a
+  formatting delta in the untouched pre-existing `crates/fullmag-runner/src/lib.rs`;
+  it was not changed in this worktree.
+- The managed canonical Linux runtime remains `NOT VERIFIED`: the available
+  storage/export route does not currently satisfy the repository's required
+  loop-backed `canonical`/`native-2` profile. Therefore no managed receipt,
+  scientific CPU/GPU parity, benchmark speedup, or production qualification is
+  claimed.
+- During verification one invalid exchange negative case was corrected and the
+  preconditioner now rejects a negative exchange weight, preserving the
+  fail-closed contract.
+
+## Reduced exchange consumer completion (2026-09-02)
+
+- EX-01 source gap closed: periodic reduced CSR is now consumed by dedicated
+  CUDA kernels for final RK exchange energy and direct-minimizer exchange
+  energy difference (the Armijo input), with the full CSR path retained as the
+  non-periodic/fallback route.
+- Canonical Windows FEM GPU build was rerun after this change and exited `0`.
+- The seven focused CMake contracts were rebuilt and passed `7/7`, including
+  the exchange-operator contract; this proves CUDA compilation and source
+  contracts, not periodic physics parity or a managed runtime receipt.
+- The EX-01 status and coverage matrix were synchronized in both the source
+  documentation package and the combined document. Managed runtime,
+  field/energy/direct-energy parity, complexity receipt and benchmark remain
+  `NOT VERIFIED`.
+- Final documentation checks after synchronization: manifest metrics match all
+  11 files, the matrix has 31 unique IDs equal to the manifest, the combined
+  document's 01–10 sections match their source documents (README link paths
+  remain intentionally rebased for the combined location), and the manifest
+  JSON parses successfully.
+
+## Results mode-sweep continuation (2026-09-02)
+
+- Stale result overlays are now cleared in the React layout phase when the
+  selected dataset/item changes; the regression is RED on the old effect and
+  GREEN at 9/9 with `useLayoutEffect`.
+- Commit `3c645b827` contains only the production hook and its regression test;
+  Control Room typecheck, ESLint, and the focused Results/Analysis suite pass.

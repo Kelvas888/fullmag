@@ -314,6 +314,71 @@ pub enum TimeIntegrator {
     ABM3,
 }
 
+/// Explicit projection policy used by constrained RK stages.
+///
+/// The CPU FDM implementation currently realizes the embedded RK tableaus as
+/// projected methods: every trial stage and accepted candidate is projected
+/// back to the unit sphere before the next RHS evaluation.  Keeping this
+/// policy typed prevents the operation from being mistaken for an accidental
+/// vector normalization hidden in a tableau implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProjectionPolicy {
+    #[default]
+    UnitSphere,
+}
+
+/// Stable identity of the current FDM RK projection realization.
+pub const FDM_RK_PROJECTION_REALIZATION_VERSION: &str = "fullmag.fdm.rk_projection.unit_sphere.v1";
+
+impl ProjectionPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UnitSphere => "unit_sphere",
+        }
+    }
+
+    pub const fn realization_version(self) -> &'static str {
+        match self {
+            Self::UnitSphere => FDM_RK_PROJECTION_REALIZATION_VERSION,
+        }
+    }
+
+    pub fn project(self, vector: Vector3) -> Result<Vector3> {
+        match self {
+            Self::UnitSphere => crate::vector::normalized(vector),
+        }
+    }
+}
+
+#[cfg(test)]
+mod projection_policy_tests {
+    use super::{EngineErrorCode, ProjectionPolicy, FDM_RK_PROJECTION_REALIZATION_VERSION};
+
+    #[test]
+    fn unit_sphere_projection_has_stable_identity_and_fail_closed_nonfinite_input() {
+        let policy = ProjectionPolicy::default();
+        assert_eq!(policy.as_str(), "unit_sphere");
+        assert_eq!(
+            policy.realization_version(),
+            FDM_RK_PROJECTION_REALIZATION_VERSION
+        );
+
+        let projected = policy
+            .project([3.0, 4.0, 0.0])
+            .expect("finite vector projects");
+        assert!((projected[0] - 0.6).abs() < 1.0e-15);
+        assert!((projected[1] - 0.8).abs() < 1.0e-15);
+        assert_eq!(
+            policy.project([0.0, 0.0, 0.0]).expect("inactive cell"),
+            [0.0; 3]
+        );
+        assert_eq!(
+            policy.project([f64::NAN, 0.0, 0.0]).unwrap_err().code(),
+            EngineErrorCode::NaNValue
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AdaptiveStepConfig {
     pub max_error: f64,
@@ -344,12 +409,145 @@ impl Default for AdaptiveStepConfig {
     }
 }
 
+/// Stable identity of the Rust FDM CPU adaptive-step controller policy.
+///
+/// Attempt telemetry carries this value so a recorded retry trace cannot be
+/// interpreted with a different accept/reject policy after a solver change.
+pub const FDM_ADAPTIVE_CONTROLLER_POLICY_VERSION: &str = "fullmag.fdm.adaptive_controller.v1";
+
+/// Default bounded retry budget for one adaptive outer-step transaction.
+pub const FDM_ADAPTIVE_CONTROLLER_MAX_REJECTED_ATTEMPTS: u32 = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AdaptiveStepDecision {
+    Accepted(f64),
+    Retry(f64),
+    DtMinExhausted,
+    NonFinite(EngineErrorCode),
+    RetryLimitExhausted,
+}
+
+/// Public, versioned PI controller shared by all Rust FDM CPU embedded-RK
+/// representations.  It owns the previous accepted error and retry budget;
+/// rejected attempts never update the PI history.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AdaptiveStepController {
+    order_estimate: i32,
+    config: AdaptiveStepConfig,
+    previous_error: Option<f64>,
+    rejected_attempts: u32,
+    max_rejected_attempts: u32,
+}
+
+impl AdaptiveStepController {
+    pub const POLICY_VERSION: &'static str = FDM_ADAPTIVE_CONTROLLER_POLICY_VERSION;
+    pub const DEFAULT_MAX_REJECTED_ATTEMPTS: u32 = FDM_ADAPTIVE_CONTROLLER_MAX_REJECTED_ATTEMPTS;
+
+    pub fn new(
+        order_estimate: i32,
+        config: AdaptiveStepConfig,
+        previous_error: Option<f64>,
+    ) -> Self {
+        Self {
+            order_estimate,
+            config,
+            previous_error,
+            rejected_attempts: 0,
+            max_rejected_attempts: Self::DEFAULT_MAX_REJECTED_ATTEMPTS,
+        }
+    }
+
+    pub fn with_max_rejected_attempts(mut self, max_rejected_attempts: u32) -> Self {
+        self.max_rejected_attempts = max_rejected_attempts;
+        self
+    }
+
+    pub const fn policy_version(&self) -> &'static str {
+        Self::POLICY_VERSION
+    }
+
+    pub const fn previous_error(&self) -> Option<f64> {
+        self.previous_error
+    }
+
+    pub const fn rejected_attempts(&self) -> u32 {
+        self.rejected_attempts
+    }
+
+    pub const fn max_rejected_attempts(&self) -> u32 {
+        self.max_rejected_attempts
+    }
+
+    fn retry_or_fail(&mut self, dt_next: f64) -> AdaptiveStepDecision {
+        if self.rejected_attempts >= self.max_rejected_attempts {
+            AdaptiveStepDecision::RetryLimitExhausted
+        } else {
+            self.rejected_attempts += 1;
+            AdaptiveStepDecision::Retry(dt_next)
+        }
+    }
+
+    pub fn decide(&mut self, dt: f64, error: f64) -> AdaptiveStepDecision {
+        if error.is_nan() {
+            return AdaptiveStepDecision::NonFinite(EngineErrorCode::NaNValue);
+        }
+        if error.is_infinite() {
+            return AdaptiveStepDecision::NonFinite(EngineErrorCode::InfiniteValue);
+        }
+        // Treat a representationally rounded value just above `dt_min` as the
+        // minimum-step boundary.  Otherwise a rejected attempt can schedule
+        // one redundant retry at the same clamped `dt_min`.
+        let at_dt_min = dt <= self.config.dt_min
+            || (dt - self.config.dt_min).abs() <= self.config.dt_min * (4.0 * f64::EPSILON);
+        if error > 1.0 && at_dt_min {
+            return AdaptiveStepDecision::DtMinExhausted;
+        }
+        let accepted = error <= 1.0;
+        let raw_ratio = if error == 0.0 {
+            self.config.growth_limit
+        } else {
+            let scale = 1.0 / f64::from(self.order_estimate + 1);
+            if accepted {
+                self.previous_error
+                    .filter(|value| *value > 0.0)
+                    .map_or_else(
+                        || self.config.headroom * error.powf(-scale),
+                        |previous| {
+                            self.config.headroom
+                                * error.powf(-0.7 * scale)
+                                * previous.powf(0.4 * scale)
+                        },
+                    )
+            } else {
+                self.config.headroom * error.powf(-scale)
+            }
+        };
+        let next = (dt * raw_ratio.clamp(self.config.shrink_limit, self.config.growth_limit))
+            .clamp(self.config.dt_min, self.config.dt_max);
+        if accepted {
+            self.previous_error = Some(error);
+            AdaptiveStepDecision::Accepted(next)
+        } else if next < dt {
+            self.retry_or_fail(next)
+        } else {
+            let decreased = dt.next_down();
+            if decreased > 0.0 && decreased >= self.config.dt_min {
+                self.retry_or_fail(decreased)
+            } else {
+                AdaptiveStepDecision::DtMinExhausted
+            }
+        }
+    }
+}
+
 use crate::DEFAULT_GYROMAGNETIC_RATIO;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LlgConfig {
     pub gyromagnetic_ratio: f64,
     pub integrator: TimeIntegrator,
+    /// Explicit constrained-RK projection policy for this solver session.
+    pub projection_policy: ProjectionPolicy,
     /// True only when the public problem selected an adaptive timestep policy.
     /// Embedded RK tableaus remain fixed-step when this is false.
     pub adaptive_enabled: bool,
@@ -362,6 +560,7 @@ impl Default for LlgConfig {
         Self {
             gyromagnetic_ratio: DEFAULT_GYROMAGNETIC_RATIO,
             integrator: TimeIntegrator::Heun,
+            projection_policy: ProjectionPolicy::default(),
             adaptive_enabled: false,
             adaptive: AdaptiveStepConfig::default(),
             precession_enabled: true,
@@ -377,6 +576,7 @@ impl LlgConfig {
         Ok(Self {
             gyromagnetic_ratio,
             integrator,
+            projection_policy: ProjectionPolicy::default(),
             adaptive_enabled: false,
             adaptive: AdaptiveStepConfig::default(),
             precession_enabled: true,
@@ -386,6 +586,11 @@ impl LlgConfig {
     pub fn with_adaptive(mut self, config: AdaptiveStepConfig) -> Self {
         self.adaptive_enabled = true;
         self.adaptive = config;
+        self
+    }
+
+    pub fn with_projection_policy(mut self, policy: ProjectionPolicy) -> Self {
+        self.projection_policy = policy;
         self
     }
 

@@ -488,6 +488,11 @@ fn execute_projected_gradient_bb_soa(
             line_search_backtracks += 1;
         }
         let Some(e_trial) = accepted_energy else {
+            // Exhausting the backtracking budget is a numerical stopping
+            // condition, not a successful stage completion.  Preserve the
+            // distinction so the runner reports a deterministic gradient /
+            // stagnation reason instead of the generic backend error.
+            numerical_stagnation = true;
             break;
         };
 
@@ -720,6 +725,10 @@ fn execute_projected_gradient_bb_aos(
             line_search_backtracks += 1;
         }
         let Some((m_trial, e_trial)) = accepted_trial else {
+            // No Armijo candidate survived the complete backtracking budget.
+            // This is recoverable numerical stagnation and must be surfaced
+            // as such in the completion contract.
+            numerical_stagnation = true;
             break;
         };
 
@@ -971,6 +980,7 @@ fn execute_nonlinear_cg_soa(
             line_search_backtracks += 1;
         }
         let Some(e_new) = accepted_energy else {
+            numerical_stagnation = true;
             break;
         };
 
@@ -1186,6 +1196,7 @@ fn execute_nonlinear_cg_aos(
             line_search_backtracks += 1;
         }
         let Some((m_new, e_new)) = accepted_trial else {
+            numerical_stagnation = true;
             break;
         };
 
@@ -1602,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn relaxation_convergence_rejects_energy_only_stop() {
+    fn relaxation_convergence_accepts_energy_only_stop() {
         let control = control(None, Some(1e-18));
         let energy_plateau_range = Some(EnergyPlateauRangeJ { value: 5e-19 });
         let stats = StepStats {
@@ -1611,7 +1622,7 @@ mod tests {
             ..StepStats::default()
         };
 
-        assert!(!relaxation_converged(
+        assert!(relaxation_converged(
             &control,
             &stats,
             energy_plateau_range,
@@ -1622,16 +1633,16 @@ mod tests {
     }
 
     #[test]
-    fn relaxation_convergence_requires_both_torque_and_energy_when_both_are_set() {
+    fn relaxation_convergence_accepts_torque_when_energy_does_not_pass() {
         let control = control(Some(1e-3), Some(1e-18));
-        let energy_plateau_range = Some(EnergyPlateauRangeJ { value: 5e-19 });
+        let energy_plateau_range = Some(EnergyPlateauRangeJ { value: 2e-18 });
         let stats = StepStats {
-            e_total: 1.0 - 5e-19,
-            max_torque_Apm: 1e-2,
+            e_total: 1.0 - 2e-18,
+            max_torque_Apm: 5e-4,
             ..StepStats::default()
         };
 
-        assert!(!relaxation_converged(
+        assert!(relaxation_converged(
             &control,
             &stats,
             energy_plateau_range,

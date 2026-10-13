@@ -2,9 +2,9 @@
  * GPU CUDA Poisson demag operator workspace source contract.
  *
  * This source owns construction and device upload/destruction of the strict GPU
- * Poisson demag P1-state/P2-potential RHS CSR, P1-state recovery CSR, and
- * essential potential true DOF lists. Periodic reduction remains P1/P1. It
- * does not own Hypre solver policy, lifecycle publication,
+ * Poisson demag P1-state/resolved-potential-order RHS CSR, P1-state recovery
+ * CSR, and essential potential true DOF lists. Periodic reduction remains
+ * P1/P1. It does not own Hypre solver policy, lifecycle publication,
  * RK-stage orchestration, local interaction kernels, or C ABI entrypoints.
  */
 
@@ -30,8 +30,8 @@ namespace fullmag::fem {
 
 namespace {
 
-constexpr std::string_view kMixedP1P2DemagQuadraturePolicy =
-    "mixed_p1_state_p2_potential_demag_operator.v1:int_rules_2p_plus_p1";
+constexpr std::string_view kMixedP1ResolvedDemagQuadraturePolicy =
+    "mixed_p1_state_resolved_potential_demag_operator.v3:int_rules_2p";
 constexpr std::string_view kPeriodicP1DemagQuadraturePolicy =
     "periodic_p1_node_class_demag_operator.v1:int_rules_3";
 
@@ -194,6 +194,41 @@ void destroy_scalar(DeviceCsrScalar &op)
     free_device_array(op.d_values);
 }
 #endif
+
+uint64_t csr_pattern_digest(const DeviceCsrScalar &op)
+{
+    uint64_t hash = 14695981039346656037ull;
+    fnv1a_string(hash, "fullmag.fem.gpu.demag.recovery.csr-pattern.v1");
+    fnv1a_u64(hash, op.rows);
+    fnv1a_u64(hash, op.nnz);
+    fnv1a_integral_vector(hash, op.row_offsets);
+    fnv1a_integral_vector(hash, op.col_indices);
+    return hash;
+}
+
+bool csr_pattern_equal(
+    const DeviceCsrScalar &lhs,
+    const DeviceCsrScalar &rhs)
+{
+    return lhs.rows == rhs.rows &&
+        lhs.nnz == rhs.nnz &&
+        lhs.row_offsets == rhs.row_offsets &&
+        lhs.col_indices == rhs.col_indices;
+}
+
+bool shared_xyz_csr_pattern(
+    const DeviceCsrScalar &x,
+    const DeviceCsrScalar &y,
+    const DeviceCsrScalar &z)
+{
+    const uint64_t digest = csr_pattern_digest(x);
+    if (digest != csr_pattern_digest(y) || digest != csr_pattern_digest(z)) {
+        return false;
+    }
+    // A digest is only a setup-time fast reject.  Never select the fused
+    // kernel without the exact row-offset/column-index comparison.
+    return csr_pattern_equal(x, y) && csr_pattern_equal(x, z);
+}
 
 int signed_dof_index(int dof)
 {
@@ -614,6 +649,8 @@ bool build_mixed_demag_operator_fingerprint(
         !fnv1a_device_csr_scalar(hash, workspace.robin_boundary_mass, "Robin boundary mass", error)) {
         return false;
     }
+    fnv1a_u64(hash, workspace.recovery_xyz_pattern_digest);
+    fnv1a_u64(hash, workspace.visual_recovery_xyz_pattern_digest);
     fnv1a_integral_vector(hash, workspace.ess_tdofs);
 
     std::ostringstream encoded;
@@ -645,7 +682,12 @@ bool build_mixed_demag_operators(
     const bool periodic_node_class_reduction =
         !ctx.mesh.periodic_node_pairs.empty() ||
         ctx.poisson_demag.periodic_reduced_ready;
-    const int expected_potential_order = periodic_node_class_reduction ? 1 : 2;
+    const int expected_potential_order =
+        static_cast<int>(ctx.poisson_demag.potential_order);
+    if (expected_potential_order <= 0) {
+        error = "strict FEM GPU demag requires a resolved positive potential order";
+        return false;
+    }
     if (state_fes->GetVSize() != state_fes->GetTrueVSize() ||
         state_fes->GetTrueVSize() != static_cast<int>(ctx.mesh.n_nodes) ||
         state_fes->GetTrueVSize() <= 0) {
@@ -655,10 +697,6 @@ bool build_mixed_demag_operators(
     if (potential_fes->GetVSize() != potential_fes->GetTrueVSize() ||
         potential_fes->GetTrueVSize() <= 0) {
         error = "strict FEM GPU demag requires unconstrained serial potential true DOFs";
-        return false;
-    }
-    if (ctx.demag.realization == FULLMAG_FEM_DEMAG_FREDKIN_KOEHLER) {
-        error = "strict FEM GPU demag does not support Fredkin-Koehler FEM/BEM demag";
         return false;
     }
     if (!ctx.material_fields.Ms_element_field.empty() ||
@@ -749,7 +787,7 @@ bool build_mixed_demag_operators(
         if (potential_fe == nullptr || potential_fe->GetOrder() != expected_potential_order) {
             error = periodic_node_class_reduction
                 ? "strict FEM GPU periodic demag found a non-P1 element in the potential FE space"
-                : "strict FEM GPU nonperiodic demag requires P2 potential elements";
+                : "strict FEM GPU nonperiodic demag found an element whose order differs from the resolved potential order";
             return false;
         }
         if (state_fe == nullptr || state_fe->GetOrder() != 1) {
@@ -796,9 +834,13 @@ bool build_mixed_demag_operators(
         const bool magnetic_element = ctx.mesh.magnetic_element_mask.empty() ||
             ctx.mesh.magnetic_element_mask[static_cast<size_t>(elem)] != 0u;
         const mfem::IntegrationRule &ir =
+            // Match MFEM's DomainLFGradIntegrator default exactly.  Its
+            // implementation requests IntRules(geom, 2 * test_order);
+            // using a higher order here changes the non-affine pyramid
+            // quadrature result and breaks CPU/GPU operator parity.
             mfem::IntRules.Get(
                 potential_fe->GetGeomType(),
-                2 * potential_fe->GetOrder() + state_fe->GetOrder());
+                2 * potential_fe->GetOrder());
         state_shape.SetSize(state_ndof);
         potential_dshape.SetSize(potential_ndof, 3);
         for (int q = 0; q < ir.GetNPoints(); ++q) {
@@ -811,7 +853,7 @@ bool build_mixed_demag_operators(
             }
             const double w = ip.weight * jacobian_weight;
             if (!std::isfinite(w)) {
-                error = "strict FEM GPU demag found a non-finite mixed P1/P2 quadrature weight";
+                error = "strict FEM GPU demag found a non-finite resolved-order quadrature weight";
                 return false;
             }
             state_fe->CalcShape(ip, state_shape);
@@ -1040,6 +1082,22 @@ bool build_mixed_demag_operators(
         return false;
     }
 
+    workspace.recovery_mode = shared_xyz_csr_pattern(
+        workspace.recovery_x,
+        workspace.recovery_y,
+        workspace.recovery_z)
+        ? GpuDemagRecoveryMode::SharedPatternFusedXyz
+        : GpuDemagRecoveryMode::SplitCsr;
+    workspace.recovery_xyz_pattern_digest = csr_pattern_digest(workspace.recovery_x);
+    workspace.visual_recovery_mode = shared_xyz_csr_pattern(
+        workspace.visual_recovery_x,
+        workspace.visual_recovery_y,
+        workspace.visual_recovery_z)
+        ? GpuDemagRecoveryMode::SharedPatternFusedXyz
+        : GpuDemagRecoveryMode::SplitCsr;
+    workspace.visual_recovery_xyz_pattern_digest =
+        csr_pattern_digest(workspace.visual_recovery_x);
+
     if (ctx.demag.realization == FULLMAG_FEM_DEMAG_AIRBOX_ROBIN &&
         ctx.poisson_demag.robin_effective_beta > 0.0 &&
         ctx.poisson_demag.robin_boundary_mass != nullptr) {
@@ -1084,7 +1142,7 @@ bool build_mixed_demag_operators(
             workspace,
             periodic_node_class_reduction
                 ? kPeriodicP1DemagQuadraturePolicy
-                : kMixedP1P2DemagQuadraturePolicy,
+                : kMixedP1ResolvedDemagQuadraturePolicy,
             workspace.operator_fingerprint,
             error)) {
         return false;
@@ -1162,6 +1220,10 @@ void destroy_demag_poisson_operators(GpuDemagPoissonWorkspace &workspace)
     workspace.operator_fingerprint.clear();
     workspace.operator_build_count = 0;
     workspace.operator_upload_count = 0;
+    workspace.recovery_xyz_pattern_digest = 0;
+    workspace.recovery_mode = GpuDemagRecoveryMode::SplitCsr;
+    workspace.visual_recovery_xyz_pattern_digest = 0;
+    workspace.visual_recovery_mode = GpuDemagRecoveryMode::SplitCsr;
     workspace.device_bytes = 0;
     workspace.ready = false;
 }

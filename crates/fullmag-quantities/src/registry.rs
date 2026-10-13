@@ -249,6 +249,7 @@ pub fn register_standard_providers(registry: &mut QuantityRegistry) {
         Torque,
         HAni,
         HDmi,
+        HDmiRotated,
         HMel,
         U,
         Eps,
@@ -272,6 +273,7 @@ pub fn register_standard_providers(registry: &mut QuantityRegistry) {
     for id in [
         ModeAmplitude,
         ModePhase,
+        FrozenSpins,
         // Second wave (QB-17): energy densities
         EdenEx,
         EdenDemag,
@@ -280,6 +282,7 @@ pub fn register_standard_providers(registry: &mut QuantityRegistry) {
         EdenDrive,
         EdenAni,
         EdenDmi,
+        EdenRotatedDmi,
         EdenTotal,
         MatMs,
         MatAex,
@@ -301,6 +304,7 @@ pub fn register_standard_providers(registry: &mut QuantityRegistry) {
         (EDrive, "e_drive"),
         (EAni, "e_ani"),
         (EDmi, "e_dmi"),
+        (ERotatedDmi, "e_rotated_dmi"),
         (EEl, "e_el"),
         (EKinEl, "e_kin_el"),
         (ElasticResidualNorm, "elastic_residual_norm"),

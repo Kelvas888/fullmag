@@ -1,19 +1,52 @@
 #include "cpu/frequency_domain/poisson_airbox_schur_matshell.hpp"
+#include "core/petsc_slepc_runtime.hpp"
+#include "cpu/frequency_domain/mode_deduplication.hpp"
+#include "cpu/frequency_domain/modal_krylov_tuning.hpp"
+#include "cpu/frequency_domain/operators/poisson_airbox_shared_domain.hpp"
 #include "frequency_domain/mode_kinematics.hpp"
+#include "frequency_domain/real_frequency_rotated_pencil.hpp"
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <complex>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <vector>
 
 #if FULLMAG_FEM_WITH_SLEPC
 #include <petscksp.h>
 #include <slepceps.h>
+
+// The managed qualification runtime intentionally supports PETSc 3.15, while
+// the development lane may use current PETSc. Keep callback code source-level
+// compatible without changing solver semantics.
+#ifndef PETSC_SUCCESS
+#define PETSC_SUCCESS 0
+#endif
+#ifndef PetscCall
+#define PetscCall(expression) \
+    do { \
+        const PetscErrorCode fullmag_petsc_error_ = (expression); \
+        CHKERRQ(fullmag_petsc_error_); \
+    } while (0)
+#endif
+#ifndef PetscCheck
+#define PetscCheck(condition, communicator, error_code, ...) \
+    do { \
+        if (!(condition)) { \
+            SETERRQ(communicator, error_code, __VA_ARGS__); \
+        } \
+    } while (0)
+#endif
+#ifndef KSP_DIVERGED_USER
+#define KSP_DIVERGED_USER KSP_DIVERGED_BREAKDOWN
+#endif
 #endif
 
 namespace fullmag::fem::frequency_domain {
@@ -25,6 +58,37 @@ namespace fullmag::fem::frequency_domain {
 namespace {
 
 using Complex = std::complex<double>;
+
+#if FULLMAG_FEM_WITH_SLEPC
+#if PETSC_VERSION_LT(3, 14, 3)
+// PETSc added the public GMRES restart-breakdown setter in 3.14.3. The
+// managed qualification image still carries PETSc 3.12, where the default
+// breakdown policy is the only source-compatible option.
+PetscErrorCode set_gmres_breakdown_tolerance_compat(KSP, PetscReal)
+{
+    return PETSC_SUCCESS;
+}
+#else
+PetscErrorCode set_gmres_breakdown_tolerance_compat(KSP ksp, PetscReal tolerance)
+{
+    return KSPGMRESSetBreakdownTolerance(ksp, tolerance);
+}
+#endif
+
+#if defined(SLEPC_VERSION_MAJOR) && \
+    (SLEPC_VERSION_MAJOR > 3 || \
+     (SLEPC_VERSION_MAJOR == 3 && SLEPC_VERSION_MINOR >= 15))
+PetscErrorCode set_st_preconditioner_mat_compat(ST st, Mat matrix)
+{
+    return STSetPreconditionerMat(st, matrix);
+}
+#else
+PetscErrorCode set_st_preconditioner_mat_compat(ST st, Mat matrix)
+{
+    return STPrecondSetMatForPC(st, matrix);
+}
+#endif
+#endif
 
 constexpr std::uint64_t kFnvOffset = 1469598103934665603ULL;
 constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
@@ -64,6 +128,51 @@ void copy_message(char *destination, std::size_t destination_size, const char *m
     }
     std::strncpy(destination, message != nullptr ? message : "", destination_size - 1);
     destination[destination_size - 1] = '\0';
+}
+
+void format_nullable_u64_json(
+    char *destination,
+    std::size_t destination_size,
+    bool available,
+    std::uint64_t value) noexcept
+{
+    if (destination == nullptr || destination_size == 0u) {
+        return;
+    }
+    const int written = available
+        ? std::snprintf(
+              destination,
+              destination_size,
+              "%llu",
+              static_cast<unsigned long long>(value))
+        : std::snprintf(destination, destination_size, "%s", "null");
+    if (written < 0 || static_cast<std::size_t>(written) >= destination_size) {
+        copy_message(destination, destination_size, "null");
+    }
+}
+
+void format_nullable_double_json(
+    char *destination,
+    std::size_t destination_size,
+    bool available,
+    double value) noexcept
+{
+    if (destination == nullptr || destination_size == 0u) {
+        return;
+    }
+    if (!available || !std::isfinite(value)) {
+        copy_message(destination, destination_size, "null");
+        return;
+    }
+    const int written = std::snprintf(destination, destination_size, "%.17g", value);
+    if (written < 0 || static_cast<std::size_t>(written) >= destination_size) {
+        copy_message(destination, destination_size, "null");
+    }
+}
+
+bool production_string_equals(const char *actual, const char *expected) noexcept
+{
+    return actual != nullptr && expected != nullptr && std::strcmp(actual, expected) == 0;
 }
 
 std::uint64_t fnv_mix_byte(std::uint64_t hash, unsigned char byte) noexcept
@@ -122,6 +231,66 @@ std::uint64_t hash_csr(const CsrMatrixView &matrix, std::uint64_t seed) noexcept
         }
     }
     return hash;
+}
+
+double csr_infinity_norm(const CsrMatrixView &matrix) noexcept
+{
+    if (matrix.row_offsets == nullptr || matrix.values == nullptr ||
+        matrix.row_offsets_len != matrix.row_count + 1u) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    double norm = 0.0;
+    for (std::uint64_t row = 0; row < matrix.row_count; ++row) {
+        long double row_sum = 0.0L;
+        for (std::uint32_t entry = matrix.row_offsets[row];
+             entry < matrix.row_offsets[row + 1u];
+             ++entry) {
+            row_sum += std::abs(static_cast<long double>(matrix.values[entry]));
+        }
+        norm = std::max(norm, static_cast<double>(row_sum));
+    }
+    return norm;
+}
+
+double production_modal_eigensolver_tolerance(double residual_tolerance) noexcept
+{
+    // Reserve three decades of the public original-descriptor certification
+    // budget for the transformed SLEPc solve. The transformed real pencil and
+    // reconstructed SI descriptor have different conditioning, so a single
+    // decade can converge the former while leaving the latter above its
+    // acceptance gate. The independent full residual check remains the
+    // acceptance gate, not this internal solver budget.
+    return std::max(
+        1.0e-12,
+        std::min(1.0e-8, 1.0e-3 * std::max(residual_tolerance, 0.0)));
+}
+
+struct BoundedKrylovDimensions {
+    std::uint64_t nev = 0;
+    std::uint64_t ncv = 0;
+    bool valid = false;
+};
+
+BoundedKrylovDimensions bounded_krylov_dimensions(
+    std::uint64_t dimension,
+    std::uint64_t requested_nev,
+    bool frequency_window = false) noexcept
+{
+    if (dimension < 2u || requested_nev == 0u) {
+        return {};
+    }
+    const std::uint64_t nev = std::min(dimension - 1u, requested_nev);
+    // Window coverage requests retain extra Ritz pairs even in empty local
+    // intervals. Reserve a larger basis for that solve, without changing nev,
+    // tolerances or the completeness certificate. Standalone shifts keep 2x.
+    // Bound before multiplication to avoid overflow near the u64 limit.
+    const std::uint64_t basis_multiplier = frequency_window ? 4u : 2u;
+    const std::uint64_t oversampled_nev =
+        nev > dimension / basis_multiplier ? dimension : basis_multiplier * nev;
+    const std::uint64_t ncv = std::min(
+        dimension,
+        std::max(nev + 1u, oversampled_nev));
+    return {nev, ncv, ncv > nev && ncv <= dimension};
 }
 
 double complex_l2_norm(const std::vector<Complex> &values) noexcept
@@ -335,6 +504,7 @@ ComplexDenseMatrix build_explicit_schur_by_direct_apply(
     }
     return schur;
 }
+
 
 ComplexDenseMatrix left_solve_matrix(
     const ComplexDenseMatrix &lhs,
@@ -625,6 +795,7 @@ void write_diagnostics_json(
         "\"solver_adapter\":\"k0_poisson_airbox_cpu_schur_matshell_slepc\","
         "\"demag_kind\":\"%s\","
         "\"gauge_policy\":\"%s\","
+        "\"residual_tolerance\":%.17g,"
         "\"zero_frequency_mode_policy\":\"exclude_zero_frequency\","
         "\"algebraic_form\":\"schur_reduced_matrix_free_mean_zero_poisson\","
         "\"reference_adapter\":\"k0_poisson_airbox_cpu_full_coupled_slepc\","
@@ -667,6 +838,7 @@ void write_diagnostics_json(
         reason != nullptr ? reason : "",
         problem.demag_kind != nullptr ? problem.demag_kind : "",
         problem.gauge_policy != nullptr ? problem.gauge_policy : "",
+        problem.residual_tolerance,
         result.created_petsc_matshell ? "true" : "false",
         result.reused_mean_zero_poisson_setup ? "true" : "false",
         static_cast<unsigned long long>(result.q_dof_count),
@@ -731,14 +903,34 @@ struct SchurMatShellContext {
     char error_message[256]{};
 };
 
-std::mutex &pa_e3_slepc_mutex()
+// Access only while the shared PETSc/SLEPc process mutex is held.
+// EPS solve returns a hard PETSc error, no later production K0 solve may
+// create or query another SLEPc graph in this process.
+bool &production_k0_slepc_process_quarantined()
 {
-    static std::mutex mutex;
-    return mutex;
+    static bool quarantined = false;
+    return quarantined;
 }
 
 bool ensure_slepc_initialized(char error_message[256])
 {
+    if (fullmag::fem::runtime::petsc_slepc_process_is_unsafe_locked()) {
+        copy_message(error_message, 256,
+                     "petsc_runtime_unsafe: PETSc/SLEPc graph is quarantined");
+        return false;
+    }
+
+    PetscBool petsc_finalized = PETSC_FALSE;
+    if (PetscFinalized(&petsc_finalized) != 0) {
+        copy_message(error_message, 256, "PETSc finalization state query failed");
+        return false;
+    }
+    if (petsc_finalized == PETSC_TRUE) {
+        copy_message(error_message, 256,
+                     "PETSc/SLEPc runtime is finalized and cannot be reinitialized");
+        return false;
+    }
+
     PetscBool initialized = PETSC_FALSE;
     if (SlepcInitialized(&initialized) != 0) {
         copy_message(error_message, 256, "SLEPc initialization query failed");
@@ -1082,9 +1274,5823 @@ bool solve_schur_matshell_slepc(
     }
     return found;
 }
+
+// Production shared-domain context.  The scalar Poisson factorization is
+// created once and every Schur MatShell action reuses it.  The context owns no
+// input storage; all matrices are assembled from the immutable request and
+// destroyed by solve_poisson_airbox_modal_eigen_cpu_schur().
+struct ProductionSchurContext {
+    Mat a_qq = nullptr;
+    Mat a_qphi = nullptr;
+    Mat a_phiq = nullptr;
+    Mat poisson = nullptr;
+    KSP poisson_ksp = nullptr;
+    Vec phi_rhs = nullptr;
+    Vec poisson_rhs = nullptr;
+    Vec poisson_solution = nullptr;
+    Vec phi_solution = nullptr;
+    Vec feedback = nullptr;
+    PetscInt q_count = 0;
+    PetscInt phi_count = 0;
+    PetscInt augmented_phi_count = 0;
+    bool gauge_augmented = false;
+    std::uint64_t operator_apply_count = 0;
+    std::uint64_t poisson_solve_count = 0;
+    std::uint64_t poisson_iteration_count = 0;
+    char error_message[256]{};
+};
+
+struct ProductionSplitContext {
+    ProductionSchurContext *base = nullptr;
+    Vec q_real = nullptr;
+    Vec q_imag = nullptr;
+    Vec y_real = nullptr;
+    Vec y_imag = nullptr;
+    double operator_scale = 1.0;
+};
+
+struct ProductionCpuSolveControl {
+    PoissonAirboxEigenBlockProblem callback_problem{};
+    std::chrono::steady_clock::time_point callback_started_at{};
+    bool armed = false;
+    bool cancellation_observed = false;
+    bool cancel_poll_enabled = true;
+    bool progress_enabled = true;
+
+    void arm(
+        const PoissonAirboxEigenBlockProblem &problem,
+        std::chrono::steady_clock::time_point started_at) noexcept
+    {
+        callback_problem = problem;
+        callback_started_at = started_at;
+        armed = true;
+        cancellation_observed = false;
+        cancel_poll_enabled = true;
+        progress_enabled = true;
+    }
+
+    void disarm() noexcept
+    {
+        callback_problem = PoissonAirboxEigenBlockProblem{};
+        callback_started_at = {};
+        armed = false;
+        cancellation_observed = false;
+        cancel_poll_enabled = true;
+        progress_enabled = true;
+    }
+};
+
+struct ProductionKspConvergenceContext {
+    ProductionCpuSolveControl *solve_control = nullptr;
+    PoissonAirboxModalLinearSolverRole linear_solver_role =
+        PoissonAirboxModalLinearSolverRole::unknown;
+    void *default_context = nullptr;
+};
+
+PetscErrorCode destroy_production_modal_ksp_convergence_context_value(
+    ProductionKspConvergenceContext *context)
+{
+    PetscFunctionBeginUser;
+    if (context == nullptr) {
+        PetscFunctionReturn(PETSC_SUCCESS);
+    }
+    PetscCall(KSPConvergedDefaultDestroy(&context->default_context));
+    delete context;
+    PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+#if PETSC_VERSION_LT(3, 24, 0)
+PetscErrorCode destroy_production_modal_ksp_convergence_context(void *raw_context)
+{
+    return destroy_production_modal_ksp_convergence_context_value(
+        static_cast<ProductionKspConvergenceContext *>(raw_context));
+}
+#else
+PetscErrorCode destroy_production_modal_ksp_convergence_context(void **raw_context)
+{
+    if (raw_context == nullptr) {
+        return PETSC_SUCCESS;
+    }
+    const PetscErrorCode status =
+        destroy_production_modal_ksp_convergence_context_value(
+            static_cast<ProductionKspConvergenceContext *>(*raw_context));
+    *raw_context = nullptr;
+    return status;
+}
+#endif
+
+PetscErrorCode production_modal_ksp_convergence_test(
+    KSP ksp,
+    PetscInt iteration,
+    PetscReal residual_norm,
+    KSPConvergedReason *reason,
+    void *raw_problem)
+{
+    PetscFunctionBeginUser;
+    auto *context = static_cast<ProductionKspConvergenceContext *>(raw_problem);
+    PetscCheck(context != nullptr && context->solve_control != nullptr &&
+                   context->solve_control->armed &&
+                   context->default_context != nullptr,
+               PETSC_COMM_SELF, PETSC_ERR_ARG_NULL,
+               "missing production modal callback problem");
+    ProductionCpuSolveControl *solve_control = context->solve_control;
+    const PoissonAirboxEigenBlockProblem &problem = solve_control->callback_problem;
+    auto emit_linear_progress =
+        [&](const char *phase, const char *stop_reason) noexcept {
+            if (!solve_control->progress_enabled ||
+                problem.progress_callback == nullptr) {
+                return;
+            }
+            const char *ksp_type = nullptr;
+            const PetscErrorCode ksp_type_status =
+                ksp != nullptr ? KSPGetType(ksp, &ksp_type) : PETSC_ERR_ARG_NULL;
+            if (ksp_type_status != PETSC_SUCCESS) {
+                ksp_type = nullptr;
+            }
+            const PoissonAirboxModalLinearProgress linear_progress{
+                context->linear_solver_role,
+                ksp_type,
+                static_cast<std::uint32_t>(std::max<PetscInt>(0, iteration)),
+                static_cast<double>(residual_norm)};
+            const auto progress_problem = poisson_airbox_modal_progress_with_elapsed(
+                problem,
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - solve_control->callback_started_at)
+                    .count());
+            poisson_airbox_modal_emit_progress(
+                progress_problem,
+                phase,
+                "production_cpu",
+                static_cast<std::uint32_t>(std::max<PetscInt>(0, iteration)),
+                0,
+                0,
+                static_cast<std::uint32_t>(std::max<PetscInt>(0, iteration)),
+                static_cast<double>(residual_norm),
+                stop_reason,
+                &linear_progress);
+        };
+    if (solve_control->cancel_poll_enabled &&
+        poisson_airbox_modal_cancel_requested(problem)) {
+        solve_control->cancellation_observed = true;
+        if (reason != nullptr) {
+            *reason = KSP_DIVERGED_USER;
+        }
+        emit_linear_progress("cancelling_shift_invert", "cancel_requested");
+        PetscFunctionReturn(PETSC_SUCCESS);
+    }
+    // The same ST KSP is reused for every shift solve and for post-EPS Ritz
+    // refinement.  KSPConvergedDefault keeps its initial norm in the opaque
+    // context, so recreate it at iteration zero to make each KSPSolve use its
+    // own RHS normalization rather than a stale norm from the previous solve.
+    if (iteration == 0) {
+        PetscCall(KSPConvergedDefaultDestroy(&context->default_context));
+        PetscCall(KSPConvergedDefaultCreate(&context->default_context));
+    }
+    PetscCall(KSPConvergedDefault(
+        ksp, iteration, residual_norm, reason, context->default_context));
+    emit_linear_progress("solving_shift_invert", nullptr);
+    PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+PetscErrorCode install_production_modal_ksp_convergence_test(
+    KSP ksp,
+    ProductionCpuSolveControl *solve_control,
+    PoissonAirboxModalLinearSolverRole linear_solver_role)
+{
+    PetscFunctionBeginUser;
+    PetscCheck(ksp != nullptr && solve_control != nullptr,
+               PETSC_COMM_SELF,
+               PETSC_ERR_ARG_NULL,
+               "missing production modal KSP convergence installation input");
+    auto *context = new (std::nothrow) ProductionKspConvergenceContext{};
+    PetscCheck(context != nullptr,
+               PETSC_COMM_SELF,
+               PETSC_ERR_MEM,
+               "failed to allocate production modal KSP convergence context");
+    context->solve_control = solve_control;
+    context->linear_solver_role = linear_solver_role;
+    PetscErrorCode status = KSPConvergedDefaultCreate(&context->default_context);
+    if (status == PETSC_SUCCESS) {
+        status = KSPSetConvergenceTest(
+            ksp,
+            production_modal_ksp_convergence_test,
+            context,
+            destroy_production_modal_ksp_convergence_context);
+    }
+    if (status != PETSC_SUCCESS) {
+        const PetscErrorCode destroy_status =
+            destroy_production_modal_ksp_convergence_context_value(context);
+        PetscFunctionReturn(status != PETSC_SUCCESS ? status : destroy_status);
+    }
+    PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+bool create_production_csr_matrix(
+    const CsrMatrixView &csr,
+    Mat *matrix)
+{
+    if (matrix == nullptr ||
+        csr.row_count > static_cast<std::uint64_t>(std::numeric_limits<PetscInt>::max()) ||
+        csr.column_count > static_cast<std::uint64_t>(std::numeric_limits<PetscInt>::max())) {
+        return false;
+    }
+    const PetscInt rows = static_cast<PetscInt>(csr.row_count);
+    const PetscInt columns = static_cast<PetscInt>(csr.column_count);
+    std::vector<PetscInt> row_nonzeros(static_cast<std::size_t>(rows), 0);
+    for (PetscInt row = 0; row < rows; ++row) {
+        const std::uint64_t count =
+            csr.row_offsets[static_cast<std::size_t>(row + 1)] -
+            csr.row_offsets[static_cast<std::size_t>(row)];
+        if (count > static_cast<std::uint64_t>(std::numeric_limits<PetscInt>::max())) {
+            return false;
+        }
+        row_nonzeros[static_cast<std::size_t>(row)] = static_cast<PetscInt>(count);
+    }
+    if (MatCreateSeqAIJ(PETSC_COMM_SELF, rows, columns, 0, row_nonzeros.data(), matrix) != 0) {
+        return false;
+    }
+    // MFEM CSR blocks have unique entries, but disabling this guard keeps the
+    // native contract robust if an accepted payload contains repeated entries.
+    if (MatSetOption(*matrix, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE) != 0) {
+        return false;
+    }
+    if (!insert_csr_block(*matrix, csr)) {
+        return false;
+    }
+    return MatAssemblyBegin(*matrix, MAT_FINAL_ASSEMBLY) == 0 &&
+        MatAssemblyEnd(*matrix, MAT_FINAL_ASSEMBLY) == 0;
+}
+
+bool create_production_augmented_poisson(
+    const PoissonAirboxEigenBlockProblem &problem,
+    ProductionSchurContext *context)
+{
+    if (context == nullptr) {
+        return false;
+    }
+    const bool gauge = production_string_equals(
+        problem.gauge_policy,
+        "mean_zero_augmented");
+    const std::uint64_t phi_count = problem.phi_dof_count;
+    const std::uint64_t augmented_count = phi_count + (gauge ? 1u : 0u);
+    if (augmented_count > static_cast<std::uint64_t>(std::numeric_limits<PetscInt>::max())) {
+        return false;
+    }
+    std::vector<PetscInt> row_nonzeros(static_cast<std::size_t>(augmented_count), 0);
+    for (std::uint64_t row = 0; row < phi_count; ++row) {
+        const std::uint64_t base =
+            problem.A_phiphi.row_offsets[row + 1u] - problem.A_phiphi.row_offsets[row];
+        const std::uint64_t count = base + (gauge ? 1u : 0u);
+        if (count > static_cast<std::uint64_t>(std::numeric_limits<PetscInt>::max())) {
+            return false;
+        }
+        row_nonzeros[static_cast<std::size_t>(row)] = static_cast<PetscInt>(count);
+    }
+    if (gauge) {
+        // Keep the augmented gauge diagonal structurally present even though
+        // its physical value is zero.  PETSc's sparse LU symbolic factorizer
+        // requires every row to carry a diagonal slot.
+        row_nonzeros.back() = static_cast<PetscInt>(phi_count + 1u);
+    }
+    const PetscInt dimension = static_cast<PetscInt>(augmented_count);
+    if (MatCreateSeqAIJ(
+            PETSC_COMM_SELF,
+            dimension,
+            dimension,
+            0,
+            row_nonzeros.data(),
+            &context->poisson) != 0) {
+        return false;
+    }
+    if (MatSetOption(context->poisson, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE) != 0) {
+        return false;
+    }
+    for (std::uint64_t row = 0; row < phi_count; ++row) {
+        for (std::uint32_t entry = problem.A_phiphi.row_offsets[row];
+             entry < problem.A_phiphi.row_offsets[row + 1u];
+             ++entry) {
+            if (MatSetValue(
+                    context->poisson,
+                    static_cast<PetscInt>(row),
+                    static_cast<PetscInt>(problem.A_phiphi.column_indices[entry]),
+                    static_cast<PetscScalar>(problem.A_phiphi.values[entry]),
+                    INSERT_VALUES) != 0) {
+                return false;
+            }
+        }
+        if (gauge && MatSetValue(
+                context->poisson,
+                static_cast<PetscInt>(row),
+                static_cast<PetscInt>(phi_count),
+                static_cast<PetscScalar>(problem.phi_mean_weights[row]),
+                INSERT_VALUES) != 0) {
+            return false;
+        }
+    }
+    if (gauge) {
+        for (std::uint64_t column = 0; column < phi_count; ++column) {
+            if (MatSetValue(
+                    context->poisson,
+                    static_cast<PetscInt>(phi_count),
+                    static_cast<PetscInt>(column),
+                    static_cast<PetscScalar>(problem.phi_mean_weights[column]),
+                    INSERT_VALUES) != 0) {
+                return false;
+            }
+        }
+        if (MatSetValue(
+                context->poisson,
+                static_cast<PetscInt>(phi_count),
+                static_cast<PetscInt>(phi_count),
+                static_cast<PetscScalar>(0.0),
+                INSERT_VALUES) != 0) {
+            return false;
+        }
+    }
+    return MatAssemblyBegin(context->poisson, MAT_FINAL_ASSEMBLY) == 0 &&
+        MatAssemblyEnd(context->poisson, MAT_FINAL_ASSEMBLY) == 0;
+}
+
+bool create_production_split_mass(
+    const CsrMatrixView &mass,
+    double mass_scale,
+    Mat *matrix)
+{
+    if (matrix == nullptr ||
+        !std::isfinite(mass_scale) || mass_scale <= 0.0 ||
+        mass.row_count > static_cast<std::uint64_t>(std::numeric_limits<PetscInt>::max()) / 2u) {
+        return false;
+    }
+    const PetscInt base = static_cast<PetscInt>(mass.row_count);
+    const PetscInt dimension = 2 * base;
+    std::vector<PetscInt> row_nonzeros(static_cast<std::size_t>(dimension), 0);
+    for (PetscInt row = 0; row < base; ++row) {
+        const PetscInt count = static_cast<PetscInt>(
+            mass.row_offsets[static_cast<std::size_t>(row + 1)] -
+            mass.row_offsets[static_cast<std::size_t>(row)]);
+        // The rotated mass has zero diagonal values, but STSHIFT treats the
+        // generalized problem through B^{-1}A and PETSc's sparse factorizer
+        // still requires a structural diagonal slot in every row.
+        row_nonzeros[static_cast<std::size_t>(row)] = count + 1;
+        row_nonzeros[static_cast<std::size_t>(row + base)] = count + 1;
+    }
+    if (MatCreateSeqAIJ(
+            PETSC_COMM_SELF,
+            dimension,
+            dimension,
+            0,
+            row_nonzeros.data(),
+            matrix) != 0) {
+        return false;
+    }
+    if (MatSetOption(*matrix, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE) != 0) {
+        return false;
+    }
+    for (std::uint64_t row = 0; row < mass.row_count; ++row) {
+        for (std::uint32_t entry = mass.row_offsets[row];
+             entry < mass.row_offsets[row + 1u];
+             ++entry) {
+            const PetscInt column = static_cast<PetscInt>(mass.column_indices[entry]);
+            const PetscScalar value = static_cast<PetscScalar>(
+                mass_scale * mass.values[entry]);
+            if (MatSetValue(
+                    *matrix,
+                    static_cast<PetscInt>(row),
+                    column + base,
+                    -value,
+                    INSERT_VALUES) != 0 ||
+                MatSetValue(
+                    *matrix,
+                    static_cast<PetscInt>(row) + base,
+                    column,
+                    value,
+                    INSERT_VALUES) != 0) {
+                return false;
+            }
+        }
+        if (MatSetValue(
+                *matrix,
+                static_cast<PetscInt>(row),
+                static_cast<PetscInt>(row),
+                static_cast<PetscScalar>(0.0),
+                INSERT_VALUES) != 0 ||
+            MatSetValue(
+                *matrix,
+                static_cast<PetscInt>(row) + base,
+                static_cast<PetscInt>(row) + base,
+                static_cast<PetscScalar>(0.0),
+                INSERT_VALUES) != 0) {
+            return false;
+        }
+    }
+    return MatAssemblyBegin(*matrix, MAT_FINAL_ASSEMBLY) == 0 &&
+        MatAssemblyEnd(*matrix, MAT_FINAL_ASSEMBLY) == 0;
+}
+
+// Build the magnetic-only shifted preconditioner used by STSINVERT.  The
+// exact shifted operator remains a MatShell because its Schur feedback reuses
+// the persistent Poisson factorization.  This sparse matrix retains the
+// tangent block and gyrotropic mass coupling, omitting only the scalar-field
+// feedback; it is a legitimate right preconditioner, not an alternate
+// eigen-operator.
+bool create_production_shift_preconditioner(
+    const CsrMatrixView &a_qq,
+    const CsrMatrixView &mass,
+    double shift,
+    double operator_scale,
+    Mat *matrix)
+{
+    if (matrix == nullptr ||
+        a_qq.row_count == 0 ||
+        a_qq.row_count != a_qq.column_count ||
+        a_qq.row_count != mass.row_count ||
+        mass.row_count != mass.column_count ||
+        !std::isfinite(shift) || !std::isfinite(operator_scale) ||
+        operator_scale <= 0.0 ||
+        a_qq.row_count > static_cast<std::uint64_t>(std::numeric_limits<PetscInt>::max()) / 2u) {
+        return false;
+    }
+    const PetscInt base = static_cast<PetscInt>(a_qq.row_count);
+    const PetscInt dimension = 2 * base;
+    std::vector<PetscInt> row_nonzeros(static_cast<std::size_t>(dimension), 0);
+    for (std::uint64_t row = 0; row < a_qq.row_count; ++row) {
+        const std::uint64_t a_count =
+            a_qq.row_offsets[row + 1u] - a_qq.row_offsets[row];
+        const std::uint64_t b_count =
+            mass.row_offsets[row + 1u] - mass.row_offsets[row];
+        const std::uint64_t count = a_count + b_count + 1u;
+        if (count > static_cast<std::uint64_t>(std::numeric_limits<PetscInt>::max())) {
+            return false;
+        }
+        row_nonzeros[static_cast<std::size_t>(row)] = static_cast<PetscInt>(count);
+        row_nonzeros[static_cast<std::size_t>(row + a_qq.row_count)] = static_cast<PetscInt>(count);
+    }
+    if (MatCreateSeqAIJ(
+            PETSC_COMM_SELF,
+            dimension,
+            dimension,
+            0,
+            row_nonzeros.data(),
+            matrix) != 0) {
+        return false;
+    }
+    if (MatSetOption(*matrix, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE) != 0) {
+        MatDestroy(matrix);
+        return false;
+    }
+    for (std::uint64_t row = 0; row < a_qq.row_count; ++row) {
+        for (std::uint32_t entry = a_qq.row_offsets[row];
+             entry < a_qq.row_offsets[row + 1u];
+             ++entry) {
+            const PetscInt column = static_cast<PetscInt>(a_qq.column_indices[entry]);
+            const PetscScalar value = static_cast<PetscScalar>(
+                operator_scale * a_qq.values[entry]);
+            if (MatSetValue(
+                    *matrix,
+                    static_cast<PetscInt>(row),
+                    column,
+                    value,
+                    ADD_VALUES) != 0 ||
+                MatSetValue(
+                    *matrix,
+                    static_cast<PetscInt>(row) + base,
+                    column + base,
+                    value,
+                    ADD_VALUES) != 0) {
+                MatDestroy(matrix);
+                return false;
+            }
+        }
+        for (std::uint32_t entry = mass.row_offsets[row];
+             entry < mass.row_offsets[row + 1u];
+             ++entry) {
+            const PetscInt column = static_cast<PetscInt>(mass.column_indices[entry]);
+            const PetscScalar value = static_cast<PetscScalar>(
+                operator_scale * shift * mass.values[entry]);
+            if (MatSetValue(
+                    *matrix,
+                    static_cast<PetscInt>(row),
+                    column + base,
+                    value,
+                    ADD_VALUES) != 0 ||
+                MatSetValue(
+                    *matrix,
+                    static_cast<PetscInt>(row) + base,
+                    column,
+                    -value,
+                    ADD_VALUES) != 0) {
+                MatDestroy(matrix);
+                return false;
+            }
+        }
+        if (MatSetValue(
+                *matrix,
+                static_cast<PetscInt>(row),
+                static_cast<PetscInt>(row),
+                static_cast<PetscScalar>(0.0),
+                ADD_VALUES) != 0 ||
+            MatSetValue(
+                *matrix,
+                static_cast<PetscInt>(row) + base,
+                static_cast<PetscInt>(row) + base,
+                static_cast<PetscScalar>(0.0),
+                ADD_VALUES) != 0) {
+            MatDestroy(matrix);
+            return false;
+        }
+    }
+    if (MatAssemblyBegin(*matrix, MAT_FINAL_ASSEMBLY) != 0 ||
+        MatAssemblyEnd(*matrix, MAT_FINAL_ASSEMBLY) != 0) {
+        MatDestroy(matrix);
+        return false;
+    }
+    return true;
+}
+
+bool configure_production_context(
+    const PoissonAirboxEigenBlockProblem &problem,
+    ProductionCpuSolveControl *solve_control,
+    ProductionSchurContext *context)
+{
+    if (solve_control == nullptr || context == nullptr ||
+        problem.q_dof_count > static_cast<std::uint64_t>(std::numeric_limits<PetscInt>::max()) / 2u ||
+        problem.phi_dof_count > static_cast<std::uint64_t>(std::numeric_limits<PetscInt>::max())) {
+        return false;
+    }
+    context->q_count = static_cast<PetscInt>(problem.q_dof_count);
+    context->phi_count = static_cast<PetscInt>(problem.phi_dof_count);
+    context->gauge_augmented = production_string_equals(
+        problem.gauge_policy,
+        "mean_zero_augmented");
+    context->augmented_phi_count = context->phi_count +
+        (context->gauge_augmented ? 1 : 0);
+    if (!create_production_csr_matrix(problem.A_qq, &context->a_qq) ||
+        !create_production_csr_matrix(problem.A_qphi, &context->a_qphi) ||
+        !create_production_csr_matrix(problem.A_phiq, &context->a_phiq) ||
+        !create_production_augmented_poisson(problem, context)) {
+        return false;
+    }
+
+    PC pc = nullptr;
+    if (KSPCreate(PETSC_COMM_SELF, &context->poisson_ksp) != 0 ||
+        KSPSetOperators(context->poisson_ksp, context->poisson, context->poisson) != 0 ||
+        KSPSetType(context->poisson_ksp, KSPPREONLY) != 0 ||
+        KSPGetPC(context->poisson_ksp, &pc) != 0 ||
+        PCSetType(pc, PCLU) != 0 ||
+        PCFactorSetShiftType(pc, MAT_SHIFT_NONZERO) != 0 ||
+        KSPSetTolerances(
+            context->poisson_ksp,
+            1.0e-12,
+            PETSC_DEFAULT,
+            PETSC_DEFAULT,
+            problem.max_linear_iterations > 0
+                ? static_cast<PetscInt>(problem.max_linear_iterations)
+                : PETSC_DEFAULT) != 0 ||
+        KSPSetErrorIfNotConverged(context->poisson_ksp, PETSC_TRUE) != 0 ||
+        install_production_modal_ksp_convergence_test(
+            context->poisson_ksp,
+            solve_control,
+            PoissonAirboxModalLinearSolverRole::poisson) != 0 ||
+        KSPSetUp(context->poisson_ksp) != 0) {
+        return false;
+    }
+
+    if (VecCreateSeq(PETSC_COMM_SELF, context->phi_count, &context->phi_rhs) != 0 ||
+        VecCreateSeq(PETSC_COMM_SELF, context->augmented_phi_count, &context->poisson_rhs) != 0 ||
+        VecCreateSeq(PETSC_COMM_SELF, context->augmented_phi_count, &context->poisson_solution) != 0 ||
+        VecCreateSeq(PETSC_COMM_SELF, context->phi_count, &context->phi_solution) != 0 ||
+        VecCreateSeq(PETSC_COMM_SELF, context->q_count, &context->feedback) != 0) {
+        return false;
+    }
+    return true;
+}
+
+void destroy_production_context(ProductionSchurContext *context) noexcept
+{
+    if (context == nullptr) {
+        return;
+    }
+    if (context->feedback != nullptr) {
+        VecDestroy(&context->feedback);
+    }
+    if (context->phi_solution != nullptr) {
+        VecDestroy(&context->phi_solution);
+    }
+    if (context->poisson_solution != nullptr) {
+        VecDestroy(&context->poisson_solution);
+    }
+    if (context->poisson_rhs != nullptr) {
+        VecDestroy(&context->poisson_rhs);
+    }
+    if (context->phi_rhs != nullptr) {
+        VecDestroy(&context->phi_rhs);
+    }
+    if (context->poisson_ksp != nullptr) {
+        KSPDestroy(&context->poisson_ksp);
+    }
+    if (context->poisson != nullptr) {
+        MatDestroy(&context->poisson);
+    }
+    if (context->a_phiq != nullptr) {
+        MatDestroy(&context->a_phiq);
+    }
+    if (context->a_qphi != nullptr) {
+        MatDestroy(&context->a_qphi);
+    }
+    if (context->a_qq != nullptr) {
+        MatDestroy(&context->a_qq);
+    }
+}
+
+bool solve_production_phi(
+    ProductionSchurContext *context,
+    Vec q,
+    std::vector<double> *phi,
+    double *eta)
+{
+    if (context == nullptr || q == nullptr || phi == nullptr || eta == nullptr ||
+        MatMult(context->a_phiq, q, context->phi_rhs) != 0 ||
+        VecScale(context->phi_rhs, static_cast<PetscScalar>(-1.0)) != 0) {
+        if (context != nullptr) {
+            copy_message(context->error_message, sizeof(context->error_message),
+                         "production Schur Poisson RHS assembly failed");
+        }
+        return false;
+    }
+    const PetscScalar *rhs_values = nullptr;
+    PetscScalar *augmented_rhs = nullptr;
+    if (VecGetArrayRead(context->phi_rhs, &rhs_values) != 0 ||
+        VecGetArray(context->poisson_rhs, &augmented_rhs) != 0) {
+        if (rhs_values != nullptr) {
+            VecRestoreArrayRead(context->phi_rhs, &rhs_values);
+        }
+        if (augmented_rhs != nullptr) {
+            VecRestoreArray(context->poisson_rhs, &augmented_rhs);
+        }
+        copy_message(context->error_message, sizeof(context->error_message),
+                     "production Schur Poisson RHS vector access failed");
+        return false;
+    }
+    for (PetscInt index = 0; index < context->phi_count; ++index) {
+        augmented_rhs[index] = rhs_values[index];
+    }
+    if (context->gauge_augmented) {
+        augmented_rhs[context->phi_count] = static_cast<PetscScalar>(0.0);
+    }
+    VecRestoreArray(context->poisson_rhs, &augmented_rhs);
+    VecRestoreArrayRead(context->phi_rhs, &rhs_values);
+
+    ++context->poisson_solve_count;
+    if (KSPSolve(context->poisson_ksp, context->poisson_rhs, context->poisson_solution) != 0) {
+        copy_message(context->error_message, sizeof(context->error_message),
+                     "production Schur Poisson factor solve failed");
+        return false;
+    }
+    KSPConvergedReason reason = KSP_CONVERGED_ITERATING;
+    if (KSPGetConvergedReason(context->poisson_ksp, &reason) != 0 || reason < 0) {
+        copy_message(context->error_message, sizeof(context->error_message),
+                     "production Schur Poisson factor solve did not converge");
+        return false;
+    }
+    PetscInt poisson_iterations = 0;
+    if (KSPGetTotalIterations(context->poisson_ksp, &poisson_iterations) == 0) {
+        context->poisson_iteration_count = static_cast<std::uint64_t>(
+            std::max<PetscInt>(0, poisson_iterations));
+    }
+    const PetscScalar *solution_values = nullptr;
+    PetscScalar *phi_values = nullptr;
+    if (VecGetArrayRead(context->poisson_solution, &solution_values) != 0 ||
+        VecGetArray(context->phi_solution, &phi_values) != 0) {
+        if (solution_values != nullptr) {
+            VecRestoreArrayRead(context->poisson_solution, &solution_values);
+        }
+        if (phi_values != nullptr) {
+            VecRestoreArray(context->phi_solution, &phi_values);
+        }
+        copy_message(context->error_message, sizeof(context->error_message),
+                     "production Schur Poisson solution access failed");
+        return false;
+    }
+    phi->assign(static_cast<std::size_t>(context->phi_count), 0.0);
+    for (PetscInt index = 0; index < context->phi_count; ++index) {
+        phi_values[index] = solution_values[index];
+        (*phi)[static_cast<std::size_t>(index)] =
+            static_cast<double>(solution_values[index]);
+    }
+    *eta = context->gauge_augmented
+        ? static_cast<double>(solution_values[context->phi_count])
+        : 0.0;
+    VecRestoreArray(context->phi_solution, &phi_values);
+    VecRestoreArrayRead(context->poisson_solution, &solution_values);
+    return true;
+}
+
+bool apply_probe_csr(
+    const CsrMatrixView &matrix,
+    const std::vector<double> &input,
+    std::vector<double> *output)
+{
+    if (output == nullptr || matrix.row_offsets == nullptr ||
+        matrix.column_indices == nullptr || matrix.values == nullptr ||
+        matrix.column_count != input.size() ||
+        matrix.row_offsets_len != matrix.row_count + 1u ||
+        matrix.column_indices_len != matrix.values_len ||
+        matrix.row_offsets[0] != 0u ||
+        matrix.row_offsets[matrix.row_count] != matrix.values_len) {
+        return false;
+    }
+    output->assign(static_cast<std::size_t>(matrix.row_count), 0.0);
+    for (std::uint64_t row = 0u; row < matrix.row_count; ++row) {
+        const std::uint32_t begin = matrix.row_offsets[row];
+        const std::uint32_t end = matrix.row_offsets[row + 1u];
+        if (begin > end || end > matrix.values_len) {
+            return false;
+        }
+        long double value = 0.0L;
+        for (std::uint32_t entry = begin; entry < end; ++entry) {
+            const std::uint32_t column = matrix.column_indices[entry];
+            if (column >= matrix.column_count ||
+                !std::isfinite(matrix.values[entry]) ||
+                !std::isfinite(input[column])) {
+                return false;
+            }
+            value += static_cast<long double>(matrix.values[entry]) * input[column];
+        }
+        (*output)[static_cast<std::size_t>(row)] = static_cast<double>(value);
+        if (!std::isfinite((*output)[static_cast<std::size_t>(row)])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+double probe_vector_dot(
+    const std::vector<double> &left,
+    const std::vector<double> &right) noexcept
+{
+    if (left.size() != right.size()) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    long double sum = 0.0L;
+    for (std::size_t index = 0; index < left.size(); ++index) {
+        sum += static_cast<long double>(left[index]) * right[index];
+    }
+    return static_cast<double>(sum);
+}
+
+double probe_vector_l2(const std::vector<double> &values) noexcept
+{
+    long double sum = 0.0L;
+    for (double value : values) {
+        if (!std::isfinite(value)) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        sum += static_cast<long double>(value) * value;
+    }
+    return std::sqrt(static_cast<double>(sum));
+}
+
+bool run_k0_demag_probe_sample(
+    ProductionSchurContext *context,
+    const PoissonAirboxEigenBlockProblem &problem,
+    const std::vector<double> &q_values,
+    const std::vector<double> &field_functional,
+    double magnetization_integral,
+    double energy_scale,
+    double magnetic_volume,
+    bool observable,
+    PoissonAirboxK0DemagProbeSample *sample,
+    char failure_reason[96])
+{
+    if (sample == nullptr) {
+        copy_message(failure_reason, 96, "probe_result_missing");
+        return false;
+    }
+    *sample = PoissonAirboxK0DemagProbeSample{};
+    if (!observable) {
+        return true;
+    }
+    sample->attempted = true;
+    sample->q_l2_norm = probe_vector_l2(q_values);
+    if (context == nullptr || problem.k0_demag_probe == nullptr ||
+        q_values.size() != static_cast<std::size_t>(problem.q_dof_count) ||
+        field_functional.size() != static_cast<std::size_t>(problem.phi_dof_count) ||
+        !std::isfinite(sample->q_l2_norm) || sample->q_l2_norm <= 1.0e-12 ||
+        !std::isfinite(magnetization_integral) ||
+        !std::isfinite(energy_scale) || energy_scale <= 0.0 ||
+        !std::isfinite(magnetic_volume) || magnetic_volume <= 0.0 ||
+        !std::isfinite(problem.k0_demag_probe->mu0_t_m_a) ||
+        problem.k0_demag_probe->mu0_t_m_a <= 0.0) {
+        copy_message(failure_reason, 96, "probe_input_invalid");
+        return false;
+    }
+
+    Vec q = nullptr;
+    if (VecCreateSeq(PETSC_COMM_SELF, context->q_count, &q) != 0) {
+        copy_message(failure_reason, 96, "probe_q_vector_create_failed");
+        return false;
+    }
+    PetscScalar *q_array = nullptr;
+    bool q_copied = VecGetArray(q, &q_array) == 0;
+    if (q_copied) {
+        for (PetscInt index = 0; index < context->q_count; ++index) {
+            q_array[index] = static_cast<PetscScalar>(
+                q_values[static_cast<std::size_t>(index)]);
+        }
+        q_copied = VecRestoreArray(q, &q_array) == 0;
+    }
+    std::vector<double> phi;
+    double eta = 0.0;
+    const bool solved = q_copied &&
+        solve_production_phi(context, q, &phi, &eta);
+    VecDestroy(&q);
+    if (!solved) {
+        copy_message(failure_reason, 96, "probe_poisson_solve_failed");
+        return false;
+    }
+
+    std::vector<double> a_phiq_q;
+    std::vector<double> p_phi;
+    std::vector<double> a_qphi_phi;
+    if (!apply_probe_csr(problem.A_phiq, q_values, &a_phiq_q) ||
+        !apply_probe_csr(problem.A_phiphi, phi, &p_phi) ||
+        !apply_probe_csr(problem.A_qphi, phi, &a_qphi_phi)) {
+        copy_message(failure_reason, 96, "probe_original_csr_action_failed");
+        return false;
+    }
+    std::vector<double> potential_residual(p_phi.size(), 0.0);
+    for (std::size_t index = 0; index < potential_residual.size(); ++index) {
+        potential_residual[index] = p_phi[index] + a_phiq_q[index];
+        if (context->gauge_augmented) {
+            if (problem.phi_mean_weights == nullptr ||
+                problem.phi_mean_weights_count != potential_residual.size()) {
+                copy_message(failure_reason, 96, "probe_gauge_weights_missing");
+                return false;
+            }
+            potential_residual[index] +=
+                problem.phi_mean_weights[index] * eta;
+        }
+    }
+    double gauge_weight_l2 = 0.0;
+    if (context->gauge_augmented) {
+        long double gauge_weight_squared = 0.0L;
+        for (std::size_t index = 0; index < phi.size(); ++index) {
+            gauge_weight_squared +=
+                static_cast<long double>(problem.phi_mean_weights[index]) *
+                problem.phi_mean_weights[index];
+        }
+        gauge_weight_l2 = std::sqrt(static_cast<double>(gauge_weight_squared));
+    }
+    const double residual_denominator =
+        probe_vector_l2(p_phi) + probe_vector_l2(a_phiq_q) +
+        (context->gauge_augmented ? std::abs(eta) * gauge_weight_l2 : 0.0);
+    sample->potential_action_relative_residual = probe_vector_l2(potential_residual) /
+        std::max(residual_denominator, 1.0e-300);
+    std::vector<double> poisson_scale;
+    std::vector<double> source_scale;
+    if (!poisson_probe_absolute_csr_action(problem.A_phiphi, phi, &poisson_scale) ||
+        !poisson_probe_absolute_csr_action(problem.A_phiq, q_values, &source_scale)) {
+        copy_message(failure_reason, 96, "probe_residual_scale_failed");
+        return false;
+    }
+    // Componentwise backward error remains meaningful for a charge-free
+    // in-plane probe, where signed source terms cancel to roundoff.
+    sample->potential_relative_residual = poisson_probe_componentwise_residual(
+        potential_residual, poisson_scale, source_scale,
+        context->gauge_augmented ? problem.phi_mean_weights : nullptr, eta);
+    if (context->gauge_augmented) {
+        long double gauge_value = 0.0L;
+        for (std::size_t index = 0; index < phi.size(); ++index) {
+            gauge_value += static_cast<long double>(problem.phi_mean_weights[index]) *
+                phi[index];
+        }
+        sample->gauge_constraint_abs = std::abs(static_cast<double>(gauge_value));
+    }
+    const double field_integral = probe_vector_dot(field_functional, phi);
+    sample->mean_field_a_per_m = field_integral / magnetic_volume;
+    sample->mean_magnetization_a_per_m = magnetization_integral / magnetic_volume;
+    if (std::abs(sample->mean_magnetization_a_per_m) <= 1.0e-14) {
+        copy_message(failure_reason, 96, "probe_magnetization_not_observable");
+        return false;
+    }
+    sample->demag_factor = -sample->mean_field_a_per_m /
+        sample->mean_magnetization_a_per_m;
+    const double potential_quadratic = probe_vector_dot(phi, p_phi);
+    const double magnetic_quadratic = probe_vector_dot(q_values, a_qphi_phi);
+    const double mu0 = problem.k0_demag_probe->mu0_t_m_a;
+    sample->potential_energy_j = 0.5 * mu0 * potential_quadratic;
+    sample->magnetic_energy_j = 0.5 * magnetic_quadratic;
+    sample->energy_form_relative_defect =
+        std::abs(sample->potential_energy_j - sample->magnetic_energy_j) /
+        std::max({energy_scale,
+                  std::abs(sample->potential_energy_j),
+                  std::abs(sample->magnetic_energy_j),
+                  1.0e-300});
+    const double gauge_scale = context->gauge_augmented
+        ? std::max(probe_vector_l2(phi) * gauge_weight_l2, 1.0e-300)
+        : 1.0;
+    sample->passed =
+        std::isfinite(sample->potential_relative_residual) &&
+        sample->potential_relative_residual <= 1.0e-8 &&
+        std::isfinite(sample->gauge_constraint_abs) &&
+        sample->gauge_constraint_abs <= 1.0e-8 * gauge_scale &&
+        std::isfinite(sample->mean_field_a_per_m) &&
+        std::isfinite(sample->mean_magnetization_a_per_m) &&
+        std::isfinite(sample->demag_factor) &&
+        std::isfinite(sample->potential_energy_j) &&
+        std::isfinite(sample->magnetic_energy_j) &&
+        std::isfinite(sample->energy_form_relative_defect) &&
+        sample->energy_form_relative_defect <= 1.0e-8 &&
+        sample->potential_energy_j >= -1.0e-8 * energy_scale &&
+        sample->magnetic_energy_j >= -1.0e-8 * energy_scale;
+    if (!sample->passed) {
+        copy_message(failure_reason, 96, "probe_physical_operator_check_failed");
+    }
+    return sample->passed;
+}
+
+// Apply the Schur operator while retaining the reconstructed scalar solution
+// in the persistent phi vector.
+PetscErrorCode production_schur_apply_vec(
+    ProductionSchurContext *context,
+    Vec q,
+    Vec y)
+{
+    if (context == nullptr || q == nullptr || y == nullptr ||
+        MatMult(context->a_qq, q, y) != 0 ||
+        MatMult(context->a_phiq, q, context->phi_rhs) != 0 ||
+        VecScale(context->phi_rhs, static_cast<PetscScalar>(-1.0)) != 0) {
+        if (context != nullptr) {
+            copy_message(context->error_message, sizeof(context->error_message),
+                         "production Schur action failed before Poisson solve");
+        }
+        return PETSC_ERR_LIB;
+    }
+    ++context->operator_apply_count;
+    const PetscScalar *rhs_values = nullptr;
+    PetscScalar *augmented_rhs = nullptr;
+    if (VecGetArrayRead(context->phi_rhs, &rhs_values) != 0 ||
+        VecGetArray(context->poisson_rhs, &augmented_rhs) != 0) {
+        if (rhs_values != nullptr) {
+            VecRestoreArrayRead(context->phi_rhs, &rhs_values);
+        }
+        if (augmented_rhs != nullptr) {
+            VecRestoreArray(context->poisson_rhs, &augmented_rhs);
+        }
+        copy_message(context->error_message, sizeof(context->error_message),
+                     "production Schur action Poisson RHS access failed");
+        return PETSC_ERR_LIB;
+    }
+    for (PetscInt index = 0; index < context->phi_count; ++index) {
+        augmented_rhs[index] = rhs_values[index];
+    }
+    if (context->gauge_augmented) {
+        augmented_rhs[context->phi_count] = static_cast<PetscScalar>(0.0);
+    }
+    VecRestoreArray(context->poisson_rhs, &augmented_rhs);
+    VecRestoreArrayRead(context->phi_rhs, &rhs_values);
+    ++context->poisson_solve_count;
+    if (KSPSolve(context->poisson_ksp, context->poisson_rhs, context->poisson_solution) != 0) {
+        copy_message(context->error_message, sizeof(context->error_message),
+                     "production Schur action Poisson factor solve failed");
+        return PETSC_ERR_NOT_CONVERGED;
+    }
+    KSPConvergedReason reason = KSP_CONVERGED_ITERATING;
+    if (KSPGetConvergedReason(context->poisson_ksp, &reason) != 0 || reason < 0) {
+        copy_message(context->error_message, sizeof(context->error_message),
+                     "production Schur action Poisson factor did not converge");
+        return PETSC_ERR_NOT_CONVERGED;
+    }
+    PetscInt poisson_iterations = 0;
+    if (KSPGetTotalIterations(context->poisson_ksp, &poisson_iterations) == 0) {
+        context->poisson_iteration_count = static_cast<std::uint64_t>(
+            std::max<PetscInt>(0, poisson_iterations));
+    }
+    const PetscScalar *solution_values = nullptr;
+    PetscScalar *phi_values = nullptr;
+    if (VecGetArrayRead(context->poisson_solution, &solution_values) != 0 ||
+        VecGetArray(context->phi_solution, &phi_values) != 0) {
+        if (solution_values != nullptr) {
+            VecRestoreArrayRead(context->poisson_solution, &solution_values);
+        }
+        if (phi_values != nullptr) {
+            VecRestoreArray(context->phi_solution, &phi_values);
+        }
+        copy_message(context->error_message, sizeof(context->error_message),
+                     "production Schur action Poisson solution access failed");
+        return PETSC_ERR_LIB;
+    }
+    for (PetscInt index = 0; index < context->phi_count; ++index) {
+        phi_values[index] = solution_values[index];
+    }
+    VecRestoreArray(context->phi_solution, &phi_values);
+    VecRestoreArrayRead(context->poisson_solution, &solution_values);
+    if (MatMult(context->a_qphi, context->phi_solution, context->feedback) != 0 ||
+        VecAXPY(y, static_cast<PetscScalar>(1.0), context->feedback) != 0) {
+        copy_message(context->error_message, sizeof(context->error_message),
+                     "production Schur magnetic feedback apply failed");
+        return PETSC_ERR_LIB;
+    }
+    return 0;
+}
+
+PetscErrorCode production_split_schur_matmult(Mat matrix, Vec x, Vec y)
+{
+    void *raw_context = nullptr;
+    if (MatShellGetContext(matrix, &raw_context) != 0 || raw_context == nullptr) {
+        return PETSC_ERR_ARG_NULL;
+    }
+    auto *context = static_cast<ProductionSplitContext *>(raw_context);
+    if (context->base == nullptr) {
+        return PETSC_ERR_ARG_NULL;
+    }
+    PetscInt size = 0;
+    if (VecGetSize(x, &size) != 0 || size != 2 * context->base->q_count) {
+        copy_message(context->base->error_message, sizeof(context->base->error_message),
+                     "production real-split Schur input size mismatch");
+        return PETSC_ERR_ARG_SIZ;
+    }
+    const PetscScalar *input = nullptr;
+    PetscScalar *output = nullptr;
+    if (VecGetArrayRead(x, &input) != 0 || VecGetArray(y, &output) != 0) {
+        if (input != nullptr) {
+            VecRestoreArrayRead(x, &input);
+        }
+        if (output != nullptr) {
+            VecRestoreArray(y, &output);
+        }
+        return PETSC_ERR_LIB;
+    }
+    PetscErrorCode error = 0;
+    if (VecPlaceArray(context->q_real, input) != 0 ||
+        VecPlaceArray(context->q_imag, input + context->base->q_count) != 0 ||
+        VecPlaceArray(context->y_real, output) != 0 ||
+        VecPlaceArray(context->y_imag, output + context->base->q_count) != 0) {
+        error = PETSC_ERR_LIB;
+    } else {
+        error = production_schur_apply_vec(context->base, context->q_real, context->y_real);
+        if (error == 0) {
+            error = production_schur_apply_vec(context->base, context->q_imag, context->y_imag);
+        }
+        if (error == 0) {
+            error = VecScale(
+                context->y_real,
+                static_cast<PetscScalar>(context->operator_scale));
+        }
+        if (error == 0) {
+            error = VecScale(
+                context->y_imag,
+                static_cast<PetscScalar>(context->operator_scale));
+        }
+    }
+    VecResetArray(context->q_real);
+    VecResetArray(context->q_imag);
+    VecResetArray(context->y_real);
+    VecResetArray(context->y_imag);
+    VecRestoreArray(y, &output);
+    VecRestoreArrayRead(x, &input);
+    return error;
+}
+
+struct ProductionCpuOperatorContext {
+    ProductionCpuSolveControl solve_control{};
+    ProductionSchurContext schur{};
+    ProductionSplitContext split{};
+    Mat schur_shell = nullptr;
+    Mat split_mass = nullptr;
+    Mat cached_window_schur = nullptr;
+    PetscInt split_count = 0;
+    double descriptor_mass_norm = 0.0;
+    double descriptor_operator_norm = 0.0;
+    double angular_frequency_scale = 1.0;
+    double mass_scale = 1.0;
+    double operator_scale = 1.0;
+    std::uint32_t operator_context_setup_count = 0;
+    std::uint32_t poisson_factorization_setup_count = 0;
+    std::uint32_t shift_solver_setup_count = 0;
+    bool exact_cache_construction_attempted = false;
+    bool exact_cache_construction_succeeded = false;
+    bool exact_cache_shift_failure_observed = false;
+    char exact_cache_status[64]{};
+    std::uint64_t exact_cache_dimension = 0;
+    std::uint64_t exact_cache_column_count = 0;
+    std::uint64_t exact_cache_construction_poisson_solve_count = 0;
+    double exact_cache_construction_seconds = 0.0;
+    bool k0_demag_probe_completed = false;
+    PoissonAirboxK0DemagProbeResult k0_demag_operator_probe{};
+    bool invalidated = false;
+    bool eps_lifetime_unsafe = false;
+    bool ready = false;
+
+    ProductionCpuOperatorContext() = default;
+    ProductionCpuOperatorContext(const ProductionCpuOperatorContext &) = delete;
+    ProductionCpuOperatorContext &operator=(const ProductionCpuOperatorContext &) = delete;
+    ProductionCpuOperatorContext(ProductionCpuOperatorContext &&) = delete;
+    ProductionCpuOperatorContext &operator=(ProductionCpuOperatorContext &&) = delete;
+};
+
+void copy_exact_cache_observability(
+    const ProductionCpuOperatorContext &context,
+    PoissonAirboxModalEigenResult *out_result) noexcept
+{
+    if (out_result == nullptr) {
+        return;
+    }
+    out_result->exact_preconditioner_shift_failure_observed =
+        context.exact_cache_shift_failure_observed;
+    if (context.exact_cache_construction_attempted) {
+        out_result->exact_preconditioner_column_count_available = true;
+        out_result->exact_preconditioner_column_count =
+            context.exact_cache_column_count;
+        out_result->exact_preconditioner_construction_metrics_available = true;
+        out_result->exact_preconditioner_construction_poisson_solve_count =
+            context.exact_cache_construction_poisson_solve_count;
+        out_result->exact_preconditioner_construction_timing_available = true;
+        out_result->exact_preconditioner_construction_seconds =
+            context.exact_cache_construction_seconds;
+    }
+}
+
+bool run_k0_demag_operator_probe(
+    const PoissonAirboxEigenBlockProblem &problem,
+    ProductionCpuOperatorContext *context) noexcept
+{
+    if (context == nullptr || problem.k0_demag_probe == nullptr) {
+        return false;
+    }
+    PoissonAirboxK0DemagProbeResult &result = context->k0_demag_operator_probe;
+    result = PoissonAirboxK0DemagProbeResult{};
+    result.requested = true;
+    try {
+        const PoissonAirboxK0DemagProbeAssembly &assembly = *problem.k0_demag_probe;
+        result.magnetic_volume_m3 = assembly.magnetic_volume_m3;
+        result.mu0_t_m_a = assembly.mu0_t_m_a;
+        result.robin_beta = assembly.robin_beta;
+        copy_message(
+            result.outer_boundary_kind,
+            sizeof(result.outer_boundary_kind),
+            problem.outer_boundary_kind != nullptr ? problem.outer_boundary_kind : "");
+        const bool global_y_ok = run_k0_demag_probe_sample(
+            &context->schur,
+            problem,
+            assembly.q_global_y,
+            assembly.h_functional_global_y,
+            assembly.magnetization_integral_global_y_a_per_m_m3,
+            assembly.magnetic_energy_scale_global_y_j,
+            assembly.magnetic_volume_m3,
+            assembly.global_y_observable,
+            &result.global_y,
+            result.failure_reason);
+        const bool global_z_ok = run_k0_demag_probe_sample(
+            &context->schur,
+            problem,
+            assembly.q_global_z,
+            assembly.h_functional_global_z,
+            assembly.magnetization_integral_global_z_a_per_m_m3,
+            assembly.magnetic_energy_scale_global_z_j,
+            assembly.magnetic_volume_m3,
+            assembly.global_z_observable,
+            &result.global_z,
+            result.failure_reason);
+        result.available = result.global_y.attempted || result.global_z.attempted;
+        result.passed = result.available && assembly.global_y_observable &&
+            assembly.global_z_observable && global_y_ok && global_z_ok;
+        if (!result.available) {
+            copy_message(result.failure_reason, sizeof(result.failure_reason),
+                         "no_global_transverse_direction_observable");
+        } else if (!result.passed && result.failure_reason[0] == '\0') {
+            copy_message(result.failure_reason, sizeof(result.failure_reason),
+                         "global_direction_probe_failed");
+        }
+    } catch (...) {
+        result.available = false;
+        result.passed = false;
+        copy_message(result.failure_reason, sizeof(result.failure_reason),
+                     "probe_allocation_or_diagnostic_failure");
+    }
+    return result.passed;
+}
+
+void destroy_production_cpu_operator_context(
+    ProductionCpuOperatorContext *context) noexcept
+{
+    if (context == nullptr || context->eps_lifetime_unsafe) {
+        return;
+    }
+    context->solve_control.disarm();
+    if (context->cached_window_schur != nullptr) {
+        MatDestroy(&context->cached_window_schur);
+    }
+    if (context->schur_shell != nullptr) {
+        MatDestroy(&context->schur_shell);
+    }
+    if (context->split_mass != nullptr) {
+        MatDestroy(&context->split_mass);
+    }
+    if (context->split.y_imag != nullptr) {
+        VecDestroy(&context->split.y_imag);
+    }
+    if (context->split.y_real != nullptr) {
+        VecDestroy(&context->split.y_real);
+    }
+    if (context->split.q_imag != nullptr) {
+        VecDestroy(&context->split.q_imag);
+    }
+    if (context->split.q_real != nullptr) {
+        VecDestroy(&context->split.q_real);
+    }
+    destroy_production_context(&context->schur);
+    context->split.base = nullptr;
+    context->split_count = 0;
+    context->ready = false;
+}
+
+bool configure_production_cpu_operator_context(
+    const PoissonAirboxEigenBlockProblem &problem,
+    ProductionCpuOperatorContext *context) noexcept
+{
+    if (context == nullptr || context->invalidated ||
+        context->eps_lifetime_unsafe) {
+        return false;
+    }
+    if (context->ready) {
+        return true;
+    }
+    ++context->operator_context_setup_count;
+    if (!configure_production_context(
+            problem,
+            &context->solve_control,
+            &context->schur)) {
+        destroy_production_cpu_operator_context(context);
+        return false;
+    }
+    ++context->poisson_factorization_setup_count;
+    context->descriptor_mass_norm = csr_infinity_norm(problem.B_qq);
+    context->descriptor_operator_norm = csr_infinity_norm(problem.A_qq);
+    context->angular_frequency_scale = std::max(
+        1.0,
+        context->descriptor_operator_norm /
+            std::max(context->descriptor_mass_norm, 1.0e-300));
+    if (!std::isfinite(context->descriptor_mass_norm) ||
+        context->descriptor_mass_norm <= 0.0 ||
+        !std::isfinite(context->descriptor_operator_norm) ||
+        !std::isfinite(
+            context->angular_frequency_scale * context->descriptor_mass_norm) ||
+        context->angular_frequency_scale * context->descriptor_mass_norm <= 0.0) {
+        destroy_production_cpu_operator_context(context);
+        return false;
+    }
+    context->mass_scale = 1.0 / context->descriptor_mass_norm;
+    context->operator_scale =
+        context->mass_scale / context->angular_frequency_scale;
+    context->split.base = &context->schur;
+    context->split.operator_scale = context->operator_scale;
+    const PetscInt base_count = context->schur.q_count;
+    if (VecCreateSeq(PETSC_COMM_SELF, base_count, &context->split.q_real) != 0 ||
+        VecCreateSeq(PETSC_COMM_SELF, base_count, &context->split.q_imag) != 0 ||
+        VecCreateSeq(PETSC_COMM_SELF, base_count, &context->split.y_real) != 0 ||
+        VecCreateSeq(PETSC_COMM_SELF, base_count, &context->split.y_imag) != 0 ||
+        MatCreateShell(
+            PETSC_COMM_SELF,
+            2 * base_count,
+            2 * base_count,
+            2 * base_count,
+            2 * base_count,
+            &context->split,
+            &context->schur_shell) != 0 ||
+        MatShellSetOperation(
+            context->schur_shell,
+            MATOP_MULT,
+            reinterpret_cast<void (*)(void)>(production_split_schur_matmult)) != 0 ||
+        MatSetUp(context->schur_shell) != 0 ||
+        !create_production_split_mass(
+            problem.B_qq,
+            context->mass_scale,
+            &context->split_mass)) {
+        destroy_production_cpu_operator_context(context);
+        return false;
+    }
+    context->split_count = 2 * base_count;
+    context->ready = true;
+    return true;
+}
+
+thread_local ProductionCpuOperatorContext *active_cpu_window_operator_context = nullptr;
+
+struct ProductionCpuSolveControlScope {
+    ProductionCpuSolveControl *control = nullptr;
+
+    ~ProductionCpuSolveControlScope()
+    {
+        if (control != nullptr) {
+            control->disarm();
+        }
+    }
+};
+
+struct ProductionCpuOperatorContextDeleter {
+    void operator()(ProductionCpuOperatorContext *context) const noexcept
+    {
+        if (context == nullptr || context->eps_lifetime_unsafe) {
+            // An unsafe graph is intentionally retained until process exit;
+            // PETSc/SLEPc teardown may touch borrowed DS views after EPSSolve fails.
+            return;
+        }
+        destroy_production_cpu_operator_context(context);
+        delete context;
+    }
+};
+
+using ProductionCpuOperatorContextOwner =
+    std::unique_ptr<ProductionCpuOperatorContext,
+                    ProductionCpuOperatorContextDeleter>;
+
+struct ProductionCpuWindowOperatorScope {
+    ProductionCpuOperatorContext *previous = nullptr;
+
+    ~ProductionCpuWindowOperatorScope()
+    {
+        active_cpu_window_operator_context = previous;
+    }
+};
+
+constexpr PetscInt kProductionExactPreconditionerMaxDimension = 8192;
+
+// For the bounded CPU qualification scope, materialize only the shifted
+// Schur *preconditioner* by applying the production MatShell to basis
+// vectors.  The eigensolver operator itself remains the persistent MatShell;
+// this matrix is used solely by STSINVERT's sparse direct inner solve.  The
+// cap keeps the O(n^2) setup explicit and prevents this baseline from being
+// mistaken for the scalable Schur path.
+bool create_production_exact_shift_preconditioner(
+    Mat schur_shell,
+    Mat split_mass,
+    PetscInt dimension,
+    double shift,
+    Mat *matrix,
+    ProductionCpuSolveControl *solve_control,
+    std::uint64_t *completed_column_count)
+{
+    if (completed_column_count != nullptr) {
+        *completed_column_count = 0u;
+    }
+    // This bounded exact materialization is used for a single selected shift
+    // (nearest_frequency) as a qualification/reference path.  A frequency
+    // window uses this helper only once at zero shift for its bounded cache;
+    // larger windows retain the scalable magnetic preconditioner.
+    if (matrix == nullptr || schur_shell == nullptr || split_mass == nullptr ||
+        dimension <= 0 || dimension > kProductionExactPreconditionerMaxDimension ||
+        !std::isfinite(shift)) {
+        return false;
+    }
+    if (MatCreateSeqAIJ(
+            PETSC_COMM_SELF,
+            dimension,
+            dimension,
+            dimension,
+            nullptr,
+            matrix) != 0) {
+        return false;
+    }
+    if (MatSetOption(*matrix, MAT_NEW_NONZERO_ALLOCATION_ERR, PETSC_FALSE) != 0) {
+        MatDestroy(matrix);
+        return false;
+    }
+    Vec basis = nullptr;
+    Vec schur_action = nullptr;
+    Vec mass_action = nullptr;
+    bool ok =
+        VecCreateSeq(PETSC_COMM_SELF, dimension, &basis) == 0 &&
+        VecDuplicate(basis, &schur_action) == 0 &&
+        VecDuplicate(basis, &mass_action) == 0;
+    if (!ok) {
+        if (mass_action != nullptr) {
+            VecDestroy(&mass_action);
+        }
+        if (schur_action != nullptr) {
+            VecDestroy(&schur_action);
+        }
+        if (basis != nullptr) {
+            VecDestroy(&basis);
+        }
+        MatDestroy(matrix);
+        return false;
+    }
+
+    PetscScalar *basis_values = nullptr;
+    const PetscScalar *schur_values = nullptr;
+    const PetscScalar *mass_values = nullptr;
+    for (PetscInt column = 0; column < dimension && ok; ++column) {
+        // Direct Poisson solves need not invoke iterative KSP callbacks.
+        // Poll explicitly so cancellation is observed during materialization.
+        if (solve_control != nullptr && solve_control->armed &&
+            solve_control->cancel_poll_enabled &&
+            poisson_airbox_modal_cancel_requested(solve_control->callback_problem)) {
+            solve_control->cancellation_observed = true;
+            ok = false;
+            break;
+        }
+        ok = VecGetArray(basis, &basis_values) == 0;
+        if (!ok) {
+            break;
+        }
+        for (PetscInt row = 0; row < dimension; ++row) {
+            basis_values[row] = static_cast<PetscScalar>(row == column ? 1.0 : 0.0);
+        }
+        VecRestoreArray(basis, &basis_values);
+        basis_values = nullptr;
+
+        ok = MatMult(schur_shell, basis, schur_action) == 0 &&
+            MatMult(split_mass, basis, mass_action) == 0;
+        if (!ok) {
+            break;
+        }
+        ok = VecGetArrayRead(schur_action, &schur_values) == 0 &&
+            VecGetArrayRead(mass_action, &mass_values) == 0;
+        if (!ok) {
+            if (schur_values != nullptr) {
+                VecRestoreArrayRead(schur_action, &schur_values);
+            }
+            if (mass_values != nullptr) {
+                VecRestoreArrayRead(mass_action, &mass_values);
+            }
+            break;
+        }
+        for (PetscInt row = 0; row < dimension; ++row) {
+            const PetscScalar value =
+                schur_values[row] - static_cast<PetscScalar>(shift) * mass_values[row];
+            if (MatSetValue(*matrix, row, column, value, INSERT_VALUES) != 0) {
+                ok = false;
+                break;
+            }
+        }
+        VecRestoreArrayRead(mass_action, &mass_values);
+        VecRestoreArrayRead(schur_action, &schur_values);
+        schur_values = nullptr;
+        mass_values = nullptr;
+        if (ok && completed_column_count != nullptr) {
+            *completed_column_count = static_cast<std::uint64_t>(column + 1);
+        }
+    }
+    if (basis_values != nullptr) {
+        VecRestoreArray(basis, &basis_values);
+    }
+    VecDestroy(&mass_action);
+    VecDestroy(&schur_action);
+    VecDestroy(&basis);
+    if (!ok || MatAssemblyBegin(*matrix, MAT_FINAL_ASSEMBLY) != 0 ||
+        MatAssemblyEnd(*matrix, MAT_FINAL_ASSEMBLY) != 0) {
+        MatDestroy(matrix);
+        return false;
+    }
+    return true;
+}
+
+constexpr PetscInt kProductionWindowExactPreconditionerMaxDimension = 512;
+
+// Cache only the small-window preconditioner. EPS continues to apply the
+// original MatShell, and every shift has its own independently owned matrix.
+bool create_production_cached_window_preconditioner(
+    ProductionCpuOperatorContext *context,
+    double shift,
+    Mat *matrix,
+    double *shift_setup_seconds,
+    bool *shift_setup_timing_available)
+{
+    if (shift_setup_seconds != nullptr) {
+        *shift_setup_seconds = 0.0;
+    }
+    if (shift_setup_timing_available != nullptr) {
+        *shift_setup_timing_available = false;
+    }
+    if (context == nullptr || matrix == nullptr || *matrix != nullptr ||
+        context->split_count <= 0 ||
+        context->split_count > kProductionWindowExactPreconditionerMaxDimension ||
+        !std::isfinite(shift)) {
+        return false;
+    }
+    bool constructed_now = false;
+    // Preserve the pre-observability retry semantics: if materialization did
+    // not produce a cache, the next caller may try the same production path
+    // again.  The failed attempt is still reported through the latest
+    // execution metrics; never pass a null cache to MatDuplicate.
+    if (context->cached_window_schur == nullptr) {
+        constructed_now = true;
+        context->exact_cache_construction_attempted = true;
+        context->exact_cache_dimension = static_cast<std::uint64_t>(
+            context->split_count);
+        context->exact_cache_column_count = static_cast<std::uint64_t>(
+            context->split_count);
+        const std::uint64_t poisson_solve_count_before =
+            context->schur.poisson_solve_count;
+        const auto construction_started_at = std::chrono::steady_clock::now();
+        const bool constructed = create_production_exact_shift_preconditioner(
+            context->schur_shell,
+            context->split_mass,
+            context->split_count,
+            0.0,
+            &context->cached_window_schur,
+            &context->solve_control,
+            &context->exact_cache_column_count);
+        context->exact_cache_construction_seconds =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - construction_started_at)
+                .count();
+        context->exact_cache_construction_poisson_solve_count =
+            context->schur.poisson_solve_count - poisson_solve_count_before;
+        context->exact_cache_construction_succeeded = constructed;
+        copy_message(
+            context->exact_cache_status,
+            sizeof(context->exact_cache_status),
+            constructed ? "cache_built" : "cache_construction_failed");
+        if (!constructed) {
+            return false;
+        }
+    }
+    const auto shift_setup_started_at = std::chrono::steady_clock::now();
+    bool shift_matrix_ok =
+        MatDuplicate(context->cached_window_schur, MAT_COPY_VALUES, matrix) == 0;
+    if (shift_matrix_ok) {
+        shift_matrix_ok = MatAXPY(
+            *matrix,
+            static_cast<PetscScalar>(-shift),
+            context->split_mass,
+            DIFFERENT_NONZERO_PATTERN) == 0;
+    }
+    if (!shift_matrix_ok) {
+        if (*matrix != nullptr) {
+            MatDestroy(matrix);
+        }
+        context->exact_cache_shift_failure_observed = true;
+        copy_message(
+            context->exact_cache_status,
+            sizeof(context->exact_cache_status),
+            "cache_shift_matrix_failed");
+        return false;
+    }
+    if (shift_setup_seconds != nullptr) {
+        *shift_setup_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - shift_setup_started_at).count();
+    }
+    if (shift_setup_timing_available != nullptr) {
+        *shift_setup_timing_available = true;
+    }
+    copy_message(
+        context->exact_cache_status,
+        sizeof(context->exact_cache_status),
+        context->exact_cache_shift_failure_observed
+            ? "cache_reused_after_shift_failure"
+            : (constructed_now ? "cache_built" : "cache_reused"));
+    return true;
+}
+
+std::vector<Complex> copy_production_split_eigenvector(
+    Vec real_part,
+    Vec imaginary_part,
+    PetscInt base_count)
+{
+    std::vector<Complex> result;
+    const PetscScalar *real_values = nullptr;
+    const PetscScalar *imaginary_values = nullptr;
+    if (VecGetArrayRead(real_part, &real_values) != 0 ||
+        VecGetArrayRead(imaginary_part, &imaginary_values) != 0) {
+        if (real_values != nullptr) {
+            VecRestoreArrayRead(real_part, &real_values);
+        }
+        if (imaginary_values != nullptr) {
+            VecRestoreArrayRead(imaginary_part, &imaginary_values);
+        }
+        return result;
+    }
+    result.reserve(static_cast<std::size_t>(base_count));
+    for (PetscInt index = 0; index < base_count; ++index) {
+        // EPSGetEigenpair returns the real and imaginary parts of the
+        // 2N-dimensional real-split eigenvector in separate vectors when
+        // PETSc is built with real scalars.  Reconstruct the physical complex
+        // q = (u + i v) from both vectors; using only the first vector loses
+        // the xi contribution and can make the full descriptor residual look
+        // large even when the reduced Schur action is converged.
+#if defined(PETSC_USE_COMPLEX)
+        const Complex real_half{
+            static_cast<double>(PetscRealPart(real_values[index])),
+            static_cast<double>(PetscImaginaryPart(real_values[index]))};
+        const Complex imag_half{
+            static_cast<double>(PetscRealPart(real_values[index + base_count])),
+            static_cast<double>(PetscImaginaryPart(real_values[index + base_count]))};
+#else
+        const Complex real_half{
+            static_cast<double>(PetscRealPart(real_values[index])),
+            static_cast<double>(PetscRealPart(imaginary_values[index]))};
+        const Complex imag_half{
+            static_cast<double>(PetscRealPart(real_values[index + base_count])),
+            static_cast<double>(PetscRealPart(imaginary_values[index + base_count]))};
+#endif
+        const Complex value = real_half + Complex{0.0, 1.0} * imag_half;
+        if (!std::isfinite(value.real()) || !std::isfinite(value.imag())) {
+            result.clear();
+            break;
+        }
+        result.push_back(value);
+    }
+    VecRestoreArrayRead(real_part, &real_values);
+    VecRestoreArrayRead(imaginary_part, &imaginary_values);
+    return result;
+}
+
+struct ProductionShiftedOperatorContext {
+    Mat schur_shell = nullptr;
+    Mat split_mass = nullptr;
+    Vec mass_action = nullptr;
+    PetscReal shift = 0.0;
+};
+
+PetscErrorCode production_shifted_operator_matmult(Mat matrix, Vec x, Vec y)
+{
+    void *raw_context = nullptr;
+    PetscFunctionBeginUser;
+    PetscCall(MatShellGetContext(matrix, &raw_context));
+    auto *context = static_cast<ProductionShiftedOperatorContext *>(raw_context);
+    PetscCheck(context != nullptr && context->schur_shell != nullptr &&
+                   context->split_mass != nullptr,
+               PETSC_COMM_SELF, PETSC_ERR_ARG_NULL,
+               "missing production shifted operator context");
+    if (context->mass_action == nullptr) {
+        PetscCall(VecDuplicate(x, &context->mass_action));
+    }
+    PetscCall(MatMult(context->schur_shell, x, y));
+    PetscCall(MatMult(context->split_mass, x, context->mass_action));
+    PetscCall(VecAXPY(
+        y,
+        static_cast<PetscScalar>(-context->shift),
+        context->mass_action));
+    PetscFunctionReturn(PETSC_SUCCESS);
+}
+
+bool create_production_shifted_operator(
+    Mat schur_shell,
+    Mat split_mass,
+    PetscInt dimension,
+    PetscReal shift,
+    Mat *out_matrix,
+    ProductionShiftedOperatorContext **out_context)
+{
+    if (schur_shell == nullptr || split_mass == nullptr || dimension <= 0 ||
+        !std::isfinite(static_cast<double>(shift)) || out_matrix == nullptr ||
+        out_context == nullptr) {
+        return false;
+    }
+    *out_matrix = nullptr;
+    *out_context = nullptr;
+    auto *context = new (std::nothrow) ProductionShiftedOperatorContext{};
+    if (context == nullptr) {
+        return false;
+    }
+    context->schur_shell = schur_shell;
+    context->split_mass = split_mass;
+    context->shift = shift;
+    const bool created =
+        MatCreateShell(
+            PETSC_COMM_SELF,
+            dimension,
+            dimension,
+            dimension,
+            dimension,
+            context,
+            out_matrix) == 0 &&
+        MatShellSetOperation(
+            *out_matrix,
+            MATOP_MULT,
+            reinterpret_cast<void (*)(void)>(production_shifted_operator_matmult)) == 0 &&
+        MatSetUp(*out_matrix) == 0;
+    if (!created) {
+        if (*out_matrix != nullptr) {
+            MatDestroy(out_matrix);
+        }
+        delete context;
+        return false;
+    }
+    *out_context = context;
+    return true;
+}
+
+void destroy_production_shifted_operator(
+    Mat *matrix,
+    ProductionShiftedOperatorContext **context) noexcept
+{
+    if (matrix != nullptr && *matrix != nullptr) {
+        MatDestroy(matrix);
+    }
+    if (context != nullptr && *context != nullptr) {
+        if ((*context)->mass_action != nullptr) {
+            VecDestroy(&(*context)->mass_action);
+        }
+        delete *context;
+        *context = nullptr;
+    }
+}
+
+// Keep post-EPS Ritz correction independent from the KSP owned by SLEPc's
+// ST.  The latter can carry an internal DMShell and is lifecycle-managed by
+// ST; resetting or setting it up again after EPSSolve can invalidate that
+// state.  The new KSP receives an explicit (S - tau B) MatShell so the
+// correction is not dependent on the opaque operator representation returned
+// by ST.
+bool configure_production_refinement_ksp(
+    KSP source_ksp,
+    Mat schur_shell,
+    Mat split_mass,
+    PetscReal shift,
+    PetscInt split_count,
+    PetscReal eigensolver_tolerance,
+    PetscInt max_linear_iterations,
+    ProductionCpuSolveControl *solve_control,
+    KSP *out_ksp,
+    Mat *out_operator,
+    ProductionShiftedOperatorContext **out_operator_context)
+{
+    if (source_ksp == nullptr || schur_shell == nullptr ||
+        split_mass == nullptr || split_count <= 0 ||
+        !std::isfinite(static_cast<double>(shift)) ||
+        !std::isfinite(static_cast<double>(eigensolver_tolerance)) ||
+        eigensolver_tolerance <= 0.0 || solve_control == nullptr ||
+        out_ksp == nullptr || out_operator == nullptr ||
+        out_operator_context == nullptr) {
+        return false;
+    }
+    *out_ksp = nullptr;
+    *out_operator = nullptr;
+    *out_operator_context = nullptr;
+
+    Mat ignored_shifted_operator = nullptr;
+    Mat shifted_preconditioner = nullptr;
+    if (KSPGetOperators(
+            source_ksp,
+            &ignored_shifted_operator,
+            &shifted_preconditioner) != 0 ||
+        shifted_preconditioner == nullptr ||
+        !create_production_shifted_operator(
+            schur_shell,
+            split_mass,
+            split_count,
+            shift,
+            out_operator,
+            out_operator_context)) {
+        return false;
+    }
+
+    KSP refinement_ksp = nullptr;
+    PC refinement_pc = nullptr;
+    const PetscReal refinement_tolerance = std::max(
+        static_cast<PetscReal>(1.0e-10),
+        std::min(
+            static_cast<PetscReal>(1.0e-10),
+            static_cast<PetscReal>(1.0e-2) * eigensolver_tolerance));
+    const PetscInt refinement_max_iterations =
+        max_linear_iterations > 0 ? max_linear_iterations : 1000;
+    bool configured =
+        KSPCreate(PETSC_COMM_SELF, &refinement_ksp) == 0 &&
+        KSPSetOperators(
+            refinement_ksp,
+            *out_operator,
+            shifted_preconditioner) == 0 &&
+        // The correction loop supplies the original-descriptor residual.  A
+        // single preconditioner application is not a solve for the Schur
+        // MatShell and can move a Ritz vector farther from the eigenspace;
+        // use an independent GMRES instance for the actual shifted solve.
+        KSPSetType(refinement_ksp, KSPGMRES) == 0 &&
+        KSPGMRESSetRestart(
+            refinement_ksp,
+            std::min<PetscInt>(split_count, static_cast<PetscInt>(256))) == 0 &&
+        // The Schur MatShell contains an inner Poisson solve with its own
+        // finite stopping criterion.  That makes the restart residual a
+        // conservative diagnostic rather than an exact GMRES recurrence;
+        // retain the true residual gate below while allowing this bounded
+        // inner solve to continue across a restart.
+        set_gmres_breakdown_tolerance_compat(
+            refinement_ksp,
+            static_cast<PetscReal>(32.0)) == 0 &&
+        KSPGetPC(refinement_ksp, &refinement_pc) == 0 &&
+        PCSetType(refinement_pc, PCLU) == 0 &&
+        PCFactorReorderForNonzeroDiagonal(refinement_pc, 1.0e-12) == 0 &&
+        PCFactorSetShiftType(refinement_pc, MAT_SHIFT_NONE) == 0 &&
+        KSPSetTolerances(
+            refinement_ksp,
+            refinement_tolerance,
+            PETSC_DEFAULT,
+            PETSC_DEFAULT,
+            refinement_max_iterations) == 0 &&
+        KSPSetNormType(refinement_ksp, KSP_NORM_UNPRECONDITIONED) == 0 &&
+        KSPSetErrorIfNotConverged(refinement_ksp, PETSC_FALSE) == 0 &&
+        KSPSetInitialGuessNonzero(refinement_ksp, PETSC_FALSE) == 0 &&
+        KSPSetUp(refinement_ksp) == 0;
+    if (!configured) {
+        if (refinement_ksp != nullptr) {
+            KSPDestroy(&refinement_ksp);
+        }
+        destroy_production_shifted_operator(out_operator, out_operator_context);
+        return false;
+    }
+    *out_ksp = refinement_ksp;
+    return true;
+}
+
+// SLEPc's convergence test is performed on the transformed pencil.  For a
+// MatShell shift-invert solve that test can accept a Ritz vector before the
+// independently reconstructed original descriptor reaches the public
+// residual gate.  Refine the real/imaginary Ritz pair with the already
+// configured shifted KSP before reconstructing phi.  This is a correction of
+// the vector, not a change to the acceptance threshold or eigenvalue
+// convention.
+bool refine_production_split_ritz_pair(
+    KSP shifted_ksp,
+    Mat schur_shell,
+    Mat split_mass,
+    Vec real_part,
+    Vec imag_part,
+    double eigenvalue_real,
+    double eigenvalue_imag,
+    double target_relative_residual,
+    PetscInt max_refinement_iterations,
+    double *out_relative_residual)
+{
+    if (shifted_ksp == nullptr || schur_shell == nullptr || split_mass == nullptr ||
+        real_part == nullptr || imag_part == nullptr ||
+        !std::isfinite(eigenvalue_real) || !std::isfinite(eigenvalue_imag) ||
+        !std::isfinite(target_relative_residual) || target_relative_residual <= 0.0 ||
+        max_refinement_iterations < 0) {
+        return false;
+    }
+    if (out_relative_residual != nullptr) {
+        *out_relative_residual = std::numeric_limits<double>::infinity();
+    }
+
+    // EPS leaves the ST-owned KSP configured for shift-invert.  Reuse that
+    // operator and preconditioner, but force every correction solve to start
+    // from the explicitly zero correction vector.  KSPReset/KSPSetUp must not
+    // be called here: the ST-owned KSP may carry a DMShell without a global
+    // vector factory, and rebuilding it would fail before KSPSolve.
+    if (KSPSetInitialGuessNonzero(shifted_ksp, PETSC_FALSE) != 0) {
+        return false;
+    }
+
+    Vec action_real = nullptr;
+    Vec action_imag = nullptr;
+    Vec mass_real = nullptr;
+    Vec mass_imag = nullptr;
+    Vec residual_real = nullptr;
+    Vec residual_imag = nullptr;
+    Vec correction_real = nullptr;
+    Vec correction_imag = nullptr;
+    Vec delta_real = nullptr;
+    Vec delta_imag = nullptr;
+    const bool allocated =
+        VecDuplicate(real_part, &action_real) == 0 &&
+        VecDuplicate(real_part, &mass_real) == 0 &&
+        VecDuplicate(real_part, &residual_real) == 0 &&
+        VecDuplicate(real_part, &correction_real) == 0 &&
+        VecDuplicate(real_part, &delta_real) == 0 &&
+        VecDuplicate(imag_part, &action_imag) == 0 &&
+        VecDuplicate(imag_part, &mass_imag) == 0 &&
+        VecDuplicate(imag_part, &residual_imag) == 0 &&
+        VecDuplicate(imag_part, &correction_imag) == 0 &&
+        VecDuplicate(imag_part, &delta_imag) == 0;
+    if (!allocated) {
+        if (delta_imag != nullptr) VecDestroy(&delta_imag);
+        if (delta_real != nullptr) VecDestroy(&delta_real);
+        if (correction_imag != nullptr) VecDestroy(&correction_imag);
+        if (correction_real != nullptr) VecDestroy(&correction_real);
+        if (residual_imag != nullptr) VecDestroy(&residual_imag);
+        if (residual_real != nullptr) VecDestroy(&residual_real);
+        if (mass_imag != nullptr) VecDestroy(&mass_imag);
+        if (mass_real != nullptr) VecDestroy(&mass_real);
+        if (action_imag != nullptr) VecDestroy(&action_imag);
+        if (action_real != nullptr) VecDestroy(&action_real);
+        return false;
+    }
+
+    bool ok = true;
+    double relative_residual = std::numeric_limits<double>::infinity();
+    for (PetscInt iteration = 0; iteration <= max_refinement_iterations; ++iteration) {
+        if (MatMult(schur_shell, real_part, action_real) != 0 ||
+            MatMult(split_mass, real_part, mass_real) != 0 ||
+            MatMult(schur_shell, imag_part, action_imag) != 0 ||
+            MatMult(split_mass, imag_part, mass_imag) != 0 ||
+            VecWAXPY(
+                residual_real,
+                static_cast<PetscScalar>(-eigenvalue_real),
+                mass_real,
+                action_real) != 0 ||
+            VecWAXPY(
+                residual_imag,
+                static_cast<PetscScalar>(-eigenvalue_real),
+                mass_imag,
+                action_imag) != 0 ||
+            VecAXPY(
+                residual_real,
+                static_cast<PetscScalar>(eigenvalue_imag),
+                mass_imag) != 0 ||
+            VecAXPY(
+                residual_imag,
+                static_cast<PetscScalar>(-eigenvalue_imag),
+                mass_real) != 0) {
+            ok = false;
+            break;
+        }
+
+        PetscReal action_real_norm = 0.0;
+        PetscReal action_imag_norm = 0.0;
+        PetscReal mass_real_norm = 0.0;
+        PetscReal mass_imag_norm = 0.0;
+        PetscReal residual_real_norm = 0.0;
+        PetscReal residual_imag_norm = 0.0;
+        if (VecNorm(action_real, NORM_2, &action_real_norm) != 0 ||
+            VecNorm(action_imag, NORM_2, &action_imag_norm) != 0 ||
+            VecNorm(mass_real, NORM_2, &mass_real_norm) != 0 ||
+            VecNorm(mass_imag, NORM_2, &mass_imag_norm) != 0 ||
+            VecNorm(residual_real, NORM_2, &residual_real_norm) != 0 ||
+            VecNorm(residual_imag, NORM_2, &residual_imag_norm) != 0) {
+            ok = false;
+            break;
+        }
+        const double residual_norm = std::hypot(
+            static_cast<double>(residual_real_norm),
+            static_cast<double>(residual_imag_norm));
+        const double action_norm = std::hypot(
+            static_cast<double>(action_real_norm),
+            static_cast<double>(action_imag_norm));
+        const double mass_norm = std::hypot(
+            static_cast<double>(mass_real_norm),
+            static_cast<double>(mass_imag_norm));
+        relative_residual = residual_norm /
+            (action_norm +
+             std::hypot(eigenvalue_real, eigenvalue_imag) * mass_norm +
+             1.0e-300);
+        if (out_relative_residual != nullptr) {
+            *out_relative_residual = relative_residual;
+        }
+        if (!std::isfinite(relative_residual) ||
+            relative_residual <= target_relative_residual ||
+            iteration == max_refinement_iterations) {
+            break;
+        }
+
+        if (VecCopy(residual_real, correction_real) != 0 ||
+            VecScale(correction_real, static_cast<PetscScalar>(-1.0)) != 0 ||
+            VecSet(delta_real, static_cast<PetscScalar>(0.0)) != 0 ||
+            KSPSolve(shifted_ksp, correction_real, delta_real) != 0) {
+            ok = false;
+            break;
+        }
+        KSPConvergedReason reason = KSP_CONVERGED_ITERATING;
+        if (KSPGetConvergedReason(shifted_ksp, &reason) != 0 || reason < 0 ||
+            VecAXPY(real_part, static_cast<PetscScalar>(1.0), delta_real) != 0) {
+            ok = false;
+            break;
+        }
+        if (VecCopy(residual_imag, correction_imag) != 0 ||
+            VecScale(correction_imag, static_cast<PetscScalar>(-1.0)) != 0 ||
+            VecSet(delta_imag, static_cast<PetscScalar>(0.0)) != 0 ||
+            KSPSolve(shifted_ksp, correction_imag, delta_imag) != 0) {
+            ok = false;
+            break;
+        }
+        reason = KSP_CONVERGED_ITERATING;
+        if (KSPGetConvergedReason(shifted_ksp, &reason) != 0 || reason < 0 ||
+            VecAXPY(imag_part, static_cast<PetscScalar>(1.0), delta_imag) != 0) {
+            ok = false;
+            break;
+        }
+    }
+
+    VecDestroy(&delta_imag);
+    VecDestroy(&delta_real);
+    VecDestroy(&correction_imag);
+    VecDestroy(&correction_real);
+    VecDestroy(&residual_imag);
+    VecDestroy(&residual_real);
+    VecDestroy(&mass_imag);
+    VecDestroy(&mass_real);
+    VecDestroy(&action_imag);
+    VecDestroy(&action_real);
+    return ok && std::isfinite(relative_residual);
+}
+
+bool reconstruct_production_mode(
+    ProductionSchurContext *context,
+    const std::vector<Complex> &q,
+    std::vector<Complex> *full_vector)
+{
+    if (context == nullptr || full_vector == nullptr ||
+        q.size() != static_cast<std::size_t>(context->q_count)) {
+        return false;
+    }
+    std::vector<PetscScalar> q_real(q.size(), 0.0);
+    std::vector<PetscScalar> q_imag(q.size(), 0.0);
+    for (std::size_t index = 0; index < q.size(); ++index) {
+        q_real[index] = static_cast<PetscScalar>(q[index].real());
+        q_imag[index] = static_cast<PetscScalar>(q[index].imag());
+    }
+    Vec q_real_vec = nullptr;
+    Vec q_imag_vec = nullptr;
+    if (VecCreateSeqWithArray(
+            PETSC_COMM_SELF,
+            1,
+            context->q_count,
+            q_real.data(),
+            &q_real_vec) != 0 ||
+        VecCreateSeqWithArray(
+            PETSC_COMM_SELF,
+            1,
+            context->q_count,
+            q_imag.data(),
+            &q_imag_vec) != 0) {
+        if (q_real_vec != nullptr) {
+            VecDestroy(&q_real_vec);
+        }
+        if (q_imag_vec != nullptr) {
+            VecDestroy(&q_imag_vec);
+        }
+        return false;
+    }
+    std::vector<double> phi_real;
+    std::vector<double> phi_imag;
+    double eta_real = 0.0;
+    double eta_imag = 0.0;
+    const bool solved = solve_production_phi(
+            context,
+            q_real_vec,
+            &phi_real,
+            &eta_real) &&
+        solve_production_phi(context, q_imag_vec, &phi_imag, &eta_imag);
+    VecDestroy(&q_real_vec);
+    VecDestroy(&q_imag_vec);
+    if (!solved || phi_real.size() != static_cast<std::size_t>(context->phi_count) ||
+        phi_imag.size() != static_cast<std::size_t>(context->phi_count)) {
+        return false;
+    }
+    full_vector->clear();
+    full_vector->reserve(static_cast<std::size_t>(
+        context->q_count + context->phi_count +
+        (context->gauge_augmented ? 1 : 0)));
+    full_vector->insert(full_vector->end(), q.begin(), q.end());
+    for (PetscInt index = 0; index < context->phi_count; ++index) {
+        full_vector->emplace_back(
+            phi_real[static_cast<std::size_t>(index)],
+            phi_imag[static_cast<std::size_t>(index)]);
+    }
+    if (context->gauge_augmented) {
+        full_vector->emplace_back(eta_real, eta_imag);
+    }
+    return true;
+}
+
+void write_production_schur_diagnostics(
+    const PoissonAirboxEigenBlockProblem &problem,
+    const PoissonAirboxModalEigenResult &result,
+    const char *status,
+    const char *reason,
+    PoissonAirboxModalEigenResult *out) noexcept
+{
+    if (out == nullptr) {
+        return;
+    }
+    char exact_preconditioner_dimension_json[32]{};
+    char exact_preconditioner_column_count_json[32]{};
+    char exact_preconditioner_poisson_solve_count_json[32]{};
+    char split_dof_count_json[32]{};
+    char exact_preconditioner_construction_seconds_json[64]{};
+    char shifted_preconditioner_setup_seconds_json[64]{};
+    char eps_solve_seconds_json[64]{};
+    format_nullable_u64_json(
+        exact_preconditioner_dimension_json,
+        sizeof(exact_preconditioner_dimension_json),
+        result.exact_preconditioner_dimension_available,
+        result.exact_preconditioner_dimension);
+    format_nullable_u64_json(
+        exact_preconditioner_column_count_json,
+        sizeof(exact_preconditioner_column_count_json),
+        result.exact_preconditioner_column_count_available,
+        result.exact_preconditioner_column_count);
+    format_nullable_u64_json(
+        exact_preconditioner_poisson_solve_count_json,
+        sizeof(exact_preconditioner_poisson_solve_count_json),
+        result.exact_preconditioner_construction_metrics_available,
+        result.exact_preconditioner_construction_poisson_solve_count);
+    format_nullable_u64_json(
+        split_dof_count_json,
+        sizeof(split_dof_count_json),
+        result.split_dof_count_available,
+        result.split_dof_count);
+    format_nullable_double_json(
+        exact_preconditioner_construction_seconds_json,
+        sizeof(exact_preconditioner_construction_seconds_json),
+        result.exact_preconditioner_construction_timing_available,
+        result.exact_preconditioner_construction_seconds);
+    format_nullable_double_json(
+        shifted_preconditioner_setup_seconds_json,
+        sizeof(shifted_preconditioner_setup_seconds_json),
+        result.shifted_preconditioner_setup_timing_available,
+        result.shifted_preconditioner_setup_seconds);
+    format_nullable_double_json(
+        eps_solve_seconds_json,
+        sizeof(eps_solve_seconds_json),
+        result.eps_solve_timing_available,
+        result.eps_solve_seconds);
+    const int diagnostics_written = std::snprintf(
+        out->diagnostics_json,
+        sizeof(out->diagnostics_json),
+        "{"
+        "\"schema_version\":\"poisson_airbox_modal_eigen_schur_slepc.v1\","
+        "\"status\":\"%s\","
+        "\"complete\":%s,"
+        "\"solve_succeeded\":%s,"
+        "\"fields_available\":%s,"
+        "\"reason\":\"%s\","
+        "\"slepc_converged_reason\":\"%s\","
+        "\"slepc_converged_reason_code\":%d,"
+        "\"stop_reason\":\"%s\","
+        "\"eps_solve_error_code_available\":%s,"
+        "\"eps_solve_error_code\":%d,"
+        "\"slepc_process_quarantined\":%s,"
+        "\"operator_context_invalidated\":%s,"
+        "\"eps_lifetime_unsafe\":%s,"
+        "\"study_product\":\"modal_eigen\","
+        "\"solver_adapter\":\"k0_poisson_airbox_cpu_schur_slepc\","
+        "\"engine_id\":\"native_fem.frequency_domain.k0_poisson_airbox_cpu_schur_slepc.v1\","
+        "\"requested_solver_adapter\":\"%s\","
+        "\"execution_lane\":\"production_cpu\","
+        "\"requested_execution\":\"production_cpu\","
+        "\"resolved_execution\":\"production_cpu\","
+        "\"production_implication\":%s,"
+        "\"validation_only\":%s,"
+        "\"persistent_solver_context\":true,"
+        "\"operator_context_scope\":\"%s\","
+        "\"operator_context_setup_count\":%u,"
+        "\"poisson_factorization_setup_count\":%u,"
+        "\"shift_solver_setup_count\":%u,"
+        "\"exact_preconditioner\":{\"enabled\":%s,\"status\":\"%s\","
+        "\"shift_failure_observed\":%s,"
+        "\"dimension\":%s,\"column_count\":%s,"
+        "\"construction_poisson_solve_count\":%s,"
+        "\"construction_seconds\":%s,"
+        "\"shifted_setup_seconds\":%s,\"eps_solve_seconds\":%s},"
+        "\"gpu_device_resident_modal_eigensolver\":false,"
+        "\"per_iteration_h2d_transfer_count\":0,"
+        "\"per_iteration_d2h_transfer_count\":0,"
+        "\"per_iteration_full_vector_transfers\":0,"
+        "\"fallback_used\":false,"
+        "\"demag_kind\":\"%s\","
+        "\"assembly_kind\":\"%s\","
+        "\"outer_boundary_kind\":\"%s\","
+        "\"robin_beta\":%.17g,"
+        "\"gauge_policy\":\"%s\","
+        "\"gauge_reason\":\"%s\","
+        "\"residual_tolerance\":%.17g,"
+        "\"modal_krylov_tuning\":%s,"
+        "\"phasor_convention\":\"%s\","
+        "\"eigenvalue_convention\":\"%s\","
+        "\"algebraic_form\":\"schur_reduced_descriptor\","
+        "\"schur_reduced\":true,"
+        "\"static_demag_substitution\":false,"
+        "\"poisson_factorization_reused\":true,"
+        "\"matrix_format\":\"real_split_matshell_seq_aij\","
+        "\"spectral_pencil_kind\":\"real_frequency_rotated\","
+        "\"target_representation\":\"tau=omega_target\","
+        "\"target_kind\":\"%s\","
+        "\"spectrum_completeness\":\"%s\","
+        "\"window_complete\":%s,"
+        "\"requested_window_hz\":[%.17g,%.17g],"
+        "\"target_tau_rad_s\":%.17g,"
+        "\"target_omega_rad_s\":%.17g,"
+        "\"descriptor_scaling\":{\"kind\":\"dimensionless_frequency\","
+        "\"applied\":%s,"
+        "\"mass_norm\":%.17g,\"operator_norm\":%.17g,"
+        "\"angular_frequency_scale\":%.17g,\"mass_scale\":%.17g,"
+        "\"operator_scale\":%.17g,\"target_eigenvalue_scaled\":%.17g},"
+        "\"raw_ritz_classification\":%s,"
+        "\"slepc\":{\"eps_type\":\"krylovschur\",\"problem_type\":\"gnhep\","
+        "\"spectral_transform\":\"shift_invert\",\"which_eigenpairs\":\"target_magnitude\","
+        "\"ksp_type\":\"%s\",\"pc_type\":\"lu\",\"pc_matrix\":\"%s\","
+        "\"converged_eigenpair_count\":%u,\"accepted_mode_count\":%u,\"outer_iterations\":%s},"
+        "\"operator_apply_count\":%llu,\"poisson_solve_count\":%llu,"
+        "\"poisson_iteration_count\":%llu,\"shift_linear_iteration_count\":%llu,"
+        "\"eps_restart_count\":null,"
+        "\"finite_real_eigenpair_count\":%u,"
+        "\"positive_frequency_eigenpair_count\":%u,"
+        "\"action_residual_evaluated_count\":%u,"
+        "\"action_residual_evaluation_failed_count\":%u,"
+        "\"q_vector_extraction_failed_count\":%u,"
+        "\"full_vector_reconstruction_failed_count\":%u,"
+        "\"full_vector_nonfinite_count\":%u,"
+        "\"reconstructed_mode_count\":%u,"
+        "\"full_residual_evaluation_failed_count\":%u,"
+        "\"full_residual_rejected_count\":%u,"
+        "\"full_residual_accepted_count\":%u,"
+        "\"refinement_attempted_count\":%u,"
+        "\"refinement_succeeded_count\":%u,"
+        "\"refinement_failed_count\":%u,"
+        "\"refinement_linear_iteration_count\":%llu,"
+        "\"refinement_last_ksp_reason_code\":%d,"
+        "\"q_dof_count\":%llu,\"split_dof_count\":%s,"
+        "\"phi_dof_count\":%llu,\"augmented_dof_count\":%llu,"
+        "\"periodic_mesh_certificate\":{\"schema_version\":\"%s\","
+        "\"magnetic_pair_count\":%llu,\"airbox_pair_count\":%llu},"
+        "\"metrics\":{\"full_residual_reconstruction_relative_error\":%.17g,"
+        "\"slepc_reported_backward_error\":%.17g,\"reconstructed_full_descriptor_backward_error\":%.17g,"
+        "\"reconstruction_vs_slepc_ratio\":%.17g,"
+        "\"magnetic_block_backward_error\":%.17g,\"poisson_block_backward_error\":%.17g,"
+        "\"gauge_constraint_backward_error\":%.17g,\"poisson_constraint_relative_residual\":%.17g,"
+        "\"gauge_mean_abs\":%.17g,\"eigen_residual_relative\":%.17g,"
+        "\"refinement_final_action_residual\":%.17g,"
+        "\"relative_reference_frequency_error\":%.17g},"
+        "\"residual_fields\":{"
+        "\"residual_acceptance_name\":\"modal_original_unscaled_full_descriptor_backward_error\","
+        "\"modal_original_unscaled_full_descriptor_backward_error\":%.17g,"
+        "\"modal_original_unscaled_magnetic_block_backward_error\":%.17g,"
+        "\"modal_original_unscaled_poisson_block_backward_error\":%.17g,"
+        "\"modal_original_unscaled_gauge_constraint_backward_error\":%.17g,"
+        "\"modal_original_unscaled_magnetic_residual_l2\":%.17g,"
+        "\"modal_original_unscaled_poisson_residual_l2\":%.17g,"
+        "\"modal_original_unscaled_gauge_residual_abs\":%.17g,"
+        "\"modal_original_unscaled_full_descriptor_threshold\":%.17g,"
+        "\"slepc_reported_backward_error_diagnostic\":%.17g,"
+        "\"scaled_descriptor_backward_error_diagnostic\":null,"
+        "\"transformed_pencil_backward_error_diagnostic\":null,"
+        "\"reconstruction_vs_slepc_ratio\":%.17g,"
+        "\"eps_full_original_unscaled\":%.17g,"
+        "\"eta_row_present\":%s,"
+        "\"finite_mode_filter_status\":\"%s\""
+        "},"
+        "\"eigenpair\":{\"eigenvalue_real\":%.17g,\"eigenvalue_imag\":%.17g,"
+        "\"omega_rad_s\":%.17g,\"frequency_hz\":%.17g,\"eigenpair_found\":%s,"
+        "\"eigenpair_accepted\":%s,\"positive_frequency_branch_found\":%s},"
+        "\"certification\":{\"full_residual_certified\":%s,\"reference_frequency_certified\":%s},"
+        "\"full_residual_reconstruction_relative_error\":%.17g,"
+        "\"poisson_constraint_relative_residual\":%.17g,"
+        "\"full_residual_certified\":%s,"
+        "\"subwindows\":%s,"
+        "\"window_completeness\":{\"status\":\"%s\",\"subwindow_count\":%u,"
+        "\"completed_subwindow_count\":%u,\"failed_subwindow_count\":%u,"
+        "\"empty_subwindow_count\":%u},"
+        "\"window_certificate\":%s,"
+        "\"cpu_fallback\":\"disabled\""
+        "}",
+        status != nullptr ? status : "unknown",
+        status != nullptr && std::strcmp(status, "ok") == 0 ? "true" : "false",
+        status != nullptr && std::strcmp(status, "ok") == 0 ? "true" : "false",
+        result.accepted_mode_count > 0u ? "true" : "false",
+        reason != nullptr ? reason : "",
+        result.slepc_converged_reason[0] != '\0'
+            ? result.slepc_converged_reason
+            : "not_available",
+        result.slepc_converged_reason_code,
+        result.stop_reason[0] != '\0'
+            ? result.stop_reason
+            : (reason != nullptr ? reason : "not_available"),
+        result.eps_solve_error_code_available ? "true" : "false",
+        static_cast<int>(result.eps_solve_error_code),
+        result.slepc_process_quarantined ? "true" : "false",
+        result.operator_context_invalidated ? "true" : "false",
+        result.eps_lifetime_unsafe ? "true" : "false",
+        problem.solver_adapter != nullptr ? problem.solver_adapter : "",
+        problem.production_shared_domain ? "true" : "false",
+        problem.production_shared_domain ? "false" : "true",
+        result.operator_context_scope[0] != '\0'
+            ? result.operator_context_scope
+            : "not_configured",
+        result.operator_context_setup_count,
+        result.poisson_factorization_setup_count,
+        result.shift_solver_setup_count,
+        result.exact_preconditioner_enabled ? "true" : "false",
+        result.exact_preconditioner_status[0] != '\0'
+            ? result.exact_preconditioner_status
+            : "not_available",
+        result.exact_preconditioner_shift_failure_observed ? "true" : "false",
+        exact_preconditioner_dimension_json,
+        exact_preconditioner_column_count_json,
+        exact_preconditioner_poisson_solve_count_json,
+        exact_preconditioner_construction_seconds_json,
+        shifted_preconditioner_setup_seconds_json,
+        eps_solve_seconds_json,
+        problem.demag_kind != nullptr ? problem.demag_kind : "",
+        problem.assembly_kind != nullptr ? problem.assembly_kind : "",
+        problem.outer_boundary_kind != nullptr ? problem.outer_boundary_kind : "",
+        problem.robin_beta,
+        problem.gauge_policy != nullptr ? problem.gauge_policy : "",
+        problem.gauge_reason != nullptr ? problem.gauge_reason : "",
+        problem.residual_tolerance,
+        result.modal_krylov_tuning_json[0] != '\0'
+            ? result.modal_krylov_tuning_json : "null",
+        problem.phasor_convention != nullptr ? problem.phasor_convention : "",
+        problem.eigenvalue_convention != nullptr ? problem.eigenvalue_convention : "",
+        problem.target_kind != nullptr ? problem.target_kind : "",
+        production_string_equals(problem.target_kind, "nearest_frequency")
+            ? "selected_only"
+            : (result.window_complete ? "certified_window" : "incomplete_window"),
+        result.window_complete ? "true" : "false",
+        problem.frequency_min_hz,
+        problem.frequency_max_hz,
+        omega_rad_s_from_frequency_hz(std::max(0.0, problem.target_frequency_hz)),
+        omega_rad_s_from_frequency_hz(std::max(0.0, problem.target_frequency_hz)),
+        result.mass_scale != 1.0 || result.operator_scale != 1.0 ||
+                result.angular_frequency_scale != 1.0
+            ? "true"
+            : "false",
+        result.descriptor_mass_norm,
+        result.descriptor_operator_norm,
+        result.angular_frequency_scale,
+        result.mass_scale,
+        result.operator_scale,
+        result.target_eigenvalue_scaled,
+        result.raw_ritz_classification_json[0] != '\0'
+            ? result.raw_ritz_classification_json
+            : "{\"available\":false,\"samples\":[]}",
+        result.configured_shifted_ksp_type[0] != '\0'
+            ? result.configured_shifted_ksp_type : "not_configured",
+        result.shifted_preconditioner_kind[0] != '\0'
+            ? result.shifted_preconditioner_kind
+            : "not_configured",
+        result.converged_eigenpair_count,
+        result.accepted_mode_count,
+        result.slepc_process_quarantined
+            ? "null" : std::to_string(result.outer_iterations).c_str(),
+        static_cast<unsigned long long>(result.operator_apply_count),
+        static_cast<unsigned long long>(result.poisson_solve_count),
+        static_cast<unsigned long long>(result.poisson_iteration_count),
+        static_cast<unsigned long long>(result.shift_linear_iteration_count),
+        result.finite_real_eigenpair_count,
+        result.positive_frequency_eigenpair_count,
+        result.action_residual_evaluated_count,
+        result.action_residual_evaluation_failed_count,
+        result.q_vector_extraction_failed_count,
+        result.full_vector_reconstruction_failed_count,
+        result.full_vector_nonfinite_count,
+        result.reconstructed_mode_count,
+        result.full_residual_evaluation_failed_count,
+        result.full_residual_rejected_count,
+        result.full_residual_accepted_count,
+        result.refinement_attempted_count,
+        result.refinement_succeeded_count,
+        result.refinement_failed_count,
+        static_cast<unsigned long long>(result.refinement_linear_iteration_count),
+        result.refinement_last_ksp_reason_code,
+        static_cast<unsigned long long>(result.q_dof_count),
+        split_dof_count_json,
+        static_cast<unsigned long long>(result.phi_dof_count),
+        static_cast<unsigned long long>(result.augmented_dof_count),
+        problem.periodic_mesh_certificate_schema != nullptr
+            ? problem.periodic_mesh_certificate_schema
+            : "",
+        static_cast<unsigned long long>(result.magnetic_pair_count),
+        static_cast<unsigned long long>(result.airbox_pair_count),
+        result.full_residual_reconstruction_relative_error,
+        result.slepc_reported_backward_error,
+        result.reconstructed_full_descriptor_backward_error,
+        result.reconstruction_vs_slepc_ratio,
+        result.magnetic_block_backward_error,
+        result.poisson_block_backward_error,
+        result.gauge_constraint_backward_error,
+        result.poisson_constraint_relative_residual,
+        result.gauge_mean_abs,
+        result.eigen_residual_relative,
+        result.refinement_final_action_residual,
+        result.relative_reference_frequency_error,
+        result.reconstructed_full_descriptor_backward_error,
+        result.magnetic_block_backward_error,
+        result.poisson_block_backward_error,
+        result.gauge_constraint_backward_error,
+        result.magnetic_residual_l2,
+        result.poisson_residual_l2,
+        result.gauge_residual_abs,
+        problem.residual_tolerance,
+        result.slepc_reported_backward_error,
+        result.reconstruction_vs_slepc_ratio,
+        result.reconstructed_full_descriptor_backward_error,
+        production_string_equals(problem.gauge_policy, "mean_zero_augmented")
+            ? "true"
+            : "false",
+        result.positive_frequency_branch_found ? "passed" : "failed",
+        result.eigenvalue_real,
+        result.eigenvalue_imag,
+        result.omega_rad_s,
+        result.frequency_hz,
+        result.converged_eigenpair_count > 0 ? "true" : "false",
+        result.accepted_mode_count > 0 ? "true" : "false",
+        result.positive_frequency_branch_found ? "true" : "false",
+        result.full_residual_certified ? "true" : "false",
+        result.reference_frequency_certified ? "true" : "false",
+        result.full_residual_reconstruction_relative_error,
+        result.poisson_constraint_relative_residual,
+        result.full_residual_certified ? "true" : "false",
+        result.executed_subwindows_json[0] != '\0'
+            ? result.executed_subwindows_json
+            : "[]",
+        result.window_complete ? "certified" :
+            (result.window_failed_subwindow_count > 0u
+                 ? "failed"
+                 : "not_certified"),
+        result.window_subwindow_count,
+        result.window_completed_subwindow_count,
+        result.window_failed_subwindow_count,
+        result.window_empty_subwindow_count,
+        result.window_certificate_json[0] != '\0'
+            ? result.window_certificate_json
+            : "null");
+    if (diagnostics_written < 0 ||
+        static_cast<std::size_t>(diagnostics_written) >=
+            sizeof(out->diagnostics_json)) {
+        constexpr char kDiagnosticsTruncatedJson[] =
+            "{\"schema_version\":\"poisson_airbox_modal_eigen_schur_slepc.v1\","
+            "\"status\":\"unavailable\",\"complete\":false,"
+            "\"solve_succeeded\":false,\"fields_available\":false,"
+            "\"reason\":\"diagnostics_json_truncated\","
+            "\"diagnostics_json_truncated\":true}";
+        static_assert(
+            sizeof(kDiagnosticsTruncatedJson) <= sizeof(out->diagnostics_json),
+            "diagnostics truncation fallback must fit the result buffer");
+        std::memcpy(
+            out->diagnostics_json,
+            kDiagnosticsTruncatedJson,
+            sizeof(kDiagnosticsTruncatedJson));
+    }
+}
+
+FrequencyDomainStatus fail_production_schur(
+    const PoissonAirboxEigenBlockProblem &problem,
+    PoissonAirboxModalEigenResult *result,
+    FrequencyDomainStatus status,
+    const char *message,
+    const char *reason) noexcept
+{
+    if (result != nullptr) {
+        result->status = status;
+        copy_message(result->error_message, sizeof(result->error_message), message);
+        copy_message(result->stop_reason, sizeof(result->stop_reason), reason);
+        write_production_schur_diagnostics(problem, *result, status == FrequencyDomainStatus::unavailable
+            ? "unavailable"
+            : status == FrequencyDomainStatus::validation_error
+                ? "validation_error"
+                : status == FrequencyDomainStatus::operator_error
+                    ? "operator_error"
+                    : status == FrequencyDomainStatus::interrupted
+                        ? "interrupted"
+                    : "solve_error", reason, result);
+    }
+    return status;
+}
 #endif
 
 } // namespace
+
+bool format_poisson_airbox_subwindow_termination_json(
+    const PoissonAirboxModalEigenResult &result,
+    char *destination,
+    std::size_t destination_size) noexcept
+{
+    if (destination == nullptr || destination_size == 0u) {
+        return false;
+    }
+    const bool available = result.eps_reason_available &&
+        !(result.eps_solve_error_code_available &&
+          result.eps_solve_error_code != 0) &&
+        !result.slepc_process_quarantined &&
+        !result.operator_context_invalidated &&
+        !result.eps_lifetime_unsafe;
+    const int written = available
+        ? std::snprintf(
+              destination,
+              destination_size,
+              "\"eps_reason_available\":true,"
+              "\"slepc_converged_reason_code\":%d,"
+              "\"outer_iterations\":%u",
+              result.slepc_converged_reason_code,
+              result.outer_iterations)
+        : std::snprintf(
+              destination,
+              destination_size,
+              "\"eps_reason_available\":false,"
+              "\"slepc_converged_reason_code\":null,"
+              "\"outer_iterations\":null");
+    if (written < 0 || static_cast<std::size_t>(written) >= destination_size) {
+        destination[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+bool format_poisson_airbox_eps_dimensions_json(
+    bool query_succeeded,
+    std::int64_t nev,
+    std::int64_t ncv,
+    std::int64_t mpd,
+    char *destination,
+    std::size_t destination_size) noexcept
+{
+    if (destination == nullptr || destination_size == 0u) {
+        return false;
+    }
+    const int written = query_succeeded
+        ? std::snprintf(
+              destination,
+              destination_size,
+              "\"eps_dimensions\":{\"query_succeeded\":true,"
+              "\"nev\":%lld,\"ncv\":%lld,\"mpd\":%lld}",
+              static_cast<long long>(nev),
+              static_cast<long long>(ncv),
+              static_cast<long long>(mpd))
+        : std::snprintf(
+              destination,
+              destination_size,
+              "\"eps_dimensions\":{\"query_succeeded\":false,"
+              "\"nev\":null,\"ncv\":null,\"mpd\":null}");
+    if (written < 0 || static_cast<std::size_t>(written) >= destination_size) {
+        destination[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+FrequencyDomainStatus solve_poisson_airbox_modal_eigen_cpu_schur(
+    const PoissonAirboxEigenBlockProblem &problem,
+    PoissonAirboxModalEigenResult *out_result) noexcept
+{
+    const auto callback_started_at = std::chrono::steady_clock::now();
+    if (out_result == nullptr) {
+        return FrequencyDomainStatus::validation_error;
+    }
+    // This result owns large bounded JSON buffers (hundreds of KiB).  The
+    // frequency-window solver calls this function recursively for shifted
+    // subwindows, so assigning from a temporary would materialize another
+    // large object on each worker stack and can exhaust the native stack
+    // before the first shifted solve returns.  Reconstruct the already
+    // constructed caller-owned result in place instead; no large temporary is
+    // needed and the vector/string members are released by the destructor.
+    out_result->~PoissonAirboxModalEigenResult();
+    ::new (static_cast<void *>(out_result)) PoissonAirboxModalEigenResult();
+    out_result->q_dof_count = problem.q_dof_count;
+    out_result->phi_dof_count = problem.phi_dof_count;
+    out_result->augmented_dof_count = problem.q_dof_count + problem.phi_dof_count +
+        (production_string_equals(problem.gauge_policy, "mean_zero_augmented") ? 1u : 0u);
+    out_result->magnetic_pair_count = problem.magnetic_pair_count;
+    out_result->airbox_pair_count = problem.airbox_pair_count;
+    out_result->expected_reference_frequency_hz = problem.expected_reference_frequency_hz;
+    out_result->gauge_augmented = production_string_equals(
+        problem.gauge_policy,
+        "mean_zero_augmented");
+    out_result->q_layout_interleaved_node_component =
+        production_string_equals(problem.assembly_kind, "mfem_weak_form_shared_domain");
+
+#if !FULLMAG_FEM_WITH_SLEPC
+    copy_message(
+        out_result->error_message,
+        sizeof(out_result->error_message),
+        "production shared-domain K0 Schur eigensolver requires PETSc/SLEPc");
+    out_result->status = FrequencyDomainStatus::unavailable;
+    std::snprintf(
+        out_result->diagnostics_json,
+        sizeof(out_result->diagnostics_json),
+        "{\"schema_version\":\"poisson_airbox_modal_eigen_schur_slepc.v1\","
+        "\"status\":\"unavailable\",\"reason\":\"slepc_not_available\","
+        "\"solver_adapter\":\"k0_poisson_airbox_cpu_schur_slepc\","
+        "\"cpu_fallback\":\"disabled\"}");
+    return out_result->status;
+#else
+#if defined(PETSC_USE_COMPLEX)
+    return fail_production_schur(
+        problem,
+        out_result,
+        FrequencyDomainStatus::unavailable,
+        "production shared-domain K0 Schur lane requires a real PETSc scalar runtime",
+        "complex_petsc_scalar_unsupported");
+#else
+    const auto petsc_integer_max = static_cast<std::uint64_t>(
+        std::numeric_limits<PetscInt>::max());
+    if (static_cast<std::uint64_t>(problem.max_linear_iterations) > petsc_integer_max ||
+        static_cast<std::uint64_t>(problem.max_outer_iterations) > petsc_integer_max) {
+        return fail_production_schur(problem, out_result,
+            FrequencyDomainStatus::validation_error,
+            "production K0 Schur iteration budget exceeds the PETSc integer range",
+            "k0_modal_iteration_budget_out_of_range");
+    }
+    const double default_eigensolver_tolerance =
+        production_modal_eigensolver_tolerance(problem.residual_tolerance);
+    const ModalKrylovTuning default_tuning{
+        default_eigensolver_tolerance,
+        std::max(1.0e-13, std::min(1.0e-10,
+            1.0e-3 * default_eigensolver_tolerance)),
+        256,
+        "gmres"};
+    ModalKrylovTuning resolved_tuning{};
+    if (!resolve_modal_krylov_tuning(default_tuning, false, &resolved_tuning)) {
+        return fail_production_schur(
+            problem, out_result, FrequencyDomainStatus::validation_error,
+            "production K0 Schur diagnostic Krylov options are invalid",
+            "k0_modal_krylov_option_invalid");
+    }
+    if (problem.requested_mode_count == 0u) {
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::validation_error,
+            "production shared-domain K0 Schur eigensolver requires requested_mode_count > 0",
+            "poisson_airbox_eigen_invalid_requested_mode_count");
+    }
+    const bool nearest_target = production_string_equals(
+        problem.target_kind,
+        "nearest_frequency");
+    const bool frequency_window_target = production_string_equals(
+        problem.target_kind,
+        "frequency_window");
+    if (!nearest_target && !frequency_window_target) {
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::validation_error,
+            "production shared-domain K0 Schur eigensolver requires a supported target_kind",
+            problem.target_kind == nullptr
+                ? "poisson_airbox_eigen_missing_target_kind"
+                : "poisson_airbox_eigen_unsupported_target_kind");
+    }
+    if (!std::isfinite(problem.target_frequency_hz) ||
+        problem.target_frequency_hz < 0.0 ||
+        !std::isfinite(problem.frequency_min_hz) ||
+        !std::isfinite(problem.frequency_max_hz) ||
+        problem.frequency_min_hz < 0.0 ||
+        problem.frequency_max_hz < 0.0 ||
+        (frequency_window_target &&
+         !(problem.frequency_max_hz > problem.frequency_min_hz)) ||
+        (frequency_window_target && problem.target_frequency_hz != 0.0 &&
+         (problem.target_frequency_hz < problem.frequency_min_hz ||
+          problem.target_frequency_hz > problem.frequency_max_hz))) {
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::validation_error,
+            "production shared-domain K0 Schur eigensolver received an invalid target frequency",
+            "poisson_airbox_eigen_invalid_frequency_window");
+    }
+    const bool requested_frequency_window =
+        problem.target_kind != nullptr &&
+        std::strcmp(problem.target_kind, "frequency_window") == 0;
+    if (requested_frequency_window &&
+        problem.frequency_min_hz >= 0.0 &&
+        problem.frequency_max_hz > problem.frequency_min_hz) {
+        const std::lock_guard<std::mutex> window_lock(
+            fullmag::fem::runtime::petsc_slepc_process_mutex());
+        if (fullmag::fem::runtime::petsc_slepc_process_is_unsafe_locked()) {
+            out_result->slepc_process_quarantined = true;
+            return fail_production_schur(
+                problem, out_result, FrequencyDomainStatus::solve_error,
+                "PETSc/SLEPc graph is quarantined; process restart required",
+                "petsc_runtime_unsafe");
+        }
+        if (production_k0_slepc_process_quarantined()) {
+            out_result->slepc_process_quarantined = true;
+            return fail_production_schur(
+                problem,
+                out_result,
+                FrequencyDomainStatus::solve_error,
+                "production K0 SLEPc graph is quarantined; process restart required",
+                "k0_slepc_process_quarantined");
+        }
+        if (!ensure_slepc_initialized(out_result->error_message)) {
+            return fail_production_schur(
+                problem,
+                out_result,
+                FrequencyDomainStatus::solve_error,
+                out_result->error_message,
+                "slepc_initialization_failed");
+        }
+        ProductionCpuOperatorContextOwner window_operator_context_owner(
+            new (std::nothrow) ProductionCpuOperatorContext{},
+            ProductionCpuOperatorContextDeleter{});
+        if (!window_operator_context_owner) {
+            return fail_production_schur(
+                problem,
+                out_result,
+                FrequencyDomainStatus::operator_error,
+                "production K0 window operator context allocation failed",
+                "production_operator_context_allocation_failed");
+        }
+        ProductionCpuOperatorContext &window_operator_context =
+            *window_operator_context_owner;
+        ProductionCpuWindowOperatorScope window_operator_scope{
+            active_cpu_window_operator_context};
+        active_cpu_window_operator_context = &window_operator_context;
+        copy_message(
+            out_result->operator_context_scope,
+            sizeof(out_result->operator_context_scope),
+            "frequency_window");
+        struct WindowCandidate {
+            PoissonAirboxModalEigenResult::AcceptedMode mode{};
+            std::uint32_t pass_index = 0;
+        };
+        // Keep one heap-owned result template for the final aggregate.  A
+        // complete modal result contains large fixed diagnostic buffers; the
+        // previous per-candidate `source` copy multiplied that storage by the
+        // number of modes retained across all 50 subwindows.
+        auto window_template_storage =
+            std::make_unique<PoissonAirboxModalEigenResult>();
+        bool window_template_initialized = false;
+        std::vector<WindowCandidate> window_candidates;
+        constexpr std::uint32_t base_subwindow_count = 16u;
+        constexpr std::uint32_t refinement_partition_count = 32u;
+        constexpr std::uint32_t refinement_subwindow_count =
+            refinement_partition_count + 2u;
+        constexpr std::uint32_t pass_count = 2u;
+        constexpr double cluster_frequency_relative_tolerance = 1.0e-8;
+        constexpr double cluster_frequency_absolute_tolerance_hz = 1.0;
+        constexpr double subspace_overlap_threshold = 1.0 - 1.0e-6;
+        const std::uint64_t split_dimension = 2u * problem.q_dof_count;
+        const std::uint64_t maximum_nev = split_dimension > 0u
+            ? split_dimension - 1u
+            : 0u;
+        const auto resolved_nev = [maximum_nev](std::uint32_t requested_count) {
+            return std::min<std::uint64_t>(
+                maximum_nev,
+                4u * static_cast<std::uint64_t>(requested_count));
+        };
+        const auto resolved_ncv = [split_dimension](std::uint64_t nev) {
+            return bounded_krylov_dimensions(split_dimension, nev, true).ncv;
+        };
+        if (problem.requested_mode_count >
+                std::numeric_limits<std::uint32_t>::max() / 4u ||
+            maximum_nev == 0u) {
+            return fail_production_schur(
+                problem,
+                out_result,
+                FrequencyDomainStatus::validation_error,
+                "production shared-domain K0 Schur frequency window cannot form a guarded nev",
+                "poisson_airbox_eigen_invalid_requested_mode_count");
+        }
+        const std::uint32_t refined_requested_mode_count =
+            std::min<std::uint32_t>(
+                std::numeric_limits<std::uint32_t>::max() / 4u,
+                problem.requested_mode_count <=
+                        std::numeric_limits<std::uint32_t>::max() / 2u
+                    ? 2u * problem.requested_mode_count
+                    : std::numeric_limits<std::uint32_t>::max() / 4u);
+        // A frequency window is assembled from many local shifts.  Asking
+        // every shift for the complete global mode count is needlessly
+        // expensive on the production Schur MatShell (each extra Ritz pair
+        // drives more GMRES/Poisson applications).  Start with a bounded
+        // local request and grow it only when the local accepted set fills
+        // the request.  The final certificate records the effective request;
+        // a saturated local solve is never silently treated as complete.
+        const std::uint32_t base_window_requested_mode_count =
+            std::min<std::uint32_t>(problem.requested_mode_count, 2u);
+        const std::uint32_t refinement_window_requested_mode_count =
+            std::min<std::uint32_t>(refined_requested_mode_count, 4u);
+        std::uint64_t requested_nev =
+            resolved_nev(base_window_requested_mode_count);
+        std::uint64_t refined_nev =
+            resolved_nev(refinement_window_requested_mode_count);
+        std::array<std::uint32_t, pass_count>
+            pass_effective_requested_mode_count{
+                base_window_requested_mode_count,
+                refinement_window_requested_mode_count};
+        std::array<std::uint32_t, pass_count> pass_planned_subwindow_count{
+            base_subwindow_count,
+            refinement_subwindow_count};
+        std::array<std::uint32_t, pass_count> pass_completed_subwindow_count{};
+        std::array<std::uint32_t, pass_count> pass_failed_subwindow_count{};
+        std::array<bool, pass_count> pass_cancelled{};
+        std::array<std::uint32_t, pass_count>
+            pass_local_coverage_uncertified_count{};
+        std::uint64_t converged_total = 0;
+        std::uint64_t finite_real_total = 0;
+        std::uint64_t positive_total = 0;
+        std::uint64_t residual_evaluated_total = 0;
+        std::uint64_t action_residual_evaluation_failed_total = 0;
+        std::uint64_t q_vector_extraction_failed_total = 0;
+        std::uint64_t full_vector_reconstruction_failed_total = 0;
+        std::uint64_t full_vector_nonfinite_total = 0;
+        std::uint64_t reconstructed_total = 0;
+        std::uint64_t full_residual_evaluation_failed_total = 0;
+        std::uint64_t full_residual_rejected_total = 0;
+        std::uint64_t full_residual_accepted_total = 0;
+        std::uint64_t outer_iterations_total = 0;
+        bool window_interrupted = false;
+        bool window_failed = false;
+        bool window_local_coverage_failed = false;
+        char window_failure_reason[96]{};
+        std::uint32_t window_empty_subwindow_count = 0;
+        out_result->window_subwindow_count =
+            base_subwindow_count + refinement_subwindow_count;
+        out_result->window_completed_subwindow_count = 0;
+        out_result->window_failed_subwindow_count = 0;
+        out_result->window_empty_subwindow_count = 0;
+        out_result->window_complete = false;
+        // This schedule can be hundreds of KiB. Keep it off the caller's
+        // (often Rust worker) stack, where it otherwise combines with the
+        // large modal result records and can overflow a 2 MiB thread stack.
+        std::vector<char> executed_subwindows_json(
+            sizeof(out_result->executed_subwindows_json),
+            '\0');
+        std::size_t executed_subwindows_size = 1u;
+        executed_subwindows_json[0] = '[';
+        bool subwindow_json_complete = true;
+        auto append_subwindow_json = [&](const char *format, auto... values) {
+            if (!subwindow_json_complete ||
+                executed_subwindows_size >= executed_subwindows_json.size()) {
+                subwindow_json_complete = false;
+                return;
+            }
+            const int written = std::snprintf(
+                executed_subwindows_json.data() + executed_subwindows_size,
+                executed_subwindows_json.size() - executed_subwindows_size,
+                format,
+                values...);
+            if (written < 0 ||
+                static_cast<std::size_t>(written) >=
+                    executed_subwindows_json.size() - executed_subwindows_size) {
+                subwindow_json_complete = false;
+                return;
+            }
+            executed_subwindows_size += static_cast<std::size_t>(written);
+        };
+        auto finalize_subwindow_json = [&]() {
+            append_subwindow_json("%s", "]");
+            if (!subwindow_json_complete) {
+                std::snprintf(
+                    executed_subwindows_json.data(),
+                    executed_subwindows_json.size(),
+                    "[{\"status\":\"diagnostics_truncated\"}]");
+            }
+            copy_message(
+                out_result->executed_subwindows_json,
+                sizeof(out_result->executed_subwindows_json),
+                executed_subwindows_json.data());
+        };
+        const double window_width = problem.frequency_max_hz - problem.frequency_min_hz;
+        const double refinement_spacing =
+            window_width / static_cast<double>(refinement_partition_count);
+        const double base_spacing =
+            window_width / static_cast<double>(base_subwindow_count);
+        const double refinement_first_shift_hz =
+            problem.frequency_min_hz - 0.5 * refinement_spacing;
+        const double refinement_last_shift_hz =
+            problem.frequency_max_hz + 0.5 * refinement_spacing;
+        const double lower_coverage_margin_hz =
+            problem.frequency_min_hz - refinement_first_shift_hz;
+        const double upper_coverage_margin_hz =
+            refinement_last_shift_hz - problem.frequency_max_hz;
+        const auto window_started_at = std::chrono::steady_clock::now();
+        for (std::uint32_t pass_index = 0;
+             pass_index < pass_count && !window_interrupted;
+             ++pass_index) {
+            const std::uint32_t subwindow_count =
+                pass_planned_subwindow_count[pass_index];
+            const std::uint32_t pass_initial_requested_mode_count =
+                pass_index == 0u
+                    ? base_window_requested_mode_count
+                    : std::min<std::uint32_t>(
+                          refined_requested_mode_count,
+                          std::max<std::uint32_t>(
+                              refinement_window_requested_mode_count,
+                              pass_effective_requested_mode_count[0] + 1u));
+            pass_effective_requested_mode_count[pass_index] = std::max(
+                pass_effective_requested_mode_count[pass_index],
+                pass_initial_requested_mode_count);
+            for (std::uint32_t subwindow_index = 0;
+                 subwindow_index < subwindow_count;
+                 ++subwindow_index) {
+                const auto subwindow_started_at = std::chrono::steady_clock::now();
+                const std::uint32_t current_subwindow =
+                    1u + (pass_index == 0u
+                              ? subwindow_index
+                              : base_subwindow_count + subwindow_index);
+                PoissonAirboxEigenBlockProblem shifted_problem = problem;
+                shifted_problem.target_kind = "nearest_frequency";
+                shifted_problem.target_frequency_hz = pass_index == 0u
+                    ? problem.frequency_min_hz +
+                        (static_cast<double>(subwindow_index) + 0.5) *
+                            window_width /
+                            static_cast<double>(base_subwindow_count)
+                    : problem.frequency_min_hz +
+                        (static_cast<double>(subwindow_index) - 0.5) *
+                            refinement_spacing;
+                const std::uint32_t maximum_subwindow_requested_mode_count =
+                    pass_index == 0u
+                        ? problem.requested_mode_count
+                        : refined_requested_mode_count;
+                std::uint32_t subwindow_requested_mode_count =
+                    pass_initial_requested_mode_count;
+                const double local_half_width_hz = pass_index == 0u
+                    ? 0.5 * base_spacing
+                    : refinement_spacing;
+                const double local_frequency_min_hz = std::max(
+                    problem.frequency_min_hz,
+                    shifted_problem.target_frequency_hz - local_half_width_hz);
+                const double local_frequency_max_hz = std::min(
+                    problem.frequency_max_hz,
+                    shifted_problem.target_frequency_hz + local_half_width_hz);
+                const double required_local_coverage_radius_hz = std::max(
+                    std::abs(
+                        local_frequency_min_hz -
+                        shifted_problem.target_frequency_hz),
+                    std::abs(
+                        local_frequency_max_hz -
+                        shifted_problem.target_frequency_hz));
+                // Preserve discovered interior modes before the global window
+                // selects clusters; endpoint guards cannot recover capped modes.
+                shifted_problem.retain_window_discovery_pool = true;
+                shifted_problem.progress_window_phase =
+                    pass_index == 0u ? "base" : "refinement";
+                shifted_problem.progress_current_subwindow = current_subwindow;
+                shifted_problem.progress_total_subwindows =
+                    base_subwindow_count + refinement_subwindow_count;
+                shifted_problem.progress_subwindow_elapsed_seconds = 0.0;
+                shifted_problem.progress_window_elapsed_seconds =
+                    std::chrono::duration<double>(
+                        subwindow_started_at - window_started_at)
+                        .count();
+                poisson_airbox_modal_emit_progress(
+                    shifted_problem,
+                    pass_index == 0u
+                        ? "frequency_window_base_subwindow"
+                        : "frequency_window_refinement_subwindow",
+                    "production_cpu",
+                    0u,
+                    0u,
+                    0u,
+                    0u,
+                    std::numeric_limits<double>::quiet_NaN());
+                auto shifted_result_storage =
+                    std::make_unique<PoissonAirboxModalEigenResult>();
+                FrequencyDomainStatus shifted_status =
+                    FrequencyDomainStatus::solve_error;
+                std::uint32_t subwindow_retry_count = 0u;
+                std::size_t final_local_accepted_mode_count = 0u;
+                double final_selected_coverage_radius_hz = 0.0;
+                double final_selected_frequency_min_hz = 0.0;
+                double final_selected_frequency_max_hz = 0.0;
+                bool final_result_truncated_at_requested_count = false;
+                bool final_lower_edge_covered = false;
+                bool final_upper_edge_covered = false;
+                bool final_rejection_stage_clean = false;
+                bool final_raw_ritz_pool_saturated = false;
+                bool final_accepted_candidate_pool_saturated = false;
+                bool final_candidate_pool_saturated = false;
+                bool final_split_spectrum_exhausted = false;
+                bool final_request_limit_reached = false;
+                bool final_nev_limit_reached = false;
+                std::uint64_t final_rejection_stage_count = 0u;
+                bool final_local_coverage_certified = false;
+                for (;;) {
+                    shifted_problem.requested_mode_count =
+                        subwindow_requested_mode_count;
+                    const auto attempt_started_at = std::chrono::steady_clock::now();
+                    shifted_problem.progress_subwindow_elapsed_seconds =
+                        std::chrono::duration<double>(attempt_started_at - subwindow_started_at)
+                            .count();
+                    shifted_problem.progress_window_elapsed_seconds =
+                        std::chrono::duration<double>(attempt_started_at - window_started_at)
+                            .count();
+                    shifted_result_storage =
+                        std::make_unique<PoissonAirboxModalEigenResult>();
+                    shifted_status = solve_poisson_airbox_modal_eigen_cpu_schur(
+                        shifted_problem,
+                        shifted_result_storage.get());
+                    if (window_operator_context.invalidated) {
+                        break;
+                    }
+                    const PoissonAirboxModalEigenResult &attempted_result =
+                        *shifted_result_storage;
+                    std::size_t local_accepted_mode_count = 0u;
+                    double selected_coverage_radius_hz = 0.0;
+                    double selected_frequency_min_hz =
+                        std::numeric_limits<double>::infinity();
+                    double selected_frequency_max_hz =
+                        -std::numeric_limits<double>::infinity();
+                    for (const PoissonAirboxModalEigenResult::AcceptedMode &mode :
+                         attempted_result.accepted_modes) {
+                        const double local_tolerance_hz = std::max(
+                            1.0,
+                            1.0e-8 * std::max({
+                                std::abs(mode.frequency_hz),
+                                std::abs(local_frequency_min_hz),
+                                std::abs(local_frequency_max_hz)}));
+                        if (mode.frequency_hz >=
+                                local_frequency_min_hz - local_tolerance_hz &&
+                            mode.frequency_hz <=
+                                local_frequency_max_hz + local_tolerance_hz) {
+                            ++local_accepted_mode_count;
+                        }
+                        selected_coverage_radius_hz = std::max(
+                            selected_coverage_radius_hz,
+                            std::abs(
+                                mode.frequency_hz -
+                                shifted_problem.target_frequency_hz));
+                        selected_frequency_min_hz = std::min(
+                            selected_frequency_min_hz,
+                            mode.frequency_hz);
+                        selected_frequency_max_hz = std::max(
+                            selected_frequency_max_hz,
+                            mode.frequency_hz);
+                    }
+                    // Publication truncation and positive-branch filtering
+                    // must not discard an independently certified lower guard
+                    // below the fundamental positive frequency.
+                    for (double guard_frequency_hz :
+                         attempted_result.certified_spectral_guard_frequencies_hz) {
+                        selected_frequency_min_hz = std::min(
+                            selected_frequency_min_hz, guard_frequency_hz);
+                        selected_frequency_max_hz = std::max(
+                            selected_frequency_max_hz, guard_frequency_hz);
+                        selected_coverage_radius_hz = std::max(
+                            selected_coverage_radius_hz,
+                            std::abs(guard_frequency_hz -
+                                     shifted_problem.target_frequency_hz));
+                    }
+                    const double local_coverage_tolerance_hz = std::max(
+                        1.0,
+                        1.0e-8 * std::max({
+                            std::abs(shifted_problem.target_frequency_hz),
+                            std::abs(local_frequency_min_hz),
+                            std::abs(local_frequency_max_hz),
+                            required_local_coverage_radius_hz}));
+                    const std::uint64_t attempted_nev =
+                        resolved_nev(subwindow_requested_mode_count);
+                    const bool accepted_result_truncated_at_requested_count =
+                        shifted_status == FrequencyDomainStatus::ok &&
+                        (attempted_result.accepted_modes.size() >=
+                             subwindow_requested_mode_count ||
+                         attempted_result.full_residual_accepted_count >=
+                             subwindow_requested_mode_count);
+                    const bool raw_ritz_result_truncated_at_requested_count =
+                        shifted_status == FrequencyDomainStatus::ok &&
+                        attempted_result.converged_eigenpair_count >=
+                            attempted_nev;
+                    // EPS can converge more Ritz pairs than the requested
+                    // NEV.  On a small contract fixture, reaching the full
+                    // split operator dimension is an exhaustive spectrum,
+                    // not a truncated candidate pool.  Production meshes are
+                    // far larger than the bounded local NEV, so they must
+                    // still prove both local edges independently.
+                    const bool split_spectrum_exhausted =
+                        shifted_status == FrequencyDomainStatus::ok &&
+                        static_cast<std::uint64_t>(
+                            attempted_result.converged_eigenpair_count) ==
+                            split_dimension;
+                    const bool result_truncated_at_requested_count =
+                        !split_spectrum_exhausted &&
+                        (accepted_result_truncated_at_requested_count ||
+                         raw_ritz_result_truncated_at_requested_count);
+                    const bool request_limit_reached =
+                        subwindow_requested_mode_count >=
+                            maximum_subwindow_requested_mode_count;
+                    const bool nev_limit_reached =
+                        attempted_nev >= maximum_nev;
+                    const bool selected_frequency_range_available =
+                        (!attempted_result.accepted_modes.empty() ||
+                         !attempted_result.certified_spectral_guard_frequencies_hz.empty()) &&
+                        std::isfinite(selected_frequency_min_hz) &&
+                        std::isfinite(selected_frequency_max_hz);
+                    const bool lower_edge_covered =
+                        selected_frequency_range_available &&
+                        selected_frequency_min_hz <=
+                            local_frequency_min_hz +
+                                local_coverage_tolerance_hz;
+                    const bool upper_edge_covered =
+                        selected_frequency_range_available &&
+                        selected_frequency_max_hz +
+                                local_coverage_tolerance_hz >=
+                            local_frequency_max_hz;
+                    // A rejected or unreadable converged Ritz pair can hide a
+                    // physical mode inside the local interval.  Its frequency
+                    // is not always recoverable after the failing stage, so
+                    // completeness must stay fail-closed rather than treating
+                    // a short accepted list as proof that the spectrum ended.
+                    const std::uint64_t rejection_stage_count =
+                        static_cast<std::uint64_t>(
+                            attempted_result.raw_ritz_retrieval_failed_count) +
+                        attempted_result.raw_ritz_nonfinite_count +
+                        attempted_result.raw_ritz_complex_rejected_count +
+                        attempted_result.action_residual_evaluation_failed_count +
+                        attempted_result.q_vector_extraction_failed_count +
+                        attempted_result.full_vector_reconstruction_failed_count +
+                        attempted_result.full_vector_nonfinite_count +
+                        attempted_result.full_residual_evaluation_failed_count +
+                        attempted_result.full_residual_rejected_count;
+                    const bool rejection_stage_clean =
+                        rejection_stage_count == 0u;
+                    const bool local_coverage_certified =
+                        shifted_status == FrequencyDomainStatus::ok &&
+                        rejection_stage_clean &&
+                        (!result_truncated_at_requested_count ||
+                         (lower_edge_covered && upper_edge_covered));
+                    final_local_accepted_mode_count =
+                        local_accepted_mode_count;
+                    final_selected_coverage_radius_hz =
+                        selected_coverage_radius_hz;
+                    final_selected_frequency_min_hz =
+                        selected_frequency_range_available
+                            ? selected_frequency_min_hz
+                            : 0.0;
+                    final_selected_frequency_max_hz =
+                        selected_frequency_range_available
+                            ? selected_frequency_max_hz
+                            : 0.0;
+                    final_result_truncated_at_requested_count =
+                        result_truncated_at_requested_count;
+                    final_lower_edge_covered = lower_edge_covered;
+                    final_upper_edge_covered = upper_edge_covered;
+                    final_rejection_stage_clean = rejection_stage_clean;
+                    final_raw_ritz_pool_saturated =
+                        raw_ritz_result_truncated_at_requested_count;
+                    final_accepted_candidate_pool_saturated =
+                        accepted_result_truncated_at_requested_count;
+                    final_candidate_pool_saturated =
+                        result_truncated_at_requested_count;
+                    final_split_spectrum_exhausted =
+                        split_spectrum_exhausted;
+                    final_request_limit_reached = request_limit_reached;
+                    final_nev_limit_reached = nev_limit_reached;
+                    final_rejection_stage_count = rejection_stage_count;
+                    final_local_coverage_certified =
+                        local_coverage_certified;
+                    const bool local_request_saturated =
+                        shifted_status == FrequencyDomainStatus::ok &&
+                        !local_coverage_certified &&
+                        (result_truncated_at_requested_count ||
+                         rejection_stage_count > 0u) &&
+                        !request_limit_reached &&
+                        !nev_limit_reached;
+                    if (!local_request_saturated) {
+                        break;
+                    }
+                    const std::uint32_t next_requested_mode_count =
+                        std::min<std::uint32_t>(
+                            maximum_subwindow_requested_mode_count,
+                            std::max<std::uint32_t>(
+                                subwindow_requested_mode_count + 1u,
+                                subwindow_requested_mode_count * 2u));
+                    if (next_requested_mode_count <= subwindow_requested_mode_count) {
+                        break;
+                    }
+                    if (resolved_nev(next_requested_mode_count) <= attempted_nev) {
+                        final_nev_limit_reached = true;
+                        break;
+                    }
+                    subwindow_requested_mode_count = next_requested_mode_count;
+                    pass_effective_requested_mode_count[pass_index] =
+                        std::max(
+                            pass_effective_requested_mode_count[pass_index],
+                            subwindow_requested_mode_count);
+                    ++subwindow_retry_count;
+                }
+                if (window_operator_context.invalidated) {
+                    const PoissonAirboxModalEigenResult &failed_result =
+                        *shifted_result_storage;
+                    const bool failure_interrupted =
+                        shifted_status == FrequencyDomainStatus::interrupted;
+                    const char *failure_stop_reason =
+                        failure_interrupted ? "cancel_requested" : "slepc_solve_failed";
+                    ++pass_failed_subwindow_count[pass_index];
+                    ++out_result->window_failed_subwindow_count;
+                    pass_cancelled[pass_index] = failure_interrupted;
+                    window_failed = true;
+                    window_interrupted = failure_interrupted;
+                    out_result->window_subwindow_count =
+                        base_subwindow_count + refinement_subwindow_count;
+                    out_result->window_failed_subwindow = true;
+                    out_result->window_cancelled = failure_interrupted;
+                    out_result->window_complete = false;
+                    out_result->window_empty_subwindow_count =
+                        window_empty_subwindow_count;
+                    out_result->operator_context_setup_count =
+                        window_operator_context.operator_context_setup_count;
+                    out_result->poisson_factorization_setup_count =
+                        window_operator_context.poisson_factorization_setup_count;
+                    out_result->shift_solver_setup_count =
+                        window_operator_context.shift_solver_setup_count;
+                    out_result->operator_apply_count =
+                        window_operator_context.schur.operator_apply_count;
+                    out_result->poisson_solve_count =
+                        window_operator_context.schur.poisson_solve_count;
+                    out_result->poisson_iteration_count =
+                        window_operator_context.schur.poisson_iteration_count;
+                    out_result->outer_iterations = 0u;
+                    out_result->converged_eigenpair_count = 0u;
+                    out_result->accepted_mode_count = 0u;
+                    out_result->accepted_modes.clear();
+                    out_result->certified_spectral_guard_frequencies_hz.clear();
+                    out_result->slepc_process_quarantined = true;
+                    fullmag::fem::runtime::mark_petsc_slepc_process_unsafe_locked();
+                    out_result->operator_context_invalidated = true;
+                    out_result->eps_lifetime_unsafe = true;
+                    out_result->eps_solve_error_code_available =
+                        failed_result.eps_solve_error_code_available;
+                    out_result->eps_solve_error_code =
+                        failed_result.eps_solve_error_code;
+                    out_result->eps_solve_timing_available =
+                        failed_result.eps_solve_timing_available;
+                    out_result->eps_solve_seconds =
+                        failed_result.eps_solve_seconds;
+                    out_result->eps_reason_available = false;
+                    out_result->eps_stop_reason[0] = '\0';
+                    copy_message(
+                        out_result->eps_stop_reason,
+                        sizeof(out_result->eps_stop_reason),
+                        failure_stop_reason);
+                    copy_message(
+                        out_result->stop_reason,
+                        sizeof(out_result->stop_reason),
+                        failure_stop_reason);
+                    copy_message(
+                        out_result->operator_context_scope,
+                        sizeof(out_result->operator_context_scope),
+                        "frequency_window");
+                    copy_message(
+                        out_result->configured_shifted_ksp_type,
+                        sizeof(out_result->configured_shifted_ksp_type),
+                        failed_result.configured_shifted_ksp_type);
+                    copy_message(
+                        out_result->modal_krylov_tuning_json,
+                        sizeof(out_result->modal_krylov_tuning_json),
+                        failed_result.modal_krylov_tuning_json);
+                    out_result->k0_demag_operator_probe =
+                        window_operator_context.k0_demag_operator_probe;
+                    copy_exact_cache_observability(
+                        window_operator_context,
+                        out_result);
+                    out_result->window_certificate_json[0] = '\0';
+                    const int failure_code =
+                        static_cast<int>(failed_result.eps_solve_error_code);
+                    char termination_fields_json[128]{};
+                    const bool termination_fields_formatted =
+                        format_poisson_airbox_subwindow_termination_json(
+                            failed_result,
+                            termination_fields_json,
+                            sizeof(termination_fields_json));
+                    append_subwindow_json(
+                        "%s{\"pass\":\"%s\",\"subwindow_index\":%u,"
+                        "\"status\":\"failed\",\"stop_reason\":\"%s\","
+                        "\"eps_solve_error_code_available\":%s,"
+                        "\"eps_solve_error_code\":%d,"
+                        "%s,"
+                        "\"slepc_process_quarantined\":true,"
+                        "\"operator_context_invalidated\":true,"
+                        "\"eps_lifetime_unsafe\":true,"
+                        "\"accepted_mode_count\":0,"
+                        "\"window_complete\":false}",
+                        executed_subwindows_size == 1u ? "" : ",",
+                        pass_index == 0u ? "base" : "refinement",
+                        subwindow_index,
+                        failure_stop_reason,
+                        failed_result.eps_solve_error_code_available
+                            ? "true" : "false",
+                        failure_code,
+                        termination_fields_formatted
+                            ? termination_fields_json
+                            : "\"eps_reason_available\":false,"
+                              "\"slepc_converged_reason_code\":null,"
+                              "\"outer_iterations\":null");
+                    finalize_subwindow_json();
+                    return fail_production_schur(
+                        problem,
+                        out_result,
+                        shifted_status,
+                        failed_result.error_message[0] != '\0'
+                            ? failed_result.error_message
+                            : "production K0 EPSSolve failed and its graph was quarantined",
+                        failure_stop_reason);
+                }
+                pass_effective_requested_mode_count[pass_index] = std::max(
+                    pass_effective_requested_mode_count[pass_index],
+                    subwindow_requested_mode_count);
+                PoissonAirboxModalEigenResult &shifted_result =
+                    *shifted_result_storage;
+                const bool subwindow_coverage_uncertified =
+                    shifted_status == FrequencyDomainStatus::ok &&
+                    !final_local_coverage_certified;
+                if (subwindow_coverage_uncertified) {
+                    ++pass_local_coverage_uncertified_count[pass_index];
+                }
+                // The lower-NEV base pass is intentionally exploratory.  A
+                // clean but one-sided base interval is allowed only as an
+                // explicit deferral to the higher-NEV overlapping refinement
+                // pass.  Rejected Ritz evidence is fatal in either pass, and
+                // unresolved refinement coverage is always fatal.
+                const bool coverage_deferred_to_refinement =
+                    pass_index == 0u &&
+                    subwindow_coverage_uncertified &&
+                    final_rejection_stage_clean;
+                const bool subwindow_coverage_failed =
+                    subwindow_coverage_uncertified &&
+                    (!final_rejection_stage_clean || pass_index != 0u);
+                const auto subwindow_finished_at = std::chrono::steady_clock::now();
+                const double subwindow_elapsed_seconds =
+                    std::chrono::duration<double>(
+                        subwindow_finished_at - subwindow_started_at)
+                        .count();
+                shifted_problem.progress_subwindow_elapsed_seconds =
+                    subwindow_elapsed_seconds;
+                shifted_problem.progress_window_elapsed_seconds =
+                    std::chrono::duration<double>(
+                        subwindow_finished_at - window_started_at)
+                        .count();
+                poisson_airbox_modal_emit_progress(
+                    shifted_problem,
+                    "frequency_window_subwindow_complete",
+                    "production_cpu",
+                    shifted_result.outer_iterations,
+                    shifted_result.raw_ritz_in_window_count,
+                    shifted_result.accepted_mode_count,
+                    static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                        shifted_result.poisson_iteration_count,
+                        std::numeric_limits<std::uint32_t>::max())),
+                    shifted_result.eigen_residual_relative);
+                out_result->operator_context_setup_count =
+                    window_operator_context.operator_context_setup_count;
+                out_result->poisson_factorization_setup_count =
+                    window_operator_context.poisson_factorization_setup_count;
+                out_result->shift_solver_setup_count =
+                    window_operator_context.shift_solver_setup_count;
+                converged_total += shifted_result.converged_eigenpair_count;
+                finite_real_total += shifted_result.finite_real_eigenpair_count;
+                positive_total += shifted_result.positive_frequency_eigenpair_count;
+                residual_evaluated_total +=
+                    shifted_result.action_residual_evaluated_count;
+                action_residual_evaluation_failed_total +=
+                    shifted_result.action_residual_evaluation_failed_count;
+                q_vector_extraction_failed_total +=
+                    shifted_result.q_vector_extraction_failed_count;
+                full_vector_reconstruction_failed_total +=
+                    shifted_result.full_vector_reconstruction_failed_count;
+                full_vector_nonfinite_total +=
+                    shifted_result.full_vector_nonfinite_count;
+                reconstructed_total += shifted_result.reconstructed_mode_count;
+                full_residual_evaluation_failed_total +=
+                    shifted_result.full_residual_evaluation_failed_count;
+                full_residual_rejected_total +=
+                    shifted_result.full_residual_rejected_count;
+                full_residual_accepted_total +=
+                    shifted_result.full_residual_accepted_count;
+                outer_iterations_total += shifted_result.outer_iterations;
+                std::vector<const PoissonAirboxModalEigenResult::AcceptedMode *>
+                    in_window_modes;
+                in_window_modes.reserve(shifted_result.accepted_modes.size());
+                for (const PoissonAirboxModalEigenResult::AcceptedMode &mode :
+                     shifted_result.accepted_modes) {
+                    if (mode.frequency_hz >= problem.frequency_min_hz &&
+                        mode.frequency_hz <= problem.frequency_max_hz) {
+                        in_window_modes.push_back(&mode);
+                    }
+                }
+                const std::uint64_t resolved_subwindow_nev =
+                    resolved_nev(subwindow_requested_mode_count);
+                const std::uint64_t resolved_subwindow_ncv =
+                    resolved_ncv(resolved_subwindow_nev);
+                char subwindow_exact_dimension_json[32]{};
+                char subwindow_exact_column_count_json[32]{};
+                char subwindow_exact_poisson_solve_count_json[32]{};
+                char subwindow_split_dof_count_json[32]{};
+                char subwindow_exact_construction_seconds_json[64]{};
+                char subwindow_shifted_setup_seconds_json[64]{};
+                char subwindow_eps_solve_seconds_json[64]{};
+                format_nullable_u64_json(
+                    subwindow_exact_dimension_json,
+                    sizeof(subwindow_exact_dimension_json),
+                    shifted_result.exact_preconditioner_dimension_available,
+                    shifted_result.exact_preconditioner_dimension);
+                format_nullable_u64_json(
+                    subwindow_exact_column_count_json,
+                    sizeof(subwindow_exact_column_count_json),
+                    shifted_result.exact_preconditioner_column_count_available,
+                    shifted_result.exact_preconditioner_column_count);
+                format_nullable_u64_json(
+                    subwindow_exact_poisson_solve_count_json,
+                    sizeof(subwindow_exact_poisson_solve_count_json),
+                    shifted_result.exact_preconditioner_construction_metrics_available,
+                    shifted_result.exact_preconditioner_construction_poisson_solve_count);
+                format_nullable_u64_json(
+                    subwindow_split_dof_count_json,
+                    sizeof(subwindow_split_dof_count_json),
+                    shifted_result.split_dof_count_available,
+                    shifted_result.split_dof_count);
+                format_nullable_double_json(
+                    subwindow_exact_construction_seconds_json,
+                    sizeof(subwindow_exact_construction_seconds_json),
+                    shifted_result.exact_preconditioner_construction_timing_available,
+                    shifted_result.exact_preconditioner_construction_seconds);
+                format_nullable_double_json(
+                    subwindow_shifted_setup_seconds_json,
+                    sizeof(subwindow_shifted_setup_seconds_json),
+                    shifted_result.shifted_preconditioner_setup_timing_available,
+                    shifted_result.shifted_preconditioner_setup_seconds);
+                format_nullable_double_json(
+                    subwindow_eps_solve_seconds_json,
+                    sizeof(subwindow_eps_solve_seconds_json),
+                    shifted_result.eps_solve_timing_available,
+                    shifted_result.eps_solve_seconds);
+                char termination_fields_json[128]{};
+                const bool termination_fields_formatted =
+                    format_poisson_airbox_subwindow_termination_json(
+                        shifted_result,
+                        termination_fields_json,
+                        sizeof(termination_fields_json));
+                append_subwindow_json(
+                    "%s{\"pass\":\"%s\",\"subwindow_index\":%u,"
+                    "\"shift_frequency_hz\":%.17g,\"requested_nev\":%llu,"
+                    "\"requested_ncv\":%llu,"
+                    "\"modal_krylov_tuning\":%s,"
+                    "\"status\":\"%s\",\"converged_eigenpair_count\":%u,"
+                    "%s,"
+                    "\"candidate_mode_count\":%u,"
+                    "\"candidate_mode_count_kind\":\"raw_ritz_in_window\","
+                    "\"raw_ritz_in_window_count\":%u,"
+                    "\"action_residual_evaluated_count\":%u,"
+                    "\"action_residual_evaluation_failed_count\":%u,"
+                    "\"q_vector_extraction_failed_count\":%u,"
+                    "\"full_vector_reconstruction_failed_count\":%u,"
+                    "\"full_vector_nonfinite_count\":%u,"
+                    "\"reconstructed_mode_count\":%u,"
+                    "\"full_residual_evaluation_failed_count\":%u,"
+                    "\"full_residual_rejected_count\":%u,"
+                    "\"full_residual_accepted_count\":%u,"
+                    "\"accepted_mode_count\":%zu,"
+                    "\"local_frequency_min_hz\":%.17g,"
+                    "\"local_frequency_max_hz\":%.17g,"
+                    "\"local_accepted_mode_count\":%zu,"
+                    "\"required_local_coverage_radius_hz\":%.17g,"
+                    "\"selected_coverage_radius_hz\":%.17g,"
+                    "\"selected_frequency_min_hz\":%.17g,"
+                    "\"selected_frequency_max_hz\":%.17g,"
+                    "\"coverage_guard_kind\":\"original_descriptor_certified_signed_ritz\","
+                    "\"certified_spectral_guard_count\":%zu,"
+                    "\"result_truncated_at_requested_count\":%s,"
+                    "\"raw_ritz_pool_saturated\":%s,"
+                    "\"accepted_candidate_pool_saturated\":%s,"
+                    "\"candidate_pool_saturated\":%s,"
+                    "\"split_spectrum_exhausted\":%s,"
+                    "\"request_limit_reached\":%s,"
+                    "\"nev_limit_reached\":%s,"
+                    "\"rejection_stage_count\":%llu,"
+                    "\"lower_edge_covered\":%s,"
+                    "\"upper_edge_covered\":%s,"
+                    "\"rejection_stage_clean\":%s,"
+                    "\"local_coverage_certified\":%s,"
+                    "\"coverage_deferred_to_refinement\":%s,"
+                    "\"coverage_failure_at_limit\":%s,"
+                    "\"requested_mode_count\":%u,"
+                    "\"retry_count\":%u,"
+                    "\"elapsed_seconds\":%.17g,"
+                    "\"q_dof_count\":%llu,\"split_dof_count\":%s,"
+                    "\"phi_dof_count\":%llu,"
+                    "\"augmented_dof_count\":%llu,"
+                    "\"exact_preconditioner\":{\"enabled\":%s,"
+                    "\"shift_failure_observed\":%s,"
+                    "\"status\":\"%s\",\"dimension\":%s,"
+                    "\"column_count\":%s,"
+                    "\"construction_poisson_solve_count\":%s,"
+                    "\"construction_seconds\":%s,"
+                    "\"shifted_setup_seconds\":%s,"
+                    "\"eps_solve_seconds\":%s},"
+                    "\"stop_reason\":\"%s\",\"raw_ritz_classification\":%s,"
+                    "\"accepted_frequencies_hz\":[",
+                    pass_index == 0u && subwindow_index == 0u ? "" : ",",
+                    pass_index == 0u ? "base" : "refinement",
+                    subwindow_index,
+                    shifted_problem.target_frequency_hz,
+                    static_cast<unsigned long long>(resolved_subwindow_nev),
+                    static_cast<unsigned long long>(resolved_subwindow_ncv),
+                    shifted_result.modal_krylov_tuning_json[0] != '\0'
+                        ? shifted_result.modal_krylov_tuning_json : "null",
+                    shifted_status == FrequencyDomainStatus::ok &&
+                            !subwindow_coverage_failed
+                        ? "ok"
+                        : "failed",
+                    shifted_result.converged_eigenpair_count,
+                    termination_fields_formatted
+                        ? termination_fields_json
+                        : "\"eps_reason_available\":false,"
+                          "\"slepc_converged_reason_code\":null,"
+                          "\"outer_iterations\":null",
+                    shifted_result.raw_ritz_in_window_count,
+                    shifted_result.raw_ritz_in_window_count,
+                    shifted_result.action_residual_evaluated_count,
+                    shifted_result.action_residual_evaluation_failed_count,
+                    shifted_result.q_vector_extraction_failed_count,
+                    shifted_result.full_vector_reconstruction_failed_count,
+                    shifted_result.full_vector_nonfinite_count,
+                    shifted_result.reconstructed_mode_count,
+                    shifted_result.full_residual_evaluation_failed_count,
+                    shifted_result.full_residual_rejected_count,
+                    shifted_result.full_residual_accepted_count,
+                    in_window_modes.size(),
+                    local_frequency_min_hz,
+                    local_frequency_max_hz,
+                    final_local_accepted_mode_count,
+                    required_local_coverage_radius_hz,
+                    final_selected_coverage_radius_hz,
+                    final_selected_frequency_min_hz,
+                    final_selected_frequency_max_hz,
+                    shifted_result.certified_spectral_guard_frequencies_hz.size(),
+                    final_result_truncated_at_requested_count ? "true" : "false",
+                    final_raw_ritz_pool_saturated ? "true" : "false",
+                    final_accepted_candidate_pool_saturated ? "true" : "false",
+                    final_candidate_pool_saturated ? "true" : "false",
+                    final_split_spectrum_exhausted ? "true" : "false",
+                    final_request_limit_reached ? "true" : "false",
+                    final_nev_limit_reached ? "true" : "false",
+                    static_cast<unsigned long long>(final_rejection_stage_count),
+                    final_lower_edge_covered ? "true" : "false",
+                    final_upper_edge_covered ? "true" : "false",
+                    final_rejection_stage_clean ? "true" : "false",
+                    final_local_coverage_certified ? "true" : "false",
+                    coverage_deferred_to_refinement ? "true" : "false",
+                    subwindow_coverage_failed &&
+                            (final_request_limit_reached ||
+                             final_nev_limit_reached)
+                        ? "true"
+                        : "false",
+                    subwindow_requested_mode_count,
+                    subwindow_retry_count,
+                    subwindow_elapsed_seconds,
+                    static_cast<unsigned long long>(shifted_result.q_dof_count),
+                    subwindow_split_dof_count_json,
+                    static_cast<unsigned long long>(shifted_result.phi_dof_count),
+                    static_cast<unsigned long long>(shifted_result.augmented_dof_count),
+                    shifted_result.exact_preconditioner_enabled ? "true" : "false",
+                    shifted_result.exact_preconditioner_shift_failure_observed
+                        ? "true"
+                        : "false",
+                    shifted_result.exact_preconditioner_status[0] != '\0'
+                        ? shifted_result.exact_preconditioner_status
+                        : "not_available",
+                    subwindow_exact_dimension_json,
+                    subwindow_exact_column_count_json,
+                    subwindow_exact_poisson_solve_count_json,
+                    subwindow_exact_construction_seconds_json,
+                    subwindow_shifted_setup_seconds_json,
+                    subwindow_eps_solve_seconds_json,
+                    subwindow_coverage_failed
+                        ? "frequency_window_local_coverage_not_certified"
+                        : coverage_deferred_to_refinement
+                        ? "frequency_window_local_coverage_deferred_to_refinement"
+                        : shifted_result.stop_reason[0] != '\0'
+                        ? shifted_result.stop_reason
+                        : (shifted_status == FrequencyDomainStatus::ok
+                               ? "converged"
+                               : "subwindow_failed"),
+                    shifted_result.raw_ritz_classification_json[0] != '\0'
+                        ? shifted_result.raw_ritz_classification_json
+                        : "{\"available\":false,\"samples\":[]}");
+                for (std::size_t accepted_index = 0;
+                     accepted_index < in_window_modes.size();
+                     ++accepted_index) {
+                    append_subwindow_json(
+                        "%s%.17g",
+                        accepted_index == 0u ? "" : ",",
+                        in_window_modes[accepted_index]->frequency_hz);
+                }
+                append_subwindow_json("%s", "]}");
+                if (shifted_status != FrequencyDomainStatus::ok ||
+                    subwindow_coverage_failed) {
+                    if (shifted_status == FrequencyDomainStatus::interrupted) {
+                        window_interrupted = true;
+                        pass_cancelled[pass_index] = true;
+                    } else {
+                        ++out_result->window_failed_subwindow_count;
+                        ++pass_failed_subwindow_count[pass_index];
+                        window_failed = true;
+                        window_local_coverage_failed =
+                            window_local_coverage_failed ||
+                            subwindow_coverage_failed;
+                    }
+                    if (window_failure_reason[0] == '\0') {
+                        copy_message(
+                            window_failure_reason,
+                            sizeof(window_failure_reason),
+                            subwindow_coverage_failed
+                                ? "frequency_window_local_coverage_not_certified"
+                                : shifted_result.stop_reason[0] != '\0'
+                                ? shifted_result.stop_reason
+                                : (shifted_status ==
+                                           FrequencyDomainStatus::interrupted
+                                       ? "cancel_requested"
+                                       : "subwindow_failed"));
+                    }
+                    if (shifted_status == FrequencyDomainStatus::interrupted) {
+                        break;
+                    }
+                    continue;
+                }
+                if (!window_template_initialized) {
+                    *window_template_storage = shifted_result;
+                    window_template_initialized = true;
+                }
+                ++out_result->window_completed_subwindow_count;
+                ++pass_completed_subwindow_count[pass_index];
+                if (in_window_modes.empty()) {
+                    ++window_empty_subwindow_count;
+                }
+                for (const PoissonAirboxModalEigenResult::AcceptedMode &mode :
+                     shifted_result.accepted_modes) {
+                    if (mode.frequency_hz < local_frequency_min_hz ||
+                        mode.frequency_hz > local_frequency_max_hz) {
+                        continue;
+                    }
+                    const bool duplicate = std::any_of(
+                        window_candidates.begin(),
+                        window_candidates.end(),
+                        [&mode, pass_index](const WindowCandidate &existing) {
+                            if (existing.pass_index != pass_index) {
+                                return false;
+                            }
+                            const double relative_frequency_difference =
+                                std::abs(
+                                    existing.mode.frequency_hz -
+                                    mode.frequency_hz) /
+                                std::max(
+                                    {1.0,
+                                     std::abs(existing.mode.frequency_hz),
+                                     std::abs(mode.frequency_hz)});
+                            if (relative_frequency_difference > 1.0e-8 ||
+                                existing.mode.full_vector.size() !=
+                                    mode.full_vector.size()) {
+                                return false;
+                            }
+                            Complex overlap = 0.0;
+                            double existing_norm = 0.0;
+                            double candidate_norm = 0.0;
+                            for (std::size_t component = 0;
+                                 component < mode.full_vector.size();
+                                 ++component) {
+                                overlap +=
+                                    std::conj(existing.mode.full_vector[component]) *
+                                    mode.full_vector[component];
+                                existing_norm +=
+                                    std::norm(existing.mode.full_vector[component]);
+                                candidate_norm +=
+                                    std::norm(mode.full_vector[component]);
+                            }
+                            const double normalized_overlap = std::abs(overlap) /
+                                (std::sqrt(existing_norm * candidate_norm) +
+                                 1.0e-300);
+                            return normalized_overlap >= 1.0 - 1.0e-6;
+                        });
+                    if (!duplicate) {
+                        window_candidates.push_back(WindowCandidate{
+                            mode,
+                            pass_index});
+                    }
+                }
+                if (poisson_airbox_modal_cancel_requested(problem)) {
+                    window_interrupted = true;
+                    pass_cancelled[pass_index] = true;
+                    if (window_failure_reason[0] == '\0') {
+                        copy_message(
+                            window_failure_reason,
+                            sizeof(window_failure_reason),
+                            "cancel_requested");
+                    }
+                    break;
+                }
+            }
+        }
+        requested_nev = resolved_nev(pass_effective_requested_mode_count[0]);
+        refined_nev = resolved_nev(pass_effective_requested_mode_count[1]);
+        const bool refined_nev_increased = refined_nev > requested_nev;
+        out_result->window_empty_subwindow_count = window_empty_subwindow_count;
+        finalize_subwindow_json();
+        if (!subwindow_json_complete) {
+            window_failed = true;
+            if (window_failure_reason[0] == '\0') {
+                copy_message(
+                    window_failure_reason,
+                    sizeof(window_failure_reason),
+                    "subwindow_diagnostics_truncated");
+            }
+        }
+        const auto pass_state = [&](std::uint32_t pass_index) {
+            if (pass_cancelled[pass_index]) {
+                return "cancelled";
+            }
+            if (pass_failed_subwindow_count[pass_index] > 0u) {
+                return "failed";
+            }
+            if (pass_completed_subwindow_count[pass_index] ==
+                pass_planned_subwindow_count[pass_index]) {
+                return "completed";
+            }
+            return pass_completed_subwindow_count[pass_index] == 0u
+                ? "not_run"
+                : "incomplete";
+        };
+        if (window_candidates.empty()) {
+            out_result->window_failed_subwindow = window_failed;
+            out_result->window_cancelled = window_interrupted;
+            const char *empty_stop_reason = window_interrupted
+                ? "cancel_requested"
+                : (window_failure_reason[0] != '\0'
+                       ? window_failure_reason
+                       : "frequency_window_no_accepted_mode");
+            const int empty_certificate_written = std::snprintf(
+                out_result->window_certificate_json,
+                sizeof(out_result->window_certificate_json),
+                "{\"schema_version\":\"poisson_airbox_frequency_window_certificate.v2\","
+                "\"status\":\"%s\","
+                "\"spectrum_scope\":\"selected\","
+                "\"window_complete\":false,"
+                "\"count_certificate\":{\"status\":\"not_performed\",\"method\":null,\"count\":null},"
+                "\"search_stability\":{\"status\":\"not_established\",\"requested_cluster_limit_covered\":false},"
+                "\"method\":\"shift_nev_refinement_subspace_v1\","
+                "\"krylov_subspace_policy\":\"bounded_quadruple_nev_window_v2\","
+                "\"requested_min_hz\":%.17g,\"requested_max_hz\":%.17g,"
+                "\"requested_mode_count\":%u,\"requested_nev\":%llu,\"requested_ncv\":%llu,"
+                "\"refined_requested_mode_count\":%u,\"refined_nev\":%llu,\"refined_ncv\":%llu,"
+                "\"base_schedule\":{\"state\":\"%s\","
+                "\"planned_subwindow_count\":%u,\"completed_subwindow_count\":%u,"
+                "\"failed_subwindow_count\":%u,\"cancelled\":%s},"
+                "\"refinement_schedule\":{\"state\":\"%s\","
+                "\"planned_subwindow_count\":%u,\"completed_subwindow_count\":%u,"
+                "\"failed_subwindow_count\":%u,\"cancelled\":%s},"
+                "\"accepted_cluster_frequencies_hz\":[],\"cluster_ranks\":[],"
+                "\"coverage_margins_hz\":{\"lower\":%.17g,\"upper\":%.17g},"
+                "\"min_subspace_overlap\":0,"
+                "\"perturbation_result\":\"%s\","
+                "\"base_schedule_summary_ref\":\"executed_subwindows_json#pass=base\","
+                "\"refinement_schedule_summary_ref\":\"executed_subwindows_json#pass=refinement\","
+                "\"stop_reason\":\"%s\"}",
+                window_failed ? "failed" : "not_certified",
+                problem.frequency_min_hz,
+                problem.frequency_max_hz,
+                problem.requested_mode_count,
+                static_cast<unsigned long long>(requested_nev),
+                static_cast<unsigned long long>(resolved_ncv(requested_nev)),
+                pass_effective_requested_mode_count[1],
+                static_cast<unsigned long long>(refined_nev),
+                static_cast<unsigned long long>(resolved_ncv(refined_nev)),
+                pass_state(0u),
+                pass_planned_subwindow_count[0],
+                pass_completed_subwindow_count[0],
+                pass_failed_subwindow_count[0],
+                pass_cancelled[0] ? "true" : "false",
+                pass_state(1u),
+                pass_planned_subwindow_count[1],
+                pass_completed_subwindow_count[1],
+                pass_failed_subwindow_count[1],
+                pass_cancelled[1] ? "true" : "false",
+                lower_coverage_margin_hz,
+                upper_coverage_margin_hz,
+                window_interrupted ? "cancelled" : "no_accepted_mode",
+                empty_stop_reason);
+            if (empty_certificate_written <= 0 ||
+                static_cast<std::size_t>(empty_certificate_written) >=
+                    sizeof(out_result->window_certificate_json)) {
+                std::snprintf(
+                    out_result->window_certificate_json,
+                    sizeof(out_result->window_certificate_json),
+                    "{\"schema_version\":\"poisson_airbox_frequency_window_certificate.v2\","
+                    "\"status\":\"failed\","
+                    "\"spectrum_scope\":\"selected\","
+                    "\"window_complete\":false,"
+                    "\"count_certificate\":{\"status\":\"not_performed\",\"method\":null,\"count\":null},"
+                    "\"search_stability\":{\"status\":\"not_established\",\"requested_cluster_limit_covered\":false},"
+                    "\"method\":\"shift_nev_refinement_subspace_v1\","
+                    "\"truncated\":true,"
+                    "\"stop_reason\":\"frequency_window_certificate_truncated\"}");
+                empty_stop_reason = "frequency_window_certificate_truncated";
+            }
+            return fail_production_schur(
+                problem,
+                out_result,
+                window_interrupted
+                    ? FrequencyDomainStatus::interrupted
+                    : FrequencyDomainStatus::solve_error,
+                window_interrupted
+                    ? "production shared-domain K0 Schur window was cancelled before preserving a mode"
+                    : (window_failure_reason[0] != '\0'
+                           ? "production shared-domain K0 Schur multi-shift window failed"
+                           : "production shared-domain K0 Schur multi-shift window found no accepted mode"),
+                empty_stop_reason);
+        }
+        std::sort(
+            window_candidates.begin(),
+            window_candidates.end(),
+            [](const WindowCandidate &left, const WindowCandidate &right) {
+                return left.mode.frequency_hz < right.mode.frequency_hz;
+            });
+        const std::size_t requested_mode_count = static_cast<std::size_t>(
+            std::max<std::uint32_t>(1u, problem.requested_mode_count));
+        const std::size_t discovered_mode_count = window_candidates.size();
+        struct WindowCluster {
+            double frequency_sum_hz = 0.0;
+            std::size_t frequency_sample_count = 0;
+            std::vector<std::size_t> independent_candidate_indices{};
+            std::vector<std::vector<Complex>> orthonormal_basis{};
+
+            double frequency_hz() const noexcept
+            {
+                return frequency_sample_count > 0u
+                    ? frequency_sum_hz /
+                        static_cast<double>(frequency_sample_count)
+                    : 0.0;
+            }
+        };
+        const auto frequencies_match = [=](double left_hz, double right_hz) {
+            const double tolerance_hz = std::max(
+                cluster_frequency_absolute_tolerance_hz,
+                cluster_frequency_relative_tolerance *
+                    std::max(std::abs(left_hz), std::abs(right_hz)));
+            return std::abs(left_hz - right_hz) <= tolerance_hz;
+        };
+        const auto build_clusters = [&](std::uint32_t pass_index) {
+            std::vector<WindowCluster> clusters;
+            for (std::size_t candidate_index = 0;
+                 candidate_index < window_candidates.size();
+                 ++candidate_index) {
+                const WindowCandidate &candidate = window_candidates[candidate_index];
+                if (candidate.pass_index != pass_index ||
+                    candidate.mode.full_vector.size() <
+                        static_cast<std::size_t>(problem.q_dof_count)) {
+                    continue;
+                }
+                if (clusters.empty() ||
+                    !frequencies_match(
+                        clusters.back().frequency_hz(),
+                        candidate.mode.frequency_hz)) {
+                    clusters.emplace_back();
+                }
+                WindowCluster &cluster = clusters.back();
+                cluster.frequency_sum_hz += candidate.mode.frequency_hz;
+                ++cluster.frequency_sample_count;
+                std::vector<Complex> vector(
+                    candidate.mode.full_vector.begin(),
+                    candidate.mode.full_vector.begin() +
+                        static_cast<std::ptrdiff_t>(problem.q_dof_count));
+                for (int orthogonalization_pass = 0;
+                     orthogonalization_pass < 2;
+                     ++orthogonalization_pass) {
+                    for (const std::vector<Complex> &basis_vector :
+                         cluster.orthonormal_basis) {
+                        Complex projection = 0.0;
+                        for (std::size_t component = 0;
+                             component < vector.size();
+                             ++component) {
+                            projection += std::conj(basis_vector[component]) *
+                                vector[component];
+                        }
+                        for (std::size_t component = 0;
+                             component < vector.size();
+                             ++component) {
+                            vector[component] -=
+                                projection * basis_vector[component];
+                        }
+                    }
+                }
+                double norm_squared = 0.0;
+                for (const Complex value : vector) {
+                    norm_squared += std::norm(value);
+                }
+                const double norm = std::sqrt(norm_squared);
+                if (!(norm > 1.0e-8) || !std::isfinite(norm)) {
+                    continue;
+                }
+                for (Complex &value : vector) {
+                    value /= norm;
+                }
+                cluster.orthonormal_basis.push_back(std::move(vector));
+                cluster.independent_candidate_indices.push_back(candidate_index);
+            }
+            return clusters;
+        };
+        const std::vector<WindowCluster> base_clusters = build_clusters(0u);
+        const std::vector<WindowCluster> refinement_clusters = build_clusters(1u);
+        struct ClusterSelection {
+            std::vector<std::size_t> cluster_indices{};
+            std::size_t covered_mode_count = 0;
+            std::size_t split_cluster_index =
+                std::numeric_limits<std::size_t>::max();
+            bool complete = false;
+            bool splits_cluster = false;
+        };
+        const auto select_clusters = [requested_mode_count](
+            const std::vector<WindowCluster> &clusters) {
+            ClusterSelection selection{};
+            for (std::size_t cluster_index = 0;
+                 cluster_index < clusters.size();
+                 ++cluster_index) {
+                const std::size_t rank =
+                    clusters[cluster_index].orthonormal_basis.size();
+                if (rank == 0u) {
+                    continue;
+                }
+                if (selection.covered_mode_count + rank > requested_mode_count) {
+                    selection.splits_cluster = true;
+                    selection.split_cluster_index = cluster_index;
+                    break;
+                }
+                selection.cluster_indices.push_back(cluster_index);
+                selection.covered_mode_count += rank;
+                if (selection.covered_mode_count == requested_mode_count) {
+                    selection.complete = true;
+                    break;
+                }
+            }
+            return selection;
+        };
+        const ClusterSelection base_selection = select_clusters(base_clusters);
+        const ClusterSelection refinement_selection =
+            select_clusters(refinement_clusters);
+        const bool base_pass_complete =
+            pass_completed_subwindow_count[0] == pass_planned_subwindow_count[0] &&
+            pass_failed_subwindow_count[0] == 0u &&
+            !pass_cancelled[0];
+        const bool refinement_pass_complete =
+            pass_completed_subwindow_count[1] == pass_planned_subwindow_count[1] &&
+            pass_failed_subwindow_count[1] == 0u &&
+            !pass_cancelled[1];
+        const bool coverage_margins_positive =
+            std::isfinite(lower_coverage_margin_hz) &&
+            std::isfinite(upper_coverage_margin_hz) &&
+            lower_coverage_margin_hz > 0.0 &&
+            upper_coverage_margin_hz > 0.0;
+        bool refinement_disagreement = false;
+        const char *perturbation_result = "stable";
+        double min_subspace_overlap = 1.0;
+        if (!refined_nev_increased) {
+            refinement_disagreement = true;
+            perturbation_result = "refined_nev_not_greater";
+        } else if (base_selection.splits_cluster ||
+                   refinement_selection.splits_cluster) {
+            refinement_disagreement = true;
+            perturbation_result = "requested_count_splits_cluster";
+            min_subspace_overlap = 0.0;
+        } else if (base_selection.complete && refinement_selection.complete) {
+            if (base_selection.cluster_indices.size() !=
+                refinement_selection.cluster_indices.size()) {
+                refinement_disagreement = true;
+                perturbation_result = "cluster_count_mismatch";
+            } else {
+                for (std::size_t selected_cluster = 0;
+                     selected_cluster < base_selection.cluster_indices.size();
+                     ++selected_cluster) {
+                    const WindowCluster &base_cluster = base_clusters[
+                        base_selection.cluster_indices[selected_cluster]];
+                    const WindowCluster &refinement_cluster = refinement_clusters[
+                        refinement_selection.cluster_indices[selected_cluster]];
+                    const std::size_t base_rank =
+                        base_cluster.orthonormal_basis.size();
+                    const std::size_t refinement_rank =
+                        refinement_cluster.orthonormal_basis.size();
+                    if (!frequencies_match(
+                            base_cluster.frequency_hz(),
+                            refinement_cluster.frequency_hz())) {
+                        refinement_disagreement = true;
+                        perturbation_result = "cluster_frequency_mismatch";
+                        break;
+                    }
+                    if (base_rank != refinement_rank || base_rank == 0u) {
+                        refinement_disagreement = true;
+                        perturbation_result = "cluster_rank_mismatch";
+                        break;
+                    }
+                    double squared_overlap_sum = 0.0;
+                    for (const std::vector<Complex> &base_vector :
+                         base_cluster.orthonormal_basis) {
+                        for (const std::vector<Complex> &refinement_vector :
+                             refinement_cluster.orthonormal_basis) {
+                            Complex overlap = 0.0;
+                            for (std::size_t component = 0;
+                                 component < base_vector.size();
+                                 ++component) {
+                                overlap += std::conj(base_vector[component]) *
+                                    refinement_vector[component];
+                            }
+                            squared_overlap_sum += std::norm(overlap);
+                        }
+                    }
+                    const double subspace_overlap = std::sqrt(std::max(
+                        0.0,
+                        squared_overlap_sum / static_cast<double>(base_rank)));
+                    min_subspace_overlap = std::min(
+                        min_subspace_overlap,
+                        std::min(1.0, subspace_overlap));
+                    if (!std::isfinite(subspace_overlap) ||
+                        subspace_overlap < subspace_overlap_threshold) {
+                        refinement_disagreement = true;
+                        perturbation_result = "invariant_subspace_mismatch";
+                        break;
+                    }
+                }
+            }
+        } else {
+            min_subspace_overlap = 0.0;
+            if (base_selection.complete != refinement_selection.complete ||
+                base_selection.covered_mode_count !=
+                    refinement_selection.covered_mode_count) {
+                refinement_disagreement = true;
+                perturbation_result = "cluster_coverage_mismatch";
+            } else {
+                perturbation_result = "insufficient_requested_mode_coverage";
+            }
+        }
+        if (!coverage_margins_positive && !refinement_disagreement) {
+            refinement_disagreement = true;
+            perturbation_result = "nonpositive_coverage_margin";
+        }
+        const bool mode_coverage_complete =
+            base_selection.complete && refinement_selection.complete;
+        std::vector<WindowCandidate> selected_base_candidates;
+        for (const std::size_t cluster_index : base_selection.cluster_indices) {
+            for (const std::size_t candidate_index :
+                 base_clusters[cluster_index].independent_candidate_indices) {
+                selected_base_candidates.push_back(window_candidates[candidate_index]);
+            }
+        }
+        if (selected_base_candidates.empty()) {
+            char observed_cluster_frequencies_json[128] = "[]";
+            char observed_cluster_ranks_json[64] = "[]";
+            if (base_selection.split_cluster_index < base_clusters.size()) {
+                const WindowCluster &split_cluster =
+                    base_clusters[base_selection.split_cluster_index];
+                std::snprintf(
+                    observed_cluster_frequencies_json,
+                    sizeof(observed_cluster_frequencies_json),
+                    "[%.17g]",
+                    split_cluster.frequency_hz());
+                std::snprintf(
+                    observed_cluster_ranks_json,
+                    sizeof(observed_cluster_ranks_json),
+                    "[%zu]",
+                    split_cluster.orthonormal_basis.size());
+            }
+            const char *empty_selection_stop_reason = window_interrupted
+                ? "cancel_requested"
+                : (!subwindow_json_complete
+                       ? "frequency_window_schedule_summary_truncated"
+                       : (window_failed ||
+                          !base_pass_complete ||
+                          !refinement_pass_complete
+                              ? "frequency_window_subwindow_failed"
+                              : (refinement_disagreement
+                                     ? "frequency_window_refinement_disagreement"
+                                     : "frequency_window_incomplete_mode_coverage")));
+            out_result->window_subwindow_count =
+                base_subwindow_count + refinement_subwindow_count;
+            out_result->window_failed_subwindow = window_failed;
+            out_result->window_cancelled = window_interrupted;
+            out_result->window_complete = false;
+            out_result->accepted_modes.clear();
+            out_result->accepted_mode_count = 0u;
+            copy_message(
+                out_result->executed_subwindows_json,
+                sizeof(out_result->executed_subwindows_json),
+                executed_subwindows_json.data());
+            const int empty_selection_certificate_written = std::snprintf(
+                out_result->window_certificate_json,
+                sizeof(out_result->window_certificate_json),
+                "{\"schema_version\":\"poisson_airbox_frequency_window_certificate.v2\","
+                "\"status\":\"%s\","
+                "\"spectrum_scope\":\"selected\","
+                "\"window_complete\":false,"
+                "\"count_certificate\":{\"status\":\"not_performed\",\"method\":null,\"count\":null},"
+                "\"search_stability\":{\"status\":\"not_established\",\"requested_cluster_limit_covered\":false},"
+                "\"method\":\"shift_nev_refinement_subspace_v1\","
+                "\"krylov_subspace_policy\":\"bounded_quadruple_nev_window_v2\","
+                "\"requested_min_hz\":%.17g,\"requested_max_hz\":%.17g,"
+                "\"requested_mode_count\":%u,\"requested_nev\":%llu,\"requested_ncv\":%llu,"
+                "\"refined_requested_mode_count\":%u,\"refined_nev\":%llu,\"refined_ncv\":%llu,"
+                "\"discovered_mode_count\":%zu,\"accepted_mode_count\":0,"
+                "\"base_schedule\":{\"state\":\"%s\","
+                "\"planned_subwindow_count\":%u,\"completed_subwindow_count\":%u,"
+                "\"failed_subwindow_count\":%u,\"cancelled\":%s},"
+                "\"refinement_schedule\":{\"state\":\"%s\","
+                "\"planned_subwindow_count\":%u,\"completed_subwindow_count\":%u,"
+                "\"failed_subwindow_count\":%u,\"cancelled\":%s},"
+                "\"accepted_cluster_frequencies_hz\":%s,\"cluster_ranks\":%s,"
+                "\"coverage_margins_hz\":{\"lower\":%.17g,\"upper\":%.17g},"
+                "\"min_subspace_overlap\":%.17g,"
+                "\"subspace_overlap_threshold\":%.17g,"
+                "\"perturbation_result\":\"%s\","
+                "\"base_schedule_summary_ref\":\"executed_subwindows_json#pass=base\","
+                "\"refinement_schedule_summary_ref\":\"executed_subwindows_json#pass=refinement\","
+                "\"stop_reason\":\"%s\"}",
+                window_failed ? "failed" : "not_certified",
+                problem.frequency_min_hz,
+                problem.frequency_max_hz,
+                problem.requested_mode_count,
+                static_cast<unsigned long long>(requested_nev),
+                static_cast<unsigned long long>(resolved_ncv(requested_nev)),
+                pass_effective_requested_mode_count[1],
+                static_cast<unsigned long long>(refined_nev),
+                static_cast<unsigned long long>(resolved_ncv(refined_nev)),
+                discovered_mode_count,
+                pass_state(0u),
+                pass_planned_subwindow_count[0],
+                pass_completed_subwindow_count[0],
+                pass_failed_subwindow_count[0],
+                pass_cancelled[0] ? "true" : "false",
+                pass_state(1u),
+                pass_planned_subwindow_count[1],
+                pass_completed_subwindow_count[1],
+                pass_failed_subwindow_count[1],
+                pass_cancelled[1] ? "true" : "false",
+                observed_cluster_frequencies_json,
+                observed_cluster_ranks_json,
+                lower_coverage_margin_hz,
+                upper_coverage_margin_hz,
+                min_subspace_overlap,
+                subspace_overlap_threshold,
+                window_interrupted ? "cancelled" : perturbation_result,
+                empty_selection_stop_reason);
+            if (empty_selection_certificate_written <= 0 ||
+                static_cast<std::size_t>(empty_selection_certificate_written) >=
+                    sizeof(out_result->window_certificate_json)) {
+                std::snprintf(
+                    out_result->window_certificate_json,
+                    sizeof(out_result->window_certificate_json),
+                    "{\"schema_version\":\"poisson_airbox_frequency_window_certificate.v2\","
+                    "\"status\":\"failed\","
+                    "\"spectrum_scope\":\"selected\","
+                    "\"window_complete\":false,"
+                    "\"count_certificate\":{\"status\":\"not_performed\",\"method\":null,\"count\":null},"
+                    "\"search_stability\":{\"status\":\"not_established\",\"requested_cluster_limit_covered\":false},"
+                    "\"method\":\"shift_nev_refinement_subspace_v1\","
+                    "\"truncated\":true,"
+                    "\"stop_reason\":\"frequency_window_certificate_truncated\"}");
+                empty_selection_stop_reason =
+                    "frequency_window_certificate_truncated";
+            }
+            return fail_production_schur(
+                problem,
+                out_result,
+                window_interrupted
+                    ? FrequencyDomainStatus::interrupted
+                    : FrequencyDomainStatus::solve_error,
+                window_interrupted
+                    ? "production shared-domain K0 Schur window was cancelled before preserving a complete mode"
+                    : "production shared-domain K0 Schur window preserved no complete base cluster",
+                empty_selection_stop_reason);
+        }
+        window_candidates = std::move(selected_base_candidates);
+        char cluster_frequencies_json[2048]{};
+        char cluster_ranks_json[1024]{};
+        std::size_t cluster_frequencies_size = 1u;
+        std::size_t cluster_ranks_size = 1u;
+        cluster_frequencies_json[0] = '[';
+        cluster_ranks_json[0] = '[';
+        bool cluster_json_complete = true;
+        for (std::size_t selected_cluster = 0;
+             selected_cluster < base_selection.cluster_indices.size();
+             ++selected_cluster) {
+            const WindowCluster &cluster = base_clusters[
+                base_selection.cluster_indices[selected_cluster]];
+            const int frequency_written = std::snprintf(
+                cluster_frequencies_json + cluster_frequencies_size,
+                sizeof(cluster_frequencies_json) - cluster_frequencies_size,
+                "%s%.17g",
+                selected_cluster == 0u ? "" : ",",
+                cluster.frequency_hz());
+            const int rank_written = std::snprintf(
+                cluster_ranks_json + cluster_ranks_size,
+                sizeof(cluster_ranks_json) - cluster_ranks_size,
+                "%s%zu",
+                selected_cluster == 0u ? "" : ",",
+                cluster.orthonormal_basis.size());
+            if (frequency_written < 0 || rank_written < 0 ||
+                static_cast<std::size_t>(frequency_written) >=
+                    sizeof(cluster_frequencies_json) - cluster_frequencies_size ||
+                static_cast<std::size_t>(rank_written) >=
+                    sizeof(cluster_ranks_json) - cluster_ranks_size) {
+                cluster_json_complete = false;
+                break;
+            }
+            cluster_frequencies_size += static_cast<std::size_t>(frequency_written);
+            cluster_ranks_size += static_cast<std::size_t>(rank_written);
+        }
+        if (cluster_json_complete) {
+            const int frequency_closed = std::snprintf(
+                cluster_frequencies_json + cluster_frequencies_size,
+                sizeof(cluster_frequencies_json) - cluster_frequencies_size,
+                "]");
+            const int rank_closed = std::snprintf(
+                cluster_ranks_json + cluster_ranks_size,
+                sizeof(cluster_ranks_json) - cluster_ranks_size,
+                "]");
+            cluster_json_complete = frequency_closed == 1 && rank_closed == 1;
+        }
+        if (!cluster_json_complete) {
+            window_failed = true;
+            copy_message(
+                window_failure_reason,
+                sizeof(window_failure_reason),
+                "frequency_window_cluster_summary_truncated");
+            std::snprintf(
+                cluster_frequencies_json,
+                sizeof(cluster_frequencies_json),
+                "[]");
+            std::snprintf(
+                cluster_ranks_json,
+                sizeof(cluster_ranks_json),
+                "[]");
+        }
+        auto aggregate_storage = std::make_unique<PoissonAirboxModalEigenResult>();
+        if (window_template_initialized) {
+            *aggregate_storage = *window_template_storage;
+        }
+        PoissonAirboxModalEigenResult &aggregate = *aggregate_storage;
+        aggregate.accepted_modes.clear();
+        aggregate.accepted_modes.reserve(window_candidates.size());
+        for (const WindowCandidate &candidate : window_candidates) {
+            aggregate.accepted_modes.push_back(candidate.mode);
+        }
+        const auto &selected = aggregate.accepted_modes.front();
+        aggregate.accepted_mode_count =
+            static_cast<std::uint32_t>(aggregate.accepted_modes.size());
+        aggregate.selected_eigenpair_index = selected.eigenpair_index;
+        aggregate.eigenvalue_real = selected.eigenvalue_real;
+        aggregate.eigenvalue_imag = selected.eigenvalue_imag;
+        aggregate.omega_rad_s = selected.omega_rad_s;
+        aggregate.frequency_hz = selected.frequency_hz;
+        aggregate.slepc_reported_backward_error =
+            selected.slepc_reported_backward_error;
+        aggregate.full_residual_reconstruction_relative_error =
+            selected.full_residual_reconstruction_relative_error;
+        aggregate.eigen_residual_relative = selected.relative_residual;
+        aggregate.magnetic_block_backward_error =
+            selected.magnetic_block_backward_error;
+        aggregate.poisson_block_backward_error = selected.poisson_block_backward_error;
+        aggregate.gauge_constraint_backward_error =
+            selected.gauge_constraint_backward_error;
+        aggregate.magnetic_residual_l2 = selected.magnetic_residual_l2;
+        aggregate.poisson_residual_l2 = selected.poisson_residual_l2;
+        aggregate.gauge_residual_abs = selected.gauge_residual_abs;
+        aggregate.gauge_mean_abs = selected.gauge_mean_abs;
+        aggregate.converged_eigenpair_count = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                converged_total,
+                std::numeric_limits<std::uint32_t>::max()));
+        aggregate.finite_real_eigenpair_count = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                finite_real_total,
+                std::numeric_limits<std::uint32_t>::max()));
+        aggregate.positive_frequency_eigenpair_count = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                positive_total,
+                std::numeric_limits<std::uint32_t>::max()));
+        aggregate.action_residual_evaluated_count = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                residual_evaluated_total,
+                std::numeric_limits<std::uint32_t>::max()));
+        aggregate.action_residual_evaluation_failed_count =
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                action_residual_evaluation_failed_total,
+                std::numeric_limits<std::uint32_t>::max()));
+        aggregate.q_vector_extraction_failed_count = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                q_vector_extraction_failed_total,
+                std::numeric_limits<std::uint32_t>::max()));
+        aggregate.full_vector_reconstruction_failed_count =
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                full_vector_reconstruction_failed_total,
+                std::numeric_limits<std::uint32_t>::max()));
+        aggregate.full_vector_nonfinite_count = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                full_vector_nonfinite_total,
+                std::numeric_limits<std::uint32_t>::max()));
+        aggregate.reconstructed_mode_count = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                reconstructed_total,
+                std::numeric_limits<std::uint32_t>::max()));
+        aggregate.full_residual_evaluation_failed_count =
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                full_residual_evaluation_failed_total,
+                std::numeric_limits<std::uint32_t>::max()));
+        aggregate.full_residual_rejected_count = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                full_residual_rejected_total,
+                std::numeric_limits<std::uint32_t>::max()));
+        aggregate.full_residual_accepted_count = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                full_residual_accepted_total,
+                std::numeric_limits<std::uint32_t>::max()));
+        aggregate.outer_iterations = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(
+                outer_iterations_total,
+                std::numeric_limits<std::uint32_t>::max()));
+        aggregate.window_subwindow_count =
+            base_subwindow_count + refinement_subwindow_count;
+        aggregate.window_completed_subwindow_count =
+            out_result->window_completed_subwindow_count;
+        aggregate.window_failed_subwindow_count =
+            out_result->window_failed_subwindow_count;
+        aggregate.window_empty_subwindow_count = window_empty_subwindow_count;
+        aggregate.window_failed_subwindow = window_failed;
+        aggregate.window_cancelled = window_interrupted;
+        copy_message(
+            aggregate.operator_context_scope,
+            sizeof(aggregate.operator_context_scope),
+            "frequency_window");
+        aggregate.operator_context_setup_count =
+            window_operator_context.operator_context_setup_count;
+        aggregate.poisson_factorization_setup_count =
+            window_operator_context.poisson_factorization_setup_count;
+        aggregate.shift_solver_setup_count =
+            window_operator_context.shift_solver_setup_count;
+        aggregate.q_dof_count = static_cast<std::uint64_t>(
+            std::max<PetscInt>(window_operator_context.schur.q_count, 0));
+        aggregate.phi_dof_count = static_cast<std::uint64_t>(
+            std::max<PetscInt>(window_operator_context.schur.phi_count, 0));
+        aggregate.augmented_dof_count = aggregate.q_dof_count +
+            aggregate.phi_dof_count +
+            (window_operator_context.schur.gauge_augmented ? 1u : 0u);
+        aggregate.split_dof_count_available =
+            window_operator_context.split_count > 0;
+        aggregate.split_dof_count = aggregate.split_dof_count_available
+            ? static_cast<std::uint64_t>(window_operator_context.split_count)
+            : 0u;
+        aggregate.exact_preconditioner_shift_failure_observed =
+            window_operator_context.exact_cache_shift_failure_observed;
+        aggregate.exact_preconditioner_enabled =
+            window_operator_context.cached_window_schur != nullptr &&
+            window_operator_context.exact_cache_construction_succeeded &&
+            !window_operator_context.exact_cache_shift_failure_observed;
+        aggregate.exact_preconditioner_dimension_available =
+            aggregate.exact_preconditioner_enabled;
+        aggregate.exact_preconditioner_dimension =
+            aggregate.exact_preconditioner_enabled
+                ? aggregate.split_dof_count
+                : 0u;
+        if (window_operator_context.exact_cache_construction_attempted) {
+            copy_exact_cache_observability(window_operator_context, &aggregate);
+            copy_message(
+                aggregate.exact_preconditioner_status,
+                sizeof(aggregate.exact_preconditioner_status),
+                window_operator_context.exact_cache_status[0] != '\0'
+                    ? window_operator_context.exact_cache_status
+                    : (window_operator_context.exact_cache_shift_failure_observed
+                           ? "cache_shift_matrix_failed"
+                           : (aggregate.exact_preconditioner_enabled
+                                  ? "cache_available"
+                                  : "cache_construction_failed")));
+        } else {
+            copy_message(
+                aggregate.exact_preconditioner_status,
+                sizeof(aggregate.exact_preconditioner_status),
+                aggregate.split_dof_count_available &&
+                        window_operator_context.split_count <=
+                            kProductionWindowExactPreconditionerMaxDimension
+                    ? "cache_not_attempted"
+                    : "disabled_dimension_cap");
+        }
+        // Aggregate diagnostics describe the whole window; per-shift timing
+        // stays in executed_subwindows_json and is intentionally unavailable
+        // here rather than being mistaken for a sum or an average.
+        aggregate.shifted_preconditioner_setup_timing_available = false;
+        aggregate.shifted_preconditioner_setup_seconds = 0.0;
+        aggregate.eps_solve_timing_available = false;
+        aggregate.eps_solve_seconds = 0.0;
+        const bool refinement_local_coverage_complete =
+            pass_local_coverage_uncertified_count[1] == 0u;
+        const bool search_stability_complete =
+            !window_failed && !window_interrupted &&
+            base_pass_complete && refinement_pass_complete &&
+            mode_coverage_complete && !refinement_disagreement &&
+            coverage_margins_positive && cluster_json_complete &&
+            refinement_local_coverage_complete;
+        aggregate.window_complete = false;
+        const char *window_certificate_status =
+            window_failed ? "failed" : "not_certified";
+        const char *search_stability_status =
+            search_stability_complete ? "stable" : "not_established";
+        const char *window_stop_reason = search_stability_complete
+            ? "selected_spectrum_stable_count_unavailable"
+            : (window_interrupted
+                   ? "cancel_requested"
+                   : (window_local_coverage_failed
+                          ? "frequency_window_local_coverage_not_certified"
+                   : (!subwindow_json_complete
+                          ? "frequency_window_schedule_summary_truncated"
+                          : (window_failed ||
+                             !base_pass_complete ||
+                             !refinement_pass_complete
+                                 ? "frequency_window_subwindow_failed"
+                                 : (refinement_disagreement
+                                        ? "frequency_window_refinement_disagreement"
+                                        : "frequency_window_incomplete_mode_coverage")))));
+        if (window_interrupted) {
+            perturbation_result = "cancelled";
+            min_subspace_overlap = 0.0;
+        } else if (window_failed || !base_pass_complete ||
+                   !refinement_pass_complete) {
+            perturbation_result = "pass_incomplete";
+            min_subspace_overlap = 0.0;
+        }
+        copy_message(
+            aggregate.stop_reason,
+            sizeof(aggregate.stop_reason),
+            window_stop_reason);
+        const int certificate_written = std::snprintf(
+            aggregate.window_certificate_json,
+            sizeof(aggregate.window_certificate_json),
+            "{\"schema_version\":\"poisson_airbox_frequency_window_certificate.v2\","
+            "\"status\":\"%s\","
+            "\"spectrum_scope\":\"selected\","
+            "\"window_complete\":false,"
+            "\"count_certificate\":{\"status\":\"not_performed\",\"method\":null,\"count\":null},"
+            "\"search_stability\":{\"status\":\"%s\",\"requested_cluster_limit_covered\":%s},"
+            "\"method\":\"shift_nev_refinement_subspace_v1\","
+            "\"krylov_subspace_policy\":\"bounded_quadruple_nev_window_v2\","
+            "\"requested_min_hz\":%.17g,\"requested_max_hz\":%.17g,"
+            "\"requested_mode_count\":%u,\"requested_nev\":%llu,\"requested_ncv\":%llu,"
+            "\"refined_requested_mode_count\":%u,\"refined_nev\":%llu,\"refined_ncv\":%llu,"
+            "\"discovered_mode_count\":%zu,\"accepted_mode_count\":%u,"
+            "\"base_schedule\":{\"state\":\"%s\","
+            "\"planned_subwindow_count\":%u,\"completed_subwindow_count\":%u,"
+            "\"failed_subwindow_count\":%u,\"cancelled\":%s,"
+            "\"first_shift_hz\":%.17g,\"last_shift_hz\":%.17g},"
+            "\"refinement_schedule\":{\"state\":\"%s\","
+            "\"planned_subwindow_count\":%u,\"completed_subwindow_count\":%u,"
+            "\"failed_subwindow_count\":%u,\"cancelled\":%s,"
+            "\"first_shift_hz\":%.17g,\"last_shift_hz\":%.17g},"
+            "\"accepted_cluster_frequencies_hz\":%s,\"cluster_ranks\":%s,"
+            "\"coverage_margins_hz\":{\"lower\":%.17g,\"upper\":%.17g},"
+            "\"min_subspace_overlap\":%.17g,"
+            "\"subspace_overlap_threshold\":%.17g,"
+            "\"perturbation_result\":\"%s\","
+            "\"base_schedule_summary_ref\":\"executed_subwindows_json#pass=base\","
+            "\"refinement_schedule_summary_ref\":\"executed_subwindows_json#pass=refinement\","
+            "\"stop_reason\":\"%s\"}",
+            window_certificate_status,
+            search_stability_status,
+            mode_coverage_complete ? "true" : "false",
+            problem.frequency_min_hz,
+            problem.frequency_max_hz,
+            problem.requested_mode_count,
+            static_cast<unsigned long long>(requested_nev),
+            static_cast<unsigned long long>(resolved_ncv(requested_nev)),
+            pass_effective_requested_mode_count[1],
+            static_cast<unsigned long long>(refined_nev),
+            static_cast<unsigned long long>(resolved_ncv(refined_nev)),
+            discovered_mode_count,
+            aggregate.accepted_mode_count,
+            pass_state(0u),
+            pass_planned_subwindow_count[0],
+            pass_completed_subwindow_count[0],
+            pass_failed_subwindow_count[0],
+            pass_cancelled[0] ? "true" : "false",
+            problem.frequency_min_hz +
+                0.5 * window_width / static_cast<double>(base_subwindow_count),
+            problem.frequency_max_hz -
+                0.5 * window_width / static_cast<double>(base_subwindow_count),
+            pass_state(1u),
+            pass_planned_subwindow_count[1],
+            pass_completed_subwindow_count[1],
+            pass_failed_subwindow_count[1],
+            pass_cancelled[1] ? "true" : "false",
+            refinement_first_shift_hz,
+            refinement_last_shift_hz,
+            cluster_frequencies_json,
+            cluster_ranks_json,
+            lower_coverage_margin_hz,
+            upper_coverage_margin_hz,
+            min_subspace_overlap,
+            subspace_overlap_threshold,
+            perturbation_result,
+            window_stop_reason);
+        const bool certificate_complete = certificate_written > 0 &&
+            static_cast<std::size_t>(certificate_written) <
+                sizeof(aggregate.window_certificate_json);
+        if (!certificate_complete) {
+            aggregate.window_complete = false;
+            copy_message(
+                aggregate.stop_reason,
+                sizeof(aggregate.stop_reason),
+                "frequency_window_certificate_truncated");
+            std::snprintf(
+                aggregate.window_certificate_json,
+                sizeof(aggregate.window_certificate_json),
+                "{\"schema_version\":\"poisson_airbox_frequency_window_certificate.v2\","
+                "\"status\":\"failed\","
+                "\"spectrum_scope\":\"selected\","
+                "\"window_complete\":false,"
+                "\"count_certificate\":{\"status\":\"not_performed\",\"method\":null,\"count\":null},"
+                "\"search_stability\":{\"status\":\"not_established\",\"requested_cluster_limit_covered\":false},"
+                "\"method\":\"shift_nev_refinement_subspace_v1\","
+                "\"truncated\":true,"
+                "\"perturbation_result\":\"certificate_truncated\","
+                "\"stop_reason\":\"frequency_window_certificate_truncated\"}");
+            window_stop_reason = aggregate.stop_reason;
+        }
+        aggregate.status = search_stability_complete && certificate_complete
+            ? FrequencyDomainStatus::ok
+            : (window_interrupted
+                   ? FrequencyDomainStatus::interrupted
+                   : FrequencyDomainStatus::solve_error);
+        copy_message(
+            aggregate.error_message,
+            sizeof(aggregate.error_message),
+            aggregate.status == FrequencyDomainStatus::ok
+                ? ""
+                : (window_interrupted
+                       ? "production shared-domain K0 Schur window was cancelled"
+                       : "production shared-domain K0 Schur frequency window was not certified"));
+        copy_message(
+            aggregate.executed_subwindows_json,
+            sizeof(aggregate.executed_subwindows_json),
+            executed_subwindows_json.data());
+        *out_result = std::move(aggregate);
+        out_result->k0_demag_operator_probe =
+            window_operator_context.k0_demag_operator_probe;
+        write_production_schur_diagnostics(
+            problem,
+            *out_result,
+            out_result->status == FrequencyDomainStatus::ok
+                ? "ok"
+                : (out_result->status == FrequencyDomainStatus::interrupted
+                       ? "interrupted"
+                       : "solve_error"),
+            out_result->stop_reason,
+            out_result);
+        return out_result->status;
+    }
+    std::unique_lock<std::mutex> lock(
+        fullmag::fem::runtime::petsc_slepc_process_mutex(),
+        std::defer_lock);
+    const bool borrowed_window_operator =
+        active_cpu_window_operator_context != nullptr;
+    if (!borrowed_window_operator) {
+        lock.lock();
+    }
+    // The window recursion already owns the shared process mutex; standalone
+    // calls own the unique_lock above.  Read the process latch only here.
+    if (fullmag::fem::runtime::petsc_slepc_process_is_unsafe_locked()) {
+        out_result->slepc_process_quarantined = true;
+        return fail_production_schur(
+            problem, out_result, FrequencyDomainStatus::solve_error,
+            "PETSc/SLEPc graph is quarantined; process restart required",
+            "petsc_runtime_unsafe");
+    }
+    if (production_k0_slepc_process_quarantined()) {
+        out_result->slepc_process_quarantined = true;
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::solve_error,
+            "production K0 SLEPc graph is quarantined; process restart required",
+            "k0_slepc_process_quarantined");
+    }
+    if (!ensure_slepc_initialized(out_result->error_message)) {
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::solve_error,
+            out_result->error_message,
+            "slepc_initialization_failed");
+    }
+
+    ProductionCpuOperatorContextOwner owned_operator_context_owner(
+        nullptr,
+        ProductionCpuOperatorContextDeleter{});
+    if (!borrowed_window_operator) {
+        owned_operator_context_owner.reset(
+            new (std::nothrow) ProductionCpuOperatorContext{});
+        if (!owned_operator_context_owner) {
+            return fail_production_schur(
+                problem,
+                out_result,
+                FrequencyDomainStatus::operator_error,
+                "production K0 operator context allocation failed",
+                "production_operator_context_allocation_failed");
+        }
+    }
+    ProductionCpuOperatorContext *operator_context =
+        borrowed_window_operator
+            ? active_cpu_window_operator_context
+            : owned_operator_context_owner.get();
+    operator_context->solve_control.arm(problem, callback_started_at);
+    ProductionCpuSolveControlScope solve_control_scope{
+        &operator_context->solve_control};
+    if (!configure_production_cpu_operator_context(
+            problem,
+            operator_context)) {
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::operator_error,
+            "production shared-domain K0 Schur Poisson factorization setup failed",
+            "poisson_factorization_setup_failed");
+    }
+    if (problem.k0_demag_probe != nullptr &&
+        !operator_context->k0_demag_probe_completed) {
+        const bool probe_passed =
+            run_k0_demag_operator_probe(problem, operator_context);
+        operator_context->k0_demag_probe_completed = true;
+        out_result->k0_demag_operator_probe =
+            operator_context->k0_demag_operator_probe;
+        if (!probe_passed) {
+            return fail_production_schur(
+                problem,
+                out_result,
+                FrequencyDomainStatus::operator_error,
+                "production shared-domain K0 demag operator probe failed before SLEPc",
+                "k0_demag_operator_probe_failed");
+        }
+    } else if (operator_context->k0_demag_probe_completed) {
+        out_result->k0_demag_operator_probe =
+            operator_context->k0_demag_operator_probe;
+    }
+    ++operator_context->shift_solver_setup_count;
+
+    ProductionSchurContext &context = operator_context->schur;
+    Mat schur_shell = operator_context->schur_shell;
+    Mat split_mass = operator_context->split_mass;
+    const PetscInt base_count = context.q_count;
+    const PetscInt split_count = operator_context->split_count;
+    out_result->split_dof_count_available = split_count > 0;
+    out_result->split_dof_count = split_count > 0
+        ? static_cast<std::uint64_t>(split_count)
+        : 0u;
+    const double mass_norm = operator_context->descriptor_mass_norm;
+    const double operator_norm = operator_context->descriptor_operator_norm;
+    const double angular_frequency_scale =
+        operator_context->angular_frequency_scale;
+    const double mass_scale = operator_context->mass_scale;
+    const double operator_scale = operator_context->operator_scale;
+    const std::uint64_t operator_apply_count_before =
+        context.operator_apply_count;
+    const std::uint64_t poisson_solve_count_before =
+        context.poisson_solve_count;
+
+    EPS eps = nullptr;
+    Vec xr = nullptr;
+    Vec xi = nullptr;
+    const double target_omega = omega_rad_s_from_frequency_hz(
+        std::max(0.0, problem.target_frequency_hz));
+    const double target_eigenvalue = target_omega / angular_frequency_scale;
+    out_result->descriptor_mass_norm = mass_norm;
+    out_result->descriptor_operator_norm = operator_norm;
+    out_result->angular_frequency_scale = angular_frequency_scale;
+    out_result->mass_scale = mass_scale;
+    out_result->operator_scale = operator_scale;
+    out_result->target_eigenvalue_scaled = target_eigenvalue;
+    copy_message(
+        out_result->operator_context_scope,
+        sizeof(out_result->operator_context_scope),
+        borrowed_window_operator ? "frequency_window" : "single_shift");
+    out_result->operator_context_setup_count =
+        operator_context->operator_context_setup_count;
+    out_result->poisson_factorization_setup_count =
+        operator_context->poisson_factorization_setup_count;
+    out_result->shift_solver_setup_count =
+        operator_context->shift_solver_setup_count;
+    // split_dof_count is always a resolved operator dimension.  The exact
+    // preconditioner dimension remains null until its matrix is actually
+    // materialized and usable for this shift.
+    out_result->exact_preconditioner_dimension_available = false;
+    out_result->exact_preconditioner_dimension = 0u;
+    if (borrowed_window_operator) {
+        copy_message(
+            out_result->exact_preconditioner_status,
+            sizeof(out_result->exact_preconditioner_status),
+            split_count <= kProductionWindowExactPreconditionerMaxDimension
+                ? "pending_window_cache"
+                : "disabled_dimension_cap");
+    } else {
+        copy_message(
+            out_result->exact_preconditioner_status,
+            sizeof(out_result->exact_preconditioner_status),
+            split_count <= kProductionExactPreconditionerMaxDimension
+                ? "pending_single_shift"
+                : "disabled_dimension_limit");
+    }
+    // A standalone positive target needs the two-vector J-equivalence class.
+    // Window subcalls use the same target enum but retain four-vector coverage.
+    const std::uint64_t requested_pairs =
+        std::max<std::uint64_t>(1u, problem.requested_mode_count) *
+        (nearest_target && !borrowed_window_operator &&
+                 problem.target_frequency_hz > 0.0
+             ? 2u
+             : 4u);
+    const BoundedKrylovDimensions dimensions = bounded_krylov_dimensions(
+        split_count >= 2 ? static_cast<std::uint64_t>(split_count) : 0u,
+        requested_pairs,
+        borrowed_window_operator);
+    if (!dimensions.valid) {
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::validation_error,
+            "production shared-domain K0 Schur could not resolve bounded nev/ncv",
+            "production_krylov_dimensions_invalid");
+    }
+    const PetscInt nev = static_cast<PetscInt>(dimensions.nev);
+    const PetscInt ncv = static_cast<PetscInt>(dimensions.ncv);
+    const PetscReal tolerance = static_cast<PetscReal>(problem.residual_tolerance);
+    const PetscReal eigensolver_tolerance =
+        static_cast<PetscReal>(resolved_tuning.eps_prefilter_abs);
+    const PetscReal shifted_ksp_tolerance =
+        static_cast<PetscReal>(resolved_tuning.shifted_ksp_rtol);
+    const PetscInt shifted_restart = std::min<PetscInt>(
+        split_count, static_cast<PetscInt>(resolved_tuning.gmres_restart));
+    const PetscInt shifted_max_iterations = problem.max_linear_iterations > 0
+        ? static_cast<PetscInt>(problem.max_linear_iterations) : 1000;
+    const PetscInt max_outer = problem.max_outer_iterations > 0
+        ? static_cast<PetscInt>(problem.max_outer_iterations)
+        : PETSC_DEFAULT;
+    Mat shifted_preconditioner = nullptr;
+    const bool bounded_window_preconditioner =
+        borrowed_window_operator &&
+        split_count <= kProductionWindowExactPreconditionerMaxDimension;
+    const bool exact_preconditioner_eligible =
+        borrowed_window_operator
+            ? bounded_window_preconditioner
+            : split_count <= kProductionExactPreconditionerMaxDimension;
+    const std::uint64_t preconditioner_poisson_solve_count_before =
+        context.poisson_solve_count;
+    double window_shift_setup_seconds = 0.0;
+    bool window_shift_setup_timing_available = false;
+    bool exact_shifted_preconditioner = false;
+    if (bounded_window_preconditioner) {
+        exact_shifted_preconditioner =
+            create_production_cached_window_preconditioner(
+                operator_context,
+                target_eigenvalue,
+                &shifted_preconditioner,
+                &window_shift_setup_seconds,
+                &window_shift_setup_timing_available);
+        out_result->shifted_preconditioner_setup_timing_available =
+            window_shift_setup_timing_available;
+        out_result->shifted_preconditioner_setup_seconds =
+            window_shift_setup_seconds;
+    } else if (!borrowed_window_operator) {
+        const auto exact_construction_started_at = std::chrono::steady_clock::now();
+        exact_shifted_preconditioner = create_production_exact_shift_preconditioner(
+            schur_shell,
+            split_mass,
+            split_count,
+            target_eigenvalue,
+            &shifted_preconditioner,
+            &operator_context->solve_control,
+            &out_result->exact_preconditioner_column_count);
+        const double exact_construction_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - exact_construction_started_at).count();
+        if (exact_preconditioner_eligible) {
+            out_result->exact_preconditioner_construction_timing_available = true;
+            out_result->exact_preconditioner_construction_seconds =
+                exact_construction_seconds;
+        }
+    }
+    if (borrowed_window_operator) {
+        copy_exact_cache_observability(*operator_context, out_result);
+        if (operator_context->exact_cache_construction_attempted) {
+            copy_message(
+                out_result->exact_preconditioner_status,
+                sizeof(out_result->exact_preconditioner_status),
+                operator_context->exact_cache_status[0] != '\0'
+                    ? operator_context->exact_cache_status
+                    : (exact_shifted_preconditioner
+                           ? "cache_reused"
+                           : "cache_failed"));
+        }
+    } else if (exact_preconditioner_eligible) {
+        out_result->exact_preconditioner_column_count_available = true;
+        out_result->exact_preconditioner_construction_metrics_available = true;
+        out_result->exact_preconditioner_construction_poisson_solve_count =
+            context.poisson_solve_count - preconditioner_poisson_solve_count_before;
+        copy_message(
+            out_result->exact_preconditioner_status,
+            sizeof(out_result->exact_preconditioner_status),
+            exact_shifted_preconditioner
+                ? "single_shift_materialized"
+                : "single_shift_materialization_failed");
+    }
+    out_result->exact_preconditioner_enabled = exact_shifted_preconditioner;
+    if (exact_shifted_preconditioner) {
+        out_result->exact_preconditioner_dimension_available = true;
+        out_result->exact_preconditioner_dimension =
+            static_cast<std::uint64_t>(split_count);
+    }
+    if (!exact_shifted_preconditioner &&
+        (operator_context->solve_control.cancellation_observed ||
+         poisson_airbox_modal_cancel_requested(problem))) {
+        if (shifted_preconditioner != nullptr) {
+            MatDestroy(&shifted_preconditioner);
+        }
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::interrupted,
+            "production shared-domain K0 Schur preconditioner setup was cancelled",
+            "cancel_requested");
+    }
+    if (bounded_window_preconditioner && !exact_shifted_preconditioner) {
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::operator_error,
+            "production shared-domain K0 cached window preconditioner setup failed",
+            "cached_window_preconditioner_setup_failed");
+    }
+    if (!exact_shifted_preconditioner) {
+        exact_shifted_preconditioner = false;
+        const auto fallback_setup_started_at = std::chrono::steady_clock::now();
+        const bool fallback_setup_succeeded = create_production_shift_preconditioner(
+                problem.A_qq,
+                problem.B_qq,
+                target_omega,
+                operator_scale,
+                &shifted_preconditioner);
+        out_result->shifted_preconditioner_setup_timing_available = true;
+        out_result->shifted_preconditioner_setup_seconds =
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - fallback_setup_started_at)
+                .count();
+        if (!fallback_setup_succeeded) {
+            destroy_slepc_objects(&eps, &xr, &xi, nullptr, nullptr);
+            if (shifted_preconditioner != nullptr) {
+                MatDestroy(&shifted_preconditioner);
+            }
+            return fail_production_schur(
+                problem,
+                out_result,
+                FrequencyDomainStatus::operator_error,
+                "production shared-domain K0 Schur shifted preconditioner setup failed",
+                "shifted_preconditioner_setup_failed");
+        }
+    }
+    if (!exact_shifted_preconditioner &&
+        !borrowed_window_operator && exact_preconditioner_eligible) {
+        copy_message(
+            out_result->exact_preconditioner_status,
+            sizeof(out_result->exact_preconditioner_status),
+            "single_shift_materialization_failed_fallback");
+    }
+    std::snprintf(
+        out_result->shifted_preconditioner_kind,
+        sizeof(out_result->shifted_preconditioner_kind),
+        "%s",
+        exact_shifted_preconditioner
+            ? "exact_shifted_schur_action"
+            : "magnetic_shift_preconditioner");
+    if (shifted_preconditioner == nullptr) {
+        destroy_slepc_objects(&eps, &xr, &xi, nullptr, nullptr);
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::operator_error,
+            "production shared-domain K0 Schur shifted preconditioner setup failed",
+            "shifted_preconditioner_setup_failed");
+    }
+
+    if (poisson_airbox_modal_cancel_requested(problem)) {
+        destroy_slepc_objects(&eps, &xr, &xi, nullptr, nullptr);
+        MatDestroy(&shifted_preconditioner);
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::interrupted,
+            "production shared-domain K0 Schur solve was cancelled before EPSSolve",
+            "cancel_requested");
+    }
+
+    ST st = nullptr;
+    KSP st_ksp = nullptr;
+    KSP refinement_ksp = nullptr;
+    Mat refinement_operator = nullptr;
+    ProductionShiftedOperatorContext *refinement_operator_context = nullptr;
+    PC st_pc = nullptr;
+    bool configured =
+        EPSCreate(PETSC_COMM_SELF, &eps) == 0 &&
+        EPSSetOperators(eps, schur_shell, split_mass) == 0 &&
+        EPSSetProblemType(eps, EPS_GNHEP) == 0 &&
+        EPSSetType(eps, EPSKRYLOVSCHUR) == 0 &&
+        EPSSetDimensions(eps, nev, ncv, PETSC_DEFAULT) == 0 &&
+        EPSSetWhichEigenpairs(eps, EPS_TARGET_MAGNITUDE) == 0 &&
+        EPSSetTarget(eps, static_cast<PetscScalar>(target_eigenvalue)) == 0 &&
+        EPSSetTrueResidual(eps, PETSC_TRUE) == 0 &&
+        EPSSetTolerances(eps, eigensolver_tolerance, max_outer) == 0 &&
+        EPSGetST(eps, &st) == 0 &&
+        // The selected-spectrum lane must use shift-and-invert.  STSHIFT only
+        // forms (A-tau B), which does not amplify the interior eigenvalues and
+        // leaves the KSP/PC configuration below unused.  STSINVERT applies the
+        // requested real-frequency shift to the rotated pencil as
+        // (A-tau B)^-1, matching ADR-017 and the full descriptor CPU lane.
+        STSetType(st, STSINVERT) == 0 &&
+        STSetShift(st, static_cast<PetscScalar>(target_eigenvalue)) == 0 &&
+        set_st_preconditioner_mat_compat(st, shifted_preconditioner) == 0 &&
+        STGetKSP(st, &st_ksp) == 0;
+    if (configured) {
+        // Defaults preserve the existing GMRES path. An explicit common
+        // runtime override also applies to Gamma within a Floquet sweep.
+        configured = KSPSetType(st_ksp, resolved_tuning.shifted_ksp_type) == 0 &&
+            KSPGMRESSetRestart(st_ksp, shifted_restart) == 0;
+        if (configured && std::strcmp(resolved_tuning.shifted_ksp_type, "fgmres") == 0) {
+            configured = KSPSetPCSide(st_ksp, PC_RIGHT) == 0 &&
+                KSPSetNormType(st_ksp, KSP_NORM_UNPRECONDITIONED) == 0;
+        }
+    }
+    configured = configured &&
+        KSPGetPC(st_ksp, &st_pc) == 0 &&
+        PCSetType(st_pc, PCLU) == 0 &&
+        // MATSOLVERUMFPACK/MATSOLVERKLU are public string constants even
+        // when PETSc was built without those packages.  Do not use their
+        // preprocessor presence as an availability probe; PETSc's default
+        // sequential factorization is always valid for this bounded path.
+        PCFactorReorderForNonzeroDiagonal(st_pc, 1.0e-12) == 0 &&
+        // The transformed pencil is dimensionless, so the factorization uses
+        // PETSc's default zero-pivot policy without the former SI workaround.
+        PCFactorSetShiftType(st_pc, MAT_SHIFT_NONE) == 0 &&
+        KSPSetTolerances(
+            st_ksp,
+            shifted_ksp_tolerance,
+            PETSC_DEFAULT,
+            PETSC_DEFAULT,
+            shifted_max_iterations) == 0 &&
+        KSPSetErrorIfNotConverged(st_ksp, PETSC_TRUE) == 0 &&
+        install_production_modal_ksp_convergence_test(
+            st_ksp,
+            &operator_context->solve_control,
+            PoissonAirboxModalLinearSolverRole::shift_invert) == 0 &&
+        VecCreateSeq(PETSC_COMM_SELF, split_count, &xr) == 0 &&
+        VecCreateSeq(PETSC_COMM_SELF, split_count, &xi) == 0;
+    if (!configured) {
+        destroy_slepc_objects(&eps, &xr, &xi, nullptr, nullptr);
+        MatDestroy(&shifted_preconditioner);
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::solve_error,
+            "production shared-domain K0 Schur SLEPc configuration failed",
+            "slepc_solver_configuration_failed");
+    }
+
+    auto capture_krylov_configuration = [&](const char *phase) noexcept {
+        PetscReal eps_tol = 0.0, ksp_rtol = 0.0;
+        PetscInt eps_max = 0, ksp_max = 0, restart = 0;
+        PetscInt queried_nev = 0, queried_ncv = 0, queried_mpd = 0;
+        const bool eps_dimensions_query_succeeded =
+            EPSGetDimensions(eps, &queried_nev, &queried_ncv, &queried_mpd) == 0;
+        const char *ksp_type = nullptr;
+        if (EPSGetTolerances(eps, &eps_tol, &eps_max) != 0 ||
+            KSPGetTolerances(st_ksp, &ksp_rtol, nullptr, nullptr, &ksp_max) != 0 ||
+            KSPGetType(st_ksp, &ksp_type) != 0 || ksp_type == nullptr ||
+            KSPGMRESGetRestart(st_ksp, &restart) != 0 ||
+            std::strcmp(ksp_type, resolved_tuning.shifted_ksp_type) != 0 ||
+            eps_tol != eigensolver_tolerance || ksp_rtol != shifted_ksp_tolerance ||
+            restart != shifted_restart || ksp_max != shifted_max_iterations ||
+            (problem.max_outer_iterations > 0 && eps_max != max_outer)) {
+            return false;
+        }
+        char eps_max_json[32]{};
+        format_nullable_u64_json(eps_max_json, sizeof(eps_max_json),
+            eps_max > 0, eps_max > 0 ? static_cast<std::uint64_t>(eps_max) : 0u);
+        char eps_dimensions_json[192]{};
+        const bool eps_dimensions_formatted =
+            format_poisson_airbox_eps_dimensions_json(
+                eps_dimensions_query_succeeded,
+                static_cast<std::int64_t>(queried_nev),
+                static_cast<std::int64_t>(queried_ncv),
+                static_cast<std::int64_t>(queried_mpd),
+                eps_dimensions_json,
+                sizeof(eps_dimensions_json));
+        const char *eps_dimensions_fields = eps_dimensions_formatted
+            ? eps_dimensions_json
+            : "\"eps_dimensions\":{\"query_succeeded\":false,"
+              "\"nev\":null,\"ncv\":null,\"mpd\":null}";
+        const int written = std::snprintf(
+            out_result->modal_krylov_tuning_json,
+            sizeof(out_result->modal_krylov_tuning_json),
+            "{\"phase\":\"%s\",\"eps_tolerance\":%.17g,"
+            "\"eps_max_iterations\":%s,\"shifted_ksp_type\":\"%s\","
+            "\"shifted_ksp_rtol\":%.17g,\"shifted_ksp_max_iterations\":%lld,"
+            "\"shifted_ksp_restart\":%lld,%s}",
+            phase, static_cast<double>(eps_tol), eps_max_json,
+            resolved_tuning.shifted_ksp_type, static_cast<double>(ksp_rtol),
+            static_cast<long long>(ksp_max), static_cast<long long>(restart),
+            eps_dimensions_fields);
+        if (written < 0 || static_cast<std::size_t>(written) >=
+                sizeof(out_result->modal_krylov_tuning_json)) {
+            out_result->modal_krylov_tuning_json[0] = '\0';
+            return false;
+        }
+        copy_message(out_result->configured_shifted_ksp_type,
+            sizeof(out_result->configured_shifted_ksp_type),
+            resolved_tuning.shifted_ksp_type);
+        return true;
+    };
+    if (!capture_krylov_configuration("configured_before_eps")) {
+        destroy_slepc_objects(&eps, &xr, &xi, nullptr, nullptr);
+        MatDestroy(&shifted_preconditioner);
+        return fail_production_schur(problem, out_result,
+            FrequencyDomainStatus::solve_error,
+            "production K0 Schur Krylov configuration query failed",
+            "k0_modal_krylov_configuration_mismatch");
+    }
+
+    PetscInt outer_iterations = 0;
+    PetscInt converged = 0;
+    const auto eps_started_at = std::chrono::steady_clock::now();
+    const PetscErrorCode eps_solve_status = EPSSolve(eps);
+    out_result->eps_solve_timing_available = true;
+    out_result->eps_solve_seconds =
+        std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - eps_started_at)
+            .count();
+    bool solve_interrupted =
+        operator_context->solve_control.cancellation_observed ||
+        poisson_airbox_modal_cancel_requested(problem);
+    if (eps_solve_status != PETSC_SUCCESS) {
+        operator_context->eps_lifetime_unsafe = true;
+        operator_context->invalidated = true;
+        operator_context->solve_control.disarm();
+        production_k0_slepc_process_quarantined() = true;
+        fullmag::fem::runtime::mark_petsc_slepc_process_unsafe_locked();
+        const char *failure_stop_reason =
+            solve_interrupted ? "cancel_requested" : "slepc_solve_failed";
+        out_result->eps_solve_error_code_available = true;
+        out_result->eps_solve_error_code =
+            static_cast<std::int32_t>(eps_solve_status);
+        out_result->slepc_process_quarantined = true;
+        out_result->operator_context_invalidated = true;
+        out_result->eps_lifetime_unsafe = true;
+        out_result->eps_reason_available = false;
+        out_result->outer_iterations = 0u;
+        out_result->converged_eigenpair_count = 0u;
+        out_result->accepted_mode_count = 0u;
+        out_result->accepted_modes.clear();
+        out_result->certified_spectral_guard_frequencies_hz.clear();
+        out_result->window_complete = false;
+        out_result->operator_apply_count =
+            context.operator_apply_count - operator_apply_count_before;
+        out_result->poisson_solve_count =
+            context.poisson_solve_count - poisson_solve_count_before;
+        out_result->poisson_iteration_count = context.poisson_iteration_count;
+        out_result->shift_linear_iteration_count = 0u;
+        copy_exact_cache_observability(*operator_context, out_result);
+        copy_message(
+            out_result->eps_stop_reason,
+            sizeof(out_result->eps_stop_reason),
+            failure_stop_reason);
+        char failure_message[256]{};
+        std::snprintf(
+            failure_message,
+            sizeof(failure_message),
+            "production shared-domain K0 EPSSolve failed with PetscErrorCode %d",
+            static_cast<int>(eps_solve_status));
+        return fail_production_schur(
+            problem,
+            out_result,
+            solve_interrupted
+                ? FrequencyDomainStatus::interrupted
+                : FrequencyDomainStatus::solve_error,
+            failure_message,
+            failure_stop_reason);
+    }
+    const bool tuning_snapshot_ok = capture_krylov_configuration("queried_after_eps");
+    if (!tuning_snapshot_ok && !solve_interrupted) {
+        destroy_slepc_objects(&eps, &xr, &xi, nullptr, nullptr);
+        MatDestroy(&shifted_preconditioner);
+        return fail_production_schur(problem, out_result,
+            FrequencyDomainStatus::solve_error,
+            "production K0 Schur Krylov configuration changed during EPS",
+            "k0_modal_krylov_configuration_mismatch");
+    }
+    EPSConvergedReason eps_reason = EPS_CONVERGED_ITERATING;
+    const PetscErrorCode iteration_status = EPSGetIterationNumber(eps, &outer_iterations);
+    const PetscErrorCode converged_status = EPSGetConverged(eps, &converged);
+    const PetscErrorCode reason_status = EPSGetConvergedReason(eps, &eps_reason);
+    if ((eps_solve_status != 0 && !solve_interrupted) ||
+        iteration_status != 0 ||
+        converged_status != 0 ||
+        reason_status != 0) {
+        destroy_slepc_objects(&eps, &xr, &xi, nullptr, nullptr);
+        MatDestroy(&shifted_preconditioner);
+        return fail_production_schur(
+            problem,
+            out_result,
+            solve_interrupted
+                ? FrequencyDomainStatus::interrupted
+                : FrequencyDomainStatus::solve_error,
+            solve_interrupted
+                ? "production shared-domain K0 Schur SLEPc solve was cancelled"
+                : "production shared-domain K0 Schur SLEPc solve failed",
+            solve_interrupted ? "cancel_requested" : "slepc_solve_failed");
+    }
+    out_result->slepc_converged_reason_code = static_cast<int>(eps_reason);
+    out_result->eps_reason_available = true;
+    copy_message(
+        out_result->slepc_converged_reason,
+        sizeof(out_result->slepc_converged_reason),
+        eps_reason > 0 ? "eps_converged" :
+            eps_reason < 0 ? "eps_diverged" : "eps_iterating");
+    // Preserve work actually performed even when EPS exhausts its iteration
+    // budget.  A failed solve must not serialize default zero counters.
+    out_result->outer_iterations = static_cast<std::uint32_t>(
+        std::max<PetscInt>(0, outer_iterations));
+    out_result->converged_eigenpair_count = static_cast<std::uint32_t>(
+        std::max<PetscInt>(0, converged));
+    out_result->operator_apply_count =
+        context.operator_apply_count - operator_apply_count_before;
+    out_result->poisson_solve_count =
+        context.poisson_solve_count - poisson_solve_count_before;
+    out_result->poisson_iteration_count = context.poisson_iteration_count;
+    PetscInt shift_linear_iterations = 0;
+    if (KSPGetTotalIterations(st_ksp, &shift_linear_iterations) == 0) {
+        out_result->shift_linear_iteration_count = static_cast<std::uint64_t>(
+            std::max<PetscInt>(0, shift_linear_iterations));
+    }
+    // Extract and certify the converged Ritz vectors even when EPS did not
+    // reach its requested nev.  These observations are diagnostic only: the
+    // incomplete solve still returns solve_error before mode selection.
+    const bool incomplete_eps = !solve_interrupted && eps_reason <= 0;
+    if (incomplete_eps && converged == 0) {
+        destroy_slepc_objects(&eps, &xr, &xi, nullptr, nullptr);
+        MatDestroy(&shifted_preconditioner);
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::solve_error,
+            "production shared-domain K0 Schur SLEPc did not report convergence",
+            eps_reason < 0 ? "slepc_diverged" : "slepc_not_converged");
+    }
+    if (!configure_production_refinement_ksp(
+            st_ksp,
+            schur_shell,
+            split_mass,
+            target_eigenvalue,
+            split_count,
+            eigensolver_tolerance,
+            problem.max_linear_iterations > 0
+                ? static_cast<PetscInt>(problem.max_linear_iterations)
+            : PETSC_DEFAULT,
+            &operator_context->solve_control,
+            &refinement_ksp,
+            &refinement_operator,
+            &refinement_operator_context)) {
+        destroy_slepc_objects(&eps, &xr, &xi, nullptr, nullptr);
+        MatDestroy(&shifted_preconditioner);
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::solve_error,
+            "production shared-domain K0 Schur Ritz refinement KSP setup failed",
+            "refinement_ksp_setup_failed");
+    }
+    auto destroy_refinement_ksp = [&]() noexcept {
+        if (refinement_ksp != nullptr) {
+            KSPDestroy(&refinement_ksp);
+        }
+        destroy_production_shifted_operator(
+            &refinement_operator,
+            &refinement_operator_context);
+    };
+    copy_message(
+        out_result->stop_reason,
+        sizeof(out_result->stop_reason),
+        solve_interrupted ? "cancel_requested" :
+            incomplete_eps ? (eps_reason < 0 ? "slepc_diverged" : "slepc_not_converged") :
+                "converged");
+    if (KSPGetTotalIterations(st_ksp, &shift_linear_iterations) == 0) {
+        out_result->shift_linear_iteration_count = static_cast<std::uint64_t>(
+            std::max<PetscInt>(0, shift_linear_iterations));
+    }
+    out_result->outer_iterations = static_cast<std::uint32_t>(
+        std::max<PetscInt>(0, outer_iterations));
+    out_result->converged_eigenpair_count = static_cast<std::uint32_t>(
+        std::max<PetscInt>(0, converged));
+
+    // Cancellation stops SLEPc/KSP iteration, but already converged Ritz
+    // pairs still need read-only Schur actions to reconstruct phi and full
+    // block residuals.  The persistent callback context remains installed;
+    // only polling and progress are suspended during this bounded extraction.
+    if (solve_interrupted) {
+        operator_context->solve_control.cancel_poll_enabled = false;
+        operator_context->solve_control.progress_enabled = false;
+    }
+
+    struct Candidate {
+        PetscInt eigenpair_index = -1;
+        double target_distance = 0.0;
+        double lambda_real = 0.0;
+        double lambda_imag = 0.0;
+        double omega_rad_s = 0.0;
+        double frequency_hz = 0.0;
+        double slepc_residual = 0.0;
+        std::vector<Complex> q_vector{};
+        std::vector<Complex> full_vector{};
+        PoissonAirboxModalResidualMetrics metrics{};
+    };
+    std::vector<Candidate> candidates;
+    bool saw_positive = false;
+    const bool frequency_window =
+        problem.target_kind != nullptr &&
+        std::strcmp(problem.target_kind, "frequency_window") == 0;
+    const bool diagnostic_window =
+        std::isfinite(problem.frequency_min_hz) &&
+        std::isfinite(problem.frequency_max_hz) &&
+        problem.frequency_max_hz > problem.frequency_min_hz;
+    double kr_scaled_min = std::numeric_limits<double>::infinity();
+    double kr_scaled_max = -std::numeric_limits<double>::infinity();
+    double ki_scaled_min = std::numeric_limits<double>::infinity();
+    double ki_scaled_max = -std::numeric_limits<double>::infinity();
+    char raw_ritz_samples[1024]{'['};
+    std::size_t raw_ritz_samples_size = 1u;
+    std::uint32_t raw_ritz_sample_count = 0u;
+    bool raw_ritz_samples_complete = true;
+    char reconstructed_samples[1536]{'['};
+    std::size_t reconstructed_samples_size = 1u;
+    std::uint32_t reconstructed_sample_count = 0u;
+    bool reconstructed_samples_complete = true;
+    const auto append_raw_ritz_sample = [&](PetscInt index,
+                                            double kr_scaled,
+                                            double ki_scaled,
+                                            const char *classification) {
+        constexpr std::uint32_t kMaximumSamples = 4u;
+        if (!raw_ritz_samples_complete ||
+            raw_ritz_sample_count >= kMaximumSamples) {
+            return;
+        }
+        const int written = std::snprintf(
+            raw_ritz_samples + raw_ritz_samples_size,
+            sizeof(raw_ritz_samples) - raw_ritz_samples_size,
+            "%s{\"index\":%d,\"kr_scaled\":%.17g,\"ki_scaled\":%.17g,"
+            "\"kr_rad_s\":%.17g,\"ki_rad_s\":%.17g,\"classification\":\"%s\"}",
+            raw_ritz_sample_count == 0u ? "" : ",",
+            static_cast<int>(index),
+            kr_scaled,
+            ki_scaled,
+            kr_scaled * angular_frequency_scale,
+            ki_scaled * angular_frequency_scale,
+            classification);
+        if (written <= 0 ||
+            static_cast<std::size_t>(written) >=
+                sizeof(raw_ritz_samples) - raw_ritz_samples_size) {
+            raw_ritz_samples_complete = false;
+            return;
+        }
+        raw_ritz_samples_size += static_cast<std::size_t>(written);
+        ++raw_ritz_sample_count;
+    };
+    for (PetscInt index = 0; index < converged; ++index) {
+        PetscScalar kr = 0.0;
+        PetscScalar ki = 0.0;
+        PetscReal residual = 0.0;
+        if (EPSGetEigenpair(eps, index, &kr, &ki, xr, xi) != 0) {
+            ++out_result->raw_ritz_retrieval_failed_count;
+            continue;
+        }
+        const double scaled_eigenvalue = static_cast<double>(PetscRealPart(kr));
+        const double scaled_imaginary = static_cast<double>(PetscRealPart(ki));
+        if (!std::isfinite(scaled_eigenvalue) ||
+            !std::isfinite(scaled_imaginary)) {
+            ++out_result->raw_ritz_nonfinite_count;
+            continue;
+        }
+        ++out_result->raw_ritz_finite_count;
+        kr_scaled_min = std::min(kr_scaled_min, scaled_eigenvalue);
+        kr_scaled_max = std::max(kr_scaled_max, scaled_eigenvalue);
+        ki_scaled_min = std::min(ki_scaled_min, scaled_imaginary);
+        ki_scaled_max = std::max(ki_scaled_max, scaled_imaginary);
+        const double split_eigenvalue =
+            scaled_eigenvalue * angular_frequency_scale;
+        const double split_imaginary =
+            scaled_imaginary * angular_frequency_scale;
+        // The rotated real-scalar descriptor is mathematically real, but
+        // SLEPc may return a tiny projected imaginary component.  Compare it
+        // in the dimensionless scaled pencil, where the solver tolerance is
+        // defined; comparing the unscaled rad/s value against 1e-10 would
+        // reject harmless roundoff after the physical scaling.
+        const double scaled_real_axis_tolerance = std::max(
+            1.0e-8,
+            10.0 * std::max(problem.residual_tolerance, 0.0));
+        if (std::abs(scaled_imaginary) >
+            scaled_real_axis_tolerance * std::max(1.0, std::abs(scaled_eigenvalue))) {
+            ++out_result->raw_ritz_complex_rejected_count;
+            append_raw_ritz_sample(
+                index, scaled_eigenvalue, scaled_imaginary, "complex_rejected");
+            continue;
+        }
+        ++out_result->raw_ritz_real_axis_count;
+        ++out_result->finite_real_eigenpair_count;
+        // The rotated pencil eigenvalue is w = kr + i*ki while the original
+        // descriptor uses lambda = i*w = -ki + i*kr.  Preserve the small
+        // computed real component while refining and certifying the original
+        // descriptor residual.  The public undamped mode remains projected
+        // onto the imaginary axis below; using that projected value for the
+        // residual makes harmless Ritz roundoff dominate certification after
+        // restoring the physical rad/s scale.
+        const Complex residual_lambda = original_descriptor_eigenvalue_from_rotated(
+            {scaled_eigenvalue, scaled_imaginary},
+            angular_frequency_scale);
+        const double residual_lambda_real = residual_lambda.real();
+        const double published_lambda_real = 0.0;
+        const double lambda_imag = residual_lambda.imag();
+        const ModeKinematics kinematics = map_eigenvalue(
+            {published_lambda_real, lambda_imag},
+            FrequencyDomainPhaseConvention::exp_i_omega_t);
+        if (kinematics.zero_frequency_mode) {
+            ++out_result->raw_ritz_zero_count;
+            append_raw_ritz_sample(
+                index, scaled_eigenvalue, scaled_imaginary, "zero_frequency");
+        } else if (kinematics.branch_sign < 0) {
+            ++out_result->raw_ritz_negative_count;
+            append_raw_ritz_sample(
+                index, scaled_eigenvalue, scaled_imaginary, "negative_frequency");
+        } else {
+            ++out_result->raw_ritz_positive_count;
+            const bool in_window = !diagnostic_window ||
+                (kinematics.frequency_hz >= problem.frequency_min_hz &&
+                 kinematics.frequency_hz <= problem.frequency_max_hz);
+            if (in_window) {
+                ++out_result->raw_ritz_in_window_count;
+            } else {
+                ++out_result->raw_ritz_out_of_window_count;
+            }
+            append_raw_ritz_sample(
+                index,
+                scaled_eigenvalue,
+                scaled_imaginary,
+                in_window ? "positive_in_window" : "positive_out_of_window");
+        }
+        const bool publish_positive = select_positive_frequency_mode(
+            kinematics, ZeroFrequencyModePolicy::exclude);
+        const bool certify_signed_guard =
+            problem.progress_total_subwindows > 0u &&
+            !kinematics.zero_frequency_mode;
+        if (!publish_positive && !certify_signed_guard) {
+            continue;
+        }
+        if (publish_positive) {
+            saw_positive = true;
+            ++out_result->positive_frequency_eigenpair_count;
+        }
+        if (frequency_window &&
+            (kinematics.frequency_hz < problem.frequency_min_hz ||
+             kinematics.frequency_hz > problem.frequency_max_hz)) {
+            continue;
+        }
+
+        // The outer EPS residual is evaluated on the transformed problem and
+        // can stop before the original descriptor residual is small enough.
+        // Use the same configured shift solver for a bounded Newton-like
+        // correction of this Ritz pair.  The real-split operator and mass are
+        // dimensionless, therefore the scaled Ritz values are used here.
+        double refined_action_residual = std::numeric_limits<double>::infinity();
+        PetscInt refinement_iterations_before = 0;
+        PetscInt refinement_iterations_after = 0;
+        (void)KSPGetTotalIterations(
+            refinement_ksp,
+            &refinement_iterations_before);
+        ++out_result->refinement_attempted_count;
+        // The production alpha=0 lane is an undamped real-frequency pencil.
+        // Treat the tiny SLEPc imaginary part of the rotated Ritz value as
+        // numerical roundoff and refine on the real axis.  Move the explicit
+        // MatShell shift to this candidate before solving; retaining the
+        // original target shift can leave the correction under-resolved when
+        // a selected pair is away from tau.
+        if (refinement_operator_context != nullptr) {
+            refinement_operator_context->shift = scaled_eigenvalue;
+        }
+        const bool refinement_succeeded = refine_production_split_ritz_pair(
+            refinement_ksp,
+            schur_shell,
+            split_mass,
+            xr,
+            xi,
+            scaled_eigenvalue,
+            scaled_imaginary,
+            static_cast<double>(eigensolver_tolerance),
+            3,
+            &refined_action_residual);
+        (void)KSPGetTotalIterations(
+            refinement_ksp,
+            &refinement_iterations_after);
+        if (refinement_iterations_after > refinement_iterations_before) {
+            out_result->refinement_linear_iteration_count +=
+                static_cast<std::uint64_t>(
+                    refinement_iterations_after - refinement_iterations_before);
+        }
+        KSPConvergedReason refinement_reason = KSP_CONVERGED_ITERATING;
+        (void)KSPGetConvergedReason(refinement_ksp, &refinement_reason);
+        out_result->refinement_last_ksp_reason_code =
+            static_cast<int>(refinement_reason);
+        if (refinement_succeeded) {
+            ++out_result->refinement_succeeded_count;
+        } else {
+            ++out_result->refinement_failed_count;
+        }
+        if (std::isfinite(refined_action_residual)) {
+            out_result->refinement_final_action_residual = std::max(
+                out_result->refinement_final_action_residual,
+                refined_action_residual);
+        }
+
+        // SLEPc cannot call EPSComputeError for a MatShell because the shell
+        // intentionally has no matrix norm operation.  Recompute the
+        // backward error from the original shell and mass actions instead of
+        // accepting a library-side sentinel or silently dropping the mode.
+        Vec residual_vec = nullptr;
+        Vec action_vec = nullptr;
+        Vec mass_vec = nullptr;
+        PetscReal action_norm = 0.0;
+        PetscReal mass_norm = 0.0;
+        PetscReal residual_norm = 0.0;
+        PetscErrorCode residual_error = VecDuplicate(xr, &residual_vec);
+        if (residual_error == 0) {
+            residual_error = VecDuplicate(xr, &action_vec);
+        }
+        if (residual_error == 0) {
+            residual_error = VecDuplicate(xr, &mass_vec);
+        }
+        if (residual_error == 0) {
+            residual_error = MatMult(schur_shell, xr, action_vec);
+        }
+        if (residual_error == 0) {
+            residual_error = MatMult(split_mass, xr, mass_vec);
+        }
+        if (residual_error == 0) {
+            residual_error = VecWAXPY(
+                residual_vec,
+                static_cast<PetscScalar>(-scaled_eigenvalue),
+                mass_vec,
+                action_vec);
+        }
+        if (residual_error == 0) {
+            residual_error = VecNorm(action_vec, NORM_2, &action_norm);
+        }
+        if (residual_error == 0) {
+            residual_error = VecNorm(mass_vec, NORM_2, &mass_norm);
+        }
+        if (residual_error == 0) {
+            residual_error = VecNorm(residual_vec, NORM_2, &residual_norm);
+        }
+        const bool residual_ok = residual_error == 0;
+        if (residual_vec != nullptr) {
+            VecDestroy(&residual_vec);
+        }
+        if (action_vec != nullptr) {
+            VecDestroy(&action_vec);
+        }
+        if (mass_vec != nullptr) {
+            VecDestroy(&mass_vec);
+        }
+        if (!residual_ok) {
+            ++out_result->action_residual_evaluation_failed_count;
+            continue;
+        }
+        ++out_result->action_residual_evaluated_count;
+        residual = residual_norm /
+            (action_norm + std::abs(scaled_eigenvalue) * mass_norm + 1.0e-300);
+        const std::vector<Complex> q = copy_production_split_eigenvector(
+            xr,
+            xi,
+            base_count);
+        if (q.size() != static_cast<std::size_t>(base_count)) {
+            ++out_result->q_vector_extraction_failed_count;
+            continue;
+        }
+        std::vector<Complex> full_vector;
+        if (!reconstruct_production_mode(&context, q, &full_vector)) {
+            ++out_result->full_vector_reconstruction_failed_count;
+            continue;
+        }
+        bool finite_full_vector = true;
+        for (std::size_t component = 0; component < full_vector.size(); ++component) {
+            if (!std::isfinite(full_vector[component].real()) ||
+                !std::isfinite(full_vector[component].imag())) {
+                finite_full_vector = false;
+                break;
+            }
+        }
+        if (!finite_full_vector) {
+            ++out_result->full_vector_nonfinite_count;
+            continue;
+        }
+        ++out_result->reconstructed_mode_count;
+        std::vector<double> vector_real(full_vector.size(), 0.0);
+        std::vector<double> vector_imag(full_vector.size(), 0.0);
+        for (std::size_t component = 0; component < full_vector.size(); ++component) {
+            vector_real[component] = full_vector[component].real();
+            vector_imag[component] = full_vector[component].imag();
+        }
+        PoissonAirboxModalResidualMetrics metrics{};
+        const FrequencyDomainStatus residual_status =
+            evaluate_poisson_airbox_modal_residuals(
+                problem,
+                vector_real.data(),
+                vector_imag.data(),
+                static_cast<std::uint64_t>(full_vector.size()),
+                residual_lambda_real,
+                lambda_imag,
+                static_cast<double>(residual),
+                &metrics);
+        if (residual_status == FrequencyDomainStatus::ok) {
+            out_result->full_residual_reconstruction_relative_error =
+                metrics.reconstructed_full_descriptor_backward_error;
+            out_result->reconstructed_full_descriptor_backward_error =
+                metrics.reconstructed_full_descriptor_backward_error;
+            out_result->magnetic_block_backward_error =
+                metrics.magnetic_block_backward_error;
+            out_result->poisson_block_backward_error =
+                metrics.poisson_block_backward_error;
+            out_result->gauge_constraint_backward_error =
+                metrics.gauge_constraint_backward_error;
+            out_result->magnetic_residual_l2 = metrics.magnetic_residual_l2;
+            out_result->poisson_residual_l2 = metrics.poisson_residual_l2;
+            out_result->gauge_residual_abs = metrics.gauge_residual_abs;
+            out_result->poisson_constraint_relative_residual =
+                metrics.poisson_block_backward_error;
+            out_result->gauge_mean_abs = metrics.gauge_mean_abs;
+            out_result->slepc_reported_backward_error =
+                metrics.slepc_reported_backward_error;
+            out_result->reconstruction_vs_slepc_ratio =
+                metrics.reconstruction_vs_slepc_ratio;
+        }
+        if (residual_status != FrequencyDomainStatus::ok) {
+            ++out_result->full_residual_evaluation_failed_count;
+            continue;
+        }
+        if (metrics.reconstructed_full_descriptor_backward_error >
+            problem.residual_tolerance) {
+            ++out_result->full_residual_rejected_count;
+            continue;
+        }
+        if (certify_signed_guard) {
+            out_result->certified_spectral_guard_frequencies_hz.push_back(
+                kinematics.frequency_hz);
+        }
+        if (!publish_positive) {
+            // This eigenpair proves signed spectral coverage only. Keep it
+            // out of public positive modes, cluster ranks and branch tracking.
+            continue;
+        }
+        ++out_result->full_residual_accepted_count;
+        if (reconstructed_samples_complete && reconstructed_sample_count < 4u) {
+            const int written = std::snprintf(
+                reconstructed_samples + reconstructed_samples_size,
+                sizeof(reconstructed_samples) - reconstructed_samples_size,
+                "%s{\"index\":%d,\"frequency_hz\":%.17g,"
+                "\"full_backward_error\":%.17g,\"magnetic_backward_error\":%.17g,"
+                "\"poisson_backward_error\":%.17g,\"gauge_backward_error\":%.17g}",
+                reconstructed_sample_count == 0u ? "" : ",",
+                static_cast<int>(index),
+                kinematics.frequency_hz,
+                metrics.reconstructed_full_descriptor_backward_error,
+                metrics.magnetic_block_backward_error,
+                metrics.poisson_block_backward_error,
+                metrics.gauge_constraint_backward_error);
+            if (written <= 0 ||
+                static_cast<std::size_t>(written) >=
+                    sizeof(reconstructed_samples) - reconstructed_samples_size) {
+                reconstructed_samples_complete = false;
+            } else {
+                reconstructed_samples_size += static_cast<std::size_t>(written);
+                ++reconstructed_sample_count;
+            }
+        }
+        candidates.push_back(Candidate{
+            index,
+            std::abs(kinematics.omega_rad_s - target_omega),
+            published_lambda_real,
+            lambda_imag,
+            kinematics.omega_rad_s,
+            kinematics.frequency_hz,
+            static_cast<double>(residual),
+            q,
+            std::move(full_vector),
+            metrics});
+    }
+
+    if (raw_ritz_samples_complete &&
+        raw_ritz_samples_size + 2u <= sizeof(raw_ritz_samples)) {
+        raw_ritz_samples[raw_ritz_samples_size++] = ']';
+        raw_ritz_samples[raw_ritz_samples_size] = '\0';
+    } else {
+        copy_message(raw_ritz_samples, sizeof(raw_ritz_samples), "[]");
+    }
+    if (reconstructed_samples_complete &&
+        reconstructed_samples_size + 2u <= sizeof(reconstructed_samples)) {
+        reconstructed_samples[reconstructed_samples_size++] = ']';
+        reconstructed_samples[reconstructed_samples_size] = '\0';
+    } else {
+        reconstructed_samples_complete = false;
+        copy_message(reconstructed_samples, sizeof(reconstructed_samples), "[]");
+    }
+    const bool raw_ritz_range_available = out_result->raw_ritz_finite_count > 0u;
+    const int raw_ritz_json_size = std::snprintf(
+        out_result->raw_ritz_classification_json,
+        sizeof(out_result->raw_ritz_classification_json),
+        "{\"available\":true,\"retrieval_failed_count\":%u,"
+        "\"nonfinite_count\":%u,\"finite_count\":%u,"
+        "\"complex_rejected_count\":%u,\"real_axis_count\":%u,"
+        "\"positive_count\":%u,\"negative_count\":%u,\"zero_count\":%u,"
+        "\"in_window_count\":%u,\"out_of_window_count\":%u,"
+        "\"kr_scaled_range\":[%.17g,%.17g],"
+        "\"ki_scaled_range\":[%.17g,%.17g],"
+        "\"sample_limit\":4,\"samples\":%s,"
+        "\"reconstructed_sample_limit\":4,\"reconstructed_samples_available\":%s,"
+        "\"reconstructed_samples\":%s}",
+        out_result->raw_ritz_retrieval_failed_count,
+        out_result->raw_ritz_nonfinite_count,
+        out_result->raw_ritz_finite_count,
+        out_result->raw_ritz_complex_rejected_count,
+        out_result->raw_ritz_real_axis_count,
+        out_result->raw_ritz_positive_count,
+        out_result->raw_ritz_negative_count,
+        out_result->raw_ritz_zero_count,
+        out_result->raw_ritz_in_window_count,
+        out_result->raw_ritz_out_of_window_count,
+        raw_ritz_range_available ? kr_scaled_min : 0.0,
+        raw_ritz_range_available ? kr_scaled_max : 0.0,
+        raw_ritz_range_available ? ki_scaled_min : 0.0,
+        raw_ritz_range_available ? ki_scaled_max : 0.0,
+        raw_ritz_samples,
+        reconstructed_samples_complete ? "true" : "false",
+        reconstructed_samples);
+    if (raw_ritz_json_size < 0 ||
+        static_cast<std::size_t>(raw_ritz_json_size) >=
+            sizeof(out_result->raw_ritz_classification_json)) {
+        copy_message(
+            out_result->raw_ritz_classification_json,
+            sizeof(out_result->raw_ritz_classification_json),
+            "{\"available\":false,\"reason\":\"diagnostic_buffer_exhausted\"}");
+    }
+
+    out_result->operator_apply_count =
+        context.operator_apply_count - operator_apply_count_before;
+    out_result->poisson_solve_count =
+        context.poisson_solve_count - poisson_solve_count_before;
+    out_result->poisson_iteration_count = context.poisson_iteration_count;
+    if (KSPGetTotalIterations(st_ksp, &shift_linear_iterations) == 0) {
+        out_result->shift_linear_iteration_count = static_cast<std::uint64_t>(
+            std::max<PetscInt>(0, shift_linear_iterations));
+    }
+    destroy_slepc_objects(&eps, &xr, &xi, nullptr, nullptr);
+    MatDestroy(&shifted_preconditioner);
+
+    // Cancellation can arrive while reconstructing diagnostic partial Ritz vectors.
+    solve_interrupted = solve_interrupted ||
+        operator_context->solve_control.cancellation_observed ||
+        poisson_airbox_modal_cancel_requested(problem);
+    if (incomplete_eps) {
+        destroy_refinement_ksp();
+        return fail_production_schur(
+            problem,
+            out_result,
+            solve_interrupted ? FrequencyDomainStatus::interrupted
+                              : FrequencyDomainStatus::solve_error,
+            solve_interrupted
+                ? "production shared-domain K0 Schur diagnostic reconstruction was cancelled"
+                : "production shared-domain K0 Schur SLEPc did not report convergence",
+            solve_interrupted ? "cancel_requested"
+                              : (eps_reason < 0 ? "slepc_diverged" : "slepc_not_converged"));
+    }
+
+    std::sort(
+        candidates.begin(),
+        candidates.end(),
+        [frequency_window](const Candidate &left, const Candidate &right) {
+            if (frequency_window) {
+                return left.frequency_hz < right.frequency_hz;
+            }
+            if (left.target_distance != right.target_distance) {
+                return left.target_distance < right.target_distance;
+            }
+            return left.frequency_hz < right.frequency_hz;
+        });
+    // The rotated-real pencil emits a two-vector J-equivalence class for one
+    // physical complex mode.  Collapse those representations before applying
+    // requested_mode_count, otherwise a request for two modes can publish the
+    // same physical frequency twice and hide the next branch.
+    std::vector<ModalCandidate> modal_candidates;
+    modal_candidates.reserve(candidates.size());
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+        ModalCandidate modal_candidate{};
+        modal_candidate.frequency_hz = candidates[index].frequency_hz;
+        modal_candidate.relative_residual =
+            candidates[index].metrics.reconstructed_full_descriptor_backward_error;
+        modal_candidate.source_index = static_cast<int>(index);
+        modal_candidate.mode = candidates[index].q_vector;
+        modal_candidates.push_back(std::move(modal_candidate));
+    }
+    const std::vector<ModalCandidate> deduplicated =
+        deduplicate_modes_by_frequency_and_overlap(
+            modal_candidates,
+            nullptr,
+            static_cast<std::size_t>(base_count),
+            1.0e-8,
+            1.0e-12,
+            0.90);
+    std::vector<Candidate> physical_candidates;
+    physical_candidates.reserve(deduplicated.size());
+    for (std::size_t index = 0; index < candidates.size(); ++index) {
+        const bool retained = std::any_of(
+            deduplicated.begin(),
+            deduplicated.end(),
+            [index](const ModalCandidate &candidate) {
+                return candidate.source_index == static_cast<int>(index);
+            });
+        if (retained) {
+            physical_candidates.push_back(std::move(candidates[index]));
+        }
+    }
+    candidates = std::move(physical_candidates);
+    const std::size_t requested_mode_count = static_cast<std::size_t>(
+        std::max<std::uint32_t>(1u, problem.requested_mode_count));
+    if (candidates.empty()) {
+        destroy_refinement_ksp();
+        return fail_production_schur(
+            problem,
+            out_result,
+            solve_interrupted
+                ? FrequencyDomainStatus::interrupted
+                : FrequencyDomainStatus::solve_error,
+            solve_interrupted
+                ? "production shared-domain K0 Schur cancellation preserved no complete mode"
+                : (saw_positive
+                      ? "production shared-domain K0 Schur found no accepted positive-frequency mode"
+                      : "production shared-domain K0 Schur found no positive-frequency mode"),
+            solve_interrupted
+                ? "cancel_requested"
+                : (saw_positive
+                      ? "no_accepted_positive_frequency_mode"
+                      : "no_positive_frequency_eigenpair"));
+    }
+    if (!problem.retain_window_discovery_pool &&
+        candidates.size() > requested_mode_count) {
+        candidates.resize(requested_mode_count);
+    }
+
+    out_result->accepted_modes.clear();
+    out_result->accepted_modes.reserve(candidates.size());
+    for (Candidate &candidate : candidates) {
+        PoissonAirboxModalEigenResult::AcceptedMode mode{};
+        mode.eigenpair_index = static_cast<std::uint32_t>(candidate.eigenpair_index);
+        mode.eigenvalue_real = candidate.lambda_real;
+        mode.eigenvalue_imag = candidate.lambda_imag;
+        mode.omega_rad_s = candidate.omega_rad_s;
+        mode.frequency_hz = candidate.frequency_hz;
+        mode.slepc_reported_backward_error = candidate.slepc_residual;
+        mode.full_residual_reconstruction_relative_error =
+            candidate.metrics.reconstructed_full_descriptor_backward_error;
+        mode.relative_residual = mode.full_residual_reconstruction_relative_error;
+        mode.magnetic_block_backward_error = candidate.metrics.magnetic_block_backward_error;
+        mode.poisson_block_backward_error = candidate.metrics.poisson_block_backward_error;
+        mode.gauge_constraint_backward_error = candidate.metrics.gauge_constraint_backward_error;
+        mode.magnetic_residual_l2 = candidate.metrics.magnetic_residual_l2;
+        mode.poisson_residual_l2 = candidate.metrics.poisson_residual_l2;
+        mode.gauge_residual_abs = candidate.metrics.gauge_residual_abs;
+        mode.gauge_mean_abs = candidate.metrics.gauge_mean_abs;
+        if (problem.retain_window_discovery_pool) {
+            // The child already owns this reconstruction; transfer it rather
+            // than keeping a second full discovery pool alive.
+            mode.full_vector = std::move(candidate.full_vector);
+        } else {
+            mode.full_vector = candidate.full_vector;
+        }
+        out_result->accepted_modes.push_back(std::move(mode));
+    }
+    const Candidate &selected = candidates.front();
+    out_result->accepted_mode_count = static_cast<std::uint32_t>(out_result->accepted_modes.size());
+    out_result->selected_eigenpair_index = static_cast<std::uint32_t>(selected.eigenpair_index);
+    out_result->positive_frequency_branch_found = true;
+    out_result->eigenvalue_real = selected.lambda_real;
+    out_result->eigenvalue_imag = selected.lambda_imag;
+    out_result->omega_rad_s = selected.omega_rad_s;
+    out_result->frequency_hz = selected.frequency_hz;
+    const FrequencyDomainStatus certification_status =
+        apply_poisson_airbox_modal_residual_certification(
+            selected.metrics,
+            problem.residual_tolerance,
+            out_result);
+    if (certification_status != FrequencyDomainStatus::ok) {
+        destroy_refinement_ksp();
+        return fail_production_schur(
+            problem,
+            out_result,
+            FrequencyDomainStatus::solve_error,
+            "production shared-domain K0 Schur full descriptor residual failed certification",
+            "poisson_airbox_eigen_full_residual_not_certified");
+    }
+    if (problem.expected_reference_frequency_hz > 0.0) {
+        out_result->relative_reference_frequency_error =
+            std::abs(out_result->frequency_hz - problem.expected_reference_frequency_hz) /
+            problem.expected_reference_frequency_hz;
+    }
+    out_result->reference_frequency_certified =
+        problem.expected_reference_frequency_hz <= 0.0 ||
+        out_result->relative_reference_frequency_error <= 1.0e-10;
+    out_result->status = solve_interrupted
+        ? FrequencyDomainStatus::interrupted
+        : FrequencyDomainStatus::ok;
+    copy_message(out_result->error_message, sizeof(out_result->error_message), "");
+    write_production_schur_diagnostics(
+        problem,
+        *out_result,
+        solve_interrupted ? "interrupted" : "ok",
+        solve_interrupted ? "cancel_requested" : "",
+        out_result);
+    destroy_refinement_ksp();
+    return out_result->status;
+#endif
+#endif
+}
 
 FrequencyDomainStatus certify_poisson_airbox_schur_matshell_cpu(
     const PoissonAirboxEigenBlockProblem &problem,
@@ -1120,7 +7126,8 @@ FrequencyDomainStatus certify_poisson_airbox_schur_matshell_cpu(
         "PA-E3 Schur MatShell certification requires PETSc/SLEPc",
         "slepc_not_available");
 #else
-    PoissonAirboxModalEigenResult sparse_reference{};
+    auto sparse_reference_storage = std::make_unique<PoissonAirboxModalEigenResult>();
+    PoissonAirboxModalEigenResult &sparse_reference = *sparse_reference_storage;
     FrequencyDomainStatus reference_status =
         solve_poisson_airbox_modal_eigen_cpu_slepc(problem, &sparse_reference);
     if (reference_status != FrequencyDomainStatus::ok) {
@@ -1134,7 +7141,13 @@ FrequencyDomainStatus certify_poisson_airbox_schur_matshell_cpu(
     }
     out_result->full_sparse_reference_frequency_hz = sparse_reference.frequency_hz;
 
-    const std::lock_guard<std::mutex> lock(pa_e3_slepc_mutex());
+    const std::lock_guard<std::mutex> lock(
+        fullmag::fem::runtime::petsc_slepc_process_mutex());
+    if (fullmag::fem::runtime::petsc_slepc_process_is_unsafe_locked()) {
+        return fail(problem, out_result, FrequencyDomainStatus::solve_error,
+                    "PETSc/SLEPc graph is quarantined; process restart required",
+                    "petsc_runtime_unsafe");
+    }
     if (!ensure_slepc_initialized(out_result->error_message)) {
         return fail(
             problem,

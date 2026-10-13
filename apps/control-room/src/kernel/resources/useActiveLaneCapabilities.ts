@@ -7,6 +7,14 @@ import { useSessionStatusSelector } from "./useSessionStatus";
 export type ActiveLaneCapabilitySnapshot =
   LiveStatusResource["capabilities"]["active_lane"];
 
+export function resolveActiveLaneDiscretization(
+  snapshot: ActiveLaneCapabilitySnapshot | null,
+): "fdm" | "fem" | "unknown" {
+  if (snapshot?.source.kind !== "planner") return "unknown";
+  const value = snapshot.resolved?.discretization;
+  return value === "fdm" || value === "fem" ? value : "unknown";
+}
+
 export type ActiveLaneOperationId =
   | "grid_build"
   | "shared_mesh_build"
@@ -16,6 +24,8 @@ export type ActiveLaneOperationId =
   | "air_void_overlay"
   | "region_membership"
   | "hover_select_cell"
+  | "initial_magnetization.uniform"
+  | "initial_magnetization.vortex"
   | "interaction.exchange"
   | "interaction.demag"
   | "interaction.dmi"
@@ -25,6 +35,7 @@ export type ActiveLaneOperationId =
   | "interaction.sot"
   | "interaction.stt"
   | "interaction.interfacial_dmi"
+  | "interaction.rotated_interfacial_dmi"
   | "interaction.bulk_dmi"
   | "interaction.uniaxial_anisotropy"
   | "interaction.cubic_anisotropy"

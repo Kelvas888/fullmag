@@ -10,6 +10,7 @@ import {
   type ActiveLaneOperationId,
 } from "@/kernel/resources/useActiveLaneCapabilities";
 import { DEFAULT_RELAX_TORQUE_APM } from "@/shared/domain/physics/torqueUnits";
+import { readStudyStageSource } from "@/shared/domain/study/studyStageSource";
 import { validateFieldDriveDraft } from "@/shared/domain/physics/fieldDrive";
 import {
   DEFAULT_HYSTERESIS_BRANCH_MODE,
@@ -129,6 +130,7 @@ const MAX_HYSTERESIS_AUTHORING_FIELD_POINTS = 10_000;
 
 export type StudyStageDraftKind =
   | "add_field_drive"
+  | "antenna_field_solve"
   | "autosave"
   | "change_device"
   | "eigenmodes"
@@ -175,6 +177,9 @@ export interface StudyStageDraft {
   algorithm: string;
   artifactName: string;
   autosave: StudyAutosaveStageDraft;
+  biasFieldContinuationSeed: string;
+  biasFieldEquilibriumPolicy: string;
+  biasFieldSamplesApm: string;
   bc: string;
   calculationMode: string;
   count: string;
@@ -241,6 +246,9 @@ export interface StudyStageDraft {
   // Hysteresis expansion fields
   protocolKind: string;
   rawStage?: JsonObject;
+  pipelineNodeId?: string;
+  pipelineEnabled?: boolean;
+  pipelineGroupIds?: readonly string[];
   initialStatePolicy: string;
   initialStateRef: string;
   orientationMode: string;
@@ -266,6 +274,14 @@ export interface StudyStageDraft {
 export interface StudyStageDraftValidation {
   message: string;
   severity: "error" | "warning";
+}
+
+/** Revisioned runtime prerequisites for the production K0 periodic-airbox lane. */
+export interface K0ModalExecutionReadiness {
+  acceptedEquilibriumReady?: boolean;
+  periodicCertificateReady?: boolean;
+  sharedDomainMeshReady?: boolean;
+  strictGpuReady?: boolean;
 }
 
 const DEFAULT_FIELD_DRIVE: RegionalFieldDriveResource = {
@@ -320,6 +336,10 @@ export function relaxationAlgorithmAvailability(
     demagEnabled?: boolean;
     device: string;
     mode: string;
+    sharedDomainMeshReady?: boolean;
+    periodicCertificateReady?: boolean;
+    acceptedEquilibriumReady?: boolean;
+    strictGpuReady?: boolean;
   },
 ): { reason: string | null; supported: boolean } {
   if (
@@ -352,6 +372,9 @@ const DEFAULT_RELAX_STAGE_DRAFT: StudyStageDraft = {
   algorithm: "llg_overdamped",
   artifactName: "state_snapshot",
   autosave: DEFAULT_AUTOSAVE,
+  biasFieldContinuationSeed: "initial_state",
+  biasFieldEquilibriumPolicy: "relax_each",
+  biasFieldSamplesApm: "",
   bc: "free",
   calculationMode: "",
   count: "10",
@@ -442,6 +465,9 @@ const DEFAULT_RUN_STAGE_DRAFT: StudyStageDraft = {
   algorithm: "llg_overdamped",
   artifactName: "state_snapshot",
   autosave: DEFAULT_AUTOSAVE,
+  biasFieldContinuationSeed: "initial_state",
+  biasFieldEquilibriumPolicy: "relax_each",
+  biasFieldSamplesApm: "",
   bc: "free",
   calculationMode: "",
   count: "10",
@@ -715,7 +741,7 @@ export function createStudyStageDraft(
   const kind = stageKind(record);
   const action = asRecord(record?.action);
   const payload = asRecord(record?.payload);
-  if (kind === "unsupported") {
+  if (kind === "unsupported" || kind === "antenna_field_solve") {
     return cloneStudyStageDraft({
       ...DEFAULT_RELAX_STAGE_DRAFT,
       kind,
@@ -1173,6 +1199,9 @@ export function createDefaultStudyStageDraft(
   kind: StudyStageDraftKind,
   stageCount: number,
 ): StudyStageDraft {
+  if (kind === "antenna_field_solve") {
+    throw new Error("Add an existing antenna field-solve definition to Study instead of creating an unbound stage.");
+  }
   const base =
     kind === "add_field_drive"
       ? DEFAULT_ADD_FIELD_DRIVE_STAGE_DRAFT
@@ -1205,9 +1234,9 @@ export function createDefaultStudyStageDraft(
 export function studyStageDraftToSceneStage(
   draft: StudyStageDraft,
 ): JsonObject {
-  if (draft.kind === "unsupported") {
+  if (draft.kind === "unsupported" || draft.kind === "antenna_field_solve") {
     if (!draft.rawStage) {
-      throw new Error("unsupported study stage requires its preserved raw payload");
+      throw new Error("reference-only study stage requires its preserved raw payload");
     }
     return structuredClone(draft.rawStage);
   }
@@ -1320,7 +1349,7 @@ export function studyStageDraftToSceneStage(
       entrypoint_kind: "flat_run",
       kind: "run",
       stage_id: requiredText(draft.stageId, "run"),
-      until_seconds: requiredNumber(draft.untilSeconds, "until_seconds"),
+      until_seconds: String(requiredNumber(draft.untilSeconds, "until_seconds")),
     };
     const autosave = stageAutosaveDraftToValue(draft.stageAutosave, "run");
     if (autosave) stage.autosave = autosave;
@@ -1341,6 +1370,8 @@ export function studyStageDraftToSceneStage(
     setOptionalNumber(stage, "eigen_frequency_min", draft.frequencyMin);
     setOptionalNumber(stage, "eigen_frequency_max", draft.frequencyMax);
     setOptionalText(stage, "eigen_k_path", draft.kPath);
+    stage.magnetostatic_bc = requiredText(draft.magnetostaticBc, "open");
+    stage.eigen_magnetostatic_bc = stage.magnetostatic_bc;
     return stage;
   }
   if (draft.kind === "frequency_response") {
@@ -1509,7 +1540,7 @@ export function studyStageDraftToSceneStage(
     algorithm: requiredText(draft.algorithm, "llg_overdamped"),
     entrypoint_kind: "flat_relax",
     kind: "relax",
-    max_steps: requiredInteger(draft.maxSteps, "max_steps"),
+    max_steps: String(requiredInteger(draft.maxSteps, "max_steps")),
     stage_id: requiredText(draft.stageId, "relax"),
     torque_tolerance_apm: requiredNumber(
       draft.torqueTolerance,
@@ -1527,7 +1558,7 @@ export function studyStageDraftToSceneStage(
     setOptionalNumber(stage, "relax_alpha", draft.relaxAlpha);
     setOptionalText(stage, "integrator", draft.solver);
     if (draft.timestepMode === "fixed" && draft.dt.trim()) {
-      stage.fixed_timestep = requiredNumber(draft.dt, "fixed_timestep");
+      stage.fixed_timestep = String(requiredNumber(draft.dt, "fixed_timestep"));
     } else if (draft.timestepMode === "adaptive") {
       const adaptive: JsonObject = { tolerance_mode: draft.toleranceMode };
       if (draft.toleranceMode === "advanced") {
@@ -1574,9 +1605,18 @@ export function studyStageDraftToSceneStage(
   return stage;
 }
 
+export function antennaFieldSolvePortReferences(raw: JsonObject | undefined): string[] {
+  if (raw && "port_mode_id" in raw) {
+    if ("port_mode_ids" in raw && (!Array.isArray(raw.port_mode_ids) || raw.port_mode_ids.length !== 0)) return [];
+    return typeof raw.port_mode_id === "string" && raw.port_mode_id.trim() ? [raw.port_mode_id] : [];
+  }
+  return Array.isArray(raw?.port_mode_ids) && raw.port_mode_ids.every((id) => typeof id === "string" && id.trim())
+    ? raw.port_mode_ids as string[] : [];
+}
+
 export function validateStudyStageDraft(
   draft: StudyStageDraft,
-  execution?: {
+  execution?: K0ModalExecutionReadiness & {
     activeLane?: ActiveLaneCapabilitySnapshot | null;
     algorithmsAvailable?: readonly string[];
     backend: string;
@@ -1589,6 +1629,14 @@ export function validateStudyStageDraft(
   const issues: StudyStageDraftValidation[] = [];
   if (!draft.stageId.trim()) {
     issues.push({ message: "Stage ID is required.", severity: "error" });
+  }
+  if (draft.kind === "antenna_field_solve") {
+    const raw = draft.rawStage;
+    if (!raw || typeof raw.stage_id !== "string" || !raw.stage_id.trim()
+      || antennaFieldSolvePortReferences(raw).length !== 1) {
+      issues.push({ message: "Antenna field solve requires an explicit definition ID and exactly one executable port reference.", severity: "error" });
+    }
+    return issues;
   }
   if (draft.kind === "unsupported") {
     issues.push({
@@ -1736,6 +1784,7 @@ export function validateStudyStageDraft(
     }
     validateOptionalVector3(issues, draft.kVector, "k vector");
     validateOptionalJson(issues, draft.kSampling, "k sampling");
+    validateBiasFieldSweepDraft(issues, draft);
     validateJsonOrString(issues, draft.bc, "BC");
     validateSupportedText(
       issues,
@@ -1743,6 +1792,21 @@ export function validateStudyStageDraft(
       SUPPORTED_FREQUENCY_MAGNETOSTATIC_BCS,
       "Magnetostatic BC",
     );
+    if (draft.magnetostaticBc === "periodic_airbox_k0") {
+      if (!draft.includeDemag) issues.push({ severity: "error", message: "periodic_airbox_k0 requires demag." });
+      if (draft.bc !== "periodic") issues.push({ severity: "error", message: "periodic_airbox_k0 requires periodic spin-wave BC." });
+      if (draft.kVector !== "0,0,0" && draft.kVector !== "0, 0, 0") issues.push({ severity: "error", message: "periodic_airbox_k0 requires k=(0,0,0)." });
+      if (draft.dampingPolicy !== "ignore") issues.push({ severity: "error", message: "periodic_airbox_k0 requires zero damping." });
+      if (execution?.sharedDomainMeshReady === false) issues.push({ severity: "error", message: "periodic_airbox_k0 requires a shared-domain mesh." });
+      if (execution?.periodicCertificateReady === false) issues.push({ severity: "error", message: "periodic_airbox_k0 requires a periodic certificate." });
+      if (execution?.acceptedEquilibriumReady === false) issues.push({ severity: "error", message: "periodic_airbox_k0 requires an accepted equilibrium." });
+      if (
+        (execution?.device === "gpu" || draft.deviceTarget === "gpu") &&
+        execution?.strictGpuReady === false
+      ) {
+        issues.push({ severity: "error", message: "Strict GPU K0 modal demag prerequisites are unavailable." });
+      }
+    }
     return issues;
   }
   if (draft.kind === "frequency_response") {
@@ -2020,9 +2084,18 @@ function joinOptions(options: readonly string[]): string {
 
 export function buildStudyStagesMergePatch(
   stages: readonly StudyStageDraft[],
+  baseRevision?: number | null,
+  scene?: unknown,
 ): AuthoringTransactionRequest {
+  const study = asRecord(asRecord(scene)?.study);
+  if (readStudyStageSource(study).kind !== "flat" || stages.some((stage) => stage.pipelineNodeId)) {
+    throw new Error("Editing a canonical pipeline through the flat-stage editor is not supported; no dormant stages were written.");
+  }
   return {
     kind: "merge_patch",
+    ...(baseRevision === undefined || baseRevision === null
+      ? {}
+      : { base_revision: baseRevision }),
     merge_patch: {
       study: {
         stages: stages.map(studyStageDraftToSceneStage),
@@ -3293,6 +3366,7 @@ function stageKind(record: JsonRecord | null): StudyStageDraftKind {
   }
   const kind = String(authoredKind);
   const normalized = kind.toLowerCase();
+  if (normalized === "antenna_field_solve" || normalized === "flat_antenna_field_solve") return "antenna_field_solve";
   if (normalized.includes("add_field_drive")) return "add_field_drive";
   if (normalized.includes("table_autosave")) return "table_autosave";
   if (normalized.includes("fft_response")) return "fft_response";
@@ -3388,8 +3462,24 @@ function spectralDraft(
   index: number,
   kind: "eigenmodes" | "frequency_response",
 ): StudyStageDraft {
+  const biasFieldSweep = asRecord(
+    kind === "eigenmodes"
+      ? spectralRecordValue(record, kind, "bias_field_sweep")
+      : undefined,
+  );
   return {
     ...base,
+    biasFieldContinuationSeed: scalarText(
+      biasFieldSweep?.continuation_seed,
+      base.biasFieldContinuationSeed,
+    ),
+    biasFieldEquilibriumPolicy: scalarText(
+      biasFieldSweep?.equilibrium_policy,
+      base.biasFieldEquilibriumPolicy,
+    ),
+    biasFieldSamplesApm: biasFieldSweepSamplesText(
+      biasFieldSweep?.samples_a_per_m,
+    ),
     bc: scalarOrObjectText(
       spectralRecordValue(record, kind, "spin_wave_bc") ?? record?.bc,
       base.bc,
@@ -3511,6 +3601,11 @@ function spectralSceneStage(
     stage.eigen_damping_policy = stage.damping_policy;
     if (kVector) stage.eigen_k_vector = kVector;
     if (kSampling) stage.eigen_k_sampling = kSampling;
+    const biasFieldSweep = optionalBiasFieldSweep(draft);
+    if (biasFieldSweep) {
+      stage.bias_field_sweep = biasFieldSweep;
+      stage.eigen_bias_field_sweep = biasFieldSweep;
+    }
     stage.eigen_spin_wave_bc = stage.bc;
   } else {
     stage.magnetostatic_bc = requiredText(draft.magnetostaticBc, "open");
@@ -3595,6 +3690,71 @@ function vectorText(value: unknown, fallback: string): string {
   return Array.isArray(value) && value.length === 3
     ? value.join(", ")
     : scalarText(value, fallback);
+}
+
+function biasFieldSweepSamplesText(value: unknown): string {
+  if (!Array.isArray(value)) return "";
+  return value
+    .filter((sample): sample is unknown[] => Array.isArray(sample))
+    .map((sample) => sample.join(", "))
+    .join("\n");
+}
+
+function optionalBiasFieldSweep(draft: StudyStageDraft): JsonObject | null {
+  if (!draft.biasFieldSamplesApm.trim()) return null;
+  return {
+    samples_a_per_m: parseBiasFieldSweepSamples(draft.biasFieldSamplesApm),
+    equilibrium_policy: requiredText(
+      draft.biasFieldEquilibriumPolicy,
+      "relax_each",
+    ),
+    ordering: "declared",
+    continuation_seed: requiredText(
+      draft.biasFieldContinuationSeed,
+      "initial_state",
+    ),
+  };
+}
+
+function parseBiasFieldSweepSamples(value: string): JsonValue[] {
+  const rows = value.split(/\n|;/).map((row) => row.trim()).filter(Boolean);
+  if (rows.length === 0) {
+    throw new Error("bias_field_sweep requires at least one [Hx, Hy, Hz] sample.");
+  }
+  return rows.map((row) => requiredVector3(row, "bias_field_sweep sample"));
+}
+
+function validateBiasFieldSweepDraft(
+  issues: StudyStageDraftValidation[],
+  draft: StudyStageDraft,
+): void {
+  if (!draft.biasFieldSamplesApm.trim()) return;
+  try {
+    parseBiasFieldSweepSamples(draft.biasFieldSamplesApm);
+  } catch (error) {
+    issues.push({
+      message: error instanceof Error ? error.message : "Bias field scan is invalid.",
+      severity: "error",
+    });
+  }
+  if (draft.kVector.trim() !== "0,0,0" && draft.kVector.trim() !== "0, 0, 0") {
+    issues.push({
+      message: "Bias field scan requires a single Gamma point k=(0,0,0).",
+      severity: "error",
+    });
+  }
+  if (draft.kSampling.trim() || draft.kPath.trim()) {
+    issues.push({
+      message: "Bias field scan cannot be combined with k-path sampling.",
+      severity: "error",
+    });
+  }
+  if (!new Set(["relax_each", "continuation"]).has(draft.biasFieldEquilibriumPolicy)) {
+    issues.push({ message: "Bias field scan equilibrium policy is invalid.", severity: "error" });
+  }
+  if (!new Set(["initial_state", "previous_accepted_equilibrium"]).has(draft.biasFieldContinuationSeed)) {
+    issues.push({ message: "Bias field scan continuation seed is invalid.", severity: "error" });
+  }
 }
 
 function legacyVectorSweepToMilliteslaRange(

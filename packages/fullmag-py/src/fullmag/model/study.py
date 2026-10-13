@@ -7,7 +7,7 @@ from typing import Mapping, Sequence
 
 from fullmag.model.constraints import FrozenSpins
 from fullmag.model.dynamics import LLG
-from fullmag.model.eigen import ModeTracking, coerce_k_sampling
+from fullmag.model.eigen import BiasFieldSweep, ModeTracking, coerce_k_sampling
 from fullmag.model.outputs import (
     SaveDispersion,
     SaveEigenDiagnostics,
@@ -173,12 +173,72 @@ class FrequencyResponseSolverPolicy:
         return policy
 
 
+# The native FEM modal planner bounds both counters by i32::MAX.
+_MAX_FEM_EIGEN_SOLVER_ITERATIONS = (1 << 31) - 1
+
+
+@dataclass(frozen=True, slots=True)
+class FemEigenSolverPolicy:
+    """Optional native PETSc/SLEPc controls for FEM modal eigensolves."""
+
+    residual_tolerance: float | None = None
+    max_outer_iterations: int | None = None
+    max_linear_iterations: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.residual_tolerance is not None:
+            if isinstance(self.residual_tolerance, bool):
+                raise TypeError("residual_tolerance must be a real number")
+            tolerance = float(self.residual_tolerance)
+            if not math.isfinite(tolerance) or tolerance <= 0.0:
+                raise ValueError("residual_tolerance must be finite and positive")
+            object.__setattr__(self, "residual_tolerance", tolerance)
+        if self.max_outer_iterations is not None:
+            object.__setattr__(
+                self,
+                "max_outer_iterations",
+                _positive_fem_eigen_solver_iterations(
+                    self.max_outer_iterations, "max_outer_iterations"
+                ),
+            )
+        if self.max_linear_iterations is not None:
+            object.__setattr__(
+                self,
+                "max_linear_iterations",
+                _positive_fem_eigen_solver_iterations(
+                    self.max_linear_iterations, "max_linear_iterations"
+                ),
+            )
+
+    def to_ir(self) -> dict[str, object]:
+        policy: dict[str, object] = {}
+        if self.residual_tolerance is not None:
+            policy["residual_tolerance"] = self.residual_tolerance
+        if self.max_outer_iterations is not None:
+            policy["max_outer_iterations"] = self.max_outer_iterations
+        if self.max_linear_iterations is not None:
+            policy["max_linear_iterations"] = self.max_linear_iterations
+        return policy
+
+
 def _positive_int(value: object, field_name: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise TypeError(f"{field_name} must be an integer")
     if value <= 0:
         raise ValueError(f"{field_name} must be positive")
     return value
+
+
+def _positive_fem_eigen_solver_iterations(value: object, field_name: str) -> int:
+    iterations = _positive_int(value, field_name)
+    if iterations > _MAX_FEM_EIGEN_SOLVER_ITERATIONS:
+        raise ValueError(
+            f"{field_name} must fit the native signed iteration limit "
+            f"(<= {_MAX_FEM_EIGEN_SOLVER_ITERATIONS})"
+        )
+    return iterations
+
+
 SUPPORTED_FIELD_ORIENTATION_PRESETS = {
     "oop_positive",
     "oop_negative",
@@ -249,6 +309,7 @@ SUPPORTED_TABLE_AUTOSAVE_QUANTITIES = frozenset(
         "e_drive",
         "e_ani",
         "e_dmi",
+        "e_rotated_dmi",
         "e_total",
         "max_dm_dt",
         "max_h_eff",
@@ -263,6 +324,7 @@ TABLE_AUTOSAVE_QUANTITY_ALIASES = {
     "solver_dt": "dt",
     "E_total": "e_total",
     "E_drive": "e_drive",
+    "E_rotated_dmi": "e_rotated_dmi",
     "max_torque_Apm": "max_torque",
 }
 
@@ -590,6 +652,11 @@ class FloquetBC:
 SpinWaveBoundarySpec = str | dict[str, object] | PeriodicBC | FloquetBC
 
 
+def _spin_wave_bc_kind(value: SpinWaveBoundarySpec) -> str:
+    serialized = _serialize_spin_wave_bc(value)
+    return serialized if isinstance(serialized, str) else str(serialized["kind"])
+
+
 def _serialize_spin_wave_bc(value: SpinWaveBoundarySpec) -> str | dict[str, object]:
     if hasattr(value, "to_ir"):
         serialized = value.to_ir()
@@ -607,6 +674,21 @@ def _serialize_spin_wave_bc(value: SpinWaveBoundarySpec) -> str | dict[str, obje
             raise ValueError(f"spin_wave_bc.kind must be one of: {supported}")
         return serialized
     raise ValueError("spin_wave_bc must be a string, mapping, PeriodicBC, or FloquetBC")
+
+
+@dataclass(frozen=True, slots=True)
+class AntennaFieldSolve:
+    """Standalone charge/antenna stage family without magnetic dynamics."""
+
+    @property
+    def outputs(self) -> tuple[TimeOutputSpec, ...]:
+        return ()
+
+    def to_ir(self) -> dict[str, object]:
+        return {
+            "kind": "antenna_field_solve",
+            "sampling": {"outputs": []},
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -1021,10 +1103,13 @@ class Eigenmodes:
     include_demag: bool = True
     k_sampling: object | None = None
     k_vector: tuple[float, float, float] | None = None
+    bias_field_sweep: BiasFieldSweep | None = None
     mode_tracking: ModeTracking | None = None
     normalization: str = "unit_l2"
     damping_policy: str = "ignore"
     spin_wave_bc: SpinWaveBoundarySpec = "free"
+    magnetostatic_bc: str = "open"
+    solver_policy: FemEigenSolverPolicy | None = None
     dynamics: LLG = field(default_factory=LLG)
 
     def __post_init__(self) -> None:
@@ -1072,8 +1157,41 @@ class Eigenmodes:
             ),
         )
         _serialize_spin_wave_bc(self.spin_wave_bc)
+        magnetostatic_bc = require_non_empty(self.magnetostatic_bc, "magnetostatic_bc")
+        if magnetostatic_bc not in SUPPORTED_MAGNETOSTATIC_BCS:
+            supported = ", ".join(sorted(SUPPORTED_MAGNETOSTATIC_BCS))
+            raise ValueError(f"magnetostatic_bc must be one of: {supported}")
+        object.__setattr__(self, "magnetostatic_bc", magnetostatic_bc)
+        if self.solver_policy is not None and not isinstance(
+            self.solver_policy,
+            FemEigenSolverPolicy,
+        ):
+            raise TypeError("solver_policy must be FemEigenSolverPolicy")
+        if magnetostatic_bc == "periodic_airbox_k0":
+            if not self.include_demag:
+                raise ValueError("periodic_airbox_k0 requires include_demag=True")
+            if _spin_wave_bc_kind(self.spin_wave_bc) != "periodic":
+                raise ValueError("periodic_airbox_k0 requires spin_wave_bc='periodic'")
+            sampling = coerce_k_sampling(k_sampling=self.k_sampling, legacy_k_vector=self.k_vector)
+            if sampling != {"kind": "single", "k_vector": [0.0, 0.0, 0.0]}:
+                raise ValueError("periodic_airbox_k0 requires k_vector=(0.0, 0.0, 0.0)")
+            if self.damping_policy != "ignore":
+                raise ValueError("periodic_airbox_k0 requires damping_policy='ignore'")
         # Validate alias / primary representation early to fail loudly.
-        coerce_k_sampling(k_sampling=self.k_sampling, legacy_k_vector=self.k_vector)
+        sampling = coerce_k_sampling(k_sampling=self.k_sampling, legacy_k_vector=self.k_vector)
+        if self.bias_field_sweep is not None:
+            if not isinstance(self.bias_field_sweep, BiasFieldSweep):
+                raise TypeError("bias_field_sweep must be a BiasFieldSweep")
+            if sampling != {"kind": "single", "k_vector": [0.0, 0.0, 0.0]}:
+                raise ValueError("bias_field_sweep requires k_sampling at single Gamma")
+            if not self.include_demag:
+                raise ValueError("bias_field_sweep requires include_demag=True")
+            if magnetostatic_bc != "periodic_airbox_k0":
+                raise ValueError("bias_field_sweep requires magnetostatic_bc='periodic_airbox_k0'")
+            if _spin_wave_bc_kind(self.spin_wave_bc) != "periodic":
+                raise ValueError("bias_field_sweep requires spin_wave_bc='periodic'")
+            if self.damping_policy != "ignore":
+                raise ValueError("bias_field_sweep requires damping_policy='ignore'")
 
     def to_ir(self) -> dict[str, object]:
         target: dict[str, object]
@@ -1116,10 +1234,15 @@ class Eigenmodes:
             "normalization": self.normalization,
             "damping_policy": self.damping_policy,
             "spin_wave_bc": _serialize_spin_wave_bc(self.spin_wave_bc),
+            "magnetostatic_bc": self.magnetostatic_bc,
             "sampling": {"outputs": [output.to_ir() for output in self.outputs]},
         }
         if self.mode_tracking is not None:
             payload["mode_tracking"] = self.mode_tracking.to_ir()
+        if self.bias_field_sweep is not None:
+            payload["bias_field_sweep"] = self.bias_field_sweep.to_ir()
+        if self.solver_policy is not None:
+            payload["solver_policy"] = self.solver_policy.to_ir()
         return payload
 
 

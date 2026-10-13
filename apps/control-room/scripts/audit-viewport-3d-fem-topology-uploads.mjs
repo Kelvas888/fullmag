@@ -859,12 +859,34 @@ function makeFemTopologyBuffer(partCount) {
 }
 
 async function installFemFixtureApi(page, fixture) {
-  await page.route("**/v2/sessions/current/**", async (route) => {
+  await page.route("**/v2/**", async (route) => {
     const request = route.request();
     const requestUrl = new URL(request.url());
     const requestPath = requestUrl.pathname;
     fixture.requests.push(requestPath);
     if (request.method() === "OPTIONS") return fulfillEmpty(route, 204);
+    if (requestPath === "/v2/sessions") {
+      return fulfillJson(route, {
+        schema_version: "session-list.v1",
+        sessions: [{
+          current: true,
+          name: "FEM topology upload fixture",
+          session_id: "fem-topology-upload-fixture",
+          status: "running",
+        }],
+      });
+    }
+    if (requestPath === "/v2/platform/health") {
+      return fulfillJson(route, {
+        active_session: true,
+        api_contract_version: "v2",
+        status: "ok",
+        uptime_seconds: 1,
+      });
+    }
+    if (requestPath === "/v2/platform/capabilities") {
+      return fulfillJson(route, { engines: [], profile_version: "fixture.v1" });
+    }
     if (requestPath === "/v2/sessions/current/status") return fulfillJson(route, femStatusFixture());
     if (requestPath === "/v2/sessions/current/visualization/state") return fulfillJson(route, fixture.visualizationState);
     if (requestPath === "/v2/sessions/current/data/domain/meta") return fulfillJson(route, fixture.domainMeta ?? femDomainMetaFixture());
@@ -892,7 +914,7 @@ function femStatusFixture() {
     resources: { artifact_revision: 0, artifacts_revision: 0, command_completion_revision: 0, commands_revision: 0, display_revision: 1, domain_generation_id: 1, engine_log_revision: 0, field_catalog_revision: 1, field_revision: 1, fields_revision: 1, mesh_build_revision: 1, mesh_revision: 1, scalars_revision: 0, scene_revision: 1, slice_revision: 0, stages_revision: 0, topology_revision: 1, visualization_state_revision: 1, workspace_revision: 0 },
     run: null,
     runtime_bundle_version: "fem-topology-upload-fixture",
-    session: { created_at: "0", name: "FEM topology upload fixture", session_epoch: "fem-topology-upload-fixture@0", session_id: "fem-topology-upload-fixture", workspace_root: "/tmp/fullmag-fem-topology-upload-fixture" },
+    session: { created_at: "0", name: "FEM topology upload fixture", request_scope_epoch: "fem-topology-upload-fixture-scope@0", session_epoch: "fem-topology-upload-fixture@0", session_id: "fem-topology-upload-fixture", workspace_root: "/tmp/fullmag-fem-topology-upload-fixture" },
     solver: { state: "idle" },
   };
 }

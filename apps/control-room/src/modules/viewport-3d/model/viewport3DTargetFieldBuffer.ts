@@ -4,7 +4,10 @@ import type {
 } from "@/kernel/api/apiTypes";
 import type { DecodedFieldVector } from "@/kernel/api/codecs";
 import { fieldVectorComponentsSemanticallyEqual } from "@/kernel/api/fieldQueryIdentity";
-import { resolveCanonicalQuantityId } from "@/kernel/api/quantityIds";
+import {
+  resolveCanonicalQuantityId,
+  sameRenderableFieldQuantityId,
+} from "@/kernel/api/quantityIds";
 import type { SurfaceFieldProjectionMode } from "@/kernel/visualization/ObjectVisualizationController";
 import type { SessionResourceIdentity } from "@/kernel/resources/sessionResourceIdentity";
 
@@ -12,6 +15,7 @@ import type {
   Viewport3DFieldComponentDemand,
   Viewport3DFieldScopeKind,
 } from "./viewport3DFieldDataPlan";
+import type { Viewport3DFieldVector } from "../viewport3dFieldMapping";
 import { buildViewport3DFieldResourceRequestId } from "./viewport3DFieldDataPlan";
 import {
   resolveViewport3DFieldDomainCompatibility,
@@ -80,8 +84,8 @@ export type Viewport3DTargetFieldInputSource =
 
 export interface Viewport3DTargetFieldInput {
   explicitFieldBuffer: Viewport3DTargetFieldBuffer | null;
-  explicitFieldVector: DecodedFieldVector | null;
-  fieldVector: DecodedFieldVector | null;
+  explicitFieldVector: Viewport3DFieldVector | null;
+  fieldVector: Viewport3DFieldVector | null;
   source: Viewport3DTargetFieldInputSource;
 }
 
@@ -113,7 +117,8 @@ export function buildViewport3DTargetFieldBuffer({
   topologyRevision?: string | null;
 }): Viewport3DTargetFieldBuffer {
   const validSessionIdentity =
-    sessionIdentity?.sessionId?.trim() && sessionIdentity.sessionEpoch?.trim()
+    sessionIdentity?.sessionId?.trim() && sessionIdentity.sessionEpoch?.trim() &&
+      sessionIdentity.requestScopeEpoch?.trim()
       ? sessionIdentity
       : null;
   const component = resolveTargetFieldBufferComponent(fieldVector, query);
@@ -204,6 +209,7 @@ export function buildViewport3DTargetFieldBuffer({
       indexing,
       sessionEpoch: validSessionIdentity?.sessionEpoch ?? null,
       sessionId: validSessionIdentity?.sessionId ?? null,
+      requestScopeEpoch: validSessionIdentity?.requestScopeEpoch ?? null,
       topologyRevision,
     }),
     capability,
@@ -322,8 +328,8 @@ export function resolveViewport3DTargetFieldInput({
   partId,
   targetFieldBuffers,
 }: {
-  fallbackFieldVector: DecodedFieldVector | null | undefined;
-  legacyPartFieldVectors?: ReadonlyMap<string, DecodedFieldVector>;
+  fallbackFieldVector: Viewport3DFieldVector | null | undefined;
+  legacyPartFieldVectors?: ReadonlyMap<string, Viewport3DFieldVector>;
   partId: string;
   targetFieldBuffers?: ReadonlyMap<string, Viewport3DTargetFieldBuffer>;
 }): Viewport3DTargetFieldInput {
@@ -527,8 +533,7 @@ export function viewport3DTargetFieldBufferMatchesQuantity(
   return (
     !buffer ||
     quantityId == null ||
-    resolveCanonicalQuantityId(buffer.quantityId) ===
-      resolveCanonicalQuantityId(quantityId)
+    sameRenderableFieldQuantityId(buffer.quantityId, quantityId)
   );
 }
 
@@ -544,6 +549,7 @@ function buildViewport3DTargetFieldBufferId({
   indexing,
   sessionEpoch,
   sessionId,
+  requestScopeEpoch,
   topologyRevision,
 }: {
   component: Exclude<Viewport3DFieldComponentDemand, "none">;
@@ -557,11 +563,13 @@ function buildViewport3DTargetFieldBufferId({
   indexing: NonNullable<DecodedFieldVector["indexing"]>;
   sessionEpoch: string | null;
   sessionId: string | null;
+  requestScopeEpoch: string | null;
   topologyRevision: string | null;
 }): string {
   return [
     sessionId ?? "session:none",
     sessionEpoch ?? "epoch:none",
+    requestScopeEpoch ?? "request-epoch:none",
     resolveCanonicalQuantityId(quantityId),
     component,
     scopeKind,

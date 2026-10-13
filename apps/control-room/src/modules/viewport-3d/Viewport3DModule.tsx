@@ -1,4 +1,6 @@
 "use client";
+import { useAntennaFieldOverlay } from "./hooks/useAntennaFieldOverlay";
+import { antennaFieldDisplayLabel } from "@/kernel/visualization/antennaFieldIntent";
 
 import { useThree } from "@react-three/fiber";
 import {
@@ -34,8 +36,8 @@ import {
 import type { MeshSizeHistogramHighlight } from "@/kernel/events/eventTypes";
 import { useMeshHistogramBinElementsResource } from "@/kernel/resources/geometryLifecycleResources";
 import { useSessionResourceIdentity } from "@/kernel/resources/useSessionStatus";
-import type { SessionResourceIdentity } from "@/kernel/resources/sessionResourceIdentity";
-import { useFieldMetaResource } from "@/kernel/resources/studyRuntimeResources";
+import { sessionResourceIdentityKey, type SessionResourceIdentity } from "@/kernel/resources/sessionResourceIdentity";
+import { useFieldMetaResource, useSolverStatusResource } from "@/kernel/resources/studyRuntimeResources";
 import {
   frozenSpinsMaskIdFromResource,
   useFrozenSpinsActivePreviewId,
@@ -57,6 +59,7 @@ import {
   type SemanticRenderTargetCatalog,
 } from "@/kernel/selection/semanticRenderTargetCatalog";
 import { WorkspaceRenderProfiler } from "@/kernel/performance/reactRenderProfiler";
+import { useObjectEditSelector } from "@/kernel/authoring/object-edit/useObjectEditSelector";
 import { recordVisualizationDebugResourceCounts } from "@/kernel/performance/visualizationDebugPerformanceProbe";
 import type { ModuleProps } from "@/kernel/types";
 import {
@@ -88,6 +91,7 @@ import {
 } from "@/shared/ui/Dialog";
 
 import { useViewport3DColors } from "./hooks/useViewport3DColors";
+import { withObjectPlacementDraftPreview } from "./viewport3dPrimitiveModel";
 import {
   useViewport3DSceneModel,
   type Viewport3DFieldDataIssue,
@@ -98,7 +102,10 @@ import {
   type Viewport3DVisualizationDebugFrameCommit,
   type Viewport3DVisualizationDebugSource,
 } from "./hooks/useViewport3DVisualizationDebugPublisher";
-import { createViewport3DRenderAdoptionRegistry } from "./model/viewport3DRenderAdoptionRegistry";
+import {
+  createViewport3DRenderAdoptionRegistry,
+  type Viewport3DRenderAdoptionRegistry,
+} from "./model/viewport3DRenderAdoptionRegistry";
 import {
   resolveViewport3DCameraFit,
   normalizeViewport3DOrbitDebugAngles,
@@ -109,11 +116,18 @@ import {
   VIEWPORT_3D_ORBIT_DEBUG_LIMITS,
 } from "./layers/CameraControls";
 import { Viewport3DScene } from "./layers/Viewport3DScene";
+import {
+  useViewport3DObjectMoveInteraction,
+  Viewport3DMoveStatus,
+} from "./Viewport3DObjectMoveInteraction";
 import type { Viewport3DAirboxFrameState } from "./layers/Viewport3DScene";
 import { recordViewport3DCameraTrajectorySample } from "./layers/viewport3DCameraTrajectoryProbe";
 import { resolveViewport3DTargetSurfaceLayerInput } from "./layers/viewport3DLayerPassInputs";
 import type { RegionOverlaySelection } from "./layers/RegionOverlayLayer";
-import { buildFrozenSpinsOverlayModel } from "./layers/FrozenSpinsOverlay";
+import {
+  buildFrozenSpinsOverlayModel,
+  buildFrozenSpinsOverlayModelFromField,
+} from "./layers/FrozenSpinsOverlay";
 import {
   DEFAULT_REGION_DIAGNOSTIC_OVERLAY_STATE,
   regionDiagnosticOverlayMode,
@@ -147,12 +161,16 @@ import {
   type Viewport3DColorbarPlan,
 } from "./model/viewport3DColorbarPlan";
 export { resolveViewport3DColorbarRangeStates } from "./model/viewport3DColorbarPlan";
+
 import {
   useViewport3DResourceCounts,
   useViewport3DResourceTracker,
 } from "./viewport3dDiagnostics";
 import { useViewport3DWorkerRuntime } from "./viewport3dWorkerRuntime";
 import { createViewport3DEventManager } from "./viewport3dEventManager";
+import {
+  useViewport3DFieldVectorRequest,
+} from "./viewport3dResources";
 import { retainViewport3DMeshSizeHighlight } from "./viewport3dMeshSizeHighlight";
 import {
   formatViewport3DInspectComponents,
@@ -195,11 +213,100 @@ import {
   type Viewport3DVisualProfile,
 } from "./viewport3dVisualProfile";
 import {
-  beginViewport3DFieldUpdateHold,
-  endViewport3DFieldUpdateHold,
+  createViewport3DInteractionFieldHold,
 } from "./viewport3dFieldUpdateHold";
 import type { ScalarColorBuffer } from "./viewport3dFieldMapping";
 import { installViewport3DThreeConsolePolicy } from "./viewport3dThreeConsolePolicy";
+import {
+  captureViewport3DThumbnail,
+  resolveViewport3DThumbnailColouring,
+  type Viewport3DThumbnailColouring,
+} from "./viewport3dThumbnail";
+import { registerViewport3DThumbnailCapture } from "./viewport3dThumbnailRegistry";
+
+export function resolveViewport3DVisualizationAckDataIdentity({
+  adoptionRegistry,
+  sessionIdentity,
+  source,
+  visualizationRevision,
+}: {
+  adoptionRegistry: Viewport3DRenderAdoptionRegistry;
+  sessionIdentity: SessionResourceIdentity | null;
+  source: Viewport3DVisualizationDebugSource;
+  visualizationRevision: number;
+}): VisualizationDataAdoptionIdentity | null {
+  if (sessionIdentity?.sessionEpoch && sessionIdentity.sessionId) {
+    const receipt = adoptionRegistry.latestActiveAdoption({
+      sessionEpoch: sessionIdentity.sessionEpoch,
+      sessionId: sessionIdentity.sessionId,
+    });
+    if (receipt?.fieldBufferId && receipt.resourceKey) {
+      const fieldRevision = [...(source.fieldModel?.targetPasses.values() ?? [])]
+        .map((renderPass) => renderPass.fieldBuffer)
+        .find((fieldBuffer) => fieldBuffer?.bufferId === receipt.fieldBufferId)
+        ?.fieldRevision ?? null;
+      return {
+        fieldBufferId: receipt.fieldBufferId,
+        fieldRevision,
+        resourceKey: receipt.resourceKey,
+        sessionEpoch: receipt.sessionEpoch,
+        sessionId: receipt.sessionId,
+        visualizationRevision,
+      };
+    }
+  }
+  const fallback = source.fullFieldBufferIdentity;
+  if (
+    !fallback?.bufferId ||
+    !fallback.resourceKey ||
+    !fallback.sessionEpoch ||
+    !fallback.sessionId
+  ) return null;
+  return {
+    fieldBufferId: fallback.bufferId,
+    fieldRevision: fallback.fieldRevision ?? null,
+    resourceKey: fallback.resourceKey,
+    sessionEpoch: fallback.sessionEpoch,
+    sessionId: fallback.sessionId,
+    visualizationRevision,
+  };
+}
+
+export function resolveViewport3DVisualizationFrameAck({
+  committedDataIdentity,
+  registeredChangeKind,
+}: {
+  committedDataIdentity: VisualizationDataAdoptionIdentity | null;
+  registeredChangeKind: "data" | "style" | null;
+}): {
+  changeKind: "data" | "style";
+  dataIdentity: VisualizationDataAdoptionIdentity | null;
+} {
+  const changeKind = registeredChangeKind ??
+    (committedDataIdentity ? "data" : "style");
+  return {
+    changeKind,
+    dataIdentity: changeKind === "data" ? committedDataIdentity : null,
+  };
+}
+
+export function resolveViewport3DVisualizationAckRegistration({
+  existing,
+  previousResourceFrameKey,
+  resourceFrameKey,
+  resourceKey,
+}: {
+  existing: { changeKind: "data" | "style"; resourceKey: string } | null;
+  previousResourceFrameKey: string | null;
+  resourceFrameKey: string;
+  resourceKey: string;
+}): { changeKind: "data" | "style"; resourceKey: string } {
+  if (existing) return existing;
+  return {
+    changeKind: previousResourceFrameKey === resourceFrameKey ? "style" : "data",
+    resourceKey,
+  };
+}
 
 type Viewport3DSceneProps = ComponentProps<typeof Viewport3DScene>;
 type Viewport3DCanvasCreatedState = Parameters<
@@ -280,6 +387,13 @@ const VIEWPORT_3D_CANVAS_GL_ANTIALIAS = {
 const VIEWPORT_3D_CANVAS_GL_CAPTURE = {
   alpha: false,
   antialias: true,
+  powerPreference: "high-performance" as const,
+  preserveDrawingBuffer: true,
+};
+
+const VIEWPORT_3D_CANVAS_GL_CAPTURE_NO_ANTIALIAS = {
+  alpha: false,
+  antialias: false,
   powerPreference: "high-performance" as const,
   preserveDrawingBuffer: true,
 };
@@ -422,13 +536,27 @@ function formatLegendValue(value: number): string {
   return formatDisplayUnitValue(value);
 }
 
+/**
+ * S-15: mirrors resolveViewport3DCanvasGlOptions (viewport3dVisualProfile.ts)
+ * but returns one of four module-level frozen objects, because the returned
+ * value is handed to R3F as the `gl` prop -- a fresh object literal per render
+ * would make the canvas re-create its renderer. The user-facing
+ * "Antialiasing" toggle now reaches the WebGL context here (it previously only
+ * fed the EffectComposer's `multisampling`, which does not exist while both
+ * post effects are off); the visual profile keeps its veto so
+ * `interactive-lite` stays MSAA-free for performance.
+ */
 function resolveStableViewport3DCanvasGlOptions(
   profile: Viewport3DVisualProfile,
+  antialiasEnabled = true,
 ) {
+  const antialias = profile.antialias && antialiasEnabled;
   if (profile.preserveDrawingBuffer) {
-    return VIEWPORT_3D_CANVAS_GL_CAPTURE;
+    return antialias
+      ? VIEWPORT_3D_CANVAS_GL_CAPTURE
+      : VIEWPORT_3D_CANVAS_GL_CAPTURE_NO_ANTIALIAS;
   }
-  return profile.antialias
+  return antialias
     ? VIEWPORT_3D_CANVAS_GL_ANTIALIAS
     : VIEWPORT_3D_CANVAS_GL_NO_ANTIALIAS;
 }
@@ -1214,7 +1342,12 @@ interface Viewport3DFrameProps
   extends Omit<
     Viewport3DSceneProps,
     | "colors"
+    | "moveDraftResetRevision"
+    | "moveToolObjectId"
     | "onOrbitDebugAnglesChange"
+    | "onMoveCommit"
+    | "onBeginGesture"
+    | "onMoveGestureActiveChange"
     | "onVisualizationFrameCommitted"
     | "orbitDebugAngles"
     | "orbitDebugCommitRevision"
@@ -1228,6 +1361,7 @@ interface Viewport3DFrameProps
   captureRevision: number;
   diagnostics: string;
   domainSummary: string;
+  effectAntialias: boolean;
   fieldDataIssue: Viewport3DFieldDataIssue | null;
   fieldRefresh: Viewport3DFieldRefreshState;
   fdmFieldIdentityCompatible: boolean;
@@ -1249,9 +1383,13 @@ interface Viewport3DFrameProps
   onRegionOverlayVisibilityChange: (visible: boolean) => void;
   regionDiagnosticOverlayState: RegionDiagnosticOverlayState;
   quantityId: string;
+  /** Human label for the HUD: the mode while a mode field is the viewport quantity. */
+  quantityLabel: string;
   renderedMeshRevision: number | string | null;
   scalarColorPalette: string;
+  savedViewportActive: boolean;
   sessionIdentity: SessionResourceIdentity | null;
+  sessionDiscretization: "fdm" | "fem" | null;
   selectedLabel: string;
   slotId: ModuleProps["slotId"];
   status: string;
@@ -1271,11 +1409,12 @@ export default function Viewport3DModule({
   const selection = useSelectionSelector((state) => state, {
     isEqual: selectionSnapshotEquals,
   });
+  const savedViewportSelectionActive =
+    selection.kind === "results.materialized_dataset" &&
+    selection.ref?.type === "materialized-dataset";
   const { select, clear } = useSelectionActions(moduleId);
   const tracker = useViewport3DResourceTracker();
-  const sessionIdentityKey = sessionIdentity
-    ? `${sessionIdentity.sessionId}\u0000${sessionIdentity.sessionEpoch}`
-    : null;
+  const sessionIdentityKey = sessionIdentity ? sessionResourceIdentityKey(sessionIdentity) : null;
   const previousSessionIdentityKeyRef = useRef(sessionIdentityKey);
   useEffect(() => {
     if (previousSessionIdentityKeyRef.current === sessionIdentityKey) return;
@@ -1308,8 +1447,13 @@ export default function Viewport3DModule({
     useState(true);
   const meshHistogramBinElements = useMeshHistogramBinElementsResource(
     meshSizeHighlight?.resource ?? null,
+    { enabled: !savedViewportSelectionActive },
   );
-  const { domainId, ...sceneModel } = useViewport3DSceneModel({
+  const {
+    domainId,
+    savedViewportCamera,
+    ...sceneModel
+  } = useViewport3DSceneModel({
     commandState,
     colors,
     meshSizeHighlight,
@@ -1318,37 +1462,134 @@ export default function Viewport3DModule({
       : null,
     resourceCounts,
     selection,
+    tracker,
   });
+  const solverStatus = useSolverStatusResource({ enabled: true });
+  const runtimeFrozenSpins = solverStatus.data?.frozen_spins ?? null;
+  const runtimeFrozenSpinsFieldRequest = useMemo(
+    () => ({
+      consumers: ["frozen-spins-runtime-overlay"],
+      quantityId: "frozen_spins",
+      query: { component: "full", scope_kind: "full" } as const,
+      requestId: "frozen_spins-runtime-overlay",
+    }),
+    [],
+  );
+  const runtimeFrozenSpinsFieldEnabled = Boolean(solverStatus.data?.run_id);
+  const runtimeFrozenSpinsFieldResource = useViewport3DFieldVectorRequest(
+    runtimeFrozenSpinsFieldRequest,
+    runtimeFrozenSpinsFieldEnabled,
+  );
+  const runtimeFrozenSpinsFieldVector = runtimeFrozenSpinsFieldResource.data;
+  const objectEditSnapshot = useObjectEditSelector(kernel.objectEditSession);
+  const primitiveModelWithPlacementDraft = useMemo(
+    () => withObjectPlacementDraftPreview(
+      sceneModel.primitiveModel,
+      objectEditSnapshot.draft,
+      sceneModel.selectedObjectId,
+    ),
+    [
+      objectEditSnapshot.draft,
+      sceneModel.primitiveModel,
+      sceneModel.selectedObjectId,
+    ],
+  );
+  const {
+    beginInteraction: beginSavedCameraInteraction,
+    endInteraction: endSavedCameraInteraction,
+    patchCamera: patchSavedCamera,
+    saveCameraState: saveSavedCameraState,
+  } = savedViewportCamera;
   const frozenSpinsPreviewId = useFrozenSpinsActivePreviewId();
   const frozenSpinsPreview = useFrozenSpinsPreviewResource(
     frozenSpinsPreviewId ?? "",
-    { enabled: frozenSpinsPreviewId !== null },
+    {
+      enabled:
+        !sceneModel.savedViewportActive && frozenSpinsPreviewId !== null,
+    },
   );
-  const frozenSpinsMaskId = frozenSpinsPreview.data
+  const frozenSpinsMaskId = !sceneModel.savedViewportActive && frozenSpinsPreview.data
     ? frozenSpinsMaskIdFromResource(frozenSpinsPreview.data.mask_resource)
     : null;
   const frozenSpinsMask = useFrozenSpinsMaskResource(
     frozenSpinsMaskId ?? "",
-    { enabled: frozenSpinsMaskId !== null },
+    {
+      enabled: !sceneModel.savedViewportActive && frozenSpinsMaskId !== null,
+    },
   );
+  const femFrozenSpinsCarrier = useMemo(() => {
+    const topology = sceneModel.topologyModel;
+    if (
+      !topology ||
+      !topology.meshTopologyHash ||
+      topology.nodeCount <= 0 ||
+      topology.positions.length !== topology.nodeCount * 3
+    ) {
+      return null;
+    }
+    return {
+      schemaVersion: "fullmag.fem-local-node-render.v1" as const,
+      carrierFingerprint: topology.meshTopologyHash,
+      meshFingerprint: topology.meshTopologyHash,
+      feSpaceOrder: 1,
+      vectorOrdering: "by_nodes" as const,
+      localNodeCount: topology.nodeCount,
+      renderVertexPositions: topology.positions,
+    };
+  }, [sceneModel.topologyModel]);
   const frozenSpinsOverlayModel = useMemo(
-    () =>
-      buildFrozenSpinsOverlayModel({
+    () => {
+      if (sceneModel.savedViewportActive) return null;
+      return buildFrozenSpinsOverlayModel({
         current: frozenSpinsPreview.data?.current ?? false,
+        expectedTopologyFingerprint:
+          frozenSpinsPreview.data?.resolved.topology_fingerprint ?? null,
         fdmDomain: sceneModel.fdmDomain,
-        // No OpenAPI resource currently publishes exact FEM true-DOF coordinates.
-        // Never substitute topology vertices: higher-order true DOFs are not nodes.
-        femTrueDofPositions: null,
+        // FEM frozen masks use the backend's local-node AoS state space. The
+        // published FMMT topology uses the same local-node ordering for P1.
+        femCarrier: femFrozenSpinsCarrier,
         mask: frozenSpinsMask.data,
         previewId: frozenSpinsPreviewId ?? "",
-      }),
+      });
+    },
     [
       frozenSpinsMask.data,
       frozenSpinsPreview.data,
       frozenSpinsPreviewId,
+      femFrozenSpinsCarrier,
+      sceneModel.savedViewportActive,
       sceneModel.fdmDomain,
     ],
   );
+  const runtimeFrozenSpinsRunId = solverStatus.data?.run_id ?? "";
+  const runtimeFrozenSpinsFieldRevision =
+    runtimeFrozenSpinsFieldResource.payloadRevision ?? "field";
+  const runtimeFrozenSpinsPreviewId = runtimeFrozenSpinsRunId
+    ? `runtime:${runtimeFrozenSpinsRunId}:${runtimeFrozenSpins?.mask_sha256 ?? runtimeFrozenSpinsFieldRevision}`
+    : "";
+  const runtimeFrozenSpinsOverlayModel = useMemo(
+    () =>
+      buildFrozenSpinsOverlayModelFromField({
+        current: true,
+        expectedTopologyFingerprint: runtimeFrozenSpins?.topology_fingerprint,
+        fdmDomain: sceneModel.fdmDomain,
+        femCarrier: femFrozenSpinsCarrier,
+        fieldVector: runtimeFrozenSpinsFieldVector,
+        maskSha256:
+          runtimeFrozenSpins?.mask_sha256 ?? runtimeFrozenSpinsFieldRevision,
+        previewId: runtimeFrozenSpinsPreviewId,
+      }),
+    [
+      femFrozenSpinsCarrier,
+      runtimeFrozenSpins,
+      runtimeFrozenSpinsFieldRevision,
+      runtimeFrozenSpinsFieldVector,
+      runtimeFrozenSpinsPreviewId,
+      sceneModel.fdmDomain,
+    ],
+  );
+  const effectiveFrozenSpinsOverlayModel =
+    frozenSpinsOverlayModel ?? runtimeFrozenSpinsOverlayModel;
   const { onSelectDomain, onSelectFdmCell, onSelectFdmTarget, onSelectFdmUniverseOutsideSupport, onSelectObject, onSelectPart, onSelectPlanarMonitor, onSelectRegion } =
     useViewport3DSelectionHandlers({
       domainId,
@@ -1400,6 +1641,10 @@ export default function Viewport3DModule({
   });
   const patchCameraState = useCallback(
     (patch: NonNullable<VisualizationStatePatch["camera"]>) => {
+      if (sceneModel.savedViewportActive) {
+        patchSavedCamera(patch);
+        return;
+      }
       kernel.cameraRegistry.patchCamera(patch);
       if (patch.position && patch.target) {
         const nextCamera = {
@@ -1426,10 +1671,14 @@ export default function Viewport3DModule({
         viewport3dStore.setCameraOrthographicScale(patch.orthographic_scale ?? null);
       }
     },
-    [kernel.cameraRegistry],
+    [kernel.cameraRegistry, patchSavedCamera, sceneModel.savedViewportActive],
   );
   const saveCameraState = useCallback(
     (camera: Viewport3DCameraChange, epoch?: number) => {
+      if (sceneModel.savedViewportActive) {
+        saveSavedCameraState(camera, epoch);
+        return;
+      }
       const accepted = kernel.cameraRegistry.patchCamera(
         buildViewport3DCameraRegistryPatch(camera),
         epoch,
@@ -1464,31 +1713,42 @@ export default function Viewport3DModule({
         timestamp: performance.now(),
       });
     },
-    [kernel.cameraRegistry],
+    [kernel.cameraRegistry, saveSavedCameraState, sceneModel.savedViewportActive],
   );
-  const cameraFieldUpdateHoldRef = useRef(false);
+  const cameraFieldUpdateHold = useMemo(() => createViewport3DInteractionFieldHold(), []);
   const beginCameraInteraction = useCallback((epoch?: number) => {
-    if (!cameraFieldUpdateHoldRef.current) {
-      cameraFieldUpdateHoldRef.current = true;
-      beginViewport3DFieldUpdateHold();
+    cameraFieldUpdateHold.begin(epoch);
+    if (sceneModel.savedViewportActive) {
+      beginSavedCameraInteraction(epoch);
+    } else {
+      kernel.cameraRegistry.beginInteraction(epoch);
     }
-    kernel.cameraRegistry.beginInteraction(epoch);
-  }, [kernel.cameraRegistry]);
+  }, [cameraFieldUpdateHold, beginSavedCameraInteraction, kernel.cameraRegistry, sceneModel.savedViewportActive]);
   const endCameraInteraction = useCallback((epoch?: number) => {
-    kernel.cameraRegistry.endInteraction(epoch);
-    if (cameraFieldUpdateHoldRef.current) {
-      cameraFieldUpdateHoldRef.current = false;
-      endViewport3DFieldUpdateHold();
+    if (sceneModel.savedViewportActive) {
+      endSavedCameraInteraction(epoch);
+    } else {
+      kernel.cameraRegistry.endInteraction(epoch);
     }
-  }, [kernel.cameraRegistry]);
+    cameraFieldUpdateHold.end(epoch);
+  }, [cameraFieldUpdateHold, endSavedCameraInteraction, kernel.cameraRegistry, sceneModel.savedViewportActive]);
   useEffect(
-    () => () => {
-      if (!cameraFieldUpdateHoldRef.current) return;
-      cameraFieldUpdateHoldRef.current = false;
-      endViewport3DFieldUpdateHold();
-    },
-    [],
+    () => () => cameraFieldUpdateHold.end(),
+    [cameraFieldUpdateHold],
   );
+  useEffect(() => {
+    if (!sceneModel.savedViewportActive) return;
+    viewport3dStore.setCameraView({
+      camera: sceneModel.cameraState,
+      orthographicScale: sceneModel.cameraOrthographicScale,
+      projection: sceneModel.cameraProjection,
+    });
+  }, [
+    sceneModel.cameraOrthographicScale,
+    sceneModel.cameraProjection,
+    sceneModel.cameraState,
+    sceneModel.savedViewportActive,
+  ]);
   const changeRegionOverlaySource = useCallback(
     (source: RegionDiagnosticOverlaySource) => {
       setRegionDiagnosticOverlayState((state) => ({ ...state, source }));
@@ -1515,12 +1775,15 @@ export default function Viewport3DModule({
         <WorkspaceRenderProfiler id="Viewport3DModule">
         <Viewport3DFrame
       {...sceneModel}
+      primitiveModel={primitiveModelWithPlacementDraft ?? null}
       clientReady={clientReady}
       colors={colors}
       cameraDialogOpen={commandState.widgets.cameraDialogOpen}
       cameraDialogState={commandState.camera}
+      dimensionFrameAnnotation={commandState.widgets.dimensionFrameAnnotation}
       dimensionFrameDensity={commandState.widgets.dimensionFrameDensity}
       dimensionFrameMode={commandState.widgets.dimensionFrameMode}
+      effectAntialias={commandState.widgets.effectAntialias}
       fitRevision={commandState.fitRevision}
       kernel={kernel}
       fdmSelectionCellOrdinal={fdmSelectionCellOrdinal}
@@ -1528,7 +1791,7 @@ export default function Viewport3DModule({
       onCameraPatch={patchCameraState}
       onClearSelection={clear}
       onFdmUniverseOverlayVisibilityChange={changeFdmUniverseOverlayVisibility}
-      frozenSpinsOverlayModel={frozenSpinsOverlayModel}
+      frozenSpinsOverlayModel={effectiveFrozenSpinsOverlayModel}
       frozenSpinsOverlayVisible={frozenSpinsOverlayVisible}
       onFrozenSpinsOverlayVisibilityChange={setFrozenSpinsOverlayVisible}
       onRegionOverlaySourceChange={changeRegionOverlaySource}
@@ -1552,6 +1815,7 @@ export default function Viewport3DModule({
       regionDiagnosticOverlayState={regionDiagnosticOverlayState}
       regionOverlayMode={regionDiagnosticOverlayMode(regionDiagnosticOverlayState)}
       rotationMode={commandState.widgets.rotationMode}
+      savedViewportActive={sceneModel.savedViewportActive}
       scaleLabelsVisible={commandState.widgets.scaleLabelsVisible}
       scaleUnitMode={commandState.widgets.scaleUnitMode}
       sessionIdentity={sessionIdentity}
@@ -1728,6 +1992,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   colors,
   diagnostics,
   domainSummary,
+  effectAntialias,
   fieldDataIssue,
   fieldRefresh,
   fdmSelectionCellOrdinal,
@@ -1746,7 +2011,10 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   onRegionOverlayVisibilityChange,
   regionDiagnosticOverlayState,
   quantityId,
+  quantityLabel,
+  savedViewportActive,
   sessionIdentity,
+  sessionDiscretization,
   selectedLabel,
   slotId,
   status,
@@ -1756,6 +2024,17 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   ...sceneProps
 }: Viewport3DFrameProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const antennaFieldOverlay = useAntennaFieldOverlay();
+  const antennaFieldSourceLabel = antennaFieldOverlay
+    ? sceneProps.primitiveModel?.objects.find(
+        (object) => object.objectId === antennaFieldOverlay.intent.sourceObjectId,
+      )?.label ?? antennaFieldOverlay.intent.sourceObjectId
+    : null;
+  const createCanvasEvents = useCallback(
+    (store: Parameters<typeof createViewport3DEventManager>[0]) =>
+      createViewport3DEventManager(store, () => kernel.objectMoveTool.getSnapshot() !== null),
+    [kernel.objectMoveTool],
+  );
   const pendingCaptureRevisionRef = useRef<number | null>(null);
   const primitiveObjectIds =
     sceneProps.primitiveModel?.objects
@@ -1773,7 +2052,10 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
       typeof window === "undefined" ? 1 : window.devicePixelRatio,
     profile: visualProfile,
   });
-  const canvasGlOptions = resolveStableViewport3DCanvasGlOptions(visualProfile);
+  const canvasGlOptions = resolveStableViewport3DCanvasGlOptions(
+    visualProfile,
+    effectAntialias,
+  );
   const canvasContextKey = `viewport-3d-canvas-aa:${canvasGlOptions.antialias ? "1" : "0"}-preserve:${canvasGlOptions.preserveDrawingBuffer ? "1" : "0"}`;
   const orbitDebugEnabled = viewport3DOrbitDebugEnabledFromBrowserConfig();
   const hysteresisReplayLabel = formatHysteresisReplayLabel(hysteresisReplayTarget);
@@ -1787,6 +2069,19 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     useState<string | null>(null);
   const [inspectHover, setInspectHover] =
     useState<Viewport3DInspectHover | null>(null);
+  const moveTargetEligible = Boolean(
+    sceneProps.selectedObjectId &&
+      sceneProps.primitiveModel?.objects.some(
+        (object) =>
+          object.objectId === sceneProps.selectedObjectId &&
+          object.role === "magnet",
+      ),
+  );
+  const moveInteraction = useViewport3DObjectMoveInteraction({
+    moveTargetEligible,
+    selectedObjectId: sceneProps.selectedObjectId,
+    sessionId: sessionIdentity?.sessionId ?? null,
+  });
   const lastRenderedMeshRevision = useRef<number | string | null>(null);
   const sendVisualizationAck = useVisualizationClientAckSender({ api: kernel.api });
   const visualizationAckRevisionRef = useRef<{
@@ -1796,7 +2091,6 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   const visualizationAckKindsRef = useRef(
     new Map<number, {
       changeKind: "data" | "style";
-      dataIdentity: VisualizationDataAdoptionIdentity | null;
       resourceKey: string;
     }>(),
   );
@@ -1830,7 +2124,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     if (visualizationDebugSource.fullFieldVector) {
       for (const { carrierIds, target } of visualizationDebugSource.targets) {
         if (carrierIds.length === 0 && target.kind !== "airbox") {
-          appendTarget("fdm-domain", target.id);
+          appendTarget(target.id, target.id);
         }
       }
     }
@@ -1859,11 +2153,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     }),
     [initialCameraFit.far, initialCameraFit.near],
   );
-  const discretizationKind = sceneProps.fdmDomain
-    ? "FDM"
-    : sceneProps.femDomain.magneticParts.length > 0
-      ? "FEM"
-      : null;
+  const discretizationKind = sessionDiscretization?.toUpperCase() ?? null;
   const meshQualityLegend = resolveViewport3DMeshQualityLegend(
     sceneProps.meshQualityOverlayVisible,
     meshQualityMetric,
@@ -1917,22 +2207,27 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     () => getRetainedViewport3DColorbarPlans(slotId),
     () => EMPTY_VIEWPORT_3D_COLORBAR_PLANS,
   );
+  const savedViewportColorbarReady =
+    !savedViewportActive || sceneProps.fieldModel !== null;
   const colorbarTargetPlans = useMemo(
     () =>
-      buildViewport3DColorbarTargetPlans({
-        availableQuantityIds: sceneProps.availableQuantityIds,
-        fdmSettings:
-          sceneProps.fdmDomain && sceneProps.fdmTargetViews.length === 0
-            ? sceneProps.fdmSettings
-            : null,
-        parts: colorbarParts,
-      }),
+      savedViewportColorbarReady
+        ? buildViewport3DColorbarTargetPlans({
+            availableQuantityIds: sceneProps.availableQuantityIds,
+            fdmSettings:
+              sceneProps.fdmDomain && sceneProps.fdmTargetViews.length === 0
+                ? sceneProps.fdmSettings
+                : null,
+            parts: colorbarParts,
+          })
+        : [],
     [
       colorbarParts,
       sceneProps.availableQuantityIds,
       sceneProps.fdmDomain,
       sceneProps.fdmSettings,
       sceneProps.fdmTargetViews.length,
+      savedViewportColorbarReady,
     ],
   );
   const initialColorbarPlans = useMemo(
@@ -1988,14 +2283,16 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   const colorbarTargetPlanAvailable = Boolean(
     sceneProps.fdmDomain || colorbarTopologyModel,
   );
-  const colorbarPlans = resolveViewport3DColorbarPlansForRender({
-    fieldIdentityCompatible: sceneProps.fdmFieldIdentityCompatible,
-    planned: plannedColorbars,
-    renderSurfaceAvailable,
-    retained: retainedColorbarPlans,
-    targetPlanAvailable: colorbarTargetPlanAvailable,
-    viewportColorbarRequested,
-  });
+  const colorbarPlans = savedViewportColorbarReady
+    ? resolveViewport3DColorbarPlansForRender({
+        fieldIdentityCompatible: sceneProps.fdmFieldIdentityCompatible,
+        planned: plannedColorbars,
+        renderSurfaceAvailable,
+        retained: retainedColorbarPlans,
+        targetPlanAvailable: colorbarTargetPlanAvailable,
+        viewportColorbarRequested,
+      })
+    : EMPTY_VIEWPORT_3D_COLORBAR_PLANS;
   const colorbarLabelByTargetId = useMemo(() => {
     const labels = new Map<string, string>(
       colorbarParts.map((part) => [part.id, part.label]),
@@ -2039,14 +2336,16 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   useEffect(() => {
     setRetainedViewport3DColorbarPlans(
       slotId,
-      resolveRetainedViewport3DColorbarPlansForStore({
-        fieldIdentityCompatible: sceneProps.fdmFieldIdentityCompatible,
-        planned: plannedColorbars,
-        renderSurfaceAvailable,
-        retained: retainedColorbarPlans,
-        targetPlanAvailable: colorbarTargetPlanAvailable,
-        viewportColorbarRequested,
-      }),
+      savedViewportColorbarReady
+        ? resolveRetainedViewport3DColorbarPlansForStore({
+            fieldIdentityCompatible: sceneProps.fdmFieldIdentityCompatible,
+            planned: plannedColorbars,
+            renderSurfaceAvailable,
+            retained: retainedColorbarPlans,
+            targetPlanAvailable: colorbarTargetPlanAvailable,
+            viewportColorbarRequested,
+          })
+        : EMPTY_VIEWPORT_3D_COLORBAR_PLANS,
     );
     viewport3dStore.setActiveScalarColorbarLegends(
       colorbarLegends.map(({ legend }) => legend),
@@ -2060,6 +2359,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     retainedColorbarPlans,
     renderedScalarRanges,
     sceneProps.fdmFieldIdentityCompatible,
+    savedViewportColorbarReady,
     slotId,
     viewportColorbarRequested,
   ]);
@@ -2085,24 +2385,37 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
       }),
     );
     const ackKind = visualizationAckKindsRef.current.get(revision);
-    const resourceKey = ackKind?.resourceKey ?? sceneProps.resourceFrameKey;
+    const frameAck = resolveViewport3DVisualizationFrameAck({
+      committedDataIdentity: resolveViewport3DVisualizationAckDataIdentity({
+        adoptionRegistry: visualizationDebugAdoptionRegistry,
+        sessionIdentity,
+        source: visualizationDebugSource,
+        visualizationRevision: revision,
+      }),
+      registeredChangeKind: ackKind?.changeKind ?? null,
+    });
+    const committedDataIdentity = frameAck.dataIdentity;
+    const resourceKey = committedDataIdentity?.resourceKey ??
+      ackKind?.resourceKey ?? sceneProps.resourceFrameKey;
     const hasMatchingAdoption = !ackKind ||
       ackKind.changeKind === "style" ||
-      (ackKind.dataIdentity !== null &&
+      (committedDataIdentity !== null &&
         visualizationDebugAdoptionRegistry.hasActiveAdoption({
-          fieldBufferId: ackKind.dataIdentity.fieldBufferId,
+          fieldBufferId: committedDataIdentity.fieldBufferId,
           resourceKey,
-          sessionEpoch: ackKind.dataIdentity.sessionEpoch,
-          sessionId: ackKind.dataIdentity.sessionId,
+          sessionEpoch: committedDataIdentity.sessionEpoch,
+          sessionId: committedDataIdentity.sessionId,
         }));
     if (hasMatchingAdoption) sendVisualizationAck({
-      changeKind: ackKind?.changeKind ?? "style",
+      changeKind: frameAck.changeKind,
       effectiveRenderMode: visualizationEffectiveRenderMode,
       enabled: clientReady && !visualizationError,
-      dataIdentity: ackKind?.dataIdentity ?? null,
-      renderCommit: ackKind?.dataIdentity ?? null,
+      dataIdentity: committedDataIdentity,
+      renderCommit: committedDataIdentity,
       revision,
+      requestScopeEpoch: sessionIdentity?.requestScopeEpoch ?? null,
       resourceKey,
+      sessionId: sessionIdentity?.sessionId ?? null,
       sessionEpoch: sessionIdentity?.sessionEpoch ?? null,
       status: "rendered",
       viewportId: slotId,
@@ -2125,46 +2438,39 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     sceneProps.renderedMeshRevision,
     sceneProps.resourceFrameKey,
     sendVisualizationAck,
-    sessionIdentity?.sessionEpoch,
+    sessionIdentity,
     slotId,
     visualizationDebugPublisher,
     visualizationDebugAdoptionRegistry,
+    visualizationDebugSource,
     visualizationEffectiveRenderMode,
     visualizationError,
   ]);
-  const fullFieldBufferIdentity = visualizationDebugSource.fullFieldBufferIdentity;
-  const fullFieldBufferId = fullFieldBufferIdentity?.bufferId;
-  const fullFieldRevision = fullFieldBufferIdentity?.fieldRevision;
-  const fullFieldResourceKey = fullFieldBufferIdentity?.resourceKey;
-  const fullFieldSessionEpoch = fullFieldBufferIdentity?.sessionEpoch;
-  const fullFieldSessionId = fullFieldBufferIdentity?.sessionId;
   useEffect(() => {
     const revision = sceneProps.visualizationRevision;
     if (revision == null) return;
     const previous = visualizationAckRevisionRef.current;
-    const changeKind = previous?.resourceFrameKey === sceneProps.resourceFrameKey
-      ? "style"
-      : "data";
-    const resourceKey = fullFieldResourceKey ?? sceneProps.resourceFrameKey;
-    const dataIdentity =
-      fullFieldBufferId &&
-      fullFieldResourceKey &&
-      fullFieldSessionEpoch &&
-      fullFieldSessionId
-        ? {
-            fieldBufferId: fullFieldBufferId,
-            fieldRevision: fullFieldRevision ?? null,
-            resourceKey: fullFieldResourceKey,
-            sessionEpoch: fullFieldSessionEpoch,
-            sessionId: fullFieldSessionId,
-            visualizationRevision: revision,
-          }
-        : null;
+    const dataIdentity = resolveViewport3DVisualizationAckDataIdentity({
+      adoptionRegistry: visualizationDebugAdoptionRegistry,
+      sessionIdentity,
+      source: visualizationDebugSource,
+      visualizationRevision: revision,
+    });
+    const existingRegistration = visualizationAckKindsRef.current.get(revision) ?? null;
+    const registration = resolveViewport3DVisualizationAckRegistration({
+      existing: existingRegistration,
+      previousResourceFrameKey: previous?.resourceFrameKey ?? null,
+      resourceFrameKey: sceneProps.resourceFrameKey,
+      resourceKey: dataIdentity?.resourceKey ?? sceneProps.resourceFrameKey,
+    });
+    const { changeKind, resourceKey } = registration;
     visualizationAckRevisionRef.current = {
       resourceFrameKey: sceneProps.resourceFrameKey,
       revision,
     };
-    visualizationAckKindsRef.current.set(revision, { changeKind, dataIdentity, resourceKey });
+    if (!existingRegistration) {
+      visualizationAckKindsRef.current.set(revision, registration);
+    }
     while (visualizationAckKindsRef.current.size > 64) {
       const oldest = visualizationAckKindsRef.current.keys().next().value;
       if (oldest === undefined) break;
@@ -2178,24 +2484,24 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
       error: visualizationError,
       resourceKey,
       revision,
+      requestScopeEpoch: sessionIdentity?.requestScopeEpoch ?? null,
+      sessionId: sessionIdentity?.sessionId ?? null,
       sessionEpoch: sessionIdentity?.sessionEpoch ?? null,
       status: visualizationError ? "failed" : changeKind === "data" ? "applied" : "rendered",
       viewportId: slotId,
     });
   }, [
     clientReady,
-    fullFieldBufferId,
-    fullFieldResourceKey,
-    fullFieldRevision,
-    fullFieldSessionEpoch,
-    fullFieldSessionId,
     sceneProps.resourceFrameKey,
     sceneProps.visualizationRevision,
     sendVisualizationAck,
+    sessionIdentity,
     sessionIdentity?.sessionEpoch,
     slotId,
     visualizationEffectiveRenderMode,
     visualizationError,
+    visualizationDebugAdoptionRegistry,
+    visualizationDebugSource,
   ]);
   const resourceIssueOpen = Boolean(
     fieldDataIssue && dismissedResourceIssueKey !== fieldDataIssue.key,
@@ -2314,6 +2620,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     <section
       aria-label="3D viewport"
       className="fm-viewport-3d"
+      data-view-source={savedViewportActive ? "saved" : "current"}
       data-camera-position={sceneProps.cameraState.position.join(" ")}
       data-camera-projection={sceneProps.cameraProjection}
       data-camera-target={sceneProps.cameraState.target.join(" ")}
@@ -2358,9 +2665,16 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
       data-frozen-spins-preview-current={
         sceneProps.frozenSpinsOverlayModel?.current ? "true" : "false"
       }
+      data-frozen-spins-overlay-source={
+        sceneProps.frozenSpinsOverlayModel?.source ?? "none"
+      }
       data-inspect-enabled={sceneProps.inspectEnabled ? "true" : "false"}
       data-primitive-object-count={sceneProps.primitiveModel?.objects.length ?? 0}
       data-primitive-object-ids={primitiveObjectIds}
+      data-primitive-object-kinds={sceneProps.primitiveModel?.objects
+        .map((object) => `${object.objectId}:${object.kind}`).join(" ") ?? ""}
+      data-primitive-object-geometry-descriptors={sceneProps.primitiveModel?.objects
+        .map((object) => object.geometryKey.slice(0, 120)).join(" ") ?? ""}
       data-hysteresis-replay-snapshot-id={hysteresisReplayTarget?.snapshotId ?? ""}
       data-hysteresis-replay-stage-id={hysteresisReplayTarget?.stageId ?? ""}
       data-hysteresis-replay-field-direction={formatHysteresisReplayGlyphVector(
@@ -2374,13 +2688,34 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
         sceneProps.bounds ? JSON.stringify(sceneProps.bounds) : ""
       }
       data-visual-profile-id={sceneProps.visualProfileId}
+      data-antenna-field-quantity={antennaFieldOverlay?.intent.quantity}
+      data-antenna-field-sample-count={antennaFieldOverlay?.count}
       onPointerDown={() => kernel.layout.setFocusedSlot(slotId)}
     >
       <div aria-live="polite" className="fm-viewport-3d__hud">
-        <span>{quantityId}</span>
-        <span>{selectedLabel}</span>
+        {savedViewportActive && sessionIdentity ? (
+          <fieldset
+            aria-label="Viewport source"
+            className="fm-viewport-3d__region-modes"
+          >
+            <Button
+              aria-label="Return to current view"
+              onClick={onClearSelection}
+              size="sm"
+              type="button"
+              variant="secondary"
+            >
+              Current view
+            </Button>
+          </fieldset>
+        ) : null}
+        <span data-quantity-id={quantityId}>{antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityLabel}</span>
+        <span>{antennaFieldSourceLabel ?? selectedLabel}</span>
         {hysteresisReplayLabel ? <span>{hysteresisReplayLabel}</span> : null}
-        <span>{domainSummary}</span>
+        <span>{antennaFieldOverlay ? `${antennaFieldOverlay.count} samples` : domainSummary}</span>
+        {antennaFieldOverlay?.intent.kind === "inspection" ? (
+          <span>inspection only · external electrode truncation · not qualified for LLG</span>
+        ) : null}
         {meshQualityLegend ? <span>{meshQualityLegend}</span> : null}
         {sceneProps.meshSizeHighlightModel ? (
           <span>
@@ -2395,6 +2730,11 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           </span>
         ) : null}
         <span>{status}</span>
+        {sceneProps.primitiveModel?.diagnostics?.map((issue) => (
+          <span key={issue.objectId} role="alert">
+            Geometry preview unavailable · {issue.objectId}: {issue.message}
+          </span>
+        ))}
         {sceneProps.regionOverlays.length > 0 ||
         sceneProps.meshRegionOverlays.length > 0 ? (
           <fieldset
@@ -2511,6 +2851,9 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
               {sceneProps.frozenSpinsOverlayModel.carrierKind === "fdm-cells"
                 ? "FDM cells"
                 : "FEM true DOFs"}
+              {sceneProps.frozenSpinsOverlayModel.source === "runtime-field"
+                ? " · runtime field"
+                : " · preview mask"}
               {sceneProps.frozenSpinsOverlayModel.current
                 ? " · current"
                 : " · stale preview"}
@@ -2525,7 +2868,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           camera={canvasCamera}
           className="fm-viewport-3d__canvas"
           dpr={canvasDpr}
-          events={createViewport3DEventManager}
+          events={createCanvasEvents}
           frameloop={VIEWPORT_3D_FRAMELOOP}
           gl={canvasGlOptions}
           key={canvasContextKey}
@@ -2534,10 +2877,17 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           onPointerMissed={handleCanvasPointerMissed}
         >
           <Viewport3DRendererProfile visualProfile={visualProfile} />
+          <Viewport3DThumbnailBridge
+            colouring={resolveViewport3DThumbnailColouring(sceneProps.fdmSettings)}
+            slotId={slotId}
+          />
           <Viewport3DScene
             {...sceneProps}
+            antennaFieldOverlay={antennaFieldOverlay}
             adoptionRegistry={visualizationDebugAdoptionRegistry}
             colors={colors}
+            savedViewportActive={savedViewportActive}
+            sessionIdentity={sessionIdentity}
             hysteresisReplayGlyphModel={hysteresisReplayGlyphModel}
             orbitDebugAngles={orbitDebugAngles}
             orbitDebugCommitRevision={orbitDebugCommitRevision}
@@ -2547,6 +2897,11 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             }
             onInspectClear={clearInspectHover}
             onInspectSample={updateInspectHover}
+            onMoveCommit={moveInteraction.commitMove}
+            onBeginGesture={moveInteraction.onBeginGesture}
+            onMoveGestureActiveChange={moveInteraction.onGestureActiveChange}
+            moveToolObjectId={moveInteraction.moveToolObjectId}
+            moveDraftResetRevision={moveInteraction.moveDraftResetRevision}
             onVisualizationFrameCommitted={onVisualizationFrameCommitted}
             visualProfileId={visualProfile.id}
           />
@@ -2575,6 +2930,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           provenance={visibleInspectProvenance}
         />
       ) : null}
+      <Viewport3DMoveStatus error={moveInteraction.moveError} />
       <Viewport3DFdmSelectionAnnouncement
         announcement={fdmSelectionAnnouncement}
       />
@@ -2730,6 +3086,40 @@ export const Viewport3DFdmSelectionAnnouncement = memo(
     );
   },
 );
+
+/**
+ * Registers this canvas with the thumbnail registry. The renderer does not
+ * keep its drawing buffer, so a capture renders the scene and copies it in one
+ * synchronous step instead of enabling preserveDrawingBuffer.
+ */
+function Viewport3DThumbnailBridge({
+  colouring,
+  slotId,
+}: {
+  colouring: Viewport3DThumbnailColouring;
+  slotId: string;
+}) {
+  const getState = useThree((state) => state.get);
+  const colouringRef = useRef(colouring);
+  useEffect(() => {
+    colouringRef.current = colouring;
+  }, [colouring]);
+  useEffect(
+    () =>
+      registerViewport3DThumbnailCapture(slotId, () =>
+        captureViewport3DThumbnail({
+          canvas: getState().gl.domElement,
+          colouring: colouringRef.current,
+          render: () => {
+            const { camera, gl, scene } = getState();
+            gl.render(scene, camera);
+          },
+        }),
+      ),
+    [getState, slotId],
+  );
+  return null;
+}
 
 function Viewport3DRendererProfile({
   visualProfile,
@@ -3192,10 +3582,11 @@ function Viewport3DOrbitDebugSlider({
   value: number;
 }) {
   return (
-    <label className="fm-viewport-3d__orbit-debug-field">
+    <div className="fm-viewport-3d__orbit-debug-field">
       <span>{label}</span>
       <output>{value.toFixed(3)}</output>
       <input
+        aria-label={label}
         max={max}
         min={min}
         step="0.001"
@@ -3208,6 +3599,6 @@ function Viewport3DOrbitDebugSlider({
         onPointerDown={onInteractionStart}
         onPointerUp={onInteractionEnd}
       />
-    </label>
+    </div>
   );
 }

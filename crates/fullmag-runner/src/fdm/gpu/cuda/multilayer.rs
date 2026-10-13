@@ -19,9 +19,11 @@ use fullmag_fdm_demag::{
     compute_exact_self_kernel, compute_shifted_kernel, TransferBoundaryPolicy,
 };
 use fullmag_ir::{
-    ExchangeBoundaryCondition, ExecutionPrecision, FdmLayerPlanIR, FdmMaterialIR,
-    FdmMultilayerPlanIR, FdmPlanIR, GridDimensions, IntegratorChoice, OutputIR,
+    ExchangeBoundaryCondition, ExecutionPrecision, FdmGridCertificateIR, FdmLayerPlanIR,
+    FdmMaterialIR, FdmMultilayerPlanIR, FdmPlanIR, FdmRegionLegendEntryIR, GridDimensions,
+    IntegratorChoice, OutputIR, ResolvedFrozenSpinsPlanIR,
 };
+use sha2::{Digest, Sha256};
 
 use crate::artifact_pipeline::{ArtifactPipelineSender, ArtifactRecorder};
 use crate::derived_fields::{compute_torque_field, max_torque_residual_apm_from_field};
@@ -249,6 +251,65 @@ struct LayerStateSingle {
     time_seconds: f64,
 }
 
+/// Host-side Frozen Spins carrier for the CUDA-assisted FP32 multilayer lane.
+///
+/// The native single-grid backend owns an exact f64 reference.  The assisted
+/// lane keeps its own f32 reference so a frozen value is restored to the exact
+/// representation used by the FP32 staged tableau, including after every
+/// normalization and at the final state boundary.
+#[derive(Debug, Clone)]
+struct FrozenSpinsStateSingle {
+    mask: Vec<bool>,
+    reference: Vec<[f32; 3]>,
+}
+
+impl FrozenSpinsStateSingle {
+    fn restore_reference(&self, layers: &mut [Vec<[f32; 3]>]) -> Result<(), RunError> {
+        let total_len = layers.iter().map(Vec::len).sum::<usize>();
+        if total_len != self.reference.len() || total_len != self.mask.len() {
+            return Err(RunError {
+                message: format!(
+                    "frozen_spins_multilayer_fp32_state_size_mismatch: flattened layer length {total_len} differs from reference/mask length {}/{}",
+                    self.reference.len(),
+                    self.mask.len()
+                ),
+            });
+        }
+        let mut offset = 0usize;
+        for layer in layers {
+            for value in layer {
+                if self.mask[offset] {
+                    *value = self.reference[offset];
+                }
+                offset += 1;
+            }
+        }
+        Ok(())
+    }
+
+    fn zero_rhs(&self, layers: &mut [Vec<[f32; 3]>]) -> Result<(), RunError> {
+        let total_len = layers.iter().map(Vec::len).sum::<usize>();
+        if total_len != self.mask.len() {
+            return Err(RunError {
+                message: format!(
+                    "frozen_spins_multilayer_fp32_rhs_size_mismatch: flattened layer length {total_len} differs from mask length {}",
+                    self.mask.len()
+                ),
+            });
+        }
+        let mut offset = 0usize;
+        for layer in layers {
+            for value in layer {
+                if self.mask[offset] {
+                    *value = [0.0; 3];
+                }
+                offset += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone)]
 struct NativeStackedLayer {
     magnet_name: String,
@@ -432,6 +493,15 @@ fn resolve_cuda_multilayer_execution_shape(
 fn validate_device_resident_cuda_multilayer_lane(
     plan: &FdmMultilayerPlanIR,
 ) -> Result<(), RunError> {
+    // The v2 multilayer ABI has no frozen-mask/reference payload.  Keep the
+    // D-07 device-resident lane fail-closed and route constrained plans to the
+    // staged assisted lane (or the native single-grid plan, which carries the
+    // already-qualified Frozen Spins ABI).
+    if plan.frozen_spins.is_some() {
+        return Err(RunError {
+            message: "fdm_cuda_device_resident_multilayer_frozen_spins_unqualified: v2 multilayer ABI does not carry Frozen Spins mask/reference; use the staged or native single-grid lane".to_string(),
+        });
+    }
     if !plan.enable_demag {
         return Err(RunError {
             message: "fdm_cuda_device_resident_multilayer_requires_demag: bounded D-07 lane requires enable_demag=true".to_string(),
@@ -635,6 +705,7 @@ fn build_contexts_and_states(
                             .unwrap_or([0.0, 1.0, 0.0]),
                     }),
                 interfacial_dmi: plan.interfacial_dmi,
+                rotated_interfacial_dmi: plan.rotated_interfacial_dmi,
                 bulk_dmi: plan.bulk_dmi,
                 zhang_li_stt: None,
                 slonczewski_stt: None,
@@ -817,6 +888,21 @@ fn execute_cuda_assisted_multilayer_double(
             .map(|state| state.magnetization().to_vec())
             .collect::<Vec<_>>(),
     );
+    let active_mask = multilayer_active_mask(plan);
+    let frozen_spins = plan
+        .frozen_spins
+        .as_ref()
+        .map(|frozen_plan| {
+            fullmag_engine::FrozenSpinsState::capture_at_activation(
+                frozen_plan,
+                active_mask.as_deref(),
+                &initial_magnetization,
+            )
+            .map_err(|error| RunError {
+                message: format!("CUDA-assisted multilayer Frozen Spins activation: {error}"),
+            })
+        })
+        .transpose()?;
     let dt = plan.fixed_timestep.ok_or_else(|| RunError {
         message: "multilayer FDM requires an explicit fixed_timestep".to_string(),
     })?;
@@ -876,6 +962,7 @@ fn execute_cuda_assisted_multilayer_double(
             native_demag.as_mut(),
             dt_step,
             plan.integrator,
+            frozen_spins.as_ref(),
         )?;
         let wall_time_ns = wall_start.elapsed().as_nanos() as u64;
         step_count += 1;
@@ -929,6 +1016,7 @@ fn execute_cuda_assisted_multilayer_double(
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: false,
+                terminal_field_snapshot: false,
                 finished: false,
             });
             match action {
@@ -1077,6 +1165,8 @@ fn execute_cuda_assisted_multilayer_single(
         .and_then(|gpu| gpu.backend.device_info().ok());
 
     let initial_magnetization = flatten_layers_single(&states);
+    let active_mask = multilayer_active_mask(plan);
+    let frozen_spins = capture_frozen_spins_single(plan, active_mask.as_deref(), &states)?;
     let dt = plan.fixed_timestep.ok_or_else(|| RunError {
         message: "multilayer FDM requires an explicit fixed_timestep".to_string(),
     })?;
@@ -1136,6 +1226,7 @@ fn execute_cuda_assisted_multilayer_single(
             native_demag.as_mut(),
             dt_step,
             plan.integrator,
+            frozen_spins.as_ref(),
         )?;
         let wall_time_ns = wall_start.elapsed().as_nanos() as u64;
         step_count += 1;
@@ -1189,6 +1280,7 @@ fn execute_cuda_assisted_multilayer_single(
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: false,
+                terminal_field_snapshot: false,
                 finished: false,
             });
             match action {
@@ -1463,6 +1555,7 @@ fn execute_native_device_resident_cuda_multilayer(
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: false,
+                terminal_field_snapshot: false,
                 finished: false,
             }) {
                 StepAction::Continue => {}
@@ -1603,10 +1696,13 @@ fn device_resident_multilayer_provenance(
         None,
         crate::types::TimestepExecutionLane::fdm_cuda(plan.precision),
     )?;
+    let fdm_fft_execution =
+        crate::fdm::resolve_cuda_fft_execution_for_demag(plan.enable_demag, plan.fft.as_ref())?;
     Ok(ExecutionProvenance {
         charge_transport: None,
         execution_engine: "cuda_native_multilayer_convolution".to_string(),
         precision: "double".to_string(),
+        fdm_fft_execution,
         demag_operator_kind: Some("native_multilayer_tensor_fft_newell".to_string()),
         fft_backend: Some("cuFFT".to_string()),
         device_name: device_info.as_ref().map(|info| info.name.clone()),
@@ -1634,6 +1730,7 @@ fn snapshot_native_multilayer_observables(
     let mut external_field = Vec::new();
     let mut anisotropy_field = Vec::new();
     let mut dmi_field = Vec::new();
+    let mut rotated_dmi_field = Vec::new();
     let mut effective_field = Vec::new();
     let mut torque_field = Vec::new();
     let mut exchange_energy = 0.0;
@@ -1641,6 +1738,7 @@ fn snapshot_native_multilayer_observables(
     let mut external_energy = 0.0;
     let mut anisotropy_energy = 0.0;
     let mut dmi_energy = 0.0;
+    let mut rotated_dmi_energy = 0.0;
     let mut max_dm_dt: f64 = 0.0;
     let mut max_h_eff: f64 = 0.0;
     let mut max_h_demag: f64 = 0.0;
@@ -1653,6 +1751,11 @@ fn snapshot_native_multilayer_observables(
         let mut h_ex = backend.copy_layer_h_ex(layer_index as u32, cell_count)?;
         let mut h_ani = backend.copy_layer_h_ani(layer_index as u32, cell_count)?;
         let mut h_dmi = backend.copy_layer_h_dmi(layer_index as u32, cell_count)?;
+        let mut h_rotated_dmi = if plan.rotated_interfacial_dmi.is_some() {
+            backend.copy_layer_h_rotated_dmi(layer_index as u32, cell_count)?
+        } else {
+            vec![[0.0; 3]; cell_count]
+        };
         let mut native_h_eff = backend.copy_layer_h_eff(layer_index as u32, cell_count)?;
         let active_mask = context.problem.active_mask.as_deref();
         // The native multilayer ABI materializes the uniform Zeeman field in
@@ -1674,7 +1777,13 @@ fn snapshot_native_multilayer_observables(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_else(|| vec![[0.0; 3]; cell_count]);
-        for _ in 0..6 {
+        // H_rotated_dmi is a real native observable only when the plan
+        // contains the rotated term.  Keep the receipt count exact for
+        // conventional-DMI snapshots (six fields) while retaining the
+        // seventh device-to-host vector for an active rDMI term.
+        let observed_vector_fields =
+            observed_snapshot_vector_field_count(plan.rotated_interfacial_dmi.is_some());
+        for _ in 0..observed_vector_fields {
             transfer_counters.record_observed_snapshot_d2h_vector(cell_count);
         }
         for field in [
@@ -1683,13 +1792,14 @@ fn snapshot_native_multilayer_observables(
             &mut h_ext,
             &mut h_ani,
             &mut h_dmi,
+            &mut h_rotated_dmi,
             &mut native_h_eff,
         ] {
             zero_outside_active(field, active_mask);
         }
         let h_eff = canonical_snapshot_effective_field(
             &native_h_eff,
-            [&h_ex, &h_demag, &h_ext, &h_ani, &h_dmi],
+            [&h_ex, &h_demag, &h_ext, &h_ani, &h_dmi, &h_rotated_dmi],
             &layer.layer_id,
         )?;
 
@@ -1728,6 +1838,9 @@ fn snapshot_native_multilayer_observables(
             })?;
         let local_anisotropy_energy = local_reference.anisotropy_energy_joules;
         let local_dmi_energy = local_reference.dmi_energy_joules;
+        let local_rotated_dmi_energy = context
+            .problem
+            .rotated_interfacial_dmi_energy_from_vectors(local_state.magnetization());
         let rhs = llg_rhs_for_layer(context, &m, &h_eff);
         let local_torque = compute_torque_field(
             &m,
@@ -1757,6 +1870,7 @@ fn snapshot_native_multilayer_observables(
                 ("e_ext".to_string(), local_external_energy),
                 ("e_ani".to_string(), local_anisotropy_energy),
                 ("e_dmi".to_string(), local_dmi_energy),
+                ("e_rotated_dmi".to_string(), local_rotated_dmi_energy),
                 ("e_total".to_string(), local_total),
                 ("mx".to_string(), mx),
                 ("my".to_string(), my),
@@ -1770,6 +1884,7 @@ fn snapshot_native_multilayer_observables(
         external_energy += local_external_energy;
         anisotropy_energy += local_anisotropy_energy;
         dmi_energy += local_dmi_energy;
+        rotated_dmi_energy += local_rotated_dmi_energy;
         max_dm_dt = max_dm_dt.max(max_norm(&rhs));
         max_h_eff = max_h_eff.max(max_norm(&h_eff));
         max_h_demag = max_h_demag.max(max_norm(&h_demag));
@@ -1779,6 +1894,7 @@ fn snapshot_native_multilayer_observables(
         external_field.extend(h_ext);
         anisotropy_field.extend(h_ani);
         dmi_field.extend(h_dmi);
+        rotated_dmi_field.extend(h_rotated_dmi);
         effective_field.extend(h_eff);
         torque_field.extend(local_torque);
     }
@@ -1802,6 +1918,7 @@ fn snapshot_native_multilayer_observables(
         effective_field,
         anisotropy_field,
         dmi_field,
+        rotated_dmi_field,
         magnetoelastic_field: Vec::new(),
         cubic_anisotropy_field: Vec::new(),
         bulk_dmi_field: Vec::new(),
@@ -1813,6 +1930,7 @@ fn snapshot_native_multilayer_observables(
         drive_energy: 0.0,
         anisotropy_energy,
         dmi_energy,
+        rotated_dmi_energy,
         total_energy,
         max_dm_dt,
         max_rhs_all_norm_per_s: max_dm_dt,
@@ -1828,7 +1946,7 @@ fn snapshot_native_multilayer_observables(
 
 fn canonical_snapshot_effective_field(
     native_h_eff: &[[f64; 3]],
-    terms: [&[[f64; 3]]; 5],
+    terms: [&[[f64; 3]]; 6],
     layer_id: &str,
 ) -> Result<Vec<[f64; 3]>, RunError> {
     if terms.iter().any(|term| term.len() != native_h_eff.len()) {
@@ -1885,10 +2003,19 @@ fn assisted_multilayer_provenance(
         None,
         crate::types::TimestepExecutionLane::fdm_cuda(plan.precision),
     )?;
+    let fdm_fft_execution = if native_demag_enabled {
+        crate::fdm::resolve_cuda_fft_execution_for_demag(plan.enable_demag, plan.fft.as_ref())?
+    } else {
+        crate::fdm::cpu::reference::resolve_cpu_fft_execution_for_demag(
+            plan.enable_demag,
+            plan.fft.as_ref(),
+        )?
+    };
     Ok(ExecutionProvenance {
         charge_transport: None,
         execution_engine: "cuda_assisted_multilayer".to_string(),
         precision: precision_name(plan.precision).to_string(),
+        fdm_fft_execution,
         demag_operator_kind: if plan.enable_demag {
             Some(
                 if native_demag_enabled {
@@ -1997,24 +2124,51 @@ fn build_native_stacked_cuda_plan(
         global_grid[1] as usize,
         global_grid[2] as usize,
     ];
-    let total_cells = fullmag_plan::checked_fdm_grid_cost(
+    let global_grid_cost = fullmag_plan::checked_fdm_grid_cost(
         global_grid,
         fullmag_plan::FDM_GRID_ESTIMATED_BYTES_PER_CELL,
     )
     .map_err(|error| RunError {
         message: format!("native stacked global grid budget rejected before allocation: {error}"),
-    })
-    .and_then(|cost| {
-        usize::try_from(cost.cells).map_err(|_| RunError {
-            message: format!(
-                "native stacked global grid cell count {} is not addressable",
-                cost.cells
-            ),
-        })
     })?;
+    let total_cells = usize::try_from(global_grid_cost.cells).map_err(|_| RunError {
+        message: format!(
+            "native stacked global grid cell count {} is not addressable",
+            global_grid_cost.cells
+        ),
+    })?;
+    let frozen_plan = if let Some(frozen) = plan.frozen_spins.as_ref() {
+        frozen.validate_intrinsic().map_err(|message| RunError {
+            message: format!(
+                "native stacked Frozen Spins plan is intrinsically invalid before materialization: {message}"
+            ),
+        })?;
+        let expected_len = plan
+            .layers
+            .iter()
+            .map(|layer| layer.initial_magnetization.len())
+            .try_fold(0usize, usize::checked_add)
+            .ok_or_else(|| RunError {
+                message: "native stacked Frozen Spins local mask length overflows usize"
+                    .to_string(),
+            })?;
+        if frozen.frozen_mask.len() != expected_len {
+            return Err(RunError {
+                message: format!(
+                    "native stacked Frozen Spins mask has {} entries, expected {expected_len} in native-layer order",
+                    frozen.frozen_mask.len()
+                ),
+            });
+        }
+        Some(frozen)
+    } else {
+        None
+    };
     let mut active_mask = vec![false; total_cells];
     let mut region_mask = vec![0u32; total_cells];
     let mut initial_magnetization = vec![[0.0, 0.0, 0.0]; total_cells];
+    let mut global_frozen_mask = vec![false; total_cells];
+    let mut frozen_local_offset = 0usize;
     let mut layers = Vec::with_capacity(plan.layers.len());
 
     for (layer_index, layer) in plan.layers.iter().enumerate() {
@@ -2042,6 +2196,17 @@ fn build_native_stacked_cuda_plan(
                         .native_active_mask
                         .as_ref()
                         .map_or(true, |mask| mask[local_index]);
+                    let is_frozen = frozen_plan.is_some_and(|frozen| {
+                        frozen.frozen_mask[frozen_local_offset + local_index]
+                    });
+                    if is_frozen && !is_active {
+                        return Err(RunError {
+                            message: format!(
+                                "native stacked Frozen Spins mask selects inactive local cell {local_index} in layer '{}'",
+                                layer.layer_id
+                            ),
+                        });
+                    }
                     if !is_active {
                         continue;
                     }
@@ -2066,11 +2231,18 @@ fn build_native_stacked_cuda_plan(
                         });
                     }
                     active_mask[global_index] = true;
+                    global_frozen_mask[global_index] = is_frozen;
                     region_mask[global_index] = (layer_index + 1) as u32;
                     initial_magnetization[global_index] = layer.initial_magnetization[local_index];
                 }
             }
         }
+
+        frozen_local_offset = frozen_local_offset
+            .checked_add(layer.initial_magnetization.len())
+            .ok_or_else(|| RunError {
+                message: "native stacked Frozen Spins local offset overflows usize".to_string(),
+            })?;
 
         layers.push(NativeStackedLayer {
             magnet_name: layer.magnet_name.clone(),
@@ -2080,32 +2252,111 @@ fn build_native_stacked_cuda_plan(
         });
     }
 
+    if let Some(frozen) = frozen_plan {
+        if frozen_local_offset != frozen.frozen_mask.len() {
+            return Err(RunError {
+                message: format!(
+                    "native stacked Frozen Spins local offset {} differs from mask length {}",
+                    frozen_local_offset,
+                    frozen.frozen_mask.len()
+                ),
+            });
+        }
+    }
+
+    let active_cells = active_mask.iter().filter(|active| **active).count() as u64;
+    let global_region_legend = plan
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(index, layer)| FdmRegionLegendEntryIR {
+            numeric_id: (index + 1) as u32,
+            object_id: layer.object_id.clone(),
+            region_id: format!("native_stacked:{}", layer.layer_id),
+            priority: index as i32,
+        })
+        .collect::<Vec<_>>();
+    let global_grid_certificate = FdmGridCertificateIR::new_with_topology_tokens(
+        min_origin,
+        global_grid,
+        reference_cell_size,
+        active_cells,
+        global_grid_cost.estimated_bytes,
+        Some(&active_mask),
+        &region_mask,
+    )
+    .map_err(|message| RunError {
+        message: format!(
+            "native stacked global grid certificate construction failed before CUDA allocation: {message}"
+        ),
+    })?
+    .with_region_legend(global_region_legend);
+    let mapped_frozen_spins = frozen_plan.map(|frozen| {
+        let frozen_dof_count = global_frozen_mask
+            .iter()
+            .filter(|is_frozen| **is_frozen)
+            .count() as u64;
+        let free_dof_count = active_cells.saturating_sub(frozen_dof_count);
+        let mask_sha256 = frozen_mask_sha256(&global_frozen_mask);
+        let reference_sha256 = frozen_reference_sha256(&global_frozen_mask, &initial_magnetization);
+        let inactive_candidate_dof_count = (total_cells as u64).saturating_sub(active_cells);
+        let mut certificate = frozen.certificate.clone();
+        certificate.raw_candidate_dof_count = frozen_dof_count + inactive_candidate_dof_count;
+        certificate.inactive_candidate_dof_count = inactive_candidate_dof_count;
+        certificate.active_dof_count = active_cells;
+        certificate.frozen_dof_count = frozen_dof_count;
+        certificate.free_dof_count = free_dof_count;
+        certificate.grid_or_mesh_fingerprint = global_grid_certificate.grid_fingerprint.clone();
+        certificate.mask_sha256 = mask_sha256.clone();
+        certificate.resolved_reference_sha256 = reference_sha256;
+        certificate
+            .warnings
+            .push("mapped_to_native_stacked_global_grid".to_string());
+        ResolvedFrozenSpinsPlanIR {
+            schema_version: frozen.schema_version.clone(),
+            constraint_ids: frozen.constraint_ids.clone(),
+            frozen_mask: global_frozen_mask.clone(),
+            active_dof_count: active_cells,
+            frozen_dof_count,
+            free_dof_count,
+            mask_sha256,
+            grid_or_mesh_fingerprint: global_grid_certificate.grid_fingerprint.clone(),
+            source_state_revision: frozen.source_state_revision,
+            all_active_dofs_frozen: active_cells > 0 && free_dof_count == 0,
+            certificate,
+        }
+    });
+
     Ok(Some(NativeStackedCudaPlan {
         combined_plan: FdmPlanIR {
             origin_m: min_origin,
             grid: GridDimensions { cells: global_grid },
             cell_size: reference_cell_size,
-            grid_certificate: None,
+            grid_certificate: Some(global_grid_certificate),
             region_mask,
             active_mask: Some(active_mask),
             spin_transport_plans: Vec::new(),
             fdm_gpu_charge_transports: Vec::new(),
             initial_magnetization,
-            frozen_spins: None,
+            frozen_spins: mapped_frozen_spins,
             material: reference_material.clone(),
             enable_exchange: plan.enable_exchange,
             enable_demag: plan.enable_demag,
+            fft: plan.fft.clone(),
             external_field: plan.external_field,
             antenna_zeeman_masks: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
             field_drives: Vec::new(),
             regional_field_drive_bases: Vec::new(),
             time_stage: Default::default(),
             gyromagnetic_ratio: plan.gyromagnetic_ratio,
             precision: plan.precision,
+            precision_policy: plan.precision_policy.clone(),
             exchange_bc: plan.exchange_bc,
             periodicity: plan.periodicity.clone(),
             resolved_periodic_images: plan.resolved_periodic_images.clone(),
             integrator: Some(plan.integrator),
+            projection_policy: None,
             fixed_timestep: plan.fixed_timestep,
             adaptive_timestep: None,
             field_refresh: plan.field_refresh.clone(),
@@ -2148,6 +2399,7 @@ fn build_native_stacked_cuda_plan(
             temperature: None,
             thermal_seed_config: None,
             interfacial_dmi: plan.interfacial_dmi,
+            rotated_interfacial_dmi: plan.rotated_interfacial_dmi,
             bulk_dmi: plan.bulk_dmi,
             dind_field: None,
             dbulk_field: None,
@@ -2189,9 +2441,14 @@ fn execute_native_stacked_cuda_multilayer(
         native.combined_plan.adaptive_timestep.as_ref(),
         crate::types::TimestepExecutionLane::fdm_cuda(native.combined_plan.precision),
     )?;
+    let fdm_fft_execution = crate::fdm::resolve_cuda_fft_execution_for_demag(
+        native.combined_plan.enable_demag,
+        native.combined_plan.fft.as_ref(),
+    )?;
     let provenance = ExecutionProvenance {
         execution_engine: "cuda_native_multilayer_single_grid".to_string(),
         precision: precision_name(native.combined_plan.precision).to_string(),
+        fdm_fft_execution,
         demag_operator_kind: if native.combined_plan.enable_demag {
             Some("tensor_fft_newell".to_string())
         } else {
@@ -2308,6 +2565,7 @@ fn execute_native_stacked_cuda_multilayer(
                     hysteresis_settle_step_kind: None,
                     hysteresis_settle_step_method: None,
                     scalar_row_due: false,
+                    terminal_field_snapshot: false,
                     finished: false,
                 });
                 match action {
@@ -2335,6 +2593,7 @@ fn execute_native_stacked_cuda_multilayer(
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: false,
+                terminal_field_snapshot: false,
                 finished: false,
             });
             match action {
@@ -2488,17 +2747,21 @@ fn single_layer_cuda_plan(plan: &FdmMultilayerPlanIR, layer: &FdmLayerPlanIR) ->
         },
         enable_exchange: plan.enable_exchange,
         enable_demag: false,
+        fft: None,
         external_field: plan.external_field,
         antenna_zeeman_masks: Vec::new(),
+        solved_antenna_drive_bases: Vec::new(),
         field_drives: Vec::new(),
         regional_field_drive_bases: Vec::new(),
         time_stage: Default::default(),
         gyromagnetic_ratio: plan.gyromagnetic_ratio,
         precision: plan.precision,
+        precision_policy: plan.precision_policy.clone(),
         exchange_bc: ExchangeBoundaryCondition::Neumann,
         periodicity: None,
         resolved_periodic_images: None,
         integrator: Some(plan.integrator),
+        projection_policy: None,
         fixed_timestep: plan.fixed_timestep,
         adaptive_timestep: None,
         field_refresh: plan.field_refresh.clone(),
@@ -2541,6 +2804,7 @@ fn single_layer_cuda_plan(plan: &FdmMultilayerPlanIR, layer: &FdmLayerPlanIR) ->
         temperature: None,
         thermal_seed_config: None,
         interfacial_dmi: plan.interfacial_dmi,
+        rotated_interfacial_dmi: plan.rotated_interfacial_dmi,
         bulk_dmi: plan.bulk_dmi,
         dind_field: None,
         dbulk_field: None,
@@ -2678,6 +2942,7 @@ fn observe_multilayer_cuda(
     let mut external_field = Vec::new();
     let mut anisotropy_field = Vec::new();
     let mut dmi_field = Vec::new();
+    let mut rotated_dmi_field = Vec::new();
     let mut effective_field = Vec::new();
     let mut torque_field = Vec::new();
     let mut exchange_energy = 0.0;
@@ -2685,6 +2950,7 @@ fn observe_multilayer_cuda(
     let mut external_energy = 0.0;
     let mut anisotropy_energy = 0.0;
     let mut dmi_energy = 0.0;
+    let mut rotated_dmi_energy = 0.0;
     let mut max_dm_dt: f64 = 0.0;
     let mut max_h_eff: f64 = 0.0;
     let mut max_h_demag: f64 = 0.0;
@@ -2712,12 +2978,19 @@ fn observe_multilayer_cuda(
         let mut local_external = local_observables.external_field;
         let mut local_anisotropy = context.problem.anisotropy_field(state.magnetization());
         let mut local_dmi = local_observables.dmi_field;
+        let mut local_rotated_dmi = context
+            .problem
+            .rotated_interfacial_dmi_field(state.magnetization());
         zero_outside_active(&mut local_external, context.problem.active_mask.as_deref());
         zero_outside_active(
             &mut local_anisotropy,
             context.problem.active_mask.as_deref(),
         );
         zero_outside_active(&mut local_dmi, context.problem.active_mask.as_deref());
+        zero_outside_active(
+            &mut local_rotated_dmi,
+            context.problem.active_mask.as_deref(),
+        );
         let mut local_effective = local_observables.effective_field;
         for cell in 0..local_effective.len() {
             local_effective[cell] = add(
@@ -2745,11 +3018,15 @@ fn observe_multilayer_cuda(
             .sum::<f64>();
         let local_anisotropy_energy = local_observables.anisotropy_energy_joules;
         let local_dmi_energy = local_observables.dmi_energy_joules;
+        let local_rotated_dmi_energy = context
+            .problem
+            .rotated_interfacial_dmi_energy_from_vectors(state.magnetization());
         exchange_energy += local_exchange_energy;
         demag_energy += local_demag_energy;
         external_energy += local_external_energy;
         anisotropy_energy += local_anisotropy_energy;
         dmi_energy += local_dmi_energy;
+        rotated_dmi_energy += local_rotated_dmi_energy;
         max_dm_dt = max_dm_dt.max(max_norm(&rhs));
         max_h_eff = max_h_eff.max(max_norm(&local_effective));
         max_h_demag = max_h_demag.max(max_norm(&local_demag));
@@ -2778,6 +3055,7 @@ fn observe_multilayer_cuda(
                 ("e_ext".to_string(), local_external_energy),
                 ("e_ani".to_string(), local_anisotropy_energy),
                 ("e_dmi".to_string(), local_dmi_energy),
+                ("e_rotated_dmi".to_string(), local_rotated_dmi_energy),
                 (
                     "e_total".to_string(),
                     local_exchange_energy
@@ -2799,6 +3077,7 @@ fn observe_multilayer_cuda(
         external_field.extend(local_external);
         anisotropy_field.extend(local_anisotropy);
         dmi_field.extend(local_dmi);
+        rotated_dmi_field.extend(local_rotated_dmi);
         effective_field.extend(local_effective);
     }
 
@@ -2821,6 +3100,7 @@ fn observe_multilayer_cuda(
         effective_field,
         anisotropy_field,
         dmi_field,
+        rotated_dmi_field,
         magnetoelastic_field: Vec::new(),
         cubic_anisotropy_field: Vec::new(),
         bulk_dmi_field: Vec::new(),
@@ -2832,6 +3112,7 @@ fn observe_multilayer_cuda(
         drive_energy: 0.0,
         anisotropy_energy,
         dmi_energy,
+        rotated_dmi_energy,
         total_energy: exchange_energy
             + demag_energy
             + external_energy
@@ -2847,6 +3128,17 @@ fn observe_multilayer_cuda(
     })
 }
 
+/// Count the native vector payloads copied back for one multilayer snapshot.
+///
+/// The six base payloads are M, H_demag, H_ex, H_ani, H_dmi and H_eff.  The
+/// rotated-DMI field is a seventh payload only when the planner materializes
+/// that term; keeping the count derived from the same plan presence check as
+/// the copy above prevents telemetry from claiming a transfer for a zero
+/// placeholder field.
+fn observed_snapshot_vector_field_count(has_rotated_dmi: bool) -> u64 {
+    6 + u64::from(has_rotated_dmi)
+}
+
 fn step_multilayer_cuda(
     contexts: &[LayerContext],
     gpu_contexts: &mut [LayerGpuContext],
@@ -2855,22 +3147,37 @@ fn step_multilayer_cuda(
     mut native_demag: Option<&mut NativeMultilayerDemagOperator>,
     dt: f64,
     integrator: IntegratorChoice,
+    frozen_spins: Option<&fullmag_engine::FrozenSpinsState>,
 ) -> Result<(), RunError> {
     let m0 = states
         .iter()
         .map(|state| state.magnetization().to_vec())
         .collect::<Vec<_>>();
     let corrected = crate::fdm::multilayer::explicit_rk_step(&m0, dt, integrator, |m| {
-        llg_rhs_multilayer_cuda(
+        let mut constrained = m.to_vec();
+        if let Some(frozen) = frozen_spins {
+            restore_frozen_reference_by_layer_offsets(frozen, &mut constrained)
+                .map_err(|error| error.message)?;
+        }
+        let mut rhs = llg_rhs_multilayer_cuda(
             contexts,
             gpu_contexts,
-            m,
+            &constrained,
             demag_runtime,
             native_demag.as_mut().map(|operator| &mut **operator),
         )
-        .map_err(|error| error.message)
+        .map_err(|error| error.message)?;
+        if let Some(frozen) = frozen_spins {
+            zero_frozen_rhs_by_layer_offsets(frozen, &mut rhs).map_err(|error| error.message)?;
+        }
+        Ok(rhs)
     })
     .map_err(|message| RunError { message })?;
+
+    let mut corrected = corrected;
+    if let Some(frozen) = frozen_spins {
+        restore_frozen_reference_by_layer_offsets(frozen, &mut corrected)?;
+    }
 
     for (state, new_layer) in states.iter_mut().zip(corrected.into_iter()) {
         state
@@ -3014,6 +3321,7 @@ fn observe_multilayer_cuda_single(
     let mut external_field = Vec::new();
     let mut anisotropy_field = Vec::new();
     let mut dmi_field = Vec::new();
+    let mut rotated_dmi_field = Vec::new();
     let mut effective_field = Vec::new();
     let mut torque_field = Vec::new();
     let mut exchange_energy = 0.0;
@@ -3021,6 +3329,7 @@ fn observe_multilayer_cuda_single(
     let mut external_energy = 0.0;
     let mut anisotropy_energy = 0.0;
     let mut dmi_energy = 0.0;
+    let mut rotated_dmi_energy = 0.0;
     let mut max_dm_dt: f64 = 0.0;
     let mut max_h_eff: f64 = 0.0;
     let mut max_h_demag: f64 = 0.0;
@@ -3045,12 +3354,21 @@ fn observe_multilayer_cuda_single(
         let mut local_external = to_f32_vectors(&local_observables.external_field);
         let mut local_anisotropy = context.problem.anisotropy_field(&local_magnetization);
         let mut local_dmi = to_f32_vectors(&local_observables.dmi_field);
+        let mut local_rotated_dmi = to_f32_vectors(
+            &context
+                .problem
+                .rotated_interfacial_dmi_field(&local_magnetization),
+        );
         zero_outside_active_f32(&mut local_external, context.problem.active_mask.as_deref());
         zero_outside_active(
             &mut local_anisotropy,
             context.problem.active_mask.as_deref(),
         );
         zero_outside_active_f32(&mut local_dmi, context.problem.active_mask.as_deref());
+        zero_outside_active_f32(
+            &mut local_rotated_dmi,
+            context.problem.active_mask.as_deref(),
+        );
         let mut local_effective = to_f32_vectors(&local_observables.effective_field);
         for cell in 0..local_effective.len() {
             local_effective[cell] = add_f32(
@@ -3076,11 +3394,15 @@ fn observe_multilayer_cuda_single(
         );
         let local_anisotropy_energy = local_observables.anisotropy_energy_joules;
         let local_dmi_energy = local_observables.dmi_energy_joules;
+        let local_rotated_dmi_energy = context
+            .problem
+            .rotated_interfacial_dmi_energy_from_vectors(&local_magnetization);
         exchange_energy += local_exchange_energy;
         demag_energy += local_demag_energy;
         external_energy += local_external_energy;
         anisotropy_energy += local_anisotropy_energy;
         dmi_energy += local_dmi_energy;
+        rotated_dmi_energy += local_rotated_dmi_energy;
         max_dm_dt = max_dm_dt.max(max_norm_f32(&rhs));
         max_h_eff = max_h_eff.max(max_norm_f32(&local_effective));
         max_h_demag = max_h_demag.max(max_norm_f32(&local_demag));
@@ -3109,6 +3431,7 @@ fn observe_multilayer_cuda_single(
                 ("e_ext".to_string(), local_external_energy),
                 ("e_ani".to_string(), local_anisotropy_energy),
                 ("e_dmi".to_string(), local_dmi_energy),
+                ("e_rotated_dmi".to_string(), local_rotated_dmi_energy),
                 (
                     "e_total".to_string(),
                     local_exchange_energy
@@ -3130,6 +3453,7 @@ fn observe_multilayer_cuda_single(
         external_field.extend(to_f64_vectors(&local_external));
         anisotropy_field.extend(local_anisotropy);
         dmi_field.extend(to_f64_vectors(&local_dmi));
+        rotated_dmi_field.extend(to_f64_vectors(&local_rotated_dmi));
         effective_field.extend(to_f64_vectors(&local_effective));
     }
 
@@ -3152,6 +3476,7 @@ fn observe_multilayer_cuda_single(
         effective_field,
         anisotropy_field,
         dmi_field,
+        rotated_dmi_field,
         magnetoelastic_field: Vec::new(),
         cubic_anisotropy_field: Vec::new(),
         bulk_dmi_field: Vec::new(),
@@ -3163,6 +3488,7 @@ fn observe_multilayer_cuda_single(
         drive_energy: 0.0,
         anisotropy_energy,
         dmi_energy,
+        rotated_dmi_energy,
         total_energy: exchange_energy
             + demag_energy
             + external_energy
@@ -3186,20 +3512,34 @@ fn step_multilayer_cuda_single(
     mut native_demag: Option<&mut NativeMultilayerDemagOperator>,
     dt: f64,
     integrator: IntegratorChoice,
+    frozen_spins: Option<&FrozenSpinsStateSingle>,
 ) -> Result<(), RunError> {
     let m0 = states
         .iter()
         .map(|state| state.magnetization.clone())
         .collect::<Vec<_>>();
     let corrected = explicit_rk_step_single(&m0, dt as f32, integrator, |m| {
-        llg_rhs_multilayer_cuda_single(
+        let mut constrained = m.to_vec();
+        if let Some(frozen) = frozen_spins {
+            frozen.restore_reference(&mut constrained)?;
+        }
+        let mut rhs = llg_rhs_multilayer_cuda_single(
             contexts,
             gpu_contexts,
-            m,
+            &constrained,
             demag_runtime,
             native_demag.as_mut().map(|operator| &mut **operator),
-        )
+        )?;
+        if let Some(frozen) = frozen_spins {
+            frozen.zero_rhs(&mut rhs)?;
+        }
+        Ok(rhs)
     })?;
+
+    let mut corrected = corrected;
+    if let Some(frozen) = frozen_spins {
+        frozen.restore_reference(&mut corrected)?;
+    }
 
     for (state, new_layer) in states.iter_mut().zip(corrected.into_iter()) {
         state.magnetization = new_layer;
@@ -3412,6 +3752,7 @@ fn observe_native_stacked_cuda(
     let exchange_full = backend.copy_h_ex(cell_count)?;
     let demag_full = backend.copy_h_demag(cell_count)?;
     let external_full = backend.copy_h_ext(cell_count)?;
+    let rotated_dmi_full = backend.copy_h_rotated_dmi(cell_count)?;
     let effective_full = backend.copy_h_eff(cell_count)?;
     observe_native_stacked_fields(
         native,
@@ -3419,6 +3760,7 @@ fn observe_native_stacked_cuda(
         &exchange_full,
         &demag_full,
         &external_full,
+        &rotated_dmi_full,
         &effective_full,
     )
 }
@@ -3429,6 +3771,7 @@ fn observe_native_stacked_fields(
     exchange_full: &[[f64; 3]],
     demag_full: &[[f64; 3]],
     external_full: &[[f64; 3]],
+    rotated_dmi_full: &[[f64; 3]],
     effective_full: &[[f64; 3]],
 ) -> Result<StateObservables, RunError> {
     let cell_count = magnetization_full.len();
@@ -3475,9 +3818,11 @@ fn observe_native_stacked_fields(
         std::collections::HashMap<String, f64>,
     > = std::collections::HashMap::new();
     let mut dmi_field = Vec::new();
+    let mut rotated_dmi_field = Vec::new();
     let mut anisotropy_field = Vec::new();
     let mut anisotropy_energy = 0.0;
     let mut dmi_energy = 0.0;
+    let mut rotated_dmi_energy = 0.0;
     let local_self_field_energy_factor = -0.5 * MU0 * ms * cell_volume;
     let local_external_field_energy_factor = -MU0 * ms * cell_volume;
     for layer in &native.layers {
@@ -3547,13 +3892,28 @@ fn observe_native_stacked_fields(
             layer.context.problem.active_mask.as_deref(),
         );
         let mut local_dmi = local_observables.dmi_field;
+        let mut local_rotated_dmi =
+            extract_native_stacked_layer_field(rotated_dmi_full, native, layer);
         zero_outside_active(&mut local_dmi, layer.context.problem.active_mask.as_deref());
+        zero_outside_active(
+            &mut local_rotated_dmi,
+            layer.context.problem.active_mask.as_deref(),
+        );
         let local_anisotropy_energy = local_observables.anisotropy_energy_joules;
         let local_dmi_energy = local_observables.dmi_energy_joules;
+        let local_rotated_dmi_energy = field_energy_from_full(
+            local_state.magnetization(),
+            &local_rotated_dmi,
+            layer.context.problem.active_mask.as_deref(),
+            layer.context.problem.material.saturation_magnetisation,
+            cell_volume,
+        );
         anisotropy_energy += local_anisotropy_energy;
         dmi_energy += local_dmi_energy;
+        rotated_dmi_energy += local_rotated_dmi_energy;
         anisotropy_field.extend(local_anisotropy);
         dmi_field.extend(local_dmi);
+        rotated_dmi_field.extend(local_rotated_dmi);
 
         let inv = if active_count > 0 {
             1.0 / active_count as f64
@@ -3568,6 +3928,7 @@ fn observe_native_stacked_fields(
                 ("e_ext".to_string(), local_external_energy),
                 ("e_ani".to_string(), local_anisotropy_energy),
                 ("e_dmi".to_string(), local_dmi_energy),
+                ("e_rotated_dmi".to_string(), local_rotated_dmi_energy),
                 (
                     "e_total".to_string(),
                     local_exchange_energy
@@ -3619,6 +3980,7 @@ fn observe_native_stacked_fields(
         effective_field,
         anisotropy_field,
         dmi_field,
+        rotated_dmi_field,
         magnetoelastic_field: Vec::new(),
         cubic_anisotropy_field: Vec::new(),
         bulk_dmi_field: Vec::new(),
@@ -3630,6 +3992,7 @@ fn observe_native_stacked_fields(
         drive_energy: 0.0,
         anisotropy_energy,
         dmi_energy,
+        rotated_dmi_energy,
         total_energy: exchange_energy
             + demag_energy
             + external_energy
@@ -3790,11 +4153,147 @@ fn flatten_layers_single(states: &[LayerStateSingle]) -> Vec<[f64; 3]> {
         .collect()
 }
 
+fn flatten_layers_single_f32(states: &[LayerStateSingle]) -> Vec<[f32; 3]> {
+    states
+        .iter()
+        .flat_map(|state| state.magnetization.iter().copied())
+        .collect()
+}
+
+fn multilayer_active_mask(plan: &FdmMultilayerPlanIR) -> Option<Vec<bool>> {
+    if !plan
+        .layers
+        .iter()
+        .any(|layer| layer.native_active_mask.is_some())
+    {
+        return None;
+    }
+    Some(
+        plan.layers
+            .iter()
+            .flat_map(|layer| {
+                layer.native_active_mask.as_deref().map_or_else(
+                    || vec![true; layer.initial_magnetization.len()],
+                    ToOwned::to_owned,
+                )
+            })
+            .collect(),
+    )
+}
+
+fn capture_frozen_spins_single(
+    plan: &FdmMultilayerPlanIR,
+    active_mask: Option<&[bool]>,
+    states: &[LayerStateSingle],
+) -> Result<Option<FrozenSpinsStateSingle>, RunError> {
+    let Some(frozen) = plan.frozen_spins.as_ref() else {
+        return Ok(None);
+    };
+    frozen.validate_intrinsic().map_err(|message| RunError {
+        message: format!(
+            "CUDA-assisted FP32 multilayer Frozen Spins plan is intrinsically invalid: {message}"
+        ),
+    })?;
+    let reference = flatten_layers_single_f32(states);
+    if frozen.frozen_mask.len() != reference.len() {
+        return Err(RunError {
+            message: format!(
+                "CUDA-assisted FP32 multilayer Frozen Spins mask has {} entries, expected {}",
+                frozen.frozen_mask.len(),
+                reference.len()
+            ),
+        });
+    }
+    if let Some(active_mask) = active_mask {
+        frozen
+            .validate_against_active_mask(active_mask)
+            .map_err(|message| RunError {
+                message: format!(
+                    "CUDA-assisted FP32 multilayer Frozen Spins active-domain validation failed: {message}"
+                ),
+            })?;
+    }
+    Ok(Some(FrozenSpinsStateSingle {
+        mask: frozen.frozen_mask.clone(),
+        reference,
+    }))
+}
+
+fn restore_frozen_reference_by_layer_offsets(
+    frozen: &fullmag_engine::FrozenSpinsState,
+    layers: &mut [Vec<[f64; 3]>],
+) -> Result<(), RunError> {
+    let total_len = layers.iter().map(Vec::len).sum::<usize>();
+    if total_len != frozen.len() {
+        return Err(RunError {
+            message: format!(
+                "frozen_spins_multilayer_state_size_mismatch: flattened layer length {total_len} differs from frozen state length {}",
+                frozen.len()
+            ),
+        });
+    }
+    let mut flat = flatten_layers(layers);
+    frozen.restore_reference(&mut flat);
+    let mut offset = 0usize;
+    for layer in layers {
+        let end = offset + layer.len();
+        layer.copy_from_slice(&flat[offset..end]);
+        offset = end;
+    }
+    Ok(())
+}
+
+fn zero_frozen_rhs_by_layer_offsets(
+    frozen: &fullmag_engine::FrozenSpinsState,
+    layers: &mut [Vec<[f64; 3]>],
+) -> Result<(), RunError> {
+    let total_len = layers.iter().map(Vec::len).sum::<usize>();
+    if total_len != frozen.len() {
+        return Err(RunError {
+            message: format!(
+                "frozen_spins_multilayer_rhs_size_mismatch: flattened layer length {total_len} differs from frozen state length {}",
+                frozen.len()
+            ),
+        });
+    }
+    let mut offset = 0usize;
+    for layer in layers {
+        for value in layer {
+            if frozen.mask()[offset] {
+                *value = [0.0; 3];
+            }
+            offset += 1;
+        }
+    }
+    Ok(())
+}
+
 fn precision_name(value: ExecutionPrecision) -> &'static str {
     match value {
         ExecutionPrecision::Single => "single",
         ExecutionPrecision::Double => "double",
     }
+}
+
+fn frozen_mask_sha256(mask: &[bool]) -> String {
+    let mut hash = Sha256::new();
+    hash.update((mask.len() as u64).to_le_bytes());
+    hash.update(mask.iter().copied().map(u8::from).collect::<Vec<_>>());
+    format!("{:x}", hash.finalize())
+}
+
+fn frozen_reference_sha256(mask: &[bool], reference: &[[f64; 3]]) -> String {
+    let mut hash = Sha256::new();
+    hash.update((mask.len() as u64).to_le_bytes());
+    for (is_frozen, value) in mask.iter().zip(reference) {
+        hash.update([u8::from(*is_frozen)]);
+        if *is_frozen {
+            for component in value {
+                hash.update(component.to_bits().to_le_bytes());
+            }
+        }
+    }
+    format!("{:x}", hash.finalize())
 }
 
 fn zero_outside_active(values: &mut [[f64; 3]], active_mask: Option<&[bool]>) {
@@ -4040,7 +4539,51 @@ fn field_energy_from_vectors_f32(
 mod tests {
     use super::*;
     use crate::fdm::cpu::multilayer_reference;
-    use fullmag_ir::{FdmGridCertificateIR, RelaxationAlgorithmIR, RelaxationControlIR};
+    use fullmag_ir::{
+        FdmGridCertificateIR, RelaxationAlgorithmIR, RelaxationControlIR,
+        ResolvedFrozenSpinsPlanIR, SelectionAuthoredFingerprintIR, SelectionCertificateIR,
+        RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION, SELECTION_CERTIFICATE_SCHEMA_VERSION,
+    };
+
+    fn frozen_plan_for_mask(mask: Vec<bool>, grid_fingerprint: &str) -> ResolvedFrozenSpinsPlanIR {
+        let frozen_dof_count = mask.iter().filter(|is_frozen| **is_frozen).count() as u64;
+        let active_dof_count = mask.len() as u64;
+        let free_dof_count = active_dof_count - frozen_dof_count;
+        let mask_sha256 = frozen_mask_sha256(&mask);
+        let certificate = SelectionCertificateIR {
+            schema_version: SELECTION_CERTIFICATE_SCHEMA_VERSION.to_string(),
+            evaluator_id: "test.multilayer.frozen_spins".to_string(),
+            constraint_ids: vec!["multilayer-test".to_string()],
+            authored_fingerprints: vec![SelectionAuthoredFingerprintIR {
+                constraint_id: "multilayer-test".to_string(),
+                selector_sha256: "a".repeat(64),
+            }],
+            raw_candidate_dof_count: frozen_dof_count,
+            inactive_candidate_dof_count: 0,
+            active_dof_count,
+            frozen_dof_count,
+            free_dof_count,
+            bounds_m: None,
+            grid_or_mesh_fingerprint: grid_fingerprint.to_string(),
+            source_state_revision: Some(7),
+            mask_sha256: mask_sha256.clone(),
+            resolved_reference_sha256: "c".repeat(64),
+            warnings: Vec::new(),
+        };
+        ResolvedFrozenSpinsPlanIR {
+            schema_version: RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION.to_string(),
+            constraint_ids: vec!["multilayer-test".to_string()],
+            frozen_mask: mask,
+            active_dof_count,
+            frozen_dof_count,
+            free_dof_count,
+            mask_sha256,
+            grid_or_mesh_fingerprint: grid_fingerprint.to_string(),
+            source_state_revision: Some(7),
+            all_active_dofs_frozen: active_dof_count > 0 && free_dof_count == 0,
+            certificate,
+        }
+    }
 
     #[test]
     fn assisted_multilayer_telemetry_counts_vector_roundtrips() {
@@ -4089,6 +4632,43 @@ mod tests {
         assert_eq!(telemetry.d2h_transfer_count, 1);
         assert_eq!(telemetry.h2d_bytes, 384);
         assert_eq!(telemetry.d2h_bytes, 384);
+    }
+
+    #[test]
+    fn fdm_fft_device_resident_multilayer_provenance_records_cufft_execution() {
+        let provenance = device_resident_multilayer_provenance(
+            &make_plan(true, ExecutionPrecision::Double),
+            None,
+            None,
+            DeviceResidentMultilayerTransferCounters::default(),
+        )
+        .expect("device-resident plan should resolve cuFFT provenance");
+        let receipt = provenance
+            .fdm_fft_execution
+            .expect("demag execution must publish an FFT receipt");
+
+        assert_eq!(receipt.requested_backend, "auto");
+        assert_eq!(receipt.resolved_backend, "cufft");
+        assert_eq!(receipt.executed_backend, "cufft");
+    }
+
+    #[test]
+    fn fdm_fft_assisted_multilayer_provenance_records_rustfft_execution() {
+        let provenance = assisted_multilayer_provenance(
+            &make_plan(true, ExecutionPrecision::Double),
+            None,
+            false,
+            CudaTransferCounters::default(),
+            None,
+        )
+        .expect("assisted plan should resolve RustFFT provenance");
+        let receipt = provenance
+            .fdm_fft_execution
+            .expect("demag execution must publish an FFT receipt");
+
+        assert_eq!(receipt.requested_backend, "auto");
+        assert_eq!(receipt.resolved_backend, "rustfft");
+        assert_eq!(receipt.executed_backend, "rustfft");
     }
 
     fn manufactured_rhs_single(state: &[Vec<[f32; 3]>]) -> Result<Vec<Vec<[f32; 3]>>, RunError> {
@@ -4197,13 +4777,17 @@ mod tests {
                     transfer_kind: "identity".to_string(),
                 },
             ],
+            frozen_spins: None,
             enable_exchange: true,
             enable_demag,
+            fft: None,
             external_field: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             gyromagnetic_ratio: 2.211e5,
             precision,
+            precision_policy: fullmag_ir::FdmPrecisionPolicyIR::resolve(precision),
             exchange_bc: ExchangeBoundaryCondition::Neumann,
             periodicity: None,
             integrator: IntegratorChoice::Heun,
@@ -4397,17 +4981,24 @@ mod tests {
     }
 
     #[test]
+    fn device_resident_snapshot_transfer_count_matches_rotated_dmi_presence() {
+        assert_eq!(observed_snapshot_vector_field_count(false), 6);
+        assert_eq!(observed_snapshot_vector_field_count(true), 7);
+    }
+
+    #[test]
     fn device_resident_snapshot_effective_field_is_canonical_term_sum() {
         let h_ex = vec![[1.0, 2.0, 3.0], [0.5, -1.0, 0.0]];
         let h_demag = vec![[4.0, 5.0, 6.0], [1.5, 2.0, -3.0]];
         let h_ext = vec![[7.0, 8.0, 9.0], [0.0, 4.0, 1.0]];
         let h_ani = vec![[10.0, 11.0, 12.0], [-2.0, 0.0, 3.0]];
         let h_dmi = vec![[13.0, 14.0, 15.0], [5.0, -4.0, 2.0]];
-        let native = vec![[35.0, 40.0, 45.0], [5.0, 1.0, 3.0]];
+        let h_rotated_dmi = vec![[16.0, 17.0, 18.0], [0.5, -1.0, -2.0]];
+        let native = vec![[51.0, 57.0, 63.0], [5.5, 0.0, 1.0]];
 
         let canonical = canonical_snapshot_effective_field(
             &native,
-            [&h_ex, &h_demag, &h_ext, &h_ani, &h_dmi],
+            [&h_ex, &h_demag, &h_ext, &h_ani, &h_dmi, &h_rotated_dmi],
             "layer-a",
         )
         .expect("native H_eff matching all active field terms must be accepted");
@@ -4417,7 +5008,7 @@ mod tests {
         inconsistent[1][2] += 1.0;
         assert!(canonical_snapshot_effective_field(
             &inconsistent,
-            [&h_ex, &h_demag, &h_ext, &h_ani, &h_dmi],
+            [&h_ex, &h_demag, &h_ext, &h_ani, &h_dmi, &h_rotated_dmi],
             "layer-a",
         )
         .unwrap_err()
@@ -4714,13 +5305,17 @@ mod tests {
                     transfer_kind: "identity".to_string(),
                 },
             ],
+            frozen_spins: None,
             enable_exchange: true,
             enable_demag: true,
+            fft: None,
             external_field: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             gyromagnetic_ratio: 2.211e5,
             precision,
+            precision_policy: fullmag_ir::FdmPrecisionPolicyIR::resolve(precision),
             exchange_bc: ExchangeBoundaryCondition::Neumann,
             periodicity: None,
             integrator: IntegratorChoice::Heun,
@@ -4821,6 +5416,96 @@ mod tests {
     }
 
     #[test]
+    fn native_stacked_cuda_plan_maps_frozen_mask_and_rebinds_global_certificate() {
+        let mut plan = make_auto_plan(false, ExecutionPrecision::Double);
+        let local_mask = (0..32).map(|index| index % 5 == 0).collect::<Vec<_>>();
+        plan.frozen_spins = Some(frozen_plan_for_mask(local_mask.clone(), "source-grid"));
+
+        let native = build_native_stacked_cuda_plan(&plan)
+            .expect("native stacked Frozen Spins plan should build")
+            .expect("auto identity plan should use native stacked lane");
+        let mapped = native
+            .combined_plan
+            .frozen_spins
+            .as_ref()
+            .expect("native stacked plan must retain Frozen Spins");
+
+        let mut expected = vec![false; 64];
+        for (local_index, is_frozen) in local_mask.iter().copied().enumerate() {
+            let layer_offset = if local_index < 16 { 0 } else { 48 };
+            let layer_local_index = local_index % 16;
+            expected[layer_offset + layer_local_index] = is_frozen;
+        }
+        assert_eq!(mapped.frozen_mask, expected);
+        assert_eq!(mapped.active_dof_count, 32);
+        assert_eq!(
+            mapped.frozen_dof_count,
+            local_mask.iter().filter(|v| **v).count() as u64
+        );
+        assert_eq!(mapped.free_dof_count, 32 - mapped.frozen_dof_count);
+        mapped
+            .validate_intrinsic()
+            .expect("mapped Frozen Spins certificate must remain intrinsically valid");
+
+        let grid_certificate = native
+            .combined_plan
+            .grid_certificate
+            .as_ref()
+            .expect("native stacked plan must expose its global grid certificate");
+        grid_certificate
+            .validate_against_masks(
+                native.combined_plan.active_mask.as_deref(),
+                &native.combined_plan.region_mask,
+            )
+            .expect("global grid certificate must validate against native masks");
+        assert_eq!(
+            mapped.grid_or_mesh_fingerprint,
+            grid_certificate.grid_fingerprint
+        );
+        assert_eq!(
+            mapped.certificate.grid_or_mesh_fingerprint,
+            grid_certificate.grid_fingerprint
+        );
+    }
+
+    #[test]
+    fn device_resident_multilayer_lane_rejects_frozen_spins_without_v2_payload() {
+        let mut plan = make_bounded_device_resident_plan();
+        plan.frozen_spins = Some(frozen_plan_for_mask(vec![true; 32], "device-resident"));
+        let error = validate_device_resident_cuda_multilayer_lane(&plan)
+            .expect_err("v2 device-resident lane must fail closed for Frozen Spins");
+        assert!(error
+            .message
+            .contains("fdm_cuda_device_resident_multilayer_frozen_spins_unqualified"));
+    }
+
+    #[test]
+    fn assisted_fp32_frozen_reference_and_rhs_are_hard_restored() {
+        let frozen = FrozenSpinsStateSingle {
+            mask: vec![true, false, true],
+            reference: vec![[0.25, 0.5, 0.75], [1.0, 0.0, 0.0], [0.0, -0.5, 0.5]],
+        };
+        let mut stage = vec![
+            vec![[9.0, 9.0, 9.0], [8.0, 8.0, 8.0]],
+            vec![[7.0, 7.0, 7.0]],
+        ];
+        frozen
+            .restore_reference(&mut stage)
+            .expect("FP32 Frozen Spins restore should accept matching layer sizes");
+        assert_eq!(stage[0][0], frozen.reference[0]);
+        assert_eq!(stage[0][1], [8.0, 8.0, 8.0]);
+        assert_eq!(stage[1][0], frozen.reference[2]);
+
+        let mut rhs = vec![vec![[1.0, 2.0, 3.0]; 2], vec![[4.0, 5.0, 6.0]]];
+        frozen
+            .zero_rhs(&mut rhs)
+            .expect("FP32 Frozen Spins RHS mask should accept matching layer sizes");
+        assert_eq!(rhs[0][0], [0.0, 0.0, 0.0]);
+        assert_eq!(rhs[0][1], [1.0, 2.0, 3.0]);
+        assert_eq!(rhs[1][0], [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
     fn staged_v2_cuda_allows_fixed_step_rk23_but_rejects_rk45() {
         let mut plan = make_auto_plan(false, ExecutionPrecision::Double);
         plan.integrator = IntegratorChoice::Rk45;
@@ -4872,6 +5557,7 @@ mod tests {
             &zero_field,
             &zero_field,
             &zero_field,
+            &zero_field,
         )
         .expect("native stacked field assembly should compute");
 
@@ -4913,6 +5599,7 @@ mod tests {
             &zero_field,
             &external_field,
             &zero_field,
+            &zero_field,
         )
         .expect("native stacked field assembly should compute");
 
@@ -4944,6 +5631,7 @@ mod tests {
         let observables = observe_native_stacked_fields(
             &native,
             &native.combined_plan.initial_magnetization,
+            &zero_field,
             &zero_field,
             &zero_field,
             &zero_field,
@@ -4996,6 +5684,7 @@ mod tests {
             effective_field: Vec::new(),
             anisotropy_field: Vec::new(),
             dmi_field: Vec::new(),
+            rotated_dmi_field: Vec::new(),
             magnetoelastic_field: Vec::new(),
             cubic_anisotropy_field: Vec::new(),
             bulk_dmi_field: Vec::new(),
@@ -5007,6 +5696,7 @@ mod tests {
             drive_energy: 0.0,
             anisotropy_energy: 0.5,
             dmi_energy: 0.25,
+            rotated_dmi_energy: 0.0,
             total_energy: 6.75,
             max_dm_dt: 7.0,
             max_rhs_all_norm_per_s: 7.0,

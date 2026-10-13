@@ -20,6 +20,29 @@ import {
 
 export type { ObjectInteractionKind, PhysicsInteractionDraft, PhysicsInteractionId };
 
+export function interactionIdFromSelection(
+  nodeId: string | null,
+): PhysicsInteractionId | null {
+  const raw = nodeId?.split(":").at(-1);
+  if (
+    raw === "exchange" ||
+    raw === "demag" ||
+    raw === "zeeman" ||
+    raw === "current_transport" ||
+    raw === "spin_torque" ||
+    raw === "interfacial_dmi" ||
+    raw === "rotated_interfacial_dmi" ||
+    raw === "bulk_dmi" ||
+    raw === "uniaxial_anisotropy" ||
+    raw === "cubic_anisotropy" ||
+    raw === "oersted_field" ||
+    raw === "magnetoelastic"
+  ) {
+    return raw;
+  }
+  return null;
+}
+
 export type InteractionApplyPatchResult =
   | { error: string }
   | { patch: JsonObject; storage: "study" }
@@ -35,8 +58,9 @@ export function interactionLabel(id: PhysicsInteractionId): string {
 
 export function isWritableObjectInteraction(
   id: PhysicsInteractionId,
+  objectId?: string | null,
 ): id is ObjectInteractionKind {
-  return isObjectInteractionKind(id) && findInteractionSpec(id)?.storage === "object_interaction";
+  return isObjectInteractionKind(id) && findInteractionSpec(id, objectId)?.storage === "object_interaction";
 }
 
 export function isWritableStudyInteraction(id: PhysicsInteractionId): boolean {
@@ -57,6 +81,7 @@ export function defaultObjectInteractionResource(
     object_id: objectId,
     params: {},
     present: false,
+    scene_revision: 0,
   };
 }
 
@@ -113,6 +138,28 @@ export function draftFromStudyScene(
     };
   }
 
+  if (id === "rotated_interfacial_dmi") {
+    const value = study?.rotated_interfacial_dmi;
+    const parsedValue =
+      typeof value === "number"
+        ? Number.isFinite(value)
+          ? value
+          : null
+        : typeof value === "string" && value.trim() !== ""
+          ? Number(value)
+          : null;
+    const present = parsedValue !== null && Number.isFinite(parsedValue);
+    return {
+      ...draft,
+      enabled: present,
+      present,
+      values: {
+        ...draft.values,
+        d: present ? String(parsedValue) : "0.003",
+      },
+    };
+  }
+
   return draft;
 }
 
@@ -129,21 +176,93 @@ export function draftKeyForInteraction(
   ].join(":");
 }
 
+export function interactionMutationKey({
+  interactionId,
+  objectId,
+  regionId,
+  sessionId,
+}: {
+  interactionId: PhysicsInteractionId;
+  objectId: string | null | undefined;
+  regionId: string | null | undefined;
+  sessionId: string | null | undefined;
+}): string {
+  const scope = regionId
+    ? regionId.startsWith("region:")
+      ? regionId
+      : `region:${regionId}`
+    : objectId
+      ? `object:${objectId}`
+      : "study";
+  return `${sessionId ?? "current"}:${scope}:${interactionId}`;
+}
+
+export function physicsInteractionDraftDirty(
+  draft: PhysicsInteractionDraft,
+  baseDraft: PhysicsInteractionDraft,
+): boolean {
+  if (
+    draft.id !== baseDraft.id ||
+    draft.enabled !== baseDraft.enabled ||
+    draft.present !== baseDraft.present
+  ) {
+    return true;
+  }
+  const keys = new Set([
+    ...Object.keys(draft.values),
+    ...Object.keys(baseDraft.values),
+  ]);
+  for (const key of keys) {
+    if (interactionDraftValueDirty(draft.values[key], baseDraft.values[key])) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function interactionDraftValueDirty(
+  value: string | string[] | undefined,
+  baseValue: string | string[] | undefined,
+): boolean {
+  if (Array.isArray(value) || Array.isArray(baseValue)) {
+    if (!Array.isArray(value) || !Array.isArray(baseValue) || value.length !== baseValue.length) {
+      return true;
+    }
+    return value.some((entry, index) =>
+      interactionDraftValueDirty(entry, baseValue[index]),
+    );
+  }
+  if (value === undefined || baseValue === undefined) return value !== baseValue;
+  const trimmedValue = value.trim();
+  const trimmedBaseValue = baseValue.trim();
+  if (trimmedValue === "" || trimmedBaseValue === "") {
+    return trimmedValue !== trimmedBaseValue;
+  }
+  const numeric = Number(trimmedValue);
+  const baseNumeric = Number(trimmedBaseValue);
+  if (Number.isFinite(numeric) && Number.isFinite(baseNumeric)) {
+    return numeric !== baseNumeric;
+  }
+  return trimmedValue !== trimmedBaseValue;
+}
+
 export function buildInteractionApplyPatch(
   draft: PhysicsInteractionDraft,
+  scene?: SceneResource | null,
+  objectId?: string | null,
 ): InteractionApplyPatchResult {
-  const spec = findInteractionSpec(draft.id);
+  const spec = findInteractionSpec(draft.id, objectId);
   if (!spec) return { error: `Unknown physics interaction: ${draft.id}` };
 
   if (spec.storage === "object_interaction") {
-    const result = buildObjectInteractionPatchFromDraft(draft);
+    const result = buildObjectInteractionPatchFromDraft(draft, scene, objectId);
     return "error" in result
       ? result
       : { patch: result.patch, storage: "object_interaction" };
   }
 
   if (spec.storage === "study") {
-    const result = buildStudyInteractionPatchFromDraft(draft);
+    const result = buildStudyInteractionPatchFromDraft(draft, scene);
     return "error" in result ? result : { patch: result.patch, storage: "study" };
   }
 
@@ -158,8 +277,7 @@ function isObjectInteractionKind(id: PhysicsInteractionId): id is ObjectInteract
   return (
     id === "exchange" ||
     id === "demag" ||
-    id === "interfacial_dmi" ||
-    id === "uniaxial_anisotropy"
+    id === "interfacial_dmi" || id === "uniaxial_anisotropy"
   );
 }
 

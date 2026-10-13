@@ -28,9 +28,12 @@ impl GpuInteractiveFemPreviewRuntime {
             });
         }
         if normalized_quantity_name(&request.quantity).ok() == Some("H_ant") {
+            let time = self.backend.snapshot_step_stats(self.node_count)?.time;
+            let antenna_field =
+                crate::antenna_fields::compute_antenna_field_at_time(&self.plan_signature, time)?;
             return Ok(build_mesh_preview_field_with_active_mask(
                 request,
-                &self.antenna_field,
+                &antenna_field,
                 None,
             ));
         }
@@ -47,6 +50,11 @@ impl GpuInteractiveFemPreviewRuntime {
             active_fem_preview_quantities(FemEngine::NativeGpu, &self.plan_signature, quantities);
         let mut cached = Vec::new();
         let mut seen = HashSet::new();
+        let antenna_time = if quantities.iter().any(|quantity| *quantity == "H_ant") {
+            Some(self.backend.snapshot_step_stats(self.node_count)?.time)
+        } else {
+            None
+        };
 
         for quantity in quantities
             .iter()
@@ -58,9 +66,13 @@ impl GpuInteractiveFemPreviewRuntime {
             let mut preview_request = request.clone();
             preview_request.quantity = quantity.to_string();
             if quantity == "H_ant" {
+                let antenna_field = crate::antenna_fields::compute_antenna_field_at_time(
+                    &self.plan_signature,
+                    antenna_time.expect("H_ant requested with captured time"),
+                )?;
                 cached.push(build_mesh_preview_field_with_active_mask(
                     &preview_request,
-                    &self.antenna_field,
+                    &antenna_field,
                     None,
                 ));
             } else {
@@ -164,6 +176,7 @@ impl GpuInteractiveFemPreviewRuntime {
                 preview_field,
                 cached_preview_fields,
                 scalar_row_due: preview_due && display_is_global_scalar(&display_state),
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -396,6 +409,7 @@ impl GpuInteractiveFemPreviewRuntime {
                 preview_field,
                 cached_preview_fields: None,
                 scalar_row_due: preview_due && display_is_global_scalar(&display_state),
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {

@@ -1,6 +1,12 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import {
+  createContext,
+  useContext,
+  useEffect,
+  useState,
+  type ReactNode,
+} from "react";
 
 import { Button } from "@/shared/ui/Button";
 import { Progress } from "@/shared/ui/Progress";
@@ -15,6 +21,7 @@ import type { LiveStatusResource } from "../api/apiTypes";
 import { useKernel } from "../KernelContext";
 import { statusRefreshIntervalMs } from "../realtime/communicationPolicy";
 import { useRealtimeConnection } from "../realtime/useRealtimeConnection";
+import { SimulationPreparationFailureDialog } from "./SimulationPreparationFailureDialog";
 import type { ResourceResult } from "../resources/resourceTypes";
 import { useSessionStatusSelector } from "../resources/useSessionStatus";
 import { useSimulationPreparation } from "../resources/useSimulationPreparation";
@@ -30,6 +37,19 @@ import {
 import { useLayoutSelector } from "./useLayout";
 
 export type SimulationStartupOverlayState = SimulationPreparationViewModel;
+
+export const WorkspaceStartupInteractionContext = createContext(false);
+
+export function useWorkspaceStartupInteractionBlocked(): boolean {
+  return useContext(WorkspaceStartupInteractionContext);
+}
+
+export function shouldMountWorkspaceChildren(
+  startupVisible: boolean,
+  childrenMounted: boolean,
+): boolean {
+  return childrenMounted || !startupVisible;
+}
 
 interface SimulationStartupOverlayOptions {
   readonly allowMissingSessionSmoke?: boolean;
@@ -119,10 +139,16 @@ export function SimulationStartupOverlayView({
     state.progress.kind === "determinate" ? state.progress.value : undefined;
 
   return (
-    <div className="fm-simulation-startup" data-state={state.kind}>
+    <div
+      className="fm-simulation-startup"
+      data-interaction-state="blocked"
+      data-state={state.kind}
+    >
       <section
         aria-labelledby="fm-simulation-startup-title"
         className="fm-simulation-startup__panel"
+        role={state.failure ? undefined : "dialog"}
+        aria-modal={state.failure ? undefined : "true"}
       >
         <header className="fm-simulation-startup__header">
           <div className="fm-simulation-startup__heading-row">
@@ -173,6 +199,39 @@ export function SimulationStartupOverlayView({
             </dl>
           ) : null}
 
+          {state.preparation?.receipt ? (
+            <dl
+              aria-label="Accepted preparation provenance"
+              className="fm-simulation-startup__receipt"
+              data-preparation-receipt="accepted"
+            >
+              <div>
+                <dt>Accepted preparation</dt>
+                <dd>{state.preparation.receipt.preparation_id}</dd>
+              </div>
+              <div>
+                <dt>Live run</dt>
+                <dd>{state.preparation.receipt.run_id}</dd>
+              </div>
+              <div>
+                <dt>Receipt schema</dt>
+                <dd>{state.preparation.receipt.schema_version}</dd>
+              </div>
+              <div>
+                <dt>Plan digest</dt>
+                <dd title={state.preparation.receipt.plan_fingerprint}>
+                  {state.preparation.receipt.plan_fingerprint}
+                </dd>
+              </div>
+              <div>
+                <dt>Payload digest</dt>
+                <dd title={state.preparation.receipt.payload_sha256}>
+                  {state.preparation.receipt.payload_sha256}
+                </dd>
+              </div>
+            </dl>
+          ) : null}
+
           <div
             aria-live="polite"
             className="fm-visually-hidden"
@@ -212,11 +271,11 @@ export function SimulationStartupOverlayView({
 
         <footer className="fm-simulation-startup__footer">
           <p>
-            The workspace opens after solver initialization completes.
+            Simulation controls will be available when initialization finishes.
           </p>
           {(state.failure && state.preparation) || state.kind === "resource-error" ? (
             <SimulationPreparationFailureActions
-              snapshot={state.preparation}
+              state={state}
             />
           ) : null}
         </footer>
@@ -344,48 +403,100 @@ export function openSimulationPreparationDiagnostics(
 }
 
 function SimulationPreparationFailureActions({
-  snapshot,
+  state,
 }: {
-  snapshot: SimulationStartupOverlayState["preparation"];
+  state: SimulationStartupOverlayState;
+}) {
+  const snapshot = state.preparation;
+  const failureIdentity =
+    snapshot && state.failure
+      ? JSON.stringify([
+          snapshot.preparation_id,
+          snapshot.revision,
+          state.failure.errorCode,
+        ])
+      : "resource-error";
+
+  return (
+    <SimulationPreparationFailureAttempt
+      initiallyOpen={Boolean(snapshot && state.failure)}
+      key={failureIdentity}
+      state={state}
+    />
+  );
+}
+
+function SimulationPreparationFailureAttempt({
+  initiallyOpen,
+  state,
+}: {
+  initiallyOpen: boolean;
+  state: SimulationStartupOverlayState;
 }) {
   const kernel = useKernel();
+  const snapshot = state.preparation;
   const [copyState, setCopyState] = useState<"copied" | "failed" | "idle">(
     "idle",
   );
+  const [dialogOpen, setDialogOpen] = useState(initiallyOpen);
+  const diagnosticReport = snapshot
+    ? serializeSimulationPreparationDiagnostics(snapshot)
+    : "";
 
   const copyDiagnostics = async () => {
     if (!snapshot) return;
 
+    setCopyState("idle");
     try {
-      await navigator.clipboard.writeText(
-        serializeSimulationPreparationDiagnostics(snapshot),
-      );
+      await navigator.clipboard.writeText(diagnosticReport);
       setCopyState("copied");
     } catch {
       setCopyState("failed");
     }
   };
 
+  const openDiagnostics = () => openSimulationPreparationDiagnostics(kernel);
+
   return (
-    <div className="fm-simulation-startup__actions">
-      {snapshot ? (
-        <Button onClick={copyDiagnostics} size="sm" type="button">
-          {copyState === "copied"
-            ? "Diagnostics copied"
-            : copyState === "failed"
-              ? "Copy failed"
-              : "Copy diagnostics"}
+    <>
+      <div className="fm-simulation-startup__actions">
+        {snapshot ? (
+          <>
+            <Button onClick={copyDiagnostics} size="sm" type="button">
+              {copyState === "copied"
+                ? "Diagnostics copied"
+                : copyState === "failed"
+                  ? "Copy failed"
+                  : "Copy diagnostics"}
+            </Button>
+            <Button
+              onClick={() => setDialogOpen(true)}
+              size="sm"
+              type="button"
+            >
+              View error details
+            </Button>
+          </>
+        ) : null}
+        <Button
+          onClick={openDiagnostics}
+          size="sm"
+          type="button"
+          variant="primary"
+        >
+          Open full diagnostics
         </Button>
-      ) : null}
-      <Button
-        onClick={() => openSimulationPreparationDiagnostics(kernel)}
-        size="sm"
-        type="button"
-        variant="primary"
-      >
-        Open full diagnostics
-      </Button>
-    </div>
+      </div>
+      <SimulationPreparationFailureDialog
+        copyState={copyState}
+        diagnosticReport={diagnosticReport}
+        onCopy={copyDiagnostics}
+        onOpenChange={setDialogOpen}
+        onOpenDiagnostics={openDiagnostics}
+        open={dialogOpen}
+        state={state}
+      />
+    </>
   );
 }
 
@@ -541,42 +652,60 @@ function preparationDuringRealtimeDisruption(
 export function WorkspaceStartupGateView({
   children,
   state,
+  preserveMountedWorkspace = false,
 }: {
   children: ReactNode;
   state: SimulationStartupOverlayState;
+  /** Keep the workspace mounted after its first successful preparation. */
+  preserveMountedWorkspace?: boolean;
 }) {
-  if (state.isVisible) {
-    return (
-      <>
-        <SimulationStartupOverlayView state={state} />
-        <SimulationStartupDiagnosticsDock />
-      </>
-    );
-  }
-
-  return (
-    <>
-      {children}
-      <SimulationStartupOverlayView state={state} />
-    </>
+  const [childrenMounted, setChildrenMounted] = useState(() => !state.isVisible);
+  const shouldMountChildren = shouldMountWorkspaceChildren(
+    state.isVisible,
+    preserveMountedWorkspace && childrenMounted,
   );
-}
-
-function SimulationStartupDiagnosticsDock() {
-  const isVisible = useLayoutSelector(
+  const diagnosticsRequested = useLayoutSelector(
     (layout) =>
       layout.panelVisible.bottom &&
       layout.focusedSlot === "panel-bottom" &&
       layout.activeBottomPanelTab === "diagnostics",
   );
 
+  useEffect(() => {
+    if (!preserveMountedWorkspace || !shouldMountChildren || childrenMounted) {
+      return;
+    }
+
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (!cancelled) setChildrenMounted(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [childrenMounted, preserveMountedWorkspace, shouldMountChildren]);
+
+  return (
+    <WorkspaceStartupInteractionContext.Provider
+      value={state.isVisible && shouldMountChildren}
+    >
+      {shouldMountChildren ? children : null}
+      {!shouldMountChildren && diagnosticsRequested ? (
+        <SimulationStartupDiagnosticsDock />
+      ) : null}
+      <SimulationStartupOverlayView state={state} />
+    </WorkspaceStartupInteractionContext.Provider>
+  );
+}
+
+function SimulationStartupDiagnosticsDock() {
   return (
     <aside
-      aria-hidden={!isVisible}
-      className="fm-simulation-startup__diagnostics-dock"
-      hidden={!isVisible}
+      aria-label="Simulation diagnostics"
+      className="fm-workspace-bottom-panel"
+      data-startup-diagnostics="visible"
     >
-      {isVisible ? <SlotHost slotId="panel-bottom" /> : null}
+      <SlotHost slotId="panel-bottom" />
     </aside>
   );
 }

@@ -14,6 +14,7 @@ import {
   resolveViewport3DTargetFieldInput,
   viewport3DTargetFieldBufferCanServeSurface,
   viewport3DTargetFieldBufferCanServeVectors,
+  viewport3DTargetFieldBufferMatchesQuantity,
 } from "./viewport3DTargetFieldBuffer";
 import { resolveTrustedViewport3DResponseDomainGenerationId } from "./viewport3DFieldDomainCompatibility";
 
@@ -31,7 +32,7 @@ function buildViewport3DTargetFieldBuffer(
     sessionIdentity:
       "sessionIdentity" in options
         ? options.sessionIdentity
-        : { sessionEpoch: "test-session@1000", sessionId: "test-session" },
+        : { sessionEpoch: "test-session@1000", sessionId: "test-session", requestScopeEpoch: "test-api:1" },
     resourceKey:
       options.resourceKey ??
       serializeCanonicalFieldVectorResourceKey(
@@ -858,6 +859,56 @@ describe("viewport3DTargetFieldBuffer", () => {
     expect(viewport3DTargetFieldBufferCanServeVectors(buffer)).toBe(false);
   });
 
+  it.each(["fdm", "fem"] as const)(
+    "adopts a topology-aware %s Frozen Spins scalar carrier for 3D surfaces",
+    (discretization) => {
+      const buffer = buildViewport3DTargetFieldBuffer({
+        domain: {
+          discretization,
+          domainGenerationId: `${discretization}-generation-7`,
+          meshTopologyHash: `${discretization}-topology-hash`,
+          meshTopologyRevision: "11",
+          pointCount: 4,
+        },
+        fieldVector: vectorFixture({
+          domainGenerationId: `${discretization}-generation-7`,
+          formatVersion: 3,
+          indexing: "explicit_node_indices",
+          meshTopologyHash: `${discretization}-topology-hash`,
+          meshTopologyRevision: "11",
+          nComp: 1,
+          nodeIndices: new Uint32Array([0, 1, 2, 3]),
+          pointCount: 4,
+          quantityId: "frozen_spins",
+          scopeId: "film",
+          scopeKind: "object",
+          valueCount: 4,
+          values: new Float64Array([1, 0, 0, 1]),
+        }),
+        query: {
+          component: "full",
+          scope_id: "film",
+          scope_kind: "object",
+        },
+        targetIds: ["part:film"],
+        topologyRevision: "11",
+      });
+
+      expect(buffer.capability).toBe("scalar-complete");
+      expect(buffer.component).toBe("magnitude");
+      expect(buffer.domainCompatibility.status).toBe("compatible");
+      expect(buffer.quantityId).toBe("frozen_spins");
+      expect(
+        viewport3DTargetFieldBufferCanServeSurface(
+          buffer,
+          "magnitude",
+          "frozen_spins",
+        ),
+      ).toBe(true);
+      expect(viewport3DTargetFieldBufferCanServeVectors(buffer)).toBe(false);
+    },
+  );
+
   it("rejects otherwise compatible buffers from another requested quantity", () => {
     const scalarBuffer = buildViewport3DTargetFieldBuffer({
       fieldVector: vectorFixture({
@@ -969,15 +1020,31 @@ describe("viewport3DTargetFieldBuffer", () => {
     };
     const first = buildViewport3DTargetFieldBuffer({
       ...options,
-      sessionIdentity: { sessionEpoch: "epoch-1", sessionId: "session-1" },
+      sessionIdentity: { sessionEpoch: "epoch-1", sessionId: "session-1", requestScopeEpoch: "test-api:1" },
     });
     const second = buildViewport3DTargetFieldBuffer({
       ...options,
-      sessionIdentity: { sessionEpoch: "epoch-2", sessionId: "session-1" },
+      sessionIdentity: { sessionEpoch: "epoch-2", sessionId: "session-1", requestScopeEpoch: "test-api:2" },
     });
 
     expect(first.bufferId).not.toBe(second.bufferId);
     expect(first.sessionEpoch).toBe("epoch-1");
     expect(second.sessionEpoch).toBe("epoch-2");
+  });
+  it("matches an analysis mode buffer to the renderable magnetization target", () => {
+    const buffer = buildViewport3DTargetFieldBuffer({
+      fieldVector: vectorFixture({
+        quantityId: "analysis:eigen:sample-0000:mode-0000",
+      }),
+      query: { component: "full", scope_kind: "full" },
+      targetIds: ["part:film"],
+    });
+
+    expect(
+      viewport3DTargetFieldBufferMatchesQuantity(buffer, "m"),
+    ).toBe(true);
+    expect(viewport3DTargetFieldBufferMatchesQuantity(buffer, "H_eff")).toBe(
+      false,
+    );
   });
 });

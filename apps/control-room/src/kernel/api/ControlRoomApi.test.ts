@@ -4,6 +4,7 @@ import {
   collectFieldVectorIdentityIssues,
   ControlRoomApi,
   ControlRoomApiError,
+  MAX_ANTENNA_INSPECTION_BYTES,
   MAX_TOPOLOGY_BYTES,
   parseFieldVectorResponseMetadata,
   transformFieldMetaForDisplay,
@@ -19,9 +20,30 @@ import type {
   FdmScopedFieldVectorQuery,
   FieldVectorResponseMetadata,
   LiveStatusResource,
+  LivePreparationMaterializationRequest,
+  LivePreparationMaterializationResource,
   SimulationPreparationResource,
+  AnalysisResultPageQuery,
+  OutputStorageSettings,
+  ProjectBatchCasesQuery,
+  ProjectBatchCasesResource,
+  ProjectBatchListQuery,
+  ProjectBatchListResource,
+  ProjectBatchSubmitRequest,
+  ProjectBatchSubmitResource,
 } from "./apiTypes";
-import { SIMULATION_PREPARATION_PATH } from "./apiPaths";
+import {
+  ANALYSIS_RESULT_BRANCH_POINTS_PATH,
+  ANALYSIS_RESULT_ITEMS_PATH,
+  DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH,
+  DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH,
+  DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH,
+  DATA_ANTENNA_SOURCE_SPECTRUM_PAYLOAD_PATH,
+  DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH,
+  SESSIONS_PATH,
+  SIMULATION_PREPARATION_MATERIALIZATION_PATH,
+  SIMULATION_PREPARATION_PATH,
+} from "./apiPaths";
 import type { DecodedFieldVector } from "./codecs";
 import { RequestDiagnosticsController } from "./RequestDiagnosticsController";
 import { activeLaneCapabilityFixture } from "../resources/activeLaneCapabilityFixture.testSupport";
@@ -82,6 +104,170 @@ describe("derived B_drive display quantity", () => {
   });
 });
 
+describe("antenna source-spectrum binary payloads", () => {
+  it("loads a port-scoped field basis through the typed binary facade", async () => {
+    let observedUrl = "";
+    let observedHeaders = new Headers();
+    const payload = new Float64Array([1, 2, 3]);
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        observedUrl = String(url);
+        observedHeaders = new Headers(init?.headers);
+        return binaryResponse(payload.buffer, { headers: { etag: '"field-basis"' } });
+      },
+    });
+
+    const result = await api.data.antenna.fieldSolutionPayload(
+      "solution-1",
+      "magnetic_field_per_ampere",
+      "port-1",
+      { etag: '"previous"', range: "bytes=0-23" },
+    );
+
+    expect(result.status).toBe("ready");
+    expect(observedUrl).toBe(
+      "http://127.0.0.1:8765/v2/sessions/current/data/antenna/field-solutions/solution-1/payloads/magnetic_field_per_ampere?port_mode_id=port-1",
+    );
+    expect(observedHeaders.get("if-none-match")).toBe('"previous"');
+    expect(observedHeaders.get("range")).toBe("bytes=0-23");
+    expect(DATA_ANTENNA_FIELD_SOLUTION_PAYLOAD_PATH).toContain("/payloads/{payload_kind}");
+    if (result.status === "ready") {
+      expect(Array.from(new Float64Array(result.data))).toEqual([1, 2, 3]);
+    }
+  });
+
+  it("loads a stage output catalog through the typed JSON facade", async () => {
+    let observedUrl = "";
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url) => {
+        observedUrl = String(url);
+        return jsonResponse({
+          content_digest: "sha256:catalog",
+          outputs: [],
+          port_mode_id: "port-a",
+          resource_id: "antenna/stage-output-catalog/solve-1",
+          schema_version: "stage_output_catalog.v1",
+          session_epoch: "epoch-1",
+          request_scope_epoch: "instance-1:7",
+          session_id: "session-1",
+          stage_id: "solve-1",
+          stage_kind: "antenna_field_solve",
+          stage_revision: 4,
+          status: "cancelled",
+        });
+      },
+    });
+
+    await api.data.antenna.stageOutputCatalog("solve-1");
+
+    expect(observedUrl).toBe(
+      "http://127.0.0.1:8765/v2/sessions/current/data/antenna/stages/solve-1/output-catalog",
+    );
+    expect(DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH).toContain(
+      "/stages/{stage_id}/output-catalog",
+    );
+  });
+
+  it("loads a payload through the typed v2 binary facade", async () => {
+    let observedUrl = "";
+    let observedHeaders = new Headers();
+    const payload = new Float64Array([1, 0, 2, -1]);
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        observedUrl = String(url);
+        observedHeaders = new Headers(init?.headers);
+        return binaryResponse(payload.buffer, {
+          headers: { etag: '"spectrum-v2-amplitudes"' },
+        });
+      },
+    });
+
+    const result = await api.data.antenna.sourceSpectrumPayload(
+      "spectrum-output",
+      "amplitudes_re_im",
+      { etag: '"previous"', range: "bytes=0-15" },
+    );
+
+    expect(result.status).toBe("ready");
+    if (result.status !== "ready") {
+      throw new Error(`Expected ready spectrum payload, received ${result.status}`);
+    }
+    expect(observedUrl).toBe(
+      "http://127.0.0.1:8765/v2/sessions/current/data/antenna/source-spectra/spectrum-output/payloads/amplitudes_re_im",
+    );
+    expect(observedHeaders.get("if-none-match")).toBe('"previous"');
+    expect(observedHeaders.get("range")).toBe("bytes=0-15");
+    expect(result.etag).toBe('"spectrum-v2-amplitudes"');
+    expect(Array.from(new Float64Array(result.data))).toEqual([1, 0, 2, -1]);
+    expect(DATA_ANTENNA_SOURCE_SPECTRUM_PAYLOAD_PATH).toContain(
+      "/payloads/{payload_kind}",
+    );
+  });
+});
+
+describe("antenna external-lead inspection facade", () => {
+  const sessionScopeKey = "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7";
+
+  it("reads a cancelled inspection without inventing a field solution", async () => {
+    let observedUrl = "";
+    let observedHeaders = new Headers();
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        observedUrl = String(url);
+        observedHeaders = new Headers(init?.headers);
+        return jsonResponse({ status: "cancelled", qualification: "NOT VERIFIED", outputs: [], manifest: null });
+      },
+    });
+    const result = await api.data.antenna.externalLeadInspection("stage/1", { sessionScopeKey });
+    expect(observedUrl).toBe("http://127.0.0.1:8765/v2/sessions/current/data/antenna/stages/stage%2F1/external-lead-inspection");
+    expect(observedHeaders.get("x-fullmag-session-scope")).toBe(sessionScopeKey);
+    expect(result).toMatchObject({ status: "cancelled", outputs: [], manifest: null });
+    expect(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH).toContain("{stage_id}");
+  });
+
+  it("pins raw SI bytes to the selected inspection digest and request scope", async () => {
+    let observedUrl = "";
+    let observedHeaders = new Headers();
+    const payload = new Float64Array([1, -2, 3]);
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        observedUrl = String(url);
+        observedHeaders = new Headers(init?.headers);
+        return binaryResponse(payload.buffer, { status: 206, headers: { etag: '"inspection"' } });
+      },
+    });
+    const result = await api.data.antenna.externalLeadInspectionPayload(
+      "stage-1", "magnetic_field", "sha256:selected",
+      { sessionScopeKey, etag: '"old"', range: "bytes=0-23" },
+    );
+    expect(observedUrl).toBe("http://127.0.0.1:8765/v2/sessions/current/data/antenna/stages/stage-1/external-lead-inspection/payloads/magnetic_field?content_digest=sha256%3Aselected");
+    expect(observedHeaders.get("x-fullmag-session-scope")).toBe(sessionScopeKey);
+    expect(observedHeaders.get("if-none-match")).toBe('"old"');
+    expect(observedHeaders.get("range")).toBe("bytes=0-23");
+    expect(DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH).toContain("{payload_kind}");
+    expect(result.status).toBe("ready");
+    if (result.status === "ready") expect(Array.from(new Float64Array(result.data))).toEqual([1, -2, 3]);
+  });
+
+  it("rejects an oversized inspection before reading the body even with a larger caller budget", async () => {
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async () => binaryResponse(new ArrayBuffer(8), {
+        headers: { "content-length": String(MAX_ANTENNA_INSPECTION_BYTES + 1) },
+      }),
+    });
+    await expect(api.data.antenna.externalLeadInspectionPayload(
+      "stage-1", "bundle", "sha256:selected",
+      { sessionScopeKey, maxResponseBytes: 2 * MAX_ANTENNA_INSPECTION_BYTES },
+    )).rejects.toThrow(/byte budget/);
+  });
+});
+
 describe("field vector response metadata", () => {
   it("requires response metadata for ready typed field-vector results", () => {
     type Ready = Extract<
@@ -111,6 +297,7 @@ describe("field vector response metadata", () => {
   it("parses every documented response header and reports invalid numbers", () => {
     const headers = new Headers({
       "x-fullmag-component": "full",
+      "x-fullmag-artifact-generation-id": "artifact-generation-8",
       "x-fullmag-domain-generation-id": "12",
       "x-fullmag-encoding": "FMVP;version=3",
       "x-fullmag-field-indexing": "explicit_node_indices",
@@ -127,6 +314,7 @@ describe("field vector response metadata", () => {
     });
     expect(parseFieldVectorResponseMetadata(headers)).toMatchObject({
       component: "full",
+      artifactGenerationId: "artifact-generation-8",
       domainGenerationId: "12",
       encoding: "FMVP;version=3",
       fieldIndexing: "explicit_node_indices",
@@ -142,6 +330,7 @@ describe("field vector response metadata", () => {
       valueCount: null,
     });
     expect(parseFieldVectorResponseMetadata(new Headers())).toMatchObject({
+      artifactGenerationId: null,
       pointCount: null,
       quantityId: null,
     });
@@ -150,6 +339,7 @@ describe("field vector response metadata", () => {
   it("returns null independently for every absent response header", () => {
     const mappings = [
       ["x-fullmag-component", "component"],
+      ["x-fullmag-artifact-generation-id", "artifactGenerationId"],
       ["x-fullmag-domain-generation-id", "domainGenerationId"],
       ["x-fullmag-encoding", "encoding"],
       ["x-fullmag-field-indexing", "fieldIndexing"],
@@ -321,6 +511,7 @@ const resourceRevisions: LiveStatusResource["resources"] = {
   fields_revision: 0,
   mesh_build_revision: 0,
   mesh_revision: 0,
+  mode_composition_revision: 0,
   region_coefficients_revision: 0,
   region_initial_state_revision: 0,
   region_membership_revision: 0,
@@ -398,6 +589,7 @@ function liveStatusFixture(
       created_at: "0",
       name: "test",
       session_epoch: "session-1@0",
+      request_scope_epoch: "test-api:0",
       session_id: "session-1",
       workspace_root: "/tmp/fullmag",
     },
@@ -791,6 +983,75 @@ function parseRequestBody(body: BodyInit | null | undefined): unknown {
 }
 
 describe("ControlRoomApi", () => {
+  it("preserves the session scope in JSON and binary headers without changing URLs", async () => {
+    const scope = "session=project-a&epoch=project-a%40123";
+    const requests: Array<{ url: string; scope: string | null }> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        requests.push({
+          url: String(url),
+          scope: new Headers(init?.headers).get("x-fullmag-session-scope"),
+        });
+        return String(url).includes("fdm-region-membership/")
+          ? binaryResponse(new ArrayBuffer(8))
+          : jsonResponse({});
+      },
+    });
+    await api.model.scene({ sessionScopeKey: scope });
+    await api.model.commitTransaction({
+      kind: "create_object",
+      base_revision: 1,
+      object_id: "body",
+      name: "Body",
+      geometry: { kind: "box", size: [1, 1, 1] },
+      transform: { rotation: [0, 0, 0], translation: [0, 0, 0] },
+    }, { sessionScopeKey: scope });
+    await api.data.fdmRegionMembershipRegionBytes("body", "core", {
+      sessionScopeKey: scope,
+    });
+    await api.sessions.current.status();
+    expect(requests.map((request) => request.scope)).toEqual([scope, scope, scope, null]);
+    expect(requests.every((request) => !request.url.includes("epoch="))).toBe(true);
+    expect(requests.every((request) => !request.url.includes("session="))).toBe(true);
+  });
+
+  it("routes full visualization replacements through scoped typed PUT requests", async () => {
+    const scope = "session=project-a&epoch=project-a%40123";
+    const requests: Array<{ method: string | undefined; scope: string | null; url: string }> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        requests.push({
+          method: init?.method,
+          scope: new Headers(init?.headers).get("x-fullmag-session-scope"),
+          url: String(url),
+        });
+        return jsonResponse({});
+      },
+    });
+
+    await api.visualization.replaceDisplay({ revision: 1 } as never, {
+      sessionScopeKey: scope,
+    });
+    await api.visualization.replaceState({ revision: 1 } as never, {
+      sessionScopeKey: scope,
+    });
+
+    expect(requests).toEqual([
+      {
+        method: "PUT",
+        scope,
+        url: "http://127.0.0.1:8765/v2/sessions/current/visualization/display",
+      },
+      {
+        method: "PUT",
+        scope,
+        url: "http://127.0.0.1:8765/v2/sessions/current/visualization/state",
+      },
+    ]);
+  });
+
   it("loads preparation through the simulation facade", async () => {
     let observedInit: RequestInit | undefined;
     let observedUrl = "";
@@ -837,6 +1098,45 @@ describe("ControlRoomApi", () => {
     expect(observedInit?.signal?.aborted).toBe(false);
     controller.abort();
     expect(observedInit?.signal?.aborted).toBe(true);
+  });
+
+  it("materializes Live preparation through the typed session-scoped facade", async () => {
+    const scope = "session=project-a&epoch=project-a%40123";
+    const request = {
+      preparation_id: "prep-1",
+      scene_revision: 17,
+    } satisfies LivePreparationMaterializationRequest;
+    const response = {
+      disposition: "accepted",
+      preparation_id: "prep-1",
+      scene_revision: 17,
+      run_id: "run-1",
+      plan_fingerprint: `sha256:${"a".repeat(64)}`,
+      receipt_sha256: "b".repeat(64),
+    } satisfies LivePreparationMaterializationResource;
+    let observedUrl = "";
+    let observedInit: RequestInit | undefined;
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        observedUrl = String(url);
+        observedInit = init;
+        return jsonResponse(response);
+      },
+    });
+
+    await expect(
+      api.simulation.materializePreparation(request, { sessionScopeKey: scope }),
+    ).resolves.toEqual(response);
+
+    expect(observedUrl).toBe(
+      `http://127.0.0.1:8765${SIMULATION_PREPARATION_MATERIALIZATION_PATH}`,
+    );
+    expect(observedInit?.method).toBe("POST");
+    expect(parseRequestBody(observedInit?.body)).toEqual(request);
+    expect(new Headers(observedInit?.headers).get("x-fullmag-session-scope")).toBe(
+      scope,
+    );
   });
 
   it("sends a request when the browser exposes crypto without randomUUID", async () => {
@@ -891,6 +1191,182 @@ describe("ControlRoomApi", () => {
     expect(observedInit?.method).toBe("GET");
     expect(headers.get("x-request-id")).toBe("req-1");
     expect(headers.get("x-fullmag-contract-version")).toBeNull();
+  });
+
+  it("keeps result dataset requests on the typed resource facade", async () => {
+    const fetchImpl = vi.fn(async (_url: RequestInfo | URL) => jsonResponse({}));
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl,
+      requestIdFactory: () => "req-results",
+    });
+    const query = {
+      has_field: true,
+      limit: 25,
+      sample_id: "sample/1",
+    } as AnalysisResultPageQuery;
+
+    await api.analysis.results.items("run/1", "dataset/1", query);
+
+    const observedUrl = new URL(String(fetchImpl.mock.calls[0]?.[0]));
+    expect(observedUrl.pathname).toBe(
+      ANALYSIS_RESULT_ITEMS_PATH.replace("{run_id}", "run%2F1")
+        .replace("{dataset_id}", "dataset%2F1"),
+    );
+    expect(Object.fromEntries(observedUrl.searchParams)).toMatchObject({
+      has_field: "true",
+      limit: "25",
+      sample_id: "sample/1",
+    });
+  });
+
+  it("encodes branch path segments through the typed result facade", async () => {
+    const fetchImpl = vi.fn(async (_url: RequestInfo | URL) => jsonResponse({}));
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl,
+      requestIdFactory: () => "req-branch",
+    });
+
+    await api.analysis.results.branchPoints(
+      "run/1",
+      "dataset/1",
+      "branch/7",
+      { limit: 10 },
+    );
+
+    const observedUrl = new URL(String(fetchImpl.mock.calls[0]?.[0]));
+    expect(observedUrl.pathname).toBe(
+      ANALYSIS_RESULT_BRANCH_POINTS_PATH.replace("{run_id}", "run%2F1")
+        .replace("{dataset_id}", "dataset%2F1")
+        .replace("{branch_id}", "branch%2F7"),
+    );
+    expect(observedUrl.searchParams.get("limit")).toBe("10");
+  });
+
+  it("creates a scratch session through the typed sessions facade", async () => {
+    let observedInit: RequestInit | undefined;
+    let observedUrl = "";
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        observedUrl = String(url);
+        observedInit = init;
+        return jsonResponse(
+          {
+            session_id: "session-scratch",
+            status: {
+              requested_execution: {
+                backend: "fem",
+                device: "cpu",
+                precision: "double",
+              },
+              effective_execution: {
+                backend: "fem",
+                device: "cpu",
+                precision: "double",
+              },
+              fallback: null,
+            },
+            scene_document: {
+              schema_version: "0.3",
+              version: "scene.v2",
+              revision: 0,
+              scene: null,
+              objects: [],
+            },
+            revisions: { scene_revision: 0, state_version: 1 },
+          },
+          { status: 201 },
+        );
+      },
+    });
+
+    const created = await api.sessions.create({
+      name: "Scratch FEM",
+      backend: "fem",
+      device: "cpu",
+      precision: "double",
+    });
+
+    type CreateScratchSessionInput = Parameters<typeof api.sessions.create>[0];
+    expectTypeOf<CreateScratchSessionInput>().toEqualTypeOf<{
+      backend: "fdm" | "fem";
+      device: "cpu";
+      name: string;
+      output_storage?: OutputStorageSettings | null;
+      precision: "double";
+      replace_current?: boolean;
+    }>();
+    expectTypeOf<typeof created.scene_document.schema_version>().toEqualTypeOf<"0.3">();
+    expectTypeOf<typeof created.status.fallback>().toEqualTypeOf<string | null>();
+
+    // @ts-expect-error The typed facade rejects unsupported execution requests before transport.
+    void ({ backend: "gpu", device: "cpu", name: "Invalid", precision: "double" } satisfies CreateScratchSessionInput);
+
+    expect(created.session_id).toBe("session-scratch");
+    expect(created.status.fallback).toBeNull();
+    expect(created.scene_document.schema_version).toBe("0.3");
+    expect(observedUrl).toBe(`http://127.0.0.1:8765${SESSIONS_PATH}`);
+    expect(observedInit?.method).toBe("POST");
+    expect(parseRequestJsonBody(observedInit?.body)).toMatchObject({
+      backend: "fem",
+      device: "cpu",
+      name: "Scratch FEM",
+      precision: "double",
+    });
+  });
+
+  it("activates a one-time Frozen Spins preview candidate through the typed model facade", async () => {
+    let observedInit: RequestInit | undefined;
+    let observedUrl = "";
+    const definition = {
+      enabled: true,
+      id: "pin-edge",
+      name: "Pinned edge",
+      reference: { kind: "capture_current_at_activation" as const },
+      schema_version: "fullmag.frozen-spins.v1",
+      selector: { kind: "in_object" as const, object_id: "film" },
+    };
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        observedUrl = String(url);
+        observedInit = init;
+        return jsonResponse({
+          activation_candidate_token_consumed: true,
+          definition,
+          mask_resource: "/v2/sessions/current/data/frozen-spins/resolved-masks/mask-1",
+          mask_sha256: "sha256:mask",
+          preview_id: "preview-1",
+          revision: 8,
+          schema_version: "frozen_spins_activation.v1",
+          source_state_revision: 41,
+          topology_fingerprint: "sha256:topology",
+        });
+      },
+      requestIdFactory: () => "req-frozen-spins-activate",
+    });
+
+    await expect(api.model.frozenSpins.activatePreview("preview-1", {
+      activation_candidate_token: "fsact-candidate-1",
+      definition,
+      expected_revision: 7,
+    })).resolves.toMatchObject({
+      activation_candidate_token_consumed: true,
+      preview_id: "preview-1",
+      revision: 8,
+    });
+
+    expect(observedUrl).toBe(
+      "http://127.0.0.1:8765/v2/sessions/current/model/frozen-spins/previews/preview-1/activate",
+    );
+    expect(observedInit?.method).toBe("POST");
+    expect(parseRequestJsonBody(observedInit?.body)).toEqual({
+      activation_candidate_token: "fsact-candidate-1",
+      definition,
+      expected_revision: 7,
+    });
   });
 
   it("loads magnetic response sweep artifacts through the analysis facade", async () => {
@@ -1283,7 +1759,7 @@ describe("ControlRoomApi", () => {
     ]);
   });
 
-  it("loads modal eigen artifacts through both eigen and family namespaces", async () => {
+  it("loads modal eigen artifacts through the canonical frequency-domain family", async () => {
     const observedUrls: string[] = [];
     const fetchImpl = vi.fn(async (url: RequestInfo | URL) => {
       const target = String(url);
@@ -1331,14 +1807,21 @@ describe("ControlRoomApi", () => {
           value_kind: "complex_spatial_vector",
         });
       }
-      if (target.endsWith("/analysis/eigen/modes/1/2")) {
+      if (target.endsWith("/analysis/frequency-domain/eigen/modes/1/2")) {
         return jsonResponse({
-          branch_id: "branch-0",
-          field_id: "analysis:eigen:sample-0001:mode-0002",
-          frequency_hz: 3.2e9,
-          raw_mode_index: 2,
-          sample_index: 1,
-          schema_version: "eigen_mode.v2",
+          artifact_path: "eigen/modes/sample_0001/mode_0002.json",
+          payload: {
+            branch_id: "branch-0",
+            field_id: "analysis:eigen:sample-0001:mode-0002",
+            frequency_hz: 3.2e9,
+            raw_mode_index: 2,
+            sample_index: 1,
+            schema_version: "eigen_mode.v2",
+          },
+          resource_key:
+            "/v2/sessions/current/analysis/frequency-domain/eigen/modes/1/2",
+          schema_version: "frequency_domain_eigen_artifact.v1",
+          status: "ready",
         });
       }
       return jsonResponse({
@@ -1362,11 +1845,11 @@ describe("ControlRoomApi", () => {
     await api.analysis.eigen.eigenBranchesV2();
     await api.analysis.eigen.eigenDiagnosticsV2();
     await api.analysis.eigen.eigenDispersion();
-    const mode = await api.analysis.eigen.modeV2(1, 2);
+    const mode = await api.analysis.frequencyDomain.eigenMode(1, 2);
     const modeMeta = await api.analysis.eigen.eigenModeFieldMeta(1, 2);
     await api.analysis.frequencyDomain.eigenSpectrumV2();
 
-    expect(mode).toMatchObject({
+    expect(mode.payload).toMatchObject({
       field_id: "analysis:eigen:sample-0001:mode-0002",
       schema_version: "eigen_mode.v2",
     });
@@ -1384,7 +1867,7 @@ describe("ControlRoomApi", () => {
       "http://127.0.0.1:8765/v2/sessions/current/analysis/frequency-domain/eigen/branches.v2",
       "http://127.0.0.1:8765/v2/sessions/current/analysis/frequency-domain/eigen/diagnostics.v2",
       "http://127.0.0.1:8765/v2/sessions/current/analysis/frequency-domain/eigen/dispersion",
-      "http://127.0.0.1:8765/v2/sessions/current/analysis/eigen/modes/1/2",
+      "http://127.0.0.1:8765/v2/sessions/current/analysis/frequency-domain/eigen/modes/1/2",
       "http://127.0.0.1:8765/v2/sessions/current/analysis/frequency-domain/eigen/mode-field/1/2/meta",
       "http://127.0.0.1:8765/v2/sessions/current/analysis/frequency-domain/eigen/spectrum.v2",
     ]);
@@ -1843,6 +2326,14 @@ describe("ControlRoomApi", () => {
           url: String(url),
         });
         const requestUrl = String(url);
+        if (requestUrl.endsWith("/v2/sessions/current/model/geometry/validation")) {
+          return jsonResponse({ dirty: false, scene_revision: 1 });
+        }
+        if (requestUrl.endsWith("/v2/sessions/current/status")) {
+          return jsonResponse({
+            resources: { mesh_revision: 1, mesh_build_revision: 1 },
+          });
+        }
         if (requestUrl.endsWith("/v2/sessions/current/simulation/commands")) {
           return jsonResponse({
             accepted: true,
@@ -1891,6 +2382,97 @@ describe("ControlRoomApi", () => {
       reason: "field_on_demand",
       target: { kind: "study" },
     });
+  });
+
+  it("coalesces field materialization per session scope without changing resource URLs", async () => {
+    let commandRequests = 0;
+    let twoCommandsStartedResolve: (() => void) | null = null;
+    const twoCommandsStarted = new Promise<void>((resolve) => {
+      twoCommandsStartedResolve = resolve;
+    });
+    let releaseCommands!: () => void;
+    let commandsReleased = false;
+    const commandGate = new Promise<void>((resolve) => {
+      releaseCommands = () => {
+        commandsReleased = true;
+        resolve();
+      };
+    });
+    const observedUrls: string[] = [];
+    const freshnessScopes: Array<string | null> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        const requestUrl = String(url);
+        observedUrls.push(requestUrl);
+        if (requestUrl.endsWith("/v2/sessions/current/model/geometry/validation")) {
+          freshnessScopes.push(new Headers(init?.headers).get("x-fullmag-session-scope"));
+          return jsonResponse({ dirty: false, scene_revision: 1 });
+        }
+        if (requestUrl.endsWith("/v2/sessions/current/simulation/commands")) {
+          commandRequests += 1;
+          if (commandRequests >= 2) twoCommandsStartedResolve?.();
+          await commandGate;
+          return jsonResponse({
+            accepted: true,
+            command_id: `cmd-fields-${commandRequests}`,
+            error: null,
+          });
+        }
+        if (
+          requestUrl.includes("/v2/sessions/current/data/fields/") &&
+          /\/meta(?:\?|$)/.test(requestUrl)
+        ) {
+          if (!commandsReleased) {
+            return jsonResponse(
+              { message: "field not available in memory" },
+              { status: 404 },
+            );
+          }
+          const quantityId = requestUrl.includes("/fields/m/") ? "m" : "H_demag";
+          return jsonResponse({
+            components: 3,
+            domain_generation_id: 4,
+            field_revision: 12,
+            kind: "vector",
+            label: quantityId,
+            location: "cells",
+            quantity_id: quantityId,
+            stats: { max: 0.2, mean: 0.01, min: -0.3 },
+            unit: "A/m",
+          });
+        }
+        throw new Error(`Unexpected request ${requestUrl}`);
+      },
+    });
+
+    const sharedScope = "session=alpha&epoch=one";
+    const first = api.data.fields.meta(
+      "H_demag",
+      { component: "full" },
+      { sessionScopeKey: sharedScope },
+    );
+    const second = api.data.fields.meta(
+      "m",
+      { component: "full" },
+      { sessionScopeKey: sharedScope },
+    );
+    const otherSession = api.data.fields.meta(
+      "H_demag",
+      { component: "full" },
+      { sessionScopeKey: "session=beta&epoch=two" },
+    );
+
+    await Promise.race([
+      twoCommandsStarted,
+      new Promise<void>((resolve) => setTimeout(resolve, 1000)),
+    ]);
+    expect(commandRequests).toBe(2);
+    expect(observedUrls.every((url) => !url.includes("sessionScopeKey"))).toBe(true);
+    expect(new Set(freshnessScopes)).toEqual(new Set([sharedScope, "session=beta&epoch=two"]));
+    releaseCommands();
+    await Promise.all([first, second, otherSession]);
+    expect(commandRequests).toBe(2);
   });
 
   it("normalizes object-prefixed field metadata scope ids for object scopes", async () => {
@@ -1943,6 +2525,51 @@ describe("ControlRoomApi", () => {
     expect(observedUrl).toBe(
       "http://127.0.0.1:8765/v2/sessions/current/data/fields/m/samples/vector?component=full&scope_id=permalloy_layer&scope_kind=object",
     );
+  });
+
+  it("sends the artifact generation precondition and rejects missing or mismatched response headers", async () => {
+    let observedUrl = "";
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url) => {
+        observedUrl = String(url);
+        return binaryResponse(makeFieldVectorBuffer(), {
+          headers: {
+            ...contractHeaders,
+            "x-fullmag-artifact-generation-id": "publication-14",
+          },
+        });
+      },
+    });
+
+    const result = await api.data.fields.vector("m", {
+      expected_artifact_generation_id: "publication-14",
+    });
+    expect(observedUrl).toContain("expected_artifact_generation_id=publication-14");
+    expect(result).toMatchObject({
+      responseMetadata: { artifactGenerationId: "publication-14" },
+      status: "ready",
+    });
+
+    for (const responseGenerationId of [null, "publication-stale"]) {
+      const headers: Record<string, string> = { ...contractHeaders };
+      if (responseGenerationId !== null) {
+        headers["x-fullmag-artifact-generation-id"] = responseGenerationId;
+      }
+      const rejectingApi = new ControlRoomApi({
+        baseUrl: "http://127.0.0.1:8765",
+        fetchImpl: async () =>
+          binaryResponse(makeFieldVectorBuffer(), { headers }),
+      });
+      await expect(
+        rejectingApi.data.fields.vector("m", {
+          expected_artifact_generation_id: "publication-14",
+        }),
+      ).rejects.toMatchObject({
+        message: "Field vector artifact generation did not match the requested generation.",
+        status: 409,
+      });
+    }
   });
 
   it.each([
@@ -1999,6 +2626,14 @@ describe("ControlRoomApi", () => {
           url: String(url),
         });
         const requestUrl = String(url);
+        if (requestUrl.endsWith("/v2/sessions/current/model/geometry/validation")) {
+          return jsonResponse({ dirty: false, scene_revision: 1 });
+        }
+        if (requestUrl.endsWith("/v2/sessions/current/status")) {
+          return jsonResponse({
+            resources: { mesh_revision: 1, mesh_build_revision: 1 },
+          });
+        }
         if (requestUrl.endsWith("/v2/sessions/current/simulation/commands")) {
           return jsonResponse({
             accepted: true,
@@ -2052,6 +2687,95 @@ describe("ControlRoomApi", () => {
       reason: "field_on_demand",
       target: { kind: "study" },
     });
+  });
+
+  it("does not enqueue field materialization while the authored mesh is stale", async () => {
+    const calls: Array<{ method: string | undefined; url: string }> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        const requestUrl = String(url);
+        calls.push({ method: init?.method, url: requestUrl });
+        if (requestUrl.includes("/data/fields/H_demag/samples/vector")) {
+          return new Response(null, { headers: contractHeaders, status: 204 });
+        }
+        if (requestUrl.includes("/data/fields/H_demag/meta")) {
+          return jsonResponse(
+            { message: "field 'H_demag' not available in memory" },
+            { status: 404 },
+          );
+        }
+        if (requestUrl.endsWith("/v2/sessions/current/simulation/solver/status")) {
+          return jsonResponse({ is_busy: false, runtime_state: "waiting_for_compute" });
+        }
+        if (requestUrl.endsWith("/v2/sessions/current/model/geometry/validation")) {
+          return jsonResponse({ dirty: true });
+        }
+        if (requestUrl.endsWith("/v2/sessions/current/status")) {
+          return jsonResponse({
+            resources: { mesh_revision: 2, mesh_build_revision: 1 },
+          });
+        }
+        throw new Error(`Unexpected request ${requestUrl}`);
+      },
+    });
+
+    await expect(
+      api.data.fields.vector("H_demag", {
+        component: "full",
+        scope_id: "body",
+        scope_kind: "part",
+      }),
+    ).resolves.toMatchObject({ status: "not-applicable" });
+    expect(
+      calls.filter(
+        (call) =>
+          call.method === "POST" &&
+          call.url.endsWith("/v2/sessions/current/simulation/commands"),
+      ),
+    ).toHaveLength(0);
+  });
+
+  it("fails closed when mesh freshness validation is unavailable", async () => {
+    const calls: Array<{ method: string | undefined; url: string }> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        const requestUrl = String(url);
+        calls.push({ method: init?.method, url: requestUrl });
+        if (requestUrl.includes("/data/fields/H_demag/samples/vector")) {
+          return new Response(null, { headers: contractHeaders, status: 204 });
+        }
+        if (requestUrl.includes("/data/fields/H_demag/meta")) {
+          return jsonResponse(
+            { message: "field 'H_demag' not available in memory" },
+            { status: 404 },
+          );
+        }
+        if (requestUrl.endsWith("/v2/sessions/current/model/geometry/validation")) {
+          throw new Error("validation unavailable");
+        }
+        if (requestUrl.endsWith("/v2/sessions/current/simulation/solver/status")) {
+          return jsonResponse({ is_busy: false, runtime_state: "waiting_for_compute" });
+        }
+        throw new Error(`Unexpected request ${requestUrl}`);
+      },
+    });
+
+    await expect(
+      api.data.fields.vector("H_demag", {
+        component: "full",
+        scope_id: "body",
+        scope_kind: "part",
+      }),
+    ).resolves.toMatchObject({ status: "not-applicable" });
+    expect(
+      calls.filter(
+        (call) =>
+          call.method === "POST" &&
+          call.url.endsWith("/v2/sessions/current/simulation/commands"),
+      ),
+    ).toHaveLength(0);
   });
 
   it("retries a pending field vector without enqueueing a duplicate compute command", async () => {
@@ -2763,6 +3487,46 @@ describe("ControlRoomApi", () => {
       },
       {
         profile: "resume",
+      },
+    ]);
+  });
+
+  it("deletes a checkpoint with DELETE and surfaces a 409 refusal with its message", async () => {
+    const calls: Array<{ method: string | undefined; url: string }> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        calls.push({ method: init?.method, url: String(url) });
+        if (String(url).endsWith("/cp-busy")) {
+          return jsonResponse(
+            {
+              code: "conflict",
+              message: "checkpoint_delete_referenced: checkpoint cp-busy is the restore source",
+            },
+            { status: 409 },
+          );
+        }
+        return new Response(null, {
+          status: 204,
+          headers: { "x-api-contract-version": "1.0.0" },
+        });
+      },
+      retryDelayMs: 0,
+    });
+
+    await expect(api.persistence.checkpoints.delete("cp-000042")).resolves.toBeUndefined();
+    await expect(api.persistence.checkpoints.delete("cp-busy")).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining("checkpoint_delete_referenced"),
+    });
+    expect(calls).toEqual([
+      {
+        method: "DELETE",
+        url: "http://127.0.0.1:8765/v2/sessions/current/persistence/checkpoints/cp-000042",
+      },
+      {
+        method: "DELETE",
+        url: "http://127.0.0.1:8765/v2/sessions/current/persistence/checkpoints/cp-busy",
       },
     ]);
   });
@@ -4192,7 +4956,7 @@ describe("ControlRoomApi", () => {
     });
   });
 
-  it("exposes scene, universe, and shared-domain manifest through facade methods", async () => {
+  it("exposes scene readiness, universe, and shared-domain manifest through facade methods", async () => {
     const seenUrls: string[] = [];
     const api = new ControlRoomApi({
       baseUrl: "http://127.0.0.1:8765",
@@ -4203,12 +4967,14 @@ describe("ControlRoomApi", () => {
     });
 
     await api.model.scene();
+    await api.model.readiness();
     await api.model.physicsGraph();
     await api.model.universe();
     await api.meshing.sharedDomainManifest();
 
     expect(seenUrls).toEqual([
       "http://127.0.0.1:8765/v2/sessions/current/model/scene",
+      "http://127.0.0.1:8765/v2/sessions/current/model/readiness",
       "http://127.0.0.1:8765/v2/sessions/current/model/physics-graph",
       "http://127.0.0.1:8765/v2/sessions/current/model/universe",
       "http://127.0.0.1:8765/v2/sessions/current/meshing/meshes/shared-domain/manifest",
@@ -4420,7 +5186,7 @@ describe("ControlRoomApi", () => {
       {
         body: { fms_base64: "abc" },
         method: "POST",
-        url: "http://127.0.0.1:8765/v2/sessions/current/persistence/imports/inspections",
+        url: "http://127.0.0.1:8765/v2/persistence/imports/inspections",
       },
       {
         body: { fms_base64: "abc", restore_mode: "resume" },
@@ -4428,6 +5194,274 @@ describe("ControlRoomApi", () => {
         url: "http://127.0.0.1:8765/v2/sessions/current/persistence/imports",
       },
     ]);
+  });
+
+  it("materializes a pinned project run without a current-session target", async () => {
+    const requests: Array<{ body: unknown; method: string | undefined; url: string }> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        requests.push({
+          body: init?.body ? parseRequestBody(init.body) : null,
+          method: init?.method,
+          url: String(url),
+        });
+        return jsonResponse({
+          run_id: "run-1",
+          catalog_revision: 1,
+          task_ids: ["task-1"],
+          execution_state: "pending_preparation",
+        });
+      },
+    });
+
+    const result = await api.persistence.projects.materializeRun("project-1", "run-1");
+    expect(result.execution_state).toBe("pending_preparation");
+    expect(requests).toEqual([{
+      body: null,
+      method: "POST",
+      url: "http://127.0.0.1:8765/v2/persistence/projects/project-1/runs/run-1/materialization",
+    }]);
+  });
+
+  it("posts the script to the from-script resource with explicit consent and surfaces a typed 422", async () => {
+    const requests: Array<{ body: unknown; method: string | undefined; url: string }> = [];
+    let respondWithFailure = false;
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        requests.push({
+          body: init?.body ? parseRequestBody(init.body) : null,
+          method: init?.method,
+          url: String(url),
+        });
+        if (respondWithFailure) {
+          return jsonResponse(
+            { code: "script_export_failed", message: "script_export_failed: boom" },
+            { status: 422 },
+          );
+        }
+        return jsonResponse({ project_id: "project-1", name: "demo" });
+      },
+    });
+    const request = {
+      source: { name: "demo.py", text: "import fullmag as fm\n" },
+      project_name: "demo",
+      consent: { executed_by_user: true },
+    };
+
+    await api.persistence.projects.fromScript(request);
+    expect(requests).toEqual([{
+      body: request,
+      method: "POST",
+      url: "http://127.0.0.1:8765/v2/persistence/projects/from-script",
+    }]);
+
+    respondWithFailure = true;
+    await expect(api.persistence.projects.fromScript(request)).rejects.toMatchObject({
+      status: 422,
+      code: "script_export_failed",
+    });
+  });
+
+  it("requests durable cancellation for the exact project run task", async () => {
+    const requests: Array<{ body: unknown; method: string | undefined; url: string }> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        requests.push({
+          body: init?.body ? parseRequestBody(init.body) : null,
+          method: init?.method,
+          url: String(url),
+        });
+        return jsonResponse({
+          disposition: "accepted",
+          run_id: "run-1",
+          task_id: "task-1",
+          command_id: "command-1",
+          lifecycle: "stopping",
+          catalog_revision: 4,
+        });
+      },
+    });
+
+    const result = await api.persistence.projects.cancelRunTask(
+      "project-1",
+      "run-1",
+      "task-1",
+      { reason: "Cancelled by operator from Control Room" },
+    );
+
+    expect(result.catalog_revision).toBe(4);
+    expect(requests).toEqual([{
+      body: { reason: "Cancelled by operator from Control Room" },
+      method: "POST",
+      url: "http://127.0.0.1:8765/v2/persistence/projects/project-1/runs/run-1/tasks/task-1/cancellation",
+    }]);
+  });
+
+  it("reads a durable project run without a current-session target", async () => {
+    const requests: Array<{ method: string | undefined; url: string }> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        requests.push({ method: init?.method, url: String(url) });
+        return jsonResponse({
+          project_id: "project-1",
+          run_id: "run-1",
+          payload_fingerprint: "a".repeat(64),
+          requested_execution: { backend: "fdm", device: "cpu", precision: "double", mode: "strict" },
+          catalog_state: "materialized",
+          catalog_revision: 1,
+          tasks: [{ task_id: "task-1", lifecycle: "accepted", readiness: { state: "blocked", reason: "preparation" } }],
+        });
+      },
+    });
+
+    const result = await api.persistence.projects.getRun("project-1", "run-1");
+    expect(result.catalog_state).toBe("materialized");
+    expect(result.tasks[0]?.task_id).toBe("task-1");
+    expect(requests).toEqual([{
+      method: "GET",
+      url: "http://127.0.0.1:8765/v2/persistence/projects/project-1/runs/run-1",
+    }]);
+  });
+
+  it("reads a pinned historical scalar without using the current session", async () => {
+    const requests: Array<{ method: string | undefined; url: string }> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        requests.push({ method: init?.method, url: String(url) });
+        return jsonResponse({
+          project_id: "project-1",
+          run_id: "run-1",
+          solution_set_id: "set-1",
+          revision: "9007199254740993",
+          member_id: "member-1",
+          artifact_id: "artifact-1",
+          value_si: -1,
+          unit: "J",
+        });
+      },
+    });
+
+    const result = await api.persistence.projects.solutionScalar(
+      "project-1",
+      "run-1",
+      "set-1",
+      "9007199254740993",
+      "member-1",
+      "artifact-1",
+    );
+    expect(result.revision).toBe("9007199254740993");
+    expect(result.value_si).toBe(-1);
+    expect(requests).toEqual([{
+      method: "GET",
+      url: "http://127.0.0.1:8765/v2/persistence/projects/project-1/runs/run-1/solution-sets/set-1/revisions/9007199254740993/members/member-1/artifacts/artifact-1/scalar",
+    }]);
+  });
+
+  it("lists durable project runs with an explicit cursor", async () => {
+    const requests: Array<{ method: string | undefined; url: string }> = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url, init) => {
+        requests.push({ method: init?.method, url: String(url) });
+        return jsonResponse({ project_id: "project-1", runs: [], next_cursor: null });
+      },
+    });
+
+    const result = await api.persistence.projects.listRuns("project-1", {
+      limit: 10,
+      cursor: "run-prev",
+    });
+    expect(result.project_id).toBe("project-1");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.method).toBe("GET");
+    const url = new URL(requests[0]!.url);
+    expect(url.pathname).toBe("/v2/persistence/projects/project-1/runs");
+    expect(url.searchParams.get("limit")).toBe("10");
+    expect(url.searchParams.get("cursor")).toBe("run-prev");
+  });
+
+  it("submits and pages project batches through the typed persistence facade", async () => {
+    const requests: Array<{ body: unknown; method: string | undefined; url: string }> = [];
+    const batchRequest: ProjectBatchSubmitRequest = {
+      archive_base64: "Zg==",
+      idempotency_key: "submit-batch-1",
+      batch_request: { batch_id: "batch-1" },
+      study_plan: { schema_version: "study_plan.v2" },
+      study_problem_catalog: { schema_version: "study_problem_catalog.v3" },
+      asset_paths: {},
+    };
+    const accepted: ProjectBatchSubmitResource = {
+      disposition: "accepted",
+      batch_id: "batch-1",
+      manifest_sha256: "a".repeat(64),
+      case_count: 2,
+    };
+    const batchPage: ProjectBatchListResource = {
+      project_id: "project-1",
+      batches: [{
+        batch_id: "batch-1",
+        accepted_at: "2026-10-07T00:00:00Z",
+        manifest_sha256: accepted.manifest_sha256,
+        case_count: 2,
+        max_parallel_cases: 2,
+        failure_policy: "continue_independent",
+        published_case_count: 0,
+        expansion_state: "pending",
+      }],
+      next_cursor: null,
+    };
+    const casesPage: ProjectBatchCasesResource = {
+      batch_id: "batch-1",
+      axes: [{ name: "field_z", canonical_unit: "T" }],
+      cases: [{
+        case_id: "case-" + "b".repeat(64),
+        planned_run_id: "run-planned-1",
+        parameter_tuple: { field_z: -0.01 },
+        state: "pending_expansion",
+      }],
+      next_cursor: null,
+    };
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (input, init) => {
+        const url = String(input);
+        requests.push({
+          body: init?.body ? parseRequestBody(init.body) : null,
+          method: init?.method,
+          url,
+        });
+        if (init?.method === "POST") return jsonResponse(accepted, { status: 201 });
+        if (url.includes("/cases")) return jsonResponse(casesPage);
+        return jsonResponse(batchPage);
+      },
+    });
+
+    const submitted = await api.persistence.projects.submitBatch("project-1", batchRequest);
+    const batchQuery: ProjectBatchListQuery = { limit: 25, cursor: "batch-prev" };
+    const listed = await api.persistence.projects.listBatches("project-1", batchQuery);
+    const casesQuery: ProjectBatchCasesQuery = { limit: 10 };
+    const cases = await api.persistence.projects.listBatchCases(
+      "project-1", "batch-1", casesQuery,
+    );
+
+    expect(submitted).toEqual(accepted);
+    expect(listed).toEqual(batchPage);
+    expect(cases).toEqual(casesPage);
+    expect(requests.map(({ method, url }) => ({ method, url: new URL(url).pathname }))).toEqual([
+      { method: "POST", url: "/v2/persistence/projects/project-1/batches" },
+      { method: "GET", url: "/v2/persistence/projects/project-1/batches" },
+      { method: "GET", url: "/v2/persistence/projects/project-1/batches/batch-1/cases" },
+    ]);
+    expect(requests[0]?.body).toEqual(batchRequest);
+    const batchListUrl = new URL(requests[1]!.url);
+    expect(batchListUrl.searchParams.get("limit")).toBe("25");
+    expect(batchListUrl.searchParams.get("cursor")).toBe("batch-prev");
+    expect(new URL(requests[2]!.url).searchParams.get("limit")).toBe("10");
   });
 
   it("loads and patches object interaction resources through v2 model facade methods", async () => {
@@ -5592,5 +6626,95 @@ describe("ControlRoomApi", () => {
         url: "http://127.0.0.1:8765/v2/sessions/current/model/transport-validation",
       },
     ]);
+  });
+
+  it("loads dedicated frequency-domain field-sweep and FMR artifact resources", async () => {
+    const observedUrls: string[] = [];
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url) => {
+        observedUrls.push(String(url));
+        return jsonResponse({
+          artifact_path: "frequency-domain/artifact.json",
+          missing_reason: null,
+          payload: { schema_version: "frequency_domain_artifact.v1" },
+          resource_key: String(url).replace("http://127.0.0.1:8765", ""),
+          schema_version: "frequency_domain_json_artifact.v1",
+          status: "ready",
+        });
+      },
+    });
+
+    await api.analysis.frequencyDomain.eigenFieldSweep();
+    await api.analysis.frequencyDomain.fmrPeaks();
+    await api.analysis.frequencyDomain.fmrResonanceFits();
+    await api.analysis.frequencyDomain.fmrKittelFit();
+
+    expect(observedUrls).toEqual([
+      "http://127.0.0.1:8765/v2/sessions/current/analysis/frequency-domain/eigen/field-sweep",
+      "http://127.0.0.1:8765/v2/sessions/current/analysis/frequency-domain/fmr/peaks",
+      "http://127.0.0.1:8765/v2/sessions/current/analysis/frequency-domain/fmr/resonance-fits",
+      "http://127.0.0.1:8765/v2/sessions/current/analysis/frequency-domain/fmr/kittel-fit",
+    ]);
+  });
+});
+
+
+describe("API instance fence", () => {
+  it("discards binary output when replacement is observed during decoding", async () => {
+    const pin = "12345678-1234-4234-8234-123456789abc";
+    let releaseDecode: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => { releaseDecode = resolve; });
+    let decoding = false;
+    const api = new ControlRoomApi({
+      baseUrl: "http://localhost",
+      expectedApiInstance: pin,
+      binaryDecodeScheduler: async ({ buffer, decodeInline }) => {
+        decoding = true;
+        await gate;
+        return decodeInline(buffer);
+      },
+      fetchImpl: async (url) => new URL(String(url)).pathname.endsWith("/topology")
+        ? binaryResponse(makeTopologyBuffer(), { headers: { ...contractHeaders, "x-fullmag-api-instance": pin } })
+        : new Response("{}", { headers: { "x-fullmag-api-instance": "replacement" } }),
+    });
+    const pending = api.data.domain.topology();
+    await vi.waitFor(() => expect(decoding).toBe(true));
+    await expect(api.platform.health()).rejects.toMatchObject({ code: "API_INSTANCE_MISMATCH" });
+    const rejected = expect(pending).rejects.toMatchObject({ code: "API_INSTANCE_MISMATCH" });
+    releaseDecode?.();
+    await rejected;
+  });
+
+  it("discards an in-flight old response after another request observes replacement", async () => {
+    const pin = "12345678-1234-4234-8234-123456789abc";
+    let releaseOld: ((response: Response) => void) | undefined;
+    const oldResponse = new Promise<Response>((resolve) => { releaseOld = resolve; });
+    const fetchImpl = vi.fn()
+      .mockImplementationOnce(() => oldResponse)
+      .mockResolvedValueOnce(new Response("{}", { headers: { "x-fullmag-api-instance": "replacement" } }));
+    const api = new ControlRoomApi({ expectedApiInstance: pin, fetchImpl });
+    const pending = api.sessions.current.status();
+    while (fetchImpl.mock.calls.length === 0) await Promise.resolve();
+    await expect(api.sessions.current.status()).rejects.toMatchObject({ code: "API_INSTANCE_MISMATCH" });
+    const rejected = expect(pending).rejects.toMatchObject({ code: "API_INSTANCE_MISMATCH" });
+    releaseOld?.(new Response("{}", { headers: { "x-fullmag-api-instance": pin } }));
+    await rejected;
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it("pins requests and permanently refuses a replacement without retries", async () => {
+    const pin = "12345678-1234-4234-8234-123456789abc";
+    const fetchImpl = vi.fn(async (_url: RequestInfo | URL, init?: RequestInit) => {
+      expect(new Headers(init?.headers).get("x-fullmag-api-instance")).toBe(pin);
+      return new Response("{}", { headers: {
+        "x-api-contract-version": "1.0.0",
+        "x-fullmag-api-instance": "87654321-1234-4234-8234-123456789abc",
+      } });
+    });
+    const api = new ControlRoomApi({ expectedApiInstance: pin, fetchImpl });
+    await expect(api.sessions.current.status()).rejects.toMatchObject({ code: "API_INSTANCE_MISMATCH" });
+    await expect(api.sessions.current.status()).rejects.toMatchObject({ code: "API_INSTANCE_MISMATCH" });
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
   });
 });

@@ -1,15 +1,20 @@
 import { MODEL_SCENE_PATH } from "@/kernel/api/apiPaths";
+import {
+  acknowledgedAuthoringSceneRevision,
+  invalidateAuthoringMutationDependents,
+} from "@/kernel/authoring/authoringMutationInvalidation";
+import {
+  prepareAuthoringMutation,
+  recordAuthoringMutationHistory,
+  authoringWriteOptions,
+} from "@/kernel/authoring/authoringHistoryMutation";
+import { obsoleteSessionResult } from "@/kernel/commands/commandSessionScope";
 import type { JsonObject } from "@/kernel/api/apiTypes";
 import type {
   CommandContext,
   CommandContribution,
   CommandResult,
 } from "@/kernel/commands/commandTypes";
-import {
-  MODEL_REGIONS_RESOURCE_KEY,
-  SCENE_RESOURCE_KEY,
-  VISUALIZATION_STATE_RESOURCE_KEY,
-} from "@/kernel/resources/geometryLifecycleResources";
 
 import {
   magnetizationTextureAssetId,
@@ -72,39 +77,85 @@ async function assignPreset(
       message: disabledReason(context) ?? "Magnetization target unavailable.",
     };
   }
+  const obsoleteBeforeMutation = obsoleteSessionResult(context);
+  if (obsoleteBeforeMutation) return obsoleteBeforeMutation;
+  const sessionScopeKey = context.sessionScopeKey;
 
+  const historyContext = {
+    api: context.api,
+    authoringHistory: context.authoringHistory,
+    resourceData: context.resourceData,
+    selection: context.selection,
+    sessionScopeKey,
+    isCurrentSessionScope: context.isCurrentSessionScope,
+  };
+  const preparation = await prepareAuthoringMutation(historyContext);
+  const obsoleteAfterPreparation = obsoleteSessionResult(context);
+  if (obsoleteAfterPreparation) return obsoleteAfterPreparation;
+  const baseRevision = preparation.baseRevision ?? sceneRevision(context);
+  const requestOptions = sessionScopeKey ? { sessionScopeKey } : undefined;
   const assetId = magnetizationTextureAssetId(target, presetKind);
-  const assetResponse = await context.api.model.patchMagnetizationAsset(
-    assetId,
-    {
-      asset: presetMagnetizationAsset({
-        id: assetId,
-        presetKind,
-        presetParams,
-      }),
-      base_revision: sceneRevision(context),
-    },
-  );
-
-  if (target.kind === "region") {
-    await context.api.model.patchRegion(
-      target.regionId,
+  try {
+    const assetResponse = await context.api.model.patchMagnetizationAsset(
+      assetId,
       {
-        magnetization_ref: assetId,
+        asset: presetMagnetizationAsset({
+          id: assetId,
+          presetKind,
+          presetParams,
+        }),
+        base_revision: baseRevision,
       },
+      requestOptions,
     );
-  } else {
-    await context.api.model.patchObject(target.objectId, {
-      base_revision: assetResponse.scene_revision,
-      magnetization_ref: assetId,
-    });
-  }
+    const obsoleteAfterAsset = obsoleteSessionResult(context);
+    if (obsoleteAfterAsset) return obsoleteAfterAsset;
+    const assetRevision = acknowledgedAuthoringSceneRevision(assetResponse);
+    const assignmentResponse =
+      target.kind === "region"
+        ? await context.api.model.patchRegion(
+            target.regionId,
+            { magnetization_ref: assetId },
+            authoringWriteOptions(assetRevision, sessionScopeKey),
+          )
+        : await context.api.model.patchObject(target.objectId, {
+            base_revision: assetRevision,
+            magnetization_ref: assetId,
+          }, authoringWriteOptions(assetRevision, sessionScopeKey));
+    const obsoleteAfterAssignment = obsoleteSessionResult(context);
+    if (obsoleteAfterAssignment) return obsoleteAfterAssignment;
 
-  const revision = assetResponse.scene_revision ?? Date.now();
-  context.resources?.invalidate(SCENE_RESOURCE_KEY, revision);
-  context.resources?.invalidate(MODEL_REGIONS_RESOURCE_KEY, revision);
-  context.resources?.invalidate(VISUALIZATION_STATE_RESOURCE_KEY, revision);
-  return { status: "completed" };
+    const revision = acknowledgedAuthoringSceneRevision(assignmentResponse);
+    await recordAuthoringMutationHistory(
+      historyContext,
+      `Assign ${presetKind} magnetization`,
+      preparation,
+      assignmentResponse,
+    );
+    const obsoleteAfterHistory = obsoleteSessionResult(context);
+    if (obsoleteAfterHistory) return obsoleteAfterHistory;
+    if (context.resources) {
+      invalidateAuthoringMutationDependents(
+        context.resources,
+        "magnetization",
+        revision,
+      );
+    }
+    return { status: "completed" };
+  } catch (error) {
+    const obsoleteAfterFailure = obsoleteSessionResult(context);
+    if (obsoleteAfterFailure) return obsoleteAfterFailure;
+    // The asset can be durable even when the second assignment request fails.
+    // Preserve that partial ACK in semantic history before surfacing the error.
+    await recordAuthoringMutationHistory(
+      historyContext,
+      `Assign ${presetKind} magnetization (partial)`,
+      preparation,
+    );
+    const obsoleteAfterPartialHistory = obsoleteSessionResult(context);
+    if (obsoleteAfterPartialHistory) return obsoleteAfterPartialHistory;
+    throw error;
+  }
 }
 
 function presetCommand(

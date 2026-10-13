@@ -133,6 +133,94 @@ def test_materialize_excludes_administrative_worktree_symlink(tmp_path: Path) ->
     assert not os.path.lexists(snapshot / ".worktrees")
 
 
+def test_materialize_excludes_nonruntime_agent_metadata_with_empty_symlink(
+    tmp_path: Path,
+) -> None:
+    repo = _repository(tmp_path)
+    def create_tree(entries: list[tuple[str, str, str]]) -> str:
+        payload = b"".join(
+            f"{mode} {name}".encode("utf-8")
+            + b"\0"
+            + bytes.fromhex(object_id)
+            for mode, name, object_id in entries
+        )
+        return subprocess.run(
+            ("git", "hash-object", "-t", "tree", "-w", "--stdin"),
+            cwd=repo,
+            input=payload,
+            capture_output=True,
+            check=True,
+        ).stdout.decode("ascii").strip()
+
+    empty_blob = subprocess.run(
+        ("git", "hash-object", "-w", "--stdin"),
+        cwd=repo,
+        input=b"",
+        capture_output=True,
+        check=True,
+    ).stdout.decode("ascii").strip()
+    skills_tree = create_tree([("120000", "empty", empty_blob)])
+    claude_tree = create_tree([("40000", "skills", skills_tree)])
+    tracked_blob = subprocess.run(
+        ("git", "rev-parse", "HEAD:tracked.txt"),
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    root_tree = create_tree(
+        [
+            ("40000", ".claude", claude_tree),
+            ("100644", "tracked.txt", tracked_blob),
+        ]
+    )
+    parent = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    commit = subprocess.run(
+        (
+            "git",
+            "commit-tree",
+            root_tree,
+            "-p",
+            parent,
+            "-m",
+            "track empty non-runtime agent link",
+        ),
+        cwd=repo,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+    _git(repo, "update-ref", "HEAD", commit)
+
+    identity_path = tmp_path / "identity.json"
+    snapshot = tmp_path / "snapshot"
+    result = subprocess.run(
+        (
+            sys.executable,
+            str(CAPTURE),
+            "--repo-root",
+            str(repo),
+            "--ignore-non-runtime-dirty",
+            "--output",
+            str(identity_path),
+            "--materialize",
+            str(snapshot),
+        ),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not os.path.lexists(snapshot / ".claude")
+
+
 def test_runtime_materialize_ignores_dirty_administrative_worktree_symlink(
     tmp_path: Path,
 ) -> None:
@@ -480,6 +568,8 @@ def test_runtime_capture_uses_pruned_status_and_untracked_scans(
     status_calls = [call for call in calls if call[:2] == ("status", "--porcelain=v1")]
     assert status_calls
     assert all("--untracked-files=all" not in call for call in status_calls)
+    assert all("--no-renames" in call for call in status_calls)
+    assert any(":(exclude)external_solvers/**" in call for call in status_calls)
     assert any(call[:2] == ("ls-files", "--others") for call in calls)
 
 
@@ -590,6 +680,55 @@ def test_qualification_input_is_bound_to_source_snapshot(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
+    "unsafe_path",
+    (
+        r"\foo",
+        "/foo",
+        "C:foo",
+        r"C:\foo",
+        r"\\server\share\file",
+        r"\\?\C:\file",
+        r"\\.\PhysicalDrive0",
+    ),
+)
+def test_safe_relative_path_rejects_windows_anchored_forms(
+    tmp_path: Path, unsafe_path: str
+) -> None:
+    repo = _repository(tmp_path)
+    spec = importlib.util.spec_from_file_location("source_identity_path_safety", CAPTURE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    with pytest.raises(module.SourceIdentityError, match="unsafe qualification input path"):
+        module._safe_relative_path(unsafe_path, "qualification input")
+
+
+def test_qualification_input_parent_link_cannot_escape_repository(tmp_path: Path) -> None:
+    repo = _repository(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    fixture = outside / "fixture.v1.json"
+    fixture.write_text("outside\n", encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("source_identity_containment", CAPTURE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+
+    with pytest.raises(module.SourceIdentityError, match="escapes snapshot root"):
+        module._resolve_contained_path(repo, fixture, "qualification input")
+    link = repo / "outside-parent"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        return
+    with pytest.raises(module.SourceIdentityError, match="escapes snapshot root"):
+        module.capture(repo, qualification_inputs=("outside-parent/fixture.v1.json",))
+
+
+@pytest.mark.parametrize(
     ("links", "expected_detail"),
     [
         ({"unsafe-link": "/tmp/fullmag-source-outside"}, "absolute"),
@@ -645,6 +784,32 @@ def test_materialize_rejects_unsafe_committed_symlink_graph(
     assert result.returncode == 2
     assert "unsafe source symlink" in result.stderr
     assert expected_detail in result.stderr
+
+
+def test_materialize_rejects_committed_symlink_with_empty_target(
+    tmp_path: Path,
+) -> None:
+    repo = _repository(tmp_path)
+    empty_object = subprocess.run(
+        ("git", "hash-object", "-w", "--stdin"),
+        cwd=repo,
+        input=b"",
+        capture_output=True,
+        check=True,
+    ).stdout.decode("ascii").strip()
+    _git(
+        repo,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"120000,{empty_object},empty-link",
+    )
+    _git(repo, "commit", "-qm", "add empty symlink target")
+
+    result = _materialize(repo, tmp_path / "snapshot", tmp_path / "identity.json")
+
+    assert result.returncode == 2
+    assert "source symlink has empty target: empty-link" in result.stderr
 
 
 def test_verify_materialized_binds_identity_to_exact_snapshot_content_and_mode(
@@ -719,3 +884,35 @@ def test_materialized_snapshot_is_normalized_and_independent_of_worktree(
 
     tracked.write_text("later mutation\n", encoding="utf-8")
     assert (snapshot / "tracked.txt").read_text(encoding="utf-8") == "captured tracked\n"
+
+
+def test_materialize_uses_committed_bytes_when_parent_git_enables_autocrlf(
+    tmp_path: Path,
+) -> None:
+    repo = _repository(tmp_path)
+    snapshot = tmp_path / "snapshot-autocrlf"
+    identity_path = tmp_path / "identity-autocrlf.json"
+    environment = os.environ.copy()
+    environment["GIT_CONFIG_COUNT"] = "1"
+    environment["GIT_CONFIG_KEY_0"] = "core.autocrlf"
+    environment["GIT_CONFIG_VALUE_0"] = "true"
+
+    captured = subprocess.run(
+        (
+            sys.executable,
+            str(CAPTURE),
+            "--repo-root",
+            str(repo),
+            "--output",
+            str(identity_path),
+            "--materialize",
+            str(snapshot),
+        ),
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert captured.returncode == 0, captured.stderr
+    assert (snapshot / "tracked.txt").read_bytes() == b"committed\n"

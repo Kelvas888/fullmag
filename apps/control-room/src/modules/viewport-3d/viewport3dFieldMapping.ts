@@ -1,7 +1,11 @@
-import type { DecodedFieldVector } from "@/kernel/api/codecs";
+import type {
+  DecodedComplexFieldVector,
+  DecodedFieldVector,
+} from "@/kernel/api/codecs";
 import type { SurfaceFieldProjectionMode } from "@/kernel/visualization/ObjectVisualizationController";
 
 import { buildFdmFieldIndexResolver } from "./model/fdmFieldIndexing";
+import { srgbToLinearChannel } from "./viewport3dColorSpace";
 
 import {
   normalizeViewport3DVectorColorMode,
@@ -10,6 +14,21 @@ import {
   type Viewport3DScalarColorRange,
   type Viewport3DVectorColorMode,
 } from "./viewport3dVectorColoring";
+import { isDivergingScalarPalette } from "../../shared/visualization/scalarColorPalette";
+
+/**
+ * Renderer-facing field vector contract.  The API decoder currently emits
+ * float64 values, while durable saved fields may be bounded float32 payloads.
+ * Mapping only reads ArrayLike numbers, so retain the producer dtype and
+ * avoid widening a saved buffer merely to satisfy the live decoder type.
+ */
+export type Viewport3DFieldVector = Omit<
+  DecodedFieldVector,
+  "dtype" | "values"
+> & {
+  dtype: "float32" | "float64";
+  values: Float32Array | Float64Array;
+};
 
 export interface ScalarRange {
   max: number;
@@ -26,7 +45,26 @@ export interface ScalarRangeDiagnostics extends ScalarRange {
   zeroCount: number;
 }
 
+/**
+ * Optional mesh-node membership for target-scoped world-Z projection. This is
+ * separate from targetNodeIndices, which maps payload entries to global nodes.
+ */
+export interface Viewport3DProjectionNodeSelection {
+  nodeCount?: number;
+  node_count?: number;
+  nodeIndices?: ArrayLike<number>;
+  node_indices?: ArrayLike<number>;
+  nodeStart?: number;
+  node_start?: number;
+}
+
+export interface Viewport3DProjectionNodeMembership {
+  cacheKey: string;
+  contains(nodeIndex: number): boolean;
+}
+
 export interface ScalarColorBuffer {
+  amplitudeScale?: number;
   buildKey?: string;
   colors: Float32Array;
   colorMode?: string;
@@ -34,6 +72,12 @@ export interface ScalarColorBuffer {
   complexImagValues?: Float32Array;
   complexPhaseRad?: number;
   complexRealValues?: Float32Array;
+  complexRepresentation?:
+    | "phase_rotated_real"
+    | "real"
+    | "imag"
+    | "abs"
+    | "phase";
   wavevectorKf?: [number, number, number];
   cellOrigin?: [number, number, number];
   floquetSpatialConvention?: string;
@@ -106,6 +150,7 @@ export interface ChunkedFieldTransformOptions {
 export const VIEWPORT_3D_SYNC_COLOR_POINT_LIMIT = 50_000;
 const LOW_CONFIDENCE_ORIENTATION_RGB = [0.6, 0.6, 0.6] as const;
 const MISSING_PROJECTED_DATA_RGB = [0.5, 0.5, 0.5] as const;
+const MISSING_FIELD_COVERAGE_RGB = [0.5, 0.5, 0.5] as const;
 const REDUCED_MAGNETIZATION_LOW_NORM_EPSILON = 1e-3;
 
 export function fieldTransformNeedsChunking(
@@ -116,7 +161,7 @@ export function fieldTransformNeedsChunking(
 }
 
 export function buildVertexScalarColors(
-  fieldVector: DecodedFieldVector | null | undefined,
+  fieldVector: Viewport3DFieldVector | null | undefined,
   vertexCount: number,
   maxSynchronousPoints = VIEWPORT_3D_SYNC_COLOR_POINT_LIMIT,
   colorMode = "magnitude",
@@ -148,7 +193,7 @@ export function buildVertexScalarColors(
 }
 
 export function buildSampledScalarColors(
-  fieldVector: DecodedFieldVector | null | undefined,
+  fieldVector: Viewport3DFieldVector | null | undefined,
   pointIndices: Uint32Array | null | undefined,
   colorMode = "magnitude",
   colorPalette = "viridis",
@@ -168,7 +213,7 @@ export function buildSampledScalarColors(
     return null;
   }
 
-  const range = resolveScalarRange(fieldVector, resolvedColorMode);
+  const range = resolveScalarRange(fieldVector, resolvedColorMode, colorPalette);
   const colors = new Float32Array(pointIndices.length * 3);
   const scalarValues = shaderScalarModeSupports(resolvedColorMode)
     ? new Float32Array(pointIndices.length)
@@ -177,26 +222,26 @@ export function buildSampledScalarColors(
   for (let index = 0; index < pointIndices.length; index += 1) {
     const pointIndex = pointIndices[index] ?? 0;
     if (pointIndex >= fieldVector.pointCount) {
-      const target = index * 3;
-      colors[target] = 0.5;
-      colors[target + 1] = 0.5;
-      colors[target + 2] = 0.5;
+      writeColorBufferRgb(
+        colors,
+        index,
+        MISSING_FIELD_COVERAGE_RGB,
+        "srgb",
+      );
       continue;
     }
     if (scalarValues) {
-      scalarValues[index] = scalarAt(fieldVector, pointIndex, resolvedColorMode);
+      scalarValues[index] = normalizeScalarValueForShaderAttribute(
+        scalarAt(fieldVector, pointIndex, resolvedColorMode),
+        range,
+      );
     }
-    const [red, green, blue] = colorAt(
-      fieldVector,
-      pointIndex,
-      resolvedColorMode,
-      range,
-      colorPalette,
+    writeColorBufferRgb(
+      colors,
+      index,
+      colorAt(fieldVector, pointIndex, resolvedColorMode, range, colorPalette),
+      resolvedColorMode === "orientation" ? "srgb" : "linear",
     );
-    const target = index * 3;
-    colors[target] = red;
-    colors[target + 1] = green;
-    colors[target + 2] = blue;
   }
 
   return {
@@ -221,7 +266,7 @@ export function buildSampledScalarColors(
  * neutral material instead of painting a wrong cell with a neighboring value.
  */
 export function buildFdmSampledScalarColors(
-  fieldVector: DecodedFieldVector | null | undefined,
+  fieldVector: Viewport3DFieldVector | null | undefined,
   cellOrdinals: Uint32Array | null | undefined,
   domainCellCount: number,
   colorMode = "magnitude",
@@ -256,7 +301,7 @@ export function buildFdmSampledScalarColors(
 
   const range =
     resolveProvidedScalarRange(scalarRange) ??
-    resolveScalarRange(fieldVector, resolvedColorMode);
+    resolveScalarRange(fieldVector, resolvedColorMode, colorPalette);
   const colors = new Float32Array(cellOrdinals.length * 3);
   const scalarValues = shaderScalarModeSupports(resolvedColorMode)
     ? new Float32Array(cellOrdinals.length)
@@ -264,21 +309,19 @@ export function buildFdmSampledScalarColors(
 
   for (let index = 0; index < cellOrdinals.length; index += 1) {
     const fieldIndex = indexing.resolve(cellOrdinals[index] ?? -1);
-    const target = index * 3;
     if (fieldIndex === null) return null;
     if (scalarValues) {
-      scalarValues[index] = scalarAt(fieldVector, fieldIndex, resolvedColorMode);
+      scalarValues[index] = normalizeScalarValueForShaderAttribute(
+        scalarAt(fieldVector, fieldIndex, resolvedColorMode),
+        range,
+      );
     }
-    const [red, green, blue] = colorAt(
-      fieldVector,
-      fieldIndex,
-      resolvedColorMode,
-      range,
-      colorPalette,
+    writeColorBufferRgb(
+      colors,
+      index,
+      colorAt(fieldVector, fieldIndex, resolvedColorMode, range, colorPalette),
+      resolvedColorMode === "orientation" ? "srgb" : "linear",
     );
-    colors[target] = red;
-    colors[target + 1] = green;
-    colors[target + 2] = blue;
   }
 
   return {
@@ -296,7 +339,7 @@ export function buildFdmSampledScalarColors(
 }
 
 export function buildMappedVertexScalarColors(
-  fieldVector: DecodedFieldVector | null | undefined,
+  fieldVector: Viewport3DFieldVector | null | undefined,
   targetNodeIndices: Uint32Array | null | undefined,
   vertexCount: number,
   maxSynchronousPoints = VIEWPORT_3D_SYNC_COLOR_POINT_LIMIT,
@@ -322,7 +365,7 @@ export function buildMappedVertexScalarColors(
 
   const range =
     resolveProvidedScalarRange(scalarRange) ??
-    resolveScalarRange(fieldVector, resolvedColorMode);
+    resolveScalarRange(fieldVector, resolvedColorMode, colorPalette);
   const colors = new Float32Array(vertexCount * 3);
   const scalarValues = shaderScalarModeSupports(resolvedColorMode)
     ? new Float32Array(vertexCount)
@@ -334,19 +377,17 @@ export function buildMappedVertexScalarColors(
       continue;
     }
     if (scalarValues) {
-      scalarValues[nodeIndex] = scalarAt(fieldVector, index, resolvedColorMode);
+      scalarValues[nodeIndex] = normalizeScalarValueForShaderAttribute(
+        scalarAt(fieldVector, index, resolvedColorMode),
+        range,
+      );
     }
-    const [red, green, blue] = colorAt(
-      fieldVector,
-      index,
-      resolvedColorMode,
-      range,
-      colorPalette,
+    writeColorBufferRgb(
+      colors,
+      nodeIndex,
+      colorAt(fieldVector, index, resolvedColorMode, range, colorPalette),
+      resolvedColorMode === "orientation" ? "srgb" : "linear",
     );
-    const target = nodeIndex * 3;
-    colors[target] = red;
-    colors[target + 1] = green;
-    colors[target + 2] = blue;
   }
 
   return {
@@ -364,7 +405,7 @@ export function buildMappedVertexScalarColors(
 }
 
 export function buildSurfaceFaceScalarColors(
-  fieldVector: DecodedFieldVector | null | undefined,
+  fieldVector: Viewport3DFieldVector | null | undefined,
   surfaceIndices: Uint32Array | null | undefined,
   vertexCount: number,
   colorMode = "magnitude",
@@ -476,11 +517,19 @@ export function buildSurfaceFaceScalarColors(
     for (let corner = 0; corner < 3; corner += 1) {
       const targetIndex = faceIndex * 3 + corner;
       const colorOffset = targetIndex * 3;
-      colors[colorOffset] = rgb[0];
-      colors[colorOffset + 1] = rgb[1];
-      colors[colorOffset + 2] = rgb[2];
+      writeColorBufferRgb(
+        colors,
+        targetIndex,
+        rgb,
+        degradedFaces[faceIndex] === 1 || resolvedColorMode === "orientation"
+          ? "srgb"
+          : "linear",
+      );
       if (scalarValues) {
-        scalarValues[targetIndex] = scalar;
+        scalarValues[targetIndex] = normalizeScalarValueForShaderAttribute(
+          scalar,
+          range,
+        );
       }
       if (vectorValues) {
         vectorValues[colorOffset] = x;
@@ -510,7 +559,7 @@ export function buildSurfaceFaceScalarColors(
 }
 
 export function buildThicknessAverageZScalarColors(
-  fieldVector: DecodedFieldVector | null | undefined,
+  fieldVector: Viewport3DFieldVector | null | undefined,
   positions: ArrayLike<number> | null | undefined,
   surfaceIndices: Uint32Array | null | undefined,
   vertexCount: number,
@@ -519,6 +568,7 @@ export function buildThicknessAverageZScalarColors(
   scalarRange?: ScalarRange | null,
   maxSynchronousPoints = VIEWPORT_3D_SYNC_COLOR_POINT_LIMIT,
   targetNodeIndices?: ArrayLike<number> | null,
+  projectionNodeMembership?: Viewport3DProjectionNodeMembership | null,
 ): ScalarColorBuffer | null {
   const resolvedColorMode = normalizeViewport3DVectorColorMode(
     colorMode,
@@ -553,6 +603,7 @@ export function buildThicknessAverageZScalarColors(
     nodeToFieldIndex,
     positions,
     vertexCount,
+    projectionNodeMembership,
   });
   if (!projection) return null;
   const projectedVectors = projection.vectors;
@@ -630,11 +681,19 @@ export function buildThicknessAverageZScalarColors(
     for (let corner = 0; corner < 3; corner += 1) {
       const targetIndex = faceIndex * 3 + corner;
       const colorOffset = targetIndex * 3;
-      colors[colorOffset] = rgb[0];
-      colors[colorOffset + 1] = rgb[1];
-      colors[colorOffset + 2] = rgb[2];
+      writeColorBufferRgb(
+        colors,
+        targetIndex,
+        rgb,
+        degradedFaces[faceIndex] === 1 || resolvedColorMode === "orientation"
+          ? "srgb"
+          : "linear",
+      );
       if (scalarValues) {
-        scalarValues[targetIndex] = scalar;
+        scalarValues[targetIndex] = normalizeScalarValueForShaderAttribute(
+          scalar,
+          range,
+        );
       }
       if (vectorValues) {
         vectorValues[colorOffset] = x;
@@ -670,8 +729,211 @@ export function buildThicknessAverageZScalarColors(
   };
 }
 
+/**
+ * Projects complex modal pairs using the same face averaging and world-Z
+ * columns as the scalar surface buffer, returning face-expanded shader values.
+ */
+export function buildProjectedComplexSurfaceShaderValues({
+  complexFieldVector,
+  positions,
+  projectionNodeMembership,
+  projectionMode,
+  surfaceIndices,
+  targetNodeIndices,
+  vertexCount,
+}: {
+  complexFieldVector: DecodedComplexFieldVector | null | undefined;
+  positions?: ArrayLike<number> | null;
+  projectionNodeMembership?: Viewport3DProjectionNodeMembership | null;
+  projectionMode: "surface_faces" | "thickness_average_z";
+  surfaceIndices: Uint32Array | null | undefined;
+  targetNodeIndices?: ArrayLike<number> | null;
+  vertexCount: number;
+}): {
+  complexImagValues: Float32Array;
+  complexRealValues: Float32Array;
+} | null {
+  if (
+    !complexFieldVector ||
+    !surfaceIndices ||
+    surfaceIndices.length === 0 ||
+    surfaceIndices.length % 3 !== 0 ||
+    complexFieldVector.pointCount === 0
+  ) {
+    return null;
+  }
+
+  const nodeToFieldIndex = buildNodeToFieldIndexMap(
+    complexFieldVector,
+    vertexCount,
+    targetNodeIndices,
+  );
+  if (!nodeToFieldIndex) return null;
+
+  let projectedVectors: ReadonlyMap<number, ComplexFieldVector6> | null = null;
+  if (projectionMode === "thickness_average_z") {
+    if (!positions || positions.length < vertexCount * 3) return null;
+    projectedVectors = buildWorldZProjectedComplexVectors({
+      complexFieldVector,
+      nodeToFieldIndex,
+      positions,
+      vertexCount,
+      projectionNodeMembership,
+    });
+    if (!projectedVectors) return null;
+  }
+
+  const complexRealValues = new Float32Array(surfaceIndices.length * 3);
+  const complexImagValues = new Float32Array(surfaceIndices.length * 3);
+  for (
+    let faceIndex = 0;
+    faceIndex < surfaceIndices.length / 3;
+    faceIndex += 1
+  ) {
+    const surfaceOffset = faceIndex * 3;
+    const nodeA = surfaceIndices[surfaceOffset] ?? -1;
+    const nodeB = surfaceIndices[surfaceOffset + 1] ?? -1;
+    const nodeC = surfaceIndices[surfaceOffset + 2] ?? -1;
+    const fieldA = nodeToFieldIndex.get(nodeA);
+    const fieldB = nodeToFieldIndex.get(nodeB);
+    const fieldC = nodeToFieldIndex.get(nodeC);
+    if (fieldA === undefined || fieldB === undefined || fieldC === undefined) {
+      return null;
+    }
+
+    const vectorA = projectedVectors
+      ? projectedVectors.get(nodeA)
+      : complexFieldVector6(complexFieldVector, fieldA);
+    const vectorB = projectedVectors
+      ? projectedVectors.get(nodeB)
+      : complexFieldVector6(complexFieldVector, fieldB);
+    const vectorC = projectedVectors
+      ? projectedVectors.get(nodeC)
+      : complexFieldVector6(complexFieldVector, fieldC);
+    if (!vectorA || !vectorB || !vectorC) return null;
+    const faceVector: ComplexFieldVector6 = [
+      (vectorA[0] + vectorB[0] + vectorC[0]) / 3,
+      (vectorA[1] + vectorB[1] + vectorC[1]) / 3,
+      (vectorA[2] + vectorB[2] + vectorC[2]) / 3,
+      (vectorA[3] + vectorB[3] + vectorC[3]) / 3,
+      (vectorA[4] + vectorB[4] + vectorC[4]) / 3,
+      (vectorA[5] + vectorB[5] + vectorC[5]) / 3,
+    ];
+
+    for (let corner = 0; corner < 3; corner += 1) {
+      const targetOffset = (faceIndex * 3 + corner) * 3;
+      complexRealValues[targetOffset] = faceVector[0];
+      complexRealValues[targetOffset + 1] = faceVector[1];
+      complexRealValues[targetOffset + 2] = faceVector[2];
+      complexImagValues[targetOffset] = faceVector[3];
+      complexImagValues[targetOffset + 1] = faceVector[4];
+      complexImagValues[targetOffset + 2] = faceVector[5];
+    }
+  }
+  return { complexImagValues, complexRealValues };
+}
+
+type ComplexFieldVector6 = readonly [
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+];
+
+function complexFieldVector6(
+  fieldVector: DecodedComplexFieldVector,
+  fieldIndex: number,
+): ComplexFieldVector6 {
+  const base = fieldIndex * fieldVector.componentCount * 2;
+  const componentValue = (componentIndex: number, pairComponent: 0 | 1) =>
+    componentIndex < fieldVector.componentCount
+      ? fieldVector.values[base + componentIndex * 2 + pairComponent] ?? 0
+      : 0;
+  return [
+    componentValue(0, 0),
+    componentValue(1, 0),
+    componentValue(2, 0),
+    componentValue(0, 1),
+    componentValue(1, 1),
+    componentValue(2, 1),
+  ];
+}
+
+function buildWorldZProjectedComplexVectors({
+  complexFieldVector,
+  nodeToFieldIndex,
+  positions,
+  projectionNodeMembership,
+  vertexCount,
+}: {
+  complexFieldVector: DecodedComplexFieldVector;
+  nodeToFieldIndex: ReadonlyMap<number, number>;
+  positions: ArrayLike<number>;
+  projectionNodeMembership?: Viewport3DProjectionNodeMembership | null;
+  vertexCount: number;
+}): Map<number, ComplexFieldVector6> | null {
+  const membership = projectionNodeMembership ?? null;
+  const bounds = worldZProjectionBounds(positions, vertexCount, membership);
+  if (!bounds) return null;
+  const tolerance = worldZProjectionTolerance(bounds);
+  if (!Number.isFinite(tolerance) || tolerance <= 0) return null;
+  const columns = new Map<
+    string,
+    { count: number; sums: [number, number, number, number, number, number] }
+  >();
+  const nodeColumnKeys = new Map<number, string>();
+
+  for (const [nodeIndex, fieldIndex] of nodeToFieldIndex) {
+    if (nodeIndex < 0 || nodeIndex >= vertexCount) return null;
+    if (membership && !membership.contains(nodeIndex)) continue;
+    const positionOffset = nodeIndex * 3;
+    const x = positions[positionOffset] ?? Number.NaN;
+    const y = positions[positionOffset + 1] ?? Number.NaN;
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null;
+    const key = `${Math.round(x / tolerance)}:${Math.round(y / tolerance)}`;
+    const column = columns.get(key) ?? {
+      count: 0,
+      sums: [0, 0, 0, 0, 0, 0],
+    };
+    const vector = complexFieldVector6(complexFieldVector, fieldIndex);
+    column.count += 1;
+    for (let componentIndex = 0; componentIndex < 6; componentIndex += 1) {
+      column.sums[componentIndex] =
+        (column.sums[componentIndex] ?? 0) +
+        (vector[componentIndex] ?? 0);
+    }
+    columns.set(key, column);
+    nodeColumnKeys.set(nodeIndex, key);
+  }
+
+  const columnVectors = new Map<string, ComplexFieldVector6>();
+  for (const [key, column] of Array.from(columns).sort(([left], [right]) =>
+    left.localeCompare(right),
+  )) {
+    if (column.count <= 0) return null;
+    columnVectors.set(key, [
+      column.sums[0] / column.count,
+      column.sums[1] / column.count,
+      column.sums[2] / column.count,
+      column.sums[3] / column.count,
+      column.sums[4] / column.count,
+      column.sums[5] / column.count,
+    ]);
+  }
+
+  const projected = new Map<number, ComplexFieldVector6>();
+  for (const [nodeIndex, key] of nodeColumnKeys) {
+    const vector = columnVectors.get(key);
+    if (!vector) return null;
+    projected.set(nodeIndex, vector);
+  }
+  return projected;
+}
+
 export async function buildVertexScalarColorsChunked(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   options: ChunkedFieldTransformOptions = {},
 ): Promise<ScalarColorBuffer | null> {
   const chunkSize = Math.max(Math.floor(options.chunkSize ?? 10_000), 1);
@@ -696,6 +958,7 @@ export async function buildVertexScalarColorsChunked(
         (await resolveScalarRangeChunked(
             fieldVector,
             colorMode,
+            colorPalette,
             chunkSize,
             options.signal,
             yieldToMain,
@@ -744,7 +1007,7 @@ export async function buildVertexScalarColorsChunked(
 }
 
 export function fieldVectorSupportsScalarColorMode(
-  fieldVector: Pick<DecodedFieldVector, "nComp">,
+  fieldVector: Pick<Viewport3DFieldVector, "nComp">,
   colorMode: Viewport3DVectorColorMode,
 ): boolean {
   return colorMode !== "orientation" || fieldVector.nComp >= 3;
@@ -752,7 +1015,7 @@ export function fieldVectorSupportsScalarColorMode(
 
 export function fieldVectorUsesDirectNodeOrder(
   fieldVector:
-    | Pick<DecodedFieldVector, "indexing" | "nodeIndices" | "pointCount">
+    | Pick<Viewport3DFieldVector, "indexing" | "nodeIndices" | "pointCount">
     | null
     | undefined,
   nodeCount: number,
@@ -791,13 +1054,36 @@ function resolveProvidedScalarRange(
 }
 
 /**
+ * Auto-symmetrizes a scalar range around zero for signed component color
+ * modes (x/y/z) when a diverging palette (e.g. "coolwarm") is selected.
+ * Diverging palettes rely on their midpoint mapping to zero; an
+ * asymmetric range would shift that midpoint away from zero and make the
+ * palette misleading. Sequential palettes and magnitude-style modes are
+ * left untouched (S-11).
+ */
+function resolveDivergingSymmetricRange(
+  range: ScalarRange,
+  colorMode: Viewport3DVectorColorMode,
+  colorPalette: string,
+): ScalarRange {
+  const isSignedComponent =
+    colorMode === "x" || colorMode === "y" || colorMode === "z";
+  if (!isSignedComponent || !isDivergingScalarPalette(colorPalette)) {
+    return range;
+  }
+  const extent = Math.max(Math.abs(range.min), Math.abs(range.max));
+  return { max: extent, min: -extent };
+}
+
+/**
  * Chunked version of resolveScalarRange that yields to main thread between
  * chunks.  Prevents the synchronous O(N) range scan from blocking the UI
  * for large meshes (> 50K points).
  */
 async function resolveScalarRangeChunked(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   colorMode: string,
+  colorPalette: string,
   chunkSize: number,
   signal?: AbortSignal,
   yieldToMain?: () => Promise<void>,
@@ -806,14 +1092,16 @@ async function resolveScalarRangeChunked(
     colorMode,
     "magnitude",
   );
+  const safeChunkSize = Math.max(Math.floor(chunkSize || 10_000), 1);
   let min = Infinity;
   let max = -Infinity;
 
-  for (let start = 0; start < fieldVector.pointCount; start += chunkSize) {
+  for (let start = 0; start < fieldVector.pointCount; start += safeChunkSize) {
     throwIfAborted(signal);
-    const end = Math.min(start + chunkSize, fieldVector.pointCount);
+    const end = Math.min(start + safeChunkSize, fieldVector.pointCount);
     for (let index = start; index < end; index += 1) {
       const value = scalarAt(fieldVector, index, resolvedColorMode);
+      if (!Number.isFinite(value)) continue;
       if (value < min) min = value;
       if (value > max) max = value;
     }
@@ -826,12 +1114,17 @@ async function resolveScalarRangeChunked(
     return { max: 0, min: 0 };
   }
 
-  return { max, min };
+  return resolveDivergingSymmetricRange(
+    { max, min },
+    resolvedColorMode,
+    colorPalette,
+  );
 }
 
 export function resolveScalarRange(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   colorMode = "magnitude",
+  colorPalette = "viridis",
 ): ScalarRange {
   const resolvedColorMode = normalizeViewport3DVectorColorMode(
     colorMode,
@@ -842,6 +1135,7 @@ export function resolveScalarRange(
 
   for (let index = 0; index < fieldVector.pointCount; index += 1) {
     const value = scalarAt(fieldVector, index, resolvedColorMode);
+    if (!Number.isFinite(value)) continue;
     min = Math.min(min, value);
     max = Math.max(max, value);
   }
@@ -850,11 +1144,15 @@ export function resolveScalarRange(
     return { max: 0, min: 0 };
   }
 
-  return { max, min };
+  return resolveDivergingSymmetricRange(
+    { max, min },
+    resolvedColorMode,
+    colorPalette,
+  );
 }
 
 export function resolveScalarRangeDiagnostics(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   colorMode = "magnitude",
 ): ScalarRangeDiagnostics {
   const resolvedColorMode = normalizeViewport3DVectorColorMode(
@@ -916,7 +1214,10 @@ export function resolveScalarRangeDiagnostics(
 }
 
 function buildNodeToFieldIndexMap(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Pick<
+    Viewport3DFieldVector,
+    "indexing" | "nodeIndices" | "pointCount"
+  >,
   vertexCount: number,
   targetNodeIndices?: ArrayLike<number> | null,
 ): Map<number, number> | null {
@@ -997,11 +1298,13 @@ function buildWorldZProjectedVectors({
   fieldVector,
   nodeToFieldIndex,
   positions,
+  projectionNodeMembership,
   vertexCount,
 }: {
-  fieldVector: DecodedFieldVector;
+  fieldVector: Viewport3DFieldVector;
   nodeToFieldIndex: ReadonlyMap<number, number>;
   positions: ArrayLike<number>;
+  projectionNodeMembership?: Viewport3DProjectionNodeMembership | null;
   vertexCount: number;
 }): {
   binCount: number;
@@ -1012,7 +1315,8 @@ function buildWorldZProjectedVectors({
   tolerance: number;
   vectors: Map<number, readonly [number, number, number]>;
 } | null {
-  const bounds = worldZProjectionBounds(positions, vertexCount);
+  const membership = projectionNodeMembership ?? null;
+  const bounds = worldZProjectionBounds(positions, vertexCount, membership);
   if (!bounds) return null;
   const tolerance = worldZProjectionTolerance(bounds);
   if (!Number.isFinite(tolerance) || tolerance <= 0) return null;
@@ -1024,6 +1328,7 @@ function buildWorldZProjectedVectors({
 
   for (const [nodeIndex, fieldIndex] of nodeToFieldIndex) {
     if (nodeIndex < 0 || nodeIndex >= vertexCount) return null;
+    if (membership && !membership.contains(nodeIndex)) continue;
     const positionOffset = nodeIndex * 3;
     const x = positions[positionOffset] ?? Number.NaN;
     const y = positions[positionOffset + 1] ?? Number.NaN;
@@ -1087,6 +1392,7 @@ function buildWorldZProjectedVectors({
 function worldZProjectionBounds(
   positions: ArrayLike<number>,
   vertexCount: number,
+  membership: Viewport3DProjectionNodeMembership | null,
 ): {
   maxX: number;
   maxY: number;
@@ -1102,6 +1408,7 @@ function worldZProjectionBounds(
   let minZ = Infinity;
   let maxZ = -Infinity;
   for (let nodeIndex = 0; nodeIndex < vertexCount; nodeIndex += 1) {
+    if (membership && !membership.contains(nodeIndex)) continue;
     const offset = nodeIndex * 3;
     const x = positions[offset] ?? Number.NaN;
     const y = positions[offset + 1] ?? Number.NaN;
@@ -1127,6 +1434,57 @@ function worldZProjectionBounds(
     return null;
   }
   return { maxX, maxY, maxZ, minX, minY, minZ };
+}
+
+export function buildViewport3DProjectionNodeMembership(
+  selection: Viewport3DProjectionNodeSelection | null | undefined,
+  vertexCount: number,
+): Viewport3DProjectionNodeMembership | null {
+  if (!selection) return null;
+
+  const explicitNodeIndices = selection.nodeIndices ?? selection.node_indices;
+  if (explicitNodeIndices !== undefined) {
+    const selected = new Set<number>();
+    let hash = 2166136261;
+    for (let offset = 0; offset < explicitNodeIndices.length; offset += 1) {
+      const nodeIndex = explicitNodeIndices[offset];
+      hash ^= nodeIndex ?? 0;
+      hash = Math.imul(hash, 16777619);
+      if (
+        nodeIndex !== undefined &&
+        Number.isInteger(nodeIndex) &&
+        nodeIndex >= 0 &&
+        nodeIndex < vertexCount
+      ) {
+        selected.add(nodeIndex);
+      }
+    }
+    return {
+      cacheKey: `indices:${explicitNodeIndices.length}:${hash >>> 0}`,
+      contains: (nodeIndex) => selected.has(nodeIndex),
+    };
+  }
+
+  const rawStart = selection.nodeStart ?? selection.node_start ?? 0;
+  if (!Number.isFinite(rawStart)) {
+    return {
+      cacheKey: `range:invalid:${vertexCount}`,
+      contains: () => false,
+    };
+  }
+  const start = Math.max(0, Math.floor(rawStart));
+  const rawCount = selection.nodeCount ?? selection.node_count;
+  const count =
+    rawCount === undefined || (rawCount <= 0 && start > 0)
+      ? vertexCount - start
+      : Math.max(0, Math.floor(rawCount));
+  const end = Number.isNaN(count)
+    ? start
+    : Math.min(vertexCount, start + count);
+  return {
+    cacheKey: `range:${start}:${end}:${vertexCount}`,
+    contains: (nodeIndex) => nodeIndex >= start && nodeIndex < end,
+  };
 }
 
 function worldZProjectionTolerance(
@@ -1163,7 +1521,7 @@ function resolveWorldZProjectionSuitability({
 }
 
 function averageFieldVectorComponents(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   fieldA: number,
   fieldB: number,
   fieldC: number,
@@ -1176,7 +1534,7 @@ function averageFieldVectorComponents(
 }
 
 function averageFieldComponent(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   fieldA: number,
   fieldB: number,
   fieldC: number,
@@ -1192,7 +1550,7 @@ function averageFieldComponent(
 }
 
 function fieldComponent(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   fieldIndex: number,
   component: number,
 ): number {
@@ -1317,7 +1675,7 @@ function scalarRangeDiagnosticsFromValues(
 }
 
 function buildVertexScalarColorsUnchecked(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   vertexCount: number,
   colorMode: Viewport3DVectorColorMode,
   colorPalette: string,
@@ -1325,7 +1683,7 @@ function buildVertexScalarColorsUnchecked(
 ): ScalarColorBuffer {
   const range =
     resolveProvidedScalarRange(scalarRange) ??
-    resolveScalarRange(fieldVector, colorMode);
+    resolveScalarRange(fieldVector, colorMode, colorPalette);
   const colors = new Float32Array(vertexCount * 3);
   const scalarValues = shaderScalarModeSupports(colorMode)
     ? new Float32Array(vertexCount)
@@ -1359,7 +1717,7 @@ function percentileIndex(count: number, percentile: number): number {
 }
 
 function writeScalarColors(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   colors: Float32Array,
   range: ScalarRange,
   start: number,
@@ -1374,26 +1732,50 @@ function writeScalarColors(
       writeVectorValue(fieldVector, index, vectorValues, index);
     }
     if (scalarValues) {
-      scalarValues[index] = scalarAt(fieldVector, index, colorMode);
+      scalarValues[index] = normalizeScalarValueForShaderAttribute(
+        scalarAt(fieldVector, index, colorMode),
+        range,
+      );
     }
     if (colors.length > 0) {
-      const [red, green, blue] = colorAt(
-        fieldVector,
+      writeColorBufferRgb(
+        colors,
         index,
-        colorMode,
-        range,
-        colorPalette,
+        colorAt(fieldVector, index, colorMode, range, colorPalette),
+        colorMode === "orientation" ? "srgb" : "linear",
       );
-      const target = index * 3;
-      colors[target] = red;
-      colors[target + 1] = green;
-      colors[target + 2] = blue;
     }
   }
 }
 
+/**
+ * Writes one colour into a vertex/instance colour buffer.
+ *
+ * `scalarColorRgb()` already returns Linear-sRGB values for scalar palettes,
+ * while orientation colours and neutral sentinels are authored in sRGB. The
+ * input space must therefore be explicit: converting every input here would
+ * apply the sRGB EOTF twice to scalar palette values.
+ */
+function writeColorBufferRgb(
+  colors: Float32Array,
+  targetIndex: number,
+  rgb: readonly [number, number, number],
+  inputColorSpace: "linear" | "srgb",
+): void {
+  const target = targetIndex * 3;
+  if (inputColorSpace === "srgb") {
+    colors[target] = srgbToLinearChannel(rgb[0]);
+    colors[target + 1] = srgbToLinearChannel(rgb[1]);
+    colors[target + 2] = srgbToLinearChannel(rgb[2]);
+    return;
+  }
+  colors[target] = rgb[0];
+  colors[target + 1] = rgb[1];
+  colors[target + 2] = rgb[2];
+}
+
 function writeVectorValue(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   sourceIndex: number,
   targetValues: Float32Array,
   targetIndex: number,
@@ -1406,7 +1788,7 @@ function writeVectorValue(
 }
 
 function colorAt(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   pointIndex: number,
   colorMode: Viewport3DVectorColorMode,
   range: Viewport3DScalarColorRange,
@@ -1444,7 +1826,7 @@ function colorAt(
 }
 
 function scalarAt(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   pointIndex: number,
   colorMode: Viewport3DVectorColorMode,
 ): number {
@@ -1469,9 +1851,43 @@ function normalizeScalarValue(
   value: number,
   range: Viewport3DScalarColorRange,
 ): number {
-  if (!Number.isFinite(value)) return 0.5;
-  const span = Math.max(range.max - range.min, 1e-12);
+  if (
+    !range ||
+    !Number.isFinite(value) ||
+    !Number.isFinite(range.min) ||
+    !Number.isFinite(range.max)
+  ) {
+    return 0.5;
+  }
+  const scale = Math.max(Math.abs(range.max), Math.abs(range.min));
+  const span = range.max - range.min;
+  if (span <= 1e-6 * Math.max(scale, 1)) return 0.5;
   return Math.min(Math.max((value - range.min) / span, 0), 1);
+}
+
+/**
+ * S-07 — CPU-side (float64) normalization for the value written into the
+ * `scalarValues` GPU attribute, reusing the exact same precision-preserving
+ * formula already used for the CPU-rasterized `colors` output above (see
+ * normalizeScalarValue). Previously the RAW physical value (e.g. ~8e5 for a
+ * narrow exchange-field window) was downcast into a Float32Array unmodified,
+ * and normalization was deferred to the GPU fragment shader as
+ * `(v - fmScalarMin) / span` on two float32 numbers — a catastrophic
+ * cancellation when the interesting span is small relative to the absolute
+ * magnitude. Normalizing here instead, in full float64 precision, and
+ * shipping an already-clamped t in [0, 1] to the GPU eliminates that
+ * precision loss.
+ *
+ * NaN / overflow sentinels are deliberately passed through UNNORMALIZED so
+ * the fragment shader's existing per-vertex "bad value" detection
+ * (`!(v == v) || abs(v) > 3.0e38`) keeps working unchanged.
+ */
+function normalizeScalarValueForShaderAttribute(
+  value: number,
+  range: Viewport3DScalarColorRange,
+): number {
+  if (!Number.isFinite(value) || Math.abs(value) > 3.0e38) return value;
+  return normalizeScalarValue(value, range);
 }
 
 function shaderScalarModeSupports(mode: Viewport3DVectorColorMode): boolean {
@@ -1480,7 +1896,12 @@ function shaderScalarModeSupports(mode: Viewport3DVectorColorMode): boolean {
 
 function shaderVectorModeSupports(
   mode: Viewport3DVectorColorMode,
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
 ): boolean {
   return mode === "orientation" && fieldVector.nComp >= 3;
 }
+
+export const resolveScalarRangeChunkedForTests = resolveScalarRangeChunked;
+export const scalarRangeFromValuesForTests = scalarRangeFromValues;
+export const normalizeScalarValueFieldMappingForTests = normalizeScalarValue;
+export const normalizeScalarValueForShaderAttributeFieldMappingForTests = normalizeScalarValueForShaderAttribute;

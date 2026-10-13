@@ -18,13 +18,17 @@ use fullmag_engine::{
     dot, AdaptiveStepConfig, EffectiveFieldTerms, LlgConfig, MaterialParameters, TimeIntegrator,
     MU0,
 };
-use fullmag_ir::{ExecutionPrecision, FemObjectSegmentIR, FemPlanIR, IntegratorChoice, OutputIR};
+use fullmag_ir::{
+    ExecutionPrecision, FemObjectSegmentIR, FemPlanIR, IntegratorChoice, OutputIR,
+    StageCompletionIR,
+};
 
 use crate::antenna_fields::{
-    combined_antenna_field_at_time, compute_per_unit_antenna_fields, has_time_varying_antenna,
+    compute_per_unit_antenna_fields, dynamic_antenna_drive_terms, has_time_varying_antenna,
+    static_antenna_field, validate_antenna_zeeman_mask_lengths,
 };
 use crate::artifact_pipeline::{ArtifactPipelineSender, ArtifactRecorder};
-use crate::derived_fields::{compute_torque_field, max_torque_residual_apm_from_field};
+use crate::derived_fields::compute_torque_field;
 use crate::interactive_runtime::{display_is_global_scalar, display_refresh_due};
 use crate::preview::{
     build_mesh_preview_field_with_active_mask, build_mesh_scalar_preview_field_with_active_mask,
@@ -206,14 +210,17 @@ pub(crate) fn fem_energy_density_values(
             active_mask,
             quantity,
         )?,
-        "eden_dmi" => field_dot_energy_density(
-            &observables.magnetization,
-            &observables.dmi_field,
-            saturation_magnetisation,
-            -0.5,
-            active_mask,
-            quantity,
-        )?,
+        "eden_dmi" => {
+            let aggregate_dmi_field = aggregate_dmi_field(observables)?;
+            field_dot_energy_density(
+                &observables.magnetization,
+                &aggregate_dmi_field,
+                saturation_magnetisation,
+                -0.5,
+                active_mask,
+                quantity,
+            )?
+        }
         "eden_total" => {
             let mut total = vec![0.0; observables.magnetization.len()];
             for term in ["eden_ex", "eden_demag", "eden_ext", "eden_ani", "eden_dmi"] {
@@ -233,6 +240,36 @@ pub(crate) fn fem_energy_density_values(
         _ => return Ok(None),
     };
     Ok(Some(values))
+}
+
+fn aggregate_dmi_field(observables: &StateObservables) -> Result<Vec<[f64; 3]>, RunError> {
+    let node_count = observables.magnetization.len();
+    let mut aggregate = vec![[0.0, 0.0, 0.0]; node_count];
+    for (label, field) in [
+        ("conventional DMI", &observables.dmi_field),
+        ("rotated DMI", &observables.rotated_dmi_field),
+        ("bulk DMI", &observables.bulk_dmi_field),
+    ] {
+        if field.is_empty() {
+            continue;
+        }
+        if field.len() != node_count {
+            return Err(RunError {
+                message: format!(
+                    "FEM aggregate DMI field requires {} nodes for {}, got {}",
+                    node_count,
+                    label,
+                    field.len()
+                ),
+            });
+        }
+        for (target, source) in aggregate.iter_mut().zip(field) {
+            target[0] += source[0];
+            target[1] += source[1];
+            target[2] += source[2];
+        }
+    }
+    Ok(aggregate)
 }
 
 fn field_dot_energy_density(
@@ -292,6 +329,7 @@ pub(crate) fn build_problem_and_state(
     if !plan.mesh.periodic_node_pairs.is_empty()
         && (plan.enable_demag
             || plan.interfacial_dmi.is_some()
+            || plan.rotated_interfacial_dmi.is_some()
             || plan.bulk_dmi.is_some()
             || has_time_varying_antenna(plan))
     {
@@ -408,7 +446,8 @@ pub(crate) fn build_problem_and_state(
             return Err(RunError {
                 message: format!(
                     "Internal FEM baseline engine does not support the following interaction terms: {}; \
-                     supported: exchange, demag (poisson), zeeman, interfacial_dmi, bulk_dmi. \
+                     supported: exchange, demag (poisson), zeeman, interfacial_dmi, \
+                     rotated_interfacial_dmi, bulk_dmi. \
                      Use the native FEM GPU backend for these interactions.",
                     unsupported_terms.join(", ")
                 ),
@@ -416,12 +455,9 @@ pub(crate) fn build_problem_and_state(
         }
     }
 
+    validate_antenna_zeeman_mask_lengths(&plan.antenna_zeeman_masks, plan.mesh.nodes.len())?;
     let per_unit_fields = compute_per_unit_antenna_fields(plan)?;
-    let initial_antenna_field = if per_unit_fields.is_empty() {
-        None
-    } else {
-        Some(combined_antenna_field_at_time(plan, &per_unit_fields, 0.0))
-    };
+    let initial_antenna_field = static_antenna_field(plan, &per_unit_fields);
     let terms = EffectiveFieldTerms {
         exchange: plan.enable_exchange,
         demag: plan.enable_demag,
@@ -431,6 +467,7 @@ pub(crate) fn build_problem_and_state(
         uniaxial_anisotropy: None,
         cubic_anisotropy: None,
         interfacial_dmi: plan.interfacial_dmi,
+        rotated_interfacial_dmi: plan.rotated_interfacial_dmi,
         bulk_dmi: plan.bulk_dmi,
         zhang_li_stt: None,
         slonczewski_stt: None,
@@ -470,6 +507,11 @@ pub(crate) fn build_problem_and_state(
         }
         None => FemLlgProblem::with_terms(topology, material, dynamics, terms),
     };
+    problem
+        .set_dynamic_field_drives(dynamic_antenna_drive_terms(plan, &per_unit_fields))
+        .map_err(|error| RunError {
+            message: format!("configure FEM dynamic antenna field basis: {error}"),
+        })?;
     if let Some(normal) = plan.dmi_interface_normal {
         problem.set_dmi_interface_normal(normal);
     }
@@ -483,11 +525,18 @@ pub(crate) fn build_problem_and_state(
         .map_err(|e| RunError {
             message: format!("FEM reference semantics: {}", e),
         })?;
-    let state = problem
+    let mut state = problem
         .new_state(plan.initial_magnetization.clone())
         .map_err(|e| RunError {
             message: format!("State: {}", e),
         })?;
+    if let Some(frozen_spins) = plan.frozen_spins.as_ref() {
+        problem
+            .capture_frozen_spins_at_activation(frozen_spins, &mut state)
+            .map_err(|e| RunError {
+                message: format!("Frozen Spins activation: {}", e),
+            })?;
+    }
     Ok((problem, state))
 }
 
@@ -559,20 +608,31 @@ fn execute_reference_fem_impl(
         });
     }
 
-    let (mut problem, mut state) = build_problem_and_state(plan)?;
-    // Precompute per-unit-current Biot-Savart fields for time-varying updates.
-    let per_unit_antenna_fields = if has_time_varying_antenna(plan) {
-        compute_per_unit_antenna_fields(plan)?
-    } else {
-        vec![]
-    };
-    let has_time_varying = !per_unit_antenna_fields.is_empty();
-    // For the observation parameter we use the field already baked into the problem.
-    let antenna_field_at = |p: &FemLlgProblem, n: usize| -> Vec<[f64; 3]> {
-        p.terms
-            .per_node_field
+    let (problem, mut state) = build_problem_and_state(plan)?;
+    let per_unit_antenna_fields = compute_per_unit_antenna_fields(plan)?;
+    let dynamic_antenna_drives = dynamic_antenna_drive_terms(plan, &per_unit_antenna_fields);
+    let static_antenna_field = problem.terms.per_node_field.clone();
+    let antenna_node_count = state.magnetization().len();
+    // Observation payloads must expose the same time-dependent antenna field
+    // that the engine evaluates in the LLG RHS, without mutating the static
+    // field term owned by the problem.
+    let antenna_field_at = |time_seconds: f64| -> Vec<[f64; 3]> {
+        let n = antenna_node_count;
+        let mut field = static_antenna_field
             .clone()
-            .unwrap_or_else(|| vec![[0.0, 0.0, 0.0]; n])
+            .unwrap_or_else(|| vec![[0.0, 0.0, 0.0]; n]);
+        for drive in &dynamic_antenna_drives {
+            let multiplier = drive.multiplier_at(time_seconds);
+            if multiplier == 0.0 {
+                continue;
+            }
+            for (node, basis) in drive.basis_field.iter().enumerate().take(n) {
+                field[node][0] += basis[0] * multiplier;
+                field[node][1] += basis[1] * multiplier;
+                field[node][2] += basis[2] * multiplier;
+            }
+        }
+        field
     };
     let initial_magnetization = state.magnetization().to_vec();
 
@@ -596,7 +656,7 @@ fn execute_reference_fem_impl(
     let default_scalar_trace = scalar_schedules.is_empty();
 
     if default_scalar_trace {
-        let ant = antenna_field_at(&problem, state.magnetization().len());
+        let ant = antenna_field_at(state.time_seconds);
         record_scalar_snapshot(
             &problem,
             &state,
@@ -610,7 +670,7 @@ fn execute_reference_fem_impl(
             &mut artifacts,
         )?;
     } else {
-        let ant = antenna_field_at(&problem, state.magnetization().len());
+        let ant = antenna_field_at(state.time_seconds);
         record_due_outputs(
             &problem,
             &state,
@@ -636,7 +696,7 @@ fn execute_reference_fem_impl(
     let mut cancelled = false;
     let mut paused = false;
     let mut current_observables = {
-        let ant = antenna_field_at(&problem, state.magnetization().len());
+        let ant = antenna_field_at(state.time_seconds);
         observe_state(&problem, &state, &ant)?
     };
     let mut current_stats = make_step_stats(
@@ -649,6 +709,7 @@ fn execute_reference_fem_impl(
         &plan.mesh_parts,
         &problem.topology.magnetic_node_volumes,
     );
+    apply_frozen_spin_step_telemetry(&mut current_stats, &problem, state.magnetization());
 
     let until_label = if until_seconds.is_finite() {
         format!("{until_seconds:.4e}")
@@ -673,8 +734,11 @@ fn execute_reference_fem_impl(
 
     let n_nodes = state.magnetization().len();
     let mut integrator_ws = FemIntegratorWorkspace::new(n_nodes);
+    let all_active_dofs_frozen = problem
+        .frozen_spins()
+        .is_some_and(fullmag_engine::FrozenSpinsState::all_active_dofs_frozen);
 
-    while state.time_seconds < until_seconds {
+    while state.time_seconds < until_seconds && !all_active_dofs_frozen {
         if let Some(live) = live.as_mut() {
             if let Some(display_selection) = live.display_selection.map(|get| get()) {
                 let preview_due = display_refresh_due(
@@ -707,6 +771,7 @@ fn execute_reference_fem_impl(
                     hysteresis_settle_step_kind: None,
                     hysteresis_settle_step_method: None,
                     scalar_row_due: preview_due && preview_targets_global_scalar,
+                    terminal_field_snapshot: false,
                     finished: false,
                 });
                 if preview_due {
@@ -727,14 +792,6 @@ fn execute_reference_fem_impl(
         }
 
         let dt_step = dt.min(until_seconds - state.time_seconds);
-        // Update antenna field for time-varying drives (e.g. sinusoidal RF).
-        if has_time_varying {
-            problem.terms.per_node_field = Some(combined_antenna_field_at_time(
-                plan,
-                &per_unit_antenna_fields,
-                state.time_seconds,
-            ));
-        }
         let wall_start = Instant::now();
         let report = problem
             .step_with_workspace(&mut state, dt_step, &mut integrator_ws)
@@ -746,22 +803,37 @@ fn execute_reference_fem_impl(
         if let Some(next) = report.suggested_next_dt {
             dt = next;
         }
-        let latest_stats = StepStats {
+        let rotated_dmi_energy =
+            rotated_dmi_energy_from_magnetization(&problem, state.magnetization());
+        let mut latest_stats = StepStats {
             step: step_count,
             time: report.time_seconds,
             dt: report.dt_used,
             e_ex: report.exchange_energy_joules,
             e_demag: report.demag_energy_joules,
             e_ext: report.external_energy_joules,
+            e_dmi: report.dmi_energy_joules,
             e_total: report.total_energy_joules,
             max_dm_dt: report.max_rhs_amplitude,
+            max_rhs_norm_per_s: report.max_rhs_amplitude,
+            max_rhs_all_norm_per_s: report.max_rhs_all_amplitude,
             max_h_eff: report.max_effective_field_amplitude,
             max_h_demag: report.max_demag_field_amplitude,
             max_torque_Apm: report.max_torque_Apm,
+            max_torque_all_Apm: report.max_torque_all_Apm,
             max_torque_T: report.max_torque_Apm * crate::MU0,
             wall_time_ns: wall_elapsed,
             ..StepStats::default()
         };
+        // `StepReport::dmi_energy_joules` is the aggregate conventional +
+        // rotated channel.  Keep the aggregate in `e_dmi` while exposing the
+        // rotated contribution separately so live/relaxation telemetry cannot
+        // silently report an rDMI run as zero-DMI.
+        latest_stats.set_dmi_energy_components(
+            report.dmi_energy_joules - rotated_dmi_energy,
+            0.0,
+            rotated_dmi_energy,
+        );
         current_stats = enrich_step_stats_from_magnetization(
             latest_stats.clone(),
             state.magnetization(),
@@ -769,10 +841,11 @@ fn execute_reference_fem_impl(
             &plan.mesh_parts,
             &problem.topology.magnetic_node_volumes,
         );
+        apply_frozen_spin_step_telemetry(&mut current_stats, &problem, state.magnetization());
         artifacts.record_solver_step(&current_stats);
 
         if !default_scalar_trace || !field_schedules.is_empty() {
-            let ant = antenna_field_at(&problem, state.magnetization().len());
+            let ant = antenna_field_at(state.time_seconds);
             let field_due_now = field_schedules
                 .iter()
                 .any(|schedule| is_due(state.time_seconds, schedule.next_time));
@@ -859,6 +932,7 @@ fn execute_reference_fem_impl(
                     hysteresis_settle_step_kind: None,
                     hysteresis_settle_step_method: None,
                     scalar_row_due: due_scalar_row,
+                    terminal_field_snapshot: false,
                     finished: false,
                 });
                 if preview_due {
@@ -898,7 +972,7 @@ fn execute_reference_fem_impl(
             let preview_field = if preview_due && !preview_targets_global_scalar {
                 let selection = display_selection.as_ref().expect("checked preview_due");
                 let request = selection.preview_request();
-                let ant = antenna_field_at(&problem, state.magnetization().len());
+                let ant = antenna_field_at(state.time_seconds);
                 let observables = observe_state(&problem, &state, &ant)?;
                 current_observables = observables.clone();
                 Some(build_mesh_preview_field_with_active_mask(
@@ -935,6 +1009,7 @@ fn execute_reference_fem_impl(
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: due_scalar_row,
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -1003,6 +1078,77 @@ fn execute_reference_fem_impl(
             break;
         }
     }
+    if all_active_dofs_frozen
+        && plan.relaxation.is_none()
+        && !paused
+        && !cancelled
+        && until_seconds.is_finite()
+    {
+        // A fully constrained time-evolution stage is an analytical
+        // constant-state advance.  Do not invoke any RHS/integrator kernels.
+        // Output schedules still have to be materialized at their requested
+        // simulated times, including time-dependent antenna fields.  The
+        // magnetization remains bitwise constant; only the observation clock
+        // and the time-dependent external terms move forward.
+        if !scalar_schedules.is_empty() || !field_schedules.is_empty() {
+            state.time_seconds = 0.0;
+            // The initial scalar row may already have been emitted above.
+            // Calling the common scheduler here is idempotent for scalar
+            // schedules and additionally emits field/snapshot outputs at t=0
+            // when no scalar schedule was requested.
+            let ant = antenna_field_at(state.time_seconds);
+            record_due_outputs(
+                &problem,
+                &state,
+                &ant,
+                &plan.object_segments,
+                &plan.mesh_parts,
+                0,
+                0.0,
+                0,
+                &mut scalar_schedules,
+                &mut field_schedules,
+                &mut steps,
+                &mut artifacts,
+                None,
+                None,
+            )?;
+
+            loop {
+                let next_time = scalar_schedules
+                    .iter()
+                    .chain(field_schedules.iter())
+                    .map(|schedule| schedule.next_time)
+                    .filter(|time| time.is_finite() && *time > state.time_seconds)
+                    .min_by(f64::total_cmp);
+                let Some(next_time) = next_time else {
+                    break;
+                };
+                if next_time > until_seconds && !same_time(next_time, until_seconds) {
+                    break;
+                }
+                state.time_seconds = next_time.min(until_seconds);
+                let ant = antenna_field_at(state.time_seconds);
+                record_due_outputs(
+                    &problem,
+                    &state,
+                    &ant,
+                    &plan.object_segments,
+                    &plan.mesh_parts,
+                    0,
+                    0.0,
+                    0,
+                    &mut scalar_schedules,
+                    &mut field_schedules,
+                    &mut steps,
+                    &mut artifacts,
+                    None,
+                    None,
+                )?;
+            }
+        }
+        state.time_seconds = until_seconds;
+    }
     if !cancelled {
         let until_label = if until_seconds.is_finite() {
             format!("{until_seconds:.4e}")
@@ -1018,7 +1164,7 @@ fn execute_reference_fem_impl(
         );
     }
 
-    let final_ant = antenna_field_at(&problem, state.magnetization().len());
+    let final_ant = antenna_field_at(state.time_seconds);
     record_final_outputs(
         &problem,
         &state,
@@ -1042,18 +1188,37 @@ fn execute_reference_fem_impl(
     } else {
         RunStatus::Completed
     };
-    let completion = crate::relaxation::resolve_stage_completion(
-        status,
-        plan.relaxation.as_ref(),
-        crate::relaxation::RelaxationCompletionMetrics {
-            max_torque_apm: Some(current_stats.max_torque_Apm),
-            torque_confirmed: torque_confirmation.confirmed(),
-            accepted_energy_plateau_range_j: energy_plateau.range(),
-            steps: step_count,
-            relaxation_time_s: Some(state.time_seconds),
-            numerical_stagnation: false,
-        },
-    );
+    let completion = if all_active_dofs_frozen {
+        StageCompletionIR {
+            status: "completed".to_string(),
+            converged: true,
+            reason: None,
+            metric: None,
+            metric_name: Some(
+                if plan.relaxation.is_some() {
+                    "all_active_dofs_frozen_relaxation"
+                } else {
+                    "all_active_dofs_frozen_time_advance"
+                }
+                .to_string(),
+            ),
+            metric_value: Some(0.0),
+            threshold: None,
+        }
+    } else {
+        crate::relaxation::resolve_stage_completion(
+            status,
+            plan.relaxation.as_ref(),
+            crate::relaxation::RelaxationCompletionMetrics {
+                max_torque_apm: Some(current_stats.max_torque_Apm),
+                torque_confirmed: torque_confirmation.confirmed(),
+                accepted_energy_plateau_range_j: energy_plateau.range(),
+                steps: step_count,
+                relaxation_time_s: Some(state.time_seconds),
+                numerical_stagnation: false,
+            },
+        )
+    };
 
     Ok(ExecutedRun {
         result: RunResult {
@@ -1119,7 +1284,7 @@ fn record_due_outputs(
     };
 
     if scalar_due {
-        let stats = make_step_stats(
+        let mut stats = make_step_stats(
             step,
             state.time_seconds,
             solver_dt,
@@ -1129,6 +1294,7 @@ fn record_due_outputs(
             mesh_parts,
             &problem.topology.magnetic_node_volumes,
         );
+        apply_frozen_spin_step_telemetry(&mut stats, problem, state.magnetization());
         artifacts.record_scalar(&stats)?;
         steps.push(stats);
         advance_due_schedules(scalar_schedules, state.time_seconds);
@@ -1168,7 +1334,7 @@ fn record_scalar_snapshot(
     artifacts: &mut ArtifactRecorder,
 ) -> Result<(), RunError> {
     let observables = observe_state(problem, state, antenna_field)?;
-    let stats = make_step_stats(
+    let mut stats = make_step_stats(
         step,
         state.time_seconds,
         solver_dt,
@@ -1178,6 +1344,7 @@ fn record_scalar_snapshot(
         mesh_parts,
         &problem.topology.magnetic_node_volumes,
     );
+    apply_frozen_spin_step_telemetry(&mut stats, problem, state.magnetization());
     artifacts.record_scalar(&stats)?;
     steps.push(stats);
     Ok(())
@@ -1220,7 +1387,13 @@ fn record_final_outputs(
     }
 
     if need_scalar && missing_field_names.is_empty() {
-        if let Some(stats) = fallback_scalar_stats {
+        // A fallback is valid only when it describes the same physical time.
+        // In particular, all-frozen dynamics analytically advances the clock
+        // without an integrator step, so the initial t=0 row must not be
+        // replayed as the final t=end scalar sample.
+        if let Some(stats) =
+            fallback_scalar_stats.filter(|stats| same_time(stats.time, state.time_seconds))
+        {
             artifacts.record_scalar(stats)?;
             steps.push(stats.clone());
             return Ok(());
@@ -1229,7 +1402,7 @@ fn record_final_outputs(
 
     let observables = observe_state(problem, state, antenna_field)?;
     if need_scalar {
-        let stats = make_step_stats(
+        let mut stats = make_step_stats(
             step,
             state.time_seconds,
             solver_dt,
@@ -1239,6 +1412,7 @@ fn record_final_outputs(
             mesh_parts,
             &problem.topology.magnetic_node_volumes,
         );
+        apply_frozen_spin_step_telemetry(&mut stats, problem, state.magnetization());
         artifacts.record_scalar(&stats)?;
         steps.push(stats);
     }
@@ -1278,6 +1452,29 @@ fn enrich_step_stats_from_magnetization(
     stats
 }
 
+fn apply_frozen_spin_step_telemetry(
+    stats: &mut StepStats,
+    problem: &FemLlgProblem,
+    magnetization: &[[f64; 3]],
+) {
+    let active_dof_count = problem
+        .topology
+        .magnetic_node_volumes
+        .iter()
+        .filter(|volume| **volume > 0.0)
+        .count();
+    stats.active_dof_count = active_dof_count as u64;
+    if let Some(frozen) = problem.frozen_spins() {
+        stats.frozen_dof_count = frozen.frozen_dof_count() as u64;
+        stats.free_dof_count = frozen.free_dof_count() as u64;
+        stats.frozen_reference_max_drift = frozen.max_reference_drift(magnetization);
+    } else {
+        stats.free_dof_count = active_dof_count as u64;
+        stats.max_rhs_all_norm_per_s = stats.max_rhs_norm_per_s;
+        stats.max_torque_all_Apm = stats.max_torque_Apm;
+    }
+}
+
 pub(crate) fn observe_state(
     problem: &FemLlgProblem,
     state: &FemLlgState,
@@ -1292,11 +1489,50 @@ pub(crate) fn observe_state(
         problem.material.damping,
         problem.dynamics.precession_enabled,
     );
-    let max_torque_apm = max_torque_residual_apm_from_field(
-        &observables.magnetization,
-        &observables.effective_field,
-    );
-
+    let has_rotated_dmi = problem
+        .terms
+        .rotated_interfacial_dmi
+        .is_some_and(|d| d != 0.0);
+    let has_bulk_dmi = problem.terms.bulk_dmi.is_some_and(|d| d != 0.0);
+    let rotated_dmi_field = if has_rotated_dmi {
+        problem.rotated_interfacial_dmi_field_from_vectors(&observables.magnetization)
+    } else {
+        Vec::new()
+    };
+    let bulk_dmi_field = if has_bulk_dmi {
+        problem.bulk_dmi_field_from_vectors(&observables.magnetization)
+    } else {
+        Vec::new()
+    };
+    let rotated_dmi_energy =
+        rotated_dmi_energy_from_magnetization(problem, &observables.magnetization);
+    // `FemLlgProblem::observe` returns the aggregate interfacial + rotated +
+    // bulk DMI field. Remove each independently materialized component so
+    // `H_dmi`, `H_rotated_dmi`, and `H_dmi_bulk` remain disjoint observables.
+    let conventional_dmi_field = if has_rotated_dmi || has_bulk_dmi {
+        observables
+            .dmi_field
+            .iter()
+            .enumerate()
+            .map(|(index, total)| {
+                let rotated = rotated_dmi_field
+                    .get(index)
+                    .copied()
+                    .unwrap_or([0.0, 0.0, 0.0]);
+                let bulk = bulk_dmi_field
+                    .get(index)
+                    .copied()
+                    .unwrap_or([0.0, 0.0, 0.0]);
+                [
+                    total[0] - rotated[0] - bulk[0],
+                    total[1] - rotated[1] - bulk[1],
+                    total[2] - rotated[2] - bulk[2],
+                ]
+            })
+            .collect()
+    } else {
+        observables.dmi_field
+    };
     Ok(StateObservables {
         magnetization: observables.magnetization,
         torque_field,
@@ -1307,10 +1543,11 @@ pub(crate) fn observe_state(
         drive_field: vec![[0.0, 0.0, 0.0]; observables.effective_field.len()],
         effective_field: observables.effective_field,
         anisotropy_field: Vec::new(),
-        dmi_field: Vec::new(),
+        dmi_field: conventional_dmi_field,
+        rotated_dmi_field,
         magnetoelastic_field: Vec::new(),
         cubic_anisotropy_field: Vec::new(),
-        bulk_dmi_field: Vec::new(),
+        bulk_dmi_field,
         oersted_field: Vec::new(),
         thermal_field: Vec::new(),
         exchange_energy: observables.exchange_energy_joules,
@@ -1318,16 +1555,41 @@ pub(crate) fn observe_state(
         external_energy: observables.external_energy_joules,
         drive_energy: 0.0,
         anisotropy_energy: 0.0,
-        dmi_energy: 0.0,
+        dmi_energy: observables.dmi_energy_joules - rotated_dmi_energy,
+        rotated_dmi_energy,
         total_energy: observables.total_energy_joules,
         max_dm_dt: observables.max_rhs_amplitude,
         max_rhs_all_norm_per_s: observables.max_rhs_all_amplitude,
         max_h_eff: observables.max_effective_field_amplitude,
         max_h_demag: observables.max_demag_field_amplitude,
-        max_torque_Apm: max_torque_apm,
+        // `FemLlgProblem::observe` already separates free and all-node
+        // metrics when Frozen Spins are active.  Recomputing torque here
+        // would reintroduce frozen nodes into the public free metric.
+        max_torque_Apm: observables.max_torque_Apm,
         max_torque_all_Apm: observables.max_torque_all_Apm,
         per_object_scalars: std::collections::HashMap::new(),
     })
+}
+
+/// Return the independently materialized rotated-interfacial DMI energy.
+///
+/// `StepReport` and the engine's aggregate observables intentionally expose
+/// one DMI energy channel.  Consumers that publish component telemetry must
+/// derive the rotated part with the same active-term semantics used by
+/// `observe_state`; in particular, an authored zero coefficient is a no-op.
+fn rotated_dmi_energy_from_magnetization(
+    problem: &FemLlgProblem,
+    magnetization: &[[f64; 3]],
+) -> f64 {
+    if problem
+        .terms
+        .rotated_interfacial_dmi
+        .is_some_and(|d| d != 0.0)
+    {
+        problem.rotated_interfacial_dmi_energy_from_vectors(magnetization)
+    } else {
+        0.0
+    }
 }
 
 fn make_step_stats(
@@ -1351,9 +1613,12 @@ fn make_step_stats(
         e_dmi: observables.dmi_energy,
         e_total: observables.total_energy,
         max_dm_dt: observables.max_dm_dt,
+        max_rhs_norm_per_s: observables.max_dm_dt,
+        max_rhs_all_norm_per_s: observables.max_rhs_all_norm_per_s,
         max_h_eff: observables.max_h_eff,
         max_h_demag: observables.max_h_demag,
         max_torque_Apm: observables.max_torque_Apm,
+        max_torque_all_Apm: observables.max_torque_all_Apm,
         max_torque_T: observables.max_torque_Apm * crate::MU0,
         wall_time_ns,
         ..StepStats::default()
@@ -1363,6 +1628,7 @@ fn make_step_stats(
         &observables.magnetization,
         magnetic_node_volumes,
     );
+    stats.set_dmi_energy_components(observables.dmi_energy, 0.0, observables.rotated_dmi_energy);
     stats.per_object_scalars = fem_per_object_scalars(
         object_segments,
         mesh_parts,
@@ -1599,10 +1865,92 @@ fn select_base_field(
 mod tests {
     use super::*;
     use fullmag_ir::{
-        AirBoxConfigIR, ExchangeBoundaryCondition, ExecutionPrecision, FemMeshPartIR,
-        FemMeshPartRole, FemMeshPartSelector, FemObjectSegmentIR, FemPlanIR, IntegratorChoice,
+        AdaptiveTimeStepIR, AdaptiveToleranceModeIR, AirBoxConfigIR,
+        AntennaFieldSourceModelIR, CurrentModuleIR, DriveActivationIR,
+        ExchangeBoundaryCondition, ExecutionPrecision, FemMeshPartIR, FemMeshPartRole,
+        FemMeshPartSelector, FemObjectSegmentIR, FemPlanIR, FieldTimeOriginIR, IntegratorChoice,
         MaterialIR, MeshIR, RelaxationAlgorithmIR, RelaxationControlIR,
+        ResolvedAntennaZeemanMaskIR, ResolvedFrozenSpinsPlanIR,
+        ResolvedSolvedAntennaDriveBasisIR, RfDriveIR, SelectionAuthoredFingerprintIR,
+        SelectionCertificateIR, SolvedAntennaDriveIR, TimeDependenceIR,
+        RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION, SELECTION_CERTIFICATE_SCHEMA_VERSION,
     };
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn reference_antenna_drive_maps_stage_clock_to_waveform_origin() {
+        let mut plan = make_test_plan(false);
+        plan.time_stage.start_time_s = 10.0;
+        plan.time_stage.active_stage_id = Some("run".into());
+        let make_basis = |id: &str, time_origin| ResolvedSolvedAntennaDriveBasisIR {
+            drive: SolvedAntennaDriveIR {
+                id: id.into(),
+                name: id.into(),
+                projection_ref: "projection".into(),
+                port_mode_id: "common".into(),
+                peak_current_a: 0.25,
+                waveform: TimeDependenceIR::Sinusoidal {
+                    frequency_hz: 0.25,
+                    phase_rad: 0.3,
+                    offset: 0.1,
+                },
+                bandwidth_declaration: None,
+                time_origin,
+                activation: DriveActivationIR::StageIds {
+                    stage_ids: vec!["run".into()],
+                },
+            },
+            solution_id: "solution".into(),
+            source_object_id: "antenna".into(),
+            field_xyz_apm_per_a: vec![[4.0, 0.0, 0.0]; 4],
+            projection_signature: "verified".into(),
+        };
+        plan.solved_antenna_drive_bases = vec![
+            make_basis("local", FieldTimeOriginIR::StageLocal),
+            make_basis("absolute", FieldTimeOriginIR::Absolute),
+        ];
+
+        let terms = dynamic_antenna_drive_terms(&plan, &[]);
+        let expected_local = 0.3_f64.cos() + 0.1;
+        let expected_absolute = -0.3_f64.cos() + 0.1;
+        assert_eq!(terms.len(), 2);
+        assert_eq!(terms[0].basis_field[0], [1.0, 0.0, 0.0]);
+        assert!((terms[0].multiplier_at(1.0) - expected_local).abs() < 1.0e-12);
+        assert!((terms[1].multiplier_at(1.0) - expected_absolute).abs() < 1.0e-12);
+
+        let absolute_waveform = plan.solved_antenna_drive_bases[1].drive.waveform.clone();
+        plan.antenna_zeeman_masks = vec![ResolvedAntennaZeemanMaskIR {
+            source: "prescribed".into(),
+            object: "magnet".into(),
+            amplitude_b_t: 0.0,
+            direction: [1.0, 0.0, 0.0],
+            spatial_profile: None,
+            waveform: Some(absolute_waveform.clone()),
+            field_xyz: vec![[2.0, 0.0, 0.0]; 4],
+        }];
+        plan.current_modules = vec![CurrentModuleIR::AntennaFieldSource {
+            name: "legacy".into(),
+            model: AntennaFieldSourceModelIR::Mqs2p5dAz,
+            solver: None,
+            antenna: None,
+            drive: Some(RfDriveIR {
+                current_a: 2.0,
+                waveform: Some(absolute_waveform),
+            }),
+            air_box_factor: None,
+            object: None,
+            field: None,
+            spatial_profile: None,
+            waveform: None,
+        }];
+        let per_unit_fields = vec![vec![[3.0, 0.0, 0.0]; 4]];
+        let terms = dynamic_antenna_drive_terms(&plan, &per_unit_fields);
+        assert_eq!(terms.len(), 4);
+        assert_eq!(terms[0].basis_field[0], [2.0, 0.0, 0.0]);
+        assert_eq!(terms[3].basis_field[0], [6.0, 0.0, 0.0]);
+        assert!((terms[0].multiplier_at(1.0) - expected_absolute).abs() < 1.0e-12);
+        assert!((terms[3].multiplier_at(1.0) - expected_absolute).abs() < 1.0e-12);
+    }
 
     fn make_test_plan(enable_demag: bool) -> FemPlanIR {
         FemPlanIR {
@@ -1667,10 +2015,12 @@ mod tests {
             enable_demag,
             external_field: None,
             antenna_zeeman_masks: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
             field_drives: Vec::new(),
             field_drive_geometry_masks: Vec::new(),
             time_stage: Default::default(),
             current_modules: vec![],
+            charge_transport_plans: vec![],
             spin_transport_plans: vec![],
             gyromagnetic_ratio: 2.211e5,
             precision: ExecutionPrecision::Double,
@@ -1683,6 +2033,7 @@ mod tests {
             demag_realization: None,
             air_box_config: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             dind_field: None,
             dbulk_field: None,
@@ -1717,6 +2068,216 @@ mod tests {
             mfem_device_string: None,
             dmi_interface_normal: None,
             use_consistent_mass: None,
+        }
+    }
+
+    fn resolved_frozen_spins(mask: Vec<bool>) -> ResolvedFrozenSpinsPlanIR {
+        let active_dof_count = mask.len() as u64;
+        let frozen_dof_count = mask.iter().filter(|frozen| **frozen).count() as u64;
+        let free_dof_count = active_dof_count - frozen_dof_count;
+        let mut hash = Sha256::new();
+        hash.update((mask.len() as u64).to_le_bytes());
+        hash.update(
+            mask.iter()
+                .map(|frozen| u8::from(*frozen))
+                .collect::<Vec<_>>(),
+        );
+        let mask_sha256 = format!("{:x}", hash.finalize());
+        ResolvedFrozenSpinsPlanIR {
+            schema_version: RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION.to_string(),
+            constraint_ids: vec!["reference-test-pin".to_string()],
+            frozen_mask: mask,
+            active_dof_count,
+            frozen_dof_count,
+            free_dof_count,
+            mask_sha256: mask_sha256.clone(),
+            grid_or_mesh_fingerprint: "sha256:reference-test-mesh".to_string(),
+            source_state_revision: Some(1),
+            all_active_dofs_frozen: free_dof_count == 0,
+            certificate: SelectionCertificateIR {
+                schema_version: SELECTION_CERTIFICATE_SCHEMA_VERSION.to_string(),
+                evaluator_id: "selection.fem_true_dof.v1".to_string(),
+                constraint_ids: vec!["reference-test-pin".to_string()],
+                authored_fingerprints: vec![SelectionAuthoredFingerprintIR {
+                    constraint_id: "reference-test-pin".to_string(),
+                    selector_sha256: "a".repeat(64),
+                }],
+                raw_candidate_dof_count: frozen_dof_count,
+                inactive_candidate_dof_count: 0,
+                active_dof_count,
+                frozen_dof_count,
+                free_dof_count,
+                bounds_m: None,
+                grid_or_mesh_fingerprint: "sha256:reference-test-mesh".to_string(),
+                source_state_revision: Some(1),
+                mask_sha256,
+                resolved_reference_sha256: "b".repeat(64),
+                warnings: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn reference_runner_enforces_frozen_spins_across_fem_integrator_step() {
+        let mut plan = make_test_plan(false);
+        plan.external_field = Some([0.0, 0.0, 1.0e6]);
+        plan.initial_magnetization = vec![
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ];
+        plan.frozen_spins = Some(resolved_frozen_spins(vec![true, false, false, false]));
+
+        let (problem, initial_state) =
+            build_problem_and_state(&plan).expect("FEM reference Frozen Spins activation");
+        let frozen_reference = initial_state.magnetization()[0];
+        assert_eq!(
+            problem
+                .frozen_spins()
+                .expect("activated Frozen Spins state")
+                .frozen_dof_count(),
+            1
+        );
+
+        let result = execute_reference_fem(&plan, 1.0e-13, &[], None, None)
+            .expect("FEM reference Frozen Spins run");
+        assert_eq!(result.result.final_magnetization[0], frozen_reference);
+        assert_ne!(
+            result.result.final_magnetization[1], plan.initial_magnetization[1],
+            "free FEM DOF should still respond to the external field"
+        );
+        let step = result
+            .result
+            .steps
+            .last()
+            .expect("reference run emits a step");
+        assert_eq!(step.frozen_dof_count, 1);
+        assert_eq!(step.frozen_reference_max_drift, 0.0);
+    }
+
+    #[test]
+    fn reference_runner_all_frozen_dynamics_advances_clock_and_emits_final_time() {
+        let mut plan = make_test_plan(false);
+        plan.external_field = Some([0.0, 0.0, 1.0e6]);
+        let initial = plan.initial_magnetization.clone();
+        plan.frozen_spins = Some(resolved_frozen_spins(vec![true; 4]));
+
+        let result = execute_reference_fem(&plan, 2.0e-13, &[], None, None)
+            .expect("all-frozen FEM reference run");
+        assert_eq!(result.result.final_magnetization, initial);
+        assert_eq!(result.result.status, RunStatus::Completed);
+        assert_eq!(
+            result
+                .result
+                .completion
+                .as_ref()
+                .and_then(|c| c.metric_name.as_deref()),
+            Some("all_active_dofs_frozen_time_advance")
+        );
+        let final_step = result
+            .result
+            .steps
+            .last()
+            .expect("all-frozen run emits final scalar row");
+        assert_eq!(final_step.time, 2.0e-13);
+        assert_eq!(final_step.step, 0);
+        assert_eq!(final_step.active_dof_count, 4);
+        assert_eq!(final_step.frozen_dof_count, 4);
+        assert_eq!(final_step.free_dof_count, 0);
+        assert_eq!(final_step.frozen_reference_max_drift, 0.0);
+    }
+
+    #[test]
+    fn all_frozen_time_advance_materializes_intermediate_output_schedules() {
+        let mut plan = make_test_plan(false);
+        plan.external_field = Some([0.0, 0.0, 1.0e6]);
+        let initial = plan.initial_magnetization.clone();
+        plan.frozen_spins = Some(resolved_frozen_spins(vec![true; 4]));
+        let outputs = vec![
+            OutputIR::Scalar {
+                name: "time".to_string(),
+                every_seconds: 1.0e-13,
+            },
+            OutputIR::Field {
+                name: "m".to_string(),
+                every_seconds: 1.0e-13,
+            },
+        ];
+
+        let result = execute_reference_fem(&plan, 3.0e-13, &outputs, None, None)
+            .expect("all-frozen scheduled FEM run");
+        let expected_times = [0.0, 1.0e-13, 2.0e-13, 3.0e-13];
+        assert_eq!(result.result.steps.len(), expected_times.len());
+        for (step, expected) in result.result.steps.iter().zip(expected_times) {
+            assert!((step.time - expected).abs() <= 1.0e-24, "{step:?}");
+            assert_eq!(
+                step.step, 0,
+                "analytical advance must not invent solver steps"
+            );
+            assert_eq!(step.frozen_reference_max_drift, 0.0);
+        }
+        let snapshots = result
+            .field_snapshots
+            .iter()
+            .filter(|snapshot| snapshot.name == "m")
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), expected_times.len());
+        for (snapshot, expected) in snapshots.iter().zip(expected_times) {
+            assert!((snapshot.time - expected).abs() <= 1.0e-24);
+            assert_eq!(snapshot.step, 0);
+            assert_eq!(snapshot.values.len(), initial.len() * 3);
+        }
+        assert_eq!(result.result.final_magnetization, initial);
+    }
+
+    #[test]
+    fn fem_frozen_spins_hard_restore_covers_all_reference_integrators() {
+        for integrator in [
+            IntegratorChoice::Heun,
+            IntegratorChoice::Rk4,
+            IntegratorChoice::Rk23,
+            IntegratorChoice::Rk45,
+            IntegratorChoice::Abm3,
+        ] {
+            let mut plan = make_test_plan(false);
+            plan.external_field = Some([0.0, 0.0, 1.0e6]);
+            plan.initial_magnetization = vec![
+                [0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+            ];
+            plan.integrator = Some(integrator);
+            if matches!(integrator, IntegratorChoice::Rk23 | IntegratorChoice::Rk45) {
+                plan.adaptive_timestep = Some(AdaptiveTimeStepIR {
+                    tolerance_mode: AdaptiveToleranceModeIR::Advanced,
+                    atol: 1.0e12,
+                    rtol: 0.0,
+                    dt_initial: Some(1.0e-13),
+                    dt_min: 1.0e-15,
+                    dt_max: Some(1.0e-12),
+                    safety: 0.9,
+                    growth_limit: 2.0,
+                    shrink_limit: 0.2,
+                    max_spin_rotation: None,
+                    norm_tolerance: None,
+                });
+            }
+            plan.frozen_spins = Some(resolved_frozen_spins(vec![true, false, false, false]));
+            let (problem, mut state) =
+                build_problem_and_state(&plan).expect("integrator Frozen Spins activation");
+            let frozen_reference = state.magnetization()[0];
+            let mut workspace = FemIntegratorWorkspace::new(state.magnetization().len());
+            problem
+                .step_with_workspace(&mut state, 1.0e-13, &mut workspace)
+                .unwrap_or_else(|error| panic!("{integrator:?} step failed: {error}"));
+            assert_eq!(state.magnetization()[0], frozen_reference, "{integrator:?}");
+            assert_ne!(
+                state.magnetization()[1],
+                plan.initial_magnetization[1],
+                "{integrator:?}"
+            );
         }
     }
 
@@ -1853,10 +2414,12 @@ mod tests {
             enable_demag: true,
             external_field: None,
             antenna_zeeman_masks: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
             field_drives: Vec::new(),
             field_drive_geometry_masks: Vec::new(),
             time_stage: Default::default(),
             current_modules: vec![],
+            charge_transport_plans: vec![],
             spin_transport_plans: vec![],
             gyromagnetic_ratio: 2.211e5,
             precision: ExecutionPrecision::Double,
@@ -1869,6 +2432,7 @@ mod tests {
             demag_realization: None,
             air_box_config: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             dind_field: None,
             dbulk_field: None,
@@ -2045,10 +2609,12 @@ mod tests {
             enable_demag: true,
             external_field: None,
             antenna_zeeman_masks: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
             field_drives: Vec::new(),
             field_drive_geometry_masks: Vec::new(),
             time_stage: Default::default(),
             current_modules: vec![],
+            charge_transport_plans: vec![],
             spin_transport_plans: vec![],
             gyromagnetic_ratio: 2.211e5,
             precision: ExecutionPrecision::Double,
@@ -2071,6 +2637,7 @@ mod tests {
                 boundary_marker_source: None,
             }),
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             dind_field: None,
             dbulk_field: None,
@@ -2156,6 +2723,131 @@ mod tests {
             "DMI terms should contribute to H_eff, got {}",
             last.max_h_eff
         );
+
+        let (problem, state) = build_problem_and_state(&plan)
+            .expect("FEM DMI problem should build for observable separation");
+        let observables =
+            observe_state(&problem, &state, &[]).expect("FEM DMI observables should be separable");
+        assert!(
+            observables
+                .dmi_field
+                .iter()
+                .flatten()
+                .any(|value| value.abs() > 0.0),
+            "interfacial DMI field should remain in H_dmi"
+        );
+        assert!(
+            observables
+                .bulk_dmi_field
+                .iter()
+                .flatten()
+                .any(|value| value.abs() > 0.0),
+            "bulk DMI field should be exposed separately as H_dmi_bulk"
+        );
+    }
+
+    #[test]
+    fn rotated_dmi_is_forwarded_to_fem_observable_adapter() {
+        let mut plan = make_test_plan(false);
+        plan.enable_exchange = false;
+        plan.rotated_interfacial_dmi = Some(3e-3);
+        plan.initial_magnetization = vec![
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ];
+
+        let magnetization = plan.initial_magnetization.clone();
+        let observables = fem_observables_for_magnetization(&plan, &magnetization)
+            .expect("rotated DMI should be supported by the FEM reference observable adapter");
+
+        assert_eq!(observables.dmi_field.len(), plan.mesh.nodes.len());
+        assert!(
+            observables
+                .dmi_field
+                .iter()
+                .flatten()
+                .any(|component| component.abs() > 0.0),
+            "rotated DMI must contribute to the aggregate FEM DMI field"
+        );
+        assert!(
+            observables.max_effective_field_amplitude > 0.0,
+            "rotated DMI must contribute to FEM H_eff"
+        );
+    }
+
+    #[test]
+    fn reference_live_step_stats_preserve_rotated_dmi_energy_component() {
+        let mut plan = make_test_plan(false);
+        plan.enable_exchange = false;
+        plan.rotated_interfacial_dmi = Some(3e-3);
+        plan.initial_magnetization = vec![
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ];
+
+        let result = execute_reference_fem(&plan, 1e-13, &[], None, None)
+            .expect("reference FEM rotated-DMI run should succeed");
+        let step = result
+            .result
+            .steps
+            .last()
+            .expect("rotated-DMI run must publish a step");
+
+        assert!(
+            step.e_rotated_dmi.abs() > 0.0,
+            "live step telemetry must expose the rotated DMI energy"
+        );
+        assert!(
+            (step.e_dmi - step.e_rotated_dmi).abs() < 1e-30,
+            "with only rotated DMI active, aggregate and rotated energies must agree"
+        );
+    }
+
+    #[test]
+    fn reference_rotated_dmi_energy_treats_any_exact_nonzero_coefficient_as_active() {
+        let mut plan = make_test_plan(false);
+        plan.enable_exchange = false;
+        plan.rotated_interfacial_dmi = Some(1.0e-31);
+        plan.initial_magnetization = vec![
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ];
+
+        let magnetization = plan.initial_magnetization.clone();
+        let (problem, _) = build_problem_and_state(&plan)
+            .expect("tiny nonzero rotated DMI should build in the FEM reference path");
+        let energy = rotated_dmi_energy_from_magnetization(&problem, &magnetization);
+
+        assert_ne!(
+            energy, 0.0,
+            "FEM telemetry must not silently drop a finite nonzero rotated-DMI coefficient"
+        );
+    }
+
+    #[test]
+    fn equilibrium_identity_rejects_rotated_dmi_source_plans() {
+        let mut plan = make_test_plan(false);
+        crate::fem::equilibrium_identity::EquilibriumIdentitySignaturesV1::from_relax_plan(
+            &plan,
+        )
+        .expect("the baseline exchange/demag plan must have a supported identity");
+        plan.rotated_interfacial_dmi = Some(3e-3);
+
+        let error =
+            crate::fem::equilibrium_identity::EquilibriumIdentitySignaturesV1::from_relax_plan(
+                &plan,
+            )
+            .expect_err("an equilibrium identity must not omit rotated-DMI physics");
+        assert!(error
+            .message
+            .contains("equilibrium_identity_scope_unsupported"));
+        assert!(error.message.contains("DMI physics outside the certified"));
     }
 
     #[test]
@@ -2222,6 +2914,35 @@ mod tests {
                 .iter()
                 .any(|value| value.abs() > 0.0),
             "expected FEM eden_total preview to contain nonzero scalar values"
+        );
+    }
+
+    #[test]
+    fn fem_snapshot_eden_dmi_includes_rotated_interfacial_component() {
+        let mut plan = make_test_plan(false);
+        plan.enable_exchange = false;
+        plan.rotated_interfacial_dmi = Some(3e-3);
+        plan.initial_magnetization = vec![
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ];
+
+        let fields =
+            snapshot_vector_fields(&plan, &["eden_dmi"], &crate::LivePreviewRequest::default())
+                .expect("FEM rotated-DMI energy-density preview should succeed");
+        let dmi = fields
+            .iter()
+            .find(|field| field.quantity == "eden_dmi")
+            .expect("eden_dmi preview should be present");
+        assert_eq!(dmi.spatial_kind, "mesh");
+        assert_eq!(dmi.vector_field_values.len(), plan.mesh.nodes.len());
+        assert!(
+            dmi.vector_field_values
+                .iter()
+                .any(|value| value.abs() > 0.0),
+            "rotated interfacial DMI must be represented in FEM eden_dmi"
         );
     }
 
@@ -2331,6 +3052,7 @@ mod tests {
             effective_field: Vec::new(),
             anisotropy_field: Vec::new(),
             dmi_field: Vec::new(),
+            rotated_dmi_field: Vec::new(),
             magnetoelastic_field: Vec::new(),
             cubic_anisotropy_field: Vec::new(),
             bulk_dmi_field: Vec::new(),
@@ -2342,6 +3064,7 @@ mod tests {
             drive_energy: 0.0,
             anisotropy_energy: 0.0,
             dmi_energy: 0.0,
+            rotated_dmi_energy: 0.0,
             total_energy: 0.0,
             max_dm_dt: 0.0,
             max_rhs_all_norm_per_s: 0.0,

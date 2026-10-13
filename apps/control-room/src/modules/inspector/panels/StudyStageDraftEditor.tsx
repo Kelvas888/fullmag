@@ -59,7 +59,7 @@ export function StudyStageDraftEditor({
         </ul>
       ) : null}
       <FormField
-        disabled={draft.kind === "unsupported"}
+        disabled={draft.kind === "unsupported" || draft.kind === "antenna_field_solve"}
         label="Kind"
         type="select"
         value={draft.kind}
@@ -68,7 +68,7 @@ export function StudyStageDraftEditor({
         }
       >
         <option value="relax">Relax</option>
-        <option value="add_field_drive">Add antenna</option>
+        <option value="add_field_drive">Add field drive</option>
         <option value="table_autosave">Table autosave</option>
         <option value="autosave">Autosave</option>
         <option value="fft_response">FFT response</option>
@@ -81,14 +81,23 @@ export function StudyStageDraftEditor({
         {draft.kind === "unsupported" ? (
           <option value="unsupported">Unsupported (read-only)</option>
         ) : null}
+        {draft.kind === "antenna_field_solve" ? (
+          <option value="antenna_field_solve">Antenna field solve (definition reference)</option>
+        ) : null}
       </FormField>
       <FormField
-        disabled={draft.kind === "unsupported"}
+        disabled={draft.kind === "unsupported" || draft.kind === "antenna_field_solve"}
         label="Stage ID"
         value={draft.stageId}
         onChange={(event) => onUpdate({ stageId: event.target.value })}
       />
-      {draft.kind === "unsupported" ? (
+      {draft.kind === "antenna_field_solve" ? (
+        <div className="fm-study-stage-note">
+          {draft.pipelineNodeId ? "Canonical pipeline reference (read-only). " : ""}
+          This instruction references an antenna definition. Edit its current,
+          ports and sampling under the antenna, not as magnetic Run or Relax controls.
+        </div>
+      ) : draft.kind === "unsupported" ? (
         <div className="fm-study-stage-note">
           This stage kind is not supported by the current editor. Its original
           payload is preserved losslessly and cannot be edited here.
@@ -96,7 +105,8 @@ export function StudyStageDraftEditor({
       ) : draft.kind === "add_field_drive" ? (
         <div className="fm-study-stage-note">
           The ordered instruction adds its field drive to the current simulation
-          state. Full antenna controls and the sampled source FFT are shown below.
+          state. These are prescribed field controls and waveform FFT, not a
+          conductor/current solve or a spatial spin-wave excitation spectrum.
         </div>
       ) : draft.kind === "table_autosave" ? (
         <div className="fm-study-stage-note">
@@ -167,8 +177,9 @@ export function StudyStageDraftEditor({
 }
 
 function studyStageDraftKindLabel(kind: StudyStageDraftKind): string {
+  if (kind === "antenna_field_solve") return "Antenna Field Solve";
   if (kind === "unsupported") return "Unsupported (read-only)";
-  if (kind === "add_field_drive") return "Add Antenna";
+  if (kind === "add_field_drive") return "Add Field Drive";
   if (kind === "table_autosave") return "Table Autosave";
   if (kind === "autosave") return "Autosave";
   if (kind === "fft_response") return "FFT Response";
@@ -499,6 +510,55 @@ function EigenmodesStageDraftFields({
   );
 }
 
+function BiasFieldSweepDraftFields({
+  draft,
+  onUpdate,
+}: {
+  draft: StudyStageDraft;
+  onUpdate: (patch: Partial<StudyStageDraft>) => void;
+}) {
+  return (
+    <>
+      <FormField
+        label="Bias field sweep samples"
+        hint="Canonical unit A/m; enter one [Hx, Hy, Hz] vector per line. Leave empty for a single-field solve."
+        type="textarea"
+        rows={4}
+        value={draft.biasFieldSamplesApm}
+        onChange={(event) =>
+          onUpdate({ biasFieldSamplesApm: event.target.value })
+        }
+      />
+      <FormField
+        label="Bias field equilibrium policy"
+        hint="Each sample must publish its own accepted equilibrium before modal solve."
+        type="select"
+        value={draft.biasFieldEquilibriumPolicy}
+        onChange={(event) =>
+          onUpdate({ biasFieldEquilibriumPolicy: event.target.value })
+        }
+      >
+        <option value="relax_each">Relax each sample</option>
+        <option value="continuation">Continue from previous sample</option>
+      </FormField>
+      <FormField
+        label="Bias field continuation seed"
+        hint="The seed applies to the first sample; continuation then uses the previous accepted equilibrium."
+        type="select"
+        value={draft.biasFieldContinuationSeed}
+        onChange={(event) =>
+          onUpdate({ biasFieldContinuationSeed: event.target.value })
+        }
+      >
+        <option value="initial_state">Initial state</option>
+        <option value="previous_accepted_equilibrium">
+          Previous accepted equilibrium
+        </option>
+      </FormField>
+    </>
+  );
+}
+
 function EigenmodeTargetFields({
   draft,
   onUpdate,
@@ -747,12 +807,19 @@ function SpectralStageDraftFields({
   const showOperator =
     view === "overview" || view === "operator" || view === "solver";
   const showBoundary =
-    view === "overview" || view === "boundary" || view === "periodic_pairs";
+    view === "overview" ||
+    view === "setup" ||
+    view === "boundary" ||
+    view === "periodic_pairs";
   const showKSampling =
     view === "overview" ||
+    view === "setup" ||
     view === "k_sampling" ||
     view === "k_path" ||
     view === "k_grid";
+  const showBiasFieldSweep =
+    draft.kind === "eigenmodes" &&
+    (view === "overview" || view === "setup");
   return (
     <>
       {showOperator ? (
@@ -769,27 +836,10 @@ function SpectralStageDraftFields({
             </FormField>
           ) : null}
           {draft.kind === "frequency_response" ? (
-            <FormField
-              label="Solver method"
-              type="select"
-              value={draft.solverMethod}
-              onChange={(event) =>
-                onUpdate({ solverMethod: event.target.value })
-              }
-            >
-              <option value="auto">Auto</option>
-              <option value="dense_reference">Dense reference</option>
-              <option value="cpu_sparse_direct">CPU sparse direct</option>
-              <option value="full_coupled_field_split">
-                Full coupled field split
-              </option>
-              <option value="schur_reduced">Schur reduced</option>
-              <option value="modal_reduced">Modal reduced</option>
-              <option value="gpu_operator_host_krylov">
-                GPU operator host Krylov
-              </option>
-              <option value="gpu_device_krylov">GPU device Krylov</option>
-            </FormField>
+            <div className="fm-study-stage-note">
+              Solver implementation is resolved from device, precision, certificates,
+              and active capabilities.
+            </div>
           ) : null}
           <FormField
             label="Include demag"
@@ -873,6 +923,9 @@ function SpectralStageDraftFields({
           ) : null}
         </>
       ) : null}
+      {showBiasFieldSweep ? (
+        <BiasFieldSweepDraftFields draft={draft} onUpdate={onUpdate} />
+      ) : null}
       {showBoundary ? (
         <>
           <FormField
@@ -881,7 +934,7 @@ function SpectralStageDraftFields({
             value={draft.bc}
             onChange={(event) => onUpdate({ bc: event.target.value })}
           />
-          {draft.kind === "frequency_response" ? (
+          {draft.kind === "eigenmodes" || draft.kind === "frequency_response" ? (
             <FormField
               label="Magnetostatic BC"
               type="select"

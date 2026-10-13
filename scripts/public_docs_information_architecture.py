@@ -78,6 +78,7 @@ PHYSICS_REFERENCE_PAGES = frozenset(
         "physics/interactions/dmi/boundary-conditions.md",
         "physics/interactions/dmi/bulk.md",
         "physics/interactions/dmi/interfacial.md",
+        "physics/interactions/dmi/rotated-interfacial.md",
         "physics/interactions/dmi/validation.md",
         "physics/interactions/thermal-noise/index.md",
         "physics/interactions/zeeman/index.md",
@@ -113,6 +114,7 @@ PHYSICS_REFERENCE_STATUSES = {
 DMI_SUBPAGES = (
     "interfacial",
     "bulk",
+    "rotated-interfacial",
     "boundary-conditions",
     "validation",
 )
@@ -197,6 +199,7 @@ _INTERACTION_TITLES = {
     "inter-region-couplings": "Inter-Region Couplings",
 }
 REFERENCE_PAGE_TITLES = {
+    "python-api/magnets-and-textures/mumax3-compatibility.md": "Mumax3 Texture Compatibility",
     "python-api/geometry/universe-and-domain.md": "Universe and Domain",
     "python-api/discretization/per-object-meshing.md": "Per-Object Meshing",
     "python-api/outputs/modes-and-spectra.md": "Modes and Spectra",
@@ -221,6 +224,7 @@ REFERENCE_PAGE_TITLES = {
     "physics/interactions/anisotropy/cubic.md": "Cubic anisotropy",
     "physics/interactions/dmi/bulk.md": "Bulk Dzyaloshinskii–Moriya interaction",
     "physics/interactions/dmi/interfacial.md": "Interfacial Dzyaloshinskii–Moriya interaction",
+    "physics/interactions/dmi/rotated-interfacial.md": "Rotated interfacial Dzyaloshinskii–Moriya interaction",
     "physics/interactions/demagnetization/multilayer-convolution.md": "FDM multilayer convolution",
     "python-api/discretization/fdm-multilayer-convolution.md": "FDM multilayer convolution — Python, ProblemIR, and UI",
     "physics/interactions/thermal-noise/index.md": "Thermal Brown noise",
@@ -241,6 +245,7 @@ REFERENCE_PAGE_TITLES = {
     "python-api/interactions/inter-region-couplings.md": "Inter-region couplings Python API",
 }
 REFERENCE_PAGE_LABELS = {
+    "python-api/magnets-and-textures/mumax3-compatibility.md": "public-docs-python-api-mumax3-texture-compatibility",
     "physics/interactions/zeeman/index.md": "public-docs-physics-interactions-zeeman",
     "physics/interactions/magnetoelastic/index.md": "public-docs-physics-interactions-magnetoelastic",
     "physics/interactions/spin-transfer-torque/index.md": "public-docs-physics-interactions-stt",
@@ -252,6 +257,9 @@ REFERENCE_PAGE_LABELS = {
     "python-api/interactions/spin-orbit-torque.md": "sot-api-problem-statement",
     "python-api/interactions/magnetoelastic.md": "magnetoelastic-api-problem-statement",
     "python-api/discretization/fdm-multilayer-convolution.md": "python-api-fdm-multilayer-convolution",
+}
+REFERENCE_PAGE_STATUSES = {
+    "python-api/magnets-and-textures/mumax3-compatibility.md": "implemented",
 }
 
 
@@ -328,6 +336,7 @@ PYTHON_API_REFERENCE_PAGES = {
     "python-api/geometry/index.md",
     "python-api/materials/index.md",
     "python-api/magnets-and-textures/index.md",
+    "python-api/magnets-and-textures/mumax3-compatibility.md",
     "python-api/current-and-excitations/index.md",
     "python-api/boundary-conditions/index.md",
     "python-api/discretization/index.md",
@@ -438,6 +447,14 @@ def _section(
                 f"{directory}/{page}.md",
                 _page_title(f"{directory}/{page}.md", _title(page)),
                 f"the {title.lower()} reference for {_title(page)}",
+                status=REFERENCE_PAGE_STATUSES.get(
+                    f"{directory}/{page}.md",
+                    "partial"
+                    if f"{directory}/{page}.md" in PHYSICS_REFERENCE_PAGES
+                    or f"{directory}/{page}.md" in PYTHON_API_REFERENCE_PAGES
+                    or f"{directory}/{page}.md" in NUMERICAL_METHODS_REFERENCE_PAGES
+                    else "planned",
+                ),
             )
             for page in pages
         ),
@@ -528,7 +545,7 @@ PAGE_SPECS: tuple[PageSpec, ...] = (
     *_section("python-api/problem", "Problem", ("problem", "validation", "problem-ir", "round-trip"), "the Python API Problem reference"),
     *_section("python-api/geometry", "Geometry", ("primitives", "transforms", "boolean-operations", "imported-geometry", "regions", "universe-and-domain", "auxiliary-geometry"), "the Python API geometry reference"),
     *_section("python-api/materials", "Materials", ("material", "spatial-parameter-fields", "elastic-materials", "magnetostriction-laws"), "the Python API materials reference"),
-    *_section("python-api/magnets-and-textures", "Magnets and Textures", ("ferromagnet", "initial-magnetization", "uniform-texture", "preset-textures"), "the Python API magnets and textures reference"),
+    *_section("python-api/magnets-and-textures", "Magnets and Textures", ("ferromagnet", "initial-magnetization", "uniform-texture", "preset-textures", "mumax3-compatibility"), "the Python API magnets and textures reference"),
     _reference(
         "python-api/interactions/index.md",
         "Interactions",
@@ -747,7 +764,7 @@ def write_pages(specs: Iterable[PageSpec], root: Path) -> None:
             continue
         rendered = render_page(spec, root)
         if path.exists():
-            if path.read_text() != rendered:
+            if path.read_text(encoding="utf-8") != rendered:
                 raise FileExistsError(f"{path}: existing scaffold would need replacement")
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -755,7 +772,7 @@ def write_pages(specs: Iterable[PageSpec], root: Path) -> None:
 
 
 def _front_matter(path: Path) -> dict[str, str] | None:
-    lines = path.read_text().splitlines()
+    lines = path.read_text(encoding="utf-8").splitlines()
     if not lines or lines[0] != "---":
         return None
     metadata: dict[str, str] = {}
@@ -765,7 +782,14 @@ def _front_matter(path: Path) -> dict[str, str] | None:
         if ":" not in line:
             return None
         key, value = line.split(":", 1)
-        metadata[key.strip()] = value.strip()
+        normalized = value.strip()
+        if (
+            len(normalized) >= 2
+            and normalized[0] == normalized[-1]
+            and normalized[0] in {"'", '"'}
+        ):
+            normalized = normalized[1:-1]
+        metadata[key.strip()] = normalized
     return None
 
 
@@ -796,7 +820,7 @@ def check_pages(specs: Iterable[PageSpec], root: Path) -> list[str]:
             errors.append(f"missing page: {spec.path}")
             continue
         if spec.doc_kind == "scaffold":
-            if path.read_text() != render_page(spec, root):
+            if path.read_text(encoding="utf-8") != render_page(spec, root):
                 errors.append(f"scaffold does not match manifest: {spec.path}")
             continue
         metadata = _front_matter(path)
@@ -810,7 +834,7 @@ def check_pages(specs: Iterable[PageSpec], root: Path) -> list[str]:
         }.items():
             if metadata.get(key) != expected:
                 errors.append(f"reference metadata {key!r} does not match manifest: {spec.path}")
-        text = path.read_text()
+        text = path.read_text(encoding="utf-8")
         if f"({spec.label})=" not in text:
             errors.append(f"reference label does not match manifest: {spec.path}")
         if spec.children:

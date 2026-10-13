@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import importlib
+import inspect
 import itertools
 import json
+import ast
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import numpy as np
 import pytest
 
 import fullmag as fm
 import fullmag.meshing._gmsh_generators as gmsh_generators
+import fullmag.meshing._gmsh_airbox as gmsh_airbox
+import fullmag.meshing._gmsh_swept as gmsh_swept
 import fullmag.meshing._gmsh_types as gmsh_types
 from fullmag import world as flat_world
 from fullmag.meshing._gmsh_extraction import (
@@ -25,6 +29,7 @@ from fullmag.meshing._gmsh_occ import generate_shared_domain_mesh_via_occ
 from fullmag.meshing._gmsh_types import (
     MeshData,
     MeshOptions,
+    MeshValidationError,
     MixedLayerTopologyCertificate,
     _cell_jacobian_determinants,
     _mixed_same_side_two_owner_face_count,
@@ -34,7 +39,6 @@ from fullmag.meshing._gmsh_swept import (
     _extract_swept_mesh_data,
     _mixed_apex_factor_preserves_face_sides,
     _mixed_apex_candidate_preserves_face_sides,
-    _repair_mixed_tetrahedra,
     _iter_mixed_apex_face_side_constraints,
     _mixed_shared_faces_by_apex,
     _prepare_mixed_apex_face_side_constraints,
@@ -46,6 +50,35 @@ from fullmag.meshing.remesh_cli import _mesh_result_payload
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gmsh" / "mixed_prism_pyramid_airbox.geo"
+
+
+def test_mixed_transition_shell_expands_only_for_large_far_field_jump() -> None:
+    expanded = gmsh_airbox._mixed_transition_shell_parameters(
+        h_outer=20.0e-9,
+        h_inner=2.0e-9,
+        hmax=2.0e-9,
+        clearance_limit=31.25e-9,
+        grading_ratio=1.7,
+    )
+    assert expanded == pytest.approx((20.0e-9, 20.0e-9 / 1.7))
+
+    ordinary = gmsh_airbox._mixed_transition_shell_parameters(
+        h_outer=1.2e-6,
+        h_inner=0.4e-6,
+        hmax=0.8e-6,
+        clearance_limit=1.0e-6,
+        grading_ratio=1.3,
+    )
+    assert ordinary == pytest.approx((0.8e-6, 0.8e-6))
+
+    insufficient_clearance = gmsh_airbox._mixed_transition_shell_parameters(
+        h_outer=20.0e-9,
+        h_inner=2.0e-9,
+        hmax=2.0e-9,
+        clearance_limit=10.0e-9,
+        grading_ratio=1.7,
+    )
+    assert insufficient_clearance == pytest.approx((2.0e-9, 2.0e-9))
 
 CELL_FACES = {
     "Tetrahedron 4": ((0, 2, 1), (0, 1, 3), (1, 2, 3), (2, 0, 3)),
@@ -84,12 +117,591 @@ def test_mixed_face_frequency_counting_is_linear_in_face_count() -> None:
     assert CountingFace.comparisons <= len(faces)
 
 
-def test_mixed_tetra_repair_uses_default_gmsh_optimizer() -> None:
+def test_mixed_gmsh_quality_vectorization_matches_scalar_reference() -> None:
+    rng = np.random.default_rng(42)
+    tags = np.asarray([50, 10, 80, 20, 70, 30, 90, 40, 60], dtype=np.int64)
+    coordinates = rng.normal(size=(len(tags), 3))
+    elements = {
+        4: (np.asarray([101], dtype=np.int64), np.asarray([10, 20, 30, 40], dtype=np.int64)),
+        6: (np.asarray([201], dtype=np.int64), np.asarray([10, 20, 30, 50, 60, 70], dtype=np.int64)),
+        7: (np.asarray([301], dtype=np.int64), np.asarray([20, 30, 40, 80, 90], dtype=np.int64)),
+    }
+    gmsh = Mock()
+    gmsh.model.mesh.getNodes.return_value = (
+        tags,
+        coordinates.reshape(-1),
+        np.asarray([], dtype=np.float64),
+    )
+    gmsh.model.mesh.getElementsByType.side_effect = lambda element_type: elements.get(
+        int(element_type),
+        (np.asarray([], dtype=np.int64), np.asarray([], dtype=np.int64)),
+    )
+
+    actual = gmsh_swept._mixed_gmsh_scaled_jacobian_p05(gmsh)
+    coordinate_by_tag = {
+        int(tag): point for tag, point in zip(tags, coordinates, strict=True)
+    }
+    expected: dict[str, float] = {}
+    for element_type, family, arity in (
+        (4, "tet4", 4),
+        (6, "prism6", 6),
+        (7, "pyramid5", 5),
+    ):
+        _, element_nodes = elements[element_type]
+        cell_coordinates = np.asarray(
+            [coordinate_by_tag[int(tag)] for tag in element_nodes],
+            dtype=np.float64,
+        )
+        assert cell_coordinates.shape == (arity, 3)
+        values = gmsh_swept._mixed_cell_scaled_jacobians(family, cell_coordinates)
+        expected[family] = float(np.percentile(values, 5.0))
+
+    assert actual.keys() == expected.keys()
+    for family in expected:
+        assert actual[family] == pytest.approx(expected[family], rel=1.0e-12)
+
+
+def test_mixed_topology_quality_preserves_anisotropic_prism() -> None:
+    coordinates = np.asarray(
+        [
+            [0.0, 0.0, 0.0],
+            [2.5e-9, 0.0, 0.0],
+            [0.0, 2.5e-9, 0.0],
+            [0.0, 0.0, 10.0e-9],
+            [2.5e-9, 0.0, 10.0e-9],
+            [0.0, 2.5e-9, 10.0e-9],
+        ],
+        dtype=np.float64,
+    )
+
+    quality = gmsh_types._mixed_cell_scaled_jacobians("prism6", coordinates)
+
+    assert quality.shape == (6,)
+    assert np.all(quality >= gmsh_types.MIXED_SCALED_JACOBIAN_P05_MIN)
+    np.testing.assert_allclose(quality, 1.0, rtol=1.0e-12, atol=1.0e-12)
+
+
+def _empty_tet_gmsh_mock() -> Mock:
+    gmsh = Mock()
+    gmsh.model.mesh.getElementsByType.return_value = (
+        np.asarray([], dtype=np.int64),
+        np.asarray([], dtype=np.int64),
+    )
+    return gmsh
+
+
+class _LocalRepairTetMesh:
+    def __init__(self) -> None:
+        self.coordinates = {
+            1: np.asarray([0.0, 0.0, 0.0]),
+            2: np.asarray([1.0e-3, 0.0, 0.0]),
+            3: np.asarray([0.0, 1.0e-3, 0.0]),
+            4: np.asarray([5.0e-4, 5.0e-4, 1.0e-12]),
+            # This disconnected point establishes the full-domain scale used
+            # by the native certificate threshold.
+            5: np.asarray([1.0, 1.0, 1.0]),
+        }
+        self.dimensions = {1: 2, 2: 2, 3: 2, 4: 3, 5: 3}
+        self.optimize = Mock()
+
+    def getNodes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        tags = np.asarray(sorted(self.coordinates), dtype=np.int64)
+        coordinates = np.concatenate([self.coordinates[int(tag)] for tag in tags])
+        return tags, coordinates, np.asarray([], dtype=np.float64)
+
+    def getElementsByType(self, element_type: int) -> tuple[np.ndarray, np.ndarray]:
+        assert element_type == 4
+        return np.asarray([101], dtype=np.int64), np.asarray([1, 2, 3, 4])
+
+    def getNode(self, node_tag: int) -> tuple[np.ndarray, list[float], int, int]:
+        return self.coordinates[node_tag], [], self.dimensions[node_tag], 1
+
+    def setNode(
+        self,
+        node_tag: int,
+        coordinates: list[float],
+        parameters: list[float],
+    ) -> None:
+        del parameters
+        self.coordinates[node_tag] = np.asarray(coordinates, dtype=np.float64)
+
+
+def _local_repair_gmsh(mesh: _LocalRepairTetMesh) -> object:
+    return type(
+        "Gmsh",
+        (),
+        {
+            "model": type("Model", (), {"mesh": mesh})(),
+            "option": Mock(),
+        },
+    )()
+
+
+def test_mixed_tet_global_threshold_matches_native_scale_gate() -> None:
+    mesh = _LocalRepairTetMesh()
+    gmsh = _local_repair_gmsh(mesh)
+
+    local = gmsh_swept._mixed_tet_degeneracy_report(gmsh)
+    global_scale = gmsh_swept._mixed_tet_degeneracy_report(
+        gmsh,
+        use_global_scale=True,
+    )
+
+    assert local.element_tags == frozenset()
+    assert global_scale.element_tags == frozenset({101})
+    assert global_scale.worst_threshold == pytest.approx(6.0e-18)
+
+
+def test_mixed_tet_local_first_repair_avoids_global_optimizer() -> None:
+    mesh = _LocalRepairTetMesh()
+    gmsh = _local_repair_gmsh(mesh)
+
+    gmsh_swept._repair_mixed_tetrahedra(gmsh)
+
+    assert mesh.coordinates[4][2] > 1.0e-12
+    assert gmsh.model.mesh.optimize.call_count == 0
+    assert not gmsh_swept._mixed_tet_degeneracy_report(
+        gmsh,
+        use_global_scale=True,
+    ).element_tags
+
+
+def test_mixed_tetrahedra_repair_uses_versioned_local_first_policy() -> None:
+    gmsh = _empty_tet_gmsh_mock()
+
+    gmsh_swept._repair_mixed_tetrahedra(gmsh)
+
+    gmsh.model.mesh.optimize.assert_not_called()
+    policy = gmsh_swept._STRICT_MIXED_TET_REPAIR_POLICY
+    assert policy.algorithm_id == "fullmag.mixed-tet-repair.v1"
+    assert policy.method == "Relocate3D"
+    assert policy.optimize_threshold == 1.0e-6
+    assert policy.force is True
+    assert policy.local_first is True
+
+
+def test_mixed_tetrahedra_repair_uses_one_iteration() -> None:
+    gmsh = _empty_tet_gmsh_mock()
+    policy = gmsh_swept._MixedTetRepairPolicy(
+        algorithm_id="qualification",
+        method="Relocate3D",
+        iterations=1,
+    )
+
+    gmsh_swept._execute_mixed_tet_repair_policy(gmsh, policy)
+
+    assert gmsh.model.mesh.optimize.call_args == call(
+        "Relocate3D", force=True, niter=1
+    )
+    gmsh.option.setNumber.assert_any_call("Mesh.OptimizeThreshold", 1.0e-6)
+
+
+def test_mixed_tetrahedra_repair_restores_gmsh_threshold_after_optimizer_failure() -> None:
+    gmsh = _empty_tet_gmsh_mock()
+    gmsh.option.getNumber.return_value = 0.42
+    gmsh.model.mesh.optimize.side_effect = RuntimeError("optimizer failed")
+    policy = gmsh_swept._MixedTetRepairPolicy(
+        algorithm_id="qualification",
+        method="Relocate3D",
+        iterations=1,
+    )
+
+    with pytest.raises(RuntimeError, match="optimizer failed"):
+        gmsh_swept._execute_mixed_tet_repair_policy(gmsh, policy)
+
+    assert gmsh.option.setNumber.call_args_list == [
+        call("Mesh.OptimizeThreshold", 1.0e-6),
+        call("Mesh.OptimizeThreshold", 0.42),
+    ]
+
+
+def test_mixed_tetrahedra_repair_rejects_created_degenerate_tet4() -> None:
+    class MutableTetMesh:
+        def __init__(self) -> None:
+            self.coordinates = {
+                1: np.asarray([0.0, 0.0, 0.0]),
+                2: np.asarray([1.0, 0.0, 0.0]),
+                3: np.asarray([0.0, 1.0, 0.0]),
+                4: np.asarray([0.0, 0.0, 1.0]),
+            }
+
+        def getNodes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            tags = np.asarray(sorted(self.coordinates), dtype=np.int64)
+            coordinates = np.concatenate([self.coordinates[int(tag)] for tag in tags])
+            return tags, coordinates, np.asarray([], dtype=np.float64)
+
+        def getElementsByType(self, element_type: int) -> tuple[np.ndarray, np.ndarray]:
+            assert element_type == 4
+            return np.asarray([101], dtype=np.int64), np.asarray([1, 2, 3, 4])
+
+        def optimize(self, method: str, *, force: bool, niter: int) -> None:
+            assert (method, force, niter) == ("Relocate3D", True, 1)
+            self.coordinates[4] = np.asarray(
+                [0.0, 0.0, np.finfo(np.float64).eps * 1.0e-3]
+            )
+
+    mesh = MutableTetMesh()
+    gmsh = type(
+        "Gmsh",
+        (),
+        {"model": type("Model", (), {"mesh": mesh})(), "option": Mock()},
+    )()
+
+    with pytest.raises(RuntimeError, match="repair.*created: count=1"):
+        gmsh_swept._repair_mixed_tetrahedra_for_qualification("Relocate3D", gmsh)
+
+
+def test_mixed_tetrahedra_repair_rejects_generated_sliver_left_by_policy() -> None:
+    class GeneratedSliverMesh:
+        def __init__(self) -> None:
+            self.coordinates = {
+                1: np.asarray([0.0, 0.0, 0.0]),
+                2: np.asarray([1.0, 0.0, 0.0]),
+                3: np.asarray([0.0, 1.0, 0.0]),
+                4: np.asarray([0.5, 0.5, 0.0]),
+            }
+
+        def getNodes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            tags = np.asarray(sorted(self.coordinates), dtype=np.int64)
+            coordinates = np.concatenate([self.coordinates[int(tag)] for tag in tags])
+            return tags, coordinates, np.asarray([], dtype=np.float64)
+
+        def getElementsByType(self, element_type: int) -> tuple[np.ndarray, np.ndarray]:
+            assert element_type == 4
+            return np.asarray([101], dtype=np.int64), np.asarray([1, 2, 3, 4])
+
+        def optimize(self, method: str, *, force: bool, niter: int) -> None:
+            assert (method, force, niter) == ("Relocate3D", True, 1)
+
+    mesh = GeneratedSliverMesh()
+    gmsh = type(
+        "Gmsh",
+        (),
+        {"model": type("Model", (), {"mesh": mesh})(), "option": Mock()},
+    )()
+
+    with pytest.raises(RuntimeError, match="left: count=1.*worst_element_tag=101"):
+        gmsh_swept._repair_mixed_tetrahedra_for_qualification("Relocate3D", gmsh)
+
+    assert mesh.coordinates[4][2] == 0.0
+
+
+def test_mixed_tetrahedra_repair_reports_created_and_left_worst_separately() -> None:
+    class MixedFailureMesh:
+        def __init__(self) -> None:
+            self.coordinates = {
+                1: np.asarray([0.0, 0.0, 0.0]),
+                2: np.asarray([1.0, 0.0, 0.0]),
+                3: np.asarray([0.0, 1.0, 0.0]),
+                4: np.asarray([0.0, 0.0, 0.0]),
+                5: np.asarray([2.0, 0.0, 0.0]),
+                6: np.asarray([3.0, 0.0, 0.0]),
+                7: np.asarray([2.0, 1.0, 0.0]),
+                8: np.asarray([2.0, 0.0, 1.0]),
+            }
+
+        def getNodes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+            tags = np.asarray(sorted(self.coordinates), dtype=np.int64)
+            coordinates = np.concatenate([self.coordinates[int(tag)] for tag in tags])
+            return tags, coordinates, np.asarray([], dtype=np.float64)
+
+        def getElementsByType(self, element_type: int) -> tuple[np.ndarray, np.ndarray]:
+            assert element_type == 4
+            return (
+                np.asarray([101, 102], dtype=np.int64),
+                np.asarray([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.int64),
+            )
+
+        def optimize(self, method: str, *, force: bool, niter: int) -> None:
+            assert (method, force, niter) == ("Relocate3D", True, 1)
+            self.coordinates[8] = np.asarray([2.0, 0.0, 0.0])
+
+    mesh = MixedFailureMesh()
+    gmsh = type(
+        "Gmsh",
+        (),
+        {"model": type("Model", (), {"mesh": mesh})(), "option": Mock()},
+    )()
+
+    with pytest.raises(RuntimeError) as caught:
+        gmsh_swept._repair_mixed_tetrahedra_for_qualification("Relocate3D", gmsh)
+
+    message = str(caught.value)
+    assert "created: count=1, worst_element_tag=102" in message
+    assert "left: count=1, worst_element_tag=101" in message
+
+
+def test_strict_mixed_generation_does_not_expose_public_optimizer_override() -> None:
+    parameters = inspect.signature(generate_swept_box_mesh).parameters
+
+    assert "optimizer" not in parameters
+    assert "repair_method" not in parameters
+    assert "repair_policy" not in parameters
+
+
+def test_mixed_repair_policy_id_changes_when_method_or_iterations_change() -> None:
+    production = gmsh_swept._qualification_mixed_tet_repair_algorithm_id(
+        "Relocate3D", 1
+    )
+
+    assert production != gmsh_swept._qualification_mixed_tet_repair_algorithm_id(
+        "Netgen", 1
+    )
+    assert production != gmsh_swept._qualification_mixed_tet_repair_algorithm_id(
+        "Relocate3D", 2
+    )
+
+
+def test_qualification_repair_selector_delegates_through_validated_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gmsh = Mock()
+    delegated: list[object] = []
+
+    def capture(_gmsh: object, policy: object) -> None:
+        assert _gmsh is gmsh
+        delegated.append(policy)
+
+    monkeypatch.setattr(gmsh_swept, "_execute_mixed_tet_repair_policy", capture)
+
+    gmsh_swept._repair_mixed_tetrahedra_for_qualification("Netgen", gmsh)
+
+    assert len(delegated) == 1
+    policy = delegated[0]
+    assert policy.method == "Netgen"
+    assert policy.iterations == 1
+    assert policy.algorithm_id == (
+        gmsh_swept._qualification_mixed_tet_repair_algorithm_id("Netgen", 1)
+    )
+
+
+def test_qualification_relocate_selector_uses_its_own_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gmsh = Mock()
+    delegated: list[object] = []
+
+    def capture(_gmsh: object, policy: object) -> None:
+        assert _gmsh is gmsh
+        delegated.append(policy)
+
+    monkeypatch.setattr(gmsh_swept, "_execute_mixed_tet_repair_policy", capture)
+
+    gmsh_swept._repair_mixed_tetrahedra_for_qualification("Relocate3D", gmsh)
+
+    assert len(delegated) == 1
+    policy = delegated[0]
+    assert policy.method == "Relocate3D"
+    assert policy.iterations == 1
+    assert policy.algorithm_id == (
+        gmsh_swept._qualification_mixed_tet_repair_algorithm_id("Relocate3D", 1)
+    )
+
+
+def test_qualification_default_selector_uses_an_exact_candidate_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gmsh = Mock()
+    delegated: list[object] = []
+
+    def capture(_gmsh: object, policy: object) -> None:
+        assert _gmsh is gmsh
+        delegated.append(policy)
+
+    monkeypatch.setattr(gmsh_swept, "_execute_mixed_tet_repair_policy", capture)
+
+    gmsh_swept._repair_mixed_tetrahedra_for_qualification("", gmsh)
+
+    assert len(delegated) == 1
+    policy = delegated[0]
+    assert policy is not gmsh_swept._STRICT_MIXED_TET_REPAIR_POLICY
+    assert policy.algorithm_id == (
+        gmsh_swept._qualification_mixed_tet_repair_algorithm_id("default", 1)
+    )
+    assert policy.method == ""
+    assert policy.local_first is False
+
+
+@pytest.mark.parametrize(
+    "policy",
+    [
+        ("", "Relocate3D", 1),
+        ("qualification", "Laplace2D", 1),
+        ("qualification", "Relocate3D", 0),
+    ],
+)
+def test_mixed_tetrahedra_repair_rejects_invalid_private_policy(
+    policy: tuple[str, str, int],
+) -> None:
     gmsh = Mock()
 
-    _repair_mixed_tetrahedra(gmsh)
+    with pytest.raises(ValueError):
+        gmsh_swept._repair_mixed_tetrahedra(
+            gmsh,
+            policy=gmsh_swept._MixedTetRepairPolicy(*policy),
+        )
 
-    gmsh.model.mesh.optimize.assert_called_once_with("", niter=1)
+    gmsh.model.mesh.optimize.assert_not_called()
+
+
+def _netgen_regression_topology() -> MeshData:
+    nodes: list[list[float]] = []
+    cells: list[list[int]] = []
+
+    def add_same_side_pair(offset: float) -> None:
+        start = len(nodes)
+        nodes.extend(
+            [
+                [offset, 0.0, 0.0],
+                [offset + 1.0, 0.0, 0.0],
+                [offset, 1.0, 0.0],
+                [offset, 0.0, 1.0],
+                [offset + 0.2, 0.2, 2.0],
+            ]
+        )
+        cells.extend(
+            [
+                [start, start + 1, start + 2, start + 3],
+                [start, start + 1, start + 2, start + 4],
+            ]
+        )
+
+    def add_non_manifold_triple(offset: float) -> None:
+        start = len(nodes)
+        nodes.extend(
+            [
+                [offset, 0.0, 0.0],
+                [offset + 1.0, 0.0, 0.0],
+                [offset, 1.0, 0.0],
+                [offset, 0.0, 1.0],
+                [offset, 0.0, -1.0],
+                [offset + 0.2, 0.2, 2.0],
+            ]
+        )
+        cells.extend(
+            [
+                [start, start + 1, start + 2, start + 3],
+                [start, start + 1, start + 2, start + 4],
+                [start, start + 1, start + 2, start + 5],
+            ]
+        )
+
+    add_same_side_pair(0.0)
+    add_same_side_pair(10.0)
+    add_non_manifold_triple(20.0)
+    add_non_manifold_triple(30.0)
+    face_counts = Counter(
+        tuple(sorted(cell[index] for index in face))
+        for cell in cells
+        for face in CELL_FACES["Tetrahedron 4"]
+    )
+    exterior_faces = sorted(face for face, count in face_counts.items() if count == 1)
+    cell_nodes = np.asarray(cells, dtype=np.int32).reshape(-1)
+    return MeshData(
+        nodes=np.asarray(nodes, dtype=np.float64),
+        cell_types=np.asarray(["tet4"] * len(cells)),
+        cell_offsets=np.arange(0, 4 * len(cells) + 1, 4, dtype=np.int32),
+        cell_nodes=cell_nodes,
+        element_markers=np.zeros(len(cells), dtype=np.int32),
+        facet_types=np.asarray(["tri3"] * len(exterior_faces), dtype=np.str_),
+        facet_roles=np.asarray(["exterior"] * len(exterior_faces), dtype=np.str_),
+        facet_offsets=np.arange(0, 3 * len(exterior_faces) + 1, 3, dtype=np.int32),
+        facet_nodes=np.asarray(exterior_faces, dtype=np.int32).reshape(-1),
+        boundary_markers=np.asarray([99] * len(exterior_faces), dtype=np.int32),
+        cell_global_ordinals=np.arange(len(cells), dtype=np.int64),
+        facet_global_ordinals=np.arange(len(exterior_faces), dtype=np.int64),
+        cell_mesh_parts=np.asarray(["far_air"] * len(cells)),
+    )
+
+
+def test_netgen_regression_fixture_is_rejected_by_certificate_conformity_boundary() -> None:
+    pytest.importorskip("gmsh")
+    from fullmag.meshing._gmsh_airbox import _attach_mixed_layer_topology_certificate
+
+    body_size, airbox, accepted = _mixed_shared_domain_case()
+    defect = _netgen_regression_topology()
+    node_offset = accepted.n_nodes
+    cell_offset = accepted.n_elements
+    facet_offset = accepted.n_boundary_faces
+    corrupted = replace(
+        accepted,
+        nodes=np.concatenate([accepted.nodes, defect.nodes * 0.01e-6 + [3.0e-6, 1.5e-6, 0.0]]),
+        cell_types=np.concatenate([accepted.cell_types, defect.cell_types]),
+        cell_offsets=np.concatenate(
+            [
+                accepted.cell_offsets,
+                accepted.cell_offsets[-1] + defect.cell_offsets[1:],
+            ]
+        ),
+        cell_nodes=np.concatenate([accepted.cell_nodes, defect.cell_nodes + node_offset]),
+        element_markers=np.concatenate(
+            [accepted.element_markers, np.zeros(defect.n_elements, dtype=np.int32)]
+        ),
+        cell_global_ordinals=np.concatenate(
+            [
+                accepted.cell_global_ordinals,
+                np.arange(cell_offset, cell_offset + defect.n_elements, dtype=np.int64),
+            ]
+        ),
+        facet_types=np.concatenate([accepted.facet_types, defect.facet_types]),
+        facet_roles=np.concatenate([accepted.facet_roles, defect.facet_roles]),
+        facet_offsets=np.concatenate(
+            [
+                accepted.facet_offsets,
+                accepted.facet_offsets[-1] + defect.facet_offsets[1:],
+            ]
+        ),
+        facet_nodes=np.concatenate(
+            [accepted.facet_nodes, defect.facet_nodes + node_offset]
+        ),
+        boundary_markers=np.concatenate(
+            [accepted.boundary_markers, defect.boundary_markers]
+        ),
+        facet_global_ordinals=np.concatenate(
+            [
+                accepted.facet_global_ordinals,
+                np.arange(
+                    facet_offset,
+                    facet_offset + defect.n_boundary_faces,
+                    dtype=np.int64,
+                ),
+            ]
+        ),
+        cell_mesh_parts=np.concatenate(
+            [accepted.cell_mesh_parts, defect.cell_mesh_parts]
+        ),
+        mixed_layer_topology_certificate=None,
+    )
+    assert airbox.size is not None
+
+    with pytest.raises(MeshValidationError, match="conformity validation failed") as caught:
+        _attach_mixed_layer_topology_certificate(
+            corrupted,
+            body_size_m=body_size,
+            airbox_bounds_min_m=tuple(-0.5 * value for value in airbox.size),
+            airbox_bounds_max_m=tuple(0.5 * value for value in airbox.size),
+            requested_axis=2,
+            requested_layers=1,
+            gmsh_version="4.15.2",
+            cell_mesh_parts=corrupted.cell_mesh_parts,
+            outer_boundary_marker=99,
+            effective_gmsh_thread_count=1,
+        )
+
+    message = str(caught.value)
+    conformity_text, diagnostics_text = message.split("; diagnostics=", maxsplit=1)
+    conformity = ast.literal_eval(conformity_text.split(": ", maxsplit=1)[1])
+    diagnostics = ast.literal_eval(diagnostics_text)
+    issue_counts = Counter(row["issue"] for row in diagnostics)
+    assert conformity["nonmanifold_face_count"] == 2
+    assert issue_counts["same_side_two_owner_face"] == 2
+    assert issue_counts["nonmanifold_face"] == 2
+    assert all(
+        owner["mesh_part"] == "far_air"
+        for row in diagnostics
+        if row["issue"] in {"same_side_two_owner_face", "nonmanifold_face"}
+        for owner in row["owners"]
+    )
 
 
 def test_qualified_boundary_markers_bypass_volume_face_adjacency() -> None:
@@ -232,6 +844,41 @@ def test_mixed_apex_local_star_includes_owner_opposite_face() -> None:
         apex=3,
         candidate=np.asarray([0.0, 0.0, -2.0]),
         shared_faces=shared_faces[3],
+    )
+
+
+def test_mixed_apex_shared_tet_pyramid_owner_fails_closed_on_flattening() -> None:
+    pyramid = np.asarray([0, 1, 2, 3, 4], dtype=np.int64)
+    tetrahedron = np.asarray([0, 1, 4, 5], dtype=np.int64)
+    coordinates = {
+        0: np.asarray([0.0, 0.0, 0.0]),
+        1: np.asarray([1.0, 0.0, 0.0]),
+        2: np.asarray([1.0, 1.0, 0.0]),
+        3: np.asarray([0.0, 1.0, 0.0]),
+        4: np.asarray([0.5, 0.5, 1.0]),
+        5: np.asarray([0.5, -1.0, 0.0]),
+    }
+    shared_faces = _mixed_shared_faces_by_apex(
+        {"pyramid5": [pyramid], "tet4": [tetrahedron]},
+        apex_tags=[4],
+    )[4]
+    flattened = np.asarray([0.5, 0.5, 0.0])
+
+    assert len(shared_faces) == 1
+    assert shared_faces[0][0] == (0, 1, 4)
+    assert np.array_equal(shared_faces[0][1][0], pyramid)
+    assert np.array_equal(shared_faces[0][1][1], tetrahedron)
+    assert not _mixed_apex_candidate_preserves_face_sides(
+        coordinates,
+        apex=4,
+        candidate=flattened,
+        shared_faces=shared_faces,
+    )
+    assert gmsh_swept._mixed_cell_has_degenerate_jacobian(
+        "tet4",
+        np.asarray(
+            [flattened if int(tag) == 4 else coordinates[int(tag)] for tag in tetrahedron]
+        ),
     )
 
 
@@ -971,6 +1618,10 @@ def test_existing_swept_cylinder_quality_path_remains_available() -> None:
     assert set(mesh.cell_types.tolist()) == {"tet4"}
     assert mesh.quality is not None
     assert mesh.quality.quality_source == "swept_topology_proxy"
+    assert mesh.realization_report is not None
+    assert mesh.realization_report.requested_topology == "prism6"
+    assert mesh.realization_report.resolved_topology == "tet4"
+    assert mesh.realization_report.fallbacks_triggered == ("swept_cylinder_to_tet4",)
 
 
 def test_mesh_data_rejects_realization_report_that_misstates_topology() -> None:
@@ -1139,6 +1790,40 @@ def _mixed_shared_domain_case(
         options=MeshOptions(mesh_strategy=SWEEP_STRATEGY_PRISM),
     )
     return tuple(body_size), airbox, mesh
+
+
+def test_mixed_certificate_recompute_reuses_topology_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("gmsh")
+    body_size, airbox, certified = _mixed_shared_domain_case()
+    mesh = replace(certified, mixed_layer_topology_certificate=None)
+    certificate = certified.mixed_layer_topology_certificate
+    assert certificate is not None
+    assert airbox.size is not None
+    original = MeshData.cell_node_ids
+    cell_node_reads = 0
+
+    def counted_cell_node_ids(self: MeshData, ordinal: int) -> np.ndarray:
+        nonlocal cell_node_reads
+        cell_node_reads += 1
+        return original(self, ordinal)
+
+    monkeypatch.setattr(MeshData, "cell_node_ids", counted_cell_node_ids)
+
+    evidence = gmsh_types._recompute_mixed_certificate_evidence(
+        mesh,
+        sweep_axis=2,
+        interface_marker=certificate.interface_marker,
+        outer_boundary_marker=certificate.outer_boundary_marker,
+        magnetic_bounds_min_m=tuple(-0.5 * value for value in body_size),
+        magnetic_bounds_max_m=tuple(0.5 * value for value in body_size),
+        airbox_bounds_min_m=tuple(-0.5 * value for value in airbox.size),
+        airbox_bounds_max_m=tuple(0.5 * value for value in airbox.size),
+    )
+
+    assert evidence["nonconforming_face_count"] == 0
+    assert cell_node_reads <= 2 * mesh.n_elements
 
 
 @pytest.mark.parametrize("layers", [1, 2, 3])
@@ -1473,6 +2158,7 @@ def test_public_prismatic_thin_film_materializes_qualified_mixed_asset(
     fm.reset()
     study = fm.study("public-prismatic-asset")
     study.engine("fem")
+    study.device("cpu")
     study.mode("strict")
     study.universe(
         mode="manual",
@@ -1637,6 +2323,7 @@ def _public_prismatic_refinement_asset(
     fm.reset()
     study = fm.study("public-prismatic-refinement-pair")
     study.engine("fem")
+    study.device("cpu")
     study.mode("strict")
     study.universe(
         mode="manual",
@@ -2459,12 +3146,12 @@ def test_mixed_certificate_rejects_semantically_resigned_part_reassignment() -> 
         replace(unsigned, mixed_layer_topology_certificate=resigned)
 
 
-def test_mixed_certificate_uses_recomputable_scaled_jacobian_not_gmsh_sicn() -> None:
+def test_mixed_certificate_uses_recomputable_topology_scaled_jacobian_not_gmsh_sicn() -> None:
     pytest.importorskip("gmsh")
     certificate = _mixed_shared_domain_case()[2].mixed_layer_topology_certificate
     assert certificate is not None
     payload = certificate.to_dict()
-    assert payload["quality_metric"] == "tetra_decomposition_scaled_jacobian.v1"
+    assert payload["quality_metric"] == "mixed_topology_scaled_jacobian.v1"
     assert "scaled_jacobian_minima_by_family" in payload
     assert "scaled_jacobian_p05_by_family" in payload
     assert all(
@@ -2733,11 +3420,11 @@ def test_mixed_certificate_nested_wire_types_fail_before_normalization(
         gmsh_types.MixedLayerTopologyCertificate.from_dict(payload)
 
 
-def test_mixed_certificate_uses_versioned_tetra_decomposition_quality_name() -> None:
+def test_mixed_certificate_uses_versioned_topology_quality_name() -> None:
     pytest.importorskip("gmsh")
     certificate = _mixed_shared_domain_case()[2].mixed_layer_topology_certificate
     assert certificate is not None
-    assert certificate.quality_metric == "tetra_decomposition_scaled_jacobian.v1"
+    assert certificate.quality_metric == "mixed_topology_scaled_jacobian.v1"
     payload = certificate.to_dict()
     payload["quality_metric"] = "scaled_jacobian"
     with pytest.raises(ValueError, match="quality_metric"):

@@ -9,7 +9,10 @@ import {
   surfaceMaterialPolicyProps,
 } from "./viewport3DRenderPolicy";
 
-import type { VisualizationTargetSettings } from "@/kernel/visualization/ObjectVisualizationController";
+import {
+  DEFAULT_OBJECT_VISUALIZATION,
+  type VisualizationTargetSettings,
+} from "@/kernel/visualization/ObjectVisualizationController";
 
 import type { Viewport3DResourceTracker } from "../viewport3dDiagnostics";
 import { useBatchedInvalidate } from "../viewport3dBatchedInvalidate";
@@ -29,6 +32,7 @@ import { resolveViewport3DTargetRenderPlan } from "./viewport3DTargetRenderPlan"
 import {
   buildPrimitiveTransformGizmoSegments,
   releasePrimitiveObjectGeometry,
+  primitiveObjectSurfaceColor,
   resolvePrimitiveObjectRenderSettings,
   shouldRenderPrimitiveObject,
   shouldRenderPrimitiveTransformGizmo,
@@ -61,10 +65,31 @@ export function PrimitiveObjectLayer({
     invalidate();
   }, [invalidate, primitiveFrameKey, tracker]);
 
-  if (!primitiveModel?.objects.length) return null;
+  if (!primitiveModel?.objects.length && !primitiveModel?.draftOverlay) return null;
 
   return (
     <>
+      {primitiveModel.draftOverlay ? (
+        <group
+          key={primitiveModel.draftOverlay.geometryKey}
+          userData={{ layer: "primitive-draft-overlay" }}
+        >
+          <RenderablePrimitiveObject
+            colors={colors}
+            materialProfile={materialProfile}
+            object={primitiveModel.draftOverlay}
+            onSelectObject={() => undefined}
+            settings={{
+              ...DEFAULT_OBJECT_VISUALIZATION,
+              primitiveOpacityPercent: 42,
+              primitiveVisible: true,
+              shaderVisible: true,
+              wireframeVisible: true,
+            }}
+            tracker={tracker}
+          />
+        </group>
+      ) : null}
       {primitiveModel.objects.map((object) => (
         <PrimitiveObject
           colors={colors}
@@ -163,14 +188,7 @@ function RenderablePrimitiveObject({
   // FDM/FEM surface is available.  The inspector's Solid surface control
   // edits `shaderMonoColor`, so prefer that value for the preview whenever
   // Solid is selected instead of retaining the stale primitive preference.
-  const primitiveColor =
-    renderSettings.surfaceColorSource === "solid"
-      ? renderSettings.shaderMonoColor
-      : renderSettings.primitiveMonoColor;
-  const shaderColor =
-    primitiveColor && !primitiveColor.startsWith("var(")
-      ? primitiveColor
-      : colors.mesh;
+  const shaderColor = primitiveObjectSurfaceColor(object, renderSettings, colors);
 
   return (
     <group

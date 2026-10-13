@@ -29,6 +29,7 @@ import math
 from typing import Mapping, Sequence
 
 from fullmag._progress import emit_progress
+from fullmag._validation import parse_bool, parse_finite_float, parse_integer
 from fullmag.model.discretization import PerObjectMeshRecipe, SharedMeshAssemblyPolicy
 from fullmag.model.domain_frame import geometry_bounds
 from fullmag.model.geometry import ArchWaveguide, Box, Geometry, Translate
@@ -36,14 +37,32 @@ from fullmag.model.geometry import ArchWaveguide, Box, Geometry, Translate
 from .gmsh_bridge import MeshOptions
 
 from ._mesh_targets import (
+    _MESH_GEOMETRY_POLICY_KEYS,
+    _canonicalize_geometry_owner_mapping,
     _coerce_positive_float,
-    _lookup_geometry_name_alias,
-    _parse_per_geometry_overrides,
-    _geometry_name_aliases,
+    _geometry_owner_alias_index,
+    _resolve_geometry_owner_name,
+    _scope_per_geometry_entries,
 )
 
 _NO_OP_FIELD_SIZE = 1.0e22
 _AIRBOX_BOUNDARY_TRANSITION_TOKENS = {"airbox_boundary", "airbox-boundary", "auto_boundary"}
+
+
+def _first_defined(mapping: Mapping[str, object] | None, *keys: str) -> object | None:
+    """Return the first explicitly supplied value, preserving falsey values.
+
+    Legacy mesh metadata uses aliases (for example ``bulk_hmax``/``hmax``),
+    and an explicit zero is a meaningful disable token for optional fields.
+    Boolean ``or`` chains lose that distinction and can silently re-enable an
+    alias.  Only a missing/``None`` value falls through to the next key.
+    """
+    if mapping is None:
+        return None
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return None
 
 
 def _is_airbox_boundary_transition(value: object) -> bool:
@@ -151,9 +170,13 @@ def _perimeter_refinement_config(
     if entry is None:
         return None
 
-    edge_hmax = _coerce_positive_float(entry.get("edge_maximum_element_size") or entry.get("edge_hmax"))
+    edge_hmax = _coerce_positive_float(
+        _first_defined(entry, "edge_maximum_element_size", "edge_hmax")
+    )
     edge_thickness = _coerce_positive_float(entry.get("edge_thickness"))
-    corner_hmax = _coerce_positive_float(entry.get("corner_maximum_element_size") or entry.get("corner_hmax"))
+    corner_hmax = _coerce_positive_float(
+        _first_defined(entry, "corner_maximum_element_size", "corner_hmax")
+    )
     corner_extent = _coerce_positive_float(entry.get("corner_extent"))
 
     if all(value is None for value in (edge_hmax, edge_thickness, corner_hmax, corner_extent)):
@@ -233,7 +256,7 @@ def _build_perimeter_refinement_fields(
     """Build box-local or component-boundary edge and corner refinement fields."""
     fields: list[dict[str, object]] = []
     for geometry in geometries:
-        entry = _lookup_geometry_name_alias(override_by_name, geometry.geometry_name)
+        entry = override_by_name.get(geometry.geometry_name)
         if entry is None:
             continue
 
@@ -369,11 +392,13 @@ def _build_perimeter_refinement_fields(
         use_rectangular_distance_fields = _unwrap_translated_box_geometry(geometry) is None
         air_side_fields: list[dict[str, object]] = []
         raw_bulk_hmax = (
-            entry.get("bulk_hmax") or entry.get("hmax")
+            _first_defined(entry, "bulk_hmax", "hmax")
             if entry is not None
             else None
         )
-        bulk_hmax = _coerce_positive_float(raw_bulk_hmax) or default_hmax
+        bulk_hmax = _coerce_positive_float(raw_bulk_hmax)
+        if bulk_hmax is None:
+            bulk_hmax = default_hmax
         transition_growth = (
             _coerce_positive_float(entry.get("transition_growth"))
             if entry is not None
@@ -659,7 +684,9 @@ def _legacy_box_size_fields(
         if bounds_min is None or bounds_max is None:
             continue
         entry = override_by_name.get(geometry.geometry_name)
-        target_hmax = _coerce_positive_float(entry.get("hmax") if entry else None) or default_hmax
+        target_hmax = _coerce_positive_float(entry.get("hmax") if entry else None)
+        if target_hmax is None:
+            target_hmax = default_hmax
         if target_hmax >= default_hmax:
             continue
         fields.append(
@@ -695,10 +722,12 @@ def _build_object_bulk_fields(
     """Build per-object bulk refinement fields."""
     fields: list[dict[str, object]] = []
     for geometry in geometries:
-        entry = _lookup_geometry_name_alias(override_by_name, geometry.geometry_name)
+        entry = override_by_name.get(geometry.geometry_name)
         bulk_hmax = _coerce_positive_float(
-            entry.get("bulk_hmax") or entry.get("hmax") if entry else None  # type: ignore[union-attr]
-        ) or default_hmax
+            _first_defined(entry, "bulk_hmax", "hmax") if entry else None
+        )
+        if bulk_hmax is None:
+            bulk_hmax = default_hmax
 
         if bulk_hmax >= default_hmax:
             continue
@@ -759,10 +788,12 @@ def _build_interface_fields(
     """Build interface refinement fields around each object."""
     fields: list[dict[str, object]] = []
     for geometry in geometries:
-        entry = _lookup_geometry_name_alias(override_by_name, geometry.geometry_name)
+        entry = override_by_name.get(geometry.geometry_name)
         bulk_hmax = _coerce_positive_float(
-            entry.get("bulk_hmax") or entry.get("hmax") if entry else None  # type: ignore[union-attr]
-        ) or default_hmax
+            _first_defined(entry, "bulk_hmax", "hmax") if entry else None
+        )
+        if bulk_hmax is None:
+            bulk_hmax = default_hmax
         interface_hmax = _coerce_positive_float(
             entry.get("interface_hmax") if entry else None  # type: ignore[union-attr]
         )
@@ -871,10 +902,12 @@ def _build_transition_fields(
     """Build transition zone fields from fine object region to coarse airbox."""
     fields: list[dict[str, object]] = []
     for geometry in geometries:
-        entry = _lookup_geometry_name_alias(override_by_name, geometry.geometry_name)
+        entry = override_by_name.get(geometry.geometry_name)
         bulk_hmax = _coerce_positive_float(
-            entry.get("bulk_hmax") or entry.get("hmax") if entry else None  # type: ignore[union-attr]
-        ) or default_hmax
+            _first_defined(entry, "bulk_hmax", "hmax") if entry else None
+        )
+        if bulk_hmax is None:
+            bulk_hmax = default_hmax
         raw_transition_distance = entry.get("transition_distance") if entry else None  # type: ignore[union-attr]
         if raw_transition_distance == 0 or raw_transition_distance == 0.0:
             continue
@@ -1045,37 +1078,63 @@ def _expand_object_core_relaxation(
     if not isinstance(geometry_name, str) or not geometry_name.strip():
         return []
     core_hmax = _coerce_positive_float(
-        params.get("core_maximum_element_size")
-        or params.get("core_hmax")
-        or params.get("CoreHmax")
+        _first_defined(
+            params,
+            "core_maximum_element_size",
+            "core_hmax",
+            "CoreHmax",
+        )
     )
     surface_hmax = _coerce_positive_float(
-        params.get("surface_maximum_element_size")
-        or params.get("surface_hmax")
-        or params.get("SurfaceHmax")
+        _first_defined(
+            params,
+            "surface_maximum_element_size",
+            "surface_hmax",
+            "SurfaceHmax",
+        )
     )
     surface_distance = _coerce_positive_float(
-        params.get("surface_distance") or params.get("SurfaceDistance")
+        _first_defined(params, "surface_distance", "SurfaceDistance")
     )
     if core_hmax is None or surface_hmax is None or surface_distance is None:
         return []
     edge_hmax = _coerce_positive_float(
-        params.get("edge_maximum_element_size")
-        or params.get("edge_hmax")
-        or params.get("EdgeHmax")
-    ) or surface_hmax
-    edge_distance = _coerce_positive_float(params.get("edge_distance") or params.get("edge_thickness")) or surface_distance
+        _first_defined(
+            params,
+            "edge_maximum_element_size",
+            "edge_hmax",
+            "EdgeHmax",
+        )
+    )
+    if edge_hmax is None:
+        edge_hmax = surface_hmax
+    edge_distance = _coerce_positive_float(
+        _first_defined(params, "edge_distance", "edge_thickness")
+    )
+    if edge_distance is None:
+        edge_distance = surface_distance
+
+    surface_sampling_raw = _first_defined(
+        params, "sampling_surface", "SamplingSurface", "Sampling"
+    )
     surface_sampling = int(
-        params.get("sampling_surface")
-        or params.get("SamplingSurface")
-        or params.get("Sampling")
-        or 20
+        parse_integer(
+            20 if surface_sampling_raw is None else surface_sampling_raw,
+            "/mesh_options/size_fields/ObjectCoreRelaxation/sampling_surface",
+            minimum=2,
+            allow_numeric_string=True,
+        )
+    )
+    edge_sampling_raw = _first_defined(
+        params, "sampling_edge", "SamplingEdge", "Sampling"
     )
     edge_sampling = int(
-        params.get("sampling_edge")
-        or params.get("SamplingEdge")
-        or params.get("Sampling")
-        or 40
+        parse_integer(
+            40 if edge_sampling_raw is None else edge_sampling_raw,
+            "/mesh_options/size_fields/ObjectCoreRelaxation/sampling_edge",
+            minimum=2,
+            allow_numeric_string=True,
+        )
     )
     return [
         {
@@ -1123,6 +1182,8 @@ def _build_field_stack(
     *,
     default_hmax: float,
     per_geometry: object,
+    owner_geometry_names: Sequence[str] | None = None,
+    per_object_recipes: dict[str, PerObjectMeshRecipe] | None = None,
     bounds_by_name: dict[str, tuple] | None = None,
     airbox_bounds: tuple[Sequence[float], Sequence[float]] | None = None,
     component_aware: bool = False,
@@ -1134,13 +1195,83 @@ def _build_field_stack(
     Falls back to Box-only bulk fields when no interface/transition params are
     specified, keeping backward compatibility.
     """
-    override_by_name = _parse_per_geometry_overrides(per_geometry)
+    owner_names, alias_candidates, current_geometries = _geometry_owner_alias_index(
+        geometries,
+        owner_geometry_names,
+    )
+    recipes_by_owner = _canonicalize_geometry_owner_mapping(
+        per_object_recipes,
+        owner_names=owner_names,
+        alias_candidates=alias_candidates,
+        owner_label="per-object recipe",
+    )
+    recipe_hmax_owners: set[str] = set()
+    for owner_name, recipe in recipes_by_owner.items():
+        if owner_name not in current_geometries or not isinstance(
+            recipe, PerObjectMeshRecipe
+        ):
+            continue
+        recipe_hmax = (
+            recipe.maximum_element_size
+            if recipe.maximum_element_size is not None
+            else recipe.hmax
+        )
+        if _coerce_positive_float(recipe_hmax) is not None:
+            recipe_hmax_owners.add(owner_name)
+
+    override_by_name: dict[str, Mapping[str, object]] = {}
+    scoped_per_geometry: list[object] = []
+    entries = per_geometry if isinstance(per_geometry, list) else []
+    for entry in entries:
+        if not isinstance(entry, Mapping):
+            continue
+        owner = entry.get("geometry") or entry.get("geometry_name")
+        if not isinstance(owner, str) or not owner.strip():
+            scoped_per_geometry.append(entry)
+            continue
+        has_policy = any(
+            key in _MESH_GEOMETRY_POLICY_KEYS
+            and value is not None
+            and not (key == "size_fields" and value == [])
+            for key, value in entry.items()
+        )
+        try:
+            resolved_owner = _resolve_geometry_owner_name(
+                owner,
+                owner_names=owner_names,
+                alias_candidates=alias_candidates,
+            )
+        except ValueError:
+            if has_policy:
+                raise
+            continue
+        if resolved_owner is None:
+            if has_policy:
+                raise ValueError(
+                    "mesh_size_field_owner_binding_missing: "
+                    f"per_geometry owner='{owner}' has no matching mesh geometry"
+                )
+            continue
+        if resolved_owner not in current_geometries:
+            continue
+        # Match _parse_per_geometry_overrides' first-entry-wins behavior for
+        # duplicate policies that resolve to the same canonical owner.
+        override_by_name.setdefault(resolved_owner, entry)
+        scoped_entry = dict(entry)
+        scoped_entry["geometry"] = current_geometries[resolved_owner].geometry_name
+        scoped_per_geometry.append(scoped_entry)
+
+    override_by_geometry_name = {
+        geometry.geometry_name: override_by_name[owner_name]
+        for owner_name, geometry in current_geometries.items()
+        if owner_name in override_by_name and owner_name not in recipe_hmax_owners
+    }
 
     # Layer 1: Object bulk (Box fields)
     fields = _build_object_bulk_fields(
         geometries,
         default_hmax=default_hmax,
-        override_by_name=override_by_name,
+        override_by_name=override_by_geometry_name,
         bounds_by_name=bounds_by_name,
         component_aware=component_aware,
     )
@@ -1149,7 +1280,7 @@ def _build_field_stack(
     interface_fields = _build_interface_fields(
         geometries,
         default_hmax=default_hmax,
-        override_by_name=override_by_name,
+        override_by_name=override_by_geometry_name,
         bounds_by_name=bounds_by_name,
         component_aware=component_aware,
     )
@@ -1160,7 +1291,7 @@ def _build_field_stack(
     transition_fields = _build_transition_fields(
         geometries,
         default_hmax=default_hmax,
-        override_by_name=override_by_name,
+        override_by_name=override_by_geometry_name,
         bounds_by_name=bounds_by_name,
         airbox_bounds=airbox_bounds,
         component_aware=component_aware,
@@ -1171,7 +1302,7 @@ def _build_field_stack(
     perimeter_fields = _build_perimeter_refinement_fields(
         geometries,
         default_hmax=default_hmax,
-        override_by_name=override_by_name,
+        override_by_name=override_by_geometry_name,
         bounds_by_name=bounds_by_name,
         airbox_bounds=airbox_bounds,
         component_aware=component_aware,
@@ -1180,7 +1311,7 @@ def _build_field_stack(
         fields.extend(perimeter_fields)
 
     # Layer 4: Manual hotspot fields
-    hotspot_fields = _build_manual_hotspot_fields(per_geometry)
+    hotspot_fields = _build_manual_hotspot_fields(scoped_per_geometry)
     if hotspot_fields:
         fields.extend(hotspot_fields)
 
@@ -1188,15 +1319,25 @@ def _build_field_stack(
     region_fields = []
     if object_regions:
         from fullmag.model.domain_frame import geometry_bounds
-        for region in object_regions:
+        for region_index, region in enumerate(object_regions):
             if not region.get("enabled", True):
                 continue
-            owner = region.get("owner_object")
-            aliases = _geometry_name_aliases(owner)
-            geometry = next((g for g in geometries if g.geometry_name in aliases), None)
+            owner = region.get("owner_geometry_name") or region.get("owner_object")
+            resolved_owner = _resolve_geometry_owner_name(
+                owner,
+                owner_names=owner_names,
+                alias_candidates=alias_candidates,
+            )
+            geometry = current_geometries.get(resolved_owner)
 
             mesh_policy = region.get("mesh_policy")
-            if not mesh_policy or mesh_policy.get("maximum_element_size") is None:
+            if not isinstance(mesh_policy, Mapping):
+                continue
+            region_id = str(
+                region.get("region_id") or region.get("name") or f"{owner}:{region_index}"
+            )
+            r_order = _validate_region_mesh_policy_order(region_id, mesh_policy)
+            if mesh_policy.get("maximum_element_size") is None:
                 continue
 
             if geometry is None:
@@ -1210,15 +1351,6 @@ def _build_field_stack(
             r_hmin = mesh_policy.get("minimum_element_size")
             if r_hmin is not None:
                 r_hmin = float(r_hmin)
-            r_order = mesh_policy.get("order")
-            if r_order is not None:
-                r_order = int(r_order)
-                if r_order != 1:
-                    raise ValueError(
-                        "region_mesh_policy_order_unsupported: "
-                        f"region='{region.get('region_id') or region.get('name')}' "
-                        f"requested_order={r_order}; only first-order mesh extraction is supported"
-                    )
             r_trans = mesh_policy.get("transition_distance")
             if r_trans is not None:
                 r_trans = float(r_trans)
@@ -1248,11 +1380,32 @@ def _build_field_stack(
             else:
                 region_center = [float(raw_center[i]) for i in range(3)]
 
-            owner_override = override_by_name.get(owner, {}) if override_by_name else {}
-            parent_hmax = owner_override.get("hmax") or default_hmax
+            owner_override = (
+                override_by_name.get(resolved_owner, {})
+                if override_by_name and resolved_owner is not None
+                else {}
+            )
+            recipe = recipes_by_owner.get(resolved_owner)
+            recipe_hmax = None
+            if isinstance(recipe, PerObjectMeshRecipe):
+                recipe_hmax = (
+                    recipe.maximum_element_size
+                    if recipe.maximum_element_size is not None
+                    else recipe.hmax
+                )
+            parent_hmax = (
+                _coerce_positive_float(recipe_hmax)
+                or _coerce_positive_float(owner_override.get("hmax"))
+                or default_hmax
+            )
 
             common_params = {
                 "GeometryName": geometry.geometry_name,
+                "RegionId": str(
+                    region.get("region_id")
+                    or region.get("name")
+                    or f"{owner}:{region_index}"
+                ),
                 "Source": "region_mesh_policy",
             }
             if r_hmin is not None:
@@ -1390,6 +1543,7 @@ def _resolve_per_object_mesh_options(
     assembly_policy: SharedMeshAssemblyPolicy,  # kept for API compat
     *,
     default_hmax: float,
+    owner_geometry_names: Sequence[str] | None = None,
     bounds_by_name: dict[str, tuple] | None = None,
     component_aware: bool = False,
 ) -> list[dict[str, object]]:
@@ -1401,10 +1555,36 @@ def _resolve_per_object_mesh_options(
     airbox and can turn thin-film shared-domain meshes into million-element
     meshes.
     """
+    canonical_policy = SharedMeshAssemblyPolicy()
+    if not isinstance(assembly_policy, SharedMeshAssemblyPolicy):
+        raise TypeError(
+            "assembly_policy must be a SharedMeshAssemblyPolicy"
+        )
+    if assembly_policy != canonical_policy:
+        raise ValueError(
+            "shared_mesh_assembly_policy_unsupported: non-default assembly "
+            "policy fields have no validated size-field lowering"
+        )
+
+    owner_names, alias_candidates, _current_geometries = _geometry_owner_alias_index(
+        geometries,
+        owner_geometry_names,
+    )
+    recipes_by_owner = _canonicalize_geometry_owner_mapping(
+        per_object_recipes,
+        owner_names=owner_names,
+        alias_candidates=alias_candidates,
+        owner_label="per-object recipe",
+    )
     extra_fields: list[dict[str, object]] = []
     for geometry in geometries:
-        recipe = _lookup_geometry_name_alias(per_object_recipes, geometry.geometry_name)
-        if recipe is None:
+        geometry_owner = _resolve_geometry_owner_name(
+            geometry.geometry_name,
+            owner_names=owner_names,
+            alias_candidates=alias_candidates,
+        )
+        recipe = recipes_by_owner.get(geometry_owner)
+        if not isinstance(recipe, PerObjectMeshRecipe):
             continue
         recipe_payload = recipe.to_ir()
         if bounds_by_name is not None:
@@ -1459,11 +1639,217 @@ def _resolve_per_object_mesh_options(
 # MeshOptions from workflow metadata
 # ===================================================================
 
+def _validate_region_mesh_policy_order(
+    region_id: str,
+    mesh_policy: Mapping[str, object],
+) -> int | None:
+    raw_order = mesh_policy.get("order")
+    if raw_order is None:
+        return None
+    try:
+        order = int(raw_order)
+    except (TypeError, ValueError, OverflowError):
+        order = raw_order
+    if order != 1:
+        raise ValueError(
+            "region_mesh_policy_order_unsupported: "
+            f"region='{region_id}' requested_order={order}; "
+            "only first-order mesh extraction is supported"
+        )
+    return 1
+
+
+def _build_scoped_lower_bound_fields(
+    geometries: list[Geometry],
+    *,
+    per_geometry: list[object],
+    per_object_recipes: dict[str, PerObjectMeshRecipe] | None,
+    object_regions: list[dict[str, object]],
+    owner_geometry_names: Sequence[str] | None = None,
+) -> list[dict[str, object]]:
+    """Preserve body and material-region lower bounds with their owners.
+
+    These are semantic lower-bound descriptors.  Gmsh realization happens in
+    ``_configure_mesh_size_fields`` where component volume identity is known.
+    A standalone object mesh may receive the full authoring roster; in that
+    case valid policies for other objects stay bound to those owners and are
+    omitted from this object's fields.
+    """
+    lower_bounds: list[dict[str, object]] = []
+    owner_names, alias_candidates, current_geometries = _geometry_owner_alias_index(
+        geometries,
+        owner_geometry_names,
+    )
+    per_geometry_by_owner: dict[str, Mapping[str, object]] = {}
+    recipe_by_owner = _canonicalize_geometry_owner_mapping(
+        per_object_recipes,
+        owner_names=owner_names,
+        alias_candidates=alias_candidates,
+        owner_label="per-object recipe",
+        missing_error_code="mesh_lower_bound_owner_binding_missing",
+    )
+
+    for entry in per_geometry:
+        if not isinstance(entry, Mapping):
+            continue
+        owner = entry.get("geometry") or entry.get("geometry_name")
+        resolved_owner = _resolve_geometry_owner_name(
+            owner,
+            owner_names=owner_names,
+            alias_candidates=alias_candidates,
+        )
+        if resolved_owner is not None:
+            per_geometry_by_owner.setdefault(resolved_owner, entry)
+        raw_hmin = _first_defined(entry, "hmin", "minimum_element_size")
+        if _coerce_positive_float(raw_hmin) is None:
+            continue
+        if resolved_owner is None:
+            raise ValueError(
+                "mesh_lower_bound_owner_binding_missing: "
+                f"per_geometry owner='{owner}' has no matching mesh geometry"
+            )
+
+    for geometry in geometries:
+        geometry_owner = _resolve_geometry_owner_name(
+            geometry.geometry_name,
+            owner_names=owner_names,
+            alias_candidates=alias_candidates,
+        )
+        recipe = recipe_by_owner.get(geometry_owner)
+        recipe_payload = recipe.to_ir() if isinstance(recipe, PerObjectMeshRecipe) else {}
+        recipe_hmin = _first_defined(recipe_payload, "hmin", "minimum_element_size")
+        per_geometry_entry = per_geometry_by_owner.get(geometry_owner)
+        per_geometry_hmin = (
+            _first_defined(per_geometry_entry, "hmin", "minimum_element_size")
+            if isinstance(per_geometry_entry, Mapping)
+            else None
+        )
+        raw_hmin = recipe_hmin if recipe_hmin is not None else per_geometry_hmin
+        body_hmin = _coerce_positive_float(raw_hmin)
+        if body_hmin is None:
+            continue
+        lower_bounds.append(
+            {
+                "kind": "ComponentVolumeLowerBound",
+                "params": {
+                    "GeometryName": geometry.geometry_name,
+                    "MinimumElementSize": float(body_hmin),
+                    "Source": (
+                        "per_object_mesh_recipe"
+                        if recipe_hmin is not None
+                        else "per_geometry_mesh_policy"
+                    ),
+                },
+            }
+        )
+
+    for index, region in enumerate(object_regions):
+        if not isinstance(region, Mapping) or not region.get("enabled", True):
+            continue
+        mesh_policy = region.get("mesh_policy")
+        if not isinstance(mesh_policy, Mapping):
+            continue
+        region_id = str(region.get("region_id") or region.get("name") or f"{region.get('owner_object')}:{index}")
+        _validate_region_mesh_policy_order(region_id, mesh_policy)
+        region_hmin = _coerce_positive_float(
+            _first_defined(mesh_policy, "minimum_element_size", "hmin")
+        )
+        if region_hmin is None:
+            continue
+
+        owner = region.get("owner_geometry_name") or region.get("owner_object")
+        resolved_owner = _resolve_geometry_owner_name(
+            owner,
+            owner_names=owner_names,
+            alias_candidates=alias_candidates,
+        )
+        if resolved_owner is None:
+            raise ValueError(
+                "mesh_lower_bound_owner_binding_missing: "
+                f"region='{region_id}' owner='{owner}' has no matching mesh geometry"
+            )
+        geometry = current_geometries.get(resolved_owner)
+        if geometry is None:
+            continue
+
+        shape = region.get("shape")
+        if not isinstance(shape, Mapping):
+            raise ValueError(
+                "mesh_lower_bound_shape_unsupported: "
+                f"region='{region_id}' has no supported geometric shape"
+            )
+        kind = shape.get("kind")
+        if kind not in {"box", "cylinder", "sphere"}:
+            raise ValueError(
+                "mesh_lower_bound_shape_unsupported: "
+                f"region='{region_id}' shape_kind='{kind}'"
+            )
+
+        bounds = geometry_bounds(geometry, source_root=None)
+        if bounds is None or bounds[0] is None or bounds[1] is None:
+            raise ValueError(
+                "mesh_lower_bound_owner_binding_missing: "
+                f"region='{region_id}' owner='{owner}' has no recoverable geometry bounds"
+            )
+        g_min, g_max = bounds
+        owner_center = [0.5 * (g_min[axis] + g_max[axis]) for axis in range(3)]
+        frame = region.get("frame", "object")
+        raw_center = shape.get("center", [0.0, 0.0, 0.0])
+        if not isinstance(raw_center, (list, tuple)) or len(raw_center) != 3:
+            raise ValueError(
+                "mesh_lower_bound_shape_unsupported: "
+                f"region='{region_id}' center must have three coordinates"
+            )
+        center = [
+            float(raw_center[axis]) + owner_center[axis]
+            if frame == "object"
+            else float(raw_center[axis])
+            for axis in range(3)
+        ]
+        params: dict[str, object] = {
+            "GeometryName": geometry.geometry_name,
+            "RegionId": region_id,
+            "ShapeKind": str(kind),
+            "Center": center,
+            "MinimumElementSize": float(region_hmin),
+            "Source": "region_mesh_policy",
+        }
+        if kind == "box":
+            size = shape.get("size")
+            if not isinstance(size, (list, tuple)) or len(size) != 3:
+                raise ValueError(
+                    "mesh_lower_bound_shape_unsupported: "
+                    f"region='{region_id}' box size must have three coordinates"
+                )
+            params["Size"] = [float(value) for value in size]
+        elif kind == "cylinder":
+            params["Radius"] = float(shape.get("radius"))
+            params["Height"] = float(shape.get("height"))
+            axis = shape.get("axis", [0.0, 0.0, 1.0])
+            if not isinstance(axis, (list, tuple)) or len(axis) != 3:
+                raise ValueError(
+                    "mesh_lower_bound_shape_unsupported: "
+                    f"region='{region_id}' cylinder axis must have three coordinates"
+                )
+            params["Axis"] = [float(value) for value in axis]
+        else:
+            params["Radius"] = float(shape.get("radius"))
+
+        lower_bounds.append(
+            {
+                "kind": "ComponentRegionLowerBound",
+                "params": params,
+            }
+        )
+    return lower_bounds
+
+
 def _mesh_options_from_runtime_metadata(
     mesh_workflow: Mapping[str, object] | None,
     *,
     geometries: list[Geometry],
     default_hmax: float,
+    owner_geometry_names: Sequence[str] | None = None,
     bounds_by_name: dict[str, tuple] | None = None,
     airbox_bounds: tuple[Sequence[float], Sequence[float]] | None = None,
     component_aware: bool = False,
@@ -1478,13 +1864,21 @@ def _mesh_options_from_runtime_metadata(
         else {}
     )
     assert isinstance(raw_mesh_options, Mapping)
-    raw_per_geometry = (
+    raw_per_geometry_payload = (
         mesh_workflow.get("per_geometry")
         if isinstance(mesh_workflow, Mapping)
         and isinstance(mesh_workflow.get("per_geometry"), list)
         else []
     )
-    assert isinstance(raw_per_geometry, list)
+    assert isinstance(raw_per_geometry_payload, list)
+    raw_per_geometry = [
+        entry
+        for _owner, entry in _scope_per_geometry_entries(
+            raw_per_geometry_payload,
+            geometries=geometries,
+            owner_geometry_names=owner_geometry_names,
+        )
+    ]
     raw_default_mesh = (
         mesh_workflow.get("default_mesh")
         if isinstance(mesh_workflow, Mapping)
@@ -1492,6 +1886,17 @@ def _mesh_options_from_runtime_metadata(
         else {}
     )
     assert isinstance(raw_default_mesh, Mapping)
+
+    owner_names, alias_candidates, _current_geometries = _geometry_owner_alias_index(
+        geometries,
+        owner_geometry_names,
+    )
+    recipes_by_owner = _canonicalize_geometry_owner_mapping(
+        per_object_recipes,
+        owner_names=owner_names,
+        alias_candidates=alias_candidates,
+        owner_label="per-object recipe",
+    )
 
     def _single_geometry_value(key: str) -> object | None:
         entries = [entry for entry in raw_per_geometry if isinstance(entry, Mapping)]
@@ -1517,10 +1922,12 @@ def _mesh_options_from_runtime_metadata(
             return None
         values: list[object] = []
         for geometry in geometries:
-            recipe = _lookup_geometry_name_alias(
-                per_object_recipes,
+            geometry_owner = _resolve_geometry_owner_name(
                 geometry.geometry_name,
+                owner_names=owner_names,
+                alias_candidates=alias_candidates,
             )
+            recipe = recipes_by_owner.get(geometry_owner)
             if not isinstance(recipe, PerObjectMeshRecipe):
                 continue
             recipe_payload = recipe.to_ir()
@@ -1534,9 +1941,9 @@ def _mesh_options_from_runtime_metadata(
             return None
         if reducer == "min":
             numeric_values = [
-                float(value)
+                parsed
                 for value in values
-                if isinstance(value, (int, float))
+                if (parsed := _coerce_positive_float(value)) is not None
             ]
             return min(numeric_values) if numeric_values else None
         first = values[0]
@@ -1557,9 +1964,9 @@ def _mesh_options_from_runtime_metadata(
             for key in keys:
                 values.extend(_per_geometry_values(key))
             numeric_values = [
-                float(value)
+                parsed
                 for value in values
-                if isinstance(value, (int, float))
+                if (parsed := _coerce_positive_float(value)) is not None
             ]
             return min(numeric_values) if numeric_values else None
         for key in keys:
@@ -1572,12 +1979,22 @@ def _mesh_options_from_runtime_metadata(
     patch_object_regions = patch.get("object_regions") if isinstance(patch, Mapping) else None
     effective_object_regions = patch_object_regions or object_regions
 
+    scoped_lower_bound_fields = _build_scoped_lower_bound_fields(
+        geometries,
+        per_geometry=raw_per_geometry,
+        per_object_recipes=per_object_recipes,
+        owner_geometry_names=owner_geometry_names,
+        object_regions=(
+            [region for region in effective_object_regions if isinstance(region, dict)]
+            if isinstance(effective_object_regions, list)
+            else []
+        ),
+    )
+
     def _mesh_hmin_value() -> object | None:
-        values = [
-            value for value in (_mesh_option_value("hmin", "minimum_element_size", reducer="min"),)
-            if isinstance(value, (int, float))
-        ]
-        return min(values) if values else None
+        # Only mesh_options carries the operator-global floor. Per-geometry
+        # recipes and body overrides are retained in scoped_lower_bound_fields.
+        return _first_defined(raw_mesh_options, "hmin", "minimum_element_size")
 
     def _shared_per_geometry_value(key: str) -> object | None:
         values = _per_geometry_values(key)
@@ -1607,6 +2024,8 @@ def _mesh_options_from_runtime_metadata(
                 geometries,
                 default_hmax=default_hmax,
                 per_geometry=mesh_workflow.get("per_geometry") if isinstance(mesh_workflow, Mapping) else None,
+                owner_geometry_names=owner_geometry_names,
+                per_object_recipes=per_object_recipes,
                 bounds_by_name=bounds_by_name,
                 airbox_bounds=airbox_bounds,
                 component_aware=component_aware,
@@ -1614,15 +2033,18 @@ def _mesh_options_from_runtime_metadata(
             )
         )
     optimize = _mesh_option_value("optimize")
-    raw_mesh_strategy = raw_mesh_options.get("mesh_strategy") or _single_geometry_value("mesh_strategy")
+    raw_mesh_strategy = _first_non_none(
+        raw_mesh_options.get("mesh_strategy"),
+        _single_geometry_value("mesh_strategy"),
+    )
     raw_through_thickness_elements = (
         raw_mesh_options.get("through_thickness_elements")
         if raw_mesh_options.get("through_thickness_elements") is not None
         else _single_geometry_value("through_thickness_elements")
     )
-    raw_through_thickness_distribution = (
-        raw_mesh_options.get("through_thickness_distribution")
-        or _single_geometry_value("through_thickness_distribution")
+    raw_through_thickness_distribution = _first_non_none(
+        raw_mesh_options.get("through_thickness_distribution"),
+        _single_geometry_value("through_thickness_distribution"),
     )
     raw_through_thickness_element_ratio = (
         raw_mesh_options.get("through_thickness_element_ratio")
@@ -1634,9 +2056,11 @@ def _mesh_options_from_runtime_metadata(
         if raw_mesh_options.get("through_thickness_symmetric") is not None
         else _single_geometry_value("through_thickness_symmetric")
     )
-    raw_sweep_face_meshing = raw_mesh_options.get("sweep_face_meshing") or _single_geometry_value(
-        "sweep_face_meshing"
+    raw_sweep_face_meshing = _first_non_none(
+        raw_mesh_options.get("sweep_face_meshing"),
+        _single_geometry_value("sweep_face_meshing"),
     )
+    raw_sweep_direction = _mesh_option_value("sweep_direction")
     raw_boundary_layer_count = _first_non_none(
         raw_mesh_options.get("boundary_layer_count"),
         _shared_per_geometry_value("boundary_layer_count"),
@@ -1669,29 +2093,106 @@ def _mesh_options_from_runtime_metadata(
     raw_per_element_quality = _mesh_option_value("per_element_quality")
 
     def _int_list(value: object) -> list[int] | None:
-        if not isinstance(value, list):
+        if value is None:
             return None
-        return [int(item) for item in value]
-
-    def _selector_list(value: object) -> list[dict[str, object]] | None:
         if not isinstance(value, list):
-            return None
-        return [dict(item) for item in value if isinstance(item, Mapping)]
-
-    def _str_list(value: object) -> list[str]:
-        if not isinstance(value, list):
-            return []
+            raise TypedValidationError(
+                code="list_type_error",
+                pointer="/mesh_workflow/mesh_options/integer_list",
+                message="value must be a list of integers",
+                value=type(value).__name__,
+            )
         return [
-            str(item).strip()
+            int(parse_integer(
+                item,
+                "/mesh_workflow/mesh_options/integer_list",
+                minimum=1,
+                allow_numeric_string=True,
+            ))
             for item in value
-            if isinstance(item, str) and item.strip()
         ]
 
+    def _selector_list(value: object) -> list[dict[str, object]] | None:
+        if value is None:
+            return None
+        if not isinstance(value, list):
+            raise TypedValidationError(
+                code="list_type_error",
+                pointer="/mesh_workflow/mesh_options/selector_list",
+                message="value must be a list of selector objects",
+                value=type(value).__name__,
+            )
+        result: list[dict[str, object]] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, Mapping):
+                raise TypedValidationError(
+                    code="selector_type_error",
+                    pointer=f"/mesh_workflow/mesh_options/selector_list/{index}",
+                    message="selector entries must be objects",
+                    value=type(item).__name__,
+                )
+            result.append(dict(item))
+        return result
+
+    def _str_list(value: object) -> list[str]:
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise TypedValidationError(
+                code="list_type_error",
+                pointer="/mesh_workflow/mesh_options/string_list",
+                message="value must be a list of non-empty strings",
+                value=type(value).__name__,
+            )
+        result: list[str] = []
+        for index, item in enumerate(value):
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError(
+                    f"/mesh_workflow/mesh_options/string_list/{index} must be a non-empty string"
+                )
+            result.append(item.strip())
+        return result
+
+    def _legacy_positive_float(
+        value: object,
+        field: str,
+        *,
+        default: float | None = None,
+    ) -> float | None:
+        if value is None:
+            return default
+        parsed = parse_finite_float(
+            value,
+            f"/mesh_workflow/mesh_options/{field}",
+            positive=True,
+            allow_numeric_string=True,
+        )
+        return float(parsed)
+
+    def _legacy_int(value: object, field: str, *, minimum: int, default: int | None = None) -> int | None:
+        if value is None:
+            return default
+        parsed = parse_integer(
+            value,
+            f"/mesh_workflow/mesh_options/{field}",
+            minimum=minimum,
+            allow_numeric_string=True,
+        )
+        return int(parsed)
+
+    def _legacy_bool(value: object, field: str, *, default: bool) -> bool:
+        parsed = parse_bool(
+            default if value is None else value,
+            f"/mesh_workflow/mesh_options/{field}",
+        )
+        return bool(parsed)
+
     raw_optimize_iters = _mesh_option_value("optimize_iterations", "optimize_iters")
+    raw_smoothing_steps = _mesh_option_value("smoothing_steps")
 
     return MeshOptions(
-        algorithm_2d=int(_mesh_option_value("algorithm_2d") or 6),
-        algorithm_3d=int(_mesh_option_value("algorithm_3d") or 1),
+        algorithm_2d=int(_legacy_int(_mesh_option_value("algorithm_2d"), "algorithm_2d", minimum=1, default=6)),
+        algorithm_3d=int(_legacy_int(_mesh_option_value("algorithm_3d"), "algorithm_3d", minimum=1, default=1)),
         hmin=_coerce_positive_float(_mesh_hmin_value()),
         calibrate_for=(
             str(_mesh_option_value("calibrate_for"))
@@ -1703,37 +2204,38 @@ def _mesh_options_from_runtime_metadata(
             if isinstance(_mesh_option_value("size_preset"), str)
             else None
         ),
-        size_factor=float(_mesh_option_value("size_factor") or 1.0),
-        size_from_curvature=int(_mesh_option_value("size_from_curvature") or 0),
+        size_factor=float(_legacy_positive_float(_mesh_option_value("size_factor"), "size_factor", default=1.0)),
+        size_from_curvature=int(_legacy_int(_mesh_option_value("size_from_curvature"), "size_from_curvature", minimum=0, default=0)),
         curvature_factor=_coerce_positive_float(
             _mesh_option_value("curvature_factor")
         ),
         growth_rate=_coerce_positive_float(
             _mesh_option_value("growth_rate", "maximum_element_growth_rate")
         ),
-        narrow_regions=int(_mesh_option_value("narrow_regions") or 0),
+        narrow_regions=int(_legacy_int(_mesh_option_value("narrow_regions"), "narrow_regions", minimum=0, default=0)),
         narrow_region_resolution=_coerce_positive_float(
             _mesh_option_value("narrow_region_resolution")
         ),
-        smoothing_steps=int(_mesh_option_value("smoothing_steps") or 1),
+        smoothing_steps=int(_legacy_int(raw_smoothing_steps, "smoothing_steps", minimum=0, default=1)),
         optimize=str(optimize) if isinstance(optimize, str) and optimize.strip() else None,
-        optimize_iters=int(raw_optimize_iters) if raw_optimize_iters is not None else 1,
+        optimize_iters=int(_legacy_int(raw_optimize_iters, "optimize_iters", minimum=1, default=1)),
         size_fields=size_fields,
-        compute_quality=(
-            bool(raw_compute_quality) if raw_compute_quality is not None else True
-        ),
-        per_element_quality=(
-            bool(raw_per_element_quality) if raw_per_element_quality is not None else True
+        lower_bound_fields=scoped_lower_bound_fields,
+        compute_quality=_legacy_bool(raw_compute_quality, "compute_quality", default=True),
+        per_element_quality=_legacy_bool(
+            raw_per_element_quality,
+            "per_element_quality",
+            default=True,
         ),
         mesh_strategy=(
             str(raw_mesh_strategy)
             if isinstance(raw_mesh_strategy, str) and raw_mesh_strategy.strip()
             else None
         ),
-        through_thickness_elements=(
-            int(raw_through_thickness_elements)
-            if raw_through_thickness_elements is not None
-            else None
+        through_thickness_elements=_legacy_int(
+            raw_through_thickness_elements,
+            "through_thickness_elements",
+            minimum=1,
         ),
         through_thickness_distribution=(
             str(raw_through_thickness_distribution)
@@ -1744,16 +2246,25 @@ def _mesh_options_from_runtime_metadata(
         through_thickness_element_ratio=_coerce_positive_float(
             raw_through_thickness_element_ratio
         ),
-        through_thickness_symmetric=bool(raw_through_thickness_symmetric or False),
+        through_thickness_symmetric=_legacy_bool(
+            raw_through_thickness_symmetric,
+            "through_thickness_symmetric",
+            default=False,
+        ),
         sweep_face_meshing=(
             str(raw_sweep_face_meshing)
             if isinstance(raw_sweep_face_meshing, str) and raw_sweep_face_meshing.strip()
             else None
         ),
-        boundary_layer_count=(
-            int(raw_boundary_layer_count)
-            if raw_boundary_layer_count is not None and int(raw_boundary_layer_count) > 0
+        sweep_direction=(
+            str(raw_sweep_direction).strip()
+            if isinstance(raw_sweep_direction, str) and raw_sweep_direction.strip()
             else None
+        ),
+        boundary_layer_count=_legacy_int(
+            raw_boundary_layer_count,
+            "boundary_layer_count",
+            minimum=1,
         ),
         boundary_layer_thickness=_coerce_positive_float(raw_boundary_layer_thickness),
         boundary_layer_stretching=_coerce_positive_float(raw_boundary_layer_stretching),
@@ -1766,7 +2277,9 @@ def _mesh_options_from_runtime_metadata(
             raw_boundary_layer_curve_selectors
         ),
         periodic_pair_ids=_str_list(
-            _mesh_option_value("periodic_pair_ids")
-            or raw_default_mesh.get("periodic_pair_ids")
+            _first_non_none(
+                _mesh_option_value("periodic_pair_ids"),
+                raw_default_mesh.get("periodic_pair_ids"),
+            )
         ),
     )

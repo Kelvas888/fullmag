@@ -310,6 +310,27 @@ fn attach_compatibility_registry(
     mut capabilities: BackendCapabilities,
     precision: fullmag_ir::ExecutionPrecision,
 ) -> BackendCapabilities {
+    if precision == fullmag_ir::ExecutionPrecision::Single {
+        let frozen_fp32_executable = capabilities.engine_id == RuntimeEngineId::FdmCuda
+            && capabilities
+                .feature_capabilities
+                .get("constraint.frozen_spins")
+                .is_some_and(|feature| feature.scope.contains("single_grid"));
+        if let Some(feature) = capabilities
+            .feature_capabilities
+            .get_mut("constraint.frozen_spins")
+        {
+            if frozen_fp32_executable {
+                feature.status = FeatureCapabilityStatus::DevelopmentExecutable;
+                feature.reason = "Frozen Spins execution is available for the resolved FDM CUDA single-grid FP32 lane; production qualification remains receipt-scoped.".to_string();
+                feature.scope = "single_grid; device=cuda; precision=single; integrators=heun|rk4|rk23|dp45|abm3; hard_restore=quantized_bitwise".to_string();
+            } else {
+                feature.status = FeatureCapabilityStatus::Unsupported;
+                feature.reason = "Frozen Spins execution is not implemented for this lane in single precision; authoring remains available but execution must fail closed.".to_string();
+                feature.scope = format!("{}; precision=double", feature.scope);
+            }
+        }
+    }
     let mut field_quantities = capabilities
         .preview_quantities
         .iter()
@@ -484,6 +505,7 @@ fn fdm_supported_terms(profile: FdmCapabilityProfile, cuda: bool) -> Vec<String>
             "uniaxial_anisotropy",
             "cubic_anisotropy",
             "interfacial_dmi",
+            "rotated_interfacial_dmi",
             "bulk_dmi",
             "stt",
             "sot",
@@ -496,6 +518,7 @@ fn fdm_supported_terms(profile: FdmCapabilityProfile, cuda: bool) -> Vec<String>
             "uniaxial_anisotropy",
             "cubic_anisotropy",
             "interfacial_dmi",
+            "rotated_interfacial_dmi",
         ],
     };
     let mut terms = terms.into_iter().map(str::to_string).collect::<Vec<_>>();
@@ -552,7 +575,7 @@ fn mixed_p1_feature_capabilities(
     const FDM_REASON: &str =
         "Mixed-P1 shared-domain topology is FEM-only; FDM retains Cartesian cells.";
     const OPERATOR_SCOPE: &str =
-        "double; one axis-aligned P1 Box; one conforming shared-domain airbox; requested_layers=realized_layers={1,2,3}; magnetic_node_planes=requested_layers+1; uniform Ms/Aex; exchange; uniform Zeeman; Poisson Robin|Dirichlet; PG-BB|NCG|overdamped LLG; no fallback";
+        "double; one axis-aligned P1 Box; one conforming shared-domain airbox; requested_layers=realized_layers={1,2,3}; magnetic_node_planes=requested_layers+1; uniform Ms/Aex/Ku1/Ku2 and one anisotropy axis; exchange; uniform Zeeman; Poisson Robin|Dirichlet; PG-BB|NCG|overdamped LLG; no fallback";
 
     let mesh_status = match fem_engine {
         Some(FemEngine::CpuNative | FemEngine::NativeGpu) => FeatureCapabilityStatus::Implemented,
@@ -634,7 +657,7 @@ pub(crate) fn capabilities_for_fdm_engine(
     engine: FdmEngine,
     profile: FdmCapabilityProfile,
 ) -> BackendCapabilities {
-    let capabilities = match engine {
+    let mut capabilities = match engine {
         FdmEngine::CpuReference => BackendCapabilities {
             supports_frequency_response: DEFERRED_STUDY_CAPABILITY,
             supports_coupled_magnetoelastic_quasistatic: DEFERRED_STUDY_CAPABILITY,
@@ -652,12 +675,14 @@ pub(crate) fn capabilities_for_fdm_engine(
             // H_ant is always zero (no antenna connectivity in the reference path).
             preview_quantities: quantity_names(&[
                 QuantityId::M,
+                QuantityId::FrozenSpins,
                 QuantityId::HEx,
                 QuantityId::HDemag,
                 QuantityId::HExt,
                 QuantityId::Torque,
                 QuantityId::HAni,
                 QuantityId::HDmi,
+                QuantityId::HDmiRotated,
                 QuantityId::HEff,
                 QuantityId::EdenEx,
                 QuantityId::EdenDemag,
@@ -665,15 +690,18 @@ pub(crate) fn capabilities_for_fdm_engine(
                 QuantityId::EdenDrive,
                 QuantityId::EdenAni,
                 QuantityId::EdenDmi,
+                QuantityId::EdenRotatedDmi,
                 QuantityId::EdenTotal,
             ]),
             snapshot_quantities: quantity_names(&[
                 QuantityId::M,
+                QuantityId::FrozenSpins,
                 QuantityId::HEx,
                 QuantityId::HDemag,
                 QuantityId::HExt,
                 QuantityId::HAni,
                 QuantityId::HDmi,
+                QuantityId::HDmiRotated,
                 QuantityId::HEff,
                 QuantityId::EdenEx,
                 QuantityId::EdenDemag,
@@ -681,12 +709,14 @@ pub(crate) fn capabilities_for_fdm_engine(
                 QuantityId::EdenDrive,
                 QuantityId::EdenAni,
                 QuantityId::EdenDmi,
+                QuantityId::EdenRotatedDmi,
                 QuantityId::EdenTotal,
             ]),
             scalar_outputs: vec![
                 "E_ex".to_string(),
                 "E_demag".to_string(),
                 "E_ext".to_string(),
+                "E_rotated_dmi".to_string(),
                 "E_total".to_string(),
             ],
             resolved_quantity_registry: None,
@@ -707,11 +737,13 @@ pub(crate) fn capabilities_for_fdm_engine(
             supported_demag_realizations: vec!["tensor_fft_newell".to_string()],
             preview_quantities: quantity_names(&[
                 QuantityId::M,
+                QuantityId::FrozenSpins,
                 QuantityId::HEx,
                 QuantityId::HDemag,
                 QuantityId::HExt,
                 QuantityId::Torque,
                 QuantityId::HAni,
+                QuantityId::HDmiRotated,
                 QuantityId::HEff,
                 QuantityId::HOe,
                 QuantityId::EdenEx,
@@ -719,14 +751,17 @@ pub(crate) fn capabilities_for_fdm_engine(
                 QuantityId::EdenExt,
                 QuantityId::EdenAni,
                 QuantityId::EdenDmi,
+                QuantityId::EdenRotatedDmi,
                 QuantityId::EdenTotal,
             ]),
             snapshot_quantities: quantity_names(&[
                 QuantityId::M,
+                QuantityId::FrozenSpins,
                 QuantityId::HEx,
                 QuantityId::HDemag,
                 QuantityId::HExt,
                 QuantityId::HAni,
+                QuantityId::HDmiRotated,
                 QuantityId::HEff,
                 QuantityId::HOe,
                 QuantityId::EdenEx,
@@ -734,12 +769,14 @@ pub(crate) fn capabilities_for_fdm_engine(
                 QuantityId::EdenExt,
                 QuantityId::EdenAni,
                 QuantityId::EdenDmi,
+                QuantityId::EdenRotatedDmi,
                 QuantityId::EdenTotal,
             ]),
             scalar_outputs: vec![
                 "E_ex".to_string(),
                 "E_demag".to_string(),
                 "E_ext".to_string(),
+                "E_rotated_dmi".to_string(),
                 "E_total".to_string(),
             ],
             resolved_quantity_registry: None,
@@ -747,6 +784,27 @@ pub(crate) fn capabilities_for_fdm_engine(
             supports_lossy_fallback_override: false,
         },
     };
+    let (status, reason, scope) = match (engine, profile) {
+        (_, FdmCapabilityProfile::SingleGrid) => (
+            FeatureCapabilityStatus::DevelopmentExecutable,
+            "Frozen Spins source execution is available for the resolved FDM single-grid double-precision lane; production qualification remains receipt-scoped.",
+            "single_grid; precision=double; membership=static|snapshot_at_activation; reference=capture_current_at_activation",
+        ),
+        (FdmEngine::CpuReference, FdmCapabilityProfile::Multilayer) => (
+            FeatureCapabilityStatus::DevelopmentExecutable,
+            "Frozen Spins source execution is available for CPU double-precision multilayer plans in canonical native-layer order; production qualification remains receipt-scoped.",
+            "multilayer_native_layer_order; device=cpu; precision=double; explicit_rk|abm3; checkpoint=history_resume",
+        ),
+        (FdmEngine::CudaFdm, FdmCapabilityProfile::Multilayer) => (
+            FeatureCapabilityStatus::Unsupported,
+            "Frozen Spins multilayer CUDA execution is fail-closed because the device-resident v2 ABI carries no mask/reference payload; use CPU multilayer or the native single-grid CUDA lane.",
+            "multilayer; device=cuda; reason_code=frozen_spins_fdm_multilayer_cuda_unqualified",
+        ),
+    };
+    capabilities.feature_capabilities.insert(
+        "constraint.frozen_spins".to_string(),
+        feature_capability(status, reason, scope),
+    );
     attach_compatibility_registry(capabilities, fullmag_ir::ExecutionPrecision::Double)
 }
 
@@ -766,8 +824,36 @@ pub(crate) fn capabilities_for_fdm_engine_with_precision(
     attach_compatibility_registry(capabilities, precision)
 }
 
+/// Return the planner capability profile used while a blank scratch session is
+/// being authored.  Scratch sessions have an explicit CPU/double lane before
+/// a ProblemIR plan exists, so this profile describes the selected lane without
+/// claiming scientific qualification or a managed-runtime receipt.
+pub fn scratch_authoring_capabilities(backend: &str) -> Option<BackendCapabilities> {
+    match backend {
+        "fdm" => Some(capabilities_for_fdm_engine_with_precision(
+            FdmEngine::CpuReference,
+            FdmCapabilityProfile::SingleGrid,
+            fullmag_ir::ExecutionPrecision::Double,
+        )),
+        "fem" => Some(capabilities_for_fem_engine(FemEngine::CpuNative)),
+        _ => None,
+    }
+}
+
 pub(crate) fn capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilities {
-    let capabilities = match engine {
+    let mut capabilities = base_capabilities_for_fem_engine(engine);
+    // Report the existing planner/native time-domain branch. This is not a
+    // runtime availability or scientific qualification claim; dispatch still
+    // enforces mesh, device and operator prerequisites.
+    capabilities
+        .supported_demag_realizations
+        .push("fredkin_koehler".to_string());
+    capabilities.capability_profile_version = "2026-09-20".to_string();
+    capabilities
+}
+
+fn base_capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilities {
+    let mut capabilities = match engine {
         FemEngine::CpuNative => BackendCapabilities {
             supports_frequency_response: DEFERRED_STUDY_CAPABILITY,
             supports_coupled_magnetoelastic_quasistatic: DEFERRED_STUDY_CAPABILITY,
@@ -784,6 +870,7 @@ pub(crate) fn capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilit
                 "uniaxial_anisotropy".to_string(),
                 "cubic_anisotropy".to_string(),
                 "interfacial_dmi".to_string(),
+                "rotated_interfacial_dmi".to_string(),
                 "magnetoelastic".to_string(),
                 "thermal".to_string(),
                 "oersted".to_string(),
@@ -796,9 +883,11 @@ pub(crate) fn capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilit
             ],
             preview_quantities: quantity_names(&[
                 QuantityId::M,
+                QuantityId::FrozenSpins,
                 QuantityId::HEx,
                 QuantityId::HDemag,
                 QuantityId::HExt,
+                QuantityId::HAnt,
                 QuantityId::Torque,
                 QuantityId::HEff,
                 QuantityId::HAni,
@@ -813,9 +902,11 @@ pub(crate) fn capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilit
             ]),
             snapshot_quantities: quantity_names(&[
                 QuantityId::M,
+                QuantityId::FrozenSpins,
                 QuantityId::HEx,
                 QuantityId::HDemag,
                 QuantityId::HExt,
+                QuantityId::HAnt,
                 QuantityId::HEff,
                 QuantityId::HAni,
                 QuantityId::HDmi,
@@ -831,6 +922,7 @@ pub(crate) fn capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilit
                 "E_ex".to_string(),
                 "E_demag".to_string(),
                 "E_ext".to_string(),
+                "E_rotated_dmi".to_string(),
                 "E_total".to_string(),
             ],
             resolved_quantity_registry: None,
@@ -853,6 +945,7 @@ pub(crate) fn capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilit
                 "uniaxial_anisotropy".to_string(),
                 "cubic_anisotropy".to_string(),
                 "interfacial_dmi".to_string(),
+                "rotated_interfacial_dmi".to_string(),
                 "magnetoelastic".to_string(),
                 "thermal".to_string(),
                 "oersted".to_string(),
@@ -865,6 +958,7 @@ pub(crate) fn capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilit
             ],
             preview_quantities: quantity_names(&[
                 QuantityId::M,
+                QuantityId::FrozenSpins,
                 QuantityId::HEx,
                 QuantityId::HDemag,
                 QuantityId::HExt,
@@ -882,6 +976,7 @@ pub(crate) fn capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilit
             ]),
             snapshot_quantities: quantity_names(&[
                 QuantityId::M,
+                QuantityId::FrozenSpins,
                 QuantityId::HEx,
                 QuantityId::HDemag,
                 QuantityId::HExt,
@@ -900,6 +995,7 @@ pub(crate) fn capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilit
                 "E_ex".to_string(),
                 "E_demag".to_string(),
                 "E_ext".to_string(),
+                "E_rotated_dmi".to_string(),
                 "E_total".to_string(),
             ],
             resolved_quantity_registry: None,
@@ -907,11 +1003,28 @@ pub(crate) fn capabilities_for_fem_engine(engine: FemEngine) -> BackendCapabilit
             supports_lossy_fallback_override: false,
         },
     };
+    let (status, reason, scope) = match engine {
+        FemEngine::CpuNative => (
+            FeatureCapabilityStatus::DevelopmentExecutable,
+            "Frozen Spins source execution is available for the resolved FEM CPU double-precision explicit and relaxation scope; production qualification remains gated.",
+            "true_dof; precision=double; explicit_rk|projected_gradient_bb|nonlinear_cg|tangent_plane_implicit",
+        ),
+        FemEngine::NativeGpu => (
+            FeatureCapabilityStatus::DevelopmentExecutable,
+            "Frozen Spins device-resident FEM GPU explicit RK, projected-gradient BB, and nonlinear-CG execution is available in double precision; tangent-plane implicit relaxation and production qualification remain gated.",
+            "true_dof; precision=double; explicit_rk|projected_gradient_bb|nonlinear_cg; tangent_plane_implicit=unsupported; reason_code=frozen_spins_fem_gpu_tpi_unqualified",
+        ),
+    };
+    capabilities.feature_capabilities.insert(
+        "constraint.frozen_spins".to_string(),
+        feature_capability(status, reason, scope),
+    );
     attach_compatibility_registry(capabilities, fullmag_ir::ExecutionPrecision::Double)
 }
 
 pub(crate) fn capabilities_for_fem_eigen_engine(engine: FemEngine) -> BackendCapabilities {
-    let mut capabilities = capabilities_for_fem_engine(engine);
+    let mut capabilities =
+        without_rotated_dmi_for_modal_fem(base_capabilities_for_fem_engine(engine));
     capabilities.engine_id = match engine {
         FemEngine::CpuNative => RuntimeEngineId::FemEigenCpuBaseline,
         FemEngine::NativeGpu => RuntimeEngineId::FemEigenNativeGpu,
@@ -922,7 +1035,8 @@ pub(crate) fn capabilities_for_fem_eigen_engine(engine: FemEngine) -> BackendCap
 pub(crate) fn capabilities_for_fem_frequency_response_validation_engine(
     engine: FemEngine,
 ) -> BackendCapabilities {
-    let mut capabilities = capabilities_for_fem_engine(engine);
+    let mut capabilities =
+        without_rotated_dmi_for_modal_fem(base_capabilities_for_fem_engine(engine));
     #[cfg(feature = "fem-gpu")]
     {
         capabilities.engine_id = RuntimeEngineId::FemFrequencyResponseProductionCpu;
@@ -932,6 +1046,33 @@ pub(crate) fn capabilities_for_fem_frequency_response_validation_engine(
         capabilities.engine_id = RuntimeEngineId::FemFrequencyResponseDenseValidation;
     }
     align_compatibility_registry_to_final_engine(capabilities)
+}
+
+/// Rotated-interfacial DMI is a time-domain interaction only.  Eigen and
+/// frequency-response capability profiles must not inherit it from the
+/// time-domain compatibility profile until those operators are implemented.
+fn without_rotated_dmi_for_modal_fem(mut capabilities: BackendCapabilities) -> BackendCapabilities {
+    capabilities
+        .supported_terms
+        .retain(|term| term != "rotated_interfacial_dmi");
+    for quantities in [
+        &mut capabilities.preview_quantities,
+        &mut capabilities.snapshot_quantities,
+    ] {
+        quantities.retain(|quantity| quantity != "H_rotated_dmi" && quantity != "eden_rotated_dmi");
+    }
+    capabilities
+        .scalar_outputs
+        .retain(|quantity| quantity != "E_rotated_dmi");
+    if let Some(registry) = capabilities.resolved_quantity_registry.as_mut() {
+        registry
+            .field_quantities
+            .retain(|quantity| quantity != "H_rotated_dmi" && quantity != "eden_rotated_dmi");
+        registry
+            .scalar_quantities
+            .retain(|quantity| quantity != "E_rotated_dmi");
+    }
+    capabilities
 }
 
 fn align_compatibility_registry_to_final_engine(
@@ -1070,6 +1211,9 @@ mod tests {
         assert!(cpu_operator
             .scope
             .contains("magnetic_node_planes=requested_layers+1"));
+        assert!(cpu_operator
+            .scope
+            .contains("uniform Ms/Aex/Ku1/Ku2 and one anisotropy axis"));
     }
 
     #[test]
@@ -1109,6 +1253,9 @@ mod tests {
         assert!(gpu_operator
             .scope
             .contains("magnetic_node_planes=requested_layers+1"));
+        assert!(gpu_operator
+            .scope
+            .contains("uniform Ms/Aex/Ku1/Ku2 and one anisotropy axis"));
     }
 
     #[test]
@@ -1117,11 +1264,15 @@ mod tests {
             let capabilities =
                 capabilities_for_fdm_engine(engine, FdmCapabilityProfile::SingleGrid);
 
-            assert_eq!(capabilities.feature_capabilities.len(), 6);
-            assert!(capabilities
-                .feature_capabilities
-                .values()
-                .all(|feature| feature.status == FeatureCapabilityStatus::Unsupported));
+            assert_eq!(capabilities.feature_capabilities.len(), 7);
+            assert!(MIXED_P1_FEATURE_CAPABILITY_IDS.iter().all(|id| {
+                capabilities.feature_capabilities[*id].status
+                    == FeatureCapabilityStatus::Unsupported
+            }));
+            assert_eq!(
+                capabilities.feature_capabilities["constraint.frozen_spins"].status,
+                FeatureCapabilityStatus::DevelopmentExecutable
+            );
         }
     }
 
@@ -1147,13 +1298,13 @@ mod tests {
             (FemEngine::NativeGpu, "fem.gpu.exchange_demag.mixed_p1"),
         ] {
             let capabilities = capabilities_for_fem_engine(engine);
-            assert_eq!(capabilities.feature_capabilities.len(), 6);
+            assert_eq!(capabilities.feature_capabilities.len(), 7);
 
             let encoded = serde_json::to_value(capabilities).expect("serialize capabilities");
             let features = encoded["feature_capabilities"]
                 .as_object()
                 .expect("feature capabilities serialize as an object");
-            assert_eq!(features.len(), 6);
+            assert_eq!(features.len(), 7);
             assert_eq!(features["mesh.topology.mixed_p1"]["status"], "implemented");
             assert_eq!(features[operator_id]["status"], "implemented");
             for id in MIXED_P1_FEATURE_CAPABILITY_IDS {
@@ -1168,6 +1319,56 @@ mod tests {
     }
 
     #[test]
+    fn frozen_spins_execution_capability_is_lane_and_precision_specific() {
+        let fdm_cpu = capabilities_for_fdm_engine_with_precision(
+            FdmEngine::CpuReference,
+            FdmCapabilityProfile::SingleGrid,
+            fullmag_ir::ExecutionPrecision::Double,
+        );
+        let fdm_fp32 = capabilities_for_fdm_engine_with_precision(
+            FdmEngine::CudaFdm,
+            FdmCapabilityProfile::SingleGrid,
+            fullmag_ir::ExecutionPrecision::Single,
+        );
+        let fdm_multilayer = capabilities_for_fdm_engine_with_precision(
+            FdmEngine::CpuReference,
+            FdmCapabilityProfile::Multilayer,
+            fullmag_ir::ExecutionPrecision::Double,
+        );
+        let fem_cpu = capabilities_for_fem_engine(FemEngine::CpuNative);
+        let fem_gpu = capabilities_for_fem_engine(FemEngine::NativeGpu);
+
+        assert_eq!(
+            fdm_cpu.feature_capabilities["constraint.frozen_spins"].status,
+            FeatureCapabilityStatus::DevelopmentExecutable
+        );
+        assert_eq!(
+            fdm_fp32.feature_capabilities["constraint.frozen_spins"].status,
+            FeatureCapabilityStatus::DevelopmentExecutable
+        );
+        assert!(fdm_fp32.feature_capabilities["constraint.frozen_spins"]
+            .scope
+            .contains("hard_restore=quantized_bitwise"));
+        assert_eq!(
+            fdm_multilayer.feature_capabilities["constraint.frozen_spins"].status,
+            FeatureCapabilityStatus::DevelopmentExecutable
+        );
+        assert_eq!(
+            fem_cpu.feature_capabilities["constraint.frozen_spins"].status,
+            FeatureCapabilityStatus::DevelopmentExecutable
+        );
+        assert_eq!(
+            fem_gpu.feature_capabilities["constraint.frozen_spins"].status,
+            FeatureCapabilityStatus::DevelopmentExecutable
+        );
+        let fem_gpu_scope = &fem_gpu.feature_capabilities["constraint.frozen_spins"].scope;
+        assert!(fem_gpu_scope.contains("explicit_rk"));
+        assert!(fem_gpu_scope.contains("projected_gradient_bb"));
+        assert!(fem_gpu_scope.contains("nonlinear_cg"));
+        assert!(fem_gpu_scope.contains("tangent_plane_implicit=unsupported"));
+    }
+
+    #[test]
     fn fem_time_domain_and_eigen_capabilities_keep_distinct_engine_ids() {
         let fem_cpu = capabilities_for_fem_engine(FemEngine::CpuNative);
         let fem_eigen_cpu = capabilities_for_fem_eigen_engine(FemEngine::CpuNative);
@@ -1175,6 +1376,8 @@ mod tests {
             capabilities_for_fem_frequency_response_validation_engine(FemEngine::CpuNative);
         let fem_gpu = capabilities_for_fem_engine(FemEngine::NativeGpu);
         let fem_eigen_gpu = capabilities_for_fem_eigen_engine(FemEngine::NativeGpu);
+        let fem_response_gpu =
+            capabilities_for_fem_frequency_response_validation_engine(FemEngine::NativeGpu);
 
         assert_eq!(fem_cpu.engine_id.as_str(), "fem_cpu_native");
         assert_eq!(fem_eigen_cpu.engine_id.as_str(), "fem_eigen_cpu_baseline");
@@ -1191,12 +1394,56 @@ mod tests {
         assert_eq!(fem_gpu.engine_id.as_str(), "fem_native_gpu");
         assert_eq!(fem_eigen_gpu.engine_id.as_str(), "fem_eigen_native_gpu");
 
-        assert_eq!(fem_cpu.supported_terms, fem_eigen_cpu.supported_terms);
-        assert_eq!(fem_cpu.supported_terms, fem_response_cpu.supported_terms);
-        assert_eq!(
-            fem_gpu.supported_demag_realizations,
-            fem_eigen_gpu.supported_demag_realizations
-        );
+        assert!(fem_cpu
+            .supported_terms
+            .iter()
+            .any(|term| term == "rotated_interfacial_dmi"));
+        for modal in [
+            &fem_eigen_cpu,
+            &fem_response_cpu,
+            &fem_eigen_gpu,
+            &fem_response_gpu,
+        ] {
+            assert!(!modal
+                .supported_terms
+                .iter()
+                .any(|term| term == "rotated_interfacial_dmi"));
+            assert!(!modal
+                .scalar_outputs
+                .iter()
+                .any(|quantity| quantity == "E_rotated_dmi"));
+            assert!(!modal
+                .preview_quantities
+                .iter()
+                .chain(&modal.snapshot_quantities)
+                .any(|quantity| quantity == "H_rotated_dmi" || quantity == "eden_rotated_dmi"));
+            if let Some(registry) = &modal.resolved_quantity_registry {
+                assert!(!registry.field_quantities.iter().any(|quantity| {
+                    quantity == "H_rotated_dmi" || quantity == "eden_rotated_dmi"
+                }));
+                assert!(!registry
+                    .scalar_quantities
+                    .iter()
+                    .any(|quantity| quantity == "E_rotated_dmi"));
+            }
+        }
+        for time_domain in [&fem_cpu, &fem_gpu] {
+            assert!(time_domain
+                .supported_demag_realizations
+                .iter()
+                .any(|realization| realization == "fredkin_koehler"));
+        }
+        for modal in [
+            &fem_eigen_cpu,
+            &fem_response_cpu,
+            &fem_eigen_gpu,
+            &fem_response_gpu,
+        ] {
+            assert_eq!(
+                modal.supported_demag_realizations,
+                vec!["poisson_robin", "poisson_dirichlet"]
+            );
+        }
     }
 
     #[test]
@@ -1370,6 +1617,31 @@ mod tests {
                     capabilities.engine_id.as_str()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn fem_capability_profiles_expose_frozen_spins_compatibility_quantity() {
+        for capabilities in [
+            capabilities_for_fem_engine(FemEngine::CpuNative),
+            capabilities_for_fem_engine(FemEngine::NativeGpu),
+        ] {
+            assert!(
+                capabilities
+                    .preview_quantities
+                    .iter()
+                    .any(|id| id == QuantityId::FrozenSpins.as_str()),
+                "{} must expose Frozen Spins in the FEM preview compatibility projection",
+                capabilities.engine_id.as_str()
+            );
+            assert!(
+                capabilities
+                    .snapshot_quantities
+                    .iter()
+                    .any(|id| id == QuantityId::FrozenSpins.as_str()),
+                "{} must expose Frozen Spins in the FEM snapshot compatibility projection",
+                capabilities.engine_id.as_str()
+            );
         }
     }
 
@@ -1607,10 +1879,7 @@ mod tests {
         );
 
         assert_eq!(resolved.provider, QuantityProviderCapability::Available);
-        assert_eq!(
-            resolved.request,
-            QuantityRequestCapability::FieldVector
-        );
+        assert_eq!(resolved.request, QuantityRequestCapability::FieldVector);
         assert_eq!(
             resolved.materialization,
             QuantityMaterializationCapability::Unmaterialized

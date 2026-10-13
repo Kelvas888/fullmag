@@ -1,19 +1,37 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import copy
 import json
+import math
 import os
+import re
+import tempfile
+import threading
+import time
+import uuid
 import warnings
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from hashlib import sha256
+from numbers import Integral
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
-from fullmag._progress import emit_progress, emit_progress_event
+from fullmag._progress import (
+    emit_progress,
+    emit_progress_event,
+    indeterminate_progress_phase,
+)
 from fullmag._validation import ensure_unique_names, require_non_empty
+from fullmag.cuda_device_identity import legacy_cuda_binding
+from fullmag.model._incomplete import IncompletePhysicsError
 from fullmag.init.textures import PresetTexture
 from fullmag.model.antenna import (
+    AntennaFieldSolveStage,
+    AntennaSpectrumRequest,
+    AntennaTargetProjection,
+    AntennaPortMode,
     AntennaFieldSource,
     DriveActivation,
     FieldTarget,
@@ -21,15 +39,16 @@ from fullmag.model.antenna import (
     RegionalFieldDrive,
     SincFieldProfile,
     SpinWaveExcitationAnalysis,
+    SolvedAntennaDrive,
     UniformFieldProfile,
 )
 from fullmag.model.couplings import Coupling
 from fullmag.model.constraints import FrozenSpins
 from fullmag.model.current_transport import CurrentTransport
-from fullmag.model.discretization import DiscretizationHints, FEM
+from fullmag.model.discretization import DiscretizationHints, FEM, PerObjectMeshRecipe
 from fullmag.model.dynamics import LLG
 from fullmag.model.domain_frame import build_domain_frame, geometry_bounds
-from fullmag.model.energy import BulkDMI, CubicAnisotropy, Demag, Exchange, InterfacialDMI, Magnetoelastic, OerstedField, OerstedCylinder, PiecewiseLinear, StaticFieldMap, ThermalNoise, UniaxialAnisotropy, Zeeman
+from fullmag.model.energy import BulkDMI, CubicAnisotropy, Demag, Exchange, InterfacialDMI, Magnetoelastic, OerstedField, OerstedCylinder, PiecewiseLinear, RotatedInterfacialDMI, StaticFieldMap, ThermalNoise, UniaxialAnisotropy, Zeeman
 from fullmag.model.spin_torque import (
     LegacySpinTorque,
     PrescribedSpinOrbitTorque,
@@ -45,8 +64,10 @@ from fullmag.model.mechanics import (
     MechanicalLoad,
 )
 from fullmag.model.physics_scope import build_physics_graph
+from fullmag.model.parameters import ParameterLibrary
 from fullmag.model.outputs import (
     SaveDispersion,
+    SaveEigenDiagnostics,
     SaveField,
     SaveMode,
     SaveScalar,
@@ -61,7 +82,7 @@ from fullmag.model.structure import (
     ObjectRegion,
     Region,
 )
-from fullmag.model.study import Eigenmodes, FrequencyResponse, Relaxation, TimeEvolution
+from fullmag.model.study import AntennaFieldSolve, Eigenmodes, FrequencyResponse, Relaxation, TimeEvolution
 from fullmag.model.selection import SelectionDefinition
 
 IR_VERSION = "0.3.0"
@@ -71,7 +92,116 @@ SERIALIZER_VERSION = "0.3.0"
 _FDM_M2_OPERATOR_VERSION = "fdm_coupled_charge_spin_fv_block_gmres.v1"
 _FEM_M2_OPERATOR_VERSION = "fem_charge_spin_conforming_h1_p1.reciprocal_m2.v1"
 
-_FEM_MESH_CACHE_VERSION = "v5"
+# Keep the shared-domain cache namespace separate from the older per-object
+# ``.npz`` cache.  The version is part of the digest, so changing the cache
+# document or the generation contract cannot silently reuse an old artifact.
+# v8 invalidated v7 source-face corner targets. v9 invalidates meshes generated
+# with alias-shadowed per-geometry hmax policies; reusing them could retain a
+# neighboring geometry's size field after canonical owner binding changes.
+_FEM_MESH_CACHE_VERSION = "v9"
+_FEM_SHARED_DOMAIN_CACHE_SCHEMA = "fullmag.fem.shared-domain-cache.v1"
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _fem_verified_source_snapshot_sha256() -> str | None:
+    """Return the launcher-provided source identity when it is well formed.
+
+    The native Windows/managed launchers verify the source snapshot before
+    exporting this value.  Local/source-only Python runs intentionally do not
+    opt into the trusted cache when the value is absent or malformed.
+    """
+    raw = os.environ.get("FULLMAG_SOURCE_SNAPSHOT_SHA256", "").strip().lower()
+    return raw if _SHA256_RE.fullmatch(raw) is not None else None
+
+
+def _fem_resolved_mesh_policy_sha256(
+    hints: FEM,
+    *,
+    study_universe: Mapping[str, object] | None,
+    mesh_workflow: Mapping[str, object] | None,
+    per_object_recipes: Mapping[str, PerObjectMeshRecipe] | None,
+    object_regions: Sequence[Mapping[str, object]] | None,
+) -> str:
+    """Hash the complete resolved mixed-mesh policy used by the producer.
+
+    This is deliberately separate from the authoring-document digest in the
+    receipt.  It binds the execution policy (Gmsh/repair/certifier algorithms
+    and thread contract) as well as every resolved mesh control, so a trusted
+    artifact cannot survive a policy change merely because its geometry key
+    stayed the same.
+    """
+    from fullmag.meshing._certification_receipt import (
+        ARTIFACT_SCHEMA_V2,
+        MIXED_CERTIFIER_ALGORITHM,
+        MIXED_REPAIR_ALGORITHM,
+    )
+    from fullmag.meshing._gmsh_types import MIXED_SHARED_GMSH_VERSION
+
+    policy = {
+        "schema": "fullmag.fem.mixed-resolved-policy.v1",
+        "cache_version": _FEM_MESH_CACHE_VERSION,
+        "fem": hints.to_ir(),
+        "study_universe": study_universe,
+        "mesh_workflow": mesh_workflow,
+        "per_object_recipes": {
+            str(name): recipe.to_ir()
+            for name, recipe in (per_object_recipes or {}).items()
+        },
+        "object_regions": [dict(region) for region in (object_regions or [])],
+        "gmsh_version": MIXED_SHARED_GMSH_VERSION,
+        "gmsh_threads": 1,
+        "repair_algorithm_id": MIXED_REPAIR_ALGORITHM,
+        "repair_method": "Relocate3D",
+        "repair_iterations": 1,
+        "certifier_algorithm_id": MIXED_CERTIFIER_ALGORITHM,
+        "artifact_schema": ARTIFACT_SCHEMA_V2,
+        "topology_fingerprint_version": "v3",
+    }
+    encoded = json.dumps(
+        policy,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest()
+
+
+def _fem_cache_contract_identity(
+    *,
+    resolved_policy_sha256: str | None = None,
+) -> dict[str, object]:
+    """Return producer compatibility fields shared by every FEM cache.
+
+    The per-object cache predates the v2 artifact manifest and has no
+    provenance document of its own. Keeping these fields in its canonical key
+    prevents a Gmsh/repair/certifier or source-compatibility change from
+    becoming a false warm hit. The launcher-provided snapshot is optional for
+    local source-only runs; trusted shared-domain reuse still requires it.
+    """
+    from fullmag.meshing._certification_receipt import (
+        ARTIFACT_SCHEMA_V2,
+        MIXED_CERTIFIER_ALGORITHM,
+        MIXED_REPAIR_ALGORITHM,
+    )
+    from fullmag.meshing._gmsh_types import MIXED_SHARED_GMSH_VERSION
+
+    identity: dict[str, object] = {
+        "source_snapshot_sha256": _fem_verified_source_snapshot_sha256(),
+        "source_compatibility_epoch": "fullmag.fem.meshing.production-closure.2026-08-31.v1",
+        "gmsh_version": MIXED_SHARED_GMSH_VERSION,
+        "gmsh_threads": 1,
+        "repair_algorithm_id": MIXED_REPAIR_ALGORITHM,
+        "repair_method": "Relocate3D",
+        "repair_iterations": 1,
+        "certifier_algorithm_id": MIXED_CERTIFIER_ALGORITHM,
+        "artifact_schema": ARTIFACT_SCHEMA_V2,
+        "topology_fingerprint_version": "v3",
+    }
+    if resolved_policy_sha256 is not None:
+        identity["resolved_policy_sha256"] = resolved_policy_sha256
+    return identity
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +222,11 @@ class FdmPbc:
                 "FdmPbc.demag must be 'open', 'truncated_images', or 'periodic_airbox_k0'"
             )
         object.__setattr__(self, "demag", demag)
+
+        if demag == "periodic_airbox_k0" and axes != (True, True, False):
+            raise ValueError(
+                "FdmPbc.demag='periodic_airbox_k0' requires x/y periodic axes and open z"
+            )
 
         if demag != "truncated_images" and self.image_counts is not None:
             raise ValueError("FdmPbc.image_counts require demag='truncated_images'")
@@ -286,10 +421,256 @@ def _fem_mesh_cache_dir() -> Path | None:
         return None
     if raw:
         path = Path(raw).expanduser()
+    elif (cache_root := os.environ.get("FULLMAG_CACHE_ROOT")) and cache_root.strip():
+        path = Path(cache_root).expanduser() / "fem_mesh_assets"
     else:
         path = Path.cwd() / ".fullmag" / "local" / "cache" / "fem_meshes"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _fsync_cache_file(path: Path) -> None:
+    """Flush a cache file before it is made visible to another process.
+
+    NumPy writes the ``.npz`` archive directly.  Opening the completed file in
+    read/write mode is intentional: on Windows ``FlushFileBuffers`` (used by
+    ``os.fsync``) requires a writable handle, while POSIX accepts either mode.
+    """
+    with path.open("r+b") as stream:
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _fsync_cache_directory(path: Path) -> None:
+    """Best-effort directory barrier for a cache promotion."""
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def _save_fem_mesh_cache_atomically(mesh: MeshData, target: Path) -> None:
+    """Publish a per-object FEM cache archive without exposing partial bytes.
+
+    A unique sibling directory prevents two writers from sharing a temporary
+    filename.  The final path is replaced only after ``MeshData.save`` and an
+    explicit file flush have completed; a failed/interrupted writer therefore
+    leaves an existing cache entry untouched.
+    """
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with _fem_cache_write_lock(target):
+        temporary_dir = Path(
+            tempfile.mkdtemp(prefix=f".{target.name}.", dir=str(target.parent))
+        )
+        temporary_path = temporary_dir / target.name
+        try:
+            mesh.save(temporary_path)
+            _fsync_cache_file(temporary_path)
+            os.replace(temporary_path, target)
+            _fsync_cache_directory(target.parent)
+        finally:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                temporary_dir.rmdir()
+            except OSError:
+                # A failed cleanup is harmless and must not turn a valid
+                # promoted cache into a failed build; the unique directory is
+                # quarantinable by the next cache maintenance pass.
+                pass
+
+
+def _quarantine_fem_mesh_cache_entry(path: Path, *, reason: str) -> Path | None:
+    """Move a corrupt cache entry aside without deleting or overwriting it.
+
+    The stat check closes the common race where a concurrent atomic writer has
+    already replaced the path with a fresh archive while this reader is
+    handling an older failure.  A failed rename is intentionally non-fatal:
+    the caller can still rebuild into the canonical path.
+    """
+    path = Path(path)
+    try:
+        before = path.stat()
+    except OSError:
+        return None
+
+    quarantine_dir = path.parent / "quarantine"
+    try:
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            return None
+        current = path.stat()
+        if (
+            current.st_ino != before.st_ino
+            or current.st_size != before.st_size
+            or current.st_mtime_ns != before.st_mtime_ns
+        ):
+            return None
+        reason_digest = sha256(reason.encode("utf-8", errors="replace")).hexdigest()[:12]
+        destination = quarantine_dir / (
+            f"{path.name}.{time.time_ns()}-{uuid.uuid4().hex}-r{reason_digest}.corrupt"
+        )
+        os.replace(path, destination)
+        _fsync_cache_directory(quarantine_dir)
+        _fsync_cache_directory(path.parent)
+        return destination
+    except OSError:
+        return None
+
+
+def _write_fem_cache_lock_metadata(path: Path, payload: Mapping[str, object]) -> None:
+    """Atomically refresh a lock's owner/heartbeat metadata."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        temporary.write_text(
+            json.dumps(dict(payload), sort_keys=True, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        _fsync_cache_file(temporary)
+        os.replace(temporary, path)
+        _fsync_cache_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+@contextmanager
+def _fem_cache_write_lock(
+    target: Path,
+    *,
+    timeout_s: float | None = None,
+    stale_after_s: float = 300.0,
+) -> Iterator[None]:
+    """Serialize cache publication and expose an observable owner heartbeat."""
+    target = Path(target)
+    lock_path = target.with_name(f".{target.name}.lock")
+    if timeout_s is None:
+        raw_timeout = os.environ.get("FULLMAG_FEM_CACHE_LOCK_TIMEOUT_S", "120")
+        try:
+            timeout_s = float(raw_timeout)
+        except (TypeError, ValueError):
+            timeout_s = 120.0
+    if not math.isfinite(timeout_s) or timeout_s <= 0.0:
+        raise ValueError("FULLMAG_FEM_CACHE_LOCK_TIMEOUT_S must be finite and positive")
+    if not math.isfinite(stale_after_s) or stale_after_s <= 0.0:
+        raise ValueError("stale_after_s must be finite and positive")
+
+    token = uuid.uuid4().hex
+    started_ns = time.time_ns()
+    owner: dict[str, object] = {
+        "schema": "fullmag.fem.cache-lock.v1",
+        "token": token,
+        "pid": os.getpid(),
+        "thread": threading.get_ident(),
+        "host": os.environ.get("COMPUTERNAME") or os.environ.get("HOSTNAME") or "unknown",
+        "target": str(target),
+        "started_unix_ns": started_ns,
+        "heartbeat_unix_ns": started_ns,
+    }
+    deadline = time.monotonic() + timeout_s
+    acquired = False
+    while not acquired:
+        try:
+            descriptor = os.open(
+                str(lock_path),
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+            try:
+                encoded = json.dumps(owner, sort_keys=True, separators=(",", ":")).encode(
+                    "utf-8"
+                )
+                written = 0
+                while written < len(encoded):
+                    written += os.write(descriptor, encoded[written:])
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            acquired = True
+        except FileExistsError:
+            stale = False
+            malformed = False
+            lock_mtime_ns = 0
+            try:
+                lock_mtime_ns = lock_path.stat().st_mtime_ns
+                payload = json.loads(lock_path.read_text(encoding="utf-8"))
+                heartbeat_ns = int(payload.get("heartbeat_unix_ns", 0))
+                stale = heartbeat_ns <= 0 or (
+                    time.time_ns() - heartbeat_ns > int(stale_after_s * 1.0e9)
+                )
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                malformed = True
+                # O_EXCL creates the lock before its owner can write the JSON.
+                # A contender must not quarantine that short publication window
+                # and let a second writer enter concurrently.  Treat malformed
+                # metadata as stale only after the same owner-age budget.
+                stale = lock_mtime_ns <= 0 or (
+                    time.time_ns() - lock_mtime_ns > int(stale_after_s * 1.0e9)
+                )
+            if stale:
+                _quarantine_fem_mesh_cache_entry(
+                    lock_path,
+                    reason=(
+                        "stale-or-malformed-cache-lock"
+                        if malformed
+                        else "stale-cache-lock"
+                    ),
+                )
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(
+                    f"timed out waiting for FEM cache writer lock '{lock_path}'"
+                )
+            time.sleep(0.05)
+
+    stop_heartbeat = threading.Event()
+
+    def heartbeat() -> None:
+        while not stop_heartbeat.wait(15.0):
+            owner["heartbeat_unix_ns"] = time.time_ns()
+            try:
+                _write_fem_cache_lock_metadata(lock_path, owner)
+            except OSError:
+                return
+
+    heartbeat_thread = threading.Thread(
+        target=heartbeat,
+        name="fullmag-fem-cache-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    try:
+        yield
+    finally:
+        stop_heartbeat.set()
+        heartbeat_thread.join(timeout=2.0)
+        try:
+            payload = json.loads(lock_path.read_text(encoding="utf-8"))
+            if payload.get("token") == token:
+                lock_path.unlink()
+                _fsync_cache_directory(lock_path.parent)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+
+
+def _file_content_sha256(path: Path) -> str:
+    digest = sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _geometry_cache_fingerprint(geometry: object) -> dict[str, object]:
@@ -307,6 +688,11 @@ def _geometry_cache_fingerprint(geometry: object) -> dict[str, object]:
                 "size": stat.st_size,
                 "mtime_ns": stat.st_mtime_ns,
             }
+            # Metadata alone can produce a false hit when an importer replaces
+            # a file in place while preserving size and timestamps. Include a
+            # content digest in the key; the chunked read keeps peak memory
+            # bounded for large STEP/STL/MSH inputs.
+            fingerprint["source_sha256"] = _file_content_sha256(source_path)
     return fingerprint
 
 
@@ -316,15 +702,109 @@ def _fem_mesh_cache_key(
     *,
     study_universe: dict[str, object] | None = None,
     mesh_workflow: dict[str, object] | None = None,
+    per_object_recipes: Mapping[str, PerObjectMeshRecipe] | None = None,
+    owner_geometry_names: Sequence[str] | None = None,
+    object_id: str | None = None,
 ) -> str:
+    resolved_owner_geometry_names = sorted(
+        owner_geometry_names
+        if owner_geometry_names is not None
+        else (str(getattr(geometry, "geometry_name", "")),)
+    )
     payload = {
         "version": _FEM_MESH_CACHE_VERSION,
         "geometry": _geometry_cache_fingerprint(geometry),
+        "object_id": object_id,
         "fem": hints.to_ir(),
         "study_universe": study_universe,
         "mesh_workflow": mesh_workflow,
+        "owner_geometry_names": resolved_owner_geometry_names,
+        "per_object_recipes": {
+            str(name): recipe.to_ir()
+            for name, recipe in (per_object_recipes or {}).items()
+        },
+        "cache_identity": _fem_cache_contract_identity(),
     }
-    return sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _fem_shared_domain_cache_document(
+    geometries: Sequence[object],
+    hints: FEM,
+    *,
+    study_universe: dict[str, object] | None,
+    mesh_workflow: dict[str, object] | None,
+    per_object_recipes: Mapping[str, PerObjectMeshRecipe] | None,
+    object_regions: Sequence[dict[str, object]] | None,
+    cache_identity: Mapping[str, object] | None = None,
+) -> tuple[str, dict[str, object]]:
+    """Return the persistent identity for a generated shared FEM domain.
+
+    The cache is deliberately keyed from the resolved source geometry
+    fingerprints (including imported-file stat data), not only from object
+    names.  This keeps a stale cache from surviving an STL/STEP replacement
+    while avoiding a repository-wide source scan on every run.
+    """
+    document: dict[str, object] = {
+        "schema": _FEM_SHARED_DOMAIN_CACHE_SCHEMA,
+        "version": _FEM_MESH_CACHE_VERSION,
+        "geometries": [
+            _geometry_cache_fingerprint(geometry) for geometry in geometries
+        ],
+        "fem": hints.to_ir(),
+        "study_universe": study_universe,
+        "mesh_workflow": mesh_workflow,
+        "per_object_recipes": {
+            str(name): recipe.to_ir()
+            for name, recipe in (per_object_recipes or {}).items()
+        },
+        "object_regions": [dict(region) for region in (object_regions or [])],
+    }
+    if cache_identity is not None:
+        document["cache_identity"] = dict(cache_identity)
+    encoded = json.dumps(
+        document,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    ).encode("utf-8")
+    return sha256(encoded).hexdigest(), document
+
+
+def _mesh_boundary_semantic_map(mesh: object) -> dict[str, int]:
+    """Build a stable boundary map without importing the world module.
+
+    Cache persistence only needs semantic marker coverage.  Preserve a role in
+    the name where the typed mesh exposes one, and fall back to a marker-only
+    name for legacy meshes.
+    """
+    raw_markers = getattr(mesh, "boundary_markers", None)
+    if raw_markers is None:
+        return {}
+    markers = [int(value) for value in raw_markers.tolist()]
+    raw_roles = getattr(mesh, "facet_roles", None)
+    roles = [str(value) for value in raw_roles.tolist()] if raw_roles is not None else []
+    result: dict[str, int] = {}
+    for marker in sorted(set(markers)):
+        marker_roles = sorted(
+            {
+                roles[index]
+                for index, value in enumerate(markers)
+                if value == marker and index < len(roles)
+            }
+        )
+        role = marker_roles[0] if len(marker_roles) == 1 else "boundary"
+        result[f"{role}_{marker}"] = marker
+    return result
 
 
 def resolve_geometry_sources(
@@ -389,9 +869,16 @@ def build_geometry_assets_for_request(
     discretization: DiscretizationHints | None,
     study_universe: dict[str, object] | None = None,
     mesh_workflow: dict[str, object] | None = None,
+    per_object_recipes: Mapping[str, PerObjectMeshRecipe] | None = None,
     object_regions: Sequence[dict[str, object]] | None = None,
+    geometry_object_ids: Mapping[str, str] | None = None,
     asset_cache: dict[str, dict[str, Any] | None] | None = None,
     _copy_cached_assets: bool = True,
+    _include_domain_mesh_ir: bool = True,
+    _realized_domain_mesh_sink: list[
+        tuple[object, list[dict[str, object]], object | None]
+    ] | None = None,
+    _realized_object_mesh_sink: dict[str, object] | None = None,
 ) -> dict[str, Any] | None:
     if discretization is None:
         return None
@@ -407,10 +894,12 @@ def build_geometry_assets_for_request(
         discretization=discretization,
         study_universe=study_universe,
         mesh_workflow=mesh_workflow,
+        per_object_recipes=per_object_recipes,
         object_regions=object_regions,
+        geometry_object_ids=geometry_object_ids,
         fdm_only=fdm_only,
     )
-    if asset_cache is not None and asset_cache_key in asset_cache:
+    if _realized_object_mesh_sink is None and asset_cache is not None and asset_cache_key in asset_cache:
         cached = asset_cache[asset_cache_key]
         return copy.deepcopy(cached) if _copy_cached_assets else cached
 
@@ -482,10 +971,21 @@ def build_geometry_assets_for_request(
                     )
 
     if discretization.fdm is not None:
-        from fullmag.model.geometry import Cylinder, ImportedGeometry
+        from fullmag.model.geometry import (
+            CPWAntennaLayout,
+            Cylinder,
+            ImportedGeometry,
+            MicrostripAntennaLayout,
+        )
         from fullmag.meshing import realize_fdm_grid_asset
 
         for geometry in geometries:
+            # A conductor-backed antenna is an authoring/field-solve object,
+            # never a magnetic FDM occupancy mask.  Keep it in the canonical
+            # geometry list for bounds and visualization, but do not hand it
+            # to the magnetic voxelizer when a study universe is present.
+            if isinstance(geometry, (MicrostripAntennaLayout, CPWAntennaLayout)):
+                continue
             should_realize = isinstance(geometry, (Cylinder, ImportedGeometry)) or study_universe is not None
             if should_realize:
                 asset = realize_fdm_grid_asset(
@@ -522,6 +1022,9 @@ def build_geometry_assets_for_request(
         )
 
         if not has_shared_domain_mesh_asset:
+            owner_geometry_names = tuple(
+                candidate.geometry_name for candidate in geometries
+            )
             for geometry in geometries:
                 imported_surface_only = (
                     discretization.fem.mesh is None
@@ -532,6 +1035,11 @@ def build_geometry_assets_for_request(
                 if mesh_source is None and isinstance(geometry, ImportedGeometry):
                     mesh_source = geometry.source
                 if mesh_source is not None and mesh_source.lower().endswith(".json"):
+                    if _realized_object_mesh_sink is not None:
+                        raise ValueError(
+                            "antenna lead preparation requires actual MeshData vertex identity; "
+                            "a serialized MeshIR JSON cannot supply it"
+                        )
                     emit_progress(
                         f"Preparing FEM mesh asset for '{geometry.geometry_name}' from MeshIR JSON"
                     )
@@ -558,6 +1066,9 @@ def build_geometry_assets_for_request(
                         discretization.fem,
                         study_universe=study_universe,
                         mesh_workflow=mesh_workflow,
+                        per_object_recipes=per_object_recipes,
+                        owner_geometry_names=owner_geometry_names,
+                        object_id=(geometry_object_ids or {}).get(geometry.geometry_name),
                     )
                     cache_path = (
                         fem_mesh_cache_dir.joinpath(f"{mesh_cache_key}.npz")
@@ -569,8 +1080,24 @@ def build_geometry_assets_for_request(
                         emit_progress(
                             f"Reusing cached FEM mesh for '{geometry.geometry_name}'"
                         )
-                        mesh = MeshData.load(cache_path)
-                    else:
+                        try:
+                            mesh = MeshData.load(cache_path)
+                        except Exception as exc:
+                            quarantined = _quarantine_fem_mesh_cache_entry(
+                                cache_path,
+                                reason=f"per-object-load:{type(exc).__name__}:{exc}",
+                            )
+                            emit_progress(
+                                "Ignoring invalid cached FEM mesh "
+                                f"'{cache_path}': {exc}"
+                                + (
+                                    f" (quarantined at '{quarantined}')"
+                                    if quarantined is not None
+                                    else ""
+                                )
+                            )
+                            mesh = None
+                    if mesh is None:
                         emit_progress(
                             f"Preparing FEM mesh asset for '{geometry.geometry_name}'"
                         )
@@ -579,6 +1106,9 @@ def build_geometry_assets_for_request(
                             discretization.fem,
                             study_universe=study_universe,
                             mesh_workflow=mesh_workflow,
+                            per_object_recipes=dict(per_object_recipes or {}),
+                            _owner_geometry_names=owner_geometry_names,
+                            object_id=(geometry_object_ids or {}).get(geometry.geometry_name),
                         )
                         mesh = _drop_degenerate_tetrahedra(
                             mesh,
@@ -586,7 +1116,7 @@ def build_geometry_assets_for_request(
                             fallbacks_triggered=[],
                         )
                         if cache_path is not None and not imported_surface_only:
-                            mesh.save(cache_path)
+                            _save_fem_mesh_cache_atomically(mesh, cache_path)
                             emit_progress(
                                 f"Cached FEM mesh for '{geometry.geometry_name}'"
                             )
@@ -603,6 +1133,8 @@ def build_geometry_assets_for_request(
                         f"{mesh.n_boundary_faces} boundary faces"
                     )
                     mesh_ir = mesh.to_ir(geometry.geometry_name)
+                    if _realized_object_mesh_sink is not None:
+                        _realized_object_mesh_sink[geometry.geometry_name] = mesh
                     is_valid = validate_mesh_ir(mesh_ir)
                     if is_valid is False:
                         raise ValueError(
@@ -661,17 +1193,288 @@ def build_geometry_assets_for_request(
                 }
         elif study_universe is not None:
             authored_regions = list(object_regions or [])
-            domain_mesh, region_markers, build_report = (
-                realize_fem_domain_mesh_asset_from_components_with_report(
-                    list(geometries),
+
+            # A generated shared-domain mesh is much more expensive than the
+            # surrounding Python model assembly. Reuse a certified native
+            # artifact between independent runs, while retaining the full
+            # portable audit on every cache read. The cache is best-effort: a
+            # corrupt, interrupted, or old entry is ignored and replaced only
+            # after a fresh mesh has completed successfully.
+            if fem_mesh_cache_dir is None:
+                fem_mesh_cache_dir = _fem_mesh_cache_dir()
+            shared_cache_path: Path | None = None
+            shared_cache_document: dict[str, object] | None = None
+            shared_cache_key: str | None = None
+            verified_source_snapshot = _fem_verified_source_snapshot_sha256()
+            resolved_policy_sha256 = _fem_resolved_mesh_policy_sha256(
+                discretization.fem,
+                study_universe=study_universe,
+                mesh_workflow=mesh_workflow,
+                per_object_recipes=per_object_recipes,
+                object_regions=authored_regions,
+            )
+            from fullmag import _core as _fullmag_core
+
+            v2_cache_enabled = bool(
+                verified_source_snapshot
+                and _fullmag_core._native_core is not None
+                and callable(
+                    getattr(_fullmag_core._native_core, "certify_mixed_mesh_arrays", None)
+                )
+                and callable(
+                    getattr(_fullmag_core._native_core, "preflight_mixed_mesh_arrays", None)
+                )
+            )
+            # v2 entries are internal, content-addressed artifacts produced
+            # only after the launcher supplied a verified source snapshot and
+            # native certifier.  Their cache hit can therefore use the native
+            # structural preflight plus receipt bindings without rebuilding
+            # the large Python topology fingerprint.  Keep an explicit
+            # fail-safe opt-out for diagnostics and rollback.
+            trusted_cache_mode = os.environ.get(
+                "FULLMAG_FEM_MESH_TRUSTED_CACHE", ""
+            ).strip().lower()
+            use_trusted_cache = bool(
+                v2_cache_enabled
+                and trusted_cache_mode not in {"0", "false", "no", "off"}
+            )
+            if fem_mesh_cache_dir is not None:
+                cache_identity = (
+                    _fem_cache_contract_identity(
+                        resolved_policy_sha256=resolved_policy_sha256,
+                    )
+                    if v2_cache_enabled
+                    else None
+                )
+                (
+                    shared_cache_key,
+                    shared_cache_document,
+                ) = _fem_shared_domain_cache_document(
+                    geometries,
                     discretization.fem,
                     study_universe=study_universe,
                     mesh_workflow=mesh_workflow,
+                    per_object_recipes=per_object_recipes,
                     object_regions=authored_regions,
+                    cache_identity=cache_identity,
                 )
-            )
-            domain_mesh_ir = domain_mesh.to_ir("study_domain")
-            is_valid = validate_mesh_ir(domain_mesh_ir)
+                shared_cache_dir = fem_mesh_cache_dir / (
+                    "shared_domains-v2" if v2_cache_enabled else "shared_domains"
+                )
+                shared_cache_dir.mkdir(parents=True, exist_ok=True)
+                shared_cache_path = shared_cache_dir / f"{shared_cache_key}.fullmag-mesh"
+
+            cached_shared_domain = False
+            domain_mesh = None
+            region_markers = None
+            build_report = None
+            if shared_cache_path is not None and shared_cache_path.exists():
+                from fullmag.meshing.persistence import (
+                    MeshArtifactError,
+                    MeshArtifactVersionError,
+                    _document_sha256,
+                    _load_trusted_cached_mesh_artifact,
+                    load_mesh_artifact,
+                )
+
+                try:
+                    try:
+                        if use_trusted_cache:
+                            assert shared_cache_document is not None
+                            assert verified_source_snapshot is not None
+                            cached_artifact = _load_trusted_cached_mesh_artifact(
+                                shared_cache_path,
+                                expected_authoring_sha256=_document_sha256(
+                                    shared_cache_document
+                                ),
+                                expected_policy_sha256=resolved_policy_sha256,
+                                expected_source_snapshot_sha256=verified_source_snapshot,
+                                expected_gmsh_version="4.15.2",
+                                expected_repair_algorithm_id=(
+                                    "fullmag.mixed-tet-repair.v1"
+                                ),
+                                expected_certifier_algorithm_id=(
+                                    "fullmag.mixed-certificate.rust-rayon.v1"
+                                ),
+                                use_native_fingerprint=True,
+                            )
+                        else:
+                            cached_artifact = load_mesh_artifact(
+                                shared_cache_path,
+                                expected_authoring_document=shared_cache_document,
+                            )
+                    except MeshArtifactVersionError:
+                        # A v1 entry can only be consumed through the public
+                        # full audit.  This compatibility branch is safe for a
+                        # cache directory that predates the v2 producer.
+                        cached_artifact = load_mesh_artifact(
+                            shared_cache_path,
+                            expected_authoring_document=shared_cache_document,
+                        )
+                    cached_provenance = dict(cached_artifact.provenance or {})
+                    if cached_provenance.get("cache_key") != shared_cache_key:
+                        raise MeshArtifactError(
+                            "shared-domain cache provenance does not match cache key"
+                        )
+                except (
+                    MeshArtifactError,
+                    OSError,
+                    RuntimeError,
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                ) as exc:
+                    quarantined = _quarantine_fem_mesh_cache_entry(
+                        shared_cache_path,
+                        reason=f"shared-domain-load:{type(exc).__name__}:{exc}",
+                    )
+                    emit_progress(
+                        "Ignoring invalid cached shared-domain FEM mesh "
+                        f"'{shared_cache_path}': {exc}"
+                        + (
+                            f" (quarantined at '{quarantined}')"
+                            if quarantined is not None
+                            else ""
+                        )
+                    )
+                else:
+                    domain_mesh = cached_artifact.mesh
+                    region_markers = [
+                        dict(entry) for entry in cached_artifact.region_markers
+                    ]
+                    build_report = cached_artifact.build_report
+                    cached_shared_domain = True
+                    emit_progress(
+                        "Reusing cached shared-domain FEM mesh "
+                        f"({domain_mesh.n_nodes} nodes, {domain_mesh.n_elements} elements)"
+                    )
+
+            if not cached_shared_domain:
+                domain_mesh, region_markers, build_report = (
+                    realize_fem_domain_mesh_asset_from_components_with_report(
+                        list(geometries),
+                        discretization.fem,
+                        study_universe=study_universe,
+                        mesh_workflow=mesh_workflow,
+                        per_object_recipes=dict(per_object_recipes or {}),
+                        object_regions=authored_regions,
+                    )
+                )
+                if shared_cache_path is not None:
+                    from fullmag.meshing.persistence import save_mesh_artifact
+
+                    if build_report is not None:
+                        report_payload = (
+                            dict(build_report.to_dict())
+                            if callable(getattr(build_report, "to_dict", None))
+                            else dict(build_report)
+                        )
+                    else:
+                        report_payload = None
+                    object_region_markers = (
+                        report_payload.get("object_region_markers", [])
+                        if report_payload is not None
+                        else []
+                    )
+                    certification_bindings = None
+                    native_certificate_result = None
+                    if (
+                        v2_cache_enabled
+                        and domain_mesh.mixed_layer_topology_certificate is not None
+                    ):
+                        from fullmag._core import certify_mixed_mesh_arrays
+                        from fullmag.meshing._certification_receipt import (
+                            CertificationReceiptBindingsV1,
+                            MIXED_CERTIFIER_ALGORITHM,
+                            MIXED_REPAIR_ALGORITHM,
+                        )
+
+                        native_certificate_result = certify_mixed_mesh_arrays(
+                            mesh=domain_mesh,
+                            metadata={"mesh_name": "study_domain"},
+                            certificate=(
+                                domain_mesh.mixed_layer_topology_certificate.to_dict()
+                            ),
+                            require_native=True,
+                        )
+                        if native_certificate_result is None:
+                            raise RuntimeError(
+                                "trusted shared-domain cache requires native mixed certification"
+                            )
+                        certificate = domain_mesh.mixed_layer_topology_certificate
+                        certification_bindings = CertificationReceiptBindingsV1(
+                            resolved_policy_sha256=resolved_policy_sha256,
+                            source_snapshot_sha256=verified_source_snapshot,
+                            gmsh_version=certificate.gmsh_version,
+                            repair_algorithm_id=MIXED_REPAIR_ALGORITHM,
+                            repair_method="Relocate3D",
+                            repair_iterations=1,
+                            gmsh_threads=certificate.effective_gmsh_thread_count,
+                            certifier_algorithm_id=MIXED_CERTIFIER_ALGORITHM,
+                            certifier_backend="rust_rayon",
+                            certifier_threads=native_certificate_result.rayon_threads,
+                        )
+                    with _fem_cache_write_lock(shared_cache_path):
+                        save_mesh_artifact(
+                            shared_cache_path,
+                            mesh=domain_mesh,
+                            mesh_name="study_domain",
+                            authoring_document=shared_cache_document or {},
+                            region_markers=region_markers,
+                            object_region_markers=object_region_markers,
+                            boundary_map=_mesh_boundary_semantic_map(domain_mesh),
+                            build_report=report_payload,
+                            provenance={
+                                "origin": "generated_shared_domain_cache",
+                                "cache_key": shared_cache_key,
+                                "cache_schema": _FEM_SHARED_DOMAIN_CACHE_SCHEMA,
+                            },
+                            certification_bindings=certification_bindings,
+                            _native_certificate_result=native_certificate_result,
+                        )
+                    emit_progress(f"Cached shared-domain FEM mesh at '{shared_cache_path}'")
+
+            assert domain_mesh is not None
+            assert region_markers is not None
+            if _realized_domain_mesh_sink is not None:
+                # The public asset remains JSON MeshIR for the ProblemIR
+                # contract, while the state owner can retain this exact typed
+                # mesh for the immediately-following persistence operation.
+                # This avoids a JSON -> NumPy rehydration of the same large
+                # mixed CSR payload.
+                _realized_domain_mesh_sink.append(
+                    (
+                        domain_mesh,
+                        [dict(entry) for entry in region_markers],
+                        build_report,
+                    )
+                )
+            if _include_domain_mesh_ir:
+                with indeterminate_progress_phase(
+                    phase="postprocessing",
+                    progress_label="serializing and validating shared-domain mesh",
+                    message="Serializing and validating the shared-domain mesh",
+                ):
+                    domain_mesh_ir = domain_mesh.to_ir("study_domain")
+                    # ``MeshData.to_ir`` already performs the native mixed-mesh
+                    # certificate audit for a certified prism/pyramid/tet mesh.
+                    # Running the generic JSON validator immediately afterwards
+                    # reparses and walks the same 800k-cell payload.  Keep that
+                    # preflight for source-only/generic meshes, where no mixed
+                    # certificate provides the stronger proof.
+                    is_valid = (
+                        True
+                        if domain_mesh.mixed_layer_topology_certificate is not None
+                        else validate_mesh_ir(domain_mesh_ir)
+                    )
+            else:
+                # The world-level build path retains the exact typed mesh in
+                # ``_realized_domain_mesh_sink`` and immediately binds it to
+                # the active study artifact.  Materializing a JSON MeshIR here
+                # would allocate and serialize the same large CSR payload only
+                # to discard it.  ProblemIR callers keep the default True.
+                domain_mesh_ir = None
+                is_valid = True
             if is_valid is False:
                 raise ValueError(
                     "generated shared FEM domain mesh asset failed Rust validation"
@@ -681,13 +1484,21 @@ def build_geometry_assets_for_request(
                 "mesh": domain_mesh_ir,
                 "region_markers": region_markers,
                 "object_region_markers": (
-                    build_report.object_region_markers
-                    if build_report is not None
-                    else []
+                    list(build_report.get("object_region_markers", []))
+                    if isinstance(build_report, Mapping)
+                    else (
+                        list(build_report.object_region_markers)
+                        if build_report is not None
+                        else []
+                    )
                 ),
             }
             if build_report is not None:
-                domain_asset["build_report"] = build_report.to_dict()
+                domain_asset["build_report"] = (
+                    dict(build_report)
+                    if isinstance(build_report, Mapping)
+                    else build_report.to_dict()
+                )
             assets["fem_domain_mesh_asset"] = domain_asset
 
     if (
@@ -699,7 +1510,7 @@ def build_geometry_assets_for_request(
     else:
         result = assets
 
-    if asset_cache is not None:
+    if asset_cache is not None and _include_domain_mesh_ir:
         asset_cache[asset_cache_key] = (
             copy.deepcopy(result) if _copy_cached_assets else result
         )
@@ -714,8 +1525,10 @@ def _geometry_asset_cache_key(
     discretization: DiscretizationHints,
     study_universe: dict[str, object] | None,
     mesh_workflow: dict[str, object] | None,
+    per_object_recipes: Mapping[str, PerObjectMeshRecipe] | None,
     object_regions: Sequence[dict[str, object]] | None,
     fdm_only: bool,
+    geometry_object_ids: Mapping[str, str] | None = None,
 ) -> str:
     """Build a cache identity for the products actually realized.
 
@@ -725,12 +1538,17 @@ def _geometry_asset_cache_key(
     """
     payload: dict[str, object] = {
         "requested_backend": requested_backend.value,
-        "geometries": [geometry.to_ir() for geometry in geometries],
+        "geometries": [_geometry_cache_fingerprint(geometry) for geometry in geometries],
         "discretization": discretization.to_ir(),
         "study_universe": study_universe,
     }
     if not fdm_only:
+        payload["geometry_object_ids"] = dict(geometry_object_ids or {})
         payload["mesh_workflow"] = mesh_workflow
+        payload["per_object_recipes"] = {
+            str(name): recipe.to_ir()
+            for name, recipe in (per_object_recipes or {}).items()
+        }
         payload["object_regions"] = list(object_regions or [])
     return json.dumps(payload, sort_keys=True)
 
@@ -753,6 +1571,188 @@ class ExecutionPrecision(str, Enum):
     DOUBLE = "double"
 
 
+class FdmPrecisionPolicy(str, Enum):
+    FULL_DOUBLE = "full_double"
+    SINGLE_STORAGE_FP64_REDUCTION = "single_storage_fp64_reduction"
+
+    @property
+    def execution_precision(self) -> ExecutionPrecision:
+        if self is FdmPrecisionPolicy.FULL_DOUBLE:
+            return ExecutionPrecision.DOUBLE
+        return ExecutionPrecision.SINGLE
+
+    def to_ir(self) -> dict[str, str]:
+        if self is FdmPrecisionPolicy.FULL_DOUBLE:
+            return {
+                "storage": "double",
+                "compute": "double",
+                "fft": "double",
+                "reduction": "double",
+                "realization_id": "fullmag.fdm.cuda.precision.full_double.v1",
+            }
+        return {
+            "storage": "single",
+            "compute": "single",
+            "fft": "single",
+            "reduction": "double",
+            "realization_id": "fullmag.fdm.cuda.precision.single_storage_fp64_reduction.v1",
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ParallelExecutionPolicy:
+    """Authoring policy for admitting independent work items.
+
+    The CPU and memory percentages are soft admission targets inside the
+    effective process/container allocation.  They do not replace the native
+    runtime's hard resource limits or its existing Rayon pool.
+    """
+
+    mode: str = "serial"
+    max_cpu_percent: float = 90.0
+    max_memory_percent: float = 80.0
+    memory_reserve_bytes: int = 1_073_741_824
+    max_workers: int | None = None
+    threads_per_worker: int = 1
+
+    _U32_MAX = 4_294_967_295
+    _U64_MAX = 18_446_744_073_709_551_615
+
+    def __post_init__(self) -> None:
+        mode = str(self.mode).strip().lower()
+        if mode not in {"serial", "adaptive"}:
+            raise ValueError("parallel execution mode must be 'serial' or 'adaptive'")
+        object.__setattr__(self, "mode", mode)
+
+        if isinstance(self.max_cpu_percent, bool) or not isinstance(
+            self.max_cpu_percent, (int, float)
+        ):
+            raise ValueError("parallel_execution.max_cpu_percent must be numeric")
+        if isinstance(self.max_memory_percent, bool) or not isinstance(
+            self.max_memory_percent, (int, float)
+        ):
+            raise ValueError("parallel_execution.max_memory_percent must be numeric")
+        max_cpu_percent = float(self.max_cpu_percent)
+        max_memory_percent = float(self.max_memory_percent)
+        for name, value in (
+            ("max_cpu_percent", max_cpu_percent),
+            ("max_memory_percent", max_memory_percent),
+        ):
+            if not math.isfinite(value) or value <= 0.0 or value > 100.0:
+                raise ValueError(
+                    f"parallel_execution.{name} must be finite and in (0, 100]"
+                )
+        object.__setattr__(self, "max_cpu_percent", max_cpu_percent)
+        object.__setattr__(self, "max_memory_percent", max_memory_percent)
+
+        memory_reserve_bytes = self._integral_value(
+            self.memory_reserve_bytes,
+            "memory_reserve_bytes",
+            self._U64_MAX,
+        )
+        object.__setattr__(self, "memory_reserve_bytes", memory_reserve_bytes)
+
+        max_workers = None if self.max_workers is None else self._integral_value(
+            self.max_workers,
+            "max_workers",
+            self._U32_MAX,
+        )
+        if max_workers is not None and max_workers < 1:
+            raise ValueError("parallel_execution.max_workers must be >= 1")
+        object.__setattr__(self, "max_workers", max_workers)
+
+        threads_per_worker = self._integral_value(
+            self.threads_per_worker,
+            "threads_per_worker",
+            self._U32_MAX,
+        )
+        if threads_per_worker < 1:
+            raise ValueError("parallel_execution.threads_per_worker must be >= 1")
+        object.__setattr__(self, "threads_per_worker", threads_per_worker)
+
+    @staticmethod
+    def _integral_value(value: object, name: str, maximum: int) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"parallel_execution.{name} must be an integer")
+        if value < 0 or value > maximum:
+            raise ValueError(
+                f"parallel_execution.{name} must be in the range [0, {maximum}]"
+            )
+        return value
+
+    @classmethod
+    def from_ir(
+        cls,
+        value: "ParallelExecutionPolicy | Mapping[str, object] | None",
+    ) -> "ParallelExecutionPolicy":
+        if value is None:
+            return cls()
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, Mapping):
+            raise TypeError("parallel_execution must be a mapping or ParallelExecutionPolicy")
+        known = {
+            "mode",
+            "max_cpu_percent",
+            "max_memory_percent",
+            "memory_reserve_bytes",
+            "max_workers",
+            "threads_per_worker",
+        }
+        unknown = sorted(str(key) for key in set(value) - known)
+        if unknown:
+            raise ValueError(
+                "parallel_execution contains unknown fields: " + ", ".join(unknown)
+            )
+        defaults = cls()
+        return cls(
+            mode=value.get("mode", defaults.mode),
+            max_cpu_percent=value.get("max_cpu_percent", defaults.max_cpu_percent),
+            max_memory_percent=value.get(
+                "max_memory_percent", defaults.max_memory_percent
+            ),
+            memory_reserve_bytes=value.get(
+                "memory_reserve_bytes", defaults.memory_reserve_bytes
+            ),
+            max_workers=value.get("max_workers", defaults.max_workers),
+            threads_per_worker=value.get(
+                "threads_per_worker", defaults.threads_per_worker
+            ),
+        )
+
+    def to_ir(self) -> dict[str, object]:
+        return {
+            "mode": self.mode,
+            "max_cpu_percent": self.max_cpu_percent,
+            "max_memory_percent": self.max_memory_percent,
+            "memory_reserve_bytes": self.memory_reserve_bytes,
+            "max_workers": self.max_workers,
+            "threads_per_worker": self.threads_per_worker,
+        }
+
+    def validate_for_runtime(self, backend: object, device: object) -> None:
+        """Reject adaptive scheduling outside its qualified FEM CPU lane.
+
+        The native runner additionally checks that the study is an independent
+        eigen k-sweep.  The authoring layers can already fail closed on the
+        requested backend and device, so an adaptive request is never silently
+        ignored by an FDM or GPU realization.
+        """
+        if self.mode != "adaptive":
+            return
+        backend_value = getattr(backend, "value", backend)
+        device_value = getattr(device, "value", device)
+        if (
+            str(backend_value).strip().lower() != "fem"
+            or str(device_value).strip().lower() != "cpu"
+        ):
+            raise ValueError(
+                "unsupported parallel_execution realization: adaptive mode "
+                "requires requested_backend='fem' and requested_device='cpu' "
+                "for independent eigen k execution"
+            )
+
+
 class DeviceTarget(str, Enum):
     AUTO = "auto"
     CPU = "cpu"
@@ -769,20 +1769,46 @@ class RuntimeSelection:
     cpu_threads: int | None = None
     execution_mode: ExecutionMode = ExecutionMode.STRICT
     execution_precision: ExecutionPrecision = ExecutionPrecision.DOUBLE
+    fdm_precision_policy: FdmPrecisionPolicy | None = None
+    parallel_execution: ParallelExecutionPolicy = field(
+        default_factory=ParallelExecutionPolicy
+    )
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "backend_target", BackendTarget(self.backend_target))
         object.__setattr__(self, "device_target", DeviceTarget(self.device_target))
         object.__setattr__(self, "execution_mode", ExecutionMode(self.execution_mode))
         object.__setattr__(self, "execution_precision", ExecutionPrecision(self.execution_precision))
+        if self.fdm_precision_policy is not None:
+            policy = FdmPrecisionPolicy(self.fdm_precision_policy)
+            object.__setattr__(self, "fdm_precision_policy", policy)
+            if policy.execution_precision is not self.execution_precision:
+                raise ValueError(
+                    "fdm_precision_policy conflicts with execution_precision"
+                )
+        object.__setattr__(
+            self,
+            "parallel_execution",
+            ParallelExecutionPolicy.from_ir(self.parallel_execution),
+        )
+        self.parallel_execution.validate_for_runtime(
+            self.backend_target,
+            self.device_target,
+        )
         if self.gpu_count < 0:
             raise ValueError("gpu_count must be >= 0")
         if self.gpu_count > 1:
             raise ValueError(
                 "gpu_count > 1 requests multi-GPU execution, but multi-GPU execution is not implemented"
             )
-        if self.device_index is not None and self.device_index < 0:
-            raise ValueError("device_index must be >= 0")
+        if self.device_index is not None:
+            if isinstance(self.device_index, bool) or not isinstance(
+                self.device_index, Integral
+            ):
+                raise ValueError("device_index must be a nonnegative integer")
+            object.__setattr__(self, "device_index", int(self.device_index))
+            if self.device_index < 0:
+                raise ValueError("device_index must be >= 0")
         if self.cpu_threads is not None and self.cpu_threads <= 0:
             raise ValueError("cpu_threads must be >= 1")
         if self.cpu_threads is not None and self.cpu_threads > 1:
@@ -807,6 +1833,8 @@ class RuntimeSelection:
             cpu_threads=self.cpu_threads,
             execution_mode=self.execution_mode,
             execution_precision=self.execution_precision,
+            fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=self.parallel_execution,
         )
 
     def device(self, index: int) -> "RuntimeSelection":
@@ -820,6 +1848,8 @@ class RuntimeSelection:
             cpu_threads=self.cpu_threads,
             execution_mode=self.execution_mode,
             execution_precision=self.execution_precision,
+            fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=self.parallel_execution,
         )
 
     def cpu(self) -> "RuntimeSelection":
@@ -831,6 +1861,8 @@ class RuntimeSelection:
             cpu_threads=self.cpu_threads,
             execution_mode=self.execution_mode,
             execution_precision=self.execution_precision,
+            fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=self.parallel_execution,
         )
 
     def cuda(self, gpu_count: int = 1) -> "RuntimeSelection":
@@ -842,6 +1874,8 @@ class RuntimeSelection:
             cpu_threads=self.cpu_threads,
             execution_mode=self.execution_mode,
             execution_precision=self.execution_precision,
+            fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=self.parallel_execution,
         )
 
     def gpu(self, gpu_count: int = 1) -> "RuntimeSelection":
@@ -863,6 +1897,8 @@ class RuntimeSelection:
             cpu_threads=cpu_threads,
             execution_mode=self.execution_mode,
             execution_precision=self.execution_precision,
+            fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=self.parallel_execution,
         )
 
     def mode(self, execution_mode: ExecutionMode | str) -> "RuntimeSelection":
@@ -877,6 +1913,8 @@ class RuntimeSelection:
             cpu_threads=self.cpu_threads,
             execution_mode=ExecutionMode(normalized_mode),
             execution_precision=self.execution_precision,
+            fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=self.parallel_execution,
         )
 
     def precision(self, execution_precision: ExecutionPrecision | str) -> "RuntimeSelection":
@@ -893,6 +1931,40 @@ class RuntimeSelection:
             cpu_threads=self.cpu_threads,
             execution_mode=self.execution_mode,
             execution_precision=ExecutionPrecision(normalized_precision),
+            parallel_execution=self.parallel_execution,
+        )
+
+    def precision_policy(
+        self, policy: FdmPrecisionPolicy | str
+    ) -> "RuntimeSelection":
+        resolved_policy = FdmPrecisionPolicy(policy)
+        return RuntimeSelection(
+            backend_target=self.backend_target,
+            device_target=self.device_target,
+            gpu_count=self.gpu_count,
+            device_index=self.device_index,
+            cpu_threads=self.cpu_threads,
+            execution_mode=self.execution_mode,
+            execution_precision=resolved_policy.execution_precision,
+            fdm_precision_policy=resolved_policy,
+            parallel_execution=self.parallel_execution,
+        )
+
+    def with_parallel_execution(
+        self,
+        policy: ParallelExecutionPolicy | Mapping[str, object],
+    ) -> "RuntimeSelection":
+        """Return a copy with the independent-work admission policy changed."""
+        return RuntimeSelection(
+            backend_target=self.backend_target,
+            device_target=self.device_target,
+            gpu_count=self.gpu_count,
+            device_index=self.device_index,
+            cpu_threads=self.cpu_threads,
+            execution_mode=self.execution_mode,
+            execution_precision=self.execution_precision,
+            fdm_precision_policy=self.fdm_precision_policy,
+            parallel_execution=ParallelExecutionPolicy.from_ir(policy),
         )
 
     def resolved(
@@ -908,11 +1980,13 @@ class RuntimeSelection:
         if mode is not None:
             resolved = resolved.mode(mode)
         if precision is not None:
-            resolved = resolved.precision(precision)
+            normalized_precision = ExecutionPrecision(precision)
+            if normalized_precision is not resolved.execution_precision:
+                resolved = resolved.precision(normalized_precision)
         return resolved
 
     def to_runtime_metadata(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "backend": self.backend_target.value,
             "device": self.device_target.value,
             "gpu_count": self.gpu_count,
@@ -921,15 +1995,21 @@ class RuntimeSelection:
             "execution_mode": self.execution_mode.value,
             "execution_precision": self.execution_precision.value,
         }
+        if self.fdm_precision_policy is not None:
+            result["fdm_precision_policy"] = self.fdm_precision_policy.to_ir()
+        result["parallel_execution"] = self.parallel_execution.to_ir()
+        if self.device_index is not None:
+            result["legacy_cuda_binding"] = legacy_cuda_binding(self.device_index)
+        return result
 
 
 backend = RuntimeSelection()
 
 
-EnergyTerm = Exchange | Demag | InterfacialDMI | BulkDMI | Zeeman | StaticFieldMap | Magnetoelastic | UniaxialAnisotropy | OerstedCylinder | OerstedField | CubicAnisotropy | ThermalNoise
+EnergyTerm = Exchange | Demag | InterfacialDMI | RotatedInterfacialDMI | BulkDMI | Zeeman | StaticFieldMap | Magnetoelastic | UniaxialAnisotropy | OerstedCylinder | OerstedField | CubicAnisotropy | ThermalNoise
 CurrentModule = AntennaFieldSource | CurrentTransport
 LegacyOutputSpec = SaveField | SaveScalar | Snapshot
-OutputSpec = LegacyOutputSpec | SaveSpectrum | SaveMode | SaveDispersion
+OutputSpec = LegacyOutputSpec | SaveSpectrum | SaveMode | SaveDispersion | SaveEigenDiagnostics
 
 
 def _material_has_anisotropy(material: Material) -> bool:
@@ -1399,12 +2479,130 @@ def _validate_constraint_selector_references(
         )
 
 
+def _validate_authored_mixed_p1_scope(
+    *,
+    runtime_selection: dict[str, object],
+    mesh_workflow: dict[str, object] | None,
+    materials: Sequence[object],
+    energy_terms: Sequence[object],
+) -> None:
+    if (
+        runtime_selection.get("backend") != "fem"
+        or runtime_selection.get("execution_mode") != "strict"
+    ):
+        return
+    per_geometry = (
+        mesh_workflow.get("per_geometry")
+        if isinstance(mesh_workflow, dict)
+        else None
+    )
+    if not isinstance(per_geometry, list):
+        return
+    requests_mixed_p1 = any(
+        isinstance(recipe, dict)
+        and recipe.get("mesh_strategy") == "swept_prism"
+        and recipe.get("transition_policy") == "pyramid_to_tetrahedra"
+        and recipe.get("order") == 1
+        for recipe in per_geometry
+    )
+    if not requests_mixed_p1:
+        return
+
+    material_payloads = [
+        material.to_ir()
+        for material in materials
+        if hasattr(material, "to_ir")
+    ]
+    energy_payloads = [
+        term.to_ir()
+        for term in energy_terms
+        if hasattr(term, "to_ir")
+    ]
+    device = runtime_selection.get("device")
+    dmi_kinds = {"interfacial_dmi", "bulk_dmi", "rotated_interfacial_dmi"}
+
+    def has_nonzero_value(value: object) -> bool:
+        if value is None or isinstance(value, bool):
+            return False
+        if isinstance(value, (int, float)):
+            # NaN is non-zero here so malformed authored input remains visible
+            # to the normal finite-value validators instead of being silently
+            # treated as an inactive interaction.
+            return value != 0.0
+        if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+            return any(has_nonzero_value(item) for item in value)
+        return False
+
+    has_dmi = any(
+        payload.get("kind") in dmi_kinds and has_nonzero_value(payload.get("D"))
+        for payload in energy_payloads
+    ) or any(
+        has_nonzero_value(payload.get(key))
+        for payload in material_payloads
+        for key in ("interfacial_dmi", "bulk_dmi", "dind_field", "dbulk_field")
+    )
+    failed: list[str] = []
+    if device not in {"cpu", "cuda", "gpu"}:
+        failed.append("device_not_explicit_cpu_or_gpu")
+    exchange_count = sum(
+        payload.get("kind") == "exchange" for payload in energy_payloads
+    )
+    qualified_demag_count = sum(
+        payload.get("kind") == "demag"
+        and payload.get("realization")
+        in {"auto", "poisson_robin", "poisson_dirichlet"}
+        for payload in energy_payloads
+    )
+    if exchange_count == 0:
+        failed.append("missing_exchange")
+    elif exchange_count != 1:
+        failed.append("exchange_term_count_not_one")
+    if qualified_demag_count == 0:
+        failed.append("missing_qualified_demag")
+    elif qualified_demag_count != 1:
+        failed.append("demag_term_count_not_one")
+    if any(
+        payload.get("kind")
+        not in {
+            "exchange",
+            "demag",
+            "zeeman",
+            "interfacial_dmi",
+            "bulk_dmi",
+            "rotated_interfacial_dmi",
+        }
+        for payload in energy_payloads
+    ):
+        failed.append("unsupported_energy_term")
+    if device in {"cuda", "gpu"} and has_dmi:
+        failed.append("gpu_dmi_kernel_not_mixed_p1")
+    if len(material_payloads) != 1:
+        failed.append("material_count_not_one")
+    if any(
+        payload.get(key) is not None
+        for payload in material_payloads
+        for key in (
+            "ms_field",
+            "a_field",
+            "alpha_field",
+        )
+    ):
+        failed.append("unsupported_material_field_or_dmi")
+
+    if failed:
+        raise ValueError(
+            "fem_mixed_p1_scope_rejected: "
+            f"phase=authored_preflight; failed_predicates=[{','.join(failed)}]; "
+            "qualified_scope=exchange+uniform_or_nodal_uniaxial_or_cubic_anisotropy+cpu_dmi_only+auto_or_poisson_open_boundary_order_one; fallback=none"
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Problem:
     name: str
     magnets: Sequence[Ferromagnet]
     energy: Sequence[EnergyTerm]
-    study: TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse | None = None
+    study: AntennaFieldSolve | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse | None = None
     dynamics: LLG | None = None
     outputs: Sequence[LegacyOutputSpec] | None = None
     discretization: DiscretizationHints | None = None
@@ -1413,8 +2611,17 @@ class Problem:
     runtime_metadata: dict[str, object] = field(default_factory=dict)
     auxiliary_geometries: Sequence[object] = ()
     auxiliary_geometry_roles: Mapping[str, str] = field(default_factory=dict)
+    auxiliary_geometry_object_ids: Mapping[str, str] = field(default_factory=dict)
     current_modules: Sequence[CurrentModule] = ()
     field_drives: Sequence[RegionalFieldDrive] = ()
+    # Composition-first microwave antenna resources.  These are immutable
+    # authoring records; the solved field asset is produced by a dedicated
+    # stage and is never inferred from a field drive.
+    antenna_port_modes: Sequence[AntennaPortMode] = ()
+    antenna_field_solve_stages: Sequence[AntennaFieldSolveStage] = ()
+    antenna_target_projections: Sequence[AntennaTargetProjection] = ()
+    solved_antenna_drives: Sequence[SolvedAntennaDrive] = ()
+    antenna_spectrum_requests: Sequence[AntennaSpectrumRequest] = ()
     couplings: Sequence[Coupling] = ()
     monitors: Sequence[PlanarMonitor] = ()
     excitation_analysis: SpinWaveExcitationAnalysis | None = None
@@ -1440,12 +2647,25 @@ class Problem:
     mechanical_loads: Sequence[MechanicalLoad] = ()
     selections: Sequence[SelectionDefinition] = ()
     magnetization_constraints: Sequence[FrozenSpins] = ()
+    # Optional versioned authoring parameter library.  It is lowered as
+    # authoring metadata only; solver code continues to consume resolved SI
+    # values through the existing material/physics contracts.
+    parameters: ParameterLibrary | None = None
 
     # Periodic boundary conditions (per-axis, for FDM)
     pbc: FdmPbc | tuple[bool, bool, bool] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "name", require_non_empty(self.name, "name"))
+        if self.parameters is not None:
+            if not isinstance(self.parameters, ParameterLibrary):
+                raise TypeError("Problem.parameters must be a ParameterLibrary or None")
+            # Construction is the authoring → Problem boundary.  Resolve now
+            # so unknown references, cycles and display-dimension conflicts
+            # fail before any runtime or meshing path can consume this object.
+            parameter_snapshot = ParameterLibrary.from_ir(self.parameters.to_ir())
+            parameter_snapshot.resolve_all()
+            object.__setattr__(self, "parameters", parameter_snapshot)
         roles = {
             require_non_empty(str(name), "auxiliary_geometry_roles.name"): require_non_empty(
                 str(role), "auxiliary_geometry_roles.role"
@@ -1470,12 +2690,24 @@ class Problem:
                 + ", ".join(unknown_roles)
             )
         object.__setattr__(self, "auxiliary_geometry_roles", roles)
-        if not self.magnets:
+        auxiliary_object_ids = {
+            require_non_empty(name, "auxiliary_geometry_object_ids.name"):
+            require_non_empty(object_id, "auxiliary_geometry_object_ids.object_id")
+            for name, object_id in self.auxiliary_geometry_object_ids.items()
+        }
+        unknown_ids = sorted(set(auxiliary_object_ids) - set(roles))
+        if unknown_ids:
+            raise ValueError(
+                "auxiliary_geometry_object_ids references unknown geometry object(s): "
+                + ", ".join(unknown_ids)
+            )
+        object.__setattr__(self, "auxiliary_geometry_object_ids", auxiliary_object_ids)
+        if not self.magnets and not isinstance(self.study, AntennaFieldSolve):
             raise ValueError("Problem requires at least one magnet")
-        if not self.energy and not any(
+        if not isinstance(self.study, AntennaFieldSolve) and not self.energy and not any(
             _material_has_anisotropy(magnet.material) for magnet in self.magnets
         ):
-            raise ValueError(
+            raise IncompletePhysicsError(
                 "Problem requires at least one interaction or material anisotropy"
             )
 
@@ -1552,6 +2784,15 @@ class Problem:
             magnet.object_id for magnet in self.magnets if magnet.object_id is not None
         ]
         ensure_unique_names(explicit_object_ids, "magnet object_ids")
+        ensure_unique_names(
+            [
+                *(magnet.object_id if magnet.object_id is not None else magnet.name
+                  for magnet in self.magnets),
+                *(self.auxiliary_geometry_object_ids.get(name, name)
+                  for name in self.auxiliary_geometry_roles),
+            ],
+            "object_ids",
+        )
         self._validate_magnetization_constraints()
         ensure_unique_names(
             (module.name for module in self.current_modules), "current module names"
@@ -1560,6 +2801,16 @@ class Problem:
         ensure_unique_names((drive.name for drive in self.field_drives), "field drive names")
         if any(not isinstance(drive, RegionalFieldDrive) for drive in self.field_drives):
             raise TypeError("Problem.field_drives must contain RegionalFieldDrive objects")
+        for name, values, expected in (
+            ("antenna_port_modes", self.antenna_port_modes, AntennaPortMode),
+            ("antenna_field_solve_stages", self.antenna_field_solve_stages, AntennaFieldSolveStage),
+            ("antenna_target_projections", self.antenna_target_projections, AntennaTargetProjection),
+            ("solved_antenna_drives", self.solved_antenna_drives, SolvedAntennaDrive),
+            ("antenna_spectrum_requests", self.antenna_spectrum_requests, AntennaSpectrumRequest),
+        ):
+            if any(not isinstance(value, expected) for value in values):
+                raise TypeError(f"Problem.{name} must contain {expected.__name__} objects")
+            ensure_unique_names((value.id for value in values), f"{name} ids")
         magnetic_object_ids = {magnet.name for magnet in self.magnets}
         region_ids = {
             (region.owner_object, region.region_id) for region in self._collect_object_regions()
@@ -1709,10 +2960,11 @@ class Problem:
         script_source: str | None = None,
         source_root: str | Path | None = None,
         entrypoint_kind: str = "direct",
-        asset_cache: dict[str, dict[str, Any] | None] | None = None,
-        include_geometry_assets: bool = True,
-        study_pipeline: dict[str, object] | None = None,
-        _copy_cached_geometry_assets: bool = True,
+          asset_cache: dict[str, dict[str, Any] | None] | None = None,
+          include_geometry_assets: bool = True,
+          study_pipeline: dict[str, object] | None = None,
+          runtime_device_override: str | None = None,
+          _copy_cached_geometry_assets: bool = True,
     ) -> dict[str, object]:
         runtime = self.runtime.resolved(
             backend=requested_backend,
@@ -1741,6 +2993,8 @@ class Problem:
         effective_asset_cache = asset_cache if asset_cache is not None else self.geometry_asset_cache
         runtime_metadata = dict(self.runtime_metadata)
         runtime_metadata["runtime_selection"] = runtime.to_runtime_metadata()
+        if isinstance(self.study, Eigenmodes) and self.study.solver_policy is not None:
+            runtime_metadata["modal_solver_policy"] = self.study.solver_policy.to_ir()
         effective_study_pipeline = _normalize_study_pipeline_value(study_pipeline)
         if effective_study_pipeline is None:
             effective_study_pipeline = _normalize_study_pipeline_value(
@@ -1756,6 +3010,18 @@ class Problem:
         mesh_workflow = runtime_metadata.get("mesh_workflow")
         if not isinstance(mesh_workflow, dict):
             mesh_workflow = None
+        authored_runtime_selection = runtime_metadata["runtime_selection"]
+        if runtime_device_override in {"cpu", "gpu"}:
+            authored_runtime_selection = {
+                **authored_runtime_selection,
+                "device": runtime_device_override,
+            }
+        _validate_authored_mixed_p1_scope(
+            runtime_selection=authored_runtime_selection,
+            mesh_workflow=mesh_workflow,
+            materials=materials,
+            energy_terms=self.energy,
+        )
         study_universe = (
             runtime_metadata.get("study_universe")
             if isinstance(runtime_metadata.get("study_universe"), dict)
@@ -1784,6 +3050,11 @@ class Problem:
         )
         geometry_assets = None
         if include_geometry_assets:
+            per_object_recipes = {
+                magnet.geometry.geometry_name: magnet.mesh
+                for magnet in self.magnets
+                if isinstance(magnet.mesh, PerObjectMeshRecipe)
+            }
             owner_geometry_names = {
                 magnet.name: magnet.geometry.geometry_name for magnet in self.magnets
             }
@@ -1801,7 +3072,9 @@ class Problem:
                 discretization=discretization,
                 study_universe=study_universe,
                 mesh_workflow=mesh_workflow,
+                per_object_recipes=per_object_recipes,
                 object_regions=object_region_mesh_specs,
+                geometry_object_ids=self._geometry_object_ids(),
                 asset_cache=effective_asset_cache,
                 _copy_cached_assets=_copy_cached_geometry_assets,
             )
@@ -1820,14 +3093,13 @@ class Problem:
         physics_objects = [
             {
                 "schema_version": "physics_object.v1",
-                "object_id": name,
+                "object_id": self.auxiliary_geometry_object_ids.get(name, name),
                 "name": name,
                 "type": role,
                 "geometry_id": name,
                 "material_assignment_ids": [],
             }
             for name, role in self.auxiliary_geometry_roles.items()
-            if role != "antenna"
         ]
 
         result = {
@@ -1846,6 +3118,11 @@ class Problem:
                 "seeds": [],
             },
             "geometry": {"entries": [geometry.to_ir() for geometry in geometries]},
+            **(
+                {"parameters": self.parameters.to_ir()}
+                if self.parameters is not None
+                else {}
+            ),
             "geometry_assets": geometry_assets,
             "regions": [region.to_ir() for region in regions],
             "object_regions": [
@@ -1859,6 +3136,19 @@ class Problem:
             "couplings": [coupling.to_ir() for coupling in self.couplings],
             "planar_monitors": [monitor.to_ir() for monitor in self.monitors],
             "field_drives": [drive.to_ir() for drive in self.field_drives],
+            "antenna_port_modes": [mode.to_ir() for mode in self.antenna_port_modes],
+            "antenna_field_solve_stages": [
+                stage.to_ir() for stage in self.antenna_field_solve_stages
+            ],
+            "antenna_target_projections": [
+                projection.to_ir() for projection in self.antenna_target_projections
+            ],
+            "solved_antenna_drives": [
+                drive.to_ir() for drive in self.solved_antenna_drives
+            ],
+            "antenna_spectrum_requests": [
+                request.to_ir() for request in self.antenna_spectrum_requests
+            ],
             "magnets": magnets_ir,
             "selections": [selection.to_ir() for selection in self.selections],
             "magnetization_constraints": [
@@ -1878,6 +3168,11 @@ class Problem:
             "backend_policy": {
                 "requested_backend": runtime.backend_target.value,
                 "execution_precision": runtime.execution_precision.value,
+                **(
+                    {"fdm_precision_policy": runtime.fdm_precision_policy.to_ir()}
+                    if runtime.fdm_precision_policy is not None
+                    else {}
+                ),
                 "discretization_hints": discretization.to_ir() if discretization else None,
             },
             "validation_profile": {"execution_mode": runtime.execution_mode.value},
@@ -1898,7 +3193,27 @@ class Problem:
         }
         if physics_objects:
             result["physics_objects"] = physics_objects
+        if include_geometry_assets:
+            from fullmag.runtime.antenna_lead_materialization import materialize_antenna_lead_preparations
+
+            materialize_antenna_lead_preparations(
+                self, result, geometries=geometries, discretization=discretization,
+                mesh_workflow=mesh_workflow,
+                runtime_device_override=runtime_device_override,
+            )
         return result
+
+    def to_model_definition(self, *, model_id: str | None = None) -> "ModelDefinition":
+        """Return the read-only authoring projection for this problem.
+
+        The projection is an authoring/document boundary only.  It does not
+        materialize meshes, select a runtime, or create a second mutable
+        problem state.
+        """
+
+        from fullmag.model.authoring import ModelDefinition
+
+        return ModelDefinition.from_problem(self, model_id=model_id)
 
     def _collect_magnetization_constraints(self) -> tuple[FrozenSpins, ...]:
         collected: list[FrozenSpins] = list(self.magnetization_constraints)
@@ -1996,7 +3311,7 @@ class Problem:
             hybrid=self.discretization.hybrid,
         )
 
-    def _normalize_study(self) -> TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse:
+    def _normalize_study(self) -> AntennaFieldSolve | TimeEvolution | Relaxation | Eigenmodes | FrequencyResponse:
         if self.study is not None and (self.dynamics is not None or self.outputs is not None):
             raise ValueError(
                 "Problem accepts either study=... or the legacy dynamics=... and outputs=... shape, not both"
@@ -2075,7 +3390,7 @@ class Problem:
         for geometry in self.auxiliary_geometries:
             geometry_name = geometry.geometry_name
             role = self.auxiliary_geometry_roles.get(geometry_name)
-            if role is None or role == "antenna" or geometry_name in seen:
+            if role is None or geometry_name in seen:
                 continue
             regions.append(Region(name=geometry_name, geometry=geometry))
             seen.add(geometry_name)
@@ -2120,13 +3435,24 @@ class Problem:
         for geometry in self.auxiliary_geometries:
             geometry_name = geometry.geometry_name
             role = self.auxiliary_geometry_roles.get(geometry_name)
-            if role not in {"conductor", "electrode", "geometry"}:
+            if role not in {"conductor", "electrode", "geometry", "antenna"}:
                 continue
             if geometry_name in seen and seen[geometry_name] != geometry_name:
                 raise ValueError(
                     f"region '{geometry_name}' is bound to conflicting geometries"
                 )
             seen[geometry_name] = geometry_name
+
+    def _geometry_object_ids(self) -> dict[str, str]:
+        return {
+            **self.auxiliary_geometry_object_ids,
+            **{
+                magnet.geometry.geometry_name: (
+                    magnet.name if magnet.object_id is None else magnet.object_id
+                )
+                for magnet in self.magnets
+            },
+        }
 
     def _build_geometry_assets(
         self,
@@ -2140,6 +3466,12 @@ class Problem:
             requested_backend=requested_backend,
             geometries=geometries,
             discretization=discretization,
+            geometry_object_ids=self._geometry_object_ids(),
+            per_object_recipes={
+                magnet.geometry.geometry_name: magnet.mesh
+                for magnet in self.magnets
+                if isinstance(magnet.mesh, PerObjectMeshRecipe)
+            },
             mesh_workflow=(
                 self.runtime_metadata.get("mesh_workflow")
                 if isinstance(self.runtime_metadata.get("mesh_workflow"), dict)

@@ -1,14 +1,19 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type {
+  FieldMetaResource,
   FrozenSpinsActivation,
   FrozenSpinsDefinition,
   FrozenSpinsMembershipPolicy,
+  FrozenSpinsPreviewActivationResponse,
   FrozenSpinsPreviewResponse,
   FrozenSpinsReferencePolicy,
+  FrozenSpinsRuntimeApplication,
+  FrozenSpinsSolverRuntimeStatus,
 } from "@/kernel/api/apiTypes";
+import { runAuthoringMutationWithHistory } from "@/kernel/authoring/authoringHistoryMutation";
 import { useKernel } from "@/kernel/KernelContext";
 import {
   FROZEN_SPINS_ACTIVE_PREVIEW_RESOURCE_KEY,
@@ -16,16 +21,22 @@ import {
   frozenSpinsDefinitionResourceKey,
   useFrozenSpinsDefinitionResource,
 } from "@/kernel/resources/frozenSpinsResources";
-import { useFieldMetaResource } from "@/kernel/resources/studyRuntimeResources";
+import { sessionRequestScopeKey } from "@/kernel/resources/sessionResourceIdentity";
+import {
+  useFieldMetaResource,
+  useSolverStatusResource,
+} from "@/kernel/resources/studyRuntimeResources";
+import { useSessionScopedResourceKey } from "@/kernel/resources/useSessionScopedResourceKey";
 import { Button } from "@/shared/ui/Button";
 
+import { useRegisterInspectorEditSession } from "../../InspectorEditSession";
 import type { InspectorPanelProps } from "../../inspectorTypes";
 import { FeedbackBanner } from "../../primitives/FeedbackBanner";
 import { FieldRow } from "../../primitives/FieldRow";
 import { InspectorGroup } from "../../primitives/InspectorGroup";
 import { SelectionExpressionBuilder } from "../selection/SelectionExpressionBuilder";
 
-type PendingField = "apply" | "delete" | "preview" | null;
+type PendingField = "activate" | "apply" | "delete" | "preview" | "quantity" | null;
 
 interface Feedback {
   kind: "error" | "success" | "warning";
@@ -35,22 +46,29 @@ interface Feedback {
 export function FrozenSpinsInspectorPanel({ selection }: InspectorPanelProps) {
   const ref = selection.ref?.type === "frozen-spins" ? selection.ref : null;
   const constraintId = ref?.constraintId ?? "";
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    frozenSpinsDefinitionResourceKey(constraintId),
+  );
+  const sessionScopeKey = sessionRequestScopeKey(sessionIdentity);
   const resource = useFrozenSpinsDefinitionResource(constraintId, {
     enabled: ref !== null,
   });
   const [lastGood, setLastGood] = useState<{
     constraintId: string;
+    resourceKey: string;
     resource: NonNullable<typeof resource.data>;
   } | null>(null);
   if (
     resource.data &&
-    (lastGood?.constraintId !== constraintId || lastGood.resource !== resource.data)
+    (lastGood?.constraintId !== constraintId ||
+      lastGood.resourceKey !== resourceKey ||
+      lastGood.resource !== resource.data)
   ) {
-    setLastGood({ constraintId, resource: resource.data });
+    setLastGood({ constraintId, resourceKey, resource: resource.data });
   }
   const retainedResource =
     resource.data ??
-    (lastGood?.constraintId === constraintId
+    (lastGood?.constraintId === constraintId && lastGood.resourceKey === resourceKey
       ? lastGood.resource
       : null);
 
@@ -76,11 +94,12 @@ export function FrozenSpinsInspectorPanel({ selection }: InspectorPanelProps) {
   const objectId = ref.objectId ?? selection.objectId;
   return (
     <FrozenSpinsEditor
-      key={constraintId}
+      key={resourceKey}
       definition={retainedResource.definition}
       objectId={objectId}
       regionId={ref.regionId ?? null}
       revision={retainedResource.revision}
+      sessionScopeKey={sessionScopeKey}
     />
   );
 }
@@ -90,19 +109,36 @@ export function FrozenSpinsEditor({
   objectId,
   regionId,
   revision: initialRevision,
+  sessionScopeKey,
 }: {
   definition: FrozenSpinsDefinition;
   objectId: string | null;
   regionId: string | null;
   revision: number;
+  sessionScopeKey?: string | null;
 }) {
   const kernel = useKernel();
   const [draft, setDraft] = useState(() => normalizeDefinition(initialDefinition));
+  const [baseline, setBaseline] = useState(() => normalizeDefinition(initialDefinition));
+  const baselineRef = useRef({
+    definition: normalizeDefinition(initialDefinition),
+    revision: initialRevision,
+  });
+  const acknowledgedRevisionRef = useRef(initialRevision);
   const draftRef = useRef(draft);
+  const applyInFlight = useRef(false);
+  const acknowledgeAppliedDraftRef = useRef<(() => boolean) | null>(null);
+  const mountedRef = useRef(true);
   const [revision, setRevision] = useState(initialRevision);
   const [pendingField, setPendingField] = useState<PendingField>(null);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
   const [preview, setPreview] = useState<FrozenSpinsPreviewResponse | null>(null);
+  const [activationReceipt, setActivationReceipt] =
+    useState<FrozenSpinsPreviewActivationResponse | null>(null);
+  const [runtimeApplication, setRuntimeApplication] =
+    useState<FrozenSpinsRuntimeApplication | null>(null);
+  const [previewSelectorJson, setPreviewSelectorJson] = useState<string | null>(null);
+  const solverStatus = useSolverStatusResource();
   const fieldMeta = useFieldMetaResource({
     enabled: objectId !== null,
     owner_object_id: objectId,
@@ -111,32 +147,115 @@ export function FrozenSpinsEditor({
   useEffect(() => {
     draftRef.current = draft;
   }, [draft]);
+  useEffect(() => {
+    const incomingDefinition = normalizeDefinition(initialDefinition);
+    if (initialRevision < acknowledgedRevisionRef.current) return;
+    const previousBaseline = baselineRef.current;
+    if (
+      initialRevision === previousBaseline.revision &&
+      JSON.stringify(incomingDefinition) === JSON.stringify(previousBaseline.definition)
+    ) {
+      return;
+    }
+    const wasClean =
+      JSON.stringify(draftRef.current) === JSON.stringify(previousBaseline.definition);
+    baselineRef.current = { definition: incomingDefinition, revision: initialRevision };
+    acknowledgedRevisionRef.current = initialRevision;
+    setBaseline(incomingDefinition);
+    setRevision(initialRevision);
+    if (wasClean) {
+      draftRef.current = incomingDefinition;
+      setDraft(incomingDefinition);
+      setPreview(null);
+      setPreviewSelectorJson(null);
+    }
+  }, [initialDefinition, initialRevision]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
-  async function applyDraft(): Promise<void> {
+  async function applyDraft(): Promise<boolean> {
+    if (applyInFlight.current || !dirty) return false;
+    const acknowledgeDraft = acknowledgeAppliedDraftRef.current;
     const submittedDraft = draft;
+    const operationSessionScopeKey = sessionScopeKey ?? null;
+    if (!operationSessionScopeKey) {
+      setFeedback({ kind: "error", message: "Session identity is not ready. Try again after it loads." });
+      return false;
+    }
+    const historyGeneration = kernel.authoringHistory?.getGeneration?.();
+    const isCurrentSession = () =>
+      kernel.commands.getSessionScopeKey() === operationSessionScopeKey &&
+      (historyGeneration === undefined ||
+        kernel.authoringHistory?.getGeneration?.() === historyGeneration);
+    const requestOptions = scopedFrozenSpinsRequestOptions(sessionScopeKey);
+    applyInFlight.current = true;
     setPendingField("apply");
     setFeedback(null);
     try {
-      const response = await kernel.api.model.frozenSpins.patch(draft.id, {
-        definition: draft,
-        expected_revision: revision,
-      });
+      const response = await runAuthoringMutationWithHistory(
+        {
+          api: kernel.api,
+          authoringHistory: kernel.authoringHistory,
+          sessionScopeKey,
+          isCurrentSessionScope: isCurrentSession,
+        },
+        "Update Frozen Spins definition",
+        async ({ baseRevision }) =>
+          requestOptions
+            ? kernel.api.model.frozenSpins.patch(
+                draft.id,
+                {
+                  definition: draft,
+                  expected_revision: baseRevision ?? revision,
+                },
+                requestOptions,
+              )
+            : kernel.api.model.frozenSpins.patch(draft.id, {
+                definition: draft,
+                expected_revision: baseRevision ?? revision,
+          }),
+      );
+      if (!mountedRef.current) return false;
+      if (!isCurrentSession()) return false;
+      const acknowledged = normalizeDefinition(response.definition);
+      baselineRef.current = { definition: acknowledged, revision: response.revision };
+      acknowledgedRevisionRef.current = response.revision;
+      setBaseline(acknowledged);
       if (draftRef.current === submittedDraft) {
-        const acknowledged = normalizeDefinition(response.definition);
+        if (!acknowledgeDraft?.()) return false;
         draftRef.current = acknowledged;
         setDraft(acknowledged);
       }
       setRevision(response.revision);
+      setPreview(null);
+      setActivationReceipt(null);
+      setRuntimeApplication(response.runtime_application ?? null);
       invalidateDefinitionResources(kernel, draft.id, response.revision);
-      setFeedback({ kind: "success", message: "Frozen Spins definition updated." });
+      kernel.resources.invalidate(FROZEN_SPINS_ACTIVE_PREVIEW_RESOURCE_KEY, "");
+      setFeedback({
+        kind: response.runtime_application ? "warning" : "success",
+        message: response.runtime_application
+          ? frozenSpinsRuntimeApplicationMessage(response.runtime_application)
+          : "Frozen Spins definition updated.",
+      });
+      return true;
     } catch (error) {
+      if (!mountedRef.current) return false;
+      if (!isCurrentSession()) return false;
       setFeedback({ kind: "error", message: errorMessage(error) });
+      return false;
     } finally {
-      setPendingField(null);
+      applyInFlight.current = false;
+      if (mountedRef.current) setPendingField(null);
     }
   }
 
   async function createPreview(): Promise<void> {
+    if (applyInFlight.current) return;
     if (!objectId) {
       setFeedback({
         kind: "warning",
@@ -144,8 +263,8 @@ export function FrozenSpinsEditor({
       });
       return;
     }
-    const sourceStateRevision = fieldMeta.data?.source_revision;
-    const topologyFingerprint = fieldMeta.data?.publication_bundle?.topology_hash;
+    const sourceStateRevision = fieldMeta.data?.field_revision;
+    const topologyFingerprint = frozenSpinsPreviewTopologyFingerprint(fieldMeta.data);
     if (sourceStateRevision === undefined || !topologyFingerprint) {
       setFeedback({
         kind: "warning",
@@ -156,7 +275,7 @@ export function FrozenSpinsEditor({
     setPendingField("preview");
     setFeedback(null);
     try {
-      const response = await kernel.api.model.frozenSpins.createPreview({
+      const request = {
         expected_revision: revision,
         expected_source_state_revision: sourceStateRevision,
         expected_topology_fingerprint: topologyFingerprint,
@@ -166,8 +285,16 @@ export function FrozenSpinsEditor({
             ? draft.activation.stage_ids[0] ?? null
             : null,
         target_object_id: objectId,
-      });
+      };
+      const requestOptions = scopedFrozenSpinsRequestOptions(sessionScopeKey);
+      const response = requestOptions
+        ? await kernel.api.model.frozenSpins.createPreview(request, requestOptions)
+        : await kernel.api.model.frozenSpins.createPreview(request);
+      if (!mountedRef.current) return;
+      setPreviewSelectorJson(JSON.stringify(draft.selector));
       setPreview(response);
+      setActivationReceipt(null);
+      setRuntimeApplication(null);
       kernel.resources.invalidate(
         FROZEN_SPINS_ACTIVE_PREVIEW_RESOURCE_KEY,
         response.preview_id,
@@ -175,23 +302,138 @@ export function FrozenSpinsEditor({
       setFeedback({
         kind: response.current ? "success" : "warning",
         message: response.current
-          ? "Frozen Spins preview is current and visible in the 3D viewport."
+          ? "Speculative Frozen Spins preview is current and visible in the 3D viewport. Solver identity is not bound until runtime activation."
           : "Preview was created but is stale against the current model state.",
       });
     } catch (error) {
+      if (!mountedRef.current) return;
+      const message = errorMessage(error);
+      if (message.includes("selection_stale_revision")) {
+        await fieldMeta.refetch();
+        setFeedback({
+          kind: "warning",
+          message: `${message} Current field identity was refreshed; retry Preview mask.`,
+        });
+      } else {
+        setFeedback({ kind: "error", message });
+      }
+    } finally {
+      if (mountedRef.current) setPendingField(null);
+    }
+  }
+
+  async function activatePreview(): Promise<void> {
+    const acknowledgeDraft = acknowledgeAppliedDraftRef.current;
+    if (applyInFlight.current) return;
+    if (!preview?.current) {
+      setFeedback({
+        kind: "warning",
+        message: "Create a current Frozen Spins preview before activation.",
+      });
+      return;
+    }
+    const submittedDraft = draft;
+    const operationSessionScopeKey = sessionScopeKey ?? null;
+    if (!operationSessionScopeKey) {
+      setFeedback({ kind: "error", message: "Session identity is not ready. Try again after it loads." });
+      return;
+    }
+    const historyGeneration = kernel.authoringHistory?.getGeneration?.();
+    const isCurrentSession = () =>
+      kernel.commands.getSessionScopeKey() === operationSessionScopeKey &&
+      (historyGeneration === undefined ||
+        kernel.authoringHistory?.getGeneration?.() === historyGeneration);
+    const requestOptions = scopedFrozenSpinsRequestOptions(sessionScopeKey);
+    applyInFlight.current = true;
+    setPendingField("activate");
+    setFeedback(null);
+    try {
+      const response = await runAuthoringMutationWithHistory(
+        {
+          api: kernel.api,
+          authoringHistory: kernel.authoringHistory,
+          sessionScopeKey,
+          isCurrentSessionScope: isCurrentSession,
+        },
+        "Commit Frozen Spins preview",
+        async ({ baseRevision }) =>
+          requestOptions
+            ? kernel.api.model.frozenSpins.activatePreview(
+                preview.preview_id,
+                {
+                  activation_candidate_token: preview.activation_candidate_token,
+                  definition: submittedDraft,
+                  expected_revision: baseRevision ?? revision,
+                },
+                requestOptions,
+              )
+            : kernel.api.model.frozenSpins.activatePreview(
+                preview.preview_id,
+                {
+                  activation_candidate_token: preview.activation_candidate_token,
+                  definition: submittedDraft,
+                  expected_revision: baseRevision ?? revision,
+                },
+              ),
+      );
+      if (!mountedRef.current) return;
+      if (!isCurrentSession()) return;
+      const acknowledged = normalizeDefinition(response.definition);
+      baselineRef.current = { definition: acknowledged, revision: response.revision };
+      acknowledgedRevisionRef.current = response.revision;
+      setBaseline(acknowledged);
+      if (draftRef.current === submittedDraft) {
+        if (!acknowledgeDraft?.()) return;
+        draftRef.current = acknowledged;
+        setDraft(acknowledged);
+      }
+      setRevision(response.revision);
+      setPreview(null);
+      setActivationReceipt(response);
+      setRuntimeApplication(response.runtime_application);
+      invalidateDefinitionResources(kernel, draft.id, response.revision);
+      kernel.resources.invalidate(FROZEN_SPINS_ACTIVE_PREVIEW_RESOURCE_KEY, "");
+      solverStatus.refetch();
+      setFeedback({
+        kind: "warning",
+        message: `${frozenSpinsRuntimeApplicationMessage(response.runtime_application)} The preview candidate was consumed; solver activation is still pending runtime confirmation and a matching solver-owned certificate.`,
+      });
+    } catch (error) {
+      if (!mountedRef.current) return;
+      if (!isCurrentSession()) return;
       setFeedback({ kind: "error", message: errorMessage(error) });
     } finally {
-      setPendingField(null);
+      applyInFlight.current = false;
+      if (mountedRef.current) setPendingField(null);
     }
   }
 
   async function deleteDefinition(): Promise<void> {
+    if (applyInFlight.current) return;
+    applyInFlight.current = true;
+    const requestOptions = scopedFrozenSpinsRequestOptions(sessionScopeKey);
     setPendingField("delete");
     setFeedback(null);
     try {
-      const response = await kernel.api.model.frozenSpins.delete(draft.id, {
-        expected_revision: revision,
-      });
+      const response = await runAuthoringMutationWithHistory(
+        {
+          api: kernel.api,
+          authoringHistory: kernel.authoringHistory,
+          sessionScopeKey,
+        },
+        "Delete Frozen Spins definition",
+        async ({ baseRevision }) =>
+          requestOptions
+            ? kernel.api.model.frozenSpins.delete(
+                draft.id,
+                { expected_revision: baseRevision ?? revision },
+                requestOptions,
+              )
+            : kernel.api.model.frozenSpins.delete(draft.id, {
+                expected_revision: baseRevision ?? revision,
+              }),
+      );
+      if (!mountedRef.current) return;
       kernel.resources.invalidate(
         frozenSpinsCollectionResourceKey(),
         response.revision,
@@ -200,16 +442,84 @@ export function FrozenSpinsEditor({
         frozenSpinsDefinitionResourceKey(draft.id),
         response.revision,
       );
+      kernel.resources.invalidate(FROZEN_SPINS_ACTIVE_PREVIEW_RESOURCE_KEY, "");
       kernel.selection.clear("inspector");
     } catch (error) {
+      if (!mountedRef.current) return;
       setFeedback({ kind: "error", message: errorMessage(error) });
+      setPendingField(null);
+    } finally {
+      applyInFlight.current = false;
+    }
+  }
+
+  async function showSolverQuantity(): Promise<void> {
+    setPendingField("quantity");
+    setFeedback(null);
+    try {
+      kernel.visualizationSync.queuePatch({
+        active_quantity_id: "frozen_spins",
+        field_component: null,
+        quantity: {
+          active_quantity_id: "frozen_spins",
+          field_component: null,
+        },
+      });
+      await kernel.visualizationSync.flushNow();
+      kernel.layout.setActiveViewportMainModule("viewport-3d");
+      kernel.layout.setFocusedSlot("viewport-main");
+      setFeedback({
+        kind: "success",
+        message: "3D viewport now reads the solver-owned frozen_spins quantity.",
+      });
+    } catch (error) {
+      setFeedback({ kind: "error", message: errorMessage(error) });
+    } finally {
       setPendingField(null);
     }
   }
 
+  const dirty = JSON.stringify(draft) !== JSON.stringify(baseline);
+  const resetDraft = () => {
+    if (applyInFlight.current) return;
+    draftRef.current = baseline;
+    setDraft(baseline);
+    setPreview(null);
+    setPreviewSelectorJson(null);
+    setFeedback(null);
+  };
   const activation = draft.activation ?? { kind: "all_stages" };
   const reference = draft.reference ?? { kind: "capture_current_at_activation" };
   const membership = draft.membership ?? { kind: "static" };
+  const toolbarPending = pendingField !== null;
+  const activationCandidateReady = Boolean(
+    preview?.current &&
+    draft.enabled &&
+    reference.kind === "capture_current_at_activation" &&
+    previewSelectorJson === JSON.stringify(draft.selector) &&
+    activationIncludesStage(activation, preview.requested.stage_id),
+  );
+  const solverBinding = resolveFrozenSpinsSolverBinding(
+    activationReceipt,
+    solverStatus.data?.frozen_spins ?? null,
+    draft.id,
+  );
+  const acknowledgeAppliedDraft = useRegisterInspectorEditSession(
+    "staged",
+    pendingField === "apply" || pendingField === "activate",
+    dirty,
+    true,
+    undefined,
+    applyDraft,
+    resetDraft,
+    {
+      applyBlockReason: sessionScopeKey ? undefined : "Session identity is not ready.",
+      historyMode: "mutation-owned",
+    },
+  );
+  useLayoutEffect(() => {
+    acknowledgeAppliedDraftRef.current = acknowledgeAppliedDraft;
+  }, [acknowledgeAppliedDraft]);
 
   return (
     <div
@@ -363,7 +673,7 @@ export function FrozenSpinsEditor({
       <InspectorGroup title="Preview" collapsible defaultOpen>
         <div className="fm-inspector-toolbar">
           <Button
-            disabled={pendingField === "preview"}
+            disabled={toolbarPending}
             size="sm"
             type="button"
             onClick={() => void createPreview()}
@@ -371,16 +681,31 @@ export function FrozenSpinsEditor({
             {pendingField === "preview" ? "Computing preview…" : "Preview mask"}
           </Button>
           <Button
-            disabled={pendingField === "apply"}
+            disabled={toolbarPending || !dirty}
             size="sm"
             type="button"
-            variant="primary"
             onClick={() => void applyDraft()}
           >
             {pendingField === "apply" ? "Applying…" : "Apply"}
           </Button>
+          {preview ? (
+            <Button
+              disabled={!activationCandidateReady || toolbarPending}
+              size="sm"
+              title={
+                activationCandidateReady
+                  ? "Atomically commit this exact preview candidate"
+                  : "Create a preview that matches the current selector, reference, and stage"
+              }
+              type="button"
+              variant="primary"
+              onClick={() => void activatePreview()}
+            >
+              {pendingField === "activate" ? "Committing…" : "Commit preview"}
+            </Button>
+          ) : null}
           <Button
-            disabled={pendingField === "delete"}
+            disabled={toolbarPending}
             size="sm"
             type="button"
             variant="danger"
@@ -389,26 +714,88 @@ export function FrozenSpinsEditor({
             {pendingField === "delete" ? "Deleting…" : "Delete"}
           </Button>
         </div>
-        {preview ? <FrozenSpinsPreviewDetails preview={preview} /> : null}
+        {preview ? (
+          <FrozenSpinsPreviewDetails
+            activationCandidateReady={activationCandidateReady}
+            preview={preview}
+          />
+        ) : null}
+        {activationReceipt ? (
+          <FrozenSpinsSolverBindingDetails
+            binding={solverBinding}
+            receipt={activationReceipt}
+            runtime={solverStatus.data?.frozen_spins ?? null}
+          />
+        ) : null}
+        {runtimeApplication ? (
+          <FrozenSpinsRuntimeApplicationDetails application={runtimeApplication} />
+        ) : null}
+        {solverBinding.state === "confirmed" || solverBinding.state === "mismatch" ? (
+          <Button
+            disabled={toolbarPending}
+            size="sm"
+            type="button"
+            variant="primary"
+            onClick={() => void showSolverQuantity()}
+          >
+            {pendingField === "quantity"
+              ? "Opening solver quantity…"
+              : "Show solver frozen_spins in 3D"}
+          </Button>
+        ) : null}
       </InspectorGroup>
     </div>
   );
 }
 
+export function frozenSpinsPreviewTopologyFingerprint(
+  fieldMeta: FieldMetaResource | null | undefined,
+): string | null {
+  const publicationFingerprint = fieldMeta?.publication_bundle?.topology_hash?.trim();
+  if (publicationFingerprint) return publicationFingerprint;
+
+  const currentCarriers = (fieldMeta?.resolved_capability?.carriers ?? []).filter(
+    (carrier) =>
+      carrier.payload_state === "current" && carrier.carrier_fingerprint.trim().length > 0,
+  );
+  const fullCarrier = currentCarriers.find(
+    (carrier) => carrier.scope_kind === "full" && carrier.scope_id == null,
+  );
+  if (fullCarrier) return fullCarrier.carrier_fingerprint;
+
+  const fingerprints = [...new Set(
+    currentCarriers.map((carrier) => carrier.carrier_fingerprint),
+  )];
+  return fingerprints.length === 1 ? fingerprints[0] : null;
+}
+
 export function FrozenSpinsPreviewDetails({
+  activationCandidateReady,
   preview,
 }: {
+  activationCandidateReady?: boolean;
   preview: FrozenSpinsPreviewResponse;
 }) {
+  const activationCandidateState = !preview.current
+    ? "stale"
+    : activationCandidateReady === false
+      ? "requires new preview"
+      : "ready (one-time)";
   return (
     <div className="fm-inspector-panel" data-preview-current={preview.current}>
       <FieldRow label="Preview ID" value={preview.preview_id} />
+      <FieldRow label="Authority" value={preview.authority} />
+      <FieldRow label="Solver binding" value={preview.solver_binding} />
       <FieldRow label="Frozen DOFs" value={String(preview.frozen_dof_count)} />
       <FieldRow label="Free DOFs" value={String(preview.free_dof_count)} />
       <FieldRow label="Frozen fraction" value={`${(preview.fraction * 100).toFixed(2)}%`} />
       <FieldRow label="Bounds (m)" value={formatBounds(preview.bounds_m)} />
       <FieldRow label="Mask hash" value={preview.mask_sha256} />
       <FieldRow label="Freshness" value={preview.current ? "current" : "stale"} />
+      <FieldRow
+        label="Activation candidate"
+        value={activationCandidateState}
+      />
       <FieldRow label="Qualification" value={preview.resolved.qualification} />
       {preview.warnings.map((warning) => (
         <FeedbackBanner
@@ -419,6 +806,136 @@ export function FrozenSpinsPreviewDetails({
       ))}
     </div>
   );
+}
+
+export interface FrozenSpinsSolverBindingModel {
+  state: "confirmed" | "mismatch" | "not_committed" | "pending";
+  message: string;
+}
+
+export function resolveFrozenSpinsSolverBinding(
+  receipt: FrozenSpinsPreviewActivationResponse | null,
+  runtime: FrozenSpinsSolverRuntimeStatus | null,
+  constraintId: string,
+): FrozenSpinsSolverBindingModel {
+  if (!receipt) {
+    return {
+      state: "not_committed",
+      message: "No authoring preview has been committed.",
+    };
+  }
+  if (!runtime || !runtime.active_constraint_ids.includes(constraintId)) {
+    return {
+      state: "pending",
+      message:
+        "Waiting for a solver stage that activates this constraint and publishes its certificate.",
+    };
+  }
+  const matches =
+    runtime.constraint_activation_epochs[constraintId] !== undefined &&
+    runtime.topology_fingerprint === receipt.topology_fingerprint &&
+    (runtime.source_state_revision === null ||
+      runtime.source_state_revision === receipt.source_state_revision) &&
+    sameSha256Identity(runtime.mask_sha256, receipt.mask_sha256) &&
+    sameSha256Identity(runtime.reference_sha256, receipt.reference_sha256) &&
+    runtime.active_site_count === receipt.active_site_count &&
+    runtime.frozen_site_count === receipt.frozen_site_count &&
+    runtime.free_site_count === receipt.free_site_count;
+  return matches
+    ? {
+        state: "confirmed",
+        message: "Solver certificate matches the committed preview identity.",
+      }
+    : {
+        state: "mismatch",
+        message:
+          "Solver recomputed a different activation identity. The speculative preview is invalid and the solver-owned quantity must be used.",
+      };
+}
+
+function sameSha256Identity(left: string, right: string): boolean {
+  return normalizeSha256Identity(left) === normalizeSha256Identity(right);
+}
+
+function normalizeSha256Identity(value: string): string {
+  return value.trim().toLowerCase().replace(/^sha256:/, "");
+}
+
+function FrozenSpinsSolverBindingDetails({
+  binding,
+  receipt,
+  runtime,
+}: {
+  binding: FrozenSpinsSolverBindingModel;
+  receipt: FrozenSpinsPreviewActivationResponse;
+  runtime: FrozenSpinsSolverRuntimeStatus | null;
+}) {
+  return (
+    <div className="fm-inspector-panel" data-solver-binding={binding.state}>
+      <FieldRow label="Activation scope" value={receipt.activation_scope} />
+      <FieldRow label="Runtime binding" value={binding.state} />
+      <FieldRow
+        label="Activation epoch"
+        value={
+          runtime?.constraint_activation_epochs[receipt.definition.id]?.toString() ??
+          "pending"
+        }
+      />
+      <FieldRow
+        label="Resolved set revision"
+        value={runtime?.resolved_constraint_set_revision?.toString() ?? "pending"}
+      />
+      <FeedbackBanner
+        kind={binding.state === "confirmed" ? "success" : "warning"}
+        message={binding.message}
+      />
+    </div>
+  );
+}
+
+function FrozenSpinsRuntimeApplicationDetails({
+  application,
+}: {
+  application: FrozenSpinsRuntimeApplication;
+}) {
+  return (
+    <div
+      className="fm-inspector-panel"
+      data-runtime-application={application.state}
+    >
+      <FieldRow label="Runtime application" value={application.state} />
+      <FieldRow
+        label="Pending scene revision"
+        value={application.pending_revision.toString()}
+      />
+      <FieldRow label="Apply boundary" value={application.apply_boundary} />
+      {application.application_command_id ? (
+        <FieldRow
+          label="Application command ID"
+          value={application.application_command_id}
+        />
+      ) : null}
+      <FieldRow
+        label="Current solver"
+        value={
+          application.current_runtime_unchanged ? "unchanged" : "updated"
+        }
+      />
+    </div>
+  );
+}
+
+function frozenSpinsRuntimeApplicationMessage(
+  application: FrozenSpinsRuntimeApplication,
+): string {
+  const boundary =
+    application.apply_boundary === "accepted_step"
+      ? "the next accepted solver step"
+      : "the next runtime plan";
+  const command = application.application_command_id
+    ? ` Application command: ${application.application_command_id}.`
+    : "";
+  return `Frozen Spins definition committed as revision ${application.pending_revision}. The current solver is unchanged until ${boundary}.${command}`;
 }
 
 function normalizeDefinition(definition: FrozenSpinsDefinition): FrozenSpinsDefinition {
@@ -442,8 +959,22 @@ function invalidateDefinitionResources(
   kernel.resources.invalidate(frozenSpinsDefinitionResourceKey(constraintId), revision);
 }
 
+function scopedFrozenSpinsRequestOptions(
+  sessionScopeKey: string | null | undefined,
+): { sessionScopeKey: string } | undefined {
+  return sessionScopeKey ? { sessionScopeKey } : undefined;
+}
+
 function splitIds(value: string): string[] {
   return value.split(",").map((entry) => entry.trim()).filter(Boolean);
+}
+
+function activationIncludesStage(
+  activation: FrozenSpinsActivation,
+  stageId: string | null | undefined,
+): boolean {
+  if (!stageId || activation.kind === "all_stages") return true;
+  return activation.stage_ids.includes(stageId);
 }
 
 function formatBounds(bounds: number[][] | null | undefined): string {
@@ -470,6 +1001,7 @@ function TextInput({
       <input
         aria-label={label}
         className="fm-inspector-input"
+        type="text"
         value={value}
         onChange={(event) => onChange(event.target.value)}
       />

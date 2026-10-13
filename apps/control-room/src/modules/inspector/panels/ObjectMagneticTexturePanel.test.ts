@@ -59,4 +59,38 @@ describe("ObjectMagneticTexturePanel", () => {
     expect(objectPanel).not.toContain("JSON.stringify(draft)");
     expect(regionPanel).not.toContain("JSON.stringify(draft)");
   });
+
+  it("saves the asset and assignment through one atomic transaction", () => {
+    const source = readFileSync(
+      new URL("./ObjectMagneticTexturePanel.tsx", import.meta.url),
+      "utf8",
+    );
+
+    expect(source).toContain("buildMagnetizationTransactionRequest(");
+    expect(source).toContain("api.model.commitTransaction(");
+    expect(source).toContain("initial_magnetization.uniform");
+    expect(source).toContain("initial_magnetization.vortex");
+    expect(source).not.toContain("patchMagnetizationAsset(");
+    expect(source).not.toContain("patchRegion(");
+    expect(source).not.toContain("patchObject(model.objectId");
+  });
+
+  it("records immediate texture writes through the shared authoring history boundary", () => {
+    const objectPanel = readFileSync(
+      new URL("./ObjectMagneticTexturePanel.tsx", import.meta.url),
+      "utf8",
+    );
+    const regionPanel = readFileSync(
+      new URL("./region/ObjectRegionTexturePanel.tsx", import.meta.url),
+      "utf8",
+    );
+
+    for (const source of [objectPanel, regionPanel]) {
+      expect(source).toContain("runAuthoringMutationWithHistory(");
+      expect(source).toContain("authoringHistory");
+    }
+    expect(objectPanel).toContain("base_revision: baseRevision ?? request.base_revision");
+    expect(regionPanel).toContain("const commitRevision = baseRevision ?? request.base_revision;");
+    expect(regionPanel).toContain("base_revision: commitRevision");
+  });
 });

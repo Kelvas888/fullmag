@@ -4,9 +4,46 @@ pub(crate) mod gpu;
 pub(crate) mod multilayer;
 pub(crate) mod schedules;
 
+#[cfg(feature = "cuda")]
+use crate::types::FdmFftExecutionProvenance;
 use crate::types::RunError;
 
-#[cfg(any(feature = "cuda", test))]
+#[cfg(feature = "cuda")]
+pub(crate) fn resolve_cuda_fft_execution_for_demag(
+    demag_enabled: bool,
+    fft: Option<&fullmag_ir::FdmFftPlanIR>,
+) -> Result<Option<FdmFftExecutionProvenance>, RunError> {
+    if !demag_enabled && fft.is_some() {
+        return Err(RunError {
+            message: "FDM plan carries an FFT request while demag is disabled".to_string(),
+        });
+    }
+    if !demag_enabled {
+        return Ok(None);
+    }
+    let requested = fft
+        .map(|fft| fft.requested_backend.as_str())
+        .unwrap_or("auto");
+    if !matches!(requested, "auto" | "cufft") {
+        return Err(RunError {
+            message: format!(
+                "fdm.demag.fft_backend='{requested}' is not available for CUDA FDM demag in this build; supported CUDA FDM FFT backends: auto, cufft"
+            ),
+        });
+    }
+    Ok(Some(FdmFftExecutionProvenance {
+        requested_backend: requested.to_string(),
+        resolved_backend: "cufft".to_string(),
+        executed_backend: "cufft".to_string(),
+        backend_version: None,
+        plan_mode: "cufft_explicit_workspace".to_string(),
+        thread_count: None,
+        workspace_layout: "full_complex".to_string(),
+        runtime_telemetry: None,
+    }))
+}
+
+#[cfg(test)]
 pub(crate) fn next_fdm_attempt_dt(
     adaptive: bool,
     current_dt: f64,
@@ -82,6 +119,11 @@ fn validate_single_grid_budget_with_policy(
     plan: &fullmag_ir::FdmPlanIR,
     allow_legacy_fixture: bool,
 ) -> Result<u64, RunError> {
+    plan.precision_policy
+        .validate_for(plan.precision)
+        .map_err(|message| RunError {
+            message: format!("FDM precision policy rejected before allocation: {message}"),
+        })?;
     if plan.origin_m.iter().any(|component| !component.is_finite()) {
         return Err(RunError {
             message: format!(
@@ -522,7 +564,8 @@ pub(crate) fn validate_multilayer_grid_budget(
         return Err(RunError {
             message: format!(
                 "FDM multilayer kernel estimate mismatch: model={} summary={} recomputed={computed_kernel_bytes}",
-                admission_model.as_str(), plan.planner_summary.estimated_kernel_bytes
+                admission_model.as_str(),
+                plan.planner_summary.estimated_kernel_bytes
             ),
         });
     }
@@ -603,13 +646,17 @@ mod tests {
                 layer("free", 0.0, [1.0, 0.0, 0.0]),
                 layer("ref", 2.0, [0.0, 1.0, 0.0]),
             ],
+            frozen_spins: None,
             enable_exchange: true,
             enable_demag: true,
+            fft: None,
             external_field: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             gyromagnetic_ratio: 2.211e5,
             precision: ExecutionPrecision::Double,
+            precision_policy: fullmag_ir::FdmPrecisionPolicyIR::default(),
             exchange_bc: ExchangeBoundaryCondition::Neumann,
             periodicity: None,
             resolved_periodic_images: None,

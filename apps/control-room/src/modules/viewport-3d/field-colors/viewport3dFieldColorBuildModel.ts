@@ -1,5 +1,4 @@
-import type { DecodedFieldVector } from "@/kernel/api/codecs";
-
+import { srgbToLinearChannel } from "../viewport3dColorSpace";
 import {
   buildSurfaceFaceScalarColors,
   buildThicknessAverageZScalarColors,
@@ -8,6 +7,7 @@ import {
   type ChunkedFieldTransformOptions,
   type ScalarColorBuffer,
   type ScalarRange,
+  type Viewport3DFieldVector,
 } from "../viewport3dFieldMapping";
 import {
   normalizeViewport3DVectorColorMode,
@@ -15,6 +15,9 @@ import {
   resolveViewport3DVectorColorScalar,
   type Viewport3DVectorColorMode,
 } from "../viewport3dVectorColoring";
+import { isDivergingScalarPalette } from "../../../shared/visualization/scalarColorPalette";
+
+const FALLBACK_GRAY_RGB = [0.5, 0.5, 0.5] as const;
 
 export type Viewport3DFieldColorBuildTarget =
   | {
@@ -46,13 +49,13 @@ export type Viewport3DFieldColorBuildTarget =
 
 export interface Viewport3DFieldColorBuildModelInput
   extends ChunkedFieldTransformOptions {
-  fieldVector: DecodedFieldVector;
+  fieldVector: Viewport3DFieldVector;
   target: Viewport3DFieldColorBuildTarget;
 }
 
 export interface Viewport3DFieldColorBuildByteEstimateInput {
   colorMode?: string;
-  fieldVector: DecodedFieldVector;
+  fieldVector: Viewport3DFieldVector;
   shaderOnly?: boolean;
   target: Viewport3DFieldColorBuildTarget;
 }
@@ -102,7 +105,7 @@ export function estimateViewport3DFieldColorBuildInputBytes({
   fieldVector,
   target,
 }: {
-  fieldVector: DecodedFieldVector;
+  fieldVector: Viewport3DFieldVector;
   target: Viewport3DFieldColorBuildTarget;
 }): number {
   switch (target.kind) {
@@ -152,7 +155,7 @@ export function estimateViewport3DFieldColorBuildOutputBytes({
 }
 
 async function buildSampledFieldColorBuffer(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   target: Extract<Viewport3DFieldColorBuildTarget, { kind: "sampled" }>,
   options: ChunkedFieldTransformOptions,
 ): Promise<ScalarColorBuffer | null> {
@@ -217,7 +220,7 @@ async function buildSampledFieldColorBuffer(
 }
 
 async function buildMappedFieldColorBuffer(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   target: Extract<Viewport3DFieldColorBuildTarget, { kind: "mapped-vertices" }>,
   options: ChunkedFieldTransformOptions,
 ): Promise<ScalarColorBuffer | null> {
@@ -278,14 +281,38 @@ async function buildMappedFieldColorBuffer(
   };
 }
 
+/**
+ * Auto-symmetrizes a scalar range around zero for signed component color
+ * modes (x/y/z) when a diverging palette (e.g. "coolwarm") is selected.
+ * Mirrors resolveDivergingSymmetricRange in viewport3dFieldMapping.ts (S-11):
+ * diverging palettes rely on their midpoint mapping to zero, so an
+ * asymmetric auto-computed range would shift that midpoint away from zero.
+ * A caller-provided explicit range is left untouched (see the
+ * providedRange short-circuit above), since that's an intentional override.
+ */
+function resolveDivergingSymmetricRange(
+  range: ScalarRange,
+  colorMode: Viewport3DVectorColorMode,
+  colorPalette: string,
+): ScalarRange {
+  const isSignedComponent =
+    colorMode === "x" || colorMode === "y" || colorMode === "z";
+  if (!isSignedComponent || !isDivergingScalarPalette(colorPalette)) {
+    return range;
+  }
+  const extent = Math.max(Math.abs(range.min), Math.abs(range.max));
+  return { max: extent, min: -extent };
+}
+
 async function resolveScalarRangeForField(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   colorMode: Viewport3DVectorColorMode,
   options: ChunkedFieldTransformOptions,
 ): Promise<ScalarRange> {
   const providedRange = resolveProvidedScalarRange(options.scalarRange);
   if (providedRange) return providedRange;
 
+  const colorPalette = options.colorPalette ?? "viridis";
   const chunkSize = resolveChunkSize(options);
   const yieldToMain = options.yieldToMain ?? (() => Promise.resolve());
   let min = Infinity;
@@ -296,6 +323,7 @@ async function resolveScalarRangeForField(
     const end = Math.min(start + chunkSize, fieldVector.pointCount);
     for (let index = start; index < end; index += 1) {
       const value = scalarAt(fieldVector, index, colorMode);
+      if (!Number.isFinite(value)) continue;
       if (value < min) min = value;
       if (value > max) max = value;
     }
@@ -307,7 +335,7 @@ async function resolveScalarRangeForField(
   if (!Number.isFinite(min) || !Number.isFinite(max)) {
     return { max: 0, min: 0 };
   }
-  return { max, min };
+  return resolveDivergingSymmetricRange({ max, min }, colorMode, colorPalette);
 }
 
 function resolveProvidedScalarRange(
@@ -327,7 +355,7 @@ function resolveProvidedScalarRange(
 }
 
 function resolveTargetVertexCount(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   target: Viewport3DFieldColorBuildTarget,
 ): number {
   switch (target.kind) {
@@ -345,7 +373,7 @@ function resolveTargetVertexCount(
 
 function resolveShaderOnly(
   colorMode: Viewport3DVectorColorMode,
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   options: ChunkedFieldTransformOptions,
 ): { any: boolean; vector: boolean } {
   const scalar = shaderScalarModeSupports(colorMode);
@@ -362,7 +390,7 @@ function resolveChunkSize(options: ChunkedFieldTransformOptions): number {
 }
 
 function writeFieldColor(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   pointIndex: number,
   targetIndex: number,
   colors: Float32Array,
@@ -376,32 +404,50 @@ function writeFieldColor(
     writeVectorValue(fieldVector, pointIndex, vectorValues, targetIndex);
   }
   if (scalarValues) {
-    scalarValues[targetIndex] = scalarAt(fieldVector, pointIndex, colorMode);
+    scalarValues[targetIndex] = normalizeScalarValueForShaderAttribute(
+      scalarAt(fieldVector, pointIndex, colorMode),
+      range,
+    );
   }
   if (colors.length > 0) {
-    const [red, green, blue] = colorAt(
-      fieldVector,
-      pointIndex,
-      colorMode,
-      range,
-      colorPalette,
+    writeColorBufferRgb(
+      colors,
+      targetIndex,
+      colorAt(fieldVector, pointIndex, colorMode, range, colorPalette),
+      colorMode === "orientation" ? "srgb" : "linear",
     );
-    const target = targetIndex * 3;
-    colors[target] = red;
-    colors[target + 1] = green;
-    colors[target + 2] = blue;
   }
 }
 
 function writeFallbackGray(colors: Float32Array, targetIndex: number): void {
+  writeColorBufferRgb(colors, targetIndex, FALLBACK_GRAY_RGB, "srgb");
+}
+
+/**
+ * Writes a colour into a ScalarColorBuffer. Scalar palette helpers already
+ * return Linear-sRGB values; orientation colours and neutral fallbacks are
+ * sRGB and need exactly one EOTF conversion before upload.
+ */
+function writeColorBufferRgb(
+  colors: Float32Array,
+  targetIndex: number,
+  rgb: readonly [number, number, number],
+  inputColorSpace: "linear" | "srgb",
+): void {
   const target = targetIndex * 3;
-  colors[target] = 0.5;
-  colors[target + 1] = 0.5;
-  colors[target + 2] = 0.5;
+  if (inputColorSpace === "srgb") {
+    colors[target] = srgbToLinearChannel(rgb[0]);
+    colors[target + 1] = srgbToLinearChannel(rgb[1]);
+    colors[target + 2] = srgbToLinearChannel(rgb[2]);
+    return;
+  }
+  colors[target] = rgb[0];
+  colors[target + 1] = rgb[1];
+  colors[target + 2] = rgb[2];
 }
 
 function writeVectorValue(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   pointIndex: number,
   values: Float32Array,
   targetIndex: number,
@@ -414,7 +460,7 @@ function writeVectorValue(
 }
 
 function colorAt(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   pointIndex: number,
   colorMode: Viewport3DVectorColorMode,
   range: ScalarRange,
@@ -454,7 +500,7 @@ function colorAt(
 }
 
 function scalarAt(
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
   pointIndex: number,
   colorMode: Viewport3DVectorColorMode,
 ): number {
@@ -469,8 +515,26 @@ function scalarAt(
 }
 
 function normalizeScalarValue(value: number, range: ScalarRange): number {
-  const span = Math.max(range.max - range.min, 1e-12);
+  if (
+    !range ||
+    !Number.isFinite(value) ||
+    !Number.isFinite(range.min) ||
+    !Number.isFinite(range.max)
+  ) {
+    return 0.5;
+  }
+  const scale = Math.max(Math.abs(range.max), Math.abs(range.min));
+  const span = range.max - range.min;
+  if (span <= 1e-6 * Math.max(scale, 1)) return 0.5;
   return Math.min(Math.max((value - range.min) / span, 0), 1);
+}
+
+function normalizeScalarValueForShaderAttribute(
+  value: number,
+  range: ScalarRange,
+): number {
+  if (!Number.isFinite(value) || Math.abs(value) > 3.0e38) return value;
+  return normalizeScalarValue(value, range);
 }
 
 function shaderScalarModeSupports(mode: Viewport3DVectorColorMode): boolean {
@@ -479,7 +543,7 @@ function shaderScalarModeSupports(mode: Viewport3DVectorColorMode): boolean {
 
 function shaderVectorModeSupports(
   mode: Viewport3DVectorColorMode,
-  fieldVector: DecodedFieldVector,
+  fieldVector: Viewport3DFieldVector,
 ): boolean {
   return mode === "orientation" && fieldVector.nComp >= 3;
 }
@@ -489,3 +553,5 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
     throw new DOMException("Field transform aborted", "AbortError");
   }
 }
+
+export const normalizeScalarValueForShaderAttributeForTests = normalizeScalarValueForShaderAttribute;

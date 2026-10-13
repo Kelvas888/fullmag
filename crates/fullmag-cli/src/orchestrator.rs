@@ -1,14 +1,15 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, ValueEnum};
 use fullmag_ir::{
-    BackendPlanIR, BackendTarget, DiscretizationHintsIR, DynamicsIR, ExecutionPlanIR, FemHintsIR,
-    GeometryEntryIR, MagnetIR, MaterialIR, ObjectRegionIR, ProblemIR, RegionIR,
-    RelaxationAlgorithmIR, StudyIR,
+    AutosaveFormatIR, BackendPlanIR, BackendTarget, DiscretizationHintsIR, DynamicsIR,
+    ExecutionPlanIR, FdmHintsIR, FemHintsIR, GeometryEntryIR, MagnetIR, MaterialIR, ObjectRegionIR,
+    OutputDataFormatIR, OutputStorageIR, ProblemIR, RegionIR, RelaxationAlgorithmIR, StudyIR,
 };
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +28,10 @@ use crate::simulation_preparation::{
 use crate::step_utils::*;
 use crate::types::*;
 
+mod manual_remesh;
+use manual_remesh::execute_manual_interactive_remesh;
+mod antenna_external_lead_inspection;
+
 // ── helpers local to the orchestrator ────────────────────────────────────────
 
 const FEM_FREQUENCY_RESPONSE_PROGRESS_KEY: &str = "fem_frequency_response_progress";
@@ -40,6 +45,210 @@ const DEFERRED_DOMAIN_COMPLETION_DETAIL: &str =
     "Domain completed during deferred materialization; timing unavailable";
 const DEFERRED_MESH_COMPLETION_DETAIL: &str =
     "Mesh completed during deferred materialization; timing unavailable";
+
+struct ScriptOutputStorageLease {
+    lease: Option<fullmag_runner::project_storage::ProjectStorageLease>,
+}
+
+impl ScriptOutputStorageLease {
+    fn new(lease: fullmag_runner::project_storage::ProjectStorageLease) -> Self {
+        Self { lease: Some(lease) }
+    }
+
+    fn resolved(&self) -> &fullmag_runner::project_storage::ResolvedOutputStorage {
+        self.lease
+            .as_ref()
+            .expect("script storage lease is active")
+            .resolved()
+    }
+
+    fn finish(&mut self, success: bool) -> Result<()> {
+        let Some(mut lease) = self.lease.take() else {
+            bail!("script storage lease is already finalized");
+        };
+        lease
+            .finish(success)
+            .map_err(|error| anyhow!("failed to finalize project output storage: {error}"))
+    }
+}
+
+fn collect_authored_output_storage(
+    config: &ScriptExecutionConfig,
+) -> Result<Option<OutputStorageIR>> {
+    let mut candidates = Vec::new();
+    for problem in std::iter::once(&config.ir).chain(config.stages.iter().map(|stage| &stage.ir)) {
+        if let Some(value) = problem.problem_meta.runtime_metadata.get("output_storage") {
+            candidates.push(
+                serde_json::from_value::<OutputStorageIR>(value.clone())
+                    .context("invalid output_storage metadata")?,
+            );
+        }
+    }
+    let Some(first) = candidates.first().cloned() else {
+        return Ok(None);
+    };
+    if candidates.iter().any(|candidate| candidate != &first) {
+        bail!("script stages declare conflicting output_storage policies");
+    }
+    Ok(Some(first))
+}
+
+fn explicit_stage_output_format(problem: &ProblemIR) -> Option<OutputDataFormatIR> {
+    match problem.study.sampling().stage_autosave.as_ref()?.format {
+        AutosaveFormatIR::Zarr => Some(OutputDataFormatIR::Zarr),
+        AutosaveFormatIR::Hdf5 => Some(OutputDataFormatIR::Hdf5),
+        AutosaveFormatIR::Txt => None,
+    }
+}
+
+fn prepare_script_output_storage(
+    config: &mut ScriptExecutionConfig,
+    args: &ScriptCli,
+    script_path: &Path,
+    run_id: &str,
+) -> Result<(ScriptOutputStorageLease, OutputStorageIR, serde_json::Value)> {
+    let authored = collect_authored_output_storage(config)?;
+    let mut settings = authored.clone().unwrap_or_default();
+    if authored.is_none() && args.data_format.is_none() {
+        let mut stage_formats = std::iter::once(&config.ir)
+            .chain(config.stages.iter().map(|stage| &stage.ir))
+            .filter_map(explicit_stage_output_format);
+        if let Some(format) = stage_formats.next() {
+            if stage_formats.any(|other| other != format) {
+                bail!("script stages declare conflicting primary autosave formats");
+            }
+            settings.data_format = format;
+        }
+    }
+
+    if let Some(output_dir) = args.output_dir.as_ref() {
+        let path = if output_dir.is_absolute() {
+            output_dir.clone()
+        } else {
+            std::env::current_dir()?.join(output_dir)
+        };
+        settings.output_dir = Some(path.to_string_lossy().into_owned());
+    }
+    if let Some(temp_dir) = args.temp_dir.as_ref() {
+        let path = if temp_dir.is_absolute() {
+            temp_dir.clone()
+        } else {
+            std::env::current_dir()?.join(temp_dir)
+        };
+        settings.temp_dir = Some(path.to_string_lossy().into_owned());
+    }
+    if let Some(data_format) = args.data_format {
+        settings.data_format = data_format.into();
+    }
+    if let Some(cleanup) = args.temp_cleanup {
+        settings.cleanup = cleanup.into();
+    }
+    if let Some(existing_output) = args.existing_output {
+        settings.existing_output = existing_output.into();
+    }
+    settings
+        .validate()
+        .map_err(|errors| anyhow!(errors.join("; ")))?;
+
+    let script_dir = script_path.parent().unwrap_or_else(|| Path::new("."));
+    let extension = match settings.data_format {
+        OutputDataFormatIR::Zarr => "zarr",
+        OutputDataFormatIR::Hdf5 => "results",
+    };
+    let default_output_dir = script_path.with_extension(extension);
+    let lease = fullmag_runner::project_storage::ProjectStorageLease::prepare(
+        &settings,
+        &default_output_dir,
+        script_dir,
+        run_id,
+    )
+    .map_err(|error| anyhow!("failed to prepare project output storage: {error}"))?;
+    let storage_lease = ScriptOutputStorageLease::new(lease);
+    let resolved = serde_json::to_value(storage_lease.resolved())?;
+    let settings_value = serde_json::to_value(&settings)?;
+    let source_dir = script_dir.canonicalize()?.to_string_lossy().into_owned();
+    let source_stem = script_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("fullmag_script")
+        .to_string();
+    let attach_storage_metadata = |problem: &mut ProblemIR| {
+        let metadata = &mut problem.problem_meta.runtime_metadata;
+        metadata.insert("output_storage".to_string(), settings_value.clone());
+        metadata.insert("resolved_output_storage".to_string(), resolved.clone());
+        metadata.insert(
+            "output_storage_source_dir".to_string(),
+            serde_json::Value::String(source_dir.clone()),
+        );
+        metadata.insert(
+            "output_storage_source_stem".to_string(),
+            serde_json::Value::String(source_stem.clone()),
+        );
+    };
+    attach_storage_metadata(&mut config.ir);
+    for stage in &mut config.stages {
+        attach_storage_metadata(&mut stage.ir);
+    }
+    Ok((storage_lease, settings, resolved))
+}
+
+fn prepare_grid_operation_storage(
+    workspace_dir: &Path,
+    command_id: &str,
+    script_path: &Path,
+) -> Result<(ScriptOutputStorageLease, OutputStorageIR, serde_json::Value)> {
+    let operation_id = format!("grid-{}", fullmag_session::hex_sha256(command_id.as_bytes()));
+    let operation_root = workspace_dir.join("grid-preparations").join(&operation_id);
+    let settings = OutputStorageIR {
+        output_dir: Some(operation_root.join("workspace").to_string_lossy().into_owned()),
+        temp_dir: Some(operation_root.join("temporary").to_string_lossy().into_owned()),
+        data_format: OutputDataFormatIR::Zarr,
+        cleanup: fullmag_ir::TempCleanupIR::Never,
+        existing_output: fullmag_ir::ExistingOutputIR::Error,
+    };
+    let source_dir = script_path.parent().context("grid source has no parent")?;
+    let lease = fullmag_runner::project_storage::ProjectStorageLease::prepare(
+        &settings, &operation_root.join("workspace"), source_dir, &operation_id,
+    ).map_err(|error| anyhow!("failed to prepare private grid operation storage: {error}"))?;
+    let lease = ScriptOutputStorageLease::new(lease);
+    let resolved = serde_json::to_value(lease.resolved())?;
+    Ok((lease, settings, resolved))
+}
+
+fn attached_session_id_or(generated: String) -> String {
+    std::env::var("FULLMAG_ATTACHED_SESSION_ID")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(generated)
+}
+
+fn attached_session_started_at_or(generated: u128) -> Result<u128> {
+    if std::env::var("FULLMAG_ATTACHED_SESSION_ID")
+        .ok().is_none_or(|value| value.trim().is_empty())
+    {
+        return Ok(generated);
+    }
+    let raw = std::env::var("FULLMAG_ATTACHED_SESSION_STARTED_AT_UNIX_MS")
+        .context("attached session requires its authoritative start timestamp")?;
+    let timestamp = raw.parse::<u128>().context("invalid attached session start timestamp")?;
+    anyhow::ensure!(timestamp > 0 && timestamp.to_string() == raw, "invalid attached session start timestamp");
+    Ok(timestamp)
+}
+
+fn control_room_bootstrap_disabled() -> bool {
+    std::env::var("FULLMAG_SKIP_CONTROL_ROOM")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
+}
+
+fn attached_wait_for_solve_enabled() -> bool {
+    // `--wait-for-solve` is the flag form of the same gate.
+    crate::script_launch::wait_for_solve_flag()
+        || std::env::var("FULLMAG_ATTACHED_WAIT_FOR_SOLVE")
+            .ok()
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes"))
+}
 
 fn frozen_spins_checkpoint_from_stage_artifacts(
     stage_artifact_dir: &Path,
@@ -55,24 +264,34 @@ fn frozen_spins_checkpoint_from_stage_artifacts(
     Ok(Some(value))
 }
 
-fn preparation_unix_time_millis() -> Result<u64> {
-    u64::try_from(unix_time_millis()?).context("preparation timestamp exceeds u64")
+fn publish_frozen_spins_runtime_status_for_execution_plan(
+    live_workspace: &LocalLiveWorkspace,
+    execution_plan: &ExecutionPlanIR,
+) -> Result<()> {
+    let status =
+        fullmag_runner::frozen_spins_runtime_status_for_backend_plan(&execution_plan.backend_plan)
+            .map_err(|error| anyhow!(error.to_string()))?;
+    live_workspace.update(|state| {
+        let metadata = state.metadata.get_or_insert_with(|| serde_json::json!({}));
+        let Some(metadata) = metadata.as_object_mut() else {
+            return;
+        };
+        match status {
+            Some(status) => {
+                if let Ok(value) = serde_json::to_value(status) {
+                    metadata.insert("frozen_spins_runtime_status".to_string(), value);
+                }
+            }
+            None => {
+                metadata.remove("frozen_spins_runtime_status");
+            }
+        }
+    });
+    Ok(())
 }
 
-fn continuation_source_for_backend_plan(plan: &BackendPlanIR) -> ContinuationSource {
-    match plan {
-        BackendPlanIR::Fem(fem_plan) => ContinuationSource::Fem(fem_plan.mesh.clone()),
-        BackendPlanIR::Fdm(fdm_plan) => ContinuationSource::FdmGrid(FdmContinuationGrid {
-            cells: fdm_plan.grid.cells,
-            origin_m: fdm_plan.origin_m,
-            cell_size_m: fdm_plan.cell_size,
-            active_mask: fdm_plan.active_mask.clone(),
-        }),
-        BackendPlanIR::FdmMultilayer(_) => ContinuationSource::Fdm,
-        BackendPlanIR::FemEigen(_) | BackendPlanIR::FemFrequencyResponse(_) => {
-            ContinuationSource::Fdm
-        }
-    }
+fn preparation_unix_time_millis() -> Result<u64> {
+    u64::try_from(unix_time_millis()?).context("preparation timestamp exceeds u64")
 }
 
 fn new_simulation_preparation(
@@ -191,10 +410,12 @@ fn fail_owned_preparation_stage_with_diagnostics(
     stage_id: PreparationStageId,
     error_code: &str,
     safe_summary: &str,
+    detail: Option<String>,
 ) -> Result<()> {
     let timestamp_unix_ms = preparation_unix_time_millis()?;
     transition_preparation(workspace, |preparation| {
         preparation.fail_stage(stage_id, timestamp_unix_ms, error_code, safe_summary)?;
+        preparation.set_failure_detail(detail);
         let correlation_id = format!(
             "preparation-{}-{}-{}",
             stage_id.as_str(),
@@ -269,7 +490,7 @@ fn sanitized_preparation_error_message(message: &str) -> Option<String> {
     is_bounded.then_some(sanitized)
 }
 
-fn fail_active_preparation_stage_with_detail(
+fn fail_active_preparation_stage_with_diagnostics(
     workspace: &LocalLiveWorkspace,
     error_code: &str,
     safe_summary: &str,
@@ -281,7 +502,7 @@ fn fail_active_preparation_stage_with_detail(
         .as_ref()
         .and_then(|preparation| preparation.active_stage_id);
     if let Some(active_stage_id) = active_stage_id {
-        fail_owned_preparation_stage_with_detail(
+        fail_owned_preparation_stage_with_diagnostics(
             workspace,
             active_stage_id,
             error_code,
@@ -301,7 +522,7 @@ fn run_active_preparation_operation<T>(
     match operation() {
         Ok(value) => Ok(value),
         Err(error) => {
-            fail_active_preparation_stage_with_detail(
+            fail_active_preparation_stage_with_diagnostics(
                 workspace,
                 error_code,
                 safe_failure_summary,
@@ -321,7 +542,7 @@ fn own_preparation_boundary_failure<T>(
     match result {
         Ok(value) => Ok(value),
         Err(error) => {
-            if let Err(record_error) = fail_owned_preparation_stage_with_detail(
+            if let Err(record_error) = fail_owned_preparation_stage_with_diagnostics(
                 workspace,
                 PreparationStageId::ScriptMaterialization,
                 error_code,
@@ -466,7 +687,11 @@ fn run_owned_preparation_stage<T>(
             if expose_safe_operation_error {
                 let summary = safe_validation_failure_summary(&error, safe_failure_summary);
                 fail_owned_preparation_stage_with_diagnostics(
-                    workspace, stage_id, error_code, &summary,
+                    workspace,
+                    stage_id,
+                    error_code,
+                    &summary,
+                    safe_preparation_error_detail(&error),
                 )?;
             } else {
                 fail_owned_preparation_stage(
@@ -501,11 +726,12 @@ fn run_solver_initialization_safety_check<T>(
     match operation() {
         Ok(value) => Ok(value),
         Err(error) => {
-            fail_owned_preparation_stage(
+            fail_owned_preparation_stage_with_diagnostics(
                 workspace,
                 PreparationStageId::SolverInitialization,
                 error_code,
                 safe_failure_summary,
+                safe_preparation_error_detail(&error),
             )?;
             Err(error)
         }
@@ -657,7 +883,10 @@ fn deferred_mesh_failure_stage(
         .get("last_build_error")
         .and_then(serde_json::Value::as_str)
         .filter(|error| !error.trim().is_empty())?;
-    let payload = workspace.get("last_build_summary")?;
+    let payload = workspace
+        .get("last_build_attempt")
+        .filter(|value| value.is_object())
+        .or_else(|| workspace.get("last_build_summary"))?;
     match payload.get("phase").and_then(serde_json::Value::as_str) {
         Some("preparing_domain" | "meshing" | "postprocessing") => {}
         _ => return None,
@@ -715,6 +944,58 @@ fn project_deferred_mesh_failure(
     Ok(())
 }
 
+fn project_authoritative_authored_preflight_failure(
+    workspace: &LocalLiveWorkspace,
+    error: &anyhow::Error,
+) -> Result<bool> {
+    let Some(detail) = safe_preparation_error_detail(error) else {
+        return Ok(false);
+    };
+    if !detail.contains("fem_mixed_p1_scope_rejected: phase=authored_preflight;") {
+        return Ok(false);
+    }
+
+    let timestamp_unix_ms = preparation_unix_time_millis()?;
+    transition_preparation(workspace, |preparation| {
+        project_completed_preparation_stage(
+            preparation,
+            PreparationStageId::ScriptMaterialization,
+            timestamp_unix_ms,
+            "Python authored simulation materialized for capability preflight",
+        )?;
+        skip_preparation_stage(
+            preparation,
+            PreparationStageId::Validation,
+            timestamp_unix_ms,
+            "Full canonical validation was not reached after authored capability rejection",
+        )?;
+        preparation.project_failed_stage(
+            PreparationStageId::Planning,
+            "fem_mixed_p1_scope_rejected",
+            "Simulation planning rejected unsupported mixed-P1 capability",
+        )?;
+        preparation.set_failure_detail(Some(detail.clone()));
+        let correlation_id = format!(
+            "preparation-{}-{}-{}",
+            PreparationStageId::Planning.as_str(),
+            preparation.preparation_id,
+            timestamp_unix_ms
+        );
+        if let Some(failure) = preparation.failure.as_mut() {
+            failure.diagnostics_correlation_id = Some(correlation_id);
+        }
+        push_preparation_log_once(
+            preparation,
+            timestamp_unix_ms,
+            PreparationLogLevel::Error,
+            PreparationStageId::Planning,
+            "Simulation planning rejected unsupported mixed-P1 capability",
+        );
+        Ok(())
+    })?;
+    Ok(true)
+}
+
 fn project_script_export_failure(
     workspace: &LocalLiveWorkspace,
     early_preflight_completed: bool,
@@ -753,7 +1034,7 @@ fn project_script_export_failure(
             project_deferred_mesh_failure(preparation, failure_stage_id, timestamp_unix_ms)
         })?;
     } else {
-        fail_active_preparation_stage_with_detail(
+        fail_active_preparation_stage_with_diagnostics(
             workspace,
             "materialization_failed",
             "Simulation materialization failed",
@@ -962,8 +1243,46 @@ fn current_live_metadata(
     plan: &ExecutionPlanIR,
     status: &str,
 ) -> serde_json::Value {
+    if antenna_external_lead_inspection::is_carrier(plan) {
+        return serde_json::json!({
+            "session_protocol_version": "2026-04-04",
+            "capability_profile_version": "2026-04-04",
+            "problem_name": &problem.problem_meta.name,
+            "ir_version": &problem.ir_version,
+            "source_hash": &problem.problem_meta.source_hash,
+            "execution_plan": {"backend_plan": {"kind": "antenna_external_lead_inspection"}},
+            "inspection_carrier_only": true,
+            "runtime_engine": {
+                "backend_family": "fem",
+                "engine_id": "antenna_external_lead_inspection",
+                "engine_label": "Inspection-only V/RT0/H",
+                "accelerator": "cpu",
+            },
+            "requested_execution": {
+                "backend": backend_target_name(problem.backend_policy.requested_backend),
+                "device": requested_device_from_problem(problem),
+                "precision": execution_precision_name(problem.backend_policy.execution_precision),
+                "mode": execution_mode_name(problem.validation_profile.execution_mode),
+            },
+            "resolved_execution": {
+                "backend": "fem", "device": "cpu", "precision": "double", "mode": "strict",
+                "runtime_family": "antenna_external_lead_inspection",
+                "engine_id": "antenna_external_lead_inspection", "lossy_fallback_used": false,
+            },
+            "qualification": "NOT VERIFIED",
+            "field_scope": "external_electrode_truncation",
+            "timestep_qualification": null,
+            "capabilities": null,
+            "artifact_layout": current_artifact_layout(problem, plan),
+            "meshing_capabilities": current_meshing_capabilities(plan),
+            "live_preview": {"mode": "inspection_resources_only", "supported_quantities": [], "downsampling": null},
+            "engine_version": env!("CARGO_PKG_VERSION"),
+            "status": status,
+        });
+    }
     let runtime_engine_info = fullmag_runner::resolve_planned_runtime_engine(problem, plan).ok();
-    let resolved_session_runtime = fullmag_runner::resolve_session_runtime(problem).ok();
+    let resolved_session_runtime =
+        fullmag_runner::resolve_session_runtime_for_plan_and_preview(problem, plan, u64::MAX).ok();
     let timestep_qualification = resolved_session_runtime.as_ref().and_then(|runtime| {
         fullmag_runner::timestep_qualification_for_plan(plan, &runtime.resolved_device)
     });
@@ -1217,6 +1536,7 @@ fn torque_display_mode(problem: &ProblemIR) -> Option<TorqueDisplayMode> {
         StudyIR::Eigenmodes { .. } => return None,
         StudyIR::FrequencyResponse { .. } => return None,
         StudyIR::Hysteresis { .. } => return None,
+        StudyIR::AntennaFieldSolve { .. } => return None,
     };
     let damping = problem.materials.first()?.damping;
     Some(TorqueDisplayMode::FromDmdt {
@@ -1279,6 +1599,7 @@ impl LiveProgressCadence {
         if update.stats.step <= 1
             || update.finished
             || has_heavy_live_payload(update)
+            || step_update_has_parallel_execution_progress(update)
             || step_update_has_frequency_response_progress(update)
         {
             self.last_publish_at = Some(Instant::now());
@@ -1315,12 +1636,27 @@ impl LiveProgressCadence {
 }
 
 fn has_heavy_live_payload(update: &fullmag_runner::StepUpdate) -> bool {
-    update.magnetization.is_some()
-        || update.preview_field.is_some()
-        || update
-            .cached_preview_fields
-            .as_ref()
-            .is_some_and(|fields| !fields.is_empty())
+    let flags = crate::live_workspace::feature_flags();
+    let live_magnetization_disabled = flags.disable_live_magnetization && !update.finished;
+    let previews_disabled = flags.disable_preview_2d && flags.disable_preview_3d;
+    (!live_magnetization_disabled && update.magnetization.is_some())
+        || (!previews_disabled && update.preview_field.is_some())
+        || (!previews_disabled
+            && update
+                .cached_preview_fields
+                .as_ref()
+                .is_some_and(|fields| !fields.is_empty()))
+}
+
+fn fem_eigen_progress_metrics(
+    stats: &fullmag_runner::StepStats,
+) -> Option<&std::collections::HashMap<String, f64>> {
+    if stats.validate_record_kind().is_err() || !stats.kind.is_solver_progress() {
+        return None;
+    }
+    match stats.solver_progress.as_ref()? {
+        fullmag_quantities::SolverProgress::FemEigen { metrics } => Some(metrics),
+    }
 }
 
 fn step_update_has_frequency_response_progress(update: &fullmag_runner::StepUpdate) -> bool {
@@ -1333,6 +1669,11 @@ fn step_update_has_frequency_response_progress(update: &fullmag_runner::StepUpda
                 .get("total_frequency_count")
                 .is_some_and(|value| value.is_finite() && *value > 0.0)
         })
+}
+
+fn step_update_has_parallel_execution_progress(update: &fullmag_runner::StepUpdate) -> bool {
+    fem_eigen_progress_metrics(&update.stats)
+        .is_some_and(|metrics| metrics.get("parallel_telemetry_available") == Some(&1.0))
 }
 
 fn publish_live_step_update(
@@ -1514,6 +1855,10 @@ fn apply_live_step_update_to_workspace_state(
         "running".to_string()
     };
     state.run = running_run_manifest_from_update(run_id, session_id, artifact_dir, &update);
+    let disable_live_magnetization = crate::live_workspace::feature_flags()
+        .disable_live_magnetization
+        && !update.finished;
+    let previous_step_is_physical = state.live_state.latest_step.is_physical_observation();
     let previous_magnetization = state.live_state.latest_step.magnetization.take();
     let previous_fem_mesh_generation_id =
         state.live_state.latest_step.fem_mesh_generation_id.take();
@@ -1540,12 +1885,22 @@ fn apply_live_step_update_to_workspace_state(
         hysteresis_settle_step_kind: update.hysteresis_settle_step_kind.clone(),
         hysteresis_settle_step_method: update.hysteresis_settle_step_method.clone(),
         scalar_row_due: update.scalar_row_due,
+        terminal_field_snapshot: update.terminal_field_snapshot,
         finished: update.finished,
     };
     state.live_state = live_state_manifest_from_update(update);
-    if state.live_state.latest_step.magnetization.is_none()
+    if disable_live_magnetization {
+        // Large-grid runs do not need a full m vector in every control-plane
+        // frame. Keep the authoritative saved states and terminal artifacts,
+        // but remove the expensive live carrier after bootstrap.
+        state.latest_fields.0.remove("m");
+    }
+    if previous_step_is_physical
+        && state.live_state.latest_step.is_physical_observation()
+        && state.live_state.latest_step.magnetization.is_none()
         && !incoming_has_magnetization
         && !incoming_has_magnetization_preview
+        && !disable_live_magnetization
     {
         state.live_state.latest_step.magnetization = previous_magnetization;
     }
@@ -1583,6 +1938,13 @@ fn ingest_magnetization_field_from_update(
     state: &mut LocalLiveWorkspaceState,
     update: &mut fullmag_runner::StepUpdate,
 ) -> bool {
+    if crate::live_workspace::feature_flags().disable_live_magnetization && !update.finished {
+        update.magnetization = None;
+        return false;
+    }
+    if !update.stats.is_physical_observation() {
+        return false;
+    }
     let Some(values) = update.magnetization.take() else {
         return false;
     };
@@ -1626,6 +1988,9 @@ fn preserve_frequency_response_progress_scalars_from_live_state(
     state: &LocalLiveWorkspaceState,
     update: &mut fullmag_runner::StepUpdate,
 ) {
+    if !update.stats.is_physical_observation() {
+        return;
+    }
     if update
         .stats
         .per_object_scalars
@@ -1667,6 +2032,9 @@ fn apply_fem_frequency_response_progress_to_stage_execution(
     state: &mut LocalLiveWorkspaceState,
     update: &fullmag_runner::StepUpdate,
 ) {
+    if !update.stats.is_physical_observation() {
+        return;
+    }
     let Some(progress) = update
         .stats
         .per_object_scalars
@@ -1798,7 +2166,7 @@ fn apply_fem_eigen_progress_to_stage_execution(
     state: &mut LocalLiveWorkspaceState,
     update: &fullmag_runner::StepUpdate,
 ) {
-    let Some(progress) = update.stats.per_object_scalars.get("fem_eigen_progress") else {
+    let Some(progress) = fem_eigen_progress_metrics(&update.stats) else {
         return;
     };
     let Some(stage_execution) = state.stage_execution.as_mut() else {
@@ -1812,14 +2180,7 @@ fn apply_fem_eigen_progress_to_stage_execution(
     };
 
     let phase = fem_eigen_progress_phase(progress);
-    let solver = if progress
-        .get("solver_cpu_sparse_lobpcg")
-        .is_some_and(|value| *value > 0.0)
-    {
-        "cpu_sparse_lobpcg"
-    } else {
-        "cpu_dense_symmetric_eigen"
-    };
+    let solver = fem_eigen_progress_solver(progress);
     let percent = progress
         .get("percent")
         .copied()
@@ -1830,10 +2191,147 @@ fn apply_fem_eigen_progress_to_stage_execution(
     }
     stage.progress_label = Some(phase.to_string());
     stage.progress_detail = Some(fem_eigen_progress_detail(progress, phase, solver));
+    if progress.get("parallel_telemetry_available") == Some(&1.0) {
+        stage.parallel_execution = parallel_execution_telemetry_from_progress(progress);
+    }
     stage.last_progress_unix_ms = Some(current_unix_millis_u64());
 }
 
+fn parallel_execution_telemetry_from_progress(
+    progress: &std::collections::HashMap<String, f64>,
+) -> Option<fullmag_runner::LiveParallelExecutionTelemetry> {
+    if progress.get("parallel_telemetry_available") != Some(&1.0) {
+        return None;
+    }
+
+    fn scalar_u32(value: Option<&f64>) -> Option<u32> {
+        let value = value.copied()?;
+        (value.is_finite() && value >= 0.0 && value.fract() == 0.0 && value <= u32::MAX as f64)
+            .then_some(value as u32)
+    }
+
+    fn scalar_u64_pair(
+        progress: &std::collections::HashMap<String, f64>,
+        key: &str,
+    ) -> Option<u64> {
+        let low = scalar_u32(progress.get(&format!("{key}_lo")))?;
+        let high = scalar_u32(progress.get(&format!("{key}_hi")))?;
+        Some((u64::from(high) << 32) | u64::from(low))
+    }
+
+    fn optional_u32(
+        progress: &std::collections::HashMap<String, f64>,
+        key: &str,
+    ) -> Option<Option<u32>> {
+        match progress.get(key) {
+            None => Some(None),
+            Some(value) => scalar_u32(Some(value)).map(Some),
+        }
+    }
+
+    fn optional_f64(
+        progress: &std::collections::HashMap<String, f64>,
+        key: &str,
+    ) -> Option<Option<f64>> {
+        match progress.get(key) {
+            None => Some(None),
+            Some(value) if value.is_finite() => Some(Some(*value)),
+            Some(_) => None,
+        }
+    }
+
+    fn optional_u64_pair(
+        progress: &std::collections::HashMap<String, f64>,
+        key: &str,
+    ) -> Option<Option<u64>> {
+        let has_low = progress.contains_key(&format!("{key}_lo"));
+        let has_high = progress.contains_key(&format!("{key}_hi"));
+        match (has_low, has_high) {
+            (false, false) => Some(None),
+            (true, true) => scalar_u64_pair(progress, key).map(Some),
+            _ => None,
+        }
+    }
+
+    fn tagged(progress: &std::collections::HashMap<String, f64>, prefix: &str) -> Option<String> {
+        let mut values = progress.iter().filter_map(|(key, value)| {
+            (key.starts_with(prefix) && *value == 1.0).then(|| key[prefix.len()..].to_string())
+        });
+        let value = values.next().filter(|value| !value.is_empty())?;
+        values.next().is_none().then_some(value)
+    }
+
+    let sampled_at_unix_ms = scalar_u64_pair(progress, "parallel_sampled_at_unix_ms")?;
+    let active_workers = scalar_u32(progress.get("parallel_active_workers"))?;
+    let admission_desired_workers = scalar_u32(progress.get("parallel_admission_desired_workers"))?;
+    let admission_pending_samples = scalar_u32(progress.get("parallel_admission_pending_samples"))?;
+    let cpu_target_percent = progress.get("parallel_cpu_target_percent").copied()?;
+    let memory_target_percent = progress.get("parallel_memory_target_percent").copied()?;
+    if !cpu_target_percent.is_finite()
+        || !memory_target_percent.is_finite()
+        || cpu_target_percent <= 0.0
+        || memory_target_percent <= 0.0
+    {
+        return None;
+    }
+    let memory_reserve_bytes = scalar_u64_pair(progress, "parallel_memory_reserve_bytes")?;
+    Some(fullmag_runner::LiveParallelExecutionTelemetry {
+        sampled_at_unix_ms,
+        active_workers,
+        admission_desired_workers,
+        admission_worker_limit: optional_u32(progress, "parallel_admission_worker_limit")?,
+        admission_pending_samples,
+        resolved_workers: optional_u32(progress, "parallel_resolved_workers")?,
+        cpu_target_percent,
+        memory_target_percent,
+        memory_reserve_bytes,
+        cpu_target_kind: tagged(progress, "parallel_cpu_target_kind:")?,
+        cpu_busy_percent: optional_f64(progress, "parallel_cpu_busy_percent")?,
+        allocated_cpu_cores: optional_f64(progress, "parallel_allocated_cpu_cores")?,
+        cpu_available_cores: optional_f64(progress, "parallel_cpu_available_cores")?,
+        memory_limit_bytes: optional_u64_pair(progress, "parallel_memory_limit_bytes")?,
+        memory_available_bytes: optional_u64_pair(progress, "parallel_memory_available_bytes")?,
+        worker_peak_cpu_cores: optional_f64(progress, "parallel_worker_peak_cpu_cores")?,
+        worker_peak_rss_bytes: optional_u64_pair(progress, "parallel_worker_peak_rss_bytes")?,
+        admission_reason: tagged(progress, "parallel_admission_reason:")?,
+        terminal: progress.get("parallel_telemetry_terminal") == Some(&1.0),
+    })
+}
+
+fn fem_eigen_progress_solver(progress: &std::collections::HashMap<String, f64>) -> &str {
+    let mut kinds = progress.iter().filter_map(|(key, value)| {
+        key.strip_prefix("solver_kind:")
+            .filter(|kind| !kind.is_empty() && *value == 1.0)
+    });
+    if let Some(kind) = kinds.next() {
+        return if kinds.next().is_none() {
+            kind
+        } else {
+            "unknown"
+        };
+    }
+    // Older producers explicitly exposed only LOBPCG. Absence of that flag
+    // cannot prove a dense solver, a device lane, or an execution algorithm.
+    if progress.get("solver_cpu_sparse_lobpcg") == Some(&1.0) {
+        "cpu_sparse_lobpcg"
+    } else {
+        "unknown"
+    }
+}
+
 fn fem_eigen_progress_phase(progress: &std::collections::HashMap<String, f64>) -> &'static str {
+    if progress.get("window_phase_base") == Some(&1.0) {
+        return "solving native frequency window base";
+    }
+    if progress.get("window_phase_refinement") == Some(&1.0) {
+        return "solving native frequency window refinement";
+    }
+    if progress.get("phase_kind:solving_native_shift_invert") == Some(&1.0) {
+        return "solving native shift-invert";
+    }
+    if progress.get("phase_kind:solving_native_contour_interval") == Some(&1.0) {
+        return "solving native contour interval";
+    }
     if progress
         .get("phase_materializing_equilibrium")
         .is_some_and(|value| *value > 0.0)
@@ -1869,6 +2367,73 @@ fn fem_eigen_progress_phase(progress: &std::collections::HashMap<String, f64>) -
     }
 }
 
+fn fem_eigen_progress_is_ksp_norm(
+    progress: &std::collections::HashMap<String, f64>,
+) -> bool {
+    progress.get("residual_source:ksp_norm") == Some(&1.0)
+}
+
+fn fem_eigen_progress_counter(
+    progress: &std::collections::HashMap<String, f64>,
+    key: &str,
+) -> Option<u64> {
+    let value = progress.get(key).copied()?;
+    (value.is_finite()
+        && value >= 0.0
+        && value.fract() == 0.0
+        && value < u64::MAX as f64)
+        .then_some(value as u64)
+}
+
+fn fem_eigen_progress_tagged_value<'a>(
+    progress: &std::collections::HashMap<String, f64>,
+    prefix: &str,
+    allowed: &'a [&'a str],
+) -> Option<&'a str> {
+    let mut matches = allowed.iter().copied().filter(|value| {
+        let key = format!("{prefix}{value}");
+        progress
+            .get(&key)
+            .is_some_and(|flag| flag.is_finite() && *flag == 1.0)
+    });
+    let value = matches.next()?;
+    matches.next().is_none().then_some(value)
+}
+
+fn fem_eigen_linear_progress_detail(
+    progress: &std::collections::HashMap<String, f64>,
+) -> Option<String> {
+    if !fem_eigen_progress_is_ksp_norm(progress) {
+        return None;
+    }
+
+    let mut fields = Vec::with_capacity(4);
+    if let Some(iteration) = fem_eigen_progress_counter(progress, "linear_iteration") {
+        fields.push(format!("linear_iteration={iteration}"));
+    }
+    if let Some(norm) = progress
+        .get("linear_residual_norm")
+        .copied()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+    {
+        fields.push(format!("ksp_norm={norm:.3e}"));
+    }
+    if let Some(role) =
+        fem_eigen_progress_tagged_value(progress, "linear_solver_role:", &["poisson", "shift_invert"])
+    {
+        fields.push(format!("linear_solver_role={role}"));
+    }
+    if let Some(ksp_type) = fem_eigen_progress_tagged_value(
+        progress,
+        "linear_ksp_type:",
+        &["gmres", "fgmres", "preonly"],
+    ) {
+        fields.push(format!("linear_ksp_type={ksp_type}"));
+    }
+
+    (!fields.is_empty()).then(|| fields.join("; "))
+}
+
 fn fem_eigen_progress_detail(
     progress: &std::collections::HashMap<String, f64>,
     phase: &str,
@@ -1881,18 +2446,52 @@ fn fem_eigen_progress_detail(
     let mut detail = format!(
         "{phase}; solver={solver}; active_nodes={active_nodes}; effective_dof={effective_dof}; requested_modes={requested_modes}; computed_modes={computed_modes}"
     );
-    if let Some(iteration) = progress.get("iteration").copied() {
-        if let Some(max_iterations) = progress.get("max_iterations").copied() {
-            detail.push_str(&format!(
-                "; iteration={}/{}",
-                iteration as u64, max_iterations as u64
-            ));
+    if let Some(iteration) = fem_eigen_progress_counter(progress, "iteration") {
+        if let Some(max_iterations) = fem_eigen_progress_counter(progress, "max_iterations") {
+            detail.push_str(&format!("; iteration={iteration}/{max_iterations}"));
         } else {
-            detail.push_str(&format!("; iteration={}", iteration as u64));
+            detail.push_str(&format!("; iteration={iteration}"));
         }
     }
-    if let Some(residual) = progress.get("residual").copied() {
-        detail.push_str(&format!("; residual={residual:.3e}"));
+    if !fem_eigen_progress_is_ksp_norm(progress) {
+        if let Some(residual) = progress.get("residual").copied() {
+            detail.push_str(&format!("; residual={residual:.3e}"));
+        }
+    }
+    if let Some(linear_progress) = fem_eigen_linear_progress_detail(progress) {
+        detail.push_str(&format!("; {linear_progress}"));
+    }
+    let window_phase = if progress
+        .get("window_phase_base")
+        .is_some_and(|value| *value > 0.0)
+    {
+        Some("base")
+    } else if progress
+        .get("window_phase_refinement")
+        .is_some_and(|value| *value > 0.0)
+    {
+        Some("refinement")
+    } else {
+        None
+    };
+    if let Some(window_phase) = window_phase {
+        detail.push_str(&format!("; window_phase={window_phase}"));
+    }
+    if let (Some(current), Some(total)) = (
+        fem_eigen_progress_counter(progress, "current_subwindow"),
+        fem_eigen_progress_counter(progress, "total_subwindows"),
+    ) {
+        detail.push_str(&format!("; subwindow={current}/{total}"));
+    }
+    if let Some(seconds) = progress.get("subwindow_elapsed_seconds").copied() {
+        if seconds.is_finite() {
+            detail.push_str(&format!("; subwindow_s={seconds:.1}"));
+        }
+    }
+    if let Some(seconds) = progress.get("window_elapsed_seconds").copied() {
+        if seconds.is_finite() {
+            detail.push_str(&format!("; window_s={seconds:.1}"));
+        }
     }
     if progress
         .get("warning_dense_o_n3")
@@ -2018,6 +2617,63 @@ fn append_detailed_fem_step_profile(line: &mut String, stats: &fullmag_runner::S
     ));
 }
 
+fn append_fem_eigen_step_progress(line: &mut String, stats: &fullmag_runner::StepStats) {
+    let Some(progress) = fem_eigen_progress_metrics(stats) else {
+        return;
+    };
+    let window_phase = if progress
+        .get("window_phase_base")
+        .is_some_and(|value| *value == 1.0)
+    {
+        Some("base")
+    } else if progress
+        .get("window_phase_refinement")
+        .is_some_and(|value| *value == 1.0)
+    {
+        Some("refinement")
+    } else {
+        None
+    };
+    let linear_progress = fem_eigen_linear_progress_detail(progress);
+    if window_phase.is_none() && linear_progress.is_none() {
+        return;
+    }
+    let mut segment = window_phase
+        .map(|phase| format!("  modal window phase={phase}"))
+        .unwrap_or_else(|| "  modal linear solve".to_string());
+    if let (Some(current), Some(total)) = (
+        fem_eigen_progress_counter(progress, "current_subwindow"),
+        fem_eigen_progress_counter(progress, "total_subwindows"),
+    ) {
+        segment.push_str(&format!(" subwindow={current}/{total}"));
+    }
+    if let Some(seconds) = progress.get("subwindow_elapsed_seconds").copied() {
+        if seconds.is_finite() {
+            segment.push_str(&format!(" subwindow_s={seconds:.1}"));
+        }
+    }
+    if let Some(seconds) = progress.get("window_elapsed_seconds").copied() {
+        if seconds.is_finite() {
+            segment.push_str(&format!(" window_s={seconds:.1}"));
+        }
+    }
+    if let Some(linear_progress) = linear_progress {
+        if !line.contains(linear_progress.as_str()) {
+            segment.push_str(&format!(" {linear_progress}"));
+        }
+    }
+    if !fem_eigen_progress_is_ksp_norm(progress) {
+        if let Some(residual) = progress
+            .get("residual")
+            .copied()
+            .filter(|value| value.is_finite())
+        {
+            segment.push_str(&format!(" relres={residual:.3e}"));
+        }
+    }
+    line.push_str(&segment);
+}
+
 fn frequency_response_step_progress_segment(stats: &fullmag_runner::StepStats) -> Option<String> {
     let Some(progress) = stats
         .per_object_scalars
@@ -2126,6 +2782,19 @@ fn format_stage_progress_line(
             .map(|age| format!("  heartbeat idle={:.1}s", age.as_secs_f64()))
             .unwrap_or_default();
         return format!("{prefix}  frequency sweep  {progress}{heartbeat}  [{wall_ms:.0}ms]");
+    }
+    if let Some(progress) = fem_eigen_progress_metrics(stats) {
+        let detail = fem_eigen_progress_detail(
+            progress,
+            fem_eigen_progress_phase(progress),
+            fem_eigen_progress_solver(progress),
+        );
+        let heartbeat = heartbeat_age
+            .map(|age| format!("  heartbeat idle={:.1}s", age.as_secs_f64()))
+            .unwrap_or_default();
+        let mut line = format!("{prefix}  modal eigen  {detail}{heartbeat}  [{wall_ms:.0}ms]");
+        append_fem_eigen_step_progress(&mut line, stats);
+        return line;
     }
     let torque_t = if stats.max_torque_T > 0.0 {
         stats.max_torque_T
@@ -2265,6 +2934,164 @@ fn ensure_frequency_response_relaxed_continuation_is_qualified(
         metric_value,
         threshold
     );
+}
+
+#[derive(Debug, Clone)]
+struct ContinuationStageSource {
+    run_id: String,
+    stage_id: String,
+    stage_kind: String,
+    is_relaxation: bool,
+}
+
+fn accepted_relax_handoff_for_eigen_stage(
+    backend_plan: &BackendPlanIR,
+    continuation_magnetization: Option<&[[f64; 3]]>,
+    prepared_handoff: Option<&fullmag_runner::AcceptedFemRelaxStageHandoff>,
+) -> Result<Option<fullmag_runner::AcceptedFemRelaxStageHandoff>> {
+    let BackendPlanIR::FemEigen(eigen) = backend_plan else {
+        return Ok(None);
+    };
+    if !matches!(
+        eigen.equilibrium,
+        fullmag_ir::EquilibriumSourceIR::RelaxedInitialState
+    ) || continuation_magnetization.is_none()
+    {
+        return Ok(None);
+    }
+    prepared_handoff.cloned().map(Some).ok_or_else(|| {
+        anyhow!("relax-to-eigen continuation is missing the accepted Relax handoff v3")
+    })
+}
+
+fn accepted_relax_handoff_from_completed_stage(
+    backend_plan: &BackendPlanIR,
+    source_stage: &ContinuationStageSource,
+    source_mesh: &fullmag_runner::FemMeshPayload,
+    completion: &fullmag_ir::StageCompletionIR,
+    equilibrium_magnetization: &[[f64; 3]],
+    accepted_fields: &fullmag_runner::CertifiedFemEquilibriumFields,
+    certified_fields: &fullmag_runner::CertifiedFemEquilibriumFields,
+    recomputed_certificate: &fullmag_runner::RecomputedFemLinearizationCertificateV1,
+) -> Result<Option<fullmag_runner::AcceptedFemRelaxStageHandoff>> {
+    let BackendPlanIR::Fem(source_plan) = backend_plan else {
+        return Ok(None);
+    };
+    if !source_stage.is_relaxation {
+        return Ok(None);
+    }
+    fullmag_runner::AcceptedFemRelaxStageHandoff::from_completed_relax_verified(
+        &source_stage.run_id,
+        &source_stage.stage_id,
+        &source_stage.stage_kind,
+        true,
+        source_plan,
+        source_mesh,
+        completion,
+        equilibrium_magnetization.to_vec(),
+        accepted_fields.clone(),
+        certified_fields.clone(),
+        recomputed_certificate.clone(),
+    )
+    .map(Some)
+    .map_err(|error| anyhow!(error.to_string()))
+}
+
+fn accepted_relax_handoff_from_completed_stage_with_exact_artifacts(
+    backend_plan: &BackendPlanIR,
+    source_stage: &ContinuationStageSource,
+    source_mesh: &fullmag_runner::FemMeshPayload,
+    completion: &fullmag_ir::StageCompletionIR,
+    equilibrium_magnetization: &[[f64; 3]],
+    artifact_dir: &Path,
+    accepted_fields: &fullmag_runner::CertifiedFemEquilibriumFields,
+    certified_fields: &fullmag_runner::CertifiedFemEquilibriumFields,
+    recomputed_certificate: &fullmag_runner::RecomputedFemLinearizationCertificateV1,
+) -> Result<Option<fullmag_runner::AcceptedFemRelaxStageHandoff>> {
+    let BackendPlanIR::Fem(source_plan) = backend_plan else {
+        return Ok(None);
+    };
+    if !source_stage.is_relaxation {
+        return Ok(None);
+    }
+    let accepted_path = artifact_dir.join(
+        fullmag_runner::CertifiedFemEquilibriumFields::accepted_artifact_path_for_material(
+            &source_plan.material,
+        ),
+    );
+    let (certified_relative_path, recomputed_relative_path) =
+        fullmag_runner::CertifiedFemEquilibriumFields::artifact_paths_for_material(
+            &source_plan.material,
+        );
+    let certified_path = artifact_dir.join(certified_relative_path);
+    let recomputed_path = artifact_dir.join(recomputed_relative_path);
+    let producer_provenance_path = artifact_dir.join(
+        fullmag_runner::FEM_RELAXATION_PRODUCER_PROVENANCE_RELATIVE_PATH,
+    );
+    let read_exact = |path: &Path, label: &str| -> Result<Vec<u8>> {
+        fs::read(path).with_context(|| {
+            format!(
+                "verified FEM relaxation handoff did not publish exact {label} bytes {}",
+                path.display()
+            )
+        })
+    };
+    let producer_provenance_json = read_exact(&producer_provenance_path, "producer provenance")?;
+    let producer_provenance: fullmag_runner::FemRelaxationProducerProvenance =
+        serde_json::from_slice(&producer_provenance_json)
+        .with_context(|| {
+            format!(
+                "failed to decode producer provenance sidecar {}",
+                producer_provenance_path.display()
+            )
+        })?;
+    fullmag_runner::AcceptedFemRelaxStageHandoff::from_completed_relax_verified_with_exact_artifacts_and_provenance(
+        &source_stage.run_id,
+        &source_stage.stage_id,
+        &source_stage.stage_kind,
+        true,
+        source_plan,
+        source_mesh,
+        completion,
+        equilibrium_magnetization.to_vec(),
+        accepted_fields.clone(),
+        certified_fields.clone(),
+        recomputed_certificate.clone(),
+        fullmag_runner::AcceptedFemRelaxExactArtifacts {
+            accepted_fields_json: read_exact(&accepted_path, "accepted fields")?,
+            certified_fields_json: read_exact(&certified_path, "certified fields")?,
+            recomputed_certificate_json: read_exact(&recomputed_path, "recomputed certificate")?,
+        },
+        producer_provenance,
+        producer_provenance_json,
+    )
+    .map(Some)
+    .map_err(|error| anyhow!(error.to_string()))
+}
+
+fn replace_continuation_after_synthetic_stage(
+    continuation_magnetization: &mut Option<Vec<[f64; 3]>>,
+    continuation_source: &mut Option<ContinuationSource>,
+    continuation_fem_mesh_payload: &mut Option<fullmag_runner::FemMeshPayload>,
+    continuation_completion: &mut Option<fullmag_ir::StageCompletionIR>,
+    continuation_stage_source: &mut Option<ContinuationStageSource>,
+    continuation_accepted_fields: &mut Option<fullmag_runner::CertifiedFemEquilibriumFields>,
+    continuation_certified_fields: &mut Option<fullmag_runner::CertifiedFemEquilibriumFields>,
+    continuation_relax_handoff: &mut Option<fullmag_runner::AcceptedFemRelaxStageHandoff>,
+    magnetization: Vec<[f64; 3]>,
+    preserves_certified_equilibrium: bool,
+) {
+    *continuation_magnetization = Some(magnetization);
+    if preserves_certified_equilibrium {
+        return;
+    }
+    *continuation_source = None;
+    *continuation_fem_mesh_payload = None;
+    *continuation_completion = None;
+    *continuation_stage_source = None;
+    *continuation_accepted_fields = None;
+    *continuation_certified_fields = None;
+    *continuation_relax_handoff = None;
 }
 
 struct StageProgressHeartbeat {
@@ -2432,6 +3259,7 @@ pub(crate) fn requested_runtime_selection(
 
 fn session_runtime_selection_for_problem(
     problem: &ProblemIR,
+    plan: Option<&ExecutionPlanIR>,
     field_every_n: u64,
     fallback_requested_backend: &str,
     fallback_requested_mode: &str,
@@ -2451,7 +3279,27 @@ fn session_runtime_selection_for_problem(
         requested_mode,
         requested_cpu_threads,
     );
-    match fullmag_runner::resolve_session_runtime_for_preview(problem, field_every_n) {
+    if plan.is_some_and(antenna_external_lead_inspection::is_carrier) {
+        selection.resolved_backend = Some("fem".into());
+        selection.resolved_device = Some("cpu".into());
+        selection.resolved_precision = Some("double".into());
+        selection.resolved_mode = Some("strict".into());
+        selection.resolved_runtime_family = Some("antenna_external_lead_inspection".into());
+        selection.resolved_engine_id = Some("antenna_external_lead_inspection".into());
+        return selection;
+    }
+    let resolved_runtime = plan
+        .map(|plan| {
+            fullmag_runner::resolve_session_runtime_for_plan_and_preview(
+                problem,
+                plan,
+                field_every_n,
+            )
+        })
+        .unwrap_or_else(|| {
+            fullmag_runner::resolve_session_runtime_for_preview(problem, field_every_n)
+        });
+    match resolved_runtime {
         Ok(resolved) => {
             selection.requested_device = resolved.requested_device;
             selection.requested_cpu_threads = resolved
@@ -2485,7 +3333,8 @@ fn fem_mesh_payload_from_backend_plan(
         BackendPlanIR::Fem(fem) => Some(fullmag_runner::FemMeshPayload::from(fem)),
         BackendPlanIR::FemEigen(fem) => Some(fullmag_runner::FemMeshPayload::from(fem)),
         BackendPlanIR::FemFrequencyResponse(fem) => Some(fullmag_runner::FemMeshPayload::from(fem)),
-        BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) => None,
+        BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_) => None,
     }
 }
 
@@ -2513,6 +3362,13 @@ fn initial_live_state_manifest_from_backend_plan(
     continuation_magnetization: Option<&[[f64; 3]]>,
 ) -> anyhow::Result<(LiveStateManifest, Option<fullmag_runner::FemMeshPayload>)> {
     let mut live_state = live_state_manifest_from_update(update.clone());
+    if matches!(backend_plan, BackendPlanIR::AntennaExternalLeadInspection(_)) {
+        live_state.latest_step.magnetization = None;
+        live_state.latest_step.grid = [0; 3];
+        live_state.latest_step.preview_field = None;
+        live_state.latest_step.fem_mesh_generation_id = None;
+        return Ok((live_state, None));
+    }
     if let Some(mesh_payload) = mesh_payload.as_ref() {
         let initial_magnetization =
             current_stage_magnetization_vectors(continuation_magnetization, backend_plan);
@@ -2670,6 +3526,21 @@ fn adaptive_remesh_legality_reason(problem: &ProblemIR) -> Option<&'static str> 
     has_periodic_mesh.then_some("adaptive_periodic_remesh_not_certified")
 }
 
+fn adaptive_remesh_backend_legality_reason(backend_plan: &BackendPlanIR) -> Option<&'static str> {
+    let domain_mesh_mode = match backend_plan {
+        BackendPlanIR::Fem(plan) => Some(plan.domain_mesh_mode),
+        BackendPlanIR::FemEigen(plan) => Some(plan.domain_mesh_mode),
+        BackendPlanIR::FemFrequencyResponse(plan) => Some(plan.domain_mesh_mode),
+        BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_) => None,
+    };
+    matches!(
+        domain_mesh_mode,
+        Some(fullmag_ir::FemDomainMeshModeIR::SharedDomainMeshWithAir)
+    )
+    .then_some("adaptive_shared_domain_remesh_requires_dedicated_remesher")
+}
+
 fn validate_periodic_remesh_candidate(
     previous: &fullmag_ir::MeshIR,
     candidate: &fullmag_ir::MeshIR,
@@ -2709,6 +3580,10 @@ struct SceneProblemPatch {
     object_regions: Vec<ObjectRegionIR>,
     #[serde(default)]
     universe: Option<serde_json::Value>,
+    #[serde(default)]
+    fdm: Option<serde_json::Value>,
+    #[serde(default)]
+    runtime_selection: Option<serde_json::Value>,
 }
 
 fn scene_problem_patch_from_mesh_options(
@@ -2729,12 +3604,19 @@ fn scene_problem_patch_from_mesh_options(
     Ok(Some(patch))
 }
 
-fn apply_scene_problem_patch(problem: &mut ProblemIR, patch: &SceneProblemPatch) {
+fn apply_scene_problem_patch(problem: &mut ProblemIR, patch: &SceneProblemPatch) -> Result<()> {
     problem.geometry.entries = patch.geometry_entries.clone();
     problem.regions = patch.regions.clone();
     problem.materials = patch.materials.clone();
     problem.magnets = patch.magnets.clone();
     problem.object_regions = patch.object_regions.clone();
+    apply_scene_discretization_patch(problem, patch)
+}
+
+fn apply_scene_discretization_patch(
+    problem: &mut ProblemIR,
+    patch: &SceneProblemPatch,
+) -> Result<()> {
     if let Some(universe) = patch.universe.as_ref() {
         problem
             .problem_meta
@@ -2742,6 +3624,58 @@ fn apply_scene_problem_patch(problem: &mut ProblemIR, patch: &SceneProblemPatch)
             .insert("study_universe".to_string(), universe.clone());
         problem.problem_meta.runtime_metadata.remove("domain_frame");
     }
+    if let Some(fdm) = patch.fdm.as_ref() {
+        let mut fdm = fdm.clone();
+        let fallback_cell = problem
+            .backend_policy
+            .discretization_hints
+            .as_ref()
+            .and_then(|hints| hints.fdm.as_ref())
+            .map(|hints| hints.cell);
+        if let Some(object) = fdm.as_object_mut() {
+            if let Some(per_object_grid) = object
+                .remove("per_object_grid")
+                .or_else(|| object.remove("per_magnet"))
+            {
+                object.insert("per_magnet".to_string(), per_object_grid);
+            }
+            if let Some(demag) = object
+                .get_mut("demag")
+                .and_then(|value| value.as_object_mut())
+            {
+                demag.remove("explain");
+                demag
+                    .entry("fft_backend".to_string())
+                    .or_insert_with(|| serde_json::json!("auto"));
+            }
+            if !object.contains_key("cell") {
+                if let Some(default_cell) = object.get("default_cell").cloned() {
+                    object.insert("cell".to_string(), default_cell);
+                } else if let Some(fallback_cell) = fallback_cell {
+                    object.insert("cell".to_string(), serde_json::json!(fallback_cell));
+                }
+            }
+        }
+        let fdm_hints: FdmHintsIR = serde_json::from_value(fdm)
+            .context("failed to apply FDM discretization patch to ProblemIR")?;
+        let hints = problem
+            .backend_policy
+            .discretization_hints
+            .get_or_insert_with(|| DiscretizationHintsIR {
+                fdm: None,
+                fem: None,
+                hybrid: None,
+            });
+        hints.fdm = Some(fdm_hints);
+        problem.backend_policy.requested_backend = BackendTarget::Fdm;
+    }
+    if let Some(runtime_selection) = patch.runtime_selection.as_ref() {
+        problem
+            .problem_meta
+            .runtime_metadata
+            .insert("runtime_selection".to_string(), runtime_selection.clone());
+    }
+    Ok(())
 }
 
 fn apply_remeshed_problem_snapshot_to_stages(
@@ -2756,7 +3690,7 @@ fn apply_remeshed_problem_snapshot_to_stages(
 ) -> Result<()> {
     for stage in stages {
         if let Some(patch) = scene_problem_patch {
-            apply_scene_problem_patch(&mut stage.ir, patch);
+            apply_scene_problem_patch(&mut stage.ir, patch)?;
         }
         apply_current_fem_overrides(
             &mut stage.ir,
@@ -2821,6 +3755,13 @@ fn refresh_materialized_stage_execution_plans(
 }
 
 fn plan_materialized_stage_snapshot(stage: &ResolvedScriptStage) -> Result<ExecutionPlanIR> {
+    if let Some(ResolvedScriptStageAction::AntennaExternalLeadInspection {
+        input, requested_execution, output_id,
+    }) = &stage.action {
+        return antenna_external_lead_inspection::plan_carrier(
+            &stage.ir, input, requested_execution, output_id,
+        );
+    }
     let mut planning_ir = stage.ir.clone();
     if stage.action.is_some() {
         let sampling = planning_ir.study.sampling_mut();
@@ -2837,6 +3778,743 @@ fn plan_materialized_stage_snapshot(stage: &ResolvedScriptStage) -> Result<Execu
         });
     }
     fullmag_plan::plan(&planning_ir).map_err(|error| anyhow!(error.to_string()))
+}
+
+/// Re-resolve the dedicated conductor solve solely to calculate the current
+/// dependency signature.  This does not execute the native solve; it rebuilds
+/// the canonical plan so an old immutable asset cannot be accepted merely
+/// because its own bytes and digest are intact.
+fn current_antenna_solution_expectation(
+    problem: &ProblemIR,
+    stage_id: &str,
+    port_mode_id: &str,
+    reference: fullmag_ir::AntennaFieldSolutionRefIR,
+) -> Result<fullmag_runner::ExpectedAntennaSolution> {
+    let mut verification_problem = problem.clone();
+    verification_problem.backend_policy.requested_backend = BackendTarget::Fem;
+    let solve_plan =
+        fullmag_plan::plan_antenna_field_solve(&verification_problem, stage_id, port_mode_id)
+            .map_err(|error| anyhow!("re-resolve current antenna dependencies: {error}"))?;
+    let signatures = fullmag_runner::antenna_field_solution_signatures(&solve_plan).map_err(|error| {
+        anyhow!(
+            "compute current antenna dependency signature: {}",
+            error.message
+        )
+    })?;
+    let request = solve_plan.conductor.charge_transport_plans[0]
+        .antenna_field_solution_request
+        .as_ref()
+        .ok_or_else(|| anyhow!("resolved antenna solve has no field-solution request"))?;
+    Ok(fullmag_runner::ExpectedAntennaSolution::new(reference, signatures)
+        .with_source_revisions(
+            request.geometry_revision.clone(),
+            request.material_revision.clone(),
+            request.mesh_digest.clone(),
+        ))
+}
+
+/// Validate activation before resolving any asset storage. Clear obsolete
+/// bases when this exact problem has no active antenna consumer.
+pub(super) fn prepare_solved_antenna_drive_activation(
+    problem: &ProblemIR,
+    execution_plan: &mut ExecutionPlanIR,
+) -> Result<bool> {
+    let active_stage_id = problem
+        .problem_meta
+        .runtime_metadata
+        .get("active_stage_id")
+        .and_then(serde_json::Value::as_str);
+    if !problem.solved_antenna_drives.is_empty() {
+        let time_stage = match &execution_plan.backend_plan {
+            BackendPlanIR::Fem(plan) => Some(&plan.time_stage),
+            BackendPlanIR::Fdm(plan) => Some(&plan.time_stage),
+            _ => None,
+        };
+        if time_stage.is_some_and(|stage| {
+            stage.study_kind != problem.study.kind()
+                || stage.active_stage_id.as_deref() != active_stage_id
+        }) {
+            bail!("solved antenna drive activation context differs between ProblemIR and execution plan");
+        }
+    }
+    if !problem.solved_antenna_drives.iter().any(|drive| {
+        drive
+            .activation
+            .is_active_for(problem.study.kind(), active_stage_id)
+    }) {
+        match &mut execution_plan.backend_plan {
+            BackendPlanIR::Fem(plan) => plan.solved_antenna_drive_bases.clear(),
+            BackendPlanIR::Fdm(plan) => plan.solved_antenna_drive_bases.clear(),
+            _ => {}
+        }
+        return Ok(false);
+    }
+    match &execution_plan.backend_plan {
+        BackendPlanIR::Fem(_) | BackendPlanIR::Fdm(_) => {}
+        BackendPlanIR::FdmMultilayer(_) => {
+            bail!("solved antenna drives are not supported by the FDM multilayer lane")
+        }
+        BackendPlanIR::FemEigen(_) | BackendPlanIR::FemFrequencyResponse(_) => {
+            bail!("solved antenna drives are supported only by the FEM time-evolution LLG lane")
+        }
+        BackendPlanIR::AntennaExternalLeadInspection(_) => {
+            bail!("raw antenna inspection is not a solved LLG drive basis")
+        }
+    };
+    Ok(true)
+}
+
+/// Attach published immutable antenna bases to the backend execution plan
+/// that will consume them. The field-solve stage only publishes an asset; this
+/// boundary is the explicit asset-to-LLG hand-off. FEM and FDM use separate
+/// target projections, while missing/stale assets fail closed instead of
+/// silently dropping the authored drive.
+pub(super) fn attach_solved_antenna_drive_bases(
+    problem: &ProblemIR,
+    execution_plan: &mut ExecutionPlanIR,
+    artifact_dir: &Path,
+) -> Result<()> {
+    if !prepare_solved_antenna_drive_activation(problem, execution_plan)? {
+        return Ok(());
+    }
+
+    let time_stage = match &execution_plan.backend_plan {
+        BackendPlanIR::Fem(plan) => &plan.time_stage,
+        BackendPlanIR::Fdm(plan) => &plan.time_stage,
+        _ => unreachable!("backend lane was validated before antenna activation"),
+    };
+    let active_drives = problem
+        .solved_antenna_drives
+        .iter()
+        .filter(|drive| {
+            drive.activation.is_active_for(
+                time_stage.study_kind,
+                time_stage.active_stage_id.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut assets = std::collections::BTreeMap::new();
+    for drive in active_drives {
+        let projection = problem
+            .antenna_target_projections
+            .iter()
+            .find(|projection| projection.id == drive.projection_ref)
+            .ok_or_else(|| {
+                anyhow!(
+                    "solved antenna drive '{}' references missing projection '{}'",
+                    drive.id,
+                    drive.projection_ref
+                )
+            })?;
+        let stage = problem
+            .antenna_field_solve_stages
+            .iter()
+            .find(|stage| stage.id == projection.solution.stage_id())
+            .ok_or_else(|| {
+                anyhow!(
+                    "antenna projection '{}' references missing solve stage '{}'",
+                    projection.id,
+                    projection.solution.stage_id()
+                )
+            })?;
+        let reference = projection
+            .solution
+            .published()
+            .ok_or_else(|| anyhow!("antenna projection '{}' is not resolved", projection.id))?;
+        let expected = current_antenna_solution_expectation(
+            problem,
+            &stage.id,
+            &drive.port_mode_id,
+            reference.clone(),
+        )?;
+        let asset = fullmag_runner::load_expected_antenna_field_solution(artifact_dir, &expected)
+            .map_err(|error| {
+                anyhow!(
+                    "load current antenna solution asset '{}' for drive '{}': {}",
+                    reference.asset_id,
+                    drive.id,
+                    error.message
+                )
+            })?;
+        if let Some(previous) = assets.get(&reference.asset_id) {
+            if previous != &asset {
+                bail!(
+                    "antenna solution asset '{}' was resolved with conflicting immutable payloads",
+                    reference.asset_id
+                );
+            }
+        } else {
+            assets.insert(reference.asset_id.clone(), asset);
+        }
+    }
+
+    match &mut execution_plan.backend_plan {
+        BackendPlanIR::Fem(plan) => {
+            fullmag_runner::materialize_fem_solved_antenna_drives_v03(problem, plan, &assets)
+                .map_err(|error| anyhow!("materialize solved antenna drives: {}", error.message))
+        }
+        BackendPlanIR::Fdm(plan) => {
+            fullmag_runner::materialize_fdm_solved_antenna_drives_v03(problem, plan, &assets)
+                .map_err(|error| anyhow!("materialize solved antenna drives: {}", error.message))
+        }
+        BackendPlanIR::FdmMultilayer(_)
+        | BackendPlanIR::AntennaExternalLeadInspection(_)
+        | BackendPlanIR::FemEigen(_)
+        | BackendPlanIR::FemFrequencyResponse(_) => unreachable!(
+            "backend lane was validated before antenna solution assets were materialized"
+        ),
+    }
+}
+
+fn resolve_active_antenna_stage_outputs(
+    problem: &mut ProblemIR,
+    published: &std::collections::BTreeMap<
+        (String, String, String),
+        fullmag_ir::AntennaFieldSolutionRefIR,
+    >,
+) -> Result<()> {
+    let mut resolved_projection_ports = std::collections::BTreeMap::<&str, &str>::new();
+    let mut resolved = Vec::new();
+    let active_stage_id = problem
+        .problem_meta
+        .runtime_metadata
+        .get("active_stage_id")
+        .and_then(serde_json::Value::as_str);
+    for drive in &problem.solved_antenna_drives {
+        if !drive
+            .activation
+            .is_active_for(problem.study.kind(), active_stage_id)
+        {
+            continue;
+        }
+        if let Some(previous_port) =
+            resolved_projection_ports.insert(&drive.projection_ref, &drive.port_mode_id)
+        {
+            if previous_port != drive.port_mode_id.as_str() {
+                bail!(
+                    "antenna projection '{}' is shared by active drives with different ports '{}' and '{}'",
+                    drive.projection_ref,
+                    previous_port,
+                    drive.port_mode_id
+                );
+            }
+        }
+        let (projection_index, projection) = problem
+            .antenna_target_projections
+            .iter()
+            .enumerate()
+            .find(|(_, projection)| projection.id == drive.projection_ref)
+            .ok_or_else(|| {
+                anyhow!(
+                    "solved antenna drive '{}' has no projection '{}'",
+                    drive.id,
+                    drive.projection_ref
+                )
+            })?;
+        if let fullmag_ir::AntennaSolutionRefIR::StageOutput(
+            fullmag_ir::AntennaStageOutputRefIR::StageOutput { stage_id, output_id },
+        ) = &projection.solution
+        {
+            let reference = published
+                .get(&(stage_id.clone(), output_id.clone(), drive.port_mode_id.clone()))
+                .ok_or_else(|| anyhow!(
+                    "antenna drive '{}' requires prior ready stage output '{}/{}' for port '{}'; forward, failed, or cancelled references are not executable",
+                    drive.id, stage_id, output_id, drive.port_mode_id
+                ))?;
+            if reference.stage_id != *stage_id || reference.output_id != *output_id {
+                bail!("antenna drive '{}' resolved an incompatible stage output", drive.id);
+            }
+            resolved.push((projection_index, reference.clone()));
+        }
+    }
+    for (index, reference) in resolved {
+        problem.antenna_target_projections[index].solution =
+            fullmag_ir::AntennaSolutionRefIR::Published(reference);
+    }
+    Ok(())
+}
+
+fn resolve_antenna_spectrum_stage_outputs(
+    problem: &mut ProblemIR,
+    published: &std::collections::BTreeMap<
+        (String, String, String),
+        fullmag_ir::AntennaFieldSolutionRefIR,
+    >,
+) -> Result<()> {
+    let mut resolved = Vec::new();
+    for (index, request) in problem.antenna_spectrum_requests.iter().enumerate() {
+        if let fullmag_ir::AntennaSolutionRefIR::StageOutput(
+            fullmag_ir::AntennaStageOutputRefIR::StageOutput { stage_id, output_id },
+        ) = &request.solution_ref
+        {
+            let stage = problem
+                .antenna_field_solve_stages
+                .iter()
+                .find(|stage| stage.id == *stage_id)
+                .ok_or_else(|| anyhow!("antenna spectrum request '{}' references missing solve stage '{}'", request.id, stage_id))?;
+            let port_mode_id = request.port_mode_id.as_deref().or_else(|| {
+                (stage.port_mode_ids.len() == 1).then(|| stage.port_mode_ids[0].as_str())
+            }).ok_or_else(|| anyhow!("antenna spectrum request '{}' must select one port", request.id))?;
+            let reference = published
+                .get(&(stage_id.clone(), output_id.clone(), port_mode_id.to_string()))
+                .ok_or_else(|| anyhow!(
+                    "antenna spectrum request '{}' requires prior ready stage output '{}/{}' for port '{}'",
+                    request.id, stage_id, output_id, port_mode_id
+                ))?;
+            if reference.stage_id != *stage_id || reference.output_id != *output_id {
+                bail!("antenna spectrum request '{}' resolved an incompatible stage output", request.id);
+            }
+            resolved.push((index, reference.clone()));
+        }
+    }
+    for (index, reference) in resolved {
+        problem.antenna_spectrum_requests[index].solution_ref =
+            fullmag_ir::AntennaSolutionRefIR::Published(reference);
+    }
+    Ok(())
+}
+
+/// Execute authored source-spectrum requests only from a published immutable
+/// antenna field asset.  This is an analysis product, not a hidden field solve
+/// and not a magnetization-response FFT.
+fn collect_published_spectrum_files(root: &Path) -> Result<std::collections::BTreeSet<PathBuf>> {
+    let mut pending = vec![PathBuf::new()];
+    let mut files = std::collections::BTreeSet::new();
+    while let Some(relative_dir) = pending.pop() {
+        let directory = root.join(&relative_dir);
+        for entry in fs::read_dir(&directory).with_context(|| {
+            format!(
+                "scan antenna source-spectrum directory {}",
+                directory.display()
+            )
+        })? {
+            let entry = entry?;
+            let relative = relative_dir.join(entry.file_name());
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                pending.push(relative);
+            } else if file_type.is_file() {
+                files.insert(relative);
+            } else {
+                bail!(
+                    "antenna source-spectrum output contains unsupported filesystem entry '{}'",
+                    entry.path().display()
+                );
+            }
+        }
+    }
+    Ok(files)
+}
+
+fn verify_existing_antenna_spectrum_output(
+    final_dir: &Path,
+    output_id: &str,
+    normalized: &[(PathBuf, &fullmag_runner::AuxiliaryArtifact)],
+    interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    if !final_dir.is_dir() {
+        bail!(
+            "antenna source-spectrum output '{}' already exists as a non-directory",
+            output_id
+        );
+    }
+    let expected_files = normalized
+        .iter()
+        .map(|(relative, _)| relative.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual_files = collect_published_spectrum_files(final_dir)?;
+    if actual_files != expected_files {
+        bail!(
+            "antenna source-spectrum output '{}' has a different published file set (expected {}, found {})",
+            output_id,
+            expected_files.len(),
+            actual_files.len()
+        );
+    }
+    let mut buffer = [0_u8; 64 * 1024];
+    for (relative, artifact) in normalized {
+        let existing = final_dir.join(relative);
+        let mut file = fs::File::open(&existing)
+            .with_context(|| format!("open existing antenna source-spectrum artifact {}", existing.display()))?;
+        let mut offset = 0_usize;
+        loop {
+            if synthetic_interrupt_requested(interrupt_requested) {
+                bail!("antenna source-spectrum stage was cancelled before reuse");
+            }
+            let count = file.read(&mut buffer)
+                .with_context(|| format!("read existing antenna source-spectrum artifact {}", existing.display()))?;
+            if count == 0 {
+                break;
+            }
+            let end = offset.checked_add(count)
+                .ok_or_else(|| anyhow!("existing antenna source-spectrum artifact exceeds addressable size"))?;
+            if artifact.bytes.get(offset..end) != Some(&buffer[..count]) {
+                bail!(
+                    "antenna source-spectrum output '{}' already exists with different content at '{}'",
+                    output_id,
+                    relative.display()
+                );
+            }
+            offset = end;
+        }
+        if offset != artifact.bytes.len() {
+            bail!(
+                "antenna source-spectrum output '{}' already exists with different content at '{}'",
+                output_id,
+                relative.display()
+            );
+        }
+    }
+    if synthetic_interrupt_requested(interrupt_requested) {
+        bail!("antenna source-spectrum stage was cancelled before reuse");
+    }
+    Ok(())
+}
+
+fn verify_staged_antenna_spectrum_output(
+    staging_dir: &Path,
+    normalized: &[(PathBuf, &fullmag_runner::AuxiliaryArtifact)],
+) -> Result<()> {
+    let mut buffer = [0_u8; 64 * 1024];
+    for (relative, artifact) in normalized {
+        let path = staging_dir.join(relative);
+        let mut file = fs::File::open(&path)
+            .with_context(|| format!("open staged antenna spectrum artifact {}", path.display()))?;
+        let mut offset = 0_usize;
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            let end = offset.checked_add(count).ok_or_else(|| {
+                anyhow!("staged antenna spectrum artifact '{}' exceeds addressable size", relative.display())
+            })?;
+            if artifact.bytes.get(offset..end) != Some(&buffer[..count]) {
+                bail!("staged antenna spectrum artifact '{}' differs from generated content", relative.display());
+            }
+            offset = end;
+        }
+        if offset != artifact.bytes.len() {
+            bail!("staged antenna spectrum artifact '{}' has an incomplete payload", relative.display());
+        }
+    }
+    Ok(())
+}
+
+fn publish_antenna_spectrum_artifacts_atomically(
+    current_stage_artifact_dir: &Path,
+    output_id: &str,
+    artifacts: &[fullmag_runner::AuxiliaryArtifact],
+    interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    publish_antenna_spectrum_artifacts_atomically_with_hook(
+        current_stage_artifact_dir,
+        output_id,
+        artifacts,
+        interrupt_requested,
+        None,
+    )
+}
+
+fn publish_antenna_spectrum_artifacts_atomically_with_hook(
+    current_stage_artifact_dir: &Path,
+    output_id: &str,
+    artifacts: &[fullmag_runner::AuxiliaryArtifact],
+    interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+    before_rename: Option<&dyn Fn() -> Result<()>>,
+) -> Result<()> {
+    let output_id_path = Path::new(output_id);
+    if output_id.trim().is_empty()
+        || output_id_path.components().count() != 1
+        || !matches!(
+            output_id_path.components().next(),
+            Some(Component::Normal(_))
+        )
+    {
+        bail!("antenna source-spectrum output_id '{output_id}' must be one safe path component");
+    }
+    if artifacts.is_empty() {
+        bail!("antenna source-spectrum output '{output_id}' produced no artifacts");
+    }
+    let output_prefix = Path::new("antenna").join("source_spectra").join(output_id);
+    let final_dir = current_stage_artifact_dir.join(&output_prefix);
+    let parent = final_dir
+        .parent()
+        .ok_or_else(|| anyhow!("antenna source-spectrum output has no parent directory"))?;
+    let mut normalized = Vec::with_capacity(artifacts.len());
+    let mut seen = std::collections::BTreeSet::new();
+    let mut has_manifest = false;
+    for artifact in artifacts {
+        let path = Path::new(&artifact.relative_path);
+        let relative = path.strip_prefix(&output_prefix).map_err(|_| {
+            anyhow!(
+                "antenna source-spectrum artifact '{}' is outside output '{}'",
+                artifact.relative_path,
+                output_id
+            )
+        })?;
+        if relative.as_os_str().is_empty()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            bail!(
+                "antenna source-spectrum artifact '{}' has an unsafe relative path",
+                artifact.relative_path
+            );
+        }
+        if !seen.insert(relative.to_string_lossy().into_owned()) {
+            bail!(
+                "antenna source-spectrum output '{}' contains duplicate artifact '{}'",
+                output_id,
+                relative.display()
+            );
+        }
+        if relative == Path::new("spectrum.v2.json") {
+            has_manifest = true;
+        }
+        normalized.push((relative.to_path_buf(), artifact));
+    }
+    if !has_manifest {
+        bail!(
+            "antenna source-spectrum output '{}' has no spectrum.v2.json manifest",
+            output_id
+        );
+    }
+    if synthetic_interrupt_requested(interrupt_requested) {
+        bail!("antenna source-spectrum stage was cancelled before publication");
+    }
+
+    if final_dir.exists() {
+        return verify_existing_antenna_spectrum_output(
+            &final_dir,
+            output_id,
+            &normalized,
+            interrupt_requested,
+        );
+    }
+
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "create antenna source-spectrum publication directory {}",
+            parent.display()
+        )
+    })?;
+    let staging_dir = parent.join(format!(
+        ".{output_id}.staging-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::create_dir(&staging_dir).with_context(|| {
+        format!(
+            "create antenna source-spectrum staging directory {}",
+            staging_dir.display()
+        )
+    })?;
+    let publish_result = (|| -> Result<()> {
+        normalized.sort_by_key(|(relative, _)| relative == Path::new("spectrum.v2.json"));
+        for (relative, artifact) in &normalized {
+            let target = staging_dir.join(relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&target, &artifact.bytes).with_context(|| {
+                format!(
+                    "write staged antenna source-spectrum artifact {}",
+                    target.display()
+                )
+            })?;
+        }
+        if synthetic_interrupt_requested(interrupt_requested) {
+            bail!("antenna source-spectrum stage was cancelled before publication");
+        }
+        if let Some(before_rename) = before_rename {
+            before_rename()?;
+        }
+        verify_staged_antenna_spectrum_output(&staging_dir, &normalized)?;
+        if synthetic_interrupt_requested(interrupt_requested) {
+            bail!("antenna source-spectrum stage was cancelled before publication");
+        }
+        fs::rename(&staging_dir, &final_dir).with_context(|| {
+            format!(
+                "atomically publish antenna source-spectrum output {}",
+                final_dir.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if publish_result.is_err() {
+        let _ = fs::remove_dir_all(&staging_dir);
+        if final_dir.exists() && !synthetic_interrupt_requested(interrupt_requested) {
+            return verify_existing_antenna_spectrum_output(
+                &final_dir,
+                output_id,
+                &normalized,
+                interrupt_requested,
+            );
+        }
+    }
+    publish_result
+}
+
+fn validate_antenna_spectrum_output_ids<'a>(
+    requests: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    let mut output_ids = std::collections::BTreeSet::new();
+    for (request_id, output_id) in requests {
+        if !output_ids.insert(output_id) {
+            bail!("antenna source-spectrum output_id '{output_id}' is declared more than once");
+        }
+        let output_id_path = Path::new(output_id);
+        if output_id.trim().is_empty()
+            || output_id_path.components().count() != 1
+            || !matches!(output_id_path.components().next(), Some(Component::Normal(_)))
+        {
+            bail!("antenna spectrum request '{request_id}' has an unsafe output_id");
+        }
+    }
+    Ok(())
+}
+
+fn execute_antenna_spectrum_requests(
+    problem: &ProblemIR,
+    artifact_dir: &Path,
+    current_stage_artifact_dir: &Path,
+    interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    if problem.antenna_spectrum_requests.is_empty() {
+        return Ok(());
+    }
+    validate_antenna_spectrum_output_ids(problem.antenna_spectrum_requests.iter()
+        .map(|request| (request.id.as_str(), request.output_id.as_str())))?;
+    let mut resolved_requests = Vec::with_capacity(problem.antenna_spectrum_requests.len());
+    for (request_index, request) in problem.antenna_spectrum_requests.iter().enumerate() {
+        if synthetic_interrupt_requested(interrupt_requested) {
+            bail!("antenna source-spectrum stage was cancelled before request '{}'", request.id);
+        }
+        let reference = request.solution_ref.published().ok_or_else(|| anyhow!(
+            "antenna spectrum request '{}' has an unresolved stage output '{}/{}'",
+            request.id,
+            request.solution_ref.stage_id(),
+            request.solution_ref.output_id()
+        ))?;
+        let stage_index = problem
+            .antenna_field_solve_stages
+            .iter()
+            .position(|stage| stage.id == request.solution_ref.stage_id())
+            .ok_or_else(|| {
+                anyhow!(
+                    "antenna spectrum request '{}' references missing solve stage '{}'",
+                    request.id,
+                    request.solution_ref.stage_id()
+                )
+            })?;
+        let stage = &problem.antenna_field_solve_stages[stage_index];
+        let port_mode_id = request
+            .port_mode_id
+            .as_deref()
+            .or_else(|| (stage.port_mode_ids.len() == 1).then(|| stage.port_mode_ids[0].as_str()))
+            .ok_or_else(|| {
+                anyhow!(
+                    "antenna spectrum request '{}' must identify one port mode for dependency validation",
+                    request.id
+                )
+            })?;
+        let expected = current_antenna_solution_expectation(
+            problem,
+            &stage.id,
+            port_mode_id,
+            reference.clone(),
+        )?;
+        resolved_requests.push((request_index, stage_index, port_mode_id.to_owned(), expected));
+    }
+    for (request_index, stage_index, port_mode_id, expected) in resolved_requests {
+        let request = &problem.antenna_spectrum_requests[request_index];
+        let stage = &problem.antenna_field_solve_stages[stage_index];
+        let reference = &expected.reference;
+        if synthetic_interrupt_requested(interrupt_requested) {
+            bail!("antenna source-spectrum stage was cancelled before request '{}'", request.id);
+        }
+        let asset = fullmag_runner::load_expected_antenna_field_solution(artifact_dir, &expected)
+            .map_err(|error| {
+                anyhow!(
+                    "load current antenna solution asset '{}' for spectrum request '{}': {}",
+                    reference.asset_id,
+                    request.id,
+                    error.message
+                )
+            })?;
+        let output_dir = current_stage_artifact_dir
+            .join("antenna/source_spectra")
+            .join(&request.output_id);
+        if fullmag_runner::reusable_antenna_source_spectrum_output(
+            &output_dir,
+            request,
+            &reference.output_id,
+            &stage.source_object_id,
+            &port_mode_id,
+            &reference.content_digest,
+            interrupt_requested,
+        )
+        .map_err(|error| anyhow!(
+            "inspect cached antenna spectrum request '{}': {}",
+            request.id,
+            error.message
+        ))? {
+            continue;
+        }
+        let samples = fullmag_runner::load_antenna_field_solution_samples_for_spectrum(
+            &asset.manifest_bytes,
+            &asset.payloads,
+            request,
+        )
+        .map_err(|error| {
+            anyhow!(
+                "load antenna spectrum source samples for request '{}': {}",
+                request.id,
+                error.message
+            )
+        })?;
+        let spectrum =
+            fullmag_runner::compute_antenna_source_spectrum_artifact_interruptible(
+                request,
+                &samples,
+                None,
+                interrupt_requested,
+            )
+                .map_err(|error| {
+                    anyhow!(
+                        "compute antenna source spectrum request '{}': {}",
+                        request.id,
+                        error.message
+                    )
+                })?;
+        let artifacts = fullmag_runner::antenna_source_spectrum_auxiliary_artifacts(&spectrum)
+            .map_err(|error| {
+                anyhow!(
+                    "serialize antenna source-spectrum request '{}': {}",
+                    request.id,
+                    error.message
+                )
+            })?;
+        fullmag_runner::verify_antenna_source_spectrum_auxiliary_artifacts(&artifacts)
+            .map_err(|error| anyhow!(
+                "verify antenna source-spectrum request '{}': {}",
+                request.id,
+                error.message
+            ))?;
+        publish_antenna_spectrum_artifacts_atomically(
+            current_stage_artifact_dir,
+            &request.output_id,
+            &artifacts,
+            interrupt_requested,
+        )?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -2862,8 +4540,17 @@ fn prepare_remesh_stage_transaction(
     object_region_markers: &[fullmag_ir::FemDomainRegionMarkerIR],
     adaptive_runtime_state: Option<&serde_json::Value>,
     first_stage_plan: Option<ExecutionPlanIR>,
+    source_scene_revision: Option<u64>,
 ) -> Result<PreparedRemeshStageTransaction> {
     let mut candidate_stages = stages.to_vec();
+    if let Some(revision) = source_scene_revision {
+        for stage in &mut candidate_stages {
+            stage.ir.problem_meta.runtime_metadata.insert(
+                "mesh_source_scene_revision".to_string(),
+                serde_json::json!(revision),
+            );
+        }
+    }
     apply_remeshed_problem_snapshot_to_stages(
         &mut candidate_stages,
         scene_problem_patch,
@@ -3145,38 +4832,236 @@ fn current_mesh_workspace(
     quality_summary: Option<&crate::python_bridge::RemeshQualitySummary>,
     mesh_history: &[serde_json::Value],
 ) -> Option<serde_json::Value> {
-    let (mesh, mesh_source, fe_order, hmax) = match &plan.backend_plan {
-        BackendPlanIR::Fem(fem) => (
+    match &plan.backend_plan {
+        BackendPlanIR::Fem(fem) => Some(current_fem_mesh_workspace(
+            problem,
             &fem.mesh,
             fem.mesh_source.as_deref(),
             fem.fe_order,
             fem.hmax,
-        ),
-        BackendPlanIR::FemEigen(fem) => (
+            status,
+            problem.problem_meta.runtime_metadata.get("adaptive_mesh"),
+            problem
+                .problem_meta
+                .runtime_metadata
+                .get("adaptive_mesh_runtime_state"),
+            quality_summary,
+            None,
+            None,
+            mesh_history,
+        )),
+        BackendPlanIR::FemEigen(fem) => Some(current_fem_mesh_workspace(
+            problem,
             &fem.mesh,
             fem.mesh_source.as_deref(),
             fem.fe_order,
             fem.hmax,
-        ),
-        _ => return None,
-    };
-    Some(current_fem_mesh_workspace(
-        problem,
-        mesh,
-        mesh_source,
-        fe_order,
-        hmax,
+            status,
+            problem.problem_meta.runtime_metadata.get("adaptive_mesh"),
+            problem
+                .problem_meta
+                .runtime_metadata
+                .get("adaptive_mesh_runtime_state"),
+            quality_summary,
+            None,
+            None,
+            mesh_history,
+        )),
+        BackendPlanIR::Fdm(fdm) => Some(current_fdm_mesh_workspace(fdm, status, mesh_history)),
+        BackendPlanIR::FdmMultilayer(fdm) => Some(current_fdm_multilayer_mesh_workspace(
+            fdm,
+            status,
+            mesh_history,
+        )),
+        _ => None,
+    }
+}
+
+fn current_fdm_mesh_workspace(
+    plan: &fullmag_ir::FdmPlanIR,
+    status: &str,
+    mesh_history: &[serde_json::Value],
+) -> serde_json::Value {
+    let certificate = plan.grid_certificate.as_ref();
+    let counts = certificate
+        .map(|certificate| certificate.counts)
+        .unwrap_or(plan.grid.cells);
+    let cell_size = certificate
+        .map(|certificate| certificate.cell_m)
+        .unwrap_or(plan.cell_size);
+    let origin = certificate
+        .map(|certificate| certificate.origin_m)
+        .unwrap_or(plan.origin_m);
+    let active_cells = certificate
+        .map(|certificate| certificate.active_cells)
+        .unwrap_or_else(|| {
+            plan.active_mask
+                .as_ref()
+                .map(|mask| mask.iter().filter(|active| **active).count() as u64)
+                .unwrap_or_else(|| {
+                    plan.region_mask
+                        .iter()
+                        .filter(|marker| **marker != 0)
+                        .count() as u64
+                })
+        });
+    let fingerprint = certificate
+        .map(|certificate| certificate.grid_fingerprint.clone())
+        .unwrap_or_else(|| format!("fdm-grid-{}x{}x{}", counts[0], counts[1], counts[2]));
+    fdm_mesh_workspace_value(
+        "fdm",
+        counts,
+        cell_size,
+        origin,
+        active_cells,
+        certificate.map(|certificate| certificate.estimated_bytes),
+        fingerprint,
         status,
-        problem.problem_meta.runtime_metadata.get("adaptive_mesh"),
-        problem
-            .problem_meta
-            .runtime_metadata
-            .get("adaptive_mesh_runtime_state"),
-        quality_summary,
-        None,
-        None,
         mesh_history,
-    ))
+        true,
+    )
+}
+
+fn current_fdm_multilayer_mesh_workspace(
+    plan: &fullmag_ir::FdmMultilayerPlanIR,
+    status: &str,
+    mesh_history: &[serde_json::Value],
+) -> serde_json::Value {
+    let certificate = plan.grid_certificate.as_ref();
+    let counts = certificate
+        .map(|certificate| certificate.counts)
+        .unwrap_or(plan.common_cells);
+    let first_layer = plan.layers.first();
+    let cell_size = certificate
+        .map(|certificate| certificate.cell_m)
+        .or_else(|| first_layer.map(|layer| layer.convolution_cell_size))
+        .unwrap_or([0.0, 0.0, 0.0]);
+    let origin = certificate
+        .map(|certificate| certificate.origin_m)
+        .or_else(|| first_layer.map(|layer| layer.convolution_origin))
+        .unwrap_or([0.0, 0.0, 0.0]);
+    let active_cells = certificate
+        .map(|certificate| certificate.active_cells)
+        .unwrap_or_else(|| {
+            plan.layers
+                .iter()
+                .map(|layer| {
+                    layer
+                        .native_active_mask
+                        .as_ref()
+                        .map(|mask| mask.iter().filter(|active| **active).count() as u64)
+                        .unwrap_or_else(|| {
+                            layer
+                                .native_grid
+                                .iter()
+                                .try_fold(1u64, |product, count| product.checked_mul(*count as u64))
+                                .unwrap_or(0)
+                        })
+                })
+                .sum()
+        });
+    let fingerprint = certificate
+        .map(|certificate| certificate.grid_fingerprint.clone())
+        .unwrap_or_else(|| format!("fdm-multilayer-{}x{}x{}", counts[0], counts[1], counts[2]));
+    fdm_mesh_workspace_value(
+        "fdm_multilayer",
+        counts,
+        cell_size,
+        origin,
+        active_cells,
+        certificate.map(|certificate| certificate.estimated_bytes),
+        fingerprint,
+        status,
+        mesh_history,
+        false,
+    )
+}
+
+fn fdm_mesh_workspace_value(
+    backend: &str,
+    counts: [u32; 3],
+    cell_size: [f64; 3],
+    origin: [f64; 3],
+    active_cells: u64,
+    estimated_bytes: Option<u64>,
+    fingerprint: String,
+    status: &str,
+    mesh_history: &[serde_json::Value],
+    supports_boundary_correction: bool,
+) -> serde_json::Value {
+    let total_cells = counts
+        .iter()
+        .try_fold(1u64, |product, count| product.checked_mul(*count as u64))
+        .unwrap_or(0);
+    let mesh_generation_id = format!("{backend}:{fingerprint}");
+    let estimated_bytes = estimated_bytes.unwrap_or_else(|| {
+        total_cells
+            .saturating_mul(3)
+            .saturating_mul(std::mem::size_of::<f64>() as u64)
+    });
+    serde_json::json!({
+        "mesh_summary": {
+            "mesh_id": mesh_generation_id,
+            "mesh_name": format!("{backend}-structured-grid"),
+            "backend": backend,
+            "source_kind": "planner_resolved_structured_grid",
+            "generation_id": mesh_generation_id,
+            "grid": { "cells": counts },
+            "cells": counts,
+            "cell_size": cell_size,
+            "cell_size_m": cell_size,
+            "origin": origin,
+            "origin_m": origin,
+            "total_cells": total_cells,
+            "active_cells": active_cells,
+            "grid_fingerprint": fingerprint,
+            "node_count": total_cells,
+            "element_count": 0,
+            "boundary_face_count": 0,
+            "domain_mesh_mode": "structured_grid",
+        },
+        "mesh_quality_summary": null,
+        "mesh_statistics": {
+            "backend": backend,
+            "total_cells": total_cells,
+            "active_cells": active_cells,
+            "mask_coverage": if total_cells > 0 { active_cells as f64 / total_cells as f64 } else { 0.0 },
+        },
+        "mesh_cost_report": {
+            "total_cells": total_cells,
+            "active_cells": active_cells,
+            "estimated_bytes": estimated_bytes,
+            "estimated_memory_mb": estimated_bytes as f64 / 1.0e6,
+            "status": status,
+        },
+        "mesh_pipeline_status": [
+            {"id": "grid", "label": "Grid", "status": if total_cells > 0 { "done" } else { "warning" }, "detail": format!("{} × {} × {} cells", counts[0], counts[1], counts[2])},
+            {"id": "membership", "label": "Membership mask", "status": if active_cells > 0 { "done" } else { "warning" }, "detail": format!("{} active magnetic cells", active_cells)},
+            {"id": "runtime", "label": "Runtime replan", "status": if status == "ready" || status == "awaiting_command" || status == "waiting_for_compute" { "done" } else { "active" }, "detail": "Execution plan and runtime are derived from the same committed scene snapshot"},
+            {"id": "readiness", "label": "Solver readiness", "status": if total_cells > 0 { "done" } else { "warning" }, "detail": status},
+        ],
+        "mesh_capabilities": {
+            "has_volume_mesh": false,
+            "has_structured_grid": true,
+            "has_membership_mask": active_cells > 0,
+            "has_quality_arrays": false,
+            "supports_adaptive_remesh": false,
+            "supports_compare_snapshots": true,
+            "supports_grid_replan": true,
+            "supports_size_field_remesh": false,
+            "supports_edge_distance_fields": false,
+            "supports_boundary_layers": supports_boundary_correction,
+            "supports_mesh_convergence_workflow": false,
+            "supports_mesh_error_preview": false,
+            "supports_target_h_preview": false,
+        },
+        "mesh_adaptivity_state": {
+            "enabled": false,
+            "policy": "manual",
+            "convergence_status": "not_applicable",
+        },
+        "mesh_history": mesh_history,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -3551,27 +5436,30 @@ fn overlay_mesh_workspace(
                 value
             }),
     );
+    let effective_airbox_target = overlay
+        .effective_airbox_target
+        .clone()
+        .or_else(|| obj.get("effective_airbox_target").cloned())
+        .unwrap_or(serde_json::Value::Null);
     obj.insert(
         "effective_airbox_target".to_string(),
-        overlay
-            .effective_airbox_target
-            .clone()
-            .unwrap_or(serde_json::Value::Null),
+        effective_airbox_target,
     );
+    let effective_per_object_targets = overlay
+        .effective_per_object_targets
+        .clone()
+        .or_else(|| obj.get("effective_per_object_targets").cloned())
+        .unwrap_or(serde_json::Value::Null);
     obj.insert(
         "effective_per_object_targets".to_string(),
-        overlay
-            .effective_per_object_targets
-            .clone()
-            .unwrap_or(serde_json::Value::Null),
+        effective_per_object_targets,
     );
-    obj.insert(
-        "last_build_summary".to_string(),
-        overlay
-            .last_build_summary
-            .clone()
-            .unwrap_or(serde_json::Value::Null),
-    );
+    let last_build_summary = overlay
+        .last_build_summary
+        .clone()
+        .or_else(|| obj.get("last_build_summary").cloned())
+        .unwrap_or(serde_json::Value::Null);
+    obj.insert("last_build_summary".to_string(), last_build_summary);
     obj.insert(
         "last_build_error".to_string(),
         overlay
@@ -3638,6 +5526,50 @@ fn stage_execution_from_records(
     }
 }
 
+fn mark_live_stage_execution_failed(
+    stage_execution: &mut Option<CurrentLiveStageExecutionState>,
+    completed_at_unix_ms: u128,
+) {
+    let Some(previous) = stage_execution.take() else {
+        return;
+    };
+    let mut stages = previous.stages;
+    let active_index = previous
+        .active_stage_index
+        .or_else(|| stages.iter().position(|stage| stage.status == "running"));
+    if let Some(active_index) = active_index.and_then(|index| stages.get_mut(index)) {
+        active_index.status = "failed".to_string();
+        active_index.completed_at_unix_ms = Some(millis_to_u64(completed_at_unix_ms));
+        active_index.progress_label = Some("failed".to_string());
+        active_index.last_progress_unix_ms = Some(millis_to_u64(completed_at_unix_ms));
+        active_index.parallel_execution = None;
+    }
+    *stage_execution = Some(stage_execution_from_records(&stages, None, None, "failed"));
+}
+
+fn preserve_completed_parallel_execution(
+    next: &mut CurrentLiveStageExecutionState,
+    previous: Option<&CurrentLiveStageExecutionState>,
+    stage_index: usize,
+) {
+    if next
+        .stages
+        .get(stage_index)
+        .is_none_or(|stage| stage.status != "completed")
+    {
+        return;
+    }
+    let Some(telemetry) = previous
+        .and_then(|state| state.stages.get(stage_index))
+        .and_then(|stage| stage.parallel_execution.clone())
+    else {
+        return;
+    };
+    if let Some(stage) = next.stages.get_mut(stage_index) {
+        stage.parallel_execution = Some(telemetry);
+    }
+}
+
 fn scripted_stage_execution_state(
     total_stages: usize,
     active_index: usize,
@@ -3653,10 +5585,18 @@ fn scripted_stage_execution_state(
     let mut stages = vec![
         CurrentLiveStageExecutionRecord {
             stage_id: None,
+            antenna_solve_stage_id: None,
             kind: None,
             status: "pending".to_string(),
             command_id: None,
+            mesh_generation_id: None,
+            mesh_topology_fingerprint: None,
+            mesh_revision: None,
             started_at_unix_ms: None,
+            applied_step: None,
+            completed_step: None,
+            applied_time_seconds: None,
+            segment_id: None,
             completed_at_unix_ms: None,
             reason: None,
             converged: false,
@@ -3682,10 +5622,14 @@ fn scripted_stage_execution_state(
             current_settle_step_index: None,
             current_settle_step_kind: None,
             current_settle_step_method: None,
+            parallel_execution: None,
         };
         total_stages
     ];
 
+    for (index, stage) in stages.iter_mut().enumerate() {
+        stage.stage_id = Some(format!("stage-{index:03}"));
+    }
     for stage in stages.iter_mut().take(active_index) {
         stage.status = "completed".to_string();
     }
@@ -3754,6 +5698,59 @@ fn scripted_stage_execution_state_with_completion(
         stage.threshold = completion.and_then(|value| value.threshold);
     }
     execution
+}
+
+fn attach_stage_antenna_solve_identity(
+    execution: &mut CurrentLiveStageExecutionState,
+    stage_index: usize,
+    action: Option<&ResolvedScriptStageAction>,
+) {
+    let Some(record) = execution.stages.get_mut(stage_index) else {
+        return;
+    };
+    record.antenna_solve_stage_id = match action {
+        Some(ResolvedScriptStageAction::AntennaExternalLeadInspection { input, .. }) => {
+            Some(input.stage.id.clone())
+        }
+        Some(ResolvedScriptStageAction::AntennaFieldSolve { stage_id, .. }) => {
+            Some(stage_id.clone())
+        }
+        _ => None,
+    };
+}
+
+fn attach_stage_fem_mesh_identity(
+    execution: &mut CurrentLiveStageExecutionState,
+    stage_index: usize,
+    asset: Option<&fullmag_runner::StageFemMeshAsset>,
+) {
+    let (Some(record), Some(asset)) = (execution.stages.get_mut(stage_index), asset) else {
+        return;
+    };
+    record.mesh_generation_id = Some(asset.identity.generation_id().to_string());
+    record.mesh_topology_fingerprint = Some(fullmag_runner::fem_mesh_topology_fingerprint(
+        &asset.payload,
+    ));
+}
+
+fn publish_scripted_stages_awaiting_command(execution: &mut CurrentLiveStageExecutionState) {
+    // Completed stages are history; the interactive owner still accepts commands.
+    *execution = stage_execution_from_records(&execution.stages, None, None, "awaiting_command");
+}
+
+fn attach_scripted_stage_solver_steps(
+    execution: &mut CurrentLiveStageExecutionState,
+    stage_index: usize,
+    boundary: Option<&CommandApplicationBoundary>,
+    completed_step: Option<u64>,
+) {
+    let Some(record) = execution.stages.get_mut(stage_index) else {
+        return;
+    };
+    record.applied_step = boundary.map(|boundary| boundary.applied_step);
+    record.applied_time_seconds = boundary.map(|boundary| boundary.applied_time_seconds);
+    record.segment_id = boundary.map(|boundary| boundary.segment_id.clone());
+    record.completed_step = completed_step;
 }
 
 fn preserve_terminal_stage_history(
@@ -3828,10 +5825,18 @@ fn user_cancelled_stage_completion(status: &str) -> fullmag_ir::StageCompletionI
 fn stage_record(index: usize, kind: Option<&str>) -> CurrentLiveStageExecutionRecord {
     CurrentLiveStageExecutionRecord {
         stage_id: Some(format!("stage-{index:03}")),
+        antenna_solve_stage_id: None,
         kind: kind.map(str::to_string),
         status: "pending".to_string(),
         command_id: None,
+        mesh_generation_id: None,
+        mesh_topology_fingerprint: None,
+        mesh_revision: None,
         started_at_unix_ms: None,
+        applied_step: None,
+        completed_step: None,
+        applied_time_seconds: None,
+        segment_id: None,
         completed_at_unix_ms: None,
         reason: None,
         converged: false,
@@ -3857,6 +5862,25 @@ fn stage_record(index: usize, kind: Option<&str>) -> CurrentLiveStageExecutionRe
         current_settle_step_index: None,
         current_settle_step_kind: None,
         current_settle_step_method: None,
+        parallel_execution: None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct CommandApplicationBoundary {
+    applied_step: u64,
+    applied_time_seconds: f64,
+    segment_id: String,
+}
+
+impl CommandApplicationBoundary {
+    fn new(run_id: &str, command_id: &str, applied_step: u64, applied_time_seconds: f64) -> Self {
+        let time_bits = applied_time_seconds.to_bits();
+        Self {
+            applied_step,
+            applied_time_seconds,
+            segment_id: format!("segment:{run_id}:{command_id}:{applied_step}:{time_bits:016x}"),
+        }
     }
 }
 
@@ -3896,6 +5920,7 @@ impl ActiveSequenceState {
         command_id: &str,
         started_at_unix_ms: u128,
         artifact_ref: Option<String>,
+        application_boundary: Option<&CommandApplicationBoundary>,
     ) {
         let current_index = self.current_stage_index();
         if current_index >= self.stages.len() {
@@ -3906,6 +5931,10 @@ impl ActiveSequenceState {
         record.status = "running".to_string();
         record.command_id = Some(command_id.to_string());
         record.started_at_unix_ms = Some(millis_to_u64(started_at_unix_ms));
+        record.applied_step = application_boundary.map(|boundary| boundary.applied_step);
+        record.applied_time_seconds =
+            application_boundary.map(|boundary| boundary.applied_time_seconds);
+        record.segment_id = application_boundary.map(|boundary| boundary.segment_id.clone());
         record.completed_at_unix_ms = None;
         record.progress_percent = Some(5.0);
         record.progress_label = Some("starting".to_string());
@@ -3915,6 +5944,23 @@ impl ActiveSequenceState {
             push_unique_artifact_ref(&mut record.artifact_refs, artifact_ref);
         }
         self.stages[current_index] = record;
+    }
+
+    fn mark_current_fem_mesh_identity(
+        &mut self,
+        asset: Option<&fullmag_runner::StageFemMeshAsset>,
+    ) {
+        let current_index = self.current_stage_index();
+        let Some(record) = self.stages.get_mut(current_index) else {
+            return;
+        };
+        let Some(asset) = asset else {
+            return;
+        };
+        record.mesh_generation_id = Some(asset.identity.generation_id().to_string());
+        record.mesh_topology_fingerprint = Some(fullmag_runner::fem_mesh_topology_fingerprint(
+            &asset.payload,
+        ));
     }
 
     fn mark_current_checkpoint_preserved(
@@ -3987,10 +6033,18 @@ impl ActiveSequenceState {
             }
             self.stages[current_index] = CurrentLiveStageExecutionRecord {
                 stage_id: previous.stage_id,
+                antenna_solve_stage_id: previous.antenna_solve_stage_id,
                 kind: previous.kind,
                 status: status.to_string(),
                 command_id: previous.command_id,
+                mesh_generation_id: previous.mesh_generation_id,
+                mesh_topology_fingerprint: previous.mesh_topology_fingerprint,
+                mesh_revision: previous.mesh_revision,
                 started_at_unix_ms: previous.started_at_unix_ms,
+                applied_step: previous.applied_step,
+                completed_step: previous.completed_step,
+                applied_time_seconds: previous.applied_time_seconds,
+                segment_id: previous.segment_id,
                 completed_at_unix_ms: completed_at_unix_ms
                     .map(millis_to_u64)
                     .or(previous.completed_at_unix_ms),
@@ -4031,6 +6085,9 @@ impl ActiveSequenceState {
                 current_settle_step_index: previous.current_settle_step_index,
                 current_settle_step_kind: previous.current_settle_step_kind,
                 current_settle_step_method: previous.current_settle_step_method,
+                parallel_execution: (status == "completed")
+                    .then_some(previous.parallel_execution)
+                    .flatten(),
             };
         }
     }
@@ -4293,6 +6350,32 @@ fn apply_current_fem_overrides(
     }
 }
 
+fn continuation_state_trace(values: &[[f64; 3]]) -> String {
+    let active = values
+        .iter()
+        .filter(|value| value.iter().any(|component| component.abs() > 0.0))
+        .count();
+    let max_transverse = values
+        .iter()
+        .map(|value| (value[1] * value[1] + value[2] * value[2]).sqrt())
+        .fold(0.0, f64::max);
+    format!(
+        "vectors={} active={} max_transverse={:.6e}",
+        values.len(),
+        active,
+        max_transverse
+    )
+}
+
+fn trace_continuation_state(label: &str, values: &[[f64; 3]]) {
+    if std::env::var_os("FULLMAG_TRACE_CONTINUATION").is_some() {
+        eprintln!(
+            "[fullmag] continuation {label}: {}",
+            continuation_state_trace(values)
+        );
+    }
+}
+
 fn attach_region_realization_revisions(
     problem: &mut ProblemIR,
     precondition: Option<&RuntimeCommandPrecondition>,
@@ -4338,613 +6421,6 @@ fn renormalize_magnetization(values: &mut [[f64; 3]]) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_manual_interactive_remesh(
-    command: &SessionCommand,
-    stages: &mut [ResolvedScriptStage],
-    stage_execution_plans: &mut [ExecutionPlanIR],
-    workspace_status: &str,
-    live_workspace: &LocalLiveWorkspace,
-    current_mesh_quality: &mut Option<crate::python_bridge::RemeshQualitySummary>,
-    current_mesh_history: &mut Vec<serde_json::Value>,
-    current_fem_mesh_override: &mut Option<fullmag_ir::MeshIR>,
-    current_fem_hmax_override: &mut Option<f64>,
-    current_adaptive_runtime_state: &Option<serde_json::Value>,
-) -> Result<()> {
-    let mesh_target = command
-        .mesh_target
-        .as_ref()
-        .ok_or_else(|| anyhow!("remesh command is missing mesh_target"))?;
-    if matches!(mesh_target, MeshCommandTarget::AdaptiveFollowup) {
-        bail!(
-            "interactive remesh does not accept mesh_target=adaptive_followup, got {:?}",
-            mesh_target
-        );
-    }
-    let opts = command
-        .mesh_options
-        .clone()
-        .unwrap_or(serde_json::json!({}));
-    let scene_problem_patch = scene_problem_patch_from_mesh_options(&opts)?;
-    let base_problem = stages
-        .first()
-        .map(|stage| stage.ir.clone())
-        .ok_or_else(|| anyhow!("interactive remesh requires at least one materialized stage"))?;
-    let base_execution_plan = stage_execution_plans
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow!("interactive remesh requires at least one materialized plan"))?;
-    let mut remesh_problem_source = base_problem;
-    if let Some(patch) = scene_problem_patch.as_ref() {
-        apply_scene_problem_patch(&mut remesh_problem_source, patch);
-    }
-    if let Some(source_scene_revision) = mesh_source_scene_revision(&opts) {
-        remesh_problem_source.problem_meta.runtime_metadata.insert(
-            "mesh_source_scene_revision".to_string(),
-            serde_json::json!(source_scene_revision),
-        );
-    }
-    let mesh_reason = command
-        .mesh_reason
-        .as_deref()
-        .unwrap_or("manual_ui_rebuild");
-    let mesh_target_label = match mesh_target {
-        MeshCommandTarget::StudyDomain => "study_domain".to_string(),
-        MeshCommandTarget::AdaptiveFollowup => "adaptive_followup".to_string(),
-        MeshCommandTarget::Airbox => "airbox".to_string(),
-        MeshCommandTarget::ObjectMesh { object_id } => format!("object_mesh:{object_id}"),
-    };
-    eprintln!(
-        "[fullmag] remesh requested with target={} reason={} options: {}",
-        mesh_target_label, mesh_reason, opts
-    );
-    live_workspace.push_log(
-        "info",
-        format!(
-            "Remesh requested — target={} · reason={} · options: {}",
-            mesh_target_label, mesh_reason, opts
-        ),
-    );
-    if mesh_reason == "airbox_parameter_changed" {
-        eprintln!(
-            "[fullmag] remesh note — airbox change requires full shared-domain remesh (ferromagnet geometry included)"
-        );
-        live_workspace.push_log(
-            "info",
-            "Airbox change requires full shared-domain remesh; ferromagnet mesh will also be regenerated",
-        );
-    }
-
-    let adaptive_mesh_runtime = remesh_problem_source
-        .problem_meta
-        .runtime_metadata
-        .get("adaptive_mesh")
-        .cloned();
-    let fem_plan = match &base_execution_plan.backend_plan {
-        BackendPlanIR::Fem(plan) => Some(plan),
-        _ => None,
-    };
-    let previous_periodic_mesh = remesh_problem_source
-        .geometry_assets
-        .as_ref()
-        .and_then(|assets| assets.fem_domain_mesh_asset.as_ref())
-        .and_then(|asset| asset.mesh.clone());
-
-    if let Some(plan) = fem_plan {
-        let shared_domain_remesh = matches!(
-            plan.domain_mesh_mode,
-            fullmag_ir::FemDomainMeshModeIR::SharedDomainMeshWithAir
-        );
-        let declared_universe = fem_declared_universe(&remesh_problem_source);
-        let geometry_entry = remesh_problem_source.geometry.entries.first().cloned();
-        let hmax = opts
-            .get("hmax")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(plan.hmax);
-        if shared_domain_remesh && mesh_reason == "airbox_parameter_changed" {
-            let airbox_hmax = declared_universe
-                .as_ref()
-                .and_then(|value| value.airbox_hmax);
-            match airbox_hmax {
-                Some(airbox_hmax) if airbox_hmax > 0.0 => {
-                    eprintln!(
-                        "[fullmag] shared-domain remesh scope — updating airbox grading only (airbox_hmax={:.3e} m, magnetic body hmax remains {:.3e} m)",
-                        airbox_hmax, hmax
-                    );
-                    live_workspace.push_log(
-                        "info",
-                        format!(
-                            "Shared-domain remesh scope — airbox grading update only (airbox_hmax={:.3e}, body_hmax={:.3e})",
-                            airbox_hmax, hmax
-                        ),
-                    );
-                }
-                _ => {
-                    eprintln!(
-                        "[fullmag] shared-domain remesh scope — rebuilding study mesh after airbox parameter change (magnetic body hmax remains {:.3e} m)",
-                        hmax
-                    );
-                    live_workspace.push_log(
-                        "info",
-                        format!(
-                            "Shared-domain remesh scope — airbox parameter change detected; body_hmax remains {:.3e}",
-                            hmax
-                        ),
-                    );
-                }
-            }
-        } else if shared_domain_remesh && mesh_reason.starts_with("object_mesh_override_changed") {
-            let object_id = mesh_reason
-                .strip_prefix("object_mesh_override_changed:")
-                .unwrap_or("selected_object");
-            let custom_override_count = opts
-                .get("per_geometry")
-                .and_then(|value| value.as_array())
-                .map(|entries| {
-                    entries
-                        .iter()
-                        .filter(|entry| {
-                            entry
-                                .get("mode")
-                                .and_then(|value| value.as_str())
-                                .map(|mode| mode == "custom")
-                                .unwrap_or(false)
-                        })
-                        .count()
-                })
-                .unwrap_or(0);
-            eprintln!(
-                "[fullmag] shared-domain remesh scope — applying local object sizing for {} (custom object overrides={}, default body hmax={:.3e} m)",
-                object_id, custom_override_count, hmax
-            );
-            live_workspace.push_log(
-                "info",
-                format!(
-                    "Shared-domain remesh scope — local object sizing for {} (custom overrides={}, default body hmax={:.3e})",
-                    object_id,
-                    custom_override_count,
-                    hmax
-                ),
-            );
-        }
-        eprintln!(
-            "[fullmag] meshing in progress — hmax={:.3e} m, order=P{} ...",
-            hmax, plan.fe_order
-        );
-        live_workspace.push_log(
-            "info",
-            format!(
-                "Meshing in progress — hmax={:.3e}, order=P{}",
-                hmax, plan.fe_order
-            ),
-        );
-        let build_overlay = Arc::new(Mutex::new(CurrentMeshBuildOverlay {
-            active_build: Some(mesh_build_intent_json(mesh_target, mesh_reason, &opts)),
-            effective_airbox_target: None,
-            effective_per_object_targets: None,
-            last_build_summary: None,
-            last_build_error: None,
-            active_phase: Some("queued".to_string()),
-            progress_percent: None,
-            progress_label: None,
-            attempt_index: None,
-            algorithm_3d: None,
-            attempt_status: None,
-            attempt_failure_reason: None,
-            next_algorithm_3d: None,
-            progress_kind: None,
-            last_recoverable_attempt: None,
-            phase_started_at: Instant::now(),
-            phase_durations_ms: Vec::new(),
-            failed: false,
-        }));
-        live_workspace.update(|state| {
-            let mut workspace = state
-                .mesh_workspace
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({}));
-            let overlay = build_overlay
-                .lock()
-                .expect("mesh build overlay mutex poisoned")
-                .clone();
-            overlay_mesh_workspace(&mut workspace, &overlay);
-            state.mesh_workspace = Some(workspace);
-        });
-        let mesh_start = std::time::Instant::now();
-        let remesh_progress_stage = Arc::new(Mutex::new(None::<RemeshTerminalProgress>));
-        let remesh_progress_callback = Some({
-            let live_workspace = live_workspace.clone();
-            let remesh_progress_stage = Arc::clone(&remesh_progress_stage);
-            let build_overlay = Arc::clone(&build_overlay);
-            Arc::new(move |event: PythonProgressEvent| {
-                let terminal_update = match &event {
-                    PythonProgressEvent::Message(message) => {
-                        if message.trim_start().starts_with("json:") {
-                            None
-                        } else {
-                            match map_remesh_progress_message(message) {
-                                Some(stage) => {
-                                    let mut guard = remesh_progress_stage
-                                        .lock()
-                                        .expect("remesh progress mutex poisoned");
-                                    if guard.as_ref() == Some(&stage)
-                                        && !gmsh_indeterminate_heartbeat(message)
-                                    {
-                                        None
-                                    } else {
-                                        *guard = Some(stage);
-                                        if let Ok(mut overlay) = build_overlay.lock() {
-                                            update_mesh_overlay_from_terminal_progress(
-                                                &mut overlay,
-                                                stage,
-                                            );
-                                            let overlay_snapshot = overlay.clone();
-                                            live_workspace.update(|state| {
-                                                let mut workspace = state
-                                                    .mesh_workspace
-                                                    .clone()
-                                                    .unwrap_or_else(|| serde_json::json!({}));
-                                                overlay_mesh_workspace(
-                                                    &mut workspace,
-                                                    &overlay_snapshot,
-                                                );
-                                                state.mesh_workspace = Some(workspace);
-                                            });
-                                        }
-                                        Some(match stage.percent {
-                                            Some(percent) => format!(
-                                                "[fullmag] remesh {percent:02}% - {}",
-                                                stage.label
-                                            ),
-                                            None => format!(
-                                                "[fullmag] remesh active (indeterminate) - {}",
-                                                stage.label
-                                            ),
-                                        })
-                                    }
-                                }
-                                None => Some(format!("[fullmag] remesh info - {}", message)),
-                            }
-                        }
-                    }
-                    PythonProgressEvent::FemSurfacePreview { .. } => None,
-                    PythonProgressEvent::Structured { kind, payload } => {
-                        if let Ok(mut overlay) = build_overlay.lock() {
-                            if update_mesh_attempt_overlay_from_payload(&mut overlay, kind, payload)
-                            {
-                                let overlay_snapshot = overlay.clone();
-                                live_workspace.update(|state| {
-                                    let mut workspace = state
-                                        .mesh_workspace
-                                        .clone()
-                                        .unwrap_or_else(|| serde_json::json!({}));
-                                    overlay_mesh_workspace(&mut workspace, &overlay_snapshot);
-                                    state.mesh_workspace = Some(workspace);
-                                });
-                            }
-                        }
-                        payload
-                            .get("message")
-                            .and_then(|value| value.as_str())
-                            .map(|message| format!("[fullmag] remesh info - {}", message))
-                    }
-                };
-                apply_python_progress_event(&live_workspace, event);
-                if let Some(line) = terminal_update {
-                    eprintln!("{}", line);
-                }
-            }) as PythonProgressCallback
-        });
-
-        let remesh_attempt = if shared_domain_remesh {
-            let declared_universe = declared_universe.ok_or_else(|| {
-                anyhow!(
-                    "shared-domain remesh requires a declared universe in domain_frame or study_universe metadata"
-                )
-            })?;
-            let declared_universe_value = serde_json::to_value(&declared_universe)
-                .context("failed to serialize declared universe for shared-domain remesh")?;
-            let object_region_mesh_specs =
-                shared_domain_object_region_mesh_specs(&remesh_problem_source)?;
-            invoke_shared_domain_remesh_full(
-                &remesh_problem_source.geometry.entries,
-                &object_region_mesh_specs,
-                &declared_universe_value,
-                hmax,
-                plan.fe_order,
-                &opts,
-                remesh_progress_callback,
-            )
-        } else {
-            let geom = geometry_entry
-                .as_ref()
-                .ok_or_else(|| anyhow!("no geometry entry available"))?;
-            invoke_remesh_full(geom, hmax, plan.fe_order, &opts, remesh_progress_callback)
-        };
-
-        match remesh_attempt {
-            Ok(remesh_result) => {
-                let elapsed = mesh_start.elapsed();
-                let new_mesh = remesh_result.clone().into_mesh_ir();
-                if let Some(previous_mesh) = previous_periodic_mesh.as_ref() {
-                    validate_periodic_remesh_candidate(previous_mesh, &new_mesh)?;
-                }
-                let node_count = new_mesh.nodes.len();
-                let elem_count = new_mesh.cell_count();
-                let face_count = new_mesh.facet_count();
-                let remeshed_mesh_source = if shared_domain_remesh {
-                    None
-                } else {
-                    plan.mesh_source.clone()
-                };
-                let (live_mesh_payload, remeshed_magnetization, remeshed_plan) = {
-                    let mut remeshed_problem = remesh_problem_source.clone();
-                    apply_current_fem_overrides(
-                        &mut remeshed_problem,
-                        Some(&new_mesh),
-                        Some(hmax),
-                        current_adaptive_runtime_state.as_ref(),
-                    );
-                    if shared_domain_remesh {
-                        let region_markers = if remesh_result.region_markers.is_empty() {
-                            default_domain_region_markers(&remeshed_problem.geometry.entries)
-                        } else {
-                            remesh_result.region_markers.clone()
-                        };
-                        let object_region_markers = resolved_shared_domain_object_region_markers(
-                            &remeshed_problem,
-                            &remesh_result.object_region_markers,
-                        )?;
-                        let domain_asset = remeshed_problem
-                            .geometry_assets
-                            .as_mut()
-                            .and_then(|assets| assets.fem_domain_mesh_asset.as_mut())
-                            .ok_or_else(|| {
-                                anyhow!(
-                                    "shared-domain remesh produced a domain mesh but no fem_domain_mesh_asset is attached"
-                                )
-                            })?;
-                        domain_asset.region_markers = region_markers;
-                        domain_asset.object_region_markers = object_region_markers;
-                    }
-                    let remeshed_plan = fullmag_plan::plan(&remeshed_problem)
-                        .map_err(|error| anyhow!(error.to_string()))?;
-                    let magnetization =
-                        current_stage_magnetization_vectors(None, &remeshed_plan.backend_plan);
-                    let mesh_payload =
-                        fem_mesh_payload_from_backend_plan(&remeshed_plan.backend_plan)
-                            .ok_or_else(|| {
-                                anyhow!("updated backend plan did not produce a FEM mesh payload")
-                            })?;
-                    (mesh_payload, magnetization, remeshed_plan)
-                };
-                let prepared_remesh = prepare_remesh_stage_transaction(
-                    stages,
-                    stage_execution_plans,
-                    scene_problem_patch.as_ref(),
-                    &new_mesh,
-                    hmax,
-                    shared_domain_remesh,
-                    &remesh_result.region_markers,
-                    &remesh_result.object_region_markers,
-                    current_adaptive_runtime_state.as_ref(),
-                    Some(remeshed_plan.clone()),
-                )?;
-                live_workspace.push_log(
-                    "success",
-                    format!(
-                        "Remesh complete — {} nodes, {} elements, {} boundary faces ({:.1}s)",
-                        node_count,
-                        elem_count,
-                        face_count,
-                        elapsed.as_secs_f64()
-                    ),
-                );
-                eprintln!(
-                    "[fullmag] ✓ remesh complete — {} nodes, {} elements ({:.1}s)",
-                    node_count,
-                    elem_count,
-                    elapsed.as_secs_f64()
-                );
-                if node_count > 50_000 {
-                    live_workspace.push_log(
-                        "warn",
-                        format!(
-                            "⛔ Mesh has {} nodes — CPU dense solver will likely OOM. Increase hmax.",
-                            node_count
-                        ),
-                    );
-                } else if node_count > 10_000 {
-                    live_workspace.push_log(
-                        "warn",
-                        format!(
-                            "⚠ Mesh has {} nodes — may be slow with CPU dense solver.",
-                            node_count
-                        ),
-                    );
-                }
-                live_workspace.push_log(
-                    "info",
-                    format!(
-                        "Magnetization texture re-sampled on the new mesh — {} vectors",
-                        remeshed_magnetization.len()
-                    ),
-                );
-                *current_mesh_quality = remesh_result.quality.clone();
-                *current_fem_mesh_override = Some(new_mesh.clone());
-                *current_fem_hmax_override = Some(hmax);
-                stages.clone_from_slice(&prepared_remesh.stages);
-                stage_execution_plans.clone_from_slice(&prepared_remesh.stage_execution_plans);
-                current_mesh_history.push(serde_json::json!({
-                    "mesh_name": new_mesh.mesh_name,
-                    "generation_mode": remesh_result.generation_mode,
-                    "node_count": node_count,
-                    "element_count": elem_count,
-                    "boundary_face_count": face_count,
-                    "quality": remesh_result.quality.as_ref().map(|quality| serde_json::json!({
-                        "sicn_p5": quality.sicn_p5,
-                        "gamma_min": quality.gamma_min,
-                        "avg_quality": quality.avg_quality,
-                    })),
-                    "mesh_target": mesh_target_label.clone(),
-                    "mesh_reason": mesh_reason,
-                    "mesh_provenance": remesh_result.mesh_provenance.clone(),
-                    "mesh_statistics": remesh_result.mesh_statistics.clone(),
-                    "size_field_stats": remesh_result.size_field_stats.clone(),
-                    "quality_data_artifact": remesh_result.quality_data_artifact.clone(),
-                }));
-                live_workspace.update(|state| {
-                    state.live_state.latest_step.fem_mesh_generation_id =
-                        live_mesh_payload.generation_id.clone();
-                    state.fem_mesh = Some(live_mesh_payload);
-                    state.live_state.latest_step.magnetization =
-                        Some(flatten_magnetization(&remeshed_magnetization));
-                    let mut workspace = current_fem_mesh_workspace(
-                        &remesh_problem_source,
-                        &new_mesh,
-                        remeshed_mesh_source.as_deref(),
-                        plan.fe_order,
-                        hmax,
-                        workspace_status,
-                        adaptive_mesh_runtime.as_ref(),
-                        current_adaptive_runtime_state.as_ref(),
-                        current_mesh_quality.as_ref(),
-                        remesh_result.quality_data_artifact.as_ref(),
-                        remesh_result.mesh_statistics.as_ref(),
-                        current_mesh_history,
-                    );
-                    let provenance = remesh_result
-                        .mesh_provenance
-                        .as_ref()
-                        .and_then(|value| value.as_object());
-                    let summary = serde_json::json!({
-                        "kind": "mesh_build_summary",
-                        "mesh_target": mesh_target_label.clone(),
-                        "mesh_reason": mesh_reason,
-                        "geometry_realization": mesh_geometry_realization_json(&opts),
-                        "source_scene_revision": opts
-                            .get("geometry_realization")
-                            .and_then(|value| value.get("source_scene_revision"))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "realization_revision": opts
-                            .get("geometry_realization")
-                            .and_then(|value| value.get("realization_revision"))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "shared_domain_build_mode": provenance
-                            .and_then(|value| value.get("shared_domain_build_mode"))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "effective_airbox_target": provenance
-                            .and_then(|value| value.get("effective_airbox_target"))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "effective_per_object_targets": provenance
-                            .and_then(|value| value.get("effective_per_object_targets"))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "used_size_field_kinds": provenance
-                            .and_then(|value| value.get("used_size_field_kinds"))
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!([])),
-                        "fallbacks_triggered": provenance
-                            .and_then(|value| value.get("fallbacks_triggered"))
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!([])),
-                        "operation_statuses": provenance
-                            .and_then(|value| value.get("operation_statuses"))
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!([])),
-                        "thin_film_diagnostics": provenance
-                            .and_then(|value| value.get("thin_film_diagnostics"))
-                            .cloned()
-                            .unwrap_or_else(|| serde_json::json!([])),
-                        "shared_domain_build_report": provenance
-                            .and_then(|value| value.get("shared_domain_build_report"))
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null),
-                        "mesh_statistics": remesh_result
-                            .mesh_statistics
-                            .clone()
-                            .unwrap_or(serde_json::Value::Null),
-                        "n_nodes": node_count,
-                        "n_elements": elem_count,
-                        "n_boundary_faces": face_count,
-                    });
-                    if let Ok(mut overlay) = build_overlay.lock() {
-                        overlay.active_build = None;
-                        overlay.effective_airbox_target = provenance
-                            .and_then(|value| value.get("effective_airbox_target"))
-                            .cloned();
-                        overlay.effective_per_object_targets = provenance
-                            .and_then(|value| value.get("effective_per_object_targets"))
-                            .cloned();
-                        overlay.last_build_summary = Some(summary);
-                        overlay.last_build_error = None;
-                        transition_mesh_build_phase(&mut overlay, "ready");
-                        overlay.progress_percent = Some(100);
-                        overlay.progress_label = Some("mesh ready".to_string());
-                        overlay.failed = false;
-                        let overlay_snapshot = overlay.clone();
-                        overlay_mesh_workspace(&mut workspace, &overlay_snapshot);
-                    }
-                    state.mesh_workspace = Some(workspace);
-                });
-            }
-            Err(error) => {
-                let elapsed = mesh_start.elapsed();
-                eprintln!(
-                    "[fullmag] ✗ remesh FAILED after {:.1}s: {}",
-                    elapsed.as_secs_f64(),
-                    error
-                );
-                live_workspace.push_log("error", format!("Remesh failed: {}", error));
-                if let Ok(mut overlay) = build_overlay.lock() {
-                    overlay.active_build = None;
-                    overlay.last_build_summary = Some(serde_json::json!({
-                        "kind": "mesh_build_failed",
-                        "phase": overlay.active_phase.clone(),
-                        "attempt_index": overlay.attempt_index,
-                        "algorithm_3d": overlay.algorithm_3d.clone(),
-                        "attempt_status": overlay.attempt_status.clone(),
-                        "attempt_failure_reason": overlay.attempt_failure_reason.clone(),
-                        "next_algorithm_3d": overlay.next_algorithm_3d.clone(),
-                        "last_recoverable_attempt": overlay.last_recoverable_attempt.clone(),
-                        "error": error.to_string(),
-                        "duration_ms": saturating_duration_millis_u64(elapsed),
-                    }));
-                    overlay.last_build_error = Some(error.to_string());
-                    overlay.active_phase = Some(
-                        overlay
-                            .active_phase
-                            .clone()
-                            .unwrap_or_else(|| "meshing".to_string()),
-                    );
-                    overlay.failed = true;
-                    let overlay_snapshot = overlay.clone();
-                    live_workspace.update(|state| {
-                        let mut workspace = state
-                            .mesh_workspace
-                            .clone()
-                            .unwrap_or_else(|| serde_json::json!({}));
-                        overlay_mesh_workspace(&mut workspace, &overlay_snapshot);
-                        state.mesh_workspace = Some(workspace);
-                    });
-                }
-            }
-        }
-    } else {
-        eprintln!("[fullmag] ✗ cannot remesh — no FEM plan available (wrong backend?)");
-        live_workspace.push_log(
-            "warn",
-            "Cannot remesh — no FEM plan available (wrong backend?)",
-        );
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
 fn maybe_execute_adaptive_relaxation_followup_passes(
     stage: &mut ResolvedScriptStage,
     execution_plan: &mut ExecutionPlanIR,
@@ -4959,7 +6435,6 @@ fn maybe_execute_adaptive_relaxation_followup_passes(
     current_stage_artifact_dir: &Path,
     field_every_n: u64,
     global_step_offset: u64,
-    global_time_offset: f64,
     current_mesh_quality: &mut Option<crate::python_bridge::RemeshQualitySummary>,
     current_mesh_history: &mut Vec<serde_json::Value>,
     current_fem_mesh_override: &mut Option<fullmag_ir::MeshIR>,
@@ -4971,6 +6446,11 @@ fn maybe_execute_adaptive_relaxation_followup_passes(
     };
     if !settings.enabled || settings.policy != "auto" || settings.max_passes == 0 {
         return Ok(false);
+    }
+    if let Some(reason) = adaptive_remesh_backend_legality_reason(&execution_plan.backend_plan) {
+        return Err(anyhow!(
+            "{reason}: generic adaptive remeshing cannot preserve the non-overlapping shared magnetic-domain and airbox topology"
+        ));
     }
     if let Some(reason) = adaptive_remesh_legality_reason(&stage.ir) {
         return Err(anyhow!(
@@ -5024,11 +6504,14 @@ fn maybe_execute_adaptive_relaxation_followup_passes(
     let mut afem_history = fullmag_engine::fem_afem_loop::AfemHistory::new();
     let mut remesh_pass_count = 0u32;
     let mut local_step_offset = stage_result.steps.last().map(|step| step.step).unwrap_or(0);
-    let mut local_time_offset = stage_result
+    let mut physical_end_time_s = stage_result
         .steps
         .last()
         .map(|step| step.time)
-        .unwrap_or(0.0);
+        .unwrap_or(stage.ir.problem_meta.runtime_metadata
+            .get("stage_start_time_s")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0));
     let mut mutated = false;
     let mut previous_solve_summary: Option<RelaxationSolveSummary> = None;
     let torque_mode = torque_display_mode(&stage.ir);
@@ -5326,6 +6809,10 @@ fn maybe_execute_adaptive_relaxation_followup_passes(
             Some(&remeshed_runtime_state),
         );
         apply_continuation_initial_state(&mut candidate_stage.ir, &transferred_magnetization)?;
+        candidate_stage.ir.problem_meta.runtime_metadata.insert(
+            "stage_start_time_s".to_string(),
+            serde_json::json!(physical_end_time_s),
+        );
 
         let candidate_execution_plan =
             fullmag_plan::plan(&candidate_stage.ir).map_err(|error| anyhow!(error.to_string()))?;
@@ -5395,7 +6882,7 @@ fn maybe_execute_adaptive_relaxation_followup_passes(
             Some(remeshed_mesh_asset.identity.generation_id().to_string()),
         );
         adaptive_initial_update.stats.step += global_step_offset + local_step_offset;
-        adaptive_initial_update.stats.time += global_time_offset + local_time_offset;
+        adaptive_initial_update.stats.time = physical_end_time_s;
         let mut stage_heartbeat = Some(StageProgressHeartbeat::spawn(
             adaptive_initial_update,
             live_workspace.clone(),
@@ -5420,7 +6907,7 @@ fn maybe_execute_adaptive_relaxation_followup_passes(
                 let mut adjusted = offset_step_update(
                     update,
                     global_step_offset + local_step_offset,
-                    global_time_offset + local_time_offset,
+                    0.0,
                     false,
                 );
                 if let Some(heartbeat) = stage_heartbeat.as_mut() {
@@ -5476,11 +6963,10 @@ fn maybe_execute_adaptive_relaxation_followup_passes(
         }
         let pass_result = pass_result.map_err(|error| anyhow!(error.message))?;
 
-        let pass_steps =
-            offset_step_stats(&pass_result.steps, local_step_offset, local_time_offset);
+        let pass_steps = offset_step_stats(&pass_result.steps, local_step_offset, 0.0);
         if let Some(last) = pass_steps.last() {
             local_step_offset = last.step;
-            local_time_offset = last.time;
+            physical_end_time_s = last.time;
         }
         stage_result.steps.extend(pass_steps);
         stage_result.final_magnetization = pass_result.final_magnetization;
@@ -5513,6 +6999,8 @@ pub(crate) fn build_session_manifest(
     finished_at_unix_ms: u128,
     plan_summary: serde_json::Value,
 ) -> SessionManifest {
+    // A managed run's receipt reports the latest requested/resolved selection.
+    crate::script_launch::note_runtime(runtime);
     SessionManifest {
         session_id: session_id.to_string(),
         run_id: run_id.to_string(),
@@ -5573,6 +7061,7 @@ pub(crate) fn run_manifest_from_steps(
         final_e_ext: steps.last().map(|step| step.e_ext),
         final_e_ani: steps.last().map(|step| step.e_ani),
         final_e_dmi: steps.last().map(|step| step.e_dmi),
+        final_e_rotated_dmi: steps.last().map(|step| step.e_rotated_dmi),
         final_e_total: steps.last().map(|step| step.e_total),
         artifact_dir: artifact_dir.display().to_string(),
     }
@@ -5583,6 +7072,63 @@ struct PausedInteractiveStage {
     command: SessionCommand,
     source_kind: String,
     checkpoint_ref: Option<String>,
+    waveform_origin_time_s: f64,
+    requires_exact_waveform_clock: bool,
+}
+
+fn elapsed_stage_seconds(
+    result: &fullmag_runner::RunResult,
+    stage_start_time_s: f64,
+    frame: fullmag_runner::StageStepTimeFrame,
+) -> Result<f64> {
+    let Some(last) = result.steps.last() else {
+        return Ok(0.0);
+    };
+    let elapsed = match frame {
+        fullmag_runner::StageStepTimeFrame::StageLocal => last.time,
+        fullmag_runner::StageStepTimeFrame::Absolute => last.time - stage_start_time_s,
+    };
+    if !elapsed.is_finite() || elapsed < 0.0 {
+        bail!("runner reported an invalid elapsed stage time {elapsed}");
+    }
+    Ok(elapsed)
+}
+
+fn has_time_dependent_stage_drive(problem: &ProblemIR) -> bool {
+    let dynamic = |waveform: &fullmag_ir::TimeDependenceIR| {
+        !matches!(waveform, fullmag_ir::TimeDependenceIR::Constant)
+    };
+    let active_stage_id = problem
+        .problem_meta
+        .runtime_metadata
+        .get("active_stage_id")
+        .and_then(serde_json::Value::as_str);
+    let study_kind = problem.study.kind();
+    problem.field_drives.iter().any(|drive| {
+        drive.enabled
+            && drive.activation.is_active_for(study_kind, active_stage_id)
+            && dynamic(&drive.waveform)
+    })
+        || problem
+            .solved_antenna_drives
+            .iter()
+            .any(|drive| {
+                drive.activation.is_active_for(study_kind, active_stage_id)
+                    && dynamic(&drive.waveform)
+            })
+        || problem.current_modules.iter().any(|module| match module {
+            fullmag_ir::CurrentModuleIR::AntennaFieldSource { drive, waveform, .. } => {
+                drive.as_ref()
+                    .and_then(|drive| drive.waveform.as_ref())
+                    .is_some_and(dynamic)
+                    || waveform.as_ref().is_some_and(dynamic)
+            }
+            fullmag_ir::CurrentModuleIR::CurrentTransport { time_envelope, .. } => {
+                time_envelope.as_ref().is_some_and(|envelope| {
+                    !matches!(envelope, fullmag_ir::TimeEnvelopeIR::Constant { .. })
+                })
+            }
+        })
 }
 
 struct PauseCheckpointProvider {
@@ -5651,8 +7197,7 @@ fn capture_pause_checkpoint(
     backend_plan: &BackendPlanIR,
     stage_artifact_dir: &Path,
 ) -> Result<fullmag_session::CaptureResult> {
-    let store_root = repo_root()
-        .join(".fullmag")
+    let store_root = runtime_state_root(&repo_root())
         .join("local-live")
         .join("session-store");
     let store = fullmag_session::SessionStore::open(store_root)?;
@@ -5666,6 +7211,7 @@ fn capture_pause_checkpoint(
             zeeman: step.map(|value| value.e_ext).unwrap_or(0.0),
             anisotropy: step.map(|value| value.e_ani).unwrap_or(0.0),
             dmi: step.map(|value| value.e_dmi).unwrap_or(0.0),
+            rotated_dmi: step.map(|value| value.e_rotated_dmi).unwrap_or(0.0),
             total: step.map(|value| value.e_total).unwrap_or(0.0),
         },
         magnetization: magnetization.to_vec(),
@@ -5703,6 +7249,7 @@ fn pause_checkpoint_compatibility(
 
 fn backend_plan_family(backend_plan: &BackendPlanIR) -> &'static str {
     match backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => "antenna_external_lead_inspection",
         BackendPlanIR::Fdm(_) => "fdm",
         BackendPlanIR::FdmMultilayer(_) => "fdm_multilayer",
         BackendPlanIR::Fem(_) => "fem",
@@ -5754,6 +7301,9 @@ fn print_script_summary(summary: &ScriptRunSummary) {
     if let Some(final_e_dmi) = summary.final_e_dmi {
         println!("- final_E_dmi: {:.6e} J", final_e_dmi);
     }
+    if let Some(final_e_rotated_dmi) = summary.final_e_rotated_dmi {
+        println!("- final_E_rotated_dmi: {:.6e} J", final_e_rotated_dmi);
+    }
     if let Some(final_e_total) = summary.final_e_total {
         println!("- final_E_total: {:.6e} J", final_e_total);
     }
@@ -5798,22 +7348,25 @@ fn refresh_problem_preview_state(
         apply_continuation_initial_state(&mut problem, previous_final_magnetization)?;
     }
 
+    let plan = crate::antenna_workflow::plan_antenna_observation(&problem, live_workspace)?;
     let preview_request = display_selection.preview_request();
     let (preview_field, cached_fields, auxiliary_artifacts) = if refresh_mode
         == ProblemPreviewRefreshMode::MaterializeFields
     {
         let cached_quantities = fullmag_runner::quantities::field_materialization_quantity_ids();
         let materialization_request = full_field_materialization_request(preview_request.clone());
-        let batch = fullmag_runner::snapshot_problem_vector_field_batch(
+        let batch = fullmag_runner::snapshot_planned_problem_vector_field_batch(
             &problem,
+            &plan,
             &cached_quantities,
             &materialization_request,
         )?;
-        let preview_field = fullmag_runner::snapshot_problem_preview(&problem, &preview_request)?;
+        let preview_field =
+            fullmag_runner::snapshot_planned_problem_preview(&problem, &plan, &preview_request)?;
         (preview_field, Some(batch.fields), batch.auxiliary_artifacts)
     } else {
         (
-            fullmag_runner::snapshot_problem_preview(&problem, &preview_request)?,
+            fullmag_runner::snapshot_planned_problem_preview(&problem, &plan, &preview_request)?,
             None,
             Vec::new(),
         )
@@ -5841,7 +7394,8 @@ fn refresh_problem_energy_state(
         apply_continuation_initial_state(&mut problem, previous_final_magnetization)?;
     }
 
-    let mut runtime = fullmag_runner::create_interactive_runtime(&problem, None)
+    let plan = crate::antenna_workflow::plan_antenna_observation(&problem, live_workspace)?;
+    let mut runtime = fullmag_runner::create_planned_interactive_runtime(&problem, &plan, None)
         .map_err(|error| anyhow!(error.to_string()))?;
     let step_stats = runtime
         .snapshot_step_stats()
@@ -5857,6 +7411,7 @@ fn refresh_problem_energy_state(
         state.live_state.latest_step.e_ext = step_stats.e_ext;
         state.live_state.latest_step.e_ani = step_stats.e_ani;
         state.live_state.latest_step.e_dmi = step_stats.e_dmi;
+        state.live_state.latest_step.e_rotated_dmi = step_stats.e_rotated_dmi;
         state.live_state.latest_step.e_total = step_stats.e_total;
         state.live_state.latest_step.max_dm_dt = step_stats.max_dm_dt;
         state.live_state.latest_step.max_h_eff = step_stats.max_h_eff;
@@ -5879,7 +7434,10 @@ fn is_control_checkpoint_only(update: &fullmag_runner::StepUpdate) -> bool {
 }
 
 fn wait_for_solve_supported(backend_plan: &BackendPlanIR) -> bool {
-    matches!(backend_plan, BackendPlanIR::Fdm(_) | BackendPlanIR::Fem(_))
+    matches!(
+        backend_plan,
+        BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_) | BackendPlanIR::Fem(_)
+    )
 }
 
 fn wait_for_solve_should_block(requested: bool, supported: bool, headless: bool) -> bool {
@@ -5922,8 +7480,8 @@ fn classify_wait_for_solve_command(kind: &str) -> WaitForSolveCommandAction {
         "compute_fields" => WaitForSolveCommandAction::RefreshFields,
         "compute_energies" => WaitForSolveCommandAction::RefreshEnergies,
         "set_solver_profile" => WaitForSolveCommandAction::ConfigureProfiler,
-        "solve" | "compute" | "run" => WaitForSolveCommandAction::StartSolver,
-        "remesh" => WaitForSolveCommandAction::Remesh,
+        "solve" | "compute" | "run" | "relax" => WaitForSolveCommandAction::StartSolver,
+        "remesh" | "fdm_grid_refresh" => WaitForSolveCommandAction::Remesh,
         "stop" => WaitForSolveCommandAction::Stop,
         _ => WaitForSolveCommandAction::Ignore,
     }
@@ -6054,6 +7612,7 @@ fn current_stage_magnetization_vectors(
         return current.to_vec();
     }
     match backend_plan {
+        BackendPlanIR::AntennaExternalLeadInspection(_) => Vec::new(),
         BackendPlanIR::Fdm(fdm) => fdm.initial_magnetization.clone(),
         BackendPlanIR::FdmMultilayer(fdm) => fdm
             .layers
@@ -6200,6 +7759,287 @@ fn write_synthetic_stage_record(
     Ok(())
 }
 
+const ANTENNA_STAGE_OUTPUT_CATALOG_NAME: &str = "stage_output_catalog.v1.json";
+
+#[derive(serde::Deserialize)]
+struct ReadyAntennaStageOutputCatalog {
+    schema_version: String,
+    stage_id: String,
+    stage_kind: String,
+    port_mode_id: String,
+    status: String,
+    outputs: Vec<ReadyAntennaStageOutput>,
+}
+
+#[derive(serde::Deserialize)]
+struct ReadyAntennaStageOutput {
+    kind: String,
+    output_id: String,
+    solution_ref: fullmag_ir::AntennaFieldSolutionRefIR,
+    manifest_ref: String,
+    quantity_ids: Vec<String>,
+}
+
+fn read_ready_antenna_stage_outputs(
+    path: &Path,
+    artifact_dir: &Path,
+    expected_stage_id: &str,
+    expected_port_mode_id: &str,
+) -> Result<Vec<fullmag_ir::AntennaFieldSolutionRefIR>> {
+    let catalog: ReadyAntennaStageOutputCatalog = serde_json::from_slice(
+        &fs::read(path)
+            .with_context(|| format!("read antenna stage output catalog {}", path.display()))?,
+    )
+    .with_context(|| format!("parse antenna stage output catalog {}", path.display()))?;
+    if catalog.schema_version != "stage_output_catalog.v1"
+        || catalog.status != "ready"
+        || catalog.stage_kind != "antenna_field_solve"
+        || catalog.stage_id != expected_stage_id
+        || catalog.port_mode_id != expected_port_mode_id
+        || catalog.outputs.is_empty()
+    {
+        bail!(
+            "antenna stage output catalog {} is not the expected ready output",
+            path.display()
+        );
+    }
+    let mut output_ids = std::collections::BTreeSet::new();
+    let artifact_root = fs::canonicalize(artifact_dir).with_context(|| {
+        format!("resolve antenna artifact directory {}", artifact_dir.display())
+    })?;
+    catalog
+        .outputs
+        .into_iter()
+        .map(|output| {
+            let reference = output.solution_ref;
+            let manifest_ref = Path::new(&output.manifest_ref);
+            let solution_dir = Path::new("antenna")
+                .join("field_solutions")
+                .join(&reference.output_id);
+            let revision_manifest = solution_dir
+                .join(&reference.asset_id)
+                .join("manifest.v1.json");
+            let legacy_manifest = solution_dir.join("manifest.v1.json");
+            let manifest_path = artifact_dir.join(manifest_ref);
+            let manifest_available = !manifest_ref.as_os_str().is_empty()
+                && (manifest_ref == revision_manifest.as_path()
+                    || manifest_ref == legacy_manifest.as_path())
+                && manifest_ref.components().all(|component| matches!(component, std::path::Component::Normal(_)))
+                && fs::canonicalize(&manifest_path).ok().is_some_and(|resolved| {
+                    resolved.starts_with(&artifact_root) && resolved.is_file()
+                });
+            if output.kind != "antenna_field_solution"
+                || !output.quantity_ids.iter().any(|quantity| quantity == "H_ant_basis")
+                || !output_ids.insert(output.output_id.clone())
+                || output.output_id != reference.output_id
+                || reference.stage_id != expected_stage_id
+                || reference.asset_id.trim().is_empty()
+                || reference.content_digest.trim().is_empty()
+                || !manifest_available
+            {
+                bail!(
+                    "antenna stage output catalog {} contains an incompatible reference",
+                    path.display()
+                );
+            }
+            let asset = fullmag_runner::load_published_antenna_field_solution_for_port(
+                artifact_dir,
+                &reference,
+                expected_port_mode_id,
+            ).map_err(|error| anyhow!(
+                "verify antenna stage output catalog asset: {}", error.message
+            ))?;
+            if asset.manifest_bytes != fs::read(&manifest_path)? {
+                bail!("antenna stage output catalog manifest differs from the verified asset");
+            }
+            Ok(reference)
+        })
+        .collect()
+}
+
+fn antenna_stage_output_catalog_path(current_stage_artifact_dir: &Path) -> PathBuf {
+    current_stage_artifact_dir.join(ANTENNA_STAGE_OUTPUT_CATALOG_NAME)
+}
+
+fn relative_artifact_ref(artifact_dir: &Path, path: &Path) -> Result<String> {
+    let artifact_root = fs::canonicalize(artifact_dir)?;
+    let manifest = fs::canonicalize(path)?;
+    let relative = manifest.strip_prefix(&artifact_root).with_context(|| {
+        format!(
+            "antenna manifest {} is outside artifact directory {}",
+            path.display(),
+            artifact_dir.display()
+        )
+    })?;
+    if relative.as_os_str().is_empty()
+        || !relative.components().all(|component| matches!(component, std::path::Component::Normal(_)))
+        || !manifest.starts_with(&artifact_root)
+        || !manifest.is_file()
+    {
+        bail!("antenna manifest {} is not a file inside artifact directory {}", path.display(), artifact_dir.display());
+    }
+    Ok(relative
+        .to_str()
+        .context("antenna manifest path is not UTF-8")?
+        .replace('\\', "/"))
+}
+
+fn write_antenna_stage_output_catalog(
+    current_stage_artifact_dir: &Path,
+    payload: &serde_json::Value,
+) -> Result<()> {
+    write_antenna_stage_output_catalog_with_hook(
+        current_stage_artifact_dir,
+        payload,
+        None,
+    )
+}
+
+fn write_antenna_stage_output_catalog_with_hook(
+    current_stage_artifact_dir: &Path,
+    payload: &serde_json::Value,
+    before_rename: Option<&dyn Fn() -> Result<()>>,
+) -> Result<()> {
+    fs::create_dir_all(current_stage_artifact_dir).with_context(|| {
+        format!(
+            "creating antenna stage artifact directory {}",
+            current_stage_artifact_dir.display()
+        )
+    })?;
+    let path = antenna_stage_output_catalog_path(current_stage_artifact_dir);
+    let bytes = serde_json::to_vec_pretty(payload)
+        .context("serializing antenna stage output catalog")?;
+    if path.exists() {
+        let existing = fs::read(&path).with_context(|| {
+            format!("reading existing antenna stage output catalog {}", path.display())
+        })?;
+        if existing == bytes {
+            if let Some(before_rename) = before_rename {
+                before_rename()?;
+            }
+            return Ok(());
+        }
+        bail!(
+            "antenna stage output catalog already exists with different content: {}",
+            path.display()
+        );
+    }
+
+    let temporary = current_stage_artifact_dir.join(format!(
+        ".{ANTENNA_STAGE_OUTPUT_CATALOG_NAME}.tmp-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let write_result = (|| -> Result<()> {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .and_then(|mut file| file.write_all(&bytes))
+            .with_context(|| {
+                format!(
+                    "writing temporary antenna stage output catalog {}",
+                    temporary.display()
+                )
+            })?;
+        if let Some(before_rename) = before_rename {
+            before_rename()?;
+        }
+        fs::hard_link(&temporary, &path).with_context(|| {
+            format!(
+                "publishing antenna stage output catalog {}",
+                path.display()
+            )
+        })?;
+        let _ = fs::remove_file(&temporary);
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temporary);
+        if path.exists() && fs::read(&path).ok().as_deref() == Some(bytes.as_slice()) {
+            if let Some(before_rename) = before_rename {
+                before_rename()?;
+            }
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn write_antenna_stage_output_catalog_ready(
+    current_stage_artifact_dir: &Path,
+    artifact_dir: &Path,
+    stage_id: &str,
+    port_mode_id: &str,
+    reference: &fullmag_ir::AntennaFieldSolutionRefIR,
+    manifest_path: &Path,
+    quantity_ids: &[String],
+    reused_existing: bool,
+    interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    let before_rename = || {
+        if synthetic_interrupt_requested(interrupt_requested) {
+            bail!("{SYNTHETIC_ANTENNA_CANCELLED}");
+        }
+        Ok(())
+    };
+    write_antenna_stage_output_catalog_with_hook(
+        current_stage_artifact_dir,
+        &serde_json::json!({
+            "schema_version": "stage_output_catalog.v1",
+            "stage_id": stage_id,
+            "stage_kind": "antenna_field_solve",
+            "port_mode_id": port_mode_id,
+            "status": "ready",
+            "outputs": [{
+                "kind": "antenna_field_solution",
+                "output_id": reference.output_id,
+                "solution_ref": reference,
+                "manifest_ref": relative_artifact_ref(artifact_dir, manifest_path)?,
+                "quantity_ids": quantity_ids,
+                "reused_existing": reused_existing,
+            }],
+        }),
+        Some(&before_rename),
+    )
+}
+
+fn write_antenna_stage_output_catalog_terminal(
+    current_stage_artifact_dir: &Path,
+    stage_id: &str,
+    solution_id: &str,
+    port_mode_id: &str,
+    status: &str,
+    diagnostic: &str,
+) -> Result<()> {
+    write_antenna_stage_output_catalog(
+        current_stage_artifact_dir,
+        &serde_json::json!({
+            "schema_version": "stage_output_catalog.v1",
+            "stage_id": stage_id,
+            "stage_kind": "antenna_field_solve",
+            "solution_id": solution_id,
+            "port_mode_id": port_mode_id,
+            "status": status,
+            "outputs": [],
+            "diagnostic": diagnostic,
+        }),
+    )
+}
+
+fn synthetic_stage_artifact_ref(
+    action: &ResolvedScriptStageAction,
+    current_stage_artifact_dir: &Path,
+) -> PathBuf {
+    if matches!(action, ResolvedScriptStageAction::AntennaExternalLeadInspection { .. }) {
+        current_stage_artifact_dir.join(antenna_external_lead_inspection::STAGE_OUTPUT_NAME)
+    } else if matches!(action, ResolvedScriptStageAction::AntennaFieldSolve { .. }) {
+        antenna_stage_output_catalog_path(current_stage_artifact_dir)
+    } else {
+        current_stage_artifact_dir.to_path_buf()
+    }
+}
+
 fn write_sampling_resolution_stage_record(
     current_stage_artifact_dir: &Path,
     sampling_resolution: Option<&serde_json::Value>,
@@ -6223,6 +8063,82 @@ struct SyntheticStageOutcome {
     message: String,
 }
 
+const SYNTHETIC_ANTENNA_CANCELLED: &str =
+    "antenna field solve cancelled: interrupt_requested";
+
+fn synthetic_interrupt_requested(
+    interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+) -> bool {
+    interrupt_requested.is_some_and(|signal| {
+        signal.load(std::sync::atomic::Ordering::Acquire)
+    })
+}
+
+fn update_antenna_live_stage_progress(
+    execution: &mut CurrentLiveStageExecutionState,
+    stage_index: usize,
+    phase: fullmag_runner::AntennaFieldStageStatus,
+    diagnostic: Option<String>,
+    at_unix_ms: u64,
+) -> bool {
+    if execution.active_stage_index != Some(stage_index) {
+        return false;
+    }
+    let Some(stage) = execution.stages.get_mut(stage_index) else {
+        return false;
+    };
+    if stage.status != "running" {
+        return false;
+    }
+    let (label, default_detail) = match phase {
+        fullmag_runner::AntennaFieldStageStatus::Meshing =>
+            ("mesh reused", "using meshes resolved by the planner"),
+        fullmag_runner::AntennaFieldStageStatus::SolvingCurrent =>
+            ("solving current", "solving the static conductor current"),
+        fullmag_runner::AntennaFieldStageStatus::EvaluatingField =>
+            ("evaluating field", "evaluating the antenna Oersted field"),
+        fullmag_runner::AntennaFieldStageStatus::ProjectingTargets =>
+            ("publishing field basis", "publishing the resolved target field basis"),
+        _ => return false,
+    };
+    stage.progress_label = Some(label.to_string());
+    stage.progress_detail = Some(diagnostic.unwrap_or_else(|| default_detail.into()));
+    stage.last_progress_unix_ms = Some(at_unix_ms);
+    true
+}
+
+fn record_cancelled_antenna_stage(
+    lifecycle: &mut fullmag_runner::AntennaFieldStageState,
+    stage_id: &str,
+    port_mode_id: &str,
+    current_stage_artifact_dir: &Path,
+    diagnostic: &str,
+) -> Result<()> {
+    lifecycle.transition(
+        fullmag_runner::AntennaFieldStageStatus::Cancelled,
+        Some(diagnostic.to_string()),
+    )?;
+    let solution_id = lifecycle.solution_id.clone();
+    write_synthetic_stage_record(
+        current_stage_artifact_dir,
+        serde_json::json!({
+            "kind": "antenna_field_solve",
+            "stage_id": stage_id,
+            "port_mode_id": port_mode_id,
+            "stage_state": lifecycle,
+        }),
+    )?;
+    write_antenna_stage_output_catalog_terminal(
+        current_stage_artifact_dir,
+        stage_id,
+        &solution_id,
+        port_mode_id,
+        "cancelled",
+        diagnostic,
+    )?;
+    Ok(())
+}
+
 fn execute_synthetic_stage(
     action: &ResolvedScriptStageAction,
     artifact_dir: &Path,
@@ -6230,7 +8146,392 @@ fn execute_synthetic_stage(
     backend_plan: &BackendPlanIR,
     continuation_magnetization: Option<&[[f64; 3]]>,
 ) -> Result<SyntheticStageOutcome> {
+    execute_synthetic_stage_with_interrupt(
+        action,
+        None,
+        artifact_dir,
+        current_stage_artifact_dir,
+        backend_plan,
+        continuation_magnetization,
+        None,
+        None,
+    )
+}
+
+fn execute_synthetic_stage_with_interrupt(
+    action: &ResolvedScriptStageAction,
+    problem: Option<&ProblemIR>,
+    artifact_dir: &Path,
+    current_stage_artifact_dir: &Path,
+    backend_plan: &BackendPlanIR,
+    continuation_magnetization: Option<&[[f64; 3]]>,
+    interrupt_requested: Option<&std::sync::atomic::AtomicBool>,
+    mut progress_observer: Option<
+        &mut dyn FnMut(fullmag_runner::AntennaFieldStageStatus, Option<String>),
+    >,
+) -> Result<SyntheticStageOutcome> {
     match action {
+        ResolvedScriptStageAction::AntennaExternalLeadInspection {
+            input,
+            requested_execution,
+            output_id,
+        } => antenna_external_lead_inspection::execute(
+            input,
+            requested_execution,
+            output_id,
+            artifact_dir,
+            current_stage_artifact_dir,
+            backend_plan,
+            continuation_magnetization,
+            interrupt_requested,
+            progress_observer,
+        ),
+        ResolvedScriptStageAction::AntennaSourceSpectrum { request_id } => {
+            if synthetic_interrupt_requested(interrupt_requested) {
+                bail!("antenna source-spectrum stage was cancelled before execution");
+            }
+            let mut analysis = problem
+                .context("antenna source-spectrum stage requires its resolved ProblemIR")?
+                .clone();
+            analysis.antenna_spectrum_requests.retain(|request| request.id == *request_id);
+            if analysis.antenna_spectrum_requests.len() != 1 {
+                bail!("antenna source-spectrum request '{}' is missing from this stage", request_id);
+            }
+            execute_antenna_spectrum_requests(
+                &analysis,
+                artifact_dir,
+                current_stage_artifact_dir,
+                interrupt_requested,
+            )?;
+            write_synthetic_stage_record(
+                current_stage_artifact_dir,
+                serde_json::json!({"kind": "antenna_source_spectrum", "request_id": request_id}),
+            )?;
+            Ok(SyntheticStageOutcome {
+                magnetization: current_stage_magnetization_vectors(continuation_magnetization, backend_plan),
+                message: format!("Computed antenna source spectrum '{}'", request_id),
+            })
+        }
+        ResolvedScriptStageAction::AddSolvedAntennaDrive { projection_id, drive_id } => {
+            let vectors = current_stage_magnetization_vectors(continuation_magnetization, backend_plan);
+            write_synthetic_stage_record(
+                current_stage_artifact_dir,
+                serde_json::json!({
+                    "kind": "add_solved_antenna_drive",
+                    "projection_id": projection_id,
+                    "drive_id": drive_id,
+                    "vector_count": vectors.len(),
+                }),
+            )?;
+            Ok(SyntheticStageOutcome {
+                magnetization: vectors,
+                message: format!("Registered solved antenna drive '{}'", drive_id),
+            })
+        }
+        ResolvedScriptStageAction::AntennaFieldSolve {
+            stage_id,
+            port_mode_id,
+            plan,
+        } => {
+            let mut lifecycle = fullmag_runner::AntennaFieldStageState {
+                stage_id: stage_id.clone(),
+                solution_id: plan.solution_id.clone(),
+                status: fullmag_runner::AntennaFieldStageStatus::Missing,
+                transitions: Vec::new(),
+                signatures: None,
+                diagnostic: None,
+            };
+            if synthetic_interrupt_requested(interrupt_requested) {
+                lifecycle.transition(fullmag_runner::AntennaFieldStageStatus::Queued, None)?;
+                record_cancelled_antenna_stage(
+                    &mut lifecycle,
+                    stage_id,
+                    port_mode_id,
+                    current_stage_artifact_dir,
+                    SYNTHETIC_ANTENNA_CANCELLED,
+                )?;
+                bail!("{SYNTHETIC_ANTENNA_CANCELLED}");
+            }
+            let cache_state =
+                fullmag_runner::inspect_cached_antenna_field_solution(artifact_dir, plan)?;
+            if let fullmag_runner::AntennaFieldSolutionCacheState::Stale {
+                expected_asset_id,
+                cached_asset_id,
+                manifest_path,
+            } = &cache_state
+            {
+                lifecycle.transition(
+                    fullmag_runner::AntennaFieldStageStatus::Stale,
+                    Some(format!(
+                        "immutable field solution is stale: cached_asset_id={cached_asset_id} expected_asset_id={expected_asset_id} manifest_path={}",
+                        manifest_path.display()
+                    )),
+                )?;
+                lifecycle.transition(
+                    fullmag_runner::AntennaFieldStageStatus::Queued,
+                    Some("re-solving stale immutable field solution".into()),
+                )?;
+            } else {
+                lifecycle.transition(fullmag_runner::AntennaFieldStageStatus::Queued, None)?;
+            }
+
+            if synthetic_interrupt_requested(interrupt_requested) {
+                record_cancelled_antenna_stage(
+                    &mut lifecycle,
+                    stage_id,
+                    port_mode_id,
+                    current_stage_artifact_dir,
+                    SYNTHETIC_ANTENNA_CANCELLED,
+                )?;
+                bail!("{SYNTHETIC_ANTENNA_CANCELLED}");
+            }
+
+            if let fullmag_runner::AntennaFieldSolutionCacheState::Ready(cached) = cache_state {
+                let reuse_diagnostic = "reused verified immutable field solution".to_string();
+                lifecycle.transition(
+                    fullmag_runner::AntennaFieldStageStatus::ProjectingTargets,
+                    Some(reuse_diagnostic.clone()),
+                )?;
+                if let Some(observer) = progress_observer.as_deref_mut() {
+                    observer(
+                        fullmag_runner::AntennaFieldStageStatus::ProjectingTargets,
+                        Some(reuse_diagnostic),
+                    );
+                }
+                if synthetic_interrupt_requested(interrupt_requested) {
+                    record_cancelled_antenna_stage(
+                        &mut lifecycle,
+                        stage_id,
+                        port_mode_id,
+                        current_stage_artifact_dir,
+                        SYNTHETIC_ANTENNA_CANCELLED,
+                    )?;
+                    bail!("{SYNTHETIC_ANTENNA_CANCELLED}");
+                }
+                let quantity_ids = vec!["H_ant_basis".to_string()];
+                if let Err(error) = write_antenna_stage_output_catalog_ready(
+                    current_stage_artifact_dir,
+                    artifact_dir,
+                    stage_id,
+                    port_mode_id,
+                    &cached.reference,
+                    &cached.manifest_path,
+                    &quantity_ids,
+                    true,
+                    interrupt_requested,
+                ) {
+                    if synthetic_interrupt_requested(interrupt_requested) {
+                        record_cancelled_antenna_stage(
+                            &mut lifecycle,
+                            stage_id,
+                            port_mode_id,
+                            current_stage_artifact_dir,
+                            SYNTHETIC_ANTENNA_CANCELLED,
+                        )?;
+                    }
+                    return Err(error);
+                }
+                lifecycle.signatures = Some(cached.signatures.clone());
+                lifecycle.transition(fullmag_runner::AntennaFieldStageStatus::Ready, None)?;
+                write_synthetic_stage_record(
+                    current_stage_artifact_dir,
+                    serde_json::json!({
+                        "kind": "antenna_field_solve",
+                        "stage_id": stage_id,
+                        "port_mode_id": port_mode_id,
+                        "solution_id": cached.reference.output_id,
+                        "asset_id": cached.reference.asset_id,
+                        "content_digest": cached.reference.content_digest,
+                        "manifest_path": cached.manifest_path.display().to_string(),
+                        "reused_existing": true,
+                        "quantity_ids": ["H_ant_basis"],
+                        "stage_state": lifecycle,
+                    }),
+                )?;
+                let vectors =
+                    current_stage_magnetization_vectors(continuation_magnetization, backend_plan);
+                return Ok(SyntheticStageOutcome {
+                    magnetization: vectors,
+                    message: format!(
+                        "Reused immutable antenna field basis '{}' for port '{}'.",
+                        cached.reference.output_id, cached.reference.stage_id
+                    ),
+                });
+            }
+
+            let result = match fullmag_runner::execute_antenna_field_solve_plan_with_progress_interruptible(
+                plan,
+                interrupt_requested,
+                &mut |status, diagnostic| {
+                    lifecycle.transition(status, diagnostic.clone())?;
+                    if let Some(observer) = progress_observer.as_deref_mut() {
+                        observer(status, diagnostic);
+                    }
+                    Ok(())
+                },
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    let diagnostic = error.to_string();
+                    if synthetic_interrupt_requested(interrupt_requested) {
+                        record_cancelled_antenna_stage(
+                            &mut lifecycle,
+                            stage_id,
+                            port_mode_id,
+                            current_stage_artifact_dir,
+                            &diagnostic,
+                        )?;
+                    } else {
+                        let _ = lifecycle.transition(
+                            fullmag_runner::AntennaFieldStageStatus::Failed,
+                            Some(diagnostic.clone()),
+                        );
+                        let _ = write_synthetic_stage_record(
+                            current_stage_artifact_dir,
+                            serde_json::json!({
+                                "kind": "antenna_field_solve",
+                                "stage_id": stage_id,
+                                "port_mode_id": port_mode_id,
+                                "stage_state": lifecycle,
+                            }),
+                        );
+                    }
+                    return Err(error.into());
+                }
+            };
+            if synthetic_interrupt_requested(interrupt_requested) {
+                record_cancelled_antenna_stage(
+                    &mut lifecycle,
+                    stage_id,
+                    port_mode_id,
+                    current_stage_artifact_dir,
+                    SYNTHETIC_ANTENNA_CANCELLED,
+                )?;
+                bail!("{SYNTHETIC_ANTENNA_CANCELLED}");
+            }
+            lifecycle.transition(
+                fullmag_runner::AntennaFieldStageStatus::ProjectingTargets,
+                None,
+            )?;
+            if let Some(observer) = progress_observer.as_deref_mut() {
+                observer(fullmag_runner::AntennaFieldStageStatus::ProjectingTargets, None);
+            }
+            if synthetic_interrupt_requested(interrupt_requested) {
+                record_cancelled_antenna_stage(
+                    &mut lifecycle,
+                    stage_id,
+                    port_mode_id,
+                    current_stage_artifact_dir,
+                    SYNTHETIC_ANTENNA_CANCELLED,
+                )?;
+                bail!("{SYNTHETIC_ANTENNA_CANCELLED}");
+            }
+            let published = match fullmag_runner::publish_antenna_field_solution_atomically_interruptible(
+                artifact_dir,
+                &result,
+                interrupt_requested,
+            ) {
+                Ok(published) => published,
+                Err(error) => {
+                    let diagnostic = error.to_string();
+                    if synthetic_interrupt_requested(interrupt_requested) {
+                        record_cancelled_antenna_stage(
+                            &mut lifecycle,
+                            stage_id,
+                            port_mode_id,
+                            current_stage_artifact_dir,
+                            &diagnostic,
+                        )?;
+                    } else {
+                        let _ = lifecycle.transition(
+                            fullmag_runner::AntennaFieldStageStatus::Failed,
+                            Some(diagnostic.clone()),
+                        );
+                        let _ = write_synthetic_stage_record(
+                            current_stage_artifact_dir,
+                            serde_json::json!({
+                                "kind": "antenna_field_solve",
+                                "stage_id": stage_id,
+                                "port_mode_id": port_mode_id,
+                                "stage_state": lifecycle,
+                            }),
+                        );
+                    }
+                    return Err(error.into());
+                }
+            };
+            if synthetic_interrupt_requested(interrupt_requested) {
+                record_cancelled_antenna_stage(
+                    &mut lifecycle,
+                    stage_id,
+                    port_mode_id,
+                    current_stage_artifact_dir,
+                    SYNTHETIC_ANTENNA_CANCELLED,
+                )?;
+                bail!("{SYNTHETIC_ANTENNA_CANCELLED}");
+            }
+            let quantity_ids = result
+                .quantities
+                .iter()
+                .map(|quantity| quantity.quantity_id.clone())
+                .collect::<Vec<_>>();
+            if let Err(error) = write_antenna_stage_output_catalog_ready(
+                current_stage_artifact_dir,
+                artifact_dir,
+                stage_id,
+                port_mode_id,
+                &published.reference,
+                &published.manifest_path,
+                &quantity_ids,
+                published.reused_existing,
+                interrupt_requested,
+            ) {
+                if synthetic_interrupt_requested(interrupt_requested) {
+                    record_cancelled_antenna_stage(
+                        &mut lifecycle,
+                        stage_id,
+                        port_mode_id,
+                        current_stage_artifact_dir,
+                        SYNTHETIC_ANTENNA_CANCELLED,
+                    )?;
+                }
+                return Err(error);
+            }
+            lifecycle.signatures = Some(published.signatures.clone());
+            lifecycle.transition(fullmag_runner::AntennaFieldStageStatus::Ready, None)?;
+            write_synthetic_stage_record(
+                current_stage_artifact_dir,
+                serde_json::json!({
+                    "kind": "antenna_field_solve",
+                    "stage_id": stage_id,
+                    "port_mode_id": port_mode_id,
+                    "solution_id": result.solution_id,
+                    "asset_id": published.reference.asset_id,
+                    "content_digest": published.reference.content_digest,
+                    "manifest_path": published.manifest_path.display().to_string(),
+                    "reused_existing": published.reused_existing,
+                    "quantity_ids": quantity_ids,
+                    "transport_provenance": result.transport_provenance,
+                    "stage_state": lifecycle,
+                }),
+            )?;
+            let vectors =
+                current_stage_magnetization_vectors(continuation_magnetization, backend_plan);
+            Ok(SyntheticStageOutcome {
+                magnetization: vectors,
+                message: format!(
+                    "Solved antenna field basis '{}' for port '{}' ({}{}).",
+                    result.solution_id,
+                    result.port_mode_id,
+                    published.reference.asset_id,
+                    if published.reused_existing {
+                        ", reused immutable asset"
+                    } else {
+                        ""
+                    }
+                ),
+            })
+        }
         ResolvedScriptStageAction::SaveState {
             artifact_name,
             format,
@@ -6534,12 +8835,54 @@ fn resolve_preview_field_every_n(
     })
 }
 
+const DEFAULT_AUTO_RAYON_THREAD_CAP: usize = 16;
+
+fn parse_positive_thread_count(raw: Option<&str>) -> Option<usize> {
+    raw.and_then(|value| value.parse::<usize>().ok())
+        .filter(|&threads| threads >= 1)
+}
+
+fn resolve_rayon_cpu_threads(
+    default_cpu_threads: usize,
+    fullmag_cpu_threads: Option<&str>,
+    rayon_cpu_threads: Option<&str>,
+    external_auto_resolved: Option<&str>,
+) -> (usize, bool) {
+    if fullmag_cpu_threads.is_some_and(|value| value.eq_ignore_ascii_case("auto")) {
+        let external = parse_positive_thread_count(external_auto_resolved);
+        return (
+            external
+                .unwrap_or(DEFAULT_AUTO_RAYON_THREAD_CAP)
+                .min(default_cpu_threads.max(1)),
+            true,
+        );
+    }
+    (
+        parse_positive_thread_count(fullmag_cpu_threads)
+            .or_else(|| parse_positive_thread_count(rayon_cpu_threads))
+            .unwrap_or(default_cpu_threads.max(1)),
+        false,
+    )
+}
+
 pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
-    let args = ScriptCli::parse_from(raw_args);
+    let mut args = ScriptCli::parse_from(raw_args);
+    let ui_plan = crate::script_launch::ui_plan(&args);
+    if ui_plan == crate::script_launch::UiPlan::None {
+        // `--ui none` is the headless web side.
+        args.headless = true;
+    }
+    if let Some(port) = args.api_port {
+        // `--api-port` replaces the FULLMAG_API_PORT convention for this run.
+        std::env::set_var("FULLMAG_API_PORT", port.to_string());
+    }
     if args.headless {
         init_headless_api_port()?;
     } else {
         init_api_port()?;
+    }
+    if crate::script_launch::is_managed_run() && api_port() != 0 {
+        crate::script_launch::note_api_port(api_port());
     }
 
     // Eagerly configure the global Rayon pool used by Rust-side control-plane
@@ -6550,20 +8893,20 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         .unwrap_or(1);
     let fullmag_cpu_threads = std::env::var("FULLMAG_CPU_THREADS").ok();
     let rayon_cpu_threads = std::env::var("RAYON_NUM_THREADS").ok();
-    let cpu_threads = fullmag_cpu_threads
-        .as_deref()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|&n| n >= 1)
-        .or_else(|| {
-            rayon_cpu_threads
-                .as_deref()
-                .and_then(|v| v.parse::<usize>().ok())
-                .filter(|&n| n >= 1)
-        })
-        .unwrap_or(default_cpu_threads);
+    let external_auto_resolved = std::env::var("FULLMAG_CPU_THREADS_AUTO_RESOLVED").ok();
+    let (cpu_threads, auto_cap_applied) = resolve_rayon_cpu_threads(
+        default_cpu_threads,
+        fullmag_cpu_threads.as_deref(),
+        rayon_cpu_threads.as_deref(),
+        external_auto_resolved.as_deref(),
+    );
     let rayon_log_detail = match fullmag_cpu_threads.as_deref() {
         Some(raw) if raw.eq_ignore_ascii_case("auto") => {
-            " (FULLMAG_CPU_THREADS=auto; MFEM/libCEED/hypre CPU FEM logs resolved OpenMP threads separately)"
+            if auto_cap_applied && external_auto_resolved.is_some() {
+                " (FULLMAG_CPU_THREADS=auto; external auto-resolved cap)"
+            } else {
+                " (FULLMAG_CPU_THREADS=auto; conservative control-plane cap)"
+            }
         }
         Some(_) => " (source=FULLMAG_CPU_THREADS)",
         None => match rayon_cpu_threads {
@@ -6594,12 +8937,16 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     }
     crate::live_workspace::init_feature_flags(feature_flags);
 
-    let started_at_unix_ms = unix_time_millis()?;
+    let started_at_unix_ms = attached_session_started_at_or(unix_time_millis()?)?;
     let script_path = args
         .script
         .canonicalize()
         .with_context(|| format!("failed to resolve script path {}", args.script.display()))?;
-    check_script_syntax_via_python(&script_path)?;
+    if let Err(error) = check_script_syntax_via_python(&script_path) {
+        crate::script_launch::mark_failure(crate::script_launch::ExitKind::Syntax);
+        return Err(error);
+    }
+    crate::script_launch::note_stage(crate::script_launch::Stage::Materializing);
     eprintln!("fullmag syntax check passed");
     eprintln!("- script: {}", script_path.display());
     let requested_backend_name = args
@@ -6615,25 +8962,36 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         .map(|value| value.to_possible_value().unwrap().get_name().to_string())
         .unwrap_or_else(|| "double".to_string());
 
-    let session_id = format!("session-{}-{}", started_at_unix_ms, std::process::id());
+    let session_id = attached_session_id_or(format!(
+        "session-{}-{}",
+        started_at_unix_ms,
+        std::process::id()
+    ));
     let run_id = format!("run-{}", session_id);
-    let output_paths = resolve_script_output_paths(
-        &script_path,
-        args.output_dir.as_deref(),
-        &args.session_root,
-        &session_id,
-    );
-    let workspace_dir = output_paths.workspace_dir.clone();
-    let artifact_dir = output_paths.artifact_dir.clone();
-
-    if output_paths.is_sibling_zarr_bundle {
-        replace_and_initialize_script_result_bundle(&output_paths, &script_path, &session_id)?;
-        eprintln!("- result_bundle: {}", workspace_dir.display());
+    crate::script_launch::note_ids(&session_id, &run_id);
+    let default_session_root = runtime_state_root(&repo_root())
+        .join("local-live")
+        .join("history");
+    let session_root = if args.session_root == Path::new(".fullmag/local-live/history") {
+        default_session_root.as_path()
     } else {
-        fs::create_dir_all(&workspace_dir).with_context(|| {
-            format!("failed to create workspace dir {}", workspace_dir.display())
-        })?;
-    }
+        args.session_root.as_path()
+    };
+    // Keep preparation state in its session directory until authored storage has
+    // been captured and the shared lease reserves the actual result directory.
+    let mut output_paths = ScriptOutputPaths {
+        workspace_dir: session_root.join(&session_id),
+        artifact_dir: session_root.join(&session_id).join("artifacts"),
+        is_sibling_zarr_bundle: false,
+    };
+    let mut workspace_dir = output_paths.workspace_dir.clone();
+    let mut artifact_dir = output_paths.artifact_dir.clone();
+    fs::create_dir_all(&artifact_dir).with_context(|| {
+        format!(
+            "failed to create session artifact directory {}",
+            artifact_dir.display()
+        )
+    })?;
     // When 3D preview is disabled, set field_every_n to infinity to skip expensive computations.
     // Keep FEM cadence aligned with interactive control-room expectations:
     // too-large step intervals make 3D magnetization look "stuck" even while
@@ -6650,7 +9008,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     let preview_every_n_override = preview_every_n_override_raw
         .as_ref()
         .map(|_| field_every_n as u32);
-    let current_live_publisher = CurrentLivePublisher::spawn(&session_id);
+    let grid_refresh_command_id = std::env::var("FULLMAG_ATTACHED_GRID_REFRESH_COMMAND_ID").ok();
+    let current_live_publisher = if grid_refresh_command_id.is_some() {
+        CurrentLivePublisher::unpublished_grid_refresh()
+    } else {
+        CurrentLivePublisher::spawn(&session_id)
+    };
     let bootstrapping_runtime = requested_runtime_selection(
         &requested_backend_name,
         false,
@@ -6707,7 +9070,11 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         },
         current_live_publisher.clone(),
     );
-    let display_selection_handle = CurrentLiveDisplaySelectionHandle::spawn();
+    let display_selection_handle = if let Some(command_id) = grid_refresh_command_id.as_ref() {
+        CurrentLiveDisplaySelectionHandle::spawn_for_grid_refresh(session_id.clone(), command_id.clone())
+    } else {
+        CurrentLiveDisplaySelectionHandle::spawn_for_session(Some(session_id.clone()))
+    };
     live_workspace.push_log(
         "system",
         format!(
@@ -6752,85 +9119,107 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     );
 
     // Phase 1: fast pre-pass without geometry assets, runs concurrently with frontend startup.
-    let phase1_script_path = script_path.clone();
-    let phase1_backend = args.backend;
-    let phase1_mode = args.mode;
-    let phase1_precision = args.precision;
-    let phase1_runtime_device = crate::python_bridge::managed_execution_device(
-        phase1_backend,
-        std::env::var("FULLMAG_FEM_EXECUTION").ok().as_deref(),
-        std::env::var("FULLMAG_FDM_EXECUTION").ok().as_deref(),
-    );
-    let phase1_handle = own_preparation_boundary_failure(
-        &live_workspace,
-        "script_materialization_thread_start_failed",
-        "Python script materialization could not start",
-        std::thread::Builder::new()
-            .name("fullmag-materialize-phase1".to_string())
-            .spawn(move || -> Result<ScriptExecutionConfig> {
-                use clap::ValueEnum;
-                let mut helper_args = vec![
-                    "-m".to_string(),
-                    "fullmag.runtime.helper".to_string(),
-                    "export-run-config".to_string(),
-                    "--script".to_string(),
-                    phase1_script_path.display().to_string(),
-                    "--skip-geometry-assets".to_string(),
-                ];
-                if let Some(backend) = phase1_backend {
-                    helper_args.push("--backend".to_string());
-                    helper_args.push(backend.to_possible_value().unwrap().get_name().to_string());
-                }
-                if let Some(mode) = phase1_mode {
-                    helper_args.push("--mode".to_string());
-                    helper_args.push(mode.to_possible_value().unwrap().get_name().to_string());
-                }
-                if let Some(precision) = phase1_precision {
-                    helper_args.push("--precision".to_string());
-                    helper_args.push(
-                        precision
-                            .to_possible_value()
-                            .unwrap()
-                            .get_name()
-                            .to_string(),
-                    );
-                }
-                if let Some(device) = phase1_runtime_device {
-                    helper_args.push("--runtime-device".to_string());
-                    helper_args.push(device.to_string());
-                }
-                let output = run_python_helper_with_progress(&helper_args, None)
-                    .context("phase-1 python helper failed")?;
-                if !output.status.success() {
-                    let stderr = String::from_utf8_lossy(&output.stderr);
-                    bail!("phase-1 python helper exited non-zero: {}", stderr.trim());
-                }
-                let stdout =
-                    String::from_utf8(output.stdout).context("phase-1 output not valid UTF-8")?;
-                let json_str = crate::python_bridge::extract_json_from_stdout(&stdout)?;
-                serde_json::from_str(json_str)
-                    .context("failed to deserialize phase-1 script execution config")
-            })
-            .context("failed to spawn phase-1 materialization thread"),
-    )?;
+    // A headless run has no frontend that can consume the early metadata, and
+    // the full materialization/solver-initialization safety boundary below
+    // performs the authoritative validation.  Skip this duplicate Python
+    // import in headless mode to remove one process start and one script pass.
+    let phase1_handle = if args.headless {
+        None
+    } else {
+        let phase1_script_path = script_path.clone();
+        let phase1_backend = args.backend;
+        let phase1_mode = args.mode;
+        let phase1_precision = args.precision;
+        let phase1_execution_layers = crate::python_bridge::script_cli_execution_layers(&args)?;
+        let phase1_runtime_device = crate::python_bridge::managed_execution_device(
+            phase1_backend,
+            std::env::var("FULLMAG_FEM_EXECUTION").ok().as_deref(),
+            std::env::var("FULLMAG_FDM_EXECUTION").ok().as_deref(),
+        );
+        Some(own_preparation_boundary_failure(
+            &live_workspace,
+            "script_materialization_thread_start_failed",
+            "Python script materialization could not start",
+            std::thread::Builder::new()
+                .name("fullmag-materialize-phase1".to_string())
+                .spawn(move || -> Result<ScriptExecutionConfig> {
+                    use clap::ValueEnum;
+                    let mut helper_args = vec![
+                        "-m".to_string(),
+                        "fullmag.runtime.helper".to_string(),
+                        "export-run-config".to_string(),
+                        "--script".to_string(),
+                        phase1_script_path.display().to_string(),
+                        "--skip-geometry-assets".to_string(),
+                    ];
+                    if let Some(backend) = phase1_backend {
+                        helper_args.push("--backend".to_string());
+                        helper_args
+                            .push(backend.to_possible_value().unwrap().get_name().to_string());
+                    }
+                    if let Some(mode) = phase1_mode {
+                        helper_args.push("--mode".to_string());
+                        helper_args.push(mode.to_possible_value().unwrap().get_name().to_string());
+                    }
+                    if let Some(precision) = phase1_precision {
+                        helper_args.push("--precision".to_string());
+                        helper_args.push(
+                            precision
+                                .to_possible_value()
+                                .unwrap()
+                                .get_name()
+                                .to_string(),
+                        );
+                    }
+                    if let Some(device) = phase1_runtime_device {
+                        helper_args.push("--runtime-device".to_string());
+                        helper_args.push(device.to_string());
+                    }
+                    let output = run_python_helper_with_progress(&helper_args, None)
+                        .context("phase-1 python helper failed")?;
+                    if !output.status.success() {
+                        let stderr = String::from_utf8_lossy(&output.stderr);
+                        bail!("phase-1 python helper exited non-zero: {}", stderr.trim());
+                    }
+                    let stdout = String::from_utf8(output.stdout)
+                        .context("phase-1 output not valid UTF-8")?;
+                    let json_str = crate::python_bridge::extract_json_from_stdout(&stdout)?;
+                    let mut config = serde_json::from_str(json_str)
+                        .context("failed to deserialize phase-1 script execution config")?;
+                    crate::python_bridge::bind_script_execution_profiles(
+                        &mut config,
+                        &phase1_execution_layers,
+                        phase1_runtime_device,
+                    )?;
+                    Ok(config)
+                })
+                .context("failed to spawn phase-1 materialization thread"),
+        )?)
+    };
 
     eprintln!("fullmag materializing script");
 
-    if !args.headless {
+    if !args.headless && !control_room_bootstrap_disabled() {
         let (web_port, child, frontend_child) = own_preparation_boundary_failure(
             &live_workspace,
             "control_room_bootstrap_failed",
             "Control Room bootstrap failed",
-            spawn_control_room(&session_id, args.dev, args.web_port, &live_workspace).with_context(
-                || {
-                    format!(
-                        "failed to bootstrap control room for workspace {}",
-                        session_id
-                    )
-                },
-            ),
+            spawn_control_room(
+                &session_id,
+                args.dev,
+                args.web_port,
+                &live_workspace,
+                ui_plan,
+            )
+            .with_context(|| {
+                format!(
+                    "failed to bootstrap control room for workspace {}",
+                    session_id
+                )
+            }),
         )?;
         eprintln!("fullmag control room bootstrap verified");
+        crate::script_launch::note_ui_ready();
         live_workspace.push_log("system", "Control room bootstrap verified");
         _control_room_guard = ControlRoomGuard::active(web_port, child, frontend_child);
         let failed_workspace = live_workspace.clone();
@@ -6842,69 +9231,128 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         });
     }
 
-    // Join Phase 1 and push early metadata to the already-loaded frontend.
-    let early_config = match phase1_handle
-        .join()
-        .unwrap_or_else(|_| Err(anyhow::anyhow!("phase-1 thread panicked")))
-    {
-        Ok(early_config) => {
-            let early_problem = early_config
-                .stages
-                .last()
-                .map(|s| &s.ir)
-                .unwrap_or(&early_config.ir);
-            let problem_name = early_problem.problem_meta.name.clone();
-            let stage_names: Vec<String> = early_config
-                .stages
-                .iter()
-                .map(|s| s.ir.problem_meta.name.clone())
-                .collect();
-            let geometry_names: Vec<String> = early_problem
-                .geometry
-                .entries
-                .iter()
-                .map(|e| e.name().to_string())
-                .collect();
-            live_workspace.update(|state| {
-                if state.metadata.is_none() {
-                    state.metadata = Some(serde_json::json!({
-                        "problem_name": problem_name,
-                        "stage_count": early_config.stages.len(),
-                        "stage_names": stage_names,
-                        "geometry_names": geometry_names,
-                        "early_preview": true,
-                    }));
-                }
-            });
-            live_workspace.push_log(
-                "info",
-                format!(
-                    "Problem: {} · {} stage(s) · {} geometry object(s)",
-                    problem_name,
-                    early_config.stages.len().max(1),
-                    geometry_names.len()
-                ),
-            );
-            Some(early_config)
-        }
-        Err(err) => {
-            // Phase 1 failure is non-fatal — Phase 2 will produce the real error if needed.
-            eprintln!("[fullmag] phase-1 pre-pass skipped: {:#}", err);
-            let timestamp_unix_ms = preparation_unix_time_millis()?;
-            transition_preparation(&live_workspace, |preparation| {
-                push_preparation_log_once(
-                    preparation,
-                    timestamp_unix_ms,
-                    PreparationLogLevel::Warning,
-                    PreparationStageId::ScriptMaterialization,
-                    "Lightweight script preflight was unavailable; using full materialization",
-                );
-                Ok(())
-            })?;
-            None
-        }
+    // Keep a small bridge alive for a Control Room-created scratch session.
+    // The bridge ignores this script-backed session and only attaches a fresh
+    // runtime after the browser explicitly replaces it with a runnable scene.
+    let _scratch_runtime = if !args.headless {
+        std::env::current_exe()
+            .ok()
+            .map(|executable| {
+                fullmag_runtime_control::application_attach::prepare_for_authoring(
+                    &crate::control_room::repo_root(),
+                    &crate::control_room::runtime_state_root(&crate::control_room::repo_root()),
+                    api_port(),
+                )
+                .map(|binding| {
+                    crate::scratch_runtime::spawn(
+                        api_port(),
+                        executable,
+                        Some(session_id.clone()),
+                        binding.api_instance_id().to_owned(),
+                    )
+                })
+                .map_err(|error| {
+                    eprintln!("[fullmag] scratch observer identity unavailable: {error:#}")
+                })
+                .ok()
+            })
+            .flatten()
+    } else {
+        None
     };
-    let early_preflight_completed = if let Some(early_config) = early_config {
+
+    // Join Phase 1 and push early metadata to the already-loaded frontend.
+    let (early_config, authoritative_preflight_error) = match phase1_handle {
+        None => (None, None),
+        Some(phase1_handle) => match phase1_handle
+            .join()
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("phase-1 thread panicked")))
+        {
+            Ok(early_config) => {
+                let early_problem = early_config
+                    .stages
+                    .last()
+                    .map(|s| &s.ir)
+                    .unwrap_or(&early_config.ir);
+                let problem_name = early_problem.problem_meta.name.clone();
+                let stage_names: Vec<String> = early_config
+                    .stages
+                    .iter()
+                    .map(|s| s.ir.problem_meta.name.clone())
+                    .collect();
+                let geometry_names: Vec<String> = early_problem
+                    .geometry
+                    .entries
+                    .iter()
+                    .map(|e| e.name().to_string())
+                    .collect();
+                live_workspace.update(|state| {
+                    if state.metadata.is_none() {
+                        state.metadata = Some(serde_json::json!({
+                            "problem_name": problem_name,
+                            "stage_count": early_config.stages.len(),
+                            "stage_names": stage_names,
+                            "geometry_names": geometry_names,
+                            "early_preview": true,
+                        }));
+                    }
+                });
+                live_workspace.push_log(
+                    "info",
+                    format!(
+                        "Problem: {} · {} stage(s) · {} geometry object(s)",
+                        problem_name,
+                        early_config.stages.len().max(1),
+                        geometry_names.len()
+                    ),
+                );
+                (Some(early_config), None)
+            }
+            Err(err) => {
+                if project_authoritative_authored_preflight_failure(&live_workspace, &err)? {
+                    eprintln!(
+                        "[fullmag] authored capability preflight rejected the execution plan"
+                    );
+                    (None, Some(err))
+                } else {
+                    // A transport or helper failure remains non-fatal; Phase 2 owns the real result.
+                    eprintln!("[fullmag] phase-1 pre-pass skipped: {:#}", err);
+                    let timestamp_unix_ms = preparation_unix_time_millis()?;
+                    transition_preparation(&live_workspace, |preparation| {
+                        push_preparation_log_once(
+                        preparation,
+                        timestamp_unix_ms,
+                        PreparationLogLevel::Warning,
+                        PreparationStageId::ScriptMaterialization,
+                        "Lightweight script preflight was unavailable; using full materialization",
+                    );
+                        Ok(())
+                    })?;
+                    (None, None)
+                }
+            }
+        },
+    };
+    if let Some(config) = early_config.as_ref().filter(|config| requires_antenna_lead_materialization(config)) {
+        run_active_preparation_operation(
+            &live_workspace,
+            "script_materialization_failed",
+            "Authored antenna lead validation failed",
+            || {
+                config.antenna_inventory.validate().map_err(anyhow::Error::msg)?;
+                validate_ir(&config.ir)?;
+                for stage in &config.stages {
+                    validate_ir(&stage.ir)?;
+                }
+                Ok(())
+            },
+        )?;
+        live_workspace.push_log(
+            "info",
+            "Antenna lead planning deferred until the independent conductor mesh is materialized",
+        );
+    }
+    let early_preflight_completed = if let Some(early_config) = early_config.filter(|config| !requires_antenna_lead_materialization(config)) {
         let early_stages = run_active_preparation_operation(
             &live_workspace,
             "script_materialization_failed",
@@ -6936,32 +9384,36 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     } else {
         false
     };
-    let script_config = match export_script_execution_config_via_python(
-        &script_path,
-        &args,
-        Some({
-            let live_workspace = live_workspace.clone();
-            Arc::new(move |event: PythonProgressEvent| {
-                let terminal_line = match &event {
-                    PythonProgressEvent::Message(message) => {
-                        (!message.trim_start().starts_with("json:"))
-                            .then(|| format!("[fullmag] materialize - {}", message))
+    let export_full_script = || {
+        export_script_execution_config_via_python(
+            &script_path,
+            &args,
+            Some({
+                let live_workspace = live_workspace.clone();
+                Arc::new(move |event: PythonProgressEvent| {
+                    let terminal_line = match &event {
+                        PythonProgressEvent::Message(message) => {
+                            (!message.trim_start().starts_with("json:"))
+                                .then(|| format!("[fullmag] materialize - {}", message))
+                        }
+                        PythonProgressEvent::FemSurfacePreview { message, .. } => message
+                            .as_ref()
+                            .map(|text| format!("[fullmag] materialize - {}", text)),
+                        PythonProgressEvent::Structured { payload, .. } => payload
+                            .get("message")
+                            .and_then(|value| value.as_str())
+                            .map(|message| format!("[fullmag] materialize - {}", message)),
+                    };
+                    apply_python_progress_event(&live_workspace, event);
+                    if let Some(line) = terminal_line {
+                        eprintln!("{}", line);
                     }
-                    PythonProgressEvent::FemSurfacePreview { message, .. } => message
-                        .as_ref()
-                        .map(|text| format!("[fullmag] materialize - {}", text)),
-                    PythonProgressEvent::Structured { payload, .. } => payload
-                        .get("message")
-                        .and_then(|value| value.as_str())
-                        .map(|message| format!("[fullmag] materialize - {}", message)),
-                };
-                apply_python_progress_event(&live_workspace, event);
-                if let Some(line) = terminal_line {
-                    eprintln!("{}", line);
-                }
-            })
-        }),
-    ) {
+                })
+            }),
+        )
+    };
+    let script_export = authoritative_preflight_error.map_or_else(export_full_script, Err);
+    let mut script_config = match script_export {
         Ok(config) => config,
         Err(error) => {
             let error =
@@ -7021,6 +9473,54 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             return Err(error);
         }
     };
+    // Grid authoring must not reserve the user's next scientific output path
+    // or modify its existing-output policy in the canonical script/IR.
+    let (mut storage_lease, storage_settings, resolved_storage) =
+        if let Some(command_id) = grid_refresh_command_id.as_deref() {
+            prepare_grid_operation_storage(&workspace_dir, command_id, &script_path)?
+        } else {
+            prepare_script_output_storage(&mut script_config, &args, &script_path, &run_id)?
+        };
+    workspace_dir = storage_lease.resolved().output_dir.clone();
+    crate::script_launch::note_results_dir(&workspace_dir);
+    crate::script_launch::note_source_hash(script_config.ir.problem_meta.source_hash.as_deref());
+    artifact_dir = workspace_dir.join("artifacts");
+    output_paths = ScriptOutputPaths {
+        workspace_dir: workspace_dir.clone(),
+        artifact_dir: artifact_dir.clone(),
+        is_sibling_zarr_bundle: storage_settings.data_format == OutputDataFormatIR::Zarr,
+    };
+    fs::create_dir_all(&artifact_dir).with_context(|| {
+        format!(
+            "failed to create project artifact directory {}",
+            artifact_dir.display()
+        )
+    })?;
+    fs::create_dir_all(workspace_dir.join("stages")).with_context(|| {
+        format!(
+            "failed to create project stage directory {}",
+            workspace_dir.join("stages").display()
+        )
+    })?;
+    if output_paths.is_sibling_zarr_bundle {
+        initialize_zarr_group(
+            &artifact_dir,
+            serde_json::json!({"fullmag_role": "final_stage_artifacts"}),
+        )?;
+        initialize_zarr_group(
+            &workspace_dir.join("stages"),
+            serde_json::json!({"fullmag_role": "stage_artifacts"}),
+        )?;
+        eprintln!("- result_bundle: {}", workspace_dir.display());
+    }
+    live_workspace.update(|state| {
+        state.session.artifact_dir = artifact_dir.display().to_string();
+        state.run.artifact_dir = artifact_dir.display().to_string();
+        state.metadata = Some(serde_json::json!({
+            "output_storage": storage_settings,
+            "resolved_output_storage": resolved_storage,
+        }));
+    });
     let mut stages = run_active_preparation_operation(
         &live_workspace,
         "script_materialization_failed",
@@ -7028,27 +9528,45 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         || materialize_script_stages(script_config),
     )?;
     if !early_preflight_completed {
-        run_script_preparation_preflight(
-            &live_workspace,
-            || {
-                if stages.is_empty() {
-                    bail!("script did not produce any executable stages");
-                }
-                for stage in &stages {
-                    validate_ir(&stage.ir)?;
-                }
-                Ok(())
-            },
-            || {
-                for stage in &stages {
-                    stage
-                        .ir
-                        .plan_for(args.backend.map(BackendTarget::from))
-                        .map_err(join_errors)?;
-                }
-                Ok(())
-            },
-        )?;
+        if args.headless {
+            // Headless runs perform the authoritative validation and planning
+            // inside `run_solver_initialization` after the complete script
+            // export has been materialized.  Keep the preparation state
+            // transitions for the live manifest without repeating those
+            // expensive passes here.
+            run_script_preparation_preflight(
+                &live_workspace,
+                || {
+                    if stages.is_empty() {
+                        bail!("script did not produce any executable stages");
+                    }
+                    Ok(())
+                },
+                || Ok(()),
+            )?;
+        } else {
+            run_script_preparation_preflight(
+                &live_workspace,
+                || {
+                    if stages.is_empty() {
+                        bail!("script did not produce any executable stages");
+                    }
+                    for stage in &stages {
+                        validate_ir(&stage.ir)?;
+                    }
+                    Ok(())
+                },
+                || {
+                    for stage in &stages {
+                        stage
+                            .ir
+                            .plan_for(args.backend.map(BackendTarget::from))
+                            .map_err(join_errors)?;
+                    }
+                    Ok(())
+                },
+            )?;
+        }
     }
     let detailed_mesh_workspace = live_workspace.snapshot().mesh_workspace;
     finish_mesh_preparation(&live_workspace, detailed_mesh_workspace.as_ref())?;
@@ -7059,7 +9577,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     let (
         mut stage_execution_plans,
         mut current_plan_summary,
-        initial_execution_plan,
+        mut initial_execution_plan,
         initial_live_state,
         initial_fem_mesh,
         mut initial_fem_mesh_asset,
@@ -7183,11 +9701,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         script_requested_interactive,
         args.headless,
     );
-    let final_session_runtime = stages
+    let mut final_session_runtime = stages
         .last()
         .map(|stage| {
             session_runtime_selection_for_problem(
                 &stage.ir,
+                stage_execution_plans.last(),
                 field_every_n,
                 backend_target_name(final_requested_backend),
                 execution_mode_name(final_execution_mode),
@@ -7208,10 +9727,20 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     let previous_workspace = live_workspace.snapshot();
     let initial_runtime = session_runtime_selection_for_problem(
         &stages[0].ir,
+        Some(&initial_execution_plan),
         field_every_n,
         backend_target_name(final_requested_backend),
         execution_mode_name(final_execution_mode),
         execution_precision_name(final_precision),
+    );
+    let initial_live_metadata =
+        current_live_metadata(&stages[0].ir, &initial_execution_plan, "running");
+    let initial_mesh_workspace = current_mesh_workspace(
+        &stages[0].ir,
+        &initial_execution_plan,
+        "running",
+        current_mesh_quality.as_ref(),
+        &current_mesh_history,
     );
     live_workspace.replace(LocalLiveWorkspaceState {
         session: build_session_manifest(
@@ -7230,19 +9759,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         run: build_run_manifest(&run_id, &session_id, "running", &artifact_dir),
         live_state: initial_live_state,
         fem_mesh: initial_fem_mesh,
-        metadata: Some(current_live_metadata(
-            &stages[0].ir,
-            &initial_execution_plan,
-            "running",
-        )),
+        metadata: Some(initial_live_metadata),
         mesh_workspace: merge_detailed_mesh_workspace(
-            current_mesh_workspace(
-                &stages[0].ir,
-                &initial_execution_plan,
-                "running",
-                current_mesh_quality.as_ref(),
-                &current_mesh_history,
-            ),
+            initial_mesh_workspace,
             previous_workspace.mesh_workspace.as_ref(),
         ),
         stage_execution: None,
@@ -7293,12 +9812,43 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     let mut aggregated_steps = Vec::<fullmag_runner::StepStats>::new();
     let mut step_offset = 0u64;
     let mut time_offset = 0.0f64;
+    let mut published_antenna_outputs = std::collections::BTreeMap::new();
+    let scheduled_spectrum_request_ids = stages
+        .iter()
+        .filter_map(|stage| match stage.action.as_ref() {
+            Some(ResolvedScriptStageAction::AntennaSourceSpectrum { request_id }) => Some(request_id.clone()),
+            _ => None,
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let scheduled_solved_drives = stages
+        .iter()
+        .filter_map(|stage| match stage.action.as_ref() {
+            Some(ResolvedScriptStageAction::AddSolvedAntennaDrive { projection_id, drive_id }) => {
+                Some((projection_id.clone(), drive_id.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut activated_solved_drive_ids = std::collections::BTreeSet::new();
     let mut continuation_magnetization: Option<Vec<[f64; 3]>> = None;
     let mut continuation_source: Option<ContinuationSource> = None;
     let mut saved_state_sources: HashMap<String, ContinuationSource> = HashMap::new();
+    let mut continuation_fem_mesh_payload: Option<fullmag_runner::FemMeshPayload> = None;
     let mut continuation_completion: Option<fullmag_ir::StageCompletionIR> = None;
+    let mut continuation_stage_source: Option<ContinuationStageSource> = None;
+    let mut continuation_accepted_fields: Option<fullmag_runner::CertifiedFemEquilibriumFields> =
+        None;
+    let mut continuation_certified_fields: Option<fullmag_runner::CertifiedFemEquilibriumFields> =
+        None;
+    let mut continuation_relax_handoff: Option<fullmag_runner::AcceptedFemRelaxStageHandoff> = None;
     let mut start_solver_command_id: Option<String> = None;
+    // The first solver command may be consumed by the wait-for-compute gate
+    // before the regular interactive command loop starts. Keep the applied
+    // scene revision across both paths so a Frozen Spins binding is neither
+    // skipped at initial launch nor replayed later.
+    let mut frozen_spins_applied_scene_revision: Option<u64> = None;
     let mut paused_stage: Option<PausedInteractiveStage> = None;
+    let mut scripted_cancelled = false;
 
     // ── visualization quantity hint ──────────────────────────────────────
     // If the script declared `fm.visualization(active_quantity_id="...")`, push a
@@ -7656,21 +10206,36 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         }
     }
 
+    // The attached scratch runtime may use `wait_for_solve` to consume the
+    // initial remesh/solve command before the general interactive host is
+    // constructed. Materialization is complete at this point, so command
+    // polling is safe to enable and no command can be lost during startup.
+    display_selection_handle.enable_command_polling();
+
     // ── wait_for_solve gate ──────────────────────────────────────────────
-    let wait_for_solve_requested = stages
-        .first()
-        .map(|stage| {
-            stage
-                .ir
-                .problem_meta
-                .runtime_metadata
-                .get("wait_for_solve")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-        })
-        .unwrap_or(false);
+    let wait_for_solve_requested = attached_wait_for_solve_enabled()
+        || stages
+            .first()
+            .map(|stage| {
+                stage
+                    .ir
+                    .problem_meta
+                    .runtime_metadata
+                    .get("wait_for_solve")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            })
+            .unwrap_or(false);
     let _is_fem_backend = matches!(&initial_execution_plan.backend_plan, BackendPlanIR::Fem(_));
     let wait_for_solve_supported = wait_for_solve_supported(&initial_execution_plan.backend_plan);
+    if let Some(command_id) = grid_refresh_command_id.as_deref() {
+        anyhow::ensure!(
+            !command_id.is_empty()
+                && wait_for_solve_should_block(wait_for_solve_requested, wait_for_solve_supported, args.headless)
+                && matches!(&initial_execution_plan.backend_plan, BackendPlanIR::Fdm(_) | BackendPlanIR::FdmMultilayer(_)),
+            "grid-only attached runtime requires an interactive FDM wait-for-solve command pin"
+        );
+    }
 
     if wait_for_solve_should_block(
         wait_for_solve_requested,
@@ -7680,6 +10245,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         let wait_message = wait_for_solve_prompt(&initial_execution_plan.backend_plan);
         eprintln!("[fullmag] {}", wait_message.to_lowercase());
         live_workspace.push_log("system", wait_message);
+        crate::script_launch::note_stage(crate::script_launch::Stage::WaitingForSolve);
         // Switch to slow publish mode — solver loop will produce its own cadenced updates.
         live_workspace.set_publish_fast_mode(false);
         live_workspace.update(|state| {
@@ -7903,6 +10469,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                                     &remesh_result.object_region_markers,
                                     current_adaptive_runtime_state.as_ref(),
                                     Some(remeshed_plan.clone()),
+                                    None,
                                 )?;
 
                                 if new_ram <= ram_budget {
@@ -7994,9 +10561,26 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         }
 
         loop {
+            if display_selection_handle.grid_refresh_command_refused() {
+                bail!("grid-only control receiver refused an unpinned command");
+            }
+            if display_selection_handle.owner_session_lost() {
+                live_workspace.push_log(
+                    "warning",
+                    "Attached runtime owner session was replaced — stopping before compute",
+                );
+                return Ok(());
+            }
             let Some(cmd) =
                 display_selection_handle.wait_next_command_coalesced(Duration::from_millis(250))
             else {
+                if display_selection_handle.owner_session_lost() {
+                    live_workspace.push_log(
+                        "warning",
+                        "Attached runtime owner session was replaced — stopping before compute",
+                    );
+                    return Ok(());
+                }
                 continue;
             };
 
@@ -8021,7 +10605,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 "load_state" => {
                     let Some(state_path) = cmd.state_path.as_deref() else {
                         live_workspace
-                            .push_log("error", "State import command is missing state_path");
+                            .push_command_log(&cmd.command_id, "error", "Failed to load workspace state: missing state_path");
                         continue;
                     };
                     match read_magnetization_state(
@@ -8029,11 +10613,24 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         cmd.state_format.as_deref(),
                         cmd.state_dataset.as_deref(),
                         cmd.state_sample_index,
-                    ) {
+                    )
+                    .and_then(|loaded_state| {
+                        validate_imported_magnetization(&stages[0].ir, &loaded_state.values)?;
+                        Ok(loaded_state)
+                    }) {
                         Ok(loaded_state) => {
-                            continuation_magnetization = Some(loaded_state.values.clone());
-                            continuation_source = None; // loaded from file — unknown source backend
-                            continuation_completion = None;
+                            replace_continuation_after_synthetic_stage(
+                                &mut continuation_magnetization,
+                                &mut continuation_source,
+                                &mut continuation_fem_mesh_payload,
+                                &mut continuation_completion,
+                                &mut continuation_stage_source,
+                                &mut continuation_accepted_fields,
+                                &mut continuation_certified_fields,
+                                &mut continuation_relax_handoff,
+                                loaded_state.values.clone(),
+                                false,
+                            );
                             live_workspace.update(|state| {
                                 state.live_state.updated_at_unix_ms =
                                     unix_time_millis().unwrap_or(0);
@@ -8061,7 +10658,8 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                                     format!("Loaded state preview refresh failed: {}", error),
                                 );
                             }
-                            live_workspace.push_log(
+                            live_workspace.push_command_log(
+                                &cmd.command_id,
                                 "success",
                                 format!(
                                     "Loaded workspace state from {} ({} vectors)",
@@ -8070,7 +10668,8 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                             );
                         }
                         Err(error) => {
-                            live_workspace.push_log(
+                            live_workspace.push_command_log(
+                                &cmd.command_id,
                                 "error",
                                 format!("Failed to load workspace state: {}", error),
                             );
@@ -8100,12 +10699,13 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         &live_workspace,
                         ProblemPreviewRefreshMode::MaterializeFields,
                     ) {
-                        Ok(()) => live_workspace.push_log(
+                        Ok(()) => live_workspace.push_command_log(
+                            &cmd.command_id,
                             "success",
                             "Field snapshots computed for the current magnetization",
                         ),
                         Err(error) => live_workspace
-                            .push_log("error", format!("Compute fields failed: {}", error)),
+                            .push_command_log(&cmd.command_id, "error", format!("Compute fields failed: {}", error)),
                     }
                     continue;
                 }
@@ -8125,9 +10725,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         &live_workspace,
                     ) {
                         Ok(()) => live_workspace
-                            .push_log("success", "Energies computed for the current magnetization"),
+                            .push_command_log(&cmd.command_id, "success", "Energies computed for the current magnetization"),
                         Err(error) => live_workspace
-                            .push_log("error", format!("Compute energies failed: {}", error)),
+                            .push_command_log(&cmd.command_id, "error", format!("Compute energies failed: {}", error)),
                     }
                     continue;
                 }
@@ -8136,7 +10736,151 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     continue;
                 }
                 WaitForSolveCommandAction::StartSolver => {
+                    anyhow::ensure!(grid_refresh_command_id.is_none(), "grid-only runtime cannot execute a solver command");
+                    if matches!(cmd.kind.as_str(), "relax" | "run" | "solve") {
+                        let frozen_binding_summary = cmd
+                            .frozen_spins_runtime_plan_binding
+                            .as_ref()
+                            .map(|binding| {
+                                format!(
+                                    "revision {} with {} selection definition(s) and {} constraint(s)",
+                                    binding.source_scene_revision,
+                                    binding.selection_definitions.len(),
+                                    binding.magnetization_constraints.len()
+                                )
+                            })
+                            .unwrap_or_else(|| "missing".to_string());
+                        let (command_base_ir, bound_frozen_spins_scene_revision) =
+                            match problem_with_frozen_spins_runtime_plan_binding(
+                                &stages[0].ir,
+                                &cmd,
+                                frozen_spins_applied_scene_revision,
+                            ) {
+                                Ok(Some((candidate, source_scene_revision))) => {
+                                    (candidate, Some(source_scene_revision))
+                                }
+                                Ok(None) => (stages[0].ir.clone(), None),
+                                Err(error) => {
+                                    let message = format!(
+                                        "wait_for_solve Frozen Spins runtime-plan binding rejected for command {}: {}",
+                                        cmd.command_id, error
+                                    );
+                                    live_workspace.push_log("error", message.clone());
+                                    eprintln!("[fullmag] {message}");
+                                    continue;
+                                }
+                            };
+                        let Some(mut command_stage) = (match crate::step_utils::build_initial_interactive_command_stage(
+                            &stages[0],
+                            &command_base_ir,
+                            &cmd,
+                        ) {
+                            Ok(Some(stage)) => Some(stage),
+                            Ok(None) => {
+                                let message = format!(
+                                        "wait_for_solve command '{}' did not produce an executable stage",
+                                        cmd.kind
+                                    );
+                                live_workspace.push_log("error", message.clone());
+                                eprintln!("[fullmag] {message}");
+                                None
+                            }
+                            Err(error) => {
+                                let message = format!(
+                                    "wait_for_solve command '{}' rejected: {}",
+                                    cmd.kind, error
+                                );
+                                live_workspace.push_log("error", message.clone());
+                                eprintln!("[fullmag] {message}");
+                                None
+                            }
+                        }) else {
+                            continue;
+                        };
+                        apply_current_fem_overrides(
+                            &mut command_stage.ir,
+                            current_fem_mesh_override.as_ref(),
+                            current_fem_hmax_override,
+                            current_adaptive_runtime_state.as_ref(),
+                        );
+                        attach_region_realization_revisions(
+                            &mut command_stage.ir,
+                            cmd.precondition.as_ref(),
+                        );
+                        if let Err(error) = validate_ir(&command_stage.ir) {
+                            let message = format!(
+                                "wait_for_solve command '{}' rejected by validation: {}",
+                                cmd.kind, error
+                            );
+                            live_workspace.push_log("error", message.clone());
+                            eprintln!("[fullmag] {message}");
+                            continue;
+                        }
+                        let command_plan = match fullmag_plan::plan(&command_stage.ir) {
+                            Ok(plan) => plan,
+                            Err(error) => {
+                                let message = format!(
+                                    "wait_for_solve command '{}' could not be planned: {}",
+                                    cmd.kind, error
+                                );
+                                live_workspace.push_log("error", message.clone());
+                                eprintln!("[fullmag] {message}");
+                                continue;
+                            }
+                        };
+                        let planned_frozen_spins_summary =
+                            match fullmag_runner::frozen_spins_runtime_status_for_backend_plan(
+                                &command_plan.backend_plan,
+                            ) {
+                                Ok(Some(status)) => format!(
+                                    "certificate with {} frozen and {} free site(s)",
+                                    status.frozen_site_count, status.free_site_count
+                                ),
+                                Ok(None) => "no certificate".to_string(),
+                                Err(error) => format!("invalid certificate: {error}"),
+                            };
+                        if cmd.kind == "solve" {
+                            command_stage.entrypoint_kind = stages[0].entrypoint_kind.clone();
+                            command_stage.ir.problem_meta.entrypoint_kind =
+                                stages[0].ir.problem_meta.entrypoint_kind.clone();
+                            command_stage.incoming_transition =
+                                stages[0].incoming_transition.clone();
+                        }
+                        stages[0] = command_stage;
+                        stage_execution_plans[0] = command_plan.clone();
+                        initial_execution_plan = command_plan;
+                        current_plan_summary = stages[0]
+                            .ir
+                            .plan_for(args.backend.map(BackendTarget::from))
+                            .map_err(join_errors)?;
+                        if stages.len() == 1 {
+                            interactive_template_ir = stages[0].ir.clone();
+                        }
+                        if let Some(source_scene_revision) = bound_frozen_spins_scene_revision {
+                            frozen_spins_applied_scene_revision = Some(source_scene_revision);
+                            live_workspace.push_log(
+                                "system",
+                                format!(
+                                    "Applied Frozen Spins scene revision {source_scene_revision} at the initial runtime-plan boundary for command {}",
+                                    cmd.command_id
+                                ),
+                            );
+                        }
+                        live_workspace.push_log(
+                            "info",
+                            format!(
+                                "Applied solver command payload overrides for {}; Frozen Spins binding: {}; planned status: {}",
+                                cmd.kind,
+                                frozen_binding_summary,
+                                planned_frozen_spins_summary
+                            ),
+                        );
+                    }
                     eprintln!("[fullmag] compute requested — starting solver");
+                    // The attached scratch runtime admits the command here, while the
+                    // canonical SceneDocument stage remains the source of solver defaults.
+                    // UI edits must be committed to the scene before issuing relax/run;
+                    // explicit command payload overrides were materialized and replanned above.
                     start_solver_command_id = Some(cmd.command_id.clone());
                     live_workspace.push_log("system", "Compute requested — starting solver");
                     live_workspace.update(|state| {
@@ -8148,7 +10892,13 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     break;
                 }
                 WaitForSolveCommandAction::Remesh => {
-                    execute_manual_interactive_remesh(
+                    if let Some(expected_id) = grid_refresh_command_id.as_deref() {
+                        anyhow::ensure!(
+                            cmd.kind == "fdm_grid_refresh" && cmd.command_id == expected_id,
+                            "grid-only runtime received a different command"
+                        );
+                    }
+                    let remesh_summary = execute_manual_interactive_remesh(
                         &cmd,
                         &mut stages,
                         &mut stage_execution_plans,
@@ -8159,18 +10909,33 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         &mut current_fem_mesh_override,
                         &mut current_fem_hmax_override,
                         &current_adaptive_runtime_state,
-                    )?;
-                    if continuation_magnetization.take().is_some() {
-                        live_workspace.push_log(
-                            "info",
-                            "Remesh changed the solver mesh; previous continuation magnetization was cleared",
-                        );
+                        &mut continuation_magnetization,
+                        &mut continuation_source,
+                        &mut continuation_completion,
+                        None,
+                        args.backend.map(BackendTarget::from),
+                    );
+                    let remesh_succeeded = remesh_summary.is_some();
+                    if let Some(summary) = remesh_summary {
+                        current_plan_summary = summary;
+                        continuation_relax_handoff = None;
+                        // The remesh invalidates all cached equilibrium field evidence.
+                        continuation_fem_mesh_payload = None;
+                        continuation_completion = None;
+                        continuation_stage_source = None;
+                        continuation_accepted_fields = None;
+                        continuation_certified_fields = None;
                     }
-                    continuation_source = None;
-                    continuation_completion = None;
+                    if grid_refresh_command_id.is_some() {
+                        let payload = live_workspace.grid_refresh_snapshot()?;
+                        sync_current_live_snapshot(&session_id, &payload)?;
+                        storage_lease.finish(remesh_succeeded)?;
+                        return Ok(());
+                    }
                 }
                 WaitForSolveCommandAction::Stop => {
                     eprintln!("[fullmag] aborted by user during wait_for_solve");
+                    crate::script_launch::mark_failure(crate::script_launch::ExitKind::Stopped);
                     live_workspace.push_log("system", "Aborted by user");
                     live_workspace.update(|state| {
                         state.session.status = "stopped".to_string();
@@ -8201,6 +10966,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         );
     }
 
+    crate::script_launch::note_stage(crate::script_launch::Stage::Running);
     for (stage_index, (mut stage, materialized_execution_plan)) in stages
         .into_iter()
         .zip(stage_execution_plans.into_iter())
@@ -8215,6 +10981,45 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         }
         let materialized_stage_ir = stage.ir.clone();
         let synthetic_action = stage.action.clone();
+        let stage_start_time_s = time_offset;
+        if synthetic_action.is_none() {
+            stage.ir.problem_meta.runtime_metadata.insert(
+                "stage_start_time_s".to_string(),
+                serde_json::json!(stage_start_time_s),
+            );
+        }
+        if let Some(ResolvedScriptStageAction::AddSolvedAntennaDrive { drive_id, .. }) = synthetic_action.as_ref() {
+            activated_solved_drive_ids.insert(drive_id.clone());
+        }
+        stage.ir.solved_antenna_drives.retain(|drive| {
+            !scheduled_solved_drives.iter().any(|(_, id)| id == &drive.id)
+                || activated_solved_drive_ids.contains(&drive.id)
+        });
+        let active_projection_ids = stage.ir.solved_antenna_drives.iter()
+            .map(|drive| drive.projection_ref.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        stage.ir.antenna_target_projections.retain(|projection| {
+            !scheduled_solved_drives.iter().any(|(id, _)| id == &projection.id)
+                || active_projection_ids.contains(projection.id.as_str())
+        });
+        match synthetic_action.as_ref() {
+            Some(ResolvedScriptStageAction::AntennaSourceSpectrum { request_id }) => {
+                stage.ir.antenna_spectrum_requests.retain(|request| request.id == *request_id);
+            }
+            _ => {
+                stage.ir.antenna_spectrum_requests.retain(|request| {
+                    !scheduled_spectrum_request_ids.contains(&request.id)
+                });
+            }
+        }
+        if synthetic_action.is_none() {
+            resolve_active_antenna_stage_outputs(&mut stage.ir, &published_antenna_outputs)?;
+        }
+        if synthetic_action.is_none()
+            || matches!(synthetic_action.as_ref(), Some(ResolvedScriptStageAction::AntennaSourceSpectrum { .. }))
+        {
+            resolve_antenna_spectrum_stage_outputs(&mut stage.ir, &published_antenna_outputs)?;
+        }
         apply_current_fem_overrides(
             &mut stage.ir,
             current_fem_mesh_override.as_ref(),
@@ -8256,6 +11061,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                                 );
                             }
                             apply_continuation_initial_state(&mut stage.ir, &transfer.values)?;
+                            trace_continuation_state("after-cross-backend-apply", &transfer.values);
                         }
                         Ok(None) => {
                             // Same-backend continuation — use values directly.
@@ -8263,6 +11069,10 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                                 &mut stage.ir,
                                 previous_final_magnetization,
                             )?;
+                            trace_continuation_state(
+                                "after-same-backend-apply",
+                                previous_final_magnetization,
+                            );
                         }
                         Err(e) => {
                             eprintln!("[fullmag] magnetization state transfer failed: {}", e);
@@ -8271,21 +11081,52 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     }
                 } else {
                     apply_continuation_initial_state(&mut stage.ir, previous_final_magnetization)?;
+                    trace_continuation_state(
+                        "after-untyped-backend-apply",
+                        previous_final_magnetization,
+                    );
                 }
             }
         }
-        validate_ir(&stage.ir)?;
-
-        current_plan_summary = stage
-            .ir
-            .plan_for(args.backend.map(BackendTarget::from))
-            .map_err(join_errors)?;
-        let mut execution_plan = if stage.ir == materialized_stage_ir {
+        let stage_plan_reusable = stage.ir == materialized_stage_ir;
+        if !stage_plan_reusable {
+            validate_ir(&stage.ir)?;
+            current_plan_summary = stage
+                .ir
+                .plan_for(args.backend.map(BackendTarget::from))
+                .map_err(join_errors)?;
+        }
+        let mut execution_plan = if stage_plan_reusable {
             materialized_execution_plan
+        } else if matches!(stage.action.as_ref(), Some(ResolvedScriptStageAction::AntennaExternalLeadInspection { .. })) {
+            plan_materialized_stage_snapshot(&stage)?
         } else {
             fullmag_plan::plan(&stage.ir).map_err(|error| anyhow!(error.to_string()))?
         };
-        emit_initial_state_warnings(Some(&live_workspace), &stage.ir, &execution_plan)?;
+        if let BackendPlanIR::FemEigen(fem) = &execution_plan.backend_plan {
+            trace_continuation_state("materialized-eigen-plan", &fem.equilibrium_magnetization);
+        }
+        let relax_handoff = accepted_relax_handoff_for_eigen_stage(
+            &execution_plan.backend_plan,
+            continuation_magnetization.as_deref(),
+            continuation_relax_handoff.as_ref(),
+        )?;
+        if synthetic_action.is_none() {
+            attach_solved_antenna_drive_bases(&stage.ir, &mut execution_plan, &artifact_dir)?;
+        }
+        let stage_time_frame = if synthetic_action.is_some() {
+            fullmag_runner::StageStepTimeFrame::StageLocal
+        } else {
+            fullmag_runner::stage_step_time_frame(&stage.ir, &execution_plan)
+                .map_err(|error| anyhow!(error.message))?
+        };
+        let runner_time_offset = match stage_time_frame {
+            fullmag_runner::StageStepTimeFrame::StageLocal => time_offset,
+            fullmag_runner::StageStepTimeFrame::Absolute => 0.0,
+        };
+        if !antenna_external_lead_inspection::is_carrier(&execution_plan) {
+            emit_initial_state_warnings(Some(&live_workspace), &stage.ir, &execution_plan)?;
+        }
         let use_live_callback = matches!(
             &execution_plan.backend_plan,
             BackendPlanIR::Fdm(_)
@@ -8297,6 +11138,22 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         let is_final_stage = stage_index + 1 == stage_count;
         let is_session_final_stage = is_final_stage && !interactive_requested;
         let current_stage_id = format!("stage-{stage_index:03}");
+        // The native runner receives the stage ProblemIR, while the session
+        // run identity lives in orchestration.  Carry both identities through
+        // runtime metadata so the artifact writer can publish producer
+        // provenance from the actual run instead of reconstructing it later.
+        stage.ir.problem_meta.runtime_metadata.insert(
+            "producer_run_id".to_string(),
+            serde_json::Value::String(run_id.clone()),
+        );
+        stage.ir.problem_meta.runtime_metadata.insert(
+            "producer_stage_id".to_string(),
+            serde_json::Value::String(current_stage_id.clone()),
+        );
+        stage.ir.problem_meta.runtime_metadata.insert(
+            "producer_stage_kind".to_string(),
+            serde_json::Value::String(stage.entrypoint_kind.clone()),
+        );
         let current_stage_artifact_dir = stage_artifact_dir(
             &workspace_dir,
             &artifact_dir,
@@ -8322,6 +11179,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             initialize_zarr_group(
                 &current_stage_artifact_dir.join("fields"),
                 serde_json::json!({"fullmag_role": "sampled_fields"}),
+            )?;
+        }
+        if synthetic_action.is_none() {
+            execute_antenna_spectrum_requests(
+                &stage.ir,
+                &artifact_dir,
+                &current_stage_artifact_dir,
+                None,
             )?;
         }
         write_sampling_resolution_stage_record(
@@ -8359,9 +11224,18 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 stage.entrypoint_kind
             ),
         );
+        let stage_application_boundary = start_solver_command_id.as_deref().map(|command_id| {
+            CommandApplicationBoundary::new(
+                &run_id,
+                command_id,
+                stage_initial_update.stats.step,
+                stage_initial_update.stats.time,
+            )
+        });
         live_workspace.update(|state| {
             let stage_runtime = session_runtime_selection_for_problem(
                 &stage.ir,
+                Some(&execution_plan),
                 field_every_n,
                 backend_target_name(stage.ir.backend_policy.requested_backend),
                 execution_mode_name(stage.ir.validation_profile.execution_mode),
@@ -8408,28 +11282,84 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 None,
                 stage.incoming_transition.as_ref(),
             );
+            attach_scripted_stage_solver_steps(
+                &mut next_stage_execution,
+                stage_index,
+                stage_application_boundary.as_ref(),
+                None,
+            );
             preserve_terminal_stage_history(
                 &mut next_stage_execution,
                 previous_stage_execution.as_ref(),
             );
+            attach_stage_antenna_solve_identity(
+                &mut next_stage_execution,
+                stage_index,
+                stage.action.as_ref(),
+            );
+            attach_stage_fem_mesh_identity(
+                &mut next_stage_execution,
+                stage_index,
+                stage_fem_mesh_asset.as_ref(),
+            );
             state.stage_execution = Some(next_stage_execution);
             clear_cached_preview_fields(state);
+            if antenna_external_lead_inspection::is_carrier(&execution_plan) {
+                antenna_external_lead_inspection::clear_magnetic_snapshot(state);
+            }
         });
 
         if let Some(action) = synthetic_action {
-            let synthetic_outcome = match execute_synthetic_stage(
+            let synthetic_interrupt_signal = display_selection_handle.running_interrupt_signal();
+            let synthetic_stage_output_dir = if matches!(
+                &action, ResolvedScriptStageAction::AntennaExternalLeadInspection { .. }
+            ) {
+                artifact_dir.join("antenna").join("external_lead_stage_outputs").join(&current_stage_id)
+            } else {
+                current_stage_artifact_dir.clone()
+            };
+            let synthetic_artifact_ref =
+                synthetic_stage_artifact_ref(&action, &synthetic_stage_output_dir);
+            let mut antenna_progress = |
+                phase: fullmag_runner::AntennaFieldStageStatus,
+                diagnostic: Option<String>,
+            | {
+                live_workspace.update(|state| {
+                    if let Some(execution) = state.stage_execution.as_mut() {
+                        update_antenna_live_stage_progress(
+                            execution,
+                            stage_index,
+                            phase,
+                            diagnostic,
+                            current_unix_millis_u64(),
+                        );
+                    }
+                });
+            };
+            let synthetic_outcome = match execute_synthetic_stage_with_interrupt(
                 &action,
+                Some(&stage.ir),
                 &artifact_dir,
-                &current_stage_artifact_dir,
+                &synthetic_stage_output_dir,
                 &execution_plan.backend_plan,
                 continuation_magnetization.as_deref(),
+                Some(synthetic_interrupt_signal.as_ref()),
+                Some(&mut antenna_progress),
             ) {
                 Ok(outcome) => outcome,
                 Err(error) => {
-                    let failed_at_unix_ms = unix_time_millis()?;
+                    let synthetic_cancelled =
+                        synthetic_interrupt_requested(Some(synthetic_interrupt_signal.as_ref()));
+                    let terminal_status = if synthetic_cancelled {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    };
+                    let terminal_at_unix_ms = unix_time_millis()?;
                     let mut snapshot = live_workspace.snapshot();
-                    let failed_runtime = session_runtime_selection_for_problem(
+                    let terminal_runtime = session_runtime_selection_for_problem(
                         &stage.ir,
+                        Some(&execution_plan),
                         field_every_n,
                         backend_target_name(final_requested_backend),
                         execution_mode_name(final_execution_mode),
@@ -8438,34 +11368,98 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     snapshot.session = build_session_manifest(
                         &session_id,
                         &run_id,
-                        "failed",
+                        terminal_status,
                         interactive_requested,
                         &script_path,
                         &final_problem_name,
-                        &failed_runtime,
+                        &terminal_runtime,
                         &artifact_dir,
                         started_at_unix_ms,
-                        failed_at_unix_ms,
+                        terminal_at_unix_ms,
                         plan_summary_json(&current_plan_summary),
                     );
                     snapshot.metadata =
-                        Some(current_live_metadata(&stage.ir, &execution_plan, "failed"));
+                        Some(current_live_metadata(
+                            &stage.ir,
+                            &execution_plan,
+                            terminal_status,
+                        ));
                     snapshot.mesh_workspace = current_mesh_workspace(
                         &stage.ir,
                         &execution_plan,
-                        "failed",
+                        terminal_status,
                         current_mesh_quality.as_ref(),
                         &current_mesh_history,
                     );
                     snapshot.run = run_manifest_from_steps(
                         &run_id,
                         &session_id,
-                        "failed",
+                        terminal_status,
                         &artifact_dir,
                         &aggregated_steps,
                     );
-                    set_live_state_status(&mut snapshot.live_state, "failed", Some(true));
+                    set_live_state_status(&mut snapshot.live_state, terminal_status, Some(true));
+                    if synthetic_cancelled
+                        || matches!(&action, ResolvedScriptStageAction::AntennaExternalLeadInspection { .. })
+                    {
+                        let previous_stage_execution = snapshot.stage_execution.clone();
+                        let terminal_completion = fullmag_ir::StageCompletionIR {
+                            status: terminal_status.into(),
+                            converged: false,
+                            reason: Some(if synthetic_cancelled {
+                                fullmag_ir::StageStopReason::UserCancelled
+                            } else {
+                                fullmag_ir::StageStopReason::BackendError
+                            }),
+                            metric: None,
+                            metric_name: None,
+                            metric_value: None,
+                            threshold: None,
+                        };
+                        let mut next_stage_execution =
+                            scripted_stage_execution_state_with_completion(
+                                stage_count,
+                                stage_index,
+                                &stage.entrypoint_kind,
+                                terminal_status,
+                                start_solver_command_id.as_deref(),
+                                Some(stage_started_at_unix_ms),
+                                Some(terminal_at_unix_ms),
+                                Some(synthetic_artifact_ref.display().to_string()),
+                                Some(&terminal_completion),
+                                stage.incoming_transition.as_ref(),
+                            );
+                        preserve_terminal_stage_history(
+                            &mut next_stage_execution,
+                            previous_stage_execution.as_ref(),
+                        );
+                        attach_stage_antenna_solve_identity(
+                            &mut next_stage_execution,
+                            stage_index,
+                            stage.action.as_ref(),
+                        );
+                        attach_stage_fem_mesh_identity(
+                            &mut next_stage_execution,
+                            stage_index,
+                            stage_fem_mesh_asset.as_ref(),
+                        );
+                        snapshot.stage_execution = Some(next_stage_execution);
+                    } else {
+                        mark_live_stage_execution_failed(
+                            &mut snapshot.stage_execution,
+                            terminal_at_unix_ms,
+                        );
+                    }
                     live_workspace.replace(snapshot);
+                    if synthetic_cancelled {
+                        scripted_cancelled = true;
+                        display_selection_handle.clear_running_interrupt();
+                        live_workspace.push_log(
+                            "warning",
+                            format!("Synthetic stage execution cancelled: {}", error),
+                        );
+                        break;
+                    }
                     live_workspace.push_log(
                         "error",
                         format!("Synthetic stage execution failed: {}", error),
@@ -8473,23 +11467,44 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     return Err(error);
                 }
             };
-
-            match &action {
-                ResolvedScriptStageAction::SaveState { artifact_name, .. } => {
-                    saved_state_sources.insert(
-                        artifact_name.clone(),
-                        continuation_source_for_backend_plan(&execution_plan.backend_plan),
+            if let ResolvedScriptStageAction::AntennaFieldSolve {
+                stage_id,
+                port_mode_id,
+                ..
+            } = &action
+            {
+                for reference in read_ready_antenna_stage_outputs(
+                    &antenna_stage_output_catalog_path(&current_stage_artifact_dir),
+                    &artifact_dir,
+                    stage_id,
+                    port_mode_id,
+                )? {
+                    let key = (
+                        reference.stage_id.clone(),
+                        reference.output_id.clone(),
+                        port_mode_id.clone(),
                     );
+                    if published_antenna_outputs.insert(key, reference).is_some() {
+                        bail!("antenna stage output was published more than once in this pipeline");
+                    }
+                }
+            }
+
+            let restored_saved_state_source = match &action {
+                ResolvedScriptStageAction::SaveState { artifact_name, .. } => {
+                    let source = continuation_source.clone().unwrap_or_else(|| {
+                        continuation_source_from_backend_plan(&execution_plan.backend_plan)
+                    });
+                    saved_state_sources.insert(artifact_name.clone(), source);
+                    None
                 }
                 ResolvedScriptStageAction::LoadState {
                     artifact_name: Some(artifact_name),
                     state_path: None,
                     ..
-                } => {
-                    continuation_source = saved_state_sources.get(artifact_name).cloned();
-                }
-                _ => {}
-            }
+                } => saved_state_sources.get(artifact_name).cloned(),
+                _ => None,
+            };
 
             let synthetic_stats = aggregated_steps.last().cloned().unwrap_or_default();
             let final_update = snapshot_step_update_from_stats(
@@ -8524,7 +11539,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     start_solver_command_id.as_deref(),
                     Some(stage_started_at_unix_ms),
                     Some(synthetic_completed_at_unix_ms),
-                    Some(current_stage_artifact_dir.display().to_string()),
+                    Some(synthetic_artifact_ref.display().to_string()),
                     None,
                     stage.incoming_transition.as_ref(),
                 );
@@ -8532,7 +11547,23 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     &mut next_stage_execution,
                     previous_stage_execution.as_ref(),
                 );
+                attach_stage_antenna_solve_identity(
+                    &mut next_stage_execution,
+                    stage_index,
+                    stage.action.as_ref(),
+                );
+                attach_stage_fem_mesh_identity(
+                    &mut next_stage_execution,
+                    stage_index,
+                    stage_fem_mesh_asset.as_ref(),
+                );
+                if interactive_requested && is_session_final_stage {
+                    publish_scripted_stages_awaiting_command(&mut next_stage_execution);
+                }
                 state.stage_execution = Some(next_stage_execution);
+                if antenna_external_lead_inspection::is_carrier(&execution_plan) {
+                    antenna_external_lead_inspection::clear_magnetic_snapshot(state);
+                }
             });
 
             if matches!(action, ResolvedScriptStageAction::LoadState { .. }) {
@@ -8555,19 +11586,34 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 }
             }
 
-            continuation_magnetization = Some(synthetic_outcome.magnetization);
-            if matches!(action, ResolvedScriptStageAction::LoadState { .. }) {
-                if !matches!(
-                    action,
-                    ResolvedScriptStageAction::LoadState {
-                        artifact_name: Some(_),
-                        state_path: None,
-                        ..
-                    }
-                ) {
-                    continuation_source = None;
+            // Inspection does not create or replace magnetic state. In
+            // particular, absent continuation must stay None, not Some([]).
+            if !matches!(
+                action,
+                ResolvedScriptStageAction::AntennaExternalLeadInspection { .. }
+            ) {
+                replace_continuation_after_synthetic_stage(
+                    &mut continuation_magnetization,
+                    &mut continuation_source,
+                    &mut continuation_fem_mesh_payload,
+                    &mut continuation_completion,
+                    &mut continuation_stage_source,
+                    &mut continuation_accepted_fields,
+                    &mut continuation_certified_fields,
+                    &mut continuation_relax_handoff,
+                    synthetic_outcome.magnetization,
+                    matches!(action, ResolvedScriptStageAction::ChangeDevice { .. }),
+                );
+            }
+            if matches!(
+                action,
+                ResolvedScriptStageAction::LoadState {
+                    artifact_name: Some(_),
+                    state_path: None,
+                    ..
                 }
-                continuation_completion = None;
+            ) {
+                continuation_source = restored_saved_state_source;
             }
             live_workspace.push_log("success", synthetic_outcome.message);
             eprintln!(
@@ -8607,6 +11653,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 torque_mode,
             )
         });
+        publish_frozen_spins_runtime_status_for_execution_plan(&live_workspace, &execution_plan)?;
         let mut stage_result = match if use_live_callback {
             if supports_dynamic_live_preview(&execution_plan.backend_plan) {
                 let mut live_cadence = LiveProgressCadence::default();
@@ -8631,7 +11678,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         let mut adjusted = offset_step_update(
                             update,
                             step_offset,
-                            time_offset,
+                            runner_time_offset,
                             finished,
                         );
                         if let Some(heartbeat) = stage_heartbeat.as_mut() {
@@ -8711,19 +11758,20 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 )
             } else {
                 let mut live_cadence = LiveProgressCadence::default();
-                fullmag_runner::run_planned_problem_with_callback_and_hysteresis_stage_id(
+                fullmag_runner::run_planned_problem_with_callback_and_hysteresis_stage_id_and_relax_handoff(
                     &stage.ir,
                     &execution_plan,
                     stage.until_seconds,
                     &current_stage_artifact_dir,
                     field_every_n,
                     Some(&current_stage_id),
+                    relax_handoff.as_ref(),
                     |update| {
                         let callback_start = solver_profile_callback_start(&live_workspace);
                         let _callback_nvtx = nvtx_range::Range::new(b"fem.host.callback\0");
                         let finished = update.finished && is_session_final_stage;
                         let mut adjusted =
-                            offset_step_update(update, step_offset, time_offset, finished);
+                            offset_step_update(update, step_offset, runner_time_offset, finished);
                         if let Some(heartbeat) = stage_heartbeat.as_mut() {
                             heartbeat.record(&mut adjusted);
                         }
@@ -8783,6 +11831,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 let mut snapshot = live_workspace.snapshot();
                 let failed_runtime = session_runtime_selection_for_problem(
                     &stage.ir,
+                    Some(&execution_plan),
                     field_every_n,
                     backend_target_name(final_requested_backend),
                     execution_mode_name(final_execution_mode),
@@ -8817,6 +11866,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     &artifact_dir,
                     &aggregated_steps,
                 );
+                mark_live_stage_execution_failed(&mut snapshot.stage_execution, failed_at_unix_ms);
                 set_live_state_status(&mut snapshot.live_state, "failed", Some(true));
                 live_workspace.replace(snapshot);
                 live_workspace.push_log("error", format!("Stage execution failed: {}", error));
@@ -8838,7 +11888,6 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             &current_stage_artifact_dir,
             field_every_n,
             step_offset,
-            time_offset,
             &mut current_mesh_quality,
             &mut current_mesh_history,
             &mut current_fem_mesh_override,
@@ -8857,7 +11906,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             &live_workspace,
             &stage_result,
             step_offset,
-            time_offset,
+            runner_time_offset,
         );
 
         if !use_live_callback {
@@ -8873,6 +11922,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     fdm.common_cells[2],
                 ],
                 BackendPlanIR::Fem(_)
+                | BackendPlanIR::AntennaExternalLeadInspection(_)
                 | BackendPlanIR::FemEigen(_)
                 | BackendPlanIR::FemFrequencyResponse(_) => [0, 0, 0],
             };
@@ -8886,7 +11936,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     coupled_checkpoint: is_final_step
                         .then(|| frozen_spins_checkpoint.clone())
                         .flatten(),
-                    stats: offset_step_stats(std::slice::from_ref(stats), step_offset, time_offset)
+                    stats: offset_step_stats(std::slice::from_ref(stats), step_offset, runner_time_offset)
                         .into_iter()
                         .next()
                         .expect("single step should offset"),
@@ -8908,6 +11958,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     hysteresis_settle_step_kind: None,
                     hysteresis_settle_step_method: None,
                     scalar_row_due: true,
+                    terminal_field_snapshot: false,
                     finished: is_final_step && is_session_final_stage,
                 };
                 if live_cadence.should_publish(&update) {
@@ -8943,7 +11994,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             &stage_result.steps,
             &stage_result.final_magnetization,
             step_offset,
-            time_offset,
+            runner_time_offset,
             is_session_final_stage && !stage_failed,
             frozen_spins_checkpoint_from_stage_artifacts(&current_stage_artifact_dir)?,
         ) {
@@ -8962,15 +12013,143 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             live_workspace.force_publish_latest_scalar_row();
         }
 
-        let offset_steps = offset_step_stats(&stage_result.steps, step_offset, time_offset);
+        let offset_steps = offset_step_stats(&stage_result.steps, step_offset, runner_time_offset);
+        let completed_step = offset_steps.last().map(|last| last.step);
         if let Some(last) = offset_steps.last() {
             step_offset = last.step;
             time_offset = last.time;
         }
         aggregated_steps.extend(offset_steps);
-        continuation_magnetization = Some(stage_result.final_magnetization.clone());
-        continuation_completion = stage_result.completion.clone();
-        continuation_source = Some(continuation_source_for_backend_plan(
+        let next_continuation_magnetization = stage_result.final_magnetization.clone();
+        let next_continuation_completion = stage_result.completion.clone();
+        let native_equilibrium_artifact_paths = match &execution_plan.backend_plan {
+            BackendPlanIR::Fem(plan) => Some(
+                fullmag_runner::CertifiedFemEquilibriumFields::artifact_paths_for_material(
+                    &plan.material,
+                ),
+            ),
+            _ => None,
+        };
+        let native_accepted_equilibrium_artifact_path = match &execution_plan.backend_plan {
+            BackendPlanIR::Fem(plan) => Some(
+                fullmag_runner::CertifiedFemEquilibriumFields::accepted_artifact_path_for_material(
+                    &plan.material,
+                ),
+            ),
+            _ => None,
+        };
+        let next_continuation_accepted_fields =
+            if matches!(&stage.ir.study, fullmag_ir::StudyIR::Relaxation { .. })
+                && matches!(&execution_plan.backend_plan, BackendPlanIR::Fem(_))
+                && stage_result.completion.as_ref().is_some_and(|completion| {
+                    completion.status == "completed" && completion.converged
+                })
+            {
+                let path = current_stage_artifact_dir.join(
+                    native_accepted_equilibrium_artifact_path
+                        .expect("FEM relaxation plan was checked"),
+                );
+                let bytes = fs::read(&path).with_context(|| {
+                    format!(
+                        "accepted native FEM relaxation did not publish accepted fields {}",
+                        path.display()
+                    )
+                })?;
+                Some(
+                    serde_json::from_slice(&bytes)
+                        .with_context(|| format!("failed to decode {}", path.display()))?,
+                )
+            } else {
+                None
+            };
+        let next_continuation_certified_fields =
+            if matches!(&stage.ir.study, fullmag_ir::StudyIR::Relaxation { .. })
+                && matches!(&execution_plan.backend_plan, BackendPlanIR::Fem(_))
+                && stage_result.completion.as_ref().is_some_and(|completion| {
+                    completion.status == "completed" && completion.converged
+                })
+            {
+                let path = current_stage_artifact_dir.join(
+                    native_equilibrium_artifact_paths.expect("FEM relaxation plan was checked").0,
+                );
+                let bytes = fs::read(&path).with_context(|| {
+                    format!(
+                        "certified native FEM relaxation did not publish {}",
+                        path.display()
+                    )
+                })?;
+                Some(
+                    serde_json::from_slice(&bytes)
+                        .with_context(|| format!("failed to decode {}", path.display()))?,
+                )
+            } else {
+                None
+            };
+        let next_continuation_recomputed_certificate =
+            if matches!(&stage.ir.study, fullmag_ir::StudyIR::Relaxation { .. })
+                && matches!(&execution_plan.backend_plan, BackendPlanIR::Fem(_))
+                && stage_result.completion.as_ref().is_some_and(|completion| {
+                    completion.status == "completed" && completion.converged
+                })
+            {
+                let path = current_stage_artifact_dir.join(
+                    native_equilibrium_artifact_paths.expect("FEM relaxation plan was checked").1,
+                );
+                let bytes = fs::read(&path).with_context(|| {
+                    format!(
+                        "recomputed native FEM relaxation did not publish {}",
+                        path.display()
+                    )
+                })?;
+                Some(
+                    serde_json::from_slice(&bytes)
+                        .with_context(|| format!("failed to decode {}", path.display()))?,
+                )
+            } else {
+                None
+            };
+        let next_continuation_stage_source = ContinuationStageSource {
+            run_id: run_id.clone(),
+            stage_id: current_stage_id.clone(),
+            stage_kind: stage.entrypoint_kind.clone(),
+            is_relaxation: matches!(&stage.ir.study, fullmag_ir::StudyIR::Relaxation { .. }),
+        };
+        let next_continuation_fem_mesh_payload =
+            fem_mesh_payload_from_backend_plan(&execution_plan.backend_plan);
+        let next_relax_handoff = match (
+            next_continuation_completion.as_ref(),
+            next_continuation_fem_mesh_payload.as_ref(),
+            next_continuation_accepted_fields.as_ref(),
+            next_continuation_certified_fields.as_ref(),
+            next_continuation_recomputed_certificate.as_ref(),
+        ) {
+            (
+                Some(completion),
+                Some(source_mesh),
+                Some(accepted_fields),
+                Some(certified_fields),
+                Some(recomputed_certificate),
+            ) => accepted_relax_handoff_from_completed_stage_with_exact_artifacts(
+                &execution_plan.backend_plan,
+                &next_continuation_stage_source,
+                source_mesh,
+                completion,
+                &next_continuation_magnetization,
+                &current_stage_artifact_dir,
+                accepted_fields,
+                certified_fields,
+                recomputed_certificate,
+            )?,
+            _ => None,
+        };
+        continuation_magnetization = Some(next_continuation_magnetization);
+        continuation_completion = next_continuation_completion;
+        continuation_accepted_fields = next_continuation_accepted_fields;
+        continuation_certified_fields = next_continuation_certified_fields;
+        continuation_stage_source = Some(next_continuation_stage_source);
+        continuation_fem_mesh_payload = next_continuation_fem_mesh_payload;
+        continuation_relax_handoff = next_relax_handoff;
+        continuation_source = Some(continuation_source_from_backend_plan(
             &execution_plan.backend_plan,
         ));
 
@@ -9027,12 +12206,30 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     preview_config: None,
                     stages: None,
                     profile: None,
+                    frozen_spins_runtime_plan_binding: None,
                 };
-                paused_stage = build_resumable_interactive_command(&stage_command, &stage_result)
+                let elapsed_seconds = elapsed_stage_seconds(
+                    &stage_result,
+                    stage_start_time_s,
+                    stage_time_frame,
+                )?;
+                paused_stage = build_resumable_interactive_command(
+                    &stage_command,
+                    &stage_result,
+                    elapsed_seconds,
+                )
                     .map(|command| PausedInteractiveStage {
                         command,
                         source_kind: stage.entrypoint_kind.clone(),
                         checkpoint_ref: None,
+                        waveform_origin_time_s: stage
+                            .ir
+                            .problem_meta
+                            .runtime_metadata
+                            .get("stage_waveform_origin_time_s")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(stage_start_time_s),
+                        requires_exact_waveform_clock: has_time_dependent_stage_drive(&stage.ir),
                     });
             }
             live_workspace.update(|state| {
@@ -9056,6 +12253,16 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 preserve_terminal_stage_history(
                     &mut next_stage_execution,
                     previous_stage_execution.as_ref(),
+                );
+                attach_stage_antenna_solve_identity(
+                    &mut next_stage_execution,
+                    stage_index,
+                    stage.action.as_ref(),
+                );
+                attach_stage_fem_mesh_identity(
+                    &mut next_stage_execution,
+                    stage_index,
+                    stage_fem_mesh_asset.as_ref(),
                 );
                 state.stage_execution = Some(next_stage_execution);
             });
@@ -9092,12 +12299,13 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         {
             let final_step = stage_result.steps.last();
             eprintln!(
-                "[fullmag] stage {}/{} ({}) {} — steps={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
+                "[fullmag] stage {}/{} ({}) {} — samples={}  final_step={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
                 stage_index + 1,
                 stage_count,
                 stage.entrypoint_kind,
                 stage_status,
                 stage_result.steps.len(),
+                final_step.map(|s| s.step).unwrap_or(0),
                 final_step.map(|s| s.time).unwrap_or(0.0),
                 final_step.map(|s| s.max_torque_T).unwrap_or(0.0),
                 format_stop_reason(stage_result.completion.as_ref()),
@@ -9128,10 +12336,34 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 stage_result.completion.as_ref(),
                 stage.incoming_transition.as_ref(),
             );
+            attach_scripted_stage_solver_steps(
+                &mut next_stage_execution,
+                stage_index,
+                stage_application_boundary.as_ref(),
+                completed_step,
+            );
             preserve_terminal_stage_history(
                 &mut next_stage_execution,
                 previous_stage_execution.as_ref(),
             );
+            preserve_completed_parallel_execution(
+                &mut next_stage_execution,
+                previous_stage_execution.as_ref(),
+                stage_index,
+            );
+            attach_stage_antenna_solve_identity(
+                &mut next_stage_execution,
+                stage_index,
+                stage.action.as_ref(),
+            );
+            attach_stage_fem_mesh_identity(
+                &mut next_stage_execution,
+                stage_index,
+                stage_fem_mesh_asset.as_ref(),
+            );
+            if interactive_requested && is_session_final_stage && !stage_failed {
+                publish_scripted_stages_awaiting_command(&mut next_stage_execution);
+            }
             state.stage_execution = Some(next_stage_execution);
             if stage_failed {
                 state.session.status = "failed".to_string();
@@ -9156,6 +12388,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
 
     if interactive_requested {
         let awaiting_at_unix_ms = unix_time_millis()?;
+        if paused_stage.is_none() {
+            resolve_active_antenna_stage_outputs(
+                &mut interactive_template_ir,
+                &published_antenna_outputs,
+            )?;
+        }
         apply_current_fem_overrides(
             &mut interactive_template_ir,
             current_fem_mesh_override.as_ref(),
@@ -9164,15 +12402,15 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         );
 
         // Build session context for interactive command loop
-        let ctx = crate::runtime_supervisor::InteractiveSessionContext {
+        let mut ctx = crate::runtime_supervisor::InteractiveSessionContext {
             session_id: session_id.clone(),
             run_id: run_id.clone(),
             interactive_requested,
             script_path: script_path.clone(),
             final_problem_name: final_problem_name.clone(),
-            requested_backend: final_requested_backend,
-            execution_mode: final_execution_mode,
-            precision: final_precision,
+            runtime_selection: crate::runtime_supervisor::runtime_selection_from_manifest(
+                &live_workspace.snapshot().session,
+            ),
             artifact_dir: artifact_dir.clone(),
             workspace_dir: workspace_dir.clone(),
             started_at_unix_ms,
@@ -9181,6 +12419,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
 
         if paused_stage.is_none() {
             live_workspace.update(|state| {
+                if let Some(execution) = state.stage_execution.as_mut() {
+                    publish_scripted_stages_awaiting_command(execution);
+                }
                 state.session = ctx.build_session(
                     "awaiting_command",
                     &plan_summary_json(&current_plan_summary),
@@ -9227,6 +12468,13 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         // Each completed/skipped stage pops from the front. Break aborts the whole sequence.
         let mut active_sequence: Option<ActiveSequenceState> = None;
         loop {
+            if display_selection_handle.owner_session_lost() {
+                live_workspace.push_log(
+                    "warning",
+                    "Attached runtime owner session was replaced — closing workspace",
+                );
+                break;
+            }
             if paused_stage.is_some() {
                 match interactive_runtime_host.take_running_interrupt() {
                     Some(crate::interactive_runtime_host::InteractiveStageInterrupt::Break) => {
@@ -9309,7 +12557,85 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             let Some(command) =
                 interactive_runtime_host.wait_next_command_coalesced(Duration::from_millis(250))
             else {
+                if display_selection_handle.owner_session_lost() {
+                    live_workspace.push_log(
+                        "warning",
+                        "Attached runtime owner session was replaced — closing workspace",
+                    );
+                    break;
+                }
                 continue;
+            };
+
+            let mut frozen_replan_resume_label = None;
+            let command = if command.kind == "apply_frozen_spins" {
+                if let Some(paused) = paused_stage.take() {
+                    let resumed = match bind_frozen_spins_replan_to_paused_command(
+                        paused.command,
+                        &command,
+                    ) {
+                        Ok(resumed) => resumed,
+                        Err(error) => {
+                            live_workspace.push_log(
+                                "error",
+                                format!(
+                                    "Frozen Spins hot-apply command {} was rejected: {}",
+                                    command.command_id, error
+                                ),
+                            );
+                            continue;
+                        }
+                    };
+                    frozen_replan_resume_label =
+                        Some(format!("Frozen Spins hot-apply ({})", paused.source_kind));
+                    live_workspace.push_log(
+                        "system",
+                        format!(
+                            "Applying Frozen Spins revision at accepted-step boundary and resuming {}",
+                            paused.source_kind
+                        ),
+                    );
+                    resumed
+                } else {
+                    match problem_with_frozen_spins_runtime_plan_binding(
+                        &interactive_template_ir,
+                        &command,
+                        frozen_spins_applied_scene_revision,
+                    ) {
+                        Ok(Some((candidate, source_scene_revision))) => {
+                            if let Err(error) = validate_ir(&candidate) {
+                                live_workspace.push_log(
+                                    "error",
+                                    format!(
+                                        "Frozen Spins revision {source_scene_revision} failed canonical IR validation: {error}"
+                                    ),
+                                );
+                                continue;
+                            }
+                            interactive_template_ir = candidate;
+                            frozen_spins_applied_scene_revision = Some(source_scene_revision);
+                            interactive_runtime_host
+                                .replace_base_problem(interactive_template_ir.clone());
+                            live_workspace.push_log(
+                                "system",
+                                format!(
+                                    "Applied Frozen Spins scene revision {source_scene_revision} to the idle runtime template"
+                                ),
+                            );
+                        }
+                        Ok(None) => {}
+                        Err(error) => live_workspace.push_log(
+                            "error",
+                            format!(
+                                "Frozen Spins idle runtime-plan binding rejected for command {}: {}",
+                                command.command_id, error
+                            ),
+                        ),
+                    }
+                    continue;
+                }
+            } else {
+                command
             };
 
             if interactive_runtime_host.handle_display_sync(&command, &live_workspace) {
@@ -9334,12 +12660,13 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 match interactive_runtime_host
                     .compute_current_fields(compute_magnetization, &live_workspace)
                 {
-                    Ok(()) => live_workspace.push_log(
+                    Ok(()) => live_workspace.push_command_log(
+                        &command.command_id,
                         "success",
                         "Field snapshots computed for the current magnetization",
                     ),
                     Err(error) => live_workspace
-                        .push_log("error", format!("Compute fields failed: {}", error)),
+                        .push_command_log(&command.command_id, "error", format!("Compute fields failed: {}", error)),
                 }
                 continue;
             }
@@ -9358,9 +12685,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     .compute_current_energies(compute_magnetization, &live_workspace)
                 {
                     Ok(()) => live_workspace
-                        .push_log("success", "Energies computed for the current magnetization"),
+                        .push_command_log(&command.command_id, "success", "Energies computed for the current magnetization"),
                     Err(error) => live_workspace
-                        .push_log("error", format!("Compute energies failed: {}", error)),
+                        .push_command_log(&command.command_id, "error", format!("Compute energies failed: {}", error)),
                 }
                 continue;
             }
@@ -9425,7 +12752,19 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 break;
             }
 
-            let (command, resume_label_hint) =
+            if matches!(typed_cmd, Some(fullmag_runner::LiveControlCommand::Resume))
+                && paused_stage
+                    .as_ref()
+                    .is_some_and(|paused| paused.requires_exact_waveform_clock)
+            {
+                live_workspace.push_log(
+                    "error",
+                    "Resuming a time-dependent drive requires restoring its original waveform clock; stop this paused stage instead",
+                );
+                continue;
+            }
+
+            let (command, resume_label_hint, resumed_waveform_origin_time_s) =
                 if matches!(typed_cmd, Some(fullmag_runner::LiveControlCommand::Resume)) {
                     let Some(paused) = paused_stage.take() else {
                         live_workspace.push_log(
@@ -9446,21 +12785,26 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     (
                         paused.command,
                         Some(format!("resume ({})", paused.source_kind)),
+                        Some(paused.waveform_origin_time_s),
                     )
                 } else {
-                    (command, None)
+                    (command, frozen_replan_resume_label, None)
                 };
+            let frozen_spins_explicit_reactivation = resume_label_hint
+                .as_deref()
+                .is_some_and(|label| label.starts_with("Frozen Spins hot-apply"));
 
             if command.kind == "load_state" {
                 if paused_stage.is_some() {
-                    live_workspace.push_log(
+                    live_workspace.push_command_log(
+                        &command.command_id,
                         "warning",
-                        "Load-state is disabled while a stage is paused. Stop it first or resume it.",
+                        "Failed to load workspace state: load-state is disabled while a stage is paused. Stop it first or resume it.",
                     );
                     continue;
                 }
                 let Some(state_path) = command.state_path.as_deref() else {
-                    live_workspace.push_log("error", "State import command is missing state_path");
+                    live_workspace.push_command_log(&command.command_id, "error", "Failed to load workspace state: missing state_path");
                     continue;
                 };
                 match read_magnetization_state(
@@ -9473,16 +12817,27 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         if let Err(error) = interactive_runtime_host
                             .load_state(loaded_state.values.clone(), &live_workspace)
                         {
-                            live_workspace.push_log(
+                            live_workspace.push_command_log(
+                                &command.command_id,
                                 "error",
-                                format!("Failed to apply imported workspace state: {}", error),
+                                format!("Failed to load workspace state: {}", error),
                             );
                             continue;
                         }
-                        continuation_magnetization = Some(loaded_state.values);
-                        continuation_source = None; // loaded from file — unknown source
-                        continuation_completion = None;
-                        live_workspace.push_log(
+                        replace_continuation_after_synthetic_stage(
+                            &mut continuation_magnetization,
+                            &mut continuation_source,
+                            &mut continuation_fem_mesh_payload,
+                            &mut continuation_completion,
+                            &mut continuation_stage_source,
+                            &mut continuation_accepted_fields,
+                            &mut continuation_certified_fields,
+                            &mut continuation_relax_handoff,
+                            loaded_state.values,
+                            false,
+                        );
+                        live_workspace.push_command_log(
+                            &command.command_id,
                             "success",
                             format!(
                                 "Loaded workspace state from {} ({} vectors)",
@@ -9491,7 +12846,8 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         );
                     }
                     Err(error) => {
-                        live_workspace.push_log(
+                        live_workspace.push_command_log(
+                            &command.command_id,
                             "error",
                             format!("Failed to load workspace state: {}", error),
                         );
@@ -9520,7 +12876,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     .enter_awaiting_command(continuation_magnetization.clone(), &live_workspace);
             }
 
-            if command.kind == "remesh" {
+            if matches!(command.kind.as_str(), "remesh" | "fdm_grid_refresh") {
                 let mut remesh_problem = interactive_template_ir.clone();
                 apply_current_fem_overrides(
                     &mut remesh_problem,
@@ -9533,9 +12889,8 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     0.0,
                     "interactive_remesh",
                 )];
-                let mut remesh_stage_plans = vec![fullmag_plan::plan(&remesh_stages[0].ir)
-                    .map_err(|error| anyhow!(error.to_string()))?];
-                execute_manual_interactive_remesh(
+                let mut remesh_stage_plans = Vec::new();
+                if let Some(summary) = execute_manual_interactive_remesh(
                     &command,
                     &mut remesh_stages,
                     &mut remesh_stage_plans,
@@ -9546,24 +12901,23 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     &mut current_fem_mesh_override,
                     &mut current_fem_hmax_override,
                     &current_adaptive_runtime_state,
-                )?;
-                if continuation_magnetization.take().is_some() {
-                    live_workspace.push_log(
-                        "info",
-                        "Remesh changed the solver mesh; previous continuation magnetization was cleared",
-                    );
+                    &mut continuation_magnetization,
+                    &mut continuation_source,
+                    &mut continuation_completion,
+                    Some(&mut interactive_runtime_host),
+                    args.backend.map(BackendTarget::from),
+                ) {
+                    interactive_template_ir = remesh_stages.remove(0).ir;
+                    current_plan_summary = summary;
+                    drop(continuation_relax_handoff.take());
+                    // The remesh invalidates all cached equilibrium field evidence.
+                    continuation_fem_mesh_payload = None;
+                    continuation_completion = None;
+                    continuation_stage_source = None;
+                    continuation_accepted_fields = None;
+                    continuation_certified_fields = None;
+                    interactive_runtime_host.enter_awaiting_command(None, &live_workspace);
                 }
-                continuation_source = None;
-                continuation_completion = None;
-                if let Some(remesh_stage) = remesh_stages.into_iter().next() {
-                    interactive_template_ir = remesh_stage.ir;
-                    current_plan_summary = interactive_template_ir
-                        .plan_for(args.backend.map(BackendTarget::from))
-                        .map_err(join_errors)?;
-                    interactive_runtime_host.replace_base_problem(interactive_template_ir.clone());
-                }
-                interactive_runtime_host
-                    .enter_awaiting_command(continuation_magnetization.clone(), &live_workspace);
                 continue;
             }
 
@@ -9661,6 +13015,49 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 (command, kind)
             };
 
+            match problem_with_frozen_spins_runtime_plan_binding(
+                &interactive_template_ir,
+                &command,
+                frozen_spins_applied_scene_revision,
+            ) {
+                Ok(Some((candidate, source_scene_revision))) => {
+                    if let Err(error) = validate_ir(&candidate) {
+                        live_workspace.push_log(
+                            "error",
+                            format!(
+                                "Frozen Spins revision {source_scene_revision} failed canonical IR validation: {error}"
+                            ),
+                        );
+                        continue;
+                    }
+                    interactive_template_ir = candidate;
+                    frozen_spins_applied_scene_revision = Some(source_scene_revision);
+                    interactive_runtime_host.replace_base_problem(interactive_template_ir.clone());
+                    live_workspace.push_log(
+                        "system",
+                        format!(
+                            "Applied Frozen Spins scene revision {source_scene_revision} at the next runtime-plan boundary for command {}",
+                            command.command_id
+                        ),
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!(
+                        "[fullmag] frozen spins runtime plan binding rejected for command '{}': {}",
+                        command.command_id, error
+                    );
+                    live_workspace.push_log(
+                        "error",
+                        format!(
+                            "Frozen Spins runtime-plan binding rejected for command {}: {}",
+                            command.command_id, error
+                        ),
+                    );
+                    continue;
+                }
+            }
+
             let Some(mut stage) =
                 (match build_interactive_command_stage(&interactive_template_ir, &command) {
                     Ok(stage) => stage,
@@ -9682,6 +13079,19 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             else {
                 break;
             };
+            if let Err(error) =
+                resolve_active_antenna_stage_outputs(&mut stage.ir, &published_antenna_outputs)
+            {
+                live_workspace.push_command_log(
+                    &command.command_id,
+                    "error",
+                    format!(
+                        "Interactive command '{}' failed antenna stage-output resolution: {}",
+                        command.kind, error
+                    ),
+                );
+                continue;
+            }
             if active_sequence.is_none()
                 && matches!(command.kind.as_str(), "run" | "relax" | "solve")
             {
@@ -9742,14 +13152,48 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     apply_continuation_initial_state(&mut stage.ir, previous_final_magnetization)?;
                 }
             }
+            let stage_start_time_s = time_offset;
+            stage.ir.problem_meta.runtime_metadata.insert(
+                "stage_start_time_s".to_string(),
+                serde_json::json!(stage_start_time_s),
+            );
+            if let Some(origin_time_s) = resumed_waveform_origin_time_s {
+                stage.ir.problem_meta.runtime_metadata.insert(
+                    "stage_waveform_origin_time_s".to_string(),
+                    serde_json::json!(origin_time_s),
+                );
+            } else {
+                stage
+                    .ir
+                    .problem_meta
+                    .runtime_metadata
+                    .remove("stage_waveform_origin_time_s");
+            }
             validate_ir(&stage.ir)?;
             current_plan_summary = stage
                 .ir
                 .plan_for(args.backend.map(BackendTarget::from))
                 .map_err(join_errors)?;
-            let execution_plan =
+            let mut execution_plan =
                 fullmag_plan::plan(&stage.ir).map_err(|error| anyhow!(error.to_string()))?;
-            emit_initial_state_warnings(Some(&live_workspace), &stage.ir, &execution_plan)?;
+            ctx.runtime_selection = session_runtime_selection_for_problem(
+                &stage.ir,
+                Some(&execution_plan),
+                field_every_n,
+                backend_target_name(stage.ir.backend_policy.requested_backend),
+                execution_mode_name(stage.ir.validation_profile.execution_mode),
+                execution_precision_name(stage.ir.backend_policy.execution_precision),
+            );
+            attach_solved_antenna_drive_bases(&stage.ir, &mut execution_plan, &artifact_dir)?;
+            let stage_time_frame = fullmag_runner::stage_step_time_frame(&stage.ir, &execution_plan)
+                .map_err(|error| anyhow!(error.message))?;
+            let runner_time_offset = match stage_time_frame {
+                fullmag_runner::StageStepTimeFrame::StageLocal => stage_start_time_s,
+                fullmag_runner::StageStepTimeFrame::Absolute => 0.0,
+            };
+            if !antenna_external_lead_inspection::is_carrier(&execution_plan) {
+                emit_initial_state_warnings(Some(&live_workspace), &stage.ir, &execution_plan)?;
+            }
             let use_live_callback = matches!(
                 &execution_plan.backend_plan,
                 BackendPlanIR::Fdm(_)
@@ -9766,6 +13210,22 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 &stage.entrypoint_kind,
             );
             let current_stage_id = format!("stage-{interactive_stage_index:03}");
+            // Preserve the actual orchestration identity at the producer
+            // boundary.  Interactive FEM eigen sweeps use the same exact
+            // relaxation sidecar contract as scripted stages; never let the
+            // runner infer these values from the consuming modal stage.
+            stage.ir.problem_meta.runtime_metadata.insert(
+                "producer_run_id".to_string(),
+                serde_json::Value::String(run_id.clone()),
+            );
+            stage.ir.problem_meta.runtime_metadata.insert(
+                "producer_stage_id".to_string(),
+                serde_json::Value::String(current_stage_id.clone()),
+            );
+            stage.ir.problem_meta.runtime_metadata.insert(
+                "producer_stage_kind".to_string(),
+                serde_json::Value::String(stage.entrypoint_kind.clone()),
+            );
             fs::create_dir_all(&current_stage_artifact_dir).with_context(|| {
                 format!(
                     "failed to create interactive stage artifact dir {}",
@@ -9795,6 +13255,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     .get("sampling_resolution"),
             )?;
             let running_at_unix_ms = unix_time_millis()?;
+            let application_boundary = CommandApplicationBoundary::new(
+                &run_id,
+                &command.command_id,
+                step_offset,
+                time_offset,
+            );
             let stage_fem_mesh_asset = fullmag_runner::StageFemMeshAsset::build_from_backend_plan(
                 &execution_plan.backend_plan,
             );
@@ -9814,7 +13280,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                     &command.command_id,
                     running_at_unix_ms,
                     Some(current_stage_artifact_dir.display().to_string()),
+                    Some(&application_boundary),
                 );
+                sequence.mark_current_fem_mesh_identity(stage_fem_mesh_asset.as_ref());
             }
             live_workspace.push_log(
                 "system",
@@ -9844,6 +13312,9 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 });
                 state.live_state = live_state_manifest_from_update(stage_initial_update.clone());
                 clear_cached_preview_fields(state);
+                if antenna_external_lead_inspection::is_carrier(&execution_plan) {
+                    antenna_external_lead_inspection::clear_magnetic_snapshot(state);
+                }
             });
 
             let torque_mode = torque_display_mode(&stage.ir);
@@ -9870,7 +13341,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         let callback_start = solver_profile_callback_start(&live_workspace);
                         let _callback_nvtx = nvtx_range::Range::new(b"fem.host.callback\0");
                         let mut adjusted =
-                            offset_step_update(update, step_offset, time_offset, false);
+                            offset_step_update(update, step_offset, runner_time_offset, false);
                         if let Some(heartbeat) = stage_heartbeat.as_mut() {
                             heartbeat.record(&mut adjusted);
                         }
@@ -9959,6 +13430,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                             stage_fem_mesh_asset.as_ref(),
                             field_every_n,
                             continuation_magnetization.as_deref(),
+                            frozen_spins_explicit_reactivation,
                             &live_workspace,
                         ) {
                             eprintln!("interactive preview runtime warning: {}", error);
@@ -10026,7 +13498,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                             let callback_start = solver_profile_callback_start(&live_workspace);
                             let _callback_nvtx = nvtx_range::Range::new(b"fem.host.callback\0");
                             let mut adjusted =
-                                offset_step_update(update, step_offset, time_offset, false);
+                                offset_step_update(update, step_offset, runner_time_offset, false);
                             if let Some(heartbeat) = stage_heartbeat.as_mut() {
                                 heartbeat.record(&mut adjusted);
                             }
@@ -10165,12 +13637,12 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 &live_workspace,
                 &stage_result,
                 step_offset,
-                time_offset,
+                runner_time_offset,
             );
 
             // Handle mid-stage pause (first-class RunStatus::Paused from runner)
             if stage_result.status == fullmag_runner::RunStatus::Paused {
-                let offset_steps = offset_step_stats(&stage_result.steps, step_offset, time_offset);
+                let offset_steps = offset_step_stats(&stage_result.steps, step_offset, runner_time_offset);
                 if let Some(last) = offset_steps.last() {
                     step_offset = last.step;
                     time_offset = last.time;
@@ -10179,14 +13651,19 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 aggregated_steps.extend(offset_steps);
                 continuation_magnetization = Some(stage_result.final_magnetization.clone());
                 continuation_completion = stage_result.completion.clone();
-                continuation_source = Some(continuation_source_for_backend_plan(
+                continuation_source = Some(continuation_source_from_backend_plan(
                     &execution_plan.backend_plan,
                 ));
                 interactive_stage_index += 1;
 
                 let paused_at_unix_ms = unix_time_millis()?;
+                let elapsed_seconds = elapsed_stage_seconds(
+                    &stage_result,
+                    stage_start_time_s,
+                    stage_time_frame,
+                )?;
                 let resumable_command =
-                    build_resumable_interactive_command(&command, &stage_result);
+                    build_resumable_interactive_command(&command, &stage_result, elapsed_seconds);
                 if let Some(resumable_command) = resumable_command {
                     let pause_checkpoint = match capture_pause_checkpoint(
                         &run_id,
@@ -10224,6 +13701,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         checkpoint_ref: pause_checkpoint
                             .as_ref()
                             .map(|capture| capture.checkpoint.checkpoint_id.clone()),
+                        waveform_origin_time_s: stage
+                            .ir
+                            .problem_meta
+                            .runtime_metadata
+                            .get("stage_waveform_origin_time_s")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(stage_start_time_s),
+                        requires_exact_waveform_clock: has_time_dependent_stage_drive(&stage.ir),
                     });
                     live_workspace.update(|state| {
                         state.session = ctx.build_session(
@@ -10279,7 +13764,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
 
             // Handle mid-stage cancellation (break/close — still uses take_running_interrupt)
             if stage_result.status == fullmag_runner::RunStatus::Cancelled {
-                let offset_steps = offset_step_stats(&stage_result.steps, step_offset, time_offset);
+                let offset_steps = offset_step_stats(&stage_result.steps, step_offset, runner_time_offset);
                 if let Some(last) = offset_steps.last() {
                     step_offset = last.step;
                     time_offset = last.time;
@@ -10287,7 +13772,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 aggregated_steps.extend(offset_steps);
                 continuation_magnetization = Some(stage_result.final_magnetization.clone());
                 continuation_completion = stage_result.completion.clone();
-                continuation_source = Some(continuation_source_for_backend_plan(
+                continuation_source = Some(continuation_source_from_backend_plan(
                     &execution_plan.backend_plan,
                 ));
                 interactive_stage_index += 1;
@@ -10490,6 +13975,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         fdm.common_cells[2],
                     ],
                     BackendPlanIR::Fem(_)
+                    | BackendPlanIR::AntennaExternalLeadInspection(_)
                     | BackendPlanIR::FemEigen(_)
                     | BackendPlanIR::FemFrequencyResponse(_) => [0, 0, 0],
                 };
@@ -10506,7 +13992,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         stats: offset_step_stats(
                             std::slice::from_ref(stats),
                             step_offset,
-                            time_offset,
+                            runner_time_offset,
                         )
                         .into_iter()
                         .next()
@@ -10522,6 +14008,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                         hysteresis_settle_step_kind: None,
                         hysteresis_settle_step_method: None,
                         scalar_row_due: true,
+                        terminal_field_snapshot: false,
                         finished: false,
                     };
                     if live_cadence.should_publish(&update) {
@@ -10548,7 +14035,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 &stage_result.steps,
                 &stage_result.final_magnetization,
                 step_offset,
-                time_offset,
+                runner_time_offset,
                 false,
                 frozen_spins_checkpoint_from_stage_artifacts(&current_stage_artifact_dir)?,
             ) {
@@ -10570,7 +14057,8 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 live_workspace.force_publish_latest_scalar_row();
             }
 
-            let offset_steps = offset_step_stats(&stage_result.steps, step_offset, time_offset);
+            let offset_steps = offset_step_stats(&stage_result.steps, step_offset, runner_time_offset);
+            let completed_step = offset_steps.last().map(|last| last.step);
             if let Some(last) = offset_steps.last() {
                 step_offset = last.step;
                 time_offset = last.time;
@@ -10578,7 +14066,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             aggregated_steps.extend(offset_steps);
             continuation_completion = stage_result.completion.clone();
             continuation_magnetization = Some(stage_result.final_magnetization);
-            continuation_source = Some(continuation_source_for_backend_plan(
+            continuation_source = Some(continuation_source_from_backend_plan(
                 &execution_plan.backend_plan,
             ));
             interactive_stage_index += 1;
@@ -10598,9 +14086,10 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 {
                     let final_step = stage_result.steps.last();
                     eprintln!(
-                        "[fullmag] {} — steps={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
+                        "[fullmag] {} — samples={}  final_step={}  t={:.4e}  max_torque[T]={:.4e}  stop: {}",
                         stage_message,
                         stage_result.steps.len(),
+                        final_step.map(|s| s.step).unwrap_or(0),
                         final_step.map(|s| s.time).unwrap_or(0.0),
                         final_step.map(|s| s.max_torque_T).unwrap_or(0.0),
                         format_stop_reason(stage_result.completion.as_ref()),
@@ -10611,6 +14100,10 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
 
             // ── Sequence continuation: if there are more stages, advance ──
             if let Some(sequence) = active_sequence.as_mut() {
+                let current_stage_index = sequence.current_stage_index();
+                if let Some(record) = sequence.stages.get_mut(current_stage_index) {
+                    record.completed_step = completed_step;
+                }
                 sequence.mark_current(
                     "completed",
                     stage_result.completion.as_ref(),
@@ -10676,14 +14169,22 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                 .enter_awaiting_command(continuation_magnetization.clone(), &live_workspace);
             paused_stage = None;
         }
+        final_session_runtime = ctx.runtime_selection.clone();
         interactive_runtime_host.mark_closed(&live_workspace);
+        if display_selection_handle.owner_session_lost() {
+            return Ok(());
+        }
         live_workspace.update(|state| {
             set_live_state_status(&mut state.live_state, "completed", Some(true));
         });
     }
 
     let finished_at_unix_ms = unix_time_millis()?;
-    let final_status = fullmag_runner::RunStatus::Completed;
+    let final_status = if scripted_cancelled && !interactive_requested {
+        fullmag_runner::RunStatus::Cancelled
+    } else {
+        fullmag_runner::RunStatus::Completed
+    };
 
     // If this was a FEM eigen run, read the spectrum artifact from disk so we
     // can include the mode count and lowest frequency in the summary printout.
@@ -10736,6 +14237,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         final_e_ext: aggregated_steps.last().map(|step| step.e_ext),
         final_e_ani: aggregated_steps.last().map(|step| step.e_ani),
         final_e_dmi: aggregated_steps.last().map(|step| step.e_dmi),
+        final_e_rotated_dmi: aggregated_steps.last().map(|step| step.e_rotated_dmi),
         final_e_total: aggregated_steps.last().map(|step| step.e_total),
         wall_time_ns: aggregated_steps.last().map(|step| step.wall_time_ns),
         backend_create_wall_time_ns: aggregated_steps
@@ -10812,6 +14314,14 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     };
 
     live_workspace.update(|state| {
+        if let Some(execution) = state.stage_execution.as_mut() {
+            *execution = stage_execution_from_records(
+                &execution.stages,
+                None,
+                None,
+                &summary.status,
+            );
+        }
         state.session = build_session_manifest(
             &session_id,
             &run_id,
@@ -10833,6 +14343,8 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             &aggregated_steps,
         );
         state.latest_scalar_row = aggregated_steps.last().map(|step| CurrentLiveScalarRow {
+            kind: step.kind.clone(),
+            solver_progress: step.solver_progress.clone(),
             step: step.step,
             time: step.time,
             solver_dt: step.dt,
@@ -10850,6 +14362,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
             e_ext: step.e_ext,
             e_ani: step.e_ani,
             e_dmi: step.e_dmi,
+            e_rotated_dmi: step.e_rotated_dmi,
             e_total: step.e_total,
             max_dm_dt: step.max_dm_dt,
             max_h_eff: step.max_h_eff,
@@ -10861,10 +14374,20 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         });
         set_live_state_status(&mut state.live_state, &summary.status, Some(true));
     });
+    let summary_level = if matches!(final_status, fullmag_runner::RunStatus::Cancelled) {
+        "warning"
+    } else {
+        "success"
+    };
+    let summary_verb = if matches!(final_status, fullmag_runner::RunStatus::Cancelled) {
+        "cancelled"
+    } else {
+        "completed"
+    };
     live_workspace.push_log(
-        "success",
+        summary_level,
         format!(
-            "Workspace completed — {} steps, final time {}",
+            "Workspace {summary_verb} — {} steps, final time {}",
             summary.total_steps,
             summary
                 .final_time
@@ -10873,11 +14396,19 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
         ),
     );
 
+    // The asynchronous publisher must acknowledge this terminal snapshot
+    // before the CLI exits. A failed publication preserves numerical results
+    // and private scratch instead of reporting successful live completion.
+    live_workspace
+        .publish_terminal_and_wait(std::time::Duration::from_secs(30))
+        .context("terminal live publication failed; scientific artifacts are retained")?;
+
     if args.json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
         print_script_summary(&summary);
     }
+    storage_lease.finish(true)?;
 
     Ok(())
 }
@@ -10906,7 +14437,7 @@ pub(crate) fn prepare_live_workspace_for_ui(
 
     let session_id = format!("session-{}-{}", started_at_unix_ms, std::process::id());
     let run_id = format!("run-{}", session_id);
-    let workspace_dir = PathBuf::from(".fullmag")
+    let workspace_dir = runtime_state_root(&repo_root())
         .join("local-live")
         .join("history")
         .join(&session_id);
@@ -10996,13 +14527,26 @@ pub(crate) fn prepare_live_workspace_for_ui(
 #[cfg(test)]
 mod tests {
     use super::{
-        adaptive_remesh_legality_reason, apply_current_fem_overrides,
-        apply_initial_magnetization_state_override, apply_live_step_update_to_workspace_state,
-        apply_remeshed_problem_snapshot_to_stages, apply_stage_heartbeat_progress,
+        accepted_relax_handoff_for_eigen_stage, accepted_relax_handoff_from_completed_stage,
+        adaptive_remesh_backend_legality_reason, adaptive_remesh_legality_reason,
+        apply_current_fem_overrides, apply_initial_magnetization_state_override,
+        apply_live_step_update_to_workspace_state, apply_remeshed_problem_snapshot_to_stages,
+        apply_scene_discretization_patch, apply_stage_heartbeat_progress,
+        update_antenna_live_stage_progress,
         apply_terminal_live_step_update_to_workspace_state,
-        attach_initial_magnetization_state_override_metadata, attach_region_realization_revisions,
-        classify_wait_for_solve_command, cumulative_rhs_evals, default_domain_region_markers,
-        deferred_mesh_failure_stage, discard_active_paused_stage_execution,
+        attach_initial_magnetization_state_override_metadata,
+        attach_region_realization_revisions,
+        attach_stage_fem_mesh_identity,
+        antenna_stage_output_catalog_path,
+        classify_wait_for_solve_command,
+        continuation_source_from_backend_plan,
+        cumulative_rhs_evals,
+        current_fdm_mesh_workspace,
+        default_domain_region_markers,
+        deferred_mesh_failure_stage,
+        attach_solved_antenna_drive_bases,
+        attach_scripted_stage_solver_steps,
+        discard_active_paused_stage_execution,
         ensure_frequency_response_relaxed_continuation_is_qualified, execute_synthetic_stage,
         fail_owned_preparation_stage, fem_gpu_memory_preflight_message,
         fem_interactive_dense_ram_estimate, fem_live_mesh_payload_and_initial_magnetization,
@@ -11010,30 +14554,80 @@ mod tests {
         format_stage_progress_line, has_heavy_live_payload,
         initial_live_state_manifest_from_backend_plan, initial_magnetization_state_override,
         initial_step_update, interactive_session_should_stay_alive,
-        mark_ui_shell_preparation_ready, mesh_build_pipeline_status_json,
+        mark_live_stage_execution_failed, mark_ui_shell_preparation_ready,
+        mesh_build_pipeline_status_json,
         mesh_source_scene_revision, offset_step_update, own_preparation_boundary_failure,
         plan_materialized_stage_snapshot, prepare_remesh_stage_transaction,
         preserve_terminal_stage_history, project_script_export_failure,
-        requested_execution_device_for_overrides, resolve_adaptive_convergence_metric,
-        resolve_preview_field_every_n, resolved_shared_domain_object_region_markers,
+        relative_artifact_ref,
+        replace_continuation_after_synthetic_stage,
+        requested_execution_device_for_overrides,
+        publish_scripted_stages_awaiting_command,
+        resolve_adaptive_convergence_metric, resolve_preview_field_every_n,
+        resolve_rayon_cpu_threads, resolved_shared_domain_object_region_markers,
         run_active_preparation_operation, run_owned_preparation_stage,
         run_script_preparation_preflight, run_solver_initialization,
         run_solver_initialization_safety_check, scripted_stage_execution_state,
         scripted_stage_execution_state_with_completion, set_latest_scalar_row_if_due,
         shared_domain_object_region_mesh_specs, stage_allows_sampled_continuation_initial_state,
-        step_update_has_frequency_response_progress, user_cancelled_stage_completion,
+        step_update_has_frequency_response_progress, step_update_has_parallel_execution_progress,
+        parallel_execution_telemetry_from_progress, user_cancelled_stage_completion,
         validate_periodic_remesh_candidate, wait_for_failed_preparation_close,
         wait_for_solve_prompt, wait_for_solve_should_block, wait_for_solve_supported,
-        write_sampling_resolution_stage_record, ActiveSequenceState, LiveProgressCadence,
-        LoadedInitialMagnetizationState, RuntimeCommandPrecondition, SceneProblemPatch,
-        StageProgressHeartbeat, WaitForSolveCommandAction, FEM_FREQUENCY_RESPONSE_PROGRESS_KEY,
-        LIVE_PROGRESS_PUBLISH_INTERVAL,
+        write_antenna_stage_output_catalog_ready, write_antenna_stage_output_catalog_terminal,
+        write_antenna_stage_output_catalog_with_hook,
+        write_sampling_resolution_stage_record, ActiveSequenceState, CommandApplicationBoundary,
+        ContinuationStageSource,
+        LiveProgressCadence, LoadedInitialMagnetizationState, RuntimeCommandPrecondition,
+        SceneProblemPatch, StageProgressHeartbeat, WaitForSolveCommandAction,
+        FEM_FREQUENCY_RESPONSE_PROGRESS_KEY, LIVE_PROGRESS_PUBLISH_INTERVAL,
     };
     use crate::live_workspace::{CurrentLivePublisher, LocalLiveWorkspace};
     use crate::simulation_preparation::{
         PreparationStageId, PreparationStageStatus, PreparationStatus, SimulationPreparationState,
     };
     use crate::types::PythonProgressEvent;
+    use std::path::Path;
+
+    #[test]
+    fn elapsed_stage_time_uses_the_reported_clock_frame() {
+        let mut result = fullmag_runner::RunResult {
+            status: fullmag_runner::RunStatus::Completed,
+            steps: vec![fullmag_runner::StepStats {
+                time: 10.4,
+                ..fullmag_runner::StepStats::default()
+            }],
+            final_magnetization: Vec::new(),
+            completion: None,
+        };
+        assert!((super::elapsed_stage_seconds(
+            &result,
+            10.0,
+            fullmag_runner::StageStepTimeFrame::Absolute,
+        )
+        .unwrap()
+            - 0.4)
+            .abs()
+            < 1e-12);
+        result.steps[0].time = 0.4;
+        assert!((super::elapsed_stage_seconds(
+            &result,
+            10.0,
+            fullmag_runner::StageStepTimeFrame::StageLocal,
+        )
+        .unwrap()
+            - 0.4)
+            .abs()
+            < 1e-12);
+    }
+
+    fn set_fem_eigen_progress(
+        stats: &mut fullmag_runner::StepStats,
+        metrics: std::collections::HashMap<String, f64>,
+    ) {
+        stats.kind = fullmag_quantities::StepDataKind::SolverProgress;
+        stats.solver_progress = Some(fullmag_quantities::SolverProgress::FemEigen { metrics });
+    }
 
     #[test]
     fn fdm_override_wins_over_fem_override_in_summary_device() {
@@ -11042,6 +14636,30 @@ mod tests {
         assert_eq!(
             requested_execution_device_for_overrides(&runtime, Some("cpu"), Some("gpu")),
             "gpu"
+        );
+    }
+
+    #[test]
+    fn auto_rayon_threads_are_bounded_before_native_mesh_resolution() {
+        assert_eq!(
+            resolve_rayon_cpu_threads(40, Some("auto"), None, None),
+            (16, true)
+        );
+        assert_eq!(
+            resolve_rayon_cpu_threads(8, Some("auto"), None, None),
+            (8, true)
+        );
+        assert_eq!(
+            resolve_rayon_cpu_threads(40, Some("auto"), None, Some("12")),
+            (12, true)
+        );
+        assert_eq!(
+            resolve_rayon_cpu_threads(40, Some("auto"), Some("4"), None),
+            (16, true)
+        );
+        assert_eq!(
+            resolve_rayon_cpu_threads(40, None, Some("12"), None),
+            (12, false)
         );
     }
 
@@ -11073,6 +14691,73 @@ mod tests {
         assert!(!adaptive.contains("offset_step_update(\n                &initial_step_update"));
         assert!(adaptive
             .contains("StageProgressHeartbeat::spawn(\n            adaptive_initial_update"));
+    }
+
+    #[test]
+    fn continuation_source_classification_is_centralized_and_fail_closed() {
+        let source = include_str!("orchestrator.rs");
+        let production = source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("production source");
+        assert_eq!(
+            production
+                .matches("continuation_source_from_backend_plan(")
+                .count(),
+            5,
+            "every stage-result continuation source must use the canonical classifier"
+        );
+        assert!(
+            !production.contains("_ => ContinuationSource::Fdm"),
+            "wildcard source classification aliases FEM eigen/frequency and unsupported backends to FDM"
+        );
+    }
+
+    #[test]
+    fn fem_equilibrium_certificates_are_only_required_for_native_fem_relaxation() {
+        let source = include_str!("orchestrator.rs");
+        let production = source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("production source");
+        let certified_block = production
+            .split("let next_continuation_certified_fields =")
+            .nth(1)
+            .and_then(|tail| {
+                tail.split("let next_continuation_recomputed_certificate =")
+                    .next()
+            })
+            .expect("certified FEM equilibrium field handoff block");
+        let recomputed_block = production
+            .split("let next_continuation_recomputed_certificate =")
+            .nth(1)
+            .and_then(|tail| tail.split("let next_continuation_stage_source =").next())
+            .expect("recomputed FEM linearization certificate handoff block");
+        for block in [certified_block, recomputed_block] {
+            assert!(
+                block.contains("execution_plan.backend_plan")
+                    && block.contains("BackendPlanIR::Fem(_)")
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_shared_domain_followup_uses_a_fail_closed_legality_gate() {
+        let source = include_str!("orchestrator.rs");
+        let production = source
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .map(|(production, _)| production)
+            .expect("production source");
+        assert!(
+            production.contains(
+                "adaptive_remesh_backend_legality_reason(&execution_plan.backend_plan)"
+            ),
+            "adaptive follow-up must reject SharedDomainMeshWithAir before the generic remesher can overlap the magnetic body and airbox"
+        );
+        assert_eq!(
+            adaptive_remesh_backend_legality_reason(&tiny_shared_domain_fem_plan()),
+            Some("adaptive_shared_domain_remesh_requires_dedicated_remesher")
+        );
     }
 
     #[test]
@@ -11223,6 +14908,361 @@ mod tests {
         ];
 
         assert_eq!(cumulative_rhs_evals(&steps), 12);
+    }
+
+    #[test]
+    fn solved_antenna_drive_attachment_rejects_invalid_projection_before_fdm_materialization() {
+        let mut problem = ProblemIR::bootstrap_example();
+        problem.solved_antenna_drives = vec![serde_json::from_value(serde_json::json!({
+            "id": "drive_1",
+            "name": "Drive 1",
+            "projection_ref": "projection_1",
+            "port_mode_id": "port_1",
+            "peak_current_a": 1.0,
+            "waveform": {"kind": "constant"},
+            "time_origin": "absolute",
+            "activation": {"kind": "all_time_evolution"}
+        }))
+        .expect("fixture drive should deserialize")];
+        let mut plan = fullmag_ir::ExecutionPlanIR {
+            common: fullmag_ir::CommonPlanMeta {
+                ir_version: "test".into(),
+                requested_backend: fullmag_ir::BackendTarget::Fdm,
+                resolved_backend: fullmag_ir::BackendTarget::Fdm,
+                execution_mode: fullmag_ir::ExecutionMode::Strict,
+                material_field_plans: Vec::new(),
+            },
+            backend_plan: BackendPlanIR::Fdm(fullmag_ir::FdmPlanIR::default()),
+            output_plan: fullmag_ir::OutputPlanIR {
+                outputs: Vec::new(),
+            },
+            provenance: fullmag_ir::ProvenancePlanIR::default(),
+        };
+
+        if let BackendPlanIR::Fdm(fdm) = &mut plan.backend_plan {
+            fdm.time_stage.study_kind = fullmag_ir::StudyKindIR::TimeEvolution;
+        }
+
+        let error = attach_solved_antenna_drive_bases(
+            &problem,
+            &mut plan,
+            Path::new("antenna-test-artifacts"),
+        )
+        .expect_err("FDM solved-antenna attachment must fail closed on invalid projection");
+        assert!(error.to_string().contains(
+            "solved_antenna_drives[0] has an invalid projection, port mode, or peak current"
+        ));
+    }
+
+    #[test]
+    fn solved_antenna_attachment_skips_inactive_future_stage_without_asset() {
+        let mut problem = ProblemIR::bootstrap_example();
+        let (dynamics, sampling) = match &problem.study {
+            StudyIR::TimeEvolution { dynamics, sampling } => (dynamics.clone(), sampling.clone()),
+            _ => unreachable!("bootstrap fixture is a time-evolution study"),
+        };
+        problem.study = StudyIR::Relaxation {
+            algorithm: fullmag_ir::RelaxationAlgorithmIR::LlgOverdamped,
+            dynamics: Some(dynamics),
+            stop: fullmag_ir::RelaxStopIR {
+                torque_tolerance_apm: Some(1.0),
+                energy_tolerance_j: None,
+                max_steps: Some(10),
+                max_relaxation_time_s: None,
+            },
+            sampling,
+        };
+        problem
+            .problem_meta
+            .runtime_metadata
+            .insert("active_stage_id".into(), serde_json::json!("relax"));
+        problem.solved_antenna_drives = vec![serde_json::from_value(serde_json::json!({
+            "id": "drive_1",
+            "name": "Drive 1",
+            "projection_ref": "projection_1",
+            "port_mode_id": "port_1",
+            "peak_current_a": 1.0,
+            "waveform": {"kind": "sinusoidal", "frequency_hz": 1e9, "phase_rad": 0.0, "offset": 0.0},
+            "time_origin": "stage_local",
+            "activation": {"kind": "stage_ids", "stage_ids": ["run"]}
+        }))
+        .expect("fixture drive should deserialize")];
+        let mut plan = fullmag_ir::ExecutionPlanIR {
+            common: fullmag_ir::CommonPlanMeta {
+                ir_version: "test".into(),
+                requested_backend: fullmag_ir::BackendTarget::Fdm,
+                resolved_backend: fullmag_ir::BackendTarget::Fdm,
+                execution_mode: fullmag_ir::ExecutionMode::Strict,
+                material_field_plans: Vec::new(),
+            },
+            backend_plan: BackendPlanIR::Fdm(fullmag_ir::FdmPlanIR::default()),
+            output_plan: fullmag_ir::OutputPlanIR {
+                outputs: Vec::new(),
+            },
+            provenance: fullmag_ir::ProvenancePlanIR::default(),
+        };
+
+        if let BackendPlanIR::Fdm(fdm) = &mut plan.backend_plan {
+            fdm.time_stage.study_kind = fullmag_ir::StudyKindIR::Relaxation;
+            fdm.time_stage.active_stage_id = Some("relax".into());
+            fdm.solved_antenna_drive_bases
+                .push(fullmag_ir::ResolvedSolvedAntennaDriveBasisIR {
+                    drive: problem.solved_antenna_drives[0].clone(),
+                    solution_id: "previous_solution".into(),
+                    source_object_id: "previous_antenna".into(),
+                    field_xyz_apm_per_a: vec![[1.0, 0.0, 0.0]],
+                    projection_signature: "previous_projection".into(),
+                });
+        }
+
+        attach_solved_antenna_drive_bases(&problem, &mut plan, Path::new("antenna-test-artifacts"))
+            .expect("an inactive future drive must not load its unpublished asset");
+        assert!(matches!(
+            plan.backend_plan,
+            BackendPlanIR::Fdm(ref fdm) if fdm.solved_antenna_drive_bases.is_empty()
+        ));
+        if let BackendPlanIR::Fdm(fdm) = &mut plan.backend_plan {
+            fdm.time_stage.study_kind = fullmag_ir::StudyKindIR::TimeEvolution;
+        }
+        let error = attach_solved_antenna_drive_bases(
+            &problem,
+            &mut plan,
+            Path::new("antenna-test-artifacts"),
+        )
+        .expect_err("a mismatched stage must not silently omit the antenna drive");
+        assert!(error.to_string().contains("activation context differs"));
+    }
+
+    #[test]
+    fn symbolic_antenna_reference_resolves_only_from_a_prior_matching_port() {
+        let mut problem = ProblemIR::bootstrap_example();
+        problem.antenna_target_projections = vec![serde_json::from_value(serde_json::json!({
+            "id": "projection_1",
+            "solution": {"kind": "stage_output", "stage_id": "solve_1", "output_id": "basis"},
+            "target": {"kind": "global"},
+            "output_id": "projected"
+        }))
+        .unwrap()];
+        problem.solved_antenna_drives = vec![serde_json::from_value(serde_json::json!({
+            "id": "drive_1",
+            "name": "Drive 1",
+            "projection_ref": "projection_1",
+            "port_mode_id": "port_1",
+            "peak_current_a": 1.0,
+            "waveform": {"kind": "constant"},
+            "time_origin": "absolute",
+            "activation": {"kind": "all_time_evolution"}
+        }))
+        .unwrap()];
+        let reference = fullmag_ir::AntennaFieldSolutionRefIR {
+            stage_id: "solve_1".into(),
+            output_id: "basis".into(),
+            asset_id: "asset-1".into(),
+            content_digest: "sha256:valid".into(),
+        };
+        let mut wrong_port = std::collections::BTreeMap::new();
+        wrong_port.insert(("solve_1".into(), "basis".into(), "port_2".into()), reference.clone());
+        assert!(super::resolve_active_antenna_stage_outputs(&mut problem, &wrong_port)
+            .unwrap_err()
+            .to_string()
+            .contains("requires prior ready stage output"));
+        assert!(problem.antenna_target_projections[0].solution.published().is_none());
+
+        let mut published = std::collections::BTreeMap::new();
+        published.insert(("solve_1".into(), "basis".into(), "port_1".into()), reference.clone());
+        let mut partially_resolvable = problem.clone();
+        let mut second_projection = partially_resolvable.antenna_target_projections[0].clone();
+        second_projection.id = "projection_2".into();
+        second_projection.solution = serde_json::from_value(serde_json::json!({
+            "kind": "stage_output", "stage_id": "solve_2", "output_id": "basis"
+        }))
+        .unwrap();
+        partially_resolvable.antenna_target_projections.push(second_projection);
+        let mut second_drive = partially_resolvable.solved_antenna_drives[0].clone();
+        second_drive.id = "drive_2".into();
+        second_drive.projection_ref = "projection_2".into();
+        partially_resolvable.solved_antenna_drives.push(second_drive);
+        assert!(super::resolve_active_antenna_stage_outputs(&mut partially_resolvable, &published)
+            .is_err());
+        assert!(partially_resolvable
+            .antenna_target_projections
+            .iter()
+            .all(|projection| projection.solution.published().is_none()));
+        super::resolve_active_antenna_stage_outputs(&mut problem, &published).unwrap();
+        assert_eq!(problem.antenna_target_projections[0].solution.published(), Some(&reference));
+
+        let mut conflicting = problem.clone();
+        let mut second_drive = conflicting.solved_antenna_drives[0].clone();
+        second_drive.id = "drive_2".into();
+        second_drive.port_mode_id = "port_2".into();
+        conflicting.solved_antenna_drives.push(second_drive);
+        assert!(super::resolve_active_antenna_stage_outputs(&mut conflicting, &published)
+            .unwrap_err()
+            .to_string()
+            .contains("different ports"));
+    }
+
+    #[test]
+    fn solved_antenna_reference_respects_both_solve_relax_run_orders() {
+        let mut run = ProblemIR::bootstrap_example();
+        run.problem_meta.runtime_metadata.insert(
+            "active_stage_id".into(),
+            serde_json::json!("run"),
+        );
+        run.antenna_target_projections = vec![serde_json::from_value(serde_json::json!({
+            "id": "projection_1",
+            "solution": {"kind": "stage_output", "stage_id": "solve_1", "output_id": "basis"},
+            "target": {"kind": "global"},
+            "output_id": "projected"
+        }))
+        .unwrap()];
+        run.solved_antenna_drives = vec![serde_json::from_value(serde_json::json!({
+            "id": "drive_1",
+            "name": "Drive 1",
+            "projection_ref": "projection_1",
+            "port_mode_id": "port_1",
+            "peak_current_a": 1.0,
+            "waveform": {"kind": "sinusoidal", "frequency_hz": 1e9, "phase_rad": 0.0, "offset": 0.0},
+            "time_origin": "stage_local",
+            "activation": {"kind": "all_time_evolution"}
+        }))
+        .unwrap()];
+        let mut relax = run.clone();
+        let (dynamics, sampling) = match &relax.study {
+            StudyIR::TimeEvolution { dynamics, sampling } => (dynamics.clone(), sampling.clone()),
+            _ => unreachable!("bootstrap fixture is a time-evolution study"),
+        };
+        relax.study = StudyIR::Relaxation {
+            algorithm: fullmag_ir::RelaxationAlgorithmIR::LlgOverdamped,
+            dynamics: Some(dynamics),
+            stop: fullmag_ir::RelaxStopIR {
+                torque_tolerance_apm: Some(1.0),
+                energy_tolerance_j: None,
+                max_steps: Some(10),
+                max_relaxation_time_s: None,
+            },
+            sampling,
+        };
+        relax.problem_meta.runtime_metadata.insert(
+            "active_stage_id".into(),
+            serde_json::json!("relax"),
+        );
+        let reference = fullmag_ir::AntennaFieldSolutionRefIR {
+            stage_id: "solve_1".into(),
+            output_id: "basis".into(),
+            asset_id: "asset-1".into(),
+            content_digest: "sha256:valid".into(),
+        };
+        let mut published = std::collections::BTreeMap::new();
+        for solve_before_relax in [true, false] {
+            let mut current_relax = relax.clone();
+            if solve_before_relax {
+                published.insert(
+                    ("solve_1".into(), "basis".into(), "port_1".into()),
+                    reference.clone(),
+                );
+            } else {
+                published.clear();
+            }
+            super::resolve_active_antenna_stage_outputs(&mut current_relax, &published)
+                .expect("Relax must not require or consume a solved RF basis");
+            assert!(current_relax.antenna_target_projections[0]
+                .solution
+                .published()
+                .is_none());
+
+            let mut current_run = run.clone();
+            if !solve_before_relax {
+                assert!(super::resolve_active_antenna_stage_outputs(&mut current_run, &published)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("requires prior ready stage output"));
+                published.insert(
+                    ("solve_1".into(), "basis".into(), "port_1".into()),
+                    reference.clone(),
+                );
+            }
+            super::resolve_active_antenna_stage_outputs(&mut current_run, &published)
+                .expect("Run must resolve the previously published antenna basis");
+            assert_eq!(
+                current_run.antenna_target_projections[0].solution.published(),
+                Some(&reference)
+            );
+        }
+    }
+
+    #[test]
+    fn symbolic_antenna_spectrum_requires_a_prior_ready_output() {
+        let mut problem = ProblemIR::bootstrap_example();
+        problem.antenna_field_solve_stages = vec![serde_json::from_value(serde_json::json!({
+            "id": "solve_1",
+            "source_object_id": "antenna_1",
+            "current_transport_id": "transport_1",
+            "port_mode_ids": ["port_1"],
+            "conservative_current_view_ref": "transport_1:rt0",
+            "model": "quasistatic_conduction_biot_savart3d",
+            "oersted_realization": "direct_tetra_quadrature",
+            "conductor_mesh_policy": "full_3d",
+            "field_sampling_domain": {"kind": "global"},
+            "target_refs": [{"kind": "global"}],
+            "solver_policy": "direct",
+            "outputs": [{"id": "basis", "quantity": "H_ant_basis"}]
+        }))
+        .unwrap()];
+        problem.antenna_spectrum_requests = vec![serde_json::from_value(serde_json::json!({
+            "id": "source_k",
+            "solution_ref": {"kind": "stage_output", "stage_id": "solve_1", "output_id": "basis"},
+            "target": {"kind": "global"},
+            "transform": "spatial_fft",
+            "sampling_plane": {
+                "origin_m": [0.0, 0.0, 0.0],
+                "axis_u": [1.0, 0.0, 0.0],
+                "axis_v": [0.0, 1.0, 0.0],
+                "extent_u_m": 1.0,
+                "extent_v_m": 1.0,
+                "sample_count_u": 4,
+                "sample_count_v": 4,
+                "interpolation": "fem_element",
+                "outside_policy": "zero"
+            },
+            "window": "rectangular",
+            "normalization": "unitary_discrete",
+            "component": "x",
+            "output_id": "spectrum"
+        }))
+        .unwrap()];
+        let reference = fullmag_ir::AntennaFieldSolutionRefIR {
+            stage_id: "solve_1".into(),
+            output_id: "basis".into(),
+            asset_id: "asset-1".into(),
+            content_digest: "sha256:valid".into(),
+        };
+        let missing = std::collections::BTreeMap::new();
+        assert!(super::resolve_antenna_spectrum_stage_outputs(&mut problem, &missing)
+            .unwrap_err()
+            .to_string()
+            .contains("requires prior ready stage output"));
+        assert!(problem.antenna_spectrum_requests[0].solution_ref.published().is_none());
+        let published = std::collections::BTreeMap::from([(
+            ("solve_1".into(), "basis".into(), "port_1".into()),
+            reference.clone(),
+        )]);
+        let mut partially_resolvable = problem.clone();
+        let mut second_request = partially_resolvable.antenna_spectrum_requests[0].clone();
+        second_request.id = "source_k_2".into();
+        second_request.solution_ref = serde_json::from_value(serde_json::json!({
+            "kind": "stage_output", "stage_id": "solve_2", "output_id": "basis"
+        }))
+        .unwrap();
+        partially_resolvable.antenna_spectrum_requests.push(second_request);
+        assert!(super::resolve_antenna_spectrum_stage_outputs(&mut partially_resolvable, &published)
+            .is_err());
+        assert!(partially_resolvable
+            .antenna_spectrum_requests
+            .iter()
+            .all(|request| request.solution_ref.published().is_none()));
+        super::resolve_antenna_spectrum_stage_outputs(&mut problem, &published).unwrap();
+        assert_eq!(problem.antenna_spectrum_requests[0].solution_ref.published(), Some(&reference));
     }
 
     #[test]
@@ -11417,12 +15457,41 @@ mod tests {
             &[],
             None,
             None,
+            Some(42),
         )
         .expect_err("a shared-domain candidate without a domain asset must fail before commit");
 
         assert!(error
             .to_string()
             .contains("shared-domain remesh produced no fem_domain_mesh_asset"));
+        assert_eq!(stages[0].ir, stages_before[0].ir);
+        assert_eq!(plans, plans_before);
+
+        let initial_plan =
+            fullmag_plan::plan(&stages[0].ir).expect("bootstrap problem should plan");
+        let prepared = prepare_remesh_stage_transaction(
+            &stages,
+            &[initial_plan],
+            None,
+            &candidate,
+            1.0,
+            false,
+            &[],
+            &[],
+            None,
+            None,
+            Some(42),
+        )
+        .expect("valid candidate should prepare without publishing");
+        assert_eq!(
+            prepared.stages[0].ir.problem_meta.runtime_metadata["mesh_source_scene_revision"],
+            serde_json::json!(42),
+        );
+        assert_eq!(
+            prepared.stage_execution_plans[0],
+            fullmag_plan::plan(&prepared.stages[0].ir)
+                .expect("candidate plan must reflect the updated stage snapshot"),
+        );
         assert_eq!(stages[0].ir, stages_before[0].ir);
         assert_eq!(plans, plans_before);
     }
@@ -11500,8 +15569,93 @@ mod tests {
             hysteresis_settle_step_kind: None,
             hysteresis_settle_step_method: None,
             scalar_row_due: false,
+            terminal_field_snapshot: false,
             finished: false,
         }
+    }
+
+    #[test]
+    fn adaptive_parallel_progress_decodes_typed_admission_telemetry() {
+        let mut progress = std::collections::HashMap::new();
+        progress.insert("parallel_telemetry_available".into(), 1.0);
+        progress.insert("parallel_active_workers".into(), 2.0);
+        progress.insert("parallel_admission_desired_workers".into(), 3.0);
+        progress.insert("parallel_admission_pending_samples".into(), 5.0);
+        progress.insert("parallel_admission_worker_limit".into(), 4.0);
+        progress.insert("parallel_cpu_target_percent".into(), 90.0);
+        progress.insert("parallel_memory_target_percent".into(), 80.0);
+        progress.insert("parallel_cpu_busy_percent".into(), 62.5);
+        progress.insert("parallel_cpu_available_cores".into(), 4.0);
+        progress.insert("parallel_memory_reserve_bytes_lo".into(), 1_073_741_824.0);
+        progress.insert("parallel_memory_reserve_bytes_hi".into(), 0.0);
+        progress.insert("parallel_sampled_at_unix_ms_lo".into(), 3_350_608_227.0);
+        progress.insert("parallel_sampled_at_unix_ms_hi".into(), 414.0);
+        progress.insert("parallel_cpu_target_kind:soft_admission_target".into(), 1.0);
+        progress.insert("parallel_admission_reason:waiting_cpu_headroom_for_probe".into(), 1.0);
+        progress.insert("parallel_admission_reason:waiting_memory_headroom_for_probe".into(), 1.0);
+        assert!(parallel_execution_telemetry_from_progress(&progress).is_none());
+        progress.remove("parallel_admission_reason:waiting_memory_headroom_for_probe");
+
+        let decoded = parallel_execution_telemetry_from_progress(&progress)
+            .expect("complete adaptive telemetry should decode");
+        assert_eq!(decoded.active_workers, 2);
+        assert_eq!(decoded.admission_desired_workers, 3);
+        assert_eq!(decoded.admission_worker_limit, Some(4));
+        assert_eq!(decoded.memory_reserve_bytes, 1_073_741_824);
+        assert_eq!(decoded.cpu_target_kind, "soft_admission_target");
+        assert_eq!(decoded.admission_reason, "waiting_cpu_headroom_for_probe");
+        assert_eq!(decoded.cpu_busy_percent, Some(62.5));
+        assert_eq!(decoded.cpu_available_cores, Some(4.0));
+
+        progress.remove("parallel_cpu_available_cores");
+        let historical = parallel_execution_telemetry_from_progress(&progress)
+            .expect("telemetry without legacy CPU capacity remains decodable");
+        assert_eq!(historical.cpu_available_cores, None);
+    }
+
+    #[test]
+    fn failed_stage_clears_previous_parallel_admission_sample() {
+        let mut stage_execution = Some(CurrentLiveStageExecutionState {
+            total_stages: 1,
+            completed_stage_indexes: Vec::new(),
+            stages: vec![CurrentLiveStageExecutionRecord {
+                status: "running".to_string(),
+                parallel_execution: Some(fullmag_runner::LiveParallelExecutionTelemetry {
+                    sampled_at_unix_ms: 10,
+                    active_workers: 2,
+                    admission_desired_workers: 2,
+                    admission_worker_limit: Some(4),
+                    admission_pending_samples: 1,
+                    resolved_workers: None,
+                    cpu_target_percent: 90.0,
+                    memory_target_percent: 80.0,
+                    memory_reserve_bytes: 1_073_741_824,
+                    cpu_target_kind: "soft_admission_target".to_string(),
+                    cpu_busy_percent: Some(50.0),
+                    allocated_cpu_cores: Some(2.0),
+                    cpu_available_cores: Some(4.0),
+                    memory_limit_bytes: Some(8 * 1024 * 1024 * 1024),
+                    memory_available_bytes: Some(4 * 1024 * 1024 * 1024),
+                    worker_peak_cpu_cores: Some(1.0),
+                    worker_peak_rss_bytes: Some(512 * 1024 * 1024),
+                    admission_reason: "calibrating_first_sample".to_string(),
+                    terminal: false,
+                }),
+                ..CurrentLiveStageExecutionRecord::default()
+            }],
+            stage_statuses: vec!["running".to_string()],
+            active_stage_index: Some(0),
+            active_stage_kind: Some("eigenmodes".to_string()),
+            runtime_state: "running".to_string(),
+        });
+
+        mark_live_stage_execution_failed(&mut stage_execution, 20);
+        let failed = stage_execution.expect("failed stage state should remain published");
+        assert_eq!(failed.runtime_state, "failed");
+        assert_eq!(failed.active_stage_index, None);
+        assert_eq!(failed.stages[0].status, "failed");
+        assert_eq!(failed.stages[0].completed_at_unix_ms, Some(20));
+        assert_eq!(failed.stages[0].parallel_execution, None);
     }
 
     fn test_preview_field(quantity: &str, revision: u64, z: f64) -> LivePreviewField {
@@ -11575,6 +15729,7 @@ mod tests {
                 final_e_ext: None,
                 final_e_ani: None,
                 final_e_dmi: None,
+                final_e_rotated_dmi: None,
                 final_e_total: None,
                 artifact_dir: "/tmp/artifacts".to_string(),
             },
@@ -11607,7 +15762,7 @@ mod tests {
         state.simulation_preparation = Some(preparation);
         LocalLiveWorkspace::new(
             state,
-            CurrentLivePublisher::spawn("prep-orchestration-test"),
+            CurrentLivePublisher::spawn_with_test_sink("prep-orchestration-test", |_, _| Ok(())),
         )
     }
 
@@ -11977,6 +16132,59 @@ mod tests {
     }
 
     #[test]
+    fn authored_mixed_p1_preflight_failure_is_owned_by_planning_with_diagnostics() {
+        let workspace = preparation_workspace(PreparationStageId::ScriptMaterialization);
+        let raw_error = concat!(
+            "ValueError: fem_mixed_p1_scope_rejected: phase=authored_preflight;",
+            " failed_predicates=[unsupported_uniaxial_anisotropy]"
+        );
+
+        assert!(super::project_authoritative_authored_preflight_failure(
+            &workspace,
+            &anyhow::anyhow!(raw_error),
+        )
+        .expect("authored capability failure should project"),);
+
+        let preparation = workspace
+            .snapshot()
+            .simulation_preparation
+            .expect("preparation state");
+        for (stage_id, expected_status) in [
+            (
+                PreparationStageId::ScriptMaterialization,
+                PreparationStageStatus::Completed,
+            ),
+            (
+                PreparationStageId::Validation,
+                PreparationStageStatus::Skipped,
+            ),
+            (PreparationStageId::Planning, PreparationStageStatus::Failed),
+        ] {
+            let stage = preparation
+                .stages
+                .iter()
+                .find(|stage| stage.id == stage_id)
+                .expect("projected preflight stage");
+            assert_eq!(stage.status, expected_status);
+        }
+        let failure = preparation.failure.as_ref().expect("owned failure");
+        assert_eq!(failure.error_code, "fem_mixed_p1_scope_rejected");
+        assert_eq!(
+            failure.summary,
+            "Simulation planning rejected unsupported mixed-P1 capability"
+        );
+        assert_eq!(failure.detail.as_deref(), Some(raw_error));
+        assert!(failure
+            .diagnostics_correlation_id
+            .as_deref()
+            .is_some_and(|value| value.starts_with("preparation-planning-")));
+        assert!(preparation.log_tail.iter().all(|entry| {
+            entry.message
+                != "Lightweight script preflight was unavailable; using full materialization"
+        }));
+    }
+
+    #[test]
     fn generic_materialization_failure_preserves_safe_root_cause_detail() {
         let workspace = preparation_workspace(PreparationStageId::ScriptMaterialization);
         let raw_error = "python helper failed: FDM universe membership is unavailable";
@@ -12156,6 +16364,10 @@ mod tests {
             let workspace = serde_json::json!({
                 "last_build_error": "raw mesher failure",
                 "last_build_summary": {
+                    "build_id": "mesh:last-good",
+                    "status": "completed"
+                },
+                "last_build_attempt": {
                     "phase": phase,
                     "message": "Shared-domain mesh build failed"
                 }
@@ -12164,6 +16376,19 @@ mod tests {
             assert_eq!(
                 deferred_mesh_failure_stage(Some(&workspace)),
                 Some(stage_id)
+            );
+
+            let legacy_workspace = serde_json::json!({
+                "last_build_error": "raw mesher failure",
+                "last_build_summary": {
+                    "phase": phase,
+                    "message": "Shared-domain mesh build failed"
+                }
+            });
+            assert_eq!(
+                deferred_mesh_failure_stage(Some(&legacy_workspace)),
+                Some(stage_id),
+                "legacy failure summaries remain readable"
             );
         }
     }
@@ -12196,6 +16421,15 @@ mod tests {
             .snapshot()
             .simulation_preparation
             .expect("preparation state");
+        let failure = preparation.failure.as_ref().expect("owned failure");
+        assert_eq!(
+            failure.detail.as_deref(),
+            Some("materialized validator leaked <path>")
+        );
+        assert!(failure
+            .diagnostics_correlation_id
+            .as_deref()
+            .is_some_and(|value| value.starts_with("preparation-solver_initialization-")));
         assert!(preparation.log_tail.iter().any(|entry| {
             entry.stage_id == PreparationStageId::SolverInitialization
                 && entry.message == "Checking fully materialized runtime validity"
@@ -12240,6 +16474,15 @@ mod tests {
             .snapshot()
             .simulation_preparation
             .expect("preparation state");
+        let failure = preparation.failure.as_ref().expect("owned failure");
+        assert_eq!(
+            failure.detail.as_deref(),
+            Some("materialized planner leaked backend internals")
+        );
+        assert!(failure
+            .diagnostics_correlation_id
+            .as_deref()
+            .is_some_and(|value| value.starts_with("preparation-solver_initialization-")));
         assert!(preparation.log_tail.iter().any(|entry| {
             entry.stage_id == PreparationStageId::SolverInitialization
                 && entry.message == "Checking the fully materialized execution plan"
@@ -12423,8 +16666,14 @@ mod tests {
         });
         let mut progress = std::collections::HashMap::new();
         progress.insert("percent".to_string(), 48.0);
-        progress.insert("phase_solving_sparse_lobpcg".to_string(), 1.0);
-        progress.insert("solver_cpu_sparse_lobpcg".to_string(), 1.0);
+        progress.insert(
+            "phase_kind:solving_native_frequency_window_base".to_string(),
+            1.0,
+        );
+        progress.insert(
+            "solver_kind:slepc_multi_shift_invert_production_cpu_dense".to_string(),
+            1.0,
+        );
         progress.insert("active_nodes".to_string(), 1931.0);
         progress.insert("effective_dof".to_string(), 3862.0);
         progress.insert("requested_modes".to_string(), 20.0);
@@ -12432,11 +16681,13 @@ mod tests {
         progress.insert("iteration".to_string(), 37.0);
         progress.insert("max_iterations".to_string(), 5000.0);
         progress.insert("residual".to_string(), 1.2e-5);
+        progress.insert("window_phase_base".to_string(), 1.0);
+        progress.insert("current_subwindow".to_string(), 3.0);
+        progress.insert("total_subwindows".to_string(), 16.0);
+        progress.insert("subwindow_elapsed_seconds".to_string(), 2.5);
+        progress.insert("window_elapsed_seconds".to_string(), 8.0);
         let mut update = test_step_update(37);
-        update
-            .stats
-            .per_object_scalars
-            .insert("fem_eigen_progress".to_string(), progress);
+        set_fem_eigen_progress(&mut update.stats, progress);
 
         let _ = apply_live_step_update_to_workspace_state(
             &mut state,
@@ -12451,14 +16702,305 @@ mod tests {
         assert_eq!(stage.progress_percent, Some(48.0));
         assert_eq!(
             stage.progress_label.as_deref(),
-            Some("solving sparse LOBPCG")
+            Some("solving native frequency window base")
         );
         let detail = stage.progress_detail.as_deref().unwrap_or_default();
-        assert!(detail.contains("solver=cpu_sparse_lobpcg"));
+        assert!(detail.contains("solver=slepc_multi_shift_invert_production_cpu_dense"));
         assert!(detail.contains("effective_dof=3862"));
         assert!(detail.contains("iteration=37/5000"));
         assert!(detail.contains("residual=1.200e-5"));
+        assert!(detail.contains("window_phase=base"));
+        assert!(detail.contains("subwindow=3/16"));
+        assert!(detail.contains("subwindow_s=2.5"));
+        assert!(detail.contains("window_s=8.0"));
         assert!(stage.last_progress_unix_ms.is_some());
+    }
+
+    #[test]
+    fn modal_progress_does_not_replace_physical_scalar_history_or_run_energy() {
+        let mut state = test_workspace_state();
+        let mut measured = test_step_update(3);
+        measured.stats.e_total = -1.25e-18;
+        state.latest_scalar_row = Some(crate::live_workspace::scalar_row_from_stats(
+            &measured.stats,
+        ));
+        let mut modal = test_step_update(4);
+        set_fem_eigen_progress(
+            &mut modal.stats,
+            std::collections::HashMap::from([("progress_fraction".into(), 0.5)]),
+        );
+        let modal_live_state = crate::step_utils::live_state_manifest_from_update(modal.clone());
+        assert_eq!(
+            modal_live_state.latest_step.kind,
+            fullmag_quantities::StepDataKind::SolverProgress
+        );
+        assert!(matches!(
+            modal_live_state.latest_step.solver_progress,
+            Some(fullmag_quantities::SolverProgress::FemEigen { .. })
+        ));
+        assert!(modal_live_state.latest_step.per_object_scalars.is_empty());
+        modal.finished = true;
+        crate::live_workspace::set_latest_scalar_row_for_terminal_update(&mut state, &modal);
+        assert_eq!(state.latest_scalar_row.as_ref().unwrap().e_total, -1.25e-18);
+        assert_eq!(state.latest_scalar_row.as_ref().unwrap().step, 3);
+        let run = crate::step_utils::running_run_manifest_from_update(
+            "run",
+            "session",
+            PathBuf::from("/tmp/artifacts").as_path(),
+            &modal,
+        );
+        assert_eq!(run.final_e_total, None);
+        assert_eq!(run.final_time, None);
+        assert_eq!(run.total_steps, 0);
+        let physical = crate::step_utils::running_run_manifest_from_update(
+            "run",
+            "session",
+            PathBuf::from("/tmp/artifacts").as_path(),
+            &measured,
+        );
+        assert_eq!(physical.final_e_total, Some(-1.25e-18));
+    }
+
+    #[test]
+    fn eigen_progress_after_physical_magnetization_serializes_an_api_acceptable_frame() {
+        let mut state = test_workspace_state();
+        let mut initial_physical = test_step_update(3);
+        initial_physical.magnetization = Some(vec![1.0, 0.0, 0.0]);
+        state.live_state = crate::step_utils::live_state_manifest_from_update(
+            initial_physical.clone(),
+        );
+        let mut initial_field = initial_physical;
+        assert!(super::ingest_magnetization_field_from_update(
+            &mut state,
+            &mut initial_field
+        ));
+
+        let thin_physical = test_step_update(4);
+        let _ = apply_live_step_update_to_workspace_state(
+            &mut state,
+            "run-test",
+            "session-test",
+            PathBuf::from("/tmp/artifacts").as_path(),
+            thin_physical,
+            false,
+        );
+        assert!(state.live_state.latest_step.is_physical_observation());
+        assert_eq!(
+            state.live_state.latest_step.magnetization,
+            Some(vec![1.0, 0.0, 0.0]),
+            "physical-to-physical thin updates retain magnetization"
+        );
+
+        let mut progress = test_step_update(5);
+        set_fem_eigen_progress(
+            &mut progress.stats,
+            std::collections::HashMap::from([("progress_fraction".into(), 0.5)]),
+        );
+        let _ = apply_live_step_update_to_workspace_state(
+            &mut state,
+            "run-test",
+            "session-test",
+            PathBuf::from("/tmp/artifacts").as_path(),
+            progress,
+            false,
+        );
+
+        let latest_step = &state.live_state.latest_step;
+        assert!(!latest_step.is_physical_observation());
+        assert_eq!(
+            latest_step.kind,
+            fullmag_quantities::StepDataKind::SolverProgress
+        );
+        assert!(matches!(
+            latest_step.solver_progress.as_ref(),
+            Some(fullmag_quantities::SolverProgress::FemEigen { .. })
+        ));
+        assert!(latest_step.magnetization.is_none());
+        assert_eq!(
+            state.latest_fields.0["m"]["values"],
+            serde_json::json!([1.0, 0.0, 0.0]),
+            "the previously accepted field remains independently cached"
+        );
+
+        let api_live_state = serde_json::to_value(&state.live_state)
+            .expect("CLI live state should serialize to the API frame shape");
+        let api_step = &api_live_state["latest_step"];
+        assert_eq!(api_step["kind"], serde_json::json!("solver_progress"));
+        assert_eq!(
+            api_step["solver_progress"]["kind"],
+            serde_json::json!("fem_eigen")
+        );
+        assert!(api_step["magnetization"].is_null());
+        assert_eq!(api_step["per_object_scalars"], serde_json::json!({}));
+        assert_eq!(api_step["field_materialization_states"], serde_json::json!([]));
+        assert!(api_step["preview_field"].is_null());
+    }
+
+    #[test]
+    fn nonphysical_or_contradictory_magnetization_is_not_promoted_to_latest_fields() {
+        let cases = [
+            (
+                fullmag_quantities::StepDataKind::LegacyUnclassified,
+                None,
+            ),
+            (
+                fullmag_quantities::StepDataKind::SolverProgress,
+                Some(fullmag_quantities::SolverProgress::FemEigen {
+                    metrics: std::collections::HashMap::from([("progress_fraction".into(), 0.5)]),
+                }),
+            ),
+            (
+                fullmag_quantities::StepDataKind::PhysicalObservation,
+                Some(fullmag_quantities::SolverProgress::FemEigen {
+                    metrics: std::collections::HashMap::from([("progress_fraction".into(), 0.5)]),
+                }),
+            ),
+        ];
+
+        for (kind, solver_progress) in cases {
+            let mut state = test_workspace_state();
+            let mut update = test_step_update(5);
+            update.stats.kind = kind;
+            update.stats.solver_progress = solver_progress;
+            update.magnetization = Some(vec![1.0, 0.0, 0.0]);
+
+            assert!(!super::ingest_magnetization_field_from_update(
+                &mut state,
+                &mut update
+            ));
+            assert!(state.latest_fields.0.get("m").is_none());
+            assert!(update.magnetization.is_some());
+        }
+    }
+
+    #[test]
+    fn modal_solver_identity_never_infers_dense_from_missing_or_ambiguous_flags() {
+        let mut progress = std::collections::HashMap::new();
+        assert_eq!(super::fem_eigen_progress_solver(&progress), "unknown");
+        for kind in [
+            "slepc_multi_shift_invert_production_cpu_dense",
+            "gpu_modal_device_krylov",
+            "cpu_full_2x2_symmetric",
+        ] {
+            progress.clear();
+            progress.insert(format!("solver_kind:{kind}"), 1.0);
+            assert_eq!(super::fem_eigen_progress_solver(&progress), kind);
+        }
+        progress.insert("solver_kind:other".into(), 1.0);
+        assert_eq!(super::fem_eigen_progress_solver(&progress), "unknown");
+    }
+
+    #[test]
+    fn terminal_stage_line_includes_fem_eigen_window_progress() {
+        let mut progress = std::collections::HashMap::new();
+        progress.insert(
+            "solver_kind:slepc_multi_shift_invert_production_cpu_dense".to_string(),
+            1.0,
+        );
+        progress.insert("window_phase_refinement".to_string(), 1.0);
+        progress.insert("current_subwindow".to_string(), 17.0);
+        progress.insert("total_subwindows".to_string(), 34.0);
+        progress.insert("subwindow_elapsed_seconds".to_string(), 4.25);
+        progress.insert("window_elapsed_seconds".to_string(), 71.5);
+        progress.insert("residual".to_string(), 2.0e-9);
+        let stats = fullmag_runner::StepStats {
+            kind: fullmag_quantities::StepDataKind::SolverProgress,
+            solver_progress: Some(fullmag_quantities::SolverProgress::FemEigen {
+                metrics: progress,
+            }),
+            step: 17,
+            ..fullmag_runner::StepStats::default()
+        };
+
+        let line = format_stage_progress_line(
+            "stage 2/2 (flat_eigenmodes)",
+            &stats,
+            None,
+            Some(Duration::from_secs(5)),
+            None,
+        );
+
+        for forbidden in ["|H_eff|", "max_torque", "E_total", "m_avg", " t=", " dt="] {
+            assert!(!line.contains(forbidden), "{line}");
+        }
+        assert!(line.contains("solver=slepc_multi_shift_invert_production_cpu_dense"));
+        assert!(line.contains("modal window phase=refinement"), "{line}");
+        assert!(line.contains("subwindow=17/34"), "{line}");
+        assert!(line.contains("subwindow_s=4.2"), "{line}");
+        assert!(line.contains("window_s=71.5"), "{line}");
+        assert!(line.contains("relres=2.000e-9"), "{line}");
+    }
+
+    fn tagged_ksp_progress_for_cli() -> std::collections::HashMap<String, f64> {
+        let mut progress = std::collections::HashMap::new();
+        for (key, value) in [
+            ("window_phase_refinement", 1.0),
+            ("iteration", 17.0),
+            ("max_iterations", 300.0),
+            ("current_subwindow", 23.0),
+            ("total_subwindows", 50.0),
+            ("linear_iteration", 12.0),
+            ("linear_residual_norm", 4.5e-8),
+            ("linear_solver_role:poisson", 1.0),
+            ("linear_ksp_type:gmres", 1.0),
+            ("residual_source:ksp_norm", 1.0),
+            ("residual", 5.0e-2),
+        ] {
+            progress.insert(key.to_string(), value);
+        }
+        progress
+    }
+
+    #[test]
+    fn terminal_stage_line_formats_tagged_ksp_without_relative_residual() {
+        let stats = fullmag_runner::StepStats {
+            kind: fullmag_quantities::StepDataKind::SolverProgress,
+            solver_progress: Some(fullmag_quantities::SolverProgress::FemEigen {
+                metrics: tagged_ksp_progress_for_cli(),
+            }),
+            step: 17,
+            ..fullmag_runner::StepStats::default()
+        };
+
+        let line = format_stage_progress_line(
+            "stage 2/2 (flat_eigenmodes)",
+            &stats,
+            None,
+            Some(Duration::from_secs(5)),
+            None,
+        );
+
+        assert!(line.contains("iteration=17/300"), "{line}");
+        assert!(line.contains("subwindow=23/50"), "{line}");
+        assert!(line.contains("linear_iteration=12"), "{line}");
+        assert!(line.contains("ksp_norm=4.500e-8"), "{line}");
+        assert!(line.contains("linear_solver_role=poisson"), "{line}");
+        assert!(line.contains("linear_ksp_type=gmres"), "{line}");
+        assert_eq!(line.matches("ksp_norm=").count(), 1, "{line}");
+        assert!(!line.contains("relres="), "{line}");
+        assert!(!line.contains("residual=5.000e-2"), "{line}");
+    }
+
+    #[test]
+    fn appended_fem_eigen_progress_formats_tagged_ksp_diagnostics() {
+        let stats = fullmag_runner::StepStats {
+            kind: fullmag_quantities::StepDataKind::SolverProgress,
+            solver_progress: Some(fullmag_quantities::SolverProgress::FemEigen {
+                metrics: tagged_ksp_progress_for_cli(),
+            }),
+            ..fullmag_runner::StepStats::default()
+        };
+        let mut line = "stage".to_string();
+
+        super::append_fem_eigen_step_progress(&mut line, &stats);
+
+        assert!(line.contains("subwindow=23/50"), "{line}");
+        assert!(line.contains("linear_iteration=12"), "{line}");
+        assert!(line.contains("ksp_norm=4.500e-8"), "{line}");
+        assert!(line.contains("linear_solver_role=poisson"), "{line}");
+        assert!(line.contains("linear_ksp_type=gmres"), "{line}");
+        assert!(!line.contains("relres="), "{line}");
+        assert!(!line.contains("residual=5.000e-2"), "{line}");
     }
 
     #[test]
@@ -12486,6 +17028,49 @@ mod tests {
             .as_deref()
             .is_some_and(|detail| detail.contains("iteration=37/5000")));
         assert_eq!(stage.last_progress_unix_ms, Some(1_781_531_277_401));
+    }
+
+    #[test]
+    fn antenna_live_progress_updates_only_the_active_running_stage() {
+        let mut execution = scripted_stage_execution_state(
+            2,
+            0,
+            "antenna_field_solve",
+            "running",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(update_antenna_live_stage_progress(
+            &mut execution,
+            0,
+            fullmag_runner::AntennaFieldStageStatus::Meshing,
+            Some("reused planned mesh".into()),
+            123,
+        ));
+        assert_eq!(execution.stages[0].progress_label.as_deref(), Some("mesh reused"));
+        assert_eq!(execution.stages[0].progress_detail.as_deref(), Some("reused planned mesh"));
+        assert_eq!(execution.stages[0].progress_percent, None);
+        assert_eq!(execution.stages[0].last_progress_unix_ms, Some(123));
+        assert!(!update_antenna_live_stage_progress(
+            &mut execution,
+            1,
+            fullmag_runner::AntennaFieldStageStatus::EvaluatingField,
+            None,
+            124,
+        ));
+        execution.stages[0].status = "completed".into();
+        assert!(!update_antenna_live_stage_progress(
+            &mut execution,
+            0,
+            fullmag_runner::AntennaFieldStageStatus::ProjectingTargets,
+            None,
+            125,
+        ));
+        assert_eq!(execution.stages[0].last_progress_unix_ms, Some(123));
     }
 
     #[test]
@@ -12721,6 +17306,7 @@ mod tests {
             hysteresis_settle_step_kind: None,
             hysteresis_settle_step_method: None,
             scalar_row_due: false,
+            terminal_field_snapshot: false,
             finished: false,
         };
 
@@ -12943,17 +17529,17 @@ mod tests {
             "interactive remesh must mutate both stage IR snapshots and materialized execution plans"
         );
         assert!(
-            source.contains("interactive_template_ir = remesh_stage.ir;")
+            source.contains("interactive_template_ir = remesh_stages.remove(0).ir;")
                 && source.contains(
-                    "interactive_runtime_host.replace_base_problem(interactive_template_ir.clone())"
+                    "Some(&mut interactive_runtime_host)"
                 ),
             "post-script interactive remesh must update the base problem used by later run/relax commands"
         );
+        let remesh_source = include_str!("orchestrator/manual_remesh.rs");
         assert!(
-            source
-                .matches("previous continuation magnetization was cleared")
-                .count()
-                >= 2,
+            remesh_source.contains("*continuation = None;")
+                && remesh_source.contains("*continuation_source = None;")
+                && remesh_source.contains("*continuation_completion = None;"),
             "interactive remesh must not let old-mesh continuation magnetization override the refreshed solver mesh"
         );
         assert!(
@@ -12998,6 +17584,7 @@ mod tests {
     #[test]
     fn fem_gpu_preflight_reports_available_vram() {
         let status = fullmag_runner::NativeFemGpuStatus {
+            cpu_available: true,
             available: true,
             visible_cuda_device_count: 1,
             requested_gpu_index: -1,
@@ -13019,6 +17606,7 @@ mod tests {
     #[test]
     fn fem_gpu_preflight_reports_native_availability_reason() {
         let status = fullmag_runner::NativeFemGpuStatus {
+            cpu_available: false,
             available: false,
             visible_cuda_device_count: 0,
             requested_gpu_index: -1,
@@ -13089,6 +17677,75 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn mesh_build_overlay_keeps_last_successful_artifact_during_new_attempt() {
+        let last_success = serde_json::json!({
+            "build_id": "mesh:previous-success",
+            "status": "completed",
+            "source_scene_revision": 12
+        });
+        let airbox_target = serde_json::json!({ "hmax": "5e-9" });
+        let per_object_targets = serde_json::json!({
+            "film": { "hmax": "2e-9" }
+        });
+        let mut workspace = serde_json::json!({
+            "last_build_summary": last_success,
+            "effective_airbox_target": airbox_target,
+            "effective_per_object_targets": per_object_targets,
+            "last_build_error": "an earlier build failed"
+        });
+        let mut overlay = super::CurrentMeshBuildOverlay {
+            active_build: Some(serde_json::json!({ "build_id": "mesh:next-attempt" })),
+            effective_airbox_target: None,
+            effective_per_object_targets: None,
+            last_build_summary: None,
+            last_build_error: None,
+            active_phase: Some("meshing".to_string()),
+            progress_percent: None,
+            progress_label: None,
+            attempt_index: None,
+            algorithm_3d: None,
+            attempt_status: None,
+            attempt_failure_reason: None,
+            next_algorithm_3d: None,
+            progress_kind: None,
+            last_recoverable_attempt: None,
+            phase_started_at: Instant::now(),
+            phase_durations_ms: Vec::new(),
+            failed: false,
+        };
+
+        super::overlay_mesh_workspace(&mut workspace, &overlay);
+
+        assert_eq!(
+            workspace["last_build_summary"]["build_id"],
+            "mesh:previous-success"
+        );
+        assert_eq!(workspace["effective_airbox_target"], airbox_target);
+        assert_eq!(
+            workspace["effective_per_object_targets"],
+            per_object_targets
+        );
+        assert!(workspace["last_build_error"].is_null());
+        assert_eq!(workspace["active_build"]["build_id"], "mesh:next-attempt");
+
+        overlay.active_build = None;
+        overlay.effective_airbox_target = Some(serde_json::Value::Null);
+        overlay.effective_per_object_targets = Some(serde_json::Value::Null);
+        overlay.last_build_summary = Some(serde_json::json!({
+            "build_id": "mesh:next-success",
+            "status": "completed"
+        }));
+        super::overlay_mesh_workspace(&mut workspace, &overlay);
+
+        assert_eq!(
+            workspace["last_build_summary"]["build_id"],
+            "mesh:next-success"
+        );
+        assert!(workspace["effective_airbox_target"].is_null());
+        assert!(workspace["effective_per_object_targets"].is_null());
     }
 
     #[test]
@@ -13259,6 +17916,20 @@ mod tests {
         assert!(step_update_has_frequency_response_progress(&update));
         assert!(cadence.should_publish(&update));
         assert!(cadence.should_log(&update));
+    }
+
+    #[test]
+    fn parallel_admission_progress_forces_publish_without_waiting_for_heartbeat() {
+        let mut cadence = LiveProgressCadence::default();
+        cadence.last_publish_at = Some(Instant::now());
+        let mut progress = std::collections::HashMap::new();
+        progress.insert("parallel_telemetry_available".to_string(), 1.0);
+        let mut update = test_step_update(257);
+        set_fem_eigen_progress(&mut update.stats, progress);
+
+        assert!(!has_heavy_live_payload(&update));
+        assert!(step_update_has_parallel_execution_progress(&update));
+        assert!(cadence.should_publish(&update));
     }
 
     #[test]
@@ -13479,6 +18150,7 @@ mod tests {
         e_total.vector_field_values = vec![11.0];
         terminal.stats.time = 2.5e-12;
         terminal.cached_preview_fields = Some(vec![eden_demag, eden_total, mat_ms, e_total]);
+        terminal.terminal_field_snapshot = true;
 
         let _ = apply_live_step_update_to_workspace_state(
             &mut state,
@@ -13520,6 +18192,70 @@ mod tests {
     }
 
     #[test]
+    fn async_materialized_field_batches_merge_without_terminal_replacement() {
+        let mut state = test_workspace_state();
+        state.latest_fields.insert(
+            "m".to_string(),
+            serde_json::json!({
+                "quantity": "m",
+                "values": [[1.0, 0.0, 0.0]],
+                "layout": { "grid_cells": [1, 1, 1], "spatial_kind": "mesh" }
+            }),
+        );
+
+        let mut first = test_step_update(12);
+        let mut h_demag = test_preview_field("H_demag", 12, 2.0);
+        h_demag.quantity_domain = "magnetic_only".to_string();
+        h_demag.materialized_at_unix_ms = 17;
+        first.cached_preview_fields = Some(vec![h_demag]);
+        let _ = apply_live_step_update_to_workspace_state(
+            &mut state,
+            "run-test",
+            "session-test",
+            PathBuf::from("/tmp/artifacts").as_path(),
+            first,
+            true,
+        );
+
+        assert!(state.latest_fields.0.contains_key("m"));
+        assert!(state
+            .pending_preview_fields
+            .to_vec()
+            .iter()
+            .any(|field| field.quantity == "H_demag"));
+        assert!(!state.replace_latest_fields);
+        assert!(state.field_generation.is_none());
+        assert!(!state.clear_preview_cache);
+
+        let mut second = test_step_update(12);
+        let mut h_ex = test_preview_field("H_ex", 13, 3.0);
+        h_ex.quantity_domain = "magnetic_only".to_string();
+        h_ex.materialized_at_unix_ms = 18;
+        second.cached_preview_fields = Some(vec![h_ex]);
+        let _ = apply_live_step_update_to_workspace_state(
+            &mut state,
+            "run-test",
+            "session-test",
+            PathBuf::from("/tmp/artifacts").as_path(),
+            second,
+            true,
+        );
+
+        assert!(state.latest_fields.0.contains_key("m"));
+        let pending_quantities = state
+            .pending_preview_fields
+            .to_vec()
+            .into_iter()
+            .map(|field| field.quantity)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(pending_quantities.contains("H_demag"));
+        assert!(pending_quantities.contains("H_ex"));
+        assert!(!state.replace_latest_fields);
+        assert!(state.field_generation.is_none());
+        assert!(!state.clear_preview_cache);
+    }
+
+    #[test]
     fn interactive_terminal_field_snapshot_does_not_promote_an_ambiguous_scalar_plane() {
         let mut state = test_workspace_state();
         let mut terminal = test_step_update(12);
@@ -13534,6 +18270,7 @@ mod tests {
         eden_demag.vector_field_values = vec![3.0, 4.0];
         eden_demag.materialized_at_unix_ms = 17;
         terminal.cached_preview_fields = Some(vec![eden_demag]);
+        terminal.terminal_field_snapshot = true;
 
         let _ = apply_live_step_update_to_workspace_state(
             &mut state,
@@ -13752,6 +18489,96 @@ mod tests {
         })
     }
 
+    #[test]
+    fn fdm_grid_refresh_workspace_exposes_new_generation_and_mask_contract() {
+        let BackendPlanIR::Fdm(mut plan) = tiny_fdm_plan() else {
+            panic!("test fixture must be an FDM plan");
+        };
+        plan.region_mask = vec![1];
+        let workspace = current_fdm_mesh_workspace(&plan, "awaiting_command", &[]);
+
+        assert_eq!(
+            workspace["mesh_summary"]["cells"],
+            serde_json::json!([1, 1, 1])
+        );
+        assert_eq!(
+            workspace["mesh_summary"]["cell_size_m"],
+            serde_json::json!([5e-9, 5e-9, 5e-9])
+        );
+        assert_eq!(
+            workspace["mesh_summary"]["generation_id"],
+            "fdm:fdm-grid-1x1x1"
+        );
+        assert_eq!(workspace["mesh_summary"]["active_cells"], 1);
+        assert_eq!(workspace["mesh_capabilities"]["has_structured_grid"], true);
+        assert_eq!(workspace["mesh_capabilities"]["has_membership_mask"], true);
+        assert_eq!(workspace["mesh_capabilities"]["supports_grid_replan"], true);
+    }
+
+    #[test]
+    fn fdm_grid_refresh_patch_normalizes_policy_and_runtime_selection() {
+        let mut problem = ProblemIR::bootstrap_example();
+        let geometry_before = problem.geometry.clone();
+        let materials_before = problem.materials.clone();
+        let magnets_before = problem.magnets.clone();
+        let regions_before = problem.regions.clone();
+        let object_regions_before = problem.object_regions.clone();
+        let patch = SceneProblemPatch {
+            geometry_entries: Vec::new(),
+            magnets: Vec::new(),
+            materials: Vec::new(),
+            regions: Vec::new(),
+            object_regions: Vec::new(),
+            universe: None,
+            fdm: Some(serde_json::json!({
+                "default_cell": [1e-9, 2e-9, 3e-9],
+                "per_object_grid": {
+                    "magnet": {"cell": [4e-9, 5e-9, 6e-9]}
+                },
+                "demag": {"strategy": "auto", "mode": "auto", "explain": true}
+            })),
+            runtime_selection: Some(serde_json::json!({
+                "backend": "fdm",
+                "device": "gpu",
+                "precision": "double"
+            })),
+        };
+
+        apply_scene_discretization_patch(&mut problem, &patch)
+            .expect("FDM discretization patch should be valid");
+
+        assert_eq!(problem.backend_policy.requested_backend, BackendTarget::Fdm);
+        assert_eq!(problem.geometry, geometry_before);
+        assert_eq!(problem.materials, materials_before);
+        assert_eq!(problem.magnets, magnets_before);
+        assert_eq!(problem.regions, regions_before);
+        assert_eq!(problem.object_regions, object_regions_before);
+        let hints = problem
+            .backend_policy
+            .discretization_hints
+            .as_ref()
+            .and_then(|hints| hints.fdm.as_ref())
+            .expect("FDM hints should be materialized");
+        assert_eq!(hints.cell, [1e-9, 2e-9, 3e-9]);
+        assert_eq!(hints.default_cell, Some([1e-9, 2e-9, 3e-9]));
+        assert_eq!(
+            hints
+                .per_magnet
+                .as_ref()
+                .and_then(|entries| entries.get("magnet"))
+                .map(|entry| entry.cell),
+            Some([4e-9, 5e-9, 6e-9])
+        );
+        assert_eq!(
+            hints.demag.as_ref().map(|demag| demag.fft_backend.as_str()),
+            Some("auto")
+        );
+        assert_eq!(
+            problem.problem_meta.runtime_metadata["runtime_selection"]["device"],
+            "gpu"
+        );
+    }
+
     fn tiny_fem_plan() -> BackendPlanIR {
         BackendPlanIR::Fem(FemPlanIR {
             mesh_name: "tiny".to_string(),
@@ -13815,10 +18642,12 @@ mod tests {
             enable_demag: true,
             external_field: None,
             antenna_zeeman_masks: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
             field_drives: Vec::new(),
             field_drive_geometry_masks: Vec::new(),
             time_stage: Default::default(),
             current_modules: vec![],
+            charge_transport_plans: vec![],
             spin_transport_plans: vec![],
             gyromagnetic_ratio: 2.211e5,
             precision: ExecutionPrecision::Double,
@@ -13831,6 +18660,7 @@ mod tests {
             demag_realization: None,
             air_box_config: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             dmi_interface_normal: None,
             dind_field: None,
@@ -13956,10 +18786,12 @@ mod tests {
             enable_demag: true,
             external_field: None,
             antenna_zeeman_masks: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
             field_drives: Vec::new(),
             field_drive_geometry_masks: Vec::new(),
             time_stage: Default::default(),
             current_modules: vec![],
+            charge_transport_plans: vec![],
             spin_transport_plans: vec![],
             gyromagnetic_ratio: 2.211e5,
             precision: ExecutionPrecision::Double,
@@ -13972,6 +18804,7 @@ mod tests {
             demag_realization: None,
             air_box_config: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             dmi_interface_normal: None,
             dind_field: None,
@@ -14083,6 +18916,7 @@ mod tests {
             backend_policy: BackendPolicyIR {
                 requested_backend: BackendTarget::Fem,
                 execution_precision: ExecutionPrecision::Double,
+                fdm_precision_policy: None,
                 discretization_hints: Some(DiscretizationHintsIR {
                     fdm: None,
                     fem: None,
@@ -14095,6 +18929,11 @@ mod tests {
             planar_monitors: Vec::new(),
             field_drives: Vec::new(),
             current_modules: Vec::new(),
+            antenna_port_modes: Vec::new(),
+            antenna_field_solve_stages: Vec::new(),
+            antenna_target_projections: Vec::new(),
+            solved_antenna_drives: Vec::new(),
+            antenna_spectrum_requests: Vec::new(),
             spin_torque_modules: Vec::new(),
             physics_graph: None,
             excitation_analysis: None,
@@ -14177,6 +19016,58 @@ mod tests {
         }
     }
 
+    fn certified_fields(node_count: usize) -> fullmag_runner::CertifiedFemEquilibriumFields {
+        let zeros = vec![[0.0, 0.0, 0.0]; node_count];
+        fullmag_runner::CertifiedFemEquilibriumFields::from_fields(
+            zeros.clone(),
+            zeros.clone(),
+            zeros.clone(),
+            zeros,
+            vec![0.0; node_count],
+        )
+        .expect("certified field fixture")
+    }
+
+    fn recomputed_certificate(
+        plan: &fullmag_ir::FemPlanIR,
+        mesh: &fullmag_runner::FemMeshPayload,
+        m0: &[[f64; 3]],
+        fields: &fullmag_runner::CertifiedFemEquilibriumFields,
+    ) -> fullmag_runner::RecomputedFemLinearizationCertificateV1 {
+        let [material, physics, boundary] =
+            fullmag_runner::fem_relax_equilibrium_identity_signatures(plan)
+                .expect("equilibrium identity fixture");
+        let mut certificate = fullmag_runner::RecomputedFemLinearizationCertificateV1 {
+            schema_version: "RecomputedFemLinearizationCertificate.v1".to_string(),
+            status: "matched".to_string(),
+            recompute_provider: "native_fem_final_state_refresh.v1".to_string(),
+            node_count: m0.len(),
+            equilibrium_content_sha256: fullmag_runner::recomputed_fem_equilibrium_content_sha256(
+                m0,
+            ),
+            mesh_topology_sha256: fullmag_runner::fem_mesh_topology_fingerprint(mesh),
+            equilibrium_material_signature: material,
+            equilibrium_static_physics_signature: physics,
+            equilibrium_boundary_signature: boundary,
+            accepted_fields_content_sha256: fields.content_sha256.clone(),
+            recomputed_fields_content_sha256: fields.content_sha256.clone(),
+            max_h_ex_difference_a_per_m: 0.0,
+            max_h_demag_difference_a_per_m: 0.0,
+            max_h_ext_difference_a_per_m: 0.0,
+            max_h_anisotropy_difference_a_per_m: None,
+            max_h_eff_difference_a_per_m: 0.0,
+            max_phi_difference_a: 0.0,
+            field_absolute_tolerance_a_per_m: 1.0e-6,
+            field_relative_tolerance: 1.0e-8,
+            phi_absolute_tolerance_a: 1.0e-12,
+            content_sha256: String::new(),
+        };
+        certificate.content_sha256 =
+            fullmag_runner::recomputed_fem_linearization_certificate_sha256(&certificate)
+                .expect("certificate digest fixture");
+        certificate
+    }
+
     #[test]
     fn frequency_response_rejects_max_steps_relaxation_continuation() {
         let stage = frequency_response_relaxed_stage();
@@ -14214,13 +19105,35 @@ mod tests {
     }
 
     #[test]
+    fn active_sequence_records_the_exact_application_boundary_and_segment() {
+        let mut sequence = ActiveSequenceState::single_current();
+        let boundary = CommandApplicationBoundary::new("run-7", "cmd-hot-apply", 42, 2.5e-12);
+
+        sequence.mark_current_started("cmd-hot-apply", 1_700_000_000_000, None, Some(&boundary));
+        sequence.mark_current("completed", None, Some(1_700_000_001_000), None);
+
+        let stage = sequence
+            .completed_stage_execution("awaiting_command")
+            .stages
+            .into_iter()
+            .next()
+            .expect("stage record should be present");
+        assert_eq!(stage.applied_step, Some(42));
+        assert_eq!(stage.applied_time_seconds, Some(2.5e-12));
+        assert_eq!(
+            stage.segment_id.as_deref(),
+            Some("segment:run-7:cmd-hot-apply:42:3d85fd7fe1796495")
+        );
+    }
+
+    #[test]
     fn active_sequence_tracks_pause_checkpoint_and_resume_ref() {
         let mut sequence = ActiveSequenceState::new(vec![SequenceStage::Run {
             until_seconds: 1e-9,
             max_steps: Some(100),
         }]);
 
-        sequence.mark_current_started("cmd-stage-0", 1_700_000_000_000, None);
+        sequence.mark_current_started("cmd-stage-0", 1_700_000_000_000, None, None);
         sequence.mark_current(
             "paused",
             None,
@@ -14232,7 +19145,7 @@ mod tests {
             Some("runs/run-1/checkpoints/cp-000042/common_state.json".to_string()),
         );
         sequence.mark_current_resume_from_checkpoint("cp-000042");
-        sequence.mark_current_started("cmd-stage-0", 1_700_000_001_000, None);
+        sequence.mark_current_started("cmd-stage-0", 1_700_000_001_000, None, None);
 
         let stage = sequence
             .stage_execution(Some("run"), "running")
@@ -14301,12 +19214,57 @@ mod tests {
         }]);
 
         sequence.mark_current_materialized_kind("flat_hysteresis");
-        sequence.mark_current_started("cmd-stage-0", 1_700_000_000_000, None);
+        sequence.mark_current_started("cmd-stage-0", 1_700_000_000_000, None, None);
         sequence.mark_current("completed", None, Some(1_700_000_001_000), None);
 
         let execution = sequence.completed_stage_execution("awaiting_command");
         assert_eq!(execution.stages[0].kind.as_deref(), Some("flat_hysteresis"));
         assert_eq!(execution.stages[0].status, "completed");
+    }
+
+    #[test]
+    fn scripted_inspection_stage_has_runtime_identity_and_terminal_artifact_ref() {
+        for (status, reason) in [
+            ("completed", None),
+            ("failed", Some(fullmag_ir::StageStopReason::BackendError)),
+            ("cancelled", Some(fullmag_ir::StageStopReason::UserCancelled)),
+        ] {
+            let reference = "antenna/external_lead_stage_outputs/stage-001/antenna_external_lead_stage_output.v1.json";
+            let completion = fullmag_ir::StageCompletionIR {
+                status: status.into(), converged: false, reason,
+                metric: None, metric_name: None, metric_value: None, threshold: None,
+            };
+            let execution = scripted_stage_execution_state_with_completion(
+                3, 1, "study_pipeline_antenna_field_solve", status, None,
+                Some(1), Some(2), Some(reference.into()), Some(&completion), None,
+            );
+            assert_eq!(execution.stages[1].stage_id.as_deref(), Some("stage-001"));
+            assert_eq!(execution.stages[1].status, status);
+            assert_eq!(execution.stages[1].reason, reason);
+            assert_eq!(execution.stages[1].artifact_refs, vec![reference.to_string()]);
+            assert_eq!(execution.stages[0].stage_id.as_deref(), Some("stage-000"));
+            assert_eq!(execution.stages[2].stage_id.as_deref(), Some("stage-002"));
+            assert!(!execution.stages[1].converged);
+        }
+    }
+
+    #[test]
+    fn antenna_manifest_reference_accepts_canonical_path_and_operator_root_alias() {
+        let storage = std::path::PathBuf::from(std::env::var_os("FULLMAG_PROJECT_STORAGE_ROOT")
+            .expect("manifest reference test requires resolver-owned storage"));
+        assert!(storage.is_absolute());
+        let root = storage.join("tmp").join(format!("antenna-manifest-ref-{}", uuid::Uuid::new_v4().simple()));
+        fs::create_dir_all(root.join("operator-root-alias")).unwrap();
+        let path = root.join("manifest.v1.json");
+        fs::write(&path, b"{}").unwrap();
+        let canonical = fs::canonicalize(&path).unwrap();
+        assert_eq!(relative_artifact_ref(&root, &canonical).unwrap(), "manifest.v1.json");
+        let alias = root.join("operator-root-alias").join("..");
+        assert_eq!(relative_artifact_ref(&alias, &canonical).unwrap(), "manifest.v1.json");
+        assert!(relative_artifact_ref(&root, &root).is_err());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(root.join("operator-root-alias")).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]
@@ -14331,6 +19289,42 @@ mod tests {
         );
         assert_eq!(execution.stages[0].kind.as_deref(), Some("flat_hysteresis"));
         assert_eq!(execution.stages[0].status, "completed");
+    }
+
+    #[test]
+    fn completed_scripted_stages_keep_interactive_owner_awaiting_commands() {
+        let mut execution = scripted_stage_execution_state(
+            1,
+            0,
+            "flat_run",
+            "completed",
+            Some("cmd-solve"),
+            Some(1_700_000_000_000),
+            Some(1_700_000_001_000),
+            Some("artifacts/stage-000".to_string()),
+            Some(fullmag_ir::StageStopReason::MaxPhysicalTime),
+            None,
+        );
+        let boundary = CommandApplicationBoundary::new("run-1", "cmd-solve", 0, 0.0);
+        attach_scripted_stage_solver_steps(&mut execution, 0, Some(&boundary), Some(10));
+        assert_eq!(execution.stages[0].applied_step, Some(0));
+        assert_eq!(execution.stages[0].completed_step, Some(10));
+        assert_eq!(execution.stages[0].segment_id, Some(boundary.segment_id));
+        let terminal_history = serde_json::to_value(&execution.stages).unwrap();
+
+        publish_scripted_stages_awaiting_command(&mut execution);
+
+        assert_eq!(execution.runtime_state, "awaiting_command");
+        assert_eq!(execution.active_stage_index, None);
+        assert_eq!(execution.active_stage_kind, None);
+        assert_eq!(execution.completed_stage_indexes, vec![0]);
+        assert_eq!(execution.stage_statuses, vec!["completed"]);
+        assert_eq!(serde_json::to_value(&execution.stages).unwrap(), terminal_history);
+
+        // A later explicit close must publish terminal ownership, not idle ownership.
+        execution = super::stage_execution_from_records(&execution.stages, None, None, "completed");
+        assert_eq!(execution.runtime_state, "completed");
+        assert_eq!(serde_json::to_value(&execution.stages).unwrap(), terminal_history);
     }
 
     #[test]
@@ -14406,7 +19400,7 @@ mod tests {
         let sequence = active_sequence
             .as_mut()
             .expect("active sequence should be present");
-        sequence.mark_current_started("cmd-solve", 1_700_000_000_000, None);
+        sequence.mark_current_started("cmd-solve", 1_700_000_000_000, None, None);
         sequence.mark_current("paused", None, None, None);
 
         let execution =
@@ -14501,6 +19495,258 @@ mod tests {
     }
 
     #[test]
+    fn antenna_spectrum_batch_rejects_later_invalid_output_before_publication() {
+        let duplicate = super::validate_antenna_spectrum_output_ids([
+            ("first", "field"),
+            ("second", "field"),
+        ])
+        .unwrap_err();
+        assert!(duplicate.to_string().contains("declared more than once"));
+
+        let unsafe_id = super::validate_antenna_spectrum_output_ids([
+            ("first", "field"),
+            ("second", "../outside"),
+        ])
+        .unwrap_err();
+        assert!(unsafe_id.to_string().contains("second"));
+        assert!(unsafe_id.to_string().contains("unsafe output_id"));
+    }
+
+    #[test]
+    fn antenna_spectrum_publication_is_atomic_and_content_addressed() {
+        let root = temp_test_dir("antenna-spectrum-publication");
+        let artifacts = vec![
+            fullmag_runner::AuxiliaryArtifact {
+                relative_path: "antenna/source_spectra/field/k_u_rad_per_m.f64le".into(),
+                bytes: vec![1, 2, 3],
+            },
+            fullmag_runner::AuxiliaryArtifact {
+                relative_path: "antenna/source_spectra/field/spectrum.v2.json".into(),
+                bytes: br#"{"content_digest":"sha256:test"}"#.to_vec(),
+            },
+        ];
+        let error =
+            super::publish_antenna_spectrum_artifacts_atomically(&root, "../outside", &artifacts, None)
+                .expect_err("output ids must not escape the artifact directory");
+        assert!(error.to_string().contains("one safe path component"));
+
+        super::publish_antenna_spectrum_artifacts_atomically(&root, "field", &artifacts, None)
+            .expect("first spectrum publication should succeed");
+        let output_dir = root.join("antenna/source_spectra/field");
+        assert_eq!(
+            fs::read(output_dir.join("k_u_rad_per_m.f64le")).unwrap(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            fs::read(output_dir.join("spectrum.v2.json")).unwrap(),
+            br#"{"content_digest":"sha256:test"}"#
+        );
+        assert!(fs::read_dir(root.join("antenna/source_spectra"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().contains("staging")));
+
+        super::publish_antenna_spectrum_artifacts_atomically(&root, "field", &artifacts, None)
+            .expect("identical spectrum publication should be reused");
+
+        let mut conflicting = artifacts.clone();
+        conflicting[0].bytes = vec![9, 9, 9];
+        let error =
+            super::publish_antenna_spectrum_artifacts_atomically(&root, "field", &conflicting, None)
+                .expect_err("different content must not overwrite an existing result");
+        assert!(error.to_string().contains("different content"));
+        assert_eq!(
+            fs::read(output_dir.join("k_u_rad_per_m.f64le")).unwrap(),
+            vec![1, 2, 3]
+        );
+
+        fs::write(output_dir.join("unexpected.tmp"), b"stray")
+            .expect("test should create an unexpected file");
+        let error =
+            super::publish_antenna_spectrum_artifacts_atomically(&root, "field", &artifacts, None)
+                .expect_err("unexpected files must invalidate an existing publication");
+        assert!(error.to_string().contains("different published file set"));
+        fs::remove_file(output_dir.join("unexpected.tmp")).unwrap();
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn antenna_spectrum_reuse_streams_large_payload_and_rejects_late_corruption() {
+        let root = temp_test_dir("antenna-spectrum-large-reuse");
+        let payload = vec![7_u8; 128 * 1024 + 1];
+        let artifacts = vec![
+            fullmag_runner::AuxiliaryArtifact {
+                relative_path: "antenna/source_spectra/field/power.f64le".into(),
+                bytes: payload.clone(),
+            },
+            fullmag_runner::AuxiliaryArtifact {
+                relative_path: "antenna/source_spectra/field/spectrum.v2.json".into(),
+                bytes: br#"{"content_digest":"sha256:test"}"#.to_vec(),
+            },
+        ];
+        super::publish_antenna_spectrum_artifacts_atomically(&root, "field", &artifacts, None)
+            .unwrap();
+        super::publish_antenna_spectrum_artifacts_atomically(&root, "field", &artifacts, None)
+            .expect("identical multi-block payload should be reused");
+
+        let path = root.join("antenna/source_spectra/field/power.f64le");
+        let mut corrupted = payload;
+        corrupted[128 * 1024] ^= 1;
+        fs::write(&path, corrupted).unwrap();
+        let error = super::publish_antenna_spectrum_artifacts_atomically(
+            &root, "field", &artifacts, None,
+        ).unwrap_err();
+        assert!(error.to_string().contains("different content"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn antenna_spectrum_publication_race_reuses_only_identical_output() {
+        let artifacts = vec![fullmag_runner::AuxiliaryArtifact {
+            relative_path: "antenna/source_spectra/field/spectrum.v2.json".into(),
+            bytes: br#"{"content_digest":"sha256:first"}"#.to_vec(),
+        }];
+        let root = temp_test_dir("antenna-spectrum-publication-race");
+        let winner = || {
+            super::publish_antenna_spectrum_artifacts_atomically(&root, "field", &artifacts, None)
+        };
+        super::publish_antenna_spectrum_artifacts_atomically_with_hook(
+            &root,
+            "field",
+            &artifacts,
+            None,
+            Some(&winner),
+        )
+        .expect("losing writer must reuse a complete identical output");
+        assert!(fs::read_dir(root.join("antenna/source_spectra"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().contains("staging")));
+        let _ = fs::remove_dir_all(root);
+
+        let root = temp_test_dir("antenna-spectrum-publication-race-conflict");
+        let mut conflicting = artifacts.clone();
+        conflicting[0].bytes = br#"{"content_digest":"sha256:other"}"#.to_vec();
+        let winner = || {
+            super::publish_antenna_spectrum_artifacts_atomically(&root, "field", &conflicting, None)
+        };
+        let error = super::publish_antenna_spectrum_artifacts_atomically_with_hook(
+            &root,
+            "field",
+            &artifacts,
+            None,
+            Some(&winner),
+        )
+        .expect_err("losing writer must reject a different immutable output");
+        assert!(error.to_string().contains("different content"));
+        assert_eq!(
+            fs::read(root.join("antenna/source_spectra/field/spectrum.v2.json")).unwrap(),
+            conflicting[0].bytes
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn antenna_spectrum_publication_rejects_corrupted_staging_bytes() {
+        let root = temp_test_dir("antenna-spectrum-staging-integrity");
+        let artifacts = vec![
+            fullmag_runner::AuxiliaryArtifact {
+                relative_path: "antenna/source_spectra/field/power.f64le".into(),
+                bytes: vec![1, 2, 3, 4],
+            },
+            fullmag_runner::AuxiliaryArtifact {
+                relative_path: "antenna/source_spectra/field/spectrum.v2.json".into(),
+                bytes: br#"{"content_digest":"sha256:test"}"#.to_vec(),
+            },
+        ];
+        let corrupt_staging = || {
+            let staging_dir = fs::read_dir(root.join("antenna/source_spectra"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .find(|entry| entry.file_name().to_string_lossy().contains("staging"))
+                .unwrap()
+                .path();
+            fs::write(staging_dir.join("power.f64le"), [9, 9, 9, 9]).unwrap();
+            Ok(())
+        };
+        let error = super::publish_antenna_spectrum_artifacts_atomically_with_hook(
+            &root,
+            "field",
+            &artifacts,
+            None,
+            Some(&corrupt_staging),
+        )
+        .expect_err("corrupted staged bytes must not become a ready output");
+        assert!(error.to_string().contains("differs from generated content"));
+        assert!(!root.join("antenna/source_spectra/field").exists());
+        assert!(fs::read_dir(root.join("antenna/source_spectra"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().contains("staging")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancelled_antenna_spectrum_leaves_no_published_output() {
+        let root = temp_test_dir("cancelled-antenna-spectrum");
+        let artifacts = vec![fullmag_runner::AuxiliaryArtifact {
+            relative_path: "antenna/source_spectra/field/spectrum.v2.json".into(),
+            bytes: br#"{"content_digest":"sha256:test"}"#.to_vec(),
+        }];
+        let interrupted = std::sync::atomic::AtomicBool::new(true);
+        let error = super::publish_antenna_spectrum_artifacts_atomically(
+            &root,
+            "field",
+            &artifacts,
+            Some(&interrupted),
+        )
+        .expect_err("cancelled spectrum publication must not become visible");
+        assert!(error.to_string().contains("cancelled before publication"));
+        let spectrum_root = root.join("antenna/source_spectra");
+        assert!(!spectrum_root.join("field").exists());
+        if spectrum_root.exists() {
+            assert!(fs::read_dir(&spectrum_root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains("staging")));
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn cancellation_at_spectrum_rename_boundary_keeps_manifest_private() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let root = temp_test_dir("cancelled-antenna-spectrum-rename");
+        let artifacts = vec![fullmag_runner::AuxiliaryArtifact {
+            relative_path: "antenna/source_spectra/field/spectrum.v2.json".into(),
+            bytes: br#"{"content_digest":"sha256:test"}"#.to_vec(),
+        }];
+        let interrupted = AtomicBool::new(false);
+        let cancel_at_boundary = || {
+            interrupted.store(true, Ordering::Release);
+            Ok(())
+        };
+        let error = super::publish_antenna_spectrum_artifacts_atomically_with_hook(
+            &root,
+            "field",
+            &artifacts,
+            Some(&interrupted),
+            Some(&cancel_at_boundary),
+        )
+        .expect_err("cancellation before rename must keep the manifest private");
+        assert!(error.to_string().contains("cancelled before publication"));
+        let spectrum_root = root.join("antenna/source_spectra");
+        assert!(!spectrum_root.join("field").exists());
+        assert!(fs::read_dir(&spectrum_root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .all(|entry| !entry.file_name().to_string_lossy().contains("staging")));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn wait_for_solve_is_supported_for_fdm_and_fem() {
         assert!(wait_for_solve_supported(&tiny_fdm_plan()));
         assert!(wait_for_solve_supported(&tiny_fem_plan()));
@@ -14512,6 +19758,55 @@ mod tests {
         assert!(!wait_for_solve_should_block(true, true, true));
         assert!(!wait_for_solve_should_block(true, false, false));
         assert!(!wait_for_solve_should_block(false, true, false));
+    }
+
+    #[test]
+    fn wait_for_solve_applies_frozen_spins_binding_before_building_the_initial_stage() {
+        let source = include_str!("orchestrator.rs");
+        let branch = source
+            .split("WaitForSolveCommandAction::StartSolver => {")
+            .nth(1)
+            .expect("wait-for-solve start branch")
+            .split("WaitForSolveCommandAction::Remesh => {")
+            .next()
+            .expect("wait-for-solve start branch body");
+        let binding_index = branch
+            .find("problem_with_frozen_spins_runtime_plan_binding(")
+            .expect("initial solver command must consume the Frozen Spins binding");
+        let stage_index = branch
+            .find("build_initial_interactive_command_stage(")
+            .expect("initial solver command must build a stage");
+
+        assert!(
+            binding_index < stage_index,
+            "Frozen Spins must update canonical IR before the initial execution plan is built"
+        );
+        assert!(
+            branch.contains("frozen_spins_applied_scene_revision = Some(source_scene_revision)")
+        );
+    }
+
+    #[test]
+    fn scripted_solver_publishes_frozen_spins_certificate_before_one_shot_execution() {
+        let source = include_str!("orchestrator.rs");
+        let execution = source
+            .split("let mut stage_heartbeat = use_live_callback.then(|| {")
+            .nth(1)
+            .expect("scripted stage execution block")
+            .split("let stage_failed =")
+            .next()
+            .expect("scripted stage execution body");
+        let certificate_index = execution
+            .find("publish_frozen_spins_runtime_status_for_execution_plan(")
+            .expect("scripted execution must publish the runner-owned certificate");
+        let run_index = execution
+            .find("run_planned_problem_with_live_preview_interruptible")
+            .expect("scripted execution must invoke the one-shot runner");
+
+        assert!(
+            certificate_index < run_index,
+            "Frozen Spins activation status must be published before the first solver step"
+        );
     }
 
     #[test]
@@ -14557,6 +19852,10 @@ mod tests {
             WaitForSolveCommandAction::StartSolver
         );
         assert_eq!(
+            classify_wait_for_solve_command("relax"),
+            WaitForSolveCommandAction::StartSolver
+        );
+        assert_eq!(
             classify_wait_for_solve_command("display_sync"),
             WaitForSolveCommandAction::Ignore
         );
@@ -14590,7 +19889,7 @@ mod tests {
             .and_then(|rest| rest.split("fn refresh_problem_energy_state(").next())
             .expect("refresh_problem_preview_state should be present");
 
-        assert!(function_body.contains("snapshot_problem_vector_field_batch"));
+        assert!(function_body.contains("snapshot_planned_problem_vector_field_batch"));
         assert!(function_body.contains("replace_auxiliary_artifacts"));
         assert!(function_body.contains("full_field_materialization_request"));
     }
@@ -14629,6 +19928,298 @@ mod tests {
         assert_eq!(payload.object_segments[0].element_count, 1);
         assert_eq!(payload.object_segments[1].object_id, "right");
         assert_eq!(payload.object_segments[1].boundary_face_count, 1);
+    }
+
+    #[test]
+    fn scripted_relax_to_single_k_builds_typed_handoff_only_from_accepted_completion() {
+        let BackendPlanIR::Fem(source) = tiny_fem_plan() else {
+            unreachable!()
+        };
+        let source_backend = BackendPlanIR::Fem(source.clone());
+        let source_mesh = fullmag_runner::FemMeshPayload::from(&source);
+        let m0 = source.initial_magnetization.clone();
+        let fields = certified_fields(source_mesh.nodes.len());
+        let recomputed = recomputed_certificate(&source, &source_mesh, &m0, &fields);
+        let target = fullmag_ir::FemEigenPlanIR {
+            mesh_name: source.mesh_name,
+            mesh_source: source.mesh_source,
+            mesh: source.mesh,
+            object_segments: source.object_segments,
+            mesh_parts: source.mesh_parts,
+            mesh_build_report: source.mesh_build_report,
+            domain_mesh_mode: source.domain_mesh_mode,
+            domain_frame: source.domain_frame,
+            fe_order: source.fe_order,
+            hmax: source.hmax,
+            equilibrium_magnetization: m0.clone(),
+            material: source.material,
+            operator: fullmag_ir::EigenOperatorConfigIR {
+                kind: fullmag_ir::EigenOperatorIR::Full2x2,
+                include_demag: true,
+            },
+            count: 2,
+            target: fullmag_ir::EigenTargetIR::Lowest,
+            equilibrium: fullmag_ir::EquilibriumSourceIR::RelaxedInitialState,
+            k_sampling: Some(fullmag_ir::KSamplingIR::Single {
+                k_vector: [0.0, 0.0, 0.0],
+            }),
+            bias_field_samples: Vec::new(),
+            normalization: fullmag_ir::EigenNormalizationIR::UnitL2,
+            damping_policy: fullmag_ir::EigenDampingPolicyIR::Ignore,
+            enable_exchange: source.enable_exchange,
+            enable_demag: source.enable_demag,
+            interfacial_dmi: source.interfacial_dmi,
+            dmi_interface_normal: source.dmi_interface_normal,
+            bulk_dmi: source.bulk_dmi,
+            external_field: source.external_field,
+            gyromagnetic_ratio: source.gyromagnetic_ratio,
+            precision: source.precision,
+            exchange_bc: source.exchange_bc,
+            spin_wave_bc: fullmag_ir::SpinWaveBoundaryConditionIR::default(),
+            demag_realization: None,
+            air_box_config: None,
+            mode_tracking: None,
+            dispersion_validation: None,
+            k0_kittel_validation: None,
+            solver_policy: None,
+        };
+        let backend = BackendPlanIR::FemEigen(target);
+        let completion = stage_completion(fullmag_ir::StageStopReason::Torque);
+        let source_stage = ContinuationStageSource {
+            run_id: "run-test".to_string(),
+            stage_id: "stage-000".to_string(),
+            stage_kind: "flat_relax".to_string(),
+            is_relaxation: true,
+        };
+        let handoff = accepted_relax_handoff_from_completed_stage(
+            &source_backend,
+            &source_stage,
+            &source_mesh,
+            &completion,
+            &m0,
+            &fields,
+            &fields,
+            &recomputed,
+        )
+        .expect("accepted relax output should create a typed handoff");
+        assert!(handoff.is_some());
+        let handoff = handoff.expect("accepted Relax must publish handoff v3 immediately");
+        assert!(
+            accepted_relax_handoff_for_eigen_stage(&backend, Some(&m0), Some(&handoff))
+                .expect("Eigen should consume the prepared handoff")
+                .is_some()
+        );
+
+        let mut tampered_accepted_fields = fields.clone();
+        tampered_accepted_fields.h_eff_a_per_m[0][0] += 1.0;
+        let error = accepted_relax_handoff_from_completed_stage(
+            &source_backend,
+            &source_stage,
+            &source_mesh,
+            &completion,
+            &m0,
+            &tampered_accepted_fields,
+            &fields,
+            &recomputed,
+        )
+        .expect_err("a digest-stale accepted endpoint must fail closed");
+        assert!(error
+            .to_string()
+            .contains("certified_fields_invalid"));
+
+        let mut tampered_recompute = recomputed.clone();
+        tampered_recompute.max_h_demag_difference_a_per_m = 1.0;
+        let error = accepted_relax_handoff_from_completed_stage(
+            &source_backend,
+            &source_stage,
+            &source_mesh,
+            &completion,
+            &m0,
+            &fields,
+            &fields,
+            &tampered_recompute,
+        )
+        .expect_err("a digest-stale recompute certificate must fail closed");
+        assert!(error.to_string().contains("content digest mismatch"));
+
+        let mut mismatched_equilibrium = recomputed.clone();
+        mismatched_equilibrium.equilibrium_content_sha256 = format!("sha256:{}", "a".repeat(64));
+        mismatched_equilibrium.content_sha256 =
+            fullmag_runner::recomputed_fem_linearization_certificate_sha256(
+                &mismatched_equilibrium,
+            )
+            .expect("equilibrium-mismatch certificate digest");
+        let error = accepted_relax_handoff_from_completed_stage(
+            &source_backend,
+            &source_stage,
+            &source_mesh,
+            &completion,
+            &m0,
+            &fields,
+            &fields,
+            &mismatched_equilibrium,
+        )
+        .expect_err("a certificate for a different equilibrium must fail closed");
+        assert!(error.to_string().contains("equilibrium digest mismatch"));
+
+        let mut mismatched_mesh = recomputed.clone();
+        mismatched_mesh.mesh_topology_sha256 = format!("sha256:{}", "b".repeat(64));
+        mismatched_mesh.content_sha256 =
+            fullmag_runner::recomputed_fem_linearization_certificate_sha256(&mismatched_mesh)
+                .expect("mesh-mismatch certificate digest");
+        let error = accepted_relax_handoff_from_completed_stage(
+            &source_backend,
+            &source_stage,
+            &source_mesh,
+            &completion,
+            &m0,
+            &fields,
+            &fields,
+            &mismatched_mesh,
+        )
+        .expect_err("a certificate for a different mesh must fail closed");
+        assert!(error.to_string().contains("mesh topology digest mismatch"));
+
+        let mut mismatched_fields = recomputed.clone();
+        mismatched_fields.recomputed_fields_content_sha256 = format!("sha256:{}", "c".repeat(64));
+        mismatched_fields.content_sha256 =
+            fullmag_runner::recomputed_fem_linearization_certificate_sha256(&mismatched_fields)
+                .expect("field-mismatch certificate digest");
+        let error = accepted_relax_handoff_from_completed_stage(
+            &source_backend,
+            &source_stage,
+            &source_mesh,
+            &completion,
+            &m0,
+            &fields,
+            &fields,
+            &mismatched_fields,
+        )
+        .expect_err("a certificate for different recomputed fields must fail closed");
+        assert!(error
+            .to_string()
+            .contains("recomputed field digest mismatch"));
+
+        let artifact_dir = temp_test_dir("relax-save-eigen-handoff");
+        let save_action = ResolvedScriptStageAction::SaveState {
+            artifact_name: "equilibrium".to_string(),
+            format: Some("json".to_string()),
+            dataset: None,
+        };
+        let save_outcome = execute_synthetic_stage(
+            &save_action,
+            &artifact_dir,
+            &artifact_dir.join("stage_save"),
+            &source_backend,
+            Some(&m0),
+        )
+        .expect("intermediate save_state stage should execute");
+        let mut continuation_magnetization = Some(m0.clone());
+        let mut continuation_source = Some(continuation_source_from_backend_plan(&source_backend));
+        let mut continuation_fem_mesh_payload = Some(source_mesh.clone());
+        let mut continuation_completion = Some(completion.clone());
+        let mut continuation_stage_source = Some(source_stage.clone());
+        let mut continuation_accepted_fields = Some(fields.clone());
+        let mut continuation_certified_fields = Some(fields.clone());
+        let mut continuation_relax_handoff = Some(handoff.clone());
+
+        replace_continuation_after_synthetic_stage(
+            &mut continuation_magnetization,
+            &mut continuation_source,
+            &mut continuation_fem_mesh_payload,
+            &mut continuation_completion,
+            &mut continuation_stage_source,
+            &mut continuation_accepted_fields,
+            &mut continuation_certified_fields,
+            &mut continuation_relax_handoff,
+            save_outcome.magnetization,
+            false,
+        );
+
+        assert_eq!(continuation_magnetization.as_deref(), Some(m0.as_slice()));
+        assert!(continuation_source.is_none());
+        assert!(continuation_fem_mesh_payload.is_none());
+        assert!(continuation_completion.is_none());
+        assert!(continuation_stage_source.is_none());
+        assert!(continuation_accepted_fields.is_none());
+        assert!(continuation_certified_fields.is_none());
+        assert!(continuation_relax_handoff.is_none());
+        let error = accepted_relax_handoff_for_eigen_stage(
+            &backend,
+            continuation_magnetization.as_deref(),
+            continuation_relax_handoff.as_ref(),
+        )
+        .expect_err("save_state must invalidate the preceding relaxation handoff");
+        assert!(error
+            .to_string()
+            .contains("missing the accepted Relax handoff v3"));
+
+        let mut continuation_magnetization = Some(m0.clone());
+        let mut continuation_source = Some(continuation_source_from_backend_plan(&source_backend));
+        let mut continuation_fem_mesh_payload = Some(source_mesh.clone());
+        let mut continuation_completion = Some(completion.clone());
+        let mut continuation_stage_source = Some(source_stage.clone());
+        let mut continuation_accepted_fields = Some(fields.clone());
+        let mut continuation_certified_fields = Some(fields.clone());
+        let mut continuation_relax_handoff = Some(handoff.clone());
+        replace_continuation_after_synthetic_stage(
+            &mut continuation_magnetization,
+            &mut continuation_source,
+            &mut continuation_fem_mesh_payload,
+            &mut continuation_completion,
+            &mut continuation_stage_source,
+            &mut continuation_accepted_fields,
+            &mut continuation_certified_fields,
+            &mut continuation_relax_handoff,
+            m0.clone(),
+            true,
+        );
+        assert!(
+            continuation_source.is_some(),
+            "change_device must preserve the typed continuation source"
+        );
+        assert!(continuation_accepted_fields.is_some());
+        assert!(accepted_relax_handoff_for_eigen_stage(
+            &backend,
+            continuation_magnetization.as_deref(),
+            continuation_relax_handoff.as_ref(),
+        )
+        .expect("change_device must preserve the certified relaxation handoff")
+        .is_some());
+        let _ = fs::remove_dir_all(&artifact_dir);
+
+        let mut rejected = completion;
+        rejected.converged = false;
+        let error = accepted_relax_handoff_from_completed_stage(
+            &source_backend,
+            &source_stage,
+            &source_mesh,
+            &rejected,
+            &m0,
+            &fields,
+            &fields,
+            &recomputed,
+        )
+        .expect_err("unaccepted relax output must fail closed before the runner");
+        assert!(error.to_string().contains("completion_not_accepted"));
+
+        let non_relax_source = ContinuationStageSource {
+            stage_kind: "flat_run".to_string(),
+            is_relaxation: false,
+            ..source_stage
+        };
+        assert!(accepted_relax_handoff_from_completed_stage(
+            &source_backend,
+            &non_relax_source,
+            &source_mesh,
+            &stage_completion(fullmag_ir::StageStopReason::Torque),
+            &m0,
+            &fields,
+            &fields,
+            &recomputed,
+        )
+        .expect("a non-relaxation stage should invalidate rather than create a handoff")
+        .is_none());
     }
 
     #[test]
@@ -14703,11 +20294,13 @@ mod tests {
         state.live_state.latest_step.preview_field = Some(test_preview_field("h_eff", 1, 2.0));
         let mut update = test_step_update(9);
         update.stats.e_total = 42.0;
+        update.stats.e_rotated_dmi = 17.0;
         let progress = crate::stage_heartbeat::StageHeartbeatProgress::new(&update);
 
         progress.apply_to_live_step(&mut state.live_state.latest_step);
 
         assert_eq!(state.live_state.latest_step.step, 9);
+        assert_eq!(state.live_state.latest_step.e_rotated_dmi, 17.0);
         assert_eq!(state.live_state.latest_step.e_total, 42.0);
         assert_eq!(state.live_state.latest_step.grid, [17, 19, 23]);
         assert_eq!(
@@ -14733,6 +20326,56 @@ mod tests {
 
         assert_eq!(payload.nodes.len(), initial_magnetization.len());
         assert_eq!(payload.object_segments.len(), 2);
+    }
+
+    #[test]
+    fn stage_execution_records_full_fem_mesh_identity() {
+        let asset = fullmag_runner::StageFemMeshAsset::build_from_backend_plan(&tiny_fem_plan())
+            .expect("FEM stage mesh asset");
+        let expected_generation_id = asset.identity.generation_id().to_string();
+        let expected_topology_fingerprint =
+            fullmag_runner::fem_mesh_topology_fingerprint(&asset.payload);
+
+        let mut scripted = scripted_stage_execution_state(
+            1,
+            0,
+            "relax",
+            "running",
+            Some("cmd-scripted"),
+            Some(1_700_000_000_000),
+            None,
+            None,
+            None,
+            None,
+        );
+        attach_stage_fem_mesh_identity(&mut scripted, 0, Some(&asset));
+        assert_eq!(
+            scripted.stages[0].mesh_generation_id.as_deref(),
+            Some(expected_generation_id.as_str())
+        );
+        assert_eq!(
+            scripted.stages[0].mesh_topology_fingerprint.as_deref(),
+            Some(expected_topology_fingerprint.as_str())
+        );
+        assert_eq!(scripted.stages[0].mesh_revision, None);
+
+        let mut interactive = ActiveSequenceState::single_current();
+        interactive.mark_current_started("cmd-interactive", 1_700_000_000_000, None, None);
+        interactive.mark_current_fem_mesh_identity(Some(&asset));
+        let interactive_execution = interactive.stage_execution(Some("relax"), "running");
+        assert_eq!(
+            interactive_execution.stages[0]
+                .mesh_generation_id
+                .as_deref(),
+            Some(expected_generation_id.as_str())
+        );
+        assert_eq!(
+            interactive_execution.stages[0]
+                .mesh_topology_fingerprint
+                .as_deref(),
+            Some(expected_topology_fingerprint.as_str())
+        );
+        assert_eq!(interactive_execution.stages[0].mesh_revision, None);
     }
 
     #[test]
@@ -14830,6 +20473,10 @@ mod tests {
             mode: None,
             precision: None,
             output_dir: None,
+            temp_dir: None,
+            data_format: None,
+            temp_cleanup: None,
+            existing_output: None,
             initial_magnetization_state: Some(state_path.clone()),
             initial_magnetization_state_format: Some("json".to_string()),
             initial_magnetization_state_dataset: None,
@@ -14839,6 +20486,13 @@ mod tests {
             dev: false,
             json: true,
             web_port: None,
+            ui: None,
+            api_port: None,
+            wait_for_solve: false,
+            expect_script_sha256: None,
+            receipt: None,
+            launched_by: None,
+            python: None,
         };
 
         let loaded =
@@ -15003,6 +20657,8 @@ mod tests {
                 "kind": "box",
                 "extent": [4.0, 2.0, 2.0]
             })),
+            fdm: None,
+            runtime_selection: None,
         };
         let new_mesh = MeshIR {
             mesh_name: "study_domain_after_ui_patch".to_string(),
@@ -15232,10 +20888,379 @@ mod tests {
         let _ = fs::remove_dir_all(stage_dir);
     }
 
+    // Synthetic non-direct lifecycle fixture; not a scientific field-solve result.
+    fn write_valid_antenna_catalog_asset(
+        artifact_dir: &Path,
+    ) -> (fullmag_ir::AntennaFieldSolutionRefIR, PathBuf) {
+        use sha2::{Digest, Sha256};
+        let directory = artifact_dir.join("antenna/field_solutions/basis/afs-test");
+        fs::create_dir_all(&directory).unwrap();
+        let binary_ref = |relative: &str, values: &[f64], layout: &str, unit: &str| {
+            let bytes = values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>();
+            let path = directory.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, &bytes).unwrap();
+            serde_json::json!({
+                "path": format!("antenna/field_solutions/basis/{relative}"),
+                "sha256": format!("{:x}", Sha256::digest(&bytes)),
+                "scalar_type": "float64_le", "layout": layout, "unit": unit,
+                "value_count": values.len(),
+            })
+        };
+        let mut manifest = serde_json::json!({
+            "schema_version": "antenna_field_solution.v1", "status": "ready",
+            "asset_id": "afs-test", "solution_id": "basis", "stage_id": "solve_antenna",
+            "source_object_id": "antenna", "current_transport_id": "charge",
+            "geometry_revision": "fixture-geometry", "material_revision": "fixture-material",
+            "mesh_digest": "fixture-mesh", "gauge_policy": "dirichlet_reference",
+            "solver_policy": {}, "requested_execution": {"device": "cpu"},
+            "resolved_execution": {"device": "cpu", "precision": "double"},
+            "signatures": {
+                "current_solution_signature": format!("sha256:{}", "1".repeat(64)),
+                "field_solution_signature": format!("sha256:{}", "2".repeat(64)),
+                "target_projection_signatures": {},
+            },
+            "conductor_positions": binary_ref("conductor_positions.f64le", &[0.0; 3], "node_xyz_interleaved", "m"),
+            "sample_positions": binary_ref("sample_positions.f64le", &[1.0, 0.0, 0.0], "sample_xyz_interleaved", "m"),
+            "bases": [{
+                "port_mode_id": "port_1", "measured_positive_terminal_current_a": 1.0,
+                "normalization_current_a": 1.0, "normalization_scale": 1.0,
+                "current_balance_certificate_digest": "fixture-balance",
+                "oersted_operator_version": fullmag_ir::ANTENNA_VECTOR_POTENTIAL_OPERATOR_VERSION,
+                "quadrature_diagnostics": {"operator_version": fullmag_ir::ANTENNA_VECTOR_POTENTIAL_OPERATOR_VERSION},
+                "electric_potential_per_ampere": binary_ref("port_1/V_per_A.f64le", &[1.0], "node_scalar", "V/A"),
+                "current_density_per_ampere": binary_ref("port_1/J_per_A.f64le", &[1.0, 0.0, 0.0], "sample_xyz_interleaved", "A/m^2/A"),
+                "magnetic_field_per_ampere": binary_ref("port_1/H_per_A.f64le", &[2.0, 0.0, 0.0], "sample_xyz_interleaved", "A/m/A"),
+            }],
+        });
+        let digest = format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&manifest).unwrap()));
+        manifest["content_digest"] = serde_json::json!(&digest);
+        let manifest_path = directory.join("manifest.v1.json");
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        (fullmag_ir::AntennaFieldSolutionRefIR {
+            stage_id: "solve_antenna".into(), output_id: "basis".into(),
+            asset_id: "afs-test".into(), content_digest: digest,
+        }, manifest_path)
+    }
+
+    #[test]
+    fn antenna_stage_output_catalog_is_idempotent_and_fail_closed() {
+        let artifact_dir = temp_test_dir("antenna-stage-output-catalog");
+        let cancelled_stage_dir = artifact_dir.join("cancelled");
+
+        write_antenna_stage_output_catalog_terminal(
+            &cancelled_stage_dir,
+            "solve_antenna",
+            "basis",
+            "port_1",
+            "cancelled",
+            "interrupt_requested",
+        )
+        .expect("cancelled antenna catalog should write");
+        let cancelled_path = antenna_stage_output_catalog_path(&cancelled_stage_dir);
+        let cancelled: serde_json::Value = serde_json::from_slice(
+            &fs::read(&cancelled_path).expect("cancelled antenna catalog should exist"),
+        )
+        .expect("cancelled antenna catalog should be JSON");
+        assert_eq!(cancelled["schema_version"], "stage_output_catalog.v1");
+        assert_eq!(cancelled["status"], "cancelled");
+        assert!(cancelled["outputs"].as_array().is_some_and(Vec::is_empty));
+
+        write_antenna_stage_output_catalog_terminal(
+            &cancelled_stage_dir,
+            "solve_antenna",
+            "basis",
+            "port_1",
+            "cancelled",
+            "interrupt_requested",
+        )
+        .expect("identical catalogue bytes should be idempotent");
+        assert!(write_antenna_stage_output_catalog_terminal(
+            &cancelled_stage_dir,
+            "solve_antenna",
+            "basis",
+            "port_1",
+            "failed",
+            "different terminal state",
+        )
+        .is_err());
+
+        let ready_stage_dir = artifact_dir.join("ready");
+        let (reference, manifest_path) = write_valid_antenna_catalog_asset(&artifact_dir);
+        write_antenna_stage_output_catalog_ready(
+            &ready_stage_dir,
+            &artifact_dir,
+            "solve_antenna",
+            "port_1",
+            &reference,
+            &manifest_path,
+            &["H_ant_basis".into()],
+            false,
+            None,
+        )
+        .expect("ready antenna catalog should write");
+        let ready: serde_json::Value = serde_json::from_slice(
+            &fs::read(antenna_stage_output_catalog_path(&ready_stage_dir))
+                .expect("ready antenna catalog should exist"),
+        )
+        .expect("ready antenna catalog should be JSON");
+        assert_eq!(ready["status"], "ready");
+        assert_eq!(ready["outputs"][0]["solution_ref"], serde_json::json!(&reference));
+        assert!(super::read_ready_antenna_stage_outputs(
+            &antenna_stage_output_catalog_path(&cancelled_stage_dir),
+            &artifact_dir,
+            "solve_antenna",
+            "port_1",
+        )
+        .is_err());
+        assert!(super::read_ready_antenna_stage_outputs(
+            &antenna_stage_output_catalog_path(&ready_stage_dir),
+            &artifact_dir,
+            "solve_antenna",
+            "port_2",
+        )
+        .is_err());
+        assert_eq!(super::read_ready_antenna_stage_outputs(
+            &antenna_stage_output_catalog_path(&ready_stage_dir),
+            &artifact_dir,
+            "solve_antenna",
+            "port_1",
+        ).unwrap(), vec![reference.clone()]);
+        let manifest_bytes = fs::read(&manifest_path).unwrap();
+        fs::write(&manifest_path, b"test manifest").unwrap();
+        let invalid_asset = super::read_ready_antenna_stage_outputs(
+            &antenna_stage_output_catalog_path(&ready_stage_dir),
+            &artifact_dir,
+            "solve_antenna",
+            "port_1",
+        ).expect_err("an existing dummy manifest is not a verified ready asset");
+        assert!(invalid_asset.to_string().contains("verify antenna stage output catalog asset"));
+        fs::write(&manifest_path, manifest_bytes).unwrap();
+        let mut duplicated = ready.clone();
+        duplicated["outputs"].as_array_mut().unwrap().push(ready["outputs"][0].clone());
+        let duplicate_path = artifact_dir.join("duplicate-stage-output-catalog.json");
+        fs::write(&duplicate_path, serde_json::to_vec(&duplicated).unwrap()).unwrap();
+        let duplicate = super::read_ready_antenna_stage_outputs(
+            &duplicate_path,
+            &artifact_dir,
+            "solve_antenna",
+            "port_1",
+        ).expect_err("second output with the same ID must be rejected after the valid first asset");
+        assert!(duplicate.to_string().contains("contains an incompatible reference"));
+        let mut wrong_kind = ready.clone();
+        wrong_kind["stage_kind"] = serde_json::json!("antenna_source_spectrum");
+        let wrong_kind_path = artifact_dir.join("wrong-stage-kind-catalog.json");
+        fs::write(&wrong_kind_path, serde_json::to_vec(&wrong_kind).unwrap()).unwrap();
+        assert!(super::read_ready_antenna_stage_outputs(
+            &wrong_kind_path,
+            &artifact_dir,
+            "solve_antenna",
+            "port_1",
+        )
+        .is_err());
+        let mut wrong_quantity = ready.clone();
+        wrong_quantity["outputs"][0]["quantity_ids"] = serde_json::json!(["H_ant"]);
+        let wrong_quantity_path = artifact_dir.join("wrong-quantity-catalog.json");
+        fs::write(&wrong_quantity_path, serde_json::to_vec(&wrong_quantity).unwrap()).unwrap();
+        assert!(super::read_ready_antenna_stage_outputs(
+            &wrong_quantity_path,
+            &artifact_dir,
+            "solve_antenna",
+            "port_1",
+        )
+        .is_err());
+        let mut missing_manifest = ready.clone();
+        missing_manifest["outputs"][0]["manifest_ref"] = serde_json::json!("missing/manifest.v1.json");
+        let missing_path = artifact_dir.join("missing-manifest-catalog.json");
+        fs::write(&missing_path, serde_json::to_vec(&missing_manifest).unwrap()).unwrap();
+        assert!(super::read_ready_antenna_stage_outputs(
+            &missing_path,
+            &artifact_dir,
+            "solve_antenna",
+            "port_1",
+        )
+        .is_err());
+        let unrelated_manifest_path = artifact_dir.join("unrelated/manifest.v1.json");
+        fs::create_dir_all(unrelated_manifest_path.parent().unwrap()).unwrap();
+        fs::write(&unrelated_manifest_path, b"other asset").unwrap();
+        let mut unrelated_manifest = ready.clone();
+        unrelated_manifest["outputs"][0]["manifest_ref"] =
+            serde_json::json!("unrelated/manifest.v1.json");
+        let unrelated_path = artifact_dir.join("unrelated-manifest-catalog.json");
+        fs::write(&unrelated_path, serde_json::to_vec(&unrelated_manifest).unwrap()).unwrap();
+        assert!(super::read_ready_antenna_stage_outputs(
+            &unrelated_path,
+            &artifact_dir,
+            "solve_antenna",
+            "port_1",
+        )
+        .is_err());
+        let mut escaped_manifest = ready.clone();
+        escaped_manifest["outputs"][0]["manifest_ref"] = serde_json::json!("../manifest.v1.json");
+        let escaped_path = artifact_dir.join("escaped-manifest-catalog.json");
+        fs::write(&escaped_path, serde_json::to_vec(&escaped_manifest).unwrap()).unwrap();
+        assert!(super::read_ready_antenna_stage_outputs(
+            &escaped_path,
+            &artifact_dir,
+            "solve_antenna",
+            "port_1",
+        )
+        .is_err());
+        assert_eq!(
+            ready["outputs"][0]["manifest_ref"],
+            "antenna/field_solutions/basis/afs-test/manifest.v1.json"
+        );
+
+        let scoped_root = artifact_dir.join("scoped");
+        fs::create_dir_all(&scoped_root).unwrap();
+        let invalid_stage_dir = artifact_dir.join("invalid-ready");
+        assert!(write_antenna_stage_output_catalog_ready(
+            &invalid_stage_dir,
+            &scoped_root,
+            "solve_antenna",
+            "port_1",
+            &reference,
+            &manifest_path,
+            &["H_ant_basis".into()],
+            false,
+            None,
+        )
+        .is_err());
+        assert!(!antenna_stage_output_catalog_path(&invalid_stage_dir).exists());
+
+        let noncanonical_manifest = artifact_dir.join(
+            "antenna/../antenna/field_solutions/basis/afs-test/manifest.v1.json",
+        );
+        assert!(write_antenna_stage_output_catalog_ready(
+            &invalid_stage_dir,
+            &artifact_dir,
+            "solve_antenna",
+            "port_1",
+            &reference,
+            &noncanonical_manifest,
+            &["H_ant_basis".into()],
+            false,
+            None,
+        )
+        .is_err());
+        assert!(!antenna_stage_output_catalog_path(&invalid_stage_dir).exists());
+
+        let _ = fs::remove_dir_all(artifact_dir);
+    }
+
+    #[test]
+    fn antenna_stage_output_catalog_cleans_private_temp_on_pre_rename_cancel() {
+        let artifact_dir = temp_test_dir("antenna-stage-output-catalog-cancel");
+        let stage_dir = artifact_dir.join("stage");
+        let cancel = || -> anyhow::Result<()> { Err(anyhow::anyhow!("interrupt_requested")) };
+
+        let error = write_antenna_stage_output_catalog_with_hook(
+            &stage_dir,
+            &serde_json::json!({
+                "schema_version": "stage_output_catalog.v1",
+                "status": "ready",
+                "outputs": []
+            }),
+            Some(&cancel),
+        )
+        .expect_err("pre-rename cancellation must reject publication");
+        assert!(error.to_string().contains("interrupt_requested"));
+        assert!(!antenna_stage_output_catalog_path(&stage_dir).exists());
+        let remaining = fs::read_dir(&stage_dir)
+            .expect("stage directory should remain readable")
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("stage directory entries should be readable");
+        assert!(remaining.is_empty(), "private temp files must be cleaned");
+
+        let _ = fs::remove_dir_all(artifact_dir);
+    }
+
+    #[test]
+    fn antenna_stage_output_catalog_does_not_replace_concurrent_publication() {
+        let artifact_dir = temp_test_dir("antenna-stage-output-catalog-race");
+        let payload = serde_json::json!({"status": "ready"});
+        let conflicting = serde_json::json!({"status": "failed"});
+        let conflicting_bytes = serde_json::to_vec_pretty(&conflicting).unwrap();
+        let identical_bytes = serde_json::to_vec_pretty(&payload).unwrap();
+
+        let conflicting_dir = artifact_dir.join("conflicting");
+        let conflicting_path = antenna_stage_output_catalog_path(&conflicting_dir);
+        let competing_writer = || -> anyhow::Result<()> {
+            fs::write(&conflicting_path, &conflicting_bytes)?;
+            Ok(())
+        };
+        assert!(write_antenna_stage_output_catalog_with_hook(
+            &conflicting_dir,
+            &payload,
+            Some(&competing_writer),
+        )
+        .is_err());
+        assert_eq!(fs::read(&conflicting_path).unwrap(), conflicting_bytes);
+        assert_eq!(fs::read_dir(&conflicting_dir).unwrap().count(), 1);
+
+        let identical_dir = artifact_dir.join("identical");
+        let identical_path = antenna_stage_output_catalog_path(&identical_dir);
+        let matching_writer = || -> anyhow::Result<()> {
+            fs::write(&identical_path, &identical_bytes)?;
+            Ok(())
+        };
+        write_antenna_stage_output_catalog_with_hook(
+            &identical_dir,
+            &payload,
+            Some(&matching_writer),
+        )
+        .expect("identical concurrent publication should be reused");
+        assert_eq!(fs::read(&identical_path).unwrap(), identical_bytes);
+        assert_eq!(fs::read_dir(&identical_dir).unwrap().count(), 1);
+
+        let _ = fs::remove_dir_all(artifact_dir);
+    }
+
+    #[test]
+    fn ready_antenna_catalog_rejects_cancel_before_new_or_reused_publication() {
+        let artifact_dir = temp_test_dir("antenna-ready-catalog-cancel");
+        let reference = fullmag_ir::AntennaFieldSolutionRefIR {
+            stage_id: "solve_antenna".into(),
+            output_id: "basis".into(),
+            asset_id: "afs-test".into(),
+            content_digest: "sha256:test".into(),
+        };
+        let manifest_path =
+            artifact_dir.join("antenna/field_solutions/basis/afs-test/manifest.v1.json");
+        let interrupted = std::sync::atomic::AtomicBool::new(true);
+        let write_ready = |stage_dir: &Path, signal: Option<&std::sync::atomic::AtomicBool>| {
+            write_antenna_stage_output_catalog_ready(
+                stage_dir,
+                &artifact_dir,
+                "solve_antenna",
+                "port_1",
+                &reference,
+                &manifest_path,
+                &["H_ant_basis".into()],
+                false,
+                signal,
+            )
+        };
+        let new_stage_dir = artifact_dir.join("new");
+        assert!(write_ready(&new_stage_dir, Some(&interrupted))
+            .unwrap_err()
+            .to_string()
+            .contains("interrupt_requested"));
+        assert!(!antenna_stage_output_catalog_path(&new_stage_dir).exists());
+
+        let reused_stage_dir = artifact_dir.join("reused");
+        write_ready(&reused_stage_dir, None).unwrap();
+        assert!(write_ready(&reused_stage_dir, Some(&interrupted))
+            .unwrap_err()
+            .to_string()
+            .contains("interrupt_requested"));
+        let _ = fs::remove_dir_all(artifact_dir);
+    }
+
     #[test]
     fn active_sequence_preserves_completed_relaxation_metric_and_identity() {
         let mut state = ActiveSequenceState::single_current();
-        state.mark_current_started("cmd-relax", 1_700_000_000_000, None);
+        state.mark_current_started("cmd-relax", 1_700_000_000_000, None, None);
         let completion = fullmag_ir::StageCompletionIR {
             status: "completed".into(),
             converged: true,

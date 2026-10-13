@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <limits>
 #include <unordered_set>
+#include <utility>
 
 namespace fullmag::fem {
 namespace {
@@ -37,6 +38,28 @@ constexpr uint8_t kHexFaceOffsets[] = {0, 4, 8, 12, 16, 20, 24};
 constexpr uint8_t kHexFaceNodes[] = {3, 2, 1, 0, 0, 1, 5, 4, 1, 2, 6, 5, 2, 3, 7, 6, 3, 0, 4, 7, 4, 5, 6, 7};
 constexpr uint8_t kHexEdgeOffsets[] = {0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24};
 constexpr uint8_t kHexEdgeNodes[] = {0, 1, 1, 2, 2, 3, 3, 0, 4, 5, 5, 6, 6, 7, 7, 4, 0, 4, 1, 5, 2, 6, 3, 7};
+
+uint64_t periodic_map_revision(
+    uint32_t n_nodes,
+    const std::vector<uint32_t> &reduced,
+    const std::vector<uint32_t> &representatives)
+{
+    uint64_t hash = 1469598103934665603ull;
+    const auto mix = [&hash](uint64_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    mix(n_nodes);
+    mix(static_cast<uint64_t>(reduced.size()));
+    for (uint32_t value : reduced) {
+        mix(value);
+    }
+    mix(static_cast<uint64_t>(representatives.size()));
+    for (uint32_t value : representatives) {
+        mix(value);
+    }
+    return hash == 0 ? 1 : hash;
+}
 
 template <typename T>
 bool validate_span(const T *pointer, uint64_t length, const char *name, std::string &error) {
@@ -428,30 +451,51 @@ bool element_topology(uint32_t cell_type, ElementTopology &topology) {
     }
 }
 
+bool import_mesh_descriptor(
+    const fullmag_fem_mesh_desc &descriptor,
+    FemMeshRuntimeState &mesh,
+    std::string &error)
+{
+    error.clear();
+    if (!validate_mesh_topology(descriptor, error)) {
+        return false;
+    }
+
+    FemMeshRuntimeState candidate;
+    candidate.n_nodes = static_cast<uint32_t>(descriptor.nodes_xyz_len / 3u);
+    candidate.n_elements = static_cast<uint32_t>(descriptor.cell_types_len);
+    candidate.n_boundary_faces = static_cast<uint32_t>(descriptor.facet_types_len);
+    copy_span(candidate.nodes_xyz, descriptor.nodes_xyz, descriptor.nodes_xyz_len);
+    copy_span(candidate.cell_types, descriptor.cell_types, descriptor.cell_types_len);
+    copy_span(candidate.cell_offsets, descriptor.cell_offsets, descriptor.cell_offsets_len);
+    copy_span(candidate.cell_nodes, descriptor.cell_nodes, descriptor.cell_nodes_len);
+    copy_span(candidate.cell_global_ordinals, descriptor.cell_global_ordinals,
+        descriptor.cell_global_ordinals_len);
+    copy_span(candidate.cell_markers, descriptor.cell_markers, descriptor.cell_markers_len);
+    copy_span(candidate.facet_types, descriptor.facet_types, descriptor.facet_types_len);
+    copy_span(candidate.facet_roles, descriptor.facet_roles, descriptor.facet_roles_len);
+    copy_span(candidate.facet_offsets, descriptor.facet_offsets, descriptor.facet_offsets_len);
+    copy_span(candidate.facet_nodes, descriptor.facet_nodes, descriptor.facet_nodes_len);
+    copy_span(candidate.facet_global_ordinals, descriptor.facet_global_ordinals,
+        descriptor.facet_global_ordinals_len);
+    copy_span(candidate.facet_markers, descriptor.facet_markers, descriptor.facet_markers_len);
+    copy_span(candidate.periodic_node_pairs, descriptor.periodic_node_pairs,
+        descriptor.periodic_node_pairs_len);
+    copy_span(candidate.periodic_boundary_pair_markers,
+        descriptor.periodic_boundary_pair_markers,
+        descriptor.periodic_boundary_pair_markers_len);
+    mesh = std::move(candidate);
+    return true;
+}
+
 bool initialize_mesh_plan_fields(
     Context &ctx,
     const fullmag_fem_mesh_desc &mesh,
     std::string &error)
 {
-    if (!validate_mesh_topology(mesh, error)) {
+    if (!import_mesh_descriptor(mesh, ctx.mesh, error)) {
         return false;
     }
-    ctx.mesh.n_nodes = static_cast<uint32_t>(mesh.nodes_xyz_len / 3u);
-    ctx.mesh.n_elements = static_cast<uint32_t>(mesh.cell_types_len);
-    ctx.mesh.n_boundary_faces = static_cast<uint32_t>(mesh.facet_types_len);
-    copy_span(ctx.mesh.nodes_xyz, mesh.nodes_xyz, mesh.nodes_xyz_len);
-    copy_span(ctx.mesh.cell_types, mesh.cell_types, mesh.cell_types_len);
-    copy_span(ctx.mesh.cell_offsets, mesh.cell_offsets, mesh.cell_offsets_len);
-    copy_span(ctx.mesh.cell_nodes, mesh.cell_nodes, mesh.cell_nodes_len);
-    copy_span(ctx.mesh.cell_global_ordinals, mesh.cell_global_ordinals, mesh.cell_global_ordinals_len);
-    copy_span(ctx.mesh.cell_markers, mesh.cell_markers, mesh.cell_markers_len);
-    copy_span(ctx.mesh.facet_types, mesh.facet_types, mesh.facet_types_len);
-    copy_span(ctx.mesh.facet_roles, mesh.facet_roles, mesh.facet_roles_len);
-    copy_span(ctx.mesh.facet_offsets, mesh.facet_offsets, mesh.facet_offsets_len);
-    copy_span(ctx.mesh.facet_nodes, mesh.facet_nodes, mesh.facet_nodes_len);
-    copy_span(ctx.mesh.facet_global_ordinals, mesh.facet_global_ordinals, mesh.facet_global_ordinals_len);
-    copy_span(ctx.mesh.facet_markers, mesh.facet_markers, mesh.facet_markers_len);
-    copy_span(ctx.mesh.periodic_node_pairs, mesh.periodic_node_pairs, mesh.periodic_node_pairs_len);
     if (!build_static_periodic_reduction(ctx, error)) {
         return false;
     }
@@ -486,6 +530,10 @@ bool validate_supported_physics_topology(
         return std::find(ctx.mesh.cell_types.begin(), ctx.mesh.cell_types.end(), type) !=
             ctx.mesh.cell_types.end();
     };
+    const auto has_facet_family = [&](uint32_t type) {
+        return std::find(ctx.mesh.facet_types.begin(), ctx.mesh.facet_types.end(), type) !=
+            ctx.mesh.facet_types.end();
+    };
     const bool exact_cell_families =
         has_cell_family(FULLMAG_FEM_CELL_TET4) &&
         has_cell_family(FULLMAG_FEM_CELL_PRISM6) &&
@@ -506,6 +554,20 @@ bool validate_supported_physics_topology(
                 return type == FULLMAG_FEM_FACET_TRI3 ||
                     type == FULLMAG_FEM_FACET_QUAD4;
             });
+    const bool pure_prism_cell_family =
+        !ctx.mesh.cell_types.empty() &&
+        std::all_of(
+            ctx.mesh.cell_types.begin(), ctx.mesh.cell_types.end(),
+            [](uint32_t type) { return type == FULLMAG_FEM_CELL_PRISM6; });
+    const bool pure_prism_facet_families =
+        has_facet_family(FULLMAG_FEM_FACET_TRI3) &&
+        has_facet_family(FULLMAG_FEM_FACET_QUAD4) &&
+        std::all_of(
+            ctx.mesh.facet_types.begin(), ctx.mesh.facet_types.end(),
+            [](uint32_t type) {
+                return type == FULLMAG_FEM_FACET_TRI3 ||
+                    type == FULLMAG_FEM_FACET_QUAD4;
+            });
     bool markers_match_scope =
         ctx.mesh.cell_markers.size() == ctx.mesh.cell_types.size();
     for (size_t i = 0; markers_match_scope && i < ctx.mesh.cell_types.size(); ++i) {
@@ -513,6 +575,14 @@ bool validate_supported_physics_topology(
         markers_match_scope =
             (ctx.mesh.cell_types[i] == FULLMAG_FEM_CELL_PRISM6) == magnetic;
     }
+    const bool pure_prism_markers_cover_magnetic_and_air =
+        ctx.mesh.cell_markers.size() == ctx.mesh.cell_types.size() &&
+        std::any_of(
+            ctx.mesh.cell_markers.begin(), ctx.mesh.cell_markers.end(),
+            [](uint32_t marker) { return marker != 0u; }) &&
+        std::any_of(
+            ctx.mesh.cell_markers.begin(), ctx.mesh.cell_markers.end(),
+            [](uint32_t marker) { return marker == 0u; });
     const bool exact_plan_topology =
         plan.mesh.cell_types_len == ctx.mesh.cell_types.size() &&
         plan.mesh.periodic_node_pairs_len == 0u &&
@@ -523,33 +593,99 @@ bool validate_supported_physics_topology(
         plan.mfem_device_string != nullptr ? plan.mfem_device_string : "";
     const bool explicit_cpu_or_cuda_device =
         mfem_device == "cpu" || mfem_device == "cuda";
-    const bool no_extended_physics =
-        plan.has_uniaxial_anisotropy == 0 &&
-        plan.has_cubic_anisotropy == 0 &&
-        plan.has_interfacial_dmi == 0 &&
-        plan.has_bulk_dmi == 0 &&
+    const bool has_dmi =
+        plan.has_interfacial_dmi != 0 || plan.has_bulk_dmi != 0 ||
+        ctx.dmi.rotated_interfacial_enabled || plan.dind_field_len != 0u ||
+        plan.dbulk_field_len != 0u;
+    const bool dmi_supported = !has_dmi || mfem_device == "cpu";
+    const bool no_other_extended_physics =
         plan.ms_field_len == 0u && plan.a_field_len == 0u &&
-        plan.alpha_field_len == 0u && plan.ku_field_len == 0u &&
-        plan.ku2_field_len == 0u && plan.kc1_field_len == 0u &&
-        plan.kc2_field_len == 0u && plan.kc3_field_len == 0u &&
-        plan.dind_field_len == 0u && plan.dbulk_field_len == 0u &&
-        plan.ms_element_field_len == 0u && plan.a_element_field_len == 0u &&
+        plan.alpha_field_len == 0u && plan.ms_element_field_len == 0u &&
+        plan.a_element_field_len == 0u &&
         plan.has_zhang_li_stt == 0 && plan.has_slonczewski_stt == 0 &&
         plan.has_oersted_cylinder == 0 && plan.oersted_field_len == 0u &&
-        plan.temperature == 0.0 && plan.has_magnetoelastic == 0 &&
-        plan.regional_field_drive_count == 0u;
-    const bool qualified = exact_cell_families && exact_facet_families &&
-        markers_match_scope && exact_plan_topology && explicit_cpu_or_cuda_device &&
+        plan.temperature == 0.0 && plan.has_magnetoelastic == 0;
+    const bool common_scope = exact_plan_topology && explicit_cpu_or_cuda_device &&
         plan.fe_order == 1u && plan.precision == FULLMAG_FEM_PRECISION_DOUBLE &&
         plan.enable_exchange != 0 && plan.enable_demag != 0 &&
         (plan.demag_realization == FULLMAG_FEM_DEMAG_AIRBOX_ROBIN ||
          plan.demag_realization == FULLMAG_FEM_DEMAG_AIRBOX_DIRICHLET) &&
-        no_extended_physics;
+        dmi_supported && no_other_extended_physics;
+    const bool qualified_mixed_p1 =
+        exact_cell_families && exact_facet_families && markers_match_scope;
+    // A conforming shared domain made entirely from prism6 cells does not
+    // need the pyramid transition that forces the Poisson potential to P1.
+    // Keep this first qualification lane deliberately CPU-only and bounded to
+    // the SP4 exchange+Poisson scope until independent CUDA and extended-
+    // physics evidence exists.
+    const bool qualified_pure_prism_p2 =
+        pure_prism_cell_family && pure_prism_facet_families &&
+        pure_prism_markers_cover_magnetic_and_air && mfem_device == "cpu" && !has_dmi;
+    const bool qualified = common_scope &&
+        (qualified_mixed_p1 || qualified_pure_prism_p2);
     if (!qualified) {
+        if (pure_prism_cell_family) {
+            std::string failed_predicates;
+            const auto add_failed = [&failed_predicates](const char *predicate) {
+                if (!failed_predicates.empty()) {
+                    failed_predicates += ",";
+                }
+                failed_predicates += predicate;
+            };
+            if (!pure_prism_facet_families) add_failed("prism_tri3_quad4_facets");
+            if (!pure_prism_markers_cover_magnetic_and_air) {
+                add_failed("prism_shared_domain_magnetic_air_markers");
+            }
+            if (!exact_plan_topology) add_failed("plan_topology_matches_import_no_periodic");
+            if (mfem_device != "cpu") add_failed("pure_prism_p2_cpu_only");
+            if (plan.fe_order != 1u) add_failed("p1_magnetization_state");
+            if (plan.precision != FULLMAG_FEM_PRECISION_DOUBLE) add_failed("double_precision");
+            if (plan.enable_exchange == 0) add_failed("exchange");
+            if (plan.enable_demag == 0 ||
+                (plan.demag_realization != FULLMAG_FEM_DEMAG_AIRBOX_ROBIN &&
+                 plan.demag_realization != FULLMAG_FEM_DEMAG_AIRBOX_DIRICHLET)) {
+                add_failed("poisson_robin_or_dirichlet");
+            }
+            if (has_dmi) add_failed("pure_prism_p2_dmi_not_qualified");
+            if (!no_other_extended_physics) add_failed("unrelated_extended_physics_scope");
+            error =
+                "native FEM pure prism P2 scope rejected: required=explicit_cpu+double+"
+                "P1_magnetization_state+prism6_shared_magnetic_air+tri3_quad4+no_periodic+"
+                "exchange+poisson_robin_or_dirichlet+uniform_Ms_A_alpha+no_DMI; "
+                "failed_predicates=[" + failed_predicates + "]; fallback=none";
+            return false;
+        }
+        std::string failed_predicates;
+        const auto add_failed = [&failed_predicates](const char *predicate) {
+            if (!failed_predicates.empty()) {
+                failed_predicates += ",";
+            }
+            failed_predicates += predicate;
+        };
+        if (!exact_cell_families) add_failed("mixed_cell_families");
+        if (!exact_facet_families) add_failed("mixed_facet_families");
+        if (!markers_match_scope) add_failed("magnetic_prism6_markers");
+        if (!exact_plan_topology) add_failed("plan_topology_matches_import");
+        if (!explicit_cpu_or_cuda_device) add_failed("explicit_cpu_or_cuda_device");
+        if (plan.fe_order != 1u) add_failed("p1");
+        if (plan.precision != FULLMAG_FEM_PRECISION_DOUBLE) add_failed("double_precision");
+        if (plan.enable_exchange == 0) add_failed("exchange");
+        if (plan.enable_demag == 0 ||
+            (plan.demag_realization != FULLMAG_FEM_DEMAG_AIRBOX_ROBIN &&
+             plan.demag_realization != FULLMAG_FEM_DEMAG_AIRBOX_DIRICHLET)) {
+            add_failed("poisson_robin_or_dirichlet");
+        }
+        if (!dmi_supported) {
+            add_failed(mfem_device == "cuda"
+                    ? "gpu_dmi_kernel_not_mixed_p1"
+                    : "dmi_requires_explicit_cpu");
+        }
+        if (!no_other_extended_physics) add_failed("unrelated_extended_physics_scope");
         error =
             "native FEM mixed P1 scope rejected: required=explicit_cpu_or_gpu+double+P1+"
             "prism6_magnetic+pyramid5_tet4_air+tri3_quad4+exchange+"
-            "poisson_robin_or_dirichlet+uniform_material; fallback=none";
+            "poisson_robin_or_dirichlet+uniform_Ms_A_alpha+local_anisotropy_cpu_or_cuda+"
+            "dmi_cpu_only; failed_predicates=[" + failed_predicates + "]; fallback=none";
         return false;
     }
     return true;
@@ -656,7 +792,8 @@ bool validate_periodic_plan_compatibility(Context &ctx, std::string &error)
             return false;
         }
     }
-    if (ctx.dmi.interfacial_enabled || ctx.dmi.bulk_enabled) {
+    if (ctx.dmi.interfacial_enabled || ctx.dmi.rotated_interfacial_enabled ||
+        ctx.dmi.bulk_enabled) {
         if (!validate_periodic_scalar_field_classes(ctx, ctx.material_fields.Dind_field, "Dind_field", error) ||
             !validate_periodic_scalar_field_classes(ctx, ctx.material_fields.Dbulk_field, "Dbulk_field", error)) {
             return false;
@@ -669,6 +806,7 @@ bool build_static_periodic_reduction(Context &ctx, std::string &error) {
     ctx.mesh.periodic_reduced_node.clear();
     ctx.mesh.periodic_representative_nodes.clear();
     ctx.mesh.periodic_reduced_node_count = 0;
+    ctx.mesh.periodic_map_revision = 0;
     if (ctx.mesh.periodic_node_pairs.empty()) {
         return true;
     }
@@ -732,6 +870,10 @@ bool build_static_periodic_reduction(Context &ctx, std::string &error) {
     }
     ctx.mesh.periodic_reduced_node_count =
         static_cast<uint32_t>(ctx.mesh.periodic_representative_nodes.size());
+    ctx.mesh.periodic_map_revision = periodic_map_revision(
+        ctx.mesh.n_nodes,
+        ctx.mesh.periodic_reduced_node,
+        ctx.mesh.periodic_representative_nodes);
     return true;
 }
 

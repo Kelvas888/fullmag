@@ -30,7 +30,7 @@ import { createViewport3DRenderAdoptionRegistry } from "../model/viewport3DRende
 const vectorFieldLayerSource = readFileSync(
   join(process.cwd(), "src/modules/viewport-3d/layers/VectorFieldLayer.tsx"),
   "utf8",
-);
+).replace(/\r\n/g, "\n");
 import {
   shaderColorFromSettings,
   shaderUsesVertexColors,
@@ -124,7 +124,7 @@ describe("VectorFieldLayer performance contracts", () => {
       fieldBufferId: "field-a",
       glyphCount: 7,
       registry,
-      sessionIdentity: { sessionEpoch: "test-session@1000", sessionId: "test-session" },
+      sessionIdentity: { sessionEpoch: "test-session@1000", sessionId: "test-session", requestScopeEpoch: "test-api:1" },
     });
 
     expect(registry.snapshot("object:a")[0]).toMatchObject({
@@ -366,6 +366,42 @@ describe("VectorFieldLayer performance contracts", () => {
     );
     expect(vectorFieldLayerSource).not.toContain("requestAnimationFrame");
     expect(vectorFieldLayerSource).not.toContain("setTimeout(callback, 0)");
+  });
+
+  it("adopts glyph count and instance colors only with the completed matrix upload", () => {
+    const uploadHookStart = vectorFieldLayerSource.indexOf(
+      "function useVectorGlyphUpload(",
+    );
+    const componentStart = vectorFieldLayerSource.indexOf(
+      "export function VectorFieldLayer(",
+      uploadHookStart,
+    );
+    const uploadSource = vectorFieldLayerSource.slice(
+      uploadHookStart,
+      componentStart,
+    );
+    const colorVisibleStart = uploadSource.indexOf("onVisible: () => {");
+    const matrixVisibleStart = uploadSource.indexOf(
+      "onVisible: () => {",
+      colorVisibleStart + 1,
+    );
+    const colorVisibleSource = uploadSource.slice(
+      colorVisibleStart,
+      matrixVisibleStart,
+    );
+    const matrixVisibleSource = uploadSource.slice(matrixVisibleStart);
+
+    expect(colorVisibleSource).not.toContain("shaft.count = glyphCount");
+    expect(colorVisibleSource).not.toContain("head.count = glyphCount");
+    expect(colorVisibleSource).not.toMatch(
+      /markVectorGlyphAttributeRange\(\s*instanceColorAttr/,
+    );
+    expect(matrixVisibleSource).toMatch(
+      /markVectorGlyphAttributeRange\(\s*instanceColorAttr/,
+    );
+    expect(matrixVisibleSource).toContain(
+      "activeShaft.count = activeGlyphs.count",
+    );
   });
 
   it("keeps glyph builds asynchronous and uploads only resolved build buffers", () => {

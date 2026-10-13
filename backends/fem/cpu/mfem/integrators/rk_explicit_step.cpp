@@ -30,10 +30,13 @@
 #include "gpu/cuda/integrators/rk/rk.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
+#include <limits>
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -54,7 +57,52 @@ bool rk_rhs_allows_fsal_reuse(const fullmag::fem::Context &ctx)
     if (ctx.thermal_brown.temperature > 0.0) {
         return false;
     }
+    // Stage callbacks receive a stage identity and may carry mutable source
+    // state. Without a separate query-only revision endpoint, reusing their
+    // last-stage RHS across accepted-step boundaries would be speculative.
+    if (ctx.oersted.has_stage_callback || ctx.stage_transport.has_stage_callback) {
+        return false;
+    }
     return true;
+}
+
+bool last_stage_samples_accepted_endpoint(
+    const fullmag::fem::ExplicitTableau &tab)
+{
+    if (tab.stages <= 0 || tab.stages > fullmag::fem::MAX_RK_STAGES) {
+        return false;
+    }
+    return std::isfinite(tab.c[tab.stages - 1]) &&
+        std::abs(tab.c[tab.stages - 1] - 1.0) <=
+            64.0 * std::numeric_limits<double>::epsilon();
+}
+
+fullmag::fem::RkFinalRefreshReason endpoint_refresh_reason(
+    const fullmag::fem::ExplicitTableau &tab,
+    const fullmag::fem::EndpointCacheValidity &validity)
+{
+    if (validity.valid()) {
+        return fullmag::fem::RkFinalRefreshReason::CacheHit;
+    }
+    if (!tab.fsal) {
+        return fullmag::fem::RkFinalRefreshReason::NonFsalTableau;
+    }
+    if (!validity.state) {
+        return fullmag::fem::RkFinalRefreshReason::CandidateStateMismatch;
+    }
+    if (!validity.time) {
+        return fullmag::fem::RkFinalRefreshReason::EndpointTimeMismatch;
+    }
+    if (!validity.dynamic_sources) {
+        return fullmag::fem::RkFinalRefreshReason::DynamicSourceChanged;
+    }
+    if (!validity.transport) {
+        return fullmag::fem::RkFinalRefreshReason::TransportSourceChanged;
+    }
+    if (!validity.projection) {
+        return fullmag::fem::RkFinalRefreshReason::ProjectionMismatch;
+    }
+    return fullmag::fem::RkFinalRefreshReason::CacheUnavailable;
 }
 
 uint64_t stage_identity(
@@ -109,10 +157,6 @@ bool context_step_explicit_rk_mfem(
     }
 
     if (mfem_device_requests_gpu(ctx)) {
-        if (ctx.frozen_spins.enabled()) {
-            error = "GPU RK cannot execute frozen spins constraints before a device-resident lane is qualified (frozen_spins_fem_gpu_unqualified)";
-            return false;
-        }
         if (ctx.oersted.has_stage_callback) {
             error = "GPU RK cannot use the CPU-only stage Oersted callback before a device-resident lane is qualified";
             return false;
@@ -138,11 +182,16 @@ bool context_step_explicit_rk_mfem(
     }
 
     ctx.adaptive_dt.current_dt = dt_seconds;
+    static const std::vector<uint8_t> no_frozen_nodes;
+    const auto &frozen_node_mask = ctx.frozen_spins.enabled()
+        ? ctx.frozen_spins.mask()
+        : no_frozen_nodes;
     ctx.stepper.attempt_trace.records.clear();
 
     const size_t dof_len = ctx.state.m_xyz.size();
     stepper_workspace_allocate(ctx.stepper.workspace, dof_len, tab.stages);
     auto &ws = ctx.stepper.workspace;
+    ws.endpoint_telemetry = {};
 
     const bool adaptive = (tab.order_est > 0) && ctx.adaptive_dt.enabled;
     double dt = dt_seconds;
@@ -155,6 +204,14 @@ bool context_step_explicit_rk_mfem(
     const bool fsal_reuse_allowed = rk_rhs_allows_fsal_reuse(ctx);
     double exchange_energy_final = 0.0;
     double demag_energy_final = 0.0;
+    RkAttemptCacheSnapshot *attempt_cache = nullptr;
+    if (adaptive) {
+        if (ws.attempt_checkpoint == nullptr) {
+            error = "adaptive RK attempt checkpoint was not prepared during Context setup";
+            return false;
+        }
+        attempt_cache = ws.attempt_checkpoint.get();
+    }
 
     for (;;) {
         ctx.adaptive_dt.current_dt = dt;
@@ -180,13 +237,8 @@ bool context_step_explicit_rk_mfem(
         }
         const uint32_t demag_solves_before_attempt = ctx.poisson_demag.solves_current_step;
         const uint32_t rhs_before_attempt = total_rhs;
-        std::unique_ptr<RkAttemptCacheSnapshot> attempt_cache;
-        if (adaptive) {
-            attempt_cache = std::make_unique<RkAttemptCacheSnapshot>(ctx);
-        }
-        ws.m_backup = ctx.state.m_xyz;
-        if (ctx.frozen_spins.enabled()) {
-            ctx.frozen_spins.project_onto_reference(ctx.state.m_xyz);
+        if (adaptive && !attempt_cache->capture(error)) {
+            return false;
         }
         fsal_used = false;
         final_stage_cache_valid = false;
@@ -209,10 +261,6 @@ bool context_step_explicit_rk_mfem(
                     &timings,
                     error)) {
                 if (ctx.interrupt.step_interrupted) {
-                    ctx.state.m_xyz = ws.m_backup;
-                    if (ctx.frozen_spins.enabled()) {
-                        ctx.frozen_spins.project_onto_reference(ctx.state.m_xyz);
-                    }
                     ws.fsal_valid = false;
                     return true;
                 }
@@ -221,10 +269,6 @@ bool context_step_explicit_rk_mfem(
             total_rhs += 1;
         }
         if (poll_interrupt(ctx)) {
-            ctx.state.m_xyz = ws.m_backup;
-            if (ctx.frozen_spins.enabled()) {
-                ctx.frozen_spins.project_onto_reference(ctx.state.m_xyz);
-            }
             ws.fsal_valid = false;
             return true;
         }
@@ -235,18 +279,18 @@ bool context_step_explicit_rk_mfem(
                 for (int j = 0; j < s; ++j) {
                     accum += tab.a[s][j] * ws.k[j][i];
                 }
-                ws.m_stage[i] = ws.m_backup[i] + dt * accum;
+                ws.m_stage[i] = ctx.state.m_xyz[i] + dt * accum;
             }
             if (!normalize_active_magnetization_aos(ctx, ws.m_stage, error)) {
-                ctx.state.m_xyz = ws.m_backup;
-                if (ctx.frozen_spins.enabled()) {
-                    ctx.frozen_spins.project_onto_reference(ctx.state.m_xyz);
-                }
                 ws.fsal_valid = false;
                 error = "explicit RK stage candidate normalization failed: " + error;
                 return false;
             }
-            project_static_periodic_aos(ctx, ws.m_stage);
+            if (!project_static_periodic_aos_checked(ctx, ws.m_stage, error)) {
+                ws.fsal_valid = false;
+                error = "explicit RK stage periodic projection failed: " + error;
+                return false;
+            }
             if (ctx.frozen_spins.enabled()) {
                 ctx.frozen_spins.project_onto_reference(ws.m_stage);
             }
@@ -270,20 +314,12 @@ bool context_step_explicit_rk_mfem(
                                        &timings,
                                        error)) {
                 if (ctx.interrupt.step_interrupted) {
-                    ctx.state.m_xyz = ws.m_backup;
-                    if (ctx.frozen_spins.enabled()) {
-                        ctx.frozen_spins.project_onto_reference(ctx.state.m_xyz);
-                    }
                     ws.fsal_valid = false;
                     return true;
                 }
                 return false;
             }
             if (poll_interrupt(ctx)) {
-                ctx.state.m_xyz = ws.m_backup;
-                if (ctx.frozen_spins.enabled()) {
-                    ctx.frozen_spins.project_onto_reference(ctx.state.m_xyz);
-                }
                 ws.fsal_valid = false;
                 return true;
             }
@@ -298,9 +334,13 @@ bool context_step_explicit_rk_mfem(
             for (int s = 0; s < tab.stages; ++s) {
                 accum += tab.b_hi[s] * ws.k[s][i];
             }
-            ws.m_candidate[i] = ws.m_backup[i] + dt * accum;
+            ws.m_candidate[i] = ctx.state.m_xyz[i] + dt * accum;
         }
-        project_static_periodic_aos(ctx, ws.m_candidate);
+        if (!project_static_periodic_aos_checked(ctx, ws.m_candidate, error)) {
+            ws.fsal_valid = false;
+            error = "explicit RK embedded candidate periodic projection failed: " + error;
+            return false;
+        }
         if (ctx.frozen_spins.enabled()) {
             ctx.frozen_spins.project_onto_reference(ws.m_candidate);
         }
@@ -315,30 +355,38 @@ bool context_step_explicit_rk_mfem(
                 }
                 ws.err[i] = dt * err_accum;
             }
-            double err_norm = compute_adaptive_error_norm(
+            const std::vector<double> *norm_weights =
+                &ctx.integration_weights.mfem_lumped_mass;
+            if (norm_weights->empty()) {
+                norm_weights = &ctx.mesh.node_volumes;
+            }
+            AdaptiveErrorNormMetrics norm_metrics{};
+            double err_norm = compute_adaptive_error_norm_mass_weighted(
                 ws.err,
-                ws.m_backup,
+                ctx.state.m_xyz,
                 ws.m_candidate,
+                *norm_weights,
                 ctx.mesh.magnetic_node_mask,
+                frozen_node_mask,
                 ctx.adaptive_dt.atol,
-                ctx.adaptive_dt.rtol);
+                ctx.adaptive_dt.rtol,
+                &norm_metrics);
             if (!compute_adaptive_attempt_guard_metric(
                     ctx.adaptive_dt,
                     err_norm,
-                    ws.m_backup,
+                    ctx.state.m_xyz,
                     ws.m_candidate,
                     ctx.mesh.magnetic_node_mask,
+                    frozen_node_mask,
                     acceptance_metric,
                     guard_metrics,
                     error)) {
-                ctx.state.m_xyz = ws.m_backup;
                 ws.fsal_valid = false;
                 error = "adaptive RK candidate guard failed: " + error;
                 return false;
             }
             auto result = adaptive_pi_step(ctx, dt, acceptance_metric, tab.order_est);
             if (ctx.stepper.attempt_trace.records.size() >= RkAttemptTraceState::max_records) {
-                ctx.state.m_xyz = ws.m_backup;
                 ws.fsal_valid = false;
                 error = "adaptive RK attempt trace capacity exceeded";
                 return false;
@@ -364,21 +412,21 @@ bool context_step_explicit_rk_mfem(
                 total_rhs - rhs_before_attempt,
                 tab.order_est,
             });
+            auto &attempt_record = ctx.stepper.attempt_trace.records.back();
+            attempt_record.error_norm_type = 2u; // mass_weighted_rms
+            attempt_record.active_node_count = norm_metrics.active_node_count;
+            attempt_record.active_measure = norm_metrics.active_measure;
+            attempt_record.normalization_denominator =
+                norm_metrics.normalization_denominator;
+            attempt_record.max_scaled_error = norm_metrics.max_scaled_error;
+            attempt_record.weighted_rms_error = norm_metrics.weighted_rms_error;
             if (result.kind == adaptive::AdaptiveDecisionKind::failed) {
-                ctx.state.m_xyz = ws.m_backup;
-                if (ctx.frozen_spins.enabled()) {
-                    ctx.frozen_spins.project_onto_reference(ctx.state.m_xyz);
-                }
                 ws.fsal_valid = false;
                 error = std::string("adaptive RK decision failed: ") +
                     adaptive::adaptive_decision_reason_id(result.reason);
                 return false;
             }
             if (result.kind == adaptive::AdaptiveDecisionKind::retry) {
-                ctx.state.m_xyz = ws.m_backup;
-                if (ctx.frozen_spins.enabled()) {
-                    ctx.frozen_spins.project_onto_reference(ctx.state.m_xyz);
-                }
                 attempt_cache->restore_preserving_attempt_counters();
                 if (!rollback_transport_stage_attempt(ctx, error) ||
                     !rollback_oersted_stage_attempt(ctx, error)) {
@@ -398,10 +446,6 @@ bool context_step_explicit_rk_mfem(
                 continue;
             }
             if (poll_interrupt(ctx)) {
-                ctx.state.m_xyz = ws.m_backup;
-                if (ctx.frozen_spins.enabled()) {
-                    ctx.frozen_spins.project_onto_reference(ctx.state.m_xyz);
-                }
                 ws.fsal_valid = false;
                 return true;
             }
@@ -412,16 +456,13 @@ bool context_step_explicit_rk_mfem(
             if (!compute_adaptive_attempt_guard_metric(
                     ctx.adaptive_dt,
                     0.0,
-                    ws.m_backup,
+                    ctx.state.m_xyz,
                     ws.m_candidate,
                     ctx.mesh.magnetic_node_mask,
+                    frozen_node_mask,
                     acceptance_metric,
                     guard_metrics,
                     error)) {
-                ctx.state.m_xyz = ws.m_backup;
-                if (ctx.frozen_spins.enabled()) {
-                    ctx.frozen_spins.project_onto_reference(ctx.state.m_xyz);
-                }
                 ws.fsal_valid = false;
                 error = "fixed RK candidate guard failed: " + error;
                 return false;
@@ -452,9 +493,29 @@ bool context_step_explicit_rk_mfem(
             error = "explicit RK high-order candidate normalization failed: " + error;
             return false;
         }
-        project_static_periodic_aos(ctx, ws.m_candidate);
+        if (!project_static_periodic_aos_checked(ctx, ws.m_candidate, error)) {
+            ws.fsal_valid = false;
+            error = "explicit RK high-order candidate periodic projection failed: " + error;
+            return false;
+        }
         if (ctx.frozen_spins.enabled()) {
             ctx.frozen_spins.project_onto_reference(ws.m_candidate);
+        }
+        if (final_stage_cache_valid) {
+            auto &validity = ws.endpoint_telemetry.cache_validity;
+            validity.state =
+                ws.m_candidate.size() == ws.m_stage.size() &&
+                std::equal(ws.m_candidate.cbegin(), ws.m_candidate.cend(), ws.m_stage.cbegin());
+            validity.time = validity.state && last_stage_samples_accepted_endpoint(tab);
+            // Brown noise is cached for the current accepted interval, so it
+            // is valid for this endpoint but is deliberately excluded from
+            // the next-step FSAL gate. Callback realizations are stage-identity
+            // and mutable-source aware; they require an explicit endpoint
+            // evaluation instead of assuming the last stage is reusable.
+            validity.dynamic_sources = validity.time && !ctx.oersted.has_stage_callback;
+            validity.transport = validity.time && !ctx.stage_transport.has_stage_callback;
+            validity.projection = validity.state;
+            final_stage_cache_valid = validity.valid();
         }
         if (poll_interrupt(ctx)) {
             ws.fsal_valid = false;
@@ -468,7 +529,7 @@ bool context_step_explicit_rk_mfem(
             return false;
         }
 
-        if (tab.fsal && fsal_reuse_allowed) {
+        if (tab.fsal && fsal_reuse_allowed && final_stage_cache_valid) {
             std::swap(ws.k[0], ws.k[tab.stages - 1]);
             ws.fsal_valid = true;
         } else {
@@ -478,11 +539,19 @@ bool context_step_explicit_rk_mfem(
         break;
     }
 
+    auto &endpoint_telemetry = ws.endpoint_telemetry;
+    endpoint_telemetry.final_refresh_reason = endpoint_refresh_reason(
+        tab,
+        endpoint_telemetry.cache_validity);
+    const uint32_t demag_solves_before_endpoint_refresh =
+        ctx.poisson_demag.solves_current_step;
     if (final_stage_cache_valid) {
+        endpoint_telemetry.endpoint_cache_hits += 1u;
         std::swap(ctx.exchange.h_xyz, ws.h_ex_tmp);
         std::swap(ctx.demag.h_xyz, ws.h_demag_tmp);
         std::swap(ctx.effective_field.h_xyz, ws.h_eff_tmp);
     } else {
+        endpoint_telemetry.endpoint_refreshes += 1u;
         if (!compute_effective_fields_for_magnetization(
                 ctx,
                 ws.m_candidate,
@@ -497,15 +566,15 @@ bool context_step_explicit_rk_mfem(
                 error,
                 stage_identity(target_step, attempt_identity, 0xffffu))) {
             if (ctx.interrupt.step_interrupted) {
-                ctx.state.m_xyz = ws.m_backup;
-                if (ctx.frozen_spins.enabled()) {
-                    ctx.frozen_spins.project_onto_reference(ctx.state.m_xyz);
-                }
                 ws.fsal_valid = false;
                 return true;
             }
             return false;
         }
+        endpoint_telemetry.extra_poisson_solves +=
+            static_cast<uint64_t>(
+                ctx.poisson_demag.solves_current_step -
+                demag_solves_before_endpoint_refresh);
         if (rk_step_inject_failure(
                 ctx,
                 RkStepFailurePoint::DuringFinalFieldRefresh,
@@ -534,7 +603,8 @@ bool context_step_explicit_rk_mfem(
 
     double max_rhs_final = 0.0;
     if (final_stage_cache_valid) {
-        max_rhs_final = max_norm_aos(ws.k[0]);
+        const auto &final_rhs = ws.fsal_valid ? ws.k[0] : ws.k[tab.stages - 1];
+        max_rhs_final = max_norm_aos(final_rhs);
     } else {
         if (!materialize_transport_stage_rhs(
                 ctx,
@@ -566,6 +636,7 @@ bool context_step_explicit_rk_mfem(
         }
         max_rhs_final = max_norm_aos(ws.k[0]);
         total_rhs += 1;
+        endpoint_telemetry.final_rhs_evaluations += 1u;
     }
 
     stats.step = ctx.state.step_count;
@@ -579,6 +650,7 @@ bool context_step_explicit_rk_mfem(
     stats.fsal_reused = fsal_used ? 1 : 0;
     apply_phase_timings(stats, timings);
     stats.wall_time_ns = elapsed_ns(wall_start);
+    endpoint_telemetry.accepted_step_wall_time_ns = stats.wall_time_ns;
     update_stage_completion_from_stats(ctx, stats);
 
     return true;

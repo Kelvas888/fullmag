@@ -23,6 +23,7 @@
 #include "cpu/mfem/interactions/dmi.hpp"
 #include "cpu/mfem/interactions/effective_field.hpp"
 #include "cpu/mfem/interactions/exchange.hpp"
+#include "cpu/mfem/interactions/frozen_spins.hpp"
 #include "cpu/mfem/interactions/magnetoelastic.hpp"
 #include "cpu/mfem/interactions/oersted.hpp"
 #include "cpu/mfem/interactions/stt.hpp"
@@ -30,6 +31,7 @@
 #include "cpu/mfem/interactions/thermal_brown.hpp"
 #include "cpu/mfem/interactions/zeeman.hpp"
 #include "cpu/mfem/integrators/adaptive_dt.hpp"
+#include "cpu/mfem/integrators/rk_step_transaction.hpp"
 #include "cpu/mfem/runtime/aos_field.hpp"
 #include "cpu/mfem/runtime/field_refresh.hpp"
 #include "gpu/cuda/runtime/gpu_state_runtime.hpp"
@@ -37,8 +39,9 @@
 #include "cpu/mfem/runtime/mfem_device.hpp"
 #include "cpu/mfem/runtime/stage_completion.hpp"
 
-#include <algorithm>
 #include <cmath>
+#include <memory>
+#include <new>
 
 namespace fullmag::fem {
 
@@ -105,27 +108,7 @@ bool build_context_from_plan(
     if (!initialize_state_plan_fields(ctx, plan, error)) {
         return false;
     }
-    const std::size_t true_dofs = static_cast<std::size_t>(
-        ctx.mesh.periodic_reduced_node_count > 0
-            ? ctx.mesh.periodic_reduced_node_count
-            : ctx.mesh.n_nodes);
-    const std::size_t active_candidates = ctx.mesh.magnetic_node_mask.empty()
-        ? true_dofs
-        : static_cast<std::size_t>(std::count_if(
-            ctx.mesh.magnetic_node_mask.begin(),
-            ctx.mesh.magnetic_node_mask.end(),
-            [](uint8_t v) { return v != 0; }));
-
-    const char *fingerprint = "mesh_p1_v1";
-    if (!ctx.frozen_spins.import_descriptor(
-            plan.frozen_mask,
-            plan.frozen_mask_len,
-            plan.frozen_reference_xyz,
-            plan.frozen_reference_len,
-            true_dofs,
-            active_candidates,
-            fingerprint,
-            error)) {
+    if (!initialize_frozen_spins_plan_fields(ctx, plan, error)) {
         return false;
     }
     if (ctx.frozen_spins.enabled()) {
@@ -139,10 +122,6 @@ bool build_context_from_plan(
 
     // Precompute per-node dual volumes for thermal noise after mesh masks exist.
     compute_node_volumes(ctx);
-
-    if (!project_regional_field_drive_bases(ctx, error)) {
-        return false;
-    }
 
     initialize_uniform_zeeman_field(ctx);
     initialize_context_field_buffers(ctx);
@@ -173,6 +152,12 @@ bool build_context_from_plan(
     if (!context_initialize_mfem(ctx, error)) {
         return false;
     }
+    // Mixed P1 uses MFEM's assembled magnetic mass row sums as the canonical
+    // nodal integration weights. Project the drive only after that publication
+    // so the basis is both topology-safe and normalized on the same weights.
+    if (!project_regional_field_drive_bases(ctx, error)) {
+        return false;
+    }
     if (!initialize_demag_runtime(ctx, error)) {
         return false;
     }
@@ -180,8 +165,35 @@ bool build_context_from_plan(
         return false;
     }
     context_populate_device_info(ctx);
+#else
+    if (!project_regional_field_drive_bases(ctx, error)) {
+        return false;
+    }
 #endif
     if (!initialize_context_gpu_state(ctx, error)) {
+        return false;
+    }
+    rk_step_transaction_reset_workspace(ctx.stepper.workspace);
+    ctx.stepper.workspace.attempt_checkpoint.reset();
+    if (ctx.adaptive_dt.enabled &&
+        (ctx.base_plan.integrator == FULLMAG_FEM_INTEGRATOR_RK23_BS ||
+         ctx.base_plan.integrator == FULLMAG_FEM_INTEGRATOR_RK45_DP54)) {
+        try {
+            ctx.stepper.workspace.attempt_checkpoint =
+                std::make_unique<RkAttemptCacheSnapshot>(ctx, false);
+            ctx.stepper.transaction_telemetry.attempt_cache_allocation_count += 1;
+        } catch (const std::bad_alloc &) {
+            error = "RK attempt cache checkpoint allocation failed during setup";
+            return false;
+        }
+        if (!ctx.stepper.workspace.attempt_checkpoint->prepare(error)) {
+            return false;
+        }
+    }
+    try {
+        rk_step_transaction_prepare_workspace(ctx);
+    } catch (const std::bad_alloc &) {
+        error = "RK step transaction journal allocation failed during setup";
         return false;
     }
     return true;

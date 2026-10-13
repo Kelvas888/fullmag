@@ -9,6 +9,16 @@ import type { Viewport3DMaterialProfile } from "./viewport3DMaterialProfile";
 
 export const VERTEX_COLOR_MATERIAL_COLOR = 0xffffff;
 
+/** Authored presentation only; never infer physics or ownership from labels. */
+export function resolveMeshPartPresentationColor(
+  objectId: string | null | undefined,
+  objects: ReadonlyArray<{ objectId: string; role?: string | null }>,
+  colors: { mesh: ColorRepresentation; antenna?: ColorRepresentation },
+): ColorRepresentation {
+  const owner = objectId ? objects.find((object) => object.objectId === objectId) : null;
+  return owner?.role === "antenna" ? colors.antenna ?? colors.mesh : colors.mesh;
+}
+
 export function opacityFromSettings(
   settings: VisualizationTargetSettings,
 ): number {
@@ -56,6 +66,13 @@ export function resolveMeshPartSurfaceMaterialColor(
       ? meshColor
       : magnetizationTexturePreviewColor ?? meshColor;
   return surfaceMaterialColorFromSettings(settings, fallback, hasVertexColors);
+}
+
+export function resolveMeshPartMagnetizationTexturePreviewColor(
+  analysisOverlayActive: boolean,
+  magnetizationTexturePreviewColor: ColorRepresentation | null,
+): ColorRepresentation | null {
+  return analysisOverlayActive ? null : magnetizationTexturePreviewColor;
 }
 
 export function shaderUsesVertexColors(

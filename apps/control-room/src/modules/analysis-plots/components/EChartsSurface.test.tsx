@@ -60,6 +60,29 @@ describe("EChartsSurface", () => {
     expect(model.provenance?.descriptorId).toBe("analysis:data-table:default");
   });
 
+  it("preserves typed artifact and execution identity in export provenance", () => {
+    const seriesWithIdentity = series.map((entry) => ({
+      ...entry,
+      sourceIdentity: {
+        artifactPath: "eigen/spectrum.v2.json",
+        backend: null,
+        contentDigest: "sha256:spectrum",
+        device: null,
+        precision: null,
+        provenance: null,
+        qualification: "unknown",
+        runId: "run-7",
+        schemaVersion: "frequency_domain_eigen_spectrum.v2",
+        stageId: "stage-3",
+      },
+    }));
+
+    expect(
+      tableSeriesRenderModel(seriesWithIdentity, seriesWithIdentity, "mode index")
+        .provenance,
+    ).toMatchObject(seriesWithIdentity[0]!.sourceIdentity);
+  });
+
   it("labels one or many normalized magnetization components consistently", () => {
     const single = tableSeriesRenderModel(series, series, "step");
     const multiTable = {
@@ -210,6 +233,70 @@ describe("EChartsSurface", () => {
       expect(mountedCanvas.getAttribute("data-retained")).toBe("true");
       expect(container.textContent).not.toContain("Loading table samples");
       expect(echarts.init).toHaveBeenCalledTimes(1);
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("retains the mounted Analysis chart owner while initial samples arrive", async () => {
+    const dom = installSimulationPreparationTestDom();
+    globalThis.getComputedStyle = (() => ({
+      direction: "ltr",
+      getPropertyValue: () => "",
+    })) as unknown as typeof getComputedStyle;
+    const container = dom.document.createElement("div");
+    dom.document.body.appendChild(container);
+    const root = createRoot(container as unknown as Element);
+
+    try {
+      await act(async () => {
+        root.render(
+          <EChartsSurface
+            presentation={{ kind: "ready", revision: 41 }}
+            series={[]}
+            xAxisLabel="step"
+          />,
+        );
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      const mountedSurface = findElement(
+        container,
+        (element) => element.getAttribute("class") === "fm-analysis-chart-surface",
+        "initial Analysis chart surface",
+      );
+      const mountedCanvas = findElement(
+        container,
+        (element) => element.getAttribute("class") === "fm-analysis-plots__echarts",
+        "initial Analysis chart canvas",
+      );
+      const initCount = echarts.init.mock.calls.length;
+
+      await act(async () => {
+        root.render(
+          <EChartsSurface
+            presentation={{ kind: "ready", revision: 42 }}
+            series={series}
+            xAxisLabel="step"
+          />,
+        );
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(findElement(
+        container,
+        (element) => element.getAttribute("class") === "fm-analysis-chart-surface",
+        "loaded Analysis chart surface",
+      )).toBe(mountedSurface);
+      expect(findElement(
+        container,
+        (element) => element.getAttribute("class") === "fm-analysis-plots__echarts",
+        "loaded Analysis chart canvas",
+      )).toBe(mountedCanvas);
+      expect(mountedCanvas.getAttribute("data-retained")).toBe("true");
+      expect(echarts.init).toHaveBeenCalledTimes(initCount);
     } finally {
       await act(async () => root.unmount());
       dom.restore();

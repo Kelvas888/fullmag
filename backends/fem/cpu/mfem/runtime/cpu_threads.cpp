@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <optional>
+#include <string>
 #include <thread>
 
 #ifdef _OPENMP
@@ -89,11 +90,12 @@ int auto_cpu_thread_cap_for_context(const Context &ctx, int requested_threads)
     if (requested_threads <= 1) {
         return std::max(1, requested_threads);
     }
-    if (ctx.demag.enabled) {
-        return std::max(1, requested_threads);
-    }
     const uint32_t node_count = ctx.mesh.n_nodes;
     const uint32_t element_count = ctx.mesh.n_elements;
+    // Hypre/AMG is especially sensitive to excessive OpenMP teams on the
+    // Windows Docker lane.  Keep small and medium demag contexts on the same
+    // size-aware limits as the other FEM kernels; large contexts retain the
+    // requested auto count because their operator work can still scale out.
     if (node_count <= 10000u || element_count <= 75000u) {
         return std::min(requested_threads, 8);
     }
@@ -109,9 +111,6 @@ int auto_cpu_thread_cap_reason_for_context(const Context &ctx, int requested_thr
         return FULLMAG_FEM_CPU_THREAD_CAP_GPU_DEFAULT_ONE;
     }
     if (requested_threads <= 1) {
-        return FULLMAG_FEM_CPU_THREAD_CAP_AUTO_UNCAPPED;
-    }
-    if (ctx.demag.enabled) {
         return FULLMAG_FEM_CPU_THREAD_CAP_AUTO_UNCAPPED;
     }
     const uint32_t node_count = ctx.mesh.n_nodes;
@@ -136,6 +135,9 @@ void configure_fem_host_runtime_threads(Context &ctx)
     ctx.cpu_threads.requested_omp_threads = request.requested_threads;
     ctx.cpu_threads.effective_omp_threads = request.requested_threads;
     ctx.cpu_threads.cap_reason = FULLMAG_FEM_CPU_THREAD_CAP_NONE;
+    ctx.cpu_threads.dynamic_threads_disabled = true;
+    ctx.cpu_threads.nested_parallelism_disabled = true;
+    ctx.cpu_threads.max_active_parallel_levels = 1;
     if (request.auto_requested) {
         const bool gpu_host_runtime = mfem_device_requests_gpu(ctx);
         ctx.cpu_threads.effective_omp_threads =
@@ -148,8 +150,30 @@ void configure_fem_host_runtime_threads(Context &ctx)
             : auto_cpu_thread_cap_reason_for_context(ctx, request.requested_threads);
     }
 #ifdef _OPENMP
+    // MFEM, Hypre/AMG and BLAS may all enter OpenMP regions. Keep one runtime
+    // owner and reject nested teams instead of multiplying the configured
+    // budget at an inner operator or solver phase.
+    omp_set_dynamic(0);
+    omp_set_nested(0);
+#if _OPENMP >= 200805
+    omp_set_max_active_levels(1);
+#endif
     omp_set_num_threads(ctx.cpu_threads.effective_omp_threads);
 #endif
+    if (request.auto_requested && !mfem_device_requests_gpu(ctx)) {
+        // Hypre and the MPI/OpenMP runtime may snapshot OMP_NUM_THREADS before
+        // their first parallel region.  omp_set_num_threads() alone therefore
+        // leaves the auto path at the host-wide default on the Windows Docker
+        // lane.  Publish the already size-capped value before MFEM/Hypre setup
+        // so both OpenMP consumers observe the same process-level budget.
+        const std::string effective_threads =
+            std::to_string(ctx.cpu_threads.effective_omp_threads);
+#if defined(_WIN32)
+        _putenv_s("OMP_NUM_THREADS", effective_threads.c_str());
+#else
+        setenv("OMP_NUM_THREADS", effective_threads.c_str(), 1);
+#endif
+    }
 }
 
 void log_cpu_runtime_selection(const Context &ctx)
@@ -161,13 +185,14 @@ void log_cpu_runtime_selection(const Context &ctx)
 
     std::fprintf(
         stderr,
-        "[fullmag-fem] cpu runtime: poisson_solver=%s preconditioner=%s cpu_threads=%s requested_omp_threads=%d effective_omp_threads=%d cap_reason=%d mesh_nodes=%u elements=%u\n",
+        "[fullmag-fem] cpu runtime: poisson_solver=%s preconditioner=%s cpu_threads=%s requested_omp_threads=%d effective_omp_threads=%d cap_reason=%d dynamic_threads=disabled nested_parallelism=disabled max_active_parallel_levels=%d mesh_nodes=%u elements=%u\n",
         demag_poisson_linear_solver_name(ctx.demag.solver.solver),
         demag_poisson_preconditioner_name(ctx.demag.solver.preconditioner),
         thread_mode,
         ctx.cpu_threads.requested_omp_threads,
         ctx.cpu_threads.effective_omp_threads,
         ctx.cpu_threads.cap_reason,
+        ctx.cpu_threads.max_active_parallel_levels,
         ctx.mesh.n_nodes,
         ctx.mesh.n_elements);
 }

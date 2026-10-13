@@ -5,7 +5,23 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from fullmag.model.study import _MAX_FEM_EIGEN_SOLVER_ITERATIONS
+from fullmag.model.compute_resources import ComputeResources
+from fullmag.model.output_storage import OutputStorage
+from fullmag.model.execution_profile import ExecutionProfile, ExecutionRequestLayer, _parallel_execution_lane
+from fullmag.runtime.output_storage_lowering import (
+    configure_scene_stage_autosaves,
+    configure_study_pipeline_autosaves,
+)
 from fullmag.model.current_transport import (
+    ExternalLeadCurrentSource,
+    ExternalLeadPreparation,
+    TerminalLeadExtension,
+    _CURRENT_SOURCE_MAX_ITEMS,
+    CurrentSourceInterfacePair,
+    CurrentSourceOuterTerminal,
+    CurrentSourceTerminalObservation,
+    CurrentSourceDrive,
     ConservativeCurrentBoundaryFace,
     ConservativeCurrentClosedGeometry,
     ConservativeCurrentExternalLead,
@@ -23,6 +39,7 @@ from fullmag.model.current_transport import (
     ChargeTransportMaterialAssignment,
     CurrentTransport,
     NormalCurrentElectrode,
+    EquipotentialCurrentTerminal,
     StructuredCurrentClosure,
     StructuredCurrentSourceCut,
     StructuredCutPlane,
@@ -56,6 +73,120 @@ from fullmag.model.spin_transport import (
     DriftDiffusionSpinTorque as CanonicalDriftDiffusionSpinTorque,
     SurfaceRef,
 )
+from fullmag.model.problem import FdmPbc, ParallelExecutionPolicy
+
+
+_SCENE_CURRENT_MODULE_FIELDS = frozenset(
+    {
+        "kind",
+        "name",
+        "solver",
+        "air_box_factor",
+        "antenna_kind",
+        "antenna_params",
+        "drive",
+    }
+)
+_SCENE_CURRENT_DRIVE_FIELDS = frozenset(
+    {"current_a", "frequency_hz", "phase_rad", "waveform"}
+)
+_SCENE_EXCITATION_ANALYSIS_FIELDS = frozenset(
+    {"source", "method", "propagation_axis", "k_max_rad_per_m", "samples"}
+)
+_CURRENT_TRANSPORT_FIELDS = frozenset(
+    {
+        "kind",
+        "name",
+        "model",
+        "current_density",
+        "solve_region",
+        "conductivity_s_per_m",
+        "coupling",
+        "domain",
+        "materials",
+        "boundaries",
+        "gauge",
+        "solver",
+        "time_envelope",
+        "conservative_current_view",
+        "conservative_current_source",
+        "external_lead_preparation",
+        "structured_current_closure",
+    }
+)
+
+
+def _scene_pbc_from_ir(value: object) -> FdmPbc | None:
+    """Decode the canonical PBC object without lossy Python coercions."""
+    if value is None:
+        return None
+    if isinstance(value, FdmPbc):
+        return value
+    if not isinstance(value, Mapping):
+        raise TypeError("SceneDocument.study.pbc must be an object or null")
+
+    unknown = set(value) - {"axes", "demag", "image_counts"}
+    if unknown:
+        names = ", ".join(sorted(str(name) for name in unknown))
+        raise ValueError(f"SceneDocument.study.pbc has unsupported fields: {names}")
+
+    raw_axes = value.get("axes")
+    if (
+        isinstance(raw_axes, (str, bytes))
+        or not isinstance(raw_axes, Sequence)
+        or len(raw_axes) != 3
+    ):
+        raise ValueError("SceneDocument.study.pbc.axes must contain three axis values")
+    if any(
+        type(axis) is not str or axis not in {"open", "periodic"}
+        for axis in raw_axes
+    ):
+        raise ValueError(
+            "SceneDocument.study.pbc.axes values must be 'open' or 'periodic'"
+        )
+
+    demag = value.get("demag")
+    if type(demag) is not str or demag not in {
+        "open",
+        "truncated_images",
+        "periodic_airbox_k0",
+    }:
+        raise ValueError(
+            "SceneDocument.study.pbc.demag must be 'open', 'truncated_images', "
+            "or 'periodic_airbox_k0'"
+        )
+
+    image_counts: tuple[int, int, int] | None = None
+    if "image_counts" in value and value["image_counts"] is not None:
+        raw_counts = value["image_counts"]
+        if (
+            isinstance(raw_counts, (str, bytes))
+            or not isinstance(raw_counts, Sequence)
+            or len(raw_counts) != 3
+        ):
+            raise ValueError(
+                "SceneDocument.study.pbc.image_counts must contain three integers or null"
+            )
+        maximum = (1 << 32) - 1
+        if any(
+            type(count) is not int or count < 0 or count > maximum
+            for count in raw_counts
+        ):
+            raise ValueError(
+                "SceneDocument.study.pbc.image_counts values must be u32 integers"
+            )
+        image_counts = tuple(raw_counts)
+
+    return FdmPbc(
+        axes=tuple(axis == "periodic" for axis in raw_axes),
+        demag=demag,
+        image_counts=image_counts,
+    )
+
+
+def _scene_pbc_to_ir(value: object) -> dict[str, object] | None:
+    pbc = _scene_pbc_from_ir(value)
+    return pbc.to_ir() if pbc is not None else None
 
 
 def _material_id(name: str) -> str:
@@ -114,6 +245,48 @@ def _mapping(value: object, context: str) -> dict[str, object]:
     return dict(value)
 
 
+def _execution_profile_fields(
+    source: Mapping[str, object],
+    context: str,
+) -> dict[str, object]:
+    has_profile = "execution_profile" in source
+    raw_layers = source.get("execution_layers", [])
+    if not isinstance(raw_layers, list):
+        raise ValueError(f"{context}.execution_layers must be a list")
+    if not has_profile:
+        if raw_layers:
+            raise ValueError(f"{context}.execution_layers requires execution_profile")
+        return {}
+
+    profile = ExecutionProfile.from_ir(source["execution_profile"])
+    layers = [ExecutionRequestLayer.from_ir(layer) for layer in raw_layers]
+    result: dict[str, object] = {"execution_profile": profile.to_ir()}
+    if layers:
+        result["execution_layers"] = [layer.to_ir() for layer in layers]
+    return result
+
+
+def _compute_resources_fields(
+    source: Mapping[str, object],
+    context: str,
+) -> dict[str, object]:
+    if "compute_resources" not in source:
+        return {}
+    if not isinstance(source["compute_resources"], Mapping):
+        raise ValueError(f"{context}.compute_resources must be an object")
+    resources = ComputeResources.from_ir(source["compute_resources"])
+    return {"compute_resources": resources.to_ir()}
+
+
+def _reject_unknown_fields(
+    entry: Mapping[str, object], supported_fields: frozenset[str], context: str
+) -> None:
+    unknown_fields = set(entry) - supported_fields
+    if unknown_fields:
+        names = ", ".join(sorted(str(name) for name in unknown_fields))
+        raise ValueError(f"{context} has unsupported fields: {names}")
+
+
 def _finite_number(value: object, context: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{context} must be a finite number")
@@ -146,6 +319,7 @@ def _nonempty_string(value: object, context: str) -> str:
 
 def _region_ref(value: object, context: str) -> RegionRef:
     entry = _mapping(value, context)
+    _reject_unknown_fields(entry, frozenset({"object_id", "region_id"}), context)
     object_id = _nonempty_string(entry.get("object_id"), f"{context}.object_id")
     region_id = entry.get("region_id")
     if region_id is not None:
@@ -157,6 +331,7 @@ def _decode_current_transport(value: object) -> CurrentTransport:
     entry = _mapping(value, "current_transport")
     if entry.get("kind") != "current_transport":
         raise ValueError(f"unsupported current transport kind {entry.get('kind')!r}")
+    _reject_unknown_fields(entry, _CURRENT_TRANSPORT_FIELDS, "current_transport")
     current_density = entry.get("current_density")
     domain_value = entry.get("domain", [])
     materials_value = entry.get("materials", [])
@@ -173,10 +348,27 @@ def _decode_current_transport(value: object) -> CurrentTransport:
     ]
     materials: list[ChargeTransportMaterialAssignment] = []
     for index, raw_assignment in enumerate(materials_value):
-        assignment = _mapping(raw_assignment, f"current_transport.materials[{index}]")
+        assignment_context = f"current_transport.materials[{index}]"
+        assignment = _mapping(raw_assignment, assignment_context)
+        _reject_unknown_fields(
+            assignment, frozenset({"region", "material"}), assignment_context
+        )
+        material_context = f"{assignment_context}.material"
         material = _mapping(
             assignment.get("material"),
-            f"current_transport.materials[{index}].material",
+            material_context,
+        )
+        _reject_unknown_fields(
+            material,
+            frozenset(
+                {
+                    "sigma_Spm",
+                    "sigma_parallel_Spm",
+                    "sigma_perpendicular_Spm",
+                    "sigma_AHE_Spm",
+                }
+            ),
+            material_context,
         )
         materials.append(
             ChargeTransportMaterialAssignment(
@@ -219,15 +411,22 @@ def _decode_current_transport(value: object) -> CurrentTransport:
 
     boundaries = []
     for index, raw_boundary in enumerate(boundaries_value):
-        boundary = _mapping(raw_boundary, f"current_transport.boundaries[{index}]")
+        boundary_context = f"current_transport.boundaries[{index}]"
+        boundary = _mapping(raw_boundary, boundary_context)
         surfaces_value = boundary.get("surfaces")
         if not isinstance(surfaces_value, list):
-            raise ValueError(f"current_transport.boundaries[{index}].surfaces must be a list")
+            raise ValueError(f"{boundary_context}.surfaces must be a list")
         surfaces = []
         for surface_index, raw_surface in enumerate(surfaces_value):
+            surface_context = f"{boundary_context}.surfaces[{surface_index}]"
             surface = _mapping(
                 raw_surface,
-                f"current_transport.boundaries[{index}].surfaces[{surface_index}]",
+                surface_context,
+            )
+            _reject_unknown_fields(
+                surface,
+                frozenset({"object_id", "surface_id", "orientation"}),
+                surface_context,
             )
             surfaces.append(
                 SurfaceRef(
@@ -246,11 +445,30 @@ def _decode_current_transport(value: object) -> CurrentTransport:
                     ),
                 )
             )
-        boundary_id = _nonempty_string(
-            boundary.get("id"), f"current_transport.boundaries[{index}].id"
-        )
         kind = boundary.get("kind")
-        if kind == "voltage_electrode":
+        boundary_fields = (
+            {
+                "equipotential_current_terminal": frozenset(
+                    {"id", "kind", "surfaces"}
+                ),
+                "voltage_electrode": frozenset(
+                    {"id", "kind", "surfaces", "potential_V"}
+                ),
+                "normal_current_electrode": frozenset(
+                    {"id", "kind", "surfaces", "outward_current_density_Apm2"}
+                ),
+                "insulating": frozenset({"id", "kind", "surfaces"}),
+            }.get(kind)
+            if isinstance(kind, str)
+            else None
+        )
+        if boundary_fields is None:
+            raise ValueError(f"unsupported charge boundary kind {kind!r}")
+        _reject_unknown_fields(boundary, boundary_fields, boundary_context)
+        boundary_id = _nonempty_string(boundary.get("id"), f"{boundary_context}.id")
+        if kind == "equipotential_current_terminal":
+            boundaries.append(EquipotentialCurrentTerminal(boundary_id, surfaces))
+        elif kind == "voltage_electrode":
             boundaries.append(
                 VoltageElectrode(
                     boundary_id,
@@ -282,7 +500,19 @@ def _decode_current_transport(value: object) -> CurrentTransport:
     solver = None
     if solver_value is not None:
         solver_entry = _mapping(solver_value, "current_transport.solver")
+        _reject_unknown_fields(
+            solver_entry,
+            frozenset(
+                {"engine", "linear", "physical_residual_version", "operator_version"}
+            ),
+            "current_transport.solver",
+        )
         linear = _mapping(solver_entry.get("linear"), "current_transport.solver.linear")
+        _reject_unknown_fields(
+            linear,
+            frozenset({"relative_tolerance", "absolute_tolerance", "max_iterations"}),
+            "current_transport.solver.linear",
+        )
         solver = ChargeSolverPolicy(
             engine=_nonempty_string(solver_entry.get("engine"), "current_transport.solver.engine"),
             relative_tolerance=_finite_number(
@@ -341,13 +571,25 @@ def _decode_current_transport(value: object) -> CurrentTransport:
         ),
         solver=solver,
         time_envelope=(
-            _decode_sot_envelope(entry["time_envelope"])
+            _decode_sot_envelope(
+                entry["time_envelope"], context="current_transport.time_envelope"
+            )
             if entry.get("time_envelope") is not None
             else None
         ),
         conservative_current_view=(
             _decode_conservative_current_view(conservative_view_value)
             if conservative_view_value is not None
+            else None
+        ),
+        conservative_current_source=(
+            _decode_conservative_current_source(entry["conservative_current_source"])
+            if entry.get("conservative_current_source") is not None
+            else None
+        ),
+        external_lead_preparation=(
+            _decode_external_lead_preparation(entry["external_lead_preparation"])
+            if entry.get("external_lead_preparation") is not None
             else None
         ),
         structured_current_closure=(
@@ -358,21 +600,107 @@ def _decode_current_transport(value: object) -> CurrentTransport:
     )
 
 
+def _decode_external_lead_preparation(value: object) -> ExternalLeadPreparation:
+    entry = dict(_mapping(value, "external_lead_preparation"))
+    if set(entry) != {"schema_version", "kind", "revision", "extensions", "drives"}:
+        raise ValueError("external_lead_preparation has unknown or missing fields")
+    if entry.pop("kind") != "isolated_branch_straight_stubs":
+        raise ValueError("unsupported external_lead_preparation kind")
+    extensions, drives = entry["extensions"], entry["drives"]
+    if not isinstance(extensions, list) or not isinstance(drives, list):
+        raise ValueError("external_lead_preparation extensions and drives must be lists")
+    if not 2 <= len(extensions) <= 128 or not drives or len(drives) * len(extensions) > _CURRENT_SOURCE_MAX_ITEMS:
+        raise ValueError("external_lead_preparation exceeds bounded input support before construction")
+    for values, key in ((extensions, "boundary_markers"), (drives, "outer_terminal_currents_a")):
+        count = 0
+        for raw in values:
+            item = _mapping(raw, "external_lead_preparation entry")
+            controls = item.get(key)
+            expected_type = list if key == "boundary_markers" else Mapping
+            if not isinstance(controls, expected_type):
+                raise ValueError(f"external_lead_preparation.{key} has an invalid shape")
+            count += len(controls)
+            if count > _CURRENT_SOURCE_MAX_ITEMS:
+                raise ValueError("external_lead_preparation exceeds bounded input support before construction")
+    groups = (
+        ("extensions", TerminalLeadExtension, {"id", "observation_id", "object_id", "boundary_markers",
+                                              "length_m", "outward_direction_xyz", "conductivity_spm", "layers"}),
+        ("drives", CurrentSourceDrive, {"id", "port_mode_ref", "outer_terminal_currents_a"}),
+    )
+    for name, cls, fields in groups:
+        values = []
+        for raw in entry[name]:
+            item = _mapping(raw, f"external_lead_preparation.{name}")
+            required = fields - {"layers"} if name == "extensions" else fields
+            if not required <= item.keys() or not item.keys() <= fields:
+                raise ValueError(f"external_lead_preparation.{name} has unknown or missing fields")
+            values.append(cls(**item))
+        entry[name] = values
+    return ExternalLeadPreparation(**entry)
+
+
+def _decode_conservative_current_source(value: object) -> ExternalLeadCurrentSource:
+    entry = dict(_mapping(value, "conservative_current_source"))
+    fields = {"schema_version", "kind", "revision", "device_stable_vertex_ids", "lead_mesh",
+              "lead_stable_vertex_ids", "lead_conductivity_spm_per_element", "interface_pairs",
+              "outer_terminals", "terminal_observations", "drives"}
+    if set(entry) != fields:
+        raise ValueError("conservative_current_source has unknown or missing fields")
+    if entry.pop("kind") != "external_lead_current":
+        raise ValueError("unsupported conservative_current_source kind")
+    groups = (
+        ("interface_pairs", CurrentSourceInterfacePair, {"id", "device_face_vertex_ids", "lead_face_vertex_ids", "vertex_pairs"}),
+        ("outer_terminals", CurrentSourceOuterTerminal, {"id", "boundary_face_vertex_ids"}),
+        ("terminal_observations", CurrentSourceTerminalObservation, {"id", "object_id", "interface_pair_ids"}),
+        ("drives", CurrentSourceDrive, {"id", "port_mode_ref", "outer_terminal_currents_a"}),
+    )
+    for name, cls, keys in groups:
+        if not isinstance(entry[name], list):
+            raise ValueError(f"conservative_current_source.{name} must be a list")
+        values = []
+        for raw in entry[name]:
+            item = _mapping(raw, f"conservative_current_source.{name}")
+            if set(item) != keys:
+                raise ValueError(f"conservative_current_source.{name} has unknown or missing fields")
+            values.append(cls(**item))
+        entry[name] = values
+    return ExternalLeadCurrentSource(**entry)
+
+
 def _decode_structured_current_closure(value: object) -> StructuredCurrentClosure:
     entry = _mapping(value, "current_transport.structured_current_closure")
+    root_context = "current_transport.structured_current_closure"
+    _reject_unknown_fields(
+        entry,
+        frozenset({"schema_version", "closure_id", "kind", "source_cuts"}),
+        root_context,
+    )
     cuts_value = entry.get("source_cuts")
     if not isinstance(cuts_value, list):
-        raise ValueError(
-            "current_transport.structured_current_closure.source_cuts must be a list"
-        )
+        raise ValueError(f"{root_context}.source_cuts must be a list")
     cuts: list[StructuredCurrentSourceCut] = []
     for index, raw_cut in enumerate(cuts_value):
-        context = f"current_transport.structured_current_closure.source_cuts[{index}]"
+        context = f"{root_context}.source_cuts[{index}]"
         cut = _mapping(raw_cut, context)
-        plane = _mapping(cut.get("plane"), f"{context}.plane")
-        drive = _mapping(cut.get("drive"), f"{context}.drive")
+        _reject_unknown_fields(
+            cut,
+            frozenset({"source_cut_id", "circuit_id", "region", "plane", "drive"}),
+            context,
+        )
+        plane_context = f"{context}.plane"
+        plane = _mapping(cut.get("plane"), plane_context)
+        _reject_unknown_fields(
+            plane, frozenset({"axis", "offset_m", "normal"}), plane_context
+        )
+        drive_context = f"{context}.drive"
+        drive = _mapping(cut.get("drive"), drive_context)
+        _reject_unknown_fields(
+            drive,
+            frozenset({"schema_version", "kind", "drive_id", "potential_jump_V"}),
+            drive_context,
+        )
         if drive.get("kind") != "impressed_potential_jump":
-            raise ValueError(f"{context}.drive.kind must be 'impressed_potential_jump'")
+            raise ValueError(f"{drive_context}.kind must be 'impressed_potential_jump'")
         cuts.append(
             StructuredCurrentSourceCut(
                 source_cut_id=_nonempty_string(
@@ -393,15 +721,15 @@ def _decode_structured_current_closure(value: object) -> StructuredCurrentClosur
                 ),
                 drive=ImpressedPotentialJump(
                     drive_id=_nonempty_string(
-                        drive.get("drive_id"), f"{context}.drive.drive_id"
+                        drive.get("drive_id"), f"{drive_context}.drive_id"
                     ),
                     potential_jump_V=_finite_number(
                         drive.get("potential_jump_V"),
-                        f"{context}.drive.potential_jump_V",
+                        f"{drive_context}.potential_jump_V",
                     ),
                     schema_version=_nonempty_string(
                         drive.get("schema_version"),
-                        f"{context}.drive.schema_version",
+                        f"{drive_context}.schema_version",
                     ),
                 ),
             )
@@ -409,22 +737,40 @@ def _decode_structured_current_closure(value: object) -> StructuredCurrentClosur
     return StructuredCurrentClosure(
         closure_id=_nonempty_string(
             entry.get("closure_id"),
-            "current_transport.structured_current_closure.closure_id",
+            f"{root_context}.closure_id",
         ),
         source_cuts=cuts,
         schema_version=_nonempty_string(
             entry.get("schema_version"),
-            "current_transport.structured_current_closure.schema_version",
+            f"{root_context}.schema_version",
         ),
         kind=_nonempty_string(
             entry.get("kind"),
-            "current_transport.structured_current_closure.kind",
+            f"{root_context}.kind",
         ),
     )
 
 
 def _decode_conservative_current_view(value: object) -> ConservativeCurrentView:
     entry = _mapping(value, "current_transport.conservative_current_view")
+    root_context = "current_transport.conservative_current_view"
+    _reject_unknown_fields(
+        entry,
+        frozenset(
+            {
+                "stable_vertex_ids",
+                "boundary_faces",
+                "identity",
+                "pins",
+                "closure",
+                "algebraic_relative_tolerance",
+                "physical_relative_gate",
+                "physical_absolute_gate_a",
+                "reference_mpi_gather_broadcast",
+            }
+        ),
+        root_context,
+    )
     stable_ids = entry.get("stable_vertex_ids")
     if not isinstance(stable_ids, list):
         raise ValueError("current_transport.conservative_current_view.stable_vertex_ids must be a list")
@@ -434,7 +780,13 @@ def _decode_conservative_current_view(value: object) -> ConservativeCurrentView:
         raise ValueError("current_transport.conservative_current_view.boundary_faces must be a list")
     boundary_faces = []
     for index, raw_face in enumerate(boundary_value):
-        face = _mapping(raw_face, f"current_transport.conservative_current_view.boundary_faces[{index}]")
+        face_context = f"{root_context}.boundary_faces[{index}]"
+        face = _mapping(raw_face, face_context)
+        _reject_unknown_fields(
+            face,
+            frozenset({"face_vertex_ids", "role", "circuit_id"}),
+            face_context,
+        )
         face_ids = face.get("face_vertex_ids")
         if not isinstance(face_ids, list):
             raise ValueError(f"current_transport.conservative_current_view.boundary_faces[{index}].face_vertex_ids must be a list")
@@ -450,7 +802,28 @@ def _decode_conservative_current_view(value: object) -> ConservativeCurrentView:
             )
         )
 
-    identity_value = _mapping(entry.get("identity"), "current_transport.conservative_current_view.identity")
+    identity_context = f"{root_context}.identity"
+    identity_value = _mapping(entry.get("identity"), identity_context)
+    _reject_unknown_fields(
+        identity_value,
+        frozenset(
+            {
+                "source_module_id",
+                "source_state_revision",
+                "source_field_digest",
+                "conductivity_digest",
+                "mesh_revision",
+                "topology_revision",
+                "geometry_digest",
+                "envelope_revision",
+                "envelope_digest",
+                "evaluated_envelope_multiplier",
+                "evaluation_time_s",
+                "stage_identity",
+            }
+        ),
+        identity_context,
+    )
     identity = ConservativeCurrentIdentity(
         source_module_id=_nonempty_string(identity_value.get("source_module_id"), "conservative_current_view.identity.source_module_id"),
         source_state_revision=_nonempty_string(identity_value.get("source_state_revision"), "conservative_current_view.identity.source_state_revision"),
@@ -466,7 +839,20 @@ def _decode_conservative_current_view(value: object) -> ConservativeCurrentView:
         stage_identity=_positive_integer(identity_value.get("stage_identity"), "conservative_current_view.identity.stage_identity"),
     )
 
-    pins_value = _mapping(entry.get("pins"), "current_transport.conservative_current_view.pins")
+    pins_context = f"{root_context}.pins"
+    pins_value = _mapping(entry.get("pins"), pins_context)
+    _reject_unknown_fields(
+        pins_value,
+        frozenset(
+            {
+                "required_source_state_revision",
+                "required_source_field_digest",
+                "required_mesh_revision",
+                "required_topology_revision",
+            }
+        ),
+        pins_context,
+    )
     pins = ConservativeCurrentPins(
         required_source_state_revision=_nonempty_string(pins_value.get("required_source_state_revision"), "conservative_current_view.pins.required_source_state_revision"),
         required_source_field_digest=_nonempty_string(pins_value.get("required_source_field_digest"), "conservative_current_view.pins.required_source_field_digest"),
@@ -474,8 +860,30 @@ def _decode_conservative_current_view(value: object) -> ConservativeCurrentView:
         required_topology_revision=_nonempty_string(pins_value.get("required_topology_revision"), "conservative_current_view.pins.required_topology_revision"),
     )
 
-    closure_value = _mapping(entry.get("closure"), "current_transport.conservative_current_view.closure")
+    closure_context = f"{root_context}.closure"
+    closure_value = _mapping(entry.get("closure"), closure_context)
     if closure_value.get("kind") == "external_lead":
+        _reject_unknown_fields(
+            closure_value,
+            frozenset(
+                {
+                    "kind",
+                    "operator_version",
+                    "revision",
+                    "digest",
+                    "drive_id",
+                    "outer_electrode_potential_drop_v",
+                    "lead_mesh",
+                    "lead_conductivity_spm_per_element",
+                    "lead_stable_vertex_ids",
+                    "interface_pairs",
+                    "minus_outer_electrode_face_vertex_ids",
+                    "plus_outer_electrode_face_vertex_ids",
+                    "lead_conductivity_digest",
+                }
+            ),
+            closure_context,
+        )
         lead_mesh = _mapping(
             closure_value.get("lead_mesh"),
             "conservative_current_view.closure.lead_mesh",
@@ -551,18 +959,35 @@ def _decode_conservative_current_view(value: object) -> ConservativeCurrentView:
         raise ValueError(
             "current_transport.conservative_current_view currently supports only closed_geometry closure"
         )
+    _reject_unknown_fields(
+        closure_value,
+        frozenset({"kind", "operator_version", "revision", "digest", "source_cuts"}),
+        closure_context,
+    )
     source_cuts_value = closure_value.get("source_cuts")
     if not isinstance(source_cuts_value, list):
         raise ValueError("conservative_current_view.closure.source_cuts must be a list")
     source_cuts = []
     for index, raw_cut in enumerate(source_cuts_value):
-        cut = _mapping(raw_cut, f"conservative_current_view.closure.source_cuts[{index}]")
+        cut_context = f"{closure_context}.source_cuts[{index}]"
+        cut = _mapping(raw_cut, cut_context)
+        _reject_unknown_fields(
+            cut,
+            frozenset({"id", "translation_m", "potential_drop_v", "face_pairs"}),
+            cut_context,
+        )
         pairs_value = cut.get("face_pairs")
         if not isinstance(pairs_value, list):
-            raise ValueError(f"conservative_current_view.closure.source_cuts[{index}].face_pairs must be a list")
+            raise ValueError(f"{cut_context}.face_pairs must be a list")
         pairs = []
         for pair_index, raw_pair in enumerate(pairs_value):
-            pair = _mapping(raw_pair, f"conservative_current_view.closure.source_cuts[{index}].face_pairs[{pair_index}]")
+            pair_context = f"{cut_context}.face_pairs[{pair_index}]"
+            pair = _mapping(raw_pair, pair_context)
+            _reject_unknown_fields(
+                pair,
+                frozenset({"minus_face_vertex_ids", "plus_face_vertex_ids"}),
+                pair_context,
+            )
             minus = pair.get("minus_face_vertex_ids")
             plus = pair.get("plus_face_vertex_ids")
             if not isinstance(minus, list) or not isinstance(plus, list):
@@ -598,52 +1023,81 @@ def _decode_conservative_current_view(value: object) -> ConservativeCurrentView:
     )
 
 
-def _decode_sot_envelope(value: object) -> object:
-    entry = _mapping(value, "prescribed_sot.drive.envelope")
+def _decode_sot_envelope(
+    value: object, *, context: str = "prescribed_sot.drive.envelope"
+) -> object:
+    entry = _mapping(value, context)
     kind = entry.get("kind")
     if kind == "constant":
-        return ConstantEnvelope(_finite_number(entry.get("value"), "envelope.value"))
+        _reject_unknown_fields(entry, frozenset({"kind", "value"}), context)
+        return ConstantEnvelope(_finite_number(entry.get("value"), f"{context}.value"))
     if kind == "sinusoidal":
+        _reject_unknown_fields(
+            entry,
+            frozenset({"kind", "amplitude", "frequency_hz", "phase_rad", "offset"}),
+            context,
+        )
         return SinusoidalEnvelope(
-            _finite_number(entry.get("amplitude"), "envelope.amplitude"),
-            _finite_number(entry.get("frequency_hz"), "envelope.frequency_hz"),
-            phase_rad=_finite_number(entry.get("phase_rad"), "envelope.phase_rad"),
-            offset=_finite_number(entry.get("offset"), "envelope.offset"),
+            _finite_number(entry.get("amplitude"), f"{context}.amplitude"),
+            _finite_number(entry.get("frequency_hz"), f"{context}.frequency_hz"),
+            phase_rad=_finite_number(entry.get("phase_rad"), f"{context}.phase_rad"),
+            offset=_finite_number(entry.get("offset"), f"{context}.offset"),
         )
     if kind == "pulse":
+        _reject_unknown_fields(
+            entry, frozenset({"kind", "amplitude", "t_on_s", "t_off_s"}), context
+        )
         return PulseEnvelope(
-            _finite_number(entry.get("amplitude"), "envelope.amplitude"),
-            _finite_number(entry.get("t_on_s"), "envelope.t_on_s"),
-            _finite_number(entry.get("t_off_s"), "envelope.t_off_s"),
+            _finite_number(entry.get("amplitude"), f"{context}.amplitude"),
+            _finite_number(entry.get("t_on_s"), f"{context}.t_on_s"),
+            _finite_number(entry.get("t_off_s"), f"{context}.t_off_s"),
         )
     if kind == "piecewise_linear":
+        _reject_unknown_fields(entry, frozenset({"kind", "points"}), context)
         points = entry.get("points")
         if not isinstance(points, list):
-            raise ValueError("envelope.points must be a list")
-        return PiecewiseLinearEnvelope(
-            [
+            raise ValueError(f"{context}.points must be a list")
+        decoded_points = []
+        for index, point in enumerate(points):
+            point_context = f"{context}.points[{index}]"
+            point_entry = _mapping(point, point_context)
+            _reject_unknown_fields(
+                point_entry, frozenset({"time_s", "value"}), point_context
+            )
+            decoded_points.append(
                 TimeEnvelopePoint(
-                    _finite_number(_mapping(point, f"envelope.points[{index}]").get("time_s"), f"envelope.points[{index}].time_s"),
-                    _finite_number(_mapping(point, f"envelope.points[{index}]").get("value"), f"envelope.points[{index}].value"),
+                    _finite_number(point_entry.get("time_s"), f"{point_context}.time_s"),
+                    _finite_number(point_entry.get("value"), f"{point_context}.value"),
                 )
-                for index, point in enumerate(points)
-            ]
-        )
+            )
+        return PiecewiseLinearEnvelope(decoded_points)
     if kind == "sinc":
+        _reject_unknown_fields(
+            entry,
+            frozenset({"kind", "amplitude", "center_s", "bandwidth_hz", "offset"}),
+            context,
+        )
         return SincEnvelope(
-            _finite_number(entry.get("amplitude"), "envelope.amplitude"),
-            center_s=_finite_number(entry.get("center_s"), "envelope.center_s"),
-            bandwidth_hz=_finite_number(entry.get("bandwidth_hz"), "envelope.bandwidth_hz"),
-            offset=_finite_number(entry.get("offset"), "envelope.offset"),
+            _finite_number(entry.get("amplitude"), f"{context}.amplitude"),
+            center_s=_finite_number(entry.get("center_s"), f"{context}.center_s"),
+            bandwidth_hz=_finite_number(entry.get("bandwidth_hz"), f"{context}.bandwidth_hz"),
+            offset=_finite_number(entry.get("offset"), f"{context}.offset"),
         )
     if kind == "tabulated":
+        _reject_unknown_fields(
+            entry,
+            frozenset(
+                {"kind", "artifact_ref", "interpolation", "extrapolation", "bandwidth_hz"}
+            ),
+            context,
+        )
         bandwidth = entry.get("bandwidth_hz")
         return TabulatedEnvelope(
-            _nonempty_string(entry.get("artifact_ref"), "envelope.artifact_ref"),
-            interpolation=_nonempty_string(entry.get("interpolation"), "envelope.interpolation"),
-            extrapolation=_nonempty_string(entry.get("extrapolation"), "envelope.extrapolation"),
+            _nonempty_string(entry.get("artifact_ref"), f"{context}.artifact_ref"),
+            interpolation=_nonempty_string(entry.get("interpolation"), f"{context}.interpolation"),
+            extrapolation=_nonempty_string(entry.get("extrapolation"), f"{context}.extrapolation"),
             bandwidth_hz=(
-                _finite_number(bandwidth, "envelope.bandwidth_hz") if bandwidth is not None else None
+                _finite_number(bandwidth, f"{context}.bandwidth_hz") if bandwidth is not None else None
             ),
         )
     raise ValueError(f"unsupported prescribed SOT envelope kind {kind!r}")
@@ -992,6 +1446,10 @@ def _normalize_interaction_entry(
     if not isinstance(raw, dict):
         return None
     kind = str(raw.get("kind") or "").strip()
+    if kind == "rotated_interfacial_dmi":
+        raise ValueError(
+            "rotated_interfacial_dmi is study-scoped and cannot appear in object physics_stack"
+        )
     if kind not in _INTERACTION_ORDER:
         return None
     if kind in {"exchange", "demag"}:
@@ -1044,13 +1502,15 @@ def _ensure_physics_stack(
     for required in ("exchange", "demag"):
         if required not in by_kind:
             by_kind[required] = {"kind": required, "enabled": True, "params": None}
-    if material_dind is not None and "interfacial_dmi" not in by_kind:
+    material_dind_value = _number_or_none(material_dind)
+    material_dbulk_value = _number_or_none(material_dbulk)
+    if material_dind_value not in (None, 0.0) and "interfacial_dmi" not in by_kind:
         by_kind["interfacial_dmi"] = _normalize_interaction_entry(
             {"kind": "interfacial_dmi", "enabled": True, "params": None},
             material_dind=material_dind,
             material_dbulk=None,
         ) or {"kind": "interfacial_dmi", "enabled": True, "params": {"dind": 1e-3}}
-    if material_dbulk is not None and "bulk_dmi" not in by_kind:
+    if material_dbulk_value not in (None, 0.0) and "bulk_dmi" not in by_kind:
         by_kind["bulk_dmi"] = _normalize_interaction_entry(
             {"kind": "bulk_dmi", "enabled": True, "params": None},
             material_dind=None,
@@ -1064,6 +1524,78 @@ def _ensure_physics_stack(
     return ordered
 
 
+def _validate_dmi_scope_exclusivity(
+    objects: object,
+    rotated_interfacial_dmi: object,
+    *,
+    materials: Mapping[str, Mapping[str, object]] | None = None,
+) -> None:
+    if _number_or_none(rotated_interfacial_dmi) is None:
+        return
+    conflicts: set[str] = set()
+    if isinstance(objects, list):
+        for obj in objects:
+            if not isinstance(obj, Mapping):
+                continue
+            if str(obj.get("role") or "magnet") != "magnet":
+                continue
+            stack = obj.get("physics_stack")
+            if materials is not None:
+                material_ref = str(obj.get("material_ref") or "")
+                material = materials.get(material_ref, {})
+                stack = _ensure_physics_stack(
+                    stack,
+                    material_dind=material.get("Dind"),
+                    material_dbulk=material.get("Dbulk"),
+                )
+            elif not isinstance(stack, list):
+                continue
+            for entry in stack:
+                if not isinstance(entry, Mapping):
+                    continue
+                kind = str(entry.get("kind") or "").strip()
+                if kind in {"interfacial_dmi", "bulk_dmi"} and entry.get(
+                    "enabled", True
+                ) is not False:
+                    conflicts.add(kind)
+    if conflicts:
+        raise ValueError(
+            "rotated_interfacial_dmi is study-scoped and cannot coexist with active "
+            f"object-scoped {', '.join(sorted(conflicts))}"
+        )
+
+
+def _validate_rotated_dmi_exchange_requirement(
+    rotated_interfacial_dmi: object,
+    exchange_enabled: object,
+    *,
+    pbc: object = None,
+) -> None:
+    """Require Exchange for nonzero rotated DMI when a magnetic axis is open.
+
+    An explicitly fully periodic 3D problem has no open magnetic boundary, so
+    the coupled natural-boundary condition does not require study Exchange.
+    The planner remains responsible for validating overall PBC legality.
+    """
+    d = _number_or_none(rotated_interfacial_dmi)
+    if d is None or d == 0.0:
+        return
+    disabled = exchange_enabled is False or (
+        isinstance(exchange_enabled, str)
+        and exchange_enabled.strip().lower() == "false"
+    )
+    if disabled:
+        pbc_config = _scene_pbc_from_ir(pbc)
+        has_open_magnetic_boundary = (
+            pbc_config is None or not all(pbc_config.axes)
+        )
+        if has_open_magnetic_boundary:
+            raise ValueError(
+                "RotatedInterfacialDmi with open magnetic boundaries requires Exchange "
+                "for the coupled natural boundary condition"
+            )
+
+
 def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]:
     geometries = builder.get("geometries") or []
     objects: list[dict[str, Any]] = []
@@ -1072,6 +1604,7 @@ def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]
 
     for geometry in geometries:
         name = str(geometry.get("name", "object"))
+        object_id = str(geometry.get("object_id") or name)
         geometry_params = dict(geometry.get("geometry_params") or {})
         translation = geometry_params.pop("translation", geometry_params.pop("translate", [0, 0, 0]))
         role = str(geometry.get("role") or "magnet")
@@ -1099,7 +1632,7 @@ def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]
 
         objects.append(
             {
-                "id": name,
+                "id": object_id,
                 "name": name,
                 "role": role,
                 "geometry": {
@@ -1121,6 +1654,7 @@ def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]
                 "object_mesh": geometry.get("mesh"),
                 "mesh_override": geometry.get("mesh"),
                 "regions": object_regions,
+                "absorbing_boundary": geometry.get("absorbing_boundary"),
                 "allocated_region_ids": allocated_region_ids,
                 "material_parameter_fields": geometry.get("material_parameter_fields") or [],
                 "visualization_hint": geometry.get("visualization_hint") or {},
@@ -1160,6 +1694,16 @@ def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]
             }
         )
 
+    _validate_dmi_scope_exclusivity(
+        objects,
+        builder.get("rotated_interfacial_dmi"),
+    )
+    _validate_rotated_dmi_exchange_requirement(
+        builder.get("rotated_interfacial_dmi"),
+        builder.get("exchange_enabled", True),
+        pbc=builder.get("pbc"),
+    )
+
     raw_current_modules = builder.get("current_modules") or []
     if not isinstance(raw_current_modules, list):
         raise ValueError("current_modules must be a list")
@@ -1171,12 +1715,29 @@ def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]
         else:
             legacy_current_modules.append(copy.deepcopy(module))
 
+    requested_backend = str(
+        builder.get("requested_backend") or builder.get("backend") or "auto"
+    )
+    requested_device = str(builder.get("requested_device") or "auto")
+    requested_precision = str(
+        builder.get("requested_precision")
+        or builder.get("execution_precision")
+        or "double"
+    )
+    parallel_execution_policy = ParallelExecutionPolicy.from_ir(
+        builder.get("parallel_execution")
+    )
+    parallel_execution_policy.validate_for_runtime(
+        *_parallel_execution_lane(builder, requested_backend, requested_device)
+    )
+    parallel_execution = parallel_execution_policy.to_ir()
+
     document = {
         "version": "scene.v2",
         "revision": int(builder.get("revision", 0)),
         "scene": {
             "id": "scene",
-            "name": "Scene",
+            "name": str(builder.get("study_name") or "Scene"),
             "source_of_truth": "repo_head",
             "authoring_schema": "mesh-first-fem.v1",
         },
@@ -1194,26 +1755,37 @@ def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]
         "monitors": {"planar": copy.deepcopy(builder.get("planar_monitors") or [])},
         "study": {
             "backend": builder.get("backend"),
-            "requested_backend": "auto",
-            "requested_device": "auto",
-            "requested_precision": "double",
+            "requested_backend": requested_backend,
+            "requested_device": requested_device,
+            "requested_precision": requested_precision,
             "requested_mode": builder.get("requested_mode", "strict"),
             "requested_cpu_threads": builder.get("cpu_threads"),
+            "parallel_execution": copy.deepcopy(parallel_execution),
             "fem_demag_solver_policy": builder.get("fem_demag_solver_policy"),
             "exchange_enabled": bool(builder.get("exchange_enabled", True)),
             "demag_enabled": bool(builder.get("demag_enabled", True)),
             "demag_realization": builder.get("demag_realization"),
             "external_field": builder.get("external_field"),
+            "rotated_interfacial_dmi": builder.get("rotated_interfacial_dmi"),
             "solver": builder.get("solver") or {},
             "universe_mesh": builder.get("universe"),
             "shared_domain_mesh": builder.get("mesh") or {},
             "mesh_defaults": builder.get("mesh") or {},
             "stages": [
                 _canonical_scene_stage(stage)
-                for stage in (builder.get("stages") or [])
+                for stage in configure_scene_stage_autosaves(
+                    builder.get("stages") or [],
+                    builder.get("output_storage"),
+                    table_autosave=builder.get("table_autosave"),
+                )
             ],
-            "study_pipeline": builder.get("study_pipeline"),
+            "study_pipeline": configure_study_pipeline_autosaves(
+                builder.get("study_pipeline"),
+                builder.get("output_storage"),
+                table_autosave=builder.get("table_autosave"),
+            ),
             "table_autosave": builder.get("table_autosave"),
+            "output_storage": builder.get("output_storage"),
             "initial_state": builder.get("initial_state"),
         },
         "outputs": {"items": []},
@@ -1230,8 +1802,24 @@ def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]
             "active_transform_scope": None,
         },
     }
+    if "pbc" in builder:
+        document["study"]["pbc"] = _scene_pbc_to_ir(builder["pbc"])
+    for collection in (
+        "antenna_port_modes",
+        "antenna_field_solve_stages",
+        "antenna_target_projections",
+        "solved_antenna_drives",
+        "antenna_spectrum_requests",
+    ):
+        if collection in builder:
+            value = builder[collection]
+            if not isinstance(value, list):
+                raise ValueError(f"{collection} must be a list when present")
+            document[collection] = copy.deepcopy(value)
     if "fdm" in builder:
         document["study"]["fdm"] = copy.deepcopy(builder.get("fdm"))
+    document["study"].update(_execution_profile_fields(builder, "builder"))
+    document["study"].update(_compute_resources_fields(builder, "builder"))
     if "spin_torques" in builder:
         document["spin_torques"] = _canonical_spin_torques(
             builder["spin_torques"], scene_ids=True
@@ -1248,19 +1836,62 @@ def build_scene_document_from_builder(builder: dict[str, Any]) -> dict[str, Any]
 
 
 def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
+    raw_study = scene.get("study")
     materials = {
         str(material.get("id", "")): dict(material.get("properties") or {})
         for material in (scene.get("materials") or [])
     }
+    _validate_dmi_scope_exclusivity(
+        scene.get("objects"),
+        raw_study.get("rotated_interfacial_dmi")
+        if isinstance(raw_study, Mapping)
+        else None,
+        materials=materials,
+    )
+    _validate_rotated_dmi_exchange_requirement(
+        raw_study.get("rotated_interfacial_dmi")
+        if isinstance(raw_study, Mapping)
+        else None,
+        raw_study.get("exchange_enabled", True)
+        if isinstance(raw_study, Mapping)
+        else True,
+        pbc=raw_study.get("pbc") if isinstance(raw_study, Mapping) else None,
+    )
     magnetization_assets = {
         str(asset.get("id", "")): dict(asset)
         for asset in (scene.get("magnetization_assets") or [])
     }
     geometries: list[dict[str, Any]] = []
 
+    object_ids: set[str] = set()
+    geometry_names: set[str] = set()
+    magnetic_aliases = {
+        str(obj.get("name") or "").strip() or str(obj.get("id") or "")
+        for obj in scene.get("objects") or []
+        if obj.get("role", "magnet") == "magnet"
+    }
     for obj in scene.get("objects") or []:
-        role = str(obj.get("role") or "magnet")
+        role = str(obj.get("role", "magnet"))
+        if role not in {"magnet", "geometry", "conductor", "electrode", "antenna"}:
+            raise ValueError(f"unsupported scene presentation type '{role}'")
+        object_id = obj.get("id")
+        if not isinstance(object_id, str):
+            raise ValueError("immutable object ID must be a string")
+        if not object_id or object_id.strip() != object_id:
+            raise ValueError("immutable object ID must be nonempty without surrounding whitespace")
+        raw_name = obj.get("name", "")
+        if not isinstance(raw_name, str):
+            raise ValueError("geometry name must be a string")
+        name = raw_name.strip() or object_id
         is_auxiliary = role != "magnet"
+        if object_id in object_ids:
+            raise ValueError(f"duplicate immutable object ID '{object_id}'")
+        if name in geometry_names:
+            raise ValueError(f"ambiguous geometry name '{name}'")
+        if is_auxiliary and object_id in magnetic_aliases:
+            raise ValueError("auxiliary ID conflicts with a magnetic name alias")
+        object_ids.add(object_id)
+        geometry_names.add(name)
         material_ref = str(obj.get("material_ref") or "")
         if not is_auxiliary and (not material_ref or material_ref not in materials):
             raise ValueError(
@@ -1276,10 +1907,9 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
         geometry = dict(obj.get("geometry") or {})
         geometry_params = dict(geometry.get("geometry_params") or {})
         transform = dict(obj.get("transform") or {})
-        translation = transform.get("translation")
-        if isinstance(translation, list) and len(translation) == 3:
-            if any(abs(float(value)) > 0 for value in translation):
-                geometry_params["translation"] = [float(value) for value in translation]
+        translation = _owner_frame_translation(transform, object_id)
+        if any(abs(value) > 0 for value in translation):
+            geometry_params["translation"] = list(translation)
 
         magnetization_asset = magnetization_assets.get(magnetization_ref, {})
         magnetization = {
@@ -1299,6 +1929,18 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
             "preset_version": magnetization_asset.get("preset_version"),
             "ui_label": magnetization_asset.get("ui_label"),
         }
+        if (
+            not is_auxiliary
+            and magnetization["kind"] in {"file", "sampled", "sampled_field"}
+            and (
+                not isinstance(magnetization["source_path"], str)
+                or not magnetization["source_path"].strip()
+            )
+        ):
+            raise ValueError(
+                "scene_document_sampled_magnetization_missing_source_path: "
+                f"object '{object_id}' requires a source path"
+            )
         material_properties = materials.get(material_ref, {})
         physics_stack = _ensure_physics_stack(
             obj.get("physics_stack"),
@@ -1307,7 +1949,8 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
         )
 
         entry: dict[str, Any] = {
-            "name": str(obj.get("name") or obj.get("id") or ""),
+            "object_id": object_id,
+            "name": name,
             "role": role,
             "region_name": obj.get("region_name"),
             "geometry_kind": str(geometry.get("geometry_kind", "")),
@@ -1315,6 +1958,7 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
             "bounds_min": geometry.get("bounds_min"),
             "bounds_max": geometry.get("bounds_max"),
             "mesh": obj.get("object_mesh", obj.get("mesh_override")),
+            "absorbing_boundary": obj.get("absorbing_boundary"),
             "object_regions": obj.get("regions") or [],
             "allocated_region_ids": obj.get("allocated_region_ids") or [],
             "material_parameter_fields": obj.get("material_parameter_fields") or [],
@@ -1327,10 +1971,99 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
         geometries.append(entry)
 
     study = dict(scene.get("study") or {})
-    current_modules = dict(scene.get("current_modules") or {})
-    legacy_modules = current_modules.get("modules") or []
+    output_storage = study.get("output_storage")
+    if output_storage is not None:
+        if not isinstance(output_storage, Mapping):
+            raise ValueError("SceneDocument.study.output_storage must be an object")
+        study["output_storage"] = OutputStorage.from_ir(output_storage).to_ir()
+        study["stages"] = configure_scene_stage_autosaves(
+            study.get("stages") or [],
+            study["output_storage"],
+            table_autosave=study.get("table_autosave"),
+        )
+        study["study_pipeline"] = configure_study_pipeline_autosaves(
+            study.get("study_pipeline"),
+            study["output_storage"],
+            table_autosave=study.get("table_autosave"),
+        )
+    current_modules_value = scene.get("current_modules", {})
+    if not isinstance(current_modules_value, Mapping):
+        raise ValueError("SceneDocument.current_modules must be an object")
+    current_modules = dict(current_modules_value)
+    unknown_current_module_fields = set(current_modules) - {
+        "modules",
+        "excitation_analysis",
+    }
+    if unknown_current_module_fields:
+        names = ", ".join(sorted(str(name) for name in unknown_current_module_fields))
+        raise ValueError(
+            f"SceneDocument.current_modules has unsupported fields: {names}"
+        )
+    legacy_modules = current_modules.get("modules", [])
     if not isinstance(legacy_modules, list):
-        raise ValueError("current_modules.modules must be a list")
+        raise ValueError("SceneDocument.current_modules.modules must be a list")
+    for index, module in enumerate(legacy_modules):
+        if not isinstance(module, Mapping):
+            raise ValueError(
+                f"SceneDocument.current_modules.modules[{index}] must be an object"
+            )
+        if module.get("kind") == "current_transport":
+            # Compatibility input is checked by the canonical transport decoder below.
+            continue
+        unknown_module_fields = set(module) - _SCENE_CURRENT_MODULE_FIELDS
+        if unknown_module_fields:
+            names = ", ".join(sorted(str(name) for name in unknown_module_fields))
+            raise ValueError(
+                "SceneDocument.current_modules.modules["
+                f"{index}] has unsupported fields: {names}"
+            )
+        if "drive" not in module:
+            continue
+        drive = module["drive"]
+        if not isinstance(drive, Mapping):
+            raise ValueError(
+                f"SceneDocument.current_modules.modules[{index}].drive must be an object"
+            )
+        unknown_drive_fields = set(drive) - _SCENE_CURRENT_DRIVE_FIELDS
+        if unknown_drive_fields:
+            names = ", ".join(sorted(str(name) for name in unknown_drive_fields))
+            raise ValueError(
+                "SceneDocument.current_modules.modules["
+                f"{index}].drive has unsupported fields: {names}"
+            )
+        if "current_a" not in drive:
+            raise ValueError(
+                "SceneDocument.current_modules.modules["
+                f"{index}].drive is missing required field: current_a"
+            )
+    excitation_analysis = current_modules.get("excitation_analysis")
+    if excitation_analysis is not None:
+        if not isinstance(excitation_analysis, Mapping):
+            raise ValueError(
+                "SceneDocument.current_modules.excitation_analysis must be an object"
+            )
+        unknown_excitation_fields = (
+            set(excitation_analysis) - _SCENE_EXCITATION_ANALYSIS_FIELDS
+        )
+        if unknown_excitation_fields:
+            names = ", ".join(sorted(str(name) for name in unknown_excitation_fields))
+            raise ValueError(
+                "SceneDocument.current_modules.excitation_analysis has unsupported fields: "
+                f"{names}"
+            )
+        missing_excitation_fields = {
+            "source",
+            "method",
+            "propagation_axis",
+            "samples",
+        } - set(excitation_analysis)
+        if missing_excitation_fields:
+            names = ", ".join(sorted(missing_excitation_fields))
+            raise ValueError(
+                "SceneDocument.current_modules.excitation_analysis is missing "
+                "required fields: "
+                f"{names}"
+            )
     migrated_transports = [
         module
         for module in legacy_modules
@@ -1350,40 +2083,92 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
     transport_names = [str(entry["name"]) for entry in transports]
     if len(transport_names) != len(set(transport_names)):
         raise ValueError("current_transports contains duplicate names")
+    parallel_execution_policy = ParallelExecutionPolicy.from_ir(
+        study.get("parallel_execution")
+    )
+    parallel_execution_policy.validate_for_runtime(
+        *_parallel_execution_lane(study, study.get("requested_backend", "auto"), study.get("requested_device", "auto"))
+    )
     builder = {
         "revision": int(scene.get("revision", 0)),
-        "backend": study.get("backend"),
+        "study_name": (
+            (scene.get("scene") or {}).get("name")
+            if isinstance(scene.get("scene"), Mapping)
+            else None
+        ),
+        "backend": study.get("backend") or study.get("requested_backend"),
+        "requested_backend": study.get("requested_backend", "auto"),
+        "requested_device": study.get("requested_device", "auto"),
+        "requested_precision": study.get("requested_precision", "double"),
         "requested_mode": study.get("requested_mode", "strict"),
         "cpu_threads": study.get("requested_cpu_threads"),
+        "parallel_execution": parallel_execution_policy.to_ir(),
+        **_execution_profile_fields(study, "SceneDocument.study"),
+        **_compute_resources_fields(study, "SceneDocument.study"),
         "fem_demag_solver_policy": study.get("fem_demag_solver_policy"),
         "exchange_enabled": bool(study.get("exchange_enabled", True)),
         "demag_enabled": bool(study.get("demag_enabled", True)),
         "demag_realization": study.get("demag_realization"),
         "external_field": study.get("external_field"),
+        "rotated_interfacial_dmi": study.get("rotated_interfacial_dmi"),
         "solver": study.get("solver") or {},
         "mesh": study.get("shared_domain_mesh") or study.get("mesh_defaults") or {},
         "universe": study.get("universe_mesh") or scene.get("universe"),
         "stages": study.get("stages") or [],
         "study_pipeline": study.get("study_pipeline"),
         "table_autosave": study.get("table_autosave"),
+        "output_storage": study.get("output_storage"),
         "initial_state": study.get("initial_state"),
         "geometries": geometries,
         "couplings": scene.get("couplings") or [],
         "current_modules": [*antenna_modules, *transports],
-        "excitation_analysis": current_modules.get("excitation_analysis"),
+        "excitation_analysis": excitation_analysis,
     }
+    if "pbc" in study:
+        builder["pbc"] = _scene_pbc_to_ir(study["pbc"])
     if "fdm" in study:
         builder["fdm"] = copy.deepcopy(study.get("fdm"))
-    field_drives = scene.get("field_drives")
-    if isinstance(field_drives, Mapping):
-        drives = field_drives.get("drives")
-        if isinstance(drives, list):
-            builder["field_drives"] = copy.deepcopy(drives)
-    monitors = scene.get("monitors")
-    if isinstance(monitors, Mapping):
-        planar = monitors.get("planar")
-        if isinstance(planar, list):
-            builder["planar_monitors"] = copy.deepcopy(planar)
+    if "field_drives" in scene:
+        field_drives = scene["field_drives"]
+        if not isinstance(field_drives, Mapping):
+            raise ValueError("SceneDocument.field_drives must be an object")
+        unknown_field_drive_fields = set(field_drives) - {"drives"}
+        if unknown_field_drive_fields:
+            names = ", ".join(
+                sorted(str(name) for name in unknown_field_drive_fields)
+            )
+            raise ValueError(
+                f"SceneDocument.field_drives has unsupported fields: {names}"
+            )
+        drives = field_drives.get("drives", [])
+        if not isinstance(drives, list):
+            raise ValueError("SceneDocument.field_drives.drives must be a list")
+        for index, drive in enumerate(drives):
+            if not isinstance(drive, Mapping):
+                raise ValueError(
+                    "SceneDocument.field_drives.drives["
+                    f"{index}] must be an object"
+                )
+        builder["field_drives"] = copy.deepcopy(drives)
+    if "monitors" in scene:
+        monitors = scene["monitors"]
+        if not isinstance(monitors, Mapping):
+            raise ValueError("SceneDocument.monitors must be an object")
+        unknown_monitor_fields = set(monitors) - {"planar"}
+        if unknown_monitor_fields:
+            names = ", ".join(sorted(str(name) for name in unknown_monitor_fields))
+            raise ValueError(
+                f"SceneDocument.monitors has unsupported fields: {names}"
+            )
+        planar = monitors.get("planar", [])
+        if not isinstance(planar, list):
+            raise ValueError("SceneDocument.monitors.planar must be a list")
+        for index, monitor in enumerate(planar):
+            if not isinstance(monitor, Mapping):
+                raise ValueError(
+                    f"SceneDocument.monitors.planar[{index}] must be an object"
+                )
+        builder["planar_monitors"] = copy.deepcopy(planar)
     if "spin_torques" in scene:
         builder["spin_torques"] = _canonical_spin_torques(
             scene["spin_torques"], scene_ids=False
@@ -1400,7 +2185,59 @@ def build_builder_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
         builder["oersted_terms"] = _canonical_oersted_fields(
             scene["oersted_terms"], scene_ids=False
         )
+    for collection in (
+        "antenna_port_modes",
+        "antenna_field_solve_stages",
+        "antenna_target_projections",
+        "solved_antenna_drives",
+        "antenna_spectrum_requests",
+    ):
+        if collection in scene:
+            value = scene[collection]
+            if not isinstance(value, list):
+                raise ValueError(f"{collection} must be a list when present")
+            builder[collection] = copy.deepcopy(value)
     return builder
+
+
+def _owner_frame_translation(
+    transform: Mapping[str, object], object_id: str
+) -> tuple[float, float, float]:
+    def vector(
+        key: str,
+        default: Sequence[float],
+    ) -> tuple[float, ...]:
+        raw = transform.get(key, default)
+        if (
+            isinstance(raw, (str, bytes))
+            or not isinstance(raw, Sequence)
+            or len(raw) != len(default)
+        ):
+            raise ValueError(
+                f"objects.{object_id}.transform.{key} must have {len(default)} components"
+            )
+        return tuple(
+            _finite_number(component, f"objects.{object_id}.transform.{key}[{index}]")
+            for index, component in enumerate(raw)
+        )
+
+    rotation = vector("rotation_quat", (0.0, 0.0, 0.0, 1.0))
+    scale = vector("scale", (1.0, 1.0, 1.0))
+    epsilon = math.ulp(1.0)
+    has_rotation = any(
+        abs(value - expected) > epsilon
+        for value, expected in zip(rotation, (0, 0, 0, 1))
+    )
+    has_scale = any(abs(value - 1.0) > epsilon for value in scale)
+    if has_rotation or has_scale:
+        raise ValueError(
+            "owner_transform_rotation_scale_unsupported: "
+            f"object '{object_id}' uses rotation or scale that is not represented "
+            "by the canonical FDM owner-frame lowering"
+        )
+
+    translation = vector("translation", (0.0, 0.0, 0.0))
+    return translation[0], translation[1], translation[2]
 
 
 def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, Any]:
@@ -1429,8 +2266,15 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
     if "integrator" in solver:
         solver_override["integrator"] = solver.get("integrator") or None
     for key in ("fixed_timestep", "dt_initial", "dt_min", "dt_max", "max_err"):
-        if key in solver:
-            solver_override[key] = _number_or_none(solver.get(key))
+        if key not in solver:
+            continue
+        raw_value = solver.get(key)
+        # The Rust builder adapter serializes unset text fields as empty strings;
+        # those are absence, while an explicit JSON null remains a deliberate
+        # clear request and must stay visible to the override validator.
+        if isinstance(raw_value, str) and not raw_value.strip():
+            continue
+        solver_override[key] = _number_or_none(raw_value)
     if "adaptive_timestep" in solver:
         solver_override["adaptive_timestep"] = advanced_adaptive_override
     solver_override["relax"] = {
@@ -1440,9 +2284,19 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
         "max_steps": _int_or_none(solver.get("max_relax_steps")),
     }
     mesh = dict(builder.get("mesh") or {})
+    parallel_execution_policy = ParallelExecutionPolicy.from_ir(
+        builder.get("parallel_execution")
+    )
+    parallel_execution_policy.validate_for_runtime(
+        *_parallel_execution_lane(builder, builder.get("backend") or builder.get("requested_backend") or "auto", builder.get("requested_device") or "auto")
+    )
+    parallel_execution = parallel_execution_policy.to_ir()
     overrides = {
         "runtime_selection": {
             "cpu_threads": _int_or_none(builder.get("cpu_threads")),
+            "device": builder.get("requested_device", "auto"),
+            "precision": builder.get("requested_precision", "double"),
+            "parallel_execution": parallel_execution,
         },
         "fem_demag_solver_policy": (
             dict(builder.get("fem_demag_solver_policy"))
@@ -1458,6 +2312,7 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
             and len(builder.get("external_field")) == 3
             else None
         ),
+        "rotated_interfacial_dmi": builder.get("rotated_interfacial_dmi"),
         "solver": solver_override,
         "mesh": {
             "algorithm_2d": mesh.get("algorithm_2d"),
@@ -1466,6 +2321,7 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
             "hmin": _number_or_none(mesh.get("minimum_element_size") or mesh.get("hmin")),
             "maximum_element_size": _number_or_auto(mesh.get("maximum_element_size") or mesh.get("hmax")),
             "minimum_element_size": _number_or_none(mesh.get("minimum_element_size") or mesh.get("hmin")),
+            "order": _int_or_none(mesh.get("order")),
             "calibrate_for": mesh.get("calibrate_for") or None,
             "size_preset": mesh.get("size_preset") or None,
             "size_factor": mesh.get("size_factor"),
@@ -1519,11 +2375,12 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
                     else {}
                 ),
                 "until_seconds": _number_or_none(stage.get("until_seconds")),
+                "autosave": copy.deepcopy(stage.get("autosave")),
                 "relax_algorithm": _stage_relax_algorithm(stage) or None,
                 "torque_tolerance": _number_or_none(stage.get("torque_tolerance")),
                 "energy_tolerance": _number_or_none(stage.get("energy_tolerance")),
                 "max_steps": _int_or_none(stage.get("max_steps")),
-                "eigen_count": _int_or_none(stage.get("eigen_count")),
+                "eigen_count": _eigen_count_override(stage),
                 "eigen_target": stage.get("eigen_target") or None,
                 "eigen_operator": stage.get("eigen_operator") or None,
                 "eigen_include_demag": (
@@ -1531,7 +2388,10 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
                     if isinstance(stage.get("eigen_include_demag"), bool)
                     else None
                 ),
-                "eigen_equilibrium_source": stage.get("eigen_equilibrium_source") or None,
+                "eigen_equilibrium_source": stage.get("eigen_equilibrium_source") or stage.get("equilibrium_source") or None,
+                "eigen_equilibrium_artifact": stage.get("eigen_equilibrium_artifact") or stage.get("equilibrium_artifact") or None,
+                "frequency_equilibrium_source": stage.get("frequency_equilibrium_source") or stage.get("equilibrium_source") or None,
+                "frequency_equilibrium_artifact": stage.get("frequency_equilibrium_artifact") or stage.get("equilibrium_artifact") or None,
                 "eigen_normalization": stage.get("eigen_normalization") or None,
                 "eigen_target_frequency": _number_or_none(stage.get("eigen_target_frequency")),
                 "eigen_frequency_min": _number_or_none(stage.get("eigen_frequency_min")),
@@ -1545,23 +2405,75 @@ def builder_overrides_from_scene_document(scene: dict[str, Any]) -> dict[str, An
                     if isinstance(stage.get("eigen_spin_wave_bc_config"), dict)
                     else None
                 ),
+                "eigen_magnetostatic_bc": stage.get("eigen_magnetostatic_bc") or None,
+                "eigen_solver_rtol": _eigen_solver_rtol_or_none(
+                    stage.get("eigen_solver_rtol")
+                    if stage.get("eigen_solver_rtol") not in (None, "")
+                    else stage.get("eigen_solver_residual_tolerance"),
+                    "SceneDocument.study.stages.eigen_solver_rtol",
+                ),
+                "eigen_solver_max_outer_iterations": _positive_fem_eigen_iterations_or_none(
+                    stage.get("eigen_solver_max_outer_iterations"),
+                    "SceneDocument.study.stages.eigen_solver_max_outer_iterations",
+                ),
+                "eigen_solver_max_linear_iterations": _positive_fem_eigen_iterations_or_none(
+                    stage.get("eigen_solver_max_linear_iterations"),
+                    "SceneDocument.study.stages.eigen_solver_max_linear_iterations",
+                ),
             }
             for stage in (builder.get("stages") or [])
         ],
         "study_pipeline": builder.get("study_pipeline"),
         "table_autosave": builder.get("table_autosave"),
+        "output_storage": builder.get("output_storage"),
         "initial_state": builder.get("initial_state"),
         "geometries": builder.get("geometries") or [],
         "couplings": builder.get("couplings") or [],
+        "field_drives": builder.get("field_drives") or [],
         "planar_monitors": builder.get("planar_monitors") or [],
         "current_modules": builder.get("current_modules") or [],
         "excitation_analysis": builder.get("excitation_analysis"),
     }
+    raw_study = scene.get("study")
+    if isinstance(raw_study, Mapping) and "pbc" in raw_study:
+        # Missing is no override; explicit null intentionally clears PBC.
+        overrides["pbc"] = copy.deepcopy(builder["pbc"])
     _copy_present_collection(builder, overrides, "spin_torques")
     _copy_present_collection(builder, overrides, "spin_transports")
     _copy_present_collection(builder, overrides, "oersted_terms")
+    _copy_present_collection(builder, overrides, "field_drives")
+    _copy_present_collection(builder, overrides, "antenna_port_modes")
+    _copy_present_collection(builder, overrides, "antenna_field_solve_stages")
+    _copy_present_collection(builder, overrides, "antenna_target_projections")
+    _copy_present_collection(builder, overrides, "solved_antenna_drives")
+    _copy_present_collection(builder, overrides, "antenna_spectrum_requests")
     if "fdm" in builder:
-        overrides["fdm"] = copy.deepcopy(builder.get("fdm"))
+        fdm = copy.deepcopy(builder.get("fdm"))
+        if isinstance(fdm, dict):
+            aliases: dict[str, str] = {}
+            for geometry in builder.get("geometries") or []:
+                if not isinstance(geometry, dict):
+                    continue
+                name = geometry.get("name") or geometry.get("object_id") or geometry.get("id")
+                if name is None:
+                    continue
+                for alias in (
+                    geometry.get("object_id"),
+                    geometry.get("id"),
+                    geometry.get("region_name"),
+                ):
+                    if alias is not None:
+                        aliases[str(alias)] = str(name)
+            for grid_key in ("per_magnet", "per_object_grid"):
+                raw_grid = fdm.get(grid_key)
+                if isinstance(raw_grid, dict):
+                    fdm[grid_key] = {
+                        aliases.get(str(key), str(key)): value
+                        for key, value in raw_grid.items()
+                    }
+        overrides["fdm"] = fdm
+    overrides.update(_execution_profile_fields(builder, "SceneDocument.study"))
+    overrides.update(_compute_resources_fields(builder, "SceneDocument.study"))
     return overrides
 
 
@@ -1611,6 +2523,51 @@ def _number_or_auto(value: Any) -> float | str | None:
     return _number_or_none(value)
 
 
+def _positive_integer_or_none(value: object, context: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        try:
+            value = int(stripped)
+        except ValueError as error:
+            raise ValueError(f"{context} must be a positive integer") from error
+    return _positive_integer(value, context)
+
+
+def _positive_fem_eigen_iterations_or_none(value: object, context: str) -> int | None:
+    if value is None or (isinstance(value, str) and value == ""):
+        return None
+    if isinstance(value, str):
+        try:
+            value = int(value)
+        except ValueError as error:
+            raise ValueError(f"{context} must be a positive integer") from error
+    result = _positive_integer(value, context)
+    if result > _MAX_FEM_EIGEN_SOLVER_ITERATIONS:
+        raise ValueError(
+            f"{context} must fit the native signed iteration limit "
+            f"(<= {_MAX_FEM_EIGEN_SOLVER_ITERATIONS})"
+        )
+    return result
+
+
+def _eigen_solver_rtol_or_none(value: object, context: str) -> float | None:
+    if value is None or (isinstance(value, str) and value == ""):
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError(f"{context} must be a finite positive number")
+    try:
+        result = float(value)
+    except (OverflowError, TypeError, ValueError) as error:
+        raise ValueError(f"{context} must be a finite positive number") from error
+    if not math.isfinite(result) or result <= 0.0:
+        raise ValueError(f"{context} must be a finite positive number")
+    return result
+
+
 def _int_or_none(value: Any) -> int | None:
     if value is None:
         return None
@@ -1625,3 +2582,18 @@ def _int_or_none(value: Any) -> int | None:
     if isinstance(value, (int, float)):
         return int(value)
     return None
+
+
+def _eigen_count_override(stage: Mapping[str, Any]) -> int | None:
+    value = stage.get("eigen_count")
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, bool):
+        raise ValueError("eigen_count must be a positive integer")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("eigen_count must be a positive integer") from exc
+    if not math.isfinite(numeric) or numeric < 1 or int(numeric) != numeric:
+        raise ValueError("eigen_count must be a positive integer")
+    return int(numeric)

@@ -2,6 +2,7 @@ import type { ResourceRevision } from "../api/apiTypes";
 import type { EventBus } from "../events/EventBus";
 import type { KernelEventMap } from "../events/eventTypes";
 import {
+  ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH,
   ANALYSIS_OBJECT_TOPOLOGICAL_CHARGE_PATH,
   ANALYSIS_HYSTERESIS_ADAPTIVE_REFINEMENT_PATH,
   ANALYSIS_HYSTERESIS_BOOKMARKS_PATH,
@@ -18,6 +19,9 @@ import {
   ANALYSIS_HYSTERESIS_SETTLE_TRACE_PATH,
   DATA_DOMAIN_META_PATH,
   DATA_DOMAIN_TOPOLOGY_PATH,
+  DATA_ANTENNA_FIELD_SOLUTION_PATH,
+  DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH,
+  DATA_ANTENNA_SOURCE_SPECTRUM_PATH,
   DATA_FDM_REGION_MEMBERSHIP_BINARY_PATH,
   DATA_FDM_REGION_MEMBERSHIP_SCOPED_PATH,
   DATA_FDM_REGION_MEMBERSHIPS_PATH,
@@ -39,11 +43,18 @@ import {
   MESHING_SHARED_DOMAIN_REALIZED_SIZE_FIELDS_PATH,
   MESHING_SUMMARY_PATH,
   MODEL_MATERIAL_FIELDS_PATH,
+  MODEL_MAGNETIZATION_ASSET_PATH,
+  MODEL_MATERIAL_PATH,
+  MODEL_OBJECT_GEOMETRY_PATH,
+  MODEL_OBJECT_INTERACTION_PATH,
+  MODEL_READINESS_PATH,
   MODEL_REALIZED_REGIONS_PATH,
   MODEL_REGION_DIAGNOSTICS_PATH,
   MODEL_REGIONS_PATH,
   MODEL_SCENE_PATH,
+  MODEL_STUDY_PATH,
   SESSION_CURRENT_PATH,
+  SESSIONS_PATH,
   SIMULATION_COMMANDS_PATH,
   SIMULATION_OBJECT_METRICS_PATH,
   SIMULATION_SOLVER_STATUS_PATH,
@@ -64,6 +75,7 @@ import {
   parseCanonicalFieldVectorResourceKey,
 } from "../api/fieldQueryIdentity";
 import type { ResourceInvalidationController } from "../resources/ResourceInvalidationController";
+import { canonicalFrequencyDomainResourceKey } from "../resources/frequencyDomainResourceKeys";
 import { PHYSICS_GRAPH_RESOURCE_KEY } from "../resources/physicsGraphResources";
 
 const SESSION_STATUS_RESOURCE_KEY = "session:status";
@@ -77,8 +89,23 @@ const FDM_REGION_MEMBERSHIP_SCOPED_PREFIX =
     0,
     DATA_FDM_REGION_MEMBERSHIP_SCOPED_PATH.indexOf("{region_id}"),
   );
+const ANTENNA_FIELD_SOLUTION_PREFIX = DATA_ANTENNA_FIELD_SOLUTION_PATH.slice(
+  0,
+  DATA_ANTENNA_FIELD_SOLUTION_PATH.indexOf("{solution_id}"),
+);
+const ANTENNA_STAGE_OUTPUT_CATALOG_PREFIX =
+  DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH.slice(
+    0,
+    DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH.indexOf("{stage_id}"),
+  );
+const ANTENNA_SOURCE_SPECTRUM_PREFIX = DATA_ANTENNA_SOURCE_SPECTRUM_PATH.slice(
+  0,
+  DATA_ANTENNA_SOURCE_SPECTRUM_PATH.indexOf("{output_id}"),
+);
 
 interface RealtimeResourceEvent {
+  artifact_path?: string;
+  content_digest?: ResourceRevision;
   resource_key?: string;
   revision?: ResourceRevision;
   seq?: ResourceRevision;
@@ -87,11 +114,14 @@ interface RealtimeResourceEvent {
 }
 
 interface RealtimeBatchChange {
+  artifact_path?: string;
   broad?: boolean;
+  content_digest?: ResourceRevision;
   domain_generation_id?: string | null;
   quantity_ids?: string[];
   resource?: string;
   resource_id?: string;
+  resource_key?: string;
   recommended_fetch?: string;
   revision: ResourceRevision;
 }
@@ -217,13 +247,32 @@ function realtimeBatchChange(change: unknown): RealtimeBatchChange | null {
   }
 
   const record = change as Record<string, unknown>;
-  const revision = record.revision;
+  const contentDigest = realtimeRevision(record.content_digest);
+  const revision = contentDigest ?? record.revision;
   if (typeof revision !== "number" && typeof revision !== "string") {
     return null;
   }
 
+  const resourceKey = canonicalFrequencyDomainResourceKey(
+    typeof record.resource_key === "string"
+      ? record.resource_key
+      : typeof record.artifact_path === "string"
+        ? record.artifact_path
+        : undefined,
+  );
+  const recommendedFetch = canonicalFrequencyDomainResourceKey(
+    typeof record.recommended_fetch === "string"
+      ? record.recommended_fetch
+      : undefined,
+  );
+
   return {
+    artifact_path:
+      typeof record.artifact_path === "string"
+        ? record.artifact_path
+        : undefined,
     broad: record.broad === true,
+    content_digest: contentDigest ?? undefined,
     domain_generation_id: realtimeDomainGenerationId(record.domain_generation_id),
     quantity_ids: Array.isArray(record.quantity_ids)
       ? record.quantity_ids.filter((value): value is string => typeof value === "string")
@@ -231,12 +280,22 @@ function realtimeBatchChange(change: unknown): RealtimeBatchChange | null {
     resource: typeof record.resource === "string" ? record.resource : undefined,
     resource_id:
       typeof record.resource_id === "string" ? record.resource_id : undefined,
+    resource_key:
+      resourceKey ??
+      (typeof record.resource_key === "string"
+        ? record.resource_key
+        : undefined),
     recommended_fetch:
-      typeof record.recommended_fetch === "string"
+      recommendedFetch ??
+      (typeof record.recommended_fetch === "string"
         ? record.recommended_fetch
-        : undefined,
+        : undefined),
     revision,
   };
+}
+
+function realtimeRevision(value: unknown): ResourceRevision | null {
+  return typeof value === "number" || typeof value === "string" ? value : null;
 }
 
 function realtimeDomainGenerationId(value: unknown): string | null {
@@ -333,6 +392,21 @@ const SESSION_STATUS_RECOMMENDED_FETCHES = new Set<string>([
   SIMULATION_STAGES_EXECUTION_PATH,
 ]);
 
+const MODEL_READINESS_DEPENDENCY_PATHS = [
+  MODEL_STUDY_PATH,
+  MODEL_MATERIAL_PATH,
+  MODEL_MAGNETIZATION_ASSET_PATH,
+  MODEL_OBJECT_GEOMETRY_PATH,
+  MODEL_OBJECT_INTERACTION_PATH,
+  MESHING_BUILDS_CURRENT_PATH,
+] as const;
+
+function isModelReadinessDependency(resourceKey: string): boolean {
+  return MODEL_READINESS_DEPENDENCY_PATHS.some((pathTemplate) =>
+    stageScopedRegex(pathTemplate).test(resourceKey),
+  );
+}
+
 function shouldInvalidateSessionStatus(recommendedFetch?: string): boolean {
   return (
     recommendedFetch !== undefined &&
@@ -376,6 +450,7 @@ export class RealtimeInvalidationBridge {
   private currentRunId: string | null = null;
   private currentSessionId: string | null = null;
   private flushCancel: (() => void) | null = null;
+  private pendingExactFetches = new Set<string>();
   private pendingFetches = new Map<string, ResourceRevision>();
   private pendingMatchers: Array<{
     fieldInvalidation?: "broad" | "exact";
@@ -400,6 +475,15 @@ export class RealtimeInvalidationBridge {
 
   getFieldInvalidationTelemetry(): FieldInvalidationTelemetry {
     return { ...this.fieldInvalidationTelemetry };
+  }
+
+  /**
+   * Reconnect is a transport boundary.  HTTP remains authoritative, so force
+   * the session status/current resources to refetch even when the socket did
+   * not deliver a hello or replay marker after the handshake.
+   */
+  handleReconnect(): void {
+    this.invalidateSessionScope(`realtime:reconnect:${Date.now()}`);
   }
 
   handleEvent(event: unknown): boolean {
@@ -439,7 +523,7 @@ export class RealtimeInvalidationBridge {
         if (!change) {
           continue;
         }
-        const recommendedFetch = change.recommended_fetch;
+        const recommendedFetch = change.recommended_fetch ?? change.resource_key;
         const fieldSampleChange =
           change.resource === "fields" && change.resource_id === "samples";
         const planarFieldChange = change.resource === "planar_fields";
@@ -518,17 +602,43 @@ export class RealtimeInvalidationBridge {
               );
             }
           }
-        } else if (recommendedFetch) {
-          this.queueResourceInvalidation(
-            recommendedFetch,
+        } else if (change.resource === "artifacts") {
+          if (recommendedFetch) {
+            this.queueResourceInvalidation(recommendedFetch, change.revision);
+          }
+          this.queuePrefixInvalidation(
+            ANTENNA_FIELD_SOLUTION_PREFIX,
             change.revision,
           );
+          this.queuePrefixInvalidation(
+            ANTENNA_STAGE_OUTPUT_CATALOG_PREFIX,
+            change.revision,
+          );
+          this.queuePrefixInvalidation(
+            ANTENNA_SOURCE_SPECTRUM_PREFIX,
+            change.revision,
+          );
+        } else if (recommendedFetch) {
           if (
             recommendedFetch === DATA_FIELDS_PATH &&
             change.resource === "fields" &&
             change.resource_id === "catalog"
           ) {
-            this.queueResourceInvalidation(DATA_QUANTITIES_PATH, change.revision);
+            this.queueExactResourceInvalidation(DATA_FIELDS_PATH, change.revision);
+            this.queueExactResourceInvalidation(
+              DATA_QUANTITIES_PATH,
+              change.revision,
+            );
+          } else if (
+            change.resource === "diagnostics" &&
+            (change.resource_id === "cpu" || change.resource_id === "gpu")
+          ) {
+            this.queueExactResourceInvalidation(
+              recommendedFetch,
+              change.revision,
+            );
+          } else {
+            this.queueResourceInvalidation(recommendedFetch, change.revision);
           }
         }
         handled = true;
@@ -555,11 +665,17 @@ export class RealtimeInvalidationBridge {
       return sessionHandled;
     }
 
-    if (!event.resource_key || event.revision === undefined) {
+    const resourceKey =
+      canonicalFrequencyDomainResourceKey(
+        event.resource_key ?? event.artifact_path,
+      ) ??
+      event.resource_key;
+    const revision = event.content_digest ?? event.revision;
+    if (!resourceKey || revision === undefined) {
       return sessionHandled;
     }
 
-    this.invalidateResource(event.resource_key, event.revision);
+    this.invalidateResource(resourceKey, revision);
     return true;
   }
 
@@ -612,6 +728,7 @@ export class RealtimeInvalidationBridge {
   }
 
   private invalidateSessionScope(revision: ResourceRevision): void {
+    this.resources.invalidate(SESSIONS_PATH, revision);
     this.resources.invalidate(SESSION_STATUS_RESOURCE_KEY, revision);
     this.resources.invalidatePrefix(SESSION_CURRENT_PATH, revision);
   }
@@ -624,6 +741,14 @@ export class RealtimeInvalidationBridge {
       resourceKey,
       latestRevision(this.pendingFetches.get(resourceKey) ?? null, revision),
     );
+  }
+
+  private queueExactResourceInvalidation(
+    resourceKey: string,
+    revision: ResourceRevision,
+  ): void {
+    this.pendingExactFetches.add(resourceKey);
+    this.queueResourceInvalidation(resourceKey, revision);
   }
 
   private recordFieldInvalidation(kind: "broad" | "exact"): void {
@@ -707,10 +832,12 @@ export class RealtimeInvalidationBridge {
   }
 
   private flushPendingInvalidations(): void {
+    const pendingExactFetches = this.pendingExactFetches;
     const pendingFetches = this.pendingFetches;
     const pendingPrefixes = this.pendingPrefixes;
     const pendingMatchers = this.pendingMatchers;
     let statusRevision = this.pendingStatusRevision;
+    this.pendingExactFetches = new Set<string>();
     this.pendingFetches = new Map<string, ResourceRevision>();
     this.pendingPrefixes = new Map();
     this.pendingMatchers = [];
@@ -718,9 +845,12 @@ export class RealtimeInvalidationBridge {
 
     for (const [resourceKey, revision] of pendingFetches) {
       this.invalidateResource(resourceKey, revision);
-      this.resources.invalidatePrefix(resourceKey, revision);
+      if (!pendingExactFetches.has(resourceKey)) {
+        this.resources.invalidatePrefix(resourceKey, revision);
+      }
       this.invalidateSceneDocumentDependents(resourceKey, revision);
       this.invalidateMeshBuildCompletionDependents(resourceKey, revision);
+      this.invalidateModelReadinessDependent(resourceKey, revision);
       this.invalidateFdmMembershipDependents(resourceKey, revision);
       this.invalidateHysteresisAnalysisDependents(resourceKey, revision);
       const dependentStatusRevision =
@@ -782,6 +912,7 @@ export class RealtimeInvalidationBridge {
     if (recommendedFetch !== MESHING_BUILDS_LATEST_SUCCESSFUL_PATH) return;
 
     this.resources.invalidate(MODEL_SCENE_PATH, revision);
+    this.resources.invalidate(MODEL_READINESS_PATH, revision);
     this.resources.invalidate(MESHING_BUILDS_CURRENT_PATH, revision);
     this.resources.invalidate(MESHING_SUMMARY_PATH, revision);
     this.resources.invalidate(MESHING_SEMANTICS_PATH, revision);
@@ -854,6 +985,9 @@ export class RealtimeInvalidationBridge {
     this.resources.invalidate(MODEL_REALIZED_REGIONS_PATH, dependentRevision);
     this.resources.invalidate(MODEL_REGION_DIAGNOSTICS_PATH, dependentRevision);
     this.resources.invalidate(MODEL_MATERIAL_FIELDS_PATH, dependentRevision);
+    this.resources.invalidate(MODEL_READINESS_PATH, dependentRevision);
+    // User-created Results nodes are stored in the scene document (ADR 0054).
+    this.resources.invalidate(ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH, dependentRevision);
     this.resources.invalidateMatching(
       (resourceKey) =>
         matchesStageScopedResource(
@@ -884,6 +1018,17 @@ export class RealtimeInvalidationBridge {
     );
   }
 
+  private invalidateModelReadinessDependent(
+    recommendedFetch: string,
+    revision: ResourceRevision,
+  ): void {
+    if (!isModelReadinessDependency(recommendedFetch)) return;
+    this.resources.invalidate(
+      MODEL_READINESS_PATH,
+      dependentResourceRevision(recommendedFetch, revision),
+    );
+  }
+
   private invalidateRuntimeLifecycleDependents(
     recommendedFetch: string,
     revision: ResourceRevision,
@@ -901,6 +1046,8 @@ export class RealtimeInvalidationBridge {
     if (recommendedFetch === SIMULATION_STAGES_EXECUTION_PATH) {
       this.resources.invalidate(SIMULATION_SOLVER_STATUS_PATH, dependentRevision);
       this.resources.invalidate(SIMULATION_COMMANDS_PATH, dependentRevision);
+      // Catalog, inspection metadata and payloads share the canonical stage prefix.
+      this.resources.invalidatePrefix(ANTENNA_STAGE_OUTPUT_CATALOG_PREFIX, dependentRevision);
       this.resources.invalidateMatching(
         (resourceKey) =>
           matchesStageScopedResource(

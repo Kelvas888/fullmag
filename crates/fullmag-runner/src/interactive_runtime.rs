@@ -13,9 +13,13 @@ use fullmag_ir::{BackendPlanIR, FdmPlanIR, FemPlanIR, OutputIR, ProblemIR};
 use crate::dispatch::{self, FdmEngine, FemEngine};
 use crate::fdm::cpu::reference as cpu_reference;
 #[cfg(feature = "cuda")]
-use crate::fdm::gpu::cuda::native::{NativeFdmBackend, NativeFdmPreviewSnapshot};
+use crate::fdm::gpu::cuda::artifacts::{
+    copy_cuda_field_snapshot_with_plan, copy_cuda_live_preview_field,
+};
 #[cfg(feature = "cuda")]
 use crate::fdm::gpu::cuda::native::residency::FdmGpuReceiptLifecycle;
+#[cfg(feature = "cuda")]
+use crate::fdm::gpu::cuda::native::{NativeFdmBackend, NativeFdmPreviewSnapshot};
 use crate::fem_baseline;
 #[cfg(feature = "fem-gpu")]
 use crate::native_fem::{DeviceInfo as FemDeviceInfo, NativeFemBackend};
@@ -34,9 +38,9 @@ use crate::schedules::{
     OutputSchedule,
 };
 use crate::types::{
-    ExecutedRun, ExecutionProvenance, FemStageExecutionContext, FieldSnapshot, LivePreviewField,
-    LivePreviewRequest, ResolvedFallback, RunError, RunResult, RunStatus, StateObservables,
-    StepAction, StepStats, StepUpdate,
+    ExecutedRun, ExecutionProvenance, FdmCpuStateLayoutProvenance, FemStageExecutionContext,
+    FieldSnapshot, LivePreviewField, LivePreviewRequest, ResolvedFallback, RunError, RunResult,
+    RunStatus, StateObservables, StepAction, StepStats, StepUpdate,
 };
 use crate::DisplaySelectionState;
 
@@ -76,14 +80,18 @@ pub(crate) fn cached_preview_quantities_for(
 
 fn interactive_time_event_schedule(
     drives: &[fullmag_ir::RegionalFieldDriveIR],
+    solved_bases: &[fullmag_ir::ResolvedSolvedAntennaDriveBasisIR],
     stage_start_s: f64,
+    waveform_origin_time_s: f64,
     duration_s: f64,
     output_periods_s: impl IntoIterator<Item = f64>,
 ) -> Vec<f64> {
     let stage_end_s = stage_start_s + duration_s;
-    let mut times = crate::time_events::build_resolved_stage_event_schedule(
+    let mut times = crate::time_events::build_resolved_stage_event_schedule_with_origin(
         drives,
+        solved_bases,
         stage_start_s,
+        waveform_origin_time_s,
         stage_end_s,
         &[],
         crate::schedules::OUTPUT_TIME_TOLERANCE,
@@ -230,10 +238,14 @@ mod tests {
         ExecutedRun, ExecutionProvenance, LivePreviewRequest, RunResult, StepAction, StepStats,
     };
     use fullmag_ir::{
-        BackendPlanIR, ExchangeBoundaryCondition, ExecutionPrecision, FdmMaterialIR, FdmPlanIR,
-        GridDimensions, IntegratorChoice, ProblemIR, RelaxationAlgorithmIR, RelaxationControlIR,
-        ResolvedAntennaZeemanMaskIR, TimeDependenceIR,
+        BackendPlanIR, ExchangeBoundaryCondition, ExecutionPrecision, FdmGridCertificateIR,
+        FdmMaterialIR, FdmPlanIR, GridDimensions, IntegratorChoice, ProblemIR,
+        RelaxationAlgorithmIR, RelaxationControlIR, ResolvedAntennaZeemanMaskIR,
+        ResolvedFrozenSpinsPlanIR, SelectionAuthoredFingerprintIR, SelectionCertificateIR,
+        TimeDependenceIR, RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION,
+        SELECTION_CERTIFICATE_SCHEMA_VERSION,
     };
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn interactive_fem_runtime_reuses_runtime_owned_stage_context() {
@@ -252,6 +264,26 @@ mod tests {
     }
 
     #[test]
+    fn interactive_fem_activation_materializes_continuation_before_native_create() {
+        let runner_source = include_str!("lib.rs");
+        let create = runner_source
+            .split("pub fn create_planned_interactive_runtime_with_stage_fem_mesh_asset_and_preview_cadence")
+            .nth(1)
+            .and_then(|tail| tail.split("/// Run a problem using a unified").next())
+            .expect("planned interactive runtime constructor");
+        let continuation = create
+            .find("activation_plan.initial_magnetization = magnetization.to_vec();")
+            .expect("FEM continuation must be materialized into the activation plan");
+        let native_create = create
+            .rfind("InteractiveFemPreviewRuntime::create_from_plan")
+            .expect("native FEM runtime creation");
+        assert!(
+            continuation < native_create,
+            "CaptureCurrentAtActivation must observe continuation before native FEM construction"
+        );
+    }
+
+    #[test]
     fn strict_interactive_fem_attaches_mfem_identity_before_recording_initial_fields() {
         let runtime_source = include_str!("interactive_runtime.rs");
         let version_attachment = runtime_source
@@ -266,6 +298,19 @@ mod tests {
 
         assert!(version_attachment < native_recorder);
         assert!(native_recorder < initial_fields);
+    }
+
+    fn interactive_fdm_grid_certificate() -> FdmGridCertificateIR {
+        FdmGridCertificateIR::new_with_masks(
+            [0.0; 3],
+            [4, 2, 1],
+            [2e-9; 3],
+            8,
+            8 * fullmag_plan::FDM_GRID_ESTIMATED_BYTES_PER_CELL,
+            None,
+            &[0; 8],
+        )
+        .expect("interactive FDM fixture grid certificate")
     }
 
     fn make_soa_fdm_plan() -> FdmPlanIR {
@@ -299,8 +344,471 @@ mod tests {
             adaptive_timestep: None,
             enable_exchange: true,
             enable_demag: true,
+            grid_certificate: Some(interactive_fdm_grid_certificate()),
             ..Default::default()
         }
+    }
+
+    fn recertify_interactive_fdm_grid_certificate(plan: &mut FdmPlanIR) {
+        let cost = fullmag_plan::checked_fdm_grid_cost(
+            plan.grid.cells,
+            fullmag_plan::FDM_GRID_ESTIMATED_BYTES_PER_CELL,
+        )
+        .expect("interactive FDM fixture grid cost should fit u64");
+        let total_cells_len = usize::try_from(cost.cells)
+            .expect("interactive FDM fixture cell count should fit usize");
+        assert_eq!(plan.region_mask.len(), total_cells_len);
+        if let Some(active_mask) = plan.active_mask.as_deref() {
+            assert_eq!(active_mask.len(), total_cells_len);
+        }
+        let active_cells = plan.active_mask.as_deref().map_or(cost.cells, |mask| {
+            u64::try_from(mask.iter().filter(|active| **active).count())
+                .expect("interactive FDM fixture active-cell count should fit u64")
+        });
+        plan.grid_certificate = Some(
+            FdmGridCertificateIR::new_with_masks(
+                plan.origin_m,
+                plan.grid.cells,
+                plan.cell_size,
+                active_cells,
+                cost.estimated_bytes,
+                plan.active_mask.as_deref(),
+                &plan.region_mask,
+            )
+            .expect("interactive FDM certificate should match the final fixture masks"),
+        );
+    }
+
+    fn resolved_frozen_spins(mask: Vec<bool>) -> ResolvedFrozenSpinsPlanIR {
+        let grid_fingerprint = interactive_fdm_grid_certificate().grid_fingerprint;
+        let active_dof_count = mask.len() as u64;
+        let frozen_dof_count = mask.iter().filter(|frozen| **frozen).count() as u64;
+        let free_dof_count = active_dof_count - frozen_dof_count;
+        let mut hash = Sha256::new();
+        hash.update(active_dof_count.to_le_bytes());
+        hash.update(
+            mask.iter()
+                .map(|frozen| u8::from(*frozen))
+                .collect::<Vec<_>>(),
+        );
+        let mask_sha256 = format!("{:x}", hash.finalize());
+        ResolvedFrozenSpinsPlanIR {
+            schema_version: RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION.to_string(),
+            constraint_ids: vec!["stage-pin".to_string()],
+            frozen_mask: mask,
+            active_dof_count,
+            frozen_dof_count,
+            free_dof_count,
+            mask_sha256: mask_sha256.clone(),
+            grid_or_mesh_fingerprint: grid_fingerprint.clone(),
+            source_state_revision: Some(1),
+            all_active_dofs_frozen: active_dof_count > 0 && free_dof_count == 0,
+            certificate: SelectionCertificateIR {
+                schema_version: SELECTION_CERTIFICATE_SCHEMA_VERSION.to_string(),
+                evaluator_id: "selection.fdm_cell_center.v1".to_string(),
+                constraint_ids: vec!["stage-pin".to_string()],
+                authored_fingerprints: vec![SelectionAuthoredFingerprintIR {
+                    constraint_id: "stage-pin".to_string(),
+                    selector_sha256: "a".repeat(64),
+                }],
+                raw_candidate_dof_count: frozen_dof_count,
+                inactive_candidate_dof_count: 0,
+                active_dof_count,
+                frozen_dof_count,
+                free_dof_count,
+                bounds_m: None,
+                grid_or_mesh_fingerprint: grid_fingerprint,
+                source_state_revision: Some(1),
+                mask_sha256,
+                resolved_reference_sha256: "b".repeat(64),
+                warnings: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn interactive_fdm_frozen_spins_fixture_has_authoritative_topology_anchor() {
+        let mut plan = make_soa_fdm_plan();
+        plan.frozen_spins = Some(resolved_frozen_spins(vec![
+            true, false, false, false, false, false, false, false,
+        ]));
+
+        let grid_certificate = plan
+            .grid_certificate
+            .as_ref()
+            .expect("interactive Frozen Spins fixture must carry a grid certificate");
+        grid_certificate
+            .validate_against_masks(plan.active_mask.as_deref(), &plan.region_mask)
+            .expect("interactive grid certificate must match its realized masks");
+        let frozen_spins = plan
+            .frozen_spins
+            .as_ref()
+            .expect("interactive Frozen Spins fixture");
+        frozen_spins
+            .validate_intrinsic()
+            .expect("interactive Frozen Spins carrier must be intrinsically valid");
+        frozen_spins
+            .validate_against_active_mask(&vec![true; plan.initial_magnetization.len()])
+            .expect("interactive Frozen Spins carrier must match the active domain");
+        assert_eq!(
+            frozen_spins.grid_or_mesh_fingerprint,
+            grid_certificate.grid_fingerprint
+        );
+    }
+
+    #[test]
+    fn interactive_cpu_runtime_preserves_frozen_spin_epoch_across_stage_gap() {
+        let mut active_plan = make_soa_fdm_plan();
+        active_plan.enable_demag = false;
+        active_plan.frozen_spins = Some(resolved_frozen_spins(vec![
+            true, false, false, false, false, false, false, false,
+        ]));
+        let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
+            &active_plan,
+            FdmEngine::CpuReference,
+            None,
+            "cpu",
+            fullmag_ir::ExecutionMode::Extended,
+        )
+        .expect("create persistent CPU runtime");
+
+        let cpu = match &runtime.inner {
+            InteractiveFdmPreviewRuntimeInner::Cpu(cpu) => cpu,
+            #[cfg(feature = "cuda")]
+            InteractiveFdmPreviewRuntimeInner::Cuda(_) => panic!("test requested the CPU runtime"),
+        };
+        let initial = cpu.problem.frozen_spins().expect("stage A constraint");
+        assert_eq!(initial.constraint_activation_epochs()["stage-pin"], 1);
+        let initial_reference = initial.reference()[0];
+
+        let mut inactive_plan = active_plan.clone();
+        inactive_plan.frozen_spins = None;
+        runtime
+            .apply_stage_plan(&inactive_plan)
+            .expect("deactivate for stage B");
+        let inactive_status = runtime
+            .frozen_spins_runtime_status()
+            .expect("retained inactive-stage certificate");
+        assert!(inactive_status.active_constraint_ids.is_empty());
+        assert_eq!(inactive_status.frozen_site_count, 0);
+        assert_eq!(inactive_status.free_site_count, 8);
+        assert_eq!(inactive_status.resolved_constraint_set_revision, 2);
+        let replacement = vec![[0.0, 1.0, 0.0]; 8];
+        runtime
+            .upload_magnetization(&replacement)
+            .expect("load stage B continuation state");
+        runtime
+            .apply_stage_plan(&active_plan)
+            .expect("reactivate for stage C");
+
+        let cpu = match &runtime.inner {
+            InteractiveFdmPreviewRuntimeInner::Cpu(cpu) => cpu,
+            #[cfg(feature = "cuda")]
+            InteractiveFdmPreviewRuntimeInner::Cuda(_) => panic!("test requested the CPU runtime"),
+        };
+        let reentered = cpu.problem.frozen_spins().expect("stage C constraint");
+        assert_eq!(reentered.constraint_activation_epochs()["stage-pin"], 2);
+        assert_eq!(reentered.reference()[0], replacement[0]);
+        assert_ne!(reentered.reference()[0], initial_reference);
+        assert_eq!(reentered.resolved_constraint_set_revision(), 3);
+        let status = runtime
+            .frozen_spins_runtime_status()
+            .expect("stage C activation certificate");
+        assert_eq!(status.constraint_activation_epochs["stage-pin"], 2);
+        assert_eq!(status.resolved_constraint_set_revision, 3);
+        assert_eq!(status.frozen_site_count, 1);
+        assert_eq!(status.free_site_count, 7);
+        assert_eq!(status.vector_dimension, 3);
+        assert_eq!(status.scalar_component_dof_count, 24);
+    }
+
+    #[test]
+    fn interactive_cpu_explicit_reactivation_recaptures_same_mask_and_advances_epoch() {
+        let mut plan = make_soa_fdm_plan();
+        plan.enable_demag = false;
+        plan.frozen_spins = Some(resolved_frozen_spins(vec![
+            true, false, false, false, false, false, false, false,
+        ]));
+        let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
+            &plan,
+            FdmEngine::CpuReference,
+            None,
+            "cpu",
+            fullmag_ir::ExecutionMode::Extended,
+        )
+        .expect("create persistent CPU runtime");
+        assert!(runtime.supports_frozen_spins_reactivation_in_place());
+
+        let replacement = vec![[0.0, 0.6, 0.8]; 8];
+        runtime
+            .upload_magnetization(&replacement)
+            .expect("install continuation before explicit reactivation");
+        runtime
+            .apply_frozen_spins_reactivation_plan(&plan)
+            .expect("explicitly reactivate the unchanged resolved mask");
+
+        let cpu = match &runtime.inner {
+            InteractiveFdmPreviewRuntimeInner::Cpu(cpu) => cpu,
+            #[cfg(feature = "cuda")]
+            InteractiveFdmPreviewRuntimeInner::Cuda(_) => panic!("test requested the CPU runtime"),
+        };
+        let reactivated = cpu.problem.frozen_spins().expect("reactivated constraint");
+        assert_eq!(reactivated.constraint_activation_epochs()["stage-pin"], 2);
+        assert_eq!(reactivated.resolved_constraint_set_revision(), 2);
+        assert_eq!(reactivated.reference()[0], replacement[0]);
+        let status = runtime
+            .frozen_spins_runtime_status()
+            .expect("solver-owned reactivation status");
+        assert_eq!(status.constraint_activation_epochs["stage-pin"], 2);
+        assert_eq!(status.resolved_constraint_set_revision, 2);
+
+        let carried = crate::constraints::FrozenSpinsActivationSet::default()
+            .prepare_transition(["stage-pin".to_string()])
+            .and_then(|set| set.prepare_reactivation(["stage-pin".to_string()]))
+            .expect("pre-existing native-style activation history");
+        let backend = InteractiveFdmPreviewRuntime::from_fdm_plan(
+            &plan,
+            FdmEngine::CpuReference,
+            None,
+            "cpu",
+            fullmag_ir::ExecutionMode::Extended,
+        )
+        .expect("create replacement backend");
+        let mut unified =
+            crate::interactive::runtime::InteractiveRuntime::new_with_frozen_spins_activation_set(
+                Box::new(backend),
+                Some(carried),
+                false,
+            )
+            .expect("carry activation history into replacement runtime");
+        unified
+            .upload_magnetization(&replacement)
+            .expect("install replacement continuation");
+        let execution_plan = fullmag_ir::ExecutionPlanIR {
+            common: fullmag_ir::CommonPlanMeta {
+                ir_version: fullmag_ir::IR_VERSION.to_string(),
+                requested_backend: fullmag_ir::BackendTarget::Fdm,
+                resolved_backend: fullmag_ir::BackendTarget::Fdm,
+                execution_mode: fullmag_ir::ExecutionMode::Extended,
+                material_field_plans: Vec::new(),
+            },
+            backend_plan: BackendPlanIR::Fdm(plan.clone()),
+            output_plan: fullmag_ir::OutputPlanIR {
+                outputs: Vec::new(),
+            },
+            provenance: fullmag_ir::ProvenancePlanIR::default(),
+        };
+        unified
+            .apply_frozen_spins_reactivation_plan(&execution_plan)
+            .expect("reactivate after carrying native-style history");
+        let carried_status = unified
+            .frozen_spins_runtime_status()
+            .expect("carried solver-owned status");
+        assert_eq!(carried_status.constraint_activation_epochs["stage-pin"], 3);
+        assert_eq!(carried_status.resolved_constraint_set_revision, 4);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn interactive_cuda_rebuild_reactivation_preserves_continuation_epoch_and_quantity() {
+        let mut initial_plan = make_soa_fdm_plan();
+        initial_plan.enable_demag = false;
+        initial_plan.frozen_spins = Some(resolved_frozen_spins(vec![
+            true, false, false, false, false, false, false, false,
+        ]));
+        let initial_backend = InteractiveFdmPreviewRuntime::from_fdm_plan(
+            &initial_plan,
+            FdmEngine::CudaFdm,
+            None,
+            "cuda",
+            fullmag_ir::ExecutionMode::Extended,
+        )
+        .expect("create initial native CUDA runtime");
+        let mut initial_runtime =
+            crate::interactive::runtime::InteractiveRuntime::new_with_frozen_spins_activation_set(
+                Box::new(initial_backend),
+                None,
+                false,
+            )
+            .expect("publish initial CUDA activation metadata");
+        let initial_status = initial_runtime
+            .frozen_spins_runtime_status()
+            .expect("initial CUDA solver-owned status");
+        assert_eq!(initial_status.constraint_activation_epochs["stage-pin"], 1);
+        assert_eq!(initial_status.resolved_constraint_set_revision, 1);
+
+        let continuation = vec![[0.0, 0.6, 0.8]; 8];
+        initial_runtime
+            .upload_magnetization(&continuation)
+            .expect("install accepted-step continuation on CUDA");
+        let continuation_field = initial_runtime
+            .snapshot_preview(&LivePreviewRequest {
+                quantity: "m".to_string(),
+                ..Default::default()
+            })
+            .expect("snapshot CUDA continuation before rebuild");
+        assert_eq!(
+            continuation_field.vector_field_values,
+            continuation.concat()
+        );
+
+        let carried = initial_runtime.frozen_spins_activation_set().clone();
+        let mut reactivation_plan = initial_plan.clone();
+        reactivation_plan.initial_magnetization = continuation.clone();
+        let reactivated_backend = InteractiveFdmPreviewRuntime::from_fdm_plan(
+            &reactivation_plan,
+            FdmEngine::CudaFdm,
+            None,
+            "cuda",
+            fullmag_ir::ExecutionMode::Extended,
+        )
+        .expect("rebuild native CUDA runtime from accepted-step continuation");
+        let mut reactivated_runtime =
+            crate::interactive::runtime::InteractiveRuntime::new_with_frozen_spins_activation_set(
+                Box::new(reactivated_backend),
+                Some(carried),
+                true,
+            )
+            .expect("publish explicit CUDA reactivation metadata");
+        let reactivated_status = reactivated_runtime
+            .frozen_spins_runtime_status()
+            .expect("reactivated CUDA solver-owned status");
+        assert_eq!(
+            reactivated_status.constraint_activation_epochs["stage-pin"],
+            2
+        );
+        assert_eq!(reactivated_status.resolved_constraint_set_revision, 2);
+        assert_eq!(reactivated_status.mask_sha256, initial_status.mask_sha256);
+        assert_ne!(
+            reactivated_status.reference_sha256,
+            initial_status.reference_sha256
+        );
+
+        let reactivated_m = reactivated_runtime
+            .snapshot_preview(&LivePreviewRequest {
+                quantity: "m".to_string(),
+                ..Default::default()
+            })
+            .expect("snapshot CUDA continuation after rebuild");
+        assert_eq!(reactivated_m.vector_field_values, continuation.concat());
+        let frozen_quantity = reactivated_runtime
+            .snapshot_preview(&LivePreviewRequest {
+                quantity: "frozen_spins".to_string(),
+                ..Default::default()
+            })
+            .expect("snapshot solver-owned Frozen Spins quantity after rebuild");
+        assert_eq!(frozen_quantity.quantity, "frozen_spins");
+        assert_eq!(frozen_quantity.unit, "1");
+        assert_eq!(
+            frozen_quantity.vector_field_values,
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
+    }
+
+    #[cfg(feature = "fem-gpu")]
+    #[test]
+    fn interactive_fem_gpu_rebuild_reactivation_preserves_continuation_epoch_and_quantity() {
+        let mut initial_plan = crate::dispatch::test_tiny_fem_plan();
+        let mesh_fingerprint = initial_plan
+            .mesh
+            .mixed_topology_fingerprint_v3()
+            .expect("fingerprint the serial-P1 FEM carrier");
+        let mut frozen_spins = resolved_frozen_spins(vec![true, false, false, false]);
+        frozen_spins.grid_or_mesh_fingerprint = mesh_fingerprint.clone();
+        frozen_spins.certificate.grid_or_mesh_fingerprint = mesh_fingerprint;
+        frozen_spins.certificate.evaluator_id = "selection.fem_p1_true_dof.v1".to_string();
+        initial_plan.frozen_spins = Some(frozen_spins);
+
+        let initial_backend = super::InteractiveFemPreviewRuntime::from_fem_plan(
+            &initial_plan,
+            crate::dispatch::FemEngine::NativeGpu,
+            None,
+            None,
+            None,
+            fullmag_ir::ExecutionMode::Extended,
+        )
+        .expect("create initial native FEM GPU runtime");
+        let mut initial_runtime =
+            crate::interactive::runtime::InteractiveRuntime::new_with_frozen_spins_activation_set(
+                Box::new(initial_backend),
+                None,
+                false,
+            )
+            .expect("publish initial FEM GPU activation metadata");
+        let initial_status = initial_runtime
+            .frozen_spins_runtime_status()
+            .expect("initial FEM GPU solver-owned status");
+        assert_eq!(initial_status.constraint_activation_epochs["stage-pin"], 1);
+        assert_eq!(initial_status.resolved_constraint_set_revision, 1);
+
+        let continuation = vec![[0.0, 0.6, 0.8]; 4];
+        initial_runtime
+            .upload_magnetization(&continuation)
+            .expect("install accepted-step continuation on FEM GPU");
+        let continuation_field = initial_runtime
+            .snapshot_preview(&LivePreviewRequest {
+                quantity: "m".to_string(),
+                ..Default::default()
+            })
+            .expect("snapshot FEM GPU continuation before rebuild");
+        assert_eq!(
+            continuation_field.vector_field_values,
+            continuation.concat()
+        );
+
+        let carried = initial_runtime.frozen_spins_activation_set().clone();
+        let mut reactivation_plan = initial_plan.clone();
+        reactivation_plan.initial_magnetization = continuation.clone();
+        let reactivated_backend = super::InteractiveFemPreviewRuntime::from_fem_plan(
+            &reactivation_plan,
+            crate::dispatch::FemEngine::NativeGpu,
+            None,
+            None,
+            None,
+            fullmag_ir::ExecutionMode::Extended,
+        )
+        .expect("rebuild native FEM GPU runtime from accepted-step continuation");
+        let mut reactivated_runtime =
+            crate::interactive::runtime::InteractiveRuntime::new_with_frozen_spins_activation_set(
+                Box::new(reactivated_backend),
+                Some(carried),
+                true,
+            )
+            .expect("publish explicit FEM GPU reactivation metadata");
+        let reactivated_status = reactivated_runtime
+            .frozen_spins_runtime_status()
+            .expect("reactivated FEM GPU solver-owned status");
+        assert_eq!(
+            reactivated_status.constraint_activation_epochs["stage-pin"],
+            2
+        );
+        assert_eq!(reactivated_status.resolved_constraint_set_revision, 2);
+        assert_eq!(reactivated_status.mask_sha256, initial_status.mask_sha256);
+        assert_ne!(
+            reactivated_status.reference_sha256,
+            initial_status.reference_sha256
+        );
+
+        let reactivated_m = reactivated_runtime
+            .snapshot_preview(&LivePreviewRequest {
+                quantity: "m".to_string(),
+                ..Default::default()
+            })
+            .expect("snapshot FEM GPU continuation after rebuild");
+        assert_eq!(reactivated_m.vector_field_values, continuation.concat());
+        let frozen_quantity = reactivated_runtime
+            .snapshot_preview(&LivePreviewRequest {
+                quantity: "frozen_spins".to_string(),
+                ..Default::default()
+            })
+            .expect("snapshot solver-owned FEM Frozen Spins quantity after rebuild");
+        assert_eq!(frozen_quantity.quantity, "frozen_spins");
+        assert_eq!(frozen_quantity.unit, "1");
+        assert_eq!(
+            frozen_quantity.vector_field_values,
+            vec![1.0, 0.0, 0.0, 0.0]
+        );
+        assert_eq!(frozen_quantity.active_mask, Some(vec![true; 4]));
     }
 
     #[test]
@@ -437,6 +945,7 @@ mod tests {
                 boundary_correction: None,
                 boundary_phi_floor: None,
                 boundary_delta_min: None,
+                projection_policy: None,
             }),
             fem: Some(FemHintsIR {
                 order: 1,
@@ -650,15 +1159,14 @@ mod tests {
     #[test]
     fn cpu_interactive_runtime_keeps_supported_fdm_segment_on_persistent_soa_state() {
         let plan = make_soa_fdm_plan();
-        let mut runtime =
-            InteractiveFdmPreviewRuntime::from_fdm_plan(
-                &plan,
-                FdmEngine::CpuReference,
-                None,
-                "cpu",
-                fullmag_ir::ExecutionMode::Strict,
-            )
-                .expect("CPU interactive runtime should build");
+        let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
+            &plan,
+            FdmEngine::CpuReference,
+            None,
+            "cpu",
+            fullmag_ir::ExecutionMode::Strict,
+        )
+        .expect("CPU interactive runtime should build");
         let cpu = match &mut runtime.inner {
             InteractiveFdmPreviewRuntimeInner::Cpu(cpu) => cpu,
             #[cfg(feature = "cuda")]
@@ -667,6 +1175,15 @@ mod tests {
             }
         };
         assert!(cpu.soa_fast_path_active());
+        let layout = cpu
+            .provenance
+            .fdm_cpu_state_layout
+            .as_ref()
+            .expect("CPU interactive runtime must publish its state layout");
+        assert_eq!(layout.requested, "auto");
+        assert_eq!(layout.resolved, "soa_xyz");
+        assert_eq!(layout.executed, "soa_xyz");
+        assert_eq!(layout.rejection_reason, None);
 
         let display_selection = || {
             let mut state = DisplaySelectionState::default();
@@ -720,15 +1237,15 @@ mod tests {
             }),
             field_xyz: vec![[0.0, 250.0, -125.0]; plan.initial_magnetization.len()],
         }];
-        let mut runtime =
-            InteractiveFdmPreviewRuntime::from_fdm_plan(
-                &plan,
-                FdmEngine::CpuReference,
-                None,
-                "cpu",
-                fullmag_ir::ExecutionMode::Strict,
-            )
-                .expect("CPU interactive runtime should build");
+        recertify_interactive_fdm_grid_certificate(&mut plan);
+        let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
+            &plan,
+            FdmEngine::CpuReference,
+            None,
+            "cpu",
+            fullmag_ir::ExecutionMode::Strict,
+        )
+        .expect("CPU interactive runtime should build");
         let display_selection = || {
             let mut state = DisplaySelectionState::default();
             state.selection.quantity = "E_total".to_string();
@@ -918,15 +1435,14 @@ mod tests {
             let mut execution_plan = fullmag_plan::plan(&ProblemIR::bootstrap_example())
                 .expect("bootstrap execution plan");
             execution_plan.backend_plan = BackendPlanIR::Fdm(plan.clone());
-            let mut runtime =
-                InteractiveFdmPreviewRuntime::from_fdm_plan(
-                    &plan,
-                    FdmEngine::CpuReference,
-                    None,
-                    "cpu",
-                    fullmag_ir::ExecutionMode::Strict,
-                )
-                    .expect("CPU interactive runtime should build");
+            let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
+                &plan,
+                FdmEngine::CpuReference,
+                None,
+                "cpu",
+                fullmag_ir::ExecutionMode::Strict,
+            )
+            .expect("CPU interactive runtime should build");
             let executed = ExecutedRun {
                 result: RunResult {
                     status,
@@ -970,15 +1486,14 @@ mod tests {
         }
 
         let plan = make_soa_fdm_plan();
-        let mut runtime =
-            InteractiveFdmPreviewRuntime::from_fdm_plan(
-                &plan,
-                FdmEngine::CudaFdm,
-                None,
-                "gpu",
-                fullmag_ir::ExecutionMode::Strict,
-            )
-                .expect("CUDA interactive runtime should build");
+        let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
+            &plan,
+            FdmEngine::CudaFdm,
+            None,
+            "gpu",
+            fullmag_ir::ExecutionMode::Strict,
+        )
+        .expect("CUDA interactive runtime should build");
         let display_selection = || DisplaySelectionState::default();
         let mut backend_terminal_batches = 0;
         let executed = runtime
@@ -1046,15 +1561,14 @@ mod tests {
     #[test]
     fn cpu_interactive_snapshot_preview_m_uses_direct_state_without_reobserving_state() {
         let plan = make_soa_fdm_plan();
-        let mut runtime =
-            InteractiveFdmPreviewRuntime::from_fdm_plan(
-                &plan,
-                FdmEngine::CpuReference,
-                None,
-                "cpu",
-                fullmag_ir::ExecutionMode::Strict,
-            )
-                .expect("CPU interactive runtime should build");
+        let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
+            &plan,
+            FdmEngine::CpuReference,
+            None,
+            "cpu",
+            fullmag_ir::ExecutionMode::Strict,
+        )
+        .expect("CPU interactive runtime should build");
 
         reset_observe_state_calls();
         let preview = runtime
@@ -1078,15 +1592,14 @@ mod tests {
     fn cpu_interactive_snapshot_vector_fields_share_direct_effective_field_cache_without_reobserving_state(
     ) {
         let plan = make_soa_fdm_plan();
-        let mut runtime =
-            InteractiveFdmPreviewRuntime::from_fdm_plan(
-                &plan,
-                FdmEngine::CpuReference,
-                None,
-                "cpu",
-                fullmag_ir::ExecutionMode::Strict,
-            )
-                .expect("CPU interactive runtime should build");
+        let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
+            &plan,
+            FdmEngine::CpuReference,
+            None,
+            "cpu",
+            fullmag_ir::ExecutionMode::Strict,
+        )
+        .expect("CPU interactive runtime should build");
 
         reset_observe_state_calls();
         reset_direct_field_assembly_calls();
@@ -1130,15 +1643,15 @@ mod tests {
         plan.initial_magnetization = std::iter::once([1.0, 0.0, 0.0])
             .chain(std::iter::repeat_n([0.0, 0.0, 0.0], 7))
             .collect();
-        let mut runtime =
-            InteractiveFdmPreviewRuntime::from_fdm_plan(
-                &plan,
-                FdmEngine::CpuReference,
-                None,
-                "cpu",
-                fullmag_ir::ExecutionMode::Strict,
-            )
-                .expect("CPU interactive runtime should build");
+        recertify_interactive_fdm_grid_certificate(&mut plan);
+        let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
+            &plan,
+            FdmEngine::CpuReference,
+            None,
+            "cpu",
+            fullmag_ir::ExecutionMode::Strict,
+        )
+        .expect("CPU interactive runtime should build");
         let cpu = match &mut runtime.inner {
             InteractiveFdmPreviewRuntimeInner::Cpu(cpu) => cpu,
             #[cfg(feature = "cuda")]
@@ -1178,15 +1691,15 @@ mod tests {
         plan.initial_magnetization = std::iter::once([1.0, 0.0, 0.0])
             .chain(std::iter::repeat_n([0.0, 0.0, 0.0], 7))
             .collect();
-        let mut runtime =
-            InteractiveFdmPreviewRuntime::from_fdm_plan(
-                &plan,
-                FdmEngine::CpuReference,
-                None,
-                "cpu",
-                fullmag_ir::ExecutionMode::Strict,
-            )
-                .expect("CPU interactive runtime should build");
+        recertify_interactive_fdm_grid_certificate(&mut plan);
+        let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
+            &plan,
+            FdmEngine::CpuReference,
+            None,
+            "cpu",
+            fullmag_ir::ExecutionMode::Strict,
+        )
+        .expect("CPU interactive runtime should build");
         let display_selection = || {
             let mut state = DisplaySelectionState::default();
             state.selection.quantity = "H_demag".to_string();
@@ -1226,15 +1739,14 @@ mod tests {
     #[test]
     fn cpu_interactive_snapshot_step_stats_uses_last_step_report_without_reobserving_state() {
         let plan = make_soa_fdm_plan();
-        let mut runtime =
-            InteractiveFdmPreviewRuntime::from_fdm_plan(
-                &plan,
-                FdmEngine::CpuReference,
-                None,
-                "cpu",
-                fullmag_ir::ExecutionMode::Strict,
-            )
-                .expect("CPU interactive runtime should build");
+        let mut runtime = InteractiveFdmPreviewRuntime::from_fdm_plan(
+            &plan,
+            FdmEngine::CpuReference,
+            None,
+            "cpu",
+            fullmag_ir::ExecutionMode::Strict,
+        )
+        .expect("CPU interactive runtime should build");
         let display_selection = || {
             let mut state = DisplaySelectionState::default();
             state.selection.quantity = "E_total".to_string();
@@ -1287,6 +1799,7 @@ struct CpuInteractiveFdmPreviewRuntime {
     integrator_buffers: IntegratorBuffers,
     original_grid: [u32; 3],
     plan_signature: FdmPlanIR,
+    frozen_spins_identity_plan: Option<fullmag_ir::ResolvedFrozenSpinsPlanIR>,
     provenance: ExecutionProvenance,
     total_steps: u64,
 }
@@ -1300,11 +1813,15 @@ struct CudaInteractiveFdmPreviewRuntime {
     provenance: ExecutionProvenance,
     total_steps: u64,
     total_time: f64,
+    frozen_spins_identity_plan: Option<fullmag_ir::ResolvedFrozenSpinsPlanIR>,
+    frozen_spins_state: Option<fullmag_engine::FrozenSpinsState>,
 }
 
 pub struct InteractiveFemPreviewRuntime {
     inner: InteractiveFemPreviewRuntimeInner,
     stage_context: FemStageExecutionContext,
+    frozen_spins_identity_plan: Option<fullmag_ir::ResolvedFrozenSpinsPlanIR>,
+    frozen_spins_state: Option<fullmag_engine::FrozenSpinsState>,
 }
 
 enum InteractiveFemPreviewRuntimeInner {
@@ -1378,6 +1895,7 @@ impl InteractiveFdmPreviewRuntime {
         requested_device: &str,
         execution_mode: fullmag_ir::ExecutionMode,
     ) -> Result<Self, RunError> {
+        let _ = (requested_device, execution_mode);
         let inner = match engine {
             FdmEngine::CpuReference => {
                 let (problem, state) = cpu_reference::build_snapshot_problem_and_state(plan)?;
@@ -1389,6 +1907,11 @@ impl InteractiveFdmPreviewRuntime {
                 let fft_workspace = problem.create_workspace();
                 let integrator_buffers = problem.create_integrator_buffers();
                 let mut provenance = cpu_execution_provenance(plan)?;
+                provenance.fdm_cpu_state_layout = Some(FdmCpuStateLayoutProvenance::from_problem(
+                    &problem,
+                    state_soa.is_some(),
+                    None,
+                ));
                 attach_resolved_fallback_to_provenance(&mut provenance, fallback);
                 InteractiveFdmPreviewRuntimeInner::Cpu(CpuInteractiveFdmPreviewRuntime {
                     problem,
@@ -1399,6 +1922,7 @@ impl InteractiveFdmPreviewRuntime {
                     integrator_buffers,
                     original_grid: plan.grid.cells,
                     plan_signature: normalize_plan_signature(plan),
+                    frozen_spins_identity_plan: plan.frozen_spins.clone(),
                     provenance,
                     total_steps: 0,
                 })
@@ -1406,15 +1930,27 @@ impl InteractiveFdmPreviewRuntime {
             FdmEngine::CudaFdm => {
                 #[cfg(feature = "cuda")]
                 {
+                    let frozen_spins_state = plan
+                        .frozen_spins
+                        .as_ref()
+                        .map(|frozen_plan| {
+                            fullmag_engine::FrozenSpinsState::capture_at_activation(
+                                frozen_plan,
+                                plan.active_mask.as_deref(),
+                                &plan.initial_magnetization,
+                            )
+                            .map_err(|error| RunError {
+                                message: format!(
+                                    "interactive CUDA Frozen Spins activation metadata failed: {error}"
+                                ),
+                            })
+                        })
+                        .transpose()?;
                     let backend = NativeFdmBackend::create(plan)?;
                     let device_info = backend.device_info()?;
                     let mut provenance = cuda_execution_provenance(plan, &device_info)?;
                     let (receipt_lifecycle, initial_receipt) =
-                        FdmGpuReceiptLifecycle::begin(
-                            &backend,
-                            requested_device,
-                            execution_mode,
-                        )?;
+                        FdmGpuReceiptLifecycle::begin(&backend, requested_device, execution_mode)?;
                     provenance.fdm_gpu_execution_receipt = Some(initial_receipt);
                     attach_resolved_fallback_to_provenance(&mut provenance, fallback);
                     InteractiveFdmPreviewRuntimeInner::Cuda(CudaInteractiveFdmPreviewRuntime {
@@ -1425,6 +1961,8 @@ impl InteractiveFdmPreviewRuntime {
                         provenance,
                         total_steps: 0,
                         total_time: 0.0,
+                        frozen_spins_identity_plan: plan.frozen_spins.clone(),
+                        frozen_spins_state,
                     })
                 }
                 #[cfg(not(feature = "cuda"))]
@@ -1452,15 +1990,60 @@ impl InteractiveFdmPreviewRuntime {
     }
 
     pub fn can_continue_with_plan(&self, plan: &FdmPlanIR) -> bool {
-        let normalized = normalize_runtime_context_signature(plan);
         match &self.inner {
             InteractiveFdmPreviewRuntimeInner::Cpu(runtime) => {
-                normalize_runtime_context_signature(&runtime.plan_signature) == normalized
+                normalize_cpu_runtime_context_signature(&runtime.plan_signature)
+                    == normalize_cpu_runtime_context_signature(plan)
             }
             #[cfg(feature = "cuda")]
             InteractiveFdmPreviewRuntimeInner::Cuda(runtime) => {
-                normalize_runtime_context_signature(&runtime.plan_signature) == normalized
+                normalize_runtime_context_signature(&runtime.plan_signature)
+                    == normalize_runtime_context_signature(plan)
             }
+        }
+    }
+
+    /// Apply a compatible stage plan to solver-owned state. CPU FDM supports
+    /// an atomic frozen-spin active-set transition. CUDA keeps the stricter
+    /// compatibility rule until its native backend exposes an equivalent
+    /// transition API, so changed constraints are rebuilt rather than applied
+    /// partially.
+    pub fn apply_stage_plan(&mut self, plan: &FdmPlanIR) -> Result<(), RunError> {
+        match &mut self.inner {
+            InteractiveFdmPreviewRuntimeInner::Cpu(runtime) => runtime.apply_stage_plan(plan),
+            #[cfg(feature = "cuda")]
+            InteractiveFdmPreviewRuntimeInner::Cuda(runtime) => {
+                if normalize_runtime_context_signature(&runtime.plan_signature)
+                    != normalize_runtime_context_signature(plan)
+                {
+                    return Err(RunError {
+                        message: "interactive CUDA FDM runtime context mismatch; caller must rebuild runtime before applying the stage plan".to_string(),
+                    });
+                }
+                runtime.plan_signature = normalize_plan_signature(plan);
+                Ok(())
+            }
+        }
+    }
+
+    pub fn supports_frozen_spins_reactivation_in_place(&self) -> bool {
+        matches!(self.inner, InteractiveFdmPreviewRuntimeInner::Cpu(_))
+    }
+
+    pub fn apply_frozen_spins_reactivation_plan(
+        &mut self,
+        plan: &FdmPlanIR,
+    ) -> Result<(), RunError> {
+        match &mut self.inner {
+            InteractiveFdmPreviewRuntimeInner::Cpu(runtime) => {
+                runtime.apply_frozen_spins_reactivation_plan(plan)
+            }
+            #[cfg(feature = "cuda")]
+            InteractiveFdmPreviewRuntimeInner::Cuda(_) => Err(RunError {
+                message:
+                    "interactive CUDA FDM requires rebuild for explicit Frozen Spins reactivation"
+                        .to_string(),
+            }),
         }
     }
 
@@ -1469,6 +2052,28 @@ impl InteractiveFdmPreviewRuntime {
             InteractiveFdmPreviewRuntimeInner::Cpu(runtime) => runtime.provenance.clone(),
             #[cfg(feature = "cuda")]
             InteractiveFdmPreviewRuntimeInner::Cuda(runtime) => runtime.provenance.clone(),
+        }
+    }
+
+    pub fn frozen_spins_runtime_status(
+        &self,
+    ) -> Option<crate::constraints::FrozenSpinsRuntimeStatus> {
+        match &self.inner {
+            InteractiveFdmPreviewRuntimeInner::Cpu(runtime) => runtime
+                .frozen_spins_identity_plan
+                .as_ref()
+                .zip(runtime.problem.frozen_spins())
+                .map(|(plan, state)| {
+                    crate::constraints::FrozenSpinsRuntimeStatus::from_resolved_state(plan, state)
+                }),
+            #[cfg(feature = "cuda")]
+            InteractiveFdmPreviewRuntimeInner::Cuda(runtime) => runtime
+                .frozen_spins_identity_plan
+                .as_ref()
+                .zip(runtime.frozen_spins_state.as_ref())
+                .map(|(plan, state)| {
+                    crate::constraints::FrozenSpinsRuntimeStatus::from_resolved_state(plan, state)
+                }),
         }
     }
 
@@ -1694,6 +2299,24 @@ impl InteractiveFemPreviewRuntime {
                 }
             };
             let (mesh, stage_context) = reuse_stage_fem_mesh_asset(stage_asset);
+            let magnetic_node_mask = mesh_quantity_active_mask("m", &effective_plan.mesh)
+                .unwrap_or_else(|| vec![true; effective_plan.initial_magnetization.len()]);
+            let frozen_spins_state = effective_plan
+                .frozen_spins
+                .as_ref()
+                .map(|frozen_plan| {
+                    fullmag_engine::FrozenSpinsState::capture_at_activation(
+                        frozen_plan,
+                        Some(&magnetic_node_mask),
+                        &effective_plan.initial_magnetization,
+                    )
+                    .map_err(|error| RunError {
+                        message: format!(
+                            "interactive native FEM Frozen Spins activation metadata failed: {error}"
+                        ),
+                    })
+                })
+                .transpose()?;
             let backend = NativeFemBackend::create(&effective_plan)?;
             let device_info = backend.device_info()?;
             let antenna_field = crate::antenna_fields::compute_antenna_field(&effective_plan)?;
@@ -1720,6 +2343,8 @@ impl InteractiveFemPreviewRuntime {
             Ok(Self {
                 inner,
                 stage_context,
+                frozen_spins_identity_plan: effective_plan.frozen_spins.clone(),
+                frozen_spins_state,
             })
         }
     }
@@ -1764,6 +2389,17 @@ impl InteractiveFemPreviewRuntime {
         }
     }
 
+    pub fn frozen_spins_runtime_status(
+        &self,
+    ) -> Option<crate::constraints::FrozenSpinsRuntimeStatus> {
+        self.frozen_spins_identity_plan
+            .as_ref()
+            .zip(self.frozen_spins_state.as_ref())
+            .map(|(plan, state)| {
+                crate::constraints::FrozenSpinsRuntimeStatus::from_resolved_state(plan, state)
+            })
+    }
+
     pub fn upload_magnetization(&mut self, magnetization: &[[f64; 3]]) -> Result<(), RunError> {
         match &mut self.inner {
             InteractiveFemPreviewRuntimeInner::Cpu(runtime) => {
@@ -1803,6 +2439,10 @@ impl InteractiveFemPreviewRuntime {
         }
     }
 
+    /// Low-level in-memory execution. This returns a `RunResult` without
+    /// publishing producer provenance or a qualified relaxation artifact bundle.
+    /// Artifact-producing callers use the runner entry point that binds the
+    /// execution identity before dispatch and writes the exact payloads.
     pub fn execute_with_live_preview(
         &mut self,
         plan: &FemPlanIR,
@@ -1895,6 +2535,79 @@ impl InteractiveFemPreviewRuntime {
 }
 
 impl CpuInteractiveFdmPreviewRuntime {
+    fn apply_stage_plan(&mut self, plan: &FdmPlanIR) -> Result<(), RunError> {
+        let normalized_plan = normalize_plan_signature(plan);
+        if self.plan_signature == normalized_plan {
+            return Ok(());
+        }
+        if normalize_cpu_runtime_context_signature(&self.plan_signature)
+            != normalize_cpu_runtime_context_signature(plan)
+        {
+            return Err(RunError {
+                message: "interactive CPU FDM runtime context mismatch; caller must rebuild runtime before applying the stage plan".to_string(),
+            });
+        }
+        self.problem
+            .transition_frozen_spins_at_stage_boundary(plan.frozen_spins.as_ref(), &mut self.state)
+            .map_err(|error| RunError {
+                message: format!(
+                    "applying interactive CPU frozen-spin stage transition failed: {error}"
+                ),
+            })?;
+        self.state_soa = if self.problem.soa_fast_path_supported() {
+            Some(self.state.to_soa())
+        } else {
+            None
+        };
+        self.last_step_report = None;
+        if let Some(frozen_spins) = plan.frozen_spins.as_ref() {
+            self.frozen_spins_identity_plan = Some(frozen_spins.clone());
+        }
+        self.plan_signature = normalized_plan;
+        Ok(())
+    }
+
+    fn apply_frozen_spins_reactivation_plan(&mut self, plan: &FdmPlanIR) -> Result<(), RunError> {
+        let normalized_plan = normalize_plan_signature(plan);
+        if normalize_cpu_runtime_context_signature(&self.plan_signature)
+            != normalize_cpu_runtime_context_signature(plan)
+        {
+            return Err(RunError {
+                message: "interactive CPU FDM runtime context mismatch; caller must rebuild runtime before Frozen Spins reactivation".to_string(),
+            });
+        }
+
+        match plan.frozen_spins.as_ref() {
+            Some(frozen_spins) => self
+                .problem
+                .capture_frozen_spins_at_activation(frozen_spins, &mut self.state)
+                .map_err(|error| RunError {
+                    message: format!(
+                        "applying interactive CPU Frozen Spins explicit reactivation failed: {error}"
+                    ),
+                })?,
+            None => self
+                .problem
+                .transition_frozen_spins_at_stage_boundary(None, &mut self.state)
+                .map_err(|error| RunError {
+                    message: format!(
+                        "applying interactive CPU Frozen Spins deactivation failed: {error}"
+                    ),
+                })?,
+        }
+        self.state_soa = if self.problem.soa_fast_path_supported() {
+            Some(self.state.to_soa())
+        } else {
+            None
+        };
+        self.last_step_report = None;
+        if let Some(frozen_spins) = plan.frozen_spins.as_ref() {
+            self.frozen_spins_identity_plan = Some(frozen_spins.clone());
+        }
+        self.plan_signature = normalized_plan;
+        Ok(())
+    }
+
     fn upload_magnetization(&mut self, magnetization: &[[f64; 3]]) -> Result<(), RunError> {
         self.state
             .set_magnetization(magnetization.to_vec())
@@ -1986,6 +2699,10 @@ impl CpuInteractiveFdmPreviewRuntime {
             quantities,
         );
         let sample_count = self.state.magnetization().len();
+        crate::antenna_fields::validate_fdm_antenna_sample_counts(
+            &self.plan_signature,
+            sample_count,
+        )?;
         self.problem.terms.per_node_field =
             cpu_reference::resolved_per_node_external_field_for_count(
                 &self.plan_signature,
@@ -2028,6 +2745,8 @@ impl CpuInteractiveFdmPreviewRuntime {
                 report,
                 0,
                 self.state.magnetization(),
+                self.problem
+                    .rotated_interfacial_dmi_energy_from_vectors(self.state.magnetization()),
             ));
         }
 
@@ -2121,7 +2840,9 @@ impl CpuInteractiveFdmPreviewRuntime {
             cpu_reference::resolved_regional_field_drives(plan, base_time);
         let time_events = interactive_time_event_schedule(
             &plan.field_drives,
+            &plan.solved_antenna_drive_bases,
             base_time,
+            plan.time_stage.waveform_origin_time_s.unwrap_or(base_time),
             until_seconds,
             std::iter::empty(),
         );
@@ -2193,6 +2914,7 @@ impl CpuInteractiveFdmPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: preview_due && display_is_global_scalar(&display_state),
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -2237,6 +2959,8 @@ impl CpuInteractiveFdmPreviewRuntime {
                 &report,
                 wall_elapsed,
                 self.state.magnetization(),
+                self.problem
+                    .rotated_interfacial_dmi_energy_from_vectors(self.state.magnetization()),
             );
             let mut local_stats = total_stats.clone();
             local_stats.step -= base_step;
@@ -2293,6 +3017,7 @@ impl CpuInteractiveFdmPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due,
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -2468,7 +3193,9 @@ impl CpuInteractiveFdmPreviewRuntime {
             .map(|schedule| schedule.every_seconds);
         let time_events = interactive_time_event_schedule(
             &plan.field_drives,
+            &plan.solved_antenna_drive_bases,
             base_time,
+            plan.time_stage.waveform_origin_time_s.unwrap_or(base_time),
             until_seconds,
             output_periods,
         );
@@ -2527,6 +3254,7 @@ impl CpuInteractiveFdmPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: preview_due && display_is_global_scalar(&display_state),
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -2569,6 +3297,8 @@ impl CpuInteractiveFdmPreviewRuntime {
                 &report,
                 wall_elapsed,
                 self.state.magnetization(),
+                self.problem
+                    .rotated_interfacial_dmi_energy_from_vectors(self.state.magnetization()),
             );
             let mut local_stats = total_stats.clone();
             local_stats.step -= base_step;
@@ -2640,6 +3370,7 @@ impl CpuInteractiveFdmPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due,
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -2746,10 +3477,13 @@ impl CudaInteractiveFdmPreviewRuntime {
                 ),
             });
         }
-        self.backend.copy_live_preview_field(
+        copy_cuda_live_preview_field(
+            &self.backend,
+            &self.plan_signature,
             request,
             self.original_grid,
             self.plan_signature.active_mask.as_deref(),
+            self.total_time,
         )
     }
 
@@ -2772,10 +3506,13 @@ impl CudaInteractiveFdmPreviewRuntime {
             }
             let mut preview_request = request.clone();
             preview_request.quantity = quantity.to_string();
-            cached.push(self.backend.copy_live_preview_field(
+            cached.push(copy_cuda_live_preview_field(
+                &self.backend,
+                &self.plan_signature,
                 &preview_request,
                 self.original_grid,
                 self.plan_signature.active_mask.as_deref(),
+                self.total_time,
             )?);
         }
 
@@ -2796,6 +3533,16 @@ impl CudaInteractiveFdmPreviewRuntime {
             &cached_preview_quantities_for(display_state),
         );
         if quantities.is_empty() {
+            return Ok(None);
+        }
+        if quantities.iter().any(|quantity| {
+            normalized_quantity_name(quantity)
+                .ok()
+                .is_some_and(|name| name == "H_ant")
+        }) {
+            // H_ant is retained as a runner-side per-cell basis rather than a
+            // native CUDA observable.  Keep this pass synchronous so the
+            // host-materialized field follows the same time as the live step.
             return Ok(None);
         }
         let base_request = display_state.preview_request();
@@ -2858,7 +3605,9 @@ impl CudaInteractiveFdmPreviewRuntime {
         let base_time = self.total_time;
         let time_events = interactive_time_event_schedule(
             &plan.field_drives,
+            &plan.solved_antenna_drive_bases,
             base_time,
+            plan.time_stage.waveform_origin_time_s.unwrap_or(base_time),
             until_seconds,
             std::iter::empty(),
         );
@@ -2892,9 +3641,8 @@ impl CudaInteractiveFdmPreviewRuntime {
         let mut current_local_stats = self.backend.snapshot_step_stats(grid)?;
         current_local_stats.step -= base_step;
         current_local_stats.time -= base_time;
-        let initial_display_state = (checkpoint.display_selection)();
-        let mut pending_cached_preview_snapshots =
-            self.begin_cached_preview_prefetch(&initial_display_state)?;
+        let mut observations =
+            crate::fdm::gpu::cuda::live_observations::FdmLiveObservationScheduler::new(plan, grid);
 
         while self.total_time - base_time < until_seconds {
             let display_state = (checkpoint.display_selection)();
@@ -2909,32 +3657,16 @@ impl CudaInteractiveFdmPreviewRuntime {
                 current_local_stats.step,
                 field_every_n,
             );
-            let preview_field = if preview_due && !display_is_global_scalar(&display_state) {
-                let preview_cfg = display_state.preview_request();
-                Some(self.backend.copy_live_preview_field(
-                    &preview_cfg,
-                    grid,
-                    self.plan_signature.active_mask.as_deref(),
-                )?)
-            } else {
-                None
-            };
-            let cached_preview_fields = if cached_display_due {
-                match pending_cached_preview_snapshots.take() {
-                    Some(snapshots) => Some(self.resolve_cached_preview_prefetch(snapshots)?),
-                    None => {
-                        let preview_cfg = display_state.preview_request();
-                        let quantities = cached_preview_quantities_for(&display_state);
-                        if quantities.is_empty() {
-                            None
-                        } else {
-                            Some(self.snapshot_vector_fields(&quantities, &preview_cfg)?)
-                        }
-                    }
-                }
-            } else {
-                None
-            };
+            let mut publication = observations.observe(
+                &self.backend,
+                &display_state,
+                current_local_stats.step,
+                current_local_stats.time,
+                current_local_stats.dt,
+            );
+            publication.apply_to_stats(&mut current_local_stats);
+            let preview_field = publication.preview_field.take();
+            let cached_preview_fields = publication.cached_preview_fields.take();
             let action = on_step(StepUpdate {
                 coupled_checkpoint: None,
                 stats: current_local_stats.clone(),
@@ -2949,6 +3681,7 @@ impl CudaInteractiveFdmPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: preview_due && display_is_global_scalar(&display_state),
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -2987,21 +3720,6 @@ impl CudaInteractiveFdmPreviewRuntime {
             if let Some(next) = total_stats.dt_suggested {
                 dt = next;
             }
-            let post_step_display_state = (checkpoint.display_selection)();
-            // Only start async cached-preview GPU→CPU copies when the next
-            // iteration will actually consume them.
-            let next_cached_step = (total_stats.step - base_step) + 1;
-            if cached_display_refresh_due(
-                last_cached_preview_revision,
-                &post_step_display_state,
-                next_cached_step,
-                field_every_n,
-            ) {
-                pending_cached_preview_snapshots =
-                    self.begin_cached_preview_prefetch(&post_step_display_state)?;
-            } else {
-                pending_cached_preview_snapshots = None;
-            }
 
             let mut local_stats = total_stats.clone();
             local_stats.step -= base_step;
@@ -3019,16 +3737,16 @@ impl CudaInteractiveFdmPreviewRuntime {
                 local_stats.step,
                 field_every_n,
             );
-            let preview_field = if preview_due && !display_is_global_scalar(&display_state) {
-                let preview_cfg = display_state.preview_request();
-                Some(self.backend.copy_live_preview_field(
-                    &preview_cfg,
-                    grid,
-                    self.plan_signature.active_mask.as_deref(),
-                )?)
-            } else {
-                None
-            };
+            let mut publication = observations.observe(
+                &self.backend,
+                &display_state,
+                local_stats.step,
+                local_stats.time,
+                local_stats.dt,
+            );
+            publication.apply_to_stats(&mut local_stats);
+            let preview_field = publication.preview_field.take();
+            let cached_preview_fields = publication.cached_preview_fields.take();
             let scalar_row_due = local_stats.step <= 1
                 || local_stats.step % field_every_n.max(1) == 0
                 || (preview_due && display_is_global_scalar(&display_state));
@@ -3039,13 +3757,14 @@ impl CudaInteractiveFdmPreviewRuntime {
                 fem_mesh_generation_id: None,
                 magnetization: None,
                 preview_field,
-                cached_preview_fields: None,
+                cached_preview_fields,
                 hysteresis_field_m_t: None,
                 hysteresis_point_index: None,
                 hysteresis_settle_step_index: None,
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due,
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -3091,6 +3810,14 @@ impl CudaInteractiveFdmPreviewRuntime {
             }
         }
 
+        publish_final_cuda_observations(
+            &mut observations,
+            &self.backend,
+            &(checkpoint.display_selection)(),
+            &current_local_stats,
+            grid,
+            on_step,
+        );
         let status = if paused {
             RunStatus::Paused
         } else if cancelled {
@@ -3234,7 +3961,9 @@ impl CudaInteractiveFdmPreviewRuntime {
         let default_scalar_trace = scalar_schedules.is_empty();
         capture_initial_cuda_runtime_fields(
             &self.backend,
+            &self.plan_signature,
             cell_count,
+            self.total_time,
             &mut field_schedules,
             &mut artifacts,
         )?;
@@ -3247,7 +3976,9 @@ impl CudaInteractiveFdmPreviewRuntime {
             .map(|schedule| schedule.every_seconds);
         let time_events = interactive_time_event_schedule(
             &plan.field_drives,
+            &plan.solved_antenna_drive_bases,
             base_time,
+            plan.time_stage.waveform_origin_time_s.unwrap_or(base_time),
             until_seconds,
             output_periods,
         );
@@ -3278,9 +4009,8 @@ impl CudaInteractiveFdmPreviewRuntime {
         let mut current_local_stats = self.backend.snapshot_step_stats(grid)?;
         current_local_stats.step -= base_step;
         current_local_stats.time -= base_time;
-        let initial_display_state = (checkpoint.display_selection)();
-        let mut pending_cached_preview_snapshots =
-            self.begin_cached_preview_prefetch(&initial_display_state)?;
+        let mut observations =
+            crate::fdm::gpu::cuda::live_observations::FdmLiveObservationScheduler::new(plan, grid);
 
         while self.total_time - base_time < until_seconds {
             let display_state = (checkpoint.display_selection)();
@@ -3295,32 +4025,16 @@ impl CudaInteractiveFdmPreviewRuntime {
                 current_local_stats.step,
                 field_every_n,
             );
-            let preview_field = if preview_due && !display_is_global_scalar(&display_state) {
-                let preview_cfg = display_state.preview_request();
-                Some(self.backend.copy_live_preview_field(
-                    &preview_cfg,
-                    grid,
-                    self.plan_signature.active_mask.as_deref(),
-                )?)
-            } else {
-                None
-            };
-            let cached_preview_fields = if cached_display_due {
-                match pending_cached_preview_snapshots.take() {
-                    Some(snapshots) => Some(self.resolve_cached_preview_prefetch(snapshots)?),
-                    None => {
-                        let preview_cfg = display_state.preview_request();
-                        let quantities = cached_preview_quantities_for(&display_state);
-                        if quantities.is_empty() {
-                            None
-                        } else {
-                            Some(self.snapshot_vector_fields(&quantities, &preview_cfg)?)
-                        }
-                    }
-                }
-            } else {
-                None
-            };
+            let mut publication = observations.observe(
+                &self.backend,
+                &display_state,
+                current_local_stats.step,
+                current_local_stats.time,
+                current_local_stats.dt,
+            );
+            publication.apply_to_stats(&mut current_local_stats);
+            let preview_field = publication.preview_field.take();
+            let cached_preview_fields = publication.cached_preview_fields.take();
             let action = on_step(StepUpdate {
                 coupled_checkpoint: None,
                 stats: current_local_stats.clone(),
@@ -3335,6 +4049,7 @@ impl CudaInteractiveFdmPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: preview_due && display_is_global_scalar(&display_state),
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -3373,21 +4088,6 @@ impl CudaInteractiveFdmPreviewRuntime {
             if let Some(next) = total_stats.dt_suggested {
                 dt = next;
             }
-            let post_step_display_state = (checkpoint.display_selection)();
-            // Only start async cached-preview GPU→CPU copies when the next
-            // iteration will actually consume them.
-            let next_cached_step = (total_stats.step - base_step) + 1;
-            if cached_display_refresh_due(
-                last_cached_preview_revision,
-                &post_step_display_state,
-                next_cached_step,
-                field_every_n,
-            ) {
-                pending_cached_preview_snapshots =
-                    self.begin_cached_preview_prefetch(&post_step_display_state)?;
-            } else {
-                pending_cached_preview_snapshots = None;
-            }
 
             let mut local_stats = total_stats.clone();
             local_stats.step -= base_step;
@@ -3407,16 +4107,16 @@ impl CudaInteractiveFdmPreviewRuntime {
                 local_stats.step,
                 field_every_n,
             );
-            let preview_field = if preview_due && !display_is_global_scalar(&display_state) {
-                let preview_cfg = display_state.preview_request();
-                Some(self.backend.copy_live_preview_field(
-                    &preview_cfg,
-                    grid,
-                    self.plan_signature.active_mask.as_deref(),
-                )?)
-            } else {
-                None
-            };
+            let mut publication = observations.observe(
+                &self.backend,
+                &display_state,
+                local_stats.step,
+                local_stats.time,
+                local_stats.dt,
+            );
+            publication.apply_to_stats(&mut local_stats);
+            let preview_field = publication.preview_field.take();
+            let cached_preview_fields = publication.cached_preview_fields.take();
             let scalar_row_due = local_stats.step <= 1
                 || local_stats.step % field_every_n.max(1) == 0
                 || (preview_due && display_is_global_scalar(&display_state));
@@ -3436,13 +4136,14 @@ impl CudaInteractiveFdmPreviewRuntime {
                 fem_mesh_generation_id: None,
                 magnetization: None,
                 preview_field,
-                cached_preview_fields: None,
+                cached_preview_fields,
                 hysteresis_field_m_t: None,
                 hysteresis_point_index: None,
                 hysteresis_settle_step_index: None,
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due,
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -3465,8 +4166,10 @@ impl CudaInteractiveFdmPreviewRuntime {
 
             record_due_cuda_runtime_outputs(
                 &self.backend,
+                &self.plan_signature,
                 cell_count,
                 &local_stats,
+                self.total_time,
                 &mut scalar_schedules,
                 &mut field_schedules,
                 &mut steps,
@@ -3490,10 +4193,20 @@ impl CudaInteractiveFdmPreviewRuntime {
             }
         }
 
+        publish_final_cuda_observations(
+            &mut observations,
+            &self.backend,
+            &(checkpoint.display_selection)(),
+            &current_local_stats,
+            grid,
+            on_step,
+        );
         record_final_cuda_runtime_outputs(
             &self.backend,
+            &self.plan_signature,
             cell_count,
             latest_local_stats,
+            self.total_time,
             default_scalar_trace,
             &scalar_schedules,
             &field_schedules,
@@ -3537,6 +4250,38 @@ impl CudaInteractiveFdmPreviewRuntime {
             provenance,
         })
     }
+}
+
+#[cfg(feature = "cuda")]
+fn publish_final_cuda_observations(
+    observations: &mut crate::fdm::gpu::cuda::live_observations::FdmLiveObservationScheduler,
+    backend: &crate::fdm::gpu::cuda::native::NativeFdmBackend,
+    display: &DisplaySelectionState,
+    stats: &StepStats,
+    grid: [u32; 3],
+    on_step: &mut dyn FnMut(StepUpdate) -> StepAction,
+) {
+    let mut publication = observations.finish(backend, display, stats.step, stats.time, stats.dt);
+    let mut stats = stats.clone();
+    publication.apply_to_stats(&mut stats);
+    let _ = on_step(StepUpdate {
+        stats,
+        grid,
+        coupled_checkpoint: None,
+        fem_mesh_generation_id: None,
+        magnetization: None,
+        preview_field: publication.preview_field.take(),
+        cached_preview_fields: publication.cached_preview_fields.take(),
+        hysteresis_field_m_t: None,
+        hysteresis_point_index: None,
+        hysteresis_settle_step_index: None,
+        hysteresis_settle_step_kind: None,
+        hysteresis_settle_step_method: None,
+        scalar_row_due: false,
+        // A delayed observation is not an authoritative terminal state batch.
+        terminal_field_snapshot: false,
+        finished: false,
+    });
 }
 
 impl CpuInteractiveFemPreviewRuntime {
@@ -3647,7 +4392,9 @@ impl CpuInteractiveFemPreviewRuntime {
         let base_time = self.state.time_seconds;
         let time_events = interactive_time_event_schedule(
             &plan.field_drives,
+            &plan.solved_antenna_drive_bases,
             base_time,
+            plan.time_stage.waveform_origin_time_s.unwrap_or(base_time),
             until_seconds,
             std::iter::empty(),
         );
@@ -3732,6 +4479,7 @@ impl CpuInteractiveFemPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: preview_due && display_is_global_scalar(&display_state),
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -3782,6 +4530,7 @@ impl CpuInteractiveFemPreviewRuntime {
                 &report,
                 wall_elapsed,
                 self.state.magnetization(),
+                0.0,
             );
             let mut local_stats = total_stats.clone();
             local_stats.step -= base_step;
@@ -3858,6 +4607,7 @@ impl CpuInteractiveFemPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due,
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -3989,7 +4739,9 @@ impl CpuInteractiveFemPreviewRuntime {
             .map(|schedule| schedule.every_seconds);
         let time_events = interactive_time_event_schedule(
             &plan.field_drives,
+            &plan.solved_antenna_drive_bases,
             base_time,
+            plan.time_stage.waveform_origin_time_s.unwrap_or(base_time),
             until_seconds,
             output_periods,
         );
@@ -4057,6 +4809,7 @@ impl CpuInteractiveFemPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: preview_due && display_is_global_scalar(&display_state),
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -4105,6 +4858,7 @@ impl CpuInteractiveFemPreviewRuntime {
                 &report,
                 wall_elapsed,
                 self.state.magnetization(),
+                0.0,
             );
             let mut local_stats = total_stats.clone();
             local_stats.step -= base_step;
@@ -4206,6 +4960,7 @@ impl CpuInteractiveFemPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due,
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -4315,9 +5070,12 @@ impl GpuInteractiveFemPreviewRuntime {
             });
         }
         if normalized_quantity_name(&request.quantity).ok() == Some("H_ant") {
+            let time = self.backend.snapshot_step_stats(self.node_count)?.time;
+            let antenna_field =
+                crate::antenna_fields::compute_antenna_field_at_time(&self.plan_signature, time)?;
             return Ok(build_mesh_preview_field_with_active_mask(
                 request,
-                &self.antenna_field,
+                &antenna_field,
                 None,
             ));
         }
@@ -4334,6 +5092,11 @@ impl GpuInteractiveFemPreviewRuntime {
             active_fem_preview_quantities(FemEngine::NativeGpu, &self.plan_signature, quantities);
         let mut cached = Vec::new();
         let mut seen = HashSet::new();
+        let antenna_time = if quantities.iter().any(|quantity| *quantity == "H_ant") {
+            Some(self.backend.snapshot_step_stats(self.node_count)?.time)
+        } else {
+            None
+        };
 
         for quantity in quantities
             .iter()
@@ -4345,9 +5108,13 @@ impl GpuInteractiveFemPreviewRuntime {
             let mut preview_request = request.clone();
             preview_request.quantity = quantity.to_string();
             if quantity == "H_ant" {
+                let antenna_field = crate::antenna_fields::compute_antenna_field_at_time(
+                    &self.plan_signature,
+                    antenna_time.expect("H_ant requested with captured time"),
+                )?;
                 cached.push(build_mesh_preview_field_with_active_mask(
                     &preview_request,
-                    &self.antenna_field,
+                    &antenna_field,
                     None,
                 ));
             } else {
@@ -4391,10 +5158,15 @@ impl GpuInteractiveFemPreviewRuntime {
 
         let base_step = self.total_steps;
         let base_time = self.total_time;
-        self.backend.begin_stage(base_time)?;
+        self.backend.begin_stage_with_waveform_origin(
+            base_time,
+            plan.time_stage.waveform_origin_time_s.unwrap_or(base_time),
+        )?;
         let time_events = interactive_time_event_schedule(
             &plan.field_drives,
+            &plan.solved_antenna_drive_bases,
             base_time,
+            plan.time_stage.waveform_origin_time_s.unwrap_or(base_time),
             until_seconds,
             std::iter::empty(),
         );
@@ -4469,6 +5241,7 @@ impl GpuInteractiveFemPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: preview_due && display_is_global_scalar(&display_state),
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -4558,6 +5331,7 @@ impl GpuInteractiveFemPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due,
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -4659,6 +5433,15 @@ impl GpuInteractiveFemPreviewRuntime {
         let mut scalar_schedules = collect_scalar_schedules(outputs)?;
         let mut field_schedules = collect_field_schedules(outputs)?;
         let default_scalar_trace = scalar_schedules.is_empty();
+        let base_step = self.total_steps;
+        let base_time = self.total_time;
+        let waveform_origin_time_s = plan.time_stage.waveform_origin_time_s.unwrap_or(base_time);
+        let split_waveform_clock = waveform_origin_time_s != base_time;
+        if split_waveform_clock {
+            self.backend
+                .begin_stage_with_waveform_origin(base_time, waveform_origin_time_s)?;
+            self.backend.snapshot_step_stats(self.node_count)?;
+        }
         capture_initial_native_fem_runtime_fields(
             &self.backend,
             self.node_count,
@@ -4666,16 +5449,18 @@ impl GpuInteractiveFemPreviewRuntime {
             &mut artifacts,
         )?;
 
-        let base_step = self.total_steps;
-        let base_time = self.total_time;
-        self.backend.begin_stage(base_time)?;
+        if !split_waveform_clock {
+            self.backend.begin_stage(base_time)?;
+        }
         let output_periods = scalar_schedules
             .iter()
             .chain(field_schedules.iter())
             .map(|schedule| schedule.every_seconds);
         let time_events = interactive_time_event_schedule(
             &plan.field_drives,
+            &plan.solved_antenna_drive_bases,
             base_time,
+            plan.time_stage.waveform_origin_time_s.unwrap_or(base_time),
             until_seconds,
             output_periods,
         );
@@ -4733,6 +5518,7 @@ impl GpuInteractiveFemPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: preview_due && display_is_global_scalar(&display_state),
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -4804,6 +5590,7 @@ impl GpuInteractiveFemPreviewRuntime {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due,
+                terminal_field_snapshot: false,
                 finished: false,
             });
             if preview_due {
@@ -4910,6 +5697,12 @@ fn normalize_runtime_context_signature(plan: &FdmPlanIR) -> FdmPlanIR {
     normalized.field_refresh = None;
     normalized.relaxation = None;
     normalized.time_stage = Default::default();
+    normalized
+}
+
+fn normalize_cpu_runtime_context_signature(plan: &FdmPlanIR) -> FdmPlanIR {
+    let mut normalized = normalize_runtime_context_signature(plan);
+    normalized.frozen_spins = None;
     normalized
 }
 
@@ -5298,7 +6091,9 @@ fn copy_native_fem_base_field_values(
 #[cfg(feature = "cuda")]
 fn capture_initial_cuda_runtime_fields(
     backend: &NativeFdmBackend,
+    plan: &FdmPlanIR,
     cell_count: usize,
+    time_seconds: f64,
     field_schedules: &mut [OutputSchedule],
     artifacts: &mut ArtifactRecorder,
 ) -> Result<(), RunError> {
@@ -5320,7 +6115,11 @@ fn capture_initial_cuda_runtime_fields(
             scope: "full".into(),
             revision: (0 as u64).saturating_add(1),
             values: FieldSnapshot::flatten_vec3(copy_cuda_field_values(
-                backend, cell_count, &name,
+                backend,
+                plan,
+                cell_count,
+                time_seconds,
+                &name,
             )?),
         })?;
     }
@@ -5331,8 +6130,10 @@ fn capture_initial_cuda_runtime_fields(
 #[cfg(feature = "cuda")]
 fn record_due_cuda_runtime_outputs(
     backend: &NativeFdmBackend,
+    plan: &FdmPlanIR,
     cell_count: usize,
     stats: &StepStats,
+    time_seconds: f64,
     scalar_schedules: &mut [OutputSchedule],
     field_schedules: &mut [OutputSchedule],
     steps: &mut Vec<StepStats>,
@@ -5366,7 +6167,11 @@ fn record_due_cuda_runtime_outputs(
             scope: "full".into(),
             revision: (stats.step as u64).saturating_add(1),
             values: FieldSnapshot::flatten_vec3(copy_cuda_field_values(
-                backend, cell_count, &name,
+                backend,
+                plan,
+                cell_count,
+                time_seconds,
+                &name,
             )?),
         })?;
     }
@@ -5377,8 +6182,10 @@ fn record_due_cuda_runtime_outputs(
 #[cfg(feature = "cuda")]
 fn record_final_cuda_runtime_outputs(
     backend: &NativeFdmBackend,
+    plan: &FdmPlanIR,
     cell_count: usize,
     latest_stats: Option<StepStats>,
+    time_seconds: f64,
     default_scalar_trace: bool,
     scalar_schedules: &[OutputSchedule],
     field_schedules: &[OutputSchedule],
@@ -5423,7 +6230,13 @@ fn record_final_cuda_runtime_outputs(
             location: "sample".into(),
             scope: "full".into(),
             revision: (latest_stats.step as u64).saturating_add(1),
-            values: FieldSnapshot::flatten_vec3(copy_cuda_field_values(backend, cell_count, name)?),
+            values: FieldSnapshot::flatten_vec3(copy_cuda_field_values(
+                backend,
+                plan,
+                cell_count,
+                time_seconds,
+                name,
+            )?),
         })?;
     }
     let _ = scalar_schedules;
@@ -5433,13 +6246,16 @@ fn record_final_cuda_runtime_outputs(
 #[cfg(feature = "cuda")]
 fn copy_cuda_field_values(
     backend: &NativeFdmBackend,
+    plan: &FdmPlanIR,
     cell_count: usize,
+    time_seconds: f64,
     name: &str,
 ) -> Result<Vec<[f64; 3]>, RunError> {
     if let Some(dot_pos) = name.find('.') {
         let base = &name[..dot_pos];
         let component = &name[dot_pos + 1..];
-        let full = copy_cuda_base_field_values(backend, cell_count, base)?;
+        let full =
+            copy_cuda_field_snapshot_with_plan(backend, plan, base, cell_count, time_seconds)?;
         let idx = match component {
             "x" => 0,
             "y" => 1,
@@ -5456,33 +6272,15 @@ fn copy_cuda_field_values(
         return Ok(full.iter().map(|value| [value[idx], 0.0, 0.0]).collect());
     }
 
-    copy_cuda_base_field_values(backend, cell_count, name)
-}
-
-#[cfg(feature = "cuda")]
-fn copy_cuda_base_field_values(
-    backend: &NativeFdmBackend,
-    cell_count: usize,
-    name: &str,
-) -> Result<Vec<[f64; 3]>, RunError> {
-    match name {
-        "m" => backend.copy_m(cell_count),
-        "H_ex" => backend.copy_h_ex(cell_count),
-        "H_demag" => backend.copy_h_demag(cell_count),
-        "H_ext" => backend.copy_h_ext(cell_count),
-        "H_eff" => backend.copy_h_eff(cell_count),
-        "torque" => backend.copy_torque(cell_count),
-        other => Err(RunError {
-            message: format!(
-                "unsupported interactive CUDA output field snapshot '{}'",
-                other
-            ),
-        }),
-    }
+    copy_cuda_field_snapshot_with_plan(backend, plan, name, cell_count, time_seconds)
 }
 
 fn cpu_execution_provenance(plan: &FdmPlanIR) -> Result<ExecutionProvenance, RunError> {
-    let fft_backend = cpu_reference::resolve_cpu_fft_backend_name_for_demag(plan.enable_demag)?;
+    let fdm_fft_execution =
+        cpu_reference::resolve_cpu_fft_execution_for_demag(plan.enable_demag, plan.fft.as_ref())?;
+    let fft_backend = fdm_fft_execution
+        .as_ref()
+        .map(|execution| execution.executed_backend.clone());
     let timestep_policy =
         if crate::relaxation::direct_minimizer::direct_minimizer_control(plan.relaxation.as_ref())
             .is_some()
@@ -5501,7 +6299,14 @@ fn cpu_execution_provenance(plan: &FdmPlanIR) -> Result<ExecutionProvenance, Run
         charge_transport: None,
         transport_modules: Vec::new(),
         fdm_gpu_transport_telemetry: None,
+        fdm_cpu_state_layout: None,
         fdm_gpu_execution_receipt: None,
+        fdm_gpu_step_transaction_telemetry: None,
+        fdm_gpu_observation_policy: None,
+        fdm_gpu_endpoint_cache_telemetry: None,
+        fdm_cpu_step_transaction_telemetry: None,
+        fdm_cpu_evaluation_telemetry: None,
+        fdm_fft_execution,
         fem_gpu_execution_receipt: None,
         executed_physics_kinds: if timestep_policy.is_some()
             && (plan.zhang_li_formula_version.is_some()
@@ -5527,6 +6332,8 @@ fn cpu_execution_provenance(plan: &FdmPlanIR) -> Result<ExecutionProvenance, Run
         cuda_runtime_version: None,
         lossy_fallback_used: false,
         resolved_fallback: None,
+        fem_eigen_execution_resolution: None,
+        fem_eigen_native_execution_attestation: None,
         fem_crossover_decision: None,
         ignored_terms: Vec::new(),
         random_seed: None,
@@ -5586,6 +6393,7 @@ fn cpu_execution_provenance(plan: &FdmPlanIR) -> Result<ExecutionProvenance, Run
         requested_fem_omp_threads: None,
         effective_fem_omp_threads: None,
         fem_poisson_demag: None,
+        fem_bem_demag: None,
     })
 }
 
@@ -5594,6 +6402,8 @@ fn cuda_execution_provenance(
     plan: &FdmPlanIR,
     device_info: &crate::fdm::gpu::cuda::native::DeviceInfo,
 ) -> Result<ExecutionProvenance, RunError> {
+    let fdm_fft_execution =
+        crate::fdm::resolve_cuda_fft_execution_for_demag(plan.enable_demag, plan.fft.as_ref())?;
     let timestep_policy =
         if crate::fem::relax::algorithm::native_step_control(plan.relaxation.as_ref()).is_some() {
             None
@@ -5609,8 +6419,17 @@ fn cuda_execution_provenance(
         charge_transport: None,
         transport_modules: Vec::new(),
         fdm_gpu_transport_telemetry: None,
+        fdm_cpu_state_layout: None,
         fem_gpu_execution_receipt: None,
         fdm_gpu_execution_receipt: None,
+        fdm_gpu_step_transaction_telemetry: None,
+        fdm_gpu_observation_policy: None,
+        fdm_gpu_endpoint_cache_telemetry: None,
+        fem_eigen_execution_resolution: None,
+        fem_eigen_native_execution_attestation: None,
+        fdm_cpu_step_transaction_telemetry: None,
+        fdm_cpu_evaluation_telemetry: None,
+        fdm_fft_execution,
         executed_physics_kinds: if timestep_policy.is_some()
             && (plan.zhang_li_formula_version.is_some()
                 || plan.slonczewski_formula_version.is_some()
@@ -5708,6 +6527,7 @@ fn cuda_execution_provenance(
         requested_fem_omp_threads: None,
         effective_fem_omp_threads: None,
         fem_poisson_demag: None,
+        fem_bem_demag: None,
     })
 }
 
@@ -5737,8 +6557,17 @@ fn fem_gpu_execution_provenance(
         charge_transport: None,
         transport_modules: Vec::new(),
         fdm_gpu_transport_telemetry: None,
+        fdm_cpu_state_layout: None,
         fdm_gpu_execution_receipt: None,
+        fdm_gpu_step_transaction_telemetry: None,
+        fdm_gpu_observation_policy: None,
+        fdm_gpu_endpoint_cache_telemetry: None,
+        fdm_cpu_step_transaction_telemetry: None,
+        fdm_cpu_evaluation_telemetry: None,
+        fdm_fft_execution: None,
         fem_gpu_execution_receipt: None,
+        fem_eigen_execution_resolution: None,
+        fem_eigen_native_execution_attestation: None,
         executed_physics_kinds: if timestep_policy.is_some() && plan.spin_torque_contract.is_some()
         {
             vec!["spin_torque".to_string()]
@@ -5873,6 +6702,7 @@ fn fem_gpu_execution_provenance(
         requested_fem_omp_threads: None,
         effective_fem_omp_threads: None,
         fem_poisson_demag: None,
+        fem_bem_demag: None,
     };
     crate::relaxation::apply_energy_minimizer_provenance(&mut provenance, plan.relaxation.as_ref());
     crate::relaxation::apply_fem_direct_minimizer_policy_provenance(
@@ -5930,6 +6760,11 @@ fn make_step_stats(
         wall_time_ns,
         ..StepStats::default()
     };
+    stats.set_dmi_energy_components(
+        observables.dmi_energy - observables.rotated_dmi_energy,
+        0.0,
+        observables.rotated_dmi_energy,
+    );
     crate::scalar_metrics::apply_average_m_to_step_stats(&mut stats, &observables.magnetization);
     stats.per_object_scalars = observables.per_object_scalars.clone();
     stats
@@ -5944,6 +6779,7 @@ fn make_step_stats_from_report(
     report: &fullmag_engine::StepReport,
     wall_time_ns: u64,
     magnetization: &[[f64; 3]],
+    rotated_dmi_energy: f64,
 ) -> StepStats {
     let mut stats = StepStats {
         step,
@@ -5964,6 +6800,11 @@ fn make_step_stats_from_report(
         wall_time_ns,
         ..StepStats::default()
     };
+    stats.set_dmi_energy_components(
+        report.dmi_energy_joules - rotated_dmi_energy,
+        0.0,
+        rotated_dmi_energy,
+    );
     crate::scalar_metrics::apply_average_m_to_step_stats(&mut stats, magnetization);
     stats
 }
@@ -6002,6 +6843,10 @@ impl InteractiveBackend for InteractiveFdmPreviewRuntime {
         self.execution_provenance()
     }
 
+    fn frozen_spins_runtime_status(&self) -> Option<crate::constraints::FrozenSpinsRuntimeStatus> {
+        self.frozen_spins_runtime_status()
+    }
+
     fn matches_problem(&self, problem: &ProblemIR) -> Result<bool, RunError> {
         let plan = fullmag_plan::plan(problem)?;
         let BackendPlanIR::Fdm(fdm) = &plan.backend_plan else {
@@ -6022,6 +6867,33 @@ impl InteractiveBackend for InteractiveFdmPreviewRuntime {
             return Ok(false);
         };
         Ok(self.can_continue_with_plan(fdm))
+    }
+
+    fn apply_stage_plan(&mut self, plan: &fullmag_ir::ExecutionPlanIR) -> Result<(), RunError> {
+        let BackendPlanIR::Fdm(fdm) = &plan.backend_plan else {
+            return Err(RunError {
+                message: "InteractiveBackend(FDM)::apply_stage_plan requires FDM plan".into(),
+            });
+        };
+        self.apply_stage_plan(fdm)
+    }
+
+    fn supports_frozen_spins_reactivation_in_place(&self) -> bool {
+        self.supports_frozen_spins_reactivation_in_place()
+    }
+
+    fn apply_frozen_spins_reactivation_plan(
+        &mut self,
+        plan: &fullmag_ir::ExecutionPlanIR,
+    ) -> Result<(), RunError> {
+        let BackendPlanIR::Fdm(fdm) = &plan.backend_plan else {
+            return Err(RunError {
+                message:
+                    "InteractiveBackend(FDM)::apply_frozen_spins_reactivation_plan requires FDM plan"
+                        .into(),
+            });
+        };
+        self.apply_frozen_spins_reactivation_plan(fdm)
     }
 
     fn geometry(&self) -> BackendGeometry {
@@ -6096,6 +6968,10 @@ impl InteractiveBackend for InteractiveFemPreviewRuntime {
 
     fn execution_provenance(&self) -> ExecutionProvenance {
         self.execution_provenance()
+    }
+
+    fn frozen_spins_runtime_status(&self) -> Option<crate::constraints::FrozenSpinsRuntimeStatus> {
+        self.frozen_spins_runtime_status()
     }
 
     fn matches_problem(&self, problem: &ProblemIR) -> Result<bool, RunError> {

@@ -40,6 +40,8 @@ import {
 } from "./modelRootNodes";
 import {
   buildPhysicsFirstResultsTree,
+  withCatalogAnalysisFamilies,
+  withPinnedAnalysisDefinitions,
   physicsFirstResultsSnapshotFromResources,
 } from "./resultsExplorerNodes";
 
@@ -176,6 +178,10 @@ export function buildExplorerTree(
       return buildPhysicsFirstResultsTree({
         contractGaps: resources.resultContextContractGaps,
         entries: [],
+        ...(resources.observationFrames
+          ? { observationFrames: resources.observationFrames }
+          : {}),
+        pinnedObservationFrameId: resources.pinnedObservationFrameId,
         resultContextRunId: resources.resultContextRunId,
       });
     }
@@ -193,12 +199,21 @@ export function buildExplorerTree(
       currentRun: resources.currentRun,
       dispersion: resources.frequencyDomainDispersion,
       manifest: resources.frequencyDomainManifest,
+      observationFrames: resources.observationFrames,
+      pinnedObservationFrameId: resources.pinnedObservationFrameId,
       responseSweep: resources.frequencyDomainResponseSweep,
       spectrum: resources.frequencyDomainSpectrum,
       artifacts: resources.artifacts,
       tableCatalog: resources.tableCatalog,
     });
-    return buildPhysicsFirstResultsTree(adapted.snapshot);
+    return withPinnedAnalysisDefinitions(
+      withCatalogAnalysisFamilies(
+        buildPhysicsFirstResultsTree(adapted.snapshot),
+        resources.analysisDatasets ?? [],
+        resources.analysisDefinitions ?? [],
+      ),
+      resources.analysisDefinitions ?? [],
+    );
   }
   if (tabId === "jobs") return buildRuntimeJobTree(runtime?.jobs);
 

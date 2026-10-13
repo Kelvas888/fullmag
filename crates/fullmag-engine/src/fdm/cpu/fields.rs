@@ -3,114 +3,44 @@
 //!
 //! Every function here lives inside `impl ExchangeLlgProblem`.
 
-use rustfft::num_complex::Complex;
-
-use crate::fdm::cpu::fft::{combine_fields_4, padded_index, zero_vectors};
+use crate::fdm::cpu::fft::{combine_fields_4, zero_vectors};
 use crate::fdm::cpu::fft_backend::FdmFftBackend;
-use crate::fdm::shared::types::{neighbor_index, AxisBoundary};
+#[cfg(test)]
+use crate::fdm::shared::types::AxisBoundary;
 use crate::magnetoelastic;
 use crate::telemetry::{sections, StepTelemetry};
 use crate::vector::{add, cross, dot, max_cross_norm, max_norm, norm, scale, squared_norm, sub};
 use crate::{
-    EffectiveFieldObservables, ExchangeLlgProblem, FftWorkspace, OerstedCylinderConfig,
-    RhsEvaluation, SlonczewskiFormula, SlonczewskiSttConfig, SotConfig, SotFormula, Vector3,
-    VectorFieldSoA, ZhangLiFormula, ZhangLiSttConfig, MU0,
+    ExchangeLlgProblem, FftWorkspace, OerstedCylinderConfig, RhsEvaluation, SlonczewskiFormula,
+    SlonczewskiSttConfig, SotConfig, SotFormula, Vector3, VectorFieldSoA, ZhangLiFormula,
+    ZhangLiSttConfig, MU0,
 };
+
+#[path = "fields/direct_torques.rs"]
+mod direct_torques;
+pub(crate) use direct_torques::{prescribed_sot_torque_from_config, slonczewski_torque_from_config};
+#[cfg(test)]
+use direct_torques::slonczewski_prefactor;
+
+#[path = "fields/exchange.rs"]
+mod exchange;
+#[path = "fields/anisotropy.rs"]
+mod anisotropy;
+#[path = "fields/dmi.rs"]
+mod dmi;
+#[path = "fields/magnetoelastic.rs"]
+mod magnetoelastic_terms;
+#[path = "fields/zeeman.rs"]
+mod zeeman;
+#[path = "fields/demag.rs"]
+mod demag;
+#[path = "fields/energy.rs"]
+mod energy;
+#[path = "fields/observables.rs"]
+mod observables;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
-
-fn slonczewski_prefactor(
-    formula: SlonczewskiFormula,
-    current_sign: f64,
-    current_density_magnitude: f64,
-    gamma0: f64,
-    saturation_magnetisation: f64,
-    thickness: f64,
-) -> f64 {
-    const HBAR: f64 = 1.054571817e-34;
-    const EXACT_E_CHARGE: f64 = 1.602176634e-19;
-    const LEGACY_E_CHARGE: f64 = 1.60217662e-19;
-    const MU0_CONST: f64 = 1.2566370614359173e-6;
-    let charge = match formula {
-        SlonczewskiFormula::FullmagV2 | SlonczewskiFormula::FullmagV1 => EXACT_E_CHARGE,
-        SlonczewskiFormula::LegacyFullmagV0 => LEGACY_E_CHARGE,
-    };
-    let omega_denominator_factor = match formula {
-        SlonczewskiFormula::FullmagV2 => 1.0,
-        SlonczewskiFormula::FullmagV1 | SlonczewskiFormula::LegacyFullmagV0 => 2.0,
-    };
-    current_sign * (current_density_magnitude * HBAR * gamma0)
-        / (omega_denominator_factor * charge * MU0_CONST * saturation_magnetisation * thickness)
-}
-
-fn gilbert_slonczewski_scales(
-    formula: SlonczewskiFormula,
-    omega_j: f64,
-    epsilon: f64,
-    epsilon_prime: f64,
-    alpha: f64,
-) -> (f64, f64) {
-    let inv_gilbert = 1.0 / (1.0 + alpha * alpha);
-    match formula {
-        SlonczewskiFormula::FullmagV2 | SlonczewskiFormula::FullmagV1 => (
-            omega_j * (epsilon + alpha * epsilon_prime) * inv_gilbert,
-            omega_j * (epsilon_prime - alpha * epsilon) * inv_gilbert,
-        ),
-        SlonczewskiFormula::LegacyFullmagV0 => {
-            let beta_stt = omega_j * epsilon;
-            (
-                beta_stt * (1.0 + alpha * epsilon_prime) * inv_gilbert,
-                beta_stt * (epsilon_prime - alpha) * inv_gilbert,
-            )
-        }
-    }
-}
-
-fn gilbert_zhang_li_scales(beta: f64, alpha: f64) -> (f64, f64) {
-    let inv_gilbert = 1.0 / (1.0 + alpha * alpha);
-    (
-        (1.0 + alpha * beta) * inv_gilbert,
-        (alpha - beta) * inv_gilbert,
-    )
-}
-
-/// Evaluate the canonical local Slonczewski RHS contribution shared by the
-/// FDM and FEM reference realizations.  Target-mask and active-cell policy
-/// stay with the caller; this function owns only the SI algebra and Gilbert
-/// conversion.
-pub(crate) fn slonczewski_torque_from_config(
-    magnetization: Vector3,
-    cfg: &SlonczewskiSttConfig,
-    alpha: f64,
-    gyromagnetic_ratio: f64,
-    saturation_magnetisation: f64,
-) -> Vector3 {
-    let ms = saturation_magnetisation.max(1e-30);
-    let thickness = cfg.thickness.max(1e-30);
-    let prefactor = slonczewski_prefactor(
-        cfg.formula,
-        cfg.current_sign,
-        cfg.current_density_magnitude,
-        gyromagnetic_ratio,
-        ms,
-        thickness,
-    );
-    let [px, py, pz] = cfg.spin_polarization_axis;
-    let m_dot_p = dot(magnetization, [px, py, pz]);
-    let lambda_squared = cfg.lambda * cfg.lambda;
-    let degree = if cfg.degree > 0.0 { cfg.degree } else { 1.0 };
-    let epsilon =
-        (degree * lambda_squared) / ((lambda_squared + 1.0) + (lambda_squared - 1.0) * m_dot_p);
-    let (damping_like, field_like) =
-        gilbert_slonczewski_scales(cfg.formula, prefactor, epsilon, cfg.epsilon_prime, alpha);
-    let m_cross_p = cross(magnetization, [px, py, pz]);
-    let m_cross_m_cross_p = cross(magnetization, m_cross_p);
-    add(
-        scale(m_cross_m_cross_p, damping_like),
-        scale(m_cross_p, field_like),
-    )
-}
 
 fn anisotropy_energy_density_for_magnetization(
     magnetization: Vector3,
@@ -154,1312 +84,87 @@ fn oersted_envelope_at_time(cfg: &OerstedCylinderConfig, time_seconds: f64) -> f
     }
 }
 
-fn prescribed_sot_scales(
-    cfg: &SotConfig,
-    saturation_magnetisation: f64,
-    gamma0: f64,
-    alpha: f64,
-) -> (f64, f64) {
-    const HBAR: f64 = 1.054571817e-34;
-    const EXACT_E_CHARGE: f64 = 1.602176634e-19;
-    const LEGACY_E_CHARGE: f64 = 1.60217662e-19;
-    let envelope_multiplier = match cfg.envelope.as_ref() {
-        None => 1.0,
-        Some(fullmag_ir::TimeEnvelopeIR::Constant { value }) => *value,
-        Some(_) => unreachable!("non-constant SOT envelopes must fail construction"),
-    };
-    let current_density = cfg.current_density * envelope_multiplier;
+const BOLTZMANN_CONSTANT: f64 = 1.380649e-23;
+const MU0_THERMAL: f64 = 1.2566370614359173e-6;
 
-    match cfg.formula {
-        SotFormula::FullmagV1 => {
-            let gamma_e = gamma0 / MU0;
-            let omega_base = gamma_e * HBAR * current_density
-                / (2.0 * EXACT_E_CHARGE * saturation_magnetisation * cfg.thickness.max(1e-30));
-            let omega_dl = omega_base * cfg.xi_dl;
-            let omega_fl = omega_base * cfg.xi_fl;
-            let inv_gilbert = 1.0 / (1.0 + alpha * alpha);
-            (
-                (omega_dl - alpha * omega_fl) * inv_gilbert,
-                (omega_fl + alpha * omega_dl) * inv_gilbert,
-            )
-        }
-        SotFormula::LegacyFullmagV0 => {
-            let amplitude = current_density.abs() * HBAR
-                / (2.0
-                    * LEGACY_E_CHARGE
-                    * MU0
-                    * saturation_magnetisation
-                    * cfg.thickness.max(1e-30));
-            (amplitude * cfg.xi_dl, amplitude * cfg.xi_fl)
-        }
+/// Return the material-independent part of Brown's thermal amplitude.
+///
+/// The per-cell `Ms` and `alpha` factors are applied by
+/// `thermal_sigma_for_cell`, while the timestep factor is kept separate so a
+/// retry only changes one common multiplier.
+#[inline]
+fn thermal_base_factor(temperature: f64, gamma0: f64, cell_volume: f64) -> Option<f64> {
+    if !(temperature > 0.0
+        && gamma0 > 0.0
+        && cell_volume > 0.0
+        && temperature.is_finite()
+        && gamma0.is_finite()
+        && cell_volume.is_finite())
+    {
+        return None;
     }
+    let factor = 2.0 * BOLTZMANN_CONSTANT * temperature / (gamma0 * MU0_THERMAL * cell_volume);
+    factor.is_finite().then_some(factor)
 }
 
-/// Evaluate the backend-neutral prescribed-SOT local torque for one
-/// magnetization vector. FEM and FDM reference paths call this helper so the
-/// SI constants, Gilbert conversion, and cross-product signs stay identical.
-pub(crate) fn prescribed_sot_torque_from_config(
-    magnetization: Vector3,
-    cfg: &SotConfig,
-    saturation_magnetisation: f64,
-    gamma0: f64,
-    alpha: f64,
-) -> Vector3 {
-    let ms = saturation_magnetisation.max(1e-30);
-    let (damping_like, field_like) = prescribed_sot_scales(cfg, ms, gamma0, alpha);
-    let [sx, sy, sz] = cfg.sigma;
-    let snorm = (sx * sx + sy * sy + sz * sz).sqrt().max(1e-30);
-    let sigma = [sx / snorm, sy / snorm, sz / snorm];
-    let [m0, m1, m2] = magnetization;
-    let mxs = [
-        m1 * sigma[2] - m2 * sigma[1],
-        m2 * sigma[0] - m0 * sigma[2],
-        m0 * sigma[1] - m1 * sigma[0],
-    ];
-    let mmxs = [
-        m1 * mxs[2] - m2 * mxs[1],
-        m2 * mxs[0] - m0 * mxs[2],
-        m0 * mxs[1] - m1 * mxs[0],
-    ];
-    [
-        -damping_like * mmxs[0] + field_like * mxs[0],
-        -damping_like * mmxs[1] + field_like * mxs[1],
-        -damping_like * mmxs[2] + field_like * mxs[2],
-    ]
+#[inline]
+fn thermal_sigma_for_cell(base_factor: f64, dt_scale: f64, ms: f64, alpha: f64) -> Option<f64> {
+    if !(ms > 0.0 && alpha >= 0.0 && ms.is_finite() && alpha.is_finite()) {
+        return None;
+    }
+    let sigma = (base_factor * alpha / ms).sqrt() * dt_scale;
+    sigma.is_finite().then_some(sigma)
 }
 
 impl ExchangeLlgProblem {
     // ===================================================================
-    // Observables
-    // ===================================================================
-
-    pub(crate) fn observe_vectors_ws_at_time(
-        &self,
-        magnetization: &[Vector3],
-        ws: &mut FftWorkspace,
-        time_seconds: f64,
-    ) -> EffectiveFieldObservables {
-        let exchange_field = if self.terms.exchange {
-            self.exchange_field_from_vectors(magnetization)
-        } else {
-            zero_vectors(self.grid.cell_count())
-        };
-        let demag_field = if self.terms.demag {
-            self.demag_field_from_vectors_ws(magnetization, ws)
-        } else {
-            zero_vectors(self.grid.cell_count())
-        };
-        let external_field = self.external_field_vectors();
-        let mel_field = self.magnetoelastic_field(magnetization);
-        let ani_field = self.anisotropy_field(magnetization);
-        let idmi_field = self.interfacial_dmi_field(magnetization);
-        let bdmi_field = self.bulk_dmi_field(magnetization);
-        let dmi_field = idmi_field
-            .iter()
-            .zip(bdmi_field.iter())
-            .map(|(interfacial, bulk)| add(*interfacial, *bulk))
-            .collect::<Vec<_>>();
-        let mut effective_field =
-            combine_fields_4(&exchange_field, &demag_field, &external_field, &mel_field);
-        for (i, h) in effective_field.iter_mut().enumerate() {
-            *h = add(add(*h, ani_field[i]), dmi_field[i]);
-        }
-        let mut cylinder_oersted_field = zero_vectors(self.grid.cell_count());
-        self.oersted_field_add_into_at_time(&mut cylinder_oersted_field, time_seconds);
-        for (effective, oersted) in effective_field
-            .iter_mut()
-            .zip(cylinder_oersted_field.iter())
-        {
-            *effective = add(*effective, *oersted);
-        }
-        self.thermal_field_add_into(&mut effective_field);
-        let mut rhs = {
-            let compute = |i: usize| self.llg_rhs_from_field(magnetization[i], effective_field[i]);
-            #[cfg(feature = "parallel")]
-            {
-                (0..magnetization.len())
-                    .into_par_iter()
-                    .map(compute)
-                    .collect::<Vec<_>>()
-            }
-            #[cfg(not(feature = "parallel"))]
-            {
-                (0..magnetization.len()).map(compute).collect::<Vec<_>>()
-            }
-        };
-        // Observability owns a raw all-DOF RHS. Do not reuse the mutating
-        // final-RHS mask owner here: telemetry must retain pinned STT/SOT and
-        // thermal contributions while separately publishing the free subset.
-        self.direct_torques_add_into(magnetization, &mut rhs);
-
-        let exchange_energy_joules = if self.terms.exchange {
-            self.exchange_energy_from_field(magnetization, &exchange_field)
-        } else {
-            0.0
-        };
-        let demag_energy_joules = if self.terms.demag {
-            self.demag_energy_from_fields(magnetization, &demag_field)
-        } else {
-            0.0
-        };
-        let external_energy_joules = if self.terms.external_field.is_some()
-            || self.terms.per_node_field.is_some()
-            || self.static_external_field.is_some()
-            || self.terms.oersted_cylinder.is_some()
-        {
-            let combined_external = external_field
-                .iter()
-                .zip(cylinder_oersted_field.iter())
-                .map(|(external, oersted)| add(*external, *oersted))
-                .collect::<Vec<_>>();
-            self.external_energy_from_fields(magnetization, &combined_external)
-        } else {
-            0.0
-        };
-        let mel_energy_joules = self.magnetoelastic_energy(magnetization);
-        let ani_energy_joules = self.anisotropy_energy(magnetization);
-        let dmi_energy_joules = self.dmi_energy_from_vectors(magnetization);
-        let total_energy_joules = exchange_energy_joules
-            + demag_energy_joules
-            + external_energy_joules
-            + mel_energy_joules
-            + ani_energy_joules
-            + dmi_energy_joules;
-
-        let max_effective_field_amplitude = max_norm(&effective_field);
-        let max_demag_field_amplitude = max_norm(&demag_field);
-        let max_rhs_all_amplitude = max_norm(&rhs);
-        let max_torque_all_apm = max_cross_norm(magnetization, &effective_field);
-        let max_rhs_amplitude = self
-            .frozen_spins()
-            .map_or(max_rhs_all_amplitude, |frozen| frozen.max_norm_free(&rhs));
-        let max_torque_apm = self.frozen_spins().map_or(max_torque_all_apm, |frozen| {
-            frozen.max_cross_norm_free(magnetization, &effective_field)
-        });
-
-        EffectiveFieldObservables {
-            magnetization: magnetization.to_vec(),
-            exchange_field,
-            demag_field,
-            external_field,
-            effective_field: effective_field.clone(),
-            dmi_field,
-            exchange_energy_joules,
-            demag_energy_joules,
-            external_energy_joules,
-            anisotropy_energy_joules: ani_energy_joules,
-            dmi_energy_joules,
-            total_energy_joules,
-            max_effective_field_amplitude,
-            max_demag_field_amplitude,
-            max_rhs_amplitude,
-            max_rhs_all_amplitude,
-            max_torque_Apm: max_torque_apm,
-            max_torque_all_Apm: max_torque_all_apm,
-        }
-    }
-
-    // ===================================================================
     // Individual field terms (allocating)
     // ===================================================================
-
-    pub(crate) fn cell_exchange_field(
-        &self,
-        flat_index: usize,
-        magnetization: &[Vector3],
-        px: bool,
-        py: bool,
-        pz: bool,
-        dx2: f64,
-        dy2: f64,
-        dz2: f64,
-    ) -> Vector3 {
-        if !self.is_active(flat_index) {
-            return [0.0, 0.0, 0.0];
-        }
-        let grid = self.grid;
-        let x = flat_index % grid.nx;
-        let y = (flat_index / grid.nx) % grid.ny;
-        let z = flat_index / (grid.nx * grid.ny);
-        let center = magnetization[flat_index];
-        let ai = self.a_at(flat_index);
-        let ms_i = self.ms_at(flat_index);
-
-        let sample_neighbor_contrib = |nx: usize, ny: usize, nz: usize, dist2: f64| -> Vector3 {
-            let neighbor_index = grid.index(nx, ny, nz);
-            if self.is_active(neighbor_index) {
-                let aj = self.a_at(neighbor_index);
-                let aij = if ai == 0.0 || aj == 0.0 {
-                    0.0
-                } else {
-                    2.0 * ai * aj / (ai + aj)
-                };
-                let coeff = 2.0 * aij / (MU0 * ms_i * dist2);
-                scale(sub(magnetization[neighbor_index], center), coeff)
-            } else {
-                [0.0, 0.0, 0.0]
-            }
-        };
-
-        let x_minus_idx = neighbor_index(x, grid.nx, -1, px);
-        let x_plus_idx = neighbor_index(x, grid.nx, 1, px);
-        let y_minus_idx = neighbor_index(y, grid.ny, -1, py);
-        let y_plus_idx = neighbor_index(y, grid.ny, 1, py);
-        let z_minus_idx = neighbor_index(z, grid.nz, -1, pz);
-        let z_plus_idx = neighbor_index(z, grid.nz, 1, pz);
-
-        let h_x_minus = sample_neighbor_contrib(x_minus_idx, y, z, dx2);
-        let h_x_plus = sample_neighbor_contrib(x_plus_idx, y, z, dx2);
-        let h_y_minus = sample_neighbor_contrib(x, y_minus_idx, z, dy2);
-        let h_y_plus = sample_neighbor_contrib(x, y_plus_idx, z, dy2);
-        let h_z_minus = sample_neighbor_contrib(x, y, z_minus_idx, dz2);
-        let h_z_plus = sample_neighbor_contrib(x, y, z_plus_idx, dz2);
-
-        [
-            h_x_minus[0] + h_x_plus[0] + h_y_minus[0] + h_y_plus[0] + h_z_minus[0] + h_z_plus[0],
-            h_x_minus[1] + h_x_plus[1] + h_y_minus[1] + h_y_plus[1] + h_z_minus[1] + h_z_plus[1],
-            h_x_minus[2] + h_x_plus[2] + h_y_minus[2] + h_y_plus[2] + h_z_minus[2] + h_z_plus[2],
-        ]
-    }
-
-    pub(crate) fn exchange_field_from_vectors(&self, magnetization: &[Vector3]) -> Vec<Vector3> {
-        let grid = self.grid;
-        let dx2 = self.cell_size.dx * self.cell_size.dx;
-        let dy2 = self.cell_size.dy * self.cell_size.dy;
-        let dz2 = self.cell_size.dz * self.cell_size.dz;
-        let px = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-        let py = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-        let pz = matches!(self.boundary_policy.z, AxisBoundary::Periodic);
-
-        let compute_cell = |flat_index: usize| -> Vector3 {
-            self.cell_exchange_field(flat_index, magnetization, px, py, pz, dx2, dy2, dz2)
-        };
-
-        #[cfg(feature = "parallel")]
-        {
-            (0..grid.cell_count())
-                .into_par_iter()
-                .map(compute_cell)
-                .collect()
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            (0..grid.cell_count()).map(compute_cell).collect()
-        }
-    }
-
-    pub(crate) fn demag_field_from_vectors(&self, magnetization: &[Vector3]) -> Vec<Vector3> {
-        let mut ws = self.create_workspace();
-        self.demag_field_from_vectors_ws(magnetization, &mut ws)
-    }
-
-    pub(crate) fn observable_demag_field_from_vectors(
-        &self,
-        magnetization: &[Vector3],
-    ) -> Vec<Vector3> {
-        let mut ws = self.create_workspace();
-        self.observable_demag_field_from_vectors_ws(magnetization, &mut ws)
-    }
-
-    pub(crate) fn demag_field_from_vectors_ws(
-        &self,
-        magnetization: &[Vector3],
-        ws: &mut FftWorkspace,
-    ) -> Vec<Vector3> {
-        self.demag_field_from_vectors_ws_with_output_mask(magnetization, ws, true)
-    }
-
-    pub(crate) fn observable_demag_field_from_vectors_ws(
-        &self,
-        magnetization: &[Vector3],
-        ws: &mut FftWorkspace,
-    ) -> Vec<Vector3> {
-        self.demag_field_from_vectors_ws_with_output_mask(magnetization, ws, false)
-    }
-
-    fn demag_field_from_vectors_ws_with_output_mask(
-        &self,
-        magnetization: &[Vector3],
-        ws: &mut FftWorkspace,
-        mask_inactive_output: bool,
-    ) -> Vec<Vector3> {
-        let px = ws.px;
-        let py = ws.py;
-        let pz = ws.pz;
-        let padded_len = px * py * pz;
-
-        ws.clear_m_bufs();
-
-        for z in 0..self.grid.nz {
-            for y in 0..self.grid.ny {
-                for x in 0..self.grid.nx {
-                    let src_index = self.grid.index(x, y, z);
-                    let dst_index = padded_index(px, py, x, y, z);
-                    let moment = if self.is_active(src_index) {
-                        scale(magnetization[src_index], self.ms_at(src_index))
-                    } else {
-                        [0.0, 0.0, 0.0]
-                    };
-                    ws.buf_mx[dst_index] = Complex::new(moment[0], 0.0);
-                    ws.buf_my[dst_index] = Complex::new(moment[1], 0.0);
-                    ws.buf_mz[dst_index] = Complex::new(moment[2], 0.0);
-                }
-            }
-        }
-
-        ws.fft3_m_forward();
-
-        #[cfg(feature = "parallel")]
-        {
-            let (mx_sl, my_sl, mz_sl) = (&ws.buf_mx[..], &ws.buf_my[..], &ws.buf_mz[..]);
-            let (kxx, kyy, kzz) = (&ws.kern_xx[..], &ws.kern_yy[..], &ws.kern_zz[..]);
-            let (kxy, kxz, kyz) = (&ws.kern_xy[..], &ws.kern_xz[..], &ws.kern_yz[..]);
-            let hx = &mut ws.buf_hx[..];
-            let hy = &mut ws.buf_hy[..];
-            let hz = &mut ws.buf_hz[..];
-            hx.par_iter_mut().enumerate().for_each(|(i, h)| {
-                *h = -(kxx[i] * mx_sl[i] + kxy[i] * my_sl[i] + kxz[i] * mz_sl[i]);
-            });
-            hy.par_iter_mut().enumerate().for_each(|(i, h)| {
-                *h = -(kxy[i] * mx_sl[i] + kyy[i] * my_sl[i] + kyz[i] * mz_sl[i]);
-            });
-            hz.par_iter_mut().enumerate().for_each(|(i, h)| {
-                *h = -(kxz[i] * mx_sl[i] + kyz[i] * my_sl[i] + kzz[i] * mz_sl[i]);
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for i in 0..padded_len {
-                let mx = ws.buf_mx[i];
-                let my = ws.buf_my[i];
-                let mz = ws.buf_mz[i];
-                ws.buf_hx[i] = -(ws.kern_xx[i] * mx + ws.kern_xy[i] * my + ws.kern_xz[i] * mz);
-                ws.buf_hy[i] = -(ws.kern_xy[i] * mx + ws.kern_yy[i] * my + ws.kern_yz[i] * mz);
-                ws.buf_hz[i] = -(ws.kern_xz[i] * mx + ws.kern_yz[i] * my + ws.kern_zz[i] * mz);
-            }
-        }
-
-        ws.fft3_h_inverse();
-
-        let normalisation = 1.0 / padded_len as f64;
-        let mut field = vec![[0.0, 0.0, 0.0]; self.grid.cell_count()];
-        for z in 0..self.grid.nz {
-            for y in 0..self.grid.ny {
-                for x in 0..self.grid.nx {
-                    let src_index = padded_index(px, py, x, y, z);
-                    let dst_index = self.grid.index(x, y, z);
-                    field[dst_index] = if !mask_inactive_output || self.is_active(dst_index) {
-                        [
-                            ws.buf_hx[src_index].re * normalisation,
-                            ws.buf_hy[src_index].re * normalisation,
-                            ws.buf_hz[src_index].re * normalisation,
-                        ]
-                    } else {
-                        [0.0, 0.0, 0.0]
-                    };
-                }
-            }
-        }
-
-        field
-    }
-
-    pub(crate) fn external_field_vectors(&self) -> Vec<Vector3> {
-        let external = self.terms.external_field.unwrap_or([0.0, 0.0, 0.0]);
-        (0..self.grid.cell_count())
-            .map(|i| {
-                if !self.is_active(i) {
-                    return [0.0, 0.0, 0.0];
-                }
-                let mut value = external;
-                if let Some(per_node_field) = self.terms.per_node_field.as_ref() {
-                    if let Some(node_value) = per_node_field.get(i) {
-                        value[0] += node_value[0];
-                        value[1] += node_value[1];
-                        value[2] += node_value[2];
-                    }
-                }
-                if let Some(static_field) = self.static_external_field.as_ref() {
-                    if let Some(node_value) = static_field.get(i) {
-                        value[0] += node_value[0];
-                        value[1] += node_value[1];
-                        value[2] += node_value[2];
-                    }
-                }
-                value
-            })
-            .collect()
-    }
-
-    pub(crate) fn has_external_zeeman_source(&self) -> bool {
-        self.terms.external_field.is_some()
-            || self.terms.per_node_field.is_some()
-            || self.static_external_field.is_some()
-            || self.terms.oersted_cylinder.is_some()
-    }
-
-    pub(crate) fn external_zeeman_field_vectors(&self) -> Vec<Vector3> {
-        let mut field = self.external_field_vectors();
-        self.oersted_field_add_into(&mut field);
-        field
-    }
-
-    pub(crate) fn magnetoelastic_field(&self, magnetization: &[Vector3]) -> Vec<Vector3> {
-        match &self.terms.magnetoelastic {
-            Some(config) => magnetoelastic::h_mel_field(
-                magnetization,
-                &config.strain,
-                &config.params,
-                self.active_mask.as_deref(),
-            ),
-            None => zero_vectors(self.grid.cell_count()),
-        }
-    }
-
-    pub(crate) fn magnetoelastic_energy(&self, magnetization: &[Vector3]) -> f64 {
-        match &self.terms.magnetoelastic {
-            Some(config) => {
-                let cell_volume = self.cell_size.dx * self.cell_size.dy * self.cell_size.dz;
-                magnetoelastic::e_mel_total(
-                    magnetization,
-                    &config.strain,
-                    &config.params,
-                    cell_volume,
-                    self.active_mask.as_deref(),
-                )
-            }
-            None => 0.0,
-        }
-    }
-
-    pub(crate) fn magnetoelastic_energy_soa(&self, magnetization: &VectorFieldSoA) -> f64 {
-        let config = match &self.terms.magnetoelastic {
-            Some(config) => config,
-            None => return 0.0,
-        };
-        let n = magnetization.len();
-        let cell_volume = self.cell_size.volume();
-
-        let compute_cell = |i: usize, strain: &magnetoelastic::StrainVoigt| {
-            if self.is_active(i) {
-                magnetoelastic::e_mel_density_single(
-                    [magnetization.x[i], magnetization.y[i], magnetization.z[i]],
-                    strain,
-                    &config.params,
-                )
-            } else {
-                0.0
-            }
-        };
-
-        let sum: f64 = match &config.strain {
-            magnetoelastic::PrescribedStrainField::Uniform(strain) => {
-                (0..n).map(|i| compute_cell(i, strain)).sum()
-            }
-            magnetoelastic::PrescribedStrainField::PerCell(strain) => {
-                assert_eq!(
-                    strain.len(),
-                    n,
-                    "strain field length must match magnetization"
-                );
-                (0..n).map(|i| compute_cell(i, &strain[i])).sum()
-            }
-        };
-        sum * cell_volume
-    }
-
-    /// Return the uniaxial and cubic contributions separately.  The solver
-    /// uses their sum, while field materialization needs the canonical
-    /// quantity split (`H_ani` versus `H_ani_cubic`).
-    pub fn anisotropy_field_components(
-        &self,
-        magnetization: &[Vector3],
-    ) -> (Vec<Vector3>, Vec<Vector3>) {
-        let mut uniaxial = zero_vectors(self.grid.cell_count());
-        let mut cubic = zero_vectors(self.grid.cell_count());
-        if self.terms.uniaxial_anisotropy.is_none() && self.terms.cubic_anisotropy.is_none() {
-            return (uniaxial, cubic);
-        }
-        for (i, m) in magnetization.iter().enumerate() {
-            if !self.is_active(i) {
-                continue;
-            }
-            let ms_safe = self.ms_at(i).max(1e-30);
-            if let Some(ref uni) = self.terms.uniaxial_anisotropy {
-                let n = norm(uni.axis).max(1e-30);
-                let u = scale(uni.axis, 1.0 / n);
-                let m_dot_u = dot(*m, u);
-                let coeff = 2.0 * uni.ku1 / (MU0 * ms_safe) * m_dot_u
-                    + 4.0 * uni.ku2 / (MU0 * ms_safe) * m_dot_u * m_dot_u * m_dot_u;
-                uniaxial[i] = scale(u, coeff);
-            }
-            if let Some(ref cub) = self.terms.cubic_anisotropy {
-                let n1 = norm(cub.axis1).max(1e-30);
-                let n2 = norm(cub.axis2).max(1e-30);
-                let c1 = scale(cub.axis1, 1.0 / n1);
-                let c2 = scale(cub.axis2, 1.0 / n2);
-                let c3 = cross(c1, c2);
-                let m1 = dot(*m, c1);
-                let m2 = dot(*m, c2);
-                let m3 = dot(*m, c3);
-                let sigma = m1 * m1 * m2 * m2 + m2 * m2 * m3 * m3 + m1 * m1 * m3 * m3;
-                let pf = 2.0 / (MU0 * ms_safe);
-                let g1 = -pf
-                    * (cub.kc1 * m1 * (m2 * m2 + m3 * m3)
-                        + cub.kc2 * m1 * m2 * m2 * m3 * m3
-                        + 2.0 * cub.kc3 * sigma * m1 * (m2 * m2 + m3 * m3));
-                let g2 = -pf
-                    * (cub.kc1 * m2 * (m1 * m1 + m3 * m3)
-                        + cub.kc2 * m2 * m1 * m1 * m3 * m3
-                        + 2.0 * cub.kc3 * sigma * m2 * (m1 * m1 + m3 * m3));
-                let g3 = -pf
-                    * (cub.kc1 * m3 * (m1 * m1 + m2 * m2)
-                        + cub.kc2 * m3 * m1 * m1 * m2 * m2
-                        + 2.0 * cub.kc3 * sigma * m3 * (m1 * m1 + m2 * m2));
-                cubic[i] = add(add(scale(c1, g1), scale(c2, g2)), scale(c3, g3));
-            }
-        }
-        (uniaxial, cubic)
-    }
-
-    pub fn anisotropy_field(&self, magnetization: &[Vector3]) -> Vec<Vector3> {
-        let (uniaxial, cubic) = self.anisotropy_field_components(magnetization);
-        uniaxial
-            .into_iter()
-            .zip(cubic)
-            .map(|(uniaxial, cubic)| add(uniaxial, cubic))
-            .collect()
-    }
-
-    pub(crate) fn anisotropy_energy(&self, magnetization: &[Vector3]) -> f64 {
-        let cell_volume = self.cell_size.volume();
-        self.anisotropy_energy_density_from_vectors(magnetization)
-            .into_iter()
-            .map(|density| density * cell_volume)
-            .sum()
-    }
-
-    pub(crate) fn anisotropy_energy_from_soa(&self, magnetization: &VectorFieldSoA) -> f64 {
-        let uni_data = self.terms.uniaxial_anisotropy.as_ref().map(|uni| {
-            let n = norm(uni.axis).max(1e-30);
-            (scale(uni.axis, 1.0 / n), uni.ku1, uni.ku2)
-        });
-        let cub_data = self.terms.cubic_anisotropy.as_ref().map(|cub| {
-            let n1 = norm(cub.axis1).max(1e-30);
-            let n2 = norm(cub.axis2).max(1e-30);
-            let c1 = scale(cub.axis1, 1.0 / n1);
-            let c2 = scale(cub.axis2, 1.0 / n2);
-            (c1, c2, cross(c1, c2), cub.kc1, cub.kc2, cub.kc3)
-        });
-        let cell_volume = self.cell_size.volume();
-
-        (0..magnetization.len())
-            .filter(|&i| self.is_active(i))
-            .map(|i| {
-                let m = [magnetization.x[i], magnetization.y[i], magnetization.z[i]];
-                anisotropy_energy_density_for_magnetization(m, uni_data, cub_data) * cell_volume
-            })
-            .sum()
-    }
-
-    pub(crate) fn dmi_energy_from_vectors(&self, magnetization: &[Vector3]) -> f64 {
-        let cell_volume = self.cell_size.volume();
-        self.dmi_energy_density_from_vectors(magnetization)
-            .into_iter()
-            .map(|density| density * cell_volume)
-            .sum()
-    }
-
-    pub fn dmi_energy_density_from_vectors(&self, magnetization: &[Vector3]) -> Vec<f64> {
-        let interfacial_dmi = match self.terms.interfacial_dmi {
-            Some(d) if d.abs() > 0.0 => Some(d),
-            _ => None,
-        };
-        let bulk_dmi = match self.terms.bulk_dmi {
-            Some(d) if d.abs() > 0.0 => Some(d),
-            _ => None,
-        };
-        if interfacial_dmi.is_none() && bulk_dmi.is_none() {
-            return vec![0.0; self.grid.cell_count()];
-        }
-
-        let grid = self.grid;
-        let dx = self.cell_size.dx;
-        let dy = self.cell_size.dy;
-        let dz = self.cell_size.dz;
-        let bpx = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-        let bpy = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-        let bpz = matches!(self.boundary_policy.z, AxisBoundary::Periodic);
-
-        let compute = |flat: usize| -> f64 {
-            if !self.is_active(flat) {
-                return 0.0;
-            }
-            let x = flat % grid.nx;
-            let y = (flat / grid.nx) % grid.ny;
-            let z = flat / (grid.nx * grid.ny);
-            let sample = |neighbor: usize| {
-                if self.is_active(neighbor) {
-                    neighbor
-                } else {
-                    flat
-                }
-            };
-            let xp = sample(grid.index(neighbor_index(x, grid.nx, 1, bpx), y, z));
-            let xm = sample(grid.index(neighbor_index(x, grid.nx, -1, bpx), y, z));
-            let yp = sample(grid.index(x, neighbor_index(y, grid.ny, 1, bpy), z));
-            let ym = sample(grid.index(x, neighbor_index(y, grid.ny, -1, bpy), z));
-            let zp = sample(grid.index(x, y, neighbor_index(z, grid.nz, 1, bpz)));
-            let zm = sample(grid.index(x, y, neighbor_index(z, grid.nz, -1, bpz)));
-
-            let m = magnetization[flat];
-            let mut energy = 0.0;
-            if let Some(d) = interfacial_dmi {
-                let dmx_dx = (magnetization[xp][0] - magnetization[xm][0]) / (2.0 * dx);
-                let dmy_dy = (magnetization[yp][1] - magnetization[ym][1]) / (2.0 * dy);
-                let dmz_dx = (magnetization[xp][2] - magnetization[xm][2]) / (2.0 * dx);
-                let dmz_dy = (magnetization[yp][2] - magnetization[ym][2]) / (2.0 * dy);
-                energy += d * (m[2] * (dmx_dx + dmy_dy) - m[0] * dmz_dx - m[1] * dmz_dy);
-            }
-            if let Some(d) = bulk_dmi {
-                let curl_x = (magnetization[yp][2] - magnetization[ym][2]) / (2.0 * dy)
-                    - (magnetization[zp][1] - magnetization[zm][1]) / (2.0 * dz);
-                let curl_y = (magnetization[zp][0] - magnetization[zm][0]) / (2.0 * dz)
-                    - (magnetization[xp][2] - magnetization[xm][2]) / (2.0 * dx);
-                let curl_z = (magnetization[xp][1] - magnetization[xm][1]) / (2.0 * dx)
-                    - (magnetization[yp][0] - magnetization[ym][0]) / (2.0 * dy);
-                energy += d * (m[0] * curl_x + m[1] * curl_y + m[2] * curl_z);
-            }
-            energy
-        };
-
-        #[cfg(feature = "parallel")]
-        {
-            (0..grid.cell_count())
-                .into_par_iter()
-                .map(compute)
-                .collect()
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            (0..grid.cell_count()).map(compute).collect()
-        }
-    }
-
-    pub(crate) fn dmi_energy_from_soa(&self, magnetization: &VectorFieldSoA) -> f64 {
-        let interfacial_dmi = match self.terms.interfacial_dmi {
-            Some(d) if d.abs() > 0.0 => Some(d),
-            _ => None,
-        };
-        let bulk_dmi = match self.terms.bulk_dmi {
-            Some(d) if d.abs() > 0.0 => Some(d),
-            _ => None,
-        };
-        if interfacial_dmi.is_none() && bulk_dmi.is_none() {
-            return 0.0;
-        }
-
-        let grid = self.grid;
-        let dx = self.cell_size.dx;
-        let dy = self.cell_size.dy;
-        let dz = self.cell_size.dz;
-        let cell_volume = self.cell_size.volume();
-        let bpx = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-        let bpy = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-        let bpz = matches!(self.boundary_policy.z, AxisBoundary::Periodic);
-
-        let mut energy = 0.0;
-        for flat in 0..grid.cell_count() {
-            if !self.is_active(flat) {
-                continue;
-            }
-            let x = flat % grid.nx;
-            let y = (flat / grid.nx) % grid.ny;
-            let z = flat / (grid.nx * grid.ny);
-            let sample = |neighbor: usize| {
-                if self.is_active(neighbor) {
-                    neighbor
-                } else {
-                    flat
-                }
-            };
-            let xp = sample(grid.index(neighbor_index(x, grid.nx, 1, bpx), y, z));
-            let xm = sample(grid.index(neighbor_index(x, grid.nx, -1, bpx), y, z));
-            let yp = sample(grid.index(x, neighbor_index(y, grid.ny, 1, bpy), z));
-            let ym = sample(grid.index(x, neighbor_index(y, grid.ny, -1, bpy), z));
-            let zp = sample(grid.index(x, y, neighbor_index(z, grid.nz, 1, bpz)));
-            let zm = sample(grid.index(x, y, neighbor_index(z, grid.nz, -1, bpz)));
-
-            let mx = magnetization.x[flat];
-            let my = magnetization.y[flat];
-            let mz = magnetization.z[flat];
-            if let Some(d) = interfacial_dmi {
-                let dmx_dx = (magnetization.x[xp] - magnetization.x[xm]) / (2.0 * dx);
-                let dmy_dy = (magnetization.y[yp] - magnetization.y[ym]) / (2.0 * dy);
-                let dmz_dx = (magnetization.z[xp] - magnetization.z[xm]) / (2.0 * dx);
-                let dmz_dy = (magnetization.z[yp] - magnetization.z[ym]) / (2.0 * dy);
-                energy += cell_volume * d * (mz * (dmx_dx + dmy_dy) - mx * dmz_dx - my * dmz_dy);
-            }
-            if let Some(d) = bulk_dmi {
-                let curl_x = (magnetization.z[yp] - magnetization.z[ym]) / (2.0 * dy)
-                    - (magnetization.y[zp] - magnetization.y[zm]) / (2.0 * dz);
-                let curl_y = (magnetization.x[zp] - magnetization.x[zm]) / (2.0 * dz)
-                    - (magnetization.z[xp] - magnetization.z[xm]) / (2.0 * dx);
-                let curl_z = (magnetization.y[xp] - magnetization.y[xm]) / (2.0 * dx)
-                    - (magnetization.x[yp] - magnetization.x[ym]) / (2.0 * dy);
-                energy += cell_volume * d * (mx * curl_x + my * curl_y + mz * curl_z);
-            }
-        }
-        energy
-    }
-
-    pub fn interfacial_dmi_field(&self, magnetization: &[Vector3]) -> Vec<Vector3> {
-        let d = match self.terms.interfacial_dmi {
-            Some(d) if d.abs() > 0.0 => d,
-            _ => return zero_vectors(self.grid.cell_count()),
-        };
-        let nx = self.grid.nx;
-        let ny = self.grid.ny;
-        let _nz = self.grid.nz;
-        let dx = self.cell_size.dx;
-        let dy = self.cell_size.dy;
-        let px = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-        let py = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-
-        (0..self.grid.cell_count())
-            .map(|flat| {
-                if !self.is_active(flat) {
-                    return [0.0, 0.0, 0.0];
-                }
-                let ms = self.ms_at(flat).max(1e-30);
-                let pf = 2.0 * d / (MU0 * ms);
-                let x = flat % nx;
-                let y = (flat / nx) % ny;
-                let z = flat / (nx * ny);
-                let center = magnetization[flat];
-                let sample = |neighbor: usize| {
-                    if self.is_active(neighbor) {
-                        magnetization[neighbor]
-                    } else {
-                        center
-                    }
-                };
-
-                let xp = sample(self.grid.index(neighbor_index(x, nx, 1, px), y, z));
-                let xm = sample(self.grid.index(neighbor_index(x, nx, -1, px), y, z));
-                let yp = sample(self.grid.index(x, neighbor_index(y, ny, 1, py), z));
-                let ym = sample(self.grid.index(x, neighbor_index(y, ny, -1, py), z));
-
-                let dx_mz = (xp[2] - xm[2]) / (2.0 * dx);
-                let dy_mz = (yp[2] - ym[2]) / (2.0 * dy);
-                let dx_mx = (xp[0] - xm[0]) / (2.0 * dx);
-                let dy_my = (yp[1] - ym[1]) / (2.0 * dy);
-
-                [pf * dx_mz, pf * dy_mz, -pf * (dx_mx + dy_my)]
-            })
-            .collect()
-    }
-
-    pub fn bulk_dmi_field(&self, magnetization: &[Vector3]) -> Vec<Vector3> {
-        let d = match self.terms.bulk_dmi {
-            Some(d) if d.abs() > 0.0 => d,
-            _ => return zero_vectors(self.grid.cell_count()),
-        };
-        let nx = self.grid.nx;
-        let ny = self.grid.ny;
-        let nz = self.grid.nz;
-        let dx = self.cell_size.dx;
-        let dy = self.cell_size.dy;
-        let dz = self.cell_size.dz;
-        let px = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-        let py = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-        let pz = matches!(self.boundary_policy.z, AxisBoundary::Periodic);
-
-        (0..self.grid.cell_count())
-            .map(|flat| {
-                if !self.is_active(flat) {
-                    return [0.0, 0.0, 0.0];
-                }
-                let ms = self.ms_at(flat).max(1e-30);
-                let pf = -2.0 * d / (MU0 * ms);
-                let x = flat % nx;
-                let y = (flat / nx) % ny;
-                let z = flat / (nx * ny);
-                let center = magnetization[flat];
-                let sample = |neighbor: usize| {
-                    if self.is_active(neighbor) {
-                        magnetization[neighbor]
-                    } else {
-                        center
-                    }
-                };
-
-                let xp = sample(self.grid.index(neighbor_index(x, nx, 1, px), y, z));
-                let xm = sample(self.grid.index(neighbor_index(x, nx, -1, px), y, z));
-                let yp = sample(self.grid.index(x, neighbor_index(y, ny, 1, py), z));
-                let ym = sample(self.grid.index(x, neighbor_index(y, ny, -1, py), z));
-                let zp = sample(self.grid.index(x, y, neighbor_index(z, nz, 1, pz)));
-                let zm = sample(self.grid.index(x, y, neighbor_index(z, nz, -1, pz)));
-
-                let curl_x = (yp[2] - ym[2]) / (2.0 * dy) - (zp[1] - zm[1]) / (2.0 * dz);
-                let curl_y = (zp[0] - zm[0]) / (2.0 * dz) - (xp[2] - xm[2]) / (2.0 * dx);
-                let curl_z = (xp[1] - xm[1]) / (2.0 * dx) - (yp[0] - ym[0]) / (2.0 * dy);
-
-                [pf * curl_x, pf * curl_y, pf * curl_z]
-            })
-            .collect()
-    }
 
     // ===================================================================
     // Zero-allocation in-place field accumulation methods
     // ===================================================================
 
-    pub(crate) fn exchange_field_add_into(&self, magnetization: &[Vector3], h_eff: &mut [Vector3]) {
-        #[cfg(not(feature = "parallel"))]
-        let grid = self.grid;
-        let dx2 = self.cell_size.dx * self.cell_size.dx;
-        let dy2 = self.cell_size.dy * self.cell_size.dy;
-        let dz2 = self.cell_size.dz * self.cell_size.dz;
-        let px = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-        let py = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-        let pz = matches!(self.boundary_policy.z, AxisBoundary::Periodic);
-
-        #[cfg(feature = "parallel")]
-        {
-            h_eff
-                .par_iter_mut()
-                .enumerate()
-                .for_each(|(flat_index, h)| {
-                    let h_ex = self.cell_exchange_field(
-                        flat_index,
-                        magnetization,
-                        px,
-                        py,
-                        pz,
-                        dx2,
-                        dy2,
-                        dz2,
-                    );
-                    h[0] += h_ex[0];
-                    h[1] += h_ex[1];
-                    h[2] += h_ex[2];
-                });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for flat_index in 0..grid.cell_count() {
-                let h_ex =
-                    self.cell_exchange_field(flat_index, magnetization, px, py, pz, dx2, dy2, dz2);
-                let h = &mut h_eff[flat_index];
-                h[0] += h_ex[0];
-                h[1] += h_ex[1];
-                h[2] += h_ex[2];
-            }
-        }
-    }
-
-    pub(crate) fn demag_field_add_into(
-        &self,
-        magnetization: &[Vector3],
-        ws: &mut FftWorkspace,
-        h_eff: &mut [Vector3],
-    ) {
-        let px = ws.px;
-        let py = ws.py;
-        let pz = ws.pz;
-        let padded_len = px * py * pz;
-
-        ws.clear_m_bufs();
-
-        for z in 0..self.grid.nz {
-            for y in 0..self.grid.ny {
-                for x in 0..self.grid.nx {
-                    let src_index = self.grid.index(x, y, z);
-                    let dst_index = padded_index(px, py, x, y, z);
-                    let moment = if self.is_active(src_index) {
-                        scale(magnetization[src_index], self.ms_at(src_index))
-                    } else {
-                        [0.0, 0.0, 0.0]
-                    };
-                    ws.buf_mx[dst_index] = Complex::new(moment[0], 0.0);
-                    ws.buf_my[dst_index] = Complex::new(moment[1], 0.0);
-                    ws.buf_mz[dst_index] = Complex::new(moment[2], 0.0);
-                }
-            }
-        }
-
-        ws.fft3_m_forward();
-
-        #[cfg(feature = "parallel")]
-        {
-            let (mx_sl, my_sl, mz_sl) = (&ws.buf_mx[..], &ws.buf_my[..], &ws.buf_mz[..]);
-            let (kxx, kyy, kzz) = (&ws.kern_xx[..], &ws.kern_yy[..], &ws.kern_zz[..]);
-            let (kxy, kxz, kyz) = (&ws.kern_xy[..], &ws.kern_xz[..], &ws.kern_yz[..]);
-            let hx = &mut ws.buf_hx[..];
-            let hy = &mut ws.buf_hy[..];
-            let hz = &mut ws.buf_hz[..];
-            hx.par_iter_mut().enumerate().for_each(|(i, h)| {
-                *h = -(kxx[i] * mx_sl[i] + kxy[i] * my_sl[i] + kxz[i] * mz_sl[i]);
-            });
-            hy.par_iter_mut().enumerate().for_each(|(i, h)| {
-                *h = -(kxy[i] * mx_sl[i] + kyy[i] * my_sl[i] + kyz[i] * mz_sl[i]);
-            });
-            hz.par_iter_mut().enumerate().for_each(|(i, h)| {
-                *h = -(kxz[i] * mx_sl[i] + kyz[i] * my_sl[i] + kzz[i] * mz_sl[i]);
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for i in 0..padded_len {
-                let mx = ws.buf_mx[i];
-                let my = ws.buf_my[i];
-                let mz = ws.buf_mz[i];
-                ws.buf_hx[i] = -(ws.kern_xx[i] * mx + ws.kern_xy[i] * my + ws.kern_xz[i] * mz);
-                ws.buf_hy[i] = -(ws.kern_xy[i] * mx + ws.kern_yy[i] * my + ws.kern_yz[i] * mz);
-                ws.buf_hz[i] = -(ws.kern_xz[i] * mx + ws.kern_yz[i] * my + ws.kern_zz[i] * mz);
-            }
-        }
-
-        ws.fft3_h_inverse();
-
-        let normalisation = 1.0 / padded_len as f64;
-        for z in 0..self.grid.nz {
-            for y in 0..self.grid.ny {
-                for x in 0..self.grid.nx {
-                    let src_index = padded_index(px, py, x, y, z);
-                    let dst_index = self.grid.index(x, y, z);
-                    if self.is_active(dst_index) {
-                        h_eff[dst_index][0] += ws.buf_hx[src_index].re * normalisation;
-                        h_eff[dst_index][1] += ws.buf_hy[src_index].re * normalisation;
-                        h_eff[dst_index][2] += ws.buf_hz[src_index].re * normalisation;
-                    }
-                }
-            }
-        }
-    }
-
-    pub(crate) fn external_field_add_into(&self, h_eff: &mut [Vector3]) {
-        let ext = self.terms.external_field.unwrap_or([0.0, 0.0, 0.0]);
-        let per_node_field = self.terms.per_node_field.as_ref();
-        let static_field = self.static_external_field.as_ref();
-        if self.terms.external_field.is_some() || per_node_field.is_some() || static_field.is_some()
-        {
-            #[cfg(feature = "parallel")]
-            {
-                h_eff.par_iter_mut().enumerate().for_each(|(i, h)| {
-                    if self.is_active(i) {
-                        h[0] += ext[0];
-                        h[1] += ext[1];
-                        h[2] += ext[2];
-                        if let Some(value) = per_node_field.and_then(|field| field.get(i)) {
-                            h[0] += value[0];
-                            h[1] += value[1];
-                            h[2] += value[2];
-                        }
-                        if let Some(value) = static_field.and_then(|field| field.get(i)) {
-                            h[0] += value[0];
-                            h[1] += value[1];
-                            h[2] += value[2];
-                        }
-                    }
-                });
-            }
-            #[cfg(not(feature = "parallel"))]
-            {
-                for i in 0..h_eff.len() {
-                    if self.is_active(i) {
-                        h_eff[i][0] += ext[0];
-                        h_eff[i][1] += ext[1];
-                        h_eff[i][2] += ext[2];
-                        if let Some(value) = per_node_field.and_then(|field| field.get(i)) {
-                            h_eff[i][0] += value[0];
-                            h_eff[i][1] += value[1];
-                            h_eff[i][2] += value[2];
-                        }
-                        if let Some(value) = static_field.and_then(|field| field.get(i)) {
-                            h_eff[i][0] += value[0];
-                            h_eff[i][1] += value[1];
-                            h_eff[i][2] += value[2];
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    pub(crate) fn demag_field_add_into_soa_fft_backend(
-        &self,
-        magnetization: &VectorFieldSoA,
-        fft_backend: &mut dyn FdmFftBackend,
-        h_eff: &mut VectorFieldSoA,
-    ) {
-        fft_backend.convolve_demag(
-            magnetization,
-            self.material.saturation_magnetisation,
-            self.active_mask.as_deref(),
-            h_eff,
-        );
-    }
-
     /// Whether the problem can step through the persistent SoA CPU fast path.
     pub fn soa_fast_path_supported(&self) -> bool {
-        self.frozen_spins
+        self.soa_fast_path_rejection_reason().is_none()
+    }
+
+    /// Stable capability reason for a problem that cannot use the persistent
+    /// SoA CPU layout.  The caller may keep the AoS layout only when this
+    /// capability is rejected before the session starts; no mid-step layout
+    /// fallback is allowed.
+    pub fn soa_fast_path_rejection_reason(&self) -> Option<&'static str> {
+        if self
+            .frozen_spins
             .as_ref()
-            .is_none_or(|frozen| frozen.frozen_dof_count() == 0)
-    }
-
-    pub(crate) fn exchange_field_add_into_soa(
-        &self,
-        magnetization: &VectorFieldSoA,
-        h_eff: &mut VectorFieldSoA,
-    ) {
-        let prefactor =
-            2.0 * self.material.exchange_stiffness / (MU0 * self.material.saturation_magnetisation);
-        let dx2 = self.cell_size.dx * self.cell_size.dx;
-        let dy2 = self.cell_size.dy * self.cell_size.dy;
-        let dz2 = self.cell_size.dz * self.cell_size.dz;
-        let grid = self.grid;
-        let px = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-        let py = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-        let pz = matches!(self.boundary_policy.z, AxisBoundary::Periodic);
-
-        for flat_index in 0..grid.cell_count() {
-            if !self.is_active(flat_index) {
-                continue;
-            }
-            let x = flat_index % grid.nx;
-            let y = (flat_index / grid.nx) % grid.ny;
-            let z = flat_index / (grid.nx * grid.ny);
-            let center_x = magnetization.x[flat_index];
-            let center_y = magnetization.y[flat_index];
-            let center_z = magnetization.z[flat_index];
-            let sample = |nx: usize, ny: usize, nz: usize| -> Vector3 {
-                let ni = grid.index(nx, ny, nz);
-                if self.is_active(ni) {
-                    [
-                        magnetization.x[ni],
-                        magnetization.y[ni],
-                        magnetization.z[ni],
-                    ]
-                } else {
-                    [center_x, center_y, center_z]
-                }
-            };
-
-            let x_minus = sample(neighbor_index(x, grid.nx, -1, px), y, z);
-            let x_plus = sample(neighbor_index(x, grid.nx, 1, px), y, z);
-            let y_minus = sample(x, neighbor_index(y, grid.ny, -1, py), z);
-            let y_plus = sample(x, neighbor_index(y, grid.ny, 1, py), z);
-            let z_minus = sample(x, y, neighbor_index(z, grid.nz, -1, pz));
-            let z_plus = sample(x, y, neighbor_index(z, grid.nz, 1, pz));
-
-            h_eff.x[flat_index] += prefactor
-                * ((x_plus[0] - 2.0 * center_x + x_minus[0]) / dx2
-                    + (y_plus[0] - 2.0 * center_x + y_minus[0]) / dy2
-                    + (z_plus[0] - 2.0 * center_x + z_minus[0]) / dz2);
-            h_eff.y[flat_index] += prefactor
-                * ((x_plus[1] - 2.0 * center_y + x_minus[1]) / dx2
-                    + (y_plus[1] - 2.0 * center_y + y_minus[1]) / dy2
-                    + (z_plus[1] - 2.0 * center_y + z_minus[1]) / dz2);
-            h_eff.z[flat_index] += prefactor
-                * ((x_plus[2] - 2.0 * center_z + x_minus[2]) / dx2
-                    + (y_plus[2] - 2.0 * center_z + y_minus[2]) / dy2
-                    + (z_plus[2] - 2.0 * center_z + z_minus[2]) / dz2);
+            .is_some_and(|frozen| frozen.frozen_dof_count() != 0)
+        {
+            return Some("frozen_spins");
         }
-    }
-
-    pub(crate) fn anisotropy_field_add_into_soa(
-        &self,
-        magnetization: &VectorFieldSoA,
-        h_eff: &mut VectorFieldSoA,
-    ) {
-        let has_uni = self.terms.uniaxial_anisotropy.is_some();
-        let has_cub = self.terms.cubic_anisotropy.is_some();
-        if !has_uni && !has_cub {
-            return;
+        if self.ms_field.is_some() {
+            return Some("spatial_saturation_magnetisation");
         }
-        let ms_safe = self.material.saturation_magnetisation.max(1e-30);
-
-        let uni_data = self.terms.uniaxial_anisotropy.as_ref().map(|uni| {
-            let n = norm(uni.axis).max(1e-30);
-            let u = scale(uni.axis, 1.0 / n);
-            (u, uni.ku1, uni.ku2)
-        });
-        let cub_data = self.terms.cubic_anisotropy.as_ref().map(|cub| {
-            let n1 = norm(cub.axis1).max(1e-30);
-            let n2 = norm(cub.axis2).max(1e-30);
-            let c1 = scale(cub.axis1, 1.0 / n1);
-            let c2 = scale(cub.axis2, 1.0 / n2);
-            let c3 = cross(c1, c2);
-            (c1, c2, c3, cub.kc1, cub.kc2, cub.kc3)
-        });
-
-        for i in 0..magnetization.len() {
-            if !self.is_active(i) {
-                continue;
-            }
-            let mx = magnetization.x[i];
-            let my = magnetization.y[i];
-            let mz = magnetization.z[i];
-
-            if let Some((u, ku1, ku2)) = &uni_data {
-                let m_dot_u = mx * u[0] + my * u[1] + mz * u[2];
-                let coeff = 2.0 * ku1 / (MU0 * ms_safe) * m_dot_u
-                    + 4.0 * ku2 / (MU0 * ms_safe) * m_dot_u * m_dot_u * m_dot_u;
-                h_eff.x[i] += u[0] * coeff;
-                h_eff.y[i] += u[1] * coeff;
-                h_eff.z[i] += u[2] * coeff;
-            }
-            if let Some((c1, c2, c3, kc1, kc2, kc3)) = &cub_data {
-                let m1 = mx * c1[0] + my * c1[1] + mz * c1[2];
-                let m2 = mx * c2[0] + my * c2[1] + mz * c2[2];
-                let m3 = mx * c3[0] + my * c3[1] + mz * c3[2];
-                let sigma = m1 * m1 * m2 * m2 + m2 * m2 * m3 * m3 + m1 * m1 * m3 * m3;
-                let pf = 2.0 / (MU0 * ms_safe);
-                let g1 = -pf
-                    * (kc1 * m1 * (m2 * m2 + m3 * m3)
-                        + kc2 * m1 * m2 * m2 * m3 * m3
-                        + 2.0 * kc3 * sigma * m1 * (m2 * m2 + m3 * m3));
-                let g2 = -pf
-                    * (kc1 * m2 * (m1 * m1 + m3 * m3)
-                        + kc2 * m2 * m1 * m1 * m3 * m3
-                        + 2.0 * kc3 * sigma * m2 * (m1 * m1 + m3 * m3));
-                let g3 = -pf
-                    * (kc1 * m3 * (m1 * m1 + m2 * m2)
-                        + kc2 * m3 * m1 * m1 * m2 * m2
-                        + 2.0 * kc3 * sigma * m3 * (m1 * m1 + m2 * m2));
-                h_eff.x[i] += c1[0] * g1 + c2[0] * g2 + c3[0] * g3;
-                h_eff.y[i] += c1[1] * g1 + c2[1] * g2 + c3[1] * g3;
-                h_eff.z[i] += c1[2] * g1 + c2[2] * g2 + c3[2] * g3;
-            }
+        if self.a_field.is_some() {
+            return Some("spatial_exchange_stiffness");
         }
-    }
-
-    pub(crate) fn interfacial_dmi_field_add_into_soa(
-        &self,
-        magnetization: &VectorFieldSoA,
-        h_eff: &mut VectorFieldSoA,
-    ) {
-        let d = match self.terms.interfacial_dmi {
-            Some(d) if d.abs() > 0.0 => d,
-            _ => return,
-        };
-        let ms = self.material.saturation_magnetisation.max(1e-30);
-        let pf = 2.0 * d / (MU0 * ms);
-        let nx = self.grid.nx;
-        let ny = self.grid.ny;
-        let dx = self.cell_size.dx;
-        let dy = self.cell_size.dy;
-        let grid = self.grid;
-        let bpx = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-        let bpy = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-
-        for flat in 0..grid.cell_count() {
-            if !self.is_active(flat) {
-                continue;
-            }
-            let x = flat % nx;
-            let y = (flat / nx) % ny;
-            let z = flat / (nx * ny);
-            let sample = |neighbor: usize| {
-                if self.is_active(neighbor) {
-                    neighbor
-                } else {
-                    flat
-                }
-            };
-
-            let xp = sample(grid.index(neighbor_index(x, nx, 1, bpx), y, z));
-            let xm = sample(grid.index(neighbor_index(x, nx, -1, bpx), y, z));
-            let yp = sample(grid.index(x, neighbor_index(y, ny, 1, bpy), z));
-            let ym = sample(grid.index(x, neighbor_index(y, ny, -1, bpy), z));
-
-            let dx_mz = (magnetization.z[xp] - magnetization.z[xm]) / (2.0 * dx);
-            let dy_mz = (magnetization.z[yp] - magnetization.z[ym]) / (2.0 * dy);
-            let dx_mx = (magnetization.x[xp] - magnetization.x[xm]) / (2.0 * dx);
-            let dy_my = (magnetization.y[yp] - magnetization.y[ym]) / (2.0 * dy);
-
-            h_eff.x[flat] += pf * dx_mz;
-            h_eff.y[flat] += pf * dy_mz;
-            h_eff.z[flat] += -pf * (dx_mx + dy_my);
+        if self.alpha_field.is_some() {
+            return Some("spatial_damping");
         }
-    }
-
-    pub(crate) fn bulk_dmi_field_add_into_soa(
-        &self,
-        magnetization: &VectorFieldSoA,
-        h_eff: &mut VectorFieldSoA,
-    ) {
-        let d = match self.terms.bulk_dmi {
-            Some(d) if d.abs() > 0.0 => d,
-            _ => return,
-        };
-        let ms = self.material.saturation_magnetisation.max(1e-30);
-        let pf = -2.0 * d / (MU0 * ms);
-        let nx = self.grid.nx;
-        let ny = self.grid.ny;
-        let nz = self.grid.nz;
-        let dx = self.cell_size.dx;
-        let dy = self.cell_size.dy;
-        let dz = self.cell_size.dz;
-        let grid = self.grid;
-        let bpx = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-        let bpy = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-        let bpz = matches!(self.boundary_policy.z, AxisBoundary::Periodic);
-
-        for flat in 0..grid.cell_count() {
-            if !self.is_active(flat) {
-                continue;
-            }
-            let x = flat % nx;
-            let y = (flat / nx) % ny;
-            let z = flat / (nx * ny);
-            let sample = |neighbor: usize| {
-                if self.is_active(neighbor) {
-                    neighbor
-                } else {
-                    flat
-                }
-            };
-
-            let xp = sample(grid.index(neighbor_index(x, nx, 1, bpx), y, z));
-            let xm = sample(grid.index(neighbor_index(x, nx, -1, bpx), y, z));
-            let yp = sample(grid.index(x, neighbor_index(y, ny, 1, bpy), z));
-            let ym = sample(grid.index(x, neighbor_index(y, ny, -1, bpy), z));
-            let zp = sample(grid.index(x, y, neighbor_index(z, nz, 1, bpz)));
-            let zm = sample(grid.index(x, y, neighbor_index(z, nz, -1, bpz)));
-
-            let curl_x = (magnetization.z[yp] - magnetization.z[ym]) / (2.0 * dy)
-                - (magnetization.y[zp] - magnetization.y[zm]) / (2.0 * dz);
-            let curl_y = (magnetization.x[zp] - magnetization.x[zm]) / (2.0 * dz)
-                - (magnetization.z[xp] - magnetization.z[xm]) / (2.0 * dx);
-            let curl_z = (magnetization.y[xp] - magnetization.y[xm]) / (2.0 * dx)
-                - (magnetization.x[yp] - magnetization.x[ym]) / (2.0 * dy);
-
-            h_eff.x[flat] += pf * curl_x;
-            h_eff.y[flat] += pf * curl_y;
-            h_eff.z[flat] += pf * curl_z;
-        }
+        None
     }
 
     pub(crate) fn thermal_field_add_into_soa(&self, h_eff: &mut VectorFieldSoA) {
-        if self.temperature <= 0.0
-            || self.material.saturation_magnetisation <= 0.0
-            || self.thermal_dt <= 0.0
-        {
-            return;
-        }
-
-        let alpha = self.material.damping;
-        let ms = self.material.saturation_magnetisation;
-        let gamma0 = self.dynamics.gyromagnetic_ratio;
-        let v_cell = self.cell_size.dx * self.cell_size.dy * self.cell_size.dz;
-        const KB: f64 = 1.380649e-23;
-        const MU0_LOCAL: f64 = 1.2566370614359173e-6;
-
-        let sigma = (2.0 * alpha * KB * self.temperature
-            / (gamma0 * MU0_LOCAL * ms * v_cell * self.thermal_dt))
-            .sqrt();
+        let thermal_dt = self.thermal_dt_for_evaluation();
+        let base_factor = match thermal_base_factor(
+            self.temperature,
+            self.dynamics.gyromagnetic_ratio,
+            self.cell_size.volume(),
+        ) {
+            Some(factor) if thermal_dt > 0.0 && thermal_dt.is_finite() => factor,
+            _ => return,
+        };
+        let dt_scale = 1.0 / thermal_dt.sqrt();
         let global_seed = self.thermal_seed;
         let step = self.thermal_step();
 
@@ -1484,6 +189,11 @@ impl ExchangeLlgProblem {
             if !self.is_active(i) {
                 continue;
             }
+            let Some(sigma) =
+                thermal_sigma_for_cell(base_factor, dt_scale, self.ms_at(i), self.alpha_at(i))
+            else {
+                continue;
+            };
             let ci = i as u64;
             let u1 = counter_uniform(global_seed, step, ci, 0).max(1e-300);
             let u2 = counter_uniform(global_seed, step, ci, 1);
@@ -1496,51 +206,6 @@ impl ExchangeLlgProblem {
             h_eff.x[i] += sigma * r1 * theta1.cos();
             h_eff.y[i] += sigma * r1 * theta1.sin();
             h_eff.z[i] += sigma * r2 * theta2.cos();
-        }
-    }
-
-    pub(crate) fn magnetoelastic_field_add_into_soa(
-        &self,
-        magnetization: &VectorFieldSoA,
-        h_eff: &mut VectorFieldSoA,
-    ) {
-        let config = match &self.terms.magnetoelastic {
-            Some(config) => config,
-            None => return,
-        };
-        let n = magnetization.len();
-
-        let add_cell =
-            |i: usize, strain: &magnetoelastic::StrainVoigt, h_eff: &mut VectorFieldSoA| {
-                if !self.is_active(i) {
-                    return;
-                }
-                let h = magnetoelastic::h_mel_single(
-                    [magnetization.x[i], magnetization.y[i], magnetization.z[i]],
-                    strain,
-                    &config.params,
-                );
-                h_eff.x[i] += h[0];
-                h_eff.y[i] += h[1];
-                h_eff.z[i] += h[2];
-            };
-
-        match &config.strain {
-            magnetoelastic::PrescribedStrainField::Uniform(strain) => {
-                for i in 0..n {
-                    add_cell(i, strain, h_eff);
-                }
-            }
-            magnetoelastic::PrescribedStrainField::PerCell(strain) => {
-                assert_eq!(
-                    strain.len(),
-                    n,
-                    "strain field length must match magnetization"
-                );
-                for (i, cell_strain) in strain.iter().enumerate() {
-                    add_cell(i, cell_strain, h_eff);
-                }
-            }
         }
     }
 
@@ -1634,34 +299,6 @@ impl ExchangeLlgProblem {
         }
     }
 
-    pub(crate) fn external_field_add_into_soa(&self, h_eff: &mut VectorFieldSoA) {
-        let ext = self.terms.external_field.unwrap_or([0.0, 0.0, 0.0]);
-        let per_node_field = self.terms.per_node_field.as_ref();
-        let static_field = self.static_external_field.as_ref();
-        if self.terms.external_field.is_none() && per_node_field.is_none() && static_field.is_none()
-        {
-            return;
-        }
-
-        for i in 0..self.grid.cell_count() {
-            if self.is_active(i) {
-                h_eff.x[i] += ext[0];
-                h_eff.y[i] += ext[1];
-                h_eff.z[i] += ext[2];
-                if let Some(value) = per_node_field.and_then(|field| field.get(i)) {
-                    h_eff.x[i] += value[0];
-                    h_eff.y[i] += value[1];
-                    h_eff.z[i] += value[2];
-                }
-                if let Some(value) = static_field.and_then(|field| field.get(i)) {
-                    h_eff.x[i] += value[0];
-                    h_eff.y[i] += value[1];
-                    h_eff.z[i] += value[2];
-                }
-            }
-        }
-    }
-
     pub fn effective_field_into_soa_ws(
         &self,
         magnetization: &VectorFieldSoA,
@@ -1696,6 +333,7 @@ impl ExchangeLlgProblem {
         self.effective_field_into_soa_fft_backend_at_time(magnetization, ws, h_eff, time_seconds);
     }
 
+    #[cfg(test)]
     pub(crate) fn effective_field_into_soa_fft_backend(
         &self,
         magnetization: &VectorFieldSoA,
@@ -1725,22 +363,10 @@ impl ExchangeLlgProblem {
         self.anisotropy_field_add_into_soa(magnetization, h_eff);
         self.thermal_field_add_into_soa(h_eff);
         self.interfacial_dmi_field_add_into_soa(magnetization, h_eff);
+        self.rotated_interfacial_dmi_field_add_into_soa(magnetization, h_eff);
         self.bulk_dmi_field_add_into_soa(magnetization, h_eff);
         self.oersted_field_add_into_soa_at_time(h_eff, time_seconds);
-        for drive in self
-            .regional_field_drives
-            .iter()
-            .filter(|drive| drive.enabled)
-        {
-            let multiplier = drive.multiplier_at(time_seconds);
-            for (index, basis) in drive.basis_field.iter().enumerate().take(h_eff.len()) {
-                if self.is_active(index) {
-                    h_eff.x[index] += multiplier * basis[0];
-                    h_eff.y[index] += multiplier * basis[1];
-                    h_eff.z[index] += multiplier * basis[2];
-                }
-            }
-        }
+        self.regional_field_drives_add_into_soa_at_time(h_eff, time_seconds);
     }
 
     pub(crate) fn llg_rhs_soa_into(
@@ -1763,6 +389,9 @@ impl ExchangeLlgProblem {
             out.z[i] = rhs[2];
         }
         self.direct_torques_add_into_soa(magnetization, out);
+        if let Some(frozen) = &self.frozen_spins {
+            frozen.mask_final_rhs_soa(out);
+        }
     }
 
     pub(crate) fn llg_rhs_from_fields_with_direct_torques_into(
@@ -1783,275 +412,22 @@ impl ExchangeLlgProblem {
         }
     }
 
-    pub(crate) fn direct_torques_add_into(&self, magnetization: &[Vector3], out: &mut [Vector3]) {
-        let n = magnetization.len();
-        if let Some(ref zl) = self.terms.zhang_li_stt {
-            self.zhang_li_stt_torque_add_into(magnetization, zl, &mut out[..n]);
-        }
-        if let Some(ref slon) = self.terms.slonczewski_stt {
-            self.slonczewski_stt_torque_add_into(magnetization, slon, &mut out[..n]);
-        }
-        if let Some(ref sot) = self.terms.sot {
-            self.sot_torque_add_into(magnetization, sot, &mut out[..n]);
-        }
-    }
-
-    pub(crate) fn direct_torques_add_into_soa(
-        &self,
-        magnetization: &VectorFieldSoA,
-        out: &mut VectorFieldSoA,
-    ) {
-        if let Some(ref zl) = self.terms.zhang_li_stt {
-            self.zhang_li_stt_torque_add_into_soa(magnetization, zl, out);
-        }
-        if let Some(ref slon) = self.terms.slonczewski_stt {
-            self.slonczewski_stt_torque_add_into_soa(magnetization, slon, out);
-        }
-        if let Some(ref sot) = self.terms.sot {
-            self.sot_torque_add_into_soa(magnetization, sot, out);
-        }
-    }
-
-    pub(crate) fn magnetoelastic_field_add_into(
-        &self,
-        magnetization: &[Vector3],
-        h_eff: &mut [Vector3],
-    ) {
-        if let Some(ref config) = self.terms.magnetoelastic {
-            magnetoelastic::h_mel_field_add_into(
-                magnetization,
-                &config.strain,
-                &config.params,
-                self.active_mask.as_deref(),
-                h_eff,
-            );
-        }
-    }
-
-    pub(crate) fn anisotropy_field_add_into(
-        &self,
-        magnetization: &[Vector3],
-        h_eff: &mut [Vector3],
-    ) {
-        let has_uni = self.terms.uniaxial_anisotropy.is_some();
-        let has_cub = self.terms.cubic_anisotropy.is_some();
-        if !has_uni && !has_cub {
-            return;
-        }
-
-        let uni_data = self.terms.uniaxial_anisotropy.as_ref().map(|uni| {
-            let n = norm(uni.axis).max(1e-30);
-            let u = scale(uni.axis, 1.0 / n);
-            (u, uni.ku1, uni.ku2)
-        });
-        let cub_data = self.terms.cubic_anisotropy.as_ref().map(|cub| {
-            let n1 = norm(cub.axis1).max(1e-30);
-            let n2 = norm(cub.axis2).max(1e-30);
-            let c1 = scale(cub.axis1, 1.0 / n1);
-            let c2 = scale(cub.axis2, 1.0 / n2);
-            let c3 = cross(c1, c2);
-            (c1, c2, c3, cub.kc1, cub.kc2, cub.kc3)
-        });
-
-        let compute_aniso = |i: usize, m: &Vector3, h: &mut Vector3| {
-            if !self.is_active(i) {
-                return;
-            }
-            let ms_safe = self.ms_at(i).max(1e-30);
-            if let Some((u, ku1, ku2)) = &uni_data {
-                let m_dot_u = dot(*m, *u);
-                let coeff = 2.0 * ku1 / (MU0 * ms_safe) * m_dot_u
-                    + 4.0 * ku2 / (MU0 * ms_safe) * m_dot_u * m_dot_u * m_dot_u;
-                *h = add(*h, scale(*u, coeff));
-            }
-            if let Some((c1, c2, c3, kc1, kc2, kc3)) = &cub_data {
-                let m1 = dot(*m, *c1);
-                let m2 = dot(*m, *c2);
-                let m3 = dot(*m, *c3);
-                let sigma = m1 * m1 * m2 * m2 + m2 * m2 * m3 * m3 + m1 * m1 * m3 * m3;
-                let pf = 2.0 / (MU0 * ms_safe);
-                let g1 = -pf
-                    * (kc1 * m1 * (m2 * m2 + m3 * m3)
-                        + kc2 * m1 * m2 * m2 * m3 * m3
-                        + 2.0 * kc3 * sigma * m1 * (m2 * m2 + m3 * m3));
-                let g2 = -pf
-                    * (kc1 * m2 * (m1 * m1 + m3 * m3)
-                        + kc2 * m2 * m1 * m1 * m3 * m3
-                        + 2.0 * kc3 * sigma * m2 * (m1 * m1 + m3 * m3));
-                let g3 = -pf
-                    * (kc1 * m3 * (m1 * m1 + m2 * m2)
-                        + kc2 * m3 * m1 * m1 * m2 * m2
-                        + 2.0 * kc3 * sigma * m3 * (m1 * m1 + m2 * m2));
-                *h = add(*h, add(add(scale(*c1, g1), scale(*c2, g2)), scale(*c3, g3)));
-            }
-        };
-
-        #[cfg(feature = "parallel")]
-        {
-            h_eff.par_iter_mut().enumerate().for_each(|(i, h)| {
-                compute_aniso(i, &magnetization[i], h);
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for (i, m) in magnetization.iter().enumerate() {
-                compute_aniso(i, m, &mut h_eff[i]);
-            }
-        }
-    }
-
-    pub(crate) fn interfacial_dmi_field_add_into(
-        &self,
-        magnetization: &[Vector3],
-        h_eff: &mut [Vector3],
-    ) {
-        let d = match self.terms.interfacial_dmi {
-            Some(d) if d.abs() > 0.0 => d,
-            _ => return,
-        };
-        let nx = self.grid.nx;
-        let ny = self.grid.ny;
-        let dx = self.cell_size.dx;
-        let dy = self.cell_size.dy;
-        let grid = self.grid;
-        let bpx = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-        let bpy = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-
-        let compute = |flat: usize, h: &mut Vector3| {
-            if !self.is_active(flat) {
-                return;
-            }
-            let ms = self.ms_at(flat).max(1e-30);
-            let pf = 2.0 * d / (MU0 * ms);
-            let x = flat % nx;
-            let y = (flat / nx) % ny;
-            let z = flat / (nx * ny);
-            let center = magnetization[flat];
-            let sample = |neighbor: usize| {
-                if self.is_active(neighbor) {
-                    magnetization[neighbor]
-                } else {
-                    center
-                }
-            };
-
-            let xp = sample(grid.index(neighbor_index(x, nx, 1, bpx), y, z));
-            let xm = sample(grid.index(neighbor_index(x, nx, -1, bpx), y, z));
-            let yp = sample(grid.index(x, neighbor_index(y, ny, 1, bpy), z));
-            let ym = sample(grid.index(x, neighbor_index(y, ny, -1, bpy), z));
-
-            let dx_mz = (xp[2] - xm[2]) / (2.0 * dx);
-            let dy_mz = (yp[2] - ym[2]) / (2.0 * dy);
-            let dx_mx = (xp[0] - xm[0]) / (2.0 * dx);
-            let dy_my = (yp[1] - ym[1]) / (2.0 * dy);
-
-            h[0] += pf * dx_mz;
-            h[1] += pf * dy_mz;
-            h[2] += -pf * (dx_mx + dy_my);
-        };
-
-        #[cfg(feature = "parallel")]
-        {
-            h_eff.par_iter_mut().enumerate().for_each(|(flat, h)| {
-                compute(flat, h);
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for flat in 0..grid.cell_count() {
-                compute(flat, &mut h_eff[flat]);
-            }
-        }
-    }
-
-    pub(crate) fn bulk_dmi_field_add_into(&self, magnetization: &[Vector3], h_eff: &mut [Vector3]) {
-        let d = match self.terms.bulk_dmi {
-            Some(d) if d.abs() > 0.0 => d,
-            _ => return,
-        };
-        let nx = self.grid.nx;
-        let ny = self.grid.ny;
-        let nz = self.grid.nz;
-        let dx = self.cell_size.dx;
-        let dy = self.cell_size.dy;
-        let dz = self.cell_size.dz;
-        let grid = self.grid;
-        let bpx = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-        let bpy = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-        let bpz = matches!(self.boundary_policy.z, AxisBoundary::Periodic);
-
-        let compute = |flat: usize, h: &mut Vector3| {
-            if !self.is_active(flat) {
-                return;
-            }
-            let ms = self.ms_at(flat).max(1e-30);
-            let pf = -2.0 * d / (MU0 * ms);
-            let x = flat % nx;
-            let y = (flat / nx) % ny;
-            let z = flat / (nx * ny);
-            let center = magnetization[flat];
-            let sample = |neighbor: usize| {
-                if self.is_active(neighbor) {
-                    magnetization[neighbor]
-                } else {
-                    center
-                }
-            };
-
-            let xp = sample(grid.index(neighbor_index(x, nx, 1, bpx), y, z));
-            let xm = sample(grid.index(neighbor_index(x, nx, -1, bpx), y, z));
-            let yp = sample(grid.index(x, neighbor_index(y, ny, 1, bpy), z));
-            let ym = sample(grid.index(x, neighbor_index(y, ny, -1, bpy), z));
-            let zp = sample(grid.index(x, y, neighbor_index(z, nz, 1, bpz)));
-            let zm = sample(grid.index(x, y, neighbor_index(z, nz, -1, bpz)));
-
-            let curl_x = (yp[2] - ym[2]) / (2.0 * dy) - (zp[1] - zm[1]) / (2.0 * dz);
-            let curl_y = (zp[0] - zm[0]) / (2.0 * dz) - (xp[2] - xm[2]) / (2.0 * dx);
-            let curl_z = (xp[1] - xm[1]) / (2.0 * dx) - (yp[0] - ym[0]) / (2.0 * dy);
-
-            h[0] += pf * curl_x;
-            h[1] += pf * curl_y;
-            h[2] += pf * curl_z;
-        };
-
-        #[cfg(feature = "parallel")]
-        {
-            h_eff.par_iter_mut().enumerate().for_each(|(flat, h)| {
-                compute(flat, h);
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for flat in 0..grid.cell_count() {
-                compute(flat, &mut h_eff[flat]);
-            }
-        }
-    }
-
     pub(crate) fn thermal_field_add_into(&self, h_eff: &mut [Vector3]) {
         self.thermal_field_add_into_step(h_eff, self.thermal_step());
     }
 
     /// Counter-based thermal field with an explicit step index for reproducibility.
     pub(crate) fn thermal_field_add_into_step(&self, h_eff: &mut [Vector3], step: u64) {
-        if self.temperature <= 0.0
-            || self.material.saturation_magnetisation <= 0.0
-            || self.thermal_dt <= 0.0
-        {
-            return;
-        }
-
-        let alpha = self.material.damping;
-        let ms = self.material.saturation_magnetisation;
-        let gamma0 = self.dynamics.gyromagnetic_ratio;
-        let v_cell = self.cell_size.dx * self.cell_size.dy * self.cell_size.dz;
-        const KB: f64 = 1.380649e-23;
-        #[allow(unused)]
-        const MU0_LOCAL: f64 = 1.2566370614359173e-6;
-
-        let sigma = (2.0 * alpha * KB * self.temperature
-            / (gamma0 * MU0_LOCAL * ms * v_cell * self.thermal_dt))
-            .sqrt();
+        let thermal_dt = self.thermal_dt_for_evaluation();
+        let base_factor = match thermal_base_factor(
+            self.temperature,
+            self.dynamics.gyromagnetic_ratio,
+            self.cell_size.volume(),
+        ) {
+            Some(factor) if thermal_dt > 0.0 && thermal_dt.is_finite() => factor,
+            _ => return,
+        };
+        let dt_scale = 1.0 / thermal_dt.sqrt();
 
         // ── Counter-based RNG (B7 reproducibility) ─────────────────────
         // Deterministic seed per cell: hash(global_seed, step_counter, cell_index).
@@ -2080,6 +456,14 @@ impl ExchangeLlgProblem {
         }
 
         let compute_noise = |i: usize, h: &mut Vector3| {
+            if !self.is_active(i) {
+                return;
+            }
+            let Some(sigma) =
+                thermal_sigma_for_cell(base_factor, dt_scale, self.ms_at(i), self.alpha_at(i))
+            else {
+                return;
+            };
             let ci = i as u64;
             let u1 = counter_uniform(global_seed, step, ci, 0).max(1e-300);
             let u2 = counter_uniform(global_seed, step, ci, 1);
@@ -2127,6 +511,7 @@ impl ExchangeLlgProblem {
         let n = magnetization.len();
         let ext = self.terms.external_field;
         let per_node_field = self.terms.per_node_field.as_ref();
+        let static_field = self.static_external_field.as_ref();
         let ms_safe = self.material.saturation_magnetisation.max(1e-30);
 
         let uni_data = self.terms.uniaxial_anisotropy.as_ref().map(|uni| {
@@ -2143,25 +528,19 @@ impl ExchangeLlgProblem {
             (c1, c2, c3, cub.kc1, cub.kc2, cub.kc3)
         });
 
-        // Thermal noise setup
-        let has_thermal = self.temperature > 0.0
-            && self.material.saturation_magnetisation > 0.0
-            && self.thermal_dt > 0.0;
-        let thermal_sigma = if has_thermal {
-            let alpha = self.material.damping;
-            let gamma0 = self.dynamics.gyromagnetic_ratio;
-            let v_cell = self.cell_size.dx * self.cell_size.dy * self.cell_size.dz;
-            const KB: f64 = 1.380649e-23;
-            const MU0_LOCAL: f64 = 1.2566370614359173e-6;
-            (2.0 * alpha * KB * self.temperature
-                / (gamma0
-                    * MU0_LOCAL
-                    * self.material.saturation_magnetisation
-                    * v_cell
-                    * self.thermal_dt))
-                .sqrt()
-        } else {
-            0.0
+        // Thermal noise setup.  Ms/alpha are resolved per cell below; only
+        // the temperature, geometry and timestep factors are shared.
+        let thermal_base = thermal_base_factor(
+            self.temperature,
+            self.dynamics.gyromagnetic_ratio,
+            self.cell_size.volume(),
+        );
+        let thermal_dt = self.thermal_dt_for_evaluation();
+        let thermal_dt_scale =
+            (thermal_dt > 0.0 && thermal_dt.is_finite()).then(|| 1.0 / thermal_dt.sqrt());
+        let (has_thermal, thermal_base, thermal_dt_scale) = match (thermal_base, thermal_dt_scale) {
+            (Some(base), Some(dt_scale)) => (true, base, dt_scale),
+            _ => (false, 0.0, 0.0),
         };
         let thermal_seed = self.thermal_seed;
         let thermal_step = self.thermal_step();
@@ -2186,6 +565,11 @@ impl ExchangeLlgProblem {
                 h[2] += ext[2];
             }
             if let Some(value) = per_node_field.and_then(|field| field.get(i)) {
+                h[0] += value[0];
+                h[1] += value[1];
+                h[2] += value[2];
+            }
+            if let Some(value) = static_field.and_then(|field| field.get(i)) {
                 h[0] += value[0];
                 h[1] += value[1];
                 h[2] += value[2];
@@ -2227,6 +611,14 @@ impl ExchangeLlgProblem {
 
             // Thermal noise
             if has_thermal {
+                let Some(thermal_sigma) = thermal_sigma_for_cell(
+                    thermal_base,
+                    thermal_dt_scale,
+                    self.ms_at(i),
+                    self.alpha_at(i),
+                ) else {
+                    return;
+                };
                 let ci = i as u64;
                 let counter_uniform = |stream: u64| -> f64 {
                     let key = thermal_seed
@@ -2427,24 +819,12 @@ impl ExchangeLlgProblem {
 
         // DMI terms need neighbor stencils — separate passes
         self.interfacial_dmi_field_add_into(magnetization, h_eff);
+        self.rotated_interfacial_dmi_field_add_into(magnetization, h_eff);
         self.bulk_dmi_field_add_into(magnetization, h_eff);
 
         // Oersted field from cylindrical conductor (STNO / MTJ)
         self.oersted_field_add_into_at_time(h_eff, time_seconds);
-        for drive in self
-            .regional_field_drives
-            .iter()
-            .filter(|drive| drive.enabled)
-        {
-            let multiplier = drive.multiplier_at(time_seconds);
-            for (index, basis) in drive.basis_field.iter().enumerate().take(h_eff.len()) {
-                if self.is_active(index) {
-                    h_eff[index][0] += multiplier * basis[0];
-                    h_eff[index][1] += multiplier * basis[1];
-                    h_eff[index][2] += multiplier * basis[2];
-                }
-            }
-        }
+        self.regional_field_drives_add_into_at_time(h_eff, time_seconds);
     }
 
     /// Effective field accumulation with telemetry instrumentation.
@@ -2484,6 +864,7 @@ impl ExchangeLlgProblem {
 
         telem.begin(sections::FIELD_DMI);
         self.interfacial_dmi_field_add_into(magnetization, h_eff);
+        self.rotated_interfacial_dmi_field_add_into(magnetization, h_eff);
         self.bulk_dmi_field_add_into(magnetization, h_eff);
         telem.end(sections::FIELD_DMI);
 
@@ -2511,657 +892,7 @@ impl ExchangeLlgProblem {
     // Torques
     // ===================================================================
 
-    /// Evaluate the MuMax3 `addzhanglitorque2` realization at one cell.
-    ///
-    /// MuMax3 stores this contribution as a field-like torque divided by the
-    /// electron gyromagnetic ratio.  The FDM engine stores direct RHS rates,
-    /// so the shared `gamma_e` factor cancels from the source prefactor here.
-    /// Non-periodic neighbours are clamped exactly as `hclampx/lclampx` in the
-    /// vendored CUDA kernel; periodic axes wrap.
-    fn zhang_li_mumax3_torque_at_with<F>(
-        &self,
-        cfg: &ZhangLiSttConfig,
-        flat: usize,
-        sample: F,
-    ) -> Vector3
-    where
-        F: Fn(usize) -> Vector3,
-    {
-        if !self.is_active(flat) {
-            return [0.0, 0.0, 0.0];
-        }
-        const MU_B: f64 = 9.2740091523e-24;
-        const E_CHARGE: f64 = 1.60217646e-19;
-
-        let ms = self.material.saturation_magnetisation.max(1e-30);
-        let beta = cfg.non_adiabaticity;
-        let alpha = self.material.damping;
-        let b = (cfg.spin_polarization * MU_B) / (2.0 * E_CHARGE * ms * (1.0 + beta * beta));
-        let ux = b * cfg.current_density[0];
-        let uy = b * cfg.current_density[1];
-        let uz = b * cfg.current_density[2];
-
-        let nx = self.grid.nx;
-        let ny = self.grid.ny;
-        let nz = self.grid.nz;
-        let x = flat % nx;
-        let y = (flat / nx) % ny;
-        let z = flat / (nx * ny);
-        let pbc_x = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-        let pbc_y = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-        let pbc_z = matches!(self.boundary_policy.z, AxisBoundary::Periodic);
-        let xm = neighbor_index(x, nx, -1, pbc_x);
-        let xp = neighbor_index(x, nx, 1, pbc_x);
-        let ym = neighbor_index(y, ny, -1, pbc_y);
-        let yp = neighbor_index(y, ny, 1, pbc_y);
-        let zm = neighbor_index(z, nz, -1, pbc_z);
-        let zp = neighbor_index(z, nz, 1, pbc_z);
-
-        // `neighbor_index` clamps for open boundaries and wraps for PBC,
-        // matching MuMax3's hclamp/lclamp helpers.
-        let x_minus = sample(self.grid.index(xm, y, z));
-        let x_plus = sample(self.grid.index(xp, y, z));
-        let y_minus = sample(self.grid.index(x, ym, z));
-        let y_plus = sample(self.grid.index(x, yp, z));
-        let z_minus = sample(self.grid.index(x, y, zm));
-        let z_plus = sample(self.grid.index(x, y, zp));
-        let [m0, m1, m2] = sample(flat);
-
-        // MuMax3's source prefactor already contains the factor 1/2. Its
-        // `deltax`/`deltay`/`deltaz` macros therefore use the unhalved
-        // neighbour difference divided by the cell size.
-        let inv_dx = 1.0 / self.cell_size.dx;
-        let inv_dy = 1.0 / self.cell_size.dy;
-        let inv_dz = 1.0 / self.cell_size.dz;
-        let dm0 = ux * (x_plus[0] - x_minus[0]) * inv_dx
-            + uy * (y_plus[0] - y_minus[0]) * inv_dy
-            + uz * (z_plus[0] - z_minus[0]) * inv_dz;
-        let dm1 = ux * (x_plus[1] - x_minus[1]) * inv_dx
-            + uy * (y_plus[1] - y_minus[1]) * inv_dy
-            + uz * (z_plus[1] - z_minus[1]) * inv_dz;
-        let dm2 = ux * (x_plus[2] - x_minus[2]) * inv_dx
-            + uy * (y_plus[2] - y_minus[2]) * inv_dy
-            + uz * (z_plus[2] - z_minus[2]) * inv_dz;
-
-        let cx = m1 * dm2 - m2 * dm1;
-        let cy = m2 * dm0 - m0 * dm2;
-        let cz = m0 * dm1 - m1 * dm0;
-        let dcx = m1 * cz - m2 * cy;
-        let dcy = m2 * cx - m0 * cz;
-        let dcz = m0 * cy - m1 * cx;
-        let inv_gilbert = 1.0 / (1.0 + alpha * alpha);
-        [
-            -(1.0 + beta * alpha) * dcx * inv_gilbert + (alpha - beta) * cx * inv_gilbert,
-            -(1.0 + beta * alpha) * dcy * inv_gilbert + (alpha - beta) * cy * inv_gilbert,
-            -(1.0 + beta * alpha) * dcz * inv_gilbert + (alpha - beta) * cz * inv_gilbert,
-        ]
-    }
-
-    fn zhang_li_mumax3_torque_at(
-        &self,
-        magnetization: &[Vector3],
-        cfg: &ZhangLiSttConfig,
-        flat: usize,
-    ) -> Vector3 {
-        self.zhang_li_mumax3_torque_at_with(cfg, flat, |index| magnetization[index])
-    }
-
-    fn zhang_li_mumax3_torque_at_soa(
-        &self,
-        magnetization: &VectorFieldSoA,
-        cfg: &ZhangLiSttConfig,
-        flat: usize,
-    ) -> Vector3 {
-        self.zhang_li_mumax3_torque_at_with(cfg, flat, |index| {
-            [
-                magnetization.x[index],
-                magnetization.y[index],
-                magnetization.z[index],
-            ]
-        })
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn zhang_li_stt_torque(
-        &self,
-        magnetization: &[Vector3],
-        cfg: &ZhangLiSttConfig,
-    ) -> Vec<Vector3> {
-        if cfg.formula == ZhangLiFormula::Mumax3V1 {
-            return (0..self.grid.cell_count())
-                .map(|flat| self.zhang_li_mumax3_torque_at(magnetization, cfg, flat))
-                .collect();
-        }
-        const MU_B: f64 = 9.274009994e-24;
-        // Zhang-Li remains an unversioned legacy evaluator. Preserve its
-        // historical literal until a canonical formula version is introduced.
-        const E_CHARGE: f64 = 1.60217662e-19;
-
-        let ms = self.material.saturation_magnetisation.max(1e-30);
-        let beta = cfg.non_adiabaticity;
-        let alpha = self.material.damping;
-        let (adiabatic_scale, cross_scale) = gilbert_zhang_li_scales(beta, alpha);
-        let b = (cfg.spin_polarization * MU_B) / (E_CHARGE * ms * (1.0 + beta * beta));
-        let ux = b * cfg.current_density[0];
-        let uy = b * cfg.current_density[1];
-        let uz = b * cfg.current_density[2];
-
-        let nx = self.grid.nx;
-        let ny = self.grid.ny;
-        let nz = self.grid.nz;
-        let dx = self.cell_size.dx;
-        let dy = self.cell_size.dy;
-        let dz = self.cell_size.dz;
-        let n = self.grid.cell_count();
-
-        (0..n)
-            .map(|flat| {
-                if !self.is_active(flat) {
-                    return [0.0, 0.0, 0.0];
-                }
-                let x = flat % nx;
-                let y = (flat / nx) % ny;
-                let z = flat / (nx * ny);
-                let [m0, m1, m2] = magnetization[flat];
-
-                let mut dm0 = 0.0f64;
-                let mut dm1 = 0.0f64;
-                let mut dm2 = 0.0f64;
-
-                let pbc_x = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-                let pbc_y = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-                let pbc_z = matches!(self.boundary_policy.z, AxisBoundary::Periodic);
-
-                if ux > 0.0 && (pbc_x || x > 0) {
-                    let prev = self.grid.index(neighbor_index(x, nx, -1, pbc_x), y, z);
-                    let [p0, p1, p2] = magnetization[prev];
-                    dm0 += ux * (m0 - p0) / dx;
-                    dm1 += ux * (m1 - p1) / dx;
-                    dm2 += ux * (m2 - p2) / dx;
-                } else if ux < 0.0 && (pbc_x || x + 1 < nx) {
-                    let next = self.grid.index(neighbor_index(x, nx, 1, pbc_x), y, z);
-                    let [n0, n1, n2] = magnetization[next];
-                    dm0 += ux * (n0 - m0) / dx;
-                    dm1 += ux * (n1 - m1) / dx;
-                    dm2 += ux * (n2 - m2) / dx;
-                }
-
-                if uy > 0.0 && (pbc_y || y > 0) {
-                    let prev = self.grid.index(x, neighbor_index(y, ny, -1, pbc_y), z);
-                    let [p0, p1, p2] = magnetization[prev];
-                    dm0 += uy * (m0 - p0) / dy;
-                    dm1 += uy * (m1 - p1) / dy;
-                    dm2 += uy * (m2 - p2) / dy;
-                } else if uy < 0.0 && (pbc_y || y + 1 < ny) {
-                    let next = self.grid.index(x, neighbor_index(y, ny, 1, pbc_y), z);
-                    let [n0, n1, n2] = magnetization[next];
-                    dm0 += uy * (n0 - m0) / dy;
-                    dm1 += uy * (n1 - m1) / dy;
-                    dm2 += uy * (n2 - m2) / dy;
-                }
-
-                if uz > 0.0 && (pbc_z || z > 0) {
-                    let prev = self.grid.index(x, y, neighbor_index(z, nz, -1, pbc_z));
-                    let [p0, p1, p2] = magnetization[prev];
-                    dm0 += uz * (m0 - p0) / dz;
-                    dm1 += uz * (m1 - p1) / dz;
-                    dm2 += uz * (m2 - p2) / dz;
-                } else if uz < 0.0 && (pbc_z || z + 1 < nz) {
-                    let next = self.grid.index(x, y, neighbor_index(z, nz, 1, pbc_z));
-                    let [n0, n1, n2] = magnetization[next];
-                    dm0 += uz * (n0 - m0) / dz;
-                    dm1 += uz * (n1 - m1) / dz;
-                    dm2 += uz * (n2 - m2) / dz;
-                }
-
-                let cx = m1 * dm2 - m2 * dm1;
-                let cy = m2 * dm0 - m0 * dm2;
-                let cz = m0 * dm1 - m1 * dm0;
-
-                let dcx = m1 * cz - m2 * cy;
-                let dcy = m2 * cx - m0 * cz;
-                let dcz = m0 * cy - m1 * cx;
-
-                [
-                    adiabatic_scale * (-dcx) + cross_scale * cx,
-                    adiabatic_scale * (-dcy) + cross_scale * cy,
-                    adiabatic_scale * (-dcz) + cross_scale * cz,
-                ]
-            })
-            .collect()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn slonczewski_stt_torque(
-        &self,
-        magnetization: &[Vector3],
-        cfg: &SlonczewskiSttConfig,
-    ) -> Vec<Vector3> {
-        let n = self.grid.cell_count();
-
-        (0..n)
-            .map(|flat| {
-                if !self.is_active(flat)
-                    || cfg
-                        .active_mask
-                        .as_ref()
-                        .is_some_and(|mask| !mask.get(flat).copied().unwrap_or(false))
-                {
-                    return [0.0, 0.0, 0.0];
-                }
-                slonczewski_torque_from_config(
-                    magnetization[flat],
-                    cfg,
-                    self.material.damping,
-                    self.dynamics.gyromagnetic_ratio,
-                    self.material.saturation_magnetisation,
-                )
-            })
-            .collect()
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn sot_torque(&self, magnetization: &[Vector3], cfg: &SotConfig) -> Vec<Vector3> {
-        let n = self.grid.cell_count();
-
-        (0..n)
-            .map(|flat| {
-                if !self.is_active(flat)
-                    || cfg
-                        .active_mask
-                        .as_ref()
-                        .is_some_and(|mask| !mask.get(flat).copied().unwrap_or(false))
-                {
-                    return [0.0, 0.0, 0.0];
-                }
-                prescribed_sot_torque_from_config(
-                    magnetization[flat],
-                    cfg,
-                    self.material.saturation_magnetisation,
-                    self.dynamics.gyromagnetic_ratio,
-                    self.material.damping,
-                )
-            })
-            .collect()
-    }
-
     // ── Torque _add_into variants (zero-alloc) ──────────────────────────
-
-    pub(crate) fn zhang_li_stt_torque_add_into(
-        &self,
-        magnetization: &[Vector3],
-        cfg: &ZhangLiSttConfig,
-        out: &mut [Vector3],
-    ) {
-        if cfg.formula == ZhangLiFormula::Mumax3V1 {
-            for flat in 0..self.grid.cell_count() {
-                let torque = self.zhang_li_mumax3_torque_at(magnetization, cfg, flat);
-                out[flat][0] += torque[0];
-                out[flat][1] += torque[1];
-                out[flat][2] += torque[2];
-            }
-            return;
-        }
-        const MU_B: f64 = 9.274009994e-24;
-        const E_CHARGE: f64 = 1.60217662e-19;
-
-        let ms = self.material.saturation_magnetisation.max(1e-30);
-        let beta = cfg.non_adiabaticity;
-        let alpha = self.material.damping;
-        let (adiabatic_scale, cross_scale) = gilbert_zhang_li_scales(beta, alpha);
-        let b = (cfg.spin_polarization * MU_B) / (E_CHARGE * ms * (1.0 + beta * beta));
-        let ux = b * cfg.current_density[0];
-        let uy = b * cfg.current_density[1];
-        let uz = b * cfg.current_density[2];
-
-        let nx = self.grid.nx;
-        let ny = self.grid.ny;
-        let nz = self.grid.nz;
-        let dx = self.cell_size.dx;
-        let dy = self.cell_size.dy;
-        let dz = self.cell_size.dz;
-        let n = self.grid.cell_count();
-        let grid = self.grid;
-
-        let compute = |flat: usize, o: &mut Vector3| {
-            if !self.is_active(flat) {
-                return;
-            }
-            let x = flat % nx;
-            let y = (flat / nx) % ny;
-            let z = flat / (nx * ny);
-            let [m0, m1, m2] = magnetization[flat];
-
-            let pbc_x = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-            let pbc_y = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-            let pbc_z = matches!(self.boundary_policy.z, AxisBoundary::Periodic);
-
-            let mut dm0 = 0.0f64;
-            let mut dm1 = 0.0f64;
-            let mut dm2 = 0.0f64;
-
-            if ux > 0.0 && (pbc_x || x > 0) {
-                let prev = grid.index(neighbor_index(x, nx, -1, pbc_x), y, z);
-                let [p0, p1, p2] = magnetization[prev];
-                dm0 += ux * (m0 - p0) / dx;
-                dm1 += ux * (m1 - p1) / dx;
-                dm2 += ux * (m2 - p2) / dx;
-            } else if ux < 0.0 && (pbc_x || x + 1 < nx) {
-                let next = grid.index(neighbor_index(x, nx, 1, pbc_x), y, z);
-                let [n0, n1, n2] = magnetization[next];
-                dm0 += ux * (n0 - m0) / dx;
-                dm1 += ux * (n1 - m1) / dx;
-                dm2 += ux * (n2 - m2) / dx;
-            }
-
-            if uy > 0.0 && (pbc_y || y > 0) {
-                let prev = grid.index(x, neighbor_index(y, ny, -1, pbc_y), z);
-                let [p0, p1, p2] = magnetization[prev];
-                dm0 += uy * (m0 - p0) / dy;
-                dm1 += uy * (m1 - p1) / dy;
-                dm2 += uy * (m2 - p2) / dy;
-            } else if uy < 0.0 && (pbc_y || y + 1 < ny) {
-                let next = grid.index(x, neighbor_index(y, ny, 1, pbc_y), z);
-                let [n0, n1, n2] = magnetization[next];
-                dm0 += uy * (n0 - m0) / dy;
-                dm1 += uy * (n1 - m1) / dy;
-                dm2 += uy * (n2 - m2) / dy;
-            }
-
-            if uz > 0.0 && (pbc_z || z > 0) {
-                let prev = grid.index(x, y, neighbor_index(z, nz, -1, pbc_z));
-                let [p0, p1, p2] = magnetization[prev];
-                dm0 += uz * (m0 - p0) / dz;
-                dm1 += uz * (m1 - p1) / dz;
-                dm2 += uz * (m2 - p2) / dz;
-            } else if uz < 0.0 && (pbc_z || z + 1 < nz) {
-                let next = grid.index(x, y, neighbor_index(z, nz, 1, pbc_z));
-                let [n0, n1, n2] = magnetization[next];
-                dm0 += uz * (n0 - m0) / dz;
-                dm1 += uz * (n1 - m1) / dz;
-                dm2 += uz * (n2 - m2) / dz;
-            }
-
-            let cx = m1 * dm2 - m2 * dm1;
-            let cy = m2 * dm0 - m0 * dm2;
-            let cz = m0 * dm1 - m1 * dm0;
-
-            let dcx = m1 * cz - m2 * cy;
-            let dcy = m2 * cx - m0 * cz;
-            let dcz = m0 * cy - m1 * cx;
-
-            o[0] += adiabatic_scale * (-dcx) + cross_scale * cx;
-            o[1] += adiabatic_scale * (-dcy) + cross_scale * cy;
-            o[2] += adiabatic_scale * (-dcz) + cross_scale * cz;
-        };
-
-        #[cfg(feature = "parallel")]
-        {
-            out[..n].par_iter_mut().enumerate().for_each(|(flat, o)| {
-                compute(flat, o);
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for flat in 0..n {
-                compute(flat, &mut out[flat]);
-            }
-        }
-    }
-
-    pub(crate) fn zhang_li_stt_torque_add_into_soa(
-        &self,
-        magnetization: &VectorFieldSoA,
-        cfg: &ZhangLiSttConfig,
-        out: &mut VectorFieldSoA,
-    ) {
-        if cfg.formula == ZhangLiFormula::Mumax3V1 {
-            for flat in 0..self.grid.cell_count() {
-                let torque = self.zhang_li_mumax3_torque_at_soa(magnetization, cfg, flat);
-                out.x[flat] += torque[0];
-                out.y[flat] += torque[1];
-                out.z[flat] += torque[2];
-            }
-            return;
-        }
-        const MU_B: f64 = 9.274009994e-24;
-        const E_CHARGE: f64 = 1.60217662e-19;
-
-        let ms = self.material.saturation_magnetisation.max(1e-30);
-        let beta = cfg.non_adiabaticity;
-        let alpha = self.material.damping;
-        let (adiabatic_scale, cross_scale) = gilbert_zhang_li_scales(beta, alpha);
-        let b = (cfg.spin_polarization * MU_B) / (E_CHARGE * ms * (1.0 + beta * beta));
-        let ux = b * cfg.current_density[0];
-        let uy = b * cfg.current_density[1];
-        let uz = b * cfg.current_density[2];
-
-        let nx = self.grid.nx;
-        let ny = self.grid.ny;
-        let nz = self.grid.nz;
-        let dx = self.cell_size.dx;
-        let dy = self.cell_size.dy;
-        let dz = self.cell_size.dz;
-        let grid = self.grid;
-
-        for flat in 0..grid.cell_count() {
-            if !self.is_active(flat) {
-                continue;
-            }
-            let x = flat % nx;
-            let y = (flat / nx) % ny;
-            let z = flat / (nx * ny);
-            let m0 = magnetization.x[flat];
-            let m1 = magnetization.y[flat];
-            let m2 = magnetization.z[flat];
-
-            let pbc_x = matches!(self.boundary_policy.x, AxisBoundary::Periodic);
-            let pbc_y = matches!(self.boundary_policy.y, AxisBoundary::Periodic);
-            let pbc_z = matches!(self.boundary_policy.z, AxisBoundary::Periodic);
-
-            let mut dm0 = 0.0f64;
-            let mut dm1 = 0.0f64;
-            let mut dm2 = 0.0f64;
-
-            if ux > 0.0 && (pbc_x || x > 0) {
-                let prev = grid.index(neighbor_index(x, nx, -1, pbc_x), y, z);
-                dm0 += ux * (m0 - magnetization.x[prev]) / dx;
-                dm1 += ux * (m1 - magnetization.y[prev]) / dx;
-                dm2 += ux * (m2 - magnetization.z[prev]) / dx;
-            } else if ux < 0.0 && (pbc_x || x + 1 < nx) {
-                let next = grid.index(neighbor_index(x, nx, 1, pbc_x), y, z);
-                dm0 += ux * (magnetization.x[next] - m0) / dx;
-                dm1 += ux * (magnetization.y[next] - m1) / dx;
-                dm2 += ux * (magnetization.z[next] - m2) / dx;
-            }
-
-            if uy > 0.0 && (pbc_y || y > 0) {
-                let prev = grid.index(x, neighbor_index(y, ny, -1, pbc_y), z);
-                dm0 += uy * (m0 - magnetization.x[prev]) / dy;
-                dm1 += uy * (m1 - magnetization.y[prev]) / dy;
-                dm2 += uy * (m2 - magnetization.z[prev]) / dy;
-            } else if uy < 0.0 && (pbc_y || y + 1 < ny) {
-                let next = grid.index(x, neighbor_index(y, ny, 1, pbc_y), z);
-                dm0 += uy * (magnetization.x[next] - m0) / dy;
-                dm1 += uy * (magnetization.y[next] - m1) / dy;
-                dm2 += uy * (magnetization.z[next] - m2) / dy;
-            }
-
-            if uz > 0.0 && (pbc_z || z > 0) {
-                let prev = grid.index(x, y, neighbor_index(z, nz, -1, pbc_z));
-                dm0 += uz * (m0 - magnetization.x[prev]) / dz;
-                dm1 += uz * (m1 - magnetization.y[prev]) / dz;
-                dm2 += uz * (m2 - magnetization.z[prev]) / dz;
-            } else if uz < 0.0 && (pbc_z || z + 1 < nz) {
-                let next = grid.index(x, y, neighbor_index(z, nz, 1, pbc_z));
-                dm0 += uz * (magnetization.x[next] - m0) / dz;
-                dm1 += uz * (magnetization.y[next] - m1) / dz;
-                dm2 += uz * (magnetization.z[next] - m2) / dz;
-            }
-
-            let cx = m1 * dm2 - m2 * dm1;
-            let cy = m2 * dm0 - m0 * dm2;
-            let cz = m0 * dm1 - m1 * dm0;
-
-            let dcx = m1 * cz - m2 * cy;
-            let dcy = m2 * cx - m0 * cz;
-            let dcz = m0 * cy - m1 * cx;
-
-            out.x[flat] += adiabatic_scale * (-dcx) + cross_scale * cx;
-            out.y[flat] += adiabatic_scale * (-dcy) + cross_scale * cy;
-            out.z[flat] += adiabatic_scale * (-dcz) + cross_scale * cz;
-        }
-    }
-
-    pub(crate) fn slonczewski_stt_torque_add_into(
-        &self,
-        magnetization: &[Vector3],
-        cfg: &SlonczewskiSttConfig,
-        out: &mut [Vector3],
-    ) {
-        let n = self.grid.cell_count();
-
-        let compute = |flat: usize, o: &mut Vector3| {
-            if !self.is_active(flat)
-                || cfg
-                    .active_mask
-                    .as_ref()
-                    .is_some_and(|mask| !mask.get(flat).copied().unwrap_or(false))
-            {
-                return;
-            }
-            let torque = slonczewski_torque_from_config(
-                magnetization[flat],
-                cfg,
-                self.material.damping,
-                self.dynamics.gyromagnetic_ratio,
-                self.material.saturation_magnetisation,
-            );
-            o[0] += torque[0];
-            o[1] += torque[1];
-            o[2] += torque[2];
-        };
-
-        #[cfg(feature = "parallel")]
-        {
-            out[..n].par_iter_mut().enumerate().for_each(|(flat, o)| {
-                compute(flat, o);
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for flat in 0..n {
-                compute(flat, &mut out[flat]);
-            }
-        }
-    }
-
-    pub(crate) fn slonczewski_stt_torque_add_into_soa(
-        &self,
-        magnetization: &VectorFieldSoA,
-        cfg: &SlonczewskiSttConfig,
-        out: &mut VectorFieldSoA,
-    ) {
-        for flat in 0..self.grid.cell_count() {
-            if !self.is_active(flat)
-                || cfg
-                    .active_mask
-                    .as_ref()
-                    .is_some_and(|mask| !mask.get(flat).copied().unwrap_or(false))
-            {
-                continue;
-            }
-            let torque = slonczewski_torque_from_config(
-                [
-                    magnetization.x[flat],
-                    magnetization.y[flat],
-                    magnetization.z[flat],
-                ],
-                cfg,
-                self.material.damping,
-                self.dynamics.gyromagnetic_ratio,
-                self.material.saturation_magnetisation,
-            );
-            out.x[flat] += torque[0];
-            out.y[flat] += torque[1];
-            out.z[flat] += torque[2];
-        }
-    }
-
-    pub(crate) fn sot_torque_add_into(
-        &self,
-        magnetization: &[Vector3],
-        cfg: &SotConfig,
-        out: &mut [Vector3],
-    ) {
-        let n = self.grid.cell_count();
-
-        let compute = |flat: usize, o: &mut Vector3| {
-            if !self.is_active(flat)
-                || cfg
-                    .active_mask
-                    .as_ref()
-                    .is_some_and(|mask| !mask.get(flat).copied().unwrap_or(false))
-            {
-                return;
-            }
-            let torque = prescribed_sot_torque_from_config(
-                magnetization[flat],
-                cfg,
-                self.material.saturation_magnetisation,
-                self.dynamics.gyromagnetic_ratio,
-                self.material.damping,
-            );
-            o[0] += torque[0];
-            o[1] += torque[1];
-            o[2] += torque[2];
-        };
-
-        #[cfg(feature = "parallel")]
-        {
-            out[..n].par_iter_mut().enumerate().for_each(|(flat, o)| {
-                compute(flat, o);
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for flat in 0..n {
-                compute(flat, &mut out[flat]);
-            }
-        }
-    }
-
-    pub(crate) fn sot_torque_add_into_soa(
-        &self,
-        magnetization: &VectorFieldSoA,
-        cfg: &SotConfig,
-        out: &mut VectorFieldSoA,
-    ) {
-        for flat in 0..self.grid.cell_count() {
-            if !self.is_active(flat)
-                || cfg
-                    .active_mask
-                    .as_ref()
-                    .is_some_and(|mask| !mask.get(flat).copied().unwrap_or(false))
-            {
-                continue;
-            }
-            let torque = prescribed_sot_torque_from_config(
-                [
-                    magnetization.x[flat],
-                    magnetization.y[flat],
-                    magnetization.z[flat],
-                ],
-                cfg,
-                self.material.saturation_magnetisation,
-                self.dynamics.gyromagnetic_ratio,
-                self.material.damping,
-            );
-            out.x[flat] += torque[0];
-            out.y[flat] += torque[1];
-            out.z[flat] += torque[2];
-        }
-    }
 
     // ===================================================================
     // Zero-allocation step report computation
@@ -3240,12 +971,15 @@ impl ExchangeLlgProblem {
         };
 
         // ── External ──────────────────────────────────────────────────
-        let external_energy_joules = if self.has_external_zeeman_source() {
+        let external_energy_joules = if self.has_external_zeeman_source()
+            || self.regional_field_drives.iter().any(|drive| drive.enabled)
+        {
             for h in h_scratch[..n].iter_mut() {
                 *h = [0.0, 0.0, 0.0];
             }
             self.external_field_add_into(&mut h_scratch[..n]);
             self.oersted_field_add_into_at_time(&mut h_scratch[..n], time_seconds);
+            self.regional_field_drives_add_into_at_time(&mut h_scratch[..n], time_seconds);
             let e = self.external_energy_from_fields(magnetization, &h_scratch[..n]);
             for i in 0..n {
                 h_eff[i] = add(h_eff[i], h_scratch[i]);
@@ -3259,6 +993,7 @@ impl ExchangeLlgProblem {
         self.magnetoelastic_field_add_into(magnetization, &mut h_eff[..n]);
         self.anisotropy_field_add_into(magnetization, &mut h_eff[..n]);
         self.interfacial_dmi_field_add_into(magnetization, &mut h_eff[..n]);
+        self.rotated_interfacial_dmi_field_add_into(magnetization, &mut h_eff[..n]);
         self.bulk_dmi_field_add_into(magnetization, &mut h_eff[..n]);
         self.thermal_field_add_into(&mut h_eff[..n]);
 
@@ -3510,38 +1245,39 @@ impl ExchangeLlgProblem {
         let mel_field = self.magnetoelastic_field(magnetization);
         let ani_field = self.anisotropy_field(magnetization);
         let idmi_field = self.interfacial_dmi_field(magnetization);
+        let rdmi_field = self.rotated_interfacial_dmi_field(magnetization);
         let bdmi_field = self.bulk_dmi_field(magnetization);
         let mut h_eff =
             combine_fields_4(&exchange_field, &demag_field, &external_field, &mel_field);
         for (i, h) in h_eff.iter_mut().enumerate() {
-            *h = add(add(add(*h, ani_field[i]), idmi_field[i]), bdmi_field[i]);
+            *h = add(
+                add(add(add(*h, ani_field[i]), idmi_field[i]), rdmi_field[i]),
+                bdmi_field[i],
+            );
         }
 
-        // Brown thermal field
-        if self.temperature > 0.0
-            && self.material.saturation_magnetisation > 0.0
-            && self.thermal_dt > 0.0
-        {
+        // Brown thermal field.  Keep this legacy public path on the same
+        // per-cell material contract as the fused execution path.
+        let thermal_dt = self.thermal_dt_for_evaluation();
+        if let (Some(base_factor), true) = (
+            thermal_base_factor(
+                self.temperature,
+                self.dynamics.gyromagnetic_ratio,
+                self.cell_size.volume(),
+            ),
+            thermal_dt > 0.0 && thermal_dt.is_finite(),
+        ) {
             use std::cell::RefCell;
 
             thread_local! {
                 static RNG: RefCell<u64> = const { RefCell::new(42u64) };
             }
 
-            let alpha = self.material.damping;
-            let ms = self.material.saturation_magnetisation;
-            let gamma0 = self.dynamics.gyromagnetic_ratio;
-            let v_cell = self.cell_size.dx * self.cell_size.dy * self.cell_size.dz;
-            const KB: f64 = 1.380649e-23;
-            const MU0: f64 = 1.2566370614359173e-6;
-
-            let sigma = (2.0 * alpha * KB * self.temperature
-                / (gamma0 * MU0 * ms * v_cell * self.thermal_dt))
-                .sqrt();
+            let dt_scale = 1.0 / thermal_dt.sqrt();
 
             RNG.with(|seed_cell| {
                 let mut seed = *seed_cell.borrow();
-                for h in h_eff.iter_mut() {
+                for (i, h) in h_eff.iter_mut().enumerate() {
                     let (n0, n1, n2) = {
                         let next_u = |s: &mut u64| -> f64 {
                             *s ^= *s >> 12;
@@ -3560,9 +1296,16 @@ impl ExchangeLlgProblem {
                         let theta2 = 2.0 * std::f64::consts::PI * u4;
                         (r1 * theta1.cos(), r1 * theta1.sin(), r2 * theta2.cos())
                     };
-                    h[0] += sigma * n0;
-                    h[1] += sigma * n1;
-                    h[2] += sigma * n2;
+                    if let Some(sigma) = thermal_sigma_for_cell(
+                        base_factor,
+                        dt_scale,
+                        self.ms_at(i),
+                        self.alpha_at(i),
+                    ) {
+                        h[0] += sigma * n0;
+                        h[1] += sigma * n1;
+                        h[2] += sigma * n2;
+                    }
                 }
                 *seed_cell.borrow_mut() = seed;
             });
@@ -3570,37 +1313,8 @@ impl ExchangeLlgProblem {
 
         // Oersted field from cylindrical conductor (STNO / MTJ)
         self.oersted_field_add_into_at_time(&mut h_eff, time_seconds);
+        self.regional_field_drives_add_into_at_time(&mut h_eff, time_seconds);
 
-        h_eff
-    }
-
-    pub(crate) fn observable_effective_field_from_vectors_ws_at_time(
-        &self,
-        magnetization: &[Vector3],
-        ws: &mut FftWorkspace,
-        time_seconds: f64,
-    ) -> Vec<Vector3> {
-        let exchange_field = if self.terms.exchange {
-            self.exchange_field_from_vectors(magnetization)
-        } else {
-            zero_vectors(self.grid.cell_count())
-        };
-        let demag_field = if self.terms.demag {
-            self.demag_field_from_vectors_ws(magnetization, ws)
-        } else {
-            zero_vectors(self.grid.cell_count())
-        };
-        let external_field = self.external_field_vectors();
-        let mel_field = self.magnetoelastic_field(magnetization);
-        let ani_field = self.anisotropy_field(magnetization);
-        let idmi_field = self.interfacial_dmi_field(magnetization);
-        let bdmi_field = self.bulk_dmi_field(magnetization);
-        let mut h_eff =
-            combine_fields_4(&exchange_field, &demag_field, &external_field, &mel_field);
-        for (i, h) in h_eff.iter_mut().enumerate() {
-            *h = add(add(add(*h, ani_field[i]), idmi_field[i]), bdmi_field[i]);
-        }
-        self.oersted_field_add_into_at_time(&mut h_eff, time_seconds);
         h_eff
     }
 
@@ -3655,130 +1369,6 @@ impl ExchangeLlgProblem {
             .collect()
     }
 
-    pub fn total_energy_from_soa_ws(
-        &self,
-        magnetization: &VectorFieldSoA,
-        ws: &mut FftWorkspace,
-        scratch: &mut VectorFieldSoA,
-    ) -> f64 {
-        let mut total = 0.0;
-
-        if self.terms.exchange {
-            scratch.fill_zero();
-            self.exchange_field_add_into_soa(magnetization, scratch);
-            total += self.half_field_energy_from_soa(magnetization, scratch);
-        }
-        if self.terms.demag {
-            scratch.fill_zero();
-            self.demag_field_add_into_soa_fft_backend(magnetization, ws, scratch);
-            total += self.half_field_energy_from_soa(magnetization, scratch);
-        }
-        if self.has_external_zeeman_source() {
-            scratch.fill_zero();
-            self.external_field_add_into_soa(scratch);
-            self.oersted_field_add_into_soa(scratch);
-            total += self.full_field_energy_from_soa(magnetization, scratch);
-        }
-        if self.regional_field_drives.iter().any(|drive| drive.enabled) {
-            scratch.fill_zero();
-            for drive in self
-                .regional_field_drives
-                .iter()
-                .filter(|drive| drive.enabled)
-            {
-                let multiplier = drive.multiplier_at(0.0);
-                for (index, basis) in drive.basis_field.iter().enumerate().take(scratch.len()) {
-                    if self.is_active(index) {
-                        scratch.x[index] += multiplier * basis[0];
-                        scratch.y[index] += multiplier * basis[1];
-                        scratch.z[index] += multiplier * basis[2];
-                    }
-                }
-            }
-            total += self.full_field_energy_from_soa(magnetization, scratch);
-        }
-        total += self.magnetoelastic_energy_soa(magnetization);
-        if self.terms.uniaxial_anisotropy.is_some() || self.terms.cubic_anisotropy.is_some() {
-            total += self.anisotropy_energy_from_soa(magnetization);
-        }
-        total += self.dmi_energy_from_soa(magnetization);
-
-        total
-    }
-
-    pub fn total_energy_from_vectors_ws(
-        &self,
-        magnetization: &[Vector3],
-        ws: &mut FftWorkspace,
-    ) -> f64 {
-        let mut total = 0.0;
-
-        if self.terms.exchange {
-            let h_ex = self.exchange_field_from_vectors(magnetization);
-            total += self.exchange_energy_from_field(magnetization, &h_ex);
-        }
-        if self.terms.demag {
-            let h_demag = self.demag_field_from_vectors_ws(magnetization, ws);
-            total += self.demag_energy_from_fields(magnetization, &h_demag);
-        }
-        if self.has_external_zeeman_source() {
-            let h_ext = self.external_zeeman_field_vectors();
-            total += self.external_energy_from_fields(magnetization, &h_ext);
-        }
-        if self.regional_field_drives.iter().any(|drive| drive.enabled) {
-            let h_drive = self.regional_drive_field_at_time(0.0);
-            total += self.external_energy_from_fields(magnetization, &h_drive);
-        }
-        total += self.magnetoelastic_energy(magnetization);
-        if self.terms.uniaxial_anisotropy.is_some() || self.terms.cubic_anisotropy.is_some() {
-            total += self.anisotropy_energy(magnetization);
-        }
-        total += self.dmi_energy_from_vectors(magnetization);
-
-        total
-    }
-
-    pub(crate) fn half_field_energy_from_soa(
-        &self,
-        magnetization: &VectorFieldSoA,
-        field: &VectorFieldSoA,
-    ) -> f64 {
-        self.field_energy_from_soa(magnetization, field, -0.5 * MU0)
-    }
-
-    pub(crate) fn full_field_energy_from_soa(
-        &self,
-        magnetization: &VectorFieldSoA,
-        field: &VectorFieldSoA,
-    ) -> f64 {
-        self.field_energy_from_soa(magnetization, field, -MU0)
-    }
-
-    pub(crate) fn field_energy_from_soa(
-        &self,
-        magnetization: &VectorFieldSoA,
-        field: &VectorFieldSoA,
-        mu0_scale: f64,
-    ) -> f64 {
-        let n = magnetization.len();
-        debug_assert!(field.len() >= n);
-        let scale = mu0_scale * self.material.saturation_magnetisation * self.cell_size.volume();
-        let compute = |i: usize| {
-            scale
-                * (magnetization.x[i] * field.x[i]
-                    + magnetization.y[i] * field.y[i]
-                    + magnetization.z[i] * field.z[i])
-        };
-        #[cfg(feature = "parallel")]
-        {
-            (0..n).into_par_iter().map(compute).sum()
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            (0..n).map(compute).sum()
-        }
-    }
-
     pub(crate) fn llg_rhs_from_vectors(&self, magnetization: &[Vector3]) -> Vec<Vector3> {
         let mut ws = self.create_workspace();
         self.llg_rhs_from_vectors_ws(magnetization, &mut ws)
@@ -3815,15 +1405,20 @@ impl ExchangeLlgProblem {
         let mel_field = self.magnetoelastic_field(magnetization);
         let ani_field = self.anisotropy_field(magnetization);
         let idmi_field = self.interfacial_dmi_field(magnetization);
+        let rdmi_field = self.rotated_interfacial_dmi_field(magnetization);
         let bdmi_field = self.bulk_dmi_field(magnetization);
         let mut effective_field =
             combine_fields_4(&exchange_field, &demag_field, &external_field, &mel_field);
         for (i, h) in effective_field.iter_mut().enumerate() {
-            *h = add(add(add(*h, ani_field[i]), idmi_field[i]), bdmi_field[i]);
+            *h = add(
+                add(add(add(*h, ani_field[i]), idmi_field[i]), rdmi_field[i]),
+                bdmi_field[i],
+            );
         }
 
         // Oersted field from cylindrical conductor (STNO / MTJ)
         self.oersted_field_add_into(&mut effective_field);
+        self.regional_field_drives_add_into_at_time(&mut effective_field, 0.0);
 
         let mut rhs: Vec<Vector3> = magnetization
             .iter()
@@ -3861,8 +1456,11 @@ impl ExchangeLlgProblem {
         } else {
             0.0
         };
-        let external_energy_joules = if self.has_external_zeeman_source() {
-            let external_zeeman_field = self.external_zeeman_field_vectors();
+        let external_energy_joules = if self.has_external_zeeman_source()
+            || self.regional_field_drives.iter().any(|drive| drive.enabled)
+        {
+            let mut external_zeeman_field = self.external_zeeman_field_vectors();
+            self.regional_field_drives_add_into_at_time(&mut external_zeeman_field, 0.0);
             self.external_energy_from_fields(magnetization, &external_zeeman_field)
         } else {
             0.0
@@ -3894,6 +1492,7 @@ impl ExchangeLlgProblem {
         (rhs, eval)
     }
 
+    #[cfg(test)]
     pub(crate) fn llg_rhs_from_field(&self, magnetization: Vector3, field: Vector3) -> Vector3 {
         let alpha = self.material.damping;
         let gamma_bar = self.dynamics.gyromagnetic_ratio / (1.0 + alpha * alpha);
@@ -3924,193 +1523,6 @@ impl ExchangeLlgProblem {
         };
         scale(add(precession_term, scale(damping, alpha)), -gamma_bar)
     }
-
-    // ===================================================================
-    // Energy calculations
-    // ===================================================================
-
-    pub fn exchange_energy_from_vectors(&self, magnetization: &[Vector3]) -> f64 {
-        let cell_volume = self.cell_size.volume();
-        let grid = self.grid;
-        let dx2 = self.cell_size.dx * self.cell_size.dx;
-        let dy2 = self.cell_size.dy * self.cell_size.dy;
-        let dz2 = self.cell_size.dz * self.cell_size.dz;
-
-        let compute_cell_energy = |flat_index: usize| -> f64 {
-            if !self.is_active(flat_index) {
-                return 0.0;
-            }
-            let x = flat_index % grid.nx;
-            let y = (flat_index / grid.nx) % grid.ny;
-            let z = flat_index / (grid.nx * grid.ny);
-            let center = magnetization[flat_index];
-            let ai = self.a_at(flat_index);
-            let mut e = 0.0;
-            if x + 1 < grid.nx {
-                let neighbor_index = grid.index(x + 1, y, z);
-                if self.is_active(neighbor_index) {
-                    let aj = self.a_at(neighbor_index);
-                    let aij = if ai == 0.0 || aj == 0.0 {
-                        0.0
-                    } else {
-                        2.0 * ai * aj / (ai + aj)
-                    };
-                    let neighbor = magnetization[neighbor_index];
-                    e += aij * cell_volume * squared_norm(sub(neighbor, center)) / dx2;
-                }
-            }
-            if y + 1 < grid.ny {
-                let neighbor_index = grid.index(x, y + 1, z);
-                if self.is_active(neighbor_index) {
-                    let aj = self.a_at(neighbor_index);
-                    let aij = if ai == 0.0 || aj == 0.0 {
-                        0.0
-                    } else {
-                        2.0 * ai * aj / (ai + aj)
-                    };
-                    let neighbor = magnetization[neighbor_index];
-                    e += aij * cell_volume * squared_norm(sub(neighbor, center)) / dy2;
-                }
-            }
-            if z + 1 < grid.nz {
-                let neighbor_index = grid.index(x, y, z + 1);
-                if self.is_active(neighbor_index) {
-                    let aj = self.a_at(neighbor_index);
-                    let aij = if ai == 0.0 || aj == 0.0 {
-                        0.0
-                    } else {
-                        2.0 * ai * aj / (ai + aj)
-                    };
-                    let neighbor = magnetization[neighbor_index];
-                    e += aij * cell_volume * squared_norm(sub(neighbor, center)) / dz2;
-                }
-            }
-            e
-        };
-
-        #[cfg(feature = "parallel")]
-        {
-            (0..grid.cell_count())
-                .into_par_iter()
-                .map(compute_cell_energy)
-                .sum()
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            (0..grid.cell_count()).map(compute_cell_energy).sum()
-        }
-    }
-
-    pub(crate) fn exchange_energy_from_field(
-        &self,
-        magnetization: &[Vector3],
-        exchange_field: &[Vector3],
-    ) -> f64 {
-        let cell_volume = self.cell_size.volume();
-        self.exchange_energy_density_from_field(magnetization, exchange_field)
-            .into_iter()
-            .map(|density| density * cell_volume)
-            .sum()
-    }
-
-    pub fn exchange_energy_density_from_field(
-        &self,
-        magnetization: &[Vector3],
-        exchange_field: &[Vector3],
-    ) -> Vec<f64> {
-        self.field_dot_energy_density(magnetization, exchange_field, -0.5)
-    }
-
-    pub(crate) fn demag_energy_from_fields(
-        &self,
-        magnetization: &[Vector3],
-        demag_field: &[Vector3],
-    ) -> f64 {
-        let cell_volume = self.cell_size.volume();
-        self.demag_energy_density_from_fields(magnetization, demag_field)
-            .into_iter()
-            .map(|density| density * cell_volume)
-            .sum()
-    }
-
-    pub fn demag_energy_density_from_fields(
-        &self,
-        magnetization: &[Vector3],
-        demag_field: &[Vector3],
-    ) -> Vec<f64> {
-        self.field_dot_energy_density(magnetization, demag_field, -0.5)
-    }
-
-    pub(crate) fn external_energy_from_fields(
-        &self,
-        magnetization: &[Vector3],
-        external_field: &[Vector3],
-    ) -> f64 {
-        let cell_volume = self.cell_size.volume();
-        self.external_energy_density_from_fields(magnetization, external_field)
-            .into_iter()
-            .map(|density| density * cell_volume)
-            .sum()
-    }
-
-    pub fn external_energy_density_from_fields(
-        &self,
-        magnetization: &[Vector3],
-        external_field: &[Vector3],
-    ) -> Vec<f64> {
-        self.field_dot_energy_density(magnetization, external_field, -1.0)
-    }
-
-    pub fn anisotropy_energy_density_from_vectors(&self, magnetization: &[Vector3]) -> Vec<f64> {
-        let uni_data = self.terms.uniaxial_anisotropy.as_ref().map(|uni| {
-            let n = norm(uni.axis).max(1e-30);
-            (scale(uni.axis, 1.0 / n), uni.ku1, uni.ku2)
-        });
-        let cub_data = self.terms.cubic_anisotropy.as_ref().map(|cub| {
-            let n1 = norm(cub.axis1).max(1e-30);
-            let n2 = norm(cub.axis2).max(1e-30);
-            let c1 = scale(cub.axis1, 1.0 / n1);
-            let c2 = scale(cub.axis2, 1.0 / n2);
-            (c1, c2, cross(c1, c2), cub.kc1, cub.kc2, cub.kc3)
-        });
-
-        magnetization
-            .iter()
-            .enumerate()
-            .map(|(i, &m)| {
-                self.is_active(i)
-                    .then(|| anisotropy_energy_density_for_magnetization(m, uni_data, cub_data))
-                    .unwrap_or(0.0)
-            })
-            .collect()
-    }
-
-    fn field_dot_energy_density(
-        &self,
-        magnetization: &[Vector3],
-        field: &[Vector3],
-        prefactor: f64,
-    ) -> Vec<f64> {
-        let compute = |i: usize| {
-            if self.is_active(i) {
-                let ms = self.ms_at(i);
-                prefactor * MU0 * ms * dot(magnetization[i], field[i])
-            } else {
-                0.0
-            }
-        };
-        #[cfg(feature = "parallel")]
-        {
-            (0..magnetization.len())
-                .into_par_iter()
-                .map(compute)
-                .collect()
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            (0..magnetization.len()).map(compute).collect()
-        }
-    }
 }
 
 #[cfg(test)]
@@ -4135,6 +1547,35 @@ mod stt_tests {
             MaterialParameters::new(800.0e3, 13.0e-12, damping).unwrap(),
             LlgConfig::default(),
         )
+    }
+
+    #[test]
+    fn rotated_dmi_energy_helpers_short_circuit_when_term_is_absent_or_zero() {
+        // Deliberately supply no field data: an absent/zero term must return
+        // before visiting even a periodic self-neighbor in the face loop.
+        let magnetization: [Vector3; 0] = [];
+        let mut without_term = one_cell_problem(0.2);
+        without_term.boundary_policy.x = AxisBoundary::Periodic;
+        assert_eq!(
+            without_term.rotated_interfacial_dmi_energy_from_vectors(&magnetization),
+            0.0
+        );
+        assert_eq!(
+            without_term.rotated_interfacial_dmi_energy_density_from_vectors(&magnetization),
+            vec![0.0]
+        );
+
+        let mut zero_term = one_cell_problem(0.2);
+        zero_term.boundary_policy.x = AxisBoundary::Periodic;
+        zero_term.terms.rotated_interfacial_dmi = Some(0.0);
+        assert_eq!(
+            zero_term.rotated_interfacial_dmi_energy_from_vectors(&magnetization),
+            0.0
+        );
+        assert_eq!(
+            zero_term.rotated_interfacial_dmi_energy_density_from_vectors(&magnetization),
+            vec![0.0]
+        );
     }
 
     fn canonical_slonczewski_oracle(
@@ -4403,6 +1844,86 @@ mod stt_tests {
         let measured_ratio = strong_field[0][0] / weak_field[0][0];
         let expected_ratio = (0.5_f64 / 0.2_f64).sqrt();
         check_close(measured_ratio, expected_ratio, expected_ratio * 1e-12);
+    }
+
+    #[test]
+    fn spatial_material_thermal_noise_uses_local_ms_and_alpha_in_aos_and_fused_paths() {
+        let grid = GridShape::new(2, 1, 1).unwrap();
+        let cell_size = CellSize::new(1.0e-9, 1.0e-9, 1.0e-9).unwrap();
+        let mut spatial = ExchangeLlgProblem::with_terms_and_mask(
+            grid,
+            cell_size,
+            MaterialParameters::new(800.0e3, 13.0e-12, 0.2).unwrap(),
+            LlgConfig::default(),
+            EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                ..Default::default()
+            },
+            Some(vec![true, true]),
+        )
+        .unwrap()
+        .with_spatial_fields(Some(vec![400.0e3, 1_600.0e3]), None, Some(vec![0.05, 0.8]))
+        .unwrap();
+        spatial.temperature = 300.0;
+        spatial.thermal_dt = 2.5e-13;
+        spatial.thermal_seed = 0x5eed;
+
+        let mut spatial_noise = vec![[0.0; 3]; 2];
+        spatial.thermal_field_add_into_step(&mut spatial_noise, 7);
+
+        for (index, (ms, alpha)) in [(400.0e3, 0.05), (1_600.0e3, 0.8)].into_iter().enumerate() {
+            let mut scalar = ExchangeLlgProblem::with_terms(
+                grid,
+                cell_size,
+                MaterialParameters::new(ms, 13.0e-12, alpha).unwrap(),
+                LlgConfig::default(),
+                EffectiveFieldTerms {
+                    exchange: false,
+                    demag: false,
+                    ..Default::default()
+                },
+            );
+            scalar.temperature = spatial.temperature;
+            scalar.thermal_dt = spatial.thermal_dt;
+            scalar.thermal_seed = spatial.thermal_seed;
+            let mut scalar_noise = vec![[0.0; 3]; 2];
+            scalar.thermal_field_add_into_step(&mut scalar_noise, 7);
+            assert_eq!(spatial_noise[index], scalar_noise[index]);
+        }
+
+        spatial.restore_thermal_step(7);
+        let mut fused_noise = vec![[0.0; 3]; 2];
+        let mut workspace = spatial.create_workspace();
+        spatial.effective_field_into_ws(&[[1.0, 0.0, 0.0]; 2], &mut workspace, &mut fused_noise);
+        assert_eq!(fused_noise, spatial_noise);
+    }
+
+    #[test]
+    fn inactive_spatial_material_cells_do_not_receive_thermal_noise() {
+        let grid = GridShape::new(2, 1, 1).unwrap();
+        let mut problem = ExchangeLlgProblem::with_terms_and_mask(
+            grid,
+            CellSize::new(1.0e-9, 1.0e-9, 1.0e-9).unwrap(),
+            MaterialParameters::new(800.0e3, 13.0e-12, 0.2).unwrap(),
+            LlgConfig::default(),
+            EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                ..Default::default()
+            },
+            Some(vec![true, false]),
+        )
+        .unwrap()
+        .with_spatial_fields(Some(vec![800.0e3, 800.0e3]), None, Some(vec![0.2, 0.2]))
+        .unwrap();
+        problem.temperature = 300.0;
+        problem.thermal_dt = 2.5e-13;
+
+        let mut field = vec![[0.0; 3]; 2];
+        problem.thermal_field_add_into_step(&mut field, 11);
+        assert!(field[0].iter().all(|component| component.is_finite()));
+        assert_eq!(field[1], [0.0; 3]);
     }
 
     #[test]
@@ -4737,6 +2258,114 @@ mod stt_tests {
     }
 
     #[test]
+    fn local_ms_and_alpha_are_used_by_all_cpu_direct_torque_layouts() {
+        let grid = GridShape::new(2, 1, 1).unwrap();
+        let cell_size = CellSize::new(1.0e-9, 1.0e-9, 1.0e-9).unwrap();
+        let spatial = ExchangeLlgProblem::new(
+            grid,
+            cell_size,
+            MaterialParameters::new(800.0e3, 13.0e-12, 0.2).unwrap(),
+            LlgConfig::default(),
+        )
+        .with_spatial_fields(Some(vec![400.0e3, 1_600.0e3]), None, Some(vec![0.05, 0.8]))
+        .unwrap();
+        let magnetization = vec![[0.4, 0.7, 0.2], [0.1, 0.3, 0.9]];
+        let zhang = ZhangLiSttConfig {
+            formula: ZhangLiFormula::LegacyFullmagV0,
+            current_density: [1.0e12, -2.0e11, 0.0],
+            spin_polarization: 0.8,
+            non_adiabaticity: 0.1,
+        };
+        let slon = SlonczewskiSttConfig {
+            formula: SlonczewskiFormula::FullmagV2,
+            current_density_magnitude: 7.0e11,
+            spin_polarization_axis: [0.0, 0.0, 1.0],
+            lambda: 1.7,
+            epsilon_prime: 0.13,
+            degree: 0.6,
+            thickness: 1.5e-9,
+            current_sign: -1.0,
+            active_mask: None,
+        };
+        let sot = SotConfig {
+            formula: SotFormula::FullmagV1,
+            current_density: 1.0e12,
+            xi_dl: 0.35,
+            xi_fl: 0.15,
+            sigma: [0.0, 0.0, 1.0],
+            thickness: 1.5e-9,
+            active_mask: None,
+            envelope: None,
+        };
+
+        let spatial_zhang = spatial.zhang_li_stt_torque(&magnetization, &zhang);
+        let spatial_slon = spatial.slonczewski_stt_torque(&magnetization, &slon);
+        let spatial_sot = spatial.sot_torque(&magnetization, &sot);
+
+        for (index, (ms, alpha)) in [(400.0e3, 0.05), (1_600.0e3, 0.8)].into_iter().enumerate() {
+            let scalar = ExchangeLlgProblem::new(
+                grid,
+                cell_size,
+                MaterialParameters::new(ms, 13.0e-12, alpha).unwrap(),
+                LlgConfig::default(),
+            );
+            let scalar_zhang = scalar.zhang_li_stt_torque(&magnetization, &zhang);
+            let scalar_slon = scalar.slonczewski_stt_torque(&magnetization, &slon);
+            let scalar_sot = scalar.sot_torque(&magnetization, &sot);
+            for component in 0..3 {
+                check_close(
+                    spatial_zhang[index][component],
+                    scalar_zhang[index][component],
+                    scalar_zhang[index][component].abs() * 1.0e-12 + 1.0e-18,
+                );
+                check_close(
+                    spatial_slon[index][component],
+                    scalar_slon[index][component],
+                    scalar_slon[index][component].abs() * 1.0e-12 + 1.0e-18,
+                );
+                check_close(
+                    spatial_sot[index][component],
+                    scalar_sot[index][component],
+                    scalar_sot[index][component].abs() * 1.0e-12 + 1.0e-18,
+                );
+            }
+        }
+
+        let mut zhang_aos = vec![[0.0; 3]; 2];
+        spatial.zhang_li_stt_torque_add_into(&magnetization, &zhang, &mut zhang_aos);
+        let mut zhang_soa = VectorFieldSoA::zeros(2);
+        spatial.zhang_li_stt_torque_add_into_soa(
+            &VectorFieldSoA::from_aos(&magnetization),
+            &zhang,
+            &mut zhang_soa,
+        );
+        assert_eq!(zhang_aos, spatial_zhang);
+        assert_eq!(zhang_soa.gather_to_aos(), spatial_zhang);
+
+        let mut slon_aos = vec![[0.0; 3]; 2];
+        spatial.slonczewski_stt_torque_add_into(&magnetization, &slon, &mut slon_aos);
+        let mut slon_soa = VectorFieldSoA::zeros(2);
+        spatial.slonczewski_stt_torque_add_into_soa(
+            &VectorFieldSoA::from_aos(&magnetization),
+            &slon,
+            &mut slon_soa,
+        );
+        assert_eq!(slon_aos, spatial_slon);
+        assert_eq!(slon_soa.gather_to_aos(), spatial_slon);
+
+        let mut sot_aos = vec![[0.0; 3]; 2];
+        spatial.sot_torque_add_into(&magnetization, &sot, &mut sot_aos);
+        let mut sot_soa = VectorFieldSoA::zeros(2);
+        spatial.sot_torque_add_into_soa(
+            &VectorFieldSoA::from_aos(&magnetization),
+            &sot,
+            &mut sot_soa,
+        );
+        assert_eq!(sot_aos, spatial_sot);
+        assert_eq!(sot_soa.gather_to_aos(), spatial_sot);
+    }
+
+    #[test]
     fn observable_demag_field_preserves_stray_field_in_inactive_cells() {
         let problem = ExchangeLlgProblem::with_terms_and_mask(
             GridShape::new(2, 1, 1).unwrap(),
@@ -4773,5 +2402,44 @@ mod stt_tests {
         let observable_energy =
             problem.demag_energy_from_fields(state.magnetization(), &observable_field);
         assert_eq!(observable_energy, masked_energy);
+    }
+
+    #[test]
+    fn fused_aos_and_soa_include_static_external_field_map() {
+        let problem = ExchangeLlgProblem::with_terms(
+            GridShape::new(2, 1, 1).unwrap(),
+            CellSize::new(1.0e-9, 1.0e-9, 1.0e-9).unwrap(),
+            MaterialParameters::new(800.0e3, 13.0e-12, 0.1).unwrap(),
+            LlgConfig::default(),
+            EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                ..Default::default()
+            },
+        )
+        .with_static_external_field(Some(vec![[0.0, 1.0, 2.0], [3.0, 4.0, 5.0]]))
+        .unwrap();
+        let magnetization = vec![[1.0, 0.0, 0.0]; 2];
+
+        let mut aos_field = vec![[0.0; 3]; 2];
+        let mut aos_workspace = problem.create_workspace();
+        problem.effective_field_into_ws_at_time(
+            &magnetization,
+            &mut aos_workspace,
+            &mut aos_field,
+            0.0,
+        );
+
+        let soa_magnetization = VectorFieldSoA::from_aos(&magnetization);
+        let mut soa_field = VectorFieldSoA::zeros(2);
+        let mut soa_workspace = problem.create_workspace();
+        problem.effective_field_into_soa_ws_at(
+            &soa_magnetization,
+            0.0,
+            &mut soa_workspace,
+            &mut soa_field,
+        );
+
+        assert_eq!(aos_field, soa_field.gather_to_aos());
     }
 }

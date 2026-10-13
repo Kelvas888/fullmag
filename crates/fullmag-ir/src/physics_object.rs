@@ -1,14 +1,17 @@
 use crate::{
-    AbsorbingBoundaryLayerIR, AirBoxPolicyIR, BackendPolicyIR, CouplingIR, CurrentModuleIR,
-    ElasticBodyIR, ElasticMaterialIR, EnergyTermIR, ExcitationAnalysisIR, FdmPeriodicityIR,
-    GeometryAssetsIR, GeometryIR, InitialMagnetizationIR, MagnetostrictionLawIR, MaterialIR,
-    MaterialParameterAssignmentIR, MechanicalBoundaryConditionIR, MechanicalLoadIR,
+    AbsorbingBoundaryLayerIR, AirBoxPolicyIR, AntennaFieldSolveStageIR, AntennaPortModeIR,
+    AntennaSpectrumRequestIR, AntennaTargetProjectionRefIR, BackendPolicyIR, CouplingIR,
+    CurrentModuleIR, ElasticBodyIR, ElasticMaterialIR, EnergyTermIR, ExcitationAnalysisIR,
+    FdmPeriodicityIR, GeometryAssetsIR, GeometryIR, InitialMagnetizationIR,
+    MagnetostaticBoundaryConditionIR, MagnetostrictionLawIR,
+    MaterialIR, MaterialParameterAssignmentIR, MechanicalBoundaryConditionIR, MechanicalLoadIR,
     MeshSemanticsIR, ObjectRegionIR, PlanarMonitorIR, ProblemIR, ProblemMeta, RegionIR,
-    RegionRefIR, RegionalFieldDriveIR, SpinTorqueModuleIR, SpinTransportModuleIR, StudyIR,
-    SurfaceRefIR, ValidationProfileIR,
+    RegionRefIR, RegionalFieldDriveIR, SolvedAntennaDriveIR, SpinTorqueModuleIR,
+    SpinTransportModuleIR, StudyIRV04, SurfaceRefIR, ValidationProfileIR,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const PHYSICS_OBJECT_SCHEMA_VERSION: &str = "physics_object.v1";
@@ -23,6 +26,7 @@ pub enum PhysicsObjectTypeIR {
     Geometry,
     Ferromagnet,
     Conductor,
+    Electrode,
     Antenna,
 }
 
@@ -224,13 +228,23 @@ pub struct ProblemIRV04 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub planar_monitors: Vec<PlanarMonitorIR>,
     pub energy_terms: Vec<EnergyTermIR>,
-    pub study: StudyIR,
+    pub study: StudyIRV04,
     pub backend_policy: BackendPolicyIR,
     pub validation_profile: ValidationProfileIR,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub current_modules: Vec<CurrentModuleIR>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub field_drives: Vec<RegionalFieldDriveIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antenna_port_modes: Vec<AntennaPortModeIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antenna_field_solve_stages: Vec<AntennaFieldSolveStageIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antenna_target_projections: Vec<AntennaTargetProjectionRefIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub solved_antenna_drives: Vec<SolvedAntennaDriveIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub antenna_spectrum_requests: Vec<AntennaSpectrumRequestIR>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub excitation_analysis: Option<ExcitationAnalysisIR>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -287,6 +301,7 @@ struct ProblemIRV04Wire {
     regions: Vec<RegionIR>,
     #[serde(default)]
     object_regions: Vec<ObjectRegionIR>,
+    #[serde(deserialize_with = "crate::v04_material_wire::deserialize_materials")]
     materials: Vec<MaterialIR>,
     #[serde(default)]
     material_parameter_fields: Vec<MaterialParameterAssignmentIR>,
@@ -306,13 +321,23 @@ struct ProblemIRV04Wire {
     #[serde(default)]
     planar_monitors: Vec<PlanarMonitorIR>,
     energy_terms: Vec<EnergyTermIR>,
-    study: StudyIR,
+    study: StudyIRV04,
     backend_policy: BackendPolicyIR,
     validation_profile: ValidationProfileIR,
     #[serde(default)]
     current_modules: Vec<CurrentModuleIR>,
     #[serde(default)]
     field_drives: Vec<RegionalFieldDriveIR>,
+    #[serde(default)]
+    antenna_port_modes: Vec<AntennaPortModeIR>,
+    #[serde(default)]
+    antenna_field_solve_stages: Vec<AntennaFieldSolveStageIR>,
+    #[serde(default)]
+    antenna_target_projections: Vec<AntennaTargetProjectionRefIR>,
+    #[serde(default)]
+    solved_antenna_drives: Vec<SolvedAntennaDriveIR>,
+    #[serde(default)]
+    antenna_spectrum_requests: Vec<AntennaSpectrumRequestIR>,
     #[serde(default)]
     excitation_analysis: Option<ExcitationAnalysisIR>,
     #[serde(default)]
@@ -384,6 +409,11 @@ impl From<ProblemIRV04Wire> for ProblemIRV04 {
             validation_profile: wire.validation_profile,
             current_modules: wire.current_modules,
             field_drives: wire.field_drives,
+            antenna_port_modes: wire.antenna_port_modes,
+            antenna_field_solve_stages: wire.antenna_field_solve_stages,
+            antenna_target_projections: wire.antenna_target_projections,
+            solved_antenna_drives: wire.solved_antenna_drives,
+            antenna_spectrum_requests: wire.antenna_spectrum_requests,
             excitation_analysis: wire.excitation_analysis,
             spin_torque_modules: wire.spin_torque_modules,
             spin_transport_modules: wire.spin_transport_modules,
@@ -416,8 +446,26 @@ impl<'de> Deserialize<'de> for ProblemIRV04 {
         D: Deserializer<'de>,
     {
         let mut value = Value::deserialize(deserializer)?;
+        crate::study_v04::validate_v04_study_wire(&value).map_err(serde::de::Error::custom)?;
         crate::normalize_frozen_membership_defaults_in_problem_value(&mut value)
             .map_err(serde::de::Error::custom)?;
+        if let Some(policy_value) = value.pointer("/mesh_semantics/requested_policy") {
+            let policy =
+                crate::FemMeshPolicyIR::from_json_value(policy_value.clone()).map_err(|error| {
+                    serde::de::Error::custom(
+                        error
+                            .with_pointer_prefix("/mesh_semantics/requested_policy")
+                            .to_string(),
+                    )
+                })?;
+            policy.validate().map_err(|error| {
+                serde::de::Error::custom(
+                    error
+                        .with_pointer_prefix("/mesh_semantics/requested_policy")
+                        .to_string(),
+                )
+            })?;
+        }
         let wire = ProblemIRV04Wire::deserialize(value).map_err(serde::de::Error::custom)?;
         Ok(wire.into())
     }
@@ -433,7 +481,33 @@ impl ProblemIRV04 {
     }
 
     pub fn validate(&self) -> Result<(), Vec<String>> {
-        crate::validate_physics_object_problem(self)
+        let mut errors = crate::validate_physics_object_problem(self)
+            .err()
+            .unwrap_or_default();
+        let study = self.study.legacy_validation_view();
+        errors.extend(crate::validate_study_root_context_contracts(
+            &study,
+            &crate::StudyRootValidationContext {
+                energy_terms: &self.energy_terms,
+                materials: &self.materials,
+                backend_policy: &self.backend_policy,
+                validation_profile: &self.validation_profile,
+                pbc: self.pbc.as_ref(),
+            },
+        ));
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+
+    /// The only mesh-policy source used by the typed V04 execution contract.
+    /// Legacy runtime metadata is retained for migration provenance only.
+    pub fn fem_mesh_policy(&self) -> Option<&crate::FemMeshPolicyIR> {
+        self.mesh_semantics
+            .as_ref()
+            .and_then(|semantics| semantics.requested_policy.as_ref())
     }
 }
 
@@ -467,15 +541,153 @@ fn object_id_for(legacy_name: &str) -> String {
     format!("obj_{legacy_name}")
 }
 
+fn insert_legacy_object_alias(
+    aliases: &mut BTreeMap<String, String>,
+    alias: &str,
+    object_id: &str,
+    pointer: &str,
+) -> Result<(), String> {
+    if let Some(existing) = aliases.get(alias) {
+        if existing != object_id {
+            return Err(format!(
+                "{pointer}: ambiguous legacy object alias '{alias}' resolves to both '{existing}' and '{object_id}'"
+            ));
+        }
+        return Ok(());
+    }
+    aliases.insert(alias.to_string(), object_id.to_string());
+    Ok(())
+}
+
+fn validate_v03_migration_metadata_versions(
+    root: &serde_json::Map<String, Value>,
+) -> Result<(), String> {
+    let metadata = root
+        .get("problem_meta")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "/problem_meta: expected an object".to_string())?;
+    for key in ["script_api_version", "serializer_version"] {
+        match metadata.get(key) {
+            Some(Value::String(version)) if version == "0.3.0" => {}
+            Some(Value::String(version)) => {
+                return Err(format!(
+                    "/problem_meta/{key}: version '{version}' conflicts with ir_version '0.3.0'"
+                ))
+            }
+            Some(_) => {
+                return Err(format!(
+                    "/problem_meta/{key}: expected version string '0.3.0'"
+                ))
+            }
+            None => return Err(format!("/problem_meta/{key}: missing version '0.3.0'")),
+        }
+    }
+    Ok(())
+}
+
 /// Migrate one 0.3 JSON document to the explicit 0.4 object wire model.
-/// It is deliberately opt-in: direct `ProblemIR` deserialization still reads 0.3.
+/// It is deliberately opt-in: direct ProblemIR deserialization still reads 0.3.
+/// Failed migrations are atomic and leave the caller-owned document unchanged.
 pub fn migrate_v0_3_problem_ir_to_v0_4(value: &mut Value) -> Result<(), String> {
+    if value.get("ir_version").and_then(Value::as_str) == Some("0.3.0") {
+        crate::reject_unversioned_spatial_representation(value)?;
+    }
+    let mut candidate = value.clone();
+    migrate_v0_3_problem_ir_to_v0_4_in_place(&mut candidate)?;
+    let _: ProblemIRV04 = serde_json::from_value(candidate.clone()).map_err(|error| {
+        format!("/study: migrated document does not satisfy the typed V04 wire: {error}")
+    })?;
+    *value = candidate;
+    Ok(())
+}
+
+fn migrate_v0_3_problem_ir_to_v0_4_in_place(value: &mut Value) -> Result<(), String> {
     let root = value
         .as_object_mut()
         .ok_or_else(|| "ProblemIR payload must be a JSON object".to_string())?;
     if root.get("ir_version").and_then(Value::as_str) != Some("0.3.0") {
         return Err("/ir_version: expected '0.3.0' for the 0.3 -> 0.4 migration".to_string());
     }
+    validate_v03_migration_metadata_versions(root)?;
+
+    let bootstrap = serde_json::to_value(ProblemIR::bootstrap_example())
+        .expect("ProblemIR bootstrap must serialize");
+    let study_was_present = root.contains_key("study");
+    let bootstrap_study = bootstrap
+        .get("study")
+        .cloned()
+        .ok_or_else(|| "ProblemIR bootstrap study must serialize".to_string())?;
+    let mut migrated_study = root.get("study").cloned().unwrap_or(bootstrap_study);
+    let study_object = migrated_study
+        .as_object_mut()
+        .ok_or_else(|| "/study: expected an object".to_string())?;
+    let study_kind = required_string(
+        study_object.get("kind").unwrap_or(&Value::Null),
+        "/study/kind",
+    )?;
+    if !matches!(
+        study_kind.as_str(),
+        "time_evolution" | "relaxation" | "eigenmodes" | "frequency_response" | "hysteresis"
+    ) {
+        return Err(format!(
+            "/study/kind: unsupported study kind '{study_kind}'"
+        ));
+    }
+    let spectral_study = matches!(study_kind.as_str(), "eigenmodes" | "frequency_response");
+    let magnetostatic_bc_presence =
+        if spectral_study {
+            match study_object.get("magnetostatic_bc") {
+                None => {
+                    study_object.insert(
+                        "magnetostatic_bc".to_string(),
+                        Value::String("open".to_string()),
+                    );
+                    "missing"
+                }
+                Some(Value::Null) => return Err(
+                    "/study/magnetostatic_bc: explicit null is not a missing historical default"
+                        .to_string(),
+                ),
+                Some(boundary_condition) => {
+                    serde_json::from_value::<MagnetostaticBoundaryConditionIR>(
+                        boundary_condition.clone(),
+                    )
+                    .map_err(|error| format!("/study/magnetostatic_bc: {error}"))?;
+                    "explicit"
+                }
+            }
+        } else {
+            if study_object.contains_key("magnetostatic_bc") {
+                return Err(format!(
+                    "/study/magnetostatic_bc: field is not valid for {study_kind}"
+                ));
+            }
+            "not_applicable"
+        };
+    study_object.insert(
+        "spatial_representation".to_string(),
+        serde_json::json!({ "kind": "full_3d" }),
+    );
+    let magnetostatic_bc_value = study_object.get("magnetostatic_bc").cloned();
+    let spatial_migration_record = serde_json::json!({
+        "schema_version": "fullmag.spatial-representation-migration.v1",
+        "source_ir_version": "0.3.0",
+        "target_ir_version": PROBLEM_IR_V04_VERSION,
+        "study_presence": if study_was_present { "present" } else { "missing" },
+        "study_source": if study_was_present { "historical_payload" } else { "historical_bootstrap" },
+        "study_kind": study_kind,
+        "spatial_representation_presence": "missing",
+        "spatial_representation": "full_3d",
+        "magnetostatic_bc_presence": magnetostatic_bc_presence,
+        "magnetostatic_bc_provenance": if magnetostatic_bc_presence == "missing" {
+            "defaulted_from_missing"
+        } else if magnetostatic_bc_presence == "explicit" {
+            "explicit"
+        } else {
+            "not_applicable"
+        },
+        "magnetostatic_bc_value": magnetostatic_bc_value,
+    });
 
     let geometry_entries = root
         .get("geometry")
@@ -571,8 +783,18 @@ pub fn migrate_v0_3_problem_ir_to_v0_4(value: &mut Value) -> Result<(), String> 
                 "/magnets/{index}/name: duplicate migrated object name '{name}'"
             ));
         }
-        object_id_by_legacy_name.insert(name.clone(), object_id.clone());
-        object_id_by_legacy_name.insert(object_id.clone(), object_id.clone());
+        insert_legacy_object_alias(
+            &mut object_id_by_legacy_name,
+            &name,
+            &object_id,
+            &format!("/magnets/{index}/name"),
+        )?;
+        insert_legacy_object_alias(
+            &mut object_id_by_legacy_name,
+            &object_id,
+            &object_id,
+            &format!("/magnets/{index}/object_id"),
+        )?;
         magnetic_geometry_ids.insert(geometry_id.clone());
 
         let assignment_id = format!("assignment_{object_id}");
@@ -640,13 +862,45 @@ pub fn migrate_v0_3_problem_ir_to_v0_4(value: &mut Value) -> Result<(), String> 
         } else {
             PhysicsObjectTypeIR::Geometry
         };
-        object_id_by_legacy_name.insert(name.clone(), object_id.clone());
+        let alias_pointer = format!("/geometry/entries/{index}/name");
+        insert_legacy_object_alias(
+            &mut object_id_by_legacy_name,
+            name,
+            &object_id,
+            &alias_pointer,
+        )?;
+        insert_legacy_object_alias(
+            &mut object_id_by_legacy_name,
+            &object_id,
+            &object_id,
+            &alias_pointer,
+        )?;
         objects.push(PhysicsObjectIR::new(
             object_id,
             name.clone(),
             object_type,
             name.clone(),
         ));
+    }
+
+    if let Some(object_regions) = root.get_mut("object_regions") {
+        let object_regions = object_regions
+            .as_array_mut()
+            .ok_or_else(|| "/object_regions: expected an array".to_string())?;
+        for (index, object_region) in object_regions.iter_mut().enumerate() {
+            let object_region = object_region
+                .as_object_mut()
+                .ok_or_else(|| format!("/object_regions/{index}: expected an object"))?;
+            let owner_pointer = format!("/object_regions/{index}/owner_object");
+            let legacy_owner = required_string(
+                object_region.get("owner_object").unwrap_or(&Value::Null),
+                &owner_pointer,
+            )?;
+            let object_id = object_id_by_legacy_name.get(&legacy_owner).ok_or_else(|| {
+                format!("{owner_pointer}: unresolved legacy object '{legacy_owner}'")
+            })?;
+            object_region.insert("owner_object".to_string(), Value::String(object_id.clone()));
+        }
     }
 
     let legacy_interfaces = root
@@ -730,12 +984,11 @@ pub fn migrate_v0_3_problem_ir_to_v0_4(value: &mut Value) -> Result<(), String> 
     }
 
     root.remove("magnets");
+    root.insert("study".to_string(), migrated_study);
     root.insert(
         "ir_version".to_string(),
         Value::String(PROBLEM_IR_V04_VERSION.to_string()),
     );
-    let bootstrap = serde_json::to_value(ProblemIR::bootstrap_example())
-        .expect("ProblemIR bootstrap must serialize");
     for key in [
         "energy_terms",
         "study",
@@ -770,6 +1023,27 @@ pub fn migrate_v0_3_problem_ir_to_v0_4(value: &mut Value) -> Result<(), String> 
             }
         }
     }
+    let runtime_metadata = root
+        .get_mut("problem_meta")
+        .and_then(Value::as_object_mut)
+        .and_then(|meta| meta.get_mut("runtime_metadata"))
+        .and_then(Value::as_object_mut)
+        .ok_or_else(|| "/problem_meta/runtime_metadata: expected an object".to_string())?;
+    match runtime_metadata.get("spatial_representation_migration") {
+        Some(existing) if existing == &spatial_migration_record => {}
+        Some(_) => {
+            return Err(
+                "/problem_meta/runtime_metadata/spatial_representation_migration: conflicting preexisting record"
+                    .to_string(),
+            )
+        }
+        None => {
+            runtime_metadata.insert(
+                "spatial_representation_migration".to_string(),
+                spatial_migration_record,
+            );
+        }
+    }
     root.insert(
         "objects".to_string(),
         serde_json::to_value(objects).expect("object IR serializes"),
@@ -790,6 +1064,96 @@ pub fn migrate_v0_3_problem_ir_to_v0_4(value: &mut Value) -> Result<(), String> 
         .or_insert_with(|| Value::Array(Vec::new()));
     root.entry("magnetization_constraints".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
+
+    if let Some(mesh_semantics) = root.get("mesh_semantics") {
+        let mesh_semantics = mesh_semantics
+            .as_object()
+            .ok_or_else(|| "/mesh_semantics: expected an object".to_string())?;
+        if mesh_semantics.contains_key("requested_policy") {
+            return Err(
+                "/mesh_semantics/requested_policy: V03 input must not contain typed V04 policy"
+                    .to_string(),
+            );
+        }
+    }
+
+    let legacy_mesh_workflow = root
+        .get("problem_meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("runtime_metadata"))
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("mesh_workflow"))
+        .cloned();
+    let legacy_study_universe = root
+        .get("problem_meta")
+        .and_then(Value::as_object)
+        .and_then(|meta| meta.get("runtime_metadata"))
+        .and_then(Value::as_object)
+        .and_then(|metadata| metadata.get("study_universe"))
+        .cloned();
+    if legacy_mesh_workflow.is_some() || legacy_study_universe.is_some() {
+        let workflow = legacy_mesh_workflow
+            .clone()
+            .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+        if let Some(requested_policy) = crate::FemMeshPolicyIR::from_legacy_mesh_workflow(
+            &workflow,
+            legacy_study_universe.as_ref(),
+            &object_id_by_legacy_name,
+        )? {
+            let policy_fingerprint = requested_policy.policy_fingerprint().map_err(|error| {
+                error
+                    .with_pointer_prefix("/mesh_semantics/requested_policy")
+                    .to_string()
+            })?;
+            let source_payload = serde_json::json!({
+                "mesh_workflow": legacy_mesh_workflow.clone(),
+                "study_universe": legacy_study_universe.clone(),
+            });
+            let mut source_hasher = Sha256::new();
+            source_hasher.update(b"fullmag.fem_mesh_policy_migration_source.v1\0");
+            source_hasher.update(
+                serde_json::to_vec(&source_payload)
+                    .expect("legacy mesh-policy migration source serializes"),
+            );
+            let source_fingerprint = format!("sha256:{:x}", source_hasher.finalize());
+            let mesh_semantics = root
+                .entry("mesh_semantics".to_string())
+                .or_insert_with(|| Value::Object(serde_json::Map::new()))
+                .as_object_mut()
+                .ok_or_else(|| "/mesh_semantics: expected an object".to_string())?;
+            mesh_semantics.insert(
+                "requested_policy".to_string(),
+                serde_json::to_value(requested_policy)
+                    .expect("validated FEM mesh policy serializes"),
+            );
+            let runtime_metadata = root
+                .get_mut("problem_meta")
+                .and_then(Value::as_object_mut)
+                .and_then(|meta| meta.get_mut("runtime_metadata"))
+                .and_then(Value::as_object_mut)
+                .ok_or_else(|| "/problem_meta/runtime_metadata: expected an object".to_string())?;
+            let mut source_paths = Vec::new();
+            if legacy_mesh_workflow.is_some() {
+                source_paths.push("/problem_meta/runtime_metadata/mesh_workflow");
+            }
+            if legacy_study_universe.is_some() {
+                source_paths.push("/problem_meta/runtime_metadata/study_universe");
+            }
+            runtime_metadata.insert(
+                "mesh_policy_migration".to_string(),
+                serde_json::json!({
+                    "schema_version": "fem_mesh_policy_migration.v1",
+                    "source_ir_version": "0.3.0",
+                    "source_path": source_paths[0],
+                    "source_paths": source_paths,
+                    "source_snapshot": source_payload,
+                    "source_fingerprint": source_fingerprint,
+                    "resolver_version": "fem_mesh_policy_v03_adapter.v1",
+                    "requested_policy_fingerprint": policy_fingerprint,
+                }),
+            );
+        }
+    }
     crate::normalize_frozen_membership_defaults_in_problem_value(value)?;
     Ok(())
 }

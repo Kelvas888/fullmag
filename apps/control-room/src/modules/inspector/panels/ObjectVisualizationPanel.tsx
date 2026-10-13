@@ -1,5 +1,6 @@
 "use client";
 
+import { Eye } from "lucide-react";
 import React, {
   useCallback,
   useEffect,
@@ -11,6 +12,7 @@ import React, {
 } from "react";
 
 import { useKernel } from "@/kernel/KernelContext";
+import { useRenderableAnalysisFieldOverlay } from "@/kernel/visualization/AnalysisFieldOverlayController";
 import { VISUALIZATION_STATE_PATH } from "@/kernel/api/apiPaths";
 import type { VisualizationStateResource } from "@/kernel/api/apiTypes";
 import { createCommandContext } from "@/kernel/commands/commandContext";
@@ -40,6 +42,7 @@ import {
   type ViewportTargetRenderingPreferences,
 } from "@/kernel/visualization/ObjectVisualizationController";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import {
   shouldLoadRuntimeMeshManifest,
   useFieldCatalogResource,
@@ -72,6 +75,8 @@ import { useLayoutSelector } from "@/kernel/layout/useLayout";
 import { manifestRenderableCarriers } from "@/modules/viewport-3d/public";
 
 import type { InspectorPanelProps } from "../inspectorTypes";
+import { AntennaVisualizationView } from "./antenna/AntennaVisualizationPanel";
+import { isAntennaVisualizationObject } from "./antenna/AntennaVisualizationObjectModel";
 import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 import {
   ScientificInspectorContext,
@@ -80,6 +85,7 @@ import {
 import { FieldRow } from "../primitives/FieldRow";
 import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { InspectorGroup } from "../primitives/InspectorGroup";
+import { EmptyState } from "@/shared/ui/EmptyState";
 import {
   buildVisualizationPanelSections,
   canonicalVisualizationStateForBaseline,
@@ -248,6 +254,7 @@ import {
 
 function useObjectVisualizationPanelState(
   selection: InspectorPanelProps["selection"],
+  sceneOverride?: ReturnType<typeof useSceneResource>,
 ) {
   const selectionTarget = resolveVisualizationTargetFromSelection(selection);
   const kernel = useKernel();
@@ -261,7 +268,9 @@ function useObjectVisualizationPanelState(
       isEqual: objectVisualizationManifestStatusEquals,
     },
   );
-  const lane = resolveObjectVisualizationLane(manifestStatus?.domain.discretization);
+  const lane = resolveObjectVisualizationLane(
+    resolveSessionDiscretization(manifestStatus),
+  );
   const fdmMultilayerLayout = useFdmMultilayerLayoutResource({
     enabled: lane === "fdm",
   });
@@ -294,7 +303,8 @@ function useObjectVisualizationPanelState(
   const [patchChildRegions, setPatchChildRegions] = useState(false);
   const [fieldCatalogRequestedTargetKey, setFieldCatalogRequestedTargetKey] =
     useState<string | null>(null);
-  const scene = useSceneResource({ enabled: femResourcesEnabled });
+  const ownScene = useSceneResource({ enabled: femResourcesEnabled && !sceneOverride });
+  const scene = sceneOverride ?? ownScene;
   const fdmDomain = useDomainMetaResource({ enabled: fdmResourcesEnabled });
   const fdmMembership = useFdmRegionMembershipResource({
     enabled: fdmResourcesEnabled,
@@ -992,6 +1002,9 @@ function useObjectVisualizationPanelState(
     multilayerAirbox: multilayerAirboxCapacity,
     target: resolvedTarget,
   });
+  const vectorSceneCap = resolveVisualizationVectorSceneCap(
+    displayVisualizationState,
+  );
   const vectorBudgetRanges = {
     full: resolveVisualizationVectorBudgetRange({
       capacity: vectorCapacity,
@@ -999,6 +1012,7 @@ function useObjectVisualizationPanelState(
       manifestRegions: fdmTarget ? null : manifest.data?.regions,
       memberships: fdmTarget ? null : regionMemberships,
       meshParts: fdmTarget ? null : manifest.data?.mesh_parts,
+      sceneCap: vectorSceneCap,
       target: resolvedTarget,
     }),
     surface: resolveVisualizationVectorBudgetRange({
@@ -1007,6 +1021,7 @@ function useObjectVisualizationPanelState(
       manifestRegions: fdmTarget ? null : manifest.data?.regions,
       memberships: fdmTarget ? null : regionMemberships,
       meshParts: fdmTarget ? null : manifest.data?.mesh_parts,
+      sceneCap: vectorSceneCap,
       target: resolvedTarget,
     }),
   } satisfies Record<
@@ -1015,9 +1030,6 @@ function useObjectVisualizationPanelState(
   >;
   const vectorBudgetRange =
     vectorBudgetRanges[settings?.geometryScope ?? "full"];
-  const vectorSceneCap = resolveVisualizationVectorSceneCap(
-    displayVisualizationState,
-  );
   const vectorTopologyHash =
     vectorCapacity?.topologyHash ??
     (fdmTarget
@@ -1121,10 +1133,17 @@ const OBJECT_VISUALIZATION_OWNER: VisualizationInspectorOwner = {
 };
 
 export function VisualizationTargetInspectorPanel({
+  children,
   owner,
   selection,
-}: InspectorPanelProps & { owner: VisualizationInspectorOwner }) {
-  const panel = useObjectVisualizationPanelState(selection);
+  sceneOverride,
+}: InspectorPanelProps & {
+  /** Owner-specific nav sections (e.g. complex representation and phase for a mode), shown after "View" in 3D. */
+  children?: React.ReactNode;
+  owner: VisualizationInspectorOwner;
+  sceneOverride?: ReturnType<typeof useSceneResource>;
+}) {
+  const panel = useObjectVisualizationPanelState(selection, sceneOverride);
   const {
     carrierIdentity,
     displaySettings,
@@ -1236,9 +1255,13 @@ export function VisualizationTargetInspectorPanel({
     return (
       <div className="fm-inspector-panel fm-scientific-inspector" data-inspector-owner={owner.id}>
         {scientificInspectorIdentity}
-        <InspectorGroup title="Visualization">
-          <FieldRow label="Target" value="No visualization target" />
-        </InspectorGroup>
+        <EmptyState
+          description={`Select an Explorer node that supports ${owner.targetLabel} visualization.`}
+          heading="No visualization target selected"
+          icon={<Eye aria-hidden="true" size={20} strokeWidth={1.5} />}
+          size="compact"
+        />
+        {children ? <div className="fm-viz-nav-sections">{children}</div> : null}
         {scientificInspectorContext}
       </div>
     );
@@ -1263,6 +1286,7 @@ export function VisualizationTargetInspectorPanel({
       <InspectorGroup title="View">
         <VisualizationContextSwitchControl onPlanarActivate={syncSharedQuiverIntent} />
       </InspectorGroup>
+      {children ? <div className="fm-viz-nav-sections">{children}</div> : null}
       <ObjectVisualizationPanelView
         key={visualizationTargetKey(stablePanel.target)}
         panel={stablePanel}
@@ -1273,10 +1297,15 @@ export function VisualizationTargetInspectorPanel({
 }
 
 export function ObjectVisualizationPanel({ selection }: InspectorPanelProps) {
+  const scene = useSceneResource();
+  const objectId = selection.ref?.type === "scene-object" ? selection.ref.objectId : selection.objectId;
+  if (isAntennaVisualizationObject(scene.data, objectId)) return <AntennaVisualizationView selection={selection} scene={scene} />;
+  if (!scene.data) return <div className="fm-inspector-panel"><p role="status">Resolving visualization owner…</p></div>;
   return (
     <VisualizationTargetInspectorPanel
       owner={OBJECT_VISUALIZATION_OWNER}
       selection={selection}
+      sceneOverride={scene}
     />
   );
 }
@@ -1286,6 +1315,8 @@ function ObjectVisualizationPanelView({
 }: {
   panel: ResolvedObjectVisualizationPanelState;
 }) {
+  const { analysisFieldOverlay } = useKernel();
+  const shownAnalysisField = useRenderableAnalysisFieldOverlay(analysisFieldOverlay);
   const {
     appliedBaseline: currentAppliedBaseline,
     airboxFieldCarrierIdentity,
@@ -1332,6 +1363,15 @@ function ObjectVisualizationPanelView({
     vectorMeshParts,
     vectorTopologyHash,
   } = panel;
+  // While a mode field is the viewport quantity on magnetic targets (ADR 0054),
+  // coloring, colorbar and vectors describe the mode rather than the model quantity.
+  const analysisFieldShown =
+    shownAnalysisField !== null &&
+    target.kind !== "airbox" &&
+    !isFdmUniverseOutsideSupportTarget(target);
+  const presentedSettings = analysisFieldShown && shownAnalysisField
+    ? { ...settings, activeQuantityId: shownAnalysisField.fieldId }
+    : settings;
   const [appliedBaseline] = useState<ObjectVisualizationAppliedBaseline>(() =>
     structuredClone(currentAppliedBaseline),
   );
@@ -1445,9 +1485,11 @@ function ObjectVisualizationPanelView({
             enabledPassCount={enabledPassCount}
             meshState={meshState}
             quantitySource={
-              capabilities.supportsFieldData
-                ? settings.activeQuantityId || "H_eff"
-                : "Not available"
+              !capabilities.supportsFieldData
+                ? "Not available"
+                : analysisFieldShown && shownAnalysisField
+                  ? `Mode · ${shownAnalysisField.label}`
+                  : settings.activeQuantityId || "H_eff"
             }
             surfaceColoring={!capabilities.supportsFieldData || target.kind === "airbox" || isFdmUniverseOutsideSupportTarget(target) ? null : (
               <VisualizationSurfaceColoringSection
@@ -1461,7 +1503,7 @@ function ObjectVisualizationPanelView({
               fieldMetaTarget={fieldMetaTarget}
               onFieldCatalogRequest={onFieldCatalogRequest}
               regionCarrier={regionCarrier}
-              settings={settings}
+              settings={presentedSettings}
               target={target}
               />
             )}
@@ -1479,7 +1521,7 @@ function ObjectVisualizationPanelView({
               isFieldPending={isFieldPending}
               regionCarrier={regionCarrier}
               sectionDisabled={sectionDisabled}
-              settings={settings}
+              settings={presentedSettings}
               target={target}
               targetKind={target.kind}
               vectorBudgetRange={vectorBudgetRange}

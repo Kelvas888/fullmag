@@ -263,6 +263,7 @@ pub(crate) fn fdm_transport_execution_provenance(
     fdm_transport_execution_provenance_for_lane(plan, false)
 }
 
+#[cfg(feature = "cuda")]
 pub(crate) fn fdm_gpu_transport_execution_provenance(
     plan: &FdmPlanIR,
 ) -> Vec<crate::types::TransportExecutionProvenance> {
@@ -486,6 +487,14 @@ fn coupled_checkpoint_payload_sha256(
     let payload = serde_json::to_vec(&canonical)
         .map_err(|error| run_error(format!("serializing coupled checkpoint digest: {error}")))?;
     Ok(format!("{:x}", Sha256::digest(payload)))
+}
+
+pub(crate) fn coupled_checkpoint_payload_sha256_value(
+    value: &serde_json::Value,
+) -> Result<String, RunError> {
+    let checkpoint: FdmCoupledCheckpoint = serde_json::from_value(value.clone())
+        .map_err(|error| run_error(format!("invalid coupled M3 checkpoint payload: {error}")))?;
+    coupled_checkpoint_payload_sha256(&checkpoint)
 }
 
 pub(crate) fn validate_coupled_m3_checkpoint_value(
@@ -2904,6 +2913,11 @@ fn materialize_one_way_problem(
             gauge: match descriptor.charge_gauge {
                 ChargePotentialGaugeIR::DirichletReference => None,
                 ChargePotentialGaugeIR::ZeroMean => Some(PotentialGauge::ZeroMean),
+                ChargePotentialGaugeIR::TerminalReference => {
+                    return Err(RunError {
+                        message: "terminal-reference gauge requires dedicated FEM antenna solve".into(),
+                    });
+                }
             },
         })
         .map_err(engine_error("charge solve"))?;

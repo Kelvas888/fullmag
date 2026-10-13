@@ -531,6 +531,9 @@ describe("FdmCuboidLayer model", () => {
 
     expect(source).toContain("adoptionRegistry.clearAdoption(");
     expect(source).toContain("if (usesInstanceColors || !adoptionRegistry) return;");
+    expect(source).toContain("const adoptionIdentityChanged =");
+    expect(source).toContain("colorChanged || adoptionIdentityChanged");
+    expect(source).toContain("sessionIdentity?.sessionEpoch");
     expect(source).toContain("unregister();");
   });
   it("records FDM surface colors as an adopted derived-global carrier", () => {
@@ -541,7 +544,7 @@ describe("FdmCuboidLayer model", () => {
     recordFdmCuboidSurfaceAdoption({
       fieldBufferId: "field-global",
       registry,
-      sessionIdentity: { sessionEpoch: "test-session@1000", sessionId: "test-session" },
+      sessionIdentity: { sessionEpoch: "test-session@1000", sessionId: "test-session", requestScopeEpoch: "test-api:1" },
       scalarBuffer: {
         buildKey: "scalar-global",
         colors: new Float32Array(12),
@@ -566,7 +569,7 @@ describe("FdmCuboidLayer model", () => {
       carrierId: "region:left:core",
       fieldBufferId: "field-global",
       registry,
-      sessionIdentity: { sessionEpoch: "test-session@1000", sessionId: "test-session" },
+      sessionIdentity: { sessionEpoch: "test-session@1000", sessionId: "test-session", requestScopeEpoch: "test-api:1" },
       scalarBuffer: {
         buildKey: "scalar-left-core",
         colors: new Float32Array(6),
@@ -943,14 +946,14 @@ describe("FdmCuboidLayer model", () => {
     const budget = memoryBudgetRegistry
       .snapshot()
       .find((entry) => entry.id === "viewport3d.render.fdmVectorSegmentCache");
-    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8");
+    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8").replace(/\r\n/g, "\n");
 
     expect(budget?.maxBytes).toBe(32 * 1024 * 1024);
     expect(layerSource).toContain("fieldCacheBytes > maxBytes");
   });
 
   it("reuses the scene-level FDM instance model for surface color mapping and layer rendering", () => {
-    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8");
+    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8").replace(/\r\n/g, "\n");
     const sceneSource = readFileSync(viewport3DScenePath, "utf8");
     const sceneModelSource = readFileSync(viewport3DSceneModelPath, "utf8");
 
@@ -962,7 +965,9 @@ describe("FdmCuboidLayer model", () => {
     expect(sceneModelSource).toContain(
       "modelFieldVector: fdmInstanceModelFieldVector",
     );
-    expect(sceneModelSource).toContain("fdmInstanceModel: fdmInstanceModel");
+    expect(sceneModelSource).toContain(
+      "fdmInstanceModel: savedSelectionActive ? null : fdmInstanceModel",
+    );
     expect(sceneModelSource).toContain("fdmVectorSegments");
     expect(sceneModelSource).toContain("fdmBuildState?.error?.message");
     expect(sceneModelSource).not.toContain("buildFdmCuboidInstanceModel(");
@@ -985,7 +990,7 @@ describe("FdmCuboidLayer model", () => {
   });
 
   it("uses unlit materials for FDM cell surfaces", () => {
-    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8");
+    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8").replace(/\r\n/g, "\n");
 
     expect(layerSource).toContain("MeshBasicMaterial");
     expect(layerSource).not.toContain("MeshStandardMaterial");
@@ -994,7 +999,7 @@ describe("FdmCuboidLayer model", () => {
   });
 
   it("keeps instance colors neutral against the regular vertex-color channel", () => {
-    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8");
+    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8").replace(/\r\n/g, "\n");
 
     expect(layerSource).toContain(
       'next.setAttribute("color", new BufferAttribute(color, 3))',
@@ -1003,7 +1008,7 @@ describe("FdmCuboidLayer model", () => {
   });
 
   it("keys FDM matrix uploads by prepared content rather than render mode", () => {
-    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8");
+    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8").replace(/\r\n/g, "\n");
     const matrixUploadBlock = layerSource.slice(
       layerSource.indexOf("const uploadPreparedCarriers = useCallback"),
       layerSource.indexOf("useEffect(() => {\n    uploadPreparedCarriers();"),
@@ -1015,7 +1020,7 @@ describe("FdmCuboidLayer model", () => {
   });
 
   it("retains the FDM surface mesh when scalar coloring changes", () => {
-    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8");
+    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8").replace(/\r\n/g, "\n");
     const surfaceMeshBlock = layerSource.slice(
       layerSource.indexOf("<instancedMesh"),
       layerSource.indexOf("ref={surfaceRef}"),
@@ -1027,8 +1032,21 @@ describe("FdmCuboidLayer model", () => {
     );
   });
 
+  it("mutates the owned surface material through its Three.js ref", () => {
+    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8").replace(/\r\n/g, "\n");
+
+    expect(layerSource).toContain(
+      "const surfaceMaterialRef = useRef<MeshBasicMaterial>(null);",
+    );
+    expect(layerSource).toContain("ref={surfaceMaterialRef}");
+    expect(layerSource).toContain(
+      "surfaceMaterialRef.current.needsUpdate = true;",
+    );
+    expect(layerSource).not.toContain("surfaceMaterial.needsUpdate = true;");
+  });
+
   it("does not recreate FDM materials for vector-only setting changes", () => {
-    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8");
+    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8").replace(/\r\n/g, "\n");
     const surfaceMaterialBlock = layerSource.slice(
       layerSource.indexOf("const surfaceMaterial = useMemo"),
       layerSource.indexOf("const wireframePolicy = RENDER_POLICIES.featureEdges"),
@@ -1046,7 +1064,7 @@ describe("FdmCuboidLayer model", () => {
   });
 
   it("uses a native raycast path for FDM inspect hover sampling", () => {
-    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8");
+    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8").replace(/\r\n/g, "\n");
 
     expect(layerSource).toContain('canvas.addEventListener("pointermove"');
     expect(layerSource).toContain("passive: true");
@@ -1062,7 +1080,7 @@ describe("FdmCuboidLayer model", () => {
   });
 
   it("prevents native FDM inspect from duplicating R3F hover samples in the same frame", () => {
-    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8");
+    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8").replace(/\r\n/g, "\n");
 
     expect(layerSource).toContain("const r3fInspectHitFrameRef = useRef(0);");
     expect(layerSource).toContain("r3fInspectHitFrameRef.current = inspectFrameRef.current;");
@@ -1072,7 +1090,7 @@ describe("FdmCuboidLayer model", () => {
   });
 
   it("does not block farther overlay picking when the FDM surface handles domain selection", () => {
-    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8");
+    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8").replace(/\r\n/g, "\n");
 
     expect(layerSource).toContain("if (eventIntersectsRegionOverlay(event)) return;");
     expect(layerSource).not.toContain("event.stopPropagation();\n    onSelectDomain();");
@@ -1080,7 +1098,7 @@ describe("FdmCuboidLayer model", () => {
   });
 
   it("routes target-view picks through a target-aware callback", () => {
-    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8");
+    const layerSource = readFileSync(fdmCuboidLayerPath, "utf8").replace(/\r\n/g, "\n");
     const sceneSource = readFileSync(viewport3DScenePath, "utf8");
 
     expect(layerSource).toContain("onSelectTarget?: () => void");

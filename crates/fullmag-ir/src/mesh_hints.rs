@@ -1,8 +1,8 @@
 #[allow(unused_imports)]
 use crate::{
     ExchangeBoundaryCondition, ExecutionPrecision, FdmMaterialIR, FdmPeriodicityIR,
-    FemLinearSolverPolicy, FieldRefreshPolicyIR, HybridHintsIR, IntegratorChoice,
-    RelaxationControlIR,
+    FdmProjectionPolicyIR, FemLinearSolverPolicy, FieldRefreshPolicyIR, HybridHintsIR,
+    IntegratorChoice, RelaxationControlIR,
 };
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -40,6 +40,10 @@ pub struct FdmHintsIR {
     /// Backend default: 0.1 × min(dx, dy, dz).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub boundary_delta_min: Option<f64>,
+    /// Projected-RK state constraint used by the FDM time integrator.
+    /// `None` preserves the historical default and resolves to `unit_sphere`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_policy: Option<FdmProjectionPolicyIR>,
 }
 
 fn is_zero_cell(cell: &[f64; 3]) -> bool {
@@ -53,12 +57,19 @@ pub struct FdmGridHintsIR {
 
 pub const FDM_DEMAG_STRATEGIES: &[&str] = &["auto", "single_grid", "multilayer_convolution"];
 pub const FDM_DEMAG_MODES: &[&str] = &["auto", "two_d_stack", "three_d"];
+pub const FDM_FFT_BACKENDS: &[&str] = &["auto", "rustfft", "fftw", "mkl", "cufft"];
+
+fn default_fdm_fft_backend() -> String {
+    "auto".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct FdmDemagHintsIR {
     pub strategy: String,
     pub mode: String,
+    #[serde(default = "default_fdm_fft_backend")]
+    pub fft_backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub common_cells: Option<[u32; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -72,6 +83,8 @@ pub struct FdmDemagHintsIR {
 struct FdmDemagHintsWireIR {
     strategy: String,
     mode: String,
+    #[serde(default = "default_fdm_fft_backend")]
+    fft_backend: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     common_cells: Option<[u32; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -89,6 +102,7 @@ impl<'de> Deserialize<'de> for FdmDemagHintsIR {
         let hints = Self {
             strategy: wire.strategy,
             mode: wire.mode,
+            fft_backend: wire.fft_backend,
             common_cells: wire.common_cells,
             common_cells_xy: wire.common_cells_xy,
             common_cell_size: wire.common_cell_size,
@@ -117,6 +131,12 @@ impl FdmDemagHintsIR {
             errors.push(format!(
                 "fdm.demag.mode '{}' is unsupported; expected one of auto, two_d_stack, three_d",
                 self.mode
+            ));
+        }
+        if !FDM_FFT_BACKENDS.contains(&self.fft_backend.as_str()) {
+            errors.push(format!(
+                "fdm.demag.fft_backend '{}' is unsupported; expected one of auto, rustfft, fftw, mkl, cufft",
+                self.fft_backend
             ));
         }
         if self.common_cells.is_some() && self.common_cells_xy.is_some() {
@@ -223,16 +243,25 @@ pub struct FdmMultilayerPlanIR {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grid_certificate: Option<crate::plan::FdmGridCertificateIR>,
     pub layers: Vec<FdmLayerPlanIR>,
+    /// Resolved dense mask in canonical native-layer order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_spins: Option<crate::plan::ResolvedFrozenSpinsPlanIR>,
     pub enable_exchange: bool,
     pub enable_demag: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fft: Option<crate::plan::FdmFftPlanIR>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_field: Option<[f64; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interfacial_dmi: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotated_interfacial_dmi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bulk_dmi: Option<f64>,
     pub gyromagnetic_ratio: f64,
     pub precision: ExecutionPrecision,
+    /// Planner-resolved storage/compute/FFT/reduction precision contract.
+    pub precision_policy: crate::execution::FdmPrecisionPolicyIR,
     pub exchange_bc: ExchangeBoundaryCondition,
     /// Periodic boundary conditions configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -539,16 +568,24 @@ struct FdmMultilayerPlanWireIR {
     #[serde(default)]
     grid_certificate: Option<crate::plan::FdmGridCertificateIR>,
     layers: Vec<FdmLayerPlanIR>,
+    #[serde(default)]
+    frozen_spins: Option<crate::plan::ResolvedFrozenSpinsPlanIR>,
     enable_exchange: bool,
     enable_demag: bool,
+    #[serde(default)]
+    fft: Option<crate::plan::FdmFftPlanIR>,
     #[serde(default)]
     external_field: Option<[f64; 3]>,
     #[serde(default)]
     interfacial_dmi: Option<f64>,
     #[serde(default)]
+    rotated_interfacial_dmi: Option<f64>,
+    #[serde(default)]
     bulk_dmi: Option<f64>,
     gyromagnetic_ratio: f64,
     precision: ExecutionPrecision,
+    #[serde(default)]
+    precision_policy: Option<crate::execution::FdmPrecisionPolicyIR>,
     exchange_bc: ExchangeBoundaryCondition,
     #[serde(default)]
     periodicity: Option<FdmPeriodicityIR>,
@@ -756,13 +793,19 @@ impl<'de> Deserialize<'de> for FdmMultilayerPlanIR {
             requested_common_cell_size: wire.requested_common_cell_size,
             grid_certificate: wire.grid_certificate,
             layers: wire.layers,
+            frozen_spins: wire.frozen_spins,
             enable_exchange: wire.enable_exchange,
             enable_demag: wire.enable_demag,
+            fft: wire.fft,
             external_field: wire.external_field,
             interfacial_dmi: wire.interfacial_dmi,
+            rotated_interfacial_dmi: wire.rotated_interfacial_dmi,
             bulk_dmi: wire.bulk_dmi,
             gyromagnetic_ratio: wire.gyromagnetic_ratio,
             precision: wire.precision,
+            precision_policy: wire
+                .precision_policy
+                .unwrap_or_else(|| crate::execution::FdmPrecisionPolicyIR::resolve(wire.precision)),
             exchange_bc: wire.exchange_bc,
             periodicity: wire.periodicity,
             resolved_periodic_images: wire.resolved_periodic_images,
@@ -798,6 +841,31 @@ impl FdmMultilayerPlanIR {
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
         self.validate_requested_common_cell_size(&mut errors);
+        if let Err(error) = self.precision_policy.validate_for(self.precision) {
+            errors.push(error);
+        }
+        if let Some(frozen) = self.frozen_spins.as_ref() {
+            if let Err(error) = frozen.validate_intrinsic() {
+                errors.push(error);
+            }
+            let native_cell_count = self
+                .layers
+                .iter()
+                .map(|layer| {
+                    layer
+                        .native_grid
+                        .iter()
+                        .map(|value| *value as usize)
+                        .product::<usize>()
+                })
+                .sum::<usize>();
+            if frozen.frozen_mask.len() != native_cell_count {
+                errors.push(format!(
+                    "fdm multilayer Frozen Spins mask has {} entries, expected {native_cell_count} in native-layer order",
+                    frozen.frozen_mask.len()
+                ));
+            }
+        }
         if !matches!(self.mode.as_str(), "two_d_stack" | "three_d") {
             errors.push(format!(
                 "fdm multilayer resolved mode '{}' is unsupported",
@@ -1006,6 +1074,43 @@ mod multilayer_contract_tests {
     use super::*;
     use crate::plan::FdmGridCertificateIR;
 
+    #[test]
+    fn fdm_fft_legacy_demag_policy_defaults_backend_to_auto() {
+        let hints: FdmDemagHintsIR = serde_json::from_value(serde_json::json!({
+            "strategy": "auto",
+            "mode": "auto"
+        }))
+        .expect("legacy FDM demag policy should remain compatible");
+
+        assert_eq!(hints.fft_backend, "auto");
+    }
+
+    #[test]
+    fn fdm_fft_demag_policy_round_trip_preserves_explicit_backend() {
+        let hints: FdmDemagHintsIR = serde_json::from_value(serde_json::json!({
+            "strategy": "single_grid",
+            "mode": "three_d",
+            "fft_backend": "fftw"
+        }))
+        .expect("known FFT backend request should deserialize");
+        let encoded = serde_json::to_value(&hints).expect("FFT backend request should serialize");
+
+        assert_eq!(encoded["fft_backend"], "fftw");
+    }
+
+    #[test]
+    fn fdm_fft_demag_policy_rejects_unknown_backend() {
+        let error = serde_json::from_value::<FdmDemagHintsIR>(serde_json::json!({
+            "strategy": "auto",
+            "mode": "auto",
+            "fft_backend": "vendor_magic"
+        }))
+        .expect_err("unknown FFT backend must fail at the IR boundary");
+
+        assert!(error.to_string().contains("fdm.demag.fft_backend"));
+        assert!(error.to_string().contains("vendor_magic"));
+    }
+
     fn legacy_plan_fixture() -> FdmMultilayerPlanIR {
         let layers = vec![FdmLayerPlanIR {
             magnet_name: "free".to_string(),
@@ -1044,13 +1149,17 @@ mod multilayer_contract_tests {
             requested_common_cell_size: None,
             grid_certificate: Some(grid_certificate),
             layers,
+            frozen_spins: None,
             enable_exchange: false,
             enable_demag: true,
+            fft: None,
             external_field: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             gyromagnetic_ratio: 1.0,
             precision: ExecutionPrecision::Double,
+            precision_policy: crate::FdmPrecisionPolicyIR::default(),
             exchange_bc: ExchangeBoundaryCondition::Neumann,
             periodicity: None,
             resolved_periodic_images: None,
@@ -1628,6 +1737,25 @@ pub struct MeshIR {
     pub periodic_node_pairs: Vec<MeshPeriodicNodePairIR>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub per_domain_quality: HashMap<u32, MeshQualityIR>,
+}
+
+/// Empty mesh scaffold used by programmatic plan builders before a concrete
+/// topology is installed.  It is intentionally not a valid executable mesh;
+/// runtime validators still require non-empty, positively oriented cells.
+impl Default for MeshIR {
+    fn default() -> Self {
+        Self {
+            mesh_name: String::new(),
+            nodes: Vec::new(),
+            cells: FemConnectivityIR::empty(),
+            element_markers: Vec::new(),
+            facets: FemFacetConnectivityIR::empty(),
+            boundary_markers: Vec::new(),
+            periodic_boundary_pairs: Vec::new(),
+            periodic_node_pairs: Vec::new(),
+            per_domain_quality: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -2497,9 +2625,28 @@ fn audit_edge_corner_closure(mesh: &MeshIR, errors: &mut Vec<String>) -> EdgeCor
 }
 
 fn periodic_equivalence_classes(mesh: &MeshIR) -> (Vec<Vec<(u32, [f64; 3])>>, Vec<String>) {
+    periodic_equivalence_classes_with_node_limit(mesh, mesh.nodes.len())
+}
+
+fn periodic_equivalence_classes_with_node_limit(
+    mesh: &MeshIR,
+    node_limit: usize,
+) -> (Vec<Vec<(u32, [f64; 3])>>, Vec<String>) {
     let mut graph: BTreeMap<u32, Vec<(u32, [f64; 3])>> = BTreeMap::new();
     let mut errors = Vec::new();
     for pair in &mesh.periodic_node_pairs {
+        let source_in = (pair.node_a as usize) < node_limit;
+        let destination_in = (pair.node_b as usize) < node_limit;
+        if source_in != destination_in {
+            errors.push(format!(
+                "periodic v6 relation '{}' crosses certified node prefix {}",
+                pair.pair_id, node_limit
+            ));
+            continue;
+        }
+        if !source_in {
+            continue;
+        }
         let Some(boundary_pair) = mesh
             .periodic_boundary_pairs
             .iter()
@@ -2593,6 +2740,110 @@ impl Default for MeshValidationPolicy {
             require_positive_orientation: true,
             eps_volume: None,
         }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct MeshGeometryValidationErrors {
+    node_errors: Vec<String>,
+    cell_errors: Vec<String>,
+}
+
+impl MeshGeometryValidationErrors {
+    pub(crate) fn into_errors(self) -> Vec<String> {
+        self.node_errors
+            .into_iter()
+            .chain(self.cell_errors)
+            .collect()
+    }
+}
+
+pub(crate) fn validate_mesh_geometry_from_jacobian_samples<I, S>(
+    nodes: &[[f64; 3]],
+    samples: I,
+    policy: &MeshValidationPolicy,
+) -> Result<(), MeshGeometryValidationErrors>
+where
+    I: IntoIterator<Item = (u64, FemCellTypeIR, S)>,
+    S: AsRef<[f64]>,
+{
+    let mut node_errors = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if node.iter().any(|value| !value.is_finite()) {
+            node_errors.push(format!("mesh node {index} contains non-finite coordinates"));
+        }
+    }
+
+    let bbox_scale = nodes
+        .iter()
+        .fold(None::<([f64; 3], [f64; 3])>, |acc, node| match acc {
+            Some((mut min, mut max)) => {
+                for axis in 0..3 {
+                    min[axis] = min[axis].min(node[axis]);
+                    max[axis] = max[axis].max(node[axis]);
+                }
+                Some((min, max))
+            }
+            None => Some((*node, *node)),
+        })
+        .map(|(min, max)| {
+            (max[0] - min[0])
+                .abs()
+                .max((max[1] - min[1]).abs())
+                .max((max[2] - min[2]).abs())
+        })
+        .unwrap_or(1.0);
+    let eps = policy
+        .eps_volume
+        .unwrap_or_else(|| {
+            let scale = if bbox_scale > 0.0 { bbox_scale } else { 1.0 };
+            scale.powi(3) * 1e-18
+        })
+        .max(f64::MIN_POSITIVE);
+
+    let mut cell_errors = Vec::new();
+    for (global_ordinal, cell_type, determinants) in samples {
+        let determinants = determinants.as_ref();
+        if cell_type == FemCellTypeIR::Tet4 {
+            let determinant = determinants[0];
+            let volume = determinant / 6.0;
+            if volume.abs() <= eps {
+                cell_errors.push(format!(
+                    "mesh element {global_ordinal} has degenerate tetra volume {volume:.6e} <= eps {eps:.6e}"
+                ));
+            } else if policy.require_positive_orientation && volume < 0.0 {
+                cell_errors.push(format!(
+                    "mesh element {global_ordinal} has negative tetra orientation {volume:.6e}"
+                ));
+            }
+            continue;
+        }
+        let determinant_eps = eps * 6.0;
+        let minimum_abs = determinants
+            .iter()
+            .map(|value| value.abs())
+            .fold(f64::INFINITY, f64::min);
+        if minimum_abs <= determinant_eps {
+            cell_errors.push(format!(
+                "mesh cell {global_ordinal} has degenerate {cell_type:?} Jacobian {minimum_abs:.6e} <= eps {determinant_eps:.6e}"
+            ));
+        } else if policy.require_positive_orientation
+            && determinants.iter().any(|determinant| *determinant < 0.0)
+        {
+            let minimum = determinants.iter().copied().fold(f64::INFINITY, f64::min);
+            cell_errors.push(format!(
+                "mesh cell {global_ordinal} has negative {cell_type:?} Jacobian {minimum:.6e}"
+            ));
+        }
+    }
+
+    if node_errors.is_empty() && cell_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(MeshGeometryValidationErrors {
+            node_errors,
+            cell_errors,
+        })
     }
 }
 
@@ -2924,26 +3175,72 @@ impl MeshIR {
 
         let (classes, class_errors) = periodic_equivalence_classes(self);
         errors.extend(class_errors);
+        let magnetic_node_count = self
+            .require_tet4_elements()
+            .ok()
+            .filter(|cells| cells.len() == self.element_markers.len())
+            .map(|cells| {
+                let mut magnetic_mask = vec![false; self.nodes.len()];
+                for (cell, marker) in cells.iter().zip(&self.element_markers) {
+                    if *marker != 0 {
+                        for node in cell {
+                            if let Some(value) = magnetic_mask.get_mut(*node as usize) {
+                                *value = true;
+                            }
+                        }
+                    }
+                }
+                let prefix = magnetic_mask.iter().take_while(|value| **value).count();
+                if magnetic_mask[prefix..].iter().any(|value| *value) {
+                    errors.push(
+                        "periodic v6 magnetic nodes do not form an exact leading prefix"
+                            .to_string(),
+                    );
+                }
+                if prefix == 0 && !self.nodes.is_empty() {
+                    self.nodes.len()
+                } else {
+                    prefix
+                }
+            })
+            .unwrap_or(self.nodes.len());
+        let (magnetic_classes, magnetic_class_errors) =
+            periodic_equivalence_classes_with_node_limit(self, magnetic_node_count);
+        errors.extend(magnetic_class_errors);
         let edge_corner_audit = audit_edge_corner_closure(self, &mut errors);
-        let class_count = classes.iter().filter(|class| class.len() > 1).count() as u64;
-        let pair_count = classes
+        let scalar_class_count = classes.iter().filter(|class| class.len() > 1).count() as u64;
+        let scalar_pair_count = classes
             .iter()
             .map(|class| class.len().saturating_sub(1) as u64)
             .sum::<u64>();
-        let class_payload = serde_json::to_vec(&classes).unwrap_or_default();
-        let class_hash = format!("sha256:{:x}", Sha256::digest(class_payload));
+        let magnetic_class_count = magnetic_classes
+            .iter()
+            .filter(|class| class.len() > 1)
+            .count() as u64;
+        let magnetic_pair_count = magnetic_classes
+            .iter()
+            .map(|class| class.len().saturating_sub(1) as u64)
+            .sum::<u64>();
+        let scalar_class_hash = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&classes).unwrap_or_default())
+        );
+        let magnetic_class_hash = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&magnetic_classes).unwrap_or_default())
+        );
         if errors.is_empty() {
             Ok(PeriodicMeshCertificateV6IR {
                 schema_version: "periodic_mesh_certificate.v6".to_string(),
                 certificate_status: "accepted".to_string(),
                 topology_fingerprint,
                 axis_pairs,
-                magnetic_class_count: class_count,
-                magnetic_pair_count: pair_count,
-                scalar_class_count: class_count,
-                scalar_pair_count: pair_count,
-                magnetic_equivalence_classes_sha256: class_hash.clone(),
-                scalar_equivalence_classes_sha256: class_hash,
+                magnetic_class_count,
+                magnetic_pair_count,
+                scalar_class_count,
+                scalar_pair_count,
+                magnetic_equivalence_classes_sha256: magnetic_class_hash,
+                scalar_equivalence_classes_sha256: scalar_class_hash,
                 translation_residual_max_m: global_translation_residual,
                 orientation_residual_max: global_orientation_residual,
                 normal_mismatch_max: global_normal_mismatch,
@@ -2958,7 +3255,7 @@ impl MeshIR {
                 h_demag0_seam_mismatch_max: 0.0,
                 marker_map_fingerprint: marker_map_fingerprint(self),
                 material_realization_fingerprint: material_realization_fingerprint(None, None),
-                region_class_count: class_count,
+                region_class_count: scalar_class_count,
                 max_material_residual: 0.0,
             })
         } else {
@@ -3410,93 +3707,30 @@ impl MeshIR {
     pub fn validate_strict(&self, policy: &MeshValidationPolicy) -> Result<(), Vec<String>> {
         let mut errors = self.validate().err().unwrap_or_default();
 
-        for (index, node) in self.nodes.iter().enumerate() {
-            if node.iter().any(|value| !value.is_finite()) {
-                errors.push(format!("mesh node {index} contains non-finite coordinates"));
-            }
-        }
-
-        if self.element_markers.len() != self.cells.len() {
-            errors.push("mesh.element_markers must cover every FEM cell".to_string());
-        }
-
-        let bbox_scale = self
-            .nodes
-            .iter()
-            .fold(None::<([f64; 3], [f64; 3])>, |acc, node| match acc {
-                Some((mut min, mut max)) => {
-                    for axis in 0..3 {
-                        min[axis] = min[axis].min(node[axis]);
-                        max[axis] = max[axis].max(node[axis]);
-                    }
-                    Some((min, max))
-                }
-                None => Some((*node, *node)),
-            })
-            .map(|(min, max)| {
-                (max[0] - min[0])
-                    .abs()
-                    .max((max[1] - min[1]).abs())
-                    .max((max[2] - min[2]).abs())
-            })
-            .unwrap_or(1.0);
-        let eps = policy
-            .eps_volume
-            .unwrap_or_else(|| {
-                let scale = if bbox_scale > 0.0 { bbox_scale } else { 1.0 };
-                scale.powi(3) * 1e-18
-            })
-            .max(f64::MIN_POSITIVE);
-
-        for cell in self.cells.iter() {
+        let geometry_samples = self.cells.iter().filter_map(|cell| {
             if cell.nodes.len() != cell.cell_type.arity() {
-                continue;
+                return None;
             }
-            let Some(coordinates) = cell
+            let coordinates = cell
                 .nodes
                 .iter()
                 .map(|node| self.nodes.get(*node as usize).copied())
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
-            };
-            let determinants = cell_jacobian_determinants(cell.cell_type, &coordinates);
-            if cell.cell_type == FemCellTypeIR::Tet4 {
-                let determinant = determinants[0];
-                let volume = determinant / 6.0;
-                if volume.abs() <= eps {
-                    errors.push(format!(
-                        "mesh element {} has degenerate tetra volume {volume:.6e} <= eps {eps:.6e}",
-                        cell.global_ordinal
-                    ));
-                } else if policy.require_positive_orientation && volume < 0.0 {
-                    errors.push(format!(
-                        "mesh element {} has negative tetra orientation {volume:.6e}",
-                        cell.global_ordinal
-                    ));
-                }
-                continue;
-            }
-            let determinant_eps = eps * 6.0;
-            let minimum_abs = determinants
-                .iter()
-                .map(|value| value.abs())
-                .fold(f64::INFINITY, f64::min);
-            if minimum_abs <= determinant_eps {
-                errors.push(format!(
-                    "mesh cell {} has degenerate {:?} Jacobian {minimum_abs:.6e} <= eps {determinant_eps:.6e}",
-                    cell.global_ordinal, cell.cell_type
-                ));
-            } else if policy.require_positive_orientation
-                && determinants.iter().any(|determinant| *determinant < 0.0)
-            {
-                let minimum = determinants.iter().copied().fold(f64::INFINITY, f64::min);
-                errors.push(format!(
-                    "mesh cell {} has negative {:?} Jacobian {minimum:.6e}",
-                    cell.global_ordinal, cell.cell_type
-                ));
-            }
+                .collect::<Option<Vec<_>>>()?;
+            Some((
+                cell.global_ordinal,
+                cell.cell_type,
+                cell_jacobian_determinants(cell.cell_type, &coordinates),
+            ))
+        });
+        let geometry_errors =
+            validate_mesh_geometry_from_jacobian_samples(&self.nodes, geometry_samples, policy)
+                .err()
+                .unwrap_or_default();
+        errors.extend(geometry_errors.node_errors);
+        if self.element_markers.len() != self.cells.len() {
+            errors.push("mesh.element_markers must cover every FEM cell".to_string());
         }
+        errors.extend(geometry_errors.cell_errors);
 
         if errors.is_empty() {
             Ok(())
@@ -3665,6 +3899,10 @@ fn determinant3(matrix: [[f64; 3]; 3]) -> f64 {
 }
 
 fn mapped_jacobian_determinant(coordinates: &[[f64; 3]], derivatives: &[[f64; 3]]) -> f64 {
+    determinant3(mapped_jacobian(coordinates, derivatives))
+}
+
+fn mapped_jacobian(coordinates: &[[f64; 3]], derivatives: &[[f64; 3]]) -> [[f64; 3]; 3] {
     let mut jacobian = [[0.0; 3]; 3];
     for (coordinate, derivative) in coordinates.iter().zip(derivatives) {
         for physical_axis in 0..3 {
@@ -3674,7 +3912,24 @@ fn mapped_jacobian_determinant(coordinates: &[[f64; 3]], derivatives: &[[f64; 3]
             }
         }
     }
-    determinant3(jacobian)
+    jacobian
+}
+
+fn mapped_jacobian_scaled_jacobian(coordinates: &[[f64; 3]], derivatives: &[[f64; 3]]) -> f64 {
+    let jacobian = mapped_jacobian(coordinates, derivatives);
+    let denominator = (0..3)
+        .map(|reference_axis| {
+            (0..3)
+                .map(|physical_axis| jacobian[physical_axis][reference_axis].powi(2))
+                .sum::<f64>()
+                .sqrt()
+        })
+        .product::<f64>();
+    if denominator == 0.0 {
+        0.0
+    } else {
+        determinant3(jacobian).abs() / denominator
+    }
 }
 
 pub(crate) fn cell_jacobian_determinants(
@@ -3789,6 +4044,119 @@ pub(crate) fn cell_jacobian_determinants(
                         ]
                     });
                     mapped_jacobian_determinant(coordinates, &derivatives)
+                })
+                .collect()
+        }
+    }
+}
+
+/// Return the normalized mapped-Jacobian samples used by the mixed-topology
+/// quality certificate. Non-tetrahedral cells are evaluated in their native
+/// isoparametric topology rather than decomposed into substitute tetrahedra.
+pub(crate) fn cell_scaled_jacobians(
+    cell_type: FemCellTypeIR,
+    coordinates: &[[f64; 3]],
+) -> Vec<f64> {
+    let q = 1.0 / 3.0_f64.sqrt();
+    match cell_type {
+        FemCellTypeIR::Tet4 => {
+            let derivatives = [
+                [-1.0, -1.0, -1.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ];
+            vec![mapped_jacobian_scaled_jacobian(coordinates, &derivatives)]
+        }
+        FemCellTypeIR::Prism6 => [
+            (1.0 / 6.0, 1.0 / 6.0, -q),
+            (2.0 / 3.0, 1.0 / 6.0, -q),
+            (1.0 / 6.0, 2.0 / 3.0, -q),
+            (1.0 / 6.0, 1.0 / 6.0, q),
+            (2.0 / 3.0, 1.0 / 6.0, q),
+            (1.0 / 6.0, 2.0 / 3.0, q),
+        ]
+        .into_iter()
+        .map(|(r, s, t)| {
+            let derivatives = [
+                [-(1.0 - t) / 2.0, -(1.0 - t) / 2.0, -(1.0 - r - s) / 2.0],
+                [(1.0 - t) / 2.0, 0.0, -r / 2.0],
+                [0.0, (1.0 - t) / 2.0, -s / 2.0],
+                [-(1.0 + t) / 2.0, -(1.0 + t) / 2.0, (1.0 - r - s) / 2.0],
+                [(1.0 + t) / 2.0, 0.0, r / 2.0],
+                [0.0, (1.0 + t) / 2.0, s / 2.0],
+            ];
+            mapped_jacobian_scaled_jacobian(coordinates, &derivatives)
+        })
+        .collect(),
+        FemCellTypeIR::Pyramid5 => {
+            let qt = 10.0_f64.sqrt() / 15.0;
+            [
+                (-q, -q, 1.0 / 3.0 - qt),
+                (q, -q, 1.0 / 3.0 - qt),
+                (-q, q, 1.0 / 3.0 - qt),
+                (q, q, 1.0 / 3.0 - qt),
+                (-q, -q, 1.0 / 3.0 + qt),
+                (q, -q, 1.0 / 3.0 + qt),
+                (-q, q, 1.0 / 3.0 + qt),
+                (q, q, 1.0 / 3.0 + qt),
+            ]
+            .into_iter()
+            .map(|(r, s, t)| {
+                let derivatives = [
+                    [
+                        -(1.0 - s) * (1.0 - t) / 4.0,
+                        -(1.0 - r) * (1.0 - t) / 4.0,
+                        -(1.0 - r) * (1.0 - s) / 4.0,
+                    ],
+                    [
+                        (1.0 - s) * (1.0 - t) / 4.0,
+                        -(1.0 + r) * (1.0 - t) / 4.0,
+                        -(1.0 + r) * (1.0 - s) / 4.0,
+                    ],
+                    [
+                        (1.0 + s) * (1.0 - t) / 4.0,
+                        (1.0 + r) * (1.0 - t) / 4.0,
+                        -(1.0 + r) * (1.0 + s) / 4.0,
+                    ],
+                    [
+                        -(1.0 + s) * (1.0 - t) / 4.0,
+                        (1.0 - r) * (1.0 - t) / 4.0,
+                        -(1.0 - r) * (1.0 + s) / 4.0,
+                    ],
+                    [0.0, 0.0, 1.0],
+                ];
+                mapped_jacobian_scaled_jacobian(coordinates, &derivatives)
+            })
+            .collect()
+        }
+        FemCellTypeIR::Hex8 => {
+            let signs = [
+                [-1.0, -1.0, -1.0],
+                [1.0, -1.0, -1.0],
+                [1.0, 1.0, -1.0],
+                [-1.0, 1.0, -1.0],
+                [-1.0, -1.0, 1.0],
+                [1.0, -1.0, 1.0],
+                [1.0, 1.0, 1.0],
+                [-1.0, 1.0, 1.0],
+            ];
+            [-q, q]
+                .into_iter()
+                .flat_map(|r| {
+                    [-q, q]
+                        .into_iter()
+                        .flat_map(move |s| [-q, q].into_iter().map(move |t| (r, s, t)))
+                })
+                .map(|(r, s, t)| {
+                    let derivatives = signs.map(|sign| {
+                        [
+                            sign[0] * (1.0 + sign[1] * s) * (1.0 + sign[2] * t) / 8.0,
+                            sign[1] * (1.0 + sign[0] * r) * (1.0 + sign[2] * t) / 8.0,
+                            sign[2] * (1.0 + sign[0] * r) * (1.0 + sign[1] * s) / 8.0,
+                        ]
+                    });
+                    mapped_jacobian_scaled_jacobian(coordinates, &derivatives)
                 })
                 .collect()
         }
@@ -4424,6 +4792,73 @@ mod mesh_validation_tests {
             .material_realization_fingerprint
             .starts_with("sha256:"));
         assert_eq!(certificate.max_material_residual, 0.0);
+    }
+
+    #[test]
+    fn periodic_certificate_v6_separates_magnetic_prefix_from_global_scalar_classes() {
+        let mut mesh = mirrored_periodic_mesh();
+        let node_offset = mesh.nodes.len() as u32;
+        mesh.nodes.extend([
+            [0.0, 2.0, 0.0],
+            [0.0, 3.0, 0.0],
+            [0.0, 2.0, 1.0],
+            [1.0, 2.0, 0.0],
+            [1.0, 3.0, 0.0],
+            [1.0, 2.0, 1.0],
+        ]);
+        mesh.set_tet4_cells(vec![
+            [0, 1, 2, 3],
+            [3, 5, 4, 0],
+            [6, 7, 8, 9],
+            [9, 11, 10, 6],
+        ]);
+        mesh.element_markers = vec![1, 1, 0, 0];
+        mesh.extend_tri3_facets(vec![
+            [node_offset, node_offset + 1, node_offset + 2],
+            [node_offset + 3, node_offset + 5, node_offset + 4],
+        ])
+        .unwrap();
+        mesh.boundary_markers.extend([20, 21]);
+        mesh.periodic_boundary_pairs
+            .push(MeshPeriodicBoundaryPairIR {
+                pair_id: "air_x_faces".to_string(),
+                source_marker: None,
+                destination_marker: None,
+                marker_a: 20,
+                marker_b: 21,
+                translation: Some([1.0, 0.0, 0.0]),
+                tolerance: Some(1.0e-12),
+                axis_hint: Some("x".to_string()),
+                orientation: None,
+                pairing_policy: None,
+            });
+        mesh.periodic_node_pairs.extend([
+            MeshPeriodicNodePairIR {
+                pair_id: "air_x_faces".to_string(),
+                node_a: node_offset,
+                node_b: node_offset + 3,
+            },
+            MeshPeriodicNodePairIR {
+                pair_id: "air_x_faces".to_string(),
+                node_a: node_offset + 1,
+                node_b: node_offset + 4,
+            },
+            MeshPeriodicNodePairIR {
+                pair_id: "air_x_faces".to_string(),
+                node_a: node_offset + 2,
+                node_b: node_offset + 5,
+            },
+        ]);
+
+        let certificate = mesh.periodic_mesh_certificate_v6().unwrap();
+        assert_eq!(certificate.magnetic_class_count, 3);
+        assert_eq!(certificate.magnetic_pair_count, 3);
+        assert_eq!(certificate.scalar_class_count, 6);
+        assert_eq!(certificate.scalar_pair_count, 6);
+        assert_ne!(
+            certificate.magnetic_equivalence_classes_sha256,
+            certificate.scalar_equivalence_classes_sha256
+        );
     }
 
     #[test]

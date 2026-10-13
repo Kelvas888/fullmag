@@ -7,6 +7,8 @@ import {
   type ActiveLaneCapabilitySnapshot,
 } from "@/kernel/resources/useActiveLaneCapabilities";
 
+import { createStudyStageDrafts, type StudyStageDraft } from "./StudyStageAuthoringModel";
+
 type JsonRecord = Record<string, unknown>;
 
 const FDM_DEMAG_REALIZATIONS = [
@@ -19,6 +21,11 @@ const FDM_ONLY_DEMAG_REALIZATIONS = [
   "single_grid",
   "multilayer_convolution",
 ] as const;
+
+const PARALLEL_MAX_WORKERS = 4_294_967_295;
+const PARALLEL_MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
+const PARALLEL_BYTES_PER_MIB = 1024 * 1024;
+const PARALLEL_MAX_MEMORY_RESERVE_BYTES = PARALLEL_MAX_SAFE_INTEGER;
 
 export const FDM_SINGLE_GRID_MULTI_BODY_REASON =
   "multi-body FDM currently supports only the multilayer_convolution strategy; 'single_grid' for multiple magnets is not yet executable";
@@ -35,7 +42,18 @@ export interface StudyGlobalDraft {
   requestedDevice: string;
   requestedMode: string;
   requestedPrecision: string;
+  parallelExecution: StudyParallelExecutionDraft;
   solver: StudySolverDraft;
+}
+
+export interface StudyParallelExecutionDraft {
+  /** Keep malformed imported values visible so validation can fail closed. */
+  mode: string;
+  maxCpuPercent: string;
+  maxMemoryPercent: string;
+  memoryReserveMiB: string;
+  maxWorkers: string;
+  threadsPerWorker: string;
 }
 
 export interface StudyFdmDraft {
@@ -49,6 +67,23 @@ export interface StudyFdmDraft {
   demagMode: string;
   demagStrategy: string;
   perMagnet: string;
+}
+
+export type FdmGridVector = [number, number, number];
+
+export interface FdmGridPreviewEntry {
+  objectId: string;
+  cell: FdmGridVector;
+  geometryExtent: FdmGridVector;
+  extent: FdmGridVector;
+  counts: FdmGridVector;
+  cellCount: number;
+}
+
+export interface FdmGridPreview {
+  lane: "fdm";
+  entries: FdmGridPreviewEntry[];
+  totalCellCount: number;
 }
 
 export interface StudyAdaptiveTimestepDraft {
@@ -86,6 +121,8 @@ export interface StudyGlobalDraftValidation {
 }
 
 export interface StudyExecutionDiscretizationContext {
+  baseRevision?: number | null;
+  executionProfileBound?: boolean;
   requestedBackend?: string | null;
   requestedDiscretization?: string | null;
   sessionDiscretization?: string | null;
@@ -123,6 +160,14 @@ const DEFAULT_STUDY_GLOBAL_DRAFT: StudyGlobalDraft = {
   requestedDevice: "auto",
   requestedMode: "strict",
   requestedPrecision: "double",
+  parallelExecution: {
+    mode: "serial",
+    maxCpuPercent: "90",
+    maxMemoryPercent: "80",
+    memoryReserveMiB: "1024",
+    maxWorkers: "",
+    threadsPerWorker: "1",
+  },
   solver: createSolverDraft(null),
 };
 
@@ -137,6 +182,15 @@ export function createStudyGlobalDraft(scene: unknown): StudyGlobalDraft {
     DEFAULT_STUDY_GLOBAL_DRAFT.demagRealization,
   );
   const fdm = asRecord(study?.fdm);
+  const rawParallelExecution = study?.parallel_execution;
+  const parallelExecution = asRecord(rawParallelExecution);
+  const parallelPolicyShapeInvalid =
+    rawParallelExecution !== undefined &&
+    rawParallelExecution !== null &&
+    parallelExecution === null;
+  const parallelMode = parallelModeText(
+    parallelPolicyShapeInvalid ? rawParallelExecution : parallelExecution?.mode,
+  );
   return {
     demagEnabled: booleanValue(study?.demag_enabled, true),
     demagRealization: stringValue(
@@ -166,6 +220,39 @@ export function createStudyGlobalDraft(scene: unknown): StudyGlobalDraft {
       study?.requested_precision,
       DEFAULT_STUDY_GLOBAL_DRAFT.requestedPrecision,
     ),
+    parallelExecution: {
+      mode: parallelMode,
+      maxCpuPercent: importedParallelNumberText(
+        parallelPolicyShapeInvalid
+          ? rawParallelExecution
+          : parallelExecution?.max_cpu_percent,
+        DEFAULT_STUDY_GLOBAL_DRAFT.parallelExecution.maxCpuPercent,
+      ),
+      maxMemoryPercent: importedParallelNumberText(
+        parallelPolicyShapeInvalid
+          ? rawParallelExecution
+          : parallelExecution?.max_memory_percent,
+        DEFAULT_STUDY_GLOBAL_DRAFT.parallelExecution.maxMemoryPercent,
+      ),
+      memoryReserveMiB: importedMemoryReserveMiBText(
+        parallelPolicyShapeInvalid
+          ? rawParallelExecution
+          : parallelExecution?.memory_reserve_bytes,
+        DEFAULT_STUDY_GLOBAL_DRAFT.parallelExecution.memoryReserveMiB,
+      ),
+      maxWorkers: importedOptionalParallelNumberText(
+        parallelPolicyShapeInvalid
+          ? rawParallelExecution
+          : parallelExecution?.max_workers,
+        DEFAULT_STUDY_GLOBAL_DRAFT.parallelExecution.maxWorkers,
+      ),
+      threadsPerWorker: importedParallelNumberText(
+        parallelPolicyShapeInvalid
+          ? rawParallelExecution
+          : parallelExecution?.threads_per_worker,
+        DEFAULT_STUDY_GLOBAL_DRAFT.parallelExecution.threadsPerWorker,
+      ),
+    },
     solver: createSolverDraft(study?.solver),
   };
 }
@@ -175,9 +262,13 @@ export function validateStudyGlobalDraft(
   capabilities?: {
     activeLane?: ActiveLaneCapabilitySnapshot | null;
     algorithmsAvailable?: readonly string[];
+    executionProfileBound?: boolean;
     magneticObjectCount?: number;
+    magneticObjectIds?: readonly string[];
     requestedDiscretization?: string | null;
     sessionDiscretization?: string | null;
+    studyStages?: readonly unknown[];
+    studyStageDrafts?: readonly StudyStageDraft[];
   },
 ): StudyGlobalDraftValidation[] {
   const issues: StudyGlobalDraftValidation[] = [];
@@ -203,16 +294,16 @@ export function validateStudyGlobalDraft(
       }
     }
   }
-  if (!draft.requestedBackend.trim()) {
+  if (!capabilities?.executionProfileBound && !draft.requestedBackend.trim()) {
     issues.push({ message: "Backend is required.", severity: "error" });
   }
-  if (!draft.requestedDevice.trim()) {
+  if (!capabilities?.executionProfileBound && !draft.requestedDevice.trim()) {
     issues.push({ message: "Device is required.", severity: "error" });
   }
-  if (!draft.requestedPrecision.trim()) {
+  if (!capabilities?.executionProfileBound && !draft.requestedPrecision.trim()) {
     issues.push({ message: "Precision is required.", severity: "error" });
   }
-  if (!draft.requestedMode.trim()) {
+  if (!capabilities?.executionProfileBound && !draft.requestedMode.trim()) {
     issues.push({ message: "Execution mode is required.", severity: "error" });
   }
   if (draft.externalField.trim() && !optionalVector3(draft.externalField)) {
@@ -221,7 +312,7 @@ export function validateStudyGlobalDraft(
       severity: "error",
     });
   }
-  if (draft.requestedCpuThreads.trim()) {
+  if (!capabilities?.executionProfileBound && draft.requestedCpuThreads.trim()) {
     const threads = Number(draft.requestedCpuThreads.trim());
     if (!Number.isInteger(threads) || threads <= 0) {
       issues.push({
@@ -230,14 +321,39 @@ export function validateStudyGlobalDraft(
       });
     }
   }
+  validateParallelExecutionDraft(issues, draft.parallelExecution);
+  const parallelLane = capabilities?.executionProfileBound
+    ? capabilities.activeLane?.requested
+    : { backend: draft.requestedBackend, device: draft.requestedDevice };
+  if (
+    draft.parallelExecution.mode === "adaptive" &&
+    (parallelLane?.backend.trim().toLowerCase() !== "fem" ||
+      parallelLane?.device.trim().toLowerCase() !== "cpu")
+  ) {
+    issues.push({
+      message:
+        "Adaptive parallel execution requires an explicit FEM CPU lane for independent eigen k execution.",
+      severity: "error",
+    });
+  }
+  if (draft.parallelExecution.mode === "adaptive") {
+    validateAdaptiveWorkflow(issues, capabilities?.studyStages, capabilities?.studyStageDrafts);
+  }
   validateSolverDraft(issues, draft.solver, draft, capabilities);
   const explicitFdm = isExplicitFdmStudy({
-    requestedBackend: draft.requestedBackend,
+    requestedBackend: capabilities?.executionProfileBound
+      ? null
+      : draft.requestedBackend,
     requestedDiscretization: capabilities?.requestedDiscretization,
     sessionDiscretization: capabilities?.sessionDiscretization,
   });
   if (explicitFdm) {
-    validateFdmDraft(issues, draft.fdm, draft.demagRealization);
+    validateFdmDraft(
+      issues,
+      draft.fdm,
+      draft.demagRealization,
+      capabilities?.magneticObjectIds,
+    );
     if (
       capabilities?.magneticObjectCount !== undefined &&
       capabilities.magneticObjectCount > 1 &&
@@ -258,6 +374,71 @@ export function validateStudyGlobalDraft(
   return issues;
 }
 
+
+
+function validateRawAdaptiveStages(
+  issues: StudyGlobalDraftValidation[],
+  stages: readonly unknown[] | undefined,
+): void {
+  const canonicalKinds = new Set([
+    "relax", "minimize", "eigenmodes", "frequency_response", "run", "hysteresis",
+    "change_device", "table_autosave", "autosave", "save_state", "fft_response", "add_field_drive",
+  ]);
+  for (const raw of stages ?? []) {
+    const stage = asRecord(raw);
+    const rawKind = stage?.kind ?? stage?.entrypoint_kind;
+    const kind = typeof rawKind === "string" ? rawKind.trim().toLowerCase().replace(/^flat_/, "") : "";
+    if (!canonicalKinds.has(kind)) {
+      issues.push({ message: "Adaptive parallel execution requires canonical, known stage types.", severity: "error" });
+      continue;
+    }
+    if (kind === "change_device" && (typeof stage?.device !== "string" || !["cpu", "gpu", "auto"].includes(stage.device.trim().toLowerCase()))) {
+      issues.push({ message: "Adaptive parallel execution requires an explicit, valid device transition.", severity: "error" });
+    }
+    if (kind === "eigenmodes") {
+      const rawSweep = stage?.eigen_bias_field_sweep ?? stage?.bias_field_sweep;
+      if (rawSweep !== undefined && rawSweep !== null) {
+        const sweep = asRecord(rawSweep);
+        const samples = sweep?.samples_a_per_m;
+        if (!Array.isArray(samples) || samples.length === 0 || samples.some((row) => !Array.isArray(row) || row.length !== 3 || row.some((value) => typeof value !== "number" || !Number.isFinite(value)))) {
+          issues.push({ message: "Adaptive parallel execution cannot accept malformed bias-field continuation samples.", severity: "error" });
+        }
+      }
+    }
+  }
+}
+
+function validateAdaptiveWorkflow(
+  issues: StudyGlobalDraftValidation[],
+  rawStages: readonly unknown[] | undefined,
+  previewStages?: readonly StudyStageDraft[],
+): void {
+  validateRawAdaptiveStages(issues, rawStages);
+  const stages = previewStages ?? createStudyStageDrafts(rawStages ?? []);
+  let hasSolverStage = false;
+  let device = "cpu"; // The independent lane gate requires explicit FEM CPU.
+  for (const stage of stages ?? []) {
+    if (stage.kind === "relax") {
+      hasSolverStage = true;
+    } else if (stage.kind === "eigenmodes") {
+      hasSolverStage = true;
+      if (stage.biasFieldSamplesApm.trim()) {
+        issues.push({ message: "Adaptive parallel execution is unavailable for bias-field continuation. Use serial execution.", severity: "error" });
+      }
+    } else if (stage.kind === "change_device") {
+      device = stage.deviceTarget.trim().toLowerCase();
+    } else if (!["table_autosave", "autosave", "save_state", "fft_response", "add_field_drive"].includes(stage.kind)) {
+      issues.push({ message: `Adaptive parallel execution is unavailable for ${stage.kind} stages. Use serial execution.`, severity: "error" });
+    }
+    if ((stage.kind === "relax" || stage.kind === "eigenmodes") && device !== "cpu") {
+      issues.push({ message: "Adaptive parallel execution requires the CPU device at every solver stage.", severity: "error" });
+    }
+  }
+  if (!hasSolverStage) {
+    issues.push({ message: "Adaptive parallel execution requires a known Relax or Eigen workflow.", severity: "error" });
+  }
+}
+
 function fdmDemagStrategyForDraft(draft: StudyGlobalDraft): string {
   const strategy = draft.fdm?.demagStrategy;
   return normalizeDemagStrategy(
@@ -270,7 +451,9 @@ export function buildStudyGlobalMergePatch(
   context: StudyExecutionDiscretizationContext = {},
 ): AuthoringTransactionRequest {
   const laneContext = {
-    requestedBackend: context.requestedBackend ?? draft.requestedBackend,
+    requestedBackend: context.executionProfileBound
+      ? null
+      : context.requestedBackend ?? draft.requestedBackend,
     requestedDiscretization: context.requestedDiscretization,
     sessionDiscretization: context.sessionDiscretization,
   } satisfies StudyExecutionDiscretizationContext;
@@ -283,11 +466,13 @@ export function buildStudyGlobalMergePatch(
     demag_enabled: draft.demagEnabled,
     demag_realization: explicitFdm ? null : normalizedDemagRealization,
     exchange_enabled: draft.exchangeEnabled,
-    requested_backend: requiredText(draft.requestedBackend, "auto"),
-    requested_device: requiredText(draft.requestedDevice, "auto"),
-    requested_mode: requiredText(draft.requestedMode, "strict"),
-    requested_precision: requiredText(draft.requestedPrecision, "double"),
   };
+  if (!context.executionProfileBound) {
+    study.requested_backend = requiredText(draft.requestedBackend, "auto");
+    study.requested_device = requiredText(draft.requestedDevice, "auto");
+    study.requested_mode = requiredText(draft.requestedMode, "strict");
+    study.requested_precision = requiredText(draft.requestedPrecision, "double");
+  }
   if (explicitFdm) {
     study.fdm = fdmDraftToScene(
       draft.fdm ?? createFdmDraft(null, normalizedDemagRealization),
@@ -297,15 +482,175 @@ export function buildStudyGlobalMergePatch(
   study.fem_demag_solver_policy = explicitFdm
     ? null
     : optionalJsonObject(draft.femDemagSolverPolicy);
-  const requestedCpuThreads = optionalPositiveInteger(draft.requestedCpuThreads);
-  study.requested_cpu_threads = requestedCpuThreads;
+  if (!context.executionProfileBound) {
+    const requestedCpuThreads = optionalPositiveInteger(draft.requestedCpuThreads);
+    study.requested_cpu_threads = requestedCpuThreads;
+  }
+  study.parallel_execution = parallelExecutionDraftToScene(draft.parallelExecution);
   study.solver = solverDraftToScene(draft.solver);
   return {
     kind: "merge_patch",
+    ...(context.baseRevision === undefined || context.baseRevision === null
+      ? {}
+      : { base_revision: context.baseRevision }),
     merge_patch: {
       study,
     },
   };
+}
+
+function validateParallelExecutionDraft(
+  issues: StudyGlobalDraftValidation[],
+  draft: StudyParallelExecutionDraft,
+): void {
+  if (draft.mode !== "serial" && draft.mode !== "adaptive") {
+    issues.push({
+      message: "Parallel execution mode must be serial or adaptive.",
+      severity: "error",
+    });
+  }
+  validatePercent(issues, draft.maxCpuPercent, "Maximum CPU target");
+  validatePercent(issues, draft.maxMemoryPercent, "Maximum memory target");
+  validateMemoryReserveMiB(issues, draft.memoryReserveMiB);
+  if (draft.maxWorkers.trim()) {
+    validatePositiveInteger(
+      issues,
+      draft.maxWorkers,
+      "Maximum workers",
+      PARALLEL_MAX_WORKERS,
+    );
+  }
+  validatePositiveInteger(
+    issues,
+    draft.threadsPerWorker,
+    "Threads per worker",
+    PARALLEL_MAX_WORKERS,
+  );
+}
+
+function validatePercent(
+  issues: StudyGlobalDraftValidation[],
+  value: string,
+  label: string,
+): void {
+  const parsed = parseNumericText(value);
+  if (parsed === null || parsed <= 0 || parsed > 100) {
+    issues.push({
+      message: `${label} must be finite and in the range (0, 100].`,
+      severity: "error",
+    });
+  }
+}
+
+function validatePositiveInteger(
+  issues: StudyGlobalDraftValidation[],
+  value: string,
+  label: string,
+  maximum = PARALLEL_MAX_SAFE_INTEGER,
+): void {
+  const parsed = Number(value.trim());
+  if (!Number.isSafeInteger(parsed) || parsed <= 0 || parsed > maximum) {
+    issues.push({ message: `${label} must be a positive integer.`, severity: "error" });
+  }
+}
+
+function validateMemoryReserveMiB(
+  issues: StudyGlobalDraftValidation[],
+  value: string,
+): void {
+  if (memoryReserveBytesFromMiB(value) === null) {
+    issues.push({
+      message:
+        "Memory reserve (MiB) must be finite, nonnegative, and convert to a safe integer number of bytes.",
+      severity: "error",
+    });
+  }
+}
+
+function parallelExecutionDraftToScene(
+  draft: StudyParallelExecutionDraft,
+): JsonObject {
+  if (draft.mode !== "serial" && draft.mode !== "adaptive") {
+    throw new Error("Parallel execution mode must be serial or adaptive.");
+  }
+  return {
+    mode: draft.mode,
+    max_cpu_percent: requiredParallelPercent(draft.maxCpuPercent, "Maximum CPU target"),
+    max_memory_percent: requiredParallelPercent(
+      draft.maxMemoryPercent,
+      "Maximum memory target",
+    ),
+    memory_reserve_bytes: requiredParallelMemoryReserveBytes(
+      draft.memoryReserveMiB,
+    ),
+    max_workers: optionalParallelInteger(
+      draft.maxWorkers,
+      "Maximum workers",
+      PARALLEL_MAX_WORKERS,
+    ),
+    threads_per_worker: requiredParallelInteger(
+      draft.threadsPerWorker,
+      "Threads per worker",
+      PARALLEL_MAX_WORKERS,
+      false,
+    ),
+  };
+}
+
+function requiredParallelPercent(value: string, label: string): number {
+  const parsed = parseNumericText(value);
+  if (parsed === null || parsed <= 0 || parsed > 100) {
+    throw new Error(`${label} must be finite and in the range (0, 100].`);
+  }
+  return parsed;
+}
+
+function memoryReserveBytesFromMiB(value: string): number | null {
+  const parsed = parseNumericText(value);
+  if (parsed === null || parsed < 0) return null;
+  const bytes = parsed * PARALLEL_BYTES_PER_MIB;
+  return bytes <= PARALLEL_MAX_MEMORY_RESERVE_BYTES && Number.isSafeInteger(bytes)
+    ? bytes
+    : null;
+}
+
+function requiredParallelMemoryReserveBytes(value: string): number {
+  const bytes = memoryReserveBytesFromMiB(value);
+  if (bytes === null) {
+    throw new Error(
+      "Memory reserve (MiB) must be finite, nonnegative, and convert to a safe integer number of bytes.",
+    );
+  }
+  return bytes;
+}
+
+function requiredParallelInteger(
+  value: string,
+  label: string,
+  maximum: number,
+  allowZero: boolean,
+): number {
+  const parsed = Number(value.trim());
+  if (
+    !value.trim() ||
+    !Number.isSafeInteger(parsed) ||
+    parsed > maximum ||
+    (allowZero ? parsed < 0 : parsed < 1)
+  ) {
+    throw new Error(
+      `${label} must be a ${allowZero ? "nonnegative" : "positive"} integer.`,
+    );
+  }
+  return parsed;
+}
+
+function optionalParallelInteger(
+  value: string,
+  label: string,
+  maximum: number,
+): number | null {
+  if (!value.trim()) return null;
+  return requiredParallelInteger(value, label, maximum, false);
 }
 
 function createSolverDraft(value: unknown): StudySolverDraft {
@@ -364,7 +709,7 @@ function solverDraftToScene(draft: StudySolverDraft): JsonObject {
 
   const solver: JsonObject = {
     adaptive_timestep: null,
-    demag_interval_s: optionalNumber(draft.demagInterval),
+    demag_interval_s: optionalNumericText(draft.demagInterval),
     dt_initial: null,
     dt_max: null,
     dt_min: null,
@@ -377,26 +722,26 @@ function solverDraftToScene(draft: StudySolverDraft): JsonObject {
     torque_tolerance: draft.torqueTolerance,
   };
   if (draft.timestepMode === "fixed") {
-    solver.fixed_timestep = optionalNumber(draft.fixDt);
+    solver.fixed_timestep = optionalNumericText(draft.fixDt);
   } else if (draft.timestepMode === "adaptive_max_error") {
-    solver.dt_initial = optionalNumber(draft.dtInitial);
-    solver.dt_min = optionalNumber(draft.dtMin);
-    solver.dt_max = optionalNumber(draft.dtMax);
-    solver.max_err = optionalNumber(draft.maxErr);
+    solver.dt_initial = optionalNumericText(draft.dtInitial);
+    solver.dt_min = optionalNumericText(draft.dtMin);
+    solver.dt_max = optionalNumericText(draft.dtMax);
+    solver.max_err = optionalNumericText(draft.maxErr);
   } else if (draft.timestepMode === "adaptive_advanced") {
     const advanced = draft.adaptiveTimestep;
     solver.adaptive_timestep = advanced
       ? {
-          atol: optionalNumber(advanced.atol),
-          rtol: optionalNumber(advanced.rtol),
-          dt_initial: optionalNumber(advanced.dtInitial),
-          dt_min: optionalNumber(advanced.dtMin),
-          dt_max: optionalNumber(advanced.dtMax),
-          safety: optionalNumber(advanced.safety),
-          growth_limit: optionalNumber(advanced.growthLimit),
-          shrink_limit: optionalNumber(advanced.shrinkLimit),
-          max_spin_rotation: optionalNumber(advanced.maxSpinRotation),
-          norm_tolerance: optionalNumber(advanced.normTolerance),
+          atol: optionalNumericText(advanced.atol),
+          rtol: optionalNumericText(advanced.rtol),
+          dt_initial: optionalNumericText(advanced.dtInitial),
+          dt_min: optionalNumericText(advanced.dtMin),
+          dt_max: optionalNumericText(advanced.dtMax),
+          safety: optionalNumericText(advanced.safety),
+          growth_limit: optionalNumericText(advanced.growthLimit),
+          shrink_limit: optionalNumericText(advanced.shrinkLimit),
+          max_spin_rotation: optionalNumericText(advanced.maxSpinRotation),
+          norm_tolerance: optionalNumericText(advanced.normTolerance),
         }
       : null;
   }
@@ -441,10 +786,109 @@ function fdmDraftToScene(draft: StudyFdmDraft): JsonObject {
   };
 }
 
+/**
+ * Calculate the structured-grid coverage implied by the authored FDM policy.
+ * This is a preview only: no mesh/topology resource is materialized here.
+ */
+export function resolveFdmGridPreview(
+  scene: unknown,
+  draft: StudyGlobalDraft,
+): FdmGridPreview {
+  const objects = asRecord(scene)?.objects;
+  if (!Array.isArray(objects)) {
+    return { lane: "fdm", entries: [], totalCellCount: 0 };
+  }
+  const fdm = draft.fdm;
+  if (!fdm) return { lane: "fdm", entries: [], totalCellCount: 0 };
+
+  const defaultCell = optionalPositiveVector3(fdm.defaultCell);
+  const overrides = parseFdmPerMagnetOverrides(fdm.perMagnet);
+  const entries: FdmGridPreviewEntry[] = [];
+  for (const rawObject of objects) {
+    const object = asRecord(rawObject);
+    if (object?.role !== "magnet") continue;
+    const objectId = typeof object.id === "string" ? object.id.trim() : "";
+    if (!objectId) continue;
+    const cell = overrides[objectId] ?? defaultCell;
+    if (!cell) continue;
+    const geometryExtent = geometryExtentForFdmPreview(object);
+    if (!geometryExtent || geometryExtent.some((value) => value <= 0)) continue;
+    const counts = geometryExtent.map((extent, index) =>
+      Math.max(1, Math.ceil(extent / cell[index])),
+    ) as FdmGridVector;
+    const extent = counts.map((count, index) =>
+      Number((count * cell[index]).toPrecision(15)),
+    ) as FdmGridVector;
+    const cellCount = counts[0] * counts[1] * counts[2];
+    entries.push({ objectId, cell, geometryExtent, extent, counts, cellCount });
+  }
+  return {
+    lane: "fdm",
+    entries,
+    totalCellCount: entries.reduce((total, entry) => total + entry.cellCount, 0),
+  };
+}
+
+function parseFdmPerMagnetOverrides(
+  value: string,
+): Record<string, FdmGridVector> {
+  if (!value.trim()) return {};
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return {};
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+  const overrides: Record<string, FdmGridVector> = {};
+  for (const [objectId, rawOverride] of Object.entries(parsed)) {
+    const cell = optionalPositiveVector3Value(asRecord(rawOverride)?.cell);
+    if (cell) overrides[objectId] = cell;
+  }
+  return overrides;
+}
+
+function geometryExtentForFdmPreview(object: JsonRecord): FdmGridVector | null {
+  const geometry = asRecord(object.geometry);
+  const params = asRecord(geometry?.geometry_params);
+  const boundsMin = finiteVector3Value(geometry?.bounds_min);
+  const boundsMax = finiteVector3Value(geometry?.bounds_max);
+  if (boundsMin && boundsMax) {
+    const bounds = boundsMax.map((value, index) => value - boundsMin[index]) as FdmGridVector;
+    if (bounds.every((value) => value > 0)) return bounds;
+  }
+
+  const geometryKind = String(geometry?.geometry_kind ?? geometry?.kind ?? "").toLowerCase();
+  const paramsSize = finiteVector3Value(params?.size ?? params?.dimensions);
+  if (paramsSize && paramsSize.every((value) => value > 0)) return paramsSize;
+  if (geometryKind === "cylinder") {
+    const radius = finitePositiveNumber(params?.radius);
+    const height = finitePositiveNumber(params?.height);
+    return radius !== null && height !== null
+      ? [radius * 2, radius * 2, height]
+      : null;
+  }
+  if (geometryKind === "sphere") {
+    const radius = finitePositiveNumber(params?.radius);
+    return radius === null ? null : [radius * 2, radius * 2, radius * 2];
+  }
+  if (geometryKind === "archwaveguide" || geometryKind === "arch_waveguide") {
+    const length = finitePositiveNumber(params?.length);
+    const width = finitePositiveNumber(params?.width);
+    const height = finitePositiveNumber(params?.height);
+    const archHeight = finitePositiveNumber(params?.arch_height);
+    return length !== null && width !== null && height !== null && archHeight !== null
+      ? [length, width, height + archHeight]
+      : null;
+  }
+  return null;
+}
+
 function validateFdmDraft(
   issues: StudyGlobalDraftValidation[],
   draft: StudyFdmDraft | undefined,
   legacyStrategy: string,
+  magneticObjectIds?: readonly string[],
 ): void {
   const effective = draft ?? createFdmDraft(null, legacyStrategy);
   const strategy = normalizeDemagStrategy(
@@ -523,18 +967,51 @@ function validateFdmDraft(
       });
     }
   }
-  if (effective.defaultCell.trim() && !optionalVector3(effective.defaultCell)) {
+  if (effective.defaultCell.trim() && !optionalPositiveVector3(effective.defaultCell)) {
     issues.push({
-      message: "FDM default cell must contain three finite numbers.",
+      message: "FDM default cell must contain three finite positive SI values.",
       severity: "error",
     });
   }
   validateOptionalJsonObject(issues, effective.perMagnet, "FDM per-magnet grids");
+  validateFdmPerMagnetOverrides(issues, effective.perMagnet, magneticObjectIds);
   if (strategyValid && !effective.defaultCell.trim() && !effective.perMagnet.trim()) {
     issues.push({
       message: "FDM requires a default cell or per-magnet grid specification.",
       severity: "error",
     });
+  }
+}
+
+function validateFdmPerMagnetOverrides(
+  issues: StudyGlobalDraftValidation[],
+  value: string,
+  magneticObjectIds?: readonly string[],
+): void {
+  if (!value.trim()) return;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+  const knownIds = magneticObjectIds ? new Set(magneticObjectIds) : null;
+  for (const [objectId, rawOverride] of Object.entries(parsed)) {
+    if (knownIds && !knownIds.has(objectId)) {
+      issues.push({
+        message: `FDM per-magnet grid ${objectId} does not match a magnetic object_id.`,
+        severity: "error",
+      });
+    }
+    const override = asRecord(rawOverride);
+    const cell = override?.cell;
+    if (!optionalPositiveVector3Value(cell)) {
+      issues.push({
+        message: `FDM per-magnet grid ${objectId} cell must contain three finite positive SI values.`,
+        severity: "error",
+      });
+    }
   }
 }
 
@@ -545,7 +1022,10 @@ function validateSolverDraft(
     StudyGlobalDraft,
     "requestedBackend" | "requestedDevice" | "requestedPrecision"
   >,
-  capabilities?: { algorithmsAvailable?: readonly string[] },
+  capabilities?: {
+    algorithmsAvailable?: readonly string[];
+    executionProfileBound?: boolean;
+  },
 ): void {
   if (draft.timestepMode === "fixed") {
     validatePositiveText(issues, draft.fixDt, "Fixed dt");
@@ -569,7 +1049,7 @@ function validateSolverDraft(
     const advanced = draft.adaptiveTimestep;
     validateNonnegativeText(issues, advanced.atol, "Absolute tolerance");
     validateNonnegativeText(issues, advanced.rtol, "Relative tolerance");
-    if (Number(advanced.atol) === 0 && Number(advanced.rtol) === 0) {
+    if (parseNumericText(advanced.atol) === 0 && parseNumericText(advanced.rtol) === 0) {
       issues.push({ message: "At least one advanced tolerance must be positive.", severity: "error" });
     }
     validatePositiveText(issues, advanced.dtMin, "Adaptive dt min");
@@ -587,7 +1067,10 @@ function validateAdaptiveExecution(
     StudyGlobalDraft,
     "requestedBackend" | "requestedDevice" | "requestedPrecision"
   >,
-  capabilities?: { algorithmsAvailable?: readonly string[] },
+  capabilities?: {
+    algorithmsAvailable?: readonly string[];
+    executionProfileBound?: boolean;
+  },
 ): void {
   if (!matchesAdaptiveIntegrator(integrator)) {
     issues.push({ message: "Adaptive policy requires RK23 or RK45.", severity: "error" });
@@ -598,6 +1081,7 @@ function validateAdaptiveExecution(
   ) {
     issues.push({ message: "LLG is not advertised by the active session.", severity: "error" });
   }
+  if (capabilities?.executionProfileBound) return;
   if (
     execution.requestedBackend.trim() &&
     execution.requestedBackend !== "fem" &&
@@ -629,16 +1113,16 @@ function validateController(
   validatePositiveText(issues, adaptive.shrinkLimit, "Adaptive shrink limit");
   validateOptionalPositiveText(issues, adaptive.maxSpinRotation, "Max spin rotation");
   validateOptionalPositiveText(issues, adaptive.normTolerance, "Norm tolerance");
-  const safety = Number(adaptive.safety);
-  const growth = Number(adaptive.growthLimit);
-  const shrink = Number(adaptive.shrinkLimit);
-  if (Number.isFinite(safety) && safety > 1) {
+  const safety = parseNumericText(adaptive.safety);
+  const growth = parseNumericText(adaptive.growthLimit);
+  const shrink = parseNumericText(adaptive.shrinkLimit);
+  if (safety !== null && safety > 1) {
     issues.push({ message: "Adaptive safety must be at most one.", severity: "error" });
   }
-  if (Number.isFinite(growth) && growth <= 1) {
+  if (growth !== null && growth <= 1) {
     issues.push({ message: "Adaptive growth limit must be greater than one.", severity: "error" });
   }
-  if (Number.isFinite(shrink) && shrink >= 1) {
+  if (shrink !== null && shrink >= 1) {
     issues.push({ message: "Adaptive shrink limit must be less than one.", severity: "error" });
   }
 }
@@ -649,19 +1133,18 @@ function validateAdaptiveBounds(
   minimum: string,
   maximum: string,
 ): void {
-  const min = Number(minimum);
-  const max = maximum.trim() ? Number(maximum) : null;
-  if (Number.isFinite(min) && max !== null && Number.isFinite(max) && max < min) {
+  const min = parseNumericText(minimum);
+  const max = maximum.trim() ? parseNumericText(maximum) : null;
+  if (min !== null && max !== null && max < min) {
     issues.push({
       message: "Adaptive dt max must be greater than or equal to dt min.",
       severity: "error",
     });
   }
-  const first = initial.trim() ? Number(initial) : null;
+  const first = initial.trim() ? parseNumericText(initial) : null;
   if (
     first !== null &&
-    Number.isFinite(first) &&
-    (first < min || (max !== null && first > max))
+    (min === null || first < min || (max !== null && first > max))
   ) {
     issues.push({ message: "Initial dt must lie within adaptive bounds.", severity: "error" });
   }
@@ -672,8 +1155,8 @@ function validatePositiveText(
   value: string,
   label: string,
 ): void {
-  const parsed = Number(value);
-  if (!value.trim() || !Number.isFinite(parsed) || parsed <= 0) {
+  const parsed = parseNumericText(value);
+  if (!value.trim() || parsed === null || parsed <= 0) {
     issues.push({ message: `${label} must be finite and positive.`, severity: "error" });
   }
 }
@@ -691,8 +1174,8 @@ function validateNonnegativeText(
   value: string,
   label: string,
 ): void {
-  const parsed = Number(value);
-  if (!value.trim() || !Number.isFinite(parsed) || parsed < 0) {
+  const parsed = parseNumericText(value);
+  if (!value.trim() || parsed === null || parsed < 0) {
     issues.push({ message: `${label} must be finite and nonnegative.`, severity: "error" });
   }
 }
@@ -700,6 +1183,21 @@ function validateNonnegativeText(
 function optionalNumber(value: string): number | null {
   const trimmed = value.trim();
   if (!trimmed) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function optionalNumericText(value: string): string | null {
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return parseNumericText(trimmed) === null ? null : trimmed;
+}
+
+const NUMERIC_TEXT_PATTERN = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$/;
+
+function parseNumericText(value: string): number | null {
+  const trimmed = value.trim();
+  if (!NUMERIC_TEXT_PATTERN.test(trimmed)) return null;
   const parsed = Number(trimmed);
   return Number.isFinite(parsed) ? parsed : null;
 }
@@ -713,6 +1211,49 @@ function scalarText(value: unknown, fallback: string): string {
     return String(value);
   }
   return fallback;
+}
+
+function parallelModeText(value: unknown): string {
+  if (value === undefined) return DEFAULT_STUDY_GLOBAL_DRAFT.parallelExecution.mode;
+  return typeof value === "string"
+    ? value
+    : invalidImportedParallelValue(value);
+}
+
+function importedParallelNumberText(value: unknown, fallback: string): string {
+  if (value === undefined) return fallback;
+  return typeof value === "number"
+    ? String(value)
+    : invalidImportedParallelValue(value);
+}
+
+function importedOptionalParallelNumberText(
+  value: unknown,
+  fallback: string,
+): string {
+  if (value === undefined) return fallback;
+  if (value === null) return "";
+  return typeof value === "number"
+    ? String(value)
+    : invalidImportedParallelValue(value);
+}
+
+function importedMemoryReserveMiBText(value: unknown, fallback: string): string {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return invalidImportedParallelValue(value);
+  }
+  return String(value / PARALLEL_BYTES_PER_MIB);
+}
+
+function invalidImportedParallelValue(value: unknown): string {
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    serialized = undefined;
+  }
+  return `invalid imported policy value: ${serialized ?? String(value)}`;
 }
 
 function booleanValue(value: unknown, fallback: boolean): boolean {
@@ -783,6 +1324,38 @@ function optionalVector3(value: string): number[] | null {
     values.push(Number(entry));
   }
   return values.length === 3 && values.every(Number.isFinite) ? values : null;
+}
+
+function optionalPositiveVector3(value: string): FdmGridVector | null {
+  return optionalPositiveVector3Value(
+    value
+      .split(/[;,\s]+/)
+      .map((token) => token.trim())
+      .filter(Boolean)
+      .map((token) => Number(token)),
+  );
+}
+
+function optionalPositiveVector3Value(value: unknown): FdmGridVector | null {
+  const values = finiteVector3Value(value);
+  return values && values.every((entry) => entry > 0) ? values : null;
+}
+
+function finiteVector3Value(value: unknown): FdmGridVector | null {
+  if (
+    !Array.isArray(value) ||
+    value.length !== 3 ||
+    !value.every((entry) => typeof entry === "number" && Number.isFinite(entry))
+  ) {
+    return null;
+  }
+  return value as FdmGridVector;
+}
+
+function finitePositiveNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : null;
 }
 
 function optionalPositiveIntegerVector(value: string, length: number): number[] | null {

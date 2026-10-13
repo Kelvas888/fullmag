@@ -1,6 +1,11 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
 
 import type { LiveStatusResource } from "@/kernel/api/apiTypes";
+import { CommandRegistry } from "@/kernel/commands/CommandRegistry";
+import { buildRuntimeCommandControlResourceData } from "@/kernel/resources/studyRuntimeResources";
+import { STUDY_RUNTIME_COMMANDS } from "@/kernel/runtime/studyRuntimeCommandContributions";
 
 import { __ribbonModuleTestUtils } from "./RibbonModule";
 
@@ -17,6 +22,7 @@ const baseResources: LiveStatusResource["resources"] = {
   fields_revision: 0,
   mesh_build_revision: 0,
   mesh_revision: 0,
+  mode_composition_revision: 0,
   region_coefficients_revision: 0,
   region_initial_state_revision: 0,
   region_membership_revision: 0,
@@ -84,11 +90,73 @@ function select(status: LiveStatusResource) {
 }
 
 describe("RibbonModule runtime status selection", () => {
+  it("loads the canonical scene on Physics before validating selected-object Exchange", () => {
+    const source = readFileSync(new URL("./RibbonModule.tsx", import.meta.url), "utf8");
+    const sceneHook = source.match(/const scene = useSceneResource\(\{[\s\S]*?\}\);/)?.[0];
+    expect(sceneHook).toContain('activeTab === "physics"');
+    expect(source).toContain('[MODEL_SCENE_PATH]: scene.status === "ready" ? scene.data : null');
+  });
+
   it("wires the runtime field catalog into ribbon tab construction", () => {
     const source = readFileSync(new URL("./RibbonModule.tsx", import.meta.url), "utf8");
 
     expect(source).toContain("useFieldCatalogResource({");
     expect(source).toContain("fieldCatalog: fieldCatalog.data,");
+    expect(source).toContain("useModelReadinessResource({");
+    expect(source).toContain("buildRuntimeCommandControlResourceData({");
+  });
+
+  it.each([
+    {
+      enabled: true,
+      name: "ready",
+      readiness: { blockers: [], ready_to_run: true, scene_revision: 1 },
+      reason: null,
+    },
+    {
+      enabled: false,
+      name: "blocked",
+      readiness: {
+        blockers: ["Assign a material to every magnetic object."],
+        ready_to_run: false,
+        scene_revision: 1,
+      },
+      reason: "Assign a material to every magnetic object.",
+    },
+    {
+      enabled: false,
+      name: "stale",
+      readiness: { blockers: [], ready_to_run: true, scene_revision: 0 },
+      reason: "Model readiness is stale for the current scene.",
+    },
+  ])("feeds $name readiness into the Ribbon Run command", ({ enabled, readiness, reason }) => {
+    const commands = new CommandRegistry();
+    for (const command of STUDY_RUNTIME_COMMANDS) commands.register(command);
+    const resourceData = buildRuntimeCommandControlResourceData({
+      commandQueue: { commands: [] },
+      geometryValidation: { diagnostics: [] },
+      meshBuildCurrent: null,
+      meshManifest: null,
+      modelReadinessData: {
+        capabilities: {} as never,
+        checks: [],
+        ready_to_export: readiness.ready_to_run,
+        ...readiness,
+      },
+      modelReadinessStatus: "ready",
+      sessionStatus: statusWith(),
+      solverStatus: { runtime_state: "idle" },
+      stageExecution: {
+        active_stage_index: null,
+        revision: 1,
+        runtime_state: "idle",
+        stages: [],
+      },
+    });
+    const context = { api: {} as never, resourceData, source: "ribbon" as const };
+
+    expect(commands.isEnabled("study.run", context)).toBe(enabled);
+    expect(commands.get("study.run")?.disabledReason?.(context)).toBe(reason);
   });
   it("treats session identity changes as runtime command state changes", () => {
     const previous = select(statusWith({ sessionId: "session-old" }));
@@ -131,4 +199,3 @@ describe("RibbonModule runtime status selection", () => {
     ).toBe(false);
   });
 });
-import { readFileSync } from "node:fs";

@@ -10,6 +10,9 @@
 #if FULLMAG_HAS_MFEM_STACK
 
 #include "context.hpp"
+#include "cpu/mfem/interactions/dmi_bulk.hpp"
+#include "cpu/mfem/interactions/dmi_interfacial.hpp"
+#include "cpu/mfem/interactions/anisotropy_uniaxial.hpp"
 #include "cpu/mfem/interactions/demag.hpp"
 #include "cpu/mfem/interactions/demag_poisson_recovery.hpp"
 #include "cpu/mfem/interactions/zeeman_uniform_field.hpp"
@@ -114,12 +117,6 @@ bool all_gpu_state_owned_pointers_are_null(const fullmag::fem::FemGpuState &gpu)
              &gpu.fields.h_eff, &gpu.fields.regional_drive_basis,
              &gpu.rk.m_backup, &gpu.rk.m_stage, &gpu.rk.error,
              &gpu.rk.transaction_m, &gpu.rk.transaction_k0,
-             &gpu.rk.transaction_h_ex, &gpu.rk.transaction_h_demag,
-             &gpu.rk.transaction_h_drive, &gpu.rk.transaction_h_ani,
-             &gpu.rk.transaction_h_cubic_ani, &gpu.rk.transaction_h_dmi,
-             &gpu.rk.transaction_h_bulk_dmi, &gpu.rk.transaction_h_oe,
-             &gpu.rk.transaction_h_therm, &gpu.rk.transaction_h_mel,
-             &gpu.rk.transaction_h_eff,
          }) {
         if (!component_pointers_are_null(*field)) {
             return false;
@@ -139,8 +136,6 @@ bool all_gpu_state_owned_pointers_are_null(const fullmag::fem::FemGpuState &gpu)
         gpu.fields.regional_drive_descs == nullptr &&
         gpu.fields.regional_drive_point_times == nullptr &&
         gpu.fields.regional_drive_point_values == nullptr &&
-        gpu.rk.transaction_poisson_solution == nullptr &&
-        gpu.rk.transaction_poisson_solution_full == nullptr &&
         gpu.local_interactions.node_weight == nullptr &&
         gpu.magnetoelastic.strain_voigt == nullptr &&
         gpu.materials.ms == nullptr && gpu.materials.a == nullptr &&
@@ -311,6 +306,13 @@ void single_element_families_preserve_geometry_dofs_vertices_and_attributes()
         auto mesh = build(source);
         check(mesh->GetNV() == static_cast<int>(source.n_nodes),
               "MFEM mesh must preserve canonical vertex count");
+        for (uint32_t node = 0; node < source.n_nodes; ++node) {
+            const auto *actual = mesh->GetVertex(static_cast<int>(node));
+            for (uint32_t axis = 0; axis < 3u; ++axis) {
+                check(actual[axis] == source.nodes_xyz[3u * node + axis],
+                      "MFEM mesh must preserve canonical vertex coordinates");
+            }
+        }
         check(mesh->GetNE() == 1, "single canonical cell must remain one MFEM element");
         check(mesh->GetElementGeometry(0) == item.geometry,
               "canonical cell family must map to its native MFEM geometry");
@@ -486,6 +488,147 @@ void distorted_prism_mass_weights_match_independent_mfem_oracle()
               std::accumulate(actual.begin(), actual.end(), 0.0),
               std::accumulate(oracle.begin(), oracle.end(), 0.0)),
           "production distorted-prism row sums must conserve the independent MFEM volume");
+    fullmag::fem::context_destroy_mfem(ctx);
+}
+
+void mixed_p1_uniform_uniaxial_field_and_energy_use_mfem_mass_weights()
+{
+    fullmag::fem::Context ctx{};
+    ctx.mesh = conforming_prism_pyramid_tet();
+    ctx.mesh.magnetic_element_mask = {1,0,0};
+    ctx.mesh.magnetic_node_mask = {1,1,1,1,1,1,0,0};
+    initialize_uniform_material(ctx);
+    ctx.anisotropy.uniaxial_enabled = true;
+    ctx.anisotropy.uniaxial_Ku = 1.0e5;
+    ctx.anisotropy.uniaxial_Ku2 = 2.0e4;
+    ctx.anisotropy.uniaxial_axis = {0.0, 0.0, 1.0};
+    for (uint32_t node = 0; node < 6u; ++node) {
+        const size_t base = 3u * static_cast<size_t>(node);
+        ctx.state.m_xyz[base] = 0.0;
+        ctx.state.m_xyz[base + 2u] = 1.0;
+    }
+    initialize_mfem_and_check_magnetic_volume(ctx, 0.5);
+
+    std::vector<double> field;
+    double energy = 0.0;
+    fullmag::fem::compute_uniaxial_anisotropy_field(ctx, ctx.state.m_xyz, field, &energy);
+    constexpr double mu0 = 1.2566370614359172953850573533118e-6;
+    const double expected_hz = (2.0e5 + 8.0e4) / (mu0 * 8.0e5);
+    for (uint32_t node = 0; node < ctx.mesh.n_nodes; ++node) {
+        const size_t base = 3u * static_cast<size_t>(node);
+        check(field[base] == 0.0 && field[base + 1u] == 0.0,
+              "mixed-P1 uniaxial field must remain axis-local");
+        const double expected = node < 6u ? expected_hz : 0.0;
+        check(std::abs(field[base + 2u] - expected) <=
+                  256.0 * std::numeric_limits<double>::epsilon() * std::abs(expected_hz),
+              "mixed-P1 uniaxial field must match the analytic nodal value");
+    }
+    check(std::abs(energy - (-6.0e4)) <= 1.0e-10,
+          "mixed-P1 uniaxial energy must use the conserved 0.5 m3 MFEM mass weights");
+    fullmag::fem::context_destroy_mfem(ctx);
+}
+
+void mixed_p1_cpu_dmi_fields_and_energies_use_magnetic_prism6_mfem_oracle()
+{
+    fullmag::fem::Context ctx{};
+    ctx.mesh = conforming_prism_pyramid_tet();
+    ctx.mesh.magnetic_element_mask = {1u, 0u, 0u};
+    ctx.mesh.magnetic_node_mask = {1u, 1u, 1u, 1u, 1u, 1u, 0u, 0u};
+    ctx.mfem_device.device_string_override = "cpu";
+    initialize_uniform_material(ctx);
+    ctx.dmi.interfacial_enabled = true;
+    ctx.dmi.bulk_enabled = true;
+    ctx.material_fields.Dind_field = {
+        2.0e-3, 3.0e-3, 4.0e-3, 5.0e-3, 6.0e-3, 7.0e-3, 23.0, 29.0};
+    ctx.material_fields.Dbulk_field = {
+        1.0e-3, 2.0e-3, 3.0e-3, 4.0e-3, 5.0e-3, 6.0e-3, 31.0, 37.0};
+    std::string error;
+    check(fullmag::fem::initialize_material_runtime(ctx, error), error.c_str());
+    initialize_mfem_and_check_magnetic_volume(ctx, 0.5);
+    auto *mfem_mesh = static_cast<mfem::Mesh *>(ctx.mfem_context.mesh);
+    check(ctx.mesh.cell_types[0] == FULLMAG_FEM_CELL_PRISM6 &&
+              ctx.mesh.magnetic_element_mask[0] == 1u &&
+              mfem_mesh != nullptr &&
+              mfem_mesh->GetElementGeometry(0) == mfem::Geometry::PRISM,
+          "mixed DMI oracle must exercise the magnetic prism6 element");
+
+    constexpr double magnetic_prism_volume = 0.5;
+    const double dind_prism_average =
+        std::accumulate(ctx.material_fields.Dind_field.begin(),
+                        ctx.material_fields.Dind_field.begin() + 6, 0.0) / 6.0;
+    const double dbulk_prism_average =
+        std::accumulate(ctx.material_fields.Dbulk_field.begin(),
+                        ctx.material_fields.Dbulk_field.begin() + 6, 0.0) / 6.0;
+    // For m=(x,y,z), n=z: m_n div(m)-m.grad(m_n)=2z, whose prism average is 1.
+    const double expected_interfacial_energy =
+        dind_prism_average * magnetic_prism_volume;
+    // For m=(-y,x,1): curl(m)=(0,0,2), so m.curl(m)=2 everywhere.
+    const double expected_bulk_energy =
+        2.0 * dbulk_prism_average * magnetic_prism_volume;
+
+    std::vector<double> interfacial_m(3u * ctx.mesh.n_nodes, 0.0);
+    std::vector<double> bulk_m(3u * ctx.mesh.n_nodes, 0.0);
+    for (uint32_t node = 0; node < ctx.mesh.n_nodes; ++node) {
+        const size_t base = 3u * static_cast<size_t>(node);
+        const double x = ctx.mesh.nodes_xyz[base];
+        const double y = ctx.mesh.nodes_xyz[base + 1u];
+        const double z = ctx.mesh.nodes_xyz[base + 2u];
+        interfacial_m[base] = x;
+        interfacial_m[base + 1u] = y;
+        interfacial_m[base + 2u] = z;
+        bulk_m[base] = -y;
+        bulk_m[base + 1u] = x;
+        bulk_m[base + 2u] = 1.0;
+    }
+    const auto field_scaling_derivative = [&ctx](
+        const std::vector<double> &field,
+        const std::vector<double> &magnetization) {
+        constexpr double mu0 = 1.2566370614359172953850573533118e-6;
+        double derivative = 0.0;
+        for (uint32_t node = 0; node < ctx.mesh.n_nodes; ++node) {
+            const size_t base = 3u * static_cast<size_t>(node);
+            derivative -= mu0 * ctx.material_fields.material.saturation_magnetisation *
+                ctx.integration_weights.mfem_lumped_mass[node] *
+                (field[base] * magnetization[base] +
+                 field[base + 1u] * magnetization[base + 1u] +
+                 field[base + 2u] * magnetization[base + 2u]);
+        }
+        return derivative;
+    };
+
+    std::vector<double> interfacial_field;
+    double interfacial_energy = 0.0;
+    check(fullmag::fem::compute_interfacial_dmi_field(
+              ctx, interfacial_m, interfacial_field, &interfacial_energy, error),
+          error.c_str());
+    check(std::abs(interfacial_energy - expected_interfacial_energy) <= 1.0e-12,
+          "magnetic prism6 interfacial DMI energy must match the analytic linear-field integral");
+    check(std::abs(field_scaling_derivative(interfacial_field, interfacial_m) -
+                       2.0 * expected_interfacial_energy) <= 1.0e-12,
+          "interfacial DMI field must be the derivative of the analytic prism6 energy");
+    check(std::any_of(interfacial_field.begin(), interfacial_field.begin() + 18u,
+                      [](double value) { return std::abs(value) > 0.0; }),
+          "magnetic prism6 interfacial DMI field must be nonzero");
+    check(std::all_of(interfacial_field.begin() + 18u, interfacial_field.end(),
+                      [](double value) { return value == 0.0; }),
+          "air nodes must not receive magnetic prism6 interfacial DMI");
+
+    std::vector<double> bulk_field;
+    double bulk_energy = 0.0;
+    error.clear();
+    check(fullmag::fem::compute_bulk_dmi_field(ctx, bulk_m, bulk_field, &bulk_energy, error),
+          error.c_str());
+    check(std::abs(bulk_energy - expected_bulk_energy) <= 1.0e-12,
+          "magnetic prism6 bulk DMI energy must match the analytic curl integral");
+    check(std::abs(field_scaling_derivative(bulk_field, bulk_m) -
+                       2.0 * expected_bulk_energy) <= 1.0e-12,
+          "bulk DMI field must be the derivative of the analytic prism6 energy");
+    check(std::any_of(bulk_field.begin(), bulk_field.begin() + 18u,
+                      [](double value) { return std::abs(value) > 0.0; }),
+          "magnetic prism6 bulk DMI field must be nonzero");
+    check(std::all_of(bulk_field.begin() + 18u, bulk_field.end(),
+                      [](double value) { return value == 0.0; }),
+          "air nodes must not receive magnetic prism6 bulk DMI");
     fullmag::fem::context_destroy_mfem(ctx);
 }
 
@@ -1032,6 +1175,37 @@ void typed_boundary_uses_owner_orientation_roles_and_attributes()
     check(triangles == 6 && quads == 2,
           "typed boundary must preserve native tri3 and quad4 geometries");
     check(found_periodic, "periodic seam must remain an attributed MFEM boundary element");
+
+    for (uint32_t facet = 0; facet < source.n_boundary_faces; ++facet) {
+        if (source.facet_roles[facet] == FULLMAG_FEM_FACET_ROLE_MATERIAL_INTERFACE) {
+            continue;
+        }
+        const uint32_t start = source.facet_offsets[facet];
+        const uint32_t end = source.facet_offsets[facet + 1u];
+        std::vector<int> expected;
+        for (uint32_t node = start; node < end; ++node) {
+            expected.push_back(static_cast<int>(source.facet_nodes[node]));
+        }
+        std::sort(expected.begin(), expected.end());
+        const int expected_attribute = source.facet_markers[facet] == 0u
+            ? 1
+            : static_cast<int>(source.facet_markers[facet]);
+        bool found_matching_boundary = false;
+        for (int boundary = 0; boundary < mesh->GetNBE(); ++boundary) {
+            if (mesh->GetBdrAttribute(boundary) != expected_attribute) {
+                continue;
+            }
+            mfem::Array<int> vertices;
+            mesh->GetBdrElementVertices(boundary, vertices);
+            if (sorted_vertices(vertices) == expected) {
+                found_matching_boundary = true;
+                break;
+            }
+        }
+        check(found_matching_boundary,
+              "finalized MFEM boundary connectivity must match every canonical exterior/seam facet");
+    }
+
     std::sort(boundary_attributes.begin(), boundary_attributes.end());
     check(boundary_attributes == std::vector<int>({1,12,13,14,15,16,17,77}),
           "boundary markers must be preserved, with zero mapped to positive attribute one");
@@ -1077,6 +1251,11 @@ void malformed_face_ownership_and_marker_inputs_fail_closed()
         auto source = typed_prism_pyramid_boundary();
         source.facet_roles[0] = FULLMAG_FEM_FACET_ROLE_MATERIAL_INTERFACE;
         expect_reject(source, "material-interface facet must have exactly two owners");
+    }
+    {
+        auto source = typed_prism_pyramid_boundary();
+        source.cell_markers[1] = source.cell_markers[0];
+        expect_reject(source, "material-interface facet must separate distinct cell markers");
     }
     {
         auto source = typed_prism_pyramid_boundary();
@@ -1271,7 +1450,8 @@ struct MixedGpuRuntimeFixture {
 
 std::unique_ptr<MixedGpuRuntimeFixture> initialize_mixed_gpu_runtime(
     fullmag_fem_integrator integrator,
-    bool enable_device_hypre_demag)
+    bool enable_device_hypre_demag,
+    bool enable_uniform_uniaxial = false)
 {
     auto fixture = std::make_unique<MixedGpuRuntimeFixture>();
     auto &context = fixture->context;
@@ -1284,6 +1464,12 @@ std::unique_ptr<MixedGpuRuntimeFixture> initialize_mixed_gpu_runtime(
     context.base_plan.precession_enabled = false;
     context.mfem_device.device_string_override = "cuda";
     context.mfem_device.gpu_device_index = 0;
+    if (enable_uniform_uniaxial) {
+        context.anisotropy.uniaxial_enabled = true;
+        context.anisotropy.uniaxial_Ku = 1.0e5;
+        context.anisotropy.uniaxial_Ku2 = 2.0e4;
+        context.anisotropy.uniaxial_axis = {0.0, 0.0, 1.0};
+    }
     context.demag.enabled = enable_device_hypre_demag;
     if (enable_device_hypre_demag) {
         context.demag.realization = FULLMAG_FEM_DEMAG_AIRBOX_ROBIN;
@@ -1336,7 +1522,14 @@ std::unique_ptr<MixedGpuRuntimeFixture> initialize_mixed_gpu_runtime(
               context.gpu_state.device.mesh_geometry.magnetic_element_mask == nullptr,
           "exchange-only mixed relaxation must not upload flat tetrahedral geometry");
     check(context.gpu_state.device.legacy_exchange.uploaded,
-          "exchange-only mixed relaxation requires assembled MFEM CSR on CUDA");
+          "mixed relaxation requires assembled MFEM exchange CSR on CUDA");
+    if (enable_uniform_uniaxial) {
+        check(context.gpu_state.device.materials.ku != nullptr &&
+                  context.gpu_state.device.materials.ku2 != nullptr &&
+                  context.gpu_state.device.materials.anisotropy_axis_x != nullptr &&
+                  context.gpu_state.device.fields.h_ani.x != nullptr,
+              "mixed uniform uniaxial anisotropy requires device-resident material and field buffers");
+    }
     if (enable_device_hypre_demag) {
         check(fullmag::fem::gpu_demag_poisson_ready(context),
               "mixed relaxation with demag requires a ready device-Hypre workspace");
@@ -1557,6 +1750,38 @@ void check_device_magnetization_is_finite_unit_and_changed(
     }
 }
 
+std::vector<double> download_device_magnetization(
+    fullmag::fem::Context &context)
+{
+    std::vector<double> values;
+    std::string error;
+    check(fullmag::fem::gpu_state_download_magnetization_aos(
+              context.gpu_state.device,
+              values,
+              context.transfer_audit.audit,
+              error),
+          error.c_str());
+    return values;
+}
+
+std::vector<double> download_device_component(
+    fullmag::fem::Context &context,
+    const fullmag::fem::FemGpuComponentField &field,
+    const char *label)
+{
+    std::vector<double> values;
+    std::string error;
+    check(fullmag::fem::gpu_state_download_component_aos(
+              context.gpu_state.device,
+              field,
+              values,
+              context.transfer_audit.audit,
+              label,
+              error),
+          error.c_str());
+    return values;
+}
+
 void check_device_hypre_demag_operator_is_reused(
     const fullmag::fem::Context &context,
     const char *algorithm)
@@ -1589,7 +1814,7 @@ void mixed_p1_gpu_direct_minimizers_use_device_armijo_without_tet_geometry()
     for (const bool enable_device_hypre_demag : {false, true}) {
         for (const auto &item : cases) {
             auto fixture = initialize_mixed_gpu_runtime(
-                FULLMAG_FEM_INTEGRATOR_HEUN, enable_device_hypre_demag);
+                FULLMAG_FEM_INTEGRATOR_HEUN, enable_device_hypre_demag, true);
             auto &context = fixture->context;
             const std::string case_name = std::string(item.name) +
                 (enable_device_hypre_demag ? "/device_hypre" : "/exchange_only");
@@ -1670,6 +1895,126 @@ void mixed_p1_gpu_direct_minimizers_use_device_armijo_without_tet_geometry()
 #endif
 }
 
+void mixed_p1_gpu_ncg_fault_injection_rolls_back_and_retries_bitwise()
+{
+    const char *requested_device = std::getenv("FULLMAG_MIXED_P1_ROLLBACK_DEVICE");
+    if (requested_device == nullptr || std::string(requested_device) != "cuda") {
+        return;
+    }
+#if FULLMAG_HAS_CUDA_RUNTIME
+    for (const auto failure_point : {
+             fullmag::fem::GpuRelaxNcgFailurePoint::AfterTrialMagnetization,
+             fullmag::fem::GpuRelaxNcgFailurePoint::DuringAcceptedStatistics,
+         }) {
+        auto fault_fixture = initialize_mixed_gpu_runtime(
+            FULLMAG_FEM_INTEGRATOR_HEUN, false, true);
+        auto control_fixture = initialize_mixed_gpu_runtime(
+            FULLMAG_FEM_INTEGRATOR_HEUN, false, true);
+        auto &fault = fault_fixture->context;
+        auto &control = control_fixture->context;
+
+        fullmag_fem_step_stats first_fault_stats{};
+        fullmag_fem_step_stats first_control_stats{};
+        std::string error;
+        check(fullmag::fem::run_backend_relaxation_step(
+                  fault,
+                  FULLMAG_FEM_RELAX_NONLINEAR_CG,
+                  first_fault_stats,
+                  error) == FULLMAG_FEM_OK,
+              error.c_str());
+        error.clear();
+        check(fullmag::fem::run_backend_relaxation_step(
+                  control,
+                  FULLMAG_FEM_RELAX_NONLINEAR_CG,
+                  first_control_stats,
+                  error) == FULLMAG_FEM_OK,
+              error.c_str());
+
+        const auto accepted_m = download_device_magnetization(fault);
+        const auto control_accepted_m = download_device_magnetization(control);
+        check(accepted_m == control_accepted_m,
+              "GPU nonlinear-CG fixtures must match before fault injection");
+        const auto accepted_direction = download_device_component(
+            fault,
+            fault.gpu_state.device.relaxation.nonlinear_cg_direction,
+            "GPU nonlinear-CG accepted direction before fault injection");
+        const uint64_t accepted_steps = fault.relaxation.accepted_steps;
+        const uint64_t step_count = fault.state.step_count;
+        const auto accepted_token =
+            fault.gpu_state.device.relaxation.accepted_evaluation;
+
+        fault.gpu_state.device.relaxation.next_nonlinear_cg_failure =
+            failure_point;
+        fullmag_fem_step_stats rejected_stats{};
+        error.clear();
+        check(fullmag::fem::run_backend_relaxation_step(
+                  fault,
+                  FULLMAG_FEM_RELAX_NONLINEAR_CG,
+                  rejected_stats,
+                  error) == FULLMAG_FEM_ERR_INTERNAL,
+              "injected GPU nonlinear-CG failure must fail the step");
+        check(error.find("previous device state restored") != std::string::npos,
+              error.c_str());
+        check(fault.gpu_state.device.relaxation.nonlinear_cg_failures_injected == 1u &&
+                  fault.gpu_state.device.relaxation.next_nonlinear_cg_failure ==
+                      fullmag::fem::GpuRelaxNcgFailurePoint::None,
+              "GPU nonlinear-CG failpoint must be one-shot and observable");
+        check(fault.relaxation.accepted_steps == accepted_steps &&
+                  fault.state.step_count == step_count,
+              "failed GPU nonlinear-CG attempt must not publish accepted counters");
+        check(download_device_magnetization(fault) == accepted_m,
+              "failed GPU nonlinear-CG attempt must restore magnetization bitwise");
+        check(download_device_component(
+                  fault,
+                  fault.gpu_state.device.relaxation.nonlinear_cg_direction,
+                  "GPU nonlinear-CG direction after rollback") ==
+                  accepted_direction,
+              "failed GPU nonlinear-CG attempt must restore direction bitwise");
+        const auto &restored_token =
+            fault.gpu_state.device.relaxation.accepted_evaluation;
+        check(!restored_token.valid &&
+                  restored_token.accepted_step == accepted_token.accepted_step &&
+                  restored_token.state_generation == accepted_token.state_generation &&
+                  restored_token.total_energy_j == accepted_token.total_energy_j &&
+                  restored_token.energy_terms_j == accepted_token.energy_terms_j &&
+                  restored_token.invalidations ==
+                      accepted_token.invalidations + 1u,
+              "failed GPU nonlinear-CG attempt must preserve but invalidate the accepted evaluation token");
+        check(!fault.gpu_state.device.fields.accepted_observables_valid &&
+                  fault.poisson_demag.fresh_initial_guess_required &&
+                  !fault.gpu_state.device.rk.fsal_valid,
+              "GPU nonlinear-CG rollback must invalidate derived fields, Poisson guess, and FSAL");
+
+        fullmag_fem_step_stats retried_stats{};
+        fullmag_fem_step_stats control_stats{};
+        error.clear();
+        check(fullmag::fem::run_backend_relaxation_step(
+                  fault,
+                  FULLMAG_FEM_RELAX_NONLINEAR_CG,
+                  retried_stats,
+                  error) == FULLMAG_FEM_OK,
+              error.c_str());
+        error.clear();
+        check(fullmag::fem::run_backend_relaxation_step(
+                  control,
+                  FULLMAG_FEM_RELAX_NONLINEAR_CG,
+                  control_stats,
+                  error) == FULLMAG_FEM_OK,
+              error.c_str());
+        check(download_device_magnetization(fault) ==
+                  download_device_magnetization(control),
+              "GPU nonlinear-CG retry must match a clean control bitwise");
+        check(retried_stats.total_energy_joules == control_stats.total_energy_joules &&
+                  retried_stats.max_torque_Apm == control_stats.max_torque_Apm,
+              "GPU nonlinear-CG retry observables must match a clean control bitwise");
+        check(fault.gpu_state.device.fields.accepted_observables_valid &&
+                  fault.gpu_state.device.fields.accepted_observables_step ==
+                      fault.state.step_count,
+              "successful GPU nonlinear-CG retry must publish current observables");
+    }
+#endif
+}
+
 void mixed_p1_gpu_llg_overdamped_runs_every_explicit_rk_without_tet_geometry()
 {
     const char *requested_device = std::getenv("FULLMAG_MIXED_P1_ROLLBACK_DEVICE");
@@ -1736,6 +2081,29 @@ void mixed_p1_gpu_llg_overdamped_runs_every_explicit_rk_without_tet_geometry()
 
 int main()
 {
+    const char *ncg_transaction_only =
+        std::getenv("FULLMAG_MIXED_P1_NCG_TRANSACTION_ONLY");
+    if (ncg_transaction_only != nullptr &&
+        std::string(ncg_transaction_only) == "1") {
+        mixed_p1_gpu_direct_minimizers_use_device_armijo_without_tet_geometry();
+        mixed_p1_gpu_ncg_fault_injection_rolls_back_and_retries_bitwise();
+        return 0;
+    }
+    const char *local_interactions_only =
+        std::getenv("FULLMAG_MIXED_P1_LOCAL_INTERACTIONS_ONLY");
+    if (local_interactions_only != nullptr &&
+        std::string(local_interactions_only) == "1") {
+        mixed_p1_uniform_uniaxial_field_and_energy_use_mfem_mass_weights();
+        mixed_p1_cpu_dmi_fields_and_energies_use_magnetic_prism6_mfem_oracle();
+        return 0;
+    }
+    const char *anisotropy_only = std::getenv("FULLMAG_MIXED_P1_ANISOTROPY_ONLY");
+    if (anisotropy_only != nullptr && std::string(anisotropy_only) == "1") {
+        mixed_p1_uniform_uniaxial_field_and_energy_use_mfem_mass_weights();
+        mixed_p1_gpu_direct_minimizers_use_device_armijo_without_tet_geometry();
+        return 0;
+    }
+
     single_element_families_preserve_geometry_dofs_vertices_and_attributes();
     zero_marker_uses_an_unoccupied_positive_air_attribute();
     legal_int_max_marker_without_air_is_preserved();
@@ -1752,8 +2120,11 @@ int main()
     repeated_post_device_fes_failure_rolls_back_runtime_state();
     post_allocation_gpu_bootstrap_failure_rolls_back_every_owner();
     mixed_p1_gpu_direct_minimizers_use_device_armijo_without_tet_geometry();
+    mixed_p1_gpu_ncg_fault_injection_rolls_back_and_retries_bitwise();
     mixed_p1_gpu_llg_overdamped_runs_every_explicit_rk_without_tet_geometry();
     mfem_mass_weights_cover_tet_prism_and_mixed_magnetic_domains();
+    mixed_p1_uniform_uniaxial_field_and_energy_use_mfem_mass_weights();
+    mixed_p1_cpu_dmi_fields_and_energies_use_magnetic_prism6_mfem_oracle();
     distorted_prism_mass_weights_match_independent_mfem_oracle();
     mixed_core_measure_over_arity_is_not_published_as_runtime_node_volume();
     mixed_nodal_ms_and_a_follow_validated_mfem_realization();

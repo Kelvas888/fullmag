@@ -300,6 +300,15 @@ void native_sources_prepare_multilayer_fft_workspace() {
                 std::string::npos,
         "Context must cache and bind per-grid multilayer FFT workspaces instead of reallocating for every grid switch");
     check(
+        context_source.find(
+            "for (const DeviceMultilayerTensorKernel &kernel : ctx.multilayer_kernels)") !=
+                std::string::npos &&
+            context_source.find(
+                "context_prepare_multilayer_fft_workspace_for_kernel(ctx, kernel)") !=
+                std::string::npos &&
+            c_api.find("prepared all FFT workspaces") != std::string::npos,
+        "create_v2 must preallocate every distinct multilayer FFT workspace before the first stage");
+    check(
         context_source.find("bool context_prepare_multilayer_fft_workspace_for_kernel(") !=
                 std::string::npos &&
             context_source.find("ensure_multilayer_fft_workspace(ctx, kernel.fft_grid") !=
@@ -326,8 +335,8 @@ void native_sources_prepare_multilayer_fft_workspace() {
     check(
         c_api.find("context_prepare_multilayer_fft_workspace_v2(*ctx)") !=
                 std::string::npos &&
-            c_api.find("prepared initial FFT workspace") != std::string::npos,
-        "create_v2 must prepare the initial multilayer FFT workspace before reporting native timestep execution");
+            c_api.find("prepared all FFT workspaces") != std::string::npos,
+        "create_v2 must prepare all multilayer FFT workspaces before reporting native timestep execution");
 }
 
 void native_sources_expose_multilayer_cuda_demag_boundary() {
@@ -510,10 +519,12 @@ void native_multilayer_push_pull_transfer_uses_staged_maps() {
                 std::string::npos,
         "native v2 upload must build layer push maps and per-kernel pull maps for push_pull transfer");
     check(
-        context_source.find("free_device_push_map") != std::string::npos &&
-            context_source.find("free_device_pull_map(kernel.dst_pull_map)") !=
+        context_source.find("free_device_push_map(ctx, layer.push_map)") !=
+                std::string::npos &&
+            context_source.find(
+                "free_device_pull_map(ctx, kernel.dst_pull_map)") !=
                 std::string::npos,
-        "Context cleanup must free staged layer push maps and per-kernel pull maps");
+        "Context cleanup must account for and free staged layer push maps and per-kernel pull maps");
     check(
         multilayer_source.find("src.push_map.offsets") != std::string::npos &&
             multilayer_source.find("kernel.dst_pull_map.indices") != std::string::npos,
@@ -555,8 +566,10 @@ void native_c_api_keeps_v2_handles_out_of_legacy_step_path() {
     const std::size_t step_entry = c_api.find("int fullmag_fdm_backend_step(");
     const std::size_t multilayer_step =
         c_api.find("if (ctx->has_multilayer_plan_v2)", step_entry);
-    const std::size_t transport_begin =
-        c_api.find("context_begin_gpu_transport_step(*ctx, transport_attempt_id)", step_entry);
+    const std::size_t multilayer_transaction =
+        c_api.find("return execute_multilayer_step_transaction(", step_entry);
+    const std::size_t single_grid_transaction =
+        c_api.find("return execute_single_grid_step_transaction(", step_entry);
 
     check(
         create_v2 != std::string::npos &&
@@ -566,25 +579,27 @@ void native_c_api_keeps_v2_handles_out_of_legacy_step_path() {
         "create_v2 must honor the same explicit CUDA device selection as create");
     check(
         c_api.find("if (ctx->has_multilayer_plan_v2)") != std::string::npos &&
-            c_api.find("launch_multilayer_heun_step_fp64(*ctx, dt_seconds, out_stats)") !=
+            c_api.find("launch_multilayer_heun_step_fp64(ctx, dt_seconds, &trial_stats)") !=
                 std::string::npos &&
-            c_api.find("launch_multilayer_heun_step_fp32(*ctx, dt_seconds, out_stats)") !=
+            c_api.find("launch_multilayer_heun_step_fp32(ctx, dt_seconds, &trial_stats)") !=
                 std::string::npos &&
-            c_api.find("launch_multilayer_rk4_step_fp64(*ctx, dt_seconds, out_stats)") !=
+            c_api.find("launch_multilayer_rk4_step_fp64(ctx, dt_seconds, &trial_stats)") !=
                 std::string::npos &&
-            c_api.find("launch_multilayer_rk4_step_fp32(*ctx, dt_seconds, out_stats)") !=
+            c_api.find("launch_multilayer_rk4_step_fp32(ctx, dt_seconds, &trial_stats)") !=
                 std::string::npos &&
-            c_api.find("launch_multilayer_rk23_step_fp64(*ctx, dt_seconds, out_stats)") !=
+            c_api.find("launch_multilayer_rk23_step_fp64(ctx, dt_seconds, &trial_stats)") !=
                 std::string::npos &&
-            c_api.find("launch_multilayer_rk23_step_fp32(*ctx, dt_seconds, out_stats)") !=
+            c_api.find("launch_multilayer_rk23_step_fp32(ctx, dt_seconds, &trial_stats)") !=
                 std::string::npos,
-        "step must route staged v2 multilayer handles through native timestep launchers");
+        "step must route staged v2 multilayer handles through transactional native timestep launchers");
     check(
         step_entry != std::string::npos &&
             multilayer_step != std::string::npos &&
-            transport_begin != std::string::npos &&
-            multilayer_step < transport_begin,
-        "multilayer stepping must branch before starting the unsupported transport transaction");
+            multilayer_transaction != std::string::npos &&
+            single_grid_transaction != std::string::npos &&
+            multilayer_step < multilayer_transaction &&
+            multilayer_transaction < single_grid_transaction,
+        "multilayer stepping must commit to its transaction before entering the single-grid transaction");
     check(
         c_api.find("spin transport is unsupported for v2 multilayer handles") !=
             std::string::npos,
@@ -943,6 +958,12 @@ void native_multilayer_v2_rhs_includes_dmi() {
     const std::string rk4_source =
         read_text_file(root / "backends" / "fdm" / "gpu" / "cuda" / "integrators" /
                        "multilayer_explicit_rk.cu");
+    const std::string dmi_source =
+        read_text_file(root / "backends" / "fdm" / "gpu" / "cuda" / "interactions" /
+                       "multilayer_dmi.cu");
+    const std::string effective_field_source =
+        read_text_file(root / "backends" / "fdm" / "gpu" / "cuda" / "interactions" /
+                       "multilayer_effective_field.cu");
     const std::string c_v2_plan = slice_between(
         c_header,
         "typedef struct {\n    fullmag_fdm_plan_kind      kind",
@@ -965,6 +986,11 @@ void native_multilayer_v2_rhs_includes_dmi() {
                 std::string::npos,
         "C ABI v2 multilayer plan descriptor must carry DMI constants");
     check(
+        c_v2_plan.find("has_rotated_interfacial_dmi") == std::string::npos &&
+            c_v2_plan.find("dmi_D_rotated_interfacial") == std::string::npos &&
+            sizeof(fullmag_fdm_multilayer_plan_desc_v2) == 160,
+        "C ABI v2 multilayer descriptor must retain its historical 160-byte layout");
+    check(
         rust_v2_plan.find("pub has_interfacial_dmi: i32") !=
                 std::string::npos &&
             rust_v2_plan.find("pub dmi_d_interfacial: f64") !=
@@ -974,6 +1000,12 @@ void native_multilayer_v2_rhs_includes_dmi() {
             rust_v2_plan.find("pub dmi_d_bulk: f64") != std::string::npos,
         "Rust FFI v2 multilayer plan descriptor must mirror DMI constants");
     check(
+        rust_v2_plan.find("has_rotated_interfacial_dmi") == std::string::npos &&
+            rust_v2_plan.find("dmi_d_rotated_interfacial") == std::string::npos &&
+            rust.find("pub struct fullmag_fdm_rotated_interfacial_dmi_desc_v1") !=
+                std::string::npos,
+        "Rust FFI must keep rotated DMI outside the historical v2 multilayer descriptor");
+    check(
         rust_runner.find("has_interfacial_dmi: if plan.interfacial_dmi.is_some()") !=
                 std::string::npos &&
             rust_runner.find("dmi_d_interfacial: plan.interfacial_dmi.unwrap_or(0.0)") !=
@@ -982,7 +1014,17 @@ void native_multilayer_v2_rhs_includes_dmi() {
                 std::string::npos &&
             rust_runner.find("dmi_d_bulk: plan.bulk_dmi.unwrap_or(0.0)") !=
                 std::string::npos,
-        "Rust native runner wrapper must pass multilayer DMI constants into the v2 ABI");
+        "Rust native runner wrapper must pass conventional multilayer DMI constants into the v2 ABI");
+    check(
+        c_header.find("fullmag_fdm_rotated_interfacial_dmi_desc_v1") !=
+                std::string::npos &&
+            c_api.find("fullmag_fdm_backend_set_rotated_interfacial_dmi_v1") !=
+                std::string::npos &&
+            rust_runner.find("fullmag_fdm_backend_set_rotated_interfacial_dmi_v1") !=
+                std::string::npos &&
+            rust_runner.find("FULLMAG_FDM_ROTATED_INTERFACIAL_DMI_ABI_V1") !=
+                std::string::npos,
+        "multilayer rotated DMI must cross the separate versioned setter");
     check(
         c_api.find("ctx->has_interfacial_dmi = plan->has_interfacial_dmi != 0") !=
                 std::string::npos &&
@@ -1014,6 +1056,86 @@ void native_multilayer_v2_rhs_includes_dmi() {
             rk4_source.find("ctx.has_interfacial_dmi ? 1 : 0") !=
                 std::string::npos,
         "v2 multilayer RK4 RHS must include staged DMI field");
+    check(
+        heun_source.find("int periodic_x") != std::string::npos &&
+            heun_source.find("int periodic_y") != std::string::npos &&
+            heun_source.find("int periodic_z") != std::string::npos &&
+            heun_source.find("periodic_x && nx > 1") != std::string::npos &&
+            heun_source.find("periodic_y && ny > 1") != std::string::npos &&
+            heun_source.find("periodic_z && nz > 1") != std::string::npos &&
+            heun_source.find("ix == 0 && !periodic_x") != std::string::npos &&
+            heun_source.find("iy == 0 && !periodic_y") != std::string::npos &&
+            heun_source.find("iz == 0 && !periodic_z") != std::string::npos &&
+            count_occurrences(heun_source, "ctx.periodic_x ? 1 : 0") == 2 &&
+            count_occurrences(heun_source, "ctx.periodic_y ? 1 : 0") == 2 &&
+            count_occurrences(heun_source, "ctx.periodic_z ? 1 : 0") == 2,
+        "v2 multilayer Heun RHS must wrap all periodic axes in predictor and corrector");
+    check(
+        rk4_source.find("int periodic_x") != std::string::npos &&
+            rk4_source.find("int periodic_y") != std::string::npos &&
+            rk4_source.find("int periodic_z") != std::string::npos &&
+            rk4_source.find("periodic_x && nx > 1") != std::string::npos &&
+            rk4_source.find("periodic_y && ny > 1") != std::string::npos &&
+            rk4_source.find("periodic_z && nz > 1") != std::string::npos &&
+            rk4_source.find("ix == 0 && !periodic_x") != std::string::npos &&
+            rk4_source.find("iy == 0 && !periodic_y") != std::string::npos &&
+            rk4_source.find("iz == 0 && !periodic_z") != std::string::npos &&
+            count_occurrences(rk4_source, "ctx.periodic_x ? 1 : 0") == 1 &&
+            count_occurrences(rk4_source, "ctx.periodic_y ? 1 : 0") == 1 &&
+            count_occurrences(rk4_source, "ctx.periodic_z ? 1 : 0") == 1,
+        "v2 multilayer explicit RK RHS must wrap all periodic axes for RK4 and RK23");
+    const std::size_t rotated_pos = dmi_source.find(
+        "if (has_rotated_interfacial_dmi)");
+    const std::size_t bulk_pos = dmi_source.find("if (has_bulk_dmi)", rotated_pos);
+    check(
+        rotated_pos != std::string::npos && bulk_pos != std::string::npos &&
+            dmi_source.substr(rotated_pos, bulk_pos - rotated_pos).find("h0_before_rotated") ==
+                std::string::npos &&
+            dmi_source.substr(rotated_pos, bulk_pos - rotated_pos).find("rotated_h0 +=") !=
+                std::string::npos &&
+            dmi_source.substr(rotated_pos, bulk_pos - rotated_pos).find("rotated_h1 +=") !=
+                std::string::npos &&
+            dmi_source.substr(rotated_pos, bulk_pos - rotated_pos).find("rotated_h2 -=") !=
+                std::string::npos &&
+            dmi_source.substr(rotated_pos, bulk_pos - rotated_pos).find(
+                "missing,\n            rotated_h0,") != std::string::npos,
+        "multilayer DMI must keep rotated field accumulation separate from H_DMI");
+    const std::string single_grid_rotated_launch = slice_between(
+        dmi_source,
+        "bool launch_rotated_interfacial_dmi_field_impl",
+        "} // namespace",
+        "single-grid rotated DMI launch");
+    check(
+        dmi_source.find("__global__ void rotated_interfacial_dmi_field_kernel") !=
+                std::string::npos &&
+            single_grid_rotated_launch.find(
+                "rotated_interfacial_dmi_field_kernel<Scalar><<<") != std::string::npos &&
+            single_grid_rotated_launch.find("multilayer_dmi_field_kernel<Scalar><<<") ==
+                std::string::npos &&
+            count_occurrences(
+                single_grid_rotated_launch,
+                "static_cast<Scalar *>(ctx.h_rotated_dmi.x)") == 1 &&
+            count_occurrences(
+                single_grid_rotated_launch,
+                "static_cast<Scalar *>(ctx.h_rotated_dmi.y)") == 1 &&
+            count_occurrences(
+                single_grid_rotated_launch,
+                "static_cast<Scalar *>(ctx.h_rotated_dmi.z)") == 1,
+        "single-grid rotated DMI must use a dedicated kernel with non-aliased outputs");
+    check(
+        effective_field_source.find("h_rotated_dmi_x") != std::string::npos &&
+            effective_field_source.find("h_rotated_dmi_y") != std::string::npos &&
+            effective_field_source.find("h_rotated_dmi_z") != std::string::npos &&
+            effective_field_source.find("h_rotated_dmi_x != nullptr") !=
+                std::string::npos &&
+            effective_field_source.find("h_rotated_dmi_y != nullptr") !=
+                std::string::npos &&
+            effective_field_source.find("h_rotated_dmi_z != nullptr") !=
+                std::string::npos &&
+            effective_field_source.find("layer.h_rotated_dmi.x") != std::string::npos &&
+            effective_field_source.find("layer.h_rotated_dmi.y") != std::string::npos &&
+            effective_field_source.find("layer.h_rotated_dmi.z") != std::string::npos,
+        "multilayer H_EFF must sum H_DMI and H_rotated_dmi only at assembly");
 }
 
 void native_sources_expose_multilayer_layer_field_copy() {
@@ -1090,8 +1212,8 @@ void native_sources_expose_multilayer_layer_field_copy() {
     check(
         context_header.find("context_download_layer_field_f64") != std::string::npos &&
             context_header.find("context_download_layer_field_f32") != std::string::npos &&
-            context_header.find("DeviceVectorField h_dmi;\n    DeviceVectorField h_ani;") !=
-                std::string::npos &&
+            context_header.find("DeviceVectorField h_dmi;") != std::string::npos &&
+            context_header.find("DeviceVectorField h_ani;") != std::string::npos &&
             context_header.find("DeviceVectorField tmp;") !=
                 std::string::npos,
         "Context must expose per-layer H_DMI/H_ANI helpers and a scratch field for H_EFF downloads");

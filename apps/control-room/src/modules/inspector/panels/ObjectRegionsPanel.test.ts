@@ -178,9 +178,10 @@ describe("ObjectRegionsPanel physical scalar inputs", () => {
       "utf8",
     );
 
-    expect(texturePanel).toContain("buildRegionTextureOverridePatch(");
-    expect(texturePanel).toContain("api.model.patchObjectRegionResource(");
-    expect(texturePanel).not.toContain("api.model.patchRegion(");
+    expect(texturePanel).toContain("buildMagnetizationTransactionRequest(");
+    expect(texturePanel).toContain("api.model.commitTransaction(");
+    expect(texturePanel).not.toContain("patchMagnetizationAsset(");
+    expect(texturePanel).not.toContain("patchObjectRegionResource(");
   });
 
   it("syncs the canonical authoring script after region edits", () => {
@@ -199,15 +200,21 @@ describe("ObjectRegionsPanel physical scalar inputs", () => {
     expect(deleteRegionStart).toBeGreaterThan(duplicateRegionStart);
     expect(subPropsStart).toBeGreaterThan(deleteRegionStart);
 
+    expect(source.slice(applyRegionStart, duplicateRegionStart)).toMatch(
+      /syncAuthoringScriptBestEffort\(\s*api,\s*operationSessionScopeKey,\s*\)/,
+    );
+    expect(source.slice(duplicateRegionStart, deleteRegionStart)).toMatch(
+      /syncAuthoringScriptBestEffort\(\s*api,\s*operationSessionScopeKey,\s*\)/,
+    );
+    expect(source.slice(deleteRegionStart, subPropsStart)).toMatch(
+      /syncAuthoringScriptBestEffort\(\s*api,\s*operationSessionScopeKey,\s*\)/,
+    );
     expect(source.slice(applyRegionStart, duplicateRegionStart)).toContain(
-      "syncAuthoringScriptBestEffort(api)",
+      "runAuthoringMutationWithHistory",
     );
-    expect(source.slice(duplicateRegionStart, deleteRegionStart)).toContain(
-      "syncAuthoringScriptBestEffort(api)",
-    );
-    expect(source.slice(deleteRegionStart, subPropsStart)).toContain(
-      "syncAuthoringScriptBestEffort(api)",
-    );
+    expect(source).toContain('{ historyMode: "mutation-owned" }');
+    expect(source).toContain("requireRegionBaseRevision(baseRevision)");
+    expect(source).not.toContain("return Date.now()");
   });
 
   it("keeps region mesh actions tied to realized lifecycle resources", () => {
@@ -222,7 +229,7 @@ describe("ObjectRegionsPanel physical scalar inputs", () => {
     const parent = readFileSync(
       new URL("./ObjectRegionsPanel.tsx", import.meta.url),
       "utf8",
-    );
+    ).replace(/\r\n/g, "\n");
 
     expect(parent).toContain("useMeshRegionMembershipResource");
     expect(parent).toContain("useMeshBuildCurrent");
@@ -312,7 +319,7 @@ describe("ObjectRegionsPanel physical scalar inputs", () => {
     const parent = readFileSync(
       new URL("./ObjectRegionsPanel.tsx", import.meta.url),
       "utf8",
-    );
+    ).replace(/\r\n/g, "\n");
 
     expect(parent).toContain(
       'const regionVisualizationSelection =\n    selection.kind === "object.region.visualization";',

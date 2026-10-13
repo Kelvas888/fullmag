@@ -12,6 +12,7 @@ import {
   resolveViewport3DOrthographicCameraFrame,
   resolveViewport3DOrthographicZoom,
   resolveNextViewport3DModelLayerStage,
+  resolveNextViewport3DModelLayerStageState,
   resolveAuthoredRegionOverlayVisibility,
   resolveViewport3DAirboxFrameState,
   resolveViewport3DModelLayerStageKey,
@@ -33,6 +34,16 @@ function invokeFrameCallback(
 }
 
 describe("Viewport3DScene scale helpers", () => {
+  it("releases the scene-owned gesture on effect cleanup without disposing the replayable ref", () => {
+    const source = readFileSync(new URL("./Viewport3DScene.tsx", import.meta.url), "utf8");
+    const start = source.indexOf("const cameraGestureRef = useMemo");
+    const cleanup = source.slice(start, source.indexOf("const [moveGestureActive", start));
+    expect(cleanup).toContain("useEffect(() => () => {");
+    expect(cleanup).toContain("cancelViewport3DCameraGesture(cameraGestureRef, epoch)");
+    expect(cleanup).toContain("onCameraInteractionEnd?.(epoch)");
+    expect(cleanup).not.toContain("disposeViewport3DCameraGesture(");
+  });
+
   it("treats native multilayer grids as realized object geometry", () => {
     expect(
       resolveViewport3DRealizedFdmObjectIds({
@@ -51,7 +62,7 @@ describe("Viewport3DScene scale helpers", () => {
     const source = readFileSync(
       new URL("./Viewport3DScene.tsx", import.meta.url),
       "utf8",
-    );
+    ).replace(/\r\n/g, "\n");
     const controlsStart = source.indexOf("<OrbitCameraControls");
     const controlsBlock = source.slice(
       controlsStart,
@@ -118,22 +129,21 @@ describe("Viewport3DScene scale helpers", () => {
       source.indexOf("export function Viewport3DScene"),
     );
 
-    expect(adoptionFrameHook).toContain("adoptionRegistry.subscribe");
-    expect(adoptionFrameHook).toContain('tracker.recordDirtyFrame("render-adoption")');
-    const subscriberStart = adoptionFrameHook.indexOf(
-      "adoptionRegistry.subscribe",
+    expect(adoptionFrameHook).toContain("adoptionRegistry.subscribeActive");
+    expect(adoptionFrameHook).toContain('scheduleFrame("render-adoption")');
+    expect(adoptionFrameHook).toContain("tracker.recordDirtyFrame(reason)");
+    expect(adoptionFrameHook).toContain("const frameIdRef = useRef<number | null>(null)");
+    expect(adoptionFrameHook).toContain("const commitLatestFrame = useEffectEvent");
+    const scheduleStart = adoptionFrameHook.indexOf("const scheduleFrame");
+    expect(adoptionFrameHook.indexOf("invalidate();", scheduleStart)).toBeLessThan(
+      adoptionFrameHook.indexOf("window.requestAnimationFrame", scheduleStart),
     );
-    expect(
-      adoptionFrameHook.indexOf("invalidate();", subscriberStart),
-    ).toBeLessThan(
-      adoptionFrameHook.indexOf(
-        "onVisualizationFrameCommitted(",
-        subscriberStart,
-      ),
+    expect(adoptionFrameHook).toContain("onVisualizationFrameCommitted(");
+    const resourceUpdateEffect = adoptionFrameHook.slice(
+      adoptionFrameHook.indexOf('scheduleFrame("resources-updated")') - 40,
+      adoptionFrameHook.indexOf('scheduleFrame("resources-updated")') + 160,
     );
-    expect(adoptionFrameHook).toContain(
-      "onVisualizationFrameCommitted(\n          visualizationRevision,\n          airboxFrameState,\n        )",
-    );
+    expect(resourceUpdateEffect).not.toContain("cancelAnimationFrame");
   });
 
   it("binds Airbox frame state to the staged multilayer render passes", () => {
@@ -284,23 +294,20 @@ describe("Viewport3DScene scale helpers", () => {
     });
   });
 
-  it("passes the frame-bound Airbox state from the resource-frame effect", () => {
+  it("passes the latest frame-bound Airbox state from the persistent frame scheduler", () => {
     const source = readFileSync(
       new URL("./Viewport3DScene.tsx", import.meta.url),
       "utf8",
     );
-    const resourceFrameEffect = source.slice(
-      source.indexOf("// Demand rendering needs an explicit frame"),
-      source.indexOf(
-        "\n\n  return (",
-        source.indexOf("// Demand rendering needs an explicit frame"),
-      ),
+    const adoptionFrameHook = source.slice(
+      source.indexOf("function useViewport3DRenderAdoptionFrame"),
+      source.indexOf("export function Viewport3DScene"),
     );
 
-    expect(resourceFrameEffect).toContain(
-      "onVisualizationFrameCommitted(visualizationRevision, airboxFrameState)",
-    );
-    expect(resourceFrameEffect).toContain("airboxFrameState,");
+    expect(adoptionFrameHook).toContain("const commitLatestFrame = useEffectEvent");
+    expect(adoptionFrameHook).toContain("onVisualizationFrameCommitted(");
+    expect(adoptionFrameHook).toContain("visualizationRevision,");
+    expect(adoptionFrameHook).toContain("airboxFrameState,");
   });
 
   it("places the shared glyph-cache provider above the model stack that mounts VectorFieldLayer consumers", () => {
@@ -672,17 +679,17 @@ describe("Viewport3DScene scale helpers", () => {
     const source = readFileSync(
       new URL("./Viewport3DScene.tsx", import.meta.url),
       "utf8",
-    );
+    ).replace(/\r\n/g, "\n");
     const modelStack = source.slice(
       source.indexOf("function Viewport3DModelLayerStack"),
       source.indexOf("function RegionOverlayNativePickingLayer"),
     );
 
     expect(modelStack).toContain(
-      "{!fdmLaneActive &&\n      stageVisibility.baseGeometry &&\n      viewport3DAirboxLayerEnabledFromBrowserConfig() ? (",
+      "{!fdmLaneActive &&\n      viewport3DAirboxLayerEnabledFromBrowserConfig() ? (",
     );
     expect(modelStack).toContain(
-      "{!fdmLaneActive &&\n      stageVisibility.baseGeometry &&\n      viewport3DTopologyMeshLayerEnabledFromBrowserConfig() ? (",
+      "{!savedViewportActive &&\n      !fdmLaneActive &&\n      viewport3DTopologyMeshLayerEnabledFromBrowserConfig() ? (",
     );
   });
 
@@ -903,6 +910,144 @@ describe("Viewport3DScene scale helpers", () => {
     expect(stageHook).toContain("window.requestAnimationFrame");
     expect(stageHook).toContain("setStageState((current) =>");
     expect(stageHook).not.toContain("startTransition");
+  });
+
+  it("does not change stage key on fdmTargetViews or fdmNativeLayerViews length changes, but does on mesh or scene identity", () => {
+    const baseTopology = {
+      airboxParts: [],
+      magneticParts: [],
+      meshGenerationId: "gen-1",
+      meshRevision: "rev-1",
+      nodeCount: 100,
+    };
+    const basePrimitive = {
+      objects: [{ id: "obj-1" }],
+      sceneRevision: "scene-rev-1",
+    };
+
+    const baseKey = resolveViewport3DModelLayerStageKey({
+      fdmNativeLayerViews: [],
+      fdmTargetViews: [],
+      primitiveModel: basePrimitive as never,
+      topologyModel: baseTopology as never,
+    });
+
+    const keyWithPopulatedViews = resolveViewport3DModelLayerStageKey({
+      fdmNativeLayerViews: [{ target: { id: "native-1" } } as never],
+      fdmTargetViews: [{ target: { id: "target-1" } } as never],
+      primitiveModel: basePrimitive as never,
+      topologyModel: baseTopology as never,
+    });
+
+    expect(keyWithPopulatedViews).toBe(baseKey);
+
+    const keyWithDifferentMeshRevision = resolveViewport3DModelLayerStageKey({
+      primitiveModel: basePrimitive as never,
+      topologyModel: {
+        ...baseTopology,
+        meshRevision: "rev-2",
+      } as never,
+    });
+    expect(keyWithDifferentMeshRevision).not.toBe(baseKey);
+
+    const keyWithDifferentMeshGeneration = resolveViewport3DModelLayerStageKey({
+      primitiveModel: basePrimitive as never,
+      topologyModel: {
+        ...baseTopology,
+        meshGenerationId: "gen-2",
+      } as never,
+    });
+    expect(keyWithDifferentMeshGeneration).not.toBe(baseKey);
+
+    const keyWithDifferentSceneRevision = resolveViewport3DModelLayerStageKey({
+      primitiveModel: {
+        ...basePrimitive,
+        sceneRevision: "scene-rev-2",
+      } as never,
+      topologyModel: baseTopology as never,
+    });
+    expect(keyWithDifferentSceneRevision).not.toBe(baseKey);
+  });
+
+  it("does not drop stage to 0 when identity is constant, and preserves stage when compatible content is present", () => {
+    const initial = {
+      resetKey: "gen-1:rev-1:100:0:0:scene-1:1",
+      stage: 3,
+    };
+
+    const sameKeyTransition = resolveNextViewport3DModelLayerStageState({
+      current: initial,
+      hasCompatibleContent: true,
+      nextResetKey: "gen-1:rev-1:100:0:0:scene-1:1",
+    });
+    expect(sameKeyTransition.didReset).toBe(false);
+    expect(sameKeyTransition.next.stage).toBe(3);
+    expect(sameKeyTransition.next.resetKey).toBe("gen-1:rev-1:100:0:0:scene-1:1");
+
+    const compatibleTransition = resolveNextViewport3DModelLayerStageState({
+      current: initial,
+      hasCompatibleContent: true,
+      nextResetKey: "gen-1:rev-2:100:0:0:scene-1:1",
+    });
+    expect(compatibleTransition.didReset).toBe(false);
+    expect(compatibleTransition.next.stage).toBe(3);
+    expect(compatibleTransition.next.resetKey).toBe("gen-1:rev-2:100:0:0:scene-1:1");
+
+    const incompatibleTransition = resolveNextViewport3DModelLayerStageState({
+      current: initial,
+      hasCompatibleContent: false,
+      nextResetKey: "gen-2:rev-1:200:0:0:scene-1:1",
+    });
+    expect(incompatibleTransition.didReset).toBe(true);
+    expect(incompatibleTransition.next.stage).toBe(0);
+    expect(incompatibleTransition.next.resetKey).toBe("gen-2:rev-1:200:0:0:scene-1:1");
+  });
+
+  it("does not zero fieldVector or colors on layer views during staging and preserves FdmCuboidLayer mounts via group visibility", () => {
+    const source = readFileSync(
+      new URL("./Viewport3DScene.tsx", import.meta.url),
+      "utf8",
+    );
+    const modelStack = source.slice(
+      source.indexOf("function Viewport3DModelLayerStack"),
+      source.indexOf("function RegionOverlayNativePickingLayer"),
+    );
+
+    expect(modelStack).not.toContain("fieldVector: null");
+    expect(modelStack).not.toContain("surfaceColors: null");
+    expect(source).toContain("fdmTargetViews.map((view)");
+    expect(modelStack).toContain("{fdmTargetViews.map((view) => (");
+
+    expect(modelStack).toContain("<group visible={stageVisibility.baseGeometry}>");
+    expect(modelStack).not.toContain("{stageVisibility.baseGeometry &&\n      fdmCuboidLayerEnabled");
+  });
+
+  it("preserves AirboxLayer and TopologyMeshLayer mounts during staging via group visibility (B4 FEM)", () => {
+    const source = readFileSync(
+      new URL("./Viewport3DScene.tsx", import.meta.url),
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+    const modelStack = source.slice(
+      source.indexOf("function Viewport3DModelLayerStack"),
+      source.indexOf("function RegionOverlayNativePickingLayer"),
+    );
+
+    expect(modelStack).not.toContain("stageVisibility.baseGeometry &&\n      viewport3DAirboxLayerEnabledFromBrowserConfig()");
+    expect(modelStack).not.toContain("stageVisibility.baseGeometry &&\n      viewport3DTopologyMeshLayerEnabledFromBrowserConfig()");
+
+    const airboxStart = modelStack.indexOf("<AirboxLayer");
+    const airboxGroupStart = modelStack.lastIndexOf("<group", airboxStart);
+    const airboxGroupEnd = modelStack.indexOf("</group>", airboxStart) + 8;
+    const airboxBlock = modelStack.slice(airboxGroupStart, airboxGroupEnd);
+    expect(airboxBlock).toContain("visible={stageVisibility.baseGeometry}");
+    expect(airboxBlock).toContain("<AirboxLayer");
+
+    const topologyStart = modelStack.indexOf("<TopologyMeshLayer");
+    const topologyGroupStart = modelStack.lastIndexOf("<group", topologyStart);
+    const topologyGroupEnd = modelStack.indexOf("</group>", topologyStart) + 8;
+    const topologyBlock = modelStack.slice(topologyGroupStart, topologyGroupEnd);
+    expect(topologyBlock).toContain("visible={stageVisibility.baseGeometry}");
+    expect(topologyBlock).toContain("<TopologyMeshLayer");
   });
 });
 

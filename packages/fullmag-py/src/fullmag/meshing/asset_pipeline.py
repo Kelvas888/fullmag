@@ -7,7 +7,7 @@ from dataclasses import replace as _dc_replace
 import math
 import tempfile
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 
@@ -41,9 +41,60 @@ from .gmsh_bridge import (
     generate_mesh_from_file,
     generate_shared_domain_mesh_from_components,
 )
+from ._gmsh_swept import (
+    THIN_FILM_SCOPED_LAYER_PARTITION_UNSUPPORTED,
+    THIN_FILM_SCOPED_LAYER_PARTITION_UNSUPPORTED_REASON,
+    _SCOPED_LAYER_PLANE_PROOF_KEY,
+    _coincident_ring_airbox_bounds,
+    _fresh_scoped_layer_plane_attempt_options,
+    _has_component_scoped_size_fields,
+    _is_box_cylinder_ring,
+    _supports_scoped_layer_partitioned_box,
+)
 from ._gmsh_types import FEM_TOPOLOGY_VOLUME_EPS
 from .surface_assets import _geometry_to_trimesh, _import_trimesh, build_surface_preview_payload
 from .voxelization import VoxelMaskData, voxelize_geometry
+
+
+class MeshQualityUnavailableError(ValueError):
+    """Blocking error when topology mutation invalidates an old quality report."""
+
+    def __init__(self, *, context: str, old_element_count: int, new_element_count: int) -> None:
+        self.code = "quality_unavailable_after_topology_mutation"
+        self.pointer = "/quality"
+        self.context = context
+        self.old_element_count = int(old_element_count)
+        self.new_element_count = int(new_element_count)
+        super().__init__(
+            f"{self.code} at {self.pointer}: {context} removed cells after quality "
+            f"extraction ({old_element_count} -> {new_element_count}); recertify quality "
+            "before publishing the mutated mesh"
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a stable quality-failure envelope for API/CI consumers."""
+
+        return {
+            "schema_version": "mesh_quality_failure.v2",
+            "code": self.code,
+            "pointer": self.pointer,
+            "metric_id": "quality",
+            "threshold": None,
+            "observed": None,
+            "comparator": "must_be_recertified",
+            "family": None,
+            "material_region": None,
+            "zone": None,
+            "element_ordinals": [],
+            "policy_fingerprint": None,
+            "topology_fingerprint": None,
+            "evidence_path": None,
+            "details": {
+                "context": self.context,
+                "old_element_count": self.old_element_count,
+                "new_element_count": self.new_element_count,
+            },
+        }
 
 # PR 2: target resolution extracted into _mesh_targets
 from ._mesh_targets import (
@@ -58,10 +109,12 @@ from ._mesh_targets import (
 from ._gmsh_extraction import build_per_domain_quality_from_mesh_arrays
 from .mesh_build_report import _build_mesh_operation_statuses, _build_shared_domain_build_report
 from ._mesh_targets import (
+    _canonicalize_geometry_owner_mapping as _canonicalize_geometry_owner_mapping,
     _coerce_positive_float as _coerce_positive_float,
+    _geometry_owner_alias_index as _geometry_owner_alias_index,
     _geometry_name_aliases as _geometry_name_aliases,
-    _lookup_geometry_name_alias as _lookup_geometry_name_alias,
-    _parse_per_geometry_overrides as _parse_per_geometry_overrides,
+    _resolve_geometry_owner_name as _resolve_geometry_owner_name,
+    _resolve_per_geometry_overrides as _resolve_per_geometry_overrides,
     _resolve_requested_partition_hmaxs as _mesh_targets_resolve_partition_hmaxs,
 )
 
@@ -90,6 +143,38 @@ _SUPPORTED_DOMAIN_MESH_MODES = frozenset(
         _FROZEN_MAGNETIC_SUBMESH_MODE,
     }
 )
+
+
+def _validate_shared_mesh_assembly_policy(
+    assembly_policy: SharedMeshAssemblyPolicy | None,
+) -> SharedMeshAssemblyPolicy:
+    """Validate that an assembly policy has a real shared-domain lowering.
+
+    The public policy record intentionally remains available for round-trip
+    compatibility, but the current generator only realizes its canonical
+    conforming defaults.  Silently accepting a custom factor would make the
+    resulting mesh indistinguishable from a mesh built with another policy.
+    Reject custom values before any geometry import, Gmsh invocation, cache
+    lookup or artifact publication.
+    """
+
+    effective = (
+        SharedMeshAssemblyPolicy()
+        if assembly_policy is None
+        else assembly_policy
+    )
+    if not isinstance(effective, SharedMeshAssemblyPolicy):
+        raise TypeError(
+            "assembly_policy must be a SharedMeshAssemblyPolicy or None"
+        )
+    canonical = SharedMeshAssemblyPolicy()
+    if effective != canonical:
+        raise ValueError(
+            "shared_mesh_assembly_policy_unsupported: non-default assembly "
+            "policy fields have no validated shared-domain lowering; use the "
+            "canonical conforming defaults or omit assembly_policy"
+        )
+    return effective
 
 
 def _is_stl_imported_geometry(geometry: Geometry) -> bool:
@@ -286,6 +371,16 @@ def _extract_frozen_magnetic_submesh(
 
     frozen_mesh = MeshData(
         nodes=np.asarray(shared_mesh.nodes[used_nodes], dtype=np.float64),
+        vertex_identity=(
+            {
+                **shared_mesh.vertex_identity,
+                "vertex_ids": [
+                    shared_mesh.vertex_identity["vertex_ids"][int(index)]
+                    for index in used_nodes
+                ],
+            }
+            if shared_mesh.vertex_identity is not None else None
+        ),
         cell_types=cell_types,
         cell_offsets=cell_offsets,
         cell_nodes=cell_nodes,
@@ -761,6 +856,40 @@ def _validate_declared_mesh_operations(
         )
 
 
+def _validate_per_object_recipe_operations(
+    per_object_recipes: Mapping[str, PerObjectMeshRecipe] | None,
+) -> None:
+    """Reject operation sequences authored directly on object recipes."""
+    if not isinstance(per_object_recipes, Mapping):
+        return
+
+    for geometry_name, recipe in per_object_recipes.items():
+        operations = getattr(recipe, "operations", None)
+        if operations is None:
+            continue
+        if not isinstance(operations, list):
+            raise ValueError(
+                "mesh operation executor unavailable: operations for scope "
+                f"{geometry_name!r} must be a list"
+            )
+        for index, operation in enumerate(operations):
+            kind = (
+                operation.get("kind")
+                if isinstance(operation, Mapping)
+                else getattr(operation, "kind", None)
+            )
+            if not isinstance(kind, str) or not kind.strip():
+                raise ValueError(
+                    "mesh operation executor unavailable: operation kind for "
+                    f"scope {geometry_name!r}[{index}] must be a non-empty string"
+                )
+            raise ValueError(
+                "mesh operation executor unavailable: "
+                f"kind={kind.strip()!r} scope={str(geometry_name).strip()!r}; "
+                "shared-domain realization has no validated executor for authored operations"
+            )
+
+
 def _frozen_magnetic_submesh_air_mesh_source(
     mesh_workflow: Mapping[str, object] | None,
 ) -> str | None:
@@ -881,6 +1010,15 @@ def _drop_degenerate_tetrahedra(
     keep = keep_tetrahedra
     if removed == mesh.n_elements:
         raise ValueError(f"{context} produced only degenerate tetrahedra")
+    # A topology mutation invalidates every element-indexed quality summary.
+    # Never publish a report that still describes the pre-cleanup connectivity;
+    # the caller must recertify the cleaned mesh before exposing it.
+    if mesh.quality is not None or mesh.per_domain_quality:
+        raise MeshQualityUnavailableError(
+            context=context,
+            old_element_count=mesh.n_elements,
+            new_element_count=mesh.n_elements - removed,
+        )
     marker = "shared_domain_degenerate_tetra_cleanup"
     if marker not in fallbacks_triggered:
         fallbacks_triggered.append(marker)
@@ -890,13 +1028,14 @@ def _drop_degenerate_tetrahedra(
     boundary_faces, boundary_markers = _boundary_faces_for_kept_elements(mesh, keep)
     return MeshData.from_legacy_tet4(
         nodes=mesh.nodes,
+        vertex_identity=mesh.vertex_identity,
         elements=mesh.elements[keep],
         element_markers=mesh.element_markers[keep],
         boundary_faces=boundary_faces,
         boundary_markers=boundary_markers,
         periodic_boundary_pairs=mesh.periodic_boundary_pairs,
         periodic_node_pairs=mesh.periodic_node_pairs,
-        quality=mesh.quality,
+        quality=None,
         per_domain_quality=None,
     )
 
@@ -943,13 +1082,92 @@ def _execution_mesh_volume_epsilon(mesh: MeshData) -> float:
     The native validator scales its absolute tetra-volume threshold from the
     largest domain span.  Running the same check before publishing a Python
     generated mesh keeps OCC retry decisions consistent with execution-time
-    validation instead of accepting a locally non-degenerate sliver.
+    validation instead of accepting a locally non-degenerate sliver.  The
+    legacy Rust ``MeshTopology`` builder also rejects determinants at or below
+    its absolute ``1e-30`` zero threshold.  Include that floor here as a
+    volume so a conformal OCC attempt cannot reach the builder with a sliver
+    that passed the global airbox-scaled check.
     """
     if mesh.nodes.size == 0:
         return 1.0e-18
     bbox_scale = float(np.max(np.ptp(mesh.nodes, axis=0)))
     scale = bbox_scale if bbox_scale > 0.0 else 1.0
-    return max(np.finfo(np.float64).tiny, scale**3 * 1.0e-18)
+    rust_engine_volume_floor = 1.0e-30 / 6.0
+    return max(
+        np.finfo(np.float64).tiny,
+        scale**3 * 1.0e-18,
+        rust_engine_volume_floor,
+    )
+
+
+_MESH_FAILURE_CONTEXT_LIMIT = 1200
+
+
+def _bounded_mesh_exception_summary(label: str, exc: Exception) -> str:
+    try:
+        message = str(exc).strip()
+    except Exception as formatting_error:  # pragma: no cover - defensive diagnostic path
+        message = f"<message unavailable: {type(formatting_error).__name__}>"
+    summary = f"{label}: {type(exc).__name__}: {message}"
+    if len(summary) > _MESH_FAILURE_CONTEXT_LIMIT:
+        summary = summary[: _MESH_FAILURE_CONTEXT_LIMIT - 3] + "..."
+    return summary
+
+
+def _retain_mesh_fallback_failures(
+    final_error: Exception,
+    *,
+    primary_error: Exception,
+    component_fallback_error: Exception | None,
+) -> None:
+    """Attach bounded earlier failure evidence without replacing the final error."""
+    failures = [
+        _bounded_mesh_exception_summary("primary mesh/quality failure", primary_error)
+    ]
+    if component_fallback_error is not None:
+        failures.append(
+            _bounded_mesh_exception_summary(
+                "component-aware STL fallback failure",
+                component_fallback_error,
+            )
+        )
+
+    add_note = getattr(final_error, "add_note", None)
+    if callable(add_note):
+        for failure in failures:
+            add_note(failure)
+        return
+
+    # Python 3.10 needs an explicit carrier: OSError formats errno/strerror/
+    # filename independently of args, which must retain their structured form.
+    final_error._fullmag_mesh_fallback_notes = tuple(failures)
+    if not isinstance(final_error, OSError):
+        original_message = str(final_error)
+        final_error.args = (original_message + "\n" + "\n".join(failures),)
+
+
+def _mesh_build_failure_text(exc: Exception) -> str:
+    """Return the existing error text plus bounded notes for failure events."""
+    message = str(exc)
+    notes = getattr(exc, "__notes__", ())
+    if not notes:
+        notes = getattr(exc, "_fullmag_mesh_fallback_notes", ())
+    if not isinstance(notes, (list, tuple)):
+        return message
+    context_prefixes = (
+        "primary mesh/quality failure:",
+        "component-aware STL fallback failure:",
+    )
+    rendered_notes = [
+        str(note)[:_MESH_FAILURE_CONTEXT_LIMIT]
+        for note in notes
+        if isinstance(note, str)
+        and note.startswith(context_prefixes)
+        and note not in message
+    ][-2:]
+    if not rendered_notes:
+        return message
+    return message + "\n" + "\n".join(rendered_notes)
 
 
 def _conformal_occ_algorithm_name(algorithm_3d: int) -> str:
@@ -973,15 +1191,33 @@ def _surface_trimesh_kwargs_for_geometry(
     geometry: Geometry,
     base_kwargs: Mapping[str, object],
     mesh_workflow: Mapping[str, object] | None,
+    *,
+    owner_geometry_names: Sequence[str] | None = None,
 ) -> dict[str, object]:
     kwargs = dict(base_kwargs)
-    per_geometry = (
+    owner_names, alias_candidates, current_geometries = _geometry_owner_alias_index(
+        [geometry],
+        owner_geometry_names,
+    )
+    geometry_owner = _resolve_geometry_owner_name(
+        geometry.geometry_name,
+        owner_names=owner_names,
+        alias_candidates=alias_candidates,
+    )
+    if geometry_owner is None or geometry_owner not in current_geometries:
+        raise ValueError(
+            "mesh_geometry_owner_binding_missing: "
+            f"current geometry='{geometry.geometry_name}' has no owner"
+        )
+    overrides = _resolve_per_geometry_overrides(
         mesh_workflow.get("per_geometry")
         if isinstance(mesh_workflow, Mapping)
-        else None
+        else None,
+        geometries=[geometry],
+        owner_geometry_names=owner_geometry_names,
+        missing_error_code="mesh_geometry_owner_binding_missing",
     )
-    overrides = _parse_per_geometry_overrides(per_geometry)
-    entry = _lookup_geometry_name_alias(overrides, geometry.geometry_name)
+    entry = overrides.get(geometry_owner)
     if isinstance(entry, Mapping):
         surface_hmax = _coerce_positive_float(
             entry.get("surface_maximum_element_size")
@@ -1060,6 +1296,8 @@ def realize_fem_mesh_asset(
     study_universe: Mapping[str, object] | None = None,
     mesh_workflow: Mapping[str, object] | None = None,
     per_object_recipes: dict[str, PerObjectMeshRecipe] | None = None,
+    _owner_geometry_names: Sequence[str] | None = None,
+    object_id: str | None = None,
 ) -> MeshData:
     """Resolve a FEM mesh asset from either a prebuilt mesh or geometry source.
 
@@ -1067,17 +1305,29 @@ def realize_fem_mesh_asset(
     :func:`resolve_object_preview_target` which implements the standard
     precedence chain: recipe > per_geometry > default_mesh > FEM.
     """
-    _ = study_universe  # reserved for future airbox-aware preview
+    if study_universe is not None:
+        # This API is the standalone object/surface preview path.  Accepting a
+        # declared universe here would silently drop the airbox and produce a
+        # mesh with a misleading solver-ready name.  The shared-domain entry
+        # point is the only route allowed to consume study-universe metadata.
+        raise ValueError(
+            "fem_mesh_preview_ignores_study_universe: use "
+            "realize_fem_domain_mesh_asset_from_components for a solver mesh "
+            "with an airbox/study universe"
+        )
+    _validate_per_object_recipe_operations(per_object_recipes)
 
     target = resolve_object_preview_target(
         geometry, hints,
         mesh_workflow=mesh_workflow,
         per_object_recipes=per_object_recipes,
+        owner_geometry_names=_owner_geometry_names,
     )
     mesh_options = _mesh_options_from_runtime_metadata(
         mesh_workflow,
         geometries=[geometry],
         default_hmax=target.hmax,
+        owner_geometry_names=_owner_geometry_names,
         per_object_recipes=per_object_recipes,
     )
 
@@ -1127,6 +1377,7 @@ def realize_fem_mesh_asset(
             hmax=target.hmax,
             order=target.order,
             options=mesh_options,
+            object_id=object_id,
         )
 
     if mesh.n_elements == 0:
@@ -1334,6 +1585,14 @@ def _study_universe_airbox_options(
     airbox_hmin = study_universe.get("airbox_hmin")
     resolved_airbox_hmin = float(airbox_hmin) if airbox_hmin is not None else None
     resolved_airbox_growth_rate = _coerce_positive_float(study_universe.get("airbox_growth_rate"))
+    if (
+        resolved_airbox_growth_rate is not None
+        and resolved_airbox_growth_rate <= 1.0
+    ):
+        raise ValueError(
+            "study_universe.airbox_growth_rate must be greater than 1.0; "
+            "use null to disable explicit grading"
+        )
     raw_airbox_grading = study_universe.get("airbox_grading")
     resolved_airbox_grading: str | None = None
     if isinstance(raw_airbox_grading, str) and raw_airbox_grading.strip():
@@ -1441,9 +1700,8 @@ def _rectangular_airbox_bounds_from_options(
     )
 
 
-# _coerce_positive_float, _parse_per_geometry_overrides,
-# _geometry_name_aliases, _lookup_geometry_name_alias are now imported
-# from _mesh_targets (see top-of-file imports).
+# Numeric coercion and canonical geometry-owner resolution are imported from
+# _mesh_targets (see top-of-file imports).
 
 # _shared_domain_local_size_fields, _build_field_stack and layer builders,
 # _resolve_per_object_mesh_options, _mesh_options_from_runtime_metadata
@@ -1536,6 +1794,22 @@ def _bounds_intersection_volume(
     return float(np.prod(overlap))
 
 
+class ComponentIdentityResolutionError(ValueError):
+    """Fail-closed component/marker identity mapping error.
+
+    Concatenated STL fallback has no authoritative Gmsh volume tags.  A bbox
+    match is therefore allowed only when the best overlap is unique and
+    positive; silently breaking ties can assign material parameters to the
+    wrong object.
+    """
+
+    code = "component_identity_ambiguous"
+
+    def __init__(self, message: str, *, geometry_names: tuple[str, ...] = ()) -> None:
+        self.geometry_names = geometry_names
+        super().__init__(f"{self.code} at /mesh/component_identity: {message}")
+
+
 def _element_bounds_for_marker(
     mesh: MeshData,
     marker: int,
@@ -1590,10 +1864,7 @@ def _match_geometry_bounds_to_source_markers(
     marker_mapping: dict[str, int] = {}
     for marker in magnetic_markers:
         source_min, source_max = source_bounds_by_marker[marker]
-        source_center = _bounds_center(source_min, source_max)
-        best_name: str | None = None
-        best_intersection = -1.0
-        best_distance = math.inf
+        scored: list[tuple[float, str]] = []
         for geometry_name in unmatched_geometry_names:
             geometry_min, geometry_max = geometry_bounds_by_name[geometry_name]
             intersection = _bounds_intersection_volume(
@@ -1602,16 +1873,22 @@ def _match_geometry_bounds_to_source_markers(
                 geometry_min,
                 geometry_max,
             )
-            geometry_center = _bounds_center(geometry_min, geometry_max)
-            distance = float(np.linalg.norm(source_center - geometry_center))
-            if intersection > best_intersection + 1e-30 or (
-                math.isclose(intersection, best_intersection) and distance < best_distance
-            ):
-                best_name = geometry_name
-                best_intersection = intersection
-                best_distance = distance
-        if best_name is None:
-            return None
+            scored.append((float(intersection), geometry_name))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        if not scored or scored[0][0] <= 0.0:
+            raise ComponentIdentityResolutionError(
+                f"source marker {marker} has no positive bbox overlap with remaining geometries",
+                geometry_names=tuple(sorted(unmatched_geometry_names)),
+            )
+        if len(scored) > 1 and math.isclose(
+            scored[0][0], scored[1][0], rel_tol=1.0e-12, abs_tol=1.0e-300
+        ):
+            raise ComponentIdentityResolutionError(
+                f"source marker {marker} has an ambiguous bbox-overlap tie between "
+                f"{scored[0][1]!r} and {scored[1][1]!r}",
+                geometry_names=(scored[0][1], scored[1][1]),
+            )
+        best_name = scored[0][1]
         marker_mapping[best_name] = marker
         unmatched_geometry_names.remove(best_name)
 
@@ -2114,45 +2391,6 @@ def _assert_frozen_magnetic_submesh_invariants(
         compare(expected[key], candidate[key], key)
 
 
-def _strip_overridden_geometry_fields(
-    existing_fields: list[dict[str, object]],
-    per_object_recipes: dict[str, PerObjectMeshRecipe],
-) -> list[dict[str, object]]:
-    """Remove runtime workflow size fields for geometries overridden by recipes.
-
-    This ensures that when a recipe specifies a *coarser* hmax than the workflow,
-    the finer workflow field is removed so Gmsh's ``Min`` background-field rule
-    doesn't silently clamp the coarser recipe back to the workflow value.
-    """
-    overridden_names: set[str] = set()
-    for geometry_name, recipe in per_object_recipes.items():
-        recipe_hmax = recipe.to_ir().get("hmax")
-        if isinstance(recipe_hmax, (int, float)) and float(recipe_hmax) > 0.0:
-            overridden_names.add(geometry_name.strip())
-            if geometry_name.strip().endswith("_geom") and len(geometry_name.strip()) > len("_geom"):
-                overridden_names.add(geometry_name.strip()[: -len("_geom")])
-            else:
-                overridden_names.add(f"{geometry_name.strip()}_geom")
-    if not overridden_names:
-        return existing_fields
-
-    def _is_overridden(field: dict[str, object]) -> bool:
-        params = field.get("params")
-        if not isinstance(params, dict):
-            return False
-        geom_name = params.get("GeometryName")
-        if isinstance(geom_name, str) and geom_name in overridden_names:
-            return True
-        # For Box / BoundsSurfaceThreshold fields we can't match by geometry name
-        # directly — they don't carry one. We leave them; recipe fields prepended
-        # with smaller VIn will still win via Min. Only component-aware fields
-        # (ComponentVolumeConstant, InterfaceShellThreshold, TransitionShellThreshold)
-        # are reliably matchable.
-        return False
-
-    return [f for f in existing_fields if not _is_overridden(f)]
-
-
 def realize_fem_domain_mesh_asset(
     geometries: list[Geometry],
     hints: FEM,
@@ -2300,7 +2538,11 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
     """
     if not geometries:
         raise ValueError("shared FEM domain mesh requires at least one geometry")
+    # Do this before study-universe resolution or any cache/Gmsh work.  A
+    # non-default policy is not silently downgraded to the canonical builder.
+    assembly_policy = _validate_shared_mesh_assembly_policy(assembly_policy)
     _validate_declared_mesh_operations(mesh_workflow)
+    _validate_per_object_recipe_operations(per_object_recipes)
     frozen_payload = _validate_domain_mesh_workflow(mesh_workflow)
 
     airbox = _study_universe_airbox_options(geometries, study_universe)
@@ -2355,6 +2597,7 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
             mesh_workflow=mesh_workflow,
             per_object_recipes=per_object_recipes,
             size_fields=list(mesh_options.size_fields),
+            lower_bound_fields=list(mesh_options.lower_bound_fields),
             region_markers=region_markers,
             build_mode="frozen_magnetic_submesh_merge",
             fallbacks_triggered=[],
@@ -2368,7 +2611,7 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                 "n_nodes": merged_mesh.n_nodes,
                 "n_elements": merged_mesh.n_elements,
                 "n_boundary_faces": merged_mesh.n_boundary_faces,
-                "mesh_statistics": merged_mesh.to_ir("shared_domain").get("mesh_statistics"),
+                "mesh_statistics": merged_mesh.statistics_ir("shared_domain"),
                 **{k: v for k, v in report.to_dict().items() if k != "build_mode"},
                 "message": "Frozen magnetic submesh and air mesh merge finished",
             }
@@ -2389,6 +2632,15 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
         default_hmax=float(hints.hmax),
         bounds_by_name=None,
         include_size_fields=False,
+    )
+    # Reject the unsupported mixed-periodic combination at the planner
+    # boundary, before OCC/STL preparation or any Gmsh invocation.  This keeps
+    # the DSL/UI contract aligned with the typed and native validators.
+    from ._gmsh_types import validate_periodic_mesh_options
+
+    validate_periodic_mesh_options(
+        surface_mesh_options,
+        context="shared-domain mesh planner",
     )
     qualified_mixed_body_hmax: float | None = None
     if surface_mesh_options.mesh_strategy == "swept_prism":
@@ -2450,7 +2702,25 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
         and airbox is not None
         and surface_mesh_options.mesh_strategy == "swept_prism"
     )
-    single_geometry_occ_direct = mixed_shared_geo_direct
+    ring_shared_geo_direct = (
+        len(geometries) == 1
+        and _is_box_cylinder_ring(geometries[0])
+        and airbox is not None
+        and surface_mesh_options.mesh_strategy
+        in {"thin_film_tetrahedral", "swept_prism"}
+        and not per_object_recipes
+        and not object_regions
+    )
+    box_layered_geo_direct = (
+        len(geometries) == 1 and isinstance(geometries[0], Box)
+        and airbox is not None
+        and surface_mesh_options.mesh_strategy == "thin_film_tetrahedral"
+        and not per_object_recipes and not object_regions
+        # Layered GEO has no lateral transition shell. Use the same bounds
+        # admission as its generator before excluding the generic OCC route.
+        and _coincident_ring_airbox_bounds(geometries[0], airbox) is not None
+    )
+    single_geometry_occ_direct = mixed_shared_geo_direct or ring_shared_geo_direct or box_layered_geo_direct
     if (
         isinstance(mesh_workflow, Mapping)
         and bool(mesh_workflow.get("single_geometry_occ_direct")) is True
@@ -2500,6 +2770,9 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                         geometry,
                         surface_trimesh_kwargs,
                         mesh_workflow,
+                        owner_geometry_names=tuple(
+                            candidate.geometry_name for candidate in geometries
+                        ),
                     ),
                 )
                 comp_mesh = _sanitize_surface_mesh_for_stl_export(comp_mesh)
@@ -2574,10 +2847,40 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                 component_aware=component_aware_mesh_options,
             )
             if recipe_fields:
-                existing = _strip_overridden_geometry_fields(
-                    list(mesh_options.size_fields), per_object_recipes
+                mesh_options = _dc_replace(
+                    mesh_options,
+                    size_fields=recipe_fields + list(mesh_options.size_fields),
                 )
-                mesh_options = _dc_replace(mesh_options, size_fields=recipe_fields + existing)
+        mesh_options = _fresh_scoped_layer_plane_attempt_options(mesh_options)
+        scoped_layer_partitioned_geo = False
+        scoped_thin_film_box = (
+            len(geometries) == 1
+            and isinstance(geometries[0], Box)
+            and mesh_options.mesh_strategy == "thin_film_tetrahedral"
+            and airbox is not None
+            and _has_component_scoped_size_fields(mesh_options)
+        )
+        scoped_ring_layers = (
+            ring_shared_geo_direct
+            and _has_component_scoped_size_fields(mesh_options)
+            and _supports_scoped_layer_partitioned_box(
+                geometries[0],
+                airbox=airbox,
+            )
+        )
+        if scoped_thin_film_box or scoped_ring_layers:
+            if not _supports_scoped_layer_partitioned_box(
+                geometries[0],
+                airbox=airbox,
+            ):
+                raise ValueError(
+                    f"{THIN_FILM_SCOPED_LAYER_PARTITION_UNSUPPORTED}: "
+                    f"{THIN_FILM_SCOPED_LAYER_PARTITION_UNSUPPORTED_REASON}"
+                )
+            scoped_layer_partitioned_geo = True
+            if scoped_thin_film_box:
+                box_layered_geo_direct = True
+            single_geometry_occ_direct = True
         effective_airbox_target, effective_per_object_targets = _resolve_effective_shared_domain_targets(
             geometries,
             hints,
@@ -2588,6 +2891,10 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
         used_size_field_kinds = _unique_size_field_kinds(list(mesh_options.size_fields))
         if mixed_shared_geo_direct:
             planned_build_mode = "single_geometry_geo_mixed"
+        elif ring_shared_geo_direct:
+            planned_build_mode = "single_geometry_geo_ring"
+        elif box_layered_geo_direct:
+            planned_build_mode = "single_geometry_geo_layered_box"
         elif single_geometry_occ_direct:
             planned_build_mode = "single_geometry_occ"
         elif conformal_occ_direct:
@@ -2620,8 +2927,12 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
         )
         result: SharedDomainMeshResult | None = None
         build_mode = "component_aware"
+        fallback_failure_context: tuple[Exception, Exception | None] | None = None
 
         def _emit_mesh_build_failed(exc: Exception) -> None:
+            for descriptor in [*mesh_options.size_fields, *mesh_options.lower_bound_fields]:
+                if isinstance(descriptor, dict):
+                    descriptor.pop(_SCOPED_LAYER_PLANE_PROOF_KEY, None)
             payload: dict[str, object] = {
                 "kind": "mesh_build_failed",
                 "phase": latest_mesh_phase,
@@ -2645,10 +2956,10 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                         mesh_workflow=mesh_workflow,
                     )
                 ],
-                "error": str(exc),
+                "error": _mesh_build_failure_text(exc),
                 "message": "Shared-domain mesh build failed",
             }
-            if mixed_shared_geo_direct:
+            if mixed_shared_geo_direct or ring_shared_geo_direct or box_layered_geo_direct:
                 payload["mixed_layer_topology_rejection"] = {
                     "schema_version": "mixed_layer_topology_rejection.v1",
                     "certificate_status": "rejected",
@@ -2679,13 +2990,52 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                 else float(hints.hmax)
             )
             if (
-                not mixed_shared_geo_direct
+                len(geometries) == 1
+                and (box_layered_geo_direct or ring_shared_geo_direct)
+            ):
+                # Exact-layer Box/ring generation also uses hmax as its body
+                # upper field. Resolve it from the same owner target recorded
+                # in the build report; FEM.hmax is only the fallback. A whole-
+                # owner ComponentVolumeConstant can additionally raise that
+                # target when the manual field program is the owner policy.
+                geometry = geometries[0]
+                resolved_target = effective_per_object_targets.get(
+                    geometry.geometry_name, {}
+                )
+                resolved_body_hmax = _coerce_positive_float(
+                    resolved_target.get("hmax")
+                    if isinstance(resolved_target, Mapping)
+                    else None
+                )
+                owner_hmax_candidates = [
+                    resolved_body_hmax
+                    if resolved_body_hmax is not None
+                    else float(hints.hmax)
+                ]
+                owner_aliases = set(_geometry_name_aliases(geometry.geometry_name))
+                for field in mesh_options.size_fields:
+                    if not isinstance(field, Mapping):
+                        continue
+                    if field.get("kind") != "ComponentVolumeConstant":
+                        continue
+                    params = field.get("params")
+                    if not isinstance(params, Mapping):
+                        continue
+                    owner = params.get("GeometryName")
+                    if not isinstance(owner, str) or owner.strip() not in owner_aliases:
+                        continue
+                    owner_field_hmax = _coerce_positive_float(params.get("VIn"))
+                    if owner_field_hmax is not None:
+                        owner_hmax_candidates.append(owner_field_hmax)
+                effective_hmax = max(owner_hmax_candidates)
+            if (
+                not (mixed_shared_geo_direct or ring_shared_geo_direct or box_layered_geo_direct)
                 and airbox is not None
                 and airbox.maximum_element_size is not None
                 and float(airbox.maximum_element_size) > effective_hmax
             ):
                 effective_hmax = float(airbox.maximum_element_size)
-            if not mixed_shared_geo_direct:
+            if not (mixed_shared_geo_direct or ring_shared_geo_direct or box_layered_geo_direct):
                 for field in mesh_options.size_fields:
                     vin = field.get("params", {}).get("VIn") if isinstance(field.get("params"), dict) else None
                     if isinstance(vin, (int, float)) and float(vin) > effective_hmax:
@@ -2696,7 +3046,11 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                 build_mode = (
                     "single_geometry_geo_mixed"
                     if mixed_shared_geo_direct
-                    else "single_geometry_occ"
+                    else (
+                        "single_geometry_geo_ring"
+                        if ring_shared_geo_direct
+                        else ("single_geometry_geo_layered_box" if box_layered_geo_direct else "single_geometry_occ")
+                    )
                 )
                 emit_progress_event(
                     {
@@ -2705,14 +3059,46 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                         "message": (
                             "Generating shared-GEO prism/pyramid/tetrahedron mesh"
                             if mixed_shared_geo_direct
-                            else "Generating direct OCC 3D tetrahedral mesh"
+                            else (
+                                (
+                                    "Generating shared-GEO layer-partitioned ring tetrahedral mesh"
+                                    if scoped_ring_layers
+                                    else "Generating shared-GEO ring tetrahedral mesh"
+                                )
+                                if ring_shared_geo_direct
+                                else (
+                                    "Generating shared-GEO layer-partitioned tetrahedral Box mesh"
+                                    if scoped_layer_partitioned_geo
+                                    else (
+                                        "Generating shared-GEO layered Box tetrahedral mesh"
+                                        if box_layered_geo_direct
+                                        else "Generating direct OCC 3D tetrahedral mesh"
+                                    )
+                                )
+                            )
                         ),
                     }
                 )
                 emit_progress(
                     "Single-geometry shared-GEO mixed mesh path selected"
                     if mixed_shared_geo_direct
-                    else "Single-geometry OCC mesh path selected (skipping STL component import)"
+                    else (
+                        (
+                            "Single-geometry shared-GEO layer-partitioned ring mesh path selected"
+                            if scoped_ring_layers
+                            else "Single-geometry shared-GEO ring mesh path selected"
+                        )
+                        if ring_shared_geo_direct
+                        else (
+                            "Single-geometry shared-GEO layer-partitioned Box mesh path selected"
+                            if scoped_layer_partitioned_geo
+                            else (
+                                "Single-geometry layered Box mesh path selected"
+                                if box_layered_geo_direct
+                                else "Single-geometry OCC mesh path selected (skipping STL component import)"
+                            )
+                        )
+                    )
                 )
                 mesh = generate_mesh(
                     geometries[0],
@@ -2778,6 +3164,8 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                                 result.mesh.validate_strict(
                                     require_positive_orientation=True,
                                     eps_volume=_execution_mesh_volume_epsilon(result.mesh),
+                                    # OCC returns MeshData coordinates in SI metres.
+                                    _evidence_coordinate_scale_to_m=1.0,
                                 )
                                 emit_progress_event(
                                     {
@@ -2886,6 +3274,8 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                 except Exception as primary_exc:
                     if conformal_object_regions:
                         raise
+                    initial_primary_error = primary_exc
+                    component_fallback_error: Exception | None = None
                     # If conformal OCC failed, fall back safely to component-aware STL mesh
                     if build_mode == "conformal_occ":
                         build_mode = "component_aware"
@@ -2909,9 +3299,14 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                             )
                             primary_exc = None  # successfully recovered!
                         except Exception as stl_exc:
+                            component_fallback_error = stl_exc
                             primary_exc = stl_exc
 
                     if primary_exc is not None:
+                        fallback_failure_context = (
+                            initial_primary_error,
+                            component_fallback_error,
+                        )
                         build_mode = "concatenated_stl_fallback"
                         if _PREEMPTIVE_IMPORTED_STL_FALLBACK in fallbacks_triggered:
                             emit_progress(
@@ -2949,11 +3344,9 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                                 component_aware=False,
                             )
                             if recipe_fields:
-                                existing = _strip_overridden_geometry_fields(
-                                    list(mesh_options.size_fields), per_object_recipes
-                                )
                                 mesh_options = _dc_replace(
-                                    mesh_options, size_fields=recipe_fields + existing
+                                    mesh_options,
+                                    size_fields=recipe_fields + list(mesh_options.size_fields),
                                 )
                         used_size_field_kinds = _unique_size_field_kinds(list(mesh_options.size_fields))
                         if mesh_options.size_fields:
@@ -2970,6 +3363,10 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                                         g,
                                         surface_trimesh_kwargs,
                                         mesh_workflow,
+                                        owner_geometry_names=tuple(
+                                            candidate.geometry_name
+                                            for candidate in geometries
+                                        ),
                                     ),
                                 )
                             )
@@ -2981,14 +3378,33 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                         surface_path = Path(tmp_dir) / "shared_domain_surface.stl"
                         combined_surface.export(surface_path)
                         from .gmsh_bridge import generate_mesh_from_file
+                        fallback_geometry_binding = (
+                            {"geometry_name": geometries[0].geometry_name}
+                            if len(geometries) == 1
+                            else {}
+                        )
                         mesh = generate_mesh_from_file(
                             surface_path,
                             hmax=effective_hmax,
                             order=hints.order,
                             airbox=airbox,
                             options=mesh_options,
+                            **fallback_geometry_binding,
                         )
+                        fallback_failure_context = None
         except Exception as exc:
+            if fallback_failure_context is not None:
+                primary_error, component_fallback_error = fallback_failure_context
+                _retain_mesh_fallback_failures(
+                    exc,
+                    primary_error=primary_error,
+                    component_fallback_error=component_fallback_error,
+                )
+                cause = component_fallback_error or primary_error
+                _emit_mesh_build_failed(exc)
+                if cause is not exc:
+                    raise exc from cause
+                raise
             _emit_mesh_build_failed(exc)
             raise
 
@@ -3002,7 +3418,7 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
             }
         )
         if (
-            build_mode != "conformal_occ"
+            build_mode not in {"conformal_occ", "single_geometry_geo_ring"}
             and getattr(mesh, "mixed_layer_topology_certificate", None) is None
         ):
             mesh = _drop_degenerate_tetrahedra(
@@ -3087,41 +3503,50 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                 )
 
         tet4_only = bool(np.all(mesh.cell_types == "tet4"))
-        classified_mesh = MeshData(
-            nodes=mesh.nodes,
-            cell_types=mesh.cell_types,
-            cell_offsets=mesh.cell_offsets,
-            cell_nodes=mesh.cell_nodes,
-            element_markers=assigned_markers,
-            facet_types=mesh.facet_types,
-            facet_roles=mesh.facet_roles,
-            facet_offsets=mesh.facet_offsets,
-            facet_nodes=mesh.facet_nodes,
-            boundary_markers=mesh.boundary_markers,
-            cell_global_ordinals=mesh.cell_global_ordinals,
-            facet_global_ordinals=mesh.facet_global_ordinals,
-            cell_mesh_parts=mesh.cell_mesh_parts,
-            periodic_boundary_pairs=mesh.periodic_boundary_pairs,
-            periodic_node_pairs=mesh.periodic_node_pairs,
-            periodic_mesh_certificate=mesh.periodic_mesh_certificate,
-            quality=mesh.quality,
-            per_domain_quality=(
-                build_per_domain_quality_from_mesh_arrays(
-                    mesh.nodes,
-                    mesh.elements,
-                    assigned_markers,
-                    mesh.quality,
-                )
-                if tet4_only
-                else None
-            ) or mesh.per_domain_quality,
-            realization_report=mesh.realization_report,
-            mixed_layer_topology_certificate=(
-                mesh.mixed_layer_topology_certificate
-                if np.array_equal(assigned_markers, mesh.element_markers)
-                else None
-            ),
-        )
+        markers_unchanged = np.array_equal(assigned_markers, mesh.element_markers)
+        if markers_unchanged and not tet4_only:
+            # The canonical mixed shared-domain route already carries the
+            # complete certificate on this exact MeshData.  Classification
+            # only re-discovers the existing 0/1 partition, so constructing a
+            # second object would repeat native certification and CSR setup.
+            classified_mesh = mesh
+        else:
+            classified_mesh = MeshData(
+                nodes=mesh.nodes,
+                vertex_identity=mesh.vertex_identity,
+                cell_types=mesh.cell_types,
+                cell_offsets=mesh.cell_offsets,
+                cell_nodes=mesh.cell_nodes,
+                element_markers=assigned_markers,
+                facet_types=mesh.facet_types,
+                facet_roles=mesh.facet_roles,
+                facet_offsets=mesh.facet_offsets,
+                facet_nodes=mesh.facet_nodes,
+                boundary_markers=mesh.boundary_markers,
+                cell_global_ordinals=mesh.cell_global_ordinals,
+                facet_global_ordinals=mesh.facet_global_ordinals,
+                cell_mesh_parts=mesh.cell_mesh_parts,
+                periodic_boundary_pairs=mesh.periodic_boundary_pairs,
+                periodic_node_pairs=mesh.periodic_node_pairs,
+                periodic_mesh_certificate=mesh.periodic_mesh_certificate,
+                quality=mesh.quality,
+                per_domain_quality=(
+                    build_per_domain_quality_from_mesh_arrays(
+                        mesh.nodes,
+                        mesh.elements,
+                        assigned_markers,
+                        mesh.quality,
+                    )
+                    if tet4_only
+                    else None
+                ) or mesh.per_domain_quality,
+                realization_report=mesh.realization_report,
+                mixed_layer_topology_certificate=(
+                    mesh.mixed_layer_topology_certificate
+                    if markers_unchanged
+                    else None
+                ),
+            )
         requested_airbox_hmax, requested_hmax_by_geometry = _resolve_requested_partition_hmaxs(
             geometries, hints, airbox=airbox, mesh_workflow=mesh_workflow,
             per_object_recipes=per_object_recipes,
@@ -3142,6 +3567,7 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
             mesh_workflow=mesh_workflow,
             per_object_recipes=per_object_recipes,
             size_fields=list(mesh_options.size_fields),
+            lower_bound_fields=list(mesh_options.lower_bound_fields),
             region_markers=region_markers,
             build_mode=build_mode,
             fallbacks_triggered=fallbacks_triggered,
@@ -3149,6 +3575,15 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
             selector_resolution=result.selector_resolution if result is not None else [],
             boundary_layer_result=result.boundary_layer_result if result is not None else None,
             orphan_entities=result.orphan_entities if result is not None else [],
+            algorithm_3d_requested=(
+                result.algorithm_3d_requested if result is not None else None
+            ),
+            algorithm_3d_effective=(
+                result.algorithm_3d_effective if result is not None else None
+            ),
+            algorithm_3d_fallback_reason=(
+                result.algorithm_3d_fallback_reason if result is not None else None
+            ),
             magnetic_submesh_signatures=magnetic_submesh_signatures,
         )
         if classified_mesh.mixed_layer_topology_certificate is not None:
@@ -3178,7 +3613,7 @@ def _realize_fem_domain_mesh_asset_from_components_impl(
                 "n_nodes": classified_mesh.n_nodes,
                 "n_elements": classified_mesh.n_elements,
                 "n_boundary_faces": classified_mesh.n_boundary_faces,
-                "mesh_statistics": classified_mesh.to_ir("shared_domain").get("mesh_statistics"),
+                "mesh_statistics": classified_mesh.statistics_ir("shared_domain"),
                 **{k: v for k, v in report.to_dict().items() if k != "build_mode"},
                 "message": "Shared-domain mesh build finished",
             }

@@ -4,6 +4,10 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import type { MeshSharedDomainManifestResource } from "@/kernel/api/apiTypes";
+import {
+  geometryDraftLengthValuesEqual,
+  resolveCommittedGeometryObjectDraft,
+} from "@/kernel/authoring/object-edit/objectEditDraftModel";
 import type { Selection } from "@/kernel/selection/selectionTypes";
 
 import {
@@ -11,6 +15,7 @@ import {
   buildViewport3DPrimitiveFrameKey,
   buildViewport3DPrimitiveRenderModel,
   resolvePrimitiveSelectionBounds,
+  withObjectPlacementDraftPreview,
 } from "./viewport3dPrimitiveModel";
 
 const viewport3dPrimitiveModelSource = readFileSync(
@@ -90,8 +95,251 @@ describe("viewport3dPrimitiveModel", () => {
     expect(model.objects[0]?.bounds.center).toEqual([4, 5, 6]);
     expect(model.objects[0]?.bounds.size).toEqual([1, 2, 3]);
     expect(buildViewport3DPrimitiveFrameKey(model)).toBe(
-      "7|box:Box:{\"size\":[1,2,3]}:{\"translation\":[4,5,6]}",
+      "7|box:Box:{\"size\":[1,2,3]}:{\"translation\":[4,5,6]}|no-draft",
     );
+  });
+
+  it("moves the selected primitive preview from the shared placement draft", () => {
+    const scene = {
+      objects: [
+        {
+          geometry: {
+            geometry_kind: "Box",
+            geometry_params: { size: [1, 2, 3] },
+          },
+          id: "box",
+          name: "Box",
+          transform: { translation: [4, 5, 6] },
+        },
+      ],
+      revision: 7,
+    };
+    const model = buildViewport3DPrimitiveRenderModel(scene as never, null);
+    const canonicalDraft = resolveCommittedGeometryObjectDraft(
+      scene as never,
+      "box",
+    )!;
+    const preview = withObjectPlacementDraftPreview(
+      model,
+      { ...canonicalDraft, translation: ["7", "5", "6"] },
+      "box",
+    );
+
+    expect(preview?.objects[0]).toMatchObject({
+      bounds: { center: [7, 5, 6] },
+      translation: [7, 5, 6],
+    });
+    expect(preview?.objects[0]?.geometryKey).toContain("placement-draft:7,5,6");
+  });
+
+  it("converts unit-bearing placement draft values into SI for preview", () => {
+    const scene = {
+      objects: [
+        {
+          geometry: {
+            geometry_kind: "Box",
+            geometry_params: { size: [1, 2, 3] },
+          },
+          id: "box",
+          name: "Box",
+          transform: { translation: [4, 5, 6] },
+        },
+      ],
+      revision: 7,
+    };
+    const model = buildViewport3DPrimitiveRenderModel(scene as never, null);
+    const canonicalDraft = resolveCommittedGeometryObjectDraft(
+      scene as never,
+      "box",
+    )!;
+    const preview = withObjectPlacementDraftPreview(
+      model,
+      { ...canonicalDraft, translation: ["7000 mm", "5,0 m", "6000000 um"] },
+      "box",
+    );
+
+    expect(preview?.objects[0]).toMatchObject({
+      bounds: { center: [7, 5, 6] },
+      translation: [7, 5, 6],
+    });
+    expect(preview?.objects[0]?.geometryKey).toContain("placement-draft:7,5,6");
+  });
+
+  it("keeps an equivalent SI placement draft as a no-op", () => {
+    const scene = {
+      objects: [
+        {
+          geometry: {
+            geometry_kind: "Box",
+            geometry_params: { size: [1, 2, 3] },
+          },
+          id: "box",
+          name: "Box",
+          transform: { translation: [100 * 1e-9, 0.2 * 1e-6, 300 * 1e-9] },
+        },
+      ],
+      revision: 7,
+    };
+    const model = buildViewport3DPrimitiveRenderModel(scene as never, null);
+    const canonicalDraft = resolveCommittedGeometryObjectDraft(
+      scene as never,
+      "box",
+    )!;
+
+    expect(
+      withObjectPlacementDraftPreview(
+        model,
+        { ...canonicalDraft, translation: ["100 nm", "0,2 um", "300 nm"] },
+        "box",
+      ),
+    ).toBe(model);
+  });
+
+  it("treats mixed selected-unit translations as an SI no-op", () => {
+    const scene = {
+      objects: [{
+        geometry: {
+          geometry_kind: "Box",
+          geometry_params: { size: [1e-7, 1e-7, 1e-8] },
+        },
+        id: "box",
+        name: "Box",
+        transform: { translation: [1e-7, 0.2e-6, 3e-7] },
+      }],
+      revision: 7,
+    };
+    const model = buildViewport3DPrimitiveRenderModel(scene as never, null);
+    const canonicalDraft = resolveCommittedGeometryObjectDraft(scene as never, "box")!;
+    const selectedUnitsDraft = {
+      ...canonicalDraft,
+      quantityFields: {
+        "translation.0": { unit: "nm" as const, lastValidSI: 1e-7 },
+        "translation.1": { unit: "um" as const, lastValidSI: 0.2e-6 },
+      },
+      translation: ["100", "0.2", "3e-7"] as [string, string, string],
+    };
+
+    expect(
+      withObjectPlacementDraftPreview(model, selectedUnitsDraft, "box"),
+    ).toBe(model);
+    expect(geometryDraftLengthValuesEqual(1.0000000000000001e-7, 1e-7)).toBe(true);
+  });
+
+  it("uses last-valid SI for an invalid raw placement preview", () => {
+    const scene = {
+      objects: [{
+        geometry: {
+          geometry_kind: "Box",
+          geometry_params: { size: [1e-7, 1e-7, 1e-8] },
+        },
+        id: "box",
+        name: "Box",
+        transform: { translation: [1e-8, 2e-8, 3e-8] },
+      }],
+      revision: 7,
+    };
+    const model = buildViewport3DPrimitiveRenderModel(scene as never, null);
+    const canonicalDraft = resolveCommittedGeometryObjectDraft(scene as never, "box")!;
+    const invalidRawDraft = {
+      ...canonicalDraft,
+      quantityFields: {
+        "translation.0": { unit: "nm" as const, lastValidSI: 7e-8 },
+        "translation.1": { unit: "um" as const, lastValidSI: 2e-8 },
+      },
+      translation: ["1e-", "0.02", "3e-8"] as [string, string, string],
+    };
+
+    const preview = withObjectPlacementDraftPreview(model, invalidRawDraft, "box");
+    expect(preview).not.toBe(model);
+    expect(preview?.objects[0]?.translation).toBeDefined();
+    const translation = preview?.objects[0]?.translation;
+    expect(geometryDraftLengthValuesEqual(translation?.[0] ?? NaN, 7e-8)).toBe(true);
+    expect(geometryDraftLengthValuesEqual(translation?.[1] ?? NaN, 2e-8)).toBe(true);
+    expect(geometryDraftLengthValuesEqual(translation?.[2] ?? NaN, 3e-8)).toBe(true);
+  });
+
+  it.each(["", "1e-", "not-a-number"])(
+    "does not move the placement preview for incomplete or invalid text %s",
+    (invalidText) => {
+      const scene = {
+        objects: [
+          {
+            geometry: {
+              geometry_kind: "Box",
+              geometry_params: { size: [1, 2, 3] },
+            },
+            id: "box",
+            name: "Box",
+            transform: { translation: [4, 5, 6] },
+          },
+        ],
+        revision: 7,
+      };
+      const model = buildViewport3DPrimitiveRenderModel(scene as never, null);
+      const canonicalDraft = resolveCommittedGeometryObjectDraft(
+        scene as never,
+        "box",
+      )!;
+
+      expect(
+        withObjectPlacementDraftPreview(
+          model,
+          { ...canonicalDraft, translation: [invalidText, "5", "6"] },
+          "box",
+        ),
+      ).toBe(model);
+    },
+  );
+
+  it("keeps placement previews fenced to the matching selected object", () => {
+    const scene = {
+      objects: [
+        {
+          geometry: {
+            geometry_kind: "Box",
+            geometry_params: { size: [1, 2, 3] },
+          },
+          id: "box",
+          name: "Box",
+          transform: { translation: [4, 5, 6] },
+        },
+      ],
+      revision: 7,
+    };
+    const model = buildViewport3DPrimitiveRenderModel(scene as never, null);
+    const canonicalDraft = resolveCommittedGeometryObjectDraft(
+      scene as never,
+      "box",
+    )!;
+    const draft: typeof canonicalDraft = { ...canonicalDraft, translation: ["7", "8", "9"] };
+
+    expect(withObjectPlacementDraftPreview(model, draft, "another-object")).toBe(model);
+    expect(
+      withObjectPlacementDraftPreview(
+        model,
+        { ...draft, objectId: "missing-object" },
+        "missing-object",
+      ),
+    ).toBe(model);
+  });
+
+  it("calculates cylinder fallback bounds correctly from radius and height (F18)", () => {
+    const scene = {
+      objects: [
+        {
+          geometry: {
+            geometry_kind: "Cylinder",
+            geometry_params: { height: 1e-8, radius: 5e-8 },
+          },
+          id: "cyl",
+          name: "Cylinder",
+          transform: { translation: [0, 0, 0] },
+        },
+      ],
+      revision: 1,
+    };
+    const model = buildViewport3DPrimitiveRenderModel(scene as never, null);
+    expect(model.objects[0]?.bounds.size).toEqual([1e-7, 1e-7, 1e-8]);
   });
 
   it("builds primitive-only entries when the API uses scene_revision", () => {

@@ -4,111 +4,124 @@ status: partial
 doc_kind: reference
 audience: user
 owner: fullmag-public-docs
+last_updated: 2026-08-31
+reviewed_revision: ab3c8802a691a535063102c12f9a79bb0043b367
 ---
 
+# Interfacial DMI
+
 (public-docs-python-api-interactions-interfacial-dmi)=
-# Interfacial DMI Python API
+(python-api-interactions-interfacial-dmi-problem-statement)=
+## Problem statement
 
-This page owns the Python authoring, validation, and `ProblemIR` boundary. The scientific
-equations and backend interpretation are owned by {doc}`../../physics/interactions/dmi/index`.
+The optional normal makes the interface orientation explicit in the IR.
 
-(api-interfacial-dmi-problem-statement)=
-## Physical problem
+This page documents the public Python authoring boundary, not an undocumented runtime promise. Construction creates typed authoring data, while to_ir() is the object-level lowering boundary consumed by the study/script pipeline.
 
-This page is the public physical and authoring contract for the interaction. It separates authored semantics, planner resolution, executable backend lanes, and scientific qualification.
+(python-api-interactions-interfacial-dmi-governing-equations)=
+## Governing equations
 
-## Constructor
+```{math}
+:label: eq-interfacial_dmi
 
-`D` is in $\mathrm{J\,m^{-2}}$. The sign is physical and must be preserved.
-
-## Parameters
-
-| Parameter | Default | SI unit | Current check | Required check |
-|---|---|---:|---|---|
-| `D` | required | $\mathrm{J\,m^{-2}}$ | float conversion | finite |
-| `interface_normal` | `None` | $1$ | length/conversion | finite, non-zero; FDM requires canonical +z |
-
-Material-owned `dind` and an explicit interaction are alternative sources. Reject duplicates.
-
-(api-interfacial-dmi-problem-ir)=
-## Lowering
-
-```json
-{"kind": "interfacial_dmi", "D": 0.003, "interface_normal": [0.0, 0.0, 1.0]}
+q_{\mathrm{IR}} = \mathrm{interfacial_dmi}(\text{qualified inputs})
 ```
 
-(api-interfacial-dmi-python-api)=
-## Python API and stage-first example
+The physical term or constraint is represented by the canonical IR object interfacial_dmi. The exact discrete operator, quadrature, mesh treatment, and solver selection are backend responsibilities; this page does not replace their qualification evidence.
+
+(python-api-interactions-interfacial-dmi-symbols-and-si-units)=
+## Symbols and SI units
+
+| Symbol | Meaning | SI unit |
+|---|---|---|
+| q | canonical typed authoring quantity | \mathrm{1} |
+
+All dimensional inputs are documented in SI units. Vector quantities use Cartesian components in the repository coordinate convention. Dimensionless parameters are explicitly marked 1; a default of None means that the constructor selects or omits the field according to the contract.
+
+(python-api-interactions-interfacial-dmi-assumptions-and-validity)=
+## Assumptions and validity
+
+Inputs are finite and typed. Positive lengths, densities, conductivities, temperatures, and material constants are rejected when the source constructor requires positivity. Unsupported combinations fail closed in the constructor or lowering boundary rather than being silently converted.
+
+(python-api-interactions-interfacial-dmi-python-api)=
+## Python API
+
+### Constructor or function
+
+fm.InterfacialDMI(D, interface_normal=None)
+
+### Parameters
+
+| Python name | Type | Default | SI unit | Validation | Meaning | FEM/FDM CPU/GPU support | ProblemIR destination |
+|---|---|---|---|---|---|---|---|
+| ```fm.InterfacialDMI.D``` | ```float``` | ```required``` | ```J/m^2``` | finite; sign preserved | interfacial DMI constant | FEM/FDM CPU/GPU: IR; resolved support required | ```D``` |
+| ```fm.InterfacialDMI.interface_normal``` | ```tuple[float,float,float] or None``` | ```None``` | ```1``` | finite non-zero when supplied; normalized | interface normal | FEM/FDM CPU/GPU: IR; resolved support required | ```interface_normal``` |
+
+### Stage-first example
 
 ```python
-# %% Study, execution lane, and magnetic body
+# %%
 import fullmag as fm
 
-nm = 1.0e-9
-study = fm.study("interfacial_dmi_reference")
-study.engine("fem")
-study.device("cpu", precision="double")
-study.mode("strict")
-study.objects.mesh.defaults(cell_size=(2 * nm, 2 * nm, 2 * nm))
-body = study.geometry(fm.Box(40 * nm, 20 * nm, 4 * nm), name="film")
-body.Ms = 8.0e5
+study = fm.study("public-api-example")
+study.objects.mesh.defaults(maximum_element_size=5e-9)
+body = study.geometry(fm.Box(size=(100e-9, 20e-9, 5e-9)), name="film")
+body.Ms = 800.0e3
 body.Aex = 13.0e-12
 body.alpha = 0.02
 body.m = fm.texture.uniform(1.0, 0.0, 0.0)
-
-body.Ku1 = 4.7e5
-body.anisU = (0.0, 0.0, 1.0)
-body.dind = 3.0e-3  # J/m^2
-study.demag(realization="poisson_robin")
-study.stages.add_relax(stage_id="relax", algorithm="llg_overdamped", max_steps=500, tolT=1.0e-6)
+study.stages.add_relax(stage_id="api-example", dt=5e-13, max_steps=1)
+# Author the documented object after the stage exists.
+value = fm.InterfacialDMI(D=1.0e-3, interface_normal=(0.0, 0.0, 1.0))
+canonical_ir = value.to_ir()
 ```
 
-(api-interfacial-dmi-round-trip-and-failure-semantics)=
+The example intentionally exposes the object-level boundary. In a full stage, attach canonical_ir through the corresponding study/module registration method; no implicit runtime route is inferred from this page.
+
+(python-api-interactions-interfacial-dmi-problem-ir)=
+## ProblemIR
+
+value.to_ir() is the canonical serialization boundary. It emits a typed interfacial_dmi record with the fields listed above; nested geometry, targets, profiles, or material references remain nested typed records rather than opaque Python objects. The IR is the requested intent. Backend resolution must preserve the record or reject an unsupported combination.
+
+(python-api-interactions-interfacial-dmi-round-trip-and-failure-semantics)=
 ## Round-trip and failure semantics
+The requested intent is preserved before resolved execution. Validation errors identify invalid inputs, while unsupported combinations are rejected.
 
-Requested intent preserves the authored model, coefficients, orientations, targets, and execution request. Resolved execution records the selected solver, device, precision, discretization, and capability decision. Validation errors reject malformed or contradictory data before runtime. Unsupported combinations fail closed and are not silently omitted or converted to another interaction.
 
-(api-interfacial-dmi-governing-equations)=
-## Governing equations
+A supported record is expected to round-trip through the repository script/scene representation without changing qualified values, units, or identifiers. Invalid types, missing required fields, non-finite values, contradictory options, and unsupported backend combinations are rejected with an explicit validation error. This page makes no claim that every backend accepts every legal authoring object.
 
-The equations and sign conventions owned by this interaction are stated in the preceding scientific description.
-
-(api-interfacial-dmi-symbols-and-si-units)=
-## Symbols and SI units
-
-All physical inputs use SI units. Dimensionless axes and reduced magnetization are normalized according to the stated contract.
-
-(api-interfacial-dmi-assumptions-and-validity)=
-## Assumptions and validity
-
-The authored model is valid only within the continuum, discretization, boundary, and capability limits stated on this page.
-
-(api-interfacial-dmi-discrete-realization)=
+(python-api-interactions-interfacial-dmi-discrete-realization)=
 ## Discrete realization
 
-FDM and FEM, and CPU and GPU, are distinct numerical realizations. Their availability and qualification are reported separately in the capability tables above.
+The FEM/FDM realization selects its own mesh, stencil or element operator, boundary treatment, and CPU/GPU execution lane. The Python contract supplies the physical inputs and canonical IR only; numerical equivalence requires the backend-specific validation named below.
 
-(api-interfacial-dmi-implementation-mapping)=
+(python-api-interactions-interfacial-dmi-implementation-mapping)=
 ## Implementation mapping
 
-Python owns authoring and serialization, ProblemIR owns canonical intent, planners own legality and realization selection, and backend kernels own numerical evaluation.
+The authoritative implementation is packages/fullmag-py/src/fullmag/model/energy.py symbol class InterfacialDMI. The public constructor signature, validation branches, defaults, and to_ir() field names are derived from that source, not from a historical example.
 
-(api-interfacial-dmi-validation)=
+(python-api-interactions-interfacial-dmi-validation)=
 ## Validation
 
-Validation must cover units, signs, energy/field or torque consistency, discretization convergence, boundary behavior, and lane-specific CPU/GPU evidence.
+Focused repository tests covering this contract include: test_interfacial_dmi_interface_normal_serializes_to_ir, test_dmi_terms_preserve_signed_constants_in_ir. These tests are evidence for authoring/IR behavior; live runtime, device performance, and Control Room browser behavior require separate qualification.
 
-(api-interfacial-dmi-limitations)=
-## Limitations
+(python-api-interactions-interfacial-dmi-limitations)=
+## Limitations and Control Room
 
-Capabilities not listed as executable must fail closed. Source presence alone is not runtime or scientific qualification.
+Control Room route: no dedicated route is claimed for this low-level authoring object. It is observable only through a session/problem/field view when the owning module exposes it; a dedicated object editor or route is not currently exposed. No unsupported UI or runtime capability is implied.
 
-(api-interfacial-dmi-scientific-bibliography)=
+(python-api-interactions-interfacial-dmi-scientific-bibliography)=
 ## Scientific bibliography
 
-The principal references are listed in the interaction-specific bibliography above.
+- A. Rohart and A. Thiaville, Skyrmions on a nanostructure, Phys. Rev. B 88 (2013), DOI: https://doi.org/10.1103/PhysRevB.88.184422
 
-(api-interfacial-dmi-source-code-index)=
-## Source-code index
+(python-api-interactions-interfacial-dmi-source-code-index)=
+## Source code index
 
-The implementation owners are listed in the interaction-specific source table above.
+| Source path | Symbol | Responsibility |
+|---|---|---|
+| packages/fullmag-py/src/fullmag/model/energy.py | class InterfacialDMI | public constructor and IR lowering |
+
+- Implementation: packages/fullmag-py/src/fullmag/model/energy.py::class InterfacialDMI
+- Source-map: interactions/interfacial-dmi.source-map.json
+- Contract status: current constructor and to_ir() boundary documented against revision ab3c8802a691a535063102c12f9a79bb0043b367.

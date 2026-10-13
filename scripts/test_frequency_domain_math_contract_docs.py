@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 
@@ -7,6 +8,12 @@ PLAN_ROOT = REPO_ROOT / "docs/plans/active/fd_sovler_masterplan"
 
 def read(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def read_json(path: Path) -> dict[str, object]:
+    value = json.loads(read(path))
+    assert isinstance(value, dict)
+    return value
 
 
 def test_canonical_fem_dynamic_solver_contract_freezes_algebra_units_and_claims() -> None:
@@ -72,9 +79,12 @@ def test_dynamic_demag_and_response_observables_use_si_contract() -> None:
     floquet = read(REPO_ROOT / "docs/physics/0828-fem-frequency-domain-floquet-demag.md")
     poisson = read(REPO_ROOT / "docs/physics/0830-fem-poisson-airbox-modal-eigen.md")
 
-    assert "delta_H_demag = -grad(delta_phi)" in floquet
+    compact_floquet = "".join(floquet.split())
+    assert r"\widetilde{\mathbf h}_{d,n\mathbf k}=-\nabla\widetilde\phi_{n\mathbf k}".replace(" ", "") in compact_floquet
     assert "delta_H_demag = -grad(delta_phi)." in poisson
-    assert "div(-grad(delta_phi)) = -div(delta_M)" in floquet
+    assert r"\nabla^2\widetilde\phi_{n\mathbf k}=\nabla\cdot\widetilde{\mathbf M}_{n\mathbf k}".replace(" ", "") in compact_floquet
+    assert r"\int_{\Omega}\nabla v^\ast\cdot\nabla\widetilde\phi_{n\mathbf k}\,\mathrm dV".replace(" ", "") in compact_floquet
+    assert r"=\int_{\Omega_m}\nabla v^\ast\cdot\widetilde{\mathbf M}_{n\mathbf k}\,\mathrm dV".replace(" ", "") in compact_floquet
     assert "delta_M = Ms * delta_m" in physics
     assert "chi = delta_M / h_drive" in physics
     assert "p_abs = - 0.5 * mu0 * Ms * omega * Im(conj(h_drive) dot delta_m)" in physics
@@ -82,20 +92,42 @@ def test_dynamic_demag_and_response_observables_use_si_contract() -> None:
     assert "Gamma > 0" in physics
 
 
+def test_comsol_dispersion_guide_exposes_kalinikos_demag_reference_generator() -> None:
+    guide = read(
+        REPO_ROOT
+        / "docs/guides/comsol-nonzero-k-dispersion-benchmark.md"
+    )
+    normalized = " ".join(guide.split())
+    for required in (
+        "Analityczna kontrola demagnetyzacji dynamicznej",
+        "P00(kt) = 1 - (1 - exp(-k*t))/(k*t)",
+        "f_BV(k) = gamma0/(2*pi)",
+        "f_DE(k) = gamma0/(2*pi)",
+        "scripts/generate_comsol_analytic_reference.py",
+        "kalinikos_slab_n0_reference.csv",
+        "dynamicznego operatora `demag-k`",
+    ):
+        assert required in normalized
+
+
 def test_floquet_tangent_frame_transport_and_identity_rejection_are_documented() -> None:
     pbc_plan = read(PLAN_ROOT / "04_mesh_periodic_floquet_airbox.md")
     floquet = read(REPO_ROOT / "docs/physics/0828-fem-frequency-domain-floquet-demag.md")
 
-    assert "exp(+i omega t)" in floquet
+    assert "exp(+i omega t - i k dot r)" in floquet
     assert "q_dst = exp(-i kF · delta_r) T_dst^T R T_src q_src" in pbc_plan
     assert "q_dst = phase * G_pair q_src" in pbc_plan
     assert "duplicate periodic node pairs are rejected" in pbc_plan
-    assert "phase = exp(-i k dot Delta r)" in floquet
-    assert "T_dst q_dst = phase Q T_src q_src" in floquet
-    assert "q_dst = phase (T_dst^T Q T_src) q_src" in floquet
-    assert "Q = I for a pure translation" in floquet
-    assert "The scalar-potential constraint is phase-only" in floquet
-    assert "must reject these requests with explicit capability diagnostics" in floquet
+    compact_floquet = "".join(floquet.split())
+    assert r"p=\exp(-\mathrm{i}\mathbf k\cdot\Delta\mathbf r)".replace(" ", "") in compact_floquet
+    assert r"T_{\mathrm{dst}}q_{\mathrm{dst}}=pQ T_{\mathrm{src}}q_{\mathrm{src}}".replace(" ", "") in compact_floquet
+    assert r"q_{\mathrm{dst}}=p(T_{\mathrm{dst}}^\mathsf{T}Q T_{\mathrm{src}})q_{\mathrm{src}}".replace(" ", "") in compact_floquet
+    assert "identity for a pure translation" in " ".join(floquet.split())
+    assert r"\widetilde\phi_{\mathrm{dst}}=p\widetilde\phi_{\mathrm{src}}" in compact_floquet
+    normalized_floquet = " ".join(floquet.split())
+    assert "Unsupported combinations include dynamic floquet_airbox without a complete complex operator" in normalized_floquet
+    assert "reason and latest residual" in normalized_floquet
+    assert "No fallback may erase the physical k or report a K0 calculation as nonzero-k" in normalized_floquet
 
 
 def test_modal_dispersion_artifact_contract_names_tracking_and_mode_handoff() -> None:
@@ -104,13 +136,14 @@ def test_modal_dispersion_artifact_contract_names_tracking_and_mode_handoff() ->
     assert "`tracking_score_source`" in artifacts
     assert "`modal_overlap_available`" in artifacts
     assert "`modal_overlap_unavailable_reason`" in artifacts
-    assert "`mode_field_id` and `mode_field_resource_key`" in artifacts
+    assert "`mode_field_id` must match the selected mode payload" in artifacts
+    assert "optional legacy `mode_field_resource_key`" in artifacts
     assert (
-        "sample_index,path_s_rad_per_m,kx_rad_per_m,ky_rad_per_m,kz_rad_per_m,"
-        "label,raw_mode_index,branch_id,frequency_hz,omega_rad_s,"
+        "sample_index,sample_id,path_s_rad_per_m,kx_rad_per_m,ky_rad_per_m,"
+        "kz_rad_per_m,label,raw_mode_index,mode_id,branch_id,frequency_hz,omega_rad_s,"
         "analytic_frequency_hz,relative_error,validation_geometry,"
         "line_width_hz,residual_norm,overlap_score,tracking_score_source,"
-        "mode_field_id,mode_field_resource_key"
+        "mode_field_available,mode_field_id"
     ) in artifacts
 
 
@@ -164,3 +197,255 @@ def test_poisson_airbox_modal_docs_demote_synthetic_provenance_and_fix_signs() -
     assert "gauge_policy = none" in plan
 
     assert "periodic_airbox_k0.production_cpu_not_validated" in capability
+
+
+def test_t1_k0_production_scope_is_scalable_future_only_and_source_mapped() -> None:
+    physics = read(REPO_ROOT / "docs/physics/0830-fem-poisson-airbox-modal-eigen.md")
+    normalized_physics = " ".join(physics.split())
+    catalog = read_json(
+        PLAN_ROOT / "25_frequency_domain_readiness_scope_catalog.json"
+    )
+    readiness = read_json(PLAN_ROOT / "25_frequency_domain_readiness_matrix.json")
+    capability = read_json(REPO_ROOT / "docs/specs/capability-matrix-v0.json")
+    source_map = read_json(
+        REPO_ROOT
+        / "docs/physics/0830-fem-poisson-airbox-modal-eigen.source-map.json"
+    )
+
+    cpu_scope_id = "modal_cpu_k0_periodic_airbox_real_shared_domain.production"
+    gpu_scope_id = "modal_gpu_k0_periodic_airbox_scalable.production"
+    for token in (
+        cpu_scope_id,
+        gpu_scope_id,
+        "materialized descriptor dimension <= 1024 is validation_only",
+        "production qualification requires a measured operator_dimension > 1024",
+        "matrix_free_schur_selected_spectrum",
+    ):
+        assert token in normalized_physics
+
+    scopes = catalog["scopes"]
+    assert isinstance(scopes, dict)
+    for scope_id, device, solver_lane in (
+        (cpu_scope_id, "cpu", "cpu_slepc_schur_matrix_free"),
+        (gpu_scope_id, "gpu", "gpu_petsc_slepc_schur_matrix_free"),
+    ):
+        scope = scopes[scope_id]
+        assert isinstance(scope, dict)
+        assert scope["claim_kind"] == "validated_scope"
+        assert scope["device"] == device
+        assert scope["solver_lane"] == solver_lane
+        assert scope["implementation_state"] == "source_visible"
+        assert scope["validation_state"] == "unvalidated"
+        assert scope["production_operator_kind"] == "matrix_free_schur_selected_spectrum"
+        assert scope["materialized_validation_limit_dimension"] == 1024
+        assert (
+            scope["production_scalability_gate"]
+            == "requires_measured_operator_dimension_gt_1024"
+        )
+        exact_scope = scope["exact_scope"]
+        assert isinstance(exact_scope, dict)
+        assert exact_scope == {
+            "backend": "fem",
+            "device": device,
+            "precision": "double",
+            "wavevector": "exact_k0",
+            "periodic_axes": ["x", "y"],
+            "open_axes": ["z"],
+            "domain_mesh": {
+                "kind": "shared_magnetic_airbox",
+                "fe_order": 1,
+                "element_types": ["tet4", "prism6"],
+            },
+            "demag_model": "periodic_airbox_k0",
+            "operator_form": "full_2x2",
+            "operator_terms": ["exchange", "zeeman", "dynamic_demag"],
+            "exchange_model": "native_mfem_weak_form_homogeneous_scalar_a_ex",
+            "damping_alpha": 0.0,
+            "target": "real_frequency_rotated",
+            "spectrum": "finite_positive_physical_modes_in_requested_window",
+            "required_artifacts": [
+                "spectrum.v2",
+                "solver_diagnostics_with_eps_phi",
+                "complex_delta_m",
+            ],
+            "excluded_interactions": ["anisotropy", "dmi"],
+            "fallback_policy": "strict_no_fallback",
+        }
+
+    cells = readiness["cells"]
+    assert isinstance(cells, list)
+    cells_by_id = {
+        cell["cell_id"]: cell
+        for cell in cells
+        if isinstance(cell, dict) and isinstance(cell.get("cell_id"), str)
+    }
+    for cell_id, scope_id in (
+        ("modal_cpu_k0_periodic_airbox_real_shared_domain", cpu_scope_id),
+        ("modal_gpu_k0_periodic_airbox_scalable", gpu_scope_id),
+    ):
+        cell = cells_by_id[cell_id]
+        assert cell["implementation_state"] == "source_visible"
+        assert cell["validation_state"] == "unvalidated"
+        assert cell["validated_scope"] is None
+        assert cell["executable_scope"] is None
+        future_binding = cell["future_production_scope"]
+        assert isinstance(future_binding, dict)
+        assert future_binding["scope_id"] == scope_id
+
+    features = capability["features"]
+    assert isinstance(features, list)
+    modal_capability = next(
+        feature
+        for feature in features
+        if isinstance(feature, dict)
+        and feature.get("id") == "fem_modal_interior_window_eigensolve"
+    )
+    assert modal_capability["implementation_state"] == "source_visible"
+    assert modal_capability["validation_state"] == "unvalidated"
+    assert modal_capability["validated_workloads"] == []
+
+    sources = source_map["sources"]
+    assert isinstance(sources, list)
+    source_identities = {
+        (source.get("path"), source.get("symbol"))
+        for source in sources
+        if isinstance(source, dict)
+    }
+    for identity in (
+        (
+            "backends/fem/include/frequency_domain/modal_gpu_krylov.hpp",
+            "solve_poisson_airbox_modal_eigen_gpu_petsc_slepc",
+        ),
+        (
+            "backends/fem/gpu/frequency_domain/modal_petsc_slepc.cpp",
+            "create_gpu_solver_state",
+        ),
+        (
+            "backends/fem/gpu/frequency_domain/modal_petsc_slepc.cpp",
+            "split_schur_matmult",
+        ),
+        (
+            "crates/fullmag-runner/src/fem/eigen_native_window.rs",
+            "native_solver_diagnostics_json",
+        ),
+        (
+            "crates/fullmag-runner/src/fem/eigen_output.rs",
+            "write_eigen_v2_bundle",
+        ),
+        (
+            "crates/fullmag-api/src/router_v2/handlers/analysis/frequency_domain.rs",
+            "json_artifact_resource_first_existing_with_context",
+        ),
+        (
+            "crates/fullmag-api/src/router_v2/handlers/analysis/frequency_domain.rs",
+            "eigen_mode_field_metadata",
+        ),
+        (
+            "apps/control-room/src/modules/inspector/panels/frequency-domain/FrequencyDomainResultInspectors.tsx",
+            "EigenModeFieldResourceInspectorPanel",
+        ),
+        (
+            "apps/control-room/src/kernel/visualization/ModeFieldOverlayIntentController.ts",
+            "activate",
+        ),
+    ):
+        assert identity in source_identities
+        path, symbol = identity
+        source_path = REPO_ROOT / path
+        assert source_path.is_file(), f"missing source-map path: {path}"
+        assert symbol in read(source_path), f"missing source-map symbol: {path} + {symbol}"
+
+    sources_by_id = {
+        source["id"]: source
+        for source in sources
+        if isinstance(source, dict) and isinstance(source.get("id"), str)
+    }
+    assert sources_by_id["source-gpu-schur-action"]["entrypoint"] == "apply_schur"
+    assert (
+        sources_by_id["source-api-eigen-diagnostics"]["handler"]
+        == "get_frequency_domain_eigen_diagnostics_v2"
+    )
+    assert (
+        sources_by_id["source-api-mode-field-meta"]["handler"]
+        == "get_frequency_domain_eigen_mode_field_meta"
+    )
+    assert (
+        sources_by_id["source-mode-field-overlay"]["controller"]
+        == "class ModeFieldOverlayIntentController"
+    )
+    for source_id, field_name in (
+        ("source-gpu-schur-action", "entrypoint"),
+        ("source-api-eigen-diagnostics", "handler"),
+        ("source-api-mode-field-meta", "handler"),
+        ("source-mode-field-overlay", "controller"),
+    ):
+        source = sources_by_id[source_id]
+        assert source[field_name] in read(REPO_ROOT / source["path"])
+
+
+def test_component_participation_publication_contract_is_mass_consistent_and_mapped() -> None:
+    physics = read(REPO_ROOT / "docs/physics/0830-fem-poisson-airbox-modal-eigen.md")
+    normalized_physics = " ".join(physics.split())
+    source_map = read_json(
+        REPO_ROOT
+        / "docs/physics/0830-fem-poisson-airbox-modal-eigen.source-map.json"
+    )
+
+    for token in (
+        "volume_weighted_complex_l2_fraction.v1",
+        "E[o,c] = (d_c^o)^H M_o d_c^o",
+        "E_total = sum_{o in O} sum_{c in {x,y,z}} E[o,c]",
+        "p[o,c] = E[o,c] / E_total",
+        "P1/tet4",
+        "consistent element mass",
+        "delta m",
+        "delta M",
+        "component_participation_unavailable",
+        "postprocess_cpu",
+    ):
+        assert token in normalized_physics
+
+    symbols = source_map["symbols"]
+    assert isinstance(symbols, list)
+    symbols_by_id = {
+        symbol["id"]: symbol
+        for symbol in symbols
+        if isinstance(symbol, dict) and isinstance(symbol.get("id"), str)
+    }
+    assert symbols_by_id["component_participation_fraction"]["si_unit"] == "$1$"
+
+    equations = source_map["equations"]
+    assert isinstance(equations, list)
+    equations_by_id = {
+        equation["id"]: equation
+        for equation in equations
+        if isinstance(equation, dict) and isinstance(equation.get("id"), str)
+    }
+    participation_equation = equations_by_id[
+        "eq-poisson-airbox-component-participation"
+    ]
+    assert participation_equation["symbols"] == [
+        "modal_object_set",
+        "modal_component",
+        "modal_component_coefficients",
+        "object_consistent_mass",
+        "component_quadratic_measure",
+        "component_total_measure",
+        "component_participation_fraction",
+    ]
+
+    sources = source_map["sources"]
+    assert isinstance(sources, list)
+    source_identities = {
+        (source.get("path"), source.get("symbol"))
+        for source in sources
+        if isinstance(source, dict)
+    }
+    assert (
+        "crates/fullmag-runner/src/fem/eigen_output.rs",
+        "write_eigen_v2_bundle",
+    ) in source_identities
+    assert (
+        "scripts/test_frequency_domain_math_contract_docs.py",
+        "test_component_participation_publication_contract_is_mass_consistent_and_mapped",
+    ) in source_identities

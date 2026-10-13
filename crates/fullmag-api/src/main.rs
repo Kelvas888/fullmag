@@ -1,7 +1,7 @@
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{DefaultBodyLimit, Query, State};
 use axum::http::header::CONTENT_TYPE;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 #[cfg(not(feature = "swagger-ui"))]
 use axum::response::Html;
 use axum::response::{IntoResponse, Response};
@@ -12,7 +12,8 @@ use axum::{
 use base64::Engine;
 use fullmag_authoring::{
     normalize_scene_document_magnetization_assets, normalize_scene_document_study_pipeline_labels,
-    validate_scene_document, MagnetizationAsset, SceneDocument,
+    scene_document_has_unresolved_solve_prerequisites, validate_scene_document_for_authoring,
+    MagnetizationAsset, SceneDocument,
 };
 use fullmag_ir::{TextureMappingIR, TextureProjectionMode, TextureTransform3DIR};
 use fullmag_plan::{sample_preset_texture_versioned, TextureSamplePoint};
@@ -31,10 +32,21 @@ use tracing::info;
 use fullmag_quantities::{quantity_spec, QuantityShape as QuantityKind};
 use fullmag_runner::LivePreviewField;
 
+#[path = "accepted_fem_state.rs"]
+mod accepted_fem_state;
+#[path = "accepted_fem_study_worker.rs"]
+mod accepted_fem_study_worker;
+mod accepted_antenna_inspection_worker;
+mod accepted_study_worker;
+mod accepted_project_storage;
 mod analysis;
 mod artifacts;
 mod assets;
 mod build_info;
+mod coordinator_persistence;
+mod development_handoff_validation;
+mod development_owner_control;
+mod development_consumer_readiness;
 mod error;
 mod fdm_planar_grid_overlay;
 mod feature_flags;
@@ -47,6 +59,8 @@ mod field_projection;
 mod field_render_png;
 mod field_slice;
 mod field_store;
+mod live_command_journal;
+mod live_scene_preparation;
 mod openapi_v2;
 mod orientation_color;
 mod periodic_pairs_binary;
@@ -56,8 +70,10 @@ mod quantities;
 mod quantity_data_plane;
 mod realtime_policy;
 mod router_v2;
+mod run_intent_persistence;
 mod schemas;
 mod script;
+mod script_check;
 mod session;
 mod session_persistence;
 mod types;
@@ -86,6 +102,91 @@ pub(crate) struct CurrentLiveRealtimeState {
     pub run_id: Option<String>,
     pub revisions: RealtimeResourceRevisionMap,
     pub mesh_resource_fetches: Vec<String>,
+    pub runtime_active: bool,
+    pub diagnostics_revision: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PendingRealtimeScalarSample {
+    pub session_id: String,
+    pub run_id: Option<String>,
+    pub revision: u64,
+    pub row: ScalarRow,
+    pub terminal: bool,
+}
+
+impl PendingRealtimeScalarSample {
+    fn identity(&self) -> (String, Option<String>) {
+        (self.session_id.clone(), self.run_id.clone())
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CurrentLiveRealtimeScalarSampleQosState {
+    pub identity: Option<(String, Option<String>)>,
+    pub last_published_at: Option<tokio::time::Instant>,
+    pub pending: Option<PendingRealtimeScalarSample>,
+    pub flush_generation: u64,
+}
+
+#[derive(Debug)]
+enum ScalarSampleQosAction {
+    Publish(PendingRealtimeScalarSample),
+    Schedule { generation: u64, delay: Duration },
+    Pending,
+}
+
+impl CurrentLiveRealtimeScalarSampleQosState {
+    fn admit(
+        &mut self,
+        sample: PendingRealtimeScalarSample,
+        now: tokio::time::Instant,
+        interval_ms: u32,
+    ) -> ScalarSampleQosAction {
+        let identity = sample.identity();
+        if self.identity.as_ref() != Some(&identity) {
+            self.identity = Some(identity);
+            self.last_published_at = None;
+            self.pending = None;
+            self.flush_generation = self.flush_generation.wrapping_add(1);
+        }
+
+        let immediate = sample.row.step <= 1
+            || sample.terminal
+            || self.last_published_at.is_none()
+            || self.last_published_at.is_some_and(|last| {
+                now.saturating_duration_since(last) >= Duration::from_millis(u64::from(interval_ms))
+            });
+        if immediate {
+            self.pending = None;
+            self.last_published_at = Some(now);
+            self.flush_generation = self.flush_generation.wrapping_add(1);
+            return ScalarSampleQosAction::Publish(sample);
+        }
+
+        let already_scheduled = self.pending.is_some();
+        self.pending = Some(sample);
+        if already_scheduled {
+            ScalarSampleQosAction::Pending
+        } else {
+            self.flush_generation = self.flush_generation.wrapping_add(1);
+            let elapsed = self
+                .last_published_at
+                .map(|last| now.saturating_duration_since(last))
+                .unwrap_or_default();
+            ScalarSampleQosAction::Schedule {
+                generation: self.flush_generation,
+                delay: Duration::from_millis(u64::from(interval_ms)).saturating_sub(elapsed),
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.identity = None;
+        self.last_published_at = None;
+        self.pending = None;
+        self.flush_generation = self.flush_generation.wrapping_add(1);
+    }
 }
 
 fn realtime_timestamp_now() -> String {
@@ -113,7 +214,12 @@ pub(crate) async fn current_live_realtime_state_from_snapshot(
 ) -> CurrentLiveRealtimeState {
     let (commands_revision, command_completion_revision) = {
         let ledger = state.current_command_ledger.lock().await;
-        let revisions = command_ledger_revisions(&ledger);
+        let revisions = command_ledger_revisions(
+            &ledger,
+            state
+                .current_command_journal_revision
+                .load(Ordering::Acquire),
+        );
         (
             revisions.commands_revision,
             revisions.command_completion_revision,
@@ -134,6 +240,11 @@ pub(crate) async fn current_live_realtime_state_from_snapshot(
         session_id: snapshot.session.session_id.clone(),
         run_id: snapshot.run.as_ref().map(|run| run.run_id.clone()),
         mesh_resource_fetches: current_live_mesh_resource_fetches(snapshot),
+        runtime_active: fullmag_runner::RuntimeStatus::from_status_code(
+            &effective_runtime_status_code(snapshot),
+        )
+        .is_busy(),
+        diagnostics_revision: snapshot.state_version,
         revisions: RealtimeResourceRevisionMap {
             topology_revision: router_v2::handlers::sessions::status::topology_revision(
                 snapshot,
@@ -326,6 +437,10 @@ fn current_live_realtime_changes(
             recommended_fetch: Some("/v2/sessions/current/diagnostics/solver-profile".to_string()),
         });
     }
+    changes.extend(current_live_diagnostic_changes(
+        realtime_state.runtime_active,
+        realtime_state.diagnostics_revision,
+    ));
     if realtime_state.revisions.mesh_revision > 0 {
         changes.push(RealtimeResourceChange {
             resource: RealtimeResourceName::Mesh,
@@ -461,6 +576,31 @@ fn current_live_realtime_changes(
     changes
 }
 
+fn current_live_diagnostic_changes(
+    runtime_active: bool,
+    revision: u64,
+) -> Vec<RealtimeResourceChange> {
+    if !runtime_active {
+        return Vec::new();
+    }
+
+    [
+        ("cpu", "/v2/sessions/current/diagnostics/cpu"),
+        ("gpu", "/v2/sessions/current/diagnostics/gpu"),
+    ]
+    .into_iter()
+    .map(|(resource_id, recommended_fetch)| RealtimeResourceChange {
+        resource: RealtimeResourceName::Diagnostics,
+        revision,
+        resource_id: Some(resource_id.to_string()),
+        quantity_ids: Vec::new(),
+        broad: false,
+        domain_generation_id: None,
+        recommended_fetch: Some(recommended_fetch.to_string()),
+    })
+    .collect()
+}
+
 fn current_live_realtime_changes_since(
     realtime_state: &CurrentLiveRealtimeState,
     previous_revisions: Option<&RealtimeResourceRevisionMap>,
@@ -476,9 +616,11 @@ fn current_live_realtime_changes_since(
             if !current_live_realtime_change_revision_changed(previous_revisions, change) {
                 return None;
             }
-            if matches!(change.resource, RealtimeResourceName::Fields)
-                && change.resource_id.as_deref() == Some("samples")
-            {
+            let field_sample_change = (matches!(change.resource, RealtimeResourceName::Fields)
+                && change.resource_id.as_deref() == Some("samples"))
+                || (matches!(change.resource, RealtimeResourceName::PlanarFields)
+                    && change.resource_id.as_deref() == Some("field"));
+            if field_sample_change {
                 let quantity_ids = changed_field_sample_quantity_ids(
                     &realtime_state.revisions.field_quantity_revisions,
                     &previous_revisions.field_quantity_revisions,
@@ -545,7 +687,10 @@ fn current_live_realtime_change_revision_changed(
         },
         RealtimeResourceName::Artifacts => previous.artifacts_revision != change.revision,
         RealtimeResourceName::Logs => previous.engine_log_revision != change.revision,
-        RealtimeResourceName::Diagnostics => previous.solver_profile_revision != change.revision,
+        RealtimeResourceName::Diagnostics => match change.resource_id.as_deref() {
+            Some("cpu" | "gpu") => true,
+            _ => previous.solver_profile_revision != change.revision,
+        },
         RealtimeResourceName::Mesh => {
             previous.mesh_revision != change.revision || domain_generation_changed
         }
@@ -620,6 +765,8 @@ mod realtime_change_tests {
                     .to_string(),
                 "/v2/sessions/current/meshing/mesh/periodic_pairs.v1".to_string(),
             ],
+            runtime_active: false,
+            diagnostics_revision: 0,
         };
 
         let fetches = current_live_realtime_changes(&state)
@@ -653,6 +800,8 @@ mod realtime_change_tests {
             run_id: Some("run-1".to_string()),
             revisions: current,
             mesh_resource_fetches: Vec::new(),
+            runtime_active: false,
+            diagnostics_revision: 0,
         };
 
         let changes = current_live_realtime_changes_since(&state, Some(&previous));
@@ -677,6 +826,8 @@ mod realtime_change_tests {
             run_id: Some("run-1".to_string()),
             revisions: revisions(),
             mesh_resource_fetches: Vec::new(),
+            runtime_active: false,
+            diagnostics_revision: 0,
         });
         let monitor = changes
             .iter()
@@ -727,6 +878,8 @@ mod realtime_change_tests {
             run_id: Some("run-1".to_string()),
             revisions: revisions(),
             mesh_resource_fetches: Vec::new(),
+            runtime_active: false,
+            diagnostics_revision: 0,
         });
 
         assert!(changes.iter().any(|change| {
@@ -764,6 +917,8 @@ mod realtime_change_tests {
                 "/v2/sessions/current/meshing/meshes/shared-domain/realized-size-fields"
                     .to_string(),
             ],
+            runtime_active: false,
+            diagnostics_revision: 0,
         };
 
         let fetches = current_live_realtime_changes_since(&state, Some(&revisions()))
@@ -791,6 +946,8 @@ mod realtime_change_tests {
             run_id: Some("run-1".to_string()),
             revisions: current,
             mesh_resource_fetches: Vec::new(),
+            runtime_active: false,
+            diagnostics_revision: 0,
         };
 
         let changes = current_live_realtime_changes_since(&state, Some(&previous));
@@ -816,6 +973,8 @@ mod realtime_change_tests {
             run_id: Some("run-1".to_string()),
             revisions: current,
             mesh_resource_fetches: Vec::new(),
+            runtime_active: false,
+            diagnostics_revision: 0,
         };
 
         let changes = current_live_realtime_changes_since(&state, Some(&previous));
@@ -841,6 +1000,8 @@ mod realtime_change_tests {
             run_id: Some("run-1".to_string()),
             revisions: current_revisions,
             mesh_resource_fetches: Vec::new(),
+            runtime_active: false,
+            diagnostics_revision: 0,
         };
 
         let changes = current_live_realtime_changes_since(&state, Some(&previous));
@@ -849,6 +1010,12 @@ mod realtime_change_tests {
             matches!(change.resource, RealtimeResourceName::Fields)
                 && change.resource_id.as_deref() == Some("samples")
                 && change.recommended_fetch.is_none()
+                && !change.broad
+                && change.quantity_ids == vec!["m".to_string()]
+        }));
+        assert!(changes.iter().any(|change| {
+            matches!(change.resource, RealtimeResourceName::PlanarFields)
+                && change.resource_id.as_deref() == Some("field")
                 && !change.broad
                 && change.quantity_ids == vec!["m".to_string()]
         }));
@@ -864,6 +1031,8 @@ mod realtime_change_tests {
             run_id: Some("run-1".to_string()),
             revisions: current_revisions,
             mesh_resource_fetches: Vec::new(),
+            runtime_active: false,
+            diagnostics_revision: 0,
         };
 
         let changes = current_live_realtime_changes_since(&state, Some(&previous));
@@ -890,6 +1059,8 @@ mod realtime_change_tests {
             run_id: Some("run-1".to_string()),
             revisions: current,
             mesh_resource_fetches: Vec::new(),
+            runtime_active: false,
+            diagnostics_revision: 0,
         };
 
         let changes = current_live_realtime_changes_since(&state, Some(&previous));
@@ -1060,6 +1231,265 @@ mod realtime_change_tests {
             .iter()
             .all(|change| matches!(change.resource, RealtimeResourceName::Fields)));
     }
+
+    #[test]
+    fn planar_field_changes_use_the_field_sample_qos_lane() {
+        let policy = current_live_realtime_communication_policy_defaults();
+        let batches = split_realtime_changes_for_qos(
+            vec![RealtimeResourceChange {
+                resource: RealtimeResourceName::PlanarFields,
+                revision: 6,
+                resource_id: Some("field".to_string()),
+                quantity_ids: vec!["m".to_string()],
+                broad: false,
+                domain_generation_id: Some("1".to_string()),
+                recommended_fetch: None,
+            }],
+            true,
+            250,
+            &policy,
+        );
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].1, true);
+        assert_eq!(batches[0].2, policy.field_sample_publish_ms);
+    }
+
+    fn scalar_qos_sample(
+        run_id: &str,
+        revision: u64,
+        step: u64,
+        terminal: bool,
+    ) -> PendingRealtimeScalarSample {
+        PendingRealtimeScalarSample {
+            session_id: "session-1".to_string(),
+            run_id: Some(run_id.to_string()),
+            revision,
+            row: ScalarRow {
+                kind: fullmag_quantities::StepDataKind::PhysicalObservation,
+                solver_progress: None,
+                observation_frame: None,
+                step,
+                time: step as f64,
+                solver_dt: 1.0,
+                error_estimate: None,
+                max_error: None,
+                dt_suggested: None,
+                rejected_attempts: 0,
+                pseudo_time_s: None,
+                active_runtime_s: None,
+                mx: 0.0,
+                my: 0.0,
+                mz: 1.0,
+                e_ex: 0.0,
+                e_demag: 0.0,
+                e_ext: 0.0,
+                e_ani: 0.0,
+                e_dmi: 0.0,
+                e_rotated_dmi: Some(0.0),
+                e_total: 0.0,
+                max_dm_dt: 0.0,
+                max_h_eff: 0.0,
+                max_h_demag: 0.0,
+                max_torque_Apm: 0.0,
+                max_torque_T: 0.0,
+                per_object_scalars: HashMap::new(),
+                table_expressions: Vec::new(),
+            },
+            terminal,
+        }
+    }
+
+    #[test]
+    fn scalar_qos_publishes_first_sample_immediately() {
+        let mut state = CurrentLiveRealtimeScalarSampleQosState::default();
+        let now = tokio::time::Instant::now();
+
+        let action = state.admit(scalar_qos_sample("run-1", 1, 1, false), now, 200);
+
+        assert!(matches!(action, ScalarSampleQosAction::Publish(_)));
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn scalar_qos_keeps_only_latest_sample_inside_window() {
+        let mut state = CurrentLiveRealtimeScalarSampleQosState::default();
+        let now = tokio::time::Instant::now();
+        assert!(matches!(
+            state.admit(scalar_qos_sample("run-1", 1, 1, false), now, 200),
+            ScalarSampleQosAction::Publish(_)
+        ));
+
+        let first_pending = state.admit(
+            scalar_qos_sample("run-1", 2, 2, false),
+            now + Duration::from_millis(10),
+            200,
+        );
+        let replacement = state.admit(
+            scalar_qos_sample("run-1", 3, 3, false),
+            now + Duration::from_millis(20),
+            200,
+        );
+
+        assert!(matches!(
+            first_pending,
+            ScalarSampleQosAction::Schedule { .. }
+        ));
+        assert!(matches!(replacement, ScalarSampleQosAction::Pending));
+        assert_eq!(
+            state.pending.as_ref().map(|sample| sample.revision),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn scalar_qos_terminal_bypasses_window_and_clears_pending() {
+        let mut state = CurrentLiveRealtimeScalarSampleQosState::default();
+        let now = tokio::time::Instant::now();
+        let _ = state.admit(scalar_qos_sample("run-1", 1, 1, false), now, 200);
+        let _ = state.admit(
+            scalar_qos_sample("run-1", 2, 2, false),
+            now + Duration::from_millis(10),
+            200,
+        );
+
+        let action = state.admit(
+            scalar_qos_sample("run-1", 3, 2, true),
+            now + Duration::from_millis(20),
+            200,
+        );
+
+        assert!(matches!(action, ScalarSampleQosAction::Publish(_)));
+        assert!(state.pending.is_none());
+    }
+
+    #[test]
+    fn scalar_qos_new_run_discards_previous_pending_sample() {
+        let mut state = CurrentLiveRealtimeScalarSampleQosState::default();
+        let now = tokio::time::Instant::now();
+        let _ = state.admit(scalar_qos_sample("run-1", 1, 1, false), now, 200);
+        let _ = state.admit(
+            scalar_qos_sample("run-1", 2, 2, false),
+            now + Duration::from_millis(10),
+            200,
+        );
+
+        let action = state.admit(
+            scalar_qos_sample("run-2", 3, 2, false),
+            now + Duration::from_millis(20),
+            200,
+        );
+
+        assert!(matches!(action, ScalarSampleQosAction::Publish(_)));
+        assert!(state.pending.is_none());
+        assert_eq!(
+            state.identity,
+            Some(("session-1".to_string(), Some("run-2".to_string())))
+        );
+    }
+
+    #[tokio::test]
+    async fn scalar_qos_reloads_patched_interval_before_flush() {
+        let state = crate::router_v2::tests::test_app_state();
+        let mut events = state.current_live_realtime_events.subscribe();
+        state
+            .current_live_realtime_policy
+            .write()
+            .await
+            .effective
+            .scalar_telemetry_publish_ms = 40;
+
+        queue_current_live_realtime_scalar_sample(
+            state.as_ref(),
+            scalar_qos_sample("run-1", 1, 1, false),
+        )
+        .await
+        .expect("first scalar sample");
+        events.recv().await.expect("first scalar event");
+
+        queue_current_live_realtime_scalar_sample(
+            state.as_ref(),
+            scalar_qos_sample("run-1", 2, 2, false),
+        )
+        .await
+        .expect("pending scalar sample");
+        state
+            .current_live_realtime_policy
+            .write()
+            .await
+            .effective
+            .scalar_telemetry_publish_ms = 140;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), events.recv())
+                .await
+                .is_err(),
+            "the stale 40 ms deadline must not publish after the policy changes"
+        );
+        let event = tokio::time::timeout(Duration::from_millis(160), events.recv())
+            .await
+            .expect("patched scalar deadline")
+            .expect("latest scalar event");
+        let event: LiveRealtimeServerEvent =
+            serde_json::from_str(&event.json).expect("scalar event JSON");
+        let LiveRealtimeServerEvent::ScalarSample { payload, .. } = event else {
+            panic!("expected scalar.sample event");
+        };
+        assert_eq!(payload.revision, 2);
+    }
+
+    #[test]
+    fn diagnostics_summary_qos_keeps_cpu_gpu_separate_from_solver_profile() {
+        let policy = current_live_realtime_communication_policy_defaults();
+        let mut changes = current_live_diagnostic_changes(true, 42);
+        changes.push(RealtimeResourceChange {
+            resource: RealtimeResourceName::Diagnostics,
+            revision: 7,
+            resource_id: Some("solver-profile".to_string()),
+            quantity_ids: Vec::new(),
+            broad: false,
+            domain_generation_id: None,
+            recommended_fetch: Some("/v2/sessions/current/diagnostics/solver-profile".to_string()),
+        });
+
+        let batches = split_realtime_changes_for_qos(changes, true, 250, &policy);
+
+        assert_eq!(batches.len(), 2);
+        let solver = batches
+            .iter()
+            .find(|(changes, _, _)| {
+                changes
+                    .iter()
+                    .any(|change| change.resource_id.as_deref() == Some("solver-profile"))
+            })
+            .expect("solver-profile lifecycle batch");
+        assert_eq!(solver.2, 250);
+        let hardware = batches
+            .iter()
+            .find(|(changes, _, _)| {
+                changes
+                    .iter()
+                    .any(|change| change.resource_id.as_deref() == Some("cpu"))
+            })
+            .expect("CPU/GPU diagnostics summary batch");
+        assert_eq!(hardware.2, policy.diagnostics_summary_ms);
+        assert_eq!(
+            hardware
+                .0
+                .iter()
+                .filter_map(|change| change.recommended_fetch.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                "/v2/sessions/current/diagnostics/cpu",
+                "/v2/sessions/current/diagnostics/gpu",
+            ]
+        );
+    }
+
+    #[test]
+    fn diagnostics_summary_qos_emits_no_cpu_or_gpu_for_inactive_runtime() {
+        assert!(current_live_diagnostic_changes(false, 42).is_empty());
+    }
 }
 
 #[cfg(test)]
@@ -1164,6 +1594,219 @@ mod terminal_snapshot_route_tests {
 }
 
 #[cfg(test)]
+mod scratch_session_lifecycle_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_runner_snapshot_cannot_reinstall_a_replaced_session() {
+        let state = crate::router_v2::tests::test_app_state();
+        let (_, Json(first)) = crate::router_v2::handlers::sessions::create(
+            State(state.clone()),
+            Json(crate::schemas::sessions::CreateSessionRequest {
+                name: "First".to_string(),
+                backend: "fdm".to_string(),
+                device: "cpu".to_string(),
+                precision: "double".to_string(),
+                replace_current: false,
+                output_storage: None,
+            }),
+        )
+        .await
+        .expect("first session must be created");
+        let (_, Json(replacement)) = crate::router_v2::handlers::sessions::create(
+            State(state.clone()),
+            Json(crate::schemas::sessions::CreateSessionRequest {
+                name: "Replacement".to_string(),
+                backend: "fem".to_string(),
+                device: "cpu".to_string(),
+                precision: "double".to_string(),
+                replace_current: true,
+                output_storage: None,
+            }),
+        )
+        .await
+        .expect("replacement session must be created");
+        state.current_display_selection.write().await.revision = 7;
+
+        let stale = sync_current_live_snapshot(
+            State(state.clone()),
+            Json(CurrentLiveSnapshotRequest {
+                frozen_spins_runtime_status: None,
+                session_id: first.session_id,
+                session: None,
+                session_status: None,
+                metadata: None,
+                mesh_workspace: None,
+                stage_execution: None,
+                simulation_preparation: None,
+                run: None,
+                live_state: None,
+                coupled_checkpoint: None,
+                latest_scalar_row: None,
+                latest_fields: None,
+                replace_latest_fields: false,
+                field_generation: None,
+                preview_fields: None,
+                clear_preview_cache: false,
+                engine_log: None,
+                solver_profile: None,
+                fem_mesh: None,
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            stale.expect_err("stale session must be rejected").status,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            state
+                .current_live_state
+                .read()
+                .await
+                .as_ref()
+                .map(|snapshot| snapshot.session.session_id.as_str()),
+            Some(replacement.session_id.as_str())
+        );
+        assert_eq!(state.current_display_selection.read().await.revision, 7);
+    }
+
+    #[tokio::test]
+    async fn admitted_runner_publication_blocks_scratch_replacement_until_send() {
+        let state = crate::router_v2::tests::test_app_state();
+        let (_, Json(first)) = crate::router_v2::handlers::sessions::create(
+            State(state.clone()),
+            Json(crate::schemas::sessions::CreateSessionRequest {
+                name: "First".to_string(),
+                backend: "fdm".to_string(),
+                device: "cpu".to_string(),
+                precision: "double".to_string(),
+                replace_current: false,
+                output_storage: None,
+            }),
+        )
+        .await
+        .expect("first session must be created");
+        let hook = crate::types::CurrentLiveRealtimeBeforeSendHook {
+            admitted: Arc::new(tokio::sync::Notify::new()),
+            resume: Arc::new(tokio::sync::Notify::new()),
+        };
+        *state.current_live_realtime_before_send_hook.lock().await = Some(hook.clone());
+        let mut events = state.current_live_realtime_events.subscribe();
+
+        let runner_state = state.clone();
+        let runner_session_id = first.session_id.clone();
+        let runner = tokio::spawn(async move {
+            sync_current_live_snapshot(
+                State(runner_state),
+                Json(CurrentLiveSnapshotRequest {
+                    frozen_spins_runtime_status: None,
+                    session_id: runner_session_id,
+                    session: None,
+                    session_status: None,
+                    metadata: None,
+                    mesh_workspace: None,
+                    stage_execution: None,
+                    simulation_preparation: None,
+                    run: None,
+                    live_state: None,
+                    coupled_checkpoint: None,
+                    latest_scalar_row: None,
+                    latest_fields: Some(
+                        serde_json::from_value(serde_json::json!({
+                            "H_eff": {
+                                "values": [[0.0, 1.0, 0.0]],
+                                "layout": { "grid_cells": [1, 1, 1] }
+                            }
+                        }))
+                        .expect("runner terminal field frame must deserialize"),
+                    ),
+                    replace_latest_fields: true,
+                    field_generation: Some(CurrentLiveFieldGeneration {
+                        run_id: "runner-test".to_string(),
+                        sequence: 1,
+                    }),
+                    preview_fields: None,
+                    clear_preview_cache: true,
+                    engine_log: None,
+                    solver_profile: None,
+                    fem_mesh: None,
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), hook.admitted.notified())
+            .await
+            .expect("runner must pause after publication admission");
+
+        let replacement_state = state.clone();
+        let replacement = tokio::spawn(async move {
+            crate::router_v2::handlers::sessions::create(
+                State(replacement_state),
+                Json(crate::schemas::sessions::CreateSessionRequest {
+                    name: "Replacement".to_string(),
+                    backend: "fem".to_string(),
+                    device: "cpu".to_string(),
+                    precision: "double".to_string(),
+                    replace_current: true,
+                    output_storage: None,
+                }),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !replacement.is_finished(),
+            "scratch replacement must wait for the admitted runner publication"
+        );
+
+        hook.resume.notify_one();
+        let _ = runner
+            .await
+            .expect("runner task must complete")
+            .expect("runner publication must be accepted");
+        let (_, Json(replacement)) = replacement
+            .await
+            .expect("replacement task must complete")
+            .expect("replacement must be created");
+
+        let runner_event =
+            tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+                .await
+                .expect("runner must publish before replacement")
+                .expect("realtime channel must remain open");
+        let runner_event: LiveRealtimeServerEvent =
+            serde_json::from_str(&runner_event.json).expect("runner event must serialize");
+        assert!(matches!(
+            runner_event,
+            LiveRealtimeServerEvent::ResourceBatchChanged { ref session_id, .. }
+                if session_id == &first.session_id
+        ));
+        let replacement_event =
+            tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+                .await
+                .expect("replacement must publish after runner")
+                .expect("realtime channel must remain open");
+        let replacement_event: LiveRealtimeServerEvent =
+            serde_json::from_str(&replacement_event.json)
+                .expect("replacement event must serialize");
+        assert!(matches!(
+            replacement_event,
+            LiveRealtimeServerEvent::ResourceBatchChanged { ref session_id, .. }
+                if session_id == &replacement.session_id
+        ));
+        let replay = state.current_live_realtime_replay.lock().await;
+        assert!(replay.iter().all(|record| {
+            matches!(
+                serde_json::from_str::<LiveRealtimeServerEvent>(&record.json),
+                Ok(LiveRealtimeServerEvent::ResourceBatchChanged { ref session_id, .. })
+                    if session_id == &replacement.session_id
+            )
+        }));
+    }
+}
+
+#[cfg(test)]
 fn current_live_realtime_event_coalesce_window_ms(event: &LiveRealtimeServerEvent) -> Option<u32> {
     if let LiveRealtimeServerEvent::ResourceBatchChanged { payload, .. } = event {
         if payload.changes.iter().any(|change| {
@@ -1187,6 +1830,8 @@ async fn publish_current_live_realtime_event(
     state: &AppState,
     event: LiveRealtimeServerEvent,
 ) -> Result<(), ApiError> {
+    #[cfg(test)]
+    pause_current_live_realtime_before_send(state).await;
     publish_current_live_realtime_event_with_parts(
         &state.current_live_realtime_events,
         &state.current_live_realtime_replay,
@@ -1194,6 +1839,19 @@ async fn publish_current_live_realtime_event(
         event,
     )
     .await
+}
+
+#[cfg(test)]
+async fn pause_current_live_realtime_before_send(state: &AppState) {
+    let hook = state
+        .current_live_realtime_before_send_hook
+        .lock()
+        .await
+        .take();
+    if let Some(hook) = hook {
+        hook.admitted.notify_one();
+        hook.resume.notified().await;
+    }
 }
 
 async fn publish_current_live_realtime_event_with_parts(
@@ -1337,6 +1995,7 @@ async fn queue_current_live_realtime_resource_batch(
     };
 
     if should_spawn {
+        let session_transition = state.current_live_session_transition.clone();
         let pending_batches = state.current_live_realtime_pending_batches.clone();
         let events = state.current_live_realtime_events.clone();
         let replay = state.current_live_realtime_replay.clone();
@@ -1344,6 +2003,7 @@ async fn queue_current_live_realtime_resource_batch(
         let policy = state.current_live_realtime_policy.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(u64::from(window_ms))).await;
+            let _session_transition = session_transition.lock().await;
             let Some(pending) = pending_batches.lock().await.remove(&key) else {
                 return;
             };
@@ -1384,6 +2044,7 @@ fn realtime_coalesced_batch_key(changes: &[RealtimeResourceChange]) -> String {
     match lane {
         RealtimeQosLane::Immediate => "immediate",
         RealtimeQosLane::Lifecycle => "lifecycle",
+        RealtimeQosLane::DiagnosticsSummary => "diagnostics_summary",
         RealtimeQosLane::ScalarRows => "scalar_rows",
         RealtimeQosLane::FieldSamples => "field_samples",
     }
@@ -1453,23 +2114,11 @@ async fn publish_current_live_realtime_resource_changes_unsplit(
     .await
 }
 
-async fn publish_current_live_realtime_scalar_sample(
+async fn publish_current_live_realtime_scalar_sample_now(
     state: &AppState,
-    session_id: String,
-    run_id: Option<String>,
-    revision: u64,
-    row: ScalarRow,
+    sample: PendingRealtimeScalarSample,
 ) -> Result<(), ApiError> {
-    if !state
-        .current_live_realtime_policy
-        .read()
-        .await
-        .effective
-        .scalar_sample_enabled
-    {
-        return Ok(());
-    }
-    let row = serde_json::to_value(row).map_err(|error| {
+    let row = serde_json::to_value(sample.row).map_err(|error| {
         ApiError::internal(format!("failed to serialize scalar sample row: {error}"))
     })?;
     let seq = state
@@ -1481,19 +2130,123 @@ async fn publish_current_live_realtime_scalar_sample(
         LiveRealtimeServerEvent::ScalarSample {
             seq,
             ts: realtime_timestamp_now(),
-            session_id,
-            run_id,
+            session_id: sample.session_id,
+            run_id: sample.run_id,
             contract_version: current_live_realtime_contract_version().to_string(),
-            payload: ScalarSamplePayload { revision, row },
+            payload: ScalarSamplePayload {
+                revision: sample.revision,
+                row,
+            },
         },
     )
     .await
+}
+
+async fn queue_current_live_realtime_scalar_sample(
+    state: &AppState,
+    sample: PendingRealtimeScalarSample,
+) -> Result<(), ApiError> {
+    let policy = state
+        .current_live_realtime_policy
+        .read()
+        .await
+        .effective
+        .clone();
+    if !policy.scalar_sample_enabled {
+        state
+            .current_live_realtime_scalar_sample_qos
+            .lock()
+            .await
+            .clear();
+        return Ok(());
+    }
+
+    let action = state
+        .current_live_realtime_scalar_sample_qos
+        .lock()
+        .await
+        .admit(
+            sample,
+            tokio::time::Instant::now(),
+            policy.scalar_telemetry_publish_ms,
+        );
+    match action {
+        ScalarSampleQosAction::Publish(sample) => {
+            publish_current_live_realtime_scalar_sample_now(state, sample).await
+        }
+        ScalarSampleQosAction::Schedule { generation, delay } => {
+            spawn_current_live_realtime_scalar_sample_flush(state.clone(), generation, delay);
+            Ok(())
+        }
+        ScalarSampleQosAction::Pending => Ok(()),
+    }
+}
+
+fn spawn_current_live_realtime_scalar_sample_flush(
+    state: AppState,
+    generation: u64,
+    initial_delay: Duration,
+) {
+    tokio::spawn(async move {
+        let mut delay = initial_delay;
+        loop {
+            tokio::time::sleep(delay).await;
+            let _session_transition = state.current_live_session_transition.lock().await;
+            let policy = state
+                .current_live_realtime_policy
+                .read()
+                .await
+                .effective
+                .clone();
+            if !policy.scalar_sample_enabled {
+                let mut qos = state.current_live_realtime_scalar_sample_qos.lock().await;
+                if qos.flush_generation == generation {
+                    qos.clear();
+                }
+                return;
+            }
+
+            let now = tokio::time::Instant::now();
+            let interval = Duration::from_millis(u64::from(policy.scalar_telemetry_publish_ms));
+            let (sample, next_delay) = {
+                let mut qos = state.current_live_realtime_scalar_sample_qos.lock().await;
+                if qos.flush_generation != generation {
+                    return;
+                }
+                let Some(last_published_at) = qos.last_published_at else {
+                    qos.clear();
+                    return;
+                };
+                let deadline = last_published_at + interval;
+                if now < deadline {
+                    (None, Some(deadline.saturating_duration_since(now)))
+                } else {
+                    let sample = qos.pending.take();
+                    if sample.is_some() {
+                        qos.last_published_at = Some(now);
+                    }
+                    qos.flush_generation = qos.flush_generation.wrapping_add(1);
+                    (sample, None)
+                }
+            };
+
+            if let Some(next_delay) = next_delay {
+                delay = next_delay;
+                continue;
+            }
+            if let Some(sample) = sample {
+                let _ = publish_current_live_realtime_scalar_sample_now(&state, sample).await;
+            }
+            return;
+        }
+    });
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RealtimeQosLane {
     Immediate,
     Lifecycle,
+    DiagnosticsSummary,
     ScalarRows,
     FieldSamples,
 }
@@ -1508,8 +2261,10 @@ fn realtime_qos_lane(change: &RealtimeResourceChange) -> RealtimeQosLane {
         return RealtimeQosLane::Immediate;
     }
 
-    if matches!(change.resource, RealtimeResourceName::Fields)
-        && change.resource_id.as_deref() == Some("samples")
+    if (matches!(change.resource, RealtimeResourceName::Fields)
+        && change.resource_id.as_deref() == Some("samples"))
+        || (matches!(change.resource, RealtimeResourceName::PlanarFields)
+            && change.resource_id.as_deref() == Some("field"))
     {
         return RealtimeQosLane::FieldSamples;
     }
@@ -1518,6 +2273,12 @@ fn realtime_qos_lane(change: &RealtimeResourceChange) -> RealtimeQosLane {
         && change.resource_id.as_deref() == Some("table:default:rows")
     {
         return RealtimeQosLane::ScalarRows;
+    }
+
+    if matches!(change.resource, RealtimeResourceName::Diagnostics)
+        && matches!(change.resource_id.as_deref(), Some("cpu" | "gpu"))
+    {
+        return RealtimeQosLane::DiagnosticsSummary;
     }
 
     RealtimeQosLane::Lifecycle
@@ -1531,6 +2292,7 @@ fn realtime_qos_window_ms(
     match lane {
         RealtimeQosLane::Immediate => 0,
         RealtimeQosLane::Lifecycle => lifecycle_window_ms,
+        RealtimeQosLane::DiagnosticsSummary => policy.diagnostics_summary_ms,
         RealtimeQosLane::ScalarRows => policy.table_rows_min_refetch_ms,
         RealtimeQosLane::FieldSamples => policy.field_sample_publish_ms,
     }
@@ -1570,6 +2332,7 @@ fn realtime_change_allowed_by_policy(
     }
     match realtime_qos_lane(change) {
         RealtimeQosLane::Immediate | RealtimeQosLane::Lifecycle => policy.lifecycle_events_enabled,
+        RealtimeQosLane::DiagnosticsSummary => policy.diagnostics_enabled,
         RealtimeQosLane::ScalarRows => policy.scalar_table_rows_enabled,
         RealtimeQosLane::FieldSamples => policy.field_samples_enabled,
     }
@@ -1590,18 +2353,20 @@ fn split_realtime_changes_for_qos(
 
     let mut immediate_changes = Vec::new();
     let mut lifecycle_changes = Vec::new();
+    let mut diagnostics_summary_changes = Vec::new();
     let mut scalar_row_changes = Vec::new();
     let mut field_sample_changes = Vec::new();
     for change in changes {
         match realtime_qos_lane(&change) {
             RealtimeQosLane::Immediate => immediate_changes.push(change),
             RealtimeQosLane::Lifecycle => lifecycle_changes.push(change),
+            RealtimeQosLane::DiagnosticsSummary => diagnostics_summary_changes.push(change),
             RealtimeQosLane::ScalarRows => scalar_row_changes.push(change),
             RealtimeQosLane::FieldSamples => field_sample_changes.push(change),
         }
     }
 
-    let mut batches = Vec::with_capacity(4);
+    let mut batches = Vec::with_capacity(5);
     if !immediate_changes.is_empty() {
         batches.push((immediate_changes, false, 0));
     }
@@ -1610,6 +2375,13 @@ fn split_realtime_changes_for_qos(
             lifecycle_changes,
             true,
             realtime_qos_window_ms(RealtimeQosLane::Lifecycle, window_ms, policy),
+        ));
+    }
+    if !diagnostics_summary_changes.is_empty() {
+        batches.push((
+            diagnostics_summary_changes,
+            true,
+            realtime_qos_window_ms(RealtimeQosLane::DiagnosticsSummary, window_ms, policy),
         ));
     }
     if !scalar_row_changes.is_empty() {
@@ -1648,7 +2420,9 @@ fn parse_texture_projection_mode(value: &str) -> TextureProjectionMode {
 #[tokio::main]
 async fn main() {
     fullmag_build_info::print_startup_stamp();
-    if std::env::args().any(|arg| arg == "--print-openapi-v2") {
+    if option_env!("CARGO_BIN_NAME") == Some("fullmag-api-openapi")
+        || std::env::args().any(|arg| arg == "--print-openapi-v2")
+    {
         println!(
             "{}",
             serde_json::to_string_pretty(&openapi_v2::openapi_json())
@@ -1660,10 +2434,13 @@ async fn main() {
     tracing_subscriber::fmt().with_env_filter("info").init();
 
     let repo_root = repo_root();
-    let current_workspace_root = repo_root
-        .join(".fullmag")
-        .join("local-live")
-        .join("current");
+    let runtime_state_root = crate::script::state_root(&repo_root).unwrap_or_else(|error| {
+        tracing::error!("Cannot initialize runtime state: {error}");
+        std::process::exit(1);
+    });
+    let current_workspace_root = runtime_state_root.join("local-live").join("current");
+    let current_command_journal_store_root =
+        runtime_state_root.join("local-live").join("session-store");
     let static_web_root = resolve_static_web_root(&repo_root);
 
     let feature_flags = FeatureFlags::resolve();
@@ -1675,17 +2452,39 @@ async fn main() {
     }
 
     let state = Arc::new(AppState {
+        development_admission: Default::default(),
+        development_restored_authoring: Default::default(),
+        development_backend: router_v2::handlers::platform::development_backend::DevelopmentBackendConfig::from_environment(),
+        development_restart_transport: router_v2::handlers::platform::development_restart_request::DevelopmentRestartTransportConfig::from_environment(),
+        development_consumer_readiness: Default::default(),
         repo_root: repo_root.clone(),
+        submit_store_root: run_intent_persistence::configured_submit_store_root(
+            &repo_root,
+            &runtime_state_root,
+        ),
+        submit_backlog_limit: run_intent_persistence::configured_submit_backlog_limit()
+            .expect("accepted run backlog limit configuration must be valid"),
         current_workspace_root,
+        current_command_journal_store_root: Some(current_command_journal_store_root),
+        current_command_journal_revision: Arc::new(AtomicU64::new(0)),
         current_live_state: Arc::new(RwLock::new(None)),
+        current_live_session_transition: Arc::new(Mutex::new(())),
+        request_scope_instance_id: router_v2::middleware::version::instance_id().to_string(),
+        current_live_session_epoch: Arc::new(AtomicU64::new(0)),
+        #[cfg(test)]
+        current_live_realtime_before_send_hook: Arc::new(Mutex::new(None)),
         current_live_connectivity: Arc::new(RwLock::new(
             crate::schemas::status::SessionConnectivity::Connected,
         )),
         current_live_last_seen_unix_ms: Arc::new(AtomicU64::new(0)),
+        current_live_preparation_receipt: Arc::new(RwLock::new(None)),
         current_live_realtime_events: broadcast::channel(256).0,
         current_live_realtime_replay: Arc::new(Mutex::new(VecDeque::new())),
         current_live_realtime_next_seq: Arc::new(AtomicU64::new(0)),
         current_live_realtime_pending_batches: Arc::new(Mutex::new(HashMap::new())),
+        current_live_realtime_scalar_sample_qos: Arc::new(Mutex::new(
+            CurrentLiveRealtimeScalarSampleQosState::default(),
+        )),
         current_live_realtime_policy: Arc::new(RwLock::new(
             CurrentLiveRealtimePolicyState::default(),
         )),
@@ -1707,6 +2506,14 @@ async fn main() {
         frozen_spins_previews: Arc::new(RwLock::new(Default::default())),
     });
 
+    router_v2::handlers::platform::development_restore_input::restore_before_listen(state.as_ref())
+        .await
+        .expect("private development authoring restore must succeed before API startup");
+
+    let (owner_shutdown_tx, owner_shutdown_rx) = tokio::sync::oneshot::channel();
+    let owner_control = development_owner_control::prepare(state.clone(), owner_shutdown_tx)
+        .expect("private development owner configuration must be valid before API startup");
+
     let cors = router_v2::middleware::cors::cors_layer();
 
     let app = Router::new()
@@ -1714,12 +2521,24 @@ async fn main() {
         .route("/v2/platform/vision", get(vision))
         // ── Internal runner bridge (not part of the public browser contract) ──
         .route(
+            "/v1/internal/live/current/display-selection",
+            get(read_current_live_display_selection),
+        )
+        .route(
             "/v1/internal/live/current/snapshot",
-            post(sync_current_live_snapshot),
+            post(sync_current_live_snapshot_with_owner),
         )
         .route(
             "/v2/sessions/current/internal/live/snapshot",
-            post(sync_current_live_snapshot),
+            post(sync_current_live_snapshot_with_owner),
+        )
+        .route(
+            "/v2/sessions/current/internal/live/preparation-receipt",
+            post(sync_current_live_preparation_receipt),
+        )
+        .route(
+            "/v2/sessions/current/internal/live/materialize-preparation",
+            post(materialize_current_live_preparation),
         )
         .route(
             "/v1/internal/live/current/session",
@@ -1753,6 +2572,10 @@ async fn main() {
 
     let app = maybe_merge_swagger_ui(app)
         .layer(DefaultBodyLimit::max(LOCAL_BRIDGE_BODY_LIMIT_BYTES))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            router_v2::middleware::development_admission::mutation_admission_middleware,
+        ))
         .layer(cors)
         .with_state(state);
 
@@ -1778,9 +2601,25 @@ async fn main() {
         .await
         .expect("binding API listener should succeed");
 
-    axum::serve(listener, app)
-        .await
-        .expect("serving API should succeed");
+    let owner_control_task = owner_control.map(|control| {
+        control
+            .start(listener.local_addr().expect("API listener address").port())
+            .expect("publishing private development owner must succeed")
+    });
+
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            // An absent or failed private owner must not stop an ordinary API.
+            if owner_shutdown_rx.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        })
+        .await;
+    if let Some(task) = owner_control_task {
+        task.abort();
+        let _ = task.await;
+    }
+    result.expect("serving API should succeed");
 }
 
 #[cfg(feature = "swagger-ui")]
@@ -2113,62 +2952,289 @@ fn kb_to_mb(value: u64) -> f64 {
     value as f64 / 1024.0
 }
 
-async fn mark_command_dispatched(state: &Arc<AppState>, command: &SessionCommand) {
-    let mut ledger = state.current_command_ledger.lock().await;
-    if let Some(record) = ledger
-        .iter_mut()
-        .find(|record| record.command.command_id == command.command_id)
-    {
-        record.status = crate::types::CommandLifecycleState::Dispatched;
-        record.dispatched_at_unix_ms = Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_millis())
-                .unwrap_or(0),
-        );
-        record.completed_at_unix_ms = None;
-        record.completion_status = None;
+async fn mark_commands_dispatched(
+    state: &Arc<AppState>,
+    commands: &[SessionCommand],
+) -> Result<(), ApiError> {
+    if commands.is_empty() {
+        return Ok(());
     }
+    let snapshot = state
+        .current_live_state
+        .read()
+        .await
+        .as_ref()
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    let dispatched_at_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    live_command_journal::mutate(state, &snapshot, |ledger| {
+        let mut changed = false;
+        for command in commands {
+            if let Some(record) = ledger
+                .iter_mut()
+                .find(|record| record.command.command_id == command.command_id)
+            {
+                record.status = crate::types::CommandLifecycleState::Dispatched;
+                record.dispatched_at_unix_ms = Some(dispatched_at_unix_ms);
+                record.completed_at_unix_ms = None;
+                record.completion_status = None;
+                record.error = None;
+                changed = true;
+            }
+        }
+        Ok(((), changed))
+    })
+    .await
 }
 
 async fn take_next_current_control_command_after(
     state: &Arc<AppState>,
     after_seq: u64,
-) -> Option<SessionCommand> {
+    grid_refresh_command_id: Option<&str>,
+) -> Result<Option<SessionCommand>, ApiError> {
     let mut stale = Vec::new();
     let selected = {
         let mut queue = state.current_control_queue.lock().await;
-        let index = 0usize;
-        let mut selected = None;
-        while index < queue.len() {
-            let Some(command) = queue.get(index) else {
-                break;
-            };
-            if command.seq <= after_seq {
-                if let Some(removed) = queue.remove(index) {
-                    stale.push(removed);
-                }
-                continue;
-            }
-            selected = queue.remove(index);
-            break;
-        }
-        selected
+        take_next_control_command_from_queue(
+            &mut queue,
+            after_seq,
+            grid_refresh_command_id,
+            &mut stale,
+        )
     };
 
-    for command in &stale {
-        mark_command_dispatched(state, command).await;
+    let mut dispatched = stale.clone();
+    if let Some(command) = selected.as_ref() {
+        dispatched.push(command.clone());
     }
-    if let Some(command) = &selected {
-        mark_command_dispatched(state, command).await;
+    if let Err(error) = mark_commands_dispatched(state, &dispatched).await {
+        let mut queue = state.current_control_queue.lock().await;
+        for command in dispatched {
+            if !queue
+                .iter()
+                .any(|queued| queued.command_id == command.command_id)
+            {
+                queue.push_back(command);
+            }
+        }
+        queue.make_contiguous().sort_by_key(|command| command.seq);
+        return Err(error);
     }
-    selected
+    Ok(selected)
 }
 
+fn take_next_control_command_from_queue(
+    queue: &mut VecDeque<SessionCommand>,
+    after_seq: u64,
+    grid_refresh_command_id: Option<&str>,
+    stale: &mut Vec<SessionCommand>,
+) -> Option<SessionCommand> {
+    if let Some(command_id) = grid_refresh_command_id {
+        let index = queue.iter().position(|command| {
+            command.seq > after_seq
+                && command.command_id == command_id
+                && command.kind == "fdm_grid_refresh"
+        })?;
+        return queue.remove(index);
+    }
+
+    let index = 0usize;
+    while index < queue.len() {
+        let Some(command) = queue.get(index) else {
+            break;
+        };
+        if command.seq <= after_seq {
+            if let Some(removed) = queue.remove(index) {
+                stale.push(removed);
+            }
+            continue;
+        }
+        return queue.remove(index);
+    }
+    None
+}
+
+#[cfg(test)]
+mod current_control_queue_selection_tests {
+    use super::take_next_control_command_from_queue;
+    use crate::types::SessionCommand;
+    use std::collections::VecDeque;
+
+    fn command(seq: u64, command_id: &str, kind: &str) -> SessionCommand {
+        serde_json::from_value(serde_json::json!({
+            "seq": seq,
+            "command_id": command_id,
+            "kind": kind,
+            "created_at_unix_ms": seq
+        }))
+        .expect("minimal session command should deserialize")
+    }
+
+    #[test]
+    fn pinned_grid_refresh_removes_only_the_exact_new_command() {
+        let mut queue = VecDeque::from([
+            command(1, "old-solve", "solve"),
+            command(2, "other-grid", "fdm_grid_refresh"),
+            command(3, "wanted-grid", "fdm_grid_refresh"),
+            command(4, "later-solve", "solve"),
+        ]);
+        let mut stale = Vec::new();
+
+        let selected = take_next_control_command_from_queue(
+            &mut queue,
+            1,
+            Some("wanted-grid"),
+            &mut stale,
+        )
+        .expect("exact pinned grid refresh should be selected");
+
+        assert_eq!(selected.command_id, "wanted-grid");
+        assert!(stale.is_empty(), "pinned selection must not drain stale commands");
+        assert_eq!(
+            queue
+                .iter()
+                .map(|command| command.command_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["old-solve", "other-grid", "later-solve"]
+        );
+    }
+
+    #[test]
+    fn pinned_grid_refresh_miss_preserves_every_queued_command() {
+        let mut queue = VecDeque::from([
+            command(0, "wanted-grid", "fdm_grid_refresh"),
+            command(1, "same-id-wrong-kind", "solve"),
+            command(2, "other-grid", "fdm_grid_refresh"),
+        ]);
+        let mut stale = Vec::new();
+
+        assert!(take_next_control_command_from_queue(
+            &mut queue,
+            0,
+            Some("wanted-grid"),
+            &mut stale,
+        )
+        .is_none());
+        assert!(stale.is_empty());
+        assert_eq!(queue.len(), 3);
+    }
+}
+
+#[cfg(test)]
 async fn sync_current_live_snapshot(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CurrentLiveSnapshotRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    sync_current_live_snapshot_impl(state, req, None).await
+}
+
+/// Private runner precondition; it is not a browser resource or a new route.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalSnapshotOwner {
+    session_id: String,
+    run_id: String,
+    #[serde(default)]
+    require_empty: bool,
+    session_epoch: Option<u64>,
+    request_scope_epoch: Option<String>,
+}
+
+async fn sync_current_live_snapshot_with_owner(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<CurrentLiveSnapshotRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let owner = headers
+        .get("x-fullmag-terminal-owner")
+        .map(|value| {
+            let text = value.to_str().map_err(|_| {
+                ApiError::bad_request("invalid terminal snapshot owner header")
+            })?;
+            serde_json::from_str::<TerminalSnapshotOwner>(text).map_err(|_| {
+                ApiError::bad_request("invalid terminal snapshot owner header")
+            })
+        })
+        .transpose()?;
+    sync_current_live_snapshot_impl(state, req, owner).await
+}
+
+fn validate_terminal_snapshot_owner(
+    state: &AppState,
+    snapshot: &SessionStateResponse,
+    req: &CurrentLiveSnapshotRequest,
+    owner: &TerminalSnapshotOwner,
+) -> Result<(), ApiError> {
+    // Called by the frame apply closure under current_live_session_transition.
+    // Checking GET status before/after POST cannot provide this guarantee.
+    let epoch = state.current_live_session_epoch.load(Ordering::Acquire);
+    let request_scope_epoch = format!("{}:{epoch}", state.request_scope_instance_id);
+    let payload_matches = req.session_id == owner.session_id
+        && req.session.as_ref().is_some_and(|session| {
+            session.session_id == owner.session_id && session.run_id == owner.run_id
+        })
+        && req.run.as_ref().is_some_and(|run| {
+            run.session_id == owner.session_id && run.run_id == owner.run_id
+        });
+    if owner.require_empty {
+        // Only the initial full frame may create an empty workspace. Inspect
+        // actual state, not the default clone synthesized for a first frame.
+        let current = state
+            .current_live_state
+            .try_read()
+            .map_err(|_| ApiError::conflict_with_code(
+                "terminal_snapshot_owner_busy", "terminal_snapshot_owner_busy"
+            ))?;
+        if current.is_none()
+            && !owner.session_id.is_empty()
+            && !owner.run_id.is_empty()
+            && payload_matches
+            && owner.session_epoch.is_none()
+            && owner.request_scope_epoch.is_none()
+        {
+            return Ok(());
+        }
+        return Err(ApiError::conflict_with_code(
+            "terminal_snapshot_owner_stale", "terminal_snapshot_owner_stale"
+        ));
+    }
+    if owner.session_id.is_empty()
+        || owner.run_id.is_empty()
+        || owner.session_epoch != Some(epoch)
+        || owner.request_scope_epoch.as_deref() != Some(request_scope_epoch.as_str())
+        || snapshot.session.session_id != owner.session_id
+        || snapshot.session.run_id != owner.run_id
+        || !snapshot.run.as_ref().is_some_and(|run| {
+            run.session_id == owner.session_id && run.run_id == owner.run_id
+        })
+        || req.session_id != owner.session_id
+        || req.session.as_ref().is_some_and(|session| {
+            session.session_id != owner.session_id || session.run_id != owner.run_id
+        })
+        || req.run.as_ref().is_some_and(|run| {
+            run.session_id != owner.session_id || run.run_id != owner.run_id
+        })
+    {
+        return Err(ApiError::conflict_with_code(
+            "terminal_snapshot_owner_stale", "terminal_snapshot_owner_stale"
+        ));
+    }
+    Ok(())
+}
+
+async fn sync_current_live_snapshot_impl(
+    state: Arc<AppState>,
+    req: CurrentLiveSnapshotRequest,
+    owner: Option<TerminalSnapshotOwner>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let kind = if is_authoring_grid_snapshot(&req) {
+        CurrentLiveSyncKind::AuthoringGridSnapshot
+    } else {
+        CurrentLiveSyncKind::Snapshot
+    };
     let has_live_state_update = req.live_state.is_some();
     let has_scalar_row_update = req.latest_scalar_row.is_some();
     let has_latest_fields_update = req.latest_fields.is_some();
@@ -2176,10 +3242,21 @@ async fn sync_current_live_snapshot(
     let preview_fields = req.preview_fields.clone();
     let clear_preview_cache = req.clear_preview_cache;
     let atomic_terminal_field_publish = req.replace_latest_fields;
+    // Preserve only a genuinely finished terminal replacement payload so the
+    // completed run remains inspectable. Initial replacement frames can still
+    // carry bootstrap fields and must use the large-grid filter.
+    let terminal_replacement = req.replace_latest_fields
+        && req
+            .live_state
+            .as_ref()
+            .is_some_and(|state| state.latest_step.finished);
+    let drop_live_magnetization =
+        state.feature_flags.disable_live_magnetization && !terminal_replacement;
     let session_id = req.session_id.clone();
+    let owner_state = state.clone();
     sync_current_live_frame_update(
         &state,
-        CurrentLiveSyncKind::Snapshot,
+        kind,
         &session_id,
         allow_previous_preview_fallback,
         has_live_state_update,
@@ -2188,9 +3265,104 @@ async fn sync_current_live_snapshot(
         preview_fields,
         clear_preview_cache,
         atomic_terminal_field_publish,
-        move |next| apply_current_live_snapshot(next, req),
+        move |next| {
+            if let Some(owner) = owner.as_ref() {
+                validate_terminal_snapshot_owner(&owner_state, next, &req, owner)?;
+            }
+            apply_current_live_snapshot_with_options(next, req, drop_live_magnetization)
+        },
     )
     .await
+}
+
+#[cfg(test)]
+mod terminal_snapshot_owner_tests {
+    use super::*;
+
+    fn fixture() -> (CurrentLiveSnapshotRequest, SessionStateResponse) {
+        let mut req: CurrentLiveSnapshotRequest = serde_json::from_value(json!({
+            "session_id": "terminal-session",
+            "run": {"session_id": "terminal-session", "run_id": "terminal-run",
+                "status": "completed", "total_steps": 0, "artifact_dir": "results"}
+        })).unwrap();
+        let mut snapshot = default_current_live_state(&req);
+        snapshot.run = req.run.clone();
+        req.session = Some(snapshot.session.clone());
+        (req, snapshot)
+    }
+
+    fn owner(state: &AppState) -> TerminalSnapshotOwner {
+        TerminalSnapshotOwner {
+            session_id: "terminal-session".into(),
+            run_id: "terminal-run".into(),
+            require_empty: false,
+            session_epoch: Some(0),
+            request_scope_epoch: Some(format!("{}:0", state.request_scope_instance_id)),
+        }
+    }
+
+    #[test]
+    fn current_owner_accepts_but_new_run_and_api_incarnation_reject() {
+        let state = crate::router_v2::tests::test_app_state();
+        let (req, mut snapshot) = fixture();
+        let mut expected = owner(&state);
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_ok());
+        snapshot.session.run_id = "new-run".into();
+        snapshot.run.as_mut().unwrap().run_id = "new-run".into();
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_err());
+        let (_, snapshot) = fixture();
+        expected.request_scope_epoch = Some("other-api:0".into());
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_err());
+        expected = owner(&state);
+        state.current_live_session_epoch.store(1, Ordering::Release);
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_err());
+    }
+
+    #[tokio::test]
+    async fn initial_admission_requires_empty_workspace_and_explicit_payload_owner() {
+        let state = crate::router_v2::tests::test_app_state();
+        let (mut req, snapshot) = fixture();
+        let expected = TerminalSnapshotOwner {
+            session_id: "terminal-session".into(), run_id: "terminal-run".into(),
+            require_empty: true, session_epoch: None, request_scope_epoch: None,
+        };
+        *state.current_live_state.write().await = None;
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_ok());
+        req.run.as_mut().unwrap().run_id = "wrong-run".into();
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_err());
+        let (req, snapshot) = fixture();
+        *state.current_live_state.write().await = Some(snapshot.clone());
+        assert!(validate_terminal_snapshot_owner(&state, &snapshot, &req, &expected).is_err());
+    }
+
+    #[test]
+    fn malformed_private_owner_header_is_not_an_unconditional_publication() {
+        assert!(serde_json::from_str::<TerminalSnapshotOwner>(
+            r#"{"session_id":"s","run_id":"r","unexpected":true}"#
+        ).is_err());
+    }
+
+    #[tokio::test]
+    async fn rejected_old_owner_preserves_new_owner_connectivity_and_snapshot() {
+        let state = crate::router_v2::tests::test_app_state();
+        let (req, mut snapshot) = fixture();
+        let expected = owner(&state);
+        snapshot.session.run_id = "new-run".into();
+        snapshot.run.as_mut().unwrap().run_id = "new-run".into();
+        let version = snapshot.state_version;
+        *state.current_live_state.write().await = Some(snapshot);
+        *state.current_live_connectivity.write().await =
+            crate::schemas::status::SessionConnectivity::Connected;
+        let error = sync_current_live_snapshot_impl(state.clone(), req, Some(expected))
+            .await.unwrap_err();
+        assert_eq!(error.code.as_deref(), Some("terminal_snapshot_owner_stale"));
+        assert!(matches!(*state.current_live_connectivity.read().await,
+            crate::schemas::status::SessionConnectivity::Connected));
+        let current = state.current_live_state.read().await;
+        let current = current.as_ref().unwrap();
+        assert_eq!(current.session.run_id, "new-run");
+        assert_eq!(current.state_version, version);
+    }
 }
 
 async fn sync_current_live_heartbeat(
@@ -2238,6 +3410,7 @@ async fn sync_current_live_runtime_frame(
     Json(frame): Json<CurrentLiveRuntimeFrameRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let session_id = frame.session_id.clone();
+    let drop_live_magnetization = state.feature_flags.disable_live_magnetization;
     sync_current_live_frame_update(
         &state,
         CurrentLiveSyncKind::Runtime,
@@ -2249,7 +3422,9 @@ async fn sync_current_live_runtime_frame(
         None,
         false,
         false,
-        move |next| apply_current_live_runtime_frame(next, frame),
+        move |next| {
+            apply_current_live_runtime_frame_with_options(next, frame, drop_live_magnetization)
+        },
     )
     .await
 }
@@ -2302,6 +3477,7 @@ async fn sync_current_live_field_frame(
 #[derive(Debug, Clone, Copy)]
 enum CurrentLiveSyncKind {
     Snapshot,
+    AuthoringGridSnapshot,
     Session,
     Runtime,
     Scalars,
@@ -2311,12 +3487,687 @@ enum CurrentLiveSyncKind {
 impl CurrentLiveSyncKind {
     fn label(self) -> &'static str {
         match self {
-            Self::Snapshot => "snapshot",
+            Self::Snapshot | Self::AuthoringGridSnapshot => "snapshot",
             Self::Session => "session",
             Self::Runtime => "runtime",
             Self::Scalars => "scalars",
             Self::Fields => "fields",
         }
+    }
+}
+
+// A one-shot Grid command publishes authoring mesh metadata and exits. It is
+// not a resident solver publisher and must not start its heartbeat watchdog.
+// Keep all runtime-bearing snapshots and all typed frames on the existing path.
+fn is_authoring_grid_snapshot(req: &CurrentLiveSnapshotRequest) -> bool {
+    req.mesh_workspace.is_some()
+        && req.session.is_none()
+        && req.session_status.is_none()
+        && req.metadata.is_none()
+        && req.stage_execution.is_none()
+        && req.simulation_preparation.is_none()
+        && req.run.is_none()
+        && req.live_state.is_none()
+        && req.frozen_spins_runtime_status.is_none()
+        && req.coupled_checkpoint.is_none()
+        && req.latest_scalar_row.is_none()
+        && req.latest_fields.is_none()
+        && !req.replace_latest_fields
+        && req.field_generation.is_none()
+        && req.preview_fields.is_none()
+        && !req.clear_preview_cache
+        && req.solver_profile.is_none()
+        && req.fem_mesh.is_none()
+}
+
+#[cfg(test)]
+mod authoring_grid_heartbeat_tests {
+    use super::*;
+
+    fn grid() -> CurrentLiveSnapshotRequest {
+        serde_json::from_value(json!({
+            "session_id": "scratch-grid",
+            "mesh_workspace": {"revision": 2},
+            "engine_log": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn grid_metadata_does_not_claim_resident_runner_liveness() {
+        let mut req = grid();
+        assert!(is_authoring_grid_snapshot(&req));
+        req.mesh_workspace = None;
+        assert!(!is_authoring_grid_snapshot(&req));
+    }
+
+    #[test]
+    fn stateful_or_field_mutating_snapshots_keep_heartbeat_semantics() {
+        let mut req = grid();
+        req.session_status = Some("running".into());
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.metadata = Some(json!({"publisher": "runtime"}));
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.coupled_checkpoint = Some(json!({}));
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.clear_preview_cache = true;
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.replace_latest_fields = true;
+        assert!(!is_authoring_grid_snapshot(&req));
+        let mut req = grid();
+        req.preview_fields = Some(Vec::new());
+        assert!(!is_authoring_grid_snapshot(&req));
+    }
+}
+
+pub(crate) async fn reset_current_live_session_resources(state: &AppState) {
+    *state.current_display_selection.write().await = CurrentDisplaySelection::default();
+    *state.current_display_presentation.write().await = DisplayPresentationState::default();
+    state
+        .current_visualization_client_acks
+        .write()
+        .await
+        .clear();
+    state
+        .current_visualization_client_ack_revision
+        .store(0, Ordering::Relaxed);
+    *state.current_workspace_selection.write().await = CurrentWorkspaceSelection::default();
+    *state.current_workspace_ribbon.write().await = CurrentWorkspaceRibbon::default();
+    *state.current_workspace_layout.write().await = CurrentWorkspaceLayout::default();
+    state.current_hysteresis_bookmarks.write().await.clear();
+    state.current_control_queue.lock().await.clear();
+    state.current_command_responses.lock().await.clear();
+    state.current_command_ledger.lock().await.clear();
+    state
+        .current_command_journal_revision
+        .store(0, Ordering::Release);
+    *state.current_control_next_seq.lock().await = 0;
+    let _ = state.current_control_events.send(0);
+    state.current_live_realtime_replay.lock().await.clear();
+    state
+        .current_live_realtime_pending_batches
+        .lock()
+        .await
+        .clear();
+    state
+        .current_live_realtime_scalar_sample_qos
+        .lock()
+        .await
+        .clear();
+    state
+        .current_live_realtime_next_seq
+        .store(0, Ordering::Relaxed);
+    *state.frozen_spins_previews.write().await = Default::default();
+    *state.current_live_connectivity.write().await =
+        crate::schemas::status::SessionConnectivity::Connected;
+    state
+        .current_live_last_seen_unix_ms
+        .store(0, Ordering::Relaxed);
+    *state.current_live_preparation_receipt.write().await = None;
+}
+
+async fn sync_current_live_preparation_receipt(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CurrentLivePreparationReceiptRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let context = capture_current_live_request_context(&state).await?;
+    if context.session_id != req.session_id {
+        return Err(ApiError::conflict(
+            "current_live_preparation_receipt_session_mismatch",
+        ));
+    }
+    let disposition = crate::live_scene_preparation::commit_live_preparation_receipt_for_context(
+        &state,
+        &context,
+        req.receipt,
+        None,
+        None,
+        None,
+    )
+    .await?;
+    let disposition = match disposition {
+        fullmag_session::PreparationReceiptCommitDisposition::Accepted => "accepted",
+        fullmag_session::PreparationReceiptCommitDisposition::Replayed => "replayed",
+    };
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "disposition": disposition,
+    })))
+}
+
+async fn materialize_current_live_preparation(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CurrentLivePreparationMaterializationRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let published =
+        crate::live_scene_preparation::materialize_current_live_preparation(&state, req).await?;
+    Ok(Json(serde_json::json!({
+        "status": "ok",
+        "disposition": published.disposition,
+        "preparation_id": published.preparation_id,
+        "plan_fingerprint": published.plan_fingerprint,
+        "receipt_sha256": published.receipt_sha256,
+    })))
+}
+
+#[cfg(test)]
+mod preparation_materialization_route_tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    fn scene_document_with_region_marker(revision: u64) -> fullmag_authoring::SceneDocument {
+        serde_json::from_value(json!({
+            "version": "scene.v2",
+            "revision": revision,
+            "objects": [{
+                "id": "strip",
+                "name": "strip",
+                "role": "magnet",
+                "geometry": {
+                    "geometry_kind": "Box",
+                    "geometry_params": {"size": [200e-9, 20e-9, 6e-9]}
+                },
+                "material_ref": "permalloy",
+                "magnetization_ref": "uniform",
+                "regions": [{
+                    "region_id": "strip:core",
+                    "owner_object": "strip",
+                    "name": "core",
+                    "shape": {"kind": "box", "size": [200e-9, 20e-9, 6e-9], "center": [0.0, 0.0, 0.0]},
+                    "frame": "object",
+                    "enabled": true,
+                    "priority": 1,
+                    "realization_policy": "inherit"
+                }]
+            }],
+            "materials": [{
+                "id": "permalloy",
+                "name": "Permalloy",
+                "properties": {"Ms": 800e3, "Aex": 13e-12, "alpha": 0.02}
+            }],
+            "magnetization_assets": [{
+                "id": "uniform",
+                "name": "Uniform",
+                "kind": "uniform",
+                "value": [0.0, 0.0, 1.0]
+            }],
+            "study": {
+                "backend": "fdm",
+                "requested_backend": "fdm",
+                "requested_device": "cpu",
+                "requested_precision": "double",
+                "requested_mode": "strict",
+                "fdm": {"default_cell": [10e-9, 10e-9, 6e-9]}
+            }
+        }))
+        .expect("scene document fixture should deserialize")
+    }
+
+    fn requested_execution() -> fullmag_application::RequestedExecution {
+        fullmag_application::RequestedExecution {
+            backend: "fdm".into(),
+            device: "cpu".into(),
+            precision: "double".into(),
+            mode: "strict".into(),
+            minimum_resources: Some(fullmag_application::RequestedResourceBudget {
+                cpu_millis: 100,
+                memory_bytes: 1,
+                gpu_memory_bytes: 0,
+                storage_bytes: 1,
+            }),
+        }
+    }
+
+    fn unvalidated_preparation_receipt() -> fullmag_application::PreparationReceipt {
+        use fullmag_plan::{PreparationPlan, PreparationProducer, PreparationProducerKind};
+
+        let fingerprint = |hex: char| format!("sha256:{}", hex.to_string().repeat(64));
+        let producer = |kind: PreparationProducerKind, output: char| {
+            PreparationProducer::new(
+                kind,
+                format!("fullmag.{}", kind.as_str()),
+                format!("{}.producer.v1", kind.as_str()),
+                "test",
+                fingerprint('a'),
+                fingerprint(output),
+            )
+            .unwrap()
+        };
+        let plan = PreparationPlan::new(
+            fingerprint('b'),
+            1,
+            fullmag_ir::BackendTarget::Auto,
+            fullmag_ir::BackendTarget::Fdm,
+            producer(PreparationProducerKind::Geometry, '1'),
+            producer(PreparationProducerKind::Display, '2'),
+            producer(PreparationProducerKind::Grid, '3'),
+            producer(PreparationProducerKind::Mesh, '4'),
+            producer(PreparationProducerKind::Space, '5'),
+        )
+        .unwrap();
+        fullmag_application::PreparationReceipt {
+            schema_version: fullmag_application::PREPARATION_RECEIPT_SCHEMA.into(),
+            preparation_id: "prep-run-fence".into(),
+            plan_fingerprint: "not-validated-before-run-fence".into(),
+            plan,
+            certificates: Vec::new(),
+            reuse: Vec::new(),
+            accepted_run_source: None,
+        }
+    }
+
+    fn preparation_snapshot(preparation_id: &str) -> crate::types::SimulationPreparationSnapshot {
+        crate::types::SimulationPreparationSnapshot {
+            preparation_id: preparation_id.into(),
+            revision: 1,
+            status: "running".into(),
+            active_stage_id: Some("planning".into()),
+            started_at_unix_ms: 1,
+            completed_at_unix_ms: None,
+            stages: Vec::new(),
+            log_tail: Vec::new(),
+            failure: None,
+        }
+    }
+
+    async fn set_active_preparation(state: &Arc<AppState>, preparation_id: &str) {
+        let mut current = state.current_live_state.write().await;
+        current
+            .as_mut()
+            .expect("test session must be active")
+            .simulation_preparation = Some(preparation_snapshot(preparation_id));
+    }
+
+    #[tokio::test]
+    async fn materialization_receipt_rejects_a_run_change_before_store_access() {
+        let state = crate::router_v2::tests::test_app_state_with_live_session().await;
+        let context = capture_current_live_request_context(&state).await.unwrap();
+        let stale_run_id = format!("stale-run-{}", uuid::Uuid::new_v4().simple());
+
+        let error = crate::live_scene_preparation::commit_live_preparation_receipt_for_context(
+            &state,
+            &context,
+            unvalidated_preparation_receipt(),
+            None,
+            None,
+            Some(&stale_run_id),
+        )
+        .await
+        .expect_err("a changed run must be fenced before receipt validation or storage");
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(
+            error.message,
+            "current_live_preparation_materialization_run_id_mismatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_preparation_receipt_rejects_accepted_run_source_binding() {
+        let state = crate::router_v2::tests::test_app_state_with_live_session().await;
+        let context = capture_current_live_request_context(&state).await.unwrap();
+        let mut receipt = unvalidated_preparation_receipt();
+        receipt.accepted_run_source = Some(fullmag_application::AcceptedRunPreparationSource {
+            schema_version: fullmag_application::ACCEPTED_RUN_PREPARATION_SOURCE_SCHEMA.into(),
+            run_id: fullmag_application::RunId::parse("accepted-run-test").unwrap(),
+            specification_fingerprint: format!("sha256:{}", "a".repeat(64)),
+            step_id: "study-step-test".into(),
+            problem_fingerprint: format!("sha256:{}", "b".repeat(64)),
+        });
+
+        let error = crate::live_scene_preparation::commit_live_preparation_receipt_for_context(
+            &state, &context, receipt, None, None, None,
+        )
+        .await
+        .expect_err("Live receipt must not claim accepted-run provenance");
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.message,
+            "live_preparation_receipt_cannot_carry_accepted_run_source"
+        );
+    }
+
+    #[tokio::test]
+    async fn materialization_route_binds_immutable_problem_to_current_run() {
+        let temporary = std::env::temp_dir().join(format!(
+            "fullmag-api-preparation-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temporary).unwrap();
+        let mut state = crate::router_v2::tests::test_app_state_with_live_session().await;
+        Arc::get_mut(&mut state).unwrap().repo_root = temporary.clone();
+        set_active_preparation(&state, "prep-api-materialized").await;
+        if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+            snapshot.scene_document = Some(scene_document_with_region_marker(7));
+        }
+
+        let store = fullmag_session::SessionStore::open(
+            temporary
+                .join(".fullmag")
+                .join("local-live")
+                .join("session-store"),
+        )
+        .unwrap();
+        store
+            .commit_run_catalog(&fullmag_session::FmsRunCatalog {
+                schema_version: fullmag_session::FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: "test-run".into(),
+                revision: 1,
+                updated_at: chrono::Utc::now(),
+                tasks: Vec::new(),
+            })
+            .unwrap();
+
+        let response = materialize_current_live_preparation(
+            State(state.clone()),
+            Json(CurrentLivePreparationMaterializationRequest {
+                session_id: "test-session".into(),
+                preparation_id: "prep-api-materialized".into(),
+                scene_revision: 7,
+                requested_execution: requested_execution(),
+                display_projection: json!({"selected_object_ids": ["strip"]}),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.0["status"], "ok");
+        assert_eq!(response.0["disposition"], "accepted");
+        assert_eq!(response.0["preparation_id"], "prep-api-materialized");
+        assert!(response.0["receipt_sha256"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+
+        let replay = materialize_current_live_preparation(
+            State(state),
+            Json(CurrentLivePreparationMaterializationRequest {
+                session_id: "test-session".into(),
+                preparation_id: "prep-api-materialized".into(),
+                scene_revision: 7,
+                requested_execution: requested_execution(),
+                display_projection: json!({"selected_object_ids": ["strip"]}),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(replay.0["status"], "ok");
+        assert_eq!(replay.0["disposition"], "replayed");
+
+        let receipt = store
+            .read_preparation_receipt("test-run")
+            .unwrap()
+            .expect("materialized receipt must be durable");
+        assert_eq!(receipt.preparation_id, "prep-api-materialized");
+        assert_eq!(receipt.payload["schema_version"], "preparation_receipt.v1");
+        std::fs::remove_dir_all(&temporary).unwrap();
+    }
+
+    #[tokio::test]
+    async fn materialization_route_rejects_stale_scene_revision_before_planning() {
+        let temporary = std::env::temp_dir().join(format!(
+            "fullmag-api-preparation-stale-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temporary).unwrap();
+        let mut state = crate::router_v2::tests::test_app_state_with_live_session().await;
+        Arc::get_mut(&mut state).unwrap().repo_root = temporary.clone();
+        set_active_preparation(&state, "prep-stale").await;
+        if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+            snapshot.scene_document = Some(scene_document_with_region_marker(8));
+        }
+
+        let error = materialize_current_live_preparation(
+            State(state),
+            Json(CurrentLivePreparationMaterializationRequest {
+                session_id: "test-session".into(),
+                preparation_id: "prep-stale".into(),
+                scene_revision: 7,
+                requested_execution: requested_execution(),
+                display_projection: json!({}),
+            }),
+        )
+        .await
+        .expect_err("stale scene must be fenced before planner invocation");
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(
+            error.message,
+            "current_live_preparation_materialization_scene_revision_mismatch"
+        );
+        std::fs::remove_dir_all(&temporary).unwrap();
+    }
+
+    #[tokio::test]
+    async fn materialization_route_rejects_non_active_preparation_before_planning() {
+        let temporary = std::env::temp_dir().join(format!(
+            "fullmag-api-preparation-id-stale-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temporary).unwrap();
+        let mut state = crate::router_v2::tests::test_app_state_with_live_session().await;
+        Arc::get_mut(&mut state).unwrap().repo_root = temporary.clone();
+        set_active_preparation(&state, "prep-current").await;
+        if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+            snapshot.scene_document = Some(scene_document_with_region_marker(7));
+        }
+
+        let error = materialize_current_live_preparation(
+            State(state),
+            Json(CurrentLivePreparationMaterializationRequest {
+                session_id: "test-session".into(),
+                preparation_id: "prep-stale".into(),
+                scene_revision: 7,
+                requested_execution: requested_execution(),
+                display_projection: json!({}),
+            }),
+        )
+        .await
+        .expect_err("a non-active preparation must be rejected before planning");
+
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(
+            error.message,
+            "current_live_preparation_materialization_id_mismatch"
+        );
+        std::fs::remove_dir_all(&temporary).unwrap();
+    }
+
+    #[tokio::test]
+    async fn public_materialization_route_is_typed_and_session_scoped() {
+        let openapi = crate::openapi_v2::openapi_json();
+        let operation = &openapi["paths"]
+            ["/v2/sessions/current/simulation/preparation/materialization"]["post"];
+        assert_eq!(
+            operation["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/LivePreparationMaterializationRequest"
+        );
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v2/sessions/current/simulation/preparation/materialization")
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "preparation_id": "prep-contract-test",
+                    "scene_revision": 7
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = crate::router_v2::build_v2_router()
+            .with_state(
+                crate::router_v2::tests::test_app_state_with_simulation_preparation("ready").await,
+            )
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v2/sessions/current/simulation/preparation/materialization")
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "preparation_id": "prep-contract-test",
+                    "scene_revision": 7,
+                    "requested_execution": {
+                        "backend": "fdm",
+                        "device": "cpu",
+                        "precision": "double",
+                        "mode": "strict"
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = crate::router_v2::build_v2_router()
+            .with_state(
+                crate::router_v2::tests::test_app_state_with_simulation_preparation("ready").await,
+            )
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let temporary = std::env::temp_dir().join(format!(
+            "fullmag-api-public-preparation-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&temporary).unwrap();
+        let mut state = crate::router_v2::tests::test_app_state_with_live_session().await;
+        Arc::get_mut(&mut state).unwrap().repo_root = temporary.clone();
+        set_active_preparation(&state, "prep-contract-test").await;
+        if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+            snapshot.scene_document = Some(scene_document_with_region_marker(7));
+        }
+        let store = fullmag_session::SessionStore::open(
+            temporary
+                .join(".fullmag")
+                .join("local-live")
+                .join("session-store"),
+        )
+        .unwrap();
+        store
+            .commit_run_catalog(&fullmag_session::FmsRunCatalog {
+                schema_version: fullmag_session::FMS_RUN_CATALOG_SCHEMA.into(),
+                run_id: "test-run".into(),
+                revision: 1,
+                updated_at: chrono::Utc::now(),
+                tasks: Vec::new(),
+            })
+            .unwrap();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v2/sessions/current/simulation/preparation/materialization")
+            .header(CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "preparation_id": "prep-contract-test",
+                    "scene_revision": 7
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = crate::router_v2::build_v2_router()
+            .with_state(state)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let resource: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(resource["disposition"], "accepted");
+        assert_eq!(resource["preparation_id"], "prep-contract-test");
+        assert_eq!(resource["scene_revision"], 7);
+        assert_eq!(resource["run_id"], "test-run");
+        assert!(resource["receipt_sha256"].as_str().is_some());
+        std::fs::remove_dir_all(&temporary).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod live_publisher_epoch_tests {
+    use super::*;
+
+    async fn publish(
+        state: &Arc<AppState>,
+        session_id: &str,
+        reject: bool,
+    ) -> Result<Json<serde_json::Value>, ApiError> {
+        sync_current_live_frame_update(
+            state,
+            CurrentLiveSyncKind::Snapshot,
+            session_id,
+            false,
+            false,
+            false,
+            false,
+            None,
+            false,
+            false,
+            |_| {
+                if reject {
+                    Err(ApiError::conflict("fixture_rejected_frame"))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn first_accepted_publisher_frame_allocates_epoch_once() {
+        let state = crate::router_v2::tests::test_app_state();
+        assert!(publish(&state, "publisher-session", false).await.is_ok());
+        assert_eq!(state.current_live_session_epoch.load(Ordering::Acquire), 1);
+        assert!(publish(&state, "publisher-session", false).await.is_ok());
+        assert_eq!(state.current_live_session_epoch.load(Ordering::Acquire), 1);
+        assert!(publish(&state, "foreign-session", false).await.is_err());
+        assert_eq!(state.current_live_session_epoch.load(Ordering::Acquire), 1);
+        assert_eq!(
+            state
+                .current_live_state
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .session
+                .session_id,
+            "publisher-session"
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_first_frame_does_not_allocate_epoch_or_publish_session() {
+        let state = crate::router_v2::tests::test_app_state();
+        assert!(publish(&state, "publisher-session", true).await.is_err());
+        assert_eq!(state.current_live_session_epoch.load(Ordering::Acquire), 0);
+        assert!(state.current_live_state.read().await.is_none());
+        assert!(publish(&state, "publisher-session", false).await.is_ok());
+        assert_eq!(state.current_live_session_epoch.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn exhausted_epoch_does_not_wrap_or_publish_session() {
+        let state = crate::router_v2::tests::test_app_state();
+        state
+            .current_live_session_epoch
+            .store(u64::MAX, Ordering::Release);
+        assert!(publish(&state, "publisher-session", false).await.is_err());
+        assert_eq!(
+            state.current_live_session_epoch.load(Ordering::Acquire),
+            u64::MAX
+        );
+        assert!(state.current_live_state.read().await.is_none());
     }
 }
 
@@ -2336,24 +4187,9 @@ async fn sync_current_live_frame_update<F>(
 where
     F: FnOnce(&mut SessionStateResponse) -> Result<(), ApiError>,
 {
+    let _session_transition = state.current_live_session_transition.lock().await;
     let sync_start = std::time::Instant::now();
-    let reset_preview = state
-        .current_live_state
-        .read()
-        .await
-        .as_ref()
-        .map(|existing| existing.session.session_id != session_id)
-        .unwrap_or(false);
-    if reset_preview {
-        let display_selection = CurrentDisplaySelection::default();
-        *state.current_display_selection.write().await = display_selection.clone();
-        state.current_control_queue.lock().await.clear();
-        state.current_command_responses.lock().await.clear();
-        state.current_command_ledger.lock().await.clear();
-        let current_seq = *state.current_control_next_seq.lock().await;
-        let _ = state.current_control_events.send(current_seq);
-        let _ = std::fs::remove_dir_all(&state.current_workspace_root);
-    }
+    let admission_epoch = state.current_live_session_epoch.load(Ordering::Relaxed);
     let display_selection = state.current_display_selection.read().await.clone();
     let selected_cached_display_fields_match_selection = preview_fields
         .as_ref()
@@ -2361,36 +4197,55 @@ where
     let has_cached_display_fields =
         clear_preview_cache || selected_cached_display_fields_match_selection;
     let preview_config = display_selection.preview_request();
-    let mut current = state.current_live_state.write().await;
-    let (mut next, previous_snapshot) = match current.take() {
-        Some(existing) if existing.session.session_id == session_id => {
-            let previous_snapshot = existing.clone();
-            (existing, Some(previous_snapshot))
+    // Work on a clone and keep the last accepted snapshot visible while this
+    // update derives previews/realtime resources. Taking the value out of the
+    // lock makes readers observe `None` for the whole duration of a slow frame
+    // and causes the UI session collection to report that no local session
+    // exists.
+    let (mut next, previous_snapshot) = {
+        let current = state.current_live_state.read().await;
+        match current.as_ref() {
+            Some(existing) if existing.session.session_id == session_id => {
+                let previous_snapshot = existing.clone();
+                (previous_snapshot.clone(), Some(previous_snapshot))
+            }
+            Some(_) => return Err(ApiError::conflict("current_live_session_mismatch")),
+            _ => (
+                default_current_live_state(&CurrentLiveSnapshotRequest {
+                    frozen_spins_runtime_status: None,
+                    session_id: session_id.to_string(),
+                    session: None,
+                    session_status: None,
+                    metadata: None,
+                    mesh_workspace: None,
+                    stage_execution: None,
+                    simulation_preparation: None,
+                    run: None,
+                    live_state: None,
+                    coupled_checkpoint: None,
+                    latest_scalar_row: None,
+                    latest_fields: None,
+                    replace_latest_fields: false,
+                    field_generation: None,
+                    preview_fields: None,
+                    clear_preview_cache: false,
+                    engine_log: None,
+                    solver_profile: None,
+                    fem_mesh: None,
+                }),
+                None,
+            ),
         }
-        _ => (
-            default_current_live_state(&CurrentLiveSnapshotRequest {
-                session_id: session_id.to_string(),
-                session: None,
-                session_status: None,
-                metadata: None,
-                mesh_workspace: None,
-                stage_execution: None,
-                simulation_preparation: None,
-                run: None,
-                live_state: None,
-                coupled_checkpoint: None,
-                latest_scalar_row: None,
-                latest_fields: None,
-                replace_latest_fields: false,
-                field_generation: None,
-                preview_fields: None,
-                clear_preview_cache: false,
-                engine_log: None,
-                solver_profile: None,
-                fem_mesh: None,
-            }),
-            None,
-        ),
+    };
+    // A legacy publisher may create the first session without going through
+    // the v2 Create command. Reserve its epoch now, but publish it only after
+    // the complete frame has been accepted under the transition lock.
+    let first_session_epoch = if previous_snapshot.is_none() {
+        Some(admission_epoch.checked_add(1).ok_or_else(|| {
+            ApiError::conflict("current_live_session_epoch_exhausted")
+        })?)
+    } else {
+        None
     };
     let previous_preview = next.preview.clone();
     let previous_revisions = match previous_snapshot.as_ref() {
@@ -2403,35 +4258,24 @@ where
     };
     let apply_start = std::time::Instant::now();
     if let Err(error) = apply(&mut next) {
-        *current = Some(next);
-        drop(current);
-        *state.current_live_connectivity.write().await =
-            crate::schemas::status::SessionConnectivity::Degraded;
+        // Rejected stale ownership is an admission failure, not a failure of
+        // the current publisher. An old sender must not degrade a new owner.
+        if !matches!(error.code.as_deref(),
+            Some("terminal_snapshot_owner_stale" | "terminal_snapshot_owner_busy")) {
+            *state.current_live_connectivity.write().await =
+                crate::schemas::status::SessionConnectivity::Degraded;
+        }
         return Err(error);
     }
     let apply_ms = apply_start.elapsed().as_micros();
     next.display_selection = display_selection.clone();
     next.preview_config = preview_config.clone();
-    if next.scene_document.is_none() && !next.session.script_path.trim().is_empty() {
-        match load_scene_document_state(
-            &state.repo_root,
-            &state.current_workspace_root,
-            Path::new(next.session.script_path.trim()),
-        ) {
-            Ok(mut scene_document) => {
-                normalize_scene_document_magnetization_assets(&mut scene_document);
-                next.builder_adapter = scene_document_builder_projection(&scene_document).ok();
-                next.scene_document = Some(scene_document);
-            }
-            Err(e) => {
-                eprintln!(
-                    "[fullmag-api] failed to load scene document for '{}': {:?}",
-                    next.session.script_path.trim(),
-                    e
-                );
-            }
-        }
-    }
+    // Expose the live session before hydrating the authoring scene.  Scene
+    // export is a managed Python operation and may wait for a runner job for
+    // tens of seconds; making the first live snapshot wait here leaves the
+    // session collection empty while the UI is bootstrapping.  The authoring
+    // scene is loaded lazily by get_or_load_current_live_scene_document once
+    // the session has become visible.
     let has_fresh_preview = live_state_has_fresh_preview(next.live_state.as_ref());
     let should_rebuild_preview = !state.feature_flags.disable_preview_3d
         && (has_fresh_preview
@@ -2459,18 +4303,25 @@ where
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
         .unwrap_or(0);
-    {
-        let mut ledger = state.current_command_ledger.lock().await;
-        reconcile_command_ledger_from_stage_execution(
-            &mut ledger,
+    if previous_snapshot.is_none() {
+        live_command_journal::recover(state, &next).await?;
+    }
+    live_command_journal::mutate(state, &next, |ledger| {
+        let stage_changed = reconcile_command_ledger_from_stage_execution(
+            ledger,
             &next,
             command_completed_at_unix_ms,
         );
-        reconcile_dispatched_command_ledger_from_snapshot(
-            &mut ledger,
+        let dispatched_changed = reconcile_dispatched_command_ledger_from_snapshot(
+            ledger,
             &next,
             command_completed_at_unix_ms,
         );
+        Ok(((), stage_changed || dispatched_changed))
+    })
+    .await?;
+    if previous_snapshot.is_none() {
+        live_command_journal::fail_unacknowledged_after_restart(state, &next).await?;
     }
     let (preview_source_step, preview_vector_len, preview_vector_avg) =
         preview_debug_metrics(next.preview.as_ref());
@@ -2490,9 +4341,11 @@ where
         kind.label(),
         current_state_version,
         next.session.session_id,
-        next.run.as_ref().map(|run| run.run_id.as_str()).unwrap_or("-"),
-        next
-            .live_state
+        next.run
+            .as_ref()
+            .map(|run| run.run_id.as_str())
+            .unwrap_or("-"),
+        next.live_state
             .as_ref()
             .map(|state| state.latest_step.step)
             .unwrap_or(0),
@@ -2508,25 +4361,59 @@ where
     );
     let realtime_state =
         current_live_realtime_state_from_snapshot(&state, &next, display_selection.revision).await;
-    let scalar_sample = if has_scalar_row_update {
-        next.scalar_rows.last().cloned().map(|row| {
-            (
-                next.session.session_id.clone(),
-                next.run.as_ref().map(|run| run.run_id.clone()),
-                next.scalar_revision,
-                row,
-            )
-        })
-    } else {
-        None
-    };
-    *current = Some(next);
-    drop(current);
-    crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(state).await;
+    let scalar_sample =
+        if has_scalar_row_update
+            && !has_nonphysical_latest_step(&next)
+            && next.scalar_revision
+                > previous_snapshot
+                    .as_ref()
+                    .map_or(0, |snapshot| snapshot.scalar_revision)
+        {
+            next.scalar_rows
+                .last()
+                .cloned()
+                .map(|row| PendingRealtimeScalarSample {
+                    session_id: next.session.session_id.clone(),
+                    run_id: next.run.as_ref().map(|run| run.run_id.clone()),
+                    revision: next.scalar_revision,
+                    row,
+                    terminal: next.live_state.as_ref().is_some_and(|live| {
+                        live.latest_step.finished || live.status == "completed"
+                    }) || matches!(
+                        next.session.status.as_str(),
+                        "completed" | "failed" | "cancelled"
+                    ),
+                })
+        } else {
+            None
+        };
+    if state.current_live_session_epoch.load(Ordering::Relaxed) != admission_epoch {
+        return Err(ApiError::conflict("current_live_session_transitioned"));
+    }
+    if has_nonphysical_latest_step(&next) {
+        // The transition lock also serializes delayed scalar flushes. Cancel
+        // a pending physical sample before admitting diagnostic-only state.
+        state
+            .current_live_realtime_scalar_sample_qos
+            .lock()
+            .await
+            .clear();
+    }
+    {
+        let mut current = state.current_live_state.write().await;
+        if let Some(epoch) = first_session_epoch {
+            state
+                .current_live_session_epoch
+                .store(epoch, Ordering::Release);
+        }
+        *current = Some(next);
+    }
+    if !matches!(kind, CurrentLiveSyncKind::AuthoringGridSnapshot) {
+        crate::router_v2::handlers::sessions::status::record_current_live_heartbeat(state).await;
+    }
 
-    if let Some((session_id, run_id, revision, row)) = scalar_sample {
-        publish_current_live_realtime_scalar_sample(&state, session_id, run_id, revision, row)
-            .await?;
+    if let Some(sample) = scalar_sample {
+        queue_current_live_realtime_scalar_sample(state.as_ref(), sample).await?;
     }
 
     if atomic_terminal_field_publish {
@@ -2567,11 +4454,21 @@ where
 async fn dequeue_current_live_command(
     State(state): State<Arc<AppState>>,
 ) -> Result<Response, ApiError> {
-    let command = take_next_current_control_command_after(&state, 0).await;
+    let _permit = state.development_admission.admit().await?;
+    let _transition = state.current_live_session_transition.lock().await;
+    let command = take_next_current_control_command_after(&state, 0, None).await?;
     match command {
         Some(command) => Ok(Json(command).into_response()),
         None => Ok(StatusCode::NO_CONTENT.into_response()),
     }
+}
+
+async fn read_current_live_display_selection(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<CurrentDisplaySelection>, ApiError> {
+    let _transition = state.current_live_session_transition.lock().await;
+    let _ = current_live_session_id(&state).await?;
+    Ok(Json(state.current_display_selection.read().await.clone()))
 }
 
 async fn wait_current_live_control(
@@ -2579,20 +4476,36 @@ async fn wait_current_live_control(
     Query(query): Query<ControlWaitQuery>,
 ) -> Result<Response, ApiError> {
     let _ = current_live_session_id(&state).await?;
-    if let Some(command) = take_next_current_control_command_after(&state, query.after_seq).await {
+    let after_seq = query.after_seq;
+    let requested_session_id = query.session_id.clone();
+    let grid_refresh_command_id = query.grid_refresh_command_id.clone();
+    if let Some(command) = take_current_control_command_for_session(
+        &state,
+        after_seq,
+        requested_session_id.as_deref(),
+        grid_refresh_command_id.as_deref(),
+    )
+    .await?
+    {
         return Ok(Json(command).into_response());
     }
 
     let timeout_ms = query.timeout_ms.clamp(100, 20_000);
     let mut rx = state.current_control_events.subscribe();
     let state_for_wait = Arc::clone(&state);
+    let grid_refresh_command_id_for_wait = grid_refresh_command_id.clone();
     let waited = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), async move {
         loop {
             rx.changed()
                 .await
                 .map_err(|_| ApiError::internal("control command stream closed"))?;
-            if let Some(command) =
-                take_next_current_control_command_after(&state_for_wait, query.after_seq).await
+            if let Some(command) = take_current_control_command_for_session(
+                &state_for_wait,
+                after_seq,
+                requested_session_id.as_deref(),
+                grid_refresh_command_id_for_wait.as_deref(),
+            )
+            .await?
             {
                 return Ok::<SessionCommand, ApiError>(command);
             }
@@ -2605,6 +4518,23 @@ async fn wait_current_live_control(
         Ok(Err(error)) => Err(error),
         Err(_) => Ok(StatusCode::NO_CONTENT.into_response()),
     }
+}
+
+async fn take_current_control_command_for_session(
+    state: &Arc<AppState>,
+    after_seq: u64,
+    requested_session_id: Option<&str>,
+    grid_refresh_command_id: Option<&str>,
+) -> Result<Option<SessionCommand>, ApiError> {
+    let _permit = state.development_admission.admit().await?;
+    let _transition = state.current_live_session_transition.lock().await;
+    if let Some(requested_session_id) = requested_session_id {
+        let current_session_id = current_live_session_id(state).await?;
+        if current_session_id != requested_session_id {
+            return Ok(None);
+        }
+    }
+    take_next_current_control_command_after(state, after_seq, grid_refresh_command_id).await
 }
 
 #[allow(dead_code)]
@@ -2642,6 +4572,7 @@ async fn read_current_live_artifact(
 
 async fn build_current_live_realtime_hello_event(
     state: &AppState,
+    context: &CurrentLiveRequestContext,
 ) -> Result<LiveRealtimeServerEvent, ApiError> {
     let snapshot = state
         .current_live_state
@@ -2665,6 +4596,7 @@ async fn build_current_live_realtime_hello_event(
         contract_version: current_live_realtime_contract_version().to_string(),
         payload: HelloPayload {
             server_time: realtime_timestamp_now(),
+            request_scope_epoch: context.request_scope_epoch.clone(),
             replay_available_after_seq,
             current_seq,
             resource_revisions: realtime_state.revisions,
@@ -2729,17 +4661,21 @@ async fn send_current_live_realtime_record(
 pub(crate) async fn handle_current_live_realtime_ws(
     mut socket: WebSocket,
     state: Arc<AppState>,
+    context: CurrentLiveRequestContext,
     after_seq: u64,
 ) {
+    if !current_live_realtime_ws_scope_active(&state, &context).await {
+        return;
+    }
     let mut rx = state.current_live_realtime_events.subscribe();
-    let hello = match build_current_live_realtime_hello_event(&state).await {
+    let hello = match build_current_live_realtime_hello_event(&state, &context).await {
         Ok(event) => event,
         Err(error) => {
             tracing::warn!("failed to build realtime hello event: {:?}", error);
             return;
         }
     };
-    let (session_id, run_id, replay_available_after_seq) = match &hello {
+    let (session_id, run_id, replay_available_after_seq, current_seq) = match &hello {
         LiveRealtimeServerEvent::Hello {
             session_id,
             run_id,
@@ -2749,6 +4685,7 @@ pub(crate) async fn handle_current_live_realtime_ws(
             session_id.clone(),
             run_id.clone(),
             payload.replay_available_after_seq,
+            payload.current_seq,
         ),
         _ => return,
     };
@@ -2759,12 +4696,18 @@ pub(crate) async fn handle_current_live_realtime_ws(
             return;
         }
     };
+    if !current_live_realtime_ws_scope_active(&state, &context).await {
+        return;
+    }
     if socket.send(Message::Text(hello_json.into())).await.is_err() {
         return;
     }
 
-    let mut last_sent_seq = after_seq;
-    if after_seq > 0 && after_seq < replay_available_after_seq {
+    let mut last_sent_seq = after_seq.min(current_seq);
+    if after_seq > current_seq || (after_seq > 0 && after_seq < replay_available_after_seq) {
+        if !current_live_realtime_ws_scope_active(&state, &context).await {
+            return;
+        }
         let resync = build_current_live_realtime_resync_event(
             &state,
             session_id.clone(),
@@ -2794,6 +4737,9 @@ pub(crate) async fn handle_current_live_realtime_ws(
                 .collect::<Vec<_>>()
         };
         for event in replay_events {
+            if !current_live_realtime_ws_scope_active(&state, &context).await {
+                return;
+            }
             if !send_current_live_realtime_record(&mut socket, event, &mut last_sent_seq).await {
                 return;
             }
@@ -2806,6 +4752,9 @@ pub(crate) async fn handle_current_live_realtime_ws(
     loop {
         tokio::select! {
             result = rx.recv() => {
+                if !current_live_realtime_ws_scope_active(&state, &context).await {
+                    break;
+                }
                 match result {
                     Ok(event) => {
                         if event.seq <= last_sent_seq {
@@ -2843,6 +4792,9 @@ pub(crate) async fn handle_current_live_realtime_ws(
                 }
             }
             _ = sleep_until(heartbeat_deadline) => {
+                if !current_live_realtime_ws_scope_active(&state, &context).await {
+                    break;
+                }
                 let heartbeat_policy = state
                     .current_live_realtime_policy
                     .read()
@@ -2877,6 +4829,9 @@ pub(crate) async fn handle_current_live_realtime_ws(
                 }
             }
             msg = socket.recv() => {
+                if !current_live_realtime_ws_scope_active(&state, &context).await {
+                    break;
+                }
                 match msg {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(Message::Ping(payload))) => {
@@ -2889,6 +4844,16 @@ pub(crate) async fn handle_current_live_realtime_ws(
             }
         }
     }
+}
+
+async fn current_live_realtime_ws_scope_active(
+    state: &Arc<AppState>,
+    context: &CurrentLiveRequestContext,
+) -> bool {
+    let _transition = state.current_live_session_transition.lock().await;
+    validate_current_live_request_context(state, context)
+        .await
+        .is_ok()
 }
 
 async fn current_live_realtime_heartbeat_duration(state: &AppState) -> Duration {
@@ -2904,13 +4869,23 @@ async fn current_live_realtime_heartbeat_duration(state: &AppState) -> Duration 
 
 pub(crate) async fn import_asset_for_current_workspace(
     state: &Arc<AppState>,
+    request_context: &CurrentLiveRequestContext,
     req: ImportSessionAssetRequest,
 ) -> Result<SessionAssetImportResponse, ApiError> {
+    // Pin the workspace before writing files, and retain ownership through
+    // artifact-index refresh and realtime publication.
+    let _transition = state.current_live_session_transition.lock().await;
+    validate_current_live_request_context(state, request_context).await?;
     let (session_id, imports_dir) = {
         let current = state.current_live_state.read().await;
         let snapshot = current
             .as_ref()
             .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+        ensure_current_live_request_context(
+            snapshot,
+            request_context,
+            state.current_live_session_epoch.load(Ordering::Acquire),
+        )?;
         let session_id = snapshot.session.session_id.clone();
         let artifact_dir = current_artifact_dir(snapshot)
             .unwrap_or_else(|| state.current_workspace_root.join("artifacts"));
@@ -2918,12 +4893,19 @@ pub(crate) async fn import_asset_for_current_workspace(
     };
 
     let response = import_asset_into_dir(state, &session_id, imports_dir.clone(), req)?;
+    validate_current_live_request_context(state, request_context).await?;
     let artifacts = read_artifacts_from_dir(imports_dir.parent())?;
+    validate_current_live_request_context(state, request_context).await?;
     let realtime_state = {
         let mut current = state.current_live_state.write().await;
         let snapshot = current
             .as_mut()
             .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+        ensure_current_live_request_context(
+            snapshot,
+            request_context,
+            state.current_live_session_epoch.load(Ordering::Acquire),
+        )?;
         snapshot.artifacts = artifacts;
         current_live_realtime_state_from_snapshot(
             state,
@@ -2932,6 +4914,14 @@ pub(crate) async fn import_asset_for_current_workspace(
         )
         .await
     };
+    let session_epoch = state.current_live_session_epoch.load(Ordering::Acquire);
+    {
+        let current = state.current_live_state.read().await;
+        let snapshot = current
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+        ensure_current_live_request_context(snapshot, request_context, session_epoch)?;
+    }
     publish_current_live_realtime_batch_changed(state, &realtime_state, false, 0).await?;
     Ok(response)
 }
@@ -2988,21 +4978,171 @@ async fn sync_current_live_script(
         .map(Json)
 }
 
+async fn load_scene_document_state_async(
+    state: &AppState,
+    script_path: &Path,
+) -> Result<SceneDocument, ApiError> {
+    let repo_root = state.repo_root.clone();
+    let workspace_root = state.current_workspace_root.clone();
+    let script_path = script_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        load_scene_document_state(&repo_root, &workspace_root, &script_path)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("scene document helper task failed: {error}")))?
+}
+
+pub(crate) async fn capture_current_live_request_context(
+    state: &Arc<AppState>,
+) -> Result<CurrentLiveRequestContext, ApiError> {
+    let _transition = state.current_live_session_transition.lock().await;
+    let session_epoch = state.current_live_session_epoch.load(Ordering::Acquire);
+    let request_scope_epoch = format!("{}:{session_epoch}", state.request_scope_instance_id);
+    let current = state.current_live_state.read().await;
+    let snapshot = current
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    ensure_current_live_request_scope(snapshot, &request_scope_epoch)?;
+    Ok(CurrentLiveRequestContext {
+        session_id: snapshot.session.session_id.clone(),
+        run_id: non_empty_identity(&snapshot.session.run_id),
+        session_epoch,
+        request_scope_epoch,
+    })
+}
+
+/// Like [`capture_current_live_request_context`], but an empty workspace
+/// yields `None` instead of a 404. Used by operations that legitimately start
+/// from no active workspace (for example importing a saved archive after a
+/// restart); there is no live session identity to fence against in that case.
+pub(crate) async fn capture_optional_current_live_request_context(
+    state: &Arc<AppState>,
+) -> Result<Option<CurrentLiveRequestContext>, ApiError> {
+    if state.current_live_state.read().await.is_none() {
+        return Ok(None);
+    }
+    capture_current_live_request_context(state).await.map(Some)
+}
+
+fn non_empty_identity(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.to_string())
+}
+
+fn ensure_current_live_request_scope(
+    snapshot: &SessionStateResponse,
+    request_scope_epoch: &str,
+) -> Result<(), ApiError> {
+    let Some(expected) =
+        crate::router_v2::middleware::session_scope::current_expected_session_scope()
+    else {
+        return Ok(());
+    };
+    let actual_epoch = crate::router_v2::handlers::sessions::current_live_session_epoch(snapshot);
+    if expected.session_id != snapshot.session.session_id
+        || expected.session_epoch != actual_epoch
+        || expected.request_scope_epoch != request_scope_epoch
+    {
+        return Err(ApiError::conflict("request_context_stale"));
+    }
+    Ok(())
+}
+
+pub(crate) fn ensure_current_live_request_context(
+    snapshot: &SessionStateResponse,
+    context: &CurrentLiveRequestContext,
+    session_epoch: u64,
+) -> Result<(), ApiError> {
+    ensure_current_live_request_scope(snapshot, &context.request_scope_epoch)?;
+    let current_run_id = non_empty_identity(&snapshot.session.run_id);
+    if session_epoch != context.session_epoch
+        || snapshot.session.session_id != context.session_id
+        || current_run_id != context.run_id
+    {
+        return Err(ApiError::conflict("request_context_stale"));
+    }
+    Ok(())
+}
+
+pub(crate) async fn validate_current_live_request_context(
+    state: &Arc<AppState>,
+    context: &CurrentLiveRequestContext,
+) -> Result<(), ApiError> {
+    let session_epoch = state.current_live_session_epoch.load(Ordering::Acquire);
+    let current = state.current_live_state.read().await;
+    let snapshot = current
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    ensure_current_live_request_context(snapshot, context, session_epoch)
+}
+
 pub(crate) async fn get_or_load_current_live_scene_document(
     state: &Arc<AppState>,
 ) -> Result<SceneDocument, ApiError> {
+    get_or_load_current_live_scene_document_with_context(state, None).await
+}
+
+pub(crate) async fn get_or_load_current_live_scene_document_for_context(
+    state: &Arc<AppState>,
+    context: &CurrentLiveRequestContext,
+) -> Result<SceneDocument, ApiError> {
+    get_or_load_current_live_scene_document_with_context(state, Some(context)).await
+}
+
+async fn get_or_load_current_live_scene_document_with_context(
+    state: &Arc<AppState>,
+    context: Option<&CurrentLiveRequestContext>,
+) -> Result<SceneDocument, ApiError> {
+    if let Some(context) = context {
+        validate_current_live_request_context(state, context).await?;
+    }
+    let script_path = {
+        let current = state.current_live_state.read().await;
+        let snapshot = current
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+        if let Some(context) = context {
+            ensure_current_live_request_context(
+                snapshot,
+                context,
+                state.current_live_session_epoch.load(Ordering::Acquire),
+            )?;
+        }
+        if let Some(scene_document) = snapshot.scene_document.clone() {
+            return Ok(scene_document);
+        }
+        let script_path = snapshot.session.script_path.trim();
+        if script_path.is_empty() {
+            return Err(ApiError::not_found(
+                "no scene document available for current workspace",
+            ));
+        }
+        script_path.to_string()
+    };
+
+    // Scene export invokes the Python helper and must not run while the
+    // current-state write lock is held. Otherwise one slow helper request
+    // blocks the session list and the browser reports no local session.
+    let mut current_scene = load_scene_document_state_async(state, Path::new(&script_path)).await?;
+    normalize_scene_document_magnetization_assets(&mut current_scene);
+    let builder_adapter = scene_document_builder_projection(&current_scene).ok();
+
+    // Revalidate the pinned identity after the slow helper and serialize the
+    // final publication with session transitions. A replaced `current`
+    // workspace can therefore never receive the old request's scene.
+    let _transition = state.current_live_session_transition.lock().await;
     let mut current = state.current_live_state.write().await;
     let snapshot = current
         .as_mut()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
-    if snapshot.scene_document.is_none() && !snapshot.session.script_path.trim().is_empty() {
-        let mut current_scene = load_scene_document_state(
-            &state.repo_root,
-            &state.current_workspace_root,
-            Path::new(snapshot.session.script_path.trim()),
+    if let Some(context) = context {
+        ensure_current_live_request_context(
+            snapshot,
+            context,
+            state.current_live_session_epoch.load(Ordering::Acquire),
         )?;
-        normalize_scene_document_magnetization_assets(&mut current_scene);
-        snapshot.builder_adapter = scene_document_builder_projection(&current_scene).ok();
+    }
+    if snapshot.scene_document.is_none() {
+        snapshot.builder_adapter = builder_adapter;
         snapshot.scene_document = Some(current_scene);
     }
     snapshot
@@ -3013,11 +5153,30 @@ pub(crate) async fn get_or_load_current_live_scene_document(
 
 pub(crate) async fn commit_current_live_scene_document(
     state: &Arc<AppState>,
+    scene_document: SceneDocument,
+) -> Result<SceneDocument, ApiError> {
+    commit_current_live_scene_document_with_context(state, None, scene_document).await
+}
+
+pub(crate) async fn commit_current_live_scene_document_for_context(
+    state: &Arc<AppState>,
+    context: &CurrentLiveRequestContext,
+    scene_document: SceneDocument,
+) -> Result<SceneDocument, ApiError> {
+    commit_current_live_scene_document_with_context(state, Some(context), scene_document).await
+}
+
+async fn commit_current_live_scene_document_with_context(
+    state: &Arc<AppState>,
+    context: Option<&CurrentLiveRequestContext>,
     mut scene_document: SceneDocument,
 ) -> Result<SceneDocument, ApiError> {
+    if let Some(context) = context {
+        validate_current_live_request_context(state, context).await?;
+    }
     normalize_scene_document_magnetization_assets(&mut scene_document);
     normalize_scene_document_study_pipeline_labels(&mut scene_document);
-    validate_scene_document(&scene_document)
+    validate_scene_document_for_authoring(&scene_document)
         .map_err(|error| ApiError::bad_request(error.message))?;
     let preset_texture_count = scene_document
         .magnetization_assets
@@ -3041,20 +5200,60 @@ pub(crate) async fn commit_current_live_scene_document(
         summary = %scene_magnetization_summary(&scene_document),
         "frontend scene update received"
     );
-    let (scene_document, realtime_state, preset_texture_change_logs, live_rebuild_stats) = {
+    let scene_path_to_load = {
+        let current = state.current_live_state.read().await;
+        let snapshot = current
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+        if snapshot.scene_document.is_none() && !snapshot.session.script_path.trim().is_empty() {
+            Some(PathBuf::from(snapshot.session.script_path.trim()))
+        } else {
+            None
+        }
+    };
+    if let Some(scene_path) = scene_path_to_load {
+        // Exporting the current scene invokes Python. Resolve it before taking
+        // the state write lock so a slow helper cannot block session reads.
+        let mut current_scene = load_scene_document_state_async(state, &scene_path).await?;
+        normalize_scene_document_magnetization_assets(&mut current_scene);
+        let builder_adapter = scene_document_builder_projection(&current_scene).ok();
+        if let Some(context) = context {
+            validate_current_live_request_context(state, context).await?;
+        }
+        let _transition = state.current_live_session_transition.lock().await;
+        let mut current = state.current_live_state.write().await;
+        if let Some(snapshot) = current.as_mut() {
+            if let Some(context) = context {
+                ensure_current_live_request_context(
+                    snapshot,
+                    context,
+                    state.current_live_session_epoch.load(Ordering::Acquire),
+                )?;
+            }
+            if snapshot.scene_document.is_none() {
+                snapshot.builder_adapter = builder_adapter;
+                snapshot.scene_document = Some(current_scene);
+            }
+        }
+    }
+    let (
+        scene_document,
+        realtime_snapshot,
+        display_revision,
+        preset_texture_change_logs,
+        live_rebuild_stats,
+    ) = {
+        let _transition = state.current_live_session_transition.lock().await;
         let mut current = state.current_live_state.write().await;
         let snapshot = current
             .as_mut()
             .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
-        if snapshot.scene_document.is_none() && !snapshot.session.script_path.trim().is_empty() {
-            let mut current_scene = load_scene_document_state(
-                &state.repo_root,
-                &state.current_workspace_root,
-                Path::new(snapshot.session.script_path.trim()),
+        if let Some(context) = context {
+            ensure_current_live_request_context(
+                snapshot,
+                context,
+                state.current_live_session_epoch.load(Ordering::Acquire),
             )?;
-            normalize_scene_document_magnetization_assets(&mut current_scene);
-            snapshot.builder_adapter = scene_document_builder_projection(&current_scene).ok();
-            snapshot.scene_document = Some(current_scene);
         }
         if let Some(current_scene) = snapshot.scene_document.as_ref() {
             if scene_document.revision != current_scene.revision {
@@ -3085,7 +5284,18 @@ pub(crate) async fn commit_current_live_scene_document(
         scene_document.version = "scene.v2".to_string();
         scene_document.revision = next_revision;
         let builder_state = match scene_document_builder_projection(&scene_document) {
-            Ok(state) => state,
+            Ok(state) => Some(state),
+            Err(err) if scene_document_has_unresolved_solve_prerequisites(&scene_document) => {
+                info!(
+                    target: "fullmag_api::scene_sync",
+                    direction = "pending",
+                    revision = scene_document.revision,
+                    summary = %scene_magnetization_summary(&scene_document),
+                    error = %err.message,
+                    "frontend scene update stored before solve prerequisites are complete"
+                );
+                None
+            }
             Err(err) => {
                 info!(
                     target: "fullmag_api::scene_sync",
@@ -3098,7 +5308,7 @@ pub(crate) async fn commit_current_live_scene_document(
                 return Err(err);
             }
         };
-        snapshot.builder_adapter = Some(builder_state);
+        snapshot.builder_adapter = builder_state;
         let next_mesh_signature = scene_mesh_signature(&scene_document);
         snapshot.scene_document = Some(scene_document.clone());
         snapshot.region_realization_revisions =
@@ -3132,23 +5342,40 @@ pub(crate) async fn commit_current_live_scene_document(
             snapshot.mesh_revision = snapshot.mesh_revision.wrapping_add(1).max(1);
             snapshot.mesh_build_revision = snapshot.mesh_build_revision.wrapping_add(1).max(1);
         }
-        let realtime_state = current_live_realtime_state_from_snapshot(
-            state,
-            snapshot,
-            snapshot.display_selection.revision,
-        )
-        .await;
         let preset_texture_change_logs =
             detect_preset_texture_changes(previous_scene.as_ref(), &scene_document);
         (
             scene_document,
-            realtime_state,
+            snapshot.clone(),
+            snapshot.display_selection.revision,
             preset_texture_change_logs,
             live_rebuild_stats,
         )
     };
-
-    publish_current_live_realtime_batch_changed(state, &realtime_state, false, 0).await?;
+    if let Some(context) = context {
+        // Keep the identity fence through the realtime publication as well;
+        // otherwise a session transition between the final write and this
+        // await could route an old scene revision into the new workspace.
+        let _transition = state.current_live_session_transition.lock().await;
+        let current = state.current_live_state.read().await;
+        let snapshot = current
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+        ensure_current_live_request_context(
+            snapshot,
+            context,
+            state.current_live_session_epoch.load(Ordering::Acquire),
+        )?;
+        let realtime_state =
+            current_live_realtime_state_from_snapshot(state, &realtime_snapshot, display_revision)
+                .await;
+        publish_current_live_realtime_batch_changed(state, &realtime_state, false, 0).await?;
+    } else {
+        let realtime_state =
+            current_live_realtime_state_from_snapshot(state, &realtime_snapshot, display_revision)
+                .await;
+        publish_current_live_realtime_batch_changed(state, &realtime_state, false, 0).await?;
+    }
     eprintln!(
         "[fullmag-api] TX -> frontend scene rev={} preset_texture_assets={} status=committed",
         scene_document.revision,
@@ -4511,10 +6738,19 @@ fn resolve_global_scalar_quantity(
 }
 
 fn current_preview_source(current: &SessionStateResponse) -> (u64, f64) {
-    if let Some(live_state) = current.live_state.as_ref() {
+    if let Some(live_state) = current
+        .live_state
+        .as_ref()
+        .filter(|state| state.latest_step.is_physical_observation())
+    {
         return (live_state.latest_step.step, live_state.latest_step.time);
     }
-    if let Some(row) = current.scalar_rows.last() {
+    if let Some(row) = current
+        .scalar_rows
+        .iter()
+        .rev()
+        .find(|row| row.is_physical_observation())
+    {
         return (row.step, row.time);
     }
     if let Some(run) = current.run.as_ref() {
@@ -4524,18 +6760,34 @@ fn current_preview_source(current: &SessionStateResponse) -> (u64, f64) {
 }
 
 fn current_global_scalar_value(current: &SessionStateResponse, quantity: &str) -> Option<f64> {
+    if has_nonphysical_latest_step(current) {
+        return None;
+    }
     let metric_key = quantity_spec(quantity)?.scalar_metric_key?;
     current
         .scalar_rows
-        .last()
+        .iter()
+        .rev()
+        .find(|row| row.is_physical_observation())
         .and_then(|row| scalar_row_metric_value(row, metric_key))
         .or_else(|| {
             current
                 .live_state
                 .as_ref()
+                .filter(|state| state.latest_step.is_physical_observation())
                 .and_then(|state| live_step_metric_value(&state.latest_step, metric_key))
         })
-        .or_else(|| run_manifest_scalar_value(current.run.as_ref(), metric_key))
+        .or_else(|| {
+            // Only the component fallback needs plan provenance. Do not clone
+            // mesh/material arrays on live reads or unrelated scalar requests.
+            let plan = (metric_key == "e_rotated_dmi")
+                .then(|| current.metadata.as_ref()?.get("execution_plan"))
+                .flatten()
+                .and_then(|value| {
+                    serde_json::from_value::<fullmag_ir::ExecutionPlanIR>(value.clone()).ok()
+                });
+            run_manifest_scalar_value(current.run.as_ref(), metric_key, plan.as_ref())
+        })
 }
 
 fn scalar_row_metric_value(row: &ScalarRow, metric_key: &str) -> Option<f64> {
@@ -4545,6 +6797,7 @@ fn scalar_row_metric_value(row: &ScalarRow, metric_key: &str) -> Option<f64> {
         "e_ext" => Some(row.e_ext),
         "e_ani" => Some(row.e_ani),
         "e_dmi" => Some(row.e_dmi),
+        "e_rotated_dmi" => row.e_rotated_dmi,
         "e_total" => Some(row.e_total),
         _ => None,
     }

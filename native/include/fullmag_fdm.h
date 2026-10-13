@@ -52,6 +52,9 @@ extern "C" {
 #define FULLMAG_FDM_FROZEN_SPINS_ABI_V1 1u
 #define FULLMAG_FDM_CAPABILITY_FROZEN_SPINS_V1 (UINT64_C(1) << 0)
 #define FULLMAG_FDM_PLAN_DESC_ABI_V2 UINT32_C(2)
+#define FULLMAG_FDM_ROTATED_INTERFACIAL_DMI_ABI_V1 UINT32_C(1)
+#define FULLMAG_FDM_REGIONAL_FIELD_DRIVES_ABI_V1 UINT32_C(1)
+#define FULLMAG_FDM_REGIONAL_FIELD_DRIVES_ABI_V2 UINT32_C(2)
 
 /* ── Enums ── */
 
@@ -95,6 +98,8 @@ typedef enum {
     FULLMAG_FDM_OBSERVABLE_EDEN_ANI   = 13,
     FULLMAG_FDM_OBSERVABLE_EDEN_DMI   = 14,
     FULLMAG_FDM_OBSERVABLE_EDEN_TOTAL = 15,
+    FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI = 16,
+    FULLMAG_FDM_OBSERVABLE_EDEN_ROTATED_DMI = 17,
 } fullmag_fdm_observable;
 
 typedef enum {
@@ -151,12 +156,45 @@ typedef struct {
 typedef enum {
     FULLMAG_FDM_STATS_FULL = 0,  /* default: preserve existing per-step diagnostics */
     FULLMAG_FDM_STATS_NONE = 1,  /* step returns only step/time/dt metadata */
+    FULLMAG_FDM_STATS_CONTROL = 2, /* step-control metadata; no full observation */
+    FULLMAG_FDM_STATS_REQUESTED = 3, /* on-demand masked scalar observation */
 } fullmag_fdm_stats_mode;
+
+#define FULLMAG_FDM_STATS_QUANTITY_E_EX          (UINT64_C(1) << 0)
+#define FULLMAG_FDM_STATS_QUANTITY_E_DEMAG       (UINT64_C(1) << 1)
+#define FULLMAG_FDM_STATS_QUANTITY_E_EXT         (UINT64_C(1) << 2)
+#define FULLMAG_FDM_STATS_QUANTITY_E_ANI         (UINT64_C(1) << 3)
+#define FULLMAG_FDM_STATS_QUANTITY_E_DMI         (UINT64_C(1) << 4)
+#define FULLMAG_FDM_STATS_QUANTITY_E_TOTAL       (UINT64_C(1) << 5)
+#define FULLMAG_FDM_STATS_QUANTITY_MAX_H_EFF     (UINT64_C(1) << 6)
+#define FULLMAG_FDM_STATS_QUANTITY_MAX_H_DEMAG   (UINT64_C(1) << 7)
+#define FULLMAG_FDM_STATS_QUANTITY_MAX_TORQUE    (UINT64_C(1) << 8)
+#define FULLMAG_FDM_STATS_QUANTITY_MAX_RHS       (UINT64_C(1) << 9)
+#define FULLMAG_FDM_STATS_QUANTITY_ALL           ((UINT64_C(1) << 10) - 1)
+#define FULLMAG_FDM_STATS_QUANTITY_CONTROL       \
+    (FULLMAG_FDM_STATS_QUANTITY_MAX_TORQUE | \
+     FULLMAG_FDM_STATS_QUANTITY_MAX_RHS)
+
+#define FULLMAG_FDM_STATS_POLICY_ABI_V1 1u
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    fullmag_fdm_stats_mode mode;
+    uint32_t stride;
+    uint64_t quantity_mask;
+} fullmag_fdm_stats_policy_v1;
+
+#if defined(__cplusplus)
+static_assert(sizeof(fullmag_fdm_stats_policy_v1) == 24,
+              "stats policy v1 ABI size changed");
+#endif
 
 #define FULLMAG_FDM_LLG_CHECKPOINT_SCHEMA_V1 UINT32_C(1)
 #define FULLMAG_FDM_LLG_CHECKPOINT_SCHEMA_V2 UINT32_C(2)
 #define FULLMAG_FDM_LLG_CHECKPOINT_SCHEMA_V3 UINT32_C(3)
+#define FULLMAG_FDM_LLG_CHECKPOINT_SCHEMA_V4 UINT32_C(4)
 #define FULLMAG_FDM_CHECKPOINT_EXECUTION_IDENTITY_ABI_V3 UINT32_C(3)
+#define FULLMAG_FDM_WORKSPACE_DEPENDENCY_IDENTITY_ABI_V1 UINT32_C(1)
 #define FULLMAG_FDM_CHECKPOINT_BACKEND_FDM UINT32_C(1)
 #define FULLMAG_FDM_CHECKPOINT_BACKEND_AUTO UINT32_C(2)
 #define FULLMAG_FDM_CHECKPOINT_POLICY_GPU_REQUIRED UINT32_C(1)
@@ -259,6 +297,28 @@ typedef struct {
 } fullmag_fdm_checkpoint_execution_identity_v3;
 
 typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t grid_nx;
+    uint32_t grid_ny;
+    uint32_t grid_nz;
+    uint32_t fft_nx;
+    uint32_t fft_ny;
+    uint32_t fft_nz;
+    uint32_t precision;
+    uint32_t integrator;
+    uint32_t periodic_axis_mask;
+    uint32_t reserved0;
+    double grid_dx;
+    double grid_dy;
+    double grid_dz;
+    uint8_t mask_topology_sha256[32];
+    uint8_t material_layout_sha256[32];
+    uint8_t spectra_sha256[32];
+    uint8_t dependency_sha256[32];
+} fullmag_fdm_workspace_dependency_identity_v1;
+
+typedef struct {
     uint32_t schema_version;
     uint32_t struct_size;
     fullmag_fdm_checkpoint_execution_identity_v3 execution_identity;
@@ -296,6 +356,46 @@ typedef struct {
     uint32_t fsal_integrator_identity;
     uint32_t fsal_precision_identity;
 } fullmag_fdm_llg_checkpoint_info_v3;
+
+typedef struct {
+    uint32_t schema_version;
+    uint32_t struct_size;
+    fullmag_fdm_checkpoint_execution_identity_v3 execution_identity;
+    fullmag_fdm_workspace_dependency_identity_v1 workspace_dependency_identity;
+    uint32_t array_mask;
+    uint32_t reserved0;
+    uint64_t cell_count;
+    uint64_t payload_bytes;
+    uint64_t step_count;
+    uint64_t accepted_step_index;
+    uint64_t accepted_state_revision;
+    double current_time;
+    double current_dt;
+    uint64_t thermal_seed;
+    uint32_t rng_algorithm;
+    uint32_t rng_realization;
+    uint64_t transport_attempt_generation;
+    uint64_t rhs_source_revision;
+    uint64_t rhs_field_revision;
+    uint64_t rhs_transport_revision;
+    uint64_t projection_policy_identity;
+    uint32_t fsal_valid;
+    uint32_t abm_startup;
+    double abm_last_dt;
+    uint32_t adaptive_enabled;
+    uint32_t adaptive_has_previous_error;
+    double adaptive_previous_error;
+    uint64_t fsal_accepted_state_revision;
+    uint64_t fsal_accepted_time_bits;
+    uint64_t fsal_accepted_dt_bits;
+    uint64_t fsal_source_revision;
+    uint64_t fsal_field_revision;
+    uint64_t fsal_transport_revision;
+    uint64_t fsal_transport_state_identity;
+    uint64_t fsal_projection_policy_identity;
+    uint32_t fsal_integrator_identity;
+    uint32_t fsal_precision_identity;
+} fullmag_fdm_llg_checkpoint_info_v4;
 
 typedef int (*fullmag_fdm_interrupt_poll_fn)(void *user_data);
 
@@ -388,6 +488,19 @@ typedef struct {
     fullmag_fdm_stats_mode     stats_mode;
     uint32_t                   stats_stride;
 } fullmag_fdm_multilayer_plan_desc_v2;
+
+/*
+ * Versioned multilayer rDMI extension.  The v2 descriptor above is a frozen
+ * 160-byte ABI used by existing clients; rotated interfacial DMI is carried by
+ * the separate setter below so it cannot change the v2 wire layout.
+ */
+typedef struct {
+    uint32_t                         abi_version;
+    uint32_t                         struct_size;
+    int                              has_rotated_interfacial_dmi;
+    uint32_t                         reserved0;
+    double                           dmi_D_rotated_interfacial; /* D_21 = D_32 (J/m^2) */
+} fullmag_fdm_rotated_interfacial_dmi_desc_v1;
 
 typedef struct {
     fullmag_fdm_grid_desc      grid;
@@ -666,7 +779,60 @@ typedef struct {
     uint32_t struct_size;
     fullmag_fdm_plan_desc base;
     fullmag_fdm_time_policy_desc_v2 time_policy;
+    /* Optional append-only extension; absent when struct_size is the legacy 1384 bytes. */
+    int has_rotated_interfacial_dmi;
+    double dmi_D_rotated_interfacial; /* D_21 = D_32 (J/m^2) */
 } fullmag_fdm_plan_desc_v2;
+
+/* Append-only native CUDA extension for resolved regional field drives. */
+typedef enum {
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_CONSTANT = 0,
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_SINUSOIDAL = 1,
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_PULSE = 2,
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_PIECEWISE_LINEAR = 3,
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_SINC_PULSE = 4,
+} fullmag_fdm_regional_field_drive_waveform;
+
+typedef enum {
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_STAGE_LOCAL = 0,
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_ABSOLUTE = 1,
+} fullmag_fdm_regional_field_drive_time_origin;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    const double *field_xyz;       /* resolved H0 basis, AoS f64, A/m */
+    uint64_t field_len;            /* exactly 3 * cell_count */
+    fullmag_fdm_regional_field_drive_waveform waveform;
+    fullmag_fdm_regional_field_drive_time_origin time_origin;
+    double stage_start_time_s;     /* absolute segment start; used for ABSOLUTE */
+    double frequency_hz;
+    double phase_rad;
+    double offset;
+    double t_on_s;
+    double t_off_s;
+    double cutoff_hz;
+    double t0_s;
+    double amplitude;
+    const double *piecewise_points; /* AoS [time_s, value], if PWL */
+    uint64_t piecewise_point_count;
+} fullmag_fdm_regional_field_drive_desc_v1;
+
+/* Separate descriptor preserves the v1 array stride and binary contract.
+ * Both times are absolute seconds; 0 <= waveform_origin_time_s <=
+ * drive.stage_start_time_s. The v1 adapter sets them equal.
+ */
+typedef struct {
+    fullmag_fdm_regional_field_drive_desc_v1 drive;
+    double waveform_origin_time_s; /* original stage start for STAGE_LOCAL */
+} fullmag_fdm_regional_field_drive_desc_v2;
+
+#if defined(__cplusplus)
+static_assert(sizeof(fullmag_fdm_regional_field_drive_desc_v1) == 120,
+              "regional field-drive v1 ABI size changed");
+static_assert(sizeof(fullmag_fdm_regional_field_drive_desc_v2) == 128,
+              "regional field-drive v2 ABI size changed");
+#endif
 
 /* ── Per-step diagnostics ── */
 
@@ -697,6 +863,60 @@ typedef struct {
     uint64_t multilayer_pair_accumulation_count;
 } fullmag_fdm_step_stats;
 
+#define FULLMAG_FDM_ADAPTIVE_ATTEMPT_ABI_V1 1u
+#define FULLMAG_FDM_ADAPTIVE_ATTEMPT_CAPACITY_V1 51u
+
+typedef enum {
+    FULLMAG_FDM_ADAPTIVE_ATTEMPT_ACCEPTED = 1,
+    FULLMAG_FDM_ADAPTIVE_ATTEMPT_RETRY = 2,
+    FULLMAG_FDM_ADAPTIVE_ATTEMPT_FAILED = 3,
+} fullmag_fdm_adaptive_attempt_decision_v1;
+
+typedef enum {
+    FULLMAG_FDM_ADAPTIVE_ATTEMPT_WITHIN_TOLERANCE = 1,
+    FULLMAG_FDM_ADAPTIVE_ATTEMPT_ERROR_ABOVE_TOLERANCE = 2,
+    FULLMAG_FDM_ADAPTIVE_ATTEMPT_DT_MIN_EXHAUSTED = 3,
+    FULLMAG_FDM_ADAPTIVE_ATTEMPT_INVALID_TIMESTEP = 4,
+    FULLMAG_FDM_ADAPTIVE_ATTEMPT_INVALID_CURRENT_ERROR = 5,
+    FULLMAG_FDM_ADAPTIVE_ATTEMPT_INVALID_PREVIOUS_ERROR = 6,
+    FULLMAG_FDM_ADAPTIVE_ATTEMPT_RETRY_LIMIT_EXHAUSTED = 7,
+} fullmag_fdm_adaptive_attempt_reason_v1;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t attempt_index;
+    fullmag_fdm_adaptive_attempt_decision_v1 decision;
+    fullmag_fdm_adaptive_attempt_reason_v1 reason;
+    uint32_t reserved0;
+    double dt_attempt_seconds;
+    double normalized_error;
+    double ratio;
+    double dt_next_seconds;
+} fullmag_fdm_adaptive_attempt_v1;
+
+#define FULLMAG_FDM_ADAPTIVE_BATCH_STEP_ABI_V1 1u
+#define FULLMAG_FDM_ADAPTIVE_BATCH_STEP_CAPACITY_V1 64u
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    fullmag_fdm_adaptive_attempt_decision_v1 decision;
+    fullmag_fdm_adaptive_attempt_reason_v1 reason;
+    uint64_t step;
+    double time_seconds;
+    double dt_seconds;
+    double suggested_next_dt_seconds;
+    double normalized_error;
+    uint32_t rejected_attempts;
+    uint32_t reserved0;
+} fullmag_fdm_adaptive_batch_step_v1;
+
+#if defined(__cplusplus)
+static_assert(sizeof(fullmag_fdm_adaptive_batch_step_v1) == 64,
+              "adaptive batch step v1 ABI size changed");
+#endif
+
 #define FULLMAG_FDM_FSAL_TELEMETRY_ABI_V1 1u
 typedef struct {
     uint32_t abi_version;
@@ -725,6 +945,269 @@ typedef struct {
     uint64_t transaction_commit_count;
     uint64_t invalidation_reason_counts[FULLMAG_FDM_FSAL_INVALIDATION_REASON_COUNT];
 } fullmag_fdm_fsal_telemetry_v2;
+
+#define FULLMAG_FDM_STEP_TRANSACTION_TELEMETRY_ABI_V1 1u
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t accounting_valid;
+    uint32_t reserved0;
+    uint64_t capture_count;
+    uint64_t rollback_count;
+    uint64_t capture_d2d_bytes;
+    uint64_t rollback_d2d_bytes;
+    uint64_t rollback_latency_total_ns;
+    uint64_t rollback_latency_max_ns;
+    uint64_t accepted_step_index;
+    uint64_t attempt_generation;
+    uint64_t thermal_rng_draws;
+    uint64_t stale_publication_count;
+} fullmag_fdm_step_transaction_telemetry_v1;
+
+#define FULLMAG_FDM_ENDPOINT_CACHE_TELEMETRY_ABI_V1 1u
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t cache_identity_valid;
+    uint32_t stats_valid;
+    uint64_t accepted_state_revision;
+    uint64_t accepted_time_bits;
+    uint64_t source_revision;
+    uint64_t field_revision;
+    uint64_t transport_revision;
+    uint64_t projection_policy_identity;
+    uint64_t valid_field_mask;
+    uint64_t refresh_request_count;
+    uint64_t refresh_execution_count;
+    uint64_t refresh_cache_hit_count;
+    uint64_t invalidation_count;
+    uint64_t stats_snapshot_request_count;
+    uint64_t stats_snapshot_cache_hit_count;
+    uint64_t field_snapshot_request_count;
+    uint64_t field_snapshot_latency_total_ns;
+    uint64_t field_snapshot_latency_max_ns;
+    uint64_t exchange_evaluation_count;
+    uint64_t demag_evaluation_count;
+    uint64_t demag_forward_fft_count;
+    uint64_t demag_inverse_fft_count;
+    uint64_t effective_field_evaluation_count;
+    uint64_t energy_reduction_count;
+    uint64_t last_step_exchange_evaluation_count;
+    uint64_t last_step_demag_evaluation_count;
+    uint64_t last_step_demag_forward_fft_count;
+    uint64_t last_step_demag_inverse_fft_count;
+    uint64_t last_step_effective_field_evaluation_count;
+    uint64_t last_step_energy_reduction_count;
+} fullmag_fdm_endpoint_cache_telemetry_v1;
+
+#if defined(__cplusplus)
+static_assert(sizeof(fullmag_fdm_endpoint_cache_telemetry_v1) == 240,
+              "endpoint cache telemetry v1 ABI size changed");
+#endif
+
+#define FULLMAG_FDM_ADAPTIVE_EXECUTION_TELEMETRY_ABI_V1 1u
+
+typedef enum {
+    FULLMAG_FDM_ADAPTIVE_CONTROL_NOT_APPLICABLE = 0,
+    FULLMAG_FDM_ADAPTIVE_CONTROL_LEGACY_HOST_READBACK = 1,
+    FULLMAG_FDM_ADAPTIVE_CONTROL_CUDA_CONDITIONAL_GRAPH = 2,
+    FULLMAG_FDM_ADAPTIVE_CONTROL_CUDA_CONDITIONAL_GRAPH_BATCHED = 3,
+} fullmag_fdm_adaptive_control_realization_v1;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    fullmag_fdm_adaptive_control_realization_v1 realization;
+    uint32_t accounting_valid;
+    uint64_t graph_build_count;
+    uint64_t graph_launch_count;
+    uint64_t terminal_control_d2h_bytes;
+    uint64_t terminal_control_host_sync_count;
+    uint64_t step_completion_host_sync_count;
+    uint64_t stats_none_host_sync_count;
+} fullmag_fdm_adaptive_execution_telemetry_v1;
+
+#if defined(__cplusplus)
+static_assert(sizeof(fullmag_fdm_adaptive_execution_telemetry_v1) == 64,
+              "adaptive execution telemetry v1 ABI size changed");
+#endif
+
+#define FULLMAG_FDM_PRECISION_POLICY_TELEMETRY_ABI_V1 1u
+
+typedef enum {
+    FULLMAG_FDM_PRECISION_POLICY_FULL_DOUBLE = 1,
+    FULLMAG_FDM_PRECISION_POLICY_SINGLE_STORAGE_FP64_REDUCTION = 2,
+} fullmag_fdm_precision_policy_realization_v1;
+
+#define FULLMAG_FDM_PRECISION_POLICY_METRIC_IDENTITY (UINT64_C(1) << 0)
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t accounting_valid;
+    fullmag_fdm_precision storage_precision;
+    fullmag_fdm_precision compute_precision;
+    fullmag_fdm_precision fft_precision;
+    fullmag_fdm_precision reduction_precision;
+    fullmag_fdm_precision_policy_realization_v1 realization;
+    uint64_t metric_valid_mask;
+} fullmag_fdm_precision_policy_telemetry_v1;
+
+#if defined(__cplusplus)
+static_assert(sizeof(fullmag_fdm_precision_policy_telemetry_v1) == 40,
+              "precision policy telemetry v1 ABI size changed");
+#endif
+
+#define FULLMAG_FDM_LOCAL_PIPELINE_TELEMETRY_ABI_V1 1u
+
+typedef enum {
+    FULLMAG_FDM_LOCAL_PIPELINE_POLICY_AUTO_SAFE = 1,
+} fullmag_fdm_local_pipeline_policy_v1;
+
+typedef enum {
+    FULLMAG_FDM_LOCAL_PIPELINE_REALIZATION_NONE = 0,
+    FULLMAG_FDM_LOCAL_PIPELINE_REALIZATION_DIRECT_FUSED = 1,
+    FULLMAG_FDM_LOCAL_PIPELINE_REALIZATION_DIRECT_UNFUSED = 2,
+    FULLMAG_FDM_LOCAL_PIPELINE_REALIZATION_CUDA_GRAPH_FUSED = 3,
+    FULLMAG_FDM_LOCAL_PIPELINE_REALIZATION_CUDA_GRAPH_UNFUSED = 4,
+    FULLMAG_FDM_LOCAL_PIPELINE_REALIZATION_MIXED = 5,
+} fullmag_fdm_local_pipeline_realization_v1;
+
+#define FULLMAG_FDM_LOCAL_PIPELINE_METRIC_IDENTITY (UINT64_C(1) << 0)
+#define FULLMAG_FDM_LOCAL_PIPELINE_METRIC_DIRECT_SUBMISSIONS (UINT64_C(1) << 1)
+#define FULLMAG_FDM_LOCAL_PIPELINE_METRIC_CAPTURED_NODES (UINT64_C(1) << 2)
+#define FULLMAG_FDM_LOCAL_PIPELINE_METRIC_GRAPH_LIFECYCLE (UINT64_C(1) << 3)
+#define FULLMAG_FDM_LOCAL_PIPELINE_METRIC_GRAPH_EXECUTIONS (UINT64_C(1) << 4)
+#define FULLMAG_FDM_LOCAL_PIPELINE_METRIC_PROFILED_DRAM_BYTES (UINT64_C(1) << 5)
+#define FULLMAG_FDM_LOCAL_PIPELINE_METRIC_PROFILED_LAUNCH_TIME (UINT64_C(1) << 6)
+#define FULLMAG_FDM_LOCAL_PIPELINE_METRIC_PROFILED_OCCUPANCY (UINT64_C(1) << 7)
+
+#define FULLMAG_FDM_LOCAL_PIPELINE_FEATURE_EXCHANGE_INPUT (UINT64_C(1) << 0)
+#define FULLMAG_FDM_LOCAL_PIPELINE_FEATURE_DEMAG_INPUT (UINT64_C(1) << 1)
+#define FULLMAG_FDM_LOCAL_PIPELINE_FEATURE_UNIFORM_ZEEMAN (UINT64_C(1) << 2)
+#define FULLMAG_FDM_LOCAL_PIPELINE_FEATURE_STATIC_FIELD_PROFILE (UINT64_C(1) << 3)
+#define FULLMAG_FDM_LOCAL_PIPELINE_FEATURE_OERSTED (UINT64_C(1) << 4)
+#define FULLMAG_FDM_LOCAL_PIPELINE_FEATURE_ANISOTROPY (UINT64_C(1) << 5)
+#define FULLMAG_FDM_LOCAL_PIPELINE_FEATURE_MAGNETOELASTIC (UINT64_C(1) << 6)
+#define FULLMAG_FDM_LOCAL_PIPELINE_FEATURE_THERMAL (UINT64_C(1) << 7)
+#define FULLMAG_FDM_LOCAL_PIPELINE_FEATURE_ZHANG_LI_STT (UINT64_C(1) << 8)
+#define FULLMAG_FDM_LOCAL_PIPELINE_FEATURE_SLONCZEWSKI_STT (UINT64_C(1) << 9)
+#define FULLMAG_FDM_LOCAL_PIPELINE_FEATURE_SOT (UINT64_C(1) << 10)
+#define FULLMAG_FDM_LOCAL_PIPELINE_FEATURE_REGIONAL_FIELD_DRIVE (UINT64_C(1) << 11)
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    fullmag_fdm_local_pipeline_policy_v1 requested_policy;
+    fullmag_fdm_local_pipeline_realization_v1 resolved_realization;
+    fullmag_fdm_local_pipeline_realization_v1 executed_realization;
+    uint32_t accounting_valid;
+    fullmag_fdm_precision precision;
+    fullmag_fdm_integrator integrator;
+    uint64_t metric_valid_mask;
+    uint64_t required_operator_mask;
+    uint64_t active_feature_mask;
+    uint64_t source_revision;
+    uint64_t field_revision;
+    uint64_t direct_fused_field_rhs_launch_count;
+    uint64_t direct_unfused_effective_field_launch_count;
+    uint64_t direct_unfused_rhs_launch_count;
+    uint64_t captured_fused_field_rhs_node_count;
+    uint64_t captured_unfused_effective_field_node_count;
+    uint64_t captured_unfused_rhs_node_count;
+    uint64_t graph_build_count;
+    uint64_t graph_replay_count;
+    uint64_t graph_recapture_count;
+    uint64_t graph_attempt_execution_count;
+    uint64_t graph_fused_field_rhs_execution_count;
+    uint64_t graph_unfused_effective_field_execution_count;
+    uint64_t graph_unfused_rhs_execution_count;
+    uint64_t profiled_dram_read_bytes;
+    uint64_t profiled_dram_write_bytes;
+    uint64_t profiled_launch_time_ns;
+    uint64_t profiled_achieved_occupancy_permyriad;
+} fullmag_fdm_local_pipeline_telemetry_v1;
+
+#if defined(__cplusplus)
+static_assert(sizeof(fullmag_fdm_local_pipeline_telemetry_v1) == 208,
+              "local pipeline telemetry v1 ABI size changed");
+#endif
+
+#define FULLMAG_FDM_GPU_WORKSPACE_TELEMETRY_ABI_V1 1u
+
+#define FULLMAG_FDM_GPU_WORKSPACE_METRIC_IDENTITY (UINT64_C(1) << 0)
+#define FULLMAG_FDM_GPU_WORKSPACE_METRIC_ALLOCATIONS (UINT64_C(1) << 1)
+#define FULLMAG_FDM_GPU_WORKSPACE_METRIC_FFT_PLANS (UINT64_C(1) << 2)
+#define FULLMAG_FDM_GPU_WORKSPACE_METRIC_FOOTPRINT (UINT64_C(1) << 3)
+#define FULLMAG_FDM_GPU_WORKSPACE_METRIC_REVISIONS (UINT64_C(1) << 4)
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    uint32_t accounting_valid;
+    uint32_t setup_complete;
+    fullmag_fdm_precision precision;
+    fullmag_fdm_integrator integrator;
+    uint64_t metric_valid_mask;
+    uint64_t workspace_revision;
+    uint64_t source_revision;
+    uint64_t field_revision;
+    uint64_t setup_device_allocation_count;
+    uint64_t setup_device_allocation_bytes;
+    uint64_t total_device_allocation_count;
+    uint64_t total_device_allocation_bytes;
+    uint64_t step_device_allocation_count;
+    uint64_t step_device_allocation_bytes;
+    uint64_t setup_fft_plan_creation_count;
+    uint64_t total_fft_plan_creation_count;
+    uint64_t step_fft_plan_creation_count;
+    uint64_t prepared_fft_workspace_count;
+    uint64_t workspace_bytes;
+    uint64_t peak_vram_bytes;
+    uint64_t observed_step_count;
+} fullmag_fdm_gpu_workspace_telemetry_v1;
+
+#if defined(__cplusplus)
+static_assert(sizeof(fullmag_fdm_gpu_workspace_telemetry_v1) == 160,
+              "GPU workspace telemetry v1 ABI size changed");
+#endif
+
+#define FULLMAG_FDM_ADAPTIVE_NUMERICS_TELEMETRY_ABI_V1 1u
+
+typedef enum {
+    FULLMAG_FDM_EMBEDDED_ERROR_PRE_PROJECTION_DIFFERENCE = 1,
+} fullmag_fdm_embedded_error_semantics_v1;
+
+typedef enum {
+    FULLMAG_FDM_NORM_DEFECT_POST_PROJECTION_ABS_UNIT = 1,
+} fullmag_fdm_norm_defect_semantics_v1;
+
+typedef enum {
+    FULLMAG_FDM_SPIN_ROTATION_ATTEMPT_GEODESIC_RADIANS = 1,
+} fullmag_fdm_spin_rotation_semantics_v1;
+
+typedef struct {
+    uint32_t abi_version;
+    uint32_t struct_size;
+    fullmag_fdm_embedded_error_semantics_v1 embedded_error_semantics;
+    fullmag_fdm_norm_defect_semantics_v1 norm_defect_semantics;
+    fullmag_fdm_spin_rotation_semantics_v1 spin_rotation_semantics;
+    uint32_t accounting_valid;
+    uint64_t terminal_observation_count;
+    uint64_t decision_comparison_count;
+    uint64_t decision_divergence_count;
+    double last_terminal_normalized_error;
+    double last_terminal_max_norm_defect;
+    double last_terminal_max_spin_rotation_radians;
+    double max_attempt_normalized_error;
+    double max_attempt_norm_defect;
+    double max_attempt_spin_rotation_radians;
+} fullmag_fdm_adaptive_numerics_telemetry_v1;
+
+#if defined(__cplusplus)
+static_assert(sizeof(fullmag_fdm_adaptive_numerics_telemetry_v1) == 96,
+              "adaptive numerics telemetry v1 ABI size changed");
+#endif
 
 /* ── Device info ── */
 
@@ -882,10 +1365,21 @@ int fullmag_fdm_plan_ingestion_v2_create_checked(
     const fullmag_fdm_plan_desc_v2 *plan,
     fullmag_fdm_plan_ingestion_v2 **out_ingestion);
 
-/* Copy the ingested semantic fields into a caller-owned receipt. */
+/*
+ * Copy the ingested semantic fields into a caller-owned legacy receipt.  This
+ * symbol is permanently limited to the historical 1384-byte prefix and never
+ * writes the append-only extension.  Use the explicit sized form below when
+ * a complete 1400-byte receipt is available.
+ */
 int fullmag_fdm_plan_ingestion_v2_receipt(
     const fullmag_fdm_plan_ingestion_v2 *ingestion,
     fullmag_fdm_plan_desc_v2 *out_receipt);
+
+/* Explicit capacity form for callers that cannot initialize the output header. */
+int fullmag_fdm_plan_ingestion_v2_receipt_sized(
+    const fullmag_fdm_plan_ingestion_v2 *ingestion,
+    fullmag_fdm_plan_desc_v2 *out_receipt,
+    uint32_t out_receipt_size);
 
 /* Destroy the plan-input owner.  No backend or hot-loop state is affected. */
 void fullmag_fdm_plan_ingestion_v2_destroy(
@@ -908,6 +1402,20 @@ int fullmag_fdm_backend_create_time_policy_v2_checked(
 fullmag_fdm_backend *fullmag_fdm_backend_create_v2(
     const fullmag_fdm_multilayer_plan_desc_v2 *plan);
 
+/*
+ * Configure rotated interfacial DMI on a v2 multilayer handle.  This must be
+ * called after fullmag_fdm_backend_create_v2 and before the first step.  The
+ * operation is versioned and self-describing; the v2 multilayer descriptor
+ * remains the historical 160-byte ABI.
+ */
+int fullmag_fdm_backend_set_rotated_interfacial_dmi_v1(
+    fullmag_fdm_backend *handle,
+    const fullmag_fdm_rotated_interfacial_dmi_desc_v1 *descriptor);
+
+int fullmag_fdm_backend_set_stats_policy_v1(
+    fullmag_fdm_backend *handle,
+    const fullmag_fdm_stats_policy_v1 *policy);
+
 /** Upload a cell-wise profile as static external H_ext [A/m].
  * The legacy descriptor keeps the wire layout stable; this role setter is
  * intentionally a separate versioned operation and is valid only for a
@@ -917,6 +1425,19 @@ int fullmag_fdm_backend_set_static_external_field_f64(
     fullmag_fdm_backend *handle,
     const double *field_xyz,
     uint64_t field_len);
+
+/* Upload resolved cell-wise regional H-field bases and their time envelopes.
+ * The operation is valid before the first solver step and owns device copies
+ * after return. It is intentionally separate from the legacy plan descriptor.
+ */
+int fullmag_fdm_backend_set_regional_field_drives_v1(
+    fullmag_fdm_backend *handle,
+    const fullmag_fdm_regional_field_drive_desc_v1 *drives,
+    uint32_t drive_count);
+int fullmag_fdm_backend_set_regional_field_drives_v2(
+    fullmag_fdm_backend *handle,
+    const fullmag_fdm_regional_field_drive_desc_v2 *drives,
+    uint32_t drive_count);
 
 /**
  * Execute one time step of length dt_seconds using the configured integrator.
@@ -928,6 +1449,32 @@ int fullmag_fdm_backend_step(
     double                  dt_seconds,
     fullmag_fdm_step_stats *out_stats);
 
+/*
+ * Execute a bounded, atomic batch of adaptive CUDA steps through one terminal
+ * D2H/synchronization boundary. This API is valid only for stats-none,
+ * single-grid RK23/RK45 configurations accepted by device-loop preflight.
+ * On failure the complete batch is rolled back and *out_count remains zero.
+ */
+int fullmag_fdm_backend_step_adaptive_batch_v1(
+    fullmag_fdm_backend *handle,
+    double initial_dt_seconds,
+    double target_time_seconds,
+    uint32_t max_steps,
+    fullmag_fdm_adaptive_batch_step_v1 *out_steps,
+    uint32_t capacity,
+    uint32_t *out_count);
+
+/*
+ * Copy the completed adaptive-attempt trace in one observation-time D2H batch.
+ * A NULL output with capacity zero queries the required record count. The trace
+ * belongs to the most recent public step and is empty for fixed-step methods.
+ */
+int fullmag_fdm_backend_copy_adaptive_attempts_v1(
+    fullmag_fdm_backend *handle,
+    fullmag_fdm_adaptive_attempt_v1 *out_attempts,
+    uint32_t capacity,
+    uint32_t *out_count);
+
 /* Caller initializes abi_version and struct_size. Invalid headers leave output unchanged. */
 int fullmag_fdm_backend_get_fsal_telemetry_v1(
     fullmag_fdm_backend *handle,
@@ -936,6 +1483,35 @@ int fullmag_fdm_backend_get_fsal_telemetry_v1(
 int fullmag_fdm_backend_get_fsal_telemetry_v2(
     fullmag_fdm_backend *handle,
     fullmag_fdm_fsal_telemetry_v2 *out_telemetry);
+
+int fullmag_fdm_backend_get_step_transaction_telemetry_v1(
+    fullmag_fdm_backend *handle,
+    fullmag_fdm_step_transaction_telemetry_v1 *out_telemetry);
+
+int fullmag_fdm_backend_get_endpoint_cache_telemetry_v1(
+    fullmag_fdm_backend *handle,
+    fullmag_fdm_endpoint_cache_telemetry_v1 *out_telemetry);
+
+/* Caller initializes abi_version and struct_size. */
+int fullmag_fdm_backend_get_adaptive_execution_telemetry_v1(
+    fullmag_fdm_backend *handle,
+    fullmag_fdm_adaptive_execution_telemetry_v1 *out_telemetry);
+
+int fullmag_fdm_backend_get_precision_policy_telemetry_v1(
+    fullmag_fdm_backend *handle,
+    fullmag_fdm_precision_policy_telemetry_v1 *out_telemetry);
+
+int fullmag_fdm_backend_get_local_pipeline_telemetry_v1(
+    fullmag_fdm_backend *handle,
+    fullmag_fdm_local_pipeline_telemetry_v1 *out_telemetry);
+
+int fullmag_fdm_backend_get_gpu_workspace_telemetry_v1(
+    fullmag_fdm_backend *handle,
+    fullmag_fdm_gpu_workspace_telemetry_v1 *out_telemetry);
+
+int fullmag_fdm_backend_get_adaptive_numerics_telemetry_v1(
+    fullmag_fdm_backend *handle,
+    fullmag_fdm_adaptive_numerics_telemetry_v1 *out_telemetry);
 
 /* Bind/unbind the stage-wise GPU transport torque source for Heun or RK4. */
 int fullmag_fdm_context_bind_gpu_transport_v1(
@@ -1193,6 +1769,10 @@ int fullmag_fdm_backend_set_checkpoint_execution_identity_v3(
     fullmag_fdm_backend *handle,
     const fullmag_fdm_checkpoint_execution_identity_v3 *identity);
 
+int fullmag_fdm_backend_get_workspace_dependency_identity_v1(
+    fullmag_fdm_backend *handle,
+    fullmag_fdm_workspace_dependency_identity_v1 *out_identity);
+
 int fullmag_fdm_backend_llg_checkpoint_query_size_v3(
     fullmag_fdm_backend *handle,
     uint64_t *out_required_bytes);
@@ -1208,6 +1788,22 @@ int fullmag_fdm_backend_llg_checkpoint_import_v3(
     const void *source,
     uint64_t exact_bytes,
     const fullmag_fdm_llg_checkpoint_info_v3 *expected_info);
+
+int fullmag_fdm_backend_llg_checkpoint_query_size_v4(
+    fullmag_fdm_backend *handle,
+    uint64_t *out_required_bytes);
+
+int fullmag_fdm_backend_llg_checkpoint_export_v4(
+    fullmag_fdm_backend *handle,
+    void *destination,
+    uint64_t exact_capacity,
+    fullmag_fdm_llg_checkpoint_info_v4 *out_info);
+
+int fullmag_fdm_backend_llg_checkpoint_import_v4(
+    fullmag_fdm_backend *handle,
+    const void *source,
+    uint64_t exact_bytes,
+    const fullmag_fdm_llg_checkpoint_info_v4 *expected_info);
 
 /**
  * Replace one v2 multilayer layer magnetization from host-side f64 AoS storage.

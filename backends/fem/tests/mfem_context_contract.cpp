@@ -144,12 +144,28 @@ void mfem_context_lifecycle_is_owned_by_runtime_module() {
             runtime_header.find("mfem::GridFunction *gf_mx") != std::string::npos &&
             runtime_header.find("mfem::GridFunction *gf_my") != std::string::npos &&
             runtime_header.find("mfem::GridFunction *gf_mz") != std::string::npos &&
+            runtime_header.find("mfem::Vector *true_mx") != std::string::npos &&
+            runtime_header.find("mfem::Vector *true_my") != std::string::npos &&
+            runtime_header.find("mfem::Vector *true_mz") != std::string::npos &&
             runtime_header.find("mfem::GridFunction *gf_a") != std::string::npos &&
             runtime_header.find("mfem::GridFunction *gf_ms") != std::string::npos &&
             runtime_header.find("mfem::Coefficient *a_coeff") != std::string::npos &&
             runtime_header.find("mfem::Coefficient *ms_coeff") != std::string::npos &&
             runtime_header.find("bool ready") != std::string::npos,
         "MFEM context runtime state must own mesh/FES/GridFunction lifecycle handles and component buffers");
+    check(
+        runtime.find("std::make_unique<mfem::Vector>(fes->GetTrueVSize())") !=
+                std::string::npos &&
+            runtime.find("ctx.mfem_context.true_mx = true_mx.release()") !=
+                std::string::npos &&
+            runtime.find("delete static_cast<mfem::Vector *>(ctx.mfem_context.true_mx)") !=
+                std::string::npos &&
+            runtime.find("ctx.mfem_context.true_mx = nullptr") != std::string::npos &&
+            runtime.find("copy_local_node_aos_to_mfem_state(ctx, ctx.state.m_xyz, error)") !=
+                std::string::npos &&
+            runtime.find("copy_mfem_state_to_local_node_aos(ctx, recovered_state, error)") !=
+                std::string::npos,
+        "MFEM context must own true-DOF workspaces and verify the initial state round-trip before commit");
     check(
         context_header.find("MfemContextRuntimeState mfem_context{}") != std::string::npos,
         "Context must store actual MFEM context runtime state under mfem_context");
@@ -484,12 +500,18 @@ void mixed_mesh_builder_owns_topology_translation_with_selective_physics_gate() 
     const size_t material_runtime =
         context_builder.find("initialize_material_runtime(ctx, error)");
     const size_t mfem_runtime = context_builder.find("context_initialize_mfem(ctx, error)");
+    const size_t regional_projection =
+        context_builder.find("project_regional_field_drive_bases(ctx, error)");
+    const size_t initial_refresh =
+        context_builder.find("refresh_initial_effective_field_from_plan(ctx, plan, error)");
     const size_t gpu_runtime = context_builder.find("initialize_context_gpu_state(ctx, error)");
     check(
         topology_gate != std::string::npos && material_runtime != std::string::npos &&
-            mfem_runtime != std::string::npos && gpu_runtime != std::string::npos &&
+            mfem_runtime != std::string::npos && regional_projection != std::string::npos &&
+            initial_refresh != std::string::npos && gpu_runtime != std::string::npos &&
             topology_gate < material_runtime && topology_gate < mfem_runtime &&
-            topology_gate < gpu_runtime,
+            mfem_runtime < regional_projection && regional_projection < initial_refresh &&
+            regional_projection < gpu_runtime,
         "public selective topology gate must remain before material, MFEM, and GPU initialization");
 }
 

@@ -153,6 +153,36 @@ Requested intent is preserved; planner-resolved execution is recorded. Validatio
         errors = self.errors(manifest)
         self.assertTrue(any("declaration not found" in error for error in errors))
 
+    def test_python_module_constant_is_a_stable_source_symbol(self) -> None:
+        source = self.repo / "src/policy.py"
+        source.parent.mkdir(exist_ok=True)
+        source.write_text(
+            "# STRICT_POLICY is discussed here\n"
+            "STRICT_POLICY = Policy(\n"
+            "    method='Relocate3D',\n"
+            ")\n"
+            "use(STRICT_POLICY)\n",
+            encoding="utf-8",
+        )
+        manifest = copy.deepcopy(self.manifest)
+        manifest["sources"][0]["path"] = "src/policy.py"
+        manifest["sources"][0]["symbol"] = "STRICT_POLICY"
+        self.page_path.write_text(
+            self.page_path.read_text(encoding="utf-8")
+            + "\n| repair policy | src/policy.py | STRICT_POLICY |\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual([], self.errors(manifest))
+
+        source.write_text("# STRICT_POLICY only\nuse(STRICT_POLICY)\n", encoding="utf-8")
+        errors = self.errors(manifest)
+        self.assertTrue(any("declaration not found" in error for error in errors))
+
+        source.write_text("STRICT_POLICY == other_policy\n", encoding="utf-8")
+        errors = self.errors(manifest)
+        self.assertTrue(any("declaration not found" in error for error in errors))
+
     def test_generic_rust_function_is_a_stable_source_symbol(self) -> None:
         source = self.repo / "src/integrator.rs"
         source.parent.mkdir(exist_ok=True)
@@ -166,6 +196,176 @@ Requested intent is preserved; planner-resolved execution is recorded. Validatio
         self.page_path.write_text(
             self.page_path.read_text(encoding="utf-8")
             + "\n| coupled trial | src/integrator.rs | heun_trial |\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual([], self.errors(manifest))
+
+    def test_rust_function_qualifiers_resolve_only_in_valid_order(self) -> None:
+        source = self.repo / "src/integrator.rs"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        manifest = copy.deepcopy(self.manifest)
+        manifest["sources"][0].update(
+            {"path": "src/integrator.rs", "symbol": "heun_trial"}
+        )
+        self.page_path.write_text(
+            self.page_path.read_text(encoding="utf-8")
+            + "\n| qualified trial | src/integrator.rs | heun_trial |\n",
+            encoding="utf-8",
+        )
+
+        for declaration in (
+            "fn heun_trial() {}\n",
+            "pub fn heun_trial() {}\n",
+            "pub(crate) async fn heun_trial() {}\n",
+            "unsafe fn heun_trial() {}\n",
+            "pub async unsafe fn heun_trial() {}\n",
+        ):
+            with self.subTest(declaration=declaration.strip()):
+                source.write_text(declaration, encoding="utf-8")
+                self.assertEqual([], self.errors(manifest))
+
+        source.write_text("pub unsafe async fn heun_trial() {}\n", encoding="utf-8")
+        self.assertTrue(any("declaration not found" in error for error in self.errors(manifest)))
+
+    def test_rust_calls_comments_and_other_identifiers_do_not_resolve(self) -> None:
+        source = self.repo / "src/integrator.rs"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(
+            "// pub async unsafe fn heun_trial() {}\n"
+            "fn caller() { heun_trial(); }\n"
+            "async fn other_heun_trial() {}\n"
+            "pub unsafe async fn heun_trial_extra() {}\n",
+            encoding="utf-8",
+        )
+        manifest = copy.deepcopy(self.manifest)
+        manifest["sources"][0].update(
+            {"path": "src/integrator.rs", "symbol": "heun_trial"}
+        )
+        self.page_path.write_text(
+            self.page_path.read_text(encoding="utf-8")
+            + "\n| qualified trial | src/integrator.rs | heun_trial |\n",
+            encoding="utf-8",
+        )
+        errors = self.errors(manifest)
+        self.assertTrue(any("declaration not found" in error for error in errors))
+
+    def test_duplicate_async_rust_declarations_remain_ambiguous(self) -> None:
+        source = self.repo / "src/integrator.rs"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text(
+            "pub async fn heun_trial() {}\n"
+            "pub(crate) async unsafe fn heun_trial() {}\n",
+            encoding="utf-8",
+        )
+        manifest = copy.deepcopy(self.manifest)
+        manifest["sources"][0].update(
+            {"path": "src/integrator.rs", "symbol": "heun_trial"}
+        )
+        self.page_path.write_text(
+            self.page_path.read_text(encoding="utf-8")
+            + "\n| qualified trial | src/integrator.rs | heun_trial |\n",
+            encoding="utf-8",
+        )
+        errors = self.errors(manifest)
+        self.assertTrue(any("declaration is not unique" in error for error in errors))
+
+    def test_async_rust_function_requires_one_real_declaration(self) -> None:
+        source = self.repo / "src/resource.rs"
+        source.parent.mkdir(exist_ok=True)
+        manifest = copy.deepcopy(self.manifest)
+        manifest["sources"][0]["path"] = "src/resource.rs"
+        manifest["sources"][0]["symbol"] = "load_resource"
+        self.page_path.write_text(
+            self.page_path.read_text(encoding="utf-8")
+            + "\n| async resource | src/resource.rs | load_resource |\n",
+            encoding="utf-8",
+        )
+        for declaration in (
+            "async fn load_resource() {}",
+            "pub async fn load_resource() {}",
+            "pub(crate) async fn load_resource() {}",
+            "pub async unsafe fn load_resource() {}",
+            "pub async fn load_resource<T>(value: T) {}",
+        ):
+            with self.subTest(declaration=declaration):
+                source.write_text(declaration + "\n", encoding="utf-8")
+                self.assertEqual([], self.errors(manifest))
+        source.write_text("// pub async fn load_resource() {}\nload_resource().await;\n", encoding="utf-8")
+        self.assertTrue(any("declaration not found" in e for e in self.errors(manifest)))
+        source.write_text("async fn load_resource() {}\npub async fn load_resource() {}\n", encoding="utf-8")
+        self.assertTrue(any("declaration is not unique" in e for e in self.errors(manifest)))
+
+    def test_typescript_functions_methods_and_test_suites_are_stable_symbols(self) -> None:
+        source = self.repo / "src/viewport.ts"
+        source.parent.mkdir(exist_ok=True)
+        source.write_text(
+            "export async function loadSnapshot(\n"
+            "  revision: number,\n"
+            "): Promise<number> {\n"
+            "  return revision;\n"
+            "}\n"
+            "class Controller {\n"
+            "  private async activate(\n"
+            "    revision: number,\n"
+            "  ): Promise<void> {\n"
+            "    void revision;\n"
+            "  }\n"
+            "}\n"
+            "function previewColor(): string {\n"
+            "  return \"#000\";\n"
+            "}\n"
+            "describe(\"viewport contract\", () => {});\n",
+            encoding="utf-8",
+        )
+        manifest = copy.deepcopy(self.manifest)
+        manifest["equations"][0]["sources"] = ["ts-function"]
+        manifest["sources"] = [
+            {
+                "id": "ts-function",
+                "path": "src/viewport.ts",
+                "symbol": "loadSnapshot",
+                "responsibility": "Loads a typed snapshot.",
+            },
+            {
+                "id": "ts-method",
+                "path": "src/viewport.ts",
+                "symbol": "activate",
+                "responsibility": "Activates the viewport controller.",
+            },
+            {
+                "id": "ts-class",
+                "path": "src/viewport.ts",
+                "symbol": "class Controller",
+                "responsibility": "Owns the viewport controller.",
+            },
+            {
+                "id": "ts-prefixed-function",
+                "path": "src/viewport.ts",
+                "symbol": "function previewColor",
+                "responsibility": "Computes the preview color.",
+            },
+            {
+                "id": "ts-test-suite",
+                "path": "src/viewport.ts",
+                "symbol": "describe",
+                "responsibility": "Owns the viewport contract suite.",
+            },
+        ]
+        self.page_path.write_text(
+            self.page_path.read_text(encoding="utf-8")
+            + "\n"
+            + "\n".join(
+                f"| TypeScript source | src/viewport.ts | {symbol} |"
+                for symbol in (
+                    "loadSnapshot",
+                    "activate",
+                    "class Controller",
+                    "function previewColor",
+                    "describe",
+                )
+            )
+            + "\n",
             encoding="utf-8",
         )
 
@@ -203,6 +403,56 @@ Requested intent is preserved; planner-resolved execution is recorded. Validatio
         self.page_path.write_text(
             self.page_path.read_text(encoding="utf-8")
             + "\n| managed proof | justfile | verify-managed-charge |\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual([], self.errors(manifest))
+
+    def test_yaml_mapping_key_is_a_stable_source_symbol(self) -> None:
+        compose = self.repo / "compose.yaml"
+        compose.write_text(
+            "services:\n"
+            "  fem-cpu-tsan:\n"
+            "    extends:\n"
+            "      service: fem-cpu\n",
+            encoding="utf-8",
+        )
+        manifest = copy.deepcopy(self.manifest)
+        manifest["sources"][0].update(
+            {
+                "path": "compose.yaml",
+                "symbol": "fem-cpu-tsan",
+            }
+        )
+        self.page_path.write_text(
+            self.page_path.read_text(encoding="utf-8")
+            + "\n| managed sanitizer service | compose.yaml | fem-cpu-tsan |\n",
+            encoding="utf-8",
+        )
+
+        self.assertEqual([], self.errors(manifest))
+
+    def test_shell_case_allowlist_is_a_stable_source_symbol(self) -> None:
+        runner = self.repo / "run_contract.sh"
+        runner.write_text(
+            "#!/usr/bin/env bash\n"
+            "scenario=\"${1:-}\"\n"
+            "case \"$scenario\" in\n"
+            "  steady|oersted-oet0-tsan) ;;\n"
+            "  *) exit 2 ;;\n"
+            "esac\n",
+            encoding="utf-8",
+        )
+        manifest = copy.deepcopy(self.manifest)
+        manifest["sources"][0].update(
+            {
+                "path": "run_contract.sh",
+                "symbol": "oersted-oet0-tsan",
+            }
+        )
+        self.page_path.write_text(
+            self.page_path.read_text(encoding="utf-8")
+            + "\n| TSan scenario | run_contract.sh | oersted-oet0-tsan |\n",
             encoding="utf-8",
         )
 

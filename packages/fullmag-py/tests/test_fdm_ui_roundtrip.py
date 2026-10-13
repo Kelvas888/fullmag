@@ -98,6 +98,7 @@ class FdmUiRoundTripTests(unittest.TestCase):
                         demag=fm.FDMDemag(
                             strategy="single_grid",
                             mode="three_d",
+                            fft_backend="rustfft",
                             common_cells=(64, 32, 4),
                             explain=True,
                         ),
@@ -117,6 +118,17 @@ class FdmUiRoundTripTests(unittest.TestCase):
             )
             loaded = load_problem_from_script(source, lightweight_assets=True)
             scene = build_scene_document_from_builder(export_builder_draft(loaded))
+            # The canonical SceneDocument uses object ids for per-object FDM
+            # overrides.  The public Python renderer must accept that name
+            # while continuing to emit the stable ``per_magnet`` DSL keyword.
+            scene["study"]["fdm"]["per_object_grid"] = scene["study"]["fdm"].pop(
+                "per_magnet"
+            )
+            scene["study"]["fdm"]["per_object_grid"]["free"]["cell"] = [
+                3e-9,
+                3e-9,
+                3e-9,
+            ]
             scene["study"]["fdm"]["demag"].update(
                 {
                     "strategy": "multilayer_convolution",
@@ -134,11 +146,11 @@ class FdmUiRoundTripTests(unittest.TestCase):
             ]
             assert isinstance(rendered, str)
             self.assertIn(
-                'fm.fdm(default_cell=(2e-09, 2e-09, 1e-09), per_magnet={"free": fm.FDMGrid',
+                'fm.fdm(default_cell=(2e-09, 2e-09, 1e-09), per_magnet={"free": fm.FDMGrid(cell=(3e-09, 3e-09, 3e-09))',
                 rendered,
             )
             self.assertIn(
-                'demag=fm.FDMDemag(strategy="multilayer_convolution", mode="two_d_stack", explain=False',
+                'demag=fm.FDMDemag(strategy="multilayer_convolution", mode="two_d_stack", fft_backend="rustfft", explain=False',
                 rendered,
             )
             self.assertNotIn('fm.demag(realization="multilayer_convolution")', rendered)
@@ -151,6 +163,7 @@ class FdmUiRoundTripTests(unittest.TestCase):
         self.assertIsNotNone(fdm)
         self.assertEqual(fdm.demag.strategy, "multilayer_convolution")
         self.assertEqual(fdm.demag.mode, "two_d_stack")
+        self.assertEqual(fdm.demag.fft_backend, "rustfft")
         self.assertEqual(fdm.demag.common_cells_xy, (64, 32))
         self.assertFalse(fdm.demag.explain)
         self.assertEqual(fdm.boundary_correction, "full")
@@ -161,6 +174,7 @@ class FdmUiRoundTripTests(unittest.TestCase):
             {
                 "strategy": "multilayer_convolution",
                 "mode": "two_d_stack",
+                "fft_backend": "rustfft",
                 "common_cells_xy": [64, 32],
             },
         )

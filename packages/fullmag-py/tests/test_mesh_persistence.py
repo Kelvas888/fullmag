@@ -255,13 +255,13 @@ class MeshPersistenceTests(unittest.TestCase):
             with zipfile.ZipFile(path, "r") as archive:
                 members = {name: archive.read(name) for name in archive.namelist()}
             manifest = __import__("json").loads(members["manifest.json"])
-            manifest["schema"] = "fullmag.mesh-artifact.v2"
+            manifest["schema"] = "fullmag.mesh-artifact.v3"
             members["manifest.json"] = __import__("json").dumps(manifest).encode()
             with zipfile.ZipFile(path, "w") as archive:
                 for name, payload in members.items():
                     archive.writestr(name, payload)
 
-            with self.assertRaisesRegex(MeshArtifactVersionError, "v2"):
+            with self.assertRaisesRegex(MeshArtifactVersionError, "v3"):
                 load_mesh_artifact(path)
 
     def test_native_save_rejects_incomplete_semantic_maps(self) -> None:
@@ -610,6 +610,26 @@ class MeshPersistenceTests(unittest.TestCase):
         self.assertEqual(saved, path)
         self.assertEqual(loaded.action, "loaded")
         self.assertEqual(loaded.topology_fingerprint, mesh.topology_fingerprint_v3())
+
+    def test_current_artifact_reuses_generated_mesh_without_rehydrating_ir(self) -> None:
+        mesh = _tetra_mesh()
+        assets = {
+            "fem_domain_mesh_asset": {
+                "mesh_source": None,
+                "mesh": mesh.to_ir("study_domain"),
+                "region_markers": [{"geometry_name": "film", "marker": 1}],
+                "object_region_markers": [],
+            }
+        }
+        study = fm.study("mesh-persistence")
+        with patch("fullmag.world._build_explicit_mesh_assets", return_value=assets) as builder:
+            first = study.mesh._current_artifact()
+            second = study.mesh._current_artifact()
+
+        builder.assert_called_once()
+        self.assertIs(first, second)
+        self.assertIs(first.mesh, second.mesh)
+        self.assertEqual(first.authoring_fingerprint, mesh_authoring_fingerprint(first.authoring_document))
 
     def test_study_mesh_save_or_load_skips_builder_for_matching_artifact(self) -> None:
         mesh = _tetra_mesh()

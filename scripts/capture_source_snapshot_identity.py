@@ -7,7 +7,7 @@ import argparse
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 import posixpath
 import stat
 import subprocess
@@ -23,6 +23,13 @@ SCHEMA = "fullmag.source-snapshot.v2"
 # inputs, so the runtime snapshot deliberately leaves them at their committed
 # contents.
 NON_RUNTIME_PREFIXES = (
+    # Windows Docker mounts these generated roots below /workspace.  They are
+    # build/cache state rather than source inputs and may contain symlinks to
+    # package stores outside the repository.
+    ".fullmag-build/",
+    ".fullmag-cache/",
+    ".fullmag-cargo/",
+    ".fullmag-rustup/",
     ".agents/",
     ".claude/",
     ".codex/",
@@ -38,9 +45,15 @@ NON_RUNTIME_PREFIXES = (
     "docs/",
     "public_docs/",
     "scripts/test_",
+    # Package discovery is confined to src/; these are verification inputs.
+    "packages/fullmag-py/tests/",
 )
 NON_RUNTIME_FILES = {"AGENTS.md", "CHANGELOG.md", "README.md"}
 NON_RUNTIME_EXACT_PATHS = {
+    ".fullmag-build",
+    ".fullmag-cache",
+    ".fullmag-cargo",
+    ".fullmag-rustup",
     "Codex-Usage",
     ".impl-racetrack",
     # The repository tracks this as an absolute worktree-administration link.
@@ -57,10 +70,13 @@ NON_RUNTIME_EXACT_PATHS = {
 }
 NON_RUNTIME_SUFFIXES = (".md", ".rst", ".source-map.json")
 
-# Worktree administration is intentionally excluded from the immutable source
-# snapshot even when Git records it in the committed tree.  In this repository
-# it is an absolute symlink, which is valid metadata but unsafe to materialize.
-EXCLUDED_COMMITTED_SOURCE_PATHS = frozenset({".worktrees"})
+# Agent metadata and worktree administration are intentionally excluded from
+# the immutable native-runtime source snapshot. They are non-runtime inputs and
+# may contain host-specific or empty symlinks that cannot be materialized on
+# the Linux build filesystem.
+EXCLUDED_COMMITTED_SOURCE_PATHS = frozenset(
+    {".agents", ".claude", ".codex", ".worktrees"}
+)
 
 
 class SourceIdentityError(RuntimeError):
@@ -90,7 +106,21 @@ def _is_excluded_committed_source_path(path: str) -> bool:
 def _git(repo_root: Path, *arguments: str) -> bytes:
     try:
         return subprocess.check_output(
-            ("git", *arguments), cwd=repo_root, stderr=subprocess.PIPE
+            # Managed Linux containers often see the Windows checkout with
+            # executable-bit and CRLF presentation differences.  Git's
+            # normalized worktree view must be used for status/diff decisions;
+            # dirty-path hashing below still records raw bytes whenever the
+            # normalized content actually differs.
+            (
+                "git",
+                "-c",
+                "core.filemode=false",
+                "-c",
+                "core.autocrlf=true",
+                *arguments,
+            ),
+            cwd=repo_root,
+            stderr=subprocess.PIPE,
         )
     except (OSError, subprocess.CalledProcessError) as error:
         raise SourceIdentityError(
@@ -122,9 +152,23 @@ def _read_regular_file_stable(path: Path, label: str) -> tuple[os.stat_result, b
     descriptor = os.open(path, flags)
     try:
         before = os.fstat(descriptor)
+        try:
+            path_before = path.lstat()
+        except OSError as error:
+            raise SourceIdentityError(f"{label} changed while hashing") from error
+        if (
+            not stat.S_ISREG(path_before.st_mode)
+            or path_before.st_dev != before.st_dev
+            or path_before.st_ino != before.st_ino
+        ):
+            raise SourceIdentityError(f"{label} changed while hashing")
         with os.fdopen(descriptor, "rb", closefd=False) as stream:
             content = stream.read()
         after = os.fstat(descriptor)
+        try:
+            path_after = path.lstat()
+        except OSError as error:
+            raise SourceIdentityError(f"{label} changed while hashing") from error
     finally:
         os.close(descriptor)
     observed = (
@@ -144,6 +188,12 @@ def _read_regular_file_stable(path: Path, label: str) -> tuple[os.stat_result, b
         after.st_ctime_ns,
     ):
         raise SourceIdentityError(f"{label} changed while hashing")
+    if (
+        not stat.S_ISREG(path_after.st_mode)
+        or path_after.st_dev != after.st_dev
+        or path_after.st_ino != after.st_ino
+    ):
+        raise SourceIdentityError(f"{label} changed while hashing")
     if not stat.S_ISREG(before.st_mode):
         raise SourceIdentityError(f"{label} is not a regular file")
     return before, content
@@ -151,9 +201,34 @@ def _read_regular_file_stable(path: Path, label: str) -> tuple[os.stat_result, b
 
 def _safe_relative_path(relative: str, label: str) -> Path:
     candidate = Path(relative)
-    if candidate.is_absolute() or ".." in candidate.parts:
+    windows = PureWindowsPath(relative)
+    posix = PurePosixPath(relative)
+    if (
+        candidate.is_absolute()
+        or candidate.anchor
+        or windows.is_absolute()
+        or windows.anchor
+        or posix.is_absolute()
+        or posix.anchor
+        or ".." in candidate.parts
+        or ".." in windows.parts
+        or ".." in posix.parts
+    ):
         raise SourceIdentityError(f"unsafe {label} path: {relative}")
     return candidate
+
+
+def _resolve_contained_path(root: Path, path: Path, label: str) -> Path:
+    """Resolve a filesystem path and reject any physical escape from root."""
+
+    try:
+        canonical_root = root.resolve()
+        canonical_path = path.resolve()
+    except (OSError, RuntimeError) as error:
+        raise SourceIdentityError(f"cannot resolve {label} path") from error
+    if canonical_path != canonical_root and canonical_root not in canonical_path.parents:
+        raise SourceIdentityError(f"unsafe {label} path escapes snapshot root")
+    return canonical_path
 
 
 def _validate_filesystem_symlink_path(root: Path, relative: str) -> None:
@@ -190,6 +265,7 @@ def _validate_filesystem_symlink_path(root: Path, relative: str) -> None:
             )
         resolved.pop()
         pending = list(Path(target).parts) + pending
+    _resolve_contained_path(root, root / _safe_relative_path(relative, "source"), "source")
 
 
 def _validate_tree_symlinks(entries: dict[str, dict[str, object]]) -> None:
@@ -219,6 +295,8 @@ def _validate_tree_symlinks(entries: dict[str, dict[str, object]]) -> None:
             target = entry.get("target")
             if not isinstance(target, str):
                 raise SourceIdentityError(f"source symlink has invalid target: {current}")
+            if not target:
+                raise SourceIdentityError(f"source symlink has empty target: {current}")
             if posixpath.isabs(target):
                 raise SourceIdentityError(
                     f"unsafe source symlink has absolute target: {current}"
@@ -338,6 +416,23 @@ def _snapshot_entries(snapshot_root: Path) -> dict[str, dict[str, object]]:
     return entries
 
 
+def _snapshot_mismatch_detail(
+    actual: dict[str, dict[str, object]],
+    expected: dict[str, dict[str, object]],
+) -> str:
+    missing = sorted(expected.keys() - actual.keys())
+    unexpected = sorted(actual.keys() - expected.keys())
+    changed = sorted(
+        path for path in actual.keys() & expected.keys() if actual[path] != expected[path]
+    )
+    summarize = lambda paths: ",".join(paths[:5]) or "none"
+    return (
+        f"missing=[{summarize(missing)}]; "
+        f"unexpected=[{summarize(unexpected)}]; "
+        f"changed=[{summarize(changed)}]"
+    )
+
+
 def _parse_status_records(parts: bytes) -> list[dict[str, object]]:
     parts = parts.split(b"\0")
     records: list[dict[str, object]] = []
@@ -384,6 +479,14 @@ def _runtime_status_pathspecs(repo_root: Path) -> tuple[str, ...]:
     # Keep positive roots broad enough to catch new runtime files while pruning
     # known non-runtime subtrees from mixed roots.
     exclusions = (
+        ":(exclude).fullmag-build/**",
+        ":(exclude).fullmag-cache/**",
+        ":(exclude).fullmag-cargo/**",
+        ":(exclude).fullmag-rustup/**",
+        # The committed external solver tree is gitlink-only.  Git status
+        # otherwise descends into each nested checkout on the Windows bind
+        # mount even though _capture_once drops those records afterward.
+        ":(exclude)external_solvers/**",
         ":(exclude).agents/**",
         ":(exclude).codex/**",
         ":(exclude).github/**",
@@ -446,6 +549,11 @@ def _status_records(
             "status",
             "--porcelain=v1",
             "-z",
+            # The identity records every affected path and its exact bytes;
+            # rename similarity is not part of the contract.  Disable Git's
+            # expensive rename detection on Windows bind mounts and represent
+            # a rename as the equivalent delete/add pair.
+            "--no-renames",
             "--untracked-files=no",
             "--",
             *_runtime_status_pathspecs(repo_root),
@@ -562,6 +670,14 @@ def _qualification_input_content(
         candidate = _safe_relative_path(relative, "qualification input")
         _validate_filesystem_symlink_path(repo_root, relative)
         path = repo_root / candidate
+        canonical_parent = _resolve_contained_path(
+            repo_root, path.parent, "qualification input"
+        )
+        # Keep the final component lexical so a final symlink is still
+        # rejected by _read_regular_file_stable; resolving only the parent
+        # prevents a retargetable parent link from redirecting the open after
+        # containment was checked.
+        path = canonical_parent / candidate.name
         try:
             metadata, content = _read_regular_file_stable(
                 path, f"qualification input {relative}"
@@ -765,6 +881,8 @@ def materialize(
         snapshot_root.mkdir(parents=True)
     archive_command = (
         "git",
+        "-c",
+        "core.autocrlf=false",
         "archive",
         "--format=tar",
         str(identity["head_commit_full"]),
@@ -846,9 +964,11 @@ def verify_materialized(
             entry["target"] = target
         expected[relative] = entry
     _validate_tree_symlinks(expected)
-    if _snapshot_entries(snapshot_root) != expected:
+    actual = _snapshot_entries(snapshot_root)
+    if actual != expected:
         raise SourceIdentityError(
-            "materialized source snapshot differs from captured identity"
+            "materialized source snapshot differs from captured identity: "
+            + _snapshot_mismatch_detail(actual, expected)
         )
 
 
@@ -899,7 +1019,8 @@ def verify_materialized_snapshot(
     _validate_tree_symlinks(expected)
     if actual != expected:
         raise SourceIdentityError(
-            "materialized source snapshot differs from captured identity"
+            "materialized source snapshot differs from captured identity: "
+            + _snapshot_mismatch_detail(actual, expected)
         )
 
 

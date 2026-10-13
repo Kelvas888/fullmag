@@ -1,0 +1,137 @@
+"use client";
+
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from "react";
+
+import { useKernel } from "../KernelContext";
+import type { ModeCompositionResource } from "../visualization/ModeCompositionController";
+import {
+  ModeCompositionFieldLayerController,
+  type ModeCompositionFieldLayerLoaders,
+  type ModeCompositionFieldLayerSnapshotMap,
+  type ModeCompositionFieldLayerTopologyIdentity,
+} from "../visualization/ModeCompositionFieldLayerController";
+import { sessionResourceIdentityKey } from "./sessionResourceIdentity";
+import { useSessionResourceIdentity } from "./useSessionStatus";
+
+export type {
+  ModeCompositionFieldLayerFailureReason,
+  ModeCompositionFieldLayerSnapshot,
+  ModeCompositionFieldLayerSnapshotMap,
+  ModeCompositionFieldLayerStatus,
+  ModeCompositionFieldLayerTopologyIdentity,
+} from "../visualization/ModeCompositionFieldLayerController";
+
+export interface UseModeCompositionFieldLayerResourcesOptions {
+  readonly composition: ModeCompositionResource | null | undefined;
+  readonly enabled?: boolean;
+  readonly topologyByTarget: Readonly<
+    Record<string, ModeCompositionFieldLayerTopologyIdentity | null | undefined>
+  >;
+}
+
+/**
+ * The only React boundary for per-object complex mode fields. It uses the
+ * generated/facade API methods, while the controller owns cancellation,
+ * binary-cache identity, retained compatible buffers, and bounded loading.
+ */
+export function useModeCompositionFieldLayerResources({
+  composition,
+  enabled = true,
+  topologyByTarget,
+}: UseModeCompositionFieldLayerResourcesOptions): ModeCompositionFieldLayerSnapshotMap {
+  const { api } = useKernel();
+  const sessionIdentity = useSessionResourceIdentity();
+  const sessionScope = sessionIdentity
+    ? sessionResourceIdentityKey(sessionIdentity)
+    : null;
+  const [controller] = useState(() => new ModeCompositionFieldLayerController());
+  const stableTopology = useStableTopologyByTarget(topologyByTarget);
+  const loaders = useMemo<ModeCompositionFieldLayerLoaders>(() => ({
+    loadMetadata: (layer, signal) => {
+      const sampleIndex = layer.mode.sample_index;
+      const modeIndex = layer.mode.raw_mode_index;
+      if (
+        typeof sampleIndex !== "number" ||
+        !Number.isSafeInteger(sampleIndex) ||
+        typeof modeIndex !== "number" ||
+        !Number.isSafeInteger(modeIndex)
+      ) {
+        return Promise.reject(new Error("Mode layer does not expose canonical metadata indices."));
+      }
+      return api.analysis.frequencyDomain.eigenModeFieldMeta(sampleIndex, modeIndex, {
+        sessionScopeKey: sessionScope ?? undefined,
+        signal,
+      });
+    },
+    loadBinary: async (layer, signal, expectedArtifactGenerationId, etag) => {
+      const result = await api.data.fields.vector(
+        layer.field_id,
+        {
+          component: "full",
+          expected_artifact_generation_id: expectedArtifactGenerationId,
+          scope_id: layer.object_id,
+          scope_kind: "object",
+          view: "complex",
+        },
+        { etag, sessionScopeKey: sessionScope ?? undefined, signal },
+      );
+      if (result.status !== "ready") {
+        throw new Error(`Object-scoped mode field returned '${result.status}'.`);
+      }
+      return {
+        artifactGenerationId: result.responseMetadata.artifactGenerationId ?? null,
+        byteLength: result.byteLength,
+        data: result.data,
+        encoding: result.responseMetadata.encoding,
+        etag: result.etag,
+        fieldRevision: result.responseMetadata.fieldRevision,
+      };
+    },
+  }), [api, sessionScope]);
+  const subscribe = useCallback(
+    (listener: () => void) => controller.subscribe(listener),
+    [controller],
+  );
+  const getSnapshot = useCallback(() => controller.getSnapshot(), [controller]);
+  const snapshots = useSyncExternalStore(subscribe, getSnapshot, getSnapshot);
+
+  useEffect(() => {
+    if (!enabled || !composition || !sessionScope) {
+      controller.clear();
+      return;
+    }
+    void controller.activate(composition, stableTopology, loaders, sessionScope);
+    return () => controller.clear();
+  }, [composition, controller, enabled, loaders, sessionScope, stableTopology]);
+
+  return snapshots;
+}
+
+function useStableTopologyByTarget(
+  topologyByTarget: Readonly<
+    Record<string, ModeCompositionFieldLayerTopologyIdentity | null | undefined>
+  >,
+) {
+  const identity = JSON.stringify(Object.entries(topologyByTarget)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([targetId, topology]) => [
+      targetId,
+      topology
+        ? {
+            domainGenerationId: topology.domainGenerationId,
+            meshTopologyHash: topology.meshTopologyHash,
+            meshTopologyRevision: topology.meshTopologyRevision,
+          }
+        : null,
+    ]));
+  return useMemo(
+    () => Object.fromEntries(JSON.parse(identity) as ReadonlyArray<readonly [string, ModeCompositionFieldLayerTopologyIdentity | null]>),
+    [identity],
+  );
+}

@@ -15,8 +15,11 @@ import { RealtimeConnectionController } from "../realtime/RealtimeConnectionCont
 import { RealtimeInvalidationBridge } from "../realtime/RealtimeInvalidationBridge";
 import { ResourceInvalidationController } from "../resources/ResourceInvalidationController";
 import { SelectionController } from "../selection/SelectionController";
+import { ObjectMoveToolController } from "../authoring/ObjectMoveToolController";
+import { ObjectEditSessionController } from "../authoring/object-edit/ObjectEditSessionController";
 import type { KernelApi } from "../types";
 import { AnalysisFieldOverlayController } from "./AnalysisFieldOverlayController";
+import { ModeCompositionController } from "./ModeCompositionController";
 import { ChartViewportHandoffController } from "@/kernel/visualization/ChartViewportHandoffController";
 import { CameraRegistryController } from "./CameraRegistryController";
 import { ObjectVisualizationController } from "./ObjectVisualizationController";
@@ -46,6 +49,14 @@ function makeKernel(): KernelApi {
     }),
     layout: new LayoutController(bus),
     modules: new ModuleRegistry(),
+    objectEditSession: new ObjectEditSessionController(),
+    objectMoveTool: new ObjectMoveToolController(),
+    modeComposition: new ModeCompositionController({
+      getActiveModeComposition: (options) =>
+        api.visualization.modeComposition.active(options),
+      patchActiveModeComposition: (patch, options) =>
+        api.visualization.modeComposition.patch(patch, options),
+    }),
     realtime: new RealtimeInvalidationBridge(resources),
     realtimeConnection: new RealtimeConnectionController(),
     resources,

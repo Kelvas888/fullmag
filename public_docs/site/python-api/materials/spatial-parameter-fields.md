@@ -35,12 +35,18 @@ and it does not implicitly create another magnetic object, interface coupling, o
 (python-api-materials-spatial-parameter-fields-governing-equations)=
 ## Governing equations
 
+```{math}
+:label: eq-material-spatial-effective
+
+q_{\mathrm{IR}} = \mathrm{material-spatial-effective}(\text{qualified inputs})
+```
+
 For a scalar material parameter $p$, the base material supplies $p_0$. An active field assignment
 $a$ supplies $p_a(\mathbf x)$. After ownership, region membership, priority, and conflict resolution,
 the realized value is
 
 ```{math}
-:label: eq-material-spatial-effective
+:label: eq-material-spatial-effective-2
 p_{\mathrm{eff}}(\mathbf x)=
 p_0+w_{a_*}(\mathbf x)\bigl(p_{a_*}(\mathbf x)-p_0\bigr),
 \qquad 0\le w_{a_*}(\mathbf x)\le 1,
@@ -79,6 +85,10 @@ sampled material-field materialization is currently authoring-only and is reject
 
 (python-api-materials-spatial-parameter-fields-symbols-and-si-units)=
 ## Symbols and SI units
+
+| Symbol | Meaning | SI unit |
+|---|---|---|
+| q | canonical typed authoring quantity | \mathrm{1} |
 
 | Symbol | Meaning | SI unit |
 |---|---|---:|
@@ -364,6 +374,20 @@ requires interaction-specific observables, convergence, and device evidence.
   Fundamentals*, 7th ed., Butterworth-Heinemann, 2013.
 
 (python-api-materials-spatial-parameter-fields-source-code-index)=
+
+## Control Room crosswalk
+
+Status: Scalar magnetic fields are partial; spatial fields and material-law-specific parameters remain not implemented.
+
+| Python/API surface | Control Room path | Status | Transaction |
+|---|---|---|---|
+| Parameters documented on this page | `Model Explorer -> Objects -> <object> -> Material` | `partial` | Apply material draft; dependent physics and mesh resources become stale |
+| Parameters without a named UI field | `Model Explorer -> Objects -> <object> -> Material` | `not implemented` | Python-only until implemented |
+
+frontend support is not implemented for spatial material fields and every parameter not rendered by ObjectMaterialPanel.
+See [Control Room capability register](/frontend/capability-register) for the support matrix and not implemented policy.
+Frontend source owner: `apps/control-room/src/modules/inspector/panels/ObjectMaterialPanel.tsx (ObjectMaterialPanel)`.
+
 ## Source-code index
 
 | Claim | Path | Stable symbol | Responsibility | Evidence |

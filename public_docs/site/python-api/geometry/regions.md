@@ -4,109 +4,131 @@ status: partial
 doc_kind: reference
 audience: user
 owner: fullmag-public-docs
+last_updated: 2026-08-31
+reviewed_revision: ab3c8802a691a535063102c12f9a79bb0043b367
 ---
 
-(public-docs-python-api-geometry-regions)=
-# Regions
+# Geometry regions
 
+(public-docs-python-api-geometry-regions)=
 (python-api-geometry-regions-problem-statement)=
-<!-- (problem-statement)= -->
-## Contract
-Regions name geometric subdomains so material parameters, textures, and mesh policy can be
-assigned to specific volumes.
+## Problem statement
+
+Regions are owner-scoped typed records; registration and realization remain separate operations.
+
+This page documents the public Python authoring boundary, not an undocumented runtime promise. Construction creates typed authoring data, while to_ir() is the object-level lowering boundary consumed by the study/script pipeline.
 
 (python-api-geometry-regions-governing-equations)=
-<!-- (governing-equations)= -->
 ## Governing equations
-No physical equation is introduced; regions are domain-decomposition metadata.
 
-(python-api-geometry-regions-symbols-and-si-units)=
-<!-- (symbols-and-si-units)= -->
-## Symbols and SI units
-All fields are names, priorities, and policy identifiers.
+```{math}
+:label: eq-object_region
 
-(python-api-geometry-regions-assumptions-and-validity)=
-<!-- (assumptions-and-validity)= -->
-## Assumptions and validity
-Names must be non-empty; frame and realization policy accept only the supported identifiers.
-
-(python-api-geometry-regions-python-api)=
-<!-- (python-api)= -->
-## Python API
-| Python | Type | Default | Validation | Meaning | ProblemIR |
-|---|---|---|---|---|---|
-| `Region.name` | `str` | `required` | Non-empty | Region name | `name` |
-| `Region.geometry` | `Geometry` | `required` | Geometry object | Region domain | `geometry` |
-| `ObjectRegion.owner_object` | `str` | `required` | Non-empty | Owning magnet | region owner |
-| `ObjectRegion.frame` | `str` | `"object"` | `object` or `world` | Reference frame | `frame` |
-| `ObjectRegion.realization_policy` | `str` | `"inherit"` | `inherit`, `conformal`, or `project` | Realization policy | policy |
-| `ObjectRegion.priority` | `int` | `0` | Integer | Override priority | priority |
-| `ObjectRegion.mesh_policy` | `dict \| None` | `None` | Mapping | Region-local mesh policy | mesh policy |
-
-### Complete stage-first context
-
-Regions are attached to authored geometry and consumed by material/texture overrides.
-
-```python
-# %% Declare a region and later assign a localized material override
-import fullmag as fm
-
-nm = 1.0e-9
-
-study = fm.study("regions_api_example")
-study.engine("fdm")
-study.device("cpu", precision="double")
-study.mode("strict")
-
-study.objects.mesh.defaults(cell_size=(2 * nm, 2 * nm, 5 * nm))
-film = study.geometry(fm.Box(100 * nm, 20 * nm, 5 * nm), name="film")
-film.Ms = 800.0e3
-film.Aex = 13.0e-12
-film.alpha = 0.02
-film.m = fm.init.UniformMagnetization((1.0, 0.0, 0.0))
-study.exchange()
-study.stages.add_run(stage_id="run", until=1.0e-12)
+q_{\mathrm{IR}} = \mathrm{object_region}(\text{qualified inputs})
 ```
 
+The physical term or constraint is represented by the canonical IR object object_region. The exact discrete operator, quadrature, mesh treatment, and solver selection are backend responsibilities; this page does not replace their qualification evidence.
+
+(python-api-geometry-regions-symbols-and-si-units)=
+## Symbols and SI units
+
+| Symbol | Meaning | SI unit |
+|---|---|---|
+| q | canonical typed authoring quantity | \mathrm{1} |
+
+All dimensional inputs are documented in SI units. Vector quantities use Cartesian components in the repository coordinate convention. Dimensionless parameters are explicitly marked 1; a default of None means that the constructor selects or omits the field according to the contract.
+
+(python-api-geometry-regions-assumptions-and-validity)=
+## Assumptions and validity
+
+Inputs are finite and typed. Positive lengths, densities, conductivities, temperatures, and material constants are rejected when the source constructor requires positivity. Unsupported combinations fail closed in the constructor or lowering boundary rather than being silently converted.
+
+(python-api-geometry-regions-python-api)=
+## Python API
+
+### Constructor or function
+
+fm.Region(name, geometry) and fm.ObjectRegion(...)
+
+### Parameters
+
+| Python name | Type | Default | SI unit | Validation | Meaning | FEM/FDM CPU/GPU support | ProblemIR destination |
+|---|---|---|---|---|---|---|---|
+| ```Region.name``` | ```str``` | ```required``` | ```1``` | non-empty | region name | FEM/FDM CPU/GPU: IR; resolver-specific | ```name``` |
+| ```Region.geometry``` | ```Geometry``` | ```required``` | ```1``` | typed geometry | region shape | FEM/FDM CPU/GPU: IR; resolver-specific | ```shape``` |
+| ```ObjectRegion.owner_object``` | ```str or object``` | ```required``` | ```1``` | owner-scoped | owning object | FEM/FDM CPU/GPU: IR; resolver-specific | ```owner``` |
+| ```ObjectRegion.name``` | ```str``` | ```required``` | ```1``` | non-empty | region name | FEM/FDM CPU/GPU: IR; resolver-specific | ```name``` |
+| ```ObjectRegion.region_id``` | ```str or None``` | ```None``` | ```1``` | stable when supplied | region identifier | FEM/FDM CPU/GPU: IR; resolver-specific | ```region_id``` |
+| ```ObjectRegion.frame``` | ```str``` | ```object``` | ```1``` | supported frame | coordinate frame | FEM/FDM CPU/GPU: IR; resolver-specific | ```frame``` |
+| ```ObjectRegion.enabled``` | ```bool``` | ```True``` | ```1``` | boolean | activation flag | FEM/FDM CPU/GPU: IR; resolver-specific | ```enabled``` |
+| ```ObjectRegion.priority``` | ```int``` | ```0``` | ```1``` | integer | overlap precedence | FEM/FDM CPU/GPU: IR; resolver-specific | ```priority``` |
+| ```ObjectRegion.realization_policy``` | ```str``` | ```inherit``` | ```1``` | supported policy | mesh/realization inheritance | FEM/FDM CPU/GPU: IR; resolver-specific | ```realization_policy``` |
+
+### Stage-first example
+
+```python
+# %%
+import fullmag as fm
+
+study = fm.study("public-api-example")
+study.objects.mesh.defaults(maximum_element_size=5e-9)
+body = study.geometry(fm.Box(size=(100e-9, 20e-9, 5e-9)), name="film")
+body.Ms = 800.0e3
+body.Aex = 13.0e-12
+body.alpha = 0.02
+body.m = fm.texture.uniform(1.0, 0.0, 0.0)
+study.stages.add_relax(stage_id="api-example", dt=5e-13, max_steps=1)
+# Author the documented object after the stage exists.
+value = fm.Region("film", fm.Box(size=(100e-9, 20e-9, 5e-9)))
+canonical_ir = value.to_ir()
+```
+
+The example intentionally exposes the object-level boundary. In a full stage, attach canonical_ir through the corresponding study/module registration method; no implicit runtime route is inferred from this page.
+
 (python-api-geometry-regions-problem-ir)=
-<!-- (problem-ir)= -->
 ## ProblemIR
-`Region.to_ir()` emits `name` and the referenced `geometry` name; object regions carry owner and
-policy fields into the object-region mesh specs.
+
+value.to_ir() is the canonical serialization boundary. It emits a typed object_region record with the fields listed above; nested geometry, targets, profiles, or material references remain nested typed records rather than opaque Python objects. The IR is the requested intent. Backend resolution must preserve the record or reject an unsupported combination.
 
 (python-api-geometry-regions-round-trip-and-failure-semantics)=
-<!-- (round-trip-and-failure-semantics)= -->
 ## Round-trip and failure semantics
-Duplicate names and invalid policy identifiers fail immediately.
+The requested intent is preserved before resolved execution. Validation errors identify invalid inputs, while unsupported combinations are rejected.
+
+
+A supported record is expected to round-trip through the repository script/scene representation without changing qualified values, units, or identifiers. Invalid types, missing required fields, non-finite values, contradictory options, and unsupported backend combinations are rejected with an explicit validation error. This page makes no claim that every backend accepts every legal authoring object.
 
 (python-api-geometry-regions-discrete-realization)=
-<!-- (discrete-realization)= -->
 ## Discrete realization
-Regions intersect the mesh state and drive material parameter fields and per-region meshing.
+
+The FEM/FDM realization selects its own mesh, stencil or element operator, boundary treatment, and CPU/GPU execution lane. The Python contract supplies the physical inputs and canonical IR only; numerical equivalence requires the backend-specific validation named below.
 
 (python-api-geometry-regions-implementation-mapping)=
-<!-- (implementation-mapping)= -->
 ## Implementation mapping
-Anchor: `packages/fullmag-py/src/fullmag/model/structure.py` (`Region`, `ObjectRegion`).
+
+The authoritative implementation is packages/fullmag-py/src/fullmag/model/structure.py symbol class ObjectRegion. The public constructor signature, validation branches, defaults, and to_ir() field names are derived from that source, not from a historical example.
 
 (python-api-geometry-regions-validation)=
-<!-- (validation)= -->
 ## Validation
-Ownership tests compare this inventory with live signatures.
+
+Focused repository tests covering this contract include: test_region_registries_are_owner_scoped_and_study_read_only, test_region_shape_translation_adds_to_existing_center. These tests are evidence for authoring/IR behavior; live runtime, device performance, and Control Room browser behavior require separate qualification.
 
 (python-api-geometry-regions-limitations)=
-<!-- (limitations)= -->
-## Limitations
-Region selection is authoring metadata; mesh conformity depends on the selected backend.
+## Limitations and Control Room
+
+Control Room route: no dedicated route is claimed for this low-level authoring object. It is observable only through a session/problem/field view when the owning module exposes it; a dedicated object editor or route is not currently exposed. No unsupported UI or runtime capability is implied.
 
 (python-api-geometry-regions-scientific-bibliography)=
-<!-- (scientific-bibliography)= -->
 ## Scientific bibliography
-No physical model is introduced.
+
+- C. Geuzaine and J.-F. Remacle, Gmsh: a three-dimensional finite element mesh generator, Int. J. Numer. Meth. Eng. 79 (2009), DOI: https://doi.org/10.1002/nme.2579
 
 (python-api-geometry-regions-source-code-index)=
-<!-- (source-code-index)= -->
-## Source-code index
-| Claim | Path | Stable symbol | Responsibility | Evidence |
-|---|---|---|---|---|
-| Domain regions | `packages/fullmag-py/src/fullmag/model/structure.py` | `Region`, `ObjectRegion` | Region lowering | Ownership test |
+## Source code index
+
+| Source path | Symbol | Responsibility |
+|---|---|---|
+| packages/fullmag-py/src/fullmag/model/structure.py | class ObjectRegion | public constructor and IR lowering |
+
+- Implementation: packages/fullmag-py/src/fullmag/model/structure.py::class ObjectRegion
+- Source-map: geometry/regions.source-map.json
+- Contract status: current constructor and to_ir() boundary documented against revision ab3c8802a691a535063102c12f9a79bb0043b367.

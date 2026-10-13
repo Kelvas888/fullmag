@@ -1,12 +1,26 @@
 from pathlib import Path
+import os
+import re
+import shutil
+import subprocess
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
 JUSTFILE = ROOT / "justfile"
 LAUNCHER = ROOT / "scripts" / "windows" / "run_fullmag.ps1"
-WSL_LAUNCHER = ROOT / "scripts" / "windows" / "run_fullmag_wsl.ps1"
+CONTROL_ROOM = ROOT / "crates" / "fullmag-cli" / "src" / "control_room.rs"
+LEGACY_FEM_LAUNCHER = ROOT / "scripts" / "windows" / "run_fullmag_wsl.ps1"
+FEM_LAUNCHER = ROOT / "scripts" / "windows" / "run_fullmag_fem.ps1"
+DOCKER_LAUNCHER = ROOT / "scripts" / "windows" / "run_fullmag_docker.ps1"
 WINDOWS_COMPOSE = ROOT / "compose.windows.yaml"
 FEM_GPU_DOCKERFILE = ROOT / "docker" / "fem-gpu" / "Dockerfile"
+FEM_CPU_DOCKERFILE = ROOT / "docker" / "fem-cpu" / "Dockerfile"
+SETUP = ROOT / "scripts" / "windows" / "setup_fullmag.ps1"
+STORAGE_ADAPTER = ROOT / "scripts" / "windows" / "fullmag_storage.ps1"
+STORAGE_RESOLVER = ROOT / "scripts" / "fullmag_storage.py"
+MAKE_STORAGE_SHELL = ROOT / "scripts" / "make_storage_shell.sh"
 
 
 def test_justfile_exposes_native_windows_fullmag_route() -> None:
@@ -20,10 +34,16 @@ def test_justfile_exposes_native_windows_fullmag_route() -> None:
     assert "windows=True" in justfile
 
 
-def test_windows_launcher_keeps_build_and_cache_storage_on_d() -> None:
+def test_windows_launcher_keeps_build_and_cache_storage_outside_repo() -> None:
     launcher = LAUNCHER.read_text(encoding="utf-8")
+    adapter = STORAGE_ADAPTER.read_text(encoding="utf-8")
+    resolver = STORAGE_RESOLVER.read_text(encoding="utf-8")
 
-    assert '$defaultCacheRoot = "D:\\fullmag-cache"' in launcher
+    assert "Resolve-FullmagStorageLayout" in launcher
+    assert "Set-FullmagStorageEnvironment" in launcher
+    assert "Assert-FullmagStoragePath" in launcher
+    assert "fullmag_storage.py" in adapter
+    assert "Require-DPath" not in launcher
     for variable in (
         "CARGO_HOME",
         "RUSTUP_HOME",
@@ -41,11 +61,21 @@ def test_windows_launcher_keeps_build_and_cache_storage_on_d() -> None:
         "PLAYWRIGHT_BROWSERS_PATH",
         "PYTHONPYCACHEPREFIX",
     ):
-        assert f"$env:{variable}" in launcher
+        assert variable in adapter or variable in launcher or variable in resolver
 
     assert 'Join-Path $RepoRoot "target"' not in launcher
     assert "build_windows_msi.ps1" not in launcher
     assert "docker" not in launcher.lower()
+
+
+def test_generic_compose_separates_windows_frontend_source_and_container_target() -> None:
+    compose = (ROOT / "compose.yaml").read_text(encoding="utf-8")
+    storage_shell = (ROOT / "scripts" / "just_storage_shell.sh").read_text(encoding="utf-8")
+
+    assert "target: ${FULLMAG_FRONTEND_CONTAINER_ROOT:?resolve FULLMAG_FRONTEND_CONTAINER_ROOT before running Compose}" in compose
+    assert "target: ${FULLMAG_FRONTEND_ROOT:?resolve FULLMAG_FRONTEND_ROOT before running Compose}" not in compose
+    assert "FULLMAG_FRONTEND_ROOT: ${FULLMAG_FRONTEND_CONTAINER_ROOT:?resolve FULLMAG_FRONTEND_CONTAINER_ROOT before running Compose}" in compose
+    assert 'MSYS_NO_PATHCONV=1 command docker' in storage_shell
 
 
 def test_windows_gpu_route_builds_cuda_and_fails_closed() -> None:
@@ -58,6 +88,86 @@ def test_windows_gpu_route_builds_cuda_and_fails_closed() -> None:
     assert "nvidia-smi" in launcher
     assert "CPU fallback" in launcher
     assert "fullmag_fdm.dll" in launcher
+
+
+def test_windows_launcher_stages_cuda_dll_from_short_external_native_build_root() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+
+    assert 'FULLMAG_FDM_NATIVE_BUILD_ROOT' in launcher
+    assert 'Join-Path $nativeFdmBuildRoot "backends\\fdm\\Release\\fullmag_fdm.dll"' in launcher
+    assert launcher.index("$nativeFdmBuildRoot =") < launcher.index(
+        "$env:FULLMAG_FDM_NATIVE_BUILD_ROOT = $nativeFdmBuildRoot"
+    )
+    assert 'Join-Path $TargetRoot "$TargetTriple\\release\\build"' not in launcher
+    assert 'Join-Path $TargetRoot "release\\build"' not in launcher
+
+
+def test_windows_launcher_rechecks_source_identity_before_publishing_manifest() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+
+    assert "$finalSourceIdentity = Get-SourceIdentity" in launcher
+    assert "GIT_OPTIONAL_LOCKS" in launcher
+    assert launcher.index("$finalSourceIdentity = Get-SourceIdentity") < launcher.index(
+        "$manifest = [ordered]@{"
+    )
+    assert "source changed while the native runtime was building" in launcher
+
+
+def test_windows_launcher_skip_local_changes_is_explicit_and_non_qualifying() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+
+    assert "[switch]$SkipLocalChanges" in launcher
+    assert '[Alias("skip_local_changes")]' in launcher
+    assert "$localChangesCheck = if ($SkipLocalChanges)" in launcher
+    assert 'local_changes_check = $localChangesCheck' in launcher
+    assert 'source_snapshot_sha256_after = [string]$finalSourceIdentity.source_snapshot_sha256' in launcher
+    assert 'source_identity_check = if ($SkipLocalChanges) { "skipped" } else { "passed" }' in launcher
+    assert "unqualified for reproducibility" in launcher
+    assert "was built with -SkipLocalChanges" in launcher
+
+
+def test_windows_fem_launchers_skip_local_changes_with_the_same_manifest_contract() -> None:
+    for path in (LEGACY_FEM_LAUNCHER, DOCKER_LAUNCHER):
+        launcher = path.read_text(encoding="utf-8")
+
+        assert "[switch]$SkipLocalChanges" in launcher
+        assert '[Alias("skip_local_changes")]' in launcher
+        assert "$finalSourceIdentity = Get-SourceIdentity" in launcher
+        assert "source changed while the FEM runtime was building" in launcher
+        assert 'local_changes_check = $localChangesCheck' in launcher
+        assert 'source_snapshot_sha256_after = [string]$finalSourceIdentity.source_snapshot_sha256' in launcher
+        assert 'source_identity_check = if ($SkipLocalChanges) { "skipped" } else { "passed" }' in launcher
+        assert "unqualified for reproducibility" in launcher
+        assert "was built with -SkipLocalChanges" in launcher
+
+
+def test_windows_fem_launchers_define_source_identity_probe_before_use() -> None:
+    for path in (LEGACY_FEM_LAUNCHER, DOCKER_LAUNCHER):
+        launcher = path.read_text(encoding="utf-8")
+
+        assert "function Get-SourceIdentity {" in launcher
+        assert launcher.index("function Get-SourceIdentity {") < launcher.index(
+            "$finalSourceIdentity = Get-SourceIdentity"
+        )
+
+
+def test_just_fullmag_exposes_skip_local_changes_and_forwards_it_to_windows_launchers() -> None:
+    justfile = JUSTFILE.read_text(encoding="utf-8")
+
+    assert 'windows-build backend="fdm" device="cpu" frontend="dev" skip_local_changes="false"' in justfile
+    assert 'skip_local_changes="false"' in justfile
+    assert "--skip_local_changes|skip_local_changes|--skip-local-changes|skip-local-changes" in justfile
+    assert 'skip_local_changes="$value_lc"' in justfile
+    assert 'skip_local_changes_args=(-SkipLocalChanges)' in justfile
+    assert '"${skip_local_changes_args[@]}"' in justfile
+
+
+def test_windows_build_recipe_normalizes_named_arguments() -> None:
+    justfile = JUSTFILE.read_text(encoding="utf-8")
+
+    assert 'case "$backend" in backend=*)' in justfile
+    assert 'case "$device" in device=*)' in justfile
+    assert '-Backend "$backend" -Device "$device"' in justfile
 
 
 def test_windows_fdm_build_does_not_emit_unix_linker_rpath() -> None:
@@ -73,37 +183,188 @@ def test_windows_launcher_supports_build_false_without_rebuilding() -> None:
     assert "BuildMode" in launcher
     assert '"false"' in launcher
     assert "build-manifest.json" in launcher
-    assert "release\\fullmag.exe" in launcher
+    assert "$FullmagExe = $ArtifactPaths.binary" in launcher
+    assert "$ArtifactPaths = Get-WindowsWorkspaceArtifactPaths" in launcher
+    assert '-CompilerProfile $CargoCompilerProfile' in launcher
 
 
-def test_windows_fem_gpu_routes_to_wsl_before_posix_host_setup() -> None:
+def test_native_auto_reuses_cpu_storage_profile_without_changing_request() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+
+    assert '$StorageDevice = if ($Device -eq "gpu") { "gpu" } else { "cpu" }' in launcher
+    assert '$useCuda = $Device -eq "gpu"' in launcher
+    assert '"-Device", $Device' in launcher
+
+
+def test_fem_auto_resolves_storage_profile_before_managed_entry() -> None:
+    launcher = LEGACY_FEM_LAUNCHER.read_text(encoding="utf-8")
+
+    assert "function Resolve-FullmagWindowsAutoDevice" in launcher
+    assert '$StorageProfile = "windows-fem-$StorageDevice"' in launcher
+    assert '$Device = $StorageDevice' in launcher
+    assert '$RequestedDevice = $Device' in launcher
+
+
+def test_windows_simulation_launchers_forward_explicit_output_directory() -> None:
+    for path in (LAUNCHER, LEGACY_FEM_LAUNCHER, DOCKER_LAUNCHER):
+        launcher = path.read_text(encoding="utf-8")
+        assert "[string]$OutputDir" in launcher
+        assert '"--output-dir"' in launcher
+
+
+def test_windows_launcher_builds_cli_and_api_in_the_selected_profile() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+
+    assert '"-p", "fullmag-cli", "-p", "fullmag-api"' in launcher
+    assert '$FullmagApiExe = $ArtifactPaths.api_binary' in launcher
+    assert '$CargoCompilerProfile = if ($SelectedBackendProfile -eq "dev") { "backend-dev" } else { "release" }' in launcher
+    assert "Native Fullmag API binary was not produced" in launcher
+    assert "Native Windows Fullmag API binary is missing" in launcher
+
+
+def test_frozen_build_uses_stable_cargo_inputs_and_verifies_before_publication() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    materialize = launcher.index('"compiler_inputs.py") materialize')
+    cargo_root = launcher.index("Push-Location $CompilerSourceRoot")
+    cargo = launcher.index('Invoke-External "cargo" $cargoArguments', cargo_root)
+    desktop = launcher.index('Invoke-External "cargo" $desktopCargoArguments', cargo)
+    verify = launcher.index('"compiler_inputs.py") verify', cargo_root)
+    publish = launcher.index("$manifest = [ordered]@{", verify)
+    assert materialize < cargo_root < cargo < desktop < verify < publish
+    # Runtime/staging provenance must continue to refer to immutable sources.
+    assert '$BuildSourceRoot = [string]$BuildSnapshot.source_root' in launcher
+    assert 'snapshot_source_root -ne $BuildSourceRoot' in launcher
+    assert 'source_root = $BuildSourceRoot' in launcher
+    assert 'if ($BuildSnapshot) { return (Join-Path $BuildSourceRoot "scripts\\windows") }' in launcher
+    assert '(Join-Path (Get-WindowsBuildToolsRoot) "compiler_inputs.py")' in launcher
+
+
+def test_native_windows_control_room_uses_windows_command_lookup_and_opener() -> None:
+    control_room = CONTROL_ROOM.read_text(encoding="utf-8")
+
+    assert '#[cfg(windows)]\npub(crate) fn command_exists' in control_room
+    assert 'ProcessCommand::new("where.exe")' in control_room
+    assert 'if cfg!(windows) {\n        &["cmd.exe"]' in control_room
+    assert "let frontend_ready = loop" in control_room
+    assert "if !frontend_ready" in control_room
+    assert "if !frontend_is_ready_for_bootstrap(web_port)" not in control_room
+
+
+def test_windows_launcher_reuses_existing_msvc_rust_toolchain() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+
+    assert "rustup show active-toolchain" in launcher
+    assert "x86_64-pc-windows-msvc" in launcher
+    assert '"toolchain", "install"' not in launcher
+    assert '"target", "add"' not in launcher
+
+
+def test_windows_launcher_hashes_files_without_optional_utility_module() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+
+    assert "function Get-Sha256File" in launcher
+    assert "System.Security.Cryptography.SHA256" in launcher
+    assert "Get-FileHash" not in launcher
+
+
+def test_windows_launcher_recognizes_pnpm_windows_swc_store_entry() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+
+    assert "node_modules\\.pnpm" in launcher
+    assert "@next+swc-win32-x64-msvc@*" in launcher
+    assert '$PinnedPnpmVersion = "10.8.1"' in launcher
+    assert "$env:FULLMAG_PNPM_CLI = $PinnedPnpmCli" in launcher
+
+
+def test_root_workspace_and_windows_setup_use_one_pnpm_lock_contract() -> None:
+    package_json = (ROOT / "package.json").read_text(encoding="utf-8")
+    setup = SETUP.read_text(encoding="utf-8")
+
+    assert '"packageManager": "pnpm@10.8.1"' in package_json
+    assert (ROOT / "pnpm-lock.yaml").is_file()
+    assert not (ROOT / "package-lock.json").exists()
+    assert "/package-lock.json" in (ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert '$PinnedPnpmVersion = "10.8.1"' in setup
+    assert '$CorepackHome = [string]$StorageLayout.env.COREPACK_HOME' in setup
+    assert "Set-FullmagStorageEnvironment -Layout $StorageLayout" in setup
+    assert '"install", "--global", "pnpm@$PinnedPnpmVersion"' in setup
+    assert "Pinned pnpm validation failed" in setup
+
+
+def test_windows_fem_gpu_routes_to_docker_before_posix_host_setup() -> None:
     justfile = JUSTFILE.read_text(encoding="utf-8")
 
-    assert "scripts/windows/run_fullmag_wsl.ps1" in justfile
+    assert "scripts/windows/run_fullmag_fem.ps1" in justfile
+    assert "scripts/windows/run_fullmag_wsl.ps1" not in justfile
     assert '[ "$backend" = "fem" ]' in justfile
     assert '[ "$device" = "gpu" ]' in justfile
     fullmag_start = justfile.index("fullmag opt_1")
-    assert justfile.index("run_fullmag_wsl.ps1", fullmag_start) < justfile.index(
+    assert justfile.index("run_fullmag_fem.ps1", fullmag_start) < justfile.index(
         "just ensure-python", fullmag_start
     )
 
 
-def test_windows_wsl_fem_gpu_launcher_is_container_backed_and_d_resident() -> None:
-    launcher = WSL_LAUNCHER.read_text(encoding="utf-8")
+def test_windows_fem_aliases_share_storage_contract() -> None:
+    for path in (LEGACY_FEM_LAUNCHER, FEM_LAUNCHER, DOCKER_LAUNCHER):
+        launcher = path.read_text(encoding="utf-8")
 
-    for path in ("D:\\fullmag-cache", "D:\\fullmag-build", "D:\\fullmag-tmp"):
-        assert path in launcher
+        assert (
+            "FULLMAG_PROJECT_STORAGE_ROOT" in launcher
+            or "fullmag_storage.ps1" in launcher
+            or "run_fullmag_wsl.ps1" in launcher
+        )
+        assert '"fullmag-build\\$WorkspaceNamespace"' not in launcher
+        assert '"fullmag-cache\\$WorkspaceNamespace"' not in launcher
+        assert '"fullmag-tmp\\$WorkspaceNamespace"' not in launcher
+
+
+def test_windows_fem_entrypoint_is_windows_powerShell_to_docker_and_wsl_free() -> None:
+    launcher = FEM_LAUNCHER.read_text(encoding="utf-8")
+
+    assert "Canonical Windows FEM entry point" in launcher
+    assert "run_fullmag_wsl.ps1" in launcher
+    assert 'Invoke-External "wsl.exe"' not in launcher
+    assert "@args" in launcher
+
+
+def test_windows_fem_launcher_is_container_backed_without_direct_wsl_dependency() -> None:
+    launcher = LEGACY_FEM_LAUNCHER.read_text(encoding="utf-8")
+
     for required in (
-        "wsl.exe",
+        "fullmag_storage.ps1",
+        "Resolve-FullmagStorageLayout",
+        "Set-FullmagStorageEnvironment",
+        "Assert-FullmagStoragePath",
         "docker compose",
         "BUILDX_BUILDER",
         "fullmag-windows",
         "buildx",
+        "builderListExitCode",
+        "builderListOutput",
+        'ErrorActionPreference = "Continue"',
+        "Get-Sha256File",
+        "System.Security.Cryptography.SHA256",
+        "FULLMAG_WINDOWS_REBUILD_FEM_IMAGE",
+        "FullmagWindowsFEMBuild",
+        "Waiting for Fullmag Windows build lock",
+        "AbandonedMutexException",
+        "ReleaseMutex",
+        "docker image inspect",
+        "imageOutput",
+        "capture_source_snapshot_identity.py",
+        "--ignore-non-runtime-dirty",
+        "GIT_OPTIONAL_LOCKS",
+        "FULLMAG_SOURCE_SNAPSHOT_SHA256",
         "--load",
         "docker info",
         "nvidia-smi",
         "compose.windows.yaml",
-        "fullmag-windows-fem-gpu",
+        "$WorkspaceNamespace = [string]$StorageLayout.worktree_id",
+        "$ComposeProjectName = \"fullmag-windows-fem-$WorkspaceNamespace-$Device\"",
+        '$env:COMPOSE_PROJECT_NAME = $ComposeProjectName',
+        '$DefaultFemCpuImage = "fullmag/fem-cpu:windows-local-$WorkspaceNamespace"',
+        '$DefaultFemGpuImage = "fullmag/fem-gpu:windows-local-$WorkspaceNamespace"',
+        '$ServiceName = "fullmag-windows-fem-$Device"',
         "CudaBaseImage",
         "CudaCacheKey",
         "FULLMAG_FORCE_LOCAL_FEM_GPU",
@@ -114,29 +375,252 @@ def test_windows_wsl_fem_gpu_launcher_is_container_backed_and_d_resident() -> No
         "grep -Fxq cuda-fem-gpu",
         "FULLMAG_FEM_EXECUTION",
         "FULLMAG_RELAX_DEVICE",
+        "FULLMAG_SP4_DEVICE",
+        "FULLMAG_SP4_COMPATIBILITY",
+        "FULLMAG_SP4_TOPOLOGY_VARIANT",
+        "FULLMAG_SP4_RELAX_MAX_STEPS",
+        "GetEnvironmentVariable",
+        "FULLMAG_API_PORT=0",
         "CPU fallback",
     ):
         assert required in launcher
+    assert "Require-DPath" not in launcher
+    assert 'Invoke-External "wsl.exe"' not in launcher
     assert '"buildx", "build"' in launcher
     assert "run_fullmag.ps1" not in launcher
 
 
+def test_windows_fem_fk_gpu_route_selects_device_operator_without_cpu_fallback() -> None:
+    for launcher_path in (LEGACY_FEM_LAUNCHER, DOCKER_LAUNCHER):
+        launcher = launcher_path.read_text(encoding="utf-8")
+
+        assert 'FULLMAG_SINC_LAYER_DEMAG -eq "fredkin_koehler"' in launcher
+        assert '"device_hypre_fem_bem"' in launcher
+        assert '"device_hypre_poisson"' in launcher
+        assert "FULLMAG_FEM_GPU_DEMAG_MODE" in launcher
+
+
+def test_windows_docker_compatibility_launcher_captures_image_inspect_exit_code() -> None:
+    launcher = DOCKER_LAUNCHER.read_text(encoding="utf-8")
+
+    inspect = launcher.index("docker image inspect")
+    exit_candidates = [
+        launcher.find("$imageExitCode = $LASTEXITCODE", inspect),
+        launcher.find("$imageInspectExitCode = $LASTEXITCODE", inspect),
+    ]
+    exit_code = min(index for index in exit_candidates if index != -1)
+    selection_candidates = [
+        launcher.find("Select-Object -First 1", inspect),
+        launcher.find("$imageId = if", inspect),
+    ]
+    selection = min(index for index in selection_candidates if index != -1)
+
+    assert inspect < exit_code < selection
+    assert 'Invoke-External "wsl.exe"' not in launcher
+
+
+def test_windows_launchers_and_setup_namespace_default_storage_per_worktree() -> None:
+    launcher = LAUNCHER.read_text(encoding="utf-8")
+    fem_launcher = LEGACY_FEM_LAUNCHER.read_text(encoding="utf-8")
+    setup = SETUP.read_text(encoding="utf-8")
+
+    for script in (launcher, fem_launcher, setup):
+        assert "Resolve-FullmagStorageLayout" in script
+        assert "Set-FullmagStorageEnvironment" in script
+        assert "$WorkspaceNamespace = [string]$StorageLayout.worktree_id" in script
+        assert "[string]$StorageLayout.cache_root" in script
+        assert "[string]$StorageLayout.build_root" in script
+    assert "[string]$StorageLayout.temp_root" in fem_launcher
+    assert "[string]$StorageLayout.temp_root" in setup
+    assert '$env:COMPOSE_PROJECT_NAME = "fullmag-windows-fem"' not in fem_launcher
+
+
+def test_managed_compose_recipes_do_not_use_a_global_project_name() -> None:
+    justfile = (ROOT / "justfile").read_text(encoding="utf-8")
+    helper = (ROOT / "scripts" / "resolve_fullmag_compose_project.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "COMPOSE_PROJECT_NAME=fullmag" not in justfile
+    assert 'resolve_fullmag_compose_project.sh' in justfile
+    assert "sha256sum" in helper
+    assert "FULLMAG_REPO_ROOT" in helper
+    assert "FULLMAG_COMPOSE_PROJECT_NAME" in helper
+
+
+def test_windows_fem_image_override_is_used_for_runtime_validation() -> None:
+    launcher = LEGACY_FEM_LAUNCHER.read_text(encoding="utf-8")
+
+    runtime_image_block = launcher[launcher.index("$RuntimeImage ="):]
+    assert "FULLMAG_WINDOWS_FEM_CPU_IMAGE" in runtime_image_block
+    assert "FULLMAG_WINDOWS_FEM_GPU_IMAGE" in runtime_image_block
+
+
+def test_windows_setup_bootstraps_tools_and_validates_storage() -> None:
+    setup = SETUP.read_text(encoding="utf-8")
+
+    for required in (
+        "InstallMissing",
+        "cargo",
+        "just",
+        "uv",
+        "fullmag_storage.ps1",
+        "Resolve-FullmagStorageLayout",
+        "Set-FullmagStorageEnvironment",
+        "Assert-FullmagStoragePath",
+        "FULLMAG_WINDOWS_CACHE_ROOT",
+        "FULLMAG_WINDOWS_BUILD_ROOT",
+        "FULLMAG_WINDOWS_TEMP_ROOT",
+        "vcvars64.bat",
+        "Git\\bin\\bash.exe",
+    ):
+        assert required in setup
+
+
+def test_justfile_exposes_windows_setup_doctor_and_build_only_routes() -> None:
+    justfile = JUSTFILE.read_text(encoding="utf-8")
+
+    for recipe in ("windows-setup:", "windows-doctor:", "windows-build "):
+        assert recipe in justfile
+    assert '[ "$windows" = "true" ] || [ "$host_windows" = "true" ]' in justfile
+    assert "-BuildOnly" in justfile
+
+
+def test_windows_wsl_build_script_uses_binary_safe_bash_payload() -> None:
+    launcher = LEGACY_FEM_LAUNCHER.read_text(encoding="utf-8")
+
+    assert '[System.Text.Encoding]::UTF8.GetBytes($buildCommand)' in launcher
+    assert '[Convert]::ToBase64String($buildCommandBytes)' in launcher
+    assert "base64 --decode | bash" in launcher
+    assert '.Replace("`r`n", "`n").Replace("`r", "`n")' in launcher
+
+
 def test_windows_wsl_launcher_uses_windows_powershell_relative_path_api() -> None:
-    launcher = WSL_LAUNCHER.read_text(encoding="utf-8")
+    launcher = LEGACY_FEM_LAUNCHER.read_text(encoding="utf-8")
 
     assert "MakeRelativeUri" in launcher
     assert "Path.GetRelativePath" not in launcher
+
+
+def test_windows_fem_interactive_launch_omits_empty_compose_environment_entries() -> None:
+    launcher = LEGACY_FEM_LAUNCHER.read_text(encoding="utf-8")
+
+    assert '$(if ($RunMode -eq "headless") { "FULLMAG_API_PORT=0" } else { $null })' in launcher
+    assert "[string]::IsNullOrWhiteSpace([string]$entry)" in launcher
+    assert 'if ([string]::IsNullOrWhiteSpace([string]$entry)) {\n      continue\n    }' in launcher
+
+
+def test_windows_fem_build_mutex_is_released_before_long_running_simulation() -> None:
+    launcher = LEGACY_FEM_LAUNCHER.read_text(encoding="utf-8")
+
+    manifest_boundary = launcher.index('  if ($BuildOnly) {')
+    release_boundary = launcher.index(
+        '  if ($buildMutexHeld) {', manifest_boundary
+    )
+    run_boundary = launcher.index('  if ($Device -eq "gpu") {', release_boundary)
+    assert manifest_boundary < release_boundary < run_boundary
+    assert '$buildMutexHeld = $false' in launcher[release_boundary:run_boundary]
+    assert '$buildMutex = $null' in launcher[release_boundary:run_boundary]
+
+
+@pytest.mark.parametrize("launcher_path", [LEGACY_FEM_LAUNCHER, DOCKER_LAUNCHER])
+def test_windows_fem_interactive_launch_separates_host_and_container_web_ports(launcher_path) -> None:
+    launcher = launcher_path.read_text(encoding="utf-8")
+    compose = WINDOWS_COMPOSE.read_text(encoding="utf-8")
+
+    assert '$env:FULLMAG_WINDOWS_WEB_PORT = $WebPort.ToString()' in launcher
+    assert '$containerWebPort = 3100' in launcher
+    assert '"FULLMAG_WEB_PUBLIC_PORT=$WebPort"' in launcher
+    assert '$cliArguments += @("--web-port", $containerWebPort.ToString())' in launcher
+    assert '$cliArguments += @("--web-port", $WebPort.ToString())' not in launcher
+    assert '"${FULLMAG_WINDOWS_WEB_PORT:-3100}:3100"' in compose
+
+
+def test_windows_fem_default_web_port_is_selected_from_a_bindable_host_range() -> None:
+    justfile = JUSTFILE.read_text(encoding="utf-8")
+    launcher = LEGACY_FEM_LAUNCHER.read_text(encoding="utf-8")
+
+    assert 'fullmag opt_1=""' in justfile
+    assert 'web_port="0"' in justfile
+    assert 'scripts\\control_room_port.py' in launcher
+    assert '[int]$WebPort = 0' in launcher
+    assert "scripts\\control_room_port.py" in launcher
+    assert 'first_bindable_port' not in launcher
+    assert '"pick", "0.0.0.0"' in launcher
+    assert '$WebPort = Resolve-HostWebPort -RequestedPort $WebPort' in launcher
+    assert '3101..3199' in launcher
+
+
+@pytest.mark.parametrize(
+    "backend,explicit_port,expected",
+    [("fdm", None, "3100"), ("fem", None, "0"),
+     ("fdm", "3197", "3197"), ("fem", "3197", "3197")],
+)
+def test_fullmag_windows_dispatch_preserves_port_defaults(backend, explicit_port, expected):
+    git_bash = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe"
+    bash = str(git_bash) if os.name == "nt" and git_bash.is_file() else shutil.which("bash")
+    if bash is None:
+        pytest.skip("Bash is required to exercise the justfile parser")
+    recipe = JUSTFILE.read_text(encoding="utf-8").split('fullmag opt_1=""', 1)[1]
+    body = recipe.split("bash -euo pipefail -c '\\\n", 1)[1]
+    body = body.split("\n\n", 1)[0].rstrip()
+    assert body.endswith("'")
+    body = body[:-1].replace("\\\n", "\n")
+    options = ["windows=True", backend, "gpu", "justfile"]
+    # Use an existing file: this probe exits before invoking a real launcher.
+    options[3] = "script=justfile"
+    if explicit_port is not None:
+        options.append(f"web_port={explicit_port}")
+    body = body.replace("{{repo_root}}", ".")
+    for index in range(1, 9):
+        body = body.replace("{{opt_" + str(index) + "}}", options[index - 1] if index <= len(options) else "")
+    body = re.sub(r"exec powershell\.exe[^\n]*", 'printf "%s" "$web_port"; exit 0', body)
+    result = subprocess.run([bash, "-c", body], cwd=ROOT, text=True, capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
+
+
+@pytest.mark.parametrize("device", ["cpu", "gpu"])
+@pytest.mark.parametrize("override", [False, True])
+def test_windows_fem_exports_resolved_image_to_compose(device, override):
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell is required to exercise image selection")
+    launcher = LEGACY_FEM_LAUNCHER.read_text(encoding="utf-8")
+    selection = launcher.split("$RuntimeImage = if", 1)[1].split("foreach ($item", 1)[0]
+    image_key = f"FULLMAG_WINDOWS_FEM_{device.upper()}_IMAGE"
+    expected = f"test/{device}:override" if override else f"test/{device}:worktree"
+    setup = (
+        "$env:FULLMAG_WINDOWS_FEM_CPU_IMAGE=$null;"
+        "$env:FULLMAG_WINDOWS_FEM_GPU_IMAGE=$null;"
+        "$DefaultFemCpuImage='test/cpu:worktree';"
+        "$DefaultFemGpuImage='test/gpu:worktree';"
+        f"$Device='{device}';"
+    )
+    if override:
+        setup += f"$env:{image_key}='{expected}';"
+    command = setup + "$RuntimeImage = if" + selection + f"[Console]::Write($env:{image_key})"
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-Command", command], capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == expected
 
 
 def test_windows_compose_uses_only_bind_mounts_for_build_and_cache() -> None:
     compose = WINDOWS_COMPOSE.read_text(encoding="utf-8")
 
     assert "fullmag-windows-fem-gpu:" in compose
+    assert "fullmag-windows-fem-cpu:" in compose
     assert "gpus: all" in compose
     assert "FULLMAG_WINDOWS_REPO" in compose
     assert "FULLMAG_WINDOWS_BUILD_ROOT" in compose
     assert "FULLMAG_WINDOWS_CACHE_ROOT" in compose
     assert "FULLMAG_WINDOWS_TEMP_ROOT" in compose
+    assert compose.count("CMAKE_BUILD_PARALLEL_LEVEL") == 2
+    assert compose.count("CARGO_BUILD_JOBS") == 2
+    assert compose.count("GIT_OPTIONAL_LOCKS") == 2
+    assert compose.count("FULLMAG_SOURCE_SNAPSHOT_SHA256") == 4
     assert "FULLMAG_WINDOWS_NODE_MODULES_ROOT" in compose
     assert "FULLMAG_CUDA_BASE_IMAGE" in compose
     assert "/workspace/.fullmag-cargo" in compose
@@ -148,9 +632,78 @@ def test_windows_compose_uses_only_bind_mounts_for_build_and_cache() -> None:
     assert "volumes:" in compose
     assert "type: bind" in compose
     assert "entrypoint: []" in compose
+    assert "D:/fullmag" not in compose
     assert "- cargo-cache:" not in compose
     assert "- target-cache:" not in compose
     assert "- pnpm-store:" not in compose
+
+
+def test_windows_fem_gpu_uses_scientific_python_with_runtime_dependencies() -> None:
+    compose = WINDOWS_COMPOSE.read_text(encoding="utf-8")
+
+    gpu_service = compose.split("  fullmag-windows-fem-gpu:", 1)[1].split(
+        "  fullmag-windows-fem-cpu:", 1
+    )[0]
+    cpu_service = compose.split("  fullmag-windows-fem-cpu:", 1)[1]
+    assert "FULLMAG_PYTHON: /usr/local/bin/python3" in gpu_service
+    assert "FULLMAG_PYTHON: /usr/bin/python3" not in gpu_service
+    assert "FULLMAG_PYTHON: /usr/bin/python3" in cpu_service
+
+
+def test_windows_fem_dev_bootstrap_creates_the_requested_next_target() -> None:
+    launcher = LEGACY_FEM_LAUNCHER.read_text(encoding="utf-8")
+
+    assert '`"`$frontend_root/next/dev-$containerWebPort`"' in launcher
+    assert 'ensure_managed_link `"`$frontend_app/.next-control-room-$containerWebPort`"' in launcher
+
+
+def test_windows_fem_container_build_uses_host_managed_storage_boundary() -> None:
+    launcher = LEGACY_FEM_LAUNCHER.read_text(encoding="utf-8")
+    make_shell = MAKE_STORAGE_SHELL.read_text(encoding="utf-8")
+
+    assert "FULLMAG_WINDOWS_CONTAINER_MANAGED=1" in launcher
+    assert "FULLMAG_CARGO_TARGET_DIR=/workspace/.fullmag-build/cargo-targets/$TargetKey" in launcher
+    assert "CARGO_TARGET_DIR=/workspace/.fullmag-build/cargo-targets/$TargetKey" in launcher
+    assert "FULLMAG_WINDOWS_CONTAINER_MANAGED" in make_shell
+    assert "/workspace/.fullmag-build/cargo-targets/*" in make_shell
+    assert "CARGO_TARGET_DIR must match FULLMAG_CARGO_TARGET_DIR" in make_shell
+    assert 'exec bash -euo pipefail -c "${recipe}"' in make_shell
+
+
+def test_windows_fem_container_storage_boundary_rejects_parent_traversal(tmp_path) -> None:
+    if os.name == "nt":
+        pytest.skip("The managed-container boundary is exercised by the Linux CI lane")
+    git_bash = Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Git/bin/bash.exe"
+    bash = str(git_bash) if os.name == "nt" and git_bash.is_file() else shutil.which("bash")
+    if bash is None:
+        pytest.skip("Bash is required to exercise the managed container boundary")
+    escaped = "/workspace/.fullmag-build/cargo-targets/../escape"
+    python_probe = tmp_path / "python3"
+    python_probe.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+    python_probe.chmod(0o755)
+    uname_probe = tmp_path / "uname"
+    uname_probe.write_text("#!/usr/bin/env bash\nprintf 'Linux\\n'\n", encoding="utf-8")
+    uname_probe.chmod(0o755)
+    probe_path = str(tmp_path)
+    if os.name == "nt":
+        probe_path = f"/{probe_path[0].lower()}{probe_path[2:].replace(chr(92), '/')}"
+    env = os.environ.copy()
+    env.pop("OS", None)
+    env.update(
+        FULLMAG_WINDOWS_CONTAINER_MANAGED="1",
+        FULLMAG_CARGO_TARGET_DIR=escaped,
+        CARGO_TARGET_DIR=escaped,
+        PATH=probe_path + ":" + env.get("PATH", ""),
+    )
+    result = subprocess.run(
+        [bash, str(MAKE_STORAGE_SHELL), "-c", "exit 0"],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 2
+    assert "outside /workspace/.fullmag-build/cargo-targets" in result.stderr
 
 
 def test_fem_gpu_dockerfile_treats_nsight_as_optional() -> None:
@@ -161,9 +714,142 @@ def test_fem_gpu_dockerfile_treats_nsight_as_optional() -> None:
     assert "profiler tools are optional" in dockerfile
 
 
+def test_fem_cpu_dockerfile_provides_control_room_toolchain() -> None:
+    dockerfile = FEM_CPU_DOCKERFILE.read_text(encoding="utf-8")
+
+    assert "ARG NODE_VERSION=24.18.0" in dockerfile
+    assert "corepack enable" in dockerfile
+    assert "pnpm@10.8.1" in dockerfile
+
+
 def test_makefile_can_build_local_fem_gpu_without_linux_only_managed_export() -> None:
     makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
 
     assert "FULLMAG_FORCE_LOCAL_FEM_GPU" in makefile
     assert '"cuda fem-gpu"' in makefile
     assert 'build_mode="cuda-fem-gpu"' in makefile
+
+
+def test_makefile_can_build_container_local_fem_cpu() -> None:
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+
+    assert "FULLMAG_FORCE_LOCAL_FEM_CPU" in makefile
+    assert 'build_mode="fem-cpu"' in makefile
+    assert '"fem-gpu"' in makefile
+
+
+@pytest.fixture(scope="module")
+def public_url_probe(tmp_path_factory):
+    rustc = shutil.which("rustc")
+    if rustc is None:
+        pytest.skip("rustc is required for the isolated launcher URL check")
+    source = CONTROL_ROOM.read_text(encoding="utf-8")
+    url_helpers = source[source.index("fn web_public_url("):source.index("\npub(crate) fn internal_live_api_url")]
+    resolver = source[source.index("fn resolve_web_port("):source.index("\npub(crate) fn port_is_listening")]
+    tmp_path = tmp_path_factory.mktemp("public-url")
+    harness = tmp_path / "public_url.rs"
+    harness.write_text(
+        '''use std::{fs, path::Path};
+        type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+        macro_rules! bail { ($($arg:tt)*) => { return Err(format!($($arg)*).into()) }; }
+        fn web_public_host() -> String { "localhost".into() }
+        fn port_is_listening(_: u16) -> bool { false }
+        fn port_is_bindable(_: u16) -> bool { true }
+        ''' + url_helpers + resolver + '''
+        fn main() -> Result<()> {
+            let mode = std::env::args().nth(1).unwrap();
+            match mode.as_str() {
+                "frontend" => println!("{}", frontend_public_url(3100)?),
+                "api" => println!("{}", web_public_url(8081)),
+                "listen" => println!("{}", resolve_web_port(None, Path::new(&std::env::args().nth(2).unwrap()))?),
+                _ => panic!("unknown probe mode"),
+            }
+            Ok(())
+        }
+        ''', encoding="utf-8",
+    )
+    executable = tmp_path / ("public_url.exe" if os.name == "nt" else "public_url")
+    subprocess.run([rustc, str(harness), "-o", str(executable)], check=True)
+
+    def run(mode, published_port, *args):
+        env = os.environ.copy()
+        env.pop("FULLMAG_WEB_PUBLIC_PORT", None)
+        if published_port is not None:
+            env["FULLMAG_WEB_PUBLIC_PORT"] = published_port
+        return subprocess.run([str(executable), mode, *map(str, args)], env=env, capture_output=True, text=True)
+
+    return run
+
+
+@pytest.mark.parametrize("published_port, expected_port", [(None, 3100), ("3101", 3101), ("65535", 65535)])
+def test_logged_control_room_url_uses_published_port(public_url_probe, published_port, expected_port):
+    result = public_url_probe("frontend", published_port)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"http://localhost:{expected_port}"
+
+
+@pytest.mark.parametrize("published_port", ["", "0", "65536", "3101x", "+3101", " 3101", "-1"])
+def test_public_frontend_port_rejects_invalid_configuration(public_url_probe, published_port):
+    result = public_url_probe("frontend", published_port)
+    assert result.returncode != 0
+    assert "FULLMAG_WEB_PUBLIC_PORT" in result.stderr
+
+
+def test_api_fallback_keeps_its_own_port(public_url_probe):
+    result = public_url_probe("api", "3101")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "http://localhost:8081"
+
+
+def test_windows_internal_api_target_uses_ipv4_loopback_by_default() -> None:
+    source = CONTROL_ROOM.read_text(encoding="utf-8")
+
+    assert 'const DEFAULT_API_HOST: &str = "127.0.0.1";' in source
+    assert 'format!("http://{}:{}", api_host(), api_port())' in source
+    assert '"FULLMAG_API_HOST"' in source
+
+
+def test_listener_state_is_separate_from_public_url(public_url_probe, tmp_path):
+    (tmp_path / "control-room-url.txt").write_text("http://localhost:3101")
+    listen_file = tmp_path / "control-room-listen-port.txt"
+    listen_file.write_text("3100")
+    result = public_url_probe("listen", "3101", listen_file)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "3100"
+    source = CONTROL_ROOM.read_text(encoding="utf-8")
+    assert 'state_root.join("control-room-listen-port.txt")' in source
+    assert 'resolve_web_port(requested_port, &listen_port_file)?' in source
+    assert 'fs::write(&listen_port_file, web_port.to_string())' in source
+
+
+@pytest.mark.parametrize("test_filter", ["", "orchestrator::tests::fdm_grid"])
+def test_windows_fem_managed_entry_preserves_targeted_test_arguments(test_filter):
+    powershell = shutil.which("powershell.exe") or shutil.which("pwsh")
+    if powershell is None:
+        pytest.skip("PowerShell is required to exercise managed test dispatch")
+    launcher = LEGACY_FEM_LAUNCHER.read_text(encoding="utf-8")
+    dispatch = launcher.split('if ($env:FULLMAG_STORAGE_MANAGED_ENTRY -ne "1") {', 1)[1]
+    dispatch = dispatch.split("$StorageLayout =", 1)[0]
+    command = (
+        "function Invoke-FullmagStorageManagedScript { "
+        "param($RepoRoot, $Profile, $ScriptPath, $Arguments) "
+        "[Console]::Write(($Arguments | ConvertTo-Json -Compress)); return 0 };"
+        "$BuildMode='true'; $Frontend='dev'; $Backend='fem'; $Device='cpu';"
+        "$RunMode='headless'; $WebPort=0; $BuildOnly=$true;"
+        "$TestPackage='fullmag-cli';"
+        f"$TestFilter='{test_filter}';"
+        "& {" + dispatch
+    )
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-Command", command], capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    import json
+    arguments = json.loads(result.stdout)
+    assert arguments[arguments.index("-TestPackage") + 1] == "fullmag-cli"
+    assert "-BuildOnly" in arguments
+    assert arguments[arguments.index("-WebPort") + 1] == "0"
+    if test_filter:
+        assert arguments[arguments.index("-TestFilter") + 1] == test_filter
+    else:
+        assert "-TestFilter" not in arguments

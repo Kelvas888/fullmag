@@ -206,6 +206,15 @@ impl CpuAdaptiveAttemptBatch {
         for record in &self.records[..self.count] {
             target.push(SolverAttemptRecord {
                 attempt: u64::from(record.attempt),
+                adaptive_controller_policy_version: Some(
+                    record.controller_policy_version.to_string(),
+                ),
+                error_norm_type: None,
+                active_node_count: None,
+                active_measure: None,
+                normalization_denominator: None,
+                max_scaled_error: None,
+                weighted_rms_error: None,
                 target_step: self.target_step,
                 time: self.time,
                 dt_attempt: record.dt_attempt,
@@ -267,6 +276,7 @@ enum ArtifactJob {
         provenance: ExecutionProvenance,
         acknowledgement: mpsc::Sender<Result<(), String>>,
     },
+    #[cfg(any(feature = "cuda", test))]
     FailedRunProvenance {
         provenance: ExecutionProvenance,
         primary_error: String,
@@ -292,6 +302,7 @@ impl ArtifactJob {
             ArtifactJob::NativeFieldSnapshot { .. } => 0,
             #[cfg(feature = "fem-gpu")]
             ArtifactJob::NativeFemFieldSnapshot { .. } => 0,
+            #[cfg(any(feature = "cuda", test))]
             ArtifactJob::FailedRunProvenance { .. } => 0,
             ArtifactJob::TerminalCpuAdaptiveAttempts { batch, .. } => batch
                 .count
@@ -347,6 +358,7 @@ impl ArtifactPipelineSender {
         })
     }
 
+    #[cfg(any(feature = "cuda", test))]
     fn publish_failed_run_provenance(
         &self,
         provenance: ExecutionProvenance,
@@ -476,6 +488,7 @@ impl ArtifactPipelineSender {
         }
     }
 
+    #[cfg(any(feature = "cuda", test))]
     fn publish_failed_run_provenance_with_timeout(
         &self,
         provenance: ExecutionProvenance,
@@ -526,12 +539,10 @@ impl ArtifactPipelineSender {
             Ok(Ok(())) => Ok(()),
             Ok(Err(message)) => Err(RunError { message }),
             Err(mpsc::RecvTimeoutError::Timeout) => Err(RunError {
-                message: "timed out waiting for durable failed-run provenance publication"
-                    .into(),
+                message: "timed out waiting for durable failed-run provenance publication".into(),
             }),
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(RunError {
-                message: "artifact writer stopped before failed-run provenance was durable"
-                    .into(),
+                message: "artifact writer stopped before failed-run provenance was durable".into(),
             }),
         }
     }
@@ -565,6 +576,7 @@ impl ArtifactPipeline {
     /// older runner call sites.  The production path should prefer
     /// `start_for_problem_with_autosave_root`, but this wrapper preserves the
     /// same writer contract without enabling stage autosave.
+    #[cfg(test)]
     pub(crate) fn start(
         output_dir: PathBuf,
         field_context: FieldArtifactContext,
@@ -577,21 +589,6 @@ impl ArtifactPipeline {
             capacity,
             None,
             None,
-        )
-    }
-
-    pub(crate) fn start_for_problem(
-        problem: &fullmag_ir::ProblemIR,
-        output_dir: PathBuf,
-        field_context: FieldArtifactContext,
-        capacity: usize,
-    ) -> Result<Self, RunError> {
-        Self::start_for_problem_with_autosave_root(
-            problem,
-            output_dir.clone(),
-            output_dir,
-            field_context,
-            capacity,
         )
     }
 
@@ -609,38 +606,6 @@ impl ArtifactPipeline {
             output_dir,
             field_context,
             capacity,
-        )
-    }
-
-    pub(crate) fn start_for_problem_with_autosave_root(
-        problem: &fullmag_ir::ProblemIR,
-        output_dir: PathBuf,
-        autosave_root: PathBuf,
-        field_context: FieldArtifactContext,
-        capacity: usize,
-    ) -> Result<Self, RunError> {
-        let stage_autosave = problem
-            .study
-            .sampling()
-            .stage_autosave
-            .clone()
-            .map(|policy| StageAutosavePipelineConfig {
-                stage_id: problem
-                    .problem_meta
-                    .runtime_metadata
-                    .get("active_stage_id")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(&problem.problem_meta.entrypoint_kind)
-                    .to_string(),
-                policy,
-            });
-        Self::start_with_stage_autosave_roots(
-            output_dir,
-            autosave_root,
-            field_context,
-            capacity,
-            stage_autosave,
-            None,
         )
     }
 
@@ -678,23 +643,6 @@ impl ArtifactPipeline {
             capacity,
             stage_autosave,
             Some(physics_execution_context),
-        )
-    }
-
-    #[cfg(test)]
-    fn start_with_stage_autosave(
-        output_dir: PathBuf,
-        field_context: FieldArtifactContext,
-        capacity: usize,
-        stage_autosave: Option<StageAutosavePipelineConfig>,
-    ) -> Result<Self, RunError> {
-        Self::start_with_stage_autosave_roots(
-            output_dir.clone(),
-            output_dir,
-            field_context,
-            capacity,
-            stage_autosave,
-            None,
         )
     }
 
@@ -1254,16 +1202,15 @@ impl ArtifactRecorder {
     /// Replaces runtime provenance after a run has measured counters that are
     /// unavailable before the first step. Existing queued field snapshots keep
     /// their immutable capture-time provenance.
+    #[cfg(any(feature = "cuda", feature = "fem-gpu", test))]
     pub(crate) fn update_provenance(&mut self, provenance: ExecutionProvenance) {
         self.provenance = provenance;
     }
 
-    #[cfg(feature = "fem-gpu")]
     pub(crate) fn provenance_snapshot(&self) -> ExecutionProvenance {
         self.provenance.clone()
     }
 
-    #[cfg(feature = "fem-gpu")]
     pub(crate) fn replace_provenance_synchronously(
         &mut self,
         provenance: ExecutionProvenance,
@@ -1275,15 +1222,14 @@ impl ArtifactRecorder {
         Ok(())
     }
 
+    #[cfg(any(feature = "cuda", test))]
     pub(crate) fn publish_failed_run_provenance(
         &mut self,
         primary: &RunError,
     ) -> Result<(), RunError> {
         if let Some(pipeline) = self.pipeline.as_ref() {
-            pipeline.publish_failed_run_provenance(
-                self.provenance.clone(),
-                primary.message.clone(),
-            )?;
+            pipeline
+                .publish_failed_run_provenance(self.provenance.clone(), primary.message.clone())?;
         }
         Ok(())
     }
@@ -1510,12 +1456,13 @@ impl ZarrFieldSeriesWriter {
         provenance: &ExecutionProvenance,
     ) -> Result<(), String> {
         let path = self.root_dir.join(".zattrs");
-        let mut attrs: serde_json::Value = serde_json::from_slice(
-            &fs::read(&path).map_err(|error| {
+        let mut attrs: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).map_err(|error| {
                 format!("failed to read Zarr attrs '{}': {error}", path.display())
-            })?,
-        )
-        .map_err(|error| format!("failed to decode Zarr attrs '{}': {error}", path.display()))?;
+            })?)
+            .map_err(|error| {
+                format!("failed to decode Zarr attrs '{}': {error}", path.display())
+            })?;
         attrs["provenance"] = crate::artifacts::artifact_provenance_json(context, provenance);
         crate::autosave_zarr::write_json_atomic(&path, &attrs)
             .map_err(|error| format!("failed to update Zarr attrs '{}': {error}", path.display()))
@@ -1770,6 +1717,12 @@ fn writer_loop(
         ..ArtifactPipelineSummary::default()
     };
     let mut scalar_writer: Option<BufWriter<File>> = None;
+    let mut frames_index = crate::frames_index::FramesIndexWriter::new(
+        output_dir,
+        stage_autosave_config
+            .as_ref()
+            .map(|config| config.stage_id.clone()),
+    );
     let mut stage_autosave = stage_autosave_config
         .map(|config| StageAutosaveRuntime::new(autosave_root, config))
         .transpose()?;
@@ -1850,6 +1803,21 @@ fn writer_loop(
                                 snapshot.name, snapshot.step, error
                             )
                         })?;
+                        let relative = crate::frames_index::snapshot_relative_path(
+                            &snapshot.name,
+                            snapshot.step,
+                            true,
+                        );
+                        let bytes = fs::metadata(output_dir.join(&relative))
+                            .ok()
+                            .map(|meta| meta.len());
+                        frames_index.record(
+                            &snapshot.name,
+                            snapshot.step,
+                            snapshot.time,
+                            relative,
+                            bytes,
+                        )?;
                     }
                     FieldArtifactStorage::Zarr => {
                         #[cfg(any(feature = "cuda", feature = "fem-gpu"))]
@@ -1873,6 +1841,17 @@ fn writer_loop(
                                 )?,
                             );
                             writer.append_field_snapshot(&snapshot)?;
+                            frames_index.record(
+                                &snapshot.name,
+                                snapshot.step,
+                                snapshot.time,
+                                crate::frames_index::snapshot_relative_path(
+                                    &snapshot.name,
+                                    snapshot.step,
+                                    false,
+                                ),
+                                None,
+                            )?;
                         }
                         #[cfg(not(any(feature = "cuda", feature = "fem-gpu")))]
                         {
@@ -1931,6 +1910,13 @@ fn writer_loop(
                     )?,
                 );
                 writer.append_fdm_snapshot(&mut snapshot)?;
+                frames_index.record(
+                    &snapshot.name,
+                    snapshot.step,
+                    snapshot.time,
+                    crate::frames_index::snapshot_relative_path(&snapshot.name, snapshot.step, false),
+                    None,
+                )?;
                 if let Some(runtime) = stage_autosave.as_mut() {
                     let values = writer.last_chunk_values_f64()?;
                     runtime.append_field_values(
@@ -1974,6 +1960,13 @@ fn writer_loop(
                     )?,
                 );
                 writer.append_fem_snapshot(&mut snapshot)?;
+                frames_index.record(
+                    &snapshot.name,
+                    snapshot.step,
+                    snapshot.time,
+                    crate::frames_index::snapshot_relative_path(&snapshot.name, snapshot.step, false),
+                    None,
+                )?;
                 if let Some(runtime) = stage_autosave.as_mut() {
                     let values = writer.last_chunk_values_f64()?;
                     runtime.append_field_values(
@@ -1992,16 +1985,14 @@ fn writer_loop(
                     job_start.elapsed(),
                 );
             }
+            #[cfg(any(feature = "cuda", test))]
             ArtifactJob::FailedRunProvenance {
                 provenance,
                 primary_error,
                 acknowledgement,
             } => {
-                let result = write_failed_run_provenance_atomic(
-                    output_dir,
-                    &provenance,
-                    &primary_error,
-                );
+                let result =
+                    write_failed_run_provenance_atomic(output_dir, &provenance, &primary_error);
                 let _ = acknowledgement.send(result);
             }
             ArtifactJob::TerminalCpuAdaptiveAttempts {
@@ -2053,6 +2044,7 @@ fn writer_loop(
         })?;
     }
 
+    frames_index.finish()?;
     if let Some(runtime) = stage_autosave {
         runtime.finish()?;
     }
@@ -2071,6 +2063,7 @@ impl StageAutosaveWriter {
     }
 }
 
+#[cfg(any(feature = "cuda", test))]
 fn write_failed_run_provenance_atomic(
     output_dir: &Path,
     provenance: &ExecutionProvenance,
@@ -2097,18 +2090,19 @@ fn write_failed_run_provenance_atomic(
             )
         })?;
         let mut writer = BufWriter::new(file);
-        writer.write_all(&payload).map_err(|error| {
-            format!("failed to write failed-run provenance: {error}")
-        })?;
-        writer.write_all(b"\n").map_err(|error| {
-            format!("failed to terminate failed-run provenance: {error}")
-        })?;
-        writer.flush().map_err(|error| {
-            format!("failed to flush failed-run provenance: {error}")
-        })?;
-        writer.get_ref().sync_all().map_err(|error| {
-            format!("failed to sync failed-run provenance: {error}")
-        })?;
+        writer
+            .write_all(&payload)
+            .map_err(|error| format!("failed to write failed-run provenance: {error}"))?;
+        writer
+            .write_all(b"\n")
+            .map_err(|error| format!("failed to terminate failed-run provenance: {error}"))?;
+        writer
+            .flush()
+            .map_err(|error| format!("failed to flush failed-run provenance: {error}"))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|error| format!("failed to sync failed-run provenance: {error}"))?;
         fs::rename(&temporary_path, &final_path).map_err(|error| {
             format!(
                 "failed to atomically publish failed-run provenance '{}': {error}",
@@ -2138,7 +2132,7 @@ fn write_terminal_cpu_adaptive_attempts(
         .map_err(|error| format!("failed to open '{}': {error}", path.display()))?;
     let mut attempts = BufWriter::new(file);
     if write_header {
-        writeln!(attempts, "attempt,target_step,t_s,dt_attempt_s,eta,max_norm_defect,max_spin_rotation_rad,decision,reason,dt_next_s,demag_solves,demag_iterations,demag_residual,rhs_evals,estimator_order")
+        writeln!(attempts, "attempt,target_step,t_s,dt_attempt_s,eta,max_norm_defect,max_spin_rotation_rad,decision,reason,dt_next_s,demag_solves,demag_iterations,demag_residual,rhs_evals,estimator_order,adaptive_controller_policy_version,error_norm_type,active_node_count,active_measure,normalization_denominator,max_scaled_error,weighted_rms_error")
             .map_err(|error| format!("failed to write '{}': {error}", path.display()))?;
     }
     for record in &batch.records[..batch.count] {
@@ -2151,7 +2145,7 @@ fn write_terminal_cpu_adaptive_attempts(
         };
         writeln!(
             attempts,
-            "{},{},{:.17e},{:.17e},{:.17e},,,{},{},{:.17e},{},0,{:.17e},{},{}",
+            "{},{},{:.17e},{:.17e},{:.17e},,,{},{},{:.17e},{},0,{:.17e},{},{},{},,,,,,",
             record.attempt,
             batch.target_step,
             batch.time,
@@ -2164,6 +2158,7 @@ fn write_terminal_cpu_adaptive_attempts(
             0.0,
             record.rhs_evals,
             batch.estimator_order,
+            record.controller_policy_version,
         )
         .map_err(|error| format!("failed to write '{}': {error}", path.display()))?;
     }
@@ -2285,6 +2280,7 @@ mod tests {
             source_hash: None,
             execution_mode: fullmag_ir::ExecutionMode::Strict,
             layout: serde_json::json!({"kind": "fdm", "cell_count": 1}),
+            magnetization_field_semantics: Ok(None),
             execution_resolution: None,
         };
         let pipeline = ArtifactPipeline::start(output_dir.clone(), context, 2)
@@ -2294,8 +2290,9 @@ mod tests {
             precision: "double".into(),
             ..ExecutionProvenance::default()
         };
-        provenance.fdm_gpu_execution_receipt =
-            Some(crate::types::FdmGpuExecutionReceipt::strict_unvalidated("double"));
+        provenance.fdm_gpu_execution_receipt = Some(
+            crate::types::FdmGpuExecutionReceipt::strict_unvalidated("double"),
+        );
         let mut recorder = ArtifactRecorder::streaming(provenance, pipeline.sender());
         let primary = RunError {
             message: "injected failure after create/step".into(),
@@ -2312,11 +2309,13 @@ mod tests {
                 .expect("durable failed-run provenance"),
         )
         .expect("valid failed-run provenance JSON");
-        assert_eq!(document["schema_version"], "fullmag_failed_run_provenance.v1");
+        assert_eq!(
+            document["schema_version"],
+            "fullmag_failed_run_provenance.v1"
+        );
         assert_eq!(document["primary_error"], primary.message);
         assert_eq!(
-            document["execution_provenance"]["fdm_gpu_execution_receipt"]
-                ["validation_state"],
+            document["execution_provenance"]["fdm_gpu_execution_receipt"]["validation_state"],
             "unvalidated"
         );
         for success_marker in ["metadata.json", "manifest.json", "run-result.json"] {
@@ -2345,6 +2344,7 @@ mod tests {
     fn terminal_attempt_batch(target_step: u64) -> CpuAdaptiveAttemptBatch {
         CpuAdaptiveAttemptBatch::new(
             &[AdaptiveAttemptRecord {
+                controller_policy_version: fullmag_engine::FDM_ADAPTIVE_CONTROLLER_POLICY_VERSION,
                 attempt: 1,
                 dt_attempt: 1e-12,
                 normalized_error: 2.0,
@@ -2510,7 +2510,9 @@ mod tests {
                 Duration::from_millis(25),
             )
             .expect_err("full queue must time out");
-        assert!(error.message.contains("enqueueing artifact provenance update"));
+        assert!(error
+            .message
+            .contains("enqueueing artifact provenance update"));
         drop(receiver);
     }
 
@@ -2525,7 +2527,9 @@ mod tests {
                 Duration::from_millis(25),
             )
             .expect_err("disconnected queue must fail");
-        assert!(error.message.contains("before provenance update was queued"));
+        assert!(error
+            .message
+            .contains("before provenance update was queued"));
     }
 
     #[test]
@@ -2543,7 +2547,9 @@ mod tests {
                 Duration::from_millis(25),
             )
             .expect_err("stalled acknowledgement must time out");
-        assert!(error.message.contains("waiting for artifact provenance update"));
+        assert!(error
+            .message
+            .contains("waiting for artifact provenance update"));
         stalled.join().expect("stalled receiver exits");
     }
 
@@ -2563,6 +2569,7 @@ mod tests {
             source_hash: None,
             execution_mode: fullmag_ir::ExecutionMode::Strict,
             layout: serde_json::json!({"kind": "fem", "node_count": 2}),
+            magnetization_field_semantics: Ok(None),
             execution_resolution: None,
         };
         let mut pipeline = ArtifactPipeline::start(output_dir.clone(), context, 2)
@@ -2638,6 +2645,7 @@ mod tests {
             source_hash: None,
             execution_mode: fullmag_ir::ExecutionMode::Strict,
             layout: serde_json::json!({"kind": "fdm", "grid": [2, 1, 1]}),
+            magnetization_field_semantics: Ok(None),
             execution_resolution: None,
         };
         let info = NativeVectorSnapshotInfo {
@@ -2709,6 +2717,7 @@ mod tests {
             source_hash: None,
             execution_mode: fullmag_ir::ExecutionMode::Strict,
             layout: serde_json::json!({"kind": "fdm", "grid": [1, 1, 1]}),
+            magnetization_field_semantics: Ok(None),
             execution_resolution: None,
         };
         let execution_context =
@@ -2803,6 +2812,7 @@ mod tests {
             source_hash: None,
             execution_mode: fullmag_ir::ExecutionMode::Strict,
             layout: serde_json::json!({"kind": "fdm", "grid": [1, 1, 1]}),
+            magnetization_field_semantics: Ok(None),
             execution_resolution: None,
         };
         let stage_autosave = StageAutosavePipelineConfig {
@@ -2919,6 +2929,7 @@ mod tests {
             source_hash: None,
             execution_mode: fullmag_ir::ExecutionMode::Strict,
             layout: serde_json::json!({"kind": "fem", "node_count": 1}),
+            magnetization_field_semantics: Ok(None),
             execution_resolution: None,
         };
         let stage_autosave = StageAutosavePipelineConfig {
@@ -3012,18 +3023,14 @@ mod tests {
                 .expect("valid terminal FEM snapshot"),
             )
             .expect("enqueue terminal FEM snapshot after receipt update");
-        let expected_full_provenance = crate::artifacts::artifact_provenance_json(
-            &context,
-            &recorder.provenance_snapshot(),
-        );
+        let expected_full_provenance =
+            crate::artifacts::artifact_provenance_json(&context, &recorder.provenance_snapshot());
         drop(recorder);
         pipeline.finish().expect("finish streaming pipeline");
 
         let zattrs: serde_json::Value = serde_json::from_slice(
-            &fs::read(autosave_root.join(
-                "state.zarr/stages/stage_0000_relax/fields/m/.zattrs",
-            ))
-            .expect("read streamed FEM field zattrs"),
+            &fs::read(autosave_root.join("state.zarr/stages/stage_0000_relax/fields/m/.zattrs"))
+                .expect("read streamed FEM field zattrs"),
         )
         .expect("decode streamed FEM field zattrs");
         let root_zattrs: serde_json::Value = serde_json::from_slice(
@@ -3032,10 +3039,8 @@ mod tests {
         )
         .expect("decode existing autosave root zattrs");
         let stage_manifest: serde_json::Value = serde_json::from_slice(
-            &fs::read(autosave_root.join(
-                "state.zarr/stages/stage_0000_relax/manifest.json",
-            ))
-            .expect("read finished stage manifest"),
+            &fs::read(autosave_root.join("state.zarr/stages/stage_0000_relax/manifest.json"))
+                .expect("read finished stage manifest"),
         )
         .expect("decode finished stage manifest");
         assert_eq!(root_zattrs["provenance"], expected_full_provenance);

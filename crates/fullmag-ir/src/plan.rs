@@ -3,15 +3,17 @@ use crate::{
     AdaptiveTimeStepIR, AntennaSpatialProfileIR, BackendTarget, CurrentModuleIR, DomainFrameIR,
     EigenDampingPolicyIR, EigenNormalizationIR, EigenOperatorConfigIR, EigenTargetIR,
     EquilibriumSourceIR, ExchangeBoundaryCondition, ExecutionMode, ExecutionPrecision,
-    FdmDemagPeriodicityIR, FdmMultilayerPlanIR, FdmPeriodicityIR, FemDomainMeshAssetIR,
-    FemLinearSolverPolicy, FemSharedDomainBuildReportIR, FieldRefreshPolicyIR,
-    FrequencyExcitationIR, FrequencyResponseNormalizationIR, FrequencySweepIR, GeometryEntryIR,
-    IntegratorChoice, KSamplingIR, MagnetostrictionLawIR, MaterialFieldLocationIR, MaterialIR,
+    FdmDemagPeriodicityIR, FdmMultilayerPlanIR, FdmPeriodicityIR, FdmPrecisionPolicyIR,
+    FdmProjectionPolicyIR, FemConnectivityIR, FemDomainMeshAssetIR, FemLinearSolverPolicy,
+    FemSharedDomainBuildReportIR, FieldRefreshPolicyIR, FieldTargetIR, FrequencyExcitationIR,
+    FrequencyResponseNormalizationIR, FrequencySweepIR, GeometryEntryIR, IntegratorChoice,
+    KSamplingIR, MagnetostrictionLawIR, MaterialFieldLocationIR, MaterialIR,
     MaterialParameterNameIR, MechanicalBoundaryConditionIR, MechanicalLoadIR, MeshIR,
     ModeTrackingIR, OerstedRealization, OutputIR, PrescribedSotV1DriveIR, RegionRefIR,
-    RegionalFieldDriveIR, RelaxStopIR, RelaxationAlgorithmIR, ResolvedFdmGpuChargeTransportIR,
-    ResolvedPeriodicImagesIR, ResolvedSpinTransportPlanIR, SeedPolicy, SpinWaveBoundaryConditionIR,
-    ThermalSeedConfig, TimeDependenceIR, TimeEnvelopeIR,
+    RegionalFieldDriveIR, RelaxStopIR, RelaxationAlgorithmIR, ResolvedChargeTransportPlanIR,
+    ResolvedFdmGpuChargeTransportIR, ResolvedPeriodicImagesIR, ResolvedSpinTransportPlanIR,
+    SeedPolicy, SolvedAntennaDriveIR, SpinWaveBoundaryConditionIR, StudyKindIR, ThermalSeedConfig,
+    TimeDependenceIR, TimeEnvelopeIR,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
@@ -29,6 +31,67 @@ pub struct ExecutionPlanIR {
     pub common: CommonPlanMeta,
     pub backend_plan: BackendPlanIR,
     pub output_plan: OutputPlanIR,
+    pub provenance: ProvenancePlanIR,
+}
+
+pub const ANTENNA_FIELD_SOLVE_PLAN_SCHEMA_VERSION: &str = "antenna_field_solve_plan.v1";
+
+/// FEM conductor-only payload owned by an antenna field precomputation stage.
+///
+/// This is deliberately smaller than [`FemPlanIR`]: it has no magnetization,
+/// material-energy, time-integrator, or relaxation state and therefore cannot
+/// be executed by an LLG runner accidentally.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AntennaConductorFemPlanIR {
+    pub mesh_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mesh_source: Option<String>,
+    pub mesh: MeshIR,
+    pub object_segments: Vec<FemObjectSegmentIR>,
+    pub mesh_parts: Vec<FemMeshPartIR>,
+    pub fe_order: u32,
+    pub hmax: f64,
+    pub charge_transport_plans: Vec<ResolvedChargeTransportPlanIR>,
+    pub oersted_realization: OerstedRealization,
+}
+
+/// Explicit carrier on which the per-ampere antenna field is evaluated.
+/// It is independent from the conductor mesh carrying electric potential and
+/// current density.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AntennaFieldSamplingPlanIR {
+    pub domain: FieldTargetIR,
+    pub carrier_kind: String,
+    pub location: String,
+    pub topology_digest: String,
+    pub positions_xyz_m: Vec<[f64; 3]>,
+    /// Full connectivity of the sampling carrier when it is available.
+    ///
+    /// Older serialized plans omitted this field; an empty connectivity keeps
+    /// those plans readable but prevents FEM element interpolation at runtime.
+    #[serde(default = "crate::FemConnectivityIR::empty")]
+    pub cells: FemConnectivityIR,
+}
+
+/// Dedicated static antenna precomputation plan.
+///
+/// This wrapper deliberately cannot be passed to the ordinary LLG runner as
+/// an `ExecutionPlanIR`.  Its only executable payload is the resolved FEM
+/// charge/RT0/Oersted plan for one independently normalized port basis.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct AntennaFieldSolvePlanIR {
+    pub schema_version: String,
+    pub stage_id: String,
+    pub port_mode_id: String,
+    pub source_object_id: String,
+    pub solution_id: String,
+    pub common: CommonPlanMeta,
+    pub conductor: AntennaConductorFemPlanIR,
+    pub field_sampling: AntennaFieldSamplingPlanIR,
+    pub target_refs: Vec<FieldTargetIR>,
     pub provenance: ProvenancePlanIR,
 }
 
@@ -265,11 +328,20 @@ fn resolved_frozen_mask_sha256(mask: &[bool]) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BackendPlanIR {
+    AntennaExternalLeadInspection(AntennaExternalLeadInspectionBackendPlanIR),
     Fdm(FdmPlanIR),
     FdmMultilayer(FdmMultilayerPlanIR),
     Fem(FemPlanIR),
     FemEigen(FemEigenPlanIR),
     FemFrequencyResponse(FemFrequencyResponsePlanIR),
+}
+
+/// A standalone charge/current/Oersted inspection, not a magnetic FEM plan.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AntennaExternalLeadInspectionBackendPlanIR {
+    pub input: crate::ResolvedAntennaExternalLeadCurrentInputIR,
+    pub requested_execution: crate::RequestedTransportExecutionIR,
+    pub output_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -644,12 +716,44 @@ pub struct ResolvedRegionalFieldDriveBasisIR {
     pub projection_signature: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolvedSolvedAntennaDriveBasisIR {
+    pub drive: SolvedAntennaDriveIR,
+    pub solution_id: String,
+    pub source_object_id: String,
+    /// Immutable projected Oersted field basis in A/m per A. Runtime only
+    /// evaluates the authored scalar current waveform at integrator stage time.
+    pub field_xyz_apm_per_a: Vec<[f64; 3]>,
+    pub projection_signature: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct TimeStageContextIR {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_stage_id: Option<String>,
     #[serde(default)]
     pub start_time_s: f64,
+    /// Absolute origin of stage-local waveforms. None preserves legacy plans.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waveform_origin_time_s: Option<f64>,
+    /// Semantic study family used by stage-scoped drive activation.  Missing
+    /// values from older serialized plans remain `Unknown` and therefore do
+    /// not enable an `AllTimeEvolution` drive accidentally.
+    #[serde(default, skip_serializing_if = "StudyKindIR::is_unknown")]
+    pub study_kind: StudyKindIR,
+}
+
+impl TimeStageContextIR {
+    pub fn waveform_origin_time_s(&self) -> f64 {
+        self.waveform_origin_time_s.unwrap_or(self.start_time_s)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FdmFftPlanIR {
+    /// Canonical authoring request. Runtime resolution must preserve this
+    /// value and fail closed instead of substituting an unavailable backend.
+    pub requested_backend: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -683,6 +787,8 @@ pub struct FdmPlanIR {
     pub material: FdmMaterialIR,
     pub enable_exchange: bool,
     pub enable_demag: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fft: Option<FdmFftPlanIR>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub external_field: Option<[f64; 3]>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -693,6 +799,8 @@ pub struct FdmPlanIR {
     pub field_drives: Vec<RegionalFieldDriveIR>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub regional_field_drive_bases: Vec<ResolvedRegionalFieldDriveBasisIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub solved_antenna_drive_bases: Vec<ResolvedSolvedAntennaDriveBasisIR>,
     #[serde(default)]
     pub time_stage: TimeStageContextIR,
     /// Explicit inter-region exchange coupling overrides.
@@ -706,6 +814,9 @@ pub struct FdmPlanIR {
     pub inter_region_exchange: Vec<(u32, u32, f64)>,
     pub gyromagnetic_ratio: f64,
     pub precision: ExecutionPrecision,
+    /// Planner-resolved storage/compute/FFT/reduction precision contract.
+    #[serde(default)]
+    pub precision_policy: FdmPrecisionPolicyIR,
     pub exchange_bc: ExchangeBoundaryCondition,
     /// Periodic boundary conditions configuration.
     /// `None` means fully open (no PBC), equivalent to `axes: [Open, Open, Open]`.
@@ -718,6 +829,10 @@ pub struct FdmPlanIR {
     pub resolved_periodic_images: Option<ResolvedPeriodicImagesIR>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integrator: Option<IntegratorChoice>,
+    /// Resolved projected-RK state constraint.  Legacy plans with no field
+    /// resolve to the qualified `unit_sphere` policy in the runner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_policy: Option<FdmProjectionPolicyIR>,
     pub fixed_timestep: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adaptive_timestep: Option<AdaptiveTimeStepIR>,
@@ -881,6 +996,9 @@ pub struct FdmPlanIR {
     /// Interfacial DMI constant D [J/m²]. None = disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interfacial_dmi: Option<f64>,
+    /// Rotated interfacial DMI constant D [J/m²]. None = disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotated_interfacial_dmi: Option<f64>,
     /// Bulk (Bloch) DMI constant D [J/m²]. None = disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bulk_dmi: Option<f64>,
@@ -981,6 +1099,7 @@ pub struct FemObjectSegmentIR {
 pub enum FemMeshPartRole {
     Air,
     MagneticObject,
+    Conductor,
     Interface,
     OuterBoundary,
 }
@@ -1287,6 +1406,8 @@ pub struct FemPlanIR {
     /// their spatial basis against the realized mesh.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub field_drives: Vec<RegionalFieldDriveIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub solved_antenna_drive_bases: Vec<ResolvedSolvedAntennaDriveBasisIR>,
     /// Closed geometry trees referenced by regional-drive geometry masks.
     /// Native FEM consumes these descriptors and owns spatial projection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1295,6 +1416,9 @@ pub struct FemPlanIR {
     pub time_stage: TimeStageContextIR,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub current_modules: Vec<CurrentModuleIR>,
+    /// Standalone charge-only plans are distinct from spin transport plans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub charge_transport_plans: Vec<ResolvedChargeTransportPlanIR>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub spin_transport_plans: Vec<ResolvedSpinTransportPlanIR>,
     pub gyromagnetic_ratio: f64,
@@ -1315,6 +1439,8 @@ pub struct FemPlanIR {
     pub air_box_config: Option<AirBoxConfigIR>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interfacial_dmi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotated_interfacial_dmi: Option<f64>,
     /// Interface normal direction for interfacial DMI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dmi_interface_normal: Option<[f64; 3]>,
@@ -1419,6 +1545,90 @@ pub struct FemPlanIR {
     pub use_consistent_mass: Option<bool>,
 }
 
+/// Empty, non-executable FEM plan scaffold for programmatic builders.
+/// Concrete callers must install a valid mesh, material, timestep and
+/// integrator before dispatch; runtime validation remains fail-closed.
+impl Default for FemPlanIR {
+    fn default() -> Self {
+        Self {
+            mesh_name: String::new(),
+            mesh_source: None,
+            mesh: MeshIR::default(),
+            object_segments: Vec::new(),
+            mesh_parts: Vec::new(),
+            mesh_build_report: None,
+            domain_mesh_mode: FemDomainMeshModeIR::default(),
+            domain_frame: None,
+            fe_order: 0,
+            hmax: 0.0,
+            initial_magnetization: Vec::new(),
+            frozen_spins: None,
+            material: MaterialIR::default(),
+            anisotropy_axis_field: None,
+            ms_element_field: None,
+            a_element_field: None,
+            region_materials: Vec::new(),
+            enable_exchange: false,
+            enable_demag: false,
+            external_field: None,
+            antenna_zeeman_masks: Vec::new(),
+            field_drives: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
+            field_drive_geometry_masks: Vec::new(),
+            time_stage: TimeStageContextIR::default(),
+            current_modules: Vec::new(),
+            charge_transport_plans: Vec::new(),
+            spin_transport_plans: Vec::new(),
+            gyromagnetic_ratio: 0.0,
+            precision: ExecutionPrecision::default(),
+            exchange_bc: ExchangeBoundaryCondition::default(),
+            integrator: None,
+            fixed_timestep: None,
+            adaptive_timestep: None,
+            field_refresh: None,
+            relaxation: None,
+            demag_realization: None,
+            air_box_config: None,
+            interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
+            dmi_interface_normal: None,
+            bulk_dmi: None,
+            dind_field: None,
+            dbulk_field: None,
+            temperature: None,
+            current_density: None,
+            stt_degree: None,
+            stt_beta: None,
+            stt_spin_polarization: None,
+            stt_lambda: None,
+            stt_epsilon_prime: None,
+            stt_thickness: None,
+            stt_fixed_layer_position: None,
+            spin_torque_contract: None,
+            has_oersted_cylinder: false,
+            oersted_current: None,
+            oersted_radius: None,
+            oersted_center: None,
+            oersted_axis: None,
+            oersted_field_xyz: None,
+            oersted_time_dep_kind: 0,
+            oersted_time_dep_freq: 0.0,
+            oersted_time_dep_phase: 0.0,
+            oersted_time_dep_offset: 0.0,
+            oersted_time_dep_t_on: 0.0,
+            oersted_time_dep_t_off: 0.0,
+            magnetoelastic: None,
+            mechanics: None,
+            demag_solver_policy: None,
+            thermal_seed_config: None,
+            oersted_realization: None,
+            gpu_device_index: None,
+            mfem_device_string: None,
+            use_consistent_mass: None,
+        }
+    }
+}
+
 /// Prescribed-strain magnetoelastic coupling plan for FEM backend.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FemMagnetoelasticPlanIR {
@@ -1493,6 +1703,23 @@ pub struct FemEigenDispersionValidationIR {
     pub scenarios: Vec<FemEigenDispersionValidationScenarioIR>,
 }
 
+/// Optional native modal-solver controls carried by a resolved FEM eigen plan.
+///
+/// An omitted value delegates resolution to the native PETSc/SLEPc adapter.
+/// This keeps backend defaults observable instead of silently imposing a
+/// runner-side iteration cap.  Values supplied here are requested limits,
+/// while the native diagnostics remain the authority for resolved limits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FemEigenSolverPolicyIR {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub residual_tolerance: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_outer_iterations: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_linear_iterations: Option<u32>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct FemEigenK0KittelValidationMaterialIR {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1526,6 +1753,56 @@ pub struct FemEigenK0KittelValidationIR {
     pub samples: Vec<FemEigenK0KittelValidationSampleIR>,
 }
 
+/// Planner-visible engine identity for the bounded FEM K0 periodic-airbox modal lane.
+///
+/// `Auto` is valid only as requested intent. Resolved plans always carry one
+/// concrete CPU or GPU engine.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FemEigenEngineIR {
+    Auto,
+    K0PoissonAirboxCpuSchurSlepc,
+    /// Bounded CPU engine for the nonzero-k Floquet dynamic-demag lane.
+    ///
+    /// The k-dependent demagnetization operator is assembled by the native
+    /// shared-domain Poisson-airbox provider and consumed by the dense
+    /// SLEPc modal adapter.  It is intentionally distinct from the k=0
+    /// Schur engine so provenance cannot collapse the two physical problems.
+    FloquetAirboxCpuSchurSlepc,
+    /// Canonical planner identity for the production GPU modal lane.
+    ///
+    /// The native PETSc/SLEPc adapter remains an implementation detail of
+    /// this engine and is therefore not exposed as the resolved planner
+    /// contract. Older provenance documents may still contain the legacy
+    /// adapter token; it is accepted on input but never emitted.
+    #[serde(alias = "k0_poisson_airbox_gpu_petsc_slepc")]
+    GpuModalDeviceKrylov,
+}
+
+/// Requested and resolved execution identity emitted after K0 legality checks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FemEigenExecutionResolutionIR {
+    pub requested_device: crate::ExecutionDevice,
+    pub resolved_device: crate::ExecutionDevice,
+    pub requested_precision: ExecutionPrecision,
+    pub resolved_precision: ExecutionPrecision,
+    pub requested_engine: FemEigenEngineIR,
+    pub resolved_engine: FemEigenEngineIR,
+    pub fallback_used: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+    pub selection_reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FemEigenBiasFieldSamplePlanIR {
+    pub sample_index: u32,
+    pub field_a_per_m: [f64; 3],
+    pub equilibrium_policy: crate::BiasFieldSweepEquilibriumPolicyIR,
+    pub continuation_seed: crate::BiasFieldSweepContinuationSeedIR,
+    pub execution: FemEigenExecutionResolutionIR,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FemEigenPlanIR {
     pub mesh_name: String,
@@ -1552,6 +1829,8 @@ pub struct FemEigenPlanIR {
     pub equilibrium: EquilibriumSourceIR,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub k_sampling: Option<KSamplingIR>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bias_field_samples: Vec<FemEigenBiasFieldSamplePlanIR>,
     pub normalization: EigenNormalizationIR,
     pub damping_policy: EigenDampingPolicyIR,
     pub enable_exchange: bool,
@@ -1582,6 +1861,8 @@ pub struct FemEigenPlanIR {
     pub dispersion_validation: Option<FemEigenDispersionValidationIR>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub k0_kittel_validation: Option<FemEigenK0KittelValidationIR>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solver_policy: Option<FemEigenSolverPolicyIR>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1931,6 +2212,9 @@ pub struct ProvenancePlanIR {
     pub notes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub integrator_resolution: Option<IntegratorResolutionProvenanceIR>,
+    /// Present only for the bounded K0 periodic-airbox FEM eigen planner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fem_eigen_execution_resolution: Option<FemEigenExecutionResolutionIR>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physics_graph: Option<PhysicsGraphRuntimeProvenanceIR>,
 }
@@ -1940,12 +2224,65 @@ mod tests {
     use sha2::{Digest, Sha256};
 
     use super::{
-        FdmGridCertificateIR, FdmPlanIR, FdmRegionLegendEntryIR, FemMeshTopologyFamilyIR,
+        FdmGridCertificateIR, FdmPlanIR, FdmRegionLegendEntryIR, FemEigenEngineIR,
+        FemEigenExecutionResolutionIR, FemEigenSolverPolicyIR, FemMeshTopologyFamilyIR,
         FemMixedTopologyCapabilityStatusIR, FemMixedTopologyProvenanceIR, RequestedFemDemagIR,
         ResolvedFemDemagIR, ResolvedFrozenSpinsPlanIR, SelectionAuthoredFingerprintIR,
         SelectionCertificateIR, RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION,
+        TimeStageContextIR,
         SELECTION_CERTIFICATE_SCHEMA_VERSION,
     };
+
+    #[test]
+    fn fem_eigen_solver_policy_preserves_partial_fields_and_rejects_unknown_fields() {
+        let policy: FemEigenSolverPolicyIR = serde_json::from_value(serde_json::json!({
+            "residual_tolerance": 1.0e-8,
+            "max_outer_iterations": 24,
+        }))
+        .expect("known partial modal policy deserializes");
+        assert_eq!(
+            policy,
+            FemEigenSolverPolicyIR {
+                residual_tolerance: Some(1.0e-8),
+                max_outer_iterations: Some(24),
+                max_linear_iterations: None,
+            }
+        );
+
+        let encoded = serde_json::to_value(&policy).expect("modal policy serializes");
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "residual_tolerance": 1.0e-8,
+                "max_outer_iterations": 24,
+            })
+        );
+        let decoded: FemEigenSolverPolicyIR =
+            serde_json::from_value(encoded).expect("partial modal policy round-trips");
+        assert_eq!(decoded, policy);
+
+        let error = serde_json::from_value::<FemEigenSolverPolicyIR>(serde_json::json!({
+            "residual_tolerence": 1.0e-8,
+        }))
+        .expect_err("misspelled modal policy fields must not be silently ignored");
+        assert!(error.to_string().contains("residual_tolerence"));
+    }
+
+    #[test]
+    fn stage_waveform_origin_defaults_to_segment_start_and_round_trips() {
+        let legacy: TimeStageContextIR = serde_json::from_value(serde_json::json!({
+            "start_time_s": 10.5
+        }))
+        .expect("legacy stage context deserializes");
+        assert_eq!(legacy.waveform_origin_time_s(), 10.5);
+
+        let mut resumed = legacy;
+        resumed.waveform_origin_time_s = Some(10.0);
+        let decoded: TimeStageContextIR =
+            serde_json::from_value(serde_json::to_value(&resumed).unwrap()).unwrap();
+        assert_eq!(decoded.start_time_s, 10.5);
+        assert_eq!(decoded.waveform_origin_time_s(), 10.0);
+    }
 
     fn resolved_frozen_spins_fixture() -> ResolvedFrozenSpinsPlanIR {
         let mut hash = Sha256::new();
@@ -2070,6 +2407,128 @@ mod tests {
         let decoded: FdmPlanIR =
             serde_json::from_value(encoded).expect("legacy FDM plan deserializes");
         assert!(decoded.fdm_gpu_charge_transports.is_empty());
+    }
+
+    #[test]
+    fn fdm_projection_policy_round_trips_with_stable_realization_identity() {
+        let mut plan = FdmPlanIR::default();
+        plan.projection_policy = Some(crate::FdmProjectionPolicyIR::UnitSphere);
+        let encoded = serde_json::to_value(&plan).expect("FDM plan serializes");
+        assert_eq!(encoded["projection_policy"], "unit_sphere");
+
+        let decoded: FdmPlanIR = serde_json::from_value(encoded).expect("FDM plan deserializes");
+        let policy = decoded
+            .projection_policy
+            .expect("projection policy must survive round-trip");
+        assert_eq!(policy.as_str(), "unit_sphere");
+        assert_eq!(
+            policy.realization_version(),
+            crate::FdmProjectionPolicyIR::UNIT_SPHERE_REALIZATION_VERSION
+        );
+    }
+
+    #[test]
+    fn fdm_single_precision_plan_serializes_complete_numeric_policy() {
+        let mut plan = FdmPlanIR::default();
+        plan.precision = ExecutionPrecision::Single;
+        plan.precision_policy = crate::FdmPrecisionPolicyIR::resolve(ExecutionPrecision::Single);
+        let encoded = serde_json::to_value(&plan).expect("FDM plan serializes");
+
+        assert_eq!(encoded["precision_policy"]["storage"], "single");
+        assert_eq!(encoded["precision_policy"]["compute"], "single");
+        assert_eq!(encoded["precision_policy"]["fft"], "single");
+        assert_eq!(encoded["precision_policy"]["reduction"], "double");
+        assert_eq!(
+            encoded["precision_policy"]["realization_id"],
+            "fullmag.fdm.cuda.precision.single_storage_fp64_reduction.v1"
+        );
+
+        let decoded: FdmPlanIR =
+            serde_json::from_value(encoded).expect("precision policy round-trips");
+        decoded
+            .precision_policy
+            .validate_for(decoded.precision)
+            .expect("round-tripped policy remains coherent");
+    }
+
+    #[test]
+    fn fdm_precision_policy_rejects_unqualified_mixed_combination() {
+        let mut policy = crate::FdmPrecisionPolicyIR::resolve(ExecutionPrecision::Single);
+        policy.fft = ExecutionPrecision::Double;
+        let error = policy
+            .validate_for(ExecutionPrecision::Single)
+            .expect_err("arbitrary mixed precision must fail closed");
+        assert!(error.contains("fdm_precision_policy_mismatch"));
+    }
+
+    #[test]
+    fn fem_eigen_execution_resolution_round_trips_stable_typed_tokens() {
+        let resolution = FemEigenExecutionResolutionIR {
+            requested_device: ExecutionDevice::Auto,
+            resolved_device: ExecutionDevice::Gpu,
+            requested_precision: ExecutionPrecision::Double,
+            resolved_precision: ExecutionPrecision::Double,
+            requested_engine: FemEigenEngineIR::Auto,
+            resolved_engine: FemEigenEngineIR::GpuModalDeviceKrylov,
+            fallback_used: false,
+            fallback_reason: None,
+            selection_reason: "fem_eigen.k0_periodic_airbox.auto_runtime_gpu".to_string(),
+        };
+
+        let encoded = serde_json::to_value(&resolution).expect("resolution serializes");
+        assert_eq!(encoded["requested_device"], "auto");
+        assert_eq!(encoded["resolved_device"], "gpu");
+        assert_eq!(encoded["requested_precision"], "double");
+        assert_eq!(encoded["resolved_precision"], "double");
+        assert_eq!(encoded["requested_engine"], "auto");
+        assert_eq!(encoded["resolved_engine"], "gpu_modal_device_krylov");
+        assert_eq!(encoded["fallback_used"], false);
+        assert!(encoded.get("fallback_reason").is_none());
+        let decoded: FemEigenExecutionResolutionIR =
+            serde_json::from_value(encoded).expect("resolution deserializes");
+        assert_eq!(decoded, resolution);
+    }
+
+    #[test]
+    fn fem_eigen_execution_resolution_accepts_legacy_gpu_engine_token() {
+        let encoded = serde_json::json!({
+            "requested_device": "gpu",
+            "resolved_device": "gpu",
+            "requested_precision": "double",
+            "resolved_precision": "double",
+            "requested_engine": "auto",
+            "resolved_engine": "k0_poisson_airbox_gpu_petsc_slepc",
+            "fallback_used": false,
+            "selection_reason": "fem_eigen.k0_periodic_airbox.explicit_gpu"
+        });
+        let decoded: FemEigenExecutionResolutionIR =
+            serde_json::from_value(encoded).expect("legacy GPU token deserializes");
+        assert_eq!(
+            decoded.resolved_engine,
+            FemEigenEngineIR::GpuModalDeviceKrylov
+        );
+        let reencoded = serde_json::to_value(decoded).expect("canonical GPU token serializes");
+        assert_eq!(reencoded["resolved_engine"], "gpu_modal_device_krylov");
+    }
+
+    #[test]
+    fn fem_eigen_execution_resolution_serializes_floquet_dynamic_demag_engine_token() {
+        let resolution = FemEigenExecutionResolutionIR {
+            requested_device: ExecutionDevice::Cpu,
+            resolved_device: ExecutionDevice::Cpu,
+            requested_precision: ExecutionPrecision::Double,
+            resolved_precision: ExecutionPrecision::Double,
+            requested_engine: FemEigenEngineIR::Auto,
+            resolved_engine: FemEigenEngineIR::FloquetAirboxCpuSchurSlepc,
+            fallback_used: false,
+            fallback_reason: None,
+            selection_reason: "fem_eigen.floquet_airbox_dynamic_demag.explicit_cpu".to_string(),
+        };
+        let encoded = serde_json::to_value(&resolution).expect("resolution serializes");
+        assert_eq!(encoded["resolved_engine"], "floquet_airbox_cpu_schur_slepc");
+        let decoded: FemEigenExecutionResolutionIR =
+            serde_json::from_value(encoded).expect("resolution deserializes");
+        assert_eq!(decoded, resolution);
     }
 
     #[test]

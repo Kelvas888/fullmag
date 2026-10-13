@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import copy
 import io
@@ -11,6 +12,7 @@ import subprocess
 import struct
 import sys
 import textwrap
+import threading
 import types
 import unittest
 from dataclasses import replace
@@ -31,10 +33,161 @@ from fullmag.runtime.scene_document import build_builder_from_scene_document
 from fullmag.runtime.scene_document import builder_overrides_from_scene_document
 from fullmag.runtime.script_builder import export_builder_draft, rewrite_loaded_problem_script
 from fullmag.meshing.gmsh_bridge import MeshData
-from fullmag.model.problem import build_geometry_assets_for_request
+from fullmag.model.discretization import PerObjectMeshRecipe
+from fullmag.model.problem import (
+    _fem_mesh_cache_key,
+    _geometry_asset_cache_key,
+    _fem_cache_write_lock,
+    _quarantine_fem_mesh_cache_entry,
+    _save_fem_mesh_cache_atomically,
+    build_geometry_assets_for_request,
+)
 
 
 class ProblemApiTests(unittest.TestCase):
+    def test_fem_order_rejects_boolean_and_noninteger_values(self) -> None:
+        for invalid_order in (True, False, 1.5):
+            with self.subTest(order=invalid_order):
+                with self.assertRaisesRegex(ValueError, "order must be an integer >= 1"):
+                    fm.FEM(order=invalid_order, maximum_element_size=1e-9)
+
+    def test_fem_order_accepts_and_normalizes_numpy_integral(self) -> None:
+        fem = fm.FEM(order=np.int64(1), maximum_element_size=1e-9)
+
+        self.assertEqual(fem.order, 1)
+        self.assertIs(type(fem.order), int)
+
+    def test_fem_eigen_solver_policy_rejects_boolean_residual_tolerance(self) -> None:
+        for residual_tolerance in (True, False):
+            with self.subTest(residual_tolerance=residual_tolerance):
+                with self.assertRaisesRegex(
+                    TypeError,
+                    "residual_tolerance must be a real number",
+                ):
+                    fm.FemEigenSolverPolicy(residual_tolerance=residual_tolerance)
+
+        with self.assertRaisesRegex(
+            ValueError,
+            "residual_tolerance must be finite and positive",
+        ):
+            fm.FemEigenSolverPolicy(residual_tolerance=0.0)
+
+        policy = fm.FemEigenSolverPolicy(
+            residual_tolerance=1e-6,
+            max_outer_iterations=17,
+            max_linear_iterations=29,
+        )
+        self.assertEqual(policy.residual_tolerance, 1e-6)
+        self.assertEqual(policy.max_outer_iterations, 17)
+        self.assertEqual(policy.max_linear_iterations, 29)
+        self.assertEqual(
+            policy.to_ir(),
+            {
+                "residual_tolerance": 1e-6,
+                "max_outer_iterations": 17,
+                "max_linear_iterations": 29,
+            },
+        )
+        self.assertEqual(fm.FemEigenSolverPolicy().to_ir(), {})
+
+    def test_fem_eigen_solver_iteration_fields_match_native_signed_range(self) -> None:
+        max_iterations = 2_147_483_647
+        for field_name in ("max_outer_iterations", "max_linear_iterations"):
+            with self.subTest(field=field_name, bound="maximum"):
+                policy = fm.FemEigenSolverPolicy(**{field_name: max_iterations})
+                self.assertEqual(getattr(policy, field_name), max_iterations)
+                self.assertEqual(policy.to_ir()[field_name], max_iterations)
+
+            with self.subTest(field=field_name, bound="first out of range"):
+                with self.assertRaisesRegex(ValueError, "native signed iteration limit"):
+                    fm.FemEigenSolverPolicy(**{field_name: max_iterations + 1})
+
+            for invalid_value in (0, -1):
+                with self.subTest(field=field_name, value=invalid_value):
+                    with self.assertRaisesRegex(ValueError, "must be positive"):
+                        fm.FemEigenSolverPolicy(**{field_name: invalid_value})
+
+            for invalid_value in (
+                True,
+                False,
+                1.0,
+                1.5,
+                float("nan"),
+                float("inf"),
+                float("-inf"),
+            ):
+                with self.subTest(field=field_name, value=invalid_value):
+                    with self.assertRaises(TypeError):
+                        fm.FemEigenSolverPolicy(**{field_name: invalid_value})
+
+    def test_fem_size_rejects_boolean_values(self) -> None:
+        for field_name, kwargs in (
+            ("maximum_element_size", {"maximum_element_size": True}),
+            ("hmax", {"hmax": True}),
+            (
+                "hmax alongside maximum_element_size",
+                {"maximum_element_size": 1e-9, "hmax": True},
+            ),
+        ):
+            with self.subTest(field=field_name):
+                with self.assertRaisesRegex(TypeError, "not bool"):
+                    fm.FEM(order=1, **kwargs)
+
+    def test_fem_mesh_cache_key_changes_when_imported_source_content_changes_with_same_stat(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            source = Path(tmp_dir) / "shape.stl"
+            source.write_bytes(b"mesh-v1")
+            geometry = fm.ImportedGeometry(source=str(source), name="shape")
+            hints = fm.FEM(order=1, hmax=1e-9)
+            initial_stat = source.stat()
+            initial_key = _fem_mesh_cache_key(geometry, hints)
+
+            source.write_bytes(b"mesh-v2")
+            os.utime(source, ns=(initial_stat.st_atime_ns, initial_stat.st_mtime_ns))
+
+            replacement_stat = source.stat()
+            self.assertEqual(replacement_stat.st_size, initial_stat.st_size)
+            self.assertEqual(replacement_stat.st_mtime_ns, initial_stat.st_mtime_ns)
+            self.assertNotEqual(_fem_mesh_cache_key(geometry, hints), initial_key)
+
+    def test_geometry_asset_cache_key_changes_when_imported_source_content_changes_with_same_stat(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            source = Path(tmp_dir) / "shape.stl"
+            source.write_bytes(b"mesh-v1")
+            geometry = fm.ImportedGeometry(source=str(source), name="shape")
+            discretization = fm.DiscretizationHints(fem=fm.FEM(order=1, hmax=1e-9))
+            initial_stat = source.stat()
+            initial_key = _geometry_asset_cache_key(
+                requested_backend=fm.BackendTarget.FEM,
+                geometries=[geometry],
+                discretization=discretization,
+                study_universe=None,
+                mesh_workflow=None,
+                per_object_recipes=None,
+                object_regions=None,
+                fdm_only=False,
+            )
+
+            source.write_bytes(b"mesh-v2")
+            os.utime(source, ns=(initial_stat.st_atime_ns, initial_stat.st_mtime_ns))
+
+            replacement_stat = source.stat()
+            self.assertEqual(replacement_stat.st_size, initial_stat.st_size)
+            self.assertEqual(replacement_stat.st_mtime_ns, initial_stat.st_mtime_ns)
+            self.assertNotEqual(
+                _geometry_asset_cache_key(
+                    requested_backend=fm.BackendTarget.FEM,
+                    geometries=[geometry],
+                    discretization=discretization,
+                    study_universe=None,
+                    mesh_workflow=None,
+                    per_object_recipes=None,
+                    object_regions=None,
+                    fdm_only=False,
+                ),
+                initial_key,
+            )
+
     def test_geometry_asset_cache_copies_by_default_and_can_be_borrowed_internally(self) -> None:
         cached_assets = {"fem_domain_mesh_asset": {"mesh": {"nodes": [[0.0, 0.0, 0.0]]}}}
         cache = {"cached": cached_assets}
@@ -60,6 +213,277 @@ class ProblemApiTests(unittest.TestCase):
         self.assertIs(borrowed, cached_assets)
         copied["fem_domain_mesh_asset"]["mesh"]["nodes"].append([1.0, 0.0, 0.0])
         self.assertEqual(len(cached_assets["fem_domain_mesh_asset"]["mesh"]["nodes"]), 1)
+
+    def test_shared_domain_mesh_persistent_cache_reuses_a_certified_artifact(self) -> None:
+        geometry = fm.Box(size=(10e-9, 10e-9, 10e-9), name="box")
+        discretization = fm.DiscretizationHints(
+            fem=fm.FEM(order=1, maximum_element_size=2e-9),
+        )
+        universe = {
+            "mode": "manual",
+            "size": [20e-9, 20e-9, 20e-9],
+            "center": [0.0, 0.0, 0.0],
+        }
+        mesh = MeshData.from_legacy_tet4(
+            nodes=np.asarray(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0e-9, 0.0, 0.0],
+                    [0.0, 1.0e-9, 0.0],
+                    [0.0, 0.0, 1.0e-9],
+                ]
+            ),
+            elements=np.asarray([[0, 1, 2, 3]], dtype=np.int32),
+            element_markers=np.asarray([1], dtype=np.int32),
+            boundary_faces=np.asarray([[0, 1, 2]], dtype=np.int32),
+            boundary_markers=np.asarray([10], dtype=np.int32),
+        )
+
+        with TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"FULLMAG_FEM_MESH_CACHE_DIR": tmp}
+        ), patch(
+            "fullmag.meshing.asset_pipeline.realize_fem_domain_mesh_asset_from_components_with_report",
+            return_value=(
+                mesh,
+                [{"geometry_name": "box", "marker": 1}],
+                None,
+            ),
+        ) as realize, patch("fullmag._core.validate_mesh_ir", return_value=True):
+            first = build_geometry_assets_for_request(
+                requested_backend=fm.BackendTarget.FEM,
+                geometries=[geometry],
+                discretization=discretization,
+                study_universe=universe,
+            )
+            second = build_geometry_assets_for_request(
+                requested_backend=fm.BackendTarget.FEM,
+                geometries=[geometry],
+                discretization=discretization,
+                study_universe=universe,
+            )
+            cache_files = list(Path(tmp).glob("shared_domains/*.fullmag-mesh"))
+
+        self.assertEqual(realize.call_count, 1)
+        self.assertEqual(
+            first["fem_domain_mesh_asset"]["mesh"]["cells"],
+            second["fem_domain_mesh_asset"]["mesh"]["cells"],
+        )
+        self.assertEqual(len(cache_files), 1)
+
+    def test_shared_domain_mesh_cache_key_rebuilds_when_mesh_inputs_change(self) -> None:
+        geometry = fm.Box(size=(10e-9, 10e-9, 10e-9), name="box")
+        universe = {
+            "mode": "manual",
+            "size": [20e-9, 20e-9, 20e-9],
+            "center": [0.0, 0.0, 0.0],
+        }
+        mesh = MeshData.from_legacy_tet4(
+            nodes=np.asarray(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0e-9, 0.0, 0.0],
+                    [0.0, 1.0e-9, 0.0],
+                    [0.0, 0.0, 1.0e-9],
+                ]
+            ),
+            elements=np.asarray([[0, 1, 2, 3]], dtype=np.int32),
+            element_markers=np.asarray([1], dtype=np.int32),
+            boundary_faces=np.asarray([[0, 1, 2]], dtype=np.int32),
+            boundary_markers=np.asarray([10], dtype=np.int32),
+        )
+        with TemporaryDirectory() as tmp, patch.dict(
+            os.environ, {"FULLMAG_FEM_MESH_CACHE_DIR": tmp}
+        ), patch(
+            "fullmag.meshing.asset_pipeline.realize_fem_domain_mesh_asset_from_components_with_report",
+            return_value=(
+                mesh,
+                [{"geometry_name": "box", "marker": 1}],
+                None,
+            ),
+        ) as realize, patch("fullmag._core.validate_mesh_ir", return_value=True):
+            build_geometry_assets_for_request(
+                requested_backend=fm.BackendTarget.FEM,
+                geometries=[geometry],
+                discretization=fm.DiscretizationHints(
+                    fem=fm.FEM(order=1, maximum_element_size=2e-9)
+                ),
+                study_universe=universe,
+            )
+            build_geometry_assets_for_request(
+                requested_backend=fm.BackendTarget.FEM,
+                geometries=[geometry],
+                discretization=fm.DiscretizationHints(
+                    fem=fm.FEM(order=1, maximum_element_size=3e-9)
+                ),
+                study_universe=universe,
+            )
+
+        self.assertEqual(realize.call_count, 2)
+
+    def test_per_object_fem_cache_publish_is_atomic_and_reloadable(self) -> None:
+        mesh = MeshData.from_legacy_tet4(
+            nodes=np.asarray(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0e-9, 0.0, 0.0],
+                    [0.0, 1.0e-9, 0.0],
+                    [0.0, 0.0, 1.0e-9],
+                ]
+            ),
+            elements=np.asarray([[0, 1, 2, 3]], dtype=np.int32),
+            element_markers=np.asarray([1], dtype=np.int32),
+            boundary_faces=np.asarray([[0, 1, 2]], dtype=np.int32),
+            boundary_markers=np.asarray([10], dtype=np.int32),
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "object.npz"
+            _save_fem_mesh_cache_atomically(mesh, target)
+
+            restored = MeshData.load(target)
+            self.assertEqual(restored.n_nodes, mesh.n_nodes)
+            self.assertEqual(restored.n_elements, mesh.n_elements)
+            self.assertEqual(list(root.glob(".*.npz.*")), [])
+
+            original_bytes = target.read_bytes()
+
+            class FailingMesh:
+                def save(self, _path: Path) -> None:
+                    raise RuntimeError("simulated interrupted writer")
+
+            with self.assertRaisesRegex(RuntimeError, "interrupted writer"):
+                _save_fem_mesh_cache_atomically(FailingMesh(), target)  # type: ignore[arg-type]
+            self.assertEqual(target.read_bytes(), original_bytes)
+            self.assertEqual(list(root.glob(".*.npz.*")), [])
+
+    def test_fem_cache_key_binds_import_bytes_and_source_snapshot(self) -> None:
+        with TemporaryDirectory() as tmp:
+            source = Path(tmp) / "shape.stl"
+            source.write_bytes(b"solid a\nendsolid a\n")
+            geometry = fm.ImportedGeometry(source=str(source), volume="surface")
+            hints = fm.FEM(order=1, maximum_element_size=2e-9)
+
+            with patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("FULLMAG_SOURCE_SNAPSHOT_SHA256", None)
+                first = _fem_mesh_cache_key(geometry, hints)
+                source.write_bytes(b"solid b\nendsolid b\n")
+                second = _fem_mesh_cache_key(geometry, hints)
+            self.assertNotEqual(first, second)
+
+            source.write_bytes(b"solid c\nendsolid c\n")
+            with patch.dict(
+                os.environ,
+                {"FULLMAG_SOURCE_SNAPSHOT_SHA256": "a" * 64},
+            ):
+                third = _fem_mesh_cache_key(geometry, hints)
+            self.assertNotEqual(second, third)
+
+    def test_corrupt_fem_cache_entry_is_quarantined_without_deletion(self) -> None:
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "broken.npz"
+            target.write_bytes(b"partial archive")
+
+            quarantined = _quarantine_fem_mesh_cache_entry(
+                target,
+                reason="test-corrupt-entry",
+            )
+
+            self.assertIsNotNone(quarantined)
+            assert quarantined is not None
+            self.assertFalse(target.exists())
+            self.assertEqual(quarantined.read_bytes(), b"partial archive")
+            self.assertTrue(quarantined.name.endswith(".corrupt"))
+            self.assertIsNone(_quarantine_fem_mesh_cache_entry(target, reason="gone"))
+
+    def test_fem_cache_writer_lock_records_owner_and_recovers_stale_lock(self) -> None:
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "object.npz"
+            lock_path = target.with_name(f".{target.name}.lock")
+            with _fem_cache_write_lock(target, timeout_s=1.0):
+                metadata = json.loads(lock_path.read_text(encoding="utf-8"))
+                self.assertEqual(metadata["schema"], "fullmag.fem.cache-lock.v1")
+                self.assertEqual(metadata["target"], str(target))
+                self.assertGreater(int(metadata["pid"]), 0)
+                self.assertGreater(int(metadata["heartbeat_unix_ns"]), 0)
+            self.assertFalse(lock_path.exists())
+
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "schema": "fullmag.fem.cache-lock.v1",
+                        "token": "stale",
+                        "heartbeat_unix_ns": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with _fem_cache_write_lock(
+                target,
+                timeout_s=1.0,
+                stale_after_s=0.001,
+            ):
+                self.assertTrue(lock_path.exists())
+            self.assertFalse(lock_path.exists())
+            self.assertEqual(len(list((Path(tmp) / "quarantine").glob("*.corrupt"))), 1)
+
+    def test_fem_cache_lock_does_not_reclaim_fresh_partial_metadata(self) -> None:
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "object.npz"
+            lock_path = target.with_name(f".{target.name}.lock")
+            # O_EXCL creates the lock before the owner can finish writing its
+            # JSON. A competing reader must wait, not turn that publication
+            # window into a second writer.
+            lock_path.write_bytes(b"")
+            with self.assertRaises(TimeoutError):
+                with _fem_cache_write_lock(
+                    target,
+                    timeout_s=0.05,
+                    stale_after_s=60.0,
+                ):
+                    pass
+            self.assertTrue(lock_path.exists())
+            self.assertEqual(len(list((Path(tmp) / "quarantine").glob("*.corrupt"))), 0)
+
+    def test_fem_cache_writer_lock_serializes_parallel_publishers(self) -> None:
+        with TemporaryDirectory() as tmp:
+            target = Path(tmp) / "object.npz"
+            first_entered = threading.Event()
+            release_first = threading.Event()
+            second_entered = threading.Event()
+            entered: list[int] = []
+            errors: list[BaseException] = []
+
+            def writer(index: int) -> None:
+                try:
+                    with _fem_cache_write_lock(
+                        target,
+                        timeout_s=2.0,
+                        stale_after_s=10.0,
+                    ):
+                        entered.append(index)
+                        if index == 1:
+                            first_entered.set()
+                            if not release_first.wait(2.0):
+                                raise AssertionError("first writer was not released")
+                        else:
+                            second_entered.set()
+                except BaseException as exc:  # pragma: no cover - assertion below reports it
+                    errors.append(exc)
+
+            first = threading.Thread(target=writer, args=(1,))
+            second = threading.Thread(target=writer, args=(2,))
+            first.start()
+            self.assertTrue(first_entered.wait(1.0))
+            second.start()
+            self.assertFalse(second_entered.wait(0.1))
+            release_first.set()
+            first.join(3.0)
+            second.join(3.0)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(entered, [1, 2])
 
     def test_fdm_grid_cache_ignores_region_only_changes(self) -> None:
         geometry = fm.Cylinder(radius=10e-9, height=4e-9, name="film")
@@ -442,6 +866,297 @@ class ProblemApiTests(unittest.TestCase):
         self.assertEqual(ir["materials"][0]["anisotropy_axis"], [0.0, 1.0, 0.0])
         self.assertEqual(ir["energy_terms"], [{"kind": "exchange"}])
 
+    def test_flat_problem_with_rotated_dmi_rewrites_to_study_surface(self) -> None:
+        script = textwrap.dedent(
+            """
+            import fullmag as fm
+
+            DEFAULT_UNTIL = 1e-12
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(name="Py", Ms=800e3, A=13e-12, alpha=0.02)
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="flat_rotated_dmi",
+                    magnets=[magnet],
+                    energy=[fm.Exchange(), fm.RotatedInterfacialDMI(D=3e-3)],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "flat_rotated_dmi.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            rendered = rewrite_loaded_problem_script(loaded)["rendered_source"]
+            rewritten_path = Path(tmp_dir) / "rewritten.py"
+            rewritten_path.write_text(rendered, encoding="utf-8")
+            reloaded = load_problem_from_script(rewritten_path, lightweight_assets=True)
+
+        self.assertIn('study = fm.study("flat_rotated_dmi")', rendered)
+        self.assertIn("study.terms.add(fm.RotatedInterfacialDMI(D=0.003))", rendered)
+        self.assertNotIn("fm.Problem(", rendered)
+        self.assertEqual(
+            reloaded.problem.to_ir(include_geometry_assets=False)["energy_terms"],
+            [
+                {"kind": "exchange"},
+                {"kind": "rotated_interfacial_dmi", "D": 3e-3},
+            ],
+        )
+
+    def test_rotated_dmi_override_validates_effective_mixed_terms(self) -> None:
+        script = textwrap.dedent(
+            """
+            import fullmag as fm
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(name="Py", Ms=800e3, A=13e-12, alpha=0.02)
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="flat_conventional_dmi",
+                    magnets=[magnet],
+                    energy=[fm.Exchange(), fm.InterfacialDMI(D=3e-3)],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "flat_conventional_dmi.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            with self.assertRaisesRegex(ValueError, "mixed conventional and rotated DMI"):
+                rewrite_loaded_problem_script(
+                    loaded,
+                    overrides={"rotated_interfacial_dmi": 3e-3},
+                )
+
+    def test_bulk_and_rotated_dmi_rewrite_fails_closed_without_dropping_bulk_term(self) -> None:
+        script = textwrap.dedent(
+            """
+            import fullmag as fm
+
+            DEFAULT_UNTIL = 1e-12
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(name="Py", Ms=800e3, A=13e-12, alpha=0.02)
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="flat_mixed_bulk_rotated_dmi",
+                    magnets=[magnet],
+                    energy=[
+                        fm.Exchange(),
+                        fm.BulkDMI(D=1e-3),
+                        fm.RotatedInterfacialDMI(D=3e-3),
+                    ],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "mixed_bulk_rotated_dmi.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            with self.assertRaisesRegex(ValueError, "mixed conventional and rotated DMI"):
+                rewrite_loaded_problem_script(loaded)
+
+    def test_material_bulk_dmi_rewrite_preserves_scalar_material_channel(self) -> None:
+        script = textwrap.dedent(
+            """
+            import fullmag as fm
+
+            DEFAULT_UNTIL = 1e-12
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(
+                    name="Py",
+                    Ms=800e3,
+                    A=13e-12,
+                    alpha=0.02,
+                    Dbulk=1e-3,
+                )
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="material_bulk_dmi",
+                    magnets=[magnet],
+                    energy=[fm.Exchange()],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "material_bulk_dmi.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            rendered = rewrite_loaded_problem_script(loaded)["rendered_source"]
+
+        self.assertIn("film.Dbulk = 0.001", rendered)
+
+    def test_material_spatial_dmi_rewrite_fails_closed(self) -> None:
+        script = textwrap.dedent(
+            """
+            import fullmag as fm
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(
+                    name="Py",
+                    Ms=800e3,
+                    A=13e-12,
+                    alpha=0.02,
+                    Dbulk_field=[1e-3, 1.1e-3],
+                )
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="material_spatial_dmi",
+                    magnets=[magnet],
+                    energy=[fm.Exchange()],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "material_spatial_dmi.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            with self.assertRaisesRegex(ValueError, "spatial material DMI fields"):
+                rewrite_loaded_problem_script(loaded)
+
+    def test_material_bulk_dmi_and_rotated_dmi_rewrite_fails_closed(self) -> None:
+        script = textwrap.dedent(
+            """
+            import fullmag as fm
+
+            DEFAULT_UNTIL = 1e-12
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(
+                    name="Py",
+                    Ms=800e3,
+                    A=13e-12,
+                    alpha=0.02,
+                    Dbulk=1e-3,
+                )
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="material_bulk_rotated_dmi",
+                    magnets=[magnet],
+                    energy=[fm.Exchange(), fm.RotatedInterfacialDMI(D=3e-3)],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "material_bulk_rotated_dmi.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            with self.assertRaisesRegex(ValueError, "mixed conventional and rotated DMI"):
+                rewrite_loaded_problem_script(loaded)
+
+    def test_rotated_interfacial_dmi_rewrite_preserves_float_round_trip(self) -> None:
+        d = 0.0012345678901234567
+        script = textwrap.dedent(
+            f"""
+            import fullmag as fm
+
+            DEFAULT_UNTIL = 1e-12
+
+            def build():
+                geometry = fm.Box(size=(20e-9, 10e-9, 5e-9), name="film")
+                material = fm.Material(name="Py", Ms=800e3, A=13e-12, alpha=0.02)
+                magnet = fm.Ferromagnet(
+                    name="film",
+                    geometry=geometry,
+                    material=material,
+                    m0=fm.texture.uniform((1.0, 0.0, 0.0)),
+                )
+                return fm.Problem(
+                    name="flat_rotated_dmi_precision",
+                    magnets=[magnet],
+                    energy=[fm.Exchange(), fm.RotatedInterfacialDMI(D={d!r})],
+                    study=fm.TimeEvolution(
+                        dynamics=fm.LLG(),
+                        outputs=[fm.SaveField("m", every=1e-12)],
+                    ),
+                )
+            """
+        )
+
+        with TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "flat_rotated_dmi_precision.py"
+            source_path.write_text(script, encoding="utf-8")
+            loaded = load_problem_from_script(source_path, lightweight_assets=True)
+            rendered = rewrite_loaded_problem_script(loaded)["rendered_source"]
+            rewritten_path = Path(tmp_dir) / "rewritten.py"
+            rewritten_path.write_text(rendered, encoding="utf-8")
+            reloaded = load_problem_from_script(rewritten_path, lightweight_assets=True)
+
+        self.assertIn(
+            f"study.terms.add(fm.RotatedInterfacialDMI(D={d!r}))",
+            rendered,
+        )
+        rewritten_terms = reloaded.problem.to_ir(include_geometry_assets=False)["energy_terms"]
+        rewritten_d = rewritten_terms[1]["D"]
+        self.assertEqual(rewritten_d.hex(), d.hex())
+
     def test_flat_api_object_region_lowers_to_ir(self) -> None:
         fm.reset()
         fm.engine("fem")
@@ -597,6 +1312,24 @@ class ProblemApiTests(unittest.TestCase):
             "track_geom",
         )
 
+    def test_problem_asset_build_receives_direct_object_mesh_recipe(self) -> None:
+        problem = self._build_problem()
+        recipe = PerObjectMeshRecipe(
+            maximum_element_size=4e-9,
+        )
+        problem = replace(problem, magnets=[replace(problem.magnets[0], mesh=recipe)])
+
+        with patch(
+            "fullmag.model.problem.build_geometry_assets_for_request",
+            return_value=None,
+        ) as build_assets:
+            problem.to_ir(include_geometry_assets=True)
+
+        self.assertEqual(
+            build_assets.call_args.kwargs["per_object_recipes"],
+            {"track": recipe},
+        )
+
     def test_object_region_rejects_zero_ms_override(self) -> None:
         fm.reset()
         layer = fm.geometry(fm.Box(size=(20e-9, 20e-9, 2e-9)), name="film")
@@ -675,7 +1408,6 @@ class ProblemApiTests(unittest.TestCase):
                     first = film.add_region("core", fm.Cylinder(radius=15e-9, height=2e-9))
                     film.remove_region(first)
                     film.add_region("core", fm.Cylinder(radius=20e-9, height=2e-9))
-                    study.exchange()
                     """
                 ).strip()
                 + "\n",
@@ -802,7 +1534,6 @@ class ProblemApiTests(unittest.TestCase):
                     film.Ms = 800e3
                     film.Aex = 13e-12
                     film.add_region("core", fm.Cylinder(radius=15e-9, height=2e-9))
-                    study.exchange()
                     """
                 ).strip()
                 + "\n",
@@ -828,7 +1559,6 @@ class ProblemApiTests(unittest.TestCase):
             region="core",
         )
         study.couplings.exchange(core, shell, coupling_id="core_shell_exchange")
-        study.exchange()
 
         before = flat_world._build_problem().to_ir(include_geometry_assets=False)
         self.assertEqual(len(before["material_parameter_fields"]), 1)
@@ -906,7 +1636,6 @@ class ProblemApiTests(unittest.TestCase):
             J1=-0.3e-3,
             coupling_id="layer_a_layer_b_rkky",
         )
-        study.exchange()
         study.solver(integrator="rk23")
         fm.run(1e-12)
 
@@ -1016,7 +1745,6 @@ class ProblemApiTests(unittest.TestCase):
                         J1=-0.3e-3,
                         coupling_id="film_reference_rkky",
                     )
-                    study.exchange()
                     """
                 ).strip()
                 + "\n",
@@ -1107,7 +1835,6 @@ class ProblemApiTests(unittest.TestCase):
                         inter_exchange=6.5e-12,
                         coupling_id="core_shell_exchange",
                     )
-                    study.exchange()
                     """
                 ).strip()
                 + "\n",
@@ -1231,7 +1958,7 @@ class ProblemApiTests(unittest.TestCase):
         problem = replace(
             self._build_problem(),
             pbc=fm.FdmPbc(
-                axes=(True, False, False),
+                axes=(True, True, False),
                 demag="periodic_airbox_k0",
             ),
         )
@@ -1400,6 +2127,271 @@ class ProblemApiTests(unittest.TestCase):
                 "phase_convention": "exp_minus_i_k_dot_delta_r",
             },
         )
+
+    def test_eigen_diagnostics_flags_require_exact_bools_and_preserve_state(self) -> None:
+        defaults = fm.SaveEigenDiagnostics().to_ir()
+        self.assertEqual(
+            defaults,
+            {
+                "kind": "eigen_diagnostics",
+                "include_tracking": True,
+                "include_residuals": True,
+                "include_overlaps": True,
+                "include_tangent_leakage": True,
+                "include_orthogonality": True,
+            },
+        )
+        explicit = {
+            "include_tracking": False,
+            "include_residuals": True,
+            "include_overlaps": False,
+            "include_tangent_leakage": True,
+            "include_orthogonality": False,
+        }
+        self.assertEqual(
+            fm.SaveEigenDiagnostics(**explicit).to_ir(),
+            {"kind": "eigen_diagnostics", **explicit},
+        )
+
+        for flag in explicit:
+            for invalid in ("false", 0, 1, None):
+                with self.subTest(flag=flag, invalid=invalid):
+                    with self.assertRaises(ValueError):
+                        fm.SaveEigenDiagnostics(**{flag: invalid})
+
+                    with flat_world.ExecutionContext() as context:
+                        builder = fm.study("invalid_eigen_diagnostics_flag")
+                        state = context.state
+                        existing_output = fm.SaveSpectrum(scope="global")
+                        state._outputs.append(existing_output)
+                        state._outputs_explicit = False
+                        stage_draft = object()
+                        state._declared_stages.append(stage_draft)
+                        state._extra_runtime_metadata["execution_profile"] = {
+                            "requested_backend": "fem"
+                        }
+                        state._legacy_execution_selection_calls.add("device")
+                        last_result = object()
+                        last_step = object()
+                        state._last_result = last_result
+                        state._last_step = last_step
+
+                        outputs_before = state._outputs
+                        stages_before = state._declared_stages
+                        runtime_metadata_before = copy.deepcopy(
+                            state._extra_runtime_metadata
+                        )
+                        runtime_aliases_before = set(
+                            state._legacy_execution_selection_calls
+                        )
+                        with self.assertRaises(ValueError):
+                            builder.save("diagnostics", **{flag: invalid})
+                        self.assertIs(state._outputs, outputs_before)
+                        self.assertEqual(state._outputs, [existing_output])
+                        self.assertFalse(state._outputs_explicit)
+                        self.assertIs(state._declared_stages, stages_before)
+                        self.assertEqual(state._declared_stages, [stage_draft])
+                        self.assertEqual(
+                            state._extra_runtime_metadata,
+                            runtime_metadata_before,
+                        )
+                        self.assertEqual(
+                            state._legacy_execution_selection_calls,
+                            runtime_aliases_before,
+                        )
+                        self.assertIs(state._last_result, last_result)
+                        self.assertIs(state._last_step, last_step)
+
+    def test_eigen_output_selectors_round_trip_through_script_builder(self) -> None:
+        script = """
+        import fullmag as fm
+
+        study = fm.study("eigen_output_selectors")
+        study.engine("fem")
+        body = study.geometry(fm.Box(100e-9, 20e-9, 5e-9), name="film")
+        body.Ms = 800e3
+        body.Aex = 13e-12
+        body.alpha = 0.01
+        body.m = fm.texture.uniform(1, 0, 0)
+        study.save(
+            "spectrum",
+            spectrum_quantity=" eigenfrequency ",
+            spectrum_scope="global",
+        )
+        study.save(
+            "mode",
+            field="mode_complex",
+            indices=[0, 2],
+            branches=[4],
+            sample_indices=[0, 2],
+            sample_labels=["Gamma", "X"],
+        )
+        study.save("dispersion", name="bands", include_branch_table=False)
+        study.save(
+            "diagnostics",
+            include_tracking=False,
+            include_overlaps=False,
+        )
+        study.stages.add_eigenmodes(count=5, include_demag=False)
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir)
+            source = root / "eigen_output_selectors.py"
+            source.write_text(textwrap.dedent(script), encoding="utf-8")
+            loaded = fm.load_problem_from_script(source, lightweight_assets=True)
+            original_ir = loaded.stages[0].problem.study.to_ir()
+            rendered = rewrite_loaded_problem_script(loaded)["rendered_source"]
+            rewritten = root / "eigen_output_selectors_rewritten.py"
+            rewritten.write_text(rendered, encoding="utf-8")
+            reloaded = fm.load_problem_from_script(
+                rewritten,
+                lightweight_assets=True,
+            )
+
+        self.assertIn('study.save("mode", field="mode_complex"', rendered)
+        self.assertIn("branches=[4]", rendered)
+        self.assertIn("sample_indices=[0, 2]", rendered)
+        self.assertIn('sample_labels=["Gamma", "X"]', rendered)
+        self.assertIn(
+            'study.save("dispersion", name="bands", include_branch_table=False)',
+            rendered,
+        )
+        self.assertIn(
+            'study.save("diagnostics", include_tracking=False, include_overlaps=False)',
+            rendered,
+        )
+        self.assertEqual(reloaded.stages[0].problem.study.to_ir(), original_ir)
+
+    def test_eigen_spectrum_quantity_rejects_unsupported_values_without_state_mutation(
+        self,
+    ) -> None:
+        invalid_quantities = ("", "   ", "eigenvalue", "amplitude", "frequency_hz")
+        for invalid_quantity in invalid_quantities:
+            with self.subTest(quantity=invalid_quantity):
+                with self.assertRaises(ValueError):
+                    fm.SaveSpectrum(quantity=invalid_quantity)
+
+                with flat_world.ExecutionContext() as context:
+                    fm.study("rejected_spectrum_quantity")
+                    state = context.state
+                    existing_output = fm.SaveSpectrum(scope="global")
+                    state._outputs.append(existing_output)
+                    state._outputs_explicit = False
+                    stage_draft = object()
+                    state._declared_stages.append(stage_draft)
+                    state._extra_runtime_metadata["execution_profile"] = {
+                        "requested_backend": "fem"
+                    }
+                    state._legacy_execution_selection_calls.add("device")
+                    last_result = object()
+                    last_step = object()
+                    state._last_result = last_result
+                    state._last_step = last_step
+
+                    outputs_before = state._outputs
+                    stages_before = state._declared_stages
+                    runtime_metadata_before = copy.deepcopy(
+                        state._extra_runtime_metadata
+                    )
+                    runtime_aliases_before = set(
+                        state._legacy_execution_selection_calls
+                    )
+
+                    with self.assertRaises(ValueError):
+                        flat_world.save(
+                            "spectrum",
+                            spectrum_quantity=invalid_quantity,
+                        )
+
+                    self.assertIs(state._outputs, outputs_before)
+                    self.assertEqual(state._outputs, [existing_output])
+                    self.assertFalse(state._outputs_explicit)
+                    self.assertIs(state._declared_stages, stages_before)
+                    self.assertEqual(state._declared_stages, [stage_draft])
+                    self.assertEqual(
+                        state._extra_runtime_metadata,
+                        runtime_metadata_before,
+                    )
+                    self.assertEqual(
+                        state._legacy_execution_selection_calls,
+                        runtime_aliases_before,
+                    )
+                    self.assertIs(state._last_result, last_result)
+                    self.assertIs(state._last_step, last_step)
+
+    def test_study_save_mode_accepts_numpy_and_sequence_selectors(self) -> None:
+        cases = (
+            (
+                {"indices": np.array([0, 2], dtype=np.int64)},
+                {"kind": "eigen_mode", "field": "mode", "indices": [0, 2]},
+            ),
+            (
+                {"indices": np.array([0], dtype=np.int64)},
+                {"kind": "eigen_mode", "field": "mode", "indices": [0]},
+            ),
+            (
+                {
+                    "indices": (0,),
+                    "branches": np.array([3, 1], dtype=np.int64),
+                    "sample_indices": np.array([0, 2], dtype=np.int64),
+                    "sample_labels": np.array(["Gamma", "X"]),
+                },
+                {
+                    "kind": "eigen_mode",
+                    "field": "mode",
+                    "indices": [0],
+                    "branches": [3, 1],
+                    "sample_selector": {
+                        "sample_indices": [0, 2],
+                        "sample_labels": ["Gamma", "X"],
+                    },
+                },
+            ),
+            (
+                {
+                    "indices": range(1, 3),
+                    "sample_indices": (2, 0),
+                    "sample_labels": ["X", "M"],
+                },
+                {
+                    "kind": "eigen_mode",
+                    "field": "mode",
+                    "indices": [1, 2],
+                    "sample_selector": {
+                        "sample_indices": [2, 0],
+                        "sample_labels": ["X", "M"],
+                    },
+                },
+            ),
+        )
+        for selectors, expected in cases:
+            with self.subTest(selectors=tuple(selectors)):
+                fm.reset()
+                try:
+                    fm.study("numpy_save_mode").save("mode", **selectors)
+                    outputs = flat_world._state._outputs
+                    self.assertEqual(len(outputs), 1)
+                    self.assertEqual(outputs[0].to_ir(), expected)
+                finally:
+                    fm.reset()
+
+    def test_study_save_mode_preserves_empty_and_invalid_selectors(
+        self,
+    ) -> None:
+        invalid_cases = (
+            ({"indices": np.array([], dtype=np.int64)}, "requires at least one"),
+            ({"indices": np.array([-1], dtype=np.int64)}, "must be >= 0"),
+            ({"indices": np.array([True])}, "integers"),
+        )
+        for selectors, error in invalid_cases:
+            with self.subTest(selectors=tuple(selectors)):
+                fm.reset()
+                try:
+                    with self.assertRaisesRegex(ValueError, error):
+                        fm.study("invalid_save_mode").save("mode", **selectors)
+                finally:
+                    fm.reset()
 
     def test_eigenmodes_rejects_frequency_response_outputs(self) -> None:
         with self.assertRaisesRegex(ValueError, "Eigenmodes outputs"):
@@ -1875,6 +2867,18 @@ class ProblemApiTests(unittest.TestCase):
             {"kind": "bulk_dmi", "D": -2e-3},
         )
 
+    def test_rotated_interfacial_dmi_serializes_exact_contract(self) -> None:
+        self.assertEqual(
+            fm.RotatedInterfacialDMI(D=-3.0e-3).to_ir(),
+            {"kind": "rotated_interfacial_dmi", "D": -3.0e-3},
+        )
+
+    def test_rotated_interfacial_dmi_rejects_non_finite_d(self) -> None:
+        for value in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "D must be finite"):
+                    fm.RotatedInterfacialDMI(D=value)
+
     def test_interfacial_dmi_rejects_invalid_interface_normal_shape(self) -> None:
         with self.assertRaises(ValueError):
             fm.InterfacialDMI(D=3e-3, interface_normal=(0.0, 1.0))
@@ -2129,6 +3133,99 @@ class ProblemApiTests(unittest.TestCase):
         self.assertEqual(runtime["gpu_count"], 1)
         self.assertEqual(runtime["device_index"], 0)
         self.assertEqual(runtime["cpu_threads"], 8)
+
+    def test_parallel_execution_policy_survives_runtime_selection_copies(self) -> None:
+        policy = fm.ParallelExecutionPolicy(
+            mode="adaptive",
+            max_cpu_percent=90.0,
+            max_memory_percent=80.0,
+            memory_reserve_bytes=1_073_741_824,
+            max_workers=3,
+            threads_per_worker=2,
+        )
+        runtime = fm.backend.cpu().engine("fem").with_parallel_execution(policy)
+        for copied in (
+            runtime.engine("fem"),
+            runtime.threads(4),
+            runtime.mode("extended"),
+            runtime.precision("double"),
+        ):
+            self.assertEqual(copied.parallel_execution, policy)
+        metadata = runtime.to_runtime_metadata()
+        self.assertEqual(metadata["parallel_execution"], policy.to_ir())
+
+        for unsupported in (
+            fm.backend.cpu().engine("fdm"),
+            fm.backend.cuda(1).engine("fem"),
+            fm.backend.cpu(),
+        ):
+            with self.subTest(runtime=unsupported):
+                with self.assertRaisesRegex(ValueError, "unsupported parallel_execution realization"):
+                    unsupported.with_parallel_execution(policy)
+
+    def test_parallel_execution_policy_rejects_non_integral_or_unknown_fields(self) -> None:
+        invalid_values = (
+            {"max_cpu_percent": True},
+            {"max_memory_percent": float("nan")},
+            {"max_memory_percent": float("inf")},
+            {"max_workers": True},
+            {"threads_per_worker": 1.0},
+            {"memory_reserve_bytes": 2**64},
+            {"max_workers": 2**32},
+            {"unknown": 1},
+        )
+        for overrides in invalid_values:
+            with self.subTest(overrides=overrides):
+                with self.assertRaises((TypeError, ValueError)):
+                    fm.ParallelExecutionPolicy.from_ir(overrides)
+        with self.assertRaises((TypeError, ValueError)):
+            build_scene_document_from_builder(
+                {"parallel_execution": {"unknown": 1}}
+            )
+
+    def test_fdm_precision_policy_round_trips_through_public_authoring(self) -> None:
+        problem = self._build_problem()
+        problem = fm.Problem(
+            name=problem.name,
+            magnets=problem.magnets,
+            energy=problem.energy,
+            study=problem.study,
+            discretization=problem.discretization,
+            runtime=(
+                fm.backend.cuda(1)
+                .engine("fdm")
+                .precision_policy("single_storage_fp64_reduction")
+            ),
+        )
+
+        ir = fm.Simulation(problem).to_ir()
+        expected = {
+            "storage": "single",
+            "compute": "single",
+            "fft": "single",
+            "reduction": "double",
+            "realization_id": (
+                "fullmag.fdm.cuda.precision."
+                "single_storage_fp64_reduction.v1"
+            ),
+        }
+        self.assertEqual(ir["backend_policy"]["execution_precision"], "single")
+        self.assertEqual(ir["backend_policy"]["fdm_precision_policy"], expected)
+        self.assertEqual(
+            ir["problem_meta"]["runtime_metadata"]["runtime_selection"][
+                "fdm_precision_policy"
+            ],
+            expected,
+        )
+
+    def test_fdm_precision_policy_rejects_conflicting_scalar_precision(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "fdm_precision_policy conflicts with execution_precision"
+        ):
+            fm.RuntimeSelection(
+                execution_precision="double",
+                fdm_precision_policy="single_storage_fp64_reduction",
+            )
 
     def test_runtime_selection_rejects_unimplemented_multi_gpu_request(self) -> None:
         with self.assertRaisesRegex(ValueError, "multi-GPU execution is not implemented"):
@@ -2989,6 +4086,38 @@ class ProblemApiTests(unittest.TestCase):
 
             rewritten = rewrite_loaded_problem_script(loaded)["rendered_source"]
             self.assertIn('study.demag(realization="poisson_robin")', rewritten)
+            self.assertNotIn("study.exchange(", rewritten)
+            self.assertNotIn("enabled=True", rewritten)
+
+    def test_study_defaults_exchange_and_demag_without_enable_calls(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "default_effective_field_terms.py"
+            path.write_text(
+                "\n".join(
+                    [
+                        "import fullmag as fm",
+                        "study = fm.study('default_effective_field_terms')",
+                        "study.engine('fem')",
+                        "body = study.geometry(fm.Box(20e-9, 20e-9, 10e-9), name='body')",
+                        "body.Ms = 800e3",
+                        "body.Aex = 13e-12",
+                        "body.alpha = 0.1",
+                        "body.m = fm.texture.uniform(1, 0, 0)",
+                        "study.run(1e-12)",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = fm.load_problem_from_script(path)
+            term_kinds = [term["kind"] for term in loaded.problem.to_ir()["energy_terms"]]
+            self.assertIn("exchange", term_kinds)
+            self.assertIn("demag", term_kinds)
+
+            rewritten = rewrite_loaded_problem_script(loaded)["rendered_source"]
+            self.assertNotIn("study.exchange(", rewritten)
+            self.assertNotIn("study.demag(", rewritten)
 
     def test_flat_script_can_disable_exchange_and_demag_effective_field_terms(self) -> None:
         with TemporaryDirectory() as tmp_dir:
@@ -2998,8 +4127,8 @@ class ProblemApiTests(unittest.TestCase):
                     [
                         "import fullmag as fm",
                         "fm.engine('fem')",
-                        "fm.exchange(enabled=False)",
-                        "fm.demag(enabled=False)",
+                        "fm.disable_exchange()",
+                        "fm.disable_demag()",
                         "fm.b_ext(0.0, 0.0, 0.01)",
                         "body = fm.geometry(fm.Box(20e-9, 20e-9, 10e-9), name='body')",
                         "body.Ms = 800e3",
@@ -3031,8 +4160,43 @@ class ProblemApiTests(unittest.TestCase):
             self.assertEqual(round_trip["demag_enabled"], False)
 
             rewritten = rewrite_loaded_problem_script(loaded)["rendered_source"]
-            self.assertIn("fm.exchange(enabled=False)", rewritten)
-            self.assertIn("fm.demag(enabled=False)", rewritten)
+            self.assertIn("fm.disable_exchange()", rewritten)
+            self.assertIn("fm.disable_demag()", rewritten)
+
+    def test_study_disable_methods_preserve_demag_configuration_for_round_trip(self) -> None:
+        with TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "disabled_study_effective_field_terms.py"
+            path.write_text(
+                "\n".join(
+                    [
+                        "import fullmag as fm",
+                        "study = fm.study('disabled_study_effective_field_terms')",
+                        "study.engine('fem')",
+                        "study.demag(realization='poisson_robin')",
+                        "study.disable_exchange()",
+                        "study.disable_demag()",
+                        "fm.b_ext(0.0, 0.0, 0.01)",
+                        "body = study.geometry(fm.Box(20e-9, 20e-9, 10e-9), name='body')",
+                        "body.Ms = 800e3",
+                        "body.Aex = 13e-12",
+                        "body.alpha = 0.1",
+                        "body.m = fm.texture.uniform(1, 0, 0)",
+                        "study.run(1e-12)",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            loaded = fm.load_problem_from_script(path)
+            term_kinds = [term["kind"] for term in loaded.problem.to_ir()["energy_terms"]]
+            self.assertNotIn("exchange", term_kinds)
+            self.assertNotIn("demag", term_kinds)
+
+            rewritten = rewrite_loaded_problem_script(loaded)["rendered_source"]
+            self.assertIn('study.demag(realization="poisson_robin")', rewritten)
+            self.assertIn("study.disable_exchange()", rewritten)
+            self.assertIn("study.disable_demag()", rewritten)
 
     def test_study_shared_domain_mesh_rewrite_uses_build_domain_mesh(self) -> None:
         script = """
@@ -3217,6 +4381,17 @@ class ProblemApiTests(unittest.TestCase):
         self.assertEqual(workflow["fem"]["hmax"], 25e-9)
         self.assertEqual(loaded.problem.runtime_metadata["study_universe"]["airbox_hmax"], 80e-9)
         self.assertEqual(workflow["per_geometry"][0]["hmax"], 25e-9)
+
+    def test_object_mesh_rejects_imported_mesh_source(self) -> None:
+        fm.reset()
+        study = fm.study("object_mesh_source_rejected")
+        body = study.geometry(fm.Box(20e-9, 20e-9, 10e-9), name="body")
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"per-object mesh source is unavailable; use FEM\(mesh=\.\.\.\)",
+        ):
+            body.mesh(source="object.mesh")
 
     def test_study_build_domain_mesh_requires_explicit_airbox_hmax(self) -> None:
         script = """
@@ -3502,6 +4677,42 @@ class ProblemApiTests(unittest.TestCase):
         self.assertIsNone(scene["editor"]["selected_entity_id"])
         self.assertIsNone(scene["editor"]["focused_entity_id"])
         self.assertEqual(scene["editor"]["mesh_entity_view_state"], {})
+
+    def test_scene_document_round_trips_parallel_execution_policy(self) -> None:
+        builder = {
+            "revision": 1,
+            "backend": "fem",
+            "requested_device": "cpu",
+            "parallel_execution": {
+                "mode": "adaptive",
+                "max_cpu_percent": 90.0,
+                "max_memory_percent": 80.0,
+                "memory_reserve_bytes": 1_073_741_824,
+                "max_workers": 4,
+                "threads_per_worker": 1,
+            },
+            "solver": {},
+            "mesh": {},
+            "universe": None,
+            "stages": [],
+            "initial_state": None,
+            "geometries": [
+                {
+                    "name": "film",
+                    "geometry_kind": "Box",
+                    "geometry_params": {"size": [20e-9, 20e-9, 10e-9]},
+                    "material": {"Ms": 800e3, "Aex": 13e-12, "alpha": 0.1},
+                    "magnetization": {"kind": "uniform", "value": [1.0, 0.0, 0.0]},
+                    "mesh": {"mode": "inherit", "hmax": ""},
+                }
+            ],
+            "current_modules": [],
+            "excitation_analysis": None,
+        }
+        scene = build_scene_document_from_builder(builder)
+        self.assertEqual(scene["study"]["parallel_execution"], builder["parallel_execution"])
+        rebuilt = build_builder_from_scene_document(scene)
+        self.assertEqual(rebuilt["parallel_execution"], builder["parallel_execution"])
 
     def test_scene_document_preserves_preset_texture_round_trip(self) -> None:
         builder = {
@@ -3857,6 +5068,15 @@ class ProblemApiTests(unittest.TestCase):
         self.assertEqual(payload["per_magnet"]["left"]["cell"], [1e-9, 2e-9, 3e-9])
         self.assertEqual(payload["per_magnet"]["right"]["cell"], [2e-9, 2e-9, 3e-9])
 
+    def test_fdm_projection_policy_is_explicit_and_validated(self) -> None:
+        hints = fm.FDM(
+            cell=(2e-9, 2e-9, 2e-9),
+            projection_policy="unit_sphere",
+        )
+        self.assertEqual(hints.to_ir()["projection_policy"], "unit_sphere")
+        with self.assertRaisesRegex(ValueError, "projection_policy must be one of"):
+            fm.FDM(cell=(2e-9, 2e-9, 2e-9), projection_policy="legacy")
+
     def test_script_export_preserves_per_magnet_fdm_grids(self) -> None:
         with TemporaryDirectory() as tmp_dir:
             script_path = Path(tmp_dir) / "per_magnet_export.py"
@@ -3879,6 +5099,7 @@ class ProblemApiTests(unittest.TestCase):
                         ),
                         boundary_phi_floor=0.1,
                         boundary_delta_min=0.2e-9,
+                        projection_policy="unit_sphere",
                     )
                     left = fm.geometry(fm.Box(size=(10e-9, 10e-9, 3e-9), name="left"), name="left")
                     right = fm.geometry(fm.Box(size=(10e-9, 10e-9, 3e-9), name="right"), name="right")
@@ -3894,6 +5115,7 @@ class ProblemApiTests(unittest.TestCase):
             rewritten = rewrite_loaded_problem_script(loaded)["rendered_source"]
             self.assertIn('fm.fdm(per_magnet={"left": fm.FDMGrid', rewritten)
             self.assertIn('demag=fm.FDMDemag(strategy="multilayer_convolution"', rewritten)
+            self.assertIn('projection_policy="unit_sphere"', rewritten)
 
             rewritten_path = Path(tmp_dir) / "per_magnet_export_rewritten.py"
             rewritten_path.write_text(rewritten, encoding="utf-8")
@@ -3909,6 +5131,7 @@ class ProblemApiTests(unittest.TestCase):
         self.assertFalse(fdm.demag.explain)
         self.assertEqual(fdm.boundary_phi_floor, 0.1)
         self.assertEqual(fdm.boundary_delta_min, 0.2e-9)
+        self.assertEqual(fdm.projection_policy, "unit_sphere")
 
     def test_fdm_demag_rejects_removed_single_grid_fallback_switch(self) -> None:
         with self.assertRaisesRegex(ValueError, "allow_single_grid_fallback.*removed"):
@@ -4543,7 +5766,6 @@ class ProblemApiTests(unittest.TestCase):
         core.mesh(maximum_element_size=3e-9)
         core.set_material("ms", fm.fields.constant(760e3, unit="A/m"), priority=2)
 
-        study.exchange()
         study.run(1e-12)
         """
 
@@ -4636,7 +5858,14 @@ class ProblemApiTests(unittest.TestCase):
 
         rewritten = rewrite_loaded_problem_script(loaded)["rendered_source"]
         self.assertIn("fm.Box(1e-07, 4e-08, 2e-08, name=\"host\")", rewritten)
-        self.assertIn(".translate((1.5e-08, 0, 0))", rewritten)
+        translation_offsets = [
+            ast.literal_eval(node.args[0])
+            for node in ast.walk(ast.parse(rewritten))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "translate"
+        ]
+        self.assertEqual(translation_offsets, [(15e-9, 0.0, 0.0)])
         self.assertIn(" - ", rewritten)
 
     def test_script_builder_rewrites_file_texture_override_with_loadfile(self) -> None:
@@ -4836,6 +6065,44 @@ class ProblemApiTests(unittest.TestCase):
             policy,
         )
 
+    def test_eigen_solver_policy_lowers_from_python_stage(self) -> None:
+        script = """
+        import fullmag as fm
+
+        study = fm.study("eigenmodes_solver_policy")
+        study.engine("fem")
+        study.device("cpu", precision="double")
+        body = study.geometry(fm.Box(size=(2e-7, 2e-7, 1e-8), name="film"), name="film")
+        body.Ms = 800e3
+        body.Aex = 13e-12
+        body.m = fm.init.UniformMagnetization((1.0, 0.0, 0.0))
+        study.stages.add_eigenmodes(
+            count=4,
+            include_demag=False,
+            solver_rtol=2.5e-6,
+            solver_max_outer_iterations=17,
+            solver_max_linear_iterations=29,
+        )
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            script_path = Path(tmp_dir) / "eigenmodes_solver_policy.py"
+            script_path.write_text(textwrap.dedent(script), encoding="utf-8")
+            loaded = fm.load_problem_from_script(script_path, lightweight_assets=True)
+
+        expected_policy = {
+            "residual_tolerance": 2.5e-6,
+            "max_outer_iterations": 17,
+            "max_linear_iterations": 29,
+        }
+        study = loaded.stages[0].problem.study
+        self.assertEqual(study.solver_policy.to_ir(), expected_policy)
+        self.assertEqual(study.to_ir()["solver_policy"], expected_policy)
+        self.assertNotIn(
+            "solver_policy",
+            fm.Eigenmodes(outputs=[fm.SaveSpectrum()]).to_ir(),
+        )
+
     def test_frequency_response_accepts_uppercase_max_iterations_alias(self) -> None:
         script = """
         import fullmag as fm
@@ -4966,6 +6233,72 @@ class ProblemApiTests(unittest.TestCase):
 
         rewritten = rewrite_loaded_problem_script(loaded)["rendered_source"]
         self.assertIn('operator="full_2x2"', rewritten)
+
+    def test_study_stage_builder_bias_field_sweep_roundtrips_cpu_and_gpu_intent(self) -> None:
+        for device in ("cpu", "cuda"):
+            script = f"""
+            import fullmag as fm
+
+            study = fm.study("stage_bias_field_sweep_{device}")
+            study.engine("fem")
+            study.device("{device}", precision="double")
+            body = study.geometry(fm.Box(100e-9, 20e-9, 5e-9), name="track")
+            body.Ms = 800e3
+            body.Aex = 13e-12
+            body.alpha = 0.0
+            body.m = fm.texture.uniform(1, 0, 0)
+            study.save("spectrum")
+            study.stages.add_eigenmodes(
+                count=4,
+                target="frequency_window",
+                frequency_min=100e6,
+                frequency_max=5e9,
+                include_demag=True,
+                k_vector=(0.0, 0.0, 0.0),
+                bc="periodic",
+                magnetostatic_bc="periodic_airbox_k0",
+                bias_field_sweep=fm.BiasFieldSweep(
+                    samples_a_per_m=[
+                        (12_500.123456789122, 0.0, 0.0),
+                        (25_000.0, 0.0, 0.0),
+                    ],
+                    equilibrium_policy="relax_each",
+                    continuation_seed="initial_state",
+                ),
+            )
+            """
+            with TemporaryDirectory() as tmp_dir:
+                path = Path(tmp_dir) / f"bias_field_sweep_{device}.py"
+                path.write_text(textwrap.dedent(script), encoding="utf-8")
+                loaded = fm.load_problem_from_script(path, lightweight_assets=True)
+
+            study_ir = loaded.stages[0].problem.to_ir()["study"]
+            self.assertEqual(study_ir["bias_field_sweep"]["samples_a_per_m"], [
+                [12_500.123456789122, 0.0, 0.0],
+                [25_000.0, 0.0, 0.0],
+            ])
+            self.assertEqual(
+                loaded.stages[0].problem.to_ir()["problem_meta"]["runtime_metadata"]
+                ["runtime_selection"]["device"],
+                device,
+            )
+            rendered = rewrite_loaded_problem_script(loaded)["rendered_source"]
+            self.assertIn("bias_field_sweep=fm.BiasFieldSweep(", rendered)
+
+            with TemporaryDirectory() as tmp_dir:
+                rewritten_path = Path(tmp_dir) / f"bias_field_sweep_{device}_rewritten.py"
+                rewritten_path.write_text(rendered, encoding="utf-8")
+                reloaded = fm.load_problem_from_script(
+                    rewritten_path, lightweight_assets=True
+                )
+
+            reloaded_ir = reloaded.stages[0].problem.to_ir()
+            reloaded_study_ir = reloaded_ir["study"]
+            self.assertEqual(reloaded_study_ir, study_ir)
+            self.assertEqual(
+                reloaded_ir["problem_meta"]["runtime_metadata"]["runtime_selection"]["device"],
+                device,
+            )
 
     def test_study_builder_eigenmodes_forwards_operator(self) -> None:
         builder = flat_world.study("immediate_eigen_operator")
@@ -6279,6 +7612,122 @@ class ProblemApiTests(unittest.TestCase):
         self.assertIn("samples_per_segment=[41]", rewritten)
         self.assertIn('bc=fm.FloquetBC(["x_periodic"])', rewritten)
 
+    def test_script_rewrite_applies_eigen_solver_policy_overrides(self) -> None:
+        script = """
+        import fullmag as fm
+
+        study = fm.study("eigen_solver_policy_stage_override")
+        study.engine("fem")
+        study.device("cpu", precision="double")
+        body = study.geometry(fm.Box(100e-9, 20e-9, 5e-9), name="track")
+        body.Ms = 800e3
+        body.Aex = 13e-12
+        body.alpha = 0.1
+        body.m = fm.texture.uniform(1, 0, 0)
+        study.stages.add_eigenmodes(
+            count=4,
+            include_demag=False,
+            solver_rtol=1e-6,
+            solver_max_outer_iterations=100,
+            solver_max_linear_iterations=200,
+        )
+        """
+
+        with TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "eigen_solver_policy_stage_override.py"
+            path.write_text(textwrap.dedent(script), encoding="utf-8")
+            loaded = fm.load_problem_from_script(path, lightweight_assets=True)
+
+        partial_override = rewrite_loaded_problem_script(
+            loaded,
+            overrides={
+                "stages": [
+                    {"kind": "eigenmodes", "eigen_solver_rtol": 2e-6},
+                ],
+            },
+        )["rendered_source"]
+        self.assertIn("solver_rtol=2e-06", partial_override)
+        self.assertIn("solver_max_outer_iterations=100", partial_override)
+        self.assertIn("solver_max_linear_iterations=200", partial_override)
+
+        replaced_policy = rewrite_loaded_problem_script(
+            loaded,
+            overrides={
+                "stages": [
+                    {
+                        "kind": "eigenmodes",
+                        "eigen_solver_rtol": 3e-6,
+                        "eigen_solver_max_outer_iterations": 300,
+                        "eigen_solver_max_linear_iterations": 400,
+                    },
+                ],
+            },
+        )["rendered_source"]
+        self.assertIn("solver_rtol=3e-06", replaced_policy)
+        self.assertIn("solver_max_outer_iterations=300", replaced_policy)
+        self.assertIn("solver_max_linear_iterations=400", replaced_policy)
+        self.assertNotIn("solver_max_outer_iterations=100", replaced_policy)
+        self.assertNotIn("solver_max_linear_iterations=200", replaced_policy)
+
+        cleared_policy = rewrite_loaded_problem_script(
+            loaded,
+            overrides={
+                "stages": [
+                    {
+                        "kind": "eigenmodes",
+                        "eigen_solver_rtol": None,
+                        "eigen_solver_max_outer_iterations": "",
+                        "eigen_solver_max_linear_iterations": None,
+                    },
+                ],
+            },
+        )["rendered_source"]
+        self.assertNotIn("solver_rtol=", cleared_policy)
+        self.assertNotIn("solver_max_outer_iterations=", cleared_policy)
+        self.assertNotIn("solver_max_linear_iterations=", cleared_policy)
+
+        partially_cleared_policy = rewrite_loaded_problem_script(
+            loaded,
+            overrides={
+                "stages": [
+                    {"kind": "eigenmodes", "eigen_solver_rtol": None},
+                ],
+            },
+        )["rendered_source"]
+        self.assertNotIn("solver_rtol=", partially_cleared_policy)
+        self.assertIn("solver_max_outer_iterations=100", partially_cleared_policy)
+        self.assertIn("solver_max_linear_iterations=200", partially_cleared_policy)
+
+        no_policy_script = script.replace(
+            "            solver_rtol=1e-6,\n"
+            "            solver_max_outer_iterations=100,\n"
+            "            solver_max_linear_iterations=200,\n",
+            "",
+        )
+        with TemporaryDirectory() as tmp_dir:
+            path = Path(tmp_dir) / "eigen_solver_policy_stage_without_policy.py"
+            path.write_text(textwrap.dedent(no_policy_script), encoding="utf-8")
+            loaded_without_policy = fm.load_problem_from_script(
+                path, lightweight_assets=True
+            )
+
+        authored_without_policy = rewrite_loaded_problem_script(
+            loaded_without_policy,
+            overrides={
+                "stages": [
+                    {
+                        "kind": "eigenmodes",
+                        "eigen_solver_rtol": 4e-6,
+                        "eigen_solver_max_outer_iterations": 500,
+                        "eigen_solver_max_linear_iterations": 600,
+                    },
+                ],
+            },
+        )["rendered_source"]
+        self.assertIn("solver_rtol=4e-06", authored_without_policy)
+        self.assertIn("solver_max_outer_iterations=500", authored_without_policy)
+        self.assertIn("solver_max_linear_iterations=600", authored_without_policy)
+
     def test_study_stage_preserves_floquet_k_path_demag_intent(self) -> None:
         script = """
         import fullmag as fm
@@ -6418,17 +7867,44 @@ class ProblemApiTests(unittest.TestCase):
             {"backward_volume", "damon_eshbach"},
         )
 
-    def test_thin_film_de_bv_dispersion_validation_rejects_broad_k_range(self) -> None:
-        with self.assertRaisesRegex(ValueError, "max_k_rad_per_m"):
-            fm.ThinFilmDEBVDispersionValidation(
-                film_thickness_m=80e-9,
-                equilibrium_magnetization=(1.0, 0.0, 0.0),
-                scenarios=[
-                    fm.DispersionValidationScenario("bv", "branch_0", [0, 1, 2]),
-                    fm.DispersionValidationScenario("de", "branch_0", [0, 3, 4]),
-                ],
-                max_k_rad_per_m=4.0e6,
-            )
+    def test_numeric_de_bv_example_has_far_dirichlet_boundaries(self) -> None:
+        import math
+        example = Path(__file__).resolve().parents[3] / "examples/fem_eigenmodes_dispersion_de_bv_low_k.py"
+        loaded = fm.load_problem_from_script(example, lightweight_assets=True)
+        ir = loaded.problem.to_ir(requested_backend="fem", execution_mode="strict", execution_precision="double", include_geometry_assets=False)
+        metadata = ir["problem_meta"]["runtime_metadata"]
+        thickness = metadata["dispersion_validation"]["film_thickness_m"]
+        height = metadata["study_universe"]["size"][2]
+        padding = (height - thickness) / 2
+        self.assertAlmostEqual(padding, 2e-6, delta=1e-15)
+        # Independent uniform-slab Gamma boundary estimate, not a FEM run.
+        h = 0.05 / (4 * math.pi * 1e-7)
+        ms = 140e3
+        nz = 1 - thickness / height
+        boundary_error = 1 - math.sqrt((h + ms * nz) / (h + ms))
+        self.assertLess(boundary_error, 0.01)
+
+    def test_thin_film_de_bv_dispersion_validation_accepts_c1_range(self) -> None:
+        validation = fm.ThinFilmDEBVDispersionValidation(
+            film_thickness_m=10e-9,
+            equilibrium_magnetization=(1.0, 0.0, 0.0),
+            scenarios=[
+                fm.DispersionValidationScenario("bv", "branch_0", [0, 1, 2]),
+                fm.DispersionValidationScenario("de", "branch_0", [0, 3, 4]),
+            ],
+            max_k_rad_per_m=1.5707963267948966e7,
+            frequency_window_hz=(0.0, 15e9),
+        )
+        self.assertEqual(validation.to_ir()["frequency_window_hz"], {"min": 0.0, "max": 15e9})
+        self.assertEqual(validation.to_ir()["max_k_rad_per_m"], 1.5707963267948966e7)
+        for bounds in [(0.0, float("nan")), (0.0, float("inf")), (float("nan"), 15e9)]:
+            with self.assertRaisesRegex(ValueError, "finite"):
+                fm.ThinFilmDEBVDispersionValidation(
+                    film_thickness_m=10e-9,
+                    equilibrium_magnetization=(1.0, 0.0, 0.0),
+                    scenarios=validation.scenarios,
+                    frequency_window_hz=bounds,
+                )
 
     def test_study_k0_kittel_validation_lowers_to_runtime_metadata(self) -> None:
         script = """
@@ -7722,6 +9198,7 @@ class ProblemApiTests(unittest.TestCase):
         fm.reset()
         study = fm.study("mixed-p1-layers")
         study.engine("fem")
+        study.device("cpu", precision="double")
         study.mode("strict")
         study.universe(mode="manual", size=(100e-9, 80e-9, 65e-9))
         film = study.geometry(
@@ -8683,7 +10160,7 @@ class ProblemApiTests(unittest.TestCase):
 
         captured: dict[str, object] = {}
 
-        def fake_run_problem_json(ir, until_seconds, output_dir):
+        def fake_run_problem_json(ir, until_seconds, output_dir, **_storage):
             captured["ir"] = ir
             captured["until_seconds"] = until_seconds
             captured["output_dir"] = output_dir
@@ -8753,7 +10230,7 @@ class ProblemApiTests(unittest.TestCase):
 
         captured: dict[str, object] = {}
 
-        def fake_run_problem_json(ir, until_seconds, output_dir):
+        def fake_run_problem_json(ir, until_seconds, output_dir, **_storage):
             captured["until_seconds"] = until_seconds
             captured["entrypoint_kind"] = ir["problem_meta"]["entrypoint_kind"]
             return {
@@ -8796,7 +10273,7 @@ class ProblemApiTests(unittest.TestCase):
 
         calls: list[tuple[dict[str, object], float, str | None]] = []
 
-        def fake_run_problem_json(ir, until_seconds, output_dir):
+        def fake_run_problem_json(ir, until_seconds, output_dir, **_storage):
             calls.append((ir, until_seconds, output_dir))
             return {
                 "status": "completed",
@@ -8844,16 +10321,16 @@ class ProblemApiTests(unittest.TestCase):
         )
         self.assertEqual(
             calls[0][2],
-            str(output_dir / "stage_01_flat_relax"),
+            str(output_dir / "stage_01_flat_relax.zarr"),
         )
         self.assertEqual(
             calls[1][2],
-            str(output_dir / "stage_02_flat_run"),
+            str(output_dir / "stage_02_flat_run.zarr"),
         )
         self.assertEqual(manifest["kind"], "flat_sequence")
         self.assertEqual(len(manifest["stages"]), 2)
-        self.assertEqual(manifest["stages"][0]["output_dir"], str(output_dir / "stage_01_flat_relax"))
-        self.assertEqual(manifest["stages"][1]["output_dir"], str(output_dir / "stage_02_flat_run"))
+        self.assertEqual(manifest["stages"][0]["output_dir"], str(output_dir / "stage_01_flat_relax.zarr"))
+        self.assertEqual(manifest["stages"][1]["output_dir"], str(output_dir / "stage_02_flat_run.zarr"))
 
     def test_cli_json_mode_prints_machine_readable_summary(self) -> None:
         script = """
@@ -8927,7 +10404,7 @@ class ProblemApiTests(unittest.TestCase):
 
         captured: dict[str, object] = {}
 
-        def fake_run_problem_json(ir, until_seconds, output_dir):
+        def fake_run_problem_json(ir, until_seconds, output_dir, **_storage):
             captured["until_seconds"] = until_seconds
             return {
                 "status": "completed",
@@ -8974,7 +10451,7 @@ class ProblemApiTests(unittest.TestCase):
 
         captured: dict[str, object] = {}
 
-        def fake_run_problem_json(ir, until_seconds, output_dir):
+        def fake_run_problem_json(ir, until_seconds, output_dir, **_storage):
             captured["until_seconds"] = until_seconds
             return {
                 "status": "completed",
@@ -9024,7 +10501,7 @@ class ProblemApiTests(unittest.TestCase):
 
         captured: dict[str, object] = {}
 
-        def fake_run_problem_json(ir, until_seconds, output_dir):
+        def fake_run_problem_json(ir, until_seconds, output_dir, **_storage):
             captured["until_seconds"] = until_seconds
             return {
                 "status": "completed",

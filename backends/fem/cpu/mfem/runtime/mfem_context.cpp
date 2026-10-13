@@ -23,6 +23,7 @@
 #include "cpu/mfem/runtime/mfem_host_access.hpp"
 #include "cpu/mfem/runtime/mfem_mesh_builder.hpp"
 #include "fem_common.hpp"
+#include "gpu/cuda/demag_fem_bem/fem_bem_dispatch.hpp"
 #include "gpu/cuda/transfer/snapshot_pool.hpp"
 
 #include <mfem.hpp>
@@ -282,31 +283,29 @@ bool context_initialize_mfem(Context &ctx, std::string &error)
         auto fes = std::make_unique<mfem::FiniteElementSpace>(mesh, fec.get());
         debug_checkpoint("context_initialize_mfem:fes_ready");
 
-        if (fes->GetNDofs() != static_cast<int>(ctx.mesh.n_nodes)) {
-            error = "MFEM H1 P1 space DOF count does not match node count";
+        if (!verify_mfem_local_node_ordering(ctx.mesh, *fes, error)) {
             return false;
         }
 
-        unpack_aos_to_components(ctx.state.m_xyz, ctx.mfem_context.m_x, ctx.mfem_context.m_y, ctx.mfem_context.m_z);
         auto gf_mx = std::make_unique<mfem::GridFunction>(fes.get());
         auto gf_my = std::make_unique<mfem::GridFunction>(fes.get());
         auto gf_mz = std::make_unique<mfem::GridFunction>(fes.get());
+        auto true_mx = std::make_unique<mfem::Vector>(fes->GetTrueVSize());
+        auto true_my = std::make_unique<mfem::Vector>(fes->GetTrueVSize());
+        auto true_mz = std::make_unique<mfem::Vector>(fes->GetTrueVSize());
         auto gf_a = std::make_unique<mfem::GridFunction>(fes.get());
         auto gf_ms = std::make_unique<mfem::GridFunction>(fes.get());
         gf_mx->UseDevice(mfem::Device::IsEnabled());
         gf_my->UseDevice(mfem::Device::IsEnabled());
         gf_mz->UseDevice(mfem::Device::IsEnabled());
+        true_mx->UseDevice(mfem::Device::IsEnabled());
+        true_my->UseDevice(mfem::Device::IsEnabled());
+        true_mz->UseDevice(mfem::Device::IsEnabled());
         gf_a->UseDevice(mfem::Device::IsEnabled());
         gf_ms->UseDevice(mfem::Device::IsEnabled());
-        double *mx_host = audited_host_write(*gf_mx);
-        double *my_host = audited_host_write(*gf_my);
-        double *mz_host = audited_host_write(*gf_mz);
         double *a_host = audited_host_write(*gf_a);
         double *ms_host = audited_host_write(*gf_ms);
         for (int i = 0; i < fes->GetNDofs(); ++i) {
-            mx_host[i] = ctx.mfem_context.m_x[static_cast<size_t>(i)];
-            my_host[i] = ctx.mfem_context.m_y[static_cast<size_t>(i)];
-            mz_host[i] = ctx.mfem_context.m_z[static_cast<size_t>(i)];
             a_host[i] = scalar_field_value(
                 ctx.material_fields.A_field,
                 static_cast<size_t>(i),
@@ -358,11 +357,24 @@ bool context_initialize_mfem(Context &ctx, std::string &error)
         ctx.mfem_context.gf_mx = gf_mx.release();
         ctx.mfem_context.gf_my = gf_my.release();
         ctx.mfem_context.gf_mz = gf_mz.release();
+        ctx.mfem_context.true_mx = true_mx.release();
+        ctx.mfem_context.true_my = true_my.release();
+        ctx.mfem_context.true_mz = true_mz.release();
         ctx.mfem_context.gf_a = gf_a.release();
         ctx.mfem_context.gf_ms = gf_ms.release();
         ctx.mfem_context.a_coeff = a_coeff.release();
         ctx.mfem_context.ms_coeff = ms_coeff.release();
         ctx.mfem_context.ready = true;
+        std::vector<double> recovered_state;
+        if (!copy_local_node_aos_to_mfem_state(ctx, ctx.state.m_xyz, error) ||
+            !copy_mfem_state_to_local_node_aos(ctx, recovered_state, error)) {
+            error = "MFEM initial state representation round-trip failed: " + error;
+            return false;
+        }
+        if (recovered_state != ctx.state.m_xyz) {
+            error = "MFEM initial state representation round-trip changed authoritative AoS values";
+            return false;
+        }
         rollback.commit();
         debug_checkpoint("context_initialize_mfem:done");
         return true;
@@ -399,6 +411,9 @@ bool context_upload_mfem_exchange_to_gpu_state(Context &ctx, std::string &error)
 void context_destroy_mfem(Context &ctx)
 {
     relaxation::destroy_exchange_mass_preconditioner_cache(ctx);
+    if (ctx.poisson_demag.gpu_demag_mode == FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_FEM_BEM) {
+        gpu_demag_fem_bem_destroy(ctx);
+    }
     context_destroy_demag_fem_bem(ctx);
     context_destroy_poisson(ctx);
     destroy_dmi_workspace(ctx);
@@ -411,6 +426,14 @@ void context_destroy_mfem(Context &ctx)
     delete static_cast<mfem::Vector *>(ctx.exchange.mfem.mass_lumped);
     delete static_cast<mfem::Vector *>(ctx.exchange.mfem.mass_ones);
     delete static_cast<mfem::CGSolver *>(ctx.exchange.mfem.consistent_mass_solver);
+    delete static_cast<mfem::GSSmoother *>(ctx.exchange.mfem.consistent_mass_preconditioner);
+    delete static_cast<mfem::SparseMatrix *>(ctx.exchange.mfem.consistent_mass_matrix);
+    delete static_cast<mfem::Vector *>(ctx.exchange.mfem.periodic_mass_residual);
+    delete static_cast<mfem::Vector *>(ctx.exchange.mfem.periodic_mass_solution);
+    delete static_cast<mfem::Vector *>(ctx.exchange.mfem.periodic_mass_rhs);
+    delete static_cast<mfem::CGSolver *>(ctx.exchange.mfem.periodic_mass_solver);
+    delete static_cast<mfem::GSSmoother *>(ctx.exchange.mfem.periodic_mass_preconditioner);
+    delete static_cast<mfem::SparseMatrix *>(ctx.exchange.mfem.periodic_mass_matrix);
     delete static_cast<mfem::BilinearForm *>(ctx.exchange.mfem.mass_form);
     delete static_cast<mfem::BilinearForm *>(ctx.exchange.mfem.exchange_form);
     delete static_cast<mfem::GridFunction *>(ctx.mfem_context.gf_ms);
@@ -418,6 +441,9 @@ void context_destroy_mfem(Context &ctx)
     delete static_cast<mfem::GridFunction *>(ctx.mfem_context.gf_mz);
     delete static_cast<mfem::GridFunction *>(ctx.mfem_context.gf_my);
     delete static_cast<mfem::GridFunction *>(ctx.mfem_context.gf_mx);
+    delete static_cast<mfem::Vector *>(ctx.mfem_context.true_mz);
+    delete static_cast<mfem::Vector *>(ctx.mfem_context.true_my);
+    delete static_cast<mfem::Vector *>(ctx.mfem_context.true_mx);
     delete static_cast<mfem::FiniteElementSpace *>(ctx.mfem_context.fes);
     delete static_cast<mfem::FiniteElementCollection *>(ctx.mfem_context.fec);
     delete static_cast<mfem::Mesh *>(ctx.mfem_context.mesh);
@@ -433,12 +459,27 @@ void context_destroy_mfem(Context &ctx)
     ctx.exchange.mfem.inv_lumped_mass = nullptr;
     ctx.exchange.mfem.mass_lumped = nullptr;
     ctx.exchange.mfem.mass_ones = nullptr;
+    ctx.exchange.mfem.consistent_mass_preconditioner = nullptr;
     ctx.exchange.mfem.consistent_mass_solver = nullptr;
+    ctx.exchange.mfem.consistent_mass_matrix = nullptr;
+    ctx.exchange.mfem.periodic_mass_matrix = nullptr;
+    ctx.exchange.mfem.periodic_mass_preconditioner = nullptr;
+    ctx.exchange.mfem.periodic_mass_solver = nullptr;
+    ctx.exchange.mfem.periodic_mass_rhs = nullptr;
+    ctx.exchange.mfem.periodic_mass_solution = nullptr;
+    ctx.exchange.mfem.periodic_mass_residual = nullptr;
+    ctx.exchange.mfem.consistent_mass_solver_applies = 0;
+    ctx.exchange.mfem.periodic_mass_solver_applies = 0;
+    ctx.exchange.mfem.periodic_mass_setup_count = 0;
+    ctx.exchange.mfem.operator_lifecycle = {};
     ctx.mfem_context.gf_ms = nullptr;
     ctx.mfem_context.gf_a = nullptr;
     ctx.mfem_context.gf_mz = nullptr;
     ctx.mfem_context.gf_my = nullptr;
     ctx.mfem_context.gf_mx = nullptr;
+    ctx.mfem_context.true_mz = nullptr;
+    ctx.mfem_context.true_my = nullptr;
+    ctx.mfem_context.true_mx = nullptr;
     ctx.mfem_context.fes = nullptr;
     ctx.mfem_context.fec = nullptr;
     ctx.mfem_context.mesh = nullptr;

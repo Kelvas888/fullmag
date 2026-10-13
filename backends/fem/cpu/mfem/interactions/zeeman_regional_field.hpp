@@ -11,6 +11,13 @@ namespace fullmag::fem {
 
 struct Context;
 
+/*
+ * Regional Zeeman-field interaction owner. This module owns regional drive
+ * descriptors, target masks, spatial bases, and time materialization. It does
+ * not own global Zeeman fields, time-dependence parsing, or effective-field
+ * composition.
+ */
+
 struct RegionalFieldDriveRuntime {
     uint64_t stable_id_hash = 0;
     uint32_t time_origin = FULLMAG_FEM_TIME_STAGE_LOCAL;
@@ -32,6 +39,7 @@ struct RegionalFieldDriveRuntime {
     double gaussian_carrier_phase_rad = 0.0;
     std::vector<fullmag_fem_geometry_mask_node> geometry_nodes;
     uint32_t geometry_root_index = 0;
+    std::vector<double> preprojected_h_xyz;
     std::array<double, 3> direction{0.0, 0.0, 0.0};
     double amplitude_b_t = 0.0;
     std::vector<double> basis_h_xyz;

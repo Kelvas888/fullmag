@@ -1,21 +1,33 @@
+#include "frequency_domain/floquet_dynamic_demag_k.hpp"
 #include "frequency_domain/modal_eigen_solver.hpp"
+#include "frequency_domain/mode_kinematics.hpp"
 
 #include "cpu/frequency_domain/contour_interval_solver.hpp"
 #include "cpu/frequency_domain/mode_deduplication.hpp"
 #include "cpu/frequency_domain/mode_filter.hpp"
 #include "cpu/frequency_domain/poisson_airbox_modal_eigen.hpp"
+#include "cpu/frequency_domain/floquet_airbox_operator.hpp"
+#include "cpu/frequency_domain/floquet_k_classification.hpp"
+#include "cpu/frequency_domain/modal/floquet_modal_solver.hpp"
+#include "cpu/frequency_domain/operators/poisson_airbox_shared_domain.hpp"
+#include "cpu/frequency_domain/modal_shared_domain_provider_status.hpp"
 #include "cpu/frequency_domain/slepc_modal_eigen.hpp"
+#include "frequency_domain/modal_gpu_krylov.hpp"
 #include "cpu/frequency_domain/window_partition.hpp"
 #include "frequency_domain/solver_progress.hpp"
 #include "frequency_domain/linearized_dynamic_pencil.hpp"
 
 #include <cmath>
+#include <array>
 #include <complex>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -39,6 +51,120 @@ extern "C" int fullmag_fem_frequency_domain_apply_modal_shift_invert_gpu_action(
 namespace fullmag::fem::frequency_domain {
 
 namespace {
+
+const char *phase_convention_json_label(
+    FrequencyDomainPhaseConvention phase_convention) noexcept
+{
+    switch (phase_convention) {
+    case FrequencyDomainPhaseConvention::exp_i_omega_t:
+        return "exp_i_omega_t";
+    case FrequencyDomainPhaseConvention::exp_minus_i_omega_t:
+        return "exp_minus_i_omega_t";
+    }
+    return "unknown";
+}
+
+bool supported_frequency_domain_abi(std::uint32_t version) noexcept
+{
+    return version == kFrequencyDomainAbiVersion ||
+        version == kFrequencyDomainV18AbiVersion ||
+        version == kFrequencyDomainV17AbiVersion ||
+        version == kFrequencyDomainV16AbiVersion ||
+        version == kFrequencyDomainV15AbiVersion ||
+        version == kFrequencyDomainPreviousAbiVersion ||
+        version == kFrequencyDomainPriorAbiVersion ||
+        version == kFrequencyDomainLegacyAbiVersion;
+}
+
+bool valid_modal_request_enums(const ModalEigenRequest &request) noexcept
+{
+    const bool valid_execution_target =
+        request.execution_target == ModalExecutionTarget::auto_select ||
+        request.execution_target == ModalExecutionTarget::production_cpu ||
+        request.execution_target == ModalExecutionTarget::production_gpu;
+    const bool valid_scalar_representation =
+        request.scalar_representation == ModalScalarRepresentation::real_split ||
+        request.scalar_representation == ModalScalarRepresentation::complex_double;
+    const bool valid_result_representation =
+        request.result_field_representation == ModalResultFieldRepresentation::tangent_q ||
+        request.result_field_representation == ModalResultFieldRepresentation::cartesian_delta_m ||
+        request.result_field_representation ==
+            ModalResultFieldRepresentation::tangent_q_and_cartesian_delta_m;
+    return valid_execution_target && valid_scalar_representation && valid_result_representation;
+}
+
+bool modal_request_floquet_k_vector(
+    const ModalEigenRequest &request,
+    std::array<double, 3> &out_k) noexcept
+{
+    const double *k_vector = request.operator_request.k_vector_rad_m;
+    int k_vector_len = request.operator_request.k_vector_len;
+    if ((k_vector == nullptr || k_vector_len <= 0) && request.has_floquet_k_vector) {
+        k_vector = request.floquet_k_vector_rad_per_m;
+        k_vector_len = 3;
+    }
+    if (k_vector == nullptr || k_vector_len != 3) {
+        return false;
+    }
+    for (int index = 0; index < 3; ++index) {
+        if (!std::isfinite(k_vector[index])) {
+            return false;
+        }
+        out_k[static_cast<std::size_t>(index)] = k_vector[index];
+    }
+    return true;
+}
+
+bool modal_request_has_explicit_floquet_k_vector(
+    const ModalEigenRequest &request) noexcept
+{
+    return request.has_floquet_k_vector ||
+        request.operator_request.k_vector_len != 0;
+}
+
+floquet_k::Classification modal_request_floquet_k_classification(
+    const ModalEigenRequest &request) noexcept
+{
+    if (request.operator_request.spin_wave_bc_kind == nullptr ||
+        std::strcmp(request.operator_request.spin_wave_bc_kind, "floquet") != 0) {
+        return floquet_k::Classification::invalid;
+    }
+    if (!modal_request_has_explicit_floquet_k_vector(request)) {
+        // Preserve the legacy omitted-vector representation as implicit Gamma.
+        return floquet_k::Classification::gamma;
+    }
+    std::array<double, 3> k_vector{};
+    if (!modal_request_floquet_k_vector(request, k_vector)) {
+        return floquet_k::Classification::invalid;
+    }
+    return floquet_k::classify(k_vector);
+}
+
+bool modal_request_floquet_k_vector_is_valid_if_declared(
+    const ModalEigenRequest &request) noexcept
+{
+    if (request.operator_request.spin_wave_bc_kind == nullptr ||
+        std::strcmp(request.operator_request.spin_wave_bc_kind, "floquet") != 0 ||
+        !modal_request_has_explicit_floquet_k_vector(request)) {
+        // Older callers may omit the vector for Floquet Gamma.  Preserve that
+        // implicit-k=0 representation and validate only declared vectors.
+        return true;
+    }
+    return modal_request_floquet_k_classification(request) !=
+        floquet_k::Classification::invalid;
+}
+
+// The legacy Poisson-airbox modal path is assembled with real, k=0 blocks.
+// Route only the shared componentwise nonzero class to nonzero-k providers.
+bool modal_request_is_nonzero_k_floquet(const ModalEigenRequest &request) noexcept
+{
+    if (request.operator_request.spin_wave_bc_kind == nullptr ||
+        std::strcmp(request.operator_request.spin_wave_bc_kind, "floquet") != 0) {
+        return false;
+    }
+    return modal_request_floquet_k_classification(request) ==
+        floquet_k::Classification::nonzero;
+}
 
 std::string escape_json_string(const char *value)
 {
@@ -96,6 +222,64 @@ std::string with_operator_diagnostics(
 
 std::string format_double(double value) noexcept;
 
+std::uint64_t required_modal_mode_vector_count(
+    const PoissonAirboxModalEigenResult &result) noexcept
+{
+    const std::uint64_t max_count = std::numeric_limits<std::uint64_t>::max();
+    if (result.q_dof_count > max_count - result.phi_dof_count) {
+        return max_count;
+    }
+    const std::uint64_t base_count = result.q_dof_count + result.phi_dof_count;
+    if (result.gauge_augmented && base_count == max_count) {
+        return max_count;
+    }
+    return base_count + (result.gauge_augmented ? 1u : 0u);
+}
+
+bool accepted_modal_mode_vectors_valid(
+    const PoissonAirboxModalEigenResult &result) noexcept
+{
+    const std::uint64_t required_count = required_modal_mode_vector_count(result);
+    for (const PoissonAirboxModalEigenResult::AcceptedMode &mode : result.accepted_modes) {
+        if (mode.full_vector.size() < required_count) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool accepted_modal_mode_payload_finite(
+    const PoissonAirboxModalEigenResult &result) noexcept
+{
+    for (const PoissonAirboxModalEigenResult::AcceptedMode &mode : result.accepted_modes) {
+        if (!std::isfinite(mode.eigenvalue_real) ||
+            !std::isfinite(mode.eigenvalue_imag) ||
+            !std::isfinite(mode.relative_residual) || mode.relative_residual < 0.0) {
+            return false;
+        }
+        for (const std::complex<double> &value : mode.full_vector) {
+            if (!std::isfinite(value.real()) || !std::isfinite(value.imag())) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+void replace_json_status(std::string &json, const char *status)
+{
+    const std::string key = "\"status\":\"";
+    const std::size_t key_begin = json.find(key);
+    if (key_begin == std::string::npos) {
+        return;
+    }
+    const std::size_t value_begin = key_begin + key.size();
+    const std::size_t value_end = json.find('"', value_begin);
+    if (value_end != std::string::npos) {
+        json.replace(value_begin, value_end - value_begin, status);
+    }
+}
+
 DynamicPencilMetadata magnetic_pencil_metadata(
     const ModalEigenRequest &request) noexcept
 {
@@ -121,11 +305,33 @@ std::string with_magnetic_pencil_digest(
         json.empty() || json.back() != '}') {
         return json;
     }
-    const std::uint64_t entry_count =
-        request.mfem_tangent_dof_count * request.mfem_tangent_dof_count;
+    const std::uint64_t tangent_dof_count = request.mfem_tangent_dof_count;
+    if (tangent_dof_count >
+        std::numeric_limits<std::uint64_t>::max() / tangent_dof_count) {
+        return json;
+    }
+    const std::uint64_t entry_count = tangent_dof_count * tangent_dof_count;
+    const bool dynamic_demag_k_declared =
+        request.dynamic_demag_k_tangent_matrix_row_major != nullptr ||
+        request.dynamic_demag_k_tangent_matrix_value_count != 0u;
+    if (dynamic_demag_k_declared &&
+        (request.dynamic_demag_k_tangent_matrix_row_major == nullptr ||
+         request.dynamic_demag_k_tangent_matrix_value_count != entry_count ||
+         entry_count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()))) {
+        return json;
+    }
     std::vector<std::complex<double>> l(entry_count), b_alpha(entry_count);
     for (std::uint64_t i = 0; i < entry_count; ++i) {
-        l[i] = {-request.mfem_stiffness_matrix_row_major[i], 0.0};
+        double stiffness = request.mfem_stiffness_matrix_row_major[i];
+        if (dynamic_demag_k_declared) {
+            const double dynamic_demag_k =
+                request.dynamic_demag_k_tangent_matrix_row_major[i];
+            if (!std::isfinite(dynamic_demag_k)) {
+                return json;
+            }
+            stiffness += dynamic_demag_k;
+        }
+        l[i] = {-stiffness, 0.0};
         b_alpha[i] = {-request.mfem_gyrotropic_matrix_row_major[i], 0.0};
     }
     DynamicPencilMetadata canonical_metadata{};
@@ -181,6 +387,110 @@ FrequencyDomainContractResult validation_error_result(
         "\"study_product\":\"" +
         std::string(study_product != nullptr ? study_product : "") +
         "\",\"status\":\"validation_error\"}";
+    result.modal_execution.execution_target =
+        FULLMAG_FEM_MODAL_EXECUTION_VALIDATION;
+    result.modal_execution.scalar_representation =
+        static_cast<std::uint32_t>(ModalScalarRepresentation::complex_double);
+    result.modal_execution.spectral_transform_kind =
+        static_cast<std::uint32_t>(ModalSpectralTransformKind::auto_select);
+    result.modal_execution.fallback_state = ModalResolvedFallbackState::none;
+    result.modal_execution.engine_id = "validation_error";
+    result.modal_execution.fallback_reason = "none";
+    return result;
+}
+
+FrequencyDomainContractResult shared_domain_provider_failure_result(
+    FrequencyDomainStatus status,
+    const char *study_product,
+    const char *message,
+    const char *reason,
+    const char *operator_diagnostics_json = nullptr) noexcept
+{
+    if (status == FrequencyDomainStatus::validation_error) {
+        return validation_error_result(
+            study_product,
+            message,
+            reason,
+            operator_diagnostics_json);
+    }
+
+    FrequencyDomainContractResult result = validation_error_result(
+        study_product,
+        message,
+        reason,
+        operator_diagnostics_json);
+    result.status = status;
+    const std::string status_label = status_to_string(status);
+    result.diagnostics_json =
+        "{\"schema_version\":\"frequency_domain_contract_diagnostics.v1\","
+        "\"study_product\":\"" +
+        std::string(study_product != nullptr ? study_product : "") +
+        "\",\"status\":\"" + status_label +
+        "\",\"complete\":false,\"reason\":\"" +
+        std::string(reason != nullptr ? reason : "shared_domain_provider_failed") +
+        "\"}";
+    result.diagnostics_json = with_operator_diagnostics(
+        result.diagnostics_json,
+        operator_diagnostics_json);
+    result.result_json =
+        "{\"schema_version\":\"frequency_domain_contract_result.v1\","
+        "\"study_product\":\"" +
+        std::string(study_product != nullptr ? study_product : "") +
+        "\",\"status\":\"" + status_label + "\"}";
+    return result;
+}
+
+void set_modal_execution(
+    FrequencyDomainContractResult &result,
+    ModalExecutionTarget target,
+    ModalSpectralTransformKind transform,
+    const char *engine_id) noexcept
+{
+    result.modal_execution.execution_target = static_cast<std::uint32_t>(target);
+    result.modal_execution.scalar_representation =
+        static_cast<std::uint32_t>(ModalScalarRepresentation::complex_double);
+    result.modal_execution.spectral_transform_kind = static_cast<std::uint32_t>(transform);
+    result.modal_execution.fallback_state = ModalResolvedFallbackState::none;
+    result.modal_execution.engine_id = engine_id != nullptr ? engine_id : "unavailable";
+    result.modal_execution.fallback_reason = "none";
+}
+
+FrequencyDomainContractResult nonzero_k_floquet_k0_poisson_path_unavailable(
+    const ModalEigenRequest &request) noexcept
+{
+    FrequencyDomainContractResult result{};
+    result.status = FrequencyDomainStatus::unavailable;
+    result.error_message =
+        "native FEM modal_eigen nonzero-k Floquet requests cannot use the real k=0 Poisson-airbox path";
+    result.diagnostics_json =
+        "{\"schema_version\":\"frequency_domain_modal_diagnostics.v1\","
+        "\"study_product\":\"modal_eigen\","
+        "\"status\":\"unavailable\","
+        "\"complete\":false,"
+        "\"solver_adapter_status\":\"unsupported\","
+        "\"unsupported_reason\":\"nonzero_k_floquet_k0_poisson_path\","
+        "\"production_cpu_rejection_reason\":\"nonzero_k_floquet_k0_poisson_path\","
+        "\"production_cpu_rejection_scope\":\"selected_spectrum_nonzero_k_floquet_modal\","
+        "\"required_operator_contract\":\"bloch_floquet_airbox_shared_domain_operator\","
+        "\"required_operator_payload_kind\":\"floquet_airbox_shared_domain_operator\","
+        "\"requested_poisson_path\":\"k0_real_shared_domain\","
+        "\"spectral_transform\":\"shift_invert\","
+        "\"phasor_convention\":\"" +
+        std::string(phase_convention_json_label(request.phase_convention)) + "\"}";
+    result.diagnostics_json = with_operator_diagnostics(
+        std::move(result.diagnostics_json),
+        request.operator_request.operator_diagnostics_json);
+    result.result_json =
+        "{\"schema_version\":\"frequency_domain_modal_result.v1\","
+        "\"study_product\":\"modal_eigen\","
+        "\"status\":\"unavailable\","
+        "\"accepted_mode_count\":0,"
+        "\"unsupported_reason\":\"nonzero_k_floquet_k0_poisson_path\","
+        "\"required_operator_contract\":\"bloch_floquet_airbox_shared_domain_operator\"}";
+    result.result_json = with_operator_diagnostics(
+        std::move(result.result_json),
+        request.operator_request.operator_diagnostics_json);
+    result.artifact_manifest_path.clear();
     return result;
 }
 
@@ -225,12 +535,478 @@ bool cancel_requested(const ModalEigenRequest &request) noexcept
 
 std::string format_double(double value) noexcept
 {
+    // JSON has no NaN/Infinity literals. A failed or incomplete modal solve
+    // may leave a diagnostic quantity non-finite; encode that state as null
+    // so the scientific finite-value gate can reject it explicitly.
+    if (!std::isfinite(value)) {
+        return "null";
+    }
     char buffer[64]{};
     const int written = std::snprintf(buffer, sizeof(buffer), "%.17g", value);
     if (written <= 0 || static_cast<std::size_t>(written) >= sizeof(buffer)) {
         return "0";
     }
     return buffer;
+}
+
+std::string k0_demag_operator_probe_json_field(
+    const PoissonAirboxK0DemagProbeResult &probe)
+{
+    if (!probe.requested) {
+        return {};
+    }
+    const auto sample_json = [](const char *name,
+                                const PoissonAirboxK0DemagProbeSample &sample) {
+        return "\"" + std::string(name) + "\":{" +
+            "\"attempted\":" + (sample.attempted ? "true" : "false") +
+            ",\"passed\":" + (sample.passed ? "true" : "false") +
+            ",\"q_l2_norm\":" + format_double(sample.q_l2_norm) +
+            ",\"potential_relative_residual\":" +
+                format_double(sample.potential_relative_residual) +
+            ",\"potential_residual_normalization\":\"componentwise_absolute_csr_action\"" +
+            ",\"potential_action_relative_residual\":" +
+                format_double(sample.potential_action_relative_residual) +
+            ",\"gauge_constraint_abs\":" +
+                format_double(sample.gauge_constraint_abs) +
+            ",\"mean_field_a_per_m\":" +
+                format_double(sample.mean_field_a_per_m) +
+            ",\"mean_magnetization_a_per_m\":" +
+                format_double(sample.mean_magnetization_a_per_m) +
+            ",\"demag_factor\":" + format_double(sample.demag_factor) +
+            ",\"potential_energy_j\":" +
+                format_double(sample.potential_energy_j) +
+            ",\"magnetic_energy_j\":" +
+                format_double(sample.magnetic_energy_j) +
+            ",\"energy_form_relative_defect\":" +
+                format_double(sample.energy_form_relative_defect) + "}";
+    };
+    const char *status = probe.passed
+        ? "passed"
+        : probe.available ? "failed" : "not_observable";
+    return std::string("\"poisson_airbox_k0_demag_operator_probe\":{") +
+        "\"schema_version\":\"poisson_airbox_k0_demag_operator_probe.v1\"," +
+        "\"status\":\"" + std::string(status) + "\"," +
+        "\"potential_equation\":\"P_phi_plus_A_phiq_q_equals_zero\"," +
+        "\"potential_coefficient_unit\":\"A\"," +
+        "\"field_unit\":\"A/m\"," +
+        "\"energy_unit\":\"J\"," +
+        "\"relative_tolerance\":1e-8," +
+        "\"outer_boundary_kind\":\"" +
+            escape_json_string(probe.outer_boundary_kind) + "\"," +
+        "\"robin_beta\":" + format_double(probe.robin_beta) + "," +
+        "\"mu0_t_m_a\":" + format_double(probe.mu0_t_m_a) + "," +
+        "\"magnetic_volume_m3\":" +
+            format_double(probe.magnetic_volume_m3) + "," +
+        sample_json("global_y", probe.global_y) + "," +
+        sample_json("global_z", probe.global_z) + "," +
+        "\"failure_reason\":\"" +
+        escape_json_string(probe.failure_reason) + "\"}";
+}
+
+std::string append_json_field(std::string json, const std::string &field)
+{
+    if (field.empty() || json.empty()) {
+        return json;
+    }
+    const auto is_json_whitespace = [](char value) noexcept {
+        return value == ' ' || value == '\t' || value == '\n' || value == '\r';
+    };
+    std::size_t json_end = json.size();
+    while (json_end > 0u && is_json_whitespace(json[json_end - 1u])) {
+        --json_end;
+    }
+    if (json_end == 0u || json[json_end - 1u] != '}') {
+        return json;
+    }
+    std::size_t object_begin = 0u;
+    while (object_begin < json_end && is_json_whitespace(json[object_begin])) {
+        ++object_begin;
+    }
+    if (object_begin >= json_end || json[object_begin] != '{') {
+        return json;
+    }
+    std::size_t object_content_end = json_end - 1u;
+    while (object_content_end > object_begin + 1u &&
+           is_json_whitespace(json[object_content_end - 1u])) {
+        --object_content_end;
+    }
+    const bool object_has_members = object_content_end > object_begin + 1u;
+    const std::string trailing_whitespace = json.substr(json_end);
+    json.resize(json_end);
+    json.pop_back();
+    if (object_has_members) {
+        json += ',';
+    }
+    json += field;
+    json += '}';
+    json += trailing_whitespace;
+    return json;
+}
+
+std::string modal_request_k_vector_json_field(const ModalEigenRequest &request)
+{
+    const double *values = request.operator_request.k_vector_rad_m;
+    int count = request.operator_request.k_vector_len;
+    if ((values == nullptr || count <= 0) && request.has_floquet_k_vector) {
+        values = request.floquet_k_vector_rad_per_m;
+        count = 3;
+    }
+    if (values == nullptr || count <= 0) {
+        return "";
+    }
+    std::string field = "\"k_vector_len\":" + std::to_string(count) +
+        ",\"k_vector_rad_m\":[";
+    for (int index = 0; index < count; ++index) {
+        if (index != 0) {
+            field += ',';
+        }
+        field += format_double(values[index]);
+    }
+    field += ']';
+    return field;
+}
+
+bool json_has_top_level_field(
+    const std::string &json,
+    const char *field_name) noexcept
+{
+    if (json.empty() || field_name == nullptr || field_name[0] == '\0') {
+        return false;
+    }
+    std::size_t first = 0u;
+    while (first < json.size()) {
+        const char value = json[first];
+        if (value != ' ' && value != '\t' && value != '\n' && value != '\r') {
+            break;
+        }
+        ++first;
+    }
+    if (first == json.size() || json[first] != '{') {
+        return false;
+    }
+
+    int depth = 0;
+    bool in_string = false;
+    bool escaped = false;
+    for (std::size_t index = first; index < json.size(); ++index) {
+        const char value = json[index];
+        if (in_string) {
+            if (escaped) {
+                escaped = false;
+            } else if (value == '\\') {
+                escaped = true;
+            } else if (value == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (value == '"') {
+            if (depth == 1) {
+                const std::size_t key_begin = index + 1u;
+                std::size_t key_end = key_begin;
+                bool key_escaped = false;
+                for (; key_end < json.size(); ++key_end) {
+                    if (json[key_end] == '\\') {
+                        key_escaped = true;
+                        ++key_end;
+                        continue;
+                    }
+                    if (json[key_end] == '"') {
+                        break;
+                    }
+                }
+                if (key_end == json.size()) {
+                    return false;
+                }
+                std::size_t colon = key_end + 1u;
+                while (colon < json.size()) {
+                    const char whitespace = json[colon];
+                    if (whitespace != ' ' && whitespace != '\t' &&
+                        whitespace != '\n' && whitespace != '\r') {
+                        break;
+                    }
+                    ++colon;
+                }
+                const std::size_t field_length = std::strlen(field_name);
+                if (!key_escaped && key_end - key_begin == field_length &&
+                    std::strncmp(
+                        json.data() + key_begin,
+                        field_name,
+                        field_length) == 0 &&
+                    colon < json.size() && json[colon] == ':') {
+                    return true;
+                }
+                index = key_end;
+                continue;
+            }
+            in_string = true;
+            continue;
+        }
+        if (value == '{' || value == '[') {
+            ++depth;
+        } else if (value == '}' || value == ']') {
+            if (depth == 0) {
+                return false;
+            }
+            --depth;
+        }
+    }
+    return false;
+}
+
+#if FULLMAG_HAS_MFEM_STACK
+std::string shared_domain_operator_provenance_json(
+    const PoissonAirboxSharedDomainAssemblyResult &assembly,
+    const char *scope)
+{
+    if (assembly.operator_digest[0] == '\0' ||
+        scope == nullptr || scope[0] == '\0' ||
+        assembly.quadrature_provenance_json.empty()) {
+        return {};
+    }
+    return "\"shared_domain_operator_provenance\":{"
+        "\"schema_version\":\"poisson_airbox_shared_domain_operator_provenance.v1\","
+        "\"publisher_lane\":\"fem_cpu\","
+        "\"scope\":\"" + escape_json_string(scope) + "\","
+        "\"operator_digest\":\"" +
+        escape_json_string(assembly.operator_digest) +
+        "\",\"quadrature\":" + assembly.quadrature_provenance_json + "}";
+}
+#endif
+
+void append_shared_domain_operator_provenance(
+    FrequencyDomainContractResult &result,
+    const std::string &provenance_json)
+{
+    if (provenance_json.empty()) {
+        return;
+    }
+    constexpr const char *kFieldName = "shared_domain_operator_provenance";
+    if (!json_has_top_level_field(result.diagnostics_json, kFieldName)) {
+        result.diagnostics_json = append_json_field(
+            std::move(result.diagnostics_json), provenance_json);
+    }
+    if (!json_has_top_level_field(result.result_json, kFieldName)) {
+        result.result_json = append_json_field(
+            std::move(result.result_json), provenance_json);
+    }
+}
+
+bool append_shared_domain_cartesian_modes(
+    const FullmagFemModalSharedDomainPayload &payload,
+    const PoissonAirboxModalEigenResult &poisson_result,
+    ModalEigenTypedResult *out_result,
+    std::string &error_message)
+{
+    if (out_result == nullptr || payload.equilibrium_m0_xyz == nullptr ||
+        payload.equilibrium_m0_xyz_count == 0u ||
+        payload.magnetic_reduced_node == nullptr ||
+        payload.magnetic_reduced_node_count == 0u) {
+        error_message = "shared-domain modal result is missing the equilibrium or magnetic class payload";
+        return false;
+    }
+    if (payload.equilibrium_m0_xyz_count % 3u != 0u) {
+        error_message = "shared-domain equilibrium payload is not xyz-packed";
+        return false;
+    }
+    const std::uint64_t node_count = payload.equilibrium_m0_xyz_count / 3u;
+    if (payload.magnetic_reduced_node_count == 0u ||
+        payload.magnetic_reduced_node_count > node_count ||
+        poisson_result.q_dof_count != 2u * payload.magnetic_reduced_node_count) {
+        error_message = "shared-domain modal q dimensions do not match the magnetic class map";
+        return false;
+    }
+
+    const std::uint32_t inactive_class = std::numeric_limits<std::uint32_t>::max();
+    std::vector<double> equilibrium_for_frames(
+        payload.equilibrium_m0_xyz,
+        payload.equilibrium_m0_xyz + payload.equilibrium_m0_xyz_count);
+    for (std::uint64_t node = 0; node < node_count; ++node) {
+        const std::uint32_t reduced_node = payload.magnetic_reduced_node[node];
+        if (reduced_node == inactive_class) {
+            // Shared magnetic/airbox meshes carry zero magnetisation in airbox
+            // nodes.  Use the same neutral frame as the operator assembly for
+            // those nodes; their tangent amplitudes remain zero below.
+            equilibrium_for_frames[3u * node] = 0.0;
+            equilibrium_for_frames[3u * node + 1u] = 0.0;
+            equilibrium_for_frames[3u * node + 2u] = 1.0;
+        } else if (reduced_node >= payload.magnetic_reduced_node_count) {
+            error_message = "shared-domain magnetic class map contains an out-of-range node";
+            return false;
+        }
+    }
+
+    std::vector<TangentFrameNode> frames(static_cast<std::size_t>(node_count));
+    TangentFrameDiagnostics frame_diagnostics{};
+    if (build_tangent_frame(
+            equilibrium_for_frames.data(),
+            node_count,
+            frames.data(),
+            &frame_diagnostics) != FrequencyDomainStatus::ok) {
+        error_message = frame_diagnostics.error_message;
+        return false;
+    }
+
+    const std::uint64_t q_dof_count = poisson_result.q_dof_count;
+    out_result->mode_delta_m_xyz_complex.clear();
+    out_result->mode_delta_m_xyz_complex.reserve(
+        poisson_result.accepted_modes.size() * 3u * node_count);
+    for (const PoissonAirboxModalEigenResult::AcceptedMode &mode :
+         poisson_result.accepted_modes) {
+        if (mode.full_vector.size() < q_dof_count + poisson_result.phi_dof_count) {
+            error_message = "shared-domain accepted mode vector is shorter than q+phi dimensions";
+            return false;
+        }
+        std::vector<double> tangent_real(static_cast<std::size_t>(2u * node_count), 0.0);
+        std::vector<double> tangent_imag(static_cast<std::size_t>(2u * node_count), 0.0);
+        for (std::uint64_t node = 0; node < node_count; ++node) {
+            const std::uint32_t reduced_node = payload.magnetic_reduced_node[node];
+            if (reduced_node == inactive_class) {
+                continue;
+            }
+            if (reduced_node >= payload.magnetic_reduced_node_count) {
+                error_message = "shared-domain magnetic class map contains an out-of-range node";
+                return false;
+            }
+            const std::uint64_t reduced_offset = 2u * reduced_node;
+            const std::uint64_t node_offset = 2u * node;
+            tangent_real[node_offset] = mode.full_vector[reduced_offset].real();
+            tangent_real[node_offset + 1u] = mode.full_vector[reduced_offset + 1u].real();
+            tangent_imag[node_offset] = mode.full_vector[reduced_offset].imag();
+            tangent_imag[node_offset + 1u] = mode.full_vector[reduced_offset + 1u].imag();
+        }
+        std::vector<double> cartesian_real(static_cast<std::size_t>(3u * node_count), 0.0);
+        std::vector<double> cartesian_imag(static_cast<std::size_t>(3u * node_count), 0.0);
+        lift_tangent_complex_to_cartesian(
+            frames.data(),
+            tangent_real.data(),
+            tangent_imag.data(),
+            node_count,
+            cartesian_real.data(),
+            cartesian_imag.data());
+        for (std::uint64_t component = 0; component < 3u * node_count; ++component) {
+            out_result->mode_delta_m_xyz_complex.emplace_back(
+                cartesian_real[component], cartesian_imag[component]);
+        }
+    }
+    return true;
+}
+
+std::string format_poisson_airbox_modes_json(
+    const PoissonAirboxModalEigenResult &result,
+    bool metadata_only)
+{
+    // Keep the serializer fail-closed even if a future caller bypasses the
+    // contract-result validation below.  Never index an accepted mode vector
+    // until the complete q+phi(+gauge) extent has been checked.
+    if (!accepted_modal_mode_vectors_valid(result) ||
+        (metadata_only && !accepted_modal_mode_payload_finite(result))) {
+        return "[]";
+    }
+    std::string modes = "[";
+    for (std::size_t mode_index = 0; mode_index < result.accepted_modes.size(); ++mode_index) {
+        const PoissonAirboxModalEigenResult::AcceptedMode &mode =
+            result.accepted_modes[mode_index];
+        if (mode_index != 0) {
+            modes += ",";
+        }
+        modes +=
+            "{\"mode_index\":" + std::to_string(mode_index) +
+            ",\"eigenpair_index\":" + std::to_string(mode.eigenpair_index) +
+            ",\"eigenvalue_real\":" + format_double(mode.eigenvalue_real) +
+            ",\"eigenvalue_imag\":" + format_double(mode.eigenvalue_imag) +
+            ",\"omega_rad_s\":" + format_double(mode.omega_rad_s) +
+            ",\"frequency_hz\":" + format_double(mode.frequency_hz) +
+            ",\"relative_residual\":" + format_double(mode.relative_residual) +
+            ",\"slepc_reported_backward_error\":" +
+            format_double(mode.slepc_reported_backward_error) +
+            ",\"full_residual_reconstruction_relative_error\":" +
+            format_double(mode.full_residual_reconstruction_relative_error) +
+            ",\"magnetic_block_backward_error\":" +
+            format_double(mode.magnetic_block_backward_error) +
+            ",\"poisson_block_backward_error\":" +
+            format_double(mode.poisson_block_backward_error) +
+            ",\"gauge_constraint_backward_error\":" +
+            format_double(mode.gauge_constraint_backward_error) +
+            ",\"magnetic_residual_l2\":" +
+            format_double(mode.magnetic_residual_l2) +
+            ",\"poisson_residual_l2\":" +
+            format_double(mode.poisson_residual_l2) +
+            ",\"gauge_residual_abs\":" +
+            format_double(mode.gauge_residual_abs) +
+            ",\"gauge_mean_abs\":" + format_double(mode.gauge_mean_abs);
+        modes += ",\"q_layout\":\"" +
+            std::string(result.q_layout_interleaved_node_component
+                            ? "interleaved_node_component"
+                            : "block_component_node") +
+            "\"";
+        const std::uint64_t q_count = result.q_dof_count;
+        const std::uint64_t phi_count = result.phi_dof_count;
+        if (metadata_only) {
+            modes += ",\"mode_vector_transport\":\"typed_abi_v18\","
+                "\"q_dof_count\":" + std::to_string(q_count) +
+                ",\"phi_dof_count\":" + std::to_string(phi_count);
+            modes += phi_count == 0
+                ? ",\"phi_layout\":null"
+                : ",\"phi_layout\":\"native_complex_dof\"";
+        } else {
+            modes += ",\"mode_vector_real\":[";
+            for (std::uint64_t index = 0; index < q_count; ++index) {
+                if (index != 0) {
+                    modes += ",";
+                }
+                modes += format_double(mode.full_vector[static_cast<std::size_t>(index)].real());
+            }
+            modes += "],\"mode_vector_imag\":[";
+            for (std::uint64_t index = 0; index < q_count; ++index) {
+                if (index != 0) {
+                    modes += ",";
+                }
+                modes += format_double(mode.full_vector[static_cast<std::size_t>(index)].imag());
+            }
+            modes += "],\"mode_q_real\":[";
+            for (std::uint64_t index = 0; index < q_count; ++index) {
+                if (index != 0) {
+                    modes += ",";
+                }
+                modes += format_double(mode.full_vector[static_cast<std::size_t>(index)].real());
+            }
+            modes += "],\"mode_q_imag\":[";
+            for (std::uint64_t index = 0; index < q_count; ++index) {
+                if (index != 0) {
+                    modes += ",";
+                }
+                modes += format_double(mode.full_vector[static_cast<std::size_t>(index)].imag());
+            }
+            modes += "],\"mode_phi_real\":[";
+            for (std::uint64_t index = 0; index < phi_count; ++index) {
+                if (index != 0) {
+                    modes += ",";
+                }
+                modes += format_double(mode.full_vector[static_cast<std::size_t>(q_count + index)].real());
+            }
+            modes += "],\"mode_phi_imag\":[";
+            for (std::uint64_t index = 0; index < phi_count; ++index) {
+                if (index != 0) {
+                    modes += ",";
+                }
+                modes += format_double(mode.full_vector[static_cast<std::size_t>(q_count + index)].imag());
+            }
+            modes += "]";
+        }
+        // Gauge coefficients are scalar metadata, not bulk vector payloads.
+        // Preserve them on both lanes when the descriptor is augmented.
+        if (result.gauge_augmented) {
+            const std::size_t gauge_index = static_cast<std::size_t>(q_count + phi_count);
+            modes += ",\"mode_gauge_real\":" +
+                format_double(mode.full_vector[gauge_index].real()) +
+                ",\"mode_gauge_imag\":" +
+                format_double(mode.full_vector[gauge_index].imag());
+        }
+        modes += "}";
+    }
+    modes += "]";
+    return modes;
 }
 
 void emit_progress(
@@ -716,6 +1492,11 @@ FrequencyDomainContractResult slepc_tiny_validation_result(
         static_cast<int>(request.tiny_validation_tangent_dof_count);
     slepc_request.stiffness_matrix_row_major = stiffness;
     slepc_request.gyrotropic_matrix_row_major = gyrotropic_mass;
+    // This adapter is restricted to two toy tangent coordinates. Its explicit
+    // positive reference metric is separate from the gyrotropic pencil mass;
+    // generic production callers must still supply their physical FE metric.
+    constexpr double toy_tangent_mass[4] = {1.0, 0.0, 0.0, 1.0};
+    slepc_request.tangent_mass_matrix_row_major = toy_tangent_mass;
     slepc_request.requested_mode_count = request.requested_mode_count;
     slepc_request.target_frequency_hz = shift_frequency_hz;
     slepc_request.frequency_min_hz = request.frequency_min_hz;
@@ -846,6 +1627,11 @@ FrequencyDomainContractResult slepc_tiny_validation_result(
         format_double(kTwoPi * shift_frequency_hz) +
         "}";
     result.artifact_manifest_path.clear();
+    set_modal_execution(
+        result,
+        ModalExecutionTarget::validation,
+        ModalSpectralTransformKind::shift_invert,
+        "slepc_tiny_validation");
     return result;
 }
 
@@ -960,7 +1746,13 @@ FrequencyDomainContractResult solve_tiny_validation_modal_problem(
             "\"complete\":false,"
             "\"execution_lane\":\"validation\","
             "\"tiny_validation_solver\":true,"
-            "\"stop_reason\":null}";
+            "\"tiny_validation_gyrotropic_mass_matrix_row_major\":[" +
+            format_double(gyrotropic_mass[0]) + "," +
+            format_double(gyrotropic_mass[1]) + "," +
+            format_double(gyrotropic_mass[2]) + "," +
+            format_double(gyrotropic_mass[3]) +
+            "],\"tiny_validation_gyrotropic_mass_determinant\":" +
+            format_double(det_g) + ",\"stop_reason\":null}";
         result.diagnostics_json = with_operator_diagnostics(
             result.diagnostics_json,
             request.operator_request.operator_diagnostics_json);
@@ -1271,6 +2063,8 @@ FrequencyDomainContractResult solve_tiny_validation_modal_problem(
         std::to_string(candidate_mode_count) +
         ",\"shift_frequency_hz\":" +
         format_double(shift_frequency_hz) +
+        ",\"shift_omega_rad_s\":" +
+        format_double(omega_rad_s_from_frequency_hz(shift_frequency_hz)) +
         ",\"outer_iteration\":1,"
         "\"linear_iteration\":1,"
         "\"relative_residual_max\":" +
@@ -1302,7 +2096,9 @@ FrequencyDomainContractResult solve_tiny_validation_modal_problem(
         "\"relative_residual\":" +
         format_double(relative_residual) +
         ",\"shift_frequency_hz\":" +
-        format_double(shift_frequency_hz);
+        format_double(shift_frequency_hz) +
+        ",\"shift_omega_rad_s\":" +
+        format_double(omega_rad_s_from_frequency_hz(shift_frequency_hz));
     if (is_frequency_window(request)) {
         result.result_json += ",\"window_completeness\":\"";
         result.result_json += completeness_status;
@@ -1315,15 +2111,87 @@ FrequencyDomainContractResult solve_tiny_validation_modal_problem(
 
 } // namespace
 
+bool apply_poisson_airbox_iteration_policy(
+    PoissonAirboxEigenBlockProblem &problem,
+    const ModalEigenRequest &request) noexcept
+{
+    if (request.max_outer_iterations < 0 || request.max_linear_iterations < 0) {
+        return false;
+    }
+    const bool preserve_omitted =
+        request.execution_target == ModalExecutionTarget::production_gpu;
+    if (request.max_outer_iterations != 0 || !preserve_omitted) {
+        problem.max_outer_iterations =
+            static_cast<std::uint32_t>(request.max_outer_iterations);
+    }
+    if (request.max_linear_iterations != 0 || !preserve_omitted) {
+        problem.max_linear_iterations =
+            static_cast<std::uint32_t>(request.max_linear_iterations);
+    }
+    return true;
+}
+
 FrequencyDomainContractResult solve_modal_eigen_contract(
     const ModalEigenRequest &request) noexcept
 {
-    if (request.abi_version != kFrequencyDomainAbiVersion ||
-        request.operator_request.abi_version != kFrequencyDomainAbiVersion) {
+    if (!supported_frequency_domain_abi(request.abi_version) ||
+        !supported_frequency_domain_abi(request.operator_request.abi_version)) {
         return validation_error_result(
             "modal_eigen",
             "native FEM modal_eigen request uses an unsupported ABI version",
             "unsupported_abi_version",
+            request.operator_request.operator_diagnostics_json);
+    }
+    if (!valid_modal_request_enums(request)) {
+        return validation_error_result(
+            "modal_eigen",
+            "native FEM modal_eigen request uses an unknown enum value",
+            "unknown_modal_enum",
+            request.operator_request.operator_diagnostics_json);
+    }
+    if (request.poisson_airbox_block_enabled != 0 &&
+        (request.max_outer_iterations < 0 || request.max_linear_iterations < 0)) {
+        return validation_error_result(
+            "modal_eigen", "Poisson-airbox iteration budgets must be non-negative",
+            "poisson_airbox_iteration_budget_invalid",
+            request.operator_request.operator_diagnostics_json);
+    }
+    const char *damping_policy = request.operator_request.damping_policy;
+    const bool include_gilbert_damping = damping_policy != nullptr &&
+        std::strcmp(damping_policy, "include") == 0;
+    if (damping_policy != nullptr &&
+        std::strcmp(damping_policy, "ignore") != 0 &&
+        !include_gilbert_damping) {
+        return validation_error_result(
+            "modal_eigen",
+            "native FEM modal_eigen request uses an invalid damping_policy",
+            "invalid_modal_damping_policy",
+            request.operator_request.operator_diagnostics_json);
+    }
+    if (request.poisson_airbox_shared_domain_enabled != 0 &&
+        include_gilbert_damping) {
+        FrequencyDomainContractResult result = shared_domain_provider_failure_result(
+            FrequencyDomainStatus::unavailable,
+            "modal_eigen",
+            "native FEM modal_eigen exact damping is unavailable for shared-domain operators",
+            "shared_domain_exact_damping_unavailable",
+            request.operator_request.operator_diagnostics_json);
+        set_modal_execution(
+            result,
+            request.execution_target,
+            request.spectral_transform_kind,
+            "shared_domain_exact_damping_unavailable");
+        return result;
+    }
+    const bool wants_cartesian_delta_m =
+        request.result_field_representation != ModalResultFieldRepresentation::tangent_q;
+    if (wants_cartesian_delta_m &&
+        (request.poisson_airbox_shared_domain_enabled == 0 ||
+         request.poisson_airbox_shared_domain_payload == nullptr)) {
+        return validation_error_result(
+            "modal_eigen",
+            "native FEM modal_eigen Cartesian delta_m output requires an accepted tangent-to-Cartesian basis",
+            "missing_tangent_to_cartesian_basis",
             request.operator_request.operator_diagnostics_json);
     }
     DynamicPencilMetadata canonical_metadata{};
@@ -1349,9 +2217,404 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
             "missing_output_directory",
             request.operator_request.operator_diagnostics_json);
     }
-    if (request.tiny_validation_enabled != 0) {
-        return solve_tiny_validation_modal_problem(request);
+    if (!modal_request_floquet_k_vector_is_valid_if_declared(request)) {
+        FrequencyDomainContractResult result = validation_error_result(
+            "modal_eigen",
+            "native FEM modal_eigen Floquet wavevector must contain exactly three finite components when supplied",
+            "invalid_floquet_wavevector",
+            request.operator_request.operator_diagnostics_json);
+        return result;
     }
+    if (request.tiny_validation_enabled != 0 &&
+        request.execution_target == ModalExecutionTarget::production_gpu) {
+        FrequencyDomainContractResult result = validation_error_result(
+            "modal_eigen",
+            "native FEM modal_eigen production_gpu cannot use a tiny validation fixture",
+            "tiny_validation_production_gpu_conflict",
+            request.operator_request.operator_diagnostics_json);
+        set_modal_execution(
+            result,
+            request.execution_target,
+            request.spectral_transform_kind,
+            "production_gpu_tiny_validation_rejected");
+        return result;
+    }
+    if (request.tiny_validation_enabled != 0) {
+        FrequencyDomainContractResult result = solve_tiny_validation_modal_problem(request);
+        set_modal_execution(
+            result,
+            ModalExecutionTarget::validation,
+            ModalSpectralTransformKind::shift_invert,
+            "tiny_validation_modal_eigen");
+        return result;
+    }
+    ModalEigenRequest effective_request = request;
+    std::vector<double> floquet_dynamic_demag_k_storage;
+    bool native_nonzero_k_shared_domain_provider = false;
+    std::string k0_shared_domain_provenance;
+    std::string assembled_operator_provenance;
+#if FULLMAG_HAS_MFEM_STACK
+    PoissonAirboxSharedDomainAssemblyResult native_floquet_sparse_assembly{};
+    FloquetSharedDomainSparseModalOperator native_floquet_sparse_operator{};
+#endif
+    std::string floquet_potential_certificate;
+    FloquetPotentialReconstruction floquet_reconstruction;
+#if FULLMAG_HAS_MFEM_STACK
+    /*
+     * The runner-owned shared-domain Floquet request intentionally carries
+     * no Rust-materialised K/G/M matrices.  Consume that one mesh/material/
+     * equilibrium payload directly and retain its sparse complex phase
+     * blocks for the native MatShell owner.  The legacy dense provider below
+     * remains available only for direct callers that explicitly supplied the
+     * old dense magnetic descriptor (including the bounded contour fixture).
+     */
+    const bool has_legacy_dense_magnetic_descriptor =
+        request.mfem_operator_enabled != 0 &&
+        request.mfem_tangent_dof_count > 0 &&
+        request.mfem_stiffness_matrix_row_major != nullptr &&
+        request.mfem_gyrotropic_matrix_row_major != nullptr;
+    if (modal_request_is_nonzero_k_floquet(request) &&
+        request.execution_target == ModalExecutionTarget::production_cpu &&
+        request.operator_request.include_demag != 0 &&
+        request.poisson_airbox_shared_domain_enabled != 0 &&
+        request.poisson_airbox_shared_domain_payload != nullptr &&
+        !has_legacy_dense_magnetic_descriptor) {
+        std::array<double, 3> floquet_k{};
+        if (!modal_request_floquet_k_vector(request, floquet_k)) {
+            FrequencyDomainContractResult result = validation_error_result(
+                "modal_eigen",
+                "native FEM nonzero-k Floquet shared-domain provider requires a finite 3D wavevector",
+                "invalid_floquet_wavevector",
+                request.operator_request.operator_diagnostics_json);
+            set_modal_execution(
+                result,
+                request.execution_target,
+                request.spectral_transform_kind,
+                "production_cpu_floquet_airbox_sparse_shared_domain_validation");
+            return result;
+        }
+        const FrequencyDomainStatus provider_status =
+            assemble_poisson_airbox_shared_domain_payload(
+                *request.poisson_airbox_shared_domain_payload,
+                &native_floquet_sparse_assembly,
+                request.floquet_periodic_pairs,
+                request.floquet_periodic_pair_count,
+                &floquet_k,
+                nullptr,
+                false);
+        const FrequencyDomainStatus terminal_status =
+            resolve_shared_domain_provider_terminal_status(
+                provider_status,
+                native_floquet_sparse_assembly.floquet_sparse_operator_ready);
+        if (terminal_status != FrequencyDomainStatus::ok) {
+            FrequencyDomainContractResult result = shared_domain_provider_failure_result(
+                terminal_status,
+                "modal_eigen",
+                native_floquet_sparse_assembly.error_message[0] != '\0'
+                    ? native_floquet_sparse_assembly.error_message
+                    : "native FEM nonzero-k Floquet shared-domain sparse provider failed to assemble",
+                "floquet_shared_domain_sparse_assembly_failed",
+                request.operator_request.operator_diagnostics_json);
+            set_modal_execution(
+                result,
+                request.execution_target,
+                request.spectral_transform_kind,
+                "production_cpu_floquet_airbox_sparse_shared_domain_provider");
+            return result;
+        }
+        assembled_operator_provenance =
+            shared_domain_operator_provenance_json(
+                native_floquet_sparse_assembly,
+                "floquet_sparse_shared_domain_assembly");
+        native_floquet_sparse_operator.a_qq =
+            &native_floquet_sparse_assembly.floquet_a_qq;
+        native_floquet_sparse_operator.b_qq =
+            &native_floquet_sparse_assembly.floquet_b_qq;
+        native_floquet_sparse_operator.p =
+            &native_floquet_sparse_assembly.floquet_p;
+        native_floquet_sparse_operator.a_qphi =
+            &native_floquet_sparse_assembly.floquet_a_qphi;
+        native_floquet_sparse_operator.a_phiq =
+            &native_floquet_sparse_assembly.floquet_a_phiq;
+        native_floquet_sparse_operator.positive_tangent_mass =
+            &native_floquet_sparse_assembly.floquet_positive_tangent_mass;
+        native_floquet_sparse_operator.q_complex_dof_count =
+            native_floquet_sparse_assembly.floquet_a_qq.row_count;
+        native_floquet_sparse_operator.phi_dof_count =
+            native_floquet_sparse_assembly.floquet_p.row_count;
+        native_floquet_sparse_operator.uniform_transverse_probe_q_y =
+            &native_floquet_sparse_assembly.floquet_uniform_transverse_probe_q_y;
+        native_floquet_sparse_operator.uniform_transverse_probe_q_z =
+            &native_floquet_sparse_assembly.floquet_uniform_transverse_probe_q_z;
+        native_floquet_sparse_operator.full_descriptor_assembly =
+            &native_floquet_sparse_assembly;
+        native_floquet_sparse_operator.k_rad_per_m = floquet_k;
+        native_floquet_sparse_operator.mu0_T_m_A =
+            request.operator_request.mu0_T_m_A;
+        native_floquet_sparse_operator.boundary_kind =
+            native_floquet_sparse_assembly.boundary_kind;
+        native_floquet_sparse_operator.gauge_policy =
+            native_floquet_sparse_assembly.gauge_policy;
+        effective_request.floquet_shared_domain_operator =
+            &native_floquet_sparse_operator;
+        effective_request.mfem_sparse_operator_enabled = 1;
+        effective_request.mfem_operator_enabled = 0;
+        effective_request.mfem_tangent_dof_count = 0;
+        effective_request.mfem_stiffness_matrix_row_major = nullptr;
+        effective_request.mfem_gyrotropic_matrix_row_major = nullptr;
+        effective_request.mfem_mass_matrix_row_major = nullptr;
+        effective_request.dynamic_demag_k_tangent_matrix_row_major = nullptr;
+        effective_request.dynamic_demag_k_tangent_matrix_value_count = 0;
+        native_nonzero_k_shared_domain_provider = true;
+    }
+    if (modal_request_is_nonzero_k_floquet(request) &&
+        request.execution_target == ModalExecutionTarget::production_cpu &&
+        request.operator_request.include_demag != 0 &&
+        request.poisson_airbox_shared_domain_enabled != 0 &&
+        request.poisson_airbox_shared_domain_payload != nullptr &&
+        has_legacy_dense_magnetic_descriptor &&
+        !native_nonzero_k_shared_domain_provider) {
+        std::array<double, 3> floquet_k{};
+        if (!modal_request_floquet_k_vector(request, floquet_k)) {
+            FrequencyDomainContractResult result = validation_error_result(
+                "modal_eigen",
+                "native FEM nonzero-k Floquet shared-domain provider requires a finite 3D wavevector",
+                "invalid_floquet_wavevector",
+                request.operator_request.operator_diagnostics_json);
+            set_modal_execution(
+                result,
+                request.execution_target,
+                request.spectral_transform_kind,
+                "production_cpu_floquet_airbox_dynamic_demag_k_validation");
+            return result;
+        }
+        PoissonAirboxSharedDomainAssemblyResult provider_assembly{};
+        FloquetAirboxDynamicDemagKResult provider_result{};
+        const FrequencyDomainStatus provider_status =
+            assemble_poisson_airbox_shared_domain_payload(
+                *request.poisson_airbox_shared_domain_payload,
+                &provider_assembly,
+                request.floquet_periodic_pairs,
+                request.floquet_periodic_pair_count,
+                &floquet_k,
+                &provider_result);
+        const FrequencyDomainStatus terminal_status =
+            resolve_shared_domain_provider_terminal_status(
+                provider_status,
+                !provider_result.real_split_row_major.empty());
+        if (terminal_status != FrequencyDomainStatus::ok) {
+            FrequencyDomainContractResult result = shared_domain_provider_failure_result(
+                terminal_status,
+                "modal_eigen",
+                provider_assembly.error_message[0] != '\0'
+                    ? provider_assembly.error_message
+                    : "native FEM nonzero-k Floquet shared-domain provider failed to assemble a dynamic demagnetization operator",
+                "floquet_airbox_dynamic_demag_k_assembly_failed",
+                request.operator_request.operator_diagnostics_json);
+            set_modal_execution(
+                result,
+                request.execution_target,
+                request.spectral_transform_kind,
+                "production_cpu_floquet_airbox_dynamic_demag_k_provider");
+            return result;
+        }
+
+        assembled_operator_provenance =
+            shared_domain_operator_provenance_json(
+                provider_assembly,
+                "floquet_legacy_dynamic_demag_k_assembly");
+        const std::uint64_t q_dof_count =
+            provider_result.reconstruction.q_count;
+        const std::uint64_t max_value =
+            std::numeric_limits<std::uint64_t>::max();
+        const bool q_doubled_is_representable =
+            q_dof_count > 0u && q_dof_count <= max_value / 2u;
+        const std::uint64_t real_split_tangent_dof_count =
+            q_doubled_is_representable ? 2u * q_dof_count : 0u;
+        const bool dense_extent_is_representable =
+            real_split_tangent_dof_count > 0u &&
+            real_split_tangent_dof_count <=
+                max_value / real_split_tangent_dof_count;
+        const std::uint64_t dense_value_count =
+            dense_extent_is_representable
+                ? real_split_tangent_dof_count * real_split_tangent_dof_count
+                : 0u;
+        const bool dense_value_count_fits_size_t =
+            dense_extent_is_representable &&
+            dense_value_count <= static_cast<std::uint64_t>(
+                std::numeric_limits<std::size_t>::max());
+        if (!dense_value_count_fits_size_t ||
+            request.mfem_tangent_dof_count != real_split_tangent_dof_count ||
+            provider_result.diagnostics.q_dof_count != q_dof_count ||
+            provider_result.real_split_row_major.size() !=
+                static_cast<std::size_t>(dense_value_count)) {
+            FrequencyDomainContractResult result = validation_error_result(
+                "modal_eigen",
+                "native shared-domain Floquet dense descriptor must match the provider's full real-split tangent basis",
+                "floquet_shared_domain_dense_real_split_dimension_mismatch",
+                request.operator_request.operator_diagnostics_json);
+            append_shared_domain_operator_provenance(
+                result, assembled_operator_provenance);
+            set_modal_execution(
+                result,
+                request.execution_target,
+                request.spectral_transform_kind,
+                "production_cpu_floquet_airbox_dynamic_demag_k_dimension_validation");
+            return result;
+        }
+        const auto &certificate = provider_result.diagnostics;
+        if (!certificate.potential_solve_certified ||
+            certificate.certified_rhs_count != certificate.q_dof_count) {
+            FrequencyDomainContractResult result = validation_error_result(
+                "modal_eigen", "Floquet potential solve has no complete certificate",
+                "floquet_potential_certificate_missing",
+                request.operator_request.operator_diagnostics_json);
+            append_shared_domain_operator_provenance(
+                result, assembled_operator_provenance);
+            return result;
+        }
+        floquet_potential_certificate =
+            "{\"potential_solve_certified\":true,"
+            "\"full_modal_residual_certified\":false,"
+            "\"certified_rhs_count\":" + std::to_string(certificate.certified_rhs_count) +
+            ",\"relative_residual_max\":" +
+            format_double(certificate.max_relative_potential_solve_residual) +
+            ",\"relative_residual_tolerance\":1e-8,"
+            "\"norm\":\"original_potential_rhs_relative_linf\","
+            "\"includes_pinned_equation\":true}";
+        floquet_reconstruction=std::move(provider_result.reconstruction);
+        floquet_reconstruction.magnetic_stiffness_real_split=request.mfem_stiffness_matrix_row_major;
+        floquet_reconstruction.magnetic_stiffness_real_split_value_count =
+            provider_result.real_split_row_major.size();
+        floquet_dynamic_demag_k_storage = std::move(provider_result.real_split_row_major);
+        effective_request.dynamic_demag_k_tangent_matrix_row_major =
+            floquet_dynamic_demag_k_storage.data();
+        effective_request.dynamic_demag_k_tangent_matrix_value_count =
+            floquet_dynamic_demag_k_storage.size();
+        // The shared-domain payload has now been consumed by the k-aware
+        // provider.  Route the resulting real-split tangent operator through
+        // the ordinary native modal adapter instead of the legacy real k=0
+        // Poisson descriptor branch below.
+        effective_request.poisson_airbox_shared_domain_enabled = 0;
+        effective_request.poisson_airbox_shared_domain_payload = nullptr;
+        native_nonzero_k_shared_domain_provider = true;
+    }
+#endif
+    if (modal_request_is_nonzero_k_floquet(request) &&
+        (request.poisson_airbox_shared_domain_enabled != 0 ||
+         request.poisson_airbox_block_enabled != 0) &&
+        !native_nonzero_k_shared_domain_provider) {
+        FrequencyDomainContractResult result =
+            nonzero_k_floquet_k0_poisson_path_unavailable(request);
+        const ModalExecutionTarget unavailable_target =
+            request.execution_target == ModalExecutionTarget::production_gpu
+                ? ModalExecutionTarget::production_gpu
+                : request.execution_target == ModalExecutionTarget::production_cpu
+                    ? ModalExecutionTarget::production_cpu
+                    : ModalExecutionTarget::auto_select;
+        set_modal_execution(
+            result,
+            unavailable_target,
+            request.spectral_transform_kind,
+            unavailable_target == ModalExecutionTarget::production_gpu
+                ? "production_gpu_nonzero_k_floquet_k0_poisson_path_unavailable"
+                : "production_cpu_nonzero_k_floquet_k0_poisson_path_unavailable");
+        return result;
+    }
+#if FULLMAG_HAS_MFEM_STACK
+    PoissonAirboxSharedDomainAssemblyResult shared_domain_assembly{};
+#endif
+    if (request.poisson_airbox_shared_domain_enabled != 0 &&
+        !native_nonzero_k_shared_domain_provider) {
+        if (request.poisson_airbox_shared_domain_payload == nullptr) {
+            return validation_error_result(
+                "modal_eigen",
+                "native FEM modal_eigen shared-domain payload is missing",
+                "missing_shared_domain_payload",
+                request.operator_request.operator_diagnostics_json);
+        }
+#if FULLMAG_HAS_MFEM_STACK
+        const FrequencyDomainStatus assembly_status =
+            assemble_poisson_airbox_shared_domain_payload(
+                *request.poisson_airbox_shared_domain_payload,
+                &shared_domain_assembly);
+        if (assembly_status != FrequencyDomainStatus::ok) {
+            return validation_error_result(
+                "modal_eigen",
+                shared_domain_assembly.error_message,
+                "shared_domain_assembly_failed",
+                request.operator_request.operator_diagnostics_json);
+        }
+        k0_shared_domain_provenance =
+            shared_domain_operator_provenance_json(
+                shared_domain_assembly,
+                "k0_shared_domain_assembly");
+        const FullmagFemModalSharedDomainPayload &payload =
+            *request.poisson_airbox_shared_domain_payload;
+        effective_request.poisson_airbox_block_enabled = 1;
+        effective_request.poisson_airbox_q_dof_count = shared_domain_assembly.q_dof_count;
+        effective_request.poisson_airbox_phi_dof_count = shared_domain_assembly.phi_dof_count;
+        effective_request.poisson_airbox_a_qq_csr = shared_domain_assembly.a_qq.view();
+        effective_request.poisson_airbox_a_qphi_csr = shared_domain_assembly.a_qphi.view();
+        effective_request.poisson_airbox_a_phiq_csr = shared_domain_assembly.a_phiq.view();
+        effective_request.poisson_airbox_a_phiphi_csr = shared_domain_assembly.p.view();
+        effective_request.poisson_airbox_b_qq_csr = shared_domain_assembly.b_qq.view();
+        effective_request.poisson_airbox_phi_mean_weights =
+            shared_domain_assembly.phi_mean_weights.empty()
+                ? nullptr
+                : shared_domain_assembly.phi_mean_weights.data();
+        effective_request.poisson_airbox_phi_mean_weights_count =
+            shared_domain_assembly.phi_mean_weights.size();
+        effective_request.poisson_airbox_periodic_mesh_certificate_schema =
+            payload.mesh_certificate_schema;
+        effective_request.poisson_airbox_magnetic_pair_count = payload.magnetic_pair_count;
+        effective_request.poisson_airbox_airbox_pair_count = payload.airbox_pair_count;
+        effective_request.poisson_airbox_outer_boundary_kind =
+            shared_domain_assembly.boundary_kind;
+        effective_request.poisson_airbox_robin_beta = payload.robin_beta;
+        effective_request.poisson_airbox_gauge_policy = shared_domain_assembly.gauge_policy;
+        effective_request.poisson_airbox_gauge_reason =
+            std::strcmp(shared_domain_assembly.gauge_policy, "none") == 0
+                ? "coercive_outer_boundary"
+                : "pure_neumann_nullspace";
+        effective_request.poisson_airbox_assembly_kind =
+            shared_domain_assembly.assembly_kind;
+        effective_request.poisson_airbox_target_frequency_hz =
+            request.target_frequency_hz;
+#else
+        FrequencyDomainContractResult result{};
+        result.status = FrequencyDomainStatus::unavailable;
+        result.error_message =
+            "native FEM modal_eigen shared-domain assembly requires an MFEM-enabled build";
+        result.diagnostics_json =
+            "{\"schema_version\":\"frequency_domain_modal_diagnostics.v1\","
+            "\"study_product\":\"modal_eigen\","
+            "\"status\":\"unavailable\","
+            "\"complete\":false,"
+            "\"solver_adapter_status\":\"unsupported\","
+            "\"unsupported_reason\":\"shared_domain_requires_mfem_stack\"}";
+        result.diagnostics_json = with_operator_diagnostics(
+            std::move(result.diagnostics_json),
+            request.operator_request.operator_diagnostics_json);
+        result.result_json =
+            "{\"schema_version\":\"frequency_domain_modal_result.v1\","
+            "\"study_product\":\"modal_eigen\","
+            "\"status\":\"unavailable\","
+            "\"accepted_mode_count\":0,"
+            "\"unsupported_reason\":\"shared_domain_requires_mfem_stack\"}";
+        result.result_json = with_operator_diagnostics(
+            std::move(result.result_json),
+            request.operator_request.operator_diagnostics_json);
+        set_modal_execution(
+            result,
+            request.execution_target,
+            request.spectral_transform_kind,
+            "shared_domain_requires_mfem_stack");
+        return result;
+#endif
+    }
+    {
+    const ModalEigenRequest &request = effective_request;
     if (request.poisson_airbox_block_enabled != 0) {
         PoissonAirboxEigenBlockProblem problem{};
         problem.q_dof_count = request.poisson_airbox_q_dof_count;
@@ -1361,11 +2624,20 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
         problem.A_phiq = request.poisson_airbox_a_phiq_csr;
         problem.A_phiphi = request.poisson_airbox_a_phiphi_csr;
         problem.B_qq = request.poisson_airbox_b_qq_csr;
+#if FULLMAG_HAS_MFEM_STACK
+        if (request.execution_target != ModalExecutionTarget::production_gpu &&
+            !shared_domain_assembly.k0_demag_probe.q_global_y.empty()) {
+            problem.k0_demag_probe = &shared_domain_assembly.k0_demag_probe;
+        }
+#endif
         problem.phi_mean_weights = request.poisson_airbox_phi_mean_weights;
         problem.phi_mean_weights_count =
             request.poisson_airbox_phi_mean_weights_count;
         problem.target_frequency_hz =
             request.poisson_airbox_target_frequency_hz;
+        problem.target_kind = request.target_kind;
+        problem.frequency_min_hz = request.frequency_min_hz;
+        problem.frequency_max_hz = request.frequency_max_hz;
         problem.expected_reference_frequency_hz =
             request.poisson_airbox_expected_reference_frequency_hz;
         problem.periodic_mesh_certificate_schema =
@@ -1380,13 +2652,45 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
         problem.gauge_policy = request.poisson_airbox_gauge_policy;
         problem.gauge_reason = request.poisson_airbox_gauge_reason;
         problem.assembly_kind = request.poisson_airbox_assembly_kind;
-        problem.residual_tolerance = request.residual_tolerance;
+        problem.solver_adapter =
+            request.execution_target == ModalExecutionTarget::production_gpu ?
+                "k0_poisson_airbox_gpu_petsc_slepc" :
+                (std::strcmp(problem.assembly_kind, "mfem_weak_form_shared_domain") == 0
+                     ? "k0_poisson_airbox_cpu_schur_slepc"
+                     : "k0_poisson_airbox_cpu_full_coupled_slepc");
+        // Zero is the public ABI sentinel for an omitted residual policy.
+        // Keep the Poisson problem's existing default; explicit nonzero values,
+        // including invalid ones, remain subject to the adapter validator.
+        if (request.residual_tolerance != 0.0) {
+            problem.residual_tolerance = request.residual_tolerance;
+        }
         problem.requested_mode_count =
             static_cast<std::uint32_t>(request.requested_mode_count);
-        problem.max_outer_iterations =
-            static_cast<std::uint32_t>(request.max_outer_iterations);
-        problem.max_linear_iterations =
-            static_cast<std::uint32_t>(request.max_linear_iterations);
+        if (!apply_poisson_airbox_iteration_policy(problem, request)) {
+            return validation_error_result(
+                "modal_eigen", "Poisson-airbox iteration budgets must be non-negative",
+                "poisson_airbox_iteration_budget_invalid",
+                request.operator_request.operator_diagnostics_json);
+        }
+        problem.production_shared_domain =
+            request.poisson_airbox_shared_domain_enabled != 0;
+        problem.cancel_user_data = request.cancel_user_data;
+        problem.cancel_requested = request.cancel_requested;
+        problem.progress_user_data = request.progress_user_data;
+        problem.progress_callback = request.progress_callback;
+        if (request.poisson_airbox_shared_domain_payload != nullptr) {
+            const FullmagFemModalSharedDomainPayload &payload =
+                *request.poisson_airbox_shared_domain_payload;
+            problem.mesh_generation_identity = payload.mesh_generation_identity;
+            problem.equilibrium_digest = payload.equilibrium_digest;
+            problem.bias_field_sample_signature =
+                payload.bias_field_sample_signature;
+            problem.boundary_gauge_digest = payload.boundary_gauge_digest;
+            problem.operator_input_digest =
+                payload.linearization_descriptor != nullptr
+                    ? payload.linearization_descriptor->operator_input_digest
+                    : nullptr;
+        }
 
         if (request.poisson_airbox_shift_invert_action_enabled != 0) {
             if (request.poisson_airbox_shift_invert_action_device != 0 &&
@@ -1404,6 +2708,13 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
                     "{\"schema_version\":\"frequency_domain_modal_result.v1\","
                     "\"study_product\":\"modal_eigen\","
                     "\"status\":\"validation_error\"}";
+                set_modal_execution(
+                    result,
+                    request.execution_target,
+                    ModalSpectralTransformKind::shift_invert,
+                    "validation_error");
+                append_shared_domain_operator_provenance(
+                    result, k0_shared_domain_provenance);
                 return result;
             }
             if (request.poisson_airbox_shift_invert_action_device == 1) {
@@ -1412,6 +2723,11 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
                 char diagnostics_json[4096]{};
                 char error_message[256]{};
                 FrequencyDomainContractResult result{};
+                set_modal_execution(
+                    result,
+                    ModalExecutionTarget::production_gpu,
+                    ModalSpectralTransformKind::shift_invert,
+                    "gpu_device_dense_modal_shift_invert_action_contract");
 #if FULLMAG_HAS_CUDA_RUNTIME
                 const int gpu_status =
                     fullmag_fem_frequency_domain_apply_modal_shift_invert_gpu_action(
@@ -1450,6 +2766,9 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
                     "\"frequency_response_proxy\":false}";
 #endif
 
+                append_shared_domain_operator_provenance(
+                    result, k0_shared_domain_provenance);
+
                 std::string artifact_path_string;
                 if (result.status == FrequencyDomainStatus::ok &&
                     request.write_partial_artifacts != 0) {
@@ -1474,6 +2793,8 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
                             "\"study_product\":\"modal_eigen\","
                             "\"status\":\"artifact_error\"}";
                         result.artifact_manifest_path.clear();
+                        append_shared_domain_operator_provenance(
+                            result, k0_shared_domain_provenance);
                         return result;
                     }
                     artifact_path_string = artifact_path.string();
@@ -1505,6 +2826,8 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
                     "\"artifact_manifest_path\":\"" +
                     escape_json_string(artifact_path_string.c_str()) +
                     "\"}";
+                append_shared_domain_operator_provenance(
+                    result, k0_shared_domain_provenance);
                 return result;
             }
 
@@ -1525,9 +2848,16 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
                     &action_result);
 
             FrequencyDomainContractResult result{};
+            set_modal_execution(
+                result,
+                ModalExecutionTarget::production_cpu,
+                ModalSpectralTransformKind::shift_invert,
+                "k0_poisson_airbox_cpu_full_coupled_shift_invert_reference");
             result.status = status;
             result.error_message = action_result.error_message;
             result.diagnostics_json = action_result.diagnostics_json;
+            append_shared_domain_operator_provenance(
+                result, k0_shared_domain_provenance);
 
             std::string artifact_path_string;
             if (status == FrequencyDomainStatus::ok &&
@@ -1539,7 +2869,7 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
                 std::string artifact_error;
                 if (!write_text_file(
                         artifact_path,
-                        action_result.diagnostics_json,
+                        result.diagnostics_json.c_str(),
                         artifact_error)) {
                     result.status = FrequencyDomainStatus::artifact_error;
                     result.error_message = artifact_error;
@@ -1553,6 +2883,8 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
                         "\"study_product\":\"modal_eigen\","
                         "\"status\":\"artifact_error\"}";
                     result.artifact_manifest_path.clear();
+                    append_shared_domain_operator_provenance(
+                        result, k0_shared_domain_provenance);
                     return result;
                 }
                 artifact_path_string = artifact_path.string();
@@ -1586,26 +2918,230 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
                 ",\"artifact_manifest_path\":\"" +
                 escape_json_string(artifact_path_string.c_str()) +
                 "\"}";
+            append_shared_domain_operator_provenance(
+                result, k0_shared_domain_provenance);
             return result;
         }
 
-        PoissonAirboxModalEigenResult poisson_result{};
-        const FrequencyDomainStatus status =
-            solve_poisson_airbox_modal_eigen_cpu_slepc(problem, &poisson_result);
+        // The complete-window diagnostics make this result substantially
+        // larger than a typical Rust worker stack can safely nest with the
+        // native window solver's own state. Keep the production result on the
+        // heap and retain a reference so the existing result mapping remains
+        // explicit and unchanged.
+        auto poisson_result_storage =
+            std::make_unique<PoissonAirboxModalEigenResult>();
+        PoissonAirboxModalEigenResult &poisson_result =
+            *poisson_result_storage;
+        FrequencyDomainStatus status = FrequencyDomainStatus::unavailable;
+#if FULLMAG_HAS_CUDA_RUNTIME && FULLMAG_FEM_WITH_SLEPC
+        if (request.execution_target == ModalExecutionTarget::production_gpu) {
+            status = solve_poisson_airbox_modal_eigen_gpu_petsc_slepc(
+                problem,
+                &poisson_result);
+        } else {
+            status = solve_poisson_airbox_modal_eigen_cpu_slepc(
+                problem,
+                &poisson_result);
+        }
+#elif FULLMAG_HAS_CUDA_RUNTIME
+        if (request.execution_target == ModalExecutionTarget::production_gpu) {
+            poisson_result.status = FrequencyDomainStatus::unavailable;
+            poisson_result.q_dof_count = problem.q_dof_count;
+            poisson_result.phi_dof_count = problem.phi_dof_count;
+            poisson_result.augmented_dof_count = problem.q_dof_count + problem.phi_dof_count;
+            std::strncpy(
+                poisson_result.error_message,
+                "GPU modal K0 requires PETSc/SLEPc support",
+                sizeof(poisson_result.error_message) - 1u);
+            std::snprintf(
+                poisson_result.diagnostics_json,
+                sizeof(poisson_result.diagnostics_json),
+                "{\"schema_version\":\"poisson_airbox_modal_eigen_gpu.v1\","
+                "\"status\":\"unavailable\","
+                "\"reason\":\"slepc_unavailable\","
+                "\"execution_lane\":\"production_gpu\","
+                "\"cpu_fallback\":\"disabled\",\"fallback_used\":false}");
+            status = poisson_result.status;
+        } else {
+            status = solve_poisson_airbox_modal_eigen_cpu_slepc(
+                problem,
+                &poisson_result);
+        }
+#else
+        if (request.execution_target == ModalExecutionTarget::production_gpu) {
+            poisson_result.status = FrequencyDomainStatus::unavailable;
+            poisson_result.q_dof_count = problem.q_dof_count;
+            poisson_result.phi_dof_count = problem.phi_dof_count;
+            poisson_result.augmented_dof_count = problem.q_dof_count + problem.phi_dof_count;
+            std::strncpy(
+                poisson_result.error_message,
+                "GPU modal K0 requires CUDA runtime support",
+                sizeof(poisson_result.error_message) - 1u);
+            std::snprintf(
+                poisson_result.diagnostics_json,
+                sizeof(poisson_result.diagnostics_json),
+                "{\"schema_version\":\"poisson_airbox_modal_eigen_gpu.v1\","
+                "\"status\":\"unavailable\","
+                "\"reason\":\"cuda_runtime_unavailable\","
+                "\"execution_lane\":\"production_gpu\","
+                "\"cpu_fallback\":\"disabled\",\"fallback_used\":false}");
+            status = poisson_result.status;
+        } else {
+            status = solve_poisson_airbox_modal_eigen_cpu_slepc(
+                problem,
+                &poisson_result);
+        }
+#endif
+        poisson_result.q_layout_interleaved_node_component =
+            problem.assembly_kind != nullptr &&
+            std::strcmp(problem.assembly_kind, "mfem_weak_form_shared_domain") == 0;
         const std::uint64_t augmented_phi_dof_count =
             poisson_result.augmented_dof_count >= poisson_result.q_dof_count
                 ? (poisson_result.augmented_dof_count -
                    poisson_result.q_dof_count)
                 : 0;
+        const bool requested_gpu =
+            request.execution_target == ModalExecutionTarget::production_gpu;
+        std::string mode_transport_error;
+        if (!requested_gpu && !poisson_result.accepted_modes.empty()) {
+            if (!accepted_modal_mode_vectors_valid(poisson_result)) {
+                mode_transport_error = "invalid_mode_vector_extent";
+            } else if (!accepted_modal_mode_payload_finite(poisson_result)) {
+                mode_transport_error = "nonfinite_mode_payload";
+            } else if (!poisson_result.accepted_modes.empty()) {
+                const std::size_t mode_count = poisson_result.accepted_modes.size();
+                const std::uintmax_t size_limit =
+                    static_cast<std::uintmax_t>(std::numeric_limits<std::size_t>::max());
+                const std::uintmax_t q_count = poisson_result.q_dof_count;
+                const std::uintmax_t phi_count = poisson_result.phi_dof_count;
+                const std::size_t typed_limit =
+                    std::vector<std::complex<double>>{}.max_size();
+                if (poisson_result.q_dof_count == 0 ||
+                    poisson_result.phi_dof_count == 0 ||
+                    q_count > size_limit || phi_count > size_limit ||
+                    static_cast<std::uintmax_t>(mode_count) >
+                        std::numeric_limits<std::uint64_t>::max() ||
+                    q_count > size_limit / mode_count ||
+                    phi_count > size_limit / mode_count ||
+                    q_count * mode_count > typed_limit ||
+                    phi_count * mode_count > typed_limit) {
+                    mode_transport_error = "typed_mode_count_overflow";
+                }
+            }
+            if (!mode_transport_error.empty()) {
+                status = FrequencyDomainStatus::operator_error;
+            }
+        }
 
         FrequencyDomainContractResult result{};
         result.status = status;
-        result.error_message = poisson_result.error_message;
+        result.error_message = mode_transport_error.empty()
+            ? poisson_result.error_message
+            : "native FEM modal_eigen typed mode transport failed: " +
+                mode_transport_error;
         result.diagnostics_json = poisson_result.diagnostics_json;
+        if (!mode_transport_error.empty()) {
+            replace_json_status(result.diagnostics_json, "operator_error");
+        }
+        const std::string request_k_vector_field = modal_request_k_vector_json_field(request);
+        result.diagnostics_json = append_json_field(
+            std::move(result.diagnostics_json), request_k_vector_field);
+        append_shared_domain_operator_provenance(
+            result, k0_shared_domain_provenance);
+        const std::string k0_demag_probe_json =
+            k0_demag_operator_probe_json_field(
+                poisson_result.k0_demag_operator_probe);
+        result.diagnostics_json = append_json_field(
+            std::move(result.diagnostics_json),
+            k0_demag_probe_json);
+        result.modal_gpu_attestation.hypre_policy_observed =
+            poisson_result.hypre_device_policy_observed;
+        result.modal_gpu_attestation.hypre_policy_configured =
+            poisson_result.hypre_device_policy_configured;
+        result.modal_gpu_attestation.hypre_memory_location_device =
+            poisson_result.hypre_memory_location_device;
+        result.modal_gpu_attestation.hypre_execution_policy_device =
+            poisson_result.hypre_execution_policy_device;
+        result.modal_gpu_attestation.hypre_vendor_sptrans_enabled =
+            poisson_result.hypre_vendor_sptrans_enabled;
+        result.modal_gpu_attestation.hypre_vendor_spmv_enabled =
+            poisson_result.hypre_vendor_spmv_enabled;
+        result.modal_gpu_attestation.hypre_vendor_spgemm_enabled =
+            poisson_result.hypre_vendor_spgemm_enabled;
+        result.modal_gpu_attestation.hypre_first_error_code =
+            poisson_result.hypre_first_error_code;
+        result.modal_gpu_attestation.hypre_failure_reason =
+            poisson_result.hypre_failure_reason;
+        const char *modal_status_text =
+            status == FrequencyDomainStatus::ok ? "ok" :
+            status == FrequencyDomainStatus::interrupted ? "interrupted" :
+            status == FrequencyDomainStatus::unavailable ? "unavailable" :
+            status == FrequencyDomainStatus::validation_error ? "validation_error" :
+            status == FrequencyDomainStatus::operator_error ? "operator_error" :
+            status == FrequencyDomainStatus::artifact_error ? "artifact_error" :
+            "solve_error";
+        const char *requested_execution = requested_gpu ? "production_gpu" : "production_cpu";
+        const char *requested_solver_adapter = requested_gpu
+            ? "k0_poisson_airbox_gpu_petsc_slepc"
+            : "k0_poisson_airbox_cpu_full_coupled_slepc";
+        const bool resolves_to_cpu_schur =
+            !requested_gpu &&
+            (std::strcmp(problem.assembly_kind, "mfem_weak_form_shared_domain") == 0 ||
+             (std::strcmp(problem.solver_adapter, "k0_poisson_airbox_cpu_full_coupled_slepc") == 0 &&
+              std::strcmp(problem.gauge_policy, "mean_zero_augmented") == 0));
+        const char *resolved_solver_adapter = requested_gpu || resolves_to_cpu_schur
+            ? (requested_gpu
+                   ? "k0_poisson_airbox_gpu_petsc_slepc"
+                   : "k0_poisson_airbox_cpu_schur_slepc")
+            : "k0_poisson_airbox_cpu_full_coupled_slepc";
+        set_modal_execution(
+            result,
+            requested_gpu ? ModalExecutionTarget::production_gpu
+                          : ModalExecutionTarget::production_cpu,
+            request.spectral_transform_kind,
+            resolved_solver_adapter);
+        if (!accepted_modal_mode_vectors_valid(poisson_result)) {
+            result.status = FrequencyDomainStatus::operator_error;
+            result.error_message =
+                "native FEM modal_eigen accepted mode vector is shorter than q+phi+gauge dimensions";
+            result.diagnostics_json =
+                "{\"schema_version\":\"frequency_domain_modal_diagnostics.v1\","
+                "\"study_product\":\"modal_eigen\","
+                "\"status\":\"operator_error\","
+                "\"reason\":\"accepted_mode_vector_short\"}";
+            result.result_json =
+                "{\"schema_version\":\"frequency_domain_modal_result.v1\","
+                "\"study_product\":\"modal_eigen\","
+                "\"status\":\"operator_error\","
+                "\"accepted_mode_count\":0,\"modes\":[]}";
+            append_shared_domain_operator_provenance(
+                result, k0_shared_domain_provenance);
+            return result;
+        }
         result.result_json =
             "{\"schema_version\":\"frequency_domain_modal_result.v1\","
             "\"study_product\":\"modal_eigen\","
-            "\"solver_adapter\":\"k0_poisson_airbox_cpu_full_coupled_slepc\","
+            "\"status\":\"" +
+            std::string(modal_status_text) +
+            "\",\"complete\":" +
+            std::string(status == FrequencyDomainStatus::ok ? "true" : "false") +
+            ","
+            "\"requested_execution\":\"" +
+            std::string(requested_execution) +
+            "\",\"resolved_execution\":\"" +
+            std::string(requested_execution) +
+            "\","
+            "\"requested_solver_adapter\":\"" +
+            std::string(requested_solver_adapter) +
+            "\","
+            "\"solver_adapter\":\"" +
+            std::string(resolved_solver_adapter) +
+            "\","
+            "\"execution_lane\":\"" +
+            std::string(requested_gpu ?
+                            "production_gpu" :
+                            "production_cpu") +
+            "\","
             "\"demag_kind\":\"periodic_airbox_k0\","
             "\"accepted_mode_count\":" +
             std::to_string(poisson_result.accepted_mode_count) +
@@ -1616,36 +3152,184 @@ FrequencyDomainContractResult solve_modal_eigen_contract(
             ",\"augmented_phi_dof_count\":" +
             std::to_string(augmented_phi_dof_count) +
             ",\"frequency_hz\":" +
-            std::to_string(poisson_result.frequency_hz) +
+            format_double(poisson_result.frequency_hz) +
             ",\"omega_rad_s\":" +
-            std::to_string(poisson_result.omega_rad_s) +
+            format_double(poisson_result.omega_rad_s) +
             ",\"poisson_constraint_relative_residual\":" +
-            std::to_string(poisson_result.poisson_constraint_relative_residual) +
+            format_double(poisson_result.poisson_constraint_relative_residual) +
             ",\"relative_reference_frequency_error\":" +
-            std::to_string(poisson_result.relative_reference_frequency_error) +
-            ",\"periodic_mesh_certificate\":{\"schema_version\":\"periodic_mesh_certificate.v5\",\"magnetic_pair_count\":" +
+            format_double(poisson_result.relative_reference_frequency_error) +
+            ",\"periodic_mesh_certificate\":{\"schema_version\":\"" +
+            std::string(request.poisson_airbox_periodic_mesh_certificate_schema != nullptr
+                            ? request.poisson_airbox_periodic_mesh_certificate_schema
+                            : "periodic_mesh_certificate.v5") +
+            "\",\"magnetic_pair_count\":" +
             std::to_string(poisson_result.magnetic_pair_count) +
             ",\"airbox_pair_count\":" +
             std::to_string(poisson_result.airbox_pair_count) +
-            "}" +
+            "},\"modes\":" +
+            format_poisson_airbox_modes_json(poisson_result, !requested_gpu) +
             "}";
+        result.result_json = append_json_field(
+            std::move(result.result_json),
+            k0_demag_probe_json);
+        append_shared_domain_operator_provenance(
+            result, k0_shared_domain_provenance);
+        const bool publish_typed_mode_prefix =
+            !poisson_result.accepted_modes.empty() &&
+            (requested_gpu
+                ? (status == FrequencyDomainStatus::ok ||
+                   status == FrequencyDomainStatus::interrupted)
+                : mode_transport_error.empty());
+        if (publish_typed_mode_prefix) {
+            result.modal_eigen.q_dof_count = poisson_result.q_dof_count;
+            result.modal_eigen.phi_dof_count = poisson_result.phi_dof_count;
+            result.modal_eigen.mode_lambda.reserve(poisson_result.accepted_modes.size());
+            result.modal_eigen.mode_residuals.reserve(poisson_result.accepted_modes.size());
+            result.modal_eigen.mode_cluster_ids.reserve(poisson_result.accepted_modes.size());
+            result.modal_eigen.mode_q_complex.reserve(
+                poisson_result.accepted_modes.size() * poisson_result.q_dof_count);
+            result.modal_eigen.mode_phi_complex.reserve(
+                poisson_result.accepted_modes.size() * poisson_result.phi_dof_count);
+            for (std::size_t mode_index = 0;
+                 mode_index < poisson_result.accepted_modes.size();
+                 ++mode_index) {
+                const PoissonAirboxModalEigenResult::AcceptedMode &mode =
+                    poisson_result.accepted_modes[mode_index];
+                result.modal_eigen.mode_lambda.emplace_back(
+                    mode.eigenvalue_real, mode.eigenvalue_imag);
+                result.modal_eigen.mode_residuals.push_back(mode.relative_residual);
+                if (requested_gpu) {
+                    result.modal_eigen.mode_cluster_ids.push_back(
+                        static_cast<std::uint64_t>(mode_index));
+                }
+                if (mode.full_vector.size() < required_modal_mode_vector_count(poisson_result)) {
+                    result.modal_eigen = ModalEigenTypedResult{};
+                    result.status = FrequencyDomainStatus::operator_error;
+                    result.error_message =
+                        "native FEM modal_eigen accepted mode vector is shorter than q+phi+gauge dimensions";
+                    result.diagnostics_json =
+                        "{\"schema_version\":\"frequency_domain_modal_diagnostics.v1\","
+                        "\"study_product\":\"modal_eigen\","
+                        "\"status\":\"operator_error\","
+                        "\"reason\":\"accepted_mode_vector_short\"}";
+                    result.result_json =
+                        "{\"schema_version\":\"frequency_domain_modal_result.v1\","
+                        "\"study_product\":\"modal_eigen\","
+                        "\"status\":\"operator_error\","
+                        "\"accepted_mode_count\":0}";
+                    append_shared_domain_operator_provenance(
+                        result, k0_shared_domain_provenance);
+                    return result;
+                }
+                result.modal_eigen.mode_q_complex.insert(
+                    result.modal_eigen.mode_q_complex.end(),
+                    mode.full_vector.begin(),
+                    mode.full_vector.begin() +
+                        static_cast<std::ptrdiff_t>(poisson_result.q_dof_count));
+                result.modal_eigen.mode_phi_complex.insert(
+                    result.modal_eigen.mode_phi_complex.end(),
+                    mode.full_vector.begin() +
+                        static_cast<std::ptrdiff_t>(poisson_result.q_dof_count),
+                    mode.full_vector.begin() + static_cast<std::ptrdiff_t>(
+                        poisson_result.q_dof_count + poisson_result.phi_dof_count));
+            }
+            if ((status == FrequencyDomainStatus::ok ||
+                 status == FrequencyDomainStatus::interrupted) &&
+                request.poisson_airbox_shared_domain_enabled != 0) {
+                std::string cartesian_error;
+                if (!append_shared_domain_cartesian_modes(
+                        *request.poisson_airbox_shared_domain_payload,
+                        poisson_result,
+                        &result.modal_eigen,
+                        cartesian_error)) {
+                    result.modal_eigen = ModalEigenTypedResult{};
+                    result.status = FrequencyDomainStatus::operator_error;
+                    result.error_message = cartesian_error;
+                    result.diagnostics_json =
+                        "{\"schema_version\":\"frequency_domain_modal_diagnostics.v1\","
+                        "\"study_product\":\"modal_eigen\","
+                        "\"status\":\"operator_error\","
+                        "\"reason\":\"shared_domain_cartesian_mode_reconstruction_failed\"}";
+                    result.result_json =
+                        "{\"schema_version\":\"frequency_domain_modal_result.v1\","
+                        "\"study_product\":\"modal_eigen\","
+                        "\"status\":\"operator_error\","
+                        "\"accepted_mode_count\":0}";
+                    append_shared_domain_operator_provenance(
+                        result, k0_shared_domain_provenance);
+                    return result;
+                }
+            }
+        }
+        result.result_json = append_json_field(
+            std::move(result.result_json), request_k_vector_field);
+        if (!mode_transport_error.empty()) {
+            const std::string error_field =
+                "\"mode_vector_transport_error\":\"" +
+                escape_json_string(mode_transport_error.c_str()) + "\"";
+            result.diagnostics_json = append_json_field(
+                std::move(result.diagnostics_json), error_field);
+            result.result_json = append_json_field(
+                std::move(result.result_json), error_field);
+        }
         return result;
     }
-    FrequencyDomainContractResult result = production_cpu_modal_eigen_unavailable(request);
+    // The nonzero-k Floquet provider materializes a dense real-split
+    // demag-k matrix into effective_request.  Pass that effective envelope
+    // into the production CPU modal adapter; using the original request here
+    // would silently discard the assembled k-dependent operator and fall back
+    // to the pending/missing-payload contract.
+    FrequencyDomainContractResult result =
+        production_cpu_modal_eigen_unavailable(effective_request,
+            native_nonzero_k_shared_domain_provider ? &floquet_reconstruction : nullptr);
+    if (!floquet_potential_certificate.empty()) {
+        for (std::string *json : {&result.diagnostics_json, &result.result_json}) {
+            if (json->empty()) *json = "{}";
+            if (json->back() == '}') {
+                json->pop_back();
+                if (json->size() > 1) *json += ",";
+                *json += "\"floquet_potential_certificate\":" + floquet_potential_certificate + "}";
+            }
+        }
+    }
     // Magnetic MFEM payloads consume and publish this pencil identity.  The
     // descriptor-Poisson branch above returns before this point deliberately.
     result.diagnostics_json = with_magnetic_pencil_digest(
-        std::move(result.diagnostics_json), request, "linearized_dynamic_pencil_digest");
+        std::move(result.diagnostics_json), effective_request, "linearized_dynamic_pencil_digest");
     result.result_json = with_magnetic_pencil_digest(
-        std::move(result.result_json), request, "linearized_dynamic_pencil_digest");
+        std::move(result.result_json), effective_request, "linearized_dynamic_pencil_digest");
+    append_shared_domain_operator_provenance(
+        result, assembled_operator_provenance);
+    const ModalExecutionTarget unavailable_target =
+        request.execution_target == ModalExecutionTarget::production_gpu
+            ? ModalExecutionTarget::production_gpu
+            : request.execution_target == ModalExecutionTarget::production_cpu
+                ? ModalExecutionTarget::production_cpu
+                : ModalExecutionTarget::auto_select;
+    const bool supplied_nonzero_k_dynamic_demag =
+        modal_request_is_nonzero_k_floquet(effective_request) &&
+        effective_request.operator_request.include_demag != 0 &&
+        (effective_request.dynamic_demag_k_tangent_matrix_row_major != nullptr ||
+         effective_request.dynamic_demag_k_tangent_matrix_value_count != 0u);
+    set_modal_execution(
+        result,
+        unavailable_target,
+        effective_request.spectral_transform_kind,
+        unavailable_target == ModalExecutionTarget::production_gpu
+            ? "production_gpu_modal_eigen_unavailable"
+            : (native_nonzero_k_shared_domain_provider || supplied_nonzero_k_dynamic_demag
+                   ? "floquet_airbox_cpu_schur_slepc"
+                   : "production_cpu_modal_eigen_unavailable"));
     return result;
+    }
 }
 
 FrequencyDomainContractResult solve_driven_response_contract(
     const DrivenResponseContractRequest &request) noexcept
 {
-    if (request.abi_version != kFrequencyDomainAbiVersion ||
-        request.operator_request.abi_version != kFrequencyDomainAbiVersion) {
+    if (!supported_frequency_domain_abi(request.abi_version) ||
+        !supported_frequency_domain_abi(request.operator_request.abi_version)) {
         return validation_error_result(
             "driven_response",
             "native FEM driven_response request uses an unsupported ABI version",

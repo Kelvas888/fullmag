@@ -49,8 +49,10 @@ import {
   Trash2,
   Triangle,
   Upload,
+  Waves,
   Zap,
 } from "lucide-react";
+import { PROBLEM_IR_03_RIGID_TRANSFORM_REASON } from "@/kernel/authoring/objectTranslationMutation";
 
 import {
   MESHING_CAPABILITIES_PATH,
@@ -76,6 +78,7 @@ import {
 import type { CommandRegistry } from "@/kernel/commands/CommandRegistry";
 import type { CommandContext } from "@/kernel/commands/commandTypes";
 import { SESSION_STATUS_RESOURCE_KEY } from "@/kernel/resources/useSessionStatus";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
 import {
   resolveActiveLaneOperation,
   type ActiveLaneCapabilitySnapshot,
@@ -126,6 +129,9 @@ import {
   statusMenu,
 } from "./ribbonCommon";
 import {
+  RIBBON_ANALYSIS_SHOW_CHART_AND_FIELD_COMMAND,
+  RIBBON_ANALYSIS_SHOW_CHART_COMMAND,
+  RIBBON_ANALYSIS_SHOW_FIELD_COMMAND,
   RIBBON_PHYSICS_SELECT_INTERACTION_COMMAND,
   RIBBON_PHYSICS_CREATE_FIELD_DRIVE_COMMAND,
   RIBBON_PHYSICS_CREATE_FROZEN_SPINS_COMMAND,
@@ -281,7 +287,7 @@ function physicsInteractionMenu(
         tooltip: operation.enabled ? undefined : operation.reason,
         disabled: !operation.enabled,
         commandId: RIBBON_PHYSICS_SELECT_INTERACTION_COMMAND,
-        commandInput: { interactionId: spec.id },
+        commandInput: { interactionId: spec.id, ...(scope === "global" ? { scope: "global" } : {}) },
       };
     }),
     ...(scope === "global" ? [createFieldDriveItem] : []),
@@ -309,7 +315,7 @@ const definitionsTab: RibbonTabContent = {
 const geometryTab: RibbonTabContent = {
   tabId: "geometry",
   groups: [
-    // ── Create Object / Shape ─────────────────────────────────────────────
+    // â”€â”€ Create Object / Shape â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
       id: "builder-create",
       title: "Create Object / Shape",
@@ -320,6 +326,7 @@ const geometryTab: RibbonTabContent = {
         { id: "geometry.add-cylinder",     icon: icon(Cylinder), label: "Cylinder",       iconColor: "text-cyan-400" },
         { id: "geometry.add-sphere",       icon: icon(Circle),   label: "Sphere",         iconColor: "text-violet-400" },
         { id: "geometry.add-microstrip-antenna", icon: icon(RadioTower), label: "Microstrip", iconColor: "text-rose-300" },
+        { id: "geometry.add-cpw-antenna", icon: icon(RadioTower), label: "CPW", iconColor: "text-sky-400" },
         { id: "builder-add-ellipsoid",     icon: icon(Circle),   label: "Ellipsoid",      disabled: true, iconColor: "text-purple-300" },
         { id: "builder-add-disk",          icon: icon(Disc),     label: "Disk",           disabled: true, iconColor: "text-sky-400" },
         { id: "geometry.add-thin-film",    icon: icon(Box),      label: "Thin Film",      iconColor: "text-lime-300" },
@@ -334,7 +341,7 @@ const geometryTab: RibbonTabContent = {
         { id: "builder-add-polygon_prism", icon: icon(Circle),   label: "Polygon Prism",  disabled: true, iconColor: "text-indigo-300" },
       ],
     },
-    // ── Boolean ──────────────────────────────────────────────────────────
+    // â”€â”€ Boolean â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
       id: "builder-boolean",
       title: "Boolean",
@@ -346,19 +353,19 @@ const geometryTab: RibbonTabContent = {
         { id: "builder-boolean-intersect", icon: icon(Plus),    label: "Intersect", disabled: true, iconColor: "text-slate-400" },
       ],
     },
-    // ── Transform ────────────────────────────────────────────────────────
+    // â”€â”€ Transform â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
       id: "builder-transform",
       title: "Transform",
       subtitle: "Move / Rotate / Scale",
       tone: "authoring",
       actions: [
-        { id: "builder-tool-move",   icon: icon(Move),      label: "Move",   shortcut: "W", disabled: true, iconColor: "text-red-400" },
-        { id: "builder-tool-rotate", icon: icon(RotateCcw), label: "Rotate", shortcut: "E", disabled: true, iconColor: "text-green-400" },
-        { id: "builder-tool-scale",  icon: icon(Maximize2), label: "Scale",  shortcut: "R", disabled: true, iconColor: "text-blue-400" },
+        { id: "builder-tool-move", commandId: "geometry.move-selected", icon: icon(Move), label: "Move", shortcut: "W", iconColor: "text-red-400" },
+        { id: "builder-tool-rotate", icon: icon(RotateCcw), label: "Rotate", shortcut: "E", disabled: true, tooltip: PROBLEM_IR_03_RIGID_TRANSFORM_REASON, iconColor: "text-green-400" },
+        { id: "builder-tool-scale", icon: icon(Maximize2), label: "Scale", shortcut: "R", disabled: true, tooltip: PROBLEM_IR_03_RIGID_TRANSFORM_REASON, iconColor: "text-blue-400" },
       ],
     },
-    // ── Viewport ─────────────────────────────────────────────────────────
+    // â”€â”€ Viewport â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
       id: "builder-viewport-mode",
       title: "Viewport",
@@ -370,20 +377,20 @@ const geometryTab: RibbonTabContent = {
         { id: "builder-toggle-snap",     icon: icon(Magnet),       label: "Snap",       shortcut: "G", disabled: true, iconColor: "text-slate-400" },
       ],
     },
-    // ── Lifecycle ────────────────────────────────────────────────────────
+    // â”€â”€ Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
       id: "builder-lifecycle",
       title: "Lifecycle",
       subtitle: "Build & validate",
       tone: "neutral",
       actions: [
-        { id: "builder-build-geometry", icon: icon(Hammer),      label: "Geometry Synced", disabled: true, iconColor: "text-emerald-400" },
+        { id: "builder-build-geometry", icon: icon(Hammer),      label: "Build Geometry", iconColor: "text-emerald-400" },
         { id: "geometry.commit-object-draft", icon: icon(Save),  label: "Apply Draft",                  iconColor: "text-emerald-400" },
         { id: "mesh.build-selected",    icon: icon(Grid3X3),     label: "Build Mesh",                   iconColor: "text-amber-400" },
-        { id: "builder-validate",       icon: icon(CheckCircle), label: "Validate",      disabled: true, iconColor: "text-emerald-400" },
+        { id: "builder-validate",       icon: icon(CheckCircle), label: "Validate",                   iconColor: "text-emerald-400" },
       ],
     },
-    // ── Focus ────────────────────────────────────────────────────────────
+    // â”€â”€ Focus â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
       id: "builder-focus",
       title: "Focus",
@@ -423,7 +430,7 @@ const materialsTab: RibbonTabContent = {
         { id: "magnetization-texture.assign-random-seeded", icon: icon(Sparkles), label: "Random", iconColor: "text-emerald-400" },
         { id: "magnetization-texture.assign-vortex", icon: icon(Circle), label: "Vortex", iconColor: "text-cyan-400" },
         { id: "mat-texture-bloch-sky", icon: icon(Disc),     label: "Bloch Sky",    iconColor: "text-violet-400", disabled: true },
-        { id: "mat-texture-neel-sky",  icon: icon(Disc),     label: "Néel Sky",     iconColor: "text-purple-300", disabled: true },
+        { id: "mat-texture-neel-sky",  icon: icon(Disc),     label: "NĂ©el Sky",     iconColor: "text-purple-300", disabled: true },
       ],
     },
     {
@@ -515,7 +522,7 @@ const physicsTab: RibbonTabContent = {
       actions: [
         { id: "manage-rf",      icon: icon(RadioTower), label: "RF Sources",  disabled: true, iconColor: "text-cyan-400",    menu: menu("physics-rf", "RF source", ["Add microstrip", "Add CPW", "List sources"]) },
         { id: "add-microstrip", icon: icon(Plus),       label: "Microstrip",  commandId: "geometry.add-microstrip-antenna", iconColor: "text-teal-400" },
-        { id: "add-cpw",        icon: icon(Plus),       label: "CPW",         disabled: true, iconColor: "text-sky-400" },
+        { id: "add-cpw",        icon: icon(Plus),       label: "CPW",         commandId: "geometry.add-cpw-antenna", iconColor: "text-sky-400" },
       ],
     },
   ],
@@ -530,8 +537,9 @@ const meshTab: RibbonTabContent = {
       subtitle: "mesh",
       tone: "compute",
       actions: [
+        { id: "grid.build-fdm", icon: icon(Grid3X3), label: "Build Grid", accent: true, iconColor: C.green, tooltip: "Rebuild the structured FDM grid from the committed scene" },
         { id: "mesh.build-selected", icon: icon(RefreshCw),  label: "Build",      accent: true, splitButton: true, iconColor: C.green, menu: [...statusMenu("mesh-build-status", "Mesh state", "Not built", "warning"), separator("mesh-build-sep"), ...menu("mesh-build", "Build scope", ["Selected object", "All objects", "Universe mesh", "Shared solver mesh"])] },
-        { id: "mesh.build-shared-domain", icon: icon(Zap),   label: "Build All",  splitButton: true, iconColor: C.yellow, menu: menu("mesh-build-all", "Build all", ["FDM mesh", "FEM shared domain", "Quality report"]) },
+        { id: "mesh.build-shared-domain", icon: icon(Zap),   label: "Build All",  splitButton: true, iconColor: C.yellow, menu: menu("mesh-build-all", "Build all", ["FEM shared domain", "Quality report"]) },
         { id: "mesh-stats",     icon: icon(BarChart3),  label: "Statistics",               iconColor: C.peach },
       ],
     },
@@ -589,7 +597,7 @@ const studyTab: RibbonTabContent = {
       tone: "authoring",
       actions: [
         { id: "study.add-relax-stage", icon: icon(Play), label: "Relax", iconColor: "text-emerald-400", splitButton: true, menu: menu("study-relax",  "Relax stage",      ["Overdamped relax", "LLG relax", "Minimizer", "Stop criteria"]) },
-        { id: "study.add-field-drive-stage", icon: icon(RadioTower), label: "Antenna", iconColor: "text-cyan-400", splitButton: true, menu: menu("study-antenna-stage", "Add antenna instruction", ["Global or regional target", "Sinc waveform", "Source FFT", "Stage activation"]) },
+        { id: "study.add-field-drive-stage", icon: icon(RadioTower), label: "Field Drive", iconColor: "text-cyan-400", splitButton: true, menu: menu("study-antenna-stage", "Add prescribed field drive (not a conductor solve)", ["Global or regional target", "Sinc waveform", "Waveform FFT", "Stage activation"]) },
         { id: "study.add-table-autosave-stage", icon: icon(Activity), label: "Table", iconColor: "text-blue-300", splitButton: true, menu: menu("study-table-autosave-stage", "Table autosave instruction", ["ON or OFF", "t_sampling", "Table quantities", "FFT clock diagnostics"]) },
         { id: "study.add-autosave-stage", icon: icon(Save), label: "Autosave", iconColor: "text-lime-300", splitButton: true, menu: menu("study-autosave-stage", "Autosave instruction", ["Enable quantity", "Disable quantity", "Clear all outputs", "Independent cadence"]) },
         { id: "study.add-fft-response-stage", icon: icon(FunctionSquare), label: "FFT", iconColor: "text-violet-300", splitButton: true, menu: menu("study-fft-response-stage", "Response FFT instruction", ["ON or OFF", "Response component", "Window and detrend", "Effective dt and df"]) },
@@ -608,8 +616,8 @@ const studyTab: RibbonTabContent = {
       actions: [
         { id: "study-sweep-relax",    icon: icon(BarChart3), label: "Sweep+Relax",   disabled: true, iconColor: "text-violet-400" },
         { id: "study-sweep-snap",     icon: icon(Camera),    label: "Sweep+Snap",    disabled: true, iconColor: "text-sky-400" },
-        { id: "study-relax-run",      icon: icon(Play),      label: "Relax→Run",     disabled: true, iconColor: "text-emerald-400" },
-        { id: "study-relax-eigen",    icon: icon(Sigma),     label: "Relax→Eigen",   iconColor: "text-amber-400",  disabled: true },
+        { id: "study-relax-run",      icon: icon(Play),      label: "Relaxâ†’Run",     disabled: true, iconColor: "text-emerald-400" },
+        { id: "study-relax-eigen",    icon: icon(Sigma),     label: "Relaxâ†’Eigen",   iconColor: "text-amber-400",  disabled: true },
         { id: "study-param-sweep",    icon: icon(BarChart3), label: "Param Sweep",   disabled: true, iconColor: "text-cyan-400" },
         { id: "study-current-sweep",  icon: icon(Zap),       label: "Current Sweep", disabled: true, iconColor: "text-yellow-400" },
       ],
@@ -642,12 +650,13 @@ const studyTab: RibbonTabContent = {
       actions: [
         { id: "study.compute-fields", icon: icon(Activity), label: "Compute Fields", iconColor: C.sapphire, tooltip: "Evaluate active fields for the current magnetization" },
         { id: "study.compute-energies", icon: icon(Sigma), label: "Compute Energies", iconColor: C.lavender, tooltip: "Evaluate current energies without changing magnetization" },
+        { id: "study.prepare-live", icon: icon(Layers3), label: "Prepare", iconColor: C.blue, tooltip: "Materialize the current Live scene preparation receipt without starting the solver" },
         { id: "study.run",   icon: icon(Play,        { fill: "currentColor" }), label: "Compute", shortcut: "F5", accent: true, iconColor: C.green, tooltip: "Submit the study solve command" },
         { id: "study.pause", icon: icon(Pause,       { fill: "currentColor" }), label: "Pause",                  iconColor: C.yellow },
         { id: "study.resume",icon: icon(Play,        { fill: "currentColor" }), label: "Resume",                 iconColor: C.green },
         { id: "study.save-checkpoint", icon: icon(Save), label: "Save Checkpoint", iconColor: C.blue },
         { id: "study.restore-checkpoint", icon: icon(RotateCcw), label: "Restore", iconColor: C.lavender },
-        { id: "study.import-state", icon: icon(Upload), label: "Import State", iconColor: C.lavender },
+        { id: "study.import-state", icon: icon(Upload), label: "Restore Runtime State", iconColor: C.lavender },
         { id: "study.export-state", icon: icon(Download), label: "Export State", iconColor: C.sapphire },
         { id: "study.discard-paused-state", icon: icon(Scissors), label: "Discard", iconColor: C.red },
         { id: "study.stop",  icon: icon(Square,      { fill: "currentColor" }), label: "Stop",                   iconColor: C.red },
@@ -666,7 +675,7 @@ const resultsTab: RibbonTabContent = {
       subtitle: "resources",
       tone: "neutral",
       actions: [
-        { id: "res-m",          icon: icon(Magnet),    label: "M",         active: true, iconColor: "text-pink-400",    menu: radioMenu("results-quantity", "Result quantity", "m", [["m", "Magnetization / m"], ["H_eff", "H_eff"], ["H_demag", "H_demag"], ["H_ex", "H_ex"], ["H_ani", "H_ani"], ["H_ant", "H_ant"], ["torque", "torque"], ["eden_total", "ε_total"], ["eden_ex", "ε_ex"], ["eden_demag", "ε_demag"], ["eden_ext", "ε_ext"], ["eden_ani", "ε_ani"], ["eden_dmi", "ε_dmi"], ["mat_ms", "M_sat"], ["mat_aex", "A_ex"], ["mat_alpha", "α"], ["mat_dind", "D_ind"], ["mat_dbulk", "D_bulk"]]) },
+        { id: "res-m",          icon: icon(Magnet),    label: "M",         active: true, iconColor: "text-pink-400",    menu: radioMenu("results-quantity", "Result quantity", "m", [["m", "Magnetization / m"], ["H_eff", "H_eff"], ["H_demag", "H_demag"], ["H_ex", "H_ex"], ["H_ani", "H_ani"], ["H_ant", "H_ant"], ["torque", "torque"], ["eden_total", "Îµ_total"], ["eden_ex", "Îµ_ex"], ["eden_demag", "Îµ_demag"], ["eden_ext", "Îµ_ext"], ["eden_ani", "Îµ_ani"], ["eden_dmi", "Îµ_dmi"], ["mat_ms", "M_sat"], ["mat_aex", "A_ex"], ["mat_alpha", "Î±"], ["mat_dind", "D_ind"], ["mat_dbulk", "D_bulk"]]) },
         { id: "res-heff",       icon: icon(Zap),       label: "H_eff",                   iconColor: "text-yellow-400" },
         { id: "res-demag",      icon: icon(Sigma),     label: "H_demag",                 iconColor: "text-violet-300" },
         { id: "res-exchange",   icon: icon(Zap),       label: "H_ex",                    iconColor: "text-amber-400" },
@@ -756,6 +765,8 @@ type RibbonSessionStatus = {
 };
 
 export interface RibbonBuildContext {
+  /** Mode or response field currently shown as the viewport quantity, if any. */
+  activeAnalysisField?: { fieldId: string; label: string } | null;
   api?: { visualization: RibbonVisualizationApi };
   commandContext?: CommandContext;
   fieldCatalog?: FieldCatalogResource | null;
@@ -785,12 +796,7 @@ function ribbonDiscretization(context: RibbonBuildContext): RibbonDiscretization
   // null while unresolved), which then fails closed below.
   if (context.sessionStatus === undefined) return "fem";
   if (context.sessionStatus === null) return "unknown";
-  const value = context.sessionStatus.domain?.discretization
-    ?.trim()
-    .toLowerCase();
-  if (value === "fdm") return "fdm";
-  if (value === "fem") return "fem";
-  return "unknown";
+  return resolveSessionDiscretization(context.sessionStatus) ?? "unknown";
 }
 
 function buildGeometryTabContent(
@@ -904,14 +910,32 @@ function buildResultsQuantityGroup(
     ["res-energy", "eden_total"],
   ]);
 
+  // While a mode field is shown it is the active quantity, so no model
+  // quantity is marked active and the mode appears as its own entry.
+  const analysisField = context.activeAnalysisField ?? null;
+  const modeActions: RibbonTabContent["groups"][number]["actions"] = analysisField
+    ? [
+        {
+          id: "res-analysis-field",
+          icon: icon(Waves),
+          label: "Mode",
+          active: true,
+          iconColor: "text-sky-300",
+          // Toggle semantics: pressing the active mode returns to the model quantity.
+          commandId: "analysis.frequency-domain.clear-3d-overlay",
+          tooltip: `${analysisField.label} — click or choose another quantity to leave the mode view`,
+        },
+      ]
+    : [];
+
   return {
     ...group,
-    actions: group.actions.map((action) => {
+    actions: [...group.actions.map((action) => {
       const quantityId = resultQuantityIds.get(action.id);
       if (!quantityId) return action;
       return {
         ...action,
-        active: sameQuantityId(activeQuantityId, quantityId),
+        active: !analysisField && sameQuantityId(activeQuantityId, quantityId),
         commandId: action.menu
           ? action.commandId
           : RIBBON_VISUALIZATION_APPLY_GLOBAL_QUANTITY_COMMAND,
@@ -930,7 +954,7 @@ function buildResultsQuantityGroup(
             : node,
         ),
       };
-    }),
+    }), ...modeActions],
   };
 }
 
@@ -1013,6 +1037,45 @@ export function buildRibbonTabContent(
     ? applyCommandState(resolvedContent, context)
     : resolvedContent;
 
+  return isProductionRibbonBuild()
+    ? stripProductionRibbonPlaceholders(withCommandState, context?.commands)
+    : withCommandState;
+}
+
+/**
+ * Contextual tab of the analysis module that owns the selected Results node
+ * (ADR 0054). Only commands that work today are offered: switching the main
+ * view between the analysis chart and the 3D field, and controlling the
+ * shown mode field.
+ */
+export function buildAnalysisContextTabContent(context?: RibbonBuildContext): RibbonTabContent {
+  const content: RibbonTabContent = {
+    tabId: "results",
+    groups: [
+      {
+        id: "analysis-view",
+        title: "View",
+        subtitle: "chart · field",
+        tone: "compute",
+        actions: [
+          { id: "analysis-show-chart", icon: icon(BarChart3), label: "Chart", iconColor: "text-sky-300", commandId: RIBBON_ANALYSIS_SHOW_CHART_COMMAND },
+          { id: "analysis-show-field", icon: icon(Box), label: "3D field", iconColor: "text-teal-400", commandId: RIBBON_ANALYSIS_SHOW_FIELD_COMMAND },
+          { id: "analysis-show-chart-and-field", icon: icon(Columns2), label: "Chart + 3D", iconColor: "text-sky-300", commandId: RIBBON_ANALYSIS_SHOW_CHART_AND_FIELD_COMMAND },
+        ],
+      },
+      {
+        id: "analysis-mode-field",
+        title: "Mode field",
+        subtitle: "viewport quantity",
+        tone: "neutral",
+        actions: [
+          { id: "analysis-stop-animation", icon: icon(Pause), label: "Stop animation", commandId: "analysis.frequency-domain.stop-3d-animation" },
+          { id: "analysis-clear-field", icon: icon(Trash2), label: "Leave mode view", commandId: "analysis.frequency-domain.clear-3d-overlay" },
+        ],
+      },
+    ],
+  };
+  const withCommandState = context?.commands ? applyCommandState(content, context) : content;
   return isProductionRibbonBuild()
     ? stripProductionRibbonPlaceholders(withCommandState, context?.commands)
     : withCommandState;
@@ -1157,16 +1220,66 @@ function meshBuildStatus(context: RibbonBuildContext): {
   return { label: "not built", tone: "warning" };
 }
 
+function meshLastGoodProvenance(context: RibbonBuildContext): {
+  artifact: string;
+  sourceSceneRevision: string;
+  geometryRealizationRevision: string;
+} {
+  const lastSuccess = asRecord(context.meshBuildLatest?.last_success);
+  const artifact = [
+    lastSuccess?.mesh_id,
+    lastSuccess?.generation_id,
+    lastSuccess?.artifact,
+    lastSuccess?.build_id,
+  ].find((value) => typeof value === "string" && value.trim().length > 0);
+  const sourceSceneRevision =
+    context.meshBuildLatest?.source_scene_revision ??
+    lastSuccess?.source_scene_revision;
+  const geometryRealizationRevision =
+    context.meshBuildLatest?.geometry_realization_revision ??
+    lastSuccess?.geometry_realization_revision;
+
+  return {
+    artifact: typeof artifact === "string" ? artifact : "none",
+    sourceSceneRevision:
+      sourceSceneRevision === undefined || sourceSceneRevision === null
+        ? "unknown"
+        : String(sourceSceneRevision),
+    geometryRealizationRevision:
+      geometryRealizationRevision === undefined ||
+      geometryRealizationRevision === null
+        ? "unknown"
+        : String(geometryRealizationRevision),
+  };
+}
+
 function buildNonFemMeshTabContent(
   content: RibbonTabContent,
+  discretization: string | null,
 ): RibbonTabContent {
   const overviewLabel = "Open mesh overview";
   const viewGroup = content.groups.find((group) => group.id === "mesh-view");
   if (!viewGroup) return { ...content, groups: [] };
 
+  const buildGroup = content.groups.find((group) => group.id === "build");
+  const buildGridAction = buildGroup?.actions.find(
+    (action) => action.id === "grid.build-fdm",
+  );
+  const fdmBuildGroups =
+    discretization === "fdm" && buildGroup && buildGridAction
+      ? [
+          {
+            ...buildGroup,
+            subtitle: "structured grid",
+            actions: [buildGridAction],
+          },
+        ]
+      : [];
+
   return {
     ...content,
     groups: [
+      ...fdmBuildGroups,
       {
         ...viewGroup,
         title: "Mesh",
@@ -1204,10 +1317,11 @@ function buildMeshTabContent(
 ): RibbonTabContent {
   const discretization = ribbonDiscretization(context);
   if (discretization !== "fem") {
-    return buildNonFemMeshTabContent(content);
+    return buildNonFemMeshTabContent(content, discretization);
   }
 
   const status = meshBuildStatus(context);
+  const lastGood = meshLastGoodProvenance(context);
   const summary = asRecord(context.meshSummary?.mesh_summary);
   const solverMesh = context.meshSemantics?.solver_mesh;
   const nodeCount = summary?.node_count;
@@ -1218,10 +1332,13 @@ function buildMeshTabContent(
     ...content,
     groups: content.groups.map((group) => {
       if (group.id === "build") {
+        const actions = group.actions.filter(
+          (action) => action.id !== "grid.build-fdm",
+        );
         return {
           ...group,
           subtitle: status.label,
-          actions: group.actions.map((action) => {
+          actions: actions.map((action) => {
             if (action.id === "mesh.build-selected") {
               return {
                 ...action,
@@ -1252,6 +1369,25 @@ function buildMeshTabContent(
                     label: "Elements",
                     value: String(elementCount ?? "unknown"),
                   },
+                  {
+                    type: "status",
+                    id: "mesh-build-status:last-good",
+                    label: "Last good artifact",
+                    value: lastGood.artifact,
+                    tone: lastGood.artifact === "none" ? "warning" : "success",
+                  },
+                  {
+                    type: "status",
+                    id: "mesh-build-status:source-scene",
+                    label: "Source scene revision",
+                    value: lastGood.sourceSceneRevision,
+                  },
+                  {
+                    type: "status",
+                    id: "mesh-build-status:geometry-realization",
+                    label: "Geometry realization",
+                    value: lastGood.geometryRealizationRevision,
+                  },
                   separator("mesh-build-status:sep"),
                   {
                     type: "item",
@@ -1272,6 +1408,26 @@ function buildMeshTabContent(
                     id: "mesh.open-builds:item",
                     label: "Open build pipeline",
                     commandId: "mesh.open-builds",
+                  },
+                ] satisfies RibbonMenuNode[],
+              };
+            }
+            if (action.id === "mesh.build-shared-domain") {
+              return {
+                ...action,
+                commandId: "mesh.build-shared-domain",
+                menu: [
+                  {
+                    type: "item",
+                    id: "mesh.build-shared-domain:item",
+                    label: "Build shared domain mesh",
+                    commandId: "mesh.build-shared-domain",
+                  },
+                  {
+                    type: "item",
+                    id: "mesh.open-quality:report",
+                    label: "Quality report",
+                    commandId: "mesh.open-quality",
                   },
                 ] satisfies RibbonMenuNode[],
               };
@@ -3246,6 +3402,12 @@ function buildDimensionFrameAction({
       ["viewport-3d.dimension-frame-cage", "cage"],
       ["viewport-3d.dimension-frame-off", "off"],
     ]) ?? "floor";
+  const annotation =
+    activeCommandValue(commands, commandContext, [
+      ["viewport-3d.dimension-annotation-ticks", "ticks"],
+      ["viewport-3d.dimension-annotation-extents", "extents"],
+      ["viewport-3d.dimension-annotation-both", "both"],
+    ]) ?? "ticks";
   const gridDensity =
     activeCommandValue(commands, commandContext, [
       ["viewport-3d.dimension-density-auto", "auto"],
@@ -3291,6 +3453,29 @@ function buildDimensionFrameAction({
             commandId: "viewport-3d.dimension-frame-off",
             value: "off",
             label: "Off",
+          },
+        ],
+      },
+      {
+        type: "radio-group",
+        id: "frame:annotation",
+        label: "Annotations",
+        value: annotation,
+        items: [
+          {
+            commandId: "viewport-3d.dimension-annotation-ticks",
+            value: "ticks",
+            label: "Tick scales",
+          },
+          {
+            commandId: "viewport-3d.dimension-annotation-extents",
+            value: "extents",
+            label: "Overall size",
+          },
+          {
+            commandId: "viewport-3d.dimension-annotation-both",
+            value: "both",
+            label: "Both",
           },
         ],
       },

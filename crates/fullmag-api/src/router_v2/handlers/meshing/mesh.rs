@@ -16,7 +16,7 @@ use crate::error::ApiError;
 use crate::fem_cross_section::{
     cross_section_quality_from_fmmq, cross_section_quality_from_parent_tets,
     per_element_quality_metric_from_fmmq, serialize_cross_section_fmcs,
-    serialize_cross_section_quality_fmqs, CrossSectionQualityMetric,
+    serialize_cross_section_quality_fmqs, validate_fmmq_v2_payload, CrossSectionQualityMetric,
 };
 use crate::fem_cross_section_image::{
     render_cross_section_png, validate_cross_section_image_query, CrossSectionImageColorScale,
@@ -47,7 +47,7 @@ use crate::schemas::mesh::{
     MeshUniverseQualityResource, MeshUniverseReportResource, PeriodicValidationStatus,
 };
 use crate::session::current_artifact_dir;
-use crate::types::{AppState, SessionStateResponse};
+use crate::types::{AppState, CurrentLiveRequestContext, SessionStateResponse};
 use fullmag_authoring::{
     SceneDocument, SceneMeshInterface, SceneObject, ScriptBuilderMeshState,
     ScriptBuilderPerGeometryMeshState, ScriptBuilderUniverseState,
@@ -589,6 +589,7 @@ pub async fn replace_mesh_universe_config(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MeshUniverseConfigReplaceRequest>,
 ) -> Result<Json<MeshUniverseConfigResource>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let config: ScriptBuilderUniverseState =
         serde_json::from_value(serde_json::to_value(req.config).map_err(|error| {
             ApiError::bad_request(format!("invalid universe mesh config payload: {error}"))
@@ -596,12 +597,16 @@ pub async fn replace_mesh_universe_config(
         .map_err(|error| {
             ApiError::bad_request(format!("invalid universe mesh config payload: {error}"))
         })?;
-    let mut scene = crate::get_or_load_current_live_scene_document(&state).await?;
+    let mut scene =
+        crate::get_or_load_current_live_scene_document_for_context(&state, &request_context)
+            .await?;
     scene.study.universe_mesh = Some(config.clone());
     if scene.universe.is_none() {
         scene.universe = Some(config.clone());
     }
-    let committed = crate::commit_current_live_scene_document(&state, scene).await?;
+    let committed =
+        crate::commit_current_live_scene_document_for_context(&state, &request_context, scene)
+            .await?;
     let config = current_universe_mesh_config(&committed)
         .ok_or_else(|| ApiError::internal("committed universe mesh config missing"))?;
     let effective_config = Some(json_object_map(
@@ -616,7 +621,8 @@ pub async fn replace_mesh_universe_config(
         })?,
         "committed universe mesh config",
     )?;
-    let revision = current_snapshot(&state).await?.mesh_revision;
+    let revision = current_snapshot_with_context(&state).await?.0.mesh_revision;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(Json(MeshUniverseConfigResource {
         revision,
         config: Some(config),
@@ -684,7 +690,7 @@ pub async fn get_mesh_universe_quality(
 pub async fn get_mesh_shared_domain_config(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<MeshSharedDomainConfigResource>, ApiError> {
-    let snapshot = current_snapshot(&state).await?;
+    let (snapshot, request_context) = current_snapshot_with_context(&state).await?;
     let scene = current_scene_document(&snapshot)?;
     let config = json_object_map(
         serde_json::to_value(&scene.study.shared_domain_mesh).map_err(|error| {
@@ -694,6 +700,7 @@ pub async fn get_mesh_shared_domain_config(
         })?,
         "shared-domain mesh config",
     )?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(Json(MeshSharedDomainConfigResource {
         revision: snapshot.mesh_revision,
         config,
@@ -715,6 +722,7 @@ pub async fn replace_mesh_shared_domain_config(
     State(state): State<Arc<AppState>>,
     Json(req): Json<MeshSharedDomainConfigReplaceRequest>,
 ) -> Result<Json<MeshSharedDomainConfigResource>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let config: ScriptBuilderMeshState =
         serde_json::from_value(serde_json::to_value(req.config).map_err(|error| {
             ApiError::bad_request(format!(
@@ -726,10 +734,14 @@ pub async fn replace_mesh_shared_domain_config(
                 "invalid shared-domain mesh config payload: {error}"
             ))
         })?;
-    let mut scene = crate::get_or_load_current_live_scene_document(&state).await?;
+    let mut scene =
+        crate::get_or_load_current_live_scene_document_for_context(&state, &request_context)
+            .await?;
     scene.study.shared_domain_mesh = config.clone();
     scene.study.mesh_defaults = config.clone();
-    let committed = crate::commit_current_live_scene_document(&state, scene).await?;
+    let committed =
+        crate::commit_current_live_scene_document_for_context(&state, &request_context, scene)
+            .await?;
     let config = json_object_map(
         serde_json::to_value(&committed.study.shared_domain_mesh).map_err(|error| {
             ApiError::internal(format!(
@@ -739,6 +751,7 @@ pub async fn replace_mesh_shared_domain_config(
         "committed shared-domain mesh config",
     )?;
     let revision = current_snapshot(&state).await?.mesh_revision;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(Json(MeshSharedDomainConfigResource { revision, config }))
 }
 
@@ -859,8 +872,9 @@ pub async fn get_mesh_shared_domain_cross_section(
         ));
     }
 
-    let snapshot = current_snapshot(&state).await?;
+    let (snapshot, request_context) = current_snapshot_with_context(&state).await?;
     let Some(mesh) = snapshot.fem_mesh.as_ref() else {
+        crate::validate_current_live_request_context(&state, &request_context).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
     let elements = require_tet4_cross_section_topology(mesh, "cross-section")?;
@@ -900,6 +914,7 @@ pub async fn get_mesh_shared_domain_cross_section(
         include_polygons,
         include_wireframe,
     ));
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(crate::router_v2::handlers::shared::conditional_binary_response(&headers, &etag, binary))
 }
 
@@ -939,15 +954,19 @@ pub async fn get_mesh_shared_domain_cross_section_image(
         dpr,
     )?;
 
-    let snapshot = current_snapshot(&state).await?;
+    let (snapshot, request_context) = current_snapshot_with_context(&state).await?;
     let Some(mesh) = snapshot.fem_mesh.as_ref() else {
+        crate::validate_current_live_request_context(&state, &request_context).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
     let elements = require_tet4_cross_section_topology(mesh, "cross-section image")?;
+    let expected_topology_fingerprint = fullmag_runner::fem_mesh_topology_fingerprint(mesh);
     let artifact = snapshot
         .mesh_workspace
         .as_ref()
-        .map(read_mesh_quality_data_artifact)
+        .map(|workspace| {
+            read_mesh_quality_data_artifact(workspace, Some(expected_topology_fingerprint.as_str()))
+        })
         .transpose()?
         .flatten();
     let cut_norm = query.position_percent / 100.0;
@@ -990,6 +1009,7 @@ pub async fn get_mesh_shared_domain_cross_section_image(
         {
             (values, "parent-tet-geometry-v1".to_string())
         } else {
+            crate::validate_current_live_request_context(&state, &request_context).await?;
             return Ok(StatusCode::NO_CONTENT.into_response());
         }
     } else if let Some(values) =
@@ -997,6 +1017,7 @@ pub async fn get_mesh_shared_domain_cross_section_image(
     {
         (values, "parent-tet-geometry-v1".to_string())
     } else {
+        crate::validate_current_live_request_context(&state, &request_context).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
 
@@ -1056,6 +1077,7 @@ pub async fn get_mesh_shared_domain_cross_section_image(
     if let Ok(h) = HeaderValue::from_str(&rendered.height.to_string()) {
         response.headers_mut().insert("x-fullmag-image-height", h);
     }
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(response)
 }
 
@@ -1086,15 +1108,19 @@ pub async fn get_mesh_shared_domain_cross_section_quality(
         ));
     }
 
-    let snapshot = current_snapshot(&state).await?;
+    let (snapshot, request_context) = current_snapshot_with_context(&state).await?;
     let Some(mesh) = snapshot.fem_mesh.as_ref() else {
+        crate::validate_current_live_request_context(&state, &request_context).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
     let elements = require_tet4_cross_section_topology(mesh, "cross-section quality")?;
+    let expected_topology_fingerprint = fullmag_runner::fem_mesh_topology_fingerprint(mesh);
     let artifact = snapshot
         .mesh_workspace
         .as_ref()
-        .map(read_mesh_quality_data_artifact)
+        .map(|workspace| {
+            read_mesh_quality_data_artifact(workspace, Some(expected_topology_fingerprint.as_str()))
+        })
         .transpose()?
         .flatten();
     let cut_norm = query.position_percent / 100.0;
@@ -1137,6 +1163,7 @@ pub async fn get_mesh_shared_domain_cross_section_quality(
         {
             (values, "parent-tet-geometry-v1".to_string())
         } else {
+            crate::validate_current_live_request_context(&state, &request_context).await?;
             return Ok(StatusCode::NO_CONTENT.into_response());
         }
     } else if let Some(values) =
@@ -1144,6 +1171,7 @@ pub async fn get_mesh_shared_domain_cross_section_quality(
     {
         (values, "parent-tet-geometry-v1".to_string())
     } else {
+        crate::validate_current_live_request_context(&state, &request_context).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
     let binary = serialize_cross_section_quality_fmqs(&values);
@@ -1156,6 +1184,7 @@ pub async fn get_mesh_shared_domain_cross_section_quality(
         query.metric,
         quality_source,
     ));
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(crate::router_v2::handlers::shared::conditional_binary_response(&headers, &etag, binary))
 }
 
@@ -1177,15 +1206,23 @@ pub async fn get_mesh_shared_domain_quality_data(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
-    let snapshot = current_snapshot(&state).await?;
+    let (snapshot, request_context) = current_snapshot_with_context(&state).await?;
     let mesh_workspace = current_mesh_workspace(&snapshot)?;
-    let Some(artifact) = read_mesh_quality_data_artifact(mesh_workspace)? else {
+    let expected_topology_fingerprint = snapshot
+        .fem_mesh
+        .as_ref()
+        .map(fullmag_runner::fem_mesh_topology_fingerprint);
+    let Some(artifact) =
+        read_mesh_quality_data_artifact(mesh_workspace, expected_topology_fingerprint.as_deref())?
+    else {
+        crate::validate_current_live_request_context(&state, &request_context).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
     let etag = crate::router_v2::handlers::shared::stable_strong_etag(&format!(
         "mesh-shared-domain-quality-data:{}:{}:{}:{}",
         snapshot.mesh_revision, artifact.path, artifact.byte_size, artifact.element_count,
     ));
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(
         crate::router_v2::handlers::shared::conditional_binary_response(
             &headers,
@@ -1204,10 +1241,12 @@ struct MeshQualityDataArtifact {
 
 fn read_mesh_quality_data_artifact(
     mesh_workspace: &Value,
+    expected_topology_fingerprint: Option<&str>,
 ) -> Result<Option<MeshQualityDataArtifact>, ApiError> {
     let Some(artifact) = first_workspace_value(
         mesh_workspace,
         &[
+            &["quality_data_artifact_v2"],
             &["quality_data_artifact"],
             &["mesh_quality_data_artifact"],
             &["last_build_summary", "quality_data_artifact"],
@@ -1228,10 +1267,94 @@ fn read_mesh_quality_data_artifact(
             "mesh quality data artifact {path} is not an FMMQ payload"
         )));
     }
+    let manifest_kind = artifact.get("kind").and_then(Value::as_str);
+    if bytes.get(4) == Some(&2) {
+        if artifact.get("kind").and_then(Value::as_str) != Some("fmmq.v2")
+            || artifact.get("schema_version").and_then(Value::as_u64) != Some(2)
+        {
+            return Err(ApiError::internal(format!(
+                "mesh quality data artifact {path} has v2 bytes but not a v2 manifest"
+            )));
+        }
+        for (field, prefix) in [
+            ("topology_fingerprint", "sha256:"),
+            ("policy_fingerprint", ""),
+            ("digest", "sha256:"),
+        ] {
+            let value = artifact
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if value.is_empty() || (!prefix.is_empty() && !value.starts_with(prefix)) {
+                return Err(ApiError::internal(format!(
+                    "mesh quality data artifact {path} has incomplete v2 identity field {field}"
+                )));
+            }
+        }
+        let validation = validate_fmmq_v2_payload(&bytes, expected_topology_fingerprint)?;
+        let manifest_digest = artifact
+            .get("digest")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                ApiError::internal(format!(
+                    "mesh quality data artifact {path} has no v2 payload digest"
+                ))
+            })?;
+        if manifest_digest != validation.digest {
+            return Err(ApiError::conflict(format!(
+                "mesh quality data artifact {path} digest mismatch: manifest {manifest_digest}, payload {}",
+                validation.digest
+            )));
+        }
+        if artifact.get("topology_fingerprint").and_then(Value::as_str)
+            != Some(validation.topology_fingerprint.as_str())
+        {
+            return Err(ApiError::conflict(format!(
+                "mesh quality data artifact {path} topology identity does not match payload"
+            )));
+        }
+        if artifact.get("policy_fingerprint").and_then(Value::as_str)
+            != Some(validation.policy_fingerprint.as_str())
+        {
+            return Err(ApiError::conflict(format!(
+                "mesh quality data artifact {path} policy identity does not match payload"
+            )));
+        }
+        if artifact.get("mesh_revision").and_then(Value::as_str)
+            != Some(validation.mesh_revision.as_str())
+        {
+            return Err(ApiError::conflict(format!(
+                "mesh quality data artifact {path} mesh revision does not match payload"
+            )));
+        }
+        if let Some(manifest_count) = artifact.get("element_count").and_then(Value::as_u64) {
+            if manifest_count != validation.element_count as u64 {
+                return Err(ApiError::conflict(format!(
+                    "mesh quality data artifact {path} element count does not match payload"
+                )));
+            }
+        }
+    } else {
+        if manifest_kind == Some("fmmq.v2") {
+            return Err(ApiError::internal(format!(
+                "mesh quality data artifact {path} declares v2 but payload version is not v2"
+            )));
+        }
+        if bytes.get(4) != Some(&1) {
+            return Err(ApiError::internal(format!(
+                "mesh quality data artifact {path} uses unsupported FMMQ version"
+            )));
+        }
+    }
     let byte_size = artifact
         .get("byte_size")
         .and_then(Value::as_u64)
         .unwrap_or(bytes.len() as u64);
+    if byte_size != bytes.len() as u64 {
+        return Err(ApiError::conflict(format!(
+            "mesh quality data artifact {path} byte size does not match payload"
+        )));
+    }
     let element_count = artifact
         .get("element_count")
         .and_then(Value::as_u64)
@@ -1467,7 +1590,7 @@ fn mixed_certificate_quality_evidence(
         };
     }
     if let Err(reasons) =
-        fullmag_ir::validate_mixed_layer_topology_certificate_against_mesh(certificate, &mesh_ir)
+        fullmag_ir::validate_mixed_layer_topology_certificate_against_mesh(&mesh_ir, certificate)
     {
         return MeshMixedCertificateQualityEvidenceResource {
             status: MeshMixedCertificateQualityEvidenceStatus::Rejected,
@@ -1585,12 +1708,14 @@ pub async fn get_mesh_periodic_pairs(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
-    let snapshot = current_snapshot(&state).await?;
+    let (snapshot, request_context) = current_snapshot_with_context(&state).await?;
     let Some((body, source_id)) = periodic_pairs_resource_for_snapshot(&snapshot)? else {
+        crate::validate_current_live_request_context(&state, &request_context).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
 
     let etag = periodic_pairs_etag(&source_id, &body)?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(crate::router_v2::handlers::shared::conditional_json_response(&headers, &etag, &body))
 }
 
@@ -1615,8 +1740,9 @@ pub async fn get_mesh_periodic_pairs_binary(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
-    let snapshot = current_snapshot(&state).await?;
+    let (snapshot, request_context) = current_snapshot_with_context(&state).await?;
     let Some((resource, source_id)) = periodic_pairs_resource_for_snapshot(&snapshot)? else {
+        crate::validate_current_live_request_context(&state, &request_context).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
     let body = crate::periodic_pairs_binary::encode_periodic_pairs_binary_v1(&resource).map_err(
@@ -1657,6 +1783,7 @@ pub async fn get_mesh_periodic_pairs_binary(
             response.headers_mut().insert(header, value);
         }
     }
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(response)
 }
 
@@ -1920,7 +2047,7 @@ pub async fn get_mesh_shared_domain_manifest(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
-    let snapshot = current_snapshot(&state).await?;
+    let (snapshot, request_context) = current_snapshot_with_context(&state).await?;
     match snapshot.fem_mesh.as_ref() {
         Some(mesh) => {
             let provenance = mesh_build_provenance(&snapshot);
@@ -2017,13 +2144,17 @@ pub async fn get_mesh_shared_domain_manifest(
                     .map(|revision| revision.to_string())
                     .unwrap_or_else(|| "unknown".to_string())
             ));
+            crate::validate_current_live_request_context(&state, &request_context).await?;
             Ok(
                 crate::router_v2::handlers::shared::conditional_json_response(
                     &headers, &etag, &body,
                 ),
             )
         }
-        None => Ok(StatusCode::NO_CONTENT.into_response()),
+        None => {
+            crate::validate_current_live_request_context(&state, &request_context).await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
     }
 }
 
@@ -2085,7 +2216,7 @@ pub async fn get_mesh_shared_domain_topology(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<axum::response::Response, ApiError> {
-    let snapshot = current_snapshot(&state).await?;
+    let (snapshot, request_context) = current_snapshot_with_context(&state).await?;
     match snapshot.fem_mesh.as_ref() {
         Some(mesh) => {
             let generation_id = mesh.generation_id.as_deref().unwrap_or("no-generation");
@@ -2103,9 +2234,13 @@ pub async fn get_mesh_shared_domain_topology(
                 &mut response,
                 &topology_hash,
             );
+            crate::validate_current_live_request_context(&state, &request_context).await?;
             Ok(response)
         }
-        None => Ok(StatusCode::NO_CONTENT.into_response()),
+        None => {
+            crate::validate_current_live_request_context(&state, &request_context).await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
     }
 }
 
@@ -2165,6 +2300,7 @@ pub async fn replace_mesh_object_config(
     Path(object_id): Path<String>,
     Json(req): Json<MeshObjectConfigReplaceRequest>,
 ) -> Result<Json<MeshObjectConfigResource>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let config = req
         .config
         .map(serde_json::to_value)
@@ -2177,7 +2313,9 @@ pub async fn replace_mesh_object_config(
         .map_err(|error| {
             ApiError::bad_request(format!("invalid object mesh config payload: {error}"))
         })?;
-    let mut scene = crate::get_or_load_current_live_scene_document(&state).await?;
+    let mut scene =
+        crate::get_or_load_current_live_scene_document_for_context(&state, &request_context)
+            .await?;
     let object = scene
         .objects
         .iter_mut()
@@ -2185,7 +2323,9 @@ pub async fn replace_mesh_object_config(
         .ok_or_else(|| ApiError::not_found(format!("object not found: {object_id}")))?;
     object.object_mesh = config.clone();
     object.mesh_override = config.clone();
-    let committed = crate::commit_current_live_scene_document(&state, scene).await?;
+    let committed =
+        crate::commit_current_live_scene_document_for_context(&state, &request_context, scene)
+            .await?;
     let object = committed
         .objects
         .iter()
@@ -2197,7 +2337,8 @@ pub async fn replace_mesh_object_config(
         "effective committed object mesh config",
     )?);
     let config = optional_json_object_map(config_state, "committed object mesh config")?;
-    let revision = current_snapshot(&state).await?.mesh_revision;
+    let revision = current_snapshot_with_context(&state).await?.0.mesh_revision;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(Json(MeshObjectConfigResource {
         revision,
         object_id,
@@ -2384,7 +2525,7 @@ pub async fn get_mesh_object_topology(
     headers: HeaderMap,
     Path(object_id): Path<String>,
 ) -> Result<axum::response::Response, ApiError> {
-    let snapshot = current_snapshot(&state).await?;
+    let (snapshot, request_context) = current_snapshot_with_context(&state).await?;
     match snapshot.fem_mesh.as_ref() {
         Some(mesh) => {
             let object_mesh = subset_object_mesh(mesh, &object_id)
@@ -2410,9 +2551,13 @@ pub async fn get_mesh_object_topology(
                 &mut response,
                 &topology_hash,
             );
+            crate::validate_current_live_request_context(&state, &request_context).await?;
             Ok(response)
         }
-        None => Ok(StatusCode::NO_CONTENT.into_response()),
+        None => {
+            crate::validate_current_live_request_context(&state, &request_context).await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
     }
 }
 
@@ -2440,7 +2585,7 @@ pub async fn get_mesh_part_topology(
     headers: HeaderMap,
     Path(part_id): Path<String>,
 ) -> Result<axum::response::Response, ApiError> {
-    let snapshot = current_snapshot(&state).await?;
+    let (snapshot, request_context) = current_snapshot_with_context(&state).await?;
     match snapshot.fem_mesh.as_ref() {
         Some(mesh) => {
             let part_mesh = subset_part_mesh(mesh, &part_id)
@@ -2461,9 +2606,13 @@ pub async fn get_mesh_part_topology(
                 &mut response,
                 &topology_hash,
             );
+            crate::validate_current_live_request_context(&state, &request_context).await?;
             Ok(response)
         }
-        None => Ok(StatusCode::NO_CONTENT.into_response()),
+        None => {
+            crate::validate_current_live_request_context(&state, &request_context).await?;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
     }
 }
 
@@ -2489,8 +2638,9 @@ pub async fn get_mesh_histogram_bin_elements(
     State(state): State<Arc<AppState>>,
     Path((mesh_id, part_id, metric, bin_index)): Path<(String, String, String, u32)>,
 ) -> Result<axum::response::Response, ApiError> {
-    let snapshot = current_snapshot(&state).await?;
+    let (snapshot, request_context) = current_snapshot_with_context(&state).await?;
     let Some(mesh) = snapshot.fem_mesh.as_ref() else {
+        crate::validate_current_live_request_context(&state, &request_context).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     };
     if !matches_shared_domain_mesh_id(mesh, &mesh_id) {
@@ -2499,7 +2649,13 @@ pub async fn get_mesh_histogram_bin_elements(
     let metric = MeshHistogramMetric::from_path_segment(&metric)?;
     let quality_values = if let Some(quality_metric) = metric.quality_metric() {
         let mesh_workspace = current_mesh_workspace(&snapshot)?;
-        let Some(artifact) = read_mesh_quality_data_artifact(mesh_workspace)? else {
+        let expected_topology_fingerprint =
+            Some(fullmag_runner::fem_mesh_topology_fingerprint(mesh));
+        let Some(artifact) = read_mesh_quality_data_artifact(
+            mesh_workspace,
+            expected_topology_fingerprint.as_deref(),
+        )?
+        else {
             return Err(ApiError::bad_request(format!(
                 "histogram metric {} requires per-element mesh quality data",
                 metric.as_str()
@@ -2515,6 +2671,7 @@ pub async fn get_mesh_histogram_bin_elements(
         Vec::new()
     };
     let resource = mesh_histogram_bin_elements(mesh, &part_id, metric, bin_index, &quality_values)?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(Json(resource).into_response())
 }
 
@@ -2534,7 +2691,7 @@ pub async fn get_mesh_interface_config(
     State(state): State<Arc<AppState>>,
     Path(interface_id): Path<String>,
 ) -> Result<Json<MeshInterfaceConfigResource>, ApiError> {
-    let snapshot = current_snapshot(&state).await?;
+    let (snapshot, request_context) = current_snapshot_with_context(&state).await?;
     let scene = current_scene_document(&snapshot)?;
     let config = scene
         .study
@@ -2548,6 +2705,7 @@ pub async fn get_mesh_interface_config(
                 "failed to serialize interface mesh config: {error}"
             ))
         })?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     Ok(Json(MeshInterfaceConfigResource {
         revision: snapshot.mesh_revision,
         interface_id,
@@ -2574,6 +2732,7 @@ pub async fn replace_mesh_interface_config(
     Path(interface_id): Path<String>,
     Json(req): Json<MeshInterfaceConfigReplaceRequest>,
 ) -> Result<Json<MeshInterfaceConfigResource>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let config = req
         .config
         .map(serde_json::from_value::<ScriptBuilderPerGeometryMeshState>)
@@ -2583,7 +2742,9 @@ pub async fn replace_mesh_interface_config(
         })?;
     let (owner_a, owner_b) = resolve_interface_owners(&interface_id, req.owner_a, req.owner_b)?;
 
-    let mut scene = crate::get_or_load_current_live_scene_document(&state).await?;
+    let mut scene =
+        crate::get_or_load_current_live_scene_document_for_context(&state, &request_context)
+            .await?;
     if let Some(index) = scene
         .study
         .mesh_interfaces
@@ -2609,8 +2770,11 @@ pub async fn replace_mesh_interface_config(
         });
     }
 
-    let _committed = crate::commit_current_live_scene_document(&state, scene).await?;
+    let _committed =
+        crate::commit_current_live_scene_document_for_context(&state, &request_context, scene)
+            .await?;
     let snapshot = current_snapshot(&state).await?;
+    crate::validate_current_live_request_context(&state, &request_context).await?;
     let committed_scene = current_scene_document(&snapshot)?;
     let config = committed_scene
         .study
@@ -2698,13 +2862,28 @@ pub async fn get_mesh_interface_quality(
 }
 
 async fn current_snapshot(state: &Arc<AppState>) -> Result<SessionStateResponse, ApiError> {
-    state
+    Ok(current_snapshot_with_context(state).await?.0)
+}
+
+async fn current_snapshot_with_context(
+    state: &Arc<AppState>,
+) -> Result<(SessionStateResponse, CurrentLiveRequestContext), ApiError> {
+    let request_context = crate::capture_current_live_request_context(state).await?;
+    let snapshot = state
         .current_live_state
         .read()
         .await
         .as_ref()
         .cloned()
-        .ok_or_else(|| ApiError::not_found("no active local live workspace"))
+        .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(
+        &snapshot,
+        &request_context,
+        state
+            .current_live_session_epoch
+            .load(std::sync::atomic::Ordering::Acquire),
+    )?;
+    Ok((snapshot, request_context))
 }
 
 fn current_scene_document(snapshot: &SessionStateResponse) -> Result<&SceneDocument, ApiError> {
@@ -3683,7 +3862,10 @@ fn region_quality(
         })));
     };
 
-    if let Some(artifact) = read_mesh_quality_data_artifact(mesh_workspace)? {
+    let expected_topology_fingerprint = Some(fullmag_runner::fem_mesh_topology_fingerprint(mesh));
+    if let Some(artifact) =
+        read_mesh_quality_data_artifact(mesh_workspace, expected_topology_fingerprint.as_deref())?
+    {
         if let Some(values) =
             per_element_quality_metric_from_fmmq(&artifact.bytes, CrossSectionQualityMetric::Sicn)?
         {
@@ -3845,6 +4027,10 @@ fn mesh_build_provenance(snapshot: &SessionStateResponse) -> MeshBuildProvenance
     }
 
     clean_scene_mesh_provenance(snapshot).unwrap_or(provenance)
+}
+
+pub(crate) fn mesh_source_scene_revision(snapshot: &SessionStateResponse) -> Option<u64> {
+    mesh_build_provenance(snapshot).source_scene_revision
 }
 
 fn clean_scene_mesh_provenance(snapshot: &SessionStateResponse) -> Option<MeshBuildProvenance> {

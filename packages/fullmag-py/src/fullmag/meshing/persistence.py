@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from io import BytesIO
@@ -15,8 +15,21 @@ import zipfile
 
 import numpy as np
 
-from fullmag._core import validate_mesh_ir
+from fullmag._core import (
+    certify_mixed_mesh_arrays,
+    preflight_mixed_mesh_arrays,
+    validate_mesh_ir,
+)
 
+from ._certification_receipt import (
+    ARTIFACT_SCHEMA_V2,
+    MIXED_CERTIFIER_ALGORITHM,
+    RECEIPT_SCHEMA_V1,
+    RECEIPT_SCHEMA_V2,
+    CertificationReceiptBindingsV1,
+    CertificationReceiptV1,
+    CertificationReceiptV2,
+)
 from ._gmsh_extraction import _read_mesh_file
 from ._gmsh_extraction import _derive_facet_roles
 from ._gmsh_infra import _import_meshio
@@ -25,10 +38,16 @@ from ._gmsh_types import (
     MeshQualityReport,
     MeshRealizationReport,
     MixedLayerTopologyCertificate,
+    _TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY,
+    _bind_trusted_topology_fingerprint_v3,
+    _bind_trusted_topology_fingerprint_v3_from_native,
+    _certificate_payload_sha256,
+    _mint_trusted_native_preflight_receipt_proof,
 )
 
 
-ARTIFACT_SCHEMA = "fullmag.mesh-artifact.v1"
+ARTIFACT_SCHEMA_V1 = "fullmag.mesh-artifact.v1"
+ARTIFACT_SCHEMA = ARTIFACT_SCHEMA_V1
 AUTHORING_SCHEMA = "fullmag.mesh-authoring-fingerprint.v1"
 INTERCHANGE_SCHEMA = "fullmag.mesh-interchange.v1"
 COMSOL_INTERCHANGE_SCHEMA = "fullmag.mesh-comsol-interchange.v1"
@@ -127,6 +146,36 @@ def _canonical_json(value: object) -> bytes:
     ).encode("utf-8")
 
 
+def _fsync_file(path: Path) -> None:
+    """Flush a closed temporary file before it is atomically promoted."""
+    # Windows requires a writable handle for ``FlushFileBuffers`` (which is
+    # what ``os.fsync`` delegates to).  The files passed here are newly-created
+    # temporary artifacts, so opening them read/write is safe and portable.
+    with path.open("r+b") as stream:
+        os.fsync(stream.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort directory barrier after ``os.replace``.
+
+    POSIX filesystems can persist the rename itself separately from the file
+    contents.  Windows does not expose a portable directory handle for this
+    operation, so failures are intentionally ignored there; the file flush and
+    atomic replace remain mandatory on every platform.
+    """
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+    finally:
+        os.close(descriptor)
+
+
 def _atomic_write_bytes(target: Path, payload: bytes) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -136,7 +185,9 @@ def _atomic_write_bytes(target: Path, payload: bytes) -> None:
     temporary = Path(temporary_name)
     try:
         temporary.write_bytes(payload)
+        _fsync_file(temporary)
         os.replace(temporary, target)
+        _fsync_directory(target.parent)
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -225,13 +276,20 @@ def _serialize_mesh(mesh: MeshData) -> bytes:
     return stream.getvalue()
 
 
-def _deserialize_mesh(payload: bytes) -> MeshData:
+def _deserialize_mesh_with_detached_certificate(
+    payload: bytes,
+) -> tuple[MeshData, MixedLayerTopologyCertificate | None]:
     try:
         data = np.load(BytesIO(payload), allow_pickle=False)
         metadata = json.loads(str(data["metadata_json"]))
         realization = metadata.get("realization_report")
-        certificate = metadata.get("mixed_layer_topology_certificate")
-        return MeshData(
+        certificate_payload = metadata.get("mixed_layer_topology_certificate")
+        certificate = (
+            MixedLayerTopologyCertificate.from_dict(certificate_payload)
+            if certificate_payload is not None
+            else None
+        )
+        mesh = MeshData(
             nodes=data["nodes"],
             cell_types=data["cell_types"],
             cell_offsets=data["cell_offsets"],
@@ -256,16 +314,54 @@ def _deserialize_mesh(payload: bytes) -> MeshData:
             realization_report=(
                 MeshRealizationReport.from_dict(realization) if realization is not None else None
             ),
-            mixed_layer_topology_certificate=(
-                MixedLayerTopologyCertificate.from_dict(certificate)
-                if certificate is not None
-                else None
-            ),
+            mixed_layer_topology_certificate=None,
         )
+        return mesh, certificate
     except MeshArtifactError:
         raise
     except Exception as exc:
         raise MeshArtifactCorruptionError(f"invalid topology.npz: {exc}") from exc
+
+
+def _deserialize_mesh(payload: bytes) -> MeshData:
+    mesh, certificate = _deserialize_mesh_with_detached_certificate(payload)
+    if certificate is None:
+        return mesh
+    try:
+        return replace(mesh, mixed_layer_topology_certificate=certificate)
+    except Exception as exc:
+        raise MeshArtifactCorruptionError(
+            f"invalid mixed certificate in topology.npz: {exc}"
+        ) from exc
+
+
+def _attach_native_certificate_without_revalidation(
+    mesh_without_certificate: MeshData,
+    certificate: MixedLayerTopologyCertificate,
+) -> MeshData:
+    """Attach a certificate after the native engine already audited the mesh.
+
+    ``MeshData.__post_init__`` intentionally certifies mixed meshes when a
+    certificate is present.  Persistence has just performed that exact native
+    audit and checked its fingerprint/payload result, so calling ``replace``
+    here would walk every CSR array a second time.  The helper is private and
+    is only used at those checked native seams; realization-report validation
+    remains explicit below.
+    """
+    if mesh_without_certificate.mixed_layer_topology_certificate is not None:
+        raise ValueError("native certificate attachment requires an unsigned mesh")
+    if not isinstance(certificate, MixedLayerTopologyCertificate):
+        raise TypeError("native certificate attachment requires a mixed certificate")
+    result = object.__new__(MeshData)
+    for descriptor in fields(MeshData):
+        value = (
+            certificate
+            if descriptor.name == "mixed_layer_topology_certificate"
+            else getattr(mesh_without_certificate, descriptor.name)
+        )
+        object.__setattr__(result, descriptor.name, value)
+    result._validate_realization_report()
+    return result
 
 
 def _normalize_markers(markers: Sequence[Mapping[str, object]]) -> list[dict[str, object]]:
@@ -308,6 +404,250 @@ def _validate_semantic_marker_coverage(
         )
 
 
+def _document_sha256(document: Mapping[str, object]) -> str:
+    return sha256(_canonical_json(dict(document))).hexdigest()
+
+
+def _semantic_manifest_sha256(
+    *,
+    region_markers: object,
+    object_region_markers: object,
+    boundary_map: object,
+) -> str:
+    def normalized_markers(value: object, *, label: str) -> list[dict[str, object]]:
+        if not isinstance(value, (list, tuple)) or any(
+            not isinstance(entry, Mapping) for entry in value
+        ):
+            raise ValueError(f"{label} must be an array of marker objects")
+        return sorted(
+            _normalize_markers(value),  # type: ignore[arg-type]
+            key=lambda entry: (str(entry["geometry_name"]), int(entry["marker"])),
+        )
+
+    if not isinstance(boundary_map, Mapping):
+        raise ValueError("boundary_map must be an object")
+    projection = {
+        "region_markers": normalized_markers(
+            region_markers,
+            label="region_markers",
+        ),
+        "object_region_markers": normalized_markers(
+            object_region_markers,
+            label="object_region_markers",
+        ),
+        "boundary_map": dict(
+            sorted((str(name), int(marker)) for name, marker in boundary_map.items())
+        ),
+    }
+    return sha256(_canonical_json(projection)).hexdigest()
+
+
+def _member_descriptors(members: Mapping[str, bytes]) -> dict[str, dict[str, object]]:
+    return {
+        name: {"sha256": sha256(content).hexdigest(), "bytes": len(content)}
+        for name, content in sorted(members.items())
+    }
+
+
+def _write_native_artifact(
+    target: Path,
+    *,
+    manifest: Mapping[str, object],
+    members: Mapping[str, bytes],
+) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    manifest_bytes = _canonical_json(dict(manifest))
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("manifest.json", manifest_bytes)
+            for name, content in sorted(members.items()):
+                archive.writestr(name, content)
+        _fsync_file(temporary)
+        os.replace(temporary, target)
+        _fsync_directory(target.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _read_native_artifact(
+    source: Path,
+) -> tuple[dict[str, object], dict[str, bytes]]:
+    try:
+        with zipfile.ZipFile(source, "r") as archive:
+            names = archive.namelist()
+            if len(names) != len(set(names)):
+                raise MeshArtifactCorruptionError(
+                    "native mesh artifact contains duplicate member names"
+                )
+            manifest = json.loads(archive.read("manifest.json"))
+            if not isinstance(manifest, dict):
+                raise MeshArtifactCorruptionError("manifest.json must contain an object")
+            schema = manifest.get("schema")
+            if schema not in {ARTIFACT_SCHEMA_V1, ARTIFACT_SCHEMA_V2}:
+                raise MeshArtifactVersionError(
+                    f"unsupported mesh artifact schema {schema!r}"
+                )
+            descriptors = manifest.get("members")
+            if not isinstance(descriptors, Mapping):
+                raise MeshArtifactCorruptionError("manifest members must be an object")
+            if schema == ARTIFACT_SCHEMA_V2:
+                required = {
+                    "topology.npz",
+                    "build-report.json",
+                    "certification-receipt.json",
+                }
+                if set(descriptors) != required or set(names) != required | {"manifest.json"}:
+                    raise MeshArtifactCorruptionError(
+                        "v2 native mesh artifact has an invalid member set"
+                    )
+            members: dict[str, bytes] = {}
+            for name, raw_descriptor in descriptors.items():
+                if not isinstance(name, str) or not isinstance(raw_descriptor, Mapping):
+                    raise MeshArtifactCorruptionError("manifest member descriptor is invalid")
+                if set(raw_descriptor) != {"sha256", "bytes"}:
+                    raise MeshArtifactCorruptionError(
+                        f"manifest descriptor fields are invalid for {name}"
+                    )
+                content = archive.read(name)
+                if sha256(content).hexdigest() != raw_descriptor.get("sha256"):
+                    raise MeshArtifactCorruptionError(f"digest mismatch for {name}")
+                expected_bytes = raw_descriptor.get("bytes")
+                if (
+                    isinstance(expected_bytes, bool)
+                    or not isinstance(expected_bytes, int)
+                    or len(content) != expected_bytes
+                ):
+                    raise MeshArtifactCorruptionError(f"byte length mismatch for {name}")
+                members[name] = content
+    except (MeshArtifactError, FileNotFoundError):
+        raise
+    except Exception as exc:
+        raise MeshArtifactCorruptionError(f"invalid native mesh artifact: {exc}") from exc
+    if "topology.npz" not in members:
+        raise MeshArtifactCorruptionError("native mesh artifact is missing topology.npz")
+    return manifest, members
+
+
+def _bindings_from_manifest(
+    manifest: Mapping[str, object],
+) -> CertificationReceiptBindingsV1:
+    raw = manifest.get("certification_bindings")
+    if not isinstance(raw, Mapping):
+        raise MeshArtifactCorruptionError(
+            "v2 manifest certification_bindings must be an object"
+        )
+    expected = {
+        "resolved_policy_sha256",
+        "source_snapshot_sha256",
+        "gmsh_version",
+        "repair_algorithm_id",
+        "repair_method",
+        "repair_iterations",
+        "gmsh_threads",
+        "certifier_algorithm_id",
+        "certifier_backend",
+        "certifier_threads",
+    }
+    if set(raw) != expected:
+        raise MeshArtifactCorruptionError(
+            "v2 manifest certification_bindings fields are invalid"
+        )
+    try:
+        return CertificationReceiptBindingsV1(**dict(raw))
+    except (TypeError, ValueError) as exc:
+        raise MeshArtifactCorruptionError(
+            f"invalid v2 manifest certification bindings: {exc}"
+        ) from exc
+
+
+def _receipt_from_members(
+    members: Mapping[str, bytes],
+) -> CertificationReceiptV1 | CertificationReceiptV2:
+    try:
+        payload = json.loads(members["certification-receipt.json"])
+        if not isinstance(payload, Mapping):
+            raise ValueError("receipt JSON must contain an object")
+        schema = payload.get("schema")
+        if schema == RECEIPT_SCHEMA_V1:
+            return CertificationReceiptV1.from_dict(payload)
+        if schema == RECEIPT_SCHEMA_V2:
+            return CertificationReceiptV2.from_dict(payload)
+        raise ValueError(f"certification receipt schema {schema!r} is unsupported")
+    except MeshArtifactError:
+        raise
+    except Exception as exc:
+        raise MeshArtifactCorruptionError(
+            f"invalid certification-receipt.json: {exc}"
+        ) from exc
+
+
+def _validate_v2_receipt(
+    *,
+    manifest: Mapping[str, object],
+    members: Mapping[str, bytes],
+    mesh: MeshData,
+    certificate: MixedLayerTopologyCertificate,
+    topology_fingerprint_v3: str,
+) -> tuple[
+    CertificationReceiptV1 | CertificationReceiptV2,
+    CertificationReceiptBindingsV1,
+]:
+    receipt = _receipt_from_members(members)
+    bindings = _bindings_from_manifest(manifest)
+    authoring = manifest.get("authoring_document")
+    if not isinstance(authoring, Mapping):
+        raise MeshArtifactCorruptionError(
+            "manifest authoring_document must be an object"
+        )
+    try:
+        components = {
+            "topology_bytes": members["topology.npz"],
+            "build_report_bytes": members["build-report.json"],
+            "topology_fingerprint_v3": topology_fingerprint_v3,
+            "certificate_payload_sha256": _certificate_payload_sha256(certificate),
+            "authoring_document_sha256": _document_sha256(authoring),
+            "bindings": bindings,
+            "mesh_counts": {
+                "nodes": mesh.n_nodes,
+                "cells": mesh.n_elements,
+                "facets": mesh.n_boundary_faces,
+            },
+        }
+        if isinstance(receipt, CertificationReceiptV2):
+            expected = CertificationReceiptV2.from_components(
+                **components,
+                semantic_manifest_sha256=_semantic_manifest_sha256(
+                    region_markers=manifest.get("region_markers"),
+                    object_region_markers=manifest.get("object_region_markers"),
+                    boundary_map=manifest.get("boundary_map"),
+                ),
+            )
+        else:
+            expected = CertificationReceiptV1.from_components(**components)
+    except (TypeError, ValueError) as exc:
+        raise MeshArtifactCorruptionError(
+            f"certification receipt binding is invalid: {exc}"
+        ) from exc
+    if receipt != expected:
+        raise MeshArtifactCorruptionError(
+            "certification receipt does not match artifact contents and bindings"
+        )
+    if certificate.gmsh_version != receipt.producer.gmsh_version:
+        raise MeshArtifactCorruptionError(
+            "mixed certificate Gmsh version does not match certification receipt"
+        )
+    if certificate.effective_gmsh_thread_count != receipt.producer.gmsh_threads:
+        raise MeshArtifactCorruptionError(
+            "mixed certificate Gmsh thread count does not match certification receipt"
+        )
+    return receipt, bindings
+
+
 def save_mesh_artifact(
     path: str | Path,
     *,
@@ -319,15 +659,65 @@ def save_mesh_artifact(
     boundary_map: Mapping[str, int] | None = None,
     build_report: Mapping[str, object] | None = None,
     provenance: Mapping[str, object] | None = None,
+    certification_bindings: CertificationReceiptBindingsV1 | None = None,
+    _native_certificate_result: object | None = None,
 ) -> Path:
     target = Path(path)
     if target.suffix != ".fullmag-mesh":
         raise ValueError("native mesh artifacts must use .fullmag-mesh; use study.mesh.export() for .msh")
     target.parent.mkdir(parents=True, exist_ok=True)
-    mesh.validate_strict(require_positive_orientation=True)
-    mesh_ir = mesh.to_ir(mesh_name)
-    if validate_mesh_ir(mesh_ir) is False:
-        raise ValueError("mesh failed Rust MeshIR validation")
+    # A mixed certificate already contains the complete per-cell geometry
+    # evidence (including orientation and degeneracy checks).  Re-running the
+    # Python ``validate_strict`` loop here makes persistence scale linearly in
+    # Python over every cell and turns a large SP4 save into a multi-minute
+    # operation.  Reuse the native certificate result when available; retain
+    # the Python validator for source-only runtimes and un-certified meshes.
+    # The internal shared-domain cache may already have run the native
+    # certifier to discover its Rayon thread count before constructing the
+    # receipt bindings.  Reuse that exact result instead of certifying the
+    # same large CSR mesh a second time.  The argument is private on purpose:
+    # public callers continue to get the normal fail-closed validation path.
+    native_certificate = _native_certificate_result
+    certificate = mesh.mixed_layer_topology_certificate
+    if certificate is not None:
+        if native_certificate is None:
+            native_certificate = certify_mixed_mesh_arrays(
+                mesh=mesh,
+                metadata={"mesh_name": mesh_name},
+                certificate=certificate.to_dict(),
+                require_native=certification_bindings is not None,
+            )
+        if native_certificate is not None:
+            # The native certifier computes and validates the v3 fingerprint
+            # over the exact CSR arrays.  Recomputing that byte stream in
+            # Python here duplicates a large linear pass for SP4 meshes.
+            expected_fingerprint = native_certificate.topology_fingerprint_v3
+            expected_payload = _certificate_payload_sha256(certificate)
+            if (
+                not native_certificate.validated_claimed_certificate
+                or native_certificate.topology_fingerprint_v3 != expected_fingerprint
+                or native_certificate.certificate_payload_sha256 != expected_payload
+            ):
+                if certification_bindings is not None:
+                    raise ValueError(
+                        "native mixed certificate result does not match mesh certificate"
+                    )
+                native_certificate = None
+    native_mixed_certificate_validated = bool(
+        native_certificate is not None
+        and native_certificate.validated_claimed_certificate
+    )
+    if native_certificate is None:
+        mesh.validate_strict(require_positive_orientation=True)
+    topology_fingerprint = (
+        native_certificate.topology_fingerprint_v3
+        if native_certificate is not None
+        else mesh.topology_fingerprint_v3()
+    )
+    if not native_mixed_certificate_validated:
+        mesh_ir = mesh.to_ir(mesh_name)
+        if validate_mesh_ir(mesh_ir) is False:
+            raise ValueError("mesh failed Rust MeshIR validation")
     regions = _normalize_markers(region_markers)
     object_regions = _normalize_markers(object_region_markers)
     boundaries = {str(name): int(marker) for name, marker in (boundary_map or {}).items()}
@@ -343,41 +733,92 @@ def save_mesh_artifact(
     if report_bytes is not None:
         members["build-report.json"] = report_bytes
     authoring = dict(authoring_document)
+    schema = ARTIFACT_SCHEMA_V1
+    artifact_provenance = dict(provenance or {"origin": "generated"})
+    if certification_bindings is not None:
+        if not isinstance(certification_bindings, CertificationReceiptBindingsV1):
+            raise TypeError(
+                "certification_bindings must be CertificationReceiptBindingsV1"
+            )
+        if report_bytes is None:
+            raise ValueError("certified artifact v2 requires build_report")
+        certificate = mesh.mixed_layer_topology_certificate
+        if certificate is None:
+            raise ValueError("certified artifact v2 requires a mixed certificate")
+        if (
+            certificate.gmsh_version != certification_bindings.gmsh_version
+            or certificate.effective_gmsh_thread_count
+            != certification_bindings.gmsh_threads
+        ):
+            raise ValueError(
+                "mixed certificate Gmsh provenance does not match v2 bindings"
+            )
+        native = native_certificate
+        if native is None:  # pragma: no cover - require_native contract
+            native = certify_mixed_mesh_arrays(
+                mesh=mesh,
+                metadata={"mesh_name": mesh_name},
+                certificate=certificate.to_dict(),
+                require_native=True,
+            )
+        if native is None:  # pragma: no cover - require_native contract
+            raise RuntimeError("native mixed mesh certifier is required")
+        expected_payload = _certificate_payload_sha256(certificate)
+        if (
+            not native.validated_claimed_certificate
+            or native.topology_fingerprint_v3 != topology_fingerprint
+            or native.certificate_payload_sha256 != expected_payload
+            or native.algorithm_id != certification_bindings.certifier_algorithm_id
+            or native.rayon_threads != certification_bindings.certifier_threads
+        ):
+            raise ValueError("native mixed certificate result does not match v2 bindings")
+        receipt = CertificationReceiptV2.from_components(
+            topology_bytes=topology,
+            build_report_bytes=report_bytes,
+            topology_fingerprint_v3=native.topology_fingerprint_v3,
+            semantic_manifest_sha256=_semantic_manifest_sha256(
+                region_markers=regions,
+                object_region_markers=object_regions,
+                boundary_map=boundaries,
+            ),
+            certificate_payload_sha256=expected_payload,
+            authoring_document_sha256=_document_sha256(authoring),
+            bindings=certification_bindings,
+            mesh_counts={
+                "nodes": mesh.n_nodes,
+                "cells": mesh.n_elements,
+                "facets": mesh.n_boundary_faces,
+            },
+        )
+        members["certification-receipt.json"] = receipt.to_json_bytes()
+        schema = ARTIFACT_SCHEMA_V2
+        artifact_provenance.update(
+            {
+                "certifier_backend": "rust_rayon",
+                "production_qualified": True,
+            }
+        )
     manifest = {
-        "schema": ARTIFACT_SCHEMA,
-        "minimum_reader_schema": ARTIFACT_SCHEMA,
+        "schema": schema,
+        "minimum_reader_schema": schema,
         "coordinate_unit": "m",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "mesh_name": mesh_name,
         "topology_fingerprint_version": "v3",
-        "topology_fingerprint": mesh.topology_fingerprint_v3(),
+        "topology_fingerprint": topology_fingerprint,
         "authoring_schema": AUTHORING_SCHEMA,
         "authoring_document": authoring,
         "authoring_fingerprint": mesh_authoring_fingerprint(authoring),
         "region_markers": regions,
         "object_region_markers": object_regions,
         "boundary_map": dict(sorted(boundaries.items())),
-        "provenance": dict(provenance or {"origin": "generated"}),
+        "provenance": artifact_provenance,
         "build_report_present": report_bytes is not None,
-        "members": {
-            name: {"sha256": sha256(content).hexdigest(), "bytes": len(content)}
-            for name, content in sorted(members.items())
-        },
+        "members": _member_descriptors(members),
     }
-    manifest_bytes = _canonical_json(manifest)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
-    )
-    os.close(descriptor)
-    temporary = Path(temporary_name)
-    try:
-        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("manifest.json", manifest_bytes)
-            for name, content in sorted(members.items()):
-                archive.writestr(name, content)
-        os.replace(temporary, target)
-    finally:
-        temporary.unlink(missing_ok=True)
+    if certification_bindings is not None:
+        manifest["certification_bindings"] = asdict(certification_bindings)
+    _write_native_artifact(target, manifest=manifest, members=members)
     return target
 
 
@@ -386,36 +827,148 @@ def load_mesh_artifact(
     *,
     expected_authoring_document: Mapping[str, object] | None = None,
 ) -> MeshArtifact:
+    return _load_mesh_artifact_full_audit(
+        path,
+        expected_authoring_document=expected_authoring_document,
+        require_native=False,
+        artifact_trust="portable_full_audit",
+    )
+
+
+def _load_mesh_artifact_forced_audit(path: str | Path) -> MeshArtifact:
+    return _load_mesh_artifact_full_audit(
+        path,
+        expected_authoring_document=None,
+        require_native=True,
+        artifact_trust="forced_audit",
+    )
+
+
+def _load_mesh_artifact_full_audit(
+    path: str | Path,
+    *,
+    expected_authoring_document: Mapping[str, object] | None,
+    require_native: bool,
+    artifact_trust: str,
+) -> MeshArtifact:
     source = Path(path)
     if source.suffix != ".fullmag-mesh":
         raise ValueError("study.mesh.load() accepts only .fullmag-mesh artifacts")
-    try:
-        with zipfile.ZipFile(source, "r") as archive:
-            manifest = json.loads(archive.read("manifest.json"))
-            if manifest.get("schema") != ARTIFACT_SCHEMA:
-                raise MeshArtifactVersionError(
-                    f"unsupported mesh artifact schema {manifest.get('schema')!r}"
+    manifest, members = _read_native_artifact(source)
+    schema = manifest["schema"]
+    receipt: CertificationReceiptV1 | CertificationReceiptV2 | None = None
+    native_backend = "python_reference"
+    if schema == ARTIFACT_SCHEMA_V2:
+        unsigned, certificate = _deserialize_mesh_with_detached_certificate(
+            members["topology.npz"]
+        )
+        if certificate is None:
+            raise MeshArtifactCorruptionError("v2 artifact is missing mixed certificate")
+        native = certify_mixed_mesh_arrays(
+            mesh=unsigned,
+            metadata={"mesh_name": str(manifest.get("mesh_name", ""))},
+            certificate=certificate.to_dict(),
+            require_native=require_native,
+        )
+        topology_fingerprint = (
+            native.topology_fingerprint_v3
+            if native is not None
+            else unsigned.topology_fingerprint_v3()
+        )
+        receipt, _ = _validate_v2_receipt(
+            manifest=manifest,
+            members=members,
+            mesh=unsigned,
+            certificate=certificate,
+            topology_fingerprint_v3=topology_fingerprint,
+        )
+        if native is not None:
+            if (
+                not native.validated_claimed_certificate
+                or native.topology_fingerprint_v3
+                != f"sha256:{receipt.topology_fingerprint_v3}"
+                or native.certificate_payload_sha256
+                != f"sha256:{receipt.certificate.payload_sha256}"
+                or native.algorithm_id != receipt.certificate.algorithm_id
+                or native.rayon_threads != receipt.producer.certifier_threads
+            ):
+                raise MeshArtifactCorruptionError(
+                    "native certificate audit does not match certification receipt"
                 )
-            members: dict[str, bytes] = {}
-            for name, descriptor in manifest.get("members", {}).items():
-                content = archive.read(name)
-                if sha256(content).hexdigest() != descriptor.get("sha256"):
-                    raise MeshArtifactCorruptionError(f"digest mismatch for {name}")
-                if len(content) != int(descriptor.get("bytes", -1)):
-                    raise MeshArtifactCorruptionError(f"byte length mismatch for {name}")
-                members[name] = content
-    except (MeshArtifactError, FileNotFoundError):
-        raise
-    except Exception as exc:
-        raise MeshArtifactCorruptionError(f"invalid native mesh artifact: {exc}") from exc
-    if "topology.npz" not in members:
-        raise MeshArtifactCorruptionError("native mesh artifact is missing topology.npz")
-    mesh = _deserialize_mesh(members["topology.npz"])
-    topology_fingerprint = mesh.topology_fingerprint_v3()
-    if topology_fingerprint != manifest.get("topology_fingerprint"):
+            native_backend = "rust_rayon"
+        try:
+            mesh = (
+                _attach_native_certificate_without_revalidation(unsigned, certificate)
+                if native is not None
+                else replace(unsigned, mixed_layer_topology_certificate=certificate)
+            )
+        except Exception as exc:
+            raise MeshArtifactCorruptionError(
+                f"full mixed certificate audit failed: {exc}"
+            ) from exc
+    else:
+        # Keep the certificate detached while reading legacy v1 topology.  A
+        # v1 payload used to be constructed as signed MeshData, stripped back
+        # to unsigned MeshData for the native audit, and then validated a third
+        # time.  The detached form lets the native result validate the exact
+        # arrays once, after which the signed constructor can take its
+        # certificate fast path.
+        unsigned, certificate = _deserialize_mesh_with_detached_certificate(
+            members["topology.npz"]
+        )
+        mesh = unsigned
+        if certificate is not None:
+            native = certify_mixed_mesh_arrays(
+                mesh=mesh,
+                metadata={"mesh_name": str(manifest.get("mesh_name", ""))},
+                certificate=certificate.to_dict(),
+                require_native=require_native,
+            )
+            if native is not None:
+                if (
+                    not native.validated_claimed_certificate
+                    or native.topology_fingerprint_v3
+                    != certificate.topology_fingerprint
+                    or native.certificate_payload_sha256
+                    != _certificate_payload_sha256(certificate)
+                    or native.algorithm_id != MIXED_CERTIFIER_ALGORITHM
+                ):
+                    raise MeshArtifactCorruptionError(
+                        "native certificate audit does not match legacy mixed artifact"
+                    )
+                native_backend = "rust_rayon"
+                topology_fingerprint = native.topology_fingerprint_v3
+                try:
+                    mesh = _attach_native_certificate_without_revalidation(
+                        mesh, certificate
+                    )
+                except Exception as exc:
+                    raise MeshArtifactCorruptionError(
+                        f"full mixed certificate audit failed: {exc}"
+                    ) from exc
+            else:
+                try:
+                    mesh = replace(mesh, mixed_layer_topology_certificate=certificate)
+                except Exception as exc:
+                    raise MeshArtifactCorruptionError(
+                        f"full mixed certificate audit failed: {exc}"
+                    ) from exc
+                topology_fingerprint = mesh.topology_fingerprint_v3()
+        else:
+            topology_fingerprint = mesh.topology_fingerprint_v3()
+    manifest_fingerprint = manifest.get("topology_fingerprint")
+    if topology_fingerprint != manifest_fingerprint:
         raise MeshArtifactCorruptionError("topology fingerprint does not match manifest")
     mesh_name = str(manifest.get("mesh_name", ""))
-    if not mesh_name or validate_mesh_ir(mesh.to_ir(mesh_name)) is False:
+    if not mesh_name:
+        raise MeshArtifactCorruptionError("mesh failed Rust MeshIR validation")
+    # The native mixed certificate path has already parsed the complete typed
+    # mesh and validated its structural, orientation, degeneracy, conformity,
+    # and executable mixed-topology evidence.  Rebuilding a JSON MeshIR here
+    # only to run the same broad preflight repeats a large Python allocation and
+    # serialization pass for every certified SP4 artifact.  Keep the generic
+    # MeshIR validator for legacy or source-only artifacts.
+    if native_backend != "rust_rayon" and validate_mesh_ir(mesh.to_ir(mesh_name)) is False:
         raise MeshArtifactCorruptionError("mesh failed Rust MeshIR validation")
     authoring = manifest.get("authoring_document")
     if not isinstance(authoring, dict):
@@ -443,6 +996,23 @@ def load_mesh_artifact(
         if "build-report.json" not in members:
             raise MeshArtifactCorruptionError("native mesh artifact is missing build-report.json")
         build_report = json.loads(members["build-report.json"])
+    loaded_provenance = dict(manifest.get("provenance", {}))
+    if schema == ARTIFACT_SCHEMA_V2:
+        loaded_provenance.update(
+            {
+                "artifact_trust": artifact_trust,
+                "certifier_backend": native_backend,
+                "production_qualified": native_backend == "rust_rayon",
+            }
+        )
+    else:
+        loaded_provenance.update(
+            {
+                "artifact_trust": "legacy_v1_full_audit",
+                "certifier_backend": native_backend,
+                "production_qualified": native_backend == "rust_rayon",
+            }
+        )
     return MeshArtifact(
         mesh=mesh,
         mesh_name=mesh_name,
@@ -453,7 +1023,186 @@ def load_mesh_artifact(
         object_region_markers=object_regions,
         boundary_map=boundaries,
         build_report=build_report,
-        provenance=dict(manifest.get("provenance", {})),
+        provenance=loaded_provenance,
+    )
+
+
+def _load_trusted_cached_mesh_artifact(
+    path: Path,
+    *,
+    expected_authoring_sha256: str,
+    expected_policy_sha256: str,
+    expected_source_snapshot_sha256: str,
+    expected_gmsh_version: str,
+    expected_repair_algorithm_id: str,
+    expected_certifier_algorithm_id: str,
+    use_native_fingerprint: bool = False,
+) -> MeshArtifact:
+    source = Path(path)
+    if source.suffix != ".fullmag-mesh":
+        raise ValueError("trusted mesh cache accepts only .fullmag-mesh artifacts")
+    manifest, members = _read_native_artifact(source)
+    if manifest.get("schema") != ARTIFACT_SCHEMA_V2:
+        raise MeshArtifactVersionError(
+            f"schema {manifest.get('schema')} is never eligible for trusted fast path"
+        )
+    unsigned, certificate = _deserialize_mesh_with_detached_certificate(
+        members["topology.npz"]
+    )
+    if certificate is None:
+        raise MeshArtifactCorruptionError("v2 artifact is missing mixed certificate")
+    native = None
+    if use_native_fingerprint:
+        # Parse the receipt before native preflight so its bounded counts can
+        # be used as the expected structural contract.  The manifest
+        # fingerprint is deliberately supplied as an expectation; Rust then
+        # computes the canonical value and rejects any mismatch before the
+        # trusted constructor receives the mesh.
+        receipt_hint = _receipt_from_members(members)
+        if not isinstance(receipt_hint, CertificationReceiptV2):
+            raise MeshArtifactVersionError(
+                "receipt v1 is never eligible for trusted fast loading"
+            )
+        manifest_fingerprint = manifest.get("topology_fingerprint")
+        if (
+            not isinstance(manifest_fingerprint, str)
+            or not manifest_fingerprint.startswith("sha256:")
+            or len(manifest_fingerprint) != len("sha256:") + 64
+        ):
+            raise MeshArtifactCorruptionError(
+                "trusted cache manifest topology fingerprint is invalid"
+            )
+        native = preflight_mixed_mesh_arrays(
+            mesh=unsigned,
+            expected={
+                "counts": receipt_hint.mesh_counts.to_dict(),
+                "topology_fingerprint_v3": manifest_fingerprint,
+                "interface_marker": certificate.interface_marker,
+                "outer_marker": certificate.outer_boundary_marker,
+            },
+            require_native=False,
+        )
+        if native is None:
+            audited = load_mesh_artifact(source)
+            provenance = dict(audited.provenance or {})
+            provenance["artifact_trust"] = "bypassed_native_unavailable"
+            return replace(audited, provenance=provenance)
+        topology_context = _bind_trusted_topology_fingerprint_v3_from_native(
+            mesh_without_certificate=unsigned,
+            native_preflight=native,
+            _receipt_capability=_TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY,
+        )
+    else:
+        topology_context = _bind_trusted_topology_fingerprint_v3(
+            mesh_without_certificate=unsigned,
+            _receipt_capability=_TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY,
+        )
+    topology_fingerprint = topology_context.topology_fingerprint_v3
+    receipt, _ = _validate_v2_receipt(
+        manifest=manifest,
+        members=members,
+        mesh=unsigned,
+        certificate=certificate,
+        topology_fingerprint_v3=topology_fingerprint,
+    )
+    if not isinstance(receipt, CertificationReceiptV2):
+        raise MeshArtifactVersionError(
+            "receipt v1 is never eligible for trusted fast loading"
+        )
+    if mesh_authoring_fingerprint(manifest["authoring_document"]) != manifest.get(
+        "authoring_fingerprint"
+    ):
+        raise MeshArtifactCorruptionError(
+            "authoring fingerprint does not match manifest"
+        )
+    if topology_fingerprint != manifest.get("topology_fingerprint"):
+        raise MeshArtifactCorruptionError("topology fingerprint does not match manifest")
+    expected_bindings = {
+        "document_sha256": expected_authoring_sha256,
+        "resolved_policy_sha256": expected_policy_sha256,
+        "source_snapshot_sha256": expected_source_snapshot_sha256,
+        "gmsh_version": expected_gmsh_version,
+        "repair_algorithm_id": expected_repair_algorithm_id,
+        "certifier_algorithm_id": expected_certifier_algorithm_id,
+    }
+    actual_bindings = {
+        "document_sha256": receipt.authoring.document_sha256,
+        "resolved_policy_sha256": receipt.authoring.resolved_policy_sha256,
+        "source_snapshot_sha256": receipt.producer.source_snapshot_sha256,
+        "gmsh_version": receipt.producer.gmsh_version,
+        "repair_algorithm_id": receipt.producer.repair_algorithm_id,
+        "certifier_algorithm_id": receipt.certificate.algorithm_id,
+    }
+    if actual_bindings != expected_bindings:
+        raise MeshArtifactCorruptionError(
+            "trusted cache receipt does not match expected bindings"
+        )
+    expected_preflight = {
+        "counts": receipt.mesh_counts.to_dict(),
+        "topology_fingerprint_v3": f"sha256:{receipt.topology_fingerprint_v3}",
+        "interface_marker": certificate.interface_marker,
+        "outer_marker": certificate.outer_boundary_marker,
+    }
+    if native is None:
+        native = preflight_mixed_mesh_arrays(
+            mesh=unsigned,
+            expected=expected_preflight,
+            require_native=False,
+        )
+    if native is None:
+        audited = load_mesh_artifact(source)
+        provenance = dict(audited.provenance or {})
+        provenance["artifact_trust"] = "bypassed_native_unavailable"
+        return replace(audited, provenance=provenance)
+    proof = _mint_trusted_native_preflight_receipt_proof(
+        mesh_without_certificate=unsigned,
+        certificate=certificate,
+        native_preflight=native,
+        topology_context=topology_context,
+        expected_topology_fingerprint_v3=receipt.topology_fingerprint_v3,
+        expected_certificate_payload_sha256=receipt.certificate.payload_sha256,
+        expected_counts=receipt.mesh_counts.to_dict(),
+        _receipt_capability=_TRUSTED_NATIVE_PREFLIGHT_RECEIPT_CAPABILITY,
+    )
+    mesh = MeshData._from_trusted_native_preflight_receipt(
+        mesh_without_certificate=unsigned,
+        certificate=certificate,
+        proof=proof,
+    )
+    authoring = manifest.get("authoring_document")
+    if not isinstance(authoring, dict):
+        raise MeshArtifactCorruptionError("manifest authoring_document must be an object")
+    regions = _normalize_markers(manifest.get("region_markers", []))
+    object_regions = _normalize_markers(manifest.get("object_region_markers", []))
+    boundaries = {
+        str(name): int(marker) for name, marker in manifest.get("boundary_map", {}).items()
+    }
+    _validate_semantic_marker_coverage(
+        mesh,
+        region_markers=regions,
+        object_region_markers=object_regions,
+        boundary_map=boundaries,
+    )
+    build_report = json.loads(members["build-report.json"])
+    provenance = dict(manifest.get("provenance", {}))
+    provenance.update(
+        {
+            "artifact_trust": "trusted_cache_fast",
+            "certifier_backend": "rust_rayon",
+            "production_qualified": True,
+        }
+    )
+    return MeshArtifact(
+        mesh=mesh,
+        mesh_name=str(manifest.get("mesh_name", "")),
+        authoring_document=authoring,
+        authoring_fingerprint=str(manifest.get("authoring_fingerprint", "")),
+        topology_fingerprint=topology_fingerprint,
+        region_markers=regions,
+        object_region_markers=object_regions,
+        boundary_map=boundaries,
+        build_report=build_report,
+        provenance=provenance,
     )
 
 
@@ -496,7 +1245,9 @@ def export_gmsh_mesh(artifact: MeshArtifact, path: str | Path) -> Path:
     try:
         volume_export_map, surface_export_map = _write_gmsh41_ascii(artifact, temporary)
         payload = temporary.read_bytes()
+        _fsync_file(temporary)
         os.replace(temporary, target)
+        _fsync_directory(target.parent)
     finally:
         temporary.unlink(missing_ok=True)
     sidecar = Path(f"{target}.fullmag.json")

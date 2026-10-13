@@ -1,15 +1,29 @@
 #!/usr/bin/env bash
+#
+# Managed Linux qualification exporter.  This script is intentionally separate
+# from the Windows-first launcher: it publishes a managed FEM bundle into the
+# loop-backed ext4 storage used by the dedicated Linux runner.  The
+# `wsl.exe` remount hints below are recovery guidance for that Linux/WSL
+# storage profile only; the local Windows FEM route uses
+# scripts/windows/run_fullmag_fem.ps1 and Docker Desktop bind mounts instead.
 set -euo pipefail
 
 SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="${FULLMAG_RUNTIME_PUBLICATION_REPO_ROOT:-${SOURCE_ROOT}}"
 source "${SOURCE_ROOT}/scripts/lib/managed_fem_image_identity.sh"
 source "${SOURCE_ROOT}/scripts/lib/managed_fem_runtime_storage.sh"
+source "${SOURCE_ROOT}/scripts/lib/managed_fem_native_storage.sh"
+source "${SOURCE_ROOT}/scripts/lib/managed_fem_build_policy.sh"
+: "${FULLMAG_NATIVE_STORAGE_PROFILE:=canonical}"
+export FULLMAG_REPO_ROOT="${REPO_ROOT}"
+resolve_managed_fem_native_storage
+readonly FULLMAG_NATIVE_STORAGE_PROFILE FULLMAG_NATIVE_BUILD_STORAGE_ROOT
+readonly FULLMAG_NATIVE_BUILD_IMAGE FULLMAG_NATIVE_MOUNT_VIEW
 RUNTIME_PARENT="${REPO_ROOT}/.fullmag/runtimes"
 RUNTIME_ROOT="${RUNTIME_PARENT}/fem-gpu-host"
 VARIANTS_ROOT=""
 STAGING_ROOT=""
-RUNTIME_LOCK="${RUNTIME_PARENT}/.fem-gpu-host.export.v2.lock"
+RUNTIME_LOCK="$(managed_fem_runtime_lock_path "${REPO_ROOT}")"
 # Bounds waiting for another exporter. Override with a non-negative integer
 # number of seconds; the finite default accommodates a complete managed build.
 : "${FULLMAG_RUNTIME_EXPORT_LOCK_TIMEOUT_SECONDS:=1800}"
@@ -27,6 +41,7 @@ bootstrapped_source_snapshot_root="${FULLMAG_BOOTSTRAPPED_SOURCE_SNAPSHOT_ROOT:-
 bootstrapped_source_provenance_file="${FULLMAG_BOOTSTRAPPED_SOURCE_PROVENANCE_FILE:-}"
 source_identity_file=""
 source_provenance_json=""
+FULLMAG_NATIVE_BUILD_SOURCE_SHA256=""
 SOURCE_SNAPSHOT_ROOT=""
 source_snapshot_materialize_root=""
 source_identity_owned=0
@@ -170,7 +185,7 @@ cleanup_failed_export() {
     rm -f -- "${source_provenance_json}" || true
   fi
   if [ "${source_snapshot_owned:-0}" = "1" ] &&
-     is_canonical_source_snapshot_path "${SOURCE_SNAPSHOT_ROOT:-}"; then
+     is_materialized_source_snapshot_path "${SOURCE_SNAPSHOT_ROOT:-}"; then
     chmod -R u+w "${SOURCE_SNAPSHOT_ROOT}" 2>/dev/null || true
     rm -rf -- "${SOURCE_SNAPSHOT_ROOT}" || true
   fi
@@ -202,9 +217,7 @@ validate_container_target_dir() {
 cd "${SOURCE_ROOT}"
 #rm -rf target/* target/.* 2>/dev/null || true
 
-readonly FULLMAG_NATIVE_BUILD_STORAGE_ROOT="/zfn2/mateuszz/git/fullmag"
-readonly FULLMAG_NATIVE_BUILD_IMAGE="/zfn2/mateuszz/git/fullmag/build-volumes/fullmag-native.ext4"
-readonly FULLMAG_NATIVE_MOUNT_VIEW="/mnt/fullmag-zfn2-native"
+resolve_managed_fem_build_policy
 readonly FULLMAG_CONTAINER_TARGET_ROOT="${FULLMAG_NATIVE_MOUNT_VIEW}/managed-fem-runtime"
 readonly FULLMAG_BUILD_ROOT="${FULLMAG_NATIVE_BUILD_STORAGE_ROOT}"
 readonly PERSISTENT_RUNTIME_PARENT="${FULLMAG_BUILD_ROOT}/runtimes"
@@ -226,8 +239,11 @@ readonly VARIANTS_ROOT STAGING_ROOT
 : "${FULLMAG_FEM_RUNTIME_VARIANT:=hypre-${FULLMAG_HYPRE_MEMORY_VARIANT}}"
 : "${FULLMAG_FEM_EXPECTED_COMPUTE_CAPABILITY:=8.9}"
 : "${FULLMAG_ENABLE_NVTX:=0}"
-: "${FULLMAG_FEM_RUNTIME_REUSE_BUILD:=0}"
-: "${FULLMAG_RUNTIME_PRUNE:=1}"
+# Runtime export must never delete older generations implicitly.  Cleanup is a
+# separate, explicit maintenance action; callers that have completed its
+# dry-run may opt in with FULLMAG_RUNTIME_PRUNE=1.
+: "${FULLMAG_RUNTIME_PRUNE:=0}"
+: "${FULLMAG_RUNTIME_ARCHIVE_COPY_VERIFY:=auto}"
 case "${FULLMAG_RUNTIME_PRUNE}" in
   0|1) ;;
   *) echo "[export_fem_gpu_runtime] FULLMAG_RUNTIME_PRUNE must be 0 or 1" >&2; exit 2 ;;
@@ -240,6 +256,29 @@ case "${FULLMAG_FEM_RUNTIME_REUSE_BUILD}" in
   0|1) ;;
   *) echo "[export_fem_gpu_runtime] FULLMAG_FEM_RUNTIME_REUSE_BUILD must be 0 or 1" >&2; exit 2 ;;
 esac
+case "${FULLMAG_RUNTIME_ARCHIVE_COPY_VERIFY}" in
+  auto)
+    case "${FULLMAG_NATIVE_STORAGE_PROFILE}" in
+      canonical) FULLMAG_RUNTIME_ARCHIVE_COPY_VERIFY=1 ;;
+      local-d) FULLMAG_RUNTIME_ARCHIVE_COPY_VERIFY=0 ;;
+      *)
+        echo "[export_fem_gpu_runtime] unsupported FULLMAG_NATIVE_STORAGE_PROFILE: ${FULLMAG_NATIVE_STORAGE_PROFILE}" >&2
+        exit 2
+        ;;
+    esac
+    ;;
+  0|1) ;;
+  *)
+    echo "[export_fem_gpu_runtime] FULLMAG_RUNTIME_ARCHIVE_COPY_VERIFY must be auto, 0, or 1" >&2
+    exit 2
+    ;;
+esac
+readonly FULLMAG_RUNTIME_ARCHIVE_COPY_VERIFY
+if [ "${FULLMAG_RUNTIME_ARCHIVE_COPY_VERIFY}" = "1" ]; then
+  echo "[export_fem_gpu_runtime] verifying durable latest archive copy byte-for-byte"
+else
+  echo "[export_fem_gpu_runtime] skipping durable latest archive byte comparison; archive validation remains enabled"
+fi
 validate_container_target_dir
 if [ ! -d "${FULLMAG_BUILD_ROOT}" ] || [ ! -w "${FULLMAG_BUILD_ROOT}" ]; then
   echo "[export_fem_gpu_runtime] persistent build root is missing or not writable: ${FULLMAG_BUILD_ROOT}" >&2
@@ -274,6 +313,32 @@ prepare_source_provenance() {
     --source-input-manifest "${REPO_ROOT}/scripts/managed_fem_runtime_source_inputs.v1.txt" \
     "${source_provenance_args[@]}" \
     --output "${source_provenance_json}"
+}
+
+prepare_native_build_source_digest() {
+  if [ -n "${FULLMAG_NATIVE_BUILD_SOURCE_SHA256}" ]; then
+    return 0
+  fi
+  local -a native_source_args=()
+  case "${FULLMAG_ALLOW_DIRTY_RUNTIME_EXPORT:-0}" in
+    0) ;;
+    1) native_source_args+=(--allow-dirty) ;;
+    *)
+      echo "[export_fem_gpu_runtime] FULLMAG_ALLOW_DIRTY_RUNTIME_EXPORT must be 0 or 1" >&2
+      return 2
+      ;;
+  esac
+  FULLMAG_NATIVE_BUILD_SOURCE_SHA256="$(
+    python3 scripts/hash_managed_fem_runtime_sources.py \
+      --repo-root "${REPO_ROOT}" \
+      --source-input-manifest "${REPO_ROOT}/scripts/managed_fem_native_build_inputs.v1.txt" \
+      "${native_source_args[@]}" |
+      python3 -c 'import hashlib,json,sys; payload=json.load(sys.stdin); source=payload["source_provenance"]["source_inputs_sha256"]; manifest=payload["build_inputs"]["source_input_manifest_sha256"]; print(hashlib.sha256((source+"\0"+manifest).encode()).hexdigest())'
+  )"
+  if ! [[ "${FULLMAG_NATIVE_BUILD_SOURCE_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "[export_fem_gpu_runtime] native build source digest is invalid" >&2
+    return 2
+  fi
 }
 
 verify_source_snapshot_identity() {
@@ -312,6 +377,7 @@ bootstrap_new_source_snapshot() {
     --ignore-non-runtime-dirty \
     --output "${source_identity_file}"
   prepare_source_provenance
+  prepare_native_build_source_digest
   source_snapshot_sha256="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_snapshot_sha256"])' "${source_identity_file}")"
   SOURCE_SNAPSHOT_ROOT="${FULLMAG_CONTAINER_TARGET_DIR}/source-cache.${source_snapshot_sha256}"
   if [ -e "${SOURCE_SNAPSHOT_ROOT}" ]; then
@@ -380,6 +446,7 @@ FULLMAG_HOST_UID="$(id -u)"
 FULLMAG_HOST_GID="$(id -g)"
 resolve_source_snapshot_bootstrap
 prepare_source_provenance
+prepare_native_build_source_digest
 if [ ! -f "${source_identity_file}" ] || [ ! -d "${SOURCE_SNAPSHOT_ROOT}" ]; then
   echo "[export_fem_gpu_runtime] immutable source snapshot bootstrap is incomplete" >&2
   exit 2
@@ -396,7 +463,7 @@ if [ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_
   echo "[export_fem_gpu_runtime] source provenance commit differs from immutable source snapshot" >&2
   exit 2
 fi
-readonly FULLMAG_SOURCE_GIT_COMMIT FULLMAG_SOURCE_GIT_TREE FULLMAG_SOURCE_WORKTREE_STATE FULLMAG_SOURCE_SNAPSHOT_SHA256
+readonly FULLMAG_SOURCE_GIT_COMMIT FULLMAG_SOURCE_GIT_TREE FULLMAG_SOURCE_WORKTREE_STATE FULLMAG_SOURCE_SNAPSHOT_SHA256 FULLMAG_NATIVE_BUILD_SOURCE_SHA256
 verify_source_snapshot_identity
 cd "${SOURCE_SNAPSHOT_ROOT}"
 
@@ -404,6 +471,7 @@ docker_build_ref_marker="$(mktemp -d "${TMPDIR:-/tmp}/fullmag-fem-gpu-runtime-ex
 docker_build_ref="fullmag/fem-gpu:$(basename "${docker_build_ref_marker}")"
 build_managed_fem_image "${docker_build_ref}" "${docker_compatibility_ref}"
 docker_image_id="${MANAGED_FEM_BUILT_IMAGE_ID}"
+docker_build_cache_key="${MANAGED_FEM_BUILD_CACHE_KEY}"
 
 FULLMAG_FEM_GPU_IMAGE="${docker_image_id}" docker compose --profile fem-gpu run --rm -T \
   -v "${SOURCE_SNAPSHOT_ROOT}:/workspace:ro" \
@@ -411,22 +479,42 @@ FULLMAG_FEM_GPU_IMAGE="${docker_image_id}" docker compose --profile fem-gpu run 
   -e FULLMAG_FEM_RUNTIME_CARGO_JOBS="${FULLMAG_FEM_RUNTIME_CARGO_JOBS}" \
   -e FULLMAG_CUDA_ARCHITECTURES="${FULLMAG_CUDA_ARCHITECTURES}" \
   -e FULLMAG_ENABLE_NVTX="${FULLMAG_ENABLE_NVTX}" \
+  -e FULLMAG_NATIVE_BUILD_SOURCE_SHA256="${FULLMAG_NATIVE_BUILD_SOURCE_SHA256}" \
+  -e FULLMAG_MANAGED_FEM_IMAGE_ID="${docker_image_id}" \
+  -e FULLMAG_MANAGED_FEM_BUILD_CACHE_KEY="${docker_build_cache_key}" \
   -e FULLMAG_HOST_UID="${FULLMAG_HOST_UID}" \
   -e FULLMAG_HOST_GID="${FULLMAG_HOST_GID}" \
   -e FULLMAG_SOURCE_GIT_COMMIT="${FULLMAG_SOURCE_GIT_COMMIT}" \
   -e FULLMAG_SOURCE_WORKTREE_STATE="${FULLMAG_SOURCE_WORKTREE_STATE}" \
   -e FULLMAG_SOURCE_SNAPSHOT_SHA256="${FULLMAG_SOURCE_SNAPSHOT_SHA256}" \
-  -e TMPDIR="/workspace/target/tmp" \
+  -e TMPDIR="/workspace/target/tmp/runtime-export" \
   -e CARGO_HOME="/workspace/target/cargo-home" \
+  -e FULLMAG_BUILD_LOG="/workspace/target/tmp/fullmag-build.log" \
   -e FULLMAG_FEM_RUNTIME_REUSE_BUILD="${FULLMAG_FEM_RUNTIME_REUSE_BUILD}" \
   -e FULLMAG_RUNTIME_EXPORT_STAGING="/workspace/target/runtime-export-staging.$$" \
   fem-gpu bash -lc '
 set -euo pipefail
 runtime_root="${FULLMAG_RUNTIME_EXPORT_STAGING:?missing managed FEM runtime staging directory}"
-mkdir -p "${TMPDIR}" "${CARGO_HOME}"
+cargo_target_dir="/workspace/target/cargo-targets/${FULLMAG_MANAGED_FEM_BUILD_CACHE_KEY:?missing managed FEM build cache key}"
+export CARGO_TARGET_DIR="${cargo_target_dir}"
+build_log="${FULLMAG_BUILD_LOG:?missing managed FEM build log path}"
+native_build_stamp="/workspace/target/.fullmag-managed-fem-native-build-v1"
+native_build_stamp_tmp="${native_build_stamp}.tmp.$$"
+native_build_fingerprint="fullmag-managed-fem-native-build.v1|source=${FULLMAG_NATIVE_BUILD_SOURCE_SHA256:?missing native build source digest}|build_cache=${FULLMAG_MANAGED_FEM_BUILD_CACHE_KEY}|image=${FULLMAG_MANAGED_FEM_IMAGE_ID:?missing managed FEM image ID}|cuda=${FULLMAG_CUDA_ARCHITECTURES:?missing CUDA architectures}|nvtx=${FULLMAG_ENABLE_NVTX:?missing NVTX policy}"
+if ! [[ "${FULLMAG_NATIVE_BUILD_SOURCE_SHA256}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "[export_fem_gpu_runtime] native build source digest is invalid inside the build container" >&2
+  exit 2
+fi
+if ! [[ "${FULLMAG_MANAGED_FEM_BUILD_CACHE_KEY}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "[export_fem_gpu_runtime] managed FEM build cache key is invalid inside the build container" >&2
+  exit 2
+fi
+rm -f -- "${native_build_stamp_tmp}"
+mkdir -p "${TMPDIR}" "${CARGO_HOME}" "${CARGO_TARGET_DIR}" "$(dirname "${build_log}")"
 restore_staging_owner() {
   local status="$?"
   trap - EXIT
+  rm -f -- "${native_build_stamp_tmp}"
   if [ -e "${runtime_root}" ]; then
     chown -R "${FULLMAG_HOST_UID}:${FULLMAG_HOST_GID}" "${runtime_root}" 2>/dev/null || true
     chmod -R u+rwX,go+rX,go-w "${runtime_root}" 2>/dev/null || true
@@ -459,18 +547,33 @@ cargo +nightly clean -p fullmag-build-info
 if [ "${FULLMAG_FEM_RUNTIME_REUSE_BUILD}" = "0" ]; then
   echo "[export_fem_gpu_runtime] clearing release artifacts before a clean rebuild"
   cargo +nightly clean --workspace --release
-  mapfile -t stale_fem_native_artifacts < <(
-    find target/release/build \
-      -path "*fullmag-fem-sys*/out/native-build/backends/fem/libfullmag_fem.so.0" \
-      -print 2>/dev/null
-  )
+  stale_fem_native_artifacts=()
+  if [ -d "${CARGO_TARGET_DIR}/release/build" ]; then
+    # The persistent target is shared by immutable source snapshots. Cargo only
+    # knows how to clean build-script directories belonging to the current
+    # snapshot path, so remove stale fullmag-fem-sys native outputs explicitly.
+    find "${CARGO_TARGET_DIR}/release/build" -maxdepth 1 -type d -name "fullmag-fem-sys-*" \
+      -exec rm -rf -- {} +
+    mapfile -t stale_fem_native_artifacts < <(
+      find "${CARGO_TARGET_DIR}/release/build" \
+        -path "*fullmag-fem-sys*/out/native-build/backends/fem/libfullmag_fem.so.0" \
+        -print 2>/dev/null
+    )
+  fi
   if [ "${#stale_fem_native_artifacts[@]}" -ne 0 ]; then
     echo "[export_fem_gpu_runtime] stale fullmag-fem-sys native artifacts remain after targeted clean" >&2
     printf "  %s\n" "${stale_fem_native_artifacts[@]}" >&2
     exit 2
   fi
 else
-  echo "[export_fem_gpu_runtime] reusing the task-specific target through Cargo freshness checks"
+  if [ -f "${native_build_stamp}" ] &&
+     [ "$(cat "${native_build_stamp}")" = "${native_build_fingerprint}" ]; then
+    echo "[export_fem_gpu_runtime] reusing native CMake/CUDA artifacts with an exact build fingerprint"
+  else
+    echo "[export_fem_gpu_runtime] native build fingerprint changed; invalidating only FEM/FDM sys crates"
+    cargo +nightly clean -p fullmag-fem-sys -p fullmag-fdm-sys
+  fi
+  echo "[export_fem_gpu_runtime] reusing the task-specific target through Cargo checksum freshness"
 fi
 
 echo "[export_fem_gpu_runtime] building fullmag-cli, fullmag-api, and PyO3 core with cuda fem-gpu release features"
@@ -483,7 +586,9 @@ echo "[export_fem_gpu_runtime] cargo build jobs: ${cargo_jobs}"
 if [ "${FULLMAG_ENABLE_NVTX}" = "1" ]; then
   export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--cfg fullmag_enable_nvtx --check-cfg=cfg(fullmag_enable_nvtx)"
 fi
-FULLMAG_CUDA_ARCHITECTURES="${FULLMAG_CUDA_ARCHITECTURES}" FULLMAG_USE_MFEM_STACK=ON cargo +nightly build -j "$cargo_jobs" -p fullmag-cli -p fullmag-api -p fullmag-py-core --features "fullmag-cli/cuda fullmag-cli/fem-gpu fullmag-cli/stage-autosave-hdf5 fullmag-api/cuda fullmag-api/fem-gpu fullmag-api/stage-autosave-hdf5" --release 2>&1 | tee "${TMPDIR}/fullmag-build.log"
+FULLMAG_CUDA_ARCHITECTURES="${FULLMAG_CUDA_ARCHITECTURES}" FULLMAG_USE_MFEM_STACK=ON FULLMAG_FEM_ENABLE_CUDA=ON FULLMAG_FEM_REQUIRE_GPU=1 cargo +nightly -Z checksum-freshness build -j "$cargo_jobs" -p fullmag-cli -p fullmag-api -p fullmag-py-core --features "fullmag-cli/cuda fullmag-cli/fem-gpu fullmag-cli/stage-autosave-hdf5 fullmag-api/cuda fullmag-api/fem-gpu fullmag-api/stage-autosave-hdf5" --release 2>&1 | tee "${build_log}"
+printf "%s\n" "${native_build_fingerprint}" > "${native_build_stamp_tmp}"
+mv "${native_build_stamp_tmp}" "${native_build_stamp}"
 echo "[export_fem_gpu_runtime] clearing previous runtime bundle contents"
 clear_runtime_bundle_contents
 echo "[export_fem_gpu_runtime] copying launcher and API binaries"
@@ -494,17 +599,17 @@ copy_runtime_binary() {
   cp --remove-destination "$src" "$dest"
   chmod 755 "$dest"
 }
-copy_runtime_binary target/release/fullmag ${runtime_root}/bin/fullmag-fem-gpu-bin
-copy_runtime_binary target/release/fullmag-api ${runtime_root}/bin/fullmag-api
-if [ ! -f target/release/lib_fullmag_core.so ]; then
-  echo "[export_fem_gpu_runtime] failed to locate PyO3 module: target/release/lib_fullmag_core.so" >&2
+copy_runtime_binary "${CARGO_TARGET_DIR}/release/fullmag" ${runtime_root}/bin/fullmag-fem-gpu-bin
+copy_runtime_binary "${CARGO_TARGET_DIR}/release/fullmag-api" ${runtime_root}/bin/fullmag-api
+if [ ! -f "${CARGO_TARGET_DIR}/release/lib_fullmag_core.so" ]; then
+  echo "[export_fem_gpu_runtime] failed to locate PyO3 module: ${CARGO_TARGET_DIR}/release/lib_fullmag_core.so" >&2
   exit 1
 fi
-install -m 755 target/release/lib_fullmag_core.so ${runtime_root}/_fullmag_core.so
+install -m 755 "${CARGO_TARGET_DIR}/release/lib_fullmag_core.so" ${runtime_root}/_fullmag_core.so
 latest_native_lib_dir() {
   local pattern="$1"
   local selected
-  selected="$(find target/release/build -path "$pattern" -printf "%T@ %p\n" | sort -nr | head -n1 | cut -d" " -f2-)"
+  selected="$(find "${CARGO_TARGET_DIR}/release/build" -path "$pattern" -printf "%T@ %p\n" | sort -nr | head -n1 | cut -d" " -f2-)"
   if [ -z "$selected" ]; then
     echo "[export_fem_gpu_runtime] failed to locate native library matching pattern: $pattern" >&2
     exit 1
@@ -514,7 +619,7 @@ latest_native_lib_dir() {
 only_native_lib_dir() {
   local pattern="$1"
   local matches=()
-  mapfile -t matches < <(find target/release/build -path "$pattern" -print)
+  mapfile -t matches < <(find "${CARGO_TARGET_DIR}/release/build" -path "$pattern" -print)
   if [ "${#matches[@]}" -ne 1 ]; then
     echo "[export_fem_gpu_runtime] expected exactly one native library matching pattern: $pattern" >&2
     printf "  %s\n" "${matches[@]}" >&2
@@ -529,7 +634,17 @@ copy_library_group_entry_replace() {
 
   rm -rf -- "$dest"
   if [ -L "$src" ]; then
-    ln -sfn "$(readlink "$src")" "$dest"
+    resolved="$(readlink -f "$src" 2>/dev/null || true)"
+    if [ -z "$resolved" ] || [ ! -e "$resolved" ]; then
+      echo "[export_fem_gpu_runtime] source library symlink is dangling: $src" >&2
+      exit 2
+    fi
+    if [ "$(basename "$resolved")" = "$(basename "$src")" ]; then
+      cp -L --remove-destination "$src" "$dest"
+    else
+      copy_library_group_entry_replace "$resolved" "$dest_dir"
+      ln -sfn "$(basename "$resolved")" "$dest"
+    fi
   else
     install -m 755 "$src" "$dest"
   fi
@@ -573,6 +688,26 @@ resolve_pkg_library_path() {
   fi
   find /lib /usr/lib -name "${stem}.so*" -print | sort | head -n1
 }
+resolve_pkg_primary_library_stem() {
+  local pkg="$1"
+  local libdir
+  local linker_flag
+  local stem
+  libdir="$(pkg-config --variable=libdir "$pkg")"
+  while IFS= read -r linker_flag; do
+    case "$linker_flag" in
+      -l*)
+        stem="lib${linker_flag#-l}"
+        if [ -e "$libdir/${stem}.so" ]; then
+          printf "%s\n" "$stem"
+          return 0
+        fi
+        ;;
+    esac
+  done < <(pkg-config --libs-only-l "$pkg" | tr " " "\n")
+  echo "[export_fem_gpu_runtime] failed to resolve the primary shared library stem for $pkg" >&2
+  return 1
+}
 copy_pkg_library_group() {
   local pkg="$1"
   local stem="$2"
@@ -594,10 +729,10 @@ copy_pkg_library_group() {
 }
 copy_shared_library_dependency_closure() {
   local initial_lib="$1"
+  local copy_scope="${2:-system}"
   local dest_dir="${runtime_root}/lib"
   local pending=("$initial_lib")
   local visited=" "
-  local skip_system_runtime_regex="/(ld-linux|ld64|libc|libdl|libm|libpthread|libresolv|librt|libutil|libgcc_s|libstdc\+\+)\.so"
   while [ "${#pending[@]}" -gt 0 ]; do
     local lib="${pending[0]}"
     pending=("${pending[@]:1}")
@@ -610,16 +745,22 @@ copy_shared_library_dependency_closure() {
       *" $resolved "*) continue ;;
     esac
     visited="${visited}${resolved} "
-    if [[ "$resolved" =~ $skip_system_runtime_regex ]]; then
-      continue
-    fi
     local requested_name
     requested_name="$(basename "$lib")"
     local lib_name
     lib_name="$(basename "$resolved")"
-    case "$resolved" in
-      /lib/*|/lib64/*|/usr/lib/*|/usr/lib64/*)
+    if runtime_dependency_is_host_owned "$requested_name" ||
+       runtime_dependency_is_host_owned "$lib_name"; then
+      continue
+    fi
+    case "$copy_scope:$resolved" in
+      system:/lib/*|system:/lib64/*|system:/usr/lib/*|system:/usr/lib64/*|cuda:/usr/local/cuda-*/*|cuda:/usr/local/cuda/*)
         copy_runtime_resolved_dependency_pair "$lib" "$resolved" "$dest_dir"
+        ;;
+      system:*|cuda:*) ;;
+      *)
+        echo "[export_fem_gpu_runtime] unsupported dependency-copy scope: $copy_scope" >&2
+        exit 2
         ;;
     esac
     while IFS= read -r dep; do
@@ -659,6 +800,15 @@ FDM_LIB="$(latest_native_lib_dir "*fullmag-fdm-sys*/out/native-build/backends/fd
 echo "[export_fem_gpu_runtime] bundling FEM and FDM native libraries"
 copy_native_library_group "$FEM_LIB" libfullmag_fem
 copy_native_library_group "$FDM_LIB" libfullmag_fdm
+echo "[export_fem_gpu_runtime] bundling native shared-library dependency closure"
+copy_shared_library_dependency_closure ${runtime_root}/lib/libfullmag_fem.so.0 cuda
+copy_shared_library_dependency_closure ${runtime_root}/lib/libfullmag_fdm.so.0 cuda
+LD_LIBRARY_PATH="${runtime_root}/lib:${LD_LIBRARY_PATH:-}" PYTHONPATH="${runtime_root}" python3 -c "import _fullmag_core; assert callable(getattr(_fullmag_core, \"certify_mixed_mesh_arrays\", None)), \"exported _fullmag_core is missing certify_mixed_mesh_arrays\"; assert callable(getattr(_fullmag_core, \"preflight_mixed_mesh_arrays\", None)), \"exported _fullmag_core is missing preflight_mixed_mesh_arrays\"; assert callable(getattr(_fullmag_core, \"mixed_mesh_topology_codes_json\", None)), \"exported _fullmag_core is missing mixed_mesh_topology_codes_json\""
+copy_shared_library_dependency_closure ${runtime_root}/bin/fullmag-fem-gpu-bin
+copy_shared_library_dependency_closure ${runtime_root}/bin/fullmag-api
+copy_shared_library_dependency_closure ${runtime_root}/_fullmag_core.so
+copy_shared_library_dependency_closure ${runtime_root}/lib/libfullmag_fem.so.0
+copy_shared_library_dependency_closure ${runtime_root}/lib/libfullmag_fdm.so.0
 validate_nvtx_artifact() {
   local artifact="$1"
   shift
@@ -734,11 +884,13 @@ petsc_version="$(pkg-config --modversion PETSc)"
 slepc_version="$(pkg-config --modversion SLEPc)"
 petsc_pkgconfig_dir="$(pkg-config --variable=pcfiledir PETSc)"
 slepc_pkgconfig_dir="$(pkg-config --variable=pcfiledir SLEPc)"
+petsc_library_stem="$(resolve_pkg_primary_library_stem PETSc)"
+slepc_library_stem="$(resolve_pkg_primary_library_stem SLEPc)"
 echo "[export_fem_gpu_runtime] bundling PETSc/SLEPc shared libraries"
-copy_pkg_library_group PETSc libpetsc_real
-copy_pkg_library_group SLEPc libslepc_real
-copy_shared_library_dependency_closure ${runtime_root}/lib/libpetsc_real.so
-copy_shared_library_dependency_closure ${runtime_root}/lib/libslepc_real.so
+copy_pkg_library_group PETSc $petsc_library_stem
+copy_pkg_library_group SLEPc $slepc_library_stem
+copy_shared_library_dependency_closure ${runtime_root}/lib/${petsc_library_stem}.so
+copy_shared_library_dependency_closure ${runtime_root}/lib/${slepc_library_stem}.so
 for dep_entry in /opt/fullmag-deps/lib/*; do
   dep_name="$(basename "$dep_entry")"
   dep_dest="${runtime_root}/lib/$dep_name"
@@ -763,11 +915,12 @@ mkdir -p ${runtime_root}/include/openmpi
 cp -a /usr/lib/x86_64-linux-gnu/openmpi/include/. ${runtime_root}/include/openmpi/
 echo "[export_fem_gpu_runtime] bundling CUDA headers included by MFEM"
 cp -a /usr/local/cuda-12.4/targets/x86_64-linux/include/. ${runtime_root}/include/
-echo "[export_fem_gpu_runtime] bundling CUDA shared libraries referenced by MFEMTargets"
+echo "[export_fem_gpu_runtime] bundling CUDA libraries required by metadata or dynamic loading"
 for cuda_lib in \
   /usr/local/cuda-12.4/targets/x86_64-linux/lib/libcurand.so* \
   /usr/local/cuda-12.4/targets/x86_64-linux/lib/libcublas.so* \
-  /usr/local/cuda-12.4/targets/x86_64-linux/lib/libcusparse.so*; do
+  /usr/local/cuda-12.4/targets/x86_64-linux/lib/libcusparse.so* \
+  /usr/local/cuda-12.4/targets/x86_64-linux/lib/libnvrtc-builtins.so*; do
   if [ -e "$cuda_lib" ]; then
     copy_runtime_entry_replace "$cuda_lib" ${runtime_root}/lib
   fi
@@ -806,15 +959,27 @@ echo "[export_fem_gpu_runtime] bundling OpenMPI/PMIx runtime components"
 if [ -x /usr/bin/orted ]; then
   copy_runtime_entry_replace /usr/bin/orted ${runtime_root}/openmpi/bin
 fi
-if [ -d /usr/lib/x86_64-linux-gnu/pmix2/lib ]; then
-  mkdir -p ${runtime_root}/lib/pmix2
-  cp -a /usr/lib/x86_64-linux-gnu/pmix2/lib \
-    ${runtime_root}/lib/pmix2/
+pmix_source_root=""
+for candidate in \
+  /usr/lib/x86_64-linux-gnu/pmix2 \
+  /usr/lib/x86_64-linux-gnu/pmix; do
+  if [ -d "${candidate}/lib/pmix" ]; then
+    pmix_source_root="${candidate}"
+    break
+  fi
+done
+if [ -z "${pmix_source_root}" ]; then
+  echo "[export_fem_gpu_runtime] missing supported PMIx component layout" >&2
+  exit 1
 fi
-if [ -d /usr/lib/x86_64-linux-gnu/pmix2/share ]; then
-  mkdir -p ${runtime_root}/lib/pmix2
-  cp -a /usr/lib/x86_64-linux-gnu/pmix2/share \
-    ${runtime_root}/lib/pmix2/
+mkdir -p ${runtime_root}/lib/pmix2/lib \
+  ${runtime_root}/lib/pmix2/share/pmix
+cp -a "${pmix_source_root}/lib"/. ${runtime_root}/lib/pmix2/lib/
+if [ -d "${pmix_source_root}/share" ]; then
+  cp -a "${pmix_source_root}/share"/. ${runtime_root}/lib/pmix2/share/
+fi
+if [ -d /usr/share/pmix ]; then
+  cp -a /usr/share/pmix/. ${runtime_root}/lib/pmix2/share/pmix/
 fi
 if [ -d /usr/lib/x86_64-linux-gnu/openmpi/lib/openmpi3 ]; then
   mkdir -p ${runtime_root}/openmpi/lib
@@ -840,10 +1005,10 @@ require_exported_path ${runtime_root}/openmpi/lib/openmpi3/mca_ess_singleton.so 
 require_exported_path ${runtime_root}/openmpi/lib/openmpi3/mca_plm_isolated.so "OpenMPI isolated PLM component"
 require_exported_path ${runtime_root}/openmpi/lib/openmpi3/mca_pmix_isolated.so "OpenMPI isolated PMIx component"
 require_exported_path ${runtime_root}/openmpi/lib/openmpi3/mca_btl_self.so "OpenMPI self BTL component"
-require_exported_path ${runtime_root}/lib/pmix2/lib/pmix/mca_pcompress_zlib.so "PMIx compression component"
+require_exported_path ${runtime_root}/lib/pmix2/lib/pmix/mca_gds_hash.so "PMIx hash datastore component"
 require_exported_path ${runtime_root}/lib/pmix2/share/pmix/help-pmix-runtime.txt "PMIx help data"
-require_exported_path ${runtime_root}/lib/libpetsc_real.so "PETSc shared library"
-require_exported_path ${runtime_root}/lib/libslepc_real.so "SLEPc shared library"
+require_exported_path ${runtime_root}/lib/${petsc_library_stem}.so "PETSc shared library"
+require_exported_path ${runtime_root}/lib/${slepc_library_stem}.so "SLEPc shared library"
 require_exported_path ${runtime_root}/_fullmag_core.so "PyO3 _fullmag_core module"
 require_exported_path ${runtime_root}/lib/cmake/fullmag-frequency-domain/FindPETSc.cmake "PETSc CMake find module"
 require_exported_path ${runtime_root}/lib/cmake/fullmag-frequency-domain/FindSLEPc.cmake "SLEPc CMake find module"
@@ -851,6 +1016,8 @@ export PETSC_VERSION="$petsc_version"
 export SLEPC_VERSION="$slepc_version"
 export PETSC_PKGCONFIG_DIR="$petsc_pkgconfig_dir"
 export SLEPC_PKGCONFIG_DIR="$slepc_pkgconfig_dir"
+export PETSC_LIBRARY_STEM="$petsc_library_stem"
+export SLEPC_LIBRARY_STEM="$slepc_library_stem"
 python3 - <<PY
 import json
 import os
@@ -865,9 +1032,17 @@ payload = {
     "slepc_version": os.environ["SLEPC_VERSION"],
     "petsc_pkgconfig_dir": os.environ["PETSC_PKGCONFIG_DIR"],
     "slepc_pkgconfig_dir": os.environ["SLEPC_PKGCONFIG_DIR"],
+    "petsc_library_stem": os.environ["PETSC_LIBRARY_STEM"],
+    "slepc_library_stem": os.environ["SLEPC_LIBRARY_STEM"],
     "exported_runtime_library_paths": sorted(
-        [f"lib/{path.name}" for path in runtime.joinpath("lib").glob("libpetsc_real.so*")]
-        + [f"lib/{path.name}" for path in runtime.joinpath("lib").glob("libslepc_real.so*")]
+        [
+            f"lib/{path.name}"
+            for stem in (
+                os.environ["PETSC_LIBRARY_STEM"],
+                os.environ["SLEPC_LIBRARY_STEM"],
+            )
+            for path in runtime.joinpath("lib").glob(f"{stem}.so*")
+        ]
     ),
     "exported_cmake_module_paths": [
         "lib/cmake/fullmag-frequency-domain/FindPETSc.cmake",
@@ -989,7 +1164,7 @@ fi
 if [ -e "${RUNTIME_ROOT}/lib/libmpi.so.40" ]; then
   missing_pmix=0
   for required in \
-    "${RUNTIME_ROOT}/lib/pmix2/lib/pmix/mca_pcompress_zlib.so" \
+    "${RUNTIME_ROOT}/lib/pmix2/lib/pmix/mca_gds_hash.so" \
     "${RUNTIME_ROOT}/lib/pmix2/share/pmix/help-pmix-runtime.txt"; do
     if [ ! -e "${required}" ]; then
       echo "managed FEM runtime is missing PMIx runtime component: ${required}" >&2
@@ -1008,7 +1183,9 @@ if [ -d "${RUNTIME_ROOT}/lib/pmix2/share/pmix" ]; then
   export PMIX_PKGDATADIR="${RUNTIME_ROOT}/lib/pmix2/share/pmix"
   export PMIX_LIBDIR="${RUNTIME_ROOT}/lib/pmix2/lib"
   export PMIX_MCA_mca_base_component_path="${RUNTIME_ROOT}/lib/pmix2/lib/pmix"
-  export PMIX_MCA_pcompress_base_silence_warning="${PMIX_MCA_pcompress_base_silence_warning:-1}"
+  if [ -e "${RUNTIME_ROOT}/lib/pmix2/lib/pmix/mca_pcompress_zlib.so" ]; then
+    export PMIX_MCA_pcompress_base_silence_warning="${PMIX_MCA_pcompress_base_silence_warning:-1}"
+  fi
   if [ -z "${PMIX_MCA_ptl_tcp_if_include:-}" ] && [ -z "${PMIX_MCA_ptl_tcp_if_exclude:-}" ]; then
     export PMIX_MCA_ptl_tcp_if_include=lo
   fi
@@ -1191,8 +1368,6 @@ publish_runtime_bundle() {
   local manifest_sha256
   manifest_sha256="$(sha256sum "${STAGING_ROOT}/manifest.json" | awk '{print $1}')"
   local variant_root="${VARIANTS_ROOT}/${FULLMAG_FEM_RUNTIME_VARIANT}-${manifest_sha256}"
-  local alias_target="fem-gpu-variants/$(basename "${variant_root}")"
-  local repo_next_alias="${RUNTIME_PARENT}/.fem-gpu-host.next.$$"
   local variants_alias="${RUNTIME_PARENT}/fem-gpu-variants"
   local persistent_archive="${PERSISTENT_RUNTIME_PARENT}/$(basename "${variant_root}").tar"
   python3 scripts/validate_managed_fem_runtime_bundle.py \
@@ -1215,7 +1390,8 @@ publish_runtime_bundle() {
   else
     mv "${STAGING_ROOT}" "${variant_root}"
   fi
-  if [ -e "${RUNTIME_ROOT}" ] && [ ! -L "${RUNTIME_ROOT}" ]; then
+  if [ -e "${RUNTIME_ROOT}" ] && [ ! -L "${RUNTIME_ROOT}" ] && \
+     managed_fem_runtime_symlink_supported "${RUNTIME_PARENT}"; then
     echo "[export_fem_gpu_runtime] refusing to replace non-symlink active runtime: ${RUNTIME_ROOT}" >&2
     echo "Select an already preserved schema-v3 variant first." >&2
     return 2
@@ -1231,30 +1407,29 @@ publish_runtime_bundle() {
   validate_persistent_runtime_archive "${persistent_archive}" "${variant_root}"
   persistent_staging_archive="${PERSISTENT_LATEST_ARCHIVE}.staging.$$"
   cp -- "${persistent_archive}" "${persistent_staging_archive}"
-  if ! cmp -s "${persistent_archive}" "${persistent_staging_archive}"; then
-    echo "[export_fem_gpu_runtime] durable latest archive copy differs from immutable archive" >&2
-    return 2
+  if [ "${FULLMAG_RUNTIME_ARCHIVE_COPY_VERIFY}" = "1" ]; then
+    if ! cmp -s "${persistent_archive}" "${persistent_staging_archive}"; then
+      echo "[export_fem_gpu_runtime] durable latest archive copy differs from immutable archive" >&2
+      return 2
+    fi
   fi
   verify_source_snapshot_identity
   mv -f "${persistent_staging_archive}" "${PERSISTENT_LATEST_ARCHIVE}"
   persistent_staging_archive=""
-  if [ "${FULLMAG_RUNTIME_PRUNE}" = "1" ]; then
-    FULLMAG_RUNTIME_PARENT="${RUNTIME_PARENT}" \
-      FULLMAG_RUNTIME_KEEP_PER_FAMILY="${FULLMAG_RUNTIME_KEEP_PER_FAMILY:-2}" \
-      bash "${SOURCE_SNAPSHOT_ROOT}/scripts/prune_managed_fem_runtimes.sh"
-  fi
-  migrate_managed_fem_runtime_variants "${variants_alias}" "${VARIANTS_ROOT}" \
+  prepare_managed_fem_runtime_variants_for_rebind "${variants_alias}" \
+    "${VARIANTS_ROOT}" \
     "${SOURCE_SNAPSHOT_ROOT}/scripts/validate_managed_fem_runtime_bundle.py"
   verify_source_snapshot_identity
-  ln -sfn "${alias_target}" "${repo_next_alias}"
-  mv -Tf "${repo_next_alias}" "${RUNTIME_ROOT}"
+  rebind_managed_fem_runtime_aliases "${RUNTIME_ROOT}" "${variants_alias}" \
+    "${VARIANTS_ROOT}" "${variant_root}" \
+    "${SOURCE_SNAPSHOT_ROOT}/scripts/validate_managed_fem_runtime_bundle.py"
   rm -rf -- "${STAGING_ROOT}"
 }
 
 finalize_verified_source_publication() {
   verify_source_snapshot_identity
   publish_runtime_bundle
-  if [ "${FULLMAG_RUNTIME_PRUNE:-1}" = "1" ]; then
+  if [ "${FULLMAG_RUNTIME_PRUNE:-0}" = "1" ]; then
     FULLMAG_RUNTIME_PARENT="${RUNTIME_PARENT}" \
       FULLMAG_RUNTIME_KEEP_PER_FAMILY="${FULLMAG_RUNTIME_KEEP_PER_FAMILY:-2}" \
       bash "${SOURCE_SNAPSHOT_ROOT}/scripts/prune_managed_fem_runtimes.sh"

@@ -5,13 +5,16 @@
 
 pub mod cpu;
 pub(crate) mod demo;
+pub mod oracle;
 pub mod shared;
 
 pub use demo::{run_reference_exchange_demo, ReferenceDemoReport};
+pub use oracle::constant_z_field_llg_from_positive_x;
 
 pub use cpu::fft::{
     compute_newell_kernel_spectra, compute_newell_kernel_spectra_thin_film_2d,
     compute_periodic_newell_kernel_spectra, DemagKernelSpectra, FftWorkspace,
+    FftWorkspaceTelemetry, FDM_FFT_WORKSPACE_TELEMETRY_SCHEMA_VERSION,
 };
 
 pub use shared::problem::ExchangeLlgProblem;
@@ -26,11 +29,15 @@ pub const FDM_CPU_ADAPTIVE_RK23_MAX_RHS_EVALS_TO_ORACLE: u32 = 2_483;
 pub const FDM_CPU_ADAPTIVE_RK45_MAX_RHS_EVALS_TO_ORACLE: u32 = 135;
 
 pub use cpu::state::{
-    AbmHistory, AbmHistorySoA, AdaptiveAttemptDecision, AdaptiveAttemptReason,
-    AdaptiveAttemptRecord, ExchangeLlgState, ExchangeLlgStateSoA, IntegratorBuffers, SolverSession,
-    MAX_ADAPTIVE_ATTEMPT_RECORDS,
+    Abm3CheckpointHistoryV1, AbmHistory, AbmHistorySoA, AdaptiveAttemptDecision,
+    AdaptiveAttemptReason, AdaptiveAttemptRecord, ExchangeLlgState, ExchangeLlgStateSoA,
+    FdmCpuSolverCheckpointV1, FdmCpuStateCopyTelemetry, IntegratorBuffers, SolverSession,
+    FDM_CPU_SOLVER_CHECKPOINT_SCHEMA_VERSION, MAX_ADAPTIVE_ATTEMPT_RECORDS,
 };
-pub use shared::observables::{EffectiveFieldObservables, RhsEvaluation, StepReport};
+pub use shared::observables::{
+    Abm3StepTelemetry, EffectiveFieldObservables, RhsEvaluation, StepReport,
+    FDM_ABM3_STEP_TELEMETRY_SCHEMA_VERSION,
+};
 
 pub use shared::VectorFieldSoA;
 
@@ -40,8 +47,10 @@ pub use shared::terms::{
     UniaxialAnisotropyConfig, ZhangLiFormula, ZhangLiSttConfig,
 };
 pub use shared::types::{
-    neighbor_index, AdaptiveStepConfig, AxisBoundary, CellSize, CoupledImexArk2Stage,
-    CoupledImexArk2Tableau, EngineError, EngineErrorCode, EvaluationRequest, ExternalStageTerms,
-    FdmBoundaryPolicy, FdmDemagBoundary, GridShape, LlgConfig, MaterialParameters,
-    ResolvedFdmPeriodicWorkspace, Result, TimeIntegrator, TransportStageErrorBudget,
+    neighbor_index, AdaptiveStepConfig, AdaptiveStepController, AdaptiveStepDecision, AxisBoundary,
+    CellSize, CoupledImexArk2Stage, CoupledImexArk2Tableau, EngineError, EngineErrorCode,
+    EvaluationRequest, ExternalStageTerms, FdmBoundaryPolicy, FdmDemagBoundary, GridShape,
+    LlgConfig, MaterialParameters, ProjectionPolicy, ResolvedFdmPeriodicWorkspace, Result,
+    TimeIntegrator, TransportStageErrorBudget, FDM_ADAPTIVE_CONTROLLER_MAX_REJECTED_ATTEMPTS,
+    FDM_ADAPTIVE_CONTROLLER_POLICY_VERSION, FDM_RK_PROJECTION_REALIZATION_VERSION,
 };

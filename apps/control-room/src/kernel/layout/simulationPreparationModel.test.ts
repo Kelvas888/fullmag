@@ -370,4 +370,65 @@ describe("resolveSimulationPreparationViewModel", () => {
     });
     expect(model.stages[0]?.stateLabel).toBe("Failed");
   });
+
+  it("propagates failure causes, exact omitted entries, and incomplete predicate analysis", () => {
+    const detail = `failed_predicates=[fem_order_not_p1,${Array.from(
+      { length: 32 },
+      (_, index) => `future_constraint_${index}`,
+    ).join(",")}]`;
+    const model = resolveSimulationPreparationViewModel(
+      resource(
+        preparationFixture({
+          active_stage_id: null,
+          failure: {
+            detail,
+            diagnostics_correlation_id: "diag-42",
+            error_code: "mesh_generation_failed",
+            stage_id: "meshing",
+            summary: "Mesh generation did not converge.",
+          },
+          status: "failed",
+        }),
+      ),
+      statusResource(),
+      20_000,
+    );
+
+    expect(model.failure).toMatchObject({
+      detail,
+      omittedPredicateCount: 1,
+      predicateAnalysisTruncated: true,
+    });
+    expect(model.failure?.causes).toHaveLength(32);
+    expect(model.failure?.causes[0]).toEqual(
+      expect.objectContaining({ known: true, predicate: "fem_order_not_p1" }),
+    );
+  });
+});
+
+// A successful optional-resource lookup carries null rather than an API error.
+describe("nullable preparation resource", () => {
+  it("releases a restored session after an expected absent preparation lookup", () => {
+    const model = resolveSimulationPreparationViewModel(
+      resource<SimulationPreparationResource | null>(null, "ready"),
+      statusResource("ready", {
+        preparationRevision: 0,
+        solverState: "awaiting_command",
+      }),
+      1_000,
+    );
+    expect(model).toMatchObject({ isVisible: false, kind: "hidden" });
+  });
+
+  it("keeps genuine runtime startup visible when the optional resource is absent", () => {
+    const model = resolveSimulationPreparationViewModel(
+      resource<SimulationPreparationResource | null>(null, "ready"),
+      statusResource("ready", {
+        preparationRevision: 0,
+        solverState: "bootstrapping",
+      }),
+      1_000,
+    );
+    expect(model).toMatchObject({ isVisible: true, kind: "connecting" });
+  });
 });

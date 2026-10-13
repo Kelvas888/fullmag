@@ -22,6 +22,7 @@ pub const FULLMAG_FDM_CHECKPOINT_REALIZATION_CUDA_FDM: u32 = 1;
 pub const FULLMAG_FDM_FROZEN_SPINS_ABI_V1: u32 = 1;
 pub const FULLMAG_FDM_CAPABILITY_FROZEN_SPINS_V1: u64 = 1_u64 << 0;
 pub const FULLMAG_FDM_PLAN_DESC_ABI_V2: u32 = 2;
+pub const FULLMAG_FDM_ROTATED_INTERFACIAL_DMI_ABI_V1: u32 = 1;
 
 // ── Return codes ──
 
@@ -84,6 +85,8 @@ pub enum fullmag_fdm_observable {
     FULLMAG_FDM_OBSERVABLE_EDEN_ANI = 13,
     FULLMAG_FDM_OBSERVABLE_EDEN_DMI = 14,
     FULLMAG_FDM_OBSERVABLE_EDEN_TOTAL = 15,
+    FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI = 16,
+    FULLMAG_FDM_OBSERVABLE_EDEN_ROTATED_DMI = 17,
 }
 
 #[repr(C)]
@@ -146,6 +149,34 @@ pub struct fullmag_fdm_exchange_pair_desc {
 pub enum fullmag_fdm_stats_mode {
     FULLMAG_FDM_STATS_FULL = 0,
     FULLMAG_FDM_STATS_NONE = 1,
+    FULLMAG_FDM_STATS_CONTROL = 2,
+    FULLMAG_FDM_STATS_REQUESTED = 3,
+}
+
+pub const FULLMAG_FDM_STATS_QUANTITY_E_EX: u64 = 1 << 0;
+pub const FULLMAG_FDM_STATS_QUANTITY_E_DEMAG: u64 = 1 << 1;
+pub const FULLMAG_FDM_STATS_QUANTITY_E_EXT: u64 = 1 << 2;
+pub const FULLMAG_FDM_STATS_QUANTITY_E_ANI: u64 = 1 << 3;
+pub const FULLMAG_FDM_STATS_QUANTITY_E_DMI: u64 = 1 << 4;
+pub const FULLMAG_FDM_STATS_QUANTITY_E_TOTAL: u64 = 1 << 5;
+pub const FULLMAG_FDM_STATS_QUANTITY_MAX_H_EFF: u64 = 1 << 6;
+pub const FULLMAG_FDM_STATS_QUANTITY_MAX_H_DEMAG: u64 = 1 << 7;
+pub const FULLMAG_FDM_STATS_QUANTITY_MAX_TORQUE: u64 = 1 << 8;
+pub const FULLMAG_FDM_STATS_QUANTITY_MAX_RHS: u64 = 1 << 9;
+pub const FULLMAG_FDM_STATS_QUANTITY_ALL: u64 = (1 << 10) - 1;
+pub const FULLMAG_FDM_STATS_QUANTITY_CONTROL: u64 =
+    FULLMAG_FDM_STATS_QUANTITY_MAX_TORQUE | FULLMAG_FDM_STATS_QUANTITY_MAX_RHS;
+
+pub const FULLMAG_FDM_STATS_POLICY_ABI_V1: u32 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_stats_policy_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub mode: fullmag_fdm_stats_mode,
+    pub stride: u32,
+    pub quantity_mask: u64,
 }
 
 #[repr(C)]
@@ -280,6 +311,16 @@ pub struct fullmag_fdm_multilayer_plan_desc_v2 {
     pub adaptive_headroom: f64,
     pub stats_mode: fullmag_fdm_stats_mode,
     pub stats_stride: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_rotated_interfacial_dmi_desc_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub has_rotated_interfacial_dmi: i32,
+    pub reserved0: u32,
+    pub dmi_d_rotated_interfacial: f64,
 }
 
 #[repr(C)]
@@ -472,11 +513,63 @@ pub struct fullmag_fdm_time_policy_desc_v2 {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+#[allow(non_snake_case)]
 pub struct fullmag_fdm_plan_desc_v2 {
     pub abi_version: u32,
     pub struct_size: u32,
     pub base: fullmag_fdm_plan_desc,
     pub time_policy: fullmag_fdm_time_policy_desc_v2,
+    pub has_rotated_interfacial_dmi: i32,
+    pub dmi_D_rotated_interfacial: f64,
+}
+
+pub const FULLMAG_FDM_REGIONAL_FIELD_DRIVES_ABI_V1: u32 = 1;
+pub const FULLMAG_FDM_REGIONAL_FIELD_DRIVES_ABI_V2: u32 = 2;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum fullmag_fdm_regional_field_drive_waveform {
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_CONSTANT = 0,
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_SINUSOIDAL = 1,
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_PULSE = 2,
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_PIECEWISE_LINEAR = 3,
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_SINC_PULSE = 4,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum fullmag_fdm_regional_field_drive_time_origin {
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_STAGE_LOCAL = 0,
+    FULLMAG_FDM_REGIONAL_FIELD_DRIVE_ABSOLUTE = 1,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_regional_field_drive_desc_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub field_xyz: *const f64,
+    pub field_len: u64,
+    pub waveform: fullmag_fdm_regional_field_drive_waveform,
+    pub time_origin: fullmag_fdm_regional_field_drive_time_origin,
+    pub stage_start_time_s: f64,
+    pub frequency_hz: f64,
+    pub phase_rad: f64,
+    pub offset: f64,
+    pub t_on_s: f64,
+    pub t_off_s: f64,
+    pub cutoff_hz: f64,
+    pub t0_s: f64,
+    pub amplitude: f64,
+    pub piecewise_points: *const f64,
+    pub piecewise_point_count: u64,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_regional_field_drive_desc_v2 {
+    pub drive: fullmag_fdm_regional_field_drive_desc_v1,
+    pub waveform_origin_time_s: f64,
 }
 
 #[repr(C)]
@@ -525,7 +618,9 @@ pub struct fullmag_fdm_llg_checkpoint_info_v2 {
 }
 
 pub const FULLMAG_FDM_LLG_CHECKPOINT_SCHEMA_V3: u32 = 3;
+pub const FULLMAG_FDM_LLG_CHECKPOINT_SCHEMA_V4: u32 = 4;
 pub const FULLMAG_FDM_CHECKPOINT_EXECUTION_IDENTITY_ABI_V3: u32 = 3;
+pub const FULLMAG_FDM_WORKSPACE_DEPENDENCY_IDENTITY_ABI_V1: u32 = 1;
 pub const FULLMAG_FDM_CHECKPOINT_BACKEND_AUTO: u32 = 2;
 pub const FULLMAG_FDM_CHECKPOINT_POLICY_STRICT: u32 = 1;
 pub const FULLMAG_FDM_CHECKPOINT_POLICY_EXTENDED: u32 = 2;
@@ -566,10 +661,76 @@ pub struct fullmag_fdm_checkpoint_execution_identity_v3 {
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
+pub struct fullmag_fdm_workspace_dependency_identity_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub grid_nx: u32,
+    pub grid_ny: u32,
+    pub grid_nz: u32,
+    pub fft_nx: u32,
+    pub fft_ny: u32,
+    pub fft_nz: u32,
+    pub precision: u32,
+    pub integrator: u32,
+    pub periodic_axis_mask: u32,
+    pub reserved0: u32,
+    pub grid_dx: f64,
+    pub grid_dy: f64,
+    pub grid_dz: f64,
+    pub mask_topology_sha256: [u8; 32],
+    pub material_layout_sha256: [u8; 32],
+    pub spectra_sha256: [u8; 32],
+    pub dependency_sha256: [u8; 32],
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct fullmag_fdm_llg_checkpoint_info_v3 {
     pub schema_version: u32,
     pub struct_size: u32,
     pub execution_identity: fullmag_fdm_checkpoint_execution_identity_v3,
+    pub array_mask: u32,
+    pub reserved0: u32,
+    pub cell_count: u64,
+    pub payload_bytes: u64,
+    pub step_count: u64,
+    pub accepted_step_index: u64,
+    pub accepted_state_revision: u64,
+    pub current_time: f64,
+    pub current_dt: f64,
+    pub thermal_seed: u64,
+    pub rng_algorithm: u32,
+    pub rng_realization: u32,
+    pub transport_attempt_generation: u64,
+    pub rhs_source_revision: u64,
+    pub rhs_field_revision: u64,
+    pub rhs_transport_revision: u64,
+    pub projection_policy_identity: u64,
+    pub fsal_valid: u32,
+    pub abm_startup: u32,
+    pub abm_last_dt: f64,
+    pub adaptive_enabled: u32,
+    pub adaptive_has_previous_error: u32,
+    pub adaptive_previous_error: f64,
+    pub fsal_accepted_state_revision: u64,
+    pub fsal_accepted_time_bits: u64,
+    pub fsal_accepted_dt_bits: u64,
+    pub fsal_source_revision: u64,
+    pub fsal_field_revision: u64,
+    pub fsal_transport_revision: u64,
+    pub fsal_transport_state_identity: u64,
+    pub fsal_projection_policy_identity: u64,
+    pub fsal_integrator_identity: u32,
+    pub fsal_precision_identity: u32,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct fullmag_fdm_llg_checkpoint_info_v4 {
+    pub schema_version: u32,
+    pub struct_size: u32,
+    pub execution_identity: fullmag_fdm_checkpoint_execution_identity_v3,
+    pub workspace_dependency_identity: fullmag_fdm_workspace_dependency_identity_v1,
     pub array_mask: u32,
     pub reserved0: u32,
     pub cell_count: u64,
@@ -635,6 +796,59 @@ pub struct fullmag_fdm_step_stats {
     pub multilayer_forward_fft_count: u64,
     pub multilayer_inverse_fft_count: u64,
     pub multilayer_pair_accumulation_count: u64,
+}
+
+pub const FULLMAG_FDM_ADAPTIVE_ATTEMPT_ABI_V1: u32 = 1;
+pub const FULLMAG_FDM_ADAPTIVE_ATTEMPT_CAPACITY_V1: usize = 51;
+pub type fullmag_fdm_adaptive_attempt_decision_v1 = u32;
+pub const FULLMAG_FDM_ADAPTIVE_ATTEMPT_ACCEPTED: fullmag_fdm_adaptive_attempt_decision_v1 = 1;
+pub const FULLMAG_FDM_ADAPTIVE_ATTEMPT_RETRY: fullmag_fdm_adaptive_attempt_decision_v1 = 2;
+pub const FULLMAG_FDM_ADAPTIVE_ATTEMPT_FAILED: fullmag_fdm_adaptive_attempt_decision_v1 = 3;
+pub type fullmag_fdm_adaptive_attempt_reason_v1 = u32;
+pub const FULLMAG_FDM_ADAPTIVE_ATTEMPT_WITHIN_TOLERANCE: fullmag_fdm_adaptive_attempt_reason_v1 = 1;
+pub const FULLMAG_FDM_ADAPTIVE_ATTEMPT_ERROR_ABOVE_TOLERANCE:
+    fullmag_fdm_adaptive_attempt_reason_v1 = 2;
+pub const FULLMAG_FDM_ADAPTIVE_ATTEMPT_DT_MIN_EXHAUSTED: fullmag_fdm_adaptive_attempt_reason_v1 = 3;
+pub const FULLMAG_FDM_ADAPTIVE_ATTEMPT_INVALID_TIMESTEP: fullmag_fdm_adaptive_attempt_reason_v1 = 4;
+pub const FULLMAG_FDM_ADAPTIVE_ATTEMPT_INVALID_CURRENT_ERROR:
+    fullmag_fdm_adaptive_attempt_reason_v1 = 5;
+pub const FULLMAG_FDM_ADAPTIVE_ATTEMPT_INVALID_PREVIOUS_ERROR:
+    fullmag_fdm_adaptive_attempt_reason_v1 = 6;
+pub const FULLMAG_FDM_ADAPTIVE_ATTEMPT_RETRY_LIMIT_EXHAUSTED:
+    fullmag_fdm_adaptive_attempt_reason_v1 = 7;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_adaptive_attempt_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub attempt_index: u32,
+    pub decision: fullmag_fdm_adaptive_attempt_decision_v1,
+    pub reason: fullmag_fdm_adaptive_attempt_reason_v1,
+    pub reserved0: u32,
+    pub dt_attempt_seconds: f64,
+    pub normalized_error: f64,
+    pub ratio: f64,
+    pub dt_next_seconds: f64,
+}
+
+pub const FULLMAG_FDM_ADAPTIVE_BATCH_STEP_ABI_V1: u32 = 1;
+pub const FULLMAG_FDM_ADAPTIVE_BATCH_STEP_CAPACITY_V1: usize = 64;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_adaptive_batch_step_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub decision: fullmag_fdm_adaptive_attempt_decision_v1,
+    pub reason: fullmag_fdm_adaptive_attempt_reason_v1,
+    pub step: u64,
+    pub time_seconds: f64,
+    pub dt_seconds: f64,
+    pub suggested_next_dt_seconds: f64,
+    pub normalized_error: f64,
+    pub rejected_attempts: u32,
+    pub reserved0: u32,
 }
 
 // ── Device info ──
@@ -723,6 +937,240 @@ pub struct fullmag_fdm_fsal_telemetry_v2 {
     pub stale_publication_count: u64,
     pub transaction_commit_count: u64,
     pub invalidation_reason_counts: [u64; FULLMAG_FDM_FSAL_INVALIDATION_REASON_COUNT],
+}
+
+pub const FULLMAG_FDM_STEP_TRANSACTION_TELEMETRY_ABI_V1: u32 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_step_transaction_telemetry_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub accounting_valid: u32,
+    pub reserved0: u32,
+    pub capture_count: u64,
+    pub rollback_count: u64,
+    pub capture_d2d_bytes: u64,
+    pub rollback_d2d_bytes: u64,
+    pub rollback_latency_total_ns: u64,
+    pub rollback_latency_max_ns: u64,
+    pub accepted_step_index: u64,
+    pub attempt_generation: u64,
+    pub thermal_rng_draws: u64,
+    pub stale_publication_count: u64,
+}
+
+pub const FULLMAG_FDM_ENDPOINT_CACHE_TELEMETRY_ABI_V1: u32 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_endpoint_cache_telemetry_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub cache_identity_valid: u32,
+    pub stats_valid: u32,
+    pub accepted_state_revision: u64,
+    pub accepted_time_bits: u64,
+    pub source_revision: u64,
+    pub field_revision: u64,
+    pub transport_revision: u64,
+    pub projection_policy_identity: u64,
+    pub valid_field_mask: u64,
+    pub refresh_request_count: u64,
+    pub refresh_execution_count: u64,
+    pub refresh_cache_hit_count: u64,
+    pub invalidation_count: u64,
+    pub stats_snapshot_request_count: u64,
+    pub stats_snapshot_cache_hit_count: u64,
+    pub field_snapshot_request_count: u64,
+    pub field_snapshot_latency_total_ns: u64,
+    pub field_snapshot_latency_max_ns: u64,
+    pub exchange_evaluation_count: u64,
+    pub demag_evaluation_count: u64,
+    pub demag_forward_fft_count: u64,
+    pub demag_inverse_fft_count: u64,
+    pub effective_field_evaluation_count: u64,
+    pub energy_reduction_count: u64,
+    pub last_step_exchange_evaluation_count: u64,
+    pub last_step_demag_evaluation_count: u64,
+    pub last_step_demag_forward_fft_count: u64,
+    pub last_step_demag_inverse_fft_count: u64,
+    pub last_step_effective_field_evaluation_count: u64,
+    pub last_step_energy_reduction_count: u64,
+}
+
+pub const FULLMAG_FDM_ADAPTIVE_EXECUTION_TELEMETRY_ABI_V1: u32 = 1;
+pub type fullmag_fdm_adaptive_control_realization_v1 = u32;
+pub const FULLMAG_FDM_ADAPTIVE_CONTROL_NOT_APPLICABLE: fullmag_fdm_adaptive_control_realization_v1 =
+    0;
+pub const FULLMAG_FDM_ADAPTIVE_CONTROL_LEGACY_HOST_READBACK:
+    fullmag_fdm_adaptive_control_realization_v1 = 1;
+pub const FULLMAG_FDM_ADAPTIVE_CONTROL_CUDA_CONDITIONAL_GRAPH:
+    fullmag_fdm_adaptive_control_realization_v1 = 2;
+pub const FULLMAG_FDM_ADAPTIVE_CONTROL_CUDA_CONDITIONAL_GRAPH_BATCHED:
+    fullmag_fdm_adaptive_control_realization_v1 = 3;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_adaptive_execution_telemetry_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub realization: fullmag_fdm_adaptive_control_realization_v1,
+    pub accounting_valid: u32,
+    pub graph_build_count: u64,
+    pub graph_launch_count: u64,
+    pub terminal_control_d2h_bytes: u64,
+    pub terminal_control_host_sync_count: u64,
+    pub step_completion_host_sync_count: u64,
+    pub stats_none_host_sync_count: u64,
+}
+
+pub const FULLMAG_FDM_PRECISION_POLICY_TELEMETRY_ABI_V1: u32 = 1;
+pub type fullmag_fdm_precision_policy_realization_v1 = u32;
+pub const FULLMAG_FDM_PRECISION_POLICY_FULL_DOUBLE: fullmag_fdm_precision_policy_realization_v1 = 1;
+pub const FULLMAG_FDM_PRECISION_POLICY_SINGLE_STORAGE_FP64_REDUCTION:
+    fullmag_fdm_precision_policy_realization_v1 = 2;
+pub const FULLMAG_FDM_PRECISION_POLICY_METRIC_IDENTITY: u64 = 1 << 0;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_precision_policy_telemetry_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub accounting_valid: u32,
+    pub storage_precision: u32,
+    pub compute_precision: u32,
+    pub fft_precision: u32,
+    pub reduction_precision: u32,
+    pub realization: fullmag_fdm_precision_policy_realization_v1,
+    pub metric_valid_mask: u64,
+}
+
+pub const FULLMAG_FDM_LOCAL_PIPELINE_TELEMETRY_ABI_V1: u32 = 1;
+pub type fullmag_fdm_local_pipeline_policy_v1 = u32;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_POLICY_AUTO_SAFE: fullmag_fdm_local_pipeline_policy_v1 = 1;
+pub type fullmag_fdm_local_pipeline_realization_v1 = u32;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_REALIZATION_NONE: fullmag_fdm_local_pipeline_realization_v1 =
+    0;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_REALIZATION_DIRECT_FUSED:
+    fullmag_fdm_local_pipeline_realization_v1 = 1;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_REALIZATION_DIRECT_UNFUSED:
+    fullmag_fdm_local_pipeline_realization_v1 = 2;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_REALIZATION_CUDA_GRAPH_FUSED:
+    fullmag_fdm_local_pipeline_realization_v1 = 3;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_REALIZATION_CUDA_GRAPH_UNFUSED:
+    fullmag_fdm_local_pipeline_realization_v1 = 4;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_REALIZATION_MIXED: fullmag_fdm_local_pipeline_realization_v1 =
+    5;
+
+pub const FULLMAG_FDM_LOCAL_PIPELINE_METRIC_IDENTITY: u64 = 1 << 0;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_METRIC_DIRECT_SUBMISSIONS: u64 = 1 << 1;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_METRIC_CAPTURED_NODES: u64 = 1 << 2;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_METRIC_GRAPH_LIFECYCLE: u64 = 1 << 3;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_METRIC_GRAPH_EXECUTIONS: u64 = 1 << 4;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_METRIC_PROFILED_DRAM_BYTES: u64 = 1 << 5;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_METRIC_PROFILED_LAUNCH_TIME: u64 = 1 << 6;
+pub const FULLMAG_FDM_LOCAL_PIPELINE_METRIC_PROFILED_OCCUPANCY: u64 = 1 << 7;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_local_pipeline_telemetry_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub requested_policy: fullmag_fdm_local_pipeline_policy_v1,
+    pub resolved_realization: fullmag_fdm_local_pipeline_realization_v1,
+    pub executed_realization: fullmag_fdm_local_pipeline_realization_v1,
+    pub accounting_valid: u32,
+    pub precision: fullmag_fdm_precision,
+    pub integrator: fullmag_fdm_integrator,
+    pub metric_valid_mask: u64,
+    pub required_operator_mask: u64,
+    pub active_feature_mask: u64,
+    pub source_revision: u64,
+    pub field_revision: u64,
+    pub direct_fused_field_rhs_launch_count: u64,
+    pub direct_unfused_effective_field_launch_count: u64,
+    pub direct_unfused_rhs_launch_count: u64,
+    pub captured_fused_field_rhs_node_count: u64,
+    pub captured_unfused_effective_field_node_count: u64,
+    pub captured_unfused_rhs_node_count: u64,
+    pub graph_build_count: u64,
+    pub graph_replay_count: u64,
+    pub graph_recapture_count: u64,
+    pub graph_attempt_execution_count: u64,
+    pub graph_fused_field_rhs_execution_count: u64,
+    pub graph_unfused_effective_field_execution_count: u64,
+    pub graph_unfused_rhs_execution_count: u64,
+    pub profiled_dram_read_bytes: u64,
+    pub profiled_dram_write_bytes: u64,
+    pub profiled_launch_time_ns: u64,
+    pub profiled_achieved_occupancy_permyriad: u64,
+}
+
+pub const FULLMAG_FDM_GPU_WORKSPACE_TELEMETRY_ABI_V1: u32 = 1;
+pub const FULLMAG_FDM_GPU_WORKSPACE_METRIC_IDENTITY: u64 = 1 << 0;
+pub const FULLMAG_FDM_GPU_WORKSPACE_METRIC_ALLOCATIONS: u64 = 1 << 1;
+pub const FULLMAG_FDM_GPU_WORKSPACE_METRIC_FFT_PLANS: u64 = 1 << 2;
+pub const FULLMAG_FDM_GPU_WORKSPACE_METRIC_FOOTPRINT: u64 = 1 << 3;
+pub const FULLMAG_FDM_GPU_WORKSPACE_METRIC_REVISIONS: u64 = 1 << 4;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_gpu_workspace_telemetry_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub accounting_valid: u32,
+    pub setup_complete: u32,
+    pub precision: fullmag_fdm_precision,
+    pub integrator: fullmag_fdm_integrator,
+    pub metric_valid_mask: u64,
+    pub workspace_revision: u64,
+    pub source_revision: u64,
+    pub field_revision: u64,
+    pub setup_device_allocation_count: u64,
+    pub setup_device_allocation_bytes: u64,
+    pub total_device_allocation_count: u64,
+    pub total_device_allocation_bytes: u64,
+    pub step_device_allocation_count: u64,
+    pub step_device_allocation_bytes: u64,
+    pub setup_fft_plan_creation_count: u64,
+    pub total_fft_plan_creation_count: u64,
+    pub step_fft_plan_creation_count: u64,
+    pub prepared_fft_workspace_count: u64,
+    pub workspace_bytes: u64,
+    pub peak_vram_bytes: u64,
+    pub observed_step_count: u64,
+}
+
+pub const FULLMAG_FDM_ADAPTIVE_NUMERICS_TELEMETRY_ABI_V1: u32 = 1;
+pub type fullmag_fdm_embedded_error_semantics_v1 = u32;
+pub const FULLMAG_FDM_EMBEDDED_ERROR_PRE_PROJECTION_DIFFERENCE:
+    fullmag_fdm_embedded_error_semantics_v1 = 1;
+pub type fullmag_fdm_norm_defect_semantics_v1 = u32;
+pub const FULLMAG_FDM_NORM_DEFECT_POST_PROJECTION_ABS_UNIT: fullmag_fdm_norm_defect_semantics_v1 =
+    1;
+pub type fullmag_fdm_spin_rotation_semantics_v1 = u32;
+pub const FULLMAG_FDM_SPIN_ROTATION_ATTEMPT_GEODESIC_RADIANS:
+    fullmag_fdm_spin_rotation_semantics_v1 = 1;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct fullmag_fdm_adaptive_numerics_telemetry_v1 {
+    pub abi_version: u32,
+    pub struct_size: u32,
+    pub embedded_error_semantics: fullmag_fdm_embedded_error_semantics_v1,
+    pub norm_defect_semantics: fullmag_fdm_norm_defect_semantics_v1,
+    pub spin_rotation_semantics: fullmag_fdm_spin_rotation_semantics_v1,
+    pub accounting_valid: u32,
+    pub terminal_observation_count: u64,
+    pub decision_comparison_count: u64,
+    pub decision_divergence_count: u64,
+    pub last_terminal_normalized_error: f64,
+    pub last_terminal_max_norm_defect: f64,
+    pub last_terminal_max_spin_rotation_radians: f64,
+    pub max_attempt_normalized_error: f64,
+    pub max_attempt_norm_defect: f64,
+    pub max_attempt_spin_rotation_radians: f64,
 }
 
 pub const FULLMAG_FDM_EXECUTION_RECEIPT_ABI_V1: u32 = 1;
@@ -1486,9 +1934,13 @@ extern "C" {
         out_receipt: *mut fullmag_fdm_plan_desc_v2,
     ) -> i32;
 
-    pub fn fullmag_fdm_plan_ingestion_v2_destroy(
-        ingestion: *mut fullmag_fdm_plan_ingestion_v2,
-    );
+    pub fn fullmag_fdm_plan_ingestion_v2_receipt_sized(
+        ingestion: *const fullmag_fdm_plan_ingestion_v2,
+        out_receipt: *mut fullmag_fdm_plan_desc_v2,
+        out_receipt_size: u32,
+    ) -> i32;
+
+    pub fn fullmag_fdm_plan_ingestion_v2_destroy(ingestion: *mut fullmag_fdm_plan_ingestion_v2);
 
     pub fn fullmag_fdm_backend_create_time_policy_v2_checked(
         plan: *const fullmag_fdm_plan_desc_v2,
@@ -1499,16 +1951,54 @@ extern "C" {
         plan: *const fullmag_fdm_multilayer_plan_desc_v2,
     ) -> *mut fullmag_fdm_backend;
 
+    pub fn fullmag_fdm_backend_set_rotated_interfacial_dmi_v1(
+        handle: *mut fullmag_fdm_backend,
+        descriptor: *const fullmag_fdm_rotated_interfacial_dmi_desc_v1,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_set_stats_policy_v1(
+        handle: *mut fullmag_fdm_backend,
+        policy: *const fullmag_fdm_stats_policy_v1,
+    ) -> i32;
+
     pub fn fullmag_fdm_backend_set_static_external_field_f64(
         handle: *mut fullmag_fdm_backend,
         field_xyz: *const f64,
         field_len: u64,
     ) -> i32;
 
+    pub fn fullmag_fdm_backend_set_regional_field_drives_v1(
+        handle: *mut fullmag_fdm_backend,
+        drives: *const fullmag_fdm_regional_field_drive_desc_v1,
+        drive_count: u32,
+    ) -> i32;
+    pub fn fullmag_fdm_backend_set_regional_field_drives_v2(
+        handle: *mut fullmag_fdm_backend,
+        drives: *const fullmag_fdm_regional_field_drive_desc_v2,
+        drive_count: u32,
+    ) -> i32;
+
     pub fn fullmag_fdm_backend_step(
         handle: *mut fullmag_fdm_backend,
         dt_seconds: f64,
         out_stats: *mut fullmag_fdm_step_stats,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_step_adaptive_batch_v1(
+        handle: *mut fullmag_fdm_backend,
+        initial_dt_seconds: f64,
+        target_time_seconds: f64,
+        max_steps: u32,
+        out_steps: *mut fullmag_fdm_adaptive_batch_step_v1,
+        capacity: u32,
+        out_count: *mut u32,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_copy_adaptive_attempts_v1(
+        handle: *mut fullmag_fdm_backend,
+        out_attempts: *mut fullmag_fdm_adaptive_attempt_v1,
+        capacity: u32,
+        out_count: *mut u32,
     ) -> i32;
 
     pub fn fullmag_fdm_backend_get_fsal_telemetry_v1(
@@ -1519,6 +2009,16 @@ extern "C" {
     pub fn fullmag_fdm_backend_get_fsal_telemetry_v2(
         handle: *mut fullmag_fdm_backend,
         out_telemetry: *mut fullmag_fdm_fsal_telemetry_v2,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_get_step_transaction_telemetry_v1(
+        handle: *mut fullmag_fdm_backend,
+        out_telemetry: *mut fullmag_fdm_step_transaction_telemetry_v1,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_get_endpoint_cache_telemetry_v1(
+        handle: *mut fullmag_fdm_backend,
+        out_telemetry: *mut fullmag_fdm_endpoint_cache_telemetry_v1,
     ) -> i32;
 
     pub fn fullmag_fdm_backend_set_interrupt_poll(
@@ -1713,6 +2213,11 @@ extern "C" {
         identity: *const fullmag_fdm_checkpoint_execution_identity_v3,
     ) -> i32;
 
+    pub fn fullmag_fdm_backend_get_workspace_dependency_identity_v1(
+        handle: *mut fullmag_fdm_backend,
+        out_identity: *mut fullmag_fdm_workspace_dependency_identity_v1,
+    ) -> i32;
+
     pub fn fullmag_fdm_backend_llg_checkpoint_query_size_v3(
         handle: *mut fullmag_fdm_backend,
         out_required_bytes: *mut u64,
@@ -1732,6 +2237,25 @@ extern "C" {
         expected_info: *const fullmag_fdm_llg_checkpoint_info_v3,
     ) -> i32;
 
+    pub fn fullmag_fdm_backend_llg_checkpoint_query_size_v4(
+        handle: *mut fullmag_fdm_backend,
+        out_required_bytes: *mut u64,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_llg_checkpoint_export_v4(
+        handle: *mut fullmag_fdm_backend,
+        destination: *mut c_void,
+        exact_capacity: u64,
+        out_info: *mut fullmag_fdm_llg_checkpoint_info_v4,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_llg_checkpoint_import_v4(
+        handle: *mut fullmag_fdm_backend,
+        source: *const c_void,
+        exact_bytes: u64,
+        expected_info: *const fullmag_fdm_llg_checkpoint_info_v4,
+    ) -> i32;
+
     pub fn fullmag_fdm_backend_execution_receipt_v1(
         handle: *mut fullmag_fdm_backend,
         out_receipt: *mut fullmag_fdm_execution_receipt_v1,
@@ -1740,6 +2264,31 @@ extern "C" {
     pub fn fullmag_fdm_backend_execution_receipt_v2(
         handle: *mut fullmag_fdm_backend,
         out_receipt: *mut fullmag_fdm_execution_receipt_v2,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_get_adaptive_execution_telemetry_v1(
+        handle: *mut fullmag_fdm_backend,
+        out_telemetry: *mut fullmag_fdm_adaptive_execution_telemetry_v1,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_get_precision_policy_telemetry_v1(
+        handle: *mut fullmag_fdm_backend,
+        out_telemetry: *mut fullmag_fdm_precision_policy_telemetry_v1,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_get_local_pipeline_telemetry_v1(
+        handle: *mut fullmag_fdm_backend,
+        out_telemetry: *mut fullmag_fdm_local_pipeline_telemetry_v1,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_get_gpu_workspace_telemetry_v1(
+        handle: *mut fullmag_fdm_backend,
+        out_telemetry: *mut fullmag_fdm_gpu_workspace_telemetry_v1,
+    ) -> i32;
+
+    pub fn fullmag_fdm_backend_get_adaptive_numerics_telemetry_v1(
+        handle: *mut fullmag_fdm_backend,
+        out_telemetry: *mut fullmag_fdm_adaptive_numerics_telemetry_v1,
     ) -> i32;
 
     pub fn fullmag_fdm_backend_last_error(handle: *mut fullmag_fdm_backend) -> *const c_char;
@@ -1775,6 +2324,147 @@ mod tests {
     use std::mem::{align_of, offset_of, size_of};
 
     use super::*;
+
+    #[test]
+    fn stats_policy_v1_has_frozen_layout_and_ffi_symbol() {
+        assert_eq!(size_of::<fullmag_fdm_stats_policy_v1>(), 24);
+        assert_eq!(align_of::<fullmag_fdm_stats_policy_v1>(), 8);
+        assert_eq!(offset_of!(fullmag_fdm_stats_policy_v1, quantity_mask), 16);
+        let _setter: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *const fullmag_fdm_stats_policy_v1,
+        ) -> i32 = fullmag_fdm_backend_set_stats_policy_v1;
+    }
+
+    #[test]
+    fn regional_field_drive_v1_has_append_only_layout_and_ffi_symbol() {
+        assert_eq!(FULLMAG_FDM_REGIONAL_FIELD_DRIVES_ABI_V1, 1);
+        assert_eq!(size_of::<fullmag_fdm_regional_field_drive_desc_v1>(), 120);
+        assert_eq!(align_of::<fullmag_fdm_regional_field_drive_desc_v1>(), 8);
+        assert_eq!(
+            offset_of!(fullmag_fdm_regional_field_drive_desc_v1, field_xyz),
+            8
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_regional_field_drive_desc_v1, piecewise_points),
+            104
+        );
+        let _symbol: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *const fullmag_fdm_regional_field_drive_desc_v1,
+            u32,
+        ) -> i32 = fullmag_fdm_backend_set_regional_field_drives_v1;
+    }
+
+    #[test]
+    fn regional_field_drive_v2_keeps_v1_stride_and_adds_waveform_origin() {
+        assert_eq!(FULLMAG_FDM_REGIONAL_FIELD_DRIVES_ABI_V2, 2);
+        assert_eq!(size_of::<fullmag_fdm_regional_field_drive_desc_v1>(), 120);
+        assert_eq!(size_of::<fullmag_fdm_regional_field_drive_desc_v2>(), 128);
+        assert_eq!(
+            offset_of!(fullmag_fdm_regional_field_drive_desc_v2, waveform_origin_time_s),
+            120
+        );
+        let _symbol: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *const fullmag_fdm_regional_field_drive_desc_v2,
+            u32,
+        ) -> i32 = fullmag_fdm_backend_set_regional_field_drives_v2;
+    }
+
+    #[test]
+    fn adaptive_execution_telemetry_v1_has_stable_layout() {
+        assert_eq!(size_of::<fullmag_fdm_adaptive_execution_telemetry_v1>(), 64);
+        assert_eq!(align_of::<fullmag_fdm_adaptive_execution_telemetry_v1>(), 8);
+    }
+
+    #[test]
+    fn precision_policy_telemetry_v1_has_stable_layout_and_ffi_symbol() {
+        assert_eq!(size_of::<fullmag_fdm_precision_policy_telemetry_v1>(), 40);
+        assert_eq!(align_of::<fullmag_fdm_precision_policy_telemetry_v1>(), 8);
+        assert_eq!(
+            offset_of!(fullmag_fdm_precision_policy_telemetry_v1, storage_precision),
+            12
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_precision_policy_telemetry_v1, metric_valid_mask),
+            32
+        );
+        let _symbol: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *mut fullmag_fdm_precision_policy_telemetry_v1,
+        ) -> i32 = fullmag_fdm_backend_get_precision_policy_telemetry_v1;
+    }
+
+    #[test]
+    fn local_pipeline_telemetry_v1_has_stable_layout_and_ffi_symbol() {
+        assert_eq!(size_of::<fullmag_fdm_local_pipeline_telemetry_v1>(), 208);
+        assert_eq!(align_of::<fullmag_fdm_local_pipeline_telemetry_v1>(), 8);
+        assert_eq!(
+            offset_of!(fullmag_fdm_local_pipeline_telemetry_v1, metric_valid_mask),
+            32
+        );
+        assert_eq!(
+            offset_of!(
+                fullmag_fdm_local_pipeline_telemetry_v1,
+                graph_attempt_execution_count
+            ),
+            144
+        );
+        let _symbol: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *mut fullmag_fdm_local_pipeline_telemetry_v1,
+        ) -> i32 = fullmag_fdm_backend_get_local_pipeline_telemetry_v1;
+    }
+
+    #[test]
+    fn gpu_workspace_telemetry_v1_has_stable_layout_and_ffi_symbol() {
+        assert_eq!(size_of::<fullmag_fdm_gpu_workspace_telemetry_v1>(), 160);
+        assert_eq!(align_of::<fullmag_fdm_gpu_workspace_telemetry_v1>(), 8);
+        assert_eq!(
+            offset_of!(fullmag_fdm_gpu_workspace_telemetry_v1, metric_valid_mask),
+            24
+        );
+        assert_eq!(
+            offset_of!(
+                fullmag_fdm_gpu_workspace_telemetry_v1,
+                setup_device_allocation_count
+            ),
+            56
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_gpu_workspace_telemetry_v1, observed_step_count),
+            152
+        );
+        let _symbol: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *mut fullmag_fdm_gpu_workspace_telemetry_v1,
+        ) -> i32 = fullmag_fdm_backend_get_gpu_workspace_telemetry_v1;
+    }
+
+    #[test]
+    fn adaptive_numerics_telemetry_v1_has_stable_layout_and_ffi_symbol() {
+        assert_eq!(size_of::<fullmag_fdm_adaptive_numerics_telemetry_v1>(), 96);
+        assert_eq!(align_of::<fullmag_fdm_adaptive_numerics_telemetry_v1>(), 8);
+        assert_eq!(
+            offset_of!(
+                fullmag_fdm_adaptive_numerics_telemetry_v1,
+                terminal_observation_count
+            ),
+            24
+        );
+        assert_eq!(
+            offset_of!(
+                fullmag_fdm_adaptive_numerics_telemetry_v1,
+                last_terminal_normalized_error
+            ),
+            48
+        );
+        let _symbol: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *mut fullmag_fdm_adaptive_numerics_telemetry_v1,
+        ) -> i32 = fullmag_fdm_backend_get_adaptive_numerics_telemetry_v1;
+    }
 
     fn layout_record<'a>(
         records: &'a [fullmag_fdm_cpu_transport_abi_layout_record_v1],
@@ -2201,6 +2891,59 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_attempt_v1_is_a_fixed_batched_trace_record() {
+        assert_eq!(size_of::<fullmag_fdm_adaptive_attempt_v1>(), 56);
+        assert_eq!(offset_of!(fullmag_fdm_adaptive_attempt_v1, abi_version), 0);
+        assert_eq!(
+            offset_of!(fullmag_fdm_adaptive_attempt_v1, attempt_index),
+            8
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_adaptive_attempt_v1, dt_attempt_seconds),
+            24
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_adaptive_attempt_v1, dt_next_seconds),
+            48
+        );
+        assert_eq!(FULLMAG_FDM_ADAPTIVE_ATTEMPT_CAPACITY_V1, 51);
+        let _copy: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *mut fullmag_fdm_adaptive_attempt_v1,
+            u32,
+            *mut u32,
+        ) -> i32 = fullmag_fdm_backend_copy_adaptive_attempts_v1;
+    }
+
+    #[test]
+    fn adaptive_batch_step_v1_has_stable_layout_and_ffi_symbol() {
+        assert_eq!(
+            FULLMAG_FDM_ADAPTIVE_CONTROL_CUDA_CONDITIONAL_GRAPH_BATCHED,
+            3
+        );
+        assert_eq!(size_of::<fullmag_fdm_adaptive_batch_step_v1>(), 64);
+        assert_eq!(offset_of!(fullmag_fdm_adaptive_batch_step_v1, step), 16);
+        assert_eq!(
+            offset_of!(fullmag_fdm_adaptive_batch_step_v1, time_seconds),
+            24
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_adaptive_batch_step_v1, rejected_attempts),
+            56
+        );
+        assert_eq!(FULLMAG_FDM_ADAPTIVE_BATCH_STEP_CAPACITY_V1, 64);
+        let _step: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            f64,
+            f64,
+            u32,
+            *mut fullmag_fdm_adaptive_batch_step_v1,
+            u32,
+            *mut u32,
+        ) -> i32 = fullmag_fdm_backend_step_adaptive_batch_v1;
+    }
+
+    #[test]
     fn fsal_telemetry_v1_is_separate_from_frozen_step_stats_layout() {
         assert_eq!(size_of::<fullmag_fdm_step_stats>(), 192);
         assert_eq!(
@@ -2233,6 +2976,50 @@ mod tests {
             *mut fullmag_fdm_backend,
             *mut fullmag_fdm_fsal_telemetry_v2,
         ) -> i32 = fullmag_fdm_backend_get_fsal_telemetry_v2;
+    }
+
+    #[test]
+    fn step_transaction_telemetry_v1_has_frozen_layout_and_ffi_symbol() {
+        assert_eq!(size_of::<fullmag_fdm_step_transaction_telemetry_v1>(), 96);
+        assert_eq!(
+            offset_of!(fullmag_fdm_step_transaction_telemetry_v1, capture_count),
+            16
+        );
+        assert_eq!(
+            offset_of!(
+                fullmag_fdm_step_transaction_telemetry_v1,
+                stale_publication_count
+            ),
+            88
+        );
+        let _query: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *mut fullmag_fdm_step_transaction_telemetry_v1,
+        ) -> i32 = fullmag_fdm_backend_get_step_transaction_telemetry_v1;
+    }
+
+    #[test]
+    fn endpoint_cache_telemetry_v1_has_frozen_layout_and_ffi_symbol() {
+        assert_eq!(size_of::<fullmag_fdm_endpoint_cache_telemetry_v1>(), 240);
+        assert_eq!(align_of::<fullmag_fdm_endpoint_cache_telemetry_v1>(), 8);
+        assert_eq!(
+            offset_of!(
+                fullmag_fdm_endpoint_cache_telemetry_v1,
+                accepted_state_revision
+            ),
+            16
+        );
+        assert_eq!(
+            offset_of!(
+                fullmag_fdm_endpoint_cache_telemetry_v1,
+                last_step_energy_reduction_count
+            ),
+            232
+        );
+        let _query: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *mut fullmag_fdm_endpoint_cache_telemetry_v1,
+        ) -> i32 = fullmag_fdm_backend_get_endpoint_cache_telemetry_v1;
     }
 
     #[test]
@@ -2502,41 +3289,150 @@ mod tests {
         assert_eq!(FULLMAG_FDM_LLG_CHECKPOINT_SCHEMA_V2, 2);
         assert_eq!(size_of::<fullmag_fdm_llg_checkpoint_info_v2>(), 248);
         assert_eq!(align_of::<fullmag_fdm_llg_checkpoint_info_v2>(), 8);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v2, device_ordinal), 40);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v2, cell_count), 48);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v2, accepted_step_index), 72);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v2, current_time), 88);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v2, rhs_source_revision), 112);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v2, abm_last_dt), 152);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v2, adaptive_previous_error), 168);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v2, fsal_accepted_state_revision), 176);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v2, fsal_integrator_identity), 240);
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v2, device_ordinal),
+            40
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v2, cell_count),
+            48
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v2, accepted_step_index),
+            72
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v2, current_time),
+            88
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v2, rhs_source_revision),
+            112
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v2, abm_last_dt),
+            152
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v2, adaptive_previous_error),
+            168
+        );
+        assert_eq!(
+            offset_of!(
+                fullmag_fdm_llg_checkpoint_info_v2,
+                fsal_accepted_state_revision
+            ),
+            176
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v2, fsal_integrator_identity),
+            240
+        );
     }
 
     #[test]
     fn llg_checkpoint_info_v3_matches_the_exact_execution_and_rng_layout() {
         assert_eq!(FULLMAG_FDM_LLG_CHECKPOINT_SCHEMA_V3, 3);
-        assert_eq!(size_of::<fullmag_fdm_checkpoint_execution_identity_v3>(), 88);
-        assert_eq!(align_of::<fullmag_fdm_checkpoint_execution_identity_v3>(), 4);
+        assert_eq!(
+            size_of::<fullmag_fdm_checkpoint_execution_identity_v3>(),
+            88
+        );
+        assert_eq!(
+            align_of::<fullmag_fdm_checkpoint_execution_identity_v3>(),
+            4
+        );
         assert_eq!(
             offset_of!(fullmag_fdm_checkpoint_execution_identity_v3, device_ordinal),
             80
         );
         assert_eq!(size_of::<fullmag_fdm_llg_checkpoint_info_v3>(), 320);
         assert_eq!(align_of::<fullmag_fdm_llg_checkpoint_info_v3>(), 8);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v3, execution_identity), 8);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v3, cell_count), 104);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v3, thermal_seed), 160);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v3, rng_algorithm), 168);
-        assert_eq!(offset_of!(fullmag_fdm_llg_checkpoint_info_v3, fsal_valid), 216);
         assert_eq!(
-            offset_of!(fullmag_fdm_llg_checkpoint_info_v3, fsal_accepted_state_revision),
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v3, execution_identity),
+            8
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v3, cell_count),
+            104
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v3, thermal_seed),
+            160
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v3, rng_algorithm),
+            168
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v3, fsal_valid),
+            216
+        );
+        assert_eq!(
+            offset_of!(
+                fullmag_fdm_llg_checkpoint_info_v3,
+                fsal_accepted_state_revision
+            ),
             248
         );
         assert_eq!(
             offset_of!(fullmag_fdm_llg_checkpoint_info_v3, fsal_integrator_identity),
             312
         );
+    }
+
+    #[test]
+    fn llg_checkpoint_info_v4_binds_the_workspace_dependency_layout() {
+        assert_eq!(FULLMAG_FDM_LLG_CHECKPOINT_SCHEMA_V4, 4);
+        assert_eq!(FULLMAG_FDM_WORKSPACE_DEPENDENCY_IDENTITY_ABI_V1, 1);
+        assert_eq!(
+            size_of::<fullmag_fdm_workspace_dependency_identity_v1>(),
+            200
+        );
+        assert_eq!(
+            align_of::<fullmag_fdm_workspace_dependency_identity_v1>(),
+            8
+        );
+        assert_eq!(
+            offset_of!(
+                fullmag_fdm_workspace_dependency_identity_v1,
+                mask_topology_sha256
+            ),
+            72
+        );
+        assert_eq!(
+            offset_of!(
+                fullmag_fdm_workspace_dependency_identity_v1,
+                dependency_sha256
+            ),
+            168
+        );
+        assert_eq!(size_of::<fullmag_fdm_llg_checkpoint_info_v4>(), 520);
+        assert_eq!(align_of::<fullmag_fdm_llg_checkpoint_info_v4>(), 8);
+        assert_eq!(
+            offset_of!(
+                fullmag_fdm_llg_checkpoint_info_v4,
+                workspace_dependency_identity
+            ),
+            96
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v4, array_mask),
+            296
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v4, cell_count),
+            304
+        );
+        assert_eq!(
+            offset_of!(fullmag_fdm_llg_checkpoint_info_v4, fsal_integrator_identity),
+            512
+        );
+        let _: unsafe extern "C" fn(
+            *mut fullmag_fdm_backend,
+            *mut fullmag_fdm_workspace_dependency_identity_v1,
+        ) -> i32 = fullmag_fdm_backend_get_workspace_dependency_identity_v1;
+        let _: unsafe extern "C" fn(*mut fullmag_fdm_backend, *mut u64) -> i32 =
+            fullmag_fdm_backend_llg_checkpoint_query_size_v4;
     }
 
     #[test]

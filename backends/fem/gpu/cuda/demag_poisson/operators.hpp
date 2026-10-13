@@ -62,6 +62,11 @@ struct DeviceCsrScalar {
 #endif
 };
 
+enum class GpuDemagRecoveryMode : uint32_t {
+    SplitCsr = 0,
+    SharedPatternFusedXyz = 1,
+};
+
 struct GpuDemagPoissonWorkspace {
     std::string operator_fingerprint;
     uint64_t operator_build_count = 0;
@@ -70,9 +75,17 @@ struct GpuDemagPoissonWorkspace {
     DeviceCsrScalar recovery_x;
     DeviceCsrScalar recovery_y;
     DeviceCsrScalar recovery_z;
+    // A fused XYZ recovery is legal only when all three component operators
+    // have exactly the same row-offset and column-index pattern.  Values may
+    // differ.  Keep the digest/mode as setup telemetry and retain split CSR as
+    // the fail-closed fallback.
+    uint64_t recovery_xyz_pattern_digest = 0;
+    GpuDemagRecoveryMode recovery_mode = GpuDemagRecoveryMode::SplitCsr;
     DeviceCsrScalar visual_recovery_x;
     DeviceCsrScalar visual_recovery_y;
     DeviceCsrScalar visual_recovery_z;
+    uint64_t visual_recovery_xyz_pattern_digest = 0;
+    GpuDemagRecoveryMode visual_recovery_mode = GpuDemagRecoveryMode::SplitCsr;
     DeviceCsrScalar robin_boundary_mass;
     std::vector<uint32_t> ess_tdofs;
 #if FULLMAG_HAS_CUDA_RUNTIME
@@ -96,8 +109,8 @@ struct GpuDemagPoissonWorkspace {
     bool ready = false;
 };
 
-// Builds P1-state/P2-potential operators for nonperiodic Poisson demag and
-// retains the node-class-reduced P1/P1 operator for the periodic path.
+// Builds P1-state/resolved-order-potential operators for nonperiodic Poisson
+// demag and retains the node-class-reduced P1/P1 operator for the periodic path.
 bool build_mixed_demag_operators(
     Context &ctx,
     GpuDemagPoissonWorkspace &workspace,

@@ -176,13 +176,8 @@ void gpu_rk_transaction_telemetry_is_profiled_without_new_sync() {
     check(
         transaction_header.find("gpu_rk_collect_step_transaction_timing(") !=
                 std::string::npos &&
-            transaction_header.find(
-                "gpu_relax_capture_step_transaction_device_unprofiled(") !=
-                std::string::npos &&
-            transaction_header.find(
-                "gpu_relax_restore_step_transaction_device_unprofiled(") !=
-                std::string::npos,
-        "GPU transaction header must separate RK telemetry from direct-minimizer rollback");
+            transaction_header.find("gpu_relax_") == std::string::npos,
+        "GPU transaction header must expose only the minimal RK journal");
     check(
         transaction_source.find("cudaEventRecord") != std::string::npos &&
             transaction_source.find("cudaEventElapsedTime") != std::string::npos &&
@@ -190,9 +185,11 @@ void gpu_rk_transaction_telemetry_is_profiled_without_new_sync() {
             transaction_source.find("cudaDeviceSynchronize") == std::string::npos &&
             transaction_source.find("kMaxTransactionTimingEventPairs") !=
                 std::string::npos &&
-            transaction_source.find("13u * 3u") != std::string::npos &&
-            transaction_source.find("poisson_solution_full") != std::string::npos,
-        "GPU RK transaction telemetry must time exact D2D payloads without a new synchronization");
+            transaction_source.find("2u * 3u") != std::string::npos &&
+            transaction_source.find("transaction_h_") == std::string::npos &&
+            transaction_source.find("transaction_poisson_") == std::string::npos &&
+            transaction_source.find("gpu_relax_") == std::string::npos,
+        "GPU RK transaction telemetry and storage must contain only authoritative m/k0 D2D payloads");
     check(
         transaction_source.find(
             "reset_transaction_sample(ctx.gpu_state.rk_transaction_telemetry)") !=
@@ -212,18 +209,17 @@ void gpu_rk_transaction_telemetry_is_profiled_without_new_sync() {
         "GPU rollback timing must be collected after the existing restore fence");
     check(
         nonlinear_cg_source.find(
-                "gpu_relax_capture_step_transaction_device_unprofiled(") !=
+                "gpu_relax_restore_previous_state(") != std::string::npos &&
+            nonlinear_cg_source.find("accepted_observables_valid = false") !=
                 std::string::npos &&
-            nonlinear_cg_source.find(
-                "gpu_relax_restore_step_transaction_device_unprofiled(") !=
+            nonlinear_cg_source.find("fresh_initial_guess_required = true") !=
                 std::string::npos &&
-            nonlinear_cg_source.find(
-                "gpu_rk_capture_step_transaction_device(") ==
+            nonlinear_cg_source.find("gpu_relax_capture_step_transaction") ==
                 std::string::npos &&
             nonlinear_cg_source.find(
                 "gpu_rk_restore_step_transaction_device(") ==
                 std::string::npos,
-        "nonlinear-CG rollback must not be counted as RK transaction telemetry");
+        "nonlinear-CG rollback must restore authoritative state and invalidate derived caches without an RK/full-field transaction");
     check(
         stats_source.find("gpu_rk_collect_step_transaction_timing(ctx, reason)") <
                 stats_source.find("collect_gpu_rk_phase_timing_events(ctx, stats, reason)") &&
@@ -1623,6 +1619,8 @@ void gpu_demag_poisson_is_owned_by_cuda_demag_poisson_module() {
         read_text_file(root / "gpu" / "cuda" / "demag_poisson" / "operators.cpp");
     const std::string hypre_solver =
         read_text_file(root / "gpu" / "cuda" / "demag_poisson" / "hypre_device_solver.cpp");
+    const std::string hypre_policy =
+        read_text_file(root / "gpu" / "cuda" / "runtime" / "hypre_device_policy.cpp");
     const std::string stage_compute =
         read_text_file(root / "gpu" / "cuda" / "demag_poisson" / "stage_compute.cpp");
     const std::string compact_stage_compute = without_whitespace(stage_compute);
@@ -1824,21 +1822,24 @@ void gpu_demag_poisson_is_owned_by_cuda_demag_poisson_module() {
             hypre_solver.find("HypreBoomerAMG") != std::string::npos,
         "GPU CUDA Poisson demag Hypre solver module must own persistent setup, MFEM initial-guess policy, and iteration stats");
     check(
-        hypre_solver.find("HYPRE_SetMemoryLocation(HYPRE_MEMORY_DEVICE)") !=
+        hypre_solver.find("#include \"gpu/cuda/runtime/hypre_device_policy.hpp\"") !=
                 std::string::npos &&
-            hypre_solver.find("HYPRE_SetExecutionPolicy(HYPRE_EXEC_DEVICE)") !=
+            hypre_solver.find("configure_hypre_cuda_device_policy()") !=
                 std::string::npos &&
-            hypre_solver.find("HYPRE_SetSpTransUseVendor(1)") !=
+            hypre_solver.find("HYPRE_SetMemoryLocation(") == std::string::npos &&
+            hypre_solver.find("HYPRE_SetExecutionPolicy(") == std::string::npos &&
+            hypre_policy.find("HYPRE_SetMemoryLocation(HYPRE_MEMORY_DEVICE)") !=
                 std::string::npos &&
-            hypre_solver.find("HYPRE_SetSpMVUseVendor(1)") !=
+            hypre_policy.find("HYPRE_SetExecutionPolicy(HYPRE_EXEC_DEVICE)") !=
                 std::string::npos &&
-            hypre_solver.find("HYPRE_SetSpGemmUseVendor(1)") !=
+            hypre_policy.find("HYPRE_SetSpTransUseVendor(1)") !=
                 std::string::npos &&
-            hypre_solver.find("HYPRE_ClearAllErrors()") !=
+            hypre_policy.find("HYPRE_SetSpMVUseVendor(1)") !=
                 std::string::npos &&
-            hypre_solver.find("HYPRE_SetSpGemmUseVendor(1) failed") ==
-                std::string::npos,
-        "GPU CUDA Poisson demag Hypre solver setup must best-effort enable public device vendor sparse kernels");
+            hypre_policy.find("HYPRE_SetSpGemmUseVendor(1)") !=
+                std::string::npos &&
+            hypre_policy.find("HYPRE_ClearAllErrors()") != std::string::npos,
+        "GPU CUDA Poisson demag must consume the shared fail-closed HYPRE CUDA device policy owner");
     check(
         stage_compute.find("#include \"gpu/cuda/demag_poisson/stage_compute.hpp\"") !=
                 std::string::npos &&

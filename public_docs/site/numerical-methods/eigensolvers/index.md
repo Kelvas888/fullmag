@@ -248,7 +248,6 @@ study.stages.add_relax(
     max_steps=50_000,
 )
 study.stages.add_eigenmodes(
-    stage_id="modes",
     count=12,
     target="lowest",
     operator="linearized_llg",
@@ -398,3 +397,10 @@ partial result and the caller explicitly permits it.
 linearized-llg
 modal-validation
 ```
+## Control Room crosswalk
+
+This is a navigation page; use the terminal page named by the selected stage or solver. The category itself has no standalone editor. Numerical parameters without a matching control are not implemented in the frontend. Do not infer frontend support from Python or backend availability. See {doc}/frontend/capability-register for the current register and exact source owner.
+
+## Source-code index
+
+This is a navigation page and introduces no standalone implementation symbol. The exact source-code index is maintained by the selected terminal page.

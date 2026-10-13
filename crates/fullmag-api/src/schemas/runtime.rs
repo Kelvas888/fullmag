@@ -53,6 +53,8 @@ pub struct CurrentRunResource {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub final_dmi_energy: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_rotated_dmi_energy: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub final_total_energy: Option<f64>,
     pub artifact_dir: String,
     pub requested_backend: String,
@@ -85,6 +87,10 @@ pub struct CurrentRunResource {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StageExecutionResource {
+    pub session_id: String,
+    pub session_epoch: String,
+    pub request_scope_epoch: String,
+    pub run_id: String,
     pub revision: u64,
     pub runtime_state: String,
     pub total_stages: u32,
@@ -98,8 +104,71 @@ pub struct StageExecutionResource {
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ParallelExecutionTelemetryResource {
+    pub sampled_at_unix_ms: u64,
+    pub active_workers: u32,
+    pub admission_desired_workers: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_worker_limit: Option<u32>,
+    pub admission_pending_samples: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_workers: Option<u32>,
+    pub cpu_target_percent: f64,
+    pub memory_target_percent: f64,
+    pub memory_reserve_bytes: u64,
+    pub cpu_target_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_busy_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocated_cpu_cores: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_available_cores: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_limit_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_available_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Admission CPU demand envelope, including a conservative resolved-team
+    /// bound when a short or sparsely observed worker lacks CPU sampling coverage.
+    pub worker_peak_cpu_cores: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_peak_rss_bytes: Option<u64>,
+    pub admission_reason: String,
+    pub terminal: bool,
+}
+
+impl From<&fullmag_runner::LiveParallelExecutionTelemetry> for ParallelExecutionTelemetryResource {
+    fn from(value: &fullmag_runner::LiveParallelExecutionTelemetry) -> Self {
+        Self {
+            sampled_at_unix_ms: value.sampled_at_unix_ms,
+            active_workers: value.active_workers,
+            admission_desired_workers: value.admission_desired_workers,
+            admission_worker_limit: value.admission_worker_limit,
+            admission_pending_samples: value.admission_pending_samples,
+            resolved_workers: value.resolved_workers,
+            cpu_target_percent: value.cpu_target_percent,
+            memory_target_percent: value.memory_target_percent,
+            memory_reserve_bytes: value.memory_reserve_bytes,
+            cpu_target_kind: value.cpu_target_kind.clone(),
+            cpu_busy_percent: value.cpu_busy_percent,
+            allocated_cpu_cores: value.allocated_cpu_cores,
+            cpu_available_cores: value.cpu_available_cores,
+            memory_limit_bytes: value.memory_limit_bytes,
+            memory_available_bytes: value.memory_available_bytes,
+            worker_peak_cpu_cores: value.worker_peak_cpu_cores,
+            worker_peak_rss_bytes: value.worker_peak_rss_bytes,
+            admission_reason: value.admission_reason.clone(),
+            terminal: value.terminal,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct StageExecutionRecordResource {
     pub stage_id: String,
+    /// Exact authored antenna definition ID, not the study node or runtime ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub antenna_solve_stage_id: Option<String>,
     pub index: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -110,8 +179,19 @@ pub struct StageExecutionRecordResource {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_id: Option<String>,
+    /// Stable generation identity of the solver mesh used by this stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_generation_id: Option<String>,
+    /// Content-derived topology fingerprint of the solver mesh used by this stage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_topology_fingerprint: Option<String>,
+    /// Mesh resource revision observed when this stage mesh was published.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mesh_revision: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at_unix_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_step: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at_unix_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -165,6 +245,8 @@ pub struct StageExecutionRecordResource {
     pub current_settle_step_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_settle_step_method: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_execution: Option<ParallelExecutionTelemetryResource>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -224,8 +306,49 @@ pub struct SolverStatusResource {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub converged: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub frozen_spins: Option<FrozenSpinsSolverRuntimeStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct FrozenSpinsSolverRuntimeStatus {
+    pub schema: String,
+    pub constraint_activation_epochs: std::collections::BTreeMap<String, u64>,
+    pub active_constraint_ids: Vec<String>,
+    pub resolved_constraint_set_revision: u64,
+    pub topology_fingerprint: String,
+    pub source_state_revision: Option<u64>,
+    pub mask_sha256: String,
+    pub reference_sha256: String,
+    pub active_site_count: u64,
+    pub frozen_site_count: u64,
+    pub free_site_count: u64,
+    pub vector_dimension: u8,
+    pub scalar_component_dof_count: u64,
+}
+
+impl From<fullmag_runner::constraints::FrozenSpinsRuntimeStatus>
+    for FrozenSpinsSolverRuntimeStatus
+{
+    fn from(value: fullmag_runner::constraints::FrozenSpinsRuntimeStatus) -> Self {
+        Self {
+            schema: value.schema,
+            constraint_activation_epochs: value.constraint_activation_epochs,
+            active_constraint_ids: value.active_constraint_ids.into_iter().collect(),
+            resolved_constraint_set_revision: value.resolved_constraint_set_revision,
+            topology_fingerprint: value.topology_fingerprint,
+            source_state_revision: value.source_state_revision,
+            mask_sha256: value.mask_sha256,
+            reference_sha256: value.reference_sha256,
+            active_site_count: value.active_site_count,
+            frozen_site_count: value.frozen_site_count,
+            free_site_count: value.free_site_count,
+            vector_dimension: value.vector_dimension,
+            scalar_component_dof_count: value.scalar_component_dof_count,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -352,6 +475,8 @@ pub struct CommandStatusResource {
     pub command_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_intent_id: Option<String>,
     pub seq: u64,
     pub kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -423,6 +548,14 @@ pub struct CommandDetailResource {
     pub dispatched_at_unix_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub started_at_unix_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_step: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_step: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub applied_time_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub segment_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub completed_at_unix_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]

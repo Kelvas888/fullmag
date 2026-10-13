@@ -1,5 +1,6 @@
 //! ExchangeLlgProblem struct definition, constructors, and public API dispatch.
 
+use crate::fdm::cpu::state::FdmCpuStateLayout;
 use crate::{
     CellSize, EffectiveFieldObservables, EffectiveFieldTerms, EngineError, EngineErrorCode,
     EvaluationRequest, ExchangeLlgState, ExchangeLlgStateSoA, FdmBoundaryPolicy, FdmDemagBoundary,
@@ -7,6 +8,7 @@ use crate::{
     RegionalFieldDriveTerm, ResolvedFdmPeriodicWorkspace, Result, StepReport, TimeIntegrator,
     Vector3,
 };
+use sha2::Digest;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug)]
@@ -43,6 +45,10 @@ pub struct ExchangeLlgProblem {
     /// Monotonically increasing step counter for the thermal RNG.
     /// Incremented by each accepted step.
     thermal_step_counter: AtomicU64,
+    /// Per-attempt thermal timestep override. Zero means that the public
+    /// `thermal_dt` value is used. This execution-local value is not part of
+    /// the authored problem contract.
+    thermal_dt_override_bits: AtomicU64,
     pub ms_field: Option<Vec<f64>>,
     pub a_field: Option<Vec<f64>>,
     pub alpha_field: Option<Vec<f64>>,
@@ -142,6 +148,7 @@ impl ExchangeLlgProblem {
             thermal_dt: 1e-13,
             thermal_seed: 42,
             thermal_step_counter: AtomicU64::new(0),
+            thermal_dt_override_bits: AtomicU64::new(0),
             ms_field: None,
             a_field: None,
             alpha_field: None,
@@ -189,25 +196,65 @@ impl ExchangeLlgProblem {
         state: &mut ExchangeLlgState,
     ) -> Result<()> {
         self.ensure_state_matches_grid(state)?;
-        let frozen_spins = FrozenSpinsState::capture_at_activation(
-            plan,
-            self.active_mask.as_deref(),
-            state.magnetization(),
-        )?;
-        if self
-            .frozen_spins
-            .as_ref()
-            .is_none_or(|current| !current.same_mask(&frozen_spins))
-        {
-            state.invalidate_fsal();
-            state.reset_abm_history();
-        }
+        let frozen_spins = match self.frozen_spins.as_ref() {
+            Some(previous) => FrozenSpinsState::reactivate_at_activation(
+                previous,
+                plan,
+                self.active_mask.as_deref(),
+                state.magnetization(),
+            )?,
+            None => FrozenSpinsState::capture_at_activation(
+                plan,
+                self.active_mask.as_deref(),
+                state.magnetization(),
+            )?,
+        };
+        // An explicit activation captures a new reference even when the mask
+        // is unchanged. Every cached history was derived from the previous
+        // constrained state and must therefore be discarded atomically.
+        state.invalidate_fsal();
+        state.reset_abm_history();
         self.frozen_spins = Some(frozen_spins);
         Ok(())
     }
 
     pub fn frozen_spins(&self) -> Option<&FrozenSpinsState> {
         self.frozen_spins.as_ref()
+    }
+
+    /// Apply the stage-scoped active constraint set without recapturing the
+    /// reference of constraints that remain continuously active.
+    pub fn transition_frozen_spins_at_stage_boundary(
+        &mut self,
+        plan: Option<&fullmag_ir::ResolvedFrozenSpinsPlanIR>,
+        state: &mut ExchangeLlgState,
+    ) -> Result<()> {
+        self.ensure_state_matches_grid(state)?;
+        let next = match (self.frozen_spins.as_ref(), plan) {
+            (None, None) => return Ok(()),
+            (None, Some(plan)) => FrozenSpinsState::capture_at_activation(
+                plan,
+                self.active_mask.as_deref(),
+                state.magnetization(),
+            )?,
+            (Some(previous), Some(plan)) => FrozenSpinsState::transition_at_activation(
+                previous,
+                plan,
+                self.active_mask.as_deref(),
+                state.magnetization(),
+            )?,
+            (Some(previous), None) => FrozenSpinsState::deactivate_at_stage_boundary(previous)?,
+        };
+        if self
+            .frozen_spins
+            .as_ref()
+            .is_none_or(|current| !current.same_constraint_values(&next))
+        {
+            state.invalidate_fsal();
+            state.reset_abm_history();
+        }
+        self.frozen_spins = Some(next);
+        Ok(())
     }
 
     /// Install a constraint restored from a durable checkpoint without
@@ -365,11 +412,15 @@ impl ExchangeLlgProblem {
     pub fn dmi_field(&self, state: &ExchangeLlgState) -> Result<Vec<Vector3>> {
         self.ensure_state_matches_grid(state)?;
         let interfacial = self.interfacial_dmi_field(state.magnetization());
+        let rotated = self.rotated_interfacial_dmi_field(state.magnetization());
         let bulk = self.bulk_dmi_field(state.magnetization());
         Ok(interfacial
             .iter()
+            .zip(rotated.iter())
             .zip(bulk.iter())
-            .map(|(interfacial, bulk)| crate::add(*interfacial, *bulk))
+            .map(|((interfacial, rotated), bulk)| {
+                crate::add(crate::add(*interfacial, *rotated), *bulk)
+            })
             .collect())
     }
 
@@ -408,10 +459,13 @@ impl ExchangeLlgProblem {
 
     pub fn external_energy_density(&self, state: &ExchangeLlgState) -> Result<Vec<f64>> {
         self.ensure_state_matches_grid(state)?;
-        if !self.has_external_zeeman_source() {
+        if !self.has_external_zeeman_source()
+            && !self.regional_field_drives.iter().any(|drive| drive.enabled)
+        {
             return Ok(vec![0.0; self.grid.cell_count()]);
         }
-        let field = self.external_zeeman_field_vectors();
+        let mut field = self.external_zeeman_field_vectors_at_time(state.time_seconds);
+        self.regional_field_drives_add_into_at_time(&mut field, state.time_seconds);
         Ok(self.external_energy_density_from_fields(state.magnetization(), &field))
     }
 
@@ -506,7 +560,13 @@ impl ExchangeLlgProblem {
                 "dt must be finite and positive",
             ));
         }
+        bufs.select_layout(if self.soa_fast_path_supported() {
+            FdmCpuStateLayout::Soa
+        } else {
+            FdmCpuStateLayout::Aos
+        })?;
         bufs.begin_adaptive_step();
+        self.set_thermal_dt_for_attempt(dt);
 
         let result = match self.dynamics.integrator {
             TimeIntegrator::Heun if self.soa_fast_path_supported() => {
@@ -530,6 +590,7 @@ impl ExchangeLlgProblem {
             }
             TimeIntegrator::ABM3 => self.abm3_step_buf(state, dt, ws, bufs, evaluation),
         };
+        self.clear_thermal_dt_for_attempt();
         if result.is_ok() {
             self.restore_frozen_reference(&mut state.magnetization);
             self.advance_thermal_step();
@@ -559,11 +620,17 @@ impl ExchangeLlgProblem {
             ));
         }
         if !self.soa_fast_path_supported() {
-            return Err(EngineError::new(
-                "SoA state stepping requires a problem supported by the CPU SoA fast path",
+            let reason = self
+                .soa_fast_path_rejection_reason()
+                .unwrap_or("capability_matrix_rejected");
+            return Err(EngineError::with_code(
+                EngineErrorCode::CapabilityUnavailable,
+                format!("CPU SoA fast path unavailable: {reason}"),
             ));
         }
+        bufs.select_layout(FdmCpuStateLayout::Soa)?;
         bufs.begin_adaptive_step();
+        self.set_thermal_dt_for_attempt(dt);
 
         let result = match self.dynamics.integrator {
             TimeIntegrator::Heun => self.heun_step_soa_state_buf(state, dt, ws, bufs, evaluation),
@@ -572,6 +639,7 @@ impl ExchangeLlgProblem {
             TimeIntegrator::RK45 => self.rk45_step_soa_state_buf(state, dt, ws, bufs, evaluation),
             TimeIntegrator::ABM3 => self.abm3_step_soa_state_buf(state, dt, ws, bufs, evaluation),
         };
+        self.clear_thermal_dt_for_attempt();
         if result.is_ok() {
             self.advance_thermal_step();
         }
@@ -619,6 +687,31 @@ impl ExchangeLlgProblem {
         self.thermal_step_counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Select the timestep used by Brown thermal-field evaluations for the
+    /// current integrator attempt. Adaptive retries replace this value before
+    /// evaluating their stages, while the counter/seed remain unchanged.
+    pub(crate) fn set_thermal_dt_for_attempt(&self, dt: f64) {
+        let bits = (dt.is_finite() && dt > 0.0)
+            .then_some(dt.to_bits())
+            .unwrap_or(0);
+        self.thermal_dt_override_bits.store(bits, Ordering::Relaxed);
+    }
+
+    /// Clear the attempt-local thermal timestep override after a public step
+    /// returns. Observation APIs then use the authored `thermal_dt` again.
+    pub(crate) fn clear_thermal_dt_for_attempt(&self) {
+        self.thermal_dt_override_bits.store(0, Ordering::Relaxed);
+    }
+
+    pub(crate) fn thermal_dt_for_evaluation(&self) -> f64 {
+        let bits = self.thermal_dt_override_bits.load(Ordering::Relaxed);
+        if bits == 0 {
+            self.thermal_dt
+        } else {
+            f64::from_bits(bits)
+        }
+    }
+
     pub fn with_spatial_fields(
         mut self,
         ms_field: Option<Vec<f64>>,
@@ -634,9 +727,18 @@ impl ExchangeLlgProblem {
                     n
                 )));
             }
-            if field.iter().any(|&v| !v.is_finite() || v <= 0.0) {
+            if field.iter().any(|&v| !v.is_finite() || v < 0.0) {
                 return Err(EngineError::new(
-                    "ms_field contains non-finite or non-positive values".to_string(),
+                    "ms_field contains non-finite or negative values".to_string(),
+                ));
+            }
+            if field
+                .iter()
+                .enumerate()
+                .any(|(index, &value)| value == 0.0 && self.is_active(index))
+            {
+                return Err(EngineError::new(
+                    "ms_field contains zero on an active cell".to_string(),
                 ));
             }
         }
@@ -723,6 +825,20 @@ impl ExchangeLlgProblem {
     pub fn set_demag_boundary(&mut self, boundary: FdmDemagBoundary) {
         self.demag_boundary = boundary;
     }
+
+    /// Return a digest of the authoritative FDM state and accepted thermal
+    /// interval. The digest is intended for checkpoint/fault-injection tests;
+    /// it includes integrator memory, not only magnetization and time.
+    pub fn transactional_state_digest(&self, state: &ExchangeLlgState) -> Result<String> {
+        self.ensure_state_matches_grid(state)?;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"fullmag.fdm.transactional-state.v1\0");
+        hasher.update(state.transactional_state_digest().as_bytes());
+        hasher.update(self.thermal_seed.to_le_bytes());
+        hasher.update(self.thermal_step().to_le_bytes());
+        hasher.update(self.thermal_dt.to_bits().to_le_bytes());
+        Ok(format!("sha256:{:x}", hasher.finalize()))
+    }
 }
 
 fn zero_vectors(len: usize) -> Vec<Vector3> {
@@ -747,6 +863,7 @@ impl Clone for ExchangeLlgProblem {
             thermal_dt: self.thermal_dt,
             thermal_seed: self.thermal_seed,
             thermal_step_counter: AtomicU64::new(self.thermal_step_counter.load(Ordering::Relaxed)),
+            thermal_dt_override_bits: AtomicU64::new(0),
             ms_field: self.ms_field.clone(),
             a_field: self.a_field.clone(),
             alpha_field: self.alpha_field.clone(),

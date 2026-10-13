@@ -13,13 +13,24 @@ use crate::native_fem::NativeFemBackend;
 use crate::relaxation::{resolve_stage_completion, RelaxationCompletionMetrics};
 use crate::schedules::{same_time, OutputSchedule};
 use crate::types::{
-    AuxiliaryArtifact, ExecutedRun, FieldSnapshot, LiveStepConsumer, RunError, RunResult,
-    RunStatus, StepStats, StepUpdate,
+    FEM_LINEARIZATION_FIELD_ABSOLUTE_TOLERANCE_A_PER_M,
+    FEM_LINEARIZATION_FIELD_RELATIVE_TOLERANCE,
+    FEM_LINEARIZATION_PHI_ABSOLUTE_TOLERANCE_A,
+    recomputed_fem_equilibrium_content_sha256, recomputed_fem_linearization_certificate_sha256,
+    AuxiliaryArtifact, CertifiedFemEquilibriumFields, ExecutedRun, FieldSnapshot, LiveStepConsumer,
+    RecomputedFemLinearizationCertificateV1, RunError, RunResult, RunStatus, StepStats, StepUpdate,
 };
 
 use super::preview::FemPreviewHandoff;
 use super::scalars::ensure_fem_object_scalars;
 use super::snapshots::copy_native_fem_field_snapshot;
+
+#[derive(Debug, Clone)]
+struct NativeEquilibriumEvaluation {
+    magnetization: Vec<[f64; 3]>,
+    fields: CertifiedFemEquilibriumFields,
+    representation: fullmag_quantities::FemRepresentationReceipt,
+}
 
 #[cfg(test)]
 mod tests {
@@ -59,16 +70,28 @@ mod tests {
     #[test]
     fn invalid_strict_receipt_executes_zero_terminal_success_side_effects() {
         let receipt = FemGpuExecutionReceipt {
-            requested: "strict_device".into(), resolved: "device_resident".into(),
-            executed: "cuda_fem".into(), execution_class: FemGpuExecutionClass::DeviceResident,
-            device_ordinal: 0, precision: "double".into(), integrator: "heun".into(),
-            required_operator_mask: 0x3ff, resolved_device_operator_mask: 0x3ff,
-            resolved_host_operator_mask: 0, resolved_unknown_operator_mask: 0,
-            executed_device_operator_mask: 0x3ff, executed_host_operator_mask: 1,
-            executed_unknown_operator_mask: 0, fallback_count: 0, accepted_step_count: 1,
-            rejected_attempt_count: 0, failed_attempt_count: 0,
-            hot_loop_compute_h2d_bytes: 0, hot_loop_compute_d2h_bytes: 0,
-            hot_loop_compute_host_sync_count: 0, accounting_valid: true,
+            requested: "strict_device".into(),
+            resolved: "device_resident".into(),
+            executed: "cuda_fem".into(),
+            execution_class: FemGpuExecutionClass::DeviceResident,
+            device_ordinal: 0,
+            precision: "double".into(),
+            integrator: "heun".into(),
+            required_operator_mask: 0x3ff,
+            resolved_device_operator_mask: 0x3ff,
+            resolved_host_operator_mask: 0,
+            resolved_unknown_operator_mask: 0,
+            executed_device_operator_mask: 0x3ff,
+            executed_host_operator_mask: 1,
+            executed_unknown_operator_mask: 0,
+            fallback_count: 0,
+            accepted_step_count: 1,
+            rejected_attempt_count: 0,
+            failed_attempt_count: 0,
+            hot_loop_compute_h2d_bytes: 0,
+            hot_loop_compute_d2h_bytes: 0,
+            hot_loop_compute_host_sync_count: 0,
+            accounting_valid: true,
         };
         let mut terminal_side_effects = 0;
         let result = run_after_strict_receipt_gate(&receipt, "strict_device", || {
@@ -76,6 +99,18 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(terminal_side_effects, 0);
+    }
+
+    #[test]
+    fn native_fem_accepted_steps_reach_the_diagnostic_trace_boundary() {
+        let direct = include_str!("direct_minimizer.rs");
+        let llg = include_str!("llg_overdamped.rs");
+        let finalize = include_str!("finalize.rs");
+
+        assert!(direct.contains("artifacts.record_solver_step(&accepted_stats);"));
+        assert!(llg.contains("artifacts.record_solver_step(&stats);"));
+        assert!(finalize.contains("artifacts.take_solver_steps()"));
+        assert!(finalize.contains("solver_diagnostic_trace_artifact(diagnostic_steps)"));
     }
 }
 
@@ -86,7 +121,10 @@ fn run_after_strict_receipt_gate<T>(
 ) -> Result<T, RunError> {
     if request == "strict_device" {
         validate_strict_fem_gpu_execution_receipt(receipt).map_err(|error| RunError {
-            message: format!("strict native FEM GPU execution receipt rejected: {}", error.token()),
+            message: format!(
+                "strict native FEM GPU execution receipt rejected: {}",
+                error.token()
+            ),
         })?;
     }
     Ok(success())
@@ -99,7 +137,7 @@ pub(crate) struct NativeFemRelaxationFinalization {
     pub(crate) cancelled: bool,
     pub(crate) paused: bool,
     pub(crate) preview_handoff: FemPreviewHandoff,
-    pub(crate) fem_gpu_receipt_request: String,
+    pub(crate) fem_gpu_receipt_request: Option<String>,
 }
 
 fn terminal_scheduled_field_actions(
@@ -112,6 +150,206 @@ fn terminal_scheduled_field_actions(
         .is_some_and(|time| same_time(time, final_time));
     let diagnostic_copy = streaming && matches!(schedule.name.as_str(), "H_demag" | "demag_phi");
     (!payload_already_sampled, diagnostic_copy)
+}
+
+fn copy_native_equilibrium_evaluation(
+    backend: &NativeFemBackend, node_count: usize, demag_enabled: bool,
+    has_uniaxial: bool,
+) -> Result<NativeEquilibriumEvaluation, RunError> {
+    let phi_a = if demag_enabled { backend.copy_demag_phi(node_count)? }
+        else { vec![0.0; node_count] };
+    let h_ex = backend.copy_linearization_field(
+        fullmag_fem_sys::fullmag_fem_observable::FULLMAG_FEM_OBSERVABLE_H_EX, node_count)?;
+    let h_demag = backend.copy_linearization_field(
+        fullmag_fem_sys::fullmag_fem_observable::FULLMAG_FEM_OBSERVABLE_H_DEMAG, node_count)?;
+    let h_ext = backend.copy_linearization_field(
+        fullmag_fem_sys::fullmag_fem_observable::FULLMAG_FEM_OBSERVABLE_H_EXT, node_count)?;
+    let h_eff = backend.copy_linearization_field(
+        fullmag_fem_sys::fullmag_fem_observable::FULLMAG_FEM_OBSERVABLE_H_EFF, node_count)?;
+    let fields = if has_uniaxial {
+        let h_anisotropy = backend.copy_linearization_field(
+            fullmag_fem_sys::fullmag_fem_observable::FULLMAG_FEM_OBSERVABLE_H_ANI, node_count)?;
+        CertifiedFemEquilibriumFields::from_fields_with_anisotropy(
+            h_ex, h_demag, h_ext, h_anisotropy, h_eff, phi_a)?
+    } else {
+        CertifiedFemEquilibriumFields::from_fields(h_ex, h_demag, h_ext, h_eff, phi_a)?
+    };
+    Ok(NativeEquilibriumEvaluation {
+        magnetization: copy_native_fem_field_snapshot(backend, "m", node_count)?,
+        fields,
+        representation: backend.representation_receipt()?,
+    })
+}
+
+fn max_vector_difference(left: &[[f64; 3]], right: &[[f64; 3]]) -> Option<f64> {
+    (left.len() == right.len()).then(|| {
+        left.iter()
+            .zip(right)
+            .flat_map(|(left, right)| left.iter().zip(right))
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f64, f64::max)
+    })
+}
+
+fn max_scalar_difference(left: &[f64], right: &[f64]) -> Option<f64> {
+    (left.len() == right.len()).then(|| {
+        left.iter()
+            .zip(right)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0_f64, f64::max)
+    })
+}
+
+fn max_vector_amplitude(values: &[[f64; 3]]) -> f64 {
+    values
+        .iter()
+        .flatten()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max)
+}
+
+fn max_scalar_amplitude(values: &[f64]) -> f64 {
+    values
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max)
+}
+
+fn certify_native_linearization_recompute(
+    plan: &FemPlanIR,
+    accepted: &NativeEquilibriumEvaluation,
+    recomputed: &NativeEquilibriumEvaluation,
+) -> Result<RecomputedFemLinearizationCertificateV1, RunError> {
+    let equilibrium_content_sha256 =
+        recomputed_fem_equilibrium_content_sha256(&accepted.magnetization);
+    let recomputed_equilibrium_content_sha256 =
+        recomputed_fem_equilibrium_content_sha256(&recomputed.magnetization);
+    if equilibrium_content_sha256 != recomputed_equilibrium_content_sha256 {
+        return Err(RunError {
+            message: "native_linearization_recompute_m0_changed_during_refresh".to_string(),
+        });
+    }
+
+    crate::fem::eigen_equilibrium_contract::validate_certified_equilibrium_fields(
+        &accepted.fields, accepted.magnetization.len())?;
+    crate::fem::eigen_equilibrium_contract::validate_certified_equilibrium_fields(
+        &recomputed.fields, recomputed.magnetization.len())?;
+    if accepted.fields.schema_version != recomputed.fields.schema_version
+        || accepted.fields.h_anisotropy_a_per_m.is_some() != plan.material.uniaxial_anisotropy.is_some()
+        || recomputed.fields.h_anisotropy_a_per_m.is_some() != plan.material.uniaxial_anisotropy.is_some()
+    {
+        return Err(RunError { message: "native_linearization_recompute_anisotropy_schema_mismatch".to_string() });
+    }
+    let mut compared = vec![
+        (
+            "h_ex0",
+            max_vector_difference(
+                &accepted.fields.h_ex_a_per_m,
+                &recomputed.fields.h_ex_a_per_m,
+            ),
+            max_vector_amplitude(&accepted.fields.h_ex_a_per_m)
+                .max(max_vector_amplitude(&recomputed.fields.h_ex_a_per_m)),
+        ),
+        (
+            "h_demag0",
+            max_vector_difference(
+                &accepted.fields.h_demag_a_per_m,
+                &recomputed.fields.h_demag_a_per_m,
+            ),
+            max_vector_amplitude(&accepted.fields.h_demag_a_per_m)
+                .max(max_vector_amplitude(&recomputed.fields.h_demag_a_per_m)),
+        ),
+        (
+            "h_ext0",
+            max_vector_difference(
+                &accepted.fields.h_ext_a_per_m,
+                &recomputed.fields.h_ext_a_per_m,
+            ),
+            max_vector_amplitude(&accepted.fields.h_ext_a_per_m)
+                .max(max_vector_amplitude(&recomputed.fields.h_ext_a_per_m)),
+        ),
+        (
+            "h_eff0",
+            max_vector_difference(
+                &accepted.fields.h_eff_a_per_m,
+                &recomputed.fields.h_eff_a_per_m,
+            ),
+            max_vector_amplitude(&accepted.fields.h_eff_a_per_m)
+                .max(max_vector_amplitude(&recomputed.fields.h_eff_a_per_m)),
+        ),
+    ];
+    if let (Some(accepted_anisotropy), Some(recomputed_anisotropy)) =
+        (&accepted.fields.h_anisotropy_a_per_m, &recomputed.fields.h_anisotropy_a_per_m)
+    {
+        compared.push(("h_anisotropy0", max_vector_difference(accepted_anisotropy, recomputed_anisotropy),
+            max_vector_amplitude(accepted_anisotropy).max(max_vector_amplitude(recomputed_anisotropy))));
+    }
+    for (label, difference, scale) in compared.iter().copied() {
+        let difference = difference.ok_or_else(|| RunError {
+            message: format!("native_linearization_recompute_{label}_shape_mismatch"),
+        })?;
+        let tolerance = FEM_LINEARIZATION_FIELD_ABSOLUTE_TOLERANCE_A_PER_M
+            + FEM_LINEARIZATION_FIELD_RELATIVE_TOLERANCE * scale.max(1.0);
+        if !difference.is_finite() || difference > tolerance {
+            return Err(RunError {
+                message: format!(
+                    "native_linearization_recompute_{label}_mismatch: maximum difference {difference:.3e} exceeds {tolerance:.3e} A/m"
+                ),
+            });
+        }
+    }
+    let max_phi_difference_a =
+        max_scalar_difference(&accepted.fields.phi_a, &recomputed.fields.phi_a).ok_or_else(
+            || RunError {
+                message: "native_linearization_recompute_phi0_shape_mismatch".to_string(),
+            },
+        )?;
+    let phi_tolerance = FEM_LINEARIZATION_PHI_ABSOLUTE_TOLERANCE_A
+        + FEM_LINEARIZATION_FIELD_RELATIVE_TOLERANCE
+            * max_scalar_amplitude(&accepted.fields.phi_a)
+                .max(max_scalar_amplitude(&recomputed.fields.phi_a))
+                .max(1.0);
+    if !max_phi_difference_a.is_finite() || max_phi_difference_a > phi_tolerance {
+        return Err(RunError {
+            message: format!(
+                "native_linearization_recompute_phi0_mismatch: maximum difference {max_phi_difference_a:.3e} exceeds {phi_tolerance:.3e} A"
+            ),
+        });
+    }
+
+    let mesh = crate::types::FemMeshPayload::from(plan);
+    let mesh_topology_sha256 = crate::types::fem_mesh_topology_fingerprint(&mesh);
+    let identity =
+        crate::fem::equilibrium_identity::EquilibriumIdentitySignaturesV1::from_relax_plan(plan)?;
+    let mut certificate = RecomputedFemLinearizationCertificateV1 {
+        schema_version: if compared.len() == 5 { "RecomputedFemLinearizationCertificate.v2" } else { "RecomputedFemLinearizationCertificate.v1" }.to_string(),
+        status: "matched".to_string(),
+        recompute_provider: if compared.len() == 5 { "native_fem_final_state_refresh.v2" } else { "native_fem_final_state_refresh.v1" }.to_string(),
+        node_count: accepted.magnetization.len(),
+        equilibrium_content_sha256,
+        // The runtime plan may normalize element markers before native
+        // allocation. The stage mesh identity is computed from the immutable
+        // authoring payload before that normalization and is also what the
+        // orchestrator persists and hands to the following eigen stage.
+        mesh_topology_sha256,
+        equilibrium_material_signature: identity.equilibrium_material_signature,
+        equilibrium_static_physics_signature: identity.equilibrium_static_physics_signature,
+        equilibrium_boundary_signature: identity.equilibrium_boundary_signature,
+        accepted_fields_content_sha256: accepted.fields.content_sha256.clone(),
+        recomputed_fields_content_sha256: recomputed.fields.content_sha256.clone(),
+        max_h_ex_difference_a_per_m: compared[0].1.unwrap_or(f64::INFINITY),
+        max_h_demag_difference_a_per_m: compared[1].1.unwrap_or(f64::INFINITY),
+        max_h_ext_difference_a_per_m: compared[2].1.unwrap_or(f64::INFINITY),
+        max_h_anisotropy_difference_a_per_m: compared.get(4).map(|entry| entry.1.unwrap_or(f64::INFINITY)),
+        max_h_eff_difference_a_per_m: compared[3].1.unwrap_or(f64::INFINITY),
+        max_phi_difference_a,
+        field_absolute_tolerance_a_per_m: FEM_LINEARIZATION_FIELD_ABSOLUTE_TOLERANCE_A_PER_M,
+        field_relative_tolerance: FEM_LINEARIZATION_FIELD_RELATIVE_TOLERANCE,
+        phi_absolute_tolerance_a: FEM_LINEARIZATION_PHI_ABSOLUTE_TOLERANCE_A,
+        content_sha256: String::new(),
+    };
+    certificate.content_sha256 = recomputed_fem_linearization_certificate_sha256(&certificate)?;
+    Ok(certificate)
 }
 
 pub(crate) fn finalize_native_fem_relaxation(
@@ -127,6 +365,8 @@ pub(crate) fn finalize_native_fem_relaxation(
     mut steps: Vec<StepStats>,
     finalization: NativeFemRelaxationFinalization,
 ) -> Result<ExecutedRun, RunError> {
+    // Reject unsupported field contributions before capturing/publishing a certificate.
+    crate::fem::equilibrium_identity::validate_supported_relax_source(plan)?;
     let mut artifacts = artifacts;
     let mut final_stats = finalization.latest_stats.unwrap_or(StepStats {
         step: 0,
@@ -147,8 +387,12 @@ pub(crate) fn finalize_native_fem_relaxation(
     // side effect. The same value is published to open stores and returned in
     // ExecutedRun; no later provenance mutation is permitted.
     let mut final_provenance = artifacts.provenance_snapshot();
-    final_provenance.fem_poisson_demag =
-        fem_poisson_demag_provenance(plan, Some(&final_stats));
+    final_provenance.fem_poisson_demag = fem_poisson_demag_provenance(plan, Some(&final_stats));
+    if plan.demag_realization == Some(fullmag_ir::ResolvedFemDemagIR::FredkinKoehler) {
+        final_provenance.fem_bem_demag = backend
+            .demag_fem_bem_provenance()?
+            .map(|value| value.into_provenance());
+    }
     let gpu_state_info = backend.gpu_state_info()?;
     let gpu_rk_plan_info = backend.gpu_rk_plan_info()?;
     apply_native_fem_runtime_contract(
@@ -159,14 +403,16 @@ pub(crate) fn finalize_native_fem_relaxation(
         Some(&gpu_rk_plan_info),
     );
     if engine == FemEngine::NativeGpu {
-        let receipt = backend
-            .gpu_execution_receipt()?
-            .into_provenance(&finalization.fem_gpu_receipt_request);
-        run_after_strict_receipt_gate(
-            &receipt,
-            &finalization.fem_gpu_receipt_request,
-            || final_provenance.fem_gpu_execution_receipt = Some(receipt.clone()),
-        )?;
+        // The backend receipt describes the resolved RK execution plan. Direct
+        // minimizers publish their own policy and realization provenance.
+        if let Some(receipt_request) = finalization.fem_gpu_receipt_request.as_deref() {
+            let receipt = backend
+                .gpu_execution_receipt()?
+                .into_provenance(receipt_request);
+            run_after_strict_receipt_gate(&receipt, receipt_request, || {
+                final_provenance.fem_gpu_execution_receipt = Some(receipt.clone())
+            })?;
+        }
     }
     artifacts.replace_provenance_synchronously(final_provenance)?;
     if let Some(mut terminal_stats) = finalization.terminal_stats {
@@ -197,6 +443,12 @@ pub(crate) fn finalize_native_fem_relaxation(
             .saturating_duration_since(std::time::Instant::now())
             .as_millis(),
     );
+
+    // Preserve the accepted endpoint evaluation before the mandatory fresh
+    // snapshot. The post-refresh evaluation below is compared against this
+    // value and bound into a linearization certificate.
+    let accepted_native_equilibrium =
+        copy_native_equilibrium_evaluation(backend, node_count, plan.enable_demag, plan.material.uniaxial_anisotropy.is_some())?;
 
     // Refresh device-resident component fields at the accepted final state
     // before any synchronous or asynchronous field snapshot selects H_eff.
@@ -271,6 +523,7 @@ pub(crate) fn finalize_native_fem_relaxation(
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: false,
+                terminal_field_snapshot: true,
                 finished: false,
             });
         }
@@ -291,7 +544,15 @@ pub(crate) fn finalize_native_fem_relaxation(
         .filter(|name| !scheduled_names.contains(name.as_str()))
     {
         let copy_start = std::time::Instant::now();
-        if artifacts.is_streaming() {
+        if engine == FemEngine::CpuNative && super::snapshots::is_antenna_field_snapshot(&name) {
+            artifacts.record_field_snapshot(super::snapshots::build_antenna_field_snapshot(
+                plan,
+                &name,
+                final_stats.step,
+                final_stats.time,
+                final_stats.dt,
+            )?)?;
+        } else if artifacts.is_streaming() {
             let snapshot = backend.begin_field_snapshot(
                 &name,
                 final_stats.step,
@@ -325,7 +586,19 @@ pub(crate) fn finalize_native_fem_relaxation(
             continue;
         }
         let copy_start = std::time::Instant::now();
-        if artifacts.is_streaming() {
+        if engine == FemEngine::CpuNative
+            && super::snapshots::is_antenna_field_snapshot(&schedule.name)
+        {
+            if enqueue_payload {
+                artifacts.record_field_snapshot(super::snapshots::build_antenna_field_snapshot(
+                    plan,
+                    &schedule.name,
+                    final_stats.step,
+                    final_stats.time,
+                    final_stats.dt,
+                )?)?;
+            }
+        } else if artifacts.is_streaming() {
             if enqueue_payload {
                 let snapshot = backend.begin_field_snapshot(
                     &schedule.name,
@@ -376,13 +649,107 @@ pub(crate) fn finalize_native_fem_relaxation(
     }
 
     let copy_start = std::time::Instant::now();
-    let final_magnetization = copy_native_fem_field_snapshot(backend, "m", node_count)?;
+    let recomputed_native_equilibrium =
+        copy_native_equilibrium_evaluation(backend, node_count, plan.enable_demag, plan.material.uniaxial_anisotropy.is_some())?;
+    let recomputed_linearization_certificate = certify_native_linearization_recompute(
+        plan,
+        &accepted_native_equilibrium,
+        &recomputed_native_equilibrium,
+    )?;
+    // Preserve the exact endpoint snapshot used as the independent replay
+    // baseline.  The recomputed fields below are a fresh native copy after
+    // the mandatory refresh and must never replace this payload.
+    let accepted_fem_equilibrium_fields = accepted_native_equilibrium.fields.clone();
+let final_node_map = backend.local_node_index_map()?;
+    final_node_map
+        .validate_representation(&recomputed_native_equilibrium.representation)
+        .map_err(|message| RunError { message })?;
+    let native_indexed_geometry = backend
+        .indexed_geometry_sha256(plan.mesh.nodes.len() as u64, plan.mesh.cells.len() as u64)?;
+    let expected_indexed_geometry =
+        fullmag_ir::native_indexed_geometry::fem_native_indexed_geometry_sha256(
+            &plan.mesh.nodes,
+            &plan.mesh.cells,
+        )
+        .map_err(|message| RunError { message })?;
+    if native_indexed_geometry != expected_indexed_geometry {
+        return Err(RunError {
+            message: "live native FEM indexed geometry differs from the accepted MeshIR projection"
+                .into(),
+        });
+    }
+    let mut final_snapshot_receipt =
+        fullmag_quantities::fem_state_snapshot_receipt::FemLocalNodeSnapshotReceipt::capture(
+            final_stats.step,
+            final_stats.time,
+            final_stats.dt,
+            &recomputed_native_equilibrium.magnetization,
+            recomputed_native_equilibrium.representation,
+        )
+        .map_err(|message| RunError { message })?;
+    final_snapshot_receipt.native_node_map_sha256 = Some(
+        final_node_map
+            .content_sha256()
+            .map_err(|message| RunError { message })?,
+    );
+    final_snapshot_receipt.native_indexed_geometry_sha256 = Some(native_indexed_geometry);
+    let final_magnetization = recomputed_native_equilibrium.magnetization;
+    let certified_fem_equilibrium_fields = recomputed_native_equilibrium.fields;
     finalization_field_copy_wall_time_ns =
         finalization_field_copy_wall_time_ns.saturating_add(elapsed_ns(copy_start));
     finalization_field_copy_bytes =
         finalization_field_copy_bytes.saturating_add(vector3_f64_bytes(final_magnetization.len()));
+    let mut diagnostic_steps = artifacts.take_solver_steps();
     let (mut field_snapshots, field_snapshot_count, provenance) = artifacts.finish();
     let mut auxiliary_artifacts = Vec::new();
+    let accepted_fields_path = CertifiedFemEquilibriumFields::accepted_artifact_path_for_material(&plan.material);
+    let (fields_path, refresh_path) = CertifiedFemEquilibriumFields::artifact_paths_for_material(&plan.material);
+    let node_map_bytes = serde_json::to_vec(&final_node_map).map_err(|error| RunError {
+        message: format!("failed to encode final FEM local-node map: {error}"),
+    })?;
+    if node_map_bytes.len() > fullmag_quantities::fem_local_node_map::MAX_FEM_LOCAL_NODE_MAP_BYTES {
+        return Err(RunError {
+            message: "final FEM local-node map exceeds serialized byte budget".into(),
+        });
+    }
+    auxiliary_artifacts.push(AuxiliaryArtifact {
+        relative_path: fullmag_quantities::fem_local_node_map::FEM_FINAL_NODE_MAP_ARTIFACT.into(),
+        bytes: node_map_bytes,
+    });
+    auxiliary_artifacts.push(AuxiliaryArtifact {
+        relative_path:
+            fullmag_quantities::fem_state_snapshot_receipt::FEM_FINAL_SNAPSHOT_RECEIPT_ARTIFACT
+                .into(),
+        bytes: serde_json::to_vec(&final_snapshot_receipt).map_err(|error| RunError {
+            message: format!("failed to encode final FEM state representation: {error}"),
+        })?,
+    });
+    auxiliary_artifacts.push(AuxiliaryArtifact {
+        relative_path: accepted_fields_path.to_string(),
+        bytes: serde_json::to_vec_pretty(&accepted_fem_equilibrium_fields).map_err(|error| {
+            RunError {
+                message: format!("failed to encode accepted FEM equilibrium fields: {error}"),
+            }
+        })?,
+    });
+    auxiliary_artifacts.push(AuxiliaryArtifact {
+        relative_path: fields_path.to_string(),
+        bytes: serde_json::to_vec_pretty(&certified_fem_equilibrium_fields).map_err(|error| {
+            RunError {
+                message: format!("failed to encode certified FEM equilibrium fields: {error}"),
+            }
+        })?,
+    });
+    auxiliary_artifacts.push(AuxiliaryArtifact {
+        relative_path: refresh_path.to_string(),
+        bytes: serde_json::to_vec_pretty(&recomputed_linearization_certificate).map_err(
+            |error| RunError {
+                message: format!(
+                    "failed to encode recomputed FEM linearization certificate: {error}"
+                ),
+            },
+        )?,
+    });
     if let Some(telemetry) = backend.stage_oersted_telemetry() {
         auxiliary_artifacts.push(AuxiliaryArtifact {
             relative_path: "transport/fem_stage_oersted_callback.v1.json".into(),
@@ -414,6 +781,17 @@ pub(crate) fn finalize_native_fem_relaxation(
         last_step.wall_time_ns = last_step
             .wall_time_ns
             .saturating_add(finalization_wall_time_ns);
+    }
+    if let Some(last_step) = diagnostic_steps.last_mut() {
+        last_step.finalization_wall_time_ns = finalization_wall_time_ns;
+        last_step.finalization_field_copy_wall_time_ns = finalization_field_copy_wall_time_ns;
+        last_step.finalization_field_copy_bytes = finalization_field_copy_bytes;
+        last_step.wall_time_ns = last_step
+            .wall_time_ns
+            .saturating_add(finalization_wall_time_ns);
+    }
+    if let Some(trace) = crate::artifacts::solver_diagnostic_trace_artifact(diagnostic_steps) {
+        auxiliary_artifacts.push(trace);
     }
     let status = if finalization.paused {
         RunStatus::Paused

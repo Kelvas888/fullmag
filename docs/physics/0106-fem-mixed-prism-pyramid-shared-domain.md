@@ -1,9 +1,10 @@
 # FEM mixed prism/pyramid shared-domain mesh
 
-- Status: bounded FEM CPU/GPU double mixed-P1 relaxation lanes implemented in source/contracts; managed public-runtime proof pending; wider scopes fail closed
+- Status: bounded FEM CPU/GPU double mixed-P1 relaxation lanes `implemented`; evidence is source/contract only, no runtime qualification is asserted, and wider scopes fail closed
 - Owners: Fullmag core
-- Last updated: 2026-07-30
-- Related ADRs: `docs/adr/0021-native-mixed-p1-fem-topology.md`
+- Last updated: 2026-08-28
+- Related ADRs: `docs/adr/0021-native-mixed-p1-fem-topology.md`,
+  `docs/adr/0027-canonical-fem-mesh-policy-and-quality-evidence.md`
 - Related specs:
   - `docs/specs/capability-matrix-v0.md`
   - `docs/architecture/backend-golden-masterplan.md`
@@ -35,14 +36,22 @@ through only the bounded CPU and GPU lanes below. Every wider physics, geometry,
 precision, device, or workflow tuple remains fail-closed before native operator
 startup.
 
-The first qualification target is deliberately narrow: one axis-aligned
+The first implementation target is deliberately narrow: one axis-aligned
 `Box`, P1, one conforming shared-domain airbox, exact layer count in
-`{1, 2, 3}`, uniform `Ms` and `Aex`, exchange,
-uniform Zeeman, Poisson Robin or Dirichlet demag, explicit FEM CPU or GPU double
-precision, strict execution, and PG-BB, NCG, or overdamped LLG relaxation.
-Those exact certificate-bound device tuples are currently `implemented`, not
-`production_executable` or `validated`, because no immutable managed public
-CPU/GPU SP4 runtime report exists yet. Device `auto`, single/extended/hybrid
+`{1, 2, 3}`, uniform `Ms` and `Aex`, exchange, uniform Zeeman,
+Poisson Robin or Dirichlet demag, explicit FEM CPU or GPU double precision,
+strict execution, and PG-BB, NCG, or overdamped LLG relaxation. Within that
+target, local interactions are lane-specific:
+
+- FEM CPU accepts uniform or nodal-P1 uniaxial and cubic anisotropy, plus
+  interfacial and bulk DMI, with status `implemented` and source/contract
+  evidence only.
+- FEM GPU accepts uniform or nodal-P1 uniaxial and cubic anisotropy, while DMI
+  fails closed with `gpu_dmi_kernel_not_mixed_p1`; the accepted anisotropy
+  slice has status `implemented` with source/contract evidence only.
+
+These statuses describe checked-in source, planner, and contract evidence only;
+they do not assert runtime qualification. Device `auto`, single/extended/hybrid
 execution, and wider tuples remain `unsupported`; no fallback is permitted.
 
 (governing-equations)=
@@ -73,6 +82,32 @@ E_{\mathrm{ex}}
 E_{\mathrm Z}
 = -\mu_0\int_{\Omega_m}\mathbf M\cdot\mathbf H_{\mathrm{ext}}\,\mathrm dV.
 ```
+
+Uniaxial anisotropy is a local nodal interaction and retains its existing
+negative-power energy convention. The coefficients may be uniform or supplied
+as nodal-P1 material fields in the bounded mixed-P1 source contract:
+
+```{math}
+:label: eq-mixed-p1-uniaxial-anisotropy
+
+q=\\mathbf m\\cdot\\mathbf u,
+\\qquad
+E_{\\mathrm u}
+=\\int_{\\Omega_m}\\left(-K_{u1}q^2-K_{u2}q^4\\right)\\,\\mathrm dV.
+```
+
+```{math}
+:label: eq-mixed-p1-uniaxial-field
+
+\\mathbf H_{\\mathrm u}
+=\\frac{2K_{u1}q+4K_{u2}q^3}{\\mu_0M_s}\\,\\mathbf u.
+```
+
+For mixed P1, topology enters this local term only through the certified
+magnetic nodal mass-row-sum weights. No tetrahedral connectivity is consumed
+by the CPU or CUDA nodal field/energy realization. Cubic anisotropy follows the
+same local nodal ownership for uniform or nodal `Kc1`/`Kc2`/`Kc3`; its canonical
+energy contract remains in `docs/physics/fem_anisotropy_cubic.md`.
 
 ### 2.2 Scalar Poisson demagnetization and signs
 
@@ -135,6 +170,12 @@ Prism, pyramid, and tetrahedron assembly must reproduce these signs exactly.
 | $E_{\mathrm Z}$ | Zeeman energy | $\mathrm{J}$ |
 | $E_{\mathrm{demag}}$ | demagnetization energy | $\mathrm{J}$ |
 | $E_{\partial D}$ | demagnetization boundary contribution | $\mathrm{J}$ |
+| $\mathbf u$ | normalized uniaxial anisotropy axis | $1$ |
+| $q$ | magnetization projection on the uniaxial axis | $1$ |
+| $K_{u1}$ | first-order uniaxial anisotropy constant | $\mathrm{J\,m^{-3}}$ |
+| $K_{u2}$ | second-order uniaxial anisotropy constant | $\mathrm{J\,m^{-3}}$ |
+| $\mathbf H_{\mathrm u}$ | uniaxial anisotropy effective field | $\mathrm{A\,m^{-1}}$ |
+| $E_{\mathrm u}$ | uniaxial anisotropy energy | $\mathrm{J}$ |
 | $t$ | magnetic film thickness | $\mathrm{m}$ |
 | $L$ | requested and realized prism-cell layers | $1$ |
 | $\tau_{\mathrm{plane}}$ | node-plane comparison tolerance | $\mathrm{m}$ |
@@ -157,7 +198,15 @@ scale; production certificates apply the SI tolerances below after realization.
   has exactly $L+1$ normal-coordinate node planes.
 - One prism layer is still a three-dimensional P1 discretization. It is not a
   thickness-averaged, 2.5D, shell, or macrospin model.
-- `Ms` and `Aex` are uniform in the first qualification workload.
+- Exact through-thickness layers constrain only the number of 3D cell layers
+  and their normal-coordinate planes. They do not imply structured in-plane
+  meshing; that is a separate request and evidence dimension.
+- `Ms` and `Aex` are uniform in the bounded workload. `Ku1`/`Ku2` and
+  `Kc1`/`Kc2`/`Kc3` may be uniform or nodal-P1 fields; the uniaxial and cubic
+  axes remain authored normalized material vectors.
+- Interfacial and bulk DMI are admitted only on FEM CPU in this mixed-P1
+  contract. FEM GPU rejects any DMI before native startup with
+  `gpu_dmi_kernel_not_mixed_p1`.
 - The magnetic domain contains only `prism6`; `pyramid5` and `tet4` are air
   cells and must never carry a magnetic material marker.
 - The first supported facets are `tri3 | quad4` and the polynomial/order
@@ -252,10 +301,19 @@ on connectivity order, basis traces, signs, material masks, energy ownership,
 quadrature sufficiency, requested/resolved provenance, and rejection reasons.
 
 The target is double precision only. The bounded explicit CPU and GPU lanes are
-`implemented` in source, operator, planner, and startup contracts. Neither lane
-is yet `production_executable` or `validated`; forced GPU cannot fall back to
-CPU. Neither lane may call the legacy prism-to-tet compatibility splitter in
-strict mode.
+`implemented`; current evidence comes from source, operator, planner, and
+startup contracts. This is not runtime qualification evidence. Forced GPU cannot fall
+back to CPU. Neither lane may call the legacy prism-to-tet compatibility
+splitter in strict mode.
+
+The local-interaction admission is deliberately separate by device:
+
+| FEM lane | Mixed-P1 local-interaction contract | Stable source boundary |
+|---|---|---|
+| CPU | Uniform or nodal-P1 uniaxial and cubic anisotropy; interfacial and bulk DMI; `implemented`, source/contract evidence only | `packages/fullmag-py/src/fullmag/model/problem.py::_validate_authored_mixed_p1_scope`, `crates/fullmag-plan/src/mesh.rs::validate_mixed_p1_execution_scope`, `backends/fem/core/fem_mesh.cpp::validate_supported_physics_topology` |
+| GPU | Uniform or nodal-P1 uniaxial and cubic anisotropy; DMI rejected fail-closed as `gpu_dmi_kernel_not_mixed_p1`; accepted anisotropy slice `implemented`, source/contract evidence only | `packages/fullmag-py/src/fullmag/model/problem.py::_validate_authored_mixed_p1_scope`, `crates/fullmag-plan/src/mesh.rs::mixed_p1_scope_failed_predicates`, `backends/fem/core/fem_mesh.cpp::validate_supported_physics_topology` |
+
+The lane table records source/contract admission, not a managed runtime result.
 
 #### 3.3.1 Mixed-P1 GPU operator and residency contract
 
@@ -339,12 +397,21 @@ hash and region/material realization. For the first workload it proves:
 The certificate fails closed. A warning, inferred layer count, clipped cell,
 tet conversion, or unversioned connectivity does not satisfy it.
 
+The mixed quality metric is `mixed_topology_scaled_jacobian.v1`. For `tet4` it
+is the normalized absolute determinant of the affine edge Jacobian. For
+`prism6` and `pyramid5` it is the normalized absolute determinant of the
+topology-specific isoparametric Jacobian, sampled at the same order-2
+quadrature points as the signed-Jacobian gate. The threshold remains
+`p05 >= 0.1` for every family; changing the metric does not lower the
+threshold, convert the magnetic prism to tetrahedra, or permit a negative
+mapped Jacobian.
+
 For $L=2$ or $L=3$, the mesher bounds the magnetic source-face target size by
 $2t/L$ before extrusion. This local, deterministic refinement keeps the lateral
 `quad4` prism faces and their incident transition pyramids within the unchanged
-p05 scaled-Jacobian floor without globally refining the far-air tetrahedra. The
-authored `hmax` remains an upper bound; the realized topology and derived local
-refinement remain fingerprint-bound certificate evidence.
+p05 topology-aware scaled-Jacobian floor without globally refining the far-air
+tetrahedra. The authored `hmax` remains an upper bound; the realized topology
+and derived local refinement remain fingerprint-bound certificate evidence.
 
 Cross-language certificate recomputation admits the bounded binary64
 comparison
@@ -370,7 +437,51 @@ norm-defect rule in Section 4.6. The norm-defect check uses only an absolute
 no `1e-12` relative term; sharing the same binary64 absolute constant does not
 make the two validation contracts interchangeable.
 
-#### 3.4.1 Language-neutral topology fingerprint v3
+#### 3.4.1 Mixed tetrahedral repair policy
+
+After Gmsh generates the mixed shared-domain mesh and before Fullmag extracts
+and certifies it, the bounded mixed-P1 realization applies the private repair
+policy `fullmag.mixed-tet-repair.v1`. The policy first runs a deterministic,
+bounded local interior-node pre-pass. Only if a strict global determinant
+failure remains does it invoke the Gmsh method `Relocate3D` with `niter=1` as
+the fallback. The receipt ID and fallback method remain fixed for compatibility
+with the existing production contract; this is not a claim that `Relocate3D`
+is universally the best tetrahedral optimizer or a production-qualification
+claim before its managed ten-cold-run matrix passes.
+The previous `Netgen` choice is rejected because it reproducibly lost
+conformity for the canonical SP4 mixed mesh, including same-side two-owner
+tetrahedral faces and non-manifold far-air faces.
+
+The repair boundary uses the same global relative determinant threshold as
+strict `MeshData` validation before and after the local pass and any fallback
+`Relocate3D`. A canonical SP4 stage probe confirmed that far-air slivers can
+already exist after `generate(3)`; the bounded local pass repairs those
+residuals without invoking the multi-minute global optimizer. Gmsh `minSJ`
+reported a false-safe value for one such element, so neither `minSJ` nor a
+family p05 is an admissible substitute for the strict per-element determinant
+gate. Every candidate local move checks all incident tetrahedra, preserves
+orientation, and rejects an excessive quality loss. A sliver created or left
+by the fallback `Relocate3D` is still rejected immediately before extraction.
+The separate pyramid-apex line search applies the same absolute nondegeneracy
+guard to every incident `tet4` and performs a global postcondition check.
+
+Repair is topology-quality work inside realization. It must not change the
+requested or realized cell families, exact magnetic layer count, region or
+boundary markers, or ownership of the shared material interface. It is not a
+public authoring control and adds no Python DSL, `ProblemIR`, planner,
+capability, runtime-selection, or CPU/GPU operator branch. Production always
+uses the canonical private policy; alternative methods exist only in the
+qualification harness and remain subject to the same fail-closed certificate.
+
+Changing the fallback repair method or iteration count, or changing the local
+pre-pass bounds or acceptance policy, requires a new algorithm ID, a ten-cold-run
+canonical SP4 candidate matrix, and a managed FEM receipt. The qualification-
+only algorithm ID is derived deterministically from the fallback method and
+iteration count so evidence for distinct Gmsh policies cannot collide with the
+immutable production ID. Gmsh remains fixed at one thread until the separate
+thread determinism and quality qualification passes.
+
+#### 3.4.2 Language-neutral topology fingerprint v3
 
 Accepted mixed-layer certificates emitted after this migration bind to topology
 fingerprint `v3`. Version 3 hashes one language-neutral typed binary stream;
@@ -437,6 +548,347 @@ provenance are recomputed and revalidated. Python emits v3 for newly
 realized/rebuilt mixed-layer certificates. The JSON/OpenAPI field shape stays a
 string version plus a `sha256:` value; only the version value and digest change.
 
+#### 3.4.3 Language-neutral certificate engine
+
+The canonical language-neutral computation and validation owner is implemented
+in `crates/fullmag-ir/src/mixed_certificate.rs` and exported by `fullmag-ir`.
+The host unit-contract evidence is 8 passing parallel/determinism tests and 21
+passing `mesh_assets` tests. The typed PyO3 bridge is also implemented and
+host-extension qualified by 11 Rust core tests and 17 real-extension Python
+tests with no skips. This is not production qualification: the artifact-v2
+native audit caller, deterministic receipt, and trusted-cache preflight are
+implemented and host-extension tested, while managed FEM runtime execution
+remains **NOT VERIFIED**. The current Python
+`_recompute_mixed_certificate_evidence` remains the readable oracle and
+meshing-time producer; persistence revalidates its claimed certificate natively
+and does not move Gmsh realization into Rust.
+
+The canonical Rust entry points are
+`compute_mixed_certificate_evidence(mesh)` and
+`validate_mixed_layer_topology_certificate_against_mesh(mesh, certificate)`.
+The validation signature order is exactly `(mesh, certificate)`; callers must
+not preserve or introduce the former reverse-order convention.
+
+The implementation changes neither the equations nor any tolerance in this
+note. The engine consumes the typed realized mesh and produces the same
+certificate evidence fields as the Python oracle. Its deterministic execution
+contract is:
+
+1. reject malformed CSR, missing or duplicate global ordinals, non-finite
+   coordinates, unsupported families, invalid markers, and invalid topology
+   before admitting evidence;
+2. use Rayon only for independent per-cell work; each worker returns one
+   immutable record containing the cell global ordinal, topology family,
+   signed and absolute volume, order-2 Jacobian samples,
+   topology-aware scaled-Jacobian samples, and canonical face records;
+3. collect all records, then sort them by exact cell global ordinal before any
+   count or floating-point reduction;
+4. sort face records by sorted global node IDs, cell global ordinal, local face
+   ordinal, and topology code, then group owners from that sequence without
+   depending on `HashMap` iteration order;
+5. accumulate magnetic and shared-domain volumes in ascending global-ordinal
+   order with one fixed-order compensated binary64 sum, never a Rayon tree
+   reduction or atomic floating-point accumulator;
+6. reject non-finite metric samples, sort binary64 samples with `total_cmp`,
+   and compute each p05 with the existing linear interpolation rank
+   `(n - 1) * 0.05`; and
+7. keep plane-coordinate clustering in sorted coordinate order under the
+   unchanged $\tau_{\mathrm{plane}}$ rule.
+
+Integer counts, topology codes, global ordinals, ownership, and topology
+fingerprint v3 remain exact-match fields. Dimensionless certificate metrics
+retain the existing `max(1e-12 relative, 16 * f64::EPSILON)` cross-language
+allowance, while dimensional values retain `1e-12` relative plus `1e-30`
+absolute comparison. Differences outside those existing bounds are algorithm,
+ordering, topology-map, or formula failures; tolerances must not be widened to
+make parity pass.
+
+This engine is backend-neutral semantic infrastructure in `fullmag-ir`, not a
+second mesher or FEM solver. Python continues to own authoring and OCC/Gmsh
+realization. `backends/fem` continues to own typed native import, final runtime
+preflight, MFEM basis/quadrature and operators, and separate CPU and GPU
+realizations. Both FEM lanes consume the same accepted certificate contract;
+neither lane may duplicate its equations, tolerance policy, evidence naming,
+or acceptance logic.
+
+| Solver lane | Certificate-engine applicability | Lane contract | Qualification and fallback |
+|---|---|---|---|
+| FDM CPU | Not applicable | Cartesian FDM does not consume mixed-P1 topology or its certificate engine. | No certificate-engine execution and no FEM fallback. |
+| FDM GPU | Not applicable | Cartesian FDM GPU does not consume mixed-P1 topology or its certificate engine. | No certificate-engine execution and no FEM or CPU fallback. |
+| FEM CPU | Shared `fullmag-ir` engine, typed PyO3 bridge, and artifact-v2 caller implemented; host extension qualified | Intended consumer of the backend-neutral certificate; `backends/fem` retains CPU preflight and MFEM execution without duplicating equations or tolerances. | Artifact receipt/provenance and trusted preflight are host-tested; managed runtime qualification is **NOT VERIFIED** and fails closed, with no alternate per-device certificate implementation or solver fallback. |
+| FEM GPU | Same shared `fullmag-ir` engine, typed PyO3 bridge, and artifact-v2 caller implemented; host extension qualified; this does not claim certificate computation runs on the GPU | Intended consumer of the backend-neutral certificate; `backends/fem` retains GPU preflight and MFEM/libCEED/CUDA execution without duplicating equations or tolerances. | Artifact receipt/provenance and trusted preflight are host-tested; managed runtime qualification is **NOT VERIFIED** and fails closed, with no alternate per-device certificate implementation or solver-device fallback. |
+
+The artifact-v2 production-caller integration, build report, and deterministic
+receipt-v2 certification contract preserve
+the existing requested topology separately from resolved execution and bind
+the algorithm ID `fullmag.mixed-certificate.rust-rayon.v1`, Rust/Rayon
+backend and thread count, source snapshot, exact mesh counts, topology
+fingerprint, and certificate payload digest. The receipt additionally binds the
+topology and build-report member lengths and SHA-256 digests, exact node/cell/
+facet counts, authoring-document and resolved-policy digests, Gmsh `4.15.2`,
+the production repair ID `fullmag.mixed-tet-repair.v1`, its `Relocate3D`
+fallback, and one fallback iteration. Receipt schema
+`fullmag.mesh-certification-receipt.v2` also binds
+`semantic_manifest_sha256`, computed from canonical
+compact JSON containing exactly `region_markers`, `object_region_markers`, and
+the sorted `boundary_map`. Consequently, changing a geometry/object name or
+exchanging boundary meanings fails both full and trusted audit even when the
+same numeric marker set still covers the mesh. Timestamp, provenance, member
+descriptors, and the receipt descriptor are excluded from this projection, so
+the digest graph remains acyclic. Thread count is provenance, not a semantic
+input. The current `1`,
+`2`, `4`, and `8` engine proof establishes
+identical serialized evidence, counts, and metrics, including bitwise-stable
+fixed-order volume sums. The host extension validates topology-fingerprint-v3
+binding and computes the claimed-certificate digest from canonical parsed JSON,
+strictly projected through the validated typed certificate schema and
+byte-for-byte equal to Python `_certificate_payload_sha256` for compact, pretty,
+and key-reordered inputs. The v2 receipt contains no timestamp, and the digest
+graph has no cycle: the receipt binds topology and build report, while the
+manifest binds the receipt. Public/imported artifacts, forced audits, and
+legacy v1 loads require full certificate recomputation plus marker/IR
+validation. The private trusted-cache path is legal only for an atomically
+produced internal v2 entry whose member digests, authoring/policy/source/
+producer/certifier bindings, certificate digest, counts, topology fingerprint,
+and native structural preflight all match. Missing native preflight reports
+`bypassed_native_unavailable` and performs the public full audit; it never turns
+receipt integrity into fast trust. Managed and forced-release audits require
+native certification. An outside-managed Python reference fallback is explicit
+non-production provenance. Generic/non-mixed artifacts and mixed producers
+missing any binding remain v1/full-audit rather than fabricating a receipt.
+The exact historical receipt schema
+`fullmag.mesh-certification-receipt.v1` remains parseable inside artifact v2,
+but it is accepted only by public full audit and is never eligible for trusted
+fast loading because it lacks the semantic-manifest binding. This receipt
+migration does not introduce artifact v3 and never rewrites a legacy artifact
+in place.
+
+Validation must compare complete evidence against the Python oracle, exercise
+the four-thread-count matrix, preserve global-ordinal order, freeze the p05
+interpolation and compensated volume sum, and reject non-manifold,
+same-side-two-owner, inverted-Jacobian, stale-fingerprint, and tampered-count
+fixtures. The current host proof covers 8 parallel/determinism tests, 21
+`mesh_assets` tests, 11 PyO3 Rust core tests, and 17 real-extension Python tests
+with no skips. It establishes engine unit parity and host-extension behavior,
+including the canonical certificate digest, a detached-GIL mutation proof, and
+a production-seam preflight probe with zero certificate-evidence calls.
+Managed FEM CPU/GPU execution, physics validation, and production qualification
+remain separate gates from the implemented host-level receipt and load-path
+contract.
+
+#### 3.4.4 Typed PyO3 certificate bridge
+
+The implemented bridge in `fullmag-py-core` transports the realized mesh through
+typed C-contiguous NumPy arrays rather than a full `MeshIR` JSON document.
+Coordinates and connectivity never pass through Python lists or `.tolist()`.
+Small metadata, an optional claimed certificate, and bounded result envelopes
+may use canonical JSON. This is an internal execution bridge, not a new public
+authoring parameter, mesher, certificate equation, tolerance, or FEM runtime
+owner.
+
+The wire contract is:
+
+| Field | Required NumPy representation | Shape |
+|---|---|---|
+| `node_ids` | `int64`, C-contiguous | `[N]` |
+| `node_coordinates` | `float64`, C-contiguous | `[N, 3]` |
+| `cell_global_ordinals` | `int64`, C-contiguous | `[C]` |
+| `cell_topology_codes` | `uint8`, C-contiguous | `[C]` |
+| `cell_region_ids` | `int64`, C-contiguous | `[C]` |
+| `cell_offsets` | `int64`, C-contiguous | `[C + 1]` |
+| `cell_connectivity` | `int64`, C-contiguous | `[cell_offsets[C]]` |
+| `facet_global_ordinals` | `int64`, C-contiguous | `[F]` |
+| `facet_topology_codes` | `uint8`, C-contiguous | `[F]` |
+| `facet_marker_ids` | `int64`, C-contiguous | `[F]` |
+| `facet_offsets` | `int64`, C-contiguous | `[F + 1]` |
+| `facet_connectivity` | `int64`, C-contiguous | `[facet_offsets[F]]` |
+
+The bridge pins workspace dependency `numpy = "0.29"` and consumes it through
+`numpy.workspace = true` in `fullmag-py-core`, matching the existing
+`pyo3 = "0.29"` workspace contract. The PyO3 entry points have exactly
+these signatures and argument order:
+
+```rust
+#[pyfunction]
+#[pyo3(signature = (
+    node_ids,
+    node_coordinates,
+    cell_global_ordinals,
+    cell_topology_codes,
+    cell_region_ids,
+    cell_offsets,
+    cell_connectivity,
+    facet_global_ordinals,
+    facet_topology_codes,
+    facet_marker_ids,
+    facet_offsets,
+    facet_connectivity,
+    metadata_json,
+    certificate_json=None
+))]
+fn certify_mixed_mesh_arrays(
+    py: Python<'_>,
+    node_ids: PyReadonlyArray1<'_, i64>,
+    node_coordinates: PyReadonlyArray2<'_, f64>,
+    cell_global_ordinals: PyReadonlyArray1<'_, i64>,
+    cell_topology_codes: PyReadonlyArray1<'_, u8>,
+    cell_region_ids: PyReadonlyArray1<'_, i64>,
+    cell_offsets: PyReadonlyArray1<'_, i64>,
+    cell_connectivity: PyReadonlyArray1<'_, i64>,
+    facet_global_ordinals: PyReadonlyArray1<'_, i64>,
+    facet_topology_codes: PyReadonlyArray1<'_, u8>,
+    facet_marker_ids: PyReadonlyArray1<'_, i64>,
+    facet_offsets: PyReadonlyArray1<'_, i64>,
+    facet_connectivity: PyReadonlyArray1<'_, i64>,
+    metadata_json: &str,
+    certificate_json: Option<&str>,
+) -> PyResult<String>;
+
+#[pyfunction]
+fn preflight_mixed_mesh_arrays(
+    py: Python<'_>,
+    node_ids: PyReadonlyArray1<'_, i64>,
+    node_coordinates: PyReadonlyArray2<'_, f64>,
+    cell_global_ordinals: PyReadonlyArray1<'_, i64>,
+    cell_topology_codes: PyReadonlyArray1<'_, u8>,
+    cell_region_ids: PyReadonlyArray1<'_, i64>,
+    cell_offsets: PyReadonlyArray1<'_, i64>,
+    cell_connectivity: PyReadonlyArray1<'_, i64>,
+    facet_global_ordinals: PyReadonlyArray1<'_, i64>,
+    facet_topology_codes: PyReadonlyArray1<'_, u8>,
+    facet_marker_ids: PyReadonlyArray1<'_, i64>,
+    facet_offsets: PyReadonlyArray1<'_, i64>,
+    facet_connectivity: PyReadonlyArray1<'_, i64>,
+    expected_json: &str,
+) -> PyResult<String>;
+```
+
+One canonical Rust mapping defines topology codes `1=tet4`, `2=prism6`,
+`3=pyramid5`, `4=hex8`, `11=tri3`, and `12=quad4`; the PyO3 module must reuse
+that mapping rather than copy the magic numbers. One regression test must
+decode all six bridge codes and compare the constructed `MeshIR` types exactly
+with `FemCellTypeIR::{Tet4, Prism6, Pyramid5, Hex8}` and
+`FemFacetTypeIR::{Tri3, Quad4}`. This binds the wire decoder to the canonical IR
+enums without asserting that the bridge's namespaced facet codes `11` and `12`
+are fingerprint-v3 serialization bytes. While holding the GIL, the bridge
+validates exact dtype, dimensionality, C-contiguity, matching entity counts,
+CSR start/monotonic/terminal offsets, unique valid global ordinals, and every
+connectivity node reference. It then makes exactly one owned copy of each input
+buffer, resolves dense node IDs `0..N` without a map (with a checked sparse-ID
+fallback), and builds the owned typed `MeshIR`. It must not retain a borrowed
+NumPy view or use `unsafe` after releasing the GIL.
+
+When a certificate is present, the GIL-held boundary first rejects any input
+larger than exactly $1\,048\,576$ UTF-8 bytes with
+`mixed certificate JSON exceeds 1048576-byte limit`; this fixed conservative
+gate runs before the first Python parse. The accepted bounded input is parsed
+with Python `json.loads` and canonicalized with
+`json.dumps(sort_keys=True, separators=(",", ":"), allow_nan=False)`. Serde then
+deserializes and validates the canonical typed certificate with unknown fields
+rejected. The bridge serializes only that typed validated projection,
+canonicalizes the projection once more through the same Python JSON contract,
+and copies the final canonical string into owned Rust memory. This makes Python
+the sole owner of legal finite-float text, including exponent formatting and
+signed zero, while excluding undeclared input from the digest; NaN and
+infinities fail closed. Rust must not partially emulate Python float
+representation.
+
+`certify_mixed_mesh_arrays` then releases the GIL with the PyO3 0.29 detached
+execution mechanism while it hashes the owned canonical certificate string,
+invokes the canonical `compute_mixed_certificate_evidence(mesh)` engine, and,
+when a claimed certificate is supplied, invokes
+`validate_mixed_layer_topology_certificate_against_mesh(mesh, certificate)`.
+Its bounded JSON result uses schema
+`fullmag.mixed-certificate-native-result.v1` and contains `evidence`,
+`topology_fingerprint_v3`, `certificate_payload_sha256`, `algorithm_id`,
+`rayon_threads`, `elapsed_ns`, and `validated_claimed_certificate`. The payload
+digest is the canonical digest of the supplied certificate only after that
+certificate validates; without a supplied certificate it is `null` and
+`validated_claimed_certificate=false`. A digest in this development result is
+not an artifact receipt and does not authorize the future trusted-cache path.
+
+`preflight_mixed_mesh_arrays` shares the GIL-held typed-array parser and owned
+`MeshIR` builder but is a separate detached structural operation. Its JSON
+envelope is exactly `{metadata: ..., expected: ...}`; the nested `expected`
+schema admits only `counts` and `topology_fingerprint_v3`, so it cannot replace
+cell regions, facet roles, or periodic metadata. The detached operation runs
+the canonical structural `MeshIR` validation, checks expected counts and
+topology fingerprint, and returns only counts, `topology_fingerprint_v3`, and
+`elapsed_ns`. It must not build face adjacency, quality samples, certificate
+evidence, or invoke the full certificate engine. This portable preflight does
+not replace the final `backends/fem` execution preflight before MFEM operator
+allocation.
+
+The implemented Python adapters are keyword-only and have exactly these signatures:
+
+```text
+def certify_mixed_mesh_arrays(
+    *,
+    mesh: "MeshData",
+    metadata: Mapping[str, object],
+    certificate: Mapping[str, object] | None,
+    require_native: bool,
+) -> NativeMixedCertificateResult | None:
+
+def preflight_mixed_mesh_arrays(
+    *,
+    mesh: "MeshData",
+    expected: Mapping[str, object],
+    require_native: bool,
+) -> NativeMixedPreflightResult | None:
+```
+
+The adapter converts the existing per-family block arrays to the NumPy CSR
+buffers above with NumPy allocation and vectorized assignment. Neither node
+coordinates nor cell/facet connectivity may pass through `.tolist()` or a
+Python-element loop on the bridge path. The adapter parses the bounded result
+JSON into `NativeMixedCertificateResult` or `NativeMixedPreflightResult`; it
+does not expose the raw JSON as the Python contract.
+
+Both Python adapters require an explicit `require_native` argument. Missing
+`_fullmag_core` with `require_native=True` fails exactly with
+`RuntimeError("native mixed mesh certifier is required")`. Development-only
+`require_native=False` may return `None`. The artifact-v2 production save caller
+passes `require_native=True`. A public full audit outside managed execution may
+explicitly execute the Python reference and records
+`production_qualified=false` with `certifier_backend="python_reference"`, or
+require the native bridge with `require_native=True`; no environment variable
+or implicit exception path silently selects Python or changes the requested
+device. Managed and forced-release audit callers require native certification.
+
+The bridge is implemented and host-extension qualified. Eleven Rust core tests
+and 17 real-extension Python tests with no skips cover canonical MeshIR topology
+mapping, typed CSR rejection, exact mandatory adapter signatures, strict native
+selection, Python-oracle evidence parity, topology-fingerprint-v3 binding, and
+Python-owned canonical claimed-certificate digest parity for `1e-5`, `1e20`,
+`-0.0`, compact/pretty/reordered JSON, plus NaN rejection. They also cover the
+exact $1\,048\,576$-byte certificate boundary, pre-parse oversized rejection,
+unknown-field rejection, the exact preflight envelope, metadata override
+rejection, dense node-ID fast path, sparse-ID fallback, and detached structural
+validation. The detached-GIL proof uses one
+real native compute interval and a mutation that fails when detachment is
+removed. The production `run_preflight` seam proves zero calls to certificate
+evidence computation. The existing managed export script contains the callable
+symbol check without a second build, but execution of that installed export is
+**NOT VERIFIED**. Neither these host tests nor the unexecuted managed export
+qualify production execution, canonical SP4
+parity, Rayon `1/2/4/8`, timing p50/p95, or the `7.5x` target.
+
+The complete Task 4.5 qualification gate uses the canonical mixed SP4 artifact
+and a real built extension. It compares every exact evidence field and each
+floating metric under the unchanged canonical tolerances, then records p50 and
+p95 for Rayon thread counts `1`, `2`, `4`, and `8`. Acceptance requires native
+certificate p95 no greater than `5.0 s`, native median speedup at least `7.5x`
+against the Python reference on the same artifact, and thread-independent
+topology fingerprint plus claimed-certificate payload digest. Thread-independent
+fingerprint and digest claims across that thread-count matrix remain future
+Task 4.5 evidence, not part of the host-extension proof.
+`scripts/export_fem_gpu_runtime.sh` remains the only export build: after its
+existing `-p fullmag-py-core` build, the same script imports the installed
+`_fullmag_core` and checks all three mixed-certificate symbols. That source
+check launches no second Cargo, maturin, or extension build; its managed
+installed execution remains **NOT VERIFIED**.
+
 ### 3.5 Hybrid
 
 Unsupported. A future hybrid workflow requires explicit projection and
@@ -472,6 +924,7 @@ import fullmag as fm
 fm.reset()
 study = fm.study("mixed-p1-layers")
 study.engine("fem")
+study.device("cpu", precision="double")
 study.mode("strict")
 study.universe(mode="manual", size=(100e-9, 80e-9, 65e-9))
 film = study.geometry(
@@ -481,7 +934,7 @@ film = study.geometry(
 film.Ms = 800e3
 film.Aex = 13e-12
 film.alpha = 0.1
-film.m = fm.texture.uniform(1, 0, 0)
+film.m = fm.init.UniformMagnetization((1.0, 0.0, 0.0))
 film.mesh.thin_film(
     maximum_element_size=3e-9,
     layers=3,
@@ -490,7 +943,9 @@ film.mesh.thin_film(
     transition="pyramid_to_tetrahedra",
     order=1,
 )
-study.relax(algorithm="projected_gradient_bb", max_steps=1)
+study.exchange()
+study.demag(realization="poisson_robin")
+study.stages.add_relax(stage_id="relax", algorithm="projected_gradient_bb", max_steps=1)
 ```
 
 The public Python API and its lowering preserve the requested prismatic
@@ -626,9 +1081,10 @@ $L\in\{1,2,3\}$ with requested count equal to realized count and exactly
 $L+1$ magnetic planes. Counts `0` and `4`, a non-exact request, a stale or
 mismatched fingerprint, any fallback, or `degraded=true` reject before native
 startup. Unsupported combinations—including `time_evolution`, FEM/BEM,
-PBC/Floquet, DMI, STT, thermal, magnetoelastic, regional projection,
+PBC/Floquet, GPU DMI, STT, thermal, magnetoelastic, regional projection,
 frequency-domain/eigen studies, DG0 interfaces, high order, multiple bodies,
-and physical multilayers—retain their existing rejection. A free-tetrahedral
+and physical multilayers—retain their existing rejection. CPU DMI is admitted
+by the lane-specific source contract. A free-tetrahedral
 mesh is an explicit alternative configuration, never an automatic fallback.
 
 ### 4.4 Planner and capability matrix
@@ -644,16 +1100,21 @@ fem.cpu.exchange_demag.mixed_p1
 fem.gpu.exchange_demag.mixed_p1
 ```
 
-The four mesh capabilities and both bounded CPU/GPU operator capabilities are
-`implemented`. Neither operator lane is `production_executable` or `validated`
-until the next managed proof. The legal implementation target is strict FEM,
-explicit CPU or GPU, double precision, the narrow workload in Section 1, and
-no fallback. `auto` remains rejecting. Authored device intent, a managed-launcher
-override, the plan-bound effective device, and resolved execution must remain
-distinct provenance.
+The four mesh capabilities, both bounded CPU/GPU operator capabilities, and the
+local-interaction extension are `implemented`; evidence for the extension is
+source/contract only. Neither operator lane is `production_executable` or `validated`. The
+legal implementation target is strict FEM, explicit CPU or GPU, double
+precision, the narrow workload in Section 1, and no fallback. `auto` remains
+rejecting. Authored device intent, a managed-launcher override, the plan-bound
+effective device, and resolved execution must remain distinct provenance.
+
+On CPU, uniform or nodal-P1 uniaxial/cubic anisotropy and interfacial/bulk DMI
+are admitted. On GPU, uniform or nodal-P1 uniaxial/cubic anisotropy is admitted,
+but DMI remains fail-closed with `gpu_dmi_kernel_not_mixed_p1`. This paragraph
+is source-contract status only and makes no runtime qualification claim.
 
 Until separately qualified, planning rejects FEM/BEM demag, PBC/Floquet,
-DMI/STT/thermal/magnetoelastic terms, regional projections, eigen/frequency-
+GPU DMI, STT/thermal/magnetoelastic terms, regional projections, eigen/frequency-
 domain studies, DG0/material interfaces, order greater than one, arbitrary OCC
 shapes, multiple bodies, and multilayers.
 
@@ -661,10 +1122,16 @@ shapes, multiple bodies, and multilayers.
 ### 4.5 Runtime, ABI, and native implementation mapping
 
 Production topology import, basis/quadrature, exchange, Poisson RHS/solve/
-recovery, relaxation, and certificate generation belong under `backends/fem`.
-Rust runner code owns orchestration, typed ABI lowering, requested/resolved
-provenance, artifacts, and rejection before startup; it must not implement a
-second FEM solver or hidden element conversion.
+recovery, relaxation, and final execution preflight belong under
+`backends/fem`. The implemented and unit-qualified language-neutral certificate
+computation and validation owner is
+`crates/fullmag-ir/src/mixed_certificate.rs`, as frozen by Section 3.4.3. The
+current meshing producer remains Python. Artifact-v2 persistence now invokes
+the native language-neutral validator with explicit native-required production
+semantics, while managed FEM runtime integration remains not verified. Rust
+runner code owns orchestration, typed ABI lowering, requested/resolved
+provenance, artifacts, and rejection before startup; neither `fullmag-ir` nor
+the runner may implement a second FEM solver or hidden element conversion.
 
 The native ABI carries typed, variable-width cell/facet connectivity. CPU and
 GPU readiness probes reject an ABI/topology version they do not understand
@@ -685,6 +1152,20 @@ topology-index construction, viewport triangulation, and surface selection
 consume that typed representation. Histogram and Inspector integration are not
 claimed by this bounded transport change. FMMT v1 remains readable only for tetrahedral
 sessions; it must never carry disguised or truncated mixed cells.
+
+Mesh-quality transport is a separate format from FMMT. The **current** writer
+and decoder implement only `FMMQ v1`: parallel metric arrays without topology,
+element-family, or per-cell identity. The writer can serialize arrays produced
+for a mixed mesh, but the payload cannot prove which topology each sample
+belongs to and therefore cannot qualify prism6, pyramid5, or any mixed mesh.
+Tet4-only use is a qualification limit, not a writer guard.
+The **planned** `FMMQ v2` contract in ADR 0027 adds topology-aware metric IDs,
+sampling rules, units, producer/version identity, zone ownership and exact
+cell-identity binding. No document may claim that v2 is implemented until its
+writer, OpenAPI/resource metadata, TypeScript decoder and mixed-cell browser
+test exist. V1 exits only after every supported v2 producer/consumer passes,
+legacy v1 fixtures remain readable, and new mixed-topology runs can no longer
+emit v1.
 
 The UI must show requested topology, realized topology counts, certificate
 status, quality metric identity, exact-layer result, and explicit rejection or
@@ -710,6 +1191,10 @@ At minimum, artifacts must record:
 - mesh and material-realization hashes;
 - the complete exact-layer/shared-domain certificate;
 - Gmsh version and deterministic meshing inputs;
+- certified mixed artifact-v2 receipts record the mixed-tetrahedral repair
+  algorithm ID, method, and iteration count; generic/non-mixed artifacts and
+  incomplete producer provenance remain v1/full-audit rather than publishing
+  invented metadata;
 - `fallbacks_triggered`, with strict acceptance requiring an empty list;
 - implementation, execution, and validation states independently.
 
@@ -786,6 +1271,11 @@ own fresh managed evidence:
 - constant-field and linear-manufactured-solution patch tests across mixed
   interfaces;
 - exchange directional-derivative and convergence tests;
+- uniform and nodal `Ku1`/`Ku2`, plus cubic `Kc1`/`Kc2`/`Kc3`, field and energy
+  contract checks on certified mixed magnetic prism nodes using MFEM mass-row-
+  sum weights for the CPU and GPU anisotropy paths;
+- CPU interfacial and bulk DMI field/energy contracts on the magnetic `prism6`
+  oracle; GPU DMI rejection with `gpu_dmi_kernel_not_mixed_p1`;
 - manufactured Poisson solution and RHS/sign tests across all three cell types;
 - Dirichlet/Robin airbox convergence and existing sphere/ellipsoid demag gates;
 - PG-BB/NCG energy-descent and overdamped-LLG trajectory/stop-reason gates;
@@ -799,12 +1289,32 @@ own fresh managed evidence:
 - FMMT v2 encode/decode, range, marker, and stale-revision tests;
 - control-room mesh inspection and WebGL browser smoke;
 - artifact schema and certificate tamper/staleness tests;
+- repair-policy tests that freeze the production algorithm ID, method, and
+  iteration count, reject both created and pre-existing degeneracies left by
+  the policy, require positive per-family minima, plus a minimal Netgen
+  regression topology and the N=10 candidate matrix;
 - frozen Python/Rust fingerprint-v3 vectors spanning SI scales (`1e-7`,
   `1e-5`, `3e-9`, `1e20`), arbitrary finite round-trip floats, signed zero,
   all enum tags, non-ASCII/empty/prefix strings, absent versus present-empty
   options, every periodic field, list reordering, excluded-field stability,
   tamper rejection, legacy-v2 acceptance, plan packing, runner validation, and
   unknown-version rejection;
+- implemented fullmag-ir certificate-engine unit tests for immutable per-cell
+  collection, deterministic face grouping, exact global-ordinal ordering,
+  fixed-order compensated volume sums, binary64 p05 interpolation, and
+  identical serialized evidence, counts, and metrics for Rayon `1`, `2`, `4`,
+  and `8`, including bitwise-stable fixed-order volume sums (8
+  parallel/determinism tests plus 21 `mesh_assets` tests); the host extension
+  covers fingerprint binding and canonical digest parity, while their thread-
+  independent canonical-SP4 proof remains a Task 4.5/artifact gate;
+- implemented typed-PyO3 bridge tests for buffer dtype/shape/contiguity, CSR
+  and topology-code rejection, exactly one owned-copy boundary, detached-GIL
+  execution with mutation proof, native-required failure, canonical certificate
+  digest, zero-evidence-call structural preflight, and real-extension
+  Python/Rust parity (11 Rust core tests and 17 real-extension Python tests with
+  no skips); artifact-v2 native-required save, explicit Python fallback
+  provenance, and trusted native preflight are host-tested, while managed
+  installed export remains a runtime gate;
 - managed container runtime gates for FEM CPU and strict FEM GPU.
 - bounded same-state step-0 field, energy, and maximum-torque parity with
   immutable Zarr/CSV identity and magnetic-node scoping.
@@ -825,7 +1335,10 @@ No lower level implies a higher one.
 - [x] Canonical physical/numerical target and units
 - [x] First-slice legality and fail-closed unsupported matrix
 - [x] Exact-layer/shared-domain certificate target
+- [x] Versioned private mixed-tetrahedral repair policy
 - [x] Language-neutral topology fingerprint v3 contract and v2 migration rule
+- [x] Language-neutral fullmag-ir certificate engine and host-unit Rayon determinism gate
+- [x] Typed PyO3 certificate bridge and real host-extension contract gate
 - [x] Frozen Gmsh 4.15.2 feasibility fixture
 - [x] Python API and round-trip preserve requested mixed topology
 - [x] ProblemIR enums, validation, and legacy-tetra migration
@@ -840,13 +1353,27 @@ No lower level implies a higher one.
 (limitations)=
 ## 7. Known limits and deferred work
 
+- Nodal `Ku1`/`Ku2` and `Kc1`/`Kc2`/`Kc3` are included in the bounded
+  source-contract tuple; nodal `Ms`/`Aex`/`alpha` fields and wider axis-field
+  variants remain outside it.
 - Arbitrary OCC shapes, cylinders, imported CAD/STL, multiple bodies, and
   multilayers are deferred.
-- PBC/Floquet, FEM/BEM/FMM, frequency-domain/eigen, DMI, STT, thermal,
+- PBC/Floquet, FEM/BEM/FMM, frequency-domain/eigen, GPU DMI, STT, thermal,
   magnetoelasticity, regional projections, DG0/material-interface publication,
   and order greater than one are deferred.
 - Adaptive remeshing and state transfer across mixed topology are deferred.
 - Single precision and every hybrid execution path are deferred.
+- The language-neutral `fullmag-ir` certificate engine, its Rayon
+  implementation, and host thread-count parity suite are implemented and
+  unit-qualified. The typed PyO3 bridge is implemented and host-extension
+  qualified; artifact-v2 receipt and trusted-cache contracts are implemented
+  and host-tested, while managed FEM runtime integration and production
+  qualification remain **NOT VERIFIED**.
+- The bridge has source, real host-extension parity, canonical-digest,
+  detached-GIL mutation, and zero-evidence-call preflight evidence. The managed
+  installed export, canonical SP4 parity, Rayon `1/2/4/8` bridge matrix, and
+  p95/`7.5x` performance gates remain **NOT VERIFIED**. Python remains the
+  current meshing producer and no `7.5x` speedup is claimed.
 - The feasibility fixture does not select or validate production Gmsh meshing
   algorithms, quality budgets, performance, or runtime memory residency.
 
@@ -868,7 +1395,27 @@ No lower level implies a higher one.
 | Public exact-layer authoring | `packages/fullmag-py/src/fullmag/world.py` | `thin_film` | validates and lowers prismatic thin-film intent | FEM CPU/GPU | Python round-trip and real-mesh tests |
 | Published Python-to-IR example | `packages/fullmag-py/tests/test_api.py` | `test_mixed_p1_publication_example_lowers_complete_mesh_entry_to_problem_ir` | executes the documented authoring path and compares the complete per-geometry mesh entry | FEM CPU/GPU shared contract | focused executable lowering test |
 | Shared-domain prism realization | `packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py` | `generate_swept_box_mesh` | generates exact stacked prisms and conforming air | FEM CPU/GPU | Gmsh 4.15.2 topology/certificate tests |
-| Certificate generation | `packages/fullmag-py/src/fullmag/meshing/_gmsh_airbox.py` | `_attach_mixed_layer_topology_certificate` | recomputes and binds realized topology evidence | FEM CPU/GPU | Python/Rust cross-language validation |
+| Production mixed-tetrahedral repair policy | `packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py` | `_STRICT_MIXED_TET_REPAIR_POLICY` | freezes candidate algorithm ID `fullmag.mixed-tet-repair.v1`, bounded local pre-pass, and `Relocate3D`/one-iteration fallback | FEM CPU/GPU shared meshing contract | focused source/contract tests and one exact stage diagnosis; candidate N=10 and managed receipt pending |
+| Mixed-tetrahedral repair policy validation | `packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py` | `_validate_mixed_tet_repair_policy` | fail-closed validation owner for the source-mapped production constant `_STRICT_MIXED_TET_REPAIR_POLICY` | FEM CPU/GPU shared meshing contract | focused valid/invalid private-policy tests |
+| Mixed-tetrahedral repair execution | `packages/fullmag-py/src/fullmag/meshing/_gmsh_swept.py` | `_repair_mixed_tetrahedra` | validates the private policy and invokes the non-overridable fail-closed policy executor before extraction and certification | FEM CPU/GPU shared meshing contract | focused selector/probe integration, strict created/left degeneracy tests, and Netgen certificate-boundary tests; candidate N=10 pending |
+| Certificate generation, current Python oracle | `packages/fullmag-py/src/fullmag/meshing/_gmsh_airbox.py` | `_attach_mixed_layer_topology_certificate` | recomputes and binds realized topology evidence during meshing; artifact persistence independently revalidates the claimed certificate natively | FEM CPU/GPU | current Python source/contract evidence; Rust engine, host bridge, and artifact caller are host-tested; managed runtime remains not verified |
+| Current Python evidence oracle | `packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py` | `_recompute_mixed_certificate_evidence` | computes the readable reference evidence and preserves current equations, ordering, and tolerances | backend-neutral reference consumed by FEM CPU/GPU | current source/contract oracle |
+| Canonical typed certificate schema | `crates/fullmag-ir/src/mesh_assets.rs` | `MixedLayerTopologyCertificateV1IR` | owns the complete certificate field set and rejects unknown fields before a certificate can contribute to the bridge digest or canonical validation | backend-neutral `fullmag-ir`; consumed by FEM CPU/GPU | full `fullmag-ir` suite: 372 passing tests; production caller/runtime not verified |
+| Language-neutral certificate evidence computation | `crates/fullmag-ir/src/mixed_certificate.rs` | `compute_mixed_certificate_evidence` | computes deterministic mixed-certificate evidence from typed `MeshIR` with immutable Rayon records and canonical ordered reductions | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | implemented and unit-qualified: 8 parallel/determinism tests plus 21 `mesh_assets` tests; bridge and artifact caller host-tested; managed runtime not verified |
+| Language-neutral certificate validation | `crates/fullmag-ir/src/mixed_certificate.rs` | `validate_mixed_layer_topology_certificate_against_mesh` | validates `(mesh, certificate)` against exact topology fingerprint, counts, metrics, ownership, and canonical tolerances | backend-neutral `fullmag-ir`; intended for FEM CPU/GPU | implemented and unit-qualified: 8 parallel/determinism tests plus 21 `mesh_assets` tests; managed FEM runtime not verified |
+| Typed PyO3 certificate entry | `crates/fullmag-py-core/src/mixed_certificate.rs` | `certify_mixed_mesh_arrays` | enforces the 1 MiB pre-parse cap, rejects unknown certificate fields, and builds owned typed `MeshIR` plus the Python-canonical typed certificate projection under the GIL, then hashes and computes/validates through `fullmag-ir` while detached | backend-neutral bridge intended for FEM CPU/GPU | implemented and host-extension qualified: 11 Rust core tests and 17 real-extension Python tests with no skips; artifact caller host-tested, managed runtime not verified |
+| Typed PyO3 structural preflight | `crates/fullmag-py-core/src/mixed_certificate.rs` | `preflight_mixed_mesh_arrays` | accepts an exact separated metadata/expected envelope and validates structure plus counts/fingerprint without invoking certificate evidence or adjacency | backend-neutral bridge intended for FEM CPU/GPU | implemented and host-extension qualified; override regressions and production-seam probe prove metadata isolation and zero certificate-engine calls |
+| Python certificate adapter | `packages/fullmag-py/src/fullmag/_core.py` | `certify_mixed_mesh_arrays` | exposes the exact mandatory keyword-only `MeshData` adapter and strict native-selection boundary without `.tolist()` topology conversion | Python bridge for FEM CPU/GPU | implemented and real-extension tested; artifact v2 requires native on save and records explicit non-production Python fallback on public full audit |
+| Deterministic mixed artifact receipt v2 | `packages/fullmag-py/src/fullmag/meshing/_certification_receipt.py` | `class CertificationReceiptV2` | freezes the acyclic artifact-v2 member, certificate, authoring, producer, mesh-count, and canonical semantic-manifest bindings without a semantic timestamp | FEM CPU/GPU shared persistence contract | exact JSON, immutability, schema rejection, semantic-map tamper matrix, and member tamper-matrix tests |
+| Legacy mixed artifact receipt v1 | `packages/fullmag-py/src/fullmag/meshing/_certification_receipt.py` | `class CertificationReceiptV1` | preserves the exact pre-semantic-binding receipt parser for public full audit without admitting trusted fast loading | FEM CPU/GPU shared persistence compatibility | legacy artifact-v2 full-audit acceptance and trusted-fast rejection regression |
+| Canonical semantic-manifest digest | `packages/fullmag-py/src/fullmag/meshing/persistence.py` | `_semantic_manifest_sha256` | hashes the normalized geometry/object region names and marker values plus sorted boundary meanings without timestamp, provenance, or member descriptors | FEM CPU/GPU shared persistence contract | full/trusted tamper rejection for region name, object-region map, and swapped boundary meanings |
+| Certified mixed artifact writer | `packages/fullmag-py/src/fullmag/meshing/persistence.py` | `save_mesh_artifact` | emits v2 only for complete explicit certified-mixed bindings and calls the native certifier with `require_native=True`; otherwise preserves generic v1/full-audit compatibility | FEM CPU/GPU shared persistence contract | host-extension v2 save/load test plus generic-v1 regression |
+| Portable full artifact audit | `packages/fullmag-py/src/fullmag/meshing/persistence.py` | `load_mesh_artifact` | exposes no trust/skip flag, verifies every binding, performs native full certification when available, and marks an outside-managed Python fallback non-production | FEM CPU/GPU shared persistence contract | fast/full tamper matrix and fallback provenance tests |
+| Internal trusted-cache loader | `packages/fullmag-py/src/fullmag/meshing/persistence.py` | `_load_trusted_cached_mesh_artifact` | accepts exact expected identities, verifies v2 receipt/member bindings, requires native structural preflight for fast trust, and falls back to public full audit with `bypassed_native_unavailable` | internal FEM CPU/GPU cache contract | real-extension preflight, no-Python-evidence execution-count, v1/future-schema, and tamper tests |
+| Trusted topology-fingerprint context | `packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py` | `_bind_trusted_topology_fingerprint_v3` | computes one Python topology fingerprint, binds it to the unsigned mesh identity, and shares it across receipt, manifest, native-preflight, proof, and result checks | internal backend-neutral mesh carrier | exact one-call trusted-load regression plus native fingerprint equality |
+| Owner-minted trusted receipt proof | `packages/fullmag-py/src/fullmag/meshing/_gmsh_types.py` | `_mint_trusted_native_preflight_receipt_proof` | binds one unsigned mesh identity, immutable certificate, exact counts, topology fingerprint, certificate digest, and native preflight to private certificate attachment without evidence recomputation | internal backend-neutral mesh carrier | forged proof/digest/count/fingerprint rejection and zero-evidence-call tests |
+| Python structural-preflight adapter | `packages/fullmag-py/src/fullmag/_core.py` | `preflight_mixed_mesh_arrays` | exposes the exact mandatory keyword-only `MeshData` preflight adapter and bounded typed result | Python bridge for FEM CPU/GPU | implemented and real-extension tested; managed runtime use not verified |
+| PyO3 symbol registration and export boundary | `crates/fullmag-py-core/src/lib.rs` | `fullmag_py_core` | registers the certificate, structural-preflight, and canonical topology-code functions that the existing single-build export script checks on its installed module | managed export boundary | registration implemented and host extension import-qualified; managed installed export execution not verified |
 | Planner legality | `crates/fullmag-plan/src/mesh.rs` | `validate_mixed_p1_execution_scope` | enforces exact bounded relaxation tuples | FEM CPU/GPU | planner accept/reject matrix |
 | Capability publication | `crates/fullmag-runner/src/capabilities.rs` | `mixed_p1_feature_capabilities` | publishes bounded status and scope wording | FEM CPU/GPU | capability serialization tests |
 | FMMT v2 topology serialization | `crates/fullmag-api/src/field_store.rs` | `serialize_fem_mesh_topology_binary_v2` | emits typed CSR topology and exact optional `u64` cell/facet identities without changing the v2 version | FEM CPU/GPU shared transport | serializer layout, legacy-v2, malformed-count, and overflow tests |
@@ -889,3 +1436,12 @@ No lower level implies a higher one.
 | Demag field recovery | `backends/fem/cpu/mfem/interactions/demag_poisson_recovery.cpp` | `recover_demag_poisson_field` | recovers $\mathbf H_{\mathrm{demag}}$ on magnetic cells | FEM CPU | manufactured/operator contracts; managed proof pending |
 | Demag energy | `backends/fem/cpu/mfem/interactions/demag_poisson_energy.cpp` | `demag_poisson_energy_from_field` | evaluates the existing demag-energy sign contract | FEM CPU | energy contracts; managed proof pending |
 | Magnetic nodal weights | `backends/fem/core/fem_mesh.cpp` | `compute_node_volumes` | synchronizes mixed P1 mass-row-sum volume weights | FEM CPU/GPU shared contract | native material/metric contracts |
+| Uniform/nodal uniaxial CPU field/energy | `backends/fem/cpu/mfem/interactions/anisotropy_uniaxial.cpp` | `compute_uniaxial_anisotropy_field` | evaluates local `Ku1`/`Ku2` fields and mass-lumped energy without cell-connectivity assumptions | FEM CPU | source/contract evidence |
+| Uniform/nodal uniaxial GPU field/energy | `backends/fem/gpu/cuda/interactions/anisotropy/anisotropy_kernels.cu` | `fullmag_cuda_uniaxial_anisotropy_field_energy_blocks` | evaluates the same local nodal contract on device | FEM GPU | source/contract evidence |
+| Uniform/nodal cubic CPU field/energy | `backends/fem/cpu/mfem/interactions/anisotropy_cubic.cpp` | `compute_cubic_anisotropy_field` | evaluates local `Kc1`/`Kc2`/`Kc3` fields and energy on magnetic P1 nodes | FEM CPU | source/contract evidence |
+| Uniform/nodal cubic GPU field/energy | `backends/fem/gpu/cuda/interactions/anisotropy/anisotropy_kernels.cu` | `fullmag_cuda_cubic_anisotropy_field_energy_blocks` | evaluates the same cubic nodal contract on device | FEM GPU | source/contract evidence |
+| CPU interfacial/bulk DMI | `backends/fem/cpu/mfem/interactions/dmi_interfacial.cpp`; `backends/fem/cpu/mfem/interactions/dmi_bulk.cpp` | `compute_interfacial_dmi_field`; `compute_bulk_dmi_field` | evaluates DMI fields and energies on magnetic prism6 elements | FEM CPU | source/contract evidence |
+| GPU mixed-P1 DMI rejection | `backends/fem/core/fem_mesh.cpp` | `validate_supported_physics_topology` | rejects mixed-P1 GPU DMI with `gpu_dmi_kernel_not_mixed_p1` before unsupported startup | FEM GPU | fail-closed source/contract evidence |
+| FMMQ v1 writer | `packages/fullmag-py/src/fullmag/meshing/remesh_cli.py` | `_write_quality_data_artifact_if_available` | zapisuje bieżące równoległe tablice FMMQ v1 bez tożsamości topologii; może zapisać tablice z mixed mesh, ale payload nie kwalifikuje mixed | writer: current; qualification: tetra-only limit | current source contract |
+| FMMQ v1 decoder | `apps/control-room/src/kernel/api/codecs/meshQualityDataCodec.ts` | `decodeMeshQualityData` | dekoduje bieżący układ FMMQ v1 | Control room | current codec tests |
+| FMMQ v2 contract | `docs/adr/0027-canonical-fem-mesh-policy-and-quality-evidence.md` | `DOC-ANCHOR:fmmq-v2-contract` | definiuje planowany topology-aware v2 i v1 exit | Cross-layer contract | planned contract |

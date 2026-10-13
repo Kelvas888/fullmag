@@ -8,10 +8,14 @@
  */
 
 #include "context.hpp"
+#include "dmi_boundary.cuh"
+#include "kernels.hpp"
+#include "regional_field_drive.cuh"
 
 #include <cuda_runtime.h>
 #include <cufft.h>
 #include <curand_kernel.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -132,9 +136,9 @@ __global__ void spectral_projection_fp64_kernel(
     double lx = px * dx;
     double ly = py * dy;
     double lz = pz * dz;
-    double kx = 2.0 * M_PI * static_cast<double>(frequency_index(x, px)) / lx;
-    double ky = 2.0 * M_PI * static_cast<double>(frequency_index(y, py)) / ly;
-    double kz = 2.0 * M_PI * static_cast<double>(frequency_index(z, pz)) / lz;
+    double kx = 2.0 * kFullmagPi * static_cast<double>(frequency_index(x, px)) / lx;
+    double ky = 2.0 * kFullmagPi * static_cast<double>(frequency_index(y, py)) / ly;
+    double kz = 2.0 * kFullmagPi * static_cast<double>(frequency_index(z, pz)) / lz;
     double k2 = kx * kx + ky * ky + kz * kz;
 
     if (k2 == 0.0) {
@@ -275,8 +279,10 @@ __global__ void combine_effective_field_fp64_kernel(
     const double * __restrict__ kc2_field,
     const double * __restrict__ kc3_field,
     int has_interfacial_dmi,
+    int has_rotated_interfacial_dmi,
     int has_bulk_dmi,
     double D_int,
+    double D_rotated,
     double D_bulk,
     int nx, int ny, int nz,
     int periodic_x, int periodic_y, int periodic_z,
@@ -289,7 +295,29 @@ __global__ void combine_effective_field_fp64_kernel(
     double mel_b1,
     double mel_b2,
     double mel_e11, double mel_e22, double mel_e33,
-    double mel_e23, double mel_e13, double mel_e12)
+    double mel_e23, double mel_e13, double mel_e12,
+    const double * __restrict__ profile_x,
+    const double * __restrict__ profile_y,
+    const double * __restrict__ profile_z,
+    int has_profile,
+    double profile_scale,
+    const double * __restrict__ regional_drive_x,
+    const double * __restrict__ regional_drive_y,
+    const double * __restrict__ regional_drive_z,
+    const RegionalFieldDriveParams * __restrict__ regional_drive_params,
+    const double * __restrict__ regional_drive_points,
+    uint32_t regional_drive_count,
+    uint64_t regional_drive_cell_count,
+    double evaluation_time_s,
+    const uint8_t * __restrict__ frozen_mask,
+    int has_frozen_mask,
+    double * __restrict__ rhs_x,
+    double * __restrict__ rhs_y,
+    double * __restrict__ rhs_z,
+    double gamma_bar,
+    double alpha,
+    int disable_precession,
+    int write_rhs)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -298,6 +326,11 @@ __global__ void combine_effective_field_fp64_kernel(
         h_eff_x[idx] = 0.0;
         h_eff_y[idx] = 0.0;
         h_eff_z[idx] = 0.0;
+        if (write_rhs) {
+            rhs_x[idx] = 0.0;
+            rhs_y[idx] = 0.0;
+            rhs_z[idx] = 0.0;
+        }
         return;
     }
 
@@ -310,7 +343,7 @@ __global__ void combine_effective_field_fp64_kernel(
     double hz = hz_ext;
 
     if (has_uniaxial_anisotropy && ms > 0.0) {
-        double mu0 = 4.0 * M_PI * 1e-7;
+        double mu0 = 4.0 * kFullmagPi * 1e-7;
         double ku1_val = ku1_field ? ku1_field[idx] : Ku1;
         double ku2_val = ku2_field ? ku2_field[idx] : Ku2;
         
@@ -325,7 +358,7 @@ __global__ void combine_effective_field_fp64_kernel(
     }
 
     if (has_cubic_anisotropy && ms > 0.0) {
-        double mu0 = 4.0 * M_PI * 1e-7;
+        double mu0 = 4.0 * kFullmagPi * 1e-7;
         double kc1_val = kc1_field ? kc1_field[idx] : Kc1;
         double kc2_val = kc2_field ? kc2_field[idx] : Kc2;
         double kc3_val = kc3_field ? kc3_field[idx] : Kc3;
@@ -356,7 +389,7 @@ __global__ void combine_effective_field_fp64_kernel(
     }
 
     // --- DMI (MuMax-compatible natural free-surface boundary conditions) ---
-    if ((has_interfacial_dmi || has_bulk_dmi) && ms > 0.0) {
+    if ((has_interfacial_dmi || has_rotated_interfacial_dmi || has_bulk_dmi) && ms > 0.0) {
         int iz = idx / (ny * nx);
         int rem = idx - iz * ny * nx;
         int iy = rem / nx;
@@ -390,64 +423,16 @@ __global__ void combine_effective_field_fp64_kernel(
             if (missing_zp) zp = idx;
         }
 
-        double mu0 = 4.0 * M_PI * 1e-7;
+        double mu0 = 4.0 * kFullmagPi * 1e-7;
         double dmi_pf = 2.0 / (mu0 * ms);
 
+        const DmiMissingFaces missing{
+            missing_xp, missing_xm, missing_yp, missing_ym, missing_zp, missing_zm};
         if (has_interfacial_dmi) {
-            // MuMax's interfacial DMI uses the natural boundary condition
-            // dm/dn = (D/(2A)) (n x m).  Extrapolate a missing neighbor and
-            // use it for both the central DMI derivative and the exchange
-            // correction.  The ordinary exchange kernel intentionally keeps
-            // its clamped-Neumann stencil, so the correction is applied here.
-            double mxm = m_x[xm], mym = m_y[xm], mzm = m_z[xm];
-            double mxp = m_x[xp], myp = m_y[xp], mzp = m_z[xp];
-            double mxym = m_x[ym], myym = m_y[ym], mzym = m_z[ym];
-            double mxyP = m_x[yp], myyP = m_y[yp], mzyP = m_z[yp];
-            if (exchange_stiffness > 0.0) {
-                const double d_over_2a = D_int / (2.0 * exchange_stiffness);
-                const double dx = 0.5 / inv_2dx;
-                const double dy = 0.5 / inv_2dy;
-                if (missing_xm) {
-                    mxm = mx + dx * d_over_2a * mz;
-                    mzm = mz - dx * d_over_2a * mx;
-                }
-                if (missing_xp) {
-                    mxp = mx - dx * d_over_2a * mz;
-                    mzp = mz + dx * d_over_2a * mx;
-                }
-                if (missing_ym) {
-                    myym = my + dy * d_over_2a * mz;
-                    mzym = mz - dy * d_over_2a * my;
-                }
-                if (missing_yp) {
-                    myyP = my - dy * d_over_2a * mz;
-                    mzyP = mz + dy * d_over_2a * my;
-                }
-
-                const double exchange_pf = 2.0 * exchange_stiffness / (mu0 * ms);
-                const double inv_dx2 = 4.0 * inv_2dx * inv_2dx;
-                const double inv_dy2 = 4.0 * inv_2dy * inv_2dy;
-                if (missing_xm) {
-                    hx += exchange_pf * (mxm - mx) * inv_dx2;
-                    hy += exchange_pf * (mym - my) * inv_dx2;
-                    hz += exchange_pf * (mzm - mz) * inv_dx2;
-                }
-                if (missing_xp) {
-                    hx += exchange_pf * (mxp - mx) * inv_dx2;
-                    hy += exchange_pf * (myp - my) * inv_dx2;
-                    hz += exchange_pf * (mzp - mz) * inv_dx2;
-                }
-                if (missing_ym) {
-                    hx += exchange_pf * (mxym - mx) * inv_dy2;
-                    hy += exchange_pf * (myym - my) * inv_dy2;
-                    hz += exchange_pf * (mzym - mz) * inv_dy2;
-                }
-                if (missing_yp) {
-                    hx += exchange_pf * (mxyP - mx) * inv_dy2;
-                    hy += exchange_pf * (myyP - my) * inv_dy2;
-                    hz += exchange_pf * (mzyP - mz) * inv_dy2;
-                }
-            }
+            const double mxm = m_x[xm], mzm = m_z[xm];
+            const double mxp = m_x[xp], mzp = m_z[xp];
+            const double myym = m_y[ym], mzym = m_z[ym];
+            const double myyP = m_y[yp], mzyP = m_z[yp];
             // Interfacial DMI: H_x = D*(dmz/dx), H_y = D*(dmz/dy), H_z = -D*(dmx/dx + dmy/dy)
             double dmz_dx = (mzp - mzm) * inv_2dx;
             double dmz_dy = (mzyP - mzym) * inv_2dy;
@@ -457,6 +442,20 @@ __global__ void combine_effective_field_fp64_kernel(
             hx += dmi_pf * D_int * dmz_dx;
             hy += dmi_pf * D_int * dmz_dy;
             hz -= dmi_pf * D_int * (dmx_dx + dmy_dy);
+            add_interfacial_dmi_boundary_correction(
+                mx, my, mz, dmi_pf, D_int, inv_2dx, inv_2dy, missing, hx, hy, hz);
+        }
+
+        if (has_rotated_interfacial_dmi) {
+            const double dmz_dx = (m_z[xp] - m_z[xm]) * inv_2dx;
+            const double dmy_dy = (m_y[yp] - m_y[ym]) * inv_2dy;
+            const double dmx_dy = (m_x[yp] - m_x[ym]) * inv_2dy;
+            const double dmx_dx = (m_x[xp] - m_x[xm]) * inv_2dx;
+            hx += dmi_pf * D_rotated * (dmz_dx - dmy_dy);
+            hy += dmi_pf * D_rotated * dmx_dy;
+            hz -= dmi_pf * D_rotated * dmx_dx;
+            add_rotated_interfacial_dmi_boundary_correction(
+                mx, my, mz, dmi_pf, D_rotated, inv_2dx, inv_2dy, missing, hx, hy, hz);
         }
 
         if (has_bulk_dmi) {
@@ -471,6 +470,9 @@ __global__ void combine_effective_field_fp64_kernel(
             hx -= dmi_pf * D_bulk * (dmz_dy - dmy_dz);
             hy -= dmi_pf * D_bulk * (dmx_dz - dmz_dx);
             hz -= dmi_pf * D_bulk * (dmy_dx - dmx_dy);
+            add_bulk_dmi_boundary_correction(
+                mx, my, mz, dmi_pf, D_bulk, inv_2dx, inv_2dy, inv_2dz,
+                missing, hx, hy, hz);
         }
     }
 
@@ -479,7 +481,7 @@ __global__ void combine_effective_field_fp64_kernel(
     // H_mel,y = −(2 B1 my ε22 + B2 (mx ε12 + mz ε23)) / (μ0 Ms)
     // H_mel,z = −(2 B1 mz ε33 + B2 (mx ε13 + my ε23)) / (μ0 Ms)
     if (has_magnetoelastic && ms > 0.0) {
-        double mu0 = 4.0 * M_PI * 1e-7;
+        double mu0 = 4.0 * kFullmagPi * 1e-7;
         double inv_mu0_ms = -1.0 / (mu0 * ms);
         hx += inv_mu0_ms * (2.0 * mel_b1 * mx * mel_e11 + mel_b2 * (my * mel_e12 + mz * mel_e13));
         hy += inv_mu0_ms * (2.0 * mel_b1 * my * mel_e22 + mel_b2 * (mx * mel_e12 + mz * mel_e23));
@@ -506,9 +508,44 @@ __global__ void combine_effective_field_fp64_kernel(
         hz += thermal_sigma * curand_normal_double(&state);
     }
 
+    if (has_profile) {
+        hx += profile_scale * profile_x[idx];
+        hy += profile_scale * profile_y[idx];
+        hz += profile_scale * profile_z[idx];
+    }
+
+    hx += regional_field_drive_component(
+        regional_drive_x, regional_drive_params, regional_drive_points,
+        regional_drive_count, regional_drive_cell_count, idx, evaluation_time_s);
+    hy += regional_field_drive_component(
+        regional_drive_y, regional_drive_params, regional_drive_points,
+        regional_drive_count, regional_drive_cell_count, idx, evaluation_time_s);
+    hz += regional_field_drive_component(
+        regional_drive_z, regional_drive_params, regional_drive_points,
+        regional_drive_count, regional_drive_cell_count, idx, evaluation_time_s);
+
     h_eff_x[idx] = hx;
     h_eff_y[idx] = hy;
     h_eff_z[idx] = hz;
+
+    if (write_rhs) {
+        const double px = my * hz - mz * hy;
+        const double py = mz * hx - mx * hz;
+        const double pz = mx * hy - my * hx;
+        const double dx = my * pz - mz * py;
+        const double dy = mz * px - mx * pz;
+        const double dz = mx * py - my * px;
+        const double precession_scale = disable_precession ? 0.0 : 1.0;
+        if (has_frozen_mask && frozen_mask[idx] != 0) {
+            rhs_x[idx] = 0.0;
+            rhs_y[idx] = 0.0;
+            rhs_z[idx] = 0.0;
+        } else {
+            rhs_x[idx] = -gamma_bar * (precession_scale * px + alpha * dx);
+            rhs_y[idx] = -gamma_bar * (precession_scale * py + alpha * dy);
+            rhs_z[idx] = -gamma_bar * (precession_scale * pz + alpha * dz);
+        }
+    }
 }
 
 __global__ void anisotropy_field_fp64_kernel(
@@ -553,7 +590,7 @@ __global__ void anisotropy_field_fp64_kernel(
         double mz = m_z[idx];
 
         if (has_uniaxial_anisotropy && ms > 0.0) {
-            double mu0 = 4.0 * M_PI * 1e-7;
+            double mu0 = 4.0 * kFullmagPi * 1e-7;
             double ku1_val = ku1_field ? ku1_field[idx] : Ku1;
             double ku2_val = ku2_field ? ku2_field[idx] : Ku2;
             double m_dot_u = mx * ux + my * uy + mz * uz;
@@ -565,7 +602,7 @@ __global__ void anisotropy_field_fp64_kernel(
         }
 
         if (has_cubic_anisotropy && ms > 0.0) {
-            double mu0 = 4.0 * M_PI * 1e-7;
+            double mu0 = 4.0 * kFullmagPi * 1e-7;
             double kc1_val = kc1_field ? kc1_field[idx] : Kc1;
             double kc2_val = kc2_field ? kc2_field[idx] : Kc2;
             double kc3_val = kc3_field ? kc3_field[idx] : Kc3;
@@ -657,6 +694,7 @@ void launch_demag_field_fp64(Context &ctx) {
         context_end_compute_stream_work(ctx, "launch_demag_field_fp64");
         return;
     }
+    ++ctx.endpoint_field_cache.demag_forward_fft_count;
 
     if (ctx.has_demag_tensor_kernel) {
         tensor_convolution_fp64_kernel<<<grid_padded, BLOCK_SIZE, 0, stream>>>(
@@ -693,6 +731,7 @@ void launch_demag_field_fp64(Context &ctx) {
         context_end_compute_stream_work(ctx, "launch_demag_field_fp64");
         return;
     }
+    ++ctx.endpoint_field_cache.demag_inverse_fft_count;
 
     unpack_demag_fft_fp64_kernel<<<grid_physical, BLOCK_SIZE, 0, stream>>>(
         static_cast<const cufftDoubleComplex*>(ctx.fft_x),
@@ -753,6 +792,7 @@ void launch_demag_field_fp64(Context &ctx) {
         return;
     }
     if (context_end_compute_stream_work(ctx, "launch_demag_field_fp64")) {
+        ++ctx.endpoint_field_cache.demag_evaluation_count;
         fullmag_fdm_note_operator_device_execution(
             ctx, FULLMAG_FDM_OPERATOR_DEMAG);
         if (ctx.has_demag_boundary_corr) {
@@ -763,30 +803,18 @@ void launch_demag_field_fp64(Context &ctx) {
 }
 
 /* ── Axpy kernel: dst += scale * src  (for Oersted field addition) ── */
-__global__ void add_scaled_field_fp64_kernel(
-    double *dst_x, double *dst_y, double *dst_z,
-    const double *src_x, const double *src_y, const double *src_z,
-    double scale,
-    const uint8_t *active_mask,
-    int has_active_mask,
-    int n)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    if (has_active_mask && active_mask[i] == 0) return;
-    dst_x[i] += scale * src_x[i];
-    dst_y[i] += scale * src_y[i];
-    dst_z[i] += scale * src_z[i];
-}
-
-void launch_effective_field_fp64(Context &ctx, double evaluation_time) {
+static void launch_effective_field_fp64_impl(
+    Context &ctx,
+    double evaluation_time,
+    cudaStream_t stream,
+    DeviceVectorField *rhs_out) {
     int n = static_cast<int>(ctx.cell_count);
     int grid = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     // Compute thermal noise amplitude (FDT)
     const double thermal_dt = ctx.trial_dt > 0.0 ? ctx.trial_dt : ctx.current_dt;
     if (ctx.temperature > 0.0 && ctx.Ms > 0.0 && thermal_dt > 0.0) {
-        double MU0 = 4.0 * M_PI * 1e-7;
+        double MU0 = 4.0 * kFullmagPi * 1e-7;
         double KB = 1.380649e-23;
         double V = ctx.dx * ctx.dy * ctx.dz;
         ctx.thermal_sigma = sqrt(2.0 * ctx.alpha * KB * ctx.temperature / (ctx.gamma * MU0 * ctx.Ms * V * thermal_dt));
@@ -795,7 +823,15 @@ void launch_effective_field_fp64(Context &ctx, double evaluation_time) {
     }
     if (ctx.thermal_sigma > 0.0) ctx.thermal_rng_draws += 3 * ctx.cell_count;
 
-    combine_effective_field_fp64_kernel<<<grid, BLOCK_SIZE>>>(
+    const bool has_profile =
+        ctx.has_static_external_field_profile || ctx.has_oersted_field;
+    const double profile_scale = ctx.has_static_external_field_profile
+        ? 1.0
+        : (ctx.has_oersted_field ? oersted_field_scale(ctx, evaluation_time) : 0.0);
+    const bool write_rhs = rhs_out != nullptr;
+    const double gamma_bar = ctx.gamma / (1.0 + ctx.alpha * ctx.alpha);
+
+    combine_effective_field_fp64_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
         static_cast<const double*>(ctx.m.x),
         static_cast<const double*>(ctx.m.y),
         static_cast<const double*>(ctx.m.z),
@@ -836,8 +872,10 @@ void launch_effective_field_fp64(Context &ctx, double evaluation_time) {
         ctx.kc2_field,
         ctx.kc3_field,
         ctx.has_interfacial_dmi ? 1 : 0,
+        ctx.has_rotated_interfacial_dmi ? 1 : 0,
         ctx.has_bulk_dmi ? 1 : 0,
         ctx.D_interfacial,
+        ctx.D_rotated_interfacial,
         ctx.D_bulk,
         static_cast<int>(ctx.nx), static_cast<int>(ctx.ny), static_cast<int>(ctx.nz),
         ctx.periodic_x ? 1 : 0, ctx.periodic_y ? 1 : 0, ctx.periodic_z ? 1 : 0,
@@ -850,49 +888,49 @@ void launch_effective_field_fp64(Context &ctx, double evaluation_time) {
         ctx.mel_b1,
         ctx.mel_b2,
         ctx.mel_strain[0], ctx.mel_strain[1], ctx.mel_strain[2],  // e11, e22, e33
-        ctx.mel_strain[3] * 0.5, ctx.mel_strain[4] * 0.5, ctx.mel_strain[5] * 0.5); // e23, e13, e12 (tensor)
-
-    // ── Add a static external profile directly, or scale a dynamic Oersted profile by I(t). ──
-    if (ctx.has_static_external_field_profile) {
-        add_scaled_field_fp64_kernel<<<grid, BLOCK_SIZE>>>(
-            static_cast<double*>(ctx.work.x),
-            static_cast<double*>(ctx.work.y),
-            static_cast<double*>(ctx.work.z),
-            static_cast<const double*>(ctx.h_oe_static.x),
-            static_cast<const double*>(ctx.h_oe_static.y),
-            static_cast<const double*>(ctx.h_oe_static.z),
-            1.0,
-            ctx.active_mask,
-            ctx.has_active_mask ? 1 : 0,
-            n);
-    } else if (ctx.has_oersted_field) {
-        const double I_scale = oersted_field_scale(ctx, evaluation_time);
-        // Simple axpy: work += I_scale * h_oe_static
-        add_scaled_field_fp64_kernel<<<grid, BLOCK_SIZE>>>(
-            static_cast<double*>(ctx.work.x),
-            static_cast<double*>(ctx.work.y),
-            static_cast<double*>(ctx.work.z),
-            static_cast<const double*>(ctx.h_oe_static.x),
-            static_cast<const double*>(ctx.h_oe_static.y),
-            static_cast<const double*>(ctx.h_oe_static.z),
-            I_scale,
-            ctx.active_mask,
-            ctx.has_active_mask ? 1 : 0,
-            n);
-    }
+        ctx.mel_strain[3] * 0.5, ctx.mel_strain[4] * 0.5, ctx.mel_strain[5] * 0.5,
+        static_cast<const double*>(ctx.h_oe_static.x),
+        static_cast<const double*>(ctx.h_oe_static.y),
+        static_cast<const double*>(ctx.h_oe_static.z),
+        has_profile ? 1 : 0,
+        profile_scale,
+        static_cast<const double*>(ctx.regional_field_drive_x),
+        static_cast<const double*>(ctx.regional_field_drive_y),
+        static_cast<const double*>(ctx.regional_field_drive_z),
+        ctx.regional_field_drive_params,
+        ctx.regional_field_drive_points,
+        ctx.regional_field_drive_count,
+        ctx.cell_count,
+        evaluation_time,
+        ctx.frozen_mask,
+        ctx.has_frozen_mask ? 1 : 0,
+        write_rhs ? static_cast<double*>(rhs_out->x) : nullptr,
+        write_rhs ? static_cast<double*>(rhs_out->y) : nullptr,
+        write_rhs ? static_cast<double*>(rhs_out->z) : nullptr,
+        gamma_bar,
+        ctx.alpha,
+        ctx.disable_precession ? 1 : 0,
+        write_rhs ? 1 : 0);
     const cudaError_t launch_error = cudaGetLastError();
     if (launch_error != cudaSuccess) {
         set_cuda_error(ctx, "launch_effective_field_fp64", launch_error);
         return;
     }
-    if (ctx.has_interfacial_dmi || ctx.has_bulk_dmi) {
+    if (write_rhs) {
+        context_note_local_pipeline_fused_field_rhs(ctx);
+        fullmag_fdm_note_llg_rhs_torque_device_launch(
+            ctx, "fused local field/RHS fp64 launch");
+    }
+    ++ctx.endpoint_field_cache.effective_field_evaluation_count;
+    if (ctx.has_interfacial_dmi || ctx.has_rotated_interfacial_dmi || ctx.has_bulk_dmi) {
         fullmag_fdm_note_operator_device_execution(ctx, FULLMAG_FDM_OPERATOR_DMI);
     }
     if (ctx.has_uniaxial_anisotropy || ctx.has_cubic_anisotropy) {
         fullmag_fdm_note_operator_device_execution(
             ctx, FULLMAG_FDM_OPERATOR_ANISOTROPY);
     }
-    if (ctx.has_external_field || ctx.has_static_external_field_profile) {
+    if (ctx.has_external_field || ctx.has_static_external_field_profile ||
+        ctx.regional_field_drive_count != 0) {
         fullmag_fdm_note_operator_device_execution(
             ctx, FULLMAG_FDM_OPERATOR_EXTERNAL_FIELD);
     }
@@ -910,6 +948,80 @@ void launch_effective_field_fp64(Context &ctx, double evaluation_time) {
     if (ctx.has_oersted_field) {
         fullmag_fdm_note_operator_device_execution(ctx, FULLMAG_FDM_OPERATOR_OERSTED);
     }
+}
+
+void launch_effective_field_fp64(
+    Context &ctx,
+    double evaluation_time,
+    cudaStream_t stream) {
+    launch_effective_field_fp64_impl(ctx, evaluation_time, stream, nullptr);
+}
+
+bool launch_effective_field_and_base_llg_rhs_fp64(
+    Context &ctx,
+    double evaluation_time,
+    DeviceVectorField &rhs_out,
+    cudaStream_t stream) {
+    if (ctx.has_zhang_li_stt || ctx.has_slonczewski_stt || ctx.has_sot) {
+        return false;
+    }
+    launch_effective_field_fp64_impl(ctx, evaluation_time, stream, &rhs_out);
+    return ctx.last_error.empty();
+}
+
+void launch_effective_field_fp64(Context &ctx, double evaluation_time) {
+    launch_effective_field_fp64(ctx, evaluation_time, nullptr);
+}
+
+cudaError_t query_local_pipeline_kernel_resources_fp64(
+    LocalPipelineKernelResources *out_resources) {
+    if (out_resources == nullptr) return cudaErrorInvalidValue;
+    cudaFuncAttributes attributes{};
+    cudaError_t status = cudaFuncGetAttributes(
+        &attributes, combine_effective_field_fp64_kernel);
+    if (status != cudaSuccess) return status;
+    int device = 0;
+    status = cudaGetDevice(&device);
+    if (status != cudaSuccess) return status;
+    int max_threads_per_sm = 0;
+    status = cudaDeviceGetAttribute(
+        &max_threads_per_sm, cudaDevAttrMaxThreadsPerMultiProcessor, device);
+    if (status != cudaSuccess) return status;
+    int multiprocessor_count = 0;
+    status = cudaDeviceGetAttribute(
+        &multiprocessor_count, cudaDevAttrMultiProcessorCount, device);
+    if (status != cudaSuccess) return status;
+    int max_active_blocks_per_sm = 0;
+    status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_active_blocks_per_sm,
+        combine_effective_field_fp64_kernel,
+        BLOCK_SIZE,
+        0);
+    if (status != cudaSuccess) return status;
+    if (max_threads_per_sm <= 0 || max_active_blocks_per_sm <= 0 ||
+        attributes.numRegs < 0) {
+        return cudaErrorInvalidConfiguration;
+    }
+    LocalPipelineKernelResources resources{};
+    resources.block_threads = BLOCK_SIZE;
+    resources.registers_per_thread =
+        static_cast<uint32_t>(attributes.numRegs);
+    resources.static_shared_bytes = attributes.sharedSizeBytes;
+    resources.local_bytes_per_thread = attributes.localSizeBytes;
+    resources.max_active_blocks_per_sm =
+        static_cast<uint32_t>(max_active_blocks_per_sm);
+    resources.max_threads_per_sm = static_cast<uint32_t>(max_threads_per_sm);
+    resources.multiprocessor_count =
+        static_cast<uint32_t>(multiprocessor_count);
+    const uint64_t resident_threads =
+        static_cast<uint64_t>(max_active_blocks_per_sm) * BLOCK_SIZE;
+    resources.theoretical_occupancy_permyriad = static_cast<uint32_t>(
+        std::min<uint64_t>(
+            10000,
+            resident_threads * 10000 /
+                static_cast<uint64_t>(max_threads_per_sm)));
+    *out_resources = resources;
+    return cudaSuccess;
 }
 
 void launch_anisotropy_field_fp64(Context &ctx) {
@@ -946,10 +1058,12 @@ void launch_anisotropy_field_fp64(Context &ctx) {
 }
 
 double launch_demag_energy_fp64(Context &ctx) {
+    ++ctx.endpoint_field_cache.energy_reduction_count;
     return reduce_demag_energy_fp64(ctx);
 }
 
 double launch_external_energy_fp64(Context &ctx) {
+    ++ctx.endpoint_field_cache.energy_reduction_count;
     return reduce_external_energy_fp64(ctx);
 }
 

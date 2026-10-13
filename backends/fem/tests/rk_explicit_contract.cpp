@@ -9,6 +9,7 @@
 #include "cpu/mfem/integrators/rk_stepper_workspace.hpp"
 #include "cpu/mfem/runtime/backend_step.hpp"
 #include "cpu/mfem/runtime/state_io.hpp"
+#include "cpu/mfem/runtime/step_metrics.hpp"
 
 #include <array>
 #include <cmath>
@@ -102,6 +103,8 @@ void rk_workspace_is_owned_by_integrator_module() {
         read_text_file(root / "cpu" / "mfem" / "integrators" / "rk_stepper_workspace.hpp");
     const std::string rk_explicit_step =
         read_text_file(root / "cpu" / "mfem" / "integrators" / "rk_explicit_step.cpp");
+    const std::string context_builder =
+        read_text_file(root / "core" / "fem_context_builder.cpp");
     const std::string rk_stage_rhs =
         read_text_file(root / "cpu" / "mfem" / "integrators" / "rk_stage_rhs.cpp");
 
@@ -137,6 +140,10 @@ void rk_workspace_is_owned_by_integrator_module() {
         rk_workspace.find("StepperWorkspace workspace") != std::string::npos,
         "RK stepper runtime state must own the reusable StepperWorkspace");
     check(
+        rk_workspace.find("std::unique_ptr<RkAttemptCacheSnapshot> attempt_checkpoint") !=
+            std::string::npos,
+        "adaptive RK attempt checkpoint must be owned by the reusable workspace");
+    check(
         context_header.find("RkStepperRuntimeState stepper{}") != std::string::npos,
         "Context must store RK workspace through the runtime owner");
     check(
@@ -164,6 +171,33 @@ void rk_workspace_is_owned_by_integrator_module() {
     check(
         rk_explicit_step.find("bool context_step_explicit_rk_mfem(") != std::string::npos,
         "explicit RK stepper must be defined in rk_explicit_step.cpp");
+    check(
+        context_builder.find(
+            "std::make_unique<RkAttemptCacheSnapshot>(ctx, false)") !=
+                std::string::npos &&
+            context_builder.find("attempt_cache_allocation_count += 1") !=
+                std::string::npos &&
+            rk_workspace.find("uint64_t attempt_cache_allocation_count = 0") !=
+                std::string::npos,
+        "adaptive RK attempt checkpoint must be allocated during Context setup");
+    check(
+        rk_explicit_step.find("std::make_unique<RkAttemptCacheSnapshot>") ==
+                std::string::npos &&
+            rk_explicit_step.find("fallback_attempt_cache") == std::string::npos,
+        "adaptive RK step execution must not allocate a compatibility checkpoint");
+    check(
+        rk_explicit_step.find("compute_adaptive_error_norm_mass_weighted(") !=
+            std::string::npos &&
+            rk_explicit_step.find("ctx.integration_weights.mfem_lumped_mass") !=
+                std::string::npos &&
+            rk_explicit_step.find("ctx.mesh.node_volumes") != std::string::npos,
+        "adaptive RK production path must consume canonical FEM measure weights");
+    check(
+        rk_explicit_step.find("error_norm_type = 2u") != std::string::npos &&
+            rk_explicit_step.find("active_node_count = norm_metrics.active_node_count") !=
+                std::string::npos &&
+            rk_explicit_step.find("normalization_denominator") != std::string::npos,
+        "adaptive RK production path must publish the native weighted-norm receipt");
 }
 
 void integrator_source_files_document_module_boundaries() {
@@ -338,7 +372,7 @@ void workspace_allocates_common_buffers() {
     fullmag::fem::StepperWorkspace ws;
     fullmag::fem::stepper_workspace_allocate(ws, 9u, 3);
 
-    check(ws.m_backup.size() == 9u, "m backup allocated");
+    check(ws.m_candidate.size() == 9u, "private candidate allocated");
     check(ws.m_stage.size() == 9u, "stage magnetization allocated");
     check(ws.h_ex_tmp.size() == 9u, "exchange temp field allocated");
     check(ws.h_demag_tmp.size() == 9u, "demag temp field allocated");
@@ -346,37 +380,113 @@ void workspace_allocates_common_buffers() {
     check(ws.err.size() == 9u, "adaptive error buffer allocated");
 }
 
-void rk_transaction_payload_inventory_covers_owned_vectors() {
+void endpoint_cache_telemetry_has_explicit_validity_dimensions() {
+    fullmag::fem::EndpointCacheValidity validity{};
+    check(!validity.valid(), "an empty endpoint cache validity must be invalid");
+    validity.state = true;
+    validity.time = true;
+    validity.dynamic_sources = true;
+    validity.transport = true;
+    validity.projection = true;
+    check(validity.valid(), "all endpoint cache validity dimensions must be required");
+
+    fullmag::fem::StepperWorkspace ws;
+    ws.endpoint_telemetry.cache_validity = validity;
+    ws.endpoint_telemetry.final_refresh_reason =
+        fullmag::fem::RkFinalRefreshReason::CacheHit;
+    ws.endpoint_telemetry.final_rhs_evaluations = 2u;
+    ws.endpoint_telemetry.extra_poisson_solves = 3u;
+    check(
+        ws.endpoint_telemetry.final_refresh_reason ==
+            fullmag::fem::RkFinalRefreshReason::CacheHit &&
+            ws.endpoint_telemetry.final_rhs_evaluations == 2u &&
+            ws.endpoint_telemetry.extra_poisson_solves == 3u,
+        "endpoint telemetry must be typed and owned by the CPU RK workspace");
+
+    const std::filesystem::path root = fem_source_root();
+    const std::string stepper_header = read_text_file(
+        root / "cpu" / "mfem" / "integrators" / "rk_stepper_workspace.hpp");
+    const std::string step_source = read_text_file(
+        root / "cpu" / "mfem" / "integrators" / "rk_explicit_step.cpp");
+    for (const char *field : {
+             "bool state",
+             "bool time",
+             "bool dynamic_sources",
+             "bool transport",
+             "bool projection",
+             "final_rhs_evaluations",
+             "extra_poisson_solves",
+             "accepted_step_wall_time_ns",
+         }) {
+        check(
+            stepper_header.find(field) != std::string::npos,
+            "endpoint telemetry header must expose every required validity/cost field");
+    }
+    check(
+        step_source.find("endpoint_refresh_reason") != std::string::npos &&
+            step_source.find("endpoint_telemetry.extra_poisson_solves") !=
+                std::string::npos,
+        "CPU RK step must account for the final refresh reason and Poisson cost");
+}
+
+void endpoint_cache_telemetry_has_public_versioned_abi() {
+    const std::string abi_header = read_text_file(
+        repo_root() / "native" / "include" / "fullmag_fem.h");
+    const std::string abi_source = read_text_file(
+        repo_root() / "backends" / "fem" / "src" / "api.cpp");
+    check(
+        abi_header.find("FULLMAG_FEM_ENDPOINT_CACHE_TELEMETRY_V1_ABI_VERSION") !=
+            std::string::npos &&
+            abi_header.find("fullmag_fem_endpoint_cache_telemetry_v1") !=
+                std::string::npos &&
+            abi_header.find("fullmag_fem_backend_snapshot_endpoint_cache_telemetry_v1") !=
+                std::string::npos,
+        "endpoint cache telemetry must be exposed through an additive versioned C ABI");
+    for (const char *field : {
+             "final_rhs_evaluations",
+             "extra_poisson_solves",
+             "endpoint_cache_hits",
+             "endpoint_refreshes",
+             "accepted_step_wall_time_ns",
+             "cache_state_valid",
+             "cache_time_valid",
+             "cache_dynamic_sources_valid",
+             "cache_transport_valid",
+             "cache_projection_valid",
+         }) {
+        check(
+            abi_source.find(std::string("out_telemetry->") + field) != std::string::npos,
+            "public endpoint telemetry ABI must copy every native receipt field");
+    }
+}
+
+void rk_transaction_uses_cpu_buffer_generations_without_payload_copies() {
     const std::string transaction = read_text_file(
         fem_source_root() / "cpu" / "mfem" / "integrators" / "rk_step_transaction.cpp");
     for (const char *field : {
-             "state.m_xyz",
-             "anisotropy.uniaxial_axis_x_field",
-             "anisotropy.h_uniaxial_xyz",
-             "magnetoelastic.strain_voigt",
-             "exchange.h_xyz",
-             "exchange.mfem.h_x",
-             "demag.h_xyz",
-             "demag.cached_xyz",
-             "zeeman.h_ext_xyz",
-             "zeeman.regional_drives",
-             "attempt_trace.records",
-             "hot_loop_violation_message",
-             "dmi.h_interfacial_xyz",
-             "effective_field.h_xyz",
-             "oersted.h_basis_per_ampere_xyz",
-             "stage_transport.torque_xyz_per_s",
-             "thermal_brown.xi_xyz",
-             "gpu_hybrid_stage_m",
-             "cpu_k0",
-             "poisson_solution",
-             "fem_bem_boundary",
-             "fem_bem_rhs",
+             "CpuPublishedFieldBuffers",
+             "cpu_buffers.swap_with(ctx)",
+             "ctx.state.m_xyz.swap(ctx.stepper.workspace.m_candidate)",
+             "ctx.stepper.workspace.fsal_valid = false",
+             "ctx.poisson_demag.fresh_initial_guess_required = true",
+             "workspace->fresh_initial_guess_required = true",
          }) {
         check(
             transaction.find(field) != std::string::npos,
-            "RK transaction payload inventory must name every owned dynamic vector");
+            "CPU RK transaction must use generation swaps and cache invalidation");
     }
+    const auto payload_accounting_function =
+        transaction.find("uint64_t host_snapshot_payload_bytes() const");
+    const auto minimal_journal_branch = transaction.find(
+        "if (minimal_cpu_journal)", payload_accounting_function);
+    const auto zero_payload_return = transaction.find(
+        "return 0;", minimal_journal_branch);
+    check(
+        payload_accounting_function != std::string::npos &&
+            minimal_journal_branch != std::string::npos &&
+            zero_payload_return != std::string::npos &&
+            zero_payload_return - minimal_journal_branch < 128,
+        "CPU RK transaction payload accounting must report zero copied bytes");
 }
 
 void fsal_reuse_requires_matching_source_state() {
@@ -400,6 +510,10 @@ void fsal_reuse_requires_matching_source_state() {
         rk_explicit_step.find("ctx.thermal_brown.temperature > 0.0") !=
             std::string::npos,
         "CPU RK FSAL reuse gate must reject stochastic Brown thermal RHS");
+    check(
+        rk_explicit_step.find("ctx.oersted.has_stage_callback || ctx.stage_transport.has_stage_callback") !=
+            std::string::npos,
+        "CPU RK FSAL reuse gate must reject mutable stage callback sources");
     check(
         rk_explicit_step.find("ctx.oersted.time_dep_kind != 0u") ==
             std::string::npos,
@@ -461,11 +575,13 @@ void rk_rhs_passes_explicit_stage_and_endpoint_times() {
 #if FULLMAG_HAS_MFEM_STACK
 constexpr double kPi = 3.141592653589793238462643383279502884;
 
-fullmag::fem::Context make_oersted_only_rk_context(fullmag_fem_integrator integrator) {
-    fullmag::fem::Context ctx;
+void configure_oersted_only_rk_context(
+    fullmag::fem::Context &ctx,
+    fullmag_fem_integrator integrator) {
     ctx.mfem_context.ready = true;
     ctx.mesh.n_nodes = 1;
     ctx.mesh.magnetic_node_mask = {1u};
+    ctx.mesh.node_volumes = {1.0};
     ctx.state.m_xyz = {1.0, 0.2, -0.1};
     fullmag::fem::normalize_aos_field(ctx.state.m_xyz);
     ctx.state.current_time = 0.071;
@@ -489,7 +605,17 @@ fullmag::fem::Context make_oersted_only_rk_context(fullmag_fem_integrator integr
     ctx.anisotropy.h_uniaxial_xyz.assign(3u, 0.0);
     ctx.anisotropy.h_cubic_xyz.assign(3u, 0.0);
     ctx.dmi.h_interfacial_xyz.assign(3u, 0.0);
-    return ctx;
+
+    if (integrator == FULLMAG_FEM_INTEGRATOR_RK23_BS ||
+        integrator == FULLMAG_FEM_INTEGRATOR_RK45_DP54) {
+        ctx.stepper.workspace.attempt_checkpoint =
+            std::make_unique<fullmag::fem::RkAttemptCacheSnapshot>(ctx, false);
+        ctx.stepper.transaction_telemetry.attempt_cache_allocation_count += 1;
+        std::string error;
+        check(
+            ctx.stepper.workspace.attempt_checkpoint->prepare(error),
+            error.c_str());
+    }
 }
 
 struct StageOerstedCallbackProbe {
@@ -655,7 +781,8 @@ std::vector<double> stage_oersted_probe_rk_step(
 
 void cpu_stage_oersted_callback_samples_exact_stages_and_commits()
 {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK4);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK4);
     ctx.oersted.has_cylinder = false;
     ctx.oersted.h_basis_per_ampere_xyz.clear();
     StageOerstedCallbackProbe probe;
@@ -697,7 +824,8 @@ void cpu_stage_oersted_callback_samples_exact_stages_and_commits()
 
 void cpu_stage_oersted_callback_rolls_back_adaptive_retries()
 {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK23_BS);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK23_BS);
     ctx.oersted.has_cylinder = false;
     ctx.oersted.h_basis_per_ampere_xyz.clear();
     ctx.adaptive_dt.enabled = true;
@@ -720,6 +848,22 @@ void cpu_stage_oersted_callback_rolls_back_adaptive_retries()
         fullmag::fem::run_backend_step(ctx, 0.8, stats, error) == FULLMAG_FEM_OK,
         error.c_str());
     check(stats.rejected_attempts > 0u, "dynamic stage callback fixture must reject an initial attempt");
+    check(!ctx.stepper.attempt_trace.records.empty(),
+        "adaptive RK must retain an attempt record for the accepted retry");
+    const auto &accepted_attempt = ctx.stepper.attempt_trace.records.back();
+    check(accepted_attempt.error_norm_type == 2u,
+        "adaptive RK attempt receipt must identify mass-weighted RMS");
+    check(accepted_attempt.active_node_count == 1u,
+        "adaptive RK attempt receipt must publish active node count");
+    check_near(accepted_attempt.active_measure, 1.0, 0.0,
+        "adaptive RK attempt receipt must publish active FEM measure");
+    check_near(
+        accepted_attempt.normalization_denominator,
+        accepted_attempt.active_measure,
+        0.0,
+        "adaptive RK attempt receipt must publish normalization denominator");
+    check(std::isfinite(accepted_attempt.weighted_rms_error),
+        "adaptive RK attempt receipt must publish finite weighted RMS");
     check(
         probe.begin_count == stats.rejected_attempts + 1u,
         "every adaptive stage callback attempt must have a begin hook");
@@ -737,7 +881,8 @@ void cpu_stage_oersted_callback_rolls_back_adaptive_retries()
 
 void cpu_stage_oersted_callback_rolls_back_native_failure()
 {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK4);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK4);
     ctx.oersted.has_cylinder = false;
     ctx.oersted.h_basis_per_ampere_xyz.clear();
     StageOerstedCallbackProbe probe;
@@ -765,7 +910,8 @@ void cpu_stage_oersted_callback_rolls_back_native_failure()
 
 void gpu_requested_stage_oersted_callback_fails_closed()
 {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_HEUN);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_HEUN);
     ctx.oersted.has_cylinder = false;
     ctx.oersted.h_basis_per_ampere_xyz.clear();
     ctx.mfem_device.device_string_override = "cuda";
@@ -957,7 +1103,8 @@ std::vector<double> stage_transport_probe_rk_step(
 
 void cpu_stage_transport_callback_samples_exact_stages_and_commits()
 {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK4);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK4);
     ctx.oersted = {};
     StageTransportCallbackProbe probe;
     const auto callback = make_stage_transport_probe_callback(probe);
@@ -997,7 +1144,8 @@ void cpu_stage_transport_callback_samples_exact_stages_and_commits()
 
 void cpu_stage_transport_callback_rolls_back_adaptive_retries()
 {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK23_BS);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK23_BS);
     ctx.oersted = {};
     ctx.adaptive_dt.enabled = true;
     ctx.adaptive_dt.atol = 1e-10;
@@ -1039,7 +1187,8 @@ void cpu_stage_transport_callback_rolls_back_adaptive_retries()
 
 void cpu_stage_transport_callback_rolls_back_native_failure()
 {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK4);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK4);
     ctx.oersted = {};
     StageTransportCallbackProbe probe;
     const auto callback = make_stage_transport_probe_callback(probe);
@@ -1085,7 +1234,8 @@ void cpu_stage_transport_callback_rolls_back_native_failure()
 
 void gpu_requested_stage_transport_callback_fails_closed()
 {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_HEUN);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_HEUN);
     ctx.oersted = {};
     ctx.mfem_device.device_string_override = "cuda";
     StageTransportCallbackProbe probe;
@@ -1189,7 +1339,8 @@ void executed_cpu_rk_steps_sample_all_stage_times_and_publish_endpoint_field() {
              FULLMAG_FEM_INTEGRATOR_RK23_BS,
              FULLMAG_FEM_INTEGRATOR_RK45_DP54,
          }) {
-        auto ctx = make_oersted_only_rk_context(integrator);
+        fullmag::fem::Context ctx;
+        configure_oersted_only_rk_context(ctx, integrator);
         const auto &tableau = fullmag::fem::tableau_for_integrator(integrator);
         const double dt = 0.19;
         const double initial_time = ctx.state.current_time;
@@ -1221,11 +1372,45 @@ void executed_cpu_rk_steps_sample_all_stage_times_and_publish_endpoint_field() {
             integrator == FULLMAG_FEM_INTEGRATOR_RK23_BS ? 4u : 7u;
         check(stats.rhs_evaluations == expected_rhs, "CPU RK first-step RHS count");
         check(stats.fsal_reused == 0u, "CPU RK first step cannot reuse FSAL");
+        const auto &endpoint = ctx.stepper.workspace.endpoint_telemetry;
+        check(
+            endpoint.accepted_step_wall_time_ns == stats.wall_time_ns &&
+                endpoint.accepted_step_wall_time_ns > 0u,
+            "CPU RK endpoint telemetry must publish accepted-step wall time");
+        if (integrator == FULLMAG_FEM_INTEGRATOR_HEUN ||
+            integrator == FULLMAG_FEM_INTEGRATOR_RK4) {
+            check(
+                endpoint.final_refresh_reason ==
+                    fullmag::fem::RkFinalRefreshReason::NonFsalTableau,
+                "non-FSAL tableau must report its explicit endpoint refresh reason");
+            check(
+                endpoint.endpoint_refreshes == 1u &&
+                    endpoint.endpoint_cache_hits == 0u &&
+                    endpoint.final_rhs_evaluations == 1u,
+                "non-FSAL tableau must report one endpoint refresh and RHS evaluation");
+        } else {
+            check(
+                endpoint.final_refresh_reason ==
+                    fullmag::fem::RkFinalRefreshReason::CacheHit,
+                "FSAL tableau must report an accepted endpoint cache hit");
+            check(
+                endpoint.endpoint_refreshes == 0u &&
+                    endpoint.endpoint_cache_hits == 1u &&
+                    endpoint.final_rhs_evaluations == 0u &&
+                    endpoint.extra_poisson_solves == 0u,
+                "FSAL tableau must avoid an extra endpoint RHS/Poisson solve");
+            check(
+                endpoint.cache_validity.state && endpoint.cache_validity.time &&
+                    endpoint.cache_validity.dynamic_sources &&
+                    endpoint.cache_validity.transport && endpoint.cache_validity.projection,
+                "FSAL endpoint cache must satisfy every validity dimension");
+        }
     }
 }
 
 void deterministic_oersted_fsal_requires_an_identical_next_source_state() {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK23_BS);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK23_BS);
     const auto &tableau = fullmag::fem::tableau_for_integrator(
         FULLMAG_FEM_INTEGRATOR_RK23_BS);
     const double dt = 0.11;
@@ -1242,6 +1427,11 @@ void deterministic_oersted_fsal_requires_an_identical_next_source_state() {
         fullmag::fem::context_step_explicit_rk_mfem(ctx, tableau, dt, stats, error),
         error.c_str());
     check(stats.fsal_reused == 1u, "deterministic Oersted endpoint may be reused by FSAL");
+    check(
+        ctx.stepper.workspace.endpoint_telemetry.final_refresh_reason ==
+            fullmag::fem::RkFinalRefreshReason::CacheHit &&
+            ctx.stepper.workspace.endpoint_telemetry.final_rhs_evaluations == 0u,
+        "deterministic Oersted FSAL step must retain its endpoint cache");
     check_vector_near(ctx.state.m_xyz, expected_second, 2e-13, "FSAL Oersted second step");
 
     std::vector<double> uploaded = ctx.state.m_xyz;
@@ -1257,8 +1447,82 @@ void deterministic_oersted_fsal_requires_an_identical_next_source_state() {
     check(stats.fsal_reused == 0u, "source-state mismatch must not report FSAL reuse");
 }
 
+void brown_thermal_final_rhs_uses_last_stage_without_fsal() {
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK23_BS);
+    ctx.mesh.node_volumes = {1.0e-27};
+    ctx.material_fields.material.saturation_magnetisation = 800e3;
+    ctx.thermal_brown.temperature = 300.0;
+    ctx.thermal_brown.seed = 1234u;
+    fullmag::fem::initialize_thermal_brown_field(ctx);
+
+    const auto &tableau = fullmag::fem::tableau_for_integrator(
+        FULLMAG_FEM_INTEGRATOR_RK23_BS);
+    fullmag_fem_step_stats stats{};
+    std::string error;
+    check(
+        fullmag::fem::context_step_explicit_rk_mfem(ctx, tableau, 0.11, stats, error),
+        error.c_str());
+
+    check(stats.fsal_reused == 0u, "Brown thermal RHS must not reuse FSAL");
+    const double first_stage_rhs = fullmag::fem::max_norm_aos(ctx.stepper.workspace.k[0]);
+    const double last_stage_rhs = fullmag::fem::max_norm_aos(
+        ctx.stepper.workspace.k[tableau.stages - 1]);
+    check(
+        std::fabs(first_stage_rhs - last_stage_rhs) > 1e-12,
+        "Brown thermal fixture must distinguish first and last stage RHS");
+    check_near(
+        stats.max_rhs_amplitude,
+        last_stage_rhs,
+        std::max(1.0, last_stage_rhs) * 1e-14,
+        "Brown thermal final stats must use the last stage RHS without FSAL");
+    check(
+        ctx.stepper.workspace.endpoint_telemetry.final_refresh_reason ==
+            fullmag::fem::RkFinalRefreshReason::CacheHit &&
+            ctx.stepper.workspace.endpoint_telemetry.final_rhs_evaluations == 0u &&
+            ctx.stepper.workspace.endpoint_telemetry.cache_validity.dynamic_sources,
+        "Brown thermal endpoint cache may serve the current interval but not next-step FSAL");
+}
+
+void cpu_fsal_endpoint_cache_requires_matching_candidate_state() {
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK23_BS);
+    ctx.oersted.has_cylinder = false;
+    ctx.oersted.h_basis_per_ampere_xyz.clear();
+    StageOerstedCallbackProbe probe;
+    const auto callback = make_stage_oersted_probe_callback(probe);
+    std::string error;
+    check(
+        fullmag::fem::configure_oersted_stage_callback(ctx, &callback, error),
+        error.c_str());
+
+    auto injected = fullmag::fem::tableau_for_integrator(
+        FULLMAG_FEM_INTEGRATOR_RK23_BS);
+    injected.b_hi[0] += 0.5;
+    fullmag_fem_step_stats stats{};
+    check(
+        fullmag::fem::context_step_explicit_rk_mfem(ctx, injected, 0.19, stats, error),
+        error.c_str());
+
+    check(stats.fsal_reused == 0u, "mismatched endpoint state must not report FSAL reuse");
+    check(!ctx.stepper.workspace.fsal_valid, "mismatched endpoint state must invalidate FSAL");
+    check(
+        ctx.stepper.workspace.endpoint_telemetry.final_refresh_reason ==
+            fullmag::fem::RkFinalRefreshReason::CandidateStateMismatch &&
+            ctx.stepper.workspace.endpoint_telemetry.endpoint_refreshes == 1u &&
+            ctx.stepper.workspace.endpoint_telemetry.final_rhs_evaluations == 1u,
+        "mismatched endpoint must report one explicit refresh and final RHS evaluation");
+    check(
+        probe.evaluation_times.size() == static_cast<size_t>(injected.stages + 1),
+        "mismatched endpoint state must trigger one endpoint field refresh");
+    check(
+        (probe.stage_identities.back() & 0xffffu) == 0xffffu,
+        "mismatched endpoint refresh must use the reserved endpoint identity");
+}
+
 void gpu_requested_oersted_only_step_rejects_host_rk_fallback() {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_HEUN);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_HEUN);
     ctx.mfem_device.device_string_override = "cuda";
     const auto &tableau = fullmag::fem::tableau_for_integrator(
         FULLMAG_FEM_INTEGRATOR_HEUN);
@@ -1275,8 +1539,36 @@ void gpu_requested_oersted_only_step_rejects_host_rk_fallback() {
         "GPU-requested Oersted-only step must report the disabled GPU plan prerequisite");
 }
 
+void adaptive_cpu_rk_requires_preallocated_attempt_checkpoint() {
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK23_BS);
+    ctx.adaptive_dt.enabled = true;
+    ctx.adaptive_dt.atol = 1e-8;
+    ctx.adaptive_dt.rtol = 1e-8;
+    ctx.adaptive_dt.dt_min = 1e-9;
+    ctx.adaptive_dt.dt_max = 1.0;
+    ctx.stepper.workspace.attempt_checkpoint.reset();
+    const auto &tableau = fullmag::fem::tableau_for_integrator(
+        FULLMAG_FEM_INTEGRATOR_RK23_BS);
+    fullmag_fem_step_stats stats{};
+    std::string error;
+
+    const bool step_ok = fullmag::fem::context_step_explicit_rk_mfem(
+        ctx, tableau, 0.05, stats, error);
+
+    check(!step_ok, "adaptive CPU RK must fail without its setup-owned attempt checkpoint");
+    check(
+        error.find("attempt checkpoint was not prepared during Context setup") !=
+            std::string::npos,
+        "missing adaptive RK checkpoint must report a setup-contract error");
+    check(
+        ctx.stepper.workspace.attempt_checkpoint == nullptr,
+        "adaptive RK hot path must not allocate a missing attempt checkpoint");
+}
+
 void rejected_cpu_retry_rolls_back_and_reports_only_accepted_attempt_fsal() {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK23_BS);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK23_BS);
     set_step_profile(ctx, true);
     const auto &tableau = fullmag::fem::tableau_for_integrator(
         FULLMAG_FEM_INTEGRATOR_RK23_BS);
@@ -1309,6 +1601,8 @@ void rejected_cpu_retry_rolls_back_and_reports_only_accepted_attempt_fsal() {
     const std::vector<double> m_before = ctx.state.m_xyz;
     const double time_before = ctx.state.current_time;
     const uint64_t step_before = ctx.state.step_count;
+    auto *const attempt_checkpoint_before =
+        ctx.stepper.workspace.attempt_checkpoint.get();
     ctx.stepper.transaction_telemetry = {};
     check(
         fullmag::fem::context_step_explicit_rk_mfem(
@@ -1328,11 +1622,17 @@ void rejected_cpu_retry_rolls_back_and_reports_only_accepted_attempt_fsal() {
             stats.rejected_attempts,
         "adaptive CPU RK must restore one cache snapshot per rejected attempt");
     check(
-        ctx.stepper.transaction_telemetry.attempt_cache_snapshot_payload_bytes > 0u,
-        "adaptive CPU RK must report cache snapshot payload bytes");
+        ctx.stepper.transaction_telemetry.attempt_cache_snapshot_payload_bytes == 0u,
+        "adaptive CPU RK cache capture must copy zero payload bytes");
     check(
-        ctx.stepper.transaction_telemetry.attempt_cache_restore_payload_bytes > 0u,
-        "adaptive CPU RK retries must report restored cache payload bytes");
+        ctx.stepper.transaction_telemetry.attempt_cache_restore_payload_bytes == 0u,
+        "adaptive CPU RK cache restore must copy zero payload bytes");
+    check(
+        ctx.stepper.workspace.attempt_checkpoint.get() == attempt_checkpoint_before,
+        "adaptive CPU RK retries must reuse the setup-owned checkpoint instance");
+    check(
+        ctx.stepper.transaction_telemetry.attempt_cache_allocation_count == 0u,
+        "adaptive CPU RK retries must allocate zero attempt checkpoints");
     for (size_t attempt = 0; attempt < ctx.stepper.attempt_trace.records.size(); ++attempt) {
         const auto &record = ctx.stepper.attempt_trace.records[attempt];
         check(record.attempt == attempt, "adaptive CPU RK trace attempt indices must be contiguous");
@@ -1396,7 +1696,8 @@ void cpu_rk_guard_failures_preserve_committed_state() {
     };
 
     for (bool rotation_guard : {false, true}) {
-        auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK23_BS);
+        fullmag::fem::Context ctx;
+        configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK23_BS);
         const auto &tableau = fullmag::fem::tableau_for_integrator(
             FULLMAG_FEM_INTEGRATOR_RK23_BS);
         ctx.adaptive_dt.enabled = true;
@@ -1432,7 +1733,8 @@ void cpu_rk_guard_failures_preserve_committed_state() {
 
     const auto &rk4 = fullmag::fem::tableau_for_integrator(FULLMAG_FEM_INTEGRATOR_RK4);
     for (int invalid_stage = 1; invalid_stage < rk4.stages; ++invalid_stage) {
-        auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK4);
+        fullmag::fem::Context ctx;
+        configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK4);
         auto injected = rk4;
         injected.a[invalid_stage][0] = std::numeric_limits<double>::infinity();
         const auto m_before = ctx.state.m_xyz;
@@ -1448,7 +1750,9 @@ void cpu_rk_guard_failures_preserve_committed_state() {
             ctx, m_before, time_before, step_before, "intermediate-stage rollback");
     }
 
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK4);
+    fullmag::fem::Context ctx;
+
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK4);
     auto injected = rk4;
     injected.b_hi[0] = std::numeric_limits<double>::quiet_NaN();
     const auto m_before = ctx.state.m_xyz;
@@ -1551,9 +1855,7 @@ void assert_published_rk_state_equal(
             before.stage_transport.stage_attempt_active,
         label);
     check_vector_near(ctx.thermal_brown.h_xyz, before.thermal.h_xyz, 0.0, label);
-    check(ctx.stepper.workspace.fsal_valid == before.fsal_valid, label);
-    check_vector_near(ctx.stepper.workspace.k[0], before.fsal_k0, 0.0, label);
-    check(ctx.poisson_demag.solves_current_step == before.demag_solves_current_step, label);
+    check(!ctx.stepper.workspace.fsal_valid, label);
     check(
         ctx.transfer_audit.audit.counters.h2d_bytes ==
             before.transfer_host_to_device,
@@ -1570,7 +1872,8 @@ void cpu_rk_failure_injection_rolls_back_complete_published_state() {
              fullmag::fem::RkStepFailurePoint::DuringFinalFieldRefresh,
              fullmag::fem::RkStepFailurePoint::DuringFinalStatistics,
          }) {
-        auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK45_DP54);
+        fullmag::fem::Context ctx;
+        configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK45_DP54);
         set_step_profile(ctx, true);
         fullmag::fem::stepper_workspace_allocate(ctx.stepper.workspace, 3u, 7);
         ctx.stepper.workspace.fsal_valid = true;
@@ -1587,6 +1890,7 @@ void cpu_rk_failure_injection_rolls_back_complete_published_state() {
         ctx.poisson_demag.solves_current_step = 13;
         ctx.transfer_audit.audit.counters.h2d_bytes = 17;
         ctx.transfer_audit.audit.counters.d2h_bytes = 19;
+        fullmag::fem::rk_step_transaction_prepare_workspace(ctx);
         const auto before = capture_published_rk_state(ctx);
         ctx.stepper.failure_injection.next = failpoint;
 
@@ -1607,12 +1911,16 @@ void cpu_rk_failure_injection_rolls_back_complete_published_state() {
               "failed RK step must report one transaction rollback");
         check(stats.rk_transaction_rollback_count == 1u,
               "public failed RK stats must include the transaction rollback");
-        check(telemetry.step_transaction_host_snapshot_payload_bytes > 0u,
-              "failed RK step must report host snapshot payload bytes");
+        check(stats.rk_transaction_cpu_snapshot_allocation_count == 0u,
+              "public failed RK stats must report zero CPU snapshot allocations");
+        check(stats.rk_transaction_peak_rss_bytes > 0u,
+              "public failed RK stats must include peak RSS");
+        check(telemetry.step_transaction_host_snapshot_payload_bytes == 0u,
+              "failed CPU RK step must copy zero host snapshot payload bytes");
         check(
             telemetry.step_transaction_host_restore_payload_bytes ==
                 telemetry.step_transaction_host_snapshot_payload_bytes,
-            "outer RK rollback must report the restored host snapshot payload");
+            "CPU RK rollback must restore through swaps without copied payload");
         check(telemetry.step_transaction_device_snapshot_payload_bytes == 0u,
               "CPU RK transaction must not report a device snapshot payload");
         check(telemetry.step_transaction_device_restore_payload_bytes == 0u,
@@ -1621,7 +1929,8 @@ void cpu_rk_failure_injection_rolls_back_complete_published_state() {
 }
 
 void cpu_sot_pulse_failure_rollback_preserves_event_knot() {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_HEUN);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_HEUN);
     ctx.oersted = {};
     ctx.state.current_time = 0.0;
     ctx.state.step_count = 0;
@@ -1702,7 +2011,8 @@ void cpu_sot_pulse_failure_rollback_preserves_event_knot() {
 }
 
 void cpu_sot_pulse_energy_rejection_rolls_back_at_event_knot() {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_HEUN);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_HEUN);
     ctx.oersted = {};
     ctx.state.current_time = 1.0e-9;
     ctx.state.step_count = 0;
@@ -1759,10 +2069,12 @@ void cpu_sot_pulse_energy_rejection_rolls_back_at_event_knot() {
 }
 
 void cpu_rk_success_commits_state_and_completion_once() {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK45_DP54);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK45_DP54);
     set_step_profile(ctx, true);
     ctx.stage_completion.relax_stop.has_max_steps = 1;
     ctx.stage_completion.relax_stop.max_steps = 100;
+    fullmag::fem::rk_step_transaction_prepare_workspace(ctx);
     const uint64_t step_before = ctx.state.step_count;
     const double time_before = ctx.state.current_time;
     const uint32_t completion_samples_before = ctx.stage_completion.relax_energy_window_count;
@@ -1788,10 +2100,18 @@ void cpu_rk_success_commits_state_and_completion_once() {
           "public successful RK stats must include the committed transaction");
     check(stats.rk_transaction_rollback_count == 0u,
           "public successful RK stats must include zero transaction rollbacks");
-    check(telemetry.step_transaction_host_snapshot_payload_bytes > 0u,
-          "successful RK step must report host snapshot payload bytes");
+    check(stats.rk_transaction_cpu_snapshot_allocation_count == 0u,
+          "public successful RK stats must report zero CPU snapshot allocations");
+    check(stats.rk_transaction_peak_rss_bytes > 0u,
+          "public successful RK stats must include peak RSS");
+    check(telemetry.step_transaction_host_snapshot_payload_bytes == 0u,
+          "successful CPU RK step must copy zero host snapshot payload bytes");
     check(telemetry.step_transaction_host_restore_payload_bytes == 0u,
           "successful RK step must not report restored host payload bytes");
+    check(telemetry.step_transaction_cpu_snapshot_allocation_count == 0u,
+          "prepared successful CPU RK step must allocate zero snapshot buffers");
+    check(telemetry.step_transaction_peak_rss_bytes > 0u,
+          "profiled successful CPU RK step must publish peak RSS");
     check(
         telemetry.step_transaction_host_capture_wall_time_ns <=
             telemetry.step_transaction_begin_wall_time_ns,
@@ -1799,7 +2119,8 @@ void cpu_rk_success_commits_state_and_completion_once() {
 }
 
 void profiler_off_does_not_collect_rk_transaction_telemetry() {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK45_DP54);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK45_DP54);
     set_step_profile(ctx, false);
     fullmag_fem_step_stats stats{};
     std::string error;
@@ -1820,7 +2141,8 @@ void profiler_off_does_not_collect_rk_transaction_telemetry() {
 }
 
 void cpu_relaxation_energy_rejection_rolls_back_until_stagnation() {
-    auto ctx = make_oersted_only_rk_context(FULLMAG_FEM_INTEGRATOR_RK45_DP54);
+    fullmag::fem::Context ctx;
+    configure_oersted_only_rk_context(ctx, FULLMAG_FEM_INTEGRATOR_RK45_DP54);
     ctx.stage_completion.relax_stop.has_torque_tolerance_apm = 1;
     ctx.stage_completion.relax_stop.torque_tolerance_apm = 1.0e-30;
     ctx.stage_completion.relax_previous_total_energy_valid = true;
@@ -1947,7 +2269,9 @@ int main() {
     workspace_reallocates_when_stage_count_grows();
     workspace_invalidates_fsal_when_stage_count_shrinks();
     workspace_allocates_common_buffers();
-    rk_transaction_payload_inventory_covers_owned_vectors();
+    endpoint_cache_telemetry_has_explicit_validity_dimensions();
+    endpoint_cache_telemetry_has_public_versioned_abi();
+    rk_transaction_uses_cpu_buffer_generations_without_payload_copies();
     fsal_reuse_requires_matching_source_state();
     rk_rhs_passes_explicit_stage_and_endpoint_times();
     gpu_rk_call_path_uses_each_tableau_time_and_invalidates_rejected_fsal();
@@ -1955,6 +2279,8 @@ int main() {
 #if FULLMAG_HAS_MFEM_STACK
     executed_cpu_rk_steps_sample_all_stage_times_and_publish_endpoint_field();
     deterministic_oersted_fsal_requires_an_identical_next_source_state();
+    brown_thermal_final_rhs_uses_last_stage_without_fsal();
+    cpu_fsal_endpoint_cache_requires_matching_candidate_state();
     cpu_stage_oersted_callback_samples_exact_stages_and_commits();
     cpu_stage_oersted_callback_rolls_back_adaptive_retries();
     cpu_stage_oersted_callback_rolls_back_native_failure();
@@ -1964,6 +2290,7 @@ int main() {
     cpu_stage_transport_callback_rolls_back_native_failure();
     gpu_requested_stage_transport_callback_fails_closed();
     gpu_requested_oersted_only_step_rejects_host_rk_fallback();
+    adaptive_cpu_rk_requires_preallocated_attempt_checkpoint();
     rejected_cpu_retry_rolls_back_and_reports_only_accepted_attempt_fsal();
     cpu_rk_guard_failures_preserve_committed_state();
     cpu_rk_failure_injection_rolls_back_complete_published_state();

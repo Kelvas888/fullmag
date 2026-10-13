@@ -13,6 +13,7 @@ import type { FieldCatalogResource, FieldVectorResponseMetadata } from "@/kernel
 import type { DecodedFieldVector } from "@/kernel/api/codecs";
 import { ResourceCache } from "@/kernel/resources/ResourceCache";
 import { ResourceInvalidationController } from "@/kernel/resources/ResourceInvalidationController";
+import { ResourceRuntimeStore } from "@/kernel/resources/ResourceRuntimeStore";
 
 import {
   cachedBinaryResourceMatchesRevision,
@@ -36,10 +37,14 @@ import {
   resolveViewport3DQuantityFieldVectorResourceRequests,
   resolveViewport3DQuantityFieldVectorResourceKeys,
   synchronizeViewport3DSessionIdentity,
+  validateViewport3DObservationFrameMagnetization,
+  resolveViewport3DFieldVectorIdentityMatch,
   viewport3DFieldVectorMatchesRequestIdentity,
   viewport3DFieldMetaResourceMatchesQuantity,
+  VIEWPORT_3D_TOPOLOGY_RETRY_POLICY,
   type Viewport3DFieldVectorEnvelope,
 } from "./viewport3dResources";
+import { Viewport3DResourceTracker } from "./viewport3dDiagnostics";
 
 const viewport3dResourcesSourceUrl = new URL(
   "./viewport3dResources.ts",
@@ -56,6 +61,10 @@ const airboxFieldCatalog = {
   ],
   revision: 3,
 } as FieldCatalogResource;
+
+function fieldVectorResourceKey(query: string): string {
+  return `${DATA_FIELD_VECTOR_PATH.replace("{quantity_id}", "m")}?${query}`;
+}
 
 function fieldResponseMetadata(
   overrides: Partial<FieldVectorResponseMetadata> = {},
@@ -81,6 +90,84 @@ function fieldResponseMetadata(
 }
 
 describe("viewport3dResources", () => {
+  it("uses the bounded topology policy only for the chunked topology hook", () => {
+    const source = readFileSync(viewport3dResourcesSourceUrl, "utf8");
+    const hookStart = source.indexOf("export function useViewport3DDomainTopology");
+    const hookEnd = source.indexOf("export function useViewport3DAnalysisFieldVector", hookStart);
+    const hookSource = source.slice(hookStart, hookEnd);
+
+    expect(hookSource).toContain(
+      "retryPolicy: VIEWPORT_3D_TOPOLOGY_RETRY_POLICY",
+    );
+    expect(source).toContain("deadlineMs: 15_000");
+    expect(source).toContain("The live 1.4 MiB");
+  });
+
+  it("keeps the measured sequential topology read alive beyond the generic deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = new ResourceRuntimeStore<string>();
+      let release!: (value: string) => void;
+      let requestSignal!: AbortSignal;
+      const load = vi.fn(({ signal }: { signal: AbortSignal }) => {
+        requestSignal = signal;
+        return new Promise<string>((resolve) => {
+          release = resolve;
+        });
+      });
+
+      const result = store.ensureLoad({
+        externalRevision: null,
+        load,
+        resourceKey: "data/domain/topology",
+        retryPolicy: VIEWPORT_3D_TOPOLOGY_RETRY_POLICY,
+      });
+
+      await vi.advanceTimersByTimeAsync(5_001);
+      expect(requestSignal.aborted).toBe(false);
+      expect(VIEWPORT_3D_TOPOLOGY_RETRY_POLICY.deadlineMs).toBe(15_000);
+
+      release("decoded topology");
+      await expect(result).resolves.toMatchObject({
+        data: "decoded topology",
+        status: "ready",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("accepts only magnetization payloads from the exact observation frame", () => {
+    const field: DecodedFieldVector = {
+      dtype: "float64",
+      grid: [1, 1, 1],
+      nComp: 3,
+      pointCount: 1,
+      quantityId: "m",
+      sourceId: "frame-7",
+      sourceKind: "observation_frame",
+      sourceRevision: "accepted-12",
+      valueCount: 3,
+      values: new Float64Array([1, 0, 0]),
+    };
+
+    expect(() =>
+      validateViewport3DObservationFrameMagnetization(field, "frame-7"),
+    ).not.toThrow();
+    expect(() =>
+      validateViewport3DObservationFrameMagnetization(
+        { ...field, sourceId: "frame-8" },
+        "frame-7",
+      ),
+    ).toThrow(/returned field source frame-8/);
+    expect(() =>
+      validateViewport3DObservationFrameMagnetization(
+        { ...field, sourceKind: "live" },
+        "frame-7",
+      ),
+    ).toThrow(/returned field source kind live/);
+  });
+
   it("purges session caches and stale inflight work synchronously before resource reads", () => {
     const source = readFileSync(viewport3dResourcesSourceUrl, "utf8");
     const hookStart = source.indexOf("function useViewport3DSessionIdentity()");
@@ -101,6 +188,7 @@ describe("viewport3dResources", () => {
     const adopted = vi.fn();
     synchronizeViewport3DSessionIdentity({
       sessionEpoch: "session-old@1000",
+      requestScopeEpoch: "test-api:1",
       sessionId: "session-old",
     });
 
@@ -132,6 +220,7 @@ describe("viewport3dResources", () => {
 
     synchronizeViewport3DSessionIdentity({
       sessionEpoch: "session-new@2000",
+      requestScopeEpoch: "test-api:2",
       sessionId: "session-new",
     });
 
@@ -139,6 +228,15 @@ describe("viewport3dResources", () => {
     expect(decoded).not.toHaveBeenCalled();
     expect(adopted).not.toHaveBeenCalled();
     expect(cache.stats()).toEqual({ byteLength: 0, entryCount: 0 });
+  });
+
+  it("advances the viewport generation for a reopened session with unchanged scientific epoch", () => {
+    const identity = {
+      sessionEpoch: "session-1@1000", sessionId: "session-1", requestScopeEpoch: "api:1",
+    };
+    synchronizeViewport3DSessionIdentity(identity);
+    expect(synchronizeViewport3DSessionIdentity({ ...identity, requestScopeEpoch: "api:2" }))
+      .toBe(true);
   });
 
   it("rejects a late old-session completion even when the transport ignores abort", async () => {
@@ -152,6 +250,7 @@ describe("viewport3dResources", () => {
     const adopted = vi.fn();
     synchronizeViewport3DSessionIdentity({
       sessionEpoch: "session-old@1000",
+      requestScopeEpoch: "test-api:1",
       sessionId: "session-old",
     });
     const pending = loadCachedBinaryResource(
@@ -166,6 +265,7 @@ describe("viewport3dResources", () => {
 
     synchronizeViewport3DSessionIdentity({
       sessionEpoch: "session-new@2000",
+      requestScopeEpoch: "test-api:2",
       sessionId: "session-new",
     });
     resolveResponse({
@@ -585,6 +685,305 @@ describe("viewport3dResources", () => {
     );
   });
 
+  it("discriminates identity mismatch reason for snapshot_id, stage_id, phase_rad, and view (LR-04)", () => {
+    const baseEnvelope: Viewport3DFieldVectorEnvelope = {
+      data: {
+        dtype: "float64",
+        formatVersion: 3,
+        domainGenerationId: "gen-1",
+        grid: [1, 1, 1],
+        indexing: "full_domain",
+        meshTopologyHash: "top-1",
+        nComp: 3,
+        pointCount: 1,
+        quantityId: "m",
+        scopeId: "part-1",
+        scopeKind: "part",
+        valueCount: 3,
+        values: new Float64Array([1, 0, 0]),
+      },
+      etag: '"m-1"',
+      resourceKey:
+        fieldVectorResourceKey("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1&stage_id=stage-1&phase_rad=0&view=slice-x"),
+      responseMetadata: fieldResponseMetadata({
+        component: "full",
+        domainGenerationId: "gen-1",
+        meshTopologyHash: "top-1",
+        phaseRad: 0,
+        quantityId: "m",
+        snapshotId: "snap-1",
+        stageId: "stage-1",
+        view: "slice-x",
+      }),
+    };
+
+    const baseRequest = {
+      quantityId: "m",
+      query: {
+        component: "full",
+        expected_carrier_revision: "top-1",
+        expected_generation_id: "gen-1",
+        phase_rad: 0,
+        scope_id: "part-1",
+        scope_kind: "part",
+        snapshot_id: "snap-1",
+        stage_id: "stage-1",
+        view: "slice-x",
+      },
+    };
+
+    expect(
+      resolveViewport3DFieldVectorIdentityMatch(baseEnvelope, baseRequest),
+    ).toEqual({
+      matches: true,
+    });
+
+    expect(
+      resolveViewport3DFieldVectorIdentityMatch(baseEnvelope, {
+        ...baseRequest,
+        query: { ...baseRequest.query, snapshot_id: "snap-2" },
+      }),
+    ).toEqual({ matches: false, reason: "snapshot" });
+
+    expect(
+      resolveViewport3DFieldVectorIdentityMatch(baseEnvelope, {
+        ...baseRequest,
+        query: { ...baseRequest.query, stage_id: "stage-2" },
+      }),
+    ).toEqual({ matches: false, reason: "stage" });
+
+    expect(
+      resolveViewport3DFieldVectorIdentityMatch(baseEnvelope, {
+        ...baseRequest,
+        query: { ...baseRequest.query, phase_rad: Math.PI / 2 },
+      }),
+    ).toEqual({ matches: false, reason: "phase" });
+
+    expect(
+      resolveViewport3DFieldVectorIdentityMatch(baseEnvelope, {
+        ...baseRequest,
+        query: { ...baseRequest.query, view: "slice-z" },
+      }),
+    ).toEqual({ matches: false, reason: "view" });
+
+    expect(
+      resolveViewport3DFieldVectorIdentityMatch(baseEnvelope, {
+        ...baseRequest,
+        query: { ...baseRequest.query, max_samples: 128 },
+      }),
+    ).toEqual({ matches: true });
+
+    expect(
+      resolveViewport3DFieldVectorIdentityMatch(baseEnvelope, {
+        ...baseRequest,
+        query: {
+          ...baseRequest.query,
+          snapshot_id: 1 as unknown as string,
+          stage_id: 1 as unknown as string,
+          view: "slice-x",
+        },
+      }),
+    ).toEqual({ matches: false, reason: "snapshot" });
+
+    const numericEnvelope: Viewport3DFieldVectorEnvelope = {
+      ...baseEnvelope,
+      resourceKey:
+        fieldVectorResourceKey("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=1&stage_id=2&phase_rad=0&view=1"),
+      responseMetadata: fieldResponseMetadata({
+        ...baseEnvelope.responseMetadata,
+        snapshotId: "1",
+        stageId: "2",
+        view: "1",
+      }),
+    };
+    expect(
+      resolveViewport3DFieldVectorIdentityMatch(numericEnvelope, {
+        ...baseRequest,
+        query: {
+          ...baseRequest.query,
+          phase_rad: "0" as unknown as number,
+          snapshot_id: 1 as unknown as string,
+          stage_id: 2 as unknown as string,
+          view: 1 as unknown as string,
+        },
+      }),
+    ).toEqual({ matches: true });
+
+    expect(
+      resolveViewport3DFieldVectorIdentityMatch(baseEnvelope, {
+        ...baseRequest,
+        query: {
+          ...baseRequest.query,
+          snapshot_id: "   ",
+        },
+      }),
+    ).toEqual({ matches: false, reason: "snapshot" });
+  });
+
+  it("requires an exact committed artifact-generation response header when requested", () => {
+    const envelope: Viewport3DFieldVectorEnvelope = {
+      data: {
+        dtype: "float64",
+        formatVersion: 3,
+        domainGenerationId: "gen-1",
+        grid: [1, 1, 1],
+        indexing: "full_domain",
+        meshTopologyHash: "top-1",
+        nComp: 3,
+        pointCount: 1,
+        quantityId: "m",
+        scopeId: null,
+        scopeKind: "full",
+        valueCount: 3,
+        values: new Float64Array([1, 0, 0]),
+      },
+      etag: '"field-1"',
+      resourceKey: fieldVectorResourceKey("component=full"),
+      responseMetadata: fieldResponseMetadata({
+        artifactGenerationId: "publication-14",
+        domainGenerationId: "gen-1",
+        meshTopologyHash: "top-1",
+        quantityId: "m",
+        scopeId: null,
+        scopeKind: "full",
+      }),
+    };
+    const request = {
+      quantityId: "m",
+      query: { expected_artifact_generation_id: "publication-14" },
+    };
+
+    expect(resolveViewport3DFieldVectorIdentityMatch(envelope, request)).toEqual({
+      matches: true,
+    });
+    expect(
+      resolveViewport3DFieldVectorIdentityMatch(envelope, {
+        ...request,
+        query: { expected_artifact_generation_id: "publication-stale" },
+      }),
+    ).toEqual({ matches: false, reason: "artifact_generation" });
+    expect(
+      resolveViewport3DFieldVectorIdentityMatch(
+        {
+          ...envelope,
+          responseMetadata: fieldResponseMetadata({
+            domainGenerationId: "gen-1",
+            meshTopologyHash: "top-1",
+            quantityId: "m",
+            scopeId: null,
+            scopeKind: "full",
+          }),
+        },
+        request,
+      ),
+    ).toEqual({ matches: false, reason: "artifact_generation" });
+  });
+
+  it("retains last good frame with retained: true across mismatched ready response (LR-03)", () => {
+    const tracker = new Viewport3DResourceTracker();
+    const frameA: Viewport3DFieldVectorEnvelope = {
+      data: {
+        dtype: "float64",
+        formatVersion: 3,
+        domainGenerationId: "gen-1",
+        grid: [1, 1, 1],
+        indexing: "full_domain",
+        meshTopologyHash: "top-1",
+        nComp: 3,
+        pointCount: 1,
+        quantityId: "m",
+        scopeId: "part-1",
+        scopeKind: "part",
+        valueCount: 3,
+        values: new Float64Array([1, 0, 0]),
+      },
+      etag: '"m-frame-a"',
+      resourceKey:
+        fieldVectorResourceKey("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1"),
+      responseMetadata: fieldResponseMetadata({
+        component: "full",
+        domainGenerationId: "gen-1",
+        meshTopologyHash: "top-1",
+        quantityId: "m",
+      }),
+    };
+
+    const frameB_MismatchedQuantity: Viewport3DFieldVectorEnvelope = {
+      ...frameA,
+      data: {
+        ...frameA.data,
+        quantityId: "H_demag",
+      },
+      etag: '"m-frame-b"',
+      responseMetadata: fieldResponseMetadata({
+        component: "full",
+        domainGenerationId: "gen-1",
+        meshTopologyHash: "top-1",
+        quantityId: "H_demag",
+      }),
+    };
+
+    const frameC: Viewport3DFieldVectorEnvelope = {
+      ...frameA,
+      etag: '"m-frame-c"',
+    };
+
+    const request = {
+      quantityId: "m",
+      query: {
+        component: "full",
+        expected_carrier_revision: "top-1",
+        expected_generation_id: "gen-1",
+        scope_id: "part-1",
+        scope_kind: "part",
+      },
+    };
+    const requests = new Map([["target-1", request]]);
+
+    const stepA = resolveViewport3DFieldVectorCollectionLastGood({
+      current: new Map([["target-1", frameA]]),
+      previous: new Map(),
+      requests,
+      status: "ready",
+      tracker,
+    });
+    expect(stepA.get("target-1")).toEqual({ ...frameA, retained: false });
+
+    const stepB = resolveViewport3DFieldVectorCollectionLastGood({
+      current: new Map([["target-1", frameB_MismatchedQuantity]]),
+      previous: stepA,
+      requests,
+      status: "ready",
+      tracker,
+    });
+    expect(stepB.get("target-1")).toEqual({ ...frameA, retained: true });
+
+    const stepC = resolveViewport3DFieldVectorCollectionLastGood({
+      current: new Map([["target-1", frameC]]),
+      previous: stepB,
+      requests,
+      status: "ready",
+      tracker,
+    });
+    expect(stepC.get("target-1")).toEqual({ ...frameC, retained: false });
+
+    const requestNewGeneration = {
+      ...request,
+      query: { ...request.query, expected_generation_id: "gen-2" },
+    };
+    const stepB_GenMismatch = resolveViewport3DFieldVectorCollectionLastGood({
+      current: new Map([["target-1", frameB_MismatchedQuantity]]),
+      previous: stepA,
+      requests: new Map([["target-1", requestNewGeneration]]),
+      status: "ready",
+      tracker,
+    });
+    expect(stepB_GenMismatch.size).toBe(0);
+    expect(tracker.getRetentionRejectionCounts()).toEqual({
+      generation: 1,
+    });
+  });
+
   it("loads collection members independently instead of atomically awaiting Promise.all", () => {
     const source = readFileSync(viewport3dResourcesSourceUrl, "utf8");
     const quantityCollectionSource = source.slice(
@@ -606,6 +1005,26 @@ describe("viewport3dResources", () => {
     expect(quantityCollectionSource).toContain("loadViewport3DFieldRequestsBounded(");
     expect(partCollectionSource).toContain("loadViewport3DFieldRequestsBounded(");
     expect(airboxCollectionSource).toContain("loadViewport3DFieldRequestsBounded(");
+  });
+
+  it("threads options.tracker to resolveViewport3DFieldVectorCollectionLastGood in collection hooks (LR-14)", () => {
+    const source = readFileSync(viewport3dResourcesSourceUrl, "utf8");
+    const quantityCollectionSource = source.slice(
+      source.indexOf("export function useViewport3DQuantityFieldVectors"),
+      source.indexOf("export function useViewport3DPartFieldVectors"),
+    );
+    const partCollectionSource = source.slice(
+      source.indexOf("export function useViewport3DPartFieldVectors"),
+      source.indexOf("export function useViewport3DMeshQualityData"),
+    );
+    const airboxCollectionSource = source.slice(
+      source.indexOf("export function useViewport3DAirboxFieldVectors"),
+      source.indexOf("function isViewport3DAirboxFieldVectorRequestMap"),
+    );
+
+    expect(quantityCollectionSource).toContain("tracker: options.tracker");
+    expect(partCollectionSource).toContain("tracker: options.tracker");
+    expect(airboxCollectionSource).toContain("tracker: options.tracker");
   });
 
   it("changes a collection resource identity when a stable target changes quantity or query", () => {
@@ -1634,6 +2053,47 @@ describe("viewport3dResources", () => {
     }));
 
     expect(cache.get("field:m")?.metadata).toEqual({ topologyHash: "abc123" });
+  });
+
+  it("keeps the last-good field vector when a refresh is temporarily not applicable", async () => {
+    const cache = new ResourceCache<string>({ maxBytes: 32 });
+    cache.set("field:m", {
+      byteLength: 4,
+      data: "last-good-field",
+      etag: '"field-1"',
+    });
+
+    await expect(
+      loadCachedBinaryResource(
+        cache,
+        "field:m",
+        async () => ({ etag: null, status: "not-applicable" }),
+        { retainCachedOnNotApplicable: true },
+      ),
+    ).resolves.toBe("last-good-field");
+
+    expect(cache.peek("field:m")).toMatchObject({
+      data: "last-good-field",
+      etag: '"field-1"',
+    });
+  });
+
+  it("clears non-field binary data when it becomes not applicable", async () => {
+    const cache = new ResourceCache<string>({ maxBytes: 32 });
+    cache.set("topology", {
+      byteLength: 4,
+      data: "old-topology",
+      etag: '"topology-1"',
+    });
+
+    await expect(
+      loadCachedBinaryResource(cache, "topology", async () => ({
+        etag: null,
+        status: "not-applicable",
+      })),
+    ).resolves.toBeNull();
+
+    expect(cache.peek("topology")).toBeNull();
   });
 
   it("restores a cached binary entry when it was evicted during a 304 request", async () => {

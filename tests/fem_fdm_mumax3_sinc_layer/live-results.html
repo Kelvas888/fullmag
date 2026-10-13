@@ -1,0 +1,716 @@
+<!doctype html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>FDM · FEM · MuMax3 — live scalar monitor</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #11111b;
+      --surface: #181825;
+      --surface-raised: #1e1e2e;
+      --border: #313244;
+      --text: #cdd6f4;
+      --muted: #a6adc8;
+      --grid: #313244;
+      --fdm: #a6e3a1;
+      --fem: #89b4fa;
+      --fem-fk: #cba6f7;
+      --mumax: #f9e2af;
+      --good: #a6e3a1;
+      --warn: #f9e2af;
+      --bad: #f38ba8;
+      --shadow: 0 18px 50px rgb(0 0 0 / 18%);
+    }
+
+    @media (prefers-color-scheme: light) {
+      :root {
+        color-scheme: light;
+        --bg: #eff1f5;
+        --surface: #e6e9ef;
+        --surface-raised: #ffffff;
+        --border: #bcc0cc;
+        --text: #4c4f69;
+        --muted: #6c6f85;
+        --grid: #ccd0da;
+        --shadow: 0 18px 50px rgb(76 79 105 / 12%);
+      }
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      min-width: 320px;
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main { width: min(1320px, 100%); margin: 0 auto; padding: 28px clamp(16px, 4vw, 48px) 56px; }
+    h1, h2, h3, p { margin: 0; }
+    h1 { max-width: 760px; font-size: clamp(28px, 4vw, 48px); line-height: 1.02; letter-spacing: -0.04em; }
+    h2 { font-size: 18px; letter-spacing: -0.02em; }
+    h3 { font-size: 14px; }
+    .eyebrow { margin-bottom: 10px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase; }
+    .lede { max-width: 760px; margin-top: 14px; color: var(--muted); }
+    .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; margin-top: 22px; }
+    .status-line { display: inline-flex; align-items: center; gap: 9px; min-height: 32px; }
+    .status-dot { width: 9px; height: 9px; border-radius: 999px; background: var(--warn); box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 14%, transparent); }
+    .status-dot.good { background: var(--good); box-shadow: 0 0 0 4px color-mix(in srgb, var(--good) 14%, transparent); }
+    .status-dot.bad { background: var(--bad); box-shadow: 0 0 0 4px color-mix(in srgb, var(--bad) 14%, transparent); }
+    .muted { color: var(--muted); }
+    button { border: 1px solid var(--border); border-radius: 8px; padding: 7px 12px; background: var(--surface-raised); color: var(--text); cursor: pointer; font: inherit; }
+    button:hover, button:focus-visible { border-color: var(--fem); outline: 2px solid color-mix(in srgb, var(--fem) 35%, transparent); outline-offset: 1px; }
+    section { margin-top: 38px; }
+    .section-head { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin-bottom: 12px; }
+    .section-head span { color: var(--muted); font-size: 12px; }
+    .method-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .method { min-width: 0; padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
+    .method-top { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .method-name { font-weight: 700; }
+    .method-state { color: var(--muted); font-size: 12px; text-align: right; }
+    .method-detail { min-height: 20px; margin-top: 8px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .chart-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .energy-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .chart-card { min-width: 0; padding: 12px 12px 10px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
+    .chart-card-title { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
+    .chart-card-title span { color: var(--muted); font-size: 11px; }
+    .chart { display: block; width: 100%; height: 204px; margin-top: 5px; overflow: visible; }
+    .chart text { fill: var(--muted); font-size: 10px; font-family: inherit; }
+    .chart .axis { stroke: var(--border); stroke-width: 1; }
+    .chart .grid-line { stroke: var(--grid); stroke-width: 1; stroke-dasharray: 2 4; }
+    .chart .series { fill: none; stroke-linecap: round; stroke-linejoin: round; stroke-width: 2; }
+    .legend { display: flex; flex-wrap: wrap; gap: 6px 12px; min-height: 18px; margin: 2px 2px 0; color: var(--muted); font-size: 11px; }
+    .legend-item { display: inline-flex; align-items: center; gap: 5px; border: 0; padding: 0; background: transparent; color: inherit; cursor: pointer; font: inherit; }
+    .legend-item:disabled { cursor: not-allowed; opacity: 0.58; }
+    .legend-item:hover, .legend-item:focus-visible { color: var(--text); outline: 2px solid var(--border); outline-offset: 2px; }
+    .legend-item.is-hidden { opacity: 0.45; }
+    .legend-swatch { width: 15px; height: 3px; border-radius: 3px; background: var(--series-color); }
+    .legend-swatch[data-line-style="dashed"] { background: repeating-linear-gradient(90deg, var(--series-color) 0 8px, transparent 8px 13px); }
+    .legend-swatch[data-line-style="dotted"] { background: repeating-linear-gradient(90deg, var(--series-color) 0 2px, transparent 2px 6px); }
+    .empty { display: grid; place-items: center; min-height: 204px; color: var(--muted); font-size: 12px; text-align: center; }
+    .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; background: var(--surface); box-shadow: var(--shadow); }
+    table { width: 100%; min-width: 720px; border-collapse: collapse; }
+    th, td { padding: 10px 12px; border-bottom: 1px solid var(--border); text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; }
+    th { color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+    tbody tr:last-child td { border-bottom: 0; }
+    .footer-note { margin-top: 16px; color: var(--muted); font-size: 12px; }
+    code { padding: 1px 4px; border-radius: 4px; background: var(--surface-raised); color: var(--text); }
+    @media (max-width: 900px) {
+      .chart-grid, .energy-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .method-grid { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 600px) {
+      main { padding-top: 20px; }
+      .chart-grid, .energy-grid { grid-template-columns: 1fr; }
+      .chart { height: 220px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Fullmag · scalar comparison · no field snapshots</p>
+      <h1>FDM, FEM i MuMax3 — wyniki na żywo</h1>
+      <p class="lede">Monitor odczytuje wyłącznie średnie <code>mx</code>, <code>my</code>, <code>mz</code> i energie. Nowe próbki są pobierane automatycznie co sekundę, bez cache przeglądarki.</p>
+      <div class="toolbar">
+        <div class="status-line" role="status" aria-live="polite">
+          <span id="overall-dot" class="status-dot"></span>
+          <span id="overall-status">Oczekiwanie na artefakty…</span>
+        </div>
+        <span id="last-refresh" class="muted">Brak odczytu</span>
+        <button id="refresh-button" type="button">Odśwież teraz</button>
+      </div>
+    </header>
+
+    <section aria-labelledby="methods-title">
+      <div class="section-head"><h2 id="methods-title">Źródła</h2><span>status każdego backendu</span></div>
+      <div id="method-grid" class="method-grid"></div>
+    </section>
+
+    <section aria-labelledby="relaxation-title">
+      <div class="section-head"><h2 id="relaxation-title">Relaksacja — wartości końcowe</h2><span>ostatni punkt etapu relax · bezwymiarowa</span></div>
+      <div id="relaxation-grid" class="chart-grid"></div>
+    </section>
+
+    <section aria-labelledby="magnetization-title">
+      <div class="section-head"><h2 id="magnetization-title">Średnia magnetyzacja</h2><span>wartość bezwymiarowa · t [ns]</span></div>
+      <div id="magnetization-grid" class="chart-grid"></div>
+    </section>
+
+    <section aria-labelledby="energy-title">
+      <div class="section-head"><h2 id="energy-title">Energie</h2><span>J · każda składowa osobno</span></div>
+      <div id="energy-grid" class="chart-grid energy-grid"></div>
+    </section>
+
+    <section aria-labelledby="latest-title">
+      <div class="section-head"><h2 id="latest-title">Ostatnie wartości</h2><span>tabela scalar-only</span></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Metoda</th><th>t [ns]</th><th>mx</th><th>my</th><th>mz</th><th>E total [J]</th><th>Próbek</th></tr></thead>
+          <tbody id="latest-body"><tr><td colspan="7" class="muted">Brak danych.</td></tr></tbody>
+        </table>
+      </div>
+      <p class="footer-note">Fullmag CPU/GPU: strumieniowany <code>stages/*/table</code>, potem <code>artifacts/scalars.csv</code> i <code>artifacts/tables/default/table.csv</code>. FEM jest rozdzielony na Poisson–Robin oraz Fredkin–Köhler. MuMax3: bieżący artefakt <code>mumax3_case.zarr/table.txt</code> z builda v3.12.3-20260819. Na wykresie „zewnętrzna / Zeeman” Fullmag używa <code>E_ext</code> (bias + drive), a MuMax3 <code>E_zeeman</code>. Każda seria ma osobny przełącznik w legendzie; brakujący artefakt pozostaje oznaczony jako „oczekuje”.</p>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const BACKENDS = [
+        { id: "fdm_cpu", shortLabel: "FDM CPU", label: "Fullmag FDM · CPU · double", color: "var(--fdm)", lineStyle: "solid", strokeDasharray: null, kind: "fullmag", queryKeys: ["fdm_cpu", "fdm"], roots: ["results/current/fdm_cpu", "fdm_case.zarr", "fullmag_case.zarr", "results/fdm/fullmag_case.zarr"], liveCsv: ["results/current/fdm_cpu/artifacts/scalars.csv", "fdm_case.zarr/artifacts/scalars.csv", "fullmag_case.zarr/artifacts/scalars.csv"], csv: ["results/current/fdm_cpu/artifacts/tables/default/table.csv", "fdm_case.zarr/artifacts/tables/default/table.csv", "fdm_case.zarr/tables/default/table.csv", "fullmag_case.zarr/artifacts/tables/default/table.csv", "fullmag_case.zarr/tables/default/table.csv", "results/fdm/fullmag_case.zarr/artifacts/tables/default/table.csv"], relaxationRoots: ["results/current/fdm_cpu", "fdm_case.zarr", "fullmag_case.zarr", "results/fdm/fullmag_case.zarr"], relaxationLiveCsv: [], relaxationCsv: ["results/current/fdm_cpu/artifacts/tables/relaxation/table.csv", "results/current/fdm_cpu/tables/relaxation/table.csv", "fdm_case.zarr/artifacts/tables/relaxation/table.csv", "fullmag_case.zarr/artifacts/tables/relaxation/table.csv"] },
+        { id: "fdm_gpu", shortLabel: "FDM GPU", label: "Fullmag FDM · GPU · double", color: "var(--fdm)", lineStyle: "dashed", strokeDasharray: "8 5", kind: "fullmag", roots: ["results/current/fdm_gpu_dt50fs_diagnostic_retry"], liveCsv: ["results/current/fdm_gpu_dt50fs_diagnostic_retry/artifacts/scalars.csv", "results/current/fdm_gpu_dt50fs_diagnostic_retry/scalars.csv"], csv: ["results/current/fdm_gpu_dt50fs_diagnostic_retry/artifacts/tables/default/table.csv", "results/current/fdm_gpu_dt50fs_diagnostic_retry/tables/default/table.csv"], relaxationRoots: ["results/current/fdm_gpu_dt50fs_diagnostic_retry"], relaxationLiveCsv: [], relaxationCsv: ["results/current/fdm_gpu_dt50fs_diagnostic_retry/artifacts/tables/relaxation/table.csv", "results/current/fdm_gpu_dt50fs_diagnostic_retry/tables/relaxation/table.csv"] },
+        { id: "fem_pr_cpu", shortLabel: "FEM PR CPU", label: "Fullmag FEM · Poisson–Robin · CPU · double", color: "var(--fem)", lineStyle: "solid", strokeDasharray: null, kind: "fullmag", queryKeys: ["fem_pr_cpu", "fem_cpu", "fem"], roots: ["results/current/fem_pr_cpu", "fem_cpu_case.zarr", "results/fem_cpu/fullmag_case.zarr"], liveCsv: ["results/current/fem_pr_cpu/artifacts/scalars.csv", "fem_cpu_case.zarr/artifacts/scalars.csv"], csv: ["results/current/fem_pr_cpu/artifacts/tables/default/table.csv", "fem_cpu_case.zarr/artifacts/tables/default/table.csv", "results/fem_cpu/fullmag_case.zarr/artifacts/tables/default/table.csv"], relaxationRoots: ["results/current/fem_pr_cpu", "fem_cpu_case.zarr", "results/fem_cpu/fullmag_case.zarr"], relaxationLiveCsv: [], relaxationCsv: ["results/current/fem_pr_cpu/artifacts/tables/relaxation/table.csv", "results/current/fem_pr_cpu/tables/relaxation/table.csv", "fem_cpu_case.zarr/artifacts/tables/relaxation/table.csv"] },
+        { id: "fem_pr_gpu", shortLabel: "FEM PR GPU", label: "Fullmag FEM · Poisson–Robin · GPU · double", color: "var(--fem)", lineStyle: "dashed", strokeDasharray: "8 5", kind: "fullmag", queryKeys: ["fem_pr_gpu", "fem_gpu"], roots: ["results/current/fem_pr_gpu", "fem_gpu_case.zarr", "results/fem_gpu/fullmag_case.zarr"], liveCsv: ["results/current/fem_pr_gpu/artifacts/scalars.csv", "fem_gpu_case.zarr/artifacts/scalars.csv"], csv: ["results/current/fem_pr_gpu/artifacts/tables/default/table.csv", "fem_gpu_case.zarr/artifacts/tables/default/table.csv", "results/fem_gpu/fullmag_case.zarr/artifacts/tables/default/table.csv"], relaxationRoots: ["results/current/fem_pr_gpu", "fem_gpu_case.zarr", "results/fem_gpu/fullmag_case.zarr"], relaxationLiveCsv: [], relaxationCsv: ["results/current/fem_pr_gpu/artifacts/tables/relaxation/table.csv", "results/current/fem_pr_gpu/tables/relaxation/table.csv", "fem_gpu_case.zarr/artifacts/tables/relaxation/table.csv"] },
+        { id: "fem_fk_cpu", shortLabel: "FEM FK CPU", label: "Fullmag FEM · Fredkin–Köhler · CPU · double", color: "var(--fem-fk)", lineStyle: "solid", strokeDasharray: null, kind: "fullmag", availability: "pending", availabilityDetail: "FEM Fredkin–Köhler CPU: brak świeżego, zweryfikowanego artefaktu managed dla dokładnego benchmarku.", qualification: ["results/current/fem_fk_cpu/qualification.json"], roots: ["results/current/fem_fk_cpu"], liveCsv: ["results/current/fem_fk_cpu/artifacts/scalars.csv"], csv: ["results/current/fem_fk_cpu/artifacts/tables/default/table.csv"], relaxationRoots: ["results/current/fem_fk_cpu"], relaxationLiveCsv: [], relaxationCsv: ["results/current/fem_fk_cpu/artifacts/tables/relaxation/table.csv"] },
+        { id: "fem_fk_gpu", shortLabel: "FEM FK GPU", label: "Fullmag FEM · Fredkin–Köhler · GPU · double", color: "var(--fem-fk)", lineStyle: "dashed", strokeDasharray: "8 5", kind: "fullmag", availability: "pending", availabilityDetail: "FEM Fredkin–Köhler GPU: brak świeżego, zweryfikowanego artefaktu managed dla dokładnego benchmarku.", qualification: ["results/current/fem_fk_gpu/qualification.json"], roots: ["results/current/fem_fk_gpu"], liveCsv: ["results/current/fem_fk_gpu/artifacts/scalars.csv"], csv: ["results/current/fem_fk_gpu/artifacts/tables/default/table.csv"], relaxationRoots: ["results/current/fem_fk_gpu"], relaxationLiveCsv: [], relaxationCsv: ["results/current/fem_fk_gpu/artifacts/tables/relaxation/table.csv"] },
+        { id: "mumax3", shortLabel: "MuMax3", label: "MuMax3 · v3.12.3-20260819 · GPU", color: "var(--mumax)", lineStyle: "dotted", strokeDasharray: "1 6", kind: "mumax", paths: ["mumax3_case.zarr/table.txt"], relaxationPaths: ["results/mumax3_relax_v2/table.txt", "results/mumax3_relax_v1/table.txt"] },
+      ];
+      const STAGE_CANDIDATES = Array.from({ length: 8 }, (_, index) => `stages/stage_${String(index).padStart(4, "0")}_dynamic`);
+      const RELAXATION_STAGE_CANDIDATES = Array.from({ length: 8 }, (_, index) => `stages/stage_${String(index).padStart(4, "0")}_relax`);
+      const MAGNETIZATION = ["mx", "my", "mz"];
+      const ENERGIES = [
+        { id: "e_ex", label: "E exchange" },
+        { id: "e_demag", label: "E demag" },
+        { id: "e_external_total", label: "E zewnętrzna / Zeeman" },
+        { id: "e_drive", label: "E drive" },
+        { id: "e_ani", label: "E anis" },
+        { id: "e_dmi", label: "E DMI" },
+        { id: "e_total", label: "E total" },
+      ];
+      const state = { backends: {}, relaxation: {}, refreshing: false, refreshNumber: 0, hiddenBackends: new Set() };
+      const query = new URLSearchParams(window.location.search);
+
+      function applyQueryOverride(definition) {
+        const overrideKey = (definition.queryKeys || [definition.id]).find((key) => query.has(key));
+        if (!overrideKey) return definition;
+        const override = query.get(overrideKey);
+        if (!override) return definition;
+        const root = override.replace(/\/$/, "");
+        if (definition.kind === "mumax") return { ...definition, paths: [root], relaxationPaths: [root] };
+        if (root.toLowerCase().endsWith(".csv")) return { ...definition, roots: [], csv: [root], relaxationRoots: [], relaxationCsv: [root] };
+        return { ...definition, roots: [root], csv: [`${root}/artifacts/tables/default/table.csv`, `${root}/tables/default/table.csv`], relaxationRoots: [root], relaxationCsv: [`${root}/artifacts/tables/relaxation/table.csv`, `${root}/tables/relaxation/table.csv`] };
+      }
+
+      function cacheBusted(url) {
+        return `${url}${url.includes("?") ? "&" : "?"}_live=${Date.now()}_${Math.random().toString(16).slice(2)}`;
+      }
+
+      async function fetchResponse(url) {
+        const response = await fetch(cacheBusted(url), { cache: "no-store" });
+        if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+        return response;
+      }
+
+      async function fetchText(url) {
+        return (await fetchResponse(url)).text();
+      }
+
+      async function fetchJson(url) {
+        return (await fetchResponse(url)).json();
+      }
+
+      async function requireQualification(definition) {
+        if (!Array.isArray(definition.qualification)) return;
+        let lastError = "brak qualification.json";
+        for (const path of definition.qualification) {
+          try {
+            const report = await fetchJson(path);
+            if (!report || report.status !== "PASS") throw new Error(`status=${report && report.status ? report.status : "brak"}`);
+            return;
+          } catch (error) {
+            lastError = `kwalifikacja FEM/BEM FK nie jest PASS (${path}: ${error.message || error})`;
+          }
+        }
+        throw new Error(lastError);
+      }
+
+      function canonicalHeader(raw) {
+        const token = raw.trim().replace(/^#/, "").trim().split(/\s+/)[0].toLowerCase();
+        const aliases = { t: "time_s", time: "time_s", step: "step", mx: "mx", my: "my", mz: "mz", e_ex: "e_ex", e_exch: "e_ex", e_demag: "e_demag", e_ext: "e_ext", e_drive: "e_drive", e_ani: "e_ani", e_anis: "e_ani", e_dmi: "e_dmi", e_zeeman: "e_zeeman", e_total: "e_total" };
+        return aliases[token] || token;
+      }
+
+      function finiteNumber(raw, label) {
+        const value = Number(raw);
+        if (!Number.isFinite(value)) throw new Error(`Niepoprawna liczba w ${label}`);
+        return value;
+      }
+
+      function parseFullmagCsv(text) {
+        const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+        if (lines.length < 2) throw new Error("Tabela Fullmag nie ma jeszcze wierszy");
+        const headers = lines[0].split(",").map(canonicalHeader);
+        const required = ["time_s", ...MAGNETIZATION, "e_ex", "e_demag", "e_ext", "e_drive", "e_ani", "e_dmi", "e_total"];
+        const missing = required.filter((column) => !headers.includes(column));
+        if (missing.length) throw new Error(`Brak kolumn: ${missing.join(", ")}`);
+        const rows = [];
+        for (let index = 1; index < lines.length; index += 1) {
+          const values = lines[index].split(",");
+          if (values.length !== headers.length) continue;
+          const row = {};
+          headers.forEach((header, columnIndex) => { row[header] = finiteNumber(values[columnIndex], `${index + 1}:${header}`); });
+          rows.push(row);
+        }
+        if (!rows.length) throw new Error("Tabela Fullmag nie ma pełnego wiersza");
+        return normalizeRows(rows, "fullmag");
+      }
+
+      function parseFullmagRelaxationCsv(text) {
+        const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+        if (lines.length < 2) throw new Error("Tabela relaksacji Fullmag nie ma jeszcze wierszy");
+        const headers = lines[0].split(",").map(canonicalHeader);
+        const required = ["time_s", ...MAGNETIZATION];
+        const missing = required.filter((column) => !headers.includes(column));
+        if (missing.length) throw new Error(`Brak kolumn relaksacji: ${missing.join(", ")}`);
+        const rows = [];
+        for (let index = 1; index < lines.length; index += 1) {
+          const values = lines[index].split(",");
+          if (values.length !== headers.length) continue;
+          try {
+            const row = {};
+            headers.forEach((header, columnIndex) => { row[header] = finiteNumber(values[columnIndex], `${index + 1}:${header}`); });
+            rows.push(row);
+          } catch (error) {
+            // The producer may still be flushing the last partial row.
+          }
+        }
+        if (!rows.length) throw new Error("Tabela relaksacji Fullmag nie ma pełnego wiersza");
+        return normalizeRows(rows, "fullmag_relaxation");
+      }
+
+      function parseFullmagLiveCsv(text) {
+        const lines = text.split(/\r?\n/).filter((line) => line.trim().length > 0);
+        if (lines.length < 2) throw new Error("Strumień Fullmag nie ma jeszcze wierszy");
+        const headers = lines[0].split(",").map(canonicalHeader);
+        const required = ["time_s", ...MAGNETIZATION, "e_ex", "e_demag", "e_ext", "e_ani", "e_dmi", "e_total"];
+        const missing = required.filter((column) => !headers.includes(column));
+        if (missing.length) throw new Error(`Brak kolumn strumienia: ${missing.join(", ")}`);
+        const rows = [];
+        for (let index = 1; index < lines.length; index += 1) {
+          const values = lines[index].split(",");
+          if (values.length !== headers.length) continue;
+          try {
+            const row = {};
+            headers.forEach((header, columnIndex) => { row[header] = finiteNumber(values[columnIndex], `${index + 1}:${header}`); });
+            rows.push(row);
+          } catch (error) {
+            // The producer may still be flushing the last partial row.
+          }
+        }
+        if (!rows.length) throw new Error("Strumień Fullmag nie ma pełnego wiersza");
+        return normalizeRows(rows, "fullmag_live");
+      }
+
+      function parseMuMaxTable(text) {
+        let headers = null;
+        const rows = [];
+        for (const rawLine of text.split(/\r?\n/)) {
+          const line = rawLine.trim();
+          if (!line) continue;
+          if (line.startsWith("#")) {
+            if (!headers) headers = (line.slice(1).trim().split("\t").length > 1 ? line.slice(1).trim().split("\t") : line.slice(1).trim().split(/\s+/)).map(canonicalHeader);
+            continue;
+          }
+          if (!headers) continue;
+          const values = line.includes("\t") ? line.split("\t") : line.split(/\s+/);
+          if (values.length !== headers.length) continue;
+          const row = {};
+          headers.forEach((header, columnIndex) => {
+            if (!(header in row)) row[header] = finiteNumber(values[columnIndex], `${rows.length + 1}:${header}`);
+          });
+          if (["time_s", ...MAGNETIZATION, "e_ex", "e_demag", "e_zeeman", "e_ani", "e_total"].every((column) => column in row)) rows.push(row);
+        }
+        if (!headers || !rows.length) throw new Error("Tabela MuMax3 nie ma jeszcze pełnego wiersza");
+        return normalizeRows(rows, "mumax3");
+      }
+
+      function normalizeRows(rows, kind) {
+        return rows.map((row) => {
+          const normalized = { ...row, time_s: row.time_s };
+          if (kind === "mumax3") {
+            normalized.e_ext = row.e_zeeman;
+            normalized.e_drive = null;
+            normalized.e_dmi = null;
+            normalized.e_external_total = row.e_zeeman;
+          } else if (kind === "fullmag_relaxation") {
+            normalized.e_external_total = Number.isFinite(row.e_ext) ? row.e_ext : null;
+          } else if (kind === "fullmag_live") {
+            normalized.e_ext = row.e_ext;
+            normalized.e_drive = null;
+            normalized.e_external_total = row.e_ext;
+          } else {
+            normalized.e_ext = row.e_ext;
+            normalized.e_drive = row.e_drive;
+            normalized.e_external_total = row.e_ext;
+          }
+          return normalized;
+        }).sort((left, right) => left.time_s - right.time_s);
+      }
+
+      async function readZarrTable(root, stageKind = "dynamic") {
+        const stageCandidates = stageKind === "relaxation" ? RELAXATION_STAGE_CANDIDATES : STAGE_CANDIDATES;
+        for (const stage of stageCandidates) {
+          const base = `${root}/${stage}/table`;
+          try {
+            const [attrs, array] = await Promise.all([fetchJson(`${base}/.zattrs`), fetchJson(`${base}/.zarray`)]);
+            const quantities = Array.isArray(attrs.quantities) ? attrs.quantities : [];
+            const shape = Array.isArray(array.shape) ? array.shape : [];
+            const width = Number(shape[1]);
+            const count = Number(shape[0]);
+            if (!quantities.length || !Number.isInteger(width) || width !== quantities.length || !Number.isInteger(count)) throw new Error("Niepoprawna tablica Zarr");
+            const rows = [];
+            for (let index = 0; index < count; index += 1) {
+              try {
+                const response = await fetchResponse(`${base}/${index}.0`);
+                const buffer = await response.arrayBuffer();
+                if (buffer.byteLength < width * 8) break;
+                const view = new DataView(buffer);
+                const row = {};
+                quantities.forEach((quantity, columnIndex) => { row[canonicalHeader(quantity)] = view.getFloat64(columnIndex * 8, true); });
+                rows.push(row);
+              } catch (error) {
+                break;
+              }
+            }
+            if (rows.length) return { rows: normalizeRows(rows, stageKind === "relaxation" ? "fullmag_relaxation" : "fullmag"), source: `${base}/*`, live: true, complete: false };
+            throw new Error("strumieniowana tabela nie ma jeszcze wierszy");
+          } catch (error) {
+            // Try the next stage index; a missing stage is normal before a run starts.
+          }
+        }
+        throw new Error("brak strumieniowanej tabeli");
+      }
+
+      async function readFullmag(definition, stageKind = "dynamic") {
+        const relaxation = stageKind === "relaxation";
+        const csvPaths = relaxation ? definition.relaxationCsv : definition.csv;
+        const liveCsvPaths = relaxation ? definition.relaxationLiveCsv : definition.liveCsv;
+        const roots = relaxation ? definition.relaxationRoots : definition.roots;
+        const csvParser = relaxation ? parseFullmagRelaxationCsv : parseFullmagCsv;
+        const liveParser = relaxation ? parseFullmagRelaxationCsv : parseFullmagLiveCsv;
+        for (const path of csvPaths || []) {
+          try {
+            return { rows: csvParser(await fetchText(path)), source: path, live: false, complete: true };
+          } catch (error) {
+            // Fall through while the producer is still preparing its artifact.
+          }
+        }
+        for (const path of liveCsvPaths || []) {
+          try {
+            return { rows: liveParser(await fetchText(path)), source: path, live: true, complete: false };
+          } catch (error) {
+            // Fall through while the producer is still preparing its artifact.
+          }
+        }
+        for (const root of roots || []) {
+          try {
+            return await readZarrTable(root, stageKind);
+          } catch (error) {
+            // Fall through to the next root while the producer is still preparing its artifact.
+          }
+        }
+        throw new Error("brak tabeli Fullmag");
+      }
+
+      async function readBackend(definition, stageKind = "dynamic") {
+        if (definition.kind === "mumax") {
+          const paths = stageKind === "relaxation" ? definition.relaxationPaths : definition.paths;
+          for (const path of paths || []) {
+            try { return { rows: parseMuMaxTable(await fetchText(path)), source: path, live: false, complete: true }; } catch (error) { /* try next path */ }
+          }
+          throw new Error("brak tabeli MuMax3");
+        }
+        await requireQualification(definition);
+        return readFullmag(definition, stageKind);
+      }
+
+      function formatNumber(value, digits = 4) {
+        if (value === null || value === undefined || !Number.isFinite(value)) return "—";
+        return value.toExponential(digits - 1).replace("e+", "e");
+      }
+
+      function formatTime(value) {
+        if (!Number.isFinite(value)) return "—";
+        return (value * 1e9).toFixed(value === 0 ? 2 : 4);
+      }
+
+      function setText(id, value) { document.getElementById(id).textContent = value; }
+
+      function renderMethodCards() {
+        const grid = document.getElementById("method-grid");
+        grid.replaceChildren(...BACKENDS.map((definition) => {
+          const card = document.createElement("article");
+          card.className = "method";
+          card.innerHTML = `<div class="method-top"><span class="method-name"></span><span class="method-state"></span></div><div class="method-detail"></div>`;
+          card.dataset.backend = definition.id;
+          card.querySelector(".method-name").textContent = definition.label;
+          return card;
+        }));
+      }
+
+      function renderMethodState(definition, result) {
+        const card = document.querySelector(`[data-backend="${definition.id}"]`);
+        if (!card) return;
+        const stateElement = card.querySelector(".method-state");
+        const detailElement = card.querySelector(".method-detail");
+        if (result.error) {
+          stateElement.textContent = definition.availability === "not_applicable" ? "niedostępne" : "oczekuje";
+          detailElement.textContent = definition.availability === "not_applicable" ? definition.availabilityDetail : result.error;
+          return;
+        }
+        stateElement.textContent = result.complete ? "gotowe" : "na żywo";
+        detailElement.textContent = `${result.rows.length} próbek · ${result.source}`;
+      }
+
+      function pathFor(series, x, y, width, height, padding, xMin, xMax, yMin, yMax) {
+        return series.rows.map((row, index) => {
+          const px = padding.left + ((row.time_s - xMin) / (xMax - xMin || 1)) * (width - padding.left - padding.right);
+          const py = padding.top + (1 - ((row[y] - yMin) / (yMax - yMin || 1))) * (height - padding.top - padding.bottom);
+          return `${index ? "L" : "M"}${px.toFixed(2)},${py.toFixed(2)}`;
+        }).join(" ");
+      }
+
+      function toggleBackend(backendId) {
+        if (state.hiddenBackends.has(backendId)) state.hiddenBackends.delete(backendId);
+        else state.hiddenBackends.add(backendId);
+        renderCharts();
+      }
+
+      function appendLegend(card, seriesList) {
+        const legend = document.createElement("div"); legend.className = "legend";
+        seriesList.forEach((series) => {
+          const item = document.createElement("button");
+          const status = series.availability === "not_applicable" ? "brak składowej" : "oczekuje";
+          const label = series.available ? series.label : `${series.label} · ${status}`;
+          item.type = "button";
+          item.className = `legend-item${series.visible ? "" : " is-hidden"}`;
+          item.disabled = !series.available;
+          item.setAttribute("aria-pressed", String(series.visible));
+          item.setAttribute("aria-disabled", String(!series.available));
+          item.setAttribute("aria-label", `${series.available ? (series.visible ? "Ukryj" : "Pokaż") : "Niedostępna seria"} ${label}`);
+          item.innerHTML = `<span class="legend-swatch"></span><span></span>`;
+          const swatch = item.querySelector(".legend-swatch");
+          swatch.style.setProperty("--series-color", series.color);
+          swatch.dataset.lineStyle = series.lineStyle;
+          item.querySelector("span:last-child").textContent = label;
+          if (series.available) item.addEventListener("click", () => toggleBackend(series.id));
+          legend.append(item);
+        });
+        card.append(legend);
+      }
+
+      function chartCard(title, unit, seriesList) {
+        const card = document.createElement("article");
+        card.className = "chart-card";
+        const heading = document.createElement("div");
+        heading.className = "chart-card-title";
+        heading.innerHTML = `<h3></h3><span></span>`;
+        heading.querySelector("h3").textContent = title;
+        heading.querySelector("span").textContent = unit;
+        card.append(heading);
+        const visibleSeries = seriesList.filter((series) => series.visible && series.available);
+        const pendingSeries = seriesList.some((series) => series.visible && !series.available);
+        const allRows = visibleSeries.flatMap((series) => series.rows);
+        if (!allRows.length) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = pendingSeries ? "Oczekiwanie na dane…" : "Wybierz co najmniej jedną krzywą…";
+          card.append(empty);
+        } else {
+          const width = 640;
+          const height = 204;
+          const padding = { top: 12, right: 12, bottom: 25, left: 52 };
+          const xValues = allRows.map((row) => row.time_s);
+          const yValues = allRows.map((row) => row[visibleSeries[0].column]).filter(Number.isFinite);
+          visibleSeries.forEach((series) => series.rows.forEach((row) => { if (Number.isFinite(row[series.column])) yValues.push(row[series.column]); }));
+          let xMin = Math.min(...xValues), xMax = Math.max(...xValues);
+          let yMin = Math.min(...yValues), yMax = Math.max(...yValues);
+          if (!Number.isFinite(yMin) || !Number.isFinite(yMax)) { yMin = -1; yMax = 1; }
+          if (xMin === xMax) { xMin -= 1e-12; xMax += 1e-12; }
+          if (yMin === yMax) { const delta = Math.max(Math.abs(yMin) * 0.1, 1e-12); yMin -= delta; yMax += delta; }
+          const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+          svg.classList.add("chart");
+          svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+          svg.setAttribute("role", "img");
+          svg.setAttribute("aria-label", `${title}, wykres w czasie`);
+          const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+          for (let tick = 0; tick <= 4; tick += 1) {
+            const ratio = tick / 4;
+            const y = padding.top + ratio * (height - padding.top - padding.bottom);
+            const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            line.classList.add("grid-line"); line.setAttribute("x1", padding.left); line.setAttribute("x2", width - padding.right); line.setAttribute("y1", y); line.setAttribute("y2", y); group.append(line);
+            const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            label.setAttribute("x", padding.left - 7); label.setAttribute("y", y + 3); label.setAttribute("text-anchor", "end"); label.textContent = formatNumber(yMax - ratio * (yMax - yMin), 3); group.append(label);
+          }
+          const axis = document.createElementNS("http://www.w3.org/2000/svg", "line");
+          axis.classList.add("axis"); axis.setAttribute("x1", padding.left); axis.setAttribute("x2", width - padding.right); axis.setAttribute("y1", height - padding.bottom); axis.setAttribute("y2", height - padding.bottom); group.append(axis);
+          for (let tick = 0; tick <= 2; tick += 1) {
+            const ratio = tick / 2;
+            const x = padding.left + ratio * (width - padding.left - padding.right);
+            const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            label.setAttribute("x", x); label.setAttribute("y", height - 7); label.setAttribute("text-anchor", tick === 0 ? "start" : tick === 2 ? "end" : "middle"); label.textContent = `${((xMin + ratio * (xMax - xMin)) * 1e9).toFixed(2)} ns`; group.append(label);
+          }
+          svg.append(group);
+          const lines = document.createElementNS("http://www.w3.org/2000/svg", "g");
+          visibleSeries.forEach((series) => {
+            const visibleRows = series.rows.filter((row) => Number.isFinite(row[series.column]));
+            if (!visibleRows.length) return;
+            const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+            path.classList.add("series"); path.style.stroke = series.color; if (series.strokeDasharray) path.setAttribute("stroke-dasharray", series.strokeDasharray); path.setAttribute("d", pathFor({ rows: visibleRows }, null, series.column, width, height, padding, xMin, xMax, yMin, yMax)); lines.append(path);
+          });
+          svg.append(lines);
+          card.append(svg);
+        }
+        appendLegend(card, seriesList);
+        return card;
+      }
+
+      function methodSeries(column) {
+        return BACKENDS.map((definition) => {
+          const result = state.backends[definition.id];
+          const rows = result && !result.error && Array.isArray(result.rows) ? result.rows : [];
+          const hasData = rows.some((row) => Number.isFinite(row[column]));
+          const availability = hasData ? "ready" : definition.availability || (result && !result.error ? "not_applicable" : "pending");
+          return { id: definition.id, label: definition.label, color: definition.color, lineStyle: definition.lineStyle, visible: !state.hiddenBackends.has(definition.id), available: hasData, availability, strokeDasharray: definition.strokeDasharray || null, column, rows };
+        });
+      }
+
+      function relaxationSeries(column) {
+        return BACKENDS.map((definition) => {
+          const result = state.relaxation[definition.id];
+          const rows = result && !result.error && Array.isArray(result.rows) ? result.rows : [];
+          const last = rows[rows.length - 1];
+          const value = last && Number.isFinite(last[column]) ? last[column] : null;
+          const hasData = Number.isFinite(value);
+          const availability = hasData ? "ready" : definition.availability || (result && !result.error ? "not_applicable" : "pending");
+          return { id: definition.id, label: definition.label, shortLabel: definition.shortLabel || definition.label, color: definition.color, lineStyle: definition.lineStyle, visible: !state.hiddenBackends.has(definition.id), available: hasData, availability, strokeDasharray: definition.strokeDasharray || null, column, value };
+        });
+      }
+
+      function relaxationCard(title, unit, seriesList) {
+        const card = document.createElement("article");
+        card.className = "chart-card";
+        const heading = document.createElement("div");
+        heading.className = "chart-card-title";
+        heading.innerHTML = `<h3></h3><span></span>`;
+        heading.querySelector("h3").textContent = title;
+        heading.querySelector("span").textContent = unit;
+        card.append(heading);
+        const visibleSeries = seriesList.filter((series) => series.visible && series.available);
+        const pendingSeries = seriesList.some((series) => series.visible && !series.available);
+        if (!visibleSeries.length) {
+          const empty = document.createElement("div");
+          empty.className = "empty";
+          empty.textContent = pendingSeries ? "Oczekiwanie na dane relaksacji…" : "Wybierz co najmniej jedną serię…";
+          card.append(empty);
+        } else {
+          const width = 640;
+          const height = 230;
+          const padding = { top: 12, right: 12, bottom: 48, left: 52 };
+          const values = visibleSeries.map((series) => series.value);
+          let yMin = Math.min(...values), yMax = Math.max(...values);
+          if (yMin === yMax) { const delta = Math.max(Math.abs(yMin) * 0.1, 1e-12); yMin -= delta; yMax += delta; }
+          const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+          svg.classList.add("chart");
+          svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+          svg.setAttribute("role", "img");
+          svg.setAttribute("aria-label", `${title}, porównanie wartości po relaksacji`);
+          const group = document.createElementNS("http://www.w3.org/2000/svg", "g");
+          for (let tick = 0; tick <= 4; tick += 1) {
+            const ratio = tick / 4;
+            const y = padding.top + ratio * (height - padding.top - padding.bottom);
+            const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            line.classList.add("grid-line"); line.setAttribute("x1", padding.left); line.setAttribute("x2", width - padding.right); line.setAttribute("y1", y); line.setAttribute("y2", y); group.append(line);
+            const label = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            label.setAttribute("x", padding.left - 7); label.setAttribute("y", y + 3); label.setAttribute("text-anchor", "end"); label.textContent = formatNumber(yMax - ratio * (yMax - yMin), 3); group.append(label);
+          }
+          const axis = document.createElementNS("http://www.w3.org/2000/svg", "line");
+          axis.classList.add("axis"); axis.setAttribute("x1", padding.left); axis.setAttribute("x2", width - padding.right); axis.setAttribute("y1", height - padding.bottom); axis.setAttribute("y2", height - padding.bottom); group.append(axis);
+          visibleSeries.forEach((series, index) => {
+            const x = padding.left + ((index + 0.5) / visibleSeries.length) * (width - padding.left - padding.right);
+            const y = padding.top + (1 - ((series.value - yMin) / (yMax - yMin || 1))) * (height - padding.top - padding.bottom);
+            const stem = document.createElementNS("http://www.w3.org/2000/svg", "line");
+            stem.classList.add("series"); stem.style.stroke = series.color; if (series.strokeDasharray) stem.setAttribute("stroke-dasharray", series.strokeDasharray); stem.setAttribute("x1", x); stem.setAttribute("x2", x); stem.setAttribute("y1", height - padding.bottom); stem.setAttribute("y2", y); group.append(stem);
+            const point = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+            point.setAttribute("cx", x); point.setAttribute("cy", y); point.setAttribute("r", "4"); point.style.fill = series.color; point.style.stroke = series.color; group.append(point);
+            const name = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            name.setAttribute("x", x); name.setAttribute("y", height - 27); name.setAttribute("text-anchor", "middle"); name.textContent = series.shortLabel; group.append(name);
+            const value = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            value.setAttribute("x", x); value.setAttribute("y", Math.max(10, y - 8)); value.setAttribute("text-anchor", "middle"); value.textContent = formatNumber(series.value, 3); group.append(value);
+          });
+          svg.append(group);
+          card.append(svg);
+        }
+        appendLegend(card, seriesList);
+        return card;
+      }
+
+      function renderCharts() {
+        const magnetizationGrid = document.getElementById("magnetization-grid");
+        const energyGrid = document.getElementById("energy-grid");
+        magnetizationGrid.replaceChildren(...MAGNETIZATION.map((column) => chartCard(column, "m", methodSeries(column))));
+        energyGrid.replaceChildren(...ENERGIES.map((energy) => chartCard(energy.label, "J", methodSeries(energy.id))));
+        renderRelaxation();
+      }
+
+      function renderRelaxation() {
+        const relaxationGrid = document.getElementById("relaxation-grid");
+        relaxationGrid.replaceChildren(...MAGNETIZATION.map((column) => relaxationCard(column, "wartość po relaksacji", relaxationSeries(column))));
+      }
+
+      function renderLatest() {
+        const body = document.getElementById("latest-body");
+        const rows = BACKENDS.map((definition) => {
+          const result = state.backends[definition.id];
+          if (!result || result.error || !result.rows.length) return `<tr><td>${definition.label}</td><td colspan="6" class="muted">oczekiwanie</td></tr>`;
+          const last = result.rows[result.rows.length - 1];
+          return `<tr><td>${definition.label}</td><td>${formatTime(last.time_s)}</td><td>${formatNumber(last.mx)}</td><td>${formatNumber(last.my)}</td><td>${formatNumber(last.mz)}</td><td>${formatNumber(last.e_total)}</td><td>${result.rows.length}</td></tr>`;
+        });
+        body.innerHTML = rows.join("");
+      }
+
+      function renderOverall() {
+        const results = BACKENDS.map((definition) => state.backends[definition.id]).filter(Boolean);
+        const ready = results.filter((result) => !result.error && result.rows.length);
+        const errors = results.filter((result) => result.error);
+        const dot = document.getElementById("overall-dot");
+        dot.className = `status-dot ${errors.length === results.length ? "bad" : ready.length ? "good" : ""}`;
+        if (ready.length === results.length && results.every((result) => result.complete)) setText("overall-status", "Wszystkie źródła gotowe");
+        else if (ready.length) setText("overall-status", `Odczyt na żywo · ${ready.length}/${results.length} źródeł`);
+        else if (errors.length) setText("overall-status", "Oczekiwanie na uruchomienie symulacji");
+        else setText("overall-status", "Odczyt danych…");
+      }
+
+      async function refreshAll() {
+        if (state.refreshing) return;
+        state.refreshing = true;
+        const refreshNumber = ++state.refreshNumber;
+        const definitions = BACKENDS.map(applyQueryOverride);
+        const values = await Promise.all(definitions.map(async (definition) => {
+          const read = (stage) => readBackend(definition, stage).catch((error) => ({ error: error instanceof Error ? error.message : "błąd odczytu", rows: [] }));
+          const [dynamic, relaxation] = await Promise.all([read("dynamic"), read("relaxation")]);
+          return [definition.id, { dynamic, relaxation }];
+        }));
+        if (refreshNumber === state.refreshNumber) {
+          state.backends = Object.fromEntries(values.map(([id, value]) => [id, value.dynamic]));
+          state.relaxation = Object.fromEntries(values.map(([id, value]) => [id, value.relaxation]));
+          definitions.forEach((definition) => renderMethodState(definition, state.backends[definition.id]));
+          renderOverall(); renderCharts(); renderLatest();
+          setText("last-refresh", `Ostatni odczyt: ${new Date().toLocaleTimeString("pl-PL")}`);
+        }
+        state.refreshing = false;
+      }
+
+      renderMethodCards();
+      document.getElementById("refresh-button").addEventListener("click", refreshAll);
+      refreshAll();
+      window.setInterval(refreshAll, 1000);
+    })();
+  </script>
+</body>
+</html>

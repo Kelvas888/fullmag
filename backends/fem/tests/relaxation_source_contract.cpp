@@ -445,6 +445,8 @@ void c_abi_exposes_native_relaxation_step() {
         read_text_file(root / "cpu" / "mfem" / "interactions" / "demag_poisson_hypre.cpp");
     const std::string dmi_workspace =
         read_text_file(root / "cpu" / "mfem" / "interactions" / "dmi_workspace.cpp");
+    const std::string aos_field =
+        read_text_file(root / "cpu" / "mfem" / "runtime" / "aos_field.cpp");
     const std::string dmi_interfacial =
         read_text_file(root / "cpu" / "mfem" / "interactions" / "dmi_interfacial.cpp");
     const std::string dmi_bulk =
@@ -472,16 +474,20 @@ void c_abi_exposes_native_relaxation_step() {
     check(
         dmi_workspace.find("bool refresh_dmi_grid_functions_from_magnetization(") !=
                 std::string::npos &&
-            dmi_workspace.find("audited_host_write(*gf_mx)") != std::string::npos &&
-            dmi_workspace.find("audited_host_write(*gf_my)") != std::string::npos &&
-            dmi_workspace.find("audited_host_write(*gf_mz)") != std::string::npos &&
+            dmi_workspace.find(
+                "copy_local_node_aos_to_mfem_state(ctx, m_xyz, error)") !=
+                std::string::npos &&
+            dmi_workspace.find("audited_host_write(*gf_mx)") == std::string::npos &&
+            aos_field.find("bool copy_local_node_aos_to_mfem_state(") !=
+                std::string::npos &&
+            aos_field.find("audited_host_write(target)") != std::string::npos &&
             dmi_interfacial.find(
-                "refresh_dmi_grid_functions_from_magnetization(ctx, m_xyz, error)") !=
+                "refresh_dmi_grid_functions_from_magnetization(ctx, *dmi_input, error)") !=
                 std::string::npos &&
             dmi_bulk.find(
                 "refresh_dmi_grid_functions_from_magnetization(ctx, *exchange_input, error)") !=
                 std::string::npos,
-        "native FEM DMI field and energy owners must refresh MFEM grid functions from every trial magnetization before derivative evaluation");
+        "native FEM DMI field and energy owners must refresh MFEM grid functions through the canonical AoS adapter before derivative evaluation");
     const auto tangent_gradient_start =
         relaxation_math.find("void tangent_gradient_from_field(");
     const auto tangent_gradient_end =
@@ -1621,17 +1627,23 @@ void gpu_relaxation_pgbb_building_blocks_live_under_native_cuda() {
         "native FEM GPU nonlinear-CG must consume accepted endpoint evaluations once while publishing one logical current-state record, every normal/recovery Armijo trial exactly once, and refinement evaluations");
     check(
         nonlinear_cg_source.find(
-                "gpu_relax_capture_step_transaction_device_unprofiled(ctx, reason)") !=
+                "gpu_relax_restore_previous_state(") !=
                 std::string::npos &&
             nonlinear_cg_source.find(
-                "gpu_relax_restore_step_transaction_device_unprofiled(ctx, restore_reason)") !=
+                "gpu.rk.m_backup,") !=
+                std::string::npos &&
+            nonlinear_cg_source.find("accepted_observables_valid = false") !=
+                std::string::npos &&
+            nonlinear_cg_source.find("fresh_initial_guess_required = true") !=
+                std::string::npos &&
+            nonlinear_cg_source.find("gpu_relax_capture_step_transaction") ==
                 std::string::npos &&
             nonlinear_cg_source.find("restore_gpu_relax_ncg_accepted_evaluation(") !=
                 std::string::npos &&
             nonlinear_cg_source.find(
-                "gpu_relax_invalidate_accepted_evaluation(ctx.gpu_state.device.relaxation)") ==
+                "gpu_relax_invalidate_accepted_evaluation(gpu.relaxation)") !=
                 std::string::npos,
-        "native FEM GPU nonlinear-CG failure rollback must restore the complete published device transaction and prior accepted-endpoint token");
+        "native FEM GPU nonlinear-CG failure rollback must restore authoritative m/direction state and invalidate the accepted token plus derived caches without a full-field transaction");
     check(
         pgbb_header.find("gpu_relax_projected_gradient_bb_step(") !=
                 std::string::npos &&
@@ -2476,10 +2488,11 @@ void gpu_relaxation_ncg_direction_state_is_device_persistent() {
     check(
         ncg_source.find("gpu_relax_restore_previous_state_after_failure(") !=
                 std::string::npos &&
-            ncg_source.find(
-                "gpu_relax_restore_step_transaction_device_unprofiled(") !=
+            ncg_source.find("gpu_relax_restore_previous_state(") !=
                 std::string::npos &&
             ncg_source.find("gpu_relax_restore_previous_direction(") !=
+                std::string::npos &&
+            ncg_source.find("GPU nonlinear-CG rollback synchronization") !=
                 std::string::npos &&
             ncg_source.find("previous device state restored") !=
                 std::string::npos,
@@ -2755,7 +2768,7 @@ void mixed_p1_gpu_relaxators_depend_on_operators_not_tetrahedral_connectivity() 
         "mixed-P1 nonlinear-CG must pack the fresh energy snapshot and current direction scalars into one bounded control readback");
 
     const auto dmi_gate = direct_energy.find(
-        "if (!(bulk_mode ? ctx.dmi.bulk_enabled : ctx.dmi.interfacial_enabled))");
+        "if (!(bulk_mode ? ctx.dmi.bulk_enabled :\n              (ctx.dmi.interfacial_enabled || ctx.dmi.rotated_interfacial_enabled))) {");
     const auto dmi_geometry = direct_energy.find("gpu.mesh_geometry.nodes_xyz");
     check(
         dmi_gate != std::string::npos && dmi_geometry != std::string::npos &&
@@ -2766,7 +2779,7 @@ void mixed_p1_gpu_relaxators_depend_on_operators_not_tetrahedral_connectivity() 
             "bool gpu_state_requires_tetrahedral_mesh_geometry(const Context &ctx)") !=
                 std::string::npos &&
             gpu_state_runtime.find(
-                "return ctx.dmi.interfacial_enabled || ctx.dmi.bulk_enabled ||") !=
+                "return ctx.dmi.interfacial_enabled || ctx.dmi.rotated_interfacial_enabled ||") !=
                 std::string::npos &&
             gpu_state_runtime.find("ctx.stt.zhang_li_enabled;") !=
                 std::string::npos,

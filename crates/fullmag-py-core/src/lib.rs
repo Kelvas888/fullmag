@@ -1,13 +1,21 @@
+use fullmag_application::{DocumentMode, FileProjectRepository, ProjectApplication, ProjectSource};
 use fullmag_engine::fem::MeshTopology;
 use fullmag_engine::fem_solution_transfer::{normalize_unit_vectors, transfer_fem_field_to_grid};
 use fullmag_ir::{
-    validate_mesh_for_execution, BackendPlanIR, MeshIR, ProblemIR, TextureMappingIR,
+    validate_mesh_for_execution, AutosaveFormatIR, BackendPlanIR, ExistingOutputIR, MeshIR,
+    OutputDataFormatIR, OutputStorageIR, ProblemIR, TempCleanupIR, TextureMappingIR,
     TextureProjectionMode,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+mod mixed_certificate;
+
+static OUTPUT_STORAGE_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[pyfunction]
 fn validate_ir_json(ir_json: &str) -> PyResult<bool> {
@@ -27,29 +35,252 @@ fn validate_mesh_ir_json(mesh_ir_json: &str) -> PyResult<bool> {
     Ok(true)
 }
 
-/// Run a ProblemIR JSON through the reference FDM runner.
+/// Open a `.fms` project definition through the shared application boundary.
 ///
-/// Returns:
-///   - JSON string with RunResult (status, steps, final_magnetization)
-///   - Writes artifacts to `output_dir` if provided
+/// This is deliberately an inspect/open operation: it parses the project and
+/// migration report without restoring a runtime session or starting a solve.
 #[pyfunction]
-#[pyo3(signature = (ir_json, until_seconds, output_dir = None))]
+fn open_project_json(path: String) -> PyResult<String> {
+    let mut application = ProjectApplication::new(FileProjectRepository::new());
+    let opened = application
+        .open(ProjectSource::Path(PathBuf::from(&path)))
+        .map_err(|error| PyValueError::new_err(error.to_string()))?;
+    let view = opened.view;
+    let mode = match view.mode {
+        DocumentMode::ReadWrite => serde_json::json!({"kind": "read_write"}),
+        DocumentMode::ReadOnly { reason } => {
+            serde_json::json!({"kind": "read_only", "reason": reason})
+        }
+    };
+    let migration = serde_json::json!({
+        "source_schema": view.migration.source_schema,
+        "target_schema": view.migration.target_schema,
+        "migrated": view.migration.migrated,
+        "can_write": view.migration.can_write,
+        "warnings": view.migration.warnings,
+        "preserved_paths": view.migration.preserved_paths,
+    });
+    serde_json::to_string(&serde_json::json!({
+        "operation": "open_project",
+        "path": path,
+        "project_id": view.project_id,
+        "schema_version": view.schema_version,
+        "revision": view.revision,
+        "dirty": view.dirty,
+        "mode": mode,
+        "migration": migration,
+        "runtime": "untouched",
+    }))
+    .map_err(|error| PyValueError::new_err(error.to_string()))
+}
+
+/// Run a ProblemIR JSON through the reference runner with owned project storage.
+#[pyfunction]
+#[pyo3(signature = (
+    ir_json,
+    until_seconds,
+    output_dir = None,
+    temp_dir = None,
+    data_format = None,
+    temp_cleanup = None,
+    existing_output = None
+))]
 fn run_problem_json(
     ir_json: &str,
     until_seconds: f64,
     output_dir: Option<String>,
+    temp_dir: Option<String>,
+    data_format: Option<String>,
+    temp_cleanup: Option<String>,
+    existing_output: Option<String>,
 ) -> PyResult<String> {
-    let ir: ProblemIR =
+    let mut ir: ProblemIR =
         serde_json::from_str(ir_json).map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let has_authored_output_storage =
+        ir.problem_meta.runtime_metadata.contains_key("output_storage");
+    let explicit_data_format = data_format.is_some();
+    let mut settings = match ir.problem_meta.runtime_metadata.get("output_storage") {
+        Some(value) => serde_json::from_value::<OutputStorageIR>(value.clone())
+            .map_err(|err| PyValueError::new_err(format!("invalid output_storage: {err}")))?,
+        None => OutputStorageIR::default(),
+    };
+    if !has_authored_output_storage && !explicit_data_format {
+        if let Some(stage_autosave) = ir.study.sampling().stage_autosave.as_ref() {
+            settings.data_format = match stage_autosave.format {
+                AutosaveFormatIR::Zarr => OutputDataFormatIR::Zarr,
+                AutosaveFormatIR::Hdf5 => OutputDataFormatIR::Hdf5,
+                AutosaveFormatIR::Txt => settings.data_format,
+            };
+        }
+    }
 
-    let out_path = output_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("run_output"));
+    if let Some(path) = resolve_explicit_path(output_dir)? {
+        settings.output_dir = Some(path);
+    }
+    if let Some(path) = resolve_explicit_path(temp_dir)? {
+        settings.temp_dir = Some(path);
+    }
+    if let Some(value) = data_format {
+        settings.data_format = parse_data_format(&value)?;
+    }
+    if let Some(value) = temp_cleanup {
+        settings.cleanup = parse_temp_cleanup(&value)?;
+    }
+    if let Some(value) = existing_output {
+        settings.existing_output = parse_existing_output(&value)?;
+    }
+    settings
+        .validate()
+        .map_err(|errors| PyValueError::new_err(errors.join("; ")))?;
 
-    let result = fullmag_runner::run_problem(&ir, until_seconds, &out_path)
+    let current_dir = std::env::current_dir()
         .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let source_dir = match ir
+        .problem_meta
+        .runtime_metadata
+        .get("output_storage_source_dir")
+    {
+        Some(value) => value
+            .as_str()
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                PyValueError::new_err("output_storage_source_dir must be a nonempty path string")
+            })?,
+        None => current_dir,
+    };
+    let source_stem = ir
+        .problem_meta
+        .runtime_metadata
+        .get("output_storage_source_stem")
+        .and_then(serde_json::Value::as_str)
+        .filter(|stem| !stem.trim().is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| storage_slug(&ir.problem_meta.name));
+    let extension = match settings.data_format {
+        OutputDataFormatIR::Zarr => "zarr",
+        OutputDataFormatIR::Hdf5 => "results",
+    };
+    let default_output_dir = source_dir.join(format!("{source_stem}.{extension}"));
+    let run_id = format!(
+        "py-{}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?
+            .as_millis(),
+        OUTPUT_STORAGE_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    );
 
-    serde_json::to_string(&result).map_err(|err| PyValueError::new_err(err.to_string()))
+    fullmag_runner::project_storage::configure_project_autosave(
+        &mut ir,
+        settings.data_format,
+        until_seconds,
+    )
+    .map_err(PyValueError::new_err)?;
+
+    ir.problem_meta.runtime_metadata.insert(
+        "output_storage".to_string(),
+        serde_json::to_value(&settings)
+            .map_err(|err| PyValueError::new_err(err.to_string()))?,
+    );
+
+    let mut lease = fullmag_runner::project_storage::ProjectStorageLease::prepare(
+        &settings,
+        &default_output_dir,
+        &source_dir,
+        &run_id,
+    )
+    .map_err(PyValueError::new_err)?;
+    let resolved = serde_json::to_value(lease.resolved())
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    let resolved_output_dir = lease.resolved().output_dir.clone();
+    ir.problem_meta
+        .runtime_metadata
+        .insert("resolved_output_storage".to_string(), resolved.clone());
+
+    let run_result = match fullmag_runner::run_problem(&ir, until_seconds, &resolved_output_dir) {
+        Ok(result) => result,
+        Err(run_error) => {
+            let finalization = lease.finish(false);
+            let message = match finalization {
+                Ok(()) => run_error.to_string(),
+                Err(storage_error) => format!(
+                    "{run_error}; output storage finalization also failed: {storage_error}"
+                ),
+            };
+            return Err(PyValueError::new_err(message));
+        }
+    };
+
+    lease.finish(true).map_err(PyValueError::new_err)?;
+    let mut payload = serde_json::to_value(run_result)
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("output_dir".to_string(), serde_json::json!(resolved_output_dir));
+        object.insert("resolved_output_storage".to_string(), resolved);
+    }
+    serde_json::to_string(&payload).map_err(|err| PyValueError::new_err(err.to_string()))
+}
+
+fn resolve_explicit_path(path: Option<String>) -> PyResult<Option<String>> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        return Ok(Some(path.to_string_lossy().into_owned()));
+    }
+    let current_dir = std::env::current_dir()
+        .map_err(|err| PyValueError::new_err(err.to_string()))?;
+    Ok(Some(current_dir.join(path).to_string_lossy().into_owned()))
+}
+
+fn parse_data_format(value: &str) -> PyResult<OutputDataFormatIR> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "zarr" => Ok(OutputDataFormatIR::Zarr),
+        "hdf5" | "h5" => Ok(OutputDataFormatIR::Hdf5),
+        _ => Err(PyValueError::new_err("data_format must be 'zarr' or 'hdf5'")),
+    }
+}
+
+fn parse_temp_cleanup(value: &str) -> PyResult<TempCleanupIR> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "on_success" => Ok(TempCleanupIR::OnSuccess),
+        "always" => Ok(TempCleanupIR::Always),
+        "never" => Ok(TempCleanupIR::Never),
+        _ => Err(PyValueError::new_err(
+            "temp_cleanup must be 'on_success', 'always', or 'never'",
+        )),
+    }
+}
+
+fn parse_existing_output(value: &str) -> PyResult<ExistingOutputIR> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "timestamp" => Ok(ExistingOutputIR::Timestamp),
+        "error" => Ok(ExistingOutputIR::Error),
+        _ => Err(PyValueError::new_err(
+            "existing_output must be 'timestamp' or 'error'",
+        )),
+    }
+}
+
+fn storage_slug(value: &str) -> String {
+    let slug: String = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "fullmag".to_string()
+    } else {
+        slug.to_string()
+    }
 }
 
 fn rotate_vector_by_quaternion(vector: [f64; 3], quaternion: [f64; 4]) -> [f64; 3] {
@@ -161,7 +392,7 @@ fn sample_preset_texture_v2_json(
 ///   - `next_stage_ir_json`: JSON string of the next stage's `ProblemIR`
 ///
 /// Returns:
-///   - JSON string: `{ "values": [[mx,my,mz],...], "n_located": N, "n_outside": M, "n_total": T }`
+///   - JSON string with values, transfer counts, and canonical `target_grid` identity
 ///   - `null` if the next stage is not FDM (no resampling needed)
 #[pyfunction]
 fn resample_fem_to_fdm_grid_json(
@@ -184,18 +415,31 @@ fn resample_fem_to_fdm_grid_json(
         _ => return Ok(None), // Not FDM — no resampling needed.
     };
 
-    let grid_cells = fdm_plan.grid.cells;
-    let cell_size = fdm_plan.cell_size;
+    let grid_certificate = fdm_plan.grid_certificate.as_ref().ok_or_else(|| {
+        PyValueError::new_err(
+            "resolved FDM target is missing its canonical grid certificate; refusing state transfer",
+        )
+    })?;
+    grid_certificate
+        .validate_against_masks(fdm_plan.active_mask.as_deref(), &fdm_plan.region_mask)
+        .map_err(|e| PyValueError::new_err(format!("invalid FDM target grid certificate: {e}")))?;
+    if grid_certificate.origin_m != fdm_plan.origin_m
+        || grid_certificate.counts != fdm_plan.grid.cells
+        || grid_certificate.cell_m != fdm_plan.cell_size
+    {
+        return Err(PyValueError::new_err(
+            "resolved FDM target grid certificate does not match the planned grid",
+        ));
+    }
+
+    let grid_cells = grid_certificate.counts;
+    let cell_size = grid_certificate.cell_m;
     let grid_dims = [
         grid_cells[0] as usize,
         grid_cells[1] as usize,
         grid_cells[2] as usize,
     ];
-    let grid_origin = [
-        -(grid_cells[0] as f64 * cell_size[0]) * 0.5,
-        -(grid_cells[1] as f64 * cell_size[1]) * 0.5,
-        -(grid_cells[2] as f64 * cell_size[2]) * 0.5,
-    ];
+    let grid_origin = grid_certificate.origin_m;
 
     let topo = MeshTopology::from_ir(&fem_mesh_ir)
         .map_err(|e| PyValueError::new_err(format!("mesh topology build failed: {}", e)))?;
@@ -210,6 +454,12 @@ fn resample_fem_to_fdm_grid_json(
         "n_located": result.n_located,
         "n_outside": result.n_outside,
         "n_total": result.n_total,
+        "target_grid": {
+            "origin_m": grid_certificate.origin_m,
+            "counts": grid_certificate.counts,
+            "cell_m": grid_certificate.cell_m,
+            "grid_fingerprint": grid_certificate.grid_fingerprint,
+        },
     });
 
     serde_json::to_string(&output)
@@ -243,10 +493,23 @@ fn extract_fem_mesh_ir_json(ir_json: &str) -> PyResult<Option<String>> {
 fn fullmag_py_core(_py: Python<'_>, module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(validate_ir_json, module)?)?;
     module.add_function(wrap_pyfunction!(validate_mesh_ir_json, module)?)?;
+    module.add_function(wrap_pyfunction!(open_project_json, module)?)?;
     module.add_function(wrap_pyfunction!(run_problem_json, module)?)?;
     module.add_function(wrap_pyfunction!(sample_preset_texture_v2_json, module)?)?;
     module.add_function(wrap_pyfunction!(resample_fem_to_fdm_grid_json, module)?)?;
     module.add_function(wrap_pyfunction!(extract_fem_mesh_ir_json, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        mixed_certificate::certify_mixed_mesh_arrays,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mixed_certificate::preflight_mixed_mesh_arrays,
+        module
+    )?)?;
+    module.add_function(wrap_pyfunction!(
+        mixed_certificate::mixed_mesh_topology_codes_json,
+        module
+    )?)?;
     Ok(())
 }
 
@@ -297,6 +560,103 @@ mod tests {
             .expect("vector should be an array");
         assert!(value[0].as_f64().unwrap().abs() < 1.0e-12);
         assert!((value[1].as_f64().unwrap() - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn fem_to_fdm_resampling_uses_planned_non_centered_grid_origin() {
+        Python::initialize();
+        let origin = [28e-9, -12e-9, 3e-9];
+        let size = [4e-9, 4e-9, 2e-9];
+        let nodes = vec![
+            origin,
+            [origin[0] + size[0], origin[1], origin[2]],
+            [origin[0] + size[0], origin[1] + size[1], origin[2]],
+            [origin[0], origin[1] + size[1], origin[2]],
+            [origin[0], origin[1], origin[2] + size[2]],
+            [origin[0] + size[0], origin[1], origin[2] + size[2]],
+            [
+                origin[0] + size[0],
+                origin[1] + size[1],
+                origin[2] + size[2],
+            ],
+            [origin[0], origin[1] + size[1], origin[2] + size[2]],
+        ];
+        let mesh = MeshIR::from_legacy_tet4(
+            "shifted_box".to_string(),
+            nodes,
+            vec![
+                [0, 1, 3, 4],
+                [1, 2, 3, 6],
+                [1, 4, 5, 6],
+                [3, 4, 6, 7],
+                [1, 3, 4, 6],
+            ],
+            vec![1; 5],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            std::collections::HashMap::new(),
+        );
+        let mut target = ProblemIR::bootstrap_example();
+        target.geometry.entries = vec![fullmag_ir::GeometryEntryIR::Translate {
+            name: "shifted_box".to_string(),
+            base: Box::new(fullmag_ir::GeometryEntryIR::Box {
+                name: "box".to_string(),
+                size,
+            }),
+            by: [30e-9, -10e-9, 4e-9],
+        }];
+        target.regions[0].geometry = "shifted_box".to_string();
+        target.geometry_assets = Some(fullmag_ir::GeometryAssetsIR {
+            fdm_grid_assets: vec![fullmag_ir::FdmGridAssetIR {
+                geometry_name: "shifted_box".to_string(),
+                cells: [2, 2, 1],
+                cell_size: [2e-9, 2e-9, 2e-9],
+                origin,
+                active_mask: vec![true; 4],
+            }],
+            fem_mesh_assets: Vec::new(),
+            fem_domain_mesh_asset: None,
+        });
+
+        let result_json = resample_fem_to_fdm_grid_json(
+            &serde_json::to_string(&mesh).expect("mesh should serialize"),
+            vec![[1.0, 0.0, 0.0]; 8],
+            &serde_json::to_string(&target).expect("target should serialize"),
+        )
+        .expect("resampling should succeed")
+        .expect("FDM target should require resampling");
+        let result: serde_json::Value =
+            serde_json::from_str(&result_json).expect("result should be JSON");
+
+        assert_eq!(result["n_total"], 4);
+        assert_eq!(result["n_located"], 4);
+        assert_eq!(result["n_outside"], 0);
+        assert_eq!(result["target_grid"]["origin_m"], serde_json::json!(origin));
+        assert_eq!(
+            result["target_grid"]["counts"],
+            serde_json::json!([2, 2, 1])
+        );
+        assert_eq!(
+            result["target_grid"]["cell_m"],
+            serde_json::json!([2e-9, 2e-9, 2e-9])
+        );
+        assert!(
+            result["target_grid"]["grid_fingerprint"]
+                .as_str()
+                .is_some_and(|fingerprint| fingerprint.len() == 64),
+            "target grid identity must cross the JSON API boundary"
+        );
+        assert_eq!(
+            result["values"],
+            serde_json::json!([
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0]
+            ])
+        );
     }
 
     #[test]

@@ -77,7 +77,10 @@ describe("viewport smoke projection round-trip", () => {
   });
 
   it("refuses mutating an existing session without a disposable script guard", () => {
-    const smokeScript = readFileSync(smokeScriptUrl, "utf8");
+    const smokeScript = readFileSync(smokeScriptUrl, "utf8").replace(
+      /\r\n/g,
+      "\n",
+    );
 
     expect(smokeScript).toContain(
       'import { createSmokeMutationGuard } from "./lib/smoke-session-isolation.mjs"',
@@ -99,6 +102,8 @@ describe("viewport smoke projection round-trip", () => {
     expect(justfile).toContain(".fullmag-smoke-disposable");
     expect(justfile).toContain("CONTROL_ROOM_SMOKE_DISPOSABLE_SCRIPT_PATH");
     expect(justfile).toContain("CONTROL_ROOM_SMOKE_DISPOSABLE_FIXTURE_TOKEN");
+    expect(justfile).toContain('static_stamp="{{local_web_root}}/.build-stamp"');
+    expect(justfile).toContain("static Control Room is stale relative to");
   });
 
   it("uses an explicit timestep policy in the disposable FDM smoke fixture", () => {
@@ -281,7 +286,10 @@ describe("viewport smoke projection round-trip", () => {
   });
 
   it("marks controlled missing-session smoke runs in browser config", () => {
-    const smokeScript = readFileSync(smokeScriptUrl, "utf8");
+    const smokeScript = readFileSync(smokeScriptUrl, "utf8").replace(
+      /\r\n/g,
+      "\n",
+    );
 
     expect(smokeScript).toContain("allowMissingSessionSmoke");
     expect(smokeScript).toContain("allowMissingSessionSmoke: allowMissingSession");

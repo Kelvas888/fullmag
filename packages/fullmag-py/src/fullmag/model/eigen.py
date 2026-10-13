@@ -1,11 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
+from numbers import Integral
 from typing import Mapping, Sequence
 
 from fullmag._validation import require_non_empty, require_positive
 
 KVector = tuple[float, float, float]
+
+_BIAS_FIELD_SWEEP_EQUILIBRIUM_POLICIES = {"relax_each", "continuation"}
+_BIAS_FIELD_SWEEP_CONTINUATION_SEEDS = {
+    "previous_accepted_equilibrium",
+    "initial_state",
+}
 
 SUPPORTED_TRACKING_METHODS = {
     "overlap_greedy",
@@ -32,28 +40,96 @@ SUPPORTED_K0_KITTEL_DEMAG_KINDS = {
     "synthetic_demag_factor",
 }
 
+_U32_MAX = 0xFFFF_FFFF
+
 
 def _normalize_vec3(value: Sequence[float], name: str) -> KVector:
-    if len(value) != 3:
+    if isinstance(value, (str, bytes, bytearray)):
+        raise ValueError(f"{name} must have exactly three numeric components")
+    try:
+        value_length = len(value)
+    except TypeError as exc:
+        raise ValueError(f"{name} must have exactly three components") from exc
+    if value_length != 3:
         raise ValueError(f"{name} must have exactly three components")
-    return (float(value[0]), float(value[1]), float(value[2]))
+    try:
+        normalized = (float(value[0]), float(value[1]), float(value[2]))
+    except (TypeError, ValueError, OverflowError, IndexError, KeyError) as exc:
+        raise ValueError(f"{name} must contain numeric values") from exc
+    if not all(math.isfinite(component) for component in normalized):
+        raise ValueError(f"{name} must contain finite values")
+    return normalized
+
+
+@dataclass(frozen=True, slots=True)
+class BiasFieldSweep:
+    """Declared physical bias-field samples in SI ``A/m`` for modal K0 scans."""
+
+    samples_a_per_m: Sequence[Sequence[float]]
+    equilibrium_policy: str = "relax_each"
+    continuation_seed: str = "initial_state"
+
+    def __post_init__(self) -> None:
+        samples = tuple(
+            _normalize_vec3(sample, f"samples_a_per_m[{index}]")
+            for index, sample in enumerate(self.samples_a_per_m)
+        )
+        if not samples:
+            raise ValueError("samples_a_per_m must not be empty")
+        if not all(math.isfinite(component) for sample in samples for component in sample):
+            raise ValueError("samples_a_per_m must contain finite A/m values")
+        if self.equilibrium_policy not in _BIAS_FIELD_SWEEP_EQUILIBRIUM_POLICIES:
+            raise ValueError("equilibrium_policy must be 'relax_each' or 'continuation'")
+        if self.continuation_seed not in _BIAS_FIELD_SWEEP_CONTINUATION_SEEDS:
+            raise ValueError(
+                "continuation_seed must be 'previous_accepted_equilibrium' or 'initial_state'"
+            )
+        object.__setattr__(self, "samples_a_per_m", samples)
+
+    def to_ir(self) -> dict[str, object]:
+        return {
+            "samples_a_per_m": [list(sample) for sample in self.samples_a_per_m],
+            "equilibrium_policy": self.equilibrium_policy,
+            "ordering": "declared",
+            "continuation_seed": self.continuation_seed,
+        }
 
 
 def _tuple_of_positive_ints(values: Sequence[int], name: str) -> tuple[int, ...]:
-    normalized = tuple(int(v) for v in values)
+    if isinstance(values, (str, bytes, bytearray)):
+        raise ValueError(f"{name} must contain positive integers only")
+    try:
+        raw_values = tuple(values)
+    except TypeError as exc:
+        raise ValueError(f"{name} must contain positive integers only") from exc
+    if any(isinstance(value, bool) or not isinstance(value, Integral) for value in raw_values):
+        raise ValueError(f"{name} must contain positive integers only")
+    normalized = tuple(int(v) for v in raw_values)
     if not normalized:
         raise ValueError(f"{name} must not be empty")
     if any(v <= 0 for v in normalized):
         raise ValueError(f"{name} must contain positive integers only")
+    if any(v > _U32_MAX for v in normalized):
+        raise ValueError(f"{name} must contain positive integers in the u32 range")
     return normalized
 
 
 def _tuple_of_sample_indices(values: Sequence[int], name: str) -> tuple[int, ...]:
-    normalized = tuple(int(v) for v in values)
+    if isinstance(values, (str, bytes, bytearray)):
+        raise ValueError(f"{name} must contain non-negative integers only")
+    try:
+        raw_values = tuple(values)
+    except TypeError as exc:
+        raise ValueError(f"{name} must contain non-negative integers only") from exc
+    if any(isinstance(value, bool) or not isinstance(value, Integral) for value in raw_values):
+        raise ValueError(f"{name} must contain non-negative integers only")
+    normalized = tuple(int(v) for v in raw_values)
     if not normalized:
         raise ValueError(f"{name} must not be empty")
     if any(v < 0 for v in normalized):
         raise ValueError(f"{name} must contain non-negative integers only")
+    if any(v > _U32_MAX for v in normalized):
+        raise ValueError(f"{name} must contain non-negative integers in the u32 range")
     return normalized
 
 
@@ -75,8 +151,8 @@ def _normalize_frequency_window(value: Sequence[float]) -> tuple[float, float]:
         raise ValueError("frequency_window_hz minimum must be >= 0")
     if hi <= lo:
         raise ValueError("frequency_window_hz maximum must be greater than minimum")
-    if hi > 5.0e9:
-        raise ValueError("frequency_window_hz maximum must not exceed 5 GHz")
+    if not math.isfinite(lo) or not math.isfinite(hi):
+        raise ValueError("frequency_window_hz bounds must be finite")
     return (lo, hi)
 
 
@@ -109,9 +185,16 @@ class KPath:
     closed: bool = False
 
     def __post_init__(self) -> None:
-        normalized_points = tuple(self.points)
+        if isinstance(self.points, (str, bytes, bytearray)):
+            raise ValueError("KPath points must be a sequence of KPoint instances")
+        try:
+            normalized_points = tuple(self.points)
+        except TypeError as exc:
+            raise ValueError("KPath points must be a sequence of KPoint instances") from exc
         if len(normalized_points) < 2:
             raise ValueError("KPath requires at least two points")
+        if any(not isinstance(point, KPoint) for point in normalized_points):
+            raise ValueError("KPath points must be KPoint instances")
         object.__setattr__(self, "points", normalized_points)
 
         normalized_samples = _tuple_of_positive_ints(
@@ -171,8 +254,6 @@ class ThinFilmDEBVDispersionValidation:
     def __post_init__(self) -> None:
         require_positive(self.film_thickness_m, "film_thickness_m")
         max_k = require_positive(self.max_k_rad_per_m, "max_k_rad_per_m")
-        if max_k > 3.0e6:
-            raise ValueError("max_k_rad_per_m must not exceed 3e6")
         max_relative_error = require_positive(self.max_relative_error, "max_relative_error")
         if max_relative_error > 0.25:
             raise ValueError("max_relative_error must not exceed 0.25")
@@ -361,6 +442,8 @@ def serialize_k_sampling(value: object | None) -> dict[str, object] | None:
             "kind": "single",
             "k_vector": list(value.k),
         }
+    if isinstance(value, (str, bytes, bytearray)):
+        raise ValueError("k_sampling must have exactly three numeric components")
     if isinstance(value, (tuple, list)):
         k = _normalize_vec3(value, "k_sampling")
         return {
@@ -382,7 +465,13 @@ def coerce_k_sampling(
     if k_sampling is not None:
         return serialize_k_sampling(k_sampling)
     if legacy_k_vector is not None:
-        return serialize_k_sampling(tuple(float(v) for v in legacy_k_vector))
+        if isinstance(legacy_k_vector, (str, bytes, bytearray)):
+            raise ValueError("k_vector must have exactly three numeric components")
+        try:
+            normalized_legacy_k_vector = tuple(legacy_k_vector)
+        except TypeError as exc:
+            raise ValueError("k_vector must have exactly three numeric components") from exc
+        return serialize_k_sampling(normalized_legacy_k_vector)
     return None
 
 

@@ -1,7 +1,8 @@
 //! Runtime-registry engine resolution for backend dispatch.
 
-use fullmag_ir::{BackendPlanIR, FdmPlanIR, FemPlanIR, ProblemIR};
+use fullmag_ir::{BackendPlanIR, ExecutionPlanIR, FdmPlanIR, FemPlanIR, ProblemIR};
 
+use crate::fem::eigen_execution_resolution::{FemEigenExecutionLane, PlannedFemEigenExecution};
 use crate::runtime_registry::RuntimeRegistry;
 use crate::solver_runtime::diagnostics::runtime_fallback;
 use crate::solver_runtime::engine::{
@@ -266,13 +267,94 @@ pub(crate) fn resolve_fem_engine_with_registry(
     })
 }
 
+fn planned_fem_eigen_dispatch_resolution(
+    execution: PlannedFemEigenExecution<'_>,
+    registry: Option<&RuntimeRegistry>,
+) -> Result<DispatchEngineResolution, RunError> {
+    let resolution = execution.resolution().ok_or_else(|| RunError {
+        message: "planned_fem_eigen_resolution_missing_at_session_boundary".to_string(),
+    })?;
+    let (engine, device) = match execution.lane() {
+        FemEigenExecutionLane::Cpu => (FemEngine::CpuNative, "cpu"),
+        FemEigenExecutionLane::Gpu => (FemEngine::NativeGpu, "gpu"),
+    };
+    let precision = match resolution.resolved_precision {
+        fullmag_ir::ExecutionPrecision::Double => "double",
+        fullmag_ir::ExecutionPrecision::Single => "single",
+    };
+    let runtime = registry
+        .map(|registry| {
+            registry.resolve("fem", device, precision).ok_or_else(|| RunError {
+                message: format!(
+                    "planned_fem_eigen_runtime_unavailable: resolved_engine={} device={device} precision={precision}",
+                    execution.engine_id()
+                ),
+            })
+        })
+        .transpose()?;
+    Ok(DispatchEngineResolution {
+        engine: DispatchEngine::Fem(engine),
+        fallback: resolution.fallback_reason.as_ref().map(|reason| {
+            runtime_fallback(
+                "auto",
+                execution.engine_id(),
+                reason,
+                format!(
+                    "FEM eigen planner resolved auto execution to {} ({})",
+                    execution.engine_id(),
+                    resolution.selection_reason
+                ),
+            )
+        }),
+        runtime_family: runtime
+            .as_ref()
+            .map(|runtime| runtime.runtime_family.clone()),
+        worker: runtime.map(|runtime| runtime.worker),
+        resolved_backend: "fem".to_string(),
+        resolved_device: device.to_string(),
+        resolved_precision: precision.to_string(),
+        fem_crossover_decision: None,
+    })
+}
+
+pub(crate) fn resolve_antenna_inspection_runtime(
+    inspection: &fullmag_ir::AntennaExternalLeadInspectionBackendPlanIR,
+    registry: Option<&RuntimeRegistry>,
+) -> Result<DispatchEngineResolution, RunError> {
+    crate::antenna_external_lead_solution::validate_execution(&inspection.requested_execution)?;
+    let runtime = registry
+        .map(|registry| {
+            registry.resolve("fem", "cpu", "double").ok_or_else(|| RunError {
+                message: "antenna inspection requires an advertised FEM CPU double runtime; no GPU or magnetic fallback".into(),
+            })
+        })
+        .transpose()?;
+    if registry.is_none() && !crate::native_fem::is_cpu_available() {
+        return Err(RunError {
+            message: "antenna inspection requires native FEM CPU availability; no legacy or magnetic fallback".into(),
+        });
+    }
+    Ok(DispatchEngineResolution {
+        engine: DispatchEngine::Fem(FemEngine::CpuNative),
+        fallback: None,
+        runtime_family: runtime
+            .as_ref()
+            .map(|runtime| runtime.runtime_family.clone()),
+        worker: runtime.map(|runtime| runtime.worker),
+        resolved_backend: "fem".into(),
+        resolved_device: "cpu".into(),
+        resolved_precision: "double".into(),
+        fem_crossover_decision: None,
+    })
+}
+
 pub(crate) fn resolve_with_registry(
     problem: &ProblemIR,
+    plan: &ExecutionPlanIR,
     registry: Option<&RuntimeRegistry>,
     explicit_selection: bool,
     preview_enabled: bool,
 ) -> Result<DispatchEngineResolution, RunError> {
-    let plan = fullmag_plan::plan(problem)?;
     match registry {
         Some(registry) => match &plan.backend_plan {
             BackendPlanIR::Fdm(fdm) => {
@@ -288,11 +370,27 @@ pub(crate) fn resolve_with_registry(
                 Some(fem),
                 preview_enabled,
             ),
-            BackendPlanIR::FemEigen(_) => {
-                resolve_fem_engine_with_registry(problem, registry, explicit_selection, None, false)
+            BackendPlanIR::FemEigen(fem) => {
+                match crate::fem::eigen_execution_resolution::resolve_planned_fem_eigen_execution(
+                    plan, fem,
+                )? {
+                    Some(execution) => {
+                        planned_fem_eigen_dispatch_resolution(execution, Some(registry))
+                    }
+                    None => resolve_fem_engine_with_registry(
+                        problem,
+                        registry,
+                        explicit_selection,
+                        None,
+                        false,
+                    ),
+                }
             }
             BackendPlanIR::FemFrequencyResponse(_) => {
                 resolve_fem_engine_with_registry(problem, registry, explicit_selection, None, false)
+            }
+            BackendPlanIR::AntennaExternalLeadInspection(inspection) => {
+                resolve_antenna_inspection_runtime(inspection, Some(registry))
             }
         },
         None => match &plan.backend_plan {
@@ -345,21 +443,28 @@ pub(crate) fn resolve_with_registry(
                     fem_crossover_decision: resolution.fem_crossover_decision,
                 })
             }
-            BackendPlanIR::FemEigen(_) => {
-                let resolution = resolve_fem_engine_with_trail(problem)?;
-                Ok(DispatchEngineResolution {
-                    engine: DispatchEngine::Fem(resolution.engine),
-                    fallback: resolution.fallback,
-                    runtime_family: None,
-                    worker: None,
-                    resolved_backend: "fem".to_string(),
-                    resolved_device: match resolution.engine {
-                        FemEngine::NativeGpu => "gpu".to_string(),
-                        FemEngine::CpuNative => "cpu".to_string(),
-                    },
-                    resolved_precision: runtime_precision(problem).to_string(),
-                    fem_crossover_decision: None,
-                })
+            BackendPlanIR::FemEigen(fem) => {
+                match crate::fem::eigen_execution_resolution::resolve_planned_fem_eigen_execution(
+                    plan, fem,
+                )? {
+                    Some(execution) => planned_fem_eigen_dispatch_resolution(execution, None),
+                    None => {
+                        let resolution = resolve_fem_engine_with_trail(problem)?;
+                        Ok(DispatchEngineResolution {
+                            engine: DispatchEngine::Fem(resolution.engine),
+                            fallback: resolution.fallback,
+                            runtime_family: None,
+                            worker: None,
+                            resolved_backend: "fem".to_string(),
+                            resolved_device: match resolution.engine {
+                                FemEngine::NativeGpu => "gpu".to_string(),
+                                FemEngine::CpuNative => "cpu".to_string(),
+                            },
+                            resolved_precision: runtime_precision(problem).to_string(),
+                            fem_crossover_decision: None,
+                        })
+                    }
+                }
             }
             BackendPlanIR::FemFrequencyResponse(_) => {
                 let resolution = resolve_fem_engine_with_trail(problem)?;
@@ -376,6 +481,9 @@ pub(crate) fn resolve_with_registry(
                     resolved_precision: runtime_precision(problem).to_string(),
                     fem_crossover_decision: None,
                 })
+            }
+            BackendPlanIR::AntennaExternalLeadInspection(inspection) => {
+                resolve_antenna_inspection_runtime(inspection, None)
             }
         },
     }

@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "snake_case")]
 pub enum QuantityId {
     M,
+    /// Resolved Frozen Spins degree-of-freedom mask (`1` frozen, `0` free).
+    FrozenSpins,
     HEx,
     HDemag,
     HExt,
@@ -19,6 +21,7 @@ pub enum QuantityId {
     Torque,
     HAni,
     HDmi,
+    HDmiRotated,
     HMel,
     U,
     Eps,
@@ -33,6 +36,7 @@ pub enum QuantityId {
     EDrive,
     EAni,
     EDmi,
+    ERotatedDmi,
     EEl,
     EKinEl,
     ElasticResidualNorm,
@@ -55,6 +59,8 @@ pub enum QuantityId {
     EdenAni,
     /// Spatial DMI energy density (J/m³).
     EdenDmi,
+    /// Spatial rotated-interfacial DMI energy density (J/m³).
+    EdenRotatedDmi,
     /// Spatial total energy density (J/m³).
     EdenTotal,
     /// Resolved saturation magnetization material parameter (A/m).
@@ -87,6 +93,7 @@ impl QuantityId {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::M => "m",
+            Self::FrozenSpins => "frozen_spins",
             Self::HEx => "H_ex",
             Self::HDemag => "H_demag",
             Self::HExt => "H_ext",
@@ -96,6 +103,7 @@ impl QuantityId {
             Self::Torque => "torque",
             Self::HAni => "H_ani",
             Self::HDmi => "H_dmi",
+            Self::HDmiRotated => "H_rotated_dmi",
             Self::HMel => "H_mel",
             Self::U => "u",
             Self::Eps => "eps",
@@ -110,6 +118,7 @@ impl QuantityId {
             Self::EDrive => "E_drive",
             Self::EAni => "E_ani",
             Self::EDmi => "E_dmi",
+            Self::ERotatedDmi => "E_rotated_dmi",
             Self::EEl => "E_el",
             Self::EKinEl => "E_kin_el",
             Self::ElasticResidualNorm => "elastic_residual_norm",
@@ -126,6 +135,7 @@ impl QuantityId {
             Self::EdenDrive => "eden_drive",
             Self::EdenAni => "eden_ani",
             Self::EdenDmi => "eden_dmi",
+            Self::EdenRotatedDmi => "eden_rotated_dmi",
             Self::EdenTotal => "eden_total",
             Self::MatMs => "mat_ms",
             Self::MatAex => "mat_aex",
@@ -145,6 +155,7 @@ impl QuantityId {
     /// All defined quantity IDs.
     pub const ALL: &'static [QuantityId] = &[
         Self::M,
+        Self::FrozenSpins,
         Self::HEx,
         Self::HDemag,
         Self::HExt,
@@ -154,6 +165,7 @@ impl QuantityId {
         Self::Torque,
         Self::HAni,
         Self::HDmi,
+        Self::HDmiRotated,
         Self::HMel,
         Self::U,
         Self::Eps,
@@ -168,6 +180,7 @@ impl QuantityId {
         Self::EDrive,
         Self::EAni,
         Self::EDmi,
+        Self::ERotatedDmi,
         Self::EEl,
         Self::EKinEl,
         Self::ElasticResidualNorm,
@@ -184,6 +197,7 @@ impl QuantityId {
         Self::EdenDrive,
         Self::EdenAni,
         Self::EdenDmi,
+        Self::EdenRotatedDmi,
         Self::EdenTotal,
         Self::MatMs,
         Self::MatAex,
@@ -227,6 +241,7 @@ impl std::error::Error for QuantityIdError {}
 pub fn normalize_quantity_id(requested: &str) -> Result<QuantityId, QuantityIdError> {
     match requested {
         "m" | "M" => Ok(QuantityId::M),
+        "frozen_spins" | "frozen_mask" => Ok(QuantityId::FrozenSpins),
         "H_ex" | "h_ex" => Ok(QuantityId::HEx),
         "H_demag" | "h_demag" => Ok(QuantityId::HDemag),
         "H_ext" | "h_ext" => Ok(QuantityId::HExt),
@@ -236,6 +251,7 @@ pub fn normalize_quantity_id(requested: &str) -> Result<QuantityId, QuantityIdEr
         "torque" => Ok(QuantityId::Torque),
         "H_ani" | "h_ani" => Ok(QuantityId::HAni),
         "H_dmi" | "h_dmi" => Ok(QuantityId::HDmi),
+        "H_rotated_dmi" | "h_rotated_dmi" => Ok(QuantityId::HDmiRotated),
         "H_mel" | "h_mel" => Ok(QuantityId::HMel),
         "u" => Ok(QuantityId::U),
         "eps" => Ok(QuantityId::Eps),
@@ -250,6 +266,7 @@ pub fn normalize_quantity_id(requested: &str) -> Result<QuantityId, QuantityIdEr
         "E_drive" | "e_drive" => Ok(QuantityId::EDrive),
         "E_ani" | "e_ani" => Ok(QuantityId::EAni),
         "E_dmi" | "e_dmi" => Ok(QuantityId::EDmi),
+        "E_rotated_dmi" | "e_rotated_dmi" => Ok(QuantityId::ERotatedDmi),
         "E_el" | "e_el" => Ok(QuantityId::EEl),
         "E_kin_el" | "e_kin_el" => Ok(QuantityId::EKinEl),
         "elastic_residual_norm" => Ok(QuantityId::ElasticResidualNorm),
@@ -266,6 +283,7 @@ pub fn normalize_quantity_id(requested: &str) -> Result<QuantityId, QuantityIdEr
         "eden_drive" => Ok(QuantityId::EdenDrive),
         "eden_ani" => Ok(QuantityId::EdenAni),
         "eden_dmi" => Ok(QuantityId::EdenDmi),
+        "eden_rotated_dmi" => Ok(QuantityId::EdenRotatedDmi),
         "eden_total" => Ok(QuantityId::EdenTotal),
         "mat_ms" | "material_ms" => Ok(QuantityId::MatMs),
         "mat_aex" | "material_aex" | "material_a" => Ok(QuantityId::MatAex),

@@ -18,11 +18,21 @@ owner: fullmag-public-docs
 (python-api-magnets-and-textures-uniform-texture-governing-equations)=
 ## Governing equations
 
+```{math}
+:label: eq-record-2
+
+q_{\mathrm{IR}} = \mathrm{record}(\text{qualified inputs})
+```
+
 The preset evaluates $\mathbf m(\mathbf x)=\mathbf m_0$ at every active sample point. The runtime
 normalization policy belongs to the initial-state evaluator.
 
 (python-api-magnets-and-textures-uniform-texture-symbols-and-si-units)=
 ## Symbols and SI units
+
+| Symbol | Meaning | SI unit |
+|---|---|---|
+| q | canonical typed authoring quantity | \mathrm{1} |
 
 All direction components and `preset_version` are dimensionless.
 
@@ -101,6 +111,20 @@ A uniform preset is an initial condition, not a persistent magnetization constra
 No independent interaction is introduced.
 
 (python-api-magnets-and-textures-uniform-texture-source-code-index)=
+
+## Control Room crosswalk
+
+Status: The exposed texture families are partial; unlisted presets remain Python-only.
+
+| Python/API surface | Control Room path | Status | Transaction |
+|---|---|---|---|
+| Parameters documented on this page | `Model Explorer -> Objects -> <object> -> Magnetization` | `partial` | Apply magnetization draft; authored object state is revised |
+| Parameters without a named UI field | `Model Explorer -> Objects -> <object> -> Magnetization` | `not implemented` | Python-only until implemented |
+
+frontend support is not implemented for texture presets and arguments not exposed by ObjectMagneticTexturePanel.
+See [Control Room capability register](/frontend/capability-register) for the support matrix and not implemented policy.
+Frontend source owner: `apps/control-room/src/modules/inspector/panels/ObjectMagneticTexturePanel.tsx (ObjectMagneticTexturePanel)`.
+
 ## Source-code index
 
 | Claim | Path | Stable symbol | Responsibility | Evidence |

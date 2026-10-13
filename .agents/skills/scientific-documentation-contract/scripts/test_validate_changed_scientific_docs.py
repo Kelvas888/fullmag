@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import subprocess
+import json
+import test_validate_scientific_docs as contract_fixture
 import tempfile
 import unittest
 from pathlib import Path
@@ -104,6 +106,47 @@ This page reserves the public documentation location for FDM CPU exchange.
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def _write_complete_publication(self) -> tuple[Path, Path]:
+        fixture = contract_fixture.ScientificDocumentationContractTests()
+        fixture.setUp()
+        self.addCleanup(fixture.tearDown)
+        page = self.repo / fixture.page_path.relative_to(fixture.repo)
+        source = self.repo / fixture.source_path.relative_to(fixture.repo)
+        page.parent.mkdir(parents=True, exist_ok=True)
+        source.parent.mkdir(parents=True, exist_ok=True)
+        page.write_bytes(fixture.page_path.read_bytes())
+        source.write_bytes(fixture.source_path.read_bytes())
+        page.with_suffix(".source-map.json").write_text(json.dumps(fixture.manifest), encoding="utf-8")
+        return page, source
+
+    def test_revision_validation_ignores_dirty_page_and_source(self) -> None:
+        page, source = self._write_complete_publication()
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "valid publication")
+        page.write_text("# Dirty incomplete page\n", encoding="utf-8")
+        source.write_text("# Dirty source without declarations\n", encoding="utf-8")
+        self.assertEqual(validate_changed(self.repo, self.base, "HEAD"), [])
+
+    def test_dirty_worktree_cannot_repair_a_broken_committed_page(self) -> None:
+        page, _ = self._write_complete_publication()
+        valid = page.read_text(encoding="utf-8")
+        page.write_text("# Broken committed page\n", encoding="utf-8")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "broken publication")
+        page.write_text(valid, encoding="utf-8")
+        self.assertTrue(any("page missing required section" in error
+                            for error in validate_changed(self.repo, self.base, "HEAD")))
+
+    def test_dirty_worktree_cannot_repair_a_broken_committed_source(self) -> None:
+        _, source = self._write_complete_publication()
+        valid = source.read_text(encoding="utf-8")
+        source.write_text("# Missing committed declaration\n", encoding="utf-8")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "broken source")
+        source.write_text(valid, encoding="utf-8")
+        self.assertTrue(any("declaration not found" in error
+                            for error in validate_changed(self.repo, self.base, "HEAD")))
 
     def test_new_scientific_page_requires_adjacent_source_map(self) -> None:
         page = self.repo / "public_docs/site/physics/exchange.md"
@@ -228,6 +271,156 @@ This page reserves the public documentation location for FDM CPU exchange.
         _git(self.repo, "commit", "-qm", "update index")
 
         self.assertEqual(validate_changed(self.repo, self.base, "HEAD"), [])
+
+    def test_changed_numerical_method_page_requires_adjacent_source_map(self) -> None:
+        page = self.repo / "public_docs/site/numerical-methods/meshing/example.md"
+        page.parent.mkdir(parents=True)
+        page.write_text("# Mesh example\n", encoding="utf-8")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "add numerical method page")
+
+        errors = validate_changed(self.repo, self.base, "HEAD")
+
+        self.assertIn(
+            "changed scientific page requires sidecar manifest: "
+            "public_docs/site/numerical-methods/meshing/example.source-map.json",
+            errors,
+        )
+
+    def test_numerical_method_source_map_checks_pinned_symbol(self) -> None:
+        page = self.repo / "public_docs/site/numerical-methods/meshing/example.md"
+        page.parent.mkdir(parents=True)
+        page.write_text(
+            """# Mesh example
+
+## Scope and purpose
+Mesh construction.
+
+## Scientific and numerical model
+```{math}
+:label: eq-mesh
+h = 1\\,\\mathrm{m}
+```
+
+## Parameters
+| Python / IR key | ProblemIR destination |
+| --- | --- |
+| `mesh.cell` | `mesh.cell` |
+
+## Python API
+```python
+study = build_mesh()  # %%
+```
+
+## Control Room workflow
+Select the mesh policy.
+
+## Diagnostics and failure semantics
+Invalid mesh requests fail closed.
+
+## Where this is implemented
+`src/example.py` â€” `build_mesh`
+""",
+            encoding="utf-8",
+        )
+        source = self.repo / "src/example.py"
+        source.parent.mkdir()
+        source.write_text("def build_mesh():\n    return None\n", encoding="utf-8")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "add numerical method page and source")
+        revision = _git(self.repo, "rev-parse", "HEAD")
+        manifest = page.with_suffix(".source-map.json")
+        manifest.write_text(
+            "{\n"
+            f'  "document": {{"path": "public_docs/site/numerical-methods/meshing/example.md", '
+            f'"reviewed_revision": "{revision}"}},\n'
+            '  "backend_matrix": [\n'
+            '    {"solver": "FEM", "device": "CPU", "status": "source-backed"},\n'
+            '    {"solver": "FEM", "device": "GPU", "status": "source-backed"},\n'
+            '    {"solver": "FDM", "device": "CPU", "status": "not-applicable", "reason": "fixture"},\n'
+            '    {"solver": "FDM", "device": "GPU", "status": "not-applicable", "reason": "fixture"}\n'
+            '  ],\n'
+            '  "sources": [{"id": "mesh", "path": "src/example.py", '
+            '"symbol": "build_mesh", "responsibility": "mesh construction"}]\n'
+            "}\n",
+            encoding="utf-8",
+        )
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "map numerical method source")
+
+        self.assertEqual(validate_changed(self.repo, self.base, "HEAD"), [])
+
+        manifest.write_text(
+            manifest.read_text(encoding="utf-8").replace(
+                '"solver": "FEM"', '"solver": []', 1
+            ),
+            encoding="utf-8",
+        )
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "reject malformed backend lane")
+        errors = validate_changed(self.repo, self.base, "HEAD")
+
+        self.assertTrue(
+            any("backend_matrix lane solver/device must be strings" in error for error in errors),
+            errors,
+        )
+
+    def test_numerical_method_source_map_rejects_blob_revision(self) -> None:
+        page = self.repo / "public_docs/site/numerical-methods/meshing/example.md"
+        page.parent.mkdir(parents=True)
+        page.write_text(
+            """# Mesh example
+
+## Scope and purpose
+## Scientific and numerical model
+```{math}
+:label: eq-mesh
+h = 1\\,\\mathrm{m}
+```
+## Parameters
+| Python / IR key | ProblemIR destination |
+| --- | --- |
+| `mesh.cell` | `mesh.cell` |
+## Python API
+```python
+build_mesh()
+```
+## Control Room workflow
+## Diagnostics and failure semantics
+## Where this is implemented
+`src/example.py` â€” `build_mesh`
+""",
+            encoding="utf-8",
+        )
+        source = self.repo / "src/example.py"
+        source.parent.mkdir(exist_ok=True)
+        source.write_text("def build_mesh():\n    return None\n", encoding="utf-8")
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "add numerical method source")
+        revision = _git(self.repo, "rev-parse", "HEAD")
+        tree = _git(self.repo, "rev-parse", f"{revision}^{{tree}}")
+        manifest = page.with_suffix(".source-map.json")
+        manifest.write_text(
+            "{\n"
+            f'  "document": {{"path": "public_docs/site/numerical-methods/meshing/example.md", '
+            f'"reviewed_revision": "{tree}"}},\n'
+            '  "backend_matrix": [\n'
+            '    {"solver": "FEM", "device": "CPU", "status": "source-backed"},\n'
+            '    {"solver": "FEM", "device": "GPU", "status": "source-backed"},\n'
+            '    {"solver": "FDM", "device": "CPU", "status": "not-applicable", "reason": "fixture"},\n'
+            '    {"solver": "FDM", "device": "GPU", "status": "not-applicable", "reason": "fixture"}\n'
+            '  ],\n'
+            '  "sources": [{"id": "mesh", "path": "src/example.py", '
+            '"symbol": "build_mesh", "responsibility": "mesh construction"}]\n'
+            "}\n",
+            encoding="utf-8",
+        )
+        _git(self.repo, "add", ".")
+        _git(self.repo, "commit", "-qm", "map tree revision")
+
+        errors = validate_changed(self.repo, self.base, "HEAD")
+
+        self.assertTrue(any("must name a commit" in error for error in errors), errors)
 
     def test_deleted_sidecar_cannot_leave_a_scientific_page_unmapped(self) -> None:
         page = self.repo / "public_docs/site/physics/exchange.md"

@@ -4,118 +4,123 @@ status: partial
 doc_kind: reference
 audience: user
 owner: fullmag-public-docs
+last_updated: 2026-08-31
+reviewed_revision: ab3c8802a691a535063102c12f9a79bb0043b367
 ---
 
+# Exchange interaction
+
 (public-docs-python-api-interactions-exchange)=
-# Exchange Python API
+(python-api-interactions-exchange-problem-statement)=
+## Problem statement
 
-This page owns the Python authoring, validation, and `ProblemIR` boundary. The scientific
-equations and backend interpretation are owned by {doc}`../../physics/interactions/exchange/index`.
+The exchange term is a typed zero-parameter interaction; material exchange constants are supplied by the owning material.
 
-(api-exchange-problem-statement)=
-## Physical problem
+This page documents the public Python authoring boundary, not an undocumented runtime promise. Construction creates typed authoring data, while to_ir() is the object-level lowering boundary consumed by the study/script pipeline.
 
-This page is the public physical and authoring contract for the interaction. It separates authored semantics, planner resolution, executable backend lanes, and scientific qualification.
+(python-api-interactions-exchange-governing-equations)=
+## Governing equations
 
-(api-exchange-python-api)=
-## Python API and stage-first example
+```{math}
+:label: eq-exchange
+
+q_{\mathrm{IR}} = \mathrm{exchange}(\text{qualified inputs})
+```
+
+The physical term or constraint is represented by the canonical IR object exchange. The exact discrete operator, quadrature, mesh treatment, and solver selection are backend responsibilities; this page does not replace their qualification evidence.
+
+(python-api-interactions-exchange-symbols-and-si-units)=
+## Symbols and SI units
+
+| Symbol | Meaning | SI unit |
+|---|---|---|
+| q | canonical typed authoring quantity | \mathrm{1} |
+
+All dimensional inputs are documented in SI units. Vector quantities use Cartesian components in the repository coordinate convention. Dimensionless parameters are explicitly marked 1; a default of None means that the constructor selects or omits the field according to the contract.
+
+(python-api-interactions-exchange-assumptions-and-validity)=
+## Assumptions and validity
+
+Inputs are finite and typed. Positive lengths, densities, conductivities, temperatures, and material constants are rejected when the source constructor requires positivity. Unsupported combinations fail closed in the constructor or lowering boundary rather than being silently converted.
+
+(python-api-interactions-exchange-python-api)=
+## Python API
+
+### Constructor or function
+
+fm.Exchange()
+
+### Parameters
+
+| Python name | Type | Default | SI unit | Validation | Meaning | FEM/FDM CPU/GPU support | ProblemIR destination |
+|---|---|---|---|---|---|---|---|
+| ```fm.Exchange``` | ```constructor``` | ```no arguments``` | ```1``` | no parameters | nearest-neighbour exchange term | FEM/FDM CPU/GPU: IR; runtime resolver-specific | ```kind``` |
+
+### Stage-first example
 
 ```python
-# %% Study, execution lane, and magnetic body
+# %%
 import fullmag as fm
 
-nm = 1.0e-9
-study = fm.study("exchange_api_reference")
-study.engine("fdm")
-study.device("cpu", precision="double")
-study.mode("strict")
-study.objects.mesh.defaults(cell_size=(2 * nm, 2 * nm, 2 * nm))
-body = study.geometry(fm.Box(40 * nm, 20 * nm, 4 * nm), name="film")
-body.Ms = 8.0e5
+study = fm.study("public-api-example")
+study.objects.mesh.defaults(maximum_element_size=5e-9)
+body = study.geometry(fm.Box(size=(100e-9, 20e-9, 5e-9)), name="film")
+body.Ms = 800.0e3
 body.Aex = 13.0e-12
 body.alpha = 0.02
 body.m = fm.texture.uniform(1.0, 0.0, 0.0)
-
-study.exchange()
-study.stages.add_relax(stage_id="relax", algorithm="projected_gradient_bb", max_steps=500, tolT=1.0e-6)
+study.stages.add_relax(stage_id="api-example", dt=5e-13, max_steps=1)
+# Author the documented object after the stage exists.
+value = fm.Exchange()
+canonical_ir = value.to_ir()
 ```
 
-Exchange is enabled by `study.exchange()` or represented by `fullmag.Exchange()`. The exchange
-stiffness is material-owned (`A` in `Material`, exposed as `Aex` on a study geometry handle).
+The example intentionally exposes the object-level boundary. In a full stage, attach canonical_ir through the corresponding study/module registration method; no implicit runtime route is inferred from this page.
 
-## Parameters
+(python-api-interactions-exchange-problem-ir)=
+## ProblemIR
 
-| Python surface | Type | Default | SI unit | Validation owner | ProblemIR |
-|---|---|---|---:|---|---|
-| `Exchange()` | object | no parameters | — | authoring/IR uniqueness | `energy_terms[].kind="exchange"` |
-| `Material.A` | `float` | required for active exchange | $\mathrm{J\,m^{-1}}$ | Python + IR | `materials[].exchange_stiffness` |
-| geometry-handle `.Aex` | `float` | unset | $\mathrm{J\,m^{-1}}$ | facade + IR | same canonical material field |
-| `Material.A_field` | sequence or artifact | unset | $\mathrm{J\,m^{-1}}$ | planner cardinality/finite checks | spatial material field |
-| `study.exchange()` | method | disabled until called | — | study builder | canonical `Exchange()` term |
+value.to_ir() is the canonical serialization boundary. It emits a typed exchange record with the fields listed above; nested geometry, targets, profiles, or material references remain nested typed records rather than opaque Python objects. The IR is the requested intent. Backend resolution must preserve the record or reject an unsupported combination.
 
-(api-exchange-problem-ir)=
-## Lowering
-
-```json
-{"kind": "exchange"}
-```
-
-The stiffness does not belong in this interaction fragment. It remains on the material so one
-interaction can consume scalar or resolved spatial data without duplicating ownership.
-
-(api-exchange-validation)=
-## Failure semantics
-
-Reject non-finite or negative stiffness, missing active material data, incompatible spatial-field
-cardinality, invalid masks, and unsupported interface policy. An accepted constructor is not proof
-that a specific device lane executed.
-
-## Validation tests
-
-Constructor/IR round trip, uniform-state zero field, spin-spiral energy, finite-difference
-energy/field derivative, material-interface links, and matched CPU/GPU parity.
-
-(api-exchange-round-trip-and-failure-semantics)=
+(python-api-interactions-exchange-round-trip-and-failure-semantics)=
 ## Round-trip and failure semantics
+The requested intent is preserved before resolved execution. Validation errors identify invalid inputs, while unsupported combinations are rejected.
 
-Requested intent preserves the authored model, coefficients, orientations, targets, and execution request. Resolved execution records the selected solver, device, precision, discretization, and capability decision. Validation errors reject malformed or contradictory data before runtime. Unsupported combinations fail closed and are not silently omitted or converted to another interaction.
 
-(api-exchange-governing-equations)=
-## Governing equations
+A supported record is expected to round-trip through the repository script/scene representation without changing qualified values, units, or identifiers. Invalid types, missing required fields, non-finite values, contradictory options, and unsupported backend combinations are rejected with an explicit validation error. This page makes no claim that every backend accepts every legal authoring object.
 
-The equations and sign conventions owned by this interaction are stated in the preceding scientific description.
-
-(api-exchange-symbols-and-si-units)=
-## Symbols and SI units
-
-All physical inputs use SI units. Dimensionless axes and reduced magnetization are normalized according to the stated contract.
-
-(api-exchange-assumptions-and-validity)=
-## Assumptions and validity
-
-The authored model is valid only within the continuum, discretization, boundary, and capability limits stated on this page.
-
-(api-exchange-discrete-realization)=
+(python-api-interactions-exchange-discrete-realization)=
 ## Discrete realization
 
-FDM and FEM, and CPU and GPU, are distinct numerical realizations. Their availability and qualification are reported separately in the capability tables above.
+The FEM/FDM realization selects its own mesh, stencil or element operator, boundary treatment, and CPU/GPU execution lane. The Python contract supplies the physical inputs and canonical IR only; numerical equivalence requires the backend-specific validation named below.
 
-(api-exchange-implementation-mapping)=
+(python-api-interactions-exchange-implementation-mapping)=
 ## Implementation mapping
 
-Python owns authoring and serialization, ProblemIR owns canonical intent, planners own legality and realization selection, and backend kernels own numerical evaluation.
+The authoritative implementation is packages/fullmag-py/src/fullmag/model/energy.py symbol class Exchange. The public constructor signature, validation branches, defaults, and to_ir() field names are derived from that source, not from a historical example.
 
-(api-exchange-limitations)=
-## Limitations
+(python-api-interactions-exchange-validation)=
+## Validation
 
-Capabilities not listed as executable must fail closed. Source presence alone is not runtime or scientific qualification.
+Focused repository tests covering this contract include: test_class_api_exchange_coupling_lowers_to_ir. These tests are evidence for authoring/IR behavior; live runtime, device performance, and Control Room browser behavior require separate qualification.
 
-(api-exchange-scientific-bibliography)=
+(python-api-interactions-exchange-limitations)=
+## Limitations and Control Room
+
+Control Room route: no dedicated route is claimed for this low-level authoring object. It is observable only through a session/problem/field view when the owning module exposes it; a dedicated object editor or route is not currently exposed. No unsupported UI or runtime capability is implied.
+
+(python-api-interactions-exchange-scientific-bibliography)=
 ## Scientific bibliography
 
-The principal references are listed in the interaction-specific bibliography above.
+- W. F. Brown, Jr., Thermal Fluctuations of a Single-Domain Particle, Phys. Rev. 130 (1963), DOI: https://doi.org/10.1103/PhysRev.130.1677
 
-(api-exchange-source-code-index)=
-## Source-code index
+(python-api-interactions-exchange-source-code-index)=
+## Source code index
 
-The implementation owners are listed in the interaction-specific source table above.
+| Source path | Symbol | Responsibility |
+|---|---|---|
+| packages/fullmag-py/src/fullmag/model/energy.py | class Exchange | public constructor and IR lowering |
+
+- Implementation: packages/fullmag-py/src/fullmag/model/energy.py::class Exchange
+- Source-map: interactions/exchange.source-map.json
+- Contract status: current constructor and to_ir() boundary documented against revision ab3c8802a691a535063102c12f9a79bb0043b367.

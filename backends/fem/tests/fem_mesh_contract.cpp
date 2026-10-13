@@ -110,6 +110,10 @@ struct MeshBuffers {
     std::vector<uint32_t> facet_markers{3u, 4u, 5u};
     std::vector<uint32_t> periodic_node_pairs{15u, 16u};
     std::vector<uint32_t> periodic_boundary_pair_markers{5u, 6u};
+    std::vector<double> ms_field;
+    std::vector<double> a_field;
+    std::vector<double> alpha_field;
+    std::vector<double> ms_element_field;
 
     fullmag_fem_mesh_desc desc() const {
         fullmag_fem_mesh_desc mesh{};
@@ -239,6 +243,43 @@ fullmag_fem_plan_desc qualified_mixed_operator_plan(const MeshBuffers &source) {
     return plan;
 }
 
+fullmag_fem_regional_field_drive_desc qualified_global_uniform_sinc_drive() {
+    fullmag_fem_regional_field_drive_desc drive{};
+    drive.abi_version = FULLMAG_FEM_REGIONAL_FIELD_DRIVE_ABI_VERSION;
+    drive.struct_size = sizeof(drive);
+    drive.target.abi_version = FULLMAG_FEM_REGIONAL_FIELD_DRIVE_ABI_VERSION;
+    drive.target.struct_size = sizeof(drive.target);
+    drive.target.kind = FULLMAG_FEM_FIELD_TARGET_GLOBAL;
+    drive.spatial_profile.abi_version = FULLMAG_FEM_REGIONAL_FIELD_DRIVE_ABI_VERSION;
+    drive.spatial_profile.struct_size = sizeof(drive.spatial_profile);
+    drive.spatial_profile.kind = FULLMAG_FEM_SPATIAL_PROFILE_UNIFORM;
+    drive.amplitude_b_t = 1.0e-3;
+    drive.direction[1] = 1.0;
+    drive.waveform.abi_version = FULLMAG_FEM_REGIONAL_FIELD_DRIVE_ABI_VERSION;
+    drive.waveform.struct_size = sizeof(drive.waveform);
+    drive.waveform.kind = FULLMAG_FEM_TIME_SINC_PULSE;
+    drive.waveform.parameters.sinc_pulse = {10.0e9, 2.0e-9, 1.0};
+    drive.time_origin = FULLMAG_FEM_TIME_STAGE_LOCAL;
+    return drive;
+}
+
+void native_physics_gate_accepts_only_qualified_global_uniform_sinc_drive() {
+    MeshBuffers source = qualified_mixed_operator_mesh();
+    fullmag::fem::Context ctx;
+    std::string error;
+    check(fullmag::fem::initialize_mesh_plan_fields(ctx, source.desc(), error), error.c_str());
+
+    auto plan = qualified_mixed_operator_plan(source);
+    auto drive = qualified_global_uniform_sinc_drive();
+    plan.regional_field_drives = &drive;
+    plan.regional_field_drive_count = 1;
+    for (const char *device : {"cpu", "cuda"}) {
+        plan.mfem_device_string = device;
+        error.clear();
+        check(fullmag::fem::validate_supported_physics_topology(ctx, plan, error), error.c_str());
+    }
+}
+
 void native_physics_gate_accepts_only_qualified_explicit_cpu_or_cuda_mixed_p1_operator_scope() {
     MeshBuffers source = qualified_mixed_operator_mesh();
     fullmag::fem::Context ctx;
@@ -252,6 +293,72 @@ void native_physics_gate_accepts_only_qualified_explicit_cpu_or_cuda_mixed_p1_op
         check(fullmag::fem::validate_supported_physics_topology(ctx, plan, error), error.c_str());
     }
 
+    for (const char *device : accepted_devices) {
+        const size_t node_count = source.nodes_xyz.size() / 3u;
+        std::vector<double> ku(node_count, 1.0e5);
+        std::vector<double> ku2(node_count, 2.0e4);
+        std::vector<double> axis_x(node_count, 0.0);
+        std::vector<double> axis_y(node_count, 0.0);
+        std::vector<double> axis_z(node_count, 1.0);
+        std::vector<double> kc1(node_count, 3.0e4);
+        std::vector<double> kc2(node_count, 4.0e3);
+        std::vector<double> kc3(node_count, 5.0e2);
+        auto local_anisotropy = qualified_mixed_operator_plan(source);
+        local_anisotropy.mfem_device_string = device;
+        local_anisotropy.has_uniaxial_anisotropy = 1;
+        local_anisotropy.uniaxial_anisotropy_constant = 1.0e5;
+        local_anisotropy.uniaxial_anisotropy_k2 = 2.0e4;
+        local_anisotropy.ku_field = ku.data();
+        local_anisotropy.ku_field_len = ku.size();
+        local_anisotropy.ku2_field = ku2.data();
+        local_anisotropy.ku2_field_len = ku2.size();
+        local_anisotropy.anisotropy_axis_x_field = axis_x.data();
+        local_anisotropy.anisotropy_axis_x_field_len = axis_x.size();
+        local_anisotropy.anisotropy_axis_y_field = axis_y.data();
+        local_anisotropy.anisotropy_axis_y_field_len = axis_y.size();
+        local_anisotropy.anisotropy_axis_z_field = axis_z.data();
+        local_anisotropy.anisotropy_axis_z_field_len = axis_z.size();
+        local_anisotropy.has_cubic_anisotropy = 1;
+        local_anisotropy.cubic_kc1 = 3.0e4;
+        local_anisotropy.cubic_kc2 = 4.0e3;
+        local_anisotropy.cubic_kc3 = 5.0e2;
+        local_anisotropy.kc1_field = kc1.data();
+        local_anisotropy.kc1_field_len = kc1.size();
+        local_anisotropy.kc2_field = kc2.data();
+        local_anisotropy.kc2_field_len = kc2.size();
+        local_anisotropy.kc3_field = kc3.data();
+        local_anisotropy.kc3_field_len = kc3.size();
+        error.clear();
+        check(fullmag::fem::validate_supported_physics_topology(
+                  ctx, local_anisotropy, error),
+              error.c_str());
+    }
+
+
+    auto cpu_dmi = qualified_mixed_operator_plan(source);
+    const size_t dmi_node_count = source.nodes_xyz.size() / 3u;
+    std::vector<double> dind(dmi_node_count, 2.0e-3);
+    std::vector<double> dbulk(dmi_node_count, 3.0e-3);
+    cpu_dmi.mfem_device_string = "cpu";
+    cpu_dmi.has_interfacial_dmi = 1;
+    cpu_dmi.has_bulk_dmi = 1;
+    cpu_dmi.dind_field = dind.data();
+    cpu_dmi.dind_field_len = dind.size();
+    cpu_dmi.dbulk_field = dbulk.data();
+    cpu_dmi.dbulk_field_len = dbulk.size();
+    error.clear();
+    check(fullmag::fem::validate_supported_physics_topology(ctx, cpu_dmi, error), error.c_str());
+
+    auto cuda_dmi = cpu_dmi;
+    cuda_dmi.mfem_device_string = "cuda";
+    error.clear();
+    check(!fullmag::fem::validate_supported_physics_topology(ctx, cuda_dmi, error),
+          "CUDA mixed-P1 DMI must remain rejected before the tetrahedral-only kernel");
+    check(error.find("fallback=none") != std::string::npos, error.c_str());
+
+    check(error.find("failed_predicates=[gpu_dmi_kernel_not_mixed_p1]") !=
+              std::string::npos,
+          error.c_str());
     struct Case {
         const char *name;
         void (*mutate)(fullmag_fem_plan_desc &, MeshBuffers &);
@@ -281,17 +388,31 @@ void native_physics_gate_accepts_only_qualified_explicit_cpu_or_cuda_mixed_p1_op
         {"FEM-BEM", [](fullmag_fem_plan_desc &value, MeshBuffers &) {
              value.demag_realization = FULLMAG_FEM_DEMAG_FREDKIN_KOEHLER;
          }},
-        {"DMI", [](fullmag_fem_plan_desc &value, MeshBuffers &) {
-             value.has_bulk_dmi = 1;
-         }},
         {"STT", [](fullmag_fem_plan_desc &value, MeshBuffers &) {
              value.has_zhang_li_stt = 1;
          }},
         {"thermal", [](fullmag_fem_plan_desc &value, MeshBuffers &) {
              value.temperature = 300.0;
          }},
-        {"DG0", [](fullmag_fem_plan_desc &value, MeshBuffers &) {
-             value.ms_element_field_len = value.mesh.cell_types_len;
+        {"DG0", [](fullmag_fem_plan_desc &value, MeshBuffers &buffers) {
+             buffers.ms_element_field.assign(value.mesh.cell_types_len, 8.0e5);
+             value.ms_element_field = buffers.ms_element_field.data();
+             value.ms_element_field_len = buffers.ms_element_field.size();
+         }},
+        {"nodal Ms", [](fullmag_fem_plan_desc &value, MeshBuffers &buffers) {
+             buffers.ms_field.assign(value.mesh.nodes_xyz_len / 3u, 8.0e5);
+             value.ms_field = buffers.ms_field.data();
+             value.ms_field_len = buffers.ms_field.size();
+         }},
+        {"nodal A", [](fullmag_fem_plan_desc &value, MeshBuffers &buffers) {
+             buffers.a_field.assign(value.mesh.nodes_xyz_len / 3u, 13.0e-12);
+             value.a_field = buffers.a_field.data();
+             value.a_field_len = buffers.a_field.size();
+         }},
+        {"nodal alpha", [](fullmag_fem_plan_desc &value, MeshBuffers &buffers) {
+             buffers.alpha_field.assign(value.mesh.nodes_xyz_len / 3u, 0.02);
+             value.alpha_field = buffers.alpha_field.data();
+             value.alpha_field_len = buffers.alpha_field.size();
          }},
         {"PBC", [](fullmag_fem_plan_desc &value, MeshBuffers &mesh) {
              mesh.periodic_node_pairs = {0u, 1u};
@@ -319,6 +440,69 @@ void native_physics_gate_accepts_only_qualified_explicit_cpu_or_cuda_mixed_p1_op
         check(error.find("explicit_cpu_or_gpu") != std::string::npos, error.c_str());
         check(error.find("fallback=none") != std::string::npos, error.c_str());
     }
+}
+
+MeshBuffers qualified_pure_prism_p2_mesh() {
+    MeshBuffers source;
+    source.nodes_xyz = {
+        0, 0, 0,  1, 0, 0,  0, 1, 0,
+        0, 0, 1,  1, 0, 1,  0, 1, 1,
+        2, 0, 0,  3, 0, 0,  2, 1, 0,
+        2, 0, 1,  3, 0, 1,  2, 1, 1,
+    };
+    source.cell_types = {FULLMAG_FEM_CELL_PRISM6, FULLMAG_FEM_CELL_PRISM6};
+    source.cell_offsets = {0u, 6u, 12u};
+    source.cell_nodes = {
+        0u, 1u, 2u, 3u, 4u, 5u,
+        6u, 7u, 8u, 9u, 10u, 11u,
+    };
+    source.cell_global_ordinals = {100u, 101u};
+    source.cell_markers = {1u, 0u};
+    source.facet_types = {FULLMAG_FEM_FACET_TRI3, FULLMAG_FEM_FACET_QUAD4};
+    source.facet_roles = {
+        FULLMAG_FEM_FACET_ROLE_EXTERIOR,
+        FULLMAG_FEM_FACET_ROLE_EXTERIOR,
+    };
+    source.facet_offsets = {0u, 3u, 7u};
+    source.facet_nodes = {0u, 2u, 1u, 6u, 7u, 10u, 9u};
+    source.facet_global_ordinals = {700u, 701u};
+    source.facet_markers = {99u, 99u};
+    source.periodic_node_pairs.clear();
+    source.periodic_boundary_pair_markers.clear();
+    return source;
+}
+
+void native_physics_gate_accepts_bounded_cpu_pure_prism_p2_shared_domain() {
+    MeshBuffers source = qualified_pure_prism_p2_mesh();
+    fullmag::fem::Context ctx;
+    std::string error;
+    check(fullmag::fem::initialize_mesh_plan_fields(ctx, source.desc(), error), error.c_str());
+    auto plan = qualified_mixed_operator_plan(source);
+    check(fullmag::fem::validate_supported_physics_topology(ctx, plan, error), error.c_str());
+
+    auto cuda = plan;
+    cuda.mfem_device_string = "cuda";
+    error.clear();
+    check(!fullmag::fem::validate_supported_physics_topology(ctx, cuda, error),
+          "pure prism P2 must remain CPU-only until CUDA is qualified");
+    check(error.find("pure_prism_p2_cpu_only") != std::string::npos, error.c_str());
+    check(error.find("fallback=none") != std::string::npos, error.c_str());
+
+    MeshBuffers missing_air = source;
+    missing_air.cell_markers = {1u, 1u};
+    fullmag::fem::Context missing_air_ctx;
+    error.clear();
+    check(fullmag::fem::initialize_mesh_plan_fields(
+              missing_air_ctx, missing_air.desc(), error),
+          error.c_str());
+    auto missing_air_plan = qualified_mixed_operator_plan(missing_air);
+    error.clear();
+    check(!fullmag::fem::validate_supported_physics_topology(
+              missing_air_ctx, missing_air_plan, error),
+          "pure prism shared domain without air markers must fail closed");
+    check(error.find("prism_shared_domain_magnetic_air_markers") !=
+              std::string::npos,
+          error.c_str());
 }
 
 void typed_mesh_import_accepts_empty_optional_buffers() {
@@ -533,7 +717,9 @@ void element_family_tables_cover_all_supported_cells() {
 int main() {
     typed_mesh_import_copies_every_canonical_buffer();
     exported_mesh_abi_query_matches_compiled_layout();
+    native_physics_gate_accepts_only_qualified_global_uniform_sinc_drive();
     native_physics_gate_accepts_only_qualified_explicit_cpu_or_cuda_mixed_p1_operator_scope();
+    native_physics_gate_accepts_bounded_cpu_pure_prism_p2_shared_domain();
     typed_mesh_import_accepts_empty_optional_buffers();
     typed_mesh_import_rejects_bad_version_pointers_and_lengths();
     typed_mesh_import_rejects_invalid_csr_enums_indices_duplicates_and_jacobians();

@@ -6,23 +6,9 @@
     "pnpm": "10.8.1"
   },
   "packageManager": "pnpm@10.8.1",
-  "pnpm": {
-    "overrides": {
-      "@babel/core": "7.29.6",
-      "brace-expansion@1": "1.1.18",
-      "brace-expansion@2": "2.1.4",
-      "brace-expansion@5": "5.0.9",
-      "js-yaml": "4.3.1",
-      "nanoid@3": "3.3.17",
-      "nanoid@5": "5.1.16",
-      "postcss": "8.5.23",
-      "sharp": "0.35.0",
-      "vite": "8.0.16"
-    }
-  },
   "scripts": {
     "web:dev": "pnpm --dir apps/control-room dev",
-    "web:clean": "rm -rf apps/control-room/.next",
+    "web:clean": "node scripts/clean-control-room-next.mjs",
     "web:generate-api": "pnpm --dir apps/control-room generate:api",
     "web:generate-openapi": "pnpm --dir apps/control-room generate:openapi-v2",
     "web:generate-api-types": "pnpm --dir apps/control-room generate:api-v2-types",
@@ -41,8 +27,5 @@
   },
   "devDependencies": {
     "react-doctor": "^0.9.12"
-  },
-  "dependencies": {
-    "next": "^16.3.1"
   }
 }

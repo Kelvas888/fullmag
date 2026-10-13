@@ -1,4 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
+import { fieldVectorResourceKey } from "@/kernel/api/fieldQueryIdentity";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -21,10 +22,16 @@ describe("FrequencyDomainTables", () => {
             {
               branchId: null,
               dampingRateHz: null,
+              displayModeIndex: 1,
               frequencyHz: 750e6,
               imaginaryFrequencyHz: 20e6,
+              modeFieldAvailable: true,
               modeFieldId: "analysis:eigen:sample-0000:mode-0001",
-              modeFieldResourceKey: null,
+              modeFieldResourceKey: fieldVectorResourceKey(
+                "analysis:eigen:sample-0000:mode-0001",
+                { phase_rad: 0, view: "phase_rotated_real" },
+              ),
+              modeId: null,
               rawModeIndex: 1,
               residualNorm: null,
               sampleIndex: 0,
@@ -86,7 +93,7 @@ describe("FrequencyDomainTables", () => {
               linewidthHz: null,
               modeRef: null,
               phaseRad: null,
-              source: "modal",
+              source: "driven_response",
               validationStatus: "pass",
             },
           ]}
@@ -108,6 +115,7 @@ describe("FrequencyDomainTables", () => {
       'aria-label="Plot this eigen mode with phase-rotated real display for sample 0 mode 1"',
     );
     expect(html).toContain('title="Plot this eigen mode with phase-rotated real display"');
+    expect(html).not.toContain('title="Mode field artifact is missing"');
     expect(html).toContain('title="Plot the real part of this eigen mode"');
     expect(html).toContain(
       'title="Plot this response field with phase-rotated real display"',
@@ -139,10 +147,12 @@ describe("FrequencyDomainTables", () => {
           {
             branchId: "raw",
             dampingRateHz: null,
+            displayModeIndex: 2,
             frequencyHz: 1.2e9,
             imaginaryFrequencyHz: null,
             modeFieldId: null,
             modeFieldResourceKey: null,
+            modeId: null,
             rawModeIndex: 2,
             residualNorm: null,
             sampleIndex: 0,
@@ -171,10 +181,12 @@ describe("FrequencyDomainTables", () => {
           {
             branchId: "acoustic",
             dampingRateHz: null,
+            displayModeIndex: 1,
             frequencyHz: 1e9,
             imaginaryFrequencyHz: null,
             modeFieldId: "analysis:eigen:sample-0000:mode-0001",
             modeFieldResourceKey: null,
+            modeId: null,
             rawModeIndex: 1,
             residualNorm: null,
             sampleIndex: 0,
@@ -183,10 +195,12 @@ describe("FrequencyDomainTables", () => {
           {
             branchId: "optical",
             dampingRateHz: null,
+            displayModeIndex: 2,
             frequencyHz: 2e9,
             imaginaryFrequencyHz: null,
             modeFieldId: "analysis:eigen:sample-0000:mode-0002",
             modeFieldResourceKey: null,
+            modeId: null,
             rawModeIndex: 2,
             residualNorm: null,
             sampleIndex: 0,

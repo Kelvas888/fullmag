@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useSyncExternalStore } from "react";
-import { BufferAttribute, type BufferGeometry } from "three";
+import { BufferAttribute, DynamicDrawUsage, type BufferGeometry } from "three";
 
 import { createViewport3DGpuUploadManager } from "../build-engine/gpu/viewport3dGpuUploadManager";
 import type { Viewport3DGpuUploadChunk } from "../build-engine/gpu/viewport3dGpuUploadTypes";
@@ -29,8 +29,14 @@ interface Viewport3DScalarColorUploadPlan {
   readonly onVisible: () => void;
 }
 
+export interface Viewport3DScalarColorUploadResult {
+  readonly buffer: ScalarColorBuffer | null;
+  readonly fresh: boolean;
+}
+
 interface Viewport3DScalarShaderUploadSnapshot {
   readonly buffer: ScalarColorBuffer | null;
+  readonly fresh: boolean;
   readonly geometry: BufferGeometry | null;
   readonly retentionKey: string | null;
   readonly version: number;
@@ -42,6 +48,7 @@ interface Viewport3DScalarShaderUploadStore {
     buffer: ScalarColorBuffer | null,
     geometry: BufferGeometry | null,
     retentionKey: string | null,
+    fresh?: boolean,
   ) => void;
   readonly subscribe: (listener: () => void) => () => void;
 }
@@ -49,6 +56,7 @@ interface Viewport3DScalarShaderUploadStore {
 const EMPTY_VIEWPORT_3D_SCALAR_SHADER_UPLOAD_SNAPSHOT:
   Viewport3DScalarShaderUploadSnapshot = {
     buffer: null,
+    fresh: false,
     geometry: null,
     retentionKey: null,
     version: 0,
@@ -56,6 +64,7 @@ const EMPTY_VIEWPORT_3D_SCALAR_SHADER_UPLOAD_SNAPSHOT:
 
 interface Viewport3DScalarColorUploadSnapshot {
   readonly buffer: ScalarColorBuffer | null;
+  readonly fresh: boolean;
   readonly geometry: BufferGeometry | null;
   readonly retentionKey: string | null;
   readonly version: number;
@@ -67,6 +76,7 @@ interface Viewport3DScalarColorUploadStore {
     buffer: ScalarColorBuffer | null,
     geometry: BufferGeometry | null,
     retentionKey: string | null,
+    fresh?: boolean,
   ) => void;
   readonly subscribe: (listener: () => void) => () => void;
 }
@@ -74,6 +84,7 @@ interface Viewport3DScalarColorUploadStore {
 const EMPTY_VIEWPORT_3D_SCALAR_COLOR_UPLOAD_SNAPSHOT:
   Viewport3DScalarColorUploadSnapshot = {
     buffer: null,
+    fresh: false,
     geometry: null,
     retentionKey: null,
     version: 0,
@@ -103,7 +114,40 @@ export function canRetainViewport3DScalarUploadBuffer({
   );
 }
 
-function createViewport3DScalarColorUploadStore(): Viewport3DScalarColorUploadStore {
+export function isViewport3DScalarUploadSnapshotCurrent({
+  requestedGeometry,
+  requestedRetentionKey,
+  snapshotGeometry,
+  snapshotRetentionKey,
+}: {
+  requestedGeometry: BufferGeometry | null;
+  requestedRetentionKey: string | null | undefined;
+  snapshotGeometry: BufferGeometry | null;
+  snapshotRetentionKey: string | null;
+}): boolean {
+  return (
+    snapshotGeometry === requestedGeometry &&
+    snapshotRetentionKey === (requestedRetentionKey ?? null)
+  );
+}
+
+export function canReuseViewport3DScalarShaderAttributes(
+  previous: ScalarColorBuffer | null | undefined,
+  next: ScalarColorBuffer | null | undefined,
+): boolean {
+  return Boolean(
+    previous &&
+      next &&
+      previous.buildKey &&
+      previous.buildKey === next.buildKey &&
+      previous.scalarValues === next.scalarValues &&
+      previous.vectorValues === next.vectorValues &&
+      previous.complexRealValues === next.complexRealValues &&
+      previous.complexImagValues === next.complexImagValues,
+  );
+}
+
+export function createViewport3DScalarColorUploadStore(): Viewport3DScalarColorUploadStore {
   const listeners = new Set<() => void>();
   let snapshot = EMPTY_VIEWPORT_3D_SCALAR_COLOR_UPLOAD_SNAPSHOT;
 
@@ -111,14 +155,17 @@ function createViewport3DScalarColorUploadStore(): Viewport3DScalarColorUploadSt
     buffer: ScalarColorBuffer | null,
     geometry: BufferGeometry | null,
     retentionKey: string | null,
+    fresh = true,
   ): void {
     if (
       snapshot.buffer === buffer &&
+      snapshot.fresh === fresh &&
       snapshot.geometry === geometry &&
       snapshot.retentionKey === retentionKey
     ) return;
     snapshot = {
       buffer,
+      fresh,
       geometry,
       retentionKey,
       version: snapshot.version + 1,
@@ -164,24 +211,13 @@ export function useViewport3DScalarColorUpload({
   uploadKey: string;
   vertexColorsEnabled: boolean;
   vertexCount: number;
-}): ScalarColorBuffer | null {
-  const uploadManager = useMemo(
-    () =>
-      createViewport3DGpuUploadManager({
-        policy: {
-          targetFrameBudgetMs: VIEWPORT_3D_SCALAR_COLOR_UPLOAD_FRAME_BUDGET_MS,
-        },
-      }),
-    [],
-  );
+}): Viewport3DScalarColorUploadResult {
   const store = useMemo(() => createViewport3DScalarColorUploadStore(), []);
   const snapshot = useSyncExternalStore(
     store.subscribe,
     store.getSnapshot,
     store.getSnapshot,
   );
-
-  useEffect(() => () => uploadManager.dispose(), [uploadManager]);
 
   useEffect(() => {
     if (!enabled || !geometry) return;
@@ -197,10 +233,16 @@ export function useViewport3DScalarColorUpload({
         requestedRetentionKey: retentionKey,
         retentionKey: current.retentionKey,
       })) {
+        store.publish(current.buffer, geometry, current.retentionKey, false);
         return;
       }
+      if (current.buffer) {
+        tracker.recordRetentionRejection(
+          current.geometry !== geometry ? "geometry" : "retention-key",
+        );
+      }
       applyVertexScalarColorBuffer(geometry, null, vertexCount);
-      store.publish(null, geometry, null);
+      store.publish(null, geometry, null, false);
       tracker.recordDirtyFrame(dirtyReason);
       invalidate();
       return;
@@ -221,15 +263,29 @@ export function useViewport3DScalarColorUpload({
         requestedRetentionKey: retentionKey,
         retentionKey: current.retentionKey,
       })) {
+        store.publish(current.buffer, geometry, current.retentionKey, false);
         return;
       }
+      if (current.buffer) {
+        tracker.recordRetentionRejection(
+          current.geometry !== geometry ? "geometry" : "retention-key",
+        );
+      }
       applyVertexScalarColorBuffer(geometry, null, vertexCount);
-      store.publish(null, geometry, null);
+      store.publish(null, geometry, null, false);
       tracker.recordDirtyFrame(dirtyReason);
       invalidate();
       return;
     }
 
+    // Keep the manager inside the effect lifetime. React StrictMode intentionally
+    // runs setup -> cleanup -> setup on mount; disposing a useMemo-owned manager
+    // in that cleanup would leave the remounted manager permanently unusable.
+    const uploadManager = createViewport3DGpuUploadManager({
+      policy: {
+        targetFrameBudgetMs: VIEWPORT_3D_SCALAR_COLOR_UPLOAD_FRAME_BUDGET_MS,
+      },
+    });
     const abortController = new AbortController();
     uploadManager.enqueue({
       chunks: uploadPlan.chunks,
@@ -238,7 +294,7 @@ export function useViewport3DScalarColorUpload({
       lane: "field-color",
       onVisible: () => {
         uploadPlan.onVisible();
-        store.publish(effectiveColorBuffer, geometry, retentionKey ?? null);
+        store.publish(effectiveColorBuffer, geometry, retentionKey ?? null, true);
         tracker.recordDirtyFrame(dirtyReason);
         invalidate();
       },
@@ -248,6 +304,7 @@ export function useViewport3DScalarColorUpload({
 
     return () => {
       abortController.abort();
+      uploadManager.dispose();
     };
   }, [
     colorBuffer,
@@ -260,12 +317,18 @@ export function useViewport3DScalarColorUpload({
     targetRevision,
     tracker,
     uploadKey,
-    uploadManager,
     vertexColorsEnabled,
     vertexCount,
   ]);
 
-  return snapshot.geometry === geometry ? snapshot.buffer : null;
+  return isViewport3DScalarUploadSnapshotCurrent({
+    requestedGeometry: geometry,
+    requestedRetentionKey: retentionKey,
+    snapshotGeometry: snapshot.geometry,
+    snapshotRetentionKey: snapshot.retentionKey,
+  })
+    ? { buffer: snapshot.buffer, fresh: snapshot.fresh }
+    : { buffer: null, fresh: false };
 }
 
 export function createViewport3DScalarColorUploadPlan(
@@ -284,28 +347,68 @@ export function createViewport3DScalarColorUploadPlan(
     existing.array instanceof Float32Array
       ? existing
       : null;
-  const attribute =
-    existingAttribute ??
-    new BufferAttribute(new Float32Array(vertexCount * 3), 3);
-  const target = attribute.array as Float32Array;
+  // S-19: fmScalarValue/fmVectorValue/... i tu "color" są nadpisywane co
+  // krok animacji fazy (bufferSubData wiele razy na sekundę). Domyślny
+  // StaticDrawUsage sugeruje sterownikowi jednorazowy zapis — częste
+  // aktualizacje na takiej alokacji wymuszają realokację bufora GPU albo
+  // synchronizację potoku. Hint trzeba ustawić przed pierwszym bufferData,
+  // czyli w momencie tworzenia atrybutu (nie przy każdym ponownym użyciu).
+  // New attributes use the staging array directly; compatible live
+  // attributes get one bounded replacement array for the pending plan.
+  const staging = new Float32Array(vertexCount * 3);
+  const attribute = existingAttribute ?? new BufferAttribute(staging, 3);
+  if (!existingAttribute) {
+    attribute.setUsage(DynamicDrawUsage);
+  }
+  const previousArray = existingAttribute
+    ? (existingAttribute.array as Float32Array)
+    : null;
+  const previousUpdateRanges = existingAttribute
+    ? existingAttribute.updateRanges.map(({ start, count }) => ({
+        count,
+        start,
+      }))
+    : [];
+  // Keep all chunk writes off the live geometry. This adds one bounded CPU
+  // staging array per active attribute, but an aborted ticket leaves both the
+  // attached attribute and its GPU buffer untouched.
   const source = colorBuffer.colors;
   const safeBatchSize = Math.max(1, Math.floor(batchSize));
   const chunks: Viewport3DGpuUploadChunk[] = [];
+  let committed = false;
   const rollback = () => {
-    if (!existingAttribute && geometry.getAttribute("color") === attribute) {
+    if (existingAttribute) {
+      if (
+        !committed ||
+        geometry.getAttribute("color") !== attribute ||
+        !previousArray
+      ) {
+        return;
+      }
+      attribute.array = previousArray;
+      attribute.clearUpdateRanges();
+      for (const range of previousUpdateRanges) {
+        attribute.addUpdateRange(range.start, range.count);
+      }
+      // The version intentionally advances so the renderer uploads the
+      // restored array even when the previous state had no update range.
+      attribute.needsUpdate = true;
+      committed = false;
+      return;
+    }
+    if (geometry.getAttribute("color") === attribute) {
       geometry.deleteAttribute("color");
     }
+    committed = false;
   };
 
-  attribute.clearUpdateRanges();
   for (let start = 0; start < vertexCount; start += safeBatchSize) {
     const end = Math.min(start + safeBatchSize, vertexCount);
     chunks.push({
       estimatedBytes: (end - start) * 3 * Float32Array.BYTES_PER_ELEMENT,
       itemCount: end - start,
       upload: () => {
-        target.set(source.subarray(start * 3, end * 3), start * 3);
-        attribute.addUpdateRange(start * 3, (end - start) * 3);
+        staging.set(source.subarray(start * 3, end * 3), start * 3);
       },
       rollback,
     });
@@ -315,9 +418,15 @@ export function createViewport3DScalarColorUploadPlan(
     chunks,
     estimatedBytes: source.byteLength,
     onVisible: () => {
-      if (!existingAttribute) {
+      if (existingAttribute) {
+        attribute.array = staging;
+        committed = true;
+      } else {
         geometry.setAttribute("color", attribute);
+        committed = true;
       }
+      attribute.clearUpdateRanges();
+      attribute.addUpdateRange(0, staging.length);
       attribute.needsUpdate = true;
     },
   };
@@ -345,24 +454,13 @@ export function useViewport3DScalarShaderColorUpload({
   tracker: Viewport3DResourceTracker;
   uploadKey: string;
   vertexCount: number;
-}): ScalarColorBuffer | null {
-  const uploadManager = useMemo(
-    () =>
-      createViewport3DGpuUploadManager({
-        policy: {
-          targetFrameBudgetMs: VIEWPORT_3D_SCALAR_COLOR_UPLOAD_FRAME_BUDGET_MS,
-        },
-      }),
-    [],
-  );
+}): Viewport3DScalarColorUploadResult {
   const store = useMemo(() => createViewport3DScalarShaderUploadStore(), []);
   const snapshot = useSyncExternalStore(
     store.subscribe,
     store.getSnapshot,
     store.getSnapshot,
   );
-
-  useEffect(() => () => uploadManager.dispose(), [uploadManager]);
 
   useEffect(() => {
     if (!enabled || !geometry) return;
@@ -377,9 +475,26 @@ export function useViewport3DScalarShaderColorUpload({
         requestedRetentionKey: retentionKey,
         retentionKey: current.retentionKey,
       })) {
+        store.publish(current.buffer, geometry, current.retentionKey, false);
         return;
       }
-      store.publish(null, geometry, null);
+      if (current.buffer) {
+        tracker.recordRetentionRejection(
+          current.geometry !== geometry ? "geometry" : "retention-key",
+        );
+      }
+      store.publish(null, geometry, null, false);
+      tracker.recordDirtyFrame(dirtyReason);
+      invalidate();
+      return;
+    }
+
+    const current = store.getSnapshot();
+    if (
+      current.geometry === geometry &&
+      canReuseViewport3DScalarShaderAttributes(current.buffer, colorBuffer)
+    ) {
+      store.publish(colorBuffer, geometry, retentionKey ?? null, true);
       tracker.recordDirtyFrame(dirtyReason);
       invalidate();
       return;
@@ -400,14 +515,27 @@ export function useViewport3DScalarShaderColorUpload({
         requestedRetentionKey: retentionKey,
         retentionKey: current.retentionKey,
       })) {
+        store.publish(current.buffer, geometry, current.retentionKey, false);
         return;
       }
-      store.publish(null, geometry, null);
+      if (current.buffer) {
+        tracker.recordRetentionRejection(
+          current.geometry !== geometry ? "geometry" : "retention-key",
+        );
+      }
+      store.publish(null, geometry, null, false);
       tracker.recordDirtyFrame(dirtyReason);
       invalidate();
       return;
     }
 
+    // See the vertex-color hook above: the manager must share the effect's
+    // lifetime so StrictMode remounts cannot reuse a disposed coordinator.
+    const uploadManager = createViewport3DGpuUploadManager({
+      policy: {
+        targetFrameBudgetMs: VIEWPORT_3D_SCALAR_COLOR_UPLOAD_FRAME_BUDGET_MS,
+      },
+    });
     const abortController = new AbortController();
     uploadManager.enqueue({
       chunks: uploadPlan.chunks,
@@ -416,7 +544,7 @@ export function useViewport3DScalarShaderColorUpload({
       lane: "field-color",
       onVisible: () => {
         uploadPlan.onVisible();
-        store.publish(colorBuffer, geometry, retentionKey ?? null);
+        store.publish(colorBuffer, geometry, retentionKey ?? null, true);
         tracker.recordDirtyFrame(dirtyReason);
         invalidate();
       },
@@ -426,6 +554,7 @@ export function useViewport3DScalarShaderColorUpload({
 
     return () => {
       abortController.abort();
+      uploadManager.dispose();
     };
   }, [
     colorBuffer,
@@ -438,11 +567,17 @@ export function useViewport3DScalarShaderColorUpload({
     targetRevision,
     tracker,
     uploadKey,
-    uploadManager,
     vertexCount,
   ]);
 
-  return snapshot.geometry === geometry ? snapshot.buffer : null;
+  return isViewport3DScalarUploadSnapshotCurrent({
+    requestedGeometry: geometry,
+    requestedRetentionKey: retentionKey,
+    snapshotGeometry: snapshot.geometry,
+    snapshotRetentionKey: snapshot.retentionKey,
+  })
+    ? { buffer: snapshot.buffer, fresh: snapshot.fresh }
+    : { buffer: null, fresh: false };
 }
 
 export function createViewport3DScalarShaderColorUploadPlan(
@@ -455,13 +590,7 @@ export function createViewport3DScalarShaderColorUploadPlan(
 
   const safeBatchSize = Math.max(1, Math.floor(batchSize));
   const chunks: Viewport3DGpuUploadChunk[] = [];
-  const attributes: Array<{
-    readonly attribute: BufferAttribute;
-    readonly itemSize: number;
-    readonly name: string;
-    readonly source: Float32Array;
-    readonly wasAttached: boolean;
-  }> = [];
+  const attributes: PendingViewport3DScalarShaderUploadAttribute[] = [];
 
   addShaderUploadAttribute(
     attributes,
@@ -500,17 +629,33 @@ export function createViewport3DScalarShaderColorUploadPlan(
 
   const rollback = () => {
     for (const entry of attributes) {
-      if (
-        !entry.wasAttached &&
-        geometry.getAttribute(entry.name) === entry.attribute
-      ) {
+      if (entry.wasAttached) {
+        if (
+          !entry.committed ||
+          geometry.getAttribute(entry.name) !== entry.attribute ||
+          !entry.previousArray
+        ) {
+          continue;
+        }
+        entry.attribute.array = entry.previousArray;
+        entry.attribute.clearUpdateRanges();
+        for (const range of entry.previousUpdateRanges) {
+          entry.attribute.addUpdateRange(range.start, range.count);
+        }
+        // The version intentionally advances so the renderer uploads the
+        // restored array even when the previous state had no update range.
+        entry.attribute.needsUpdate = true;
+        entry.committed = false;
+        continue;
+      }
+      if (geometry.getAttribute(entry.name) === entry.attribute) {
         geometry.deleteAttribute(entry.name);
       }
+      entry.committed = false;
     }
   };
 
   for (const entry of attributes) {
-    entry.attribute.clearUpdateRanges();
     for (let start = 0; start < vertexCount; start += safeBatchSize) {
       const end = Math.min(start + safeBatchSize, vertexCount);
       chunks.push({
@@ -518,14 +663,12 @@ export function createViewport3DScalarShaderColorUploadPlan(
           (end - start) * entry.itemSize * Float32Array.BYTES_PER_ELEMENT,
         itemCount: end - start,
         upload: () => {
-          const target = entry.attribute.array as Float32Array;
           const sourceStart = start * entry.itemSize;
           const sourceEnd = end * entry.itemSize;
-          target.set(
+          entry.staging.set(
             entry.source.subarray(sourceStart, sourceEnd),
             sourceStart,
           );
-          entry.attribute.addUpdateRange(sourceStart, sourceEnd - sourceStart);
         },
         rollback,
       });
@@ -540,23 +683,38 @@ export function createViewport3DScalarShaderColorUploadPlan(
     ),
     onVisible: () => {
       for (const entry of attributes) {
-        if (!entry.wasAttached) {
+        if (entry.wasAttached) {
+          entry.attribute.array = entry.staging;
+          entry.committed = true;
+        } else {
           geometry.setAttribute(entry.name, entry.attribute);
+          entry.committed = true;
         }
+        entry.attribute.clearUpdateRanges();
+        entry.attribute.addUpdateRange(0, entry.staging.length);
         entry.attribute.needsUpdate = true;
       }
     },
   };
 }
 
+interface PendingViewport3DScalarShaderUploadAttribute {
+  readonly attribute: BufferAttribute;
+  readonly itemSize: number;
+  readonly name: string;
+  readonly previousArray: Float32Array | null;
+  readonly previousUpdateRanges: ReadonlyArray<{
+    readonly count: number;
+    readonly start: number;
+  }>;
+  readonly source: Float32Array;
+  readonly staging: Float32Array;
+  readonly wasAttached: boolean;
+  committed: boolean;
+}
+
 function addShaderUploadAttribute(
-  attributes: Array<{
-    readonly attribute: BufferAttribute;
-    readonly itemSize: number;
-    readonly name: string;
-    readonly source: Float32Array;
-    readonly wasAttached: boolean;
-  }>,
+  attributes: PendingViewport3DScalarShaderUploadAttribute[],
   geometry: BufferGeometry,
   name: string,
   source: Float32Array | null | undefined,
@@ -572,18 +730,41 @@ function addShaderUploadAttribute(
     existing.array instanceof Float32Array
       ? existing
       : null;
+  // S-19: patrz komentarz w createViewport3DScalarColorUploadPlan — ten sam
+  // problem dotyczy fmScalarValue/fmVectorValue/fmComplexRealValue/
+  // fmComplexImagValue.
+  // New attributes use the staging array directly; compatible live
+  // attributes get one bounded replacement array for the pending plan.
+  const staging = new Float32Array(vertexCount * itemSize);
+  const attribute = existingAttribute ?? new BufferAttribute(staging, itemSize);
+  if (!existingAttribute) {
+    attribute.setUsage(DynamicDrawUsage);
+  }
+  const previousArray = existingAttribute
+    ? (existingAttribute.array as Float32Array)
+    : null;
+  const previousUpdateRanges = existingAttribute
+    ? existingAttribute.updateRanges.map(({ start, count }) => ({
+        count,
+        start,
+      }))
+    : [];
   attributes.push({
-    attribute:
-      existingAttribute ??
-      new BufferAttribute(new Float32Array(vertexCount * itemSize), itemSize),
+    attribute,
     itemSize,
     name,
+    previousArray,
+    previousUpdateRanges,
     source,
+    // See createViewport3DScalarColorUploadPlan: chunk work stays bounded,
+    // while this per-attribute staging array keeps aborts off live geometry.
+    staging,
     wasAttached: Boolean(existingAttribute),
+    committed: false,
   });
 }
 
-function createViewport3DScalarShaderUploadStore():
+export function createViewport3DScalarShaderUploadStore():
   Viewport3DScalarShaderUploadStore {
   const listeners = new Set<() => void>();
   let snapshot = EMPTY_VIEWPORT_3D_SCALAR_SHADER_UPLOAD_SNAPSHOT;
@@ -592,14 +773,17 @@ function createViewport3DScalarShaderUploadStore():
     buffer: ScalarColorBuffer | null,
     geometry: BufferGeometry | null,
     retentionKey: string | null,
+    fresh = true,
   ): void {
     if (
       snapshot.buffer === buffer &&
+      snapshot.fresh === fresh &&
       snapshot.geometry === geometry &&
       snapshot.retentionKey === retentionKey
     ) return;
     snapshot = {
       buffer,
+      fresh,
       geometry,
       retentionKey,
       version: snapshot.version + 1,

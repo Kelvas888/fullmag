@@ -8,10 +8,14 @@
  */
 
 #include "context.hpp"
+#include "dmi_boundary.cuh"
+#include "kernels.hpp"
+#include "regional_field_drive.cuh"
 
 #include <cuda_runtime.h>
 #include <cufft.h>
 #include <curand_kernel.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -119,9 +123,9 @@ __global__ void spectral_projection_fp32_kernel(
     float lx = px * dx;
     float ly = py * dy;
     float lz = pz * dz;
-    float kx = 2.0f * static_cast<float>(M_PI) * static_cast<float>(frequency_index(x, px)) / lx;
-    float ky = 2.0f * static_cast<float>(M_PI) * static_cast<float>(frequency_index(y, py)) / ly;
-    float kz = 2.0f * static_cast<float>(M_PI) * static_cast<float>(frequency_index(z, pz)) / lz;
+    float kx = 2.0f * static_cast<float>(kFullmagPi) * static_cast<float>(frequency_index(x, px)) / lx;
+    float ky = 2.0f * static_cast<float>(kFullmagPi) * static_cast<float>(frequency_index(y, py)) / ly;
+    float kz = 2.0f * static_cast<float>(kFullmagPi) * static_cast<float>(frequency_index(z, pz)) / lz;
     float k2 = kx * kx + ky * ky + kz * kz;
 
     if (k2 == 0.0f) {
@@ -262,8 +266,10 @@ __global__ void combine_effective_field_fp32_kernel(
     const double * __restrict__ kc2_field,
     const double * __restrict__ kc3_field,
     int has_interfacial_dmi,
+    int has_rotated_interfacial_dmi,
     int has_bulk_dmi,
     float D_int,
+    float D_rotated,
     float D_bulk,
     int nx, int ny, int nz,
     int periodic_x, int periodic_y, int periodic_z,
@@ -276,7 +282,29 @@ __global__ void combine_effective_field_fp32_kernel(
     float mel_b1,
     float mel_b2,
     float mel_e11, float mel_e22, float mel_e33,
-    float mel_e23, float mel_e13, float mel_e12)
+    float mel_e23, float mel_e13, float mel_e12,
+    const float * __restrict__ profile_x,
+    const float * __restrict__ profile_y,
+    const float * __restrict__ profile_z,
+    int has_profile,
+    float profile_scale,
+    const float * __restrict__ regional_drive_x,
+    const float * __restrict__ regional_drive_y,
+    const float * __restrict__ regional_drive_z,
+    const RegionalFieldDriveParams * __restrict__ regional_drive_params,
+    const double * __restrict__ regional_drive_points,
+    uint32_t regional_drive_count,
+    uint64_t regional_drive_cell_count,
+    double evaluation_time_s,
+    const uint8_t * __restrict__ frozen_mask,
+    int has_frozen_mask,
+    float * __restrict__ rhs_x,
+    float * __restrict__ rhs_y,
+    float * __restrict__ rhs_z,
+    float gamma_bar,
+    float alpha,
+    int disable_precession,
+    int write_rhs)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
@@ -285,6 +313,11 @@ __global__ void combine_effective_field_fp32_kernel(
         h_eff_x[idx] = 0.0f;
         h_eff_y[idx] = 0.0f;
         h_eff_z[idx] = 0.0f;
+        if (write_rhs) {
+            rhs_x[idx] = 0.0f;
+            rhs_y[idx] = 0.0f;
+            rhs_z[idx] = 0.0f;
+        }
         return;
     }
 
@@ -297,7 +330,7 @@ __global__ void combine_effective_field_fp32_kernel(
     float hz = hz_ext;
 
     if (has_uniaxial_anisotropy && ms > 0.0f) {
-        float mu0 = 4.0f * static_cast<float>(M_PI) * 1e-7f;
+        float mu0 = 4.0f * static_cast<float>(kFullmagPi) * 1e-7f;
         float ku1_val = ku1_field ? static_cast<float>(ku1_field[idx]) : Ku1;
         float ku2_val = ku2_field ? static_cast<float>(ku2_field[idx]) : Ku2;
         
@@ -312,7 +345,7 @@ __global__ void combine_effective_field_fp32_kernel(
     }
 
     if (has_cubic_anisotropy && ms > 0.0f) {
-        float mu0 = 4.0f * static_cast<float>(M_PI) * 1e-7f;
+        float mu0 = 4.0f * static_cast<float>(kFullmagPi) * 1e-7f;
         float kc1_val = kc1_field ? static_cast<float>(kc1_field[idx]) : Kc1;
         float kc2_val = kc2_field ? static_cast<float>(kc2_field[idx]) : Kc2;
         float kc3_val = kc3_field ? static_cast<float>(kc3_field[idx]) : Kc3;
@@ -343,7 +376,7 @@ __global__ void combine_effective_field_fp32_kernel(
     }
 
     // --- DMI (MuMax-compatible natural free-surface boundary conditions) ---
-    if ((has_interfacial_dmi || has_bulk_dmi) && ms > 0.0f) {
+    if ((has_interfacial_dmi || has_rotated_interfacial_dmi || has_bulk_dmi) && ms > 0.0f) {
         int iz = idx / (ny * nx);
         int rem2 = idx - iz * ny * nx;
         int iy = rem2 / nx;
@@ -377,59 +410,16 @@ __global__ void combine_effective_field_fp32_kernel(
             if (missing_zp) zp = idx;
         }
 
-        float mu0 = 4.0f * static_cast<float>(M_PI) * 1e-7f;
+        float mu0 = 4.0f * static_cast<float>(kFullmagPi) * 1e-7f;
         float dmi_pf = 2.0f / (mu0 * ms);
 
+        const DmiMissingFaces missing{
+            missing_xp, missing_xm, missing_yp, missing_ym, missing_zp, missing_zm};
         if (has_interfacial_dmi) {
-            float mxm = m_x[xm], mym = m_y[xm], mzm = m_z[xm];
-            float mxp = m_x[xp], myp = m_y[xp], mzp = m_z[xp];
-            float mxym = m_x[ym], myym = m_y[ym], mzym = m_z[ym];
-            float mxyP = m_x[yp], myyP = m_y[yp], mzyP = m_z[yp];
-            if (exchange_stiffness > 0.0f) {
-                const float d_over_2a = D_int / (2.0f * exchange_stiffness);
-                const float dx = 0.5f / inv_2dx;
-                const float dy = 0.5f / inv_2dy;
-                if (missing_xm) {
-                    mxm = mx + dx * d_over_2a * mz;
-                    mzm = mz - dx * d_over_2a * mx;
-                }
-                if (missing_xp) {
-                    mxp = mx - dx * d_over_2a * mz;
-                    mzp = mz + dx * d_over_2a * mx;
-                }
-                if (missing_ym) {
-                    myym = my + dy * d_over_2a * mz;
-                    mzym = mz - dy * d_over_2a * my;
-                }
-                if (missing_yp) {
-                    myyP = my - dy * d_over_2a * mz;
-                    mzyP = mz + dy * d_over_2a * my;
-                }
-
-                const float exchange_pf = 2.0f * exchange_stiffness / (mu0 * ms);
-                const float inv_dx2 = 4.0f * inv_2dx * inv_2dx;
-                const float inv_dy2 = 4.0f * inv_2dy * inv_2dy;
-                if (missing_xm) {
-                    hx += exchange_pf * (mxm - mx) * inv_dx2;
-                    hy += exchange_pf * (mym - my) * inv_dx2;
-                    hz += exchange_pf * (mzm - mz) * inv_dx2;
-                }
-                if (missing_xp) {
-                    hx += exchange_pf * (mxp - mx) * inv_dx2;
-                    hy += exchange_pf * (myp - my) * inv_dx2;
-                    hz += exchange_pf * (mzp - mz) * inv_dx2;
-                }
-                if (missing_ym) {
-                    hx += exchange_pf * (mxym - mx) * inv_dy2;
-                    hy += exchange_pf * (myym - my) * inv_dy2;
-                    hz += exchange_pf * (mzym - mz) * inv_dy2;
-                }
-                if (missing_yp) {
-                    hx += exchange_pf * (mxyP - mx) * inv_dy2;
-                    hy += exchange_pf * (myyP - my) * inv_dy2;
-                    hz += exchange_pf * (mzyP - mz) * inv_dy2;
-                }
-            }
+            const float mxm = m_x[xm], mzm = m_z[xm];
+            const float mxp = m_x[xp], mzp = m_z[xp];
+            const float myym = m_y[ym], mzym = m_z[ym];
+            const float myyP = m_y[yp], mzyP = m_z[yp];
             float dmz_dx = (mzp - mzm) * inv_2dx;
             float dmz_dy = (mzyP - mzym) * inv_2dy;
             float dmx_dx = (mxp - mxm) * inv_2dx;
@@ -438,6 +428,21 @@ __global__ void combine_effective_field_fp32_kernel(
             hx += dmi_pf * D_int * dmz_dx;
             hy += dmi_pf * D_int * dmz_dy;
             hz -= dmi_pf * D_int * (dmx_dx + dmy_dy);
+            add_interfacial_dmi_boundary_correction(
+                mx, my, mz, dmi_pf, D_int, inv_2dx, inv_2dy, missing, hx, hy, hz);
+        }
+
+
+        if (has_rotated_interfacial_dmi) {
+            const float dmz_dx = (m_z[xp] - m_z[xm]) * inv_2dx;
+            const float dmy_dy = (m_y[yp] - m_y[ym]) * inv_2dy;
+            const float dmx_dy = (m_x[yp] - m_x[ym]) * inv_2dy;
+            const float dmx_dx = (m_x[xp] - m_x[xm]) * inv_2dx;
+            hx += dmi_pf * D_rotated * (dmz_dx - dmy_dy);
+            hy += dmi_pf * D_rotated * dmx_dy;
+            hz -= dmi_pf * D_rotated * dmx_dx;
+            add_rotated_interfacial_dmi_boundary_correction(
+                mx, my, mz, dmi_pf, D_rotated, inv_2dx, inv_2dy, missing, hx, hy, hz);
         }
 
         if (has_bulk_dmi) {
@@ -451,6 +456,9 @@ __global__ void combine_effective_field_fp32_kernel(
             hx -= dmi_pf * D_bulk * (dmz_dy - dmy_dz);
             hy -= dmi_pf * D_bulk * (dmx_dz - dmz_dx);
             hz -= dmi_pf * D_bulk * (dmy_dx - dmx_dy);
+            add_bulk_dmi_boundary_correction(
+                mx, my, mz, dmi_pf, D_bulk, inv_2dx, inv_2dy, inv_2dz,
+                missing, hx, hy, hz);
         }
     }
 
@@ -483,9 +491,44 @@ __global__ void combine_effective_field_fp32_kernel(
         hz += thermal_sigma * curand_normal(&state);
     }
 
+    if (has_profile) {
+        hx += profile_scale * profile_x[idx];
+        hy += profile_scale * profile_y[idx];
+        hz += profile_scale * profile_z[idx];
+    }
+
+    hx += static_cast<float>(regional_field_drive_component(
+        regional_drive_x, regional_drive_params, regional_drive_points,
+        regional_drive_count, regional_drive_cell_count, idx, evaluation_time_s));
+    hy += static_cast<float>(regional_field_drive_component(
+        regional_drive_y, regional_drive_params, regional_drive_points,
+        regional_drive_count, regional_drive_cell_count, idx, evaluation_time_s));
+    hz += static_cast<float>(regional_field_drive_component(
+        regional_drive_z, regional_drive_params, regional_drive_points,
+        regional_drive_count, regional_drive_cell_count, idx, evaluation_time_s));
+
     h_eff_x[idx] = hx;
     h_eff_y[idx] = hy;
     h_eff_z[idx] = hz;
+
+    if (write_rhs) {
+        const float px = my * hz - mz * hy;
+        const float py = mz * hx - mx * hz;
+        const float pz = mx * hy - my * hx;
+        const float dx = my * pz - mz * py;
+        const float dy = mz * px - mx * pz;
+        const float dz = mx * py - my * px;
+        const float precession_scale = disable_precession ? 0.0f : 1.0f;
+        if (has_frozen_mask && frozen_mask[idx] != 0) {
+            rhs_x[idx] = 0.0f;
+            rhs_y[idx] = 0.0f;
+            rhs_z[idx] = 0.0f;
+        } else {
+            rhs_x[idx] = -gamma_bar * (precession_scale * px + alpha * dx);
+            rhs_y[idx] = -gamma_bar * (precession_scale * py + alpha * dy);
+            rhs_z[idx] = -gamma_bar * (precession_scale * pz + alpha * dz);
+        }
+    }
 }
 
 __global__ void anisotropy_field_fp32_kernel(
@@ -632,6 +675,7 @@ void launch_demag_field_fp32(Context &ctx) {
         context_end_compute_stream_work(ctx, "launch_demag_field_fp32");
         return;
     }
+    ++ctx.endpoint_field_cache.demag_forward_fft_count;
 
     if (ctx.has_demag_tensor_kernel) {
         tensor_convolution_fp32_kernel<<<grid_padded, BLOCK_SIZE, 0, stream>>>(
@@ -668,6 +712,7 @@ void launch_demag_field_fp32(Context &ctx) {
         context_end_compute_stream_work(ctx, "launch_demag_field_fp32");
         return;
     }
+    ++ctx.endpoint_field_cache.demag_inverse_fft_count;
 
     unpack_demag_fft_fp32_kernel<<<grid_physical, BLOCK_SIZE, 0, stream>>>(
         static_cast<const cufftComplex*>(ctx.fft_x),
@@ -695,36 +740,25 @@ void launch_demag_field_fp32(Context &ctx) {
         return;
     }
     if (context_end_compute_stream_work(ctx, "launch_demag_field_fp32")) {
+        ++ctx.endpoint_field_cache.demag_evaluation_count;
         fullmag_fdm_note_operator_device_execution(
             ctx, FULLMAG_FDM_OPERATOR_DEMAG);
     }
 }
 
 /* ── Axpy kernel: dst += scale * src  (for Oersted field addition) ── */
-__global__ void add_scaled_field_fp32_kernel(
-    float *dst_x, float *dst_y, float *dst_z,
-    const float *src_x, const float *src_y, const float *src_z,
-    float scale,
-    const uint8_t *active_mask,
-    int has_active_mask,
-    int n)
-{
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    if (has_active_mask && active_mask[i] == 0) return;
-    dst_x[i] += scale * src_x[i];
-    dst_y[i] += scale * src_y[i];
-    dst_z[i] += scale * src_z[i];
-}
-
-void launch_effective_field_fp32(Context &ctx, double evaluation_time) {
+static void launch_effective_field_fp32_impl(
+    Context &ctx,
+    double evaluation_time,
+    cudaStream_t stream,
+    DeviceVectorField *rhs_out) {
     int n = static_cast<int>(ctx.cell_count);
     int grid = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
 
     // Compute thermal noise amplitude (FDT)
     const double thermal_dt = ctx.trial_dt > 0.0 ? ctx.trial_dt : ctx.current_dt;
     if (ctx.temperature > 0.0 && ctx.Ms > 0.0 && thermal_dt > 0.0) {
-        double MU0 = 4.0 * M_PI * 1e-7;
+        double MU0 = 4.0 * kFullmagPi * 1e-7;
         double KB = 1.380649e-23;
         double V = ctx.dx * ctx.dy * ctx.dz;
         ctx.thermal_sigma = sqrt(2.0 * ctx.alpha * KB * ctx.temperature / (ctx.gamma * MU0 * ctx.Ms * V * thermal_dt));
@@ -733,7 +767,19 @@ void launch_effective_field_fp32(Context &ctx, double evaluation_time) {
     }
     if (ctx.thermal_sigma > 0.0) ctx.thermal_rng_draws += 3 * ctx.cell_count;
 
-    combine_effective_field_fp32_kernel<<<grid, BLOCK_SIZE>>>(
+    const bool has_profile =
+        ctx.has_static_external_field_profile || ctx.has_oersted_field;
+    const float profile_scale = ctx.has_static_external_field_profile
+        ? 1.0f
+        : (ctx.has_oersted_field
+            ? static_cast<float>(oersted_field_scale(ctx, evaluation_time))
+            : 0.0f);
+    const bool write_rhs = rhs_out != nullptr;
+    const float alpha = static_cast<float>(ctx.alpha);
+    const float gamma_bar =
+        static_cast<float>(ctx.gamma / (1.0 + ctx.alpha * ctx.alpha));
+
+    combine_effective_field_fp32_kernel<<<grid, BLOCK_SIZE, 0, stream>>>(
         static_cast<const float*>(ctx.m.x),
         static_cast<const float*>(ctx.m.y),
         static_cast<const float*>(ctx.m.z),
@@ -774,8 +820,10 @@ void launch_effective_field_fp32(Context &ctx, double evaluation_time) {
         ctx.kc2_field,
         ctx.kc3_field,
         ctx.has_interfacial_dmi ? 1 : 0,
+        ctx.has_rotated_interfacial_dmi ? 1 : 0,
         ctx.has_bulk_dmi ? 1 : 0,
         static_cast<float>(ctx.D_interfacial),
+        static_cast<float>(ctx.D_rotated_interfacial),
         static_cast<float>(ctx.D_bulk),
         static_cast<int>(ctx.nx), static_cast<int>(ctx.ny), static_cast<int>(ctx.nz),
         ctx.periodic_x ? 1 : 0, ctx.periodic_y ? 1 : 0, ctx.periodic_z ? 1 : 0,
@@ -787,48 +835,49 @@ void launch_effective_field_fp32(Context &ctx, double evaluation_time) {
         static_cast<float>(ctx.mel_b1),
         static_cast<float>(ctx.mel_b2),
         static_cast<float>(ctx.mel_strain[0]), static_cast<float>(ctx.mel_strain[1]), static_cast<float>(ctx.mel_strain[2]),
-        static_cast<float>(ctx.mel_strain[3] * 0.5), static_cast<float>(ctx.mel_strain[4] * 0.5), static_cast<float>(ctx.mel_strain[5] * 0.5));
-
-    // ── Add a static external profile directly, or scale a dynamic Oersted profile by I(t). ──
-    if (ctx.has_static_external_field_profile) {
-        add_scaled_field_fp32_kernel<<<grid, BLOCK_SIZE>>>(
-            static_cast<float*>(ctx.work.x),
-            static_cast<float*>(ctx.work.y),
-            static_cast<float*>(ctx.work.z),
-            static_cast<const float*>(ctx.h_oe_static.x),
-            static_cast<const float*>(ctx.h_oe_static.y),
-            static_cast<const float*>(ctx.h_oe_static.z),
-            1.0f,
-            ctx.active_mask,
-            ctx.has_active_mask ? 1 : 0,
-            n);
-    } else if (ctx.has_oersted_field) {
-        const double I_scale = oersted_field_scale(ctx, evaluation_time);
-        add_scaled_field_fp32_kernel<<<grid, BLOCK_SIZE>>>(
-            static_cast<float*>(ctx.work.x),
-            static_cast<float*>(ctx.work.y),
-            static_cast<float*>(ctx.work.z),
-            static_cast<const float*>(ctx.h_oe_static.x),
-            static_cast<const float*>(ctx.h_oe_static.y),
-            static_cast<const float*>(ctx.h_oe_static.z),
-            static_cast<float>(I_scale),
-            ctx.active_mask,
-            ctx.has_active_mask ? 1 : 0,
-            n);
-    }
+        static_cast<float>(ctx.mel_strain[3] * 0.5), static_cast<float>(ctx.mel_strain[4] * 0.5), static_cast<float>(ctx.mel_strain[5] * 0.5),
+        static_cast<const float*>(ctx.h_oe_static.x),
+        static_cast<const float*>(ctx.h_oe_static.y),
+        static_cast<const float*>(ctx.h_oe_static.z),
+        has_profile ? 1 : 0,
+        profile_scale,
+        static_cast<const float*>(ctx.regional_field_drive_x),
+        static_cast<const float*>(ctx.regional_field_drive_y),
+        static_cast<const float*>(ctx.regional_field_drive_z),
+        ctx.regional_field_drive_params,
+        ctx.regional_field_drive_points,
+        ctx.regional_field_drive_count,
+        ctx.cell_count,
+        evaluation_time,
+        ctx.frozen_mask,
+        ctx.has_frozen_mask ? 1 : 0,
+        write_rhs ? static_cast<float*>(rhs_out->x) : nullptr,
+        write_rhs ? static_cast<float*>(rhs_out->y) : nullptr,
+        write_rhs ? static_cast<float*>(rhs_out->z) : nullptr,
+        gamma_bar,
+        alpha,
+        ctx.disable_precession ? 1 : 0,
+        write_rhs ? 1 : 0);
     const cudaError_t launch_error = cudaGetLastError();
     if (launch_error != cudaSuccess) {
         set_cuda_error(ctx, "launch_effective_field_fp32", launch_error);
         return;
     }
-    if (ctx.has_interfacial_dmi || ctx.has_bulk_dmi) {
+    if (write_rhs) {
+        context_note_local_pipeline_fused_field_rhs(ctx);
+        fullmag_fdm_note_llg_rhs_torque_device_launch(
+            ctx, "fused local field/RHS fp32 launch");
+    }
+    ++ctx.endpoint_field_cache.effective_field_evaluation_count;
+    if (ctx.has_interfacial_dmi || ctx.has_rotated_interfacial_dmi || ctx.has_bulk_dmi) {
         fullmag_fdm_note_operator_device_execution(ctx, FULLMAG_FDM_OPERATOR_DMI);
     }
     if (ctx.has_uniaxial_anisotropy || ctx.has_cubic_anisotropy) {
         fullmag_fdm_note_operator_device_execution(
             ctx, FULLMAG_FDM_OPERATOR_ANISOTROPY);
     }
-    if (ctx.has_external_field || ctx.has_static_external_field_profile) {
+    if (ctx.has_external_field || ctx.has_static_external_field_profile ||
+        ctx.regional_field_drive_count != 0) {
         fullmag_fdm_note_operator_device_execution(
             ctx, FULLMAG_FDM_OPERATOR_EXTERNAL_FIELD);
     }
@@ -846,6 +895,80 @@ void launch_effective_field_fp32(Context &ctx, double evaluation_time) {
     if (ctx.has_oersted_field) {
         fullmag_fdm_note_operator_device_execution(ctx, FULLMAG_FDM_OPERATOR_OERSTED);
     }
+}
+
+void launch_effective_field_fp32(
+    Context &ctx,
+    double evaluation_time,
+    cudaStream_t stream) {
+    launch_effective_field_fp32_impl(ctx, evaluation_time, stream, nullptr);
+}
+
+bool launch_effective_field_and_base_llg_rhs_fp32(
+    Context &ctx,
+    double evaluation_time,
+    DeviceVectorField &rhs_out,
+    cudaStream_t stream) {
+    if (ctx.has_zhang_li_stt || ctx.has_slonczewski_stt || ctx.has_sot) {
+        return false;
+    }
+    launch_effective_field_fp32_impl(ctx, evaluation_time, stream, &rhs_out);
+    return ctx.last_error.empty();
+}
+
+void launch_effective_field_fp32(Context &ctx, double evaluation_time) {
+    launch_effective_field_fp32(ctx, evaluation_time, nullptr);
+}
+
+cudaError_t query_local_pipeline_kernel_resources_fp32(
+    LocalPipelineKernelResources *out_resources) {
+    if (out_resources == nullptr) return cudaErrorInvalidValue;
+    cudaFuncAttributes attributes{};
+    cudaError_t status = cudaFuncGetAttributes(
+        &attributes, combine_effective_field_fp32_kernel);
+    if (status != cudaSuccess) return status;
+    int device = 0;
+    status = cudaGetDevice(&device);
+    if (status != cudaSuccess) return status;
+    int max_threads_per_sm = 0;
+    status = cudaDeviceGetAttribute(
+        &max_threads_per_sm, cudaDevAttrMaxThreadsPerMultiProcessor, device);
+    if (status != cudaSuccess) return status;
+    int multiprocessor_count = 0;
+    status = cudaDeviceGetAttribute(
+        &multiprocessor_count, cudaDevAttrMultiProcessorCount, device);
+    if (status != cudaSuccess) return status;
+    int max_active_blocks_per_sm = 0;
+    status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &max_active_blocks_per_sm,
+        combine_effective_field_fp32_kernel,
+        BLOCK_SIZE,
+        0);
+    if (status != cudaSuccess) return status;
+    if (max_threads_per_sm <= 0 || max_active_blocks_per_sm <= 0 ||
+        attributes.numRegs < 0) {
+        return cudaErrorInvalidConfiguration;
+    }
+    LocalPipelineKernelResources resources{};
+    resources.block_threads = BLOCK_SIZE;
+    resources.registers_per_thread =
+        static_cast<uint32_t>(attributes.numRegs);
+    resources.static_shared_bytes = attributes.sharedSizeBytes;
+    resources.local_bytes_per_thread = attributes.localSizeBytes;
+    resources.max_active_blocks_per_sm =
+        static_cast<uint32_t>(max_active_blocks_per_sm);
+    resources.max_threads_per_sm = static_cast<uint32_t>(max_threads_per_sm);
+    resources.multiprocessor_count =
+        static_cast<uint32_t>(multiprocessor_count);
+    const uint64_t resident_threads =
+        static_cast<uint64_t>(max_active_blocks_per_sm) * BLOCK_SIZE;
+    resources.theoretical_occupancy_permyriad = static_cast<uint32_t>(
+        std::min<uint64_t>(
+            10000,
+            resident_threads * 10000 /
+                static_cast<uint64_t>(max_threads_per_sm)));
+    *out_resources = resources;
+    return cudaSuccess;
 }
 
 void launch_anisotropy_field_fp32(Context &ctx) {
@@ -882,10 +1005,12 @@ void launch_anisotropy_field_fp32(Context &ctx) {
 }
 
 double launch_demag_energy_fp32(Context &ctx) {
+    ++ctx.endpoint_field_cache.energy_reduction_count;
     return reduce_demag_energy_fp32(ctx);
 }
 
 double launch_external_energy_fp32(Context &ctx) {
+    ++ctx.endpoint_field_cache.energy_reduction_count;
     return reduce_external_energy_fp32(ctx);
 }
 

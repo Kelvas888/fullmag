@@ -3,7 +3,7 @@
 //! Current public scope:
 //! - multiple ferromagnets with body-local exchange,
 //! - global demag via multilayer convolution,
-//! - fixed-step Heun/RK4/RK23/RK45/ABM3 stepping,
+//! - fixed-step Heun/RK4/RK23 stepping and stateful ABM3,
 //! - scalar traces and concatenated field snapshots.
 
 use fullmag_engine::{
@@ -22,9 +22,12 @@ use fullmag_fdm_demag::{
     },
     TransferBoundaryPolicy, TransferKind,
 };
-use fullmag_ir::{ExecutionPrecision, FdmMultilayerPlanIR, IntegratorChoice, OutputIR};
+use fullmag_ir::{
+    ExecutionPrecision, FdmMultilayerPlanIR, IntegratorChoice, OutputIR, StageCompletionIR,
+};
 
 use crate::artifact_pipeline::{ArtifactPipelineSender, ArtifactRecorder};
+use crate::constraints::{FrozenSpinsCheckpointV1, FROZEN_SPINS_CHECKPOINT_SCHEMA};
 use crate::derived_fields::max_torque_residual_apm_from_field;
 use crate::fdm::artifacts::select_state_observable_field;
 use crate::fdm::multilayer::make_multilayer_step_stats as make_step_stats;
@@ -45,7 +48,12 @@ use crate::types::{
     RunStatus, StateObservables, StepAction, StepStats, StepUpdate,
 };
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::time::Instant;
+
+const MULTILAYER_ABM3_CHECKPOINT_SCHEMA: &str = "fullmag.fdm.cpu.multilayer.abm3-checkpoint.v1";
+const ABM3_DT_RELATIVE_TOLERANCE: f64 = 1.0e-12;
 
 #[derive(Debug, Clone)]
 struct LayerContext {
@@ -58,12 +66,103 @@ struct LayerContext {
     problem: ExchangeLlgProblem,
 }
 
+/// Persistent CPU multilayer ABM3 state.  The history is stored newest first
+/// and is deliberately kept in native-layer order, matching the public
+/// `FdmMultilayerPlanIR` carrier and the Frozen Spins mask.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct MultilayerAbm3History {
+    rhs_history: Vec<Vec<Vec<[f64; 3]>>>,
+    rhs_times_seconds: Vec<f64>,
+    startup_steps: u32,
+    last_dt: f64,
+    history_resets: u64,
+}
+
+impl MultilayerAbm3History {
+    fn is_ready(&self) -> bool {
+        self.startup_steps >= 3 && self.rhs_history.len() == 3
+    }
+
+    fn restart_if_dt_changed(&mut self, dt: f64) {
+        if self.last_dt > 0.0 {
+            let scale = self.last_dt.abs().max(dt.abs()).max(f64::MIN_POSITIVE);
+            if (dt - self.last_dt).abs() > ABM3_DT_RELATIVE_TOLERANCE * scale {
+                self.restart();
+            }
+        }
+    }
+
+    fn restart(&mut self) {
+        let had_history = self.startup_steps != 0
+            || self.last_dt != 0.0
+            || !self.rhs_history.is_empty()
+            || !self.rhs_times_seconds.is_empty();
+        let history_resets = self.history_resets.saturating_add(u64::from(had_history));
+        *self = Self {
+            history_resets,
+            ..Self::default()
+        };
+    }
+
+    fn push(&mut self, rhs: Vec<Vec<[f64; 3]>>, time_seconds: f64, dt: f64) {
+        self.restart_if_dt_changed(dt);
+        self.rhs_history.insert(0, rhs);
+        self.rhs_times_seconds.insert(0, time_seconds);
+        self.rhs_history.truncate(3);
+        self.rhs_times_seconds.truncate(3);
+        self.startup_steps = (self.startup_steps + 1).min(3);
+        self.last_dt = dt;
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MultilayerAbm3CheckpointV1 {
+    schema: String,
+    plan_sha256: String,
+    layer_grid: Vec<[usize; 3]>,
+    layer_lengths: Vec<usize>,
+    step: u64,
+    time_seconds: f64,
+    last_dt: f64,
+    startup_steps: u32,
+    history_resets: u64,
+    magnetization: Vec<Vec<[f64; 3]>>,
+    /// Newest accepted RHS first; each slot preserves native layer/cell order.
+    rhs_history: Vec<Vec<Vec<[f64; 3]>>>,
+    rhs_times_seconds: Vec<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frozen_spins: Option<FrozenSpinsCheckpointV1>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frozen_mask_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frozen_activation_epoch: Option<u64>,
+}
+
 pub(crate) fn execute_reference_fdm_multilayer(
+    plan: &FdmMultilayerPlanIR,
+    until_seconds: f64,
+    outputs: &[OutputIR],
+    live: Option<(&[u32; 3], &mut dyn FnMut(StepUpdate) -> StepAction)>,
+    artifact_writer: Option<ArtifactPipelineSender>,
+) -> Result<ExecutedRun, RunError> {
+    execute_reference_fdm_multilayer_with_checkpoint(
+        plan,
+        until_seconds,
+        outputs,
+        live,
+        artifact_writer,
+        None,
+    )
+}
+
+pub(crate) fn execute_reference_fdm_multilayer_with_checkpoint(
     plan: &FdmMultilayerPlanIR,
     until_seconds: f64,
     outputs: &[OutputIR],
     mut live: Option<(&[u32; 3], &mut dyn FnMut(StepUpdate) -> StepAction)>,
     artifact_writer: Option<ArtifactPipelineSender>,
+    checkpoint: Option<serde_json::Value>,
 ) -> Result<ExecutedRun, RunError> {
     crate::fdm::reject_adaptive_multilayer_plan(plan)?;
     if let Some(layer) = plan
@@ -132,6 +231,36 @@ pub(crate) fn execute_reference_fdm_multilayer(
         }
     }
 
+    let active_mask = multilayer_active_mask(plan);
+    let mut frozen_spins = plan
+        .frozen_spins
+        .as_ref()
+        .map(|frozen_plan| {
+            fullmag_engine::FrozenSpinsState::capture_at_activation(
+                frozen_plan,
+                active_mask.as_deref(),
+                &flatten_layers(
+                    &states
+                        .iter()
+                        .map(|state| state.magnetization().to_vec())
+                        .collect::<Vec<_>>(),
+                ),
+            )
+            .map_err(|error| RunError {
+                message: format!("multilayer Frozen Spins activation: {error}"),
+            })
+        })
+        .transpose()?;
+    let mut abm3_history =
+        (plan.integrator == IntegratorChoice::Abm3).then(MultilayerAbm3History::default);
+    let mut step_count = 0u64;
+    if let Some(checkpoint) = checkpoint {
+        let (restored_frozen, restored_history, restored_step) =
+            restore_multilayer_abm3_checkpoint(plan, checkpoint, &mut states)?;
+        frozen_spins = restored_frozen;
+        abm3_history = Some(restored_history);
+        step_count = restored_step;
+    }
     let initial_magnetization = flatten_layers(
         &states
             .iter()
@@ -144,15 +273,30 @@ pub(crate) fn execute_reference_fdm_multilayer(
         None,
         crate::types::TimestepExecutionLane::fdm_cpu(),
     )?;
-    let dt = timestep_policy.initial_dt();
+    let dt = abm3_history
+        .as_ref()
+        .and_then(|history| (history.last_dt > 0.0).then_some(history.last_dt))
+        .unwrap_or_else(|| timestep_policy.initial_dt());
     let mut steps: Vec<StepStats> = Vec::new();
-    let mut step_count = 0u64;
-    let fft_backend = super::reference::resolve_cpu_fft_backend_name_for_demag(plan.enable_demag)?;
+    let fdm_fft_execution = super::reference::resolve_cpu_fft_execution_for_demag(
+        plan.enable_demag,
+        plan.fft.as_ref(),
+    )?;
+    let fft_backend = fdm_fft_execution
+        .as_ref()
+        .map(|execution| execution.executed_backend.clone());
     let provenance = ExecutionProvenance {
         charge_transport: None,
         transport_modules: Vec::new(),
         fdm_gpu_transport_telemetry: None,
+        fdm_cpu_state_layout: None,
         fdm_gpu_execution_receipt: None,
+        fdm_gpu_step_transaction_telemetry: None,
+        fdm_gpu_observation_policy: None,
+        fdm_gpu_endpoint_cache_telemetry: None,
+        fdm_cpu_step_transaction_telemetry: None,
+        fdm_cpu_evaluation_telemetry: None,
+        fdm_fft_execution,
         fem_gpu_execution_receipt: None,
         executed_physics_kinds: Vec::new(),
         executed_physics_module_ids: Vec::new(),
@@ -170,6 +314,8 @@ pub(crate) fn execute_reference_fdm_multilayer(
         cuda_runtime_version: None,
         lossy_fallback_used: false,
         resolved_fallback: None,
+        fem_eigen_execution_resolution: None,
+        fem_eigen_native_execution_attestation: None,
         fem_crossover_decision: None,
         ignored_terms: Vec::new(),
         random_seed: None,
@@ -226,6 +372,7 @@ pub(crate) fn execute_reference_fdm_multilayer(
         requested_fem_omp_threads: None,
         effective_fem_omp_threads: None,
         fem_poisson_demag: None,
+        fem_bem_demag: None,
     };
     let mut artifacts = if let Some(writer) = artifact_writer {
         ArtifactRecorder::streaming(provenance.clone(), writer)
@@ -238,15 +385,24 @@ pub(crate) fn execute_reference_fdm_multilayer(
     let default_scalar_trace = scalar_schedules.is_empty();
 
     let initial_observables = observe_multilayer(&contexts, &states, demag_runtime.as_ref())?;
+    let all_active_dofs_frozen = frozen_spins
+        .as_ref()
+        .is_some_and(fullmag_engine::FrozenSpinsState::all_active_dofs_frozen);
     if default_scalar_trace {
-        let stats = make_step_stats(0, 0.0, 0.0, 0, &initial_observables);
+        let stats = make_step_stats(
+            step_count,
+            current_time(&states),
+            0.0,
+            0,
+            &initial_observables,
+        );
         artifacts.record_scalar(&stats)?;
         steps.push(stats);
     }
     record_due_fields(
         &initial_observables,
-        0,
-        0.0,
+        step_count,
+        current_time(&states),
         0.0,
         &mut field_schedules,
         &mut artifacts,
@@ -257,109 +413,206 @@ pub(crate) fn execute_reference_fdm_multilayer(
     let mut completion_metrics = crate::relaxation::RelaxationCompletionMetrics::default();
     let mut cancelled = false;
     let mut paused = false;
-    while current_time(&states) < until_seconds {
-        let dt_step = dt.min(until_seconds - current_time(&states));
-        let wall_start = Instant::now();
-        step_multilayer(
-            &contexts,
-            &mut states,
-            demag_runtime.as_ref(),
-            dt_step,
-            plan.integrator,
-        )?;
-        let wall_time_ns = wall_start.elapsed().as_nanos() as u64;
-        step_count += 1;
+    if !all_active_dofs_frozen {
+        while current_time(&states) < until_seconds {
+            let dt_step = dt.min(until_seconds - current_time(&states));
+            let wall_start = Instant::now();
+            step_multilayer(
+                &contexts,
+                &mut states,
+                demag_runtime.as_ref(),
+                dt_step,
+                plan.integrator,
+                frozen_spins.as_ref(),
+                abm3_history.as_mut(),
+            )?;
+            let wall_time_ns = wall_start.elapsed().as_nanos() as u64;
+            step_count += 1;
 
-        let observables = observe_multilayer(&contexts, &states, demag_runtime.as_ref())?;
-        let latest_stats = make_step_stats(
-            step_count,
-            current_time(&states),
-            dt_step,
-            wall_time_ns,
-            &observables,
-        );
+            let final_abm3_checkpoint = if let Some(history) = abm3_history.as_ref() {
+                Some(multilayer_abm3_checkpoint_value(
+                    plan,
+                    &states,
+                    frozen_spins.as_ref(),
+                    history,
+                    step_count,
+                    dt_step,
+                )?)
+            } else {
+                None
+            };
 
-        if default_scalar_trace
-            || scalar_schedules
-                .iter()
-                .any(|s| is_due(latest_stats.time, s.next_time))
-        {
-            artifacts.record_scalar(&latest_stats)?;
-            steps.push(latest_stats.clone());
-            advance_due_schedules(&mut scalar_schedules, latest_stats.time);
-        }
+            let observables = observe_multilayer(&contexts, &states, demag_runtime.as_ref())?;
+            let latest_stats = make_step_stats(
+                step_count,
+                current_time(&states),
+                dt_step,
+                wall_time_ns,
+                &observables,
+            );
 
-        record_due_fields(
-            &observables,
-            latest_stats.step,
-            latest_stats.time,
-            latest_stats.dt,
-            &mut field_schedules,
-            &mut artifacts,
-        )?;
+            if default_scalar_trace
+                || scalar_schedules
+                    .iter()
+                    .any(|s| is_due(latest_stats.time, s.next_time))
+            {
+                artifacts.record_scalar(&latest_stats)?;
+                steps.push(latest_stats.clone());
+                advance_due_schedules(&mut scalar_schedules, latest_stats.time);
+            }
 
-        if let Some((grid, on_step)) = live.as_mut() {
-            let action = on_step(StepUpdate {
-                coupled_checkpoint: None,
-                stats: latest_stats.clone(),
-                grid: [grid[0], grid[1], grid[2]],
-                fem_mesh_generation_id: None,
-                magnetization: None,
-                preview_field: None,
-                cached_preview_fields: None,
-                hysteresis_field_m_t: None,
-                hysteresis_point_index: None,
-                hysteresis_settle_step_index: None,
-                hysteresis_settle_step_kind: None,
-                hysteresis_settle_step_method: None,
-                scalar_row_due: false,
-                finished: false,
-            });
-            match action {
-                StepAction::Continue => {}
-                StepAction::Stop => {
-                    cancelled = true;
-                }
-                StepAction::Pause => {
-                    paused = true;
+            record_due_fields(
+                &observables,
+                latest_stats.step,
+                latest_stats.time,
+                latest_stats.dt,
+                &mut field_schedules,
+                &mut artifacts,
+            )?;
+
+            if let Some((grid, on_step)) = live.as_mut() {
+                let action = on_step(StepUpdate {
+                    coupled_checkpoint: final_abm3_checkpoint.clone(),
+                    stats: latest_stats.clone(),
+                    grid: [grid[0], grid[1], grid[2]],
+                    fem_mesh_generation_id: None,
+                    magnetization: None,
+                    preview_field: None,
+                    cached_preview_fields: None,
+                    hysteresis_field_m_t: None,
+                    hysteresis_point_index: None,
+                    hysteresis_settle_step_index: None,
+                    hysteresis_settle_step_kind: None,
+                    hysteresis_settle_step_method: None,
+                    scalar_row_due: false,
+                    terminal_field_snapshot: false,
+                    finished: false,
+                });
+                match action {
+                    StepAction::Continue => {}
+                    StepAction::Stop => {
+                        cancelled = true;
+                    }
+                    StepAction::Pause => {
+                        paused = true;
+                    }
                 }
             }
-        }
 
-        if cancelled || paused {
-            break;
-        }
+            if cancelled || paused {
+                break;
+            }
 
-        let energy_plateau_range = energy_plateau.record(latest_stats.e_total);
-        let stop_for_relaxation = plan.relaxation.as_ref().is_some_and(|control| {
-            latest_stats.step >= control.stop.max_steps.unwrap_or(u64::MAX)
-                || torque_confirmation.observe_stats(
-                    control,
-                    &latest_stats,
-                    energy_plateau_range,
-                    plan.gyromagnetic_ratio,
-                    average_damping(&contexts),
-                    pure_damping_relax,
-                )
-        });
-        completion_metrics = crate::relaxation::RelaxationCompletionMetrics {
-            max_torque_apm: Some(latest_stats.max_torque_Apm),
-            torque_confirmed: torque_confirmation.confirmed(),
-            accepted_energy_plateau_range_j: energy_plateau_range,
-            steps: step_count,
-            relaxation_time_s: Some(latest_stats.time),
-            numerical_stagnation: false,
-        };
-        if stop_for_relaxation {
-            break;
+            let energy_plateau_range = energy_plateau.record(latest_stats.e_total);
+            let stop_for_relaxation = plan.relaxation.as_ref().is_some_and(|control| {
+                latest_stats.step >= control.stop.max_steps.unwrap_or(u64::MAX)
+                    || torque_confirmation.observe_stats(
+                        control,
+                        &latest_stats,
+                        energy_plateau_range,
+                        plan.gyromagnetic_ratio,
+                        average_damping(&contexts),
+                        pure_damping_relax,
+                    )
+            });
+            completion_metrics = crate::relaxation::RelaxationCompletionMetrics {
+                max_torque_apm: Some(latest_stats.max_torque_Apm),
+                torque_confirmed: torque_confirmation.confirmed(),
+                accepted_energy_plateau_range_j: energy_plateau_range,
+                steps: step_count,
+                relaxation_time_s: Some(latest_stats.time),
+                numerical_stagnation: false,
+            };
+            if stop_for_relaxation {
+                break;
+            }
         }
     }
 
+    if all_active_dofs_frozen
+        && plan.relaxation.is_none()
+        && until_seconds.is_finite()
+        && !paused
+        && !cancelled
+    {
+        // A fully constrained multilayer dynamics stage is an analytical
+        // constant-state evolution.  Advance only the observation clock and
+        // materialize requested schedules; never invoke an RHS/integrator.
+        let initial_time = current_time(&states);
+        if scalar_schedules
+            .iter()
+            .any(|schedule| is_due(initial_time, schedule.next_time))
+        {
+            let initial_stats =
+                make_step_stats(step_count, initial_time, 0.0, 0, &initial_observables);
+            artifacts.record_scalar(&initial_stats)?;
+            steps.push(initial_stats);
+            advance_due_schedules(&mut scalar_schedules, initial_time);
+        }
+        loop {
+            let next_time = scalar_schedules
+                .iter()
+                .chain(field_schedules.iter())
+                .map(|schedule| schedule.next_time)
+                .filter(|time| time.is_finite() && *time > current_time(&states))
+                .min_by(f64::total_cmp);
+            let Some(next_time) = next_time else {
+                break;
+            };
+            if next_time > until_seconds && !same_time(next_time, until_seconds) {
+                break;
+            }
+            for state in &mut states {
+                state.time_seconds = next_time.min(until_seconds);
+            }
+            let observables = observe_multilayer(&contexts, &states, demag_runtime.as_ref())?;
+            let time = current_time(&states);
+            let stats = make_step_stats(step_count, time, 0.0, 0, &observables);
+            if scalar_schedules
+                .iter()
+                .any(|schedule| is_due(time, schedule.next_time))
+            {
+                artifacts.record_scalar(&stats)?;
+                steps.push(stats);
+                advance_due_schedules(&mut scalar_schedules, time);
+            }
+            record_due_fields(
+                &observables,
+                step_count,
+                time,
+                0.0,
+                &mut field_schedules,
+                &mut artifacts,
+            )?;
+        }
+        if current_time(&states) < until_seconds {
+            for state in &mut states {
+                state.time_seconds = until_seconds;
+            }
+        }
+    }
+
+    let final_abm3_checkpoint = if let Some(history) = abm3_history.as_ref() {
+        Some(multilayer_abm3_checkpoint_value(
+            plan,
+            &states,
+            frozen_spins.as_ref(),
+            history,
+            step_count,
+            history.last_dt,
+        )?)
+    } else {
+        None
+    };
     let final_observables = observe_multilayer(&contexts, &states, demag_runtime.as_ref())?;
     let final_stats = make_step_stats(
         step_count,
         current_time(&states),
-        dt.min(until_seconds.max(dt)),
+        if all_active_dofs_frozen {
+            0.0
+        } else {
+            dt.min(until_seconds.max(dt))
+        },
         0,
         &final_observables,
     );
@@ -402,7 +655,6 @@ pub(crate) fn execute_reference_fdm_multilayer(
             let cached_preview_fields =
                 build_multilayer_live_preview_fields(plan, &final_observables, final_stats.step);
             let _ = on_step(StepUpdate {
-                coupled_checkpoint: None,
                 stats: final_stats.clone(),
                 scalar_row_due: true,
                 grid: [grid[0], grid[1], grid[2]],
@@ -416,12 +668,23 @@ pub(crate) fn execute_reference_fdm_multilayer(
                 hysteresis_settle_step_index: None,
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
+                terminal_field_snapshot: false,
                 finished: false,
+                coupled_checkpoint: final_abm3_checkpoint.clone(),
             });
         }
     }
 
     let (field_snapshots, field_snapshot_count, provenance) = artifacts.finish();
+    let mut auxiliary_artifacts = Vec::new();
+    if let Some(checkpoint) = final_abm3_checkpoint {
+        auxiliary_artifacts.push(crate::types::AuxiliaryArtifact {
+            relative_path: "solver/fdm_cpu_multilayer_abm3_checkpoint.v1.json".to_string(),
+            bytes: serde_json::to_vec_pretty(&checkpoint).map_err(|error| RunError {
+                message: format!("serializing final FDM CPU multilayer ABM3 checkpoint: {error}"),
+            })?,
+        });
+    }
     let status = if paused {
         RunStatus::Paused
     } else if cancelled {
@@ -429,11 +692,30 @@ pub(crate) fn execute_reference_fdm_multilayer(
     } else {
         RunStatus::Completed
     };
-    let completion = crate::relaxation::resolve_stage_completion(
-        status,
-        plan.relaxation.as_ref(),
-        completion_metrics,
-    );
+    let completion = if all_active_dofs_frozen {
+        StageCompletionIR {
+            status: "completed".to_string(),
+            converged: true,
+            reason: None,
+            metric: None,
+            metric_name: Some(
+                if plan.relaxation.is_some() {
+                    "all_active_dofs_frozen_relaxation"
+                } else {
+                    "all_active_dofs_frozen_time_advance"
+                }
+                .to_string(),
+            ),
+            metric_value: Some(0.0),
+            threshold: None,
+        }
+    } else {
+        crate::relaxation::resolve_stage_completion(
+            status,
+            plan.relaxation.as_ref(),
+            completion_metrics,
+        )
+    };
 
     Ok(ExecutedRun {
         result: RunResult {
@@ -450,7 +732,7 @@ pub(crate) fn execute_reference_fdm_multilayer(
         initial_magnetization,
         field_snapshots,
         field_snapshot_count,
-        auxiliary_artifacts: Vec::new(),
+        auxiliary_artifacts,
         provenance,
     })
 }
@@ -494,6 +776,36 @@ fn build_multilayer_live_preview_fields(
     push_field("m", &observables.magnetization);
     if plan.enable_demag {
         push_field("H_demag", &observables.demag_field);
+    }
+    drop(push_field);
+    if let Some(frozen) = plan.frozen_spins.as_ref() {
+        fields.push(LivePreviewField {
+            config_revision: 0,
+            source_step,
+            source_time_seconds: None,
+            source_revision: source_step,
+            materialized_at_unix_ms: 0,
+            materialization_wall_time_ns: 0,
+            quantity: "frozen_spins".to_string(),
+            unit: quantity_unit("frozen_spins").to_string(),
+            spatial_kind: "fdm_multilayer".to_string(),
+            quantity_domain: quantity_spatial_domain("frozen_spins").to_string(),
+            preview_grid: carrier_grid,
+            original_grid: carrier_grid,
+            vector_field_values: frozen
+                .frozen_mask
+                .iter()
+                .map(|value| if *value { 1.0 } else { 0.0 })
+                .collect(),
+            x_chosen_size: 0,
+            y_chosen_size: 0,
+            applied_x_chosen_size: 0,
+            applied_y_chosen_size: 0,
+            applied_layer_stride: 1,
+            auto_downscaled: false,
+            auto_downscale_message: None,
+            active_mask: active_mask.clone(),
+        });
     }
     fields
 }
@@ -554,7 +866,7 @@ fn snapshot_fields(
     };
     let observables = observe_multilayer(&contexts, &states, demag_runtime.as_ref())?;
     let native_point_count = observables.magnetization.len();
-    let scalar_fields = build_multilayer_scalar_fields(&contexts, &states, &observables)?;
+    let scalar_fields = build_multilayer_scalar_fields(plan, &contexts, &states, &observables)?;
     let active_mask = multilayer_active_mask(plan);
     let active_quantities = active_fdm_multilayer_preview_quantities(plan, quantities);
     let mut result = Vec::new();
@@ -607,7 +919,7 @@ fn snapshot_fields(
                             message: format!(
                             "multilayer scalar quantity '{}' is unavailable for the current plan",
                             quantity
-                            ),
+                        ),
                         })?;
             }
             fullmag_quantities::QuantityShape::VectorField => {
@@ -680,6 +992,7 @@ fn multilayer_carrier_grid(plan: &FdmMultilayerPlanIR) -> [u32; 3] {
 }
 
 fn build_multilayer_scalar_fields(
+    plan: &FdmMultilayerPlanIR,
     contexts: &[LayerContext],
     states: &[ExchangeLlgState],
     observables: &StateObservables,
@@ -690,11 +1003,24 @@ fn build_multilayer_scalar_fields(
         ("eden_ext", Vec::new()),
         ("eden_ani", Vec::new()),
         ("eden_dmi", Vec::new()),
+        ("eden_rotated_dmi", Vec::new()),
         ("eden_total", Vec::new()),
         ("mat_ms", Vec::new()),
         ("mat_aex", Vec::new()),
         ("mat_alpha", Vec::new()),
+        ("frozen_spins", Vec::new()),
     ]);
+    if let Some(frozen) = plan.frozen_spins.as_ref() {
+        fields
+            .get_mut("frozen_spins")
+            .unwrap()
+            .extend(
+                frozen
+                    .frozen_mask
+                    .iter()
+                    .map(|value| if *value { 1.0 } else { 0.0 }),
+            );
+    }
     let mut offset = 0usize;
     for (context, state) in contexts.iter().zip(states) {
         let local = context.problem.observe(state).map_err(|error| RunError {
@@ -717,6 +1043,9 @@ fn build_multilayer_scalar_fields(
             .external_energy_density_from_fields(m, &local.external_field);
         let ani = context.problem.anisotropy_energy_density_from_vectors(m);
         let dmi = context.problem.dmi_energy_density_from_vectors(m);
+        let rotated_dmi = context
+            .problem
+            .rotated_interfacial_dmi_energy_density_from_vectors(m);
         let total = (0..count)
             .map(|index| ex[index] + demag[index] + ext[index] + ani[index] + dmi[index])
             .collect::<Vec<_>>();
@@ -725,6 +1054,10 @@ fn build_multilayer_scalar_fields(
         fields.get_mut("eden_ext").unwrap().extend(ext);
         fields.get_mut("eden_ani").unwrap().extend(ani);
         fields.get_mut("eden_dmi").unwrap().extend(dmi);
+        fields
+            .get_mut("eden_rotated_dmi")
+            .unwrap()
+            .extend(rotated_dmi);
         fields.get_mut("eden_total").unwrap().extend(total);
         fields
             .get_mut("mat_ms")
@@ -818,6 +1151,7 @@ fn build_contexts_and_states(
                             .unwrap_or([0.0, 1.0, 0.0]),
                     }),
                 interfacial_dmi: plan.interfacial_dmi,
+                rotated_interfacial_dmi: plan.rotated_interfacial_dmi,
                 bulk_dmi: plan.bulk_dmi,
                 zhang_li_stt: None,
                 slonczewski_stt: None,
@@ -925,7 +1259,7 @@ fn build_multilayer_demag_runtime(
         other => {
             return Err(RunError {
                 message: format!("unsupported resolved multilayer mode '{other}'"),
-            })
+            });
         }
     };
     let conv_grid = [
@@ -994,7 +1328,7 @@ fn build_multilayer_demag_runtime(
                             "layer '{}' has unsupported transfer_kind '{other}'",
                             layer.layer_id
                         ),
-                    })
+                    });
                 }
             };
             FdmLayerDescriptor::new(
@@ -1131,6 +1465,7 @@ fn observe_multilayer(
     let mut anisotropy_field = Vec::new();
     let mut cubic_anisotropy_field = Vec::new();
     let mut dmi_field = Vec::new();
+    let mut rotated_dmi_field = Vec::new();
     let mut bulk_dmi_field = Vec::new();
     let mut effective_field = Vec::new();
     let mut exchange_energy = 0.0;
@@ -1138,6 +1473,7 @@ fn observe_multilayer(
     let mut external_energy = 0.0;
     let mut anisotropy_energy = 0.0;
     let mut dmi_energy = 0.0;
+    let mut rotated_dmi_energy = 0.0;
     let mut max_dm_dt: f64 = 0.0;
     let mut max_h_eff: f64 = 0.0;
     let mut max_h_demag: f64 = 0.0;
@@ -1161,6 +1497,9 @@ fn observe_multilayer(
             .problem
             .anisotropy_field_components(state.magnetization());
         let mut local_dmi = context.problem.interfacial_dmi_field(state.magnetization());
+        let mut local_rotated_dmi = context
+            .problem
+            .rotated_interfacial_dmi_field(state.magnetization());
         let mut local_bulk_dmi = context.problem.bulk_dmi_field(state.magnetization());
         let local_exchange = local_observables.exchange_field;
         let mut local_external = local_observables.external_field;
@@ -1174,6 +1513,10 @@ fn observe_multilayer(
             context.problem.active_mask.as_deref(),
         );
         zero_outside_active(&mut local_dmi, context.problem.active_mask.as_deref());
+        zero_outside_active(
+            &mut local_rotated_dmi,
+            context.problem.active_mask.as_deref(),
+        );
         zero_outside_active(&mut local_bulk_dmi, context.problem.active_mask.as_deref());
         let mut local_effective = local_observables.effective_field;
         for cell in 0..local_effective.len() {
@@ -1204,11 +1547,15 @@ fn observe_multilayer(
             .sum::<f64>();
         let local_anisotropy_energy = local_observables.anisotropy_energy_joules;
         let local_dmi_energy = local_observables.dmi_energy_joules;
+        let local_rotated_dmi_energy = context
+            .problem
+            .rotated_interfacial_dmi_energy_from_vectors(state.magnetization());
         exchange_energy += local_exchange_energy;
         demag_energy += local_demag_energy;
         external_energy += local_external_energy;
         anisotropy_energy += local_anisotropy_energy;
         dmi_energy += local_dmi_energy;
+        rotated_dmi_energy += local_rotated_dmi_energy;
         max_dm_dt = max_dm_dt.max(max_norm(&rhs));
         max_h_eff = max_h_eff.max(max_norm(&local_effective));
         max_h_demag = max_h_demag.max(max_norm(&local_demag));
@@ -1245,6 +1592,7 @@ fn observe_multilayer(
                 ("e_ext".to_string(), local_external_energy),
                 ("e_ani".to_string(), local_anisotropy_energy),
                 ("e_dmi".to_string(), local_dmi_energy),
+                ("e_rotated_dmi".to_string(), local_rotated_dmi_energy),
                 (
                     "e_total".to_string(),
                     local_exchange_energy
@@ -1267,6 +1615,7 @@ fn observe_multilayer(
         anisotropy_field.extend(local_anisotropy);
         cubic_anisotropy_field.extend(local_cubic_anisotropy);
         dmi_field.extend(local_dmi);
+        rotated_dmi_field.extend(local_rotated_dmi);
         bulk_dmi_field.extend(local_bulk_dmi);
         effective_field.extend(local_effective);
     }
@@ -1290,6 +1639,7 @@ fn observe_multilayer(
         effective_field,
         anisotropy_field,
         dmi_field,
+        rotated_dmi_field,
         magnetoelastic_field: Vec::new(),
         cubic_anisotropy_field,
         bulk_dmi_field,
@@ -1301,6 +1651,7 @@ fn observe_multilayer(
         drive_energy: 0.0,
         anisotropy_energy,
         dmi_energy,
+        rotated_dmi_energy,
         total_energy: exchange_energy
             + demag_energy
             + external_energy
@@ -1322,15 +1673,43 @@ fn step_multilayer(
     demag_runtime: Option<&MultilayerDemagRuntime>,
     dt: f64,
     integrator: IntegratorChoice,
+    frozen_spins: Option<&fullmag_engine::FrozenSpinsState>,
+    abm3_history: Option<&mut MultilayerAbm3History>,
 ) -> Result<(), RunError> {
+    if integrator == IntegratorChoice::Abm3 {
+        let history = abm3_history.ok_or_else(|| RunError {
+            message: "multilayer ABM3 execution requires a persistent history buffer".to_string(),
+        })?;
+        return step_multilayer_abm3(contexts, states, demag_runtime, dt, frozen_spins, history);
+    }
+    if abm3_history.is_some() {
+        return Err(RunError {
+            message: "multilayer ABM3 history was supplied for a non-ABM3 integrator".to_string(),
+        });
+    }
     let m0 = states
         .iter()
         .map(|state| state.magnetization().to_vec())
         .collect::<Vec<_>>();
     let corrected = crate::fdm::multilayer::explicit_rk_step(&m0, dt, integrator, |m| {
-        llg_rhs_multilayer(contexts, m, demag_runtime).map_err(|error| error.message)
+        let mut constrained = m.to_vec();
+        if let Some(frozen) = frozen_spins {
+            restore_frozen_reference_by_layer_offsets(frozen, &mut constrained)
+                .map_err(|error| error.message)?;
+        }
+        let mut rhs = llg_rhs_multilayer(contexts, &constrained, demag_runtime)
+            .map_err(|error| error.message)?;
+        if let Some(frozen) = frozen_spins {
+            zero_frozen_rhs_by_layer_offsets(frozen, &mut rhs).map_err(|error| error.message)?;
+        }
+        Ok(rhs)
     })
     .map_err(|message| RunError { message })?;
+
+    let mut corrected = corrected;
+    if let Some(frozen) = frozen_spins {
+        restore_frozen_reference_by_layer_offsets(frozen, &mut corrected)?;
+    }
 
     for (state, new_layer) in states.iter_mut().zip(corrected.into_iter()) {
         state
@@ -1341,6 +1720,433 @@ fn step_multilayer(
         state.time_seconds += dt;
     }
     Ok(())
+}
+
+fn step_multilayer_abm3(
+    contexts: &[LayerContext],
+    states: &mut [ExchangeLlgState],
+    demag_runtime: Option<&MultilayerDemagRuntime>,
+    dt: f64,
+    frozen_spins: Option<&fullmag_engine::FrozenSpinsState>,
+    history: &mut MultilayerAbm3History,
+) -> Result<(), RunError> {
+    if !dt.is_finite() || dt <= 0.0 {
+        return Err(RunError {
+            message: format!("multilayer ABM3 requires a finite positive dt, got {dt}"),
+        });
+    }
+    history.restart_if_dt_changed(dt);
+    let initial = states
+        .iter()
+        .map(|state| state.magnetization().to_vec())
+        .collect::<Vec<_>>();
+
+    let accepted = if !history.is_ready() {
+        // ABM3 startup is the same explicit Heun bootstrap used by the single
+        // grid CPU solver.  The endpoint RHS is captured below, so no stale
+        // pre-activation derivative can enter the multistep history.
+        crate::fdm::multilayer::explicit_rk_step(
+            &initial,
+            dt,
+            IntegratorChoice::Heun,
+            |candidate| {
+                masked_multilayer_rhs(contexts, candidate, demag_runtime, frozen_spins)
+                    .map_err(|error| error.message)
+            },
+        )
+        .map_err(|message| RunError { message })?
+    } else {
+        let f_n = history.rhs_history.first().ok_or_else(|| RunError {
+            message: "multilayer ABM3 history missing f_n".to_string(),
+        })?;
+        let f_n1 = history.rhs_history.get(1).ok_or_else(|| RunError {
+            message: "multilayer ABM3 history missing f_n_minus_1".to_string(),
+        })?;
+        let f_n2 = history.rhs_history.get(2).ok_or_else(|| RunError {
+            message: "multilayer ABM3 history missing f_n_minus_2".to_string(),
+        })?;
+        let predicted = combine_abm3_normalized(
+            &initial,
+            &[(f_n, 23.0 / 12.0), (f_n1, -16.0 / 12.0), (f_n2, 5.0 / 12.0)],
+            dt,
+        )?;
+        let predicted_rhs =
+            masked_multilayer_rhs(contexts, &predicted, demag_runtime, frozen_spins)?;
+        combine_abm3_normalized(
+            &initial,
+            &[
+                (&predicted_rhs, 5.0 / 12.0),
+                (f_n, 8.0 / 12.0),
+                (f_n1, -1.0 / 12.0),
+            ],
+            dt,
+        )?
+    };
+
+    let mut accepted = accepted;
+    if let Some(frozen) = frozen_spins {
+        restore_frozen_reference_by_layer_offsets(frozen, &mut accepted)?;
+    }
+    let endpoint_rhs = masked_multilayer_rhs(contexts, &accepted, demag_runtime, frozen_spins)?;
+    let next_time = current_time(states) + dt;
+    history.push(endpoint_rhs, next_time, dt);
+    for (state, new_layer) in states.iter_mut().zip(accepted.into_iter()) {
+        if state.magnetization().len() != new_layer.len() {
+            return Err(RunError {
+                message: "multilayer ABM3 accepted layer length mismatch".to_string(),
+            });
+        }
+        state.magnetization_mut().copy_from_slice(&new_layer);
+        state.time_seconds += dt;
+    }
+    Ok(())
+}
+
+fn masked_multilayer_rhs(
+    contexts: &[LayerContext],
+    candidate: &[Vec<[f64; 3]>],
+    demag_runtime: Option<&MultilayerDemagRuntime>,
+    frozen_spins: Option<&fullmag_engine::FrozenSpinsState>,
+) -> Result<Vec<Vec<[f64; 3]>>, RunError> {
+    let mut constrained = candidate.to_vec();
+    if let Some(frozen) = frozen_spins {
+        restore_frozen_reference_by_layer_offsets(frozen, &mut constrained)?;
+    }
+    let mut rhs = llg_rhs_multilayer(contexts, &constrained, demag_runtime)?;
+    if let Some(frozen) = frozen_spins {
+        zero_frozen_rhs_by_layer_offsets(frozen, &mut rhs)?;
+    }
+    Ok(rhs)
+}
+
+fn combine_abm3_normalized(
+    initial: &[Vec<[f64; 3]>],
+    increments: &[(&Vec<Vec<[f64; 3]>>, f64)],
+    dt: f64,
+) -> Result<Vec<Vec<[f64; 3]>>, RunError> {
+    initial
+        .iter()
+        .enumerate()
+        .map(|(layer_index, layer)| {
+            layer
+                .iter()
+                .enumerate()
+                .map(|(cell_index, value)| {
+                    let mut candidate = *value;
+                    for (rhs, coefficient) in increments {
+                        let increment = rhs
+                            .get(layer_index)
+                            .and_then(|layer_rhs| layer_rhs.get(cell_index))
+                            .ok_or_else(|| RunError {
+                                message: format!(
+                                    "multilayer ABM3 history shape mismatch at layer={layer_index} cell={cell_index}"
+                                ),
+                            })?;
+                        for component in 0..3 {
+                            candidate[component] += coefficient * dt * increment[component];
+                        }
+                    }
+                    let magnitude = norm(candidate);
+                    if !magnitude.is_finite() || magnitude == 0.0 {
+                        return Err(RunError {
+                            message:
+                                "multilayer ABM3 stage produced a non-normalizable magnetization"
+                                    .to_string(),
+                        });
+                    }
+                    Ok([
+                        candidate[0] / magnitude,
+                        candidate[1] / magnitude,
+                        candidate[2] / magnitude,
+                    ])
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
+fn multilayer_abm3_plan_sha256(plan: &FdmMultilayerPlanIR) -> Result<String, RunError> {
+    let bytes = serde_json::to_vec(plan).map_err(|error| RunError {
+        message: format!("serializing multilayer plan for ABM3 checkpoint identity: {error}"),
+    })?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn multilayer_abm3_checkpoint_value(
+    plan: &FdmMultilayerPlanIR,
+    states: &[ExchangeLlgState],
+    frozen_spins: Option<&fullmag_engine::FrozenSpinsState>,
+    history: &MultilayerAbm3History,
+    step: u64,
+    dt: f64,
+) -> Result<serde_json::Value, RunError> {
+    if plan.integrator != IntegratorChoice::Abm3 {
+        return Err(RunError {
+            message: "multilayer ABM3 checkpoint requested for a non-ABM3 plan".to_string(),
+        });
+    }
+    if states.is_empty()
+        || states
+            .iter()
+            .any(|state| state.time_seconds != states[0].time_seconds)
+    {
+        return Err(RunError {
+            message: "multilayer ABM3 checkpoint requires synchronized layer clocks".to_string(),
+        });
+    }
+    let time_seconds = states[0].time_seconds;
+    let plan_sha256 = multilayer_abm3_plan_sha256(plan)?;
+    let frozen_checkpoint = match (plan.frozen_spins.as_ref(), frozen_spins) {
+        (Some(frozen_plan), Some(frozen)) => Some(
+            FrozenSpinsCheckpointV1::from_runtime(
+                frozen_plan,
+                frozen,
+                &flatten_layers(
+                    &states
+                        .iter()
+                        .map(|state| state.magnetization().to_vec())
+                        .collect::<Vec<_>>(),
+                ),
+                step,
+                time_seconds,
+                dt,
+                "cpu_reference_multilayer",
+                "cpu",
+                "double",
+            )
+            .map_err(|error| RunError {
+                message: format!("building multilayer Frozen Spins checkpoint: {error}"),
+            })?
+            .with_problem_sha256(plan_sha256.clone()),
+        ),
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(RunError {
+                message: "multilayer ABM3 checkpoint Frozen Spins state/plan mismatch".to_string(),
+            })
+        }
+    };
+    let frozen_mask_sha256 = frozen_checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.mask_sha256.clone());
+    let frozen_activation_epoch = frozen_checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.activation.epoch);
+    let checkpoint = MultilayerAbm3CheckpointV1 {
+        schema: MULTILAYER_ABM3_CHECKPOINT_SCHEMA.to_string(),
+        plan_sha256,
+        layer_grid: plan
+            .layers
+            .iter()
+            .map(|layer| {
+                [
+                    layer.native_grid[0] as usize,
+                    layer.native_grid[1] as usize,
+                    layer.native_grid[2] as usize,
+                ]
+            })
+            .collect(),
+        layer_lengths: states
+            .iter()
+            .map(|state| state.magnetization().len())
+            .collect(),
+        step,
+        time_seconds,
+        last_dt: history.last_dt,
+        startup_steps: history.startup_steps,
+        history_resets: history.history_resets,
+        magnetization: states
+            .iter()
+            .map(|state| state.magnetization().to_vec())
+            .collect(),
+        rhs_history: history.rhs_history.clone(),
+        rhs_times_seconds: history.rhs_times_seconds.clone(),
+        frozen_spins: frozen_checkpoint,
+        frozen_mask_sha256,
+        frozen_activation_epoch,
+    };
+    serde_json::to_value(checkpoint).map_err(|error| RunError {
+        message: format!("serializing multilayer ABM3 checkpoint: {error}"),
+    })
+}
+
+fn restore_multilayer_abm3_checkpoint(
+    plan: &FdmMultilayerPlanIR,
+    value: serde_json::Value,
+    states: &mut [ExchangeLlgState],
+) -> Result<
+    (
+        Option<fullmag_engine::FrozenSpinsState>,
+        MultilayerAbm3History,
+        u64,
+    ),
+    RunError,
+> {
+    if plan.integrator != IntegratorChoice::Abm3 {
+        return Err(RunError {
+            message: "multilayer ABM3 checkpoint requires an ABM3 execution plan".to_string(),
+        });
+    }
+    if value.get("schema").and_then(serde_json::Value::as_str)
+        != Some(MULTILAYER_ABM3_CHECKPOINT_SCHEMA)
+    {
+        return Err(RunError {
+            message: format!(
+                "unsupported multilayer ABM3 checkpoint schema (expected {MULTILAYER_ABM3_CHECKPOINT_SCHEMA})"
+            ),
+        });
+    }
+    let checkpoint: MultilayerAbm3CheckpointV1 =
+        serde_json::from_value(value).map_err(|error| RunError {
+            message: format!("invalid multilayer ABM3 checkpoint payload: {error}"),
+        })?;
+    let expected_plan_sha256 = multilayer_abm3_plan_sha256(plan)?;
+    if checkpoint.plan_sha256 != expected_plan_sha256 {
+        return Err(RunError {
+            message: format!(
+                "multilayer ABM3 checkpoint plan identity mismatch: checkpoint={}, expected={expected_plan_sha256}",
+                checkpoint.plan_sha256
+            ),
+        });
+    }
+    if !checkpoint.time_seconds.is_finite()
+        || checkpoint.time_seconds < 0.0
+        || checkpoint.step == 0 && checkpoint.last_dt != 0.0
+        || checkpoint.step > 0 && (!checkpoint.last_dt.is_finite() || checkpoint.last_dt <= 0.0)
+    {
+        return Err(RunError {
+            message: "multilayer ABM3 checkpoint time/dt is invalid".to_string(),
+        });
+    }
+    if checkpoint.layer_grid.len() != states.len()
+        || checkpoint.layer_lengths.len() != states.len()
+        || checkpoint.magnetization.len() != states.len()
+    {
+        return Err(RunError {
+            message: format!(
+                "multilayer ABM3 checkpoint layer count mismatch: checkpoint={}, expected={}",
+                checkpoint.layer_grid.len(),
+                states.len()
+            ),
+        });
+    }
+    for (index, state) in states.iter().enumerate() {
+        let expected_grid = plan
+            .layers
+            .get(index)
+            .map(|layer| {
+                [
+                    layer.native_grid[0] as usize,
+                    layer.native_grid[1] as usize,
+                    layer.native_grid[2] as usize,
+                ]
+            })
+            .ok_or_else(|| RunError {
+                message: format!("multilayer ABM3 plan is missing layer {index}"),
+            })?;
+        if checkpoint.layer_grid[index] != expected_grid
+            || checkpoint.layer_lengths[index] != state.magnetization().len()
+            || checkpoint.magnetization[index].len() != state.magnetization().len()
+        {
+            return Err(RunError {
+                message: format!(
+                    "multilayer ABM3 checkpoint layer layout mismatch at index {index}"
+                ),
+            });
+        }
+    }
+    if checkpoint.startup_steps > 3
+        || checkpoint.startup_steps as usize != checkpoint.rhs_history.len()
+        || checkpoint.rhs_times_seconds.len() != checkpoint.rhs_history.len()
+        || checkpoint.rhs_history.len() > 3
+    {
+        return Err(RunError {
+            message: "multilayer ABM3 checkpoint history shape is invalid".to_string(),
+        });
+    }
+    for (slot, rhs) in checkpoint.rhs_history.iter().enumerate() {
+        if rhs.len() != states.len()
+            || rhs.iter().enumerate().any(|(layer, values)| {
+                values.len() != states[layer].magnetization().len()
+                    || values.iter().flatten().any(|value| !value.is_finite())
+            })
+            || !checkpoint.rhs_times_seconds[slot].is_finite()
+        {
+            return Err(RunError {
+                message: format!("multilayer ABM3 checkpoint RHS history slot {slot} is invalid"),
+            });
+        }
+    }
+    if checkpoint.rhs_history.is_empty() && checkpoint.last_dt != 0.0 {
+        return Err(RunError {
+            message: "multilayer ABM3 checkpoint has dt without RHS history".to_string(),
+        });
+    }
+
+    let frozen = match (plan.frozen_spins.as_ref(), checkpoint.frozen_spins.as_ref()) {
+        (Some(frozen_plan), Some(frozen_checkpoint)) => {
+            if frozen_checkpoint.schema != FROZEN_SPINS_CHECKPOINT_SCHEMA {
+                return Err(RunError {
+                    message: "multilayer Frozen Spins checkpoint schema mismatch".to_string(),
+                });
+            }
+            frozen_checkpoint
+                .validate_problem_sha256(&expected_plan_sha256)
+                .map_err(|error| RunError {
+                    message: format!("multilayer Frozen Spins checkpoint identity: {error}"),
+                })?;
+            frozen_checkpoint
+                .validate_for_plan(frozen_plan)
+                .map_err(|error| RunError {
+                    message: format!("multilayer Frozen Spins checkpoint validation: {error}"),
+                })?;
+            if frozen_checkpoint.step != checkpoint.step
+                || frozen_checkpoint.time_s != checkpoint.time_seconds
+                || frozen_checkpoint.dt != checkpoint.last_dt
+                || frozen_checkpoint.magnetization != flatten_layers(&checkpoint.magnetization)
+                || checkpoint.frozen_mask_sha256.as_deref()
+                    != Some(frozen_checkpoint.mask_sha256.as_str())
+                || checkpoint.frozen_activation_epoch != Some(frozen_checkpoint.activation.epoch)
+            {
+                return Err(RunError {
+                    message: "multilayer Frozen Spins checkpoint envelope mismatch".to_string(),
+                });
+            }
+            Some(
+                frozen_checkpoint
+                    .restore_engine_state(frozen_plan)
+                    .map_err(|error| RunError {
+                        message: format!("multilayer Frozen Spins checkpoint state: {error}"),
+                    })?,
+            )
+        }
+        (None, None) => None,
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(RunError {
+                message: "multilayer ABM3 checkpoint Frozen Spins payload does not match plan"
+                    .to_string(),
+            })
+        }
+    };
+
+    for (state, magnetization) in states.iter_mut().zip(checkpoint.magnetization.iter()) {
+        state
+            .restore_exact_checkpoint(magnetization.clone(), checkpoint.time_seconds)
+            .map_err(|error| RunError {
+                message: format!("restoring multilayer ABM3 magnetization: {error}"),
+            })?;
+    }
+    Ok((
+        frozen,
+        MultilayerAbm3History {
+            rhs_history: checkpoint.rhs_history,
+            rhs_times_seconds: checkpoint.rhs_times_seconds,
+            startup_steps: checkpoint.startup_steps,
+            last_dt: checkpoint.last_dt,
+            history_resets: checkpoint.history_resets,
+        },
+        checkpoint.step,
+    ))
 }
 
 fn llg_rhs_multilayer(
@@ -1608,6 +2414,31 @@ fn restore_frozen_reference_by_layer_offsets(
     Ok(())
 }
 
+fn zero_frozen_rhs_by_layer_offsets(
+    frozen: &fullmag_engine::FrozenSpinsState,
+    layers: &mut [Vec<[f64; 3]>],
+) -> Result<(), RunError> {
+    let total_len = layers.iter().map(Vec::len).sum::<usize>();
+    if total_len != frozen.len() {
+        return Err(RunError {
+            message: format!(
+                "frozen_spins_multilayer_rhs_size_mismatch: flattened layer length {total_len} differs from frozen state length {}",
+                frozen.len()
+            ),
+        });
+    }
+    let mut offset = 0usize;
+    for layer in layers {
+        for value in layer {
+            if frozen.mask()[offset] {
+                *value = [0.0; 3];
+            }
+            offset += 1;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1618,22 +2449,33 @@ mod tests {
         SelectionAuthoredFingerprintIR, SelectionCertificateIR,
         RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION, SELECTION_CERTIFICATE_SCHEMA_VERSION,
     };
+    use sha2::Digest;
 
     fn frozen_spins_state(
         mask: Vec<bool>,
         reference: &[[f64; 3]],
     ) -> fullmag_engine::FrozenSpinsState {
+        let plan = frozen_spins_plan(mask);
+        fullmag_engine::FrozenSpinsState::capture_at_activation(&plan, None, reference)
+            .expect("valid multilayer frozen-spin fixture")
+    }
+
+    fn frozen_spins_plan(mask: Vec<bool>) -> ResolvedFrozenSpinsPlanIR {
         let frozen_dof_count = mask.iter().filter(|frozen| **frozen).count() as u64;
         let active_dof_count = mask.len() as u64;
         let free_dof_count = active_dof_count - frozen_dof_count;
-        let plan = ResolvedFrozenSpinsPlanIR {
+        let mut mask_hash = sha2::Sha256::new();
+        mask_hash.update((mask.len() as u64).to_le_bytes());
+        mask_hash.update(mask.iter().copied().map(u8::from).collect::<Vec<_>>());
+        let mask_sha256 = format!("{:x}", mask_hash.finalize());
+        ResolvedFrozenSpinsPlanIR {
             schema_version: RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION.to_string(),
             constraint_ids: vec!["multilayer-test".to_string()],
             frozen_mask: mask,
             active_dof_count,
             frozen_dof_count,
             free_dof_count,
-            mask_sha256: "a".repeat(64),
+            mask_sha256: mask_sha256.clone(),
             grid_or_mesh_fingerprint: "multilayer-test-grid".to_string(),
             source_state_revision: Some(1),
             all_active_dofs_frozen: active_dof_count > 0 && free_dof_count == 0,
@@ -1653,13 +2495,11 @@ mod tests {
                 bounds_m: None,
                 grid_or_mesh_fingerprint: "multilayer-test-grid".to_string(),
                 source_state_revision: Some(1),
-                mask_sha256: "a".repeat(64),
+                mask_sha256,
                 resolved_reference_sha256: "c".repeat(64),
                 warnings: Vec::new(),
             },
-        };
-        fullmag_engine::FrozenSpinsState::capture_at_activation(&plan, None, reference)
-            .expect("valid multilayer frozen-spin fixture")
+        }
     }
 
     fn make_plan(enable_demag: bool) -> FdmMultilayerPlanIR {
@@ -1718,13 +2558,17 @@ mod tests {
             grid_certificate: None,
             resolved_periodic_images: None,
             layers,
+            frozen_spins: None,
             enable_exchange: true,
             enable_demag,
+            fft: None,
             external_field: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             gyromagnetic_ratio: 2.211e5,
             precision: ExecutionPrecision::Double,
+            precision_policy: fullmag_ir::FdmPrecisionPolicyIR::default(),
             exchange_bc: ExchangeBoundaryCondition::Neumann,
             periodicity: None,
             integrator: IntegratorChoice::Heun,
@@ -1797,6 +2641,338 @@ mod tests {
 
         assert_eq!(layers[0], vec![moved, reference[1]]);
         assert_eq!(layers[1], vec![reference[2], moved, reference[4]]);
+    }
+
+    #[test]
+    fn multilayer_frozen_spins_are_hard_restored_through_rk_stages() {
+        let mut plan = make_plan(false);
+        plan.enable_exchange = false;
+        plan.external_field = Some([0.0, 0.0, 2.0e5]);
+        plan.relaxation = None;
+        let mut mask = vec![false; 32];
+        mask[0] = true;
+        mask[20] = true;
+        plan.frozen_spins = Some(frozen_spins_plan(mask));
+        let reference0 = plan.layers[0].initial_magnetization[0].map(f64::to_bits);
+        let reference20 = plan.layers[1].initial_magnetization[4].map(f64::to_bits);
+
+        let executed = execute_reference_fdm_multilayer(&plan, 2.0e-13, &[], None, None)
+            .expect("multilayer Frozen Spins execution");
+        assert_eq!(
+            executed.result.final_magnetization[0].map(f64::to_bits),
+            reference0
+        );
+        assert_eq!(
+            executed.result.final_magnetization[20].map(f64::to_bits),
+            reference20
+        );
+        assert_ne!(
+            executed.result.final_magnetization[1].map(f64::to_bits),
+            plan.layers[0].initial_magnetization[1].map(f64::to_bits),
+            "an unfrozen site must remain dynamically active"
+        );
+    }
+
+    #[test]
+    fn multilayer_all_frozen_mask_covers_every_layer_without_state_drift() {
+        let mut plan = make_plan(false);
+        plan.enable_exchange = false;
+        plan.external_field = Some([0.0, 0.0, 2.0e5]);
+        plan.relaxation = None;
+        plan.frozen_spins = Some(frozen_spins_plan(vec![true; 32]));
+        let initial = flatten_layers(
+            &plan
+                .layers
+                .iter()
+                .map(|layer| layer.initial_magnetization.clone())
+                .collect::<Vec<_>>(),
+        );
+        let until = 3.0 * plan.fixed_timestep.expect("fixed timestep");
+
+        let executed = execute_reference_fdm_multilayer(&plan, until, &[], None, None)
+            .expect("all-frozen multilayer time evolution");
+
+        assert_eq!(
+            executed
+                .result
+                .final_magnetization
+                .iter()
+                .map(|value| value.map(f64::to_bits))
+                .collect::<Vec<_>>(),
+            initial
+                .iter()
+                .map(|value| value.map(f64::to_bits))
+                .collect::<Vec<_>>(),
+            "every frozen layer must remain bitwise constant"
+        );
+        assert_eq!(
+            executed.result.steps.last().map(|step| step.time),
+            Some(until),
+            "all-frozen dynamics must still advance the observation clock"
+        );
+    }
+
+    #[test]
+    fn multilayer_all_frozen_materializes_scalar_and_field_schedule_without_steps() {
+        let mut plan = make_plan(false);
+        plan.enable_exchange = false;
+        plan.external_field = Some([0.0, 0.0, 2.0e5]);
+        plan.relaxation = None;
+        plan.frozen_spins = Some(frozen_spins_plan(vec![true; 32]));
+        let dt = plan.fixed_timestep.expect("fixed timestep");
+        let until = 3.0 * dt;
+        let outputs = vec![
+            OutputIR::Scalar {
+                name: "time".to_string(),
+                every_seconds: dt,
+            },
+            OutputIR::Field {
+                name: "m".to_string(),
+                every_seconds: dt,
+            },
+        ];
+
+        let executed = execute_reference_fdm_multilayer(&plan, until, &outputs, None, None)
+            .expect("all-frozen scheduled multilayer evolution");
+
+        assert_eq!(
+            executed
+                .result
+                .steps
+                .iter()
+                .map(|step| step.time)
+                .collect::<Vec<_>>(),
+            vec![0.0, dt, 2.0 * dt, until]
+        );
+        assert_eq!(executed.field_snapshots.len(), 4);
+        assert!(executed
+            .field_snapshots
+            .iter()
+            .all(|snapshot| snapshot.name == "m" && snapshot.values.len() == 96));
+        assert_eq!(
+            executed
+                .field_snapshots
+                .iter()
+                .map(|snapshot| snapshot.time)
+                .collect::<Vec<_>>(),
+            vec![0.0, dt, 2.0 * dt, until]
+        );
+    }
+
+    #[test]
+    fn multilayer_all_frozen_relaxation_completes_without_solver_steps() {
+        let mut plan = make_plan(false);
+        plan.enable_exchange = false;
+        plan.external_field = Some([0.0, 0.0, 2.0e5]);
+        plan.frozen_spins = Some(frozen_spins_plan(vec![true; 32]));
+        let initial = flatten_layers(
+            &plan
+                .layers
+                .iter()
+                .map(|layer| layer.initial_magnetization.clone())
+                .collect::<Vec<_>>(),
+        );
+
+        let executed = execute_reference_fdm_multilayer(&plan, 1.0e-12, &[], None, None)
+            .expect("all-frozen multilayer relaxation");
+
+        assert_eq!(
+            executed
+                .result
+                .final_magnetization
+                .iter()
+                .map(|value| value.map(f64::to_bits))
+                .collect::<Vec<_>>(),
+            initial
+                .iter()
+                .map(|value| value.map(f64::to_bits))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(executed.result.steps.len(), 1);
+        assert_eq!(
+            executed
+                .result
+                .completion
+                .as_ref()
+                .and_then(|completion| completion.metric_name.as_deref()),
+            Some("all_active_dofs_frozen_relaxation")
+        );
+    }
+
+    #[test]
+    fn multilayer_no_mask_parity_matches_explicit_all_free_mask() {
+        let mut unconstrained = make_plan(false);
+        unconstrained.enable_exchange = false;
+        unconstrained.external_field = Some([0.0, 0.0, 2.0e5]);
+        unconstrained.relaxation = None;
+        let mut explicit_all_free = unconstrained.clone();
+        explicit_all_free.frozen_spins = Some(frozen_spins_plan(vec![false; 32]));
+        let until = 3.0 * unconstrained.fixed_timestep.expect("fixed timestep");
+
+        let baseline = execute_reference_fdm_multilayer(&unconstrained, until, &[], None, None)
+            .expect("unconstrained multilayer run");
+        let masked = execute_reference_fdm_multilayer(&explicit_all_free, until, &[], None, None)
+            .expect("explicit all-free multilayer run");
+
+        assert_eq!(
+            masked
+                .result
+                .final_magnetization
+                .iter()
+                .map(|value| value.map(f64::to_bits))
+                .collect::<Vec<_>>(),
+            baseline
+                .result
+                .final_magnetization
+                .iter()
+                .map(|value| value.map(f64::to_bits))
+                .collect::<Vec<_>>(),
+            "an explicit all-free Frozen Spins plan must preserve no-mask parity"
+        );
+        assert_eq!(
+            masked.result.steps.last().map(|step| step.time),
+            baseline.result.steps.last().map(|step| step.time)
+        );
+    }
+
+    #[test]
+    fn multilayer_abm3_frozen_spins_checkpoint_resume_matches_uninterrupted_run() {
+        let mut plan = make_plan(false);
+        plan.enable_exchange = false;
+        plan.external_field = Some([0.0, 0.0, 2.0e5]);
+        plan.relaxation = None;
+        plan.integrator = IntegratorChoice::Abm3;
+        let mut mask = vec![false; 32];
+        mask[0] = true;
+        mask[20] = true;
+        plan.frozen_spins = Some(frozen_spins_plan(mask));
+
+        let dt = plan.fixed_timestep.expect("test plan has a fixed timestep");
+        let until = 6.0 * dt;
+        let uninterrupted = execute_reference_fdm_multilayer(&plan, until, &[], None, None)
+            .expect("uninterrupted multilayer ABM3 run");
+        let seed = execute_reference_fdm_multilayer(&plan, 3.0 * dt, &[], None, None)
+            .expect("multilayer ABM3 checkpoint seed run");
+        let checkpoint_artifact = seed
+            .auxiliary_artifacts
+            .iter()
+            .find(|artifact| {
+                artifact.relative_path == "solver/fdm_cpu_multilayer_abm3_checkpoint.v1.json"
+            })
+            .expect("multilayer ABM3 run must emit a durable checkpoint");
+        let checkpoint: serde_json::Value = serde_json::from_slice(&checkpoint_artifact.bytes)
+            .expect("multilayer ABM3 checkpoint JSON");
+        assert_eq!(
+            checkpoint["schema"], MULTILAYER_ABM3_CHECKPOINT_SCHEMA,
+            "checkpoint schema must be explicit"
+        );
+        assert_eq!(checkpoint["startup_steps"], 3);
+        assert_eq!(checkpoint["rhs_history"].as_array().unwrap().len(), 3);
+        assert_eq!(checkpoint["frozen_activation_epoch"], 1);
+
+        let resumed = execute_reference_fdm_multilayer_with_checkpoint(
+            &plan,
+            until,
+            &[],
+            None,
+            None,
+            Some(checkpoint),
+        )
+        .expect("resumed multilayer ABM3 run");
+        assert_eq!(
+            resumed
+                .result
+                .final_magnetization
+                .iter()
+                .map(|value| value.map(f64::to_bits))
+                .collect::<Vec<_>>(),
+            uninterrupted
+                .result
+                .final_magnetization
+                .iter()
+                .map(|value| value.map(f64::to_bits))
+                .collect::<Vec<_>>(),
+            "ABM3 free and frozen state must continue bitwise after resume"
+        );
+        assert_eq!(
+            resumed.result.steps.last().map(|step| step.time),
+            uninterrupted.result.steps.last().map(|step| step.time)
+        );
+        assert_ne!(
+            resumed.result.final_magnetization[1].map(f64::to_bits),
+            plan.layers[0].initial_magnetization[1].map(f64::to_bits),
+            "free multilayer spin must remain mobile through ABM3"
+        );
+    }
+
+    #[test]
+    fn multilayer_frozen_layer_remains_in_demag_influence_on_free_layer() {
+        let mut plan = make_plan(true);
+        plan.enable_exchange = false;
+        plan.external_field = None;
+        plan.relaxation = None;
+        let mask = (0..32).map(|index| index < 16).collect::<Vec<_>>();
+        let reference = flatten_layers(
+            &plan
+                .layers
+                .iter()
+                .map(|layer| layer.initial_magnetization.clone())
+                .collect::<Vec<_>>(),
+        );
+        let frozen = frozen_spins_state(mask.clone(), &reference);
+        let (contexts, states) =
+            build_contexts_and_states(&plan, fullmag_engine::TimeIntegrator::Heun, false)
+                .expect("multilayer demag contexts should build");
+        let runtime = build_multilayer_demag_runtime(&plan).expect("demag runtime should build");
+        let baseline = states
+            .iter()
+            .map(|state| state.magnetization().to_vec())
+            .collect::<Vec<_>>();
+        let baseline_rhs =
+            masked_multilayer_rhs(&contexts, &baseline, Some(&runtime), Some(&frozen))
+                .expect("baseline frozen demag RHS");
+
+        let mut changed = baseline.clone();
+        changed[0].fill([0.0, 0.0, 1.0]);
+        let changed_reference = flatten_layers(&changed);
+        let changed_frozen = frozen_spins_state(mask, &changed_reference);
+        let changed_rhs =
+            masked_multilayer_rhs(&contexts, &changed, Some(&runtime), Some(&changed_frozen))
+                .expect("changed frozen demag RHS");
+        assert!(
+            baseline_rhs[1]
+                .iter()
+                .zip(&changed_rhs[1])
+                .any(|(before, after)| before
+                    .iter()
+                    .zip(after)
+                    .any(|(before, after)| (before - after).abs() > 1e-20)),
+            "changing the frozen layer must change the free layer demag RHS"
+        );
+    }
+
+    #[test]
+    fn multilayer_snapshot_exposes_frozen_spins_on_the_native_layer_carrier() {
+        let mut plan = make_plan(false);
+        let mask = (0..32).map(|index| index % 3 == 0).collect::<Vec<_>>();
+        plan.frozen_spins = Some(frozen_spins_plan(mask.clone()));
+        let preview = snapshot_preview(
+            &plan,
+            &LivePreviewRequest {
+                quantity: "frozen_spins".to_string(),
+                ..LivePreviewRequest::default()
+            },
+        )
+        .expect("multilayer Frozen Spins snapshot");
+
+        assert_eq!(preview.spatial_kind, "fdm_multilayer");
+        assert_eq!(preview.preview_grid, [32, 1, 1]);
+        assert_eq!(
+            preview.vector_field_values,
+            mask.into_iter()
+                .map(|value| if value { 1.0 } else { 0.0 })
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -2290,7 +3466,14 @@ mod tests {
                 .iter()
                 .map(|quantity| by_quantity[quantity].vector_field_values[component + axis])
                 .sum::<f64>();
-                assert!((h_eff[component + axis] - expected).abs() < 1.0e-10);
+                let actual = h_eff[component + axis];
+                let abs_diff = (actual - expected).abs();
+                let scale = actual.abs().max(expected.abs());
+                let tolerance = 1.0e-10_f64.max(32.0 * f64::EPSILON * scale);
+                assert!(
+                    abs_diff <= tolerance,
+                    "H_eff mismatch at cell {index}, axis {axis}: actual={actual:.17e}, expected={expected:.17e}, abs_diff={abs_diff:.17e}, tolerance={tolerance:.17e}",
+                );
             }
         }
         for index in 0..32 {
@@ -2504,6 +3687,63 @@ mod tests {
         assert!(
             rhs.iter().any(|layer| max_norm(layer) > 0.0),
             "global DMI must contribute to the multilayer RHS"
+        );
+    }
+
+    #[test]
+    fn multilayer_reference_cpu_materializes_rotated_dmi_in_energy_and_rhs() {
+        let mut plan = make_plan(false);
+        plan.enable_exchange = false;
+        plan.interfacial_dmi = None;
+        plan.bulk_dmi = None;
+        plan.rotated_interfacial_dmi = Some(3.0e-3);
+        for layer in &mut plan.layers {
+            let layer_nx = layer.native_grid[0] as usize;
+            for (index, value) in layer.initial_magnetization.iter_mut().enumerate() {
+                let x = (index % layer_nx) as f64;
+                let y = (index / layer_nx) as f64;
+                *value = [0.25 + 0.04 * x, -0.3 + 0.03 * y, 0.5 - 0.02 * x];
+            }
+        }
+
+        let (contexts, states) =
+            build_contexts_and_states(&plan, fullmag_engine::TimeIntegrator::Heun, false)
+                .expect("rotated-DMI multilayer contexts should build");
+        assert!(contexts
+            .iter()
+            .all(|context| { context.problem.terms.rotated_interfacial_dmi == Some(3.0e-3) }));
+
+        let observables = observe_multilayer(&contexts, &states, None)
+            .expect("rotated-DMI observables should compute");
+        assert!(
+            max_norm(&observables.effective_field) > 0.0,
+            "rotated DMI must contribute to the multilayer effective field"
+        );
+        assert!(
+            max_norm(&observables.rotated_dmi_field) > 0.0,
+            "rotated DMI must be exposed as a separate multilayer field"
+        );
+        assert_eq!(
+            select_state_observable_field(&observables, "H_rotated_dmi", false)
+                .expect("scheduled rotated multilayer field"),
+            observables.rotated_dmi_field
+        );
+        assert!(
+            observables.dmi_energy.abs() > 0.0,
+            "rotated DMI must contribute to multilayer DMI energy"
+        );
+        assert!(observables.rotated_dmi_energy.abs() > 0.0);
+        assert_eq!(observables.dmi_energy, observables.rotated_dmi_energy);
+
+        let magnetizations = states
+            .iter()
+            .map(|state| state.magnetization().to_vec())
+            .collect::<Vec<_>>();
+        let rhs = llg_rhs_multilayer(&contexts, &magnetizations, None)
+            .expect("rotated-DMI multilayer RHS should compute");
+        assert!(
+            rhs.iter().any(|layer| max_norm(layer) > 0.0),
+            "rotated DMI must contribute to the multilayer RHS"
         );
     }
 

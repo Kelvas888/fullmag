@@ -26,6 +26,7 @@ namespace {
 
 constexpr int NEWELL_BLOCK = 256;
 constexpr int ASYMPTOTIC_DISTANCE = 40;
+constexpr double kPi = 3.141592653589793238462643383279502884;
 
 // ---------------------------------------------------------------------------
 // Device base functions (direct port from Rust newell.rs)
@@ -169,7 +170,7 @@ __device__ double kahan_sum_27(const double terms[27]) {
 // ---------------------------------------------------------------------------
 // 27-point stencil evaluation (device)
 // ---------------------------------------------------------------------------
-__device__ double ldia_d(
+[[maybe_unused]] __device__ double ldia_d(
     int i, int j, int k,
     const double * __restrict__ f_vals,
     int fsx, int fsy,
@@ -212,7 +213,7 @@ __device__ double ldia_d(
         -f_vals[idx(i+1, j+1, k+1)],
     };
 
-    return kahan_sum_27(terms) / (4.0 * M_PI * hx * hy * hz);
+    return kahan_sum_27(terms) / (4.0 * kPi * hx * hy * hz);
 }
 
 // ---------------------------------------------------------------------------
@@ -222,14 +223,14 @@ __device__ double asymptotic_nxx_d(double x, double y, double z, double vol) {
     double r2 = x*x + y*y + z*z;
     double r = sqrt(r2);
     double r3 = r2 * r;
-    return (1.0/r3 - 3.0*x*x/(r3*r2)) / (4.0*M_PI) * vol;
+    return (1.0/r3 - 3.0*x*x/(r3*r2)) / (4.0*kPi) * vol;
 }
 
 __device__ double asymptotic_nxy_d(double x, double y, double z, double vol) {
     double r2 = x*x + y*y + z*z;
     double r = sqrt(r2);
     double r5 = r2*r2*r;
-    return -3.0*x*y / (4.0*M_PI*r5) * vol;
+    return -3.0*x*y / (4.0*kPi*r5) * vol;
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +330,7 @@ __global__ void newell_stencil_and_place_kernel(
                 -fg_val(comp, ci+1, cj+1, ck-1, fsx, fsy),
                 -fg_val(comp, ci+1, cj+1, ck+1, fsx, fsy),
             };
-            return kahan_sum_27(terms) / (4.0 * M_PI * hx * hy * hz);
+            return kahan_sum_27(terms) / (4.0 * kPi * hx * hy * hz);
         };
 
         // comp 0=f_xx, 1=f_yy, 2=f_zz, 3=g_xy, 4=g_xz, 5=g_yz
@@ -402,7 +403,8 @@ void launch_newell_compute_spectra_fp64(Context &ctx) {
 
     // Allocate device memory for f/g values
     double *d_fg = nullptr;
-    cudaError_t err = cudaMalloc(&d_fg, static_cast<size_t>(flen) * 6 * sizeof(double));
+    cudaError_t err = context_gpu_workspace_cuda_malloc(
+        ctx, &d_fg, static_cast<size_t>(flen) * 6 * sizeof(double));
     if (err != cudaSuccess) { set_cuda_error(ctx, "newell: cudaMalloc(fg)", err); return; }
 
     // Allocate temporary device arrays for the 6 kernel components
@@ -411,12 +413,12 @@ void launch_newell_compute_spectra_fp64(Context &ctx) {
     double *d_nxy = nullptr, *d_nxz = nullptr, *d_nyz = nullptr;
     size_t padded_bytes = static_cast<size_t>(padded_len) * sizeof(double);
 
-    err = cudaMalloc(&d_nxx, padded_bytes); if (err != cudaSuccess) { goto cleanup; }
-    err = cudaMalloc(&d_nyy, padded_bytes); if (err != cudaSuccess) { goto cleanup; }
-    err = cudaMalloc(&d_nzz, padded_bytes); if (err != cudaSuccess) { goto cleanup; }
-    err = cudaMalloc(&d_nxy, padded_bytes); if (err != cudaSuccess) { goto cleanup; }
-    err = cudaMalloc(&d_nxz, padded_bytes); if (err != cudaSuccess) { goto cleanup; }
-    err = cudaMalloc(&d_nyz, padded_bytes); if (err != cudaSuccess) { goto cleanup; }
+    err = context_gpu_workspace_cuda_malloc(ctx, &d_nxx, padded_bytes); if (err != cudaSuccess) { goto cleanup; }
+    err = context_gpu_workspace_cuda_malloc(ctx, &d_nyy, padded_bytes); if (err != cudaSuccess) { goto cleanup; }
+    err = context_gpu_workspace_cuda_malloc(ctx, &d_nzz, padded_bytes); if (err != cudaSuccess) { goto cleanup; }
+    err = context_gpu_workspace_cuda_malloc(ctx, &d_nxy, padded_bytes); if (err != cudaSuccess) { goto cleanup; }
+    err = context_gpu_workspace_cuda_malloc(ctx, &d_nxz, padded_bytes); if (err != cudaSuccess) { goto cleanup; }
+    err = context_gpu_workspace_cuda_malloc(ctx, &d_nyz, padded_bytes); if (err != cudaSuccess) { goto cleanup; }
 
     // Zero the output arrays
     cudaMemset(d_nxx, 0, padded_bytes);
@@ -478,13 +480,13 @@ void launch_newell_compute_spectra_fp64(Context &ctx) {
     }
 
 cleanup:
-    if (d_fg) cudaFree(d_fg);
-    if (d_nxx) cudaFree(d_nxx);
-    if (d_nyy) cudaFree(d_nyy);
-    if (d_nzz) cudaFree(d_nzz);
-    if (d_nxy) cudaFree(d_nxy);
-    if (d_nxz) cudaFree(d_nxz);
-    if (d_nyz) cudaFree(d_nyz);
+    if (d_fg) context_gpu_workspace_cuda_free(ctx, d_fg);
+    if (d_nxx) context_gpu_workspace_cuda_free(ctx, d_nxx);
+    if (d_nyy) context_gpu_workspace_cuda_free(ctx, d_nyy);
+    if (d_nzz) context_gpu_workspace_cuda_free(ctx, d_nzz);
+    if (d_nxy) context_gpu_workspace_cuda_free(ctx, d_nxy);
+    if (d_nxz) context_gpu_workspace_cuda_free(ctx, d_nxz);
+    if (d_nyz) context_gpu_workspace_cuda_free(ctx, d_nyz);
 }
 
 } // namespace fdm

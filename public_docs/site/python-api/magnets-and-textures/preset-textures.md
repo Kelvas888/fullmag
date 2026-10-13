@@ -27,6 +27,8 @@ $\mathbf m=\mathbf M/M_\mathrm s$. Fullmag currently exposes the following publi
 | `fm.texture.antiskyrmion(...)` | `antiskyrmion` | skyrmion profile with opposite azimuthal winding |
 | `fm.texture.skyrmionium(...)` | `skyrmionium` | normalized 2-pi target state with equal centre and far-field backgrounds |
 | `fm.texture.hopfion(...)` | `hopfion` | three-dimensional unit-vector Hopf-map initializer |
+| `fm.texture.vortex_wall(...)` | `vortex_wall` | Mumax3-compatible vortex-wall initializer; parameter ownership is on the [Mumax3 compatibility](mumax3-compatibility.md) page |
+| `fm.texture.hopfion_compact_support(...)` | `hopfion_compact_support` | Mumax3-compatible compact-support hopfion; parameter ownership is on the [Mumax3 compatibility](mumax3-compatibility.md) page |
 | `fm.texture.bimeron(...)` | `bimeron` | in-plane skyrmion analogue represented as a meron pair |
 | `fm.texture.domain_wall(...)` | `domain_wall` | smooth Bloch or Neel wall between antiparallel domains |
 | `fm.texture.two_domain(...)` | `two_domain` | sharp or smooth two-domain initializer |
@@ -52,6 +54,12 @@ preset.
 
 (python-api-magnets-and-textures-preset-textures-governing-equations)=
 ## Governing equations
+
+```{math}
+:label: eq-preset-texture-local-coordinate
+
+q_{\mathrm{IR}} = \mathrm{preset-texture-local-coordinate}(\text{qualified inputs})
+```
 
 ### Coordinate, mapping, plane, and transform pipeline
 
@@ -1024,6 +1032,20 @@ fallback thresholds, mapping behavior, and version semantics documented here are
 implementation contracts and are sourced from the repository.
 
 (python-api-magnets-and-textures-preset-textures-source-code-index)=
+
+## Control Room crosswalk
+
+Status: The exposed texture families are partial; unlisted presets remain Python-only.
+
+| Python/API surface | Control Room path | Status | Transaction |
+|---|---|---|---|
+| Parameters documented on this page | `Model Explorer -> Objects -> <object> -> Magnetization` | `partial` | Apply magnetization draft; authored object state is revised |
+| Parameters without a named UI field | `Model Explorer -> Objects -> <object> -> Magnetization` | `not implemented` | Python-only until implemented |
+
+frontend support is not implemented for texture presets and arguments not exposed by ObjectMagneticTexturePanel.
+See [Control Room capability register](/frontend/capability-register) for the support matrix and not implemented policy.
+Frontend source owner: `apps/control-room/src/modules/inspector/panels/ObjectMagneticTexturePanel.tsx (ObjectMagneticTexturePanel)`.
+
 ## Source-code index
 
 | Claim | Path | Stable symbol | Responsibility | Evidence / lane |

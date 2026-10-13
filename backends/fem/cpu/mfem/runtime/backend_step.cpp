@@ -24,7 +24,11 @@
 #include "cpu/mfem/runtime/step_metrics.hpp"
 #include "cpu/mfem/runtime/mfem_device.hpp"
 #include "gpu/cuda/integrators/rk/rk.hpp"
+#if FULLMAG_HAS_CUDA_RUNTIME
+#include "gpu/cuda/integrators/rk/rk_step_preflight.hpp"
+#endif
 #include "gpu/cuda/runtime/execution_receipt.hpp"
+#include "gpu/cuda/runtime/performance_counters.hpp"
 #include "gpu/cuda/relaxation/nonlinear_cg.hpp"
 #include "gpu/cuda/relaxation/pgbb.hpp"
 #include "gpu/cuda/transfer/transfer_audit.hpp"
@@ -57,6 +61,44 @@ int run_backend_step_attempt(
 #if FULLMAG_HAS_MFEM_STACK
     error.clear();
     energy_rejected = false;
+    const bool gpu_requested = mfem_device_requests_gpu(ctx);
+    const bool strict_gpu_request =
+        ctx.gpu_state.execution_request ==
+        FULLMAG_FEM_GPU_EXECUTION_REQUEST_STRICT_DEVICE;
+#if FULLMAG_HAS_CUDA_RUNTIME
+    if (gpu_requested && strict_gpu_request) {
+        GpuRkStepPreflight preflight{};
+        const auto &preflight_tableau = tableau_for_integrator(ctx.base_plan.integrator);
+        if (!gpu_rk_prepare_step_preflight(
+                ctx,
+                preflight_tableau,
+                dt_seconds,
+                preflight,
+                error)) {
+            if (error.empty()) {
+                error = "strict FEM GPU execution failed native step preflight";
+            }
+            set_stage_completion(
+                ctx,
+                FULLMAG_FEM_STAGE_STOP_REASON_BACKEND_ERROR,
+                nullptr,
+                0.0,
+                0.0);
+            return FULLMAG_FEM_ERR_UNAVAILABLE;
+        }
+    }
+#else
+    if (gpu_requested && strict_gpu_request) {
+        error = "strict FEM GPU execution requires CUDA runtime support";
+        set_stage_completion(
+            ctx,
+            FULLMAG_FEM_STAGE_STOP_REASON_BACKEND_ERROR,
+            nullptr,
+            0.0,
+            0.0);
+        return FULLMAG_FEM_ERR_UNAVAILABLE;
+    }
+#endif
     const bool previous_energy_valid =
         ctx.stage_completion.relax_previous_total_energy_valid;
     const double previous_energy_j =
@@ -84,6 +126,7 @@ int run_backend_step_attempt(
         if (gpu_execution_receipt_attempt_active(ctx.gpu_state.execution_receipt)) {
             gpu_execution_receipt_fail_attempt(ctx.gpu_state.execution_receipt);
         }
+        gpu_performance_fail_attempt(ctx.gpu_state.performance_counters);
         const std::string original_error = error;
         std::string callback_error;
         if (!rollback_transport_stage_attempt(ctx, callback_error)) {
@@ -115,7 +158,6 @@ int run_backend_step_attempt(
     bool ok = false;
     ctx.interrupt.step_interrupted = false;
     ctx.transfer_audit.audit.reset_step_violation();
-    const bool gpu_requested = mfem_device_requests_gpu(ctx);
     if (gpu_requested) {
         gpu_attempt_hot_loop.emplace(
             ctx.transfer_audit.audit,
@@ -174,6 +216,7 @@ int run_backend_step_attempt(
             0.0);
         return FULLMAG_FEM_ERR_UNAVAILABLE;
     }
+    gpu_attempt_hot_loop.reset();
     if (!gpu_rk_finalize_step_stats(ctx, out_stats, error)) {
         rollback();
         set_stage_completion(
@@ -238,6 +281,7 @@ int run_backend_step_attempt(
             if (gpu_execution_receipt_attempt_active(ctx.gpu_state.execution_receipt)) {
                 gpu_execution_receipt_reject_attempt(ctx.gpu_state.execution_receipt);
             }
+            gpu_performance_reject_attempt(ctx.gpu_state.performance_counters);
             rollback();
             energy_rejected = true;
             refresh_transaction_stats();
@@ -307,6 +351,7 @@ int run_backend_step_attempt(
         }
     }
     transaction.commit();
+    gpu_performance_commit_attempt(ctx.gpu_state.performance_counters);
     refresh_transaction_stats();
     return FULLMAG_FEM_OK;
 #else
@@ -435,6 +480,13 @@ int run_backend_relaxation_step(
     }
     ctx.interrupt.step_interrupted = false;
     ctx.transfer_audit.audit.reset_step_violation();
+    if (ctx.gpu_state.device.lifecycle.allocated &&
+        ctx.frozen_spins.enabled() &&
+        algorithm == FULLMAG_FEM_RELAX_TANGENT_PLANE_IMPLICIT) {
+        error = "frozen_spins_fem_gpu_tpi_unqualified: native FEM GPU tangent-plane "
+                "implicit relaxation does not yet provide device-resident constrained solves";
+        return FULLMAG_FEM_ERR_UNAVAILABLE;
+    }
     if (ctx.gpu_state.device.lifecycle.allocated &&
         (algorithm == FULLMAG_FEM_RELAX_PROJECTED_GRADIENT_BB ||
          algorithm == FULLMAG_FEM_RELAX_NONLINEAR_CG)) {

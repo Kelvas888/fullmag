@@ -482,6 +482,7 @@ async fn build_planar_field_from_source(
     source: PlanarDataSource,
     query: &PlanarFieldQuery,
 ) -> Result<BuiltPlanarField, ApiError> {
+    let request_context = crate::capture_current_live_request_context(state).await?;
     let resolution = resolve_resolution(query)?;
     validate_auxiliary_query(query)?;
     let guard = state.current_live_state.read().await;
@@ -489,6 +490,13 @@ async fn build_planar_field_from_source(
         .as_ref()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
     let presentation = state.current_display_presentation.read().await.clone();
+    crate::ensure_current_live_request_context(
+        snapshot,
+        &request_context,
+        state
+            .current_live_session_epoch
+            .load(std::sync::atomic::Ordering::Acquire),
+    )?;
     let planar_state = presentation
         .visualization_planar
         .unwrap_or_else(crate::schemas::visualization_state::default_planar_visualization_state);
@@ -507,7 +515,7 @@ async fn build_planar_field_from_source(
     };
     let mut frame = resolved_source.frame.clone();
     let operator = resolved_source.operator.clone();
-    let target_definition = resolved_source.target.clone();
+    let mut target_definition = resolved_source.target.clone();
     let scene_revision = snapshot
         .scene_document
         .as_ref()
@@ -518,6 +526,11 @@ async fn build_planar_field_from_source(
             "quantity_unavailable: quantity '{quantity_id}' is unknown"
         ))
     })?;
+    if matches!(&source, PlanarDataSource::Default)
+        && spec.domain == fullmag_quantities::QuantityDomain::MagneticOnly
+    {
+        target_definition = fullmag_ir::MonitorTargetIR::MagneticDomain;
+    }
     let n_comp = spec.n_comp as usize;
     let current_field_revision = field_quantity_revision(snapshot, quantity_id);
     let generation_id = domain_generation_id(snapshot);
@@ -534,6 +547,13 @@ async fn build_planar_field_from_source(
             ));
         }
         validate_hysteresis_snapshot_stage_scope(state, Some(stage_id), snapshot_id).await?;
+        crate::ensure_current_live_request_context(
+            snapshot,
+            &request_context,
+            state
+                .current_live_session_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+        )?;
         Some(persisted_hysteresis_magnetization_values(
             snapshot,
             snapshot_id,
@@ -708,6 +728,20 @@ async fn build_planar_field_from_source(
             )?))
         })
         .await?;
+    {
+        let _transition = state.current_live_session_transition.lock().await;
+        let current = state.current_live_state.read().await;
+        let current = current
+            .as_ref()
+            .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+        crate::ensure_current_live_request_context(
+            current,
+            &request_context,
+            state
+                .current_live_session_epoch
+                .load(std::sync::atomic::Ordering::Acquire),
+        )?;
+    }
     let etag = format!(
         "\"fm-planar-sha256:{:x}\"",
         Sha256::digest(sample_token.as_bytes())

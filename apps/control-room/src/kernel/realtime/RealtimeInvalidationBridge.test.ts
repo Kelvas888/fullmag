@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { EventBus } from "../events/EventBus";
 import type { KernelEventMap } from "../events/eventTypes";
@@ -7,8 +7,32 @@ import {
   serializeCanonicalFieldVectorResourceKey,
 } from "../api/fieldQueryIdentity";
 import {
+  ANALYSIS_FREQUENCY_DOMAIN_EIGEN_BRANCHES_V2_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DIAGNOSTICS_V2_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_EIGEN_FIELD_SWEEP_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_FMR_KITTEL_FIT_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_FMR_PEAKS_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_FMR_RESONANCE_FITS_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_CANCEL_REQUESTED_V1_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_DIAGNOSTICS_V1_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_FIELD_META_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_FREQUENCY_POINT_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_MAGNETIC_SWEEP_PATH,
+  ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_PROGRESS_V1_PATH,
+} from "../api/apiPaths";
+import { frequencyDomainModeFieldMetaResourceKey } from "../resources/frequencyDomainResourceKeys";
+import {
   ANALYSIS_OBJECT_TOPOLOGICAL_CHARGE_PATH,
+  DATA_ANTENNA_FIELD_SOLUTION_PATH,
+  DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH,
+  DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH,
+  DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH,
+  DATA_ANTENNA_SOURCE_SPECTRUM_PATH,
+  DATA_ARTIFACTS_PATH,
   DATA_DOMAIN_TOPOLOGY_PATH,
+  SESSIONS_PATH,
+  DATA_FIELD_AVAILABILITY_PATH,
   DATA_FDM_REGION_MEMBERSHIP_BINARY_PATH,
   DATA_FDM_REGION_MEMBERSHIPS_PATH,
   DATA_FIELDS_PATH,
@@ -19,6 +43,8 @@ import {
   DATA_PLANAR_FIELD_META_PATH,
   DATA_SCALARS_PATH,
   DATA_TABLE_ROWS_PATH,
+  DIAGNOSTICS_CPU_PATH,
+  DIAGNOSTICS_GPU_PATH,
   ANALYSIS_HYSTERESIS_BRANCHES_PATH,
   ANALYSIS_HYSTERESIS_ADAPTIVE_REFINEMENT_PATH,
   ANALYSIS_HYSTERESIS_BOOKMARKS_PATH,
@@ -45,10 +71,12 @@ import {
   MESHING_SHARED_DOMAIN_REALIZED_SIZE_FIELDS_PATH,
   MESHING_SUMMARY_PATH,
   MODEL_MATERIAL_FIELDS_PATH,
+  MODEL_READINESS_PATH,
   MODEL_REALIZED_REGIONS_PATH,
   MODEL_REGION_DIAGNOSTICS_PATH,
   MODEL_REGIONS_PATH,
   MODEL_SCENE_PATH,
+  SESSION_CURRENT_PATH,
   SIMULATION_COMMANDS_PATH,
   SIMULATION_OBJECT_METRICS_PATH,
   SIMULATION_PREPARATION_PATH,
@@ -62,6 +90,7 @@ import {
   SIMULATION_STAGE_HYSTERESIS_SATURATION_PATH,
   SIMULATION_STAGE_HYSTERESIS_SETTLE_PIPELINE_PATH,
   SIMULATION_STAGES_EXECUTION_PATH,
+  SESSION_STATUS_PATH,
   VISUALIZATION_CLIENT_ACKS_PATH,
   VISUALIZATION_STATE_PATH,
 } from "../api/apiPaths";
@@ -76,6 +105,334 @@ function dependentRevision(resourceKey: string, revision: string | number): stri
 }
 
 describe("RealtimeInvalidationBridge", () => {
+  it("forces HTTP session resources to refetch after a socket reconnect", () => {
+    const bus = new EventBus<KernelEventMap>();
+    const resources = new ResourceInvalidationController(bus);
+    const bridge = new RealtimeInvalidationBridge(resources);
+
+    bridge.handleReconnect();
+
+    expect(resources.getRevision("session:status")).toEqual(
+      expect.stringMatching(/^realtime:reconnect:/),
+    );
+    expect(resources.getRevision(SESSION_STATUS_PATH)).toEqual(
+      expect.stringMatching(/^realtime:reconnect:/),
+    );
+  });
+
+  it("reconciles active-run resources through the session prefix after reconnect", () => {
+    const bus = new EventBus<KernelEventMap>();
+    const resources = new ResourceInvalidationController(bus);
+    const bridge = new RealtimeInvalidationBridge(resources);
+    const activeRunResources = [
+      SIMULATION_RUN_CURRENT_PATH,
+      SIMULATION_STAGES_EXECUTION_PATH,
+      SIMULATION_SOLVER_STATUS_PATH,
+      SIMULATION_COMMANDS_PATH,
+    ];
+    const listeners = activeRunResources.map(() => vi.fn());
+
+    activeRunResources.forEach((resourceKey, index) => {
+      resources.subscribe(resourceKey, listeners[index]!);
+    });
+
+    bridge.handleReconnect();
+
+    const revisions = activeRunResources.map((resourceKey) =>
+      resources.getRevision(resourceKey),
+    );
+    expect(revisions).toHaveLength(activeRunResources.length);
+    expect(revisions.every((revision) =>
+      typeof revision === "string" && revision.startsWith("realtime:reconnect:"),
+    )).toBe(true);
+    listeners.forEach((listener) => {
+      expect(listener).toHaveBeenCalledTimes(1);
+      expect(listener.mock.calls[0]?.[0]).toEqual(revisions[0]);
+    });
+    expect(resources.getRevision(SESSION_CURRENT_PATH)).toBeNull();
+  });
+
+  it("invalidates CPU and GPU diagnostic resources exactly", () => {
+    const bus = new EventBus<KernelEventMap>();
+    const resources = new ResourceInvalidationController(bus);
+    const invalidatePrefix = vi.spyOn(resources, "invalidatePrefix");
+    const bridge = new RealtimeInvalidationBridge(resources);
+
+    const handled = bridge.handleEvent({
+      payload: {
+        changes: [
+          {
+            recommended_fetch: DIAGNOSTICS_CPU_PATH,
+            resource: "diagnostics",
+            resource_id: "cpu",
+            revision: 42,
+          },
+          {
+            recommended_fetch: DIAGNOSTICS_GPU_PATH,
+            resource: "diagnostics",
+            resource_id: "gpu",
+            revision: 42,
+          },
+        ],
+      },
+      type: "resource.batch_changed",
+    });
+
+    expect(handled).toBe(true);
+    expect(resources.getRevision(DIAGNOSTICS_CPU_PATH)).toBe(42);
+    expect(resources.getRevision(DIAGNOSTICS_GPU_PATH)).toBe(42);
+    expect(invalidatePrefix).not.toHaveBeenCalledWith(
+      DIAGNOSTICS_CPU_PATH,
+      42,
+    );
+    expect(invalidatePrefix).not.toHaveBeenCalledWith(
+      DIAGNOSTICS_GPU_PATH,
+      42,
+    );
+  });
+
+  it.each([
+    [
+      "field sweep",
+      ANALYSIS_FREQUENCY_DOMAIN_EIGEN_FIELD_SWEEP_PATH,
+    ],
+    ["eigen branches", ANALYSIS_FREQUENCY_DOMAIN_EIGEN_BRANCHES_V2_PATH],
+    ["eigen dispersion", ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH],
+    ["eigen diagnostics", ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DIAGNOSTICS_V2_PATH],
+    [
+      "response magnetic sweep",
+      ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_MAGNETIC_SWEEP_PATH,
+    ],
+    ["response progress", ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_PROGRESS_V1_PATH],
+    [
+      "response cancellation",
+      ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_CANCEL_REQUESTED_V1_PATH,
+    ],
+    [
+      "response diagnostics",
+      ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_DIAGNOSTICS_V1_PATH,
+    ],
+    [
+      "response frequency point",
+      ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_FREQUENCY_POINT_PATH.replace(
+        "{frequency_index}",
+        "7",
+      ),
+    ],
+    [
+      "response field metadata",
+      ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_FIELD_META_PATH.replace(
+        "{frequency_index}",
+        "8",
+      ),
+    ],
+    ["FMR peaks", ANALYSIS_FREQUENCY_DOMAIN_FMR_PEAKS_PATH],
+    [
+      "FMR resonance fits",
+      ANALYSIS_FREQUENCY_DOMAIN_FMR_RESONANCE_FITS_PATH,
+    ],
+    ["FMR Kittel fit", ANALYSIS_FREQUENCY_DOMAIN_FMR_KITTEL_FIT_PATH],
+    [
+      "mode metadata",
+      frequencyDomainModeFieldMetaResourceKey(3, 7),
+    ],
+  ])(
+    "invalidates only the named frequency-domain %s resource by content digest",
+    (_label, resourceKey) => {
+      const bus = new EventBus<KernelEventMap>();
+      const resources = new ResourceInvalidationController(bus);
+      const bridge = new RealtimeInvalidationBridge(resources);
+      const siblingKeys = [
+        ANALYSIS_FREQUENCY_DOMAIN_EIGEN_FIELD_SWEEP_PATH,
+        ANALYSIS_FREQUENCY_DOMAIN_EIGEN_BRANCHES_V2_PATH,
+        ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
+        ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DIAGNOSTICS_V2_PATH,
+        ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_MAGNETIC_SWEEP_PATH,
+        ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_PROGRESS_V1_PATH,
+        ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_CANCEL_REQUESTED_V1_PATH,
+        ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_DIAGNOSTICS_V1_PATH,
+        ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_FREQUENCY_POINT_PATH.replace(
+          "{frequency_index}",
+          "7",
+        ),
+        ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_FIELD_META_PATH.replace(
+          "{frequency_index}",
+          "8",
+        ),
+        ANALYSIS_FREQUENCY_DOMAIN_FMR_PEAKS_PATH,
+        ANALYSIS_FREQUENCY_DOMAIN_FMR_RESONANCE_FITS_PATH,
+        ANALYSIS_FREQUENCY_DOMAIN_FMR_KITTEL_FIT_PATH,
+        frequencyDomainModeFieldMetaResourceKey(3, 7),
+      ];
+      for (const key of siblingKeys) resources.subscribe(key, () => {});
+
+      const digest = "sha256:frequency-domain-test";
+      expect(
+        bridge.handleEvent({
+          payload: {
+            changes: [
+              {
+                content_digest: digest,
+                resource_key: resourceKey,
+              },
+            ],
+          },
+          type: "resource.batch_changed",
+        }),
+      ).toBe(true);
+
+      expect(resources.getRevision(resourceKey)).toBe(digest);
+      for (const siblingKey of siblingKeys) {
+        if (siblingKey !== resourceKey) {
+          expect(resources.getRevision(siblingKey)).toBeNull();
+        }
+      }
+    },
+  );
+
+  it("normalizes a direct artifact update to the canonical FMR resource key", () => {
+    const bus = new EventBus<KernelEventMap>();
+    const resources = new ResourceInvalidationController(bus);
+    const bridge = new RealtimeInvalidationBridge(resources);
+    const digest = "sha256:fmr-peaks-update";
+
+    expect(
+      bridge.handleEvent({
+        artifact_path: "fmr/peaks.v1.json",
+        content_digest: digest,
+        type: "resource.updated",
+      }),
+    ).toBe(true);
+
+    expect(resources.getRevision(ANALYSIS_FREQUENCY_DOMAIN_FMR_PEAKS_PATH)).toBe(
+      digest,
+    );
+  });
+
+  it("invalidates only antenna result resources when the artifact catalog changes", () => {
+    const bus = new EventBus<KernelEventMap>();
+    const resources = new ResourceInvalidationController(bus);
+    const bridge = new RealtimeInvalidationBridge(resources);
+    const fieldSolutionKey = DATA_ANTENNA_FIELD_SOLUTION_PATH.replace(
+      "{solution_id}",
+      "solution-1",
+    );
+    const sourceSpectrumKey = DATA_ANTENNA_SOURCE_SPECTRUM_PATH.replace(
+      "{output_id}",
+      "spectrum-1",
+    );
+    const stageOutputCatalogKey = DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH.replace(
+      "{stage_id}",
+      "solve-1",
+    );
+    const inspectionKey = "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7|" +
+      DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH.replace("{stage_id}", "solve-1");
+    const inspectionPayloadKey = inspectionKey + "/payloads/magnetic_field?content_digest=sha256%3Aselected#4:record@bytes=0-23";
+    resources.subscribe(fieldSolutionKey, () => {});
+    resources.subscribe(stageOutputCatalogKey, () => {});
+    resources.subscribe(sourceSpectrumKey, () => {});
+    resources.subscribe(inspectionKey, () => {});
+    resources.subscribe(inspectionPayloadKey, () => {});
+    resources.subscribe(DATA_ARTIFACTS_PATH, () => {});
+    resources.subscribe(DATA_DOMAIN_TOPOLOGY_PATH, () => {});
+
+    expect(
+      bridge.handleEvent({
+        payload: {
+          changes: [
+            {
+              recommended_fetch: DATA_ARTIFACTS_PATH,
+              resource: "artifacts",
+              revision: 17,
+            },
+          ],
+        },
+        type: "resource.batch_changed",
+      }),
+    ).toBe(true);
+
+    expect(resources.getRevision(fieldSolutionKey)).toBe(17);
+    expect(resources.getRevision(stageOutputCatalogKey)).toBe(17);
+    expect(resources.getRevision(sourceSpectrumKey)).toBe(17);
+    expect(resources.getRevision(inspectionKey)).toBe(17);
+    expect(resources.getRevision(inspectionPayloadKey)).toBe(17);
+    expect(resources.getRevision(DATA_ARTIFACTS_PATH)).toBe(17);
+    expect(resources.getRevision(DATA_DOMAIN_TOPOLOGY_PATH)).toBeNull();
+  });
+
+  it("invalidates scoped antenna catalogs and inspection payloads when stage execution changes", () => {
+    const bus = new EventBus<KernelEventMap>();
+    const resources = new ResourceInvalidationController(bus);
+    const bridge = new RealtimeInvalidationBridge(resources);
+    const scope = "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7|";
+    const keys = [
+      DATA_ANTENNA_STAGE_OUTPUT_CATALOG_PATH.replace("{stage_id}", "solve-1"),
+      DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PATH.replace("{stage_id}", "solve-1"),
+      DATA_ANTENNA_EXTERNAL_LEAD_INSPECTION_PAYLOAD_PATH.replace("{stage_id}", "solve-1")
+        .replace("{payload_kind}", "magnetic_field") + "?content_digest=sha256%3Aselected#4:record",
+    ].map((key) => scope + key);
+    keys.forEach((key) => resources.subscribe(key, () => {}));
+    resources.subscribe(DATA_DOMAIN_TOPOLOGY_PATH, () => {});
+    bridge.handleEvent({
+      payload: { changes: [{ recommended_fetch: SIMULATION_STAGES_EXECUTION_PATH, resource: "stages", revision: 44 }] },
+      type: "resource.batch_changed",
+    });
+    keys.forEach((key) => expect(resources.getRevision(key)).toBe(dependentRevision(SIMULATION_STAGES_EXECUTION_PATH, 44)));
+    expect(resources.getRevision(DATA_DOMAIN_TOPOLOGY_PATH)).toBeNull();
+  });
+
+  it.each([
+    [
+      "eigen branches",
+      "eigen/branches.v2.json",
+      ANALYSIS_FREQUENCY_DOMAIN_EIGEN_BRANCHES_V2_PATH,
+    ],
+    [
+      "eigen diagnostics",
+      "eigen/diagnostics.v2.json",
+      ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DIAGNOSTICS_V2_PATH,
+    ],
+    [
+      "response sweep",
+      "response/magnetic_response_sweep.v2.json",
+      ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_MAGNETIC_SWEEP_PATH,
+    ],
+    [
+      "response frequency point",
+      "response/frequency_points/frequency_0007.json",
+      ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_FREQUENCY_POINT_PATH.replace(
+        "{frequency_index}",
+        "7",
+      ),
+    ],
+    [
+      "response field metadata",
+      "response/field_payloads/frequency_0008/vector.bin",
+      ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_FIELD_META_PATH.replace(
+        "{frequency_index}",
+        "8",
+      ),
+    ],
+  ])(
+    "normalizes a direct %s artifact update to the resource hook key",
+    (_label, artifactPath, resourceKey) => {
+      const bus = new EventBus<KernelEventMap>();
+      const resources = new ResourceInvalidationController(bus);
+      const bridge = new RealtimeInvalidationBridge(resources);
+      const digest = `sha256:${_label}`;
+
+      expect(
+        bridge.handleEvent({
+          artifact_path: artifactPath,
+          content_digest: digest,
+          type: "resource.updated",
+        }),
+      ).toBe(true);
+
+      expect(resources.getRevision(resourceKey)).toBe(digest);
+    },
+  );
+
   it("invalidates preparation from the exact backend revision-only change", () => {
     const bus = new EventBus<KernelEventMap>();
     const resources = new ResourceInvalidationController(bus);
@@ -260,6 +617,9 @@ describe("RealtimeInvalidationBridge", () => {
     expect(resources.getRevision(MODEL_MATERIAL_FIELDS_PATH)).toBe(
       dependentRevision(MODEL_SCENE_PATH, 12),
     );
+    expect(resources.getRevision(MODEL_READINESS_PATH)).toBe(
+      dependentRevision(MODEL_SCENE_PATH, 12),
+    );
     expect(resources.getRevision("session:status")).toBe(
       dependentRevision(MODEL_SCENE_PATH, 12),
     );
@@ -375,6 +735,7 @@ describe("RealtimeInvalidationBridge", () => {
     ).toBe(true);
 
     expect(resources.getRevision("session:status")).toBe("session:session-new:2");
+    expect(resources.getRevision(SESSIONS_PATH)).toBe("session:session-new:2");
     expect(resources.getRevision(SIMULATION_COMMANDS_PATH)).toBe(
       "session:session-new:2",
     );
@@ -472,6 +833,45 @@ describe("RealtimeInvalidationBridge", () => {
 
     expect(resources.getRevision(DATA_FIELDS_PATH)).toBe(11);
     expect(resources.getRevision(DATA_QUANTITIES_PATH)).toBe(11);
+  });
+
+  it("does not fan a field catalog revision out to field payload resources", () => {
+    const bus = new EventBus<KernelEventMap>();
+    const resources = new ResourceInvalidationController(bus);
+    const bridge = new RealtimeInvalidationBridge(resources);
+    const availabilityKey = DATA_FIELD_AVAILABILITY_PATH.replace(
+      "{quantity_id}",
+      "m",
+    );
+    const vectorKey = serializeCanonicalFieldVectorResourceKey(
+      canonicalFieldVectorQuery("m", { component: "full" }),
+    );
+
+    resources.subscribe(availabilityKey, () => {});
+    resources.subscribe(vectorKey, () => {});
+
+    expect(
+      bridge.handleEvent({
+        payload: {
+          changes: [
+            {
+              recommended_fetch: DATA_FIELDS_PATH,
+              resource: "fields",
+              resource_id: "catalog",
+              revision: 12,
+            },
+          ],
+        },
+        seq: 12,
+        session_id: "session-1",
+        type: "resource.batch_changed",
+      }),
+    ).toBe(true);
+
+    expect(resources.getRevision(DATA_FIELDS_PATH)).toBe(12);
+    expect(resources.getRevision(DATA_QUANTITIES_PATH)).toBe(12);
+    expect(resources.getRevision(availabilityKey)).toBeNull();
+    expect(resources.getRevision(vectorKey)).toBeNull();
   });
 
   it("invalidates session-scoped runtime resources when a run appears in the current session", () => {
@@ -1314,6 +1714,7 @@ describe("RealtimeInvalidationBridge", () => {
       "mesh-build-9",
     );
     expect(resources.getRevision(MODEL_SCENE_PATH)).toBe("mesh-build-9");
+    expect(resources.getRevision(MODEL_READINESS_PATH)).toBe("mesh-build-9");
     expect(resources.getRevision(MESHING_BUILDS_CURRENT_PATH)).toBe(
       "mesh-build-9",
     );

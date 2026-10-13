@@ -93,6 +93,11 @@ void demag_phi_snapshot_contract_is_declared() {
     check(
         state_io.find("potential->GetNodalValues(nodal_values)") != std::string::npos,
         "P2 demag phi snapshots must evaluate the scalar potential at mesh vertices");
+    check(
+        state_io.find("FULLMAG_FEM_DEMAG_FREDKIN_KOEHLER") != std::string::npos &&
+            state_io.find("ctx.demag_fem_bem.workspace") != std::string::npos &&
+            state_io.find("total_potential") != std::string::npos,
+        "Fredkin-Koehler demag phi snapshots must read the solved FEM/BEM total potential");
 }
 
 void gpu_snapshot_preserves_full_domain_observable_fields() {
@@ -198,7 +203,9 @@ void gpu_snapshot_submission_uses_preallocated_bounded_pool() {
         read_text_file(root / "gpu" / "cuda" / "transfer" / "snapshot_pool.cpp");
 
     const std::size_t schedule_begin = api.find("bool schedule_gpu_snapshot_payload(");
-    const std::size_t schedule_end = api.find("\n}\n#endif", schedule_begin);
+    // Delimit by the owning preprocessor branch rather than by an LF-only
+    // brace sequence so the source contract is stable on CRLF checkouts.
+    const std::size_t schedule_end = api.find("#endif", schedule_begin);
     check(
         schedule_begin != std::string::npos && schedule_end != std::string::npos,
         "GPU snapshot scheduler must be present and bounded");

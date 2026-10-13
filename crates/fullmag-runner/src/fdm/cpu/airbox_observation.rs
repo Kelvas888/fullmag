@@ -43,6 +43,7 @@ impl AirboxObservationTarget {
     /// Build a target-only grid around one magnetic support.  This helper is
     /// used by the contract tests to prove that padding changes only the
     /// observation layout, not the native/common magnetic source grid.
+    #[cfg(test)]
     pub(crate) fn from_support(
         source_shape: [usize; 3],
         source_spacing_m: [f64; 3],
@@ -281,9 +282,13 @@ pub(crate) fn materialize_airbox_observation_snapshot(
     provenance.demag_operator_kind = plan
         .enable_demag
         .then(|| "multilayer_tensor_fft_newell".to_string());
-    provenance.fft_backend =
-        super::reference::resolve_cpu_fft_backend_name_for_demag(plan.enable_demag)
+    provenance.fdm_fft_execution =
+        super::reference::resolve_cpu_fft_execution_for_demag(plan.enable_demag, plan.fft.as_ref())
             .map_err(|error| error.to_string())?;
+    provenance.fft_backend = provenance
+        .fdm_fft_execution
+        .as_ref()
+        .map(|execution| execution.executed_backend.clone());
     let executed = ExecutedRun {
         result: crate::types::RunResult {
             status: crate::types::RunStatus::Completed,
@@ -640,13 +645,17 @@ mod tests {
             requested_common_cell_size: None,
             grid_certificate: None,
             layers: vec![layer],
+            frozen_spins: None,
             enable_exchange: true,
             enable_demag: true,
+            fft: None,
             external_field: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             bulk_dmi: None,
             gyromagnetic_ratio: 2.211e5,
             precision: ExecutionPrecision::Double,
+            precision_policy: fullmag_ir::FdmPrecisionPolicyIR::default(),
             exchange_bc: ExchangeBoundaryCondition::Neumann,
             periodicity: None,
             resolved_periodic_images: None,

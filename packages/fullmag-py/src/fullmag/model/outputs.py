@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
 from typing import Sequence
 
 from fullmag._validation import (
@@ -30,6 +31,7 @@ _KNOWN_SCALARS = {
     "E_drive",
     "E_ani",
     "E_dmi",
+    "E_rotated_dmi",
     "E_total",
     "time",
     "step",
@@ -46,8 +48,31 @@ _KNOWN_SCALARS = {
     "e_ext",
     "e_ani",
     "e_dmi",
+    "e_rotated_dmi",
     "e_total",
 }
+
+_U32_MAX = 0xFFFF_FFFF
+
+
+def _normalize_nonnegative_indices(
+    values: Sequence[int],
+    name: str,
+) -> tuple[int, ...]:
+    if isinstance(values, (str, bytes, bytearray)):
+        raise ValueError(f"{name} must contain integers only")
+    try:
+        raw_values = tuple(values)
+    except TypeError as exc:
+        raise ValueError(f"{name} must contain integers only") from exc
+    if any(isinstance(value, bool) or not isinstance(value, Integral) for value in raw_values):
+        raise ValueError(f"{name} must contain integers in the u32 range")
+    normalized = tuple(int(value) for value in raw_values)
+    if any(value < 0 for value in normalized):
+        raise ValueError(f"{name} must be >= 0")
+    if any(value > _U32_MAX for value in normalized):
+        raise ValueError(f"{name} must contain integers in the u32 range")
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,9 +102,16 @@ class SaveScalar:
     every: SamplingPeriod
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "scalar", require_non_empty(self.scalar, "scalar"))
-        if self.scalar not in _KNOWN_SCALARS:
-            raise ValueError(f"unsupported scalar quantity '{self.scalar}'")
+        scalar = require_non_empty(self.scalar, "scalar")
+        # Canonical quantity identifiers are case-sensitive in ProblemIR, but
+        # the public scalar API historically accepted lower-case aliases.
+        # Normalize the new component at the boundary so every transport
+        # layer receives the same `E_rotated_dmi` key.
+        if scalar == "e_rotated_dmi":
+            scalar = "E_rotated_dmi"
+        object.__setattr__(self, "scalar", scalar)
+        if scalar not in _KNOWN_SCALARS:
+            raise ValueError(f"unsupported scalar quantity '{scalar}'")
         object.__setattr__(self, "every", normalize_sampling_period(self.every, "every"))
 
     def to_ir(self) -> dict[str, object]:
@@ -95,7 +127,7 @@ class SaveScalar:
 _KNOWN_FIELDS = {
     "m",
     "H_ex", "H_demag", "H_ext", "H_drive", "B_drive", "H_ant", "H_eff",
-    "H_ani", "H_dmi", "H_mel", "H_ani_cubic", "H_dmi_bulk",
+    "H_ani", "H_dmi", "H_rotated_dmi", "H_mel", "H_ani_cubic", "H_dmi_bulk",
     "H_oe", "H_therm",
     "demag_phi",
     "V_electric", "J_charge", "spin_potential", "spin_current_tensor",
@@ -202,6 +234,11 @@ class SaveSpectrum:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "quantity", require_non_empty(self.quantity, "quantity"))
+        if self.quantity != "eigenfrequency":
+            raise ValueError(
+                "eigen_spectrum quantity must be 'eigenfrequency', "
+                f"got {self.quantity!r}"
+            )
         _SUPPORTED_SCOPES = {"global", "per_sample"}
         if self.scope not in _SUPPORTED_SCOPES:
             supported = ", ".join(sorted(_SUPPORTED_SCOPES))
@@ -218,36 +255,51 @@ class SaveMode:
     branches: Sequence[int] = ()
     sample_indices: Sequence[int] = ()
     sample_labels: Sequence[str] = ()
+    all_modes: bool = False
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "field", require_non_empty(self.field, "field"))
-        normalized = tuple(int(index) for index in self.indices)
-        if any(index < 0 for index in normalized):
-            raise ValueError("mode indices must be >= 0")
+        if type(self.all_modes) is not bool:
+            raise ValueError("all_modes must be a boolean")
+        normalized = _normalize_nonnegative_indices(self.indices, "mode indices")
         if len(set(normalized)) != len(normalized):
             raise ValueError("mode indices must be unique")
         object.__setattr__(self, "indices", normalized)
-        normalized_branches = tuple(int(b) for b in self.branches)
-        if any(b < 0 for b in normalized_branches):
-            raise ValueError("branch indices must be >= 0")
+        normalized_branches = _normalize_nonnegative_indices(
+            self.branches,
+            "branch indices",
+        )
         if len(set(normalized_branches)) != len(normalized_branches):
             raise ValueError("branch indices must be unique")
         object.__setattr__(self, "branches", normalized_branches)
-        if not normalized and not normalized_branches:
+        if self.all_modes and (normalized or normalized_branches):
+            raise ValueError("all_modes cannot be combined with indices or branches")
+        if not self.all_modes and not normalized and not normalized_branches:
             raise ValueError(
                 "SaveMode requires at least one raw mode index or tracked branch index"
             )
-        normalized_si = tuple(int(i) for i in self.sample_indices)
-        if any(i < 0 for i in normalized_si):
-            raise ValueError("sample_indices must be >= 0")
+        normalized_si = _normalize_nonnegative_indices(
+            self.sample_indices,
+            "sample_indices",
+        )
+        if len(set(normalized_si)) != len(normalized_si):
+            raise ValueError("sample_indices must be unique")
         object.__setattr__(self, "sample_indices", normalized_si)
+        if isinstance(self.sample_labels, (str, bytes, bytearray)):
+            raise ValueError("sample_labels must be a sequence of strings")
+        try:
+            normalized_labels = tuple(
+                require_non_empty(label, "sample_labels entry")
+                for label in self.sample_labels
+            )
+        except (AttributeError, TypeError) as exc:
+            raise ValueError("sample_labels must be a sequence of strings") from exc
+        if len(set(normalized_labels)) != len(normalized_labels):
+            raise ValueError("sample_labels must be unique")
         object.__setattr__(
             self,
             "sample_labels",
-            tuple(
-                require_non_empty(label, "sample_labels entry")
-                for label in self.sample_labels
-            ),
+            normalized_labels,
         )
 
     def to_ir(self) -> dict[str, object]:
@@ -258,6 +310,8 @@ class SaveMode:
         }
         if self.branches:
             payload["branches"] = list(self.branches)
+        if self.all_modes:
+            payload["all_modes"] = True
         if self.sample_indices or self.sample_labels:
             payload["sample_selector"] = {
                 "sample_indices": list(self.sample_indices),
@@ -290,6 +344,17 @@ class SaveEigenDiagnostics:
     include_tangent_leakage: bool = True
     include_orthogonality: bool = True
 
+    def __post_init__(self) -> None:
+        for name in (
+            "include_tracking",
+            "include_residuals",
+            "include_overlaps",
+            "include_tangent_leakage",
+            "include_orthogonality",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"{name} must be a boolean")
+
     def to_ir(self) -> dict[str, object]:
         return {
             "kind": "eigen_diagnostics",
@@ -305,10 +370,10 @@ class SaveEigenDiagnostics:
 # Use lowercase "m" to match the backend canonical wire format.
 _KNOWN_QUANTITY_IDS = {
     "m", "H_ex", "H_demag", "H_ext", "H_ant", "H_eff",
-    "H_ani", "H_dmi", "H_mel", "H_ani_cubic", "H_dmi_bulk", "H_oe", "H_therm",
+    "H_ani", "H_dmi", "H_rotated_dmi", "H_mel", "H_ani_cubic", "H_dmi_bulk", "H_oe", "H_therm",
     "demag_phi",
     "V_electric", "J_charge", "spin_potential", "spin_current_tensor",
-    "E_ex", "E_demag", "E_ext", "E_ani", "E_dmi", "E_total",
+    "E_ex", "E_demag", "E_ext", "E_ani", "E_dmi", "E_rotated_dmi", "E_total",
     "mode_amplitude", "mode_real", "mode_imag", "mode_phase",
     # Second wave (QB-17)
     "eden_ex", "eden_demag", "eden_ext", "eden_ani", "eden_dmi", "eden_total",

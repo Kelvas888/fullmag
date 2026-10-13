@@ -1,4 +1,5 @@
 export type Viewport3DRenderAdoptionKind = "surface" | "vector";
+type ViewportSessionIdentity = { requestScopeEpoch?: string; sessionEpoch: string; sessionId: string };
 
 export interface Viewport3DRenderAdoptionReceipt {
   adoptedAtMs: number;
@@ -9,6 +10,7 @@ export interface Viewport3DRenderAdoptionReceipt {
   itemCount?: number;
   kind: Viewport3DRenderAdoptionKind;
   resourceKey: string | null;
+  requestScopeEpoch?: string;
   sessionEpoch: string;
   sessionId: string;
   scalarBufferKey: string | null;
@@ -33,7 +35,7 @@ interface SurfaceAdoptionInput {
   fieldBufferId: string | null;
   ownerId?: string;
   resourceKey?: string | null;
-  sessionIdentity?: { sessionEpoch: string; sessionId: string } | null;
+  sessionIdentity?: ViewportSessionIdentity | null;
   scalarBufferKey: string;
   targetId?: string;
 }
@@ -45,7 +47,7 @@ interface VectorAdoptionInput {
   itemCount?: number;
   ownerId?: string;
   resourceKey?: string | null;
-  sessionIdentity?: { sessionEpoch: string; sessionId: string } | null;
+  sessionIdentity?: ViewportSessionIdentity | null;
   targetId?: string;
   vectorBuildKey: string;
 }
@@ -65,7 +67,7 @@ type AdoptionInput = Omit<
   Viewport3DRenderAdoptionReceipt,
   "adoptedAtMs" | "adoptionSequence" | "sessionEpoch" | "sessionId" | "targetId"
 > & {
-  sessionIdentity?: { sessionEpoch: string; sessionId: string } | null;
+  sessionIdentity?: ViewportSessionIdentity | null;
 };
 
 interface OwnedAdoption {
@@ -91,6 +93,10 @@ export interface Viewport3DRenderAdoptionRegistry {
   ): void;
   clearTarget(targetId: string): void;
   getLifecycleStats(): Viewport3DRenderAdoptionRegistryLifecycleStats;
+  latestActiveAdoption(input: {
+    sessionEpoch: string;
+    sessionId: string;
+  }): Viewport3DRenderAdoptionReceipt | null;
   hasActiveAdoption(input: {
     fieldBufferId: string;
     resourceKey: string | null;
@@ -104,11 +110,12 @@ export interface Viewport3DRenderAdoptionRegistry {
   recordSurfaceAdoption(input: SurfaceAdoptionInput): Viewport3DRenderAdoptionResult;
   recordVectorAdoption(input: VectorAdoptionInput): Viewport3DRenderAdoptionResult;
   retainDemand(targetId: string): () => void;
-  setSessionIdentity(identity: { sessionEpoch: string; sessionId: string } | null): void;
+  setSessionIdentity(identity: ViewportSessionIdentity | null): void;
   setCarrierTargets(
     targetIdsByCarrierId: ReadonlyMap<string, readonly string[]>,
   ): void;
   snapshot(targetId: string): readonly Viewport3DRenderAdoptionReceipt[];
+  subscribeActive(listener: () => void): () => void;
   subscribe(listener: (targetId: string) => void): () => void;
 }
 
@@ -130,15 +137,19 @@ export function createViewport3DRenderAdoptionRegistry({
   const activePasses = new Map<string, Map<string, OwnedAdoption>>();
   const inactiveHistory = new Map<string, AdoptionPass>();
   const listeners = new Set<(targetId: string) => void>();
+  const activeListeners = new Set<() => void>();
   const replaysByCarrier = new Map<string, Set<() => void>>();
   const rejectedTargetPasses = new Set<string>();
   let adoptionSequence = 0;
   let activeOwnerCount = 0;
   let rejectedAdoptionCount = 0;
-  let currentSessionIdentity: { sessionEpoch: string; sessionId: string } | null = null;
+  let currentSessionIdentity: ViewportSessionIdentity | null = null;
 
   const notify = (targetId: string) => {
     for (const listener of [...listeners]) listener(targetId);
+  };
+  const notifyActive = () => {
+    for (const listener of [...activeListeners]) listener();
   };
   const clearRejectedTargetPasses = (targetId: string) => {
     for (const rejectedKey of [...rejectedTargetPasses]) {
@@ -246,7 +257,8 @@ export function createViewport3DRenderAdoptionRegistry({
       currentSessionIdentity &&
       (!responseSessionIdentity ||
         responseSessionIdentity.sessionId !== currentSessionIdentity.sessionId ||
-        responseSessionIdentity.sessionEpoch !== currentSessionIdentity.sessionEpoch)
+        responseSessionIdentity.sessionEpoch !== currentSessionIdentity.sessionEpoch ||
+        responseSessionIdentity.requestScopeEpoch !== currentSessionIdentity.requestScopeEpoch)
     ) {
       rejectedAdoptionCount += 1;
       return {
@@ -297,6 +309,7 @@ export function createViewport3DRenderAdoptionRegistry({
       ...receiptInput,
       adoptedAtMs: safeTimestamp(now()),
       adoptionSequence: ++adoptionSequence,
+      requestScopeEpoch: sessionIdentity.requestScopeEpoch,
       sessionEpoch: sessionIdentity.sessionEpoch,
       sessionId: sessionIdentity.sessionId,
     });
@@ -310,6 +323,10 @@ export function createViewport3DRenderAdoptionRegistry({
     });
     activePasses.set(key, owners);
     syncPass(key);
+    // Renderer completion cannot depend on an expanded Visualization Debug
+    // target. Signal a newly effective WebGL adoption even with zero debug
+    // demand so the viewport can invalidate and commit its ACK frame.
+    if (!matchingActive) notifyActive();
     return { status: "adopted" as const };
   };
   const replayCarrier = (carrierId: string) => {
@@ -341,11 +358,18 @@ export function createViewport3DRenderAdoptionRegistry({
       if (!ownerId) return;
       const owned = owners?.get(ownerId);
       if (!owners || !owned || !adoptionIdentityEquals(owned.receipt, adoption)) return;
+      const selectedBefore = [...owners.values()].sort(
+        (left, right) => right.receipt.adoptionSequence - left.receipt.adoptionSequence,
+      )[0]?.receipt;
       owners.delete(ownerId);
       activeOwnerCount -= 1;
       rememberInactive(owned);
       if (owners.size === 0) activePasses.delete(key);
       syncPass(key);
+      const selectedAfter = [...owners.values()].sort(
+        (left, right) => right.receipt.adoptionSequence - left.receipt.adoptionSequence,
+      )[0]?.receipt;
+      if (selectedBefore !== selectedAfter) notifyActive();
     },
     clearTarget(targetId) {
       const hadReceipts = receipts.delete(targetId);
@@ -363,6 +387,32 @@ export function createViewport3DRenderAdoptionRegistry({
         rejectedTargetPassCount: rejectedTargetPasses.size,
         targetReceiptCount,
       };
+    },
+    latestActiveAdoption({ sessionEpoch, sessionId }) {
+      let latest: Viewport3DRenderAdoptionReceipt | null = null;
+      for (const owners of activePasses.values()) {
+        for (const owned of owners.values()) {
+          const receipt = owned.receipt;
+          if (
+            receipt.sessionEpoch !== sessionEpoch ||
+            receipt.sessionId !== sessionId ||
+            !receipt.fieldBufferId ||
+            !receipt.resourceKey
+          ) {
+            continue;
+          }
+          if (!latest || receipt.adoptionSequence > latest.adoptionSequence) {
+            latest = {
+              ...receipt,
+              targetId:
+                ownerTargetIds(owned)[0] ??
+                owned.explicitTargetId ??
+                receipt.carrierId,
+            };
+          }
+        }
+      }
+      return latest;
     },
     hasActiveAdoption({ fieldBufferId, resourceKey, sessionEpoch, sessionId }) {
       for (const owners of activePasses.values()) {
@@ -444,11 +494,13 @@ export function createViewport3DRenderAdoptionRegistry({
     setSessionIdentity(identity) {
       if (
         currentSessionIdentity?.sessionId === identity?.sessionId &&
-        currentSessionIdentity?.sessionEpoch === identity?.sessionEpoch
+        currentSessionIdentity?.sessionEpoch === identity?.sessionEpoch &&
+        currentSessionIdentity?.requestScopeEpoch === identity?.requestScopeEpoch
       ) {
         return;
       }
       const affectedTargetIds = [...receipts.keys()];
+      const hadActivePasses = activePasses.size > 0;
       currentSessionIdentity = identity;
       receipts.clear();
       activePasses.clear();
@@ -456,6 +508,7 @@ export function createViewport3DRenderAdoptionRegistry({
       rejectedTargetPasses.clear();
       activeOwnerCount = 0;
       for (const targetId of affectedTargetIds) notify(targetId);
+      if (hadActivePasses) notifyActive();
     },
     snapshot(targetId) {
       return receipts.get(targetId) ?? EMPTY_RECEIPTS;
@@ -480,6 +533,19 @@ export function createViewport3DRenderAdoptionRegistry({
         if (!subscribed) return;
         subscribed = false;
         listeners.delete(listener);
+      };
+    },
+    subscribeActive(listener) {
+      activeListeners.add(listener);
+      // React mounts child layer effects before the parent scene effect.  If
+      // the layer adopted its buffer first, replay that active state so the
+      // late scene subscriber still invalidates and commits the rendered ACK.
+      if (activePasses.size > 0) listener();
+      let subscribed = true;
+      return () => {
+        if (!subscribed) return;
+        subscribed = false;
+        activeListeners.delete(listener);
       };
     },
   };
@@ -561,6 +627,7 @@ function receiptsEqual(
       left.itemCount === right.itemCount &&
       left.kind === right.kind &&
       left.resourceKey === right.resourceKey &&
+      left.requestScopeEpoch === right.requestScopeEpoch &&
       left.sessionEpoch === right.sessionEpoch &&
       left.sessionId === right.sessionId &&
       left.scalarBufferKey === right.scalarBufferKey &&

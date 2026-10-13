@@ -1,20 +1,44 @@
 import { readFileSync } from "node:fs";
 import { renderToStaticMarkup } from "react-dom/server";
+import { fieldVectorResourceKey } from "@/kernel/api/fieldQueryIdentity";
 import { describe, expect, it } from "vitest";
+import type { FrequencyDomainChartSeries } from "@/shared/domain/analysis/frequencyDomainChartModels";
 import {
   frequencySeriesRenderModel,
   frequencySpectrumRenderModel,
 } from "@/shared/analysis-charts/frequencyRenderModels";
 
 import {
+  frequencyDomainSelectableSeriesPointIndexFromChartEvent,
   frequencyDomainSeriesPointIndexFromChartEvent,
   FrequencyDomainDispersionChart,
   FrequencyDomainResponseChart,
   FrequencyDomainSpectrumChart,
+  frequencyDomainSpectrumChartRenderModel,
   spectrumPointIndexFromChartEvent,
 } from "./FrequencyDomainCharts";
 
 describe("FrequencyDomainCharts", () => {
+  it("keeps mode cards and chart content bounded in a responsive inspector", () => {
+    const css = readFileSync(
+      new URL("../../../design/styles/inspector-frequency-domain.css", import.meta.url),
+      "utf8",
+    );
+
+    expect(css).toMatch(
+      /\.fm-frequency-domain-chart\s*>\s*\.fm-analysis-chart-surface\s*\{[\s\S]*?display:\s*grid;/,
+    );
+    expect(css).toMatch(
+      /\.fm-frequency-domain-chart__point-actions\s*\{[\s\S]*?display:\s*grid;[\s\S]*?grid-template-columns:\s*minmax\(0, 1fr\) auto;/,
+    );
+    expect(css).toMatch(
+      /\.fm-frequency-domain-chart__mode\s*\{[\s\S]*?min-width:\s*0;[\s\S]*?width:\s*100%;/,
+    );
+    expect(css).toContain(".fm-frequency-domain-chart__summary > span,");
+    expect(css).not.toContain(".fm-frequency-domain-chart__summary span,");
+    expect(css).toContain("grid-template-columns: repeat(auto-fit, minmax(min(100%, 180px), 1fr));");
+  });
+
   it("never disposes an ECharts instance owned by another mounted frame", () => {
     const source = readFileSync(
       new URL("./FrequencyDomainCharts.tsx", import.meta.url),
@@ -40,10 +64,16 @@ describe("FrequencyDomainCharts", () => {
             {
               branchId: null,
               dampingRateHz: 1.5e6,
+              displayModeIndex: 1,
               frequencyHz: 750e6,
               imaginaryFrequencyHz: null,
+              modeFieldAvailable: true,
               modeFieldId: "analysis:eigen:sample-0000:mode-0001",
-              modeFieldResourceKey: null,
+              modeFieldResourceKey: fieldVectorResourceKey(
+                "analysis:eigen:sample-0000:mode-0001",
+                { phase_rad: 0, view: "phase_rotated_real" },
+              ),
+              modeId: null,
               rawModeIndex: 1,
               residualNorm: 1e-8,
               sampleIndex: 0,
@@ -52,11 +82,13 @@ describe("FrequencyDomainCharts", () => {
             ...Array.from({ length: 5 }, (_, index) => ({
               branchId: null,
               dampingRateHz: null,
+              displayModeIndex: index + 2,
               frequencyHz: (800 + index * 25) * 1e6,
               imaginaryFrequencyHz: null,
               modeFieldId:
                 index === 4 ? "analysis:eigen:sample-0000:mode-0006" : null,
               modeFieldResourceKey: null,
+              modeId: null,
               rawModeIndex: index + 2,
               residualNorm: null,
               sampleIndex: 0,
@@ -93,6 +125,7 @@ describe("FrequencyDomainCharts", () => {
     expect(html).toContain("mode 1: 750 MHz");
     expect(html).toContain("mode 6: 900 MHz");
     expect(html).toContain("Select mode 1 at 750 MHz, 3D field available");
+    expect(html).not.toContain('aria-label="Load mode 1 in 3D" disabled=""');
     expect(html).toContain("Select mode 2 at 800 MHz, 3D field missing");
     expect(html).toContain("3D ready");
     expect(html).toContain("field missing");
@@ -101,6 +134,76 @@ describe("FrequencyDomainCharts", () => {
     expect(html).toContain("fm-button");
     expect(html).toContain("fm-frequency-domain-chart__mode");
     expect(html).not.toContain("mode 1: 0.75 GHz");
+  });
+
+  it("keeps modal spectrum axes on display mode rank and physical Hz", () => {
+    const renderModel = frequencyDomainSpectrumChartRenderModel({
+      dataSourceVersion: "unknown",
+      diagnostics: [],
+      droppedPointCount: 0,
+      points: [
+        {
+          branchId: null,
+          dampingRateHz: null,
+          displayModeIndex: 0,
+          frequencyHz: 3e9,
+          imaginaryFrequencyHz: null,
+          modeFieldId: null,
+          modeFieldResourceKey: null,
+          modeId: "mode-alpha",
+          rawModeIndex: 17,
+          residualNorm: null,
+          sampleIndex: 0,
+          tangentLeakageMax: null,
+        },
+        {
+          branchId: null,
+          dampingRateHz: null,
+          displayModeIndex: 1,
+          frequencyHz: 4e9,
+          imaginaryFrequencyHz: null,
+          modeFieldId: null,
+          modeFieldResourceKey: null,
+          modeId: "mode-beta",
+          rawModeIndex: 99,
+          residualNorm: null,
+          sampleIndex: 0,
+          tangentLeakageMax: null,
+        },
+      ],
+      series: [
+        {
+          id: "analysis.frequency-domain:eigen:spectrum:frequency",
+          label: "Eigen frequency",
+          points: [
+            { rowIndex: 0, x: 0, y: 3e9 },
+            { rowIndex: 1, x: 1, y: 4e9 },
+          ],
+          quantity: "frequency",
+          source: {
+            kind: "analysis.frequency_domain",
+            resourceKey: "analysis/frequency-domain/eigen/spectrum.v2",
+            tableId: "frequency-domain:eigen-spectrum",
+          },
+          status: "ready",
+          unit: "Hz",
+          xUnit: "1",
+        },
+      ],
+    });
+
+    expect(renderModel.xAxis).toEqual({
+      label: "mode rank [1]",
+      unit: "1",
+    });
+    expect(renderModel.yAxes[0]).toEqual({
+      label: "Eigen frequency [Hz]",
+      unit: "Hz",
+    });
+    expect(renderModel.series[0]?.points).toEqual([
+      { rowIndex: 0, x: 0, y: 3e9 },
+      { rowIndex: 1, x: 1, y: 4e9 },
+    ]);
   });
 
   it("labels response chart x axes with the series frequency unit", () => {
@@ -163,6 +266,98 @@ describe("FrequencyDomainCharts", () => {
     expect(
       frequencyDomainSeriesPointIndexFromChartEvent({ data: "invalid" }),
     ).toBeNull();
+  });
+
+  it("only maps dispersion clicks from matching computed-series identities", () => {
+    const source = {
+      kind: "analysis.frequency_domain" as const,
+      resourceKey: "analysis/frequency-domain/eigen/dispersion",
+      tableId: "frequency-domain:eigen-dispersion",
+    };
+    const seriesFor = (
+      id: string,
+      quantity: string,
+      kind?: "line" | "scatter",
+    ): FrequencyDomainChartSeries => ({
+      id,
+      label: id,
+      points: [{ rowIndex: 0, x: 1, y: 2 }],
+      quantity,
+      source,
+      status: "ready",
+      unit: "GHz",
+      xUnit: "rad/m",
+      ...(kind ? { kind } : {}),
+    });
+    const series = [
+      { ...seriesFor("empty-reference", "reference_frequency"), points: [] },
+      seriesFor("computed-branch", "frequency"),
+      seriesFor("analytic-overlay", "analytic_frequency"),
+      seriesFor("imported-reference", "reference_frequency"),
+      seriesFor("reference-scatter", "reference_frequency", "scatter"),
+    ];
+    const click = (seriesIndex: number, seriesId: string) => ({
+      data: [1, 2, 0],
+      seriesId,
+      seriesIndex,
+    });
+
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        click(0, "computed-branch"),
+        series,
+      ),
+    ).toBe(0);
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        click(1, "analytic-overlay"),
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        click(2, "imported-reference"),
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        click(3, "reference-scatter"),
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        { data: [1, 2, 0], seriesIndex: 0 },
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        { data: [1, 2, 0], seriesId: "", seriesIndex: 0 },
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        { data: [1, 2, 0], seriesId: "computed-branch" },
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        click(0, "analytic-overlay"),
+        series,
+      ),
+    ).toBeNull();
+    expect(
+      frequencyDomainSelectableSeriesPointIndexFromChartEvent(
+        click(8, "missing-series"),
+        series,
+      ),
+    ).toBeNull();
+    // Legacy row-only consumers retain their existing event parser contract.
+    expect(frequencyDomainSeriesPointIndexFromChartEvent({ data: [1, 2, 0] })).toBe(0);
   });
 
   it("renders selectable response and dispersion chart point controls", () => {

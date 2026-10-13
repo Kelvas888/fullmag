@@ -33,22 +33,27 @@ pub const DEFAULT_GYROMAGNETIC_RATIO: f64 = 2.211e5;
 pub type Vector3 = [f64; 3];
 
 // ── Re-exports from FDM modules ───────────────────────────────────────
+pub use fdm::constant_z_field_llg_from_positive_x;
 pub use fdm::neighbor_index;
 pub use fdm::shared::frozen_spins::FrozenSpinsState;
 pub use fdm::{
     compute_newell_kernel_spectra, compute_newell_kernel_spectra_thin_film_2d,
-    compute_periodic_newell_kernel_spectra, run_reference_exchange_demo, AbmHistory, AbmHistorySoA,
-    AdaptiveAttemptDecision, AdaptiveAttemptReason, AdaptiveAttemptRecord, AdaptiveStepConfig,
+    compute_periodic_newell_kernel_spectra, run_reference_exchange_demo, Abm3CheckpointHistoryV1,
+    Abm3StepTelemetry, AbmHistory, AbmHistorySoA, AdaptiveAttemptDecision, AdaptiveAttemptReason,
+    AdaptiveAttemptRecord, AdaptiveStepConfig, AdaptiveStepController, AdaptiveStepDecision,
     AxisBoundary, CellSize, CoupledImexArk2Stage, CoupledImexArk2Tableau, CubicAnisotropyConfig,
     DemagKernelSpectra, EffectiveFieldObservables, EffectiveFieldTerms, EngineError,
     EngineErrorCode, EvaluationRequest, ExchangeLlgProblem, ExchangeLlgState, ExchangeLlgStateSoA,
-    ExternalStageTerms, FdmBoundaryPolicy, FdmDemagBoundary, FftWorkspace, GridShape,
-    IntegratorBuffers, LlgConfig, MagnetoelasticTermConfig, MaterialParameters,
-    OerstedCylinderConfig, ReferenceDemoReport, RegionalFieldDriveTerm,
-    ResolvedFdmPeriodicWorkspace, Result, RhsEvaluation, SlonczewskiFormula, SlonczewskiSttConfig,
-    SolverSession, SotConfig, SotFormula, StepReport, TimeIntegrator, UniaxialAnisotropyConfig,
-    VectorFieldSoA, ZhangLiFormula, ZhangLiSttConfig,
+    ExternalStageTerms, FdmBoundaryPolicy, FdmCpuSolverCheckpointV1, FdmCpuStateCopyTelemetry,
+    FdmDemagBoundary, FftWorkspace, GridShape, IntegratorBuffers, LlgConfig,
+    MagnetoelasticTermConfig, MaterialParameters, OerstedCylinderConfig, ProjectionPolicy,
+    ReferenceDemoReport, RegionalFieldDriveTerm, ResolvedFdmPeriodicWorkspace, Result,
+    RhsEvaluation, SlonczewskiFormula, SlonczewskiSttConfig, SolverSession, SotConfig, SotFormula,
+    StepReport, TimeIntegrator, UniaxialAnisotropyConfig, VectorFieldSoA, ZhangLiFormula,
+    ZhangLiSttConfig, FDM_ABM3_STEP_TELEMETRY_SCHEMA_VERSION,
+    FDM_ADAPTIVE_CONTROLLER_MAX_REJECTED_ATTEMPTS, FDM_ADAPTIVE_CONTROLLER_POLICY_VERSION,
     FDM_CPU_ADAPTIVE_RK23_MAX_RHS_EVALS_TO_ORACLE, FDM_CPU_ADAPTIVE_RK45_MAX_RHS_EVALS_TO_ORACLE,
+    FDM_CPU_SOLVER_CHECKPOINT_SCHEMA_VERSION, FDM_RK_PROJECTION_REALIZATION_VERSION,
     MAX_ADAPTIVE_ATTEMPT_RECORDS,
 };
 
@@ -114,6 +119,105 @@ mod tests {
         (problem, state)
     }
 
+    #[test]
+    fn explicit_frozen_spins_reactivation_advances_epoch_and_recaptures_reference() {
+        let mut problem = simple_problem(0.1, 1.0);
+        let mut state = problem
+            .new_state(vec![[1.0, 0.0, 0.0]; 3])
+            .expect("state should build");
+        let plan = resolved_frozen_spins(vec![true, false, false]);
+
+        problem
+            .capture_frozen_spins_at_activation(&plan, &mut state)
+            .expect("initial activation should succeed");
+        let first = problem
+            .frozen_spins()
+            .expect("initial frozen state")
+            .clone();
+        assert_eq!(first.activation_epoch(), 1);
+        assert_eq!(first.constraint_activation_epochs()["pinned"], 1);
+        assert_eq!(first.resolved_constraint_set_revision(), 1);
+
+        state.magnetization_mut()[0] = [0.0, 1.0, 0.0];
+        problem
+            .capture_frozen_spins_at_activation(&plan, &mut state)
+            .expect("explicit reactivation should succeed");
+        let second = problem.frozen_spins().expect("reactivated frozen state");
+        assert_eq!(second.activation_epoch(), 2);
+        assert_eq!(second.constraint_activation_epochs()["pinned"], 2);
+        assert_eq!(second.resolved_constraint_set_revision(), 2);
+        assert_eq!(second.reference()[0], [0.0, 1.0, 0.0]);
+
+        let continued =
+            FrozenSpinsState::transition_at_activation(second, &plan, None, state.magnetization())
+                .expect("continuous stage activation should remain valid");
+        assert_eq!(continued.constraint_activation_epochs()["pinned"], 2);
+        assert_eq!(continued.resolved_constraint_set_revision(), 3);
+        assert_eq!(continued.reference()[0], [0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn frozen_spins_stage_gap_deactivates_constraint_and_reentry_advances_epoch() {
+        let mut problem = simple_problem(0.1, 1.0);
+        let mut state = problem
+            .new_state(vec![[1.0, 0.0, 0.0]; 3])
+            .expect("state should build");
+        let plan = resolved_frozen_spins(vec![true, false, false]);
+        problem
+            .capture_frozen_spins_at_activation(&plan, &mut state)
+            .expect("stage A activation should succeed");
+
+        problem
+            .transition_frozen_spins_at_stage_boundary(None, &mut state)
+            .expect("inactive stage should publish an empty resolved set");
+        let inactive = problem.frozen_spins().expect("inactive lifecycle state");
+        assert!(inactive.active_constraint_ids().is_empty());
+        assert_eq!(inactive.frozen_dof_count(), 0);
+        assert_eq!(inactive.resolved_constraint_set_revision(), 2);
+        let mut candidate = vec![[0.0, 1.0, 0.0]; 3];
+        inactive.restore_reference(&mut candidate);
+        assert_eq!(candidate[0], [0.0, 1.0, 0.0]);
+
+        state.magnetization_mut()[0] = [0.0, 1.0, 0.0];
+        problem
+            .transition_frozen_spins_at_stage_boundary(Some(&plan), &mut state)
+            .expect("stage C re-entry should succeed");
+        let reentered = problem.frozen_spins().expect("re-entered frozen state");
+        assert_eq!(reentered.constraint_activation_epochs()["pinned"], 2);
+        assert_eq!(reentered.resolved_constraint_set_revision(), 3);
+        assert_eq!(reentered.reference()[0], [0.0, 1.0, 0.0]);
+        assert_eq!(reentered.frozen_dof_count(), 1);
+    }
+
+    #[test]
+    fn failed_frozen_spins_reactivation_keeps_published_state_unchanged() {
+        let mut problem = simple_problem(0.1, 1.0);
+        let mut state = problem
+            .new_state(vec![[1.0, 0.0, 0.0]; 3])
+            .expect("state should build");
+        problem
+            .capture_frozen_spins_at_activation(
+                &resolved_frozen_spins(vec![true, false, false]),
+                &mut state,
+            )
+            .expect("initial activation should succeed");
+        let published = problem
+            .frozen_spins()
+            .expect("published frozen state")
+            .clone();
+
+        let error = problem
+            .capture_frozen_spins_at_activation(
+                &resolved_frozen_spins(vec![true, false]),
+                &mut state,
+            )
+            .expect_err("malformed reactivation must fail");
+        assert!(error
+            .to_string()
+            .contains("frozen_spins_mask_size_mismatch"));
+        assert_eq!(problem.frozen_spins(), Some(&published));
+    }
+
     fn frozen_coupled_terms() -> ExternalStageTerms {
         ExternalStageTerms {
             additional_field_apm: vec![[0.0, 0.0, 1.0], [0.0; 3], [0.0; 3]],
@@ -155,6 +259,200 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    fn projected_rk_macrospin_error(integrator: TimeIntegrator, dt: f64) -> f64 {
+        let problem = ExchangeLlgProblem::with_terms(
+            GridShape::new(1, 1, 1).expect("valid grid"),
+            CellSize::new(1.0, 1.0, 1.0).expect("valid cell size"),
+            MaterialParameters::new(1.0, 1.0e-30, 0.0).expect("valid material"),
+            LlgConfig::new(1.0, integrator).expect("valid LLG config"),
+            EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                external_field: Some([0.0, 0.0, 1.0]),
+                ..Default::default()
+            },
+        );
+        let final_time = 0.8;
+        let steps = (final_time / dt).round() as usize;
+        let mut state = problem
+            .new_state(vec![[1.0, 0.0, 0.0]])
+            .expect("macrospin state");
+        let mut workspace = problem.create_workspace();
+        let mut buffers = problem.create_integrator_buffers();
+        for _ in 0..steps {
+            match integrator {
+                TimeIntegrator::Heun => problem
+                    .heun_step_buf(
+                        &mut state,
+                        dt,
+                        &mut workspace,
+                        &mut buffers,
+                        EvaluationRequest::Minimal,
+                    )
+                    .expect("Heun step"),
+                TimeIntegrator::RK4 => problem
+                    .rk4_step_buf(
+                        &mut state,
+                        dt,
+                        &mut workspace,
+                        &mut buffers,
+                        EvaluationRequest::Minimal,
+                    )
+                    .expect("RK4 step"),
+                TimeIntegrator::RK23 => problem
+                    .rk23_step_buf(
+                        &mut state,
+                        dt,
+                        &mut workspace,
+                        &mut buffers,
+                        EvaluationRequest::Minimal,
+                    )
+                    .expect("RK23 step"),
+                TimeIntegrator::RK45 => problem
+                    .rk45_step_buf(
+                        &mut state,
+                        dt,
+                        &mut workspace,
+                        &mut buffers,
+                        EvaluationRequest::Minimal,
+                    )
+                    .expect("RK45 step"),
+                TimeIntegrator::ABM3 => panic!("ABM3 is not a projected RK tableau"),
+            };
+        }
+        let exact = [final_time.cos(), final_time.sin(), 0.0];
+        let actual = state.magnetization()[0];
+        ((actual[0] - exact[0]).powi(2)
+            + (actual[1] - exact[1]).powi(2)
+            + (actual[2] - exact[2]).powi(2))
+        .sqrt()
+    }
+
+    #[test]
+    fn projected_rk_macrospin_has_qualified_temporal_order() {
+        let cases = [
+            (TimeIntegrator::Heun, 1.5),
+            (TimeIntegrator::RK4, 3.2),
+            (TimeIntegrator::RK23, 2.2),
+            (TimeIntegrator::RK45, 4.0),
+        ];
+        for (integrator, minimum_order) in cases {
+            let coarse = projected_rk_macrospin_error(integrator, 0.04);
+            let fine = projected_rk_macrospin_error(integrator, 0.02);
+            let observed_order = (coarse / fine).log2();
+            assert!(
+                observed_order >= minimum_order,
+                "{integrator:?} projected RK order {observed_order:.3} below {minimum_order:.3} (coarse={coarse:.3e}, fine={fine:.3e})"
+            );
+        }
+    }
+
+    #[test]
+    fn constant_field_live_soa_rhs_and_trajectory_match_analytic_llg() {
+        let field_amplitude = 2.5;
+        let alpha = 0.2;
+        let gamma = 3.0;
+        let problem = ExchangeLlgProblem::with_terms(
+            GridShape::new(1, 1, 1).expect("valid grid"),
+            CellSize::new(1.0, 1.0, 1.0).expect("valid cell size"),
+            MaterialParameters::new(1.0, 1.0e-30, alpha).expect("valid material"),
+            LlgConfig::new(gamma, TimeIntegrator::RK4).expect("valid LLG config"),
+            EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                external_field: Some([0.0, 0.0, field_amplitude]),
+                ..Default::default()
+            },
+        );
+        let magnetization = vec![[1.0, 0.0, 0.0]];
+        let mut workspace = problem.create_workspace();
+        let mut soa_field = VectorFieldSoA::zeros(1);
+        let soa_magnetization = VectorFieldSoA::from_aos(&magnetization);
+        problem.effective_field_into_soa_ws_at(
+            &soa_magnetization,
+            0.0,
+            &mut workspace,
+            &mut soa_field,
+        );
+        assert_vector_close(
+            [soa_field.x[0], soa_field.y[0], soa_field.z[0]],
+            [0.0, 0.0, field_amplitude],
+            1.0e-15,
+        );
+
+        let mut soa_rhs = VectorFieldSoA::zeros(1);
+        problem.llg_rhs_soa_into(&soa_magnetization, &soa_field, &mut soa_rhs);
+        let gamma_bar = gamma / (1.0 + alpha * alpha);
+        assert_vector_close(
+            [soa_rhs.x[0], soa_rhs.y[0], soa_rhs.z[0]],
+            [
+                0.0,
+                gamma_bar * field_amplitude,
+                gamma_bar * alpha * field_amplitude,
+            ],
+            1.0e-15,
+        );
+
+        let mut aos_field = vec![[0.0; 3]];
+        problem.effective_field_into_ws_at_time(
+            &magnetization,
+            &mut workspace,
+            &mut aos_field,
+            0.0,
+        );
+        let mut aos_rhs = vec![[0.0; 3]];
+        problem.llg_rhs_from_fields_with_direct_torques_into(
+            &magnetization,
+            &aos_field,
+            &mut aos_rhs,
+        );
+        assert_vector_close(aos_field[0], [0.0, 0.0, field_amplitude], 1.0e-15);
+        assert_vector_close(
+            aos_rhs[0],
+            [soa_rhs.x[0], soa_rhs.y[0], soa_rhs.z[0]],
+            1.0e-15,
+        );
+
+        let trajectory_problem = ExchangeLlgProblem::with_terms(
+            GridShape::new(1, 1, 1).expect("valid grid"),
+            CellSize::new(1.0, 1.0, 1.0).expect("valid cell size"),
+            MaterialParameters::new(1.0, 1.0e-30, 0.0).expect("valid material"),
+            LlgConfig::new(gamma, TimeIntegrator::RK4).expect("valid LLG config"),
+            EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                external_field: Some([0.0, 0.0, field_amplitude]),
+                ..Default::default()
+            },
+        );
+        let dt = 5.0e-4;
+        let steps = 800;
+        let mut trajectory_state = trajectory_problem
+            .new_state(magnetization)
+            .expect("trajectory state")
+            .to_soa();
+        let mut trajectory_workspace = trajectory_problem.create_workspace();
+        let mut trajectory_buffers = trajectory_problem.create_integrator_buffers();
+        for _ in 0..steps {
+            trajectory_problem
+                .rk4_step_soa_state_buf(
+                    &mut trajectory_state,
+                    dt,
+                    &mut trajectory_workspace,
+                    &mut trajectory_buffers,
+                    EvaluationRequest::Minimal,
+                )
+                .expect("constant-field RK4 step");
+        }
+        let final_time = dt * steps as f64;
+        let angle = gamma * field_amplitude * final_time;
+        assert_vector_close(
+            trajectory_state.magnetization.gather_to_aos()[0],
+            [angle.cos(), angle.sin(), 0.0],
+            1.0e-11,
+        );
     }
 
     #[test]
@@ -209,6 +507,118 @@ mod tests {
             (derivative + 6.0 * MU0).abs() < 1e-15,
             "regional drive energy derivative must match the effective field, got {derivative}"
         );
+    }
+
+    #[test]
+    fn regional_drive_energy_is_reported_for_aos_and_soa_full_steps() {
+        let grid = GridShape::new(2, 1, 1).expect("valid grid");
+        let mut problem = ExchangeLlgProblem::with_terms(
+            grid,
+            CellSize::new(1.0, 1.0, 1.0).expect("valid cell size"),
+            MaterialParameters::new(2.0, 1.0, 0.1).expect("valid material"),
+            LlgConfig::new(1.0, TimeIntegrator::Heun).expect("valid llg config"),
+            EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                ..Default::default()
+            },
+        );
+        problem.regional_field_drives.push(RegionalFieldDriveTerm {
+            basis_field: vec![[0.0, 3.0, 0.0], [0.0, -1.0, 0.0]],
+            waveform: fullmag_ir::TimeDependenceIR::Constant,
+            time_offset_s: 0.0,
+            enabled: true,
+        });
+
+        let mut aos_state = problem
+            .new_state(vec![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+            .expect("AoS state");
+        let mut soa_state = aos_state.clone();
+        let mut aos_workspace = problem.create_workspace();
+        let mut soa_workspace = problem.create_workspace();
+        let mut aos_buffers = problem.create_integrator_buffers();
+        let mut soa_buffers = problem.create_integrator_buffers();
+
+        let aos_report = problem
+            .heun_step_buf(
+                &mut aos_state,
+                1.0e-3,
+                &mut aos_workspace,
+                &mut aos_buffers,
+                EvaluationRequest::Full,
+            )
+            .expect("AoS Heun step");
+        let soa_report = problem
+            .heun_step_soa_buf(
+                &mut soa_state,
+                1.0e-3,
+                &mut soa_workspace,
+                &mut soa_buffers,
+                EvaluationRequest::Full,
+            )
+            .expect("SoA Heun step");
+
+        let mut aos_energy_workspace = problem.create_workspace();
+        let aos_energy = problem
+            .total_energy_from_vectors_ws(aos_state.magnetization(), &mut aos_energy_workspace);
+        let soa_magnetization = VectorFieldSoA::from_aos(soa_state.magnetization());
+        let mut soa_energy_workspace = problem.create_workspace();
+        let mut soa_scratch = VectorFieldSoA::zeros(grid.cell_count());
+        let soa_energy = problem.total_energy_from_soa_ws(
+            &soa_magnetization,
+            &mut soa_energy_workspace,
+            &mut soa_scratch,
+        );
+        let external_density = problem
+            .external_energy_density(&aos_state)
+            .expect("external energy density");
+        let external_density_integral: f64 = external_density.iter().sum();
+        let total_density = problem
+            .total_energy_density(&aos_state)
+            .expect("total energy density");
+        let total_density_integral: f64 = total_density.iter().sum();
+
+        for (label, actual, expected) in [
+            (
+                "AoS external energy",
+                aos_report.external_energy_joules,
+                aos_energy,
+            ),
+            (
+                "AoS total energy",
+                aos_report.total_energy_joules,
+                aos_energy,
+            ),
+            (
+                "SoA external energy",
+                soa_report.external_energy_joules,
+                soa_energy,
+            ),
+            (
+                "SoA total energy",
+                soa_report.total_energy_joules,
+                soa_energy,
+            ),
+            (
+                "external energy density",
+                external_density_integral,
+                aos_energy,
+            ),
+            ("total energy density", total_density_integral, aos_energy),
+        ] {
+            assert!(
+                (actual - expected).abs() <= 1.0e-12,
+                "{label} must include regional drives: actual={actual}, expected={expected}"
+            );
+        }
+        let observables = problem.observe(&aos_state).expect("public observables");
+        assert!((observables.external_energy_joules - aos_energy).abs() <= 1.0e-12);
+        assert!((observables.total_energy_joules - aos_energy).abs() <= 1.0e-12);
+        let expected_field = problem.regional_drive_field_at_time(aos_state.time_seconds);
+        for (actual, expected) in observables.effective_field.iter().zip(expected_field) {
+            assert_vector_close(*actual, expected, 1.0e-12);
+        }
+        assert_step_report_close(soa_report, aos_report, 1.0e-12);
     }
 
     #[test]
@@ -383,18 +793,40 @@ mod tests {
         }
     }
 
-    fn expected_native_centered_dmi_energy(
-        problem: &ExchangeLlgProblem,
-        magnetization: &[Vector3],
-    ) -> f64 {
+    fn expected_face_dmi_energy(problem: &ExchangeLlgProblem, magnetization: &[Vector3]) -> f64 {
         let grid = problem.grid;
-        let dx = problem.cell_size.dx;
-        let dy = problem.cell_size.dy;
-        let dz = problem.cell_size.dz;
-        let volume = problem.cell_size.volume();
         let bpx = matches!(problem.boundary_policy.x, AxisBoundary::Periodic);
         let bpy = matches!(problem.boundary_policy.y, AxisBoundary::Periodic);
         let bpz = matches!(problem.boundary_policy.z, AxisBoundary::Periodic);
+        let sx = problem.cell_size.dy * problem.cell_size.dz;
+        let sy = problem.cell_size.dx * problem.cell_size.dz;
+        let sz = problem.cell_size.dx * problem.cell_size.dy;
+        let interfacial = problem.terms.interfacial_dmi.unwrap_or(0.0);
+        let rotated = problem.terms.rotated_interfacial_dmi.unwrap_or(0.0);
+        let bulk = problem.terms.bulk_dmi.unwrap_or(0.0);
+        let face_energy = |left: Vector3, right: Vector3, axis: usize, surface: f64| {
+            let average = [
+                0.5 * (left[0] + right[0]),
+                0.5 * (left[1] + right[1]),
+                0.5 * (left[2] + right[2]),
+            ];
+            let jump = [right[0] - left[0], right[1] - left[1], right[2] - left[2]];
+            let density_integral = match axis {
+                0 => {
+                    interfacial * (average[2] * jump[0] - average[0] * jump[2])
+                        + rotated * (average[2] * jump[0] - average[0] * jump[2])
+                        + bulk * (average[2] * jump[1] - average[1] * jump[2])
+                }
+                1 => {
+                    interfacial * (average[2] * jump[1] - average[1] * jump[2])
+                        + rotated * (average[0] * jump[1] - average[1] * jump[0])
+                        + bulk * (average[0] * jump[2] - average[2] * jump[0])
+                }
+                2 => bulk * (average[1] * jump[0] - average[0] * jump[1]),
+                _ => unreachable!("DMI face axis must be x, y, or z"),
+            };
+            surface * density_integral
+        };
 
         let mut energy = 0.0;
         for flat in 0..grid.cell_count() {
@@ -404,40 +836,22 @@ mod tests {
             let x = flat % grid.nx;
             let y = (flat / grid.nx) % grid.ny;
             let z = flat / (grid.nx * grid.ny);
-            let sample = |neighbor: usize| {
+            if bpx || x + 1 < grid.nx {
+                let neighbor = grid.index(neighbor_index(x, grid.nx, 1, bpx), y, z);
                 if problem.is_active(neighbor) {
-                    neighbor
-                } else {
-                    flat
-                }
-            };
-            let xp = sample(grid.index(neighbor_index(x, grid.nx, 1, bpx), y, z));
-            let xm = sample(grid.index(neighbor_index(x, grid.nx, -1, bpx), y, z));
-            let yp = sample(grid.index(x, neighbor_index(y, grid.ny, 1, bpy), z));
-            let ym = sample(grid.index(x, neighbor_index(y, grid.ny, -1, bpy), z));
-            let zp = sample(grid.index(x, y, neighbor_index(z, grid.nz, 1, bpz)));
-            let zm = sample(grid.index(x, y, neighbor_index(z, grid.nz, -1, bpz)));
-
-            let m = magnetization[flat];
-            if let Some(d) = problem.terms.interfacial_dmi {
-                if d.abs() > 0.0 {
-                    let dmx_dx = (magnetization[xp][0] - magnetization[xm][0]) / (2.0 * dx);
-                    let dmy_dy = (magnetization[yp][1] - magnetization[ym][1]) / (2.0 * dy);
-                    let dmz_dx = (magnetization[xp][2] - magnetization[xm][2]) / (2.0 * dx);
-                    let dmz_dy = (magnetization[yp][2] - magnetization[ym][2]) / (2.0 * dy);
-                    energy +=
-                        volume * d * (m[2] * (dmx_dx + dmy_dy) - m[0] * dmz_dx - m[1] * dmz_dy);
+                    energy += face_energy(magnetization[flat], magnetization[neighbor], 0, sx);
                 }
             }
-            if let Some(d) = problem.terms.bulk_dmi {
-                if d.abs() > 0.0 {
-                    let curl_x = (magnetization[yp][2] - magnetization[ym][2]) / (2.0 * dy)
-                        - (magnetization[zp][1] - magnetization[zm][1]) / (2.0 * dz);
-                    let curl_y = (magnetization[zp][0] - magnetization[zm][0]) / (2.0 * dz)
-                        - (magnetization[xp][2] - magnetization[xm][2]) / (2.0 * dx);
-                    let curl_z = (magnetization[xp][1] - magnetization[xm][1]) / (2.0 * dx)
-                        - (magnetization[yp][0] - magnetization[ym][0]) / (2.0 * dy);
-                    energy += volume * d * (m[0] * curl_x + m[1] * curl_y + m[2] * curl_z);
+            if bpy || y + 1 < grid.ny {
+                let neighbor = grid.index(x, neighbor_index(y, grid.ny, 1, bpy), z);
+                if problem.is_active(neighbor) {
+                    energy += face_energy(magnetization[flat], magnetization[neighbor], 1, sy);
+                }
+            }
+            if bpz || z + 1 < grid.nz {
+                let neighbor = grid.index(x, y, neighbor_index(z, grid.nz, 1, bpz));
+                if problem.is_active(neighbor) {
+                    energy += face_energy(magnetization[flat], magnetization[neighbor], 2, sz);
                 }
             }
         }
@@ -690,7 +1104,7 @@ mod tests {
     }
 
     #[test]
-    fn dmi_scalar_energy_matches_native_centered_density_contract() {
+    fn dmi_scalar_energy_matches_face_energy_contract() {
         let grid = GridShape::new(3, 3, 3).expect("valid grid");
         let problem = ExchangeLlgProblem::with_terms_and_mask(
             grid,
@@ -701,6 +1115,7 @@ mod tests {
                 exchange: false,
                 demag: false,
                 interfacial_dmi: Some(0.7 * MU0),
+                rotated_interfacial_dmi: Some(0.3 * MU0),
                 bulk_dmi: Some(-0.4 * MU0),
                 magnetoelastic: None,
                 ..Default::default()
@@ -732,7 +1147,7 @@ mod tests {
         let state = problem
             .new_state(raw_magnetization)
             .expect("state should build");
-        let expected = expected_native_centered_dmi_energy(&problem, state.magnetization());
+        let expected = expected_face_dmi_energy(&problem, state.magnetization());
         assert!(expected.abs() > 1e-12);
 
         let mut report_ws = problem.create_workspace();
@@ -754,7 +1169,7 @@ mod tests {
 
         assert!(
             (report.dmi_energy_joules - expected).abs() <= 1e-12,
-            "StepReport DMI energy differs from native centered density: {} vs {expected}",
+            "StepReport DMI energy differs from face-energy oracle: {} vs {expected}",
             report.dmi_energy_joules
         );
         assert!(
@@ -770,6 +1185,237 @@ mod tests {
             (soa_energy - expected).abs() <= 1e-12,
             "SoA total energy differs from DMI expected energy: {soa_energy} vs {expected}"
         );
+    }
+
+    #[test]
+    fn rotated_interfacial_dmi_field_matches_gobel_formula_at_interior_cell() {
+        let grid = GridShape::new(3, 3, 1).expect("valid grid");
+        let problem = ExchangeLlgProblem::with_terms(
+            grid,
+            CellSize::new(2.0, 4.0, 1.0).expect("valid cell size"),
+            MaterialParameters::new(2.0, 0.5 * MU0, 0.2).expect("valid material"),
+            LlgConfig::new(1.0, TimeIntegrator::Heun).expect("valid llg config"),
+            EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                rotated_interfacial_dmi: Some(0.5 * MU0),
+                ..Default::default()
+            },
+        );
+        let magnetization = (0..grid.cell_count())
+            .map(|flat| {
+                let x = (flat % grid.nx) as f64;
+                let y = ((flat / grid.nx) % grid.ny) as f64;
+                [
+                    0.1 + 2.0 * x + 3.0 * y,
+                    -0.2 + 5.0 * x + 7.0 * y,
+                    0.3 + 11.0 * x + 13.0 * y,
+                ]
+            })
+            .collect::<Vec<_>>();
+
+        let field = problem.rotated_interfacial_dmi_field(&magnetization);
+
+        assert_vector_close(field[grid.index(1, 1, 0)], [1.875, 0.375, -0.5], 1.0e-12);
+    }
+
+    #[test]
+    fn rotated_interfacial_dmi_is_wired_into_aos_soa_and_energy_density() {
+        let grid = GridShape::new(3, 3, 1).expect("valid grid");
+        let problem = ExchangeLlgProblem::with_terms(
+            grid,
+            CellSize::new(1.0, 1.5, 0.5).expect("valid cell size"),
+            MaterialParameters::new(2.0, 0.5 * MU0, 0.2).expect("valid material"),
+            LlgConfig::new(1.0, TimeIntegrator::Heun).expect("valid llg config"),
+            EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                rotated_interfacial_dmi: Some(0.4 * MU0),
+                ..Default::default()
+            },
+        );
+        let magnetization = (0..grid.cell_count())
+            .map(|flat| {
+                let x = (flat % grid.nx) as f64;
+                let y = ((flat / grid.nx) % grid.ny) as f64;
+                [0.2 + 0.1 * x, -0.3 + 0.2 * y, 0.4 - 0.07 * x + 0.05 * y]
+            })
+            .collect::<Vec<_>>();
+        let state = problem
+            .new_state(magnetization.clone())
+            .expect("valid state");
+        let direct = problem.rotated_interfacial_dmi_field(state.magnetization());
+
+        assert_eq!(problem.dmi_field(&state).expect("DMI field"), direct);
+        assert_eq!(
+            problem.effective_field(&state).expect("effective field"),
+            direct
+        );
+
+        let soa_magnetization = VectorFieldSoA::from_aos(state.magnetization());
+        let mut soa_field = VectorFieldSoA::zeros(grid.cell_count());
+        let mut workspace = problem.create_workspace();
+        problem.effective_field_into_soa_ws_at(
+            &soa_magnetization,
+            0.0,
+            &mut workspace,
+            &mut soa_field,
+        );
+        assert_eq!(soa_field.gather_to_aos(), direct);
+
+        let density = problem
+            .dmi_energy_density(&state)
+            .expect("DMI energy density");
+        let integrated = density.iter().sum::<f64>() * problem.cell_size.volume();
+        assert!(
+            (integrated - problem.dmi_energy_from_vectors(state.magnetization())).abs() <= 1.0e-12
+        );
+    }
+
+    #[test]
+    fn fdm_dmi_face_energy_matches_field_directional_derivative_on_open_and_mask_boundaries() {
+        let grid = GridShape::new(3, 2, 2).expect("valid grid");
+        let masks = [
+            None,
+            Some(
+                (0..grid.cell_count())
+                    .map(|flat| flat % grid.nx != 1 || flat / grid.nx != 0)
+                    .collect::<Vec<_>>(),
+            ),
+        ];
+        let dmi_values = [
+            (0.7 * MU0, 0.0, 0.0),
+            (-0.7 * MU0, 0.0, 0.0),
+            (0.0, 0.8 * MU0, 0.0),
+            (0.0, -0.8 * MU0, 0.0),
+            (0.0, 0.0, 0.9 * MU0),
+            (0.0, 0.0, -0.9 * MU0),
+        ];
+
+        for mask in masks {
+            for (interfacial_dmi, rotated_interfacial_dmi, bulk_dmi) in dmi_values {
+                let problem = ExchangeLlgProblem::with_terms_and_mask(
+                    grid,
+                    CellSize::new(1.0, 1.5, 0.75).expect("valid cell size"),
+                    MaterialParameters::new(2.0, 0.8 * MU0, 0.2).expect("valid material"),
+                    LlgConfig::new(1.0, TimeIntegrator::Heun).expect("valid llg config"),
+                    EffectiveFieldTerms {
+                        exchange: false,
+                        demag: false,
+                        interfacial_dmi: Some(interfacial_dmi),
+                        rotated_interfacial_dmi: Some(rotated_interfacial_dmi),
+                        bulk_dmi: Some(bulk_dmi),
+                        ..Default::default()
+                    },
+                    mask.clone(),
+                )
+                .expect("DMI problem should build");
+                let magnetization = (0..grid.cell_count())
+                    .map(|flat| {
+                        let x = flat % grid.nx;
+                        let y = (flat / grid.nx) % grid.ny;
+                        let z = flat / (grid.nx * grid.ny);
+                        [
+                            0.3 + 0.11 * x as f64 - 0.07 * z as f64,
+                            -0.2 + 0.13 * y as f64 + 0.05 * z as f64,
+                            0.4 - 0.09 * x as f64 + 0.08 * y as f64,
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                let variation = (0..grid.cell_count())
+                    .map(|flat| {
+                        let active = mask.as_ref().is_none_or(|mask| mask[flat]);
+                        if !active {
+                            return [0.0, 0.0, 0.0];
+                        }
+                        let x = flat % grid.nx;
+                        let y = (flat / grid.nx) % grid.ny;
+                        [
+                            0.17 - 0.03 * x as f64,
+                            -0.11 + 0.02 * y as f64,
+                            0.07 + 0.05 * (flat / (grid.nx * grid.ny)) as f64,
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                let interfacial_field = problem.interfacial_dmi_field(&magnetization);
+                let rotated_field = problem.rotated_interfacial_dmi_field(&magnetization);
+                let bulk_field = problem.bulk_dmi_field(&magnetization);
+                let predicted = -problem.material.saturation_magnetisation
+                    * MU0
+                    * problem.cell_size.volume()
+                    * interfacial_field
+                        .iter()
+                        .zip(&rotated_field)
+                        .zip(&bulk_field)
+                        .zip(&variation)
+                        .map(|(((interfacial, rotated), bulk), variation)| {
+                            dot(add(add(*interfacial, *rotated), *bulk), *variation)
+                        })
+                        .sum::<f64>();
+                let epsilon = 1.0e-7;
+                let plus = magnetization
+                    .iter()
+                    .zip(&variation)
+                    .map(|(m, variation)| add(*m, scale(*variation, epsilon)))
+                    .collect::<Vec<_>>();
+                let minus = magnetization
+                    .iter()
+                    .zip(&variation)
+                    .map(|(m, variation)| add(*m, scale(*variation, -epsilon)))
+                    .collect::<Vec<_>>();
+                let finite_difference = (problem.dmi_energy_from_vectors(&plus)
+                    - problem.dmi_energy_from_vectors(&minus))
+                    / (2.0 * epsilon);
+                let tolerance = 1.0e-9_f64.max(predicted.abs() * 1.0e-8);
+                assert!(
+                    (finite_difference - predicted).abs() <= tolerance,
+                    "DMI directional derivative mismatch: finite_difference={finite_difference:.16e}, predicted={predicted:.16e}, tolerance={tolerance:.3e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reusable_fdm_buffers_reject_layout_changes_without_mutating_state() {
+        let grid = GridShape::new(2, 1, 1).expect("grid");
+        let mut problem = ExchangeLlgProblem::with_terms(
+            grid,
+            CellSize::new(1.0, 1.0, 1.0).expect("cell size"),
+            MaterialParameters::new(1.0, 1.0e-30, 0.1).expect("material"),
+            LlgConfig::new(1.0, TimeIntegrator::Heun).expect("LLG"),
+            EffectiveFieldTerms {
+                exchange: false,
+                demag: false,
+                ..Default::default()
+            },
+        );
+        let mut state = problem.uniform_state([1.0, 0.0, 0.0]).expect("state");
+        let mut workspace = problem.create_workspace();
+        let mut buffers = problem.create_integrator_buffers();
+        problem
+            .step_with_buffers_evaluation(
+                &mut state,
+                1.0e-3,
+                &mut workspace,
+                &mut buffers,
+                EvaluationRequest::Minimal,
+            )
+            .expect("initial SoA-capable step");
+        let digest_before = state.transactional_state_digest();
+
+        problem.alpha_field = Some(vec![0.1; grid.cell_count()]);
+        let error = problem
+            .step_with_buffers_evaluation(
+                &mut state,
+                1.0e-3,
+                &mut workspace,
+                &mut buffers,
+                EvaluationRequest::Minimal,
+            )
+            .expect_err("layout change must fail closed");
+        assert_eq!(error.code(), EngineErrorCode::CapabilityUnavailable);
+        assert!(error.to_string().contains("state layout changed"));
+        assert_eq!(state.transactional_state_digest(), digest_before);
     }
 
     #[test]
@@ -1212,6 +1858,33 @@ mod tests {
         assert_eq!(report.max_torque_Apm, 0.0);
         assert!(report.max_rhs_all_amplitude > 0.0);
         assert!(report.max_torque_all_Apm > 0.0);
+    }
+
+    #[test]
+    fn soa_rhs_masks_frozen_spins_like_aos() {
+        let mut problem = zeeman_problem([0.0, 0.0, 1.0]);
+        let magnetization = vec![[1.0, 0.0, 0.0]; 2];
+        let mut state = problem
+            .new_state(magnetization.clone())
+            .expect("state should build");
+        problem
+            .capture_frozen_spins_at_activation(
+                &resolved_frozen_spins(vec![true, false]),
+                &mut state,
+            )
+            .expect("frozen-spin activation should succeed");
+
+        let h_eff = vec![[0.0, 0.0, 1.0]; 2];
+        let mut aos_rhs = vec![[0.0; 3]; 2];
+        problem.llg_rhs_from_fields_with_direct_torques_into(&magnetization, &h_eff, &mut aos_rhs);
+        let magnetization_soa = VectorFieldSoA::from_aos(&magnetization);
+        let h_eff_soa = VectorFieldSoA::from_aos(&h_eff);
+        let mut soa_rhs = VectorFieldSoA::zeros(2);
+        problem.llg_rhs_soa_into(&magnetization_soa, &h_eff_soa, &mut soa_rhs);
+
+        assert_eq!(aos_rhs, soa_rhs.gather_to_aos());
+        assert_eq!(aos_rhs[0], [0.0; 3]);
+        assert_ne!(aos_rhs[1], [0.0; 3]);
     }
 
     #[test]
@@ -1737,6 +2410,12 @@ mod tests {
             assert_eq!(soa_report.dt_used, dt);
             assert_eq!(soa_report.time_seconds, dt);
             assert_eq!(soa_report.suggested_next_dt, None);
+            assert_step_report_close(soa_report, aos_report, 1e-12);
+            assert_vector_close(
+                soa.magnetization().gather_to_aos()[0],
+                aos.magnetization()[0],
+                1e-12,
+            );
         }
     }
 

@@ -209,6 +209,8 @@ bool gpu_state_upload_mesh_geometry(
 
 bool gpu_state_upload_frozen_spins(
     FemGpuState &state,
+    const uint8_t *magnetic_node_mask,
+    uint64_t magnetic_node_mask_len,
     const uint8_t *frozen_mask,
     uint64_t frozen_mask_len,
     const double *frozen_reference_xyz,
@@ -231,7 +233,12 @@ bool gpu_state_upload_exchange_legacy_sparse(
     const double *inv_lumped_mass,
     uint64_t inv_lumped_mass_len,
     TransferAudit &audit,
-    std::string &error);
+    std::string &error,
+    const uint32_t *periodic_reduced_node = nullptr,
+    uint64_t periodic_reduced_node_len = 0,
+    const uint32_t *periodic_representative_nodes = nullptr,
+    uint64_t periodic_representative_nodes_len = 0,
+    uint64_t periodic_reduced_node_count = 0);
 
 void gpu_state_destroy(FemGpuState &state);
 

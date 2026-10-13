@@ -3,19 +3,27 @@
 //! This remains the calibration baseline for terms that are not yet wired
 //! into the native CUDA backend.
 
+mod fft_backend;
+
+#[cfg(test)]
+pub(crate) use fft_backend::resolve_cpu_fft_backend_for_demag;
+pub(crate) use fft_backend::{
+    resolve_cpu_fft_backend_name_for_demag, resolve_cpu_fft_execution_for_demag,
+};
+
 use fullmag_engine::{
     magnetoelastic::{MagnetoelasticParams, PrescribedStrainField},
     AdaptiveStepConfig, AxisBoundary, CellSize, CubicAnisotropyConfig, EffectiveFieldTerms,
     EngineError, EngineErrorCode, EvaluationRequest, ExchangeLlgProblem, ExchangeLlgState,
-    ExchangeLlgStateSoA, ExternalStageTerms, FdmBoundaryPolicy, FftWorkspace, GridShape,
-    IntegratorBuffers, LlgConfig, MagnetoelasticTermConfig, MaterialParameters,
-    OerstedCylinderConfig, RegionalFieldDriveTerm, ResolvedFdmPeriodicWorkspace,
-    SlonczewskiSttConfig, SotConfig, SotFormula, StepReport, TimeIntegrator,
-    UniaxialAnisotropyConfig, Vector3, ZhangLiFormula, ZhangLiSttConfig,
+    ExchangeLlgStateSoA, ExternalStageTerms, FdmBoundaryPolicy, FdmCpuSolverCheckpointV1,
+    FftWorkspace, GridShape, IntegratorBuffers, LlgConfig, MagnetoelasticTermConfig,
+    MaterialParameters, OerstedCylinderConfig, ProjectionPolicy, RegionalFieldDriveTerm,
+    ResolvedFdmPeriodicWorkspace, SlonczewskiSttConfig, SotConfig, SotFormula, StepReport,
+    TimeIntegrator, UniaxialAnisotropyConfig, Vector3, ZhangLiFormula, ZhangLiSttConfig,
 };
 use fullmag_ir::{
-    ExecutionPrecision, FdmPlanIR, IntegratorChoice, OutputIR, RelaxationAlgorithmIR,
-    RelaxationControlIR, StageCompletionIR,
+    AdaptiveTimeStepIR, ExecutionPrecision, FdmPlanIR, FdmProjectionPolicyIR, IntegratorChoice,
+    OutputIR, RelaxationAlgorithmIR, RelaxationControlIR, StageCompletionIR,
 };
 
 use super::spin_transport::{
@@ -47,13 +55,175 @@ use crate::schedules::{
     OutputSchedule,
 };
 use crate::types::{
-    ExecutedRun, ExecutionProvenance, FieldSnapshot, LivePreviewRequest, LiveStepConsumer,
-    RunError, RunResult, RunStatus, StateObservables, StepAction, StepStats, StepUpdate,
+    ExecutedRun, ExecutionProvenance, FdmCpuEvaluationTelemetry, FdmCpuStateLayoutProvenance,
+    FdmCpuStepTransactionTelemetry, FdmFftRuntimeTelemetry, FieldSnapshot, LivePreviewRequest,
+    LiveStepConsumer, RunError, RunResult, RunStatus, StateObservables, StepAction, StepStats,
+    StepUpdate,
 };
+#[cfg(test)]
+use crate::FDM_CPU_ACCEPTED_STATE_SNAPSHOT_SCHEMA;
+use crate::{FdmCpuAcceptedStateSnapshotV1, FDM_CPU_ACCEPTED_STATE_SNAPSHOT_FILE};
 
-use std::{env, time::Instant};
+use sha2::{Digest, Sha256};
+use std::time::Instant;
 
-pub(crate) const CPU_FFT_BACKEND_ENV: &str = "FULLMAG_CPU_FFT_BACKEND";
+const MAX_COUPLED_ADAPTIVE_REJECTIONS: u64 = 50;
+const FDM_ABM3_RUNNER_CHECKPOINT_SCHEMA: &str = "fullmag.fdm.cpu.abm3-checkpoint.v1";
+fn fdm_cpu_accepted_state_snapshot(
+    plan: &FdmPlanIR,
+    accepted_step: u64,
+    time_seconds: f64,
+    dt_seconds: Option<f64>,
+    transactional_state_digest: &str,
+    magnetization: &[[f64; 3]],
+) -> Result<Option<FdmCpuAcceptedStateSnapshotV1>, RunError> {
+    // The transactional CPU digest covers magnetization, integrator memory,
+    // and the accepted thermal RNG interval. Coupled transport and Frozen
+    // Spins own additional primary carriers, so this lane must stay unavailable
+    // until those carriers are supplied explicitly.
+    if !plan.spin_transport_plans.is_empty() || plan.frozen_spins.is_some() {
+        return Ok(None);
+    }
+    let clock = crate::ObservationClock {
+        accepted_step,
+        time_seconds,
+        dt_seconds,
+    };
+    FdmCpuAcceptedStateSnapshotV1::from_transactional_state(
+        clock,
+        transactional_state_digest,
+        magnetization,
+    )
+    .map(Some)
+    .map_err(|error| RunError {
+        message: format!("materializing FDM CPU accepted state snapshot: {error}"),
+    })
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FdmAbm3RunnerCheckpointV1 {
+    schema: String,
+    plan_sha256: String,
+    step: u64,
+    last_dt: f64,
+    thermal_seed: u64,
+    thermal_counter: u64,
+    solver: FdmCpuSolverCheckpointV1,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    frozen_spins: Option<FrozenSpinsCheckpointV1>,
+}
+
+fn fdm_abm3_plan_sha256(plan: &FdmPlanIR) -> Result<String, RunError> {
+    let bytes = serde_json::to_vec(plan).map_err(|error| RunError {
+        message: format!("serializing FDM plan for ABM3 checkpoint identity: {error}"),
+    })?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn fdm_abm3_checkpoint_value(
+    plan: &FdmPlanIR,
+    problem: &ExchangeLlgProblem,
+    state: &ExchangeLlgState,
+    state_soa: Option<&ExchangeLlgStateSoA>,
+    step: u64,
+    last_dt: f64,
+) -> Result<Option<serde_json::Value>, RunError> {
+    if plan.integrator != Some(IntegratorChoice::Abm3) {
+        return Ok(None);
+    }
+    let solver = state_soa
+        .map(ExchangeLlgStateSoA::to_aos)
+        .unwrap_or_else(|| state.clone())
+        .solver_checkpoint();
+    serde_json::to_value(FdmAbm3RunnerCheckpointV1 {
+        schema: FDM_ABM3_RUNNER_CHECKPOINT_SCHEMA.to_string(),
+        plan_sha256: fdm_abm3_plan_sha256(plan)?,
+        step,
+        last_dt,
+        thermal_seed: problem.thermal_seed,
+        thermal_counter: problem.thermal_step(),
+        solver,
+        frozen_spins: frozen_spins_checkpoint(
+            plan,
+            problem,
+            state,
+            step,
+            state.time_seconds,
+            last_dt,
+        )?,
+    })
+    .map(Some)
+    .map_err(|error| RunError {
+        message: format!("serializing FDM CPU ABM3 checkpoint: {error}"),
+    })
+}
+
+fn stage_endpoint_roundoff(stage_end_time_s: f64, dt_s: f64) -> f64 {
+    32.0 * f64::EPSILON
+        * stage_end_time_s
+            .abs()
+            .max(dt_s.abs())
+            .max(f64::MIN_POSITIVE)
+}
+
+fn stage_endpoint_reached(current_time_s: f64, stage_end_time_s: f64, dt_s: f64) -> bool {
+    current_time_s >= stage_end_time_s - stage_endpoint_roundoff(stage_end_time_s, dt_s)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum CoupledAdaptiveDecision {
+    Accepted(f64),
+    Retry(f64),
+    DtMinExhausted,
+    NonFinite,
+}
+
+fn coupled_adaptive_dt_min_reached(dt: f64, dt_min: f64) -> bool {
+    dt <= dt_min || (dt - dt_min).abs() <= dt_min * (4.0 * f64::EPSILON)
+}
+
+fn decide_coupled_adaptive_step(
+    error: f64,
+    dt: f64,
+    adaptive: &AdaptiveTimeStepIR,
+) -> CoupledAdaptiveDecision {
+    if !error.is_finite() {
+        return CoupledAdaptiveDecision::NonFinite;
+    }
+
+    let dt_max = adaptive.dt_max.unwrap_or(f64::INFINITY);
+    let factor = if error == 0.0 {
+        adaptive.growth_limit
+    } else {
+        (adaptive.safety * error.powf(-1.0 / 3.0))
+            .clamp(adaptive.shrink_limit, adaptive.growth_limit)
+    };
+    let mut next_dt = (dt * factor).clamp(adaptive.dt_min, dt_max);
+    if error <= 1.0 {
+        return if next_dt.is_finite() {
+            CoupledAdaptiveDecision::Accepted(next_dt)
+        } else {
+            CoupledAdaptiveDecision::NonFinite
+        };
+    }
+    if coupled_adaptive_dt_min_reached(dt, adaptive.dt_min) {
+        return CoupledAdaptiveDecision::DtMinExhausted;
+    }
+    if next_dt >= dt {
+        let decreased = dt.next_down();
+        if decreased > 0.0 && decreased >= adaptive.dt_min {
+            next_dt = decreased;
+        } else {
+            return CoupledAdaptiveDecision::DtMinExhausted;
+        }
+    }
+    if next_dt.is_finite() {
+        CoupledAdaptiveDecision::Retry(next_dt)
+    } else {
+        CoupledAdaptiveDecision::NonFinite
+    }
+}
 
 #[cfg(test)]
 thread_local! {
@@ -89,58 +259,6 @@ fn increment_observe_state_calls() {
 #[cfg(test)]
 fn increment_direct_h_eff_assembly_calls() {
     DIRECT_H_EFF_ASSEMBLIES.with(|calls| calls.set(calls.get() + 1));
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CpuFftBackend {
-    RustFft,
-}
-
-impl CpuFftBackend {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            CpuFftBackend::RustFft => "rustfft",
-        }
-    }
-}
-
-pub(crate) fn requested_cpu_fft_backend_from_env() -> Option<String> {
-    env::var(CPU_FFT_BACKEND_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-pub(crate) fn resolve_cpu_fft_backend_for_demag(
-    demag_enabled: bool,
-    requested: Option<&str>,
-) -> Result<Option<CpuFftBackend>, RunError> {
-    if !demag_enabled {
-        return Ok(None);
-    }
-
-    let normalized = requested
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("auto")
-        .to_ascii_lowercase();
-
-    match normalized.as_str() {
-        "auto" | "rustfft" => Ok(Some(CpuFftBackend::RustFft)),
-        other => Err(RunError {
-            message: format!(
-                "{CPU_FFT_BACKEND_ENV}='{other}' is not available for CPU FDM demag in this build; supported CPU FDM FFT backends: rustfft"
-            ),
-        }),
-    }
-}
-
-pub(crate) fn resolve_cpu_fft_backend_name_for_demag(
-    demag_enabled: bool,
-) -> Result<Option<String>, RunError> {
-    let requested = requested_cpu_fft_backend_from_env();
-    resolve_cpu_fft_backend_for_demag(demag_enabled, requested.as_deref())
-        .map(|backend| backend.map(|backend| backend.as_str().to_string()))
 }
 
 /// Build a `ZhangLiSttConfig` from plan fields if ZL STT is requested.
@@ -352,11 +470,20 @@ pub(crate) fn resolved_antenna_zeeman_field_for_count(
     sample_count: usize,
     time_seconds: f64,
 ) -> Vec<Vector3> {
-    crate::antenna_fields::combined_antenna_zeeman_mask_field_at_time(
+    let mut field = crate::antenna_fields::combined_antenna_zeeman_mask_field_at_time(
         &plan.antenna_zeeman_masks,
         sample_count,
         time_seconds,
-    )
+    );
+    for term in resolved_solved_antenna_drives(plan, plan.time_stage.start_time_s) {
+        let multiplier = term.multiplier_at(time_seconds);
+        for (target, basis) in field.iter_mut().zip(&term.basis_field) {
+            target[0] += basis[0] * multiplier;
+            target[1] += basis[1] * multiplier;
+            target[2] += basis[2] * multiplier;
+        }
+    }
+    field
 }
 
 pub(crate) fn resolved_oersted_visual_field_for_count(
@@ -399,16 +526,61 @@ pub(crate) fn resolved_regional_field_drives(
     plan: &FdmPlanIR,
     stage_start_time_s: f64,
 ) -> Vec<RegionalFieldDriveTerm> {
-    plan.regional_field_drive_bases
+    let mut drives: Vec<_> = plan
+        .regional_field_drive_bases
         .iter()
         .map(|resolved| RegionalFieldDriveTerm {
             basis_field: resolved.field_xyz.clone(),
             waveform: resolved.drive.waveform.clone(),
             time_offset_s: match resolved.drive.time_origin {
-                fullmag_ir::FieldTimeOriginIR::StageLocal => stage_start_time_s,
+                fullmag_ir::FieldTimeOriginIR::StageLocal => plan
+                    .time_stage
+                    .waveform_origin_time_s
+                    .unwrap_or(stage_start_time_s),
                 fullmag_ir::FieldTimeOriginIR::Absolute => 0.0,
             },
             enabled: resolved.drive.enabled,
+        })
+        .collect();
+    drives.extend(resolved_solved_antenna_drives(plan, stage_start_time_s));
+    drives
+}
+
+fn resolved_solved_antenna_drives(
+    plan: &FdmPlanIR,
+    stage_start_time_s: f64,
+) -> Vec<RegionalFieldDriveTerm> {
+    use fullmag_ir::FieldTimeOriginIR;
+
+    plan.solved_antenna_drive_bases
+        .iter()
+        .filter(|basis| {
+            basis.drive.activation.is_active_for(
+                plan.time_stage.study_kind,
+                plan.time_stage.active_stage_id.as_deref(),
+            )
+        })
+        .map(|basis| RegionalFieldDriveTerm {
+            basis_field: basis
+                .field_xyz_apm_per_a
+                .iter()
+                .map(|value| {
+                    [
+                        value[0] * basis.drive.peak_current_a,
+                        value[1] * basis.drive.peak_current_a,
+                        value[2] * basis.drive.peak_current_a,
+                    ]
+                })
+                .collect(),
+            waveform: basis.drive.waveform.clone(),
+            time_offset_s: match basis.drive.time_origin {
+                FieldTimeOriginIR::StageLocal => plan
+                    .time_stage
+                    .waveform_origin_time_s
+                    .unwrap_or(stage_start_time_s),
+                FieldTimeOriginIR::Absolute => 0.0,
+            },
+            enabled: true,
         })
         .collect()
 }
@@ -417,7 +589,7 @@ pub(crate) fn snapshot_preview(
     plan: &FdmPlanIR,
     request: &LivePreviewRequest,
 ) -> Result<crate::LivePreviewField, RunError> {
-    resolve_cpu_fft_backend_name_for_demag(plan.enable_demag)?;
+    resolve_cpu_fft_backend_name_for_demag(plan.enable_demag, plan.fft.as_ref())?;
     let (problem, state) = build_snapshot_problem_and_state(plan)?;
     snapshot_preview_from_state(
         &problem,
@@ -461,7 +633,7 @@ pub(crate) fn snapshot_vector_fields(
     quantities: &[&str],
     request: &LivePreviewRequest,
 ) -> Result<Vec<crate::LivePreviewField>, RunError> {
-    resolve_cpu_fft_backend_name_for_demag(plan.enable_demag)?;
+    resolve_cpu_fft_backend_name_for_demag(plan.enable_demag, plan.fft.as_ref())?;
     let (mut problem, state) = build_snapshot_problem_and_state(plan)?;
     problem.terms.per_node_field = resolved_per_node_external_field(plan, state.time_seconds);
     let antenna_field = resolved_antenna_zeeman_field(plan, state.time_seconds);
@@ -656,8 +828,22 @@ fn materialize_reference_problem(
         })
 }
 
+fn resolved_projection_policy(plan: &FdmPlanIR) -> FdmProjectionPolicyIR {
+    plan.projection_policy.unwrap_or_default()
+}
+
+fn engine_projection_policy(policy: FdmProjectionPolicyIR) -> ProjectionPolicy {
+    match policy {
+        FdmProjectionPolicyIR::UnitSphere => ProjectionPolicy::UnitSphere,
+    }
+}
+
 fn build_reference_problem(plan: &FdmPlanIR) -> Result<ExchangeLlgProblem, RunError> {
     validate_single_grid_budget(plan)?;
+    crate::antenna_fields::validate_fdm_antenna_sample_counts(
+        plan,
+        plan.initial_magnetization.len(),
+    )?;
     let grid = GridShape::new(
         plan.grid.cells[0] as usize,
         plan.grid.cells[1] as usize,
@@ -685,11 +871,13 @@ fn build_reference_problem(plan: &FdmPlanIR) -> Result<ExchangeLlgProblem, RunEr
         IntegratorChoice::Rk45 => TimeIntegrator::RK45,
         IntegratorChoice::Abm3 => TimeIntegrator::ABM3,
     };
+    let projection_policy = engine_projection_policy(resolved_projection_policy(plan));
     let pure_damping_relax = llg_overdamped_uses_pure_damping(plan.relaxation.as_ref());
     let mut dynamics = LlgConfig::new(plan.gyromagnetic_ratio, integrator)
         .map_err(|e| RunError {
             message: format!("LLG: {}", e),
         })?
+        .with_projection_policy(projection_policy)
         .with_precession_enabled(!pure_damping_relax);
     if let Some(adaptive) = plan.adaptive_timestep.as_ref() {
         dynamics = dynamics.with_adaptive(AdaptiveStepConfig {
@@ -746,6 +934,7 @@ fn build_reference_problem(plan: &FdmPlanIR) -> Result<ExchangeLlgProblem, RunEr
                         .unwrap_or([0.0, 1.0, 0.0]),
                 }),
             interfacial_dmi: plan.interfacial_dmi,
+            rotated_interfacial_dmi: plan.rotated_interfacial_dmi,
             bulk_dmi: plan.bulk_dmi,
             zhang_li_stt: build_zl_stt(plan),
             slonczewski_stt: build_slon_stt(plan, plan.cell_size[2]),
@@ -812,13 +1001,20 @@ fn apply_cpu_adaptive_attempt_telemetry(
 pub(crate) fn build_snapshot_problem_and_state(
     plan: &FdmPlanIR,
 ) -> Result<(ExchangeLlgProblem, ExchangeLlgState), RunError> {
-    let problem = build_reference_problem(plan)?;
+    let mut problem = build_reference_problem(plan)?;
     let mut state = problem
         .new_state(plan.initial_magnetization.clone())
         .map_err(|e| RunError {
             message: format!("State: {}", e),
         })?;
     state.time_seconds = plan.time_stage.start_time_s;
+    if let Some(frozen_plan) = plan.frozen_spins.as_ref() {
+        problem
+            .capture_frozen_spins_at_activation(frozen_plan, &mut state)
+            .map_err(|error| RunError {
+                message: format!("Frozen Spins snapshot activation: {error}"),
+            })?;
+    }
     Ok((problem, state))
 }
 
@@ -1059,38 +1255,50 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
 
     let (mut problem, mut state) = build_snapshot_problem_and_state(plan)?;
     let mut restored_frozen_checkpoint = None;
-    let mut restored_checkpoint = if let Some(value) = coupled_checkpoint {
-        if value.get("schema").and_then(serde_json::Value::as_str)
-            == Some(FROZEN_SPINS_CHECKPOINT_SCHEMA)
-        {
-            restored_frozen_checkpoint = Some(
-                serde_json::from_value::<FrozenSpinsCheckpointV1>(value).map_err(|error| {
-                    RunError {
-                        message: format!("invalid Frozen Spins checkpoint payload: {error}"),
-                    }
-                })?,
-            );
-            None
+    let mut restored_abm3_checkpoint = None;
+    let mut restored_checkpoint =
+        if let Some(value) = coupled_checkpoint {
+            if value.get("schema").and_then(serde_json::Value::as_str)
+                == Some(FDM_ABM3_RUNNER_CHECKPOINT_SCHEMA)
+            {
+                let checkpoint = serde_json::from_value::<FdmAbm3RunnerCheckpointV1>(value)
+                    .map_err(|error| RunError {
+                        message: format!("invalid FDM CPU ABM3 checkpoint payload: {error}"),
+                    })?;
+                restored_frozen_checkpoint = checkpoint.frozen_spins.clone();
+                restored_abm3_checkpoint = Some(checkpoint);
+                None
+            } else if value.get("schema").and_then(serde_json::Value::as_str)
+                == Some(FROZEN_SPINS_CHECKPOINT_SCHEMA)
+            {
+                restored_frozen_checkpoint = Some(
+                    serde_json::from_value::<FrozenSpinsCheckpointV1>(value).map_err(|error| {
+                        RunError {
+                            message: format!("invalid Frozen Spins checkpoint payload: {error}"),
+                        }
+                    })?,
+                );
+                None
+            } else {
+                super::spin_transport::validate_coupled_m3_checkpoint_value(
+                    &value,
+                    plan.grid
+                        .cells
+                        .iter()
+                        .map(|cells| *cells as usize)
+                        .product(),
+                )?;
+                Some(
+                    serde_json::from_value::<FdmCoupledCheckpoint>(value).map_err(|error| {
+                        RunError {
+                            message: format!("invalid coupled M3 checkpoint payload: {error}"),
+                        }
+                    })?,
+                )
+            }
         } else {
-            super::spin_transport::validate_coupled_m3_checkpoint_value(
-                &value,
-                plan.grid
-                    .cells
-                    .iter()
-                    .map(|cells| *cells as usize)
-                    .product(),
-            )?;
-            Some(
-                serde_json::from_value::<FdmCoupledCheckpoint>(value).map_err(|error| {
-                    RunError {
-                        message: format!("invalid coupled M3 checkpoint payload: {error}"),
-                    }
-                })?,
-            )
-        }
-    } else {
-        None
-    };
+            None
+        };
     let mut resume_timestep = None;
     let mut resume_previous_timestep = None;
     let mut resume_step_count = None;
@@ -1119,6 +1327,11 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
         let frozen_plan = plan.frozen_spins.as_ref().ok_or_else(|| RunError {
             message: "Frozen Spins checkpoint requires a Frozen Spins plan".to_string(),
         })?;
+        checkpoint
+            .validate_problem_sha256(&fdm_abm3_plan_sha256(plan)?)
+            .map_err(|error| RunError {
+                message: format!("Frozen Spins ExactResume problem identity: {error}"),
+            })?;
         checkpoint
             .validate_for_plan(frozen_plan)
             .map_err(|error| RunError {
@@ -1149,6 +1362,64 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                 message: format!("frozen spins activation: {error}"),
             })?;
     }
+    if let Some(checkpoint) = restored_abm3_checkpoint.take() {
+        if plan.integrator != Some(IntegratorChoice::Abm3) {
+            return Err(RunError {
+                message: "FDM CPU ABM3 checkpoint requires an ABM3 execution plan".to_string(),
+            });
+        }
+        if spin_transport.is_some() {
+            return Err(RunError {
+                message: "FDM CPU ABM3 checkpoint cannot restore an unqualified spin-transport combination".to_string(),
+            });
+        }
+        if plan.frozen_spins.is_some() != checkpoint.frozen_spins.is_some() {
+            return Err(RunError {
+                message:
+                    "FDM CPU ABM3 checkpoint Frozen Spins payload does not match the execution plan"
+                        .to_string(),
+            });
+        }
+        let expected_plan_sha256 = fdm_abm3_plan_sha256(plan)?;
+        if checkpoint.plan_sha256 != expected_plan_sha256 {
+            return Err(RunError {
+                message: format!(
+                    "FDM CPU ABM3 checkpoint plan identity mismatch: checkpoint={}, expected={expected_plan_sha256}",
+                    checkpoint.plan_sha256
+                ),
+            });
+        }
+        if checkpoint.thermal_seed != problem.thermal_seed {
+            return Err(RunError {
+                message:
+                    "FDM CPU ABM3 checkpoint thermal RNG seed does not match the planned problem"
+                        .to_string(),
+            });
+        }
+        if checkpoint.step > 0 && (!checkpoint.last_dt.is_finite() || checkpoint.last_dt <= 0.0) {
+            return Err(RunError {
+                message: "FDM CPU ABM3 checkpoint last_dt must be finite and positive after an accepted step"
+                    .to_string(),
+            });
+        }
+        if !checkpoint.solver.abm3.rhs_history.is_empty()
+            && checkpoint.last_dt != checkpoint.solver.abm3.last_dt
+        {
+            return Err(RunError {
+                message: "FDM CPU ABM3 checkpoint runner last_dt disagrees with solver history"
+                    .to_string(),
+            });
+        }
+        state
+            .restore_solver_checkpoint(checkpoint.solver)
+            .map_err(|error| RunError {
+                message: format!("restoring FDM CPU ABM3 solver checkpoint: {error}"),
+            })?;
+        problem.restore_thermal_step(checkpoint.thermal_counter);
+        resume_timestep = (checkpoint.last_dt > 0.0).then_some(checkpoint.last_dt);
+        resume_previous_timestep = resume_timestep;
+        resume_step_count = Some(checkpoint.step);
+    }
     let all_active_dofs_frozen = problem
         .frozen_spins()
         .is_some_and(fullmag_engine::FrozenSpinsState::all_active_dofs_frozen);
@@ -1167,6 +1438,20 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
     let mut last_solver_dt = resume_previous_timestep.unwrap_or(0.0);
     let mut steps: Vec<StepStats> = Vec::new();
     let mut step_count: u64 = resume_step_count.unwrap_or(0);
+    let mut cpu_rejected_attempt_count = 0u64;
+    let mut cpu_rollback_count = 0u64;
+    let mut accepted_state_publication_count = 0u64;
+    let mut accepted_state_publication_copy_bytes = 0u64;
+    let mut accepted_state_publication_full_field_copy_count = 0u64;
+    let mut scheduled_field_snapshot_metrics = FieldCopyMetrics::default();
+    let mut live_field_snapshot_metrics = FieldCopyMetrics::default();
+    let mut cpu_evaluation_telemetry = FdmCpuEvaluationTelemetry {
+        schema_version: "fullmag.fdm.cpu.evaluation.v1".to_string(),
+        minimal_step_count: 0,
+        full_step_count: 0,
+        minimal_step_wall_time_ns: 0,
+        full_step_wall_time_ns: 0,
+    };
     let mut final_coupled_checkpoint = None;
     // Keep the resolved Frozen Spins state in the live update stream as an
     // opaque restart payload.  This is the only safe way for session pause
@@ -1180,11 +1465,16 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
         state.time_seconds,
         last_solver_dt,
     )?;
-    let fft_backend = resolve_cpu_fft_backend_name_for_demag(plan.enable_demag)?;
+    let fdm_fft_execution =
+        resolve_cpu_fft_execution_for_demag(plan.enable_demag, plan.fft.as_ref())?;
+    let fft_backend = fdm_fft_execution
+        .as_ref()
+        .map(|execution| execution.executed_backend.clone());
     let mut provenance = ExecutionProvenance {
         execution_engine: "cpu_reference".to_string(),
         precision: "double".to_string(),
         transport_modules: super::spin_transport::fdm_transport_execution_provenance(plan),
+        fdm_fft_execution,
         demag_operator_kind: if plan.enable_demag {
             Some("tensor_fft_newell".to_string())
         } else {
@@ -1208,6 +1498,16 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
         },
         ..Default::default()
     };
+    let use_soa_state = spin_transport.is_none() && problem.soa_fast_path_supported();
+    let projection_policy = resolved_projection_policy(plan);
+    let mut state_layout = FdmCpuStateLayoutProvenance::from_problem(
+        &problem,
+        use_soa_state,
+        spin_transport.is_some().then_some("coupled_spin_transport"),
+    );
+    state_layout.projection_policy = Some(projection_policy.as_str().to_string());
+    state_layout.projection_realization = Some(projection_policy.realization_version().to_string());
+    provenance.fdm_cpu_state_layout = Some(state_layout);
     apply_energy_minimizer_provenance(&mut provenance, plan.relaxation.as_ref());
     if is_direct_minimization && problem.soa_fast_path_supported() {
         provenance.energy_minimizer_realization =
@@ -1224,9 +1524,11 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
 
     let mut scalar_schedules = collect_scalar_schedules(outputs)?;
     let mut field_schedules = collect_field_schedules(outputs)?;
-    let time_events = crate::time_events::build_resolved_stage_event_schedule(
+    let time_events = crate::time_events::build_resolved_stage_event_schedule_with_origin(
         &plan.field_drives,
+        &plan.solved_antenna_drive_bases,
         plan.time_stage.start_time_s,
+        plan.time_stage.waveform_origin_time_s(),
         stage_end_time_s,
         outputs,
         crate::schedules::OUTPUT_TIME_TOLERANCE,
@@ -1244,7 +1546,7 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
             &mut artifacts,
         )?;
     } else {
-        record_due_outputs(
+        scheduled_field_snapshot_metrics.add(record_due_outputs(
             &problem,
             &state,
             Some(resolved_antenna_zeeman_field(plan, state.time_seconds)),
@@ -1256,17 +1558,25 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
             &mut field_schedules,
             &mut steps,
             &mut artifacts,
-        )?;
+        )?);
     }
 
     // --- Create FFT workspace once for the entire simulation ---
     let mut fft_workspace = problem.create_workspace();
     let mut integrator_bufs = problem.create_integrator_buffers();
-    let mut state_soa = if spin_transport.is_none() && problem.soa_fast_path_supported() {
+    let mut state_soa = if use_soa_state {
         Some(state.to_soa())
     } else {
         None
     };
+    let mut final_abm3_checkpoint = fdm_abm3_checkpoint_value(
+        plan,
+        &problem,
+        &state,
+        state_soa.as_ref(),
+        step_count,
+        last_solver_dt,
+    )?;
     let mut direct_minimizer_completion: Option<StageCompletionIR> = None;
     let mut energy_plateau = RelaxationEnergyPlateauWindow::default();
     let mut torque_confirmation = RelaxationTorqueConfirmation::default();
@@ -1380,13 +1690,16 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                 )
             })
             .unwrap_or_default();
-        while !all_active_dofs_frozen && state.time_seconds < stage_end_time_s {
+        while !all_active_dofs_frozen
+            && !stage_endpoint_reached(state.time_seconds, stage_end_time_s, dt)
+        {
             if step_count == 0
                 && live
                     .as_ref()
                     .is_some_and(|consumer| consumer.initial_snapshot)
             {
                 if let Some(live) = live.as_mut() {
+                    let live_materialization_started = Instant::now();
                     let display_selection = live.display_selection.map(|get| get());
                     let preview_due = display_selection
                         .as_ref()
@@ -1434,13 +1747,29 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                     } else {
                         None
                     };
+                    let magnetization = Some(flatten_vectors(state.magnetization()));
+                    let mut live_copy_metrics = FieldCopyMetrics::default();
+                    if let Some(values) = magnetization.as_deref() {
+                        live_copy_metrics.add_f64_payload(values);
+                    }
+                    if let Some(field) = preview_field.as_ref() {
+                        live_copy_metrics.add_f64_payload(&field.vector_field_values);
+                    }
+                    if live_copy_metrics.payload_count > 0 {
+                        live_copy_metrics.wall_time_ns =
+                            live_materialization_started.elapsed().as_nanos() as u64;
+                    }
+                    live_field_snapshot_metrics.add(live_copy_metrics);
+                    apply_step_field_copy_metrics(&mut current_stats, live_copy_metrics);
                     let action = (live.on_step)(StepUpdate {
-                        coupled_checkpoint: final_frozen_checkpoint.clone(),
+                        coupled_checkpoint: final_abm3_checkpoint
+                            .clone()
+                            .or_else(|| final_frozen_checkpoint.clone()),
                         stats: current_stats.clone(),
                         scalar_row_due: preview_due && preview_targets_global_scalar,
                         grid: live.grid,
                         fem_mesh_generation_id: None,
-                        magnetization: Some(flatten_vectors(state.magnetization())),
+                        magnetization,
                         preview_field,
                         cached_preview_fields: None,
                         hysteresis_field_m_t: None,
@@ -1448,6 +1777,7 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                         hysteresis_settle_step_index: None,
                         hysteresis_settle_step_kind: None,
                         hysteresis_settle_step_method: None,
+                        terminal_field_snapshot: false,
                         finished: false,
                     });
                     if preview_due {
@@ -1485,8 +1815,7 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                             + (workflow.accepted_steps().saturating_add(1) as f64) * fixed_dt
                     })
                 });
-            let endpoint_roundoff =
-                32.0 * f64::EPSILON * stage_end_time_s.abs().max(dt.abs()).max(f64::MIN_POSITIVE);
+            let endpoint_roundoff = stage_endpoint_roundoff(stage_end_time_s, dt);
             let dt_step = canonical_fixed_target
                 .filter(|target| *target <= stage_end_time_s + endpoint_roundoff)
                 .and(plan.fixed_timestep)
@@ -1498,6 +1827,12 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                         crate::schedules::OUTPUT_TIME_TOLERANCE,
                     )
                 });
+            let step_evaluation = fdm_step_evaluation_request(
+                plan,
+                state.time_seconds + dt_step,
+                &scalar_schedules,
+                live.as_ref(),
+            );
             if crate::antenna_fields::has_time_varying_antenna_zeeman_masks(
                 &plan.antenna_zeeman_masks,
             ) {
@@ -1505,7 +1840,10 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                     resolved_per_node_external_field(plan, state.time_seconds);
             }
             let wall_start = Instant::now();
-            let previous_magnetization = state.magnetization().to_vec();
+            let previous_magnetization = spin_transport
+                .as_ref()
+                .filter(|workflow| workflow.has_transient())
+                .map(|_| state.magnetization().to_vec());
             let mut report = if let Some(workflow) = spin_transport.as_mut() {
                 let transient = workflow.has_transient();
                 if transient {
@@ -1552,37 +1890,46 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                                 adaptive.atol,
                                 adaptive.rtol,
                             )?;
-                            let factor = if error == 0.0 {
-                                adaptive.growth_limit
-                            } else {
-                                (adaptive.safety * error.powf(-1.0 / 3.0))
-                                    .clamp(adaptive.shrink_limit, adaptive.growth_limit)
-                            };
-                            let next_dt = (attempted_dt * factor)
-                                .max(adaptive.dt_min)
-                                .min(adaptive.dt_max.unwrap_or(f64::INFINITY));
-                            if error <= 1.0 {
-                                *workflow = half_workflow;
-                                workflow.set_step_counters(
-                                    accepted_before.saturating_add(1),
-                                    rejected_before.saturating_add(rejected_trials),
-                                );
-                                workflow.set_error_controller(next_dt, error);
-                                state = half_state;
-                                half_report.dt_used = attempted_dt;
-                                half_report.suggested_next_dt = Some(next_dt);
-                                problem.commit_coupled_imex_ark2_step();
-                                break half_report;
+                            match decide_coupled_adaptive_step(error, attempted_dt, adaptive) {
+                                CoupledAdaptiveDecision::Accepted(next_dt) => {
+                                    *workflow = half_workflow;
+                                    workflow.set_step_counters(
+                                        accepted_before.saturating_add(1),
+                                        rejected_before.saturating_add(rejected_trials),
+                                    );
+                                    workflow.set_error_controller(next_dt, error);
+                                    state = half_state;
+                                    half_report.dt_used = attempted_dt;
+                                    half_report.suggested_next_dt = Some(next_dt);
+                                    problem.commit_coupled_imex_ark2_step();
+                                    break half_report;
+                                }
+                                CoupledAdaptiveDecision::Retry(next_dt) => {
+                                    rejected_trials = rejected_trials.saturating_add(1);
+                                    if rejected_trials >= MAX_COUPLED_ADAPTIVE_REJECTIONS {
+                                        return Err(RunError {
+                                            message: format!(
+                                                "Step {step_count}: [adaptive_retry_limit_exhausted] coupled ARS exceeded {MAX_COUPLED_ADAPTIVE_REJECTIONS} rejected attempts"
+                                            ),
+                                        });
+                                    }
+                                    attempted_dt = next_dt;
+                                }
+                                CoupledAdaptiveDecision::DtMinExhausted => {
+                                    return Err(RunError {
+                                        message: format!(
+                                            "Step {step_count}: [adaptive_dt_min_exhausted] coupled ARS LTE {error:.6e} exceeds 1 at dt_min"
+                                        ),
+                                    });
+                                }
+                                CoupledAdaptiveDecision::NonFinite => {
+                                    return Err(RunError {
+                                        message: format!(
+                                            "Step {step_count}: [non_finite_adaptive_error] coupled ARS LTE is not finite"
+                                        ),
+                                    });
+                                }
                             }
-                            rejected_trials = rejected_trials.saturating_add(1);
-                            if attempted_dt <= adaptive.dt_min {
-                                return Err(RunError {
-                                    message: format!(
-                                        "Step {step_count}: coupled ARS LTE {error:.6e} exceeds 1 at dt_min"
-                                    ),
-                                });
-                            }
-                            attempted_dt = next_dt;
                         }
                     } else {
                         let report = execute_coupled_ars_trial(
@@ -1620,9 +1967,22 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                     dt_step,
                     &mut fft_workspace,
                     &mut integrator_bufs,
+                    step_evaluation,
                 );
                 match result {
-                    Ok(report) => report,
+                    Ok((report, state_copy)) => {
+                        if state_copy.full_field_copy_count > 0 {
+                            accepted_state_publication_count =
+                                accepted_state_publication_count.saturating_add(1);
+                            accepted_state_publication_copy_bytes =
+                                accepted_state_publication_copy_bytes
+                                    .saturating_add(state_copy.copied_bytes);
+                            accepted_state_publication_full_field_copy_count =
+                                accepted_state_publication_full_field_copy_count
+                                    .saturating_add(state_copy.full_field_copy_count);
+                        }
+                        report
+                    }
                     Err(error) => {
                         let primary = RunError {
                             message: format!("Step {}: {}", step_count, error),
@@ -1672,12 +2032,37 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                 report.dt_used = canonical_dt;
             }
             let wall_elapsed = wall_start.elapsed().as_nanos() as u64;
+            match step_evaluation {
+                EvaluationRequest::Minimal => {
+                    cpu_evaluation_telemetry.minimal_step_count = cpu_evaluation_telemetry
+                        .minimal_step_count
+                        .saturating_add(1);
+                    cpu_evaluation_telemetry.minimal_step_wall_time_ns = cpu_evaluation_telemetry
+                        .minimal_step_wall_time_ns
+                        .saturating_add(wall_elapsed);
+                }
+                EvaluationRequest::Full => {
+                    cpu_evaluation_telemetry.full_step_count =
+                        cpu_evaluation_telemetry.full_step_count.saturating_add(1);
+                    cpu_evaluation_telemetry.full_step_wall_time_ns = cpu_evaluation_telemetry
+                        .full_step_wall_time_ns
+                        .saturating_add(wall_elapsed);
+                }
+            }
             step_count += 1;
             last_solver_dt = report.dt_used;
             if let Some(next) = report.suggested_next_dt {
                 dt = next;
             }
             last_step_report = Some(report);
+            final_abm3_checkpoint = fdm_abm3_checkpoint_value(
+                plan,
+                &problem,
+                &state,
+                state_soa.as_ref(),
+                step_count,
+                last_solver_dt,
+            )?;
             let mut latest_stats = StepStats {
                 step: step_count,
                 time: report.time_seconds,
@@ -1700,6 +2085,10 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
             };
             if spin_transport.is_none() {
                 apply_cpu_adaptive_attempt_telemetry(&mut latest_stats, &integrator_bufs, plan);
+                cpu_rejected_attempt_count = cpu_rejected_attempt_count
+                    .saturating_add(u64::from(latest_stats.rejected_attempts));
+                cpu_rollback_count =
+                    cpu_rollback_count.saturating_add(u64::from(latest_stats.rejected_attempts));
                 if matches!(
                     plan.integrator.unwrap_or(IntegratorChoice::Heun),
                     IntegratorChoice::Rk23 | IntegratorChoice::Rk45
@@ -1719,11 +2108,7 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                 }
             }
             apply_frozen_spin_step_telemetry(&mut latest_stats, &problem, state.magnetization());
-            current_stats = latest_stats.clone();
-            // Preserve every accepted adaptive/fixed controller step for the
-            // solver diagnostics trace.  User-visible scalar schedules remain
-            // independent and may be sparse.
-            artifacts.record_solver_step(&latest_stats);
+            apply_abm3_step_telemetry(&mut latest_stats, &report);
 
             final_coupled_checkpoint = spin_transport
                 .as_ref()
@@ -1732,7 +2117,9 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                     workflow
                         .coupled_checkpoint(
                             state.magnetization(),
-                            &previous_magnetization,
+                            previous_magnetization
+                                .as_deref()
+                                .expect("transient checkpoint must retain pre-step magnetization"),
                             report.dt_used,
                             problem.thermal_seed,
                             problem.thermal_step(),
@@ -1754,7 +2141,7 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
             )?;
 
             if !default_scalar_trace || !field_schedules.is_empty() {
-                record_due_outputs(
+                let due_output_metrics = record_due_outputs(
                     &problem,
                     &state,
                     Some(resolved_antenna_zeeman_field(plan, state.time_seconds)),
@@ -1767,9 +2154,12 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                     &mut steps,
                     &mut artifacts,
                 )?;
+                scheduled_field_snapshot_metrics.add(due_output_metrics);
+                apply_step_field_copy_metrics(&mut latest_stats, due_output_metrics);
             }
 
             if let Some(live) = live.as_mut() {
+                let live_materialization_started = Instant::now();
                 let heavy_payload_every = live.field_every_n.max(1);
                 let display_selection = live.display_selection.map(|get| get());
                 let preview_due = display_selection
@@ -1847,10 +2237,25 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                         problem.active_mask.as_deref(),
                     );
                 }
+                let mut live_copy_metrics = FieldCopyMetrics::default();
+                if let Some(values) = magnetization.as_deref() {
+                    live_copy_metrics.add_f64_payload(values);
+                }
+                if let Some(field) = preview_field.as_ref() {
+                    live_copy_metrics.add_f64_payload(&field.vector_field_values);
+                }
+                if live_copy_metrics.payload_count > 0 {
+                    live_copy_metrics.wall_time_ns =
+                        live_materialization_started.elapsed().as_nanos() as u64;
+                }
+                live_field_snapshot_metrics.add(live_copy_metrics);
+                apply_step_field_copy_metrics(&mut update_stats, live_copy_metrics);
+                apply_step_field_copy_metrics(&mut latest_stats, live_copy_metrics);
                 let action = (live.on_step)(StepUpdate {
                     coupled_checkpoint: final_frozen_checkpoint
                         .clone()
-                        .or_else(|| final_coupled_checkpoint.clone()),
+                        .or_else(|| final_coupled_checkpoint.clone())
+                        .or_else(|| final_abm3_checkpoint.clone()),
                     stats: update_stats,
                     scalar_row_due: due_scalar_row,
                     grid: live.grid,
@@ -1863,6 +2268,7 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                     hysteresis_settle_step_index: None,
                     hysteresis_settle_step_kind: None,
                     hysteresis_settle_step_method: None,
+                    terminal_field_snapshot: false,
                     finished: false,
                 });
                 if preview_due {
@@ -1886,6 +2292,12 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                     current_observables_stale = true;
                 }
             }
+
+            current_stats = latest_stats.clone();
+            // Preserve every accepted adaptive/fixed controller step for the
+            // solver diagnostics trace. User-visible scalar schedules remain
+            // independent and may be sparse.
+            artifacts.record_solver_step(&latest_stats);
 
             if cancelled || paused {
                 break;
@@ -1917,7 +2329,20 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
         }
     }
 
-    record_final_outputs(
+    // A fully constrained dynamics stage is an analytical constant-state
+    // evolution, not an immediate-time convergence. Advance the physical
+    // clock to the requested endpoint without invoking RHS kernels. Relaxation
+    // retains immediate completion semantics and does not manufacture time.
+    if all_active_dofs_frozen
+        && plan.relaxation.is_none()
+        && !is_direct_minimization
+        && !paused
+        && !cancelled
+    {
+        state.time_seconds = stage_end_time_s;
+    }
+
+    let finalization_field_snapshot_metrics = record_final_outputs(
         &problem,
         &state,
         Some(resolved_antenna_zeeman_field(plan, state.time_seconds)),
@@ -1932,7 +2357,8 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
 
     if !paused && !cancelled {
         if let Some(live) = live.as_mut() {
-            if let Some(final_stats) = steps.last().cloned() {
+            if let Some(mut final_stats) = steps.last().cloned() {
+                let live_materialization_started = Instant::now();
                 let display_selection = live.display_selection.map(|get| get());
                 let materialization_quantities = field_materialization_quantity_ids();
                 let materialization_quantities = active_fdm_preview_quantities(
@@ -2014,15 +2440,36 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                 } else {
                     None
                 };
+                let magnetization = Some(flatten_vectors(state.magnetization()));
+                let mut live_copy_metrics = FieldCopyMetrics::default();
+                if let Some(values) = magnetization.as_deref() {
+                    live_copy_metrics.add_f64_payload(values);
+                }
+                if let Some(field) = preview_field.as_ref() {
+                    live_copy_metrics.add_f64_payload(&field.vector_field_values);
+                }
+                for field in &cached_preview_fields {
+                    live_copy_metrics.add_f64_payload(&field.vector_field_values);
+                }
+                if live_copy_metrics.payload_count > 0 {
+                    live_copy_metrics.wall_time_ns =
+                        live_materialization_started.elapsed().as_nanos() as u64;
+                }
+                live_field_snapshot_metrics.add(live_copy_metrics);
+                apply_finalization_field_copy_metrics(&mut final_stats, live_copy_metrics);
+                if let Some(stats) = steps.last_mut() {
+                    apply_finalization_field_copy_metrics(stats, live_copy_metrics);
+                }
                 let _ = (live.on_step)(StepUpdate {
                     coupled_checkpoint: final_frozen_checkpoint
                         .clone()
-                        .or_else(|| final_coupled_checkpoint.clone()),
+                        .or_else(|| final_coupled_checkpoint.clone())
+                        .or_else(|| final_abm3_checkpoint.clone()),
                     stats: final_stats,
                     scalar_row_due: true,
                     grid: live.grid,
                     fem_mesh_generation_id: None,
-                    magnetization: Some(flatten_vectors(state.magnetization())),
+                    magnetization,
                     preview_field,
                     cached_preview_fields: Some(cached_preview_fields),
                     hysteresis_field_m_t: None,
@@ -2030,12 +2477,77 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
                     hysteresis_settle_step_index: None,
                     hysteresis_settle_step_kind: None,
                     hysteresis_settle_step_method: None,
+                    terminal_field_snapshot: false,
                     finished: false,
                 });
             }
         }
     }
 
+    let final_state_sync = if !is_direct_minimization {
+        state_soa
+            .as_ref()
+            .map(|soa| soa.write_back_to(&mut state))
+            .unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    let checkpoint_digest = problem
+        .transactional_state_digest(&state)
+        .map_err(|error| RunError {
+            message: format!("CPU FDM transaction checkpoint digest: {error}"),
+        })?;
+    let accepted_state_snapshot = fdm_cpu_accepted_state_snapshot(
+        plan,
+        step_count,
+        state.time_seconds,
+        (!is_direct_minimization && last_solver_dt > 0.0).then_some(last_solver_dt),
+        &checkpoint_digest,
+        state.magnetization(),
+    )?;
+    let mut final_provenance = artifacts.provenance_snapshot();
+    if let Some(fft_execution) = final_provenance.fdm_fft_execution.as_mut() {
+        let telemetry = fft_workspace.telemetry();
+        fft_execution.thread_count = Some(telemetry.execution_thread_count);
+        fft_execution.runtime_telemetry = Some(FdmFftRuntimeTelemetry {
+            schema_version: fullmag_engine::fdm::FDM_FFT_WORKSPACE_TELEMETRY_SCHEMA_VERSION
+                .to_string(),
+            workspace_lifecycle_revision: telemetry.lifecycle_revision,
+            workspace_key_sha256: telemetry.lifecycle_key_sha256,
+            plan_creation_time_ns: telemetry.plan_creation_time_ns,
+            workspace_bytes: telemetry.workspace_bytes,
+            forward_fft_count: telemetry.forward_fft_count,
+            inverse_fft_count: telemetry.inverse_fft_count,
+            fft_elapsed_time_ns: telemetry.fft_elapsed_time_ns,
+        });
+    }
+    final_provenance.fdm_cpu_step_transaction_telemetry = Some(FdmCpuStepTransactionTelemetry {
+        schema_version: "fullmag.fdm.cpu.step_transaction.v3".to_string(),
+        accepted_step_count: step_count,
+        rejected_attempt_count: cpu_rejected_attempt_count,
+        rollback_count: cpu_rollback_count,
+        thermal_interval_index: problem.thermal_step(),
+        thermal_rng_draws: (problem.temperature > 0.0)
+            .then_some(problem.thermal_step())
+            .unwrap_or(0),
+        accepted_state_publication_count,
+        accepted_state_publication_copy_bytes,
+        accepted_state_publication_full_field_copy_count,
+        final_state_sync_copy_bytes: final_state_sync.copied_bytes,
+        final_state_sync_full_field_copy_count: final_state_sync.full_field_copy_count,
+        scheduled_field_snapshot_payload_count: scheduled_field_snapshot_metrics.payload_count,
+        scheduled_field_snapshot_copy_bytes: scheduled_field_snapshot_metrics.copy_bytes,
+        live_field_snapshot_payload_count: live_field_snapshot_metrics.payload_count,
+        live_field_snapshot_copy_bytes: live_field_snapshot_metrics.copy_bytes,
+        finalization_field_snapshot_payload_count: finalization_field_snapshot_metrics
+            .payload_count,
+        finalization_field_snapshot_copy_bytes: finalization_field_snapshot_metrics.copy_bytes,
+        checkpoint_digest,
+    });
+    if !is_direct_minimization {
+        final_provenance.fdm_cpu_evaluation_telemetry = Some(cpu_evaluation_telemetry);
+    }
+    artifacts.replace_provenance_synchronously(final_provenance)?;
     let diagnostic_trace = artifacts.take_solver_steps();
     let (field_snapshots, field_snapshot_count, provenance) = artifacts.finish();
     let mut status = if paused {
@@ -2051,7 +2563,14 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
             converged: true,
             reason: None,
             metric: None,
-            metric_name: Some("all_active_dofs_frozen".to_string()),
+            metric_name: Some(
+                if plan.relaxation.is_some() || is_direct_minimization {
+                    "all_active_dofs_frozen_relaxation"
+                } else {
+                    "all_active_dofs_frozen_time_advance"
+                }
+                .to_string(),
+            ),
             metric_value: Some(0.0),
             threshold: None,
         }
@@ -2119,6 +2638,22 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
             })?,
         });
     }
+    if let Some(checkpoint) = final_abm3_checkpoint {
+        auxiliary_artifacts.push(crate::types::AuxiliaryArtifact {
+            relative_path: "solver/fdm_cpu_abm3_checkpoint.v1.json".to_string(),
+            bytes: serde_json::to_vec_pretty(&checkpoint).map_err(|error| RunError {
+                message: format!("serializing final FDM CPU ABM3 checkpoint artifact: {error}"),
+            })?,
+        });
+    }
+    if let Some(snapshot) = accepted_state_snapshot {
+        auxiliary_artifacts.push(crate::types::AuxiliaryArtifact {
+            relative_path: FDM_CPU_ACCEPTED_STATE_SNAPSHOT_FILE.to_string(),
+            bytes: serde_json::to_vec_pretty(&snapshot).map_err(|error| RunError {
+                message: format!("serializing FDM CPU accepted state snapshot: {error}"),
+            })?,
+        });
+    }
 
     Ok(ExecutedRun {
         result: RunResult {
@@ -2143,6 +2678,22 @@ fn frozen_spins_checkpoint_value(
     time_s: f64,
     dt: f64,
 ) -> Result<Option<serde_json::Value>, RunError> {
+    frozen_spins_checkpoint(plan, problem, state, step, time_s, dt)?
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| RunError {
+            message: format!("serializing Frozen Spins checkpoint state: {error}"),
+        })
+}
+
+fn frozen_spins_checkpoint(
+    plan: &FdmPlanIR,
+    problem: &ExchangeLlgProblem,
+    state: &ExchangeLlgState,
+    step: u64,
+    time_s: f64,
+    dt: f64,
+) -> Result<Option<FrozenSpinsCheckpointV1>, RunError> {
     let (Some(frozen_plan), Some(frozen_state)) =
         (plan.frozen_spins.as_ref(), problem.frozen_spins())
     else {
@@ -2161,12 +2712,30 @@ fn frozen_spins_checkpoint_value(
     )
     .map_err(|error| RunError {
         message: format!("serializing Frozen Spins checkpoint state: {error}"),
-    })?;
-    serde_json::to_value(checkpoint)
-        .map(Some)
-        .map_err(|error| RunError {
-            message: format!("serializing Frozen Spins checkpoint state: {error}"),
-        })
+    })?
+    .with_problem_sha256(fdm_abm3_plan_sha256(plan)?);
+    Ok(Some(checkpoint))
+}
+
+fn fdm_step_evaluation_request(
+    plan: &FdmPlanIR,
+    predicted_time: f64,
+    scalar_schedules: &[OutputSchedule],
+    live: Option<&LiveStepConsumer>,
+) -> EvaluationRequest {
+    let scalar_output_due = scalar_schedules
+        .iter()
+        .any(|schedule| is_due(predicted_time, schedule.next_time));
+    let relaxation_needs_energy = plan
+        .relaxation
+        .as_ref()
+        .is_some_and(|control| control.stop.energy_tolerance_j.is_some());
+
+    if scalar_output_due || relaxation_needs_energy || live.is_some() {
+        EvaluationRequest::Full
+    } else {
+        EvaluationRequest::Minimal
+    }
 }
 
 fn step_reference_fdm_problem(
@@ -2176,7 +2745,8 @@ fn step_reference_fdm_problem(
     dt_step: f64,
     fft_workspace: &mut FftWorkspace,
     integrator_bufs: &mut IntegratorBuffers,
-) -> Result<StepReport, EngineError> {
+    evaluation: EvaluationRequest,
+) -> Result<(StepReport, fullmag_engine::FdmCpuStateCopyTelemetry), EngineError> {
     if state_soa.is_none() && problem.soa_fast_path_supported() {
         *state_soa = Some(state.to_soa());
     }
@@ -2187,12 +2757,20 @@ fn step_reference_fdm_problem(
             dt_step,
             fft_workspace,
             integrator_bufs,
-            EvaluationRequest::Full,
+            evaluation,
         )?;
-        soa.write_back_to(state);
-        Ok(report)
+        let state_copy = soa.publish_accepted_to(state);
+        Ok((report, state_copy))
     } else {
-        problem.step_with_buffers(state, dt_step, fft_workspace, integrator_bufs)
+        problem
+            .step_with_buffers_evaluation(
+                state,
+                dt_step,
+                fft_workspace,
+                integrator_bufs,
+                evaluation,
+            )
+            .map(|report| (report, Default::default()))
     }
 }
 
@@ -2229,6 +2807,59 @@ fn infer_direct_minimizer_completion(
     )
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FieldCopyMetrics {
+    payload_count: u64,
+    copy_bytes: u64,
+    wall_time_ns: u64,
+}
+
+impl FieldCopyMetrics {
+    fn add(&mut self, other: Self) {
+        self.payload_count = self.payload_count.saturating_add(other.payload_count);
+        self.copy_bytes = self.copy_bytes.saturating_add(other.copy_bytes);
+        self.wall_time_ns = self.wall_time_ns.saturating_add(other.wall_time_ns);
+    }
+
+    fn from_f64_payload(values: &[f64], wall_time_ns: u64) -> Self {
+        Self {
+            payload_count: 1,
+            copy_bytes: (values.len() as u64).saturating_mul(std::mem::size_of::<f64>() as u64),
+            wall_time_ns,
+        }
+    }
+
+    fn add_f64_payload(&mut self, values: &[f64]) {
+        self.payload_count = self.payload_count.saturating_add(1);
+        self.copy_bytes = self.copy_bytes.saturating_add(
+            (values.len() as u64).saturating_mul(std::mem::size_of::<f64>() as u64),
+        );
+    }
+}
+
+fn flatten_field_snapshot(values: Vec<Vector3>) -> (Vec<f64>, FieldCopyMetrics) {
+    let started = Instant::now();
+    let values = FieldSnapshot::flatten_vec3(values);
+    let metrics = FieldCopyMetrics::from_f64_payload(&values, started.elapsed().as_nanos() as u64);
+    (values, metrics)
+}
+
+fn apply_step_field_copy_metrics(stats: &mut StepStats, metrics: FieldCopyMetrics) {
+    stats.field_copy_bytes = stats.field_copy_bytes.saturating_add(metrics.copy_bytes);
+    stats.field_copy_wall_time_ns = stats
+        .field_copy_wall_time_ns
+        .saturating_add(metrics.wall_time_ns);
+}
+
+fn apply_finalization_field_copy_metrics(stats: &mut StepStats, metrics: FieldCopyMetrics) {
+    stats.finalization_field_copy_bytes = stats
+        .finalization_field_copy_bytes
+        .saturating_add(metrics.copy_bytes);
+    stats.finalization_field_copy_wall_time_ns = stats
+        .finalization_field_copy_wall_time_ns
+        .saturating_add(metrics.wall_time_ns);
+}
+
 fn record_due_outputs(
     problem: &ExchangeLlgProblem,
     state: &ExchangeLlgState,
@@ -2241,7 +2872,8 @@ fn record_due_outputs(
     field_schedules: &mut [OutputSchedule],
     steps: &mut Vec<StepStats>,
     artifacts: &mut ArtifactRecorder,
-) -> Result<(), RunError> {
+) -> Result<FieldCopyMetrics, RunError> {
+    let mut copy_metrics = FieldCopyMetrics::default();
     let scalar_due = scalar_schedules
         .iter()
         .any(|schedule| is_due(state.time_seconds, schedule.next_time));
@@ -2253,7 +2885,7 @@ fn record_due_outputs(
     let has_due_fields = !due_field_names.is_empty();
 
     if !scalar_due && due_field_names.is_empty() {
-        return Ok(());
+        return Ok(copy_metrics);
     }
 
     if due_field_names
@@ -2276,6 +2908,8 @@ fn record_due_outputs(
 
         let mut direct_fields = DirectFieldSnapshotCache::new(problem, state);
         for name in due_field_names {
+            let (values, field_metrics) = flatten_field_snapshot(direct_fields.select(&name)?);
+            copy_metrics.add(field_metrics);
             artifacts.record_field_snapshot(FieldSnapshot {
                 name: name.clone(),
                 step,
@@ -2286,13 +2920,19 @@ fn record_due_outputs(
                 location: "sample".into(),
                 scope: "full".into(),
                 revision: step.saturating_add(1),
-                values: FieldSnapshot::flatten_vec3(direct_fields.select(&name)?),
+                values,
             })?;
         }
         if has_due_fields {
             advance_due_schedules(field_schedules, state.time_seconds);
         }
-        return Ok(());
+        if let Some(stats) = steps
+            .last_mut()
+            .filter(|stats| same_time(stats.time, state.time_seconds))
+        {
+            apply_step_field_copy_metrics(stats, copy_metrics);
+        }
+        return Ok(copy_metrics);
     }
 
     let observables = observe_state_with_antenna_field(problem, state, antenna_field)?;
@@ -2313,6 +2953,9 @@ fn record_due_outputs(
 
     if !due_field_names.is_empty() {
         for name in due_field_names {
+            let (values, field_metrics) =
+                flatten_field_snapshot(select_state_observable_field(&observables, &name, true)?);
+            copy_metrics.add(field_metrics);
             artifacts.record_field_snapshot(FieldSnapshot {
                 name: name.clone(),
                 step,
@@ -2323,17 +2966,20 @@ fn record_due_outputs(
                 location: "sample".into(),
                 scope: "full".into(),
                 revision: step.saturating_add(1),
-                values: FieldSnapshot::flatten_vec3(select_state_observable_field(
-                    &observables,
-                    &name,
-                    true,
-                )?),
+                values,
             })?;
         }
         advance_due_schedules(field_schedules, state.time_seconds);
     }
 
-    Ok(())
+    if let Some(stats) = steps
+        .last_mut()
+        .filter(|stats| same_time(stats.time, state.time_seconds))
+    {
+        apply_step_field_copy_metrics(stats, copy_metrics);
+    }
+
+    Ok(copy_metrics)
 }
 
 fn record_scalar_snapshot(
@@ -2370,7 +3016,8 @@ fn record_final_outputs(
     field_schedules: &[OutputSchedule],
     steps: &mut Vec<StepStats>,
     artifacts: &mut ArtifactRecorder,
-) -> Result<(), RunError> {
+) -> Result<FieldCopyMetrics, RunError> {
+    let mut copy_metrics = FieldCopyMetrics::default();
     let has_current_scalar = steps
         .last()
         .map(|stats| same_time(stats.time, state.time_seconds))
@@ -2406,7 +3053,7 @@ fn record_final_outputs(
         .collect::<Vec<_>>();
 
     if !need_scalar && missing_field_names.is_empty() {
-        return Ok(());
+        return Ok(copy_metrics);
     }
 
     if !need_scalar
@@ -2416,6 +3063,8 @@ fn record_final_outputs(
     {
         let mut direct_fields = DirectFieldSnapshotCache::new(problem, state);
         for name in missing_field_names {
+            let (values, field_metrics) = flatten_field_snapshot(direct_fields.select(&name)?);
+            copy_metrics.add(field_metrics);
             artifacts.record_field_snapshot(FieldSnapshot {
                 name: name.clone(),
                 step,
@@ -2426,10 +3075,16 @@ fn record_final_outputs(
                 location: "sample".into(),
                 scope: "full".into(),
                 revision: step.saturating_add(1),
-                values: FieldSnapshot::flatten_vec3(direct_fields.select(&name)?),
+                values,
             })?;
         }
-        return Ok(());
+        if let Some(stats) = steps
+            .last_mut()
+            .filter(|stats| same_time(stats.time, state.time_seconds))
+        {
+            apply_finalization_field_copy_metrics(stats, copy_metrics);
+        }
+        return Ok(copy_metrics);
     }
 
     if need_scalar
@@ -2446,6 +3101,8 @@ fn record_final_outputs(
 
         let mut direct_fields = DirectFieldSnapshotCache::new(problem, state);
         for name in missing_field_names {
+            let (values, field_metrics) = flatten_field_snapshot(direct_fields.select(&name)?);
+            copy_metrics.add(field_metrics);
             artifacts.record_field_snapshot(FieldSnapshot {
                 name: name.clone(),
                 step,
@@ -2456,10 +3113,13 @@ fn record_final_outputs(
                 location: "sample".into(),
                 scope: "full".into(),
                 revision: step.saturating_add(1),
-                values: FieldSnapshot::flatten_vec3(direct_fields.select(&name)?),
+                values,
             })?;
         }
-        return Ok(());
+        if let Some(stats) = steps.last_mut() {
+            apply_finalization_field_copy_metrics(stats, copy_metrics);
+        }
+        return Ok(copy_metrics);
     }
 
     let observables = observe_state_with_antenna_field(problem, state, antenna_field)?;
@@ -2478,6 +3138,9 @@ fn record_final_outputs(
     }
 
     for name in missing_field_names {
+        let (values, field_metrics) =
+            flatten_field_snapshot(select_state_observable_field(&observables, &name, true)?);
+        copy_metrics.add(field_metrics);
         artifacts.record_field_snapshot(FieldSnapshot {
             name: name.clone(),
             step,
@@ -2488,15 +3151,15 @@ fn record_final_outputs(
             location: "sample".into(),
             scope: "full".into(),
             revision: step.saturating_add(1),
-            values: FieldSnapshot::flatten_vec3(select_state_observable_field(
-                &observables,
-                &name,
-                true,
-            )?),
+            values,
         })?;
     }
 
-    Ok(())
+    if let Some(stats) = steps.last_mut() {
+        apply_finalization_field_copy_metrics(stats, copy_metrics);
+    }
+
+    Ok(copy_metrics)
 }
 
 pub(crate) fn observe_state(
@@ -2533,28 +3196,8 @@ fn observe_state_with_antenna_field(
     let antenna_field = antenna_field_override
         .unwrap_or_else(|| vec![[0.0, 0.0, 0.0]; state.magnetization().len()]);
     let drive_field = problem.regional_drive_field_at_time(state.time_seconds);
-    let drive_energy = -crate::MU0
-        * problem.material.saturation_magnetisation
-        * problem.cell_size.volume()
-        * state
-            .magnetization()
-            .iter()
-            .zip(&drive_field)
-            .enumerate()
-            .filter(|(index, _)| {
-                !problem
-                    .active_mask
-                    .as_ref()
-                    .is_some_and(|mask| !mask[*index])
-            })
-            .map(|(_, (m, h))| m[0] * h[0] + m[1] * h[1] + m[2] * h[2])
-            .sum::<f64>();
+    let drive_energy = regional_drive_energy(problem, state.magnetization(), &drive_field);
     let mut effective_field = observables.effective_field;
-    for (total, drive) in effective_field.iter_mut().zip(&drive_field) {
-        total[0] += drive[0];
-        total[1] += drive[1];
-        total[2] += drive[2];
-    }
     if let Some(active_mask) = problem.active_mask.as_deref() {
         reconstruct_inactive_fdm_visual_effective_field(
             &mut effective_field,
@@ -2562,10 +3205,15 @@ fn observe_state_with_antenna_field(
             &external_field,
             &oersted_field,
             &antenna_field,
+            &drive_field,
             active_mask,
         );
     }
     let anisotropy_field = problem.anisotropy_field(state.magnetization());
+    let conventional_dmi_field = conventional_dmi_field(problem, state.magnetization());
+    let rotated_dmi_field = problem.rotated_interfacial_dmi_field(state.magnetization());
+    let rotated_dmi_energy =
+        problem.rotated_interfacial_dmi_energy_from_vectors(state.magnetization());
 
     let torque_field = compute_torque_field(
         &observables.magnetization,
@@ -2589,7 +3237,11 @@ fn observe_state_with_antenna_field(
         drive_field,
         effective_field,
         anisotropy_field,
-        dmi_field: observables.dmi_field,
+        // `H_dmi` is the conventional interfacial+bulk observable.  The
+        // rotated-interfacial contribution has its own explicit field
+        // observable and remains part of `H_eff` assembled by the engine.
+        dmi_field: conventional_dmi_field,
+        rotated_dmi_field,
         magnetoelastic_field: Vec::new(),
         cubic_anisotropy_field: Vec::new(),
         bulk_dmi_field: Vec::new(),
@@ -2601,7 +3253,8 @@ fn observe_state_with_antenna_field(
         drive_energy,
         anisotropy_energy: observables.anisotropy_energy_joules,
         dmi_energy: observables.dmi_energy_joules,
-        total_energy: observables.total_energy_joules + drive_energy,
+        rotated_dmi_energy,
+        total_energy: observables.total_energy_joules,
         max_dm_dt: observables.max_rhs_amplitude,
         max_rhs_all_norm_per_s: observables.max_rhs_all_amplitude,
         max_h_eff: observables.max_effective_field_amplitude,
@@ -2612,12 +3265,29 @@ fn observe_state_with_antenna_field(
     })
 }
 
+fn conventional_dmi_field(problem: &ExchangeLlgProblem, magnetization: &[Vector3]) -> Vec<Vector3> {
+    let interfacial = problem.interfacial_dmi_field(magnetization);
+    let bulk = problem.bulk_dmi_field(magnetization);
+    interfacial
+        .into_iter()
+        .zip(bulk)
+        .map(|(interfacial, bulk)| {
+            [
+                interfacial[0] + bulk[0],
+                interfacial[1] + bulk[1],
+                interfacial[2] + bulk[2],
+            ]
+        })
+        .collect()
+}
+
 fn reconstruct_inactive_fdm_visual_effective_field(
     effective_field: &mut [Vector3],
     demag_field: &[Vector3],
     external_field: &[Vector3],
     oersted_field: &[Vector3],
     antenna_field: &[Vector3],
+    drive_field: &[Vector3],
     active_mask: &[bool],
 ) {
     for (index, total) in effective_field.iter_mut().enumerate() {
@@ -2640,9 +3310,35 @@ fn reconstruct_inactive_fdm_visual_effective_field(
                 + antenna_field
                     .get(index)
                     .map(|value| value[component])
+                    .unwrap_or(0.0)
+                + drive_field
+                    .get(index)
+                    .map(|value| value[component])
                     .unwrap_or(0.0);
         }
     }
+}
+
+fn regional_drive_energy(
+    problem: &ExchangeLlgProblem,
+    magnetization: &[Vector3],
+    drive_field: &[Vector3],
+) -> f64 {
+    let cell_volume = problem.cell_size.volume();
+    -crate::MU0
+        * cell_volume
+        * magnetization
+            .iter()
+            .zip(drive_field)
+            .enumerate()
+            .filter(|(index, _)| {
+                !problem
+                    .active_mask
+                    .as_ref()
+                    .is_some_and(|mask| !mask[*index])
+            })
+            .map(|(index, (m, h))| problem.ms_at(index) * (m[0] * h[0] + m[1] * h[1] + m[2] * h[2]))
+            .sum::<f64>()
 }
 
 fn make_step_stats_from_report(
@@ -2653,21 +3349,8 @@ fn make_step_stats_from_report(
     problem: &ExchangeLlgProblem,
 ) -> StepStats {
     let drive_field = problem.regional_drive_field_at_time(report.time_seconds);
-    let drive_energy = -crate::MU0
-        * problem.material.saturation_magnetisation
-        * problem.cell_size.volume()
-        * magnetization
-            .iter()
-            .zip(&drive_field)
-            .enumerate()
-            .filter(|(index, _)| {
-                !problem
-                    .active_mask
-                    .as_ref()
-                    .is_some_and(|mask| !mask[*index])
-            })
-            .map(|(_, (m, h))| m[0] * h[0] + m[1] * h[1] + m[2] * h[2])
-            .sum::<f64>();
+    let drive_energy = regional_drive_energy(problem, magnetization, &drive_field);
+    let rotated_dmi_energy = problem.rotated_interfacial_dmi_energy_from_vectors(magnetization);
     let mut stats = StepStats {
         step,
         time: report.time_seconds,
@@ -2677,8 +3360,7 @@ fn make_step_stats_from_report(
         e_ext: report.external_energy_joules,
         e_drive: drive_energy,
         e_ani: report.anisotropy_energy_joules,
-        e_dmi: report.dmi_energy_joules,
-        e_total: report.total_energy_joules + drive_energy,
+        e_total: report.total_energy_joules,
         max_dm_dt: report.max_rhs_amplitude,
         max_rhs_norm_per_s: report.max_rhs_amplitude,
         max_rhs_all_norm_per_s: report.max_rhs_all_amplitude,
@@ -2690,6 +3372,11 @@ fn make_step_stats_from_report(
         wall_time_ns,
         ..StepStats::default()
     };
+    stats.set_dmi_energy_components(
+        report.dmi_energy_joules - rotated_dmi_energy,
+        0.0,
+        rotated_dmi_energy,
+    );
     apply_average_m_to_step_stats_with_active_mask(
         &mut stats,
         magnetization,
@@ -2697,6 +3384,7 @@ fn make_step_stats_from_report(
     );
     apply_frozen_spin_step_telemetry(&mut stats, problem, magnetization);
     stats.per_object_scalars = single_object_scalars("free", &stats);
+    apply_abm3_step_telemetry(&mut stats, report);
     stats
 }
 
@@ -2723,6 +3411,36 @@ fn apply_frozen_spin_step_telemetry(
     }
 }
 
+fn apply_abm3_step_telemetry(stats: &mut StepStats, report: &StepReport) {
+    let Some(telemetry) = report.abm3 else {
+        return;
+    };
+    let values = stats
+        .per_object_scalars
+        .entry("solver.abm3".to_string())
+        .or_default();
+    values.insert(
+        "schema_version".to_string(),
+        telemetry.schema_version as f64,
+    );
+    values.insert(
+        "startup_step".to_string(),
+        u8::from(telemetry.startup_step) as f64,
+    );
+    values.insert(
+        "history_reset_this_step".to_string(),
+        u8::from(telemetry.history_reset_this_step) as f64,
+    );
+    values.insert(
+        "history_resets_total".to_string(),
+        telemetry.history_resets_total as f64,
+    );
+    values.insert(
+        "rhs_evaluations".to_string(),
+        telemetry.rhs_evaluations as f64,
+    );
+}
+
 fn make_step_stats(
     step: u64,
     time: f64,
@@ -2740,7 +3458,6 @@ fn make_step_stats(
         e_ext: observables.external_energy,
         e_drive: observables.drive_energy,
         e_ani: observables.anisotropy_energy,
-        e_dmi: observables.dmi_energy,
         e_total: observables.total_energy,
         max_dm_dt: observables.max_dm_dt,
         max_rhs_norm_per_s: observables.max_dm_dt,
@@ -2753,6 +3470,11 @@ fn make_step_stats(
         wall_time_ns,
         ..StepStats::default()
     };
+    stats.set_dmi_energy_components(
+        observables.dmi_energy - observables.rotated_dmi_energy,
+        0.0,
+        observables.rotated_dmi_energy,
+    );
     apply_average_m_to_step_stats_with_active_mask(
         &mut stats,
         &observables.magnetization,
@@ -2779,6 +3501,7 @@ fn direct_field_values_available(name: &str) -> bool {
             | "H_ext"
             | "H_ani"
             | "H_dmi"
+            | "H_rotated_dmi"
             | "H_oe"
             | "H_OE"
             | "H_ant"
@@ -2790,11 +3513,13 @@ fn direct_field_values_available(name: &str) -> bool {
 fn direct_scalar_values_available(name: &str) -> bool {
     matches!(
         name,
-        "eden_ex"
+        "frozen_spins"
+            | "eden_ex"
             | "eden_demag"
             | "eden_ext"
             | "eden_ani"
             | "eden_dmi"
+            | "eden_rotated_dmi"
             | "eden_total"
             | "mat_ms"
             | "mat_aex"
@@ -2811,6 +3536,7 @@ struct DirectFieldSnapshotCache<'a> {
     external_field: Option<Vec<Vector3>>,
     anisotropy_field: Option<Vec<Vector3>>,
     dmi_field: Option<Vec<Vector3>>,
+    rotated_dmi_field: Option<Vec<Vector3>>,
     oersted_field: Option<Vec<Vector3>>,
     antenna_field_cache: Option<Vec<Vector3>>,
     effective_field: Option<Vec<Vector3>>,
@@ -2839,6 +3565,7 @@ impl<'a> DirectFieldSnapshotCache<'a> {
             external_field: None,
             anisotropy_field: None,
             dmi_field: None,
+            rotated_dmi_field: None,
             oersted_field: None,
             antenna_field_cache: None,
             effective_field: None,
@@ -2859,6 +3586,20 @@ impl<'a> DirectFieldSnapshotCache<'a> {
 
     fn select_scalar(&mut self, name: &str) -> Result<Vec<f64>, RunError> {
         match name {
+            "frozen_spins" => self
+                .problem
+                .frozen_spins()
+                .map(|frozen_spins| {
+                    frozen_spins
+                        .mask()
+                        .iter()
+                        .map(|frozen| f64::from(*frozen))
+                        .collect()
+                })
+                .ok_or_else(|| RunError {
+                    message: "CPU FDM snapshot 'frozen_spins': constraint is not active"
+                        .to_string(),
+                }),
             "eden_ex" => {
                 let magnetization = self.base_values("m", name)?.to_vec();
                 let field = self.base_values("H_ex", name)?.to_vec();
@@ -2892,6 +3633,9 @@ impl<'a> DirectFieldSnapshotCache<'a> {
                 .map_err(|error| RunError {
                     message: format!("CPU FDM snapshot '{}': DMI energy density: {}", name, error),
                 }),
+            "eden_rotated_dmi" => Ok(self
+                .problem
+                .rotated_interfacial_dmi_energy_density_from_vectors(self.state.magnetization())),
             "eden_total" => {
                 let mut total = vec![0.0; self.state.magnetization().len()];
                 for quantity in ["eden_ex", "eden_demag", "eden_ext", "eden_ani", "eden_dmi"] {
@@ -2984,19 +3728,24 @@ impl<'a> DirectFieldSnapshotCache<'a> {
             }
             "H_dmi" => {
                 if self.dmi_field.is_none() {
-                    self.dmi_field =
-                        Some(
-                            self.problem
-                                .dmi_field(self.state)
-                                .map_err(|error| RunError {
-                                    message: format!(
-                                        "CPU FDM snapshot '{}': DMI field: {}",
-                                        name, error
-                                    ),
-                                })?,
-                        );
+                    self.dmi_field = Some(conventional_dmi_field(
+                        self.problem,
+                        self.state.magnetization(),
+                    ));
                 }
                 Ok(self.dmi_field.as_deref().expect("cached DMI field"))
+            }
+            "H_rotated_dmi" => {
+                if self.rotated_dmi_field.is_none() {
+                    self.rotated_dmi_field = Some(
+                        self.problem
+                            .rotated_interfacial_dmi_field(self.state.magnetization()),
+                    );
+                }
+                Ok(self
+                    .rotated_dmi_field
+                    .as_deref()
+                    .expect("cached rotated DMI field"))
             }
             "H_oe" | "H_OE" => {
                 if self.oersted_field.is_none() {
@@ -3045,12 +3794,16 @@ impl<'a> DirectFieldSnapshotCache<'a> {
                 let demag_field = self.base_values("H_demag", name)?.to_vec();
                 let external_field = self.base_values("H_ext", name)?.to_vec();
                 let oersted_field = self.base_values("H_oe", name)?.to_vec();
+                let drive_field = self
+                    .problem
+                    .regional_drive_field_at_time(self.state.time_seconds);
                 reconstruct_inactive_fdm_visual_effective_field(
                     &mut effective_field,
                     &demag_field,
                     &external_field,
                     &oersted_field,
                     self.antenna_field.unwrap_or(&[]),
+                    &drive_field,
                     active_mask,
                 );
             }
@@ -3109,14 +3862,52 @@ mod tests {
     use fullmag_ir::{
         AdaptiveTimeStepIR, AdaptiveToleranceModeIR, AxisBoundary as IrAxisBoundary,
         DriveActivationIR, ExchangeBoundaryCondition, ExecutionPrecision, FdmDemagPeriodicityIR,
-        FdmMaterialIR, FdmPeriodicityIR, FieldDriveKindIR, FieldSpatialProfileIR, FieldTargetIR,
-        FieldTimeOriginIR, GridDimensions, IntegratorChoice, RegionalFieldDriveIR, RelaxStopIR,
-        RelaxationAlgorithmIR, RelaxationControlIR, ResolvedFrozenSpinsPlanIR,
-        ResolvedRegionalFieldDriveBasisIR, SelectionAuthoredFingerprintIR, SelectionCertificateIR,
-        StageStopReason, TimeDependenceIR, RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION,
-        SELECTION_CERTIFICATE_SCHEMA_VERSION,
+        FdmFftPlanIR, FdmMaterialIR, FdmPeriodicityIR, FdmProjectionPolicyIR, FieldDriveKindIR,
+        FieldSpatialProfileIR, FieldTargetIR, FieldTimeOriginIR, GridDimensions, IntegratorChoice,
+        RegionalFieldDriveIR, RelaxStopIR, RelaxationAlgorithmIR, RelaxationControlIR,
+        ResolvedFrozenSpinsPlanIR, ResolvedRegionalFieldDriveBasisIR,
+        ResolvedSolvedAntennaDriveBasisIR, SelectionAuthoredFingerprintIR, SelectionCertificateIR,
+        SolvedAntennaDriveIR, StageStopReason, StudyKindIR, TimeDependenceIR,
+        RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION, SELECTION_CERTIFICATE_SCHEMA_VERSION,
     };
     use sha2::{Digest, Sha256};
+
+    fn adaptive_test_policy() -> AdaptiveTimeStepIR {
+        AdaptiveTimeStepIR {
+            tolerance_mode: AdaptiveToleranceModeIR::Advanced,
+            atol: 1.0e-8,
+            rtol: 0.0,
+            dt_initial: Some(1.0e-3),
+            dt_min: 1.0e-6,
+            dt_max: Some(1.0e-2),
+            safety: 0.8,
+            growth_limit: 2.0,
+            shrink_limit: 0.2,
+            max_spin_rotation: None,
+            norm_tolerance: None,
+        }
+    }
+
+    #[test]
+    fn coupled_adaptive_controller_fails_closed_and_makes_progress() {
+        let adaptive = adaptive_test_policy();
+        let CoupledAdaptiveDecision::Retry(next_dt) =
+            decide_coupled_adaptive_step(4.0, 1.0e-3, &adaptive)
+        else {
+            panic!("finite rejection must schedule a retry");
+        };
+        assert!(next_dt < 1.0e-3);
+        assert!(next_dt >= adaptive.dt_min);
+        assert_eq!(
+            decide_coupled_adaptive_step(f64::NAN, 1.0e-3, &adaptive),
+            CoupledAdaptiveDecision::NonFinite
+        );
+        let one_ulp_above = f64::from_bits(adaptive.dt_min.to_bits() + 1);
+        assert_eq!(
+            decide_coupled_adaptive_step(4.0, one_ulp_above, &adaptive),
+            CoupledAdaptiveDecision::DtMinExhausted
+        );
+    }
 
     fn make_test_plan() -> FdmPlanIR {
         FdmPlanIR {
@@ -3173,6 +3964,288 @@ mod tests {
     }
 
     #[test]
+    fn fdm_cpu_accepted_state_snapshot_is_content_bound_and_strictly_scoped() {
+        let plan = make_test_plan();
+        let first = fdm_cpu_accepted_state_snapshot(
+            &plan,
+            5,
+            5.0e-14,
+            Some(1.0e-14),
+            &format!("sha256:{}", "a".repeat(64)),
+            &plan.initial_magnetization,
+        )
+        .expect("accepted state snapshot")
+        .expect("supported simple FDM CPU lane");
+        let changed = fdm_cpu_accepted_state_snapshot(
+            &plan,
+            5,
+            5.0e-14,
+            Some(1.0e-14),
+            &format!("sha256:{}", "b".repeat(64)),
+            &plan.initial_magnetization,
+        )
+        .expect("changed accepted state snapshot")
+        .expect("supported simple FDM CPU lane");
+
+        assert_eq!(first.schema_version, FDM_CPU_ACCEPTED_STATE_SNAPSHOT_SCHEMA);
+        first.validate().expect("valid strict lane snapshot");
+        assert_eq!(first.clock.accepted_step, 5);
+        assert_eq!(
+            first.primary_carrier_ids,
+            ["fdm.cpu.transactional-state-digest.v1"]
+        );
+        assert_eq!(first.clock_digest, changed.clock_digest);
+        assert_ne!(first.state_digest, changed.state_digest);
+
+        let invalid = fdm_cpu_accepted_state_snapshot(
+            &plan,
+            5,
+            5.0e-14,
+            Some(1.0e-14),
+            "not-a-digest",
+            &plan.initial_magnetization,
+        )
+        .expect_err("noncanonical carrier digest must fail closed");
+        assert!(invalid.message.contains("transactional_state_digest"));
+
+        let mut frozen = plan;
+        frozen.frozen_spins = Some(resolved_frozen_spins_test_plan(vec![false; 16]));
+        assert!(fdm_cpu_accepted_state_snapshot(
+            &frozen,
+            5,
+            5.0e-14,
+            Some(1.0e-14),
+            &format!("sha256:{}", "a".repeat(64)),
+            &frozen.initial_magnetization,
+        )
+        .expect("unsupported lane remains unavailable")
+        .is_none());
+    }
+
+    #[test]
+    fn simple_fdm_cpu_lane_emits_accepted_state_snapshot_from_final_transactional_state() {
+        let plan = make_test_plan();
+        let executed = execute_reference_fdm(&plan, 2.0e-14, &[], None, None)
+            .expect("simple FDM CPU execution");
+        let artifact = executed
+            .auxiliary_artifacts
+            .iter()
+            .find(|artifact| artifact.relative_path == FDM_CPU_ACCEPTED_STATE_SNAPSHOT_FILE)
+            .expect("accepted state snapshot artifact");
+        let snapshot: FdmCpuAcceptedStateSnapshotV1 =
+            serde_json::from_slice(&artifact.bytes).expect("strict accepted state snapshot");
+        let transaction = executed
+            .provenance
+            .fdm_cpu_step_transaction_telemetry
+            .as_ref()
+            .expect("FDM CPU transaction telemetry");
+        let recomputed = crate::accepted_state_digests(
+            snapshot.clock,
+            &[crate::AcceptedPrimaryCarrier {
+                carrier_id: "fdm.cpu.transactional-state-digest.v1",
+                canonical_bytes: transaction.checkpoint_digest.as_bytes(),
+            }],
+        )
+        .expect("recompute accepted state digest from the lane carrier");
+
+        assert_eq!(
+            snapshot.clock.accepted_step,
+            transaction.accepted_step_count
+        );
+        assert_eq!(snapshot.clock_digest, recomputed.clock_digest);
+        assert_eq!(snapshot.state_digest, recomputed.state_digest);
+        assert_eq!(snapshot.clock.time_seconds, 2.0e-14);
+        assert_eq!(snapshot.clock.dt_seconds, Some(1.0e-14));
+    }
+
+    #[test]
+    fn reference_problem_rejects_short_antenna_mask_before_execution() {
+        let mut plan = make_test_plan();
+        plan.antenna_zeeman_masks = vec![fullmag_ir::ResolvedAntennaZeemanMaskIR {
+            source: "antenna_1".into(),
+            object: "magnet".into(),
+            amplitude_b_t: 0.0,
+            direction: [1.0, 0.0, 0.0],
+            spatial_profile: None,
+            waveform: None,
+            field_xyz: vec![[0.0; 3]],
+        }];
+        let error = build_reference_problem(&plan)
+            .err()
+            .expect("short antenna mask must be rejected");
+        assert!(error.message.contains("antenna Zeeman mask 'antenna_1'"));
+    }
+
+    #[test]
+    fn reference_problem_materializes_rotated_interfacial_dmi_from_plan() {
+        let mut plan = make_test_plan();
+        plan.enable_exchange = false;
+        plan.rotated_interfacial_dmi = Some(3.0e-3);
+        plan.initial_magnetization = (0..16)
+            .map(|flat| {
+                let x = (flat % 4) as f64;
+                let y = (flat / 4) as f64;
+                [0.2 + 0.1 * x, -0.3 + 0.2 * y, 0.4 - 0.05 * x + 0.03 * y]
+            })
+            .collect();
+
+        let problem = build_reference_problem(&plan).expect("reference problem should build");
+        let state = problem
+            .new_state(plan.initial_magnetization.clone())
+            .expect("reference state should build");
+
+        assert_eq!(problem.terms.rotated_interfacial_dmi, Some(3.0e-3));
+        let rotated_field = problem.rotated_interfacial_dmi_field(state.magnetization());
+        assert!(
+            rotated_field
+                .iter()
+                .flatten()
+                .any(|component| component.abs() > 0.0),
+            "active rotated DMI must contribute to the FDM CPU effective field"
+        );
+        assert_eq!(
+            problem.effective_field(&state).expect("effective field"),
+            rotated_field
+        );
+
+        let observables = observe_state(&problem, &state).expect("runner observables");
+        assert_eq!(observables.rotated_dmi_field, rotated_field);
+        assert!(observables
+            .dmi_field
+            .iter()
+            .flatten()
+            .all(|component| *component == 0.0));
+        assert_eq!(observables.effective_field, rotated_field);
+        assert_eq!(
+            observables.rotated_dmi_energy,
+            problem.rotated_interfacial_dmi_energy_from_vectors(state.magnetization())
+        );
+        assert_eq!(
+            select_state_observable_field(&observables, "H_rotated_dmi", true)
+                .expect("scheduled rotated DMI field"),
+            rotated_field
+        );
+
+        let mut direct = DirectFieldSnapshotCache::new(&problem, &state);
+        assert_eq!(
+            direct
+                .select("H_rotated_dmi")
+                .expect("direct rotated DMI field"),
+            rotated_field
+        );
+        assert!(direct
+            .select("H_dmi")
+            .expect("conventional DMI field")
+            .iter()
+            .flatten()
+            .all(|component| *component == 0.0));
+        let density = direct
+            .select_scalar("eden_rotated_dmi")
+            .expect("direct rotated DMI energy density");
+        let integrated = density.iter().sum::<f64>() * problem.cell_size.volume();
+        assert!((integrated - observables.rotated_dmi_energy).abs() <= 1.0e-24);
+        let integrated_total = direct
+            .select_scalar("eden_total")
+            .expect("total energy density")
+            .iter()
+            .sum::<f64>()
+            * problem.cell_size.volume();
+        assert!((integrated_total - observables.total_energy).abs() <= 1.0e-24);
+
+        let stats = make_step_stats(0, 0.0, 1.0e-14, 0, &observables, &problem);
+        assert_eq!(stats.e_rotated_dmi, observables.rotated_dmi_energy);
+        assert_eq!(stats.e_dmi, observables.dmi_energy);
+    }
+
+    fn resolved_frozen_spins_test_plan(mask: Vec<bool>) -> ResolvedFrozenSpinsPlanIR {
+        let active_dof_count = mask.len() as u64;
+        let frozen_dof_count = mask.iter().filter(|frozen| **frozen).count() as u64;
+        let free_dof_count = active_dof_count - frozen_dof_count;
+        let mut hash = Sha256::new();
+        hash.update(active_dof_count.to_le_bytes());
+        hash.update(
+            mask.iter()
+                .map(|frozen| u8::from(*frozen))
+                .collect::<Vec<_>>(),
+        );
+        let mask_sha256 = format!("{:x}", hash.finalize());
+        ResolvedFrozenSpinsPlanIR {
+            schema_version: RESOLVED_FROZEN_SPINS_PLAN_SCHEMA_VERSION.to_string(),
+            constraint_ids: vec!["viewport-mask".to_string()],
+            frozen_mask: mask,
+            active_dof_count,
+            frozen_dof_count,
+            free_dof_count,
+            mask_sha256: mask_sha256.clone(),
+            grid_or_mesh_fingerprint: "viewport-test-grid".to_string(),
+            source_state_revision: Some(1),
+            all_active_dofs_frozen: active_dof_count > 0 && free_dof_count == 0,
+            certificate: SelectionCertificateIR {
+                schema_version: SELECTION_CERTIFICATE_SCHEMA_VERSION.to_string(),
+                evaluator_id: "selection.fdm_cell_center.v1".to_string(),
+                constraint_ids: vec!["viewport-mask".to_string()],
+                authored_fingerprints: vec![SelectionAuthoredFingerprintIR {
+                    constraint_id: "viewport-mask".to_string(),
+                    selector_sha256: "a".repeat(64),
+                }],
+                raw_candidate_dof_count: frozen_dof_count,
+                inactive_candidate_dof_count: 0,
+                active_dof_count,
+                frozen_dof_count,
+                free_dof_count,
+                bounds_m: None,
+                grid_or_mesh_fingerprint: "viewport-test-grid".to_string(),
+                source_state_revision: Some(1),
+                mask_sha256,
+                resolved_reference_sha256: "b".repeat(64),
+                warnings: Vec::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn all_frozen_time_evolution_advances_clock_without_changing_state() {
+        let mut plan = make_test_plan();
+        plan.frozen_spins = Some(resolved_frozen_spins_test_plan(vec![true; 16]));
+        let initial = plan.initial_magnetization.clone();
+        let endpoint = 5.0e-14;
+
+        let executed = execute_reference_fdm(&plan, endpoint, &[], None, None)
+            .expect("all-frozen analytical time advance");
+
+        assert_eq!(executed.result.final_magnetization, initial);
+        let completion = executed.result.completion.expect("stage completion");
+        assert_eq!(
+            completion.metric_name.as_deref(),
+            Some("all_active_dofs_frozen_time_advance")
+        );
+        assert_eq!(
+            executed.result.steps.last().map(|step| step.time),
+            Some(endpoint)
+        );
+    }
+
+    #[test]
+    fn headless_fdm_steps_skip_full_observables_until_requested() {
+        let plan = make_test_plan();
+        assert_eq!(
+            fdm_step_evaluation_request(&plan, 1.0e-14, &[], None),
+            EvaluationRequest::Minimal
+        );
+
+        let scalar_schedule = [OutputSchedule {
+            name: "E_total".to_string(),
+            every_seconds: 1.0e-14,
+            next_time: 1.0e-14,
+            last_sampled_time: None,
+        }];
+        assert_eq!(
+            fdm_step_evaluation_request(&plan, 1.0e-14, &scalar_schedule, None),
+            EvaluationRequest::Full
+        );
+    }
+
+    #[test]
     fn reference_construction_preserves_fixed_vs_adaptive_embedded_rk_policy() {
         let fixed = FdmPlanIR {
             integrator: Some(IntegratorChoice::Rk45),
@@ -3203,6 +4276,30 @@ mod tests {
         assert!(adaptive_problem.dynamics.adaptive_enabled);
         assert_eq!(adaptive_problem.dynamics.adaptive.dt_min, 1e-16);
         assert_eq!(adaptive_problem.dynamics.adaptive.dt_max, 1e-14);
+    }
+
+    #[test]
+    fn reference_runner_executes_and_provenances_resolved_projection_policy() {
+        let mut plan = make_test_plan();
+        plan.projection_policy = Some(FdmProjectionPolicyIR::UnitSphere);
+
+        let problem = build_reference_problem(&plan).expect("reference problem");
+        assert_eq!(
+            problem.dynamics.projection_policy,
+            fullmag_engine::ProjectionPolicy::UnitSphere
+        );
+
+        let executed = execute_reference_fdm(&plan, 3e-14, &[], None, None)
+            .expect("projected-RK reference run");
+        let layout = executed
+            .provenance
+            .fdm_cpu_state_layout
+            .expect("CPU FDM layout provenance");
+        assert_eq!(layout.projection_policy.as_deref(), Some("unit_sphere"));
+        assert_eq!(
+            layout.projection_realization.as_deref(),
+            Some(FdmProjectionPolicyIR::UNIT_SPHERE_REALIZATION_VERSION)
+        );
     }
 
     #[test]
@@ -3260,6 +4357,138 @@ mod tests {
     }
 
     #[test]
+    fn reference_runner_publishes_cpu_step_transaction_telemetry() {
+        let plan = FdmPlanIR {
+            temperature: Some(300.0),
+            ..make_test_plan()
+        };
+        let field_bytes =
+            (plan.initial_magnetization.len() * std::mem::size_of::<Vector3>()) as u64;
+        let executed =
+            execute_reference_fdm(&plan, 3e-14, &[], None, None).expect("thermal reference run");
+        let telemetry = executed
+            .provenance
+            .fdm_cpu_step_transaction_telemetry
+            .expect("CPU transaction telemetry");
+
+        assert_eq!(
+            telemetry.schema_version,
+            "fullmag.fdm.cpu.step_transaction.v3"
+        );
+        assert!(telemetry.accepted_step_count > 0);
+        assert_eq!(
+            telemetry.accepted_state_publication_count,
+            telemetry.accepted_step_count
+        );
+        assert_eq!(
+            telemetry.accepted_state_publication_full_field_copy_count,
+            telemetry.accepted_step_count
+        );
+        assert_eq!(
+            telemetry.accepted_state_publication_copy_bytes,
+            telemetry.accepted_step_count * field_bytes
+        );
+        assert_eq!(telemetry.final_state_sync_full_field_copy_count, 1);
+        assert_eq!(telemetry.final_state_sync_copy_bytes, field_bytes);
+        assert_eq!(telemetry.scheduled_field_snapshot_payload_count, 0);
+        assert_eq!(telemetry.scheduled_field_snapshot_copy_bytes, 0);
+        assert_eq!(telemetry.live_field_snapshot_payload_count, 0);
+        assert_eq!(telemetry.live_field_snapshot_copy_bytes, 0);
+        assert_eq!(telemetry.finalization_field_snapshot_payload_count, 0);
+        assert_eq!(telemetry.finalization_field_snapshot_copy_bytes, 0);
+        assert_eq!(
+            telemetry.thermal_interval_index,
+            telemetry.accepted_step_count
+        );
+        assert_eq!(
+            telemetry.thermal_rng_draws,
+            telemetry.thermal_interval_index
+        );
+        assert_eq!(telemetry.rollback_count, telemetry.rejected_attempt_count);
+        assert!(telemetry.checkpoint_digest.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn reference_runner_splits_minimal_and_full_evaluation_telemetry() {
+        let plan = make_test_plan();
+        let minimal =
+            execute_reference_fdm(&plan, 3e-14, &[], None, None).expect("headless reference run");
+        let minimal_telemetry = minimal
+            .provenance
+            .fdm_cpu_evaluation_telemetry
+            .as_ref()
+            .expect("CPU evaluation telemetry");
+        assert_eq!(
+            minimal_telemetry.schema_version,
+            "fullmag.fdm.cpu.evaluation.v1"
+        );
+        assert_eq!(minimal_telemetry.minimal_step_count, 3);
+        assert_eq!(minimal_telemetry.full_step_count, 0);
+        let minimal_copy = minimal
+            .provenance
+            .fdm_cpu_step_transaction_telemetry
+            .as_ref()
+            .expect("minimal CPU copy telemetry");
+        assert_eq!(minimal_copy.accepted_state_publication_count, 3);
+        assert_eq!(
+            minimal_copy.accepted_state_publication_full_field_copy_count,
+            3
+        );
+
+        let outputs = [OutputIR::Scalar {
+            name: "E_total".to_string(),
+            every_seconds: 1e-14,
+        }];
+        let full = execute_reference_fdm(&plan, 3e-14, &outputs, None, None)
+            .expect("full-observable reference run");
+        let full_telemetry = full
+            .provenance
+            .fdm_cpu_evaluation_telemetry
+            .as_ref()
+            .expect("CPU evaluation telemetry");
+        assert_eq!(full_telemetry.minimal_step_count, 0);
+        assert_eq!(full_telemetry.full_step_count, 3);
+        assert!(full_telemetry.full_step_wall_time_ns > 0);
+        let full_copy = full
+            .provenance
+            .fdm_cpu_step_transaction_telemetry
+            .as_ref()
+            .expect("full CPU copy telemetry");
+        assert_eq!(
+            full_copy.accepted_state_publication_copy_bytes,
+            minimal_copy.accepted_state_publication_copy_bytes
+        );
+        assert_eq!(
+            full_copy.accepted_state_publication_full_field_copy_count,
+            minimal_copy.accepted_state_publication_full_field_copy_count
+        );
+    }
+
+    #[test]
+    fn fixed_step_endpoint_roundoff_does_not_create_a_micro_step() {
+        let mut plan = make_test_plan();
+        plan.fixed_timestep = Some(1e-13);
+
+        let executed = execute_reference_fdm(&plan, 6.0 * 1e-13, &[], None, None)
+            .expect("fixed-step reference run");
+        let evaluation = executed
+            .provenance
+            .fdm_cpu_evaluation_telemetry
+            .expect("CPU evaluation telemetry");
+
+        assert_eq!(evaluation.minimal_step_count, 6);
+        assert_eq!(evaluation.full_step_count, 0);
+        assert_eq!(
+            executed
+                .provenance
+                .fdm_cpu_step_transaction_telemetry
+                .expect("CPU transaction telemetry")
+                .accepted_step_count,
+            6
+        );
+    }
+
+    #[test]
     fn adaptive_step_defers_attempt_record_materialization_outside_hot_path() {
         let plan = FdmPlanIR {
             integrator: Some(IntegratorChoice::Rk23),
@@ -3283,13 +4512,14 @@ mod tests {
         let mut state_soa = problem.soa_fast_path_supported().then(|| state.to_soa());
         let mut fft_workspace = problem.create_workspace();
         let mut integrator_bufs = problem.create_integrator_buffers();
-        let report = step_reference_fdm_problem(
+        let (report, _) = step_reference_fdm_problem(
             &problem,
             &mut state,
             &mut state_soa,
             1e-12,
             &mut fft_workspace,
             &mut integrator_bufs,
+            EvaluationRequest::Full,
         )
         .expect("adaptive step");
         let mut stats = StepStats {
@@ -3341,6 +4571,7 @@ mod tests {
             source_hash: None,
             execution_mode: fullmag_ir::ExecutionMode::Strict,
             layout: serde_json::json!({"kind": "fdm", "cell_count": 16}),
+            magnetization_field_semantics: Ok(None),
             execution_resolution: None,
         };
         let mut pipeline =
@@ -3461,7 +4692,7 @@ mod tests {
             migration: None,
         };
         let h = 1e-3 / crate::MU0;
-        let plan = FdmPlanIR {
+        let mut plan = FdmPlanIR {
             enable_exchange: false,
             regional_field_drive_bases: vec![ResolvedRegionalFieldDriveBasisIR {
                 drive: drive.clone(),
@@ -3472,9 +4703,15 @@ mod tests {
             field_drives: vec![drive],
             ..make_test_plan()
         };
+        plan.active_mask = Some((0..16).map(|index| index < 8).collect());
+        plan.material.ms_field = Some((0..16).map(|index| 400e3 + index as f64 * 10e3).collect());
         let outputs = [
             OutputIR::Field {
                 name: "H_drive".into(),
+                every_seconds: 1e-14,
+            },
+            OutputIR::Field {
+                name: "H_eff".into(),
                 every_seconds: 1e-14,
             },
             OutputIR::Scalar {
@@ -3495,8 +4732,114 @@ mod tests {
             .values
             .chunks_exact(3)
             .all(|value| { value[0] == 0.0 && value[1] == h && value[2] == 0.0 }));
+        let effective_field = executed
+            .field_snapshots
+            .iter()
+            .find(|snapshot| snapshot.name == "H_eff")
+            .expect("H_eff snapshot");
+        assert!(effective_field
+            .values
+            .chunks_exact(3)
+            .all(|value| { value[0] == 0.0 && value[1] == h && value[2] == 0.0 }));
         assert!(executed.result.steps.iter().any(|step| step.e_drive != 0.0));
-        assert!(executed.result.steps.iter().all(|step| step.e_ext == 0.0));
+        for step in &executed.result.steps {
+            assert_eq!(step.e_ex, 0.0);
+            assert_eq!(step.e_demag, 0.0);
+            assert_eq!(step.e_ani, 0.0);
+            assert_eq!(step.e_dmi, 0.0);
+            let energy_tolerance = 1e-12 * step.e_total.abs().max(step.e_drive.abs()).max(1e-30);
+            assert!(
+                (step.e_ext - step.e_drive).abs() <= energy_tolerance,
+                "regional drive must appear once in external energy: e_ext={}, e_drive={}",
+                step.e_ext,
+                step.e_drive
+            );
+            assert!(
+                (step.e_total - step.e_drive).abs() <= energy_tolerance,
+                "regional drive must appear exactly once in total energy: e_total={}, e_drive={}",
+                step.e_total,
+                step.e_drive
+            );
+        }
+    }
+
+    #[test]
+    fn solved_antenna_basis_uses_peak_current_stage_clock_and_exact_term_time() {
+        let mut plan = make_test_plan();
+        plan.time_stage.active_stage_id = Some("ringdown".into());
+        plan.time_stage.start_time_s = 10.0;
+        let projection_signature = format!(
+            "verified:target_topology:{}",
+            crate::antenna_field_solution::fdm_target_topology_digest(&plan).unwrap()
+        );
+        plan.solved_antenna_drive_bases = vec![ResolvedSolvedAntennaDriveBasisIR {
+            drive: SolvedAntennaDriveIR {
+                id: "antenna-drive".into(),
+                name: "Antenna drive".into(),
+                projection_ref: "projection".into(),
+                port_mode_id: "common".into(),
+                peak_current_a: 0.25,
+                waveform: TimeDependenceIR::Sinusoidal {
+                    frequency_hz: 0.25,
+                    phase_rad: 0.0,
+                    offset: 0.0,
+                },
+                bandwidth_declaration: None,
+                time_origin: FieldTimeOriginIR::StageLocal,
+                activation: DriveActivationIR::StageIds {
+                    stage_ids: vec!["ringdown".into()],
+                },
+            },
+            solution_id: "solution".into(),
+            source_object_id: "antenna".into(),
+            field_xyz_apm_per_a: vec![[4.0, 8.0, 12.0]; 16],
+            projection_signature,
+        }];
+
+        let terms = resolved_regional_field_drives(&plan, plan.time_stage.start_time_s);
+        assert_eq!(terms.len(), 1);
+        assert_eq!(terms[0].basis_field[0], [1.0, 2.0, 3.0]);
+        assert!((terms[0].multiplier_at(11.0) - 1.0).abs() < 1.0e-12);
+        let visual = resolved_antenna_zeeman_field_for_count(&plan, 16, 11.0);
+        assert!(visual.iter().all(|value| {
+            (value[0] - 1.0).abs() < 1.0e-12
+                && (value[1] - 2.0).abs() < 1.0e-12
+                && (value[2] - 3.0).abs() < 1.0e-12
+        }));
+        plan.solved_antenna_drive_bases[0].field_xyz_apm_per_a.pop();
+        let error = build_reference_problem(&plan)
+            .err()
+            .expect("short solved antenna basis must be rejected before FDM execution");
+        assert!(error.message.contains("expected 16 FDM cells"));
+    }
+
+    #[test]
+    fn solved_antenna_all_time_evolution_is_inactive_during_relaxation() {
+        let mut plan = make_test_plan();
+        plan.time_stage.study_kind = StudyKindIR::Relaxation;
+        plan.time_stage.active_stage_id = Some("relax".into());
+        plan.solved_antenna_drive_bases = vec![ResolvedSolvedAntennaDriveBasisIR {
+            drive: SolvedAntennaDriveIR {
+                id: "relaxation-drive".into(),
+                name: "Relaxation drive".into(),
+                projection_ref: "projection".into(),
+                port_mode_id: "common".into(),
+                peak_current_a: 1.0,
+                waveform: TimeDependenceIR::Constant,
+                bandwidth_declaration: None,
+                time_origin: FieldTimeOriginIR::StageLocal,
+                activation: DriveActivationIR::AllTimeEvolution {},
+            },
+            solution_id: "solution".into(),
+            source_object_id: "antenna".into(),
+            field_xyz_apm_per_a: vec![[4.0, 8.0, 12.0]; 16],
+            projection_signature: "verified".into(),
+        }];
+
+        assert!(resolved_regional_field_drives(&plan, 0.0).is_empty());
+        assert!(resolved_antenna_zeeman_field_for_count(&plan, 16, 0.0)
+            .iter()
+            .all(|value| *value == [0.0, 0.0, 0.0]));
     }
 
     #[test]
@@ -3532,6 +4875,12 @@ mod tests {
         assert_eq!(local[0].multiplier_at(11.5), 1.0);
         assert_eq!(local[0].multiplier_at(10.5), 0.0);
 
+        plan.time_stage.start_time_s = 10.5;
+        plan.time_stage.waveform_origin_time_s = Some(10.0);
+        let resumed = resolved_regional_field_drives(&plan, plan.time_stage.start_time_s);
+        assert_eq!(resumed[0].multiplier_at(11.25), 1.0);
+        assert_eq!(resumed[0].multiplier_at(12.25), 0.0);
+
         plan.regional_field_drive_bases = vec![make_basis(
             FieldTimeOriginIR::Absolute,
             TimeDependenceIR::Pulse {
@@ -3542,13 +4891,6 @@ mod tests {
         let absolute = resolved_regional_field_drives(&plan, plan.time_stage.start_time_s);
         assert_eq!(absolute[0].multiplier_at(11.5), 1.0);
         assert_eq!(absolute[0].multiplier_at(1.5), 0.0);
-    }
-
-    fn cpu_fft_env_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .expect("CPU FFT backend env lock should not be poisoned")
     }
 
     fn direct_minimizer_test_control() -> RelaxationControlIR {
@@ -3582,7 +4924,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_minimizer_energy_plateau_does_not_replace_torque_convergence() {
+    fn direct_minimizer_energy_plateau_can_certify_without_torque_convergence() {
         let control = RelaxationControlIR {
             stop: RelaxStopIR {
                 torque_tolerance_apm: None,
@@ -3596,11 +4938,14 @@ mod tests {
             infer_direct_minimizer_completion(&control, true, 8, false, false, Some(5.0e-19), 2.0);
 
         assert_eq!(completion.status, "completed");
-        assert!(!completion.converged);
-        assert_eq!(completion.reason, None);
-        assert_eq!(completion.metric_name, None);
-        assert_eq!(completion.metric_value, None);
-        assert_eq!(completion.threshold, None);
+        assert!(completion.converged);
+        assert_eq!(completion.reason, Some(StageStopReason::Energy));
+        assert_eq!(
+            completion.metric_name.as_deref(),
+            Some("total_energy_plateau_range_J")
+        );
+        assert_eq!(completion.metric_value, Some(5.0e-19));
+        assert_eq!(completion.threshold, Some(1.0e-18));
     }
 
     #[test]
@@ -3677,29 +5022,6 @@ mod tests {
         assert_eq!(completion.status, "failed");
         assert!(!completion.converged);
         assert_eq!(completion.reason, Some(StageStopReason::BackendError));
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            std::env::set_var(key, value);
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(previous) = &self.previous {
-                std::env::set_var(self.key, previous);
-            } else {
-                std::env::remove_var(self.key);
-            }
-        }
     }
 
     fn make_relaxation_precession_test_plan() -> FdmPlanIR {
@@ -3812,11 +5134,12 @@ mod tests {
 
     #[test]
     fn snapshot_preview_rejects_unimplemented_cpu_fft_backend_for_demag() {
-        let _lock = cpu_fft_env_lock();
-        let _env = EnvVarGuard::set(CPU_FFT_BACKEND_ENV, "fftw");
         let plan = FdmPlanIR {
             enable_exchange: false,
             enable_demag: true,
+            fft: Some(FdmFftPlanIR {
+                requested_backend: "fftw".to_string(),
+            }),
             ..make_test_plan()
         };
 
@@ -3832,11 +5155,41 @@ mod tests {
             Err(err) => err,
         };
 
-        assert!(err.message.contains(CPU_FFT_BACKEND_ENV));
+        assert!(err.message.contains("fdm.demag.fft_backend"));
         assert!(err.message.contains("fftw"));
         assert!(err
             .message
-            .contains("supported CPU FDM FFT backends: rustfft"));
+            .contains("supported CPU FDM FFT backends: auto, rustfft"));
+    }
+
+    #[test]
+    fn snapshot_preview_exposes_resolved_frozen_spins_as_binary_scalar_quantity() {
+        let mut mask = vec![false; 16];
+        mask[1] = true;
+        mask[14] = true;
+        let plan = FdmPlanIR {
+            frozen_spins: Some(resolved_frozen_spins_test_plan(mask.clone())),
+            ..make_test_plan()
+        };
+
+        let preview = snapshot_preview(
+            &plan,
+            &LivePreviewRequest {
+                quantity: "frozen_spins".to_string(),
+                auto_scale_enabled: false,
+                ..Default::default()
+            },
+        )
+        .expect("Frozen Spins scalar preview should build from the active runtime mask");
+
+        assert_eq!(preview.quantity, "frozen_spins");
+        assert_eq!(preview.unit, "1");
+        assert_eq!(preview.spatial_kind, "grid");
+        assert_eq!(
+            preview.vector_field_values,
+            mask.into_iter().map(f64::from).collect::<Vec<_>>()
+        );
+        assert!(can_materialize_preview_quantity(QuantityId::FrozenSpins));
     }
 
     #[test]
@@ -4262,6 +5615,59 @@ mod tests {
             assert_eq!(snapshots[0].step, 0);
             assert!(snapshots[1].step > 0);
         }
+        let telemetry = executed
+            .provenance
+            .fdm_cpu_step_transaction_telemetry
+            .as_ref()
+            .expect("CPU field-copy telemetry");
+        let field_bytes =
+            (plan.initial_magnetization.len() * std::mem::size_of::<Vector3>()) as u64;
+        assert_eq!(telemetry.scheduled_field_snapshot_payload_count, 5);
+        assert_eq!(
+            telemetry.scheduled_field_snapshot_copy_bytes,
+            5 * field_bytes
+        );
+        assert_eq!(telemetry.finalization_field_snapshot_payload_count, 5);
+        assert_eq!(
+            telemetry.finalization_field_snapshot_copy_bytes,
+            5 * field_bytes
+        );
+        assert_eq!(telemetry.live_field_snapshot_payload_count, 0);
+        assert_eq!(telemetry.live_field_snapshot_copy_bytes, 0);
+    }
+
+    #[test]
+    fn scheduled_field_copy_receipt_counts_each_due_snapshot_once() {
+        let plan = make_test_plan();
+        let outputs = [
+            OutputIR::Field {
+                name: "m".to_string(),
+                every_seconds: 1e-14,
+            },
+            OutputIR::Scalar {
+                name: "E_total".to_string(),
+                every_seconds: 1e-14,
+            },
+        ];
+
+        let executed = execute_reference_fdm(&plan, 3e-14, &outputs, None, None)
+            .expect("scheduled field-copy receipt run");
+        let telemetry = executed
+            .provenance
+            .fdm_cpu_step_transaction_telemetry
+            .as_ref()
+            .expect("CPU field-copy telemetry");
+        let field_bytes =
+            (plan.initial_magnetization.len() * std::mem::size_of::<Vector3>()) as u64;
+
+        assert_eq!(executed.field_snapshots.len(), 4);
+        assert_eq!(telemetry.scheduled_field_snapshot_payload_count, 4);
+        assert_eq!(
+            telemetry.scheduled_field_snapshot_copy_bytes,
+            4 * field_bytes
+        );
+        assert_eq!(telemetry.finalization_field_snapshot_payload_count, 0);
+        assert_eq!(telemetry.finalization_field_snapshot_copy_bytes, 0);
     }
 
     #[test]
@@ -4318,6 +5724,7 @@ mod tests {
             max_rhs_all_amplitude: 17.0,
             max_torque_Apm: 19.0,
             max_torque_all_Apm: 19.0,
+            abm3: None,
         };
         let mut scalar_schedules = vec![OutputSchedule {
             name: "E_total".to_string(),
@@ -4474,15 +5881,29 @@ mod tests {
         };
         let mut magnetization_updates = 0usize;
         let mut terminal_cache_updates = 0usize;
+        let mut expected_live_payload_count = 0u64;
+        let mut expected_live_copy_bytes = 0u64;
         let mut on_step = |update: StepUpdate| -> StepAction {
             if let Some(values) = update.magnetization.as_ref() {
                 magnetization_updates += 1;
                 assert_eq!(values.len(), plan.initial_magnetization.len() * 3);
+                expected_live_payload_count += 1;
+                expected_live_copy_bytes += (values.len() * std::mem::size_of::<f64>()) as u64;
+            }
+            if let Some(field) = update.preview_field.as_ref() {
+                expected_live_payload_count += 1;
+                expected_live_copy_bytes +=
+                    (field.vector_field_values.len() * std::mem::size_of::<f64>()) as u64;
             }
             assert!(update.preview_field.is_none());
             if update.cached_preview_fields.is_some() {
                 terminal_cache_updates += 1;
                 assert!(update.magnetization.is_some());
+            }
+            for field in update.cached_preview_fields.as_deref().unwrap_or_default() {
+                expected_live_payload_count += 1;
+                expected_live_copy_bytes +=
+                    (field.vector_field_values.len() * std::mem::size_of::<f64>()) as u64;
             }
             StepAction::Continue
         };
@@ -4517,6 +5938,20 @@ mod tests {
             observe_calls <= 2,
             "live magnetization payload should read state directly between refreshes and observe only for final outputs and the terminal cache; observe_state calls: {observe_calls}"
         );
+        let telemetry = executed
+            .provenance
+            .fdm_cpu_step_transaction_telemetry
+            .as_ref()
+            .expect("CPU live field-copy telemetry");
+        assert_eq!(
+            telemetry.live_field_snapshot_payload_count,
+            expected_live_payload_count
+        );
+        assert_eq!(
+            telemetry.live_field_snapshot_copy_bytes,
+            expected_live_copy_bytes
+        );
+        assert!(telemetry.live_field_snapshot_payload_count > magnetization_updates as u64);
     }
 
     #[test]
@@ -4574,9 +6009,17 @@ mod tests {
         for field in update.cached_preview_fields.as_ref().unwrap() {
             assert_eq!(field.preview_grid, plan.grid.cells);
             assert_eq!(field.original_grid, plan.grid.cells);
+            let expected_components =
+                if field.quantity.starts_with("eden_") || field.quantity.starts_with("mat_") {
+                    1
+                } else {
+                    3
+                };
             assert_eq!(
                 field.vector_field_values.len(),
-                plan.initial_magnetization.len() * 3
+                plan.initial_magnetization.len() * expected_components,
+                "unexpected component count for {}",
+                field.quantity
             );
             assert!(!field.auto_downscaled);
         }
@@ -4715,6 +6158,16 @@ mod tests {
         }
         assert!(first_update.preview_field.is_some());
         assert!(!first_update.finished);
+        let telemetry = executed
+            .provenance
+            .fdm_cpu_step_transaction_telemetry
+            .as_ref()
+            .expect("initial live field-copy telemetry");
+        let payload_bytes =
+            (plan.initial_magnetization.len() * std::mem::size_of::<Vector3>()) as u64;
+        assert_eq!(telemetry.live_field_snapshot_payload_count, 2);
+        assert_eq!(telemetry.live_field_snapshot_copy_bytes, 2 * payload_bytes);
+        assert_eq!(first_update.stats.field_copy_bytes, 2 * payload_bytes);
     }
 
     #[test]
@@ -4829,6 +6282,7 @@ mod tests {
             max_rhs_all_amplitude: 8.0,
             max_torque_Apm: 9.0,
             max_torque_all_Apm: 9.0,
+            abm3: None,
         };
         let mut scalar_schedules = vec![OutputSchedule {
             name: "E_total".to_string(),
@@ -5813,7 +7267,7 @@ mod tests {
             ..Default::default()
         });
 
-        record_final_outputs(
+        let metrics = record_final_outputs(
             &problem,
             &state,
             None,
@@ -5834,6 +7288,12 @@ mod tests {
         );
         let (field_snapshots, field_snapshot_count, _) = artifacts.finish();
         assert_eq!(field_snapshot_count, 1);
+        assert_eq!(metrics.payload_count, 1);
+        assert_eq!(
+            metrics.copy_bytes,
+            2 * std::mem::size_of::<Vector3>() as u64
+        );
+        assert_eq!(steps[0].finalization_field_copy_bytes, metrics.copy_bytes);
         assert_eq!(field_snapshots[0].name, "m.y");
         assert_eq!(
             field_snapshots[0].vec3_values().unwrap(),
@@ -5916,19 +7376,93 @@ mod tests {
 
         let mut fft_workspace = problem.create_workspace();
         let mut integrator_bufs = problem.create_integrator_buffers();
-        let report = step_reference_fdm_problem(
+        let expected_copy_bytes =
+            (state.magnetization().len() * std::mem::size_of::<Vector3>()) as u64;
+        let (report, state_copy) = step_reference_fdm_problem(
             &problem,
             &mut state,
             &mut state_soa,
             1e-14,
             &mut fft_workspace,
             &mut integrator_bufs,
+            EvaluationRequest::Full,
         )
         .expect("step should execute");
 
         assert!(state_soa.is_some());
         assert!(report.total_energy_joules.is_finite());
         assert_eq!(state.time_seconds, report.time_seconds);
+        assert_eq!(state_copy.copied_bytes, expected_copy_bytes);
+        assert_eq!(state_copy.full_field_copy_count, 1);
+    }
+
+    #[test]
+    fn failed_persistent_soa_step_does_not_publish_or_mutate_accepted_state() {
+        let plan = make_test_plan();
+        let (mut problem, mut published_state) =
+            build_snapshot_problem_and_state(&plan).expect("problem");
+        let mut state_soa = Some(published_state.to_soa());
+        let published_before = published_state.transactional_state_digest();
+        let authoritative_before = state_soa
+            .as_ref()
+            .expect("persistent SoA state")
+            .transactional_state_digest();
+        let mut fft_workspace = problem.create_workspace();
+        let mut integrator_bufs = problem.create_integrator_buffers();
+
+        problem.terms.external_field = Some([f64::NAN, 0.0, 0.0]);
+        let error = step_reference_fdm_problem(
+            &problem,
+            &mut published_state,
+            &mut state_soa,
+            1e-14,
+            &mut fft_workspace,
+            &mut integrator_bufs,
+            EvaluationRequest::Minimal,
+        )
+        .expect_err("non-finite RHS must fail before accepted-state publication");
+
+        assert_eq!(error.code(), EngineErrorCode::NaNValue);
+        assert_eq!(
+            published_state.transactional_state_digest(),
+            published_before
+        );
+        assert_eq!(
+            state_soa
+                .as_ref()
+                .expect("persistent SoA state after failure")
+                .transactional_state_digest(),
+            authoritative_before
+        );
+
+        problem.terms.external_field = Some([0.0, 0.0, 0.0]);
+        let (_report, state_copy) = step_reference_fdm_problem(
+            &problem,
+            &mut published_state,
+            &mut state_soa,
+            1e-14,
+            &mut fft_workspace,
+            &mut integrator_bufs,
+            EvaluationRequest::Minimal,
+        )
+        .expect("repaired step must publish exactly once");
+
+        assert_eq!(state_copy.full_field_copy_count, 1);
+        assert_eq!(
+            state_copy.copied_bytes,
+            (published_state.magnetization().len() * std::mem::size_of::<Vector3>()) as u64
+        );
+        assert_eq!(
+            published_state.transactional_state_digest(),
+            state_soa
+                .as_ref()
+                .expect("persistent SoA state after accepted step")
+                .transactional_state_digest()
+        );
+        assert_ne!(
+            published_state.transactional_state_digest(),
+            published_before
+        );
     }
 
     #[test]
@@ -5959,11 +7493,71 @@ mod tests {
         let err = resolve_cpu_fft_backend_for_demag(true, Some("fftw"))
             .expect_err("fftw is not implemented in this build");
 
-        assert!(err.message.contains("FULLMAG_CPU_FFT_BACKEND"));
+        assert!(err.message.contains("fdm.demag.fft_backend"));
         assert!(err.message.contains("fftw"));
         assert!(err
             .message
-            .contains("supported CPU FDM FFT backends: rustfft"));
+            .contains("supported CPU FDM FFT backends: auto, rustfft"));
+    }
+
+    #[test]
+    fn cpu_fft_execution_receipt_preserves_requested_resolved_and_executed_backend() {
+        let fft = FdmFftPlanIR {
+            requested_backend: "auto".to_string(),
+        };
+
+        let receipt = resolve_cpu_fft_execution_for_demag(true, Some(&fft))
+            .expect("auto CPU FFT request should resolve")
+            .expect("demag-enabled plan should produce an FFT receipt");
+
+        assert_eq!(receipt.requested_backend, "auto");
+        assert_eq!(receipt.resolved_backend, "rustfft");
+        assert_eq!(receipt.executed_backend, "rustfft");
+        assert_eq!(
+            receipt.backend_version.as_deref(),
+            Some("rustfft=6.4.1;realfft=3.5.0")
+        );
+        assert_eq!(receipt.plan_mode, "realfft_r2c_planner_cached");
+        assert_eq!(receipt.thread_count, None);
+        assert_eq!(receipt.workspace_layout, "half_spectrum_r2c");
+    }
+
+    #[test]
+    fn reference_runner_executes_the_planned_cpu_fft_backend_without_fallback() {
+        let plan = FdmPlanIR {
+            enable_demag: true,
+            fft: Some(FdmFftPlanIR {
+                requested_backend: "rustfft".to_string(),
+            }),
+            ..make_test_plan()
+        };
+
+        let executed = execute_reference_fdm(&plan, 1.0e-14, &[], None, None)
+            .expect("planned RustFFT execution");
+        let receipt = executed
+            .provenance
+            .fdm_fft_execution
+            .expect("CPU FFT execution receipt");
+
+        assert_eq!(receipt.requested_backend, "rustfft");
+        assert_eq!(receipt.resolved_backend, "rustfft");
+        assert_eq!(receipt.executed_backend, "rustfft");
+        let telemetry = receipt
+            .runtime_telemetry
+            .expect("executed CPU FFT must publish workspace telemetry");
+        assert_eq!(
+            telemetry.schema_version,
+            fullmag_engine::fdm::FDM_FFT_WORKSPACE_TELEMETRY_SCHEMA_VERSION
+        );
+        assert_eq!(telemetry.workspace_lifecycle_revision, 1);
+        assert_eq!(telemetry.workspace_key_sha256.len(), "sha256:".len() + 64);
+        assert!(receipt.thread_count.is_some_and(|count| count > 0));
+        assert!(telemetry.plan_creation_time_ns > 0);
+        assert!(telemetry.workspace_bytes > 0);
+        assert!(telemetry.forward_fft_count > 0);
+        assert_eq!(telemetry.forward_fft_count, telemetry.inverse_fft_count);
+        assert!(telemetry.fft_elapsed_time_ns > 0);
+        assert!(!executed.provenance.lossy_fallback_used);
     }
 
     #[test]
@@ -6552,6 +8146,25 @@ mod tests {
         checkpoint["reference_sha256"] =
             serde_json::Value::String(format!("{:x}", reference_hash.finalize()));
 
+        let mut changed_problem = plan.clone();
+        changed_problem.initial_magnetization[1] = [0.0, 0.0, 1.0];
+        let mismatch = execute_reference_fdm_with_coupled_checkpoint(
+            &changed_problem,
+            1e-14,
+            &[],
+            None,
+            None,
+            Some(checkpoint.clone()),
+        )
+        .expect_err("ExactResume must reject a checkpoint from another problem");
+        assert!(
+            mismatch
+                .message
+                .contains("frozen_spins_checkpoint_problem_hash_mismatch"),
+            "unexpected mismatch: {}",
+            mismatch.message
+        );
+
         let resumed = execute_reference_fdm_with_coupled_checkpoint(
             &plan,
             1e-14,
@@ -6566,6 +8179,152 @@ mod tests {
             resumed.result.final_magnetization[0].map(f64::to_bits),
             [0.0, 0.0, 1.0].map(f64::to_bits),
             "restart must use the persisted reference, not recapture the selector"
+        );
+    }
+
+    fn abm3_runner_plan() -> FdmPlanIR {
+        FdmPlanIR {
+            integrator: Some(IntegratorChoice::Abm3),
+            fixed_timestep: Some(1.0e-14),
+            external_field: Some([0.0, 0.0, 1.0e4]),
+            ..make_test_plan()
+        }
+    }
+
+    #[test]
+    fn abm3_runner_checkpoint_resume_matches_uninterrupted_execution() {
+        let plan = abm3_runner_plan();
+        let first = execute_reference_fdm(&plan, 4.0e-14, &[], None, None)
+            .expect("ABM3 checkpoint seed run");
+        let checkpoint_artifact = first
+            .auxiliary_artifacts
+            .iter()
+            .find(|artifact| artifact.relative_path == "solver/fdm_cpu_abm3_checkpoint.v1.json")
+            .expect("ABM3 run must emit a durable solver checkpoint");
+        let checkpoint: serde_json::Value =
+            serde_json::from_slice(&checkpoint_artifact.bytes).expect("ABM3 checkpoint JSON");
+        assert_eq!(checkpoint["schema"], FDM_ABM3_RUNNER_CHECKPOINT_SCHEMA);
+        assert_eq!(checkpoint["step"], 4);
+        assert_eq!(
+            checkpoint["solver"]["abm3"]["rhs_history"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            checkpoint["solver"]["abm3"]["rhs_times_seconds"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+
+        let uninterrupted =
+            execute_reference_fdm(&plan, 5.0e-14, &[], None, None).expect("uninterrupted ABM3 run");
+        let resumed = execute_reference_fdm_with_coupled_checkpoint(
+            &plan,
+            5.0e-14,
+            &[],
+            None,
+            None,
+            Some(checkpoint.clone()),
+        )
+        .expect("resumed ABM3 run");
+        assert_eq!(
+            resumed
+                .result
+                .final_magnetization
+                .iter()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            uninterrupted
+                .result
+                .final_magnetization
+                .iter()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        let telemetry = resumed
+            .result
+            .steps
+            .last()
+            .and_then(|stats| stats.per_object_scalars.get("solver.abm3"))
+            .expect("runner must publish ABM3 telemetry");
+        assert_eq!(telemetry["startup_step"], 0.0);
+        assert_eq!(telemetry["rhs_evaluations"], 2.0);
+
+        let mut changed_plan = plan;
+        changed_plan.external_field = Some([0.0, 0.0, 2.0e4]);
+        let error = execute_reference_fdm_with_coupled_checkpoint(
+            &changed_plan,
+            5.0e-14,
+            &[],
+            None,
+            None,
+            Some(checkpoint),
+        )
+        .expect_err("changed physics must invalidate the ABM3 checkpoint");
+        assert!(error.message.contains("plan identity mismatch"));
+    }
+
+    #[test]
+    fn abm3_frozen_spins_checkpoint_resume_is_bitwise_identical() {
+        let mut plan = abm3_runner_plan();
+        let mut mask = vec![false; plan.initial_magnetization.len()];
+        mask[0] = true;
+        plan.frozen_spins = Some(resolved_frozen_spins_test_plan(mask));
+        let frozen_reference_bits = plan.initial_magnetization[0].map(f64::to_bits);
+
+        let first = execute_reference_fdm(&plan, 4.0e-14, &[], None, None)
+            .expect("ABM3 plus Frozen Spins checkpoint seed run");
+        let checkpoint_artifact = first
+            .auxiliary_artifacts
+            .iter()
+            .find(|artifact| artifact.relative_path == "solver/fdm_cpu_abm3_checkpoint.v1.json")
+            .expect("combined ABM3 checkpoint must be emitted");
+        let checkpoint: serde_json::Value = serde_json::from_slice(&checkpoint_artifact.bytes)
+            .expect("combined ABM3 checkpoint JSON");
+        assert_eq!(
+            checkpoint["frozen_spins"]["schema"],
+            FROZEN_SPINS_CHECKPOINT_SCHEMA
+        );
+
+        let uninterrupted = execute_reference_fdm(&plan, 5.0e-14, &[], None, None)
+            .expect("uninterrupted ABM3 plus Frozen Spins run");
+        let resumed = execute_reference_fdm_with_coupled_checkpoint(
+            &plan,
+            5.0e-14,
+            &[],
+            None,
+            None,
+            Some(checkpoint),
+        )
+        .expect("resumed ABM3 plus Frozen Spins run");
+
+        assert_eq!(
+            resumed.result.final_magnetization[0].map(f64::to_bits),
+            frozen_reference_bits,
+            "hard restore must preserve the frozen site at zero ULP"
+        );
+        assert_eq!(
+            resumed
+                .result
+                .final_magnetization
+                .iter()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            uninterrupted
+                .result
+                .final_magnetization
+                .iter()
+                .flatten()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            "ExactResume must preserve the combined multistep and constraint state"
         );
     }
 }

@@ -42,16 +42,73 @@ interface SimulationCommandApi {
   };
 }
 
+export type PrimitiveDraftKind = "Box" | "Cylinder" | "Sphere";
+
+export interface PrimitiveDraft {
+  dimensions: [number, number, number] | null;
+  errors: Readonly<Record<string, string>>;
+  kind: PrimitiveDraftKind;
+  translation: [number, number, number] | null;
+}
+
+type PrimitiveDraftListener = () => void;
+
+class PrimitiveDraftOverlayStore {
+  private listeners = new Set<PrimitiveDraftListener>();
+  private snapshot: PrimitiveDraft | null = null;
+
+  readonly getSnapshot = (): PrimitiveDraft | null => this.snapshot;
+  readonly getServerSnapshot = (): null => null;
+  readonly subscribe = (listener: PrimitiveDraftListener): (() => void) => {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  };
+
+  publish(draft: PrimitiveDraft): void {
+    this.snapshot = draft;
+    this.emit();
+  }
+
+  clear(): void {
+    if (this.snapshot === null) return;
+    this.snapshot = null;
+    this.emit();
+  }
+
+  private emit(): void {
+    for (const listener of this.listeners) listener();
+  }
+}
+
+/** Inspector-owned draft overlay; never stores a committed SceneDocument. */
+export const primitiveDraftOverlayStore = new PrimitiveDraftOverlayStore();
+
 export interface MeshCommandTerminalOptions {
   baseMeshRevision?: number | null;
   pollDelaysMs?: readonly number[];
+  requestOptions?: RequestOptions;
 }
 
-export interface MeshCommandTerminalResult {
-  detail: CommandDetailResource;
+export type MeshCommandObservation =
+  | "waiting"
+  | "disconnected"
+  | "publication-unconfirmed";
+
+export type MeshCommandTerminalResult = {
+  commandId: string;
   message?: string;
-  status: "completed" | "failed" | "cancelled";
-}
+} & (
+  | {
+      detail: CommandDetailResource;
+      observation?: never;
+      status: "completed" | "failed" | "cancelled";
+    }
+  | {
+      detail: CommandDetailResource | null;
+      observation: MeshCommandObservation;
+      status: "pending";
+    }
+);
 
 const DEFAULT_MESH_COMMAND_POLL_DELAYS_MS: readonly number[] = [
   0,
@@ -111,11 +168,36 @@ export async function awaitMeshCommandTerminal(
       });
     }
 
-    const detail = await api.detail(commandId);
+    let detail: CommandDetailResource;
+    try {
+      detail = options.requestOptions
+        ? await api.detail(commandId, options.requestOptions)
+        : await api.detail(commandId);
+    } catch (error) {
+      return {
+        commandId,
+        detail: lastDetail,
+        message: error instanceof Error
+          ? `Mesh command observation disconnected: ${error.message}. The build outcome is unknown.`
+          : "Mesh command observation disconnected. The build outcome is unknown.",
+        observation: "disconnected",
+        status: "pending",
+      };
+    }
+    if (detail.command_id !== commandId) {
+      return {
+        commandId,
+        detail: lastDetail,
+        message: "The command resource identity does not match this mesh build.",
+        observation: "publication-unconfirmed",
+        status: "pending",
+      };
+    }
     lastDetail = detail;
     const status = commandStatus(detail);
     if (status === "failed" || status === "rejected") {
       return {
+        commandId,
         detail,
         message: detail.error ?? detail.reason ?? "Mesh build failed.",
         status: "failed",
@@ -123,6 +205,7 @@ export async function awaitMeshCommandTerminal(
     }
     if (status === "cancelled") {
       return {
+        commandId,
         detail,
         message: detail.error ?? detail.reason ?? "Mesh build was cancelled.",
         status: "cancelled",
@@ -137,20 +220,23 @@ export async function awaitMeshCommandTerminal(
       (baseMeshRevision != null && meshRevision <= baseMeshRevision)
     ) {
       return {
+        commandId,
         detail,
         message:
-          "Mesh command reached completed status without publishing a new mesh revision.",
-        status: "failed",
+          "Mesh command completion is unconfirmed: no new mesh revision was published.",
+        observation: "publication-unconfirmed",
+        status: "pending",
       };
     }
-    return { detail, status: "completed" };
+    return { commandId, detail, status: "completed" };
   }
 
-  const detail = lastDetail ?? (await api.detail(commandId));
   return {
-    detail,
-    message: "Timed out waiting for the mesh command terminal resource.",
-    status: "failed",
+    commandId,
+    detail: lastDetail,
+    message: "Mesh build is still pending. Observation paused; resume to check the same command.",
+    observation: "waiting",
+    status: "pending",
   };
 }
 

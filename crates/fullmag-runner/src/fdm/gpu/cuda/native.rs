@@ -18,7 +18,7 @@ use crate::fdm::{validate_multilayer_grid_budget, validate_single_grid_budget};
 #[cfg(feature = "cuda")]
 use crate::preview::{
     build_grid_preview_field_from_flat_plan, build_grid_scalar_preview_field, plan_grid_preview,
-    resample_grid_mask, GridPreviewPlan,
+    resample_grid_mask, resample_grid_scalars, GridPreviewPlan,
 };
 #[cfg(feature = "cuda")]
 use crate::quantities::normalized_quantity_name;
@@ -53,6 +53,7 @@ enum CudaSnapshotObservable {
     HExt,
     HOe,
     HAni,
+    HRotatedDmi,
     HEff,
     EdenEx,
     EdenDemag,
@@ -60,6 +61,7 @@ enum CudaSnapshotObservable {
     EdenDrive,
     EdenAni,
     EdenDmi,
+    EdenRotatedDmi,
     EdenTotal,
 }
 
@@ -72,6 +74,7 @@ impl CudaSnapshotObservable {
             QuantityId::HExt => Self::HExt,
             QuantityId::HOe => Self::HOe,
             QuantityId::HAni => Self::HAni,
+            QuantityId::HDmiRotated => Self::HRotatedDmi,
             QuantityId::HEff => Self::HEff,
             QuantityId::EdenEx => Self::EdenEx,
             QuantityId::EdenDemag => Self::EdenDemag,
@@ -79,6 +82,7 @@ impl CudaSnapshotObservable {
             QuantityId::EdenDrive => Self::EdenDrive,
             QuantityId::EdenAni => Self::EdenAni,
             QuantityId::EdenDmi => Self::EdenDmi,
+            QuantityId::EdenRotatedDmi => Self::EdenRotatedDmi,
             QuantityId::EdenTotal => Self::EdenTotal,
             _ => return None,
         })
@@ -94,13 +98,19 @@ impl CudaSnapshotObservable {
                 | Self::EdenDrive
                 | Self::EdenAni
                 | Self::EdenDmi
+                | Self::EdenRotatedDmi
                 | Self::EdenTotal
         )
     }
 }
 
 pub(crate) fn can_materialize_preview_quantity(id: QuantityId) -> bool {
-    id == QuantityId::Torque || CudaSnapshotObservable::from_quantity(id).is_some()
+    // H_ant is materialized by the runner from the immutable per-cell basis;
+    // the native ABI intentionally has no separate antenna observable ID.
+    matches!(
+        id,
+        QuantityId::HAnt | QuantityId::Torque | QuantityId::FrozenSpins
+    ) || CudaSnapshotObservable::from_quantity(id).is_some()
 }
 
 /// Check whether the native CUDA FDM backend is compiled and available.
@@ -138,6 +148,9 @@ pub(crate) fn reject_cuda_multilayer_containment(
 fn validate_native_adaptive_policy(
     integrator: fullmag_ir::IntegratorChoice,
     adaptive: Option<&fullmag_ir::AdaptiveTimeStepIR>,
+    thermal_active: bool,
+    dynamic_oersted_active: bool,
+    spin_transport_active: bool,
 ) -> Result<(), RunError> {
     let Some(policy) = adaptive else {
         return Ok(());
@@ -154,19 +167,43 @@ fn validate_native_adaptive_policy(
         fullmag_ir::AdaptiveToleranceModeIR::MaxError if policy.rtol != 0.0 => {
             return Err(RunError {
                 message: "maximum-error CUDA FDM requires rtol=0".to_string(),
-            })
+            });
         }
         fullmag_ir::AdaptiveToleranceModeIR::Advanced
             if policy.atol <= 0.0 && policy.rtol <= 0.0 =>
         {
             return Err(RunError {
                 message: "advanced CUDA FDM requires positive atol or rtol".to_string(),
-            })
+            });
         }
         _ => {}
     }
-    if policy.max_spin_rotation.is_some() || policy.norm_tolerance.is_some() {
-        return Err(RunError { message: "adaptive CUDA FDM norm/rotation guards are transported but unsupported until native enforcement is implemented".to_string() });
+    for (name, value) in [
+        ("max_spin_rotation", policy.max_spin_rotation),
+        ("norm_tolerance", policy.norm_tolerance),
+    ] {
+        if value.is_some_and(|value| !value.is_finite() || value <= 0.0) {
+            return Err(RunError {
+                message: format!(
+                    "adaptive CUDA FDM {name} must be finite and positive when enabled"
+                ),
+            });
+        }
+    }
+    if thermal_active {
+        return Err(RunError {
+            message: "adaptive_cuda_fdm_thermal_unsupported: Brown thermal noise requires a qualified accepted-step SDE replay contract".to_string(),
+        });
+    }
+    if dynamic_oersted_active {
+        return Err(RunError {
+            message: "adaptive_cuda_fdm_dynamic_oersted_unsupported: every adaptive RK stage requires a device-resident source-time contract".to_string(),
+        });
+    }
+    if spin_transport_active {
+        return Err(RunError {
+            message: "adaptive_cuda_fdm_spin_transport_unsupported: device-side retry cannot bind the current host-owned transport transaction".to_string(),
+        });
     }
     Ok(())
 }
@@ -242,23 +279,75 @@ mod adaptive_policy_validation_tests {
     fn incompatible_adaptive_cuda_policies_fail_before_ffi() {
         assert!(validate_native_adaptive_policy(
             fullmag_ir::IntegratorChoice::Heun,
-            Some(&policy(fullmag_ir::AdaptiveToleranceModeIR::MaxError))
+            Some(&policy(fullmag_ir::AdaptiveToleranceModeIR::MaxError)),
+            false,
+            false,
+            false,
         )
         .is_err());
         let absolute = policy(fullmag_ir::AdaptiveToleranceModeIR::Advanced);
-        validate_native_adaptive_policy(fullmag_ir::IntegratorChoice::Rk45, Some(&absolute))
-            .unwrap();
+        validate_native_adaptive_policy(
+            fullmag_ir::IntegratorChoice::Rk45,
+            Some(&absolute),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         let mut relative = absolute.clone();
         relative.atol = 0.0;
         relative.rtol = 1e-4;
-        validate_native_adaptive_policy(fullmag_ir::IntegratorChoice::Rk45, Some(&relative))
-            .unwrap();
+        validate_native_adaptive_policy(
+            fullmag_ir::IntegratorChoice::Rk45,
+            Some(&relative),
+            false,
+            false,
+            false,
+        )
+        .unwrap();
         relative.rtol = 0.0;
         assert!(validate_native_adaptive_policy(
             fullmag_ir::IntegratorChoice::Rk45,
-            Some(&relative)
+            Some(&relative),
+            false,
+            false,
+            false,
         )
         .is_err());
+        let mut guarded = absolute.clone();
+        guarded.max_spin_rotation = Some(0.2);
+        guarded.norm_tolerance = Some(1.0e-6);
+        validate_native_adaptive_policy(
+            fullmag_ir::IntegratorChoice::Rk45,
+            Some(&guarded),
+            false,
+            false,
+            false,
+        )
+        .expect("native CUDA enforces transported norm and rotation guards");
+        guarded.norm_tolerance = Some(f64::NAN);
+        assert!(validate_native_adaptive_policy(
+            fullmag_ir::IntegratorChoice::Rk45,
+            Some(&guarded),
+            false,
+            false,
+            false,
+        )
+        .is_err());
+        for unsupported in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert!(validate_native_adaptive_policy(
+                fullmag_ir::IntegratorChoice::Rk45,
+                Some(&absolute),
+                unsupported.0,
+                unsupported.1,
+                unsupported.2,
+            )
+            .is_err());
+        }
     }
 }
 
@@ -288,6 +377,49 @@ fn validate_native_step_metrics(
         max_torque_apm,
         max_rhs_norm_per_s,
     })
+}
+
+#[cfg(feature = "cuda")]
+fn validate_adaptive_attempt_batch(
+    records: &[ffi::fullmag_fdm_adaptive_attempt_v1],
+) -> Result<(u32, f64), RunError> {
+    if records.is_empty() || records.len() > ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_CAPACITY_V1 {
+        return Err(RunError {
+            message: format!(
+                "native FDM adaptive attempt count is invalid: {}",
+                records.len()
+            ),
+        });
+    }
+    for (index, record) in records.iter().enumerate() {
+        if record.abi_version != ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_ABI_V1
+            || record.struct_size as usize
+                != std::mem::size_of::<ffi::fullmag_fdm_adaptive_attempt_v1>()
+            || record.attempt_index as usize != index
+            || !record.dt_attempt_seconds.is_finite()
+            || record.dt_attempt_seconds <= 0.0
+            || !record.normalized_error.is_finite()
+            || record.normalized_error < 0.0
+            || !record.ratio.is_finite()
+            || record.ratio <= 0.0
+            || !record.dt_next_seconds.is_finite()
+            || record.dt_next_seconds <= 0.0
+        {
+            return Err(RunError {
+                message: format!("native FDM adaptive attempt record {index} is invalid"),
+            });
+        }
+    }
+    let last = records.last().expect("non-empty adaptive trace");
+    if last.decision != ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_ACCEPTED
+        || last.reason != ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_WITHIN_TOLERANCE
+    {
+        return Err(RunError {
+            message: "successful native FDM step did not end with an accepted adaptive attempt"
+                .to_string(),
+        });
+    }
+    Ok((records.len() as u32 - 1, last.normalized_error))
 }
 
 #[cfg(any(feature = "cuda", test))]
@@ -396,6 +528,63 @@ fn ensure_cuda_frozen_spins_supported(
     Ok(())
 }
 
+#[cfg(any(feature = "cuda", test))]
+fn validate_native_frozen_spins_plan(plan: &fullmag_ir::FdmPlanIR) -> Result<(), RunError> {
+    let Some(frozen_spins) = plan.frozen_spins.as_ref() else {
+        return Ok(());
+    };
+    frozen_spins.validate_intrinsic().map_err(|message| RunError {
+        message: format!(
+            "frozen_spins_native_plan_invalid: rejected before CUDA device probe or allocation: {message}"
+        ),
+    })?;
+
+    let cell_count = plan.initial_magnetization.len();
+    let all_active;
+    let active_mask = if let Some(active_mask) = plan.active_mask.as_deref() {
+        if active_mask.len() != cell_count {
+            return Err(RunError {
+                message: format!(
+                    "frozen_spins_native_plan_invalid: active mask length {} differs from initial magnetization cell count {cell_count}",
+                    active_mask.len()
+                ),
+            });
+        }
+        active_mask
+    } else {
+        all_active = vec![true; cell_count];
+        &all_active
+    };
+    frozen_spins
+        .validate_against_active_mask(active_mask)
+        .map_err(|message| RunError {
+            message: format!(
+                "frozen_spins_native_plan_invalid: rejected before CUDA device probe or allocation: {message}"
+            ),
+        })?;
+
+    let Some(grid_certificate) = plan.grid_certificate.as_ref() else {
+        return Err(RunError {
+            message: "frozen_spins_native_plan_invalid: Frozen Spins requires an authoritative FDM grid certificate before CUDA device probe or allocation"
+                .to_string(),
+        });
+    };
+    grid_certificate
+        .validate_against_masks(plan.active_mask.as_deref(), &plan.region_mask)
+        .map_err(|message| RunError {
+            message: format!(
+                "frozen_spins_native_plan_invalid: grid certificate rejected before CUDA device probe or allocation: {message}"
+            ),
+        })?;
+    if frozen_spins.grid_or_mesh_fingerprint != grid_certificate.grid_fingerprint {
+        return Err(RunError {
+            message: "frozen_spins_native_plan_invalid: resolved Frozen Spins topology fingerprint differs from the FDM grid certificate"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(feature = "cuda")]
 fn ffi_prescribed_sot_formula(
     plan: &fullmag_ir::FdmPlanIR,
@@ -445,16 +634,338 @@ fn ffi_transfer_kind(kind: &str) -> Result<ffi::fullmag_fdm_transfer_kind, RunEr
     }
 }
 
+#[cfg(feature = "cuda")]
+struct NativeRegionalFieldDrivePayload {
+    _fields: Vec<Vec<f64>>,
+    _piecewise_points: Vec<Vec<f64>>,
+    descriptors: Vec<ffi::fullmag_fdm_regional_field_drive_desc_v2>,
+}
+
+#[cfg(feature = "cuda")]
+enum NativeDriveSpec<'a> {
+    Regional(&'a fullmag_ir::ResolvedRegionalFieldDriveBasisIR),
+    Solved(&'a fullmag_ir::ResolvedSolvedAntennaDriveBasisIR),
+}
+
+#[cfg(feature = "cuda")]
+fn native_regional_field_drive_payload(
+    plan: &fullmag_ir::FdmPlanIR,
+) -> Result<Option<NativeRegionalFieldDrivePayload>, RunError> {
+    if let Some(inactive) = plan.solved_antenna_drive_bases.iter().find(|basis| {
+        !basis.drive.activation.is_active_for(
+            plan.time_stage.study_kind,
+            plan.time_stage.active_stage_id.as_deref(),
+        )
+    }) {
+        return Err(RunError {
+            message: format!(
+                "resolved CUDA antenna basis '{}' is inactive in the current stage",
+                inactive.drive.id
+            ),
+        });
+    }
+    let mut specs = Vec::with_capacity(
+        plan.regional_field_drive_bases.len() + plan.solved_antenna_drive_bases.len(),
+    );
+    specs.extend(
+        plan.regional_field_drive_bases
+            .iter()
+            .map(NativeDriveSpec::Regional),
+    );
+    specs.extend(
+        plan.solved_antenna_drive_bases
+            .iter()
+            .map(NativeDriveSpec::Solved),
+    );
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let cell_count = plan.initial_magnetization.len();
+    let flat_len = cell_count.checked_mul(3).ok_or_else(|| RunError {
+        message: "regional field drive basis length overflows usize".to_string(),
+    })?;
+    let drive_count = u32::try_from(specs.len()).map_err(|_| RunError {
+        message: "regional field drive count exceeds the native CUDA ABI limit".to_string(),
+    })?;
+    let mut fields = Vec::with_capacity(specs.len());
+    let mut piecewise_points = Vec::with_capacity(specs.len());
+    let mut descriptors = Vec::with_capacity(specs.len());
+
+    for spec in specs {
+        let (drive_id, field_xyz, field_scale, waveform, time_origin) = match spec {
+            NativeDriveSpec::Regional(resolved) => (
+                resolved.drive.id.as_str(),
+                resolved.field_xyz.as_slice(),
+                1.0,
+                &resolved.drive.waveform,
+                resolved.drive.time_origin,
+            ),
+            NativeDriveSpec::Solved(resolved) => (
+                resolved.drive.id.as_str(),
+                resolved.field_xyz_apm_per_a.as_slice(),
+                resolved.drive.peak_current_a,
+                &resolved.drive.waveform,
+                resolved.drive.time_origin,
+            ),
+        };
+        if field_xyz.len() != cell_count {
+            return Err(RunError {
+                message: format!(
+                    "regional field drive '{}' basis length {} differs from FDM cell count {}",
+                    drive_id,
+                    field_xyz.len(),
+                    cell_count
+                ),
+            });
+        }
+        let mut field = Vec::with_capacity(flat_len);
+        for value in field_xyz {
+            field.extend(value.iter().map(|component| component * field_scale));
+        }
+        let mut frequency_hz = 0.0;
+        let mut phase_rad = 0.0;
+        let mut offset = 0.0;
+        let mut t_on_s = 0.0;
+        let mut t_off_s = 0.0;
+        let mut cutoff_hz = 0.0;
+        let mut t0_s = 0.0;
+        let mut amplitude = 1.0;
+        let (waveform, points) = match waveform {
+            fullmag_ir::TimeDependenceIR::Constant => (
+                ffi::fullmag_fdm_regional_field_drive_waveform::FULLMAG_FDM_REGIONAL_FIELD_DRIVE_CONSTANT,
+                Vec::new(),
+            ),
+            fullmag_ir::TimeDependenceIR::Sinusoidal {
+                frequency_hz: frequency,
+                phase_rad: phase,
+                offset: waveform_offset,
+            } => {
+                frequency_hz = *frequency;
+                phase_rad = *phase;
+                offset = *waveform_offset;
+                (
+                    ffi::fullmag_fdm_regional_field_drive_waveform::FULLMAG_FDM_REGIONAL_FIELD_DRIVE_SINUSOIDAL,
+                    Vec::new(),
+                )
+            }
+            fullmag_ir::TimeDependenceIR::Pulse { t_on, t_off } => {
+                t_on_s = *t_on;
+                t_off_s = *t_off;
+                (
+                    ffi::fullmag_fdm_regional_field_drive_waveform::FULLMAG_FDM_REGIONAL_FIELD_DRIVE_PULSE,
+                    Vec::new(),
+                )
+            }
+            fullmag_ir::TimeDependenceIR::PiecewiseLinear { points } => {
+                let mut flat = Vec::with_capacity(points.len().checked_mul(2).ok_or_else(|| {
+                    RunError {
+                        message: "piecewise regional field drive length overflows usize"
+                            .to_string(),
+                    }
+                })?);
+                for [time_s, value] in points {
+                    flat.push(*time_s);
+                    flat.push(*value);
+                }
+                (
+                    ffi::fullmag_fdm_regional_field_drive_waveform::FULLMAG_FDM_REGIONAL_FIELD_DRIVE_PIECEWISE_LINEAR,
+                    flat,
+                )
+            }
+            fullmag_ir::TimeDependenceIR::SincPulse {
+                cutoff_hz: cutoff,
+                t0,
+                amplitude: waveform_amplitude,
+            } => {
+                cutoff_hz = *cutoff;
+                t0_s = *t0;
+                amplitude = *waveform_amplitude;
+                (
+                    ffi::fullmag_fdm_regional_field_drive_waveform::FULLMAG_FDM_REGIONAL_FIELD_DRIVE_SINC_PULSE,
+                    Vec::new(),
+                )
+            }
+        };
+        fields.push(field);
+        piecewise_points.push(points);
+        let field_storage = fields.last().expect("field storage was just appended");
+        let points_storage = piecewise_points
+            .last()
+            .expect("piecewise storage was just appended");
+        descriptors.push(ffi::fullmag_fdm_regional_field_drive_desc_v2 {
+            drive: ffi::fullmag_fdm_regional_field_drive_desc_v1 {
+                abi_version: ffi::FULLMAG_FDM_REGIONAL_FIELD_DRIVES_ABI_V2,
+                struct_size: std::mem::size_of::<ffi::fullmag_fdm_regional_field_drive_desc_v2>()
+                    as u32,
+                field_xyz: field_storage.as_ptr(),
+                field_len: field_storage.len() as u64,
+                waveform,
+                time_origin: match time_origin {
+                    fullmag_ir::FieldTimeOriginIR::StageLocal => {
+                        ffi::fullmag_fdm_regional_field_drive_time_origin::FULLMAG_FDM_REGIONAL_FIELD_DRIVE_STAGE_LOCAL
+                    }
+                    fullmag_ir::FieldTimeOriginIR::Absolute => {
+                        ffi::fullmag_fdm_regional_field_drive_time_origin::FULLMAG_FDM_REGIONAL_FIELD_DRIVE_ABSOLUTE
+                    }
+                },
+                stage_start_time_s: plan.time_stage.start_time_s,
+                frequency_hz,
+                phase_rad,
+                offset,
+                t_on_s,
+                t_off_s,
+                cutoff_hz,
+                t0_s,
+                amplitude,
+                piecewise_points: if points_storage.is_empty() {
+                    std::ptr::null()
+                } else {
+                    points_storage.as_ptr()
+                },
+                piecewise_point_count: (points_storage.len() / 2) as u64,
+            },
+            waveform_origin_time_s: plan.time_stage.waveform_origin_time_s(),
+        });
+    }
+
+    debug_assert_eq!(descriptors.len(), drive_count as usize);
+    Ok(Some(NativeRegionalFieldDrivePayload {
+        _fields: fields,
+        _piecewise_points: piecewise_points,
+        descriptors,
+    }))
+}
+
 /// Safe wrapper around the native FDM backend handle.
 #[cfg(feature = "cuda")]
 pub(crate) struct NativeFdmBackend {
     handle: *mut ffi::fullmag_fdm_backend,
     cell_count: usize,
     active_mask: Option<Vec<bool>>,
+    frozen_mask: Option<Vec<bool>>,
     precision: fullmag_ir::ExecutionPrecision,
+    precision_policy: fullmag_ir::FdmPrecisionPolicyIR,
     damping: f64,
     precession_enabled: bool,
     gpu_transport_bound: bool,
+    adaptive_timestep_enabled: bool,
+    stats_policy: NativeStatsPolicy,
+    rotated_dmi_only: bool,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AdaptiveBatchStep {
+    pub step: u64,
+    pub time: f64,
+    pub dt: f64,
+    pub suggested_next_dt: f64,
+    pub normalized_error: f64,
+    pub rejected_attempts: u32,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EndpointCacheTelemetry {
+    pub cache_identity_valid: bool,
+    pub stats_valid: bool,
+    pub accepted_state_revision: u64,
+    pub valid_field_mask: u64,
+    pub refresh_request_count: u64,
+    pub refresh_execution_count: u64,
+    pub refresh_cache_hit_count: u64,
+    pub invalidation_count: u64,
+    pub stats_snapshot_request_count: u64,
+    pub stats_snapshot_cache_hit_count: u64,
+    pub field_snapshot_request_count: u64,
+    pub field_snapshot_latency_total_ns: u64,
+    pub field_snapshot_latency_max_ns: u64,
+    pub exchange_evaluation_count: u64,
+    pub demag_evaluation_count: u64,
+    pub demag_forward_fft_count: u64,
+    pub demag_inverse_fft_count: u64,
+    pub effective_field_evaluation_count: u64,
+    pub energy_reduction_count: u64,
+    pub last_step_exchange_evaluation_count: u64,
+    pub last_step_demag_evaluation_count: u64,
+    pub last_step_demag_forward_fft_count: u64,
+    pub last_step_demag_inverse_fft_count: u64,
+    pub last_step_effective_field_evaluation_count: u64,
+    pub last_step_energy_reduction_count: u64,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeStatsMode {
+    Full,
+    None,
+    #[allow(dead_code)]
+    Control,
+    Requested,
+}
+
+#[cfg(feature = "cuda")]
+impl NativeStatsMode {
+    fn as_ffi(self) -> ffi::fullmag_fdm_stats_mode {
+        match self {
+            Self::Full => ffi::fullmag_fdm_stats_mode::FULLMAG_FDM_STATS_FULL,
+            Self::None => ffi::fullmag_fdm_stats_mode::FULLMAG_FDM_STATS_NONE,
+            Self::Control => ffi::fullmag_fdm_stats_mode::FULLMAG_FDM_STATS_CONTROL,
+            Self::Requested => ffi::fullmag_fdm_stats_mode::FULLMAG_FDM_STATS_REQUESTED,
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::None => "none",
+            Self::Control => "control",
+            Self::Requested => "requested",
+        }
+    }
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeStatsPolicy {
+    pub mode: NativeStatsMode,
+    pub stride: u32,
+    pub quantity_mask: u64,
+}
+
+#[cfg(feature = "cuda")]
+impl NativeStatsPolicy {
+    pub(crate) const fn full(stride: u32) -> Self {
+        Self {
+            mode: NativeStatsMode::Full,
+            stride,
+            quantity_mask: ffi::FULLMAG_FDM_STATS_QUANTITY_ALL,
+        }
+    }
+
+    pub(crate) const fn control(stride: u32) -> Self {
+        Self {
+            mode: NativeStatsMode::Control,
+            stride,
+            quantity_mask: ffi::FULLMAG_FDM_STATS_QUANTITY_CONTROL,
+        }
+    }
+
+    pub(crate) const fn none(stride: u32) -> Self {
+        Self {
+            mode: NativeStatsMode::None,
+            stride,
+            quantity_mask: 0,
+        }
+    }
+
+    pub(crate) const fn requested(stride: u32, quantity_mask: u64) -> Self {
+        Self {
+            mode: NativeStatsMode::Requested,
+            stride,
+            quantity_mask,
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -466,8 +977,9 @@ pub(crate) use device::DeviceInfo;
 
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone)]
-pub(crate) struct NativeLlgCheckpointV3 {
-    pub info: ffi::fullmag_fdm_llg_checkpoint_info_v3,
+#[allow(dead_code)]
+pub(crate) struct NativeLlgCheckpointV4 {
+    pub info: ffi::fullmag_fdm_llg_checkpoint_info_v4,
     pub payload_sha256: [u8; 32],
     pub payload: Vec<u8>,
 }
@@ -535,6 +1047,7 @@ pub(crate) struct NativeFdmPreviewSnapshot {
     plan: GridPreviewPlan,
     quantity: String,
     ready: Option<NativeFieldSnapshotReady>,
+    torque_inputs: Option<Box<(NativeFdmFieldSnapshot, NativeFdmFieldSnapshot, f64, bool)>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -798,6 +1311,33 @@ impl NativeFdmBackend {
             }
         }
 
+        if let Some(dmi_d) = plan.rotated_interfacial_dmi {
+            let descriptor = ffi::fullmag_fdm_rotated_interfacial_dmi_desc_v1 {
+                abi_version: ffi::FULLMAG_FDM_ROTATED_INTERFACIAL_DMI_ABI_V1,
+                struct_size: std::mem::size_of::<ffi::fullmag_fdm_rotated_interfacial_dmi_desc_v1>()
+                    as u32,
+                has_rotated_interfacial_dmi: 1,
+                reserved0: 0,
+                dmi_d_rotated_interfacial: dmi_d,
+            };
+            let status = unsafe {
+                ffi::fullmag_fdm_backend_set_rotated_interfacial_dmi_v1(handle, &descriptor)
+            };
+            if status != ffi::FULLMAG_FDM_OK {
+                let message = unsafe {
+                    let err = ffi::fullmag_fdm_backend_last_error(handle);
+                    if err.is_null() {
+                        "failed to configure rotated interfacial DMI on CUDA FDM multilayer backend"
+                            .to_string()
+                    } else {
+                        CStr::from_ptr(err).to_string_lossy().to_string()
+                    }
+                };
+                unsafe { ffi::fullmag_fdm_backend_destroy(handle) };
+                return Err(RunError { message });
+            }
+        }
+
         let first_material = plan.layers.first().map(|layer| &layer.material);
         let cell_count = plan
             .layers
@@ -827,14 +1367,66 @@ impl NativeFdmBackend {
             handle,
             cell_count,
             active_mask,
+            frozen_mask: None,
             precision: plan.precision,
+            precision_policy: plan.precision_policy.clone(),
             damping: first_material.map_or(0.0, |material| material.damping),
             precession_enabled: !llg_overdamped_uses_pure_damping(plan.relaxation.as_ref()),
             gpu_transport_bound: false,
+            adaptive_timestep_enabled: false,
+            stats_policy: NativeStatsPolicy::full(1),
+            rotated_dmi_only: plan.rotated_interfacial_dmi.is_some()
+                && plan.interfacial_dmi.is_none()
+                && plan.bulk_dmi.is_none(),
         })
     }
 
     pub fn create(plan: &fullmag_ir::FdmPlanIR) -> Result<Self, RunError> {
+        Self::create_with_stats_policy(plan, NativeStatsPolicy::full(1))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn create_for_adaptive_batch(
+        plan: &fullmag_ir::FdmPlanIR,
+    ) -> Result<Self, RunError> {
+        Self::create_for_adaptive_batch_with_policy(plan, NativeStatsPolicy::none(1))
+    }
+
+    pub(crate) fn create_for_adaptive_batch_with_policy(
+        plan: &fullmag_ir::FdmPlanIR,
+        stats_policy: NativeStatsPolicy,
+    ) -> Result<Self, RunError> {
+        if plan.adaptive_timestep.is_none() {
+            return Err(RunError {
+                message: "batched CUDA FDM construction requires an adaptive timestep policy"
+                    .to_string(),
+            });
+        }
+        Self::create_with_stats_policy(plan, stats_policy)
+    }
+
+    pub(crate) fn create_with_stats_policy(
+        plan: &fullmag_ir::FdmPlanIR,
+        stats_policy: NativeStatsPolicy,
+    ) -> Result<Self, RunError> {
+        // This is the last typed boundary before the dense carrier is flattened
+        // into nullable ABI pointers. Never let malformed or stale selection
+        // evidence reach a device probe, allocation, or native repair path.
+        validate_native_frozen_spins_plan(plan)?;
+        crate::antenna_fields::validate_fdm_antenna_sample_counts(
+            plan,
+            plan.initial_magnetization.len(),
+        )?;
+        let integrator_choice = plan
+            .integrator
+            .unwrap_or(fullmag_ir::IntegratorChoice::Heun);
+        validate_native_adaptive_policy(
+            integrator_choice,
+            plan.adaptive_timestep.as_ref(),
+            plan.temperature.unwrap_or(0.0) > 0.0,
+            plan.oersted_time_dep_kind != 0,
+            !plan.spin_transport_plans.is_empty(),
+        )?;
         let frozen_capabilities = if plan.frozen_spins.is_some() {
             unsafe { ffi::fullmag_fdm_capability_bits_v1() }
         } else {
@@ -881,10 +1473,7 @@ impl NativeFdmBackend {
 
         // The native descriptor retains an ABI-only slot that direct
         // minimizers do not consume.
-        let integrator = match plan
-            .integrator
-            .unwrap_or(fullmag_ir::IntegratorChoice::Heun)
-        {
+        let integrator = match integrator_choice {
             fullmag_ir::IntegratorChoice::Heun => {
                 ffi::fullmag_fdm_integrator::FULLMAG_FDM_INTEGRATOR_HEUN
             }
@@ -1355,8 +1944,12 @@ impl NativeFdmBackend {
             adaptive_dt_min: 0.0,
             adaptive_dt_max: 0.0,
             adaptive_headroom: 0.0,
-            stats_mode: ffi::fullmag_fdm_stats_mode::FULLMAG_FDM_STATS_FULL,
-            stats_stride: 1,
+            stats_mode: if stats_policy.mode == NativeStatsMode::Requested {
+                NativeStatsMode::None.as_ffi()
+            } else {
+                stats_policy.mode.as_ffi()
+            },
+            stats_stride: stats_policy.stride,
             frozen_mask: frozen_mask_flat
                 .as_ref()
                 .map_or(std::ptr::null(), |mask| mask.as_ptr()),
@@ -1381,6 +1974,12 @@ impl NativeFdmBackend {
             struct_size: std::mem::size_of::<ffi::fullmag_fdm_plan_desc_v2>() as u32,
             base: plan_desc,
             time_policy,
+            has_rotated_interfacial_dmi: if plan.rotated_interfacial_dmi.is_some() {
+                1
+            } else {
+                0
+            },
+            dmi_D_rotated_interfacial: plan.rotated_interfacial_dmi.unwrap_or(0.0),
         };
 
         let mut handle = std::ptr::null_mut();
@@ -1421,6 +2020,28 @@ impl NativeFdmBackend {
             return Err(RunError { message: msg });
         }
 
+        let native_stats_policy = ffi::fullmag_fdm_stats_policy_v1 {
+            abi_version: ffi::FULLMAG_FDM_STATS_POLICY_ABI_V1,
+            struct_size: std::mem::size_of::<ffi::fullmag_fdm_stats_policy_v1>() as u32,
+            mode: stats_policy.mode.as_ffi(),
+            stride: stats_policy.stride,
+            quantity_mask: stats_policy.quantity_mask,
+        };
+        let policy_status =
+            unsafe { ffi::fullmag_fdm_backend_set_stats_policy_v1(handle, &native_stats_policy) };
+        if policy_status != ffi::FULLMAG_FDM_OK {
+            let message = unsafe {
+                let err = ffi::fullmag_fdm_backend_last_error(handle);
+                if err.is_null() {
+                    "failed to apply resolved CUDA FDM stats policy".to_string()
+                } else {
+                    CStr::from_ptr(err).to_string_lossy().to_string()
+                }
+            };
+            unsafe { ffi::fullmag_fdm_backend_destroy(handle) };
+            return Err(RunError { message });
+        }
+
         if let Some(field) = static_external_field_flat.as_ref() {
             let marked = unsafe {
                 ffi::fullmag_fdm_backend_set_static_external_field_f64(
@@ -1443,15 +2064,75 @@ impl NativeFdmBackend {
             }
         }
 
+        if let Some(regional_drives) = native_regional_field_drive_payload(plan)? {
+            let drive_status = unsafe {
+                ffi::fullmag_fdm_backend_set_regional_field_drives_v2(
+                    handle,
+                    regional_drives.descriptors.as_ptr(),
+                    regional_drives.descriptors.len() as u32,
+                )
+            };
+            if drive_status != ffi::FULLMAG_FDM_OK {
+                let message = unsafe {
+                    let err = ffi::fullmag_fdm_backend_last_error(handle);
+                    if err.is_null() {
+                        "failed to upload regional field drives to CUDA FDM".to_string()
+                    } else {
+                        CStr::from_ptr(err).to_string_lossy().to_string()
+                    }
+                };
+                unsafe { ffi::fullmag_fdm_backend_destroy(handle) };
+                return Err(RunError { message });
+            }
+        }
+
         Ok(Self {
             handle,
             cell_count: m_flat.len() / 3,
             active_mask: plan.active_mask.clone(),
+            frozen_mask: plan
+                .frozen_spins
+                .as_ref()
+                .map(|frozen_spins| frozen_spins.frozen_mask.clone()),
             precision: plan.precision,
+            precision_policy: plan.precision_policy.clone(),
             damping: plan.material.damping,
             precession_enabled: !llg_overdamped_uses_pure_damping(plan.relaxation.as_ref()),
             gpu_transport_bound: false,
+            adaptive_timestep_enabled: adaptive.is_some(),
+            stats_policy,
+            rotated_dmi_only: plan.rotated_interfacial_dmi.is_some()
+                && plan.interfacial_dmi.is_none()
+                && plan.bulk_dmi.is_none(),
         })
+    }
+
+    fn split_dmi_energy(&self, aggregate_dmi_energy: f64) -> (f64, f64) {
+        crate::types::split_rotated_only_dmi_energy(self.rotated_dmi_only, aggregate_dmi_energy)
+    }
+
+    pub(crate) fn stats_policy(&self) -> NativeStatsPolicy {
+        self.stats_policy
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_stats_policy(
+        &mut self,
+        stats_policy: NativeStatsPolicy,
+    ) -> Result<(), RunError> {
+        let policy = ffi::fullmag_fdm_stats_policy_v1 {
+            abi_version: ffi::FULLMAG_FDM_STATS_POLICY_ABI_V1,
+            struct_size: std::mem::size_of::<ffi::fullmag_fdm_stats_policy_v1>() as u32,
+            mode: stats_policy.mode.as_ffi(),
+            stride: stats_policy.stride,
+            quantity_mask: stats_policy.quantity_mask,
+        };
+        let status = unsafe { ffi::fullmag_fdm_backend_set_stats_policy_v1(self.handle, &policy) };
+        if status != ffi::FULLMAG_FDM_OK {
+            return Err(self.last_error_or("setting CUDA FDM stats policy failed"));
+        }
+        self.stats_policy = stats_policy;
+        Ok(())
     }
 
     pub(crate) fn bind_gpu_transport(
@@ -1550,8 +2231,11 @@ impl NativeFdmBackend {
             return Err(self.last_error_or("step failed"));
         }
 
+        let adaptive_summary = self.copy_adaptive_attempt_summary()?;
+
         let native_metrics =
             validate_native_step_metrics(stats.max_torque_Apm, stats.max_rhs_amplitude)?;
+        let (e_dmi, e_rotated_dmi) = self.split_dmi_energy(stats.dmi_energy_joules);
         let mut step_stats = StepStats {
             step: stats.step,
             time: stats.time_seconds,
@@ -1560,7 +2244,8 @@ impl NativeFdmBackend {
             e_demag: stats.demag_energy_joules,
             e_ext: stats.external_energy_joules,
             e_ani: stats.anisotropy_energy_joules + stats.cubic_energy_joules,
-            e_dmi: stats.dmi_energy_joules,
+            e_dmi,
+            e_rotated_dmi,
             e_total: stats.total_energy_joules,
             max_h_eff: stats.max_effective_field_amplitude,
             max_h_demag: stats.max_demag_field_amplitude,
@@ -1573,6 +2258,8 @@ impl NativeFdmBackend {
             hot_loop_host_sync_count: stats.hot_loop_host_sync_count,
             hot_loop_control_scalar_d2h_bytes: stats.hot_loop_control_scalar_d2h_bytes,
             hot_loop_control_scalar_host_sync_count: stats.hot_loop_control_scalar_host_sync_count,
+            error_estimate: adaptive_summary.map(|(_, error)| error),
+            rejected_attempts: adaptive_summary.map_or(0, |(rejected, _)| rejected),
             dt_suggested: if stats.suggested_next_dt > 0.0 {
                 Some(stats.suggested_next_dt)
             } else {
@@ -1582,6 +2269,156 @@ impl NativeFdmBackend {
         };
         step_stats.per_object_scalars = single_object_scalars("free", &step_stats);
         Ok(Some(step_stats))
+    }
+
+    pub(crate) fn step_adaptive_batch_interruptible(
+        &mut self,
+        initial_dt: f64,
+        target_time: f64,
+        max_steps: u32,
+        interrupt_signal: Option<&AtomicBool>,
+    ) -> Result<Option<Vec<AdaptiveBatchStep>>, RunError> {
+        self.set_interrupt_signal(interrupt_signal)?;
+        if !self.adaptive_timestep_enabled {
+            return Err(RunError {
+                message: "adaptive CUDA batch requested for a fixed-step backend".to_string(),
+            });
+        }
+        if max_steps == 0 || max_steps as usize > ffi::FULLMAG_FDM_ADAPTIVE_BATCH_STEP_CAPACITY_V1 {
+            return Err(RunError {
+                message: format!(
+                    "adaptive CUDA batch max_steps must be in 1..={}, got {max_steps}",
+                    ffi::FULLMAG_FDM_ADAPTIVE_BATCH_STEP_CAPACITY_V1
+                ),
+            });
+        }
+
+        let mut records =
+            [std::mem::MaybeUninit::<ffi::fullmag_fdm_adaptive_batch_step_v1>::uninit();
+                ffi::FULLMAG_FDM_ADAPTIVE_BATCH_STEP_CAPACITY_V1];
+        let mut count = 0u32;
+        let rc = unsafe {
+            ffi::fullmag_fdm_backend_step_adaptive_batch_v1(
+                self.handle,
+                initial_dt,
+                target_time,
+                max_steps,
+                records.as_mut_ptr().cast(),
+                records.len() as u32,
+                &mut count,
+            )
+        };
+        if rc == ffi::FULLMAG_FDM_ERR_INTERRUPTED {
+            return Ok(None);
+        }
+        if rc != ffi::FULLMAG_FDM_OK {
+            return Err(self.last_error_or("adaptive CUDA batch step failed"));
+        }
+        if count == 0 || count > max_steps {
+            return Err(RunError {
+                message: format!(
+                    "native adaptive CUDA batch returned invalid record count {count} for max_steps={max_steps}"
+                ),
+            });
+        }
+        let records = unsafe {
+            std::slice::from_raw_parts(
+                records
+                    .as_ptr()
+                    .cast::<ffi::fullmag_fdm_adaptive_batch_step_v1>(),
+                count as usize,
+            )
+        };
+        let mut batch = Vec::with_capacity(records.len());
+        let mut previous_step = None;
+        let mut previous_time = None;
+        for record in records {
+            if record.abi_version != ffi::FULLMAG_FDM_ADAPTIVE_BATCH_STEP_ABI_V1
+                || record.struct_size
+                    != std::mem::size_of::<ffi::fullmag_fdm_adaptive_batch_step_v1>() as u32
+                || record.decision != ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_ACCEPTED
+                || record.reason != ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_WITHIN_TOLERANCE
+                || !record.time_seconds.is_finite()
+                || !record.dt_seconds.is_finite()
+                || record.dt_seconds <= 0.0
+                || !record.suggested_next_dt_seconds.is_finite()
+                || record.suggested_next_dt_seconds <= 0.0
+                || !record.normalized_error.is_finite()
+                || record.normalized_error < 0.0
+                || previous_step.is_some_and(|step| record.step != step + 1)
+                || previous_time.is_some_and(|time| record.time_seconds <= time)
+            {
+                return Err(RunError {
+                    message: "native adaptive CUDA batch returned an invalid accepted-step trace"
+                        .to_string(),
+                });
+            }
+            previous_step = Some(record.step);
+            previous_time = Some(record.time_seconds);
+            batch.push(AdaptiveBatchStep {
+                step: record.step,
+                time: record.time_seconds,
+                dt: record.dt_seconds,
+                suggested_next_dt: record.suggested_next_dt_seconds,
+                normalized_error: record.normalized_error,
+                rejected_attempts: record.rejected_attempts,
+            });
+        }
+        if batch.last().is_some_and(|record| {
+            record.time > target_time + crate::schedules::OUTPUT_TIME_TOLERANCE
+        }) {
+            return Err(RunError {
+                message: "native adaptive CUDA batch advanced beyond its target time".to_string(),
+            });
+        }
+        Ok(Some(batch))
+    }
+
+    fn copy_adaptive_attempt_summary(&self) -> Result<Option<(u32, f64)>, RunError> {
+        if !self.adaptive_timestep_enabled {
+            return Ok(None);
+        }
+        let mut count = 0u32;
+        let rc = unsafe {
+            ffi::fullmag_fdm_backend_copy_adaptive_attempts_v1(
+                self.handle,
+                std::ptr::null_mut(),
+                0,
+                &mut count,
+            )
+        };
+        if rc != ffi::FULLMAG_FDM_OK {
+            return Err(self.last_error_or("adaptive attempt count query failed"));
+        }
+        if count == 0 || count as usize > ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_CAPACITY_V1 {
+            return Err(RunError {
+                message: format!("native FDM adaptive attempt count is invalid: {count}"),
+            });
+        }
+
+        let mut records = [std::mem::MaybeUninit::<ffi::fullmag_fdm_adaptive_attempt_v1>::uninit();
+            ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_CAPACITY_V1];
+        let mut copied = 0u32;
+        let rc = unsafe {
+            ffi::fullmag_fdm_backend_copy_adaptive_attempts_v1(
+                self.handle,
+                records.as_mut_ptr().cast(),
+                records.len() as u32,
+                &mut copied,
+            )
+        };
+        if rc != ffi::FULLMAG_FDM_OK || copied != count {
+            return Err(self.last_error_or("adaptive attempt batch copy failed"));
+        }
+        let records = unsafe {
+            std::slice::from_raw_parts(
+                records
+                    .as_ptr()
+                    .cast::<ffi::fullmag_fdm_adaptive_attempt_v1>(),
+                copied as usize,
+            )
+        };
+        validate_adaptive_attempt_batch(records).map(Some)
     }
 
     pub fn apply_average_m_to_step_stats(&self, stats: &mut StepStats) -> Result<(), RunError> {
@@ -1627,7 +2464,7 @@ impl NativeFdmBackend {
                     message: format!(
                         "FDM CUDA checkpoint identity cannot request backend '{other:?}'"
                     ),
-                })
+                });
             }
         };
         let requested_device = match requested_device {
@@ -1638,7 +2475,7 @@ impl NativeFdmBackend {
                     message: format!(
                         "FDM CUDA checkpoint identity cannot request device '{other}'"
                     ),
-                })
+                });
             }
         };
         let policy = match execution_mode {
@@ -1648,7 +2485,7 @@ impl NativeFdmBackend {
                 return Err(RunError {
                     message: "FDM CUDA checkpoint identity does not support hybrid execution"
                         .to_string(),
-                })
+                });
             }
         };
         let precision = match self.precision {
@@ -1716,10 +2553,11 @@ impl NativeFdmBackend {
         Ok(())
     }
 
-    pub(crate) fn export_llg_checkpoint(&self) -> Result<NativeLlgCheckpointV3, RunError> {
+    #[allow(dead_code)]
+    pub(crate) fn export_llg_checkpoint(&self) -> Result<NativeLlgCheckpointV4, RunError> {
         let mut required_bytes = 0u64;
         let rc = unsafe {
-            ffi::fullmag_fdm_backend_llg_checkpoint_query_size_v3(self.handle, &mut required_bytes)
+            ffi::fullmag_fdm_backend_llg_checkpoint_query_size_v4(self.handle, &mut required_bytes)
         };
         if rc != ffi::FULLMAG_FDM_OK {
             return Err(self.last_error_or("LLG checkpoint size query failed"));
@@ -1734,9 +2572,9 @@ impl NativeFdmBackend {
                 message: format!("failed to allocate {required_bytes} bytes for LLG checkpoint"),
             })?;
         payload.resize(payload_len, 0);
-        let mut info = ffi::fullmag_fdm_llg_checkpoint_info_v3::default();
+        let mut info = ffi::fullmag_fdm_llg_checkpoint_info_v4::default();
         let rc = unsafe {
-            ffi::fullmag_fdm_backend_llg_checkpoint_export_v3(
+            ffi::fullmag_fdm_backend_llg_checkpoint_export_v4(
                 self.handle,
                 payload.as_mut_ptr().cast(),
                 required_bytes,
@@ -1746,7 +2584,7 @@ impl NativeFdmBackend {
         if rc != ffi::FULLMAG_FDM_OK {
             return Err(self.last_error_or("LLG checkpoint export failed"));
         }
-        if info.schema_version != ffi::FULLMAG_FDM_LLG_CHECKPOINT_SCHEMA_V3
+        if info.schema_version != ffi::FULLMAG_FDM_LLG_CHECKPOINT_SCHEMA_V4
             || info.payload_bytes != required_bytes
             || info.cell_count != self.cell_count as u64
         {
@@ -1754,22 +2592,23 @@ impl NativeFdmBackend {
                 message: "native LLG checkpoint metadata does not match the backend".to_string(),
             });
         }
-        Ok(NativeLlgCheckpointV3 {
+        Ok(NativeLlgCheckpointV4 {
             info,
             payload_sha256: Sha256::digest(&payload).into(),
             payload,
         })
     }
 
+    #[allow(dead_code)]
     pub(crate) fn restore_llg_checkpoint(
         &mut self,
-        checkpoint: &NativeLlgCheckpointV3,
+        checkpoint: &NativeLlgCheckpointV4,
     ) -> Result<(), RunError> {
         let payload_bytes = u64::try_from(checkpoint.payload.len()).map_err(|_| RunError {
             message: "LLG checkpoint payload exceeds u64".to_string(),
         })?;
         let payload_sha256: [u8; 32] = Sha256::digest(&checkpoint.payload).into();
-        if checkpoint.info.schema_version != ffi::FULLMAG_FDM_LLG_CHECKPOINT_SCHEMA_V3
+        if checkpoint.info.schema_version != ffi::FULLMAG_FDM_LLG_CHECKPOINT_SCHEMA_V4
             || checkpoint.info.payload_bytes != payload_bytes
             || checkpoint.info.cell_count != self.cell_count as u64
             || checkpoint.payload_sha256 != payload_sha256
@@ -1779,7 +2618,7 @@ impl NativeFdmBackend {
             });
         }
         let rc = unsafe {
-            ffi::fullmag_fdm_backend_llg_checkpoint_import_v3(
+            ffi::fullmag_fdm_backend_llg_checkpoint_import_v4(
                 self.handle,
                 checkpoint.payload.as_ptr().cast(),
                 payload_bytes,
@@ -1882,6 +2721,7 @@ impl NativeFdmBackend {
     }
 
     /// Copy a canonical scalar quantity from device to host as f64.
+    #[allow(dead_code)]
     pub fn copy_scalar_quantity(
         &self,
         quantity: &str,
@@ -1989,6 +2829,13 @@ impl NativeFdmBackend {
         )
     }
 
+    pub fn copy_h_rotated_dmi(&self, cell_count: usize) -> Result<Vec<[f64; 3]>, RunError> {
+        self.copy_field(
+            ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI,
+            cell_count,
+        )
+    }
+
     pub fn copy_h_eff(&self, cell_count: usize) -> Result<Vec<[f64; 3]>, RunError> {
         self.copy_field(
             ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_H_EFF,
@@ -2091,6 +2938,18 @@ impl NativeFdmBackend {
         )
     }
 
+    pub fn copy_layer_h_rotated_dmi(
+        &self,
+        layer_index: u32,
+        cell_count: usize,
+    ) -> Result<Vec<[f64; 3]>, RunError> {
+        self.copy_layer_field(
+            layer_index,
+            ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI,
+            cell_count,
+        )
+    }
+
     #[allow(dead_code)]
     pub fn copy_layer_h_dmi_f32(
         &self,
@@ -2100,6 +2959,18 @@ impl NativeFdmBackend {
         self.copy_layer_field_f32(
             layer_index,
             ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_H_DMI,
+            cell_count,
+        )
+    }
+
+    pub fn copy_layer_h_rotated_dmi_f32(
+        &self,
+        layer_index: u32,
+        cell_count: usize,
+    ) -> Result<Vec<[f32; 3]>, RunError> {
+        self.copy_layer_field_f32(
+            layer_index,
+            ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI,
             cell_count,
         )
     }
@@ -2238,6 +3109,50 @@ impl NativeFdmBackend {
     ) -> Result<NativeFdmPreviewSnapshot, RunError> {
         let plan = plan_grid_preview(request, original_grid);
         let quantity = normalized_quantity_name(&request.quantity)?.to_string();
+        if quantity == "torque" {
+            // Capture both inputs before returning to the solver. Waiting and
+            // deriving torque happen on the observation worker, never against
+            // a later live state. Sample only after evaluating the nonlinear field.
+            let magnetization = self.begin_field_snapshot("m", 0, 0.0, 0.0)?;
+            let effective_field = self.begin_field_snapshot("H_eff", 0, 0.0, 0.0)?;
+            return Ok(NativeFdmPreviewSnapshot {
+                handle: std::ptr::null_mut(),
+                request: request.clone(),
+                plan,
+                quantity,
+                ready: None,
+                torque_inputs: Some(Box::new((
+                    magnetization,
+                    effective_field,
+                    self.damping,
+                    self.precession_enabled,
+                ))),
+            });
+        }
+        if quantity == QuantityId::FrozenSpins.as_str() {
+            let values = self.frozen_mask_values()?;
+            let sampled = resample_grid_scalars(&values, &plan);
+            let mut data = Vec::with_capacity(sampled.len() * std::mem::size_of::<f64>());
+            for value in &sampled {
+                data.extend_from_slice(&value.to_ne_bytes());
+            }
+            return Ok(NativeFdmPreviewSnapshot {
+                handle: std::ptr::null_mut(),
+                request: request.clone(),
+                plan,
+                quantity,
+                torque_inputs: None,
+                ready: Some(NativeFieldSnapshotReady {
+                    data,
+                    info: NativeFieldSnapshotInfo {
+                        cell_count: sampled.len(),
+                        component_count: 1,
+                        scalar_bytes: std::mem::size_of::<f64>(),
+                        scalar_type: NativeFieldSnapshotScalarType::F64,
+                    },
+                }),
+            });
+        }
         let observable = snapshot_observable(&quantity).ok_or_else(|| RunError {
             message: format!("unsupported CUDA preview snapshot '{}'", request.quantity),
         })?;
@@ -2261,6 +3176,7 @@ impl NativeFdmBackend {
             plan,
             quantity,
             ready: None,
+            torque_inputs: None,
         })
     }
 
@@ -2279,6 +3195,15 @@ impl NativeFdmBackend {
             return Err(RunError {
                 message: "copy_field_preview planned an empty preview grid".to_string(),
             });
+        }
+
+        if quantity == QuantityId::FrozenSpins.as_str() {
+            return Ok(build_grid_scalar_preview_field(
+                request,
+                &self.frozen_mask_values()?,
+                original_grid,
+                active_mask,
+            ));
         }
 
         if is_scalar_quantity_name(quantity) {
@@ -2365,6 +3290,15 @@ impl NativeFdmBackend {
             quantity,
             active_mask.map(|mask| resample_grid_mask(mask, &plan)),
         ))
+    }
+
+    fn frozen_mask_values(&self) -> Result<Vec<f64>, RunError> {
+        self.frozen_mask
+            .as_deref()
+            .map(|mask| mask.iter().map(|frozen| f64::from(*frozen)).collect())
+            .ok_or_else(|| RunError {
+                message: "CUDA FDM snapshot 'frozen_spins': constraint is not active".to_string(),
+            })
     }
 
     pub fn upload_magnetization(&mut self, magnetization: &[[f64; 3]]) -> Result<(), RunError> {
@@ -2497,6 +3431,77 @@ impl NativeFdmBackend {
         Ok(())
     }
 
+    pub(crate) fn endpoint_cache_telemetry(&self) -> Result<EndpointCacheTelemetry, RunError> {
+        let mut telemetry = ffi::fullmag_fdm_endpoint_cache_telemetry_v1 {
+            abi_version: ffi::FULLMAG_FDM_ENDPOINT_CACHE_TELEMETRY_ABI_V1,
+            struct_size: std::mem::size_of::<ffi::fullmag_fdm_endpoint_cache_telemetry_v1>() as u32,
+            cache_identity_valid: 0,
+            stats_valid: 0,
+            accepted_state_revision: 0,
+            accepted_time_bits: 0,
+            source_revision: 0,
+            field_revision: 0,
+            transport_revision: 0,
+            projection_policy_identity: 0,
+            valid_field_mask: 0,
+            refresh_request_count: 0,
+            refresh_execution_count: 0,
+            refresh_cache_hit_count: 0,
+            invalidation_count: 0,
+            stats_snapshot_request_count: 0,
+            stats_snapshot_cache_hit_count: 0,
+            field_snapshot_request_count: 0,
+            field_snapshot_latency_total_ns: 0,
+            field_snapshot_latency_max_ns: 0,
+            exchange_evaluation_count: 0,
+            demag_evaluation_count: 0,
+            demag_forward_fft_count: 0,
+            demag_inverse_fft_count: 0,
+            effective_field_evaluation_count: 0,
+            energy_reduction_count: 0,
+            last_step_exchange_evaluation_count: 0,
+            last_step_demag_evaluation_count: 0,
+            last_step_demag_forward_fft_count: 0,
+            last_step_demag_inverse_fft_count: 0,
+            last_step_effective_field_evaluation_count: 0,
+            last_step_energy_reduction_count: 0,
+        };
+        let rc = unsafe {
+            ffi::fullmag_fdm_backend_get_endpoint_cache_telemetry_v1(self.handle, &mut telemetry)
+        };
+        if rc != ffi::FULLMAG_FDM_OK {
+            return Err(self.last_error_or("endpoint cache telemetry query failed"));
+        }
+        Ok(EndpointCacheTelemetry {
+            cache_identity_valid: telemetry.cache_identity_valid != 0,
+            stats_valid: telemetry.stats_valid != 0,
+            accepted_state_revision: telemetry.accepted_state_revision,
+            valid_field_mask: telemetry.valid_field_mask,
+            refresh_request_count: telemetry.refresh_request_count,
+            refresh_execution_count: telemetry.refresh_execution_count,
+            refresh_cache_hit_count: telemetry.refresh_cache_hit_count,
+            invalidation_count: telemetry.invalidation_count,
+            stats_snapshot_request_count: telemetry.stats_snapshot_request_count,
+            stats_snapshot_cache_hit_count: telemetry.stats_snapshot_cache_hit_count,
+            field_snapshot_request_count: telemetry.field_snapshot_request_count,
+            field_snapshot_latency_total_ns: telemetry.field_snapshot_latency_total_ns,
+            field_snapshot_latency_max_ns: telemetry.field_snapshot_latency_max_ns,
+            exchange_evaluation_count: telemetry.exchange_evaluation_count,
+            demag_evaluation_count: telemetry.demag_evaluation_count,
+            demag_forward_fft_count: telemetry.demag_forward_fft_count,
+            demag_inverse_fft_count: telemetry.demag_inverse_fft_count,
+            effective_field_evaluation_count: telemetry.effective_field_evaluation_count,
+            energy_reduction_count: telemetry.energy_reduction_count,
+            last_step_exchange_evaluation_count: telemetry.last_step_exchange_evaluation_count,
+            last_step_demag_evaluation_count: telemetry.last_step_demag_evaluation_count,
+            last_step_demag_forward_fft_count: telemetry.last_step_demag_forward_fft_count,
+            last_step_demag_inverse_fft_count: telemetry.last_step_demag_inverse_fft_count,
+            last_step_effective_field_evaluation_count: telemetry
+                .last_step_effective_field_evaluation_count,
+            last_step_energy_reduction_count: telemetry.last_step_energy_reduction_count,
+        })
+    }
+
     pub fn snapshot_step_stats(&mut self, grid: [u32; 3]) -> Result<StepStats, RunError> {
         let mut stats = ffi::fullmag_fdm_step_stats {
             step: 0,
@@ -2535,6 +3540,7 @@ impl NativeFdmBackend {
         let magnetization = self.copy_m(cell_count)?;
         let native_metrics =
             validate_native_step_metrics(stats.max_torque_Apm, stats.max_rhs_amplitude)?;
+        let (e_dmi, e_rotated_dmi) = self.split_dmi_energy(stats.dmi_energy_joules);
         let mut step_stats = StepStats {
             step: stats.step,
             time: stats.time_seconds,
@@ -2543,7 +3549,8 @@ impl NativeFdmBackend {
             e_demag: stats.demag_energy_joules,
             e_ext: stats.external_energy_joules,
             e_ani: stats.anisotropy_energy_joules + stats.cubic_energy_joules,
-            e_dmi: stats.dmi_energy_joules,
+            e_dmi,
+            e_rotated_dmi,
             e_total: stats.total_energy_joules,
             max_dm_dt: native_metrics.max_rhs_norm_per_s,
             max_rhs_norm_per_s: native_metrics.max_rhs_norm_per_s,
@@ -2565,6 +3572,30 @@ impl NativeFdmBackend {
         );
         step_stats.per_object_scalars = single_object_scalars("free", &step_stats);
         Ok(step_stats)
+    }
+
+    pub(crate) fn snapshot_step_stats_with_policy(
+        &mut self,
+        grid: [u32; 3],
+        policy: NativeStatsPolicy,
+    ) -> Result<StepStats, RunError> {
+        let previous = self.stats_policy();
+        let changed = previous != policy;
+        if changed {
+            self.set_stats_policy(policy)?;
+        }
+        let snapshot = self.snapshot_step_stats(grid);
+        let restored = if changed {
+            self.set_stats_policy(previous)
+        } else {
+            Ok(())
+        };
+        match (snapshot, restored) {
+            (Ok(stats), Ok(())) => Ok(stats),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(_restore_error)) => Err(error),
+        }
     }
 
     fn last_error_or(&self, fallback: &str) -> RunError {
@@ -2677,6 +3708,38 @@ impl NativeFdmFieldSnapshot {
 #[cfg(feature = "cuda")]
 impl NativeFdmPreviewSnapshot {
     fn ensure_ready(&mut self) -> Result<&NativeFieldSnapshotReady, RunError> {
+        if let Some(inputs) = self.torque_inputs.take() {
+            let (mut magnetization, mut effective_field, damping, precession) = *inputs;
+            let m = decode_snapshot_vectors(magnetization.ensure_ready()?)?;
+            let h = decode_snapshot_vectors(effective_field.ensure_ready()?)?;
+            let expected_cells = self
+                .plan
+                .original_grid
+                .iter()
+                .map(|n| *n as usize)
+                .product::<usize>();
+            if m.len() != h.len() || m.len() != expected_cells {
+                return Err(RunError {
+                    message: "torque snapshot input sizes differ".into(),
+                });
+            }
+            let torque = compute_torque_field(&m, &h, damping, precession);
+            let sampled = crate::preview::resample_grid_vectors(&torque, &self.plan);
+            let data = sampled
+                .iter()
+                .flatten()
+                .flat_map(|v| v.to_ne_bytes())
+                .collect();
+            self.ready = Some(NativeFieldSnapshotReady {
+                data,
+                info: NativeFieldSnapshotInfo {
+                    cell_count: sampled.len(),
+                    component_count: 3,
+                    scalar_bytes: std::mem::size_of::<f64>(),
+                    scalar_type: NativeFieldSnapshotScalarType::F64,
+                },
+            });
+        }
         if self.ready.is_none() {
             let mut data = std::ptr::null();
             let mut len_bytes = 0u64;
@@ -2850,6 +3913,9 @@ fn snapshot_observable(name: &str) -> Option<ffi::fullmag_fdm_observable> {
         CudaSnapshotObservable::HExt => ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_H_EXT,
         CudaSnapshotObservable::HOe => ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_H_OE,
         CudaSnapshotObservable::HAni => ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_H_ANI,
+        CudaSnapshotObservable::HRotatedDmi => {
+            ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI
+        }
         CudaSnapshotObservable::HEff => ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_H_EFF,
         CudaSnapshotObservable::EdenEx => {
             ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_EDEN_EX
@@ -2869,6 +3935,9 @@ fn snapshot_observable(name: &str) -> Option<ffi::fullmag_fdm_observable> {
         CudaSnapshotObservable::EdenDmi => {
             ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_EDEN_DMI
         }
+        CudaSnapshotObservable::EdenRotatedDmi => {
+            ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_EDEN_ROTATED_DMI
+        }
         CudaSnapshotObservable::EdenTotal => {
             ffi::fullmag_fdm_observable::FULLMAG_FDM_OBSERVABLE_EDEN_TOTAL
         }
@@ -2879,8 +3948,88 @@ fn snapshot_observable(name: &str) -> Option<ffi::fullmag_fdm_observable> {
 fn is_scalar_quantity_name(name: &str) -> bool {
     crate::quantities::normalize_quantity_id(name)
         .ok()
-        .and_then(CudaSnapshotObservable::from_quantity)
-        .is_some_and(CudaSnapshotObservable::is_scalar)
+        .is_some_and(|id| {
+            id == QuantityId::FrozenSpins
+                || CudaSnapshotObservable::from_quantity(id)
+                    .is_some_and(CudaSnapshotObservable::is_scalar)
+        })
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod torque_preview_snapshot_tests {
+    use super::*;
+
+    fn captured(name: &str, values: [f64; 3]) -> NativeFdmFieldSnapshot {
+        NativeFdmFieldSnapshot {
+            handle: std::ptr::null_mut(),
+            name: name.into(),
+            step: 7,
+            time: 1e-12,
+            solver_dt: 1e-13,
+            ready: Some(NativeFieldSnapshotReady {
+                data: values.iter().flat_map(|v| v.to_ne_bytes()).collect(),
+                info: NativeFieldSnapshotInfo {
+                    cell_count: 1,
+                    component_count: 3,
+                    scalar_bytes: 8,
+                    scalar_type: NativeFieldSnapshotScalarType::F64,
+                },
+            }),
+        }
+    }
+
+    #[test]
+    fn torque_preview_derives_captured_inputs_in_tesla() {
+        let request = LivePreviewRequest {
+            quantity: "torque".into(),
+            ..Default::default()
+        };
+        let snapshot = NativeFdmPreviewSnapshot {
+            handle: std::ptr::null_mut(),
+            plan: plan_grid_preview(&request, [1, 1, 1]),
+            request,
+            quantity: "torque".into(),
+            ready: None,
+            torque_inputs: Some(Box::new((
+                captured("m", [1.0, 0.0, 0.0]),
+                captured("H_eff", [0.0, 1.0 / crate::MU0, 0.0]),
+                0.5,
+                true,
+            ))),
+        };
+        let field = snapshot.into_live_preview_field(None).unwrap();
+        for (actual, expected) in field.vector_field_values.iter().zip([0.0, 0.4, -0.8]) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+        assert_eq!(field.vector_field_values.len(), 3);
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn decode_snapshot_vectors(ready: &NativeFieldSnapshotReady) -> Result<Vec<[f64; 3]>, RunError> {
+    validate_native_snapshot_payload("torque input", ready.info, ready.data.len())?;
+    if ready.info.component_count != 3 {
+        return Err(RunError {
+            message: "torque snapshot requires vector inputs".into(),
+        });
+    }
+    Ok(ready
+        .data
+        .chunks_exact(3 * ready.info.scalar_bytes)
+        .map(|cell| {
+            std::array::from_fn(|component| {
+                let offset = component * ready.info.scalar_bytes;
+                match ready.info.scalar_type {
+                    NativeFieldSnapshotScalarType::F32 => {
+                        f32::from_ne_bytes(cell[offset..offset + 4].try_into().unwrap()) as f64
+                    }
+                    NativeFieldSnapshotScalarType::F64 => {
+                        f64::from_ne_bytes(cell[offset..offset + 8].try_into().unwrap())
+                    }
+                }
+            })
+        })
+        .collect())
 }
 
 #[cfg(feature = "cuda")]
@@ -2969,6 +4118,210 @@ fn build_region_exchange_pairs(
     ))
 }
 
+#[cfg(test)]
+fn canonical_frozen_spins_cpu_gpu_parity_plan() -> fullmag_ir::FdmPlanIR {
+    use std::collections::BTreeMap;
+
+    use fullmag_ir::{
+        ConstraintActivationIR, EmptySelectionPolicyIR, ExchangeBoundaryCondition,
+        ExecutionPrecision, FdmGridCertificateIR, FdmMaterialIR, FrozenReferencePolicyIR,
+        FrozenSpinsIR, GridDimensions, InactiveSelectionPolicyIR, IntegratorChoice,
+        SelectionExprIR, SelectionMembershipPolicyIR, SelectionValidationContext,
+        FROZEN_SPINS_SCHEMA_VERSION,
+    };
+    use fullmag_plan::{
+        compile_fdm_frozen_spins, FdmFrozenSpinsDomain, FrozenSpinsCompileRequest,
+        ResolvedFrozenSpinsReference, SelectionDofMembership,
+    };
+
+    let origin_m = [0.0, 0.0, 0.0];
+    let grid_cells = [3, 3, 1];
+    let cell_size = [5e-9, 5e-9, 10e-9];
+    let active_mask = vec![true, true, true, true, false, true, true, true, false];
+    let frozen_mask = vec![true, false, false, true, false, false, true, false, false];
+    let region_mask = vec![0; 9];
+    let initial_magnetization = vec![
+        [1.0, 0.0, 0.0],
+        [0.9950041652780258, 0.09983341664682815, 0.0],
+        [0.9800665778412416, 0.19866933079506122, 0.0],
+        // Every canonical parity vector is exactly unit-length in binary64.
+        // The CPU reference normalizes at state construction; keeping the
+        // fixture on the unit sphere makes the native frozen reference and
+        // the captured CPU activation reference the same contract.
+        [0.8, 0.0, 0.6],
+        [0.6, 0.8, 0.0],
+        [0.48, 0.64, 0.6],
+        [0.8, -0.6, 0.0],
+        [0.28, 0.96, 0.0],
+        [0.36, 0.48, 0.8],
+    ];
+    let active_count = active_mask.iter().filter(|active| **active).count() as u64;
+    let grid_certificate = FdmGridCertificateIR::new_with_masks(
+        origin_m,
+        grid_cells,
+        cell_size,
+        active_count,
+        9 * fullmag_plan::FDM_GRID_ESTIMATED_BYTES_PER_CELL,
+        Some(&active_mask),
+        &region_mask,
+    )
+    .expect("canonical parity FDM grid certificate");
+
+    let memberships = (0..initial_magnetization.len())
+        .map(|index| SelectionDofMembership {
+            object_ids: vec!["parity-magnet".to_string()],
+            region_ids: frozen_mask[index]
+                .then(|| ("parity-magnet".to_string(), "frozen-column".to_string()))
+                .into_iter()
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let constraints = [FrozenSpinsIR {
+        schema_version: FROZEN_SPINS_SCHEMA_VERSION.to_string(),
+        id: "cpu-gpu-parity".to_string(),
+        name: "CPU/GPU parity frozen column".to_string(),
+        enabled: true,
+        selector: SelectionExprIR::InRegion {
+            object_id: "parity-magnet".to_string(),
+            region_id: "frozen-column".to_string(),
+        },
+        reference: FrozenReferencePolicyIR::CaptureCurrentAtActivation {},
+        membership: SelectionMembershipPolicyIR::Static {},
+        activation: ConstraintActivationIR::AllStages {},
+        empty_selection: EmptySelectionPolicyIR::Error,
+        inactive_selection: InactiveSelectionPolicyIR::Error,
+    }];
+    let references = [ResolvedFrozenSpinsReference {
+        constraint_id: "cpu-gpu-parity",
+        values: &initial_magnetization,
+        source_state_revision: Some(1),
+        topology_fingerprint: &grid_certificate.grid_fingerprint,
+    }];
+    let object_transforms = BTreeMap::new();
+    let known_entities =
+        SelectionValidationContext::new(["parity-magnet"], [("parity-magnet", "frozen-column")]);
+    let resolved = compile_fdm_frozen_spins(
+        &FdmFrozenSpinsDomain {
+            origin_m,
+            counts: grid_cells,
+            cell_m: cell_size,
+            active_mask: &active_mask,
+            memberships: &memberships,
+            grid_fingerprint: &grid_certificate.grid_fingerprint,
+        },
+        &FrozenSpinsCompileRequest {
+            constraints: &constraints,
+            selections: &[],
+            activation_stage_id: None,
+            object_transforms: &object_transforms,
+            known_entities: &known_entities,
+            state_snapshot: None,
+            resolved_references: &references,
+            expected_source_state_revision: Some(1),
+            expected_grid_or_mesh_fingerprint: &grid_certificate.grid_fingerprint,
+        },
+    )
+    .expect("compile canonical Frozen Spins parity carrier through fullmag-plan");
+    assert_eq!(resolved.frozen_mask, frozen_mask);
+    resolved
+        .validate_intrinsic()
+        .expect("canonical Frozen Spins carrier intrinsic validation");
+    resolved
+        .validate_against_active_mask(&active_mask)
+        .expect("canonical Frozen Spins carrier active-domain validation");
+
+    let mut plan = fullmag_ir::FdmPlanIR::default();
+    plan.origin_m = origin_m;
+    plan.grid = GridDimensions { cells: grid_cells };
+    plan.cell_size = cell_size;
+    plan.grid_certificate = Some(grid_certificate);
+    plan.region_mask = region_mask;
+    plan.active_mask = Some(active_mask);
+    plan.initial_magnetization = initial_magnetization;
+    plan.material = FdmMaterialIR {
+        name: "Py".to_string(),
+        saturation_magnetisation: 800e3,
+        exchange_stiffness: 13e-12,
+        damping: 0.1,
+        ..Default::default()
+    };
+    plan.gyromagnetic_ratio = 2.211e5;
+    plan.precision = ExecutionPrecision::Double;
+    plan.precision_policy = fullmag_ir::FdmPrecisionPolicyIR::resolve(plan.precision);
+    plan.exchange_bc = ExchangeBoundaryCondition::Neumann;
+    plan.integrator = Some(IntegratorChoice::Heun);
+    plan.fixed_timestep = Some(2.5e-13);
+    plan.enable_exchange = true;
+    plan.enable_demag = false;
+    plan.external_field = Some([1.5e3, -2.0e3, 7.5e2]);
+    plan.frozen_spins = Some(resolved);
+    plan
+}
+
+#[cfg(test)]
+mod frozen_spins_native_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn malformed_frozen_spins_plan_is_rejected_before_cuda_ffi_boundary() {
+        let mut plan = canonical_frozen_spins_cpu_gpu_parity_plan();
+        plan.frozen_spins
+            .as_mut()
+            .expect("canonical carrier")
+            .mask_sha256 = "0".repeat(64);
+
+        let error = validate_native_frozen_spins_plan(&plan)
+            .expect_err("tampered dense mask must fail before CUDA FFI");
+        assert!(error.message.contains("rejected before CUDA device probe"));
+        assert!(error.message.contains("mask hash"));
+    }
+
+    #[test]
+    fn intrinsically_consistent_frozen_spin_outside_active_domain_is_rejected_before_cuda_ffi() {
+        use sha2::{Digest, Sha256};
+
+        let mut plan = canonical_frozen_spins_cpu_gpu_parity_plan();
+        let resolved = plan.frozen_spins.as_mut().expect("canonical carrier");
+        resolved.frozen_mask[4] = true;
+        let mut hash = Sha256::new();
+        hash.update((resolved.frozen_mask.len() as u64).to_le_bytes());
+        hash.update(
+            resolved
+                .frozen_mask
+                .iter()
+                .map(|value| u8::from(*value))
+                .collect::<Vec<_>>(),
+        );
+        let mask_sha256 = format!("{:x}", hash.finalize());
+        resolved.frozen_dof_count = 4;
+        resolved.free_dof_count = 3;
+        resolved.mask_sha256 = mask_sha256.clone();
+        resolved.certificate.raw_candidate_dof_count = 4;
+        resolved.certificate.frozen_dof_count = 4;
+        resolved.certificate.free_dof_count = 3;
+        resolved.certificate.mask_sha256 = mask_sha256;
+        resolved
+            .validate_intrinsic()
+            .expect("fixture must pass intrinsic validation before active-domain validation");
+
+        let error = validate_native_frozen_spins_plan(&plan)
+            .expect_err("frozen inactive DOF must fail before CUDA FFI");
+        assert!(error.message.contains("rejected before CUDA device probe"));
+        assert!(error.message.contains("outside_active_domain"));
+    }
+
+    #[test]
+    fn frozen_spins_plan_without_grid_certificate_is_rejected_before_cuda_ffi() {
+        let mut plan = canonical_frozen_spins_cpu_gpu_parity_plan();
+        plan.grid_certificate = None;
+
+        let error = validate_native_frozen_spins_plan(&plan)
+            .expect_err("native boundary must require a topology certificate in every build");
+        assert!(error.message.contains("authoritative FDM grid certificate"));
+        assert!(error.message.contains("before CUDA device probe"));
+    }
+}
+
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
@@ -2980,6 +4333,43 @@ mod tests {
     };
 
     #[test]
+    fn copy_adaptive_attempt_summary_validates_one_accepted_batch() {
+        let record = ffi::fullmag_fdm_adaptive_attempt_v1 {
+            abi_version: ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_ABI_V1,
+            struct_size: std::mem::size_of::<ffi::fullmag_fdm_adaptive_attempt_v1>() as u32,
+            attempt_index: 0,
+            decision: ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_ACCEPTED,
+            reason: ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_WITHIN_TOLERANCE,
+            reserved0: 0,
+            dt_attempt_seconds: 1e-15,
+            normalized_error: 0.25,
+            ratio: 1.5,
+            dt_next_seconds: 1.5e-15,
+        };
+        assert_eq!(
+            validate_adaptive_attempt_batch(&[record]).unwrap(),
+            (0, 0.25)
+        );
+    }
+
+    #[test]
+    fn copy_adaptive_attempt_summary_rejects_nonterminal_batch() {
+        let record = ffi::fullmag_fdm_adaptive_attempt_v1 {
+            abi_version: ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_ABI_V1,
+            struct_size: std::mem::size_of::<ffi::fullmag_fdm_adaptive_attempt_v1>() as u32,
+            attempt_index: 0,
+            decision: ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_RETRY,
+            reason: ffi::FULLMAG_FDM_ADAPTIVE_ATTEMPT_ERROR_ABOVE_TOLERANCE,
+            reserved0: 0,
+            dt_attempt_seconds: 1e-15,
+            normalized_error: 2.0,
+            ratio: 0.5,
+            dt_next_seconds: 5e-16,
+        };
+        assert!(validate_adaptive_attempt_batch(&[record]).is_err());
+    }
+
+    #[test]
     fn native_fdm_frozen_spins_capability_gate_accepts_advertised_single_grid_lane() {
         ensure_cuda_frozen_spins_supported(false, 0)
             .expect("the legacy null-mask path must remain available");
@@ -2988,6 +4378,110 @@ mod tests {
         assert!(error.message.contains("frozen_spins_cuda_unqualified"));
         ensure_cuda_frozen_spins_supported(true, ffi::FULLMAG_FDM_CAPABILITY_FROZEN_SPINS_V1)
             .expect("the versioned capability bit admits the single-grid ABI payload");
+    }
+
+    #[test]
+    fn frozen_spins_preview_uses_retained_plan_mask_without_cuda_snapshot() {
+        let backend = NativeFdmBackend {
+            handle: std::ptr::null_mut(),
+            cell_count: 4,
+            active_mask: None,
+            frozen_mask: Some(vec![true, false, false, true]),
+            precision: ExecutionPrecision::Double,
+            precision_policy: fullmag_ir::FdmPrecisionPolicyIR::default(),
+            damping: 0.01,
+            precession_enabled: true,
+            gpu_transport_bound: false,
+            adaptive_timestep_enabled: false,
+            stats_policy: NativeStatsPolicy::full(1),
+            rotated_dmi_only: false,
+        };
+        let request = LivePreviewRequest {
+            quantity: "frozen_spins".to_string(),
+            auto_scale_enabled: false,
+            ..Default::default()
+        };
+
+        let sync = backend
+            .copy_live_preview_field(&request, [2, 2, 1], None)
+            .expect("synchronous Frozen Spins preview");
+        let asynchronous = backend
+            .begin_live_preview_snapshot(&request, [2, 2, 1])
+            .expect("begin host-backed Frozen Spins preview")
+            .into_live_preview_field(None)
+            .expect("collect host-backed Frozen Spins preview");
+
+        assert_eq!(sync.quantity, "frozen_spins");
+        assert_eq!(sync.unit, "1");
+        assert_eq!(sync.vector_field_values, vec![1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(asynchronous, sync);
+        assert!(can_materialize_preview_quantity(QuantityId::FrozenSpins));
+    }
+
+    #[test]
+    fn solved_antenna_basis_payload_scales_field_by_peak_current_and_preserves_waveform() {
+        let mut plan = make_relaxation_precession_test_plan();
+        plan.grid = GridDimensions { cells: [2, 1, 1] };
+        plan.initial_magnetization = vec![[1.0, 0.0, 0.0]; 2];
+        plan.time_stage = fullmag_ir::TimeStageContextIR {
+            active_stage_id: None,
+            start_time_s: 0.25,
+            waveform_origin_time_s: None,
+            study_kind: fullmag_ir::StudyKindIR::TimeEvolution,
+        };
+        plan.solved_antenna_drive_bases = vec![fullmag_ir::ResolvedSolvedAntennaDriveBasisIR {
+            drive: fullmag_ir::SolvedAntennaDriveIR {
+                id: "antenna-1-port-1".into(),
+                name: "antenna-1 port 1".into(),
+                projection_ref: "projection-1".into(),
+                port_mode_id: "port-1".into(),
+                peak_current_a: 2.5,
+                waveform: fullmag_ir::TimeDependenceIR::Sinusoidal {
+                    frequency_hz: 1.0e9,
+                    phase_rad: 0.125,
+                    offset: 0.25,
+                },
+                bandwidth_declaration: None,
+                time_origin: fullmag_ir::FieldTimeOriginIR::StageLocal,
+                activation: fullmag_ir::DriveActivationIR::AllTimeEvolution {},
+            },
+            solution_id: "solution-1".into(),
+            source_object_id: "antenna-1".into(),
+            field_xyz_apm_per_a: vec![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]],
+            projection_signature: "projection-signature".into(),
+        }];
+
+        let payload = native_regional_field_drive_payload(&plan)
+            .expect("solved antenna basis should be accepted")
+            .expect("one solved antenna basis should produce one native descriptor");
+
+        assert_eq!(payload.descriptors.len(), 1);
+        assert_eq!(payload._fields[0], vec![2.5, 5.0, 7.5, 10.0, 12.5, 15.0]);
+        let descriptor = &payload.descriptors[0];
+        assert_eq!(
+            descriptor.drive.waveform,
+            ffi::fullmag_fdm_regional_field_drive_waveform::FULLMAG_FDM_REGIONAL_FIELD_DRIVE_SINUSOIDAL
+        );
+        assert_eq!(descriptor.drive.stage_start_time_s, 0.25);
+        assert_eq!(descriptor.waveform_origin_time_s, 0.25);
+        assert_eq!(descriptor.drive.frequency_hz, 1.0e9);
+        assert_eq!(descriptor.drive.phase_rad, 0.125);
+        assert_eq!(descriptor.drive.offset, 0.25);
+        assert_eq!(
+            descriptor.drive.time_origin,
+            ffi::fullmag_fdm_regional_field_drive_time_origin::FULLMAG_FDM_REGIONAL_FIELD_DRIVE_STAGE_LOCAL
+        );
+        plan.time_stage.waveform_origin_time_s = Some(0.125);
+        let resumed = native_regional_field_drive_payload(&plan)
+            .unwrap()
+            .expect("resumed segment retains its solved basis");
+        assert_eq!(resumed.descriptors[0].drive.stage_start_time_s, 0.25);
+        assert_eq!(resumed.descriptors[0].waveform_origin_time_s, 0.125);
+        plan.time_stage.study_kind = fullmag_ir::StudyKindIR::Relaxation;
+        let error = native_regional_field_drive_payload(&plan)
+            .err()
+            .expect("inactive resolved basis must be rejected");
+        assert!(error.message.contains("inactive in the current stage"));
     }
 
     #[test]
@@ -3196,9 +4690,21 @@ mod tests {
 
     #[test]
     fn llg_checkpoint_wrapper_restores_bitwise_and_rejects_corruption() {
+        assert_llg_checkpoint_round_trip(false);
+        assert_llg_checkpoint_round_trip(true);
+    }
+
+    fn assert_llg_checkpoint_round_trip(thermal: bool) {
         let mut plan = make_masked_test_plan(false, ExecutionPrecision::Double);
         plan.enable_exchange = false;
         plan.fixed_timestep = Some(1.0e-15);
+        if thermal {
+            plan.temperature = Some(300.0);
+            plan.thermal_seed_config = Some(fullmag_ir::ThermalSeedConfig {
+                policy: fullmag_ir::SeedPolicy::Fixed,
+                seed: Some(0x5a17),
+            });
+        }
         let dt = plan.fixed_timestep.expect("fixed timestep");
         let configure_identity = |backend: &mut NativeFdmBackend| {
             backend
@@ -3376,16 +4882,12 @@ mod tests {
                 [1.0, 0.0, 0.0],
                 [0.9950041652780258, 0.09983341664682815, 0.0],
                 [0.9800665778412416, 0.19866933079506122, 0.0],
-                [0.9992009587217894, 0.0, 0.03996803834887158],
-                [0.9937606691655043, 0.09970865087213879, 0.04972948160146045],
-                [0.9778332467629838, 0.19771314245924698, 0.06988589031642899],
-                [
-                    0.9968017063026194,
-                    -0.039904089712529575,
-                    0.06972124896577284,
-                ],
-                [0.9892364775387807, 0.05946310942269411, 0.1338082836649087],
-                [0.9711213242426827, 0.15730105252897553, 0.17902957342582418],
+                [0.8, 0.0, 0.6],
+                [0.6, 0.8, 0.0],
+                [0.48, 0.64, 0.6],
+                [0.8, -0.6, 0.0],
+                [0.28, 0.96, 0.0],
+                [0.36, 0.48, 0.8],
             ],
             material: FdmMaterialIR {
                 name: "Py".to_string(),
@@ -3396,6 +4898,7 @@ mod tests {
             },
             gyromagnetic_ratio: 2.211e5,
             precision,
+            precision_policy: fullmag_ir::FdmPrecisionPolicyIR::resolve(precision),
             exchange_bc: ExchangeBoundaryCondition::Neumann,
             integrator: Some(IntegratorChoice::Heun),
             fixed_timestep: Some(2.5e-13),
@@ -3452,6 +4955,7 @@ mod tests {
             mel_b2: None,
             mel_uniform_strain: None,
             antenna_zeeman_masks: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
             ..Default::default()
         }
     }
@@ -3548,6 +5052,7 @@ mod tests {
             mel_b2: None,
             mel_uniform_strain: None,
             antenna_zeeman_masks: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
             ..Default::default()
         }
     }
@@ -3634,6 +5139,7 @@ mod tests {
             mel_b2: None,
             mel_uniform_strain: None,
             antenna_zeeman_masks: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
             ..Default::default()
         }
     }
@@ -3707,6 +5213,86 @@ mod tests {
                 (0..3).map(move |component| (f64::from(a[component]) - e[component]).abs())
             })
             .fold(0.0, f64::max)
+    }
+
+    fn vector_field_sha256(values: &[[f64; 3]]) -> String {
+        let mut hasher = Sha256::new();
+        for value in values {
+            for component in value {
+                hasher.update(component.to_bits().to_le_bytes());
+            }
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn frozen_spins_parity_plan_binding_sha256(plan: &FdmPlanIR, active_mask: &[bool]) -> String {
+        const DOMAIN: &[u8] = b"fullmag:frozen-spins:fdm-cpu-gpu-plan-binding:v1\0";
+        let resolved = plan.frozen_spins.as_ref().expect("resolved Frozen Spins");
+        let mut hasher = Sha256::new();
+        hasher.update(DOMAIN);
+        hasher.update((resolved.constraint_ids.len() as u64).to_le_bytes());
+        for constraint_id in &resolved.constraint_ids {
+            hasher.update((constraint_id.len() as u64).to_le_bytes());
+            hasher.update(constraint_id.as_bytes());
+        }
+        hasher.update((resolved.grid_or_mesh_fingerprint.len() as u64).to_le_bytes());
+        hasher.update(resolved.grid_or_mesh_fingerprint.as_bytes());
+        hasher.update((resolved.mask_sha256.len() as u64).to_le_bytes());
+        hasher.update(resolved.mask_sha256.as_bytes());
+        let reference_sha256 = &resolved.certificate.resolved_reference_sha256;
+        hasher.update((reference_sha256.len() as u64).to_le_bytes());
+        hasher.update(reference_sha256.as_bytes());
+        hasher.update(
+            resolved
+                .source_state_revision
+                .expect("canonical parity source state revision")
+                .to_le_bytes(),
+        );
+        hasher.update((active_mask.len() as u64).to_le_bytes());
+        hasher.update(
+            active_mask
+                .iter()
+                .map(|value| u8::from(*value))
+                .collect::<Vec<_>>(),
+        );
+        hasher.update((resolved.frozen_mask.len() as u64).to_le_bytes());
+        hasher.update(
+            resolved
+                .frozen_mask
+                .iter()
+                .map(|value| u8::from(*value))
+                .collect::<Vec<_>>(),
+        );
+        format!("{:x}", hasher.finalize())
+    }
+
+    fn required_frozen_spins_evidence_env(name: &str) -> String {
+        std::env::var(name).unwrap_or_else(|_| panic!("{name} must bind the parity evidence run"))
+    }
+
+    fn write_json_atomic(path: &std::path::Path, payload: &serde_json::Value) {
+        use std::io::Write as _;
+
+        let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let file_name = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .expect("parity evidence path must have a UTF-8 file name");
+        let temporary = parent.join(format!(".{file_name}.{}.write.tmp", std::process::id()));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .expect("create unique parity evidence temporary file");
+        let mut bytes = serde_json::to_vec_pretty(payload).expect("serialize parity evidence");
+        bytes.push(b'\n');
+        file.write_all(&bytes).expect("write parity evidence bytes");
+        file.sync_all().expect("fsync parity evidence bytes");
+        drop(file);
+        std::fs::rename(&temporary, path).expect("atomically publish CPU/GPU parity evidence");
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .expect("fsync parity evidence directory");
     }
 
     fn masked_oersted_field(plan: &FdmPlanIR) -> Vec<[f64; 3]> {
@@ -3797,7 +5383,7 @@ mod tests {
         let dynamics = LlgConfig::new(plan.gyromagnetic_ratio, integrator)
             .expect("dynamics")
             .with_precession_enabled(!llg_overdamped_uses_pure_damping(plan.relaxation.as_ref()));
-        ExchangeLlgProblem::with_terms_and_mask(
+        let mut problem = ExchangeLlgProblem::with_terms_and_mask(
             grid,
             cell_size,
             material,
@@ -3834,6 +5420,7 @@ mod tests {
                             .unwrap_or([0.0, 1.0, 0.0]),
                     }),
                 interfacial_dmi: plan.interfacial_dmi,
+                rotated_interfacial_dmi: plan.rotated_interfacial_dmi,
                 bulk_dmi: plan.bulk_dmi,
                 zhang_li_stt: None,
                 slonczewski_stt: None,
@@ -3842,7 +5429,33 @@ mod tests {
             },
             plan.active_mask.clone(),
         )
-        .expect("problem")
+        .expect("problem");
+        if let Some(periodicity) = plan.periodicity.as_ref() {
+            let map_axis = |axis: &fullmag_ir::AxisBoundary| match axis {
+                fullmag_ir::AxisBoundary::Periodic => fullmag_engine::AxisBoundary::Periodic,
+                fullmag_ir::AxisBoundary::Open => fullmag_engine::AxisBoundary::Open,
+            };
+            problem.boundary_policy = fullmag_engine::FdmBoundaryPolicy {
+                x: map_axis(&periodicity.axes[0]),
+                y: map_axis(&periodicity.axes[1]),
+                z: map_axis(&periodicity.axes[2]),
+            };
+            if let Some(image_counts) = periodicity.image_counts {
+                problem.demag_image_counts = image_counts;
+            }
+        }
+        problem.set_demag_boundary(
+            crate::fdm::resolve_fdm_demag_boundary(plan).expect("resolved demag boundary"),
+        );
+        problem.set_resolved_periodic_workspace(plan.resolved_periodic_images.as_ref().map(
+            |resolved| fullmag_engine::ResolvedFdmPeriodicWorkspace {
+                image_counts: resolved.resolved_image_counts,
+                padded_counts: resolved.padded_counts,
+                image_terms: resolved.image_terms,
+                estimated_bytes: resolved.estimated_bytes,
+            },
+        ));
+        problem
     }
 
     fn cpu_reference_single_step(
@@ -4018,6 +5631,243 @@ mod tests {
             5e-5,
             1e-4,
         );
+    }
+
+    #[test]
+    fn native_fdm_frozen_spins_cpu_gpu_parity_when_cuda_is_available() {
+        if !is_cuda_available() {
+            eprintln!(
+                "skipping native CUDA FDM Frozen Spins CPU/GPU parity: CUDA backend is not available"
+            );
+            return;
+        }
+
+        const REL_TOL: f64 = 5.0e-6;
+        const ABS_TOL: f64 = 1.0e-8;
+        const STEP_COUNT: u64 = 4;
+        let plan = canonical_frozen_spins_cpu_gpu_parity_plan();
+        validate_native_frozen_spins_plan(&plan)
+            .expect("canonical Frozen Spins carrier must pass the native boundary");
+        let resolved = plan.frozen_spins.as_ref().expect("resolved Frozen Spins");
+        let frozen_mask = &resolved.frozen_mask;
+        let active_mask = plan.active_mask.as_deref().expect("active mask");
+        let plan_binding_sha256 = frozen_spins_parity_plan_binding_sha256(&plan, active_mask);
+        let dt = plan.fixed_timestep.expect("fixed timestep");
+        let until_seconds = dt * STEP_COUNT as f64;
+        let cpu = crate::fdm::cpu::reference::execute_reference_fdm(
+            &plan,
+            until_seconds,
+            &[],
+            None,
+            None,
+        )
+        .expect("CPU Frozen Spins parity execution");
+        let cpu_accepted_steps = cpu
+            .provenance
+            .fdm_cpu_step_transaction_telemetry
+            .as_ref()
+            .expect("CPU accepted-step telemetry")
+            .accepted_step_count;
+        let cpu_step_stats = cpu
+            .result
+            .steps
+            .last()
+            .cloned()
+            .expect("CPU final observed step stats");
+        assert_eq!(cpu_accepted_steps, STEP_COUNT);
+        assert_eq!(cpu_step_stats.step, STEP_COUNT);
+        // The CPU transaction computes the accepted step through the adaptive
+        // time-policy path, so the decimal product can differ from the
+        // literal fixture by one binary64 rounding ulp.  Keep this tolerance
+        // limited to the time scalar; state and Frozen Spins parity below
+        // retain the strict component tolerances.
+        assert_scalar_close("cpu final dt", cpu_step_stats.dt, dt, 1.0e-12, 1.0e-30);
+        assert_scalar_close(
+            "cpu final time",
+            cpu_step_stats.time,
+            until_seconds,
+            1.0e-12,
+            1.0e-30,
+        );
+        let cpu_m = cpu.result.final_magnetization;
+
+        let mut gpu = NativeFdmBackend::create(&plan).expect("native CUDA Frozen Spins create");
+        let mut gpu_step_stats = None;
+        for expected_step in 1..=STEP_COUNT {
+            let observed = gpu.step(dt).expect("native CUDA Frozen Spins parity step");
+            assert_eq!(observed.step, expected_step);
+            assert_scalar_close("gpu observed dt", observed.dt, dt, 1.0e-12, 1.0e-30);
+            assert_scalar_close(
+                "gpu observed time",
+                observed.time,
+                dt * expected_step as f64,
+                1.0e-12,
+                1.0e-30,
+            );
+            gpu_step_stats = Some(observed);
+        }
+        let gpu_step_stats = gpu_step_stats.expect("GPU final observed step stats");
+        assert_eq!(gpu_step_stats.step, cpu_accepted_steps);
+        assert_scalar_close(
+            "CPU/GPU final time",
+            gpu_step_stats.time,
+            cpu_step_stats.time,
+            1.0e-12,
+            1.0e-30,
+        );
+        let gpu_device = gpu.device_info().expect("native CUDA device identity");
+        let gpu_device_ordinal = residency::query_execution_device_ordinal(&gpu)
+            .expect("native CUDA execution device ordinal");
+        let gpu_m = gpu
+            .copy_m(plan.initial_magnetization.len())
+            .expect("copy CUDA parity magnetization");
+
+        assert_vector_field_close("frozen_spins.cpu_gpu.m", &gpu_m, &cpu_m, REL_TOL, ABS_TOL);
+
+        let mut max_abs_component_diff = 0.0_f64;
+        let mut max_normalized_error = 0.0_f64;
+        for (gpu_value, cpu_value) in gpu_m.iter().zip(cpu_m.iter()) {
+            for component in 0..3 {
+                let difference = (gpu_value[component] - cpu_value[component]).abs();
+                let scale = gpu_value[component]
+                    .abs()
+                    .max(cpu_value[component].abs())
+                    .max(1.0);
+                let allowed = ABS_TOL.max(REL_TOL * scale);
+                max_abs_component_diff = max_abs_component_diff.max(difference);
+                max_normalized_error = max_normalized_error.max(difference / allowed);
+            }
+        }
+        assert!(max_normalized_error <= 1.0);
+
+        let mut cpu_frozen_bitwise = true;
+        let mut gpu_frozen_bitwise = true;
+        let mut max_cpu_free_displacement = 0.0_f64;
+        let mut max_gpu_free_displacement = 0.0_f64;
+        for index in 0..plan.initial_magnetization.len() {
+            if frozen_mask[index] {
+                cpu_frozen_bitwise &= cpu_m[index].map(f64::to_bits)
+                    == plan.initial_magnetization[index].map(f64::to_bits);
+                gpu_frozen_bitwise &= gpu_m[index].map(f64::to_bits)
+                    == plan.initial_magnetization[index].map(f64::to_bits);
+            } else if active_mask[index] {
+                let displacement = |value: [f64; 3]| {
+                    ((value[0] - plan.initial_magnetization[index][0]).powi(2)
+                        + (value[1] - plan.initial_magnetization[index][1]).powi(2)
+                        + (value[2] - plan.initial_magnetization[index][2]).powi(2))
+                    .sqrt()
+                };
+                max_cpu_free_displacement =
+                    max_cpu_free_displacement.max(displacement(cpu_m[index]));
+                max_gpu_free_displacement =
+                    max_gpu_free_displacement.max(displacement(gpu_m[index]));
+            }
+        }
+        assert!(
+            cpu_frozen_bitwise,
+            "CPU frozen references must be bitwise exact"
+        );
+        assert!(
+            gpu_frozen_bitwise,
+            "GPU frozen references must be bitwise exact"
+        );
+        assert!(max_cpu_free_displacement > 0.0, "CPU free spins must move");
+        assert!(max_gpu_free_displacement > 0.0, "GPU free spins must move");
+
+        if let Some(path) = std::env::var_os("FULLMAG_FDM_FROZEN_SPINS_CPU_GPU_PARITY_PATH") {
+            let run_id = required_frozen_spins_evidence_env("FULLMAG_FROZEN_SPINS_RUN_ID");
+            let source_snapshot_sha256 =
+                required_frozen_spins_evidence_env("FULLMAG_FROZEN_SPINS_SOURCE_SNAPSHOT_SHA256");
+            let native_build_sha256 =
+                required_frozen_spins_evidence_env("FULLMAG_FROZEN_SPINS_NATIVE_BUILD_SHA256");
+            let requested_gpu_ordinal = required_frozen_spins_evidence_env("FULLMAG_FDM_GPU_INDEX")
+                .parse::<i32>()
+                .expect("FULLMAG_FDM_GPU_INDEX must be an i32");
+            assert_eq!(
+                gpu_device_ordinal, requested_gpu_ordinal,
+                "parity evidence must bind the actually executing CUDA ordinal"
+            );
+            // `SelectionCertificateIR::warnings` is intentionally omitted by
+            // serde when empty for the general IR/API contract.  The managed
+            // qualification receipt is stricter: it must state explicitly
+            // that canonical selection produced no warnings, so materialize
+            // the empty array in this evidence-only projection.
+            let mut resolved_evidence =
+                serde_json::to_value(resolved).expect("serialize resolved Frozen Spins plan");
+            resolved_evidence["certificate"]["warnings"] =
+                serde_json::json!(resolved.certificate.warnings);
+            let evidence = serde_json::json!({
+                "schema_version": "fullmag.frozen_spins.fdm_cpu_gpu_parity.evidence.v1",
+                "status": "PASS",
+                "run_binding": {
+                    "run_id": run_id,
+                    "source_snapshot_sha256": source_snapshot_sha256,
+                    "native_build_sha256": native_build_sha256,
+                    "requested_gpu_ordinal": requested_gpu_ordinal,
+                    "plan_binding_sha256": plan_binding_sha256,
+                },
+                "backend_pair": ["fdm_cpu_reference", "fdm_cuda"],
+                "precision": "fp64",
+                "integrator": "heun",
+                "scientific_scope": "fdm_single_grid_fp64_heun_exchange_external_field_four_fixed_steps_no_demag",
+                "known_limitations": ["no_demag", "single_integrator", "single_precision"],
+                "steps": gpu_step_stats.step,
+                "cell_count": plan.initial_magnetization.len(),
+                "active_cell_count": resolved.active_dof_count,
+                "frozen_cell_count": resolved.frozen_dof_count,
+                "free_cell_count": resolved.free_dof_count,
+                "mask_sha256": resolved.mask_sha256,
+                "plan_binding_sha256": plan_binding_sha256,
+                "active_mask": active_mask,
+                "resolved_plan": resolved_evidence,
+                "initial_magnetization_sha256": vector_field_sha256(&plan.initial_magnetization),
+                "workload": {
+                    "grid_cells": plan.grid.cells,
+                    "cell_size_m": plan.cell_size,
+                    "fixed_timestep_seconds": dt,
+                    "physics_terms": ["exchange", "external_field"],
+                    "demag_enabled": plan.enable_demag,
+                },
+                "gpu_device": {
+                    "ordinal": gpu_device_ordinal,
+                    "name": gpu_device.name,
+                    "driver_version": gpu_device.driver_version.to_string(),
+                    "runtime_version": gpu_device.runtime_version.to_string(),
+                    "compute_capability": gpu_device.compute_capability,
+                },
+                "observed_step_stats": {
+                    "cpu": {
+                        "accepted_step_count": cpu_accepted_steps,
+                        "step": cpu_step_stats.step,
+                        "time_seconds": cpu_step_stats.time,
+                        "dt_seconds": cpu_step_stats.dt,
+                    },
+                    "gpu": {
+                        "step": gpu_step_stats.step,
+                        "time_seconds": gpu_step_stats.time,
+                        "dt_seconds": gpu_step_stats.dt,
+                    },
+                },
+                "relative_tolerance": REL_TOL,
+                "absolute_tolerance": ABS_TOL,
+                "max_abs_component_diff": max_abs_component_diff,
+                "max_normalized_error": max_normalized_error,
+                "cpu_frozen_reference_bitwise": cpu_frozen_bitwise,
+                "gpu_frozen_reference_bitwise": gpu_frozen_bitwise,
+                "max_cpu_free_displacement": max_cpu_free_displacement,
+                "max_gpu_free_displacement": max_gpu_free_displacement,
+                "cpu_final_state_sha256": vector_field_sha256(&cpu_m),
+                "gpu_final_state_sha256": vector_field_sha256(&gpu_m),
+                "initial_magnetization": &plan.initial_magnetization,
+                "cpu_final_magnetization": &cpu_m,
+                "gpu_final_magnetization": &gpu_m,
+            });
+            write_json_atomic(std::path::Path::new(&path), &evidence);
+            println!(
+                "FROZEN_SPINS_CPU_GPU_PARITY_EVIDENCE={}",
+                std::path::Path::new(&path).display()
+            );
+        }
     }
 
     #[test]
@@ -4705,6 +6555,23 @@ mod tests {
         let cell_count = plan.initial_magnetization.len();
 
         let mut backend = NativeFdmBackend::create(&plan).expect("native fdm create");
+        let receipt = backend
+            .execution_receipt("gpu", fullmag_ir::ExecutionMode::Strict)
+            .expect("static profile construction receipt");
+        let workspace = receipt
+            .gpu_workspace
+            .expect("static profile GPU workspace receipt");
+        assert!(workspace.accounting_valid);
+        assert!(workspace.setup_complete);
+        assert_eq!(
+            workspace.total_device_allocation_count,
+            workspace.setup_device_allocation_count
+        );
+        assert_eq!(
+            workspace.total_device_allocation_bytes,
+            workspace.setup_device_allocation_bytes
+        );
+        assert_eq!(workspace.observed_step_count, 0);
         backend
             .step(plan.fixed_timestep.expect("fixed dt"))
             .expect("native fdm static profile step");
@@ -5093,7 +6960,6 @@ mod tests {
         plan.material.uniaxial_anisotropy_ku1 = Some(8.0e4);
         plan.material.uniaxial_anisotropy_ku2 = Some(1.0e4);
         plan.material.anisotropy_axis = Some([0.0, 0.0, 1.0]);
-        plan.interfacial_dmi = Some(1.2e-3);
         let active_mask = plan.active_mask.as_ref().expect("active mask");
         let cell_count = plan.initial_magnetization.len();
 
@@ -5113,6 +6979,11 @@ mod tests {
             .step(plan.fixed_timestep.expect("fixed dt"))
             .expect("native fdm step");
         let actual_m = backend.copy_m(cell_count).expect("copy m");
+        assert_vector_field_close("m", &actual_m, &expected_m, 5.0e-3, 1.0e-6);
+
+        backend
+            .upload_magnetization(&expected_m)
+            .expect("upload CPU reference endpoint magnetization");
         let actual_h_ex = backend.copy_h_ex(cell_count).expect("copy H_ex");
         let actual_h_demag = backend.copy_h_demag(cell_count).expect("copy H_demag");
         let actual_h_ext = backend.copy_h_ext(cell_count).expect("copy H_ext");
@@ -5122,7 +6993,6 @@ mod tests {
         for index in 0..cell_count {
             if active_mask[index] {
                 for (label, actual, expected) in [
-                    ("m", actual_m[index], expected_m[index]),
                     ("H_ex", actual_h_ex[index], expected_h_ex[index]),
                     ("H_demag", actual_h_demag[index], expected_h_demag[index]),
                     ("H_ext", actual_h_ext[index], expected_h_ext[index]),
@@ -5276,6 +7146,12 @@ mod tests {
             demag: FdmDemagPeriodicityIR::TruncatedImages,
             image_counts: Some([2, 2, 0]),
         });
+        plan.resolved_periodic_images = plan
+            .periodicity
+            .as_ref()
+            .expect("periodic request")
+            .resolve_periodic_images(plan.grid.cells, plan.precision)
+            .expect("valid periodic image request");
         let cell_count = plan.initial_magnetization.len();
         let (
             expected_m,
@@ -5609,6 +7485,10 @@ mod exact_metric_contract_tests {
     #[test]
     fn dynamic_native_stats_map_the_same_energy_components_as_snapshot_stats() {
         let source = include_str!("native.rs");
+        let production_source = source
+            .split("#[cfg(test)]\nmod exact_metric_contract_tests")
+            .next()
+            .expect("production source prefix");
         let dynamic_stats = source
             .split("pub fn step_interruptible")
             .nth(1)
@@ -5621,8 +7501,18 @@ mod exact_metric_contract_tests {
             "dynamic native stats must include cubic anisotropy in e_ani"
         );
         assert!(
-            dynamic_stats.contains("e_dmi: stats.dmi_energy_joules"),
+            dynamic_stats.contains("e_dmi,") && dynamic_stats.contains("e_rotated_dmi,"),
             "dynamic native stats must map the native DMI energy"
+        );
+        assert!(
+            production_source.contains("rotated_dmi_only: bool"),
+            "the native wrapper must remember when aggregate DMI is exactly rotated DMI"
+        );
+        assert!(
+            dynamic_stats.contains(
+                "let (e_dmi, e_rotated_dmi) = self.split_dmi_energy(stats.dmi_energy_joules)"
+            ),
+            "dynamic native stats must expose exact rotated-only energy"
         );
         let average_stats = source
             .split("pub fn apply_average_m_to_step_stats(")

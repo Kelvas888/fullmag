@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
@@ -10,20 +10,25 @@ use fullmag_ir::{
     SelectionMembershipPolicyIR,
 };
 use fullmag_plan::{
-    compile_fdm_frozen_spins, AffineTransform3, FdmFrozenSpinsDomain, FrozenSpinsCompileRequest,
-    FrozenSpinsStateSnapshot, ResolvedFrozenSpinsReference, SelectionDofMembership,
+    compile_fdm_frozen_spins, compile_fem_frozen_spins, AffineTransform3, BoundaryMembership,
+    FdmFrozenSpinsDomain, FemIncidentElement, FemTrueDofDomain, FrozenSpinsCompileRequest,
+    FrozenSpinsStateSnapshot, GeometryPredicate, ResolvedFrozenSpinsReference,
+    SelectionDofMembership,
 };
 use sha2::{Digest, Sha256};
 
 use crate::error::{ApiDiagnostic, ApiError};
 use crate::router_v2::handlers::data::resolved_spatial_field::{
-    resolve_current_spatial_field, FdmCellMembership, SpatialFieldCarrier,
+    resolve_current_spatial_field, EntityMapping, FdmCellMembership, SpatialFieldCarrier,
 };
 use crate::router_v2::handlers::sessions::status::fdm_grid_fingerprint;
 use crate::schemas::{
-    FrozenSpinsCollectionResource, FrozenSpinsDefinitionResource, FrozenSpinsDeleteRequest,
-    FrozenSpinsMutationRequest, FrozenSpinsPreviewRequest, FrozenSpinsPreviewResponse,
-    FrozenSpinsRequestedIntent, FrozenSpinsResolvedPlanSummary, FrozenSpinsWarning,
+    FrozenSpinsActivationScope, FrozenSpinsCollectionResource, FrozenSpinsDefinitionResource,
+    FrozenSpinsDeleteRequest, FrozenSpinsMutationRequest, FrozenSpinsPreviewActivationRequest,
+    FrozenSpinsPreviewActivationResponse, FrozenSpinsPreviewAuthority, FrozenSpinsPreviewRequest,
+    FrozenSpinsPreviewResponse, FrozenSpinsRequestedIntent, FrozenSpinsResolvedPlanSummary,
+    FrozenSpinsRuntimeApplication, FrozenSpinsRuntimeApplicationState,
+    FrozenSpinsRuntimeApplyBoundary, FrozenSpinsSolverBinding, FrozenSpinsWarning,
 };
 use crate::session::FrozenSpinsPreviewRecord;
 use crate::types::AppState;
@@ -46,8 +51,11 @@ fn json_request<T>(request: Result<Json<T>, JsonRejection>) -> Result<T, ApiErro
 pub async fn list_frozen_spins(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<FrozenSpinsCollectionResource>, ApiError> {
-    let scene = crate::get_or_load_current_live_scene_document(&state).await?;
-    Ok(Json(collection_resource(&scene)))
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    let scene =
+        crate::get_or_load_current_live_scene_document_for_context(&state, &request_context)
+            .await?;
+    Ok(Json(collection_resource(&scene, None)))
 }
 
 #[utoipa::path(
@@ -65,8 +73,11 @@ pub async fn create_frozen_spins(
     State(state): State<Arc<AppState>>,
     request: Result<Json<FrozenSpinsMutationRequest>, JsonRejection>,
 ) -> Result<Json<FrozenSpinsDefinitionResource>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let request = json_request(request)?;
-    let mut scene = crate::get_or_load_current_live_scene_document(&state).await?;
+    let mut scene =
+        crate::get_or_load_current_live_scene_document_for_context(&state, &request_context)
+            .await?;
     check_revision(scene.revision, request.expected_revision)?;
     if scene
         .magnetization_constraints
@@ -82,10 +93,14 @@ pub async fn create_frozen_spins(
     scene
         .magnetization_constraints
         .push(MagnetizationConstraintIR::FrozenSpins(request.definition));
-    let committed = crate::commit_current_live_scene_document(&state, scene)
-        .await
-        .map_err(map_authoring_error)?;
-    definition_resource(&committed, &definition_id).map(Json)
+    let committed =
+        crate::commit_current_live_scene_document_for_context(&state, &request_context, scene)
+            .await
+            .map_err(map_authoring_error)?;
+    let runtime_application =
+        pending_runtime_application_for_context(&state, &request_context, committed.revision)
+            .await?;
+    definition_resource(&committed, &definition_id, Some(runtime_application)).map(Json)
 }
 
 #[utoipa::path(
@@ -102,8 +117,11 @@ pub async fn get_frozen_spins(
     State(state): State<Arc<AppState>>,
     Path(constraint_id): Path<String>,
 ) -> Result<Json<FrozenSpinsDefinitionResource>, ApiError> {
-    let scene = crate::get_or_load_current_live_scene_document(&state).await?;
-    definition_resource(&scene, &constraint_id).map(Json)
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    let scene =
+        crate::get_or_load_current_live_scene_document_for_context(&state, &request_context)
+            .await?;
+    definition_resource(&scene, &constraint_id, None).map(Json)
 }
 
 #[utoipa::path(
@@ -124,8 +142,11 @@ pub async fn patch_frozen_spins(
     Path(constraint_id): Path<String>,
     request: Result<Json<FrozenSpinsMutationRequest>, JsonRejection>,
 ) -> Result<Json<FrozenSpinsDefinitionResource>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let request = json_request(request)?;
-    let mut scene = crate::get_or_load_current_live_scene_document(&state).await?;
+    let mut scene =
+        crate::get_or_load_current_live_scene_document_for_context(&state, &request_context)
+            .await?;
     check_revision(scene.revision, request.expected_revision)?;
     if request.definition.id != constraint_id {
         return Err(ApiError::conflict(
@@ -142,10 +163,14 @@ pub async fn patch_frozen_spins(
             ))
         })?;
     *slot = MagnetizationConstraintIR::FrozenSpins(request.definition);
-    let committed = crate::commit_current_live_scene_document(&state, scene)
-        .await
-        .map_err(map_authoring_error)?;
-    definition_resource(&committed, &constraint_id).map(Json)
+    let committed =
+        crate::commit_current_live_scene_document_for_context(&state, &request_context, scene)
+            .await
+            .map_err(map_authoring_error)?;
+    let runtime_application =
+        pending_runtime_application_for_context(&state, &request_context, committed.revision)
+            .await?;
+    definition_resource(&committed, &constraint_id, Some(runtime_application)).map(Json)
 }
 
 #[utoipa::path(
@@ -166,8 +191,11 @@ pub async fn delete_frozen_spins(
     Path(constraint_id): Path<String>,
     request: Result<Json<FrozenSpinsDeleteRequest>, JsonRejection>,
 ) -> Result<Json<FrozenSpinsCollectionResource>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let request = json_request(request)?;
-    let mut scene = crate::get_or_load_current_live_scene_document(&state).await?;
+    let mut scene =
+        crate::get_or_load_current_live_scene_document_for_context(&state, &request_context)
+            .await?;
     check_revision(scene.revision, request.expected_revision)?;
     let before = scene.magnetization_constraints.len();
     scene
@@ -178,10 +206,17 @@ pub async fn delete_frozen_spins(
             "frozen spins definition not found: {constraint_id}"
         )));
     }
-    let committed = crate::commit_current_live_scene_document(&state, scene)
-        .await
-        .map_err(map_authoring_error)?;
-    Ok(Json(collection_resource(&committed)))
+    let committed =
+        crate::commit_current_live_scene_document_for_context(&state, &request_context, scene)
+            .await
+            .map_err(map_authoring_error)?;
+    let runtime_application =
+        pending_runtime_application_for_context(&state, &request_context, committed.revision)
+            .await?;
+    Ok(Json(collection_resource(
+        &committed,
+        Some(runtime_application),
+    )))
 }
 
 #[utoipa::path(
@@ -199,11 +234,19 @@ pub async fn create_frozen_spins_preview(
     State(state): State<Arc<AppState>>,
     request: Result<Json<FrozenSpinsPreviewRequest>, JsonRejection>,
 ) -> Result<Json<FrozenSpinsPreviewResponse>, ApiError> {
+    let request_context = crate::capture_current_live_request_context(&state).await?;
     let request = json_request(request)?;
     let guard = state.current_live_state.read().await;
     let snapshot = guard
         .as_ref()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(
+        snapshot,
+        &request_context,
+        state
+            .current_live_session_epoch
+            .load(std::sync::atomic::Ordering::Acquire),
+    )?;
     let scene = snapshot
         .scene_document
         .as_ref()
@@ -276,20 +319,30 @@ pub async fn create_frozen_spins_preview(
         .chunks_exact(3)
         .map(|value| [value[0], value[1], value[2]])
         .collect::<Vec<_>>();
-    let sole_magnetic_object = (scene
-        .objects
-        .iter()
-        .filter(|object| object.role == "magnet")
-        .count()
-        == 1)
-        .then_some(request.target_object_id.as_str());
-    let (counts, origin_m, cell_m, active_mask, memberships) =
-        fdm_preview_domain(&field.carrier, magnetization.len(), sole_magnetic_object)?;
-    let actual_topology = fdm_grid_fingerprint(snapshot).ok_or_else(|| {
-        ApiError::conflict(
-            "selection_topology_mismatch: current FDM domain has no canonical grid fingerprint",
-        )
-    })?;
+    let fem_topology = matches!(&field.carrier, SpatialFieldCarrier::FemNodes { .. });
+    let actual_topology = match &field.carrier {
+        SpatialFieldCarrier::FdmCells { .. } => fdm_grid_fingerprint(snapshot)
+            .ok_or_else(|| {
+                ApiError::conflict(
+                    "selection_topology_mismatch: current FDM domain has no canonical grid fingerprint",
+                )
+            })?
+            .to_string(),
+        SpatialFieldCarrier::FemNodes {
+            topology_fingerprint,
+            ..
+        } => topology_fingerprint.clone(),
+        SpatialFieldCarrier::FemElements { .. } => {
+            return Err(ApiError::unprocessable(
+                "selection_variant_unsupported: FEM frozen-spins preview requires a nodal P1 magnetization carrier",
+            ));
+        }
+        _ => {
+            return Err(ApiError::unprocessable(
+                "selection_variant_unsupported: frozen-spins preview carrier is unsupported",
+            ));
+        }
+    };
     if request.expected_topology_fingerprint != actual_topology {
         return Err(ApiError::conflict(format!(
             "selection_topology_mismatch: expected topology '{}', current '{}'",
@@ -320,7 +373,7 @@ pub async fn create_frozen_spins_preview(
         constraint_id: PREVIEW_CONSTRAINT_ID,
         values: &magnetization,
         source_state_revision: Some(actual_source_revision),
-        topology_fingerprint: actual_topology,
+        topology_fingerprint: &actual_topology,
     };
     let transforms = object_transforms(scene);
     let compile_request = FrozenSpinsCompileRequest {
@@ -335,18 +388,50 @@ pub async fn create_frozen_spins_preview(
         }),
         resolved_references: std::slice::from_ref(&reference),
         expected_source_state_revision: Some(actual_source_revision),
-        expected_grid_or_mesh_fingerprint: actual_topology,
+        expected_grid_or_mesh_fingerprint: &actual_topology,
     };
-    let domain = FdmFrozenSpinsDomain {
-        origin_m,
-        counts,
-        cell_m,
-        active_mask: &active_mask,
-        memberships: &memberships,
-        grid_fingerprint: actual_topology,
+    let resolved = match &field.carrier {
+        SpatialFieldCarrier::FdmCells { .. } => {
+            let sole_magnetic_object = (scene
+                .objects
+                .iter()
+                .filter(|object| object.role == "magnet")
+                .count()
+                == 1)
+                .then_some(request.target_object_id.as_str());
+            let (counts, origin_m, cell_m, active_mask, memberships) =
+                fdm_preview_domain(&field.carrier, magnetization.len(), sole_magnetic_object)?;
+            compile_fdm_frozen_spins(
+                &FdmFrozenSpinsDomain {
+                    origin_m,
+                    counts,
+                    cell_m,
+                    active_mask: &active_mask,
+                    memberships: &memberships,
+                    grid_fingerprint: &actual_topology,
+                },
+                &compile_request,
+            )
+            .map_err(map_selection_error)?
+        }
+        SpatialFieldCarrier::FemNodes {
+            topology, mapping, ..
+        } => {
+            let (points_m, incident_elements) =
+                fem_preview_domain(scene, topology, mapping, magnetization.len())?;
+            compile_fem_frozen_spins(
+                &FemTrueDofDomain {
+                    fe_order: 1,
+                    true_dof_points_m: &points_m,
+                    incident_elements: &incident_elements,
+                    mesh_fingerprint: &actual_topology,
+                },
+                &compile_request,
+            )
+            .map_err(map_selection_error)?
+        }
+        _ => unreachable!("carrier was validated above"),
     };
-    let resolved =
-        compile_fdm_frozen_spins(&domain, &compile_request).map_err(map_selection_error)?;
     let mask_hash = canonical_sha256(&resolved.mask_sha256);
     let preview_identity = serde_json::to_vec(&serde_json::json!({
         "session_id": snapshot.session.session_id,
@@ -361,9 +446,22 @@ pub async fn create_frozen_spins_preview(
     }))
     .map_err(|error| ApiError::internal(format!("failed to encode preview identity: {error}")))?;
     let preview_id = format!("fsp-{}", sha256_hex(&preview_identity));
+    let activation_candidate_token = format!(
+        "fsact-{}",
+        sha256_hex(
+            &[
+                b"fullmag.frozen-spins.activation-candidate.v1\0".as_slice(),
+                preview_identity.as_slice(),
+            ]
+            .concat(),
+        )
+    );
     let response = FrozenSpinsPreviewResponse {
         schema_version: PREVIEW_SCHEMA_VERSION.to_string(),
         preview_id: preview_id.clone(),
+        authority: FrozenSpinsPreviewAuthority::SpeculativeAuthoringPreview,
+        solver_binding: FrozenSpinsSolverBinding::Unbound,
+        activation_candidate_token,
         revision: scene.revision,
         current: true,
         frozen_dof_count: resolved.frozen_dof_count,
@@ -407,12 +505,14 @@ pub async fn create_frozen_spins_preview(
         session_id: snapshot.session.session_id.clone(),
         scene_revision: scene.revision,
         source_state_revision: actual_source_revision,
-        topology_fingerprint: actual_topology.to_string(),
+        fem_topology,
+        topology_fingerprint: actual_topology,
+        requested_selector: request.selector,
         response: response.clone(),
         frozen_mask: resolved.frozen_mask,
     };
     drop(guard);
-    insert_current_preview_record(&state, preview_id, record).await?;
+    insert_current_preview_record(&state, &request_context, preview_id, record).await?;
     Ok(Json(response))
 }
 
@@ -431,7 +531,8 @@ pub async fn get_frozen_spins_preview(
     State(state): State<Arc<AppState>>,
     Path(preview_id): Path<String>,
 ) -> Result<Json<FrozenSpinsPreviewResponse>, ApiError> {
-    let record = current_preview_record(&state, &preview_id)
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    let record = current_preview_record(&state, &request_context, &preview_id)
         .await?
         .ok_or_else(|| {
             ApiError::not_found(format!("frozen spins preview not found: {preview_id}"))
@@ -439,15 +540,134 @@ pub async fn get_frozen_spins_preview(
     Ok(Json(record.response))
 }
 
+#[utoipa::path(
+    post,
+    path = "/v2/sessions/current/model/frozen-spins/previews/{preview_id}/activate",
+    params(("preview_id" = String, Path)),
+    request_body = FrozenSpinsPreviewActivationRequest,
+    responses(
+        (status = 200, body = FrozenSpinsPreviewActivationResponse),
+        (status = 404, description = "Preview or definition missing", body = crate::schemas::common::ApiErrorResponse),
+        (status = 409, description = "Stale, consumed, or mismatched activation candidate", body = crate::schemas::common::ApiErrorResponse),
+        (status = 422, description = "Definition is incompatible with the preview", body = crate::schemas::common::ApiErrorResponse)
+    ),
+    tag = "model"
+)]
+pub async fn activate_frozen_spins_preview(
+    State(state): State<Arc<AppState>>,
+    Path(preview_id): Path<String>,
+    request: Result<Json<FrozenSpinsPreviewActivationRequest>, JsonRejection>,
+) -> Result<Json<FrozenSpinsPreviewActivationResponse>, ApiError> {
+    let request = json_request(request)?;
+    let request_context = crate::capture_current_live_request_context(&state).await?;
+    let record = match current_preview_record(&state, &request_context, &preview_id).await? {
+        Some(record) => record,
+        None => {
+            if state
+                .frozen_spins_previews
+                .read()
+                .await
+                .activation_token_was_consumed(&preview_id, &request.activation_candidate_token)
+            {
+                return Err(ApiError::conflict(
+                    "stale_activation_candidate: activation candidate was already consumed",
+                ));
+            }
+            return Err(ApiError::not_found(format!(
+                "frozen spins preview not found: {preview_id}"
+            )));
+        }
+    };
+    if request.activation_candidate_token != record.response.activation_candidate_token {
+        return Err(ApiError::conflict(
+            "stale_activation_candidate: activation token does not match the current preview",
+        ));
+    }
+    if request.expected_revision != record.scene_revision {
+        return Err(ApiError::conflict(format!(
+            "selection_stale_revision: activation expected scene revision {}, preview was computed at {}",
+            request.expected_revision, record.scene_revision
+        )));
+    }
+
+    let mut scene =
+        crate::get_or_load_current_live_scene_document_for_context(&state, &request_context)
+            .await?;
+    check_revision(scene.revision, request.expected_revision)?;
+    validate_activation_definition(&scene, &record, &request.definition)?;
+    let definition_id = request.definition.id.clone();
+    let slot = scene
+        .magnetization_constraints
+        .iter_mut()
+        .find(|constraint| constraint.frozen_spins().id == definition_id)
+        .ok_or_else(|| {
+            ApiError::not_found(format!(
+                "frozen spins definition not found: {definition_id}"
+            ))
+        })?;
+    *slot = MagnetizationConstraintIR::FrozenSpins(request.definition);
+    let committed =
+        crate::commit_current_live_scene_document_for_context(&state, &request_context, scene)
+            .await
+            .map_err(map_authoring_error)?;
+    let definition = committed
+        .magnetization_constraints
+        .iter()
+        .map(MagnetizationConstraintIR::frozen_spins)
+        .find(|definition| definition.id == definition_id)
+        .cloned()
+        .ok_or_else(|| ApiError::internal("activated frozen-spins definition disappeared"))?;
+
+    let consumed = state
+        .frozen_spins_previews
+        .write()
+        .await
+        .consume(&preview_id, &record.response.activation_candidate_token)
+        .is_some();
+    if !consumed {
+        return Err(ApiError::conflict(
+            "stale_activation_candidate: activation candidate was already consumed",
+        ));
+    }
+    let runtime_application =
+        pending_runtime_application_for_context(&state, &request_context, committed.revision)
+            .await?;
+    Ok(Json(FrozenSpinsPreviewActivationResponse {
+        schema_version: "frozen_spins_activation.v1".to_string(),
+        preview_id,
+        authority: FrozenSpinsPreviewAuthority::SpeculativeAuthoringPreview,
+        activation_scope: FrozenSpinsActivationScope::AuthoringCommit,
+        solver_binding: FrozenSpinsSolverBinding::PendingRuntimeActivation,
+        runtime_application,
+        activation_candidate_token_consumed: true,
+        active_site_count: record.response.frozen_dof_count + record.response.free_dof_count,
+        frozen_site_count: record.response.frozen_dof_count,
+        free_site_count: record.response.free_dof_count,
+        source_state_revision: record.source_state_revision,
+        topology_fingerprint: record.topology_fingerprint,
+        mask_sha256: record.response.mask_sha256,
+        reference_sha256: record.response.resolved.resolved_reference_sha256,
+        mask_resource: record.response.mask_resource,
+        revision: committed.revision,
+        definition,
+    }))
+}
+
 pub(crate) async fn insert_current_preview_record(
     state: &Arc<AppState>,
+    request_context: &crate::types::CurrentLiveRequestContext,
     preview_id: String,
     record: FrozenSpinsPreviewRecord,
 ) -> Result<(), ApiError> {
+    let _transition = state.current_live_session_transition.lock().await;
+    let session_epoch = state
+        .current_live_session_epoch
+        .load(std::sync::atomic::Ordering::Acquire);
     let guard = state.current_live_state.read().await;
     let snapshot = guard
         .as_ref()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(snapshot, request_context, session_epoch)?;
     if snapshot.session.session_id != record.session_id {
         return Err(ApiError::conflict(
             "selection_stale_revision: preview was computed for a superseded session",
@@ -459,14 +679,64 @@ pub(crate) async fn insert_current_preview_record(
     Ok(())
 }
 
+fn validate_activation_definition(
+    scene: &fullmag_authoring::SceneDocument,
+    record: &FrozenSpinsPreviewRecord,
+    definition: &FrozenSpinsIR,
+) -> Result<(), ApiError> {
+    if !definition.enabled {
+        return Err(ApiError::unprocessable(
+            "activation_candidate_mismatch: a disabled Frozen Spins definition cannot consume an activation candidate",
+        ));
+    }
+    if !matches!(
+        definition.reference,
+        FrozenReferencePolicyIR::CaptureCurrentAtActivation {}
+    ) {
+        return Err(ApiError::unprocessable(
+            "activation_candidate_mismatch: preview reference was captured from current magnetization but the definition uses another reference policy",
+        ));
+    }
+    reject_selector_target_mismatch(
+        &definition.selector,
+        &record.response.requested.target_object_id,
+        &scene.selections,
+    )?;
+    if definition.selector != record.requested_selector {
+        return Err(ApiError::conflict(
+            "activation_candidate_mismatch: definition selector differs from the previewed selector",
+        ));
+    }
+    if let Some(stage_id) = record.response.requested.stage_id.as_deref() {
+        let active = match &definition.activation {
+            ConstraintActivationIR::AllStages {} => true,
+            ConstraintActivationIR::StageIds { stage_ids } => {
+                stage_ids.iter().any(|candidate| candidate == stage_id)
+            }
+        };
+        if !active {
+            return Err(ApiError::conflict(format!(
+                "activation_candidate_mismatch: definition is not active for preview stage '{stage_id}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn current_preview_record(
     state: &Arc<AppState>,
+    request_context: &crate::types::CurrentLiveRequestContext,
     preview_id: &str,
 ) -> Result<Option<FrozenSpinsPreviewRecord>, ApiError> {
+    let _transition = state.current_live_session_transition.lock().await;
+    let session_epoch = state
+        .current_live_session_epoch
+        .load(std::sync::atomic::Ordering::Acquire);
     let guard = state.current_live_state.read().await;
     let snapshot = guard
         .as_ref()
         .ok_or_else(|| ApiError::not_found("no active local live workspace"))?;
+    crate::ensure_current_live_request_context(snapshot, request_context, session_epoch)?;
     let record = {
         let mut previews = state.frozen_spins_previews.write().await;
         previews.retain_session(&snapshot.session.session_id);
@@ -497,12 +767,203 @@ fn ensure_preview_current(
             "selection_stale_revision: preview source state is no longer current",
         ));
     }
-    if fdm_grid_fingerprint(snapshot) != Some(record.topology_fingerprint.as_str()) {
+    let topology_matches = if record.fem_topology {
+        snapshot
+            .fem_mesh
+            .as_ref()
+            .map(fullmag_runner::fem_mesh_topology_fingerprint)
+            .as_deref()
+            == Some(record.topology_fingerprint.as_str())
+    } else {
+        fdm_grid_fingerprint(snapshot) == Some(record.topology_fingerprint.as_str())
+    };
+    if !topology_matches {
         return Err(ApiError::conflict(
             "selection_topology_mismatch: preview topology is no longer current",
         ));
     }
     Ok(())
+}
+
+fn fem_preview_domain(
+    scene: &fullmag_authoring::SceneDocument,
+    mesh: &fullmag_runner::FemMeshPayload,
+    mapping: &EntityMapping,
+    point_count: usize,
+) -> Result<(Vec<[f64; 3]>, Vec<Vec<FemIncidentElement>>), ApiError> {
+    let global_nodes = match mapping {
+        EntityMapping::Identity { entity_count } => {
+            if *entity_count != point_count || *entity_count != mesh.nodes.len() {
+                return Err(ApiError::conflict(
+                    "selection_domain_size_mismatch: FEM identity mapping disagrees with magnetization and mesh node counts",
+                ));
+            }
+            (0..point_count)
+                .map(|index| u32::try_from(index))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    ApiError::conflict(
+                        "selection_domain_size_mismatch: FEM node index exceeds u32 carrier range",
+                    )
+                })?
+        }
+        EntityMapping::ExplicitLocalToGlobal(indices) => {
+            if indices.len() != point_count
+                || indices
+                    .iter()
+                    .any(|index| *index as usize >= mesh.nodes.len())
+                || indices.iter().copied().collect::<BTreeSet<_>>().len() != indices.len()
+            {
+                return Err(ApiError::conflict(
+                    "selection_domain_size_mismatch: FEM local-to-global mapping is not a unique in-bounds mapping for magnetization",
+                ));
+            }
+            indices.clone()
+        }
+    };
+    let points_m = global_nodes
+        .iter()
+        .map(|index| mesh.nodes[*index as usize])
+        .collect::<Vec<_>>();
+    let local_by_global = global_nodes
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(local, global)| (global, local))
+        .collect::<BTreeMap<_, _>>();
+
+    let object_transforms = object_transforms(scene);
+    let mut region_predicates = Vec::new();
+    for object in scene
+        .objects
+        .iter()
+        .filter(|object| object.role == "magnet")
+    {
+        for region in object.regions.iter().filter(|region| region.enabled) {
+            let region_ir: fullmag_ir::ObjectRegionIR = region.clone().into();
+            let transform = match region.frame {
+                fullmag_authoring::SceneRegionFrame::Object => object_transforms
+                    .get(&object.id)
+                    .cloned()
+                    .unwrap_or_else(AffineTransform3::identity),
+                fullmag_authoring::SceneRegionFrame::World => AffineTransform3::identity(),
+            };
+            let predicate = GeometryPredicate::from_object_region(
+                &region_ir,
+                transform,
+                BoundaryMembership::inclusive(),
+            )
+            .map_err(map_selection_error)?;
+            region_predicates.push((object.id.clone(), region.region_id.clone(), predicate));
+        }
+    }
+
+    if mesh.object_segments.is_empty() {
+        return Err(ApiError::unprocessable(
+            "selection_variant_unsupported: FEM preview topology has no authoritative object segments",
+        ));
+    }
+    let mut incident_elements = vec![Vec::new(); point_count];
+    for cell in mesh.cells.iter() {
+        let covering_segments = mesh
+            .object_segments
+            .iter()
+            .filter(|segment| {
+                let start = segment.element_start as usize;
+                let end = start.saturating_add(segment.element_count as usize);
+                (start..end).contains(&cell.ordinal)
+            })
+            .collect::<Vec<_>>();
+        if covering_segments.len() != 1 {
+            return Err(ApiError::conflict(format!(
+                "selection_topology_mismatch: FEM element {} belongs to {} object segments; exactly one is required",
+                cell.ordinal,
+                covering_segments.len()
+            )));
+        }
+        let segment = covering_segments[0];
+        let owner = if segment.object_id == "__air__" {
+            None
+        } else {
+            Some(resolve_fem_segment_owner(scene, segment)?)
+        };
+        for global_node in cell.nodes {
+            let Some(local_node) = local_by_global.get(global_node).copied() else {
+                continue;
+            };
+            let incident = if let Some(owner) = owner.as_ref() {
+                let point = points_m[local_node];
+                let region_ids = region_predicates
+                    .iter()
+                    .filter(|(candidate, _, _)| candidate == owner)
+                    .filter_map(
+                        |(_, region_id, predicate)| match predicate.contains(point) {
+                            Ok(true) => Some(Ok(region_id.clone())),
+                            Ok(false) => None,
+                            Err(error) => Some(Err(map_selection_error(error))),
+                        },
+                    )
+                    .collect::<Result<Vec<_>, ApiError>>()?;
+                FemIncidentElement {
+                    magnetic: true,
+                    object_id: Some(owner.clone()),
+                    region_ids,
+                }
+            } else {
+                FemIncidentElement::air()
+            };
+            incident_elements[local_node].push(incident);
+        }
+    }
+    if let Some(local_node) = incident_elements.iter().position(Vec::is_empty) {
+        return Err(ApiError::conflict(format!(
+            "selection_topology_mismatch: FEM magnetization local node {local_node} has no incident mesh element"
+        )));
+    }
+    Ok((points_m, incident_elements))
+}
+
+fn resolve_fem_segment_owner(
+    scene: &fullmag_authoring::SceneDocument,
+    segment: &fullmag_runner::FemMeshObjectSegment,
+) -> Result<String, ApiError> {
+    let matches = scene
+        .objects
+        .iter()
+        .filter(|object| object.role == "magnet")
+        .filter(|object| {
+            object_ids_match(&segment.object_id, &object.id)
+                || segment
+                    .geometry_id
+                    .as_deref()
+                    .map(|geometry_id| object_ids_match(geometry_id, &object.id))
+                    .unwrap_or(false)
+        })
+        .map(|object| object.id.clone())
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [owner] => Ok(owner.clone()),
+        [] => Err(ApiError::conflict(format!(
+            "selection_unknown_object: FEM segment '{}' has no matching magnetic scene object",
+            segment.object_id
+        ))),
+        _ => Err(ApiError::conflict(format!(
+            "selection_ambiguous_object: FEM segment '{}' matches multiple magnetic scene objects",
+            segment.object_id
+        ))),
+    }
+}
+
+fn object_ids_match(left: &str, right: &str) -> bool {
+    fn normalized(value: &str) -> &str {
+        let value = value.strip_prefix("object:").unwrap_or(value);
+        value
+            .strip_suffix("_geom")
+            .or_else(|| value.strip_suffix("_geometry"))
+            .or_else(|| value.strip_suffix("-geometry"))
+            .unwrap_or(value)
+    }
+    normalized(left) == normalized(right)
 }
 
 fn fdm_preview_domain(
@@ -547,7 +1008,7 @@ fn fdm_preview_domain(
         )));
     }
     let (active_mask, memberships) = match membership {
-        Some(membership) => memberships_from_fdm(membership, point_count)?,
+        Some(membership) => memberships_from_fdm(membership, point_count, sole_magnetic_object_id)?,
         None => {
             let object_id = sole_magnetic_object_id.ok_or_else(|| {
                 ApiError::conflict(
@@ -571,13 +1032,16 @@ fn fdm_preview_domain(
 fn memberships_from_fdm(
     membership: &FdmCellMembership,
     point_count: usize,
+    sole_magnetic_object_id: Option<&str>,
 ) -> Result<(Vec<bool>, Vec<SelectionDofMembership>), ApiError> {
     if membership.cell_membership.len() != point_count {
         return Err(ApiError::conflict(
             "selection_domain_size_mismatch: FDM membership length differs from magnetization",
         ));
     }
-    let sole_object = (membership.object_ids.len() == 1).then(|| membership.object_ids[0].clone());
+    let sole_object = (membership.object_ids.len() == 1)
+        .then(|| membership.object_ids[0].clone())
+        .or_else(|| sole_magnetic_object_id.map(str::to_string));
     let legend = membership
         .region_legend
         .iter()
@@ -613,7 +1077,10 @@ fn memberships_from_fdm(
     Ok((active_mask, resolved))
 }
 
-fn collection_resource(scene: &fullmag_authoring::SceneDocument) -> FrozenSpinsCollectionResource {
+fn collection_resource(
+    scene: &fullmag_authoring::SceneDocument,
+    runtime_application: Option<FrozenSpinsRuntimeApplication>,
+) -> FrozenSpinsCollectionResource {
     let definitions = scene
         .magnetization_constraints
         .iter()
@@ -623,12 +1090,14 @@ fn collection_resource(scene: &fullmag_authoring::SceneDocument) -> FrozenSpinsC
         revision: scene.revision,
         count: definitions.len(),
         definitions,
+        runtime_application,
     }
 }
 
 fn definition_resource(
     scene: &fullmag_authoring::SceneDocument,
     constraint_id: &str,
+    runtime_application: Option<FrozenSpinsRuntimeApplication>,
 ) -> Result<FrozenSpinsDefinitionResource, ApiError> {
     let definition = scene
         .magnetization_constraints
@@ -644,6 +1113,30 @@ fn definition_resource(
     Ok(FrozenSpinsDefinitionResource {
         revision: scene.revision,
         definition,
+        runtime_application,
+    })
+}
+
+async fn pending_runtime_application_for_context(
+    state: &Arc<AppState>,
+    context: &crate::types::CurrentLiveRequestContext,
+    revision: u64,
+) -> Result<FrozenSpinsRuntimeApplication, ApiError> {
+    let application_command_id = crate::router_v2::handlers::simulation::commands::
+        enqueue_frozen_spins_runtime_replan_if_running_with_context(
+            state, context, revision,
+        )
+        .await?;
+    Ok(FrozenSpinsRuntimeApplication {
+        state: FrozenSpinsRuntimeApplicationState::PendingRuntimePlan,
+        pending_revision: revision,
+        apply_boundary: if application_command_id.is_some() {
+            FrozenSpinsRuntimeApplyBoundary::AcceptedStep
+        } else {
+            FrozenSpinsRuntimeApplyBoundary::NextRuntimePlan
+        },
+        current_runtime_unchanged: true,
+        application_command_id,
     })
 }
 
@@ -893,4 +1386,37 @@ fn canonical_sha256(value: &str) -> String {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schemas::mesh::FdmRegionLegendEntryResource;
+
+    #[test]
+    fn single_object_fdm_membership_assigns_default_region_cells_to_scene_owner() {
+        let membership = FdmCellMembership {
+            object_ids: Vec::new(),
+            region_legend: vec![FdmRegionLegendEntryResource {
+                numeric_id: 1,
+                object_id: "film".to_string(),
+                region_id: "pinned_edge".to_string(),
+                priority: 0,
+            }],
+            cell_membership: vec![0, 1, u32::MAX],
+        };
+
+        let (active, resolved) =
+            memberships_from_fdm(&membership, 3, Some("film")).expect("membership");
+
+        assert_eq!(active, vec![true, true, false]);
+        assert_eq!(resolved[0].object_ids, vec!["film"]);
+        assert_eq!(resolved[1].object_ids, vec!["film"]);
+        assert_eq!(
+            resolved[1].region_ids,
+            vec![("film".to_string(), "pinned_edge".to_string())]
+        );
+        assert!(resolved[2].object_ids.is_empty());
+        assert!(resolved[2].region_ids.is_empty());
+    }
 }

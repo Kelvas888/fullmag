@@ -1,4 +1,9 @@
-import { act } from "react";
+import {
+  act,
+  type ComponentProps,
+  type ReactElement,
+  type ReactNode,
+} from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -23,7 +28,11 @@ import {
 } from "../realtime/communicationPolicy";
 import { ResourceInvalidationController } from "../resources/ResourceInvalidationController";
 import { RealtimeConnectionController } from "../realtime/RealtimeConnectionController";
-import { sharedResourceRuntimeStore } from "../resources/ResourceRuntimeStore";
+import { sessionScopedResourceKey } from "../resources/sessionResourceIdentity";
+import {
+  resetSharedResourceRuntimeStoreForTests,
+  sharedResourceRuntimeStore,
+} from "../resources/ResourceRuntimeStore";
 import type { ResourceResult } from "../resources/resourceTypes";
 import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
 import type { KernelApi } from "../types";
@@ -34,6 +43,7 @@ import {
   SimulationStartupOverlayView,
   WorkspaceStartupGateView,
   useSimulationStartupOverlayState,
+  type SimulationStartupOverlayState,
 } from "./SimulationStartupOverlay";
 import {
   resolveSimulationPreparationViewModel,
@@ -41,11 +51,78 @@ import {
 } from "./simulationPreparationModel";
 import {
   findElement,
+  findElements,
   installSimulationPreparationTestDom,
   TestElement,
   TestEvent,
 } from "./simulationPreparationTestDom.test-support";
 import { footerManifest } from "../../modules/footer/manifest";
+
+vi.mock("@/shared/ui/Dialog", async () => {
+  const React = await import("react");
+  const DialogContext = React.createContext<{
+    onOpenChange: (open: boolean) => void;
+    open: boolean;
+  }>({
+    onOpenChange: (_open: boolean) => undefined,
+    open: false,
+  });
+
+  return {
+    Dialog: ({
+      children,
+      onOpenChange,
+      open,
+    }: {
+      children: ReactNode;
+      onOpenChange: (open: boolean) => void;
+      open: boolean;
+    }) => (
+      <DialogContext.Provider value={{ onOpenChange, open }}>
+        {children}
+      </DialogContext.Provider>
+    ),
+    DialogClose: ({
+      asChild: _asChild,
+      children,
+    }: {
+      asChild?: boolean;
+      children: ReactElement<{ onClick?: () => void }>;
+    }) => {
+      const context = React.useContext(DialogContext);
+      return React.cloneElement(children, {
+        onClick: () => {
+          children.props.onClick?.();
+          context.onOpenChange(false);
+        },
+      });
+    },
+    DialogContent: ({
+      children,
+      ...props
+    }: ComponentProps<"section">) => {
+      const context = React.useContext(DialogContext);
+      return context.open ? (
+        <section role="dialog" {...props}>
+          {children}
+        </section>
+      ) : null;
+    },
+    DialogDescription: (props: ComponentProps<"p">) => <p {...props} />,
+    DialogFooter: (props: ComponentProps<"div">) => <div {...props} />,
+    DialogHeader: (props: ComponentProps<"div">) => <div {...props} />,
+    DialogTitle: (props: ComponentProps<"h2">) => <h2 {...props} />,
+  };
+});
+
+const SIMULATION_PREPARATION_TEST_RESOURCE_KEY = sessionScopedResourceKey(
+  {
+    requestScopeEpoch: "api-instance:preparation-test",
+    sessionEpoch: "session-preparation-test@1700000000000",
+    sessionId: "session-preparation-test",
+  },
+  SIMULATION_PREPARATION_PATH,
+);
 
 interface Deferred<TData> {
   readonly promise: Promise<TData>;
@@ -56,6 +133,7 @@ afterEach(() => {
   updateRealtimeCommunicationPolicy({});
   vi.useRealTimers();
   vi.restoreAllMocks();
+  resetSharedResourceRuntimeStoreForTests();
 });
 
 describe("mounted simulation preparation UI", () => {
@@ -86,6 +164,91 @@ describe("mounted simulation preparation UI", () => {
 
     expect(container.textContent).toContain("Viewport module");
     expect(container.textContent).not.toContain("Preparing simulation");
+
+    await act(async () => root.unmount());
+    dom.restore();
+  });
+
+  it("keeps the mounted workspace node through a startup re-entry", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const { kernel } = makeKernel({
+      loadPreparation: async () => preparationFixture(),
+      loadStatus: async () => statusFixture(),
+    });
+    const readyPreparation: SimulationPreparationResource = {
+      ...preparationFixture(),
+      active_stage_id: null,
+      completed_at_unix_ms: 20_000,
+      status: "ready",
+    };
+    const readyState = resolveSimulationPreparationViewModel(
+      resource(readyPreparation),
+      resource(statusFixture({ solverState: "awaiting_command" })),
+      20_000,
+    );
+    const blockedState = resolveSimulationPreparationViewModel(
+      resource(preparationFixture()),
+      resource(statusFixture()),
+      20_000,
+    );
+    expect(readyState.isVisible).toBe(false);
+    expect(blockedState.isVisible).toBe(true);
+
+    const container = dom.document.createElement("div");
+    dom.document.body.appendChild(container);
+    const root = createRoot(container as unknown as Element);
+
+    await act(async () => {
+      root.render(
+        <KernelContext.Provider value={kernel}>
+          <TransitionWorkspaceGate state={readyState} />
+        </KernelContext.Provider>,
+      );
+    });
+    const mountedProbe = findElement(
+      container,
+      (element) => element.getAttribute("data-workspace-probe") === "mounted",
+      "mounted workspace probe",
+    );
+
+    await act(async () => {
+      root.render(
+        <KernelContext.Provider value={kernel}>
+          <TransitionWorkspaceGate state={blockedState} />
+        </KernelContext.Provider>,
+      );
+    });
+    expect(
+      findElement(
+        container,
+        (element) =>
+          element.getAttribute("data-workspace-probe") === "mounted",
+        "workspace probe after startup re-entry",
+      ),
+    ).toBe(mountedProbe);
+    expect(
+      findElement(
+        container,
+        (element) => hasClass(element, "fm-simulation-startup"),
+        "startup overlay after re-entry",
+      ),
+    ).toBeTruthy();
+
+    await act(async () => {
+      root.render(
+        <KernelContext.Provider value={kernel}>
+          <TransitionWorkspaceGate state={readyState} />
+        </KernelContext.Provider>,
+      );
+    });
+    expect(
+      findElement(
+        container,
+        (element) =>
+          element.getAttribute("data-workspace-probe") === "mounted",
+        "workspace probe after startup recovery",
+      ),
+    ).toBe(mountedProbe);
 
     await act(async () => root.unmount());
     dom.restore();
@@ -216,6 +379,7 @@ describe("mounted simulation preparation UI", () => {
         </KernelContext.Provider>,
       );
     });
+    expect(findButton(container, "View error details")).toBeTruthy();
 
     await act(async () => {
       findButton(container, "Copy diagnostics").click();
@@ -236,6 +400,250 @@ describe("mounted simulation preparation UI", () => {
     expect(layout.get().focusedSlot).toBe("panel-bottom");
 
     unsubscribe();
+    await act(async () => root.unmount());
+    dom.restore();
+  });
+
+  it("auto-opens one precise failure dialog per failure identity and allows manual reopen", async () => {
+    const clipboardWrite = vi.fn<(text: string) => Promise<void>>();
+    clipboardWrite.mockResolvedValue(undefined);
+    const dom = installSimulationPreparationTestDom({
+      clipboard: { writeText: clipboardWrite },
+    });
+    const { kernel } = makeKernel({
+      loadPreparation: async () => preparationFixture(),
+      loadStatus: async () => statusFixture(),
+    });
+    const unsafe = {
+      ...failedPreparationFixture(),
+      host_path: "/private/modal.py",
+      log_tail: Array.from({ length: 205 }, (_, index) => ({
+        level: "info" as const,
+        message: `modal log entry ${index}`,
+        stage_id: "meshing" as const,
+        timestamp_unix_ms: index,
+      })),
+      secret: "modal-secret-token",
+    };
+    const model = resolveSimulationPreparationViewModel(
+      resource(unsafe),
+      resource(statusFixture()),
+      20_000,
+    );
+    const container = dom.document.createElement("div");
+    dom.document.body.appendChild(container);
+    const root = createRoot(container as unknown as Element);
+
+    await act(async () => {
+      root.render(
+        <KernelContext.Provider value={kernel}>
+          <SimulationStartupOverlayView state={model} />
+        </KernelContext.Provider>,
+      );
+      await Promise.resolve();
+    });
+    await settleDialog();
+
+    const dialogs = findDialogs(dom.document.body);
+    expect(dialogs).toHaveLength(1);
+    expect(dom.document.body.textContent).toContain(
+      "What happened",
+    );
+    expect(dom.document.body.textContent).toContain("How to fix");
+    expect(dom.document.body.textContent).toContain("Technical diagnostics");
+    expect(dom.document.body.textContent).toContain("gpu_dmi_kernel_not_mixed_p1");
+    expect(dom.document.body.textContent).toContain("FEM CPU");
+    expect(dom.document.body.textContent).toContain("mesh_generation_failed");
+    expect(dom.document.body.textContent).toContain("diag-42");
+    expect(dom.document.body.textContent).toContain("16.2s");
+    expect(dom.document.body.textContent).toContain(
+      "Predicate analysis was truncated. See the collapsed Full diagnostic report for complete details.",
+    );
+    expect(dom.document.body.textContent).not.toContain(
+      "additional predicate(s) are omitted",
+    );
+    expect(dom.document.body.textContent).toContain("Requested execution");
+    expect(dom.document.body.textContent).toContain(
+      "fem · gpu · double · strict · mfem",
+    );
+    expect(dom.document.body.textContent).toContain("Resolved execution");
+    expect(dom.document.body.textContent).toContain(
+      "fem · cpu · double · strict · mfem",
+    );
+    expect(findButton(dom.document.body, "Copy full diagnostic report")).toBeTruthy();
+    const fullReport = findElement(
+      dom.document.body,
+      (element) => element.tagName === "DETAILS",
+      "full diagnostic report",
+    );
+    expect(fullReport.hasAttribute("open")).toBe(false);
+    expect(fullReport.textContent).toContain("Full diagnostic report");
+    const fullReportSummary = findElement(
+      fullReport,
+      (element) => element.tagName === "SUMMARY",
+      "full diagnostic report summary",
+    );
+    await act(async () => fullReportSummary.click());
+    expect(fullReport.hasAttribute("open")).toBe(true);
+
+    await act(async () => findButton(dom.document.body, "Close").click());
+    expect(findDialogs(dom.document.body)).toHaveLength(0);
+
+    await act(async () => {
+      root.render(
+        <KernelContext.Provider value={kernel}>
+          <SimulationStartupOverlayView state={model} />
+        </KernelContext.Provider>,
+      );
+      await Promise.resolve();
+    });
+    expect(findDialogs(dom.document.body)).toHaveLength(0);
+
+    await act(async () => findButton(container, "View error details").click());
+    expect(findDialogs(dom.document.body)).toHaveLength(1);
+
+    await act(async () => {
+      findButton(dom.document.body, "Copy full diagnostic report").click();
+      await Promise.resolve();
+    });
+    expect(clipboardWrite).toHaveBeenCalledTimes(1);
+    const copied = clipboardWrite.mock.calls[0]?.[0] ?? "";
+    const report = JSON.parse(copied) as {
+      failure: { diagnostics_correlation_id: string | null } | null;
+      log_tail: unknown[];
+      requested_execution: Record<string, unknown>;
+      resolved_execution: Record<string, unknown> | null;
+      stages: unknown[];
+    };
+    expect(report.failure?.diagnostics_correlation_id).toBe("diag-42");
+    expect(report.stages).toHaveLength(9);
+    expect(report.log_tail).toHaveLength(200);
+    expect(report.requested_execution).toMatchObject({
+      backend: "fem",
+      device: "gpu",
+      precision: "double",
+    });
+    expect(report.resolved_execution).toMatchObject({
+      backend: "fem",
+      device: "cpu",
+      precision: "double",
+    });
+    expect(copied).not.toContain("/private/modal.py");
+    expect(copied).not.toContain("modal-secret-token");
+    expect(dom.document.body.textContent).toContain(
+      "Diagnostic report copied to clipboard.",
+    );
+    expect(findButton(dom.document.body, "Copy again")).toBeTruthy();
+
+    await act(async () => findButton(dom.document.body, "Close").click());
+    const nextFailure = {
+      ...failedPreparationFixture(),
+      revision: 9,
+    };
+    const nextModel = resolveSimulationPreparationViewModel(
+      resource(nextFailure),
+      resource(statusFixture({ preparationRevision: 9 })),
+      21_000,
+    );
+    await act(async () => {
+      root.render(
+        <KernelContext.Provider value={kernel}>
+          <SimulationStartupOverlayView state={nextModel} />
+        </KernelContext.Provider>,
+      );
+    });
+    expect(findDialogs(dom.document.body)).toHaveLength(1);
+
+    await act(async () => root.unmount());
+    dom.restore();
+  });
+
+  it("reports the exact omitted predicate count without a second truncation message", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const { kernel } = makeKernel({
+      loadPreparation: async () => preparationFixture(),
+      loadStatus: async () => statusFixture(),
+    });
+    const snapshot = failedPreparationFixture();
+    const model = resolveSimulationPreparationViewModel(
+      resource({
+        ...snapshot,
+        failure: {
+          ...snapshot.failure!,
+          detail: predicateDetail(34),
+        },
+      }),
+      resource(statusFixture()),
+      20_000,
+    );
+    const container = dom.document.createElement("div");
+    dom.document.body.appendChild(container);
+    const root = createRoot(container as unknown as Element);
+
+    await act(async () => {
+      root.render(
+        <KernelContext.Provider value={kernel}>
+          <SimulationStartupOverlayView state={model} />
+        </KernelContext.Provider>,
+      );
+      await Promise.resolve();
+    });
+    await settleDialog();
+
+    const countMessage =
+      "2 predicate(s) were omitted from the analysis. See the collapsed Full diagnostic report for complete details.";
+    expect(dom.document.body.textContent).toContain(countMessage);
+    expect(dom.document.body.textContent.split(countMessage)).toHaveLength(2);
+    expect(dom.document.body.textContent).not.toContain(
+      "Predicate analysis was truncated.",
+    );
+
+    await act(async () => root.unmount());
+    dom.restore();
+  });
+
+  it("reports clipboard failure accessibly and keeps copy retryable", async () => {
+    const clipboardWrite = vi.fn<(text: string) => Promise<void>>();
+    clipboardWrite.mockRejectedValue(new Error("clipboard unavailable"));
+    const dom = installSimulationPreparationTestDom({
+      clipboard: { writeText: clipboardWrite },
+    });
+    const { kernel } = makeKernel({
+      loadPreparation: async () => preparationFixture(),
+      loadStatus: async () => statusFixture(),
+    });
+    const model = resolveSimulationPreparationViewModel(
+      resource(failedPreparationFixture()),
+      resource(statusFixture()),
+      20_000,
+    );
+    const container = dom.document.createElement("div");
+    dom.document.body.appendChild(container);
+    const root = createRoot(container as unknown as Element);
+
+    await act(async () => {
+      root.render(
+        <KernelContext.Provider value={kernel}>
+          <SimulationStartupOverlayView state={model} />
+        </KernelContext.Provider>,
+      );
+      await Promise.resolve();
+    });
+    await settleDialog();
+    await act(async () => {
+      findButton(dom.document.body, "Copy full diagnostic report").click();
+      await Promise.resolve();
+    });
+
+    expect(dom.document.body.textContent).toContain(
+      "Could not copy diagnostic report. Try again.",
+    );
+    await act(async () => {
+      findButton(dom.document.body, "Retry copy").click();
+      await Promise.resolve();
+    });
+    expect(clipboardWrite).toHaveBeenCalledTimes(2);
+
     await act(async () => root.unmount());
     dom.restore();
   });
@@ -420,7 +828,7 @@ describe("mounted simulation preparation UI", () => {
 
     await act(async () => {
       sharedResourceRuntimeStore.updateData(
-        SIMULATION_PREPARATION_PATH,
+        SIMULATION_PREPARATION_TEST_RESOURCE_KEY,
         failedPreparationFixture(),
         8,
       );
@@ -434,7 +842,7 @@ describe("mounted simulation preparation UI", () => {
 
     await act(async () => {
       sharedResourceRuntimeStore.updateData(
-        SIMULATION_PREPARATION_PATH,
+        SIMULATION_PREPARATION_TEST_RESOURCE_KEY,
         { ...preparationFixture(), revision: 9 },
         9,
       );
@@ -474,7 +882,7 @@ describe("mounted simulation preparation UI", () => {
 
     await act(async () => {
       sharedResourceRuntimeStore.updateData(
-        SIMULATION_PREPARATION_PATH,
+        SIMULATION_PREPARATION_TEST_RESOURCE_KEY,
         attemptPreparationFixture(8, "Attempt 2 — HXT — progress indeterminate", 20_000),
         8,
       );
@@ -491,7 +899,7 @@ describe("mounted simulation preparation UI", () => {
 
     await act(async () => {
       sharedResourceRuntimeStore.updateData(
-        SIMULATION_PREPARATION_PATH,
+        SIMULATION_PREPARATION_TEST_RESOURCE_KEY,
         attemptPreparationFixture(9, "Attempt 2 — HXT — progress indeterminate", 35_000),
         9,
       );
@@ -500,7 +908,7 @@ describe("mounted simulation preparation UI", () => {
 
     await act(async () => {
       sharedResourceRuntimeStore.updateData(
-        SIMULATION_PREPARATION_PATH,
+        SIMULATION_PREPARATION_TEST_RESOURCE_KEY,
         attemptPreparationFixture(
           10,
           "Attempt 3 — Frontal — progress indeterminate",
@@ -553,8 +961,24 @@ function preparationFixture(): SimulationPreparationResource {
       },
     ],
     preparation_id: "prep-7",
-    requested_execution: {},
-    resolved_execution: null,
+    requested_execution: {
+      backend: "fem",
+      device: "gpu",
+      engine_id: "mfem",
+      mode: "strict",
+      precision: "double",
+      runtime_family: "managed",
+      worker: "gpu-worker",
+    },
+    resolved_execution: {
+      backend: "fem",
+      device: "cpu",
+      engine_id: "mfem",
+      mode: "strict",
+      precision: "double",
+      runtime_family: "managed",
+      worker: "cpu-worker",
+    },
     revision: 7,
     stages: ids.map((id, index) => ({
       completed_at_unix_ms: index < 5 ? 2_500 : null,
@@ -580,6 +1004,7 @@ function failedPreparationFixture(): SimulationPreparationResource {
     active_stage_id: null,
     failure: {
       diagnostics_correlation_id: "diag-42",
+      detail: `failed_predicates=[gpu_dmi_kernel_not_mixed_p1, ${"long_unknown_predicate_".repeat(12)}]`,
       error_code: "mesh_generation_failed",
       stage_id: "meshing",
       summary: "Mesh generation did not converge.",
@@ -592,6 +1017,14 @@ function failedPreparationFixture(): SimulationPreparationResource {
     ),
     status: "failed",
   };
+}
+
+function predicateDetail(count: number): string {
+  return `failed_predicates=[${Array.from(
+    { length: count },
+    (_, index) =>
+      index === 0 ? "gpu_dmi_kernel_not_mixed_p1" : `unknown_predicate_${index}`,
+  ).join(", ")}]`;
 }
 
 function attemptPreparationFixture(
@@ -626,7 +1059,12 @@ function statusFixture(
     resources: {
       simulation_preparation_revision: patch.preparationRevision ?? 7,
     },
-    session: { name: "permalloy-relaxation" },
+    session: {
+      name: "permalloy-relaxation",
+      session_id: "session-preparation-test",
+      session_epoch: "session-preparation-test@1700000000000",
+      request_scope_epoch: "api-instance:preparation-test",
+    },
     solver: { state: patch.solverState ?? "bootstrapping" },
   } as LiveStatusResource;
 }
@@ -635,6 +1073,18 @@ function MountedWorkspaceGate() {
   return (
     <WorkspaceStartupGateView state={useSimulationStartupOverlayState()}>
       <div data-slot-id="viewport-main">Viewport module</div>
+    </WorkspaceStartupGateView>
+  );
+}
+
+function TransitionWorkspaceGate({
+  state,
+}: {
+  readonly state: SimulationStartupOverlayState;
+}) {
+  return (
+    <WorkspaceStartupGateView state={state} preserveMountedWorkspace>
+      <div data-workspace-probe="mounted">Workspace module</div>
     </WorkspaceStartupGateView>
   );
 }
@@ -669,7 +1119,21 @@ function makeKernel({
   modules.register(footerManifest);
   const kernel = {
     api: {
-      sessions: { current: { status: loadStatus } },
+      sessions: {
+        current: { status: loadStatus },
+        // Session identity is confirmed against the session collection.
+        list: vi.fn(async () => ({
+          schema_version: "2.0.0",
+          sessions: [
+            {
+              current: true,
+              name: "preparation test",
+              session_id: "session-preparation-test",
+              status: "running",
+            },
+          ],
+        })),
+      },
       simulation: { preparation: loadPreparation },
     },
     bus,
@@ -684,6 +1148,14 @@ function makeKernel({
     resources,
   } as unknown as KernelApi;
   return { bus, kernel, layout, realtimeConnection, resources };
+}
+
+async function settleDialog(): Promise<void> {
+  for (let index = 0; index < 4; index += 1) {
+    await act(async () => {
+      await Promise.resolve();
+    });
+  }
 }
 
 async function settleMountedModule(): Promise<void> {
@@ -712,6 +1184,12 @@ async function settleLoads(): Promise<void> {
       await Promise.resolve();
     });
   }
+  await act(async () => {
+    // Status identity enables scoped hooks in a later React commit; advance the
+    // fake clock once so their zero-delay load runs at the browser timer floor.
+    await vi.advanceTimersByTimeAsync(1);
+    await Promise.resolve();
+  });
 }
 
 function hasClass(element: TestElement, className: string): boolean {
@@ -726,6 +1204,13 @@ function findButton(container: TestElement, name: string): TestElement {
       (element.getAttribute("aria-label") === name ||
         element.textContent.includes(name)),
     `Button ${name}`,
+  );
+}
+
+function findDialogs(container: TestElement): TestElement[] {
+  return findElements(
+    container,
+    (element) => element.getAttribute("role") === "dialog",
   );
 }
 

@@ -1,3 +1,4 @@
+use crate::fdm::RegionalFieldDriveTerm;
 use crate::periodic::constraints::PeriodicDofMap;
 use crate::periodic::reduction::{
     lift_scalar_by_periodic_classes, project_vector_field_by_periodic_classes,
@@ -5,8 +6,8 @@ use crate::periodic::reduction::{
 };
 use crate::{
     add, cross, dot, max_cross_norm, norm, normalized, scale, sub, AbmHistory,
-    EffectiveFieldObservables, EffectiveFieldTerms, EngineError, LlgConfig, MaterialParameters,
-    Result, RhsEvaluation, StepReport, TimeIntegrator, Vector3, MU0,
+    EffectiveFieldObservables, EffectiveFieldTerms, EngineError, EngineErrorCode, LlgConfig,
+    MaterialParameters, Result, RhsEvaluation, StepReport, TimeIntegrator, Vector3, MU0,
 };
 use fullmag_ir::MeshIR;
 #[cfg(feature = "parallel")]
@@ -25,12 +26,18 @@ const SPARSE_CG_TOL: f64 = 1e-10;
 const SPARSE_CG_MAX_ITER: usize = 1000;
 /// Maximum rejected attempts for one adaptive RK step before failing clearly.
 const MAX_ADAPTIVE_STEP_REJECTIONS: usize = 128;
+const ADAPTIVE_DT_MIN_ULPS: f64 = 4.0;
 /// Tolerance for barycentric coordinate inclusion test.
 const BARYCENTRIC_INCLUSION_EPS: f64 = 1e-9;
 const CUBIC_AXIS_ORTHOGONALITY_DOT_TOL: f64 = 1e-3;
 const CUBIC_AXIS_ORTHOGONALITY_CROSS_MIN_NORM: f64 = 1e-6;
 const CUBIC_AXIS_VALIDATION_ERROR: &str =
     "cubic anisotropy axes must be finite, normalized and mutually orthogonal";
+
+#[inline]
+fn adaptive_dt_min_reached(dt: f64, dt_min: f64) -> bool {
+    dt <= dt_min || (dt - dt_min).abs() <= dt_min * (ADAPTIVE_DT_MIN_ULPS * f64::EPSILON)
+}
 
 // ── C10: FEM CPU production backend dispatch ──
 
@@ -1259,6 +1266,14 @@ impl FemLlgState {
         &self.magnetization
     }
 
+    /// Mutable magnetization access for solver-owned activation/restore
+    /// transactions.  Callers that change the state directly must treat the
+    /// FSAL/ABM histories as invalid and use `set_magnetization` when they are
+    /// not part of an accepted integrator step.
+    pub fn magnetization_mut(&mut self) -> &mut [Vector3] {
+        &mut self.magnetization
+    }
+
     pub fn set_magnetization(&mut self, magnetization: Vec<Vector3>) -> Result<()> {
         if magnetization.len() != self.magnetization.len() {
             return Err(EngineError::new(format!(
@@ -1388,6 +1403,17 @@ pub struct FemLlgProblem {
     pub material: MaterialParameters,
     pub dynamics: LlgConfig,
     pub terms: EffectiveFieldTerms,
+    /// Solver-owned Frozen Spins state for the Rust FEM reference lane.
+    ///
+    /// Native MFEM keeps the equivalent mask/reference on the backend
+    /// context.  Keeping the same state in the reference lane is important:
+    /// the reference solver must not silently ignore a resolved FEM plan when
+    /// it is used for cross-discretization validation or an explicitly
+    /// selected reference fallback.
+    pub frozen_spins: Option<crate::FrozenSpinsState>,
+    /// Immutable spatial field bases evaluated only by scalar waveform
+    /// multiplication at the exact integrator stage time.
+    pub dynamic_field_drives: Vec<RegionalFieldDriveTerm>,
     /// Static periodic node reduction for FEM reference exchange operators.
     static_periodic_dof_map: Option<PeriodicDofMap>,
     /// Interface normal used by interfacial DMI in FEM reference path.
@@ -1424,6 +1450,8 @@ impl Clone for FemLlgProblem {
             material: self.material.clone(),
             dynamics: self.dynamics.clone(),
             terms: self.terms.clone(),
+            frozen_spins: self.frozen_spins.clone(),
+            dynamic_field_drives: self.dynamic_field_drives.clone(),
             static_periodic_dof_map: self.static_periodic_dof_map.clone(),
             dmi_interface_normal: self.dmi_interface_normal,
             sparse_cg_tol: self.sparse_cg_tol,
@@ -1446,6 +1474,8 @@ impl PartialEq for FemLlgProblem {
             && self.material == other.material
             && self.dynamics == other.dynamics
             && self.terms == other.terms
+            && self.frozen_spins == other.frozen_spins
+            && self.dynamic_field_drives == other.dynamic_field_drives
             && self.static_periodic_dof_map == other.static_periodic_dof_map
             && self.dmi_interface_normal == other.dmi_interface_normal
             && self.sparse_cg_tol == other.sparse_cg_tol
@@ -1528,6 +1558,8 @@ impl FemLlgProblem {
             material,
             dynamics,
             terms,
+            frozen_spins: None,
+            dynamic_field_drives: Vec::new(),
             static_periodic_dof_map,
             dmi_interface_normal: [0.0, 0.0, 1.0],
             sparse_cg_tol: None,
@@ -1575,6 +1607,8 @@ impl FemLlgProblem {
             material,
             dynamics,
             terms,
+            frozen_spins: None,
+            dynamic_field_drives: Vec::new(),
             static_periodic_dof_map,
             dmi_interface_normal: [0.0, 0.0, 1.0],
             sparse_cg_tol: None,
@@ -1592,6 +1626,68 @@ impl FemLlgProblem {
 
     pub fn set_dmi_interface_normal(&mut self, normal: Vector3) {
         self.dmi_interface_normal = normalized_dmi_interface_normal(normal);
+    }
+
+    /// Capture the resolved Frozen Spins plan at FEM activation.
+    ///
+    /// FEM plans carry a dense node mask.  The active-domain mask is derived
+    /// from the same magnetic-node volumes used by the exchange and demag
+    /// operators, so an Airbox or other non-magnetic node cannot accidentally
+    /// become a constrained solver DOF.
+    pub fn capture_frozen_spins_at_activation(
+        &mut self,
+        plan: &fullmag_ir::ResolvedFrozenSpinsPlanIR,
+        state: &mut FemLlgState,
+    ) -> Result<()> {
+        plan.validate_intrinsic().map_err(EngineError::new)?;
+        self.ensure_state_matches_topology(state)?;
+        let active_mask = self
+            .topology
+            .magnetic_node_volumes
+            .iter()
+            .map(|volume| *volume > 0.0)
+            .collect::<Vec<_>>();
+        let frozen = match self.frozen_spins.as_ref() {
+            Some(previous) => crate::FrozenSpinsState::reactivate_at_activation(
+                previous,
+                plan,
+                Some(&active_mask),
+                state.magnetization(),
+            )?,
+            None => crate::FrozenSpinsState::capture_at_activation(
+                plan,
+                Some(&active_mask),
+                state.magnetization(),
+            )?,
+        };
+        frozen.restore_reference(state.magnetization_mut());
+        self.frozen_spins = Some(frozen);
+        Ok(())
+    }
+
+    /// Return the active solver-owned Frozen Spins state, if any.
+    pub fn frozen_spins(&self) -> Option<&crate::FrozenSpinsState> {
+        self.frozen_spins.as_ref()
+    }
+
+    #[inline]
+    fn restore_frozen_reference(&self, candidate: &mut [Vector3]) {
+        if let Some(frozen) = self.frozen_spins.as_ref() {
+            frozen.restore_reference(candidate);
+        }
+    }
+
+    pub fn set_dynamic_field_drives(&mut self, drives: Vec<RegionalFieldDriveTerm>) -> Result<()> {
+        if drives
+            .iter()
+            .any(|drive| drive.basis_field.len() != self.topology.n_nodes)
+        {
+            return Err(EngineError::new(
+                "dynamic field drive basis length must equal FEM topology node count",
+            ));
+        }
+        self.dynamic_field_drives = drives;
+        Ok(())
     }
 
     /// Which demag realization this problem will use at runtime.
@@ -1623,6 +1719,76 @@ impl FemLlgProblem {
     pub fn observe(&self, state: &FemLlgState) -> Result<EffectiveFieldObservables> {
         self.ensure_state_matches_topology(state)?;
         self.observe_vectors(state.magnetization())
+    }
+
+    /// Reconstruct the scalar Poisson potential used by the FEM demag solve.
+    ///
+    /// The potential is part of the accepted static equilibrium handoff for
+    /// shared-domain frequency operators.  Keep this accessor on the same
+    /// solver object as [`observe`] so the artifact cannot accidentally use a
+    /// different boundary, periodic reduction, or CG configuration.
+    pub fn demag_potential_from_vectors(&self, magnetization: &[Vector3]) -> Result<Vec<f64>> {
+        if magnetization.len() != self.topology.n_nodes {
+            return Err(EngineError::new(format!(
+                "magnetization length {} does not match FEM node count {}",
+                magnetization.len(),
+                self.topology.n_nodes
+            )));
+        }
+        if !self.terms.demag {
+            return Ok(vec![0.0; self.topology.n_nodes]);
+        }
+
+        if let Some(periodic) = self.periodic_demag_reduced.as_ref() {
+            let reduced_n = periodic.reduced_n;
+            let mut full_rhs = vec![0.0; self.topology.n_nodes];
+            self.demag_rhs_from_vectors_into(magnetization, &mut full_rhs);
+            let reduced_rhs =
+                reduce_rhs_by_periodic_classes(&full_rhs, &periodic.full_to_reduced, reduced_n);
+            let tol = self.sparse_cg_tol.unwrap_or(SPARSE_CG_TOL);
+            let max_iter = self.sparse_cg_max_iter.unwrap_or(SPARSE_CG_MAX_ITER);
+            let mut workspace = periodic.ws.lock().unwrap();
+            workspace.ensure_size(reduced_n);
+            solve_sparse_cg_cached(
+                &periodic.reduced_csr,
+                &reduced_rhs,
+                tol,
+                max_iter,
+                &mut workspace.cg,
+                &periodic.reduced_inv_diag,
+                CgInitialGuess::Workspace,
+            )?;
+            return Ok(lift_scalar_by_periodic_classes(
+                &workspace.cg.x[..reduced_n],
+                &periodic.full_to_reduced,
+                self.topology.n_nodes,
+            ));
+        }
+
+        let n = self.demag_csr.n;
+        let mut workspace = self.demag_ws.lock().unwrap();
+        workspace.ensure_size(n);
+        self.demag_rhs_from_vectors_into(magnetization, &mut workspace.rhs[..n]);
+        if self.demag_dirichlet_boundary {
+            for &node in &self.topology.boundary_nodes {
+                if let Some(value) = workspace.rhs.get_mut(node as usize) {
+                    *value = 0.0;
+                }
+            }
+        }
+        let tol = self.sparse_cg_tol.unwrap_or(SPARSE_CG_TOL);
+        let max_iter = self.sparse_cg_max_iter.unwrap_or(SPARSE_CG_MAX_ITER);
+        let rhs = workspace.rhs[..n].to_vec();
+        solve_sparse_cg_cached(
+            &self.demag_csr,
+            &rhs,
+            tol,
+            max_iter,
+            &mut workspace.cg,
+            &self.demag_inv_diag,
+            CgInitialGuess::Workspace,
+        )?;
+        Ok(workspace.cg.x[..n].to_vec())
     }
 
     pub fn step(&self, state: &mut FemLlgState, dt: f64) -> Result<StepReport> {
@@ -1660,6 +1826,7 @@ impl FemLlgProblem {
     fn effective_field_into_scratch(
         &self,
         magnetization: &[Vector3],
+        time_seconds: f64,
         scratch: &mut FemFieldScratch,
     ) -> Result<()> {
         let n = self.topology.n_nodes;
@@ -1722,6 +1889,21 @@ impl FemLlgProblem {
                     scratch.h_eff[i] = add(scratch.h_eff[i], add(ext, h_ant));
                 }
             }
+            for drive in self
+                .dynamic_field_drives
+                .iter()
+                .filter(|drive| drive.enabled)
+            {
+                let multiplier = drive.multiplier_at(time_seconds);
+                if multiplier == 0.0 {
+                    continue;
+                }
+                for (node, basis) in drive.basis_field.iter().enumerate().take(n) {
+                    if self.topology.magnetic_node_volumes[node] > 0.0 {
+                        scratch.h_eff[node] = add(scratch.h_eff[node], scale(*basis, multiplier));
+                    }
+                }
+            }
         }
 
         // Anisotropy — in-place, no temporary Vec
@@ -1782,10 +1964,11 @@ impl FemLlgProblem {
     fn llg_rhs_into(
         &self,
         magnetization: &[Vector3],
+        time_seconds: f64,
         scratch: &mut FemFieldScratch,
         out: &mut [Vector3],
     ) -> Result<()> {
-        self.effective_field_into_scratch(magnetization, scratch)?;
+        self.effective_field_into_scratch(magnetization, time_seconds, scratch)?;
         let volumes = &self.topology.magnetic_node_volumes;
         for (i, m) in magnetization.iter().enumerate() {
             out[i] = if volumes[i] > 0.0 {
@@ -1796,6 +1979,13 @@ impl FemLlgProblem {
             } else {
                 [0.0, 0.0, 0.0]
             };
+        }
+        // Frozen Spins mask the complete assembled RHS, including exchange,
+        // demag, Zeeman, DMI and direct torque terms.  The unmasked field is
+        // still used for all energy/influence observables; only the dynamic
+        // update is constrained.
+        if let Some(frozen) = self.frozen_spins.as_ref() {
+            frozen.mask_final_rhs(out);
         }
         Ok(())
     }
@@ -1809,19 +1999,23 @@ impl FemLlgProblem {
     ) -> Result<StepReport> {
         let n = state.magnetization.len();
         ws.m0[..n].copy_from_slice(&state.magnetization);
+        self.restore_frozen_reference(&mut ws.m0[..n]);
 
-        self.llg_rhs_into(&ws.m0[..n], &mut ws.scratch, &mut ws.k[0])?;
+        let t0 = state.time_seconds;
+        self.llg_rhs_into(&ws.m0[..n], t0, &mut ws.scratch, &mut ws.k[0])?;
 
         for i in 0..n {
             ws.m_stage[i] = normalized(add(ws.m0[i], scale(ws.k[0][i], dt)))?;
         }
+        self.restore_frozen_reference(&mut ws.m_stage[..n]);
 
-        self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[1])?;
+        self.llg_rhs_into(&ws.m_stage[..n], t0 + dt, &mut ws.scratch, &mut ws.k[1])?;
 
         for i in 0..n {
             state.magnetization[i] =
                 normalized(add(ws.m0[i], scale(add(ws.k[0][i], ws.k[1][i]), 0.5 * dt)))?;
         }
+        self.restore_frozen_reference(&mut state.magnetization[..n]);
         state.time_seconds += dt;
 
         self.step_report_from_vectors(state.magnetization(), state.time_seconds, dt, false, None)
@@ -1836,20 +2030,40 @@ impl FemLlgProblem {
     ) -> Result<StepReport> {
         let n = state.magnetization.len();
         ws.m0[..n].copy_from_slice(&state.magnetization);
+        self.restore_frozen_reference(&mut ws.m0[..n]);
 
-        self.llg_rhs_into(&ws.m0[..n], &mut ws.scratch, &mut ws.k[0])?;
+        let t0 = state.time_seconds;
+        self.llg_rhs_into(&ws.m0[..n], t0, &mut ws.scratch, &mut ws.k[0])?;
         for i in 0..n {
             ws.m_stage[i] = normalized(add(ws.m0[i], scale(ws.k[0][i], 0.5 * dt)))?;
         }
-        self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[1])?;
+        self.restore_frozen_reference(&mut ws.m_stage[..n]);
+        self.llg_rhs_into(
+            &ws.m_stage[..n],
+            t0 + 0.5 * dt,
+            &mut ws.scratch,
+            &mut ws.k[1],
+        )?;
         for i in 0..n {
             ws.m_stage[i] = normalized(add(ws.m0[i], scale(ws.k[1][i], 0.5 * dt)))?;
         }
-        self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[2])?;
+        self.restore_frozen_reference(&mut ws.m_stage[..n]);
+        self.llg_rhs_into(
+            &ws.m_stage[..n],
+            t0 + 0.5 * dt,
+            &mut ws.scratch,
+            &mut ws.k[2],
+        )?;
         for i in 0..n {
             ws.m_stage[i] = normalized(add(ws.m0[i], scale(ws.k[2][i], dt)))?;
         }
-        self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[3])?;
+        self.restore_frozen_reference(&mut ws.m_stage[..n]);
+        self.llg_rhs_into(
+            &ws.m_stage[..n],
+            t0 + dt,
+            &mut ws.scratch,
+            &mut ws.k[3],
+        )?;
 
         for i in 0..n {
             let d = scale(
@@ -1861,6 +2075,7 @@ impl FemLlgProblem {
             );
             state.magnetization[i] = normalized(add(ws.m0[i], d))?;
         }
+        self.restore_frozen_reference(&mut state.magnetization[..n]);
         state.time_seconds += dt;
 
         self.step_report_from_vectors(state.magnetization(), state.time_seconds, dt, false, None)
@@ -1877,20 +2092,34 @@ impl FemLlgProblem {
         let mut dt = dt.min(cfg.dt_max).max(cfg.dt_min);
         let n = state.magnetization.len();
         ws.m0[..n].copy_from_slice(&state.magnetization);
+        self.restore_frozen_reference(&mut ws.m0[..n]);
+        let t0 = state.time_seconds;
 
         let mut rejected_attempts = 0usize;
         loop {
-            self.llg_rhs_into(&ws.m0[..n], &mut ws.scratch, &mut ws.k[0])?;
+            self.llg_rhs_into(&ws.m0[..n], t0, &mut ws.scratch, &mut ws.k[0])?;
 
             for i in 0..n {
                 ws.m_stage[i] = normalized(add(ws.m0[i], scale(ws.k[0][i], 0.5 * dt)))?;
             }
-            self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[1])?;
+            self.restore_frozen_reference(&mut ws.m_stage[..n]);
+            self.llg_rhs_into(
+                &ws.m_stage[..n],
+                t0 + 0.5 * dt,
+                &mut ws.scratch,
+                &mut ws.k[1],
+            )?;
 
             for i in 0..n {
                 ws.m_stage[i] = normalized(add(ws.m0[i], scale(ws.k[1][i], 0.75 * dt)))?;
             }
-            self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[2])?;
+            self.restore_frozen_reference(&mut ws.m_stage[..n]);
+            self.llg_rhs_into(
+                &ws.m_stage[..n],
+                t0 + 0.75 * dt,
+                &mut ws.scratch,
+                &mut ws.k[2],
+            )?;
 
             for i in 0..n {
                 ws.delta[i] = scale(
@@ -1902,8 +2131,9 @@ impl FemLlgProblem {
                 );
                 ws.m_stage[i] = normalized(add(ws.m0[i], ws.delta[i]))?;
             }
+            self.restore_frozen_reference(&mut ws.m_stage[..n]);
 
-            self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[3])?;
+            self.llg_rhs_into(&ws.m_stage[..n], t0 + dt, &mut ws.scratch, &mut ws.k[3])?;
 
             let error = Self::max_error_norm_fem(
                 &[
@@ -1916,8 +2146,20 @@ impl FemLlgProblem {
                 n,
             );
 
-            if error <= cfg.max_error || dt <= cfg.dt_min {
+            if !error.is_finite() {
+                let code = if error.is_nan() {
+                    EngineErrorCode::NaNValue
+                } else {
+                    EngineErrorCode::InfiniteValue
+                };
+                return Err(EngineError::with_code(
+                    code,
+                    "adaptive_rk23_non_finite_error",
+                ));
+            }
+            if error <= cfg.max_error {
                 state.magnetization[..n].copy_from_slice(&ws.m_stage[..n]);
+                self.restore_frozen_reference(&mut state.magnetization[..n]);
                 state.time_seconds += dt;
                 let dt_next = (cfg.headroom
                     * dt
@@ -1931,6 +2173,13 @@ impl FemLlgProblem {
                     false,
                     Some(dt_next),
                 );
+            }
+
+            if adaptive_dt_min_reached(dt, cfg.dt_min) {
+                return Err(EngineError::with_code(
+                    EngineErrorCode::AdaptiveDtMinExhausted,
+                    "adaptive_rk23_dt_min_exhausted",
+                ));
             }
 
             let dt_new = cfg.headroom * dt * (cfg.max_error / error).powf(1.0 / 3.0);
@@ -1958,6 +2207,8 @@ impl FemLlgProblem {
         let mut dt = dt.min(cfg.dt_max).max(cfg.dt_min);
         let n = state.magnetization.len();
         ws.m0[..n].copy_from_slice(&state.magnetization);
+        self.restore_frozen_reference(&mut ws.m0[..n]);
+        let t0 = state.time_seconds;
         let reuse_fsal = state.k_fsal.as_ref().is_some_and(|fsal| fsal.len() >= n);
 
         const A21: f64 = 1.0 / 5.0;
@@ -1993,13 +2244,19 @@ impl FemLlgProblem {
                 let fsal = state.k_fsal.as_ref().expect("validated FSAL cache");
                 ws.k[0][..n].copy_from_slice(&fsal[..n]);
             } else {
-                self.llg_rhs_into(&ws.m0[..n], &mut ws.scratch, &mut ws.k[0])?;
+                self.llg_rhs_into(&ws.m0[..n], t0, &mut ws.scratch, &mut ws.k[0])?;
             }
 
             for i in 0..n {
                 ws.m_stage[i] = normalized(add(ws.m0[i], scale(ws.k[0][i], A21 * dt)))?;
             }
-            self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[1])?;
+            self.restore_frozen_reference(&mut ws.m_stage[..n]);
+            self.llg_rhs_into(
+                &ws.m_stage[..n],
+                t0 + A21 * dt,
+                &mut ws.scratch,
+                &mut ws.k[1],
+            )?;
 
             for i in 0..n {
                 ws.m_stage[i] = normalized(add(
@@ -2007,7 +2264,13 @@ impl FemLlgProblem {
                     scale(add(scale(ws.k[0][i], A31), scale(ws.k[1][i], A32)), dt),
                 ))?;
             }
-            self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[2])?;
+            self.restore_frozen_reference(&mut ws.m_stage[..n]);
+            self.llg_rhs_into(
+                &ws.m_stage[..n],
+                t0 + 3.0 / 10.0 * dt,
+                &mut ws.scratch,
+                &mut ws.k[2],
+            )?;
 
             for i in 0..n {
                 ws.m_stage[i] = normalized(add(
@@ -2021,7 +2284,13 @@ impl FemLlgProblem {
                     ),
                 ))?;
             }
-            self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[3])?;
+            self.restore_frozen_reference(&mut ws.m_stage[..n]);
+            self.llg_rhs_into(
+                &ws.m_stage[..n],
+                t0 + 4.0 / 5.0 * dt,
+                &mut ws.scratch,
+                &mut ws.k[3],
+            )?;
 
             for i in 0..n {
                 ws.m_stage[i] = normalized(add(
@@ -2035,7 +2304,13 @@ impl FemLlgProblem {
                     ),
                 ))?;
             }
-            self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[4])?;
+            self.restore_frozen_reference(&mut ws.m_stage[..n]);
+            self.llg_rhs_into(
+                &ws.m_stage[..n],
+                t0 + 8.0 / 9.0 * dt,
+                &mut ws.scratch,
+                &mut ws.k[4],
+            )?;
 
             for i in 0..n {
                 ws.m_stage[i] = normalized(add(
@@ -2052,7 +2327,8 @@ impl FemLlgProblem {
                     ),
                 ))?;
             }
-            self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[5])?;
+            self.restore_frozen_reference(&mut ws.m_stage[..n]);
+            self.llg_rhs_into(&ws.m_stage[..n], t0 + dt, &mut ws.scratch, &mut ws.k[5])?;
 
             for i in 0..n {
                 ws.m_stage[i] = normalized(add(
@@ -2069,8 +2345,9 @@ impl FemLlgProblem {
                     ),
                 ))?;
             }
+            self.restore_frozen_reference(&mut ws.m_stage[..n]);
 
-            self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[6])?;
+            self.llg_rhs_into(&ws.m_stage[..n], t0 + dt, &mut ws.scratch, &mut ws.k[6])?;
 
             let error = Self::max_error_norm_fem(
                 &[
@@ -2085,8 +2362,20 @@ impl FemLlgProblem {
                 n,
             );
 
-            if error <= cfg.max_error || dt <= cfg.dt_min {
+            if !error.is_finite() {
+                let code = if error.is_nan() {
+                    EngineErrorCode::NaNValue
+                } else {
+                    EngineErrorCode::InfiniteValue
+                };
+                return Err(EngineError::with_code(
+                    code,
+                    "adaptive_rk45_non_finite_error",
+                ));
+            }
+            if error <= cfg.max_error {
                 state.magnetization[..n].copy_from_slice(&ws.m_stage[..n]);
+                self.restore_frozen_reference(&mut state.magnetization[..n]);
                 state.time_seconds += dt;
                 store_fsal_cache(state, &ws.k[6][..n]);
                 let dt_next =
@@ -2100,6 +2389,13 @@ impl FemLlgProblem {
                     false,
                     Some(dt_next),
                 );
+            }
+
+            if adaptive_dt_min_reached(dt, cfg.dt_min) {
+                return Err(EngineError::with_code(
+                    EngineErrorCode::AdaptiveDtMinExhausted,
+                    "adaptive_rk45_dt_min_exhausted",
+                ));
             }
 
             let dt_new = cfg.headroom * dt * (cfg.max_error / error).powf(0.2);
@@ -2124,23 +2420,32 @@ impl FemLlgProblem {
         ws: &mut FemIntegratorWorkspace,
     ) -> Result<StepReport> {
         let n = state.magnetization.len();
+        let t0 = state.time_seconds;
 
         if !state.abm_history.is_ready() {
             ws.m0[..n].copy_from_slice(&state.magnetization);
-            self.llg_rhs_into(&ws.m0[..n], &mut ws.scratch, &mut ws.k[0])?;
+            self.restore_frozen_reference(&mut ws.m0[..n]);
+            self.llg_rhs_into(&ws.m0[..n], t0, &mut ws.scratch, &mut ws.k[0])?;
 
             for i in 0..n {
                 ws.m_stage[i] = normalized(add(ws.m0[i], scale(ws.k[0][i], dt)))?;
             }
-            self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[1])?;
+            self.restore_frozen_reference(&mut ws.m_stage[..n]);
+            self.llg_rhs_into(&ws.m_stage[..n], t0 + dt, &mut ws.scratch, &mut ws.k[1])?;
 
             for i in 0..n {
                 state.magnetization[i] =
                     normalized(add(ws.m0[i], scale(add(ws.k[0][i], ws.k[1][i]), 0.5 * dt)))?;
             }
+            self.restore_frozen_reference(&mut state.magnetization[..n]);
             state.time_seconds += dt;
 
-            self.llg_rhs_into(state.magnetization(), &mut ws.scratch, &mut ws.k[2])?;
+            self.llg_rhs_into(
+                state.magnetization(),
+                state.time_seconds,
+                &mut ws.scratch,
+                &mut ws.k[2],
+            )?;
             state.abm_history.push_copy_from_slice(&ws.k[2][..n], dt);
 
             return self.step_report_from_vectors(
@@ -2153,6 +2458,7 @@ impl FemLlgProblem {
         }
 
         ws.m0[..n].copy_from_slice(&state.magnetization);
+        self.restore_frozen_reference(&mut ws.m0[..n]);
         let f_n = state.abm_history.f_n().unwrap();
         let f_n1 = state.abm_history.f_n_minus_1().unwrap();
         let f_n2 = state.abm_history.f_n_minus_2().unwrap();
@@ -2164,8 +2470,9 @@ impl FemLlgProblem {
             );
             ws.m_stage[i] = normalized(add(ws.m0[i], scale(pred, dt)))?;
         }
+        self.restore_frozen_reference(&mut ws.m_stage[..n]);
 
-        self.llg_rhs_into(&ws.m_stage[..n], &mut ws.scratch, &mut ws.k[0])?;
+        self.llg_rhs_into(&ws.m_stage[..n], t0 + dt, &mut ws.scratch, &mut ws.k[0])?;
 
         for i in 0..n {
             let corr = add(
@@ -2174,6 +2481,7 @@ impl FemLlgProblem {
             );
             state.magnetization[i] = normalized(add(ws.m0[i], scale(corr, dt)))?;
         }
+        self.restore_frozen_reference(&mut state.magnetization[..n]);
         state.time_seconds += dt;
         state.abm_history.push_copy_from_slice(&ws.k[0][..n], dt);
 
@@ -2358,40 +2666,48 @@ impl FemLlgProblem {
                 )
             })
             .collect::<Vec<_>>();
-        let magnetic_node_volumes = &self.topology.magnetic_node_volumes;
         let max_effective_field_amplitude = max_norm(&effective_field);
         let max_demag_field_amplitude = max_norm(&demag_field);
+        // Keep observability on the *raw* assembled RHS.  The Frozen Spins
+        // constraint is an update projection, so the all-DOF telemetry must
+        // still expose the torque/RHS that the frozen sites would have seen;
+        // the free metrics are derived from the same raw vectors below.
         #[cfg(feature = "parallel")]
-        let max_rhs_amplitude = magnetization
+        let rhs = magnetization
             .par_iter()
             .zip(effective_field.par_iter())
             .enumerate()
             .map(|(node, (m, h))| {
-                if magnetic_node_volumes[node] > 0.0 {
-                    norm(add(
+                if self.topology.magnetic_node_volumes[node] > 0.0 {
+                    add(
                         self.llg_rhs_from_field(*m, *h),
                         add(self.slonczewski_rhs_at(node, *m), self.sot_rhs_at(node, *m)),
-                    ))
+                    )
                 } else {
-                    0.0
+                    [0.0, 0.0, 0.0]
                 }
             })
-            .reduce(|| 0.0, f64::max);
+            .collect::<Vec<_>>();
         #[cfg(not(feature = "parallel"))]
-        let max_rhs_amplitude = magnetization
+        let rhs = magnetization
             .iter()
             .enumerate()
             .map(|(node, m)| {
-                if magnetic_node_volumes[node] > 0.0 {
-                    norm(add(
+                if self.topology.magnetic_node_volumes[node] > 0.0 {
+                    add(
                         self.llg_rhs_from_field(*m, effective_field[node]),
                         add(self.slonczewski_rhs_at(node, *m), self.sot_rhs_at(node, *m)),
-                    ))
+                    )
                 } else {
-                    0.0
+                    [0.0, 0.0, 0.0]
                 }
             })
-            .fold(0.0f64, f64::max);
+            .collect::<Vec<_>>();
+        let max_rhs_all_amplitude = max_norm(&rhs);
+        let max_rhs_amplitude = self
+            .frozen_spins
+            .as_ref()
+            .map_or(max_rhs_all_amplitude, |frozen| frozen.max_norm_free(&rhs));
         let exchange_energy_joules = if self.terms.exchange {
             self.exchange_energy_from_vectors(magnetization)
         } else {
@@ -2415,7 +2731,13 @@ impl FemLlgProblem {
             + cubic_anisotropy_energy_joules
             + dmi_energy_joules;
 
-        let max_torque_Apm = max_cross_norm(magnetization, &effective_field);
+        let max_torque_all_Apm = max_cross_norm(magnetization, &effective_field);
+        let max_torque_Apm = self
+            .frozen_spins
+            .as_ref()
+            .map_or(max_torque_all_Apm, |frozen| {
+                frozen.max_cross_norm_free(magnetization, &effective_field)
+            });
 
         let dmi_field = interfacial_dmi_field
             .iter()
@@ -2440,9 +2762,9 @@ impl FemLlgProblem {
             max_effective_field_amplitude,
             max_demag_field_amplitude,
             max_rhs_amplitude,
-            max_rhs_all_amplitude: max_rhs_amplitude,
+            max_rhs_all_amplitude,
             max_torque_Apm,
-            max_torque_all_Apm: max_torque_Apm,
+            max_torque_all_Apm,
         })
     }
 
@@ -2450,6 +2772,7 @@ impl FemLlgProblem {
     fn evaluate_rhs_summary_from_vectors(
         &self,
         magnetization: &[Vector3],
+        time_seconds: f64,
     ) -> Result<RhsEvaluation> {
         let n = self.topology.n_nodes;
         let exchange_field = if self.terms.exchange {
@@ -2469,7 +2792,7 @@ impl FemLlgProblem {
         } else {
             (vec![[0.0, 0.0, 0.0]; n], 0.0)
         };
-        let external_field = self.external_field_vectors();
+        let external_field = self.external_field_vectors_at_time(time_seconds);
         let anisotropy_field = self.anisotropy_field_from_vectors(magnetization)?;
         let (interfacial_dmi_field, bulk_dmi_field) = self.dmi_fields_from_vectors(magnetization);
         let exchange_energy_joules = if self.terms.exchange {
@@ -2496,7 +2819,9 @@ impl FemLlgProblem {
             + dmi_energy_joules;
         let max_demag_field_amplitude = max_norm(&demag_field);
         let mut max_effective_field_amplitude = 0.0f64;
+        let mut max_rhs_all_amplitude = 0.0f64;
         let mut max_rhs_amplitude = 0.0f64;
+        let mut max_torque_all_Apm = 0.0f64;
         let mut max_torque_Apm = 0.0f64;
         for node in 0..n {
             let effective = add(
@@ -2514,8 +2839,8 @@ impl FemLlgProblem {
                 max_effective_field_amplitude = h_norm;
             }
             let torque_norm = norm(cross(magnetization[node], effective));
-            if torque_norm > max_torque_Apm {
-                max_torque_Apm = torque_norm;
+            if torque_norm > max_torque_all_Apm {
+                max_torque_all_Apm = torque_norm;
             }
             let rhs = if self.topology.magnetic_node_volumes[node] > 0.0 {
                 add(
@@ -2529,9 +2854,29 @@ impl FemLlgProblem {
                 [0.0, 0.0, 0.0]
             };
             let rhs_norm = norm(rhs);
-            if rhs_norm > max_rhs_amplitude {
-                max_rhs_amplitude = rhs_norm;
+            if rhs_norm > max_rhs_all_amplitude {
+                max_rhs_all_amplitude = rhs_norm;
             }
+            let is_free_active = self.topology.magnetic_node_volumes[node] > 0.0
+                && self
+                    .frozen_spins
+                    .as_ref()
+                    .is_none_or(|frozen| !frozen.is_frozen(node));
+            if is_free_active {
+                if rhs_norm > max_rhs_amplitude {
+                    max_rhs_amplitude = rhs_norm;
+                }
+                if torque_norm > max_torque_Apm {
+                    max_torque_Apm = torque_norm;
+                }
+            }
+        }
+
+        if self.frozen_spins.is_none() {
+            // Preserve the historical no-constraint reference semantics: the
+            // free metric includes every assembled FEM node in that lane.
+            max_rhs_amplitude = max_rhs_all_amplitude;
+            max_torque_Apm = max_torque_all_Apm;
         }
 
         Ok(RhsEvaluation {
@@ -2545,9 +2890,9 @@ impl FemLlgProblem {
             max_effective_field_amplitude,
             max_demag_field_amplitude,
             max_rhs_amplitude,
-            max_rhs_all_amplitude: max_rhs_amplitude,
+            max_rhs_all_amplitude,
             max_torque_Apm,
-            max_torque_all_Apm: max_torque_Apm,
+            max_torque_all_Apm,
         })
     }
 
@@ -2559,7 +2904,7 @@ impl FemLlgProblem {
         step_rejected: bool,
         suggested_next_dt: Option<f64>,
     ) -> Result<StepReport> {
-        let evaluation = self.evaluate_rhs_summary_from_vectors(magnetization)?;
+        let evaluation = self.evaluate_rhs_summary_from_vectors(magnetization, time_seconds)?;
         let mut report = evaluation.into_step_report(time_seconds, dt_used, step_rejected);
         report.suggested_next_dt = suggested_next_dt;
         Ok(report)
@@ -3136,6 +3481,25 @@ impl FemLlgProblem {
         interfacial_field: &mut [Vector3],
         bulk_field: &mut [Vector3],
     ) {
+        self.dmi_fields_compute_into_selected(
+            magnetization,
+            interfacial_field,
+            bulk_field,
+            true,
+            true,
+            true,
+        );
+    }
+
+    fn dmi_fields_compute_into_selected(
+        &self,
+        magnetization: &[Vector3],
+        interfacial_field: &mut [Vector3],
+        bulk_field: &mut [Vector3],
+        include_interfacial: bool,
+        include_rotated: bool,
+        include_bulk: bool,
+    ) {
         let n_nodes = self.topology.n_nodes;
         let interfacial_field = &mut interfacial_field[..n_nodes];
         let bulk_field = &mut bulk_field[..n_nodes];
@@ -3145,9 +3509,13 @@ impl FemLlgProblem {
         let interfacial_d = self
             .terms
             .interfacial_dmi
-            .filter(|d| d.abs() > ZERO_THRESHOLD);
-        let bulk_d = self.terms.bulk_dmi.filter(|d| d.abs() > ZERO_THRESHOLD);
-        if interfacial_d.is_none() && bulk_d.is_none() {
+            .filter(|d| include_interfacial && *d != 0.0);
+        let rotated_d = self
+            .terms
+            .rotated_interfacial_dmi
+            .filter(|d| include_rotated && *d != 0.0);
+        let bulk_d = self.terms.bulk_dmi.filter(|d| include_bulk && *d != 0.0);
+        if interfacial_d.is_none() && rotated_d.is_none() && bulk_d.is_none() {
             return;
         }
 
@@ -3221,6 +3589,32 @@ impl FemLlgProblem {
                 }
             }
 
+            if let Some(d) = rotated_d {
+                const X: usize = 0;
+                const Y: usize = 1;
+                const Z: usize = 2;
+                let dw_dm = [
+                    d * (-grad_m[Z][X] + grad_m[Y][Y]),
+                    -d * grad_m[X][Y],
+                    d * grad_m[X][X],
+                ];
+                for local_index in 0..4 {
+                    let node = element[local_index] as usize;
+                    let grad_shape = gradients[local_index];
+                    let gradient_action = [
+                        d * (m_centroid[Z] * grad_shape[X] - m_centroid[Y] * grad_shape[Y]),
+                        d * m_centroid[X] * grad_shape[Y],
+                        -d * m_centroid[X] * grad_shape[X],
+                    ];
+                    let residual = [
+                        volume * (0.25 * dw_dm[X] + gradient_action[X]),
+                        volume * (0.25 * dw_dm[Y] + gradient_action[Y]),
+                        volume * (0.25 * dw_dm[Z] + gradient_action[Z]),
+                    ];
+                    interfacial_field[node] = add(interfacial_field[node], residual);
+                }
+            }
+
             if let Some(d) = bulk_d {
                 let curl_m = [
                     grad_m[2][1] - grad_m[1][2],
@@ -3251,7 +3645,7 @@ impl FemLlgProblem {
             let lumped_mass = self.topology.magnetic_node_volumes[node];
             if lumped_mass > ZERO_THRESHOLD {
                 let inv_projection_mass = -(MU0 * ms * lumped_mass).recip();
-                if interfacial_d.is_some() {
+                if interfacial_d.is_some() || rotated_d.is_some() {
                     interfacial_field[node] = scale(interfacial_field[node], inv_projection_mass);
                 }
                 if bulk_d.is_some() {
@@ -3267,7 +3661,7 @@ impl FemLlgProblem {
                 .map(|i| dof_map.reduced_node(i))
                 .collect();
             let reduced_n = dof_map.reduced_node_count;
-            if interfacial_d.is_some() {
+            if interfacial_d.is_some() || rotated_d.is_some() {
                 project_vector_field_by_periodic_classes(
                     interfacial_field,
                     &full_to_red,
@@ -3289,13 +3683,72 @@ impl FemLlgProblem {
         (interfacial_field, bulk_field)
     }
 
+    /// Return only the rotated-interfacial contribution for an observable
+    /// snapshot.  The effective field path still uses the aggregate DMI
+    /// buffer, while this selector provides a lossless component split for
+    /// runners and public scalar/field transports.
+    pub fn rotated_interfacial_dmi_field_from_vectors(
+        &self,
+        magnetization: &[Vector3],
+    ) -> Vec<Vector3> {
+        let n_nodes = self.topology.n_nodes;
+        let mut rotated_field = vec![[0.0, 0.0, 0.0]; n_nodes];
+        let mut unused_bulk = vec![[0.0, 0.0, 0.0]; n_nodes];
+        self.dmi_fields_compute_into_selected(
+            magnetization,
+            &mut rotated_field,
+            &mut unused_bulk,
+            false,
+            true,
+            false,
+        );
+        rotated_field
+    }
+
+    /// Return only the bulk-DMI contribution for an observable snapshot.
+    /// The effective field path still assembles all DMI terms together, while
+    /// this selector keeps the public runner fields losslessly separated.
+    pub fn bulk_dmi_field_from_vectors(&self, magnetization: &[Vector3]) -> Vec<Vector3> {
+        let n_nodes = self.topology.n_nodes;
+        let mut unused_interfacial = vec![[0.0, 0.0, 0.0]; n_nodes];
+        let mut bulk_field = vec![[0.0, 0.0, 0.0]; n_nodes];
+        self.dmi_fields_compute_into_selected(
+            magnetization,
+            &mut unused_interfacial,
+            &mut bulk_field,
+            false,
+            false,
+            true,
+        );
+        bulk_field
+    }
+
     fn dmi_energy_from_vectors(&self, magnetization: &[Vector3]) -> f64 {
+        self.dmi_energy_from_vectors_selected(magnetization, true, true, true)
+    }
+
+    /// Return only the rotated-interfacial energy component.
+    pub fn rotated_interfacial_dmi_energy_from_vectors(&self, magnetization: &[Vector3]) -> f64 {
+        self.dmi_energy_from_vectors_selected(magnetization, false, true, false)
+    }
+
+    fn dmi_energy_from_vectors_selected(
+        &self,
+        magnetization: &[Vector3],
+        include_interfacial: bool,
+        include_rotated: bool,
+        include_bulk: bool,
+    ) -> f64 {
         let interfacial_d = self
             .terms
             .interfacial_dmi
-            .filter(|d| d.abs() > ZERO_THRESHOLD);
-        let bulk_d = self.terms.bulk_dmi.filter(|d| d.abs() > ZERO_THRESHOLD);
-        if interfacial_d.is_none() && bulk_d.is_none() {
+            .filter(|d| include_interfacial && *d != 0.0);
+        let rotated_d = self
+            .terms
+            .rotated_interfacial_dmi
+            .filter(|d| include_rotated && *d != 0.0);
+        let bulk_d = self.terms.bulk_dmi.filter(|d| include_bulk && *d != 0.0);
+        if interfacial_d.is_none() && rotated_d.is_none() && bulk_d.is_none() {
             return 0.0;
         }
 
@@ -3346,6 +3799,14 @@ impl FemLlgProblem {
                     d * volume * (dot(m_centroid, n_hat) * div_m - dot(m_centroid, grad_m_dot_n));
             }
 
+            if let Some(d) = rotated_d {
+                energy += d
+                    * volume
+                    * (m_centroid[2] * grad_m[0][0] - m_centroid[0] * grad_m[2][0]
+                        + m_centroid[0] * grad_m[1][1]
+                        - m_centroid[1] * grad_m[0][1]);
+            }
+
             if let Some(d) = bulk_d {
                 let curl_m = [
                     grad_m[2][1] - grad_m[1][2],
@@ -3370,18 +3831,16 @@ impl FemLlgProblem {
         bulk_tmp: &mut [Vector3],
     ) {
         let n_nodes = self.topology.n_nodes;
-        let interfacial_d = self
-            .terms
-            .interfacial_dmi
-            .filter(|d| d.abs() > ZERO_THRESHOLD);
-        let bulk_d = self.terms.bulk_dmi.filter(|d| d.abs() > ZERO_THRESHOLD);
-        if interfacial_d.is_none() && bulk_d.is_none() {
+        let interfacial_d = self.terms.interfacial_dmi.filter(|d| *d != 0.0);
+        let rotated_d = self.terms.rotated_interfacial_dmi.filter(|d| *d != 0.0);
+        let bulk_d = self.terms.bulk_dmi.filter(|d| *d != 0.0);
+        if interfacial_d.is_none() && rotated_d.is_none() && bulk_d.is_none() {
             return;
         }
 
         self.dmi_fields_compute_into(magnetization, interfacial_tmp, bulk_tmp);
         for node in 0..n_nodes {
-            if interfacial_d.is_some() {
+            if interfacial_d.is_some() || rotated_d.is_some() {
                 h_eff[node] = add(h_eff[node], interfacial_tmp[node]);
             }
             if bulk_d.is_some() {
@@ -3391,10 +3850,14 @@ impl FemLlgProblem {
     }
 
     fn external_field_vectors(&self) -> Vec<Vector3> {
+        self.external_field_vectors_at_time(0.0)
+    }
+
+    fn external_field_vectors_at_time(&self, time_seconds: f64) -> Vec<Vector3> {
         let external = self.terms.external_field.unwrap_or([0.0, 0.0, 0.0]);
         let per_node_field = self.terms.per_node_field.as_deref();
         #[cfg(feature = "parallel")]
-        return self
+        let mut field: Vec<Vector3> = self
             .topology
             .magnetic_node_volumes
             .par_iter()
@@ -3412,7 +3875,8 @@ impl FemLlgProblem {
             })
             .collect();
         #[cfg(not(feature = "parallel"))]
-        self.topology
+        let mut field: Vec<Vector3> = self
+            .topology
             .magnetic_node_volumes
             .iter()
             .enumerate()
@@ -3427,7 +3891,22 @@ impl FemLlgProblem {
                     [0.0, 0.0, 0.0]
                 }
             })
-            .collect()
+            .collect();
+        for drive in self
+            .dynamic_field_drives
+            .iter()
+            .filter(|drive| drive.enabled)
+        {
+            let multiplier = drive.multiplier_at(time_seconds);
+            if multiplier != 0.0 {
+                for (node, basis) in drive.basis_field.iter().enumerate() {
+                    if self.topology.magnetic_node_volumes[node] > 0.0 {
+                        field[node] = add(field[node], scale(*basis, multiplier));
+                    }
+                }
+            }
+        }
+        field
     }
 
     fn external_energy_from_fields(
@@ -3706,6 +4185,7 @@ fn normalized_dmi_interface_normal(normal: Vector3) -> Vector3 {
 mod tests {
     use super::*;
     use crate::{CubicAnisotropyConfig, EffectiveFieldTerms, DEFAULT_GYROMAGNETIC_RATIO};
+    use fullmag_ir::TimeDependenceIR;
 
     #[test]
     fn mesh_topology_rejects_inverted_tetra_before_native_assembly() {
@@ -4114,13 +4594,69 @@ mod tests {
             !rk45.contains("state.k_fsal = None") && !rk45.contains("state.k_fsal.take()"),
             "RK45 must not consume the previous FSAL derivative until a step is accepted"
         );
+        for (name, source) in [("RK23", rk23), ("RK45", rk45)] {
+            assert!(
+                source.contains("adaptive_dt_min_reached"),
+                "{name} must reject an over-tolerance candidate at the minimum step"
+            );
+            assert!(
+                source.contains("non_finite_error"),
+                "{name} must fail closed on a non-finite error estimate"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_rk_rejects_over_tolerance_at_dt_min_without_state_commit() {
+        for integrator in [TimeIntegrator::RK23, TimeIntegrator::RK45] {
+            let mut problem = unit_tet_problem();
+            problem.dynamics = LlgConfig::new(10.0, integrator)
+                .expect("LLG config")
+                .with_adaptive(crate::AdaptiveStepConfig {
+                    max_error: 1.0e-30,
+                    dt_min: 0.2,
+                    dt_max: 0.2,
+                    headroom: 0.9,
+                    rtol: 0.0,
+                    growth_limit: 2.0,
+                    shrink_limit: 0.2,
+                });
+            problem.terms.external_field = Some([0.0, 1.0, 0.0]);
+
+            let initial = vec![[1.0, 0.0, 0.0]; problem.topology.n_nodes];
+            let mut state = problem.new_state(initial.clone()).expect("initial state");
+            let error = problem
+                .step(&mut state, 0.2)
+                .expect_err("over-tolerance minimum step must fail");
+
+            assert_eq!(error.code(), EngineErrorCode::AdaptiveDtMinExhausted);
+            assert_eq!(
+                error.to_string(),
+                format!("adaptive_{integrator:?}_dt_min_exhausted").to_lowercase()
+            );
+            assert_eq!(state.time_seconds, 0.0);
+            assert_eq!(state.magnetization, initial);
+        }
+    }
+
+    #[test]
+    fn adaptive_dt_min_boundary_accepts_rounding_but_not_a_real_larger_step() {
+        let dt_min: f64 = 1.0e-6;
+        let one_ulp_above = f64::from_bits(dt_min.to_bits() + 1);
+
+        assert!(adaptive_dt_min_reached(dt_min, dt_min));
+        assert!(adaptive_dt_min_reached(one_ulp_above, dt_min));
+        assert!(!adaptive_dt_min_reached(dt_min * 1.01, dt_min));
     }
 
     #[test]
     fn compatibility_integrators_delegate_to_workspace_path() {
-        let source = include_str!("fem.rs");
+        // `include_str!` preserves the file's physical line endings.  Normalize
+        // them before using a multi-line source marker so this contract test is
+        // stable on both LF and CRLF checkouts.
+        let source = include_str!("fem.rs").replace("\r\n", "\n");
         let compatibility = source_between(
-            source,
+            &source,
             "// Compatibility-only allocating path retained",
             "    // -----------------------------------------------------------------------\n    // Error norm helper",
         );
@@ -4141,6 +4677,39 @@ mod tests {
                 "compatibility integrators must delegate to {callee}"
             );
         }
+    }
+
+    #[test]
+    fn rk4_evaluates_dynamic_field_at_internal_stage_times() {
+        let mut problem = unit_tet_problem();
+        problem.terms.exchange = false;
+        problem.dynamics.integrator = TimeIntegrator::RK4;
+        let dt = 1.0e-6;
+        problem
+            .set_dynamic_field_drives(vec![RegionalFieldDriveTerm {
+                basis_field: vec![[0.0, 0.0, 1.0]; problem.topology.n_nodes],
+                waveform: TimeDependenceIR::Sinusoidal {
+                    frequency_hz: 0.5 / dt,
+                    phase_rad: 0.0,
+                    offset: 0.0,
+                },
+                time_offset_s: 0.0,
+                enabled: true,
+            }])
+            .expect("valid dynamic basis");
+        let mut state = problem
+            .new_state(vec![[1.0, 0.0, 0.0]; problem.topology.n_nodes])
+            .expect("state");
+        let mut workspace = FemIntegratorWorkspace::new(problem.topology.n_nodes);
+
+        problem
+            .step_with_workspace(&mut state, dt, &mut workspace)
+            .expect("RK4 step");
+
+        assert!(
+            state.magnetization()[0][1].abs() > 1.0e-4,
+            "a start-of-step-only field evaluation would see sin(0)=0 and produce no motion"
+        );
     }
 
     #[test]
@@ -4347,6 +4916,25 @@ mod tests {
     }
 
     #[test]
+    fn demag_potential_accessor_reuses_the_same_poisson_contract() {
+        let problem = coarse_box_problem(true);
+        let magnetization = vec![[0.0, 0.0, 1.0]; problem.topology.n_nodes];
+        let potential = problem
+            .demag_potential_from_vectors(&magnetization)
+            .expect("demag potential");
+        assert_eq!(potential.len(), problem.topology.n_nodes);
+        assert!(potential.iter().all(|value| value.is_finite()));
+
+        let (_field, _energy) = problem
+            .robin_demag_observables_from_vectors(&magnetization)
+            .expect("demag observables");
+        let cached = problem.demag_ws.lock().expect("demag workspace");
+        for (actual, expected) in potential.iter().zip(cached.cg.x.iter()) {
+            assert!((actual - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
     fn robin_demag_reuses_previous_potential_as_cg_initial_guess() {
         let mut problem = coarse_box_problem(true);
         let magnetization = vec![[0.0, 0.0, 1.0]; problem.topology.n_nodes];
@@ -4391,7 +4979,7 @@ mod tests {
             .expect("external magnetization update");
 
         let evaluation = problem
-            .evaluate_rhs_summary_from_vectors(state.magnetization())
+            .evaluate_rhs_summary_from_vectors(state.magnetization(), state.time_seconds)
             .expect("rhs summary after external magnetization update");
 
         let tolerance = expected_x_energy.abs().max(z_energy.abs()).max(1e-30) * 1e-10;
@@ -5014,6 +5602,44 @@ mod tests {
         assert!(
             relative_error <= 1e-9,
             "interfacial DMI field action must match dE/deps on the proof tet: \
+             derivative={derivative:.6e}, field_action={field_action:.6e}, \
+             rel_error={relative_error:.6e}"
+        );
+    }
+
+    #[test]
+    fn rotated_interfacial_dmi_field_action_matches_energy_directional_derivative() {
+        let mut problem = unit_tet_problem();
+        problem.terms.exchange = false;
+        problem.terms.interfacial_dmi = None;
+        problem.terms.rotated_interfacial_dmi = Some(3.0e-3);
+        problem.terms.bulk_dmi = None;
+        let magnetization = vec![
+            normalized([1.0, 0.1, 0.2]).expect("nonzero m0"),
+            normalized([0.7, 0.4, 0.1]).expect("nonzero m1"),
+            normalized([0.2, 0.9, 0.3]).expect("nonzero m2"),
+            normalized([0.1, 0.3, 0.95]).expect("nonzero m3"),
+        ];
+        let perturbation = vec![
+            [0.10, -0.03, 0.02],
+            [-0.04, 0.08, 0.03],
+            [0.05, 0.02, -0.07],
+            [-0.02, -0.06, 0.09],
+        ];
+        let eps = 1.0e-4;
+        let plus = add_scaled_field(&magnetization, &perturbation, eps);
+        let minus = add_scaled_field(&magnetization, &perturbation, -eps);
+        let derivative = (problem.dmi_energy_from_vectors(&plus)
+            - problem.dmi_energy_from_vectors(&minus))
+            / (2.0 * eps);
+        let field_action =
+            dmi_projected_field_action(&problem, &magnetization, &perturbation, true);
+        let denominator = derivative.abs().max(field_action.abs()).max(1e-30);
+        let relative_error = (derivative - field_action).abs() / denominator;
+
+        assert!(
+            relative_error <= 1e-9,
+            "rotated interfacial DMI field action must match dE/deps on the proof tet: \
              derivative={derivative:.6e}, field_action={field_action:.6e}, \
              rel_error={relative_error:.6e}"
         );

@@ -230,11 +230,12 @@ stagnation is failed/non-converged. Artifact sampling never infers completion.
 Physics note 0950 and ADR 0017 define the canonical extension for a
 variable-width three-dimensional microstrip/CPW. It adds these semantic types:
 
-- `AntennaLayoutIR`: straight local current axis, rigid 3D transform,
-  conductor thickness/conductivity, ordered width stations, named conductor
-  parts, and explicit port modes;
-- `AntennaPortModeIR`: terminal selectors and signed current weights whose sum
-  is zero, normalized to 1 A;
+- existing `PhysicsObjectIR`, `GeometryIR`, material assignment and
+  `CurrentModuleIR::CurrentTransport` remain the sole owners of conductor
+  identity, geometry, conductivity and charge solve;
+- `AntennaPortModeIR`: references to a source object, charge-only current
+  transport and its terminal selectors, plus signed branch weights whose sum
+  is zero and a 1 A normalization contract;
 - `StudyIR::AntennaFieldSolve`: field model, conductor-mesh policy,
   field-sampling domain, magnetic target references, solver policy, and named
   outputs;
@@ -258,12 +259,14 @@ the `stage_id` used by downstream `StageOutputRefIR`. Before a downstream
 `ProblemIR` reaches backend planning, orchestration resolves that reference to
 a concrete `antenna_field_solution.v1` manifest id and content hash.
 
-Validation requires monotone complete width stations, positive dimensions and
-conductivity, explicit return conductors, terminal selectors that resolve to
-nonempty faces, zero-sum current weights, unique ids, and an acyclic stage
-reference to an earlier compatible field-solve output. Normalization may expand
-symmetric CPW shorthand and constant-width layouts; it may not invent a missing
-return path.
+Validation requires valid source-object/current-transport references, positive
+conductivity in the referenced material/transport owner, explicit return
+conductors, referenced terminal selectors that resolve to nonempty faces,
+zero-sum current weights, unique ids, and an acyclic stage reference to an
+earlier compatible field-solve output. Migration normalization may expand
+symmetric CPW shorthand into shared geometry plus references; it may not create
+a second antenna geometry/material/current model or invent a missing return
+path.
 
 Every primitive study node has a stable unique `stage_id`. Regional-drive
 activation is either `all_time_evolution` or an explicit nonempty set of
@@ -344,9 +347,14 @@ Must be positive. The validator rejects non-positive values.
 
 Execution precision is part of backend/runtime policy, not part of the physical LLG definition.
 
-Canonical field:
+Canonical fields:
 
 - `backend_policy.execution_precision`
+- `backend_policy.fdm_precision_policy.storage`
+- `backend_policy.fdm_precision_policy.compute`
+- `backend_policy.fdm_precision_policy.fft`
+- `backend_policy.fdm_precision_policy.reduction`
+- `backend_policy.fdm_precision_policy.realization_id`
 
 Legal values:
 
@@ -355,18 +363,29 @@ Legal values:
 
 Semantics:
 
-- `double` means the backend is asked to execute in double precision,
-- `single` means the backend is asked to execute in single precision.
+- `double` resolves for single-grid FDM CUDA to
+  `fullmag.fdm.cuda.precision.full_double.v1` with FP64
+  storage/compute/FFT/reduction,
+- `single` resolves for single-grid FDM CUDA to
+  `fullmag.fdm.cuda.precision.single_storage_fp64_reduction.v1` with FP32
+  storage/compute/FFT and FP64 reduction,
+- an authored `fdm_precision_policy` must exactly match the scalar
+  `execution_precision`; the planner rejects every conflicting or unknown
+  combination instead of silently rewriting it.
 
-Current bootstrap state:
+Current state:
 
 - CPU reference FDM is public-executable only for `double`,
-- `single` is legal in Python API and canonical IR,
-- `single` is reserved for the Phase 2 CUDA FDM path and is therefore not executable on the
-  current CPU reference runner.
+- `single` is legal and public-executable only for bounded single-grid CUDA FDM
+  tuples; periodic exchange, subcell boundary correction, thermal,
+  heterogeneous material fields and multilayer FP32 remain fail-closed,
+- requested intent, planner-resolved policy and executed native realization
+  remain separate in provenance.
 
 This field belongs to `BackendPolicyIR` because precision is an execution choice made by the user,
-not a change in the physical problem description.
+not a change in the physical problem description. ADR 0028 owns the versioning
+and migration decision; `docs/physics/0300-gpu-fdm-precision-and-calibration.md`
+owns equations, units and validation evidence.
 
 ---
 

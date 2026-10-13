@@ -69,6 +69,8 @@ void initialize_transaction_context(
     // An unallocated GPU lane makes this contract deterministic on a host
     // without CUDA while still exercising the common transaction owner.
     ctx.gpu_state.device.lifecycle.allocated = false;
+    fullmag::fem::rk_step_transaction_prepare_workspace(ctx);
+    ctx.stepper.transaction_telemetry = {};
 }
 
 void source_inventory_covers_every_production_failure_boundary()
@@ -111,6 +113,8 @@ void source_inventory_covers_every_production_failure_boundary()
              "step_transaction_commit_count",
              "step_transaction_host_capture_wall_time_ns",
              "step_transaction_host_restore_wall_time_ns",
+             "step_transaction_cpu_snapshot_allocation_count",
+             "step_transaction_peak_rss_bytes",
          }) {
         check(
             runtime_state.find(field) != std::string::npos &&
@@ -122,21 +126,26 @@ void source_inventory_covers_every_production_failure_boundary()
             transaction.find("std::numeric_limits<uint64_t>::max()") !=
                 std::string::npos,
         "transaction byte accounting must use saturating addition");
+    check(
+        runtime_state.find("transaction_journal") != std::string::npos &&
+            transaction.find("prepare_for_begin") != std::string::npos,
+        "RK transaction storage must be workspace-owned and recaptured in place");
 }
 
-void rollback_restores_transaction_owned_state_and_counts_payload()
+void rollback_restores_transaction_owned_state_without_payload_copy()
 {
     fullmag::fem::Context ctx;
     initialize_transaction_context(ctx, true);
     const auto m_before = ctx.state.m_xyz;
     const auto demag_before = ctx.demag.h_xyz;
     const auto effective_before = ctx.effective_field.h_xyz;
-    const auto k0_before = ctx.stepper.workspace.k[0];
+    ctx.stepper.workspace.m_candidate.assign(ctx.state.m_xyz.size(), -1.0);
     std::string error;
     fullmag::fem::RkStepTransaction transaction(ctx);
     check(transaction.begin(error), error.c_str());
 
-    ctx.state.m_xyz.assign(ctx.state.m_xyz.size(), -1.0);
+    ctx.state.m_xyz.swap(ctx.stepper.workspace.m_candidate);
+    ctx.state.step_count += 1u;
     ctx.demag.h_xyz.assign(ctx.demag.h_xyz.size(), -2.0);
     ctx.effective_field.h_xyz.assign(ctx.effective_field.h_xyz.size(), -3.0);
     ctx.stepper.workspace.k[0].assign(ctx.stepper.workspace.k[0].size(), -4.0);
@@ -147,17 +156,24 @@ void rollback_restores_transaction_owned_state_and_counts_payload()
     check(
         ctx.effective_field.h_xyz == effective_before,
         "transaction rollback restores effective field bitwise");
-    check(ctx.stepper.workspace.k[0] == k0_before, "transaction rollback restores FSAL state bitwise");
+    check(!ctx.stepper.workspace.fsal_valid, "transaction rollback invalidates FSAL without copying k0");
     check(
         ctx.stepper.transaction_telemetry.step_transaction_begin_count == 1u &&
             ctx.stepper.transaction_telemetry.step_transaction_rollback_count == 1u &&
             ctx.stepper.transaction_telemetry.step_transaction_commit_count == 0u,
         "profiled rollback must publish one begin and one rollback");
     check(
-        ctx.stepper.transaction_telemetry.step_transaction_host_snapshot_payload_bytes > 0u &&
+        ctx.stepper.transaction_telemetry.step_transaction_host_snapshot_payload_bytes == 0u &&
             ctx.stepper.transaction_telemetry.step_transaction_host_restore_payload_bytes ==
                 ctx.stepper.transaction_telemetry.step_transaction_host_snapshot_payload_bytes,
-        "profiled rollback must report exact host capture and restore bytes");
+        "profiled CPU rollback must report zero copied host payload bytes");
+    check(
+        ctx.stepper.transaction_telemetry
+                .step_transaction_cpu_snapshot_allocation_count == 0u,
+        "prepared CPU transaction must allocate zero snapshot buffers per step");
+    check(
+        ctx.stepper.transaction_telemetry.step_transaction_peak_rss_bytes > 0u,
+        "profiled CPU transaction must publish process peak RSS");
 }
 
 void profiler_off_does_not_allocate_or_count_transaction_telemetry()
@@ -177,12 +193,47 @@ void profiler_off_does_not_allocate_or_count_transaction_telemetry()
           "profiler-off must not calculate host restore bytes");
 }
 
+void repeated_transactions_reuse_workspace_journal()
+{
+    fullmag::fem::Context ctx;
+    initialize_transaction_context(ctx, true);
+    std::string error;
+    auto *journal = ctx.stepper.workspace.transaction_journal.get();
+    check(journal != nullptr, "context setup must prepare a workspace journal");
+
+    constexpr uint64_t repetition_count = 32u;
+    for (uint64_t repetition = 0; repetition < repetition_count; ++repetition) {
+        fullmag::fem::RkStepTransaction transaction(ctx);
+        check(transaction.begin(error), error.c_str());
+        check(
+            ctx.stepper.workspace.transaction_journal.get() == journal,
+            "repeated transactions must reuse the workspace journal allocation");
+        check(transaction.rollback(error), error.c_str());
+    }
+    check(
+        ctx.stepper.transaction_telemetry.step_transaction_begin_count == repetition_count &&
+            ctx.stepper.transaction_telemetry.step_transaction_rollback_count == repetition_count,
+        "repeated profiled transactions must preserve begin/rollback accounting");
+    check(
+        ctx.stepper.transaction_telemetry
+                .step_transaction_cpu_snapshot_allocation_count == 0u,
+        "repeated prepared transactions must allocate zero CPU snapshot buffers");
+    check(
+        ctx.stepper.transaction_telemetry.step_transaction_host_snapshot_payload_bytes == 0u &&
+            ctx.stepper.transaction_telemetry.step_transaction_host_restore_payload_bytes == 0u,
+        "repeated CPU transactions must copy zero snapshot payload bytes");
+    check(
+        ctx.stepper.transaction_telemetry.step_transaction_peak_rss_bytes > 0u,
+        "repeated profiled transactions must publish peak RSS");
+}
+
 } // namespace
 
 int main()
 {
     source_inventory_covers_every_production_failure_boundary();
-    rollback_restores_transaction_owned_state_and_counts_payload();
+    rollback_restores_transaction_owned_state_without_payload_copy();
     profiler_off_does_not_allocate_or_count_transaction_telemetry();
+    repeated_transactions_reuse_workspace_journal();
     return 0;
 }

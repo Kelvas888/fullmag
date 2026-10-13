@@ -3,7 +3,10 @@ import type { ReactNode } from "react";
 import { describe, expect, it, vi } from "vitest";
 import { Accordion } from "@/shared/ui/Accordion";
 
-import type { CommandDetailResource } from "@/kernel/api/apiTypes";
+import type {
+  CommandDetailResource,
+  StageExecutionResource,
+} from "@/kernel/api/apiTypes";
 import type { ResourceResult } from "@/kernel/resources/resourceTypes";
 
 vi.mock("@radix-ui/react-dialog", async (importOriginal) => {
@@ -17,12 +20,14 @@ vi.mock("@radix-ui/react-dialog", async (importOriginal) => {
 
 import {
   CommandDetailDialog,
+  deriveK0ModalExecutionReadiness,
   ImportStateDialog,
   RestoreCheckpointDialog,
   StudyBoundarySection,
   StudyCommandButton,
   StudyRuntimeSection,
   StudySelectedStageSection,
+  studyInspectorRuntimeStatusEquals,
 } from "./StudyInspectorPanel";
 import {
   StudyPipelineSection,
@@ -56,6 +61,159 @@ function testRequested(overrides: Record<string, string> = {}) {
 }
 
 describe("StudyInspectorPanel", () => {
+  it("rerenders when the runtime advertises a new relaxation algorithm", () => {
+    const previous = {
+      capabilities: {
+        algorithms_available: ["llg_overdamped"],
+        binary_fields: true,
+        explicit_topology: true,
+      },
+      domain: { discretization: "fem" },
+      resources: {
+        mesh_build_revision: 1,
+        mesh_revision: 1,
+        commands_revision: 1,
+        scalars_revision: 1,
+        scene_revision: 1,
+        stages_revision: 1,
+      },
+      session: { session_epoch: "session-1@1", session_id: "session-1" },
+      run: null,
+    } as NonNullable<Parameters<typeof studyInspectorRuntimeStatusEquals>[0]>;
+    const next = {
+      ...previous,
+      capabilities: {
+        ...previous.capabilities,
+        algorithms_available: [
+          "llg_overdamped",
+          "projected_gradient_bb",
+        ],
+      },
+    };
+
+    expect(studyInspectorRuntimeStatusEquals(previous, next)).toBe(false);
+    expect(
+      studyInspectorRuntimeStatusEquals(previous, {
+        ...previous,
+        session: { session_epoch: "session-1@2", session_id: "session-1" },
+      }),
+    ).toBe(false);
+  });
+
+  it("derives K0 production readiness by selected equilibrium provenance", () => {
+    const resources = {
+        checkpoints: [
+          { artifact_ref: "artifact://provided", mesh_revision: 42 },
+        ] as never,
+        frequencyManifest: {
+          capabilities: { modal: { production_gpu: { reason: "not qualified", status: "contract_only" } } },
+        } as never,
+        meshManifest: { mesh_id: "shared", revision: 42 } as never,
+        periodicPairs: {
+          pairs: [{ paired_node_count: 8, status: "certified", unpaired_destination_node_count: 0, unpaired_source_node_count: 0 }],
+          revision: 42,
+        } as never,
+        solverStatus: {
+          converged: true,
+          is_busy: false,
+          revision: 42,
+        } as never,
+        stageExecution: {
+          stages: [{ converged: true, kind: "relax", status: "completed" }],
+          revision: 8,
+        } as never,
+    };
+    expect(deriveK0ModalExecutionReadiness({
+      ...resources,
+      equilibriumArtifact: "",
+      equilibriumSource: "relax",
+    })).toEqual({
+      acceptedEquilibriumReady: true,
+      periodicCertificateReady: true,
+      sharedDomainMeshReady: true,
+      strictGpuReady: false,
+    });
+    expect(deriveK0ModalExecutionReadiness({
+      ...resources,
+      equilibriumArtifact: "",
+      equilibriumSource: "provided",
+    }).acceptedEquilibriumReady).toBe(true);
+    expect(deriveK0ModalExecutionReadiness({
+      ...resources,
+      equilibriumArtifact: "artifact://provided",
+      equilibriumSource: "artifact",
+    }).acceptedEquilibriumReady).toBe(true);
+    expect(deriveK0ModalExecutionReadiness({
+      ...resources,
+      equilibriumArtifact: "artifact://missing",
+      equilibriumSource: "artifact",
+    }).acceptedEquilibriumReady).toBe(false);
+  });
+
+  it("renders unavailable K0 modal prerequisites in the study pipeline", () => {
+    const draft = {
+      ...createDefaultStudyStageDraft("eigenmodes", 0),
+      bc: "periodic",
+      dampingPolicy: "ignore",
+      deviceTarget: "gpu",
+      includeDemag: true,
+      kVector: "0,0,0",
+      magnetostaticBc: "periodic_airbox_k0",
+    };
+    const html = renderToStaticMarkup(
+      <Accordion type="multiple" defaultValue={["pipeline"]}>
+        <StudyPipelineSection
+          activeStageIndex={null}
+          authoringBusy={false}
+          authoringFeedback={null}
+          commandDisabledReason={() => null}
+          demagEnabled
+          draft={draft}
+          draftIndex={0}
+          drafts={[draft]}
+          k0ModalReadinessFor={() => ({
+            acceptedEquilibriumReady: false,
+            periodicCertificateReady: false,
+            sharedDomainMeshReady: false,
+            strictGpuReady: false,
+          })}
+          model={{
+            boundary: testBoundary(),
+            requested: testRequested({ backend: "fem", device: "gpu" }),
+            runtime: {
+              activeStageLabel: "none",
+              commandBadge: "idle",
+              commandError: null,
+              commandId: null,
+              commandLabel: "No active command",
+              maxTorque: "unavailable",
+              progressPercent: 0,
+              relaxEnergyStop: null,
+              relaxTimeStop: null,
+              relaxTorqueStop: null,
+              runId: "none",
+              state: "idle",
+            },
+            selectedStage: null,
+            stages: [],
+          }}
+          onAddStage={() => undefined}
+          onCommit={() => undefined}
+          onDuplicateStage={() => undefined}
+          onMoveStage={() => undefined}
+          onRemoveStage={() => undefined}
+          onSelectDraft={() => undefined}
+          onUpdateDraft={() => undefined}
+          runCommand={() => undefined}
+        />
+      </Accordion>,
+    );
+    expect(html).toContain("periodic_airbox_k0 requires a shared-domain mesh.");
+    expect(html).toContain("periodic_airbox_k0 requires a periodic certificate.");
+    expect(html).toContain("periodic_airbox_k0 requires an accepted equilibrium.");
+    expect(html).toContain("Strict GPU K0 modal demag prerequisites are unavailable.");
+  });
+
   it("renders requested, resolved, and fallback runtime provenance rows", () => {
     const html = renderToStaticMarkup(
       <StudyRuntimeSection
@@ -130,6 +288,115 @@ describe("StudyInspectorPanel", () => {
     expect(html).toContain("occurred");
     expect(html).toContain("cuda_unavailable");
     expect(html).toContain("CUDA device unavailable; using the reference CPU engine.");
+  });
+
+  it("distinguishes retained StageExecution telemetry from a refresh error without scoped data", () => {
+    const model = {
+      boundary: testBoundary(),
+      requested: testRequested(),
+      runtime: {
+        activeStageLabel: "Run 1",
+        commandBadge: "idle",
+        commandError: null,
+        commandId: null,
+        commandLabel: "No queued commands",
+        maxTorque: "unavailable",
+        progressPercent: 0,
+        relaxEnergyStop: null,
+        relaxTimeStop: null,
+        relaxTorqueStop: null,
+        runId: "run-1",
+        state: "running",
+      },
+      selectedStage: null,
+      stages: [],
+    } as never;
+    const renderRuntime = (
+      stageExecution: {
+        data: StageExecutionResource | null;
+        error: Error | null;
+        refreshError?: Error | null;
+        status: "error" | "stale";
+      },
+    ) =>
+      renderToStaticMarkup(
+        <StudyRuntimeSection
+          commandDisabledReason={() => null}
+          model={model}
+          onOpenCommand={() => undefined}
+          runCommand={() => undefined}
+          stageExecution={stageExecution}
+          stepValue="n/a"
+        />,
+      );
+    const lastGoodSnapshot = {
+      revision: 8,
+      run_id: "run-1",
+      session_epoch: "session-1@1",
+      session_id: "session-1",
+    } as StageExecutionResource;
+
+    const refreshErrorHtml = renderRuntime({
+      data: lastGoodSnapshot,
+      error: new Error("connection reset"),
+      status: "error",
+    });
+    expect(refreshErrorHtml).toContain('data-kind="warning"');
+    expect(refreshErrorHtml).toContain("last confirmed telemetry");
+    expect(refreshErrorHtml).toContain("connection reset");
+
+    const noSnapshotHtml = renderRuntime({
+      data: null,
+      error: new Error("session changed during refresh"),
+      status: "error",
+    });
+    expect(noSnapshotHtml).toContain('data-kind="error"');
+    expect(noSnapshotHtml).toContain("No snapshot is available");
+    expect(noSnapshotHtml).toContain("session changed during refresh");
+    expect(noSnapshotHtml).not.toContain("last confirmed telemetry");
+
+    const staleHtml = renderRuntime({
+      data: lastGoodSnapshot,
+      error: null,
+      status: "stale",
+    });
+    expect(staleHtml).toContain('data-kind="warning"');
+    expect(staleHtml).toContain("while refresh is pending");
+
+    const staleRefreshErrorHtml = renderRuntime({
+      data: lastGoodSnapshot,
+      error: null,
+      refreshError: new Error("retry failed"),
+      status: "stale",
+    });
+    expect(staleRefreshErrorHtml).toContain('data-kind="warning"');
+    expect(staleRefreshErrorHtml).toContain("last confirmed telemetry");
+    expect(staleRefreshErrorHtml).toContain("retry failed");
+
+    const staleRefreshErrorWithoutSnapshotHtml = renderRuntime({
+      data: null,
+      error: null,
+      refreshError: new Error("retry failed without scoped data"),
+      status: "stale",
+    });
+    expect(staleRefreshErrorWithoutSnapshotHtml).toContain('data-kind="error"');
+    expect(staleRefreshErrorWithoutSnapshotHtml).toContain(
+      "No snapshot is available for the current session/run scope.",
+    );
+    expect(staleRefreshErrorWithoutSnapshotHtml).toContain(
+      "retry failed without scoped data",
+    );
+
+    const staleWithoutSnapshotHtml = renderRuntime({
+      data: null,
+      error: null,
+      status: "stale",
+    });
+    expect(staleWithoutSnapshotHtml).toContain('data-kind="warning"');
+    expect(staleWithoutSnapshotHtml).toContain(
+      "no snapshot matches the current session/run scope",
+    );
+    expect(staleWithoutSnapshotHtml).not.toContain("last confirmed telemetry");
   });
 
   it("renders global advanced adaptive guard controls", () => {
@@ -421,6 +688,9 @@ describe("StudyInspectorPanel", () => {
               kind: "relax",
               label: "Relax 1",
               maxSteps: "1000",
+              meshGenerationId: "mesh-generation-7",
+              meshRevision: 19,
+              meshTopologyFingerprint: "sha256:stage-topology-7",
               progressPercent: 100,
               runtimeMetric: {
                 name: "max_torque_apm",
@@ -451,6 +721,12 @@ describe("StudyInspectorPanel", () => {
     expect(html).toContain("max_torque_apm");
     expect(html).toContain("simulation/stages/execution@13");
     expect(html).toContain("runs/run-1/stages/stage-relax");
+    expect(html).toContain("Mesh generation");
+    expect(html).toContain("mesh-generation-7");
+    expect(html).toContain("Mesh revision");
+    expect(html).toContain("19");
+    expect(html).toContain("Topology fingerprint");
+    expect(html).toContain("sha256:stage-topology-7");
   });
 
   it("renders selected stage transition metadata", () => {
@@ -487,6 +763,9 @@ describe("StudyInspectorPanel", () => {
               kind: "run",
               label: "Run 2",
               maxSteps: null,
+              meshGenerationId: null,
+              meshRevision: null,
+              meshTopologyFingerprint: null,
               progressPercent: 0,
               runtimeMetric: null,
               stageId: "stage-run",
@@ -515,6 +794,8 @@ describe("StudyInspectorPanel", () => {
     expect(html).toContain("Change device");
     expect(html).toContain("backend_transfer");
     expect(html).toContain("identity_copy");
+    expect(html).toContain("Mesh generation");
+    expect(html).toContain(">unknown<");
     expect(html).toContain("simulation/stages/execution@16");
   });
 
@@ -553,6 +834,9 @@ describe("StudyInspectorPanel", () => {
               label: "Eigenmodes 2",
               lastProgressUnixMs: 1_781_445_105_275,
               maxSteps: null,
+              meshGenerationId: null,
+              meshRevision: null,
+              meshTopologyFingerprint: null,
               progressDetail: "heartbeat 8.5s since last solver update",
               progressLabel: "solving",
               progressPercent: 35,
@@ -623,6 +907,9 @@ describe("StudyInspectorPanel", () => {
                 kind: "relax",
                 label: "Relax 1",
                 maxSteps: "50000",
+                meshGenerationId: null,
+                meshRevision: null,
+                meshTopologyFingerprint: null,
                 progressPercent: 0,
                 runtimeMetric: null,
                 stageId: "relax-1",
@@ -748,6 +1035,9 @@ describe("StudyInspectorPanel", () => {
                 label: "Frequency response 1",
                 lastProgressUnixMs: 1_781_467_092_000,
                 maxSteps: null,
+                meshGenerationId: null,
+                meshRevision: null,
+                meshTopologyFingerprint: null,
                 progressDetail:
                   "demag=periodic_airbox_k0; range=2.000000-5.000000 GHz; frequency point 2/7",
                 progressLabel: "solving frequency point",
@@ -799,6 +1089,32 @@ describe("StudyInspectorPanel", () => {
     expect(html).not.toContain('value="max_component"');
     expect(html).not.toContain('value="linearized"');
     expect(html).not.toContain('value="current_state"');
+  });
+
+  it("renders editable K0 bias-field sweep controls for eigenmodes", () => {
+    const draft = createDefaultStudyStageDraft("eigenmodes", 0);
+    const html = renderToStaticMarkup(
+      <StudyStageDraftEditor
+        draft={{
+          ...draft,
+          biasFieldSamplesApm: "0, 0, 59683.1\\n0, 0, 119366.2",
+          bc: "periodic",
+          kVector: "0, 0, 0",
+          magnetostaticBc: "periodic_airbox_k0",
+        }}
+        index={0}
+        onUpdate={() => undefined}
+        validation={[]}
+      />,
+    );
+
+    expect(html).toContain('aria-label="Bias field sweep samples"');
+    expect(html).toContain("A/m");
+    expect(html).toContain("one [Hx, Hy, Hz] vector per line");
+    expect(html).toContain('value="relax_each"');
+    expect(html).toContain('value="continuation"');
+    expect(html).toContain('value="initial_state"');
+    expect(html).toContain('value="previous_accepted_equilibrium"');
   });
 
   it("renders expanded hysteresis authoring controls", () => {
@@ -1077,6 +1393,9 @@ describe("StudyInspectorPanel", () => {
                 kind: "relax",
                 label: "Relax 1",
                 maxSteps: "50000",
+                meshGenerationId: null,
+                meshRevision: null,
+                meshTopologyFingerprint: null,
                 progressPercent: 0,
                 runtimeMetric: null,
                 stageId: "relax-1",
@@ -1127,6 +1446,14 @@ describe("StudyInspectorPanel", () => {
             requestedDevice: "gpu",
             requestedMode: "strict",
             requestedPrecision: "single",
+            parallelExecution: {
+              mode: "adaptive",
+              maxCpuPercent: "90",
+              maxMemoryPercent: "80",
+              memoryReserveMiB: "1024",
+              maxWorkers: "",
+              threadsPerWorker: "1",
+            },
             solver: {
               adaptiveTimestep: null,
               demagInterval: "",
@@ -1209,6 +1536,7 @@ describe("StudyInspectorPanel", () => {
     expect(html).not.toContain("Study solver override JSON object");
     expect(html).toContain("FEM demag policy");
     expect(html).toContain("Current CPU threads");
+    expect(html).toContain("serial mode ignores these targets");
     expect(html).toContain("LLG is not advertised by the active session.");
     expect(html).toContain(
       "Adaptive execution is qualified only for double precision.",
@@ -1233,6 +1561,14 @@ describe("StudyInspectorPanel", () => {
           requestedDevice: "auto",
           requestedMode: "strict",
           requestedPrecision: "double",
+          parallelExecution: {
+            mode: "adaptive",
+            maxCpuPercent: "90",
+            maxMemoryPercent: "80",
+            memoryReserveMiB: "1024",
+            maxWorkers: "",
+            threadsPerWorker: "1",
+          },
           solver: {
             adaptiveTimestep: null,
             demagInterval: "",
@@ -1351,7 +1687,7 @@ describe("StudyInspectorPanel", () => {
     );
     expect(html).toContain('<option value="auto">Auto</option>');
     expect(html).toContain('<option value="multilayer_convolution">FDM multilayer convolution</option>');
-    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>.*Save globals<\/button>/);
+    expect(html).toMatch(/<button[^>]*disabled=""[^>]*>.*Apply Grid<\/button>/);
   });
 
   it("renders spectral stage authoring fields", () => {
@@ -1402,8 +1738,11 @@ describe("StudyInspectorPanel", () => {
     expect(html).toContain("Frequencies");
     expect(html).toContain("Excitation");
     expect(html).toContain("Include demag");
-    expect(html).toContain("Solver method");
-    expect(html).toContain("GPU operator host Krylov");
+    expect(html).toContain(
+      "Solver implementation is resolved from device, precision, certificates, and active capabilities.",
+    );
+    expect(html).not.toContain("Solver method");
+    expect(html).not.toContain("GPU operator host Krylov");
     expect(html).toContain("k sampling");
     expect(html).toContain("BC");
   });
@@ -1459,6 +1798,53 @@ describe("StudyInspectorPanel", () => {
     expect(windowHtml).toContain('aria-label="Frequency max"');
     expect(windowHtml).toContain('value="1500000000"');
     expect(windowHtml).toContain('value="2500000000"');
+  });
+
+  it("renders canonical frequency-window controls for K0 modal authoring", () => {
+    const draft = {
+      ...createDefaultStudyStageDraft("eigenmodes", 0),
+      frequencyMax: "2e9",
+      frequencyMin: "1e9",
+      target: "frequency_window",
+    };
+    const html = renderToStaticMarkup(
+      <StudyStageDraftEditor
+        draft={draft}
+        index={0}
+        validation={[]}
+        onUpdate={() => undefined}
+      />,
+    );
+
+    expect(html).toContain('aria-label="Frequency min"');
+    expect(html).toContain('aria-label="Frequency max"');
+    expect(html).toContain('value="1e9"');
+    expect(html).toContain('value="2e9"');
+    expect(html).toContain('value="frequency_window"');
+  });
+
+  it("renders K0 bias-field sweep authoring controls", () => {
+    const draft = {
+      ...createDefaultStudyStageDraft("eigenmodes", 0),
+      biasFieldSamplesApm: "40000, 0, 0\n54000, 0, 0",
+      biasFieldEquilibriumPolicy: "continuation",
+      biasFieldContinuationSeed: "initial_state",
+    };
+    const html = renderToStaticMarkup(
+      <StudyStageDraftEditor
+        draft={draft}
+        index={0}
+        validation={[]}
+        onUpdate={() => undefined}
+      />,
+    );
+
+    expect(html).toContain('aria-label="Bias field sweep samples"');
+    expect(html).toContain("40000, 0, 0");
+    expect(html).toContain("54000, 0, 0");
+    expect(html).toContain('aria-label="Bias field equilibrium policy"');
+    expect(html).toContain('value="continuation" selected=""');
+    expect(html).toContain('aria-label="Bias field continuation seed"');
   });
 
   it("renders change-device stage authoring controls", () => {

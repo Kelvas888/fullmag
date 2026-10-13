@@ -1,6 +1,12 @@
 //! Public and internal types for the runner.
 
-use fullmag_ir::{FemMeshPartRole, FemMeshPartSelector, MeshQualityIR, StageCompletionIR};
+use fullmag_ir::{
+    FemEigenExecutionResolutionIR, FemMeshPartRole, FemMeshPartSelector, MeshQualityIR,
+    StageCompletionIR,
+};
+pub use fullmag_quantities::{
+    FemMaterialFieldLocation, FemRepresentationReceipt, FemStateRepresentation,
+};
 use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -39,6 +45,44 @@ fn record_fem_mesh_payload_build() {
 }
 
 // ----- public types -----
+
+/// Latest real admission sample for the adaptive FEM CPU eigen-k process pool.
+///
+/// This is live control-plane telemetry.  It is intentionally optional at the
+/// stage boundary: serial, FDM, GPU, and historical runs do not manufacture a
+/// pool sample.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LiveParallelExecutionTelemetry {
+    pub sampled_at_unix_ms: u64,
+    pub active_workers: u32,
+    pub admission_desired_workers: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_worker_limit: Option<u32>,
+    pub admission_pending_samples: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_workers: Option<u32>,
+    pub cpu_target_percent: f64,
+    pub memory_target_percent: f64,
+    pub memory_reserve_bytes: u64,
+    pub cpu_target_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_busy_percent: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocated_cpu_cores: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_available_cores: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_limit_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_available_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_peak_cpu_cores: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_peak_rss_bytes: Option<u64>,
+    pub admission_reason: String,
+    #[serde(default)]
+    pub terminal: bool,
+}
 
 /// Public result type returned by [`crate::run_reference_fem_eigen`].
 ///
@@ -90,6 +134,213 @@ pub struct RunResult {
     pub final_magnetization: Vec<[f64; 3]>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<StageCompletionIR>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct CertifiedFemEquilibriumFields {
+    pub schema_version: String,
+    pub h_ex_a_per_m: Vec<[f64; 3]>,
+    pub h_demag_a_per_m: Vec<[f64; 3]>,
+    pub h_ext_a_per_m: Vec<[f64; 3]>,
+    #[serde(default, deserialize_with = "deserialize_present_certificate_view", skip_serializing_if = "Option::is_none")]
+    pub h_anisotropy_a_per_m: Option<Vec<[f64; 3]>>,
+    pub h_eff_a_per_m: Vec<[f64; 3]>,
+    pub phi_a: Vec<f64>,
+    pub content_sha256: String,
+}
+
+// Keep the producer and the independent replay validator on one numerical
+// tolerance contract.  These values describe the accepted-vs-recomputed
+// snapshot comparison; they are not modal residual tolerances.
+pub(crate) const FEM_LINEARIZATION_FIELD_ABSOLUTE_TOLERANCE_A_PER_M: f64 = 1.0e-6;
+pub(crate) const FEM_LINEARIZATION_FIELD_RELATIVE_TOLERANCE: f64 = 1.0e-8;
+pub(crate) const FEM_LINEARIZATION_PHI_ABSOLUTE_TOLERANCE_A: f64 = 1.0e-12;
+
+/// A missing legacy view is valid; an explicitly present null is not a view.
+fn deserialize_present_certificate_view<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
+}
+
+impl CertifiedFemEquilibriumFields {
+    /// Select exact producer/consumer paths without a cross-version fallback.
+    pub fn artifact_paths_for_material(material: &fullmag_ir::MaterialIR) -> (&'static str, &'static str) {
+        if material.uniaxial_anisotropy.is_some() {
+            ("equilibrium/certified_fem_equilibrium_fields.v2.json",
+             "equilibrium/recomputed_fem_linearization_certificate.v2.json")
+        } else {
+            ("equilibrium/certified_fem_equilibrium_fields.v1.json",
+             "equilibrium/recomputed_fem_linearization_certificate.v1.json")
+        }
+    }
+
+    /// Select the independent accepted endpoint payload for the same schema
+    /// family as the certified/recomputed field payload.
+    ///
+    /// A declared `Ku=0` remains a V2 material.  The presence of the
+    /// authoring field, rather than its numeric value, selects the schema so
+    /// that the anisotropy observable cannot silently disappear during a
+    /// zero-anisotropy replay.
+    pub fn accepted_artifact_path_for_material(material: &fullmag_ir::MaterialIR) -> &'static str {
+        if material.uniaxial_anisotropy.is_some() {
+            "equilibrium/accepted_fem_equilibrium_fields.v2.json"
+        } else {
+            "equilibrium/accepted_fem_equilibrium_fields.v1.json"
+        }
+    }
+
+    pub fn from_fields(
+        h_ex_a_per_m: Vec<[f64; 3]>, h_demag_a_per_m: Vec<[f64; 3]>,
+        h_ext_a_per_m: Vec<[f64; 3]>, h_eff_a_per_m: Vec<[f64; 3]>, phi_a: Vec<f64>,
+    ) -> Result<Self, RunError> {
+        Self::from_optional_anisotropy_fields(h_ex_a_per_m, h_demag_a_per_m,
+            h_ext_a_per_m, None, h_eff_a_per_m, phi_a)
+    }
+
+    pub fn from_fields_with_anisotropy(
+        h_ex_a_per_m: Vec<[f64; 3]>, h_demag_a_per_m: Vec<[f64; 3]>,
+        h_ext_a_per_m: Vec<[f64; 3]>, h_anisotropy_a_per_m: Vec<[f64; 3]>,
+        h_eff_a_per_m: Vec<[f64; 3]>, phi_a: Vec<f64>,
+    ) -> Result<Self, RunError> {
+        Self::from_optional_anisotropy_fields(h_ex_a_per_m, h_demag_a_per_m,
+            h_ext_a_per_m, Some(h_anisotropy_a_per_m), h_eff_a_per_m, phi_a)
+    }
+
+    fn from_optional_anisotropy_fields(
+        h_ex_a_per_m: Vec<[f64; 3]>, h_demag_a_per_m: Vec<[f64; 3]>,
+        h_ext_a_per_m: Vec<[f64; 3]>, h_anisotropy_a_per_m: Option<Vec<[f64; 3]>>,
+        h_eff_a_per_m: Vec<[f64; 3]>, phi_a: Vec<f64>,
+    ) -> Result<Self, RunError> {
+        let node_count = h_eff_a_per_m.len();
+        let mut views = vec![&h_ex_a_per_m, &h_demag_a_per_m, &h_ext_a_per_m, &h_eff_a_per_m];
+        if let Some(anisotropy) = &h_anisotropy_a_per_m { views.push(anisotropy); }
+        if node_count == 0 || phi_a.len() != node_count
+            || views.iter().any(|values| values.len() != node_count)
+            || views.iter().flat_map(|values| values.iter()).flatten().any(|value| !value.is_finite())
+            || phi_a.iter().any(|value| !value.is_finite())
+        {
+            return Err(RunError { message: "certified FEM equilibrium fields are incomplete or non-finite".to_string() });
+        }
+        let mut value = Self {
+            schema_version: if h_anisotropy_a_per_m.is_some() {
+                "CertifiedFemEquilibriumFields.v2"
+            } else { "CertifiedFemEquilibriumFields.v1" }.to_string(),
+            h_ex_a_per_m, h_demag_a_per_m, h_ext_a_per_m, h_anisotropy_a_per_m,
+            h_eff_a_per_m, phi_a, content_sha256: String::new(),
+        };
+        value.content_sha256 = certified_equilibrium_fields_sha256(&value);
+        Ok(value)
+    }
+}
+
+pub(crate) fn certified_equilibrium_fields_sha256(
+    fields: &CertifiedFemEquilibriumFields,
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(fields.schema_version.as_bytes());
+    hash.update([0u8]);
+    let mut views = vec![
+        &fields.h_ex_a_per_m,
+        &fields.h_demag_a_per_m,
+        &fields.h_ext_a_per_m,
+        &fields.h_eff_a_per_m,
+    ];
+    if let Some(anisotropy) = &fields.h_anisotropy_a_per_m { views.insert(2, anisotropy); }
+    for vectors in views {
+        hash.update((vectors.len() as u64).to_le_bytes());
+        for vector in vectors {
+            for value in vector {
+                hash.update(value.to_bits().to_le_bytes());
+            }
+        }
+    }
+    hash.update((fields.phi_a.len() as u64).to_le_bytes());
+    for value in &fields.phi_a {
+        hash.update(value.to_bits().to_le_bytes());
+    }
+    format!("sha256:{:x}", hash.finalize())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RecomputedFemLinearizationCertificateV1 {
+    pub schema_version: String,
+    pub status: String,
+    pub recompute_provider: String,
+    pub node_count: usize,
+    pub equilibrium_content_sha256: String,
+    pub mesh_topology_sha256: String,
+    pub equilibrium_material_signature: String,
+    pub equilibrium_static_physics_signature: String,
+    pub equilibrium_boundary_signature: String,
+    pub accepted_fields_content_sha256: String,
+    pub recomputed_fields_content_sha256: String,
+    pub max_h_ex_difference_a_per_m: f64,
+    pub max_h_demag_difference_a_per_m: f64,
+    pub max_h_ext_difference_a_per_m: f64,
+    #[serde(default, deserialize_with = "deserialize_present_certificate_view", skip_serializing_if = "Option::is_none")]
+    pub max_h_anisotropy_difference_a_per_m: Option<f64>,
+    pub max_h_eff_difference_a_per_m: f64,
+    pub max_phi_difference_a: f64,
+    pub field_absolute_tolerance_a_per_m: f64,
+    pub field_relative_tolerance: f64,
+    pub phi_absolute_tolerance_a: f64,
+    pub content_sha256: String,
+}
+
+pub fn recomputed_fem_linearization_certificate_sha256(
+    certificate: &RecomputedFemLinearizationCertificateV1,
+) -> Result<String, RunError> {
+    let encoded = recomputed_fem_linearization_certificate_preimage_bytes(certificate)?;
+    let mut hash = Sha256::new();
+    hash.update(certificate.schema_version.as_bytes());
+    hash.update([0u8]);
+    hash.update((encoded.len() as u64).to_le_bytes());
+    hash.update(encoded);
+    Ok(format!("sha256:{:x}", hash.finalize()))
+}
+
+/// Return the exact UTF-8 JSON bytes used by the historical certificate
+/// digest.  This is deliberately separate from the certificate digest so a
+/// downstream replay implementation can verify Rust's serde bytes without
+/// reserializing the JSON in another language.
+pub fn recomputed_fem_linearization_certificate_preimage_bytes(
+    certificate: &RecomputedFemLinearizationCertificateV1,
+) -> Result<Vec<u8>, RunError> {
+    let mut preimage = certificate.clone();
+    preimage.content_sha256.clear();
+    serde_json::to_vec(&preimage).map_err(|error| RunError {
+        message: format!("failed to encode recomputed FEM linearization certificate: {error}"),
+    })
+}
+
+/// Digest the exact certificate preimage bytes without the historical
+/// schema/length framing.  The framed certificate digest remains the source
+/// of truth for compatibility; this auxiliary digest proves the bytes that
+/// were published beside the certificate.
+pub fn recomputed_fem_linearization_certificate_preimage_sha256(
+    certificate: &RecomputedFemLinearizationCertificateV1,
+) -> Result<String, RunError> {
+    let bytes = recomputed_fem_linearization_certificate_preimage_bytes(certificate)?;
+    let mut hash = Sha256::new();
+    hash.update(bytes);
+    Ok(format!("sha256:{:x}", hash.finalize()))
+}
+
+pub fn recomputed_fem_equilibrium_content_sha256(values: &[[f64; 3]]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"RecomputedFemLinearizationCertificate.m0.v1\0");
+    hash.update((values.len() as u64).to_le_bytes());
+    for vector in values {
+        for value in vector {
+            hash.update(value.to_bits().to_le_bytes());
+        }
+    }
+    format!("sha256:{:x}", hash.finalize())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -337,6 +588,20 @@ pub enum StepAction {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SolverAttemptRecord {
     pub attempt: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive_controller_policy_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_norm_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_node_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_measure: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normalization_denominator: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_scaled_error: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weighted_rms_error: Option<f64>,
     pub target_step: u64,
     pub time: f64,
     pub dt_attempt: f64,
@@ -378,6 +643,12 @@ pub struct LiveFieldMaterializationStatus {
 #[allow(non_snake_case)]
 pub struct StepStats {
     pub step: u64,
+    /// Semantic kind of this step record. Historical JSON without a kind is unclassified.
+    #[serde(default = "fullmag_quantities::StepDataKind::legacy_unclassified")]
+    pub kind: fullmag_quantities::StepDataKind,
+    /// Typed solver progress, present only when `kind` is `SolverProgress`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solver_progress: Option<fullmag_quantities::SolverProgress>,
     pub time: f64,
     pub dt: f64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -392,6 +663,8 @@ pub struct StepStats {
     pub e_drive: f64,
     pub e_ani: f64,
     pub e_dmi: f64,
+    #[serde(default, alias = "E_rotated_dmi")]
+    pub e_rotated_dmi: f64,
     pub e_total: f64,
     pub max_dm_dt: f64,
     /// Maximum total dynamic RHS norm in 1/s.
@@ -471,6 +744,10 @@ pub struct StepStats {
     pub rk_transaction_rollback_count: u64,
     #[serde(default)]
     pub rk_transaction_commit_count: u64,
+    #[serde(default)]
+    pub rk_transaction_cpu_snapshot_allocation_count: u64,
+    #[serde(default)]
+    pub rk_transaction_peak_rss_bytes: u64,
     /// Host time to enqueue the Fullmag→HYPRE dependency event.
     #[serde(default)]
     pub demag_hypre_wait_in_enqueue_wall_time_ns: u64,
@@ -706,6 +983,13 @@ pub struct StepStats {
     pub demag_solves: u32,
     #[serde(default)]
     pub fsal_reused: bool,
+    /// Optional native CPU RK accepted-endpoint cache receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_cache_telemetry: Option<fullmag_quantities::EndpointCacheTelemetry>,
+    /// Versioned receipt of the native FEM state/material representation and
+    /// cumulative conversion traffic observed by this backend handle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fem_representation_receipt: Option<FemRepresentationReceipt>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub solver_attempts: Vec<SolverAttemptRecord>,
     /// Number of PCG iterations in the last Poisson demag solve.
@@ -773,6 +1057,8 @@ impl Default for StepStats {
     fn default() -> Self {
         Self {
             step: 0,
+            kind: fullmag_quantities::StepDataKind::PhysicalObservation,
+            solver_progress: None,
             time: 0.0,
             dt: 0.0,
             pseudo_time_s: None,
@@ -785,6 +1071,7 @@ impl Default for StepStats {
             e_drive: 0.0,
             e_ani: 0.0,
             e_dmi: 0.0,
+            e_rotated_dmi: 0.0,
             e_total: 0.0,
             max_dm_dt: 0.0,
             max_rhs_norm_per_s: 0.0,
@@ -819,6 +1106,8 @@ impl Default for StepStats {
             rk_transaction_restore_bytes: 0,
             rk_transaction_rollback_count: 0,
             rk_transaction_commit_count: 0,
+            rk_transaction_cpu_snapshot_allocation_count: 0,
+            rk_transaction_peak_rss_bytes: 0,
             demag_hypre_wait_in_enqueue_wall_time_ns: 0,
             demag_hypre_host_api_wall_time_ns: 0,
             demag_hypre_device_elapsed_time_ns: 0,
@@ -911,6 +1200,8 @@ impl Default for StepStats {
             rhs_evals: 0,
             demag_solves: 0,
             fsal_reused: false,
+            endpoint_cache_telemetry: None,
+            fem_representation_receipt: None,
             solver_attempts: Vec::new(),
             poisson_iterations: 0,
             poisson_final_residual: 0.0,
@@ -939,7 +1230,8 @@ impl Default for StepStats {
 #[cfg(test)]
 mod all_in_gpu_fem_transfer_audit_tests {
     use super::{
-        ExecutionProvenance, FdmMultilayerStageTelemetry, FdmMultilayerTransferTelemetry, StepStats,
+        ExecutionProvenance, FdmMultilayerStageTelemetry, FdmMultilayerTransferTelemetry,
+        FemMaterialFieldLocation, FemRepresentationReceipt, FemStateRepresentation, StepStats,
     };
 
     #[test]
@@ -979,6 +1271,33 @@ mod all_in_gpu_fem_transfer_audit_tests {
             demag_recover_wall_time_ns: 7,
             demag_energy_wall_time_ns: 11,
             extra_energy_wall_time_ns: 29,
+            endpoint_cache_telemetry: Some(fullmag_quantities::EndpointCacheTelemetry {
+                final_refresh_reason: "cache_hit".to_string(),
+                cache_state_valid: true,
+                cache_time_valid: true,
+                cache_dynamic_sources_valid: true,
+                cache_transport_valid: true,
+                cache_projection_valid: true,
+                final_rhs_evaluations: 2,
+                extra_poisson_solves: 3,
+                endpoint_cache_hits: 4,
+                endpoint_refreshes: 5,
+                accepted_step_wall_time_ns: 6,
+            }),
+            fem_representation_receipt: Some(FemRepresentationReceipt {
+                schema_version: 1,
+                state_space: FemStateRepresentation::LocalNodeAos,
+                ms_location: FemMaterialFieldLocation::NodalP1,
+                a_location: FemMaterialFieldLocation::ElementDg0,
+                local_node_count: 12,
+                true_node_count: 9,
+                periodic_map_revision: 4,
+                representation_copy_count: 7,
+                gather_scatter_bytes: 288,
+                invalid_space_assertion_count: 0,
+                hot_loop_representation_copy_count: 2,
+                hot_loop_gather_scatter_bytes: 96,
+            }),
             ..StepStats::default()
         };
 
@@ -993,6 +1312,40 @@ mod all_in_gpu_fem_transfer_audit_tests {
         assert_eq!(diagnostics.demag_recover_wall_time_ns, 7);
         assert_eq!(diagnostics.demag_energy_wall_time_ns, 11);
         assert_eq!(diagnostics.extra_energy_wall_time_ns, 29);
+        let endpoint = diagnostics
+            .endpoint_cache_telemetry
+            .as_ref()
+            .expect("endpoint receipt should reach canonical diagnostics");
+        assert_eq!(endpoint.final_refresh_reason, "cache_hit");
+        assert_eq!(endpoint.final_rhs_evaluations, 2);
+        assert_eq!(endpoint.extra_poisson_solves, 3);
+        assert_eq!(endpoint.endpoint_cache_hits, 4);
+        assert_eq!(endpoint.endpoint_refreshes, 5);
+        assert_eq!(endpoint.accepted_step_wall_time_ns, 6);
+        let receipt = diagnostics
+            .fem_representation_receipt
+            .as_ref()
+            .expect("representation receipt should reach canonical diagnostics");
+        assert_eq!(receipt.state_space, FemStateRepresentation::LocalNodeAos);
+        assert_eq!(receipt.ms_location, FemMaterialFieldLocation::NodalP1);
+        assert_eq!(receipt.a_location, FemMaterialFieldLocation::ElementDg0);
+        assert_eq!(receipt.local_node_count, 12);
+        assert_eq!(receipt.true_node_count, 9);
+        assert_eq!(receipt.periodic_map_revision, 4);
+        assert_eq!(receipt.representation_copy_count, 7);
+        assert_eq!(receipt.gather_scatter_bytes, 288);
+        assert_eq!(receipt.hot_loop_representation_copy_count, 2);
+        assert_eq!(receipt.hot_loop_gather_scatter_bytes, 96);
+        let serialized = serde_json::to_value(&diagnostics)
+            .expect("canonical diagnostics should serialize with representation receipt");
+        assert_eq!(
+            serialized["fem_representation_receipt"]["state_space"],
+            "local_node_aos"
+        );
+        assert_eq!(
+            serialized["fem_representation_receipt"]["gather_scatter_bytes"],
+            288
+        );
         assert_eq!(diagnostics.relaxation_preconditioner_wall_time_ns, 0);
     }
 
@@ -1392,10 +1745,44 @@ mod all_in_gpu_fem_transfer_audit_tests {
     }
 }
 
+/// Native reducers expose aggregate DMI energy. In a rotated-only plan the
+/// aggregate is also the exact rotated component; it must not be zeroed.
+#[cfg(any(test, feature = "cuda", feature = "fem-gpu"))]
+pub(crate) fn split_rotated_only_dmi_energy(rotated_dmi_only: bool, aggregate: f64) -> (f64, f64) {
+    (aggregate, if rotated_dmi_only { aggregate } else { 0.0 })
+}
+
 impl StepStats {
+    /// Check kind/channel coherence and keep solver progress out of object samples.
+    pub fn validate_record_kind(&self) -> Result<(), &'static str> {
+        self.kind
+            .validate_solver_progress(self.solver_progress.as_ref())?;
+        if self.kind.is_solver_progress() && !self.per_object_scalars.is_empty() {
+            return Err("solver progress records cannot carry per-object scalar samples");
+        }
+        Ok(())
+    }
+
+    /// Whether this row can be interpreted as a physical observation.
+    pub fn is_physical_observation(&self) -> bool {
+        self.kind.is_physical_observation() && self.validate_record_kind().is_ok()
+    }
+
+    pub(crate) fn set_dmi_energy_components(
+        &mut self,
+        interfacial_dmi: f64,
+        bulk_dmi: f64,
+        rotated_interfacial_dmi: f64,
+    ) {
+        self.e_rotated_dmi = rotated_interfacial_dmi;
+        self.e_dmi = interfacial_dmi + bulk_dmi + rotated_interfacial_dmi;
+    }
+
     /// Extract solver diagnostics (non-physics telemetry).
     pub fn to_diagnostics(&self) -> fullmag_quantities::StepDiagnostics {
         fullmag_quantities::StepDiagnostics {
+            kind: self.kind,
+            solver_progress: self.solver_progress.clone(),
             step: self.step,
             time: self.time,
             dt: self.dt,
@@ -1433,6 +1820,8 @@ impl StepStats {
             rhs_evals: self.rhs_evals,
             demag_solves: self.demag_solves,
             fsal_reused: self.fsal_reused,
+            endpoint_cache_telemetry: self.endpoint_cache_telemetry.clone(),
+            fem_representation_receipt: self.fem_representation_receipt.clone(),
             poisson_iterations: self.poisson_iterations,
             poisson_final_residual: self.poisson_final_residual,
             demag_refreshed: self.demag_refreshed,
@@ -1445,8 +1834,17 @@ impl StepStats {
     }
 
     /// Extract per-step physical scalar observations.
+    ///
+    /// Invalid in-memory kind/channel pairs are quarantined as legacy so their
+    /// numeric compatibility fields cannot qualify; V2 validation then rejects
+    /// the mismatch against diagnostics.
     pub fn to_quantity_row(&self) -> fullmag_quantities::GlobalQuantityRow {
         fullmag_quantities::GlobalQuantityRow {
+            kind: if self.validate_record_kind().is_ok() {
+                self.kind
+            } else {
+                fullmag_quantities::StepDataKind::LegacyUnclassified
+            },
             step: self.step,
             time: self.time,
             mx: self.mx,
@@ -1458,6 +1856,7 @@ impl StepStats {
             e_drive: self.e_drive,
             e_ani: self.e_ani,
             e_dmi: self.e_dmi,
+            e_rotated_dmi: self.e_rotated_dmi,
             e_el: 0.0,
             e_kin_el: 0.0,
             e_total: self.e_total,
@@ -1469,6 +1868,153 @@ impl StepStats {
             max_torque_T: self.max_torque_T,
             per_object_scalars: self.per_object_scalars.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod step_data_kind_tests {
+    use super::StepStats;
+    use fullmag_quantities::{SolverProgress, StepDataKind};
+    use std::collections::HashMap;
+
+    #[test]
+    fn physical_object_id_does_not_override_explicit_record_kind() {
+        let mut physical = StepStats {
+            e_total: 4.25,
+            ..StepStats::default()
+        };
+        physical.per_object_scalars.insert(
+            "fem_eigen_progress".into(),
+            HashMap::from([("percent".into(), 75.0)]),
+        );
+        assert!(physical.is_physical_observation());
+        assert_eq!(physical.to_quantity_row().scalar_value("e_total"), Some(4.25));
+
+        let progress = StepStats {
+            kind: StepDataKind::SolverProgress,
+            solver_progress: Some(SolverProgress::FemEigen {
+                metrics: HashMap::from([("percent".into(), 75.0)]),
+            }),
+            ..StepStats::default()
+        };
+        assert!(progress.validate_record_kind().is_ok());
+        assert!(!progress.is_physical_observation());
+        assert_eq!(progress.to_quantity_row().scalar_value("e_total"), None);
+        let diagnostics = progress.to_diagnostics();
+        assert_eq!(diagnostics.kind, StepDataKind::SolverProgress);
+        assert!(diagnostics.solver_progress.is_some());
+    }
+
+    #[test]
+    fn typed_channel_round_trips_and_missing_legacy_kind_stays_unqualified() {
+        let progress = StepStats {
+            kind: StepDataKind::SolverProgress,
+            solver_progress: Some(SolverProgress::FemEigen {
+                metrics: HashMap::from([("residual".into(), 2.5e-7)]),
+            }),
+            ..StepStats::default()
+        };
+        let encoded = serde_json::to_value(&progress).expect("typed progress serializes");
+        let decoded: StepStats = serde_json::from_value(encoded).expect("typed progress parses");
+        assert_eq!(decoded.kind, StepDataKind::SolverProgress);
+        match decoded.solver_progress.expect("typed channel is present") {
+            SolverProgress::FemEigen { metrics } => assert_eq!(metrics["residual"], 2.5e-7),
+        }
+
+        let mut legacy_value = serde_json::to_value(StepStats {
+            e_total: 2.5,
+            ..StepStats::default()
+        })
+        .expect("physical row serializes");
+        legacy_value.as_object_mut().expect("object value").remove("kind");
+        let legacy: StepStats = serde_json::from_value(legacy_value).expect("legacy row parses");
+        assert_eq!(legacy.kind, StepDataKind::LegacyUnclassified);
+        assert_eq!(legacy.e_total, 2.5);
+        assert_eq!(legacy.to_quantity_row().scalar_value("e_total"), None);
+    }
+
+    #[test]
+    fn contradictory_step_stats_cannot_qualify_scalar_placeholders() {
+        let invalid = StepStats {
+            kind: StepDataKind::PhysicalObservation,
+            solver_progress: Some(SolverProgress::FemEigen {
+                metrics: HashMap::new(),
+            }),
+            e_total: 8.0,
+            ..StepStats::default()
+        };
+        assert!(invalid.validate_record_kind().is_err());
+        assert!(!invalid.is_physical_observation());
+        let row = invalid.to_quantity_row();
+        assert_eq!(row.kind, StepDataKind::LegacyUnclassified);
+        assert_eq!(row.scalar_value("e_total"), None);
+    }
+}
+
+#[cfg(test)]
+mod rotated_dmi_energy_tests {
+    use super::{split_rotated_only_dmi_energy, StepStats};
+
+    #[test]
+    fn native_rotated_only_dmi_split_preserves_aggregate_and_component_in_both_lanes() {
+        for aggregate in [-2.5, 0.0, 1.25] {
+            assert_eq!(
+                split_rotated_only_dmi_energy(true, aggregate),
+                (aggregate, aggregate)
+            );
+            assert_eq!(
+                split_rotated_only_dmi_energy(false, aggregate),
+                (aggregate, 0.0)
+            );
+        }
+        for source in [
+            include_str!("native_fem.rs"),
+            include_str!("fdm/gpu/cuda/native.rs"),
+        ] {
+            let splitter = source
+                .split("    fn split_dmi_energy(")
+                .nth(1)
+                .and_then(|body| body.split("\n    }").next())
+                .expect("native energy splitter");
+            assert!(splitter.contains("crate::types::split_rotated_only_dmi_energy("));
+        }
+    }
+
+    #[test]
+    fn rotated_dmi_energy_is_reported_separately_and_in_total_dmi() {
+        let mut stats = StepStats::default();
+        stats.set_dmi_energy_components(1.25, -0.5, 0.75);
+
+        assert_eq!(stats.e_rotated_dmi, 0.75);
+        assert_eq!(stats.e_dmi, 1.5);
+        assert_eq!(
+            stats.to_quantity_row().scalar_value("e_rotated_dmi"),
+            Some(0.75)
+        );
+        let json = serde_json::to_value(&stats).unwrap();
+        assert_eq!(json["e_rotated_dmi"], serde_json::json!(0.75));
+        assert!(json.get("E_rotated_dmi").is_none());
+        let legacy: StepStats = serde_json::from_value(serde_json::json!({
+            "E_rotated_dmi": 0.75,
+            "e_dmi": 0.75,
+            "e_total": 0.0,
+            "step": 1,
+            "time": 0.0,
+            "dt": 0.0,
+            "mx": 0.0,
+            "my": 0.0,
+            "mz": 1.0,
+            "e_ex": 0.0,
+            "e_demag": 0.0,
+            "e_ext": 0.0,
+            "e_ani": 0.0,
+            "max_dm_dt": 0.0,
+            "max_h_eff": 0.0,
+            "max_h_demag": 0.0,
+            "wall_time_ns": 0
+        }))
+        .expect("legacy uppercase rotated-DMI key should remain an input alias");
+        assert_eq!(legacy.e_rotated_dmi, 0.75);
     }
 }
 
@@ -1530,6 +2076,12 @@ pub struct StepUpdate {
     /// True when this update also represents a due scalar-row sample.
     #[serde(default)]
     pub scalar_row_due: bool,
+    /// Internal runner→CLI marker for a complete authoritative field generation.
+    ///
+    /// Individual asynchronously materialized fields must leave this false even
+    /// when their own materialization timestamp is populated.
+    #[serde(default)]
+    pub terminal_field_snapshot: bool,
     /// true when simulation has completed.
     #[serde(default)]
     pub finished: bool,
@@ -2039,7 +2591,9 @@ impl FemStageExecutionContext {
             fullmag_ir::BackendPlanIR::FemFrequencyResponse(plan) => {
                 StageFemMeshIdentity::from_fem_frequency_response_plan(plan)
             }
-            fullmag_ir::BackendPlanIR::Fdm(_) | fullmag_ir::BackendPlanIR::FdmMultilayer(_) => {
+            fullmag_ir::BackendPlanIR::Fdm(_)
+            | fullmag_ir::BackendPlanIR::FdmMultilayer(_)
+            | fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(_) => {
                 return None;
             }
         };
@@ -2048,7 +2602,7 @@ impl FemStageExecutionContext {
 }
 
 pub fn fem_mesh_topology_fingerprint(mesh: &FemMeshPayload) -> String {
-    fullmag_ir::fem_mesh_topology_fingerprint_v2(
+    fullmag_ir::fem_mesh_topology_fingerprint_v3(
         &mesh.nodes,
         &mesh.cells,
         &mesh.element_markers,
@@ -2057,6 +2611,7 @@ pub fn fem_mesh_topology_fingerprint(mesh: &FemMeshPayload) -> String {
         &mesh.periodic_boundary_pairs,
         &mesh.periodic_node_pairs,
     )
+    .expect("published FEM mesh topology must contain finite node coordinates")
 }
 
 fn digest_hex(bytes: &[u8]) -> String {
@@ -2250,7 +2805,9 @@ impl StageFemMeshAsset {
             fullmag_ir::BackendPlanIR::FemFrequencyResponse(plan) => {
                 Some(Self::build_from_fem_frequency_response_plan(plan))
             }
-            fullmag_ir::BackendPlanIR::Fdm(_) | fullmag_ir::BackendPlanIR::FdmMultilayer(_) => None,
+            fullmag_ir::BackendPlanIR::Fdm(_)
+            | fullmag_ir::BackendPlanIR::FdmMultilayer(_)
+            | fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(_) => None,
         }
     }
 
@@ -2500,6 +3057,7 @@ fn mesh_part_role_name(role: &FemMeshPartRole) -> &'static str {
     match role {
         FemMeshPartRole::Air => "air",
         FemMeshPartRole::MagneticObject => "magnetic_object",
+        FemMeshPartRole::Conductor => "conductor",
         FemMeshPartRole::Interface => "interface",
         FemMeshPartRole::OuterBoundary => "outer_boundary",
     }
@@ -2524,6 +3082,14 @@ impl fmt::Display for RunError {
 }
 
 impl std::error::Error for RunError {}
+
+impl From<fullmag_antenna_artifacts::ArtifactError> for RunError {
+    fn from(error: fullmag_antenna_artifacts::ArtifactError) -> Self {
+        Self {
+            message: error.message,
+        }
+    }
+}
 
 impl From<fullmag_plan::PlanError> for RunError {
     fn from(e: fullmag_plan::PlanError) -> Self {
@@ -2791,6 +3357,24 @@ pub struct FdmGpuOperatorResidency {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdmGpuPrecisionComponents {
+    pub storage: String,
+    pub compute: String,
+    pub fft: String,
+    pub reduction: String,
+    pub realization_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdmGpuPrecisionPolicyReceipt {
+    pub schema_version: String,
+    pub requested: String,
+    pub resolved: FdmGpuPrecisionComponents,
+    pub executed: FdmGpuPrecisionComponents,
+    pub accounting_valid: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FdmGpuExecutionReceipt {
     pub requested: String,
     pub resolved: String,
@@ -2807,8 +3391,175 @@ pub struct FdmGpuExecutionReceipt {
     pub operator_residency: Vec<FdmGpuOperatorResidency>,
     pub fallback_count: u64,
     pub transfer_counts: FdmGpuTransferCounts,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive_execution: Option<FdmGpuAdaptiveExecutionTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive_numerics: Option<FdmGpuAdaptiveNumericsTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_pipeline: Option<FdmGpuLocalPipelineTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu_workspace: Option<FdmGpuWorkspaceTelemetry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub precision_policy: Option<FdmGpuPrecisionPolicyReceipt>,
     pub validation_state: String,
     pub accounting_valid: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdmGpuAdaptiveExecutionTelemetry {
+    pub realization: String,
+    pub accounting_valid: bool,
+    pub graph_build_count: u64,
+    pub graph_launch_count: u64,
+    pub terminal_control_d2h_bytes: u64,
+    pub terminal_control_host_sync_count: u64,
+    pub step_completion_host_sync_count: u64,
+    pub stats_none_host_sync_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdmGpuLocalPipelineTelemetry {
+    pub requested_policy: String,
+    pub resolved_realization: String,
+    pub executed_realization: String,
+    pub accounting_valid: bool,
+    pub precision: String,
+    pub integrator: String,
+    pub metric_valid_mask: u64,
+    pub required_operator_mask: u64,
+    pub active_feature_mask: u64,
+    pub source_revision: u64,
+    pub field_revision: u64,
+    pub direct_fused_field_rhs_launch_count: u64,
+    pub direct_unfused_effective_field_launch_count: u64,
+    pub direct_unfused_rhs_launch_count: u64,
+    pub captured_fused_field_rhs_node_count: u64,
+    pub captured_unfused_effective_field_node_count: u64,
+    pub captured_unfused_rhs_node_count: u64,
+    pub graph_build_count: u64,
+    pub graph_replay_count: u64,
+    pub graph_recapture_count: u64,
+    pub graph_attempt_execution_count: u64,
+    pub graph_fused_field_rhs_execution_count: u64,
+    pub graph_unfused_effective_field_execution_count: u64,
+    pub graph_unfused_rhs_execution_count: u64,
+    pub profiled_dram_read_bytes: u64,
+    pub profiled_dram_write_bytes: u64,
+    pub profiled_launch_time_ns: u64,
+    pub profiled_achieved_occupancy_permyriad: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdmGpuWorkspaceTelemetry {
+    pub accounting_valid: bool,
+    pub setup_complete: bool,
+    pub precision: String,
+    pub integrator: String,
+    pub metric_valid_mask: u64,
+    pub workspace_revision: u64,
+    pub source_revision: u64,
+    pub field_revision: u64,
+    pub setup_device_allocation_count: u64,
+    pub setup_device_allocation_bytes: u64,
+    pub total_device_allocation_count: u64,
+    pub total_device_allocation_bytes: u64,
+    pub step_device_allocation_count: u64,
+    pub step_device_allocation_bytes: u64,
+    pub setup_fft_plan_creation_count: u64,
+    pub total_fft_plan_creation_count: u64,
+    pub step_fft_plan_creation_count: u64,
+    pub prepared_fft_workspace_count: u64,
+    pub workspace_bytes: u64,
+    pub peak_vram_bytes: u64,
+    pub observed_step_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FdmGpuAdaptiveNumericsTelemetry {
+    pub embedded_error_semantics: String,
+    pub norm_defect_semantics: String,
+    pub spin_rotation_semantics: String,
+    pub accounting_valid: bool,
+    pub terminal_observation_count: u64,
+    pub decision_comparison_count: u64,
+    pub decision_divergence_count: u64,
+    pub last_terminal_normalized_error: f64,
+    pub last_terminal_max_norm_defect: f64,
+    pub last_terminal_max_spin_rotation_radians: f64,
+    pub max_attempt_normalized_error: f64,
+    pub max_attempt_norm_defect: f64,
+    pub max_attempt_spin_rotation_radians: f64,
+}
+
+/// Native CUDA step-transaction counters captured after FDM GPU execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdmGpuStepTransactionTelemetry {
+    pub accounting_valid: bool,
+    pub capture_count: u64,
+    pub rollback_count: u64,
+    pub capture_d2d_bytes: u64,
+    pub rollback_d2d_bytes: u64,
+    pub rollback_latency_total_ns: u64,
+    pub rollback_latency_max_ns: u64,
+    pub accepted_step_index: u64,
+    pub attempt_generation: u64,
+    pub thermal_rng_draws: u64,
+    pub stale_publication_count: u64,
+}
+
+/// CPU FDM transaction counters captured after reference execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdmCpuStepTransactionTelemetry {
+    pub schema_version: String,
+    pub accepted_step_count: u64,
+    pub rejected_attempt_count: u64,
+    pub rollback_count: u64,
+    pub thermal_interval_index: u64,
+    pub thermal_rng_draws: u64,
+    /// Persistent-SoA accepted-state publications performed in this execution segment.
+    #[serde(default)]
+    pub accepted_state_publication_count: u64,
+    /// Host bytes copied by those per-step accepted-state publications.
+    #[serde(default)]
+    pub accepted_state_publication_copy_bytes: u64,
+    /// Full vector-field copies performed by accepted-state publication.
+    #[serde(default)]
+    pub accepted_state_publication_full_field_copy_count: u64,
+    /// Host bytes copied by the one final full transactional-state synchronization.
+    #[serde(default)]
+    pub final_state_sync_copy_bytes: u64,
+    /// Full vector-field copies performed by final transactional-state synchronization.
+    #[serde(default)]
+    pub final_state_sync_full_field_copy_count: u64,
+    /// Scheduled artifact field payloads materialized by this execution segment.
+    #[serde(default)]
+    pub scheduled_field_snapshot_payload_count: u64,
+    /// Exact serialized `f64` payload bytes materialized for scheduled field snapshots.
+    #[serde(default)]
+    pub scheduled_field_snapshot_copy_bytes: u64,
+    /// Live vector-field payloads materialized for callbacks, including magnetization and previews.
+    #[serde(default)]
+    pub live_field_snapshot_payload_count: u64,
+    /// Exact `f64` payload bytes materialized for live callbacks.
+    #[serde(default)]
+    pub live_field_snapshot_copy_bytes: u64,
+    /// End-of-stage artifact field payloads materialized outside the regular output schedule.
+    #[serde(default)]
+    pub finalization_field_snapshot_payload_count: u64,
+    /// Exact serialized `f64` payload bytes materialized during finalization.
+    #[serde(default)]
+    pub finalization_field_snapshot_copy_bytes: u64,
+    pub checkpoint_digest: String,
+}
+
+/// Runtime-owned evidence for the production CPU FDM evaluation policy.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdmCpuEvaluationTelemetry {
+    pub schema_version: String,
+    pub minimal_step_count: u64,
+    pub full_step_count: u64,
+    pub minimal_step_wall_time_ns: u64,
+    pub full_step_wall_time_ns: u64,
 }
 
 impl FdmGpuExecutionReceipt {
@@ -2829,6 +3580,11 @@ impl FdmGpuExecutionReceipt {
             operator_residency: Vec::new(),
             fallback_count: 0,
             transfer_counts: FdmGpuTransferCounts::default(),
+            adaptive_execution: None,
+            adaptive_numerics: None,
+            local_pipeline: None,
+            gpu_workspace: None,
+            precision_policy: None,
             validation_state: "unvalidated".to_string(),
             accounting_valid: false,
         }
@@ -2838,6 +3594,140 @@ impl FdmGpuExecutionReceipt {
 #[cfg(test)]
 mod fdm_gpu_execution_receipt_contract_tests {
     use super::*;
+
+    #[test]
+    fn execution_provenance_serializes_fdm_gpu_step_transaction_telemetry() {
+        let mut provenance = ExecutionProvenance::default();
+        provenance.fdm_gpu_step_transaction_telemetry = Some(FdmGpuStepTransactionTelemetry {
+            accounting_valid: true,
+            capture_count: 12,
+            rollback_count: 3,
+            capture_d2d_bytes: 3_072,
+            rollback_d2d_bytes: 1_536,
+            rollback_latency_total_ns: 1_800,
+            rollback_latency_max_ns: 900,
+            accepted_step_index: 7,
+            attempt_generation: 8,
+            thermal_rng_draws: 144,
+            stale_publication_count: 2,
+        });
+
+        let value = serde_json::to_value(provenance).expect("serialize provenance");
+        let telemetry = &value["fdm_gpu_step_transaction_telemetry"];
+        assert_eq!(telemetry["capture_d2d_bytes"], 3_072);
+        assert_eq!(telemetry["rollback_latency_max_ns"], 900);
+        assert_eq!(telemetry["attempt_generation"], 8);
+        assert_eq!(telemetry["accounting_valid"], true);
+    }
+
+    #[test]
+    fn execution_provenance_serializes_fdm_cpu_step_transaction_telemetry() {
+        let mut provenance = ExecutionProvenance::default();
+        provenance.fdm_cpu_step_transaction_telemetry = Some(FdmCpuStepTransactionTelemetry {
+            schema_version: "fullmag.fdm.cpu.step_transaction.v3".into(),
+            accepted_step_count: 7,
+            rejected_attempt_count: 2,
+            rollback_count: 2,
+            thermal_interval_index: 7,
+            thermal_rng_draws: 7,
+            accepted_state_publication_count: 7,
+            accepted_state_publication_copy_bytes: 16_800,
+            accepted_state_publication_full_field_copy_count: 7,
+            final_state_sync_copy_bytes: 9_600,
+            final_state_sync_full_field_copy_count: 4,
+            scheduled_field_snapshot_payload_count: 3,
+            scheduled_field_snapshot_copy_bytes: 7_200,
+            live_field_snapshot_payload_count: 5,
+            live_field_snapshot_copy_bytes: 12_000,
+            finalization_field_snapshot_payload_count: 1,
+            finalization_field_snapshot_copy_bytes: 2_400,
+            checkpoint_digest: "sha256:test".into(),
+        });
+
+        let value = serde_json::to_value(provenance).expect("serialize provenance");
+        let telemetry = &value["fdm_cpu_step_transaction_telemetry"];
+        assert_eq!(telemetry["accepted_step_count"], 7);
+        assert_eq!(telemetry["rollback_count"], 2);
+        assert_eq!(telemetry["thermal_interval_index"], 7);
+        assert_eq!(telemetry["accepted_state_publication_copy_bytes"], 16_800);
+        assert_eq!(telemetry["final_state_sync_full_field_copy_count"], 4);
+        assert_eq!(telemetry["scheduled_field_snapshot_copy_bytes"], 7_200);
+        assert_eq!(telemetry["live_field_snapshot_payload_count"], 5);
+        assert_eq!(telemetry["finalization_field_snapshot_copy_bytes"], 2_400);
+        assert_eq!(telemetry["checkpoint_digest"], "sha256:test");
+    }
+
+    #[test]
+    fn fdm_cpu_step_transaction_v1_defaults_copy_telemetry_to_zero() {
+        let legacy = serde_json::json!({
+            "schema_version": "fullmag.fdm.cpu.step_transaction.v1",
+            "accepted_step_count": 3,
+            "rejected_attempt_count": 0,
+            "rollback_count": 0,
+            "thermal_interval_index": 0,
+            "thermal_rng_draws": 0,
+            "checkpoint_digest": "sha256:legacy"
+        });
+        let telemetry: FdmCpuStepTransactionTelemetry =
+            serde_json::from_value(legacy).expect("legacy CPU transaction receipt");
+
+        assert_eq!(telemetry.accepted_state_publication_count, 0);
+        assert_eq!(telemetry.accepted_state_publication_copy_bytes, 0);
+        assert_eq!(telemetry.final_state_sync_copy_bytes, 0);
+        assert_eq!(telemetry.scheduled_field_snapshot_payload_count, 0);
+        assert_eq!(telemetry.scheduled_field_snapshot_copy_bytes, 0);
+        assert_eq!(telemetry.live_field_snapshot_payload_count, 0);
+        assert_eq!(telemetry.live_field_snapshot_copy_bytes, 0);
+        assert_eq!(telemetry.finalization_field_snapshot_payload_count, 0);
+        assert_eq!(telemetry.finalization_field_snapshot_copy_bytes, 0);
+    }
+
+    #[test]
+    fn fdm_cpu_step_transaction_v2_defaults_snapshot_telemetry_to_zero() {
+        let legacy = serde_json::json!({
+            "schema_version": "fullmag.fdm.cpu.step_transaction.v2",
+            "accepted_step_count": 3,
+            "rejected_attempt_count": 0,
+            "rollback_count": 0,
+            "thermal_interval_index": 0,
+            "thermal_rng_draws": 0,
+            "accepted_state_publication_count": 3,
+            "accepted_state_publication_copy_bytes": 7_200,
+            "accepted_state_publication_full_field_copy_count": 3,
+            "final_state_sync_copy_bytes": 2_400,
+            "final_state_sync_full_field_copy_count": 1,
+            "checkpoint_digest": "sha256:legacy-v2"
+        });
+        let telemetry: FdmCpuStepTransactionTelemetry =
+            serde_json::from_value(legacy).expect("v2 CPU transaction receipt");
+
+        assert_eq!(telemetry.scheduled_field_snapshot_payload_count, 0);
+        assert_eq!(telemetry.scheduled_field_snapshot_copy_bytes, 0);
+        assert_eq!(telemetry.live_field_snapshot_payload_count, 0);
+        assert_eq!(telemetry.live_field_snapshot_copy_bytes, 0);
+        assert_eq!(telemetry.finalization_field_snapshot_payload_count, 0);
+        assert_eq!(telemetry.finalization_field_snapshot_copy_bytes, 0);
+    }
+
+    #[test]
+    fn execution_provenance_serializes_fdm_cpu_evaluation_telemetry() {
+        let mut provenance = ExecutionProvenance::default();
+        provenance.fdm_cpu_evaluation_telemetry = Some(FdmCpuEvaluationTelemetry {
+            schema_version: "fullmag.fdm.cpu.evaluation.v1".into(),
+            minimal_step_count: 5,
+            full_step_count: 2,
+            minimal_step_wall_time_ns: 1_000,
+            full_step_wall_time_ns: 900,
+        });
+
+        let value = serde_json::to_value(provenance).expect("serialize provenance");
+        let telemetry = &value["fdm_cpu_evaluation_telemetry"];
+        assert_eq!(telemetry["schema_version"], "fullmag.fdm.cpu.evaluation.v1");
+        assert_eq!(telemetry["minimal_step_count"], 5);
+        assert_eq!(telemetry["full_step_count"], 2);
+        assert_eq!(telemetry["minimal_step_wall_time_ns"], 1_000);
+        assert_eq!(telemetry["full_step_wall_time_ns"], 900);
+    }
 
     #[test]
     fn execution_provenance_serializes_explicit_fdm_gpu_receipt() {
@@ -2868,6 +3758,74 @@ mod fdm_gpu_execution_receipt_contract_tests {
                 hot_loop_control_scalar_host_sync_count: 1,
                 ..Default::default()
             },
+            adaptive_execution: Some(FdmGpuAdaptiveExecutionTelemetry {
+                realization: "cuda_conditional_graph_v1".into(),
+                accounting_valid: true,
+                graph_build_count: 1,
+                graph_launch_count: 2,
+                terminal_control_d2h_bytes: 128,
+                terminal_control_host_sync_count: 2,
+                step_completion_host_sync_count: 0,
+                stats_none_host_sync_count: 2,
+            }),
+            adaptive_numerics: Some(FdmGpuAdaptiveNumericsTelemetry {
+                embedded_error_semantics: "pre_projection_embedded_difference_v1".into(),
+                norm_defect_semantics: "post_projection_abs_unit_norm_defect_v1".into(),
+                spin_rotation_semantics: "attempt_geodesic_rotation_radians_v1".into(),
+                accounting_valid: true,
+                terminal_observation_count: 2,
+                decision_comparison_count: 2,
+                decision_divergence_count: 0,
+                last_terminal_normalized_error: 0.25,
+                last_terminal_max_norm_defect: 1.0e-15,
+                last_terminal_max_spin_rotation_radians: 0.125,
+                max_attempt_normalized_error: 1.5,
+                max_attempt_norm_defect: 2.0e-15,
+                max_attempt_spin_rotation_radians: 0.5,
+            }),
+            local_pipeline: None,
+            gpu_workspace: Some(FdmGpuWorkspaceTelemetry {
+                accounting_valid: true,
+                setup_complete: true,
+                precision: "double".into(),
+                integrator: "heun".into(),
+                metric_valid_mask: 0x1f,
+                workspace_revision: 3,
+                source_revision: 4,
+                field_revision: 5,
+                setup_device_allocation_count: 10,
+                setup_device_allocation_bytes: 1_000,
+                total_device_allocation_count: 10,
+                total_device_allocation_bytes: 1_000,
+                step_device_allocation_count: 0,
+                step_device_allocation_bytes: 0,
+                setup_fft_plan_creation_count: 2,
+                total_fft_plan_creation_count: 2,
+                step_fft_plan_creation_count: 0,
+                prepared_fft_workspace_count: 2,
+                workspace_bytes: 800,
+                peak_vram_bytes: 1_200,
+                observed_step_count: 7,
+            }),
+            precision_policy: Some(FdmGpuPrecisionPolicyReceipt {
+                schema_version: "fullmag.fdm.cuda.precision-policy.v1".into(),
+                requested: "double".into(),
+                resolved: FdmGpuPrecisionComponents {
+                    storage: "double".into(),
+                    compute: "double".into(),
+                    fft: "double".into(),
+                    reduction: "double".into(),
+                    realization_id: "fullmag.fdm.cuda.precision.full_double.v1".into(),
+                },
+                executed: FdmGpuPrecisionComponents {
+                    storage: "double".into(),
+                    compute: "double".into(),
+                    fft: "double".into(),
+                    reduction: "double".into(),
+                    realization_id: "fullmag.fdm.cuda.precision.full_double.v1".into(),
+                },
+                accounting_valid: true,
+            }),
             validation_state: "unvalidated".into(),
             accounting_valid: true,
         });
@@ -2878,7 +3836,10 @@ mod fdm_gpu_execution_receipt_contract_tests {
         assert_eq!(receipt["resolved"], "device_resident");
         assert_eq!(receipt["executed"], "cuda_fdm");
         assert_eq!(receipt["fallback_count"], 0);
-        assert_eq!(receipt["transfer_counts"]["observation_full_vector_d2h_count"], 0);
+        assert_eq!(
+            receipt["transfer_counts"]["observation_full_vector_d2h_count"],
+            0
+        );
         assert_eq!(
             receipt["transfer_counts"]["setup_full_vector_h2d_bytes"],
             24
@@ -2888,6 +3849,31 @@ mod fdm_gpu_execution_receipt_contract_tests {
             0
         );
         assert_eq!(receipt["validation_state"], "unvalidated");
+        assert_eq!(
+            receipt["adaptive_execution"]["realization"],
+            "cuda_conditional_graph_v1"
+        );
+        assert_eq!(receipt["adaptive_execution"]["graph_build_count"], 1);
+        assert_eq!(receipt["adaptive_execution"]["graph_launch_count"], 2);
+        assert_eq!(
+            receipt["adaptive_numerics"]["embedded_error_semantics"],
+            "pre_projection_embedded_difference_v1"
+        );
+        assert_eq!(receipt["adaptive_numerics"]["decision_divergence_count"], 0);
+        assert_eq!(
+            receipt["adaptive_numerics"]["max_attempt_normalized_error"],
+            1.5
+        );
+        assert_eq!(receipt["gpu_workspace"]["step_device_allocation_count"], 0);
+        assert_eq!(receipt["gpu_workspace"]["prepared_fft_workspace_count"], 2);
+        assert_eq!(
+            receipt["precision_policy"]["executed"]["reduction"],
+            "double"
+        );
+        assert_eq!(
+            receipt["precision_policy"]["executed"]["realization_id"],
+            "fullmag.fdm.cuda.precision.full_double.v1"
+        );
     }
 }
 
@@ -2973,6 +3959,21 @@ mod fem_gpu_execution_receipt_contract_tests {
         assert_eq!(receipt["hot_loop_compute_d2h_bytes"], 24);
     }
 }
+/// Attestation returned by the native modal boundary after planner selection.
+///
+/// This is intentionally separate from `resolved_fallback`: the latter records
+/// planner selection (including legal auto-to-CPU resolution), while this
+/// object proves that the native runtime executed the accepted target without
+/// a second, hidden runtime fallback.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FemEigenNativeExecutionAttestation {
+    pub requested_target: String,
+    pub resolved_target: String,
+    pub resolved_engine_id: String,
+    pub fallback_used: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
 
 /// FEM demag solver provenance.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -2996,6 +3997,26 @@ pub struct FemPoissonDemagProvenance {
     pub variational_energy_joules: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovered_field_energy_joules: Option<f64>,
+}
+
+/// Measured Fredkin-Koehler FEM/BEM operator provenance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FemBemDemagProvenance {
+    pub operator_mode: String,
+    pub operator_fingerprint: String,
+    pub boundary_node_count: u64,
+    pub boundary_triangle_count: u64,
+    pub near_block_count: u64,
+    pub far_block_count: u64,
+    pub near_entry_count: u64,
+    pub far_row_count: u64,
+    pub max_rank: u32,
+    pub relative_error_estimate: f64,
+    pub resident_bytes: u64,
+    pub device_bytes: u64,
+    pub operator_build_count: u64,
+    pub operator_upload_count: u64,
+    pub apply_count: u64,
 }
 
 /// Records which engine and device produced a run.
@@ -3141,6 +4162,78 @@ pub struct FinalExecutionResolutionProvenance {
     pub fallback_reason: Option<String>,
 }
 
+/// Runtime-owned CPU FFT workspace evidence captured after execution.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdmFftRuntimeTelemetry {
+    pub schema_version: String,
+    pub workspace_lifecycle_revision: u64,
+    pub workspace_key_sha256: String,
+    pub plan_creation_time_ns: u64,
+    /// Allocator-reserved bytes for buffers owned by the FFT workspace.
+    pub workspace_bytes: u64,
+    pub forward_fft_count: u64,
+    pub inverse_fft_count: u64,
+    pub fft_elapsed_time_ns: u64,
+}
+
+/// Included in artifact metadata for reproducibility.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdmFftExecutionProvenance {
+    pub requested_backend: String,
+    pub resolved_backend: String,
+    pub executed_backend: String,
+    pub backend_version: Option<String>,
+    pub plan_mode: String,
+    pub thread_count: Option<u32>,
+    pub workspace_layout: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_telemetry: Option<FdmFftRuntimeTelemetry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FdmGpuObservationPolicyProvenance {
+    pub requested_contract: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requested_quantity_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_min_period_s: Option<f64>,
+    pub resolved_mode: String,
+    pub resolved_quantity_mask: u64,
+    pub resolved_stride: u32,
+    pub executed_mode: String,
+    pub executed_quantity_mask: u64,
+    pub executed_stride: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdmGpuEndpointCacheTelemetry {
+    pub cache_identity_valid: bool,
+    pub stats_valid: bool,
+    pub accepted_state_revision: u64,
+    pub valid_field_mask: u64,
+    pub refresh_request_count: u64,
+    pub refresh_execution_count: u64,
+    pub refresh_cache_hit_count: u64,
+    pub invalidation_count: u64,
+    pub stats_snapshot_request_count: u64,
+    pub stats_snapshot_cache_hit_count: u64,
+    pub field_snapshot_request_count: u64,
+    pub field_snapshot_latency_total_ns: u64,
+    pub field_snapshot_latency_max_ns: u64,
+    pub exchange_evaluation_count: u64,
+    pub demag_evaluation_count: u64,
+    pub demag_forward_fft_count: u64,
+    pub demag_inverse_fft_count: u64,
+    pub effective_field_evaluation_count: u64,
+    pub energy_reduction_count: u64,
+    pub last_step_exchange_evaluation_count: u64,
+    pub last_step_demag_evaluation_count: u64,
+    pub last_step_demag_forward_fft_count: u64,
+    pub last_step_demag_inverse_fft_count: u64,
+    pub last_step_effective_field_evaluation_count: u64,
+    pub last_step_energy_reduction_count: u64,
+}
+
 /// Included in artifact metadata for reproducibility.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ExecutionProvenance {
@@ -3157,10 +4250,32 @@ pub struct ExecutionProvenance {
     /// Measured native CUDA M1 transport residency and provenance counters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fdm_gpu_transport_telemetry: Option<FdmGpuTransportTelemetry>,
+    /// CPU FDM state-layout receipt. `requested` is the public auto policy;
+    /// `resolved` and `executed` are the layout actually used by the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fdm_cpu_state_layout: Option<FdmCpuStateLayoutProvenance>,
     /// Native CUDA Context receipt proving requested, resolved, and executed
     /// FDM LLG residency together with setup and hot-loop transfer counters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fdm_gpu_execution_receipt: Option<FdmGpuExecutionReceipt>,
+    /// Native CUDA counters for FDM GPU step-transaction capture and rollback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fdm_gpu_step_transaction_telemetry: Option<FdmGpuStepTransactionTelemetry>,
+    /// Requested, resolved, and executed native CUDA observation schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fdm_gpu_observation_policy: Option<FdmGpuObservationPolicyProvenance>,
+    /// Native CUDA accepted-endpoint cache and operator counters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fdm_gpu_endpoint_cache_telemetry: Option<FdmGpuEndpointCacheTelemetry>,
+    /// CPU reference counters for accepted/rejected FDM step transactions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fdm_cpu_step_transaction_telemetry: Option<FdmCpuStepTransactionTelemetry>,
+    /// Counts and wall time split by the actual Minimal/Full CPU evaluation request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fdm_cpu_evaluation_telemetry: Option<FdmCpuEvaluationTelemetry>,
+    /// FDM FFT request, resolution, and actually executed realization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fdm_fft_execution: Option<FdmFftExecutionProvenance>,
     /// Native FEM receipt preserving requested, resolved, and actually executed
     /// GPU residency without inferring execution from the RK plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3178,8 +4293,7 @@ pub struct ExecutionProvenance {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub demag_operator_kind: Option<String>,
     /// FFT backend used: "rustfft" (CPU) or "cuFFT" (CUDA).
-    /// CPU FDM demag resolves this through `FULLMAG_CPU_FFT_BACKEND`;
-    /// unsupported CPU backends fail instead of silently falling back.
+    /// Unsupported CPU backends fail instead of silently falling back.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fft_backend: Option<String>,
     /// GPU device name, if applicable.
@@ -3207,6 +4321,12 @@ pub struct ExecutionProvenance {
     pub random_seed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_fallback: Option<ResolvedFallback>,
+    /// Full planner-accepted exact FEM eigen execution resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fem_eigen_execution_resolution: Option<FemEigenExecutionResolutionIR>,
+    /// Native no-fallback attestation, recorded independently of planner fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fem_eigen_native_execution_attestation: Option<FemEigenNativeExecutionAttestation>,
     /// Qualified FEM auto-device crossover decision, if requested device was auto.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fem_crossover_decision: Option<FemCrossoverDecision>,
@@ -3373,6 +4493,48 @@ pub struct ExecutionProvenance {
     /// FEM Poisson demag solver policy and observed solve result.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fem_poisson_demag: Option<FemPoissonDemagProvenance>,
+    /// Measured body-only Fredkin-Koehler FEM/BEM operator provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fem_bem_demag: Option<FemBemDemagProvenance>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FdmCpuStateLayoutProvenance {
+    pub requested: String,
+    pub resolved: String,
+    pub executed: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejection_reason: Option<String>,
+    /// Projected-RK state constraint resolved for the same CPU execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_policy: Option<String>,
+    /// Stable implementation identity of the projected-RK constraint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projection_realization: Option<String>,
+}
+
+impl FdmCpuStateLayoutProvenance {
+    pub(crate) fn from_problem(
+        problem: &fullmag_engine::ExchangeLlgProblem,
+        soa_active: bool,
+        execution_rejection_reason: Option<&str>,
+    ) -> Self {
+        let resolved = if soa_active { "soa_xyz" } else { "aos_xyz" };
+        let rejection_reason = (!soa_active).then(|| {
+            execution_rejection_reason
+                .or_else(|| problem.soa_fast_path_rejection_reason())
+                .unwrap_or("capability_matrix_rejected")
+                .to_string()
+        });
+        Self {
+            requested: "auto".to_string(),
+            resolved: resolved.to_string(),
+            executed: resolved.to_string(),
+            rejection_reason,
+            projection_policy: None,
+            projection_realization: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -3713,6 +4875,7 @@ pub(crate) struct StateObservables {
     // PH-02: extended vector observables
     pub anisotropy_field: Vec<[f64; 3]>,
     pub dmi_field: Vec<[f64; 3]>,
+    pub rotated_dmi_field: Vec<[f64; 3]>,
     pub magnetoelastic_field: Vec<[f64; 3]>,
     pub cubic_anisotropy_field: Vec<[f64; 3]>,
     pub bulk_dmi_field: Vec<[f64; 3]>,
@@ -3724,6 +4887,7 @@ pub(crate) struct StateObservables {
     pub drive_energy: f64,
     pub anisotropy_energy: f64,
     pub dmi_energy: f64,
+    pub rotated_dmi_energy: f64,
     pub total_energy: f64,
     pub max_dm_dt: f64,
     pub max_rhs_all_norm_per_s: f64,
@@ -3736,22 +4900,140 @@ pub(crate) struct StateObservables {
 }
 
 #[cfg(test)]
+mod certified_field_version_tests {
+    use super::{certified_equilibrium_fields_sha256, CertifiedFemEquilibriumFields};
+    use crate::fem::eigen_equilibrium_contract::validate_certified_equilibrium_fields;
+
+    fn fields(with_anisotropy: bool) -> CertifiedFemEquilibriumFields {
+        let ex = vec![[1.0, 0.0, 0.0]];
+        let demag = vec![[2.0, 0.0, 0.0]];
+        let ext = vec![[8.0, 0.0, 0.0]];
+        if with_anisotropy {
+            CertifiedFemEquilibriumFields::from_fields_with_anisotropy(
+                ex, demag, ext, vec![[4.0, 0.0, 0.0]], vec![[15.0, 0.0, 0.0]], vec![0.0],
+            ).unwrap()
+        } else {
+            CertifiedFemEquilibriumFields::from_fields(
+                ex, demag, ext, vec![[11.0, 0.0, 0.0]], vec![0.0],
+            ).unwrap()
+        }
+    }
+
+    #[test]
+    fn legacy_field_bytes_and_binary_digest_are_frozen() {
+        let value = fields(false);
+        assert_eq!(value.content_sha256,
+            "sha256:534a654a6ca21daff11b59fc99026f02ab3f02f3f341bec6c8ead73df73fe730");
+        assert_eq!(serde_json::to_string(&value).unwrap(),
+            r#"{"schema_version":"CertifiedFemEquilibriumFields.v1","h_ex_a_per_m":[[1.0,0.0,0.0]],"h_demag_a_per_m":[[2.0,0.0,0.0]],"h_ext_a_per_m":[[8.0,0.0,0.0]],"h_eff_a_per_m":[[11.0,0.0,0.0]],"phi_a":[0.0],"content_sha256":"sha256:534a654a6ca21daff11b59fc99026f02ab3f02f3f341bec6c8ead73df73fe730"}"#);
+        validate_certified_equilibrium_fields(&value, 1).unwrap();
+    }
+
+    #[test]
+    fn anisotropy_digest_matches_independent_little_endian_fixture() {
+        let value = fields(true);
+        assert_eq!(value.content_sha256,
+            "sha256:3b4b095aa8a9ed90102425a27ed8cceab494f88816dbd4f5101d14883d278a54");
+        validate_certified_equilibrium_fields(&value, 1).unwrap();
+        let mut legacy_schema = value.clone();
+        legacy_schema.schema_version = "CertifiedFemEquilibriumFields.v1".to_string();
+        legacy_schema.content_sha256 = certified_equilibrium_fields_sha256(&legacy_schema);
+        assert!(validate_certified_equilibrium_fields(&legacy_schema, 1).is_err());
+        let mut absent_view = value.clone();
+        absent_view.h_anisotropy_a_per_m = None;
+        absent_view.content_sha256 = certified_equilibrium_fields_sha256(&absent_view);
+        assert!(validate_certified_equilibrium_fields(&absent_view, 1).is_err());
+    }
+
+    #[test]
+    fn legacy_refresh_certificate_bytes_and_digest_are_frozen() {
+        // Independent literal preimage encoded by the historical v1 contract.
+        let frozen_json = r#"{"schema_version":"RecomputedFemLinearizationCertificate.v1","status":"matched","recompute_provider":"native_fem_final_state_refresh.v1","node_count":1,"equilibrium_content_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","mesh_topology_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","equilibrium_material_signature":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","equilibrium_static_physics_signature":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","equilibrium_boundary_signature":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","accepted_fields_content_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","recomputed_fields_content_sha256":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","max_h_ex_difference_a_per_m":0.0,"max_h_demag_difference_a_per_m":0.0,"max_h_ext_difference_a_per_m":0.0,"max_h_eff_difference_a_per_m":0.0,"max_phi_difference_a":0.0,"field_absolute_tolerance_a_per_m":0.0,"field_relative_tolerance":0.0,"phi_absolute_tolerance_a":0.0,"content_sha256":"sha256:ed9805381c87f09d4b3f0a47b822b1ce8e0dbaa81c5511fccb205987e21fb2f9"}"#;
+        let certificate: super::RecomputedFemLinearizationCertificateV1 =
+            serde_json::from_str(frozen_json).unwrap();
+        assert!(certificate.max_h_anisotropy_difference_a_per_m.is_none());
+        assert_eq!(serde_json::to_string(&certificate).unwrap(), frozen_json);
+        assert_eq!(super::recomputed_fem_linearization_certificate_sha256(&certificate).unwrap(),
+            "sha256:ed9805381c87f09d4b3f0a47b822b1ce8e0dbaa81c5511fccb205987e21fb2f9");
+        let preimage = super::recomputed_fem_linearization_certificate_preimage_bytes(&certificate)
+            .unwrap();
+        // Use the frozen producer bytes: serializing Value would sort object
+        // keys and would not reproduce the typed serde field order.
+        let expected_preimage = frozen_json.replace(
+            &format!("\"content_sha256\":\"{}\"", certificate.content_sha256),
+            "\"content_sha256\":\"\"",
+        );
+        assert_eq!(preimage.as_slice(), expected_preimage.as_bytes());
+        use sha2::{Digest, Sha256};
+        assert_eq!(
+            super::recomputed_fem_linearization_certificate_preimage_sha256(&certificate)
+                .unwrap(),
+            format!("sha256:{:x}", Sha256::digest(&preimage))
+        );
+        let mut explicit_null = serde_json::to_value(&certificate).unwrap();
+        explicit_null["max_h_anisotropy_difference_a_per_m"] = serde_json::Value::Null;
+        assert!(serde_json::from_value::<super::RecomputedFemLinearizationCertificateV1>(explicit_null).is_err());
+    }
+
+    #[test]
+    fn declared_zero_ku_selects_v2_paths_without_legacy_fallback() {
+        let mut material = fullmag_ir::MaterialIR::default();
+        assert_eq!(CertifiedFemEquilibriumFields::artifact_paths_for_material(&material),
+            ("equilibrium/certified_fem_equilibrium_fields.v1.json",
+             "equilibrium/recomputed_fem_linearization_certificate.v1.json"));
+        assert_eq!(CertifiedFemEquilibriumFields::accepted_artifact_path_for_material(&material),
+            "equilibrium/accepted_fem_equilibrium_fields.v1.json");
+        material.uniaxial_anisotropy = Some(0.0);
+        assert_eq!(CertifiedFemEquilibriumFields::artifact_paths_for_material(&material),
+            ("equilibrium/certified_fem_equilibrium_fields.v2.json",
+             "equilibrium/recomputed_fem_linearization_certificate.v2.json"));
+        assert_eq!(CertifiedFemEquilibriumFields::accepted_artifact_path_for_material(&material),
+            "equilibrium/accepted_fem_equilibrium_fields.v2.json");
+    }
+
+    #[test]
+    fn explicit_null_and_unknown_certificate_views_are_rejected() {
+        for with_anisotropy in [false, true] {
+            let mut value = serde_json::to_value(fields(with_anisotropy)).unwrap();
+            value["h_anisotropy_a_per_m"] = serde_json::Value::Null;
+            assert!(serde_json::from_value::<CertifiedFemEquilibriumFields>(value).is_err());
+        }
+        let mut value = serde_json::to_value(fields(false)).unwrap();
+        value["h_fake_a_per_m"] = serde_json::json!([[0.0, 0.0, 0.0]]);
+        assert!(serde_json::from_value::<CertifiedFemEquilibriumFields>(value).is_err());
+    }
+
+    #[test]
+    fn rehashed_anisotropy_field_requires_measured_effective_sum() {
+        let mut value = fields(true);
+        value.h_anisotropy_a_per_m.as_mut().unwrap()[0][0] = 5.0;
+        value.content_sha256 = certified_equilibrium_fields_sha256(&value);
+        assert!(validate_certified_equilibrium_fields(&value, 1).is_err());
+        value.h_eff_a_per_m[0][0] = 16.0;
+        value.content_sha256 = certified_equilibrium_fields_sha256(&value);
+        validate_certified_equilibrium_fields(&value, 1).unwrap();
+        value.h_anisotropy_a_per_m.as_mut().unwrap()[0][0] = f64::NAN;
+        assert!(validate_certified_equilibrium_fields(&value, 1).is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
+        fem_eigen_mesh_generation_id, fem_frequency_response_mesh_generation_id,
         fem_mesh_fingerprint_count, fem_mesh_payload_build_count, fem_mesh_topology_fingerprint,
-        normalized_payload_element_markers, reset_fem_mesh_fingerprint_count,
-        reset_fem_mesh_payload_build_count, ExecutionProvenance, FemMeshPartPayload, FemMeshPayload,
-        FemPoissonDemagProvenance, InitialTimestepReason, LegacyDtPolicy, LivePreviewField,
-        LlgTimestepCapabilityId, LlgTimestepQualificationId, RequestedTimestepPolicy,
-        ResolvedTimestepPolicy, StageFemMeshAsset, StepStats, StepUpdate, TimestepBackend,
-        TimestepDevice, TimestepExecutionIdentity, TimestepPolicyProvenance,
+        fem_plan_mesh_generation_id, reset_fem_mesh_fingerprint_count,
+        reset_fem_mesh_payload_build_count, ExecutionProvenance, FdmCpuStateLayoutProvenance,
+        FemMeshPartPayload, FemMeshPayload, FemPoissonDemagProvenance, InitialTimestepReason,
+        LegacyDtPolicy, LivePreviewField, LlgTimestepCapabilityId, LlgTimestepQualificationId,
+        RequestedTimestepPolicy, ResolvedTimestepPolicy, StageFemMeshAsset, StepStats, StepUpdate,
+        TimestepBackend, TimestepDevice, TimestepExecutionIdentity, TimestepPolicyProvenance,
         TimestepValidationState,
     };
     use fullmag_ir::{
         ExchangeBoundaryCondition, ExecutionPrecision, FemDomainMeshModeIR, FemMeshPartIR,
         FemMeshPartRole, FemMeshPartSelector, FemPlanIR, IntegratorChoice, MaterialIR, MeshIR,
     };
-    use std::collections::BTreeSet;
 
     fn fdm_cpu_timestep_identity() -> TimestepExecutionIdentity {
         TimestepExecutionIdentity {
@@ -3836,10 +5118,12 @@ mod tests {
             enable_demag: false,
             external_field: None,
             antenna_zeeman_masks: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
             field_drives: Vec::new(),
             field_drive_geometry_masks: Vec::new(),
             time_stage: Default::default(),
             current_modules: Vec::new(),
+            charge_transport_plans: Vec::new(),
             spin_transport_plans: Vec::new(),
             gyromagnetic_ratio: 2.211e5,
             precision: ExecutionPrecision::Double,
@@ -3852,6 +5136,7 @@ mod tests {
             demag_realization: None,
             air_box_config: None,
             interfacial_dmi: None,
+            rotated_interfacial_dmi: None,
             dmi_interface_normal: None,
             bulk_dmi: None,
             dind_field: None,
@@ -3887,6 +5172,172 @@ mod tests {
             mfem_device_string: None,
             use_consistent_mass: None,
         }
+    }
+
+    fn tiny_fem_eigen_plan(plan: &FemPlanIR) -> fullmag_ir::FemEigenPlanIR {
+        fullmag_ir::FemEigenPlanIR {
+            mesh_name: plan.mesh_name.clone(),
+            mesh_source: plan.mesh_source.clone(),
+            mesh: plan.mesh.clone(),
+            object_segments: plan.object_segments.clone(),
+            mesh_parts: plan.mesh_parts.clone(),
+            mesh_build_report: plan.mesh_build_report.clone(),
+            domain_mesh_mode: plan.domain_mesh_mode,
+            domain_frame: plan.domain_frame.clone(),
+            fe_order: plan.fe_order,
+            hmax: plan.hmax,
+            equilibrium_magnetization: plan.initial_magnetization.clone(),
+            material: plan.material.clone(),
+            operator: fullmag_ir::EigenOperatorConfigIR {
+                kind: fullmag_ir::EigenOperatorIR::LinearizedLlg,
+                include_demag: false,
+            },
+            count: 1,
+            target: fullmag_ir::EigenTargetIR::Lowest,
+            equilibrium: fullmag_ir::EquilibriumSourceIR::Provided,
+            k_sampling: None,
+            bias_field_samples: Vec::new(),
+            normalization: fullmag_ir::EigenNormalizationIR::UnitL2,
+            damping_policy: fullmag_ir::EigenDampingPolicyIR::Ignore,
+            enable_exchange: true,
+            enable_demag: false,
+            interfacial_dmi: None,
+            dmi_interface_normal: None,
+            bulk_dmi: None,
+            external_field: None,
+            gyromagnetic_ratio: plan.gyromagnetic_ratio,
+            precision: plan.precision,
+            exchange_bc: plan.exchange_bc,
+            spin_wave_bc: fullmag_ir::SpinWaveBoundaryConditionIR::default(),
+            demag_realization: None,
+            air_box_config: None,
+            mode_tracking: None,
+            dispersion_validation: None,
+            k0_kittel_validation: None,
+            solver_policy: None,
+        }
+    }
+
+    fn tiny_fem_frequency_response_plan(
+        plan: &FemPlanIR,
+    ) -> fullmag_ir::FemFrequencyResponsePlanIR {
+        fullmag_ir::FemFrequencyResponsePlanIR {
+            mesh_name: plan.mesh_name.clone(),
+            mesh_source: plan.mesh_source.clone(),
+            mesh: plan.mesh.clone(),
+            object_segments: plan.object_segments.clone(),
+            mesh_parts: plan.mesh_parts.clone(),
+            mesh_build_report: plan.mesh_build_report.clone(),
+            domain_mesh_mode: plan.domain_mesh_mode,
+            domain_mesh_workflow_mode: None,
+            domain_frame: plan.domain_frame.clone(),
+            fe_order: plan.fe_order,
+            hmax: plan.hmax,
+            equilibrium_magnetization: plan.initial_magnetization.clone(),
+            material: plan.material.clone(),
+            operator: fullmag_ir::EigenOperatorConfigIR {
+                kind: fullmag_ir::EigenOperatorIR::LinearizedLlg,
+                include_demag: false,
+            },
+            equilibrium: fullmag_ir::EquilibriumSourceIR::Provided,
+            k_sampling: None,
+            normalization: fullmag_ir::FrequencyResponseNormalizationIR::UnitMaxAmplitude,
+            damping_policy: fullmag_ir::EigenDampingPolicyIR::Include,
+            spin_wave_bc: fullmag_ir::SpinWaveBoundaryConditionIR::default(),
+            magnetostatic_bc: fullmag_ir::MagnetostaticBoundaryConditionIR::default(),
+            excitation: fullmag_ir::FrequencyExcitationIR {
+                field_au_per_m: [0.0, 0.0, 1.0],
+                phase_rad: 0.0,
+            },
+            frequencies_hz: fullmag_ir::FrequencySweepIR {
+                values_hz: vec![1.0e9],
+            },
+            solver_policy: None,
+            enable_exchange: true,
+            enable_demag: false,
+            interfacial_dmi: None,
+            dmi_interface_normal: None,
+            bulk_dmi: None,
+            external_field: None,
+            gyromagnetic_ratio: plan.gyromagnetic_ratio,
+            precision: plan.precision,
+            requested_device: fullmag_ir::ExecutionDevice::Cpu,
+            exchange_bc: plan.exchange_bc,
+            demag_realization: None,
+            air_box_config: None,
+            demag_solver_policy: None,
+            periodic_constraint_sets: Vec::new(),
+            equilibrium_provenance: None,
+        }
+    }
+
+    #[test]
+    fn fem_plan_families_share_full_topology_sha256_identity() {
+        let mut time_domain = tiny_fem_plan();
+        time_domain
+            .mesh
+            .set_tet4_cells(vec![[0, 1, 2, 3], [0, 2, 1, 3]]);
+        time_domain.mesh.element_markers = vec![7, 9];
+        time_domain.region_materials = vec![
+            fullmag_ir::FemRegionMaterialIR {
+                object_id: "film-left".to_string(),
+                material: time_domain.material.clone(),
+                element_marker: 7,
+            },
+            fullmag_ir::FemRegionMaterialIR {
+                object_id: "film-right".to_string(),
+                material: time_domain.material.clone(),
+                element_marker: 9,
+            },
+        ];
+        let time_domain_payload = FemMeshPayload::from(&time_domain);
+        // The planner carries the normalized magnetic/air marker projection
+        // into each FEM study family.  Use that canonical realized topology
+        // for the cross-family identity check; raw authoring markers are not
+        // themselves a stable payload identity when region materials exist.
+        let canonical_markers = time_domain_payload.element_markers.clone();
+        let mut modal = tiny_fem_eigen_plan(&time_domain);
+        modal.mesh.element_markers = canonical_markers.clone();
+        let mut driven = tiny_fem_frequency_response_plan(&time_domain);
+        driven.mesh.element_markers = canonical_markers.clone();
+        let canonical = fullmag_ir::fem_mesh_topology_fingerprint_v3(
+            &time_domain_payload.nodes,
+            &time_domain_payload.cells,
+            &canonical_markers,
+            &time_domain_payload.facets,
+            &time_domain_payload.boundary_markers,
+            &time_domain_payload.periodic_boundary_pairs,
+            &time_domain_payload.periodic_node_pairs,
+        )
+        .expect("finite test mesh");
+
+        let canonical_generation = fem_plan_mesh_generation_id(&time_domain);
+        assert_eq!(fem_eigen_mesh_generation_id(&modal), canonical_generation);
+        assert_eq!(
+            fem_frequency_response_mesh_generation_id(&driven),
+            canonical_generation
+        );
+        assert_eq!(
+            time_domain_payload.generation_id.as_deref(),
+            Some(canonical_generation.as_str())
+        );
+        let modal_payload = FemMeshPayload::from(&modal);
+        let driven_payload = FemMeshPayload::from(&driven);
+        assert_eq!(time_domain_payload.element_markers, canonical_markers);
+        assert_eq!(
+            modal_payload.element_markers,
+            time_domain_payload.element_markers
+        );
+        assert_eq!(
+            driven_payload.element_markers,
+            time_domain_payload.element_markers
+        );
+        assert_eq!(
+            fem_mesh_topology_fingerprint(&time_domain_payload),
+            canonical
+        );
+        assert_eq!(fem_mesh_topology_fingerprint(&modal_payload), canonical);
+        assert_eq!(fem_mesh_topology_fingerprint(&driven_payload), canonical);
     }
 
     #[test]
@@ -4002,6 +5453,7 @@ mod tests {
                 hysteresis_settle_step_kind: None,
                 hysteresis_settle_step_method: None,
                 scalar_row_due: false,
+                terminal_field_snapshot: false,
                 finished: step == 7,
             };
             assert_eq!(
@@ -4022,6 +5474,19 @@ mod tests {
         assert_ne!(
             fem_mesh_topology_fingerprint(&base),
             fem_mesh_topology_fingerprint(&reordered)
+        );
+    }
+
+    #[test]
+    fn published_fem_topology_fingerprint_matches_planner_mixed_v3_identity() {
+        let plan = tiny_fem_plan();
+        let payload = FemMeshPayload::from(&plan);
+
+        assert_eq!(
+            fem_mesh_topology_fingerprint(&payload),
+            plan.mesh
+                .mixed_topology_fingerprint_v3()
+                .expect("finite test mesh")
         );
     }
 
@@ -4068,31 +5533,6 @@ mod tests {
     }
 
     #[test]
-    fn normalized_payload_markers_use_region_material_contract_when_available() {
-        let magnetic_markers = [7u32].into_iter().collect::<BTreeSet<_>>();
-        assert_eq!(
-            normalized_payload_element_markers(&[7, 99, 0], Some(&magnetic_markers)),
-            vec![1, 0, 0]
-        );
-    }
-
-    #[test]
-    fn normalized_payload_markers_preserve_simple_air_split_without_region_materials() {
-        assert_eq!(
-            normalized_payload_element_markers(&[2, 0], None),
-            vec![1, 0]
-        );
-    }
-
-    #[test]
-    fn normalized_payload_markers_treat_uniform_marker_mesh_as_fully_magnetic() {
-        assert_eq!(
-            normalized_payload_element_markers(&[5, 5], None),
-            vec![1, 1]
-        );
-    }
-
-    #[test]
     fn fem_mesh_part_payload_counts_explicit_node_indices() {
         let part = FemMeshPartIR {
             id: "part:__air__".to_string(),
@@ -4135,6 +5575,7 @@ mod tests {
             hysteresis_settle_step_kind: None,
             hysteresis_settle_step_method: None,
             scalar_row_due: false,
+            terminal_field_snapshot: false,
             finished: false,
         };
 
@@ -4189,6 +5630,7 @@ mod tests {
             hysteresis_settle_step_kind: None,
             hysteresis_settle_step_method: None,
             scalar_row_due: false,
+            terminal_field_snapshot: false,
             finished: false,
         };
 
@@ -4246,6 +5688,7 @@ mod tests {
             hysteresis_settle_step_kind: None,
             hysteresis_settle_step_method: None,
             scalar_row_due: false,
+            terminal_field_snapshot: false,
             finished: true,
         };
 
@@ -4299,6 +5742,34 @@ mod tests {
         let value = serde_json::to_value(provenance).unwrap();
         assert!(value.get("timestep_policy").is_some());
         assert!(value.get("dt_policy").is_none());
+    }
+
+    #[test]
+    fn fdm_cpu_state_layout_provenance_round_trips() {
+        let provenance = ExecutionProvenance {
+            fdm_cpu_state_layout: Some(FdmCpuStateLayoutProvenance {
+                requested: "auto".to_string(),
+                resolved: "aos_xyz".to_string(),
+                executed: "aos_xyz".to_string(),
+                rejection_reason: Some("spatial_damping".to_string()),
+                projection_policy: None,
+                projection_realization: None,
+            }),
+            ..ExecutionProvenance::default()
+        };
+        let value = serde_json::to_value(&provenance).expect("layout receipt should serialize");
+        assert_eq!(value["fdm_cpu_state_layout"]["requested"], "auto");
+        assert_eq!(value["fdm_cpu_state_layout"]["resolved"], "aos_xyz");
+        assert_eq!(
+            value["fdm_cpu_state_layout"]["rejection_reason"],
+            "spatial_damping"
+        );
+        let decoded: ExecutionProvenance =
+            serde_json::from_value(value).expect("layout receipt should deserialize");
+        assert_eq!(
+            decoded.fdm_cpu_state_layout,
+            provenance.fdm_cpu_state_layout
+        );
     }
 
     #[test]

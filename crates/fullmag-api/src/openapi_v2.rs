@@ -6,11 +6,15 @@ use utoipa::OpenApi;
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        crate::router_v2::handlers::platform::compute_profiles::get_compute_profiles,
+        crate::router_v2::handlers::platform::compute_profiles::post_compute_profile,
+        crate::router_v2::handlers::platform::compute_preview::post_compute_preview,
         crate::router_v2::handlers::platform::realtime::get_asyncapi_document,
         crate::router_v2::handlers::platform::realtime::get_asyncapi_docs,
         crate::router_v2::handlers::platform::realtime::get_communication_policy,
         crate::router_v2::handlers::platform::realtime::patch_communication_policy,
         crate::router_v2::handlers::platform::realtime::ws_current_live,
+        crate::router_v2::handlers::sessions::create,
         crate::router_v2::handlers::sessions::status::get_status,
         crate::router_v2::handlers::data::domain::get_domain_meta,
         crate::router_v2::handlers::data::domain::get_fdm_multilayer_layout,
@@ -28,6 +32,9 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::data::fdm_region_membership::get_fdm_region_membership_binary_scoped,
         crate::router_v2::handlers::data::frozen_spins::get_frozen_spins_resolved_mask,
         crate::router_v2::handlers::data::quantities::get_quantities_catalog,
+        crate::router_v2::handlers::data::observation_frames::list_observation_frames,
+        crate::router_v2::handlers::data::observation_frames::get_observation_frame,
+        crate::router_v2::handlers::data::observation_frames::get_observation_frame_magnetization,
         crate::router_v2::handlers::data::fields::get_field_catalog,
         crate::router_v2::handlers::data::fields::get_field_availability,
         crate::router_v2::handlers::data::fields::get_field_meta,
@@ -71,6 +78,8 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::visualization::display::patch_visualization_state,
         crate::router_v2::handlers::visualization::display::get_visualization_client_acks,
         crate::router_v2::handlers::visualization::display::post_visualization_client_ack,
+        crate::router_v2::handlers::visualization::mode_composition::get_active_mode_composition,
+        crate::router_v2::handlers::visualization::mode_composition::patch_active_mode_composition,
         crate::router_v2::handlers::workspace::workspace::get_workspace_selection,
         crate::router_v2::handlers::workspace::workspace::replace_workspace_selection,
         crate::router_v2::handlers::workspace::workspace::get_workspace_active_node,
@@ -79,6 +88,20 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::workspace::workspace::replace_workspace_ribbon,
         crate::router_v2::handlers::workspace::workspace::get_workspace_layout,
         crate::router_v2::handlers::workspace::workspace::replace_workspace_layout,
+        crate::router_v2::handlers::workspace_items::list_items,
+        crate::router_v2::handlers::workspace_items::post_item,
+        crate::router_v2::handlers::workspace_items::get_item,
+        crate::router_v2::handlers::workspace_items::get_item_thumbnail,
+        crate::router_v2::handlers::workspace_items::get_item_archive,
+        crate::router_v2::handlers::workspace_items::pin_item,
+        crate::router_v2::handlers::workspace_items::forget_item,
+        crate::router_v2::handlers::workspace_items::get_item_history,
+        crate::router_v2::handlers::workspace_items::get_item_frames,
+        crate::router_v2::handlers::workspace_items::get_setting,
+        crate::router_v2::handlers::workspace_items::put_setting,
+        crate::router_v2::handlers::workspace_items::get_roots,
+        crate::router_v2::handlers::workspace_items::put_roots,
+        crate::router_v2::handlers::workspace_items::post_scan,
         crate::router_v2::handlers::meshing::mesh::get_mesh_summary,
         crate::router_v2::handlers::meshing::mesh::get_mesh_capabilities,
         crate::router_v2::handlers::meshing::mesh::get_mesh_semantics,
@@ -117,6 +140,7 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::meshing::mesh::get_mesh_interface_report,
         crate::router_v2::handlers::meshing::mesh::get_mesh_interface_quality,
         crate::router_v2::handlers::model::authoring::get_authoring_scene,
+        crate::router_v2::handlers::model::readiness::get_model_readiness,
         crate::router_v2::handlers::model::authoring::replace_authoring_scene,
         crate::router_v2::handlers::model::authoring::patch_authoring_scene,
         crate::router_v2::handlers::model::physics_graph::get_physics_graph,
@@ -190,6 +214,12 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::model::planar_monitors::patch_planar_monitor,
         crate::router_v2::handlers::model::planar_monitors::delete_planar_monitor,
         crate::router_v2::handlers::model::planar_monitors::duplicate_planar_monitor,
+        crate::router_v2::handlers::analysis::analytic_references::list_analytic_reference_models,
+        crate::router_v2::handlers::analysis::postprocessing::list_postprocessing_definitions,
+        crate::router_v2::handlers::analysis::postprocessing::create_postprocessing_definition,
+        crate::router_v2::handlers::analysis::postprocessing::get_postprocessing_definition,
+        crate::router_v2::handlers::analysis::postprocessing::patch_postprocessing_definition,
+        crate::router_v2::handlers::analysis::postprocessing::delete_postprocessing_definition,
         crate::router_v2::handlers::model::frozen_spins::list_frozen_spins,
         crate::router_v2::handlers::model::frozen_spins::create_frozen_spins,
         crate::router_v2::handlers::model::frozen_spins::get_frozen_spins,
@@ -197,12 +227,29 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::model::frozen_spins::delete_frozen_spins,
         crate::router_v2::handlers::model::frozen_spins::create_frozen_spins_preview,
         crate::router_v2::handlers::model::frozen_spins::get_frozen_spins_preview,
+        crate::router_v2::handlers::model::frozen_spins::activate_frozen_spins_preview,
         crate::router_v2::handlers::simulation::commands::submit_command,
         crate::router_v2::handlers::simulation::runtime::get_command_status,
         crate::router_v2::handlers::simulation::runtime::get_command_detail,
+        crate::router_v2::handlers::simulation::runtime::report_command_failure,
         crate::router_v2::handlers::persistence::assets::import_asset,
+        crate::router_v2::handlers::persistence::projects::create,
+        crate::router_v2::handlers::persistence::projects::open,
+        crate::router_v2::handlers::persistence::projects::authoring_update,
+        crate::router_v2::handlers::persistence::script_project::from_script,
+        crate::router_v2::handlers::persistence::projects::submit_run,
+        crate::router_v2::handlers::persistence::projects::run_intent_preparation::prepare,
+        crate::router_v2::handlers::persistence::projects::submit_batch,
+        crate::router_v2::handlers::persistence::projects::list_batches,
+        crate::router_v2::handlers::persistence::projects::list_batch_cases,
+        crate::router_v2::handlers::persistence::projects::list_runs,
+        crate::router_v2::handlers::persistence::projects::get_run,
+        crate::router_v2::handlers::persistence::projects::materialize_run,
+        crate::router_v2::handlers::persistence::projects::cancel_run_task,
+        crate::router_v2::handlers::persistence::solutions::get_solution_set_discovery,
         crate::router_v2::handlers::simulation::runtime::get_current_run,
         crate::router_v2::handlers::simulation::runtime::get_simulation_preparation,
+        crate::router_v2::handlers::simulation::runtime::materialize_live_preparation,
         crate::router_v2::handlers::simulation::runtime::get_run_by_id,
         crate::router_v2::handlers::simulation::runtime::get_stage_execution,
         crate::router_v2::handlers::simulation::runtime::get_hysteresis_plan,
@@ -218,6 +265,17 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::simulation::runtime::get_object_metrics,
         crate::router_v2::handlers::data::artifacts::list_artifacts,
         crate::router_v2::handlers::data::artifacts::get_artifact,
+        crate::router_v2::handlers::data::antenna::get_antenna_field_solution,
+        crate::router_v2::handlers::data::antenna::get_antenna_field_solution_payload,
+        crate::router_v2::handlers::data::antenna::get_antenna_stage_output_catalog,
+        crate::router_v2::handlers::data::antenna_inspection::get_antenna_external_lead_inspection,
+        crate::router_v2::handlers::data::antenna_inspection::get_antenna_external_lead_inspection_display,
+        crate::router_v2::handlers::data::antenna_inspection::get_antenna_external_lead_inspection_payload,
+        crate::router_v2::handlers::data::accepted_antenna_payload::get_accepted_antenna_payload,
+        crate::router_v2::handlers::data::accepted_antenna_resource::get_accepted_antenna_inspection,
+        crate::router_v2::handlers::data::accepted_antenna_resource::get_accepted_antenna_catalog,
+        crate::router_v2::handlers::data::antenna::get_antenna_source_spectrum,
+        crate::router_v2::handlers::data::antenna::get_antenna_source_spectrum_payload,
         crate::router_v2::handlers::analysis::eigen::get_spectrum,
         crate::router_v2::handlers::analysis::eigen::get_spectrum_v2,
         crate::router_v2::handlers::analysis::eigen::get_mode,
@@ -228,16 +286,44 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::analysis::eigen::get_branches_v2,
         crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_manifest_v1,
         crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_eigen_spectrum_v2,
+        crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_eigen_spectrum_v3,
         crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_eigen_branches_v2,
+        crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_eigen_field_sweep,
         crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_eigen_dispersion,
         crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_eigen_diagnostics_v2,
+        crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_eigen_mode,
         crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_eigen_mode_field_meta,
+        crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_fmr_peaks,
+        crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_fmr_resonance_fits,
+        crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_fmr_kittel_fit,
         crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_response_magnetic_sweep,
         crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_response_progress_v1,
         crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_response_cancel_requested_v1,
         crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_response_solver_diagnostics_v1,
+        crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_response_diagnostics_v1,
         crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_response_frequency_point,
         crate::router_v2::handlers::analysis::frequency_domain::get_frequency_domain_response_field_meta,
+        crate::router_v2::handlers::analysis::results::get_analysis_result_dataset_catalog,
+        crate::router_v2::handlers::analysis::results::get_analysis_result_dataset_manifest,
+        crate::router_v2::handlers::analysis::results::get_analysis_result_axis_values,
+        crate::router_v2::handlers::analysis::results::get_analysis_result_samples,
+        crate::router_v2::handlers::analysis::results::get_analysis_result_items,
+        crate::router_v2::handlers::analysis::results::get_analysis_result_item,
+        crate::router_v2::handlers::analysis::results::get_analysis_result_branches,
+        crate::router_v2::handlers::analysis::results::get_analysis_result_branch,
+        crate::router_v2::handlers::analysis::results::get_analysis_result_branch_points,
+        crate::router_v2::handlers::analysis::results::get_analysis_result_relations,
+        crate::router_v2::handlers::analysis::results::get_analysis_result_relation,
+        crate::router_v2::handlers::analysis::results::get_analysis_result_projection,
+        crate::router_v2::handlers::persistence::solutions::get_solution_revision,
+        crate::router_v2::handlers::persistence::solutions::get_solution_members,
+        crate::router_v2::handlers::persistence::solutions::get_solution_artifacts,
+        crate::router_v2::handlers::persistence::solutions::scalar::get_solution_scalar,
+        crate::router_v2::handlers::persistence::solutions::get_materialized_dataset,
+        crate::router_v2::handlers::persistence::solutions::get_materialized_dataset_slice,
+        crate::router_v2::handlers::persistence::solutions::saved_geometry::get_saved_field_geometry,
+        crate::router_v2::handlers::persistence::solutions::saved_geometry::get_saved_field_geometry_topology,
+        crate::router_v2::handlers::persistence::solutions::saved_geometry::get_saved_field_geometry_support,
         crate::router_v2::handlers::analysis::response::get_magnetic_response_sweep_v1,
         crate::router_v2::handlers::analysis::spin_wave_response::get_spin_wave_gamma,
         crate::router_v2::handlers::analysis::spin_wave_response::get_dynamic_structure_factor,
@@ -261,10 +347,11 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::platform::system::get_gpu_telemetry,
         crate::router_v2::handlers::platform::system::get_solver_profile,
         crate::router_v2::handlers::persistence::session::export_session,
-        crate::router_v2::handlers::persistence::session::inspect_session,
+        crate::router_v2::handlers::persistence::session::inspect_project_archive,
         crate::router_v2::handlers::persistence::session::commit_session,
         crate::router_v2::handlers::persistence::session::list_checkpoints,
         crate::router_v2::handlers::persistence::session::get_checkpoint,
+        crate::router_v2::handlers::persistence::session::delete_checkpoint,
         crate::router_v2::handlers::persistence::session::create_checkpoint,
         crate::router_v2::handlers::persistence::session::restore_checkpoint,
         crate::router_v2::handlers::persistence::session::export_field_state,
@@ -274,8 +361,90 @@ use utoipa::OpenApi;
         crate::router_v2::handlers::persistence::session::clear_recovery,
         crate::router_v2::handlers::platform::system::get_capabilities,
         crate::router_v2::handlers::platform::system::get_health,
+        crate::router_v2::handlers::platform::runtime_service::get_runtime_service,
+        crate::router_v2::handlers::platform::development_backend::get_development_backend,
+        crate::router_v2::handlers::platform::development_backend_build_request::post_development_backend_build_request,
+        crate::router_v2::handlers::platform::development_backend_build_request::get_development_backend_build_request,
+        crate::router_v2::handlers::platform::output_storage::get_output_storage_defaults,
+        crate::router_v2::handlers::platform::output_storage::put_output_storage_defaults,
+        crate::router_v2::handlers::platform::development_restart_request::post_development_restart_request,
+        crate::router_v2::handlers::platform::development_restart_request::get_development_restart_request,
     ),
     components(schemas(
+        crate::schemas::development_backend::DevelopmentBackendResource,
+        crate::schemas::development_backend::DevelopmentBackendState,
+        crate::schemas::development_backend::DevelopmentBackendReason,
+        crate::schemas::development_backend::DevelopmentBuildIdentity,
+        crate::schemas::development_backend::DevelopmentBackendWorkspaceIdentity,
+        crate::schemas::development_backend_build_request::DevelopmentBackendBuildRequest,
+        crate::schemas::development_backend_build_request::DevelopmentBackendBuildRequestResource,
+        crate::schemas::development_backend_build_request::DevelopmentBackendBuildRequestState,
+        crate::schemas::development_restart_request::DevelopmentRestartRequest,
+        crate::schemas::development_restart_request::DevelopmentRestartResource,
+        crate::schemas::development_restart_request::DevelopmentRestartState,
+        crate::schemas::runtime_service::RuntimeServiceStatusResource,
+        crate::schemas::runtime_service::RuntimeServiceStatusState,
+        crate::schemas::runtime_service::RuntimeServiceStatusReason,
+        crate::schemas::output_storage::OutputDataFormatSchema,
+        crate::schemas::output_storage::TempCleanupSchema,
+        crate::schemas::output_storage::ExistingOutputSchema,
+        crate::schemas::output_storage::OutputStorageSettingsSchema,
+        crate::schemas::output_storage::OutputStorageDefaultsRequest,
+        crate::schemas::output_storage::OutputStorageDefaultsResource,
+        crate::schemas::workspace_items::WorkspaceItemKind,
+        crate::schemas::workspace_items::WorkspaceItemStatus,
+        crate::schemas::workspace_items::WorkspaceItem,
+        crate::schemas::workspace_items::WorkspaceOpenState,
+        crate::schemas::workspace_items::WorkspaceOutcome,
+        crate::schemas::workspace_items::WorkspaceItemList,
+        crate::schemas::workspace_items::WorkspaceEvent,
+        crate::schemas::workspace_items::WorkspaceItemDetail,
+        crate::schemas::workspace_items::WorkspaceHistory,
+        crate::schemas::workspace_items::WorkspacePinRequest,
+        crate::schemas::workspace_items::WorkspaceForgetResult,
+        crate::schemas::workspace_items::WorkspaceAddRequest,
+        crate::schemas::workspace_items::WorkspaceRoot,
+        crate::schemas::workspace_items::WorkspaceRootsSource,
+        crate::schemas::workspace_items::WorkspaceRoots,
+        crate::schemas::workspace_items::WorkspaceRootsRequest,
+        crate::schemas::workspace_items::WorkspaceScanRequest,
+        crate::schemas::workspace_items::WorkspaceThumbnailOrigin,
+        crate::schemas::workspace_items::WorkspaceScanReport,
+        crate::schemas::workspace_items::ItemDetail,
+        crate::schemas::workspace_items::ProjectDetail,
+        crate::schemas::workspace_items::ProjectSummary,
+        crate::schemas::workspace_items::ModelSummary,
+        crate::schemas::workspace_items::ExecutionSummary,
+        crate::schemas::workspace_items::OutputsSummary,
+        crate::schemas::workspace_items::Author,
+        crate::schemas::workspace_items::Citation,
+        crate::schemas::workspace_items::HistoryEntry,
+        crate::schemas::workspace_items::ProjectRun,
+        crate::schemas::workspace_items::PreviewInfo,
+        crate::schemas::workspace_items::ScriptDetail,
+        crate::schemas::workspace_items::ResultDetail,
+        crate::schemas::workspace_items::ResultGrid,
+        crate::schemas::workspace_items::FrameEntry,
+        crate::schemas::workspace_items::FramesStageCount,
+        crate::schemas::workspace_items::FramesSummary,
+        crate::schemas::workspace_items::FramesPage,
+        crate::schemas::workspace_items::WorkspaceSetting,
+        crate::schemas::workspace_items::WorkspaceSettingRequest,
+        fullmag_workspace_inspect::manifest::RunSource,
+        fullmag_workspace_inspect::manifest::StageSummary,
+        fullmag_workspace_inspect::manifest::RunOutput,
+        crate::schemas::sessions::CreateSessionRequest,
+        crate::schemas::sessions::CreateSessionResponse,
+        crate::schemas::sessions::SessionListResource,
+        crate::schemas::sessions::SessionSummaryResource,
+        crate::schemas::sessions::ScratchSceneSchemaVersion,
+        crate::schemas::sessions::ScratchSceneDocumentResource,
+        crate::schemas::sessions::ScratchSessionBackend,
+        crate::schemas::sessions::ScratchSessionDevice,
+        crate::schemas::sessions::ScratchSessionPrecision,
+        crate::schemas::sessions::ScratchSessionRevisionsResource,
+        crate::schemas::sessions::ScratchSessionStatusResource,
+        crate::schemas::sessions::SessionExecutionResource,
         crate::schemas::status::LiveStatus,
         crate::schemas::status::SessionSummary,
         crate::schemas::status::RunSummary,
@@ -287,6 +456,19 @@ use utoipa::OpenApi;
         crate::schemas::status::DisplaySelection,
         crate::schemas::status::DomainSummary,
         crate::schemas::status::ResourceRevisionMap,
+        crate::schemas::mode_composition::ModeCompositionResource,
+        crate::schemas::mode_composition::ModeCompositionLifecycle,
+        crate::schemas::mode_composition::ModeCompositionPatch,
+        crate::schemas::mode_composition::ModeCompositionDatasetPatch,
+        crate::schemas::mode_composition::ModeCompositionOperation,
+        crate::schemas::mode_composition::ModeCompositionLayer,
+        crate::schemas::mode_composition::EigenModeResourceRef,
+        crate::schemas::mode_composition::ModeCompositionPhaseClock,
+        crate::schemas::mode_composition::ModeFieldRepresentation,
+        crate::schemas::mode_composition::ModeFieldComponent,
+        crate::schemas::mode_composition::ModeFieldNormalization,
+        crate::schemas::mode_composition::ModeLayerAnimation,
+        crate::schemas::mode_composition::ModeLayerAppearance,
         crate::schemas::status::CapabilityMap,
         crate::schemas::status::TransportAuthoringCapability,
         crate::schemas::status::TransportAuthoringCapabilityMap,
@@ -316,12 +498,96 @@ use utoipa::OpenApi;
         crate::schemas::fields::TargetFieldAvailabilityState,
         crate::schemas::fields::FieldMeta,
         crate::schemas::common::AcceptedObservationFrameRef,
+        crate::schemas::common::AcceptedStateRefResource,
+        crate::schemas::common::AcceptedStateIdResource,
+        crate::schemas::solutions::SolutionScalarResource,
+        crate::schemas::solutions::SolutionScalarIntegrityResource,
+        crate::schemas::solutions::SolutionSetArtifactPageResource,
+        crate::schemas::solutions::SolutionSetMemberPageResource,
+        crate::schemas::solutions::SolutionSetArtifactResource,
+        crate::schemas::solutions::SolutionArtifactIntegrityStatusResource,
+        crate::schemas::solutions::SolutionAcceptedStateIdResource,
+        crate::schemas::solutions::SolutionCoverageSummaryResource,
+        crate::schemas::solutions::SolutionSetMemberResource,
+        crate::schemas::solutions::SolutionSetResource,
+        crate::schemas::solutions::SolutionProvenanceResource,
+        crate::schemas::solutions::SolutionScientificAssessmentResource,
+        crate::schemas::solutions::SolutionCoverageStateResource,
+        crate::schemas::solutions::SolutionArtifactKindResource,
+        crate::schemas::solutions::ScientificAssessmentStatusResource,
+        crate::schemas::solutions::SolutionExecutionStatusResource,
+        crate::schemas::solutions::SolutionSetManifestStateResource,
+        crate::schemas::solutions::SolutionSetMemberPageQuery,
+        crate::schemas::solutions::SolutionSetArtifactPageQuery,
+        crate::schemas::solutions::SolutionSetDiscoveryPageQuery,
+        crate::schemas::solutions::SolutionSetDiscoveryPageResource,
+        crate::schemas::solutions::SolutionSetDiscoveryRefResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetResource,
+        crate::schemas::materialized_dataset_slice::MaterializedDatasetSliceEnvelopeResource,
+        crate::schemas::materialized_dataset_slice::MaterializedDatasetSliceManifestResource,
+        crate::schemas::materialized_dataset_slice::MaterializedDatasetSlicePartResource,
+        crate::schemas::materialized_dataset_slice::MaterializedDatasetSlicePrecisionResource,
+        crate::schemas::materialized_dataset_slice::MaterializedDatasetSliceByteOrderResource,
+        crate::schemas::materialized_dataset_slice::MaterializedDatasetSliceIntegrityResource,
+        crate::schemas::saved_field_geometry::SavedFieldGeometryResource,
+        crate::schemas::saved_field_geometry::SavedFieldGeometryArtifactResource,
+        crate::schemas::saved_field_geometry::SavedFieldGeometryPayloadResource,
+        crate::schemas::saved_field_geometry::SavedFieldGeometryPinnedSourceResource,
+        crate::schemas::saved_field_geometry::SavedFieldGeometryDatasetResource,
+        crate::schemas::saved_field_geometry::SavedFieldGeometryRepresentationEvidenceResource,
+        crate::schemas::saved_field_geometry::SavedFieldGeometryBinaryIntegrityResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetIntegrityResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetQuantityResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetFrameKindResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetSampleLocationResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetFunctionSpaceOrderingResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetNormalizationResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetValueRepresentationResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetResolutionResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetComplexEncodingResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetHarmonicConventionResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetAvailabilityResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetUnavailableActionResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetEvaluationPrecisionResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetApproximationResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetUnavailableDataResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetAxisKindResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetProjectionMethodResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetPlaneResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetDtypeResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetModalReconstructionResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetModalAmplitudeResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetModalNormalizationKindResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetPinnedSourceResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetSelectionResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetStatusResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetEvaluationPolicyResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetAxisSelectionResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetFieldProjectionResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetTransformResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetDefinitionResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetIdentityResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetFrameResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetActiveSupportResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetFunctionSpaceResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetAxisResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetModalNormalizationResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetModalSemanticsResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetFieldDescriptorResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetCoverageResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetTensorArtifactResource,
+        crate::schemas::materialized_dataset::MaterializedDatasetFieldResource,
+        crate::schemas::common::AcceptedStateGenerationResource,
         crate::schemas::common::FieldPublicationBundle,
         crate::schemas::common::FieldPublicationResponseRevisions,
         crate::schemas::common::FieldPublicationBinding,
         crate::schemas::fields::FieldStats,
         crate::schemas::fields::FieldVectorQuery,
         crate::schemas::fields::FieldVectorPendingResponse,
+        crate::schemas::observations::ObservationFrameListQuery,
+        crate::schemas::observations::ObservationFrameStatus,
+        crate::schemas::observations::ObservationFrameResource,
+        crate::schemas::observations::ObservationFrameListResource,
         crate::schemas::fields::FieldSliceMeta,
         crate::schemas::fields::FieldMatrixResponse,
         crate::schemas::fields::FieldProjectionMeta,
@@ -340,6 +606,16 @@ use utoipa::OpenApi;
         crate::schemas::planar_monitors::PlanarSurfaceBoundarySelectorSchema,
         crate::schemas::planar_monitors::PlanarSurfaceVisibilityPolicySchema,
         crate::schemas::planar_monitors::PlanarMonitorCollectionResource,
+        crate::schemas::postprocessing_definitions::PostprocessingDataRef,
+        crate::schemas::postprocessing_definitions::PostprocessingDefinition,
+        crate::router_v2::handlers::analysis::analytic_references::AnalyticReferenceModelCollectionResource,
+        crate::router_v2::handlers::analysis::analytic_references::AnalyticReferenceModelResource,
+        crate::router_v2::handlers::analysis::analytic_references::AnalyticReferenceValidity,
+        crate::schemas::postprocessing_definitions::PostprocessingDefinitionCollectionResource,
+        crate::schemas::postprocessing_definitions::PostprocessingDefinitionResource,
+        crate::schemas::postprocessing_definitions::PostprocessingDefinitionCreateRequest,
+        crate::schemas::postprocessing_definitions::PostprocessingDefinitionPatchRequest,
+        crate::schemas::postprocessing_definitions::PostprocessingDefinitionDeleteRequest,
         crate::schemas::planar_monitors::PlanarMonitorResource,
         crate::schemas::planar_monitors::PlanarMonitorCreateRequest,
         crate::schemas::planar_monitors::PlanarMonitorPatchRequest,
@@ -372,6 +648,8 @@ use utoipa::OpenApi;
         crate::schemas::frozen_spins::FrozenSpinsRequestedIntent,
         crate::schemas::frozen_spins::FrozenSpinsResolvedPlanSummary,
         crate::schemas::frozen_spins::FrozenSpinsPreviewResponse,
+        crate::schemas::frozen_spins::FrozenSpinsPreviewActivationRequest,
+        crate::schemas::frozen_spins::FrozenSpinsPreviewActivationResponse,
         crate::schemas::planar_fields::PlanarFieldFrameResource,
         crate::schemas::planar_fields::PlanarFieldOccupancyResource,
         crate::schemas::planar_fields::PlanarFieldLinksResource,
@@ -446,6 +724,53 @@ use utoipa::OpenApi;
         crate::schemas::workspace::WorkspaceSelectionReplaceRequest,
         crate::schemas::workspace::WorkspaceActiveNodeResource,
         crate::schemas::workspace::WorkspaceActiveNodeReplaceRequest,
+        crate::schemas::projects::ProjectCreateRequest,
+        crate::schemas::projects::ProjectArchiveRequest,
+        crate::schemas::projects::ProjectAuthoringUpdateRequest,
+        crate::schemas::projects::ProjectFromScriptRequest,
+        crate::schemas::projects::ProjectFromScriptSource,
+        crate::schemas::projects::ProjectFromScriptConsent,
+        crate::schemas::projects::ProjectFromScriptResource,
+        crate::schemas::projects::ProjectScriptImportResource,
+        crate::schemas::projects::ScriptFidelityResource,
+        crate::schemas::projects::ScriptRoundTripState,
+        crate::schemas::projects::ProjectDocumentMode,
+        crate::schemas::projects::ProjectMigrationResource,
+        crate::schemas::projects::ProjectArchiveDurability,
+        crate::schemas::projects::ProjectDocumentResource,
+        crate::schemas::projects::ProjectRunSubmitRequest,
+        crate::schemas::projects::ProjectRunIntentRequest,
+        crate::schemas::projects::ProjectRunIntentResource,
+        crate::schemas::projects::ProjectBatchSubmitRequest,
+        crate::schemas::projects::ProjectBatchSubmitResource,
+        crate::schemas::projects::ProjectBatchListQuery,
+        crate::schemas::projects::ProjectBatchListResource,
+        crate::schemas::projects::ProjectBatchSummaryResource,
+        crate::schemas::projects::ProjectBatchFailurePolicy,
+        crate::schemas::projects::ProjectBatchExpansionState,
+        crate::schemas::projects::ProjectBatchCasesQuery,
+        crate::schemas::projects::ProjectBatchCasesResource,
+        crate::schemas::projects::ProjectBatchAxisSummaryResource,
+        crate::schemas::projects::ProjectBatchCaseState,
+        crate::schemas::projects::ProjectBatchCaseSummaryResource,
+        crate::schemas::projects::ProjectRunSubmitResource,
+        crate::schemas::projects::ProjectRunResource,
+        crate::schemas::projects::ProjectRunListQuery,
+        crate::schemas::projects::ProjectRunListResource,
+        crate::schemas::projects::ProjectRunSummaryResource,
+        crate::schemas::projects::ProjectRunRequestedExecutionResource,
+        crate::schemas::projects::ProjectRunMinimumResourceBudgetResource,
+        crate::schemas::projects::ProjectRunCatalogState,
+        crate::schemas::projects::ProjectRunTaskResource,
+        crate::schemas::projects::ProjectRunTaskLifecycle,
+        crate::schemas::projects::ProjectRunTaskReadiness,
+        crate::schemas::projects::ProjectRunObservationState,
+        crate::schemas::projects::ProjectRunMaterializationResource,
+        crate::schemas::projects::ProjectRunTaskCancellationRequest,
+        crate::schemas::projects::ProjectRunTaskCancellationResource,
+        crate::schemas::projects::ProjectRunTaskCancellationDisposition,
+        crate::schemas::projects::ProjectRunSubmitDisposition,
+        crate::schemas::projects::ProjectRunExecutionState,
         crate::schemas::workspace::WorkspaceRibbonResource,
         crate::schemas::workspace::WorkspaceRibbonReplaceRequest,
         crate::schemas::workspace::WorkspaceStageLayout,
@@ -516,6 +841,8 @@ use utoipa::OpenApi;
         crate::schemas::authoring::SceneMaterialResource,
         crate::schemas::authoring::ScenePatchRequest,
         crate::schemas::authoring::PhysicsGraphResource,
+        crate::schemas::authoring::PhysicsGraphObjectResource,
+        crate::schemas::authoring::PhysicsGraphObjectTypeResource,
         crate::schemas::authoring::PhysicsGraphModuleResource,
         crate::schemas::authoring::PhysicsGraphScopeResource,
         crate::schemas::authoring::PhysicsGraphEdgeResource,
@@ -591,6 +918,8 @@ use utoipa::OpenApi;
         crate::schemas::authoring::AuthoringTransactionResponse,
         crate::schemas::authoring::StudyRuntimeResource,
         crate::schemas::authoring::StudyRuntimePatchRequest,
+        crate::schemas::authoring::ParallelExecutionResource,
+        crate::schemas::authoring::ParallelExecutionModeResource,
         crate::schemas::authoring::SamplingPeriodPolicyResource,
         crate::schemas::authoring::AutomaticOutputSamplingResource,
         crate::schemas::authoring::AutomaticTableAutosaveResource,
@@ -655,6 +984,9 @@ use utoipa::OpenApi;
         crate::schemas::runtime::CurrentRunResource,
         crate::schemas::runtime::ResolvedFallbackResource,
         crate::schemas::preparation::SimulationPreparationResource,
+        crate::schemas::preparation::LivePreparationMaterializationRequest,
+        crate::schemas::preparation::LivePreparationMaterializationResource,
+        crate::schemas::preparation::PreparationMaterializationDisposition,
         crate::schemas::preparation::PreparationStatus,
         crate::schemas::preparation::PreparationStageId,
         crate::schemas::preparation::PreparationStageStatus,
@@ -666,6 +998,7 @@ use utoipa::OpenApi;
         crate::schemas::preparation::PreparationFailureResource,
         crate::schemas::runtime::StageExecutionResource,
         crate::schemas::runtime::StageExecutionRecordResource,
+        crate::schemas::runtime::ParallelExecutionTelemetryResource,
         crate::schemas::hysteresis::HysteresisStagePlanSchema,
         crate::schemas::hysteresis::HysteresisStorageEstimateSchema,
         crate::schemas::hysteresis::HysteresisProtocolSchema,
@@ -705,6 +1038,7 @@ use utoipa::OpenApi;
         crate::types::ScriptSyncRequest,
         crate::types::ScriptSyncResponse,
         crate::types::ScriptSourceResponse,
+        crate::types::SessionScriptSummary,
         crate::types::EngineLogEntry,
         crate::types::CpuTelemetryResponse,
         crate::types::GpuTelemetryDevice,
@@ -783,6 +1117,7 @@ use utoipa::OpenApi;
         (name = "data", description = "Quantities, fields, scalar histories, domain data, and artifacts"),
         (name = "visualization", description = "Renderer display selection and presentation state"),
         (name = "workspace", description = "Workspace shell state owned by the frontend"),
+        (name = "workspace_items", description = "Per-user recent projects, scripts and result folders (shared workspace database)"),
         (name = "analysis", description = "Analysis products such as eigenmodes and dispersion"),
         (name = "persistence", description = "Session checkpoints, exports, imports, assets, and recovery"),
         (name = "diagnostics", description = "Runtime diagnostics, GPU telemetry, and engine logs"),
@@ -796,9 +1131,20 @@ use utoipa::OpenApi;
 pub struct ApiDoc;
 
 pub fn openapi_json() -> Value {
+    std::thread::Builder::new()
+        .name("fullmag-openapi-schema".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(openapi_json_on_large_stack)
+        .expect("OpenAPI schema thread should start")
+        .join()
+        .expect("OpenAPI schema thread should finish")
+}
+
+fn openapi_json_on_large_stack() -> Value {
     let mut doc = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI v2 should serialize");
     add_platform_document_paths(&mut doc);
     add_session_collection_paths(&mut doc);
+    add_session_scope_header_parameter(&mut doc);
     let build_identity = fullmag_build_info::identity();
     doc["x-fullmag-build-identity"] = json!({
         "built_at_utc": build_identity.built_at_utc,
@@ -849,14 +1195,39 @@ fn add_session_collection_paths(doc: &mut Value) {
             "get": {
                 "tags": ["sessions"],
                 "operationId": "sessions_list_sessions",
-                "responses": {"200": {"description": "Available sessions"}}
+                "responses": {
+                    "200": {
+                        "description": "Available sessions",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/SessionListResource"}
+                            }
+                        }
+                    }
+                }
             },
             "post": {
                 "tags": ["sessions"],
                 "operationId": "sessions_create_session",
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {"$ref": "#/components/schemas/CreateSessionRequest"}
+                        }
+                    }
+                },
                 "responses": {
-                    "200": {"description": "Current session returned"},
-                    "400": {"description": "The local runtime only exposes the current session"}
+                    "201": {
+                        "description": "Scratch session created",
+                        "content": {
+                            "application/json": {
+                                "schema": {"$ref": "#/components/schemas/CreateSessionResponse"}
+                            }
+                        }
+                    },
+                    "400": {"description": "Invalid scratch session request"},
+                    "409": {"description": "An active local session already exists"}
                 }
             }
         }),
@@ -879,6 +1250,82 @@ fn add_session_collection_paths(doc: &mut Value) {
             }
         }),
     );
+}
+
+fn add_session_scope_header_parameter(doc: &mut Value) {
+    let parameter = json!({
+        "name": "x-fullmag-session-scope",
+        "in": "header",
+        "required": false,
+        "description": "Optional current-session identity in canonical form `session=<encodeURIComponent(session_id)>&epoch=<encodeURIComponent(session_epoch)>&request_scope_epoch=<encodeURIComponent(request_scope_epoch)>`. Bootstrap, legacy, and input-only inspection requests may omit it; context-bound current-session handlers reject a stale value with 409.",
+        "schema": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^session=[^&]+&epoch=[^&]+&request_scope_epoch=[^&]+$"
+        }
+    });
+
+    if let Some(parameters) = doc
+        .get_mut("components")
+        .and_then(Value::as_object_mut)
+        .map(|components| {
+            components
+                .entry("parameters".to_string())
+                .or_insert_with(|| json!({}))
+        })
+        .and_then(Value::as_object_mut)
+    {
+        parameters.insert("FullmagSessionScope".to_string(), parameter);
+    } else {
+        return;
+    }
+
+    let Some(paths) = doc.get_mut("paths").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for (path, path_item) in paths {
+        if !path.starts_with("/v2/sessions/current") {
+            continue;
+        }
+        let Some(path_item) = path_item.as_object_mut() else {
+            continue;
+        };
+        for method in ["get", "post", "put", "patch", "delete"] {
+            if !session_scope_header_applies(path, method) {
+                continue;
+            }
+            let Some(operation) = path_item.get_mut(method).and_then(Value::as_object_mut) else {
+                continue;
+            };
+            let parameters = operation
+                .entry("parameters".to_string())
+                .or_insert_with(|| json!([]));
+            let Some(parameters) = parameters.as_array_mut() else {
+                continue;
+            };
+            if !parameters
+                .iter()
+                .any(|candidate| candidate["$ref"] == "#/components/parameters/FullmagSessionScope")
+            {
+                parameters.push(json!({
+                    "$ref": "#/components/parameters/FullmagSessionScope"
+                }));
+            }
+        }
+    }
+}
+
+fn session_scope_header_applies(path: &str, method: &str) -> bool {
+    if path == "/v2/sessions/current/events/ws"
+        || path == "/v2/sessions/current/diagnostics/cpu"
+        || path == "/v2/sessions/current/diagnostics/gpu"
+    {
+        return false;
+    }
+
+    // The metadata PATCH is an explicitly unsupported no-op and has no
+    // current-session handler contract to protect.
+    !(path == "/v2/sessions/current" && method == "patch")
 }
 
 fn normalize_operation_ids(doc: &mut Value) {
@@ -1007,6 +1454,70 @@ mod tests {
     }
 
     #[test]
+    fn openapi_exposes_typed_antenna_composition_contract() {
+        let document = openapi_json();
+        let schemas = &document["components"]["schemas"];
+        let scene = &schemas["SceneResource"]["properties"];
+        for (property, schema) in [
+            ("antenna_port_modes", "AntennaPortModeResource"),
+            ("antenna_field_solve_stages", "AntennaFieldSolveStageResource"),
+            ("antenna_target_projections", "AntennaTargetProjectionResource"),
+            ("solved_antenna_drives", "SolvedAntennaDriveResource"),
+            ("antenna_spectrum_requests", "AntennaSpectrumRequestResource"),
+        ] {
+            assert_eq!(
+                scene[property]["items"]["$ref"],
+                serde_json::json!(format!("#/components/schemas/{schema}")),
+                "SceneResource.{property} must remain semantically typed"
+            );
+        }
+        assert!(schemas["AntennaPortModeResource"]["properties"]["branches"]
+            .to_string()
+            .contains("AntennaPortBranchResource"));
+        assert!(schemas["AntennaFieldSolveStageResource"]["properties"]["target_refs"]
+            .to_string()
+            .contains("FieldTargetResource"));
+        let field_solve = &schemas["AntennaFieldSolveStageResource"];
+        assert!(field_solve["properties"]
+            .get("conservative_current_view_ref")
+            .is_some());
+        assert!(!field_solve["required"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|field| field == "conservative_current_view_ref"));
+        assert!(schemas["AntennaSpectrumRequestResource"]["properties"]["sampling_plane"]
+            .to_string()
+            .contains("AntennaSpectrumSamplingPlaneResource"));
+    }
+
+    #[test]
+    fn openapi_types_antenna_spectrum_payload_and_topology_errors() {
+        let document = openapi_json();
+        for path in [
+            "/v2/sessions/current/data/antenna/source-spectra/{output_id}",
+            "/v2/sessions/current/data/antenna/source-spectra/{output_id}/payloads/{payload_kind}",
+        ] {
+            let responses = &document["paths"][path]["get"]["responses"];
+            for status in ["404", "422"] {
+                assert_eq!(
+                    responses[status]["content"]["application/json"]["schema"]["$ref"],
+                    "#/components/schemas/ApiErrorResponse",
+                    "{path} status {status} must expose the typed error body"
+                );
+            }
+            assert!(responses["404"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("missing_payload"));
+            assert!(responses["422"]["description"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unsupported_topology"));
+        }
+    }
+
+    #[test]
     fn openapi_current_transport_preserves_conservative_current_view_payload() {
         let document = openapi_json();
         let property = &document["components"]["schemas"]["KnownSceneCurrentTransport"]
@@ -1017,6 +1528,14 @@ mod tests {
             serde_json::json!(true),
             "the scene boundary must accept every validated RT0/H(div) descriptor field"
         );
+    }
+
+    #[test]
+    fn openapi_current_transport_preserves_current_driven_source_payload() {
+        let document = openapi_json();
+        let property = &document["components"]["schemas"]["KnownSceneCurrentTransport"]
+            ["properties"]["conservative_current_source"];
+        assert_eq!(property["additionalProperties"], serde_json::json!(true));
     }
 
     #[test]

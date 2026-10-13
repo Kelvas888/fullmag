@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   MODEL_GEOMETRY_VALIDATION_PATH,
+  MODEL_READINESS_PATH,
   SIMULATION_COMMANDS_PATH,
   SIMULATION_SOLVER_STATUS_PATH,
   SIMULATION_STAGES_EXECUTION_PATH,
@@ -26,9 +27,15 @@ import {
 } from "./ExplorerTreeView";
 import { explorerStatusClassName } from "./explorerStatusClass";
 
-const explorerTreeViewSource = readFileSync(
+function readSource(path: string): string {
+  return readFileSync(path, "utf8").replace(/\r\n/g, "\n");
+}
+
+const explorerTreeViewSource = readSource(
   fileURLToPath(import.meta.resolve("./ExplorerTreeView.tsx")),
-  "utf8",
+);
+const explorerModuleSource = readSource(
+  fileURLToPath(import.meta.resolve("./ExplorerModule.tsx")),
 );
 
 describe("flattenVisibleExplorerRows", () => {
@@ -220,6 +227,12 @@ describe("flattenVisibleExplorerRows", () => {
       node,
       resourceData: {
         [MODEL_GEOMETRY_VALIDATION_PATH]: { diagnostics: [] },
+        [MODEL_READINESS_PATH]: {
+          blockers: [],
+          ready_to_export: true,
+          ready_to_run: true,
+          scene_revision: 1,
+        },
         [SESSION_STATUS_RESOURCE_KEY]: {
           capabilities: {
             binary_fields: true,
@@ -265,6 +278,9 @@ describe("flattenVisibleExplorerRows", () => {
     expect(explorerTreeViewSource).toContain("includeStageExecution: false");
     expect(explorerTreeViewSource).toContain(
       "resourceData={commandResourceData}",
+    );
+    expect(explorerTreeViewSource).toContain(
+      "[MODEL_SCENE_PATH]: sceneResourceData",
     );
   });
 
@@ -406,9 +422,35 @@ describe("flattenVisibleExplorerRows", () => {
 
   it("styles completed explorer rows with the success token", () => {
     const explorerCssUrl = new URL("../../design/styles/explorer.css", import.meta.url);
-    const css = readFileSync(fileURLToPath(explorerCssUrl), "utf8");
+    const css = readSource(fileURLToPath(explorerCssUrl));
     expect(css).toContain('.fm-explorer-tree-row[data-status="completed"]');
     expect(css).toContain("var(--fm-success)");
+  });
+
+  it("keeps result labels readable when the explorer is docked narrowly", () => {
+    const explorerCssUrl = new URL("../../design/styles/explorer.css", import.meta.url);
+    const css = readSource(fileURLToPath(explorerCssUrl));
+    expect(css).toContain("display: flex;\n  flex-direction: column;");
+    expect(css).toContain(".fm-explorer-tree {\n  flex: 1 1 auto;");
+    expect(css).toContain("container-name: fm-explorer-panel");
+    expect(css).toContain("@container fm-explorer-panel (max-width: 360px)");
+    expect(css).toContain("grid-template-columns: var(--fm-space-4) var(--fm-icon-sm) minmax(0, 1fr) auto auto auto");
+    expect(css).toContain("width: max-content;");
+    expect(css).toContain(".fm-explorer-tree-row__label {\n  min-width: 0;");
+    expect(css.indexOf("/* The explorer is frequently docked below 360px."))
+      .toBeGreaterThan(css.indexOf("/* Active field badge */"));
+    expect(explorerTreeViewSource).toContain('title={node.badge}');
+  });
+
+  it("keeps the narrow explorer toolbar usable without removing button names", () => {
+    const explorerCssUrl = new URL("../../design/styles/explorer.css", import.meta.url);
+    const css = readSource(fileURLToPath(explorerCssUrl));
+    expect(css).toContain("@container fm-explorer-panel (max-width: 360px)");
+    expect(css).toContain(".fm-explorer-toolbar__action > span");
+    expect(css).toContain("width: var(--fm-control-height-compact);");
+    expect(explorerModuleSource).toContain('aria-label="Expand all explorer nodes"');
+    expect(explorerModuleSource).toContain('aria-label="Collapse all explorer nodes"');
+    expect(explorerModuleSource).toContain('aria-label="Refresh explorer"');
   });
 
   it("renders active analysis fields as a separate explorer row state", () => {
@@ -423,7 +465,7 @@ describe("flattenVisibleExplorerRows", () => {
     );
 
     const explorerCssUrl = new URL("../../design/styles/explorer.css", import.meta.url);
-    const css = readFileSync(fileURLToPath(explorerCssUrl), "utf8");
+    const css = readSource(fileURLToPath(explorerCssUrl));
     expect(css).toContain(".fm-explorer-tree-row--active-analysis-field");
     expect(css).toContain(".fm-explorer-tree-row__active-field");
   });
@@ -438,7 +480,7 @@ describe("flattenVisibleExplorerRows", () => {
     expect(explorerStatusClassName("failed")).toBe("fm-explorer-node--failed");
 
     const explorerCssUrl = new URL("../../design/styles/explorer.css", import.meta.url);
-    const css = readFileSync(fileURLToPath(explorerCssUrl), "utf8");
+    const css = readSource(fileURLToPath(explorerCssUrl));
     expect(css).toContain(".fm-explorer-node--done");
     expect(css).toContain(".fm-explorer-node--active");
     expect(css).toContain(".fm-explorer-node--muted");

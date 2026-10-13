@@ -15,14 +15,18 @@ import {
   resolveRetainedViewport3DColorbarPlansForStore,
   resolveRetainedViewport3DScalarColorbarLegends,
   resolveViewport3DColorbarLegend,
+  resolveViewport3DVisualizationFrameAck,
+  resolveViewport3DVisualizationAckRegistration,
   resolveViewport3DMeshQualityLegend,
   resolveViewport3DVectorSegmentLengthRange,
   createViewport3DPointerHoldLifecycle,
+  resolveViewport3DVisualizationAckDataIdentity,
   resolveViewport3DScalarColorbarLegend,
   resolveViewport3DScalarColorbarLegends,
   shouldClearRetainedViewport3DScalarColorbarLegends,
   shouldRetainViewport3DScalarColorbarLegends,
 } from "./Viewport3DModule";
+import { createViewport3DRenderAdoptionRegistry } from "./model/viewport3DRenderAdoptionRegistry";
 import { planViewport3DColorbars } from "./model/viewport3DColorbarPlan";
 import type { VisualizationTargetSettings } from "@/kernel/visualization/ObjectVisualizationController";
 import { ObjectVisualizationController } from "@/kernel/visualization/ObjectVisualizationController";
@@ -54,6 +58,138 @@ describe("viewport vector segment diagnostics", () => {
         new Float32Array([0, 0, 0, 3, 4, 0, 1, 1, 1, 1, 1, 1, 3, 0.5]),
       ),
     ).toEqual({ max: 5, min: 2 });
+  });
+});
+
+describe("FEM visualization ACK data identity", () => {
+  it("keeps a data classification stable when the same revision effect reruns", () => {
+    const initial = resolveViewport3DVisualizationAckRegistration({
+      existing: null,
+      previousResourceFrameKey: "field:m:61",
+      resourceFrameKey: "field:frozen_spins:63",
+      resourceKey: "field:frozen_spins:63",
+    });
+    expect(initial).toEqual({
+      changeKind: "data",
+      resourceKey: "field:frozen_spins:63",
+    });
+
+    expect(resolveViewport3DVisualizationAckRegistration({
+      existing: initial,
+      previousResourceFrameKey: "field:frozen_spins:63",
+      resourceFrameKey: "field:frozen_spins:63",
+      resourceKey: "field:frozen_spins:part:63",
+    })).toBe(initial);
+  });
+
+  it("classifies an early frame as data only when an exact adopted buffer exists", () => {
+    const identity = {
+      fieldBufferId: "fem:frozen_spins:63",
+      fieldRevision: "63",
+      resourceKey: "field:frozen_spins:63",
+      sessionEpoch: "session-fem@1000",
+      sessionId: "session-fem",
+      visualizationRevision: 12,
+    };
+
+    expect(resolveViewport3DVisualizationFrameAck({
+      committedDataIdentity: identity,
+      registeredChangeKind: null,
+    })).toEqual({ changeKind: "data", dataIdentity: identity });
+    expect(resolveViewport3DVisualizationFrameAck({
+      committedDataIdentity: null,
+      registeredChangeKind: null,
+    })).toEqual({ changeKind: "style", dataIdentity: null });
+  });
+
+  it("uses the scalar buffer actually adopted by the FEM surface renderer", () => {
+    const registry = createViewport3DRenderAdoptionRegistry();
+    const sessionIdentity = {
+      sessionEpoch: "session-fem@1000",
+      sessionId: "session-fem",
+    };
+    registry.setSessionIdentity(sessionIdentity);
+    registry.retainDemand("object:frozen");
+    registry.recordSurfaceAdoption({
+      byteLength: 496,
+      carrierId: "part:frozen",
+      fieldBufferId: "fem:frozen_spins:63",
+      resourceKey: "field:frozen_spins:63",
+      scalarBufferKey: "scalar:frozen_spins:63",
+      sessionIdentity,
+      targetId: "object:frozen",
+    });
+
+    const identity = resolveViewport3DVisualizationAckDataIdentity({
+      adoptionRegistry: registry,
+      sessionIdentity: sessionIdentity as never,
+      source: {
+        fieldModel: {
+          targetPasses: new Map([
+            ["part:frozen", {
+              fieldBuffer: {
+                bufferId: "fem:frozen_spins:63",
+                fieldRevision: "63",
+              },
+            }],
+          ]),
+        },
+        fullFieldBufferIdentity: {
+          bufferId: "fem:frozen_spins:full:63",
+          fieldRevision: "63",
+          resourceKey: "field:frozen_spins:full:63",
+          sessionEpoch: "session-fem@1000",
+          sessionId: "session-fem",
+        },
+      } as never,
+      visualizationRevision: 12,
+    });
+
+    expect(identity).toEqual({
+      fieldBufferId: "fem:frozen_spins:63",
+      fieldRevision: "63",
+      resourceKey: "field:frozen_spins:63",
+      sessionEpoch: "session-fem@1000",
+      sessionId: "session-fem",
+      visualizationRevision: 12,
+    });
+  });
+
+  it("resolves the buffer active at frame commit instead of retaining a pre-switch buffer", () => {
+    const source = readFileSync(
+      "src/modules/viewport-3d/Viewport3DModule.tsx",
+      "utf8",
+    );
+    const callbackStart = source.indexOf(
+      "const onVisualizationFrameCommitted = useCallback",
+    );
+    const callback = source.slice(
+      callbackStart,
+      source.indexOf("useEffect(() => {", callbackStart),
+    );
+
+    expect(callback).toContain(
+      "committedDataIdentity: resolveViewport3DVisualizationAckDataIdentity({",
+    );
+    expect(callback).not.toContain("ackKind.dataIdentity");
+  });
+
+  it("forwards the request scope epoch with viewport acknowledgements", () => {
+    const source = readFileSync(
+      "src/modules/viewport-3d/Viewport3DModule.tsx",
+      "utf8",
+    );
+    const callbackStart = source.indexOf(
+      "const onVisualizationFrameCommitted = useCallback",
+    );
+    const callback = source.slice(
+      callbackStart,
+      source.indexOf("useEffect(() => {", callbackStart),
+    );
+
+    expect(callback).toContain(
+      "requestScopeEpoch: sessionIdentity?.requestScopeEpoch ?? null",
+    );
   });
 });
 
@@ -211,6 +347,34 @@ describe("resolveViewport3DMeshQualityLegend", () => {
     expect(callback).toContain("...airboxFrameState");
     expect(callback).not.toContain("dataset");
     expect(callback).not.toContain("closest<HTMLElement>");
+  });
+
+  it("replays FDM render adoption through the carrier id used by each target layer", () => {
+    const source = readFileSync(
+      "src/modules/viewport-3d/Viewport3DModule.tsx",
+      "utf8",
+    );
+    const mappingStart = source.indexOf(
+      "const visualizationDebugCarrierTargets = useMemo",
+    );
+    const mappingSource = source.slice(
+      mappingStart,
+      source.indexOf("useViewport3DVisualizationDebugPublisher", mappingStart),
+    );
+
+    expect(mappingSource).toContain("appendTarget(target.id, target.id)");
+    expect(mappingSource).not.toContain('appendTarget("fdm-domain", target.id)');
+  });
+
+  it("passes session provenance explicitly to the WebGL scene after frame prop destructuring", () => {
+    const source = readFileSync(
+      "src/modules/viewport-3d/Viewport3DModule.tsx",
+      "utf8",
+    );
+    const sceneStart = source.indexOf("<Viewport3DScene", source.indexOf("const Viewport3DFrame"));
+    const sceneSource = source.slice(sceneStart, source.indexOf("/>", sceneStart));
+
+    expect(sceneSource).toContain("sessionIdentity={sessionIdentity}");
   });
 
   it("preserves mesh-part boundary face identity in viewport selection refs", () => {
@@ -1191,7 +1355,7 @@ describe("resolveViewport3DColorbarLegend", () => {
     const source = readFileSync(
       new URL("./Viewport3DModule.tsx", import.meta.url),
       "utf8",
-    );
+    ).replace(/\r\n/g, "\n");
     const targetViewsStart = source.indexOf(
       "...sceneProps.fdmTargetViews.map((view) => ({",
     );
@@ -1721,7 +1885,7 @@ describe("Viewport3DModule scene wiring", () => {
     const source = readFileSync(
       new URL("./Viewport3DModule.tsx", import.meta.url),
       "utf8",
-    );
+    ).replace(/\r\n/g, "\n");
 
     expect(source).toContain(
       'data-fdm-airbox-target={airboxRenderView?.target.id ?? "airbox"}',
@@ -1856,9 +2020,10 @@ describe("Viewport3DModule scene wiring", () => {
     expect(source).toContain("VIEWPORT_3D_CANVAS_GL_NO_ANTIALIAS");
     expect(source).toContain("VIEWPORT_3D_CANVAS_GL_ANTIALIAS");
     expect(source).toContain("VIEWPORT_3D_CANVAS_GL_CAPTURE");
+    expect(source).toContain("VIEWPORT_3D_CANVAS_GL_CAPTURE_NO_ANTIALIAS");
     expect(source).toContain("resolveStableViewport3DCanvasGlOptions");
-    expect(source).toContain(
-      "const canvasGlOptions = resolveStableViewport3DCanvasGlOptions(visualProfile);",
+    expect(source.replace(/\r\n/g, "\n")).toContain(
+      "const canvasGlOptions = resolveStableViewport3DCanvasGlOptions(\n    visualProfile,\n    effectAntialias,\n  );",
     );
     expect(source).toContain("const handleCanvasCreated = useCallback");
     expect(source).toContain("const handleCanvasContextMenu = useCallback");
@@ -1889,8 +2054,14 @@ describe("Viewport3DModule scene wiring", () => {
     );
 
     expect(source).toContain("const beginCameraInteraction = useCallback");
-    expect(source).toContain("beginViewport3DFieldUpdateHold();");
-    expect(source).toContain("endViewport3DFieldUpdateHold();");
+    expect(source).toContain(
+      "const cameraFieldUpdateHold = useMemo(() => createViewport3DInteractionFieldHold(), []);",
+    );
+    expect(source).toContain("cameraFieldUpdateHold.begin(epoch);");
+    expect(source).toContain("cameraFieldUpdateHold.end(epoch);");
+    expect(source).toContain("kernel.cameraRegistry.beginInteraction(epoch);");
+    expect(source).toContain("kernel.cameraRegistry.endInteraction(epoch);");
+    expect(source).toContain("cameraFieldUpdateHold.begin(epoch);");
     expect(source).not.toContain("onPointerDownCapture={holdFieldUpdatesForPointerGesture}");
     expect(source).not.toContain("onPointerUpCapture={releaseFieldUpdatePointerHold}");
   });
@@ -1934,7 +2105,7 @@ describe("Viewport3DModule scene wiring", () => {
     const source = readFileSync(
       new URL("./Viewport3DModule.tsx", import.meta.url),
       "utf8",
-    );
+    ).replace(/\r\n/g, "\n");
 
     expect(source).toContain("viewport3DOrbitDebugEnabledFromBrowserConfig()");
     expect(source).toContain("const orbitDebugEnabled =");
@@ -1979,7 +2150,7 @@ describe("Viewport3DModule scene wiring", () => {
     const source = readFileSync(
       new URL("./Viewport3DModule.tsx", import.meta.url),
       "utf8",
-    );
+    ).replace(/\r\n/g, "\n");
 
     expect(source).toContain('aria-label="Airbox overlay"');
     expect(source).toMatch(/\n\s+Airbox\n/);

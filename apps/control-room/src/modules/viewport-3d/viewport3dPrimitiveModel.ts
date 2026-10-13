@@ -2,11 +2,21 @@ import type {
   MeshSharedDomainManifestResource,
   SceneResource,
 } from "@/kernel/api/apiTypes";
+import type { GeometryObjectDraft } from "@/kernel/authoring/object-edit/objectEditTypes";
+import {
+  geometryDraftLengthValuesEqual,
+} from "@/kernel/authoring/object-edit/objectEditDraftModel";
+import { parseDraftQuantityField } from "@/kernel/authoring/object-edit/quantityDraftFields";
 import {
   isVisualizationAirboxIdentity,
   type Selection,
 } from "@/kernel/selection/selectionTypes";
 import { resolveSceneRevision } from "@/kernel/visualization/visualizationDisplayResolution";
+import {
+  buildAuthoredMicrostripGeometry,
+  buildAuthoredCpwGeometry,
+  type AuthoredAntennaGeometry,
+} from "@/shared/domain/geometry/authoredMicrostripGeometry";
 
 import { magnetizationHslRgb } from "./orientation/magnetizationColor";
 import type { Viewport3DBounds } from "./viewport3dRenderModel";
@@ -16,6 +26,8 @@ type Viewport3DPrimitiveKind =
   | "box-cylinder-difference"
   | "cylinder"
   | "sphere"
+  | "microstrip"
+  | "cpw"
   | "unsupported";
 type Viewport3DPrimitiveMeshState =
   | "primitive-only"
@@ -32,8 +44,11 @@ export interface Viewport3DPrimitiveObject {
   label: string;
   magnetizationTexturePreview: Viewport3DMagnetizationTexturePreview | null;
   meshState: Viewport3DPrimitiveMeshState;
+  antennaPreview?: AuthoredAntennaGeometry;
   objectId: string;
+  role?: string | null;
   sceneRevision: number;
+  translation?: [number, number, number];
 }
 
 export interface Viewport3DBoxCylinderDifferencePreview {
@@ -59,6 +74,8 @@ export interface Viewport3DMagnetizationTexturePreview {
 }
 
 export interface Viewport3DPrimitiveRenderModel {
+  diagnostics?: Array<{ objectId: string; message: string }>;
+  draftOverlay?: Viewport3DPrimitiveObject | null;
   objects: Viewport3DPrimitiveObject[];
   sceneRevision: number | null;
 }
@@ -199,6 +216,29 @@ function boundsFromMinMax(
   };
 }
 
+function boundsSizeFromParams(
+  geometry: JsonRecord,
+  params: JsonRecord | null,
+): [number, number, number] | null {
+  const kind = lowerGeometryKind(geometry.geometry_kind ?? geometry.kind);
+  const radius = asNumber(params?.radius);
+  const height = asNumber(params?.height);
+  if (kind === "cylinder" && radius !== null && height !== null) {
+    const diameter = Math.max(radius * 2, 1e-12);
+    return [diameter, diameter, Math.max(height, 1e-12)];
+  }
+  if (kind === "sphere" && radius !== null) {
+    const diameter = Math.max(radius * 2, 1e-12);
+    return [diameter, diameter, diameter];
+  }
+  return (
+    asVec3(params?.size) ??
+    asVec3(params?.dimensions) ??
+    radiusSize(params?.radius) ??
+    null
+  );
+}
+
 function boundsFromGeometry(
   geometry: JsonRecord,
   transform: JsonRecord | null,
@@ -211,9 +251,7 @@ function boundsFromGeometry(
   const csgPreview = csgPreviewFromGeometry(geometry);
   const size =
     csgPreview?.boxSize ??
-    asVec3(params?.size) ??
-    asVec3(params?.dimensions) ??
-    radiusSize(params?.radius) ??
+    boundsSizeFromParams(geometry, params) ??
     [1, 1, 1];
   const translation = asVec3(transform?.translation) ?? [0, 0, 0];
   const half: [number, number, number] = [
@@ -285,7 +323,10 @@ function objectMeshState(
   if (tags.includes("mesh:dirty") || tags.includes("mesh:building")) {
     return "mesh-stale";
   }
-  if (objectHasCsgPreview(object) && manifestSceneRevision(manifest) !== sceneRevision) {
+  const geometry = asRecord(object?.geometry);
+  const requiresCurrentScene = objectHasCsgPreview(object) ||
+    geometry?.geometry_kind === "MicrostripAntennaLayout" || geometry?.geometry_kind === "CPWAntennaLayout";
+  if (requiresCurrentScene && manifestSceneRevision(manifest) !== sceneRevision) {
     return "mesh-stale";
   }
 
@@ -463,6 +504,7 @@ export function buildViewport3DPrimitiveRenderModel(
     return { objects: [], sceneRevision };
   }
 
+  const diagnostics: NonNullable<Viewport3DPrimitiveRenderModel["diagnostics"]> = [];
   const objects = sceneRecord.objects.flatMap((value): Viewport3DPrimitiveObject[] => {
     const object = asRecord(value);
     const objectId = asString(object?.id);
@@ -480,40 +522,139 @@ export function buildViewport3DPrimitiveRenderModel(
     const state = objectMeshState(objectId, sceneRevision, manifest, object);
     const transform = asRecord(object.transform);
     const csgPreview = csgPreviewFromGeometry(geometry);
+    let antennaPreview: AuthoredAntennaGeometry | undefined;
+    if (geometry.geometry_kind === "MicrostripAntennaLayout" || geometry.geometry_kind === "CPWAntennaLayout") {
+      try {
+        antennaPreview = geometry.geometry_kind === "CPWAntennaLayout"
+          ? buildAuthoredCpwGeometry(geometry.geometry_params, object.transform)
+          : buildAuthoredMicrostripGeometry(geometry.geometry_params, object.transform);
+      } catch (error) {
+        diagnostics.push({ objectId, message: error instanceof Error ? error.message : String(error) });
+        return [];
+      }
+    }
     return [
       {
-        bounds: boundsFromGeometry(geometry, transform),
+        bounds: antennaPreview
+          ? boundsFromMinMax(antennaPreview.boundsMin, antennaPreview.boundsMax)
+          : boundsFromGeometry(geometry, transform),
         csgPreview,
         fallbackLabel: fallbackLabel(state),
         geometryKey: geometryKey(objectId, geometry, transform),
-        kind: primitiveKindFromGeometry(geometry),
+        kind: antennaPreview ? geometry.geometry_kind === "CPWAntennaLayout" ? "cpw" : "microstrip" : primitiveKindFromGeometry(geometry),
         label: asString(object.name) ?? objectId,
         magnetizationTexturePreview: magnetizationTexturePreview(
           sceneRecord,
           object,
         ),
         meshState: state,
+        antennaPreview,
         objectId,
+        role: objectRole,
         sceneRevision,
+        translation: asVec3(transform?.translation) ?? [0, 0, 0],
       },
     ];
   });
 
   return {
+    diagnostics,
     objects,
     sceneRevision,
+  };
+}
+
+export function withObjectPlacementDraftPreview(
+  model: Viewport3DPrimitiveRenderModel | null | undefined,
+  draft: GeometryObjectDraft | null,
+  selectedObjectId: string | null,
+): Viewport3DPrimitiveRenderModel | null | undefined {
+  if (
+    !model ||
+    !draft ||
+    draft.mode !== "committed" ||
+    draft.objectId !== selectedObjectId
+  ) {
+    return model;
+  }
+
+  const object = model.objects.find((candidate) => candidate.objectId === draft.objectId);
+  if (!object) return model;
+  const translationFields = [
+    "translation.0",
+    "translation.1",
+    "translation.2",
+  ] as const;
+  const parsedTranslation = translationFields.map((field) =>
+    parseDraftQuantityField(draft, field),
+  );
+  const translation: [number | null, number | null, number | null] = [
+    parsedTranslation[0]?.parseStatus === "valid"
+      ? parsedTranslation[0].parsedSI
+      : parsedTranslation[0]?.lastValidSI ?? null,
+    parsedTranslation[1]?.parseStatus === "valid"
+      ? parsedTranslation[1].parsedSI
+      : parsedTranslation[1]?.lastValidSI ?? null,
+    parsedTranslation[2]?.parseStatus === "valid"
+      ? parsedTranslation[2].parsedSI
+      : parsedTranslation[2]?.lastValidSI ?? null,
+  ];
+  const [translationX, translationY, translationZ] = translation;
+  if (translationX === null || translationY === null || translationZ === null) {
+    return model;
+  }
+  const translatedValues: [number, number, number] = [
+    translationX,
+    translationY,
+    translationZ,
+  ];
+  const currentTranslation = object.translation ?? [0, 0, 0];
+  const characteristicLength = Math.max(
+    ...object.bounds.size.map((value) => Math.abs(value)),
+    0,
+  );
+  if (translatedValues.every((value, index) =>
+    geometryDraftLengthValuesEqual(
+      value,
+      currentTranslation[index],
+      characteristicLength,
+    ),
+  )) {
+    return model;
+  }
+
+  const delta = translatedValues.map((value, index) => value - currentTranslation[index]);
+  const preview: Viewport3DPrimitiveObject = {
+    ...object,
+    bounds: {
+      ...object.bounds,
+      center: object.bounds.center.map(
+        (value, index) => value + delta[index],
+      ) as [number, number, number],
+    },
+    geometryKey: `${object.geometryKey}|placement-draft:${translatedValues.join(",")}`,
+    translation: translatedValues,
+  };
+
+  return {
+    ...model,
+    draftOverlay: preview,
+    objects: model.objects.map((candidate) =>
+      candidate.objectId === draft.objectId ? preview : candidate,
+    ),
   };
 }
 
 export function buildViewport3DPrimitiveFrameKey(
   primitiveModel: Viewport3DPrimitiveRenderModel | null | undefined,
 ): string {
-  if (!primitiveModel?.objects.length) {
+  if (!primitiveModel?.objects.length && !primitiveModel?.draftOverlay) {
     return `${primitiveModel?.sceneRevision ?? "none"}:empty`;
   }
   return [
     primitiveModel.sceneRevision ?? "none",
     ...primitiveModel.objects.map((object) => object.geometryKey),
+    primitiveModel.draftOverlay?.geometryKey ?? "no-draft",
   ].join("|");
 }
 

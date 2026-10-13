@@ -14,8 +14,11 @@ import { RealtimeConnectionController } from "../realtime/RealtimeConnectionCont
 import { RealtimeInvalidationBridge } from "../realtime/RealtimeInvalidationBridge";
 import { ResourceInvalidationController } from "../resources/ResourceInvalidationController";
 import { SelectionController } from "../selection/SelectionController";
+import { ObjectMoveToolController } from "../authoring/ObjectMoveToolController";
+import { ObjectEditSessionController } from "../authoring/object-edit/ObjectEditSessionController";
 import type { KernelApi, ModuleManifest } from "../types";
 import { AnalysisFieldOverlayController } from "../visualization/AnalysisFieldOverlayController";
+import { ModeCompositionController } from "../visualization/ModeCompositionController";
 import { ChartViewportHandoffController } from "@/kernel/visualization/ChartViewportHandoffController";
 import { CameraRegistryController } from "../visualization/CameraRegistryController";
 import { ObjectVisualizationController } from "../visualization/ObjectVisualizationController";
@@ -60,6 +63,14 @@ function makeKernel(): KernelApi {
     }),
     layout: new LayoutController(bus),
     modules: new ModuleRegistry(),
+    objectEditSession: new ObjectEditSessionController(),
+    objectMoveTool: new ObjectMoveToolController(),
+    modeComposition: new ModeCompositionController({
+      getActiveModeComposition: (options) =>
+        api.visualization.modeComposition.active(options),
+      patchActiveModeComposition: (patch, options) =>
+        api.visualization.modeComposition.patch(patch, options),
+    }),
     realtime: new RealtimeInvalidationBridge(resources),
     realtimeConnection: new RealtimeConnectionController(),
     resources,
@@ -100,6 +111,26 @@ describe("ViewportTabHost", () => {
       expect(html).toContain("Plots");
       expect(html.match(/Loading/g)).toHaveLength(1);
     }
+  });
+
+  it("mounts the companion surface once beside the active one", () => {
+    const kernel = makeKernel();
+    kernel.modules.register(makeManifest("viewport-3d-test", "3D"));
+    kernel.modules.register(makeManifest("analysis-plots-test", "Plots"));
+    kernel.layout.setActiveViewportMainModule("analysis-plots-test");
+    kernel.layout.setViewportCompanion({ moduleId: "viewport-3d-test", placement: "beside" });
+
+    const html = renderToStaticMarkup(
+      <KernelContext.Provider value={kernel}>
+        <ViewportTabHost />
+      </KernelContext.Provider>,
+    );
+
+    expect(html).toContain('data-active-module-id="analysis-plots-test"');
+    expect(html).toContain('data-companion-module-id="viewport-3d-test"');
+    // Panel contents are client-rendered by react-resizable-panels; the split host is asserted here.
+    expect(html).toContain('data-companion="true"');
+    expect(html).toContain('aria-label="Close 3D split view"');
   });
 
   it("falls back to the first registered center surface when persisted active id is stale", () => {

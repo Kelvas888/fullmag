@@ -25,12 +25,21 @@ struct FemGpuMeshRegionDeviceState {
     uint64_t stt_active_element_count = 0;
     // Optional canonical Frozen Spins constraint mask and reference.
     uint8_t *frozen_mask = nullptr;
+    // Magnetic nodes eligible for minimizer updates: magnetic && !frozen.
+    // This is uploaded once during bootstrap so relaxation reductions remain
+    // device-resident and never mistake constrained nodes for free DOFs.
+    uint8_t *free_node_mask = nullptr;
+    uint64_t free_node_mask_count = 0;
     double *frozen_reference_x = nullptr;
     double *frozen_reference_y = nullptr;
     double *frozen_reference_z = nullptr;
     uint64_t frozen_node_count = 0;
     uint32_t *periodic_reduced_node = nullptr;
+    // Node-indexed representative map retained for projection kernels.
     uint32_t *periodic_representative_nodes = nullptr;
+    // Reduced-row-indexed representative list used by reduced CSR operators.
+    uint32_t *periodic_reduced_representative_nodes = nullptr;
+    uint64_t periodic_reduced_node_count = 0;
 };
 
 } // namespace fullmag::fem

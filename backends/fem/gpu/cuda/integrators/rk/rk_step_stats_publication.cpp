@@ -55,7 +55,8 @@ void gpu_rk_publish_final_step_stats(
     const double cubic_anisotropy_energy =
         ctx.anisotropy.cubic_enabled ? scalar(GpuFinalScalarSlot::CubicAnisotropyEnergy) : 0.0;
     const double dmi_energy =
-        ctx.dmi.interfacial_enabled ? scalar(GpuFinalScalarSlot::DmiEnergy) : 0.0;
+        (ctx.dmi.interfacial_enabled || ctx.dmi.rotated_interfacial_enabled)
+            ? scalar(GpuFinalScalarSlot::DmiEnergy) : 0.0;
     const double bulk_dmi_energy =
         ctx.dmi.bulk_enabled ? scalar(GpuFinalScalarSlot::BulkDmiEnergy) : 0.0;
     const double magnetoelastic_energy =
@@ -95,7 +96,8 @@ void gpu_rk_publish_final_step_stats(
     if (ctx.demag.enabled) {
         fill_demag_solver_stats(ctx, stats);
 #if FULLMAG_HAS_MFEM_STACK
-        if (ctx.poisson_demag.gpu_demag_mode == FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_POISSON &&
+        if ((ctx.poisson_demag.gpu_demag_mode == FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_POISSON ||
+             ctx.poisson_demag.gpu_demag_mode == FULLMAG_FEM_GPU_DEMAG_DEVICE_HYPRE_FEM_BEM) &&
             ctx.poisson_demag.solves_current_step > 0) {
             DemagPoissonPhaseTimings demag_timings{};
             demag_timings.assemble_wall_time_ns = ctx.poisson_demag.step_assemble_wall_time_ns;
@@ -131,6 +133,10 @@ void gpu_rk_publish_final_step_stats(
     stats.rk_transaction_restore_bytes = saturating_add(
         host_transaction.step_transaction_host_restore_payload_bytes,
         device_transaction.restore_bytes);
+    stats.rk_transaction_cpu_snapshot_allocation_count =
+        host_transaction.step_transaction_cpu_snapshot_allocation_count;
+    stats.rk_transaction_peak_rss_bytes =
+        host_transaction.step_transaction_peak_rss_bytes;
     stats.requested_omp_threads = ctx.cpu_threads.requested_omp_threads;
     stats.effective_omp_threads = ctx.cpu_threads.effective_omp_threads;
     stats.cpu_thread_cap_reason = ctx.cpu_threads.cap_reason;

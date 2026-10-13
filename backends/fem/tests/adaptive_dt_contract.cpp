@@ -24,6 +24,7 @@ double compute_adaptive_error_norm(
     const std::vector<double> &m_old,
     const std::vector<double> &m_new,
     const std::vector<uint8_t> &magnetic_node_mask,
+    const std::vector<uint8_t> &frozen_node_mask,
     double atol,
     double rtol);
 } // namespace fullmag::fem
@@ -149,6 +150,14 @@ void rejected_error_at_dt_min_is_typed_exhaustion() {
     check(decision.kind == AdaptiveDecisionKind::failed, "dt_min exhaustion is terminal, not retry");
     check(decision.reason == AdaptiveDecisionReason::dt_min_exhausted, "typed dt_min_exhausted reason");
     check_near(decision.dt_next, 1.0e-16, 0.0, "dt_min exhaustion retains bounded timestep");
+
+    const auto rounded_above = std::nextafter(input.dt_attempt, std::numeric_limits<double>::infinity());
+    const auto rounded_decision = decide_adaptive_step(
+        canonical_policy(4), {rounded_above, input.error_current, input.error_previous, true});
+    check(rounded_decision.kind == AdaptiveDecisionKind::failed,
+          "one-ULP-above-dt_min rejection must remain terminal");
+    check(rounded_decision.reason == AdaptiveDecisionReason::dt_min_exhausted,
+          "one-ULP-above-dt_min rejection must retain typed exhaustion");
 }
 
 void invalid_scalar_inputs_fail_closed() {
@@ -188,10 +197,11 @@ void invalid_scalar_inputs_fail_closed() {
     }
 }
 
-fullmag::fem::Context make_context();
+void configure_context(fullmag::fem::Context &ctx);
 
 void invalid_runtime_decision_does_not_mutate_controller_state() {
-    auto ctx = make_context();
+    fullmag::fem::Context ctx;
+    configure_context(ctx);
     ctx.adaptive_dt.prev_error_norm = 0.25;
     ctx.adaptive_dt.has_prev_error_norm = true;
     ctx.adaptive_dt.rejected_steps = 7;
@@ -211,7 +221,8 @@ void inactive_nonfinite_previous_error_fails_without_mutation() {
              std::numeric_limits<double>::quiet_NaN(),
              std::numeric_limits<double>::infinity(),
          }) {
-        auto ctx = make_context();
+        fullmag::fem::Context ctx;
+        configure_context(ctx);
         ctx.adaptive_dt.prev_error_norm = previous;
         ctx.adaptive_dt.has_prev_error_norm = false;
         ctx.adaptive_dt.rejected_steps = 9;
@@ -378,6 +389,9 @@ void adaptive_dt_controller_is_owned_by_integrator_module() {
         adaptive.find("double compute_adaptive_error_norm(") != std::string::npos,
         "adaptive RK error norm must be defined in adaptive_dt.cpp");
     check(
+        adaptive.find("double compute_adaptive_error_norm_mass_weighted(") != std::string::npos,
+        "FEM adaptive RK weighted error norm must be defined in adaptive_dt.cpp");
+    check(
         context.find("adaptive_config.atol must be finite") == std::string::npos,
         "Context must not own adaptive config validation");
     check(
@@ -433,8 +447,7 @@ void adaptive_dt_controller_is_owned_by_integrator_module() {
     }
 }
 
-fullmag::fem::Context make_context() {
-    fullmag::fem::Context ctx;
+void configure_context(fullmag::fem::Context &ctx) {
     ctx.adaptive_dt.enabled = true;
     ctx.base_plan.dt_seconds = 1.0e-12;
     ctx.adaptive_dt.dt_min = 1.0e-15;
@@ -443,11 +456,11 @@ fullmag::fem::Context make_context() {
     ctx.adaptive_dt.dt_grow_max = 3.0;
     ctx.adaptive_dt.dt_shrink_min = 0.2;
     ctx.adaptive_dt.prev_error_norm = 1.0;
-    return ctx;
 }
 
 void disabled_or_nonpositive_error_keeps_current_dt() {
-    auto ctx = make_context();
+    fullmag::fem::Context ctx;
+    configure_context(ctx);
     ctx.adaptive_dt.enabled = false;
     const auto disabled = fullmag::fem::adaptive_pi_step(ctx, 1.0e-12, 0.5, 4);
     check(disabled.kind == fullmag::fem::adaptive::AdaptiveDecisionKind::accepted, "disabled adaptive step is accepted");
@@ -464,7 +477,8 @@ void disabled_or_nonpositive_error_keeps_current_dt() {
 }
 
 void accepted_error_grows_dt_and_updates_previous_error() {
-    auto ctx = make_context();
+    fullmag::fem::Context ctx;
+    configure_context(ctx);
     ctx.adaptive_dt.safety_factor = 0.9;
     ctx.adaptive_dt.prev_error_norm = 0.5;
     ctx.adaptive_dt.has_prev_error_norm = true;
@@ -477,7 +491,8 @@ void accepted_error_grows_dt_and_updates_previous_error() {
 }
 
 void runtime_adapter_uses_attempted_dt_not_stale_plan_dt() {
-    auto ctx = make_context();
+    fullmag::fem::Context ctx;
+    configure_context(ctx);
     ctx.base_plan.dt_seconds = 9.0e-12;
     ctx.adaptive_dt.prev_error_norm = 0.5;
     ctx.adaptive_dt.has_prev_error_norm = true;
@@ -490,7 +505,8 @@ void runtime_adapter_uses_attempted_dt_not_stale_plan_dt() {
 }
 
 void rejected_error_shrinks_dt_and_counts_rejection() {
-    auto ctx = make_context();
+    fullmag::fem::Context ctx;
+    configure_context(ctx);
     ctx.adaptive_dt.prev_error_norm = 0.75;
     ctx.adaptive_dt.safety_factor = 0.9;
     const auto result = fullmag::fem::adaptive_pi_step(ctx, 1.0e-12, 4.0, 4);
@@ -524,6 +540,7 @@ void adaptive_error_norm_uses_nodewise_vector_l2_scale() {
         m_old,
         m_new,
         {1u},
+        {},
         0.01,
         0.1);
 
@@ -532,6 +549,117 @@ void adaptive_error_norm_uses_nodewise_vector_l2_scale() {
         0.5 / 0.41,
         1e-15,
         "adaptive error norm scales by max old/high-order vector norm");
+}
+
+void adaptive_mass_weighted_error_norm_uses_fem_measure() {
+    const std::vector<double> err{
+        1.0, 0.0, 0.0,
+        3.0, 0.0, 0.0,
+    };
+    const std::vector<double> m_old{
+        1.0, 0.0, 0.0,
+        1.0, 0.0, 0.0,
+    };
+    const std::vector<double> m_new = m_old;
+    fullmag::fem::AdaptiveErrorNormMetrics metrics{};
+    const double weighted = fullmag::fem::compute_adaptive_error_norm_mass_weighted(
+        err,
+        m_old,
+        m_new,
+        {3.0, 1.0},
+        {1u, 1u},
+        {},
+        0.0,
+        1.0,
+        &metrics);
+
+    check_near(
+        weighted,
+        std::sqrt(3.0),
+        1e-15,
+        "adaptive error norm uses mass-weighted RMS over active nodes");
+    check(
+        weighted < 3.0,
+        "mass-weighted RMS must not silently reduce to the nodewise maximum");
+    check(metrics.active_node_count == 2u, "weighted RMS receipt counts active nodes");
+    check_near(metrics.active_measure, 4.0, 0.0, "weighted RMS receipt reports active measure");
+    check_near(
+        metrics.normalization_denominator,
+        metrics.active_measure,
+        0.0,
+        "weighted RMS receipt reports its normalization denominator");
+    check_near(metrics.max_scaled_error, 3.0, 0.0, "weighted RMS receipt reports max scaled error");
+    check_near(metrics.weighted_rms_error, weighted, 0.0, "weighted RMS receipt reports RMS");
+}
+
+void adaptive_mass_weighted_error_norm_excludes_airbox_and_frozen_nodes() {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<double> err{
+        nan, nan, nan,
+        0.5, 0.0, 0.0,
+        nan, nan, nan,
+    };
+    const std::vector<double> m_old{
+        nan, nan, nan,
+        1.0, 0.0, 0.0,
+        nan, nan, nan,
+    };
+    const std::vector<double> m_new = m_old;
+    const double weighted = fullmag::fem::compute_adaptive_error_norm_mass_weighted(
+        err,
+        m_old,
+        m_new,
+        {nan, 2.0, nan},
+        {0u, 1u, 1u},
+        {0u, 0u, 1u},
+        0.0,
+        1.0);
+
+    check_near(
+        weighted,
+        0.5,
+        1e-15,
+        "mass-weighted RMS excludes Airbox and frozen nodes before reading data");
+}
+
+void adaptive_mass_weighted_error_norm_fails_closed_on_invalid_measure() {
+    const std::vector<double> one_node{1.0, 0.0, 0.0};
+    const std::vector<uint8_t> active{1u};
+    const double inf = std::numeric_limits<double>::infinity();
+
+    check(
+        !std::isfinite(fullmag::fem::compute_adaptive_error_norm_mass_weighted(
+            one_node,
+            one_node,
+            one_node,
+            {},
+            active,
+            {},
+            0.0,
+            1.0)),
+        "mass-weighted RMS rejects missing measure");
+    check(
+        !std::isfinite(fullmag::fem::compute_adaptive_error_norm_mass_weighted(
+            one_node,
+            one_node,
+            one_node,
+            {-1.0},
+            active,
+            {},
+            0.0,
+            1.0)),
+        "mass-weighted RMS rejects negative active measure");
+    check(
+        !std::isfinite(fullmag::fem::compute_adaptive_error_norm_mass_weighted(
+            one_node,
+            one_node,
+            one_node,
+            {inf},
+            active,
+            {},
+            0.0,
+            1.0)),
+        "mass-weighted RMS rejects nonfinite active measure");
 }
 
 void adaptive_relative_only_error_ignores_inactive_airbox_nodes() {
@@ -547,9 +675,96 @@ void adaptive_relative_only_error_ignores_inactive_airbox_nodes() {
     const std::vector<uint8_t> mask{0u, 1u};
 
     const double norm = fullmag::fem::compute_adaptive_error_norm(
-        err, m_old, m_new, mask, 0.0, 1.0e-6);
+        err, m_old, m_new, mask, {}, 0.0, 1.0e-6);
 
     check_near(norm, 0.1, 1.0e-15, "relative-only error ignores inactive airbox node");
+}
+
+void adaptive_norms_exclude_frozen_nodes() {
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    const std::vector<double> err{
+        0.1, 0.0, 0.0,
+        nan, nan, nan,
+    };
+    const std::vector<double> m_old{
+        1.0, 0.0, 0.0,
+        nan, nan, nan,
+    };
+    const std::vector<double> m_new = m_old;
+    const std::vector<uint8_t> magnetic_mask{1u, 1u};
+    const std::vector<uint8_t> frozen_mask{0u, 1u};
+
+    const double norm = fullmag::fem::compute_adaptive_error_norm(
+        err,
+        m_old,
+        m_new,
+        magnetic_mask,
+        frozen_mask,
+        0.0,
+        1.0);
+    check_near(norm, 0.1, 1.0e-15, "adaptive error norm excludes frozen node");
+
+    fullmag::fem::AdaptiveDtRuntimeState policy{};
+    policy.has_norm_tolerance = true;
+    policy.norm_tolerance = 0.01;
+    policy.has_max_spin_rotation = true;
+    policy.max_spin_rotation = 0.1;
+    const std::vector<double> candidate{
+        1.0, 0.0, 0.0,
+        nan, nan, nan,
+    };
+    fullmag::fem::AdaptiveAttemptGuardMetrics metrics{};
+    double acceptance_metric = 0.0;
+    std::string error;
+    check(
+        fullmag::fem::compute_adaptive_attempt_guard_metric(
+            policy,
+            0.25,
+            m_old,
+            candidate,
+            magnetic_mask,
+            frozen_mask,
+            acceptance_metric,
+            metrics,
+            error),
+        "adaptive geometry guards exclude frozen node");
+    check_near(metrics.max_norm_defect, 0.0, 0.0, "frozen node does not affect norm defect");
+    check_near(metrics.max_spin_rotation, 0.0, 0.0, "frozen node does not affect spin rotation");
+    check_near(acceptance_metric, 0.25, 0.0, "frozen node does not affect acceptance metric");
+}
+
+void adaptive_norms_fail_closed_on_frozen_mask_mismatch() {
+    const std::vector<double> one_node{1.0, 0.0, 0.0};
+    const std::vector<uint8_t> magnetic_mask{1u};
+    const std::vector<uint8_t> malformed_frozen_mask{0u, 1u};
+    const double norm = fullmag::fem::compute_adaptive_error_norm(
+        one_node,
+        one_node,
+        one_node,
+        magnetic_mask,
+        malformed_frozen_mask,
+        0.0,
+        1.0);
+    check(!std::isfinite(norm), "adaptive error norm rejects frozen mask extent mismatch");
+
+    fullmag::fem::AdaptiveAttemptGuardMetrics metrics{};
+    double acceptance_metric = 0.0;
+    std::string error;
+    check(
+        !fullmag::fem::compute_adaptive_attempt_guard_metric(
+            fullmag::fem::AdaptiveDtRuntimeState{},
+            0.25,
+            one_node,
+            one_node,
+            magnetic_mask,
+            malformed_frozen_mask,
+            acceptance_metric,
+            metrics,
+            error),
+        "adaptive geometry guards reject frozen mask extent mismatch");
+    check(
+        error.find("frozen-node mask size mismatch") != std::string::npos,
+        "frozen mask extent mismatch reports a typed reason");
 }
 
 void adaptive_attempt_guards_measure_pre_normalization_geometry() {
@@ -568,6 +783,7 @@ void adaptive_attempt_guards_measure_pre_normalization_geometry() {
         1.0, 0.0, 0.0,
     };
     const std::vector<uint8_t> mask{1u, 1u};
+    const std::vector<uint8_t> frozen_mask{0u, 0u};
     fullmag::fem::AdaptiveAttemptGuardMetrics metrics{};
     double acceptance_metric = 0.0;
     std::string error;
@@ -579,6 +795,7 @@ void adaptive_attempt_guards_measure_pre_normalization_geometry() {
             old_m,
             candidate,
             mask,
+            frozen_mask,
             acceptance_metric,
             metrics,
             error),
@@ -601,6 +818,7 @@ void adaptive_attempt_guards_fail_closed_on_invalid_active_vectors() {
     policy.enabled = true;
     const std::vector<double> old_m{1.0, 0.0, 0.0};
     const std::vector<uint8_t> mask{1u};
+    const std::vector<uint8_t> frozen_mask{0u};
     for (double invalid : {
              0.0,
              std::numeric_limits<double>::denorm_min(),
@@ -618,6 +836,7 @@ void adaptive_attempt_guards_fail_closed_on_invalid_active_vectors() {
                 old_m,
                 candidate,
                 mask,
+                frozen_mask,
                 acceptance_metric,
                 metrics,
                 error),
@@ -631,6 +850,7 @@ void adaptive_attempt_guards_fail_closed_on_invalid_active_vectors() {
     };
     const std::vector<double> candidate_with_airbox = old_with_airbox;
     const std::vector<uint8_t> airbox_mask{0u, 1u};
+    const std::vector<uint8_t> no_frozen_mask{};
     fullmag::fem::AdaptiveAttemptGuardMetrics metrics{};
     double acceptance_metric = 0.0;
     std::string error;
@@ -641,6 +861,7 @@ void adaptive_attempt_guards_fail_closed_on_invalid_active_vectors() {
             old_with_airbox,
             candidate_with_airbox,
             airbox_mask,
+            no_frozen_mask,
             acceptance_metric,
             metrics,
             error),
@@ -837,7 +1058,12 @@ int main() {
     runtime_adapter_uses_attempted_dt_not_stale_plan_dt();
     rejected_error_shrinks_dt_and_counts_rejection();
     adaptive_error_norm_uses_nodewise_vector_l2_scale();
+    adaptive_mass_weighted_error_norm_uses_fem_measure();
+    adaptive_mass_weighted_error_norm_excludes_airbox_and_frozen_nodes();
+    adaptive_mass_weighted_error_norm_fails_closed_on_invalid_measure();
     adaptive_relative_only_error_ignores_inactive_airbox_nodes();
+    adaptive_norms_exclude_frozen_nodes();
+    adaptive_norms_fail_closed_on_frozen_mask_mismatch();
     adaptive_attempt_guards_measure_pre_normalization_geometry();
     adaptive_attempt_guards_fail_closed_on_invalid_active_vectors();
     gpu_adaptive_error_norm_uses_nodewise_vector_l2_scale();

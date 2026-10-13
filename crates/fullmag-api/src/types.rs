@@ -5,6 +5,7 @@ use crate::schemas::commands::{
 };
 use crate::schemas::diagnostics::SolverProfileResource;
 use crate::schemas::hysteresis::HysteresisBookmarkSchema;
+use crate::schemas::mode_composition::ModeCompositionResource;
 use crate::schemas::realtime::RealtimeResourceChange;
 use crate::schemas::runtime::FieldMaterializationRequirement;
 use crate::schemas::visualization_state::{
@@ -21,9 +22,10 @@ use fullmag_runner::{
     BackendCapabilities, DisplaySelectionState, FemMeshPayload, LivePreviewField,
     LivePreviewRequest, RuntimeStatus,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -67,6 +69,8 @@ pub(crate) struct DisplayPresentationState {
     /// Bounded restore diagnostics for presentation-schema migrations.
     #[serde(default)]
     pub visualization_restore_warnings: Vec<String>,
+    #[serde(default)]
+    pub mode_composition: ModeCompositionResource,
 }
 
 impl Default for DisplayPresentationState {
@@ -88,6 +92,7 @@ impl Default for DisplayPresentationState {
             visualization_vector_style: None,
             visualization_overrides: None,
             visualization_restore_warnings: Vec::new(),
+            mode_composition: ModeCompositionResource::default(),
         }
     }
 }
@@ -103,15 +108,54 @@ pub(crate) enum MeshCommandTarget {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppState {
+    /// Private pre-listener provenance. HTTP snapshots never carry this marker.
+    pub development_restored_authoring: Arc<std::sync::OnceLock<
+        crate::router_v2::handlers::platform::development_restore_input::RestoredAuthoringIdentity,
+    >>,
+    /// Lock order: mutation admission precedes the session-transition lock.
+    pub development_admission:
+        crate::router_v2::middleware::development_admission::DevelopmentAdmission,
+    /// Immutable native launcher binding; ordinary API startup leaves it disabled.
+    pub development_backend:
+        crate::router_v2::handlers::platform::development_backend::DevelopmentBackendConfig,
+    pub development_restart_transport:
+        crate::router_v2::handlers::platform::development_restart_request::DevelopmentRestartTransportConfig,
+    pub development_consumer_readiness:
+        crate::development_consumer_readiness::DevelopmentConsumerReadiness,
     pub repo_root: PathBuf,
+    /// Managed, project-owned run storage resolved before this API starts.
+    pub submit_store_root: Option<PathBuf>,
+    /// Global durable bound for accepted runs that have not reached a terminal
+    /// task catalog. Replays do not consume another backlog slot.
+    pub submit_backlog_limit: NonZeroUsize,
     pub current_workspace_root: PathBuf,
+    /// Durable bounded journal for current-workspace command status. Tests
+    /// that do not exercise filesystem recovery may leave it disabled.
+    pub current_command_journal_store_root: Option<PathBuf>,
+    /// Monotonic revision of the durable current-workspace command journal.
+    pub current_command_journal_revision: Arc<AtomicU64>,
     /// Sessionless local-live workspace snapshot used by the root `/` GUI.
     pub current_live_state: Arc<RwLock<Option<SessionStateResponse>>>,
+    /// Lock order: current_live_session_transition precedes current-session state,
+    /// resource, and realtime locks. It remains held through current-session publish.
+    pub current_live_session_transition: Arc<Mutex<()>>,
+    /// Unique to this API process; paired with the transition counter for browser request scope.
+    pub request_scope_instance_id: String,
+    /// Changes whenever explicit authoring replaces the current session.
+    pub current_live_session_epoch: Arc<AtomicU64>,
+    #[cfg(test)]
+    pub current_live_realtime_before_send_hook:
+        Arc<Mutex<Option<CurrentLiveRealtimeBeforeSendHook>>>,
     /// Backend-owned health of the runner-to-resource publication path.
     pub current_live_connectivity: Arc<RwLock<crate::schemas::status::SessionConnectivity>>,
     /// Last successfully accepted runner frame or idle liveness tick.
     /// Status/admission use it for degraded/disconnected transitions.
     pub current_live_last_seen_unix_ms: Arc<AtomicU64>,
+    /// Last durably published preparation receipt for the active run.
+    /// Kept outside the runner snapshot so the receipt cannot be replaced by
+    /// a stale progress frame and remains available to the resource handler.
+    pub current_live_preparation_receipt:
+        Arc<RwLock<Option<fullmag_session::FmsPreparationReceipt>>>,
     /// Resource-first realtime events for `/v2/sessions/current/events/ws`.
     pub current_live_realtime_events: broadcast::Sender<CurrentLiveRealtimeEvent>,
     /// Bounded replay buffer for the resource-first realtime stream.
@@ -121,6 +165,9 @@ pub(crate) struct AppState {
     /// Pending backend-side coalesced realtime resource batches, before sequence assignment.
     pub current_live_realtime_pending_batches:
         Arc<Mutex<HashMap<String, CurrentLiveRealtimePendingBatch>>>,
+    /// Latest-only QoS owner for lightweight `scalar.sample` events.
+    pub current_live_realtime_scalar_sample_qos:
+        Arc<Mutex<crate::CurrentLiveRealtimeScalarSampleQosState>>,
     /// Backend-owned effective realtime communication policy.
     pub current_live_realtime_policy:
         Arc<RwLock<crate::realtime_policy::CurrentLiveRealtimePolicyState>>,
@@ -145,7 +192,8 @@ pub(crate) struct AppState {
     pub current_control_queue: Arc<Mutex<VecDeque<SessionCommand>>>,
     /// Recent idempotent command responses keyed by request identity.
     pub current_command_responses: Arc<Mutex<VecDeque<(String, CommandResponse)>>>,
-    /// Submission/dispatched ledger for resource-first command status endpoints.
+    /// Recovered projection of the durable command journal used by
+    /// resource-first command status endpoints.
     pub current_command_ledger: Arc<Mutex<VecDeque<TrackedCommandRecord>>>,
     /// Latest queued control sequence number.
     pub current_control_events: watch::Sender<u64>,
@@ -160,6 +208,20 @@ pub(crate) struct AppState {
     pub frozen_spins_previews: Arc<RwLock<crate::session::FrozenSpinsPreviewStore>>,
 }
 
+/// Immutable identity captured before an async current-workspace operation.
+///
+/// Legacy `/sessions/current` routes still expose a session-scoped adapter, so
+/// this pilot uses the durable session/run identity rather than pretending the
+/// mutable `current` pointer is a project context.  A handler must validate it
+/// again immediately before it reads or publishes state after an await.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrentLiveRequestContext {
+    pub session_id: String,
+    pub run_id: Option<String>,
+    pub session_epoch: u64,
+    pub request_scope_epoch: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct HysteresisBookmarkStageStore {
     pub revision: u64,
@@ -170,6 +232,13 @@ pub(crate) struct HysteresisBookmarkStageStore {
 pub(crate) struct CurrentLiveRealtimeEvent {
     pub seq: u64,
     pub json: String,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct CurrentLiveRealtimeBeforeSendHook {
+    pub admitted: Arc<tokio::sync::Notify>,
+    pub resume: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -312,6 +381,8 @@ pub(crate) struct RunManifest {
     pub final_e_ani: Option<f64>,
     #[serde(default)]
     pub final_e_dmi: Option<f64>,
+    #[serde(default)]
+    pub final_e_rotated_dmi: Option<f64>,
     pub final_e_total: Option<f64>,
     pub artifact_dir: String,
 }
@@ -459,12 +530,22 @@ pub(crate) struct EigenModeQuery {
 #[derive(Debug, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct EigenDispersionRow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sample_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_id: Option<String>,
     pub mode_index: u32,
     pub kx: f64,
     pub ky: f64,
     pub kz: f64,
     pub frequency_hz: f64,
     pub angular_frequency_rad_per_s: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_field_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_field_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode_field_resource_key: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -478,6 +559,10 @@ pub(crate) struct EigenDispersionResponse {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[allow(non_snake_case)]
 pub(crate) struct ScalarRow {
+    #[serde(default = "fullmag_quantities::StepDataKind::legacy_unclassified")]
+    pub kind: fullmag_quantities::StepDataKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solver_progress: Option<fullmag_quantities::SolverProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observation_frame: Option<crate::schemas::common::AcceptedObservationFrameRef>,
     pub step: u64,
@@ -505,6 +590,8 @@ pub(crate) struct ScalarRow {
     pub e_ani: f64,
     #[serde(default)]
     pub e_dmi: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e_rotated_dmi: Option<f64>,
     pub e_total: f64,
     pub max_dm_dt: f64,
     pub max_h_eff: f64,
@@ -517,6 +604,21 @@ pub(crate) struct ScalarRow {
     pub per_object_scalars: HashMap<String, HashMap<String, f64>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub table_expressions: Vec<String>,
+}
+
+impl ScalarRow {
+    pub(crate) fn validate_record_kind(&self) -> Result<(), &'static str> {
+        self.kind
+            .validate_solver_progress(self.solver_progress.as_ref())?;
+        if self.kind.is_solver_progress() {
+            return Err("solver progress cannot be admitted as a physical scalar row");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_physical_observation(&self) -> bool {
+        self.kind.is_physical_observation() && self.validate_record_kind().is_ok()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -542,6 +644,10 @@ pub(crate) struct EngineLogEntry {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[allow(non_snake_case)]
 pub(crate) struct StepUpdateView {
+    #[serde(default = "fullmag_quantities::StepDataKind::legacy_unclassified")]
+    pub kind: fullmag_quantities::StepDataKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solver_progress: Option<fullmag_quantities::SolverProgress>,
     pub step: u64,
     pub time: f64,
     pub dt: f64,
@@ -554,6 +660,8 @@ pub(crate) struct StepUpdateView {
     pub e_ani: f64,
     #[serde(default)]
     pub e_dmi: f64,
+    #[serde(default, alias = "E_rotated_dmi")]
+    pub e_rotated_dmi: f64,
     pub e_total: f64,
     pub max_dm_dt: f64,
     pub max_h_eff: f64,
@@ -599,6 +707,30 @@ pub(crate) struct StepUpdateView {
 }
 
 impl StepUpdateView {
+    pub(crate) fn validate_record_kind(&self) -> Result<(), &'static str> {
+        self.kind
+            .validate_solver_progress(self.solver_progress.as_ref())?;
+        if self.kind.is_solver_progress()
+            && (!self.per_object_scalars.is_empty()
+                || self.magnetization.is_some()
+                || self.preview_field.is_some()
+                || !self.field_materialization_states.is_empty())
+        {
+            return Err("solver progress cannot include physical quantity payloads");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn is_physical_observation(&self) -> bool {
+        self.kind.is_physical_observation() && self.validate_record_kind().is_ok()
+    }
+
+    pub(crate) fn is_solver_progress(&self) -> bool {
+        self.kind.is_solver_progress() && self.validate_record_kind().is_ok()
+    }
+}
+
+impl StepUpdateView {
     /// Convert to the canonical V2 wire format.
     ///
     /// Maps the flat scalar fields to `GlobalQuantityRow` and wraps any
@@ -611,6 +743,8 @@ impl StepUpdateView {
         };
 
         let diagnostics = StepDiagnostics {
+            kind: self.kind.clone(),
+            solver_progress: self.solver_progress.clone(),
             step: self.step,
             time: self.time,
             dt: self.dt,
@@ -624,6 +758,7 @@ impl StepUpdateView {
         };
 
         let scalars = GlobalQuantityRow {
+            kind: self.kind.clone(),
             step: self.step,
             time: self.time,
             e_ex: self.e_ex,
@@ -631,6 +766,7 @@ impl StepUpdateView {
             e_ext: self.e_ext,
             e_ani: self.e_ani,
             e_dmi: self.e_dmi,
+            e_rotated_dmi: self.e_rotated_dmi,
             e_total: self.e_total,
             max_dm_dt: self.max_dm_dt,
             max_h_eff: self.max_h_eff,
@@ -659,12 +795,16 @@ impl StepUpdateView {
             });
         }
 
-        StepUpdateV2 {
+        let update = StepUpdateV2 {
             diagnostics,
             scalars,
             frames,
             finished: self.finished,
-        }
+        };
+        update
+            .validate()
+            .expect("coherent API step view should convert to V2");
+        update
     }
 }
 
@@ -859,7 +999,18 @@ pub(crate) struct QuantityDescriptor {
 pub(crate) struct LatestFields(BTreeMap<String, Value>);
 
 #[derive(Debug, Default, Clone)]
-pub(crate) struct CachedPreviewFields(BTreeMap<String, LivePreviewField>);
+pub(crate) struct CachedPreviewFields {
+    fields: BTreeMap<String, LivePreviewField>,
+    // Keep the accepted source identity separate from payload data so a later
+    // solver-progress callback cannot reclassify or erase a cached observation.
+    accepted_preview_source_frames: BTreeMap<
+        (String, u64, Option<u64>, u64, u64),
+        (u64, crate::schemas::common::AcceptedObservationFrameRef),
+    >,
+    accepted_latest_source_frames:
+        BTreeMap<String, crate::schemas::common::AcceptedObservationFrameRef>,
+    next_accepted_source_sequence: u64,
+}
 
 impl LatestFields {
     pub(crate) fn get(&self, quantity: &str) -> Option<&Value> {
@@ -872,6 +1023,10 @@ impl LatestFields {
 
     pub(crate) fn insert(&mut self, quantity: String, value: Value) {
         self.0.insert(quantity, value);
+    }
+
+    pub(crate) fn remove(&mut self, quantity: &str) {
+        self.0.remove(quantity);
     }
 
     pub(crate) fn entries(&self) -> impl Iterator<Item = (&String, &Value)> {
@@ -889,27 +1044,125 @@ impl LatestFields {
 
 impl CachedPreviewFields {
     pub(crate) fn get(&self, quantity: &str) -> Option<&LivePreviewField> {
-        self.0.get(quantity)
+        self.fields.get(quantity)
     }
 
     pub(crate) fn insert(&mut self, field: LivePreviewField) {
-        self.0.insert(field.quantity.clone(), field);
+        self.fields.insert(field.quantity.clone(), field);
     }
 
     pub(crate) fn iter(&self) -> impl Iterator<Item = (&String, &LivePreviewField)> {
-        self.0.iter()
+        self.fields.iter()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.fields.is_empty()
+    }
+
+    pub(crate) fn clear_fields(&mut self) {
+        self.fields.clear();
+    }
+
+    pub(crate) fn remember_accepted_source(
+        &mut self,
+        field: &LivePreviewField,
+        frame: crate::schemas::common::AcceptedObservationFrameRef,
+    ) {
+        self.next_accepted_source_sequence = self.next_accepted_source_sequence.wrapping_add(1);
+        self.accepted_preview_source_frames.insert(
+            preview_source_key(field),
+            (self.next_accepted_source_sequence, frame),
+        );
+        let mut source_keys = self
+            .accepted_preview_source_frames
+            .iter()
+            .filter(|((quantity, _, _, _, _), _)| quantity == &field.quantity)
+            .map(|(key, (sequence, _))| (*sequence, key.clone()))
+            .collect::<Vec<_>>();
+        source_keys.sort_by_key(|(sequence, _)| *sequence);
+        let excess = source_keys.len().saturating_sub(8);
+        for (_, stale_key) in source_keys.into_iter().take(excess) {
+            self.accepted_preview_source_frames.remove(&stale_key);
+        }
+    }
+
+    pub(crate) fn accepted_source_frame(
+        &self,
+        field: &LivePreviewField,
+    ) -> Option<&crate::schemas::common::AcceptedObservationFrameRef> {
+        self.accepted_preview_source_frames
+            .get(&preview_source_key(field))
+            .map(|(_, frame)| frame)
+    }
+
+    pub(crate) fn remember_accepted_latest_source(
+        &mut self,
+        quantity: &str,
+        frame: crate::schemas::common::AcceptedObservationFrameRef,
+    ) {
+        self.accepted_latest_source_frames
+            .insert(quantity.to_string(), frame);
+    }
+
+    pub(crate) fn accepted_latest_source_frame(
+        &self,
+        quantity: &str,
+    ) -> Option<&crate::schemas::common::AcceptedObservationFrameRef> {
+        self.accepted_latest_source_frames.get(quantity)
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
+fn preview_source_key(field: &LivePreviewField) -> (String, u64, Option<u64>, u64, u64) {
+    let payload_hash = field
+        .vector_field_values
+        .iter()
+        .fold(1469598103934665603_u64, |hash, value| {
+            hash.wrapping_mul(1099511628211)
+                .wrapping_add(value.to_bits())
+        });
+    (
+        field.quantity.clone(),
+        field.source_step,
+        field.source_time_seconds.map(f64::to_bits),
+        field.source_revision,
+        payload_hash,
+    )
+}
+
+#[derive(Debug, Serialize, Clone)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum PreviewState {
     Spatial(SpatialPreviewState),
     GlobalScalar(GlobalScalarPreviewState),
+}
+
+impl<'de> Deserialize<'de> for PreviewState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct PreviewKind {
+            kind: String,
+        }
+
+        // Keep raw JSON until the typed reader runs: Value would discard
+        // duplicate fields. Reading each variant directly also preserves
+        // serde_json's numeric map-key adapter for FEM domain quality.
+        let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        let tag: PreviewKind = serde_json::from_str(raw.get()).map_err(de::Error::custom)?;
+        match tag.kind.as_str() {
+            "spatial" => serde_json::from_str::<SpatialPreviewState>(raw.get())
+                .map(Self::Spatial)
+                .map_err(de::Error::custom),
+            "global_scalar" => serde_json::from_str::<GlobalScalarPreviewState>(raw.get())
+                .map(Self::GlobalScalar)
+                .map_err(de::Error::custom),
+            other => Err(de::Error::custom(format!(
+                "unknown preview state kind '{other}'"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1022,6 +1275,10 @@ pub(crate) struct ControlWaitQuery {
     pub after_seq: u64,
     #[serde(rename = "timeoutMs", default = "default_preview_wait_timeout_ms")]
     pub timeout_ms: u64,
+    #[serde(rename = "sessionId")]
+    pub session_id: Option<String>,
+    #[serde(rename = "gridRefreshCommandId", default)]
+    pub grid_refresh_command_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1049,11 +1306,25 @@ pub(crate) struct ScriptSyncRequest {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ScriptSyncResponse {
+    /// Path of the file that received the canonical script. For a
+    /// `user_file` session this is the managed export copy, never the
+    /// user's own script.
     pub script_path: String,
     pub source_kind: String,
     pub entrypoint_kind: String,
     pub written: bool,
     pub bytes_written: usize,
+    /// `export_copy` (user file left untouched, copy written to managed
+    /// storage) or `script` (the session's managed script was written).
+    #[serde(default)]
+    pub written_to: String,
+    /// True only when the session's own source script file was rewritten.
+    /// Always false for `user_file` sessions.
+    #[serde(default)]
+    pub source_script_modified: bool,
+    /// Managed export copy path for `user_file` sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_copy_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -1061,6 +1332,31 @@ pub(crate) struct ScriptSourceResponse {
     pub script_path: String,
     pub source: String,
     pub bytes: usize,
+    /// Script origin of the session: `user_file`, `generated` or `none`.
+    #[serde(default)]
+    pub origin: String,
+    /// Managed export copy path for `user_file` sessions (the response
+    /// carries the copy when it exists, otherwise the read-only original).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_copy_path: Option<String>,
+}
+
+/// Where the current session's Python script comes from and whether Fullmag
+/// may write to it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SessionScriptSummary {
+    /// `user_file` (a file the user owns; Fullmag never writes it),
+    /// `generated` (a script inside Fullmag-managed storage) or `none`.
+    pub origin: String,
+    pub path: String,
+    /// False for `user_file`: syncs go to `managed_copy_path` instead.
+    pub writable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_copy_path: Option<String>,
+    /// Content hash of the script at the time of the request; only present on
+    /// `GET /v2/sessions/current`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1082,6 +1378,8 @@ pub(crate) struct CurrentLiveSnapshotRequest {
     pub run: Option<RunManifest>,
     #[serde(default)]
     pub live_state: Option<LiveState>,
+    #[serde(default)]
+    pub frozen_spins_runtime_status: Option<fullmag_runner::constraints::FrozenSpinsRuntimeStatus>,
     #[serde(default)]
     pub coupled_checkpoint: Option<Value>,
     #[serde(default)]
@@ -1106,6 +1404,25 @@ pub(crate) struct CurrentLiveSnapshotRequest {
     /// are also accepted for backwards compatibility.
     #[serde(default)]
     pub fem_mesh: Option<FemMeshPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CurrentLivePreparationReceiptRequest {
+    pub session_id: String,
+    pub receipt: fullmag_application::PreparationReceipt,
+}
+
+/// Internal bridge request for materializing preparation from the current
+/// immutable SceneDocument snapshot. ProblemIR is derived server-side through
+/// the canonical Python DSL so callers cannot substitute different physics.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CurrentLivePreparationMaterializationRequest {
+    pub session_id: String,
+    pub preparation_id: String,
+    pub scene_revision: u64,
+    pub requested_execution: fullmag_application::RequestedExecution,
+    pub display_projection: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1137,6 +1454,8 @@ pub(crate) struct CurrentLiveRuntimeFrameRequest {
     pub session_id: String,
     #[serde(default)]
     pub live_state: Option<LiveState>,
+    #[serde(default)]
+    pub frozen_spins_runtime_status: Option<fullmag_runner::constraints::FrozenSpinsRuntimeStatus>,
     #[serde(default)]
     pub engine_log: Option<Vec<EngineLogEntry>>,
     #[serde(default)]
@@ -1178,12 +1497,28 @@ pub(crate) struct StageExecutionRecord {
     #[serde(default)]
     pub stage_id: Option<String>,
     #[serde(default)]
+    pub antenna_solve_stage_id: Option<String>,
+    #[serde(default)]
     pub kind: Option<String>,
     pub status: StageLifecycleState,
     #[serde(default)]
     pub command_id: Option<String>,
     #[serde(default)]
+    pub mesh_generation_id: Option<String>,
+    #[serde(default)]
+    pub mesh_topology_fingerprint: Option<String>,
+    #[serde(default)]
+    pub mesh_revision: Option<u64>,
+    #[serde(default)]
     pub started_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub applied_step: Option<u64>,
+    #[serde(default)]
+    pub completed_step: Option<u64>,
+    #[serde(default)]
+    pub applied_time_seconds: Option<f64>,
+    #[serde(default)]
+    pub segment_id: Option<String>,
     #[serde(default)]
     pub completed_at_unix_ms: Option<u64>,
     #[serde(default)]
@@ -1234,6 +1569,9 @@ pub(crate) struct StageExecutionRecord {
     pub current_settle_step_kind: Option<String>,
     #[serde(default)]
     pub current_settle_step_method: Option<String>,
+    /// Latest real adaptive FEM CPU admission sample for this stage.
+    #[serde(default)]
+    pub parallel_execution: Option<fullmag_runner::LiveParallelExecutionTelemetry>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
@@ -1383,6 +1721,8 @@ pub(crate) struct SessionCommand {
     pub stages: Option<Vec<fullmag_runner::SequenceStage>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frozen_spins_runtime_plan_binding: Option<fullmag_ir::FrozenSpinsRuntimePlanBindingIR>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub field_materialization_requirements: Vec<FieldMaterializationRequirement>,
 }
@@ -1495,18 +1835,246 @@ mod tests {
     use super::*;
     use fullmag_authoring::scene_document_from_script_builder;
 
+    #[test]
+    fn legacy_scalar_row_without_rotated_dmi_keeps_component_missing() {
+        let row: ScalarRow = serde_json::from_value(serde_json::json!({
+            "step": 1,
+            "time": 0.0,
+            "solver_dt": 1.0e-12,
+            "mx": 0.0,
+            "my": 0.0,
+            "mz": 1.0,
+            "e_ex": 0.0,
+            "e_demag": 0.0,
+            "e_ext": 0.0,
+            "e_total": 0.0,
+            "max_dm_dt": 0.0,
+            "max_h_eff": 0.0,
+            "max_h_demag": 0.0
+        }))
+        .expect("legacy scalar row should remain readable");
+        assert_eq!(row.e_rotated_dmi, None);
+        assert_eq!(row.kind, fullmag_quantities::StepDataKind::LegacyUnclassified);
+        assert!(!row.is_physical_observation());
+    }
+
+    fn spatial_preview_with_domain_quality() -> Value {
+        let fem_mesh = serde_json::json!({
+            "mesh_name": "preview",
+            "mesh_id": "mesh-1",
+            "nodes": [[0.0, 0.0, 0.0]],
+            "cells": {
+                "types": [],
+                "offsets": [],
+                "nodes": [],
+                "global_ordinals": [],
+                "mesh_parts": []
+            },
+            "facets": {
+                "types": [],
+                "roles": [],
+                "offsets": [],
+                "nodes": [],
+                "global_ordinals": []
+            },
+            "per_domain_quality": {
+                "1": {
+                    "n_elements": 1,
+                    "sicn_min": 0.1,
+                    "sicn_max": 0.9,
+                    "sicn_mean": 0.5,
+                    "sicn_p5": 0.2,
+                    "gamma_min": 0.3,
+                    "gamma_mean": 0.6,
+                    "volume_min": 1.0,
+                    "volume_max": 1.0,
+                    "volume_mean": 1.0,
+                    "volume_std": 0.0,
+                    "avg_quality": 0.5
+                }
+            }
+        });
+        serde_json::json!({
+            "kind": "spatial",
+            "display_kind": "m",
+            "config_revision": 4,
+            "source_step": 12,
+            "source_time": 0.25,
+            "spatial_kind": "mesh",
+            "quantity": "m",
+            "unit": "1",
+            "quantity_domain": "magnetic_only",
+            "component": "3D",
+            "layer": 0,
+            "all_layers": true,
+            "type": "3D",
+            "scalar_field": [[1.0, 0.0, 0.0]],
+            "min": 0.0,
+            "max": 1.0,
+            "n_comp": 3,
+            "max_points": 1,
+            "data_points_count": 1,
+            "x_possible_sizes": [1],
+            "y_possible_sizes": [1],
+            "x_chosen_size": 1,
+            "y_chosen_size": 1,
+            "applied_x_chosen_size": 1,
+            "applied_y_chosen_size": 1,
+            "applied_layer_stride": 1,
+            "auto_scale_enabled": true,
+            "auto_downscaled": false,
+            "preview_grid": [1, 1, 1],
+            "fem_mesh": fem_mesh
+        })
+    }
+
+    #[test]
+    fn preview_state_spatial_round_trips_numeric_domain_quality_keys() {
+        let value = spatial_preview_with_domain_quality();
+        let parsed: PreviewState = serde_json::from_value(value.clone())
+            .expect("spatial preview with numeric domain keys should deserialize");
+        let PreviewState::Spatial(spatial) = &parsed else {
+            panic!("expected spatial preview state");
+        };
+        assert!(spatial
+            .fem_mesh
+            .as_ref()
+            .expect("spatial preview mesh")
+            .per_domain_quality
+            .contains_key(&1));
+
+        let encoded = serde_json::to_value(&parsed).expect("spatial preview should serialize");
+        assert_eq!(encoded["kind"], "spatial");
+        assert!(encoded["fem_mesh"]["per_domain_quality"]["1"].is_object());
+        let round_tripped: PreviewState = serde_json::from_value(encoded)
+            .expect("serialized spatial preview should deserialize again");
+        let PreviewState::Spatial(round_tripped) = round_tripped else {
+            panic!("expected spatial preview state after round trip");
+        };
+        assert!(round_tripped
+            .fem_mesh
+            .expect("round-tripped spatial preview mesh")
+            .per_domain_quality
+            .contains_key(&1));
+    }
+
+    #[test]
+    fn preview_state_global_scalar_deserializes_through_explicit_kind_dispatch() {
+        let parsed: PreviewState = serde_json::from_value(serde_json::json!({
+            "kind": "global_scalar",
+            "display_kind": "total_energy",
+            "config_revision": 5,
+            "source_step": 13,
+            "source_time": 0.5,
+            "quantity": "e_total",
+            "unit": "J",
+            "value": -2.5
+        }))
+        .expect("global scalar preview should deserialize");
+        let PreviewState::GlobalScalar(scalar) = parsed else {
+            panic!("expected global scalar preview state");
+        };
+        assert_eq!(scalar.quantity, "e_total");
+        assert_eq!(scalar.value, -2.5);
+    }
+
+    #[test]
+    fn preview_state_rejects_malformed_kind_and_view_type_without_coercion() {
+        for malformed in [
+            serde_json::json!({"kind": "unknown"}),
+            serde_json::json!({"kind": 1}),
+            serde_json::json!({}),
+        ] {
+            assert!(
+                serde_json::from_value::<PreviewState>(malformed).is_err(),
+                "malformed preview kind must be rejected"
+            );
+        }
+
+        let mut malformed_type = spatial_preview_with_domain_quality();
+        malformed_type["type"] = serde_json::json!(3);
+        assert!(
+            serde_json::from_value::<PreviewState>(malformed_type).is_err(),
+            "spatial preview type must remain a string"
+        );
+    }
+
+    #[test]
+    fn preview_state_raw_json_rejects_duplicate_fields_and_kind() {
+        let scalar = r#"{"kind":"global_scalar","display_kind":"total_energy",
+            "config_revision":5,"source_step":13,"source_time":0.5,
+            "quantity":"e_total","unit":"J","value":-2.5}"#;
+        for (raw, field) in [
+            (
+                scalar.replace("\"value\":-2.5", "\"value\":-2.5,\"value\":5.0"),
+                "value",
+            ),
+            (
+                scalar.replace(
+                    "\"kind\":\"global_scalar\"",
+                    "\"kind\":\"spatial\",\"kind\":\"global_scalar\"",
+                ),
+                "kind",
+            ),
+        ] {
+            let error = serde_json::from_slice::<PreviewState>(raw.as_bytes())
+                .expect_err("duplicate known preview fields must be rejected");
+            assert!(error
+                .to_string()
+                .contains(&format!("duplicate field `{field}`")));
+        }
+
+        let spatial = serde_json::to_string(&spatial_preview_with_domain_quality()).unwrap();
+        let duplicate_nested = spatial.replace(
+            "\"mesh_name\":\"preview\"",
+            "\"mesh_name\":\"preview\",\"mesh_name\":\"other\"",
+        );
+        assert_ne!(spatial, duplicate_nested);
+        let error = serde_json::from_slice::<PreviewState>(duplicate_nested.as_bytes())
+            .expect_err("duplicate known mesh fields must be rejected");
+        assert!(error.to_string().contains("duplicate field `mesh_name`"));
+    }
+
+    #[test]
+    fn preview_state_raw_json_preserves_numeric_domain_keys_and_unknown_fields() {
+        let spatial = serde_json::to_string(&spatial_preview_with_domain_quality()).unwrap();
+        let with_unknown = spatial.replacen(
+            "{",
+            "{\"future_preview_field\":1,\"future_preview_field\":2,",
+            1,
+        );
+        let parsed: PreviewState = serde_json::from_slice(with_unknown.as_bytes())
+            .expect("unknown fields remain ignored and numeric map keys remain valid");
+        let PreviewState::Spatial(spatial) = parsed else {
+            panic!("expected spatial preview state");
+        };
+        assert!(spatial
+            .fem_mesh
+            .unwrap()
+            .per_domain_quality
+            .contains_key(&1));
+    }
+
     fn sample_builder() -> ScriptBuilderState {
         ScriptBuilderState {
             revision: 3,
+            execution_profile: None,
+            execution_layers: vec![],
             backend: None,
+            requested_backend: None,
+            requested_device: None,
+            requested_precision: None,
             requested_mode: Some("strict".to_string()),
             cpu_threads: None,
+            parallel_execution: None,
+            pbc: None,
             fem_demag_solver_policy: None,
             exchange_enabled: true,
             demag_enabled: true,
             demag_realization: None,
             fdm: None,
             external_field: None,
+            rotated_interfacial_dmi: None,
             solver: fullmag_authoring::ScriptBuilderSolverState {
                 integrator: "rk45".to_string(),
                 fixed_timestep: String::new(),
@@ -1560,6 +2128,8 @@ mod tests {
             domain_frame: None,
             stages: Vec::new(),
             study_pipeline: None,
+            table_autosave: None,
+            output_storage: None,
             initial_state: None,
             geometries: vec![fullmag_authoring::ScriptBuilderGeometryEntry {
                 name: "body".to_string(),
@@ -1605,6 +2175,11 @@ mod tests {
             spin_transports: Vec::new(),
             spin_torques: Vec::new(),
             oersted_terms: Vec::new(),
+            antenna_port_modes: Vec::new(),
+            antenna_field_solve_stages: Vec::new(),
+            antenna_target_projections: Vec::new(),
+            solved_antenna_drives: Vec::new(),
+            antenna_spectrum_requests: Vec::new(),
             excitation_analysis: None,
         }
     }
@@ -1722,8 +2297,24 @@ mod tests {
     }
 
     #[test]
+    fn control_wait_query_accepts_grid_refresh_command_pin() {
+        let query: ControlWaitQuery = serde_json::from_value(serde_json::json!({
+            "afterSeq": 4,
+            "timeoutMs": 1000,
+            "sessionId": "session-a",
+            "gridRefreshCommandId": "cmd-grid-a"
+        }))
+        .expect("control wait query should deserialize the internal grid refresh pin");
+
+        assert_eq!(query.after_seq, 4);
+        assert_eq!(query.grid_refresh_command_id.as_deref(), Some("cmd-grid-a"));
+    }
+
+    #[test]
     fn step_update_v2_uses_registry_metadata_for_magnetization() {
         let view = StepUpdateView {
+            kind: fullmag_quantities::StepDataKind::PhysicalObservation,
+            solver_progress: None,
             step: 12,
             time: 1.25,
             dt: 1.0e-12,
@@ -1733,6 +2324,7 @@ mod tests {
             e_ext: 0.0,
             e_ani: 0.0,
             e_dmi: 0.0,
+            e_rotated_dmi: 0.0,
             e_total: 0.0,
             max_dm_dt: 0.0,
             max_h_eff: 0.0,
@@ -1766,5 +2358,68 @@ mod tests {
         assert_eq!(frame.unit, spec.unit);
         assert_eq!(frame.n_comp, spec.n_comp);
         assert!(!frame.unit.is_empty());
+    }
+
+    fn minimal_step_view_json() -> Value {
+        serde_json::json!({
+            "kind": "physical_observation",
+            "step": 1,
+            "time": 0.0,
+            "dt": 1.0e-12,
+            "e_ex": 0.0,
+            "e_demag": 0.0,
+            "e_ext": 0.0,
+            "e_total": 0.0,
+            "max_dm_dt": 0.0,
+            "max_h_eff": 0.0,
+            "wall_time_ns": 0,
+            "grid": [1, 1, 1],
+            "finished": false
+        })
+    }
+
+    #[test]
+    fn step_update_view_kind_roundtrips_and_missing_kind_stays_legacy() {
+        let serialized = minimal_step_view_json();
+        let view: StepUpdateView =
+            serde_json::from_value(serialized.clone()).expect("typed step view decodes");
+        assert!(view.is_physical_observation());
+        let roundtrip: StepUpdateView = serde_json::from_value(
+            serde_json::to_value(&view).expect("step view serializes"),
+        )
+        .expect("typed step view roundtrips");
+        assert_eq!(roundtrip.kind, fullmag_quantities::StepDataKind::PhysicalObservation);
+
+        let mut legacy = serialized.clone();
+        legacy
+            .as_object_mut()
+            .expect("step view is an object")
+            .remove("kind");
+        let legacy: StepUpdateView =
+            serde_json::from_value(legacy).expect("legacy step view remains readable");
+        assert_eq!(legacy.kind, fullmag_quantities::StepDataKind::LegacyUnclassified);
+        assert!(!legacy.is_physical_observation());
+
+        let mut unknown = serialized;
+        unknown["kind"] = serde_json::json!("future_kind");
+        assert!(serde_json::from_value::<StepUpdateView>(unknown).is_err());
+    }
+
+    #[test]
+    fn step_update_view_rejects_missing_or_contradictory_progress_channel() {
+        let mut progress = minimal_step_view_json();
+        progress["kind"] = serde_json::json!("solver_progress");
+        let missing_payload: StepUpdateView =
+            serde_json::from_value(progress.clone()).expect("record shape decodes");
+        assert!(missing_payload.validate_record_kind().is_err());
+
+        progress["solver_progress"] = serde_json::json!({
+            "kind": "fem_eigen",
+            "metrics": { "progress_fraction": 0.5 }
+        });
+        progress["magnetization"] = serde_json::json!([1.0, 0.0, 0.0]);
+        let contradictory: StepUpdateView =
+            serde_json::from_value(progress).expect("record shape decodes");
+        assert!(contradictory.validate_record_kind().is_err());
     }
 }

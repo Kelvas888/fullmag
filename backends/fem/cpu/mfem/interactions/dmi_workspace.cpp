@@ -10,7 +10,6 @@
 
 #include "context.hpp"
 #include "cpu/mfem/runtime/aos_field.hpp"
-#include "cpu/mfem/runtime/mfem_host_access.hpp"
 
 #include <algorithm>
 
@@ -78,39 +77,57 @@ DmiElementWorkspace *dmi_element_workspace(Context &ctx) {
     return workspace;
 }
 
+bool prepare_dmi_periodic_input(
+    Context &ctx,
+    const std::vector<double> &m_xyz,
+    std::vector<double> &projected_m_xyz,
+    std::string &error)
+{
+    const size_t node_count = static_cast<size_t>(ctx.mesh.n_nodes);
+    if (m_xyz.size() != 3u * node_count) {
+        error = "DMI periodic input field size does not match FEM mesh nodes";
+        return false;
+    }
+    projected_m_xyz.clear();
+    if (ctx.mesh.periodic_reduced_node.empty()) {
+        return true;
+    }
+    if (ctx.mesh.periodic_reduced_node.size() != node_count ||
+        ctx.mesh.periodic_reduced_node_count == 0 ||
+        ctx.mesh.periodic_representative_nodes.size() !=
+            static_cast<size_t>(ctx.mesh.periodic_reduced_node_count)) {
+        error = "DMI periodic input requires a complete periodic node-class map";
+        return false;
+    }
+    for (size_t node = 0; node < node_count; ++node) {
+        const uint32_t reduced = ctx.mesh.periodic_reduced_node[node];
+        if (static_cast<size_t>(reduced) >= ctx.mesh.periodic_representative_nodes.size()) {
+            error = "DMI periodic input contains an out-of-range reduced node class";
+            return false;
+        }
+        const uint32_t representative =
+            ctx.mesh.periodic_representative_nodes[static_cast<size_t>(reduced)];
+        if (static_cast<size_t>(representative) >= node_count) {
+            error = "DMI periodic input contains an out-of-range representative node";
+            return false;
+        }
+    }
+    projected_m_xyz = m_xyz;
+    if (!project_static_periodic_aos_checked(ctx, projected_m_xyz, error)) {
+        error = "DMI periodic input projection failed: " + error;
+        return false;
+    }
+    return true;
+}
+
 bool refresh_dmi_grid_functions_from_magnetization(
     Context &ctx,
     const std::vector<double> &m_xyz,
     std::string &error)
 {
-    auto *gf_mx = static_cast<mfem::GridFunction *>(ctx.mfem_context.gf_mx);
-    auto *gf_my = static_cast<mfem::GridFunction *>(ctx.mfem_context.gf_my);
-    auto *gf_mz = static_cast<mfem::GridFunction *>(ctx.mfem_context.gf_mz);
-    if (gf_mx == nullptr || gf_my == nullptr || gf_mz == nullptr) {
-        error = "DMI magnetization refresh requires initialized MFEM grid functions";
+    if (!copy_local_node_aos_to_mfem_state(ctx, m_xyz, error)) {
+        error = "DMI MFEM state adapter failed: " + error;
         return false;
-    }
-    const size_t nodes = static_cast<size_t>(ctx.mesh.n_nodes);
-    if (m_xyz.size() != 3u * nodes ||
-        gf_mx->Size() != static_cast<int>(nodes) ||
-        gf_my->Size() != static_cast<int>(nodes) ||
-        gf_mz->Size() != static_cast<int>(nodes)) {
-        error = "DMI magnetization refresh field size does not match MFEM space";
-        return false;
-    }
-
-    unpack_aos_to_existing_components(
-        m_xyz,
-        ctx.mfem_context.m_x,
-        ctx.mfem_context.m_y,
-        ctx.mfem_context.m_z);
-    double *mx = audited_host_write(*gf_mx);
-    double *my = audited_host_write(*gf_my);
-    double *mz = audited_host_write(*gf_mz);
-    for (size_t node = 0; node < nodes; ++node) {
-        mx[node] = ctx.mfem_context.m_x[node];
-        my[node] = ctx.mfem_context.m_y[node];
-        mz[node] = ctx.mfem_context.m_z[node];
     }
     return true;
 }

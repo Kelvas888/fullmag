@@ -1,9 +1,13 @@
-import { readFileSync } from "node:fs";
+import { readFileSync as readFileSyncRaw } from "node:fs";
+import { act, createElement, useMemo, useState } from "react";
+import { createRoot } from "react-dom/client";
 
 import { describe, expect, it } from "vitest";
 
+import { installSimulationPreparationTestDom } from "@/kernel/layout/simulationPreparationTestDom.test-support";
+
 import { DEFAULT_CAMERA_REGISTRY_STATE } from "@/kernel/visualization/CameraRegistryController";
-import { DATA_FIELD_VECTOR_PATH } from "@/kernel/api/apiPaths";
+import { DATA_FIELD_VECTOR_PATH, DATA_OBSERVATION_FRAME_MAGNETIZATION_PATH } from "@/kernel/api/apiPaths";
 import {
   DEFAULT_OBJECT_VISUALIZATION,
   ObjectVisualizationController,
@@ -21,13 +25,18 @@ import {
   buildHysteresisChartPointSelection,
 } from "@/shared/domain/study/HysteresisChart";
 
+import { Viewport3DResourceTracker } from "../viewport3dDiagnostics";
+import type { Viewport3DFieldVectorEnvelope } from "../viewport3dResources";
 import {
   buildViewport3DAirboxSyntheticVectorField,
   applyViewport3DFieldLayerDiagnosticOverrides,
   resolveViewport3DActiveQuantityId,
   resolveViewport3DAnalysisComplexFieldQuery,
   resolveViewport3DAnalysisComplexProjectionEnabled,
+  resolveViewport3DModeFieldOverlaySourceIdentity,
   resolveViewport3DDisplayedLiveValue,
+  resolvePrimaryFieldDisplayedEnvelope,
+  type Viewport3DPrimaryFieldRetainedState,
   resolveViewport3DFieldMetaScalarComponent,
   resolveViewport3DPrimaryFieldDataOptions,
   resolveViewport3DPrimaryFieldDemandPlan,
@@ -35,6 +44,7 @@ import {
   resolveViewport3DPrimaryFieldVectorEnabled,
   resolveViewport3DPrimaryFieldQuery,
   resolveViewport3DDomainRenderLane,
+  hasActiveViewport3DTargetQuantityDemand,
   resolveViewport3DFdmFieldIdentityCompatible,
   resolveViewport3DFieldRenderModelBuildOptions,
   resolveViewport3DSelectedSnapshotId,
@@ -75,6 +85,7 @@ import {
   resolveViewport3DResolvedPartFieldBuffers,
   sameViewport3DQuantityId,
 } from "./useViewport3DSceneModel";
+
 import {
   resolveHysteresisStepViewportTarget,
 } from "../model/viewport3DTargets";
@@ -104,12 +115,24 @@ import { createViewport3DRenderAdoptionRegistry } from "../model/viewport3DRende
 import { resolveViewport3DFieldVectorForDomain } from "../model/viewport3DFieldDomainCompatibility";
 import { buildFdmSampledScalarColors } from "../viewport3dFieldMapping";
 
+function readFileSync(
+  path: Parameters<typeof readFileSyncRaw>[0],
+  encoding: "utf8",
+): string {
+  return readFileSyncRaw(path, encoding).replace(/\r\n/g, "\n");
+}
+
 const sceneModelSourceUrl = new URL("./useViewport3DSceneModel.ts", import.meta.url);
 const planarPreviewSourceUrl = new URL("../../../kernel/workspace/planarMonitorFramePreview.ts", import.meta.url);
 const TEST_SESSION_IDENTITY = {
+  requestScopeEpoch: "test-api:1",
   sessionEpoch: "test-session@1000",
   sessionId: "test-session",
 } as const;
+
+function currentFieldVectorResourcePath(query: string): string {
+  return `${DATA_FIELD_VECTOR_PATH.replace("{quantity_id}", "m")}?${query}`;
+}
 
 describe("viewport vector scale", () => {
   it("derives glyphs from effective sample spacing", () => {
@@ -481,7 +504,7 @@ describe("FDM Airbox mesh demand", () => {
     );
 
     expect(settingsBlock).toContain(
-      "visualizationState: fdmLaneActive ? null : renderingState",
+      "visualizationState: femLaneActive ? renderingState : null",
     );
   });
 
@@ -613,6 +636,33 @@ describe("airbox vector sample budget", () => {
 });
 
 describe("FDM target visualization boundary", () => {
+  it("uses committed object quantity and component after reloading the browser", () => {
+    const visualization = new ObjectVisualizationController();
+    const target = { id: "object:film", kind: "object" as const };
+    const resolved = resolveViewport3DFdmTargetVisualization({
+      snapshot: visualization.getSnapshot(),
+      target,
+      visualizationState: {
+        revision: 8,
+        targets: {
+          objects: [{
+            scope: "object", scope_id: "film",
+            settings: {
+              active_quantity_id: "H_demag",
+              surface_color_source: "component_z",
+              surface_visible: true, visible: true,
+            },
+          }],
+          parts: [], airbox: {},
+        },
+      } as never,
+    });
+    expect(resolved.effectiveSettings).toMatchObject({
+      activeQuantityId: "H_demag", surfaceColorSource: "component_z",
+      shaderVisible: true, visible: true,
+    });
+  });
+
   it("keeps local FDM object patches effective when a FEM registry entry is present", () => {
     const visualization = new ObjectVisualizationController();
     const target = { id: "object:film", kind: "object" as const };
@@ -701,20 +751,34 @@ function fieldVectorFixture(
 }
 
 describe("useViewport3DSceneModel", () => {
+  it("surfaces target-vector status only for current resolved-lane demand", () => {
+    expect(hasActiveViewport3DTargetQuantityDemand("fdm", 1)).toBe(true);
+    expect(hasActiveViewport3DTargetQuantityDemand("fem", 1)).toBe(true);
+    expect(hasActiveViewport3DTargetQuantityDemand(null, 1)).toBe(false);
+    expect(hasActiveViewport3DTargetQuantityDemand("fdm", 0)).toBe(false);
+  });
+
   it("propagates FEM Airbox per-carrier field states into scene and debug models", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
 
     expect(source).toContain(
       "airboxFieldVectorPartStates: airboxFieldVectors.partStates,",
     );
+    // Live scene model carries the states directly; the debug source and the
+    // memoized scene model drop them while a pinned saved selection is active.
     expect(
       source.match(
         /airboxFieldVectorPartStates: airboxFieldVectors\.partStates,/g,
       ),
-    ).toHaveLength(3);
+    ).toHaveLength(1);
+    expect(
+      source.match(
+        /airboxFieldVectorPartStates: savedSelectionActive\s*\? EMPTY_VIEWPORT_FDM_PART_STATES\s*: airboxFieldVectors\.partStates,/g,
+      ),
+    ).toHaveLength(2);
   });
 
-  it("keeps FDM native-layer visibility on the local structured-grid target state", () => {
+  it("resolves FDM native layers from canonical state and pending local target edits", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
     const nativeLayerSettingsBlock = source.slice(
       source.indexOf("const fdmNativeLayerSettingsById = useMemo"),
@@ -724,7 +788,8 @@ describe("useViewport3DSceneModel", () => {
     expect(nativeLayerSettingsBlock).toContain(
       "resolveViewport3DFdmTargetVisualization({",
     );
-    expect(nativeLayerSettingsBlock).not.toContain(
+    expect(nativeLayerSettingsBlock).toContain("snapshot: objectVisualizationSnapshot");
+    expect(nativeLayerSettingsBlock).toContain(
       "visualizationState: renderingState",
     );
   });
@@ -732,7 +797,7 @@ describe("useViewport3DSceneModel", () => {
   it("uses canonical local Airbox settings for both FDM Airbox carriers", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
     expect(source).toContain(
-      "target: AIRBOX_VISUALIZATION_TARGET,\n        visualizationState: fdmLaneActive ? null : renderingState,",
+      "target: AIRBOX_VISUALIZATION_TARGET,\n        visualizationState: femLaneActive ? renderingState : null,",
     );
     const fdmSingleGridAirboxBlock = source.slice(
       source.indexOf("const fdmSingleGridAirboxSettings ="),
@@ -753,7 +818,7 @@ describe("useViewport3DSceneModel", () => {
     expect(airboxSettingsBlock).toContain("resolveTargetVisualization({");
     expect(airboxSettingsBlock).toContain("target: AIRBOX_VISUALIZATION_TARGET");
     expect(airboxSettingsBlock).toContain(
-      "visualizationState: fdmLaneActive ? null : renderingState",
+      "visualizationState: femLaneActive ? renderingState : null",
     );
     expect(airboxSettingsBlock).not.toContain("resolveViewport3DFdmTargetVisualization({");
 
@@ -768,6 +833,9 @@ describe("useViewport3DSceneModel", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
 
     expect(source).toContain(
+      'domainMeta.data?.discretization === "fdm" && domainMeta.data.grid',
+    );
+    expect(source).toContain(
       "adaptFdmDomainPresentation(fdmDomainPresentation, FDM_DISPLAY_CELL_BUDGET)",
     );
     expect(source).toContain("formatFdmDisplaySamplingSummary({");
@@ -776,6 +844,24 @@ describe("useViewport3DSceneModel", () => {
     expect(source).toContain("stride: fdmDomain.stride");
     expect(source).toContain("total: fdmDomain.totalCells");
     expect(source).not.toContain("`${fdmDomain.displayCellCount}/${fdmDomain.totalCells}`");
+  });
+
+  it("reports FDM field mismatches only while the FDM lane is active", () => {
+    const source = readFileSync(sceneModelSourceUrl, "utf8");
+    const expression = source.match(
+      /fieldVector\.error\?\.message \?\?\s*([\s\S]*?)\s*\?\?\s*\(femLaneActive \? magneticPartFieldVectors/,
+    )?.[1];
+    expect(expression).toBeDefined();
+    const resolveWarning = new Function(
+      "fdmLaneActive", "fdmFieldCompatibility", `return ${expression}`,
+    );
+    const mismatch = { status: "mismatch", reason: "fdm-carrier-identity-unknown" };
+    expect(resolveWarning(false, mismatch)).toBeNull();
+    expect(resolveWarning(true, mismatch)).toBe(
+      "FDM field degraded: fdm-carrier-identity-unknown",
+    );
+    expect(resolveWarning(true, { status: "compatible" })).toBeNull();
+    expect(resolveWarning(true, null)).toBeNull();
   });
 
   it("keeps FEM colorbar identity compatible regardless of FDM-only diagnostics", () => {
@@ -804,7 +890,7 @@ describe("useViewport3DSceneModel", () => {
 
     for (const topologyFreshness of ["current", "stale", "unknown"] as const) {
       const lane = resolveViewport3DDomainRenderLane({
-        fdmActive: true,
+        discretization: "fdm",
         femDomain,
         topologyFreshness,
       });
@@ -826,7 +912,7 @@ describe("useViewport3DSceneModel", () => {
     } as never;
 
     const lane = resolveViewport3DDomainRenderLane({
-      fdmActive: false,
+      discretization: "fem",
       femDomain,
       topologyFreshness: "current",
     });
@@ -836,16 +922,45 @@ describe("useViewport3DSceneModel", () => {
     expect(lane.topologyRenderable).toBe(true);
   });
 
+  it("keeps unresolved session mode from opening a stale FEM renderer", () => {
+    const femDomain = {
+      airboxParts: [{ id: "airbox" }],
+      magneticParts: [{ id: "film" }],
+      magneticSurfacePartsByPartId: new Map(),
+      objectPartIds: new Map([["film", ["film"]]]),
+      partsById: new Map([["film", { id: "film" }]]),
+    } as never;
+
+    const lane = resolveViewport3DDomainRenderLane({
+      discretization: null,
+      femDomain,
+      topologyFreshness: "current",
+    });
+
+    expect(lane.femDomain.magneticParts).toEqual([]);
+    expect(lane.topologyCurrent).toBe(false);
+    expect(lane.topologyRenderable).toBe(false);
+  });
+
   it("does not surface FEM topology freshness labels in the FDM lane", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
 
     expect(source).toContain(
-      'const fdmLaneActive = domainMeta.data?.discretization === "fdm";',
+      'const fdmLaneActive = sessionDiscretization === "fdm";',
     );
     expect(source).toContain(
-      "const topologyFreshnessStatus = fdmLaneActive\n    ? null\n    : resolveViewport3DTopologyFreshnessLabel(topologyFreshness);",
+      "const topologyFreshnessStatus = femLaneActive\n    ? resolveViewport3DTopologyFreshnessLabel(topologyFreshness)\n    : null;",
     );
-    expect(source).toContain("topologyFreshnessStatus ??\n    topology.status");
+    expect(source).toContain(
+      "(femLaneActive ? topologyFreshnessStatus ?? topology.status : null)",
+    );
+    expect(source).toContain("(femLaneActive ? topology.error?.message : null)");
+    expect(source).toContain(
+      "(fdmLaneActive ? fdmBuildState?.error?.message : null)",
+    );
+    expect(source).toContain(
+      "[femLaneActive, objectVisualizationSnapshot, renderingState]",
+    );
   });
 
   it("uses full metadata component for scalar spatial quantities", () => {
@@ -937,7 +1052,12 @@ describe("useViewport3DSceneModel", () => {
       "topologyRenderModel: fieldCompatibleTopologyRenderModel",
     );
     expect(source).toContain("topology: fieldCompatibleTopologyRenderModel");
-    expect(source).toContain("topologyModel: topologyRenderModelForGeometry");
+    // The geometry-only topology model stays the live path; pinned saved
+    // selections substitute their own saved-viewport topology model.
+    expect(source).toContain(
+      "const effectiveViewportTopologyModel = savedSelectionActive\n    ? savedViewportSceneModel?.topologyModel ?? null\n    : topologyRenderModelForGeometry;",
+    );
+    expect(source).toContain("topologyModel: effectiveViewportTopologyModel");
     expect(source).toContain(
       "Boolean(fdmDomain || fieldCompatibleTopologyRenderModel) &&",
     );
@@ -951,7 +1071,7 @@ describe("useViewport3DSceneModel", () => {
       "const tet4FmmqQualitySupported = topologySupportsTet4FmmqQuality(topology.data);",
     );
     expect(source).toContain(
-      "useViewport3DMeshQualityData(\n    Boolean(\n      fieldCompatibleTopologyRenderModel &&\n        meshQualityOverlayVisible &&\n        tet4FmmqQualitySupported,\n    ),\n  )",
+      "useViewport3DMeshQualityData(\n    Boolean(\n      liveViewportResourcesEnabled &&\n        fieldCompatibleTopologyRenderModel &&\n        meshQualityOverlayVisible &&\n        tet4FmmqQualitySupported,\n    ),\n  )",
     );
   });
 
@@ -1425,6 +1545,685 @@ describe("useViewport3DSceneModel", () => {
     );
   });
 
+  it("retains the last compatible primary field frame across ready response with mismatched identity (LR-03)", () => {
+    const tracker = new Viewport3DResourceTracker();
+    const frameA: Viewport3DFieldVectorEnvelope = {
+      data: {
+        dtype: "float64",
+        formatVersion: 3,
+        domainGenerationId: "gen-1",
+        grid: [1, 1, 1],
+        indexing: "full_domain",
+        meshTopologyHash: "top-1",
+        nComp: 3,
+        pointCount: 1,
+        quantityId: "m",
+        scopeId: "part-1",
+        scopeKind: "part",
+        valueCount: 3,
+        values: new Float64Array([1, 0, 0]),
+      },
+      etag: '"m-frame-a"',
+      resourceKey:
+        currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1"),
+      responseMetadata: {
+        component: "full",
+        domainGenerationId: "gen-1",
+        encoding: "FMVP;version=2",
+        fieldIndexing: null,
+        fieldRevision: "rev-A",
+        identityIssues: [],
+        meshTopologyHash: "top-1",
+        nComp: 3,
+        nodeIndexCount: null,
+        pointCount: 1,
+        quantityId: "m",
+        scopeId: "part-1",
+        scopeKind: "part",
+        snapshotId: "snap-1",
+        stageId: null,
+        phaseRad: null,
+        view: null,
+        valueCount: 3,
+      },
+    };
+
+    const frameB_MismatchedSnapshot: Viewport3DFieldVectorEnvelope = {
+      ...frameA,
+      etag: '"m-frame-b"',
+      resourceKey:
+        currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-wrong"),
+      responseMetadata: {
+        ...frameA.responseMetadata!,
+        fieldRevision: "rev-B",
+        snapshotId: "snap-wrong",
+      },
+    };
+
+    const frameC: Viewport3DFieldVectorEnvelope = {
+      ...frameA,
+      etag: '"m-frame-c"',
+      responseMetadata: {
+        ...frameA.responseMetadata!,
+        fieldRevision: "rev-C",
+      },
+    };
+
+    const request = {
+      quantityId: "m",
+      query: {
+        component: "full",
+        expected_carrier_revision: "top-1",
+        expected_generation_id: "gen-1",
+        scope_id: "part-1",
+        scope_kind: "part",
+        snapshot_id: "snap-1",
+      },
+    };
+
+    // Step A: incoming frame A matches and is ready
+    const stepA = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: frameA,
+      preparedRevision: "rev-A",
+      retained: null,
+      request,
+      status: "ready",
+      tracker,
+    });
+    expect(stepA.displayedEnvelope).toEqual({ ...frameA, retained: false });
+    expect(stepA.displayedRevision).toBe("rev-A");
+    expect(stepA.nextRetained).toEqual({
+      envelope: { ...frameA, retained: false },
+      revision: "rev-A",
+    });
+
+    // Step B: incoming frame B is ready but has mismatched snapshot_id
+    const stepB = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: frameB_MismatchedSnapshot,
+      preparedRevision: "rev-B",
+      retained: stepA.nextRetained,
+      request,
+      status: "ready",
+      tracker,
+    });
+    // In step B, frame A is displayed with retained: true, and revision is rev-A (not rev-B)
+    expect(stepB.displayedEnvelope).toEqual({ ...frameA, retained: true });
+    expect(stepB.displayedRevision).toBe("rev-A");
+    expect(stepB.nextRetained).toEqual({
+      envelope: { ...frameA, retained: true },
+      revision: "rev-A",
+    });
+    expect(tracker.getRetentionRejectionCounts()).toEqual({});
+
+    // Step C: incoming frame C matches and is ready
+    const stepC = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: frameC,
+      preparedRevision: "rev-C",
+      retained: stepB.nextRetained,
+      request,
+      status: "ready",
+      tracker,
+    });
+    expect(stepC.displayedEnvelope).toEqual({ ...frameC, retained: false });
+    expect(stepC.displayedRevision).toBe("rev-C");
+    expect(stepC.nextRetained).toEqual({
+      envelope: { ...frameC, retained: false },
+      revision: "rev-C",
+    });
+
+    // Scenario 2: request has new expected_generation_id -> retention is rejected, returns null, counter incremented
+    const requestNewGeneration = {
+      ...request,
+      query: { ...request.query, expected_generation_id: "gen-2" },
+    };
+    const stepB_GenMismatch = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: frameB_MismatchedSnapshot,
+      preparedRevision: "rev-B",
+      retained: stepA.nextRetained,
+      request: requestNewGeneration,
+      status: "ready",
+      tracker,
+    });
+    expect(stepB_GenMismatch.displayedEnvelope).toBeNull();
+    expect(stepB_GenMismatch.displayedRevision).toBeNull();
+    expect(stepB_GenMismatch.nextRetained).toBeNull();
+    expect(tracker.getRetentionRejectionCounts()).toEqual({
+      generation: 1,
+    });
+  });
+
+  it("does not retain a live field after switching to an observation frame source", () => {
+    const envelope: Viewport3DFieldVectorEnvelope = {
+      data: {
+        dtype: "float64",
+        grid: [1, 1, 1],
+        nComp: 3,
+        pointCount: 1,
+        quantityId: "m",
+        valueCount: 3,
+        values: new Float64Array([1, 0, 0]),
+      },
+      etag: '"live-1"',
+      resourceKey: DATA_FIELD_VECTOR_PATH.replace("{quantity_id}", "m"),
+      responseMetadata: null,
+    };
+    const request = {
+      quantityId: "m",
+      query: { component: "full", scope_kind: "full" },
+    };
+    const live = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: envelope,
+      preparedRevision: "live-1",
+      request,
+      retained: null,
+      sourceResourceKey: envelope.resourceKey,
+      status: "ready",
+    });
+
+    const historical = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: null,
+      preparedRevision: null,
+      request,
+      retained: live.nextRetained,
+      sourceResourceKey:
+        DATA_OBSERVATION_FRAME_MAGNETIZATION_PATH.replace("{frame_id}", "frame-7"),
+      status: "loading",
+    });
+
+    expect(historical).toEqual({
+      displayedEnvelope: null,
+      displayedRevision: null,
+      nextRetained: null,
+    });
+  });
+
+  it("reaches a retention fixed point in one step (regression: render loop)", () => {
+    const tracker = new Viewport3DResourceTracker();
+    const frameA: Viewport3DFieldVectorEnvelope = {
+      data: {
+        dtype: "float64",
+        formatVersion: 3,
+        domainGenerationId: "gen-1",
+        grid: [1, 1, 1],
+        indexing: "full_domain",
+        meshTopologyHash: "top-1",
+        nComp: 3,
+        pointCount: 1,
+        quantityId: "m",
+        scopeId: "part-1",
+        scopeKind: "part",
+        valueCount: 3,
+        values: new Float64Array([1, 0, 0]),
+      },
+      etag: '"m-frame-a"',
+      resourceKey:
+        currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1"),
+      responseMetadata: {
+        component: "full",
+        domainGenerationId: "gen-1",
+        encoding: "FMVP;version=2",
+        fieldIndexing: null,
+        fieldRevision: "rev-A",
+        identityIssues: [],
+        meshTopologyHash: "top-1",
+        nComp: 3,
+        nodeIndexCount: null,
+        pointCount: 1,
+        quantityId: "m",
+        scopeId: "part-1",
+        scopeKind: "part",
+        snapshotId: "snap-1",
+        stageId: null,
+        phaseRad: null,
+        view: null,
+        valueCount: 3,
+      },
+    };
+
+    const frameB_MismatchedSnapshot: Viewport3DFieldVectorEnvelope = {
+      ...frameA,
+      etag: '"m-frame-b"',
+      resourceKey:
+        currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-wrong"),
+      responseMetadata: {
+        ...frameA.responseMetadata!,
+        fieldRevision: "rev-B",
+        snapshotId: "snap-wrong",
+      },
+    };
+
+    const request = {
+      quantityId: "m",
+      query: {
+        component: "full",
+        expected_carrier_revision: "top-1",
+        expected_generation_id: "gen-1",
+        scope_id: "part-1",
+        scope_kind: "part",
+        snapshot_id: "snap-1",
+      },
+    };
+
+    // Path 1: Fresh read on ready + compatible incoming
+    const freshStep1 = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: frameA,
+      preparedRevision: "rev-A",
+      retained: null,
+      request,
+      status: "ready",
+      tracker,
+    });
+    expect(freshStep1.nextRetained).not.toBeNull();
+    const freshStep2 = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: frameA,
+      preparedRevision: "rev-A",
+      retained: freshStep1.nextRetained,
+      request,
+      status: "ready",
+      tracker,
+    });
+    expect(freshStep2.nextRetained).toBe(freshStep1.nextRetained);
+    expect(freshStep2.displayedEnvelope).toBe(freshStep1.displayedEnvelope);
+
+    // Path 2: Retention on ready + mismatched incoming identity
+    const mismatchStep1 = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: frameB_MismatchedSnapshot,
+      preparedRevision: "rev-B",
+      retained: freshStep1.nextRetained,
+      request,
+      status: "ready",
+      tracker,
+    });
+    expect(mismatchStep1.nextRetained).not.toBeNull();
+    const mismatchStep2 = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: frameB_MismatchedSnapshot,
+      preparedRevision: "rev-B",
+      retained: mismatchStep1.nextRetained,
+      request,
+      status: "ready",
+      tracker,
+    });
+    expect(mismatchStep2.nextRetained).toBe(mismatchStep1.nextRetained);
+    expect(mismatchStep2.displayedEnvelope).toBe(mismatchStep1.displayedEnvelope);
+
+    // Path 3: Retention on loading/stale with existing retained frame
+    const loadingStep1 = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: null,
+      preparedRevision: null,
+      retained: freshStep1.nextRetained,
+      request,
+      status: "loading",
+      tracker,
+    });
+    expect(loadingStep1.nextRetained).not.toBeNull();
+    const loadingStep2 = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: null,
+      preparedRevision: null,
+      retained: loadingStep1.nextRetained,
+      request,
+      status: "loading",
+      tracker,
+    });
+    expect(loadingStep2.nextRetained).toBe(loadingStep1.nextRetained);
+    expect(loadingStep2.displayedEnvelope).toBe(loadingStep1.displayedEnvelope);
+
+    // Path 4: Stale/loading with retained: null and matching incoming frame
+    const staleStep1 = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: frameA,
+      preparedRevision: "rev-A",
+      retained: null,
+      request,
+      status: "stale",
+      tracker,
+    });
+    expect(staleStep1.nextRetained).not.toBeNull();
+    const staleStep2 = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: frameA,
+      preparedRevision: "rev-A",
+      retained: staleStep1.nextRetained,
+      request,
+      status: "stale",
+      tracker,
+    });
+    expect(staleStep2.nextRetained).toBe(staleStep1.nextRetained);
+    expect(staleStep2.displayedEnvelope).toBe(staleStep1.displayedEnvelope);
+
+    // Iterative loop (up to 10 iterations) for fresh ready path
+    let currentRetainedFresh: Viewport3DPrimaryFieldRetainedState | null = null;
+    let freshIterations = 0;
+    for (let i = 0; i < 10; i++) {
+      freshIterations++;
+      const result = resolvePrimaryFieldDisplayedEnvelope({
+        incomingEnvelope: frameA,
+        preparedRevision: "rev-A",
+        retained: currentRetainedFresh,
+        request,
+        status: "ready",
+        tracker,
+      });
+      if (result.nextRetained === currentRetainedFresh) {
+        break;
+      }
+      currentRetainedFresh = result.nextRetained;
+    }
+    expect(freshIterations).toBe(2);
+
+    // Iterative loop (up to 10 iterations) for retention on mismatch path
+    let currentRetainedMismatch: Viewport3DPrimaryFieldRetainedState | null = freshStep1.nextRetained;
+    let mismatchIterations = 0;
+    for (let i = 0; i < 10; i++) {
+      mismatchIterations++;
+      const result = resolvePrimaryFieldDisplayedEnvelope({
+        incomingEnvelope: frameB_MismatchedSnapshot,
+        preparedRevision: "rev-B",
+        retained: currentRetainedMismatch,
+        request,
+        status: "ready",
+        tracker,
+      });
+      if (result.nextRetained === currentRetainedMismatch) {
+        break;
+      }
+      currentRetainedMismatch = result.nextRetained;
+    }
+    expect(mismatchIterations).toBe(2);
+
+    // Iterative loop (up to 10 iterations) for loading/stale with existing retained frame (Path 3)
+    let currentRetainedLoading: Viewport3DPrimaryFieldRetainedState | null = freshStep1.nextRetained;
+    let loadingIterations = 0;
+    for (let i = 0; i < 10; i++) {
+      loadingIterations++;
+      const result = resolvePrimaryFieldDisplayedEnvelope({
+        incomingEnvelope: null,
+        preparedRevision: null,
+        retained: currentRetainedLoading,
+        request,
+        status: "loading",
+        tracker,
+      });
+      if (result.nextRetained === currentRetainedLoading) {
+        break;
+      }
+      currentRetainedLoading = result.nextRetained;
+    }
+    expect(loadingIterations).toBe(2);
+
+    // Iterative loop (up to 10 iterations) for stale initial adoption (Path 4)
+    let currentRetainedStale: Viewport3DPrimaryFieldRetainedState | null = null;
+    let staleIterations = 0;
+    for (let i = 0; i < 10; i++) {
+      staleIterations++;
+      const result = resolvePrimaryFieldDisplayedEnvelope({
+        incomingEnvelope: frameA,
+        preparedRevision: "rev-A",
+        retained: currentRetainedStale,
+        request,
+        status: "stale",
+        tracker,
+      });
+      if (result.nextRetained === currentRetainedStale) {
+        break;
+      }
+      currentRetainedStale = result.nextRetained;
+    }
+    expect(staleIterations).toBe(2);
+
+    // Rejection path does not double-increment tracker counts when called with null retained
+    const rejectionTracker = new Viewport3DResourceTracker();
+    const reqGen2 = {
+      ...request,
+      query: { ...request.query, expected_generation_id: "gen-2" },
+    };
+    const rejStep1 = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: frameA,
+      preparedRevision: "rev-A",
+      retained: freshStep1.nextRetained,
+      request: reqGen2,
+      status: "ready",
+      tracker: rejectionTracker,
+    });
+    expect(rejStep1.nextRetained).toBeNull();
+    expect(rejectionTracker.getRetentionRejectionCounts()).toEqual({ generation: 1 });
+
+    const rejStep2 = resolvePrimaryFieldDisplayedEnvelope({
+      incomingEnvelope: frameA,
+      preparedRevision: "rev-A",
+      retained: rejStep1.nextRetained,
+      request: reqGen2,
+      status: "ready",
+      tracker: rejectionTracker,
+    });
+    expect(rejStep2.nextRetained).toBeNull();
+    expect(rejectionTracker.getRetentionRejectionCounts()).toEqual({ generation: 1 });
+  });
+
+  it("stabilizes the render synchronization loop in at most two renders (regression: render loop)", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const root = createRoot(container as unknown as Element);
+    const frameA: Viewport3DFieldVectorEnvelope = {
+      data: {
+        dtype: "float64",
+        formatVersion: 3,
+        domainGenerationId: "gen-1",
+        grid: [1, 1, 1],
+        indexing: "full_domain",
+        meshTopologyHash: "top-1",
+        nComp: 3,
+        pointCount: 1,
+        quantityId: "m",
+        scopeId: "part-1",
+        scopeKind: "part",
+        valueCount: 3,
+        values: new Float64Array([1, 0, 0]),
+      },
+      etag: '"m-frame-a"',
+      resourceKey:
+        currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-1"),
+      responseMetadata: {
+        component: "full",
+        domainGenerationId: "gen-1",
+        encoding: "FMVP;version=2",
+        fieldIndexing: null,
+        fieldRevision: "rev-A",
+        identityIssues: [],
+        meshTopologyHash: "top-1",
+        nComp: 3,
+        nodeIndexCount: null,
+        pointCount: 1,
+        quantityId: "m",
+        scopeId: "part-1",
+        scopeKind: "part",
+        snapshotId: "snap-1",
+        stageId: null,
+        phaseRad: null,
+        view: null,
+        valueCount: 3,
+      },
+    };
+
+    const frameB_MismatchedSnapshot: Viewport3DFieldVectorEnvelope = {
+      ...frameA,
+      etag: '"m-frame-b"',
+      resourceKey:
+        currentFieldVectorResourcePath("scope_kind=part&scope_id=part-1&component=full&expected_generation_id=gen-1&expected_carrier_revision=top-1&snapshot_id=snap-wrong"),
+      responseMetadata: {
+        ...frameA.responseMetadata!,
+        fieldRevision: "rev-B",
+        snapshotId: "snap-wrong",
+      },
+    };
+
+    const frameC_Compatible: Viewport3DFieldVectorEnvelope = {
+      ...frameA,
+      etag: '"m-frame-c"',
+      responseMetadata: {
+        ...frameA.responseMetadata!,
+        fieldRevision: "rev-C",
+      },
+    };
+
+    const request = {
+      quantityId: "m",
+      query: {
+        component: "full",
+        expected_carrier_revision: "top-1",
+        expected_generation_id: "gen-1",
+        scope_id: "part-1",
+        scope_kind: "part",
+        snapshot_id: "snap-1",
+      },
+    };
+
+    const tracker = new Viewport3DResourceTracker();
+
+    let renderCount = 0;
+    function TestRetentionHarness(props: {
+      incomingEnvelope: Viewport3DFieldVectorEnvelope | null;
+      status: string;
+      preparedRevision: string | null;
+      requestOverride?: typeof request;
+    }) {
+      renderCount++;
+      const [primaryFieldRetained, setPrimaryFieldRetained] =
+        useState<Viewport3DPrimaryFieldRetainedState | null>(null);
+      const activeRequest = props.requestOverride ?? request;
+      const { nextRetained } = useMemo(() => {
+        return resolvePrimaryFieldDisplayedEnvelope({
+          incomingEnvelope: props.incomingEnvelope,
+          status: props.status,
+          preparedRevision: props.preparedRevision,
+          retained: primaryFieldRetained,
+          request: activeRequest,
+          tracker,
+        });
+      }, [props.incomingEnvelope, props.status, props.preparedRevision, primaryFieldRetained, activeRequest]);
+
+      if (nextRetained !== primaryFieldRetained) {
+        setPrimaryFieldRetained(nextRetained);
+      }
+
+      return null;
+    }
+
+    try {
+      renderCount = 0;
+      await act(async () => {
+        root.render(
+          createElement(TestRetentionHarness, {
+            incomingEnvelope: frameA,
+            status: "ready",
+            preparedRevision: "rev-A",
+          }),
+        );
+      });
+      // Initial mount: 1st render has primaryFieldRetained=null -> setState -> 2nd render stabilizes
+      expect(renderCount).toBeLessThanOrEqual(2);
+
+      // Re-render with same frame
+      const countBeforeRerender = renderCount;
+      await act(async () => {
+        root.render(
+          createElement(TestRetentionHarness, {
+            incomingEnvelope: frameA,
+            status: "ready",
+            preparedRevision: "rev-A",
+          }),
+        );
+      });
+      expect(renderCount - countBeforeRerender).toBe(1);
+
+      // Transition to retention (mismatched snapshot arrives)
+      const countBeforeMismatch = renderCount;
+      await act(async () => {
+        root.render(
+          createElement(TestRetentionHarness, {
+            incomingEnvelope: frameB_MismatchedSnapshot,
+            status: "ready",
+            preparedRevision: "rev-B",
+          }),
+        );
+      });
+      // Stabilizes in at most 2 renders
+      expect(renderCount - countBeforeMismatch).toBeLessThanOrEqual(2);
+
+      // Re-render during retention with another mismatched snapshot
+      const countBeforeMismatchRerender = renderCount;
+      await act(async () => {
+        root.render(
+          createElement(TestRetentionHarness, {
+            incomingEnvelope: frameB_MismatchedSnapshot,
+            status: "ready",
+            preparedRevision: "rev-B",
+          }),
+        );
+      });
+      expect(renderCount - countBeforeMismatchRerender).toBe(1);
+
+      // Transition back to ready (matching frame arrives)
+      const countBeforeReturnToReady = renderCount;
+      await act(async () => {
+        root.render(
+          createElement(TestRetentionHarness, {
+            incomingEnvelope: frameC_Compatible,
+            status: "ready",
+            preparedRevision: "rev-C",
+          }),
+        );
+      });
+      expect(renderCount - countBeforeReturnToReady).toBeLessThanOrEqual(2);
+
+      // Transition to stale
+      const countBeforeStale = renderCount;
+      await act(async () => {
+        root.render(
+          createElement(TestRetentionHarness, {
+            incomingEnvelope: frameC_Compatible,
+            status: "stale",
+            preparedRevision: "rev-C",
+          }),
+        );
+      });
+      expect(renderCount - countBeforeStale).toBeLessThanOrEqual(2);
+
+      // Transition to rejected retention (new generation request)
+      const reqGen2 = {
+        ...request,
+        query: { ...request.query, expected_generation_id: "gen-2" },
+      };
+      const countBeforeRejection = renderCount;
+      await act(async () => {
+        root.render(
+          createElement(TestRetentionHarness, {
+            incomingEnvelope: frameC_Compatible,
+            status: "ready",
+            preparedRevision: "rev-C",
+            requestOverride: reqGen2,
+          }),
+        );
+      });
+      expect(renderCount - countBeforeRejection).toBeLessThanOrEqual(2);
+      expect(tracker.getRetentionRejectionCounts()).toEqual({ generation: 1 });
+    } finally {
+      await act(async () => {
+        root.unmount();
+      });
+      dom.restore();
+    }
+  });
+
+  it("keys the render model by the displayed payload revision", () => {
+    const source = readFileSync(sceneModelSourceUrl, "utf8");
+    const buildStart = source.indexOf("const fieldRenderModel = useMemo");
+    const buildEnd = source.indexOf("const visualizationDebugTargets", buildStart);
+    const buildSource = source.slice(buildStart, buildEnd);
+
+    expect(buildSource).toContain("fieldRevision: primaryFieldRevision");
+    expect(buildSource).not.toContain(
+      "fieldRevision: fieldVector.payloadRevision ?? fieldVector.revision",
+    );
+  });
+
   it("keeps camera transport hold outside the React scene model", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
 
@@ -1591,7 +2390,7 @@ describe("useViewport3DSceneModel", () => {
     expect(source).toContain(
       "resolveViewport3DTargetQuantityFieldVectorForTarget({",
     );
-    expect(source).toContain("fieldVector: fdmFieldVector,");
+    expect(source).toContain("fieldVector: savedSelectionActive ? null : fdmFieldVector,");
   });
 
   it("builds synthetic +Z airbox vector fields without backend data", () => {
@@ -1726,8 +2525,9 @@ describe("useViewport3DSceneModel", () => {
 
     expect(source).toContain("useRenderableAnalysisFieldOverlay");
     expect(source).toContain("startAnalysisFieldOverlayPhaseAnimation");
-    expect(source).toContain("const primaryFieldQuantityId = analysisOverlay?.fieldId ?? quantityId;");
-    expect(source).toContain("if (analysisOverlay) {");
+    expect(source).toContain("const primaryFieldQuantityId = analysisOverlay?.fieldId ??");
+    expect(source).toContain('(pinnedObservationActive ? "m" : quantityId);');
+    expect(source).toContain("const analysisPrimaryFieldDemandPlan = useMemo(() => {");
     expect(source).toContain("query: analysisOverlay.query,");
     expect(source).toContain("consumers: [\"primary-field-vector\"],");
     expect(source).toContain("visualizationPhaseRad:");
@@ -1735,6 +2535,49 @@ describe("useViewport3DSceneModel", () => {
     expect(source).toContain("resolveViewport3DAnalysisComplexFieldQuery");
     expect(source).toContain("asDecodedComplexFieldVector");
     expect(source).toContain("Boolean(analysisOverlay) ||");
+  });
+
+  it("binds modal surface provenance to the active owner and validated binary revision", () => {
+    const metadata = {
+      binaryQuery: {
+        component: "full" as const,
+        scope_kind: "full" as const,
+        view: "complex" as const,
+      },
+      fieldId: "eigen-field-a",
+      intent: {
+        analysisRunId: "run a",
+        analysisStageId: "stage/1",
+        artifactRevision: "artifact-4",
+        modeId: "mode:2",
+        sampleId: "sample/3",
+      },
+      resourceRevision: "field-r9",
+    };
+    const canonicalResourceKey = resolveViewport3DFieldVectorResourceKey(
+      metadata.fieldId,
+      metadata.binaryQuery,
+    );
+    expect(
+      resolveViewport3DModeFieldOverlaySourceIdentity({ metadata }),
+    ).toEqual({
+      fieldBufferId:
+        "analysis-mode-field:run%20a:stage%2F1:artifact-4:sample%2F3:mode%3A2:eigen-field-a:field-r9",
+      resourceKey: canonicalResourceKey,
+    });
+    expect(
+      resolveViewport3DModeFieldOverlaySourceIdentity({ metadata: null }),
+    ).toBeNull();
+
+    const source = readFileSync(sceneModelSourceUrl, "utf8");
+    expect(source).toContain("analysisFieldIntentActive: Boolean(analysisFieldIntent)");
+    expect(source).toContain("analysisOverlaySourceIdentity,");
+    expect(source).toContain("metadata.binaryQuery,");
+    const chunkedColorBlock = source.slice(
+      source.indexOf("const chunkedScalarColors = useViewport3DChunkedScalarColors({"),
+      source.indexOf("const fieldRenderModelBuildOptions = useMemo(", source.indexOf("const chunkedScalarColors = useViewport3DChunkedScalarColors({")),
+    );
+    expect(chunkedColorBlock).toContain("!analysisFieldIntent");
   });
 
   it("requests analysis complex field data without making phase part of the resource key", () => {
@@ -1776,7 +2619,9 @@ describe("useViewport3DSceneModel", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
 
     expect(source).toContain("useModelRegionsResource({");
-    expect(source).toContain("enabled: Boolean(scene.data)");
+    expect(source).toContain(
+      "enabled: liveViewportResourcesEnabled && Boolean(scene.data)",
+    );
   });
 
   it("does not use domain selections to filter object region overlays", () => {
@@ -3795,6 +4640,12 @@ describe("useViewport3DSceneModel", () => {
   it("compares target quantities by canonical identity", () => {
     expect(sameViewport3DQuantityId("h_eff", "H_eff")).toBe(true);
     expect(sameViewport3DQuantityId("h_demag", "H_eff")).toBe(false);
+    expect(
+      sameViewport3DQuantityId(
+        "analysis:eigen:sample-0000:mode-0000",
+        "m",
+      ),
+    ).toBe(true);
   });
 
   it("keeps canonical-equivalent target quantities on the primary render path", () => {
@@ -3991,7 +4842,9 @@ describe("useViewport3DSceneModel", () => {
   it("derives primary field resource keys and loads from the primary request object", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
 
-    expect(source).toContain("const primaryFieldDemandPlan = useMemo");
+    expect(source).toContain("const analysisPrimaryFieldDemandPlan = useMemo");
+    expect(source).toContain("const livePrimaryFieldDemandPlan = useMemo");
+    expect(source).toContain("const primaryFieldDemandPlan =");
     expect(source).toContain("resolveViewport3DPrimaryFieldDemandPlan({");
     expect(source).toContain("const primaryFieldRequest = primaryFieldDemandPlan.request;");
     expect(source).toContain(
@@ -3999,6 +4852,9 @@ describe("useViewport3DSceneModel", () => {
     );
     expect(source).toContain("useViewport3DFieldVectorRequest(");
     expect(source).toContain("primaryFieldRequest,");
+    expect(source).toContain("useModeFieldOverlayIntentResource({");
+    expect(source).toContain("modeFieldOverlay.binary ?? displayedFieldVector");
+    expect(source).not.toContain("const analysisComplexFieldVector = useViewport3DFieldVector(");
   });
 
   it("keeps vector-only magnetic parts on scoped sampled field requests", () => {
@@ -4491,7 +5347,9 @@ describe("useViewport3DSceneModel", () => {
     expect(source).toContain("const visualizationState = useVisualizationStateResource();");
     expect(source).toContain("const cameraRegistryCamera = useCameraRegistryCamera();");
     expect(source).toContain("const cameraView = resolveViewport3DSceneCameraView({");
-    expect(source).toContain("const cameraResource = cameraView.cameraResource;");
+    expect(source).toContain("const cameraResource = savedSelectionActive");
+    expect(source).toContain("? savedViewportCamera.cameraResource");
+    expect(source).toContain(": cameraView.cameraResource;");
     expect(source).not.toContain("useViewport3DVisualizationState");
   });
 
@@ -4615,7 +5473,10 @@ describe("useViewport3DSceneModel", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
 
     expect(source).toContain(
-      "domainMeta.data?.discretization === \"fem\"",
+      "const sessionDiscretization = useSessionStatusSelector((status) =>\n    resolveSessionDiscretization(status.data),\n  );",
+    );
+    expect(source).not.toContain(
+      'domainMeta.data?.discretization === "fem"',
     );
     expect(source).toContain(
       "const availableQuantityIdsForPlanning = fdmLaneActive",
@@ -4635,7 +5496,9 @@ describe("useViewport3DSceneModel", () => {
 
     expect(source).toContain("activeCrossSectionFramePreview");
     expect(source).toContain("crossSectionFramePreviewToClip");
-    expect(source).toContain("enabled: Boolean(renderingState?.clip?.enabled && topologyCurrent)");
+    expect(source).toContain(
+      "liveViewportResourcesEnabled &&\n      Boolean(renderingState?.clip?.enabled && topologyCurrent)",
+    );
     expect(source).toContain("crossSectionFrameClip");
     expect(source).toContain("clipFrameRotationDegrees: 0");
   });
@@ -4742,7 +5605,9 @@ describe("useViewport3DSceneModel", () => {
       "fdmRegionMembership.error || fdmRegionMembershipBinary.error",
     );
     expect(source).toContain("fdmBuildFieldRevision");
-    expect(source).toContain("fdmInstanceModel: fdmInstanceModel");
+    expect(source).toContain(
+      "fdmInstanceModel: savedSelectionActive ? null : fdmInstanceModel",
+    );
     expect(source).toContain("fdmVectorSegments");
     expect(source).not.toContain("const fdmInstanceModel = useMemo<");
     expect(source).not.toContain("buildFdmCuboidInstanceModel(");
@@ -4846,5 +5711,43 @@ describe("useViewport3DSceneModel", () => {
       "targetQuantityFieldVectors.responseMetadataByRequestId",
     );
     expect(source).toContain("responseDomainGenerationId:");
+  });
+
+  it("uses the field buffer adopted by a visible FDM render pass for frame ACK identity", () => {
+    const source = readFileSync(sceneModelSourceUrl, "utf8");
+    const adoptionStart = source.indexOf("const adoptedFdmFieldBuffer =");
+    const debugSourceStart = source.indexOf(
+      "const visualizationDebugSource =",
+      adoptionStart,
+    );
+    const adoptionSource = source.slice(adoptionStart, debugSourceStart);
+    const identitySource = source.slice(
+      debugSourceStart,
+      source.indexOf("fullFieldVector:", debugSourceStart),
+    );
+
+    expect(adoptionSource).toContain("view.settings.visible");
+    expect(adoptionSource).toContain("view.fieldBuffer !== null");
+    expect(adoptionSource).toContain(
+      "view.surfaceColors !== null || view.vectorSegments !== null",
+    );
+    expect(adoptionSource).toContain("?.fieldBuffer ?? fdmAirboxFieldBuffer");
+    expect(identitySource).toContain(
+      "fullFieldBufferIdentity: !savedSelectionActive && adoptedFdmFieldBuffer",
+    );
+    expect(identitySource).toContain("bufferId: adoptedFdmFieldBuffer.bufferId");
+    expect(identitySource).not.toContain(
+      "fullFieldBufferIdentity: fdmAirboxFieldBuffer",
+    );
+  });
+
+  it("exposes revision quad and threads tracker to field collections in scene model (LR-14)", () => {
+    const source = readFileSync(sceneModelSourceUrl, "utf8");
+
+    expect(source).toContain("requestedRevision: fieldVectorRevisionString");
+    expect(source).toContain("receivedRevision: fieldVectorPayloadRevisionString");
+    expect(source).toContain("preparedRevision: fieldVectorPreparedRevision");
+    expect(source).toContain("displayedRevision: fieldVectorDisplayedRevision");
+    expect(source).toContain("selectedTargetId: selectedVisualizationTargetId, tracker");
   });
 });

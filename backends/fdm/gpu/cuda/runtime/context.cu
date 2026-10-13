@@ -9,6 +9,7 @@
 
 #include <cuda_runtime.h>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +19,11 @@
 
 namespace fullmag {
 namespace fdm {
+
+static uint64_t steady_clock_now_ns() {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 extern void set_cuda_error(Context &ctx, const char *operation, cudaError_t err);
 extern void set_cufft_error(Context &ctx, const char *operation, cufftResult err);
@@ -33,6 +39,8 @@ extern void launch_newell_compute_spectra_fp64(Context &ctx);
 extern void launch_newell_compute_spectra_fp32(Context &ctx);
 extern bool launch_multilayer_dmi_field_fp64(Context &ctx);
 extern bool launch_multilayer_dmi_field_fp32(Context &ctx);
+extern bool launch_rotated_interfacial_dmi_field_fp64(Context &ctx);
+extern bool launch_rotated_interfacial_dmi_field_fp32(Context &ctx);
 extern bool launch_multilayer_anisotropy_field_fp64(Context &ctx);
 extern bool launch_multilayer_anisotropy_field_fp32(Context &ctx);
 extern void launch_multilayer_exchange_field_fp64(Context &ctx);
@@ -79,6 +87,321 @@ cudaError_t fullmag_fdm_receipt_cuda_memcpy_async(
     return status;
 }
 
+cudaError_t context_gpu_workspace_cuda_malloc_raw(
+    Context &ctx,
+    void **destination,
+    size_t bytes)
+{
+    size_t free_device_bytes = 0;
+    size_t total_device_bytes = 0;
+    const cudaError_t query_status =
+        ::cudaMemGetInfo(&free_device_bytes, &total_device_bytes);
+    if (query_status != cudaSuccess) {
+        ctx.last_error =
+            "fdm_gpu_workspace_memory_query_failed: cuda_error=" +
+            std::to_string(static_cast<int>(query_status));
+        return query_status;
+    }
+    // Match the production transport solvers: keep either 256 MiB or 5% of
+    // device capacity outside this workspace allocation, whichever is larger.
+    constexpr uint64_t minimum_safety_reserve =
+        uint64_t{256} * 1024 * 1024;
+    const uint64_t proportional_reserve =
+        static_cast<uint64_t>(total_device_bytes) / 20;
+    const uint64_t safety_reserve =
+        std::max(minimum_safety_reserve, proportional_reserve);
+    const uint64_t free_bytes = static_cast<uint64_t>(free_device_bytes);
+    const uint64_t usable_device_bytes =
+        free_bytes > safety_reserve ? free_bytes - safety_reserve : 0;
+    const uint64_t required_new_bytes = static_cast<uint64_t>(bytes);
+    if (required_new_bytes > usable_device_bytes) {
+        ctx.last_error =
+            "fdm_gpu_workspace_oom_preflight: required_new_bytes=" +
+            std::to_string(required_new_bytes) +
+            " usable_device_bytes=" + std::to_string(usable_device_bytes) +
+            " free_device_bytes=" + std::to_string(free_bytes) +
+            " total_device_bytes=" +
+            std::to_string(static_cast<uint64_t>(total_device_bytes)) +
+            " safety_reserve_bytes=" + std::to_string(safety_reserve);
+        return cudaErrorMemoryAllocation;
+    }
+    const cudaError_t status = ::cudaMalloc(destination, bytes);
+    if (status == cudaSuccess) {
+        context_note_gpu_workspace_allocation(ctx, *destination, bytes);
+    }
+    return status;
+}
+
+bool context_preflight_single_grid_workspace(
+    Context &ctx,
+    const fullmag_fdm_plan_desc &plan,
+    bool reserve_rotated_dmi)
+{
+    constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    uint64_t required_aggregate_workspace_bytes = 0;
+    auto overflow = [&]() -> bool {
+        ctx.last_error =
+            "fdm_gpu_workspace_oom_preflight: aggregate workspace byte count overflows uint64_t";
+        return false;
+    };
+    auto add_bytes = [&](uint64_t bytes) -> bool {
+        if (required_aggregate_workspace_bytes > maximum - bytes) {
+            return overflow();
+        }
+        required_aggregate_workspace_bytes += bytes;
+        return true;
+    };
+    auto add_product = [&](uint64_t count, uint64_t element_bytes) -> bool {
+        if (count != 0 && element_bytes > maximum / count) {
+            return overflow();
+        }
+        return add_bytes(count * element_bytes);
+    };
+
+    const uint64_t scalar_bytes =
+        ctx.precision == FULLMAG_FDM_PRECISION_SINGLE
+            ? sizeof(float) : sizeof(double);
+    if (ctx.cell_count > maximum / scalar_bytes) return overflow();
+    const uint64_t component_bytes = ctx.cell_count * scalar_bytes;
+
+    uint64_t vector_field_count = 10;
+    if (reserve_rotated_dmi) ++vector_field_count;
+    if (ctx.has_frozen_mask) ++vector_field_count;
+    switch (ctx.integrator) {
+    case FULLMAG_FDM_INTEGRATOR_DP45:
+        vector_field_count += 7;
+        break;
+    case FULLMAG_FDM_INTEGRATOR_RK23:
+        vector_field_count += 4;
+        break;
+    case FULLMAG_FDM_INTEGRATOR_RK4:
+        vector_field_count += 3;
+        break;
+    case FULLMAG_FDM_INTEGRATOR_ABM3:
+        vector_field_count += 6;
+        break;
+    default:
+        break;
+    }
+    // h_oe_static is shared by descriptor-provided Oersted data and the
+    // late static external-field profile setter.  The latter is intentionally
+    // outside the legacy plan descriptor, so reserve its three components in
+    // the setup preflight even when no Oersted source was requested yet.
+    constexpr uint64_t h_oe_static_vector_fields = 1;
+    vector_field_count += h_oe_static_vector_fields;
+
+    // Base solver fields, scalar energy density, and both four-slot snapshot
+    // pools are mandatory setup-owned device storage.
+    constexpr uint64_t snapshot_vector_fields =
+        kFdmAsyncFieldSnapshotPoolCapacity +
+        kFdmAsyncPreviewSnapshotPoolCapacity;
+    const uint64_t scalar_component_count =
+        3 * (vector_field_count + snapshot_vector_fields) + 1;
+    if (!add_product(scalar_component_count, component_bytes)) return false;
+
+    // Synchronous preview accepts FP64 output even for an FP32 context. Keep
+    // its maximum downsample target setup-owned so observation never extends
+    // the device workspace after the setup baseline has been sealed.
+    if (!add_product(ctx.cell_count, uint64_t{3} * sizeof(double))) {
+        return false;
+    }
+
+    // Reduction arrays are always FP64. Fixed control, accepted-batch, and
+    // attempt-trace records are allocated in the same setup transaction.
+    if (ctx.cell_count > maximum - 255ULL) return overflow();
+    const uint64_t adaptive_metric_blocks = (ctx.cell_count + 255ULL) / 256ULL;
+    if (adaptive_metric_blocks > maximum / 3) return overflow();
+    const uint64_t scratch_len = std::max<uint64_t>(
+        ctx.cell_count, uint64_t{3} * adaptive_metric_blocks);
+    if (!add_product(scratch_len, uint64_t{2} * sizeof(double)) ||
+        !add_bytes(sizeof(AdaptiveDeviceControl)) ||
+        !add_bytes(sizeof(AdaptiveDeviceBatchState)) ||
+        !add_product(
+            ADAPTIVE_ACCEPTED_BATCH_CAPACITY,
+            sizeof(AdaptiveDeviceControl)) ||
+        !add_product(
+            FULLMAG_FDM_ADAPTIVE_ATTEMPT_CAPACITY_V1,
+            sizeof(fullmag_fdm_adaptive_attempt_v1))) {
+        return false;
+    }
+
+    uint64_t mask_bytes_per_cell = 0;
+    if (ctx.has_active_mask) ++mask_bytes_per_cell;
+    if (ctx.has_frozen_mask) ++mask_bytes_per_cell;
+    if (ctx.has_sot_active_mask) ++mask_bytes_per_cell;
+    if (ctx.has_slonczewski_active_mask) ++mask_bytes_per_cell;
+    if (!add_product(ctx.cell_count, mask_bytes_per_cell)) return false;
+    if (ctx.has_region_mask &&
+        !add_product(ctx.cell_count, sizeof(uint32_t))) {
+        return false;
+    }
+    if (ctx.has_exchange_lut &&
+        !add_product(
+            uint64_t{FULLMAG_FDM_MAX_EXCHANGE_REGIONS} *
+                FULLMAG_FDM_MAX_EXCHANGE_REGIONS,
+            sizeof(double))) {
+        return false;
+    }
+
+    if (ctx.enable_demag) {
+        uint64_t fft_nx = ctx.fft_nx;
+        uint64_t fft_ny = ctx.fft_ny;
+        uint64_t fft_nz = ctx.fft_nz;
+        if (fft_nx == 0 || fft_ny == 0 || fft_nz == 0) {
+            fft_nx = uint64_t{2} * ctx.nx;
+            fft_ny = uint64_t{2} * ctx.ny;
+            fft_nz = ctx.thin_film_2d_demag ? 1 : uint64_t{2} * ctx.nz;
+        }
+        if (fft_nx > UINT32_MAX || fft_ny > UINT32_MAX ||
+            fft_nz > UINT32_MAX || fft_nx == 0 || fft_ny == 0 ||
+            fft_nz == 0 || fft_nx > maximum / fft_ny ||
+            fft_nx * fft_ny > maximum / fft_nz) {
+            return overflow();
+        }
+        const uint64_t fft_cell_count = fft_nx * fft_ny * fft_nz;
+        if (fft_cell_count >
+            static_cast<uint64_t>(std::numeric_limits<int>::max())) {
+            ctx.last_error =
+                "demag FFT component stride exceeds cuFFT PlanMany limit";
+            return false;
+        }
+        ctx.fft_nx = static_cast<uint32_t>(fft_nx);
+        ctx.fft_ny = static_cast<uint32_t>(fft_ny);
+        ctx.fft_nz = static_cast<uint32_t>(fft_nz);
+
+        const uint64_t complex_bytes =
+            ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE
+                ? sizeof(cufftDoubleComplex) : sizeof(cufftComplex);
+        if (fft_cell_count > maximum / 6 ||
+            !add_product(uint64_t{3} * fft_cell_count, complex_bytes) ||
+            !add_product(uint64_t{6} * fft_cell_count, complex_bytes)) {
+            return false;
+        }
+
+        // NVIDIA documents 8 * batch * N complex elements as the cuFFT
+        // worst-case temporary storage. cufftEstimateMany may be smaller than
+        // the eventual plan requirement, so it is not an atomic OOM gate.
+        constexpr uint64_t cufft_batch = 3;
+        constexpr uint64_t cufft_worst_case_elements_per_transform = 8;
+        if (fft_cell_count >
+                maximum /
+                    (cufft_batch * cufft_worst_case_elements_per_transform) ||
+            !add_product(
+                cufft_batch * cufft_worst_case_elements_per_transform *
+                    fft_cell_count,
+                complex_bytes))
+        {
+            return false;
+        }
+    }
+
+    uint64_t optional_f64_fields = 0;
+    if (ctx.has_uniaxial_anisotropy) {
+        if (plan.ku1_field != nullptr) ++optional_f64_fields;
+        if (plan.ku2_field != nullptr) ++optional_f64_fields;
+    }
+    if (ctx.has_cubic_anisotropy) {
+        if (plan.kc1_field != nullptr) ++optional_f64_fields;
+        if (plan.kc2_field != nullptr) ++optional_f64_fields;
+        if (plan.kc3_field != nullptr) ++optional_f64_fields;
+    }
+    const bool uploads_boundary =
+        plan.boundary_correction != FULLMAG_FDM_BOUNDARY_NONE &&
+        plan.volume_fraction != nullptr &&
+        plan.volume_fraction_len == ctx.cell_count;
+    if (uploads_boundary) {
+        ++optional_f64_fields;
+        if (plan.face_link_xp && plan.face_link_xm &&
+            plan.face_link_yp && plan.face_link_ym &&
+            plan.face_link_zp && plan.face_link_zm) {
+            optional_f64_fields += 6;
+        }
+        if (plan.boundary_correction == FULLMAG_FDM_BOUNDARY_FULL &&
+            plan.delta_xp && plan.delta_xm &&
+            plan.delta_yp && plan.delta_ym &&
+            plan.delta_zp && plan.delta_zm) {
+            optional_f64_fields += 6;
+        }
+    }
+    if (optional_f64_fields != 0) {
+        if (ctx.cell_count > maximum / optional_f64_fields) return overflow();
+        const uint64_t optional_f64_values =
+            optional_f64_fields * ctx.cell_count;
+        if (!add_product(optional_f64_values, sizeof(double))) return false;
+    }
+
+    if (uploads_boundary && plan.has_demag_boundary_corr &&
+        plan.demag_corr_target_idx && plan.demag_corr_source_idx &&
+        plan.demag_corr_tensor && plan.demag_corr_target_count != 0 &&
+        plan.demag_corr_stencil_size != 0) {
+        const uint64_t targets = plan.demag_corr_target_count;
+        const uint64_t stencil = plan.demag_corr_stencil_size;
+        if (targets > maximum / stencil) return overflow();
+        const uint64_t pairs = targets * stencil;
+        if (!add_product(targets, sizeof(int32_t)) ||
+            !add_product(pairs, sizeof(int32_t)) ||
+            pairs > maximum / 6 ||
+            !add_product(6 * pairs, sizeof(double))) {
+            return false;
+        }
+    }
+
+    size_t free_device_bytes = 0;
+    size_t total_device_bytes = 0;
+    const cudaError_t query_status =
+        ::cudaMemGetInfo(&free_device_bytes, &total_device_bytes);
+    if (query_status != cudaSuccess) {
+        ctx.last_error =
+            "fdm_gpu_workspace_memory_query_failed: cuda_error=" +
+            std::to_string(static_cast<int>(query_status));
+        return false;
+    }
+    constexpr uint64_t minimum_safety_reserve =
+        uint64_t{256} * 1024 * 1024;
+    const uint64_t proportional_reserve =
+        static_cast<uint64_t>(total_device_bytes) / 20;
+    const uint64_t safety_reserve =
+        std::max(minimum_safety_reserve, proportional_reserve);
+    const uint64_t free_bytes = static_cast<uint64_t>(free_device_bytes);
+    const uint64_t usable_device_bytes =
+        free_bytes > safety_reserve ? free_bytes - safety_reserve : 0;
+    if (required_aggregate_workspace_bytes > usable_device_bytes) {
+        ctx.last_error =
+            "fdm_gpu_workspace_oom_preflight: required_aggregate_workspace_bytes=" +
+            std::to_string(required_aggregate_workspace_bytes) +
+            " usable_device_bytes=" + std::to_string(usable_device_bytes) +
+            " free_device_bytes=" + std::to_string(free_bytes) +
+            " total_device_bytes=" +
+            std::to_string(static_cast<uint64_t>(total_device_bytes)) +
+            " safety_reserve_bytes=" + std::to_string(safety_reserve);
+        return false;
+    }
+    return true;
+}
+
+cudaError_t context_gpu_workspace_cuda_free(Context &ctx, void *pointer) {
+    const cudaError_t status = ::cudaFree(pointer);
+    if (status == cudaSuccess) {
+        context_note_gpu_workspace_free(ctx, pointer);
+    }
+    return status;
+}
+
+cufftResult context_gpu_workspace_cufft_create(
+    Context &ctx,
+    cufftHandle *plan)
+{
+    const cufftResult status = ::cufftCreate(plan);
+    if (status == CUFFT_SUCCESS) {
+        context_note_gpu_workspace_fft_plan_creation(ctx);
+    }
+    return status;
+}
+
+static cudaError_t fullmag_fdm_untracked_cuda_free(void *pointer) {
+    return ::cudaFree(pointer);
+}
+
 // Every host-boundary copy in this translation unit is routed through the
 // allocation-free receipt hook. Device-internal copies are intentionally not
 // classified as host transfers.
@@ -88,11 +411,19 @@ cudaError_t fullmag_fdm_receipt_cuda_memcpy_async(
 #define cudaMemcpyAsync(destination, source, bytes, kind, stream) \
     fullmag_fdm_receipt_cuda_memcpy_async( \
         const_cast<Context &>(ctx), destination, source, bytes, kind, stream)
+#define cudaMalloc(destination, bytes) \
+    context_gpu_workspace_cuda_malloc( \
+        const_cast<Context &>(ctx), destination, bytes)
+#define cudaFree(pointer) \
+    context_gpu_workspace_cuda_free(const_cast<Context &>(ctx), pointer)
+#define cufftCreate(plan) \
+    context_gpu_workspace_cufft_create(const_cast<Context &>(ctx), plan)
 
 static void free_boundary_correction(Context &ctx);
 static void free_anisotropy_fields(Context &ctx);
 static void free_cubic_anisotropy_fields(Context &ctx);
-static bool context_refresh_anisotropy_observable(Context &ctx);
+static bool free_tracked_vector_field(Context &ctx, DeviceVectorField &field);
+static bool launch_anisotropy_observable(Context &ctx);
 static bool upload_f64_array(Context &ctx, double *&dst, const double *src,
                               uint64_t len, const char *label);
 
@@ -195,10 +526,18 @@ static bool alloc_vector_field(Context &ctx, DeviceVectorField &field) {
     if (err != cudaSuccess) { set_cuda_error(ctx, "cudaMalloc(x)", err); return false; }
 
     err = cudaMalloc(&field.y, bytes);
-    if (err != cudaSuccess) { set_cuda_error(ctx, "cudaMalloc(y)", err); return false; }
+    if (err != cudaSuccess) {
+        (void)free_tracked_vector_field(ctx, field);
+        set_cuda_error(ctx, "cudaMalloc(y)", err);
+        return false;
+    }
 
     err = cudaMalloc(&field.z, bytes);
-    if (err != cudaSuccess) { set_cuda_error(ctx, "cudaMalloc(z)", err); return false; }
+    if (err != cudaSuccess) {
+        (void)free_tracked_vector_field(ctx, field);
+        set_cuda_error(ctx, "cudaMalloc(z)", err);
+        return false;
+    }
 
     return true;
 }
@@ -221,9 +560,58 @@ static void free_energy_density(Context &ctx) {
 }
 
 static void free_vector_field(DeviceVectorField &field) {
-    if (field.x) { cudaFree(field.x); field.x = nullptr; }
-    if (field.y) { cudaFree(field.y); field.y = nullptr; }
-    if (field.z) { cudaFree(field.z); field.z = nullptr; }
+    if (field.x) { fullmag_fdm_untracked_cuda_free(field.x); field.x = nullptr; }
+    if (field.y) { fullmag_fdm_untracked_cuda_free(field.y); field.y = nullptr; }
+    if (field.z) { fullmag_fdm_untracked_cuda_free(field.z); field.z = nullptr; }
+}
+
+// Rotated-DMI workspace extension allocations happen after the normal setup
+// baseline has been sealed.  A memset failure must release the tracked
+// allocations before returning so a retry cannot observe a stale complete
+// field (or leak the live-allocation accounting entry).  A failed cudaFree is
+// deliberately retained in the field so teardown/retry can attempt it again.
+static bool free_tracked_vector_field(Context &ctx, DeviceVectorField &field) {
+    bool released = true;
+    const auto release = [&](void *&pointer) {
+        if (!pointer) {
+            return;
+        }
+        if (context_gpu_workspace_cuda_free(ctx, pointer) == cudaSuccess) {
+            pointer = nullptr;
+        } else {
+            ctx.gpu_workspace_accounting_valid = false;
+            released = false;
+        }
+    };
+    release(field.x);
+    release(field.y);
+    release(field.z);
+    return released;
+}
+
+static void free_regional_field_drives(Context &ctx) {
+    if (ctx.regional_field_drive_x) {
+        fullmag_fdm_untracked_cuda_free(ctx.regional_field_drive_x);
+        ctx.regional_field_drive_x = nullptr;
+    }
+    if (ctx.regional_field_drive_y) {
+        fullmag_fdm_untracked_cuda_free(ctx.regional_field_drive_y);
+        ctx.regional_field_drive_y = nullptr;
+    }
+    if (ctx.regional_field_drive_z) {
+        fullmag_fdm_untracked_cuda_free(ctx.regional_field_drive_z);
+        ctx.regional_field_drive_z = nullptr;
+    }
+    if (ctx.regional_field_drive_params) {
+        fullmag_fdm_untracked_cuda_free(ctx.regional_field_drive_params);
+        ctx.regional_field_drive_params = nullptr;
+    }
+    if (ctx.regional_field_drive_points) {
+        fullmag_fdm_untracked_cuda_free(ctx.regional_field_drive_points);
+        ctx.regional_field_drive_points = nullptr;
+    }
+    ctx.regional_field_drive_count = 0;
+    ctx.regional_field_drive_point_count = 0;
 }
 
 static void destroy_async_field_snapshot_pool_resources(AsyncFieldSnapshotPool &pool)
@@ -258,8 +646,8 @@ static void destroy_async_field_snapshot_pool_resources(AsyncFieldSnapshotPool &
     pool.component_bytes = 0;
     pool.host_soa_bytes = 0;
     pool.cell_count = 0;
-    __atomic_store_n(&pool.leased_slots, 0u, __ATOMIC_RELEASE);
-    __atomic_store_n(&pool.retired_slots, 0u, __ATOMIC_RELEASE);
+    pool.leased_slots.store(0u, std::memory_order_release);
+    pool.retired_slots.store(0u, std::memory_order_release);
     pool.initialized = false;
 }
 
@@ -312,8 +700,8 @@ bool initialize_async_field_snapshot_pool(Context &ctx)
         if (error != cudaSuccess) return fail("cudaEventCreate(async_snapshot_pool.done)", error);
         slot.done_event = reinterpret_cast<void *>(done_event);
     }
-    __atomic_store_n(&pool.leased_slots, 0u, __ATOMIC_RELEASE);
-    __atomic_store_n(&pool.retired_slots, 0u, __ATOMIC_RELEASE);
+    pool.leased_slots.store(0u, std::memory_order_release);
+    pool.retired_slots.store(0u, std::memory_order_release);
     pool.initialized = true;
     return true;
 }
@@ -343,9 +731,9 @@ bool acquire_async_field_snapshot_pool_slot(
          candidate < kFdmAsyncFieldSnapshotPoolCapacity;
          ++candidate) {
         const uint32_t bit = uint32_t{1} << candidate;
-        uint32_t leased = __atomic_load_n(&pool.leased_slots, __ATOMIC_ACQUIRE);
+        uint32_t leased = pool.leased_slots.load(std::memory_order_acquire);
         if ((leased & bit) != 0) {
-            const uint32_t retired = __atomic_load_n(&pool.retired_slots, __ATOMIC_ACQUIRE);
+            const uint32_t retired = pool.retired_slots.load(std::memory_order_acquire);
             if ((retired & bit) == 0 ||
                 cudaEventQuery(reinterpret_cast<cudaEvent_t>(pool.slots[candidate].done_event)) !=
                     cudaSuccess) {
@@ -354,18 +742,16 @@ bool acquire_async_field_snapshot_pool_slot(
             // A caller released the handle before waiting.  Reclaim it only
             // after the completion event is observable, then retry the same
             // slot through the normal lease CAS.
-            __atomic_fetch_and(&pool.retired_slots, ~bit, __ATOMIC_ACQ_REL);
-            __atomic_fetch_and(&pool.leased_slots, ~bit, __ATOMIC_ACQ_REL);
-            leased = __atomic_load_n(&pool.leased_slots, __ATOMIC_ACQUIRE);
+            pool.retired_slots.fetch_and(~bit, std::memory_order_acq_rel);
+            pool.leased_slots.fetch_and(~bit, std::memory_order_acq_rel);
+            leased = pool.leased_slots.load(std::memory_order_acquire);
         }
         if ((leased & bit) != 0) continue;
-        if (__atomic_compare_exchange_n(
-                &pool.leased_slots,
-                &leased,
+        if (pool.leased_slots.compare_exchange_weak(
+                leased,
                 leased | bit,
-                true,
-                __ATOMIC_ACQ_REL,
-                __ATOMIC_ACQUIRE)) {
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
             slot_index = candidate;
             return true;
         }
@@ -383,10 +769,10 @@ void release_async_field_snapshot_pool_slot(
     if (slot_index >= kFdmAsyncFieldSnapshotPoolCapacity) return;
     const uint32_t bit = uint32_t{1} << slot_index;
     if (work_complete) {
-        __atomic_fetch_and(&pool.retired_slots, ~bit, __ATOMIC_ACQ_REL);
-        __atomic_fetch_and(&pool.leased_slots, ~bit, __ATOMIC_ACQ_REL);
+        pool.retired_slots.fetch_and(~bit, std::memory_order_acq_rel);
+        pool.leased_slots.fetch_and(~bit, std::memory_order_acq_rel);
     } else {
-        __atomic_fetch_or(&pool.retired_slots, bit, __ATOMIC_ACQ_REL);
+        pool.retired_slots.fetch_or(bit, std::memory_order_acq_rel);
     }
 }
 
@@ -415,14 +801,14 @@ static void destroy_async_preview_snapshot_pool_resources(AsyncPreviewSnapshotPo
             slot.host_xyz = nullptr;
         }
         if (slot.device_xyz) {
-            cudaFree(slot.device_xyz);
+            fullmag_fdm_untracked_cuda_free(slot.device_xyz);
             slot.device_xyz = nullptr;
         }
     }
     pool.xyz_bytes = 0;
     pool.max_preview_count = 0;
-    __atomic_store_n(&pool.leased_slots, 0u, __ATOMIC_RELEASE);
-    __atomic_store_n(&pool.retired_slots, 0u, __ATOMIC_RELEASE);
+    pool.leased_slots.store(0u, std::memory_order_release);
+    pool.retired_slots.store(0u, std::memory_order_release);
     pool.initialized = false;
 }
 
@@ -472,8 +858,8 @@ bool initialize_async_preview_snapshot_pool(Context &ctx)
         if (error != cudaSuccess) return fail("cudaEventCreate(async_preview_pool.done)", error);
         slot.done_event = reinterpret_cast<void *>(done_event);
     }
-    __atomic_store_n(&pool.leased_slots, 0u, __ATOMIC_RELEASE);
-    __atomic_store_n(&pool.retired_slots, 0u, __ATOMIC_RELEASE);
+    pool.leased_slots.store(0u, std::memory_order_release);
+    pool.retired_slots.store(0u, std::memory_order_release);
     pool.initialized = true;
     return true;
 }
@@ -508,26 +894,24 @@ bool acquire_async_preview_snapshot_pool_slot(
          candidate < kFdmAsyncPreviewSnapshotPoolCapacity;
          ++candidate) {
         const uint32_t bit = uint32_t{1} << candidate;
-        uint32_t leased = __atomic_load_n(&pool.leased_slots, __ATOMIC_ACQUIRE);
+        uint32_t leased = pool.leased_slots.load(std::memory_order_acquire);
         if ((leased & bit) != 0) {
-            const uint32_t retired = __atomic_load_n(&pool.retired_slots, __ATOMIC_ACQUIRE);
+            const uint32_t retired = pool.retired_slots.load(std::memory_order_acquire);
             if ((retired & bit) == 0 ||
                 cudaEventQuery(reinterpret_cast<cudaEvent_t>(pool.slots[candidate].done_event)) !=
                     cudaSuccess) {
                 continue;
             }
-            __atomic_fetch_and(&pool.retired_slots, ~bit, __ATOMIC_ACQ_REL);
-            __atomic_fetch_and(&pool.leased_slots, ~bit, __ATOMIC_ACQ_REL);
-            leased = __atomic_load_n(&pool.leased_slots, __ATOMIC_ACQUIRE);
+            pool.retired_slots.fetch_and(~bit, std::memory_order_acq_rel);
+            pool.leased_slots.fetch_and(~bit, std::memory_order_acq_rel);
+            leased = pool.leased_slots.load(std::memory_order_acquire);
         }
         if ((leased & bit) != 0) continue;
-        if (__atomic_compare_exchange_n(
-                &pool.leased_slots,
-                &leased,
+        if (pool.leased_slots.compare_exchange_weak(
+                leased,
                 leased | bit,
-                true,
-                __ATOMIC_ACQ_REL,
-                __ATOMIC_ACQUIRE)) {
+                std::memory_order_acq_rel,
+                std::memory_order_acquire)) {
             slot_index = candidate;
             return true;
         }
@@ -545,10 +929,10 @@ void release_async_preview_snapshot_pool_slot(
     if (slot_index >= kFdmAsyncPreviewSnapshotPoolCapacity) return;
     const uint32_t bit = uint32_t{1} << slot_index;
     if (work_complete) {
-        __atomic_fetch_and(&pool.retired_slots, ~bit, __ATOMIC_ACQ_REL);
-        __atomic_fetch_and(&pool.leased_slots, ~bit, __ATOMIC_ACQ_REL);
+        pool.retired_slots.fetch_and(~bit, std::memory_order_acq_rel);
+        pool.leased_slots.fetch_and(~bit, std::memory_order_acq_rel);
     } else {
-        __atomic_fetch_or(&pool.retired_slots, bit, __ATOMIC_ACQ_REL);
+        pool.retired_slots.fetch_or(bit, std::memory_order_acq_rel);
     }
 }
 
@@ -601,9 +985,16 @@ static bool alloc_vector_field_cells(
         }
         return true;
     };
-    return alloc_component(&field.x, "x") &&
-        alloc_component(&field.y, "y") &&
-        alloc_component(&field.z, "z");
+    if (!alloc_component(&field.x, "x")) return false;
+    if (!alloc_component(&field.y, "y")) {
+        (void)free_tracked_vector_field(ctx, field);
+        return false;
+    }
+    if (!alloc_component(&field.z, "z")) {
+        (void)free_tracked_vector_field(ctx, field);
+        return false;
+    }
+    return true;
 }
 
 static bool upload_vector_field_aos_f64(
@@ -758,7 +1149,7 @@ static bool alloc_tensor_kernel_cells(
         alloc_component(&kernel.yz, "yz");
 }
 
-static void free_device_demag_kernel(DeviceDemagKernel &kernel) {
+static void free_device_demag_kernel(Context &ctx, DeviceDemagKernel &kernel) {
     if (kernel.xx) { cudaFree(kernel.xx); kernel.xx = nullptr; }
     if (kernel.yy) { cudaFree(kernel.yy); kernel.yy = nullptr; }
     if (kernel.zz) { cudaFree(kernel.zz); kernel.zz = nullptr; }
@@ -767,7 +1158,7 @@ static void free_device_demag_kernel(DeviceDemagKernel &kernel) {
     if (kernel.yz) { cudaFree(kernel.yz); kernel.yz = nullptr; }
 }
 
-static void free_device_push_map(DeviceMultilayerPushMap &map) {
+static void free_device_push_map(Context &ctx, DeviceMultilayerPushMap &map) {
     if (map.offsets) {
         cudaFree(map.offsets);
         map.offsets = nullptr;
@@ -784,7 +1175,7 @@ static void free_device_push_map(DeviceMultilayerPushMap &map) {
     map.entry_count = 0;
 }
 
-static void free_device_pull_map(DeviceMultilayerPullMap &map) {
+static void free_device_pull_map(Context &ctx, DeviceMultilayerPullMap &map) {
     if (map.indices) {
         cudaFree(map.indices);
         map.indices = nullptr;
@@ -816,7 +1207,10 @@ static void unbind_multilayer_fft_workspace(Context &ctx) {
     ctx.fft_workspace_bound_to_multilayer_cache = false;
 }
 
-static void free_multilayer_fft_workspace(DeviceMultilayerFftWorkspace &workspace) {
+static void free_multilayer_fft_workspace(
+    Context &ctx,
+    DeviceMultilayerFftWorkspace &workspace)
+{
     if (workspace.plan_valid) {
         cufftDestroy(workspace.plan);
         workspace.plan = 0;
@@ -874,7 +1268,7 @@ static void free_multilayer_fft_workspaces(Context &ctx) {
     unbind_multilayer_fft_workspace(ctx);
     free_multilayer_batch_fft_buffers(ctx);
     for (DeviceMultilayerFftWorkspace &workspace : ctx.multilayer_fft_workspaces) {
-        free_multilayer_fft_workspace(workspace);
+        free_multilayer_fft_workspace(ctx, workspace);
     }
     ctx.multilayer_fft_workspaces.clear();
 }
@@ -938,6 +1332,21 @@ static bool upload_f64_vector(
     return true;
 }
 
+static double push_map_axis_overlap(
+    double convolution_lo,
+    double convolution_hi,
+    int64_t native_index,
+    double native_spacing)
+{
+    const double native_lo =
+        static_cast<double>(native_index) * native_spacing;
+    const double native_hi = native_lo + native_spacing;
+    return std::max(
+        0.0,
+        std::min(convolution_hi, native_hi) -
+            std::max(convolution_lo, native_lo));
+}
+
 static void build_push_map_host(
     const fullmag_fdm_grid_desc &native_grid,
     const fullmag_fdm_grid_desc &convolution_grid,
@@ -972,21 +1381,18 @@ static void build_push_map_host(
 
                 for (int64_t nz = nz_lo; nz < nz_hi; ++nz) {
                     if (nz < 0 || nz >= static_cast<int64_t>(native_grid.nz)) continue;
-                    const double n_lo_z = static_cast<double>(nz) * native_grid.dz;
-                    const double n_hi_z = n_lo_z + native_grid.dz;
-                    const double oz = std::max(0.0, std::min(c_hi_z, n_hi_z) - std::max(c_lo_z, n_lo_z));
+                    const double oz = push_map_axis_overlap(
+                        c_lo_z, c_hi_z, nz, native_grid.dz);
                     if (oz <= 0.0) continue;
                     for (int64_t ny = ny_lo; ny < ny_hi; ++ny) {
                         if (ny < 0 || ny >= static_cast<int64_t>(native_grid.ny)) continue;
-                        const double n_lo_y = static_cast<double>(ny) * native_grid.dy;
-                        const double n_hi_y = n_lo_y + native_grid.dy;
-                        const double oy = std::max(0.0, std::min(c_hi_y, n_hi_y) - std::max(c_lo_y, n_lo_y));
+                        const double oy = push_map_axis_overlap(
+                            c_lo_y, c_hi_y, ny, native_grid.dy);
                         if (oy <= 0.0) continue;
                         for (int64_t nx = nx_lo; nx < nx_hi; ++nx) {
                             if (nx < 0 || nx >= static_cast<int64_t>(native_grid.nx)) continue;
-                            const double n_lo_x = static_cast<double>(nx) * native_grid.dx;
-                            const double n_hi_x = n_lo_x + native_grid.dx;
-                            const double ox = std::max(0.0, std::min(c_hi_x, n_hi_x) - std::max(c_lo_x, n_lo_x));
+                            const double ox = push_map_axis_overlap(
+                                c_lo_x, c_hi_x, nx, native_grid.dx);
                             if (ox <= 0.0) continue;
 
                             indices.push_back(flatten_grid_index(
@@ -1053,6 +1459,595 @@ static void build_pull_map_host(
             }
         }
     }
+}
+
+static bool count_push_axis_overlaps(
+    Context &ctx,
+    uint32_t convolution_count,
+    double convolution_spacing,
+    uint32_t native_count,
+    double native_spacing,
+    uint64_t &overlap_count)
+{
+    overlap_count = 0;
+    constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    const long double int64_max =
+        static_cast<long double>(std::numeric_limits<int64_t>::max());
+
+    for (uint32_t convolution_index = 0;
+         convolution_index < convolution_count;
+         ++convolution_index)
+    {
+        const double convolution_lo =
+            static_cast<double>(convolution_index) * convolution_spacing;
+        const double convolution_hi = convolution_lo + convolution_spacing;
+        const double native_lo = std::floor(convolution_lo / native_spacing);
+        const double native_hi = std::ceil(convolution_hi / native_spacing);
+        if (!std::isfinite(native_lo) || !std::isfinite(native_hi) ||
+            static_cast<long double>(native_lo) > int64_max ||
+            static_cast<long double>(native_hi) > int64_max)
+        {
+            ctx.last_error =
+                "multilayer push-map overlap range exceeds int64";
+            return false;
+        }
+
+        const int64_t native_lo_index = static_cast<int64_t>(native_lo);
+        const int64_t native_hi_index = static_cast<int64_t>(native_hi);
+        for (int64_t native_index = native_lo_index;
+             native_index < native_hi_index;
+             ++native_index)
+        {
+            if (native_index < 0 ||
+                native_index >= static_cast<int64_t>(native_count) ||
+                push_map_axis_overlap(
+                    convolution_lo,
+                    convolution_hi,
+                    native_index,
+                    native_spacing) <= 0.0)
+            {
+                continue;
+            }
+            if (overlap_count == maximum) {
+                ctx.last_error =
+                    "fdm_gpu_workspace_oom_preflight: aggregate workspace byte count overflows uint64_t";
+                return false;
+            }
+            ++overlap_count;
+        }
+    }
+    return true;
+}
+
+static bool count_push_map_entries(
+    Context &ctx,
+    const fullmag_fdm_grid_desc &native_grid,
+    const fullmag_fdm_grid_desc &convolution_grid,
+    uint64_t &entry_count)
+{
+    uint64_t overlap_x = 0;
+    uint64_t overlap_y = 0;
+    uint64_t overlap_z = 0;
+    if (!count_push_axis_overlaps(
+            ctx,
+            convolution_grid.nx,
+            convolution_grid.dx,
+            native_grid.nx,
+            native_grid.dx,
+            overlap_x) ||
+        !count_push_axis_overlaps(
+            ctx,
+            convolution_grid.ny,
+            convolution_grid.dy,
+            native_grid.ny,
+            native_grid.dy,
+            overlap_y) ||
+        !count_push_axis_overlaps(
+            ctx,
+            convolution_grid.nz,
+            convolution_grid.dz,
+            native_grid.nz,
+            native_grid.dz,
+            overlap_z))
+    {
+        return false;
+    }
+
+    constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    if (overlap_x != 0 && overlap_y > maximum / overlap_x) {
+        ctx.last_error =
+            "fdm_gpu_workspace_oom_preflight: aggregate workspace byte count overflows uint64_t";
+        return false;
+    }
+    const uint64_t overlap_xy = overlap_x * overlap_y;
+    if (overlap_xy != 0 && overlap_z > maximum / overlap_xy) {
+        ctx.last_error =
+            "fdm_gpu_workspace_oom_preflight: aggregate workspace byte count overflows uint64_t";
+        return false;
+    }
+    entry_count = overlap_xy * overlap_z;
+    return true;
+}
+
+struct MultilayerWorkspaceEstimate {
+    uint64_t layer_bytes = 0;
+    uint64_t kernel_bytes = 0;
+    uint64_t push_map_bytes = 0;
+    uint64_t pull_map_bytes = 0;
+    uint64_t fft_buffer_bytes = 0;
+    uint64_t fft_work_area_upper_bound_bytes = 0;
+    uint64_t batch_fft_bytes = 0;
+    uint64_t total_bytes = 0;
+    uint64_t allocation_count = 0;
+};
+
+struct GpuWorkspaceBudget {
+    uint64_t usable_device_bytes = 0;
+    uint64_t free_device_bytes = 0;
+    uint64_t total_device_bytes = 0;
+    uint64_t safety_reserve_bytes = 0;
+};
+
+static bool multilayer_workspace_overflow(Context &ctx) {
+    ctx.last_error =
+        "fdm_gpu_workspace_oom_preflight: aggregate workspace byte count overflows uint64_t";
+    return false;
+}
+
+static bool add_multilayer_workspace_allocations(
+    Context &ctx,
+    MultilayerWorkspaceEstimate &estimate,
+    uint64_t &component_bytes,
+    uint64_t allocation_count,
+    uint64_t bytes_per_allocation)
+{
+    if (allocation_count == 0 || bytes_per_allocation == 0) {
+        return true;
+    }
+    constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    constexpr uint64_t maximum_device_allocation_count = 65536;
+    if (estimate.allocation_count > maximum - allocation_count) {
+        return multilayer_workspace_overflow(ctx);
+    }
+    const uint64_t new_allocation_count =
+        estimate.allocation_count + allocation_count;
+    if (new_allocation_count > maximum_device_allocation_count) {
+        ctx.last_error =
+            "fdm_gpu_workspace_allocation_count_preflight: required_device_allocations=" +
+            std::to_string(new_allocation_count) +
+            " maximum_device_allocations=" +
+            std::to_string(maximum_device_allocation_count);
+        return false;
+    }
+    if (bytes_per_allocation > maximum / allocation_count) {
+        return multilayer_workspace_overflow(ctx);
+    }
+    const uint64_t requested_bytes =
+        allocation_count * bytes_per_allocation;
+    if (component_bytes > maximum - requested_bytes ||
+        estimate.total_bytes > maximum - requested_bytes)
+    {
+        return multilayer_workspace_overflow(ctx);
+    }
+    component_bytes += requested_bytes;
+    estimate.total_bytes += requested_bytes;
+    estimate.allocation_count = new_allocation_count;
+    return true;
+}
+
+static bool query_gpu_workspace_budget(
+    Context &ctx,
+    GpuWorkspaceBudget &budget)
+{
+    size_t free_device_bytes = 0;
+    size_t total_device_bytes = 0;
+    const cudaError_t query_status =
+        ::cudaMemGetInfo(&free_device_bytes, &total_device_bytes);
+    if (query_status != cudaSuccess) {
+        ctx.last_error =
+            "fdm_gpu_workspace_memory_query_failed: cuda_error=" +
+            std::to_string(static_cast<int>(query_status));
+        return false;
+    }
+    constexpr uint64_t minimum_safety_reserve =
+        uint64_t{256} * 1024 * 1024;
+    budget.total_device_bytes =
+        static_cast<uint64_t>(total_device_bytes);
+    budget.free_device_bytes =
+        static_cast<uint64_t>(free_device_bytes);
+    budget.safety_reserve_bytes = std::max(
+        minimum_safety_reserve,
+        budget.total_device_bytes / 20);
+    budget.usable_device_bytes =
+        budget.free_device_bytes > budget.safety_reserve_bytes
+            ? budget.free_device_bytes - budget.safety_reserve_bytes
+            : 0;
+    return true;
+}
+
+static bool multilayer_workspace_fits_budget(
+    Context &ctx,
+    const MultilayerWorkspaceEstimate &estimate,
+    const GpuWorkspaceBudget &budget)
+{
+    if (estimate.total_bytes <= budget.usable_device_bytes) {
+        return true;
+    }
+    ctx.last_error =
+        "fdm_gpu_workspace_oom_preflight: required_aggregate_multilayer_workspace_bytes=" +
+        std::to_string(estimate.total_bytes) +
+        " layer_bytes=" + std::to_string(estimate.layer_bytes) +
+        " kernel_bytes=" + std::to_string(estimate.kernel_bytes) +
+        " push_map_bytes=" + std::to_string(estimate.push_map_bytes) +
+        " pull_map_bytes=" + std::to_string(estimate.pull_map_bytes) +
+        " fft_buffer_bytes=" + std::to_string(estimate.fft_buffer_bytes) +
+        " fft_work_area_upper_bound_bytes=" +
+        std::to_string(estimate.fft_work_area_upper_bound_bytes) +
+        " batch_fft_bytes=" + std::to_string(estimate.batch_fft_bytes) +
+        " required_device_allocations=" +
+        std::to_string(estimate.allocation_count) +
+        " usable_device_bytes=" +
+        std::to_string(budget.usable_device_bytes) +
+        " free_device_bytes=" + std::to_string(budget.free_device_bytes) +
+        " total_device_bytes=" + std::to_string(budget.total_device_bytes) +
+        " safety_reserve_bytes=" +
+        std::to_string(budget.safety_reserve_bytes);
+    return false;
+}
+
+bool context_preflight_multilayer_workspace_v2(
+    Context &ctx,
+    const fullmag_fdm_multilayer_plan_desc_v2 &plan)
+{
+    constexpr uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    GpuWorkspaceBudget budget;
+    if (!query_gpu_workspace_budget(ctx, budget)) {
+        return false;
+    }
+    MultilayerWorkspaceEstimate estimate;
+    auto overflow = [&]() -> bool {
+        return multilayer_workspace_overflow(ctx);
+    };
+    auto multiply = [&](uint64_t lhs, uint64_t rhs, uint64_t &product) -> bool {
+        if (lhs != 0 && rhs > maximum / lhs) return overflow();
+        product = lhs * rhs;
+        return true;
+    };
+
+    const uint64_t scalar_bytes = scalar_size(ctx.precision);
+    const uint64_t complex_bytes = complex_size(ctx.precision);
+    // The frozen multilayer v2 descriptor cannot carry rotated DMI. Its
+    // versioned setter allocates and validates that optional workspace as a
+    // separate transaction after the base multilayer plan has been uploaded.
+    const uint64_t layer_vector_component_count = 11 * 3;
+    for (uint32_t layer_index = 0;
+         layer_index < plan.layer_count;
+         ++layer_index)
+    {
+        const fullmag_fdm_layer_desc_v2 &layer = plan.layers[layer_index];
+        const uint64_t native_cells = grid_cell_count(layer.native_grid);
+        uint64_t layer_component_bytes = 0;
+        if (!multiply(
+                native_cells,
+                scalar_bytes,
+                layer_component_bytes) ||
+            !add_multilayer_workspace_allocations(
+                ctx,
+                estimate,
+                estimate.layer_bytes,
+                layer_vector_component_count,
+                layer_component_bytes))
+        {
+            return false;
+        }
+        if (layer.active_mask != nullptr &&
+            !add_multilayer_workspace_allocations(
+                ctx,
+                estimate,
+                estimate.layer_bytes,
+                1,
+                native_cells * sizeof(uint8_t)))
+        {
+            return false;
+        }
+    }
+
+    if (plan.kernel_count != 0 && plan.kernels == nullptr) {
+        ctx.last_error =
+            "kernels pointer must be present when kernel_count is non-zero";
+        return false;
+    }
+    for (uint32_t kernel_index = 0;
+         kernel_index < plan.kernel_count;
+         ++kernel_index)
+    {
+        uint64_t kernel_component_bytes = 0;
+        if (!multiply(
+                plan.kernels[kernel_index].kernel_len,
+                complex_bytes,
+                kernel_component_bytes) ||
+            !add_multilayer_workspace_allocations(
+                ctx,
+                estimate,
+                estimate.kernel_bytes,
+                6,
+                kernel_component_bytes))
+        {
+            return false;
+        }
+    }
+
+    if (ctx.enable_demag) {
+        for (uint32_t layer_index = 0;
+             layer_index < plan.layer_count;
+             ++layer_index)
+        {
+            const fullmag_fdm_layer_desc_v2 &layer = plan.layers[layer_index];
+            if (layer.transfer_kind != FULLMAG_FDM_TRANSFER_PUSH_PULL) {
+                continue;
+            }
+            const uint64_t convolution_cells =
+                grid_cell_count(layer.convolution_grid);
+            if (convolution_cells == maximum) {
+                return overflow();
+            }
+            uint64_t push_offset_bytes = 0;
+            if (!multiply(
+                    convolution_cells + 1,
+                    sizeof(uint64_t),
+                    push_offset_bytes) ||
+                !add_multilayer_workspace_allocations(
+                    ctx,
+                    estimate,
+                    estimate.push_map_bytes,
+                    1,
+                    push_offset_bytes))
+            {
+                return false;
+            }
+        }
+
+        for (uint32_t kernel_index = 0;
+             kernel_index < plan.kernel_count;
+             ++kernel_index)
+        {
+            const fullmag_fdm_tensor_kernel_desc_v2 &kernel =
+                plan.kernels[kernel_index];
+            const fullmag_fdm_layer_desc_v2 &destination =
+                plan.layers[kernel.dst_layer];
+            if (destination.transfer_kind != FULLMAG_FDM_TRANSFER_PUSH_PULL) {
+                continue;
+            }
+            uint64_t pull_entry_count = 0;
+            uint64_t pull_component_bytes = 0;
+            if (!multiply(
+                    grid_cell_count(destination.native_grid),
+                    uint64_t{8},
+                    pull_entry_count) ||
+                !multiply(
+                    pull_entry_count,
+                    sizeof(uint64_t),
+                    pull_component_bytes) ||
+                !add_multilayer_workspace_allocations(
+                    ctx,
+                    estimate,
+                    estimate.pull_map_bytes,
+                    2,
+                    pull_component_bytes))
+            {
+                return false;
+            }
+        }
+
+        std::vector<fullmag_fdm_grid_desc> unique_fft_grids;
+        unique_fft_grids.reserve(plan.kernel_count);
+        for (uint32_t kernel_index = 0;
+             kernel_index < plan.kernel_count;
+             ++kernel_index)
+        {
+            const fullmag_fdm_grid_desc &grid =
+                plan.kernels[kernel_index].fft_grid;
+            const auto existing = std::find_if(
+                unique_fft_grids.begin(),
+                unique_fft_grids.end(),
+                [&](const fullmag_fdm_grid_desc &candidate) {
+                    return candidate.nx == grid.nx &&
+                        candidate.ny == grid.ny &&
+                        candidate.nz == grid.nz;
+                });
+            if (existing == unique_fft_grids.end()) {
+                unique_fft_grids.push_back(grid);
+            }
+        }
+
+        for (const fullmag_fdm_grid_desc &grid : unique_fft_grids) {
+            const uint64_t fft_cell_count = grid_cell_count(grid);
+            if (fft_cell_count >
+                static_cast<uint64_t>(std::numeric_limits<int>::max()))
+            {
+                ctx.last_error =
+                    "multilayer demag FFT component stride exceeds cuFFT PlanMany limit";
+                return false;
+            }
+            uint64_t fft_buffer_element_count = 0;
+            uint64_t fft_buffer_allocation_bytes = 0;
+            if (!multiply(
+                    fft_cell_count,
+                    uint64_t{3},
+                    fft_buffer_element_count) ||
+                !multiply(
+                    fft_buffer_element_count,
+                    complex_bytes,
+                    fft_buffer_allocation_bytes) ||
+                !add_multilayer_workspace_allocations(
+                    ctx,
+                    estimate,
+                    estimate.fft_buffer_bytes,
+                    1,
+                    fft_buffer_allocation_bytes))
+            {
+                return false;
+            }
+
+            // NVIDIA documents 8 * batch * N complex elements as the cuFFT
+            // worst case. cufftEstimateMany may understate the eventual
+            // cufftMakePlanMany requirement for non-smooth dimensions.
+            constexpr uint64_t cufft_work_elements_per_fft_cell = 8 * 3;
+            uint64_t fft_work_element_count = 0;
+            uint64_t fft_work_area_upper_bound_bytes = 0;
+            if (!multiply(
+                    fft_cell_count,
+                    cufft_work_elements_per_fft_cell,
+                    fft_work_element_count) ||
+                !multiply(
+                    fft_work_element_count,
+                    complex_bytes,
+                    fft_work_area_upper_bound_bytes) ||
+                !add_multilayer_workspace_allocations(
+                    ctx,
+                    estimate,
+                    estimate.fft_work_area_upper_bound_bytes,
+                    1,
+                    fft_work_area_upper_bound_bytes))
+            {
+                return false;
+            }
+        }
+
+        const bool all_identity = std::all_of(
+            plan.layers,
+            plan.layers + plan.layer_count,
+            [](const fullmag_fdm_layer_desc_v2 &layer) {
+                return layer.transfer_kind == FULLMAG_FDM_TRANSFER_IDENTITY;
+            });
+        if (all_identity) {
+            const fullmag_fdm_layer_desc_v2 &first_layer = plan.layers[0];
+            auto same_grid = [](
+                const fullmag_fdm_grid_desc &lhs,
+                const fullmag_fdm_grid_desc &rhs) {
+                return lhs.nx == rhs.nx && lhs.ny == rhs.ny &&
+                    lhs.nz == rhs.nz && lhs.dx == rhs.dx &&
+                    lhs.dy == rhs.dy && lhs.dz == rhs.dz;
+            };
+            if (!same_grid(
+                    first_layer.native_grid,
+                    first_layer.convolution_grid))
+            {
+                ctx.last_error =
+                    "D-07 batched multilayer workspace requires identity native/convolution grids";
+                return false;
+            }
+            for (uint32_t layer_index = 0;
+                 layer_index < plan.layer_count;
+                 ++layer_index)
+            {
+                const fullmag_fdm_layer_desc_v2 &layer =
+                    plan.layers[layer_index];
+                if (!same_grid(layer.native_grid, first_layer.native_grid) ||
+                    !same_grid(
+                        layer.convolution_grid,
+                        first_layer.convolution_grid))
+                {
+                    ctx.last_error =
+                        "D-07 batched multilayer workspace requires one common identity layer grid";
+                    return false;
+                }
+            }
+
+            const fullmag_fdm_grid_desc &fft_grid = plan.kernels[0].fft_grid;
+            const uint64_t fft_cell_count = grid_cell_count(fft_grid);
+            const bool native_grid_fits_fft =
+                first_layer.native_grid.nx <= fft_grid.nx &&
+                first_layer.native_grid.ny <= fft_grid.ny &&
+                first_layer.native_grid.nz <= fft_grid.nz &&
+                first_layer.native_grid.dx == fft_grid.dx &&
+                first_layer.native_grid.dy == fft_grid.dy &&
+                first_layer.native_grid.dz == fft_grid.dz;
+            if (fft_cell_count == 0 || !native_grid_fits_fft) {
+                ctx.last_error =
+                    "D-07 batched multilayer workspace requires a common padded FFT grid";
+                return false;
+            }
+            for (uint32_t kernel_index = 0;
+                 kernel_index < plan.kernel_count;
+                 ++kernel_index)
+            {
+                const fullmag_fdm_tensor_kernel_desc_v2 &kernel =
+                    plan.kernels[kernel_index];
+                if (kernel.kernel_len != fft_cell_count ||
+                    !same_grid(kernel.fft_grid, fft_grid) ||
+                    kernel.src_layer >= plan.layer_count ||
+                    kernel.dst_layer >= plan.layer_count)
+                {
+                    ctx.last_error =
+                        "D-07 batched multilayer workspace requires one common FFT grid and valid layer pairs";
+                    return false;
+                }
+            }
+
+            uint64_t batch_element_count = 0;
+            if (!multiply(
+                    static_cast<uint64_t>(plan.layer_count),
+                    uint64_t{3},
+                    batch_element_count) ||
+                !multiply(
+                    batch_element_count,
+                    fft_cell_count,
+                    batch_element_count) ||
+                !multiply(
+                    batch_element_count,
+                    complex_bytes,
+                    batch_element_count) ||
+                !add_multilayer_workspace_allocations(
+                    ctx,
+                    estimate,
+                    estimate.batch_fft_bytes,
+                    2,
+                    batch_element_count))
+            {
+                return false;
+            }
+        }
+
+        // Reject obviously oversized plans before the exact push-map walk,
+        // which can be proportional to the number of map entries.
+        if (!multilayer_workspace_fits_budget(ctx, estimate, budget)) {
+            return false;
+        }
+        for (uint32_t layer_index = 0;
+             layer_index < plan.layer_count;
+             ++layer_index)
+        {
+            const fullmag_fdm_layer_desc_v2 &layer = plan.layers[layer_index];
+            if (layer.transfer_kind != FULLMAG_FDM_TRANSFER_PUSH_PULL) {
+                continue;
+            }
+            uint64_t push_entry_count = 0;
+            uint64_t push_component_bytes = 0;
+            if (!count_push_map_entries(
+                    ctx,
+                    layer.native_grid,
+                    layer.convolution_grid,
+                    push_entry_count) ||
+                !multiply(
+                    push_entry_count,
+                    sizeof(uint64_t),
+                    push_component_bytes) ||
+                !add_multilayer_workspace_allocations(
+                    ctx,
+                    estimate,
+                    estimate.push_map_bytes,
+                    push_entry_count == 0 ? 0 : 2,
+                    push_component_bytes))
+            {
+                return false;
+            }
+        }
+    }
+
+    GpuWorkspaceBudget final_budget;
+    return query_gpu_workspace_budget(ctx, final_budget) &&
+        multilayer_workspace_fits_budget(ctx, estimate, final_budget);
 }
 
 static bool build_and_upload_push_map(
@@ -1158,32 +2153,44 @@ static bool upload_tensor_kernel_component(
     return true;
 }
 
-static void free_multilayer_plan_v2(Context &ctx) {
+static bool free_multilayer_plan_v2(Context &ctx) {
     free_multilayer_fft_workspaces(ctx);
+    bool rotated_dmi_released = true;
     for (DeviceMultilayerLayer &layer : ctx.multilayer_layers) {
         free_vector_field(layer.m);
+        free_vector_field(layer.pre_step_m);
         free_vector_field(layer.h_ex);
         free_vector_field(layer.h_demag);
         free_vector_field(layer.h_dmi);
+        rotated_dmi_released =
+            free_tracked_vector_field(ctx, layer.h_rotated_dmi) && rotated_dmi_released;
         free_vector_field(layer.h_ani);
         free_vector_field(layer.tmp);
         free_vector_field(layer.k1);
         free_vector_field(layer.k2);
         free_vector_field(layer.k3);
         free_vector_field(layer.k4);
-        free_device_push_map(layer.push_map);
+        free_device_push_map(ctx, layer.push_map);
         if (layer.active_mask) {
             cudaFree(layer.active_mask);
             layer.active_mask = nullptr;
         }
     }
     for (DeviceMultilayerTensorKernel &kernel : ctx.multilayer_kernels) {
-        free_device_demag_kernel(kernel.tensor);
-        free_device_pull_map(kernel.dst_pull_map);
+        free_device_demag_kernel(ctx, kernel.tensor);
+        free_device_pull_map(ctx, kernel.dst_pull_map);
     }
-    ctx.multilayer_layers.clear();
+    if (rotated_dmi_released) {
+        ctx.multilayer_layers.clear();
+        ctx.has_multilayer_plan_v2 = false;
+    } else {
+        // Keep the layer records containing failed tracked frees alive so a
+        // subsequent teardown or plan replacement can retry those pointers.
+        ctx.gpu_workspace_accounting_valid = false;
+        ctx.has_multilayer_plan_v2 = true;
+    }
     ctx.multilayer_kernels.clear();
-    ctx.has_multilayer_plan_v2 = false;
+    return rotated_dmi_released;
 }
 
 static bool alloc_active_mask(Context &ctx) {
@@ -1311,15 +2318,20 @@ static void free_exchange_lut(Context &ctx) {
 }
 
 static bool alloc_reduction_scratch(Context &ctx) {
+    const uint64_t adaptive_metric_blocks =
+        (ctx.cell_count + 255ULL) / 256ULL;
+    const uint64_t scratch_len = std::max<uint64_t>(
+        ctx.cell_count,
+        uint64_t{3} * adaptive_metric_blocks);
     cudaError_t err = cudaMalloc(reinterpret_cast<void **>(&ctx.reduction_scratch),
-        ctx.cell_count * sizeof(double));
+        scratch_len * sizeof(double));
     if (err != cudaSuccess) {
         set_cuda_error(ctx, "cudaMalloc(reduction_scratch)", err);
         return false;
     }
-    ctx.reduction_scratch_len = ctx.cell_count;
+    ctx.reduction_scratch_len = scratch_len;
     err = cudaMalloc(reinterpret_cast<void **>(&ctx.reduction_scratch_aux),
-        ctx.cell_count * sizeof(double));
+        scratch_len * sizeof(double));
     if (err != cudaSuccess) {
         set_cuda_error(ctx, "cudaMalloc(reduction_scratch_aux)", err);
         cudaFree(ctx.reduction_scratch);
@@ -1327,11 +2339,63 @@ static bool alloc_reduction_scratch(Context &ctx) {
         ctx.reduction_scratch_len = 0;
         return false;
     }
-    ctx.reduction_scratch_aux_len = ctx.cell_count;
+    ctx.reduction_scratch_aux_len = scratch_len;
     err = cudaMalloc(reinterpret_cast<void **>(&ctx.adaptive_policy_scratch),
-        3 * sizeof(double));
+        sizeof(AdaptiveDeviceControl));
     if (err != cudaSuccess) {
         set_cuda_error(ctx, "cudaMalloc(adaptive_policy_scratch)", err);
+        cudaFree(ctx.reduction_scratch_aux);
+        ctx.reduction_scratch_aux = nullptr;
+        ctx.reduction_scratch_aux_len = 0;
+        cudaFree(ctx.reduction_scratch);
+        ctx.reduction_scratch = nullptr;
+        ctx.reduction_scratch_len = 0;
+        return false;
+    }
+    err = cudaMalloc(
+        reinterpret_cast<void **>(&ctx.adaptive_batch_state),
+        sizeof(AdaptiveDeviceBatchState));
+    if (err != cudaSuccess) {
+        set_cuda_error(ctx, "cudaMalloc(adaptive_batch_state)", err);
+        cudaFree(ctx.adaptive_policy_scratch);
+        ctx.adaptive_policy_scratch = nullptr;
+        cudaFree(ctx.reduction_scratch_aux);
+        ctx.reduction_scratch_aux = nullptr;
+        ctx.reduction_scratch_aux_len = 0;
+        cudaFree(ctx.reduction_scratch);
+        ctx.reduction_scratch = nullptr;
+        ctx.reduction_scratch_len = 0;
+        return false;
+    }
+    err = cudaMalloc(
+        reinterpret_cast<void **>(&ctx.adaptive_accepted_batch),
+        ADAPTIVE_ACCEPTED_BATCH_CAPACITY * sizeof(AdaptiveDeviceControl));
+    if (err != cudaSuccess) {
+        set_cuda_error(ctx, "cudaMalloc(adaptive_accepted_batch)", err);
+        cudaFree(ctx.adaptive_batch_state);
+        ctx.adaptive_batch_state = nullptr;
+        cudaFree(ctx.adaptive_policy_scratch);
+        ctx.adaptive_policy_scratch = nullptr;
+        cudaFree(ctx.reduction_scratch_aux);
+        ctx.reduction_scratch_aux = nullptr;
+        ctx.reduction_scratch_aux_len = 0;
+        cudaFree(ctx.reduction_scratch);
+        ctx.reduction_scratch = nullptr;
+        ctx.reduction_scratch_len = 0;
+        return false;
+    }
+    err = cudaMalloc(
+        reinterpret_cast<void **>(&ctx.adaptive_attempt_trace_device),
+        FULLMAG_FDM_ADAPTIVE_ATTEMPT_CAPACITY_V1 *
+            sizeof(fullmag_fdm_adaptive_attempt_v1));
+    if (err != cudaSuccess) {
+        set_cuda_error(ctx, "cudaMalloc(adaptive_attempt_trace_device)", err);
+        cudaFree(ctx.adaptive_accepted_batch);
+        ctx.adaptive_accepted_batch = nullptr;
+        cudaFree(ctx.adaptive_batch_state);
+        ctx.adaptive_batch_state = nullptr;
+        cudaFree(ctx.adaptive_policy_scratch);
+        ctx.adaptive_policy_scratch = nullptr;
         cudaFree(ctx.reduction_scratch_aux);
         ctx.reduction_scratch_aux = nullptr;
         ctx.reduction_scratch_aux_len = 0;
@@ -1344,6 +2408,7 @@ static bool alloc_reduction_scratch(Context &ctx) {
 }
 
 static void free_reduction_scratch(Context &ctx) {
+    context_destroy_adaptive_step_graph(ctx);
     if (ctx.reduction_scratch) {
         cudaFree(ctx.reduction_scratch);
         ctx.reduction_scratch = nullptr;
@@ -1358,6 +2423,18 @@ static void free_reduction_scratch(Context &ctx) {
         cudaFree(ctx.adaptive_policy_scratch);
         ctx.adaptive_policy_scratch = nullptr;
     }
+    if (ctx.adaptive_batch_state) {
+        cudaFree(ctx.adaptive_batch_state);
+        ctx.adaptive_batch_state = nullptr;
+    }
+    if (ctx.adaptive_accepted_batch) {
+        cudaFree(ctx.adaptive_accepted_batch);
+        ctx.adaptive_accepted_batch = nullptr;
+    }
+    if (ctx.adaptive_attempt_trace_device) {
+        cudaFree(ctx.adaptive_attempt_trace_device);
+        ctx.adaptive_attempt_trace_device = nullptr;
+    }
 }
 
 static bool ensure_preview_download_scratch(Context &ctx, size_t required_bytes) {
@@ -1365,6 +2442,11 @@ static bool ensure_preview_download_scratch(Context &ctx, size_t required_bytes)
         && ctx.preview_download_scratch_len_bytes >= required_bytes)
     {
         return true;
+    }
+    if (ctx.gpu_workspace_setup_complete) {
+        ctx.last_error =
+            "synchronous preview exceeds the setup-owned download workspace";
+        return false;
     }
     if (ctx.preview_download_scratch) {
         cudaFree(ctx.preview_download_scratch);
@@ -1482,7 +2564,7 @@ static void destroy_async_preview_resources(AsyncPreviewSnapshot &snapshot) {
             cudaFreeHost(snapshot.host_xyz);
         }
         if (snapshot.device_xyz) {
-            cudaFree(snapshot.device_xyz);
+            fullmag_fdm_untracked_cuda_free(snapshot.device_xyz);
         }
     }
     snapshot.pool.reset();
@@ -1953,7 +3035,7 @@ static DeviceMultilayerFftWorkspace *ensure_multilayer_fft_workspace(
     ctx.multilayer_fft_workspaces.emplace_back();
     DeviceMultilayerFftWorkspace &workspace = ctx.multilayer_fft_workspaces.back();
     if (!alloc_multilayer_fft_workspace(ctx, workspace, grid)) {
-        free_multilayer_fft_workspace(workspace);
+        free_multilayer_fft_workspace(ctx, workspace);
         ctx.multilayer_fft_workspaces.pop_back();
         return nullptr;
     }
@@ -1978,9 +3060,15 @@ bool context_alloc_device(Context &ctx) {
     if (!alloc_vector_field(ctx, ctx.h_demag_visual)) return false;
     if (!alloc_vector_field(ctx, ctx.h_eff_visual)) return false;
     if (!alloc_vector_field(ctx, ctx.h_ani)) return false;
+    if (ctx.has_rotated_interfacial_dmi &&
+        !alloc_vector_field(ctx, ctx.h_rotated_dmi)) return false;
     if (!alloc_energy_density(ctx)) return false;
     if (!alloc_vector_field(ctx, ctx.k1))   return false;
     if (!alloc_vector_field(ctx, ctx.tmp))  return false;
+    // Every public step captures accepted magnetization before entering the
+    // trial. This transaction buffer is therefore part of the setup-owned
+    // workspace, never a first-step allocation.
+    if (!alloc_vector_field(ctx, ctx.gpu_transport_pre_step_m)) return false;
     if (!alloc_vector_field(ctx, ctx.work)) return false;
 
     // DP45 / RK23 / RK4: allocate extra stage buffers as needed.
@@ -2003,6 +3091,12 @@ bool context_alloc_device(Context &ctx) {
     if (ctx.integrator == FULLMAG_FDM_INTEGRATOR_DP45
         || ctx.integrator == FULLMAG_FDM_INTEGRATOR_RK23) {
         if (!alloc_vector_field(ctx, ctx.k_fsal)) return false;
+        // Checkpoint import swaps the accepted FSAL derivative atomically.
+        // Its peer buffer is setup-owned so restore never allocates after
+        // workspace accounting has been sealed.
+        if (!alloc_vector_field(ctx, ctx.gpu_transport_pre_step_abm_f_n)) {
+            return false;
+        }
         ctx.fsal_valid = false;
     }
 
@@ -2011,6 +3105,15 @@ bool context_alloc_device(Context &ctx) {
         if (!alloc_vector_field(ctx, ctx.abm_f_n))  return false;
         if (!alloc_vector_field(ctx, ctx.abm_f_n1)) return false;
         if (!alloc_vector_field(ctx, ctx.abm_f_n2)) return false;
+        if (!alloc_vector_field(ctx, ctx.gpu_transport_pre_step_abm_f_n)) {
+            return false;
+        }
+        if (!alloc_vector_field(ctx, ctx.gpu_transport_pre_step_abm_f_n1)) {
+            return false;
+        }
+        if (!alloc_vector_field(ctx, ctx.gpu_transport_pre_step_abm_f_n2)) {
+            return false;
+        }
         ctx.abm_startup = 0;
         ctx.abm_last_dt = 0.0;
     }
@@ -2045,6 +3148,11 @@ bool context_alloc_device(Context &ctx) {
     cudaMemset(ctx.h_ani.x, 0, bytes);
     cudaMemset(ctx.h_ani.y, 0, bytes);
     cudaMemset(ctx.h_ani.z, 0, bytes);
+    if (ctx.has_rotated_interfacial_dmi) {
+        cudaMemset(ctx.h_rotated_dmi.x, 0, bytes);
+        cudaMemset(ctx.h_rotated_dmi.y, 0, bytes);
+        cudaMemset(ctx.h_rotated_dmi.z, 0, bytes);
+    }
     cudaMemset(ctx.k1.x, 0, bytes);
     cudaMemset(ctx.k1.y, 0, bytes);
     cudaMemset(ctx.k1.z, 0, bytes);
@@ -2058,6 +3166,12 @@ bool context_alloc_device(Context &ctx) {
 
     if (!initialize_async_field_snapshot_pool(ctx)) return false;
     if (!initialize_async_preview_snapshot_pool(ctx)) {
+        destroy_async_field_snapshot_pool(ctx);
+        return false;
+    }
+    if (!ensure_preview_download_scratch(
+            ctx, ctx.cell_count * 3u * sizeof(double))) {
+        destroy_async_preview_snapshot_pool(ctx);
         destroy_async_field_snapshot_pool(ctx);
         return false;
     }
@@ -2079,51 +3193,7 @@ static bool copy_field_d2d_async(
                             cudaMemcpyDeviceToDevice, stream) == cudaSuccess;
 }
 
-bool context_capture_pre_step_state(Context &ctx) {
-    if (ctx.cell_count == 0) return true;
-    if (ctx.gpu_transport_pre_step_m.x == nullptr &&
-        !alloc_vector_field(ctx, ctx.gpu_transport_pre_step_m))
-        return false;
-    if (ctx.integrator == FULLMAG_FDM_INTEGRATOR_ABM3 &&
-        ((ctx.gpu_transport_pre_step_abm_f_n.x == nullptr &&
-          !alloc_vector_field(ctx, ctx.gpu_transport_pre_step_abm_f_n)) ||
-         (ctx.gpu_transport_pre_step_abm_f_n1.x == nullptr &&
-          !alloc_vector_field(ctx, ctx.gpu_transport_pre_step_abm_f_n1)) ||
-         (ctx.gpu_transport_pre_step_abm_f_n2.x == nullptr &&
-          !alloc_vector_field(ctx, ctx.gpu_transport_pre_step_abm_f_n2))))
-        return false;
-    const size_t scalar_bytes = ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE
-        ? sizeof(double) : sizeof(float);
-    const size_t bytes = static_cast<size_t>(ctx.cell_count) * scalar_bytes;
-    const cudaStream_t stream = context_compute_stream(ctx);
-    // Legacy fixed-step kernels still publish m on the default stream.  Order
-    // that producer before the transaction-owned compute-stream snapshot.
-    if (cudaStreamSynchronize(nullptr) != cudaSuccess ||
-        cudaMemcpyAsync(ctx.gpu_transport_pre_step_m.x, ctx.m.x, bytes,
-                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
-        cudaMemcpyAsync(ctx.gpu_transport_pre_step_m.y, ctx.m.y, bytes,
-                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
-        cudaMemcpyAsync(ctx.gpu_transport_pre_step_m.z, ctx.m.z, bytes,
-                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
-        cudaStreamSynchronize(stream) != cudaSuccess) {
-        ctx.last_error = "failed to capture pre-step magnetization";
-        return false;
-    }
-    ctx.gpu_transport_pre_step_m_valid = true;
-    if (ctx.integrator == FULLMAG_FDM_INTEGRATOR_ABM3) {
-        if (!copy_field_d2d_async(
-                ctx.gpu_transport_pre_step_abm_f_n, ctx.abm_f_n, bytes, stream) ||
-            !copy_field_d2d_async(
-                ctx.gpu_transport_pre_step_abm_f_n1, ctx.abm_f_n1, bytes, stream) ||
-            !copy_field_d2d_async(
-                ctx.gpu_transport_pre_step_abm_f_n2, ctx.abm_f_n2, bytes, stream) ||
-            cudaStreamSynchronize(stream) != cudaSuccess) {
-            ctx.gpu_transport_pre_step_m_valid = false;
-            ctx.last_error = "failed to capture pre-step ABM history";
-            return false;
-        }
-        ctx.gpu_transport_pre_step_abm_valid = true;
-    }
+static void capture_pre_step_metadata(Context &ctx) {
     ctx.gpu_transport_pre_step_step_count = ctx.step_count;
     ctx.gpu_transport_pre_step_accepted_step_index = ctx.accepted_step_index;
     ctx.gpu_transport_pre_step_accepted_state_revision = ctx.accepted_state_revision;
@@ -2134,52 +3204,9 @@ bool context_capture_pre_step_state(Context &ctx) {
     ctx.gpu_transport_pre_step_adaptive_previous_error = ctx.adaptive_previous_error;
     ctx.gpu_transport_pre_step_abm_startup = ctx.abm_startup;
     ctx.gpu_transport_pre_step_abm_last_dt = ctx.abm_last_dt;
-    return true;
 }
 
-bool context_rollback_pre_step_state(Context &ctx) {
-    if (!ctx.gpu_transport_pre_step_m_valid) {
-        ctx.last_error = "pre-step magnetization snapshot is unavailable";
-        return false;
-    }
-    const size_t scalar_bytes = ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE
-        ? sizeof(double) : sizeof(float);
-    const size_t bytes = static_cast<size_t>(ctx.cell_count) * scalar_bytes;
-    const cudaStream_t stream = context_compute_stream(ctx);
-    // A rejected legacy fixed-step integrator can still have default-stream
-    // writers in flight.  Complete those writers before restoring on the
-    // dedicated compute stream.
-    if (cudaStreamSynchronize(nullptr) != cudaSuccess) {
-        ctx.last_error = "failed to order rejected integrator work before rollback";
-        return false;
-    }
-    const cudaError_t copy_x = cudaMemcpyAsync(
-        ctx.m.x, ctx.gpu_transport_pre_step_m.x, bytes,
-        cudaMemcpyDeviceToDevice, stream);
-    const cudaError_t copy_y = cudaMemcpyAsync(
-        ctx.m.y, ctx.gpu_transport_pre_step_m.y, bytes,
-        cudaMemcpyDeviceToDevice, stream);
-    const cudaError_t copy_z = cudaMemcpyAsync(
-        ctx.m.z, ctx.gpu_transport_pre_step_m.z, bytes,
-        cudaMemcpyDeviceToDevice, stream);
-    if (copy_x != cudaSuccess || copy_y != cudaSuccess || copy_z != cudaSuccess ||
-        cudaStreamSynchronize(stream) != cudaSuccess) {
-        ctx.last_error = "failed to restore bound transport pre-step magnetization";
-        return false;
-    }
-    if (ctx.gpu_transport_pre_step_abm_valid &&
-        (!copy_field_d2d_async(
-             ctx.abm_f_n, ctx.gpu_transport_pre_step_abm_f_n, bytes, stream) ||
-         !copy_field_d2d_async(
-             ctx.abm_f_n1, ctx.gpu_transport_pre_step_abm_f_n1, bytes, stream) ||
-         !copy_field_d2d_async(
-             ctx.abm_f_n2, ctx.gpu_transport_pre_step_abm_f_n2, bytes, stream) ||
-         cudaStreamSynchronize(stream) != cudaSuccess)) {
-        ctx.last_error = "failed to restore pre-step ABM history";
-        return false;
-    }
-    ctx.gpu_transport_pre_step_m_valid = false;
-    ctx.gpu_transport_pre_step_abm_valid = false;
+static void restore_pre_step_metadata(Context &ctx) {
     ctx.step_count = ctx.gpu_transport_pre_step_step_count;
     ctx.accepted_step_index = ctx.gpu_transport_pre_step_accepted_step_index;
     ctx.accepted_state_revision = ctx.gpu_transport_pre_step_accepted_state_revision;
@@ -2194,31 +3221,250 @@ bool context_rollback_pre_step_state(Context &ctx) {
     ctx.adaptive_previous_error = ctx.gpu_transport_pre_step_adaptive_previous_error;
     ctx.abm_startup = ctx.gpu_transport_pre_step_abm_startup;
     ctx.abm_last_dt = ctx.gpu_transport_pre_step_abm_last_dt;
+}
+
+bool context_capture_pre_step_state(Context &ctx) {
+    if (ctx.has_multilayer_plan_v2) {
+        const size_t scalar_bytes = ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE
+            ? sizeof(double) : sizeof(float);
+        const cudaStream_t stream = context_compute_stream(ctx);
+        uint64_t total_cells = 0;
+        for (DeviceMultilayerLayer &layer : ctx.multilayer_layers) {
+            if (layer.cell_count > std::numeric_limits<uint64_t>::max() - total_cells) {
+                ctx.step_transaction_accounting_valid = false;
+                ctx.last_error = "multilayer transaction cell count overflow";
+                return false;
+            }
+            total_cells += layer.cell_count;
+            const size_t bytes = static_cast<size_t>(layer.cell_count) * scalar_bytes;
+            if (!copy_field_d2d_async(
+                    layer.pre_step_m, layer.m, bytes, stream)) {
+                ctx.step_transaction_accounting_valid = false;
+                ctx.last_error = "failed to capture multilayer pre-step magnetization";
+                return false;
+            }
+        }
+        // Multilayer integrators use the same compute stream.  Keeping the
+        // snapshot asynchronous preserves ordering without adding a hot-loop
+        // synchronization; the receipt or rollback boundary observes errors.
+        ctx.multilayer_pre_step_m_valid = true;
+        capture_pre_step_metadata(ctx);
+        uint64_t payload_bytes = 0;
+        if (!context_step_transaction_payload_bytes(
+                total_cells, scalar_bytes, false, payload_bytes)) {
+            ctx.step_transaction_accounting_valid = false;
+        } else {
+            (void)context_commit_step_transaction_capture_sample(ctx, payload_bytes);
+        }
+        return true;
+    }
+    if (ctx.cell_count == 0) return true;
+    if (ctx.gpu_transport_pre_step_m.x == nullptr &&
+        !alloc_vector_field(ctx, ctx.gpu_transport_pre_step_m)) {
+        ctx.step_transaction_accounting_valid = false;
+        return false;
+    }
+    if (ctx.integrator == FULLMAG_FDM_INTEGRATOR_ABM3 &&
+        ((ctx.gpu_transport_pre_step_abm_f_n.x == nullptr &&
+          !alloc_vector_field(ctx, ctx.gpu_transport_pre_step_abm_f_n)) ||
+         (ctx.gpu_transport_pre_step_abm_f_n1.x == nullptr &&
+          !alloc_vector_field(ctx, ctx.gpu_transport_pre_step_abm_f_n1)) ||
+         (ctx.gpu_transport_pre_step_abm_f_n2.x == nullptr &&
+          !alloc_vector_field(ctx, ctx.gpu_transport_pre_step_abm_f_n2)))) {
+        ctx.step_transaction_accounting_valid = false;
+        return false;
+    }
+    const size_t scalar_bytes = ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE
+        ? sizeof(double) : sizeof(float);
+    const size_t bytes = static_cast<size_t>(ctx.cell_count) * scalar_bytes;
+    const cudaStream_t stream = context_compute_stream(ctx);
+    // Legacy fixed-step kernels still publish m on the default stream.  Order
+    // that producer before the transaction-owned compute-stream snapshot.
+    if (cudaStreamSynchronize(nullptr) != cudaSuccess ||
+        cudaMemcpyAsync(ctx.gpu_transport_pre_step_m.x, ctx.m.x, bytes,
+                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+        cudaMemcpyAsync(ctx.gpu_transport_pre_step_m.y, ctx.m.y, bytes,
+                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+        cudaMemcpyAsync(ctx.gpu_transport_pre_step_m.z, ctx.m.z, bytes,
+                        cudaMemcpyDeviceToDevice, stream) != cudaSuccess ||
+        cudaStreamSynchronize(stream) != cudaSuccess) {
+        ctx.step_transaction_accounting_valid = false;
+        ctx.last_error = "failed to capture pre-step magnetization";
+        return false;
+    }
+    ctx.gpu_transport_pre_step_m_valid = true;
+    if (ctx.integrator == FULLMAG_FDM_INTEGRATOR_ABM3) {
+        if (!copy_field_d2d_async(
+                ctx.gpu_transport_pre_step_abm_f_n, ctx.abm_f_n, bytes, stream) ||
+            !copy_field_d2d_async(
+                ctx.gpu_transport_pre_step_abm_f_n1, ctx.abm_f_n1, bytes, stream) ||
+            !copy_field_d2d_async(
+                ctx.gpu_transport_pre_step_abm_f_n2, ctx.abm_f_n2, bytes, stream) ||
+            cudaStreamSynchronize(stream) != cudaSuccess) {
+            ctx.gpu_transport_pre_step_m_valid = false;
+            ctx.step_transaction_accounting_valid = false;
+            ctx.last_error = "failed to capture pre-step ABM history";
+            return false;
+        }
+        ctx.gpu_transport_pre_step_abm_valid = true;
+    }
+    capture_pre_step_metadata(ctx);
+    uint64_t step_transaction_capture_d2d_bytes = 0;
+    if (!context_step_transaction_payload_bytes(
+            ctx.cell_count, scalar_bytes,
+            ctx.integrator == FULLMAG_FDM_INTEGRATOR_ABM3,
+            step_transaction_capture_d2d_bytes)) {
+        ctx.step_transaction_accounting_valid = false;
+    } else {
+        (void)context_commit_step_transaction_capture_sample(
+            ctx, step_transaction_capture_d2d_bytes);
+    }
+    return true;
+}
+
+bool context_rollback_pre_step_state(Context &ctx) {
+    if (ctx.step_transaction_rollback_sample_pending) {
+        context_discard_step_transaction_rollback_sample(ctx);
+    }
+    if (ctx.has_multilayer_plan_v2) {
+        if (!ctx.multilayer_pre_step_m_valid) {
+            context_discard_step_transaction_rollback_sample(ctx);
+            ctx.last_error = "multilayer pre-step magnetization snapshot is unavailable";
+            return false;
+        }
+        const size_t scalar_bytes = ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE
+            ? sizeof(double) : sizeof(float);
+        const cudaStream_t stream = context_compute_stream(ctx);
+        const auto rollback_started_at = std::chrono::steady_clock::now();
+        uint64_t total_cells = 0;
+        for (DeviceMultilayerLayer &layer : ctx.multilayer_layers) {
+            if (layer.cell_count > std::numeric_limits<uint64_t>::max() - total_cells) {
+                context_discard_step_transaction_rollback_sample(ctx);
+                ctx.last_error = "multilayer rollback cell count overflow";
+                return false;
+            }
+            total_cells += layer.cell_count;
+            const size_t bytes = static_cast<size_t>(layer.cell_count) * scalar_bytes;
+            if (!copy_field_d2d_async(layer.m, layer.pre_step_m, bytes, stream)) {
+                context_discard_step_transaction_rollback_sample(ctx);
+                ctx.last_error = "failed to restore multilayer pre-step magnetization";
+                return false;
+            }
+        }
+        if (cudaStreamSynchronize(stream) != cudaSuccess) {
+            context_discard_step_transaction_rollback_sample(ctx);
+            ctx.last_error = "failed to complete multilayer magnetization rollback";
+            return false;
+        }
+        const auto rollback_finished_at = std::chrono::steady_clock::now();
+        const uint64_t rollback_latency_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                rollback_finished_at - rollback_started_at).count());
+        uint64_t rollback_bytes = 0;
+        if (!context_step_transaction_payload_bytes(
+                total_cells, scalar_bytes, false, rollback_bytes)) {
+            context_discard_step_transaction_rollback_sample(ctx);
+        } else {
+            (void)context_stage_step_transaction_rollback_sample(
+                ctx, rollback_bytes, rollback_latency_ns);
+        }
+        ctx.multilayer_pre_step_m_valid = false;
+        restore_pre_step_metadata(ctx);
+        return true;
+    }
+    if (!ctx.gpu_transport_pre_step_m_valid) {
+        context_discard_step_transaction_rollback_sample(ctx);
+        ctx.last_error = "pre-step magnetization snapshot is unavailable";
+        return false;
+    }
+    const size_t scalar_bytes = ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE
+        ? sizeof(double) : sizeof(float);
+    const size_t bytes = static_cast<size_t>(ctx.cell_count) * scalar_bytes;
+    const cudaStream_t stream = context_compute_stream(ctx);
+    const bool restored_abm_history = ctx.gpu_transport_pre_step_abm_valid;
+    const auto rollback_started_at = std::chrono::steady_clock::now();
+    // A rejected legacy fixed-step integrator can still have default-stream
+    // writers in flight.  Complete those writers before restoring on the
+    // dedicated compute stream.
+    if (cudaStreamSynchronize(nullptr) != cudaSuccess) {
+        context_discard_step_transaction_rollback_sample(ctx);
+        ctx.last_error = "failed to order rejected integrator work before rollback";
+        return false;
+    }
+    const cudaError_t copy_x = cudaMemcpyAsync(
+        ctx.m.x, ctx.gpu_transport_pre_step_m.x, bytes,
+        cudaMemcpyDeviceToDevice, stream);
+    const cudaError_t copy_y = cudaMemcpyAsync(
+        ctx.m.y, ctx.gpu_transport_pre_step_m.y, bytes,
+        cudaMemcpyDeviceToDevice, stream);
+    const cudaError_t copy_z = cudaMemcpyAsync(
+        ctx.m.z, ctx.gpu_transport_pre_step_m.z, bytes,
+        cudaMemcpyDeviceToDevice, stream);
+    if (copy_x != cudaSuccess || copy_y != cudaSuccess || copy_z != cudaSuccess ||
+        cudaStreamSynchronize(stream) != cudaSuccess) {
+        context_discard_step_transaction_rollback_sample(ctx);
+        ctx.last_error = "failed to restore bound transport pre-step magnetization";
+        return false;
+    }
+    if (ctx.gpu_transport_pre_step_abm_valid &&
+        (!copy_field_d2d_async(
+             ctx.abm_f_n, ctx.gpu_transport_pre_step_abm_f_n, bytes, stream) ||
+         !copy_field_d2d_async(
+             ctx.abm_f_n1, ctx.gpu_transport_pre_step_abm_f_n1, bytes, stream) ||
+         !copy_field_d2d_async(
+             ctx.abm_f_n2, ctx.gpu_transport_pre_step_abm_f_n2, bytes, stream) ||
+         cudaStreamSynchronize(stream) != cudaSuccess)) {
+        context_discard_step_transaction_rollback_sample(ctx);
+        ctx.last_error = "failed to restore pre-step ABM history";
+        return false;
+    }
+    const auto rollback_finished_at = std::chrono::steady_clock::now();
+    const uint64_t rollback_latency_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            rollback_finished_at - rollback_started_at).count());
+    uint64_t step_transaction_rollback_d2d_bytes = 0;
+    if (!context_step_transaction_payload_bytes(
+            ctx.cell_count, scalar_bytes, restored_abm_history,
+            step_transaction_rollback_d2d_bytes)) {
+        context_discard_step_transaction_rollback_sample(ctx);
+    } else {
+        (void)context_stage_step_transaction_rollback_sample(
+            ctx, step_transaction_rollback_d2d_bytes, rollback_latency_ns);
+    }
+    ctx.gpu_transport_pre_step_m_valid = false;
+    ctx.gpu_transport_pre_step_abm_valid = false;
+    restore_pre_step_metadata(ctx);
     return true;
 }
 
 void context_discard_pre_step_state(Context &ctx) {
     ctx.gpu_transport_pre_step_m_valid = false;
     ctx.gpu_transport_pre_step_abm_valid = false;
+    ctx.multilayer_pre_step_m_valid = false;
 }
 
 bool context_prepare_checkpoint_import_staging(
     Context &ctx, bool include_fsal, bool include_abm_history)
 {
-    if (ctx.gpu_transport_pre_step_m.x == nullptr &&
-        !alloc_vector_field(ctx, ctx.gpu_transport_pre_step_m)) {
+    const auto field_is_complete = [](const DeviceVectorField &field) {
+        return field.x != nullptr && field.y != nullptr && field.z != nullptr;
+    };
+    if (!field_is_complete(ctx.gpu_transport_pre_step_m)) {
+        ctx.last_error =
+            "checkpoint import magnetization staging is unavailable after setup";
         return false;
     }
     if ((include_fsal || include_abm_history) &&
-        ctx.gpu_transport_pre_step_abm_f_n.x == nullptr &&
-        !alloc_vector_field(ctx, ctx.gpu_transport_pre_step_abm_f_n)) {
+        !field_is_complete(ctx.gpu_transport_pre_step_abm_f_n)) {
+        ctx.last_error =
+            "checkpoint import derivative staging is unavailable after setup";
         return false;
     }
     if (include_abm_history &&
-        ((ctx.gpu_transport_pre_step_abm_f_n1.x == nullptr &&
-          !alloc_vector_field(ctx, ctx.gpu_transport_pre_step_abm_f_n1)) ||
-         (ctx.gpu_transport_pre_step_abm_f_n2.x == nullptr &&
-          !alloc_vector_field(ctx, ctx.gpu_transport_pre_step_abm_f_n2)))) {
+        (!field_is_complete(ctx.gpu_transport_pre_step_abm_f_n1) ||
+         !field_is_complete(ctx.gpu_transport_pre_step_abm_f_n2))) {
+        ctx.last_error =
+            "checkpoint import ABM history staging is unavailable after setup";
         return false;
     }
     return true;
@@ -2244,13 +3490,14 @@ void context_free_device(Context &ctx) {
     destroy_async_preview_snapshot_pool(ctx);
     destroy_async_field_snapshot_pool(ctx);
     context_destroy_compute_stream(ctx);
-    free_multilayer_plan_v2(ctx);
+    (void)free_multilayer_plan_v2(ctx);
     free_vector_field(ctx.m);
     free_vector_field(ctx.h_ex);
     free_vector_field(ctx.h_demag);
     free_vector_field(ctx.h_demag_visual);
     free_vector_field(ctx.h_eff_visual);
     free_vector_field(ctx.h_ani);
+    (void)free_tracked_vector_field(ctx, ctx.h_rotated_dmi);
     free_energy_density(ctx);
     free_vector_field(ctx.k1);
     free_vector_field(ctx.tmp);
@@ -2272,6 +3519,8 @@ void context_free_device(Context &ctx) {
     free_vector_field(ctx.abm_f_n2);
     // Oersted static field
     free_vector_field(ctx.h_oe_static);
+    // Regional time-domain field drives
+    free_regional_field_drives(ctx);
     free_fft_workspace(ctx);
     free_demag_kernel(ctx);
     free_active_mask(ctx);
@@ -2517,7 +3766,11 @@ bool context_upload_multilayer_plan_v2(
     Context &ctx,
     const fullmag_fdm_multilayer_plan_desc_v2 &plan)
 {
-    free_multilayer_plan_v2(ctx);
+    if (!free_multilayer_plan_v2(ctx)) {
+        ctx.last_error =
+            "cannot replace multilayer plan while tracked rotated DMI allocations remain";
+        return false;
+    }
     ctx.has_multilayer_plan_v2 = true;
     ctx.multilayer_layers.reserve(plan.layer_count);
     ctx.multilayer_kernels.reserve(plan.kernel_count);
@@ -2560,6 +3813,10 @@ bool context_upload_multilayer_plan_v2(
         if (!alloc_vector_field_cells(ctx, dst.m, dst.cell_count, "multilayer_m")) {
             return fail();
         }
+        if (!alloc_vector_field_cells(
+                ctx, dst.pre_step_m, dst.cell_count, "multilayer_pre_step_m")) {
+            return fail();
+        }
         if (!alloc_vector_field_cells(ctx, dst.h_ex, dst.cell_count, "multilayer_h_ex")) {
             return fail();
         }
@@ -2567,6 +3824,11 @@ bool context_upload_multilayer_plan_v2(
             return fail();
         }
         if (!alloc_vector_field_cells(ctx, dst.h_dmi, dst.cell_count, "multilayer_h_dmi")) {
+            return fail();
+        }
+        if (ctx.has_rotated_interfacial_dmi &&
+            !alloc_vector_field_cells(
+                ctx, dst.h_rotated_dmi, dst.cell_count, "multilayer_h_rotated_dmi")) {
             return fail();
         }
         if (!alloc_vector_field_cells(ctx, dst.h_ani, dst.cell_count, "multilayer_h_ani")) {
@@ -2641,6 +3903,23 @@ bool context_upload_multilayer_plan_v2(
         if (zero_err != cudaSuccess) {
             set_cuda_error(ctx, "cudaMemset(multilayer_h_dmi.z)", zero_err);
             return fail();
+        }
+        if (ctx.has_rotated_interfacial_dmi) {
+            zero_err = cudaMemset(dst.h_rotated_dmi.x, 0, layer_bytes);
+            if (zero_err != cudaSuccess) {
+                set_cuda_error(ctx, "cudaMemset(multilayer_h_rotated_dmi.x)", zero_err);
+                return fail();
+            }
+            zero_err = cudaMemset(dst.h_rotated_dmi.y, 0, layer_bytes);
+            if (zero_err != cudaSuccess) {
+                set_cuda_error(ctx, "cudaMemset(multilayer_h_rotated_dmi.y)", zero_err);
+                return fail();
+            }
+            zero_err = cudaMemset(dst.h_rotated_dmi.z, 0, layer_bytes);
+            if (zero_err != cudaSuccess) {
+                set_cuda_error(ctx, "cudaMemset(multilayer_h_rotated_dmi.z)", zero_err);
+                return fail();
+            }
         }
         zero_err = cudaMemset(dst.h_ani.x, 0, layer_bytes);
         if (zero_err != cudaSuccess) {
@@ -2730,6 +4009,208 @@ bool context_upload_multilayer_plan_v2(
     return true;
 }
 
+static bool vector_field_is_complete(const DeviceVectorField &field) {
+    return field.x != nullptr && field.y != nullptr && field.z != nullptr;
+}
+
+static bool vector_field_is_empty(const DeviceVectorField &field) {
+    return field.x == nullptr && field.y == nullptr && field.z == nullptr;
+}
+
+static bool zero_vector_field(
+    Context &ctx,
+    DeviceVectorField &field,
+    uint64_t cell_count,
+    const char *label)
+{
+    if (!vector_field_is_complete(field)) {
+        ctx.last_error = std::string(label) + " is incomplete";
+        return false;
+    }
+    const size_t bytes = static_cast<size_t>(cell_count) * scalar_size(ctx.precision);
+    const cudaError_t x_error = cudaMemset(field.x, 0, bytes);
+    const cudaError_t y_error = x_error == cudaSuccess
+        ? cudaMemset(field.y, 0, bytes) : x_error;
+    const cudaError_t z_error = y_error == cudaSuccess
+        ? cudaMemset(field.z, 0, bytes) : y_error;
+    if (z_error != cudaSuccess) {
+        set_cuda_error(ctx, label, z_error);
+        return false;
+    }
+    return true;
+}
+
+static bool validate_rotated_dmi_workspace_extension(
+    Context &ctx,
+    uint64_t allocation_count_before,
+    uint64_t allocation_bytes_before,
+    uint64_t expected_fields,
+    uint64_t expected_bytes)
+{
+    if (!ctx.gpu_workspace_setup_complete) {
+        return true;
+    }
+    const bool baseline_was_current =
+        allocation_count_before == ctx.gpu_workspace_setup_device_allocation_count &&
+        allocation_bytes_before == ctx.gpu_workspace_setup_device_allocation_bytes;
+    const bool monotonic =
+        ctx.gpu_workspace_total_device_allocation_count >= allocation_count_before &&
+        ctx.gpu_workspace_total_device_allocation_bytes >= allocation_bytes_before;
+    const bool exact_extension = monotonic &&
+        ctx.gpu_workspace_total_device_allocation_count - allocation_count_before ==
+            expected_fields * 3 &&
+        ctx.gpu_workspace_total_device_allocation_bytes - allocation_bytes_before ==
+            expected_bytes;
+    if (!baseline_was_current || !exact_extension ||
+        ctx.gpu_workspace_observed_step_count != 0) {
+        ctx.gpu_workspace_accounting_valid = false;
+        ctx.last_error =
+            "rotated DMI workspace extension violated setup accounting";
+        return false;
+    }
+    ctx.gpu_workspace_setup_device_allocation_count =
+        ctx.gpu_workspace_total_device_allocation_count;
+    ctx.gpu_workspace_setup_device_allocation_bytes =
+        ctx.gpu_workspace_total_device_allocation_bytes;
+    return true;
+}
+
+static void reset_rotated_dmi_workspace_extension_baseline(Context &ctx) {
+    if (!ctx.gpu_workspace_setup_complete) {
+        return;
+    }
+    // A failed extension is not a successful setup, but its tracked
+    // allocation attempts remain part of the monotonic total counters.  Move
+    // the extension baseline forward only after every failed field has been
+    // released; the next retry is then checked for its own exact delta.
+    ctx.gpu_workspace_setup_device_allocation_count =
+        ctx.gpu_workspace_total_device_allocation_count;
+    ctx.gpu_workspace_setup_device_allocation_bytes =
+        ctx.gpu_workspace_total_device_allocation_bytes;
+}
+
+bool context_ensure_rotated_dmi_workspace(Context &ctx) {
+    if (!ctx.has_multilayer_plan_v2) {
+        if (vector_field_is_complete(ctx.h_rotated_dmi)) {
+            return true;
+        }
+        if (!vector_field_is_empty(ctx.h_rotated_dmi)) {
+            ctx.last_error = "rotated DMI observable workspace is incomplete";
+            return false;
+        }
+        const uint64_t allocation_count_before =
+            ctx.gpu_workspace_total_device_allocation_count;
+        const uint64_t allocation_bytes_before =
+            ctx.gpu_workspace_total_device_allocation_bytes;
+        if (!alloc_vector_field(ctx, ctx.h_rotated_dmi) ||
+            !zero_vector_field(
+                ctx, ctx.h_rotated_dmi, ctx.cell_count, "rotated DMI observable")) {
+            if (free_tracked_vector_field(ctx, ctx.h_rotated_dmi)) {
+                reset_rotated_dmi_workspace_extension_baseline(ctx);
+            }
+            return false;
+        }
+        uint64_t expected_bytes = 0;
+        const uint64_t scalar_bytes = scalar_size(ctx.precision);
+        if (!fullmag_fdm_checked_vector_bytes(
+                ctx.cell_count, scalar_bytes, expected_bytes) ||
+            !validate_rotated_dmi_workspace_extension(
+                ctx,
+                allocation_count_before,
+                allocation_bytes_before,
+                1,
+                expected_bytes)) {
+            if (free_tracked_vector_field(ctx, ctx.h_rotated_dmi)) {
+                reset_rotated_dmi_workspace_extension_baseline(ctx);
+            }
+            if (ctx.last_error.empty()) {
+                ctx.last_error = "rotated DMI workspace byte count overflow";
+            }
+            return false;
+        }
+        return true;
+    }
+
+    if (ctx.multilayer_layers.empty()) {
+        ctx.last_error = "rotated DMI workspace requires uploaded multilayer layers";
+        return false;
+    }
+    uint64_t expected_bytes = 0;
+    uint64_t fields_to_allocate = 0;
+    const uint64_t scalar_bytes = scalar_size(ctx.precision);
+    for (DeviceMultilayerLayer &layer : ctx.multilayer_layers) {
+        if (vector_field_is_complete(layer.h_rotated_dmi)) {
+            continue;
+        }
+        if (!vector_field_is_empty(layer.h_rotated_dmi)) {
+            ctx.last_error = "multilayer rotated DMI workspace is incomplete";
+            return false;
+        }
+        ++fields_to_allocate;
+        uint64_t layer_bytes = 0;
+        if (!fullmag_fdm_checked_vector_bytes(
+                layer.cell_count, scalar_bytes, layer_bytes) ||
+            layer_bytes > std::numeric_limits<uint64_t>::max() - expected_bytes) {
+            ctx.last_error = "multilayer rotated DMI workspace byte count overflows uint64_t";
+            return false;
+        }
+        expected_bytes += layer_bytes;
+    }
+    if (fields_to_allocate == 0) {
+        return true;
+    }
+
+    const uint64_t allocation_count_before =
+        ctx.gpu_workspace_total_device_allocation_count;
+    const uint64_t allocation_bytes_before =
+        ctx.gpu_workspace_total_device_allocation_bytes;
+    std::vector<DeviceMultilayerLayer *> allocated_layers;
+    allocated_layers.reserve(static_cast<size_t>(fields_to_allocate));
+    for (DeviceMultilayerLayer &layer : ctx.multilayer_layers) {
+        if (!vector_field_is_empty(layer.h_rotated_dmi)) {
+            continue;
+        }
+        if (!alloc_vector_field_cells(
+                ctx,
+                layer.h_rotated_dmi,
+                layer.cell_count,
+                "multilayer_h_rotated_dmi") ||
+            !zero_vector_field(
+                ctx,
+                layer.h_rotated_dmi,
+                layer.cell_count,
+                "multilayer rotated DMI observable")) {
+            bool cleanup_ok = free_tracked_vector_field(ctx, layer.h_rotated_dmi);
+            for (DeviceMultilayerLayer *allocated : allocated_layers) {
+                cleanup_ok =
+                    free_tracked_vector_field(ctx, allocated->h_rotated_dmi) && cleanup_ok;
+            }
+            if (cleanup_ok) {
+                reset_rotated_dmi_workspace_extension_baseline(ctx);
+            }
+            return false;
+        }
+        allocated_layers.push_back(&layer);
+    }
+    const bool valid = validate_rotated_dmi_workspace_extension(
+        ctx,
+        allocation_count_before,
+        allocation_bytes_before,
+        fields_to_allocate,
+        expected_bytes);
+    if (!valid) {
+        bool cleanup_ok = true;
+        for (DeviceMultilayerLayer *allocated : allocated_layers) {
+            cleanup_ok =
+                free_tracked_vector_field(ctx, allocated->h_rotated_dmi) && cleanup_ok;
+        }
+        if (cleanup_ok) {
+            reset_rotated_dmi_workspace_extension_baseline(ctx);
+        }
+    }
+    return valid;
+}
+
 bool context_prepare_multilayer_fft_workspace_v2(Context &ctx) {
     if (!ctx.has_multilayer_plan_v2 || !ctx.enable_demag) {
         return true;
@@ -2737,6 +4218,12 @@ bool context_prepare_multilayer_fft_workspace_v2(Context &ctx) {
     if (ctx.multilayer_kernels.empty()) {
         ctx.last_error = "multilayer FFT workspace requires at least one tensor kernel";
         return false;
+    }
+
+    for (const DeviceMultilayerTensorKernel &kernel : ctx.multilayer_kernels) {
+        if (!context_prepare_multilayer_fft_workspace_for_kernel(ctx, kernel)) {
+            return false;
+        }
     }
 
     const DeviceMultilayerTensorKernel &first = ctx.multilayer_kernels.front();
@@ -2942,7 +4429,7 @@ bool context_prepare_multilayer_fft_workspace_for_kernel(
 /* ── Boundary correction upload ── */
 
 static void free_anisotropy_fields(Context &ctx) {
-    auto free_f64 = [](double *&ptr) {
+    auto free_f64 = [&ctx](double *&ptr) {
         if (ptr) { cudaFree(ptr); ptr = nullptr; }
     };
     free_f64(ctx.ku1_field);
@@ -2963,7 +4450,7 @@ bool context_upload_anisotropy_fields(Context &ctx, const double *ku1, const dou
 }
 
 static void free_cubic_anisotropy_fields(Context &ctx) {
-    auto free_f64 = [](double *&ptr) {
+    auto free_f64 = [&ctx](double *&ptr) {
         if (ptr) { cudaFree(ptr); ptr = nullptr; }
     };
     free_f64(ctx.kc1_field);
@@ -2988,7 +4475,7 @@ bool context_upload_cubic_anisotropy_fields(Context &ctx, const double *kc1, con
 }
 
 static void free_boundary_correction(Context &ctx) {
-    auto free_f64 = [](double *&ptr) {
+    auto free_f64 = [&ctx](double *&ptr) {
         if (ptr) { cudaFree(ptr); ptr = nullptr; }
     };
     free_f64(ctx.volume_fraction);
@@ -3162,7 +4649,7 @@ bool context_precompute_oersted_field(Context &ctx) {
         ctx.oersted_axis[2] / axis_norm,
     };
 
-    double inv_2pi = 1.0 / (2.0 * M_PI);
+    double inv_2pi = 1.0 / (2.0 * kFullmagPi);
     double R2 = R * R;
 
     // Compute on host in SoA layout
@@ -3277,11 +4764,333 @@ bool context_mark_static_external_field_profile(
         ctx.last_error = "static external field profile requires a cell-wise field";
         return false;
     }
+    const bool has_any_storage = ctx.h_oe_static.x != nullptr ||
+        ctx.h_oe_static.y != nullptr || ctx.h_oe_static.z != nullptr;
+    const bool has_complete_storage = ctx.h_oe_static.x != nullptr &&
+        ctx.h_oe_static.y != nullptr && ctx.h_oe_static.z != nullptr;
+    if (has_any_storage != has_complete_storage) {
+        ctx.last_error = "static external field profile workspace is partially initialized";
+        return false;
+    }
+    if (!has_complete_storage && ctx.gpu_workspace_setup_complete &&
+        ctx.gpu_workspace_observed_step_count != 0) {
+        ctx.last_error =
+            "static external field profile requires setup-owned workspace before the first step";
+        return false;
+    }
     if (!upload_cell_profile(ctx, field_xyz, len, "static external field profile")) {
         return false;
     }
     ctx.has_static_external_field_profile = true;
     return true;
+}
+
+bool context_upload_regional_field_drives(
+    Context &ctx,
+    const fullmag_fdm_regional_field_drive_desc_v2 *drives,
+    uint32_t drive_count)
+{
+    if (drive_count == 0) return true;
+    if (drives == nullptr) {
+        ctx.last_error = "regional field drives require a non-null descriptor array";
+        return false;
+    }
+    if (ctx.regional_field_drive_count != 0 ||
+        ctx.regional_field_drive_x != nullptr ||
+        ctx.regional_field_drive_params != nullptr) {
+        ctx.last_error = "regional field drives may be configured only once per backend";
+        return false;
+    }
+    if (ctx.gpu_workspace_step_active ||
+        (ctx.gpu_workspace_setup_complete &&
+         ctx.gpu_workspace_observed_step_count != 0)) {
+        ctx.last_error =
+            "regional field drives must be configured before the first solver step";
+        return false;
+    }
+
+    const uint64_t cell_count = ctx.cell_count;
+    const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+    if (drive_count != 0 && cell_count > maximum / drive_count) {
+        ctx.last_error = "regional field drive basis size overflows uint64_t";
+        return false;
+    }
+    const uint64_t basis_count = static_cast<uint64_t>(drive_count) * cell_count;
+    if (basis_count > maximum / 3u) {
+        ctx.last_error = "regional field drive basis component count overflows uint64_t";
+        return false;
+    }
+    std::vector<double> basis_x(basis_count, 0.0);
+    std::vector<double> basis_y(basis_count, 0.0);
+    std::vector<double> basis_z(basis_count, 0.0);
+    std::vector<RegionalFieldDriveParams> params(drive_count);
+    std::vector<double> piecewise_points;
+
+    for (uint32_t drive_index = 0; drive_index < drive_count; ++drive_index) {
+        const auto &entry = drives[drive_index];
+        const auto &descriptor = entry.drive;
+        if (descriptor.abi_version != FULLMAG_FDM_REGIONAL_FIELD_DRIVES_ABI_V2 ||
+            descriptor.struct_size < sizeof(fullmag_fdm_regional_field_drive_desc_v2)) {
+            ctx.last_error = "regional field drive descriptor ABI mismatch";
+            return false;
+        }
+        if (descriptor.field_xyz == nullptr ||
+            descriptor.field_len != cell_count * 3u) {
+            ctx.last_error = "regional field drive field_len must equal 3 * cell_count";
+            return false;
+        }
+        if (!std::isfinite(descriptor.stage_start_time_s) ||
+            descriptor.stage_start_time_s < 0.0 ||
+            !std::isfinite(entry.waveform_origin_time_s) ||
+            entry.waveform_origin_time_s < 0.0 ||
+            entry.waveform_origin_time_s > descriptor.stage_start_time_s ||
+            !std::isfinite(descriptor.frequency_hz) ||
+            !std::isfinite(descriptor.phase_rad) ||
+            !std::isfinite(descriptor.offset) ||
+            !std::isfinite(descriptor.t_on_s) ||
+            !std::isfinite(descriptor.t_off_s) ||
+            !std::isfinite(descriptor.cutoff_hz) ||
+            !std::isfinite(descriptor.t0_s) ||
+            !std::isfinite(descriptor.amplitude)) {
+            ctx.last_error = "regional field drive descriptor contains non-finite parameters";
+            return false;
+        }
+
+        if (descriptor.time_origin !=
+                FULLMAG_FDM_REGIONAL_FIELD_DRIVE_STAGE_LOCAL &&
+            descriptor.time_origin !=
+                FULLMAG_FDM_REGIONAL_FIELD_DRIVE_ABSOLUTE) {
+            ctx.last_error = "unknown regional field drive time origin";
+            return false;
+        }
+
+        auto &resolved = params[drive_index];
+        resolved.waveform = static_cast<int>(descriptor.waveform);
+        // The integrator clock starts at zero for each segment. The kernel
+        // evaluates t_solver - time_offset_s. Preserve the authored stage
+        // origin for stage-local waveforms across resumed segments.
+        resolved.time_offset_s =
+            descriptor.time_origin == FULLMAG_FDM_REGIONAL_FIELD_DRIVE_STAGE_LOCAL
+                ? entry.waveform_origin_time_s - descriptor.stage_start_time_s
+                : -descriptor.stage_start_time_s;
+        resolved.frequency_hz = descriptor.frequency_hz;
+        resolved.phase_rad = descriptor.phase_rad;
+        resolved.offset = descriptor.offset;
+        resolved.t_on_s = descriptor.t_on_s;
+        resolved.t_off_s = descriptor.t_off_s;
+        resolved.cutoff_hz = descriptor.cutoff_hz;
+        resolved.t0_s = descriptor.t0_s;
+        resolved.amplitude = descriptor.amplitude;
+
+        switch (descriptor.waveform) {
+        case FULLMAG_FDM_REGIONAL_FIELD_DRIVE_CONSTANT:
+            if (descriptor.piecewise_point_count != 0 ||
+                descriptor.piecewise_points != nullptr) {
+                ctx.last_error =
+                    "constant regional field drive cannot carry piecewise points";
+                return false;
+            }
+            break;
+        case FULLMAG_FDM_REGIONAL_FIELD_DRIVE_SINUSOIDAL:
+            if (descriptor.frequency_hz <= 0.0 ||
+                descriptor.piecewise_point_count != 0 ||
+                descriptor.piecewise_points != nullptr) {
+                ctx.last_error = "invalid sinusoidal regional field drive parameters";
+                return false;
+            }
+            break;
+        case FULLMAG_FDM_REGIONAL_FIELD_DRIVE_PULSE:
+            if (descriptor.t_off_s <= descriptor.t_on_s ||
+                descriptor.piecewise_point_count != 0 ||
+                descriptor.piecewise_points != nullptr) {
+                ctx.last_error = "invalid pulse regional field drive parameters";
+                return false;
+            }
+            break;
+        case FULLMAG_FDM_REGIONAL_FIELD_DRIVE_PIECEWISE_LINEAR: {
+            if (descriptor.piecewise_points == nullptr ||
+                descriptor.piecewise_point_count < 2) {
+                ctx.last_error =
+                    "piecewise regional field drive requires at least two points";
+                return false;
+            }
+            if (piecewise_points.size() / 2u > maximum -
+                    descriptor.piecewise_point_count) {
+                ctx.last_error = "regional field drive piecewise point count overflows";
+                return false;
+            }
+            resolved.point_offset = static_cast<uint64_t>(piecewise_points.size() / 2u);
+            resolved.point_count = descriptor.piecewise_point_count;
+            for (uint64_t point = 0; point < descriptor.piecewise_point_count; ++point) {
+                const double time_s = descriptor.piecewise_points[2u * point];
+                const double value = descriptor.piecewise_points[2u * point + 1u];
+                if (!std::isfinite(time_s) || !std::isfinite(value) ||
+                    (!piecewise_points.empty() &&
+                     time_s <= piecewise_points.back())) {
+                    ctx.last_error =
+                        "piecewise regional field drive times must be finite and strictly increasing";
+                    return false;
+                }
+                piecewise_points.push_back(time_s);
+                piecewise_points.push_back(value);
+            }
+            break;
+        }
+        case FULLMAG_FDM_REGIONAL_FIELD_DRIVE_SINC_PULSE:
+            if (descriptor.cutoff_hz <= 0.0 || descriptor.t0_s < 0.0 ||
+                descriptor.piecewise_point_count != 0 ||
+                descriptor.piecewise_points != nullptr) {
+                ctx.last_error = "invalid sinc regional field drive parameters";
+                return false;
+            }
+            break;
+        default:
+            ctx.last_error = "unknown regional field drive waveform";
+            return false;
+        }
+
+        const uint64_t basis_offset = static_cast<uint64_t>(drive_index) * cell_count;
+        for (uint64_t cell = 0; cell < cell_count; ++cell) {
+            const uint64_t source = 3u * cell;
+            if (!std::isfinite(descriptor.field_xyz[source]) ||
+                !std::isfinite(descriptor.field_xyz[source + 1u]) ||
+                !std::isfinite(descriptor.field_xyz[source + 2u])) {
+                ctx.last_error = "regional field drive basis contains non-finite values";
+                return false;
+            }
+            basis_x[basis_offset + cell] = descriptor.field_xyz[source];
+            basis_y[basis_offset + cell] = descriptor.field_xyz[source + 1u];
+            basis_z[basis_offset + cell] = descriptor.field_xyz[source + 2u];
+        }
+    }
+
+    if (piecewise_points.size() / 2u > maximum) {
+        ctx.last_error = "regional field drive piecewise point count overflows";
+        return false;
+    }
+    const size_t scalar_bytes = scalar_size(ctx.precision);
+    if (basis_count > std::numeric_limits<size_t>::max() / scalar_bytes ||
+        params.size() > std::numeric_limits<size_t>::max() / sizeof(RegionalFieldDriveParams) ||
+        piecewise_points.size() > std::numeric_limits<size_t>::max() / sizeof(double)) {
+        ctx.last_error = "regional field drive workspace byte count overflows size_t";
+        return false;
+    }
+
+    void *basis_x_device = nullptr;
+    void *basis_y_device = nullptr;
+    void *basis_z_device = nullptr;
+    RegionalFieldDriveParams *params_device = nullptr;
+    double *points_device = nullptr;
+    auto cleanup = [&]() {
+        if (basis_x_device) cudaFree(basis_x_device);
+        if (basis_y_device) cudaFree(basis_y_device);
+        if (basis_z_device) cudaFree(basis_z_device);
+        if (params_device) cudaFree(params_device);
+        if (points_device) cudaFree(points_device);
+    };
+
+    const size_t basis_bytes = static_cast<size_t>(basis_count) * scalar_bytes;
+    if (cudaMalloc(&basis_x_device, basis_bytes) != cudaSuccess ||
+        cudaMalloc(&basis_y_device, basis_bytes) != cudaSuccess ||
+        cudaMalloc(&basis_z_device, basis_bytes) != cudaSuccess ||
+        cudaMalloc(&params_device,
+                   params.size() * sizeof(RegionalFieldDriveParams)) != cudaSuccess) {
+        if (ctx.last_error.empty()) {
+            ctx.last_error = "regional field drive device allocation failed";
+        }
+        cleanup();
+        return false;
+    }
+    if (!piecewise_points.empty() &&
+        cudaMalloc(&points_device,
+                   piecewise_points.size() * sizeof(double)) != cudaSuccess) {
+        if (ctx.last_error.empty()) {
+            ctx.last_error = "regional field drive piecewise allocation failed";
+        }
+        cleanup();
+        return false;
+    }
+
+    auto copy_basis = [&](void *destination, const std::vector<double> &source,
+                          const char *label) -> bool {
+        if (ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE) {
+            const cudaError_t error = cudaMemcpy(
+                destination, source.data(), basis_bytes, cudaMemcpyHostToDevice);
+            if (error != cudaSuccess) set_cuda_error(ctx, label, error);
+            return error == cudaSuccess;
+        }
+        std::vector<float> converted(source.size());
+        for (size_t index = 0; index < source.size(); ++index) {
+            converted[index] = static_cast<float>(source[index]);
+        }
+        const cudaError_t error = cudaMemcpy(
+            destination, converted.data(), basis_bytes, cudaMemcpyHostToDevice);
+        if (error != cudaSuccess) set_cuda_error(ctx, label, error);
+        return error == cudaSuccess;
+    };
+    if (!copy_basis(basis_x_device, basis_x, "regional field drive basis x") ||
+        !copy_basis(basis_y_device, basis_y, "regional field drive basis y") ||
+        !copy_basis(basis_z_device, basis_z, "regional field drive basis z")) {
+        cleanup();
+        return false;
+    }
+    const cudaError_t params_error = cudaMemcpy(
+        params_device, params.data(),
+        params.size() * sizeof(RegionalFieldDriveParams),
+        cudaMemcpyHostToDevice);
+    if (params_error != cudaSuccess) {
+        set_cuda_error(ctx, "regional field drive parameters", params_error);
+        cleanup();
+        return false;
+    }
+    const cudaError_t points_error = points_device != nullptr
+        ? cudaMemcpy(
+            points_device, piecewise_points.data(),
+            piecewise_points.size() * sizeof(double),
+            cudaMemcpyHostToDevice)
+        : cudaSuccess;
+    if (points_error != cudaSuccess) {
+        set_cuda_error(ctx, "regional field drive piecewise points", points_error);
+        cleanup();
+        return false;
+    }
+
+    ctx.regional_field_drive_x = basis_x_device;
+    ctx.regional_field_drive_y = basis_y_device;
+    ctx.regional_field_drive_z = basis_z_device;
+    ctx.regional_field_drive_params = params_device;
+    ctx.regional_field_drive_points = points_device;
+    ctx.regional_field_drive_count = drive_count;
+    ctx.regional_field_drive_point_count = static_cast<uint64_t>(piecewise_points.size() / 2u);
+    return true;
+}
+
+bool context_upload_regional_field_drives(
+    Context &ctx,
+    const fullmag_fdm_regional_field_drive_desc_v1 *drives,
+    uint32_t drive_count)
+{
+    if (drive_count != 0 && drives == nullptr) {
+        ctx.last_error = "regional field drives require a non-null descriptor array";
+        return false;
+    }
+    std::vector<fullmag_fdm_regional_field_drive_desc_v2> upgraded;
+    upgraded.reserve(drive_count);
+    for (uint32_t index = 0; index < drive_count; ++index) {
+        const auto &legacy = drives[index];
+        if (legacy.abi_version != FULLMAG_FDM_REGIONAL_FIELD_DRIVES_ABI_V1 ||
+            legacy.struct_size < sizeof(fullmag_fdm_regional_field_drive_desc_v1)) {
+            ctx.last_error = "regional field drive descriptor ABI mismatch";
+            return false;
+        }
+        fullmag_fdm_regional_field_drive_desc_v2 entry{};
+        entry.drive = legacy;
+        entry.drive.abi_version = FULLMAG_FDM_REGIONAL_FIELD_DRIVES_ABI_V2;
+        entry.drive.struct_size = sizeof(entry);
+        entry.waveform_origin_time_s = legacy.stage_start_time_s;
+        upgraded.push_back(entry);
+    }
+    return context_upload_regional_field_drives(ctx, upgraded.data(), drive_count);
 }
 
 template <typename HostScalar>
@@ -3401,16 +5210,34 @@ static bool context_download_field_impl(
         return false;
     }
 
-    if (observable == FULLMAG_FDM_OBSERVABLE_H_ANI
-        && !context_refresh_anisotropy_observable(ctx))
-    {
-        return false;
+    if (observable == FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI &&
+        ctx.has_rotated_interfacial_dmi) {
+        const bool ok = ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE
+            ? launch_rotated_interfacial_dmi_field_fp64(ctx)
+            : launch_rotated_interfacial_dmi_field_fp32(ctx);
+        if (!ok) return false;
     }
-    if (observable == FULLMAG_FDM_OBSERVABLE_H_EFF
-        && !context_refresh_observables(ctx))
-    {
-        return false;
+    if (observable == FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI &&
+        !ctx.has_rotated_interfacial_dmi) {
+        std::fill(out_xyz, out_xyz + (n * 3u), static_cast<HostScalar>(0.0));
+        return true;
     }
+
+    uint64_t required_mask = 0;
+    switch (observable) {
+        case FULLMAG_FDM_OBSERVABLE_H_EX:
+            required_mask = OBSERVABLE_ENDPOINT_H_EX; break;
+        case FULLMAG_FDM_OBSERVABLE_H_DEMAG:
+            required_mask = OBSERVABLE_ENDPOINT_H_DEMAG; break;
+        case FULLMAG_FDM_OBSERVABLE_H_ANI:
+            required_mask = OBSERVABLE_ENDPOINT_H_ANI; break;
+        case FULLMAG_FDM_OBSERVABLE_H_EFF:
+            required_mask = OBSERVABLE_ENDPOINT_H_EFF_VISUAL; break;
+        default:
+            break;
+    }
+    if (required_mask != 0 &&
+        !context_ensure_observable_fields(ctx, required_mask)) return false;
 
     const DeviceVectorField *field;
     switch (observable) {
@@ -3425,6 +5252,8 @@ static bool context_download_field_impl(
             field = &ctx.h_demag_visual;
             break;
         case FULLMAG_FDM_OBSERVABLE_H_ANI: field = &ctx.h_ani; break;
+        case FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI:
+            field = &ctx.h_rotated_dmi; break;
         case FULLMAG_FDM_OBSERVABLE_H_EFF: field = &ctx.h_eff_visual; break;
         case FULLMAG_FDM_OBSERVABLE_H_OE: {
             if (ctx.has_static_external_field_profile) {
@@ -3578,8 +5407,9 @@ bool context_download_field_f32(
 }
 
 static bool is_energy_density_observable(fullmag_fdm_observable observable) {
-    return observable >= FULLMAG_FDM_OBSERVABLE_EDEN_EX &&
-        observable <= FULLMAG_FDM_OBSERVABLE_EDEN_TOTAL;
+    return (observable >= FULLMAG_FDM_OBSERVABLE_EDEN_EX &&
+            observable <= FULLMAG_FDM_OBSERVABLE_EDEN_TOTAL) ||
+        observable == FULLMAG_FDM_OBSERVABLE_EDEN_ROTATED_DMI;
 }
 
 template <typename HostScalar>
@@ -3688,7 +5518,13 @@ static bool context_download_layer_field_impl(
     {
         return false;
     }
-    if (observable == FULLMAG_FDM_OBSERVABLE_H_DMI) {
+    if (observable == FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI &&
+        !ctx.has_rotated_interfacial_dmi) {
+        std::fill(out_xyz, out_xyz + (layer.cell_count * 3u), static_cast<HostScalar>(0.0));
+        return true;
+    }
+    if (observable == FULLMAG_FDM_OBSERVABLE_H_DMI ||
+        observable == FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI) {
         const bool ok = ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE
             ? launch_multilayer_dmi_field_fp64(ctx)
             : launch_multilayer_dmi_field_fp32(ctx);
@@ -3772,6 +5608,9 @@ static bool context_download_layer_field_impl(
         case FULLMAG_FDM_OBSERVABLE_H_DMI:
             field = &layer.h_dmi;
             break;
+        case FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI:
+            field = &layer.h_rotated_dmi;
+            break;
         case FULLMAG_FDM_OBSERVABLE_H_ANI:
             field = &layer.h_ani;
             break;
@@ -3853,9 +5692,25 @@ static bool context_download_field_preview_impl(
         return false;
     }
 
+    if (observable == FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI &&
+        ctx.has_rotated_interfacial_dmi) {
+        const bool ok = ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE
+            ? launch_rotated_interfacial_dmi_field_fp64(ctx)
+            : launch_rotated_interfacial_dmi_field_fp32(ctx);
+        if (!ok) return false;
+    }
+
     uint64_t preview_count = static_cast<uint64_t>(preview_nx) * preview_ny * preview_nz;
     if (out_len != preview_count * 3 || z_origin >= ctx.nz) {
         return false;
+    }
+    if (observable == FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI &&
+        !ctx.has_rotated_interfacial_dmi) {
+        std::fill(
+            out_xyz,
+            out_xyz + (preview_count * 3u),
+            static_cast<HostScalar>(0.0));
+        return true;
     }
 
     if (preview_nx == ctx.nx && preview_ny == ctx.ny && preview_nz == ctx.nz
@@ -3864,16 +5719,21 @@ static bool context_download_field_preview_impl(
         return context_download_field_impl(ctx, observable, out_xyz, out_len);
     }
 
-    if (observable == FULLMAG_FDM_OBSERVABLE_H_ANI
-        && !context_refresh_anisotropy_observable(ctx))
-    {
-        return false;
+    uint64_t required_mask = 0;
+    switch (observable) {
+        case FULLMAG_FDM_OBSERVABLE_H_EX:
+            required_mask = OBSERVABLE_ENDPOINT_H_EX; break;
+        case FULLMAG_FDM_OBSERVABLE_H_DEMAG:
+            required_mask = OBSERVABLE_ENDPOINT_H_DEMAG; break;
+        case FULLMAG_FDM_OBSERVABLE_H_ANI:
+            required_mask = OBSERVABLE_ENDPOINT_H_ANI; break;
+        case FULLMAG_FDM_OBSERVABLE_H_EFF:
+            required_mask = OBSERVABLE_ENDPOINT_H_EFF_VISUAL; break;
+        default:
+            break;
     }
-    if (observable == FULLMAG_FDM_OBSERVABLE_H_EFF
-        && !context_refresh_observables(ctx))
-    {
-        return false;
-    }
+    if (required_mask != 0 &&
+        !context_ensure_observable_fields(ctx, required_mask)) return false;
 
     const DeviceVectorField *field = nullptr;
     switch (observable) {
@@ -3893,6 +5753,9 @@ static bool context_download_field_preview_impl(
             break;
         case FULLMAG_FDM_OBSERVABLE_H_ANI:
             field = &ctx.h_ani;
+            break;
+        case FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI:
+            field = &ctx.h_rotated_dmi;
             break;
         case FULLMAG_FDM_OBSERVABLE_H_EFF:
             field = &ctx.h_eff_visual;
@@ -4158,6 +6021,7 @@ AsyncFieldSnapshot *context_begin_async_field_snapshot(
     Context &ctx,
     fullmag_fdm_observable observable)
 {
+    ++ctx.endpoint_field_cache.field_snapshot_request_count;
     auto *snapshot = new (std::nothrow) AsyncFieldSnapshot();
     if (snapshot == nullptr) {
         ctx.last_error = "failed to allocate async field snapshot";
@@ -4165,6 +6029,8 @@ AsyncFieldSnapshot *context_begin_async_field_snapshot(
     }
     snapshot->precision = ctx.precision;
     snapshot->cell_count = ctx.cell_count;
+    snapshot->telemetry_cache = &ctx.endpoint_field_cache;
+    snapshot->telemetry_started_ns = steady_clock_now_ns();
     const bool scalar_observable = is_energy_density_observable(observable);
     snapshot->component_count = scalar_observable ? 1u : 3u;
     snapshot->host_soa_len_bytes =
@@ -4219,9 +6085,21 @@ AsyncFieldSnapshot *context_begin_async_field_snapshot(
             field = &ctx.m;
             break;
         case FULLMAG_FDM_OBSERVABLE_H_EX:
+            if (!context_ensure_observable_fields(
+                    ctx, OBSERVABLE_ENDPOINT_H_EX)) {
+                return fail_message(
+                    ctx.last_error.empty() ? "failed to refresh H_ex snapshot"
+                                           : ctx.last_error);
+            }
             field = &ctx.h_ex;
             break;
         case FULLMAG_FDM_OBSERVABLE_H_DEMAG:
+            if (!context_ensure_observable_fields(
+                    ctx, OBSERVABLE_ENDPOINT_H_DEMAG)) {
+                return fail_message(
+                    ctx.last_error.empty() ? "failed to refresh H_demag snapshot"
+                                           : ctx.last_error);
+            }
             if (ctx.h_demag_visual.x == nullptr || ctx.h_demag_visual.y == nullptr ||
                 ctx.h_demag_visual.z == nullptr) {
                 return fail_message("demag_visual_buffer_unavailable");
@@ -4229,15 +6107,44 @@ AsyncFieldSnapshot *context_begin_async_field_snapshot(
             field = &ctx.h_demag_visual;
             break;
         case FULLMAG_FDM_OBSERVABLE_H_ANI:
-            if (!context_refresh_anisotropy_observable(ctx)) {
+            if (!context_ensure_observable_fields(
+                    ctx, OBSERVABLE_ENDPOINT_H_ANI)) {
                 return fail_message(
                     ctx.last_error.empty() ? "failed to refresh H_ani snapshot"
                                            : ctx.last_error);
             }
             field = &ctx.h_ani;
             break;
+        case FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI:
+            if (!ctx.has_rotated_interfacial_dmi) {
+                if (ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE) {
+                    std::fill(
+                        reinterpret_cast<double *>(snapshot->host_soa),
+                        reinterpret_cast<double *>(snapshot->host_soa)
+                            + (ctx.cell_count * 3u),
+                        0.0);
+                } else {
+                    std::fill(
+                        reinterpret_cast<float *>(snapshot->host_soa),
+                        reinterpret_cast<float *>(snapshot->host_soa)
+                            + (ctx.cell_count * 3u),
+                        0.0f);
+                }
+                snapshot->needs_wait = false;
+                return snapshot;
+            }
+            if (!(ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE
+                    ? launch_rotated_interfacial_dmi_field_fp64(ctx)
+                    : launch_rotated_interfacial_dmi_field_fp32(ctx))) {
+                return fail_message(
+                    ctx.last_error.empty() ? "failed to refresh H_rotated_dmi snapshot"
+                                           : ctx.last_error);
+            }
+            field = &ctx.h_rotated_dmi;
+            break;
         case FULLMAG_FDM_OBSERVABLE_H_EFF:
-            if (!context_refresh_observables(ctx)) {
+            if (!context_ensure_observable_fields(
+                    ctx, OBSERVABLE_ENDPOINT_H_EFF_VISUAL)) {
                 return fail_message(
                     ctx.last_error.empty() ? "failed to refresh H_eff snapshot" : ctx.last_error);
             }
@@ -4463,6 +6370,14 @@ bool context_wait_async_field_snapshot(
 
     *out_data = snapshot.host_soa;
     out_len_bytes = static_cast<uint64_t>(snapshot.host_soa_len_bytes);
+    if (snapshot.telemetry_cache != nullptr && snapshot.telemetry_started_ns != 0) {
+        const uint64_t elapsed_ns = steady_clock_now_ns() - snapshot.telemetry_started_ns;
+        auto &cache = *snapshot.telemetry_cache;
+        cache.field_snapshot_latency_total_ns += elapsed_ns;
+        cache.field_snapshot_latency_max_ns =
+            std::max(cache.field_snapshot_latency_max_ns, elapsed_ns);
+        snapshot.telemetry_started_ns = 0;
+    }
     out_desc.cell_count = snapshot.cell_count;
     out_desc.component_count = snapshot.component_count;
     out_desc.scalar_bytes =
@@ -4565,15 +6480,44 @@ AsyncPreviewSnapshot *context_begin_async_preview_snapshot(
             field = &ctx.h_demag_visual;
             break;
         case FULLMAG_FDM_OBSERVABLE_H_ANI:
-            if (!context_refresh_anisotropy_observable(ctx)) {
+            if (!context_ensure_observable_fields(
+                    ctx, OBSERVABLE_ENDPOINT_H_ANI)) {
                 return fail_message(
                     ctx.last_error.empty() ? "failed to refresh H_ani preview snapshot"
                                            : ctx.last_error);
             }
             field = &ctx.h_ani;
             break;
+        case FULLMAG_FDM_OBSERVABLE_H_ROTATED_DMI:
+            if (!ctx.has_rotated_interfacial_dmi) {
+                if (ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE) {
+                    std::fill(
+                        reinterpret_cast<double *>(snapshot->host_xyz),
+                        reinterpret_cast<double *>(snapshot->host_xyz)
+                            + (snapshot->preview_count * 3u),
+                        0.0);
+                } else {
+                    std::fill(
+                        reinterpret_cast<float *>(snapshot->host_xyz),
+                        reinterpret_cast<float *>(snapshot->host_xyz)
+                            + (snapshot->preview_count * 3u),
+                        0.0f);
+                }
+                snapshot->needs_wait = false;
+                return snapshot;
+            }
+            if (!(ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE
+                    ? launch_rotated_interfacial_dmi_field_fp64(ctx)
+                    : launch_rotated_interfacial_dmi_field_fp32(ctx))) {
+                return fail_message(
+                    ctx.last_error.empty() ? "failed to refresh H_rotated_dmi preview snapshot"
+                                           : ctx.last_error);
+            }
+            field = &ctx.h_rotated_dmi;
+            break;
         case FULLMAG_FDM_OBSERVABLE_H_EFF:
-            if (!context_refresh_observables(ctx)) {
+            if (!context_ensure_observable_fields(
+                    ctx, OBSERVABLE_ENDPOINT_H_EFF_VISUAL)) {
                 return fail_message(
                     ctx.last_error.empty() ? "failed to refresh H_eff preview snapshot" : ctx.last_error);
             }
@@ -4891,27 +6835,60 @@ bool context_query_device_info(Context &ctx) {
 }
 
 bool context_refresh_observables(Context &ctx) {
-    ctx.observables_valid = false;
+    return context_ensure_observable_fields(ctx, OBSERVABLE_ENDPOINT_ALL_FIELDS);
+}
+
+bool context_ensure_observable_fields(Context &ctx, uint64_t required_mask) {
+    auto &cache = ctx.endpoint_field_cache;
+    ++cache.refresh_request_count;
+    context_prepare_endpoint_cache_identity(ctx);
+    const uint64_t supported_mask = OBSERVABLE_ENDPOINT_ALL_FIELDS;
+    if ((required_mask & ~supported_mask) != 0) {
+        ctx.last_error = "unsupported endpoint observable field mask";
+        return false;
+    }
+    if (context_endpoint_fields_are_fresh(ctx, required_mask)) {
+        ++cache.refresh_cache_hit_count;
+        return true;
+    }
+
+    ++cache.refresh_execution_count;
+    uint64_t expanded_mask = required_mask;
+    if ((expanded_mask & (OBSERVABLE_ENDPOINT_H_EFF |
+                          OBSERVABLE_ENDPOINT_H_EFF_VISUAL)) != 0) {
+        expanded_mask |= OBSERVABLE_ENDPOINT_CORE_FIELDS;
+    }
+    const uint64_t needed = expanded_mask & ~cache.valid_field_mask;
     const double evaluation_time =
         ctx.accepted_step_pending ? ctx.pending_time : ctx.current_time;
     if (ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE) {
-        if (ctx.enable_exchange) {
+        if ((needed & OBSERVABLE_ENDPOINT_H_EX) != 0 && ctx.enable_exchange) {
             launch_exchange_field_fp64(ctx);
         }
-        if (ctx.enable_demag) {
+        if ((needed & OBSERVABLE_ENDPOINT_H_DEMAG) != 0 && ctx.enable_demag) {
             launch_demag_field_fp64(ctx);
         }
-        launch_effective_field_fp64(ctx, evaluation_time);
-        if (!context_refresh_effective_field_visual(ctx)) return false;
+        if ((needed & OBSERVABLE_ENDPOINT_H_ANI) != 0 &&
+            !launch_anisotropy_observable(ctx)) return false;
+        if ((needed & OBSERVABLE_ENDPOINT_H_EFF) != 0) {
+            launch_effective_field_fp64(ctx, evaluation_time);
+        }
     } else {
-        if (ctx.enable_exchange) {
+        if ((needed & OBSERVABLE_ENDPOINT_H_EX) != 0 && ctx.enable_exchange) {
             launch_exchange_field_fp32(ctx);
         }
-        if (ctx.enable_demag) {
+        if ((needed & OBSERVABLE_ENDPOINT_H_DEMAG) != 0 && ctx.enable_demag) {
             launch_demag_field_fp32(ctx);
         }
-        launch_effective_field_fp32(ctx, evaluation_time);
-        if (!context_refresh_effective_field_visual(ctx)) return false;
+        if ((needed & OBSERVABLE_ENDPOINT_H_ANI) != 0 &&
+            !launch_anisotropy_observable(ctx)) return false;
+        if ((needed & OBSERVABLE_ENDPOINT_H_EFF) != 0) {
+            launch_effective_field_fp32(ctx, evaluation_time);
+        }
+    }
+    if ((needed & OBSERVABLE_ENDPOINT_H_EFF_VISUAL) != 0 &&
+        !context_refresh_effective_field_visual(ctx)) {
+        return false;
     }
 
     cudaError_t err = cudaGetLastError();
@@ -4919,34 +6896,19 @@ bool context_refresh_observables(Context &ctx) {
         set_cuda_error(ctx, "context_refresh_observables", err);
         return false;
     }
-    ctx.observables_valid = true;
+    context_publish_endpoint_fields(ctx, needed);
     return true;
 }
 
 void context_invalidate_observables(Context &ctx) {
-    ctx.observables_valid = false;
+    context_clear_endpoint_cache(ctx);
 }
 
 bool context_refresh_demag_observable(Context &ctx) {
-    if (ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE) {
-        if (ctx.enable_demag) {
-            launch_demag_field_fp64(ctx);
-        }
-    } else {
-        if (ctx.enable_demag) {
-            launch_demag_field_fp32(ctx);
-        }
-    }
-
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        set_cuda_error(ctx, "context_refresh_demag_observable", err);
-        return false;
-    }
-    return true;
+    return context_ensure_observable_fields(ctx, OBSERVABLE_ENDPOINT_H_DEMAG);
 }
 
-static bool context_refresh_anisotropy_observable(Context &ctx) {
+static bool launch_anisotropy_observable(Context &ctx) {
     if (ctx.precision == FULLMAG_FDM_PRECISION_DOUBLE) {
         launch_anisotropy_field_fp64(ctx);
     } else {
@@ -4955,7 +6917,7 @@ static bool context_refresh_anisotropy_observable(Context &ctx) {
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-        set_cuda_error(ctx, "context_refresh_anisotropy_observable", err);
+        set_cuda_error(ctx, "launch_anisotropy_observable", err);
         return false;
     }
     return true;
@@ -4997,7 +6959,8 @@ bool context_refresh_energy_density_observable(
     }
     if (wants_anisotropy &&
         (ctx.has_uniaxial_anisotropy || ctx.has_cubic_anisotropy)) {
-        if (!context_refresh_anisotropy_observable(ctx)) return false;
+        if (!context_ensure_observable_fields(
+                ctx, OBSERVABLE_ENDPOINT_H_ANI)) return false;
         // The anisotropy kernels currently use the legacy default stream.
         // Synchronize it before the scalar kernel is queued on the compute
         // stream so the materialized value cannot observe stale H_ani data.

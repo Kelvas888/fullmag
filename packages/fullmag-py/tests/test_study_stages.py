@@ -86,7 +86,26 @@ study.stages.add_run(stage_id="run-positive", until=1e-12)
         )
         node = loaded.study_pipeline_document()["nodes"][0]
         self.assertEqual(node["stage_kind"], "set_transport_current")
+        self.assertEqual(node["label"], "Set Transport Current 1")
         self.assertEqual(node["payload"]["module_id"], "charge")
+
+    def test_imported_relax_stage_has_a_nonempty_canonical_pipeline_label(self) -> None:
+        loaded = _load(
+            _PREAMBLE
+            + """
+study.stages.add_relax(
+    stage_id="relax-1",
+    algorithm="llg_overdamped",
+    dt=1e-13,
+    max_steps=2,
+)
+"""
+        )
+
+        node = loaded.study_pipeline_document()["nodes"][0]
+        self.assertEqual(node["id"], "relax-1")
+        self.assertEqual(node["stage_kind"], "relax")
+        self.assertEqual(node["label"], "Relax 1")
 
     def test_transport_current_action_rejects_inexact_electrode_coverage(self) -> None:
         transport = """
@@ -493,7 +512,18 @@ def build():
             {
                 "kind": "run",
                 "entrypoint_kind": "build",
+                "integrator": "rk4",
+                "fixed_timestep": "1e-15",
+                "demag_interval_s": "",
                 "until_seconds": "4e-12",
+                "relax_algorithm": "",
+                "torque_tolerance": "",
+                "energy_tolerance": "",
+                "max_steps": "",
+                "sampling": {"outputs": [
+                    {"kind": "scalar", "name": "E_total", "every_seconds": 1e-12},
+                ]},
+                "spin_wave_response": None,
             },
         )
 

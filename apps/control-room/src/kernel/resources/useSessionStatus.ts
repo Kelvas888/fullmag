@@ -15,8 +15,10 @@ import {
 import {
   sessionResourceIdentitiesEqual,
   sessionResourceIdentityFromStatus,
+  confirmedSessionResourceIdentity,
   type SessionResourceIdentity,
 } from "./sessionResourceIdentity";
+import { useSessionCollection } from "./useSessionCollection";
 
 export const SESSION_STATUS_RESOURCE_KEY = "session:status";
 
@@ -81,10 +83,39 @@ export function useSessionStatusSelector<TSelected>(
 }
 
 export function useSessionResourceIdentity(): SessionResourceIdentity | null {
-  return useSessionStatusSelector(
+  const sessions = useSessionCollection();
+  const identity = useSessionStatusSelector(
     (status) => sessionResourceIdentityFromStatus(status.data),
-    { isEqual: sessionResourceIdentitiesEqual },
+    { enabled: sessions.state === "ready", isEqual: sessionResourceIdentitiesEqual },
   );
+  return confirmedSessionResourceIdentity(identity, sessions.resource.data);
+}
+
+/** Identity and preparation publication share one status subscription. */
+export function useSimulationPreparationSessionScope() {
+  const sessions = useSessionCollection();
+  const scope = useSessionStatusSelector(
+    (status) => ({
+      sessionIdentity: sessionResourceIdentityFromStatus(status.data),
+      preparationRevision: status.status === "ready"
+        ? status.data?.resources.simulation_preparation_revision
+        : undefined,
+    }),
+    {
+      enabled: sessions.state === "ready",
+      isEqual: (previous, next) =>
+        sessionResourceIdentitiesEqual(previous.sessionIdentity, next.sessionIdentity) &&
+        previous.preparationRevision === next.preparationRevision,
+    },
+  );
+  const sessionIdentity = confirmedSessionResourceIdentity(
+    scope.sessionIdentity,
+    sessions.resource.data,
+  );
+  return {
+    sessionIdentity,
+    preparationRevision: sessionIdentity ? scope.preparationRevision : undefined,
+  };
 }
 
 export function useSessionLifecycle(): SelectedSessionLifecycle | null {

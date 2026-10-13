@@ -16,11 +16,21 @@ import type {
   AnalysisFieldOverlayRepresentation,
   AnalysisFieldOverlaySource,
 } from "../visualization/AnalysisFieldOverlayController";
+import type { AnalysisResultSelectionRef } from "@/shared/domain/analysis/results";
 
 type ObjectSelectionKind =
   | "object.root"
   | "object.geometry"
   | "object.antenna"
+  | "object.antenna.geometry"
+  | "object.antenna.regional"
+  | "object.antenna.conductor"
+  | "object.antenna.port"
+  | "object.antenna.solution"
+  | "object.antenna.projection"
+  | "object.antenna.drive"
+  | "object.antenna.spectrum"
+  | "object.antenna.visualization"
   | "object.material"
   | "object.physics"
   | "object.regions"
@@ -270,6 +280,28 @@ export type FdmDomainSelectionScope =
 export type SelectionRef =
   | LiveChartSelectionRef
   | LiveChartPointSelectionRef
+  | AnalysisResultSelectionRef
+  | PinnedMaterializedDatasetSelectionRef
+  | {
+      acceptedRevision: number;
+      acceptedStep: number;
+      adapterId: string;
+      frameId: string;
+      kind: "results.observation_frame";
+      nodeId: string;
+      runId: string;
+      runtimeEpoch: number;
+      stageId: string;
+      stateDigest: string;
+      type: "observation-frame";
+    }
+  | {
+      kind: "results.pinned_visualizations.root";
+      moduleId: string;
+      nodeId: string;
+      runId: string;
+      type: "analysis-pinned-group";
+    }
   | {
       constraintId: string;
       kind: "object.frozen-spins";
@@ -353,6 +385,14 @@ export type SelectionRef =
       nodeId: string;
       objectId: string;
       objectRole?: "antenna" | "magnet" | "auxiliary";
+      antennaResourceId?: string;
+      antennaResourceKind?:
+        | "conductor"
+        | "port"
+        | "solution"
+        | "projection"
+        | "drive"
+        | "spectrum";
       extensionId?: string;
       regionId?: string;
       type: "scene-object";
@@ -394,9 +434,12 @@ export type SelectionRef =
       visualizationTargetId: string;
     }
   | {
+      artifactId?: string | null;
       centroid: [number, number, number] | null;
       elementIndex: number;
+      generationId?: string | null;
       kind: "mesh.quality.element";
+      meshRevision?: number | null;
       metric?: MeshQualitySelectionMetric;
       nodeId: string;
       type: "mesh-quality-element";
@@ -574,6 +617,7 @@ export type SelectionRef =
       kind:
         | "study.stage.action"
         | "study.stage.add_field_drive"
+        | "study.stage.antenna_field_solve"
         | "study.stage.autosave"
         | "study.stage.eigenmodes"
         | "study.stage.eigenmodes.setup"
@@ -617,9 +661,53 @@ export type SelectionRef =
       type: "study-stage";
     }
   | {
+      artifactRevision: string;
+      kind: "results.eigen.spectrum";
+      nodeId: string;
+      runId: string;
+      stageId: string;
+      type: "eigen-spectrum";
+    }
+  | {
+      artifactRevision: string;
+      kind: "results.eigen.mode";
+      modeId: string;
+      nodeId: string;
+      runId: string;
+      sampleId: string;
+      stageId: string;
+      type: "eigen-mode";
+    }
+  | {
+      compositionId: string;
+      kind: "results.eigen.composition";
+      nodeId: string;
+      revision: string;
+      type: "mode-composition";
+    }
+  | {
+      compositionId: string;
+      kind: "results.eigen.composition.objects";
+      nodeId: string;
+      revision: string;
+      type: "mode-composition-objects";
+    }
+  | {
+      compositionId: string;
+      compositionRevision: string;
+      kind: "results.eigen.composition.object";
+      layerId?: string;
+      nodeId: string;
+      objectId: string;
+      targetId: `object:${string}`;
+      type: "mode-composition-object";
+    }
+  | {
       analysisRunId?: string;
       analysisStageId?: string;
       artifactRevision?: number | string;
+      datasetId?: string;
+      datasetRevision?: string;
       availability?: ResourceAvailability;
       contractGap?: string | null;
       equilibriumId?: string;
@@ -628,23 +716,30 @@ export type SelectionRef =
       artifactPath?: string;
       branchId?: string;
       calculationMode?: string;
+      detail?: string;
       fieldId?: string;
+      fitId?: string;
       fmrPeakIndex?: number;
       frequencyHz?: number;
       frequencyIndex?: number;
       kPathCoordinateRadPerM?: number;
       normalization?: string;
       kind: string;
+      modeId?: string;
       modeIndex?: number;
       nodeId: string;
       observableId?: string;
+      pointId?: string;
+      rawModeIndex?: number;
       representation?: AnalysisFieldOverlayRepresentation | string;
       resourceRef?: string;
       resourceState?: ResourceStatus;
+      sampleId?: string;
       sampleIndex?: number;
       source?: AnalysisFieldOverlaySource;
       studyProduct?: string;
       type: "frequency-domain";
+      viewId?: string;
       wavevectorKf?: readonly [number, number, number];
     }
   | {
@@ -658,7 +753,11 @@ export type SelectionRef =
       kContextKind?: AnalysisFieldOverlayKContextKind;
       kPathCoordinateRadPerM?: number;
       normalization?: string;
-      kind: "object.mode_visualization";
+      kind:
+        | "object.mode_visualization"
+        | "object.mode_visualization.group"
+        | "object.mode_visualization.field"
+        | "object.mode_visualization.view";
       modeIndex?: number;
       nodeId: string;
       objectId: string;
@@ -672,6 +771,65 @@ export type SelectionRef =
       visualizationTargetId: `mode:${string}:${AnalysisFieldOverlaySource}:${string}`;
       wavevectorKf?: readonly [number, number, number];
     };
+
+export interface PinnedMaterializedDatasetSelectionRef {
+  artifactId: string;
+  containingRevision: string;
+  datasetId: string;
+  datasetRevision: string;
+  fieldId: string;
+  itemId: string;
+  kind: "results.materialized_dataset";
+  manifestObjectRef: string;
+  memberId: string;
+  nodeId: string;
+  projectId: string;
+  runId: string;
+  sampleId: string;
+  solutionSetId: string;
+  type: "materialized-dataset";
+}
+
+type PinnedMaterializedDatasetSelectionInput = Omit<
+  PinnedMaterializedDatasetSelectionRef,
+  "kind" | "nodeId" | "type"
+>;
+
+function encodeMaterializedDatasetIdentity(value: string): string {
+  return encodeURIComponent(value);
+}
+
+export function buildPinnedMaterializedDatasetNodeId(
+  input: PinnedMaterializedDatasetSelectionInput,
+): string {
+  return [
+    ["project", input.projectId],
+    ["run", input.runId],
+    ["solution", input.solutionSetId],
+    ["containing", input.containingRevision],
+    ["member", input.memberId],
+    ["artifact", input.artifactId],
+    ["manifest", input.manifestObjectRef],
+    ["sample", input.sampleId],
+    ["item", input.itemId],
+    ["field", input.fieldId],
+    ["dataset", input.datasetId],
+    ["datasetRevision", input.datasetRevision],
+  ]
+    .map(([label, value]) => `${label}=${encodeMaterializedDatasetIdentity(value)}`)
+    .join("|");
+}
+
+export function pinnedMaterializedDatasetSelectionRef(
+  input: PinnedMaterializedDatasetSelectionInput,
+): PinnedMaterializedDatasetSelectionRef {
+  return {
+    ...input,
+    kind: "results.materialized_dataset",
+    nodeId: buildPinnedMaterializedDatasetNodeId(input),
+    type: "materialized-dataset",
+  };
+}
 
 export interface Selection {
   /** Selected scene object ID (geometry body, mesh region, etc.) */
@@ -740,6 +898,70 @@ export function selectionRefEquals(
   if (left.type !== right.type) return false;
 
   switch (left.type) {
+    case "observation-frame":
+      return (
+        right.type === "observation-frame" &&
+        left.acceptedRevision === right.acceptedRevision &&
+        left.acceptedStep === right.acceptedStep &&
+        left.adapterId === right.adapterId &&
+        left.frameId === right.frameId &&
+        left.kind === right.kind &&
+        left.nodeId === right.nodeId &&
+        left.runId === right.runId &&
+        left.runtimeEpoch === right.runtimeEpoch &&
+        left.stageId === right.stageId &&
+        left.stateDigest === right.stateDigest
+      );
+    case "analysis-pinned-group":
+      return (
+        right.type === "analysis-pinned-group" &&
+        left.kind === right.kind &&
+        left.moduleId === right.moduleId &&
+        left.nodeId === right.nodeId &&
+        left.runId === right.runId
+      );
+    case "analysis-result":
+      return (
+        right.type === "analysis-result" &&
+        left.kind === right.kind &&
+        left.nodeId === right.nodeId &&
+        left.focus === right.focus &&
+        left.runId === right.runId &&
+        left.stageId === right.stageId &&
+        left.datasetId === right.datasetId &&
+        left.datasetRevision === right.datasetRevision &&
+        left.itemKind === right.itemKind &&
+        nullableStringEquals(left.sampleId, right.sampleId) &&
+        nullableStringEquals(left.itemId, right.itemId) &&
+        nullableStringEquals(left.branchId, right.branchId) &&
+        nullableStringEquals(left.axisId, right.axisId) &&
+        nullableStringEquals(left.axisValueToken, right.axisValueToken) &&
+        recordEquals(left.axisFilters ?? {}, right.axisFilters ?? {}) &&
+        nullableStringEquals(left.fieldId, right.fieldId) &&
+        nullableStringEquals(left.fieldRevision, right.fieldRevision) &&
+        analysisResultFieldRefEquals(left.fieldRef, right.fieldRef) &&
+        nullableStringEquals(left.projectionId, right.projectionId) &&
+        nullableStringEquals(left.projectionRevision, right.projectionRevision) &&
+        (left.projectionOrdinal ?? null) === (right.projectionOrdinal ?? null)
+      );
+    case "materialized-dataset":
+      return (
+        right.type === "materialized-dataset" &&
+        left.kind === right.kind &&
+        left.nodeId === right.nodeId &&
+        left.projectId === right.projectId &&
+        left.runId === right.runId &&
+        left.solutionSetId === right.solutionSetId &&
+        left.containingRevision === right.containingRevision &&
+        left.memberId === right.memberId &&
+        left.artifactId === right.artifactId &&
+        left.manifestObjectRef === right.manifestObjectRef &&
+        left.sampleId === right.sampleId &&
+        left.itemId === right.itemId &&
+        left.fieldId === right.fieldId &&
+        left.datasetId === right.datasetId &&
+        left.datasetRevision === right.datasetRevision
+      );
     case "frozen-spins":
       return (
         right.type === "frozen-spins" &&
@@ -747,6 +969,53 @@ export function selectionRefEquals(
         left.nodeId === right.nodeId &&
         nullableStringEquals(left.objectId, right.objectId) &&
         nullableStringEquals(left.regionId, right.regionId)
+      );
+    case "eigen-spectrum":
+      return (
+        right.type === "eigen-spectrum" &&
+        left.kind === right.kind &&
+        left.nodeId === right.nodeId &&
+        left.artifactRevision === right.artifactRevision &&
+        left.runId === right.runId &&
+        left.stageId === right.stageId
+      );
+    case "eigen-mode":
+      return (
+        right.type === "eigen-mode" &&
+        left.kind === right.kind &&
+        left.nodeId === right.nodeId &&
+        left.artifactRevision === right.artifactRevision &&
+        left.modeId === right.modeId &&
+        left.runId === right.runId &&
+        left.sampleId === right.sampleId &&
+        left.stageId === right.stageId
+      );
+    case "mode-composition":
+      return (
+        right.type === "mode-composition" &&
+        left.kind === right.kind &&
+        left.nodeId === right.nodeId &&
+        left.compositionId === right.compositionId &&
+        left.revision === right.revision
+      );
+    case "mode-composition-objects":
+      return (
+        right.type === "mode-composition-objects" &&
+        left.kind === right.kind &&
+        left.nodeId === right.nodeId &&
+        left.compositionId === right.compositionId &&
+        left.revision === right.revision
+      );
+    case "mode-composition-object":
+      return (
+        right.type === "mode-composition-object" &&
+        left.kind === right.kind &&
+        left.nodeId === right.nodeId &&
+        left.compositionId === right.compositionId &&
+        left.compositionRevision === right.compositionRevision &&
+        left.objectId === right.objectId &&
+        nullableStringEquals(left.layerId, right.layerId) &&
+        left.targetId === right.targetId
       );
     case "runtime-explorer":
       return (
@@ -833,6 +1102,8 @@ export function selectionRefEquals(
         left.nodeId === right.nodeId &&
         left.objectId === right.objectId &&
         left.objectRole === right.objectRole &&
+        nullableStringEquals(left.antennaResourceId, right.antennaResourceId) &&
+        left.antennaResourceKind === right.antennaResourceKind &&
         nullableStringEquals(left.extensionId, right.extensionId) &&
         nullableStringEquals(left.regionId, right.regionId) &&
         nullableStringEquals(left.carrierPartId, right.carrierPartId) &&
@@ -878,6 +1149,9 @@ export function selectionRefEquals(
         left.elementIndex === right.elementIndex &&
         nullableStringEquals(left.metric, right.metric) &&
         centroidEquals(left.centroid, right.centroid) &&
+        nullableStringEquals(left.artifactId, right.artifactId) &&
+        nullableStringEquals(left.generationId, right.generationId) &&
+        left.meshRevision === right.meshRevision &&
         left.visualizationTargetId === right.visualizationTargetId
       );
     case "mesh-quality-metric":
@@ -1100,12 +1374,16 @@ export function selectionRefEquals(
         nullableStringEquals(left.contractGap, right.contractGap) &&
         nullableStringEquals(left.analysisRunId, right.analysisRunId) &&
         nullableStringEquals(left.analysisStageId, right.analysisStageId) &&
+        nullableStringEquals(left.datasetId, right.datasetId) &&
+        nullableStringEquals(left.datasetRevision, right.datasetRevision) &&
         nullableStringEquals(left.artifactPath, right.artifactPath) &&
         nullableStringEquals(left.branchId, right.branchId) &&
         nullableStringEquals(left.calculationMode, right.calculationMode) &&
+        nullableStringEquals(left.detail, right.detail) &&
         (left.artifactRevision ?? null) === (right.artifactRevision ?? null) &&
         nullableStringEquals(left.equilibriumId, right.equilibriumId) &&
         nullableStringEquals(left.fieldId, right.fieldId) &&
+        nullableStringEquals(left.fitId, right.fitId) &&
         (left.fmrPeakIndex ?? null) === (right.fmrPeakIndex ?? null) &&
         (left.frequencyHz ?? null) === (right.frequencyHz ?? null) &&
         left.frequencyIndex === right.frequencyIndex &&
@@ -1114,14 +1392,19 @@ export function selectionRefEquals(
         (left.kPathCoordinateRadPerM ?? null) ===
           (right.kPathCoordinateRadPerM ?? null) &&
         left.modeIndex === right.modeIndex &&
+        nullableStringEquals(left.modeId, right.modeId) &&
         nullableStringEquals(left.observableId, right.observableId) &&
+        nullableStringEquals(left.pointId, right.pointId) &&
+        left.rawModeIndex === right.rawModeIndex &&
         nullableStringEquals(left.representation, right.representation) &&
         nullableStringEquals(left.resourceRef, right.resourceRef) &&
         left.resourceState === right.resourceState &&
+        nullableStringEquals(left.sampleId, right.sampleId) &&
         left.sampleIndex === right.sampleIndex &&
         left.executionState === right.executionState &&
         nullableStringEquals(left.source, right.source) &&
         nullableStringEquals(left.studyProduct, right.studyProduct) &&
+        nullableStringEquals(left.viewId, right.viewId) &&
         centroidEquals(left.wavevectorKf, right.wavevectorKf)
       );
     case "mode-visualization":
@@ -1152,6 +1435,25 @@ export function selectionRefEquals(
         centroidEquals(left.wavevectorKf, right.wavevectorKf)
       );
   }
+}
+
+function analysisResultFieldRefEquals(
+  left: AnalysisResultSelectionRef["fieldRef"],
+  right: AnalysisResultSelectionRef["fieldRef"],
+): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return (
+    left.field_id === right.field_id &&
+    left.field_revision === right.field_revision &&
+    left.resource_key === right.resource_key &&
+    left.status === right.status &&
+    left.quantity_id === right.quantity_id &&
+    left.representation === right.representation &&
+    left.mesh_ref?.mesh_id === right.mesh_ref?.mesh_id &&
+    left.mesh_ref?.mesh_revision === right.mesh_ref?.mesh_revision &&
+    left.mesh_ref?.topology_fingerprint === right.mesh_ref?.topology_fingerprint
+  );
 }
 
 export function selectionSnapshotEquals(

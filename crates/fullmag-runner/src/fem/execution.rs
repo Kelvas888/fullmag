@@ -6,6 +6,9 @@ use crate::artifact_pipeline::ArtifactPipelineSender;
 #[cfg(feature = "fem-gpu")]
 use crate::artifact_pipeline::ArtifactRecorder;
 use crate::fem::eigen_path::execute_fem_eigen_path;
+use crate::fem::eigen_execution_resolution::{
+    FemEigenExecutionLane, PlannedFemEigenExecution,
+};
 use crate::fem::pbc::{
     fem_static_periodic_decision, validate_periodic_region_material_certificate, FemStaticPbcLane,
 };
@@ -50,6 +53,41 @@ pub(crate) fn execute_fem<'a>(
     live: Option<LiveStepConsumer<'a>>,
     artifact_writer: Option<ArtifactPipelineSender>,
 ) -> Result<ExecutedRun, RunError> {
+    let dynamic_waveform = |waveform: &fullmag_ir::TimeDependenceIR| {
+        !matches!(waveform, fullmag_ir::TimeDependenceIR::Constant)
+    };
+    let has_dynamic_drive = plan
+        .field_drives
+        .iter()
+        .any(|drive| drive.enabled && dynamic_waveform(&drive.waveform))
+        || plan
+            .solved_antenna_drive_bases
+            .iter()
+            .any(|basis| dynamic_waveform(&basis.drive.waveform))
+        || plan.antenna_zeeman_masks.iter().any(|mask| {
+            mask.waveform.as_ref().is_some_and(dynamic_waveform)
+        })
+        || plan.current_modules.iter().any(|module| match module {
+            fullmag_ir::CurrentModuleIR::AntennaFieldSource { drive, waveform, .. } => {
+                drive.as_ref()
+                    .and_then(|drive| drive.waveform.as_ref())
+                    .is_some_and(dynamic_waveform)
+                    || waveform.as_ref().is_some_and(dynamic_waveform)
+            }
+            fullmag_ir::CurrentModuleIR::CurrentTransport { time_envelope, .. } => {
+                time_envelope.as_ref().is_some_and(|envelope| {
+                    !matches!(envelope, fullmag_ir::TimeEnvelopeIR::Constant { .. })
+                })
+            }
+        });
+    if has_dynamic_drive
+        && plan.time_stage.waveform_origin_time_s() != plan.time_stage.start_time_s
+    {
+        return Err(RunError {
+            message: "exact stage-local waveform resume is not qualified for FEM execution"
+                .to_string(),
+        });
+    }
     let stage_asset = crate::types::StageFemMeshAsset::build_from_fem_plan(plan);
     let fem_mesh_generation_id = Some(stage_asset.identity.generation_id().to_string());
     let normalized_plan = normalized_fem_plan_for_runtime(plan)?;
@@ -121,16 +159,47 @@ pub(crate) fn execute_fem<'a>(
     }
 }
 
+const LEGACY_FEM_EIGEN_SWEEP_REJECTION: &str =
+    "legacy_fem_eigen_entrypoint_requires_canonical_bias_field_sweep_dispatch";
+
+/// Keep the retired execution facade from silently turning a physical sweep
+/// into a single baseline solve if it is ever wired back into the crate.
+///
+/// The compiled owner is `dispatch::execute_fem_eigen`, which routes
+/// `BiasFieldSweepIR` through the canonical CPU/GPU sweep executors.  This
+/// source file is intentionally not registered by `fem/mod.rs`; the guard is
+/// nevertheless required at this compatibility boundary so a future module
+/// registration cannot reintroduce the old baseline bypass.
+fn reject_legacy_bias_field_sweep(plan: &FemEigenPlanIR) -> Result<(), RunError> {
+    if !plan.bias_field_samples.is_empty() {
+        return Err(RunError {
+            message: LEGACY_FEM_EIGEN_SWEEP_REJECTION.to_string(),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn execute_fem_eigen(
     engine: FemEngine,
     plan: &FemEigenPlanIR,
     outputs: &[OutputIR],
 ) -> Result<ExecutedRun, RunError> {
+    reject_legacy_bias_field_sweep(plan)?;
+
     // Route Path k-sampling through the multi-k orchestrator, which calls
     // the single-k solver for each sample point and then performs branch
     // tracking and writes V2 artifacts.
     if matches!(plan.k_sampling, Some(fullmag_ir::KSamplingIR::Path { .. })) {
-        return execute_fem_eigen_path(engine, plan, outputs);
+        return execute_fem_eigen_path(
+            PlannedFemEigenExecution::legacy(match engine {
+                FemEngine::CpuNative => FemEigenExecutionLane::Cpu,
+                FemEngine::NativeGpu => FemEigenExecutionLane::Gpu,
+            }),
+            plan,
+            outputs,
+            None,
+            None,
+        );
     }
 
     match engine {
@@ -139,7 +208,7 @@ pub(crate) fn execute_fem_eigen(
             // GPU-accelerated dense eigensolver (Etap A4) — TRANSITIONAL.
             // `execute_gpu_fem_eigen` uses cuSolverDN; returns error if GPU
             // is unavailable (no silent fallback to CPU).
-            fem_eigen::execute_gpu_fem_eigen(plan, outputs)
+            fem_eigen::execute_gpu_fem_eigen(plan, outputs, None)
         }
     }
 }
@@ -166,9 +235,11 @@ fn execute_native_fem(
             message: "until_seconds must be positive".to_string(),
         });
     }
-    let time_events = crate::time_events::build_resolved_stage_event_schedule(
+    let time_events = crate::time_events::build_resolved_stage_event_schedule_with_origin(
         &plan.field_drives,
+        &plan.solved_antenna_drive_bases,
         plan.time_stage.start_time_s,
+        plan.time_stage.waveform_origin_time_s(),
         plan.time_stage.start_time_s + until_seconds,
         outputs,
         crate::schedules::OUTPUT_TIME_TOLERANCE,
@@ -240,6 +311,13 @@ fn execute_native_fem(
         StepStats::default()
     };
     let initial_stats = needs_initial_snapshot.then_some(&current_stats);
+    let fem_bem_demag = if plan.demag_realization
+        == Some(fullmag_ir::ResolvedFemDemagIR::FredkinKoehler)
+    {
+        backend.demag_fem_bem_provenance()?.map(|value| value.into_provenance())
+    } else {
+        None
+    };
     // FEM-013 fix: serialize resolved demag realization and integrator in provenance.
     let resolved_demag = plan
         .demag_realization
@@ -287,6 +365,7 @@ fn execute_native_fem(
             (stats.effective_fem_omp_threads > 0).then_some(stats.effective_fem_omp_threads as u32)
         }),
         fem_poisson_demag: fem_poisson_demag_provenance(plan, initial_stats),
+        fem_bem_demag,
         ..Default::default()
     };
     apply_energy_minimizer_provenance(&mut provenance, plan.relaxation.as_ref());

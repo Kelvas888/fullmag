@@ -6,6 +6,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   ALL_TAB_CONTENT,
+  buildAnalysisContextTabContent,
   buildRibbonTabContent,
   resolveRibbonVisualizationTarget,
   stripProductionRibbonPlaceholders,
@@ -34,7 +35,10 @@ import { RibbonTabStrip } from "./RibbonTabStrip";
 import {
   MESHING_CAPABILITIES_PATH,
   MODEL_GEOMETRY_VALIDATION_PATH,
+  MODEL_SCENE_PATH,
+  MODEL_READINESS_PATH,
   SIMULATION_COMMANDS_PATH,
+  SIMULATION_PREPARATION_PATH,
   SIMULATION_SOLVER_STATUS_PATH,
   SIMULATION_STAGES_EXECUTION_PATH,
   VISUALIZATION_STATE_PATH,
@@ -44,6 +48,12 @@ import type {
   VisualizationStateResource,
 } from "@/kernel/api/apiTypes";
 import { CommandRegistry } from "@/kernel/commands/CommandRegistry";
+import { ObjectMoveToolController } from "@/kernel/authoring/ObjectMoveToolController";
+import { EventBus } from "@/kernel/events/EventBus";
+import type { KernelEventMap } from "@/kernel/events/eventTypes";
+import { LayoutController } from "@/kernel/layout/LayoutController";
+import { SelectionController } from "@/kernel/selection/SelectionController";
+import { AnalysisFieldOverlayController } from "@/kernel/visualization/AnalysisFieldOverlayController";
 import type { CommandContext } from "@/kernel/commands/commandTypes";
 import { SESSION_STATUS_RESOURCE_KEY } from "@/kernel/resources/useSessionStatus";
 import { activeLaneCapabilityFixture } from "@/kernel/resources/activeLaneCapabilityFixture.testSupport";
@@ -59,12 +69,21 @@ import {
   crossSectionWorkspaceStore,
   resetCrossSectionWorkspaceForTests,
 } from "@/kernel/workspace/crossSectionWorkspace";
+
 import { GEOMETRY_LIFECYCLE_COMMANDS } from "@/kernel/authoring/geometryLifecycleCommandContributions";
 import { MAGNETIZATION_TEXTURE_COMMANDS } from "@/kernel/authoring/magnetization-texture/commands";
 import { REGION_COMMANDS } from "@/kernel/authoring/regionCommandContributions";
 import { SHELL_COMMANDS } from "@/kernel/layout/shellCommands";
 import { ANALYSIS_FIELD_OVERLAY_COMMANDS } from "@/kernel/visualization/analysisFieldOverlayCommandContributions";
 import { ALL_MODULES } from "@/modules/registry";
+
+const READY_MODEL_READINESS = {
+  blockers: [],
+  checks: [],
+  ready_to_export: true,
+  ready_to_run: true,
+  scene_revision: 1,
+};
 
 type DeepPartial<T> = {
   [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K];
@@ -117,8 +136,41 @@ function selectedMeshObject() {
   };
 }
 
+function ribbonActiveLane(discretization: "fdm" | "fem"): ReturnType<typeof activeLaneCapabilityFixture> {
+  const activeLane = activeLaneCapabilityFixture();
+  return {
+    ...activeLane,
+    authored: { ...activeLane.authored, backend: discretization, discretization },
+    requested: { ...activeLane.requested, backend: discretization, discretization },
+    resolved: { ...activeLane.resolved!, backend: discretization, discretization },
+    source: { ...activeLane.source, engine_id: `${discretization}_cpu_reference` },
+    operations: {
+      ...activeLane.operations,
+      grid_build: {
+        ...activeLane.operations.grid_build,
+        state: discretization === "fdm" ? "supported" as const : "unsupported" as const,
+        reason_code: discretization === "fdm" ? "capability_supported" : "capability_unsupported",
+        reason: "Grid building follows the resolved planner lane.",
+      },
+      "interaction.frozen_spins": {
+        state: discretization === "fdm" ? "supported" as const : "unsupported" as const,
+        reason_code: discretization === "fdm" ? "capability_supported" : "capability_unsupported",
+        reason: "Frozen spins are available on the resolved FDM lane only.",
+        requires: ["discretization:fdm"],
+      },
+      shared_mesh_build: {
+        state: discretization === "fem" ? "supported" as const : "unsupported" as const,
+        reason_code: discretization === "fem" ? "capability_supported" : "capability_unsupported",
+        reason: "Shared meshing follows the resolved planner lane.",
+        requires: ["discretization:fem"],
+      },
+    },
+  };
+}
+
 function femRibbonSessionStatus() {
   return {
+    capabilities: { active_lane: ribbonActiveLane("fem") },
     domain: { discretization: "fem" as const },
     resources: { field_revision: 1, fields_revision: 1 },
   };
@@ -1566,6 +1618,7 @@ describe("ribbon structure", () => {
     const content = buildRibbonTabContent("physics", {
       commands: createRibbonCommandRegistry(),
       sessionStatus: {
+        capabilities: { active_lane: ribbonActiveLane("fem") },
         domain: { discretization: "fem" },
         resources: { field_revision: 0, fields_revision: 0 },
       },
@@ -1595,6 +1648,7 @@ describe("ribbon structure", () => {
       { interactionId: "current_transport" },
       { interactionId: "spin_torque" },
       { interactionId: "interfacial_dmi" },
+      { interactionId: "rotated_interfacial_dmi" },
       { interactionId: "bulk_dmi" },
       { interactionId: "uniaxial_anisotropy" },
       { interactionId: "cubic_anisotropy" },
@@ -1649,6 +1703,59 @@ describe("ribbon structure", () => {
         objectId: "free-layer",
       }),
     ]);
+  });
+
+  it.each([
+    { scope: undefined, role: "magnet", nodeId: "model:object:waveguide:physics:exchange", status: "completed" },
+    { scope: "global", role: "magnet", nodeId: "model:physics:exchange", status: "completed" },
+    { scope: undefined, role: "conductor", nodeId: null, status: "failed" },
+  ])("keeps explicit Exchange scope honest: $scope / $role", async ({ scope, role, nodeId, status }) => {
+    const selections: unknown[] = [];
+    const result = await createRibbonCommandRegistry().execute(
+      RIBBON_PHYSICS_SELECT_INTERACTION_COMMAND,
+      {
+        resourceData: {
+          [MODEL_SCENE_PATH]: { revision: 6, objects: [{ id: "waveguide", role }] },
+          [SESSION_STATUS_RESOURCE_KEY]: {
+            capabilities: {
+              active_lane: {
+                ...activeLaneCapabilityFixture(),
+                operations: {
+                  "interaction.exchange": {
+                    state: "supported",
+                    reason: "Exchange is supported.",
+                    requires: [],
+                  },
+                },
+              },
+            },
+            domain: { discretization: "fdm" },
+          },
+        },
+        selection: {
+          get: () => ({
+            objectId: "waveguide",
+            ref: { type: "scene-object", objectId: "waveguide", regionId: "core" },
+          }),
+          set: (selection: unknown) => selections.push(selection),
+        } as never,
+        source: "test",
+      },
+      { interactionId: "exchange", ...(scope ? { scope } : {}) },
+    );
+    expect(result.status).toBe(status);
+    if (nodeId) {
+      expect(selections).toEqual([expect.objectContaining({ nodeId })]);
+      if (!scope) {
+        expect(selections[0]).toMatchObject({
+          objectId: "waveguide",
+          ref: { objectId: "waveguide", type: "scene-object" },
+        });
+        expect((selections[0] as { ref: object }).ref).not.toHaveProperty("regionId");
+      }
+    } else {
+      expect(selections).toEqual([]);
+    }
   });
 
   it("requires an object or region before opening object-scoped spin torque", async () => {
@@ -1812,6 +1919,7 @@ describe("ribbon structure", () => {
     const fdmView = buildRibbonTabContent("view", {
       ...baseContext,
       sessionStatus: {
+        capabilities: { active_lane: ribbonActiveLane("fdm") },
         domain: { discretization: "fdm" },
         resources: { field_revision: 0, fields_revision: 0 },
       },
@@ -1838,7 +1946,7 @@ describe("ribbon structure", () => {
       },
       resourceData: {
         [SESSION_STATUS_RESOURCE_KEY]: {
-          data: { domain: { discretization: "fdm" } },
+          data: { capabilities: { active_lane: ribbonActiveLane("fdm") }, domain: { discretization: "fdm" } },
         },
       },
       selection: {
@@ -1869,7 +1977,6 @@ describe("ribbon structure", () => {
       "physics-add-dmi",
       "physics-add-ku",
       "manage-rf",
-      "add-cpw",
     ]);
     const matchedIds = new Set<string>();
 
@@ -1888,7 +1995,7 @@ describe("ribbon structure", () => {
     const content = buildRibbonTabContent("physics", {
       sessionStatus: {
         capabilities: {
-          active_lane: activeLaneCapabilityFixture(),
+          active_lane: ribbonActiveLane("fem"),
         },
         domain: { discretization: "fem" },
       },
@@ -1904,16 +2011,65 @@ describe("ribbon structure", () => {
       "physics-global:exchange",
       "physics-global:demag",
       "physics-global:zeeman",
+      "physics-global:rotated_interfacial_dmi",
       "physics-global:add-field-drive",
     ]);
-    expect(items.slice(0, 3).every(
+    expect(items.slice(0, 4).every(
       (node) => node.commandId === RIBBON_PHYSICS_SELECT_INTERACTION_COMMAND,
     )).toBe(true);
-    expect(items[3]).toMatchObject({
+    expect(items.slice(0, 4).map((node) => node.commandInput)).toEqual([
+      { interactionId: "exchange", scope: "global" },
+      { interactionId: "demag", scope: "global" },
+      { interactionId: "zeeman", scope: "global" },
+      { interactionId: "rotated_interfacial_dmi", scope: "global" },
+    ]);
+    expect(items[4]).toMatchObject({
       commandId: RIBBON_PHYSICS_CREATE_FIELD_DRIVE_COMMAND,
       label: "Field Drive",
     });
     expect(items.some((node) => node.id.includes("current_transport"))).toBe(false);
+  });
+
+  it("opens global rotated interfacial DMI at the canonical ribbon node", async () => {
+    const selections: unknown[] = [];
+    const result = await createRibbonCommandRegistry().execute(
+      RIBBON_PHYSICS_SELECT_INTERACTION_COMMAND,
+      {
+        resourceData: {
+          [SESSION_STATUS_RESOURCE_KEY]: {
+            capabilities: {
+              active_lane: {
+                ...activeLaneCapabilityFixture(),
+                operations: {
+                  "interaction.rotated_interfacial_dmi": {
+                    state: "supported",
+                    reason: "Rotated interfacial DMI is supported.",
+                    requires: [],
+                  },
+                },
+              },
+            },
+            domain: { discretization: "fem" },
+          },
+        },
+        selection: {
+          get: () => ({ objectId: "film" }),
+          set: (selection: unknown) => selections.push(selection),
+        } as never,
+        source: "test",
+      },
+      { interactionId: "rotated_interfacial_dmi" },
+    );
+
+    expect(result).toEqual({ status: "completed" });
+    expect(selections).toEqual([
+      expect.objectContaining({
+        kind: "object.physics",
+        label: "Rotated interfacial DMI",
+        nodeId: "model:physics:rotated_interfacial_dmi",
+        objectId: null,
+      }),
+    ]);
   });
 
   it("opens a canonical global field-drive draft from the Ribbon", async () => {
@@ -1993,6 +2149,7 @@ describe("ribbon structure", () => {
         layout: { setPanelVisible: vi.fn() },
         resourceData: {
           [SESSION_STATUS_RESOURCE_KEY]: {
+            capabilities: { active_lane: ribbonActiveLane("fdm") },
             domain: { discretization: "fdm" },
           },
         },
@@ -2032,7 +2189,7 @@ describe("ribbon structure", () => {
     const base = {
       api: {} as never,
       resourceData: {
-        [SESSION_STATUS_RESOURCE_KEY]: { domain: { discretization: "fdm" } },
+        [SESSION_STATUS_RESOURCE_KEY]: { capabilities: { active_lane: ribbonActiveLane("fdm") }, domain: { discretization: "fdm" } },
       },
       source: "test" as const,
     };
@@ -2073,7 +2230,7 @@ describe("ribbon structure", () => {
       registry.isEnabled(RIBBON_PHYSICS_CREATE_FROZEN_SPINS_COMMAND, {
         ...base,
         resourceData: {
-          [SESSION_STATUS_RESOURCE_KEY]: { domain: { discretization: "fem" } },
+          [SESSION_STATUS_RESOURCE_KEY]: { capabilities: { active_lane: ribbonActiveLane("fem") }, domain: { discretization: "fem" } },
         },
         selection: { get: () => magnetSelection } as never,
       }),
@@ -2145,7 +2302,7 @@ describe("ribbon structure", () => {
       const content = buildRibbonTabContent("physics", {
         sessionStatus: {
           capabilities: {
-            active_lane: activeLaneCapabilityFixture(),
+            active_lane: ribbonActiveLane(discretization),
           },
           domain: { discretization },
         },
@@ -2257,6 +2414,19 @@ describe("ribbon structure", () => {
       commandId: "geometry.add-microstrip-antenna",
     });
     expect(microstripAction?.disabled).not.toBe(true);
+  });
+
+  it("wires Physics and Geometry CPW actions to one antenna command", () => {
+    const cpwAction = ALL_TAB_CONTENT.physics.groups.find(
+      (group) => group.id === "rf-sources",
+    )?.actions.find((action) => action.id === "add-cpw");
+    expect(cpwAction).toMatchObject({ commandId: "geometry.add-cpw-antenna" });
+    expect(cpwAction?.disabled).not.toBe(true);
+    const geometryAction = ALL_TAB_CONTENT.geometry.groups.flatMap(
+      (group) => group.actions,
+    ).find((action) => action.id === "geometry.add-cpw-antenna");
+    expect(geometryAction).toBeDefined();
+    expect(geometryAction?.disabled).not.toBe(true);
   });
 
   it("wires global Surface and Texture ribbon menus to object and part display defaults", async () => {
@@ -3120,6 +3290,75 @@ describe("ribbon structure", () => {
         [VISUALIZATION_STATE_PATH, 42],
       ]),
     );
+  });
+
+  it("shows an active mode field as the viewport quantity instead of m", () => {
+    const { context } = createVisualizationRibbonContext({
+      active_quantity_id: "m",
+      quantity: { active_quantity_id: "m" },
+      revision: 7,
+    });
+    const actions = buildRibbonTabContent("results", {
+      ...context,
+      activeAnalysisField: { fieldId: "analysis:eigen:sample-0006:mode-0001", label: "kᵧ +15 rad/µm · 12.025 GHz" },
+    })?.groups.find((group) => group.id === "quantity")?.actions ?? [];
+
+    expect(actions.find((action) => action.id === "res-m")?.active).toBe(false);
+    expect(actions.find((action) => action.id === "res-analysis-field")).toMatchObject({
+      active: true,
+      commandId: "analysis.frequency-domain.clear-3d-overlay",
+      label: "Mode",
+    });
+    expect(
+      buildRibbonTabContent("results", context)
+        ?.groups.find((group) => group.id === "quantity")
+        ?.actions.some((action) => action.id === "res-analysis-field"),
+    ).toBe(false);
+  });
+
+  it("offers only working commands on the analysis contextual tab", () => {
+    const content = buildAnalysisContextTabContent();
+    const commandIds = content.groups.flatMap((group) => group.actions.map((action) => action.commandId));
+
+    expect(content.groups.map((group) => group.id)).toEqual(["analysis-view", "analysis-mode-field"]);
+    expect(commandIds).toEqual([
+      "ribbon.analysis.show-chart",
+      "ribbon.analysis.show-field",
+      "ribbon.analysis.show-chart-and-field",
+      "analysis.frequency-domain.stop-3d-animation",
+      "analysis.frequency-domain.clear-3d-overlay",
+    ]);
+    const registered = new Set(RIBBON_COMMANDS.map((command) => command.id));
+    expect(registered.has("ribbon.analysis.show-chart")).toBe(true);
+    expect(registered.has("ribbon.analysis.show-field")).toBe(true);
+  });
+
+  it("leaves the mode visualization when another quantity is chosen", async () => {
+    const { context } = createVisualizationRibbonContext({
+      active_quantity_id: "m",
+      quantity: { active_quantity_id: "m" },
+      revision: 7,
+    });
+    const analysisFieldOverlay = new AnalysisFieldOverlayController();
+    analysisFieldOverlay.set({
+      fieldId: "analysis:eigen:sample-0006:mode-0001",
+      label: "Mode 1",
+      query: { view: "phase_rotated_real" },
+      source: "eigen-mode",
+    } as never);
+    const mAction = buildRibbonTabContent("results", context)
+      ?.groups.find((group) => group.id === "quantity")
+      ?.actions.find((action) => action.id === "res-heff");
+    if (!mAction?.commandId) throw new Error("Expected H_eff Results shortcut");
+
+    await createRibbonCommandRegistry().execute(mAction.commandId, {
+      ...context.commandContext,
+      analysisFieldOverlay,
+      input: mAction.commandInput,
+      source: "ribbon",
+    } as CommandContext);
+
+    expect(analysisFieldOverlay.getSnapshot()).toBeNull();
   });
 
   it("patches canonical visualization state from Results quantity shortcuts", async () => {
@@ -4092,10 +4331,11 @@ describe("ribbon structure", () => {
     });
   });
 
-  it("fails closed to the Mesh overview for an explicit FDM session", () => {
+  it("exposes Build Grid for a resolved FDM lane despite a retained FEM domain", () => {
     const visualization = new ObjectVisualizationController();
     const sessionStatus = {
-      domain: { discretization: "fdm" },
+      capabilities: { active_lane: ribbonActiveLane("fdm") },
+      domain: { discretization: "fem" },
       resources: { field_revision: 1, fields_revision: 1 },
     } as const;
     const context = {
@@ -4136,8 +4376,12 @@ describe("ribbon structure", () => {
         mesh_summary: { node_count: 9, element_count: 8 },
       } as never,
     });
-    expect(mesh?.groups.map((group) => group.id)).toEqual(["mesh-view"]);
-    expect(mesh?.groups.find((group) => group.id === "build")).toBeUndefined();
+    expect(mesh?.groups.map((group) => group.id)).toEqual(["build", "mesh-view"]);
+    expect(
+      mesh?.groups
+        .find((group) => group.id === "build")
+        ?.actions.find((action) => action.id === "grid.build-fdm"),
+    ).toMatchObject({ label: "Build Grid" });
     expect(mesh?.groups.find((group) => group.id === "method")).toBeUndefined();
     expect(mesh?.groups.find((group) => group.id === "size")).toBeUndefined();
     const inspectorAction = mesh?.groups
@@ -4217,7 +4461,23 @@ describe("ribbon structure", () => {
     ).toEqual(["mesh.open-overview"]);
   });
 
-  it("preserves FEM mesh ribbon copy for an explicit FEM session", () => {
+  it.each(["fem", "fdm"] as const)("does not infer mesh actions from a retained %s domain with an unavailable planner lane", (discretization) => {
+    const activeLane = ribbonActiveLane(discretization);
+    const context = {
+      sessionStatus: {
+        capabilities: { active_lane: { ...activeLane, resolved: null } },
+        domain: { discretization },
+        resources: { field_revision: 0, fields_revision: 0 },
+      },
+    } as never;
+    const geometry = buildRibbonTabContent("geometry", context);
+    expect(geometry?.groups.find((group) => group.id === "builder-lifecycle")?.actions
+      .some((action) => action.id === "mesh.build-selected")).not.toBe(true);
+    const mesh = buildRibbonTabContent("mesh", context);
+    expect(mesh?.groups.map((group) => group.id)).toEqual(["mesh-view"]);
+  });
+
+  it("exposes FEM meshing before the initial FDM domain is replaced", () => {
     const visualization = new ObjectVisualizationController();
     const context = {
       commandContext: { source: "test" as const },
@@ -4230,7 +4490,8 @@ describe("ribbon structure", () => {
         ref: null,
       },
       sessionStatus: {
-        domain: { discretization: "fem" },
+        capabilities: { active_lane: ribbonActiveLane("fem") },
+        domain: { discretization: "fdm" },
         resources: { field_revision: 1, fields_revision: 1 },
       } as const,
       visualization,
@@ -4245,6 +4506,9 @@ describe("ribbon structure", () => {
 
     const mesh = buildRibbonTabContent("mesh", context);
     const buildGroup = mesh?.groups.find((group) => group.id === "build");
+    expect(
+      buildGroup?.actions.find((action) => action.id === "grid.build-fdm"),
+    ).toBeUndefined();
     expect(
       buildGroup?.actions.find(
         (action) => action.id === "mesh.build-shared-domain",
@@ -4302,6 +4566,53 @@ describe("ribbon structure", () => {
       disabled: true,
       tooltip: "FEM mesh authoring is unavailable for this session.",
     });
+  });
+
+  it("shows last-good mesh identity and source provenance in the mesh status menu", () => {
+    const visualization = new ObjectVisualizationController();
+    const content = buildRibbonTabContent("mesh", {
+      meshBuildLatest: {
+        revision: 12,
+        source_scene_revision: 9,
+        geometry_realization_revision: 11,
+        last_success: {
+          mesh_id: "mesh-12",
+          generation_id: "generation-12",
+        },
+      } as never,
+      meshSummary: { mesh_summary: { node_count: 4, element_count: 2 } } as never,
+      sessionStatus: femRibbonSessionStatus(),
+      selection: {
+        kind: null,
+        label: null,
+        moduleSource: null,
+        nodeId: null,
+        objectId: null,
+        ref: null,
+      },
+      visualization,
+      visualizationSnapshot: visualization.getSnapshot(),
+    });
+
+    const menu = content?.groups
+      .find((group) => group.id === "build")
+      ?.actions.find((action) => action.id === "mesh.build-selected")?.menu;
+    expect(menu).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        id: "mesh-build-status:last-good",
+        label: "Last good artifact",
+        value: "mesh-12",
+        tone: "success",
+      }),
+      expect.objectContaining({
+        id: "mesh-build-status:source-scene",
+        value: "9",
+      }),
+      expect.objectContaining({
+        id: "mesh-build-status:geometry-realization",
+        value: "11",
+      }),
+    ]));
   });
 
   it("prefers explicit supported mesh capability data over an unsupported top-level fallback", () => {
@@ -4622,6 +4933,8 @@ describe("ribbon structure", () => {
         api: { commands: { submit: vi.fn() } } as never,
         resourceData: {
           [MODEL_GEOMETRY_VALIDATION_PATH]: { diagnostics: [] },
+          [MODEL_READINESS_PATH]: READY_MODEL_READINESS,
+          [SIMULATION_PREPARATION_PATH]: { preparation_id: "prep-1", status: "ready" },
           [SESSION_STATUS_RESOURCE_KEY]: {
             capabilities: {
               binary_fields: true,
@@ -4664,10 +4977,17 @@ describe("ribbon structure", () => {
     const computeAction = content?.groups
       .find((group) => group.id === "control")
       ?.actions.find((action) => action.id === "study.run");
+    const prepareAction = content?.groups
+      .find((group) => group.id === "control")
+      ?.actions.find((action) => action.id === "study.prepare-live");
 
     expect(computeFieldsAction).toMatchObject({
       disabled: false,
       label: "Compute Fields",
+    });
+    expect(prepareAction).toMatchObject({
+      disabled: false,
+      label: "Prepare",
     });
     expect(computeAction).toMatchObject({
       disabled: false,
@@ -4689,6 +5009,7 @@ describe("ribbon structure", () => {
         api: { commands: { submit: vi.fn() } } as never,
         resourceData: {
           [MODEL_GEOMETRY_VALIDATION_PATH]: { diagnostics: [] },
+          [MODEL_READINESS_PATH]: READY_MODEL_READINESS,
           [SESSION_STATUS_RESOURCE_KEY]: {
             capabilities: {
               binary_fields: true,
@@ -4822,6 +5143,13 @@ describe("ribbon structure", () => {
       api: { commands: { submit: vi.fn() } } as never,
       resourceData: {
         [MODEL_GEOMETRY_VALIDATION_PATH]: { diagnostics: [] },
+        [MODEL_READINESS_PATH]: {
+          ...READY_MODEL_READINESS,
+          blockers: [
+            "Build a current shared-domain mesh before running. Open Mesh Jobs or Build Shared-Domain Mesh.",
+          ],
+          ready_to_run: false,
+        },
         [SESSION_STATUS_RESOURCE_KEY]: {
           capabilities: {
             binary_fields: true,
@@ -4988,9 +5316,9 @@ describe("ribbon structure", () => {
 
     expect(importAction).toMatchObject({
       disabled: false,
-      label: "Import State",
+      label: "Restore Runtime State",
     });
-    expect(importCommand?.shortcut).toBe("Ctrl+O");
+    expect(importCommand?.shortcut).toBe("Ctrl+Shift+O");
   });
 
   it("exposes object draft commit from the Geometry lifecycle group", () => {
@@ -5041,13 +5369,11 @@ describe("ribbon structure", () => {
       "builder-add-tube",
       "builder-add-wedge",
       "builder-add-polygon_prism",
-      "builder-tool-move",
       "builder-tool-rotate",
       "builder-tool-scale",
       "builder-mode-camera",
       "builder-mode-manipulate",
       "builder-toggle-snap",
-      "builder-validate",
       "builder-show-universe",
     ]);
     const actions = ALL_TAB_CONTENT.geometry.groups.flatMap(
@@ -5059,12 +5385,114 @@ describe("ribbon structure", () => {
         expect(action.disabled, action.id).toBe(true);
       }
     }
+    const transformActions = actions.filter((action) =>
+      ["builder-tool-move", "builder-tool-rotate", "builder-tool-scale"].includes(action.id),
+    );
+    expect(transformActions).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: "builder-tool-move", commandId: "geometry.move-selected" }),
+        expect.objectContaining({
+          disabled: true,
+          id: "builder-tool-rotate",
+          tooltip: "Rotate and Scale require a canonical geometry contract newer than ProblemIR 0.3.",
+        }),
+        expect.objectContaining({
+          disabled: true,
+          id: "builder-tool-scale",
+          tooltip: "Rotate and Scale require a canonical geometry contract newer than ProblemIR 0.3.",
+        }),
+      ]),
+    );
     const frameAllAction = actions.find((action) => action.id === "builder-frame-all");
+
+    expect(actions.find((action) => action.id === "builder-build-geometry")).toMatchObject({
+      id: "builder-build-geometry",
+      label: "Build Geometry",
+    });
+    expect(actions.find((action) => action.id === "builder-validate")).toMatchObject({
+      id: "builder-validate",
+      label: "Validate",
+    });
 
     expect(frameAllAction).toMatchObject({
       commandId: "viewport-3d.fit",
     });
     expect(frameAllAction).not.toHaveProperty("disabled");
+  });
+
+  it("executes Move by activating the selected magnetic object and focusing the 3D viewport", async () => {
+    const bus = new EventBus<KernelEventMap>();
+    const selection = new SelectionController(bus);
+    const layout = new LayoutController(bus);
+    const objectMoveTool = new ObjectMoveToolController();
+    selection.set(selectedMeshObject(), "test");
+    layout.setActiveViewportMainModule("analysis-plots");
+    const registry = createRibbonCommandRegistry();
+    const context = {
+      api: {} as never,
+      layout,
+      objectMoveTool,
+      resourceData: {
+        [MODEL_SCENE_PATH]: {
+          objects: [{ id: "box", role: "magnet" }],
+          revision: 8,
+        },
+      },
+      selection,
+      source: "test" as const,
+    };
+
+    expect(registry.isEnabled("geometry.move-selected", context)).toBe(true);
+    expect(objectMoveTool.getSnapshot()).toBeNull();
+
+    expect(await registry.execute("geometry.move-selected", context)).toEqual({
+      status: "completed",
+    });
+    expect(objectMoveTool.getSnapshot()).toEqual({
+      activationId: 1,
+      mode: "move",
+      objectId: "box",
+    });
+    expect(layout.get().activeViewportMainModuleId).toBe("viewport-3d");
+    expect(layout.get().focusedSlot).toBe("viewport-main");
+    expect(registry.isActive("geometry.move-selected", context)).toBe(true);
+  });
+
+  it("fails Move closed while scene readiness is unavailable and leaves Rotate/Scale request-free", async () => {
+    const bus = new EventBus<KernelEventMap>();
+    const selection = new SelectionController(bus);
+    selection.set(selectedMeshObject(), "test");
+    const objectMoveTool = new ObjectMoveToolController();
+    const registry = createRibbonCommandRegistry();
+    const commitTransaction = vi.fn();
+    const context = {
+      api: { model: { commitTransaction } } as never,
+      objectMoveTool,
+      resourceData: { [MODEL_SCENE_PATH]: null },
+      selection,
+      source: "test" as const,
+    };
+
+    expect(registry.isEnabled("geometry.move-selected", context)).toBe(false);
+    expect(registry.get("geometry.move-selected")?.disabledReason?.(context)).toBe(
+      "The revisioned model scene is not ready.",
+    );
+    expect(await registry.execute("geometry.move-selected", context)).toEqual({
+      message: "The revisioned model scene is not ready.",
+      status: "failed",
+    });
+    const rotateAndScale = ALL_TAB_CONTENT.geometry.groups
+      .flatMap((group) => group.actions)
+      .filter((action) => ["builder-tool-rotate", "builder-tool-scale"].includes(action.id));
+    expect(rotateAndScale).toHaveLength(2);
+    for (const action of rotateAndScale) {
+      expect(action).toMatchObject({
+        disabled: true,
+        tooltip: "Rotate and Scale require a canonical geometry contract newer than ProblemIR 0.3.",
+      });
+      expect(action).not.toHaveProperty("commandId");
+    }
+    expect(commitTransaction).not.toHaveBeenCalled();
   });
 
   it("exposes concrete study stage authoring commands in the Study ribbon", () => {
