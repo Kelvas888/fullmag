@@ -685,6 +685,8 @@ export type SelectionRef =
       analysisRunId?: string;
       analysisStageId?: string;
       artifactRevision?: number | string;
+      datasetId?: string;
+      datasetRevision?: string;
       availability?: ResourceAvailability;
       contractGap?: string | null;
       equilibriumId?: string;
@@ -1346,6 +1348,8 @@ export function selectionRefEquals(
         nullableStringEquals(left.contractGap, right.contractGap) &&
         nullableStringEquals(left.analysisRunId, right.analysisRunId) &&
         nullableStringEquals(left.analysisStageId, right.analysisStageId) &&
+        nullableStringEquals(left.datasetId, right.datasetId) &&
+        nullableStringEquals(left.datasetRevision, right.datasetRevision) &&
         nullableStringEquals(left.artifactPath, right.artifactPath) &&
         nullableStringEquals(left.branchId, right.branchId) &&
         nullableStringEquals(left.calculationMode, right.calculationMode) &&

@@ -46,6 +46,13 @@ on:
       - 'apps/control-room/src/shared/domain/analysis/frequencyDomainChartModels*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/EigenModeInspectorPanel*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/EigenBranchInspectorPanel*'
+      - 'apps/control-room/src/modules/inspector/panels/frequency-domain/EigenDispersionInspectorPanel*'
+      - 'apps/control-room/src/modules/explorer/**'
+      - 'apps/control-room/src/kernel/selection/selectionTypes*'
+      - 'apps/control-room/src/kernel/analysis-modules/analysisNodeKindAliases*'
+      - 'apps/control-room/src/kernel/analysis-modules/analysisSurfaceRouting*'
+      - 'apps/control-room/src/modules/inspector/inspectorRouteCatalog*'
+      - 'apps/control-room/src/modules/inspector/inspectorRegistry*'
       - '.github/workflows/eigensolve-ui-method-contracts.yml'
       - 'scripts/ci/prepare_eigensolve_ui_workspace.py'
       - 'scripts/ci/test_prepare_eigensolve_ui_workspace.py'
@@ -92,6 +99,13 @@ on:
       - 'apps/control-room/src/shared/domain/analysis/frequencyDomainChartModels*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/EigenModeInspectorPanel*'
       - 'apps/control-room/src/modules/inspector/panels/frequency-domain/EigenBranchInspectorPanel*'
+      - 'apps/control-room/src/modules/inspector/panels/frequency-domain/EigenDispersionInspectorPanel*'
+      - 'apps/control-room/src/modules/explorer/**'
+      - 'apps/control-room/src/kernel/selection/selectionTypes*'
+      - 'apps/control-room/src/kernel/analysis-modules/analysisNodeKindAliases*'
+      - 'apps/control-room/src/kernel/analysis-modules/analysisSurfaceRouting*'
+      - 'apps/control-room/src/modules/inspector/inspectorRouteCatalog*'
+      - 'apps/control-room/src/modules/inspector/inspectorRegistry*'
       - '.github/workflows/eigensolve-ui-method-contracts.yml'
       - 'scripts/ci/prepare_eigensolve_ui_workspace.py'
       - 'scripts/ci/test_prepare_eigensolve_ui_workspace.py'
@@ -171,6 +185,13 @@ jobs:
           src/shared/domain/analysis/frequencyDomainChartModels.test.ts
           src/modules/inspector/panels/frequency-domain/EigenModeInspectorPanel.test.tsx
           src/modules/inspector/panels/frequency-domain/EigenBranchInspectorPanel.test.tsx
+          src/modules/inspector/panels/frequency-domain/EigenDispersionInspectorPanel.test.tsx
+          src/modules/explorer/builders/catalogAnalysisFamilies.test.ts
+          src/modules/explorer/builders/resultsExplorerNodes.test.ts
+          src/modules/explorer/explorerSelection.test.ts
+          src/kernel/selection/selectionTypes.modeVisualization.test.ts
+          src/kernel/analysis-modules/analysisSurfaceRouting.test.ts
+          src/modules/inspector/inspectorRegistry.test.tsx
       - name: Check module architecture
         if: always()
         run: python -B scripts/fullmag_storage.py run --profile linux-host -- pnpm --dir apps/control-room check:architecture-hygiene

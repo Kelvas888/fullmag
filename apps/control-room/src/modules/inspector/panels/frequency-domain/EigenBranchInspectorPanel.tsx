@@ -49,6 +49,11 @@ export interface EigenBranchModePlotHandoff {
   };
 }
 
+type FrequencyDomainDatasetIdentity = Pick<
+  Extract<SelectionRef, { type: "frequency-domain" }>,
+  "datasetId" | "datasetRevision"
+>;
+
 const EIGEN_MODE_FIELD_REPRESENTATION = "complex-vector-xyz" as const;
 const EIGEN_MODE_FIELD_VIEW = "phase_rotated_real" as const;
 
@@ -101,6 +106,7 @@ export function buildEigenBranchModePlotHandoff(
   artifact: FrequencyDomainJsonArtifactResource | null | undefined,
   manifestStatus: string,
   manifestOwner: EigenBranchResultManifestOwner | null,
+  datasetIdentity: FrequencyDomainDatasetIdentity = {},
 ): EigenBranchModePlotHandoff | null {
   const sessionId = artifact?.session_id;
   const artifactSetId = artifact?.artifact_set_id;
@@ -186,6 +192,7 @@ export function buildEigenBranchModePlotHandoff(
       representation: EIGEN_MODE_FIELD_REPRESENTATION,
       resourceRef,
       studyProduct,
+      ...datasetIdentity,
     },
   );
   if (selectionRef.type !== "frequency-domain" || !selectionRef.fieldId) {
@@ -229,6 +236,7 @@ function buildEigenBranchModeOpenSelectionRef(
   artifact: FrequencyDomainJsonArtifactResource | null | undefined,
   manifestStatus: string,
   manifestOwner: EigenBranchResultManifestOwner | null,
+  datasetIdentity: FrequencyDomainDatasetIdentity = {},
 ): Extract<SelectionRef, { type: "frequency-domain" }> | null {
   const sessionId = artifact?.session_id;
   const artifactSetId = artifact?.artifact_set_id;
@@ -282,6 +290,7 @@ function buildEigenBranchModeOpenSelectionRef(
       representation: EIGEN_MODE_FIELD_REPRESENTATION,
       resourceRef: point.modeFieldResourceKey ?? undefined,
       studyProduct: manifestContext.studyProduct,
+      ...datasetIdentity,
     },
   );
   return selectionRef.type === "frequency-domain" ? selectionRef : null;
@@ -305,6 +314,7 @@ export function EigenBranchInspectorPanel({
   selection,
 }: InspectorPanelProps) {
   const summary = useEigenBranchSummary(selection);
+  const datasetIdentity = selectedDatasetIdentity(selection);
 
   return (
     <div
@@ -333,6 +343,7 @@ export function EigenBranchInspectorPanel({
         <BranchSampleTable
           artifact={summary.branchArtifact}
           branch={summary.branch}
+          datasetIdentity={datasetIdentity}
           manifestOwner={summary.manifestOwner}
           manifestStatus={summary.manifestStatus}
           resourceStatus={summary.branchArtifactStatus}
@@ -406,12 +417,14 @@ function BranchContinuityCharts({ branch }: { branch: EigenBranch | null }) {
 function BranchSampleTable({
   artifact,
   branch,
+  datasetIdentity,
   manifestOwner,
   manifestStatus,
   resourceStatus,
 }: {
   artifact: FrequencyDomainJsonArtifactResource | null;
   branch: EigenBranch | null;
+  datasetIdentity: FrequencyDomainDatasetIdentity;
   manifestOwner: EigenBranchResultManifestOwner | null;
   manifestStatus: string;
   resourceStatus: string;
@@ -504,6 +517,7 @@ function BranchSampleTable({
               artifact,
               manifestStatus,
               manifestOwner,
+              datasetIdentity,
             );
             const openModeRef =
               handoff?.selectionRef ??
@@ -514,6 +528,7 @@ function BranchSampleTable({
                 artifact,
                 manifestStatus,
                 manifestOwner,
+                datasetIdentity,
               );
             const rowKey = `${point.sampleIndex}:${point.rawModeIndex}`;
             return (
@@ -625,6 +640,18 @@ function branchSamplesCsv(branch: EigenBranch): string {
     "branch_id,sample_index,sample_id,raw_mode_index,mode_id,path_s_rad_per_m,kx_rad_per_m,ky_rad_per_m,kz_rad_per_m,frequency_real_hz,frequency_imag_hz,overlap_prev,residual_norm,mode_field_available,mode_field",
     ...rows,
   ].join("\n");
+}
+
+function selectedDatasetIdentity(
+  selection: InspectorPanelProps["selection"],
+): FrequencyDomainDatasetIdentity {
+  const ownerRef = selection.ref?.type === "frequency-domain"
+    ? selection.ref
+    : null;
+  return {
+    datasetId: ownerRef?.datasetId,
+    datasetRevision: ownerRef?.datasetRevision,
+  };
 }
 
 function useEigenBranchSummary(selection: InspectorPanelProps["selection"]) {

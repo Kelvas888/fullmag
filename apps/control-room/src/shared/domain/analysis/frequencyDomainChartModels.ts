@@ -552,6 +552,8 @@ export interface FrequencyDomainSelectionContext {
   analysisRunId?: string | null;
   analysisStageId?: string | null;
   artifactRevision?: number | string | null;
+  datasetId?: string | null;
+  datasetRevision?: string | null;
   artifactPath?: string | null;
   calculationMode?: FrequencyDomainCalculationMode | null;
   equilibriumId?: string | null;
@@ -1043,6 +1045,8 @@ export function buildEigenModeSelectionRef(
     artifactRevision: context.artifactRevision == null
       ? undefined
       : String(context.artifactRevision),
+    datasetId: context.datasetId ?? undefined,
+    datasetRevision: context.datasetRevision ?? undefined,
     artifactPath: context.artifactPath ?? undefined,
     branchId: point.branchId ?? undefined,
     calculationMode: context.calculationMode ?? "free_modes",
@@ -1184,6 +1188,8 @@ export function buildEigenDispersionPointSelectionRef(
     artifactRevision: context.artifactRevision == null
       ? undefined
       : String(context.artifactRevision),
+    datasetId: context.datasetId ?? undefined,
+    datasetRevision: context.datasetRevision ?? undefined,
     equilibriumId: context.equilibriumId ?? undefined,
     kContextKind: context.kContextKind ?? undefined,
     kPathCoordinateRadPerM: point.pathS,
@@ -1259,6 +1265,8 @@ export function buildEigenBranchPointModeSelectionRef(
     artifactRevision: context.artifactRevision == null
       ? undefined
       : String(context.artifactRevision),
+    datasetId: context.datasetId ?? undefined,
+    datasetRevision: context.datasetRevision ?? undefined,
     branchId,
     calculationMode: context.calculationMode ?? "dispersion_modal",
     fieldId: fieldAvailable ? point.modeFieldId ?? undefined : undefined,

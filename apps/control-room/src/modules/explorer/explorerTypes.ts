@@ -184,6 +184,7 @@ export type ExplorerNodeKind =
   | "results.dispersion.driven.field_at_k"
   | "results.dispersion.driven.provenance"
   | "results.hysteresis.root"
+  | "results.hysteresis.dataset"
   | "results.observation_frames.root"
   | "results.pinned_visualizations.root"
   | "results.observation_frame"
@@ -326,6 +327,9 @@ export interface ExplorerNode {
   analysisRunId?: string;
   analysisStageId?: string;
   artifactRevision?: number | string;
+  /** Canonical dataset identity from the typed analysis-result catalog. */
+  datasetId?: string;
+  datasetRevision?: string;
   contractGap?: string | null;
   postprocessingCatalogRevision?: ResourceRevision | null;
   postprocessingContractGap?: string | null;

@@ -1654,6 +1654,8 @@ describe("selectExplorerNode", () => {
       analysisRunId: "run-7",
       analysisStageId: "eigen-stage",
       artifactRevision: "eigen-r9",
+      datasetId: "catalog:eigen-dataset",
+      datasetRevision: "catalog-r9",
       equilibriumId: "eq-r4",
       id: "results:run:run-7:resonance:stage:eigen-stage:modal_eigen:spectrum",
       kContextKind: "finite_open",
@@ -1669,6 +1671,8 @@ describe("selectExplorerNode", () => {
       analysisRunId: "run-7",
       analysisStageId: "eigen-stage",
       artifactRevision: "eigen-r9",
+      datasetId: "catalog:eigen-dataset",
+      datasetRevision: "catalog-r9",
       equilibriumId: "eq-r4",
       kContextKind: "finite_open",
       kind: "results.resonance.modal.spectrum",
@@ -1677,6 +1681,35 @@ describe("selectExplorerNode", () => {
       resourceRef: "artifact-revision:eigen-r9",
       studyProduct: "modal_eigen",
       type: "frequency-domain",
+    });
+  });
+
+  it("selects a catalog hysteresis dataset by its canonical dataset identity", () => {
+    const kernel = makeKernel();
+    selectExplorerNode(kernel, {
+      analysisRunId: "run-7",
+      analysisStageId: "hysteresis-stage",
+      datasetId: "catalog:hysteresis-loop",
+      datasetRevision: "catalog-r3",
+      id: "results:run:run-7:hysteresis:dataset-1",
+      kind: "results.hysteresis.dataset",
+      label: "Hysteresis loop",
+      parentId: "results:run:run-7:hysteresis",
+      studyProduct: "hysteresis_loop",
+    }, "explorer");
+
+    expect(kernel.selection.get()).toMatchObject({
+      kind: "results.hysteresis.dataset",
+      nodeId: "results:run:run-7:hysteresis:dataset-1",
+      ref: {
+        datasetId: "catalog:hysteresis-loop",
+        datasetRevision: "catalog-r3",
+        focus: "dataset",
+        kind: "analysis.result",
+        runId: "run-7",
+        stageId: "hysteresis-stage",
+        type: "analysis-result",
+      },
     });
   });
 

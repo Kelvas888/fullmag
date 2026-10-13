@@ -21,6 +21,8 @@ function modeSelection(kind: string, overrides: Record<string, unknown> = {}) {
       analysisRunId: "run-1",
       analysisStageId: "eigen-dispersion",
       artifactRevision: 7,
+      datasetId: "catalog:eigen-dispersion",
+      datasetRevision: "catalog-revision-7",
       fieldId: "analysis:eigen:sample-0006:mode-0001",
       frequencyHz: 12.025103e9,
       kind,
@@ -41,8 +43,8 @@ describe("pinned mode visualization definitions", () => {
     expect(result.definition).toMatchObject({
       definition_id: pinnedModeVisualizationId("analysis.dispersion", {
         run_id: "run-1",
-        dataset_id: "eigen-dispersion",
-        dataset_revision: "7",
+        dataset_id: "catalog:eigen-dispersion",
+        dataset_revision: "catalog-revision-7",
         field_id: "analysis:eigen:sample-0006:mode-0001",
       }),
       definition_schema: "analysis.dispersion.mode_visualization.v1",
@@ -50,8 +52,8 @@ describe("pinned mode visualization definitions", () => {
       module_id: "analysis.dispersion",
       node_kind: "analysis.dispersion.mode_visualization",
       data_ref: {
-        dataset_id: "eigen-dispersion",
-        dataset_revision: "7",
+        dataset_id: "catalog:eigen-dispersion",
+        dataset_revision: "catalog-revision-7",
         field_id: "analysis:eigen:sample-0006:mode-0001",
         run_id: "run-1",
       },
@@ -65,13 +67,19 @@ describe("pinned mode visualization definitions", () => {
     const otherRun = modeVisualizationDefinitionFromSelection(
       modeSelection("results.dispersion.modal.mode_at_k", { analysisRunId: "run-2" }) as never,
     );
-    const otherStage = modeVisualizationDefinitionFromSelection(
+    const otherDataset = modeVisualizationDefinitionFromSelection(
       modeSelection("results.dispersion.modal.mode_at_k", {
-        analysisStageId: "another-dataset",
+        datasetId: "catalog:another-dataset",
       }) as never,
     );
-    const otherRevision = modeVisualizationDefinitionFromSelection(
-      modeSelection("results.dispersion.modal.mode_at_k", { artifactRevision: 8 }) as never,
+    const otherDatasetRevision = modeVisualizationDefinitionFromSelection(
+      modeSelection("results.dispersion.modal.mode_at_k", { datasetRevision: "catalog-revision-8" }) as never,
+    );
+    const differentLegacyStage = modeVisualizationDefinitionFromSelection(
+      modeSelection("results.dispersion.modal.mode_at_k", {
+        analysisStageId: "another-stage",
+        artifactRevision: 8,
+      }) as never,
     );
     const otherSample = modeVisualizationDefinitionFromSelection(
       modeSelection("results.dispersion.modal.mode_at_k", { sampleId: "sample-7" }) as never,
@@ -84,6 +92,8 @@ describe("pinned mode visualization definitions", () => {
         analysisRunId: "run:dataset",
         analysisStageId: "revision",
         artifactRevision: "x:y",
+        datasetId: "revision",
+        datasetRevision: "x:y",
         fieldId: "field",
       }) as never,
     );
@@ -92,6 +102,8 @@ describe("pinned mode visualization definitions", () => {
         analysisRunId: "run",
         analysisStageId: "dataset:revision",
         artifactRevision: "x:y",
+        datasetId: "dataset:revision",
+        datasetRevision: "x:y",
         fieldId: "field",
       }) as never,
     );
@@ -99,8 +111,9 @@ describe("pinned mode visualization definitions", () => {
     expect(
       base.ok &&
         otherRun.ok &&
-        otherStage.ok &&
-        otherRevision.ok &&
+        otherDataset.ok &&
+        otherDatasetRevision.ok &&
+        differentLegacyStage.ok &&
         otherSample.ok &&
         otherItem.ok &&
         delimiterLeft.ok &&
@@ -109,8 +122,9 @@ describe("pinned mode visualization definitions", () => {
     if (
       !base.ok ||
       !otherRun.ok ||
-      !otherStage.ok ||
-      !otherRevision.ok ||
+      !otherDataset.ok ||
+      !otherDatasetRevision.ok ||
+      !differentLegacyStage.ok ||
       !otherSample.ok ||
       !otherItem.ok ||
       !delimiterLeft.ok ||
@@ -120,8 +134,9 @@ describe("pinned mode visualization definitions", () => {
     }
     const baseId = base.definition.definition_id;
     expect(otherRun.definition.definition_id).not.toBe(baseId);
-    expect(otherStage.definition.definition_id).not.toBe(baseId);
-    expect(otherRevision.definition.definition_id).not.toBe(baseId);
+    expect(otherDataset.definition.definition_id).not.toBe(baseId);
+    expect(otherDatasetRevision.definition.definition_id).not.toBe(baseId);
+    expect(differentLegacyStage.definition.definition_id).toBe(baseId);
     expect(otherSample.definition.definition_id).not.toBe(baseId);
     expect(otherItem.definition.definition_id).not.toBe(baseId);
     expect(delimiterLeft.definition.definition_id).not.toBe(
@@ -192,7 +207,10 @@ describe("pinned mode visualization definitions", () => {
     ).toBe(false);
     expect(
       modeVisualizationDefinitionFromSelection(
-        modeSelection("results.dispersion.modal.mode_at_k", { artifactRevision: undefined }) as never,
+        modeSelection("results.dispersion.modal.mode_at_k", {
+          datasetId: undefined,
+          datasetRevision: undefined,
+        }) as never,
       ).ok,
     ).toBe(false);
     expect(modeVisualizationDefinitionFromSelection(modeSelection("object.visualization") as never).ok).toBe(false);

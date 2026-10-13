@@ -5,6 +5,7 @@ import { analysisModuleIdForNodeKind, analysisSurfaceForSelectionKind } from "./
 describe("Analysis surface routing from the selected Results node", () => {
   it("follows the owning module of legacy and module node kinds", () => {
     expect(analysisSurfaceForSelectionKind("results.dispersion.modal.relation")).toBe("dispersion");
+    expect(analysisSurfaceForSelectionKind("results.hysteresis.dataset")).toBe("hysteresis");
     expect(analysisSurfaceForSelectionKind("analysis.dispersion.mode_visualization")).toBe("dispersion");
     expect(analysisSurfaceForSelectionKind("results.resonance.driven.spectrum")).toBe("resonance-fmr");
     expect(analysisSurfaceForSelectionKind("results.observation_frame")).toBe("dynamics");

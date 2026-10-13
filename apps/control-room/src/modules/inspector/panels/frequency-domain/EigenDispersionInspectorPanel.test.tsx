@@ -6,6 +6,7 @@ import {
   buildEigenDispersionPointViewModel,
   dispersionReferenceComparison,
 } from "./EigenDispersionInspectorModel";
+import { buildEigenDispersionPointHandoffContext } from "./EigenDispersionInspectorPanel";
 
 const point: EigenDispersionPoint = {
   analyticFrequencyHz: 12.45e9,
@@ -25,6 +26,47 @@ const point: EigenDispersionPoint = {
 };
 
 describe("EigenDispersionInspectorPanel point model", () => {
+  it("carries only the selected canonical dataset identity into point handoff", () => {
+    const datasetSelection = {
+      kind: "results.eigen.dispersion",
+      label: "Dispersion",
+      moduleSource: "frequency-domain",
+      nodeId: "results:eigen:dispersion",
+      objectId: null,
+      ref: {
+        analysisRunId: "run-canonical",
+        analysisStageId: "stage-canonical",
+        artifactPath: "frequency-domain/dispersion.v2.json",
+        artifactRevision: "sha256:artifact-revision",
+        datasetId: "dataset-canonical",
+        datasetRevision: "sha256:dataset-revision",
+        kind: "results.eigen.dispersion",
+        nodeId: "results:eigen:dispersion",
+        type: "frequency-domain",
+      },
+    } as Parameters<typeof buildEigenDispersionPointHandoffContext>[0];
+
+    expect(buildEigenDispersionPointHandoffContext(datasetSelection)).toMatchObject({
+      analysisRunId: "run-canonical",
+      analysisStageId: "stage-canonical",
+      artifactPath: "frequency-domain/dispersion.v2.json",
+      artifactRevision: "sha256:artifact-revision",
+      calculationMode: "dispersion_modal",
+      datasetId: "dataset-canonical",
+      datasetRevision: "sha256:dataset-revision",
+    });
+    expect(
+      buildEigenDispersionPointHandoffContext({
+        ...datasetSelection,
+        ref: {
+          ...datasetSelection.ref,
+          datasetId: undefined,
+          datasetRevision: undefined,
+        },
+      }).datasetId,
+    ).toBeUndefined();
+  });
+
   it("keeps path coordinate in rad/m while frequency and linewidth stay in Hz", () => {
     expect(buildEigenDispersionPointViewModel(point)).toEqual({
       branchId: "acoustic",

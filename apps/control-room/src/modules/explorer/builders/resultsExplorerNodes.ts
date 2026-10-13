@@ -927,14 +927,14 @@ export function withPinnedAnalysisDefinitions(
           if (
             candidate.fieldId &&
             candidate.analysisRunId &&
-            candidate.analysisStageId &&
-            candidate.artifactRevision !== undefined
+            candidate.datasetId &&
+            candidate.datasetRevision
           ) {
             const identity: ModeVisualizationOwnerIdentity = {
               moduleId,
               runId: candidate.analysisRunId,
-              datasetId: candidate.analysisStageId,
-              datasetRevision: String(candidate.artifactRevision),
+              datasetId: candidate.datasetId,
+              datasetRevision: candidate.datasetRevision,
               fieldId: candidate.fieldId,
               sampleId: candidate.sampleId ?? null,
               itemId: candidate.modeId ?? null,
@@ -1030,11 +1030,14 @@ export function withCatalogAnalysisFamilies(
           node(familyId, "results.hysteresis.root", "Hysteresis", resultsRoot.id, {
             analysisRunId: resultsRoot.analysisRunId,
             children: loops.map((dataset) =>
-              node(`${familyId}:${key(dataset.stage_id)}`, "results.hysteresis.root", dataset.title, familyId, {
+              node(`${familyId}:${key(dataset.dataset_id)}`, "results.hysteresis.dataset", dataset.title, familyId, {
                 analysisRunId: dataset.run_id,
                 analysisStageId: dataset.stage_id,
+                datasetId: dataset.dataset_id,
+                datasetRevision: dataset.dataset_revision,
                 badge: dataset.stage_id,
                 icon: "activity",
+                studyProduct: dataset.product_kind,
               }),
             ),
             icon: "activity",
@@ -1060,16 +1063,69 @@ export function withCatalogAnalysisFamilies(
         }),
       );
     }
-    if (families.length === 0) return resultsRoot;
-    return {
-      ...resultsRoot,
-      availability: "available",
-      executionState: "completed",
-      resourceState: resultsRoot.resourceState === "error" ? "error" : "ready",
-      status: resultsRoot.status === "failed" ? "failed" : "ready",
-      children: [...(resultsRoot.children ?? []), ...families],
-    };
+    const augmentedRoot = families.length === 0
+      ? resultsRoot
+      : {
+          ...resultsRoot,
+          availability: "available" as const,
+          executionState: "completed" as const,
+          resourceState: resultsRoot.resourceState === "error" ? "error" as const : "ready" as const,
+          status: resultsRoot.status === "failed" ? "failed" as const : "ready" as const,
+          children: [...(resultsRoot.children ?? []), ...families],
+        };
+    return withCatalogDatasetIdentity(augmentedRoot, runDatasets);
   });
+}
+
+/** Joins legacy frequency-domain result nodes only to one exact catalog identity. */
+function withCatalogDatasetIdentity(
+  node: ExplorerNode,
+  datasets: readonly AnalysisResultDatasetSummaryResource[],
+): ExplorerNode {
+  const catalogJoinOwnedKind =
+    node.kind.startsWith("results.dispersion.") ||
+    node.kind.startsWith("results.resonance.") ||
+    node.kind.startsWith("results.eigen.");
+  const catalogJoinCandidate =
+    catalogJoinOwnedKind &&
+    Boolean(node.analysisRunId && node.analysisStageId && node.studyProduct);
+  const matches = catalogJoinCandidate
+    ? datasets.filter(
+        (dataset) =>
+          dataset.run_id === node.analysisRunId &&
+          dataset.stage_id === node.analysisStageId &&
+          dataset.product_kind === node.studyProduct,
+      )
+    : [];
+  const canonical = matches.length === 1 ? matches[0] : undefined;
+  const children = node.children?.map((child) =>
+    withCatalogDatasetIdentity(child, datasets),
+  );
+  const childrenChanged = Boolean(
+    node.children && children?.some((child, index) => child !== node.children?.[index]),
+  );
+  const identityChanged = Boolean(
+    canonical &&
+      (node.datasetId !== canonical.dataset_id ||
+        node.datasetRevision !== canonical.dataset_revision),
+  );
+  const clearStaleIdentity =
+    catalogJoinCandidate &&
+    !canonical &&
+    (node.datasetId !== undefined || node.datasetRevision !== undefined);
+  if (!childrenChanged && !identityChanged && !clearStaleIdentity) return node;
+
+  const nextNode: ExplorerNode = { ...node };
+  if (clearStaleIdentity) {
+    delete nextNode.datasetId;
+    delete nextNode.datasetRevision;
+  }
+  if (canonical) {
+    nextNode.datasetId = canonical.dataset_id;
+    nextNode.datasetRevision = canonical.dataset_revision;
+  }
+  if (childrenChanged) nextNode.children = children;
+  return nextNode;
 }
 
 function publishedAnalysisRoot(

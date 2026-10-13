@@ -37,6 +37,8 @@ describe("dispersion Inspector selection handoff", () => {
       ref: {
         analysisRunId: "run-published-7",
         analysisStageId: "stage-eigen-2",
+        datasetId: "catalog:dataset-eigen-2",
+        datasetRevision: "catalog-revision-7",
         artifactPath: "results/run-published-7/eigen/dispersion.json",
         artifactRevision: "sha256:published-dispersion-v7",
         kind: "results.eigen.dispersion",
@@ -54,6 +56,8 @@ describe("dispersion Inspector selection handoff", () => {
     expect(ref).toMatchObject({
       analysisRunId: "run-published-7",
       analysisStageId: "stage-eigen-2",
+      datasetId: "catalog:dataset-eigen-2",
+      datasetRevision: "catalog-revision-7",
       artifactPath: "results/run-published-7/eigen/dispersion.json",
       artifactRevision: "sha256:published-dispersion-v7",
       fieldId: dispersionPoint.modeFieldId,
@@ -61,8 +65,6 @@ describe("dispersion Inspector selection handoff", () => {
       modeId: dispersionPoint.modeId,
       sampleId: dispersionPoint.sampleId,
     });
-    expect(ref).not.toHaveProperty("datasetId");
-    expect(ref).not.toHaveProperty("datasetRevision");
 
     const intent = ref.type === "frequency-domain"
       ? createModeFieldOverlayIntent(ref)
@@ -89,6 +91,8 @@ describe("dispersion Inspector selection handoff", () => {
     expect(ref).not.toHaveProperty("analysisRunId");
     expect(ref).not.toHaveProperty("analysisStageId");
     expect(ref).not.toHaveProperty("artifactRevision");
+    expect(ref).not.toHaveProperty("datasetId");
+    expect(ref).not.toHaveProperty("datasetRevision");
     expect(ref.type === "frequency-domain" ? createModeFieldOverlayIntent(ref) : null)
       .toBeNull();
   });

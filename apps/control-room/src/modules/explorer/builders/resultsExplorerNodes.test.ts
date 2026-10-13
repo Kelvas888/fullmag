@@ -5,12 +5,17 @@ import type { KernelEventMap } from "@/kernel/events/eventTypes";
 import { fieldVectorResourceKey } from "@/kernel/api/fieldQueryIdentity";
 import { SelectionController } from "@/kernel/selection/SelectionController";
 import type { KernelApi } from "@/kernel/types";
-import type { ArtifactResource, TableResource } from "@/kernel/api/apiTypes";
+import type {
+  AnalysisResultDatasetSummaryResource,
+  ArtifactResource,
+  TableResource,
+} from "@/kernel/api/apiTypes";
 
 import { buildExplorerTree, flattenExplorerNodes } from "./buildModelTree";
 import {
   buildPhysicsFirstResultsTree,
   withPinnedAnalysisDefinitions,
+  withCatalogAnalysisFamilies,
   physicsFirstResultsSnapshotFromResources,
   type PhysicsFirstResultEntry,
 } from "./resultsExplorerNodes";
@@ -1209,10 +1214,27 @@ describe("withPinnedAnalysisDefinitions", () => {
       ],
       resultContextRunId: modalFinite.runId,
     });
+  const catalogDataset = (
+    runId: string,
+    stageId: string,
+  ): AnalysisResultDatasetSummaryResource => ({
+    dataset_id: `catalog:${runId}:${stageId}:modal-eigen`,
+    dataset_revision: `catalog-revision:${stageId}`,
+    item_count: 1,
+    manifest_resource_key: `manifest:${runId}:${stageId}`,
+    product_kind: "modal_eigen",
+    run_id: runId,
+    sample_count: 1,
+    stage_id: stageId,
+    status: { completeness: "complete", execution: "published", qualification: "legacy", resource: "complete" },
+    title: `Modal dataset ${stageId}`,
+  });
+  const treeWithCatalog = () =>
+    withCatalogAnalysisFamilies(tree(), [catalogDataset(modalFinite.runId, modalFinite.stageId)]);
   const definition = (field: string) => ({
     data_ref: {
-      dataset_id: modalFinite.stageId,
-      dataset_revision: String(modalFinite.artifactRevision),
+      dataset_id: `catalog:${modalFinite.runId}:${modalFinite.stageId}:modal-eigen`,
+      dataset_revision: `catalog-revision:${modalFinite.stageId}`,
       field_id: field,
       run_id: modalFinite.runId,
     },
@@ -1240,6 +1262,8 @@ describe("withPinnedAnalysisDefinitions", () => {
     analysisRunId: runId,
     analysisStageId: stageId,
     artifactRevision: revision,
+    datasetId: `dataset:${runId}:${stageId}`,
+    datasetRevision: `dataset-revision:${revision}`,
     fieldId: "analysis:eigen:sample-local:mode-local",
     sampleId,
     modeId,
@@ -1262,11 +1286,13 @@ describe("withPinnedAnalysisDefinitions", () => {
   });
 
   it("adds pinned copies of published mode nodes under the owning family", () => {
-    const nodes = flattenExplorerNodes(withPinnedAnalysisDefinitions(tree(), [definition(fieldId)]));
+    const nodes = flattenExplorerNodes(withPinnedAnalysisDefinitions(treeWithCatalog(), [definition(fieldId)]));
     const group = nodes.find((node) => node.kind === "results.pinned_visualizations.root" && node.label === "Pinned visualizations");
     expect(group?.analysisModuleId).toBe("analysis.dispersion");
     const pinned = group?.children?.[0];
     expect(pinned).toMatchObject({
+      datasetId: `catalog:${modalFinite.runId}:${modalFinite.stageId}:modal-eigen`,
+      datasetRevision: `catalog-revision:${modalFinite.stageId}`,
       fieldId,
       kind: "results.dispersion.modal.mode_at_k",
       label: "Pinned mode",
@@ -1278,7 +1304,7 @@ describe("withPinnedAnalysisDefinitions", () => {
 
   it("keeps a definition whose field is no longer published visible as unavailable", () => {
     const nodes = flattenExplorerNodes(
-      withPinnedAnalysisDefinitions(tree(), [definition("analysis:eigen:sample-0009:mode-0009")]),
+      withPinnedAnalysisDefinitions(treeWithCatalog(), [definition("analysis:eigen:sample-0009:mode-0009")]),
     );
     expect(nodes.find((node) => node.label === "Pinned mode")).toMatchObject({
       availability: "unavailable",
@@ -1312,8 +1338,8 @@ describe("withPinnedAnalysisDefinitions", () => {
     ) => ({
       data_ref: {
         run_id: owner.runId,
-        dataset_id: owner.stageId,
-        dataset_revision: owner.revision,
+        dataset_id: `dataset:${owner.runId}:${owner.stageId}`,
+        dataset_revision: `dataset-revision:${owner.revision}`,
         field_id: fieldId,
         ...(owner.sampleId ? { sample_id: owner.sampleId } : {}),
         ...(owner.itemId ? { item_id: owner.itemId } : {}),
@@ -1373,6 +1399,8 @@ describe("withPinnedAnalysisDefinitions", () => {
       analysisRunId: "run-1",
       analysisStageId: "stage-1",
       artifactRevision: "revision-1",
+      datasetId: "dataset:run-1:stage-1",
+      datasetRevision: "dataset-revision:revision-1",
       sampleId: "sample-1",
       modeId: "mode-1",
     });
@@ -1380,6 +1408,8 @@ describe("withPinnedAnalysisDefinitions", () => {
       analysisRunId: "run-1",
       analysisStageId: "stage-2",
       artifactRevision: "revision-2",
+      datasetId: "dataset:run-1:stage-2",
+      datasetRevision: "dataset-revision:revision-2",
       sampleId: "sample-2",
       modeId: "mode-2",
     });
@@ -1389,6 +1419,8 @@ describe("withPinnedAnalysisDefinitions", () => {
       analysisRunId: "run-1",
       analysisStageId: "stage-1",
       artifactRevision: "revision-1",
+      datasetId: "dataset:run-1:stage-1",
+      datasetRevision: "dataset-revision:revision-1",
       sampleId: "sample-1b",
       modeId: "mode-1b",
     });
@@ -1401,6 +1433,8 @@ describe("withPinnedAnalysisDefinitions", () => {
     expect(nodes.find((node) => node.label === "Legacy pin")).toMatchObject({
       analysisRunId: "run-2",
       analysisStageId: "stage-1",
+      datasetId: "dataset:run-2:stage-1",
+      datasetRevision: "dataset-revision:revision-1",
       sampleId: "sample-3",
       modeId: "mode-3",
     });
@@ -1430,6 +1464,38 @@ describe("withPinnedAnalysisDefinitions", () => {
     ));
 
     expect(nodes.find((node) => node.label === "Ambiguous legacy pin")).toMatchObject({
+      availability: "unavailable",
+      kind: "results.pinned_visualizations.root",
+    });
+  });
+
+  it("does not resolve a pin from stage and artifact revision without canonical dataset identity", () => {
+    const candidate = publishedMode(
+      "legacy-candidate", "run-1", "stage-1", "revision-1", "sample-1", "mode-1",
+    );
+    candidate.datasetId = undefined;
+    candidate.datasetRevision = undefined;
+    const definition = {
+      data_ref: {
+        run_id: "run-1",
+        dataset_id: "dataset:run-1:stage-1",
+        dataset_revision: "dataset-revision:revision-1",
+        field_id: candidate.fieldId,
+      },
+      definition_id: "canonical-owner-with-legacy-candidate",
+      definition_schema: "analysis.dispersion.mode_visualization.v1",
+      label: "Canonical owner",
+      module_id: "analysis.dispersion",
+      module_version: "0.1.0",
+      node_kind: "analysis.dispersion.mode_visualization",
+      revision: 1,
+    };
+    const nodes = flattenExplorerNodes(withPinnedAnalysisDefinitions(
+      [resultsRoot("run-1", [candidate])],
+      [definition],
+    ));
+
+    expect(nodes.find((node) => node.label === "Canonical owner")).toMatchObject({
       availability: "unavailable",
       kind: "results.pinned_visualizations.root",
     });

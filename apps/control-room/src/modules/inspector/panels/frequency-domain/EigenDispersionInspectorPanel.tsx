@@ -9,6 +9,7 @@ import {
   buildEigenBranchSelectionRef,
   buildEigenDispersionPointSelectionRef,
   type EigenBranch,
+  type FrequencyDomainSelectionContext,
 } from "@/shared/domain/analysis/frequencyDomainChartModels";
 import type { EigenDispersionPoint } from "@/shared/domain/analysis/frequencyDomainChartModels";
 import { formatFrequencyHz } from "@/shared/domain/analysis/frequencyUnits";
@@ -31,10 +32,10 @@ export function EigenDispersionInspectorPanel({
     : null;
 
   const selectPoint = (point: EigenDispersionPoint): void => {
-    const ref = buildEigenDispersionPointSelectionRef(point, {
-      calculationMode: "dispersion_modal",
-      resourceRef: ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
-    });
+    const ref = buildEigenDispersionPointSelectionRef(
+      point,
+      buildEigenDispersionPointHandoffContext(selection),
+    );
     kernel.selection.set(
       {
         kind: ref.kind,
@@ -199,6 +200,24 @@ export function EigenDispersionInspectorPanel({
       />
     </div>
   );
+}
+
+export function buildEigenDispersionPointHandoffContext(
+  selection: InspectorPanelProps["selection"],
+): FrequencyDomainSelectionContext {
+  const ownerRef = selection.ref?.type === "frequency-domain"
+    ? selection.ref
+    : null;
+  return {
+    analysisRunId: ownerRef?.analysisRunId,
+    analysisStageId: ownerRef?.analysisStageId,
+    artifactPath: ownerRef?.artifactPath,
+    artifactRevision: ownerRef?.artifactRevision,
+    calculationMode: "dispersion_modal",
+    datasetId: ownerRef?.datasetId,
+    datasetRevision: ownerRef?.datasetRevision,
+    resourceRef: ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
+  };
 }
 
 function selectedDispersionPoint(

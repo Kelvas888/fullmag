@@ -19,6 +19,7 @@ export const LEGACY_RESULTS_NODE_KIND_ALIASES: Readonly<Record<string, AnalysisN
   "results.dispersion.driven.response_map": "analysis.dispersion.relation",
   "results.dispersion.driven.field_at_k": "analysis.dispersion.mode_visualization",
   "results.dispersion.driven.provenance": "analysis.dispersion.quality",
+  "results.hysteresis.dataset": "analysis.hysteresis.overview",
   "results.resonance.root": "analysis.resonance.overview",
   "results.resonance.modal.stage": "analysis.resonance.overview",
   "results.resonance.driven.stage": "analysis.resonance.overview",

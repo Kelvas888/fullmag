@@ -1256,6 +1256,8 @@ export function buildEigenDispersionPointSelectionRefFromSelection(
     analysisRunId: ownerRef?.analysisRunId,
     analysisStageId: ownerRef?.analysisStageId,
     artifactRevision: ownerRef?.artifactRevision,
+    datasetId: ownerRef?.datasetId,
+    datasetRevision: ownerRef?.datasetRevision,
     artifactPath: ownerRef?.artifactPath,
     calculationMode: "dispersion_modal",
     equilibriumId: ownerRef?.equilibriumId,

@@ -137,6 +137,10 @@ describe("EigenBranchInspectorPanel point model", () => {
     expect(modalManifestOwner?.resultContext.classification?.kContext.kind).toBe(
       "k_path",
     );
+    const datasetIdentity = {
+      datasetId: "dataset-canonical",
+      datasetRevision: "sha256:dataset-revision",
+    };
     const handoff = buildEigenBranchModePlotHandoff(
       "acoustic",
       plotPoint,
@@ -156,6 +160,7 @@ describe("EigenBranchInspectorPanel point model", () => {
       },
       "ready",
       modalManifestOwner,
+      datasetIdentity,
     );
 
     expect(handoff?.commandInput).toMatchObject({
@@ -180,6 +185,8 @@ describe("EigenBranchInspectorPanel point model", () => {
     expect(handoff?.selectionRef).toMatchObject({
       analysisRunId: "run-7",
       analysisStageId: "eigen-stage-7",
+      datasetId: "dataset-canonical",
+      datasetRevision: "sha256:dataset-revision",
       artifactPath: "eigen/branches.v2.json",
       artifactRevision: "sha256:branches-revision-7",
       branchId: "acoustic",
@@ -429,6 +436,8 @@ describe("EigenBranchInspectorPanel open mode owner binding", () => {
           ref: expect.objectContaining({
             analysisRunId: "run-7",
             analysisStageId: "eigen-stage-7",
+            datasetId: "dataset-canonical",
+            datasetRevision: "sha256:dataset-revision",
             artifactPath: "eigen/branches.v2.json",
             artifactRevision: "sha256:branches-revision-7",
             branchId: "acoustic",
@@ -582,6 +591,8 @@ function branchInspectorSelection(): Parameters<
     objectId: null,
     ref: {
       branchId: "acoustic",
+      datasetId: "dataset-canonical",
+      datasetRevision: "sha256:dataset-revision",
       kind: "results.eigen.branch",
       nodeId,
       type: "frequency-domain",

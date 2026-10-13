@@ -145,13 +145,17 @@ export function modeVisualizationDefinitionFromSelection(
   if (!manifest || !nodeKind || !schema) {
     return { ok: false, reason: "This result's analysis module cannot pin mode visualizations." };
   }
-  if (!ref.analysisRunId || !ref.analysisStageId || ref.artifactRevision === undefined) {
-    return { ok: false, reason: "The selected field has no published run, stage or revision identity." };
+  if (
+    !ref.analysisRunId ||
+    typeof ref.datasetId !== "string" || ref.datasetId.trim().length === 0 ||
+    typeof ref.datasetRevision !== "string" || ref.datasetRevision.trim().length === 0
+  ) {
+    return { ok: false, reason: "The selected field has no canonical published dataset identity." };
   }
   const dataRef: ModeVisualizationDataRef = {
     run_id: ref.analysisRunId,
-    dataset_id: ref.analysisStageId,
-    dataset_revision: String(ref.artifactRevision),
+    dataset_id: ref.datasetId,
+    dataset_revision: ref.datasetRevision,
     field_id: ref.fieldId,
     ...(ref.sampleId ? { sample_id: ref.sampleId } : {}),
     ...(ref.modeId ? { item_id: ref.modeId } : {}),

@@ -14,6 +14,7 @@ import type { PostprocessingDefinitionKind } from "@/shared/domain/analysis/post
 import { targetForFdmNativeLayer } from "@/kernel/visualization/ObjectVisualizationController";
 import { selectCrossSectionPlot } from "@/kernel/workspace/crossSectionWorkspace";
 import { parsePinnedQuickChart } from "@/kernel/workspace/quickChartWorkspace";
+import { analysisResultSelectionRef } from "@/shared/domain/analysis/results";
 
 import type { ExplorerNode } from "./explorerTypes";
 
@@ -180,6 +181,25 @@ export function selectionRefFromNode(node: ExplorerNode): SelectionRef | null {
     };
   }
 
+  if (node.kind === "results.hysteresis.dataset") {
+    if (
+      !node.analysisRunId ||
+      !node.analysisStageId ||
+      !node.datasetId ||
+      !node.datasetRevision
+    ) {
+      return null;
+    }
+    return analysisResultSelectionRef({
+      datasetId: node.datasetId,
+      datasetRevision: node.datasetRevision,
+      focus: "dataset",
+      runId: node.analysisRunId,
+      stageId: node.analysisStageId,
+      nodeId: node.id,
+    });
+  }
+
   if (
     node.kind === "object.frozen-spins" &&
     node.constraintId
@@ -339,6 +359,8 @@ export function selectionRefFromNode(node: ExplorerNode): SelectionRef | null {
       ...(node.artifactRevision !== undefined
         ? { artifactRevision: node.artifactRevision }
         : {}),
+      ...(node.datasetId ? { datasetId: node.datasetId } : {}),
+      ...(node.datasetRevision ? { datasetRevision: node.datasetRevision } : {}),
       ...(node.availability ? { availability: node.availability } : {}),
       ...(node.contractGap !== undefined ? { contractGap: node.contractGap } : {}),
       ...(node.equilibriumId ? { equilibriumId: node.equilibriumId } : {}),

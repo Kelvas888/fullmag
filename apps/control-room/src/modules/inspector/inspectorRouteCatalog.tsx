@@ -1443,7 +1443,7 @@ const INSPECTOR_ROUTE_CONTRIBUTIONS: InspectorPanelContribution[] = [
   {
     id: "analysis-result",
     title: "Analysis result",
-    selectionKinds: ["analysis.result"],
+    selectionKinds: ["analysis.result", "results.hysteresis.dataset"],
     component: AnalysisResultInspectorPanel,
   },
   {
