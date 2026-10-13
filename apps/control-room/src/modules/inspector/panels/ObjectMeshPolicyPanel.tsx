@@ -1283,7 +1283,7 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
 
   const executeFdmGridBuild = useCallback(async () => {
     try {
-      const result = await commands.execute("grid.build-fdm", operationContext);
+      const result = await commands.execute("grid.build-fdm", commandContext);
       setFeedback({
         kind: result.status === "completed" ? "success" : result.status === "failed" ? "error" : "warning",
         message: result.message ?? (result.status === "completed"
@@ -1294,7 +1294,7 @@ export function ObjectMeshPolicyPanel({ selection }: InspectorPanelProps) {
     } catch (error) {
       setFeedback({ kind: "error", message: errorMessage(error) });
     }
-  }, [commands, operationContext]);
+  }, [commands, commandContext]);
 
   if (explicitFdm) {
     return (

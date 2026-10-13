@@ -519,7 +519,7 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
               onCancel={closeDialog}
               onOpenMeshOverview={() => {
                 closeDialog();
-                void kernel.commands.execute("mesh.open-overview");
+                openMeshBuildDiagnostics(kernel);
               }}
               ready={snapshotCurrent}
               rendered={state.lastCommandStatus === "rendered"}
