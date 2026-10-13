@@ -4095,26 +4095,26 @@
       "id": "source-c04-factor-matrix-snapshot-contract",
       "path": "docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md",
       "symbol": "DOC-ANCHOR:c04-factor-matrix-phase-snapshots",
-      "responsibility": "Bounded input-matrix observations; pairing, runtime and scientific qualification remain NOT VERIFIED",
+      "responsibility": "Bounded v2 object/attempt/copy-origin observations; legacy pairing, last-probe relation and scientific qualification remain NOT VERIFIED",
       "evidence_status": "planned_contract"
     },
     {
       "id": "source-c04-factor-matrix-snapshot-getters",
       "path": "backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp",
       "symbol": "bool emit_floquet_factor_matrix_snapshot",
-      "responsibility": "Opt-in public PETSc getters before A/B/C setup/copy with bounded copied scalar stderr JSON and quarantine guard"
+      "responsibility": "Opt-in public matrix/PC ID, zero-pivot and pinned input-matrix inode CSR getters before A/B/C setup/copy; bounded copied values with independent availability and quarantine guard"
     },
     {
       "id": "source-c04-factor-matrix-snapshot-validator",
       "path": "scripts/ci/parse_floquet_factor_matrix_snapshots.py",
       "symbol": "validate_snapshot",
-      "responsibility": "Require measured 4x4 snapshots, sixteen finite raw-backed entries and independently available successful getters"
+      "responsibility": "Require measured 4x4/raw snapshots and strict optional PC/zero-pivot/inode availability; missing configuration is NOT VERIFIED"
     },
     {
       "id": "source-c04-factor-matrix-snapshot-log-parser",
       "path": "scripts/ci/parse_floquet_factor_matrix_snapshots.py",
       "symbol": "parse_log",
-      "responsibility": "Read and hash-bind actual CTest log; absent measurements fail and phase coverage never establishes object pairing"
+      "responsibility": "Read and hash-bind actual CTest log; separate A-to-B ID relation from B-to-C copy origin within explicit process/attempt/callback scope"
     },
     {
       "id": "source-c04-factor-matrix-snapshot-ci-environment",
@@ -4158,6 +4158,12 @@
       "path": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
       "symbol": "void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnostics",
       "responsibility": "Separate row-restore/primary-cleanup backing-byte selectors require actual before/after evidence and mutation controls; unchanged safety selectors remain separate"
+    },
+    {
+      "id": "source-c04-factor-matrix-snapshot-pairing-v2",
+      "path": "scripts/ci/parse_floquet_factor_matrix_snapshots.py",
+      "symbol": "pair_snapshots",
+      "responsibility": "Bind public IDs and exact copy origin; raw value equality is not identity and first capture is not last probe"
     }
   ],
   "public_api": {

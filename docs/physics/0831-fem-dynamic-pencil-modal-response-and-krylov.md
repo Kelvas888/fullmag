@@ -5433,12 +5433,28 @@ Strukturalne brakowanie diagonali różni się od jej liczbowego zera.
 Nonzero-state wolno porównywać wyłącznie dla tego samego obiektu macierzy.
 Ordering jest jawnie unavailable; nie używamy prywatnych getterów.
 
-Snapshoty nie zawierają object ID, copy-origin ani attempt binding.
-**Pairing A/B/C pozostaje NOT VERIFIED.** Podobne wartości lub kolejność
-markerów nie dowodzą, że A/B to ten sam obiekt, ani że C pochodzi z konkretnego
-B. Nie wyciągamy z nich przyczynowej diagnozy shiftu. Publiczny getter może
-materializować wewnętrzne metadata; sam source-only audit nie dowodzi zerowego
-wpływu obserwatora na runtime.
+Historyczny schema v1 nie zawiera object/copy-origin/attempt binding;
+jego pairing pozostaje NOT VERIFIED. Schema v2 odczytuje publicznym
+`PetscObjectGetId` ID każdego obiektu przed kwarantanną. A ma process-local
+`attempt_scope_id` konkretnego `EPSSetUp`; ten sam scope jest przekazywany
+workspace B/C. A ma `capture_scope=before_eps_setup`, bez callbacku.
+B/C zapisują dodatni callback ordinal i scope pierwszej obserwacji.
+Przed KAŻDYM rzeczywistym `MatDuplicate` odświeżamy ID źródła; C nie może
+odziedziczyć pochodzenia z wcześniejszej kopii. Getter errors i niedostępne
+ID pozostają niezależnie raportowane.
+
+Parser grupuje wyłącznie w obrębie hash-bound logu, jawnej invocation kolejnego
+CTest Start (nie łączy retry tego samego test-ID) i attempt
+scope. A→B raportuje zmierzone `same_object` albo `different_objects`;
+równe wartości nie oznaczają identity. Nonzero-state porównuje tylko dla
+identycznych ID A/B. B→C wymaga `copy_origin_id=B.object_id`, odrębnego
+C.object_id i tego samego callback ordinal. Brak, sprzeczne albo
+niejednoznaczne binding oznacza NOT VERIFIED. Byte equality jest odrębną
+obserwacją. `first_live_pc_capture` nie jest automatycznie `last_true_probe`;
+to powiązanie pozostaje NOT VERIFIED bez osobnego dowodu callbacku.
+Nie wyciągamy przyczynowej diagnozy shiftu. Publiczny getter może
+materializować metadata; source-only audit nie dowodzi zerowego wpływu
+obserwatora na runtime.
 
 Hosted `floquet-modal-slepc` włącza tę diagnostykę. Po wykonaniu kontraktu,
 również po failed CTest, `parse_log` z
@@ -5447,8 +5463,12 @@ raport odczytanego logu. Wymaga dla dwóch rzeczywistych fixtures
 `fem_modal_eigen_contract` i `fem_modal_eigen_mixed_dense_contract`
 pomierzonych A/B/C, pełnych 16 pozycji, finite wartości i poprawnych getterów.
 Brak, malformed, unavailable, not-applicable lub obcięcie nie zastępują
-pomiaru. Kompletność pomiaru może dać wyłącznie `measured_unpaired`;
-`pairing_status` oraz `scientific_qualification` pozostają `NOT VERIFIED`.
+pomiaru. Kompletne pomiary v1 pozostają `measured_unpaired`. Dla v2 wyjście parsera
+zero wymaga dodatkowo jednoznacznych ID-bound attempts obu fixtures;
+raport może wtedy dać `measured_bound` i pairing VERIFIED. Operator oraz
+przyczyna failure nie są kwalifikowane: `scientific_qualification` i
+`solver_failure_cause` pozostają NOT VERIFIED. Brak pairing nie daje
+udanego wyniku CLI, nawet gdy wszystkie 16 wartości są dostępne.
 Powtórzenia stderr przez CTest bez test-ID nie służą coverage; raport liczy je
 jawnie jako unscoped i nie przypisuje do konkretnej próby. Parser nie zmienia
 wyniku CTest ani natywnego receipt. Kod jest źródłowo
@@ -5462,7 +5482,7 @@ dowodem niezmienności produkcyjnych Vec. Snapshoty C04 tej bramki nie zamykają
 | Ścieżka | Symbol | Zakres dowodu |
 |---|---|---|
 | `backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp` | `bool emit_floquet_factor_matrix_snapshot` | Opt-in getter-only A/B/C; native wykonanie pending |
-| `scripts/ci/parse_floquet_factor_matrix_snapshots.py` | `validate_snapshot`, `parse_log` | Odczyt rzeczywistych ograniczonych markerów; brak pomiaru nie PASS |
+| `scripts/ci/parse_floquet_factor_matrix_snapshots.py` | `validate_snapshot`, `parse_log`, `pair_snapshots` | Odczyt rzeczywistych ograniczonych markerów; brak pomiaru nie PASS |
 | `scripts/ci/run_fem_positive_mass_contract.py` | `_execute_contract` | Włączenie diagnostyki w hosted Floquet profile |
 | `.github/workflows/fem-positive-mass-contract.yml` | `fem-positive-mass-contract` | Krok Record C04 matrix measurements even after failed CTest: raport `always()`, bez zmiany natywnego wyniku |
 
@@ -5506,3 +5526,29 @@ przed otrzymaniem rzeczywistych wyników.
 | `backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp` | `create_floquet_phi_vectors` | Binding produkcyjnych Vec oraz współdzielony lifetime |
 | `backends/fem/cpu/frequency_domain/modal/floquet_modal_solver.cpp` | `void snapshot_floquet_phi_backing_bytes_before_observation` | Whole-byte before snapshot bez lease |
 | `backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp` | `void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnostics` | Osobne `--floquet-row-restore-production-phi-backing-bytes-probe` i `--floquet-row-primary-cleanup-production-phi-backing-bytes-probe`; hosted wykonanie pending |
+
+
+### C04 — dodatkowy pomiar konfiguracji, bez zmiany układu
+
+W opt-in snapshot v2 A/B/C zapisujemy ID rzeczywistego PC oraz wynik
+`PCFactorGetZeroPivot`, wyłącznie dla potwierdzonego PCLU i przed quarantine.
+Availability, kod błędu i wartość pozostają oddzielne; niedostępność nie oznacza
+zera ani równej konfiguracji. Porównanie B/C dotyczy konfiguracji zero-pivot,
+nie zmierzonej perturbacji faktora. Wspólny EPS attempt/callback i copy-origin
+wiążą obserwację; first capture nie zastępuje last true probe.
+
+Dla bounded seqaij4x4 publiczny `MatInodeGetInodeSizes` w pinned PETSc3.24.6
+zwraca `size_csr`, czyli cumulative row offsets. Kopiujemy maksymalnie pięć
+wartości, bez zachowywania pożyczonego pointera. Sentinel i ścisłe granice
+rozróżniają success bez zapisanego wyniku. Odczytane metadata macierzy
+wejściowej nie dowodzą stanu wewnętrznego faktora ani inverse-diagonal cache.
+`MatGetOption(MAT_USE_INODES)` nie jest stosowane: pinned implementation nie
+obsługuje tego przypadku jako wiarygodnego getter-output.
+Nie zmieniamy ordering/inode/shift/tolerancji. Przyczyna C04 i scientific
+qualification pozostają NOT VERIFIED do rzeczywistych receipts i rozwiązania
+obu failing full/mixed cases.
+
+C05 checkpoint GHA38357069909 na `6771daab6ee81c51133453795acbfef5c182cc66`:
+oba backing-byte harnessy PASS (32bytes rhs oraz32bytes solution), wraz z
+mutation controls. Zakres dowodu to production_backing_bytes_only. Cała suite
+12/14, full/mixed FAIL; nie jest to kwalifikacja wszystkich Vec lub solvera.

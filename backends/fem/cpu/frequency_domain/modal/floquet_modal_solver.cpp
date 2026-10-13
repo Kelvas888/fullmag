@@ -36,19 +36,32 @@ thread_local FloquetPhiBackingStorageTestHarness *active_phi_backing_storage_tes
 #if FULLMAG_FEM_WITH_SLEPC
 // Public PETSc v3.24.6 getters only; no row/array leases or factor setup.
 // This opt-in observes input matrices, not LU factors or scientific invariance.
-bool emit_floquet_factor_matrix_snapshot(const char *phase, Mat matrix) noexcept
+bool floquet_factor_matrix_snapshot_requested() noexcept
 {
     const char *enabled = std::getenv("FULLMAG_FLOQUET_FACTOR_MATRIX_SNAPSHOT");
     const char *dense = std::getenv("FULLMAG_FLOQUET_DENSE_ORACLE");
     const char *action = std::getenv("FULLMAG_FLOQUET_SCHUR_ACTION_DIAGNOSTIC");
-    const bool diagnostic_requested = (dense != nullptr && std::strcmp(dense, "1") == 0) ||
-        (action != nullptr && std::strcmp(action, "1") == 0);
-    if (enabled == nullptr || std::strcmp(enabled, "1") != 0 || !diagnostic_requested) {
+    return enabled != nullptr && std::strcmp(enabled, "1") == 0 &&
+        ((dense != nullptr && std::strcmp(dense, "1") == 0) ||
+         (action != nullptr && std::strcmp(action, "1") == 0));
+}
+
+bool emit_floquet_factor_matrix_snapshot(
+    const char *phase, Mat matrix, std::uint64_t attempt_scope_id,
+    std::int64_t callback_ordinal = 0, PetscObjectId copy_origin_id = 0,
+    PetscErrorCode copy_origin_error = PETSC_ERR_ARG_WRONGSTATE,
+    bool copy_origin_attempted = false, PC observed_pc = nullptr) noexcept
+{
+    if (!floquet_factor_matrix_snapshot_requested()) {
+
         return false;
     }
     if (fullmag::fem::runtime::petsc_slepc_process_is_unsafe_locked()) {
         return false; // Never query the quarantined graph.
     }
+    PetscObjectId object_id = 0;
+    const PetscErrorCode object_id_error = matrix != nullptr
+        ? PetscObjectGetId(reinterpret_cast<PetscObject>(matrix), &object_id) : PETSC_ERR_ARG_NULL;
     PetscInt rows = -1, columns = -1, row_begin = -1, row_end = -1;
     MatType matrix_type = nullptr;
     const PetscErrorCode size_error = matrix != nullptr
@@ -93,8 +106,49 @@ bool emit_floquet_factor_matrix_snapshot(const char *phase, Mat matrix) noexcept
             values_error = MatGetValues(matrix, 4, indices, 4, indices, values);
         }
     }
+    // Public pinned-3.24.6 getters. The inode getter exposes size_csr;
+    // copy bounded offsets immediately, never retain its borrowed pointer.
+    PetscInt inode_count = -1, inode_limit = -1;
+    PetscInt *inode_csr = nullptr;
+    PetscInt inode_offsets[5] = {};
+    PetscErrorCode inode_error = PETSC_ERR_ARG_WRONGSTATE;
+    bool inode_attempted = false, inode_metadata_available = false, inode_csr_available = false;
+    if (applicable && type_available && std::strcmp(type_copy, MATSEQAIJ) == 0) {
+        inode_attempted = true;
+        inode_error = MatInodeGetInodeSizes(matrix, &inode_count, &inode_csr, &inode_limit);
+        inode_metadata_available = inode_error == PETSC_SUCCESS && inode_count >= 0 && inode_count <= 4 && inode_limit > 0;
+        if (inode_metadata_available && inode_count > 0 && inode_csr != nullptr) {
+            inode_csr_available = true;
+            for (PetscInt index = 0; index <= inode_count; ++index) {
+                inode_offsets[index] = inode_csr[index];
+                if (inode_offsets[index] < 0 || inode_offsets[index] > 4 ||
+                    (index > 0 && inode_offsets[index] <= inode_offsets[index - 1])) {
+                    inode_csr_available = false;
+                }
+            }
+            inode_csr_available = inode_csr_available && inode_offsets[0] == 0 && inode_offsets[inode_count] == 4;
+        }
+    }
+    PetscObjectId pc_object_id = 0;
+    PetscErrorCode pc_id_error = PETSC_ERR_ARG_NULL;
+    PetscErrorCode pc_type_error = PETSC_ERR_ARG_NULL;
+    PetscErrorCode zero_pivot_error = PETSC_ERR_ARG_WRONGSTATE;
+    PCType pc_type = nullptr;
+    PetscReal zero_pivot = 0;
+    bool zero_pivot_attempted = false;
+    if (observed_pc != nullptr) {
+        pc_id_error = PetscObjectGetId(reinterpret_cast<PetscObject>(observed_pc), &pc_object_id);
+        pc_type_error = PCGetType(observed_pc, &pc_type);
+        if (pc_type_error == PETSC_SUCCESS && pc_type != nullptr && std::strcmp(pc_type, PCLU) == 0) {
+            zero_pivot_attempted = true;
+            zero_pivot_error = PCFactorGetZeroPivot(observed_pc, &zero_pivot);
+        }
+    }
+    const bool zero_pivot_available = zero_pivot_attempted && zero_pivot_error == PETSC_SUCCESS &&
+        std::isfinite(static_cast<double>(zero_pivot)) && zero_pivot >= 0;
     const bool values_available = getters_attempted && values_error == PETSC_SUCCESS;
     const bool measured = applicable && type_available && values_available &&
+        object_id_error == PETSC_SUCCESS && object_id > 0 && attempt_scope_id > 0 &&
         diagonal_error == PETSC_SUCCESS && state_error == PETSC_SUCCESS;
     char json[8192] = {};
     std::size_t used = 0;
@@ -110,17 +164,60 @@ bool emit_floquet_factor_matrix_snapshot(const char *phase, Mat matrix) noexcept
         }
         used += static_cast<std::size_t>(written);
     };
-    append("{\"schema\":\"fullmag.floquet-factor-matrix-snapshot.v1\",\"phase\":\"%s\","
+    append("{\"schema\":\"fullmag.floquet-factor-matrix-snapshot.v2\",\"phase\":\"%s\","
            "\"status\":\"%s\",\"applicable_n4\":%s,\"size_available\":%s,\"rows\":%lld,\"columns\":%lld,"
            "\"type_available\":%s,\"type\":", phase,
            measured ? "measured" : (size_error == PETSC_SUCCESS && !applicable ? "not_applicable" : "unavailable"),
            applicable ? "true" : "false", size_error == PETSC_SUCCESS ? "true" : "false",
            static_cast<long long>(rows), static_cast<long long>(columns), type_available ? "true" : "false");
+    const bool setup_phase = std::strcmp(phase, "A_shifted_pmat_before_live_setup") == 0;
     if (type_available) {
         append("\"%s\"", type_copy);
     } else {
         append("null");
     }
+    append(",\"attempt_scope_id\":%llu,\"attempt_scope_semantics\":\"process_local_eps_setup_sequence\","
+           "\"capture_scope\":\"%s\",\"callback_ordinal_available\":%s,\"callback_ordinal\":",
+           static_cast<unsigned long long>(attempt_scope_id), setup_phase ? "before_eps_setup" : "first_live_pc_capture",
+           setup_phase ? "false" : "true");
+    if (setup_phase) append("null"); else append("%lld", static_cast<long long>(callback_ordinal));
+    append(",\"object_id_available\":%s,\"object_id_error_available\":%s,\"object_id_error\":%d,\"object_id\":",
+           object_id_error == PETSC_SUCCESS && object_id > 0 ? "true" : "false",
+           matrix != nullptr ? "true" : "false", static_cast<int>(object_id_error));
+    if (object_id_error == PETSC_SUCCESS && object_id > 0) append("%lld", static_cast<long long>(object_id)); else append("null");
+    const bool origin_available = copy_origin_attempted && copy_origin_error == PETSC_SUCCESS && copy_origin_id > 0;
+    append(",\"copy_origin_id_available\":%s,\"copy_origin_error_available\":%s,\"copy_origin_error\":",
+           origin_available ? "true" : "false", copy_origin_attempted ? "true" : "false");
+    if (copy_origin_attempted) append("%d", static_cast<int>(copy_origin_error)); else append("null");
+    append(",\"copy_origin_id\":");
+    if (origin_available) append("%lld", static_cast<long long>(copy_origin_id)); else append("null");
+    append(",\"pc_object_id_available\":%s,\"pc_object_id_error_available\":%s,\"pc_object_id_error\":%d,\"pc_object_id\":",
+           pc_id_error == PETSC_SUCCESS && pc_object_id > 0 ? "true" : "false",
+           observed_pc != nullptr ? "true" : "false", static_cast<int>(pc_id_error));
+    if (pc_id_error == PETSC_SUCCESS && pc_object_id > 0) append("%lld", static_cast<long long>(pc_object_id)); else append("null");
+    append(",\"pc_type_error_available\":%s,\"pc_type_error\":%d,\"pc_is_lu_available\":%s,\"pc_is_lu\":",
+           observed_pc != nullptr ? "true" : "false", static_cast<int>(pc_type_error),
+           pc_type_error == PETSC_SUCCESS && pc_type != nullptr ? "true" : "false");
+    if (pc_type_error == PETSC_SUCCESS && pc_type != nullptr) append("%s", std::strcmp(pc_type, PCLU) == 0 ? "true" : "false"); else append("null");
+    append(",\"zero_pivot_attempted\":%s,\"zero_pivot_error_available\":%s,\"zero_pivot_error\":",
+           zero_pivot_attempted ? "true" : "false", zero_pivot_attempted ? "true" : "false");
+    if (zero_pivot_attempted) append("%d", static_cast<int>(zero_pivot_error)); else append("null");
+    append(",\"zero_pivot_available\":%s,\"zero_pivot\":", zero_pivot_available ? "true" : "false");
+    if (zero_pivot_available) append("%.17g", static_cast<double>(zero_pivot)); else append("null");
+    append(",\"inode_metadata_scope\":\"pinned_3_24_6_input_matrix_size_csr_not_factor_or_use_flag\","
+           "\"inode_query_attempted\":%s,\"inode_error_available\":%s,\"inode_error\":",
+           inode_attempted ? "true" : "false", inode_attempted ? "true" : "false");
+    if (inode_attempted) append("%d", static_cast<int>(inode_error)); else append("null");
+    append(",\"inode_metadata_available\":%s,\"inode_count\":", inode_metadata_available ? "true" : "false");
+    if (inode_metadata_available) append("%lld", static_cast<long long>(inode_count)); else append("null");
+    append(",\"inode_limit\":");
+    if (inode_metadata_available) append("%lld", static_cast<long long>(inode_limit)); else append("null");
+    append(",\"inode_csr_offsets_available\":%s,\"inode_csr_offsets\":", inode_csr_available ? "true" : "false");
+    if (inode_csr_available) {
+        append("[");
+        for (PetscInt index = 0; index <= inode_count; ++index) append("%s%lld", index == 0 ? "" : ",", static_cast<long long>(inode_offsets[index]));
+        append("]");
+    } else append("null");
     append(",\"size_error_available\":%s,\"type_error_available\":%s,"
            "\"ownership_error_available\":%s,\"values_error_available\":%s,"
            "\"diagonal_error_available\":%s,\"nonzero_state_error_available\":%s,"
@@ -1266,6 +1363,7 @@ PetscErrorCode stop_native_floquet_eps(
 
 struct NativeFloquetMatShellContext {
     std::shared_ptr<FloquetPhiBackingStorageTestBuffers> phi_test_storage;
+    std::uint64_t factor_snapshot_attempt_scope_id = 0;
     Mat a_qq = nullptr;
     Mat rotated_a_qq = nullptr;
     Mat a_qphi = nullptr;
@@ -1975,6 +2073,9 @@ struct FloquetCandidateOperatorDiagnosticWorkspace {
     Mat borrowed_pmat_pattern_fixture_reference = nullptr;
     Mat live_pc_owned_pmat_copy = nullptr;
     bool pmat_before_duplicate_snapshot_emitted = false;
+    PetscObjectId pmat_snapshot_copy_origin_id = 0;
+    PetscErrorCode pmat_snapshot_copy_origin_error = PETSC_ERR_ARG_WRONGSTATE;
+    std::int64_t pmat_snapshot_callback_ordinal = 0;
     bool pmat_before_fresh_setup_snapshot_emitted = false;
     KSP live_pc_owned_pmat_ksp = nullptr;
     Vec live_pc_owned_pmat_solution = nullptr;
@@ -2669,9 +2770,18 @@ PetscErrorCode prepare_candidate_owned_pmat_copy_and_lu(
                 &observation, PETSC_ERR_LIB, "injected_borrowed_pmat_copy_failure");
             break;
         }
-        if (!workspace->pmat_before_duplicate_snapshot_emitted) {
-            workspace->pmat_before_duplicate_snapshot_emitted = emit_floquet_factor_matrix_snapshot(
-                "B_live_pc_pmat_before_duplicate", borrowed_pmat);
+        if (floquet_factor_matrix_snapshot_requested() &&
+            !fullmag::fem::runtime::petsc_slepc_process_is_unsafe_locked()) {
+            // Refresh origin on EACH actual copy, not merely the first B.
+            workspace->pmat_snapshot_copy_origin_error = PetscObjectGetId(
+                reinterpret_cast<PetscObject>(borrowed_pmat), &workspace->pmat_snapshot_copy_origin_id);
+            workspace->pmat_snapshot_callback_ordinal = workspace->summary.callback_ordinal;
+            if (!workspace->pmat_before_duplicate_snapshot_emitted) {
+                workspace->pmat_before_duplicate_snapshot_emitted = emit_floquet_factor_matrix_snapshot(
+                    "B_live_pc_pmat_before_duplicate", borrowed_pmat,
+                    workspace->production_context->factor_snapshot_attempt_scope_id,
+                    workspace->pmat_snapshot_callback_ordinal, 0, PETSC_ERR_ARG_WRONGSTATE, false, live_pc);
+            }
         }
         error = MatDuplicate(
             borrowed_pmat, MAT_COPY_VALUES, &workspace->live_pc_owned_pmat_copy);
@@ -2855,7 +2965,11 @@ PetscErrorCode prepare_candidate_owned_pmat_copy_and_lu(
         if (error == PETSC_SUCCESS) {
             if (!workspace->pmat_before_fresh_setup_snapshot_emitted) {
                 workspace->pmat_before_fresh_setup_snapshot_emitted = emit_floquet_factor_matrix_snapshot(
-                    "C_owned_copy_before_fresh_setup", workspace->live_pc_owned_pmat_copy);
+                    "C_owned_copy_before_fresh_setup", workspace->live_pc_owned_pmat_copy,
+                    workspace->production_context->factor_snapshot_attempt_scope_id,
+                    workspace->pmat_snapshot_callback_ordinal,
+                    workspace->pmat_snapshot_copy_origin_id, workspace->pmat_snapshot_copy_origin_error,
+                    workspace->pmat_before_duplicate_snapshot_emitted, fresh_pc);
             }
             (void)emit_floquet_factor_phase_marker("fresh_setup_begin");
             error = KSPSetUp(workspace->live_pc_owned_pmat_ksp);
@@ -8027,8 +8141,17 @@ solve_floquet_shared_domain_sparse_modal_spectrum_reusing_context(
     // Configure the ST operator before allocating callback work vectors. This
     // makes the workspaces match the actual shifted system, not its
     // preconditioner approximation.
+    // Process mutex serializes this diagnostic sequence; it is not a public
+    // run identity and must be combined with the CTest process/log context.
+    static std::uint64_t snapshot_attempt_sequence = 0;
+    context.factor_snapshot_attempt_scope_id = 0;
+    if (floquet_factor_matrix_snapshot_requested() &&
+        snapshot_attempt_sequence < std::numeric_limits<std::uint64_t>::max()) {
+        context.factor_snapshot_attempt_scope_id = ++snapshot_attempt_sequence;
+    }
     (void)emit_floquet_factor_matrix_snapshot(
-        "A_shifted_pmat_before_live_setup", shifted_preconditioner);
+        "A_shifted_pmat_before_live_setup", shifted_preconditioner,
+        context.factor_snapshot_attempt_scope_id, 0, 0, PETSC_ERR_ARG_WRONGSTATE, false, shifted_pc);
     (void)emit_floquet_factor_phase_marker("live_setup_begin");
     const PetscErrorCode live_setup_error = EPSSetUp(eps);
     (void)emit_floquet_factor_phase_marker("live_setup_end");

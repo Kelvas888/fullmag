@@ -2,8 +2,8 @@
 """Validate bounded C04 measurements from a real verbose CTest log.
 
 Complete phase coverage is diagnostic evidence only. The current native schema
-has no object/copy-origin binding: pairing and scientific qualification remain
-NOT VERIFIED, including when the measurement parser exits successfully.
+binds v2 IDs within a process/attempt; legacy pairing remains NOT VERIFIED.
+Scientific qualification and failure cause remain NOT VERIFIED in all cases.
 """
 from __future__ import annotations
 
@@ -15,7 +15,8 @@ from pathlib import Path
 import re
 
 PREFIX = "FULLMAG_FLOQUET_FACTOR_MATRIX_SNAPSHOT "
-SCHEMA = "fullmag.floquet-factor-matrix-snapshot.v1"
+SCHEMA = "fullmag.floquet-factor-matrix-snapshot.v2"
+LEGACY_SCHEMA = "fullmag.floquet-factor-matrix-snapshot.v1"
 PHASES = (
     "A_shifted_pmat_before_live_setup",
     "B_live_pc_pmat_before_duplicate",
@@ -24,6 +25,267 @@ PHASES = (
 MAX_LINE_BYTES = 9216
 MAX_RECORDS = 2048
 REQUIRED_TESTS = ("fem_modal_eigen_contract", "fem_modal_eigen_mixed_dense_contract")
+CONFIGURATION_FIELDS = frozenset((
+    "pc_object_id_available", "pc_object_id_error_available", "pc_object_id_error", "pc_object_id",
+    "pc_type_error_available", "pc_type_error", "pc_is_lu_available", "pc_is_lu",
+    "zero_pivot_attempted", "zero_pivot_error_available", "zero_pivot_error",
+    "zero_pivot_available", "zero_pivot", "inode_metadata_scope", "inode_query_attempted",
+    "inode_error_available", "inode_error", "inode_metadata_available", "inode_count",
+    "inode_limit", "inode_csr_offsets_available", "inode_csr_offsets",
+))
+INODE_METADATA_SCOPE = "pinned_3_24_6_input_matrix_size_csr_not_factor_or_use_flag"
+PC_CONFIGURATION_SCOPE = "public_pc_getter_observations_only; no factor perturbation or causal explanation"
+INODE_COMPARISON_SCOPE = "input_matrix_inode_size_and_csr_metadata_only; never MAT_USE_INODES or factor-internal cache"
+ZERO_PIVOT_COMPARISON_SCOPE = "separate public zero-pivot getter readings for confirmed LU PCs; equality does not establish the same PC object, factor, or configuration; no factor perturbation or causal inference"
+
+
+def _configuration_measurements(record: dict) -> tuple[dict | None, list[str]]:
+    """Read optional v2 PC/inode evidence without treating absence as a value."""
+    present = CONFIGURATION_FIELDS.intersection(record)
+    if not present:
+        return None, []
+    if present != CONFIGURATION_FIELDS:
+        return None, ["configuration evidence is partial"]
+
+    errors = []
+
+    def boolean(name: str) -> bool | None:
+        value = record[name]
+        if type(value) is not bool:
+            errors.append(f"{name} is not a boolean")
+            return None
+        return value
+
+    def integer(name: str) -> int | None:
+        value = record[name]
+        if type(value) is not int:
+            errors.append(f"{name} is not an integer")
+            return None
+        return value
+
+    pc_id_available = boolean("pc_object_id_available")
+    pc_id_error_available = boolean("pc_object_id_error_available")
+    pc_id_error = integer("pc_object_id_error")
+    pc_id = record["pc_object_id"]
+    if pc_id_available is True:
+        if pc_id_error_available is not True or pc_id_error != 0 or type(pc_id) is not int or pc_id <= 0:
+            errors.append("available PC object ID lacks a successful getter and positive integer ID")
+    elif pc_id is not None:
+        errors.append("unavailable PC object ID must be null")
+    if pc_id_error_available is False and pc_id_error == 0:
+        errors.append("unattempted PC object ID getter reports success")
+    if pc_id_error_available is True and pc_id_error not in (None, 0) and pc_id_available is True:
+        errors.append("failed PC object ID getter is marked available")
+
+    pc_type_error_available = boolean("pc_type_error_available")
+    pc_type_error = integer("pc_type_error")
+    pc_is_lu_available = boolean("pc_is_lu_available")
+    pc_is_lu = record["pc_is_lu"]
+    if pc_is_lu_available is True:
+        if pc_type_error_available is not True or pc_type_error != 0 or type(pc_is_lu) is not bool:
+            errors.append("available PC type lacks a successful getter or boolean value")
+    elif pc_is_lu is not None:
+        errors.append("unavailable PC type must be null")
+    if pc_type_error_available is False and pc_type_error == 0:
+        errors.append("unattempted PC type getter reports success")
+    if pc_type_error_available is True and pc_type_error not in (None, 0) and pc_is_lu_available is True:
+        errors.append("failed PC type getter is marked available")
+
+    zero_pivot_attempted = boolean("zero_pivot_attempted")
+    zero_pivot_error_available = boolean("zero_pivot_error_available")
+    zero_pivot_error = record["zero_pivot_error"]
+    zero_pivot_available = boolean("zero_pivot_available")
+    zero_pivot = record["zero_pivot"]
+    if zero_pivot_attempted is True:
+        if zero_pivot_error_available is not True or type(zero_pivot_error) is not int:
+            errors.append("attempted zero-pivot getter lacks an error result")
+        if pc_is_lu_available is not True or pc_is_lu is not True:
+            errors.append("zero-pivot getter was attempted without a confirmed LU PC")
+    elif zero_pivot_error_available is not False or zero_pivot_error is not None:
+        errors.append("unattempted zero-pivot getter must have no error result")
+    if zero_pivot_attempted is not None and zero_pivot_error_available is not None \
+            and zero_pivot_attempted != zero_pivot_error_available:
+        errors.append("zero-pivot attempt and error availability disagree")
+    if pc_is_lu_available is True and pc_is_lu is True and zero_pivot_attempted is False:
+        errors.append("confirmed LU PC has no zero-pivot getter attempt")
+    if zero_pivot_available is True:
+        if zero_pivot_attempted is not True or zero_pivot_error_available is not True \
+                or zero_pivot_error != 0 or type(zero_pivot) not in (int, float):
+            errors.append("available zero-pivot value lacks a successful getter")
+        else:
+            try:
+                if not math.isfinite(float(zero_pivot)) or zero_pivot < 0:
+                    errors.append("available zero-pivot value is not finite and nonnegative")
+            except (OverflowError, ValueError):
+                errors.append("available zero-pivot value cannot be represented")
+    elif zero_pivot is not None:
+        errors.append("unavailable zero-pivot value must be null")
+    if zero_pivot_attempted is True and zero_pivot_error_available is True \
+            and zero_pivot_error not in (None, 0) and zero_pivot_available is True:
+        errors.append("failed zero-pivot getter is marked available")
+
+    if record["inode_metadata_scope"] != INODE_METADATA_SCOPE:
+        errors.append("inode metadata scope is not the pinned input-matrix scope")
+    inode_query_attempted = boolean("inode_query_attempted")
+    inode_error_available = boolean("inode_error_available")
+    inode_error = record["inode_error"]
+    inode_metadata_available = boolean("inode_metadata_available")
+    inode_count = record["inode_count"]
+    inode_count_is_int = type(inode_count) is int
+    inode_limit = record["inode_limit"]
+    inode_offsets_available = boolean("inode_csr_offsets_available")
+    inode_offsets = record["inode_csr_offsets"]
+    if inode_query_attempted is True:
+        if inode_error_available is not True or type(inode_error) is not int:
+            errors.append("attempted inode query lacks an error result")
+    elif inode_error_available is not False or inode_error is not None:
+        errors.append("unattempted inode query must have no error result")
+    if inode_query_attempted is not None and inode_error_available is not None \
+            and inode_query_attempted != inode_error_available:
+        errors.append("inode query attempt and error availability disagree")
+    if inode_metadata_available is True:
+        if inode_query_attempted is not True or inode_error_available is not True or inode_error != 0:
+            errors.append("available inode metadata lacks a successful query")
+        if not inode_count_is_int or not 0 <= inode_count <= 4:
+            errors.append("available inode count is outside the bounded integer range")
+        if type(inode_limit) is not int or inode_limit <= 0:
+            errors.append("available inode limit is not a positive integer")
+    elif inode_count is not None or inode_limit is not None:
+        errors.append("unavailable inode metadata values must be null")
+    if inode_offsets_available is True:
+        if inode_metadata_available is not True or not inode_count_is_int or inode_count <= 0:
+            errors.append("available inode CSR offsets require positive-count metadata")
+        if not isinstance(inode_offsets, list):
+            errors.append("available inode CSR offsets are not a list")
+        elif not inode_count_is_int:
+            pass  # The count error above is sufficient; do not use malformed count in arithmetic.
+        elif len(inode_offsets) != inode_count + 1:
+            errors.append("inode CSR offsets do not match count plus one")
+        elif any(type(offset) is not int for offset in inode_offsets):
+            errors.append("inode CSR offsets contain a non-integer value")
+        elif inode_offsets[0] != 0 or inode_offsets[-1] != 4 \
+                or any(right <= left for left, right in zip(inode_offsets, inode_offsets[1:])):
+            errors.append("inode CSR offsets must start at zero, end at four, and strictly increase")
+    elif inode_offsets is not None:
+        errors.append("unavailable inode CSR offsets must be null")
+
+    if errors:
+        return None, errors
+
+    pc_status = "VERIFIED" if pc_id_available and pc_is_lu_available \
+        and (pc_is_lu is False or zero_pivot_available) else "NOT VERIFIED"
+    inode_status = "VERIFIED" if inode_metadata_available and (inode_count == 0 or inode_offsets_available) else "NOT VERIFIED"
+    offset_status = "VERIFIED" if inode_offsets_available else (
+        "NOT APPLICABLE" if inode_metadata_available and inode_count == 0 else "NOT VERIFIED")
+    return {
+        "pc": {
+            "scope": PC_CONFIGURATION_SCOPE,
+            "measurement_status": pc_status,
+            "object_id_available": pc_id_available,
+            "object_id_error_available": pc_id_error_available,
+            "object_id_error": pc_id_error,
+            "object_id": pc_id if pc_id_available else None,
+            "type_error_available": pc_type_error_available,
+            "type_error": pc_type_error,
+            "is_lu_available": pc_is_lu_available,
+            "is_lu": pc_is_lu if pc_is_lu_available else None,
+            "zero_pivot_attempted": zero_pivot_attempted,
+            "zero_pivot_error_available": zero_pivot_error_available,
+            "zero_pivot_error": zero_pivot_error,
+            "zero_pivot_available": zero_pivot_available,
+            "zero_pivot": zero_pivot if zero_pivot_available else None,
+        },
+        "inode": {
+            "scope": INODE_METADATA_SCOPE,
+            "measurement_status": inode_status,
+            "query_attempted": inode_query_attempted,
+            "error_available": inode_error_available,
+            "error": inode_error,
+            "metadata_available": inode_metadata_available,
+            "count": inode_count if inode_metadata_available else None,
+            "limit": inode_limit if inode_metadata_available else None,
+            "csr_offsets_available": inode_offsets_available,
+            "csr_offsets_measurement_status": offset_status,
+            "csr_offsets": inode_offsets if inode_offsets_available else None,
+        },
+    }, []
+
+
+def _inode_metadata_comparison(left: dict | None, right: dict | None) -> dict:
+    left_inode = left["inode"] if left is not None else None
+    right_inode = right["inode"] if right is not None else None
+    metadata_available = left_inode is not None and right_inode is not None \
+        and left_inode["metadata_available"] and right_inode["metadata_available"]
+    offsets_available = metadata_available and left_inode["csr_offsets_available"] \
+        and right_inode["csr_offsets_available"]
+    return {
+        "measurement_status": "VERIFIED" if metadata_available else "NOT VERIFIED",
+        "count_equal": left_inode["count"] == right_inode["count"] if metadata_available else None,
+        "limit_equal": left_inode["limit"] == right_inode["limit"] if metadata_available else None,
+        "csr_offsets_measurement_status": "VERIFIED" if offsets_available else "NOT VERIFIED",
+        "csr_offsets_equal": left_inode["csr_offsets"] == right_inode["csr_offsets"] if offsets_available else None,
+        "scope": INODE_COMPARISON_SCOPE,
+    }
+
+
+def _configuration_pair_report(a: dict | None, b: dict | None, c: dict | None) -> dict:
+    configurations = (a, b, c)
+    pcs = tuple(item["pc"] if item is not None else None for item in configurations)
+    inodes = tuple(item["inode"] if item is not None else None for item in configurations)
+    pc_status = "VERIFIED" if all(item is not None and item["measurement_status"] == "VERIFIED" for item in pcs) else "NOT VERIFIED"
+    inode_status = "VERIFIED" if all(item is not None and item["measurement_status"] == "VERIFIED" for item in inodes) else "NOT VERIFIED"
+    config_status = "VERIFIED" if pc_status == inode_status == "VERIFIED" else "NOT VERIFIED"
+
+    def pc_identity_relation(left: dict | None, right: dict | None) -> str | None:
+        if left is None or right is None or not left["object_id_available"] or not right["object_id_available"]:
+            return None
+        return "same_object" if left["object_id"] == right["object_id"] else "different_objects"
+
+    a_b_pc_relation = pc_identity_relation(pcs[0], pcs[1])
+    b_c_pc_relation = pc_identity_relation(pcs[1], pcs[2])
+
+    zero_comparison = {
+        "measurement_status": "NOT VERIFIED",
+        "reason": "B/C PC IDs, confirmed LU type, or successful finite pivot readings are unavailable",
+        "b_zero_pivot": pcs[1]["zero_pivot"] if pcs[1] is not None and pcs[1]["zero_pivot_available"] else None,
+        "c_zero_pivot": pcs[2]["zero_pivot"] if pcs[2] is not None and pcs[2]["zero_pivot_available"] else None,
+        "b_pc_object_id": pcs[1]["object_id"] if pcs[1] is not None and pcs[1]["object_id_available"] else None,
+        "c_pc_object_id": pcs[2]["object_id"] if pcs[2] is not None and pcs[2]["object_id_available"] else None,
+        "values_equal": None,
+        "scope": ZERO_PIVOT_COMPARISON_SCOPE,
+    }
+    if pcs[1] is not None and pcs[2] is not None \
+            and pcs[1]["object_id_available"] and pcs[2]["object_id_available"] \
+            and pcs[1]["is_lu_available"] and pcs[1]["is_lu"] is True \
+            and pcs[2]["is_lu_available"] and pcs[2]["is_lu"] is True \
+            and pcs[1]["zero_pivot_available"] and pcs[2]["zero_pivot_available"]:
+        zero_comparison.update({
+            "measurement_status": "VERIFIED",
+            "reason": None,
+            "values_equal": pcs[1]["zero_pivot"] == pcs[2]["zero_pivot"],
+        })
+
+    configuration = None if all(item is None for item in configurations) else {
+        "measurement_status": config_status,
+        "pc_configuration_measurement_status": pc_status,
+        "inode_metadata_measurement_status": inode_status,
+        "pc_configuration_scope": PC_CONFIGURATION_SCOPE,
+        "pc_configuration": {
+            "a": pcs[0], "b": pcs[1], "c": pcs[2],
+            "a_to_b_object_identity_relation": a_b_pc_relation,
+            "a_to_b_object_identity_status": "VERIFIED" if a_b_pc_relation is not None else "NOT VERIFIED",
+            "b_to_c_object_identity_relation": b_c_pc_relation,
+            "b_to_c_object_identity_status": "VERIFIED" if b_c_pc_relation is not None else "NOT VERIFIED",
+            "b_to_c_zero_pivot_comparison": zero_comparison,
+        },
+        "inode_metadata_scope": INODE_METADATA_SCOPE if any(item is not None for item in inodes) else None,
+        "inode_metadata": {"a": inodes[0], "b": inodes[1], "c": inodes[2]},
+        "inode_metadata_comparisons": {
+            "a_to_b": _inode_metadata_comparison(configurations[0], configurations[1]),
+            "b_to_c": _inode_metadata_comparison(configurations[1], configurations[2]),
+        },
+    }
+    return {"configuration_measurement_status": config_status, "configuration": configuration}
 
 
 def validate_snapshot(record: object) -> list[str]:
@@ -31,7 +293,7 @@ def validate_snapshot(record: object) -> list[str]:
     if not isinstance(record, dict):
         return ["snapshot root is not an object"]
     errors = []
-    if record.get("schema") != SCHEMA or record.get("phase") not in PHASES:
+    if record.get("schema") not in (SCHEMA, LEGACY_SCHEMA) or record.get("phase") not in PHASES:
         errors.append("unsupported snapshot schema or phase")
     if record.get("status") != "measured" or record.get("applicable_n4") is not True:
         errors.append("snapshot is not a measured applicable 4x4 matrix")
@@ -95,7 +357,79 @@ def validate_snapshot(record: object) -> list[str]:
                 errors.append(f"entry {part} raw bytes are invalid")
     if positions != {(row, column) for row in range(4) for column in range(4)}:
         errors.append("entry coverage is incomplete")
+    if record.get("schema") == SCHEMA:
+        for key in ("attempt_scope_id", "object_id"):
+            if type(record.get(key)) is not int or record[key] <= 0:
+                errors.append(f"{key} is unavailable or invalid")
+        if record.get("attempt_scope_semantics") != "process_local_eps_setup_sequence" or record.get("object_id_available") is not True or record.get("object_id_error_available") is not True or type(record.get("object_id_error")) is not int or record["object_id_error"] != 0:
+            errors.append("object getter or process-local attempt evidence is invalid")
+        setup = record.get("phase") == PHASES[0]
+        if setup:
+            if record.get("capture_scope") != "before_eps_setup" or record.get("callback_ordinal_available") is not False or record.get("callback_ordinal") is not None:
+                errors.append("setup snapshot must not impersonate a callback")
+        elif record.get("capture_scope") != "first_live_pc_capture" or record.get("callback_ordinal_available") is not True or type(record.get("callback_ordinal")) is not int or record["callback_ordinal"] <= 0:
+            errors.append("capture snapshot lacks a positive callback ordinal")
+        if record.get("phase") == PHASES[2]:
+            if record.get("copy_origin_id_available") is not True or record.get("copy_origin_error_available") is not True or type(record.get("copy_origin_error")) is not int or record["copy_origin_error"] != 0 or type(record.get("copy_origin_id")) is not int or record["copy_origin_id"] <= 0:
+                errors.append("owned copy has no successful source-object binding")
+        elif record.get("copy_origin_id_available") is not False or record.get("copy_origin_id") is not None:
+            errors.append("non-copy phase must not declare copy origin")
+    _, configuration_errors = _configuration_measurements(record)
+    errors.extend(configuration_errors)
     return errors
+
+
+def pair_snapshots(selected: list[dict]) -> tuple[list[dict], list[str]]:
+    """Bind IDs within one CTest process/attempt; never numerical acceptance."""
+    attempts = {}
+    issues = []
+    for item in selected:
+        record = item["snapshot"]
+        if validate_snapshot(record):
+            continue
+        if record.get("schema") != SCHEMA:
+            issues.append("legacy snapshot lacks object/copy-origin and attempt binding")
+            continue
+        invocation = item.get("ctest_invocation")
+        if type(invocation) is not int or invocation <= 0:
+            issues.append("snapshot has no explicit CTest process invocation context")
+            continue
+        phases = attempts.setdefault((invocation, record["attempt_scope_id"]), {})
+        unique = phases.setdefault(record["phase"], {})
+        unique[json.dumps(record, sort_keys=True, allow_nan=False)] = item
+    paired = []
+    for attempt, phases in sorted(attempts.items()):
+        if any(len(phases.get(phase, {})) != 1 for phase in PHASES):
+            issues.append(f"attempt {attempt}: missing or ambiguous phase snapshots")
+            continue
+        items = [next(iter(phases[phase].values())) for phase in PHASES]
+        a, b, c = (item["snapshot"] for item in items)
+        if not items[0]["line"] < items[1]["line"] < items[2]["line"]:
+            issues.append(f"attempt {attempt}: phase observation order is not A-before-B-before-C")
+            continue
+        if b["callback_ordinal"] != c["callback_ordinal"] or c["copy_origin_id"] != b["object_id"] or c["object_id"] == b["object_id"]:
+            issues.append(f"attempt {attempt}: B-to-C callback/origin/distinct-copy binding failed")
+            continue
+        def raw_values(snapshot):
+            return (snapshot["real_byte_count"], snapshot["raw_encoding"], tuple((entry["real_raw_hex"], entry["imaginary_raw_hex"]) for entry in sorted(snapshot["entries"], key=lambda entry: (entry["row"], entry["column"]))))
+        same_ab = a["object_id"] == b["object_id"]
+        configuration_a, _ = _configuration_measurements(a)
+        configuration_b, _ = _configuration_measurements(b)
+        configuration_c, _ = _configuration_measurements(c)
+        paired.append({
+            "ctest_invocation": attempt[0], "attempt_scope_id": attempt[1], "lines": [item["line"] for item in items],
+            "a_object_id": a["object_id"], "b_object_id": b["object_id"], "c_object_id": c["object_id"],
+            "b_c_callback_ordinal": b["callback_ordinal"],
+            "a_to_b_identity_relation": "same_object" if same_ab else "different_objects",
+            "a_to_b_raw_values_equal": raw_values(a) == raw_values(b),
+            "a_to_b_nonzero_state_changed": a["nonzero_state"] != b["nonzero_state"] if same_ab else None,
+            "b_to_c_copy_origin_verified": True, "b_to_c_raw_values_equal": raw_values(b) == raw_values(c),
+            "last_true_probe_binding": "NOT VERIFIED: first-capture ordinal is explicit; last probe is not bound by this schema",
+            **_configuration_pair_report(configuration_a, configuration_b, configuration_c),
+        })
+    if not paired:
+        issues.append("no complete ID-bound attempts")
+    return paired, issues
 
 
 def _finite_json_float(value: str) -> float:
@@ -110,6 +444,7 @@ def _reject_json_constant(value: str) -> None:
 
 def parse_log(path: Path, required_tests: tuple[str, ...] = REQUIRED_TESTS) -> dict:
     names = {}
+    invocations = {}
     records = []
     unscoped_markers = 0
     other_test_markers = 0
@@ -123,6 +458,7 @@ def parse_log(path: Path, required_tests: tuple[str, ...] = REQUIRED_TESTS) -> d
                 start = re.search(r"Start\s+(\d+):\s+(\S+)", line)
                 if start:
                     names[int(start[1])] = start[2]
+                    invocations[int(start[1])] = invocations.get(int(start[1]), 0) + 1
                 offset = line.find(PREFIX)
                 if offset < 0:
                     continue
@@ -144,12 +480,15 @@ def parse_log(path: Path, required_tests: tuple[str, ...] = REQUIRED_TESTS) -> d
                 except (ValueError, TypeError) as error:
                     errors.append(f"line {line_number}: invalid snapshot JSON: {error}")
                     continue
-                records.append({"line": line_number, "ctest_id": int(context[1]), "snapshot": record})
+                records.append({"line": line_number, "ctest_id": int(context[1]),
+                                "ctest_invocation": invocations.get(int(context[1])), "snapshot": record})
         log_hash = digest.hexdigest()
     except OSError as error:
         errors.append(f"cannot read native log: {error}")
         log_hash = None
     coverage = {}
+    pairing = {}
+    pairing_reasons = []
     for name in required_tests:
         selected = [item for item in records if names.get(item["ctest_id"]) == name]
         measured = {phase: [] for phase in PHASES}
@@ -165,15 +504,24 @@ def parse_log(path: Path, required_tests: tuple[str, ...] = REQUIRED_TESTS) -> d
             errors.append(f"{name}: no valid measurement for {','.join(missing)}")
         if rejected:
             errors.append(f"{name}: {len(rejected)} invalid/unavailable snapshots")
+        bound, binding_issues = pair_snapshots(selected)
+        pairing[name] = bound
+        pairing_reasons.extend(f"{name}: {issue}" for issue in binding_issues)
         coverage[name] = {"measurement_status": "complete" if not missing and not rejected else "incomplete",
                           "valid_counts_by_phase": {phase: len(items) for phase, items in measured.items()},
                           "rejected": rejected}
+    all_pairs = [item for test_pairs in pairing.values() for item in test_pairs]
+    configuration_status = "VERIFIED" if all_pairs and not errors and not pairing_reasons \
+        and all(item["configuration_measurement_status"] == "VERIFIED" for item in all_pairs) else "NOT VERIFIED"
     return {
         "schema": "fullmag.ci.floquet-factor-matrix-snapshot-report.v1",
-        "status": "failed" if errors else "measured_unpaired",
+        "status": "failed" if errors else ("measured_bound" if not pairing_reasons else "measured_unpaired"),
         "measurement_status": "incomplete" if errors else "complete",
-        "pairing_status": "NOT VERIFIED",
-        "pairing_reason": "native snapshots lack object IDs and explicit copy-origin/attempt binding; phase coverage cannot pair matrices",
+        "pairing_status": "VERIFIED" if not errors and not pairing_reasons else "NOT VERIFIED",
+        "configuration_measurement_status": configuration_status,
+        "pairing": pairing, "pairing_reasons": pairing_reasons,
+        "pairing_scope": "phase/attempt/object/copy binding only; no solver correctness or last-probe binding",
+        "solver_failure_cause": "NOT VERIFIED",
         "scientific_qualification": "NOT VERIFIED",
         "ctest_result_modified": False,
         "log_path": str(path), "log_sha256": log_hash,
@@ -192,8 +540,8 @@ def main(argv: list[str] | None = None) -> int:
     report = parse_log(args.log)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n", encoding="utf-8")
-    print(f"C04 measurements: {report['measurement_status']}; pairing: NOT VERIFIED; {args.output}")
-    return 0 if report["measurement_status"] == "complete" else 1
+    print(f"C04 measurements: {report['measurement_status']}; pairing: {report['pairing_status']}; {args.output}")
+    return 0 if report["measurement_status"] == "complete" and report["pairing_status"] == "VERIFIED" else 1
 
 
 if __name__ == "__main__":
