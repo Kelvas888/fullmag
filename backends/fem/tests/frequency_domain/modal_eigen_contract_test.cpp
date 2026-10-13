@@ -307,6 +307,61 @@ bool contains(const char *haystack, const char *needle)
     return haystack != nullptr && std::strstr(haystack, needle) != nullptr;
 }
 
+void print_bounded_hard_ksp_opt_out_failure(
+    const FullmagFemFrequencyDomainResult &result,
+    bool failure_probe_present,
+    bool borrowed_pmat_present)
+{
+    // Keep the combined JSON excerpt at or below 16 KiB while retaining the
+    // scalar C ABI status and mode counts without truncation.
+    constexpr std::size_t diagnostics_limit = 12u * 1024u;
+    constexpr std::size_t result_limit = 4u * 1024u;
+    constexpr std::size_t error_limit = 512u;
+    std::fprintf(
+        stderr,
+        "INFO: hard-KSP opt-out failure status=%u mode_count=%llu "
+        "q_dof_count=%llu phi_dof_count=%llu shifted_ksp_failure_probe=%s "
+        "borrowed_pmat_copy=%s\n",
+        static_cast<unsigned int>(result.status),
+        static_cast<unsigned long long>(result.mode_count),
+        static_cast<unsigned long long>(result.q_dof_count),
+        static_cast<unsigned long long>(result.phi_dof_count),
+        failure_probe_present ? "present" : "absent",
+        borrowed_pmat_present ? "present" : "absent");
+
+    const auto print_field = [](const char *name, const char *value, std::size_t limit) {
+        const bool present = value != nullptr;
+        const char *text = present ? value : "";
+        std::size_t observed = 0u;
+        while (observed <= limit && text[observed] != '\0') {
+            ++observed;
+        }
+        const bool truncated = observed > limit;
+        const std::size_t printed = truncated ? limit : observed;
+        std::fprintf(
+            stderr,
+            "INFO: hard-KSP opt-out %s_present=%s %s_bytes_observed=%s%zu "
+            "%s_bytes_printed=%zu %s_truncated=%s\n",
+            name,
+            present ? "true" : "false",
+            name,
+            truncated ? "at_least_" : "",
+            truncated ? limit + 1u : observed,
+            name,
+            printed,
+            name,
+            truncated ? "true" : "false");
+        std::fprintf(stderr, "INFO: hard-KSP opt-out %s_begin\n", name);
+        if (printed > 0u) {
+            std::fprintf(stderr, "%.*s\n", static_cast<int>(printed), text);
+        }
+        std::fprintf(stderr, "INFO: hard-KSP opt-out %s_end\n", name);
+    };
+    print_field("error", result.error_message, error_limit);
+    print_field("diagnostics_json", result.diagnostics_json, diagnostics_limit);
+    print_field("result_json", result.result_json, result_limit);
+}
+
 void borrowed_pmat_copy_serializer_optional_shift_fields()
 {
     using Observation = fd::FloquetShiftedKspFailureProbe::
@@ -9490,11 +9545,22 @@ void modal_nonzero_k_floquet_shared_domain_nearest_reports_shifted_ksp_diagnosti
                 fullmag_fem_modal_eigen_solve(&hard_ksp_nearest_request);
         }
     }
-    check(hard_ksp_opt_out_result.status == FULLMAG_FEM_FD_SOLVE_ERROR &&
-              contains(hard_ksp_opt_out_result.diagnostics_json,
-                       "\"shifted_ksp_failure_probe\":{\"schema_version\":\"shifted_ksp_failure_probe.v1\"") &&
-              !contains(hard_ksp_opt_out_result.diagnostics_json,
-                        "\"borrowed_pmat_copy\""),
+    const bool opt_out_failure_probe_present = contains(
+        hard_ksp_opt_out_result.diagnostics_json,
+        "\"shifted_ksp_failure_probe\":{\"schema_version\":\"shifted_ksp_failure_probe.v1\"");
+    const bool opt_out_borrowed_pmat_present = contains(
+        hard_ksp_opt_out_result.diagnostics_json,
+        "\"borrowed_pmat_copy\"");
+    const bool opt_out_serializer_contract =
+        hard_ksp_opt_out_result.status == FULLMAG_FEM_FD_SOLVE_ERROR &&
+        opt_out_failure_probe_present && !opt_out_borrowed_pmat_present;
+    if (!opt_out_serializer_contract) {
+        print_bounded_hard_ksp_opt_out_failure(
+            hard_ksp_opt_out_result,
+            opt_out_failure_probe_present,
+            opt_out_borrowed_pmat_present);
+    }
+    check(opt_out_serializer_contract,
           "private borrowed-Pmat evidence adds no JSON object when diagnostics are opted out");
     fullmag_fem_frequency_domain_result_destroy(&hard_ksp_opt_out_result);
     FullmagFemFrequencyDomainResult hard_ksp_nearest_result{};
