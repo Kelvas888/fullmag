@@ -268,13 +268,6 @@ export default function InspectorActionsPage() {
           />
         </InspectorEditSessionProvider>
       </Profiler>
-      <output
-        aria-label="Fixture action state"
-        data-testid="inspector-actions-state"
-        style={{ display: "none" }}
-      >
-        {JSON.stringify(read())}
-      </output>
     </main>
   );
 }

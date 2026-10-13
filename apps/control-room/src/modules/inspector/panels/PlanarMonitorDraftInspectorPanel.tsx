@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 
 import { MODEL_PLANAR_MONITORS_PATH } from "@/kernel/api/apiPaths";
 import { runAuthoringMutationWithHistory } from "@/kernel/authoring/authoringHistoryMutation";
@@ -46,6 +46,7 @@ export function PlanarMonitorDraftInspectorPanel() {
   } | null>(null);
   const nextPendingOperationId = useRef(0);
   const applyInFlight = useRef(false);
+  const acknowledgeCommittedDraftRef = useRef<(() => boolean) | null>(null);
   const pending = pendingOperation?.sessionScopeKey === sessionScopeKey;
 
   function createHistoryMutationContext() {
@@ -70,6 +71,7 @@ export function PlanarMonitorDraftInspectorPanel() {
     : [];
 
   const commitDraft = async (): Promise<boolean> => {
+    const acknowledgeDraft = acknowledgeCommittedDraftRef.current;
     if (applyInFlight.current) return false;
     if (!draft) return false;
     if (!visualizationState.data?.planar) {
@@ -129,7 +131,7 @@ export function PlanarMonitorDraftInspectorPanel() {
         setFeedback("The monitor was created; newer monitor edits remain in the draft.");
         return true;
       }
-      if (!acknowledgeCommittedDraft()) return false;
+      if (!acknowledgeDraft?.()) return false;
       discardPlanarMonitorDraft();
       kernel.visualizationSync.queuePatch({
         planar: { source: { kind: "monitor", monitor_id: monitor.id } },
@@ -203,6 +205,9 @@ export function PlanarMonitorDraftInspectorPanel() {
       historyMode: "mutation-owned",
     },
   );
+  useLayoutEffect(() => {
+    acknowledgeCommittedDraftRef.current = acknowledgeCommittedDraft;
+  }, [acknowledgeCommittedDraft]);
 
   if (!draft) {
     return <MeshResourceEmpty label="No editable planar monitor draft." />;

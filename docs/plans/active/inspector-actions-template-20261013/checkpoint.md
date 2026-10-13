@@ -129,3 +129,24 @@ syntetycznych callbacków: nie stanowi dowodu rzeczywistego API end-to-end.
 
 Kontrole parserów i git diff --check: PASS. Ponowne CI, browser i pełny
 przebieg mutacji z backendem: NOT VERIFIED do uzyskania aktualnych wyników.
+
+## Drugi przebieg CI i aktualny audyt zakresu
+
+Commit a6fe6a1955a617af1be9b6d7f1dbeff6a78e8541 przeszedł typecheck; lint
+ujawnił cykliczne odwołania handlerów do callbacków ACK hooka oraz odczyty ref
+w renderowaniu. Poprawki zachowują callback ACK uchwycony przy kliknięciu,
+synchronizują bridge w layout effect i używają React state w renderowaniu.
+Browser fixture brakował Chromium w resolverowym cache; CI ustala teraz
+ścieżkę przez fullmag_storage.py. Smoke routingu oczekiwał starego
+mesh-part-visualization zamiast naprawionego mesh-unassigned-part.
+
+Commit 9c99346a7dd205e8fd87c721fda98c78b159b9f0 zachowuje bajty pakietu
+dokumentacji przez scoped -text oraz aktualizuje SHA/bytes D07. Walidator
+manifestu na Windows: PASS (76 wpisów); orakle: PASS (10/10).
+
+Audyt wymagań D07 pozostawia R1 nieukończone: brakuje udowodnionego trwałego
+recovery ordinary transactions, pełnej aktywnej generacji/digestu i runtime
+receiptów. Root potwierdził limit 8 w reconcileMeshSubmission i dopuszczenie
+current/runAllowed na samym source_scene_revision. Te elementy należy
+naprawić w kolejnych oddzielnych etapach, bez traktowania PR150 jako pełnego
+zakończenia oryginalnego celu R0/R1.

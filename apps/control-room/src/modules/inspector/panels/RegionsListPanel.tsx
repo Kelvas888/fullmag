@@ -157,6 +157,22 @@ export function RegionsListPanel({ selection }: InspectorPanelProps) {
     );
   }
 
+  const acknowledgeNewRegionDraft = useRegisterInspectorEditSession(
+    adding ? "staged" : null,
+    pending,
+    adding,
+    model.mode === "committed" && validateNewRegionDraft(draft).length === 0,
+    undefined,
+    createRegion,
+    resetDraft,
+    {
+      applyBlockReason: sessionScopeKey
+        ? undefined
+        : "Session identity is not ready.",
+      historyMode: "mutation-owned",
+    },
+  );
+
   async function createRegion(): Promise<boolean> {
     if (createInFlight.current) return false;
     if (model.mode !== "committed") {
@@ -264,22 +280,6 @@ export function RegionsListPanel({ selection }: InspectorPanelProps) {
       setPending(false);
     }
   }
-
-  const acknowledgeNewRegionDraft = useRegisterInspectorEditSession(
-    adding ? "staged" : null,
-    pending,
-    adding,
-    model.mode === "committed" && validateNewRegionDraft(draft).length === 0,
-    undefined,
-    createRegion,
-    resetDraft,
-    {
-      applyBlockReason: sessionScopeKey
-        ? undefined
-        : "Session identity is not ready.",
-      historyMode: "mutation-owned",
-    },
-  );
 
   return (
     <div className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group">

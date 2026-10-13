@@ -81,6 +81,23 @@ export function ObjectAbsorbingBoundaryPanel({
   const validation = buildAbsorbingBoundaryPatch(draft, baseRevision);
   const valid = object !== null && baseRevision !== null && !("error" in validation);
 
+  const acknowledgeAppliedDraft = useRegisterInspectorEditSession(
+    object ? "staged" : null,
+    pending,
+    dirty,
+    valid,
+    undefined,
+    apply,
+    resetDraft,
+    {
+      applyBlockReason:
+        object && baseRevision === null
+          ? "The canonical scene revision is unavailable. Refetch the scene before applying."
+          : undefined,
+      historyMode: "mutation-owned",
+    },
+  );
+
   function createHistoryMutationContext() {
     const sessionScopeKey = commands.getSessionScopeKey();
     const historyGeneration = authoringHistory?.getGeneration?.();
@@ -178,23 +195,6 @@ export function ObjectAbsorbingBoundaryPanel({
       setPending(false);
     }
   }
-
-  const acknowledgeAppliedDraft = useRegisterInspectorEditSession(
-    object ? "staged" : null,
-    pending,
-    dirty,
-    valid,
-    undefined,
-    apply,
-    resetDraft,
-    {
-      applyBlockReason:
-        object && baseRevision === null
-          ? "The canonical scene revision is unavailable. Refetch the scene before applying."
-          : undefined,
-      historyMode: "mutation-owned",
-    },
-  );
 
   return (
     <InspectorGroup

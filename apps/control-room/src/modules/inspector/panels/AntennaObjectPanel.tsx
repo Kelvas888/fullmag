@@ -97,6 +97,17 @@ export function AntennaObjectPanel({ selection }: InspectorPanelProps) {
   const feedback =
     feedbackState.key === draftKey ? feedbackState.feedback : null;
 
+  const acknowledgeAntennaDraft = useRegisterInspectorEditSession(
+    model.mode === "missing" ? null : "staged",
+    pending,
+    dirty,
+    valid,
+    undefined,
+    commitDraft,
+    resetDraft,
+    { historyMode: "mutation-owned" },
+  );
+
   function updateDraft(patch: Partial<AntennaObjectDraft>): void {
     const next = { ...draftRef.current, ...patch };
     draftRef.current = next;
@@ -209,17 +220,6 @@ export function AntennaObjectPanel({ selection }: InspectorPanelProps) {
       },
     }, sessionScopeKey ? { sessionScopeKey } : undefined);
   }
-
-  const acknowledgeAntennaDraft = useRegisterInspectorEditSession(
-    model.mode === "missing" ? null : "staged",
-    pending,
-    dirty,
-    valid,
-    undefined,
-    commitDraft,
-    resetDraft,
-    { historyMode: "mutation-owned" },
-  );
 
   return (
     <div className="fm-inspector-panel">

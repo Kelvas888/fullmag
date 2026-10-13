@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import type {
   FieldMetaResource,
@@ -127,6 +127,7 @@ export function FrozenSpinsEditor({
   const acknowledgedRevisionRef = useRef(initialRevision);
   const draftRef = useRef(draft);
   const applyInFlight = useRef(false);
+  const acknowledgeAppliedDraftRef = useRef<(() => boolean) | null>(null);
   const mountedRef = useRef(true);
   const [revision, setRevision] = useState(initialRevision);
   const [pendingField, setPendingField] = useState<PendingField>(null);
@@ -178,6 +179,7 @@ export function FrozenSpinsEditor({
 
   async function applyDraft(): Promise<boolean> {
     if (applyInFlight.current || !dirty) return false;
+    const acknowledgeDraft = acknowledgeAppliedDraftRef.current;
     const submittedDraft = draft;
     const operationSessionScopeKey = sessionScopeKey ?? null;
     if (!operationSessionScopeKey) {
@@ -224,7 +226,7 @@ export function FrozenSpinsEditor({
       acknowledgedRevisionRef.current = response.revision;
       setBaseline(acknowledged);
       if (draftRef.current === submittedDraft) {
-        if (!acknowledgeAppliedDraft()) return false;
+        if (!acknowledgeDraft?.()) return false;
         draftRef.current = acknowledged;
         setDraft(acknowledged);
       }
@@ -321,6 +323,7 @@ export function FrozenSpinsEditor({
   }
 
   async function activatePreview(): Promise<void> {
+    const acknowledgeDraft = acknowledgeAppliedDraftRef.current;
     if (applyInFlight.current) return;
     if (!preview?.current) {
       setFeedback({
@@ -380,7 +383,7 @@ export function FrozenSpinsEditor({
       acknowledgedRevisionRef.current = response.revision;
       setBaseline(acknowledged);
       if (draftRef.current === submittedDraft) {
-        if (!acknowledgeAppliedDraft()) return;
+        if (!acknowledgeDraft?.()) return;
         draftRef.current = acknowledged;
         setDraft(acknowledged);
       }
@@ -514,6 +517,9 @@ export function FrozenSpinsEditor({
       historyMode: "mutation-owned",
     },
   );
+  useLayoutEffect(() => {
+    acknowledgeAppliedDraftRef.current = acknowledgeAppliedDraft;
+  }, [acknowledgeAppliedDraft]);
 
   return (
     <div

@@ -98,6 +98,7 @@ function CommittedPlanarMonitorEditor({
       : { monitor, revision: sceneRevision };
   const [draft, setDraft] = useState<PlanarMonitorDraft>(() => planarMonitorDraftFromMonitor(monitor));
   const draftRef = useRef(draft);
+  const acknowledgeCommittedDraftRef = useRef<(() => boolean) | null>(null);
   useLayoutEffect(() => {
     draftRef.current = draft;
   }, [draft]);
@@ -121,8 +122,8 @@ function CommittedPlanarMonitorEditor({
   const dirty = JSON.stringify(draft.monitor) !== JSON.stringify(baseline.monitor);
   const incomingDefinitionConflict =
     sceneRevision > acknowledgedBaseline.revision &&
-    JSON.stringify(monitor) !== JSON.stringify(baselineRef.current.monitor) &&
-    JSON.stringify(draft.monitor) !== JSON.stringify(baselineRef.current.monitor);
+    JSON.stringify(monitor) !== JSON.stringify(baselineState.monitor) &&
+    JSON.stringify(draft.monitor) !== JSON.stringify(baselineState.monitor);
   const hasConflict = conflict || incomingDefinitionConflict;
   const updateDraft = (next: PlanarMonitorDraft) => {
     draftRef.current = next;
@@ -186,6 +187,7 @@ function CommittedPlanarMonitorEditor({
 
   const apply = async (): Promise<boolean> => {
     if (applyInFlight.current || hasConflict || !dirty || errors.length > 0) return false;
+    const acknowledgeDraft = acknowledgeCommittedDraftRef.current;
     const submittedDraft = draft;
     const submittedMonitor = structuredClone(draft.monitor);
     const operationSessionScopeKey = sessionScopeKey;
@@ -249,7 +251,7 @@ function CommittedPlanarMonitorEditor({
       setBaselineState(nextBaseline);
       setAcknowledgedBaseline(nextBaseline);
       if (draftRef.current === submittedDraft) {
-        if (!acknowledgeCommittedDraft()) return false;
+        if (!acknowledgeDraft?.()) return false;
         const acknowledgedDraft = planarMonitorDraftFromMonitor(
           response.monitor,
           submittedDraft.ui.displayLengthUnit,
@@ -312,6 +314,9 @@ function CommittedPlanarMonitorEditor({
       historyMode: "mutation-owned",
     },
   );
+  useLayoutEffect(() => {
+    acknowledgeCommittedDraftRef.current = acknowledgeCommittedDraft;
+  }, [acknowledgeCommittedDraft]);
 
   return (
     <div className="fm-inspector-panel">

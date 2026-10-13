@@ -1154,7 +1154,7 @@ async function qualifyInspectorRoutingMatrix(page, inspector, screenshotFiles, f
     label: "Film",
   });
   await selectInspectorNode(page, inspector, "model:mesh:unassigned:orphan-part", {
-    owner: "mesh-part-visualization",
+    owner: "mesh-unassigned-part",
     label: "Orphan Mesh Part",
   });
 

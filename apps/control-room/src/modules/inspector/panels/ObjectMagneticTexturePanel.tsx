@@ -832,6 +832,7 @@ export function ObjectMagneticTexturePanel({
   });
   const dirty = objectMagneticTextureDraftDirty(draft, baselineDraft);
   const mutationInFlight = useRef(false);
+  const acknowledgeTextureDraftRef = useRef<(() => boolean) | null>(null);
   const textureCapabilityOperation =
     draft.presetKind === "uniform"
       ? "initial_magnetization.uniform"
@@ -866,6 +867,7 @@ export function ObjectMagneticTexturePanel({
   }
 
   async function saveTexture(): Promise<boolean> {
+    const acknowledgeDraft = acknowledgeTextureDraftRef.current;
     if (mutationInFlight.current) return false;
     if (model.mode !== "committed") {
       setFeedback({ kind: "error", message: "No committed scene object." });
@@ -931,7 +933,7 @@ export function ObjectMagneticTexturePanel({
       if (
         draftStateRef.current.identityKey === draftIdentityKey &&
         draftStateRef.current.draft === submittedDraft &&
-        acknowledgeTextureDraft()
+        acknowledgeDraft?.()
       ) {
         replaceDraftState({
           baseKey: draftKey,
@@ -958,6 +960,7 @@ export function ObjectMagneticTexturePanel({
   }
 
   async function clearTexture(): Promise<void> {
+    const acknowledgeDraft = acknowledgeTextureDraftRef.current;
     if (mutationInFlight.current) return;
     if (model.mode !== "committed") {
       setFeedback({ kind: "error", message: "No committed scene object." });
@@ -1019,7 +1022,7 @@ export function ObjectMagneticTexturePanel({
         draftStateRef.current.identityKey === draftIdentityKey &&
         draftStateRef.current.draft === submittedDraft
       ) {
-        acknowledgeTextureDraft();
+        acknowledgeDraft?.();
         replaceDraftState({
           baseKey: draftKey,
           dirty: false,
@@ -1119,7 +1122,7 @@ export function ObjectMagneticTexturePanel({
       : validationError ?? undefined;
   const acknowledgeTextureDraft = useRegisterInspectorEditSession(
     editableTextureView ? "staged" : "immediate",
-    mutationInFlight.current,
+    pending,
     editableTextureView && dirty,
     editableTextureView ? valid : true,
     undefined,
@@ -1130,6 +1133,9 @@ export function ObjectMagneticTexturePanel({
       historyMode: "mutation-owned",
     },
   );
+  useLayoutEffect(() => {
+    acknowledgeTextureDraftRef.current = acknowledgeTextureDraft;
+  }, [acknowledgeTextureDraft]);
 
   return (
     <div className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group">

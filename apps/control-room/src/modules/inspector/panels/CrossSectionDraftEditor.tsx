@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 
 import { useKernel } from "@/kernel/KernelContext";
 import { runAuthoringMutationWithHistory } from "@/kernel/authoring/authoringHistoryMutation";
@@ -45,9 +45,11 @@ export function CrossSectionDraftEditor({
   } | null>(null);
   const nextPendingOperationId = useRef(0);
   const applyInFlight = useRef(false);
+  const acknowledgeCommittedDraftRef = useRef<(() => boolean) | null>(null);
   const pending = pendingOperation?.sessionScopeKey === sessionScopeKey;
 
   const commitDraft = async (): Promise<boolean> => {
+    const acknowledgeDraft = acknowledgeCommittedDraftRef.current;
     if (applyInFlight.current) return false;
     if (!draft) return false;
     if (!visualizationState.data?.planar) {
@@ -112,7 +114,7 @@ export function CrossSectionDraftEditor({
         setFeedback("The monitor was created; newer cross-section edits remain in the draft.");
         return true;
       }
-      if (!acknowledgeCommittedDraft()) return false;
+      if (!acknowledgeDraft?.()) return false;
       const monitor = created.monitor;
       discardCrossSectionDraft();
       kernel.visualizationSync.queuePatch({
@@ -186,6 +188,9 @@ export function CrossSectionDraftEditor({
       historyMode: "mutation-owned",
     },
   );
+  useLayoutEffect(() => {
+    acknowledgeCommittedDraftRef.current = acknowledgeCommittedDraft;
+  }, [acknowledgeCommittedDraft]);
 
   if (!draft) {
     return <MeshResourceEmpty label="No editable cross-section draft." />;
