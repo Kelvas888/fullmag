@@ -72,7 +72,7 @@ export function AnalysisResultProjectionSurface({
       : null;
   const projectionStatus = resource?.unsupported_reason ? "unsupported" : status;
   const subtitle = resource
-    ? `${resource.dataset_id} · revision ${resource.projection_revision}`
+    ? `${resource.dataset_id} Â· revision ${resource.projection_revision}`
     : "Run-scoped result projection";
   const selectedLabel = useMemo(() => {
     if (!resource || selectedOrdinal == null) return null;
@@ -106,21 +106,21 @@ export function AnalysisResultProjectionSurface({
   const modelExportSeries = model.exportSeries ?? model.series;
   const dataExportModel = useMemo(() => {
     if (!resource) return undefined;
-    const model = tableSeriesRenderModel(
+    const exportRenderModel = tableSeriesRenderModel(
       modelExportSeries,
       modelExportSeries,
       xAxisLabel,
       projectionStatus,
     );
     return {
-      ...model,
+      ...exportRenderModel,
       provenance: {
-        ...(model.provenance ?? {}),
+        ...(exportRenderModel.provenance ?? {}),
         ...(exportProvenance ?? {}),
         dataRevision: resource.projection_revision,
         decimation: "none",
         descriptorId: `analysis:result-projection:${resource.dataset_id}:${resource.projection_id}`,
-        displayUnits: model.provenance?.displayUnits ?? {},
+        displayUnits: exportRenderModel.provenance?.displayUnits ?? {},
         query: JSON.stringify({
           projectionId: resource.projection_id,
           series: modelExportSeries.map((series) => series.id),
@@ -219,7 +219,7 @@ export function AnalysisResultProjectionSurface({
         </div>
       ) : model.series.length === 0 || !hasProjectionPoints ? (
         <div className="fm-analysis-plots__empty" role="status">
-          {resource ? projectionEmptyMessage(model) : "Loading result projection…"}
+          {resource ? projectionEmptyMessage(model) : "Loading result projectionâ€¦"}
         </div>
       ) : resource ? (
         <div
@@ -259,7 +259,7 @@ export function AnalysisResultProjectionSurface({
         >
           Fixed coordinates: {resource.fixed_coordinates
             .map((coordinate) => `${coordinate.axis_id}=${coordinate.label ?? coordinate.token}`)
-            .join(" · ")}
+            .join(" Â· ")}
         </div>
       ) : null}
     </ChartSection>

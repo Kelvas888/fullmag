@@ -93,7 +93,7 @@ export function buildAnalysisResultProjectionChartModel(
       const selection = selectionByOrdinal.get(point.ordinal);
       return selection ? [selection] : [];
     });
-    const createSeries = (points: typeof completePoints): ChartSeries => ({
+    const createSeries = (points: readonly AnalysisResultProjectionResource["series"][number]["points"][number][]): ChartSeries => ({
       dataRevision: resource.projection_revision,
       id: seriesId,
       label: sourceSeries.label,
@@ -102,7 +102,9 @@ export function buildAnalysisResultProjectionChartModel(
         const itemId = selection?.item_id ?? point.item_id ?? null;
         const sampleId = selection?.sample_id ?? point.sample_id ?? null;
         return {
-          branchId: selection?.branch_id ?? point.branch_id ?? null,
+          branchId: projectionPointIsGap(point)
+            ? selection?.branch_id ?? null
+            : selection?.branch_id ?? point.branch_id ?? null,
           itemId,
           label: itemId ?? sampleId ?? `point ${point.ordinal}`,
           rowIndex: point.ordinal,
