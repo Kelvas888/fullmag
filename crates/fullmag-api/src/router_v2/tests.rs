@@ -53,6 +53,8 @@ use super::build_v2_router;
 
 fn sample_scene_document() -> fullmag_authoring::SceneDocument {
     let builder = fullmag_authoring::ScriptBuilderState {
+        execution_profile: None,
+        execution_layers: vec![],
         revision: 3,
         backend: None,
         requested_mode: Some("strict".to_string()),
@@ -63,6 +65,7 @@ fn sample_scene_document() -> fullmag_authoring::SceneDocument {
         demag_realization: None,
         fdm: None,
         external_field: None,
+        rotated_interfacial_dmi: None,
         solver: fullmag_authoring::ScriptBuilderSolverState {
             integrator: "rk45".to_string(),
             fixed_timestep: String::new(),
@@ -116,6 +119,8 @@ fn sample_scene_document() -> fullmag_authoring::SceneDocument {
         domain_frame: None,
         stages: Vec::new(),
         study_pipeline: None,
+        table_autosave: None,
+        output_storage: None,
         initial_state: None,
         geometries: vec![fullmag_authoring::ScriptBuilderGeometryEntry {
             name: "body".to_string(),
@@ -639,10 +644,23 @@ pub(crate) fn test_app_state() -> Arc<AppState> {
     let (control_events_tx, _rx) = watch::channel(0u64);
 
     Arc::new(AppState {
+        development_admission: Default::default(),
+        development_restored_authoring: Default::default(),
+        development_backend: crate::router_v2::handlers::platform::development_backend::DevelopmentBackendConfig::Disabled,
+        development_restart_transport: Default::default(),
+        development_consumer_readiness: Default::default(),
         repo_root: PathBuf::from("."),
+        submit_store_root: None,
+        submit_backlog_limit: std::num::NonZeroUsize::new(
+            crate::run_intent_persistence::DEFAULT_ACCEPTED_RUN_BACKLOG_LIMIT,
+        )
+        .unwrap(),
         current_workspace_root: PathBuf::from("."),
+        current_command_journal_store_root: None,
+        current_command_journal_revision: Arc::new(AtomicU64::new(0)),
         current_live_state: Arc::new(RwLock::new(None)),
         current_live_session_transition: Arc::new(Mutex::new(())),
+        request_scope_instance_id: "test-api-instance".to_string(),
         current_live_session_epoch: Arc::new(AtomicU64::new(0)),
         current_live_realtime_before_send_hook: Arc::new(Mutex::new(None)),
         current_live_connectivity: Arc::new(RwLock::new(
@@ -657,6 +675,7 @@ pub(crate) fn test_app_state() -> Arc<AppState> {
             )
             .unwrap_or(u64::MAX),
         )),
+        current_live_preparation_receipt: Arc::new(RwLock::new(None)),
         current_live_realtime_events: tokio::sync::broadcast::channel(16).0,
         current_live_realtime_replay: Arc::new(Mutex::new(VecDeque::new())),
         current_live_realtime_next_seq: Arc::new(AtomicU64::new(0)),
@@ -688,7 +707,7 @@ pub(crate) fn test_app_state() -> Arc<AppState> {
 
 /// `AppState` with a minimal live session populated, so endpoints that read
 /// from `current_live_state` can return 200.
-async fn test_app_state_with_live_session() -> Arc<AppState> {
+pub(crate) async fn test_app_state_with_live_session() -> Arc<AppState> {
     let state = test_app_state();
 
     let session = SessionManifest {
@@ -850,7 +869,7 @@ fn simulation_preparation_fixture(status: &str) -> SimulationPreparationSnapshot
     }
 }
 
-async fn test_app_state_with_simulation_preparation(status: &str) -> Arc<AppState> {
+pub(crate) async fn test_app_state_with_simulation_preparation(status: &str) -> Arc<AppState> {
     test_app_state_with_simulation_preparation_snapshot(simulation_preparation_fixture(status))
         .await
 }
@@ -1040,6 +1059,10 @@ async fn set_running_stage_execution(state: &Arc<AppState>, state_version: u64) 
                     mesh_topology_fingerprint: None,
                     mesh_revision: None,
                     started_at_unix_ms: Some(1_700_000_000_000),
+                    applied_step: None,
+                    completed_step: None,
+                    applied_time_seconds: None,
+                    segment_id: None,
                     completed_at_unix_ms: Some(1_700_000_001_000),
                     reason: None,
                     converged: false,
@@ -1075,6 +1098,10 @@ async fn set_running_stage_execution(state: &Arc<AppState>, state_version: u64) 
                     mesh_topology_fingerprint: None,
                     mesh_revision: None,
                     started_at_unix_ms: Some(1_700_000_002_000),
+                    applied_step: None,
+                    completed_step: None,
+                    applied_time_seconds: None,
+                    segment_id: None,
                     completed_at_unix_ms: None,
                     reason: None,
                     converged: false,
@@ -1131,6 +1158,7 @@ async fn model_readiness_reports_all_empty_scene_blockers_in_stable_order() {
                     name: "Empty".into(),
                     precision: "double".into(),
                     replace_current: false,
+                    output_storage: None,
                 },
             )
             .expect("empty scratch scene"),
@@ -1649,6 +1677,7 @@ async fn delayed_scratch_session_publication_cannot_enter_replacement_realtime_s
                 device: "cpu".to_string(),
                 precision: "double".to_string(),
                 replace_current: false,
+                output_storage: None,
             }),
         )
         .await
@@ -1667,6 +1696,7 @@ async fn delayed_scratch_session_publication_cannot_enter_replacement_realtime_s
                 device: "cpu".to_string(),
                 precision: "double".to_string(),
                 replace_current: true,
+                output_storage: None,
             }),
         )
         .await
@@ -2082,6 +2112,7 @@ fn sample_scalar_row(step: u64, time: f64, e_total: f64) -> ScalarRow {
         e_ext: 3.0,
         e_ani: 0.4,
         e_dmi: 0.5,
+        e_rotated_dmi: Some(0.0),
         e_total,
         max_dm_dt: 0.01,
         max_h_eff: 100.0,
@@ -2115,19 +2146,27 @@ async fn physics_graph_resource_exposes_thin_normalized_graph_for_supported_scen
         ),
         (
             "object_local_current_chain",
-            include_str!("../../../fullmag-authoring/tests/fixtures/physics_graph/object_local_current_chain.json"),
+            include_str!(
+                "../../../fullmag-authoring/tests/fixtures/physics_graph/object_local_current_chain.json"
+            ),
         ),
         (
             "global_field_drive",
-            include_str!("../../../fullmag-authoring/tests/fixtures/physics_graph/global_field_drive.json"),
+            include_str!(
+                "../../../fullmag-authoring/tests/fixtures/physics_graph/global_field_drive.json"
+            ),
         ),
         (
             "cross_object_interface",
-            include_str!("../../../fullmag-authoring/tests/fixtures/physics_graph/cross_object_interface.json"),
+            include_str!(
+                "../../../fullmag-authoring/tests/fixtures/physics_graph/cross_object_interface.json"
+            ),
         ),
         (
             "unresolved_legacy",
-            include_str!("../../../fullmag-authoring/tests/fixtures/physics_graph/unresolved_legacy.json"),
+            include_str!(
+                "../../../fullmag-authoring/tests/fixtures/physics_graph/unresolved_legacy.json"
+            ),
         ),
     ];
 
@@ -2251,6 +2290,7 @@ async fn test_router_with_runtime_read_models() -> axum::Router {
             final_e_ext: Some(3.0),
             final_e_ani: Some(4.0),
             final_e_dmi: Some(5.0),
+            final_e_rotated_dmi: None,
             final_e_total: Some(15.0),
             artifact_dir: "/tmp/fullmag-tests".into(),
         });
@@ -2267,6 +2307,7 @@ async fn test_router_with_runtime_read_models() -> axum::Router {
                 e_ext: 3.0,
                 e_ani: 4.0,
                 e_dmi: 5.0,
+                e_rotated_dmi: 0.0,
                 e_total: 15.0,
                 max_dm_dt: 10.0,
                 max_h_eff: 11.0,
@@ -2309,6 +2350,7 @@ async fn test_router_with_runtime_read_models() -> axum::Router {
                 e_ext: 2.9,
                 e_ani: 3.9,
                 e_dmi: 4.9,
+                e_rotated_dmi: Some(0.0),
                 e_total: 14.5,
                 max_dm_dt: 10.0,
                 max_h_eff: 11.0,
@@ -2337,6 +2379,7 @@ async fn test_router_with_runtime_read_models() -> axum::Router {
                 e_ext: 3.0,
                 e_ani: 4.0,
                 e_dmi: 5.0,
+                e_rotated_dmi: Some(0.0),
                 e_total: 15.0,
                 max_dm_dt: 10.0,
                 max_h_eff: 11.0,
@@ -2360,6 +2403,10 @@ async fn test_router_with_runtime_read_models() -> axum::Router {
                     mesh_topology_fingerprint: Some("sha256:stage-topology-0".into()),
                     mesh_revision: Some(7),
                     started_at_unix_ms: Some(1_700_000_000_000),
+                    applied_step: None,
+                    completed_step: None,
+                    applied_time_seconds: None,
+                    segment_id: None,
                     completed_at_unix_ms: Some(1_700_000_001_000),
                     reason: None,
                     converged: false,
@@ -2395,6 +2442,10 @@ async fn test_router_with_runtime_read_models() -> axum::Router {
                     mesh_topology_fingerprint: Some("sha256:stage-topology-1".into()),
                     mesh_revision: Some(9),
                     started_at_unix_ms: Some(1_700_000_002_000),
+                    applied_step: None,
+                    completed_step: None,
+                    applied_time_seconds: None,
+                    segment_id: None,
                     completed_at_unix_ms: None,
                     reason: None,
                     converged: false,
@@ -2727,10 +2778,23 @@ async fn test_router_with_session_store_state() -> (axum::Router, Arc<AppState>,
     let (control_events_tx, _rx) = watch::channel(0u64);
 
     let state = Arc::new(AppState {
+        development_admission: Default::default(),
+        development_restored_authoring: Default::default(),
+        development_backend: crate::router_v2::handlers::platform::development_backend::DevelopmentBackendConfig::Disabled,
+        development_restart_transport: Default::default(),
+        development_consumer_readiness: Default::default(),
         repo_root: repo_root.clone(),
+        submit_store_root: Some(repo_root.join("submit-store")),
+        submit_backlog_limit: std::num::NonZeroUsize::new(
+            crate::run_intent_persistence::DEFAULT_ACCEPTED_RUN_BACKLOG_LIMIT,
+        )
+        .unwrap(),
         current_workspace_root: repo_root.clone(),
+        current_command_journal_store_root: None,
+        current_command_journal_revision: Arc::new(AtomicU64::new(0)),
         current_live_state: Arc::new(RwLock::new(None)),
         current_live_session_transition: Arc::new(Mutex::new(())),
+        request_scope_instance_id: "test-api-instance".to_string(),
         current_live_session_epoch: Arc::new(AtomicU64::new(0)),
         current_live_realtime_before_send_hook: Arc::new(Mutex::new(None)),
         current_live_connectivity: Arc::new(RwLock::new(
@@ -2745,6 +2809,7 @@ async fn test_router_with_session_store_state() -> (axum::Router, Arc<AppState>,
             )
             .unwrap_or(u64::MAX),
         )),
+        current_live_preparation_receipt: Arc::new(RwLock::new(None)),
         current_live_realtime_events: tokio::sync::broadcast::channel(16).0,
         current_live_realtime_replay: Arc::new(Mutex::new(VecDeque::new())),
         current_live_realtime_next_seq: Arc::new(AtomicU64::new(0)),
@@ -2823,6 +2888,7 @@ async fn test_router_with_session_store_state() -> (axum::Router, Arc<AppState>,
                 e_ext: 3.0,
                 e_ani: 4.0,
                 e_dmi: 5.0,
+                e_rotated_dmi: 0.0,
                 e_total: 15.0,
                 max_dm_dt: 10.0,
                 max_h_eff: 11.0,
@@ -3004,15 +3070,27 @@ fn assert_hysteresis_points_resource<'a>(
         .expect("hysteresis points resource must expose points")
 }
 
-fn is_iso_calendar_date(value: &str) -> bool {
-    let bytes = value.as_bytes();
-    bytes.len() == 10
-        && bytes[4] == b'-'
-        && bytes[7] == b'-'
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 4 | 7) || byte.is_ascii_digit())
+/// Accepts the version stamped by `fullmag-build-info`
+/// (`scripts/rust/build_version_stamp.rs`): `<base>-dev.<YYYYMMDD>.<identity>`
+/// where identity is `g<12 hex>[.dirty.s<12 hex>]+<day>` or `unqualified`.
+fn is_stamped_development_version(value: &str) -> bool {
+    let Some((base, rest)) = value.split_once("-dev.") else {
+        return false;
+    };
+    let base_is_semver = {
+        let parts: Vec<&str> = base.split('.').collect();
+        parts.len() == 3
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    };
+    let Some((date, identity)) = rest.split_once('.') else {
+        return false;
+    };
+    base_is_semver
+        && date.len() == 8
+        && date.bytes().all(|byte| byte.is_ascii_digit())
+        && !identity.is_empty()
 }
 
 // ─── system endpoints ───────────────────────────────────────────────────────
@@ -3332,9 +3410,14 @@ async fn status_returns_200_with_live_session() {
     let runtime_bundle = json["runtime_bundle_version"]
         .as_str()
         .expect("runtime_bundle_version should be a string");
+    assert_eq!(
+        runtime_bundle,
+        fullmag_build_info::version(),
+        "runtime_bundle_version must be the stamped product version of this build"
+    );
     assert!(
-        is_iso_calendar_date(runtime_bundle),
-        "runtime_bundle_version should expose the backend build date as YYYY-MM-DD, got {runtime_bundle}"
+        is_stamped_development_version(runtime_bundle),
+        "runtime_bundle_version should expose the generated <base>-dev.<YYYYMMDD>.<identity> product version, got {runtime_bundle}"
     );
     assert!(json["session"].is_object());
     assert_eq!(json["session"]["session_id"], "test-session");
@@ -3420,6 +3503,7 @@ async fn status_exposes_fem_auto_device_crossover_decision() {
             final_e_ext: None,
             final_e_ani: None,
             final_e_dmi: None,
+            final_e_rotated_dmi: None,
             final_e_total: None,
             artifact_dir: "/tmp/fullmag-tests".into(),
         });
@@ -3533,10 +3617,13 @@ async fn status_exposes_planner_owned_active_lane_capability_snapshot() {
     );
     assert!(active_lane["source"]["capability_profile_version"].is_string());
     assert_eq!(active_lane["qualification"]["status"], "not_asserted");
-    assert_eq!(active_lane["operations"]["grid_build"]["state"], "deferred");
+    assert_eq!(
+        active_lane["operations"]["grid_build"]["state"],
+        "supported"
+    );
     assert_eq!(
         active_lane["operations"]["grid_build"]["reason_code"],
-        "capability_deferred"
+        "capability_supported"
     );
     assert_eq!(
         active_lane["operations"]["shared_mesh_build"]["state"],
@@ -3553,6 +3640,14 @@ async fn status_exposes_planner_owned_active_lane_capability_snapshot() {
     assert_eq!(
         active_lane["operations"]["interaction.exchange"]["reason_code"],
         "capability_supported"
+    );
+    assert_eq!(
+        active_lane["operations"]["interaction.rotated_interfacial_dmi"]["state"], "unsupported",
+        "active-lane status must derive rotated-DMI support from the resolved planner terms"
+    );
+    assert_eq!(
+        active_lane["operations"]["interaction.rotated_interfacial_dmi"]["reason_code"],
+        "capability_unsupported"
     );
     assert_eq!(
         active_lane["operations"]["constraint.frozen_spins"]["state"],
@@ -3592,7 +3687,7 @@ async fn status_exposes_planner_owned_active_lane_capability_snapshot() {
             .as_object()
             .expect("operation capability map")
             .len(),
-        33
+        34
     );
     assert!(active_lane["operations"]["study.frequency_response"]["reason"].is_string());
     assert!(active_lane["operations"]["study.frequency_response"]["requires"].is_array());
@@ -3854,6 +3949,7 @@ fn active_lane_operation_catalog_covers_the_canonical_interaction_catalog() {
         "interaction.stt",
         "interaction.sot",
         "interaction.interfacial_dmi",
+        "interaction.rotated_interfacial_dmi",
         "interaction.bulk_dmi",
         "interaction.uniaxial_anisotropy",
         "interaction.cubic_anisotropy",
@@ -3982,6 +4078,7 @@ async fn domain_meta_uses_fdm_physical_cell_size_for_grid_and_bounds() {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -4827,6 +4924,7 @@ async fn domain_meta_accepts_planar_fdm_zero_spacing_axis() {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -5404,6 +5502,7 @@ async fn field_vector_returns_pending_metadata_for_materializer_request() {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -5561,6 +5660,7 @@ async fn field_vector_keeps_unknown_scope_not_found_while_materialization_is_pen
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -5644,6 +5744,7 @@ async fn field_meta_and_vector_resolve_active_live_preview_field_after_snapshot_
                         e_ext: 0.0,
                         e_ani: 0.0,
                         e_dmi: 0.0,
+                        e_rotated_dmi: 0.0,
                         e_total: 0.0,
                         max_dm_dt: 0.0,
                         max_h_eff: 0.0,
@@ -8175,6 +8276,7 @@ async fn scalar_history_returns_windowed_columnar_rows() {
             sample_scalar_row(1, 1e-12, 6.9),
             sample_scalar_row(2, 2e-12, 7.3),
         ];
+        snapshot.scalar_rows[1].e_rotated_dmi = Some(-7.5e-21);
         snapshot.scalar_revision = 2;
     }
     let app = build_v2_router().with_state(state);
@@ -8182,7 +8284,7 @@ async fn scalar_history_returns_windowed_columnar_rows() {
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/v2/sessions/current/data/scalars?since_revision=1&limit=1&columns=time,e_total,mx")
+                .uri("/v2/sessions/current/data/scalars?since_revision=1&limit=1&columns=time,e_total,e_rotated_dmi,mx")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -8197,9 +8299,12 @@ async fn scalar_history_returns_windowed_columnar_rows() {
     assert_eq!(json["returned_rows"], 1);
     assert_eq!(
         json["columns"],
-        serde_json::json!(["step", "time", "e_total", "mx"])
+        serde_json::json!(["step", "time", "e_total", "e_rotated_dmi", "mx"])
     );
-    assert_eq!(json["rows"], serde_json::json!([[2.0, 2e-12, 7.3, 0.2]]));
+    assert_eq!(
+        json["rows"],
+        serde_json::json!([[2.0, 2e-12, 7.3, -7.5e-21, 0.2]])
+    );
     assert_eq!(json["observation_frames"].as_array().map(Vec::len), Some(1));
     assert_eq!(json["observation_frames"][0]["source_step"], 2);
     assert_eq!(json["observation_frames"][0]["source_time_seconds"], 2e-12);
@@ -8338,6 +8443,109 @@ async fn table_rows_resource_returns_cursor_window_and_column_metadata() {
         ])
     );
     assert_eq!(json["rows"], serde_json::json!([[2.0, 2e-12, 7.3, 2.0]]));
+}
+
+#[tokio::test]
+async fn completed_rotated_dmi_scalar_preview_uses_plan_gated_manifest_fallback() {
+    use fullmag_ir::{
+        BackendPlanIR, BackendTarget, CommonPlanMeta, ExecutionMode, ExecutionPlanIR, FdmPlanIR,
+        OutputPlanIR, ProvenancePlanIR,
+    };
+
+    let state = test_app_state_with_live_session().await;
+    let mut guard = state.current_live_state.write().await;
+    let snapshot = guard.as_mut().expect("test live session");
+    snapshot.scalar_rows.clear();
+    snapshot.live_state = None;
+    snapshot.run = Some(
+        serde_json::from_value(serde_json::json!({
+            "run_id": "completed-rdmi", "session_id": "test", "status": "completed",
+            "total_steps": 10, "final_e_dmi": -2.5e-18, "artifact_dir": "."
+        }))
+        .unwrap(),
+    );
+    let plan = ExecutionPlanIR {
+        common: CommonPlanMeta {
+            ir_version: "test".to_string(),
+            requested_backend: BackendTarget::Fdm,
+            resolved_backend: BackendTarget::Fdm,
+            execution_mode: ExecutionMode::Strict,
+            material_field_plans: Vec::new(),
+        },
+        backend_plan: BackendPlanIR::Fdm(FdmPlanIR {
+            rotated_interfacial_dmi: Some(3.0e-3),
+            ..FdmPlanIR::default()
+        }),
+        output_plan: OutputPlanIR {
+            outputs: Vec::new(),
+        },
+        provenance: ProvenancePlanIR {
+            notes: Vec::new(),
+            integrator_resolution: None,
+            fem_eigen_execution_resolution: None,
+            physics_graph: None,
+        },
+    };
+    snapshot.metadata = Some(serde_json::json!({ "execution_plan": plan }));
+    assert_eq!(
+        crate::current_global_scalar_value(snapshot, "E_rotated_dmi"),
+        Some(-2.5e-18)
+    );
+
+    // Missing or corrupt legacy provenance cannot relabel an aggregate as a
+    // rotated component; the aggregate remains readable in both cases.
+    for metadata in [None, Some(serde_json::json!({ "execution_plan": {} }))] {
+        snapshot.metadata = metadata;
+        assert_eq!(
+            crate::current_global_scalar_value(snapshot, "E_rotated_dmi"),
+            None
+        );
+        assert_eq!(
+            crate::current_global_scalar_value(snapshot, "E_dmi"),
+            Some(-2.5e-18)
+        );
+    }
+}
+
+#[tokio::test]
+async fn table_rows_expose_rotated_dmi_energy_as_an_independent_global_scalar() {
+    let state = test_app_state_with_live_session().await;
+    {
+        let mut guard = state.current_live_state.write().await;
+        let snapshot = guard
+            .as_mut()
+            .expect("test live session should be initialized");
+        let mut row = sample_scalar_row(1, 1e-12, 6.9);
+        row.e_rotated_dmi = Some(-7.5e-21);
+        snapshot.metadata = Some(serde_json::json!({
+            "table_autosave": {
+                "kind": "table_autosave",
+                "table_id": "default",
+                "every_steps": 1,
+                "quantities": ["step", "e_rotated_dmi"]
+            }
+        }));
+        snapshot.scalar_rows = vec![row];
+        snapshot.scalar_revision = 1;
+    }
+    let app = build_v2_router().with_state(state);
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/data/tables/default/rows?columns=e_rotated_dmi")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let status = response.status();
+    let json = body_json(response).await;
+    assert_eq!(status, StatusCode::OK, "{json:#}");
+    assert_eq!(json["columns"][1]["column_id"], "e_rotated_dmi");
+    assert_eq!(json["columns"][1]["unit"], "J");
+    assert_eq!(json["rows"], serde_json::json!([[1.0, -7.5e-21]]));
 }
 
 #[tokio::test]
@@ -8648,8 +8856,24 @@ async fn table_rows_binary_marks_resync_when_cursor_exceeds_available_rows() {
 // ─── quantities endpoints ───────────────────────────────────────────────────
 
 #[tokio::test]
-async fn quantities_catalog_returns_json_without_session() {
+async fn quantities_catalog_returns_404_without_live_session() {
     let app = test_router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/data/quantities")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn quantities_catalog_returns_json_with_live_session() {
+    let app = test_router_with_session().await;
     let response = app
         .oneshot(
             Request::builder()
@@ -8993,8 +9217,25 @@ async fn fem_frozen_spins_object_scope_uses_true_mesh_node_carrier() {
 // ─── display endpoint ───────────────────────────────────────────────────────
 
 #[tokio::test]
-async fn display_get_returns_current_selection() {
+async fn display_get_returns_404_without_live_session() {
     let app = test_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/visualization/display")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn display_get_returns_current_selection() {
+    let app = test_router_with_session().await;
 
     let response = app
         .oneshot(
@@ -9016,7 +9257,7 @@ async fn display_get_returns_current_selection() {
 
 #[tokio::test]
 async fn display_put_replaces_full_selection() {
-    let state = test_app_state();
+    let state = test_app_state_with_live_session().await;
     let app = build_v2_router().with_state(state.clone());
 
     let response = app
@@ -9065,7 +9306,9 @@ async fn display_put_replaces_full_selection() {
     assert_eq!(sel.selection.every_n, 25);
     assert_eq!(sel.selection.layer, 3);
     assert!(!sel.selection.auto_scale_enabled);
-    assert_eq!(sel.revision, 1);
+    // One revision for the mutation and one for the observation-demand change
+    // from the empty default (synchronize_observation_quantities).
+    assert_eq!(sel.revision, 2);
     assert_eq!(presentation.colormap, "plasma");
     assert_eq!(presentation.contrast_min, Some(-2.0));
     assert_eq!(presentation.contrast_max, Some(4.0));
@@ -9074,7 +9317,7 @@ async fn display_put_replaces_full_selection() {
 
 #[tokio::test]
 async fn display_patch_updates_view_mode_and_field_component() {
-    let state = test_app_state();
+    let state = test_app_state_with_live_session().await;
     let app = build_v2_router().with_state(state.clone());
 
     let response = app
@@ -9103,12 +9346,14 @@ async fn display_patch_updates_view_mode_and_field_component() {
 
     let sel = state.current_display_selection.read().await;
     assert_eq!(sel.selection.preview_component(), "z");
-    assert_eq!(sel.revision, 1);
+    // One revision for the mutation and one for the observation-demand change
+    // from the empty default (synchronize_observation_quantities).
+    assert_eq!(sel.revision, 2);
 }
 
 #[tokio::test]
 async fn display_patch_accepts_partial_update() {
-    let state = test_app_state();
+    let state = test_app_state_with_live_session().await;
     let app = build_v2_router().with_state(state.clone());
 
     let response = app
@@ -9141,14 +9386,16 @@ async fn display_patch_accepts_partial_update() {
     assert_eq!(sel.selection.max_points, 4096);
     assert_eq!(sel.selection.x_chosen_size, 32);
     assert_eq!(sel.selection.y_chosen_size, 16);
-    assert_eq!(sel.revision, 1);
+    // One revision for the mutation and one for the observation-demand change
+    // from the empty default (synchronize_observation_quantities).
+    assert_eq!(sel.revision, 2);
     assert_eq!(presentation.colormap, "viridis");
     assert!(!presentation.vector_glyphs);
 }
 
 #[tokio::test]
 async fn display_patch_returns_persisted_presentation_state() {
-    let state = test_app_state();
+    let state = test_app_state_with_live_session().await;
     let app = build_v2_router().with_state(state.clone());
 
     let first = app
@@ -9197,7 +9444,7 @@ async fn display_patch_returns_persisted_presentation_state() {
 
 #[tokio::test]
 async fn visualization_state_patch_persists_nested_layer_sampling_and_fem_state() {
-    let state = test_app_state();
+    let state = test_app_state_with_live_session().await;
     let app = build_v2_router().with_state(state.clone());
 
     let patched = app
@@ -9346,7 +9593,7 @@ async fn visualization_state_patch_persists_nested_layer_sampling_and_fem_state(
 
 #[tokio::test]
 async fn visualization_state_patch_persists_fdm_and_fem_target_overrides_for_a_second_client() {
-    let state = test_app_state();
+    let state = test_app_state_with_live_session().await;
     let app = build_v2_router().with_state(state);
     let patch = serde_json::json!({
         "overrides": [
@@ -9426,7 +9673,7 @@ async fn visualization_state_patch_persists_fdm_and_fem_target_overrides_for_a_s
 
 #[tokio::test]
 async fn visualization_airbox_layer_patch_supersedes_initial_airbox_override() {
-    let state = test_app_state();
+    let state = test_app_state_with_live_session().await;
     let app = build_v2_router().with_state(state.clone());
 
     let seeded = app
@@ -11219,9 +11466,19 @@ async fn mesh_active_build_returns_304_when_etag_matches() {
 }
 
 #[tokio::test]
-async fn fdm_grid_refresh_command_is_deferred_without_queueing_a_fake_runtime_mutation() {
+async fn fdm_grid_refresh_command_is_queued_for_atomic_runtime_replan() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.session.status = "awaiting_command".into();
+        snapshot.live_state = None;
+        snapshot.stage_execution = None;
+        let mut scene = snapshot
+            .scene_document
+            .take()
+            .unwrap_or_else(sample_scene_document);
+        scene.study.requested_backend = "fdm".into();
+        scene.study.requested_device = "auto".into();
+        snapshot.scene_document = Some(scene);
         snapshot.metadata = Some(serde_json::json!({
             "execution_plan": {
                 "backend_plan": {
@@ -11230,10 +11487,12 @@ async fn fdm_grid_refresh_command_is_deferred_without_queueing_a_fake_runtime_mu
                 }
             }
         }));
+        crate::session::refresh_runtime_status(snapshot);
     }
     let app = build_v2_router().with_state(state.clone());
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -11251,27 +11510,104 @@ async fn fdm_grid_refresh_command_is_deferred_without_queueing_a_fake_runtime_mu
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::OK);
+    let status = response.status();
     let json = body_json(response).await;
-    assert_eq!(json["accepted"], false);
-    assert_eq!(
-        json["error"],
-        "FDM grid and membership masks are immutable execution-plan artifacts; standalone refresh is deferred until a safe replanning lifecycle exists."
-    );
-    assert_eq!(state.current_control_queue.lock().await.len(), 0);
+    assert_eq!(status, StatusCode::OK, "unexpected response: {json}");
+    assert_eq!(json["accepted"], true);
+    assert_eq!(json["error"], serde_json::Value::Null);
+    assert_eq!(state.current_control_queue.lock().await.len(), 1);
 
-    let ledger = state.current_command_ledger.lock().await;
-    let record = ledger.back().expect("deferred command should be recorded");
-    assert_eq!(record.command.kind, "fdm_grid_refresh");
-    assert_eq!(record.status, CommandLifecycleState::Rejected);
-    assert_eq!(
-        record.completion_status,
-        Some(CommandCompletionState::Rejected)
+    let command_id = {
+        let mut ledger = state.current_command_ledger.lock().await;
+        let record = ledger.back_mut().expect("FDM command should be recorded");
+        assert_eq!(record.command.kind, "fdm_grid_refresh");
+        assert_eq!(record.status, CommandLifecycleState::Queued);
+        assert_eq!(record.completion_status, None);
+        assert_eq!(record.error, None);
+        assert_eq!(
+            record
+                .command
+                .mesh_options
+                .as_ref()
+                .and_then(|options| options
+                    .pointer("/scene_problem_patch/runtime_selection/explicit_selection"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        record.status = CommandLifecycleState::Dispatched;
+        record.command.command_id.clone()
+    };
+    state.current_control_queue.lock().await.clear();
+    let snapshot = {
+        let mut live = state.current_live_state.write().await;
+        let snapshot = live.as_mut().expect("FDM session should remain live");
+        snapshot.mesh_revision = 14;
+        snapshot.mesh_build_revision = 14;
+        snapshot.mesh_workspace = Some(serde_json::json!({
+            "command_outcomes": [{
+                "command_id": command_id,
+                "build_id": format!("mesh:{command_id}"),
+                "status": "completed",
+                "state_policy": "reinitialize_from_model",
+                "completed_at_unix_ms": 1_700_000_000_700u64,
+                "mesh_generation_id": "fdm-generation-b"
+            }]
+        }));
+        snapshot.clone()
+    };
+    let reconciled = {
+        let mut ledger = state.current_command_ledger.lock().await;
+        crate::session::reconcile_dispatched_command_ledger_from_snapshot(
+            &mut ledger,
+            &snapshot,
+            1_700_000_002_000,
+        )
+    };
+    assert!(reconciled);
+
+    let detail = get_command_detail(&app, &command_id).await;
+    assert_eq!(detail["kind"], "fdm_grid_refresh");
+    assert_eq!(detail["status"], "completed");
+    assert_eq!(detail["completion_status"], "completed");
+    let invalidations = detail["resource_invalidations"]
+        .as_array()
+        .expect("FDM grid refresh should publish invalidations");
+    assert_command_invalidation(invalidations, "meshing/shared-domain/manifest", "observed");
+    assert_command_invalidation(invalidations, "data/domain/topology", "observed");
+
+    let queue_status = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/simulation/commands")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let queue_status = body_json(queue_status).await;
+    assert_runtime_control(
+        queue_status["runtime_controls"]
+            .as_array()
+            .expect("runtime controls should be present"),
+        "fdm_grid_refresh",
+        true,
+        None,
     );
-    assert_eq!(
-        record.error.as_deref(),
-        Some("FDM grid and membership masks are immutable execution-plan artifacts; standalone refresh is deferred until a safe replanning lifecycle exists.")
-    );
+
+    let next = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/sessions/current/simulation/commands")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"kind":"fdm_grid_refresh"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.status(), StatusCode::OK);
+    assert_eq!(body_json(next).await["accepted"], true);
 }
 
 #[tokio::test]
@@ -11313,9 +11649,56 @@ async fn fdm_grid_refresh_command_rejects_non_fdm_sessions_without_queueing() {
 }
 
 #[tokio::test]
+async fn fdm_grid_refresh_command_rejects_missing_authoring_scene_without_queueing() {
+    let state = test_app_state_with_live_session().await;
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.session.status = "awaiting_command".into();
+        snapshot.live_state = None;
+        snapshot.stage_execution = None;
+        snapshot.scene_document = None;
+        snapshot.metadata = Some(serde_json::json!({
+            "execution_plan": { "backend_plan": { "kind": "fdm" } }
+        }));
+        crate::session::refresh_runtime_status(snapshot);
+    }
+    let app = build_v2_router().with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/sessions/current/simulation/commands")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"kind":"fdm_grid_refresh"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["accepted"], false);
+    assert_eq!(
+        json["error"],
+        "FDM grid refresh requires a materialized authoring scene."
+    );
+    assert!(state.current_control_queue.lock().await.is_empty());
+    assert_eq!(
+        state
+            .current_command_ledger
+            .lock()
+            .await
+            .back()
+            .map(|record| record.status),
+        Some(CommandLifecycleState::Rejected)
+    );
+}
+
+#[tokio::test]
 async fn mesh_build_command_enqueues_remesh_via_mesh_family() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.session.status = "awaiting_command".into();
         let mut scene = sample_scene_document();
         let object_mesh = fullmag_authoring::ScriptBuilderPerGeometryMeshState {
             mode: "custom".to_string(),
@@ -11350,6 +11733,7 @@ async fn mesh_build_command_enqueues_remesh_via_mesh_family() {
     let app = build_v2_router().with_state(state.clone());
 
     let response = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -11381,6 +11765,7 @@ async fn mesh_build_command_enqueues_remesh_via_mesh_family() {
     let queue = state.current_control_queue.lock().await;
     assert_eq!(queue.len(), 1);
     let command = queue.front().expect("remesh command enqueued");
+    let command_id = command.command_id.clone();
     assert_eq!(command.kind, "remesh");
     assert_eq!(
         command
@@ -11488,12 +11873,29 @@ async fn mesh_build_command_enqueues_remesh_via_mesh_family() {
             .and_then(serde_json::Value::as_str),
         Some("linear")
     );
+    drop(queue);
+
+    let detail = get_command_detail(&app, &command_id).await;
+    assert_eq!(detail["kind"], "mesh_build");
+    let list = app
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/simulation/commands")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let listed = body_json(list).await;
+    assert_eq!(listed["commands"][0]["kind"], "mesh_build");
 }
 
 #[tokio::test]
 async fn mesh_build_command_lowers_difference_geometry_from_scene() {
     let state = test_app_state_with_live_session().await;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.session.status = "awaiting_command".into();
         let mut scene = sample_scene_document();
         scene.objects[0].id = "permalloy_box".to_string();
         scene.objects[0].name = "permalloy_box".to_string();
@@ -13754,8 +14156,25 @@ async fn response_magnetic_sweep_v1_missing_artifact_returns_404() {
 }
 
 #[tokio::test]
-async fn frequency_domain_manifest_reports_solver_family_availability() {
+async fn frequency_domain_manifest_requires_live_session() {
     let app = test_router();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/analysis/frequency-domain/manifest.v1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn frequency_domain_manifest_reports_solver_family_availability() {
+    let app = test_router_with_session().await;
 
     let response = app
         .oneshot(
@@ -13873,7 +14292,13 @@ async fn frequency_domain_manifest_reports_solver_family_availability() {
         json["capabilities"]["visualization"]["mode_3d_overlay"]["status"],
         "reference_executable"
     );
-    assert_eq!(json["response_progress"], serde_json::Value::Null);
+    // Without a response sweep the manifest still reports why, instead of null.
+    assert_eq!(json["response_progress"]["complete"], false);
+    assert_eq!(json["response_progress"]["completed_frequency_points"], 0);
+    assert_eq!(
+        json["response_progress"]["missing_reason"],
+        "response sweep progress artifacts are not present"
+    );
 }
 
 #[tokio::test]
@@ -15659,10 +16084,13 @@ async fn authoring_scene_put_commits_scene_document() {
         .as_ref()
         .map(|snapshot| snapshot.region_realization_revisions)
         .expect("region revisions should be present");
+    // A geometry change alters the occupied domain, so the authoring
+    // classifier advances every realization lane (see
+    // `fullmag_authoring::classify_region_realization_impact`).
     assert!(revisions_after_topology.topology > 0);
-    assert_eq!(revisions_after_topology.membership, 0);
-    assert_eq!(revisions_after_topology.coefficients, 0);
-    assert_eq!(revisions_after_topology.initial_state, 0);
+    assert!(revisions_after_topology.membership > 0);
+    assert!(revisions_after_topology.coefficients > 0);
+    assert!(revisions_after_topology.initial_state > 0);
     drop(guard);
 
     let mut metadata_only = committed;
@@ -15831,6 +16259,8 @@ study.run(1e-12)
     let json = body_json(response).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(json["written"], true);
+    assert_eq!(json["written_to"], "script");
+    assert_eq!(json["source_script_modified"], true);
     let rewritten = fs::read_to_string(&script_path).expect("script should be rewritten");
     assert!(rewritten.contains("body_ui_core_region = body.add_region(\"ui_core\""));
     assert!(rewritten.contains("region_id=\"body:ui-core\""));
@@ -15845,6 +16275,183 @@ study.run(1e-12)
     ));
 
     let _ = fs::remove_dir_all(&script_dir);
+}
+
+#[test]
+fn script_origin_classifies_managed_and_user_scripts() {
+    let root = std::env::temp_dir().join(format!(
+        "fullmag-api-script-origin-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos(),
+    ));
+    let workspace = root.join("local-live").join("current");
+    let store = root.join("local-live").join("session-store");
+    fs::create_dir_all(&workspace).expect("workspace dir");
+    fs::create_dir_all(&store).expect("session store dir");
+    let user = root.join("user").join("model.py");
+    assert_eq!(crate::script::script_origin(&workspace, ""), "none");
+    assert_eq!(
+        crate::script::script_origin(&workspace, &user.display().to_string()),
+        "user_file"
+    );
+    assert_eq!(
+        crate::script::script_origin(
+            &workspace,
+            &workspace.join("scene_document.py").display().to_string()
+        ),
+        "generated"
+    );
+    assert_eq!(
+        crate::script::script_origin(
+            &workspace,
+            &store.join("imports").join("a.py").display().to_string()
+        ),
+        "generated"
+    );
+    assert_eq!(
+        crate::script::managed_export_copy_path(&workspace, &user),
+        workspace.join("exports").join("model.canonical.py")
+    );
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn authoring_script_sync_never_rewrites_user_file_and_writes_managed_copy() {
+    let mut state = test_app_state_with_live_session().await;
+    let unique = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos(),
+    );
+    let root = std::env::temp_dir().join(format!("fullmag-api-user-script-sync-{unique}"));
+    let user_dir = root.join("user");
+    let workspace_dir = root.join("local-live").join("current");
+    fs::create_dir_all(&user_dir).expect("user dir");
+    fs::create_dir_all(&workspace_dir).expect("workspace dir");
+    let script_path = user_dir.join("my model.py");
+    let original = r#"
+# user comment that a canonical re-render would drop
+import os
+import fullmag as fm
+
+study = fm.study("user_owned")
+study.engine("fem")
+
+body = study.geometry(fm.Box(100e-9, 40e-9, 5e-9), name="body")
+body.Ms = 800e3
+body.Aex = 13e-12
+body.alpha = 0.1
+body.m = fm.texture.uniform(1, 0, 0)
+
+study.run(1e-12)
+"#;
+    fs::write(&script_path, original).expect("failed to write user script");
+    {
+        let state_mut = Arc::get_mut(&mut state).expect("test state should be uniquely owned");
+        state_mut.repo_root = crate::script::repo_root();
+        state_mut.current_workspace_root = workspace_dir.clone();
+    }
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.scene_document = Some(sample_scene_document());
+        snapshot.session.script_path = script_path.display().to_string();
+    }
+    let app = build_v2_router().with_state(state);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/sessions/current/model/syncs")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let json = body_json(response).await;
+    assert_eq!(status, StatusCode::OK, "user file sync response: {json:?}");
+    let copy_path = workspace_dir.join("exports").join("my model.canonical.py");
+    assert_eq!(json["written"], true);
+    assert_eq!(json["written_to"], "export_copy");
+    assert_eq!(json["source_script_modified"], false);
+    assert_eq!(json["script_path"], copy_path.display().to_string());
+    assert_eq!(json["managed_copy_path"], copy_path.display().to_string());
+    assert_eq!(
+        fs::read_to_string(&script_path).expect("user script readable"),
+        original,
+        "the user's own script must stay byte-identical"
+    );
+    assert!(
+        !user_dir.join("my model.py.fullmag.tmp").exists(),
+        "no temporary file may be created next to the user's script"
+    );
+    assert!(fs::read_to_string(&copy_path)
+        .expect("managed copy should exist")
+        .contains("study = fm.study"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v2/sessions/current/model/script")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["origin"], "user_file");
+    assert_eq!(json["script_path"], copy_path.display().to_string());
+    assert!(!json["source"]
+        .as_str()
+        .expect("source string")
+        .contains("user comment"));
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v2/sessions/current")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = body_json(response).await;
+    assert_eq!(json["script"]["origin"], "user_file");
+    assert_eq!(json["script"]["writable"], false);
+    assert_eq!(
+        json["script"]["managed_copy_path"],
+        copy_path.display().to_string()
+    );
+    assert_eq!(json["script"]["sha256"].as_str().map(str::len), Some(64));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v2/sessions/current/status")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = body_json(response).await;
+    assert_eq!(json["session"]["script"]["origin"], "user_file");
+    assert_eq!(json["session"]["script"]["writable"], false);
+
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
@@ -20479,6 +21086,52 @@ async fn authoring_object_interaction_get_returns_interfacial_dmi() {
 }
 
 #[tokio::test]
+async fn authoring_object_interaction_patch_rejects_study_scoped_rotated_dmi() {
+    let scene = sample_scene_document();
+    let object_id = scene.objects[0].id.clone();
+    let state = test_app_state_with_live_session().await;
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.scene_document = Some(scene);
+    }
+    let app = build_v2_router().with_state(state.clone());
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri(format!(
+                    "/v2/sessions/current/model/objects/{object_id}/interactions/rotated_interfacial_dmi"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "present": true,
+                        "enabled": true,
+                        "params": {"d": -0.003}
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(response).await;
+    assert!(json.to_string().contains("study-scoped"));
+
+    let guard = state.current_live_state.read().await;
+    let committed = guard
+        .as_ref()
+        .and_then(|snapshot| snapshot.scene_document.as_ref())
+        .expect("scene document committed");
+    let interaction = committed.objects[0].physics_stack.iter().find(|entry| {
+        entry.kind == fullmag_authoring::ScriptBuilderMagneticInteractionKind::RotatedInterfacialDmi
+    });
+    assert!(interaction.is_none());
+}
+
+#[tokio::test]
 async fn authoring_object_interaction_patch_updates_uniaxial_params() {
     let scene = sample_scene_document();
     let object_id = scene.objects[0].id.clone();
@@ -20755,6 +21408,12 @@ async fn solver_command_binds_current_frozen_spins_scene_revision_into_canonical
 #[tokio::test]
 async fn commands_endpoint_keeps_control_sequence_monotonic_after_ledger_reset() {
     let state = test_app_state_with_live_session().await;
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.session.status = "awaiting_command".into();
+    }
+    if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        snapshot.session.status = "awaiting_command".into();
+    }
     {
         let mut next_seq = state.current_control_next_seq.lock().await;
         *next_seq = 1;
@@ -21708,6 +22367,7 @@ async fn commands_endpoint_keeps_compute_enabled_during_wait_for_compute_gate() 
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -21967,6 +22627,10 @@ async fn commands_endpoint_invalidates_hysteresis_stage_resources() {
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -22169,6 +22833,10 @@ async fn commands_endpoint_validates_runtime_precondition_against_effective_stat
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_000_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: Some(1_700_000_001_000),
                 reason: Some(fullmag_ir::StageStopReason::UserCancelled),
                 converged: false,
@@ -22679,6 +23347,10 @@ async fn command_detail_endpoint_exposes_stage_state_linkage() {
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_000_000),
+                applied_step: Some(42),
+                completed_step: Some(52),
+                applied_time_seconds: Some(2.5e-12),
+                segment_id: Some("segment:run-7:cmd-stage-0:42:3d85fd7fe1796495".into()),
                 completed_at_unix_ms: Some(1_700_000_001_000),
                 reason: None,
                 converged: false,
@@ -22780,6 +23452,13 @@ async fn command_detail_endpoint_exposes_stage_state_linkage() {
     assert_eq!(json["state_transition"], "restored");
     assert_eq!(json["accepted_at_unix_ms"], 1_700_000_000_000u64);
     assert_eq!(json["started_at_unix_ms"], 1_700_000_000_100u64);
+    assert_eq!(json["applied_step"], 42);
+    assert_eq!(json["completed_step"], 52);
+    assert_eq!(json["applied_time_seconds"], 2.5e-12);
+    assert_eq!(
+        json["segment_id"],
+        "segment:run-7:cmd-stage-0:42:3d85fd7fe1796495"
+    );
     assert_eq!(json["terminal_at_unix_ms"], 1_700_000_001_000u64);
     assert_eq!(json["torque_tolerance_apm"], 7.5);
     assert_eq!(json["torque_tolerance"], 7.5);
@@ -23262,6 +23941,69 @@ fn simulation_preparation_openapi_registers_route_and_bounded_schemas() {
     assert!(schemas["PreparationExecutionSummary"]["properties"]
         .get("backend")
         .is_some());
+
+    let materialize =
+        &openapi["paths"]["/v2/sessions/current/simulation/preparation/materialization"]["post"];
+    assert_eq!(
+        materialize["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/LivePreparationMaterializationRequest"
+    );
+    assert_eq!(
+        materialize["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+        "#/components/schemas/LivePreparationMaterializationResource"
+    );
+}
+
+#[tokio::test]
+async fn live_preparation_materialization_is_exposed_as_typed_http_route() {
+    let payload = serde_json::json!({
+        "preparation_id": "prep-contract-test",
+        "scene_revision": 7
+    });
+    let app =
+        build_v2_router().with_state(test_app_state_with_simulation_preparation("ready").await);
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/sessions/current/simulation/preparation/materialization")
+                .header("content-type", "application/json")
+                .body(Body::from(payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = body_json(response).await;
+    assert!(body["message"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("no scene document"));
+
+    let app =
+        build_v2_router().with_state(test_app_state_with_simulation_preparation("ready").await);
+    let body = serde_json::json!({
+        "preparation_id": "prep-contract-test",
+        "scene_revision": 7,
+        "requested_execution": {
+            "backend": "fdm",
+            "device": "cpu",
+            "precision": "double",
+            "mode": "strict"
+        }
+    });
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/sessions/current/simulation/preparation/materialization")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
 }
 
 #[tokio::test]
@@ -23504,6 +24246,10 @@ async fn stage_execution_endpoint_projects_frequency_response_live_progress() {
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_010_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -23548,6 +24294,7 @@ async fn stage_execution_endpoint_projects_frequency_response_live_progress() {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 1.0,
@@ -23954,6 +24701,10 @@ async fn hysteresis_progress_endpoint_returns_current_stage_progress() {
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -24052,6 +24803,10 @@ async fn hysteresis_progress_endpoint_reports_active_first_point_before_completi
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -24140,6 +24895,10 @@ async fn hysteresis_progress_endpoint_projects_live_magnetization_for_sample_ang
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -24221,6 +24980,10 @@ async fn hysteresis_progress_endpoint_uses_measurement_axis_for_live_projection(
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -24309,6 +25072,10 @@ async fn hysteresis_progress_endpoint_averages_only_magnetic_fem_nodes() {
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -24398,6 +25165,10 @@ async fn hysteresis_progress_endpoint_uses_fem_element_volume_weights_for_live_a
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -24487,6 +25258,10 @@ async fn hysteresis_progress_endpoint_uses_snapshot_fem_mesh_for_live_average() 
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -24616,6 +25391,10 @@ async fn hysteresis_execution_tree_returns_windowed_active_points() {
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -24771,6 +25550,10 @@ async fn hysteresis_bookmarks_round_trip_through_resource_and_execution_tree() {
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: Some(1_700_000_003_000),
                 reason: None,
                 converged: false,
@@ -24918,6 +25701,10 @@ async fn hysteresis_execution_tree_marks_missing_snapshot_payloads() {
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: Some(1_700_000_003_000),
                 reason: None,
                 converged: false,
@@ -25100,6 +25887,10 @@ async fn hysteresis_execution_tree_uses_settle_trace_status_for_completed_points
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: Some(1_700_000_003_000),
                 reason: None,
                 converged: false,
@@ -25279,6 +26070,10 @@ async fn hysteresis_execution_tree_exposes_runtime_branch_nodes() {
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -25398,6 +26193,10 @@ async fn stage_execution_endpoint_exposes_completed_relaxation_stop_metric() {
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_000_000u64),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: Some(1_700_000_010_000u64),
                 reason: Some(fullmag_ir::StageStopReason::Torque),
                 converged: true,
@@ -25592,6 +26391,7 @@ async fn solver_status_does_not_infer_convergence_from_finished_sample() {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 2.0,
                 max_h_eff: 3.0,
@@ -25626,6 +26426,10 @@ async fn solver_status_does_not_infer_convergence_from_finished_sample() {
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: None,
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: Some(fullmag_ir::StageStopReason::MaxSteps),
                 converged: false,
@@ -25693,6 +26497,7 @@ async fn solver_status_endpoint_prefers_waiting_for_compute_gate_over_stale_live
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -25828,6 +26633,7 @@ async fn object_metrics_endpoint_prefers_per_object_solver_scalars() {
                 e_ext: 3.0,
                 e_ani: 4.0,
                 e_dmi: 5.0,
+                e_rotated_dmi: 0.0,
                 e_total: 15.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -25908,6 +26714,7 @@ async fn object_metrics_keep_step_and_energy_without_inventing_magnetization() {
                 e_ext: 3.0,
                 e_ani: 4.0,
                 e_dmi: 5.0,
+                e_rotated_dmi: 0.0,
                 e_total: 23.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -25970,6 +26777,7 @@ async fn object_metrics_endpoint_uses_mesh_part_node_indices_for_shared_fem_node
                 e_ext: 3.0,
                 e_ani: 4.0,
                 e_dmi: 5.0,
+                e_rotated_dmi: 0.0,
                 e_total: 15.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -26212,7 +27020,7 @@ async fn session_import_inspect_round_trips_exported_session() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v2/sessions/current/persistence/imports/inspections")
+                .uri("/v2/persistence/imports/inspections")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -26543,6 +27351,40 @@ async fn session_import_resume_without_backend_restore_leaves_active_snapshot_un
     let _ = fs::remove_dir_all(&repo_root);
 }
 
+/// Archive preflight decodes into a private, self-cleaning `imports` directory
+/// below the configured store root (ADR 0038). A rejected archive must neither
+/// open/initialize the `SessionStore` (which creates `manifests`, `runs`,
+/// `objects`, ...) nor leave any decoded staging behind.
+fn assert_active_session_store_uninitialized(repo_root: &std::path::Path, context: &str) {
+    let store_root = repo_root.join(".fullmag/local-live/session-store");
+    if !store_root.exists() {
+        return;
+    }
+    let entry_names = |directory: &std::path::Path| {
+        fs::read_dir(directory)
+            .expect("directory should be readable")
+            .map(|entry| {
+                entry
+                    .expect("directory entry should be readable")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>()
+    };
+    let entries = entry_names(&store_root);
+    assert_eq!(
+        entries,
+        vec!["imports".to_string()],
+        "{context}: only the private archive decoding root may exist"
+    );
+    let leftovers = entry_names(&store_root.join("imports"));
+    assert!(
+        leftovers.is_empty(),
+        "{context}: archive decoding must clean up after itself, found {leftovers:?}"
+    );
+}
+
 #[tokio::test]
 async fn session_import_missing_snapshot_rejects_before_mutating_state_or_store() {
     use std::io::Cursor;
@@ -26624,9 +27466,9 @@ async fn session_import_missing_snapshot_rejects_before_mutating_state_or_store(
         .expect("active snapshot must serialize"),
         active_before
     );
-    assert!(
-        !repo_root.join(".fullmag/local-live/session-store").exists(),
-        "preflight failure must not initialize the active SessionStore"
+    assert_active_session_store_uninitialized(
+        &repo_root,
+        "preflight failure must not initialize the active SessionStore",
     );
 
     let mut corrupt_documents = documents;
@@ -26673,9 +27515,9 @@ async fn session_import_missing_snapshot_rejects_before_mutating_state_or_store(
         .expect("active snapshot must serialize"),
         active_before
     );
-    assert!(
-        !repo_root.join(".fullmag/local-live/session-store").exists(),
-        "corrupt snapshot must not initialize the active SessionStore"
+    assert_active_session_store_uninitialized(
+        &repo_root,
+        "corrupt snapshot must not initialize the active SessionStore",
     );
 
     let _ = fs::remove_dir_all(&repo_root);
@@ -26735,9 +27577,11 @@ async fn session_import_rejects_late_run_snapshot_mismatch_without_publishing_or
         if let Some(name) = path.strip_prefix("project/") {
             documents.insert(name.to_string(), bytes.clone());
         } else if path.starts_with("runs/") || path.starts_with("objects/sha256/") {
-            source_store
-                .write_document(path, bytes)
-                .expect("run fixture entry should persist");
+            // Deliberately seed a synthetic corrupt import fixture without
+            // opening the public writer to control-record mutation.
+            let fixture_path = source_store.root().join(path);
+            std::fs::create_dir_all(fixture_path.parent().unwrap()).unwrap();
+            std::fs::write(fixture_path, bytes).expect("run fixture entry should persist");
         }
     }
     let snapshot = documents
@@ -26920,7 +27764,7 @@ async fn solved_session_export_restores_frequency_artifacts_after_source_history
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v2/sessions/current/persistence/imports/inspections")
+                .uri("/v2/persistence/imports/inspections")
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({ "fms_base64": fms_base64 }).to_string(),
@@ -27228,7 +28072,10 @@ async fn session_checkpoint_create_captures_live_magnetization() {
         );
     }
     let json = body_json(response).await;
-    assert_eq!(json["checkpoint"]["checkpoint_id"], "cp-000042");
+    let checkpoint_id = json["checkpoint"]["checkpoint_id"]
+        .as_str()
+        .expect("checkpoint id should be present")
+        .to_string();
     assert_eq!(json["checkpoint"]["run_id"], "test-run");
     assert_eq!(json["checkpoint"]["step"], 42);
     assert_eq!(json["checkpoint"]["source"], "manual_test");
@@ -27260,7 +28107,7 @@ async fn session_checkpoint_create_captures_live_magnetization() {
     let stage_after_create = body_json(stage_after_create_response).await;
     assert_eq!(
         stage_after_create["stages"][1]["checkpoint_ref"],
-        "cp-000042"
+        checkpoint_id.as_str()
     );
     assert_eq!(
         stage_after_create["stages"][1]["state_transition"],
@@ -27276,7 +28123,9 @@ async fn session_checkpoint_create_captures_live_magnetization() {
         .clone()
         .oneshot(
             Request::builder()
-                .uri("/v2/sessions/current/persistence/checkpoints/cp-000042")
+                .uri(format!(
+                    "/v2/sessions/current/persistence/checkpoints/{checkpoint_id}"
+                ))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -27285,7 +28134,7 @@ async fn session_checkpoint_create_captures_live_magnetization() {
 
     assert_eq!(detail_response.status(), StatusCode::OK);
     let detail = body_json(detail_response).await;
-    assert_eq!(detail["checkpoint_id"], "cp-000042");
+    assert_eq!(detail["checkpoint_id"], checkpoint_id.as_str());
     assert_eq!(detail["vector_count"], 2);
     let mut active_after_capture = coupled_checkpoint.clone();
     active_after_capture["magnetization"][0] = serde_json::json!([0.0, 0.0, 1.0]);
@@ -27303,7 +28152,9 @@ async fn session_checkpoint_create_captures_live_magnetization() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v2/sessions/current/persistence/checkpoints/cp-000042/restore")
+                .uri(format!(
+                    "/v2/sessions/current/persistence/checkpoints/{checkpoint_id}/restore"
+                ))
                 .header("content-type", "application/json")
                 .body(Body::from(
                     serde_json::json!({
@@ -27325,7 +28176,10 @@ async fn session_checkpoint_create_captures_live_magnetization() {
         );
     }
     let restored = body_json(restore_response).await;
-    assert_eq!(restored["checkpoint"]["checkpoint_id"], "cp-000042");
+    assert_eq!(
+        restored["checkpoint"]["checkpoint_id"],
+        checkpoint_id.as_str()
+    );
     assert_eq!(restored["restore_class"], "exact_resume");
     assert_eq!(restored["restored_vector_count"], 2);
     assert_eq!(restored["field_revision"], 2);
@@ -27358,7 +28212,7 @@ async fn session_checkpoint_create_captures_live_magnetization() {
     let stage_after_restore = body_json(stage_after_restore_response).await;
     assert_eq!(
         stage_after_restore["stages"][1]["resume_from_checkpoint_ref"],
-        "cp-000042"
+        checkpoint_id.as_str()
     );
     assert_eq!(
         stage_after_restore["stages"][1]["loaded_state_ref"],
@@ -27396,7 +28250,251 @@ async fn session_checkpoint_create_captures_live_magnetization() {
 
     assert_eq!(list_response.status(), StatusCode::OK);
     let listed = body_json(list_response).await;
-    assert_eq!(listed["checkpoints"][0]["checkpoint_id"], "cp-000042");
+    assert_eq!(
+        listed["checkpoints"][0]["checkpoint_id"],
+        checkpoint_id.as_str()
+    );
+
+    let _ = fs::remove_dir_all(&repo_root);
+}
+
+async fn create_resume_checkpoint_for_delete_tests(app: &axum::Router) -> String {
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/sessions/current/persistence/checkpoints")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"profile": "resume"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    body_json(create).await["checkpoint"]["checkpoint_id"]
+        .as_str()
+        .expect("checkpoint id should be present")
+        .to_string()
+}
+
+async fn delete_checkpoint_request(
+    app: &axum::Router,
+    checkpoint_id: &str,
+) -> axum::response::Response {
+    app.clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!(
+                    "/v2/sessions/current/persistence/checkpoints/{checkpoint_id}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+async fn listed_checkpoint_ids(app: &axum::Router) -> Vec<String> {
+    let list = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/persistence/checkpoints")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    body_json(list).await["checkpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["checkpoint_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+#[tokio::test]
+async fn checkpoint_delete_unknown_id_is_not_found() {
+    let (app, _state, repo_root) = test_router_with_session_store_state().await;
+    let response = delete_checkpoint_request(&app, "cp-does-not-exist").await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let _ = fs::remove_dir_all(&repo_root);
+}
+
+#[tokio::test]
+async fn checkpoint_delete_removes_the_checkpoint_and_bumps_state_version() {
+    let (app, state, repo_root) = test_router_with_session_store_state().await;
+    let kept = create_resume_checkpoint_for_delete_tests(&app).await;
+    let removed = create_resume_checkpoint_for_delete_tests(&app).await;
+    assert_ne!(kept, removed);
+    let version_before = state
+        .current_live_state
+        .read()
+        .await
+        .as_ref()
+        .unwrap()
+        .state_version;
+
+    let response = delete_checkpoint_request(&app, &removed).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(body_bytes(response).await.is_empty());
+
+    let listed = listed_checkpoint_ids(&app).await;
+    assert!(listed.contains(&kept));
+    assert!(!listed.contains(&removed));
+    assert_eq!(
+        state
+            .current_live_state
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .state_version,
+        version_before + 1
+    );
+
+    // A second delete names a checkpoint that no longer exists.
+    let again = delete_checkpoint_request(&app, &removed).await;
+    assert_eq!(again.status(), StatusCode::NOT_FOUND);
+    let detail = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/v2/sessions/current/persistence/checkpoints/{removed}"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(detail.status(), StatusCode::NOT_FOUND);
+
+    let _ = fs::remove_dir_all(&repo_root);
+}
+
+#[tokio::test]
+async fn checkpoint_delete_refuses_the_restore_source_and_loaded_state() {
+    let (app, state, repo_root) = test_router_with_session_store_state().await;
+    set_running_stage_execution(&state, 0).await;
+    let checkpoint_id = create_resume_checkpoint_for_delete_tests(&app).await;
+    let common_state_ref = format!("runs/test-run/checkpoints/{checkpoint_id}/common_state.json");
+
+    // Resume base of a stage.
+    {
+        let mut guard = state.current_live_state.write().await;
+        let record = &mut guard
+            .as_mut()
+            .unwrap()
+            .stage_execution
+            .as_mut()
+            .unwrap()
+            .stages[1];
+        record.resume_from_checkpoint_ref = Some(checkpoint_id.clone());
+    }
+    let response = delete_checkpoint_request(&app, &checkpoint_id).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = String::from_utf8(body_bytes(response).await.to_vec()).unwrap();
+    assert!(body.contains("checkpoint_delete_referenced"), "{body}");
+
+    // Loaded state of a stage, without the explicit resume pointer.
+    {
+        let mut guard = state.current_live_state.write().await;
+        let record = &mut guard
+            .as_mut()
+            .unwrap()
+            .stage_execution
+            .as_mut()
+            .unwrap()
+            .stages[1];
+        record.resume_from_checkpoint_ref = None;
+        record.loaded_state_ref = Some(common_state_ref);
+    }
+    let response = delete_checkpoint_request(&app, &checkpoint_id).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(listed_checkpoint_ids(&app).await.contains(&checkpoint_id));
+
+    // Released: the same checkpoint can now go.
+    {
+        let mut guard = state.current_live_state.write().await;
+        guard
+            .as_mut()
+            .unwrap()
+            .stage_execution
+            .as_mut()
+            .unwrap()
+            .stages[1]
+            .loaded_state_ref = None;
+    }
+    let response = delete_checkpoint_request(&app, &checkpoint_id).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let _ = fs::remove_dir_all(&repo_root);
+}
+
+#[tokio::test]
+async fn checkpoint_delete_clears_the_saving_stage_link_instead_of_dangling() {
+    let (app, state, repo_root) = test_router_with_session_store_state().await;
+    set_running_stage_execution(&state, 0).await;
+    let checkpoint_id = create_resume_checkpoint_for_delete_tests(&app).await;
+    {
+        let guard = state.current_live_state.read().await;
+        let record = &guard.as_ref().unwrap().stage_execution.as_ref().unwrap().stages[1];
+        assert_eq!(
+            record.checkpoint_ref.as_deref(),
+            Some(checkpoint_id.as_str())
+        );
+    }
+
+    let response = delete_checkpoint_request(&app, &checkpoint_id).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let guard = state.current_live_state.read().await;
+    let record = &guard.as_ref().unwrap().stage_execution.as_ref().unwrap().stages[1];
+    assert_eq!(record.checkpoint_ref, None);
+    assert_eq!(record.state_transition, None);
+    assert!(record
+        .artifact_refs
+        .iter()
+        .all(|artifact| !artifact.contains(&checkpoint_id)));
+    drop(guard);
+
+    let _ = fs::remove_dir_all(&repo_root);
+}
+
+#[tokio::test]
+async fn checkpoint_delete_refuses_the_run_manifests_latest_checkpoint() {
+    let (app, state, repo_root) = test_router_with_session_store_state().await;
+    let checkpoint_id = create_resume_checkpoint_for_delete_tests(&app).await;
+    let store = crate::session_persistence::open_store(&state).unwrap();
+    store
+        .commit_run(&fullmag_session::FmsRunManifest {
+            run_id: "test-run".into(),
+            status: fullmag_session::RunStatus::Running,
+            study_kind: "time_evolution".into(),
+            backend: "cpu".into(),
+            precision: "f64".into(),
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            total_steps: 0,
+            total_time_s: 0.0,
+            plan_ref: None,
+            live_state_ref: None,
+            latest_checkpoint_ref: Some(format!(
+                "runs/test-run/checkpoints/{checkpoint_id}/checkpoint.json"
+            )),
+            artifact_index_ref: None,
+        })
+        .unwrap();
+    drop(store);
+
+    let response = delete_checkpoint_request(&app, &checkpoint_id).await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(listed_checkpoint_ids(&app).await.contains(&checkpoint_id));
 
     let _ = fs::remove_dir_all(&repo_root);
 }
@@ -27419,6 +28517,11 @@ async fn legacy_checkpoint_fails_closed_for_active_coupled_m3_session() {
         .await
         .unwrap();
     assert_eq!(create.status(), StatusCode::OK);
+    let created = body_json(create).await;
+    let checkpoint_id = created["checkpoint"]["checkpoint_id"]
+        .as_str()
+        .expect("checkpoint id should be present")
+        .to_string();
     state
         .current_live_state
         .write()
@@ -27432,7 +28535,9 @@ async fn legacy_checkpoint_fails_closed_for_active_coupled_m3_session() {
         .oneshot(
             Request::builder()
                 .method("POST")
-                .uri("/v2/sessions/current/persistence/checkpoints/cp-000042/restore")
+                .uri(format!(
+                    "/v2/sessions/current/persistence/checkpoints/{checkpoint_id}/restore"
+                ))
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::json!({}).to_string()))
                 .unwrap(),
@@ -27444,6 +28549,75 @@ async fn legacy_checkpoint_fails_closed_for_active_coupled_m3_session() {
     assert!(body
         .to_string()
         .contains("legacy magnetization-only checkpoint"));
+    let _ = fs::remove_dir_all(&repo_root);
+}
+
+#[tokio::test]
+async fn magnetization_only_checkpoint_is_not_promoted_to_resume_and_cannot_mutate_live_state() {
+    let (app, state, repo_root) = test_router_with_session_store_state().await;
+    let create = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v2/sessions/current/persistence/checkpoints")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"profile": "resume"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(create.status(), StatusCode::OK);
+    let created = body_json(create).await;
+    assert_eq!(
+        created["checkpoint"]["resume_class"],
+        "initial_condition_import"
+    );
+    let checkpoint_id = created["checkpoint"]["checkpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (before_step, before_time, before_magnetization, before_version) = {
+        let guard = state.current_live_state.read().await;
+        let snapshot = guard.as_ref().unwrap();
+        let latest = &snapshot.live_state.as_ref().unwrap().latest_step;
+        (
+            latest.step,
+            latest.time,
+            latest.magnetization.clone(),
+            snapshot.state_version,
+        )
+    };
+
+    let restore = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/v2/sessions/current/persistence/checkpoints/{checkpoint_id}/restore"
+                ))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(restore.status(), StatusCode::CONFLICT);
+    assert!(body_json(restore)
+        .await
+        .to_string()
+        .contains("checkpoint_restore_requires_exact_resume"));
+
+    let guard = state.current_live_state.read().await;
+    let snapshot = guard.as_ref().unwrap();
+    let latest = &snapshot.live_state.as_ref().unwrap().latest_step;
+    assert_eq!(latest.step, before_step);
+    assert_eq!(latest.time, before_time);
+    assert_eq!(latest.magnetization, before_magnetization);
+    assert_eq!(snapshot.state_version, before_version);
+    drop(guard);
     let _ = fs::remove_dir_all(&repo_root);
 }
 
@@ -28011,7 +29185,8 @@ async fn uploaded_h5_field_state_can_be_inspected_and_applied() {
         .canonicalize()
         .expect("workspace root should resolve");
     let python_path = workspace_root.join("packages/fullmag-py/src");
-    let python_exe = crate::script::python_executable(&workspace_root);
+    let python_exe = crate::script::python_executable(&workspace_root)
+        .expect("Python interpreter should resolve");
     let python = std::process::Command::new(&python_exe)
         .arg("-c")
         .arg(format!(
@@ -28136,7 +29311,8 @@ async fn uploaded_zarr_zip_field_state_can_be_inspected_and_applied() {
         .canonicalize()
         .expect("workspace root should resolve");
     let python_path = workspace_root.join("packages/fullmag-py/src");
-    let python_exe = crate::script::python_executable(&workspace_root);
+    let python_exe = crate::script::python_executable(&workspace_root)
+        .expect("Python interpreter should resolve");
     let python = std::process::Command::new(&python_exe)
         .arg("-c")
         .arg(format!(
@@ -28254,7 +29430,8 @@ async fn uploaded_airbox_h5_field_state_can_be_attached_without_apply_shape_chec
         .canonicalize()
         .expect("workspace root should resolve");
     let python_path = workspace_root.join("packages/fullmag-py/src");
-    let python_exe = crate::script::python_executable(&workspace_root);
+    let python_exe = crate::script::python_executable(&workspace_root)
+        .expect("Python interpreter should resolve");
     let python = std::process::Command::new(&python_exe)
         .arg("-c")
         .arg(format!(
@@ -28359,6 +29536,58 @@ async fn uploaded_airbox_h5_field_state_can_be_attached_without_apply_shape_chec
     assert_eq!(imported["applied_point_count"], 0);
     assert_eq!(imported["mode"], "attach");
 
+    let _ = fs::remove_dir_all(&repo_root);
+}
+
+#[tokio::test]
+async fn session_recovery_is_scoped_to_current_session() {
+    let (app, state, repo_root) = test_router_with_session_store_state().await;
+    let context = crate::capture_current_live_request_context(&state)
+        .await
+        .unwrap();
+    let store = crate::session_persistence::open_store(&state).unwrap();
+    for id in [context.session_id.as_str(), "foreign-recovery-session"] {
+        store
+            .write_recovery(&fullmag_session::FmsSessionManifest::new(
+                id,
+                id,
+                fullmag_session::SaveProfile::Compact,
+            ))
+            .unwrap();
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/persistence/recovery")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    assert_eq!(json["snapshots"].as_array().unwrap().len(), 1);
+    assert_eq!(json["snapshots"][0]["session_id"], context.session_id);
+    for expected_count in [1, 0] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/v2/sessions/current/persistence/recovery")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["cleared"], expected_count);
+    }
+    assert!(store
+        .read_session_recovery("foreign-recovery-session")
+        .unwrap()
+        .is_some());
     let _ = fs::remove_dir_all(&repo_root);
 }
 
@@ -31672,6 +32901,12 @@ async fn asyncapi_document_returns_200() {
 
     let json = body_json(response).await;
     assert_eq!(json["asyncapi"], "2.6.0");
+    assert!(
+        json["components"]["schemas"]["HelloEvent"]["allOf"][1]["properties"]["payload"]
+            ["required"]
+            .as_array()
+            .is_some_and(|fields| fields.contains(&serde_json::json!("request_scope_epoch")))
+    );
     assert_eq!(
         json["channels"]["/v2/sessions/current/events/ws"]["subscribe"]["operationId"],
         "subscribeCurrentLiveRealtime"
@@ -31797,8 +33032,23 @@ async fn asyncapi_docs_page_links_to_v2_document() {
 }
 
 #[tokio::test]
-async fn communication_policy_can_be_read_and_patched() {
+async fn communication_policy_requires_live_session() {
     let app = test_router();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v2/sessions/current/events/communication-policy")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn communication_policy_can_be_read_and_patched() {
+    let app = test_router_with_session().await;
     let response = app
         .clone()
         .oneshot(
@@ -32082,7 +33332,8 @@ fn export_problem_ir_from_python_script(script_name: &str, source: &str) -> serd
     let script_path = script_dir.join(script_name);
     fs::write(&script_path, source).expect("failed to write Python script test fixture");
     let python_path = workspace_root.join("packages/fullmag-py/src");
-    let python_exe = crate::script::python_executable(&workspace_root);
+    let python_exe = crate::script::python_executable(&workspace_root)
+        .expect("Python interpreter should resolve");
     let python = std::process::Command::new(&python_exe)
         .arg("-c")
         .arg(
@@ -32207,6 +33458,7 @@ async fn test_router_with_live_magnetization() -> axum::Router {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -33439,6 +34691,10 @@ async fn hysteresis_analysis_resolves_stage_directory_artifact_refs() {
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_000_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: Some(1_700_000_001_000),
                 reason: None,
                 converged: false,
@@ -33596,6 +34852,10 @@ async fn hysteresis_analysis_accepts_active_hysteresis_kind_when_record_kind_is_
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_000_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -33720,6 +34980,10 @@ async fn hysteresis_analysis_reads_flat_live_artifact_with_active_stage_executio
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_000_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -33817,6 +35081,10 @@ async fn hysteresis_analysis_points_conflicts_when_progress_reports_completed_po
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_000_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -33893,6 +35161,10 @@ async fn hysteresis_analysis_points_returns_empty_for_running_stage_before_first
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_000_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -34445,6 +35717,10 @@ async fn field_vector_snapshot_id_validates_optional_hysteresis_stage_scope() {
                 mesh_topology_fingerprint: None,
                 mesh_revision: None,
                 started_at_unix_ms: Some(1_700_000_002_000),
+                applied_step: None,
+                completed_step: None,
+                applied_time_seconds: None,
+                segment_id: None,
                 completed_at_unix_ms: None,
                 reason: None,
                 converged: false,
@@ -34995,6 +36271,7 @@ async fn field_meta_component_query_uses_live_magnetization_before_stale_latest_
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -35060,6 +36337,7 @@ async fn v2_magnetization_meta_vector_revision_and_etag_follow_provenance_field_
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -35722,6 +37000,7 @@ async fn v2_field_catalog_rejects_non_finite_live_magnetization() {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -35800,6 +37079,7 @@ async fn v2_field_catalog_rejects_fem_live_magnetization_with_wrong_point_count(
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -35897,6 +37177,7 @@ async fn v2_field_vector_accepts_fem_live_magnetization_on_magnetic_nodes() {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -36047,6 +37328,7 @@ async fn v2_field_vector_prefers_live_magnetization_over_stale_latest_field() {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -36553,6 +37835,7 @@ async fn v2_field_vector_prefers_fresh_m_preview_cache_over_stale_latest_field()
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -36693,6 +37976,7 @@ async fn v2_fdm_vector_respects_max_samples_when_preview_would_be_downscaled() {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -36900,6 +38184,7 @@ async fn v2_h_demag_resource_prefers_newer_preview_cache_over_stale_latest_field
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -37036,6 +38321,7 @@ async fn v2_h_demag_meta_prefers_equal_generation_latest_with_source_time() {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -37112,6 +38398,7 @@ async fn v2_terminal_eden_demag_metadata_keeps_final_solver_provenance() {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -37197,6 +38484,7 @@ async fn v2_optional_field_materialization_pending_and_error_preserve_solver_and
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -37464,6 +38752,7 @@ async fn topological_charge_reports_empty_support_when_m_field_exists_without_us
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -37536,6 +38825,7 @@ async fn topological_charge_computes_uniform_fdm_grid_without_fem_mesh() {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -37623,6 +38913,7 @@ async fn topological_charge_cache_key_tracks_field_revision() {
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -37754,6 +39045,7 @@ async fn topological_charge_default_fdm_support_uses_one_midplane_of_thinnest_ax
                 e_ext: 0.0,
                 e_ani: 0.0,
                 e_dmi: 0.0,
+                e_rotated_dmi: 0.0,
                 e_total: 0.0,
                 max_dm_dt: 0.0,
                 max_h_eff: 0.0,
@@ -41355,6 +42647,7 @@ fn openapi_v2_exposes_professional_session_tree() {
             "data",
             "visualization",
             "workspace",
+            "workspace_items",
             "analysis",
             "persistence",
             "diagnostics",
@@ -43229,7 +44522,7 @@ async fn frequency_domain_field_sweep_and_fmr_resources_serve_typed_payloads() {
 }
 
 #[tokio::test]
-async fn frequency_domain_field_sweep_rejects_unpaired_typed_field_reference() {
+async fn frequency_domain_field_sweep_accepts_durable_field_reference_without_transport_key() {
     let (app, artifact_dir) = test_router_with_session_and_artifact_dir().await;
     let eigen_dir = artifact_dir.join("eigen");
     fs::create_dir_all(&eigen_dir).expect("eigen artifact directory should exist");
@@ -43333,7 +44626,14 @@ async fn frequency_domain_field_sweep_rejects_unpaired_typed_field_reference() {
         .await
         .unwrap();
 
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_payload = body_json(response).await;
+    let mode = &response_payload["payload"]["samples"][0]["modes"][0];
+    assert_eq!(
+        mode["mode_field_id"],
+        "analysis:eigen:sample-0000:mode-0000"
+    );
+    assert!(mode["mode_field_resource_key"].is_null());
 }
 
 #[tokio::test]
@@ -46814,6 +48114,9 @@ async fn frozen_spins_test_state() -> Arc<AppState> {
     let mut scene = sample_scene_document();
     scene.revision = 12;
     if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+        // This fixture models idle authoring; hot-apply tests explicitly start a stage.
+        snapshot.session.status = "awaiting_command".into();
+        crate::session::refresh_runtime_status(snapshot);
         snapshot.scene_document = Some(scene);
         snapshot.metadata = Some(serde_json::json!({
             "artifact_layout": {
@@ -47616,6 +48919,359 @@ async fn scene_commit_rejects_a_cross_family_stale_candidate_atomically() {
         .any(|constraint| constraint.frozen_spins().id == "pin-race"));
 }
 
+#[tokio::test]
+async fn context_bound_scene_commit_rejects_an_epoch_transition() {
+    let state = frozen_spins_test_state().await;
+    let context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
+    let mut scene = crate::get_or_load_current_live_scene_document_for_context(&state, &context)
+        .await
+        .expect("context-bound scene");
+    scene.scene.name = "stale context edit".to_string();
+    state
+        .current_live_session_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+    let error = crate::commit_current_live_scene_document_for_context(&state, &context, scene)
+        .await
+        .expect_err("a stale request context must not publish");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+}
+
+#[tokio::test]
+async fn context_bound_compute_enqueue_rejects_an_epoch_transition_before_queueing() {
+    let state = test_app_state_with_live_session().await;
+    let context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
+    let command: SessionCommand = serde_json::from_value(serde_json::json!({
+        "seq": 0,
+        "command_id": "cmd-stale-context",
+        "kind": "compute_fields",
+        "created_at_unix_ms": 1_700_000_000_000u128
+    }))
+    .expect("minimal compute command");
+    state
+        .current_live_session_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+    let error = crate::router_v2::handlers::simulation::commands::
+        enqueue_session_command_impl_with_context(
+            state.clone(),
+            &Default::default(),
+            command,
+            Some(&context),
+        )
+        .await
+        .expect_err("a stale compute request must not enqueue");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+    assert!(state.current_control_queue.lock().await.is_empty());
+}
+
+#[tokio::test]
+async fn context_bound_binary_membership_read_rejects_stale_epoch_before_artifact_io() {
+    let state = test_app_state_with_live_session().await;
+    let context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
+    state
+        .current_live_session_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+    let error = crate::router_v2::handlers::data::fdm_region_membership::
+        serve_fdm_region_membership_binary_with_context(
+            state,
+            Default::default(),
+            None,
+            Some(&context),
+        )
+        .await
+        .expect_err("a stale binary request must not read the replacement workspace");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+}
+
+#[tokio::test]
+async fn context_bound_persistence_read_rejects_a_stale_epoch_before_store_access() {
+    let state = test_app_state_with_live_session().await;
+    let context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
+    state
+        .current_live_session_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+    let error = crate::session_persistence::list_checkpoints_with_context(
+        axum::extract::State(state),
+        Some(&context),
+    )
+    .await
+    .expect_err("a stale persistence request must not access the replacement store");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+}
+
+#[tokio::test]
+async fn context_bound_checkpoint_capture_rejects_a_stale_epoch_before_store_access() {
+    let state = test_app_state_with_live_session().await;
+    let context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
+    state
+        .current_live_session_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+    let request =
+        serde_json::from_value(serde_json::json!({})).expect("default checkpoint capture request");
+    let error = crate::session_persistence::create_checkpoint_with_context(
+        axum::extract::State(state),
+        axum::Json(request),
+        Some(&context),
+    )
+    .await
+    .expect_err("a stale checkpoint capture must not access the replacement store");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+}
+
+#[tokio::test]
+async fn context_bound_checkpoint_restore_rejects_a_stale_epoch_before_store_access() {
+    let state = test_app_state_with_live_session().await;
+    let context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
+    state
+        .current_live_session_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+    let request =
+        serde_json::from_value(serde_json::json!({})).expect("default checkpoint restore request");
+    let error = crate::session_persistence::restore_checkpoint_with_context(
+        axum::extract::State(state),
+        "stale-checkpoint".to_string(),
+        axum::Json(request),
+        Some(&context),
+    )
+    .await
+    .expect_err("a stale checkpoint restore must not access the replacement store");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+}
+
+#[tokio::test]
+async fn context_bound_field_state_persistence_rejects_a_stale_epoch_before_file_io() {
+    let state = test_app_state_with_live_session().await;
+    let context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
+    state
+        .current_live_session_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+    let export_request = serde_json::from_value(serde_json::json!({
+        "target": {"kind": "object", "id": "object-1"},
+        "quantity_id": "m",
+        "format": "field_state_json"
+    }))
+    .expect("field-state export request");
+    let error = crate::session_persistence::export_field_state_with_context(
+        axum::extract::State(state.clone()),
+        axum::Json(export_request),
+        Some(&context),
+    )
+    .await
+    .expect_err("a stale field-state export must not write a file");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+
+    let inspect_request = serde_json::from_value(serde_json::json!({
+        "artifact_ref": "field-states/stale.json",
+        "target": {"kind": "object", "id": "object-1"},
+        "quantity_id": "m"
+    }))
+    .expect("field-state inspect request");
+    let error = crate::session_persistence::inspect_field_state_with_context(
+        axum::extract::State(state.clone()),
+        axum::Json(inspect_request),
+        Some(&context),
+    )
+    .await
+    .expect_err("a stale field-state inspection must not read an artifact");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+
+    let import_request = serde_json::from_value(serde_json::json!({
+        "artifact_ref": "field-states/stale.json",
+        "target": {"kind": "object", "id": "object-1"},
+        "quantity_id": "m",
+        "mode": "attach"
+    }))
+    .expect("field-state import request");
+    let error = crate::session_persistence::import_field_state_with_context(
+        axum::extract::State(state),
+        axum::Json(import_request),
+        Some(&context),
+    )
+    .await
+    .expect_err("a stale field-state import must not mutate the replacement workspace");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+}
+
+#[tokio::test]
+async fn context_bound_session_export_and_import_reject_a_stale_epoch_before_archive_io() {
+    let state = test_app_state_with_live_session().await;
+    let context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
+    state
+        .current_live_session_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+    let export_request = serde_json::from_value(serde_json::json!({
+        "profile": "compact"
+    }))
+    .expect("session export request");
+    let error = crate::session_persistence::export_session_with_context(
+        axum::extract::State(state.clone()),
+        axum::Json(export_request),
+        Some(&context),
+    )
+    .await
+    .expect_err("a stale session export must not read or pack an archive");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+
+    let import_request = serde_json::from_value(serde_json::json!({
+        "fms_base64": "not-read-after-stale-context"
+    }))
+    .expect("session import request");
+    let error = crate::session_persistence::import_session_commit_with_context(
+        axum::extract::State(state),
+        axum::Json(import_request),
+        Some(&context),
+    )
+    .await
+    .expect_err("a stale session import must not publish an archive");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+}
+
+#[tokio::test]
+async fn asset_import_waits_for_transition_before_processing_file_content() {
+    let state = test_app_state_with_live_session().await;
+    let context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
+    let transition = state.current_live_session_transition.lock().await;
+    let import = crate::import_asset_for_current_workspace(
+        &state,
+        &context,
+        crate::ImportSessionAssetRequest {
+            file_name: "transition-import.ovf".to_owned(),
+            content_base64: "invalid-base64-must-not-be-decoded".to_owned(),
+            target_realization: "fdm".to_owned(),
+        },
+    );
+    tokio::pin!(import);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), &mut import)
+            .await
+            .is_err(),
+        "import must wait for workspace ownership before decoding"
+    );
+    state
+        .current_live_session_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    drop(transition);
+    let error = import
+        .await
+        .expect_err("transition invalidates the waiting import");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+}
+
+#[tokio::test]
+async fn context_bound_asset_import_rejects_stale_epoch_before_decoding_or_writing() {
+    let state = test_app_state_with_live_session().await;
+    let context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
+    state
+        .current_live_session_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    let error = crate::import_asset_for_current_workspace(
+        &state,
+        &context,
+        crate::ImportSessionAssetRequest {
+            file_name: "stale-import.ovf".to_owned(),
+            content_base64: "invalid-base64-must-not-be-decoded".to_owned(),
+            target_realization: "fdm".to_owned(),
+        },
+    )
+    .await
+    .expect_err("stale asset import must be rejected before file processing");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+}
+
+#[tokio::test]
+async fn context_bound_events_publication_rejects_a_stale_epoch() {
+    let state = test_app_state_with_live_session().await;
+    let context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
+    state
+        .current_live_session_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+
+    let error = crate::router_v2::handlers::platform::realtime::
+        publish_communication_policy_change_with_context(&state, 1, Some(&context))
+        .await
+        .expect_err("a stale events request must not publish to a replacement workspace");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+}
+
+#[tokio::test]
+async fn communication_policy_patch_waits_for_transition_before_mutating_policy() {
+    let state = test_app_state_with_live_session().await;
+    let context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
+    let before = state.current_live_realtime_policy.read().await.clone();
+    let transition = state.current_live_session_transition.lock().await;
+    let patch = serde_json::from_value(serde_json::json!({
+        "heartbeat_enabled": !before.effective.heartbeat_enabled
+    }))
+    .expect("valid realtime policy patch");
+    let update =
+        crate::router_v2::handlers::platform::realtime::patch_communication_policy_with_context(
+            &state, patch, &context,
+        );
+    tokio::pin!(update);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(10), &mut update)
+            .await
+            .is_err(),
+        "patch must wait for workspace ownership before mutating policy"
+    );
+    state
+        .current_live_session_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+    drop(transition);
+
+    let error = update.await.expect_err("stale patch must be rejected");
+    assert_eq!(error.status, StatusCode::CONFLICT);
+    assert_eq!(error.message, "request_context_stale");
+    let after = state.current_live_realtime_policy.read().await;
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(after.effective, before.effective);
+}
+
 #[test]
 fn scene_resource_preserves_selection_and_frozen_spins_authoring_state() {
     let mut scene = sample_scene_document();
@@ -47640,6 +49296,31 @@ fn scene_resource_preserves_selection_and_frozen_spins_authoring_state() {
         "inactive_selection": "warn_and_intersect"
     }]))
     .expect("constraint fixture");
+    scene.monitors.planar = serde_json::from_value(serde_json::json!([{
+        "id": "midplane",
+        "name": "Midplane",
+        "target": {"kind": "object", "object_id": "body"},
+        "frame": {
+            "origin_m": [0.0, 0.0, 0.0],
+            "u_axis": [1.0, 0.0, 0.0],
+            "v_axis": [0.0, 1.0, 0.0],
+            "normal": [0.0, 0.0, 1.0],
+            "preset": "xy",
+            "normalization_version": "planar_frame_v1",
+            "extent": {"kind": "target_bounds", "padding_m": 0.0}
+        },
+        "operator": {"kind": "plane_sample"}
+    }]))
+    .expect("monitor fixture");
+    scene.study.table_autosave = Some(
+        serde_json::from_value(serde_json::json!({
+            "kind": "table_autosave",
+            "table_id": "scene-table",
+            "every_steps": 3,
+            "quantities": ["step", "mx"]
+        }))
+        .expect("table autosave fixture"),
+    );
 
     let resource = crate::schemas::authoring::SceneResource::from_scene_document(scene.clone())
         .expect("scene resource projection");
@@ -47651,6 +49332,14 @@ fn scene_resource_preserves_selection_and_frozen_spins_authoring_state() {
             .map(Vec::len),
         Some(1)
     );
+    assert_eq!(
+        projected["monitors"]["planar"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        projected["study"]["table_autosave"]["table_id"],
+        "scene-table"
+    );
     let roundtrip: fullmag_authoring::SceneDocument =
         serde_json::from_value(projected).expect("scene resource returns to canonical scene");
     assert_eq!(roundtrip.selections, scene.selections);
@@ -47658,6 +49347,8 @@ fn scene_resource_preserves_selection_and_frozen_spins_authoring_state() {
         roundtrip.magnetization_constraints,
         scene.magnetization_constraints
     );
+    assert_eq!(roundtrip.monitors.planar, scene.monitors.planar);
+    assert_eq!(roundtrip.study.table_autosave, scene.study.table_autosave);
 }
 
 #[test]
@@ -48197,6 +49888,9 @@ async fn frozen_spins_delayed_insert_cannot_clear_a_newer_session_epoch() {
             .await;
     assert_eq!(status, StatusCode::OK);
     let old_id = preview["preview_id"].as_str().unwrap();
+    let request_context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
     let old_record = state
         .frozen_spins_previews
         .read()
@@ -48219,6 +49913,7 @@ async fn frozen_spins_delayed_insert_cannot_clear_a_newer_session_epoch() {
 
     let error = super::handlers::model::frozen_spins::insert_current_preview_record(
         &state,
+        &request_context,
         "late-session-a".to_string(),
         old_record,
     )
@@ -48239,12 +49934,20 @@ async fn frozen_spins_shared_model_and_data_read_holds_the_session_epoch() {
             .await;
     assert_eq!(status, StatusCode::OK);
     let preview_id = preview["preview_id"].as_str().unwrap().to_string();
+    let request_context = crate::capture_current_live_request_context(&state)
+        .await
+        .expect("request context");
 
     let store_guard = state.frozen_spins_previews.write().await;
     let read_state = state.clone();
     let read_id = preview_id.clone();
     let read_task = tokio::spawn(async move {
-        super::handlers::model::frozen_spins::current_preview_record(&read_state, &read_id).await
+        super::handlers::model::frozen_spins::current_preview_record(
+            &read_state,
+            &request_context,
+            &read_id,
+        )
+        .await
     });
     let mut observed_session_reader = false;
     for _ in 0..256 {
@@ -48654,3 +50357,15 @@ async fn session_collection_handler_returns_a_typed_confirmed_empty_resource() {
     assert_eq!(resource.schema_version, "2.0.0");
     assert!(resource.sessions.is_empty());
 }
+
+#[path = "tests/remesh_admission.rs"]
+mod remesh_admission;
+
+#[path = "tests/project_documents.rs"]
+mod project_documents;
+
+#[path = "tests/session_scope.rs"]
+mod session_scope;
+
+#[path = "tests/workspace_items.rs"]
+mod workspace_items;

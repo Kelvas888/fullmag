@@ -1,0 +1,71 @@
+{
+  "id": "SLICE-01",
+  "kind": "specification_oracle",
+  "units": "m",
+  "vertices": [
+    [
+      0,
+      0,
+      0
+    ],
+    [
+      1e-07,
+      0,
+      0
+    ],
+    [
+      0,
+      1e-07,
+      0
+    ],
+    [
+      0,
+      0,
+      1e-07
+    ]
+  ],
+  "tetrahedra": [
+    [
+      0,
+      1,
+      2,
+      3
+    ]
+  ],
+  "plane": {
+    "normal": [
+      0,
+      0,
+      1
+    ],
+    "offset_m": 2.5e-08,
+    "equation": "n dot x = offset_m"
+  },
+  "expected_polygon_unordered": [
+    [
+      0,
+      0,
+      2.5e-08
+    ],
+    [
+      7.5e-08,
+      0,
+      2.5e-08
+    ],
+    [
+      0,
+      7.5e-08,
+      2.5e-08
+    ]
+  ],
+  "expected_area_m2": 2.8125e-15,
+  "tolerance": {
+    "point_abs_m": 1e-20,
+    "area_abs_m2": 1e-28
+  },
+  "degenerate_cases": [
+    "z=0 face coincidence handled once",
+    "z=100nm vertex intersection must not produce nonzero area",
+    "z=101nm empty"
+  ]
+}

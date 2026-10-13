@@ -25,6 +25,7 @@ use fullmag_runner::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -107,13 +108,39 @@ pub(crate) enum MeshCommandTarget {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AppState {
+    /// Private pre-listener provenance. HTTP snapshots never carry this marker.
+    pub development_restored_authoring: Arc<std::sync::OnceLock<
+        crate::router_v2::handlers::platform::development_restore_input::RestoredAuthoringIdentity,
+    >>,
+    /// Lock order: mutation admission precedes the session-transition lock.
+    pub development_admission:
+        crate::router_v2::middleware::development_admission::DevelopmentAdmission,
+    /// Immutable native launcher binding; ordinary API startup leaves it disabled.
+    pub development_backend:
+        crate::router_v2::handlers::platform::development_backend::DevelopmentBackendConfig,
+    pub development_restart_transport:
+        crate::router_v2::handlers::platform::development_restart_request::DevelopmentRestartTransportConfig,
+    pub development_consumer_readiness:
+        crate::development_consumer_readiness::DevelopmentConsumerReadiness,
     pub repo_root: PathBuf,
+    /// Managed, project-owned run storage resolved before this API starts.
+    pub submit_store_root: Option<PathBuf>,
+    /// Global durable bound for accepted runs that have not reached a terminal
+    /// task catalog. Replays do not consume another backlog slot.
+    pub submit_backlog_limit: NonZeroUsize,
     pub current_workspace_root: PathBuf,
+    /// Durable bounded journal for current-workspace command status. Tests
+    /// that do not exercise filesystem recovery may leave it disabled.
+    pub current_command_journal_store_root: Option<PathBuf>,
+    /// Monotonic revision of the durable current-workspace command journal.
+    pub current_command_journal_revision: Arc<AtomicU64>,
     /// Sessionless local-live workspace snapshot used by the root `/` GUI.
     pub current_live_state: Arc<RwLock<Option<SessionStateResponse>>>,
     /// Lock order: current_live_session_transition precedes current-session state,
     /// resource, and realtime locks. It remains held through current-session publish.
     pub current_live_session_transition: Arc<Mutex<()>>,
+    /// Unique to this API process; paired with the transition counter for browser request scope.
+    pub request_scope_instance_id: String,
     /// Changes whenever explicit authoring replaces the current session.
     pub current_live_session_epoch: Arc<AtomicU64>,
     #[cfg(test)]
@@ -124,6 +151,11 @@ pub(crate) struct AppState {
     /// Last successfully accepted runner frame or idle liveness tick.
     /// Status/admission use it for degraded/disconnected transitions.
     pub current_live_last_seen_unix_ms: Arc<AtomicU64>,
+    /// Last durably published preparation receipt for the active run.
+    /// Kept outside the runner snapshot so the receipt cannot be replaced by
+    /// a stale progress frame and remains available to the resource handler.
+    pub current_live_preparation_receipt:
+        Arc<RwLock<Option<fullmag_session::FmsPreparationReceipt>>>,
     /// Resource-first realtime events for `/v2/sessions/current/events/ws`.
     pub current_live_realtime_events: broadcast::Sender<CurrentLiveRealtimeEvent>,
     /// Bounded replay buffer for the resource-first realtime stream.
@@ -160,7 +192,8 @@ pub(crate) struct AppState {
     pub current_control_queue: Arc<Mutex<VecDeque<SessionCommand>>>,
     /// Recent idempotent command responses keyed by request identity.
     pub current_command_responses: Arc<Mutex<VecDeque<(String, CommandResponse)>>>,
-    /// Submission/dispatched ledger for resource-first command status endpoints.
+    /// Recovered projection of the durable command journal used by
+    /// resource-first command status endpoints.
     pub current_command_ledger: Arc<Mutex<VecDeque<TrackedCommandRecord>>>,
     /// Latest queued control sequence number.
     pub current_control_events: watch::Sender<u64>,
@@ -173,6 +206,20 @@ pub(crate) struct AppState {
     /// Session-bound authoritative frozen-spins preview metadata and dense mask backing.
     /// The mask is never serialized into status or another JSON control-plane resource.
     pub frozen_spins_previews: Arc<RwLock<crate::session::FrozenSpinsPreviewStore>>,
+}
+
+/// Immutable identity captured before an async current-workspace operation.
+///
+/// Legacy `/sessions/current` routes still expose a session-scoped adapter, so
+/// this pilot uses the durable session/run identity rather than pretending the
+/// mutable `current` pointer is a project context.  A handler must validate it
+/// again immediately before it reads or publishes state after an await.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CurrentLiveRequestContext {
+    pub session_id: String,
+    pub run_id: Option<String>,
+    pub session_epoch: u64,
+    pub request_scope_epoch: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -334,6 +381,8 @@ pub(crate) struct RunManifest {
     pub final_e_ani: Option<f64>,
     #[serde(default)]
     pub final_e_dmi: Option<f64>,
+    #[serde(default)]
+    pub final_e_rotated_dmi: Option<f64>,
     pub final_e_total: Option<f64>,
     pub artifact_dir: String,
 }
@@ -527,6 +576,8 @@ pub(crate) struct ScalarRow {
     pub e_ani: f64,
     #[serde(default)]
     pub e_dmi: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e_rotated_dmi: Option<f64>,
     pub e_total: f64,
     pub max_dm_dt: f64,
     pub max_h_eff: f64,
@@ -576,6 +627,8 @@ pub(crate) struct StepUpdateView {
     pub e_ani: f64,
     #[serde(default)]
     pub e_dmi: f64,
+    #[serde(default, alias = "E_rotated_dmi")]
+    pub e_rotated_dmi: f64,
     pub e_total: f64,
     pub max_dm_dt: f64,
     pub max_h_eff: f64,
@@ -653,6 +706,7 @@ impl StepUpdateView {
             e_ext: self.e_ext,
             e_ani: self.e_ani,
             e_dmi: self.e_dmi,
+            e_rotated_dmi: self.e_rotated_dmi,
             e_total: self.e_total,
             max_dm_dt: self.max_dm_dt,
             max_h_eff: self.max_h_eff,
@@ -1046,6 +1100,8 @@ pub(crate) struct ControlWaitQuery {
     pub timeout_ms: u64,
     #[serde(rename = "sessionId")]
     pub session_id: Option<String>,
+    #[serde(rename = "gridRefreshCommandId", default)]
+    pub grid_refresh_command_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1073,11 +1129,25 @@ pub(crate) struct ScriptSyncRequest {
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub(crate) struct ScriptSyncResponse {
+    /// Path of the file that received the canonical script. For a
+    /// `user_file` session this is the managed export copy, never the
+    /// user's own script.
     pub script_path: String,
     pub source_kind: String,
     pub entrypoint_kind: String,
     pub written: bool,
     pub bytes_written: usize,
+    /// `export_copy` (user file left untouched, copy written to managed
+    /// storage) or `script` (the session's managed script was written).
+    #[serde(default)]
+    pub written_to: String,
+    /// True only when the session's own source script file was rewritten.
+    /// Always false for `user_file` sessions.
+    #[serde(default)]
+    pub source_script_modified: bool,
+    /// Managed export copy path for `user_file` sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_copy_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -1085,6 +1155,31 @@ pub(crate) struct ScriptSourceResponse {
     pub script_path: String,
     pub source: String,
     pub bytes: usize,
+    /// Script origin of the session: `user_file`, `generated` or `none`.
+    #[serde(default)]
+    pub origin: String,
+    /// Managed export copy path for `user_file` sessions (the response
+    /// carries the copy when it exists, otherwise the read-only original).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_copy_path: Option<String>,
+}
+
+/// Where the current session's Python script comes from and whether Fullmag
+/// may write to it.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct SessionScriptSummary {
+    /// `user_file` (a file the user owns; Fullmag never writes it),
+    /// `generated` (a script inside Fullmag-managed storage) or `none`.
+    pub origin: String,
+    pub path: String,
+    /// False for `user_file`: syncs go to `managed_copy_path` instead.
+    pub writable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_copy_path: Option<String>,
+    /// Content hash of the script at the time of the request; only present on
+    /// `GET /v2/sessions/current`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1132,6 +1227,25 @@ pub(crate) struct CurrentLiveSnapshotRequest {
     /// are also accepted for backwards compatibility.
     #[serde(default)]
     pub fem_mesh: Option<FemMeshPayload>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CurrentLivePreparationReceiptRequest {
+    pub session_id: String,
+    pub receipt: fullmag_application::PreparationReceipt,
+}
+
+/// Internal bridge request for materializing preparation from the current
+/// immutable SceneDocument snapshot. ProblemIR is derived server-side through
+/// the canonical Python DSL so callers cannot substitute different physics.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CurrentLivePreparationMaterializationRequest {
+    pub session_id: String,
+    pub preparation_id: String,
+    pub scene_revision: u64,
+    pub requested_execution: fullmag_application::RequestedExecution,
+    pub display_projection: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1218,6 +1332,14 @@ pub(crate) struct StageExecutionRecord {
     pub mesh_revision: Option<u64>,
     #[serde(default)]
     pub started_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub applied_step: Option<u64>,
+    #[serde(default)]
+    pub completed_step: Option<u64>,
+    #[serde(default)]
+    pub applied_time_seconds: Option<f64>,
+    #[serde(default)]
+    pub segment_id: Option<String>,
     #[serde(default)]
     pub completed_at_unix_ms: Option<u64>,
     #[serde(default)]
@@ -1531,9 +1653,32 @@ mod tests {
     use super::*;
     use fullmag_authoring::scene_document_from_script_builder;
 
+    #[test]
+    fn legacy_scalar_row_without_rotated_dmi_keeps_component_missing() {
+        let row: ScalarRow = serde_json::from_value(serde_json::json!({
+            "step": 1,
+            "time": 0.0,
+            "solver_dt": 1.0e-12,
+            "mx": 0.0,
+            "my": 0.0,
+            "mz": 1.0,
+            "e_ex": 0.0,
+            "e_demag": 0.0,
+            "e_ext": 0.0,
+            "e_total": 0.0,
+            "max_dm_dt": 0.0,
+            "max_h_eff": 0.0,
+            "max_h_demag": 0.0
+        }))
+        .expect("legacy scalar row should remain readable");
+        assert_eq!(row.e_rotated_dmi, None);
+    }
+
     fn sample_builder() -> ScriptBuilderState {
         ScriptBuilderState {
             revision: 3,
+            execution_profile: None,
+            execution_layers: vec![],
             backend: None,
             requested_mode: Some("strict".to_string()),
             cpu_threads: None,
@@ -1543,6 +1688,7 @@ mod tests {
             demag_realization: None,
             fdm: None,
             external_field: None,
+            rotated_interfacial_dmi: None,
             solver: fullmag_authoring::ScriptBuilderSolverState {
                 integrator: "rk45".to_string(),
                 fixed_timestep: String::new(),
@@ -1596,6 +1742,8 @@ mod tests {
             domain_frame: None,
             stages: Vec::new(),
             study_pipeline: None,
+            table_autosave: None,
+            output_storage: None,
             initial_state: None,
             geometries: vec![fullmag_authoring::ScriptBuilderGeometryEntry {
                 name: "body".to_string(),
@@ -1758,6 +1906,20 @@ mod tests {
     }
 
     #[test]
+    fn control_wait_query_accepts_grid_refresh_command_pin() {
+        let query: ControlWaitQuery = serde_json::from_value(serde_json::json!({
+            "afterSeq": 4,
+            "timeoutMs": 1000,
+            "sessionId": "session-a",
+            "gridRefreshCommandId": "cmd-grid-a"
+        }))
+        .expect("control wait query should deserialize the internal grid refresh pin");
+
+        assert_eq!(query.after_seq, 4);
+        assert_eq!(query.grid_refresh_command_id.as_deref(), Some("cmd-grid-a"));
+    }
+
+    #[test]
     fn step_update_v2_uses_registry_metadata_for_magnetization() {
         let view = StepUpdateView {
             step: 12,
@@ -1769,6 +1931,7 @@ mod tests {
             e_ext: 0.0,
             e_ani: 0.0,
             e_dmi: 0.0,
+            e_rotated_dmi: 0.0,
             e_total: 0.0,
             max_dm_dt: 0.0,
             max_h_eff: 0.0,

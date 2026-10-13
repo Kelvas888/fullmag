@@ -882,6 +882,46 @@ describe("buildModelTree", () => {
     });
   });
 
+  it("keeps the published mesh identity visible after a failed candidate", () => {
+    const flattened = flattenExplorerNodes(
+      buildModelTree({
+        domainDiscretization: "fem",
+        mesh: {
+          lastError: "mesher rejected the candidate",
+          latestBuildStatus: "completed",
+          manifestSourceSceneRevision: 14,
+          meshName: "published-mesh",
+          meshRevision: 7,
+          sourceSceneRevision: 15,
+        },
+      }),
+    );
+
+    expect(flattened.find((node) => node.id === "model:mesh")).toMatchObject({
+      badge: "failed · retained published-mesh",
+      status: "mesh-failed",
+    });
+    expect(flattened.find((node) => node.id === "model:mesh:builds")).toMatchObject({
+      badge: "failed · retained rev 7",
+      status: "mesh-failed",
+    });
+
+    const unresolved = flattenExplorerNodes(
+      buildModelTree({
+        domainDiscretization: "fem",
+        mesh: {
+          lastError: "mesher rejected the candidate",
+          meshName: "unverified-mesh",
+          meshRevision: 8,
+        },
+      }),
+    );
+    expect(unresolved.find((node) => node.id === "model:mesh")).toMatchObject({
+      badge: "failed",
+      status: "mesh-failed",
+    });
+  });
+
   it("projects canonical SceneDocument objects into lifecycle-aware nodes", () => {
     const snapshot = modelTreeSnapshotFromScene({
       materials: [
@@ -3543,6 +3583,7 @@ describe("buildModelTree", () => {
       buildModelTree({ domainPresentation: fdmExplorerPresentation() }),
     );
     expect(nodes.find((node) => node.id === "model:mesh")).toMatchObject({
+      contextCommands: ["grid.build-fdm", "workspace.focus-selection"],
       kind: "mesh.root",
       label: "Mesh",
     });
@@ -3558,6 +3599,7 @@ describe("buildModelTree", () => {
       "model:mesh:mask", "model:mesh:provenance", "model:mesh:region:region%3Acore",
     ]));
     expect(nodes.find((node) => node.id === "model:mesh")?.contextCommands).toEqual([
+      "grid.build-fdm",
       "workspace.focus-selection",
     ]);
     for (const nodeId of [
@@ -3607,7 +3649,7 @@ describe("buildModelTree", () => {
       domainPresentationStatus: "error",
     }));
     expect(nodes.find((node) => node.id === "model:mesh")).toMatchObject({
-      kind: "mesh.root", status: "degraded", contextCommands: ["workspace.focus-selection"],
+      kind: "mesh.root", status: "degraded", contextCommands: ["grid.build-fdm", "workspace.focus-selection"],
     });
     expect(nodes.map((node) => node.kind)).not.toEqual(expect.arrayContaining([
       "mesh.unassigned", "airbox.root", "boundary-faces.root",
@@ -3928,6 +3970,11 @@ describe("buildModelTree", () => {
       kind: "airbox.root",
       label: "Airbox",
       status: "mesh-stale",
+    });
+    expect(
+      nodes.find((node) => node.id === "model:mesh:shared-domain"),
+    ).toMatchObject({
+      contextCommands: ["grid.build-fdm"],
     });
     expect(nodes.find((node) => node.id === "model:mesh")).toMatchObject({
       kind: "mesh.root",

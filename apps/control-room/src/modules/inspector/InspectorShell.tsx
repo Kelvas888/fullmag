@@ -5,15 +5,14 @@ import {
   Box,
   Focus,
   MoreHorizontal,
-  RotateCcw,
   BarChart2,
-  Check,
   Database,
   Gauge,
   Layers3,
+  PanelRightClose,
   Play,
 } from "lucide-react";
-import { useId, useLayoutEffect, useRef, type ReactNode } from "react";
+import { useLayoutEffect, useRef, type ReactNode } from "react";
 
 import { Badge } from "@/shared/ui/Badge";
 import { Button } from "@/shared/ui/Button";
@@ -25,17 +24,7 @@ import {
 } from "@/shared/ui/DropdownMenu";
 import { ScrollArea } from "@/shared/ui/ScrollArea";
 import { Tabs, TabsList, TabsTrigger } from "@/shared/ui/Tabs";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "@/shared/ui/Tooltip";
-
-import {
-  inspectorActionState,
-  useInspectorEditSession,
-} from "./InspectorEditSession";
+import { InspectorFooter } from "./InspectorFooter";
 import type { InspectorDescriptor } from "./inspectorDescriptor";
 import { resetInspectorScroll } from "./inspectorScroll";
 import {
@@ -45,10 +34,12 @@ import {
 } from "./InspectorTabState";
 
 interface InspectorShellProps {
+  focusDisabled?: boolean;
   children: ReactNode;
   descriptor: InspectorDescriptor;
   onFocus: () => void;
   onSelectBreadcrumb: (selection: NonNullable<InspectorDescriptor["breadcrumbs"][number]["selection"]>) => void;
+  onToggleVisibility: () => void;
 }
 
 function statusVariant(
@@ -72,16 +63,13 @@ function InspectorIdentityIcon({ icon }: Pick<InspectorDescriptor, "icon">) {
 }
 
 export function InspectorShell({
+  focusDisabled = false,
   children,
   descriptor,
   onFocus,
   onSelectBreadcrumb,
+  onToggleVisibility,
 }: InspectorShellProps) {
-  const editSession = useInspectorEditSession();
-  const actions = inspectorActionState(editSession);
-  const isolateReasonId = useId();
-  const resetReasonId = useId();
-  const applyReasonId = useId();
   const activeTab = useInspectorActiveTab();
   const contentRef = useRef<HTMLDivElement>(null);
   const nodeId = descriptor.metadata.find((item) => item.label === "Node")?.value;
@@ -139,28 +127,42 @@ export function InspectorShell({
               ) : null}
             </div>
           </div>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                aria-label="Inspector options"
-                className="fm-inspector__options-button"
-                size="icon"
-                variant="ghost"
-              >
-                <MoreHorizontal size={16} aria-hidden="true" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem
-                disabled={!nodeId}
-                onSelect={() => {
-                  if (nodeId) void navigator.clipboard?.writeText(nodeId);
-                }}
-              >
-                Copy node ID
-              </DropdownMenuItem>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <div className="fm-inspector__header-actions">
+            <Button
+              aria-label="Hide Inspector"
+              className="fm-inspector__panel-toggle"
+              data-panel-toggle="inspector"
+              size="icon"
+              title="Hide Inspector"
+              type="button"
+              variant="ghost"
+              onClick={onToggleVisibility}
+            >
+              <PanelRightClose size={16} aria-hidden="true" />
+            </Button>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button
+                  aria-label="Inspector options"
+                  className="fm-inspector__options-button"
+                  size="icon"
+                  variant="ghost"
+                >
+                  <MoreHorizontal size={16} aria-hidden="true" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="end">
+                <DropdownMenuItem
+                  disabled={!nodeId}
+                  onSelect={() => {
+                    if (nodeId) void navigator.clipboard?.writeText(nodeId);
+                  }}
+                >
+                  Copy node ID
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </div>
         </div>
         {descriptor.metadata.length > 0 ? (
           <dl className="fm-inspector__metadata-grid">
@@ -192,95 +194,7 @@ export function InspectorShell({
         <div className="fm-inspector__body">{children}</div>
       </ScrollArea>
 
-      <footer className="fm-inspector__action-bar">
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                className="fm-inspector__action-btn"
-                size="sm"
-                variant="secondary"
-                onClick={onFocus}
-              >
-                <Focus size={14} aria-hidden="true" />
-                Focus
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Focus viewport on this selection</TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span
-                aria-describedby={isolateReasonId}
-                className="fm-inspector__action-tooltip-target"
-                role="note"
-                tabIndex={0}
-              >
-                <Button
-                  className="fm-inspector__action-btn"
-                  size="sm"
-                  variant="secondary"
-                  disabled
-                >
-                  <BarChart2 size={14} aria-hidden="true" />
-                  Isolate
-                </Button>
-              </span>
-            </TooltipTrigger>
-            <TooltipContent id={isolateReasonId}>Isolation is not available for this selection.</TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span
-                aria-describedby={!actions.canReset ? resetReasonId : undefined}
-                className="fm-inspector__action-tooltip-target"
-                tabIndex={!actions.canReset ? 0 : -1}
-              >
-                <Button
-                  className="fm-inspector__action-btn"
-                  disabled={!actions.canReset}
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => void editSession?.reset()}
-                >
-                  <RotateCcw size={14} aria-hidden="true" />
-                  Reset
-                </Button>
-              </span>
-            </TooltipTrigger>
-            <TooltipContent id={resetReasonId}>
-              {actions.canReset ? "Reset to the last applied state" : actions.applyReason}
-            </TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-        <TooltipProvider>
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <span
-                aria-describedby={!actions.canApply ? applyReasonId : undefined}
-                className="fm-inspector__action-tooltip-target"
-                tabIndex={!actions.canApply ? 0 : -1}
-              >
-                <Button
-                  className="fm-inspector__action-btn fm-inspector__action-btn--apply"
-                  disabled={!actions.canApply}
-                  size="sm"
-                  variant="primary"
-                  onClick={() => void editSession?.apply()}
-                >
-                  <Check size={14} aria-hidden="true" />
-                  {editSession?.applying ? "Applying…" : "Apply"}
-                </Button>
-              </span>
-            </TooltipTrigger>
-            <TooltipContent id={applyReasonId}>{actions.applyReason ?? "Apply changes"}</TooltipContent>
-          </Tooltip>
-        </TooltipProvider>
-      </footer>
+      <InspectorFooter key={descriptorKey} focusDisabled={focusDisabled} onFocus={onFocus} />
     </section>
   );
 }

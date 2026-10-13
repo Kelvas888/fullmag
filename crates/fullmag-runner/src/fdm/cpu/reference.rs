@@ -60,12 +60,45 @@ use crate::types::{
     LiveStepConsumer, RunError, RunResult, RunStatus, StateObservables, StepAction, StepStats,
     StepUpdate,
 };
+#[cfg(test)]
+use crate::FDM_CPU_ACCEPTED_STATE_SNAPSHOT_SCHEMA;
+use crate::{FdmCpuAcceptedStateSnapshotV1, FDM_CPU_ACCEPTED_STATE_SNAPSHOT_FILE};
 
 use sha2::{Digest, Sha256};
 use std::time::Instant;
 
 const MAX_COUPLED_ADAPTIVE_REJECTIONS: u64 = 50;
 const FDM_ABM3_RUNNER_CHECKPOINT_SCHEMA: &str = "fullmag.fdm.cpu.abm3-checkpoint.v1";
+fn fdm_cpu_accepted_state_snapshot(
+    plan: &FdmPlanIR,
+    accepted_step: u64,
+    time_seconds: f64,
+    dt_seconds: Option<f64>,
+    transactional_state_digest: &str,
+    magnetization: &[[f64; 3]],
+) -> Result<Option<FdmCpuAcceptedStateSnapshotV1>, RunError> {
+    // The transactional CPU digest covers magnetization, integrator memory,
+    // and the accepted thermal RNG interval. Coupled transport and Frozen
+    // Spins own additional primary carriers, so this lane must stay unavailable
+    // until those carriers are supplied explicitly.
+    if !plan.spin_transport_plans.is_empty() || plan.frozen_spins.is_some() {
+        return Ok(None);
+    }
+    let clock = crate::ObservationClock {
+        accepted_step,
+        time_seconds,
+        dt_seconds,
+    };
+    FdmCpuAcceptedStateSnapshotV1::from_transactional_state(
+        clock,
+        transactional_state_digest,
+        magnetization,
+    )
+    .map(Some)
+    .map_err(|error| RunError {
+        message: format!("materializing FDM CPU accepted state snapshot: {error}"),
+    })
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -843,6 +876,7 @@ fn build_reference_problem(plan: &FdmPlanIR) -> Result<ExchangeLlgProblem, RunEr
                         .unwrap_or([0.0, 1.0, 0.0]),
                 }),
             interfacial_dmi: plan.interfacial_dmi,
+            rotated_interfacial_dmi: plan.rotated_interfacial_dmi,
             bulk_dmi: plan.bulk_dmi,
             zhang_li_stt: build_zl_stt(plan),
             slonczewski_stt: build_slon_stt(plan, plan.cell_size[2]),
@@ -2403,6 +2437,14 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
         .map_err(|error| RunError {
             message: format!("CPU FDM transaction checkpoint digest: {error}"),
         })?;
+    let accepted_state_snapshot = fdm_cpu_accepted_state_snapshot(
+        plan,
+        step_count,
+        state.time_seconds,
+        (!is_direct_minimization && last_solver_dt > 0.0).then_some(last_solver_dt),
+        &checkpoint_digest,
+        state.magnetization(),
+    )?;
     let mut final_provenance = artifacts.provenance_snapshot();
     if let Some(fft_execution) = final_provenance.fdm_fft_execution.as_mut() {
         let telemetry = fft_workspace.telemetry();
@@ -2541,6 +2583,14 @@ pub(crate) fn execute_reference_fdm_with_coupled_checkpoint(
             relative_path: "solver/fdm_cpu_abm3_checkpoint.v1.json".to_string(),
             bytes: serde_json::to_vec_pretty(&checkpoint).map_err(|error| RunError {
                 message: format!("serializing final FDM CPU ABM3 checkpoint artifact: {error}"),
+            })?,
+        });
+    }
+    if let Some(snapshot) = accepted_state_snapshot {
+        auxiliary_artifacts.push(crate::types::AuxiliaryArtifact {
+            relative_path: FDM_CPU_ACCEPTED_STATE_SNAPSHOT_FILE.to_string(),
+            bytes: serde_json::to_vec_pretty(&snapshot).map_err(|error| RunError {
+                message: format!("serializing FDM CPU accepted state snapshot: {error}"),
             })?,
         });
     }
@@ -3100,6 +3150,10 @@ fn observe_state_with_antenna_field(
         );
     }
     let anisotropy_field = problem.anisotropy_field(state.magnetization());
+    let conventional_dmi_field = conventional_dmi_field(problem, state.magnetization());
+    let rotated_dmi_field = problem.rotated_interfacial_dmi_field(state.magnetization());
+    let rotated_dmi_energy =
+        problem.rotated_interfacial_dmi_energy_from_vectors(state.magnetization());
 
     let torque_field = compute_torque_field(
         &observables.magnetization,
@@ -3123,7 +3177,11 @@ fn observe_state_with_antenna_field(
         drive_field,
         effective_field,
         anisotropy_field,
-        dmi_field: observables.dmi_field,
+        // `H_dmi` is the conventional interfacial+bulk observable.  The
+        // rotated-interfacial contribution has its own explicit field
+        // observable and remains part of `H_eff` assembled by the engine.
+        dmi_field: conventional_dmi_field,
+        rotated_dmi_field,
         magnetoelastic_field: Vec::new(),
         cubic_anisotropy_field: Vec::new(),
         bulk_dmi_field: Vec::new(),
@@ -3135,6 +3193,7 @@ fn observe_state_with_antenna_field(
         drive_energy,
         anisotropy_energy: observables.anisotropy_energy_joules,
         dmi_energy: observables.dmi_energy_joules,
+        rotated_dmi_energy,
         total_energy: observables.total_energy_joules,
         max_dm_dt: observables.max_rhs_amplitude,
         max_rhs_all_norm_per_s: observables.max_rhs_all_amplitude,
@@ -3144,6 +3203,22 @@ fn observe_state_with_antenna_field(
         max_torque_all_Apm: max_torque_all_apm,
         per_object_scalars: std::collections::HashMap::new(),
     })
+}
+
+fn conventional_dmi_field(problem: &ExchangeLlgProblem, magnetization: &[Vector3]) -> Vec<Vector3> {
+    let interfacial = problem.interfacial_dmi_field(magnetization);
+    let bulk = problem.bulk_dmi_field(magnetization);
+    interfacial
+        .into_iter()
+        .zip(bulk)
+        .map(|(interfacial, bulk)| {
+            [
+                interfacial[0] + bulk[0],
+                interfacial[1] + bulk[1],
+                interfacial[2] + bulk[2],
+            ]
+        })
+        .collect()
 }
 
 fn reconstruct_inactive_fdm_visual_effective_field(
@@ -3215,6 +3290,7 @@ fn make_step_stats_from_report(
 ) -> StepStats {
     let drive_field = problem.regional_drive_field_at_time(report.time_seconds);
     let drive_energy = regional_drive_energy(problem, magnetization, &drive_field);
+    let rotated_dmi_energy = problem.rotated_interfacial_dmi_energy_from_vectors(magnetization);
     let mut stats = StepStats {
         step,
         time: report.time_seconds,
@@ -3224,7 +3300,6 @@ fn make_step_stats_from_report(
         e_ext: report.external_energy_joules,
         e_drive: drive_energy,
         e_ani: report.anisotropy_energy_joules,
-        e_dmi: report.dmi_energy_joules,
         e_total: report.total_energy_joules,
         max_dm_dt: report.max_rhs_amplitude,
         max_rhs_norm_per_s: report.max_rhs_amplitude,
@@ -3237,6 +3312,11 @@ fn make_step_stats_from_report(
         wall_time_ns,
         ..StepStats::default()
     };
+    stats.set_dmi_energy_components(
+        report.dmi_energy_joules - rotated_dmi_energy,
+        0.0,
+        rotated_dmi_energy,
+    );
     apply_average_m_to_step_stats_with_active_mask(
         &mut stats,
         magnetization,
@@ -3318,7 +3398,6 @@ fn make_step_stats(
         e_ext: observables.external_energy,
         e_drive: observables.drive_energy,
         e_ani: observables.anisotropy_energy,
-        e_dmi: observables.dmi_energy,
         e_total: observables.total_energy,
         max_dm_dt: observables.max_dm_dt,
         max_rhs_norm_per_s: observables.max_dm_dt,
@@ -3331,6 +3410,11 @@ fn make_step_stats(
         wall_time_ns,
         ..StepStats::default()
     };
+    stats.set_dmi_energy_components(
+        observables.dmi_energy - observables.rotated_dmi_energy,
+        0.0,
+        observables.rotated_dmi_energy,
+    );
     apply_average_m_to_step_stats_with_active_mask(
         &mut stats,
         &observables.magnetization,
@@ -3357,6 +3441,7 @@ fn direct_field_values_available(name: &str) -> bool {
             | "H_ext"
             | "H_ani"
             | "H_dmi"
+            | "H_rotated_dmi"
             | "H_oe"
             | "H_OE"
             | "H_ant"
@@ -3374,6 +3459,7 @@ fn direct_scalar_values_available(name: &str) -> bool {
             | "eden_ext"
             | "eden_ani"
             | "eden_dmi"
+            | "eden_rotated_dmi"
             | "eden_total"
             | "mat_ms"
             | "mat_aex"
@@ -3390,6 +3476,7 @@ struct DirectFieldSnapshotCache<'a> {
     external_field: Option<Vec<Vector3>>,
     anisotropy_field: Option<Vec<Vector3>>,
     dmi_field: Option<Vec<Vector3>>,
+    rotated_dmi_field: Option<Vec<Vector3>>,
     oersted_field: Option<Vec<Vector3>>,
     antenna_field_cache: Option<Vec<Vector3>>,
     effective_field: Option<Vec<Vector3>>,
@@ -3418,6 +3505,7 @@ impl<'a> DirectFieldSnapshotCache<'a> {
             external_field: None,
             anisotropy_field: None,
             dmi_field: None,
+            rotated_dmi_field: None,
             oersted_field: None,
             antenna_field_cache: None,
             effective_field: None,
@@ -3485,6 +3573,9 @@ impl<'a> DirectFieldSnapshotCache<'a> {
                 .map_err(|error| RunError {
                     message: format!("CPU FDM snapshot '{}': DMI energy density: {}", name, error),
                 }),
+            "eden_rotated_dmi" => Ok(self
+                .problem
+                .rotated_interfacial_dmi_energy_density_from_vectors(self.state.magnetization())),
             "eden_total" => {
                 let mut total = vec![0.0; self.state.magnetization().len()];
                 for quantity in ["eden_ex", "eden_demag", "eden_ext", "eden_ani", "eden_dmi"] {
@@ -3577,19 +3668,24 @@ impl<'a> DirectFieldSnapshotCache<'a> {
             }
             "H_dmi" => {
                 if self.dmi_field.is_none() {
-                    self.dmi_field =
-                        Some(
-                            self.problem
-                                .dmi_field(self.state)
-                                .map_err(|error| RunError {
-                                    message: format!(
-                                        "CPU FDM snapshot '{}': DMI field: {}",
-                                        name, error
-                                    ),
-                                })?,
-                        );
+                    self.dmi_field = Some(conventional_dmi_field(
+                        self.problem,
+                        self.state.magnetization(),
+                    ));
                 }
                 Ok(self.dmi_field.as_deref().expect("cached DMI field"))
+            }
+            "H_rotated_dmi" => {
+                if self.rotated_dmi_field.is_none() {
+                    self.rotated_dmi_field = Some(
+                        self.problem
+                            .rotated_interfacial_dmi_field(self.state.magnetization()),
+                    );
+                }
+                Ok(self
+                    .rotated_dmi_field
+                    .as_deref()
+                    .expect("cached rotated DMI field"))
             }
             "H_oe" | "H_OE" => {
                 if self.oersted_field.is_none() {
@@ -3804,6 +3900,182 @@ mod tests {
             bulk_dmi: None,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn fdm_cpu_accepted_state_snapshot_is_content_bound_and_strictly_scoped() {
+        let plan = make_test_plan();
+        let first = fdm_cpu_accepted_state_snapshot(
+            &plan,
+            5,
+            5.0e-14,
+            Some(1.0e-14),
+            &format!("sha256:{}", "a".repeat(64)),
+            &plan.initial_magnetization,
+        )
+        .expect("accepted state snapshot")
+        .expect("supported simple FDM CPU lane");
+        let changed = fdm_cpu_accepted_state_snapshot(
+            &plan,
+            5,
+            5.0e-14,
+            Some(1.0e-14),
+            &format!("sha256:{}", "b".repeat(64)),
+            &plan.initial_magnetization,
+        )
+        .expect("changed accepted state snapshot")
+        .expect("supported simple FDM CPU lane");
+
+        assert_eq!(first.schema_version, FDM_CPU_ACCEPTED_STATE_SNAPSHOT_SCHEMA);
+        first.validate().expect("valid strict lane snapshot");
+        assert_eq!(first.clock.accepted_step, 5);
+        assert_eq!(
+            first.primary_carrier_ids,
+            ["fdm.cpu.transactional-state-digest.v1"]
+        );
+        assert_eq!(first.clock_digest, changed.clock_digest);
+        assert_ne!(first.state_digest, changed.state_digest);
+
+        let invalid = fdm_cpu_accepted_state_snapshot(
+            &plan,
+            5,
+            5.0e-14,
+            Some(1.0e-14),
+            "not-a-digest",
+            &plan.initial_magnetization,
+        )
+        .expect_err("noncanonical carrier digest must fail closed");
+        assert!(invalid.message.contains("transactional_state_digest"));
+
+        let mut frozen = plan;
+        frozen.frozen_spins = Some(resolved_frozen_spins_test_plan(vec![false; 16]));
+        assert!(fdm_cpu_accepted_state_snapshot(
+            &frozen,
+            5,
+            5.0e-14,
+            Some(1.0e-14),
+            &format!("sha256:{}", "a".repeat(64)),
+            &frozen.initial_magnetization,
+        )
+        .expect("unsupported lane remains unavailable")
+        .is_none());
+    }
+
+    #[test]
+    fn simple_fdm_cpu_lane_emits_accepted_state_snapshot_from_final_transactional_state() {
+        let plan = make_test_plan();
+        let executed = execute_reference_fdm(&plan, 2.0e-14, &[], None, None)
+            .expect("simple FDM CPU execution");
+        let artifact = executed
+            .auxiliary_artifacts
+            .iter()
+            .find(|artifact| artifact.relative_path == FDM_CPU_ACCEPTED_STATE_SNAPSHOT_FILE)
+            .expect("accepted state snapshot artifact");
+        let snapshot: FdmCpuAcceptedStateSnapshotV1 =
+            serde_json::from_slice(&artifact.bytes).expect("strict accepted state snapshot");
+        let transaction = executed
+            .provenance
+            .fdm_cpu_step_transaction_telemetry
+            .as_ref()
+            .expect("FDM CPU transaction telemetry");
+        let recomputed = crate::accepted_state_digests(
+            snapshot.clock,
+            &[crate::AcceptedPrimaryCarrier {
+                carrier_id: "fdm.cpu.transactional-state-digest.v1",
+                canonical_bytes: transaction.checkpoint_digest.as_bytes(),
+            }],
+        )
+        .expect("recompute accepted state digest from the lane carrier");
+
+        assert_eq!(
+            snapshot.clock.accepted_step,
+            transaction.accepted_step_count
+        );
+        assert_eq!(snapshot.clock_digest, recomputed.clock_digest);
+        assert_eq!(snapshot.state_digest, recomputed.state_digest);
+        assert_eq!(snapshot.clock.time_seconds, 2.0e-14);
+        assert_eq!(snapshot.clock.dt_seconds, Some(1.0e-14));
+    }
+
+    #[test]
+    fn reference_problem_materializes_rotated_interfacial_dmi_from_plan() {
+        let mut plan = make_test_plan();
+        plan.enable_exchange = false;
+        plan.rotated_interfacial_dmi = Some(3.0e-3);
+        plan.initial_magnetization = (0..16)
+            .map(|flat| {
+                let x = (flat % 4) as f64;
+                let y = (flat / 4) as f64;
+                [0.2 + 0.1 * x, -0.3 + 0.2 * y, 0.4 - 0.05 * x + 0.03 * y]
+            })
+            .collect();
+
+        let problem = build_reference_problem(&plan).expect("reference problem should build");
+        let state = problem
+            .new_state(plan.initial_magnetization.clone())
+            .expect("reference state should build");
+
+        assert_eq!(problem.terms.rotated_interfacial_dmi, Some(3.0e-3));
+        let rotated_field = problem.rotated_interfacial_dmi_field(state.magnetization());
+        assert!(
+            rotated_field
+                .iter()
+                .flatten()
+                .any(|component| component.abs() > 0.0),
+            "active rotated DMI must contribute to the FDM CPU effective field"
+        );
+        assert_eq!(
+            problem.effective_field(&state).expect("effective field"),
+            rotated_field
+        );
+
+        let observables = observe_state(&problem, &state).expect("runner observables");
+        assert_eq!(observables.rotated_dmi_field, rotated_field);
+        assert!(observables
+            .dmi_field
+            .iter()
+            .flatten()
+            .all(|component| *component == 0.0));
+        assert_eq!(observables.effective_field, rotated_field);
+        assert_eq!(
+            observables.rotated_dmi_energy,
+            problem.rotated_interfacial_dmi_energy_from_vectors(state.magnetization())
+        );
+        assert_eq!(
+            select_state_observable_field(&observables, "H_rotated_dmi", true)
+                .expect("scheduled rotated DMI field"),
+            rotated_field
+        );
+
+        let mut direct = DirectFieldSnapshotCache::new(&problem, &state);
+        assert_eq!(
+            direct
+                .select("H_rotated_dmi")
+                .expect("direct rotated DMI field"),
+            rotated_field
+        );
+        assert!(direct
+            .select("H_dmi")
+            .expect("conventional DMI field")
+            .iter()
+            .flatten()
+            .all(|component| *component == 0.0));
+        let density = direct
+            .select_scalar("eden_rotated_dmi")
+            .expect("direct rotated DMI energy density");
+        let integrated = density.iter().sum::<f64>() * problem.cell_size.volume();
+        assert!((integrated - observables.rotated_dmi_energy).abs() <= 1.0e-24);
+        let integrated_total = direct
+            .select_scalar("eden_total")
+            .expect("total energy density")
+            .iter()
+            .sum::<f64>()
+            * problem.cell_size.volume();
+        assert!((integrated_total - observables.total_energy).abs() <= 1.0e-24);
+
+        let stats = make_step_stats(0, 0.0, 1.0e-14, 0, &observables, &problem);
+        assert_eq!(stats.e_rotated_dmi, observables.rotated_dmi_energy);
+        assert_eq!(stats.e_dmi, observables.dmi_energy);
     }
 
     fn resolved_frozen_spins_test_plan(mask: Vec<bool>) -> ResolvedFrozenSpinsPlanIR {
@@ -4220,6 +4492,7 @@ mod tests {
             source_hash: None,
             execution_mode: fullmag_ir::ExecutionMode::Strict,
             layout: serde_json::json!({"kind": "fdm", "cell_count": 16}),
+            magnetization_field_semantics: Ok(None),
             execution_resolution: None,
         };
         let mut pipeline =

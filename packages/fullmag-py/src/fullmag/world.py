@@ -32,11 +32,14 @@ Multi-magnet example::
 from __future__ import annotations
 
 import copy
+import asyncio
 import math
+import threading
 import warnings
 from dataclasses import dataclass, field, replace
+from contextvars import ContextVar, Token
 from pathlib import Path
-from typing import Any, Callable, Literal, Mapping, Sequence, cast
+from typing import Any, Callable, Generic, Literal, Mapping, Sequence, TypeVar, cast
 
 from fullmag._progress import emit_progress
 from fullmag._validation import (
@@ -72,6 +75,7 @@ from fullmag.model.energy import (
     Demag,
     Exchange,
     InterfacialDMI,
+    RotatedInterfacialDMI,
     OerstedCylinder,
     OerstedField,
     TimeDependence,
@@ -107,6 +111,9 @@ from fullmag.model.planar_monitor import (
     PlanarMonitor,
     StudyMonitorRegistry,
 )
+from fullmag.model.output_storage import OutputStorage
+from fullmag.model.compute_resources import ComputeResources
+from fullmag.model.execution_profile import ExecutionProfile, ExecutionRequestLayer
 from fullmag.model.study import (
     DEFAULT_RELAXATION_TORQUE_TOLERANCE_T,
     AdaptiveRefinement,
@@ -151,6 +158,11 @@ from fullmag.model.problem import (
     Problem,
     resolve_geometry_sources,
     RuntimeSelection,
+)
+from fullmag.model.parameters import (
+    ParameterDefinition,
+    ParameterExpression,
+    ParameterLibrary,
 )
 from fullmag.model.discretization import (
     FDM,
@@ -310,12 +322,15 @@ class RegionRegistry:
         self._owner = owner
 
     def __iter__(self):
+        self._owner._assert_active_context()
         return iter(self._owner._object_regions)
 
     def __len__(self) -> int:
+        self._owner._assert_active_context()
         return len(self._owner._object_regions)
 
     def __contains__(self, key: object) -> bool:
+        self._owner._assert_active_context()
         try:
             self[key]  # type: ignore[index]
             return True
@@ -323,6 +338,7 @@ class RegionRegistry:
             return False
 
     def __getitem__(self, key: int | str) -> ObjectRegion:
+        self._owner._assert_active_context()
         if isinstance(key, int):
             return self._owner._object_regions[key]
         if not isinstance(key, str):
@@ -333,15 +349,19 @@ class RegionRegistry:
         raise KeyError(key)
 
     def keys(self) -> tuple[str, ...]:
+        self._owner._assert_active_context()
         return tuple(region.name for region in self._owner._object_regions)
 
     def values(self) -> tuple[ObjectRegion, ...]:
+        self._owner._assert_active_context()
         return tuple(self._owner._object_regions)
 
     def items(self) -> tuple[tuple[str, ObjectRegion], ...]:
+        self._owner._assert_active_context()
         return tuple((region.name, region) for region in self._owner._object_regions)
 
     def allocate_region_id(self, name: str) -> str:
+        self._owner._assert_active_context()
         require_non_empty(name, "name")
         candidate = f"{self._owner._name}:r{self._owner._next_region_id_index}"
         while (
@@ -355,6 +375,7 @@ class RegionRegistry:
         return candidate
 
     def reserve_region_id(self, region_id: str) -> str:
+        self._owner._assert_active_context()
         region_id = require_non_empty(region_id, "region_id")
         if (
             region_id in self._owner._allocated_region_ids
@@ -439,6 +460,7 @@ class AlphaControl:
 
     @property
     def value(self) -> float:
+        self._owner._assert_active_context()
         return self._owner._alpha_value
 
     def absorbing_boundary(
@@ -452,6 +474,7 @@ class AlphaControl:
         profile: str | None = None,
         frame: str | None = None,
     ) -> AbsorbingBoundaryLayer:
+        self._owner._assert_active_context()
         if parameters is not None:
             if any(
                 value is not None
@@ -487,21 +510,26 @@ class AlphaControl:
         return layer
 
     def __float__(self) -> float:
+        self._owner._assert_active_context()
         return self.value
 
     def __repr__(self) -> str:
+        self._owner._assert_active_context()
         return repr(self.value)
 
     def __str__(self) -> str:
+        self._owner._assert_active_context()
         return str(self.value)
 
     def __eq__(self, other: object) -> bool:
+        self._owner._assert_active_context()
         try:
             return self.value == float(other)  # type: ignore[arg-type]
         except (TypeError, ValueError):
             return False
 
     def __format__(self, spec: str) -> str:
+        self._owner._assert_active_context()
         return format(self.value, spec)
 
 
@@ -524,6 +552,7 @@ class MagnetHandle:
         *,
         object_id: str | None = None,
     ) -> None:
+        object.__setattr__(self, "_owner_state", _state.current())
         self._shape = shape
         self._name = name
         self._object_id = (
@@ -554,15 +583,31 @@ class MagnetHandle:
         self._material_parameter_assignments: list[MaterialParameterAssignment] = []
         self.regions = RegionRegistry(self)
 
+    def __setattr__(self, name: str, value: object) -> None:
+        """Fence public mutations to the context that created this handle."""
+        if not name.startswith("_"):
+            owner_state = self.__dict__.get("_owner_state")
+            if owner_state is not None:
+                self._assert_active_context()
+        object.__setattr__(self, name, value)
+
+    def _assert_active_context(self) -> None:
+        if _state.current() is not self._owner_state:
+            raise RuntimeError(
+                f"magnet handle '{self._name}' belongs to a different authoring context"
+            )
+
     def __repr__(self) -> str:
         return f"MagnetHandle({self._name!r}, Ms={self.Ms}, Aex={self.Aex}, m={self._m_value!r})"
 
     @property
     def object_id(self) -> str | None:
+        self._assert_active_context()
         return self._object_id
 
     @property
     def m(self) -> "MagnetizationHandle":
+        self._assert_active_context()
         return self._m_proxy
 
     @m.setter
@@ -571,6 +616,7 @@ class MagnetHandle:
 
     @property
     def alpha(self) -> AlphaControl:
+        self._assert_active_context()
         return self._alpha_control
 
     @alpha.setter
@@ -582,6 +628,7 @@ class MagnetHandle:
 
     @property
     def dind(self) -> float | None:
+        self._assert_active_context()
         return self.Dind
 
     @dind.setter
@@ -590,6 +637,7 @@ class MagnetHandle:
 
     @property
     def dbulk(self) -> float | None:
+        self._assert_active_context()
         return self.Dbulk
 
     @dbulk.setter
@@ -598,6 +646,7 @@ class MagnetHandle:
 
     def _resolved_geometry(self) -> object:
         """Return geometry with a stable per-magnet geometry asset name."""
+        self._assert_active_context()
         geom = self._shape
         if hasattr(geom, "name"):
             import copy
@@ -608,6 +657,7 @@ class MagnetHandle:
 
     def _to_ferromagnet(self) -> Ferromagnet:
         """Convert to class-based Ferromagnet."""
+        self._assert_active_context()
         if self.Ms is None:
             raise ValueError(f"Magnet '{self._name}': Ms not set")
         if self.Aex is None:
@@ -663,6 +713,7 @@ class MagnetHandle:
         priority: int = 0,
         realization_policy: str = "inherit",
     ) -> ObjectRegion:
+        self._assert_active_context()
         if name in self.regions:
             raise ValueError(f"Magnet '{self._name}' already has a region named {name!r}")
         resolved_region_id = (
@@ -680,11 +731,13 @@ class MagnetHandle:
             priority=priority,
             realization_policy=realization_policy,
         )
+        region._context_guard = self._assert_active_context
         region._delete_callback = lambda region_id=region.region_id: self.remove_region(region_id)
         self._object_regions.append(region)
         return region
 
     def remove_region(self, region: ObjectRegion | str | int) -> ObjectRegion:
+        self._assert_active_context()
         index, resolved = self._resolve_region_index(region)
         removed = self._object_regions.pop(index)
         removed._delete_callback = None
@@ -697,6 +750,7 @@ class MagnetHandle:
         return removed
 
     def rename_region(self, region: ObjectRegion | str | int, name: str) -> ObjectRegion:
+        self._assert_active_context()
         _, resolved = self._resolve_region_index(region)
         new_name = require_non_empty(name, "name")
         if new_name != resolved.name and new_name in self.regions:
@@ -707,6 +761,7 @@ class MagnetHandle:
         return resolved
 
     def reorder_region(self, region: ObjectRegion | str | int, index: int) -> ObjectRegion:
+        self._assert_active_context()
         current_index, resolved = self._resolve_region_index(region)
         count = len(self._object_regions)
         target = int(index)
@@ -719,6 +774,7 @@ class MagnetHandle:
         return resolved
 
     def _resolve_region_index(self, region: ObjectRegion | str | int) -> tuple[int, ObjectRegion]:
+        self._assert_active_context()
         if isinstance(region, ObjectRegion):
             for index, candidate in enumerate(self._object_regions):
                 if candidate is region:
@@ -745,6 +801,7 @@ class MagnetHandle:
         priority: int = 0,
         conflict_policy: str = "error",
     ) -> "MagnetHandle":
+        self._assert_active_context()
         field = value if isinstance(value, MaterialParameterField) else MaterialParameterField.constant(value, unit=unit)
         if isinstance(region, ObjectRegion):
             region_id = region.region_id
@@ -770,6 +827,7 @@ class MagnetHandle:
         return self
 
     def surface(self, selector: str) -> CouplingEndpoint:
+        self._assert_active_context()
         return CouplingEndpoint.surface(self._name, selector)
 
     def visualization(
@@ -833,6 +891,7 @@ class MagnetHandle:
         field_component:
             Field component to display: ``"x"``, ``"y"``, ``"z"``, ``"magnitude"``.
         """
+        self._assert_active_context()
         _VALID_SURFACE_COLOR_SOURCE = {
             "solid", "orientation", "component_x", "component_y",
             "component_z", "magnitude", "colormap",
@@ -914,6 +973,7 @@ class MagnetHandle:
         sample: int = -1,
         mode: str = "auto",
     ):
+        self._assert_active_context()
         from fullmag.init import load_field_state
 
         quantity_id = _normalize_quantity_name(getattr(quantity, "name", quantity or "m"))
@@ -940,6 +1000,7 @@ class MagnetHandle:
         dataset: str | None = None,
         units: str | None = None,
     ) -> Path:
+        self._assert_active_context()
         from fullmag.init import FieldState, SampledMagnetization, save_field_state
 
         quantity_id = _normalize_quantity_name(getattr(quantity, "name", quantity or "m"))
@@ -977,21 +1038,26 @@ class MagnetizationHandle:
 
     @property
     def value(self) -> Any:
+        self._owner._assert_active_context()
         return self._owner._m_value
 
     @property
     def table_expression(self) -> str:
         """Stable object-scoped table expression used by ``study.tableadd``."""
+        self._owner._assert_active_context()
         return f"{self._owner._name}.m"
 
     def get(self) -> Any:
+        self._owner._assert_active_context()
         return self._owner._m_value
 
     def set(self, value: Any) -> Any:
+        self._owner._assert_active_context()
         self._owner._m_value = value
         return value
 
     def clear(self) -> None:
+        self._owner._assert_active_context()
         self._owner._m_value = None
 
     def loadfile(
@@ -1002,6 +1068,7 @@ class MagnetizationHandle:
         dataset: str | None = None,
         sample: int = -1,
     ):
+        self._owner._assert_active_context()
         from fullmag.init import load_magnetization
 
         state = load_magnetization(path, format=format, dataset=dataset, sample=sample)
@@ -1015,6 +1082,7 @@ class MagnetizationHandle:
         format: str = "auto",
         dataset: str = "values",
     ) -> Path:
+        self._owner._assert_active_context()
         from fullmag.init import SampledMagnetization, save_magnetization
 
         value = self._owner._m_value
@@ -1028,9 +1096,11 @@ class MagnetizationHandle:
         return save_magnetization(path, value, format=format, dataset=dataset)
 
     def __bool__(self) -> bool:
+        self._owner._assert_active_context()
         return self._owner._m_value is not None
 
     def __repr__(self) -> str:
+        self._owner._assert_active_context()
         return repr(self._owner._m_value)
 
 
@@ -1668,6 +1738,7 @@ class GeometryMeshHandle:
         exact_layer_count : bool, optional
             Require the requested through-thickness element count exactly.
         """
+        self._owner._assert_active_context()
         if source is not None:
             raise ValueError(
                 "per-object mesh source is unavailable; use FEM(mesh=...) for "
@@ -1890,6 +1961,7 @@ class GeometryMeshHandle:
             flower.mesh.algorithm(dim3=10)  # HXT for 3D
             flower.mesh.algorithm(dim2=6, dim3=1)  # Frontal-Delaunay 2D, Delaunay 3D
         """
+        self._owner._assert_active_context()
         if dim2 is not None:
             self._owner._mesh_spec.algorithm_2d = dim2
         if dim3 is not None:
@@ -1912,17 +1984,20 @@ class GeometryMeshHandle:
                 ZMin=-5e-9, ZMax=5e-9,
             )
         """
+        self._owner._assert_active_context()
         self._owner._mesh_spec.size_fields.append({"kind": kind, "params": dict(params)})
         return self
 
     def build(self) -> "GeometryMeshHandle":
+        self._owner._assert_active_context()
         self._owner._mesh_spec.build_requested = True
-        if _capture_enabled:
+        if _capture_binding.current().enabled:
             return self
         _build_explicit_mesh_assets(_include_mesh_ir=False)
         return self
 
     def optimize(self, method: str | None = None, iterations: int = 1) -> "GeometryMeshHandle":
+        self._owner._assert_active_context()
         self._owner._mesh_spec.operations.append(
             _MeshOperationSpec(
                 kind="optimize",
@@ -1932,12 +2007,14 @@ class GeometryMeshHandle:
         return self
 
     def refine(self, steps: int = 1) -> "GeometryMeshHandle":
+        self._owner._assert_active_context()
         self._owner._mesh_spec.operations.append(
             _MeshOperationSpec(kind="refine", params={"steps": steps})
         )
         return self
 
     def smooth(self, iterations: int = 1) -> "GeometryMeshHandle":
+        self._owner._assert_active_context()
         self._owner._mesh_spec.operations.append(
             _MeshOperationSpec(kind="smooth", params={"iterations": iterations})
         )
@@ -1976,6 +2053,7 @@ class GeometryMeshHandle:
         exact_layers : bool, optional
             Require the realized mesh to preserve exactly ``elements`` layers.
         """
+        self._owner._assert_active_context()
         layer_count = _element_layer_count(
             elements,
             context=f"{self._owner._name}.mesh.swept.elements",
@@ -2089,6 +2167,7 @@ class GeometryMeshHandle:
         preset. ``topology="prismatic"`` requests strict P1 prism layers with
         a pyramid-to-tetrahedra shared-domain transition.
         """
+        self._owner._assert_active_context()
         layer_count = _element_layer_count(
             layers,
             context=f"{self._owner._name}.mesh.thin_film.layers",
@@ -2301,6 +2380,7 @@ class GeometryMeshHandle:
         Returns the ``MeshQualityReport`` from the most recent ``build()`` call,
         or ``None`` if quality extraction was not requested.
         """
+        self._owner._assert_active_context()
         return self._owner._last_mesh_quality
 
 
@@ -2381,7 +2461,7 @@ class StudyUniverseConfig:
 
 
 # ---------------------------------------------------------------------------
-# World state singleton
+# Context-bound world state
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -2414,10 +2494,12 @@ class _WorldState:
     _domain_object_region_markers: list[dict[str, object]] | None = None
     _frozen_magnetic_submesh_source: dict[str, object] | None = None
     _extra_runtime_metadata: dict[str, object] = field(default_factory=dict)
+    _legacy_execution_selection_calls: set[str] = field(default_factory=set)
     _exchange_enabled: bool = True
     _demag_enabled: bool = True
     _demag_realization: str | None = None
     _thermal_noise: ThermalNoise | None = None
+    _parameters: ParameterLibrary = field(default_factory=ParameterLibrary)
 
     # Magnets (ordered)
     _magnets: list[MagnetHandle] = field(default_factory=list)
@@ -2455,6 +2537,7 @@ class _WorldState:
     _spin_torque_activation: dict[str, bool] = field(default_factory=dict)
     _spin_transports: list[SpinDriftDiffusion] = field(default_factory=list)
     _oersted_terms: list[OerstedCylinder | OerstedField] = field(default_factory=list)
+    _explicit_energy_terms: list[RotatedInterfacialDMI] = field(default_factory=list)
     _excitation_analysis: SpinWaveExcitationAnalysis | None = None
     _last_result: Any | None = None
     _last_step: Any | None = None
@@ -2483,10 +2566,6 @@ class _WorldState:
     _magnetization_constraints: list[FrozenSpins] = field(default_factory=list)
 
 
-# Module-level singleton
-_state = _WorldState()
-_capture_enabled = False
-_capture_skip_geometry_assets = False
 _RELAXATION_DEFAULT_TORQUE_TOLERANCE_APM = DEFAULT_RELAXATION_TORQUE_TOLERANCE_APM
 _RELAXATION_DEFAULT_TORQUE_TOLERANCE_T = DEFAULT_RELAXATION_TORQUE_TOLERANCE_T
 _RELAX_UNSET = object()
@@ -2502,6 +2581,163 @@ class CapturedStage:
     output_every_seconds: float | None = None
     table_autosave: TableAutosave | None = None
     autosave: StageAutosave | None = None
+
+
+@dataclass
+class _CaptureState:
+    enabled: bool = False
+    skip_geometry_assets: bool = False
+    stages: list[CapturedStage] = field(default_factory=list)
+
+
+_ContextValue = TypeVar("_ContextValue")
+
+
+def _execution_owner() -> tuple[int, int | None]:
+    """Return the thread/task owner of the active authoring context.
+
+    ``ContextVar`` values are inherited by newly-created asyncio tasks.  A
+    mutable ``_WorldState`` must not follow that inheritance by reference:
+    otherwise two request tasks can append objects to the same flat script.
+    The owner stamp lets the binding fork a fresh state at the first access in
+    the child task while preserving normal single-task flat-script behavior.
+    """
+
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    return (threading.get_ident(), id(task) if task is not None else None)
+
+
+@dataclass
+class _ContextSlot(Generic[_ContextValue]):
+    value: _ContextValue
+    owner: tuple[int, int | None]
+
+
+class _ContextBinding(Generic[_ContextValue]):
+    """ContextVar binding that forks inherited mutable values by owner."""
+
+    def __init__(self, name: str, factory: Callable[[], _ContextValue]) -> None:
+        self._factory = factory
+        self._var: ContextVar[_ContextSlot[_ContextValue] | None] = ContextVar(
+            name,
+            default=None,
+        )
+
+    def current(self) -> _ContextValue:
+        slot = self._var.get()
+        owner = _execution_owner()
+        if slot is None or slot.owner != owner:
+            slot = _ContextSlot(self._factory(), owner)
+            self._var.set(slot)
+        return slot.value
+
+    def replace(self, value: _ContextValue) -> None:
+        self._var.set(_ContextSlot(value, _execution_owner()))
+
+    def bind(self, value: _ContextValue) -> Token[_ContextSlot[_ContextValue] | None]:
+        return self._var.set(_ContextSlot(value, _execution_owner()))
+
+    def reset(self, token: Token[_ContextSlot[_ContextValue] | None]) -> None:
+        self._var.reset(token)
+
+
+class _WorldStateBinding:
+    """Attribute-compatible proxy preserving the legacy ``world._state`` name."""
+
+    def __init__(self) -> None:
+        self._binding = _ContextBinding("fullmag_world_state", _WorldState)
+
+    def current(self) -> _WorldState:
+        return self._binding.current()
+
+    def replace(self, state: _WorldState | None = None) -> None:
+        self._binding.replace(state if state is not None else _WorldState())
+
+    def bind(self, state: _WorldState) -> Token[_ContextSlot[_WorldState] | None]:
+        return self._binding.bind(state)
+
+    def reset(self, token: Token[_ContextSlot[_WorldState] | None]) -> None:
+        self._binding.reset(token)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.current(), name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name == "_binding":
+            object.__setattr__(self, name, value)
+            return
+        setattr(self.current(), name, value)
+
+    def __repr__(self) -> str:
+        return repr(self.current())
+
+
+_state = _WorldStateBinding()
+_capture_binding = _ContextBinding("fullmag_capture_state", _CaptureState)
+
+
+class ExecutionContext:
+    """Isolated authoring context for the compatible flat Python DSL.
+
+    A context owns a fresh mutable world and capture state.  Entering a nested
+    context binds it for the current thread/task; leaving it restores the
+    previous binding even when the body raises.  The legacy module-level DSL
+    continues to use the current context when no explicit block is needed.
+    """
+
+    def __init__(self) -> None:
+        self._state = _WorldState()
+        self._state_token: Token[_ContextSlot[_WorldState] | None] | None = None
+        self._capture_token: Token[_ContextSlot[_CaptureState] | None] | None = None
+
+    @property
+    def state(self) -> _WorldState:
+        """Return this context's owned mutable state for diagnostics."""
+
+        return self._state
+
+    def _assert_active(self) -> None:
+        if _state.current() is not self._state:
+            raise RuntimeError(
+                "ExecutionContext materialization requires its active authoring context"
+            )
+
+    def materialize_problem(self, **kwargs: Any) -> Problem:
+        """Build an immutable :class:`Problem` from this context's definition.
+
+        Authoring calls only accumulate definition state.  This explicit
+        boundary performs the existing lowering/validation step and remains
+        bound to the context that owns the authored handles; it does not run a
+        solver or invoke the mesh asset builder.
+        """
+
+        self._assert_active()
+        return _build_problem(**kwargs)
+
+    def __enter__(self) -> "ExecutionContext":
+        if self._state_token is not None:
+            raise RuntimeError("ExecutionContext cannot be entered twice concurrently")
+        self._state_token = _state.bind(self._state)
+        self._capture_token = _capture_binding.bind(_CaptureState())
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> bool:
+        if self._capture_token is None or self._state_token is None:
+            raise RuntimeError("ExecutionContext exit without a matching enter")
+        _capture_binding.reset(self._capture_token)
+        _state.reset(self._state_token)
+        self._capture_token = None
+        self._state_token = None
+        return False
+
+
+def execution_context() -> ExecutionContext:
+    """Create an isolated context for concurrent or nested authoring."""
+
+    return ExecutionContext()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2577,8 +2813,6 @@ class SaveStateStageSpec:
     dataset: str | None = None
 
 
-_captured_stages: list[CapturedStage] = []
-
 _MU_0 = 4.0e-7 * math.pi
 _MU_B = 9.274_010_078_3e-24
 _HBAR = 1.054_571_817e-34
@@ -2590,6 +2824,7 @@ _SCALAR_QUANTITY_ATTRS: Mapping[str, str] = {
     "E_ext": "e_ext",
     "E_ani": "e_ani",
     "E_dmi": "e_dmi",
+    "E_rotated_dmi": "e_rotated_dmi",
     "E_total": "e_total",
     "mx": "mx",
     "my": "my",
@@ -2609,6 +2844,7 @@ _VECTOR_QUANTITIES = {
     "H_eff",
     "H_ani",
     "H_dmi",
+    "H_rotated_dmi",
     "H_mel",
     "H_ani_cubic",
     "H_dmi_bulk",
@@ -3479,6 +3715,7 @@ E_demag = QuantityHandle("E_demag", kind="scalar")
 E_ext = QuantityHandle("E_ext", kind="scalar")
 E_ani = QuantityHandle("E_ani", kind="scalar")
 E_dmi = QuantityHandle("E_dmi", kind="scalar")
+E_rotated_dmi = QuantityHandle("E_rotated_dmi", kind="scalar")
 E_total = QuantityHandle("E_total", kind="scalar")
 mx = QuantityHandle("mx", kind="scalar")
 my = QuantityHandle("my", kind="scalar")
@@ -3589,39 +3826,34 @@ def _normalize_domain_region_markers(
 
 def reset() -> None:
     """Reset world state to defaults (useful between scripts)."""
-    global _state
-    _state = _WorldState()
+    _state.replace()
 
 
 def begin_script_capture(source_root: str | Path | None = None) -> None:
     """Enable loader capture mode for flat scripts."""
-    global _capture_enabled, _captured_stages, _capture_skip_geometry_assets
     reset()
     _state._script_source_root = Path(source_root).resolve() if source_root is not None else None
-    _capture_enabled = True
-    _capture_skip_geometry_assets = False
-    _captured_stages = []
+    capture = _capture_binding.current()
+    capture.enabled = True
+    capture.skip_geometry_assets = False
+    capture.stages.clear()
 
 
 def set_script_capture_lightweight_assets(enabled: bool) -> None:
-    global _capture_skip_geometry_assets
-    _capture_skip_geometry_assets = bool(enabled)
+    _capture_binding.current().skip_geometry_assets = bool(enabled)
 
 
 def finish_script_capture() -> list[CapturedStage]:
     """Return captured flat-script execution data and clear capture mode."""
-    global _capture_enabled, _captured_stages, _capture_skip_geometry_assets
-    captured = list(_captured_stages)
-    _capture_enabled = False
-    _capture_skip_geometry_assets = False
-    _captured_stages = []
+    captured = list(_capture_binding.current().stages)
+    _capture_binding.replace(_CaptureState())
     reset()
     return captured
 
 
 def capture_workspace_problem() -> Problem | None:
     """Materialize the current flat-script world without requiring run()/relax()."""
-    if not _capture_enabled or not _state._magnets:
+    if not _capture_binding.current().enabled or not _state._magnets:
         return None
     previous_interactive = _state._interactive
     _state._interactive = True
@@ -3632,7 +3864,7 @@ def capture_workspace_problem() -> Problem | None:
 
 
 def capture_declared_stages() -> list[CapturedStage]:
-    if not _capture_enabled:
+    if not _capture_binding.current().enabled:
         return []
     return list(_state._declared_stages)
 
@@ -4541,6 +4773,11 @@ class StudyStagesBuilder:
         return self
 
     def change_device(self, device: str) -> "StudyStagesBuilder":
+        if "execution_profile" in _state._extra_runtime_metadata:
+            raise ValueError(
+                "execution_profile_change_device_stage_conflict: use per-step profile "
+                "references in StudyPlan instead of change_device stages"
+            )
         normalized = _normalize_stage_device(device)
         _state._declared_stages.append(
             CapturedStage(
@@ -5293,6 +5530,123 @@ class StudyFieldDriveRegistry:
         return tuple(_state._field_drives)
 
 
+class StudyEnergyTermRegistry:
+    """Explicit global energy terms that do not belong to material handles."""
+
+    def add(self, term: RotatedInterfacialDMI) -> RotatedInterfacialDMI:
+        if not isinstance(term, RotatedInterfacialDMI):
+            raise TypeError(
+                "study.terms.add() currently requires RotatedInterfacialDMI"
+            )
+        if any(
+            isinstance(existing, RotatedInterfacialDMI)
+            for existing in _state._explicit_energy_terms
+        ):
+            raise ValueError("rotated_interfacial_dmi may be authored only once")
+        _state._explicit_energy_terms.append(term)
+        return term
+
+    def items(self) -> tuple[RotatedInterfacialDMI, ...]:
+        return tuple(_state._explicit_energy_terms)
+
+
+def _validate_compute_resources_runtime_intent(
+    compute_resources: object,
+    *,
+    device: str,
+    cpu_threads: int | None,
+    gpu_count: int,
+    device_index: int | None,
+) -> None:
+    """Reject contradictory typed resource and legacy runtime requests."""
+    if not isinstance(compute_resources, dict):
+        return
+
+    cpu = compute_resources.get("cpu")
+    if cpu_threads is not None and isinstance(cpu, dict):
+        if cpu.get("threads") != cpu_threads:
+            raise ValueError(
+                "execution_intent_conflict: runtime_selection.cpu_threads differs "
+                "from compute_resources.cpu.threads"
+            )
+
+    gpu = compute_resources.get("gpu")
+    if not isinstance(gpu, dict):
+        return
+    if device == "cpu":
+        raise ValueError(
+            "execution_intent_conflict: GPU resources contradict runtime_selection.device=cpu"
+        )
+    if gpu_count > 0 and gpu.get("devices_per_task") != gpu_count:
+        raise ValueError(
+            "execution_intent_conflict: runtime_selection.gpu_count differs from "
+            "compute_resources.gpu.devices_per_task"
+        )
+    device_uuids = gpu.get("device_uuids")
+    if (
+        isinstance(device_uuids, (list, tuple))
+        and device_uuids
+        and device_index is not None
+    ):
+        raise ValueError(
+            "execution_intent_conflict: GPU UUID selector and legacy ordinal require "
+            "explicit inventory resolution"
+        )
+
+
+def _validate_current_compute_resources_runtime_intent() -> None:
+    _validate_compute_resources_runtime_intent(
+        _state._extra_runtime_metadata.get("compute_resources"),
+        device=_state._device,
+        cpu_threads=_state._cpu_threads,
+        gpu_count=_state._gpu_count,
+        device_index=_state._device_index,
+    )
+
+
+def _check_legacy_execution_selection_call(selection: str) -> None:
+    if "execution_profile" in _state._extra_runtime_metadata:
+        raise ValueError(
+            "execution_profile_selection_conflict: legacy "
+            f"{selection} selection cannot be combined with study.execution_profile(); "
+            "put the requested value in an ExecutionRequestLayer"
+        )
+
+
+def _record_legacy_execution_selection(selection: str) -> None:
+    _state._legacy_execution_selection_calls.add(selection)
+
+
+def _check_execution_profile_declaration_order() -> None:
+    if _state._legacy_execution_selection_calls:
+        selections = ", ".join(sorted(_state._legacy_execution_selection_calls))
+        raise ValueError(
+            "execution_profile_selection_conflict: declare the profile before legacy "
+            f"execution selections ({selections}); use ExecutionRequestLayer values instead"
+        )
+    declared_stages = _state._declared_stages
+    captured_stages = _capture_binding.current().stages
+    if declared_stages or captured_stages:
+        if any(
+            isinstance(stage.action, Mapping)
+            and stage.action.get("kind") == "change_device"
+            for stage in (*declared_stages, *captured_stages)
+        ):
+            raise ValueError(
+                "execution_profile_change_device_stage_conflict: declare the profile "
+                "before stages; use per-step profile references in StudyPlan"
+            )
+        raise ValueError(
+            "execution_profile_order_conflict: declare the profile before solver or "
+            "pipeline stages; use per-step profile references in StudyPlan"
+        )
+    if _state._last_result is not None:
+        raise ValueError(
+            "execution_profile_order_conflict: declare the profile before direct "
+            "solver execution"
+        )
+
+
 class StudyBuilder:
     """Study-root facade over the current script-local world state."""
 
@@ -5300,6 +5654,7 @@ class StudyBuilder:
         _state._api_surface = "study"
         self.stages = StudyStagesBuilder()
         self.field_drives = StudyFieldDriveRegistry()
+        self.terms = StudyEnergyTermRegistry()
         self.monitors = StudyMonitorRegistry(_state._planar_monitors)
         self.universe = StudyUniverseHandle(self)
         self.airbox = StudyAirboxHandle(self)
@@ -5313,6 +5668,25 @@ class StudyBuilder:
     def name(self, problem_name: str) -> "StudyBuilder":
         name(problem_name)
         return self
+
+    def parameter(
+        self,
+        parameter_name: str,
+        value: object,
+        *,
+        unit: str = "1",
+        display_unit: str | None = None,
+        description: str | None = None,
+    ) -> ParameterDefinition:
+        """Declare one versioned authoring parameter in this study."""
+
+        return parameter(
+            parameter_name,
+            value,
+            unit=unit,
+            display_unit=display_unit,
+            description=description,
+        )
 
     def load(
         self,
@@ -5340,8 +5714,50 @@ class StudyBuilder:
         engine(backend)
         return self
 
+    def execution_profile(
+        self,
+        profile: ExecutionProfile,
+        *,
+        layers: Sequence[ExecutionRequestLayer] = (),
+    ) -> "StudyBuilder":
+        """Attach an immutable profile and explicit layers for shared materialization."""
+        if not isinstance(profile, ExecutionProfile):
+            raise TypeError("execution_profile() requires an ExecutionProfile value")
+        _check_execution_profile_declaration_order()
+        if isinstance(layers, (str, bytes)) or not isinstance(layers, Sequence):
+            raise TypeError("execution_profile() layers must be a sequence of ExecutionRequestLayer")
+        layer_values = list(layers)
+        if any(not isinstance(layer, ExecutionRequestLayer) for layer in layer_values):
+            raise TypeError("execution_profile() layers must contain ExecutionRequestLayer values")
+        profile_ir = profile.to_ir()
+        layers_ir = [layer.to_ir() for layer in layer_values]
+        _state._extra_runtime_metadata["execution_profile"] = profile_ir
+        if layers_ir:
+            _state._extra_runtime_metadata["execution_layers"] = layers_ir
+        else:
+            _state._extra_runtime_metadata.pop("execution_layers", None)
+        return self
+
     def device(self, spec: str, *, precision: str | None = None) -> "StudyBuilder":
-        device(spec, precision=precision)
+        previous = (
+            _state._device,
+            _state._gpu_count,
+            _state._device_index,
+            _state._precision,
+        )
+        previous_selection_calls = set(_state._legacy_execution_selection_calls)
+        try:
+            device(spec, precision=precision)
+            _validate_current_compute_resources_runtime_intent()
+        except Exception:
+            (
+                _state._device,
+                _state._gpu_count,
+                _state._device_index,
+                _state._precision,
+            ) = previous
+            _state._legacy_execution_selection_calls = previous_selection_calls
+            raise
         return self
 
     def mode(self, execution_mode: str) -> "StudyBuilder":
@@ -5349,7 +5765,63 @@ class StudyBuilder:
         return self
 
     def threads(self, cpu_threads: int) -> "StudyBuilder":
-        threads(cpu_threads)
+        previous = _state._cpu_threads
+        previous_selection_calls = set(_state._legacy_execution_selection_calls)
+        try:
+            threads(cpu_threads)
+            _validate_current_compute_resources_runtime_intent()
+        except Exception:
+            _state._cpu_threads = previous
+            _state._legacy_execution_selection_calls = previous_selection_calls
+            raise
+        return self
+
+    def resources(self, value: ComputeResources) -> "StudyBuilder":
+        """Set the typed compute-resource request preserved in ProblemIR."""
+        if not isinstance(value, ComputeResources):
+            raise TypeError("resources() requires a ComputeResources value")
+        _check_legacy_execution_selection_call("resources")
+        request = value.to_ir()
+        _validate_compute_resources_runtime_intent(
+            request,
+            device=_state._device,
+            cpu_threads=_state._cpu_threads,
+            gpu_count=_state._gpu_count,
+            device_index=_state._device_index,
+        )
+        _state._extra_runtime_metadata["compute_resources"] = request
+        _record_legacy_execution_selection("resources")
+        return self
+
+    def storage(
+        self,
+        output_storage: OutputStorage | None = None,
+        *,
+        output_dir: str | None = None,
+        temp_dir: str | None = None,
+        data_format: str | None = None,
+        cleanup: str | None = None,
+        existing_output: str | None = None,
+    ) -> "StudyBuilder":
+        """Set this study's result directory, data format, and scratch policy."""
+        if output_storage is not None and any(
+            value is not None
+            for value in (output_dir, temp_dir, data_format, cleanup, existing_output)
+        ):
+            raise ValueError("pass either OutputStorage or storage fields, not both")
+        if output_storage is None:
+            output_storage = OutputStorage(
+                output_dir=output_dir,
+                temp_dir=temp_dir,
+                data_format=data_format if data_format is not None else "zarr",
+                cleanup=cleanup if cleanup is not None else "on_success",
+                existing_output=(
+                    existing_output if existing_output is not None else "timestamp"
+                ),
+            )
+        elif not isinstance(output_storage, OutputStorage):
+            raise TypeError("output_storage must be an OutputStorage value")
+        _state._extra_runtime_metadata["output_storage"] = output_storage.to_ir()
         return self
 
     def fem_demag_solver(
@@ -5689,10 +6161,18 @@ class StudyBuilder:
 
     def tableautosave(
         self,
-        every: SamplingPeriod,
+        every: SamplingPeriod | None = None,
         quantities: Sequence[str] | None = None,
+        *,
+        every_steps: int | None = None,
+        table_id: str = "default",
     ) -> "StudyBuilder":
-        tableautosave(every, quantities=quantities)
+        tableautosave(
+            every,
+            quantities=quantities,
+            every_steps=every_steps,
+            table_id=table_id,
+        )
         return self
 
     def tableadd(self, expression: object) -> "StudyBuilder":
@@ -6030,8 +6510,8 @@ def frequency_response(
         frequency_solver_policy=solver_policy,
     )
 
-    if _capture_enabled:
-        _captured_stages.append(
+    if _capture_binding.current().enabled:
+        _capture_binding.current().stages.append(
             CapturedStage(
                 problem=problem,
                 entrypoint_kind="flat_frequency_response",
@@ -6040,6 +6520,7 @@ def frequency_response(
         )
         return problem
 
+    _guard_profile_direct_execution()
     result = Simulation(problem).run()
     _record_result(result)
     return result
@@ -6050,6 +6531,36 @@ def study(problem_name: str | None = None) -> StudyBuilder:
     if problem_name is not None:
         require_non_empty(problem_name, "problem_name")
     return StudyBuilder(problem_name)
+
+
+def parameter(
+    parameter_name: str,
+    value: object,
+    *,
+    unit: str = "1",
+    display_unit: str | None = None,
+    description: str | None = None,
+) -> ParameterDefinition:
+    """Declare a versioned SI-normalized authoring parameter.
+
+    A numeric ``value`` is converted to a constant expression using ``unit``.
+    Callers can pass :class:`ParameterExpression` for references or arithmetic.
+    The definition is stored in the current context and lowered into
+    ``ProblemIR`` when a problem is materialized.
+    """
+
+    if isinstance(value, ParameterExpression):
+        if unit != "1":
+            raise ValueError("unit is only accepted for numeric parameter values")
+        expression = value
+    else:
+        expression = ParameterExpression.constant(value, unit=unit)
+    return _state._parameters.define(
+        parameter_name,
+        expression,
+        display_unit=display_unit,
+        description=description,
+    )
 
 
 def demag(
@@ -6109,7 +6620,9 @@ def thermal_noise(temperature: float, *, seed: int | None = None) -> ThermalNois
 
 def engine(backend: str) -> None:
     """Set computation backend: ``"fdm"``, ``"fem"``, or ``"auto"``."""
+    _check_legacy_execution_selection_call("backend")
     _state._backend = backend.lower()
+    _record_legacy_execution_selection("backend")
 
 
 def device(spec: str, *, precision: str | None = None) -> None:
@@ -6121,6 +6634,7 @@ def device(spec: str, *, precision: str | None = None) -> None:
         fm.device("cuda:0")
         fm.device("cuda:0", precision="single")
     """
+    _check_legacy_execution_selection_call("device")
     spec = spec.lower()
     if spec == "cpu":
         _state._device = "cpu"
@@ -6139,22 +6653,29 @@ def device(spec: str, *, precision: str | None = None) -> None:
         _state._device = spec
     if precision is not None:
         _state._precision = precision.lower()
+    _record_legacy_execution_selection("device")
+    if precision is not None:
+        _record_legacy_execution_selection("precision")
 
 
 def mode(execution_mode: str) -> None:
     """Set execution policy: ``"strict"``, ``"extended"``, or ``"hybrid"``."""
+    _check_legacy_execution_selection_call("mode")
     normalized = str(execution_mode).strip().lower()
     if normalized not in {"strict", "extended", "hybrid"}:
         raise ValueError("execution_mode must be 'strict', 'extended', or 'hybrid'")
     _state._execution_mode = normalized
+    _record_legacy_execution_selection("mode")
 
 
 def threads(cpu_threads: int) -> None:
     """Set requested CPU thread count for the next run."""
+    _check_legacy_execution_selection_call("threads")
     resolved = int(cpu_threads)
     if resolved < 1:
         raise ValueError("threads() requires cpu_threads >= 1")
     _state._cpu_threads = resolved
+    _record_legacy_execution_selection("threads")
 
 
 def fem_demag_solver(
@@ -6528,7 +7049,7 @@ def fem_order(order: int) -> None:
 def build_mesh() -> None:
     """Materialize the shared FEM mesh asset for the current flat-script model."""
     _state._default_mesh_spec.build_requested = True
-    if _capture_enabled:
+    if _capture_binding.current().enabled:
         return
     _build_explicit_mesh_assets(_include_mesh_ir=False)
 
@@ -6734,6 +7255,11 @@ def adaptive_mesh(
 def runtime_metadata(key: str, value: object) -> None:
     """Attach script-owned runtime metadata to the exported problem."""
     normalized_key = require_non_empty(str(key), "runtime_metadata key")
+    if normalized_key in {"execution_profile", "execution_layers"}:
+        raise ValueError(
+            "execution profile metadata must be authored with "
+            "study.execution_profile()"
+        )
     _state._extra_runtime_metadata[normalized_key] = copy.deepcopy(value)
 
 
@@ -8127,6 +8653,7 @@ _SCALAR_QUANTITIES = {
     "E_ext",
     "E_ani",
     "E_dmi",
+    "E_rotated_dmi",
     "E_total",
     "time",
     "step",
@@ -8265,6 +8792,7 @@ def tableautosave(
     quantities: Sequence[str] | None = None,
     *,
     every_steps: int | None = None,
+    table_id: str = "default",
 ) -> None:
     """Configure a mumax-style scalar table autosave cadence.
 
@@ -8276,6 +8804,7 @@ def tableautosave(
         t_sampl=every,
         every_steps=every_steps,
         quantities=quantities,
+        table_id=table_id,
     )
 
 
@@ -8508,6 +9037,8 @@ def _build_problem(
     """Construct a Problem from the current world state."""
     s = _state
 
+    _validate_current_compute_resources_runtime_intent()
+
     # ── Validate ──
     if not s._magnets:
         raise ValueError("No magnets defined — call fm.geometry(...) first")
@@ -8531,6 +9062,7 @@ def _build_problem(
         if h.Dbulk is not None:
             energy.append(BulkDMI(D=h.Dbulk))
             break
+    energy.extend(s._explicit_energy_terms)
     if s._b_ext is not None:
         energy.append(Zeeman(B=s._b_ext))
     energy.extend(s._oersted_terms)
@@ -8763,6 +9295,7 @@ def _build_problem(
         geometry_asset_cache=s._geometry_asset_cache,
         magnetization_constraints=tuple(s._magnetization_constraints),
         pbc=s._pbc,
+        parameters=s._parameters if s._parameters.names else None,
     )
 
 
@@ -8770,14 +9303,26 @@ def _build_problem(
 # Run / Relax
 # ---------------------------------------------------------------------------
 
+def _guard_profile_direct_execution() -> None:
+    if (
+        "execution_profile" in _state._extra_runtime_metadata
+        and not _capture_binding.current().enabled
+    ):
+        raise RuntimeError(
+            "execution_profile_requires_shared_materialization: eager Python solver "
+            "execution cannot resolve a profile; submit the authored IR through the "
+            "shared application materializer"
+        )
+
+
 def run(until: float) -> Any:
     """Build the problem and run until the given simulation time."""
     if until <= 0.0:
         raise ValueError("run(until) requires a positive stop time")
     from fullmag.runtime import Simulation
     problem = _build_problem()
-    if _capture_enabled:
-        _captured_stages.append(
+    if _capture_binding.current().enabled:
+        _capture_binding.current().stages.append(
             CapturedStage(
                 problem=problem,
                 entrypoint_kind="flat_run",
@@ -8785,6 +9330,7 @@ def run(until: float) -> Any:
             )
         )
         return problem
+    _guard_profile_direct_execution()
     result = Simulation(problem).run(until=until)
     _record_result(result)
     return result
@@ -8815,6 +9361,7 @@ def run_while(
     * At least one guard (`max_time` or `max_steps`) is required.
     * `max_steps` guards the accumulated solver steps across all chunks.
     """
+    _guard_profile_direct_execution()
     relax_kwargs: dict[str, object] = {}
     relax_fn = globals()["relax"]
     if kwargs:
@@ -8873,7 +9420,7 @@ def run_while(
                 call_kwargs[key] = relax_kwargs[key]
         return call_kwargs
 
-    if _capture_enabled:
+    if _capture_binding.current().enabled:
         if cfg.relax:
             initial_dt = _safe_step_value(_state._last_step, "dt", 1e-13)
             dt_ref = initial_dt if initial_dt > 0.0 else 1e-13
@@ -9084,8 +9631,8 @@ def relax(
         ]
         problem = dataclasses.replace(problem, magnets=new_magnets)
 
-    if _capture_enabled:
-        _captured_stages.append(
+    if _capture_binding.current().enabled:
+        _capture_binding.current().stages.append(
             CapturedStage(
                 problem=problem,
                 entrypoint_kind="flat_relax",
@@ -9094,6 +9641,7 @@ def relax(
         )
         return problem
 
+    _guard_profile_direct_execution()
     if isinstance(problem.study, Relaxation):
         until_seconds = _relaxation_default_until_seconds(problem.study)
     else:
@@ -9231,8 +9779,8 @@ def eigenmodes(
         eigen_magnetostatic_bc=magnetostatic_bc,
     )
 
-    if _capture_enabled:
-        _captured_stages.append(
+    if _capture_binding.current().enabled:
+        _capture_binding.current().stages.append(
             CapturedStage(
                 problem=problem,
                 entrypoint_kind="flat_eigenmodes",
@@ -9241,6 +9789,7 @@ def eigenmodes(
         )
         return problem
 
+    _guard_profile_direct_execution()
     result = Simulation(problem).run()
     _record_result(result)
     return result

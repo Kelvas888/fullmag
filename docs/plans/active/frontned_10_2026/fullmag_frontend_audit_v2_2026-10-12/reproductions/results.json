@@ -1,0 +1,94 @@
+{
+  "commit": "2a3c6becb9c7e111ae1497ec0cd9ac9576acba95",
+  "scope": "isolated JS source-equivalent and expression-level reproductions, no React/WebGL/backend",
+  "node": "v22.16.0",
+  "count": 7,
+  "results": [
+    {
+      "id": "R01",
+      "description": "ACK poprzedniego gestu usuwa podgląd nowszego gestu",
+      "outcome": "REPRODUCED_IN_ISOLATED_MODEL",
+      "actual": "draft=null while pointer 2 still owns an active gesture",
+      "expected": "old ACK must not clear gesture 2"
+    },
+    {
+      "id": "R02",
+      "description": "Klik osi bez ruchu nadal wywołuje commit",
+      "outcome": "REPRODUCED_IN_ISOLATED_MODEL",
+      "actual": {
+        "commitCount": 1,
+        "payload": [
+          1,
+          2,
+          3
+        ]
+      },
+      "expected": "no-op should not submit a model mutation"
+    },
+    {
+      "id": "R03",
+      "description": "Błąd transportu z end() jest propagowany jako odrzucona Promise",
+      "outcome": "REPRODUCED_IN_ISOLATED_MODEL",
+      "actual": "end rejects; UI handler invokes it using void and no catch in the inspected chain",
+      "expected": "recoverable error state and retained draft; no unhandled rejection"
+    },
+    {
+      "id": "R04",
+      "description": "Puste współrzędne stają się zerem w Number(value)",
+      "outcome": "REPRODUCED_IN_ISOLATED_MODEL",
+      "actual": [
+        {
+          "input": "",
+          "parsed": 0,
+          "finite": true
+        },
+        {
+          "input": "   ",
+          "parsed": 0,
+          "finite": true
+        }
+      ],
+      "expected": "empty required coordinate is invalid, not zero",
+      "source": "geometryObjectPanelModel.ts — numeric conversion expression"
+    },
+    {
+      "id": "R05",
+      "description": "Bazowa rewizja szkicu nie wynika automatycznie z nowego baseDraft",
+      "outcome": "REPRODUCED_IN_ISOLATED_MODEL",
+      "actual": {
+        "draftRevision": 10,
+        "sceneRevision": 11
+      },
+      "expected": "acknowledged draft baseline should advance to revision 11",
+      "scope": "expression-level model; not React integration test"
+    },
+    {
+      "id": "R06",
+      "description": "Freshness klasyfikuje przyszłą rewizję meshu jako current",
+      "outcome": "REPRODUCED_IN_ISOLATED_MODEL",
+      "actual": {
+        "sceneRevision": 10,
+        "meshSourceSceneRevision": 11,
+        "freshness": "current"
+      },
+      "expected": "inconsistent/loading, not current",
+      "source": "useMeshDetailsModel.ts — freshness expression"
+    },
+    {
+      "id": "R07",
+      "description": "Fallback wymiarów walca ignoruje wysokość",
+      "outcome": "REPRODUCED_IN_ISOLATED_MODEL",
+      "actual": {
+        "radius": 5e-8,
+        "height": 1e-8,
+        "boundsSize": [
+          1e-7,
+          1e-7,
+          1e-7
+        ]
+      },
+      "expected": "[2r,2r,h] for a z-axis cylinder",
+      "scope": "fallback path only; authoritative valid bounds bypass it"
+    }
+  ]
+}

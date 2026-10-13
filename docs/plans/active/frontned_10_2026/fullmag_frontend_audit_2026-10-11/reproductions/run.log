@@ -1,0 +1,7 @@
+R01: REPRODUCED — ACK poprzedniego gestu usuwa podgląd nowszego gestu
+R02: REPRODUCED — Klik osi bez ruchu nadal wywołuje commit
+R03: REPRODUCED — Błąd transportu z end() jest propagowany jako odrzucona Promise
+R04: REPRODUCED — Puste współrzędne stają się zerem w Number(value)
+R05: REPRODUCED — Bazowa rewizja szkicu nie wynika automatycznie z nowego baseDraft
+R06: REPRODUCED — Freshness klasyfikuje przyszłą rewizję meshu jako current
+R07: REPRODUCED — Fallback wymiarów walca ignoruje wysokość

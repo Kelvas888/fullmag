@@ -10,6 +10,9 @@ import {
   statusRefreshIntervalMs,
 } from "../realtime/communicationPolicy";
 
+import { useSessionScopedResourceKey } from "./useSessionScopedResourceKey";
+import { useSessionStatusSelector } from "./useSessionStatus";
+import { hasSimulationPreparation } from "./simulationResourceAvailability";
 import { useResource } from "./useResource";
 
 function resolvePreparationRevision(data: SimulationPreparationResource) {
@@ -24,38 +27,52 @@ export function useSimulationPreparation({
   requiredRevision?: number | null;
 } = {}) {
   const { api, resources } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    SIMULATION_PREPARATION_PATH,
+  );
+  const preparationAvailable = useSessionStatusSelector(
+    (status) => hasSimulationPreparation(status.data, requiredRevision),
+    { enabled: sessionIdentity !== null },
+  );
+  const effectiveEnabled = enabled && sessionIdentity !== null && preparationAvailable;
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.simulation.preparation({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.simulation.preparation({ sessionScopeKey, signal }),
     [api],
   );
 
   const preparation = useResource<SimulationPreparationResource>({
-    enabled,
+    enabled: effectiveEnabled,
     load,
     minRefetchIntervalMs: statusRefreshIntervalMs(),
     resolveRevision: resolvePreparationRevision,
-    resourceKey: SIMULATION_PREPARATION_PATH,
+    resourceKey,
   });
   const retriedRequiredRevision = useRef<number | null>(null);
 
   useEffect(() => {
-    if (!enabled || requiredRevision === null || requiredRevision <= 0) return;
+    if (!effectiveEnabled || requiredRevision === null || requiredRevision <= 0) return;
     if ((preparation.data?.revision ?? 0) >= requiredRevision) return;
-    const currentRevision = resources.getRevision(SIMULATION_PREPARATION_PATH);
+    const currentRevision = resources.getRevision(resourceKey);
     if (
       currentRevision === requiredRevision ||
       (typeof currentRevision === "number" && currentRevision > requiredRevision)
     ) {
       return;
     }
-    resources.invalidate(SIMULATION_PREPARATION_PATH, requiredRevision);
-  }, [enabled, preparation.data?.revision, requiredRevision, resources]);
+    resources.invalidate(resourceKey, requiredRevision);
+  }, [
+    effectiveEnabled,
+    preparation.data?.revision,
+    requiredRevision,
+    resourceKey,
+    resources,
+  ]);
 
   useEffect(() => {
     const loadedRevision = preparation.data?.revision ?? 0;
     if (
-      !enabled ||
+      !effectiveEnabled ||
       requiredRevision === null ||
       requiredRevision <= 0 ||
       loadedRevision >= requiredRevision ||
@@ -70,7 +87,7 @@ export function useSimulationPreparation({
     const timeoutId = setTimeout(preparation.refetch, errorRetryDelayMs());
     return () => clearTimeout(timeoutId);
   }, [
-    enabled,
+    effectiveEnabled,
     preparation.data?.revision,
     preparation.error,
     preparation.refetch,

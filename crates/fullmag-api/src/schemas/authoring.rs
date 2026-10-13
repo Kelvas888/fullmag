@@ -269,6 +269,9 @@ pub struct SceneResource {
     pub field_drives: FieldDriveListStateResource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(additional_properties, nullable)]
+    pub monitors: Option<BTreeMap<String, Value>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(additional_properties, nullable)]
     pub current_modules: Option<BTreeMap<String, Value>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub current_transports: Vec<fullmag_authoring::SceneCurrentTransport>,
@@ -1388,6 +1391,8 @@ pub struct CouplingListResource {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RegionPatchRequest {
+    #[serde(default)]
+    pub base_revision: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1462,6 +1467,15 @@ pub struct ScenePatchRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AuthoringTransactionRequest {
+    /// Replace an immutable profile snapshot atomically, without merging
+    /// sparse defaults from a previously assigned version.
+    AssignStudyExecution {
+        base_revision: u64,
+        #[schema(value_type = crate::schemas::compute_profiles::ExecutionProfileSchema)]
+        execution_profile: fullmag_ir::ExecutionProfileIR,
+        #[schema(value_type = Vec<crate::schemas::compute_preview::ExecutionLayerSchema>)]
+        execution_layers: Vec<fullmag_ir::ExecutionRequestLayerIR>,
+    },
     ReplaceScene {
         #[serde(default)]
         base_revision: Option<u64>,
