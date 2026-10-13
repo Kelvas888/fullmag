@@ -126,8 +126,20 @@ def _require_case_workspace(workspace: Path, case: str, run_id: str) -> None:
         raise RuntimeArtifactRootError("Runtime workspace has a noncanonical output attempt")
 
 
-def resolve_runtime_artifact_root(output_root: Path, case: str, expected_model_sha256: str) -> tuple[Path, dict]:
-    """Resolve exact recorded artifacts without guessing or modifying storage."""
+def resolve_runtime_artifact_root(
+    output_root: Path,
+    case: str,
+    expected_model_sha256: str,
+    *,
+    metadata_bytes_loader=None,
+) -> tuple[Path, dict]:
+    """Resolve exact recorded artifacts without guessing or modifying storage.
+
+    ``metadata_bytes_loader`` is an optional bounded source for the exact
+    artifact bytes to bind to the external producer attestation. It receives
+    the already validated artifact directory. Existing callers retain the
+    regular-file path behavior when the loader is omitted.
+    """
     try:
         if not isinstance(case, str) or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", case) is None:
             raise RuntimeArtifactRootError("Invalid runtime case identity")
@@ -172,7 +184,14 @@ def resolve_runtime_artifact_root(output_root: Path, case: str, expected_model_s
         if len(metadata_entries) != 1 or metadata_entries[0].get("kind") != "metadata":
             raise RuntimeArtifactRootError("Run manifest does not uniquely bind artifact metadata")
         metadata_path = artifacts / "metadata.json"
-        metadata_bytes = _read(metadata_path, MAX_METADATA_BYTES)
+        if metadata_bytes_loader is None:
+            metadata_bytes = _read(metadata_path, MAX_METADATA_BYTES)
+        else:
+            if not callable(metadata_bytes_loader):
+                raise RuntimeArtifactRootError("Metadata byte loader must be callable")
+            metadata_bytes = metadata_bytes_loader(artifacts)
+            if not isinstance(metadata_bytes, bytes) or len(metadata_bytes) > MAX_METADATA_BYTES:
+                raise RuntimeArtifactRootError("Loaded runtime metadata is not a bounded byte payload")
         attestation_path = workspace / ARTIFACT_ATTESTATION_FILE
         attestation_bytes = _read(attestation_path, MAX_ATTESTATION_BYTES)
         attestation = _attestation_object(attestation_bytes)
@@ -200,9 +219,16 @@ def resolve_runtime_artifact_root(output_root: Path, case: str, expected_model_s
         binding = {"schema": "fullmag.managed-runtime-artifact-binding.v1", "run_id": run_id, "session_id": session_id,
                    "model_sha256": expected_model_sha256, "workspace_dir": str(workspace), "artifact_dir": str(artifacts),
                    "container_workspace_dir": summary["workspace_dir"], "container_artifact_dir": summary["artifact_dir"]}
+        # Keep the historical locator field for receipt compatibility. When a
+        # loader supplied the bytes, this path is not evidence that the root
+        # alias existed or was opened; the additive fields below name the
+        # actual byte source and its logical member path.
         for key, path, data in (("runtime_log", log_path, log), ("run_manifest", manifest_path, manifest_bytes), ("output_storage", storage_path, storage_bytes), ("metadata", metadata_path, metadata_bytes), ("producer_attestation", attestation_path, attestation_bytes)):
             binding[key] = str(path)
             binding[key + "_sha256"] = hashlib.sha256(data).hexdigest()
+        if metadata_bytes_loader is not None:
+            binding["metadata_read_source"] = "provided_verified_bytes"
+            binding["metadata_logical_path"] = "metadata.json"
         return artifacts, binding
     except RuntimeArtifactRootError:
         raise

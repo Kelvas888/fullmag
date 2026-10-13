@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import json
 import math
 import re
@@ -19,10 +20,16 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from de_pilot_receipts import validate_de_pilot_receipts
+from comsol_modal_field_certificate import ArtifactBundleReader
 from finite_dirichlet_thin_film_oracle import n0_reference_frequencies
-from managed_runtime_artifact_root import resolve_runtime_artifact_root
+from managed_runtime_artifact_root import MAX_METADATA_BYTES, resolve_runtime_artifact_root
 from thin_film_thickness_oracle import MU0, solve_thickness_modes
-from validate_de_smoke_rows import SAMPLING, validate_rows
+from validate_de_smoke_rows import (
+    MAX_DE_SMOKE_CSV_BYTES,
+    MAX_DE_SMOKE_JSON_BYTES,
+    SAMPLING,
+    validate_rows,
+)
 
 
 PILOT = "de-smoke-signed-fifteen"
@@ -159,21 +166,70 @@ def _validate_campaign_policy(
 
 
 def _resolve_runtime_case(
-    batch: Path, request: Mapping[str, Any], result: Mapping[str, Any]
+    batch: Path,
+    request: Mapping[str, Any],
+    result: Mapping[str, Any],
+    *,
+    metadata_bytes_loader=None,
 ) -> tuple[Path, dict[str, Any]]:
     model_sha = request.get("model_sha256")
     if not isinstance(model_sha, str):
         raise ValueError("signed-fifteen request has no model_sha256 for runtime artifact binding")
-    case, binding = resolve_runtime_artifact_root(batch, PILOT, model_sha)
-    recorded_binding = result.get("runtime_output_binding")
-    if not isinstance(recorded_binding, Mapping):
-        raise ValueError("run-result runtime_output_binding is missing or invalid")
-    if dict(recorded_binding) != binding:
-        raise ValueError("run-result runtime_output_binding differs from current terminal runtime evidence")
+    resolver_options = (
+        {} if metadata_bytes_loader is None
+        else {"metadata_bytes_loader": metadata_bytes_loader}
+    )
+    case, binding = resolve_runtime_artifact_root(
+        batch, PILOT, model_sha, **resolver_options)
     return case, binding
 
 
-def _validate_artifact_hashes(case: Path, result: Mapping[str, Any]) -> dict[str, str]:
+def _validate_runtime_binding(
+    result: Mapping[str, Any],
+    binding: Mapping[str, Any],
+    reader: ArtifactBundleReader,
+) -> None:
+    recorded_binding = result.get("runtime_output_binding")
+    if not isinstance(recorded_binding, Mapping):
+        raise ValueError("run-result runtime_output_binding is missing or invalid")
+    if dict(recorded_binding) == dict(binding):
+        return
+
+    # Historical callback-less bindings remain compatible with mutable v1
+    # generations and legacy bundles. An immutable v2 result must explicitly
+    # identify that metadata was read from its verified logical member.
+    legacy_binding = dict(binding)
+    legacy_binding.pop("metadata_read_source", None)
+    legacy_binding.pop("metadata_logical_path", None)
+    generation = reader.generation
+    if (dict(recorded_binding) == legacy_binding
+            and (generation is None or not generation.is_immutable())):
+        return
+    raise ValueError("run-result runtime_output_binding differs from current terminal runtime evidence")
+
+
+def _campaign_artifact_limit(relative: str) -> int:
+    if relative == "metadata.json" or relative.endswith(".json"):
+        return MAX_DE_SMOKE_JSON_BYTES
+    if relative.endswith(".csv"):
+        return MAX_DE_SMOKE_CSV_BYTES
+    return 64 * 1024 * 1024
+
+
+def _bare_reader_sha256(record: Mapping[str, Any], relative: str) -> str:
+    digest = record.get("sha256")
+    prefix = "sha256:"
+    if not isinstance(digest, str) or not digest.startswith(prefix):
+        raise ValueError(f"artifact reader returned a noncanonical SHA-256 for {relative}")
+    bare_digest = digest[len(prefix):]
+    if HEX64.fullmatch(bare_digest) is None:
+        raise ValueError(f"artifact reader returned a noncanonical SHA-256 for {relative}")
+    return bare_digest
+
+
+def _validate_artifact_hashes(
+    reader: ArtifactBundleReader, result: Mapping[str, Any]
+) -> dict[str, str]:
     artifacts = _required_mapping(result.get("artifacts"), "run-result artifacts")
     hashes = _required_mapping(artifacts.get("required_artifact_hashes"), "required_artifact_hashes")
     if "metadata.json" not in hashes or "eigen/dispersion.csv" not in hashes:
@@ -182,15 +238,16 @@ def _validate_artifact_hashes(case: Path, result: Mapping[str, Any]) -> dict[str
     for relative, binding in hashes.items():
         if not isinstance(relative, str) or not isinstance(binding, Mapping):
             raise ValueError("run-result required_artifact_hashes has an invalid entry")
-        path = _contained_file(case, relative, "hashed artifact")
         expected_hash = binding.get("sha256")
         expected_size = binding.get("size")
         if not isinstance(expected_hash, str) or HEX64.fullmatch(expected_hash) is None:
             raise ValueError(f"invalid artifact hash for {relative}")
         if isinstance(expected_size, bool) or not isinstance(expected_size, int) or expected_size < 0:
             raise ValueError(f"invalid artifact size for {relative}")
-        actual_hash = _sha256(path)
-        if path.stat().st_size != expected_size or actual_hash != expected_hash:
+        reader.read_bytes(relative, maximum_bytes=_campaign_artifact_limit(relative))
+        record = reader.record_for(relative)
+        actual_hash = _bare_reader_sha256(record, relative)
+        if record["size_bytes"] != expected_size or actual_hash != expected_hash:
             raise ValueError(f"artifact hash or size mismatch: {relative}")
         observed[relative] = actual_hash
     return observed
@@ -261,13 +318,24 @@ def _validate_model_metadata(
     return fields, frequency_window, model
 
 
-def _read_actual_rows(csv_path: Path, frequency_window: list[float]) -> list[dict[str, Any]]:
+def _read_actual_rows(
+    csv_path: Path,
+    frequency_window: list[float],
+    *,
+    verified_csv_bytes: bytes | None = None,
+) -> list[dict[str, Any]]:
     required = {
         "sample_index", "raw_mode_index", "branch_id", "kx_rad_per_m",
         "ky_rad_per_m", "kz_rad_per_m", "frequency_hz",
     }
     rows: list[dict[str, Any]] = []
-    with csv_path.open(encoding="utf-8-sig", newline="") as stream:
+    csv_stream = (
+        csv_path.open(encoding="utf-8-sig", newline="")
+        if verified_csv_bytes is None
+        else io.TextIOWrapper(
+            io.BytesIO(verified_csv_bytes), encoding="utf-8-sig", newline="")
+    )
+    with csv_stream as stream:
         reader = csv.DictReader(stream)
         if not reader.fieldnames or not required.issubset(reader.fieldnames):
             raise ValueError("signed-fifteen dispersion.csv is missing required columns")
@@ -311,24 +379,53 @@ def load_campaign(batch: Path) -> dict[str, Any]:
     request = _read_json(batch / "run-request.json", "run-request")
     result = _read_json(batch / "run-result.json", "run-result")
     _validate_receipt_identity(batch, request, result)
-    case, runtime_binding = _resolve_runtime_case(batch, request, result)
+    readers: list[ArtifactBundleReader] = []
+
+    def load_captured_metadata(case_root: Path) -> bytes:
+        reader = ArtifactBundleReader(case_root)
+        readers.append(reader)
+        return reader.read_bytes("metadata.json", maximum_bytes=MAX_METADATA_BYTES)
+
+    case, runtime_binding = _resolve_runtime_case(
+        batch, request, result, metadata_bytes_loader=load_captured_metadata)
+    if len(readers) != 1:
+        raise ValueError("runtime artifact resolution did not capture exactly one artifact bundle")
+    reader = readers[0]
+    _validate_runtime_binding(result, runtime_binding, reader)
     if not case.is_dir() or case.is_symlink():
         raise ValueError("signed-fifteen runtime artifact directory is missing")
     metadata_path = case / "metadata.json"
-    metadata = _read_json(metadata_path, "signed-fifteen metadata")
-    artifact_hashes = _validate_artifact_hashes(case, result)
+    metadata_bytes = reader.read_bytes("metadata.json", maximum_bytes=MAX_DE_SMOKE_JSON_BYTES)
+    try:
+        metadata = json.loads(metadata_bytes.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError("signed-fifteen metadata is missing or invalid") from error
+    if not isinstance(metadata, dict):
+        raise ValueError("signed-fifteen metadata must be a JSON object")
+    artifact_hashes = _validate_artifact_hashes(reader, result)
     parameters, frequency_window, model = _validate_model_metadata(request, metadata)
     policy = _validate_campaign_policy(request, result, metadata)
     diagnostics_path = case / "eigen" / "diagnostics" / "solver.v1.json"
     csv_path = case / "eigen" / "dispersion.csv"
-    row_report = validate_rows(csv_path, "signed-fifteen", diagnostics_path, metadata_path)
+    row_report = validate_rows(
+        csv_path,
+        "signed-fifteen",
+        diagnostics_path,
+        metadata_path,
+        bundle_reader=reader,
+    )
     if not isinstance(row_report, Mapping) or row_report.get("status") != "pass":
         raise ValueError("signed-fifteen native row validation did not pass")
-    rows = _read_actual_rows(csv_path, frequency_window)
+    csv_bytes = reader.read_bytes(
+        "eigen/dispersion.csv", maximum_bytes=MAX_DE_SMOKE_CSV_BYTES)
+    rows = _read_actual_rows(
+        csv_path, frequency_window, verified_csv_bytes=csv_bytes)
+    reader.ensure_current()
     return {
         "batch": batch,
         "case": case,
         "runtime_output_binding": runtime_binding,
+        "artifact_generation": reader.generation_descriptor(),
         "request": request,
         "result": result,
         "metadata": metadata,
@@ -342,9 +439,13 @@ def load_campaign(batch: Path) -> dict[str, Any]:
         "input_sha256": {
             "run-request.json": _sha256(batch / "run-request.json"),
             "run-result.json": _sha256(batch / "run-result.json"),
-            "metadata.json": _sha256(metadata_path),
-            "eigen/dispersion.csv": _sha256(csv_path),
-            "eigen/diagnostics/solver.v1.json": _sha256(diagnostics_path),
+            "metadata.json": _bare_reader_sha256(
+                reader.record_for("metadata.json"), "metadata.json"),
+            "eigen/dispersion.csv": _bare_reader_sha256(
+                reader.record_for("eigen/dispersion.csv"), "eigen/dispersion.csv"),
+            "eigen/diagnostics/solver.v1.json": _bare_reader_sha256(
+                reader.record_for("eigen/diagnostics/solver.v1.json"),
+                "eigen/diagnostics/solver.v1.json"),
         },
     }
 
@@ -397,6 +498,8 @@ def _source_hashes() -> dict[str, str]:
     paths = [
         Path(__file__),
         Path(__file__).with_name("de_pilot_receipts.py"),
+        Path(__file__).with_name("comsol_modal_field_certificate.py"),
+        Path(__file__).with_name("frequency_domain_generation.py"),
         Path(__file__).with_name("managed_runtime_artifact_root.py"),
         Path(__file__).with_name("validate_de_smoke_rows.py"),
         Path(__file__).with_name("finite_dirichlet_thin_film_oracle.py"),
@@ -480,6 +583,7 @@ def write_plot(campaign: Mapping[str, Any], output: Path) -> dict[str, str]:
             "source": campaign["request"]["source"],
         },
         "runtime_output_binding": campaign["runtime_output_binding"],
+        "artifact_generation": campaign["artifact_generation"],
         "input_sha256": campaign["input_sha256"],
         "artifact_sha256": campaign["artifact_sha256"],
         "analytic_reference_models": {

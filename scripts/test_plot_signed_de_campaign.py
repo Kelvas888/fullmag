@@ -119,6 +119,7 @@ def _write_batch(tmp_path: Path) -> Path:
             stream.write(",".join(str(value) for value in row.values()) + "\n")
     artifacts = {
         "eigen/spectrum.v2.json": "{}",
+        "eigen/spectrum.v3.json": "{}",
         "eigen/branches.v2.json": "{}",
         "eigen/diagnostics/solver.v1.json": "{}",
         "eigen/metadata/eigen_summary.json": "{}",
@@ -159,6 +160,91 @@ def _write_batch(tmp_path: Path) -> Path:
     return batch
 
 
+def _publish_v2_generation(case: Path, *, omitted=()) -> str:
+    omitted = set(omitted)
+    files = {
+        path.relative_to(case).as_posix(): path.read_bytes()
+        for path in case.rglob("*")
+        if path.is_file()
+        and not path.relative_to(case).as_posix().startswith("frequency_domain/")
+        and path.relative_to(case).as_posix() not in omitted
+    }
+    members = {
+        logical: {
+            "byte_length": len(data),
+            "sha256": "sha256:" + hashlib.sha256(data).hexdigest(),
+        }
+        for logical, data in sorted(files.items())
+    }
+    content = {
+        "schema_version": "frequency_domain_artifact_generation.v2",
+        "producer": {"run_id": RUN_ID, "stage_id": "eigen", "stage_kind": "eigensolve"},
+        "members": members,
+    }
+    canonical = json.dumps(
+        content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    generation_id = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    generation_root = case / "frequency_domain/generations" / generation_id[7:]
+    for logical, data in files.items():
+        target = generation_root.joinpath(*logical.split("/"))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+    marker = json.dumps(
+        {"generation_id": generation_id, "content": content},
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+    marker_path = case / "frequency_domain/generation.v2.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_bytes(marker)
+
+    reader = plotting.ArtifactBundleReader(case)
+    _, binding = plotting.resolve_runtime_artifact_root(
+        case.parent.parent,
+        plotting.PILOT,
+        MODEL_SHA,
+        metadata_bytes_loader=lambda _artifact_root: reader.read_bytes(
+            "metadata.json", maximum_bytes=plotting.MAX_METADATA_BYTES),
+    )
+    result_path = case.parent.parent / "run-result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["runtime_output_binding"] = binding
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    return generation_id
+
+
+def _publish_v1_generation(case: Path) -> str:
+    files = {
+        path.relative_to(case).as_posix(): path.read_bytes()
+        for path in case.rglob("*")
+        if path.is_file()
+        and not path.relative_to(case).as_posix().startswith("frequency_domain/")
+    }
+    content = {
+        "schema_version": "frequency_domain_artifact_generation.v1",
+        "producer": {"run_id": RUN_ID, "stage_id": "eigen", "stage_kind": "eigensolve"},
+        "members": {
+            logical: {
+                "byte_length": len(data),
+                "sha256": "sha256:" + hashlib.sha256(data).hexdigest(),
+            }
+            for logical, data in sorted(files.items())
+        },
+    }
+    canonical = json.dumps(
+        content, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    generation_id = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    marker = json.dumps(
+        {"generation_id": generation_id, "content": content},
+        ensure_ascii=False,
+        indent=2,
+    ).encode("utf-8")
+    marker_path = case / "frequency_domain/generation.v1.json"
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_bytes(marker)
+    return generation_id
+
+
 def test_load_campaign_binds_receipt_hashes_and_actual_rows(tmp_path, monkeypatch):
     batch = _write_batch(tmp_path)
     calls = []
@@ -175,7 +261,153 @@ def test_load_campaign_binds_receipt_hashes_and_actual_rows(tmp_path, monkeypatc
     assert campaign["parallel_campaign"]["mode"] == "adaptive"
     assert campaign["case"] == _artifact_dir(batch)
     assert campaign["runtime_output_binding"]["run_id"] == RUN_ID
-    assert campaign["artifact_sha256"]["eigen/dispersion.csv"]
+    result = json.loads((batch / "run-result.json").read_text(encoding="utf-8"))
+    expected_hashes = result["artifacts"]["required_artifact_hashes"]
+    assert campaign["artifact_sha256"]["eigen/dispersion.csv"] == expected_hashes[
+        "eigen/dispersion.csv"]["sha256"]
+    assert not campaign["artifact_sha256"]["eigen/dispersion.csv"].startswith("sha256:")
+    assert campaign["input_sha256"]["metadata.json"] == expected_hashes["metadata.json"][
+        "sha256"]
+
+
+def test_load_campaign_rejects_mismatched_bare_artifact_digest(tmp_path, monkeypatch):
+    batch = _write_batch(tmp_path)
+    result_path = batch / "run-result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["artifacts"]["required_artifact_hashes"]["eigen/dispersion.csv"][
+        "sha256"] = "f" * 64
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    monkeypatch.setattr(
+        plotting, "validate_rows", lambda *args, **kwargs: {"status": "pass"})
+
+    with pytest.raises(ValueError, match="artifact hash or size mismatch: eigen/dispersion.csv"):
+        plotting.load_campaign(batch)
+
+
+def test_load_campaign_reads_immutable_members_when_legacy_aliases_are_absent(tmp_path, monkeypatch):
+    batch = _write_batch(tmp_path)
+    case = _artifact_dir(batch)
+    expected = {
+        relative: (case / relative).read_bytes()
+        for relative in (
+            "metadata.json",
+            "eigen/dispersion.csv",
+            "eigen/diagnostics/solver.v1.json",
+            "eigen/spectrum.v3.json",
+        )
+    }
+    generation_id = _publish_v2_generation(case)
+    result = json.loads((batch / "run-result.json").read_text(encoding="utf-8"))
+    for relative in result["artifacts"]["required_artifact_hashes"]:
+        (case / relative).unlink()
+
+    observed_readers = []
+
+    def validate(_csv_path, sampling, _diagnostics_path, _metadata_path, *, bundle_reader):
+        observed_readers.append(bundle_reader)
+        assert sampling == "signed-fifteen"
+        for relative, payload in expected.items():
+            assert bundle_reader.read_bytes(
+                relative, maximum_bytes=plotting._campaign_artifact_limit(relative)) == payload
+        return {"status": "pass", "sampling": sampling, "sample_count": 15}
+
+    monkeypatch.setattr(plotting, "validate_rows", validate)
+    campaign = plotting.load_campaign(batch)
+
+    assert campaign["rows"][0]["ky_rad_per_m"] == K_VALUES[0] * 1e6
+    assert campaign["artifact_sha256"]["eigen/dispersion.csv"] == hashlib.sha256(
+        expected["eigen/dispersion.csv"]).hexdigest()
+    assert campaign["input_sha256"]["metadata.json"] == hashlib.sha256(
+        expected["metadata.json"]).hexdigest()
+    assert campaign["input_sha256"]["eigen/diagnostics/solver.v1.json"] == hashlib.sha256(
+        expected["eigen/diagnostics/solver.v1.json"]).hexdigest()
+    assert len(observed_readers) == 1
+    assert observed_readers[0].generation.generation_id == generation_id
+
+
+def test_load_campaign_accepts_historical_binding_for_verified_mutable_v1(tmp_path, monkeypatch):
+    batch = _write_batch(tmp_path)
+    case = _artifact_dir(batch)
+    generation_id = _publish_v1_generation(case)
+    recorded_binding = json.loads((batch / "run-result.json").read_text(encoding="utf-8"))[
+        "runtime_output_binding"]
+    monkeypatch.setattr(
+        plotting, "validate_rows", lambda *args, **kwargs: {"status": "pass"})
+
+    campaign = plotting.load_campaign(batch)
+
+    current_binding = dict(campaign["runtime_output_binding"])
+    current_binding.pop("metadata_read_source")
+    current_binding.pop("metadata_logical_path")
+    assert current_binding == recorded_binding
+    assert campaign["rows"][0]["sample_index"] == 0
+    assert campaign["runtime_output_binding"]["metadata_read_source"] == "provided_verified_bytes"
+    assert campaign["runtime_output_binding"]["metadata_logical_path"] == "metadata.json"
+    assert campaign["artifact_generation"]["generation_id"] == generation_id
+    assert campaign["artifact_generation"]["generation_binding_status"] == "byte_verified_mutable"
+    assert campaign["case"] == case
+
+
+def test_load_campaign_rejects_callbackless_binding_for_immutable_v2(tmp_path, monkeypatch):
+    batch = _write_batch(tmp_path)
+    case = _artifact_dir(batch)
+    _publish_v2_generation(case)
+    result_path = batch / "run-result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["runtime_output_binding"].pop("metadata_read_source")
+    result["runtime_output_binding"].pop("metadata_logical_path")
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    monkeypatch.setattr(
+        plotting, "validate_rows", lambda *args, **kwargs: {"status": "pass"})
+
+    with pytest.raises(ValueError, match="runtime_output_binding differs"):
+        plotting.load_campaign(batch)
+
+
+def test_load_campaign_rejects_non_annotation_binding_drift_for_mutable_v1(
+    tmp_path, monkeypatch
+):
+    batch = _write_batch(tmp_path)
+    case = _artifact_dir(batch)
+    _publish_v1_generation(case)
+    result_path = batch / "run-result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["runtime_output_binding"]["metadata_sha256"] = "f" * 64
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+    monkeypatch.setattr(
+        plotting, "validate_rows", lambda *args, **kwargs: {"status": "pass"})
+
+    with pytest.raises(ValueError, match="runtime_output_binding differs"):
+        plotting.load_campaign(batch)
+
+
+def test_load_campaign_never_falls_back_to_an_alias_for_an_undeclared_v2_member(
+    tmp_path, monkeypatch
+):
+    batch = _write_batch(tmp_path)
+    case = _artifact_dir(batch)
+    _publish_v2_generation(case, omitted=("eigen/dispersion.csv",))
+    assert (case / "eigen/dispersion.csv").is_file()
+    monkeypatch.setattr(
+        plotting, "validate_rows", lambda *args, **kwargs: {"status": "pass"})
+
+    with pytest.raises(ValueError):
+        plotting.load_campaign(batch)
+
+
+def test_load_campaign_fences_v2_after_all_campaign_rows_are_parsed(tmp_path, monkeypatch):
+    batch = _write_batch(tmp_path)
+    case = _artifact_dir(batch)
+    _publish_v2_generation(case)
+
+    def change_generation_during_validation(*args, **kwargs):
+        marker = case / "frequency_domain/generation.v2.json"
+        marker.write_bytes(marker.read_bytes() + b" ")
+        return {"status": "pass"}
+
+    monkeypatch.setattr(plotting, "validate_rows", change_generation_during_validation)
+    with pytest.raises(ValueError, match="generation changed"):
+        plotting.load_campaign(batch)
 
 
 def test_load_campaign_rejects_missing_runtime_output_binding(tmp_path, monkeypatch):
@@ -297,7 +529,10 @@ def test_write_plot_uses_actual_points_and_refuses_overwrite(tmp_path, monkeypat
     assert report["mirrored_samples"] is False
     assert report["interpolated_numeric_samples"] is False
     assert report["runtime_output_binding"] == campaign["runtime_output_binding"]
+    assert report["artifact_generation"] == campaign["artifact_generation"]
     assert report["source_sha256"]["managed_runtime_artifact_root.py"]
+    assert report["source_sha256"]["comsol_modal_field_certificate.py"]
+    assert report["source_sha256"]["frequency_domain_generation.py"]
     assert report["references"][0]["k_rad_per_m"] == -25e6
     assert Path(files["png"]).is_file() and Path(files["pdf"]).is_file()
     with pytest.raises(ValueError, match="overwrite"):

@@ -21,6 +21,7 @@ from managed_runtime_artifact_root import resolve_runtime_artifact_root
 import argparse
 from dataclasses import dataclass
 import hashlib
+import io
 import json
 import math
 import os
@@ -45,6 +46,7 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 import fullmag_storage  # noqa: E402  (the path setup above is intentional)
+from comsol_modal_field_certificate import ArtifactBundleReader  # noqa: E402
 from local_runner.build_executor import validate_build_receipt  # noqa: E402
 from local_runner.build_source import bind_identity  # noqa: E402
 from local_runner.worker_entrypoint import canonical, verify_source  # noqa: E402
@@ -125,6 +127,8 @@ REQUIRED_CASE_ARTIFACTS = (
 # plane artifacts.  Keep a bounded, explicit budget rather than applying the
 # generic 16 MiB JSON limit and rejecting a valid native result.
 MAX_EIGEN_SUMMARY_BYTES = 256 * 1024 * 1024
+MAX_CASE_JSON_BYTES = 16 * 1024 * 1024
+MAX_CASE_DISPERSION_CSV_BYTES = 16 * 1024 * 1024
 MAX_EXTERNAL_EVIDENCE_FILES = 4096
 MAX_EXTERNAL_EVIDENCE_BYTES = 512 * 1024 * 1024
 
@@ -1353,48 +1357,168 @@ def _run_request(
     }
 
 
-def _validate_case_artifacts(case_dir: Path, case: str) -> dict[str, Any]:
+def _case_bundle_reader(
+    case_dir: Path,
+    case: str,
+    bundle_reader: ArtifactBundleReader | None,
+) -> ArtifactBundleReader:
+    try:
+        reader = bundle_reader if bundle_reader is not None else ArtifactBundleReader(case_dir)
+    except (OSError, ValueError) as error:
+        raise BenchmarkError(f"{case} artifact generation could not be captured: {error}") from error
+    if reader.root != case_dir.absolute():
+        raise BenchmarkError(f"{case} artifact reader belongs to a different case output directory")
+    return reader
+
+
+def _read_case_artifact(
+    reader: ArtifactBundleReader,
+    case: str,
+    relative: str,
+    *,
+    maximum_bytes: int | None,
+) -> tuple[bytes, dict[str, Any]]:
+    try:
+        payload = reader.read_bytes(relative, maximum_bytes=maximum_bytes)
+        record = reader.record_for(relative)
+    except (OSError, ValueError) as error:
+        raise BenchmarkError(
+            f"{case} required artifact could not be read from its captured bundle: {relative}: {error}"
+        ) from error
+    if not payload:
+        raise BenchmarkError(f"benchmark case artifact is empty: {case}/{relative}")
+    digest = record.get("sha256")
+    if isinstance(digest, str) and digest.startswith("sha256:"):
+        digest = digest[7:]
+    if not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+        raise BenchmarkError(f"{case} captured artifact has no valid SHA256: {relative}")
+    if record.get("size_bytes") != len(payload):
+        raise BenchmarkError(f"{case} captured artifact length is inconsistent: {relative}")
+    return payload, {"size": len(payload), "sha256": digest}
+
+
+def _case_json_bytes(payload: bytes, label: str, relative: str) -> dict[str, Any]:
+    try:
+        value = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, ValueError) as error:
+        raise BenchmarkError(f"{label} is not valid UTF-8 JSON: {relative}") from error
+    if not isinstance(value, dict):
+        raise BenchmarkError(f"{label} must be a JSON object: {relative}")
+    return value
+
+
+def _mode_payload_members(
+    case_dir: Path,
+    case: str,
+    reader: ArtifactBundleReader,
+    filename: str,
+    *,
+    require_nonempty: bool,
+) -> tuple[str, ...]:
+    capture = reader.generation
+    if capture is None:
+        paths = tuple(case_dir.glob(f"eigen/mode_fields/sample_*/mode_*/{filename}"))
+        for path in paths:
+            if _is_reparse(path) or not path.is_file():
+                raise BenchmarkError(f"{case} mode-field inventory contains an unsafe member: {path}")
+            if require_nonempty and path.stat().st_size == 0:
+                raise BenchmarkError(f"{case} mode-field payload is empty: {path}")
+        return tuple(path.relative_to(case_dir).as_posix() for path in paths)
+
+    logical_members = []
+    for logical in reader.iter_members("eigen/mode_fields"):
+        parts = PurePosixPath(logical).parts
+        if (
+            len(parts) != 5
+            or parts[0] != "eigen"
+            or parts[1] != "mode_fields"
+            or not parts[2].startswith("sample_")
+            or not parts[3].startswith("mode_")
+            or parts[4] != filename
+        ):
+            continue
+        member = capture.members.get(logical)
+        if member is None:
+            raise BenchmarkError(f"{case} captured mode-field inventory is inconsistent: {logical}")
+        if require_nonempty and member.byte_length == 0:
+            raise BenchmarkError(f"{case} mode-field payload is empty: {logical}")
+        try:
+            capture.verify_member(logical)
+        except (OSError, ValueError) as error:
+            raise BenchmarkError(f"{case} captured mode-field member is corrupt: {logical}: {error}") from error
+        logical_members.append(logical)
+    return tuple(logical_members)
+
+
+def _validate_case_artifacts(
+    case_dir: Path,
+    case: str,
+    *,
+    bundle_reader: ArtifactBundleReader | None = None,
+) -> dict[str, Any]:
     _regular_dir(case_dir, f"benchmark case output {case}")
+    reader = _case_bundle_reader(case_dir, case, bundle_reader)
     required_hashes: dict[str, dict[str, Any]] = {}
+    parsed_json: dict[str, dict[str, Any]] = {}
     for relative in REQUIRED_CASE_ARTIFACTS:
-        artifact = case_dir.joinpath(*relative.split("/"))
-        _regular_file(artifact, f"benchmark case artifact {case}/{relative}")
-        if artifact.stat().st_size == 0:
-            raise BenchmarkError(f"benchmark case artifact is empty: {case}/{relative}")
-        required_hashes[relative] = {
-            "size": artifact.stat().st_size,
-            "sha256": _sha256_file(artifact),
-        }
-    spectrum = _json_file(case_dir / "eigen/spectrum.v2.json", f"{case} spectrum")
-    branches = _json_file(case_dir / "eigen/branches.v2.json", f"{case} branches")
-    _json_file(
-        case_dir / "eigen/metadata/eigen_summary.json",
-        f"{case} eigen summary",
-        max_bytes=MAX_EIGEN_SUMMARY_BYTES,
-    )
-    _json_file(case_dir / "frequency_domain/manifest.v1.json", f"{case} frequency-domain manifest")
+        maximum_bytes = (
+            MAX_EIGEN_SUMMARY_BYTES
+            if relative == "eigen/metadata/eigen_summary.json"
+            else MAX_CASE_DISPERSION_CSV_BYTES
+            if relative == "eigen/dispersion.csv"
+            else MAX_CASE_JSON_BYTES
+            if relative.endswith(".json")
+            else None
+        )
+        payload, record = _read_case_artifact(
+            reader,
+            case,
+            relative,
+            maximum_bytes=maximum_bytes,
+        )
+        required_hashes[relative] = record
+        if relative.endswith(".json"):
+            parsed_json[relative] = _case_json_bytes(payload, f"{case} {relative}", relative)
+
+    spectrum = parsed_json["eigen/spectrum.v2.json"]
+    branches = parsed_json["eigen/branches.v2.json"]
     if spectrum.get("schema_version") != "eigen_spectrum.v2":
         raise BenchmarkError(f"{case} spectrum schema is invalid")
     if branches.get("schema_version") != "eigen_branches.v2":
         raise BenchmarkError(f"{case} branches schema is invalid")
-    dispersion = case_dir / "eigen/dispersion.csv"
-    with dispersion.open("r", encoding="utf-8-sig", newline="") as stream:
+
+    try:
+        dispersion_bytes = reader.read_bytes(
+            "eigen/dispersion.csv",
+            maximum_bytes=MAX_CASE_DISPERSION_CSV_BYTES,
+        )
+        dispersion_text = dispersion_bytes.decode("utf-8-sig")
+    except (OSError, UnicodeError, ValueError) as error:
+        raise BenchmarkError(f"{case} dispersion CSV is not bounded valid UTF-8: {error}") from error
+    with io.StringIO(dispersion_text, newline="") as stream:
         header = stream.readline().strip().split(",")
         rows = sum(1 for _ in stream)
     required_columns = {"kx_rad_per_m", "ky_rad_per_m", "frequency_hz"}
     if not required_columns.issubset(header) or rows < 1:
         raise BenchmarkError(f"{case} dispersion CSV has no usable mode rows")
-    mode_vectors = tuple(case_dir.glob("eigen/mode_fields/sample_*/mode_*/vector.bin"))
-    if not mode_vectors or any(_is_reparse(path) or not path.is_file() or path.stat().st_size == 0 for path in mode_vectors):
+
+    mode_vectors = _mode_payload_members(
+        case_dir, case, reader, "vector.bin", require_nonempty=True,
+    )
+    potential_files = _mode_payload_members(
+        case_dir, case, reader, "potential_full.bin", require_nonempty=True,
+    )
+    potential_manifests = _mode_payload_members(
+        case_dir, case, reader, "physical_potential.v1.json", require_nonempty=False,
+    )
+    if not mode_vectors:
         raise BenchmarkError(f"{case} has no complete complex mode field payload")
-    potential_files = tuple(case_dir.glob("eigen/mode_fields/sample_*/mode_*/potential_full.bin"))
-    potential_manifests = tuple(case_dir.glob("eigen/mode_fields/sample_*/mode_*/physical_potential.v1.json"))
-    if case in {"c1", "a1"} and (
-        not potential_files
-        or not potential_manifests
-        or any(_is_reparse(path) or not path.is_file() or path.stat().st_size == 0 for path in potential_files)
-    ):
+    if case in {"c1", "a1"} and (not potential_files or not potential_manifests):
         raise BenchmarkError(f"{case} has no full physical scalar-potential payload")
+    try:
+        reader.ensure_current()
+    except (OSError, ValueError) as error:
+        raise BenchmarkError(f"{case} artifact generation final fence failed: {error}") from error
     return {
         "case": case,
         "required_artifacts": list(REQUIRED_CASE_ARTIFACTS),
@@ -1410,6 +1534,8 @@ def _write_scientific_evidence(
     case: str,
     artifact_result: Mapping[str, Any],
     scientific_evidence_root: Path | None = None,
+    *,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> None:
     """Bind the primary numeric artifacts without inventing missing science.
 
@@ -1418,27 +1544,7 @@ def _write_scientific_evidence(
     runs, so they are recorded as pending until those bundles are supplied;
     the scientific gate remains fail-closed in the meantime.
     """
-    manifest = _json_file(
-        case_dir / "frequency_domain/manifest.v1.json",
-        f"{case} frequency-domain manifest",
-    )
-    diagnostics = _json_file(
-        case_dir / "eigen/diagnostics/solver.v1.json",
-        f"{case} solver diagnostics",
-    )
-    validation = manifest.get("validation")
-    validation = validation if isinstance(validation, Mapping) else {}
-    solver_model = diagnostics.get("solver_model")
-    production_attested = (
-        diagnostics.get("production_native_solver_available") is True
-        and diagnostics.get("validation_only") is not True
-        and isinstance(manifest.get("resolved_execution"), Mapping)
-        and manifest["resolved_execution"].get("reference_or_production") == "production"
-    )
-    frequency_source = validation.get("dispersion_frequency_source")
-    if frequency_source is None and production_attested:
-        frequency_source = "native_solver_attested"
-    dynamic_source = validation.get("dynamic_demag_operator_source")
+    reader = _case_bundle_reader(case_dir, case, bundle_reader)
     hashes = artifact_result.get("required_artifact_hashes")
     if not isinstance(hashes, Mapping):
         raise BenchmarkError(f"{case} artifact hash map is missing")
@@ -1452,10 +1558,47 @@ def _write_scientific_evidence(
     }
     artifact_bindings: dict[str, str] = {}
     for relative, binding_key in required_bindings.items():
+        maximum_bytes = (
+            MAX_CASE_DISPERSION_CSV_BYTES
+            if relative == "eigen/dispersion.csv"
+            else MAX_CASE_JSON_BYTES
+        )
+        _, actual_record = _read_case_artifact(
+            reader, case, relative, maximum_bytes=maximum_bytes,
+        )
         record = hashes.get(relative)
         if not isinstance(record, Mapping) or not isinstance(record.get("sha256"), str):
             raise BenchmarkError(f"{case} artifact hash is missing for {relative}")
-        artifact_bindings[binding_key] = record["sha256"]
+        if record["sha256"] != actual_record["sha256"]:
+            raise BenchmarkError(f"{case} artifact hash does not match the shared capture for {relative}")
+        artifact_bindings[binding_key] = actual_record["sha256"]
+    manifest_bytes, _ = _read_case_artifact(
+        reader,
+        case,
+        "frequency_domain/manifest.v1.json",
+        maximum_bytes=MAX_CASE_JSON_BYTES,
+    )
+    diagnostics_bytes, _ = _read_case_artifact(
+        reader,
+        case,
+        "eigen/diagnostics/solver.v1.json",
+        maximum_bytes=MAX_CASE_JSON_BYTES,
+    )
+    manifest = _case_json_bytes(manifest_bytes, f"{case} frequency-domain manifest", "frequency_domain/manifest.v1.json")
+    diagnostics = _case_json_bytes(diagnostics_bytes, f"{case} solver diagnostics", "eigen/diagnostics/solver.v1.json")
+    validation = manifest.get("validation")
+    validation = validation if isinstance(validation, Mapping) else {}
+    solver_model = diagnostics.get("solver_model")
+    production_attested = (
+        diagnostics.get("production_native_solver_available") is True
+        and diagnostics.get("validation_only") is not True
+        and isinstance(manifest.get("resolved_execution"), Mapping)
+        and manifest["resolved_execution"].get("reference_or_production") == "production"
+    )
+    frequency_source = validation.get("dispersion_frequency_source")
+    if frequency_source is None and production_attested:
+        frequency_source = "native_solver_attested"
+    dynamic_source = validation.get("dynamic_demag_operator_source")
     pending_reason = (
         "separate managed comparison bundles are required; the primary run "
         "must not be reused as convergence evidence"
@@ -1506,6 +1649,10 @@ def _write_scientific_evidence(
         evidence.update(external)
         evidence["artifact_bindings"] = artifact_bindings
     _write_new_json(case_dir / EVIDENCE_RELATIVE_PATH, evidence)
+    try:
+        reader.ensure_current()
+    except (OSError, ValueError) as error:
+        raise BenchmarkError(f"{case} artifact generation changed while writing its external receipt: {error}") from error
 
 
 def _execute(
@@ -1586,14 +1733,42 @@ def _execute(
                     context.source_tree
                     / "tests/standard_problems/mumag/comsol_nonzero_k_dispersion/problem.py"
                 )
-                case_dir, output_binding = resolve_runtime_artifact_root(output_dir, case, model_sha)
-                artifact_result = _validate_case_artifacts(case_dir, case)
+                captured_readers: dict[Path, ArtifactBundleReader] = {}
+
+                def load_captured_metadata(artifacts_root: Path) -> bytes:
+                    reader = _case_bundle_reader(Path(artifacts_root), case, None)
+                    payload, _ = _read_case_artifact(
+                        reader,
+                        case,
+                        "metadata.json",
+                        maximum_bytes=MAX_CASE_JSON_BYTES,
+                    )
+                    captured_readers[Path(artifacts_root).absolute()] = reader
+                    return payload
+
+                case_dir, output_binding = resolve_runtime_artifact_root(
+                    output_dir,
+                    case,
+                    model_sha,
+                    metadata_bytes_loader=load_captured_metadata,
+                )
+                bundle_reader = captured_readers.get(case_dir.absolute())
+                if bundle_reader is None:
+                    raise BenchmarkError(
+                        f"{case} runtime artifact resolver did not provide captured metadata bytes"
+                    )
+                artifact_result = _validate_case_artifacts(
+                    case_dir,
+                    case,
+                    bundle_reader=bundle_reader,
+                )
                 artifact_result["runtime_output_binding"] = output_binding
                 _write_scientific_evidence(
                     case_dir,
                     case,
                     artifact_result,
                     scientific_evidence_root,
+                    bundle_reader=bundle_reader,
                 )
                 scientific_result = validate_scientific_case(
                     case_dir,
@@ -1608,7 +1783,12 @@ def _execute(
                     / "guides"
                     / "comsol-dispersion-benchmark"
                     / "kpath.csv",
+                    bundle_reader=bundle_reader,
                 )
+                try:
+                    bundle_reader.ensure_current()
+                except (OSError, ValueError) as error:
+                    raise BenchmarkError(f"{case} artifact generation final fence failed: {error}") from error
                 case_results.append(
                     {
                         **artifact_result,

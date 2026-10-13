@@ -430,6 +430,60 @@ def test_verified_csv_bytes_remain_authoritative_after_disk_tamper(tmp_path):
     assert result["max_absolute_residual_norm"] == pytest.approx(1e-10)
 
 
+def test_bundle_reader_bytes_are_the_only_parsed_row_evidence(tmp_path):
+    sampling = "signed-fifteen"
+    case = tmp_path / "case"
+    csv_path = case / "eigen/dispersion.csv"
+    csv_path.parent.mkdir(parents=True)
+    write(csv_path, rows(sampling))
+    diagnostics_path = case / "eigen/diagnostics/solver.v1.json"
+    diagnostics_path.parent.mkdir(parents=True)
+    write_diagnostics(diagnostics_path, sampling)
+    metadata_path = case / "metadata.json"
+    write_metadata(metadata_path)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    model = metadata["problem_meta"]["runtime_metadata"]["de_smoke"]
+    model["sampling"] = sampling
+    model["k_vectors_rad_per_m"] = [[0.0, k, 0.0] for k in SAMPLING[sampling]]
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+    spectrum_path = case / "eigen/spectrum.v3.json"
+    write_spectrum_v3(spectrum_path, sampling)
+    members = {
+        "metadata.json": metadata_path.read_bytes(),
+        "eigen/dispersion.csv": csv_path.read_bytes(),
+        "eigen/diagnostics/solver.v1.json": diagnostics_path.read_bytes(),
+        "eigen/spectrum.v3.json": spectrum_path.read_bytes(),
+    }
+
+    class SnapshotReader:
+        def __init__(self, root):
+            self.root = root
+            self.reads = {}
+
+        def read_bytes(self, logical, *, maximum_bytes=None):
+            assert maximum_bytes is not None
+            self.reads[logical] = self.reads.get(logical, 0) + 1
+            payload = members[logical]
+            assert len(payload) <= maximum_bytes
+            return payload
+
+    reader = SnapshotReader(case)
+    for path in (csv_path, diagnostics_path, metadata_path, spectrum_path):
+        path.write_bytes(b"stale mutable alias")
+
+    report = validate_rows(
+        csv_path,
+        sampling,
+        diagnostics_path,
+        metadata_path,
+        bundle_reader=reader,
+    )
+
+    assert report["status"] == "pass"
+    assert report["mode_rows"] == len(rows(sampling))
+    assert reader.reads == {logical: 1 for logical in members}
+
+
 def test_relative_original_block_residual_is_used_when_absolute_alias_is_unavailable(tmp_path):
     data=rows('k2')
     data[0]['residual_norm']=''

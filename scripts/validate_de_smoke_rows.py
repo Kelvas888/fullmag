@@ -45,6 +45,8 @@ PARALLEL_PROBE_VECTORS_RAD_PER_M = (
     (0.0, 10e6, 0.0),
     (0.0, -10e6, 0.0),
 )
+MAX_DE_SMOKE_JSON_BYTES = 16 * 1024 * 1024
+MAX_DE_SMOKE_CSV_BYTES = 8 * 1024 * 1024
 PHASE_CONSTRAINT_SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}\Z")
 
 
@@ -412,17 +414,25 @@ def validate_parallel_probe_solver_artifacts(
     }
 
 
-def load_solver_diagnostics(path: Path):
+def load_solver_diagnostics(path: Path, *, verified_bytes: bytes | None = None):
     try:
-        diagnostics = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        raw = Path(path).read_bytes() if verified_bytes is None else verified_bytes
+        if not isinstance(raw, bytes):
+            raise TypeError("verified diagnostics payload must be bytes")
+        diagnostics = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as error:
         raise ValueError("missing or invalid DE-SMOKE solver diagnostics") from error
     if not isinstance(diagnostics, dict):
         raise ValueError("DE-SMOKE solver diagnostics must be an object")
     return diagnostics
 
 
-def validate_selected_only_diagnostics(path: Path, expected_target_frequency_hz: float):
+def validate_selected_only_diagnostics(
+    path: Path,
+    expected_target_frequency_hz: float,
+    *,
+    verified_bytes: bytes | None = None,
+):
     """Validate the native selected-only contract for one single-k sample.
 
     Metadata describes the requested authoring, but it is not evidence that the
@@ -437,7 +447,7 @@ def validate_selected_only_diagnostics(path: Path, expected_target_frequency_hz:
             not math.isfinite(expected_target_frequency_hz) or
             expected_target_frequency_hz <= 0.0):
         raise ValueError("selected-only expected target frequency must be finite and positive")
-    diagnostics = load_solver_diagnostics(path)
+    diagnostics = load_solver_diagnostics(path, verified_bytes=verified_bytes)
     records = diagnostics.get("sample_solver_diagnostics")
     payload = dict(diagnostics)
     if records is not None:
@@ -544,11 +554,14 @@ def diagnostics_by_sample(diagnostics, required_sample_indices, fallback_probe_k
     return by_sample
 
 
-def load_spectrum_v3_modes(path: Path):
+def load_spectrum_v3_modes(path: Path, *, verified_bytes: bytes | None = None):
     """Load per-mode relative residuals and their native block scope."""
     try:
-        spectrum = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        raw = Path(path).read_bytes() if verified_bytes is None else verified_bytes
+        if not isinstance(raw, bytes):
+            raise TypeError("verified spectrum payload must be bytes")
+        spectrum = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as error:
         raise ValueError("missing or invalid native eigen_spectrum.v3 artifact") from error
     if not isinstance(spectrum, dict) or spectrum.get("schema_version") != "eigen_spectrum.v3":
         raise ValueError("native spectrum must use eigen_spectrum.v3")
@@ -811,8 +824,13 @@ def _validate_dynamic_demag_probe(sample_index, probe, *, subwindow_index=None):
     return report
 
 
-def validate_dynamic_demag_probes(path: Path, required_sample_indices):
-    diagnostics = load_solver_diagnostics(path)
+def validate_dynamic_demag_probes(
+    path: Path,
+    required_sample_indices,
+    *,
+    verified_bytes: bytes | None = None,
+):
+    diagnostics = load_solver_diagnostics(path, verified_bytes=verified_bytes)
     by_sample = diagnostics_by_sample(
         diagnostics,
         required_sample_indices,
@@ -865,8 +883,15 @@ def validate_dynamic_demag_probes(path: Path, required_sample_indices):
 def validate_gamma_demag_probe(
     solver_diagnostics_path: Path,
     metadata_path: Path,
-    gamma_sample_index: int):
-    diagnostics = load_solver_diagnostics(solver_diagnostics_path)
+    gamma_sample_index: int,
+    *,
+    verified_solver_diagnostics_bytes: bytes | None = None,
+    verified_metadata_bytes: bytes | None = None,
+):
+    diagnostics = load_solver_diagnostics(
+        solver_diagnostics_path,
+        verified_bytes=verified_solver_diagnostics_bytes,
+    )
     by_sample = diagnostics_by_sample(
         diagnostics,
         [gamma_sample_index],
@@ -898,8 +923,11 @@ def validate_gamma_demag_probe(
         raise ValueError("Gamma K0 demag probe tolerance is invalid")
 
     try:
-        metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        raw = Path(metadata_path).read_bytes() if verified_metadata_bytes is None else verified_metadata_bytes
+        if not isinstance(raw, bytes):
+            raise TypeError("verified metadata payload must be bytes")
+        metadata = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError) as error:
         raise ValueError("missing or invalid DE-SMOKE run metadata") from error
     try:
         model = metadata["problem_meta"]["runtime_metadata"]["de_smoke"]
@@ -1003,7 +1031,8 @@ def validate_gamma_demag_probe(
 def validate_rows(path: Path, sampling: str, solver_diagnostics_path: Path,
                   metadata_path: Path | None = None, *,
                   selection_scope: str = "frequency_window",
-                  verified_csv_bytes: bytes | None = None):
+                  verified_csv_bytes: bytes | None = None,
+                  bundle_reader=None):
     if verified_csv_bytes is not None and not isinstance(verified_csv_bytes, bytes):
         raise TypeError("verified DE-SMOKE CSV payload must be bytes")
     if sampling not in SAMPLING:
@@ -1013,10 +1042,45 @@ def validate_rows(path: Path, sampling: str, solver_diagnostics_path: Path,
     expected = SAMPLING[sampling]
     if selection_scope == "selected_only" and len(expected) != 1:
         raise ValueError("selected-only DE-SMOKE validation requires one k sample")
+    if metadata_path is None:
+        raise ValueError("DE-SMOKE residual validation requires model metadata")
+    if bundle_reader is not None:
+        if verified_csv_bytes is not None:
+            raise ValueError("provide verified CSV bytes or a bundle reader, not both")
+        read_member = getattr(bundle_reader, "read_bytes", None)
+        if not callable(read_member):
+            raise TypeError("DE-SMOKE bundle reader must provide read_bytes")
+        reader_root = getattr(bundle_reader, "root", None)
+        if not isinstance(reader_root, Path):
+            raise ValueError("DE-SMOKE bundle reader has no bound artifact root")
+        reader_root = reader_root.absolute()
+        if (
+            Path(path).absolute() != reader_root / "eigen/dispersion.csv"
+            or Path(solver_diagnostics_path).absolute()
+            != reader_root / "eigen/diagnostics/solver.v1.json"
+            or Path(metadata_path).absolute() != reader_root / "metadata.json"
+        ):
+            raise ValueError("DE-SMOKE paths do not match the captured bundle root")
+        verified_csv_bytes = read_member(
+            "eigen/dispersion.csv", maximum_bytes=MAX_DE_SMOKE_CSV_BYTES)
+        verified_metadata_bytes = read_member(
+            "metadata.json", maximum_bytes=MAX_DE_SMOKE_JSON_BYTES)
+        verified_spectrum_bytes = read_member(
+            "eigen/spectrum.v3.json", maximum_bytes=MAX_DE_SMOKE_JSON_BYTES)
+    else:
+        verified_metadata_bytes = None
+        verified_spectrum_bytes = None
+    verified_diagnostics_bytes = None
     required_probe_samples = [index for index, wavevector in enumerate(expected) if wavevector != 0.0]
     if not required_probe_samples and sampling not in ("k0", "bv-k0"):
         raise ValueError("DE-SMOKE sampling must include a nonzero-k probe")
-    probe_reports = (validate_dynamic_demag_probes(solver_diagnostics_path, required_probe_samples)
+    if bundle_reader is not None and (required_probe_samples or any(k == 0.0 for k in expected)):
+        verified_diagnostics_bytes = bundle_reader.read_bytes(
+            "eigen/diagnostics/solver.v1.json", maximum_bytes=MAX_DE_SMOKE_JSON_BYTES)
+    probe_reports = (validate_dynamic_demag_probes(
+                         solver_diagnostics_path,
+                         required_probe_samples,
+                         verified_bytes=verified_diagnostics_bytes)
                      if required_probe_samples else [])
     gamma_indices = [index for index, wavevector in enumerate(expected) if wavevector == 0.0]
     gamma_report = None
@@ -1024,13 +1088,23 @@ def validate_rows(path: Path, sampling: str, solver_diagnostics_path: Path,
         if metadata_path is None:
             raise ValueError("DE-SMOKE Gamma validation requires run metadata with geometry parameters")
         gamma_report = validate_gamma_demag_probe(
-            solver_diagnostics_path, metadata_path, gamma_indices[0])
-    if metadata_path is None:
-        raise ValueError("DE-SMOKE residual validation requires model metadata")
+            solver_diagnostics_path,
+            metadata_path,
+            gamma_indices[0],
+            verified_solver_diagnostics_bytes=verified_diagnostics_bytes,
+            verified_metadata_bytes=verified_metadata_bytes,
+        )
     try:
-        metadata = json.loads(Path(metadata_path).read_text(encoding="utf-8"))
+        raw_metadata = (
+            Path(metadata_path).read_bytes()
+            if verified_metadata_bytes is None
+            else verified_metadata_bytes
+        )
+        if not isinstance(raw_metadata, bytes):
+            raise TypeError("verified metadata payload must be bytes")
+        metadata = json.loads(raw_metadata.decode("utf-8"))
         model = metadata["problem_meta"]["runtime_metadata"]["de_smoke"]
-    except (OSError, json.JSONDecodeError, KeyError, TypeError) as error:
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError) as error:
         raise ValueError("run metadata is missing the DE-SMOKE solver tolerance") from error
     if not isinstance(model, dict) or model.get("schema") != "fullmag.de-smoke.v1":
         raise ValueError("run metadata has an unsupported DE-SMOKE model descriptor")
@@ -1045,7 +1119,10 @@ def validate_rows(path: Path, sampling: str, solver_diagnostics_path: Path,
     if (isinstance(solver_rtol, bool) or not isinstance(solver_rtol, (int, float)) or
             not math.isfinite(solver_rtol) or solver_rtol <= 0):
         raise ValueError("DE-SMOKE eigen_solver_rtol must be finite and positive")
-    native_modes = load_spectrum_v3_modes(Path(path).parent / "spectrum.v3.json")
+    native_modes = load_spectrum_v3_modes(
+        Path(path).parent / "spectrum.v3.json",
+        verified_bytes=verified_spectrum_bytes,
+    )
     if sampling == "parallel-probe":
         expected_mode_keys = {(sample_index, 0) for sample_index in range(len(expected))}
         if set(native_modes) != expected_mode_keys:

@@ -5828,6 +5828,7 @@ def _validate_evidence_binding(
     if evidence is None:
         reasons.append(f"missing scientific evidence bundle: {EVIDENCE_RELATIVE_PATH.as_posix()}")
         return _new_check("missing", path=EVIDENCE_RELATIVE_PATH.as_posix())
+    reason_start = len(reasons)
     if evidence.get("schema_version") != EVIDENCE_SCHEMA:
         reasons.append("scientific evidence bundle has an unsupported schema_version")
     if evidence.get("case_id") != case:
@@ -5860,7 +5861,7 @@ def _validate_evidence_binding(
             actual = artifacts.get(Path(relative), {}).get("sha256")
             if bindings.get(key) != actual:
                 reasons.append(f"scientific evidence binding does not match current {relative}")
-    return _new_check("pass" if not any("scientific evidence" in reason or "binding" in reason for reason in reasons) else "fail", path=EVIDENCE_RELATIVE_PATH.as_posix())
+    return _new_check("pass" if len(reasons) == reason_start else "fail", path=EVIDENCE_RELATIVE_PATH.as_posix())
 
 
 def _validate_a1_comsol_reference(
@@ -6064,19 +6065,22 @@ def validate_case(
     *,
     parameters_path: Path,
     kpath_path: Path | None = None,
+    bundle_reader: ArtifactBundleReader | None = None,
 ) -> dict[str, Any]:
     """Validate one numeric case and return a JSON-serializable gate report."""
 
     if case not in EXPECTED_CASES:
         raise ScientificGateError(f"unsupported benchmark case: {case}")
     reasons: list[str] = []
-    bundle_reader: ArtifactBundleReader | None = None
     generation_capture_error: OSError | ValueError | None = None
-    try:
-        bundle_reader = ArtifactBundleReader(case_dir)
-    except (OSError, ValueError) as error:
-        generation_capture_error = error
-        reasons.append(f"primary artifact generation capture failed: {error}")
+    if bundle_reader is None:
+        try:
+            bundle_reader = ArtifactBundleReader(case_dir)
+        except (OSError, ValueError) as error:
+            generation_capture_error = error
+            reasons.append(f"primary artifact generation capture failed: {error}")
+    elif bundle_reader.root != Path(case_dir).absolute():
+        raise ScientificGateError("shared artifact reader belongs to a different case output directory")
     artifacts, artifact_reasons = _artifact_map(
         case_dir,
         bundle_reader=bundle_reader,
@@ -6149,8 +6153,79 @@ def validate_case(
             bundle_reader=bundle_reader,
         )
     evidence: dict[str, Any] | None = None
-    if bundle_reader is not None:
-        evidence = _read_captured_json(bundle_reader, EVIDENCE_RELATIVE_PATH, reasons)
+    evidence_sha256: str | None = None
+    evidence_byte_length: int | None = None
+    evidence_in_generation = bool(
+        bundle_reader is not None
+        and bundle_reader.generation is not None
+        and EVIDENCE_RELATIVE_PATH.as_posix() in bundle_reader.generation.members
+    )
+    evidence_source = (
+        "captured_generation_member"
+        if evidence_in_generation
+        else "runner_generated_external_receipt"
+    )
+    evidence_bytes: bytes | None = None
+    evidence_record: Mapping[str, Any] | None = None
+    if evidence_in_generation:
+        assert bundle_reader is not None
+        try:
+            evidence_bytes = bundle_reader.read_bytes(
+                EVIDENCE_RELATIVE_PATH.as_posix(),
+                maximum_bytes=artifact_generation.DEFAULT_MAX_JSON_BYTES,
+            )
+            evidence_record = bundle_reader.record_for(EVIDENCE_RELATIVE_PATH.as_posix())
+            evidence_digest = evidence_record.get("sha256")
+            if not isinstance(evidence_digest, str):
+                raise ValueError("captured receipt has no verified SHA256 record")
+            if evidence_record.get("size_bytes") != len(evidence_bytes):
+                raise ValueError("captured receipt byte length is inconsistent")
+        except (OSError, ValueError) as error:
+            reasons.append(f"captured scientific receipt could not be read: {error}")
+    else:
+        external_evidence_path = _safe_relative_path(
+            case_dir,
+            EVIDENCE_RELATIVE_PATH.as_posix(),
+            "runner-generated external scientific receipt",
+            reasons,
+        )
+        if external_evidence_path is not None:
+            try:
+                with external_evidence_path.open("rb") as stream:
+                    evidence_bytes = stream.read(artifact_generation.DEFAULT_MAX_JSON_BYTES + 1)
+            except OSError as error:
+                reasons.append(f"runner-generated external scientific receipt could not be read: {error}")
+    if evidence_bytes is not None:
+        if len(evidence_bytes) > artifact_generation.DEFAULT_MAX_JSON_BYTES:
+            if evidence_in_generation:
+                reasons.append("captured scientific receipt exceeds its bounded JSON byte limit")
+            else:
+                reasons.append(
+                    "runner-generated external scientific receipt exceeds its bounded JSON byte limit"
+                )
+        else:
+            try:
+                evidence_value = json.loads(evidence_bytes.decode("utf-8"))
+            except (UnicodeError, ValueError) as error:
+                if evidence_in_generation:
+                    reasons.append(f"captured scientific receipt is not valid UTF-8 JSON: {error}")
+                else:
+                    reasons.append(
+                        f"runner-generated external scientific receipt is not valid UTF-8 JSON: {error}"
+                    )
+            else:
+                if not isinstance(evidence_value, dict):
+                    if evidence_in_generation:
+                        reasons.append("captured scientific receipt root must be an object")
+                    else:
+                        reasons.append("runner-generated external scientific receipt root must be an object")
+                else:
+                    evidence = evidence_value
+                    evidence_byte_length = len(evidence_bytes)
+                    if evidence_record is not None:
+                        evidence_sha256 = evidence_record["sha256"].removeprefix("sha256:")
+                    else:
+                        evidence_sha256 = hashlib.sha256(evidence_bytes).hexdigest()
     analytic_columns_check = _new_check("not_applicable")
     if case == "c1" and Path("eigen/dispersion.csv") in artifacts and parameters:
         analytic_columns_check = _validate_primary_analytic_columns(
@@ -6368,7 +6443,13 @@ def validate_case(
         ),
         "primary_equilibrium_member_inventory_complete": False,
         "case_local_evidence_descriptor": EVIDENCE_RELATIVE_PATH.as_posix(),
-        "case_local_evidence_descriptor_bound": evidence is not None,
+        "case_local_evidence_loaded": evidence is not None,
+        "case_local_evidence_descriptor_bound": evidence_check.get("status") == "pass",
+        "case_local_evidence_artifact_binding_status": evidence_check.get("status", "missing"),
+        "case_local_evidence_descriptor_in_generation": evidence_in_generation,
+        "case_local_evidence_source": evidence_source,
+        "case_local_evidence_byte_length": evidence_byte_length,
+        "case_local_evidence_sha256": evidence_sha256,
         "referenced_external_evidence_files_in_generation": False,
         "excluded_inputs": [
             "auxiliary_convergence_and_control_runs",

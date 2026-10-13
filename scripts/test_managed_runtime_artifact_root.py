@@ -73,6 +73,53 @@ class RuntimeArtifactRootTests(unittest.TestCase):
         for key in ("runtime_log", "run_manifest", "output_storage", "metadata", "producer_attestation"):
             self.assertEqual(binding[key + "_sha256"], hashlib.sha256(Path(binding[key]).read_bytes()).hexdigest())
 
+    def test_metadata_loader_binds_supplied_bytes_when_legacy_alias_is_absent(self):
+        metadata_path = self.workspace / "artifacts/metadata.json"
+        metadata_bytes = metadata_path.read_bytes()
+        metadata_path.unlink()
+        loader_roots = []
+
+        def load_metadata(artifact_root):
+            loader_roots.append(artifact_root)
+            return metadata_bytes
+
+        artifact, binding = resolver.resolve_runtime_artifact_root(
+            self.root,
+            self.case,
+            self.sha,
+            metadata_bytes_loader=load_metadata,
+        )
+
+        self.assertEqual(artifact, self.workspace / "artifacts")
+        self.assertEqual(loader_roots, [artifact])
+        self.assertEqual(binding["metadata_sha256"], hashlib.sha256(metadata_bytes).hexdigest())
+        self.assertEqual(binding["metadata_read_source"], "provided_verified_bytes")
+        self.assertEqual(binding["metadata_logical_path"], "metadata.json")
+
+    def test_metadata_loader_bytes_must_match_external_attestation(self):
+        metadata_path = self.workspace / "artifacts/metadata.json"
+        wrong_bytes = metadata_path.read_bytes() + b" "
+
+        with self.assertRaisesRegex(resolver.RuntimeArtifactRootError, "Producer artifact attestation"):
+            resolver.resolve_runtime_artifact_root(
+                self.root,
+                self.case,
+                self.sha,
+                metadata_bytes_loader=lambda _artifact_root: wrong_bytes,
+            )
+
+    def test_metadata_loader_bytes_are_bounded(self):
+        metadata_bytes = (self.workspace / "artifacts/metadata.json").read_bytes()
+
+        with patch.object(resolver, "MAX_METADATA_BYTES", len(metadata_bytes) - 1):
+            with self.assertRaisesRegex(resolver.RuntimeArtifactRootError, "bounded byte payload"):
+                resolver.resolve_runtime_artifact_root(
+                    self.root,
+                    self.case,
+                    self.sha,
+                    metadata_bytes_loader=lambda _artifact_root: metadata_bytes,
+                )
+
     def test_post_terminal_metadata_edit_with_same_identity_is_rejected(self):
         self.metadata["completion"]["converged"] = True
         self.save()

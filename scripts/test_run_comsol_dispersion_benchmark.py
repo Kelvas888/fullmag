@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
 import json
 import ntpath
 from pathlib import Path
@@ -16,7 +17,94 @@ from unittest.mock import Mock, patch
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import frequency_domain_generation as artifact_generation
 import run_comsol_dispersion_benchmark as benchmark
+import validate_comsol_dispersion_scientific_gate as scientific_gate
+
+
+def install_v2_case(case_dir, *, payload_overrides=None, omitted=()):
+    payloads = {
+        "metadata.json": b"{}",
+        "eigen/spectrum.v2.json": json.dumps(
+            {"schema_version": "eigen_spectrum.v2", "samples": []}
+        ).encode("utf-8"),
+        "eigen/branches.v2.json": json.dumps(
+            {"schema_version": "eigen_branches.v2", "branches": []}
+        ).encode("utf-8"),
+        "eigen/dispersion.csv": b"kx_rad_per_m,ky_rad_per_m,frequency_hz\n0,0,1\n",
+        "eigen/diagnostics/solver.v1.json": b"{}",
+        "eigen/metadata/eigen_summary.json": b"{}",
+        "frequency_domain/manifest.v1.json": json.dumps(
+            {"schema_version": "frequency_domain_manifest.v1"}
+        ).encode("utf-8"),
+        "eigen/mode_fields/sample_0000/mode_0000/vector.bin": b"captured-mode-vector",
+    }
+    payloads.update(payload_overrides or {})
+    for relative in omitted:
+        payloads.pop(relative, None)
+    members = {
+        relative: {
+            "byte_length": len(payload),
+            "sha256": "sha256:" + hashlib.sha256(payload).hexdigest(),
+        }
+        for relative, payload in payloads.items()
+    }
+    content = {
+        "schema_version": artifact_generation.SCHEMA_V2,
+        "producer": None,
+        "members": {relative: members[relative] for relative in sorted(members)},
+    }
+    canonical = json.dumps(
+        content, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    generation_id = "sha256:" + hashlib.sha256(canonical).hexdigest()
+    member_root = (
+        case_dir / artifact_generation.GENERATION_DIRECTORY / generation_id[7:]
+    )
+    for relative, payload in payloads.items():
+        path = member_root.joinpath(*relative.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    marker = json.dumps(
+        {"generation_id": generation_id, "content": content},
+        ensure_ascii=False,
+        indent=2,
+        allow_nan=False,
+    ).encode("utf-8")
+    marker_path = case_dir / artifact_generation.IMMUTABLE_COMMIT_PATH
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_bytes(marker)
+    return generation_id, payloads, member_root
+
+
+def c0_evidence_for_payloads(payloads):
+    binding_paths = {
+        "metadata_sha256": "metadata.json",
+        "spectrum_v2_sha256": "eigen/spectrum.v2.json",
+        "branches_v2_sha256": "eigen/branches.v2.json",
+        "dispersion_csv_sha256": "eigen/dispersion.csv",
+        "manifest_sha256": "frequency_domain/manifest.v1.json",
+        "solver_diagnostics_sha256": "eigen/diagnostics/solver.v1.json",
+    }
+    return {
+        "schema_version": benchmark.EVIDENCE_SCHEMA,
+        "case_id": "c0",
+        "numeric_run": {
+            "frequency_source": "native_solver_attested",
+            "analytic_solver_used_for_frequencies": False,
+            "dynamic_demag_operator_source": None,
+        },
+        "artifact_bindings": {
+            key: hashlib.sha256(payloads[relative]).hexdigest()
+            for key, relative in binding_paths.items()
+        },
+        "analytic_controls": {},
+        "convergence": {
+            "mesh": {"status": "pending"},
+            "airbox": {"status": "not_applicable"},
+            "mode_count": {"status": "pending"},
+        },
+    }
 
 
 class ComsolDispersionBenchmarkTests(unittest.TestCase):
@@ -314,43 +402,339 @@ class ComsolDispersionBenchmarkTests(unittest.TestCase):
             with self.assertRaises(benchmark.BenchmarkError):
                 benchmark._validate_case_artifacts(root / "c0", "c1")
 
+    def test_v2_case_artifacts_use_declared_members_not_stale_root_shadows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = Path(directory) / "c0"
+            generation_id, payloads, _ = install_v2_case(case_dir)
+            stale_spectrum = json.dumps(
+                {"schema_version": "eigen_spectrum.v2", "samples": [{"stale": True}]}
+            ).encode("utf-8")
+            stale_path = case_dir / "eigen/spectrum.v2.json"
+            stale_path.parent.mkdir(parents=True, exist_ok=True)
+            stale_path.write_bytes(stale_spectrum)
+            extra_root_vector = case_dir / "eigen/mode_fields/sample_9999/mode_9999/vector.bin"
+            extra_root_vector.parent.mkdir(parents=True, exist_ok=True)
+            extra_root_vector.write_bytes(b"root-only-stale-vector")
+
+            reader = benchmark.ArtifactBundleReader(case_dir)
+            result = benchmark._validate_case_artifacts(
+                case_dir, "c0", bundle_reader=reader
+            )
+
+            expected_spectrum_hash = hashlib.sha256(
+                payloads["eigen/spectrum.v2.json"]
+            ).hexdigest()
+            self.assertEqual(reader.generation.generation_id, generation_id)
+            self.assertEqual(
+                result["required_artifact_hashes"]["eigen/spectrum.v2.json"]["sha256"],
+                expected_spectrum_hash,
+            )
+            self.assertNotEqual(expected_spectrum_hash, hashlib.sha256(stale_spectrum).hexdigest())
+            self.assertEqual(result["mode_field_count"], 1)
+
+    def test_v2_eigen_summary_uses_shared_reader_cache_and_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = Path(directory) / "c0"
+            install_v2_case(case_dir)
+            reader = benchmark.ArtifactBundleReader(case_dir)
+            summary = "eigen/metadata/eigen_summary.json"
+
+            # Seed every declared required input so the patched generation
+            # reader can prove validation stays on ArtifactBundleReader APIs.
+            for relative in benchmark.REQUIRED_CASE_ARTIFACTS:
+                maximum_bytes = (
+                    benchmark.MAX_EIGEN_SUMMARY_BYTES
+                    if relative == summary
+                    else benchmark.MAX_CASE_DISPERSION_CSV_BYTES
+                    if relative == "eigen/dispersion.csv"
+                    else benchmark.MAX_CASE_JSON_BYTES
+                    if relative.endswith(".json")
+                    else None
+                )
+                reader.read_bytes(relative, maximum_bytes=maximum_bytes)
+
+            with patch.object(
+                type(reader.generation),
+                "read_member",
+                side_effect=AssertionError("validation bypassed the shared reader cache"),
+            ), patch.object(reader, "read_bytes", wraps=reader.read_bytes) as read_bytes, patch.object(
+                reader, "record_for", wraps=reader.record_for
+            ) as record_for:
+                result = benchmark._validate_case_artifacts(
+                    case_dir, "c0", bundle_reader=reader
+                )
+
+            read_bytes.assert_any_call(summary, maximum_bytes=benchmark.MAX_EIGEN_SUMMARY_BYTES)
+            record_for.assert_any_call(summary)
+            summary_record = reader.record_for(summary)
+            self.assertEqual(
+                result["required_artifact_hashes"][summary]["sha256"],
+                summary_record["sha256"].removeprefix("sha256:"),
+            )
+
+    def test_v2_missing_or_corrupt_required_member_never_falls_back_to_root(self):
+        stale_spectrum = json.dumps(
+            {"schema_version": "eigen_spectrum.v2", "samples": []}
+        ).encode("utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            missing_case = Path(directory) / "missing"
+            install_v2_case(
+                missing_case,
+                omitted=("eigen/spectrum.v2.json",),
+            )
+            root_spectrum = missing_case / "eigen/spectrum.v2.json"
+            root_spectrum.parent.mkdir(parents=True, exist_ok=True)
+            root_spectrum.write_bytes(stale_spectrum)
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "captured bundle"):
+                benchmark._validate_case_artifacts(missing_case, "c0")
+
+            corrupt_case = Path(directory) / "corrupt"
+            _, _, member_root = install_v2_case(corrupt_case)
+            corrupt_member = member_root / "eigen/spectrum.v2.json"
+            corrupt_member.write_bytes(stale_spectrum + b" ")
+            root_spectrum = corrupt_case / "eigen/spectrum.v2.json"
+            root_spectrum.parent.mkdir(parents=True, exist_ok=True)
+            root_spectrum.write_bytes(stale_spectrum)
+            with self.assertRaisesRegex(benchmark.BenchmarkError, "captured bundle"):
+                benchmark._validate_case_artifacts(corrupt_case, "c0")
+
+    def test_v2_case_artifact_validation_fails_if_final_generation_fence_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = Path(directory) / "c0"
+            install_v2_case(case_dir)
+            reader = benchmark.ArtifactBundleReader(case_dir)
+            marker_path = case_dir / artifact_generation.IMMUTABLE_COMMIT_PATH
+            original_fence = reader.ensure_current
+
+            def change_marker_then_fence():
+                marker_path.write_bytes(b"{}")
+                original_fence()
+
+            with patch.object(reader, "ensure_current", side_effect=change_marker_then_fence):
+                with self.assertRaisesRegex(benchmark.BenchmarkError, "final fence failed"):
+                    benchmark._validate_case_artifacts(
+                        case_dir, "c0", bundle_reader=reader
+                    )
+
+    def test_benchmark_and_scientific_gate_share_capture_with_external_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case_dir = root / "c0"
+            manifest = {
+                "schema_version": "frequency_domain_manifest.v1",
+                "validation": {
+                    "dispersion_frequency_source": "numeric_modal_solver",
+                    "dispersion_reference_model": None,
+                },
+            }
+            payload_overrides = {
+                "frequency_domain/manifest.v1.json": json.dumps(manifest).encode("utf-8"),
+                "eigen/diagnostics/solver.v1.json": json.dumps(
+                    {"solver_model": "slepc_multi_shift_invert_production_cpu_dense"}
+                ).encode("utf-8"),
+            }
+            _, _, _ = install_v2_case(case_dir, payload_overrides=payload_overrides)
+            reader = benchmark.ArtifactBundleReader(case_dir)
+            artifact_result = benchmark._validate_case_artifacts(
+                case_dir, "c0", bundle_reader=reader
+            )
+            benchmark._write_scientific_evidence(
+                case_dir, "c0", artifact_result, bundle_reader=reader
+            )
+            receipt_path = case_dir / benchmark.EVIDENCE_RELATIVE_PATH
+            self.assertFalse(
+                receipt_path.relative_to(case_dir).as_posix() in reader.generation.members
+            )
+
+            parameters_path = root / "parameters.json"
+            parameters_path.write_text("{}", encoding="utf-8")
+            with patch.object(
+                scientific_gate,
+                "ArtifactBundleReader",
+                side_effect=AssertionError("scientific gate must reuse the supplied reader"),
+            ):
+                result = scientific_gate.validate_case(
+                    case_dir,
+                    "c0",
+                    parameters_path=parameters_path,
+                    bundle_reader=reader,
+                )
+
+            coverage = result["artifact_generation_coverage"]
+            self.assertEqual(result["artifact_generation"]["generation_id"], reader.generation.generation_id)
+            self.assertEqual(result["checks"]["artifact_generation_current_fence"]["status"], "pass")
+            self.assertEqual(result["checks"]["artifact_binding"]["status"], "pass")
+            self.assertEqual(result["qualification"], "NOT VERIFIED")
+            self.assertTrue(coverage["case_local_evidence_loaded"])
+            self.assertTrue(coverage["case_local_evidence_descriptor_bound"])
+            self.assertEqual(coverage["case_local_evidence_artifact_binding_status"], "pass")
+            self.assertFalse(coverage["case_local_evidence_descriptor_in_generation"])
+            self.assertEqual(coverage["case_local_evidence_source"], "runner_generated_external_receipt")
+            self.assertEqual(
+                coverage["case_local_evidence_sha256"],
+                hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+            )
+            self.assertEqual(coverage["case_local_evidence_byte_length"], receipt_path.stat().st_size)
+            self.assertFalse(coverage["referenced_external_evidence_files_in_generation"])
+
+            unrelated_reasons = ["unrelated earlier diagnostic"]
+            captured_artifacts = {
+                Path(relative): {"sha256": record["sha256"]}
+                for relative, record in artifact_result["required_artifact_hashes"].items()
+            }
+            binding_check = scientific_gate._validate_evidence_binding(
+                case_dir,
+                json.loads(receipt_path.read_text(encoding="utf-8")),
+                captured_artifacts,
+                "c0",
+                unrelated_reasons,
+            )
+            self.assertEqual(binding_check["status"], "pass")
+            self.assertEqual(unrelated_reasons, ["unrelated earlier diagnostic"])
+
+            for mutation in ("wrong", "missing"):
+                tampered_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+                if mutation == "wrong":
+                    tampered_receipt["artifact_bindings"]["spectrum_v2_sha256"] = "0" * 64
+                else:
+                    tampered_receipt["artifact_bindings"].pop("metadata_sha256")
+                receipt_path.write_text(json.dumps(tampered_receipt), encoding="utf-8")
+                with patch.object(
+                    scientific_gate,
+                    "ArtifactBundleReader",
+                    side_effect=AssertionError("scientific gate must reuse the supplied reader"),
+                ):
+                    tampered_result = scientific_gate.validate_case(
+                        case_dir,
+                        "c0",
+                        parameters_path=parameters_path,
+                        bundle_reader=reader,
+                    )
+                tampered_coverage = tampered_result["artifact_generation_coverage"]
+                self.assertTrue(tampered_coverage["case_local_evidence_loaded"])
+                self.assertFalse(tampered_coverage["case_local_evidence_descriptor_bound"])
+                self.assertEqual(tampered_coverage["case_local_evidence_artifact_binding_status"], "fail")
+                self.assertFalse(tampered_coverage["case_local_evidence_descriptor_in_generation"])
+                self.assertEqual(tampered_coverage["case_local_evidence_source"], "runner_generated_external_receipt")
+                self.assertEqual(
+                    tampered_coverage["case_local_evidence_sha256"],
+                    hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+                )
+                self.assertEqual(tampered_result["checks"]["artifact_generation_current_fence"]["status"], "pass")
+                self.assertEqual(tampered_result["qualification"], "NOT VERIFIED")
+
+    def test_declared_scientific_receipt_uses_verified_generation_member(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case_dir = root / "c0"
+            _, payloads, _ = install_v2_case(case_dir)
+            receipt_bytes = json.dumps(c0_evidence_for_payloads(payloads)).encode("utf-8")
+            generation_id, _, member_root = install_v2_case(
+                case_dir,
+                payload_overrides={benchmark.EVIDENCE_RELATIVE_PATH.as_posix(): receipt_bytes},
+            )
+            receipt_path = benchmark.EVIDENCE_RELATIVE_PATH
+            self.assertIn(receipt_path.as_posix(), benchmark.ArtifactBundleReader(case_dir).generation.members)
+
+            # A conflicting mutable root shadow must not override the declared
+            # generation member.
+            root_shadow = case_dir / receipt_path
+            root_shadow.parent.mkdir(parents=True, exist_ok=True)
+            root_shadow.write_text(json.dumps({"case_id": "shadow"}), encoding="utf-8")
+            reader = benchmark.ArtifactBundleReader(case_dir)
+            parameters_path = root / "parameters.json"
+            parameters_path.write_text("{}", encoding="utf-8")
+            with patch.object(reader, "read_bytes", wraps=reader.read_bytes) as read_bytes, patch.object(
+                reader, "record_for", wraps=reader.record_for
+            ) as record_for:
+                result = scientific_gate.validate_case(
+                    case_dir,
+                    "c0",
+                    parameters_path=parameters_path,
+                    bundle_reader=reader,
+                )
+
+            read_bytes.assert_any_call(
+                receipt_path.as_posix(),
+                maximum_bytes=artifact_generation.DEFAULT_MAX_JSON_BYTES,
+            )
+            record_for.assert_any_call(receipt_path.as_posix())
+            coverage = result["artifact_generation_coverage"]
+            captured_bytes = (member_root / receipt_path).read_bytes()
+            self.assertEqual(result["artifact_generation"]["generation_id"], generation_id)
+            self.assertTrue(coverage["case_local_evidence_loaded"])
+            self.assertTrue(coverage["case_local_evidence_descriptor_in_generation"])
+            self.assertEqual(coverage["case_local_evidence_source"], "captured_generation_member")
+            self.assertEqual(coverage["case_local_evidence_artifact_binding_status"], "pass")
+            self.assertEqual(
+                coverage["case_local_evidence_sha256"],
+                hashlib.sha256(captured_bytes).hexdigest(),
+            )
+            self.assertEqual(coverage["case_local_evidence_byte_length"], len(captured_bytes))
+            self.assertEqual(result["qualification"], "NOT VERIFIED")
+
+    def test_corrupt_declared_scientific_receipt_never_falls_back_to_root_shadow(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            case_dir = root / "c0"
+            _, payloads, _ = install_v2_case(case_dir)
+            receipt_bytes = json.dumps(c0_evidence_for_payloads(payloads)).encode("utf-8")
+            _, _, member_root = install_v2_case(
+                case_dir,
+                payload_overrides={benchmark.EVIDENCE_RELATIVE_PATH.as_posix(): receipt_bytes},
+            )
+            receipt_path = benchmark.EVIDENCE_RELATIVE_PATH
+            (member_root / receipt_path).write_bytes(receipt_bytes + b" ")
+            root_shadow = case_dir / receipt_path
+            root_shadow.parent.mkdir(parents=True, exist_ok=True)
+            root_shadow.write_bytes(receipt_bytes)
+
+            reader = benchmark.ArtifactBundleReader(case_dir)
+            parameters_path = root / "parameters.json"
+            parameters_path.write_text("{}", encoding="utf-8")
+            result = scientific_gate.validate_case(
+                case_dir,
+                "c0",
+                parameters_path=parameters_path,
+                bundle_reader=reader,
+            )
+
+            coverage = result["artifact_generation_coverage"]
+            self.assertTrue(coverage["case_local_evidence_descriptor_in_generation"])
+            self.assertFalse(coverage["case_local_evidence_loaded"])
+            self.assertEqual(coverage["case_local_evidence_source"], "captured_generation_member")
+            self.assertNotEqual(coverage["case_local_evidence_artifact_binding_status"], "pass")
+            self.assertIsNone(coverage["case_local_evidence_sha256"])
+            self.assertTrue(
+                any("captured scientific receipt could not be read" in reason for reason in result["reasons"])
+            )
+            self.assertEqual(result["qualification"], "NOT VERIFIED")
+
     def test_numeric_only_frequency_source_is_recorded_as_non_analytic(self):
         with tempfile.TemporaryDirectory() as directory:
             case_dir = Path(directory) / "c0"
-            (case_dir / "frequency_domain").mkdir(parents=True)
-            (case_dir / "eigen" / "diagnostics").mkdir(parents=True)
-            (case_dir / "frequency_domain" / "manifest.v1.json").write_text(
-                json.dumps(
-                    {
-                        "validation": {
-                            "dispersion_frequency_source": "numeric_modal_solver",
-                            "dispersion_reference_model": None,
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            (case_dir / "eigen" / "diagnostics" / "solver.v1.json").write_text(
-                json.dumps({"solver_model": "slepc_multi_shift_invert_production_cpu_dense"}),
-                encoding="utf-8",
-            )
-            artifact_result = {
-                "required_artifact_hashes": {
-                    relative: {"sha256": chr(97 + index) * 64}
-                    for index, relative in enumerate(
-                        (
-                            "metadata.json",
-                            "eigen/spectrum.v2.json",
-                            "eigen/branches.v2.json",
-                            "eigen/dispersion.csv",
-                            "frequency_domain/manifest.v1.json",
-                            "eigen/diagnostics/solver.v1.json",
-                        )
-                    )
-                }
+            manifest = {
+                "schema_version": "frequency_domain_manifest.v1",
+                "validation": {
+                    "dispersion_frequency_source": "numeric_modal_solver",
+                    "dispersion_reference_model": None,
+                },
             }
+            payload_overrides = {
+                "frequency_domain/manifest.v1.json": json.dumps(manifest).encode("utf-8"),
+                "eigen/diagnostics/solver.v1.json": json.dumps(
+                    {"solver_model": "slepc_multi_shift_invert_production_cpu_dense"}
+                ).encode("utf-8"),
+            }
+            install_v2_case(case_dir, payload_overrides=payload_overrides)
+            reader = benchmark.ArtifactBundleReader(case_dir)
+            artifact_result = benchmark._validate_case_artifacts(
+                case_dir, "c0", bundle_reader=reader
+            )
 
-            benchmark._write_scientific_evidence(case_dir, "c0", artifact_result)
+            benchmark._write_scientific_evidence(
+                case_dir, "c0", artifact_result, bundle_reader=reader
+            )
 
             evidence = json.loads(
                 (case_dir / benchmark.EVIDENCE_RELATIVE_PATH).read_text(encoding="utf-8")
@@ -767,6 +1151,30 @@ class ComsolDispersionBenchmarkTests(unittest.TestCase):
                 "qualification": "NOT VERIFIED",
                 "reasons": ["missing scientific evidence bundle"],
             }
+            shared_readers = []
+
+            def resolver_with_captured_metadata(_output_root, _case, _model_sha, *, metadata_bytes_loader):
+                case_dir = output_dir / "c0"
+                case_dir.mkdir(parents=True, exist_ok=True)
+                (case_dir / "metadata.json").write_bytes(b"{}")
+                metadata_bytes_loader(case_dir)
+                return case_dir, {"fixture_only": True}
+
+            def validate_artifacts(case_dir, case, *, bundle_reader):
+                shared_readers.append(("primary", bundle_reader))
+                return {"case": case}
+
+            def write_scientific_evidence(
+                case_dir, case, artifact_result, scientific_evidence_root=None, *, bundle_reader
+            ):
+                shared_readers.append(("receipt", bundle_reader))
+
+            def validate_scientific_case(
+                case_dir, case, *, parameters_path, kpath_path=None, bundle_reader
+            ):
+                shared_readers.append(("scientific", bundle_reader))
+                return failed_gate
+
             with patch.object(
                 benchmark.subprocess,
                 "run",
@@ -774,15 +1182,15 @@ class ComsolDispersionBenchmarkTests(unittest.TestCase):
             ), patch.object(
                 benchmark,
                 "resolve_runtime_artifact_root",
-                return_value=(output_dir / "c0", {"fixture_only": True}),
+                side_effect=resolver_with_captured_metadata,
             ), patch.object(
                 benchmark,
                 "_validate_case_artifacts",
-                side_effect=lambda case_dir, case: {"case": case},
+                side_effect=validate_artifacts,
             ), patch.object(
                 benchmark,
                 "validate_scientific_case",
-                return_value=failed_gate,
+                side_effect=validate_scientific_case,
             ), patch.object(
                 benchmark,
                 "validate_requested_cases",
@@ -795,7 +1203,7 @@ class ComsolDispersionBenchmarkTests(unittest.TestCase):
             ), patch.object(
                 benchmark,
                 "_write_scientific_evidence",
-                return_value=None,
+                side_effect=write_scientific_evidence,
             ):
                 result_code = benchmark._execute(
                     context,
@@ -810,6 +1218,9 @@ class ComsolDispersionBenchmarkTests(unittest.TestCase):
             self.assertEqual(result["qualification"], "NOT VERIFIED")
             self.assertEqual(result["cases"][0]["scientific_gate"], failed_gate)
             self.assertEqual(result["scientific_gate"]["status"], "not_qualified")
+            self.assertEqual([name for name, _ in shared_readers], ["primary", "receipt", "scientific"])
+            self.assertIs(shared_readers[0][1], shared_readers[1][1])
+            self.assertIs(shared_readers[1][1], shared_readers[2][1])
 
     def test_job_reader_requires_succeeded_modal_build_and_canonical_origin(self):
         with tempfile.TemporaryDirectory() as directory:
