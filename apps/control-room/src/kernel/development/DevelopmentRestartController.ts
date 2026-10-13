@@ -5,7 +5,7 @@ import { isApiInstanceId } from "../api/apiInstancePin";
 /** An owner may confirm a rejected capture only after its own cleanup succeeds. */
 export type DevelopmentRestartCaptureReason = "capture_rejected" | "pending_changes"
   | "document_capture" | "workspace_pause" | "camera_observation"
-  | "workspace_identity" | "workspace_layout";
+  | "workspace_identity" | "workspace_layout" | "candidate_confirmation";
 
 export class DevelopmentRestartCaptureError extends Error {
   readonly cleanupConfirmed: boolean;
@@ -204,6 +204,8 @@ function captureFailureMessage(error: unknown): string {
       return "The current backend and session could not be confirmed. No restart was submitted.";
     case "workspace_layout":
       return "The workspace changed or its layout could not be preserved. No restart was submitted.";
+    case "candidate_confirmation":
+      return "The ready build and protected workspace could not be confirmed together. No restart was submitted.";
     default:
       return "Workspace capture failed; no restart was submitted.";
   }
