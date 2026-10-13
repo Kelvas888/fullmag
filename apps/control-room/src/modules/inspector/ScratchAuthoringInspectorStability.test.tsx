@@ -320,6 +320,7 @@ function createFixture(): Fixture {
       },
     },
     bus,
+    commands: { getSessionScopeKey: () => SESSION_SCOPE_KEY },
     diagnosticRecorder: new DiagnosticRecorderController({ config: { enabled: false } }),
     resources,
   } as unknown as KernelApi;
