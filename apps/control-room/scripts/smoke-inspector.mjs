@@ -913,6 +913,15 @@ async function qualifyObjectMoveGestureAndSharedApply(page, inspector, fixture, 
     label: "Film",
   });
   await page.getByRole("tab", { name: "Geometry", exact: true }).click();
+  await inspector.getByRole("button", { name: "Fit view", exact: true }).click();
+  await page.waitForFunction((maximumDistance) => {
+    const viewport = document.querySelector(".fm-viewport-3d");
+    const position = viewport?.getAttribute("data-camera-position")?.trim().split(/\s+/).map(Number);
+    const target = viewport?.getAttribute("data-camera-target")?.trim().split(/\s+/).map(Number);
+    if (position?.length !== 3 || target?.length !== 3) return false;
+    const distance = Math.hypot(...position.map((value, index) => value - target[index]));
+    return Number.isFinite(distance) && distance > 0 && distance < maximumDistance;
+  }, axisLength * 100, { timeout: 10_000 });
   const moveAction = page.locator('button[data-action-id="builder-tool-move"]');
   await moveAction.waitFor({ state: "visible", timeout: 60_000 });
   await moveAction.click();
@@ -973,6 +982,10 @@ async function qualifyObjectMoveGestureAndSharedApply(page, inspector, fixture, 
   const endPoint = projectViewportWorldPoint(initialDiagnostics, endWorld);
   assertProjectedPointInCanvas(initialDiagnostics, startPoint, "X-axis drag start");
   assertProjectedPointInCanvas(initialDiagnostics, endPoint, "X-axis drag end");
+  assert(
+    Math.hypot(endPoint.x - startPoint.x, endPoint.y - startPoint.y) > 3,
+    "The framed native move must exceed the production drag threshold in CSS pixels.",
+  );
 
   const pointerUpRequestStart = fixture.requests.length;
   await page.mouse.move(startPoint.x, startPoint.y);

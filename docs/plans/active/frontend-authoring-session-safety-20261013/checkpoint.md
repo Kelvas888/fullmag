@@ -153,3 +153,11 @@ Bieżący etap nie zamyka całego R0/R1; audyt pozostaje w dokumentacji PR150.
 - Preview/payload geometry oraz kernel semantic no-op korzystają ze wspólnego parsera SI. Dodatniość domenowa pozostaje oddzielna; non-positive preview dimensions pozostają null.
 - Review P2 bare wrong suffix poprawiony i pokryty regresją. Root sprawdził fix oraz dodatniość. Architecture/API/diff źródłowe PASS, unit/typecheck/browser NOT VERIFIED.
 - Pozostałe integracje: viewport placement preview Number() do zastąpienia; wybrana jednostka kontrolki i per-field unit selector do podłączenia. Ten commit nie kończy PR04 ani R0/R1.
+
+
+## CI043 — typecheck PASS, lint i framing
+
+- Typecheck przeszedł wcześniejsze błędy. Lint FAIL exhaustive-deps475; poprawiono zależność do wyodrębnionego callbacka interaction. Review source bez findings.
+- Browserfixture FAIL staging. Artefakt11809464566 w storage/evidence/frontend-authoring-session-safety-20261013/ci-043 zawiera failureJSON: camera[0,0,1] m, start/end oddalone0.00002 CSSpx, pointerdown1, selectionNothing, writes0. To dowód złego framingu, nie PASS gestu.
+- Smoke używa produkcyjnego Fit view i czeka na kamerę blisko obiektu; wymaga drag>3 CSSpx. Review source bez findings; browserexecution korekty NOT VERIFIED.
+- ParserSI abf7eddd7642dda832b468efa83b84b0f22c3227 zapisany; viewport sharedparser reviewed i zapisany w osobnym fragmencie. Unitmetadata kernel helper etap w realizacji wg pr04-unit-controls-plan.md.

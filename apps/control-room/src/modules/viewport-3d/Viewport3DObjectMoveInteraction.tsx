@@ -468,11 +468,12 @@ export function Viewport3DObjectMoveResourceSurface() {
     selectedObjectId,
     sessionId: sessionIdentity?.sessionId ?? null,
   });
+  const onInteractionGestureActiveChange = interaction.onGestureActiveChange;
   const [orbitBlocked, setOrbitBlocked] = useState(false);
   const handleGestureActiveChange = useCallback((active: boolean) => {
-    interaction.onGestureActiveChange(active);
+    onInteractionGestureActiveChange(active);
     setOrbitBlocked(active);
-  }, [interaction.onGestureActiveChange]);
+  }, [onInteractionGestureActiveChange]);
 
   return (
     <div
