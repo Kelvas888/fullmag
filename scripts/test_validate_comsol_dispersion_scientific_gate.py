@@ -2169,7 +2169,8 @@ class ScientificGateTests(unittest.TestCase):
                 check_spectrum_path = case_dir / check_root / "eigen/spectrum.v2.json"
                 check_branches_path = case_dir / check_root / "eigen/branches.v2.json"
                 check_spectrum = json.loads(check_spectrum_path.read_text(encoding="utf-8"))
-                check_branches = json.loads(check_branches_path.read_text(encoding="utf-8"))["branches"]
+                check_branches_payload = json.loads(check_branches_path.read_text(encoding="utf-8"))
+                check_branches = check_branches_payload["branches"]
                 baseline_frequencies = {
                     (sample["sample_index"], mode["raw_mode_index"]): mode["frequency_real_hz"]
                     for sample in baseline_spectrum["samples"]
@@ -2180,6 +2181,7 @@ class ScientificGateTests(unittest.TestCase):
                         key = (sample["sample_index"], mode["raw_mode_index"])
                         if key in baseline_frequencies:
                             mode["frequency_real_hz"] = baseline_frequencies[key]
+                            _native_mode_diagnostics(mode)
                 baseline_branch_ids = {branch["branch_id"] for branch in baseline_branches}
                 for branch in check_branches:
                     for point in branch["points"]:
@@ -2187,7 +2189,7 @@ class ScientificGateTests(unittest.TestCase):
                         if branch["branch_id"] in baseline_branch_ids and key in baseline_frequencies:
                             point["frequency_real_hz"] = baseline_frequencies[key]
                 _write_json(check_spectrum_path, check_spectrum)
-                _write_json(check_branches_path, {"branches": check_branches})
+                _write_json(check_branches_path, check_branches_payload)
                 section["runs"]["check"] = _bundle_descriptor(case_dir, check_root)
                 if producer_claim:
                     section["cross_run_mode_matching"] = {
