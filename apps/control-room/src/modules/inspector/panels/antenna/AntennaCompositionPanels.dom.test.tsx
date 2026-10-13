@@ -19,6 +19,7 @@ import {
 const mocks = vi.hoisted(() => ({
   commitTransaction: vi.fn(),
   invalidate: vi.fn(),
+  publishCommittedScene: vi.fn(),
   fieldSolution: {
     data: null as AntennaFieldSolutionResource | null,
     error: null as Error | null,
@@ -54,11 +55,12 @@ vi.mock("@/kernel/KernelContext", async (importOriginal) => ({
   useKernel: () => ({
     api: { model: { commitTransaction: mocks.commitTransaction } },
     resources: { invalidate: mocks.invalidate },
+    commands: { getSessionScopeKey: () => "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7" },
   }),
 }));
 
 vi.mock("@/kernel/resources/geometryLifecycleResources", () => ({
-  publishCommittedSceneResource: vi.fn(),
+  publishCommittedSceneResource: mocks.publishCommittedScene,
   useSceneResource: () => mocks.scene,
 }));
 
@@ -111,9 +113,21 @@ vi.mock("./AntennaExternalLeadInspectionPanel", () => ({
 
 import { AntennaCompositionPanel } from "./AntennaCompositionPanels";
 
+function committedDriveAck(transaction: {
+  base_revision: number;
+  merge_patch: { solved_antenna_drives: SceneResource["solved_antenna_drives"] };
+}) {
+  const revision = transaction.base_revision + 1;
+  return {
+    scene_revision: revision,
+    committed_scene: { ...mocks.scene.data!, ...transaction.merge_patch, revision },
+  };
+}
+
 afterEach(() => {
   mocks.commitTransaction.mockReset();
   mocks.invalidate.mockReset();
+  mocks.publishCommittedScene.mockReset();
   mocks.fieldSolution.data = null;
   mocks.fieldSolution.status = "idle";
   mocks.sourceSpectrum.data = null;
@@ -259,6 +273,7 @@ describe("AntennaCompositionPanel runtime results", () => {
   });
   it("rejects activation on a Relax stage before the scene transaction", async () => {
     mocks.scene.data = {
+      scene: { id: "session-1" },
       revision: 3,
       study: { stages: [{ kind: "relax", stage_id: "relax-1" }, { kind: "run", stage_id: "run-1" }] },
       solved_antenna_drives: [{
@@ -291,13 +306,14 @@ describe("AntennaCompositionPanel runtime results", () => {
   });
   it("commits the edited drive with the scene revision and preserves other drives", async () => {
     mocks.scene.data = {
+      scene: { id: "session-1" },
       revision: 7,
       solved_antenna_drives: [
         { id: "drive-1", name: "RF", peak_current_a: 1, port_mode_id: "port-1", projection_ref: "projection-1", time_origin: "stage_local", waveform: { kind: "constant" }, activation: { kind: "all_time_evolution" } },
         { id: "drive-2", name: "Other", peak_current_a: 2, port_mode_id: "port-2", projection_ref: "projection-2", time_origin: "stage_local", waveform: { kind: "constant" }, activation: { kind: "all_time_evolution" } },
       ],
     } as unknown as SceneResource;
-    mocks.commitTransaction.mockResolvedValue({ scene_revision: 8 });
+    mocks.commitTransaction.mockImplementation(async (transaction) => committedDriveAck(transaction));
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
     const root = createRoot(container as unknown as Element);
@@ -324,7 +340,16 @@ describe("AntennaCompositionPanel runtime results", () => {
           expect.objectContaining({ id: "drive-1", peak_current_a: 3 }),
           expect.objectContaining({ id: "drive-2", peak_current_a: 2 }),
         ] },
-      });
+      }, { sessionScopeKey: "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7" });
+      expect(mocks.publishCommittedScene).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.objectContaining({ scene: { id: "session-1" }, revision: 8, solved_antenna_drives: [
+          expect.objectContaining({ id: "drive-1", peak_current_a: 3 }),
+          expect.objectContaining({ id: "drive-2", peak_current_a: 2 }),
+        ] }),
+        8, undefined, false,
+        "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7", undefined,
+      );
       expect(mocks.invalidate).toHaveBeenCalled();
     } finally {
       await act(async () => root.unmount());
@@ -334,13 +359,14 @@ describe("AntennaCompositionPanel runtime results", () => {
 
   it("preserves only edited drive fields on refresh and blocks a same-field overwrite", async () => {
     mocks.scene.data = {
+      scene: { id: "session-1" },
       revision: 7,
       solved_antenna_drives: [
         { id: "drive-1", name: "RF", peak_current_a: 1, port_mode_id: "port-1", projection_ref: "projection-1", time_origin: "stage_local", waveform: { kind: "constant" }, activation: { kind: "all_time_evolution" } },
         { id: "drive-2", name: "Other", peak_current_a: 2, port_mode_id: "port-2", projection_ref: "projection-2", time_origin: "stage_local", waveform: { kind: "constant" }, activation: { kind: "all_time_evolution" } },
       ],
     } as SceneResource;
-    mocks.commitTransaction.mockResolvedValue({ scene_revision: 9 });
+    mocks.commitTransaction.mockImplementation(async (transaction) => committedDriveAck(transaction));
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
     const root = createRoot(container as unknown as Element);
@@ -386,7 +412,7 @@ describe("AntennaCompositionPanel runtime results", () => {
           expect.objectContaining({ id: "drive-1", peak_current_a: 3, waveform: { kind: "sinusoidal", frequency_hz: 1e9, phase_rad: 0.7, offset: 0.2 } }),
           expect.objectContaining({ id: "drive-2", peak_current_a: 4 }),
         ] },
-      });
+      }, { sessionScopeKey: "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7" });
 
       mocks.scene.data = {
         ...mocks.scene.data!, revision: 9,
@@ -415,7 +441,7 @@ describe("AntennaCompositionPanel runtime results", () => {
           expect.objectContaining({ id: "drive-1", peak_current_a: 5 }),
           expect.objectContaining({ id: "drive-2", peak_current_a: 4 }),
         ] },
-      }));
+      }), { sessionScopeKey: "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7" });
     } finally {
       await act(async () => root.unmount());
       dom.restore();
@@ -424,6 +450,7 @@ describe("AntennaCompositionPanel runtime results", () => {
 
   it("keeps the drive draft and blocks another save after a scene revision conflict", async () => {
     mocks.scene.data = {
+      scene: { id: "session-1" },
       revision: 4,
       solved_antenna_drives: [{
         id: "drive-1", name: "RF", peak_current_a: 1, port_mode_id: "port-1",
@@ -481,6 +508,7 @@ describe("AntennaCompositionPanel runtime results", () => {
 
   it("rebases only edited drive fields after refetch and retries with the new revision", async () => {
     mocks.scene.data = {
+      scene: { id: "session-1" },
       revision: 4,
       solved_antenna_drives: [{
         id: "drive-1", name: "RF", peak_current_a: 1, port_mode_id: "port-1",
@@ -488,7 +516,7 @@ describe("AntennaCompositionPanel runtime results", () => {
         waveform: { kind: "constant" }, activation: { kind: "all_time_evolution" },
       }],
     } as unknown as SceneResource;
-    mocks.commitTransaction.mockRejectedValueOnce({ status: 409 }).mockResolvedValueOnce({ scene_revision: 8 });
+    mocks.commitTransaction.mockRejectedValueOnce({ status: 409 }).mockImplementationOnce(async (transaction) => committedDriveAck(transaction));
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
     const root = createRoot(container as unknown as Element);
@@ -546,7 +574,7 @@ describe("AntennaCompositionPanel runtime results", () => {
           peak_current_a: 3,
           waveform: { kind: "sinusoidal", frequency_hz: 1e9, phase_rad: 0.8, offset: 0.3 },
         })] },
-      });
+      }, { sessionScopeKey: "session=session-1&epoch=epoch-1&request_scope_epoch=instance-1%3A7" });
     } finally {
       await act(async () => root.unmount());
       dom.restore();

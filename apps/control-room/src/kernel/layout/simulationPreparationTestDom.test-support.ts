@@ -223,9 +223,11 @@ export class TestElement extends TestNode {
 
   set selected(value: boolean) {
     this.optionSelected = Boolean(value);
-    if (this.optionSelected && this.parentNode instanceof TestElement
-      && this.parentNode.tagName === "SELECT" && !this.parentNode.hasAttribute("multiple")) {
-      for (const option of this.parentNode.options) {
+    let select = this.parentNode;
+    while (select instanceof TestElement && select.tagName === "OPTGROUP") select = select.parentNode;
+    if (this.optionSelected && select instanceof TestElement
+      && select.tagName === "SELECT" && !select.hasAttribute("multiple")) {
+      for (const option of select.options) {
         if (option !== this) option.optionSelected = false;
       }
     }
@@ -284,9 +286,11 @@ export class TestElement extends TestNode {
   }
 
   get options(): TestElement[] {
-    return this.childNodes.filter(
-      (child): child is TestElement => child instanceof TestElement && child.tagName === "OPTION",
-    );
+    return this.childNodes.flatMap((child) => {
+      if (!(child instanceof TestElement)) return [];
+      if (child.tagName === "OPTION") return [child];
+      return child.tagName === "OPTGROUP" ? child.options : [];
+    });
   }
 
   constructor(ownerDocument: TestDocument, tagName: string) {
