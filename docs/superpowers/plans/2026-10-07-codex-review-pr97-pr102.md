@@ -3646,3 +3646,22 @@ Użytkownik zatwierdził wstępnie 0.5% dla każdej pary częstotliwości A1 Ful
 [Native GHA38298716226](https://github.com/MateuszZelent/fullmag/actions/runs/38298716226): clean090c13b, MFEM ON/SLEPc OFF, actual fem_floquet_bloch_scalar_contract PASS1/1, required marker observed, exit0. Receipt SHA256 `d6b173bba0df6f2876b757f4d61df962214a1716e4a2964e82b6354b5b195e4c`; native log SHA256 `1ea7cf63c8c75c230346e50f696aacb354976d991f70b805ef0b1f0bad9874cc`. To dowód elementowego assembly i Gamma reciprocity, nie pełnego solve dyspersji/GPU.
 
 GHA38301161174: render regressions passed, fulltypecheck failed TS2552 at parent alias. Commit8071bc5 uses controller-returned `stageExecution`, already scopefiltered; no guard weakened. Fresh UI CI pending.
+
+
+## Realizacja korekt GPT PRO — checkpoint 2026-10-13
+
+Podstawa audytu GPT PRO: 00392a4bacd31a8e378ac1e05a44bc23f2730e85. Rewizja bieżąca obejmuje osobne źródła, testy kontraktów, runtime i kwalifikację; audyt nie jest raportem dzisiejszego runtime.
+
+| Punkt | Wykonane teraz | Weryfikacja / pozostałe |
+|---|---|---|
+| C01 spectrum_scope | API V2/V3 odczytuje typowaną listę requested scopes, zachowuje None vs [], odrzuca invalid; digest manifestu zmienia dataset_revision. Trzy signed k, osobne stable sample/item IDs i dwa degenerate modes nie są scalane. Commit 4fa31d1a0b4603351af28f44de73b103ddbe4c7e. | [GHA38354208125](https://github.com/MateuszZelent/fullmag/actions/runs/38354208125) SUCCESS: 31 result-dataset tests, w tym trzy nowe named scope cases; 242 FMS, 83 session i pozostałe kontrakty HTTP PASS. Generated transport/UI/export pełnego zakresu nadal w toku. |
+| C02 serial Stop | Latch Stop, terminal try_wait przed cancel/kill, wspólny collector, zachowanie real errors i clean Cancelled jako interruption. Commit 8dfdf625f0f207834fdfd3310c30cef9d2dbd51e; fixture borrow fix 5e71a8569b99ab04af98c30ce0386b63a6d37815. | Pierwsze CI38353910667 FAIL E0382 w fixture, nie dowód solvera. [GHA38354639821](https://github.com/MateuszZelent/fullmag/actions/runs/38354639821) SUCCESS: 25 pool tests, named serial success/error/live kill/Pause/Pause→Stop PASS oraz istniejące output/writer/control gates PASS. Managed sweep NOT VERIFIED. |
+| C03 generacja | Producent dodaje exact-byte member map + SHA256 generation ID, marker last, bounded reader core, final-publication lease i unikalne atomic temp files. Owner jawny albo unbound. ADR0058. Commit 34abffa93d52c8e7af0736552019d87161ecb920. | [GHA38355093226](https://github.com/MateuszZelent/fullmag/actions/runs/38355093226) pending; API capture/fence, typed transport, UI joins/cache w toku. Nie nazywać całego C03 zamkniętym. |
+| C04 native failures | Opt-in getter-only bounded A/B/C input-matrix snapshot, parser rzeczywistego CTest log i always-report po failed CTest. Commit 3782725519768c06eb6ca41fca461f71cc7d72a0. | [Native GHA38354821723](https://github.com/MateuszZelent/fullmag/actions/runs/38354821723) pending. Phase coverage nie dowodzi object pairing ani przyczyny shiftu. Dwa wcześniejsze full/mixed dense failures pozostają open. |
+| C05 invariance | Safety fault guards pozostają odrębne od invariance. Prywatny harness actual backing buffers w toku; po quarantine nie wolno wywoływać PETSc. | Null/unavailable nie zalicza bramki. Genuine post-fault backing-byte measurement i lifetime proof pending. |
+| C06 fixture | Wcześniejszy observer/pattern fixture source gate zachowany; nowe C04 pomiary nie zastępują tego dowodu. | Nie utożsamiać sukcesu fixture ze scientific qualification. |
+| C07 Doctor | Wcześniejsze base/history fixes i scoped Doctor85 zachowane. | Po zmianie C03 UI potrzebna nowa bramka typów/testów/Doctor; browser/WebGL osobno NOT VERIFIED. |
+
+Żaden z tych source gates nie zamyka A1 external equivalence, zbieżności airbox/mesh, signed independent counting, GPU/BEM/RF ani managed runtime. Próg A1 nadal 0.005 per pair. PR97/integracja nadal otwarte.
+
+Chroniony local HEAD1827c3436f80ff17396c285d13c0e269eecf4b25, index SHA256 D867F6996C4A8952B025F0B8644FE5E9806628C3A59706F2D87193AC81641144 i stash a4a7d2f87508b47da6133049df6a2b91a4bfa463 pozostają niezmienione. Publikacja dokładnych fragmentów przez GitData, force:false i exact parent lease; nie wykonano lokalnego fetch/stage/reset ani lokalnych buildów/testów.

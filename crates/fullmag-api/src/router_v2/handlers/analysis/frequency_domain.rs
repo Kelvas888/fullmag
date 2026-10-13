@@ -129,6 +129,17 @@ pub struct FrequencyDomainManifestResource {
     pub result_manifest: Option<FrequencyDomainJsonArtifactResource>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FrequencyDomainArtifactGenerationStatus {
+    /// Legacy artifact without a generation commit; content is not membership-verified.
+    LegacyUnverified,
+    /// Exact member bytes match the commit, but no declared owner is bound to this request.
+    MemberVerifiedUnbound,
+    /// Exact member bytes match the commit and the declared run and stage match this request.
+    MemberVerifiedOwnerBound,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FrequencyDomainJsonArtifactResource {
     pub schema_version: String,
@@ -139,6 +150,13 @@ pub struct FrequencyDomainJsonArtifactResource {
     /// Content-addressed revision of the immutable JSON artifact bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+    /// Committed publication containing this member; only consumed member bytes are verified.
+    /// Absent for legacy artifacts without a generation receipt, which remain unverified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+    /// Verification state for a returned artifact member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_status: Option<FrequencyDomainArtifactGenerationStatus>,
     /// SHA-256 digest of the immutable JSON artifact bytes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_digest: Option<String>,
@@ -808,6 +826,13 @@ pub struct FrequencyDomainTextArtifactResource {
     pub text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<String>,
+    /// Committed publication containing this member; only consumed member bytes are verified.
+    /// Absent for legacy artifacts without a generation receipt, which remain unverified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_id: Option<String>,
+    /// Verification state for a returned artifact member.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation_status: Option<FrequencyDomainArtifactGenerationStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_digest: Option<String>,
     /// Opaque identity of the canonical artifact directory shared by its files.
@@ -1226,19 +1251,26 @@ pub async fn get_frequency_domain_eigen_dispersion(
 ) -> Result<Json<FrequencyDomainTextArtifactResource>, ApiError> {
     let mut captured =
         capture_frequency_domain_artifact_set(&state, &["eigen/dispersion.csv"]).await?;
-    captured.bind_artifact_path("eigen/dispersion.csv");
-    let csv_snapshot = read_text_artifact_snapshot(&captured.artifact_dir, "eigen/dispersion.csv")?;
-    let path_metadata =
-        if try_resolve_artifact_path(&captured.artifact_dir, "eigen/dispersion/path.json")?
-            .is_some()
-        {
-            Some(read_dispersion_path_metadata_resource(
-                &captured.artifact_dir,
-                "eigen/dispersion/path.json",
-            )?)
-        } else {
-            None
-        };
+    captured.bind_artifact_path("eigen/dispersion.csv")?;
+    let csv_snapshot = super::results::read_result_artifact_bytes_snapshot_in_generation(
+        &captured.artifact_dir,
+        "eigen/dispersion.csv",
+        captured.generation.as_ref(),
+        super::results::MAX_RESULT_ARTIFACT_BYTES,
+    )?
+    .map(|(bytes, digest)| {
+        String::from_utf8(bytes)
+            .map(|text| (text, digest))
+            .map_err(|error| ApiError::internal(format!("failed to read text artifact: {error}")))
+    })
+    .transpose()?;
+    captured.bind_artifact_path("eigen/dispersion/path.json")?;
+    let path_metadata = read_dispersion_path_metadata_resource(
+        &captured.artifact_dir,
+        "eigen/dispersion/path.json",
+        captured.generation.as_ref(),
+    )?;
+    captured.bind_artifact_path("eigen/dispersion.csv")?;
     if let (Some((text, _)), Some(path_metadata)) = (csv_snapshot.as_ref(), path_metadata.as_ref())
     {
         validate_dispersion_path_metadata_against_csv(path_metadata, text).map_err(|error| {
@@ -1259,6 +1291,15 @@ pub async fn get_frequency_domain_eigen_dispersion(
         content_type: "text/csv; charset=utf-8".to_string(),
         text,
         revision: content_digest.clone(),
+        generation_id: ready
+            .then(|| {
+                captured
+                    .generation
+                    .as_ref()
+                    .map(|generation| generation.commit.generation_id.clone())
+            })
+            .flatten(),
+        generation_status: ready.then(|| captured.generation_status()).flatten(),
         artifact_set_id: ready.then(|| captured.artifact_set_id.clone()).flatten(),
         session_id: ready
             .then(|| captured.identity.session_id.clone())
@@ -1709,15 +1750,18 @@ pub async fn get_frequency_domain_response_frequency_point(
         &["response/magnetic_response_sweep.v2.json"],
     )
     .await?;
-    let artifact_path =
-        response_frequency_point_artifact_path_from_sweep(&captured.artifact_dir, frequency_index)?
-            .unwrap_or_else(|| {
-                format!(
-                    "response/frequency_points/frequency_{:04}.json",
-                    frequency_index
-                )
-            });
-    captured.bind_artifact_path(&artifact_path);
+    let artifact_path = response_frequency_point_artifact_path_from_sweep(
+        &captured.artifact_dir,
+        frequency_index,
+        captured.generation.as_ref(),
+    )?
+    .unwrap_or_else(|| {
+        format!(
+            "response/frequency_points/frequency_{:04}.json",
+            frequency_index
+        )
+    });
+    captured.bind_artifact_path(&artifact_path)?;
     json_artifact_resource_first_existing_with_context(
         &state,
         captured,
@@ -1734,13 +1778,22 @@ pub async fn get_frequency_domain_response_frequency_point(
 fn response_frequency_point_artifact_path_from_sweep(
     artifact_dir: &std::path::Path,
     frequency_index: u32,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<Option<String>, ApiError> {
-    response_sweep_linked_path(
+    let Some((sweep, _)) = super::results::read_result_artifact_snapshot_in_generation(
         artifact_dir,
+        "response/magnetic_response_sweep.v2.json",
+        generation,
+    )?
+    else {
+        return Ok(None);
+    };
+    Ok(response_sweep_linked_path_from_value(
+        &sweep,
         frequency_index,
         "frequency_point_artifact_path",
         "frequency_point_artifact_paths",
-    )
+    ))
 }
 
 #[utoipa::path(
@@ -1757,7 +1810,7 @@ pub async fn get_frequency_domain_response_field_meta(
     let request_context = crate::capture_current_live_request_context(&state).await?;
     let artifact_dir = require_current_live_artifact_dir(&state).await?;
     let frequency_point_artifact_path =
-        response_frequency_point_artifact_path_from_sweep(&artifact_dir, frequency_index)?
+        response_frequency_point_artifact_path_from_sweep(&artifact_dir, frequency_index, None)?
             .unwrap_or_else(|| {
                 format!(
                     "response/frequency_points/frequency_{:04}.json",
@@ -1889,12 +1942,28 @@ fn response_sweep_linked_path(
     point_field: &str,
     list_field: &str,
 ) -> Result<Option<String>, ApiError> {
-    if try_resolve_artifact_path(artifact_dir, "response/magnetic_response_sweep.v2.json")?
-        .is_none()
-    {
+    let Some((sweep, _)) = super::results::read_result_artifact_snapshot_in_generation(
+        artifact_dir,
+        "response/magnetic_response_sweep.v2.json",
+        None,
+    )?
+    else {
         return Ok(None);
-    }
-    let sweep = read_json_artifact_value(artifact_dir, "response/magnetic_response_sweep.v2.json")?;
+    };
+    Ok(response_sweep_linked_path_from_value(
+        &sweep,
+        frequency_index,
+        point_field,
+        list_field,
+    ))
+}
+
+fn response_sweep_linked_path_from_value(
+    sweep: &Value,
+    frequency_index: u32,
+    point_field: &str,
+    list_field: &str,
+) -> Option<String> {
     if let Some(path) = sweep
         .get("points")
         .and_then(Value::as_array)
@@ -1913,14 +1982,14 @@ fn response_sweep_linked_path(
             })
         })
     {
-        return Ok(Some(path));
+        return Some(path);
     }
-    Ok(sweep
+    sweep
         .get(list_field)
         .and_then(Value::as_array)
         .and_then(|paths| paths.get(frequency_index as usize))
         .and_then(Value::as_str)
-        .map(str::to_string))
+        .map(str::to_string)
 }
 
 async fn json_artifact_resource(
@@ -1958,9 +2027,13 @@ async fn json_artifact_resource_first_existing_with_context(
     resource_key: &str,
 ) -> Result<Json<FrequencyDomainJsonArtifactResource>, ApiError> {
     for artifact_path in artifact_paths {
-        captured.bind_artifact_path(artifact_path);
+        captured.bind_artifact_path(artifact_path)?;
         if let Some((payload_value, content_digest)) =
-            super::results::read_result_artifact_snapshot(&captured.artifact_dir, artifact_path)?
+            super::results::read_result_artifact_snapshot_in_generation(
+                &captured.artifact_dir,
+                artifact_path,
+                captured.generation.as_ref(),
+            )?
         {
             let payload = decode_frequency_domain_artifact_payload(artifact_path, payload_value)?;
             let response = Json(FrequencyDomainJsonArtifactResource {
@@ -1970,6 +2043,11 @@ async fn json_artifact_resource_first_existing_with_context(
                 resource_key: resource_key.to_string(),
                 payload: Some(payload),
                 revision: Some(content_digest.clone()),
+                generation_id: captured
+                    .generation
+                    .as_ref()
+                    .map(|generation| generation.commit.generation_id.clone()),
+                generation_status: captured.generation_status(),
                 content_digest: Some(content_digest),
                 artifact_set_id: captured.artifact_set_id.clone(),
                 session_id: captured.identity.session_id.clone(),
@@ -1983,7 +2061,7 @@ async fn json_artifact_resource_first_existing_with_context(
         }
     }
     let missing_path = artifact_paths.first().copied().unwrap_or_default();
-    captured.bind_artifact_path(missing_path);
+    captured.bind_artifact_path(missing_path)?;
     let response = Json(FrequencyDomainJsonArtifactResource {
         schema_version: schema_version.to_string(),
         status: "missing".to_string(),
@@ -1991,6 +2069,8 @@ async fn json_artifact_resource_first_existing_with_context(
         resource_key: resource_key.to_string(),
         payload: None,
         revision: None,
+        generation_id: None,
+        generation_status: None,
         content_digest: None,
         artifact_set_id: None,
         session_id: None,
@@ -2118,15 +2198,49 @@ pub(crate) struct FrequencyDomainArtifactSetCapture {
     request_context: crate::types::CurrentLiveRequestContext,
     artifact_dir: PathBuf,
     artifact_set_id: Option<String>,
+    generation: Option<fullmag_runner::artifact_generation::GenerationCapture>,
     live_identity: FrequencyDomainCapturedLiveIdentity,
     artifact_path: String,
     identity: FrequencyDomainLiveArtifactIdentity,
 }
 
 impl FrequencyDomainArtifactSetCapture {
-    fn bind_artifact_path(&mut self, artifact_path: &str) {
+    fn bind_artifact_path(&mut self, artifact_path: &str) -> Result<(), ApiError> {
         self.artifact_path = artifact_path.to_string();
         self.identity = self.live_identity.artifact_identity(artifact_path);
+        super::results::validate_generation_producer(
+            self.generation.as_ref(),
+            self.identity.run_id.as_deref(),
+            self.identity.stage_id.as_deref(),
+        )
+    }
+
+    fn generation_status(&self) -> Option<FrequencyDomainArtifactGenerationStatus> {
+        let Some(generation) = self.generation.as_ref() else {
+            return Some(FrequencyDomainArtifactGenerationStatus::LegacyUnverified);
+        };
+        if !generation
+            .commit
+            .content
+            .members
+            .contains_key(&self.artifact_path)
+        {
+            return None;
+        }
+        let owner_bound = generation
+            .commit
+            .content
+            .producer
+            .as_ref()
+            .is_some_and(|producer| {
+                self.identity.run_id.as_deref() == Some(producer.run_id.as_str())
+                    && self.identity.stage_id.as_deref() == Some(producer.stage_id.as_str())
+            });
+        Some(if owner_bound {
+            FrequencyDomainArtifactGenerationStatus::MemberVerifiedOwnerBound
+        } else {
+            FrequencyDomainArtifactGenerationStatus::MemberVerifiedUnbound
+        })
     }
 }
 
@@ -2165,13 +2279,25 @@ async fn capture_frequency_domain_artifact_set(
     let artifact_root = crate::session::current_artifact_dir(snapshot)
         .ok_or_else(|| ApiError::not_found("no artifact directory for the active workspace"))?;
     let (artifact_dir, artifact_set_id) = canonical_frequency_domain_artifact_root(&artifact_root)?;
+    let generation =
+        fullmag_runner::artifact_generation::capture(&artifact_dir).map_err(|error| {
+            ApiError::internal(format!(
+                "invalid frequency-domain artifact generation: {error}"
+            ))
+        })?;
     let live_identity = FrequencyDomainCapturedLiveIdentity::from_snapshot(snapshot);
     let artifact_path = artifact_paths.first().copied().unwrap_or_default();
     let identity = live_identity.artifact_identity(artifact_path);
+    super::results::validate_generation_producer(
+        generation.as_ref(),
+        identity.run_id.as_deref(),
+        identity.stage_id.as_deref(),
+    )?;
     Ok(FrequencyDomainArtifactSetCapture {
         request_context,
         artifact_dir,
         artifact_set_id,
+        generation,
         live_identity,
         artifact_path: artifact_path.to_string(),
         identity,
@@ -2200,6 +2326,9 @@ async fn validate_current_frequency_domain_artifact_set(
     {
         return Err(ApiError::conflict("frequency_domain_artifact_set_stale"));
     }
+    super::results::ensure_generation_capture_current(
+        &captured.artifact_dir, captured.generation.as_ref(),
+    )?;
     Ok(())
 }
 
@@ -2217,21 +2346,6 @@ pub(crate) async fn validate_frequency_domain_artifact_set_for_test(
     captured: &FrequencyDomainArtifactSetCapture,
 ) -> Result<(), ApiError> {
     validate_current_frequency_domain_artifact_set(state, captured).await
-}
-
-fn read_text_artifact_snapshot(
-    artifact_dir: &FsPath,
-    artifact_path: &str,
-) -> Result<Option<(String, String)>, ApiError> {
-    let Some(path) = try_resolve_artifact_path(artifact_dir, artifact_path)? else {
-        return Ok(None);
-    };
-    let bytes = std::fs::read(path)
-        .map_err(|error| ApiError::internal(format!("failed to read artifact: {error}")))?;
-    let content_digest = format!("sha256:{:x}", Sha256::digest(&bytes));
-    let text = String::from_utf8(bytes)
-        .map_err(|error| ApiError::internal(format!("failed to read text artifact: {error}")))?;
-    Ok(Some((text, content_digest)))
 }
 
 pub(crate) fn decode_frequency_domain_artifact_payload(
@@ -3033,8 +3147,16 @@ fn response_frequency_point_artifacts(
 fn read_dispersion_path_metadata_resource(
     artifact_dir: &std::path::Path,
     artifact_path: &str,
-) -> Result<FrequencyDomainKPathMetadataResource, ApiError> {
-    let value = read_json_artifact_value(artifact_dir, artifact_path)?;
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<Option<FrequencyDomainKPathMetadataResource>, ApiError> {
+    let Some((value, _)) = super::results::read_result_artifact_snapshot_in_generation(
+        artifact_dir,
+        artifact_path,
+        generation,
+    )?
+    else {
+        return Ok(None);
+    };
     let normalized = if value.get("sampling").is_some() {
         value
     } else {
@@ -3045,7 +3167,7 @@ fn read_dispersion_path_metadata_resource(
             .map_err(|error| ApiError::internal(format!("invalid {artifact_path}: {error}")))?;
     normalize_and_validate_dispersion_path_metadata(&mut resource)
         .map_err(|error| ApiError::internal(format!("invalid {artifact_path}: {error}")))?;
-    Ok(resource)
+    Ok(Some(resource))
 }
 
 fn normalize_and_validate_dispersion_path_metadata(
@@ -4024,6 +4146,31 @@ fn validate_complex_payload_counts(
 #[cfg(test)]
 mod spectrum_residual_tests {
     use super::*;
+
+    #[test]
+    fn artifact_generation_status_uses_explicit_wire_values() {
+        for (status, expected) in [
+            (
+                FrequencyDomainArtifactGenerationStatus::LegacyUnverified,
+                "legacy_unverified",
+            ),
+            (
+                FrequencyDomainArtifactGenerationStatus::MemberVerifiedUnbound,
+                "member_verified_unbound",
+            ),
+            (
+                FrequencyDomainArtifactGenerationStatus::MemberVerifiedOwnerBound,
+                "member_verified_owner_bound",
+            ),
+        ] {
+            let encoded = serde_json::to_string(&status).unwrap();
+            assert_eq!(encoded, format!("\"{expected}\""));
+            assert_eq!(
+                serde_json::from_str::<FrequencyDomainArtifactGenerationStatus>(&encoded).unwrap(),
+                status
+            );
+        }
+    }
 
     fn spectrum() -> serde_json::Value {
         serde_json::json!({

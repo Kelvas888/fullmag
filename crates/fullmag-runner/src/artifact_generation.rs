@@ -212,7 +212,7 @@ pub fn capture(root: &Path) -> io::Result<Option<GenerationCapture>> {
 impl GenerationCapture {
     pub fn ensure_current(&self, root: &Path) -> io::Result<()> {
         let current = capture(root)?.ok_or_else(|| invalid("generation commit disappeared"))?;
-        if current.commit_digest != self.commit_digest {
+        if current.commit_digest != self.commit_digest || current.commit != self.commit {
             return Err(invalid("frequency-domain generation changed"));
         }
         Ok(())
@@ -272,6 +272,11 @@ mod tests {
         assert_eq!(old.read_member(&tmp.0, "eigen/dispersion.csv").unwrap(), b"two");
         assert!(old.read_member_bounded(&tmp.0, "eigen/dispersion.csv", 2).is_err());
         assert_eq!(old.read_member_bounded(&tmp.0, "eigen/dispersion.csv", 3).unwrap(), b"two");
+        let mut tampered = old.clone();
+        tampered.commit.content.producer = Some(PublicationOwner {
+            run_id: "different-run".into(), stage_id: "different-stage".into(), stage_kind: "eigenmodes".into(),
+        });
+        assert!(tampered.ensure_current(&tmp.0).is_err());
         fs::write(tmp.0.join("eigen/dispersion.csv"), b"new").unwrap();
         assert!(old.read_member(&tmp.0, "eigen/dispersion.csv").is_err());
         publish(&tmp.0, None, ["eigen/spectrum.json".into(), "eigen/dispersion.csv".into()]).unwrap();

@@ -66,3 +66,45 @@ jobs:
           cargo test --locked -p fullmag-api --bin fullmag-api router_v2::tests::postprocessing_definitions:: -- --nocapture | tee "$RUNNER_TEMP/postprocessing-revisions.log"
           grep -F "postprocessing_definition_revision_overflow_conflicts_without_mutating_the_scene ... ok" "$RUNNER_TEMP/postprocessing-revisions.log"
           grep -F "postprocessing_definition_revision_near_max_increments_once ... ok" "$RUNNER_TEMP/postprocessing-revisions.log"
+
+  generated-frequency-domain-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      FULLMAG_PROJECT_STORAGE_ROOT: ${{ github.workspace }}/../storage
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 10.8.1
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.18.0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+      - name: Prepare managed frontend and pinned manifests
+        run: |
+          python -B scripts/fullmag_storage.py prepare-links --profile linux-host --frontend
+          python -B scripts/ci/prepare_eigensolve_ui_workspace.py
+      - name: Install pinned dependencies
+        run: >-
+          python -B scripts/fullmag_storage.py run --profile linux-host --
+          pnpm --dir "$FULLMAG_CI_FRONTEND_WORKSPACE_ROOT" install --frozen-lockfile
+      - name: Generate one canonical API contract from these sources
+        run: >-
+          python -B scripts/fullmag_storage.py run --profile linux-host --
+          pnpm --dir apps/control-room generate:api
+      - name: Preserve generated contract and source identity
+        run: git rev-parse HEAD > apps/control-room/src/kernel/api/generated/source-commit.txt
+      - uses: actions/upload-artifact@v7
+        with:
+          name: eigensolve-generated-api-${{ github.run_id }}
+          path: |
+            apps/control-room/src/kernel/api/generated/openapi-v2.json
+            apps/control-room/src/kernel/api/generated/openapi-v2-types.ts
+            apps/control-room/src/kernel/api/generated/openapi-v2-client.ts
+            apps/control-room/src/kernel/api/generated/source-commit.txt
+          if-no-files-found: error

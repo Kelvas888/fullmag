@@ -45,9 +45,9 @@ pub const ANALYSIS_RESULT_INDEX_SCHEMA_VERSION: &str = "fullmag.analysis.result_
 const DEFAULT_PAGE_LIMIT: usize = 100;
 const MAX_PAGE_LIMIT: usize = 500;
 const MAX_INLINE_AXIS_VALUES: usize = 256;
-// Transitional JSON adapters have a raw-byte budget. Large datasets belong on
+// Transitional JSON/CSV adapters have a raw-byte budget. Large datasets belong on
 // the bounded binary data plane; this is not a bound on serde's parsed heap.
-const MAX_RESULT_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_RESULT_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1152,12 +1152,25 @@ pub async fn get_analysis_result_projection(
 async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollection, ApiError> {
     let request_context = crate::capture_current_live_request_context(state).await?;
     let artifact_dir = require_current_live_artifact_dir(state).await?;
-    let (run_id, default_stage_id) = current_result_identity(state).await?;
+    let (run_id, default_stage_id, request_stage_id) = current_result_identity(state).await?;
+    let generation =
+        fullmag_runner::artifact_generation::capture(&artifact_dir).map_err(|error| {
+            ApiError::internal(format!(
+                "invalid frequency-domain artifact generation: {error}"
+            ))
+        })?;
+    validate_generation_producer(
+        generation.as_ref(),
+        Some(run_id.as_str()),
+        request_stage_id.as_deref(),
+    )?;
     let mut datasets = Vec::new();
 
-    if let Some((value, digest)) =
-        read_result_artifact_snapshot(&artifact_dir, "eigen/field_sweep.v1.json")?
-    {
+    if let Some((value, digest)) = read_result_artifact_snapshot_in_generation(
+        &artifact_dir,
+        "eigen/field_sweep.v1.json",
+        generation.as_ref(),
+    )? {
         let payload =
             match decode_frequency_domain_artifact_payload("eigen/field_sweep.v1.json", value)? {
                 FrequencyDomainJsonArtifactPayload::FieldSweep(payload) => payload,
@@ -1174,9 +1187,11 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
             default_stage_id.as_str(),
         )?);
     }
-    if let Some((value, digest)) =
-        read_result_artifact_snapshot(&artifact_dir, "eigen/spectrum.v3.json")?
-    {
+    if let Some((value, digest)) = read_result_artifact_snapshot_in_generation(
+        &artifact_dir,
+        "eigen/spectrum.v3.json",
+        generation.as_ref(),
+    )? {
         let payload =
             match decode_frequency_domain_artifact_payload("eigen/spectrum.v3.json", value)? {
                 FrequencyDomainJsonArtifactPayload::SpectrumV3(payload) => payload,
@@ -1187,7 +1202,11 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
                 }
             };
         let scope_metadata = spectrum_output_scope_metadata_from_snapshot(
-            read_result_artifact_snapshot(&artifact_dir, "frequency_domain/manifest.v1.json")?,
+            read_result_artifact_snapshot_in_generation(
+                &artifact_dir,
+                "frequency_domain/manifest.v1.json",
+                generation.as_ref(),
+            )?,
         )?;
         datasets.push(build_spectrum_v3_index(
             payload,
@@ -1196,9 +1215,11 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
             default_stage_id.as_str(),
             scope_metadata,
         )?);
-    } else if let Some((value, digest)) =
-        read_result_artifact_snapshot(&artifact_dir, "eigen/spectrum.v2.json")?
-    {
+    } else if let Some((value, digest)) = read_result_artifact_snapshot_in_generation(
+        &artifact_dir,
+        "eigen/spectrum.v2.json",
+        generation.as_ref(),
+    )? {
         let payload =
             match decode_frequency_domain_artifact_payload("eigen/spectrum.v2.json", value)? {
                 FrequencyDomainJsonArtifactPayload::Spectrum(payload) => payload,
@@ -1209,7 +1230,11 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
                 }
             };
         let scope_metadata = spectrum_output_scope_metadata_from_snapshot(
-            read_result_artifact_snapshot(&artifact_dir, "frequency_domain/manifest.v1.json")?,
+            read_result_artifact_snapshot_in_generation(
+                &artifact_dir,
+                "frequency_domain/manifest.v1.json",
+                generation.as_ref(),
+            )?,
         )?;
         datasets.push(build_spectrum_v2_index(
             payload,
@@ -1220,9 +1245,11 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
         )?);
     }
 
-    if let Some((value, digest)) =
-        read_result_artifact_snapshot(&artifact_dir, "response/magnetic_response_sweep.v2.json")?
-    {
+    if let Some((value, digest)) = read_result_artifact_snapshot_in_generation(
+        &artifact_dir,
+        "response/magnetic_response_sweep.v2.json",
+        generation.as_ref(),
+    )? {
         let payload = match decode_frequency_domain_artifact_payload(
             "response/magnetic_response_sweep.v2.json",
             value,
@@ -1294,6 +1321,7 @@ async fn load_result_indices(state: &Arc<AppState>) -> Result<ResultIndexCollect
     }
 
     crate::validate_current_live_request_context(state, &request_context).await?;
+    ensure_generation_capture_current(&artifact_dir, generation.as_ref())?;
     Ok(ResultIndexCollection { run_id, datasets })
 }
 
@@ -1333,7 +1361,9 @@ fn spectrum_output_scope_metadata_from_snapshot(
     })
 }
 
-async fn current_result_identity(state: &Arc<AppState>) -> Result<(String, String), ApiError> {
+async fn current_result_identity(
+    state: &Arc<AppState>,
+) -> Result<(String, String, Option<String>), ApiError> {
     let current = state.current_live_state.read().await;
     let snapshot = current.as_ref().ok_or_else(|| {
         ApiError::not_found("RESULT_RUN_NOT_FOUND: no active local live workspace")
@@ -1343,17 +1373,16 @@ async fn current_result_identity(state: &Arc<AppState>) -> Result<(String, Strin
         .as_ref()
         .map(|run| run.run_id.clone())
         .unwrap_or_else(|| snapshot.session.run_id.clone());
-    let stage_id = snapshot
-        .stage_execution
-        .as_ref()
-        .and_then(|execution| {
-            execution
-                .active_stage_index
-                .and_then(|index| execution.stages.get(index))
-                .and_then(|stage| stage.stage_id.clone())
-        })
+    let request_stage_id = snapshot.stage_execution.as_ref().and_then(|execution| {
+        execution
+            .active_stage_index
+            .and_then(|index| execution.stages.get(index))
+            .and_then(|stage| stage.stage_id.clone())
+    });
+    let default_stage_id = request_stage_id
+        .clone()
         .unwrap_or_else(|| "stage:analysis".to_string());
-    Ok((run_id, stage_id))
+    Ok((run_id, default_stage_id, request_stage_id))
 }
 
 fn ensure_run(collection: &ResultIndexCollection, requested_run_id: &str) -> Result<(), ApiError> {
@@ -3783,11 +3812,115 @@ pub(super) fn read_result_artifact_snapshot(
     decode_result_artifact_snapshot(file, artifact_path, MAX_RESULT_ARTIFACT_BYTES).map(Some)
 }
 
-fn decode_result_artifact_snapshot(
+/// Read an artifact from the captured publication when one is available.
+/// A missing member is not read from the mutable directory as a fallback.
+pub(super) fn read_result_artifact_snapshot_in_generation(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<Option<(Value, String)>, ApiError> {
+    let Some((bytes, digest)) = read_result_artifact_bytes_snapshot_in_generation(
+        artifact_dir,
+        artifact_path,
+        generation,
+        MAX_RESULT_ARTIFACT_BYTES,
+    )?
+    else {
+        return Ok(None);
+    };
+    let value = parse_result_artifact_bytes(&bytes, artifact_path)?;
+    Ok(Some((value, digest)))
+}
+
+/// Return the exact bounded bytes and digest read from either a committed
+/// generation member or the explicitly unverified legacy directory path.
+pub(super) fn read_result_artifact_bytes_snapshot_in_generation(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+    byte_limit: u64,
+) -> Result<Option<(Vec<u8>, String)>, ApiError> {
+    let bytes = if let Some(generation) = generation {
+        if !generation
+            .commit
+            .content
+            .members
+            .contains_key(artifact_path)
+        {
+            return Ok(None);
+        }
+        generation
+            .read_member_bounded(artifact_dir, artifact_path, byte_limit)
+            .map_err(|error| {
+                if generation.ensure_current(artifact_dir).is_err() {
+                    ApiError::conflict("frequency_domain_artifact_generation_stale")
+                } else {
+                    ApiError::internal(format!(
+                        "failed to read committed result artifact '{artifact_path}': {error}"
+                    ))
+                }
+            })?
+    } else {
+        let Some(path) = try_resolve_artifact_path(artifact_dir, artifact_path)? else {
+            return Ok(None);
+        };
+        let file = std::fs::File::open(path).map_err(|error| {
+            ApiError::internal(format!(
+                "failed to open result artifact '{artifact_path}': {error}"
+            ))
+        })?;
+        if !file.metadata()?.is_file() {
+            return Err(ApiError::internal(format!(
+                "RESULT_ARTIFACT_NOT_REGULAR: '{artifact_path}' must be a regular file"
+            )));
+        }
+        read_result_artifact_bytes(file, artifact_path, byte_limit)?
+    };
+    let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+    Ok(Some((bytes, digest)))
+}
+
+/// Fence both committed publications and the absence captured for legacy reads.
+pub(super) fn ensure_generation_capture_current(
+    root: &Path,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<(), ApiError> {
+    if let Some(generation) = generation {
+        generation.ensure_current(root)
+            .map_err(|_| ApiError::conflict("frequency_domain_artifact_generation_stale"))
+    } else {
+        match fullmag_runner::artifact_generation::capture(root) {
+            Ok(None) => Ok(()),
+            _ => Err(ApiError::conflict("frequency_domain_artifact_generation_stale")),
+        }
+    }
+}
+
+pub(super) fn validate_generation_producer(
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+    request_run_id: Option<&str>,
+    request_stage_id: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(producer) =
+        generation.and_then(|generation| generation.commit.content.producer.as_ref())
+    else {
+        return Ok(());
+    };
+    if request_run_id.is_some_and(|run_id| run_id != producer.run_id.as_str())
+        || request_stage_id.is_some_and(|stage_id| stage_id != producer.stage_id.as_str())
+    {
+        return Err(ApiError::conflict(
+            "frequency_domain_artifact_generation_owner_mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn read_result_artifact_bytes(
     reader: impl Read,
     artifact_path: &str,
     byte_limit: u64,
-) -> Result<(Value, String), ApiError> {
+) -> Result<Vec<u8>, ApiError> {
     // The extra byte detects growth beyond the budget without trusting metadata.
     let mut bytes = Vec::new();
     reader
@@ -3800,16 +3933,30 @@ fn decode_result_artifact_snapshot(
         })?;
     if bytes.len() as u64 > byte_limit {
         return Err(ApiError::internal(format!(
-            "RESULT_ARTIFACT_BYTE_LIMIT: '{artifact_path}' exceeds the {byte_limit}-byte JSON adapter budget"
+            "RESULT_ARTIFACT_BYTE_LIMIT: '{artifact_path}' exceeds the {byte_limit}-byte adapter budget"
         )));
     }
-    let value = serde_json::from_slice(&bytes).map_err(|error| {
+    Ok(bytes)
+}
+
+fn decode_result_artifact_snapshot(
+    reader: impl Read,
+    artifact_path: &str,
+    byte_limit: u64,
+) -> Result<(Value, String), ApiError> {
+    let bytes = read_result_artifact_bytes(reader, artifact_path, byte_limit)?;
+    let value = parse_result_artifact_bytes(&bytes, artifact_path)?;
+    let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
+    Ok((value, digest))
+}
+
+fn parse_result_artifact_bytes(bytes: &[u8], artifact_path: &str) -> Result<Value, ApiError> {
+    let value = serde_json::from_slice(bytes).map_err(|error| {
         ApiError::internal(format!(
             "failed to parse result artifact '{artifact_path}': {error}"
         ))
     })?;
-    let digest = format!("sha256:{:x}", Sha256::digest(&bytes));
-    Ok((value, digest))
+    Ok(value)
 }
 
 fn derived_dataset_revision(
@@ -5953,5 +6100,200 @@ mod tests {
             "certified by bounded legacy adapter"
         );
         assert_eq!(index.manifest.provenance["source_drive"], "H_drive_y [A/m]");
+    }
+}
+
+#[cfg(test)]
+mod generation_snapshot_tests {
+    use super::*;
+    use fullmag_runner::artifact_generation::{
+        GenerationBody, GenerationCommit, GenerationMember, PublicationOwner, COMMIT_PATH,
+    };
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+
+    struct TempGenerationRoot(PathBuf);
+
+    impl TempGenerationRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "result-generation-snapshot-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for TempGenerationRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn publish_one_member(
+        root: &Path,
+        path: &str,
+        bytes: &[u8],
+        producer: Option<PublicationOwner>,
+    ) -> fullmag_runner::artifact_generation::GenerationCapture {
+        let member_path = root.join(path);
+        std::fs::create_dir_all(member_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(root.join("frequency_domain")).unwrap();
+        std::fs::write(&member_path, bytes).unwrap();
+        let members = BTreeMap::from([(
+            path.to_string(),
+            GenerationMember {
+                byte_length: bytes.len() as u64,
+                sha256: format!("sha256:{:x}", Sha256::digest(bytes)),
+            },
+        )]);
+        let content = GenerationBody {
+            schema_version: "frequency_domain_artifact_generation.v1".to_string(),
+            producer,
+            members,
+        };
+        let generation_id = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&content).unwrap())
+        );
+        let commit = GenerationCommit {
+            generation_id,
+            content,
+        };
+        std::fs::write(
+            root.join(COMMIT_PATH),
+            serde_json::to_vec_pretty(&commit).unwrap(),
+        )
+        .unwrap();
+        fullmag_runner::artifact_generation::capture(root)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn legacy_capture_fence_rejects_a_new_publication() {
+        let root = TempGenerationRoot::new();
+        assert!(ensure_generation_capture_current(&root.0, None).is_ok());
+        let generation = publish_one_member(&root.0, "eigen/spectrum.v3.json", b"{}", None);
+        assert!(ensure_generation_capture_current(&root.0, None).is_err());
+        assert!(ensure_generation_capture_current(&root.0, Some(&generation)).is_ok());
+        publish_one_member(&root.0, "eigen/spectrum.v3.json", b"{ }", None);
+        assert!(ensure_generation_capture_current(&root.0, Some(&generation)).is_err());
+    }
+
+    #[test]
+    fn committed_snapshot_reads_only_bounded_digest_verified_members() {
+        let root = TempGenerationRoot::new();
+        let member = br#"{"schema_version":"eigen_spectrum.v3","generation":1}"#;
+        let generation = publish_one_member(
+            &root.0,
+            "eigen/spectrum.v3.json",
+            member,
+            Some(PublicationOwner {
+                run_id: "run:one".to_string(),
+                stage_id: "stage:one".to_string(),
+                stage_kind: "eigen".to_string(),
+            }),
+        );
+        std::fs::write(
+            root.0.join("eigen/spectrum.v2.json"),
+            br#"{"schema_version":"eigen_spectrum.v2"}"#,
+        )
+        .unwrap();
+
+        let (value, digest) = read_result_artifact_snapshot_in_generation(
+            &root.0,
+            "eigen/spectrum.v3.json",
+            Some(&generation),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(value["schema_version"], "eigen_spectrum.v3");
+        assert_eq!(value["generation"], 1);
+        assert_eq!(digest, format!("sha256:{:x}", Sha256::digest(member)));
+        assert!(read_result_artifact_snapshot_in_generation(
+            &root.0,
+            "eigen/spectrum.v2.json",
+            Some(&generation),
+        )
+        .unwrap()
+        .is_none());
+        assert!(read_result_artifact_bytes_snapshot_in_generation(
+            &root.0,
+            "eigen/spectrum.v3.json",
+            Some(&generation),
+            1,
+        )
+        .is_err());
+
+        let changed_member = br#"{"schema_version":"eigen_spectrum.v3","generation":2}"#;
+        assert_eq!(member.len(), changed_member.len());
+        std::fs::write(root.0.join("eigen/spectrum.v3.json"), changed_member).unwrap();
+        assert!(read_result_artifact_snapshot_in_generation(
+            &root.0,
+            "eigen/spectrum.v3.json",
+            Some(&generation),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn legacy_absence_stays_unbound_and_generation_owner_is_only_compared_when_present() {
+        let root = TempGenerationRoot::new();
+        let member = br#"{"schema_version":"eigen_spectrum.v3","samples":[]}"#;
+        let generation = publish_one_member(
+            &root.0,
+            "eigen/spectrum.v3.json",
+            member,
+            Some(PublicationOwner {
+                run_id: "run:one".to_string(),
+                stage_id: "stage:one".to_string(),
+                stage_kind: "eigen".to_string(),
+            }),
+        );
+        assert!(validate_generation_producer(
+            Some(&generation),
+            Some("run:one"),
+            Some("stage:one"),
+        )
+        .is_ok());
+        assert!(validate_generation_producer(Some(&generation), Some("run:other"), None).is_err());
+
+        std::fs::remove_file(root.0.join(COMMIT_PATH)).unwrap();
+        let legacy_generation = fullmag_runner::artifact_generation::capture(&root.0).unwrap();
+        assert!(legacy_generation.is_none());
+        assert!(validate_generation_producer(None, Some("run:other"), Some("stage:other")).is_ok());
+        let (value, _) =
+            read_result_artifact_snapshot_in_generation(&root.0, "eigen/spectrum.v3.json", None)
+                .unwrap()
+                .unwrap();
+        assert_eq!(value["schema_version"], "eigen_spectrum.v3");
+    }
+
+    #[test]
+    fn committed_csv_snapshot_returns_the_exact_bounded_member_bytes() {
+        let root = TempGenerationRoot::new();
+        let csv = b"sample_index,kx_rad_per_m,ky_rad_per_m,kz_rad_per_m\n0,1,0,0\n";
+        let generation = publish_one_member(&root.0, "eigen/dispersion.csv", csv, None);
+
+        let (bytes, digest) = read_result_artifact_bytes_snapshot_in_generation(
+            &root.0,
+            "eigen/dispersion.csv",
+            Some(&generation),
+            csv.len() as u64,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(bytes.as_slice(), csv.as_slice());
+        assert_eq!(digest, format!("sha256:{:x}", Sha256::digest(csv)));
+        assert!(read_result_artifact_bytes_snapshot_in_generation(
+            &root.0,
+            "eigen/dispersion.csv",
+            Some(&generation),
+            csv.len() as u64 - 1,
+        )
+        .is_err());
     }
 }
