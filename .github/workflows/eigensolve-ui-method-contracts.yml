@@ -19,6 +19,8 @@ on:
       - 'apps/control-room/src/kernel/analysis-modules/postprocessingCommandContributions*'
       - 'apps/control-room/src/kernel/analysis-modules/postprocessingDefinitions*'
       - 'apps/control-room/src/kernel/resources/postprocessingDefinitionResources*'
+      - 'apps/control-room/src/kernel/resources/studyRuntimeResources*'
+      - 'apps/control-room/src/kernel/api/generated/openapi-v2*'
       - 'apps/control-room/src/modules/analysis-plots/referenceOverlaySeries.test.ts'
       - 'apps/control-room/src/modules/analysis-plots/useAnalysisPlotsController.ts'
       - 'apps/control-room/src/modules/analysis-plots/referenceChartQuantity.test.ts'
@@ -49,6 +51,8 @@ on:
       - 'apps/control-room/src/kernel/analysis-modules/postprocessingCommandContributions*'
       - 'apps/control-room/src/kernel/analysis-modules/postprocessingDefinitions*'
       - 'apps/control-room/src/kernel/resources/postprocessingDefinitionResources*'
+      - 'apps/control-room/src/kernel/resources/studyRuntimeResources*'
+      - 'apps/control-room/src/kernel/api/generated/openapi-v2*'
       - 'apps/control-room/src/modules/analysis-plots/referenceOverlaySeries.test.ts'
       - 'apps/control-room/src/modules/analysis-plots/useAnalysisPlotsController.ts'
       - 'apps/control-room/src/modules/analysis-plots/referenceChartQuantity.test.ts'
@@ -116,6 +120,7 @@ jobs:
           src/kernel/analysis-modules/postprocessingCommandContributions.test.ts
           src/kernel/analysis-modules/postprocessingDefinitions.test.ts
           src/kernel/resources/postprocessingDefinitionResources.test.tsx
+          src/kernel/resources/studyRuntimeResources.test.ts
           src/modules/analysis-plots/referenceOverlaySeries.test.ts
           src/modules/analysis-plots/referenceChartQuantity.test.ts
           src/shared/domain/analysis/modalDampingObservables.test.ts

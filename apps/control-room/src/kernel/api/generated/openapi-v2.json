@@ -1117,6 +1117,16 @@
             },
             "type": "array"
           },
+          "spectrum_output_scopes": {
+            "description": "Requested output scopes declared by the producer manifest. This does not\ndescribe which requested outputs completed or were resolved.",
+            "items": {
+              "$ref": "#/components/schemas/AnalysisResultSpectrumOutputScope"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "stage_id": {
             "type": "string"
           },
@@ -2020,6 +2030,13 @@
           "relations"
         ],
         "type": "object"
+      },
+      "AnalysisResultSpectrumOutputScope": {
+        "enum": [
+          "per_sample",
+          "global"
+        ],
+        "type": "string"
       },
       "AnalysisResultStatusFacets": {
         "properties": {
@@ -10181,6 +10198,14 @@
         "additionalProperties": true,
         "type": "object"
       },
+      "FrequencyDomainArtifactGenerationStatus": {
+        "enum": [
+          "legacy_unverified",
+          "member_verified_unbound",
+          "member_verified_owner_bound"
+        ],
+        "type": "string"
+      },
       "FrequencyDomainAvailabilitySummaryResource": {
         "properties": {
           "diagnostics_json": {
@@ -11550,6 +11575,24 @@
               "null"
             ]
           },
+          "generation_id": {
+            "description": "Committed publication containing this member; only consumed member bytes are verified.\nAbsent for legacy artifacts without a generation receipt, which remain unverified.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation_status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FrequencyDomainArtifactGenerationStatus",
+                "description": "Verification state for a returned artifact member."
+              }
+            ]
+          },
           "mesh_generation_id": {
             "description": "Runtime mesh generation bound to the publishing stage.",
             "type": [
@@ -12867,6 +12910,24 @@
           },
           "content_type": {
             "type": "string"
+          },
+          "generation_id": {
+            "description": "Committed publication containing this member; only consumed member bytes are verified.\nAbsent for legacy artifacts without a generation receipt, which remain unverified.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "generation_status": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/FrequencyDomainArtifactGenerationStatus",
+                "description": "Verification state for a returned artifact member."
+              }
+            ]
           },
           "mesh_generation_id": {
             "type": [

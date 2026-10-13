@@ -35,6 +35,8 @@ import {
 
 const artifactOwnership = {
   artifact_set_id: "fixture-artifact-set",
+  generation_id: "fixture-generation",
+  generation_status: "member_verified_owner_bound" as const,
   session_id: "session-a",
   run_id: "run-a",
   stage_id: "stage-a",
@@ -787,7 +789,7 @@ describe("frequencyDomainChartModels", () => {
     });
   });
 
-  it("enriches branch handoff only from the same owned artifact set", () => {
+  it("enriches branch handoff only from the same owner-bound artifact generation", () => {
     const branches = jsonResource({ branches: [{ branch_id: "acoustic", points: [{
       frequency_real_hz: 1.3e9, raw_mode_index: 2, sample_index: 1,
     }] }] });
@@ -808,6 +810,10 @@ describe("frequencyDomainChartModels", () => {
 
     const matched = buildEigenBranchesModel({ ...branches, content_digest: "json-digest" }, dispersion);
     const point = matched.branches[0]!.points[0]!;
+    expect(matched.artifactOwnership).toMatchObject({
+      generation_id: "fixture-generation",
+      generation_status: "member_verified_owner_bound",
+    });
     expect(point.pathS).toBe(1e7);
     expect(point.wavevectorKf).toEqual([1e7, 0, 0]);
     const selection = buildEigenBranchPointModeSelectionRef("acoustic", point);
@@ -823,6 +829,41 @@ describe("frequencyDomainChartModels", () => {
       expect(mismatched.branches[0]!.points[0]!.pathS).toBeUndefined();
       expect(mismatched.diagnostics).toContain("dispersion enrichment omitted: artifact ownership is missing or mismatched");
     }
+    const generationMismatches: FrequencyDomainTextArtifactLike[] = [
+      { ...dispersion, generation_id: "different-generation" },
+      { ...dispersion, generation_id: "   " },
+      { ...dispersion, generation_id: undefined },
+      { ...dispersion, generation_status: "member_verified_unbound" },
+      { ...dispersion, generation_status: "legacy_unverified" },
+      { ...dispersion, generation_status: undefined },
+    ];
+    const differentGeneration = generationMismatches[0]!;
+    expect(differentGeneration.artifact_set_id).toBe(dispersion.artifact_set_id);
+    expect(differentGeneration.content_digest).toBe(dispersion.content_digest);
+    expect(differentGeneration.text?.length).toBe(dispersion.text?.length);
+    for (const unverified of generationMismatches) {
+      const omitted = buildEigenBranchesModel(branches, unverified);
+      expect(omitted.branches[0]!.points[0]!.wavevectorKf).toBeUndefined();
+      expect(omitted.branches[0]!.points[0]!.pathS).toBeUndefined();
+      expect(omitted.diagnostics).toContain(
+        "dispersion enrichment omitted: artifact ownership is missing or mismatched",
+      );
+      const dispersionModel = buildEigenDispersionChartModel(
+        unverified,
+        buildEigenBranchesModel(branches),
+      );
+      expect(dispersionModel.points[0]!.branchId).toBeNull();
+    }
+    const unboundPair = buildEigenBranchesModel(
+      { ...branches, generation_status: "member_verified_unbound" },
+      { ...dispersion, generation_status: "member_verified_unbound" },
+    );
+    expect(unboundPair.branches[0]!.points[0]!.pathS).toBeUndefined();
+    const legacyPair = buildEigenBranchesModel(
+      { ...branches, generation_status: "legacy_unverified" },
+      { ...dispersion, generation_status: "legacy_unverified" },
+    );
+    expect(legacyPair.branches[0]!.points[0]!.pathS).toBeUndefined();
     const unowned = buildEigenBranchesModel(branches, { ...dispersion, artifact_set_id: undefined });
     expect(unowned.branches[0]!.points[0]!.wavevectorKf).toBeUndefined();
 
@@ -833,6 +874,36 @@ describe("frequencyDomainChartModels", () => {
     const own = buildEigenBranchesModel(ownedPoint, { ...dispersion, run_id: "foreign-run" }).branches[0]!.points[0]!;
     expect(own.wavevectorKf).toEqual([-3e7, 0, 0]);
     expect(own.pathS).toBe(3e7);
+  });
+
+  it("keeps historical standalone artifacts visible while refusing unverified joins", () => {
+    const legacyBranches = jsonResource({ branches: [{ branch_id: "acoustic", points: [{
+      frequency_real_hz: 1.3e9, raw_mode_index: 2, sample_index: 1,
+    }] }] }, "eigen/branches.v2.json");
+    const legacyDispersion: FrequencyDomainTextArtifactLike = {
+      ...textResource("sample_index,raw_mode_index,path_s_rad_per_m,frequency_hz\n1,2,10000000,1.3e9"),
+      generation_id: undefined,
+      generation_status: undefined,
+    };
+    const standaloneBranches = buildEigenBranchesModel({
+      ...legacyBranches,
+      generation_id: undefined,
+      generation_status: undefined,
+    });
+    const standaloneDispersion = buildEigenDispersionChartModel(legacyDispersion);
+
+    expect(standaloneBranches.branches).toHaveLength(1);
+    expect(standaloneDispersion.points).toHaveLength(1);
+    expect(standaloneDispersion.points[0]!.branchId).toBeNull();
+
+    const joined = buildEigenBranchesModel(
+      { ...legacyBranches, generation_id: undefined, generation_status: undefined },
+      legacyDispersion,
+    );
+    expect(joined.branches[0]!.points[0]!.pathS).toBeUndefined();
+    expect(joined.diagnostics).toContain(
+      "dispersion enrichment omitted: artifact ownership is missing or mismatched",
+    );
   });
 
   it("does not label dispersion points with branches from another run", () => {

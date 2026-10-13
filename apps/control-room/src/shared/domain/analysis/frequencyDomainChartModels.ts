@@ -7,7 +7,7 @@ import {
   ANALYSIS_FREQUENCY_DOMAIN_EIGEN_SPECTRUM_V2_PATH,
   ANALYSIS_FREQUENCY_DOMAIN_RESPONSE_MAGNETIC_SWEEP_PATH,
 } from "@/kernel/api/apiPaths";
-import type { FrequencyDomainKPathMetadataResource } from "@/kernel/api/apiTypes";
+import type { FrequencyDomainJsonArtifactResource, FrequencyDomainKPathMetadataResource } from "@/kernel/api/apiTypes";
 import type { SelectionRef } from "@/kernel/selection/selectionTypes";
 import type {
   AnalysisFieldOverlayKContextKind,
@@ -303,6 +303,8 @@ function typedKSampling(value: unknown): FrequencyDomainResultEvidence["kSamplin
 interface FrequencyDomainArtifactOwnershipLike {
   artifact_set_id?: string | null;
   content_digest?: string | null;
+  generation_id?: string | null;
+  generation_status?: FrequencyDomainJsonArtifactResource["generation_status"];
   revision?: string | null;
   session_id?: string | null;
   run_id?: string | null;
@@ -1319,13 +1321,24 @@ function eigenArtifactsShareOwnership(
   dispersion: FrequencyDomainTextArtifactLike,
 ): boolean {
   if (branches?.status !== "ready" || dispersion.status !== "ready") return false;
+  if (
+    branches.generation_status !== "member_verified_owner_bound" ||
+    dispersion.generation_status !== "member_verified_owner_bound"
+  ) return false;
+  const branchGenerationId = stringValue(branches.generation_id);
+  const dispersionGenerationId = stringValue(dispersion.generation_id);
+  if (
+    !branchGenerationId?.trim() ||
+    !dispersionGenerationId?.trim() ||
+    branchGenerationId !== dispersionGenerationId
+  ) return false;
   for (const key of ["session_id", "run_id", "artifact_set_id"] as const) {
     const branchValue = stringValue(branches[key]);
     const dispersionValue = stringValue(dispersion[key]);
     if (!branchValue || branchValue === "current" || branchValue !== dispersionValue) return false;
   }
-  // The artifact set identifies a standalone run even when no stage or mesh
-  // generation was published. Optional identities must still agree.
+  // The shared verified generation belongs to this run-level artifact set.
+  // Optional stage and mesh identities must still agree when either is present.
   for (const key of ["stage_id", "mesh_generation_id"] as const) {
     if (stringValue(branches[key]) !== stringValue(dispersion[key])) return false;
   }
@@ -1476,6 +1489,8 @@ export function buildEigenBranchesModel(
       run_id: resource.run_id,
       stage_id: resource.stage_id,
       mesh_generation_id: resource.mesh_generation_id,
+      generation_id: resource.generation_id,
+      generation_status: resource.generation_status,
       status: resource.status,
     } : undefined,
     branches, diagnostics, droppedBranchCount, droppedPointCount,

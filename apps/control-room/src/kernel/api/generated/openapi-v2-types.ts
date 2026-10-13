@@ -4940,6 +4940,11 @@ export interface components {
             sample_index_resource: string;
             schema_version: string;
             source_artifacts: components["schemas"]["AnalysisResultSourceArtifactRef"][];
+            /**
+             * @description Requested output scopes declared by the producer manifest. This does not
+             *     describe which requested outputs completed or were resolved.
+             */
+            spectrum_output_scopes?: components["schemas"]["AnalysisResultSpectrumOutputScope"][] | null;
             stage_id: string;
             status: components["schemas"]["AnalysisResultStatusFacets"];
             title: string;
@@ -5142,6 +5147,8 @@ export interface components {
             status: components["schemas"]["AnalysisResultStatusFacets"];
             wavevector_kf?: number[] | null;
         };
+        /** @enum {string} */
+        AnalysisResultSpectrumOutputScope: "per_sample" | "global";
         AnalysisResultStatusFacets: {
             completeness: string;
             detail?: string | null;
@@ -7286,6 +7293,8 @@ export interface components {
         FrequencyDomainArtifactExtras: {
             [key: string]: unknown;
         };
+        /** @enum {string} */
+        FrequencyDomainArtifactGenerationStatus: "legacy_unverified" | "member_verified_unbound" | "member_verified_owner_bound";
         FrequencyDomainAvailabilitySummaryResource: {
             diagnostics_json: string;
             driven_response_available: boolean;
@@ -7561,6 +7570,12 @@ export interface components {
             artifact_set_id?: string | null;
             /** @description SHA-256 digest of the immutable JSON artifact bytes. */
             content_digest?: string | null;
+            /**
+             * @description Committed publication containing this member; only consumed member bytes are verified.
+             *     Absent for legacy artifacts without a generation receipt, which remain unverified.
+             */
+            generation_id?: string | null;
+            generation_status?: null | components["schemas"]["FrequencyDomainArtifactGenerationStatus"];
             /** @description Runtime mesh generation bound to the publishing stage. */
             mesh_generation_id?: string | null;
             missing_reason?: string | null;
@@ -7842,6 +7857,12 @@ export interface components {
             artifact_set_id?: string | null;
             content_digest?: string | null;
             content_type: string;
+            /**
+             * @description Committed publication containing this member; only consumed member bytes are verified.
+             *     Absent for legacy artifacts without a generation receipt, which remain unverified.
+             */
+            generation_id?: string | null;
+            generation_status?: null | components["schemas"]["FrequencyDomainArtifactGenerationStatus"];
             mesh_generation_id?: string | null;
             missing_reason?: string | null;
             path_metadata?: null | components["schemas"]["FrequencyDomainKPathMetadataResource"];

@@ -793,6 +793,61 @@ describe("study runtime command resource bundles", () => {
     );
   });
 
+  it("revises frequency-domain artifacts when generation membership changes and distinguishes legacy omission", () => {
+    const base = {
+      schema_version: "frequency_domain_text_artifact.v1",
+      status: "ready",
+      artifact_path: "eigen/dispersion.csv",
+      resource_key: ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
+      content_type: "text/csv; charset=utf-8",
+      text: "sample_index,frequency_hz\n0,1e9\n",
+      missing_reason: null,
+      session_id: "session-a",
+      run_id: "run-a",
+      stage_id: "stage-a",
+      mesh_generation_id: "mesh-a",
+      artifact_set_id: "same-artifact-folder",
+      revision: "same-revision",
+      content_digest: "same-payload-hash",
+    };
+    const generationA = {
+      ...base,
+      generation_id: "generation-a",
+      generation_status: "member_verified_owner_bound" as const,
+    };
+    const generationB = { ...generationA, generation_id: "generation-b" };
+
+    expect(frequencyDomainTextArtifactRevision(generationB)).not.toBe(
+      frequencyDomainTextArtifactRevision(generationA),
+    );
+    expect(frequencyDomainJsonArtifactRevision(generationB)).not.toBe(
+      frequencyDomainJsonArtifactRevision(generationA),
+    );
+    expect(
+      frequencyDomainTextArtifactRevision({
+        ...generationA,
+        generation_status: "member_verified_unbound",
+      }),
+    ).not.toBe(frequencyDomainTextArtifactRevision(generationA));
+
+    const missingGenerationStatus = {
+      ...base,
+      generation_id: undefined,
+      generation_status: undefined,
+    };
+    const explicitlyLegacy = {
+      ...base,
+      generation_id: undefined,
+      generation_status: "legacy_unverified" as const,
+    };
+    expect(frequencyDomainTextArtifactRevision(missingGenerationStatus)).not.toBe(
+      frequencyDomainTextArtifactRevision(explicitlyLegacy),
+    );
+    expect(frequencyDomainJsonArtifactRevision(missingGenerationStatus)).not.toBe(
+      frequencyDomainJsonArtifactRevision(explicitlyLegacy),
+    );
+  });
+
   it("changes frequency-domain text artifact revision when dispersion CSV contents change", () => {
     const baseArtifact = {
       artifact_path: "eigen/dispersion.csv",

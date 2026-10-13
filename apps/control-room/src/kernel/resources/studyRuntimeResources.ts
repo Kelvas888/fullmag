@@ -590,8 +590,13 @@ export function frequencyDomainSweepProgressRevision(
     : null;
 }
 
+type FrequencyDomainArtifactGenerationMetadata = Pick<
+  FrequencyDomainJsonArtifactResource,
+  "generation_id" | "generation_status"
+>;
+
 export function frequencyDomainTextArtifactRevision(
-  data: FrequencyDomainTextArtifactResource | null,
+  data: (FrequencyDomainTextArtifactResource & FrequencyDomainArtifactGenerationMetadata) | null,
 ): string | null {
   if (!data) return null;
   const text = data.text ?? "";
@@ -613,6 +618,8 @@ export function frequencyDomainTextArtifactRevision(
     data.run_id ?? "",
     data.stage_id ?? "",
     data.mesh_generation_id ?? "",
+    data.generation_id ?? "",
+    data.generation_status ?? "",
     data.path_metadata == null ? "" : JSON.stringify(data.path_metadata),
     data.missing_reason ?? "",
     text.length,
@@ -633,7 +640,7 @@ export function frequencyDomainJsonArtifactRevision(
     | "run_id"
     | "stage_id"
     | "status"
-  > | null,
+  > & FrequencyDomainArtifactGenerationMetadata | null,
 ): string | null {
   if (!data) return null;
   return JSON.stringify([
@@ -646,6 +653,8 @@ export function frequencyDomainJsonArtifactRevision(
     data.run_id ?? "",
     data.stage_id ?? "",
     data.mesh_generation_id ?? "",
+    data.generation_id ?? "",
+    data.generation_status ?? "",
     data.missing_reason ?? "",
   ]);
 }
