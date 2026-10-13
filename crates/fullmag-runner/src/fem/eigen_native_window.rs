@@ -429,7 +429,7 @@ pub(super) fn apply_native_modal_terminal_diagnostics(
     Ok(())
 }
 
-fn build_native_modal_artifacts_after_progress<T>(
+pub(super) fn build_native_modal_artifacts_after_progress<T>(
     action: StepAction,
     terminal_state: &mut NativeModalTerminalState,
     solver_diagnostics: &mut serde_json::Value,
@@ -449,7 +449,7 @@ fn build_native_modal_artifacts_after_progress<T>(
     build(solver_diagnostics)
 }
 
-fn append_native_modal_partial_artifact(
+pub(super) fn append_native_modal_partial_artifact(
     auxiliary_artifacts: &mut Vec<AuxiliaryArtifact>,
     terminal_state: NativeModalTerminalState,
     preserved_mode_count: usize,
