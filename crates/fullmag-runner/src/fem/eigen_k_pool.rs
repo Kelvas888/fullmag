@@ -104,6 +104,23 @@ fn parallel_admission_progress(
     }
 }
 
+fn apply_pool_progress_action(
+    requested_action: &mut Option<StepAction>,
+    action: StepAction,
+    pool_completed: bool,
+) {
+    if pool_completed {
+        return;
+    }
+    match action {
+        StepAction::Stop => *requested_action = Some(StepAction::Stop),
+        StepAction::Pause if requested_action.is_none() => {
+            *requested_action = Some(StepAction::Pause)
+        }
+        StepAction::Pause | StepAction::Continue => {}
+    }
+}
+
 /// Stage Relax→Eigen certificates under this invocation's canonical attempt root.
 fn stage_relax_bootstrap_certificates(
     attempt_root: &Path,
@@ -516,12 +533,8 @@ pub(super) fn prepare_process_pool_samples(
                 });
                 last_admission_publish = Some(Instant::now());
                 last_admission_reason = Some(event.reason.clone());
-                match action {
-                    Some(StepAction::Stop) => requested_action = Some(StepAction::Stop),
-                    Some(StepAction::Pause) if requested_action.is_none() => {
-                        requested_action = Some(StepAction::Pause)
-                    }
-                    Some(StepAction::Pause | StepAction::Continue) | None => {}
+                if let Some(action) = action {
+                    apply_pool_progress_action(&mut requested_action, action, false);
                 }
             }
             return requested_action.unwrap_or(StepAction::Continue);
@@ -533,13 +546,7 @@ pub(super) fn prepare_process_pool_samples(
                 ..Default::default()
             })
         });
-        match action {
-            StepAction::Stop => requested_action = Some(StepAction::Stop),
-            StepAction::Pause if requested_action.is_none() => {
-                requested_action = Some(StepAction::Pause)
-            }
-            StepAction::Pause | StepAction::Continue => {}
-        }
+        apply_pool_progress_action(&mut requested_action, action, false);
         requested_action.unwrap_or(StepAction::Continue)
     };
     let pool_outcome = pool
@@ -562,9 +569,7 @@ pub(super) fn prepare_process_pool_samples(
                     Some(pool_result.report.resolved_workers),
                     true,
                 ));
-                if matches!(action, StepAction::Stop | StepAction::Pause) {
-                    interrupted_action = Some(action);
-                }
+                apply_pool_progress_action(&mut interrupted_action, action, true);
             }
         }
     }
@@ -810,6 +815,19 @@ mod tests {
             3,
             "the accepted prefix ends at the first planned sample not returned"
         );
+    }
+
+    #[test]
+    fn terminal_action_after_completed_pool_does_not_interrupt_but_active_actions_do() {
+        for action in [StepAction::Stop, StepAction::Pause] {
+            let mut terminal_action = None;
+            apply_pool_progress_action(&mut terminal_action, action, true);
+            assert_eq!(terminal_action, None);
+
+            let mut active_action = None;
+            apply_pool_progress_action(&mut active_action, action, false);
+            assert_eq!(active_action, Some(action));
+        }
     }
 
     #[test]

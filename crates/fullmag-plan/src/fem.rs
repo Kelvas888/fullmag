@@ -1420,6 +1420,24 @@ fn eigen_policy_floquet_dynamic_demag_path(
         && eigen_policy_floquet_pair_sets_match(plan)
 }
 
+fn selected_floquet_pairs_have_finite_payload<'a>(
+    requested_pair_ids: impl IntoIterator<Item = &'a str>,
+    has_node_pair: impl Fn(&str) -> bool,
+    translation_for: impl Fn(&str) -> Option<[f64; 3]>,
+) -> bool {
+    let mut found_selected_pair = false;
+    for pair_id in requested_pair_ids {
+        found_selected_pair = true;
+        if !has_node_pair(pair_id)
+            || translation_for(pair_id)
+                .is_none_or(|translation| !translation.iter().all(|value| value.is_finite()))
+        {
+            return false;
+        }
+    }
+    found_selected_pair
+}
+
 /// Classify only structural native solver families. Runtime provider and
 /// assembly availability remain a separate fail-closed admission check.
 fn fem_eigen_solver_policy_has_native_path(
@@ -1507,20 +1525,22 @@ fn fem_eigen_solver_policy_has_native_path(
         )
         && {
             let requested_pair_ids = plan.spin_wave_bc.boundary_pair_ids();
-            !requested_pair_ids.is_empty()
-                && requested_pair_ids.iter().any(|pair_id| {
-                    let has_nodes = plan
-                        .mesh
+            selected_floquet_pairs_have_finite_payload(
+                requested_pair_ids.iter().copied(),
+                |pair_id| {
+                    plan.mesh
                         .periodic_node_pairs
                         .iter()
-                        .any(|pair| pair.pair_id == *pair_id);
-                    let has_translation = plan
-                        .mesh
+                        .any(|pair| pair.pair_id == pair_id)
+                },
+                |pair_id| {
+                    plan.mesh
                         .periodic_boundary_pairs
                         .iter()
-                        .any(|pair| pair.pair_id == *pair_id && pair.translation.is_some());
-                    has_nodes && has_translation
-                })
+                        .find(|pair| pair.pair_id == pair_id)
+                        .and_then(|pair| pair.translation)
+                },
+            )
         };
 
     target_window
@@ -1531,6 +1551,69 @@ fn fem_eigen_solver_policy_has_native_path(
             fullmag_ir::SpinWaveBoundaryKindIR::Free
         ) && gamma_sampling)
             || floquet_payload_path)
+}
+
+#[cfg(test)]
+mod fem_eigen_floquet_payload_tests {
+    use super::selected_floquet_pairs_have_finite_payload;
+
+    fn payload_is_complete(
+        translations: &[(&str, Option<[f64; 3]>)],
+        node_pair_ids: &[&str],
+    ) -> bool {
+        selected_floquet_pairs_have_finite_payload(
+            ["left", "right"],
+            |pair_id| node_pair_ids.contains(&pair_id),
+            |pair_id| {
+                translations
+                    .iter()
+                    .find(|(candidate, _)| *candidate == pair_id)
+                    .and_then(|(_, translation)| *translation)
+            },
+        )
+    }
+
+    #[test]
+    fn native_floquet_payload_requires_finite_translation_for_every_selected_pair() {
+        let node_pair_ids = ["left", "right"];
+        assert!(payload_is_complete(
+            &[
+                ("left", Some([1.0, 0.0, 0.0])),
+                ("right", Some([0.0, 1.0, 0.0])),
+            ],
+            &node_pair_ids,
+        ));
+        assert!(!payload_is_complete(
+            &[
+                ("left", Some([1.0, 0.0, 0.0])),
+                ("right", Some([0.0, 1.0, 0.0])),
+            ],
+            &["left"],
+        ));
+        assert!(!payload_is_complete(
+            &[("left", Some([1.0, 0.0, 0.0])), ("right", None)],
+            &node_pair_ids,
+        ));
+        assert!(!payload_is_complete(
+            &[
+                ("left", Some([1.0, 0.0, 0.0])),
+                ("right", Some([f64::NAN, 0.0, 0.0])),
+            ],
+            &node_pair_ids,
+        ));
+        assert!(!payload_is_complete(
+            &[
+                ("left", Some([1.0, 0.0, 0.0])),
+                ("right", Some([f64::INFINITY, 0.0, 0.0])),
+            ],
+            &node_pair_ids,
+        ));
+        assert!(!selected_floquet_pairs_have_finite_payload(
+            std::iter::empty(),
+            |_| true,
+            |_| Some([0.0; 3]),
+        ));
+    }
 }
 
 fn validate_eigen_k0_kittel_validation(
