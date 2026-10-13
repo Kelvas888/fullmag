@@ -34,6 +34,7 @@ import { ControlRoomApiError } from "@/kernel/api/ControlRoomApi";
 import type {
   CheckpointEntry,
   FrequencyDomainManifestResource,
+  JsonObject,
   LiveStatusResource,
   MeshPeriodicPairsResource,
   MeshSharedDomainManifestResource,
@@ -112,12 +113,14 @@ import {
 } from "./StudyGlobalAuthoringModel";
 import {
   buildStudyStagesMergePatch,
+  createStudyStageDraft,
   createDefaultStudyStageDraft,
   createStudyStageDrafts,
   validateStudyStageDraft,
   type StudyStageDraft,
   type StudyStageDraftKind,
 } from "./StudyStageAuthoringModel";
+import { readStudyStageSource } from "@/shared/domain/study/studyStageSource";
 import {
   resolveStudyInspectorModel,
   studySnapshotFromScene,
@@ -332,6 +335,8 @@ function studyInspectorPanelReducer(
     case "duplicateStageDraft": {
       const source = state.stageDrafts[action.index];
       if (!source) return state;
+      // The immutable definition reference cannot be renamed into a second solve.
+      if (source.kind === "antenna_field_solve") return state;
       const draft = {
         ...source,
         stageId: `${source.stageId || source.kind}-copy`,
@@ -435,7 +440,7 @@ function clampIndex(index: number, drafts: readonly StudyStageDraft[]): number {
 function rawStudyStages(scene: unknown): unknown[] {
   const sceneRecord = asRecord(scene);
   const study = asRecord(sceneRecord?.study);
-  return Array.isArray(study?.stages) ? study.stages : [];
+  return readStudyStageSource(study).entries.map((entry) => entry.payload);
 }
 
 function magneticObjectCount(scene: unknown): number {
@@ -814,7 +819,19 @@ export function useStudyInspectorPanelController(
     if (!scene.data) return;
     if (!sceneHasAuthoringPayload(scene.data)) return;
     const rawStages = rawStudyStages(scene.data);
-    const stageDrafts = createStudyStageDrafts(rawStages);
+    const source = readStudyStageSource(asRecord(scene.data)?.study);
+    const stageDrafts = source.kind === "flat" ? createStudyStageDrafts(rawStages)
+      : source.entries.map((entry, index): StudyStageDraft => ({
+        ...createStudyStageDraft(entry.stageKind === "antenna_field_solve" ? entry.payload : {
+          kind: "unsupported",
+        }, index),
+        kind: entry.stageKind === "antenna_field_solve" ? "antenna_field_solve" : "unsupported",
+        rawStage: structuredClone(entry.payload) as JsonObject,
+        stageId: entry.queueId ?? `stage-${index + 1}`,
+        pipelineNodeId: entry.queueId ?? undefined,
+        pipelineEnabled: entry.enabled,
+        pipelineGroupIds: [...entry.groupIds],
+      }));
     dispatch({
       type: "resetStageDrafts",
       drafts: stageDrafts,
@@ -1043,7 +1060,7 @@ export function useStudyInspectorPanelController(
         mutationContext,
         "Edit study stages",
         () => kernel.api.model.commitTransaction(
-          buildStudyStagesMergePatch(state.stageDrafts, baseRevision),
+          buildStudyStagesMergePatch(state.stageDrafts, baseRevision, currentScene.scene),
           sessionScopeKey ? { sessionScopeKey } : undefined,
         ),
       );
@@ -1574,6 +1591,9 @@ export function StudyInspectorPanel({ selection }: InspectorPanelProps) {
         />
 
         <StudyPipelineSection
+          readOnlyReason={readStudyStageSource(asRecord(scene.data)?.study).kind !== "flat"
+            ? readStudyStageSource(asRecord(scene.data)?.study).error ?? "Canonical pipeline inspection is read-only. Flat-stage editing cannot preserve its groups and references."
+            : null}
           activeStageIndex={activeStageIndex}
           activeLane={runtimeStatus?.capabilities.active_lane ?? null}
           algorithmsAvailable={runtimeStatus?.capabilities.algorithms_available}

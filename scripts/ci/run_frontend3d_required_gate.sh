@@ -41,7 +41,8 @@ run_gate() {
       git diff --exit-code -- \
         apps/control-room/src/kernel/api/generated/openapi-v2.json \
         apps/control-room/src/kernel/api/generated/openapi-v2-types.ts \
-        apps/control-room/src/kernel/api/generated/openapi-v2-client.ts
+        apps/control-room/src/kernel/api/generated/openapi-v2-client.ts \
+        apps/control-room/src/kernel/api/generated/openapi-v2-paths.ts
       ;;
     architecture-api-hygiene)
       ./scripts/ci-resource-first-gates.sh --strict

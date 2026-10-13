@@ -1311,6 +1311,45 @@ def _trusted_mesh_mutation_guard_sha256(mesh: "MeshData") -> str:
     return digest.hexdigest()
 
 
+def _owned_vertex_identity(value: object, node_count: int) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or set(value) != {"schema_version", "issuer", "vertex_ids"}:
+        raise ValueError("vertex_identity requires exactly schema_version, issuer and vertex_ids")
+    if value["schema_version"] != "mesh_vertex_identity.v1" or value["issuer"] != "gmsh_node_tags.v1":
+        raise ValueError("unsupported mesh vertex identity schema or issuer")
+    raw = value["vertex_ids"]
+    if not isinstance(raw, (tuple, list, np.ndarray)) or (isinstance(raw, np.ndarray) and raw.ndim != 1):
+        raise ValueError("vertex_identity.vertex_ids must be an ordered integer sequence")
+    if len(raw) != node_count:
+        raise ValueError("vertex_identity vertex count must match mesh nodes")
+    ids: list[int] = []
+    for item in raw:
+        if isinstance(item, (bool, np.bool_)) or not isinstance(item, (int, np.integer)):
+            raise ValueError("vertex_identity IDs must be exact integers, not bool or coerced values")
+        identity = operator.index(item)
+        if not 0 < identity <= (1 << 64) - 1:
+            raise ValueError("vertex_identity IDs must be positive u64 integers")
+        ids.append(identity)
+    if len(set(ids)) != len(ids):
+        raise ValueError("vertex_identity IDs must be unique")
+    return MappingProxyType({
+        "schema_version": "mesh_vertex_identity.v1",
+        "issuer": "gmsh_node_tags.v1",
+        "vertex_ids": tuple(ids),
+    })
+
+
+def _vertex_identity_to_dict(value: Mapping[str, object] | None) -> dict[str, object] | None:
+    if value is None:
+        return None
+    return {
+        "schema_version": value["schema_version"],
+        "issuer": value["issuer"],
+        "vertex_ids": list(value["vertex_ids"]),
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class MeshData:
     """Canonical typed variable-arity FEM topology in CSR layout."""
@@ -1337,9 +1376,14 @@ class MeshData:
     per_domain_quality: dict[int, MeshQualityReport] | None = None
     realization_report: MeshRealizationReport | None = None
     mixed_layer_topology_certificate: MixedLayerTopologyCertificate | None = None
+    # Retained mesh-owner labels, not authentication or a solved-field certificate.
+    vertex_identity: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "nodes", np.asarray(self.nodes, dtype=np.float64))
+        object.__setattr__(
+            self, "vertex_identity", _owned_vertex_identity(self.vertex_identity, len(self.nodes))
+        )
         object.__setattr__(self, "cell_types", np.asarray(self.cell_types, dtype=np.str_))
         object.__setattr__(self, "cell_offsets", np.asarray(self.cell_offsets, dtype=np.int64))
         object.__setattr__(self, "cell_nodes", np.asarray(self.cell_nodes, dtype=np.int32))
@@ -2004,6 +2048,7 @@ class MeshData:
         per_domain_quality: dict[int, MeshQualityReport] | None = None,
         realization_report: MeshRealizationReport | None = None,
         mixed_layer_topology_certificate: MixedLayerTopologyCertificate | None = None,
+        vertex_identity: Mapping[str, object] | None = None,
     ) -> "MeshData":
         """Normalize the explicit legacy tet4/tri3 boundary into canonical CSR."""
         tet = np.asarray(elements, dtype=np.int32)
@@ -2036,6 +2081,7 @@ class MeshData:
             per_domain_quality=per_domain_quality,
             realization_report=realization_report,
             mixed_layer_topology_certificate=mixed_layer_topology_certificate,
+            vertex_identity=vertex_identity,
             cell_mesh_parts=np.asarray([], dtype=np.str_),
         )
 
@@ -2308,6 +2354,7 @@ class MeshData:
             per_domain_quality=self.per_domain_quality,
             realization_report=self.realization_report,
             mixed_layer_topology_certificate=self.mixed_layer_topology_certificate,
+            vertex_identity=self.vertex_identity,
         )
 
     def save(self, path: str | Path) -> None:
@@ -2318,6 +2365,7 @@ class MeshData:
                 json.dumps(
                     {
                         "mesh_name": target.stem,
+                        "vertex_identity": _vertex_identity_to_dict(self.vertex_identity),
                         "nodes": self.nodes.tolist(),
                         "cell_types": self.cell_types.tolist(),
                         "cell_offsets": self.cell_offsets.tolist(),
@@ -2358,6 +2406,7 @@ class MeshData:
         np.savez_compressed(
             target,
             nodes=self.nodes,
+            vertex_identity_json=np.asarray(json.dumps(_vertex_identity_to_dict(self.vertex_identity))),
             cell_types=self.cell_types,
             cell_offsets=self.cell_offsets,
             cell_nodes=self.cell_nodes,
@@ -2589,6 +2638,10 @@ class MeshData:
                 )
         payload = {name: data[name] for name in data.files if not name.endswith("_json")}
         payload.update(
+            vertex_identity=(
+                json.loads(str(data["vertex_identity_json"]))
+                if "vertex_identity_json" in data.files else None
+            ),
             periodic_boundary_pairs=periodic_boundary_pairs,
             periodic_node_pairs=periodic_node_pairs,
             periodic_mesh_certificate=periodic_mesh_certificate,
@@ -2611,6 +2664,7 @@ class MeshData:
             raise ValueError("mesh payload contains both legacy and v2 topology")
         common = dict(
             nodes=payload["nodes"],
+            vertex_identity=payload.get("vertex_identity"),
             element_markers=payload["element_markers"],
             boundary_markers=payload["boundary_markers"],
             periodic_boundary_pairs=[dict(pair) for pair in payload.get("periodic_boundary_pairs", [])],

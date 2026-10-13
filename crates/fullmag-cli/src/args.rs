@@ -150,6 +150,16 @@ pub(crate) enum Command {
         #[arg(long, default_value_t = false)]
         execution_plan: bool,
     },
+    /// Prepare submission JSON without accepting a run or starting a solver.
+    PrepareRunJson {
+        /// JSON containing the exact archive, expected_revision, explicit
+        /// run_authoring, compiled Study/catalog and asset_paths.
+        path: PathBuf,
+        #[arg(long)]
+        project_id: String,
+        #[arg(long)]
+        api_url: String,
+    },
     /// Submit and materialize an immutable accepted-run request through the public API v2.
     RunJson {
         /// JSON containing archive_base64, RunIntent, StudyPlan, and StudyProblemCatalog.

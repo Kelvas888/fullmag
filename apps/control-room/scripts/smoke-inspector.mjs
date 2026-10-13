@@ -1,6 +1,7 @@
 import { mkdir, writeFile } from "node:fs/promises";
 import { PerspectiveCamera, Vector3 } from "three";
 import { resolve } from "node:path";
+import { installInspectorCommitTrace } from "./lib/inspector-commit-trace.mjs";
 
 const workspaceUrl = process.env.CONTROL_ROOM_URL ?? "http://localhost:3100/workspace";
 const outputDir = resolve(
@@ -67,8 +68,16 @@ if (!playwright?.chromium) {
 }
 
 await mkdir(outputDir, { recursive: true });
-const browser = await playwright.chromium.launch({ headless: true });
+const browser = await playwright.chromium.launch({
+  headless: true,
+  ...(process.env.CONTROL_ROOM_INSPECTOR_BROWSER_CHANNEL
+    ? { channel: process.env.CONTROL_ROOM_INSPECTOR_BROWSER_CHANNEL }
+    : {}),
+});
 const page = await browser.newPage({ viewport: { width: 1600, height: 900 } });
+if (process.env.CONTROL_ROOM_INSPECTOR_COMMIT_TRACE === "1") {
+  await installInspectorCommitTrace(page);
+}
 const consoleErrors = [];
 const notFoundResponses = [];
 const previewRequests = [];
@@ -1451,9 +1460,14 @@ async function qualifyMagneticTextureMutationStability(page, inspector, fixture)
     }
     return {
       opacity: getComputedStyle(element).opacity,
+      measuredAt: performance.now(),
       scrollTop: scroller?.scrollTop ?? 0,
     };
   }, identity);
+  await page.evaluate(() => {
+    const trace = window.__FULLMAG_INSPECTOR_COMMIT_TRACE__;
+    if (trace) { trace.commits = []; trace.dropped = 0; trace.errors = 0; }
+  });
   await page.waitForTimeout(1_100);
   const requestStart = fixture.requests.length;
   fixture.texturePatchDelayMs = 180;
@@ -1533,9 +1547,19 @@ async function qualifyMagneticTextureMutationStability(page, inspector, fixture)
       renderCount: performance
         .getEntriesByType("measure")
         .filter((entry) => entry.name.startsWith("fullmag.react.render.InspectorModule")).length,
+      renderMeasures: performance
+        .getEntriesByType("measure")
+        .filter((entry) => entry.name.startsWith("fullmag.react.render.InspectorModule"))
+        .slice(-32)
+        .map((entry) => ({ name: entry.name, startTime: entry.startTime, duration: entry.duration })),
+      measuredAt: performance.now(),
+      commitTrace: window.__FULLMAG_INSPECTOR_COMMIT_TRACE__ ?? null,
       scrollTop: scroller?.scrollTop ?? 0,
     };
   });
+  await writeFile(resolve(outputDir, "magnetic-texture-mutation-evidence.json"),
+    JSON.stringify({ baseline, duringMutation, evidence,
+      requests: fixture.requests.slice(requestStart, requestStart + 32) }, null, 2));
   assert(evidence.opacity === baseline.opacity && evidence.opacityAnimations === 0,
     "Magnetic Texture mutation changed Inspector opacity after ACK.");
   assert(Math.abs(evidence.scrollTop - baseline.scrollTop) <= 1,
@@ -2995,7 +3019,8 @@ function inspectorPhysicsGuardLane() {
       capability_profile_version: "inspector-smoke",
       effective_request: "session.runtime_resolution",
       engine_id: "fem_cpu_reference",
-      kind: "fixture",
+      // Simulate the planner-owned API resource; this is not a scientific solve.
+      kind: "planner",
     },
   };
 }

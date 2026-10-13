@@ -78,6 +78,8 @@ export function meshBuildDialogRuntimeStatusEquals(
       nextActiveLane?.operations?.grid_build?.reason &&
     previousActiveLane?.operations?.grid_build?.state ===
       nextActiveLane?.operations?.grid_build?.state &&
+    previousActiveLane?.operations?.shared_mesh_build?.state ===
+      nextActiveLane?.operations?.shared_mesh_build?.state &&
     previous.domain.discretization === next.domain.discretization &&
     previous.resources.mesh_build_revision ===
       next.resources.mesh_build_revision &&

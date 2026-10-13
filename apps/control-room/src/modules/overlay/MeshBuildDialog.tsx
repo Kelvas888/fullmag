@@ -26,6 +26,7 @@ import {
   useMeshSummaryResource,
 } from "@/kernel/resources/geometryLifecycleResources";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
+import { resolveActiveLaneOperation } from "@/kernel/resources/useActiveLaneCapabilities";
 import { resolveSessionAuthoringDiscretization } from "@/kernel/resources/sessionDiscretization";
 import type { JsonObject } from "@/kernel/api/apiTypes";
 import type { KernelApi } from "@/kernel/types";
@@ -118,6 +119,10 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
   );
   const lane = resolveMeshBuildDialogLane(
     resolveSessionAuthoringDiscretization(runtimeStatus),
+  );
+  const buildOperation = resolveActiveLaneOperation(
+    runtimeStatus?.capabilities.active_lane ?? null,
+    "shared_mesh_build",
   );
   const explicitFemLane = shouldLoadMeshBuildDialogFemResources(
     state.open,
@@ -388,7 +393,7 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
   }
 
   function confirmBuild(): void {
-    if (!state.request?.requestId || !stableSnapshotBefore || !snapshotCurrent || state.phase !== "pre-build") return;
+    if (!state.request?.requestId || !stableSnapshotBefore || !snapshotCurrent || !buildOperation.enabled || state.phase !== "pre-build") return;
     dispatch({ type: "submitting" });
     kernel.bus.emit("mesh:build-confirm-resolved", { requestId: state.request.requestId, confirmed: true, precondition: { scene_revision: stableSnapshotBefore.sceneRevision, mesh_revision: stableSnapshotBefore.meshRevision } });
   }
@@ -437,7 +442,7 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
               diffRows={diffRows}
               errorMessage={state.errorMessage}
               mode={state.phase}
-              ready={snapshotCurrent}
+              ready={snapshotCurrent && buildOperation.enabled}
               stale={stableSnapshotBefore !== null && !snapshotCurrent}
               onRefresh={() => {
                 captureSnapshot(null);
@@ -477,7 +482,7 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
                 closeDialog();
                 openMeshBuildDiagnostics(kernel);
               }}
-              ready={snapshotCurrent}
+              ready={snapshotCurrent && buildOperation.enabled}
               rendered={state.lastCommandStatus === "rendered"}
               sceneRevision={sceneRevision}
               stale={stableSnapshotBefore !== null && !snapshotCurrent}
@@ -517,7 +522,7 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
                   size="sm"
                   type="button"
                   variant="ghost"
-                  onClick={() => dispatch({ open: false, type: "open" })}
+                  onClick={closeDialog}
                 >
                   Close
                 </Button>

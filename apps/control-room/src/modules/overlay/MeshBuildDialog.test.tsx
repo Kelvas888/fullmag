@@ -13,6 +13,7 @@ import {
   selectMeshBuildDialogRuntimeStatus,
 } from "./MeshBuildDialogRuntimeStatus";
 import { openMeshBuildDiagnostics } from "./meshBuildDiagnosticsNavigation";
+import { activeLaneCapabilityFixture } from "@/kernel/resources/activeLaneCapabilityFixture.testSupport";
 
 describe("MeshBuildDialog", () => {
   it("re-renders when the resolved lane changes even if mesh revisions are stable", () => {
@@ -39,10 +40,18 @@ describe("MeshBuildDialog", () => {
   });
 
   it("requires an explicit FEM lane before loading FEM mesh resources", () => {
-    expect(resolveMeshBuildDialogLane("fem")).toBe("fem");
-    expect(resolveMeshBuildDialogLane("FDM")).toBe("fdm");
-    expect(resolveMeshBuildDialogLane("auto")).toBe("unknown");
-    expect(resolveMeshBuildDialogLane(undefined)).toBe("unknown");
+    const fdm = activeLaneCapabilityFixture();
+    expect(resolveMeshBuildDialogLane({
+      ...fdm,
+      resolved: { ...fdm.resolved!, backend: "fem", discretization: "fem" },
+    })).toBe("fem");
+    expect(resolveMeshBuildDialogLane(fdm)).toBe("fdm");
+    expect(resolveMeshBuildDialogLane({ ...fdm, resolved: null })).toBe("unknown");
+    expect(resolveMeshBuildDialogLane({
+      ...fdm,
+      source: { ...fdm.source, kind: "unavailable" },
+    })).toBe("unknown");
+    expect(resolveMeshBuildDialogLane(null)).toBe("unknown");
 
     expect(shouldLoadMeshBuildDialogFemResources(false, "fem")).toBe(false);
     expect(shouldLoadMeshBuildDialogFemResources(true, "fem")).toBe(true);

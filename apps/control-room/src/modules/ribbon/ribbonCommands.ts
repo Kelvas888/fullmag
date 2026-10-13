@@ -25,7 +25,6 @@ import {
   BACKEND_INTERACTION_IDS,
   findInteractionSpec,
   interactionAvailabilityForDiscretization,
-  normalizeInteractionDiscretization,
   type InteractionDiscretization,
   type PhysicsInteractionId,
 } from "@/shared/domain/physics/interactions";
@@ -768,9 +767,23 @@ function selectPhysicsInteractionFromCommand(context: CommandContext): CommandRe
       status: "failed",
     };
   }
-  const objectId = spec.scope === "global" ? null : selectedObjectId;
+  const objectExchange = input.interactionId === "exchange" &&
+    input.scope !== "global" && Boolean(selectedObjectId);
+  if (objectExchange) {
+    const scene = asRecord(context.resourceData?.[MODEL_SCENE_PATH]);
+    if (!scene || !Array.isArray(scene.objects)) {
+      return { status: "failed", message: "The revisioned model scene is not ready. Wait for it to load before adding Exchange." };
+    }
+    const object = Array.isArray(scene?.objects)
+      ? scene.objects.find((candidate) => asRecord(candidate)?.id === selectedObjectId)
+      : null;
+    if (current?.ref?.type !== "scene-object" || asRecord(object)?.role !== "magnet") {
+      return { status: "failed", message: "Select a canonical magnetic scene object before adding Exchange." };
+    }
+  }
+  const objectId = objectExchange ? selectedObjectId : spec.scope === "global" ? null : selectedObjectId;
   const regionId =
-    current?.ref?.type === "scene-object" ? current.ref.regionId : undefined;
+    !objectExchange && current?.ref?.type === "scene-object" ? current.ref.regionId : undefined;
   const nodeId = objectId
     ? `model:object:${objectId}:physics:${input.interactionId}`
     : `model:physics:${input.interactionId}`;
@@ -1086,13 +1099,13 @@ function asVisualizationTargetRef(value: unknown): VisualizationTargetRef | null
 
 function asPhysicsInteractionInput(
   value: unknown,
-): { interactionId: PhysicsInteractionId } | null {
+): { interactionId: PhysicsInteractionId; scope?: "global" } | null {
   const record = asRecord(value);
   if (!record) return null;
   const interactionId = record.interactionId;
   return typeof interactionId === "string" &&
     (BACKEND_INTERACTION_IDS as readonly string[]).includes(interactionId)
-    ? { interactionId: interactionId as PhysicsInteractionId }
+    ? { interactionId: interactionId as PhysicsInteractionId, ...(record.scope === "global" ? { scope: "global" as const } : {}) }
     : null;
 }
 

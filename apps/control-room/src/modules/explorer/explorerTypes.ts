@@ -43,6 +43,15 @@ export type ExplorerNodeKind =
   | "object.frozen-spins"
   | "object.geometry"
   | "object.antenna"
+  | "object.antenna.geometry"
+  | "object.antenna.regional"
+  | "object.antenna.conductor"
+  | "object.antenna.port"
+  | "object.antenna.solution"
+  | "object.antenna.projection"
+  | "object.antenna.drive"
+  | "object.antenna.spectrum"
+  | "object.antenna.visualization"
   | "object.material"
   | "object.physics"
   | "object.physics.scope"
@@ -122,6 +131,7 @@ export type ExplorerNodeKind =
   | "study.stages"
   | "study.stage.action"
   | "study.stage.add_field_drive"
+  | "study.stage.antenna_field_solve"
   | "study.stage.autosave"
   | "study.stage.fft_response"
   | "study.stage.eigenmodes"
@@ -381,6 +391,14 @@ export interface ExplorerNode {
   modeIndex?: number;
   objectId?: string;
   objectRole?: "antenna" | "magnet" | "auxiliary";
+  antennaResourceId?: string;
+  antennaResourceKind?:
+    | "conductor"
+    | "port"
+    | "solution"
+    | "projection"
+    | "drive"
+    | "spectrum";
   observableId?: string;
   couplingId?: string;
   currentTransportId?: string;
@@ -593,6 +611,9 @@ interface ModelTreeStudySnapshot {
 }
 
 export interface ModelTreeStudyStageSnapshot {
+  pipelineNodeId?: string;
+  pipelineEnabled?: boolean;
+  pipelineLabel?: string | null;
   artifactName?: string | null;
   boundaryCondition?: string | null;
   calculationMode?: string | null;

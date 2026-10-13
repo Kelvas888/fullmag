@@ -1106,7 +1106,8 @@ async fn explicit_project_run_submit_is_durable_and_replays_without_live_session
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
     assert!(state.current_live_state.read().await.is_none());
     let store =
-        fullmag_session::SessionStore::open(state.submit_store_root.as_ref().unwrap()).unwrap();
+        fullmag_session::SessionStore::open_existing(state.submit_store_root.as_ref().unwrap())
+            .unwrap();
     assert!(store
         .read_run_intent(accepted["run_id"].as_str().unwrap())
         .unwrap()

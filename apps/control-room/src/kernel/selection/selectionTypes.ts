@@ -22,6 +22,15 @@ type ObjectSelectionKind =
   | "object.root"
   | "object.geometry"
   | "object.antenna"
+  | "object.antenna.geometry"
+  | "object.antenna.regional"
+  | "object.antenna.conductor"
+  | "object.antenna.port"
+  | "object.antenna.solution"
+  | "object.antenna.projection"
+  | "object.antenna.drive"
+  | "object.antenna.spectrum"
+  | "object.antenna.visualization"
   | "object.material"
   | "object.physics"
   | "object.regions"
@@ -369,6 +378,14 @@ export type SelectionRef =
       nodeId: string;
       objectId: string;
       objectRole?: "antenna" | "magnet" | "auxiliary";
+      antennaResourceId?: string;
+      antennaResourceKind?:
+        | "conductor"
+        | "port"
+        | "solution"
+        | "projection"
+        | "drive"
+        | "spectrum";
       extensionId?: string;
       regionId?: string;
       type: "scene-object";
@@ -593,6 +610,7 @@ export type SelectionRef =
       kind:
         | "study.stage.action"
         | "study.stage.add_field_drive"
+        | "study.stage.antenna_field_solve"
         | "study.stage.autosave"
         | "study.stage.eigenmodes"
         | "study.stage.eigenmodes.setup"
@@ -1067,6 +1085,8 @@ export function selectionRefEquals(
         left.nodeId === right.nodeId &&
         left.objectId === right.objectId &&
         left.objectRole === right.objectRole &&
+        nullableStringEquals(left.antennaResourceId, right.antennaResourceId) &&
+        left.antennaResourceKind === right.antennaResourceKind &&
         nullableStringEquals(left.extensionId, right.extensionId) &&
         nullableStringEquals(left.regionId, right.regionId) &&
         nullableStringEquals(left.carrierPartId, right.carrierPartId) &&

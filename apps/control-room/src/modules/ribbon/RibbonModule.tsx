@@ -251,6 +251,7 @@ export default function RibbonModule({ kernel }: ModuleProps) {
     enabled:
       activeTab === "geometry" ||
       activeTab === "mesh" ||
+      activeTab === "physics" ||
       needsGuideMeshResources ||
       (activeTab === "view" && selection.ref?.type === "mesh-part"),
   });

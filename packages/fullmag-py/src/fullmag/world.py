@@ -50,13 +50,21 @@ from fullmag._validation import (
     require_positive,
 )
 from fullmag.model.antenna import (
+    AntennaFieldSolutionRef,
+    AntennaFieldSolveStage,
     AntennaFieldSource,
     Antenna,
+    AntennaStageOutputRef,
+    AntennaTargetProjection,
+    AntennaPortMode,
+    AntennaSpectrumRequest,
     RegionalFieldDrive,
     RfDrive,
+    SolvedAntennaDrive,
     SpinWaveExcitationAnalysis,
 )
 from fullmag.model.absorbing_boundary import AbsorbingBoundaryLayer
+from fullmag.model.antenna_inventory import AntennaAuthoringInventory
 from fullmag.model.couplings import CouplingEndpoint, CouplingRegistry
 from fullmag.model.constraints import FrozenSpins, merge_constraint_stage_ids
 from fullmag.model.current_transport import (
@@ -65,6 +73,8 @@ from fullmag.model.current_transport import (
     ChargeSolverPolicy,
     ChargeTransportMaterialAssignment,
     ConservativeCurrentView,
+    ExternalLeadCurrentSource,
+    ExternalLeadPreparation,
     NormalCurrentElectrode,
     StructuredCurrentClosure,
     CurrentTransport,
@@ -136,6 +146,7 @@ from fullmag.model.study import (
     StageAutosave,
     TableAutosave,
     TimeEvolution,
+    AntennaFieldSolve,
     DEFAULT_RELAXATION_MAX_STEPS,
     DEFAULT_RELAXATION_TORQUE_TOLERANCE_APM,
 )
@@ -2505,6 +2516,7 @@ class _WorldState:
     _magnets: list[MagnetHandle] = field(default_factory=list)
     _auxiliary_geometries: list[object] = field(default_factory=list)
     _auxiliary_geometry_roles: dict[str, str] = field(default_factory=dict)
+    _auxiliary_geometry_object_ids: dict[str, str] = field(default_factory=dict)
     _couplings: CouplingRegistry = field(default_factory=CouplingRegistry)
     _loaded_field_states: dict[tuple[str, str, str], object] = field(default_factory=dict)
 
@@ -2531,6 +2543,14 @@ class _WorldState:
     _outputs_explicit: bool = False
     _table_autosave: TableAutosave | None = None
     _current_modules: list[AntennaFieldSource | CurrentTransport] = field(default_factory=list)
+    _antenna_port_modes: list[AntennaPortMode] = field(default_factory=list)
+    _antenna_field_solve_stages: list[AntennaFieldSolveStage] = field(default_factory=list)
+    _antenna_target_projections: list[AntennaTargetProjection] = field(default_factory=list)
+    _solved_antenna_drives: list[SolvedAntennaDrive] = field(default_factory=list)
+    _antenna_spectrum_requests: list[AntennaSpectrumRequest] = field(default_factory=list)
+    _antenna_authoring_inventory: AntennaAuthoringInventory = field(
+        default_factory=AntennaAuthoringInventory
+    )
     _field_drives: list[RegionalFieldDrive] = field(default_factory=list)
     _planar_monitors: list[PlanarMonitor] = field(default_factory=list)
     _spin_torques: list[SpinTorqueModule] = field(default_factory=list)
@@ -3391,7 +3411,7 @@ def _capture_stage(stage_spec: object) -> CapturedStage:
             default_until_seconds=None,
         )
     if isinstance(stage_spec, RunStageSpec):
-        problem = _build_problem()
+        problem = _build_problem(study_kind="time_evolution")
         if not isinstance(problem.study, TimeEvolution):
             raise TypeError("run stage requires a time-evolution study")
         return CapturedStage(
@@ -3851,9 +3871,18 @@ def finish_script_capture() -> list[CapturedStage]:
     return captured
 
 
+def capture_executed_stages() -> list[CapturedStage]:
+    """Read executed stages without ending capture or resetting authoring state."""
+    return list(_capture_binding.current().stages)
+
+
 def capture_workspace_problem() -> Problem | None:
     """Materialize the current flat-script world without requiring run()/relax()."""
-    if not _capture_binding.current().enabled or not _state._magnets:
+    has_antenna_stage = bool(
+        _state._declared_stages
+        and _state._declared_stages[-1].entrypoint_kind == "flat_antenna_field_solve"
+    )
+    if not _capture_binding.current().enabled or (not _state._magnets and not has_antenna_stage):
         return None
     previous_interactive = _state._interactive
     _state._interactive = True
@@ -3867,6 +3896,11 @@ def capture_declared_stages() -> list[CapturedStage]:
     if not _capture_binding.current().enabled:
         return []
     return list(_state._declared_stages)
+
+
+def capture_antenna_authoring_inventory() -> AntennaAuthoringInventory:
+    """Capture immutable declarations without adding them to solver snapshots."""
+    return _state._antenna_authoring_inventory
 
 
 class RelaxStageBuilder:
@@ -4268,6 +4302,57 @@ class StudyStagesBuilder:
         if _state._interactive:
             _state._wait_for_solve = True
         return self
+
+    def add_antenna_field_solve(
+        self,
+        *,
+        id: str,
+        definition: AntennaFieldSolveStage,
+    ) -> AntennaStageOutputRef:
+        """Declare a static antenna-field precompute and return its symbolic output."""
+        stage_id = require_non_empty(id, "id")
+        if not isinstance(definition, AntennaFieldSolveStage):
+            raise TypeError("definition must be an AntennaFieldSolveStage")
+        if any(
+            stage.stage_id == stage_id
+            for stage in _state._declared_stages
+            if stage.stage_id is not None
+        ):
+            raise ValueError(f"duplicate stage_id {stage_id!r}")
+        if any(stage.id == stage_id for stage in _state._antenna_field_solve_stages):
+            raise ValueError(f"duplicate antenna field solve id {stage_id!r}")
+        normalized_definition = replace(definition, id=stage_id)
+        declared_definition = next((
+            item for item in _state._antenna_authoring_inventory.antenna_field_solve_stages
+            if item.id == stage_id
+        ), None)
+        if declared_definition is not None and declared_definition != normalized_definition:
+            raise ValueError(f"conflicting antenna field solve declaration {stage_id!r}")
+        basis_outputs = [
+            output
+            for output in normalized_definition.outputs
+            if output.quantity == "H_ant_basis"
+        ]
+        if len(basis_outputs) != 1:
+            raise ValueError(
+                "antenna field solve requires exactly one H_ant_basis output"
+            )
+        problem_before_action = _build_problem(study_kind="antenna_field_solve")
+        _state._antenna_field_solve_stages.append(normalized_definition)
+        _state._declared_stages.append(
+            CapturedStage(
+                problem=problem_before_action,
+                entrypoint_kind="flat_antenna_field_solve",
+                action={
+                    "kind": "antenna_field_solve",
+                    "definition": normalized_definition.to_ir(),
+                },
+                stage_id=stage_id,
+            )
+        )
+        if _state._interactive:
+            _state._wait_for_solve = True
+        return AntennaStageOutputRef(stage_id=stage_id, output_id=basis_outputs[0].id)
 
     def remove_field_drive(
         self,
@@ -5669,6 +5754,190 @@ class StudyBuilder:
         name(problem_name)
         return self
 
+    def add_antenna_port_mode(self, *, port_mode: AntennaPortMode) -> AntennaPortMode:
+        """Register one authored, signed antenna current-port mode."""
+        if not isinstance(port_mode, AntennaPortMode):
+            raise TypeError("port_mode must be an AntennaPortMode")
+        if any(mode.id == port_mode.id for mode in _state._antenna_port_modes):
+            raise ValueError(f"duplicate antenna port mode id {port_mode.id!r}")
+        _state._antenna_port_modes.append(port_mode)
+        return port_mode
+
+    def _declare_antenna(self, collection: str, value: object) -> None:
+        candidate = _state._antenna_authoring_inventory.declare(collection, value)
+        active = AntennaAuthoringInventory(**{
+            name: tuple(getattr(_state, f"_{name}"))
+            for name in candidate.__dataclass_fields__
+        })
+        candidate.merge_with(active)
+        _state._antenna_authoring_inventory = candidate
+
+    def declare_antenna_field_solve(
+        self, *, definition: AntennaFieldSolveStage
+    ) -> AntennaFieldSolveStage:
+        """Keep a static solve definition without scheduling its execution."""
+        self._declare_antenna("antenna_field_solve_stages", definition)
+        return definition
+
+    def declare_antenna_target_projection(
+        self, *, projection: AntennaTargetProjection
+    ) -> AntennaTargetProjection:
+        """Keep a target projection independently of a field drive."""
+        self._declare_antenna("antenna_target_projections", projection)
+        return projection
+
+    def declare_solved_antenna_drive(
+        self, *, drive: SolvedAntennaDrive
+    ) -> SolvedAntennaDrive:
+        """Keep a drive declaration without activating its field."""
+        self._declare_antenna("solved_antenna_drives", drive)
+        return drive
+
+    def declare_antenna_spectrum_request(
+        self, *, request: AntennaSpectrumRequest
+    ) -> AntennaSpectrumRequest:
+        """Keep a source-spectrum request without scheduling analysis."""
+        self._declare_antenna("antenna_spectrum_requests", request)
+        return request
+
+    def add_solved_antenna_drive(
+        self,
+        *,
+        drive: SolvedAntennaDrive,
+        projection: AntennaTargetProjection,
+    ) -> SolvedAntennaDrive:
+        """Register a solved antenna drive and its target projection."""
+        if not isinstance(drive, SolvedAntennaDrive):
+            raise TypeError("drive must be a SolvedAntennaDrive")
+        if not isinstance(projection, AntennaTargetProjection):
+            raise TypeError("projection must be an AntennaTargetProjection")
+        if drive.projection_ref != projection.id:
+            raise ValueError(
+                "drive.projection_ref must match the supplied projection.id"
+            )
+        for collection, value in (
+            ("solved_antenna_drives", drive), ("antenna_target_projections", projection)
+        ):
+            declared = next((item for item in getattr(_state._antenna_authoring_inventory, collection)
+                             if item.id == value.id), None)
+            if declared is not None and declared != value:
+                raise ValueError(f"conflicting {collection} declaration {value.id!r}")
+        if isinstance(projection.solution, (AntennaStageOutputRef, AntennaFieldSolutionRef)):
+            solve = next(
+                (
+                    stage
+                    for stage in _state._antenna_field_solve_stages
+                    if stage.id == projection.solution.stage_id
+                ),
+                None,
+            )
+            if solve is None:
+                raise ValueError(
+                    f"projection.solution references unknown antenna field solve "
+                    f"{projection.solution.stage_id!r}"
+                )
+            if not any(
+                output.id == projection.solution.output_id
+                and output.quantity == "H_ant_basis"
+                for output in solve.outputs
+            ):
+                raise ValueError(
+                    f"projection.solution must reference an H_ant_basis output "
+                    f"{projection.solution.output_id!r} on solve "
+                    f"{projection.solution.stage_id!r}"
+                )
+            if drive.port_mode_id not in solve.port_mode_ids:
+                raise ValueError(
+                    f"drive.port_mode_id {drive.port_mode_id!r} is not in antenna "
+                    f"field solve {solve.id!r}"
+                )
+        else:
+            raise TypeError(
+                "projection.solution must be an AntennaStageOutputRef or "
+                "AntennaFieldSolutionRef"
+            )
+        existing_projection = next(
+            (item for item in _state._antenna_target_projections if item.id == projection.id),
+            None,
+        )
+        if existing_projection is not None and existing_projection != projection:
+            raise ValueError(f"conflicting antenna projection id {projection.id!r}")
+        if any(item.id == drive.id for item in _state._solved_antenna_drives):
+            raise ValueError(f"duplicate solved antenna drive id {drive.id!r}")
+        if any(
+            stage.stage_id == drive.id
+            for stage in _state._declared_stages
+            if stage.stage_id is not None
+        ):
+            raise ValueError(f"duplicate stage_id {drive.id!r}")
+        problem_before_action = _build_problem()
+        if existing_projection is None:
+            _state._antenna_target_projections.append(projection)
+        _state._solved_antenna_drives.append(drive)
+        _state._declared_stages.append(
+            CapturedStage(
+                problem=problem_before_action,
+                entrypoint_kind="flat_add_solved_antenna_drive",
+                action={
+                    "kind": "add_solved_antenna_drive",
+                    "projection": projection.to_ir(),
+                    "drive": drive.to_ir(),
+                },
+                stage_id=drive.id,
+            )
+        )
+        return drive
+
+    def add_antenna_spectrum_request(
+        self,
+        *,
+        request: AntennaSpectrumRequest,
+    ) -> AntennaSpectrumRequest:
+        """Register a source-field spectrum for a declared antenna solve output."""
+        if not isinstance(request, AntennaSpectrumRequest):
+            raise TypeError("request must be an AntennaSpectrumRequest")
+        declared = next((item for item in _state._antenna_authoring_inventory.antenna_spectrum_requests
+                         if item.id == request.id), None)
+        if declared is not None and declared != request:
+            raise ValueError(f"conflicting antenna spectrum declaration {request.id!r}")
+        if any(item.id == request.id for item in _state._antenna_spectrum_requests):
+            raise ValueError(f"duplicate antenna spectrum request id {request.id!r}")
+        if any(item.output_id == request.output_id for item in _state._antenna_spectrum_requests):
+            raise ValueError(f"duplicate antenna spectrum output_id {request.output_id!r}")
+        solve = next(
+            (
+                stage
+                for stage in _state._antenna_field_solve_stages
+                if stage.id == request.solution_ref.stage_id
+            ),
+            None,
+        )
+        if solve is None or not any(
+            output.id == request.solution_ref.output_id
+            and output.quantity == "H_ant_basis"
+            for output in solve.outputs
+        ):
+            raise ValueError("antenna spectrum request must reference an H_ant_basis solve output")
+        if request.port_mode_id is not None and request.port_mode_id not in solve.port_mode_ids:
+            raise ValueError("antenna spectrum request port_mode_id is not in its solve stage")
+        if any(
+            stage.stage_id == request.id
+            for stage in _state._declared_stages
+            if stage.stage_id is not None
+        ):
+            raise ValueError(f"duplicate stage_id {request.id!r}")
+        problem_before_action = _build_problem()
+        _state._antenna_spectrum_requests.append(request)
+        _state._declared_stages.append(
+            CapturedStage(
+                problem=problem_before_action,
+                entrypoint_kind="flat_antenna_source_spectrum",
+                action={"kind": "antenna_source_spectrum", "request": request.to_ir()},
+                stage_id=request.id,
+            )
+        )
+        return request
+
     def parameter(
         self,
         parameter_name: str,
@@ -6078,14 +6347,19 @@ class StudyBuilder:
         name: str = "object",
         *,
         type: str = "geometry",
+        object_id: str | None = None,
     ) -> object:
-        return geometry_object(shape, name=name, type=type)
+        return geometry_object(shape, name=name, type=type, object_id=object_id)
 
-    def conductor(self, shape: object, name: str = "conductor") -> object:
-        return geometry_object(shape, name=name, type="conductor")
+    def conductor(
+        self, shape: object, name: str = "conductor", *, object_id: str | None = None
+    ) -> object:
+        return geometry_object(shape, name=name, type="conductor", object_id=object_id)
 
-    def antenna_object(self, shape: object, name: str = "antenna") -> object:
-        return antenna_object(shape, name=name)
+    def antenna_object(
+        self, shape: object, name: str = "antenna", *, object_id: str | None = None
+    ) -> object:
+        return antenna_object(shape, name=name, object_id=object_id)
 
     def solver(
         self,
@@ -6227,6 +6501,8 @@ class StudyBuilder:
         time_envelope: TimeEnvelope | None = None,
         conservative_current_view: ConservativeCurrentView | None = None,
         structured_current_closure: StructuredCurrentClosure | None = None,
+        conservative_current_source: ExternalLeadCurrentSource | None = None,
+        external_lead_preparation: ExternalLeadPreparation | None = None,
     ) -> CurrentTransport:
         return current_transport(
             name=name,
@@ -6243,6 +6519,8 @@ class StudyBuilder:
             time_envelope=time_envelope,
             conservative_current_view=conservative_current_view,
             structured_current_closure=structured_current_closure,
+            conservative_current_source=conservative_current_source,
+            external_lead_preparation=external_lead_preparation,
         )
 
     def spin_torque(self, module: SpinTorqueModule) -> SpinTorqueModule:
@@ -8046,6 +8324,15 @@ def _build_explicit_mesh_assets(
     assets = build_geometry_assets_for_request(
         requested_backend=BackendTarget.FEM,
         geometries=resolved_geometries,
+        geometry_object_ids={
+            **_state._auxiliary_geometry_object_ids,
+            **{
+                handle._resolved_geometry().geometry_name: (
+                    handle._name if handle.object_id is None else handle.object_id
+                )
+                for handle in _state._magnets
+            },
+        },
         discretization=DiscretizationHints(**discretization_kwargs),
         study_universe=(
             _state._study_universe.to_ir()
@@ -8220,6 +8507,12 @@ def geometry(
     Multiple calls register multiple magnets.
     """
     handle = MagnetHandle(shape, name, object_id=object_id)
+    resolved_id = handle.object_id if handle.object_id is not None else handle._name
+    if resolved_id in _state._auxiliary_geometry_object_ids.values() or any(
+        resolved_id == (magnet.object_id if magnet.object_id is not None else magnet._name)
+        for magnet in _state._magnets
+    ):
+        raise ValueError(f"duplicate object_id {resolved_id!r}")
     _state._magnets.append(handle)
     return handle
 
@@ -8229,6 +8522,7 @@ def geometry_object(
     name: str = "object",
     *,
     type: str = "geometry",
+    object_id: str | None = None,
 ) -> object:
     """Register a non-magnetic geometry with an explicit physical object type.
 
@@ -8252,8 +8546,17 @@ def geometry_object(
         raise TypeError("geometry_object() requires a geometry with a geometry_name")
     if geometry_name in _state._auxiliary_geometry_roles:
         raise ValueError(f"duplicate geometry object name {geometry_name!r}")
+    resolved_id = (
+        require_non_empty(object_id, "object_id") if object_id is not None else geometry_name
+    )
+    if resolved_id in _state._auxiliary_geometry_object_ids.values() or any(
+        resolved_id == (magnet.object_id if magnet.object_id is not None else magnet._name)
+        for magnet in _state._magnets
+    ):
+        raise ValueError(f"duplicate object_id {resolved_id!r}")
     _state._auxiliary_geometries.append(resolved)
     _state._auxiliary_geometry_roles[geometry_name] = normalized_type
+    _state._auxiliary_geometry_object_ids[geometry_name] = resolved_id
     if normalized_type == "antenna":
         _state._register_geometry_visualization_hint(
             geometry_name,
@@ -8267,9 +8570,11 @@ def geometry_object(
     return resolved
 
 
-def antenna_object(shape: object, name: str = "antenna") -> object:
+def antenna_object(
+    shape: object, name: str = "antenna", *, object_id: str | None = None
+) -> object:
     """Register a non-magnetic geometry object for prescribed antenna masks."""
-    return geometry_object(shape, name=name, type="antenna")
+    return geometry_object(shape, name=name, type="antenna", object_id=object_id)
 
 
 # ---------------------------------------------------------------------------
@@ -8568,6 +8873,8 @@ def current_transport(
     time_envelope: TimeEnvelope | None = None,
     conservative_current_view: ConservativeCurrentView | None = None,
     structured_current_closure: StructuredCurrentClosure | None = None,
+    conservative_current_source: ExternalLeadCurrentSource | None = None,
+    external_lead_preparation: ExternalLeadPreparation | None = None,
 ) -> CurrentTransport:
     module = CurrentTransport(
         name=name,
@@ -8584,6 +8891,8 @@ def current_transport(
         time_envelope=time_envelope,
         conservative_current_view=conservative_current_view,
         structured_current_closure=structured_current_closure,
+        conservative_current_source=conservative_current_source,
+        external_lead_preparation=external_lead_preparation,
     )
     _state._current_modules.append(module)
     return module
@@ -8991,7 +9300,7 @@ def _build_relax_llg_dynamics(
 
 def _build_problem(
     *,
-    study_kind: str = "time_evolution",
+    study_kind: str | None = None,
     relax_algorithm: str = "llg_overdamped",
     relax_torque_tolerance: float = DEFAULT_RELAXATION_TORQUE_TOLERANCE_APM,
     relax_torque_tolerance_unit: str = "T",
@@ -9037,10 +9346,17 @@ def _build_problem(
     """Construct a Problem from the current world state."""
     s = _state
 
+    if study_kind is None:
+        study_kind = (
+            "antenna_field_solve"
+            if s._declared_stages and s._declared_stages[-1].entrypoint_kind == "flat_antenna_field_solve"
+            else "time_evolution"
+        )
+
     _validate_current_compute_resources_runtime_intent()
 
     # ── Validate ──
-    if not s._magnets:
+    if not s._magnets and study_kind != "antenna_field_solve":
         raise ValueError("No magnets defined — call fm.geometry(...) first")
 
     # Convert handles to Ferromagnet objects
@@ -9049,9 +9365,9 @@ def _build_problem(
     # Energy terms default to Exchange + Demag, but UI/Python authoring may
     # explicitly remove either contribution from H_eff.
     energy: list = []
-    if s._exchange_enabled:
+    if s._magnets and s._exchange_enabled:
         energy.append(Exchange())
-    if s._demag_enabled:
+    if s._magnets and s._demag_enabled:
         energy.append(Demag(realization=s._demag_realization))
     # Check if any magnet has DMI
     for h in s._magnets:
@@ -9095,7 +9411,7 @@ def _build_problem(
         llg_kwargs["field_refresh"] = FieldRefreshPolicy(
             demag_interval_s=s._demag_interval_s
         )
-    dynamics = LLG(**llg_kwargs)
+    dynamics = None if study_kind == "antenna_field_solve" else LLG(**llg_kwargs)
 
     # Discretization
     disc_kwargs: dict[str, Any] = {}
@@ -9264,6 +9580,8 @@ def _build_problem(
             k_vector=frequency_k_vector,
             dynamics=dynamics,
         )
+    elif study_kind == "antenna_field_solve":
+        study = AntennaFieldSolve()
     elif study_kind == "hysteresis":
         study = hysteresis_spec
     else:
@@ -9283,7 +9601,13 @@ def _build_problem(
         runtime_metadata=runtime_metadata,
         auxiliary_geometries=tuple(s._auxiliary_geometries),
         auxiliary_geometry_roles=dict(s._auxiliary_geometry_roles),
+        auxiliary_geometry_object_ids=dict(s._auxiliary_geometry_object_ids),
         current_modules=tuple(s._current_modules),
+        antenna_port_modes=tuple(s._antenna_port_modes),
+        antenna_field_solve_stages=tuple(s._antenna_field_solve_stages),
+        antenna_target_projections=tuple(s._antenna_target_projections),
+        solved_antenna_drives=tuple(s._solved_antenna_drives),
+        antenna_spectrum_requests=tuple(s._antenna_spectrum_requests),
         field_drives=tuple(s._field_drives),
         monitors=tuple(s._planar_monitors),
         spin_torques=tuple(s._spin_torques),
@@ -9320,7 +9644,7 @@ def run(until: float) -> Any:
     if until <= 0.0:
         raise ValueError("run(until) requires a positive stop time")
     from fullmag.runtime import Simulation
-    problem = _build_problem()
+    problem = _build_problem(study_kind="time_evolution")
     if _capture_binding.current().enabled:
         _capture_binding.current().stages.append(
             CapturedStage(

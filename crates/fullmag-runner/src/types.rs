@@ -2365,7 +2365,9 @@ impl FemStageExecutionContext {
             fullmag_ir::BackendPlanIR::FemFrequencyResponse(plan) => {
                 StageFemMeshIdentity::from_fem_frequency_response_plan(plan)
             }
-            fullmag_ir::BackendPlanIR::Fdm(_) | fullmag_ir::BackendPlanIR::FdmMultilayer(_) => {
+            fullmag_ir::BackendPlanIR::Fdm(_)
+            | fullmag_ir::BackendPlanIR::FdmMultilayer(_)
+            | fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(_) => {
                 return None;
             }
         };
@@ -2577,7 +2579,9 @@ impl StageFemMeshAsset {
             fullmag_ir::BackendPlanIR::FemFrequencyResponse(plan) => {
                 Some(Self::build_from_fem_frequency_response_plan(plan))
             }
-            fullmag_ir::BackendPlanIR::Fdm(_) | fullmag_ir::BackendPlanIR::FdmMultilayer(_) => None,
+            fullmag_ir::BackendPlanIR::Fdm(_)
+            | fullmag_ir::BackendPlanIR::FdmMultilayer(_)
+            | fullmag_ir::BackendPlanIR::AntennaExternalLeadInspection(_) => None,
         }
     }
 
@@ -2827,6 +2831,7 @@ fn mesh_part_role_name(role: &FemMeshPartRole) -> &'static str {
     match role {
         FemMeshPartRole::Air => "air",
         FemMeshPartRole::MagneticObject => "magnetic_object",
+        FemMeshPartRole::Conductor => "conductor",
         FemMeshPartRole::Interface => "interface",
         FemMeshPartRole::OuterBoundary => "outer_boundary",
     }
@@ -2851,6 +2856,14 @@ impl fmt::Display for RunError {
 }
 
 impl std::error::Error for RunError {}
+
+impl From<fullmag_antenna_artifacts::ArtifactError> for RunError {
+    fn from(error: fullmag_antenna_artifacts::ArtifactError) -> Self {
+        Self {
+            message: error.message,
+        }
+    }
+}
 
 impl From<fullmag_plan::PlanError> for RunError {
     fn from(e: fullmag_plan::PlanError) -> Self {
@@ -4761,10 +4774,12 @@ mod tests {
             enable_demag: false,
             external_field: None,
             antenna_zeeman_masks: Vec::new(),
+            solved_antenna_drive_bases: Vec::new(),
             field_drives: Vec::new(),
             field_drive_geometry_masks: Vec::new(),
             time_stage: Default::default(),
             current_modules: Vec::new(),
+            charge_transport_plans: Vec::new(),
             spin_transport_plans: Vec::new(),
             gyromagnetic_ratio: 2.211e5,
             precision: ExecutionPrecision::Double,

@@ -283,7 +283,7 @@ function physicsInteractionMenu(
         tooltip: operation.enabled ? undefined : operation.reason,
         disabled: !operation.enabled,
         commandId: RIBBON_PHYSICS_SELECT_INTERACTION_COMMAND,
-        commandInput: { interactionId: spec.id },
+        commandInput: { interactionId: spec.id, ...(scope === "global" ? { scope: "global" } : {}) },
       };
     }),
     ...(scope === "global" ? [createFieldDriveItem] : []),
@@ -311,7 +311,7 @@ const definitionsTab: RibbonTabContent = {
 const geometryTab: RibbonTabContent = {
   tabId: "geometry",
   groups: [
-    // ── Create Object / Shape ─────────────────────────────────────────────
+    // â”€â”€ Create Object / Shape â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
       id: "builder-create",
       title: "Create Object / Shape",
@@ -322,6 +322,7 @@ const geometryTab: RibbonTabContent = {
         { id: "geometry.add-cylinder",     icon: icon(Cylinder), label: "Cylinder",       iconColor: "text-cyan-400" },
         { id: "geometry.add-sphere",       icon: icon(Circle),   label: "Sphere",         iconColor: "text-violet-400" },
         { id: "geometry.add-microstrip-antenna", icon: icon(RadioTower), label: "Microstrip", iconColor: "text-rose-300" },
+        { id: "geometry.add-cpw-antenna", icon: icon(RadioTower), label: "CPW", iconColor: "text-sky-400" },
         { id: "builder-add-ellipsoid",     icon: icon(Circle),   label: "Ellipsoid",      disabled: true, iconColor: "text-purple-300" },
         { id: "builder-add-disk",          icon: icon(Disc),     label: "Disk",           disabled: true, iconColor: "text-sky-400" },
         { id: "geometry.add-thin-film",    icon: icon(Box),      label: "Thin Film",      iconColor: "text-lime-300" },
@@ -336,7 +337,7 @@ const geometryTab: RibbonTabContent = {
         { id: "builder-add-polygon_prism", icon: icon(Circle),   label: "Polygon Prism",  disabled: true, iconColor: "text-indigo-300" },
       ],
     },
-    // ── Boolean ──────────────────────────────────────────────────────────
+    // â”€â”€ Boolean â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
       id: "builder-boolean",
       title: "Boolean",
@@ -348,7 +349,7 @@ const geometryTab: RibbonTabContent = {
         { id: "builder-boolean-intersect", icon: icon(Plus),    label: "Intersect", disabled: true, iconColor: "text-slate-400" },
       ],
     },
-    // ── Transform ────────────────────────────────────────────────────────
+    // â”€â”€ Transform â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
       id: "builder-transform",
       title: "Transform",
@@ -360,7 +361,7 @@ const geometryTab: RibbonTabContent = {
         { id: "builder-tool-scale", icon: icon(Maximize2), label: "Scale", shortcut: "R", disabled: true, tooltip: PROBLEM_IR_03_RIGID_TRANSFORM_REASON, iconColor: "text-blue-400" },
       ],
     },
-    // ── Viewport ─────────────────────────────────────────────────────────
+    // â”€â”€ Viewport â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
       id: "builder-viewport-mode",
       title: "Viewport",
@@ -372,7 +373,7 @@ const geometryTab: RibbonTabContent = {
         { id: "builder-toggle-snap",     icon: icon(Magnet),       label: "Snap",       shortcut: "G", disabled: true, iconColor: "text-slate-400" },
       ],
     },
-    // ── Lifecycle ────────────────────────────────────────────────────────
+    // â”€â”€ Lifecycle â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
       id: "builder-lifecycle",
       title: "Lifecycle",
@@ -385,7 +386,7 @@ const geometryTab: RibbonTabContent = {
         { id: "builder-validate",       icon: icon(CheckCircle), label: "Validate",                   iconColor: "text-emerald-400" },
       ],
     },
-    // ── Focus ────────────────────────────────────────────────────────────
+    // â”€â”€ Focus â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     {
       id: "builder-focus",
       title: "Focus",
@@ -425,7 +426,7 @@ const materialsTab: RibbonTabContent = {
         { id: "magnetization-texture.assign-random-seeded", icon: icon(Sparkles), label: "Random", iconColor: "text-emerald-400" },
         { id: "magnetization-texture.assign-vortex", icon: icon(Circle), label: "Vortex", iconColor: "text-cyan-400" },
         { id: "mat-texture-bloch-sky", icon: icon(Disc),     label: "Bloch Sky",    iconColor: "text-violet-400", disabled: true },
-        { id: "mat-texture-neel-sky",  icon: icon(Disc),     label: "Néel Sky",     iconColor: "text-purple-300", disabled: true },
+        { id: "mat-texture-neel-sky",  icon: icon(Disc),     label: "NĂ©el Sky",     iconColor: "text-purple-300", disabled: true },
       ],
     },
     {
@@ -517,7 +518,7 @@ const physicsTab: RibbonTabContent = {
       actions: [
         { id: "manage-rf",      icon: icon(RadioTower), label: "RF Sources",  disabled: true, iconColor: "text-cyan-400",    menu: menu("physics-rf", "RF source", ["Add microstrip", "Add CPW", "List sources"]) },
         { id: "add-microstrip", icon: icon(Plus),       label: "Microstrip",  commandId: "geometry.add-microstrip-antenna", iconColor: "text-teal-400" },
-        { id: "add-cpw",        icon: icon(Plus),       label: "CPW",         disabled: true, iconColor: "text-sky-400" },
+        { id: "add-cpw",        icon: icon(Plus),       label: "CPW",         commandId: "geometry.add-cpw-antenna", iconColor: "text-sky-400" },
       ],
     },
   ],
@@ -592,7 +593,7 @@ const studyTab: RibbonTabContent = {
       tone: "authoring",
       actions: [
         { id: "study.add-relax-stage", icon: icon(Play), label: "Relax", iconColor: "text-emerald-400", splitButton: true, menu: menu("study-relax",  "Relax stage",      ["Overdamped relax", "LLG relax", "Minimizer", "Stop criteria"]) },
-        { id: "study.add-field-drive-stage", icon: icon(RadioTower), label: "Antenna", iconColor: "text-cyan-400", splitButton: true, menu: menu("study-antenna-stage", "Add antenna instruction", ["Global or regional target", "Sinc waveform", "Source FFT", "Stage activation"]) },
+        { id: "study.add-field-drive-stage", icon: icon(RadioTower), label: "Field Drive", iconColor: "text-cyan-400", splitButton: true, menu: menu("study-antenna-stage", "Add prescribed field drive (not a conductor solve)", ["Global or regional target", "Sinc waveform", "Waveform FFT", "Stage activation"]) },
         { id: "study.add-table-autosave-stage", icon: icon(Activity), label: "Table", iconColor: "text-blue-300", splitButton: true, menu: menu("study-table-autosave-stage", "Table autosave instruction", ["ON or OFF", "t_sampling", "Table quantities", "FFT clock diagnostics"]) },
         { id: "study.add-autosave-stage", icon: icon(Save), label: "Autosave", iconColor: "text-lime-300", splitButton: true, menu: menu("study-autosave-stage", "Autosave instruction", ["Enable quantity", "Disable quantity", "Clear all outputs", "Independent cadence"]) },
         { id: "study.add-fft-response-stage", icon: icon(FunctionSquare), label: "FFT", iconColor: "text-violet-300", splitButton: true, menu: menu("study-fft-response-stage", "Response FFT instruction", ["ON or OFF", "Response component", "Window and detrend", "Effective dt and df"]) },
@@ -611,8 +612,8 @@ const studyTab: RibbonTabContent = {
       actions: [
         { id: "study-sweep-relax",    icon: icon(BarChart3), label: "Sweep+Relax",   disabled: true, iconColor: "text-violet-400" },
         { id: "study-sweep-snap",     icon: icon(Camera),    label: "Sweep+Snap",    disabled: true, iconColor: "text-sky-400" },
-        { id: "study-relax-run",      icon: icon(Play),      label: "Relax→Run",     disabled: true, iconColor: "text-emerald-400" },
-        { id: "study-relax-eigen",    icon: icon(Sigma),     label: "Relax→Eigen",   iconColor: "text-amber-400",  disabled: true },
+        { id: "study-relax-run",      icon: icon(Play),      label: "Relaxâ†’Run",     disabled: true, iconColor: "text-emerald-400" },
+        { id: "study-relax-eigen",    icon: icon(Sigma),     label: "Relaxâ†’Eigen",   iconColor: "text-amber-400",  disabled: true },
         { id: "study-param-sweep",    icon: icon(BarChart3), label: "Param Sweep",   disabled: true, iconColor: "text-cyan-400" },
         { id: "study-current-sweep",  icon: icon(Zap),       label: "Current Sweep", disabled: true, iconColor: "text-yellow-400" },
       ],
@@ -670,7 +671,7 @@ const resultsTab: RibbonTabContent = {
       subtitle: "resources",
       tone: "neutral",
       actions: [
-        { id: "res-m",          icon: icon(Magnet),    label: "M",         active: true, iconColor: "text-pink-400",    menu: radioMenu("results-quantity", "Result quantity", "m", [["m", "Magnetization / m"], ["H_eff", "H_eff"], ["H_demag", "H_demag"], ["H_ex", "H_ex"], ["H_ani", "H_ani"], ["H_ant", "H_ant"], ["torque", "torque"], ["eden_total", "ε_total"], ["eden_ex", "ε_ex"], ["eden_demag", "ε_demag"], ["eden_ext", "ε_ext"], ["eden_ani", "ε_ani"], ["eden_dmi", "ε_dmi"], ["mat_ms", "M_sat"], ["mat_aex", "A_ex"], ["mat_alpha", "α"], ["mat_dind", "D_ind"], ["mat_dbulk", "D_bulk"]]) },
+        { id: "res-m",          icon: icon(Magnet),    label: "M",         active: true, iconColor: "text-pink-400",    menu: radioMenu("results-quantity", "Result quantity", "m", [["m", "Magnetization / m"], ["H_eff", "H_eff"], ["H_demag", "H_demag"], ["H_ex", "H_ex"], ["H_ani", "H_ani"], ["H_ant", "H_ant"], ["torque", "torque"], ["eden_total", "Îµ_total"], ["eden_ex", "Îµ_ex"], ["eden_demag", "Îµ_demag"], ["eden_ext", "Îµ_ext"], ["eden_ani", "Îµ_ani"], ["eden_dmi", "Îµ_dmi"], ["mat_ms", "M_sat"], ["mat_aex", "A_ex"], ["mat_alpha", "Î±"], ["mat_dind", "D_ind"], ["mat_dbulk", "D_bulk"]]) },
         { id: "res-heff",       icon: icon(Zap),       label: "H_eff",                   iconColor: "text-yellow-400" },
         { id: "res-demag",      icon: icon(Sigma),     label: "H_demag",                 iconColor: "text-violet-300" },
         { id: "res-exchange",   icon: icon(Zap),       label: "H_ex",                    iconColor: "text-amber-400" },

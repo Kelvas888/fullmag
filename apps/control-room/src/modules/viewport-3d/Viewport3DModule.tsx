@@ -1,4 +1,6 @@
 "use client";
+import { useAntennaFieldOverlay } from "./hooks/useAntennaFieldOverlay";
+import { antennaFieldDisplayLabel } from "@/kernel/visualization/antennaFieldIntent";
 
 import { useThree } from "@react-three/fiber";
 import {
@@ -1986,6 +1988,12 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   ...sceneProps
 }: Viewport3DFrameProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const antennaFieldOverlay = useAntennaFieldOverlay();
+  const antennaFieldSourceLabel = antennaFieldOverlay
+    ? sceneProps.primitiveModel?.objects.find(
+        (object) => object.objectId === antennaFieldOverlay.intent.sourceObjectId,
+      )?.label ?? antennaFieldOverlay.intent.sourceObjectId
+    : null;
   const createCanvasEvents = useCallback(
     (store: Parameters<typeof createViewport3DEventManager>[0]) =>
       createViewport3DEventManager(store, () => kernel.objectMoveTool.getSnapshot() !== null),
@@ -2624,6 +2632,10 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
       data-inspect-enabled={sceneProps.inspectEnabled ? "true" : "false"}
       data-primitive-object-count={sceneProps.primitiveModel?.objects.length ?? 0}
       data-primitive-object-ids={primitiveObjectIds}
+      data-primitive-object-kinds={sceneProps.primitiveModel?.objects
+        .map((object) => `${object.objectId}:${object.kind}`).join(" ") ?? ""}
+      data-primitive-object-geometry-descriptors={sceneProps.primitiveModel?.objects
+        .map((object) => object.geometryKey.slice(0, 120)).join(" ") ?? ""}
       data-hysteresis-replay-snapshot-id={hysteresisReplayTarget?.snapshotId ?? ""}
       data-hysteresis-replay-stage-id={hysteresisReplayTarget?.stageId ?? ""}
       data-hysteresis-replay-field-direction={formatHysteresisReplayGlyphVector(
@@ -2637,6 +2649,8 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
         sceneProps.bounds ? JSON.stringify(sceneProps.bounds) : ""
       }
       data-visual-profile-id={sceneProps.visualProfileId}
+      data-antenna-field-quantity={antennaFieldOverlay?.intent.quantity}
+      data-antenna-field-sample-count={antennaFieldOverlay?.count}
       onPointerDown={() => kernel.layout.setFocusedSlot(slotId)}
     >
       <div aria-live="polite" className="fm-viewport-3d__hud">
@@ -2656,10 +2670,13 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             </Button>
           </fieldset>
         ) : null}
-        <span>{quantityId}</span>
-        <span>{selectedLabel}</span>
+        <span>{antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityId}</span>
+        <span>{antennaFieldSourceLabel ?? selectedLabel}</span>
         {hysteresisReplayLabel ? <span>{hysteresisReplayLabel}</span> : null}
-        <span>{domainSummary}</span>
+        <span>{antennaFieldOverlay ? `${antennaFieldOverlay.count} samples` : domainSummary}</span>
+        {antennaFieldOverlay?.intent.kind === "inspection" ? (
+          <span>inspection only · external electrode truncation · not qualified for LLG</span>
+        ) : null}
         {meshQualityLegend ? <span>{meshQualityLegend}</span> : null}
         {sceneProps.meshSizeHighlightModel ? (
           <span>
@@ -2674,6 +2691,11 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           </span>
         ) : null}
         <span>{status}</span>
+        {sceneProps.primitiveModel?.diagnostics?.map((issue) => (
+          <span key={issue.objectId} role="alert">
+            Geometry preview unavailable · {issue.objectId}: {issue.message}
+          </span>
+        ))}
         {sceneProps.regionOverlays.length > 0 ||
         sceneProps.meshRegionOverlays.length > 0 ? (
           <fieldset
@@ -2819,6 +2841,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           />
           <Viewport3DScene
             {...sceneProps}
+            antennaFieldOverlay={antennaFieldOverlay}
             adoptionRegistry={visualizationDebugAdoptionRegistry}
             colors={colors}
             savedViewportActive={savedViewportActive}

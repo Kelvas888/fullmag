@@ -88,6 +88,7 @@ def _scale_mesh_nodes(mesh: MeshData, scale_xyz: NDArray[np.float64]) -> MeshDat
         )
     scaled = MeshData(
         nodes=np.asarray(mesh.nodes, dtype=np.float64) * scale_xyz.reshape(1, 3),
+        vertex_identity=mesh.vertex_identity,
         cell_types=mesh.cell_types,
         cell_offsets=mesh.cell_offsets,
         cell_nodes=mesh.cell_nodes,

@@ -215,12 +215,40 @@ export class TestElement extends TestNode {
     else this.removeAttribute("inputMode");
   }
 
+  private optionSelected = false;
+
+  get selected(): boolean {
+    return this.optionSelected;
+  }
+
+  set selected(value: boolean) {
+    this.optionSelected = Boolean(value);
+    let select = this.parentNode;
+    while (select instanceof TestElement && select.tagName === "OPTGROUP") select = select.parentNode;
+    if (this.optionSelected && select instanceof TestElement
+      && select.tagName === "SELECT" && !select.hasAttribute("multiple")) {
+      for (const option of select.options) {
+        if (option !== this) option.optionSelected = false;
+      }
+    }
+  }
+
   get value(): string {
+    if (this.tagName === "OPTION") return this.getAttribute("value") ?? this.textContent;
+    if (this.tagName === "SELECT") return this.options.find((option) => option.selected)?.value ?? "";
     return this.controlValue;
   }
 
   set value(value: string) {
-    this.controlValue = String(value);
+    if (this.tagName === "SELECT") {
+      let matched = false;
+      for (const option of this.options) {
+        option.selected = !matched && option.value === String(value);
+        matched ||= option.selected;
+      }
+    } else {
+      this.controlValue = String(value);
+    }
   }
 
   get innerHTML(): string {
@@ -258,9 +286,11 @@ export class TestElement extends TestNode {
   }
 
   get options(): TestElement[] {
-    return this.childNodes.filter(
-      (child): child is TestElement => child instanceof TestElement && child.tagName === "OPTION",
-    );
+    return this.childNodes.flatMap((child) => {
+      if (!(child instanceof TestElement)) return [];
+      if (child.tagName === "OPTION") return [child];
+      return child.tagName === "OPTGROUP" ? child.options : [];
+    });
   }
 
   constructor(ownerDocument: TestDocument, tagName: string) {

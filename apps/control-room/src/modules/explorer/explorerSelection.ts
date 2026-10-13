@@ -25,6 +25,7 @@ type StudyStageSelectionKind = Extract<
 const STUDY_STAGE_SELECTION_KINDS = new Set<string>([
   "study.stage.action",
   "study.stage.add_field_drive",
+  "study.stage.antenna_field_solve",
   "study.stage.autosave",
   "study.stage.eigenmodes",
   "study.stage.eigenmodes.setup",
@@ -413,6 +414,15 @@ export function selectionRefFromNode(node: ExplorerNode): SelectionRef | null {
     (node.kind === "object.root" ||
       node.kind === "object.geometry" ||
       node.kind === "object.antenna" ||
+      node.kind === "object.antenna.geometry" ||
+      node.kind === "object.antenna.regional" ||
+      node.kind === "object.antenna.conductor" ||
+      node.kind === "object.antenna.port" ||
+      node.kind === "object.antenna.solution" ||
+      node.kind === "object.antenna.projection" ||
+      node.kind === "object.antenna.drive" ||
+      node.kind === "object.antenna.spectrum" ||
+      node.kind === "object.antenna.visualization" ||
       node.kind === "object.material" ||
       node.kind === "object.physics" ||
       node.kind === "object.regions" ||
@@ -443,6 +453,12 @@ export function selectionRefFromNode(node: ExplorerNode): SelectionRef | null {
       kind: node.kind,
       nodeId: node.id,
       objectId: node.objectId,
+      ...(node.antennaResourceId
+        ? { antennaResourceId: node.antennaResourceId }
+        : {}),
+      ...(node.antennaResourceKind
+        ? { antennaResourceKind: node.antennaResourceKind }
+        : {}),
       ...(extensionId ? { extensionId } : {}),
       ...(node.regionId ? { regionId: node.regionId } : {}),
       type: "scene-object",
