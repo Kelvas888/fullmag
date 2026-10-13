@@ -100,6 +100,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v2/persistence/projects/{project_id}/run-intent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["persistence_post_persistence_projects_project_id_run_intent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v2/persistence/projects/{project_id}/runs": {
         parameters: {
             query?: never;
@@ -124,6 +140,54 @@ export interface paths {
             cookie?: never;
         };
         get: operations["persistence_get_persistence_projects_project_id_runs_run_id"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v2/persistence/projects/{project_id}/runs/{run_id}/antenna-inspections": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["persistence_get_persistence_projects_project_id_runs_run_id_antenna_inspections"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v2/persistence/projects/{project_id}/runs/{run_id}/antenna-inspections/{step_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["persistence_get_persistence_projects_project_id_runs_run_id_antenna_inspections_step_id"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v2/persistence/projects/{project_id}/runs/{run_id}/antenna-inspections/{step_id}/payloads/{payload_kind}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["persistence_get_persistence_projects_project_id_runs_run_id_antenna_inspections_step_id_payloads_payload_kind"];
         put?: never;
         post?: never;
         delete?: never;
@@ -4751,6 +4815,40 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        AcceptedAntennaInspectionCatalogResource: {
+            entries: components["schemas"]["AcceptedAntennaInspectionIdentity"][];
+            project_id: string;
+            resource_id: string;
+            run_id: string;
+            schema_version: string;
+            /** @description Publication evidence only; pinned reads separately validate numerical packages. */
+            validation_scope: string;
+        };
+        /** @description The Study step and native antenna stage are deliberately separate identities. */
+        AcceptedAntennaInspectionIdentity: {
+            artifact_id: string;
+            attempt_id: string;
+            case_id: string;
+            manifest_artifact_id: string;
+            manifest_object_ref: string;
+            native_stage_id: string;
+            /** Format: int64 */
+            ownership_epoch: number;
+            package_object_ref: string;
+            run_id: string;
+            study_step_id: string;
+            task_id: string;
+        };
+        AcceptedAntennaInspectionResource: {
+            display: components["schemas"]["AntennaInspectionDisplayDataResource"];
+            manifest: components["schemas"]["AntennaInspectionManifestResource"];
+            output_id: string;
+            owner: components["schemas"]["AcceptedAntennaInspectionIdentity"];
+            port_mode_id: string;
+            project_id: string;
+            resource_id: string;
+            schema_version: string;
+        };
         AcceptedObservationFrameRef: {
             domain_generation_id: string;
             observation_frame_id: string;
@@ -5366,6 +5464,27 @@ export interface components {
             llg_drive: boolean;
             per_ampere_basis: boolean;
             source_fft: boolean;
+        };
+        /** @description Shared verified display contract, without Live or accepted-run ownership. */
+        AntennaInspectionDisplayDataResource: {
+            capabilities: components["schemas"]["AntennaInspectionDisplayCapabilities"];
+            content_digest: string;
+            /** Format: int64 */
+            device_cell_count: number;
+            device_current?: null | components["schemas"]["AntennaInspectionCurrentDisplayResource"];
+            /** Format: int64 */
+            device_node_count: number;
+            device_positions: components["schemas"]["AntennaInspectionPayloadResource"];
+            device_potential: components["schemas"]["AntennaInspectionPayloadResource"];
+            device_topology: components["schemas"]["AntennaInspectionPayloadResource"];
+            field_scope: string;
+            magnetic_field: components["schemas"]["AntennaInspectionPayloadResource"];
+            normalization: string;
+            qualification: string;
+            sample_positions: components["schemas"]["AntennaInspectionPayloadResource"];
+            sampling_carrier: components["schemas"]["AntennaInspectionSamplingResource"];
+            source_object_id: string;
+            status: string;
         };
         AntennaInspectionDisplayResource: {
             capabilities: components["schemas"]["AntennaInspectionDisplayCapabilities"];
@@ -11690,6 +11809,49 @@ export interface components {
         ProjectRunCatalogState: "pending_materialization" | "materialized";
         /** @enum {string} */
         ProjectRunExecutionState: "pending_materialization" | "pending_preparation";
+        /**
+         * @description Runtime-free preparation of a submission identity. This does not accept a
+         *     run or certify host availability, admission, or published profile versions.
+         */
+        ProjectRunIntentRequest: {
+            archive_base64: string;
+            asset_paths: {
+                [key: string]: string;
+            };
+            /**
+             * Format: int64
+             * @description Revision of the exact archived definition observed by the author.
+             */
+            expected_revision: number;
+            /**
+             * @description Explicit RunIntentAuthoring: run_id, idempotency_key, parameters, seeds,
+             *     dependencies, scheduling_priority and requested_execution. No defaults
+             *     or identities are inferred from a live session.
+             */
+            run_authoring: {
+                [key: string]: unknown;
+            };
+            study_plan: {
+                [key: string]: unknown;
+            };
+            study_problem_catalog: {
+                [key: string]: unknown;
+            };
+        };
+        ProjectRunIntentResource: {
+            /** Format: int64 */
+            definition_revision: number;
+            payload_fingerprint: string;
+            project_id: string;
+            /**
+             * @description Canonical run_intent.v1 for the existing Submit operation. Submit must
+             *     receive the same archive, Study, catalog and asset bindings. It repeats
+             *     validation and checks published profiles before durable acceptance.
+             */
+            run_intent: {
+                [key: string]: unknown;
+            };
+        };
         ProjectRunListQuery: {
             /** @description Last RunId returned on the previous page. */
             cursor?: string | null;
@@ -15967,6 +16129,47 @@ export interface operations {
             };
         };
     };
+    persistence_post_persistence_projects_project_id_run_intent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Exact archived project identity */
+                project_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProjectRunIntentRequest"];
+            };
+        };
+        responses: {
+            /** @description Prepared immutable identity; not accepted or admitted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProjectRunIntentResource"];
+                };
+            };
+            /** @description Invalid archive or compiled authoring inputs */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Project identity or revision conflict; read-only archive */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     persistence_get_persistence_projects_project_id_runs: {
         parameters: {
             query?: {
@@ -16091,6 +16294,233 @@ export interface operations {
             };
             /** @description Run belongs to another project */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    persistence_get_persistence_projects_project_id_runs_run_id_antenna_inspections: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Previous strong ETag */
+                "If-None-Match"?: string | null;
+            };
+            path: {
+                /** @description Pinned project identity */
+                project_id: string;
+                /** @description Accepted durable run identity */
+                run_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current published inspection identities; no field packages are decoded */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedAntennaInspectionCatalogResource"];
+                };
+            };
+            /** @description Unchanged after accepted publication checks */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid identity */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Accepted run or catalogs are missing */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Project/run mismatch or catalogs changed during read */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid accepted state or publication metadata */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    persistence_get_persistence_projects_project_id_runs_run_id_antenna_inspections_step_id: {
+        parameters: {
+            query: {
+                /** @description Required current successful task attempt */
+                attempt_id: string;
+                /** @description Required current task ownership epoch */
+                ownership_epoch: number;
+                /** @description Required package CAS SHA-256 from the published artifact catalog */
+                package_object_ref: string;
+            };
+            header?: {
+                /** @description Previous strong ETag */
+                "If-None-Match"?: string | null;
+            };
+            path: {
+                /** @description Pinned project identity */
+                project_id: string;
+                /** @description Accepted durable run identity */
+                run_id: string;
+                /** @description Exact accepted Study step ID, not the native stage ID */
+                step_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Fully verified accepted inspection metadata and display descriptors, no numerical arrays */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedAntennaInspectionResource"];
+                };
+            };
+            /** @description Unchanged after current-attempt and full integrity checks */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid identity or query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Selected step has no published inspection */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Project/run mismatch or stale publication identity */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid accepted state, package or storage failure */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    persistence_get_persistence_projects_project_id_runs_run_id_antenna_inspections_step_id_payloads_payload_kind: {
+        parameters: {
+            query: {
+                /** @description Required current successful task attempt */
+                attempt_id: string;
+                /** @description Required current task ownership epoch */
+                ownership_epoch: number;
+                /** @description Required package CAS SHA-256 from the published artifact catalog */
+                package_object_ref: string;
+            };
+            header?: {
+                /** @description Previous strong ETag */
+                "If-None-Match"?: string | null;
+                /** @description One byte range */
+                Range?: string | null;
+            };
+            path: {
+                /** @description Pinned project identity */
+                project_id: string;
+                /** @description Accepted durable run identity */
+                run_id: string;
+                /** @description Exact accepted Study step ID, not the native stage ID */
+                step_id: string;
+                /** @description Same verified V/J/H and geometry payload kinds as the Live inspection API */
+                payload_kind: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Verified accepted antenna payload */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": unknown;
+                };
+            };
+            /** @description Verified payload byte range */
+            206: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": unknown;
+                };
+            };
+            /** @description Unchanged after current-attempt and full integrity checks */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid identity, query or payload kind */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Selected step has no published inspection */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Project/run mismatch or stale publication identity */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid byte range */
+            416: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Invalid accepted state, package or storage failure */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
