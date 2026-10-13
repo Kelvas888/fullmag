@@ -12,7 +12,7 @@ export type MeshFreshnessState =
   | "stale"
   | "unknown";
 
-export interface MeshBuildFreshnessInput extends ArtifactAssessmentInput {}
+export type MeshBuildFreshnessInput = ArtifactAssessmentInput;
 
 export interface MeshBuildFreshness {
   reason: string;
