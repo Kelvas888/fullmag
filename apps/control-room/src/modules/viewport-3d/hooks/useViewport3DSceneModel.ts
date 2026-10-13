@@ -6624,7 +6624,8 @@ export function useViewport3DSceneModel({
     domainMeta.error?.message ??
     (femLaneActive ? sharedDomainManifest.error?.message : null) ??
     visualizationState.error?.message ??
-    (femLaneActive ? topologyFreshnessStatus ?? topology.status : null);
+    (femLaneActive ? topologyFreshnessStatus ?? topology.status : null) ??
+    "idle";
   const savedViewportStatus = savedSelectionActive
     ? savedDatasetResource.error?.message ??
       savedDatasetResource.refreshError?.message ??

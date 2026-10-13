@@ -38,3 +38,7 @@ Root rozszerzy³ zakres o StudyInspectorPanelModel provenance i testy dla CPU pre
 Poprawiono: brak capabilities w adapterach, jawne unresolved Airbox, equality zachowuj¹ce lane i presence, stale explicit_topology flags, zale¿noœci callbacku wizualizacji obiektu, stale lane-specific errors viewportu. Independent review P2 wspólnego targetQuantity field poprawiony przez gating aktualnego demandu FDM/FEM; P2 metadata run poprawiony przez unavailable/not loaded zamiast domniemania not started w Inspectorze. Status bar nadal rozró¿nia running + brak metadata od potwierdzonego stanu przed run.
 
 Architecture hygiene, API hygiene, diff-check i smoke script syntax-check PASS; lokalne testy/typecheck/build/browser niewykonane. Koñcowy CI bêdzie Ÿród³em dowodu wykonania.
+
+## CI pierwszego head
+
+Head a20c9cf08d1f4d3b3fdba4f6aed72ee3669e64a7, PR #155. Control Room typecheck wykry³ brak deklaracji readback metody w Viewport3DFrameProps oraz nullable status po gatingu lane. Naprawa zachowuje neutralny status idle i przekazuje metodê jako jawny prop frame, nie rozszerza kontraktu sceny Three.js. Pozosta³e CI trwa; wynik koñcowy jeszcze niepotwierdzony. React Doctor CI PASS; local commit hook zg³osi³ 13 warnings na niezmienionych liniach, nie traktowaæ hook score jako wyniku CI dla diff.
