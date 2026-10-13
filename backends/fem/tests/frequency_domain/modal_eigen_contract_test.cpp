@@ -4451,6 +4451,153 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
               caller_gyrotropic.size() == 16u &&
               caller_tangent_mass.size() == 16u,
           "mixed dense Floquet regression supplies caller K/G/M with full 4-by-4 real-split storage");
+    {
+        constexpr std::size_t tangent_mass_dimension = 4u;
+        constexpr std::size_t maximum_values_to_print = 16u;
+        const double symmetry_tolerance_scale =
+            64.0 * std::numeric_limits<double>::epsilon();
+        bool matrix_finite = true;
+        std::size_t finite_value_count = 0u;
+        std::size_t printed_value_count = 0u;
+        std::size_t nonfinite_value_count = 0u;
+        double global_max_abs = 0.0;
+        std::fprintf(
+            stderr,
+            "INFO: mixed caller tangent mass row-major finite values (max %zu): [",
+            maximum_values_to_print);
+        for (std::size_t index = 0u;
+             index < caller_tangent_mass.size();
+             ++index) {
+            const double value = caller_tangent_mass[index];
+            if (!std::isfinite(value)) {
+                matrix_finite = false;
+                ++nonfinite_value_count;
+                continue;
+            }
+            ++finite_value_count;
+            global_max_abs = std::max(global_max_abs, std::abs(value));
+            if (printed_value_count < maximum_values_to_print) {
+                std::fprintf(
+                    stderr,
+                    "%s%zu:%.17g",
+                    printed_value_count == 0u ? "" : ", ",
+                    index,
+                    value);
+                ++printed_value_count;
+            }
+        }
+        std::fprintf(
+            stderr,
+            "] finite_count=%zu printed_count=%zu nonfinite_count=%zu\n",
+            finite_value_count,
+            printed_value_count,
+            nonfinite_value_count);
+
+        double maximum_transpose_asymmetry = 0.0;
+        bool has_maximum_asymmetry_pair = false;
+        std::size_t maximum_asymmetry_row = 0u;
+        std::size_t maximum_asymmetry_column = 0u;
+        bool has_dense_validator_offending_pair = false;
+        std::size_t offending_pair_row = 0u;
+        std::size_t offending_pair_column = 0u;
+        double offending_pair_difference = 0.0;
+        double offending_pair_bound = 0.0;
+        if (caller_tangent_mass.size() ==
+            tangent_mass_dimension * tangent_mass_dimension) {
+            for (std::size_t row = 0u; row < tangent_mass_dimension; ++row) {
+                for (std::size_t column = row + 1u;
+                     column < tangent_mass_dimension;
+                     ++column) {
+                    const double upper = caller_tangent_mass[
+                        row * tangent_mass_dimension + column];
+                    const double lower = caller_tangent_mass[
+                        column * tangent_mass_dimension + row];
+                    if (!std::isfinite(upper) || !std::isfinite(lower)) {
+                        matrix_finite = false;
+                        continue;
+                    }
+                    const double difference = std::abs(upper - lower);
+                    if (!has_maximum_asymmetry_pair ||
+                        difference > maximum_transpose_asymmetry) {
+                        has_maximum_asymmetry_pair = true;
+                        maximum_transpose_asymmetry = difference;
+                        maximum_asymmetry_row = row;
+                        maximum_asymmetry_column = column;
+                    }
+                    const double pair_bound = symmetry_tolerance_scale *
+                        std::max(std::abs(upper), std::abs(lower));
+                    if (!has_dense_validator_offending_pair &&
+                        difference > pair_bound) {
+                        has_dense_validator_offending_pair = true;
+                        offending_pair_row = row;
+                        offending_pair_column = column;
+                        offending_pair_difference = difference;
+                        offending_pair_bound = pair_bound;
+                    }
+                }
+            }
+        }
+
+        std::size_t positive_diagonal_count = 0u;
+        std::size_t first_invalid_diagonal = tangent_mass_dimension;
+        double minimum_diagonal = std::numeric_limits<double>::infinity();
+        if (caller_tangent_mass.size() ==
+            tangent_mass_dimension * tangent_mass_dimension) {
+            for (std::size_t index = 0u;
+                 index < tangent_mass_dimension;
+                 ++index) {
+                const double diagonal = caller_tangent_mass[
+                    index * tangent_mass_dimension + index];
+                if (std::isfinite(diagonal) && diagonal > 0.0) {
+                    ++positive_diagonal_count;
+                    minimum_diagonal = std::min(minimum_diagonal, diagonal);
+                } else if (first_invalid_diagonal == tangent_mass_dimension) {
+                    first_invalid_diagonal = index;
+                }
+            }
+        } else {
+            first_invalid_diagonal = 0u;
+        }
+
+        std::fprintf(
+            stderr,
+            "INFO: mixed caller tangent mass validator diagnostics finite=%s "
+            "global_max_abs=%.17g max_transpose_asymmetry=%.17g at=(%zu,%zu) ",
+            matrix_finite ? "true" : "false",
+            global_max_abs,
+            maximum_transpose_asymmetry,
+            maximum_asymmetry_row,
+            maximum_asymmetry_column);
+        if (has_dense_validator_offending_pair) {
+            const std::size_t upper_index =
+                offending_pair_row * tangent_mass_dimension + offending_pair_column;
+            const std::size_t lower_index =
+                offending_pair_column * tangent_mass_dimension + offending_pair_row;
+            std::fprintf(
+                stderr,
+                "64eps_offender=(%zu,%zu) row_major_indices=(%zu,%zu) "
+                "difference=%.17g pair_bound=%.17g\n",
+                offending_pair_row,
+                offending_pair_column,
+                upper_index,
+                lower_index,
+                offending_pair_difference,
+                offending_pair_bound);
+        } else {
+            std::fprintf(stderr, "64eps_offender=none\n");
+        }
+        std::fprintf(
+            stderr,
+            "INFO: mixed caller tangent mass diagonal_positive=%s positive_count=%zu/%zu "
+            "minimum_positive_diagonal=%.17g first_invalid_index=%zu\n",
+            positive_diagonal_count == tangent_mass_dimension ? "true" : "false",
+            positive_diagonal_count,
+            tangent_mass_dimension,
+            minimum_diagonal,
+            first_invalid_diagonal == tangent_mass_dimension
+                ? tangent_mass_dimension
+                : first_invalid_diagonal);
+    }
     double caller_stiffness_max_abs = 0.0;
     for (double value : caller_stiffness) {
         check(std::isfinite(value),
