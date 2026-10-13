@@ -16,7 +16,13 @@ SCRIPT_ROOT = Path(__file__).resolve().parents[2]
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
-from local_runner.container_api import APICallbacks, create_server  # noqa: E402
+from local_runner.container_api import (  # noqa: E402
+    APICallbacks,
+    MAX_RESPONSE_BYTES,
+    _encode_json,
+    _retention_page_response,
+    create_server,
+)
 
 
 class ContainerAPITests(unittest.TestCase):
@@ -205,6 +211,271 @@ class ContainerAPITests(unittest.TestCase):
             self.assertEqual(200, status)
             self.assertEqual(pid, self.json_body(payload)['plan_id'])
         self.assertEqual([('apply', pid), ('poll', pid), ('poll', pid)], self.calls)
+
+    def test_large_retention_detail_is_paged_and_bound_to_collection_revision(self):
+        plan_id = 'plan-1234abcd'
+        current = {
+            'plan_id': plan_id,
+            'scope': 'sources',
+            'status': 'succeeded',
+            'applied': True,
+            'candidates': [
+                {'candidate_id': f'candidate-{index:03d}', 'reason': 'x' * 70000}
+                for index in range(40)
+            ],
+            'retained': [],
+            'items': [{'job_id': f'job-{index:03d}', 'status': 'compacted'} for index in range(63)],
+        }
+        self.server.callbacks = replace(
+            self.server.callbacks,
+            retention_plan_get=lambda value: self.calls.append(('poll', value)) or current,
+        )
+        route = f'/api/v1/retention/plans/{plan_id}'
+        status, _, payload = self.request('GET', route)
+        self.assertEqual(200, status)
+        self.assertLessEqual(len(payload), MAX_RESPONSE_BYTES)
+        initial = self.json_body(payload)
+        self.assertEqual('paged', initial['representation'])
+        self.assertFalse(initial['complete'])
+        self.assertEqual(40, initial['collections']['candidates']['total'])
+        self.assertGreater(initial['collections']['candidates']['returned'], 0)
+        self.assertEqual(
+            initial['collections']['candidates']['returned'],
+            initial['collections']['candidates']['next_cursor'],
+        )
+        self.assertEqual(63, initial['collections']['items']['total'])
+        self.assertEqual(63, initial['compacted_items_count'])
+        self.assertRegex(initial['collections']['candidates']['revision'], r'^[a-f0-9]{64}$')
+
+        revision = initial['collections']['candidates']['revision']
+        cursor = initial['collections']['candidates']['next_cursor']
+        stale_cursor = cursor
+        candidate_ids = [entry['candidate_id'] for entry in initial['candidates']]
+        while cursor is not None:
+            status, _, payload = self.request(
+                'GET',
+                f'{route}?collection=candidates&cursor={cursor}&limit=5&revision={revision}',
+            )
+            self.assertEqual(200, status)
+            self.assertLessEqual(len(payload), MAX_RESPONSE_BYTES)
+            page = self.json_body(payload)['page']
+            self.assertEqual(cursor, page['offset'])
+            self.assertEqual(revision, page['revision'])
+            self.assertGreater(page['returned'], 0)
+            candidate_ids.extend(entry['candidate_id'] for entry in page['entries'])
+            cursor = page['next_cursor']
+        self.assertEqual(
+            [f'candidate-{index:03d}' for index in range(40)],
+            candidate_ids,
+            'all candidate pages must preserve the original stable order without gaps or duplicates',
+        )
+
+        current = {
+            **current,
+            'candidates': [{**current['candidates'][0], 'reason': 'changed'}] + current['candidates'][1:],
+        }
+        status, _, payload = self.request(
+            'GET',
+            f'{route}?collection=candidates&cursor={stale_cursor}&limit=5&revision={revision}',
+        )
+        self.assertEqual(409, status)
+        self.assertEqual('retention_collection_revision_conflict', self.json_body(payload)['error'])
+
+    def test_retention_projection_bounds_unknown_fields_and_collection_envelope(self):
+        plan_id = 'plan-0badcafe'
+        plan = {
+            'plan_id': plan_id,
+            'scope': 'runtime',
+            'status': 'preview',
+            'candidates': [
+                {'candidate_id': f'candidate-{index:03d}', 'detail': 'x' * 70000}
+                for index in range(20)
+            ],
+            'retained': [],
+            'items': [],
+            'processed_jobs': {'nested': {'detail': 'y' * 100000}},
+        }
+        plan.update({
+            f'unrecognized_collection_{index:03d}': [{'detail': 'z' * 1000}]
+            for index in range(24)
+        })
+        long_field_name = 'untrusted_' + ('k' * 1000)
+        plan[long_field_name] = {'nested': {'detail': 'w' * 100000}}
+        self.server.callbacks = replace(
+            self.server.callbacks,
+            retention_plan_get=lambda _value: plan,
+        )
+        route = f'/api/v1/retention/plans/{plan_id}'
+
+        status, _, payload = self.request('GET', route)
+
+        self.assertEqual(200, status)
+        self.assertLessEqual(len(payload), MAX_RESPONSE_BYTES)
+        initial = self.json_body(payload)
+        self.assertEqual('paged', initial['representation'])
+        self.assertFalse(initial['complete'])
+        self.assertNotIn('processed_jobs', initial)
+        self.assertNotIn(long_field_name, initial['omitted_fields'])
+        self.assertLessEqual(len(initial['omitted_fields']), 16)
+        self.assertTrue(initial['omitted_fields_truncated'])
+        self.assertGreaterEqual(initial['omitted_fields_count'], 26)
+        self.assertLessEqual(
+            set(initial['collections']),
+            {'candidates', 'retained', 'items', 'reference_errors', 'protected_external'},
+        )
+        self.assertNotIn('unrecognized_collection_000', initial)
+
+        revision = initial['collections']['candidates']['revision']
+        status, _, page_payload = self.request(
+            'GET',
+            f'{route}?collection=candidates&cursor=0&limit=1&revision={revision}',
+        )
+        self.assertEqual(200, status)
+        self.assertLessEqual(len(page_payload), MAX_RESPONSE_BYTES)
+        page = self.json_body(page_payload)
+        self.assertEqual(1, page['page']['returned'])
+        self.assertNotIn('error', page)
+
+    def test_retention_page_query_is_strict_and_nonzero_cursor_requires_revision(self):
+        self.server.callbacks = replace(
+            self.server.callbacks,
+            retention_plan_get=lambda value: self.calls.append(('poll', value)) or {'plan_id': value, 'candidates': []},
+        )
+        calls_before = len(self.calls)
+        route = '/api/v1/retention/plans/plan-1234abcd'
+        invalid_queries = (
+            '?collection=candidates&cursor=0&limit=101',
+            '?collection=candidates&cursor=1&limit=10',
+            '?collection=candidates&collection=items&cursor=0&limit=10',
+            '?collection=candidates&cursor=0&limit=10&unexpected=x',
+            '?collection=candidates&cursor=-1&limit=10',
+        )
+        for query in invalid_queries:
+            with self.subTest(query=query):
+                status, _, payload = self.request('GET', route + query)
+                self.assertEqual(400, status)
+                self.assertEqual('invalid_request', self.json_body(payload)['error'])
+        self.assertEqual(calls_before, len(self.calls))
+
+    def test_oversized_retention_detail_item_is_an_explicit_blocked_page(self):
+        plan_id = 'plan-5678abcd'
+        plan = {
+            'plan_id': plan_id,
+            'scope': 'execution',
+            'status': 'preview',
+            'candidates': [{'path': 'very-large', 'reason': 'z' * (MAX_RESPONSE_BYTES + 4096)}],
+            'retained': [],
+        }
+        self.server.callbacks = replace(
+            self.server.callbacks,
+            retention_plan_get=lambda _value: plan,
+        )
+        route = f'/api/v1/retention/plans/{plan_id}'
+        status, _, payload = self.request('GET', route)
+        self.assertEqual(200, status)
+        self.assertLessEqual(len(payload), MAX_RESPONSE_BYTES)
+        initial = self.json_body(payload)
+        meta = initial['collections']['candidates']
+        self.assertEqual(1, meta['total'])
+        self.assertEqual(0, meta['returned'])
+        self.assertEqual(0, meta['next_cursor'])
+        status, _, payload = self.request(
+            'GET',
+            f'{route}?collection=candidates&cursor=0&limit=1&revision={meta["revision"]}',
+        )
+        self.assertEqual(200, status)
+        self.assertLessEqual(len(payload), MAX_RESPONSE_BYTES)
+        page = self.json_body(payload)['page']
+        self.assertTrue(page['blocked'])
+        self.assertEqual('retention_page_item_too_large', page['error'])
+        self.assertEqual(0, page['blocked_cursor'])
+        self.assertIsNone(page['next_cursor'])
+        self.assertEqual([], page['entries'])
+
+    def test_near_budget_prefix_and_oversized_next_item_stays_bounded(self):
+        plan_id = 'plan-6789abcd'
+        plan = {
+            'plan_id': plan_id,
+            'scope': 'execution',
+            'status': 'preview',
+            'candidates': [
+                {'path': 'near-budget', 'reason': ''},
+                {'path': 'oversized-next', 'reason': 'z' * (MAX_RESPONSE_BYTES + 4096)},
+            ],
+            'retained': [],
+        }
+        self.server.callbacks = replace(
+            self.server.callbacks,
+            retention_plan_get=lambda _value: plan,
+        )
+        route = f'/api/v1/retention/plans/{plan_id}'
+        status, _, payload = self.request('GET', route)
+        self.assertEqual(200, status)
+        initial = self.json_body(payload)
+        revision = initial['collections']['candidates']['revision']
+        query = {'collection': 'candidates', 'cursor': 0, 'revision': revision}
+        prefix = _retention_page_response(plan, {**query, 'limit': 1})
+        blocked = _retention_page_response(plan, {**query, 'limit': 2})
+        blocked_metadata_bytes = len(_encode_json(blocked)) - len(_encode_json(prefix))
+        self.assertGreater(blocked_metadata_bytes, 0)
+        first_reason_length = MAX_RESPONSE_BYTES - len(_encode_json(prefix)) - blocked_metadata_bytes + 1
+        self.assertGreater(first_reason_length, 0)
+        plan['candidates'][0]['reason'] = 'a' * first_reason_length
+
+        status, _, payload = self.request('GET', route)
+        self.assertEqual(200, status)
+        refreshed = self.json_body(payload)
+        revision = refreshed['collections']['candidates']['revision']
+        status, _, page_payload = self.request(
+            'GET',
+            f'{route}?collection=candidates&cursor=0&limit=2&revision={revision}',
+        )
+
+        self.assertEqual(200, status)
+        self.assertLessEqual(len(page_payload), MAX_RESPONSE_BYTES)
+        response = self.json_body(page_payload)
+        self.assertNotEqual('response_too_large', response.get('error'))
+        page = response['page']
+        self.assertTrue(page['blocked'])
+        self.assertIn(
+            page['error'],
+            {'retention_page_item_too_large', 'retention_detail_envelope_unrepresentable'},
+        )
+        self.assertEqual(page['returned'], len(page['entries']))
+        self.assertIn(page['next_cursor'], (None, page['offset'] + page['returned']))
+
+    def test_small_retention_detail_keeps_legacy_shape_and_large_apply_is_bounded(self):
+        plan_id = 'plan-90abcdef'
+        small = {'plan_id': plan_id, 'scope': 'execution', 'status': 'preview', 'candidates': []}
+        self.server.callbacks = replace(
+            self.server.callbacks,
+            retention_plan_get=lambda _value: small,
+        )
+        status, _, payload = self.request('GET', f'/api/v1/retention/plans/{plan_id}')
+        self.assertEqual(200, status)
+        self.assertEqual(small, self.json_body(payload))
+
+        result = {
+            'plan_id': plan_id,
+            'scope': 'sources',
+            'status': 'succeeded',
+            'applied': True,
+            'items': [
+                {'job_id': f'job-{index:03d}', 'status': 'compacted', 'detail': 'q' * 50000}
+                for index in range(40)
+            ],
+        }
+        self.server.callbacks = replace(
+            self.server.callbacks,
+            retention_plan_apply=lambda _value: result,
+        )
+        status, _, payload = self.request('POST', f'/api/v1/retention/plans/{plan_id}/apply', body={})
+        self.assertEqual(200, status)
+        self.assertLessEqual(len(payload), MAX_RESPONSE_BYTES)
+        applied = self.json_body(payload)
+        self.assertEqual('paged', applied['representation'])
+        self.assertEqual(40, applied['collections']['items']['total'])
+        self.assertEqual(40, applied['compacted_items_count'])
 
     def test_retention_cancel_requires_auth_valid_plan_id_and_empty_payload(self):
         pid = 'plan-01234567'

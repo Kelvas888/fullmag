@@ -301,6 +301,25 @@ class RunnerAPI {
     return await this.request(`/api/v1/retention/plans/${encodeURIComponent(planId)}`);
   }
 
+  async getRetentionPlanPage(planId, { collection, cursor, limit = 50, revision } = {}) {
+    if (typeof collection !== 'string' || !collection ||
+        !Number.isSafeInteger(cursor) || cursor < 0 ||
+        !Number.isSafeInteger(limit) || limit < 1 || limit > 100 ||
+        (revision !== undefined && (typeof revision !== 'string' || !/^[a-f0-9]{64}$/.test(revision))) ||
+        (cursor > 0 && revision === undefined)) {
+      throw new Error('Invalid retention detail page request');
+    }
+    const query = new URLSearchParams({
+      collection,
+      cursor: String(cursor),
+      limit: String(limit),
+    });
+    if (revision !== undefined) query.set('revision', revision);
+    return await this.request(
+      `/api/v1/retention/plans/${encodeURIComponent(planId)}?${query.toString()}`,
+    );
+  }
+
   async pinResource(resourceId, pinned, reason = '') {
     return await this.request(`/api/v1/resources/${encodeURIComponent(resourceId)}/pin`, {
       method: 'POST',

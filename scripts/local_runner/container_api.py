@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import hmac
 import json
 import os
@@ -21,7 +22,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import threading
 from typing import Callable, Mapping
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, parse_qsl, unquote, urlsplit
 
 
 def _resolve_env_port(default: int = 48765) -> int:
@@ -102,6 +103,14 @@ class APIUnavailable(RuntimeError):
 
 class APINotFound(LookupError):
     """An injected callback could not find a requested job."""
+
+
+class APIConflict(RuntimeError):
+    """A read was based on a stale resource revision."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -214,16 +223,376 @@ def _redact(value: object) -> object:
     return str(value)
 
 
-def _json_bytes(value: object) -> bytes:
+def _encode_json(value: object, *, sort_keys: bool = False) -> bytes:
     try:
-        encoded = json.dumps(
-            _redact(value), ensure_ascii=False, allow_nan=False, separators=(",", ":")
+        return json.dumps(
+            _redact(value),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=sort_keys,
         ).encode("utf-8")
     except (TypeError, ValueError) as error:
         raise APIError("Callback returned a non-JSON value") from error
+
+
+def _json_bytes(value: object) -> bytes:
+    encoded = _encode_json(value)
     if len(encoded) > MAX_RESPONSE_BYTES:
         raise APIError("Callback response exceeds the bounded response limit")
     return encoded
+
+
+_RETENTION_PAGE_DEFAULT_LIMIT = 50
+_RETENTION_PAGE_MAX_LIMIT = 100
+_RETENTION_PAGE_COLLECTION = re.compile(r"[A-Za-z][A-Za-z0-9_]{0,63}\Z")
+_RETENTION_PAGE_REVISION = re.compile(r"[a-f0-9]{64}\Z")
+_RETENTION_COLLECTION_FIELDS = frozenset(
+    {"candidates", "retained", "items", "reference_errors", "protected_external"}
+)
+_RETENTION_SUMMARY_FIELDS = frozenset(
+    {
+        "plan_id",
+        "scope",
+        "status",
+        "applied",
+        "error",
+        "message",
+        "reclaim_measurement",
+        "reference_status",
+        "created_at",
+        "started_at",
+        "finished_at",
+        "candidates_count",
+        "retained_count",
+        "estimated_reclaimed_bytes",
+        "reclaimed_bytes",
+        "actual_reclaimed_bytes",
+        "removed_logical_bytes",
+        "disk_free_before_bytes",
+        "disk_free_after_estimated_bytes",
+        "disk_free_after_bytes",
+        "disk_free_change_bytes",
+        "processed_jobs",
+        "total_jobs",
+        "current_job_id",
+        "tree_phase",
+        "tree_entries_enumerated",
+        "tree_stat_entries",
+        "tree_files",
+        "tree_logical_bytes",
+        "orphan_scan_phase",
+        "orphan_worktrees_enumerated",
+        "orphan_jobs_enumerated",
+    }
+)
+_RETENTION_SUMMARY_RESERVED = frozenset(
+    {"representation", "complete", "collections", "omitted_fields", "omitted_fields_count", "page"}
+)
+_RETENTION_SUMMARY_VALUE_MAX_BYTES = 256
+_RETENTION_OMITTED_SAMPLE_MAX = 16
+_RETENTION_OMITTED_NAME_MAX_CHARS = 64
+
+
+def _retention_collection_revision(name: str, items: list[object]) -> str:
+    digest = hashlib.sha256()
+    encoded_name = name.encode("utf-8")
+    digest.update(len(encoded_name).to_bytes(4, "big"))
+    digest.update(encoded_name)
+    digest.update(len(items).to_bytes(8, "big"))
+    for item in items:
+        encoded_item = _encode_json(item, sort_keys=True)
+        digest.update(len(encoded_item).to_bytes(8, "big"))
+        digest.update(encoded_item)
+    return digest.hexdigest()
+
+
+def _retention_projection(
+    value: object,
+) -> tuple[dict[str, object], dict[str, list[object]], list[str], int]:
+    public = _redact(value)
+    if not isinstance(public, dict):
+        raise ValueError("Retention plan detail must be an object")
+
+    summary: dict[str, object] = {}
+    collections: dict[str, list[object]] = {}
+    omitted_fields: list[str] = []
+    omitted_fields_count = 0
+
+    def omit(key: object) -> None:
+        nonlocal omitted_fields_count
+        omitted_fields_count += 1
+        if (
+            isinstance(key, str)
+            and len(key) <= _RETENTION_OMITTED_NAME_MAX_CHARS
+            and len(omitted_fields) < _RETENTION_OMITTED_SAMPLE_MAX
+        ):
+            omitted_fields.append(key)
+
+    for key, item in public.items():
+        if not isinstance(key, str):
+            omit(key)
+            continue
+        if key in _RETENTION_SUMMARY_RESERVED:
+            omit(key)
+            continue
+        if key in _RETENTION_COLLECTION_FIELDS:
+            if isinstance(item, list):
+                collections[key] = item
+            else:
+                omit(key)
+            continue
+        if key not in _RETENTION_SUMMARY_FIELDS:
+            omit(key)
+            continue
+
+        if item is not None and type(item) not in (str, int, float, bool):
+            omit(key)
+            continue
+        try:
+            item_bytes = _encode_json(item)
+        except APIError:
+            omit(key)
+            continue
+        if len(item_bytes) > _RETENTION_SUMMARY_VALUE_MAX_BYTES:
+            omit(key)
+            continue
+        summary[key] = item
+
+    items = collections.get("items")
+    if items is not None:
+        summary["compacted_items_count"] = sum(
+            1 for item in items if isinstance(item, Mapping) and item.get("status") == "compacted"
+        )
+    return summary, collections, omitted_fields, omitted_fields_count
+
+
+def _retention_omitted_fields(
+    samples: list[str], count: int,
+) -> dict[str, object]:
+    if count <= 0:
+        return {}
+    return {
+        "omitted_fields": samples,
+        "omitted_fields_count": count,
+        "omitted_fields_truncated": count > len(samples),
+    }
+
+
+def _retention_unrepresentable_error() -> dict[str, object]:
+    return {
+        "error": "retention_detail_envelope_unrepresentable",
+        "representation": "unavailable",
+        "complete": False,
+    }
+
+
+def _retention_unrepresentable_page(
+    collection: str, cursor: int, total: int, revision: str,
+) -> dict[str, object]:
+    error = "retention_detail_envelope_unrepresentable"
+    return {
+        "representation": "paged",
+        "complete": False,
+        "page": {
+            "collection": collection,
+            "offset": cursor,
+            "returned": 0,
+            "total": total,
+            "next_cursor": None,
+            "revision": revision,
+            "complete": False,
+            "blocked": True,
+            "error": error,
+            "entries": [],
+        },
+    }
+
+
+def _retention_collection_meta(
+    name: str,
+    items: list[object],
+    revision: str,
+    *,
+    offset: int = 0,
+    returned: int = 0,
+    blocked: bool = False,
+    error: str | None = None,
+) -> dict[str, object]:
+    total = len(items)
+    next_cursor = None if offset + returned >= total or blocked else offset + returned
+    meta: dict[str, object] = {
+        "total": total,
+        "offset": offset,
+        "returned": returned,
+        "next_cursor": next_cursor,
+        "revision": revision,
+        "complete": offset == 0 and returned == total and not blocked,
+        "blocked": blocked,
+    }
+    if error is not None:
+        meta["error"] = error
+    return meta
+
+
+def _retention_initial_response(value: object) -> object:
+    encoded = _encode_json(value)
+    if len(encoded) <= MAX_RESPONSE_BYTES:
+        return value
+
+    summary, source_collections, omitted_fields, omitted_fields_count = _retention_projection(value)
+    revisions = {
+        name: _retention_collection_revision(name, items)
+        for name, items in source_collections.items()
+    }
+    response: dict[str, object] = {
+        **summary,
+        "representation": "paged",
+        "complete": False,
+        "collections": {},
+    }
+    response.update(_retention_omitted_fields(omitted_fields, omitted_fields_count))
+
+    collections_meta: dict[str, dict[str, object]] = {}
+    for name, items in source_collections.items():
+        response[name] = []
+        collections_meta[name] = _retention_collection_meta(name, items, revisions[name])
+    response["collections"] = collections_meta
+
+    if len(_encode_json(response)) > MAX_RESPONSE_BYTES:
+        return _retention_unrepresentable_error()
+
+    for name, items in source_collections.items():
+        output_items = response[name]
+        meta = collections_meta[name]
+        assert isinstance(output_items, list)
+        for item in items[:_RETENTION_PAGE_DEFAULT_LIMIT]:
+            output_items.append(item)
+            meta["returned"] = len(output_items)
+            meta["next_cursor"] = None if len(output_items) >= len(items) else len(output_items)
+            meta["complete"] = len(output_items) == len(items)
+            if len(_encode_json(response)) > MAX_RESPONSE_BYTES:
+                output_items.pop()
+                meta["returned"] = len(output_items)
+                meta["next_cursor"] = None if len(output_items) >= len(items) else len(output_items)
+                meta["complete"] = len(output_items) == len(items)
+                break
+
+    response["complete"] = omitted_fields_count == 0 and all(
+        bool(meta["complete"]) for meta in collections_meta.values()
+    )
+    return response
+
+
+def _retention_page_response(value: object, query: Mapping[str, object]) -> object:
+    summary, source_collections, omitted_fields, omitted_fields_count = _retention_projection(value)
+    collection = query["collection"]
+    cursor = query["cursor"]
+    limit = query["limit"]
+    supplied_revision = query.get("revision")
+    if collection not in source_collections:
+        raise ValueError("Unknown retention detail collection")
+
+    items = source_collections[collection]
+    revisions = {
+        name: _retention_collection_revision(name, values)
+        for name, values in source_collections.items()
+    }
+    revision = revisions[collection]
+    if supplied_revision is not None and supplied_revision != revision:
+        raise APIConflict("retention_collection_revision_conflict")
+    if cursor > len(items):
+        raise ValueError("Retention detail cursor is out of range")
+
+    collection_meta = {
+        name: _retention_collection_meta(name, values, revisions[name])
+        for name, values in source_collections.items()
+    }
+    collection_meta[collection] = _retention_collection_meta(
+        collection, items, revision, offset=cursor, returned=0,
+    )
+    page = {
+        "collection": collection,
+        "offset": cursor,
+        "returned": 0,
+        "total": len(items),
+        "next_cursor": cursor if cursor < len(items) else None,
+        "revision": revision,
+        "complete": cursor == 0 and len(items) == 0,
+        "blocked": False,
+        "entries": [],
+    }
+    response: dict[str, object] = {
+        **summary,
+        "representation": "paged",
+        "complete": False,
+        "collections": collection_meta,
+        "page": page,
+    }
+    response.update(_retention_omitted_fields(omitted_fields, omitted_fields_count))
+
+    if len(_encode_json(response)) > MAX_RESPONSE_BYTES:
+        return _retention_unrepresentable_page(collection, cursor, len(items), revision)
+
+    entries: list[object] = page["entries"]
+    for index in range(cursor, min(len(items), cursor + limit)):
+        item = items[index]
+        entries.append(item)
+        page["returned"] = len(entries)
+        page["next_cursor"] = None if index + 1 >= len(items) else index + 1
+        page["complete"] = cursor == 0 and len(entries) == len(items)
+        collection_meta[collection] = _retention_collection_meta(
+            collection,
+            items,
+            revision,
+            offset=cursor,
+            returned=len(entries),
+        )
+        if len(_encode_json(response)) <= MAX_RESPONSE_BYTES:
+            continue
+
+        entries.pop()
+        page["returned"] = len(entries)
+        page["next_cursor"] = None if cursor + len(entries) >= len(items) else cursor + len(entries)
+        page["complete"] = cursor == 0 and len(entries) == len(items)
+        collection_meta[collection] = _retention_collection_meta(
+            collection,
+            items,
+            revision,
+            offset=cursor,
+            returned=len(entries),
+        )
+
+        single_entry_page = {
+            **response,
+            "page": {
+                **page,
+                "offset": index,
+                "returned": 1,
+                "next_cursor": None if index + 1 >= len(items) else index + 1,
+                "entries": [item],
+            },
+        }
+        if len(_encode_json(single_entry_page)) > MAX_RESPONSE_BYTES:
+            page["blocked"] = True
+            page["error"] = "retention_page_item_too_large"
+            page["blocked_cursor"] = index
+            page["next_cursor"] = None
+            collection_meta[collection] = _retention_collection_meta(
+                collection,
+                items,
+                revision,
+                offset=cursor,
+                returned=len(entries),
+                blocked=True,
+                error="retention_page_item_too_large",
+            )
+        break
+
+    if len(_encode_json(response)) > MAX_RESPONSE_BYTES:
+        return _retention_unrepresentable_page(collection, cursor, len(items), revision)
+
+    return response
 
 
 class _RunnerAPIHandler(BaseHTTPRequestHandler):
@@ -359,6 +728,55 @@ class _RunnerAPIHandler(BaseHTTPRequestHandler):
         raw_query = parse_qs(parsed.query)
         return {k: v[0] if v else "" for k, v in raw_query.items()}
 
+    def _retention_page_query(self) -> dict[str, object] | None:
+        raw_query = urlsplit(self.path).query
+        if not raw_query:
+            return None
+        if re.search(r"%(?![0-9A-Fa-f]{2})", raw_query):
+            raise ValueError("Invalid retention page query encoding")
+        try:
+            pairs = parse_qsl(
+                raw_query,
+                keep_blank_values=True,
+                strict_parsing=True,
+                max_num_fields=4,
+            )
+        except ValueError as error:
+            raise ValueError("Invalid retention page query") from error
+        query: dict[str, str] = {}
+        for key, value in pairs:
+            if key in query:
+                raise ValueError("Duplicate retention page query parameter")
+            query[key] = value
+        if set(query) - {"collection", "cursor", "limit", "revision"}:
+            raise ValueError("Unknown retention page query parameter")
+        if not {"collection", "cursor", "limit"} <= set(query):
+            raise ValueError("Incomplete retention page query")
+        collection = query["collection"]
+        cursor_text = query["cursor"]
+        limit_text = query["limit"]
+        if not _RETENTION_PAGE_COLLECTION.fullmatch(collection):
+            raise ValueError("Invalid retention page collection")
+        if re.fullmatch(r"(?:0|[1-9][0-9]{0,11})", cursor_text) is None:
+            raise ValueError("Invalid retention page cursor")
+        if re.fullmatch(r"(?:[1-9][0-9]{0,2})", limit_text) is None:
+            raise ValueError("Invalid retention page limit")
+        cursor = int(cursor_text)
+        limit = int(limit_text)
+        if limit > _RETENTION_PAGE_MAX_LIMIT:
+            raise ValueError("Retention page limit exceeds the bound")
+        revision = query.get("revision")
+        if revision is not None and not _RETENTION_PAGE_REVISION.fullmatch(revision):
+            raise ValueError("Invalid retention page revision")
+        if cursor > 0 and revision is None:
+            raise ValueError("A revision is required for a nonzero retention page cursor")
+        return {
+            "collection": collection,
+            "cursor": cursor,
+            "limit": limit,
+            **({"revision": revision} if revision is not None else {}),
+        }
+
     def _path(self) -> list[str] | None:
         parsed = urlsplit(self.path)
         raw = unquote(parsed.path)
@@ -468,9 +886,15 @@ class _RunnerAPIHandler(BaseHTTPRequestHandler):
         success: int = 200,
         none_is_not_found: bool = False,
         include_api_status: bool = False,
+        response_transform: Callable[[object], object] | None = None,
     ) -> None:
         try:
             result = callback(*args)
+            if response_transform is not None:
+                result = response_transform(result)
+        except APIConflict as error:
+            self._error(409, error.code)
+            return
         except (APINotFound, LookupError):
             self._error(404, "job_not_found")
             return
@@ -619,7 +1043,21 @@ class _RunnerAPIHandler(BaseHTTPRequestHandler):
                 self._send(200, {})
         elif len(parts) == 5 and parts[:4] == ["api", "v1", "retention", "plans"]:
             if self.server.callbacks.retention_plan_get is not None:
-                self._invoke(self.server.callbacks.retention_plan_get, parts[4])
+                try:
+                    query = self._retention_page_query()
+                except ValueError:
+                    self._error(400, "invalid_request")
+                    return
+                transform = (
+                    (lambda value: _retention_initial_response(value))
+                    if query is None
+                    else (lambda value: _retention_page_response(value, query))
+                )
+                self._invoke(
+                    self.server.callbacks.retention_plan_get,
+                    parts[4],
+                    response_transform=transform,
+                )
             else:
                 self._error(503, "retention_unavailable")
         elif parts == ["api", "v1", "retention", "plans"]:
@@ -717,7 +1155,11 @@ class _RunnerAPIHandler(BaseHTTPRequestHandler):
                 return
             plan_id = parts[4]
             if self.server.callbacks.retention_plan_apply is not None:
-                self._invoke(self.server.callbacks.retention_plan_apply, plan_id)
+                self._invoke(
+                    self.server.callbacks.retention_plan_apply,
+                    plan_id,
+                    response_transform=_retention_initial_response,
+                )
             else:
                 self._send(200, {
                     "applied": False,

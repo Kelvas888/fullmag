@@ -12,7 +12,110 @@ export function renderStorageView(container) {
   let storageLoadPromise = null;
   let destroyed = false;
   let planObservation = 0;
+  let planRequestGeneration = 0;
+  let planSnapshotGeneration = 0;
+  let createRequestGeneration = 0;
+  let applyRequestGeneration = 0;
+  let planPagePlanId = null;
+  const planCollections = new Map();
   const savedPlanKey = 'fullmag-runner-retention-plan';
+  const retentionPageLimit = 50;
+
+  function resetPlanCollections(planId) {
+    planCollections.clear();
+    planPagePlanId = planId || null;
+  }
+
+  function beginPlanRequest({ invalidateObservation = true } = {}) {
+    return {
+      requestGeneration: ++planRequestGeneration,
+      observation: invalidateObservation ? ++planObservation : planObservation,
+      snapshotGeneration: planSnapshotGeneration,
+    };
+  }
+
+  function isCurrentPlanRequest(request, planId) {
+    return !destroyed &&
+      request.requestGeneration === planRequestGeneration &&
+      request.observation === planObservation &&
+      request.snapshotGeneration === planSnapshotGeneration &&
+      (activePlan?.plan_id || null) === planId;
+  }
+
+  function expectedCollectionStateIsCurrent(expected) {
+    return !expected || (
+      planCollections.get(expected.collection) === expected.state &&
+      expected.state.revision === expected.revision
+    );
+  }
+
+  function adoptPlanSnapshot(current) {
+    const planId = current?.plan_id || null;
+    if (planPagePlanId !== planId) resetPlanCollections(planId);
+
+    if (current?.representation !== 'paged' || !current.collections || typeof current.collections !== 'object') {
+      const priorCollectionNames = [...planCollections.keys()];
+      if (planCollections.size) resetPlanCollections(planId);
+      activePlan = { ...(activePlan?.plan_id === planId ? activePlan : {}) };
+      for (const name of priorCollectionNames) delete activePlan[name];
+      Object.assign(activePlan, current);
+      return activePlan;
+    }
+
+    const metadata = current.collections;
+    for (const [name, state] of planCollections) {
+      if (!Object.prototype.hasOwnProperty.call(metadata, name)) {
+        state.requestGeneration += 1;
+        planCollections.delete(name);
+      }
+    }
+    for (const [name, meta] of Object.entries(metadata)) {
+      if (!meta || !Number.isSafeInteger(meta.total) || meta.total < 0 ||
+          typeof meta.revision !== 'string' || !/^[a-f0-9]{64}$/.test(meta.revision)) {
+        const invalid = planCollections.get(name);
+        if (invalid) invalid.requestGeneration += 1;
+        planCollections.delete(name);
+        continue;
+      }
+      const initialRows = Array.isArray(current[name]) ? current[name] : [];
+      const existing = planCollections.get(name);
+      if (!existing || existing.revision !== meta.revision || existing.total !== meta.total) {
+        planCollections.set(name, {
+          revision: meta.revision,
+          total: meta.total,
+          rows: initialRows.slice(),
+          nextCursor: meta.next_cursor,
+          blocked: meta.blocked === true,
+          error: meta.error || null,
+          loading: false,
+          requestGeneration: (existing?.requestGeneration || 0) + 1,
+        });
+      } else if (existing.rows.length === 0 && initialRows.length > 0) {
+        existing.rows = initialRows.slice();
+        existing.nextCursor = meta.next_cursor;
+        existing.blocked = meta.blocked === true;
+        existing.error = meta.error || null;
+      }
+    }
+
+    activePlan = { ...(activePlan?.plan_id === planId ? activePlan : {}) };
+    for (const [name, value] of Object.entries(activePlan)) {
+      if (Array.isArray(value) && name !== 'omitted_fields' &&
+          !Object.prototype.hasOwnProperty.call(metadata, name)) {
+        delete activePlan[name];
+      }
+    }
+    const snapshot = { ...current };
+    for (const [name, value] of Object.entries(snapshot)) {
+      if (Array.isArray(value) && name !== 'omitted_fields' &&
+          !Object.prototype.hasOwnProperty.call(metadata, name)) {
+        delete snapshot[name];
+      }
+    }
+    Object.assign(activePlan, snapshot);
+    for (const [name, state] of planCollections) activePlan[name] = state.rows;
+    return activePlan;
+  }
 
   container.innerHTML = `
     <div class="view-container storage-view">
@@ -78,37 +181,88 @@ export function renderStorageView(container) {
   // Attach button actions
   container.querySelector('#btn-storage-refresh')?.addEventListener('click', () => loadStorageData());
   container.querySelector('#btn-plan-refresh')?.addEventListener('click', async () => {
-    if (!activePlan?.plan_id) return;
-    try { await observePlan(await api.getRetentionPlan(activePlan.plan_id)); }
-    catch (err) { alert(`Nie udało się odczytać operacji ${activePlan.plan_id}: ${err.message}`); }
+    const planId = activePlan?.plan_id;
+    if (!planId) return;
+    const request = beginPlanRequest({ invalidateObservation: false });
+    let current;
+    try {
+      current = await api.getRetentionPlan(planId);
+    } catch (err) {
+      if (isCurrentPlanRequest(request, planId)) {
+        alert(`Nie udało się odczytać operacji ${planId}: ${err.message}`);
+      }
+      return;
+    }
+    if (!isCurrentPlanRequest(request, planId)) return;
+    const observation = observePlan(current);
+    const observationId = planObservation;
+    try { await observation; }
+    catch (err) {
+      if (!destroyed && activePlan?.plan_id === planId && planObservation === observationId) {
+        alert(`Nie udało się odczytać operacji ${planId}: ${err.message}`);
+      }
+    }
   });
   container.querySelector('#btn-create-plan')?.addEventListener('click', async () => {
     const btn = container.querySelector('#btn-create-plan');
     if (btn) btn.disabled = true;
+    const createGeneration = ++createRequestGeneration;
+    const previousPlanId = activePlan?.plan_id || null;
+    const request = beginPlanRequest();
     try {
       const scope = container.querySelector('#retention-scope')?.value || 'execution';
-      activePlan = await observePlan(await api.createRetentionPlan(scope));
+      const current = await api.createRetentionPlan(scope);
+      if (!isCurrentPlanRequest(request, previousPlanId)) return;
+      const observation = observePlan(current);
+      const observationId = planObservation;
+      activePlan = await observation;
+      if (destroyed || planObservation !== observationId) return;
     } catch (err) {
-      alert('Błąd generowania planu: ' + err.message);
+      if (!destroyed && request.requestGeneration === planRequestGeneration) {
+        alert('Błąd generowania planu: ' + err.message);
+      }
     } finally {
-      if (btn) btn.disabled = false;
+      if (btn && !destroyed && createGeneration === createRequestGeneration) btn.disabled = false;
     }
   });
 
   container.querySelector('#btn-apply-plan')?.addEventListener('click', async () => {
-    if (!activePlan) return;
-    if (activePlan.status !== 'preview') return;
-    const question = activePlan.scope === 'sources'
-      ? `Współdzielić identyczną treść wskazanych źródeł z planu ${activePlan.plan_id}? Każda kapsuła zachowa swój manifest i zawartość.`
-      : activePlan.scope === 'runtime'
-        ? `Usunąć wskazane stare paczki programu z planu ${activePlan.plan_id}? Ponownie sprawdzimy odwołania wyników, instancje i ochronę paczek.`
-        : `Usunąć wskazane kopie robocze z planu ${activePlan.plan_id}? Przed usunięciem ponownie sprawdzimy ich użycie. Wyniki, źródła i cache pozostaną zachowane.`;
+    const planId = activePlan?.plan_id;
+    if (!planId || activePlan.status !== 'preview') return;
+    const scope = activePlan.scope;
+    const question = scope === 'sources'
+      ? `Współdzielić identyczną treść wskazanych źródeł z planu ${planId}? Każda kapsuła zachowa swój manifest i zawartość.`
+      : scope === 'runtime'
+        ? `Usunąć wskazane stare paczki programu z planu ${planId}? Ponownie sprawdzimy odwołania wyników, instancje i ochronę paczek.`
+        : `Usunąć wskazane kopie robocze z planu ${planId}? Przed usunięciem ponownie sprawdzimy ich użycie. Wyniki, źródła i cache pozostaną zachowane.`;
     if (confirm(question)) {
       const btn = container.querySelector('#btn-apply-plan');
       if (btn) btn.disabled = true;
+      const applyGeneration = ++applyRequestGeneration;
+      const request = beginPlanRequest();
       try {
-        const res = await observePlan(await api.applyRetentionPlan(activePlan.plan_id));
-        if (destroyed) return;
+        let mutationResult;
+        try {
+          mutationResult = await api.applyRetentionPlan(planId);
+        } catch (err) {
+          if (isCurrentPlanRequest(request, planId)) {
+            alert('Błąd wykonania retencji: ' + err.message);
+          }
+          return;
+        }
+        if (!isCurrentPlanRequest(request, planId)) return;
+        const observation = observePlan(mutationResult);
+        const observationId = planObservation;
+        let res;
+        try {
+          res = await observation;
+        } catch (err) {
+          if (!destroyed && activePlan?.plan_id === planId && planObservation === observationId) {
+            alert('Błąd wykonania retencji: ' + err.message);
+          }
+          return;
+        }
+        if (destroyed || activePlan?.plan_id !== planId || planObservation !== observationId) return;
         if (res && res.status === 'preview_only') {
           alert(`Tryb podglądu (Preview): ${res.message || 'Wykonawca automatycznego usuwania nie jest włączony.'}`);
           activePlan.status = 'preview_only';
@@ -120,13 +274,29 @@ export function renderStorageView(container) {
           alert('Błąd wykonania retencji: ' + errMsg);
           return;
         }
-        const outcome = activePlan.scope === 'sources'
-          ? `Współdzielono zawartość ${res.items?.filter(item => item.status === 'compacted').length || 0} kapsuł źródeł.`
-          : `Usunięto wskazane zasoby o rozmiarze logicznym ${formatBytes(res.removed_logical_bytes)}.`;
+        let outcome;
+        if (activePlan.scope === 'sources') {
+          const compactedCount = Number.isSafeInteger(res.compacted_items_count)
+            ? res.compacted_items_count
+            : Number.isSafeInteger(activePlan.compacted_items_count)
+              ? activePlan.compacted_items_count
+              : res.representation !== 'paged' && Array.isArray(res.items)
+                ? res.items.filter(item => item.status === 'compacted').length
+                : activePlan.representation !== 'paged' && Array.isArray(activePlan.items)
+                  ? activePlan.items.filter(item => item.status === 'compacted').length
+                  : null;
+          outcome = compactedCount === null
+            ? `Operacja współdzielenia źródeł zakończyła się; pełne podsumowanie pozostaje dostępne w planie ${activePlan.plan_id}.`
+            : `Współdzielono zawartość ${compactedCount} kapsuł źródeł.`;
+        } else {
+          outcome = `Usunięto wskazane zasoby o rozmiarze logicznym ${formatBytes(res.removed_logical_bytes)}.`;
+        }
         alert(`${outcome} Zmiana wolnego miejsca: ${formatBytes(res.disk_free_change_bytes)}. Pomiar miejsca może obejmować równoległe zapisy innych programów.`);
         loadStorageData();
-      } catch (err) {
-        alert('Błąd wykonania retencji: ' + err.message);
+      } finally {
+        if (btn && !destroyed && applyGeneration === applyRequestGeneration) {
+          btn.disabled = activePlan?.status !== 'preview' || !activePlan?.candidates_count;
+        }
       }
     }
   });
@@ -135,7 +305,8 @@ export function renderStorageView(container) {
     const observation = ++planObservation;
     let current = initial;
     while (!destroyed && observation === planObservation) {
-      activePlan = activePlan?.plan_id === current.plan_id ? { ...activePlan, ...current } : current;
+      activePlan = adoptPlanSnapshot(current);
+      planSnapshotGeneration += 1;
       if (current.plan_id) {
         try { sessionStorage.setItem(savedPlanKey, current.plan_id); } catch (_) { /* Storage may be disabled. */ }
       }
@@ -148,6 +319,95 @@ export function renderStorageView(container) {
       current = await api.getRetentionPlan(current.plan_id);
     }
     return activePlan;
+  }
+
+  async function refreshPlanAfterConflict(planId, expectedCollection = null) {
+    if (destroyed || activePlan?.plan_id !== planId ||
+        !expectedCollectionStateIsCurrent(expectedCollection)) return;
+    const request = beginPlanRequest();
+    try {
+      const current = await api.getRetentionPlan(planId);
+      if (!isCurrentPlanRequest(request, planId) ||
+          !expectedCollectionStateIsCurrent(expectedCollection)) return;
+      activePlan = adoptPlanSnapshot(current);
+      planSnapshotGeneration += 1;
+      renderPlan(activePlan);
+    } catch (error) {
+      if (!isCurrentPlanRequest(request, planId) ||
+          !expectedCollectionStateIsCurrent(expectedCollection)) return;
+      const message = `Nie udało się odświeżyć planu po zmianie jego zawartości: ${error.message}`;
+      activePlan = { ...activePlan, error: message };
+      planSnapshotGeneration += 1;
+      renderPlan(activePlan);
+    }
+  }
+
+  async function loadRetentionPage(collection) {
+    const planId = activePlan?.plan_id;
+    const pageState = planCollections.get(collection);
+    if (!planId || planPagePlanId !== planId || !pageState || pageState.loading ||
+        pageState.blocked || pageState.nextCursor === null || pageState.nextCursor === undefined) return;
+
+    const cursor = pageState.nextCursor;
+    const revision = pageState.revision;
+    const requestGeneration = ++pageState.requestGeneration;
+    pageState.loading = true;
+    pageState.error = null;
+    renderPlan(activePlan);
+    try {
+      const response = await api.getRetentionPlanPage(planId, {
+        collection,
+        cursor,
+        limit: retentionPageLimit,
+        revision,
+      });
+      const page = response?.page;
+      if (destroyed || activePlan?.plan_id !== planId ||
+          planCollections.get(collection) !== pageState ||
+          pageState.revision !== revision ||
+          pageState.requestGeneration !== requestGeneration) return;
+      if (!page || page.collection !== collection || page.offset !== cursor ||
+          page.revision !== revision || page.total !== pageState.total ||
+          !Array.isArray(page.entries) || page.returned !== page.entries.length ||
+          (page.blocked && page.next_cursor !== null) ||
+          (!page.blocked && page.next_cursor !==
+            (cursor + page.returned < page.total ? cursor + page.returned : null))) {
+        await refreshPlanAfterConflict(planId, { collection, state: pageState, revision });
+        return;
+      }
+      if (pageState.rows.length !== cursor) {
+        await refreshPlanAfterConflict(planId, { collection, state: pageState, revision });
+        return;
+      }
+      pageState.rows.push(...page.entries);
+      pageState.nextCursor = page.next_cursor;
+      pageState.blocked = page.blocked === true;
+      pageState.error = page.error || null;
+      if (!pageState.blocked && page.returned === 0 && page.next_cursor === cursor) {
+        pageState.error = 'Serwer nie przesunął kursora strony; odśwież plan przed kolejną próbą.';
+        pageState.blocked = true;
+        pageState.nextCursor = null;
+      }
+      activePlan = { ...activePlan, [collection]: pageState.rows };
+    } catch (error) {
+      if (destroyed || activePlan?.plan_id !== planId ||
+          planCollections.get(collection) !== pageState ||
+          pageState.revision !== revision ||
+          pageState.requestGeneration !== requestGeneration) return;
+      if (error.status === 409) {
+        await refreshPlanAfterConflict(planId, { collection, state: pageState, revision });
+        return;
+      }
+      pageState.error = error.message || 'Nie udało się pobrać kolejnej strony.';
+    } finally {
+      if (!destroyed && activePlan?.plan_id === planId &&
+          planCollections.get(collection) === pageState &&
+          pageState.revision === revision &&
+          pageState.requestGeneration === requestGeneration) {
+        pageState.loading = false;
+        renderPlan(activePlan);
+      }
+    }
   }
 
   function loadStorageData() {
@@ -387,10 +647,76 @@ export function renderStorageView(container) {
       return;
     }
 
+    const retentionRowLabel = (item) => {
+      if (typeof item === 'string') return item;
+      if (!item || typeof item !== 'object') return String(item);
+      const identity = item.name || item.path || item.job_id || item.resource_id || item.id || item.status;
+      const reason = item.why_retained || item.reason || item.error || item.message;
+      return [identity, reason].filter(value => value !== undefined && value !== null && value !== '').join(': ')
+        || 'Szczegół retencji';
+    };
+    const collectionPager = (name, label) => {
+      const pageState = planCollections.get(name);
+      if (!pageState || pageState.total <= 0) return '';
+      const loaded = Math.min(pageState.rows.length, pageState.total);
+      const range = loaded > 0
+        ? `Wyświetlono 1–${loaded} z ${pageState.total} ${label}.`
+        : `Załadowano 0 z ${pageState.total} ${label}.`;
+      const errorMessage = pageState.error === 'retention_page_item_too_large'
+        ? 'Pojedynczy szczegół przekracza limit odpowiedzi; dalsze strony są zablokowane.'
+        : pageState.error;
+      const canContinue = pageState.nextCursor !== null && pageState.nextCursor !== undefined && !pageState.blocked;
+      return `
+        <div class="retention-page-status">
+          <p>${range}</p>
+          ${errorMessage ? `<p class="error-box">${escapeHtml(errorMessage)}</p>` : ''}
+          ${canContinue ? `<button class="btn btn-secondary btn-sm" id="retention-page-${escapeHtml(name)}" ${pageState.loading ? 'disabled' : ''}>${pageState.loading ? 'Wczytywanie…' : loaded > 0 ? 'Załaduj kolejne szczegóły' : 'Załaduj szczegóły'}</button>` : ''}
+        </div>
+      `;
+    };
+
+    const candidateRows = Array.isArray(plan.candidates) ? plan.candidates : [];
+    const candidateTotal = planCollections.get('candidates')?.total ?? candidateRows.length;
+    const retainedRows = Array.isArray(plan.retained) ? plan.retained : [];
+    const retainedTotal = planCollections.get('retained')?.total ?? retainedRows.length;
+    const itemRows = Array.isArray(plan.items) ? plan.items : [];
+    const itemTotal = planCollections.get('items')?.total ?? itemRows.length;
+    const referenceErrors = Array.isArray(plan.reference_errors) ? plan.reference_errors : [];
+    const referenceErrorsTotal = planCollections.get('reference_errors')?.total ?? referenceErrors.length;
+    const detailComplete = plan.representation === 'paged' &&
+      (!plan.omitted_fields_count || plan.omitted_fields_count === 0) &&
+      Object.entries(plan.collections || {}).every(([name, collection]) => {
+        if (!collection || collection.total === 0) return true;
+        const pageState = planCollections.get(name);
+        return Boolean(pageState && pageState.rows.length === pageState.total &&
+          !pageState.blocked && !pageState.error);
+      });
+    const knownCollections = new Set(['candidates', 'retained', 'items', 'reference_errors']);
+    const otherCollections = [...planCollections.entries()]
+      .filter(([name, pageState]) => !knownCollections.has(name) && pageState.total > 0)
+      .map(([name, pageState]) => `
+        <h3>Szczegóły: ${escapeHtml(name)}</h3>
+        ${pageState.rows.length
+          ? `<ul>${pageState.rows.map(item => `<li>${escapeHtml(retentionRowLabel(item))}</li>`).join('')}</ul>`
+          : '<p class="empty-hint">Nie pobrano jeszcze szczegółów.</p>'}
+        ${collectionPager(name, 'elementów')}
+      `).join('');
+
     content.innerHTML = `
       ${plan.error ? `<p class="error-box">${escapeHtml(plan.error)}</p>` : ''}
-      ${plan.items ? `<h3>Wynik wykonania</h3><ul>${plan.items.map(item => `<li>${escapeHtml(item.job_id)}: ${escapeHtml(item.status)} ${escapeHtml(item.reason || '')}</li>`).join('')}</ul>` : ''}
-      ${plan.reference_errors?.length ? `<p class="error-box">Kontrola odwołań wykryła ${plan.reference_errors.length} problemów. Paczki objęte niepewną kontrolą pozostają chronione.</p>` : ''}
+      ${plan.representation === 'paged' ? `<p class="retention-detail-completeness">${detailComplete ? 'Pobrano wszystkie dostępne szczegóły.' : 'Szczegóły są stronicowane; poniżej pokazano pobrany zakres.'}</p>` : ''}
+      ${plan.omitted_fields_count ? `<p class="error-box">Limit odpowiedzi pominął ${plan.omitted_fields_count} dodatkowych pól: ${escapeHtml((plan.omitted_fields || []).join(', '))}${plan.omitted_fields_truncated ? ' (pokazano ograniczoną próbkę nazw)' : ''}</p>` : ''}
+      ${itemTotal > 0 || Array.isArray(plan.items) ? `
+        <h3>Wynik wykonania</h3>
+        ${itemRows.length ? `<ul>${itemRows.map(item => `<li>${escapeHtml(item.job_id)}: ${escapeHtml(item.status)} ${escapeHtml(item.reason || '')}</li>`).join('')}</ul>`
+          : itemTotal > 0 ? '<p class="empty-hint">Nie pobrano jeszcze szczegółów wykonania.</p>' : '<p class="empty-hint">Brak pozycji wyniku wykonania.</p>'}
+        ${collectionPager('items', 'pozycji wyniku')}
+      ` : ''}
+      ${referenceErrorsTotal > 0 ? `
+        <p class="error-box">Kontrola odwołań wykryła ${referenceErrorsTotal} problemów. Paczki objęte niepewną kontrolą pozostają chronione.</p>
+        ${referenceErrors.length ? `<ul>${referenceErrors.map(item => `<li>${escapeHtml(retentionRowLabel(item))}</li>`).join('')}</ul>` : '<p class="empty-hint">Nie pobrano szczegółów problemów odwołań.</p>'}
+        ${collectionPager('reference_errors', 'problemów')}
+      ` : ''}
       <div class="plan-summary-grid">
         <div class="plan-summary-box">
           <span class="plan-box-label">Rozmiar logiczny kandydatów (estymata):</span>
@@ -407,38 +733,48 @@ export function renderStorageView(container) {
       </div>
 
       <h3 class="subsection-title">Zasoby objęte tym planem:</h3>
-      ${plan.candidates && plan.candidates.length > 0 ? `
-        <div class="table-responsive">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Zasób</th>
-                <th>Ścieżka</th>
-                <th>Rozmiar</th>
-                <th>Uzasadnienie kwalifikacji</th>
-              </tr>
-            </thead>
-            <tbody>
-              ${plan.candidates.map(c => `
+      ${candidateTotal > 0 ? `
+        ${candidateRows.length ? `
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead>
                 <tr>
-                  <td><strong>${escapeHtml(c.name)}</strong></td>
-                  <td class="font-mono font-small">${escapeHtml(c.path)}</td>
-                  <td class="font-mono">${formatBytes(c.size_bytes)}</td>
-                  <td>${escapeHtml(c.reason)}</td>
+                  <th>Zasób</th>
+                  <th>Ścieżka</th>
+                  <th>Rozmiar</th>
+                  <th>Uzasadnienie kwalifikacji</th>
                 </tr>
-              `).join('')}
-            </tbody>
-          </table>
-        </div>
-      ` : `
-        <p class="empty-hint">Brak kwalifikujących się zasobów w tym planie.</p>
-      `}
-      ${plan.retained?.length ? `<h3>Zasoby zachowane</h3><ul>${plan.retained.slice(0, 50).map(item =>
-        `<li>${escapeHtml(item.name || item.job_id || item.path)}: ${escapeHtml(item.why_retained || item.reason || '')}</li>`).join('')}</ul>
-        ${plan.retained.length > 50 ? `<p>Pozostałe ${plan.retained.length - 50} zapisano w raporcie operacji.</p>` : ''}` : ''}
+              </thead>
+              <tbody>
+                ${candidateRows.map(c => `
+                  <tr>
+                    <td><strong>${escapeHtml(c.name)}</strong></td>
+                    <td class="font-mono font-small">${escapeHtml(c.path)}</td>
+                    <td class="font-mono">${formatBytes(c.size_bytes)}</td>
+                    <td>${escapeHtml(c.reason)}</td>
+                  </tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        ` : '<p class="empty-hint">Nie pobrano jeszcze szczegółów kandydatów.</p>'}
+        ${collectionPager('candidates', 'kandydatów')}
+      ` : '<p class="empty-hint">Brak kwalifikujących się zasobów w tym planie.</p>'}
+      ${retainedTotal > 0 ? `
+        <h3>Zasoby zachowane</h3>
+        ${retainedRows.length ? `<ul>${retainedRows.map(item =>
+          `<li>${escapeHtml(item.name || item.job_id || item.path)}: ${escapeHtml(item.why_retained || item.reason || '')}</li>`).join('')}</ul>`
+          : '<p class="empty-hint">Nie pobrano jeszcze szczegółów zachowanych zasobów.</p>'}
+        ${collectionPager('retained', 'zachowanych zasobów')}
+      ` : ''}
+      ${otherCollections}
     `;
-  }
 
+    for (const name of planCollections.keys()) {
+      const pageButton = content.querySelector(`#retention-page-${name}`);
+      if (pageButton) pageButton.onclick = () => loadRetentionPage(name);
+    }
+  }
   function renderResourcesTable(resData, err = null) {
     const el = container.querySelector('#resources-table-container');
     if (!el) return;
@@ -523,10 +859,26 @@ export function renderStorageView(container) {
   try {
     const savedId = sessionStorage.getItem(savedPlanKey);
     if (savedId && /^plan-[a-f0-9]{8,32}$/.test(savedId)) {
+      const request = beginPlanRequest();
       activePlan = { plan_id: savedId, status: 'reconnecting' };
+      planSnapshotGeneration += 1;
+      request.snapshotGeneration = planSnapshotGeneration;
       renderPlan(activePlan);
-      api.getRetentionPlan(savedId).then(observePlan).catch(error => {
-        if (!destroyed) renderPlan({ ...activePlan, error: `Nie udało się odczytać zapisanego wyniku: ${error.message}` });
+      api.getRetentionPlan(savedId).then(current => {
+        if (!isCurrentPlanRequest(request, savedId)) return;
+        const observation = observePlan(current);
+        const observationId = planObservation;
+        return observation.catch(error => {
+          if (destroyed || activePlan?.plan_id !== savedId || planObservation !== observationId) return;
+          activePlan = { ...activePlan, error: `Nie udało się odczytać zapisanego wyniku: ${error.message}` };
+          planSnapshotGeneration += 1;
+          renderPlan(activePlan);
+        });
+      }).catch(error => {
+        if (!isCurrentPlanRequest(request, savedId)) return;
+        activePlan = { ...activePlan, error: `Nie udało się odczytać zapisanego wyniku: ${error.message}` };
+        planSnapshotGeneration += 1;
+        renderPlan(activePlan);
       });
     }
   } catch (_) { /* Browser storage availability does not gate the API. */ }
@@ -538,6 +890,12 @@ export function renderStorageView(container) {
     destroy: () => {
       destroyed = true;
       storageLoadGeneration += 1;
+      planObservation += 1;
+      planRequestGeneration += 1;
+      planSnapshotGeneration += 1;
+      createRequestGeneration += 1;
+      applyRequestGeneration += 1;
+      resetPlanCollections(null);
     },
   };
 }
