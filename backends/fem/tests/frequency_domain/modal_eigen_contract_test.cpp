@@ -72,6 +72,55 @@ void check(bool condition, const char *message)
     }
 }
 
+void print_bounded_cabi_modal_result(
+    const char *label,
+    const FullmagFemFrequencyDomainResult &result)
+{
+    constexpr std::size_t error_limit = 8192u;
+    constexpr std::size_t diagnostics_limit = 131072u;
+    constexpr std::size_t result_limit = 8192u;
+    std::fprintf(
+        stderr,
+        "INFO: %s status=%u\n",
+        label,
+        static_cast<unsigned int>(result.status));
+    const auto print_field = [label](
+                                 const char *field_name,
+                                 const char *value,
+                                 std::size_t limit) {
+        const bool present = value != nullptr;
+        const char *text = present ? value : "";
+        std::size_t observed = 0u;
+        while (observed <= limit && text[observed] != '\0') {
+            ++observed;
+        }
+        const bool truncated = observed > limit;
+        const std::size_t printed = truncated ? limit : observed;
+        std::fprintf(
+            stderr,
+            "INFO: %s %s_present=%s %s_bytes_observed=%s%zu "
+            "%s_bytes_printed=%zu %s_truncated=%s\n",
+            label,
+            field_name,
+            present ? "true" : "false",
+            field_name,
+            truncated ? "at_least_" : "",
+            truncated ? limit + 1u : observed,
+            field_name,
+            printed,
+            field_name,
+            truncated ? "true" : "false");
+        std::fprintf(stderr, "INFO: %s %s_begin\n", label, field_name);
+        if (printed > 0u) {
+            std::fprintf(stderr, "%.*s\n", static_cast<int>(printed), text);
+        }
+        std::fprintf(stderr, "INFO: %s %s_end\n", label, field_name);
+    };
+    print_field("error", result.error_message, error_limit);
+    print_field("diagnostics", result.diagnostics_json, diagnostics_limit);
+    print_field("result", result.result_json, result_limit);
+}
+
 int set_floquet_diagnostic_environment(const char *name, const char *value)
 {
 #if defined(_WIN32)
@@ -4198,6 +4247,12 @@ void modal_floquet_shared_domain_original_descriptor_certification_is_fail_close
           "shared-domain Floquet window must publish the descriptor certificate");
     check(contains(result.result_json, "\"floquet_geometric_bc_certified\":false"),
           "shared-domain Floquet window must preserve the geometric-BC certificate distinction");
+    if (!contains(result.result_json,
+                  "\"potential_representation\":\"doubled_real_split_complex_coefficients\"")) {
+        print_bounded_cabi_modal_result(
+            "C ABI shared-domain Floquet potential representation",
+            result);
+    }
     check(contains(result.result_json,
                    "\"potential_representation\":\"doubled_real_split_complex_coefficients\""),
           "shared-domain Floquet window must publish the reconstructed potential representation");
@@ -4471,6 +4526,11 @@ void modal_shared_domain_floquet_mixed_dense_real_split_contract(
         make_mixed_request(caller_stiffness.data());
     FullmagFemFrequencyDomainResult mixed_result =
         fullmag_fem_modal_eigen_solve(&mixed_request);
+    if (mixed_result.status != FULLMAG_FEM_FD_OK) {
+        print_bounded_cabi_modal_result(
+            "C ABI mixed shared-domain Floquet request",
+            mixed_result);
+    }
     check(mixed_result.status == FULLMAG_FEM_FD_OK,
           "mixed shared-domain Floquet request solves using caller K/G/M and provider K_demag");
     check_recovery_provenance(mixed_result);
