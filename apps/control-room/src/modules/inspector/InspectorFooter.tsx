@@ -53,7 +53,7 @@ export function InspectorFooter({
     <footer className="fm-inspector__action-bar" data-edit-mode={session?.mode ?? "none"}>
       <div className="fm-inspector__action-controls">
         {!focusDisabled ? (
-          <Button className="fm-inspector__action-btn" size="sm" variant="secondary" onClick={onFocus}>
+          <Button className="fm-inspector__action-btn" size="sm" type="button" variant="secondary" onClick={onFocus}>
             <Focus size={14} aria-hidden="true" /> Fit view
           </Button>
         ) : null}
@@ -63,6 +63,7 @@ export function InspectorFooter({
             className="fm-inspector__action-btn"
             disabled={!actions.canReset || busy}
             size="sm"
+            type="button"
             variant="secondary"
             onClick={() => void run("reset")}
           >
@@ -76,6 +77,7 @@ export function InspectorFooter({
             className="fm-inspector__action-btn fm-inspector__action-btn--apply"
             disabled={!actions.canApply || busy}
             size="sm"
+            type="button"
             variant="primary"
             onClick={() => void run("apply")}
           >

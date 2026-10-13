@@ -1,4 +1,4 @@
-"""Managed browser fixture proof of pinned results, without solver or unit builds.
+"""Managed browser fixtures for fixed Control Room routes; no solver or unit builds.
 
 An immutable frontend source view and isolated Next outputs stay in storage.
 Existing checkout dependencies are read, never installed, copied or rebound.
@@ -23,6 +23,31 @@ from verify_control_room_sources import fingerprint, timestamp
 
 PROFILE = "windows-control-room-browser-fixture"
 BROWSER_CHANNEL = "chrome" if os.name == "nt" else None
+SCENARIO_SMOKES = {
+    "pinned-dataset": "smoke-pinned-materialized-dataset.mjs",
+    "project-document-handoff": "smoke-project-document-handoff.mjs",
+    "development-kernel-host": "smoke-development-kernel-host.mjs",
+    "development-run-outcome-handoff": "smoke-development-run-outcome-handoff.mjs",
+    "development-restart-action": "smoke-development-restart-action.mjs",
+    "execution-profiles": "smoke-execution-profiles.mjs",
+    "study-execution-profile": "smoke-study-execution-profile.mjs",
+    "inspector-actions": "smoke-inspector-actions.mjs",
+}
+SCENARIO_SCHEMAS = {
+    "pinned-dataset": "fullmag_pinned_dataset_browser_fixture_v1",
+    "project-document-handoff": "fullmag_project_document_browser_fixture_v1",
+    "development-kernel-host": "fullmag_development_kernel_host_browser_fixture_v1",
+    "development-run-outcome-handoff": "fullmag_development_run_outcome_handoff_browser_fixture_v1",
+    "development-restart-action": "fullmag_development_restart_action_browser_fixture_v1",
+    "execution-profiles": "fullmag_execution_profiles_browser_fixture_v1",
+    "study-execution-profile": "fullmag_study_execution_profile_browser_fixture_v1",
+    "inspector-actions": "fullmag_inspector_actions_browser_fixture_v1",
+}
+SCENARIO_PORTS = {
+    "execution-profiles": 3255,
+    "study-execution-profile": 3256,
+    "inspector-actions": 3257,
+}
 
 
 def link_directory(source: Path, target: Path):
@@ -62,21 +87,19 @@ def port_is_open(port: int):
 
 
 def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
-    if scenario not in {"pinned-dataset", "project-document-handoff", "development-kernel-host", "development-run-outcome-handoff", "development-restart-action", "execution-profiles", "study-execution-profile"}:
+    if scenario not in SCENARIO_SMOKES:
         raise storage.StorageError("Unknown fixed browser fixture scenario")
-    if scenario == "execution-profiles" and port != 3255:
-        raise storage.StorageError("Execution profiles browser fixture uses fixed port 3255")
-    if scenario == "study-execution-profile" and port != 3256:
-        raise storage.StorageError("Study execution profile browser fixture uses fixed port 3256")
+    if scenario in SCENARIO_PORTS and port != SCENARIO_PORTS[scenario]:
+        raise storage.StorageError(f"{scenario} browser fixture uses fixed port {SCENARIO_PORTS[scenario]}")
     layout = storage.resolve_layout(repo, PROFILE)
     storage.initialize(layout)
     app = repo / "apps/control-room"
-    smoke_name = {"pinned-dataset": "smoke-pinned-materialized-dataset.mjs", "project-document-handoff": "smoke-project-document-handoff.mjs", "development-kernel-host": "smoke-development-kernel-host.mjs", "development-run-outcome-handoff": "smoke-development-run-outcome-handoff.mjs", "development-restart-action": "smoke-development-restart-action.mjs", "execution-profiles": "smoke-execution-profiles.mjs", "study-execution-profile": "smoke-study-execution-profile.mjs"}[scenario]
+    smoke_name = SCENARIO_SMOKES[scenario]
     smoke = app / "scripts" / smoke_name
     node = shutil.which("node")
     next_cli = app / "node_modules/next/dist/bin/next"
     if not node or not next_cli.is_file() or not smoke.is_file():
-        raise storage.StorageError("Existing Node, Next and pinned dataset smoke are required; no bootstrap")
+        raise storage.StorageError("Existing Node, Next and scenario smoke are required; no bootstrap")
     dependencies = app / "node_modules"
     real_dependencies = dependencies.resolve()
     if not (real_dependencies == dependencies or
@@ -93,7 +116,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
         before = fingerprint(repo, False)
         receipt_path = run_root / "receipt.json"
         receipt = {
-            "schema": {"pinned-dataset": "fullmag_pinned_dataset_browser_fixture_v1", "project-document-handoff": "fullmag_project_document_browser_fixture_v1", "development-kernel-host": "fullmag_development_kernel_host_browser_fixture_v1", "development-run-outcome-handoff": "fullmag_development_run_outcome_handoff_browser_fixture_v1", "development-restart-action": "fullmag_development_restart_action_browser_fixture_v1", "execution-profiles": "fullmag_execution_profiles_browser_fixture_v1", "study-execution-profile": "fullmag_study_execution_profile_browser_fixture_v1"}[scenario], "state": "running",
+            "schema": SCENARIO_SCHEMAS[scenario], "state": "running",
             "scenario": scenario,
             "repo_root": str(repo), "worktree_id": layout["worktree_id"], "profile": PROFILE,
             "head": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip(),
@@ -135,7 +158,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                     raise storage.StorageError("Requested browser fixture page is missing")
                 target_page = fixture_app / f"app/{scenario}/page.tsx"
                 if target_page.exists():
-                    raise storage.StorageError("Project document fixture must not overwrite a product route")
+                    raise storage.StorageError("Browser fixture must not overwrite a product route")
                 target_page.parent.mkdir(parents=True, exist_ok=False)
                 shutil.copy2(fixture_page, target_page)
             link_directory(fixture_app / "node_modules", real_dependencies)
@@ -176,6 +199,7 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                     "development-restart-action": "FULLMAG_DEVELOPMENT_RESTART_ACTION",
                     "execution-profiles": "FULLMAG_EXECUTION_PROFILES",
                     "study-execution-profile": "FULLMAG_STUDY_EXECUTION_PROFILE",
+                    "inspector-actions": "FULLMAG_INSPECTOR_ACTIONS",
                 }.get(scenario, "FULLMAG_PROJECT_DOCUMENT")
                 env[report_prefix + "_REPORT_DIR"] = str(run_root / "browser")
                 if BROWSER_CHANNEL:
@@ -231,6 +255,18 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
             )
             if receipt["source_changed_during_run"]:
                 receipt.update(state="failed", exit_code=1)
+            if scenario == "inspector-actions":
+                browser_root = run_root / "browser"
+                artifacts = []
+                if browser_root.is_dir():
+                    for artifact in sorted(path for path in browser_root.rglob("*") if path.is_file()):
+                        artifacts.append({
+                            "path": str(artifact.relative_to(run_root)),
+                            "size_bytes": artifact.stat().st_size,
+                            "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                        })
+                receipt["browser_artifact_root"] = str(browser_root)
+                receipt["browser_artifacts"] = artifacts
             receipt["finished_at"] = timestamp()
             storage.atomic_json(receipt_path, receipt)
         print(json.dumps({"receipt": str(receipt_path), "state": receipt["state"]}))
@@ -241,12 +277,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--port", type=int)
-    parser.add_argument("--scenario", choices=("pinned-dataset", "project-document-handoff", "development-kernel-host", "development-run-outcome-handoff", "development-restart-action", "execution-profiles", "study-execution-profile"), default="pinned-dataset")
+    parser.add_argument("--scenario", choices=tuple(SCENARIO_SMOKES), default="pinned-dataset")
     args = parser.parse_args()
-    port = args.port if args.port is not None else {
-        "execution-profiles": 3255,
-        "study-execution-profile": 3256,
-    }.get(args.scenario, 3250)
+    port = args.port if args.port is not None else SCENARIO_PORTS.get(args.scenario, 3250)
     if not 1 <= port <= 65535:
         parser.error("port must be between 1 and 65535")
     raise SystemExit(run(args.repo_root.resolve(), port, args.scenario))
