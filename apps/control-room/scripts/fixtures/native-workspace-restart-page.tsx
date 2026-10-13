@@ -88,6 +88,7 @@ interface PreparedDraft {
   readonly ready_build_id: string;
   readonly ready_source_sha256: string;
   readonly project_document: ProjectDocumentProof;
+  readonly project_document_after_grid: ProjectDocumentProof;
   readonly scene_summary: SceneSummary;
 }
 
@@ -513,6 +514,18 @@ function assertUsefulScene(scene: SceneResource): SceneSummary {
   return summary;
 }
 
+function sceneAfterSuccessfulGrid(scene: SceneResource): SceneResource {
+  const expected = JSON.parse(JSON.stringify(scene)) as SceneResource;
+  for (const object of expected.objects ?? []) {
+    if (object.tags?.includes("mesh:dirty")) {
+      const remaining = object.tags.filter((tag) => tag !== "mesh:dirty");
+      if (remaining.length > 0) object.tags = remaining;
+      else delete object.tags;
+    }
+  }
+  return expected;
+}
+
 async function projectDocumentProof(
   snapshot: ProjectDocumentSnapshot,
   scene: SceneResource,
@@ -731,7 +744,8 @@ function NativeWorkspaceRestartFixtureBody() {
   const visibleScene = sceneResource.data ? summarizeScene(sceneResource.data) : null;
   const currentProofMatches = baseline !== null
     && documentPreview !== null
-    && canonicalJson(documentPreview) === canonicalJson(baseline.project_document);
+    && (canonicalJson(documentPreview) === canonicalJson(baseline.project_document)
+      || canonicalJson(documentPreview) === canonicalJson(baseline.project_document_after_grid));
   const currentIdentityMatches = baseline !== null
     && currentPin !== null && currentPin !== baseline.api_instance_id
     && hostSnapshot.kernel === kernel
@@ -813,6 +827,9 @@ function NativeWorkspaceRestartFixtureBody() {
           ready_build_id: eligibilityBefore.ready_build_id,
           ready_source_sha256: eligibilityBefore.ready_source_sha256,
           project_document: projectDocument,
+          project_document_after_grid: await projectDocumentProof(
+            kernel.projectDocument.getSnapshot(), sceneAfterSuccessfulGrid(sceneAfter),
+          ),
           scene_summary: assertUsefulScene(sceneAfter),
         };
         fixture.setPreparedDraft(prepared);
@@ -880,6 +897,7 @@ function NativeWorkspaceRestartFixtureBody() {
         nonce: freshProof.nonce,
         api_instance_id: prepared.api_instance_id,
         project_document_before: prepared.project_document,
+        project_document_after_grid: prepared.project_document_after_grid,
       });
       if (captured.captured !== true || captured.object_count !== prepared.project_document.scene_object_count) {
         throw new Error("The parent did not confirm capture of the same nonempty real scene.");
@@ -932,11 +950,11 @@ function NativeWorkspaceRestartFixtureBody() {
         throw new Error("The real replacement API does not report the applied ready build and new workspace.");
       }
       const restoredDocument = await projectDocumentProof(kernel.projectDocument!.getSnapshot(), sceneAfter);
-      if (canonicalJson(restoredDocument) !== canonicalJson(captured.project_document)) {
+      if (canonicalJson(restoredDocument) !== canonicalJson(captured.project_document_after_grid)) {
         throw new Error("The restored dirty project document differs from its captured before state.");
       }
       const sceneHash = await sha256Text(canonicalJson(sceneAfter));
-      if (sceneHash !== captured.project_document.scene_resource_sha256) {
+      if (sceneHash !== captured.project_document_after_grid.scene_resource_sha256) {
         throw new Error("The replacement API scene differs from the before-restart canonical scene.");
       }
       const viewportAfter = readViewportProof();

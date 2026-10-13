@@ -16,6 +16,20 @@ import verify_development_backend_api as native_gate
 
 
 class BrowserProofChecks(unittest.TestCase):
+    def test_after_grid_document_pins_hashes_but_never_relaxes_archive_metadata(self):
+        before = {"archive_base64_sha256": "a" * 64, "revision": 2, "dirty": True,
+                  "project_id": "project", "scene_resource_sha256": "b" * 64,
+                  "scene_document_sha256": "c" * 64}
+        expected = {**before, "scene_resource_sha256": "d" * 64, "scene_document_sha256": "e" * 64}
+        proof.validate_after_grid_document(before, expected)
+        for key, value in (("archive_base64_sha256", "f" * 64), ("revision", 3),
+                           ("dirty", False), ("project_id", "other"),
+                           ("scene_resource_sha256", "bad"), ("scene_document_sha256", None)):
+            with self.subTest(key=key), self.assertRaises(proof.storage.StorageError):
+                proof.validate_after_grid_document(before, {**expected, key: value})
+        with self.assertRaises(proof.storage.StorageError):
+            proof.validate_after_grid_document(before, {**expected, "extra": True})
+
     def test_successful_grid_only_clears_mesh_dirty_and_preserves_source(self):
         scene = {"revision": 3, "objects": [
             {"id": "a", "tags": ["mesh:dirty", "user-tag"], "material_ref": "m"},

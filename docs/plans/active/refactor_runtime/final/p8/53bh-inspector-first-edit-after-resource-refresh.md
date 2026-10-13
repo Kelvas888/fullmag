@@ -1,8 +1,8 @@
 # P8-53BH — pierwsza edycja Inspectora po odświeżeniu materiału
 
-Data: 13.10.2026. Status: **OPEN** — błąd odtworzony w natywnej próbie,
-poprawka źródeł i interpretowana regresja PASS; ponowna kwalifikacja
-Apply/restore w toku. Cały P8-53 pozostaje otwarty.
+Data: 13.10.2026. Status: **CLOSED w opisanym zakresie materiału** —
+pierwsza edycja, odmowa restartu przy szkicu, Apply i odtworzenie potwierdzone
+terminalną próbą przeglądarkową. Cały P8-53 pozostaje otwarty.
 
 ## Zakres i kontrakt
 
@@ -171,3 +171,56 @@ restore; nie ignorować dowolnych hashy ani zmian authoringu. Dodać regresję
 fałszywych zmian i ponowić pełny browser gate. Do tego czasu P8-53BH OPEN.
 Próbę normalnie anulowano po terminalnym Compute; terminal fixture failed,
 nie PASS całej bramki. Nie zmieniono publicznej dostępności restartu.
+
+## Poprawka checkpointu dokumentu po Grid
+
+Prywatny checkpoint przygotowuje teraz `project_document_after_grid` przed
+restartem z tego samego dokumentu i jawnej kopii sceny bez `mesh:dirty`.
+Archiwum, project_id, revision, dirty, nazwa, filename i liczności pozostają
+identyczne. Dwa przewidywane hashe zasobu/projekcji sceny są przypięte w
+niezmiennym before-capture. Parent odrzuca inne zmiany metadata, dodatkowe
+pola oraz niepoprawne hashe. Finish wymaga dokładnej zgodności z oczekiwaną
+projekcją po Grid, niezależnej ścisłej zgodności sceny i terminalnego custody.
+Natychmiastowa obserwacja odtworzenia nadal porównuje pełną scenę bez wyjątków.
+Nie zmieniono publicznego API ani zachowania produktu.
+
+Kontrole interpretowane: Python 28 PASS; frontend scene-evidence 5 PASS.
+Regresja sprawdza zachowanie parametrów i regionów, brak mutacji baseline,
+zachowanie innych tagów, usunięcie pustego tags, wiring obu hashy oraz odmowę
+zmiany archiwum, rewizji, dirty, project_id i dodatkowych pól.
+Ponowna zarządzana próba: receipt `0349fe166bc24239b39ecf5260ad3fc5`,
+pakiet L; wynik browser pozostaje otwarty do terminalnego receipt.
+
+
+## Terminalny odbiór pełnej próby materiału
+
+Receipt `0349fe166bc24239b39ecf5260ad3fc5` zakończył się 13.10.2026
+17:27:01 +02:00: state=completed, exit_code=0, dziewięć kontroli PASS.
+Wszystkie 26 procesów odebrano; Compute zakończył się normalnie, bez kill.
+Izolowany workspace na 3258; sesja użytkownika na 3197 bez zmian.
+
+Po odświeżeniu zasobu edycja samego alpha=0.02 zachowała Name,
+Ms=800000 i Aex=1.3e-11. Restart odmówił do jawnego Apply Parameters.
+Po Apply odtworzono dokładną scenę oraz niezapisany dokument, z nowym API
+`44174658-dd8b-4e13-99cf-7e6713c9f854`, generation=1 i session
+`session-18de20208fc285b400023068`. Archiwum zachowało hash
+`48bf9e9723057ffcc84e8cfeacd3bfa5e0988dad4f8b5297b4621787f9c1faaa`.
+
+Grid `fm-722bd17b-ee4f-436b-86c8-dc5012be12dd` przygotował 4×4×1 / 16 cells.
+Compute `fm-76572cb2-62d1-415a-9fb6-9a687fd9fe2a` wykonał 10 kroków / 1 ps,
+FDM CPU double strict, stage-000 completed. Close
+`fm-59323d45-c5e6-4016-a130-1a668deccdfe` oraz Finish zakończyły custody.
+Dwa hashe sceny po Grid odpowiadają przewidzianemu usunięciu mesh:dirty;
+archiwum, metadata i parametry pozostały identyczne. Typecheck i lint exit=0.
+Interpretowane kontrole: Python 28 PASS, frontend scene-evidence 5 PASS.
+Review kodu: PASS, bez wskazanych P0/P1.
+
+![Materiał po pełnej próbie restartu i Compute](53bh-material-final-proof.jpg)
+
+Źródła backendu przypięto w pakiecie L, build ID
+`2831903ee7da60597d1d9781572af240f5db7373c32452580ed5b4b49c1519f6`.
+Dowód nie kwalifikuje wszystkich równoległych zmian mastera ani innych lane’ów.
+Region i materiał wprowadzono przez typowaną transakcję sceny; ta próba
+nie dowodzi ich utworzenia przez UI. Save Project, Cancel, wszystkie typy
+Inspectora, powtórny restart i publiczna dostępność restartu nadal mają
+osobne bramki. Następny etap: Save Project i przenoszenie stanu dokumentu.

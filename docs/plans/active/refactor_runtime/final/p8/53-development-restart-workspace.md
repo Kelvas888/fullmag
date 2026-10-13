@@ -1,9 +1,11 @@
 # P8-53 — bezpieczne zastosowanie nowego backendu w workspace
 
-[P8-53BH](53bh-inspector-first-edit-after-resource-refresh.md): kontynuacja
-macierzy Inspector ujawniła utratę nietkniętych pól przy pierwszej edycji
-materiału po odświeżeniu zasobu. Restart odmawia i zachowuje scope;
-poprawka szkicu oraz Apply/restore wymagają ponownego dowodu. Bramka OPEN.
+[P8-53BH](53bh-inspector-first-edit-after-resource-refresh.md), 13.10.2026:
+pierwsza edycja materiału po odświeżeniu, guard szkicu, Apply i restart/restore
+**CLOSED w opisanym zakresie**. Receipt `0349fe166bc24239b39ecf5260ad3fc5`:
+completed, exit 0, dziewięć kontroli, Grid i Compute zakończone normalnie,
+wszystkie 26 procesów odebrane. Save Project, Cancel, pozostałe panele
+Inspectora i powtórny restart pozostają otwarte. Nie zamyka całego P8-53.
 
 [P8-53BE](53be-compute-after-workspace-restore.md), 13.10.2026:
 Compute po restore dla FDM CPU strict double **CLOSED**. Browser F→K

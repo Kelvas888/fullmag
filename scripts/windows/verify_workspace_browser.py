@@ -77,6 +77,19 @@ def scene_after_successful_grid(scene):
     return expected
 
 
+def validate_after_grid_document(before, expected):
+    """Pin predicted hashes before restart; never relax archive or metadata."""
+    if not isinstance(before, dict) or not isinstance(expected, dict):
+        raise storage.StorageError("After-grid document proof is missing")
+    hashes = ("scene_resource_sha256", "scene_document_sha256")
+    if any(not isinstance(expected.get(key), str) or not SHA256_RE.fullmatch(expected[key])
+           or not isinstance(before.get(key), str) or not SHA256_RE.fullmatch(before[key])
+           for key in hashes):
+        raise storage.StorageError("After-grid document hashes are invalid")
+    if canonical({**expected, **{key: before[key] for key in hashes}}) != canonical(before):
+        raise storage.StorageError("After-grid document changed archive or metadata")
+
+
 def check_material_anisotropy_plans(binaries, fixture, env, receipt):
     """Exercise the production planner without compiling tests or starting a solver."""
     root = fixture / "material-anisotropy-plans"
@@ -903,13 +916,14 @@ class ProofBridge:
 
     def capture_before(self, body):
         proof = self.eligibility()
-        if (set(body) != {"schema", "nonce", "api_instance_id", "project_document_before"}
+        if (set(body) != {"schema", "nonce", "api_instance_id", "project_document_before", "project_document_after_grid"}
                 or body["schema"] != "fullmag.development-browser-before.v1"
                 or body["nonce"] != self.expected["nonce"]
                 or body["api_instance_id"] != proof["api_instance_id"]
                 or not isinstance(body["project_document_before"], dict)
                 or not body["project_document_before"]):
             raise storage.StorageError("Browser before-capture has a different scope or empty draft")
+        validate_after_grid_document(body["project_document_before"], body["project_document_after_grid"])
         scene = read_api(self.api_port, proof["api_instance_id"], "/v2/sessions/current/model/scene")
         objects = scene.get("objects")
         if not isinstance(objects, list) or not objects:
@@ -950,7 +964,7 @@ class ProofBridge:
                 or body.get("new_api_instance_id") != restored.get("new_api_instance_id")
                 or body["new_api_instance_id"] == before["api_instance_id"]
                 or canonical(body["project_document_before"]) != canonical(before["project_document_before"])
-                or canonical(body["project_document_after"]) != canonical(before["project_document_before"])):
+                or canonical(body["project_document_after"]) != canonical(before["project_document_after_grid"])):
             raise storage.StorageError("Browser hydration does not preserve the captured draft and new pin")
         execution = self.execution()
         scene = read_api(self.api_port, body["new_api_instance_id"], "/v2/sessions/current/model/scene")
