@@ -1965,6 +1965,9 @@ pub(crate) fn write_artifacts(
     let _frequency_publication_lease = if executed.auxiliary_artifacts.iter().any(|artifact| {
         artifact.relative_path.starts_with("eigen/") || artifact.relative_path.starts_with("response/")
     }) {
+        // Do not mutate legacy root bytes if a v2 current selector would keep
+        // readers pinned to a different immutable publication.
+        crate::artifact_generation::ensure_legacy_publication_allowed(output_dir)?;
         Some(crate::artifact_generation::PublicationLease::acquire(output_dir)?)
     } else {
         None
@@ -5811,7 +5814,7 @@ mod tests {
         fem.mesh.boundary_markers = vec![27];
         let part = FemMeshPartIR {
             id: "part:interface:0:1".into(),
-            label: "Air ↔ film".into(),
+            label: "Air â†” film".into(),
             role: FemMeshPartRole::Interface,
             object_id: Some("film".into()),
             geometry_id: Some("film".into()),
@@ -5905,7 +5908,7 @@ mod tests {
         assert_eq!(field_unit("H_dmi_bulk.z"), "A/m");
         assert_eq!(field_unit("H_rotated_dmi"), "A/m");
         assert_eq!(field_unit("H_rotated_dmi.y"), "A/m");
-        assert_eq!(field_unit("eden_rotated_dmi"), "J/m³");
+        assert_eq!(field_unit("eden_rotated_dmi"), "J/mÂł");
     }
 
     #[test]
@@ -7297,6 +7300,57 @@ mod tests {
         });
         let _ = fs::remove_dir_all(&output_dir);
         result
+    }
+
+    #[test]
+    fn write_artifacts_refuses_eigen_auxiliary_when_immutable_generation_marker_exists() {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock drift")
+            .as_nanos();
+        let output_dir = std::env::temp_dir().join(format!(
+            "fullmag-v1-writer-v2-marker-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(output_dir.join("frequency_domain"))
+            .expect("frequency-domain marker directory should be created");
+        fs::create_dir_all(output_dir.join("eigen"))
+            .expect("legacy eigen directory should be created");
+
+        let marker_path = output_dir.join(crate::artifact_generation::IMMUTABLE_COMMIT_PATH);
+        let marker_sentinel = b"malformed but present immutable generation marker";
+        let metadata_path = output_dir.join("metadata.json");
+        let metadata_sentinel = b"legacy metadata must remain byte-identical";
+        let member_path = output_dir.join("eigen/spectrum.json");
+        let member_sentinel = b"legacy eigen member must remain byte-identical";
+        fs::write(&marker_path, marker_sentinel).expect("v2 marker should be seeded");
+        fs::write(&metadata_path, metadata_sentinel).expect("legacy metadata should be seeded");
+        fs::write(&member_path, member_sentinel).expect("legacy eigen member should be seeded");
+
+        let problem = fullmag_ir::ProblemIR::bootstrap_example();
+        let plan = test_fem_execution_plan();
+        let mut executed = final_execution_test_run(ExecutionProvenance::default());
+        executed
+            .auxiliary_artifacts
+            .push(crate::types::AuxiliaryArtifact {
+                relative_path: "eigen/spectrum.json".to_string(),
+                bytes: b"replacement spectrum from the v1 writer".to_vec(),
+            });
+
+        let error = write_artifacts(&output_dir, &problem, &plan, &executed, None)
+            .expect_err("legacy writer must refuse an existing immutable v2 marker");
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(error
+            .to_string()
+            .contains("v1 publisher cannot shadow the current immutable v2 generation"));
+        assert_eq!(fs::read(&marker_path).unwrap(), marker_sentinel.to_vec());
+        assert_eq!(fs::read(&metadata_path).unwrap(), metadata_sentinel.to_vec());
+        assert_eq!(fs::read(&member_path).unwrap(), member_sentinel.to_vec());
+        assert!(!output_dir
+            .join(".frequency-domain-publication.lease")
+            .exists());
+
+        fs::remove_dir_all(output_dir).expect("temporary writer fixture should be removed");
     }
 
     #[test]

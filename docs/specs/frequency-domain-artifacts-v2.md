@@ -27,85 +27,85 @@ artifacts/response/field_payloads.zarr/
 artifacts/mesh/periodic_pairs.v1.json
 ```
 
-### Trwały manifest FMR a transport
+### TrwaĹ‚y manifest FMR a transport
 
-Bezpośredni writer FMR z jawnym `FrequencyDomainArtifactIdentity` zapisuje
-dokładnego właściciela oraz względne ścieżki w `artifacts`. Nie utrwala
-odnośników HTTP do aktywnej sesji: opcjonalne klucze transportowe w `resources`
-mają wartość `null`, a listy odnośników transportowych są puste. Kształt
-`frequency_domain_manifest.v1` pozostaje niezmieniony. Dostępność sweepu
+BezpoĹ›redni writer FMR z jawnym `FrequencyDomainArtifactIdentity` zapisuje
+dokĹ‚adnego wĹ‚aĹ›ciciela oraz wzglÄ™dne Ĺ›cieĹĽki w `artifacts`. Nie utrwala
+odnoĹ›nikĂłw HTTP do aktywnej sesji: opcjonalne klucze transportowe w `resources`
+majÄ… wartoĹ›Ä‡ `null`, a listy odnoĹ›nikĂłw transportowych sÄ… puste. KsztaĹ‚t
+`frequency_domain_manifest.v1` pozostaje niezmieniony. DostÄ™pnoĹ›Ä‡ sweepu
 wynika z `artifacts.response_sweep_v1_path` lub `response_sweep_v2_path`,
-a zapisane punkty pozostają w `artifacts.frequency_point_paths`.
+a zapisane punkty pozostajÄ… w `artifacts.frequency_point_paths`.
 
-Adapter API jest miejscem projekcji transportu po rozwiązaniu właściciela;
-usunięcie odnośników nie jest dowodem gotowej obsługi historycznych runów.
-Stare wejścia writera bez identity zachowują odnośniki legacy i nie stanowią
-dowodu nowej publikacji. Manifest modalny z dokładną tożsamością stosuje
-ten sam pusty indeks transportu. Bezpośrednie Rust writers spectrum v2/v3,
-mode metadata i branches zapisują `mode_field_id` bez `mode_field_resource_key`;
-CSV nie publikuje kolumny transportowej. Walidatory dopuszczają jej brak,
-a każdy obecny legacy key nadal musi odpowiadać temu samemu ID. API i modele
-widoku wyliczają transport bez zmiany persisted payloadu. Niemigrowane native
-writers, copy-on-write starych artefaktów oraz historyczne pinned API pozostają
-odrębną pracą; nie jest to dowód pełnego cutoveru ani runtime qualification.
+Adapter API jest miejscem projekcji transportu po rozwiÄ…zaniu wĹ‚aĹ›ciciela;
+usuniÄ™cie odnoĹ›nikĂłw nie jest dowodem gotowej obsĹ‚ugi historycznych runĂłw.
+Stare wejĹ›cia writera bez identity zachowujÄ… odnoĹ›niki legacy i nie stanowiÄ…
+dowodu nowej publikacji. Manifest modalny z dokĹ‚adnÄ… toĹĽsamoĹ›ciÄ… stosuje
+ten sam pusty indeks transportu. BezpoĹ›rednie Rust writers spectrum v2/v3,
+mode metadata i branches zapisujÄ… `mode_field_id` bez `mode_field_resource_key`;
+CSV nie publikuje kolumny transportowej. Walidatory dopuszczajÄ… jej brak,
+a kaĹĽdy obecny legacy key nadal musi odpowiadaÄ‡ temu samemu ID. API i modele
+widoku wyliczajÄ… transport bez zmiany persisted payloadu. Niemigrowane native
+writers, copy-on-write starych artefaktĂłw oraz historyczne pinned API pozostajÄ…
+odrÄ™bnÄ… pracÄ…; nie jest to dowĂłd peĹ‚nego cutoveru ani runtime qualification.
 
-## A1S — typed server-side analysis artifacts (schema freeze)
+## A1S â€” typed server-side analysis artifacts (schema freeze)
 
-Poniższy kontrakt jest właścicielem serwerowych danych używanych przez późniejszą
-warstwę API i Control Room. Nie nadaje żadnemu backendowi statusu
-`production_qualified`; stan wykonania i stan kwalifikacji są niezależne.
+PoniĹĽszy kontrakt jest wĹ‚aĹ›cicielem serwerowych danych uĹĽywanych przez pĂłĹşniejszÄ…
+warstwÄ™ API i Control Room. Nie nadaje ĹĽadnemu backendowi statusu
+`production_qualified`; stan wykonania i stan kwalifikacji sÄ… niezaleĹĽne.
 
-### Wspólna koperta i digest
+### WspĂłlna koperta i digest
 
-Każdy z artefaktów A1S publikuje te same pola identyfikujące zakres i pochodzenie:
+KaĹĽdy z artefaktĂłw A1S publikuje te same pola identyfikujÄ…ce zakres i pochodzenie:
 
 | Pole | Typ | Znaczenie i warunek |
 |---|---|---|
-| `schema_version` | `string` | Jedna z wersji kanonicznych poniżej; zmiana kształtu wymaga nowej wersji. |
-| `artifact_id` | `string` | Stabilny identyfikator produktu analizy, niezależny od ścieżki pliku. |
-| `source` | `{kind, artifact, revision}` | Bezpośrednie źródło danych; `revision` musi być zgodne z `source_revision`. |
-| `source_revision` | `string` | Digest `sha256:<hex>` źródła, a nie timestamp ani długość pliku. |
-| `session_id`, `run_id`, `stage_id`, `scope_id`, `runtime_id` | `string` | Dokładna tożsamość właściciela sesji/run/stage/zakresu/runtime. Nowy producer nie może zapisać `current`, `run:current` ani `runtime:not_provided`; historyczny dokument z takim tokenem pozostaje legacy i nie może być reinterpretowany bez prawdziwego ID. |
-| `revision` | `string` | Digest treści artefaktu; zmiana dowolnego pola naukowego musi go zmienić. |
-| `content_sha256` | `string` | Ten sam digest co `revision`; obliczany z pełnego JSON po wyzerowaniu `revision` i `content_sha256`. |
+| `schema_version` | `string` | Jedna z wersji kanonicznych poniĹĽej; zmiana ksztaĹ‚tu wymaga nowej wersji. |
+| `artifact_id` | `string` | Stabilny identyfikator produktu analizy, niezaleĹĽny od Ĺ›cieĹĽki pliku. |
+| `source` | `{kind, artifact, revision}` | BezpoĹ›rednie ĹşrĂłdĹ‚o danych; `revision` musi byÄ‡ zgodne z `source_revision`. |
+| `source_revision` | `string` | Digest `sha256:<hex>` ĹşrĂłdĹ‚a, a nie timestamp ani dĹ‚ugoĹ›Ä‡ pliku. |
+| `session_id`, `run_id`, `stage_id`, `scope_id`, `runtime_id` | `string` | DokĹ‚adna toĹĽsamoĹ›Ä‡ wĹ‚aĹ›ciciela sesji/run/stage/zakresu/runtime. Nowy producer nie moĹĽe zapisaÄ‡ `current`, `run:current` ani `runtime:not_provided`; historyczny dokument z takim tokenem pozostaje legacy i nie moĹĽe byÄ‡ reinterpretowany bez prawdziwego ID. |
+| `revision` | `string` | Digest treĹ›ci artefaktu; zmiana dowolnego pola naukowego musi go zmieniÄ‡. |
+| `content_sha256` | `string` | Ten sam digest co `revision`; obliczany z peĹ‚nego JSON po wyzerowaniu `revision` i `content_sha256`. |
 | `status` | enum | `complete`, `partial`, `interrupted` albo `corrupt`. |
-| `complete` | `boolean` | `true` wyłącznie, gdy cały zadeklarowany zakres i wszystkie referencje są obecne. |
-| `interrupted` | `boolean` | `true` tylko dla kontrolowanego przerwania; nie zastępuje `status`. |
-| `requested_execution`, `resolved_execution` | typed object | Żądana intencja i faktycznie rozwiązane wykonanie; brak inferencji z nazwy solvera. |
-| `units` | typed object | Jednoznaczne jednostki SI każdej osi i observable. |
+| `complete` | `boolean` | `true` wyĹ‚Ä…cznie, gdy caĹ‚y zadeklarowany zakres i wszystkie referencje sÄ… obecne. |
+| `interrupted` | `boolean` | `true` tylko dla kontrolowanego przerwania; nie zastÄ™puje `status`. |
+| `requested_execution`, `resolved_execution` | typed object | Ĺ»Ä…dana intencja i faktycznie rozwiÄ…zane wykonanie; brak inferencji z nazwy solvera. |
+| `units` | typed object | Jednoznaczne jednostki SI kaĹĽdej osi i observable. |
 | `topology` | typed object | `mesh_id`, `topology_revision`, indeksowanie i osie; konflikt topologii wymusza `partial`. |
-| `cross_artifact_refs` | lista `{relation, artifact, revision}` | Referencje muszą wskazywać istniejący artefakt o zgodnym digest. |
+| `cross_artifact_refs` | lista `{relation, artifact, revision}` | Referencje muszÄ… wskazywaÄ‡ istniejÄ…cy artefakt o zgodnym digest. |
 
-Status `partial` zachowuje poprawnie zapisane rekordy, ale nie może być awansowany
-do `complete` przez klienta. `corrupt` oznacza niespójność lub nieprawidłową
-wartość i jest odrzucany przez promotion verifier. Writer nie tworzy zastępczych
-wektorów jednorodnych, pól bias ani brakujących wartości covariance.
+Status `partial` zachowuje poprawnie zapisane rekordy, ale nie moĹĽe byÄ‡ awansowany
+do `complete` przez klienta. `corrupt` oznacza niespĂłjnoĹ›Ä‡ lub nieprawidĹ‚owÄ…
+wartoĹ›Ä‡ i jest odrzucany przez promotion verifier. Writer nie tworzy zastÄ™pczych
+wektorĂłw jednorodnych, pĂłl bias ani brakujÄ…cych wartoĹ›ci covariance.
 
 ### `eigen/field_sweep.v1.json`
 
 Jest to fizyczny skan po bias field, nie konfiguracja oracle Kittela. Writer
-publikuje go tylko wtedy, gdy każdy sample ma skończone
+publikuje go tylko wtedy, gdy kaĹĽdy sample ma skoĹ„czone
 `external_field_a_per_m[3]` w opublikowanym spectrum (z zachowaniem
-`bias_field_a_per_m` jako nazwy wartości skanu). Dane
-`FemEigenK0KittelValidationIR.samples[]` są wyłącznie referencją postsolve i nie
-mogą zasilać tego artefaktu.
-Nazwa osi writera jest zamrożona jako
+`bias_field_a_per_m` jako nazwy wartoĹ›ci skanu). Dane
+`FemEigenK0KittelValidationIR.samples[]` sÄ… wyĹ‚Ä…cznie referencjÄ… postsolve i nie
+mogÄ… zasilaÄ‡ tego artefaktu.
+Nazwa osi writera jest zamroĹĽona jako
 `scan_axis.coordinate="bias_field_a_per_m"`; `external_field_a_per_m` pozostaje
-diagnostycznym polem źródłowego spectrum, nie nazwą osi artefaktu.
+diagnostycznym polem ĹşrĂłdĹ‚owego spectrum, nie nazwÄ… osi artefaktu.
 
-`source.revision`, `source_revision` oraz każde `modes[].source_revision` muszą
-być SHA-256 rzeczywistych bajtów `eigen/spectrum.v2.json`. `cross_artifact_refs`
-musi zawierać dokładnie `source_spectrum` i `source_branches`, z digestami
-rzeczywistych bajtów odpowiednio `eigen/spectrum.v2.json` i
+`source.revision`, `source_revision` oraz kaĹĽde `modes[].source_revision` muszÄ…
+byÄ‡ SHA-256 rzeczywistych bajtĂłw `eigen/spectrum.v2.json`. `cross_artifact_refs`
+musi zawieraÄ‡ dokĹ‚adnie `source_spectrum` i `source_branches`, z digestami
+rzeczywistych bajtĂłw odpowiednio `eigen/spectrum.v2.json` i
 `eigen/branches.v2.json`. Digest koperty `revision == content_sha256` jest
-niezależny od digestu source i obejmuje po wyzerowaniu tych dwóch pól całą
-deklarację skanu.
+niezaleĹĽny od digestu source i obejmuje po wyzerowaniu tych dwĂłch pĂłl caĹ‚Ä…
+deklaracjÄ™ skanu.
 
-Trwały field-sweep zapisuje `mode_field_id` i względny `mode_artifact_path`
-dla dostępnego payloadu, bez HTTP `mode_field_resource_key`. Reader akceptuje
-starszą kompletną parę ID/key, lecz key bez ID oraz puste wartości są błędem.
-Transport może być wyliczony w modelu widoku przez warstwę API; nie wolno
-wzbogacać nim hashed payloadu ani zmieniać jego JSON przy zachowaniu starego
+TrwaĹ‚y field-sweep zapisuje `mode_field_id` i wzglÄ™dny `mode_artifact_path`
+dla dostÄ™pnego payloadu, bez HTTP `mode_field_resource_key`. Reader akceptuje
+starszÄ… kompletnÄ… parÄ™ ID/key, lecz key bez ID oraz puste wartoĹ›ci sÄ… bĹ‚Ä™dem.
+Transport moĹĽe byÄ‡ wyliczony w modelu widoku przez warstwÄ™ API; nie wolno
+wzbogacaÄ‡ nim hashed payloadu ani zmieniaÄ‡ jego JSON przy zachowaniu starego
 `content_sha256`. Spectrum-only nadal nie ma referencji do payloadu.
 
 ```json
@@ -143,105 +143,105 @@ wzbogacać nim hashed payloadu ani zmieniać jego JSON przy zachowaniu starego
 }
 ```
 
-Mode bez zweryfikowanego pełnego payloadu Cartesian complex XYZ jest
-`spectrum-only`: nie może mieć `mode_field_id`, `mode_field_resource_key` ani
-`mode_artifact_path`. Dla `complete=true` każdy mode wizualizowalny musi mieć
-jednoznaczną referencję do branch, metadanych i payloadu; brakujący lub częściowy
-payload żądanego eksportu jest błędem writera, nie zerowym wektorem zastępczym.
+Mode bez zweryfikowanego peĹ‚nego payloadu Cartesian complex XYZ jest
+`spectrum-only`: nie moĹĽe mieÄ‡ `mode_field_id`, `mode_field_resource_key` ani
+`mode_artifact_path`. Dla `complete=true` kaĹĽdy mode wizualizowalny musi mieÄ‡
+jednoznacznÄ… referencjÄ™ do branch, metadanych i payloadu; brakujÄ…cy lub czÄ™Ĺ›ciowy
+payload ĹĽÄ…danego eksportu jest bĹ‚Ä™dem writera, nie zerowym wektorem zastÄ™pczym.
 
-`sample_id` i `mode_id` są stabilną tożsamością danych, natomiast
-`sample_index`/`raw_mode_index` są indeksami prezentacyjnymi. Każdy mode field
+`sample_id` i `mode_id` sÄ… stabilnÄ… toĹĽsamoĹ›ciÄ… danych, natomiast
+`sample_index`/`raw_mode_index` sÄ… indeksami prezentacyjnymi. KaĹĽdy mode field
 referuje Cartesian complex payload; sam tangent-local vector bez rekonstrukcji
 `global_xyz` nie jest poprawnym `mode_field_id` do wizualizacji.
 
 W artefaktach modalnych namespace identyfikatora odzwierciedla rodzaj osi:
 `bias-field-sample-####` jest zarezerwowany dla planu z jawnym
-`bias_field_samples`, `k-path-sample-####` oznacza punkt rozwiniętej ścieżki
-`KSamplingIR::Path`, a `k-sample-####` pojedynczy wybór `KSamplingIR::Single`
-(także dla niezerowego k). Klient traktuje identyfikator jako nieprzezroczysty
+`bias_field_samples`, `k-path-sample-####` oznacza punkt rozwiniÄ™tej Ĺ›cieĹĽki
+`KSamplingIR::Path`, a `k-sample-####` pojedynczy wybĂłr `KSamplingIR::Single`
+(takĹĽe dla niezerowego k). Klient traktuje identyfikator jako nieprzezroczysty
 i korzysta z `k_vector`, `path_s` oraz `external_field_a_per_m` do prezentacji;
-punkt Γ na ścieżce nie może być utożsamiany z próbką sweepu pola wyłącznie na
+punkt Î“ na Ĺ›cieĹĽce nie moĹĽe byÄ‡ utoĹĽsamiany z prĂłbkÄ… sweepu pola wyĹ‚Ä…cznie na
 podstawie zerowego wektora k.
 
-Każdy zapisany mode field musi ponadto nieść niezmienną
-`source_mesh_identity`: niepusty `mesh_id`, pełny lowercase
+KaĹĽdy zapisany mode field musi ponadto nieĹ›Ä‡ niezmiennÄ…
+`source_mesh_identity`: niepusty `mesh_id`, peĹ‚ny lowercase
 `topology_fingerprint=sha256:<64 hex>`, opcjonalne generation ID i revision,
-`indexing="full_domain_node_order"` oraz `node_count` równy długości obu części
-Cartesian complex payloadu. Writer waliduje całą tożsamość przed utworzeniem
+`indexing="full_domain_node_order"` oraz `node_count` rĂłwny dĹ‚ugoĹ›ci obu czÄ™Ĺ›ci
+Cartesian complex payloadu. Writer waliduje caĹ‚Ä… toĹĽsamoĹ›Ä‡ przed utworzeniem
 metadanych, payloadu albo `mode_field_id`; brak lub niekanoniczny fingerprint
-przerywa publikację zamiast tworzyć niekonsumowalny handoff. Endpoint binarnego
-pola porównuje tę tożsamość z aktualnym zasobem siatki przed serializacją FMVP.
-Brak tożsamości w starym artefakcie lub dowolna niezgodność daje
-`409 stale_eigen_mode_mesh`; serwer nie może podpisać starego wektora aktualnym
-mesh revision nawet wtedy, gdy liczba węzłów jest taka sama.
+przerywa publikacjÄ™ zamiast tworzyÄ‡ niekonsumowalny handoff. Endpoint binarnego
+pola porĂłwnuje tÄ™ toĹĽsamoĹ›Ä‡ z aktualnym zasobem siatki przed serializacjÄ… FMVP.
+Brak toĹĽsamoĹ›ci w starym artefakcie lub dowolna niezgodnoĹ›Ä‡ daje
+`409 stale_eigen_mode_mesh`; serwer nie moĹĽe podpisaÄ‡ starego wektora aktualnym
+mesh revision nawet wtedy, gdy liczba wÄ™zĹ‚Ăłw jest taka sama.
 
-`relax_to_eigen_handoff_sha256` i `source_mesh_topology_sha256` są opcjonalne
-wyłącznie dla lane'u, który nie deklaruje zaakceptowanego cross-stage
-`relax -> eigen` handoffu. Jeżeli którekolwiek pole występuje, oba są
-obowiązkowymi lowercase tokenami `sha256:<64 hex>`. Topology digest musi być
-równy `source_mesh_identity.topology_fingerprint`, a oba digesty muszą być
-identyczne w odpowiadającym mode summary `eigen/spectrum.v2.json`, wpisie
+`relax_to_eigen_handoff_sha256` i `source_mesh_topology_sha256` sÄ… opcjonalne
+wyĹ‚Ä…cznie dla lane'u, ktĂłry nie deklaruje zaakceptowanego cross-stage
+`relax -> eigen` handoffu. JeĹĽeli ktĂłrekolwiek pole wystÄ™puje, oba sÄ…
+obowiÄ…zkowymi lowercase tokenami `sha256:<64 hex>`. Topology digest musi byÄ‡
+rĂłwny `source_mesh_identity.topology_fingerprint`, a oba digesty muszÄ… byÄ‡
+identyczne w odpowiadajÄ…cym mode summary `eigen/spectrum.v2.json`, wpisie
 `eigen/metadata/eigen_summary.json` i per-mode metadata. Promotion verifier
 odrzuca brak pary, niekanoniczny digest albo dowolny cross-artifact drift.
 
-Zmiana `real`/`imag`/`abs`/`phase` dla zgodnego mode field podmienia wyłącznie
-bufor pola. Zmiana topologii unieważnia bufor i wymaga ponownego pobrania albo
-regeneracji artefaktu; klient nie rekonstruuje zera ani pola zastępczego z
+Zmiana `real`/`imag`/`abs`/`phase` dla zgodnego mode field podmienia wyĹ‚Ä…cznie
+bufor pola. Zmiana topologii uniewaĹĽnia bufor i wymaga ponownego pobrania albo
+regeneracji artefaktu; klient nie rekonstruuje zera ani pola zastÄ™pczego z
 metadanych.
 
 ### `fmr/peaks.v1.json`
 
-Peaks są derived data setem. `source.kind=driven_response` wymaga istniejącego
+Peaks sÄ… derived data setem. `source.kind=driven_response` wymaga istniejÄ…cego
 `response/magnetic_response_sweep.v2.json` i fizycznego
-`max_response_amplitude`/observable z jednostką artefaktu. `source.kind=modal_coupling`
+`max_response_amplitude`/observable z jednostkÄ… artefaktu. `source.kind=modal_coupling`
 jest dozwolone dopiero z zatwierdzonym drive/polarization i oscillator-strength
 observable. Sama lista eigenfrequency nigdy nie jest automatycznie FMR intensity.
-Jednostka `response_amplitude` musi być przepisana z mapy `si_units` źródłowego
-response artifact; brak deklaracji pozostaje `null`, nie może być zastąpiony
-wartością domyślną.
+Jednostka `response_amplitude` musi byÄ‡ przepisana z mapy `si_units` ĹşrĂłdĹ‚owego
+response artifact; brak deklaracji pozostaje `null`, nie moĹĽe byÄ‡ zastÄ…piony
+wartoĹ›ciÄ… domyĹ›lnÄ….
 
-Obowiązkowe pola root to `algorithm`, `algorithm_parameters`, `requested_point_count`,
-`completed_point_count`, `peaks[]`, `source_revision`, `units` i wspólna koperta.
-Każdy peak ma `peak_id`, source frequency index, `frequency_hz`,
-`response_amplitude`, `bracketed` oraz jawne `uncertainty`. Peak na końcu skanu
-może być zapisany diagnostycznie z `bracketed=false`, lecz nie może być promowany
+ObowiÄ…zkowe pola root to `algorithm`, `algorithm_parameters`, `requested_point_count`,
+`completed_point_count`, `peaks[]`, `source_revision`, `units` i wspĂłlna koperta.
+KaĹĽdy peak ma `peak_id`, source frequency index, `frequency_hz`,
+`response_amplitude`, `bracketed` oraz jawne `uncertainty`. Peak na koĹ„cu skanu
+moĹĽe byÄ‡ zapisany diagnostycznie z `bracketed=false`, lecz nie moĹĽe byÄ‡ promowany
 do refined resonance.
 
-Jeżeli peak pochodzi z modalnego źródła, writer zachowuje jego `sample_id` i
-`mode_id`; dla driven-response pozostają one `null`, a identyfikatorem punktu
-źródłowego jest `frequency-point-####` w response sweep.
+JeĹĽeli peak pochodzi z modalnego ĹşrĂłdĹ‚a, writer zachowuje jego `sample_id` i
+`mode_id`; dla driven-response pozostajÄ… one `null`, a identyfikatorem punktu
+ĹşrĂłdĹ‚owego jest `frequency-point-####` w response sweep.
 
 ### `fmr/resonance_fits.v1.json`
 
 Fit zapisuje `model`, `fit_range_hz`, `baseline`, `weights`,
 `peak_frequency_hz`, `linewidth_hz`, `q_factor`, `coefficients`, `covariance`,
-`conditioning`, `residual_l2`, uncertainty i referencję do `fmr/peaks.v1.json`. Writer może
-opublikować lokalny fit diagnostyczny, ale bez modelu szumu covariance pozostaje
-`null`, `status=partial`, a `complete=false`; brak covariance nie może być
-przedstawiony jako niepewność statystyczna.
+`conditioning`, `residual_l2`, uncertainty i referencjÄ™ do `fmr/peaks.v1.json`. Writer moĹĽe
+opublikowaÄ‡ lokalny fit diagnostyczny, ale bez modelu szumu covariance pozostaje
+`null`, `status=partial`, a `complete=false`; brak covariance nie moĹĽe byÄ‡
+przedstawiony jako niepewnoĹ›Ä‡ statystyczna.
 
 ### `fmr/kittel_fit.v1.json`
 
 Jest to wersjonowany postsolve comparison job. `model` (np.
 `macrospin_larmor` albo `thin_film_in_plane`), `parameters`, `validation_status`,
-`validation_tolerance_relative`, `points[]`, `excluded_samples` i niezależne
-`source_revision` muszą być zapisane. Każdy point wiąże
+`validation_tolerance_relative`, `points[]`, `excluded_samples` i niezaleĹĽne
+`source_revision` muszÄ… byÄ‡ zapisane. KaĹĽdy point wiÄ…ĹĽe
 `sample_id`, `mode_id`, `bias_field_a_per_m`, expected/solved frequency i
-`relative_frequency_error`. Artefakt nie jest wejściem solvera. Jeśli fit nie ma
-covariance/conditioning, pozostaje `partial` mimo kompletnego porównania punktów.
+`relative_frequency_error`. Artefakt nie jest wejĹ›ciem solvera. JeĹ›li fit nie ma
+covariance/conditioning, pozostaje `partial` mimo kompletnego porĂłwnania punktĂłw.
 
 ### Implementacja i dowody
 
-Rust writer znajduje się w
+Rust writer znajduje siÄ™ w
 `crates/fullmag-runner/src/eigen/artifacts.rs`:
 `build_frequency_domain_field_sweep_artifact`, `build_fmr_peaks_artifact`,
-`build_resonance_fits_artifact`, `build_kittel_fit_artifact` oraz odpowiadające
-funkcje `write_*`. Typy są re-exportowane przez `crates/fullmag-runner/src/eigen/mod.rs`.
-Focused tests sprawdzają brak fabrykacji pola z Kittel metadata, sample/mode
-identity, status `interrupted`, źródło driven response, digest całej koperty
-(w tym zmianę execution/topology o tej samej długości), bezpieczną podmianę
-plików JSON oraz obecność ścieżek typed artifacts w manifeście.
-Te testy są kontraktowe; nie są dowodem managed CPU/GPU runtime ani kwalifikacji
+`build_resonance_fits_artifact`, `build_kittel_fit_artifact` oraz odpowiadajÄ…ce
+funkcje `write_*`. Typy sÄ… re-exportowane przez `crates/fullmag-runner/src/eigen/mod.rs`.
+Focused tests sprawdzajÄ… brak fabrykacji pola z Kittel metadata, sample/mode
+identity, status `interrupted`, ĹşrĂłdĹ‚o driven response, digest caĹ‚ej koperty
+(w tym zmianÄ™ execution/topology o tej samej dĹ‚ugoĹ›ci), bezpiecznÄ… podmianÄ™
+plikĂłw JSON oraz obecnoĹ›Ä‡ Ĺ›cieĹĽek typed artifacts w manifeĹ›cie.
+Te testy sÄ… kontraktowe; nie sÄ… dowodem managed CPU/GPU runtime ani kwalifikacji
 fizycznej.
 
 ## Storage format policy
@@ -799,7 +799,7 @@ report `modal_overlap_available = true` and
 summary sources are not production acceptance evidence. `branches.v2.json` must report
 `tracking_method = "overlap_hungarian"`, and the artifact must include at least
 one `tracking_score_source = "modal_overlap_weighted_score"` branch point.
-Here “weighted” specifically means the FE mass metric; unweighted vector
+Here â€śweightedâ€ť specifically means the FE mass metric; unweighted vector
 overlap and subspace transport remain useful reference tracking evidence but
 do not satisfy this scalar production gate.
 `branches.overlap_floor`, `branches.diagnostics.min_overlap`, and non-seed
@@ -848,11 +848,11 @@ resource key, never from an ID alone.
 
 JSON API deklaruje `mode_field_available` jako opcjonalny, nullable boolean
 w `FrequencyDomainSpectrumV3ModePayload` i `FrequencyDomainFieldSweepModePayload`.
-Wartość tekstowa `"false"` jest błędnym typem i powoduje odrzucenie artefaktu;
-nie może zostać potraktowana jak brak pola. Jawne `false` blokuje `field_ref`,
-także przy pozostałych metadanych wskazujących gotowość. Brak lub `null` zachowuje
-historyczne warunki zgodności adaptera. Sam ten fallback nie jest dowodem
-istnienia binarnego payloadu ani kwalifikacji fizycznej. Nie należy mylić
+WartoĹ›Ä‡ tekstowa `"false"` jest bĹ‚Ä™dnym typem i powoduje odrzucenie artefaktu;
+nie moĹĽe zostaÄ‡ potraktowana jak brak pola. Jawne `false` blokuje `field_ref`,
+takĹĽe przy pozostaĹ‚ych metadanych wskazujÄ…cych gotowoĹ›Ä‡. Brak lub `null` zachowuje
+historyczne warunki zgodnoĹ›ci adaptera. Sam ten fallback nie jest dowodem
+istnienia binarnego payloadu ani kwalifikacji fizycznej. Nie naleĹĽy myliÄ‡
 tekstowej kolumny CSV z typem pola w JSON.
 
 For `KSamplingIR::Path`, public sample count and `path_s_rad_per_m` must follow
@@ -1115,7 +1115,7 @@ Required fields:
 - `k_vector`,
 - `relax_to_eigen_handoff_sha256` i `source_mesh_topology_sha256` jako atomowa
   para dla zaakceptowanego cross-stage handoffu,
-- `source_mesh_identity` związane topology digestem z tą parą,
+- `source_mesh_identity` zwiÄ…zane topology digestem z tÄ… parÄ…,
 - `mode_field_sample_count`,
 - `amplitude_summary`,
 - `component_summary`.
@@ -1160,26 +1160,26 @@ qualified single-precision execution. The array must be compressed by the Zarr
 codec configured for the runtime. If a compatibility `vector.bin` file exists,
 it is a derived/export payload, not the authoritative production store.
 
-### Pełny potencjał modalny na wspólnej siatce
+### PeĹ‚ny potencjaĹ‚ modalny na wspĂłlnej siatce
 
-Natywna ścieżka shared-domain publikuje dla wybranych modów plik
+Natywna Ĺ›cieĹĽka shared-domain publikuje dla wybranych modĂłw plik
 `eigen/mode_fields/sample_XXXX/mode_YYYY/physical_potential.v1.json` oraz
 `potential_full.bin` i `demag_element_full.bin`. Jest to eksport po rekonstrukcji
-`phi_full = C_phi phi_reduced`, z fazami tych samych reprezentantów klas co w
-operatorze natywnym. Potencjał zachowuje wspólną normalizację i fazę modu
-magnetyzacji oraz konwencję czasową `exp(+i omega t)`.
+`phi_full = C_phi phi_reduced`, z fazami tych samych reprezentantĂłw klas co w
+operatorze natywnym. PotencjaĹ‚ zachowuje wspĂłlnÄ… normalizacjÄ™ i fazÄ™ modu
+magnetyzacji oraz konwencjÄ™ czasowÄ… `exp(+i omega t)`.
 
-Potencjał ma układ `[source_mesh_node, real|imag]`, jednostkę A i dokładnie
-16 bajtów na węzeł. Pole `h = -grad(phi_full)` ma układ
-`[source_mesh_tet4_element, x|y|z, real|imag]`, jednostkę A/m i 48 bajtów na
-element. Oba pliki używają little-endian float64. Gradient P1 jest stały w
-elemencie; eksport nie uśrednia go pomiędzy elementami ani przez interfejs
-materiałowy. Manifest określa powiązanie z siatką źródłową, operatorem,
-warunkami fazowymi oraz SHA-256 dokładnych bajtów każdego pliku.
+PotencjaĹ‚ ma ukĹ‚ad `[source_mesh_node, real|imag]`, jednostkÄ™ A i dokĹ‚adnie
+16 bajtĂłw na wÄ™zeĹ‚. Pole `h = -grad(phi_full)` ma ukĹ‚ad
+`[source_mesh_tet4_element, x|y|z, real|imag]`, jednostkÄ™ A/m i 48 bajtĂłw na
+element. Oba pliki uĹĽywajÄ… little-endian float64. Gradient P1 jest staĹ‚y w
+elemencie; eksport nie uĹ›rednia go pomiÄ™dzy elementami ani przez interfejs
+materiaĹ‚owy. Manifest okreĹ›la powiÄ…zanie z siatkÄ… ĹşrĂłdĹ‚owÄ…, operatorem,
+warunkami fazowymi oraz SHA-256 dokĹ‚adnych bajtĂłw kaĹĽdego pliku.
 
-Eksport pełnego pola umożliwia porównanie rozwiązań po interpolacji na wspólne
-punkty i uzgodnieniu fazy. Sam zapis plików nie jest dowodem poprawności
-warunków brzegowych, zbieżności siatki ani zgodności z COMSOL.
+Eksport peĹ‚nego pola umoĹĽliwia porĂłwnanie rozwiÄ…zaĹ„ po interpolacji na wspĂłlne
+punkty i uzgodnieniu fazy. Sam zapis plikĂłw nie jest dowodem poprawnoĹ›ci
+warunkĂłw brzegowych, zbieĹĽnoĹ›ci siatki ani zgodnoĹ›ci z COMSOL.
 
 ### Legacy doubled-real Floquet modal potential sidecar
 
@@ -1376,52 +1376,52 @@ Kontrakt R4 dodaje tablice `accepted_fem_equilibrium_fields_v1_paths[]`,
 Dodatkowe tablice `certified_fem_equilibrium_fields_v1_paths[]`,
 `certified_fem_equilibrium_fields_v2_paths[]`,
 `recomputed_fem_linearization_certificate_v1_paths[]` oraz
-`recomputed_fem_linearization_certificate_v2_paths[]` zachowują endpoint
-recomputed i certyfikat różnic. Puste tablice nie dowodzą replay; producent
-kontynuacji musi dostarczyć wszystkie payloady przed kwalifikacją R4.
-Wskazują rzeczywiście obecne immutable sidecars w `eigen/metadata/sample_NNNN/`.
+`recomputed_fem_linearization_certificate_v2_paths[]` zachowujÄ… endpoint
+recomputed i certyfikat rĂłĹĽnic. Puste tablice nie dowodzÄ… replay; producent
+kontynuacji musi dostarczyÄ‡ wszystkie payloady przed kwalifikacjÄ… R4.
+WskazujÄ… rzeczywiĹ›cie obecne immutable sidecars w `eigen/metadata/sample_NNNN/`.
 Nowy producer wyznacza coverage z rzeczywistego zbioru
-`eigen/spectrum.v2.json.samples[*].sample_index`; nie wolno zastępować go
-zakresem `0..sample_count` ani największym indeksem. Manifest może dodać
-`artifacts.linearization_identity_sha256_by_sample`, którego klucze są
-indeksami próbek, a wartościami są digesty odczytane i zweryfikowane z
-identity sidecarów. Brak identity/preimage, różny zbiór próbek, mieszana
-rodzina V1/V2, niepełna rodzina certified/recomputed albo niezgodny raw-byte
-digest oznacza `r4_replay.qualification = "NOT_VERIFIED"` i nie może ustawić
+`eigen/spectrum.v2.json.samples[*].sample_index`; nie wolno zastÄ™powaÄ‡ go
+zakresem `0..sample_count` ani najwiÄ™kszym indeksem. Manifest moĹĽe dodaÄ‡
+`artifacts.linearization_identity_sha256_by_sample`, ktĂłrego klucze sÄ…
+indeksami prĂłbek, a wartoĹ›ciami sÄ… digesty odczytane i zweryfikowane z
+identity sidecarĂłw. Brak identity/preimage, rĂłĹĽny zbiĂłr prĂłbek, mieszana
+rodzina V1/V2, niepeĹ‚na rodzina certified/recomputed albo niezgodny raw-byte
+digest oznacza `r4_replay.qualification = "NOT_VERIFIED"` i nie moĹĽe ustawiÄ‡
 bramki R4 jako gotowej.
 
-Każdy nowy, kompletny pakiet R4 publikuje również surowe bajty planu
+KaĹĽdy nowy, kompletny pakiet R4 publikuje rĂłwnieĹĽ surowe bajty planu
 konsumenta w `eigen/metadata/sample_NNNN/consumer_plan_snapshot.v1.json`.
-Są to dokładnie bajty `serde_json::to_vec(FemEigenPlanIR)` użyte do obliczenia
+SÄ… to dokĹ‚adnie bajty `serde_json::to_vec(FemEigenPlanIR)` uĹĽyte do obliczenia
 `linearization_identity.v2.consumer_plan_snapshot_sha256`; sidecar nie ma
-dodatkowej koperty ani alternatywnej kolejności pól. Manifest single-k publikuje
-`artifacts.consumer_plan_snapshot_v1_path` oraz jednoelementową tablicę
-`artifacts.consumer_plan_snapshot_v1_paths[]`, a manifest path publikuje tę
-samą tablicę dla wszystkich rzeczywiście policzonych próbek. Brak próbki,
-dodatkowa próbka, niezgodny raw SHA albo niepoprawny JSON pozostają
+dodatkowej koperty ani alternatywnej kolejnoĹ›ci pĂłl. Manifest single-k publikuje
+`artifacts.consumer_plan_snapshot_v1_path` oraz jednoelementowÄ… tablicÄ™
+`artifacts.consumer_plan_snapshot_v1_paths[]`, a manifest path publikuje tÄ™
+samÄ… tablicÄ™ dla wszystkich rzeczywiĹ›cie policzonych prĂłbek. Brak prĂłbki,
+dodatkowa prĂłbka, niezgodny raw SHA albo niepoprawny JSON pozostajÄ…
 `r4_replay.qualification = "NOT_VERIFIED"`. Historyczne manifesty bez tej
-rodziny zachowują status historyczny i nie są przez to promowane.
-Jeżeli accepted oraz identity/preimage są poprawnie związane, ale rodzina
-certified/recomputed jest niepełna, manifest zachowuje mapę
+rodziny zachowujÄ… status historyczny i nie sÄ… przez to promowane.
+JeĹĽeli accepted oraz identity/preimage sÄ… poprawnie zwiÄ…zane, ale rodzina
+certified/recomputed jest niepeĹ‚na, manifest zachowuje mapÄ™
 `linearization_identity_sha256_by_sample` i publikuje
 `r4_replay.status = "missing_recomputed"` wraz z
-`r4_replay.missing_recomputed_keys[]`; ten dowód identity nie oznacza replay
+`r4_replay.missing_recomputed_keys[]`; ten dowĂłd identity nie oznacza replay
 payloadu ani kwalifikacji naukowej.
-Konflikt różnych bajtów podpisanych dokumentów pod jedną ścieżką próbki
-jest błędem agregacji; deduplikacja nie wybiera wtedy pierwszego dokumentu.
-Relokacja zachowuje dokładne bajty dokumentu, preimages i source identity;
-selekcja pól modów nie usuwa dowodów stanu równowagi policzonych próbek.
-Jeżeli producer dostarczył zwalidowany sidecar
+Konflikt rĂłĹĽnych bajtĂłw podpisanych dokumentĂłw pod jednÄ… Ĺ›cieĹĽkÄ… prĂłbki
+jest bĹ‚Ä™dem agregacji; deduplikacja nie wybiera wtedy pierwszego dokumentu.
+Relokacja zachowuje dokĹ‚adne bajty dokumentu, preimages i source identity;
+selekcja pĂłl modĂłw nie usuwa dowodĂłw stanu rĂłwnowagi policzonych prĂłbek.
+JeĹĽeli producer dostarczyĹ‚ zwalidowany sidecar
 `eigen/metadata/sample_NNNN/producer_provenance.v1.json`, manifest publikuje
 `producer_provenance_v1_path` dla pojedynczego sample oraz
-`producer_provenance_v1_paths[]` w kolejności numerycznej `sample_index`.
-Wartość jest oryginalną ścieżką producenta i nie może być rekonstruowana przez
-relokację ani zmianę bajtów sidecara.
+`producer_provenance_v1_paths[]` w kolejnoĹ›ci numerycznej `sample_index`.
+WartoĹ›Ä‡ jest oryginalnÄ… Ĺ›cieĹĽkÄ… producenta i nie moĹĽe byÄ‡ rekonstruowana przez
+relokacjÄ™ ani zmianÄ™ bajtĂłw sidecara.
 Dla spectrum-only `mode_field_storage_format = "none"`; dokumenty stanu
-nie stanowią payloadów pól modów. Accepted fields są dowodami naukowymi,
-nie dowolnym opaque JSON: wymagają replay obu rodzin V1/V2 oraz związania
+nie stanowiÄ… payloadĂłw pĂłl modĂłw. Accepted fields sÄ… dowodami naukowymi,
+nie dowolnym opaque JSON: wymagajÄ… replay obu rodzin V1/V2 oraz zwiÄ…zania
 z certificate i identity. Walidacja tych tablic w odbiorniku Python pozostaje
-otwartą bramką pełnego R4; sama obecność list nie kwalifikuje wyniku.
+otwartÄ… bramkÄ… peĹ‚nego R4; sama obecnoĹ›Ä‡ list nie kwalifikuje wyniku.
 
 Each pair belongs to the same sample; mixed versions for one sample are invalid.
 Empty legacy path arrays do not declare another handoff. Ku-free writers retain
@@ -1445,25 +1445,25 @@ does not enable or scientifically qualify the public Ku modal path.
 
 ### Kontrakt linearization_identity.v2
 
-Szczegółowy opis naukowy znajduje się w
+SzczegĂłĹ‚owy opis naukowy znajduje siÄ™ w
 docs/physics/r4-linearization-identity-v2.md. Ten artefakt jest addytywnym
-rekordem pochodzenia jednego sample modalnego, a jego obecność nie kwalifikuje
-solvera ani nie zastępuje residualu, zbieżności siatki/airboxu, branch trackingu
+rekordem pochodzenia jednego sample modalnego, a jego obecnoĹ›Ä‡ nie kwalifikuje
+solvera ani nie zastÄ™puje residualu, zbieĹĽnoĹ›ci siatki/airboxu, branch trackingu
 lub dowodu runtime.
 
-Canonical path ma postać
+Canonical path ma postaÄ‡
 `eigen/metadata/sample_NNNN/linearization_identity.v2.json`, a jego exact
 preimage jest w
 `eigen/metadata/sample_NNNN/linearization_identity_preimage.v1.json`. Token
-`NNNN` jest minimalną szerokością zgodną z Rust `format!("{index:04}")`:
+`NNNN` jest minimalnÄ… szerokoĹ›ciÄ… zgodnÄ… z Rust `format!("{index:04}")`:
 `sample_0007` jest poprawne, `sample_00000` jest niepoprawne, a indeks
-`10000` ma ścieżkę `sample_10000`. Manifest publikuje
+`10000` ma Ĺ›cieĹĽkÄ™ `sample_10000`. Manifest publikuje
 tablice artifacts.linearization_identity_v2_paths[] oraz
-artifacts.linearization_identity_preimage_v1_paths[]; kolejność tablic odpowiada
-kolejnym sample_index. Dotyczy to KSamplingIR::Single i każdego punktu
-KSamplingIR::Path. Nie wolno dopisywać brakującego punktu przez symetrię +k/-k.
+artifacts.linearization_identity_preimage_v1_paths[]; kolejnoĹ›Ä‡ tablic odpowiada
+kolejnym sample_index. Dotyczy to KSamplingIR::Single i kaĹĽdego punktu
+KSamplingIR::Path. Nie wolno dopisywaÄ‡ brakujÄ…cego punktu przez symetriÄ™ +k/-k.
 
-Identity wiąże następujące grupy pól:
+Identity wiÄ…ĹĽe nastÄ™pujÄ…ce grupy pĂłl:
 
 - family: schema_version, sample_index, equilibrium/state/fields/certificate
   schema pairs;
@@ -1487,22 +1487,22 @@ Identity wiąże następujące grupy pól:
   digests oraz recomputed_certificate_preimage_json i jego raw digest;
 - own digest: content_sha256.
 
-Rodziny są nieprzenikalne: Ku-free zachowuje equilibrium_artifact.v7,
+Rodziny sÄ… nieprzenikalne: Ku-free zachowuje equilibrium_artifact.v7,
 LinearizationState.v6, fields/certificate V1 i historyczny raw
-material_signature. Canonical Ku, również jawne Ku=0, wymaga
+material_signature. Canonical Ku, rĂłwnieĹĽ jawne Ku=0, wymaga
 equilibrium_artifact.v8, LinearizationState.v7, fields/certificate V2,
 material_identity_kind=canonical_equilibrium_material.v2 i
-material_provenance_scope=materialization_plan. V1 nie może reklamować pól V2,
-a pary V1/V2 nie mogą być mieszane w sample.
+material_provenance_scope=materialization_plan. V1 nie moĹĽe reklamowaÄ‡ pĂłl V2,
+a pary V1/V2 nie mogÄ… byÄ‡ mieszane w sample.
 
 Fizyczna sygnatura equilibrium jest oddzielona od raw MaterialIR provenance.
-Damping relaksacji i damping eigen mogą się różnić bez zmiany physical
+Damping relaksacji i damping eigen mogÄ… siÄ™ rĂłĹĽniÄ‡ bez zmiany physical
 material/static/boundary identity; zmiana Ku, canonical axis, statycznego
-materiału lub boundary jest odrzucana. source_mesh_topology_sha256 jest
-topologią źródłowej relaksacji, a modal_mesh_topology_fingerprint_v3 jest
-mieszaną topologią operatora modalnego i nie wolno ich nadpisywać.
+materiaĹ‚u lub boundary jest odrzucana. source_mesh_topology_sha256 jest
+topologiÄ… ĹşrĂłdĹ‚owej relaksacji, a modal_mesh_topology_fingerprint_v3 jest
+mieszanÄ… topologiÄ… operatora modalnego i nie wolno ich nadpisywaÄ‡.
 
-content_sha256 identity jest liczony z exact UTF-8 JSON po wyzerowaniu własnego
+content_sha256 identity jest liczony z exact UTF-8 JSON po wyzerowaniu wĹ‚asnego
 content_sha256:
 
 ~~~{math}
@@ -1521,31 +1521,31 @@ D_{\mathrm{id}} =
 ~~~
 
 Exact recomputed-certificate preimage jest przechowywany oddzielnie od jego
-historycznego content digest. Producer publikuje również addytywny
-sample-scoped `linearization_identity_preimage.v1.json` z tablicą
+historycznego content digest. Producer publikuje rĂłwnieĹĽ addytywny
+sample-scoped `linearization_identity_preimage.v1.json` z tablicÄ…
 `artifacts.linearization_identity_preimage_v1_paths[]`. Sidecar ma
 `schema_version = linearization_identity_preimage.v1` oraz pola exact UTF-8
 `identity_preimage_json`, `identity_preimage_sha256` i
-`identity_content_sha256`; jego własny digest nie należy do p_id. Konsument
-porównuje exact preimage, typed semantic equality identity po wyzerowaniu
+`identity_content_sha256`; jego wĹ‚asny digest nie naleĹĽy do p_id. Konsument
+porĂłwnuje exact preimage, typed semantic equality identity po wyzerowaniu
 `content_sha256` i framed digest. Brak sidecara dla deklarowanego identity jest
-błędem fail-closed. Python replay własnego identity może działać na takim
-artefakcie, lecz pełny R4 i managed runtime nadal mają status NOT VERIFIED.
+bĹ‚Ä™dem fail-closed. Python replay wĹ‚asnego identity moĹĽe dziaĹ‚aÄ‡ na takim
+artefakcie, lecz peĹ‚ny R4 i managed runtime nadal majÄ… status NOT VERIFIED.
 
 Odbiornik odrzuca brak payloadu/identity, family mismatch, niezgodny mesh/m0,
-różne source snapshots, różne fizyczne sygnatury, zmienione exact bytes,
-nieznaną politykę, konflikt dokumentów pod jedną ścieżką oraz V2 bez
-canonical kind/provenance. Puste tablice legacy nie deklarują drugiej rodziny.
+rĂłĹĽne source snapshots, rĂłĹĽne fizyczne sygnatury, zmienione exact bytes,
+nieznanÄ… politykÄ™, konflikt dokumentĂłw pod jednÄ… Ĺ›cieĹĽkÄ… oraz V2 bez
+canonical kind/provenance. Puste tablice legacy nie deklarujÄ… drugiej rodziny.
 
-Nieobecność wszystkich tablic R4 w historycznym manifeście jest stanem
+NieobecnoĹ›Ä‡ wszystkich tablic R4 w historycznym manifeĹ›cie jest stanem
 `r4_replay.status = "historical"` i `qualification = "NOT_VERIFIED"`; pozostaje
 czytelna w dotychczasowym zakresie i nie jest nowym dowodem kwalifikacji
-runtime. Częściowa lub niespójna obecność tablic publikuje przyczynę
+runtime. CzÄ™Ĺ›ciowa lub niespĂłjna obecnoĹ›Ä‡ tablic publikuje przyczynÄ™
 `r4_replay.status = "invalid"`, `missing_identity`, `missing_recomputed` albo
-`missing_accepted`, lecz nie promuje ogólnego manifestu do pełnej kwalifikacji.
-Stan `payload_replay_pending` oznacza wyłącznie poprawne strukturalnie ścieżki
-i exact own-link identity; replay fizycznych pól, residual, siatki i managed
-runtime pozostają osobnymi bramkami.
+`missing_accepted`, lecz nie promuje ogĂłlnego manifestu do peĹ‚nej kwalifikacji.
+Stan `payload_replay_pending` oznacza wyĹ‚Ä…cznie poprawne strukturalnie Ĺ›cieĹĽki
+i exact own-link identity; replay fizycznych pĂłl, residual, siatki i managed
+runtime pozostajÄ… osobnymi bramkami.
 
 
 For modal k-path dispersion manifests, `capabilities.dispersion` must publish
@@ -2759,16 +2759,16 @@ Analyze UI must:
   in dispersion inspectors when present, including the analytic model, maximum
   accepted `k`, frequency window, and DE/BV scenario-to-branch mapping,
 - propagate click selection as `{ branchId, sampleIndex, rawModeIndex }`,
-- zachować kompletny skończony wektor z kolumn `kx_rad_per_m`,
-  `ky_rad_per_m`, `kz_rad_per_m` i współrzędną `path_s_rad_per_m` w wyborze
-  punktu dyspersji; wektor klikniętego wiersza ma pierwszeństwo przed
+- zachowaÄ‡ kompletny skoĹ„czony wektor z kolumn `kx_rad_per_m`,
+  `ky_rad_per_m`, `kz_rad_per_m` i wspĂłĹ‚rzÄ™dnÄ… `path_s_rad_per_m` w wyborze
+  punktu dyspersji; wektor klikniÄ™tego wiersza ma pierwszeĹ„stwo przed
   kontekstem poprzedniego wyboru,
-- zachować opcjonalne `sample_id` i `mode_id` jako nieprzezroczyste
-  identyfikatory oraz dostarczoną rewizję artefaktu, równowagę i reprezentację;
-  brak tych kolumn w starszym CSV nie upoważnia do wymyślania identyfikatorów,
-- puste opcjonalne komórki liczbowe CSV oznaczają brak danych, nie zero;
-  wiersze bez skończonej częstotliwości/współrzędnej ścieżki lub bez
-  nieujemnych bezpiecznych całkowitych indeksów sample/mode są odrzucane,
+- zachowaÄ‡ opcjonalne `sample_id` i `mode_id` jako nieprzezroczyste
+  identyfikatory oraz dostarczonÄ… rewizjÄ™ artefaktu, rĂłwnowagÄ™ i reprezentacjÄ™;
+  brak tych kolumn w starszym CSV nie upowaĹĽnia do wymyĹ›lania identyfikatorĂłw,
+- puste opcjonalne komĂłrki liczbowe CSV oznaczajÄ… brak danych, nie zero;
+  wiersze bez skoĹ„czonej czÄ™stotliwoĹ›ci/wspĂłĹ‚rzÄ™dnej Ĺ›cieĹĽki lub bez
+  nieujemnych bezpiecznych caĹ‚kowitych indeksĂłw sample/mode sÄ… odrzucane,
 - load mode artifacts by `sample_index` and `raw_mode_index`.
 
 ## API contract
@@ -2787,130 +2787,130 @@ diagnostic messages, not silent empty plots.
 ### Zakres residualu natywnego sparse Floquet
 
 Adapter `floquet_airbox_cpu_schur_slepc` publikuje `eps_q` i `eps_phi` dla
-oryginalnych zredukowanych równań przed eliminacją Schura. `eps_reduced` jest
-ich maksimum (z `eps_gauge`, gdy dla danej polityki istnieje równanie cechowania),
-a nie ogólnym residualem własnym. Przy fizycznym nonzero-k bez więzu średniej
-`eps_gauge` i `gauge_constraint_backward_error` są `null`; brak tego równania
-nie jest residualem równym zero.
+oryginalnych zredukowanych rĂłwnaĹ„ przed eliminacjÄ… Schura. `eps_reduced` jest
+ich maksimum (z `eps_gauge`, gdy dla danej polityki istnieje rĂłwnanie cechowania),
+a nie ogĂłlnym residualem wĹ‚asnym. Przy fizycznym nonzero-k bez wiÄ™zu Ĺ›redniej
+`eps_gauge` i `gauge_constraint_backward_error` sÄ… `null`; brak tego rĂłwnania
+nie jest residualem rĂłwnym zero.
 
-Bez certyfikatu pełnego operatora zakres pozostaje
+Bez certyfikatu peĹ‚nego operatora zakres pozostaje
 `reduced_original_blocks_only`: `eps_full` jest `null`,
-`reduced_pencil_certified` może być true, a `certified` i
-`full_descriptor_certified` pozostają false. Po certyfikacji operatora
+`reduced_pencil_certified` moĹĽe byÄ‡ true, a `certified` i
+`full_descriptor_certified` pozostajÄ… false. Po certyfikacji operatora
 `block_residuals.scope` wynosi
 `full_projected_weak_form_and_periodic_seams`; `eps_full` jest maksimum residuali
-pełnych równań magnetycznego i potencjału, a cztery osobne pola w artefakcie
-zachowują residuale szwu fazy skalarnej, ramy stycznej, pola magnetycznego
-kartezjańskiego i pary stanu równowagi. Wtedy
-`residual_relative_l2 = max(eps_reduced, eps_full, cztery residuale szwów)`.
-Certyfikat wymaga zgodnych flag równania, szwów i polityki cechowania oraz
-wszystkich tych residuali nie większych od `certification_tolerance`.
+peĹ‚nych rĂłwnaĹ„ magnetycznego i potencjaĹ‚u, a cztery osobne pola w artefakcie
+zachowujÄ… residuale szwu fazy skalarnej, ramy stycznej, pola magnetycznego
+kartezjaĹ„skiego i pary stanu rĂłwnowagi. Wtedy
+`residual_relative_l2 = max(eps_reduced, eps_full, cztery residuale szwĂłw)`.
+Certyfikat wymaga zgodnych flag rĂłwnania, szwĂłw i polityki cechowania oraz
+wszystkich tych residuali nie wiÄ™kszych od `certification_tolerance`.
 
-Ten certyfikat dotyczy równań i szwów operatora Floqueta. Sam nie dowodzi
-zbieżności zewnętrznej granicy airboxu, siatki ani zgodności z COMSOL.
+Ten certyfikat dotyczy rĂłwnaĹ„ i szwĂłw operatora Floqueta. Sam nie dowodzi
+zbieĹĽnoĹ›ci zewnÄ™trznej granicy airboxu, siatki ani zgodnoĹ›ci z COMSOL.
 
 ### Sonda dynamicznego demagu Floqueta w solve'ach okienkowych
 
-Diagnostyka `floquet_dynamic_demag_operator_probe.v1` sprawdza dla kierunków
-global-y i global-z równanie potencjału zespolonego Blocha oraz zgodność formy
-energii. W solve'ie pojedynczego przesunięcia sonda znajduje się w diagnostyce
-próbki pod `dynamic_demag_operator_probe`. W solve'ie z wieloma podoknami
-częstotliwości każda pozycja `subwindows[]` zawiera własne
-`dynamic_demag_operator_probe`; sonda nie jest właściwością częstotliwości ani
-pojedynczego modu, lecz kontrolą operatora użytego w danym podoknie.
+Diagnostyka `floquet_dynamic_demag_operator_probe.v1` sprawdza dla kierunkĂłw
+global-y i global-z rĂłwnanie potencjaĹ‚u zespolonego Blocha oraz zgodnoĹ›Ä‡ formy
+energii. W solve'ie pojedynczego przesuniÄ™cia sonda znajduje siÄ™ w diagnostyce
+prĂłbki pod `dynamic_demag_operator_probe`. W solve'ie z wieloma podoknami
+czÄ™stotliwoĹ›ci kaĹĽda pozycja `subwindows[]` zawiera wĹ‚asne
+`dynamic_demag_operator_probe`; sonda nie jest wĹ‚aĹ›ciwoĹ›ciÄ… czÄ™stotliwoĹ›ci ani
+pojedynczego modu, lecz kontrolÄ… operatora uĹĽytego w danym podoknie.
 
-Walidator nonzero-k musi sprawdzić wszystkie podokna: unikalny nieujemny
-`index`, poprawną wersję schematu, `status = "passed"`, jednostki SI,
-residualy potencjału i różnicę energii nie większe od raportowanej tolerancji,
-oraz nieujemną energię z dokładnością tej tolerancji. Brak sondy w choć jednym
+Walidator nonzero-k musi sprawdziÄ‡ wszystkie podokna: unikalny nieujemny
+`index`, poprawnÄ… wersjÄ™ schematu, `status = "passed"`, jednostki SI,
+residualy potencjaĹ‚u i rĂłĹĽnicÄ™ energii nie wiÄ™ksze od raportowanej tolerancji,
+oraz nieujemnÄ… energiÄ™ z dokĹ‚adnoĹ›ciÄ… tej tolerancji. Brak sondy w choÄ‡ jednym
 podoknie, nieudana sonda albo niepoprawny rekord blokuje preflight. Nie wolno
-zastępować brakującego rekordu sondą z innego podokna ani podnosić tolerancji
-na podstawie samego residualu solvera własnego.
+zastÄ™powaÄ‡ brakujÄ…cego rekordu sondÄ… z innego podokna ani podnosiÄ‡ tolerancji
+na podstawie samego residualu solvera wĹ‚asnego.
 
 
-### Integralność certyfikatu Kittel Gamma — 2026-09-30, WIP
+### IntegralnoĹ›Ä‡ certyfikatu Kittel Gamma â€” 2026-09-30, WIP
 
-`validation/kittel_k0_pbc/points.v1.csv` zachowuje kolumnę
-`max_periodic_seam_mismatch`, ale nieobliczona wartość jest pustą komórką.
-Nie wolno utożsamiać certyfikatu równowagi lub geometrii z certyfikatem
-zespolonego modu. Pełna bramka Kittel wymaga skończonego pomiaru i
-odrzuca pustą komórkę.
+`validation/kittel_k0_pbc/points.v1.csv` zachowuje kolumnÄ™
+`max_periodic_seam_mismatch`, ale nieobliczona wartoĹ›Ä‡ jest pustÄ… komĂłrkÄ….
+Nie wolno utoĹĽsamiaÄ‡ certyfikatu rĂłwnowagi lub geometrii z certyfikatem
+zespolonego modu. PeĹ‚na bramka Kittel wymaga skoĹ„czonego pomiaru i
+odrzuca pustÄ… komĂłrkÄ™.
 
 `summary.v1.json` publikuje dodatkowe `frequency_comparison_status`,
 `periodic_mode_seam_metrics_complete`, `qualification` i `missing_evidence`.
-Zgodność częstotliwości przy nieobliczonym seam daje `status=partial`,
+ZgodnoĹ›Ä‡ czÄ™stotliwoĹ›ci przy nieobliczonym seam daje `status=partial`,
 `frequency_comparison_status=passed`, `qualification=NOT VERIFIED`.
-Nie jest to dowód periodyczności modu. Konsument nie może zmienić
-partial w sukces na podstawie samej częstotliwości. Obliczenie per-mode
-seam i pełny runtime pozostają otwarte; zgodność formatu nie kwalifikuje
+Nie jest to dowĂłd periodycznoĹ›ci modu. Konsument nie moĹĽe zmieniÄ‡
+partial w sukces na podstawie samej czÄ™stotliwoĹ›ci. Obliczenie per-mode
+seam i peĹ‚ny runtime pozostajÄ… otwarte; zgodnoĹ›Ä‡ formatu nie kwalifikuje
 nowej realizacji solvera.
 
 
-Źródłowy adapter dodatkowo publikuje mode_periodic_seam_measurements
+ĹąrĂłdĹ‚owy adapter dodatkowo publikuje mode_periodic_seam_measurements
 w solver diagnostics. Definition ID magnetic_cartesian_periodic_seam_max_relative.v1
-oznacza maksimum różnicy XYZ slave/phase-root znormalizowane maksimum
-amplitudy XYZ na fizycznych węzłach magnetycznych. Rekord zawiera
+oznacza maksimum rĂłĹĽnicy XYZ slave/phase-root znormalizowane maksimum
+amplitudy XYZ na fizycznych wÄ™zĹ‚ach magnetycznych. Rekord zawiera
 source_mesh_topology_sha256, sample_index, raw_mode_index, frequency_hz,
 k_vector, dodatni checked_slave_node_count i max_relative_mismatch.
-Kittel używa tylko pojedynczego zgodnego rekordu powiązanego z metryką
+Kittel uĹĽywa tylko pojedynczego zgodnego rekordu powiÄ…zanego z metrykÄ…
 consistent P1 modu. Zakres magnetic_cartesian_field_only nie obejmuje phi.
-Brak rekordu, sprzeczne identity lub duplikat nadal oznaczają brak pomiaru.
-Skończony pomiar nie ustanawia kwalifikacji; próg akceptacji, phi i runtime
-wymagają osobnych bramek. Źródła WIP, NOT VERIFIED.
+Brak rekordu, sprzeczne identity lub duplikat nadal oznaczajÄ… brak pomiaru.
+SkoĹ„czony pomiar nie ustanawia kwalifikacji; prĂłg akceptacji, phi i runtime
+wymagajÄ… osobnych bramek. ĹąrĂłdĹ‚a WIP, NOT VERIFIED.
 
-## Certyfikowane pola stanu równowagi z Ku
+## Certyfikowane pola stanu rĂłwnowagi z Ku
 
-`CertifiedFemEquilibriumFields.v1` zachowuje istniejące bytes i namespace
+`CertifiedFemEquilibriumFields.v1` zachowuje istniejÄ…ce bytes i namespace
 SHA-256 dla modeli bez Ku. `v2` wymaga `h_anisotropy_a_per_m`, osobnego
 namespace i sumy `((H_ex + H_demag) + H_anisotropy) + H_ext` zgodnej z
-producentem FEM CPU. Pole anizotropii dotyczy pierwszego przyrostu stałego
-jednoosiowego Ku; nie implikuje obsługi pozostałych interakcji.
-V1 nie może nieść widoku anizotropii; v2 nie może go pomijać. Obie wersje
-wymagają kompletnych skończonych pól, pomierzonego H_eff, potencjału i
-zgodnego digestu. Wersja i obecność Ku w materiale muszą się zgadzać.
-Kolejność danych digestu v2: H_ex, H_demag, H_anisotropy, H_ext, H_eff, phi;
-liczniki u64 little-endian, wartości f64 IEEE754 little-endian. V1 nie zmienia
-kolejności ani kodowania. Certyfikat refresh v2 dodaje porównanie H_anisotropy
-oraz wiąże digest pól przyjętych i ponownie obliczonych.
+producentem FEM CPU. Pole anizotropii dotyczy pierwszego przyrostu staĹ‚ego
+jednoosiowego Ku; nie implikuje obsĹ‚ugi pozostaĹ‚ych interakcji.
+V1 nie moĹĽe nieĹ›Ä‡ widoku anizotropii; v2 nie moĹĽe go pomijaÄ‡. Obie wersje
+wymagajÄ… kompletnych skoĹ„czonych pĂłl, pomierzonego H_eff, potencjaĹ‚u i
+zgodnego digestu. Wersja i obecnoĹ›Ä‡ Ku w materiale muszÄ… siÄ™ zgadzaÄ‡.
+KolejnoĹ›Ä‡ danych digestu v2: H_ex, H_demag, H_anisotropy, H_ext, H_eff, phi;
+liczniki u64 little-endian, wartoĹ›ci f64 IEEE754 little-endian. V1 nie zmienia
+kolejnoĹ›ci ani kodowania. Certyfikat refresh v2 dodaje porĂłwnanie H_anisotropy
+oraz wiÄ…ĹĽe digest pĂłl przyjÄ™tych i ponownie obliczonych.
 Pliki `equilibrium/certified_fem_equilibrium_fields.v2.json` oraz
-`equilibrium/recomputed_fem_linearization_certificate.v2.json` są publikowane
-wyłącznie z payloadem v2; ścieżki v1 pozostają dla danych bez Ku.
-Wersjonowanie nie zmienia publicznej legalności ani kwalifikacji CPU/GPU.
+`equilibrium/recomputed_fem_linearization_certificate.v2.json` sÄ… publikowane
+wyĹ‚Ä…cznie z payloadem v2; Ĺ›cieĹĽki v1 pozostajÄ… dla danych bez Ku.
+Wersjonowanie nie zmienia publicznej legalnoĹ›ci ani kwalifikacji CPU/GPU.
 
-Wspólny selector material-version jest używany przez finalizację, bias sweep
-oraz orchestrator etapów. Jawne null w opcjonalnym widoku jest odrzucane;
-brak klucza v1 zachowuje None. Zakres źródła sprawdzany jest przed capture
-certyfikatu. Digest accepted-fields jest ścisłym opaque dowodem producenta;
-nie zastępuje niezależnego sprawdzenia dostarczonego payloadu recomputed.
+WspĂłlny selector material-version jest uĹĽywany przez finalizacjÄ™, bias sweep
+oraz orchestrator etapĂłw. Jawne null w opcjonalnym widoku jest odrzucane;
+brak klucza v1 zachowuje None. Zakres ĹşrĂłdĹ‚a sprawdzany jest przed capture
+certyfikatu. Digest accepted-fields jest Ĺ›cisĹ‚ym opaque dowodem producenta;
+nie zastÄ™puje niezaleĹĽnego sprawdzenia dostarczonego payloadu recomputed.
 
 
-### Dowód przypisania krawędzi trackingu (addytywne rozszerzenie v2)
+### DowĂłd przypisania krawÄ™dzi trackingu (addytywne rozszerzenie v2)
 
-`branches.v2.json` i zgodny alias `branches.json` mogą zawierać w punkcie
-`tracking_edge`: politykę `ModeTrackingIR`, rzeczywiste `score_source`,
-metrykę, transition, previous_sample_index, skipped_sample_count i subspace.
+`branches.v2.json` i zgodny alias `branches.json` mogÄ… zawieraÄ‡ w punkcie
+`tracking_edge`: politykÄ™ `ModeTrackingIR`, rzeczywiste `score_source`,
+metrykÄ™, transition, previous_sample_index, skipped_sample_count i subspace.
 Rekord subspace zawiera rank, principal_cosines/minimum, branch_ids i raw
-mode indices obu próbek. Lokalne previous/current_cluster są indeksami
-pomocniczymi; tożsamość wyznaczają próbki i jawne ID modów, nie te indeksy.
+mode indices obu prĂłbek. Lokalne previous/current_cluster sÄ… indeksami
+pomocniczymi; toĹĽsamoĹ›Ä‡ wyznaczajÄ… prĂłbki i jawne ID modĂłw, nie te indeksy.
 Null oznacza brak historycznego dowodu, a nie udany transport.
-Nowy punkt `new_branch` ma `modal_overlap_unavailable` i nie spełnia
-produkcyjnej bramki ciągłości. Minimum kątów głównych nie zastępuje
-`overlap_prev`. Polityka ogólnego writera pochodzi wyłącznie z zgodnych
-rekordów; `tracking_policy_availability` wynosi complete albo missing_or_mixed.
-Pola method/floor są null w drugim przypadku. Uszkodzone obecne provenance
-jest błędem importu. Dotychczasowa skalarna bramka produkcyjna pozostaje bez zmian.
+Nowy punkt `new_branch` ma `modal_overlap_unavailable` i nie speĹ‚nia
+produkcyjnej bramki ciÄ…gĹ‚oĹ›ci. Minimum kÄ…tĂłw gĹ‚Ăłwnych nie zastÄ™puje
+`overlap_prev`. Polityka ogĂłlnego writera pochodzi wyĹ‚Ä…cznie z zgodnych
+rekordĂłw; `tracking_policy_availability` wynosi complete albo missing_or_mixed.
+Pola method/floor sÄ… null w drugim przypadku. Uszkodzone obecne provenance
+jest bĹ‚Ä™dem importu. Dotychczasowa skalarna bramka produkcyjna pozostaje bez zmian.
 
-Niezależny walidator sprawdza obecne rekordy: policy method/floor/window/gap,
+NiezaleĹĽny walidator sprawdza obecne rekordy: policy method/floor/window/gap,
 source/metric/transition, previous_sample_index i previous_raw_mode_index,
-rank/ID/principal cosines oraz zgodność obu warstw metadanych polityki.
-Sprawdzenie kontraktu nie jest numerycznym replay pól. Output selection
-może pominąć poprzednik, więc walidator nie wymyśla nowego poprzednika
+rank/ID/principal cosines oraz zgodnoĹ›Ä‡ obu warstw metadanych polityki.
+Sprawdzenie kontraktu nie jest numerycznym replay pĂłl. Output selection
+moĹĽe pominÄ…Ä‡ poprzednik, wiÄ™c walidator nie wymyĹ›la nowego poprzednika
 z ostatniego opublikowanego punktu.
-Jeśli istnieje `branches.json`, jego punkty, solver_model i wspólna
-polityka muszą być zgodne z v2; różnica schema/diagnostic envelope jest
-dozwolona dla zgodności historycznej. Obecne tracking_edge wymagają jawnego
-tracking_policy_availability. Predecessor nie może pomijać zachowanego
-punktu tej samej gałęzi.
+JeĹ›li istnieje `branches.json`, jego punkty, solver_model i wspĂłlna
+polityka muszÄ… byÄ‡ zgodne z v2; rĂłĹĽnica schema/diagnostic envelope jest
+dozwolona dla zgodnoĹ›ci historycznej. Obecne tracking_edge wymagajÄ… jawnego
+tracking_policy_availability. Predecessor nie moĹĽe pomijaÄ‡ zachowanego
+punktu tej samej gaĹ‚Ä™zi.
 
 
 ## Transport pelnego field ID - FMVP v5
@@ -2930,40 +2930,40 @@ ETag analizy uwzglednia wersje i SHA256 rzeczywistych bajtow odpowiedzi,
 aby zmiana encodingu/topologii/wartosci nie odzyskala starego cachedpayloadu.
 
 
-## R2 — wersjonowane pochodzenie referencyjnej metody modalnej
+## R2 â€” wersjonowane pochodzenie referencyjnej metody modalnej
 
-Nowe wyniki Rust reference publikują obiekt `method_evidence` w
-`solver_diagnostics`, a jego kopię w typed diagnostics i manifest.
-Obiekt ma własne `schema_version=modal_method_evidence.v1` i następujące pola:
+Nowe wyniki Rust reference publikujÄ… obiekt `method_evidence` w
+`solver_diagnostics`, a jego kopiÄ™ w typed diagnostics i manifest.
+Obiekt ma wĹ‚asne `schema_version=modal_method_evidence.v1` i nastÄ™pujÄ…ce pola:
 
 | Pole | Kontrakt |
 |---|---|
-| `damping.requested_policy` | Istniejące `ignore` lub `include`; nie dowodzi wykonanej metody |
+| `damping.requested_policy` | IstniejÄ…ce `ignore` lub `include`; nie dowodzi wykonanej metody |
 | `damping.resolved_method` | `undamped_reference_eigenbasis` lub `reference_proportional_linewidth_correction` |
 | `damping.alpha_in_pencil` | `false` dla tej referencji |
-| `damping.base_alpha` | Skończone nieujemne alfa używane w korekcie |
+| `damping.base_alpha` | SkoĹ„czone nieujemne alfa uĹĽywane w korekcie |
 | `damping.alpha_field_present` | Czy plan zawiera przestrzenne alfa |
-| `damping.alpha_field_used` | `false`: korekta używa tylko bazowego alfa |
-| `damping.exact_damped_eigenproblem` | `false`: nie jest rozwiązaniem dokładnego Gilberta |
-| `spectrum.spectrum_completeness` | `count_limited` po osiągnięciu cap; inaczej `unknown` |
-| `spectrum.independent_count_performed` | `false`; brak niezależnego count |
-| `spectrum.returned_mode_count` / `requested_mode_cap` | Rzeczywista liczba zwróconych modów i żądany cap |
-| `operator_approximations` | Tokeny `dmi_signed_coefficient_and_k_not_qualified`, `surface_anisotropy_scalar_curvature` gdy odpowiednie interakcje są aktywne |
+| `damping.alpha_field_used` | `false`: korekta uĹĽywa tylko bazowego alfa |
+| `damping.exact_damped_eigenproblem` | `false`: nie jest rozwiÄ…zaniem dokĹ‚adnego Gilberta |
+| `spectrum.spectrum_completeness` | `count_limited` po osiÄ…gniÄ™ciu cap; inaczej `unknown` |
+| `spectrum.independent_count_performed` | `false`; brak niezaleĹĽnego count |
+| `spectrum.returned_mode_count` / `requested_mode_cap` | Rzeczywista liczba zwrĂłconych modĂłw i ĹĽÄ…dany cap |
+| `operator_approximations` | Tokeny `dmi_signed_coefficient_and_k_not_qualified`, `surface_anisotropy_scalar_curvature` gdy odpowiednie interakcje sÄ… aktywne |
 | `physical_qualification` | `not_established_by_method_evidence` |
 
-Puste `operator_approximations` nie jest dowodem poprawności fizycznej.
+Puste `operator_approximations` nie jest dowodem poprawnoĹ›ci fizycznej.
 `complete=true` legacy diagnostics pozostaje stanem publikacji/procedury,
-a nie niezależnym count. Brak `method_evidence` w historycznym dokumencie
+a nie niezaleĹĽnym count. Brak `method_evidence` w historycznym dokumencie
 pozostaje nieznany; nie backfillujemy exact z tokenu `include` ani z nazwy
-`cpu_full_2x2_damped`. Native producer nie dziedziczy pól reference i wymaga
-osobnego własnego kontraktu. Nie zmieniamy istniejących schema ani pól OpenAPI.
-Pełna projekcja klienta/UI jest zadaniem P10, nie dowodem tego fragmentu.
+`cpu_full_2x2_damped`. Native producer nie dziedziczy pĂłl reference i wymaga
+osobnego wĹ‚asnego kontraktu. Nie zmieniamy istniejÄ…cych schema ani pĂłl OpenAPI.
+PeĹ‚na projekcja klienta/UI jest zadaniem P10, nie dowodem tego fragmentu.
 
-Właściciel: ADR 0056 oraz nota `0600-fem-eigenmodes-linearized-llg.md`,
-sekcja `reference-modal-method-evidence-r2`. Testy wykonujemy wyłącznie w GHA.
+WĹ‚aĹ›ciciel: ADR 0056 oraz nota `0600-fem-eigenmodes-linearized-llg.md`,
+sekcja `reference-modal-method-evidence-r2`. Testy wykonujemy wyĹ‚Ä…cznie w GHA.
 
 
-## R2 — native two-pass window certificate v2
+## R2 â€” native two-pass window certificate v2
 
 `poisson_airbox_frequency_window_certificate.v2` preserves schedule, selected
 cluster and overlap telemetry, and separates it from whole-window count.
@@ -2997,48 +2997,62 @@ i nie sa uzupelniane zgadywanymi wartosciami. Stan source/test/runtime
 tej zmiany jest rejestrowany w trackerze R2.
 
 
-### PR97 — field-specific mode output selection
+### PR97 â€” field-specific mode output selection
 
 Kontrakt korekty uwagi4204074530: requested field i jego sample/raw-mode
-selection muszą pozostać rozróżnialne w terminalnych sidecarach/manifestach
-i runtime writerze. Globalna suma może służyć planowaniu obliczeń,
-nie zastępuje per-field publikacji. Mode i mode_complex zachowują osobne
-żądania; nie ograniczamy ich do wspólnego bezimiennego outputu. Nieznany
-lub nieobsługiwany field musi być odrzucony jawnie, przed publikacją.
+selection muszÄ… pozostaÄ‡ rozrĂłĹĽnialne w terminalnych sidecarach/manifestach
+i runtime writerze. Globalna suma moĹĽe sĹ‚uĹĽyÄ‡ planowaniu obliczeĹ„,
+nie zastÄ™puje per-field publikacji. Mode i mode_complex zachowujÄ… osobne
+ĹĽÄ…dania; nie ograniczamy ich do wspĂłlnego bezimiennego outputu. Nieznany
+lub nieobsĹ‚ugiwany field musi byÄ‡ odrzucony jawnie, przed publikacjÄ….
 Nie zmienia to operatora, normalizacji, jednostek ani surowych mode IDs.
-Regresja ma przejść przez rzeczywisty writer z rozłącznymi selectorami
-obu pól i potwierdzić brak niezamówionych par field/sample/mode.
+Regresja ma przejĹ›Ä‡ przez rzeczywisty writer z rozĹ‚Ä…cznymi selectorami
+obu pĂłl i potwierdziÄ‡ brak niezamĂłwionych par field/sample/mode.
 
-`mode` i `mode_complex` są istniejącymi identyfikatorami żądania
-powiązanymi z tym samym pełnym zespolonym payloadem. Ta poprawka
-nie wprowadza nowego formatu real-only ani nie odcina części urojonej.
-Indeks `eigen/mode_output_selection.v1.json` mapuje każde żądanie
-field/sample_index/raw_mode_index na istniejące metadata i vector payload
-z ich SHA-256. Współdzielenie blobu nie znosi odrębności selektorów.
-
-
-## Addytywna generacja treści — C03 (ADR 0058)
-
-Kontrakt publikacji `frequency_domain_artifact_generation.v1` określa [ADR 0058](../adr/0058-frequency-domain-content-generation.md). Marker `frequency_domain/generation.v1.json` wiąże finalne length/SHA256 członków i jawnego publishera. Nie zastępuje spectrum schema, jednostek SI, certificate, scientific qualification ani directory artifact_set_id. Brak markera oznacza legacy_unverified, a brak producer — unbound. Zużyte bajty i końcowy marker muszą zgadzać się z jednym capture; mismatch nie może dawać ready ani verified multi-artifact join. Implementacja API/typed transport/UI w toku, runtime NOT VERIFIED.
+`mode` i `mode_complex` sÄ… istniejÄ…cymi identyfikatorami ĹĽÄ…dania
+powiÄ…zanymi z tym samym peĹ‚nym zespolonym payloadem. Ta poprawka
+nie wprowadza nowego formatu real-only ani nie odcina czÄ™Ĺ›ci urojonej.
+Indeks `eigen/mode_output_selection.v1.json` mapuje kaĹĽde ĹĽÄ…danie
+field/sample_index/raw_mode_index na istniejÄ…ce metadata i vector payload
+z ich SHA-256. WspĂłĹ‚dzielenie blobu nie znosi odrÄ™bnoĹ›ci selektorĂłw.
 
 
-### C03 — metadane pola i binarny data plane
+## Addytywna generacja treĹ›ci â€” C03 (ADR 0058)
 
-`FieldResource.generation_id` i `generation_status` są addytywne i dotyczą
-publikacji treści frequency-domain. Nie zastępują generacji siatki.
+Kontrakt publikacji `frequency_domain_artifact_generation.v1` okreĹ›la [ADR 0058](../adr/0058-frequency-domain-content-generation.md). Marker `frequency_domain/generation.v1.json` wiÄ…ĹĽe finalne length/SHA256 czĹ‚onkĂłw i jawnego publishera. Nie zastÄ™puje spectrum schema, jednostek SI, certificate, scientific qualification ani directory artifact_set_id. Brak markera oznacza legacy_unverified, a brak producer â€” unbound. ZuĹĽyte bajty i koĹ„cowy marker muszÄ… zgadzaÄ‡ siÄ™ z jednym capture; mismatch nie moĹĽe dawaÄ‡ ready ani verified multi-artifact join. Implementacja API/typed transport/UI w toku, runtime NOT VERIFIED.
+
+
+### C03 â€” metadane pola i binarny data plane
+
+`FieldResource.generation_id` i `generation_status` sÄ… addytywne i dotyczÄ…
+publikacji treĹ›ci frequency-domain. Nie zastÄ™pujÄ… generacji siatki.
 Zapytanie wektora dla committed member wymaga `expected_artifact_generation_id`
-z metadanych; istniejące `expected_generation_id` pozostaje warunkiem siatki.
-Brak lub niezgodne artifact ID daje conflict, aby dwa oddzielne żądania HTTP
-nie mogły przypadkowo połączyć metadanych z kolejną publikacją w tym samym folderze.
-Po sprawdzeniu pointer JSON, długości, SHA-256 faktycznie odczytanych bajtów,
-producenta i końcowego markera odpowiedź zwraca osobny nagłówek
-`x-fullmag-artifact-generation-id`. Klient musi porównać go z przypiętym ID;
-nagłówek generacji siatki zachowuje dotychczasowe znaczenie.
+z metadanych; istniejÄ…ce `expected_generation_id` pozostaje warunkiem siatki.
+Brak lub niezgodne artifact ID daje conflict, aby dwa oddzielne ĹĽÄ…dania HTTP
+nie mogĹ‚y przypadkowo poĹ‚Ä…czyÄ‡ metadanych z kolejnÄ… publikacjÄ… w tym samym folderze.
+Po sprawdzeniu pointer JSON, dĹ‚ugoĹ›ci, SHA-256 faktycznie odczytanych bajtĂłw,
+producenta i koĹ„cowego markera odpowiedĹş zwraca osobny nagĹ‚Ăłwek
+`x-fullmag-artifact-generation-id`. Klient musi porĂłwnaÄ‡ go z przypiÄ™tym ID;
+nagĹ‚Ăłwek generacji siatki zachowuje dotychczasowe znaczenie.
 
-Legacy bez markera pozostaje dostępne jako pojedynczy odczyt, bez dowodu
-spójności generacji i bez artifact-generation header. Nowy marker pojawiający
-się w trakcie takiego odczytu unieważnia capture. Payload jest ograniczony
-deklarowaną długością (legacy: długością otwartego pliku), sprawdzeniem zakresu
-adresowego i kontrolowanym błędem rezerwacji pamięci. Nie ma niezależnego limitu
-pamięci całego przekształcenia pola; dekodowanie/projekcja mogą wymagać kolejnych
-buforów. Pozostaje to długiem wydajnościowym, nie dowodem kwalifikacji runtime.
+Legacy bez markera pozostaje dostÄ™pne jako pojedynczy odczyt, bez dowodu
+spĂłjnoĹ›ci generacji i bez artifact-generation header. Nowy marker pojawiajÄ…cy
+siÄ™ w trakcie takiego odczytu uniewaĹĽnia capture. Payload jest ograniczony
+deklarowanÄ… dĹ‚ugoĹ›ciÄ… (legacy: dĹ‚ugoĹ›ciÄ… otwartego pliku), sprawdzeniem zakresu
+adresowego i kontrolowanym bĹ‚Ä™dem rezerwacji pamiÄ™ci. Nie ma niezaleĹĽnego limitu
+pamiÄ™ci caĹ‚ego przeksztaĹ‚cenia pola; dekodowanie/projekcja mogÄ… wymagaÄ‡ kolejnych
+buforĂłw. Pozostaje to dĹ‚ugiem wydajnoĹ›ciowym, nie dowodem kwalifikacji runtime.
+
+
+### G3 â€” planned immutable content-generation v2
+
+[ADR 0058](../adr/0058-frequency-domain-content-generation.md) rozszerza kontrakt
+o niezmienne member directories i current marker `frequency_domain/generation.v2.json`.
+Pierwszy etap jest addytywny: produkcyjny writer nadal uĹĽywa v1, dopĂłki nie zostanie
+spĂłjnie przeĹ‚Ä…czony wraz z API. V2 reader ma pierwszeĹ„stwo, a uszkodzony obecny v2
+nie moĹĽe daÄ‡ fallbacku. V1 pozostaje byte-verified mutable generation z
+`is_immutable=false`; status ten nie dowodzi zachowania historycznego snapshotu.
+Logical member resolution, owner binding i koĹ„cowy current fence obowiÄ…zujÄ… takĹĽe
+we wszystkich binarnych i JSON/CSV odczytach v2. Katalog generacji jest create-only,
+bez automatycznego GC i bez zmiany jednostek, spectrum schema lub solvera.
+Zintegrowany publisher/API, browser oraz power-loss durability: NOT VERIFIED.

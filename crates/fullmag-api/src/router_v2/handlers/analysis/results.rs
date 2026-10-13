@@ -1467,6 +1467,25 @@ fn result_artifact_stage_id_with_identity(
     // not supply ownership. The exact source snapshot identity also prevents a
     // same-named artifact from an older sibling stage from claiming ownership.
     let artifact_relative = sanitize_artifact_relative_path(artifact_path)?;
+    if let Some(generation) = generation.filter(|generation| generation.is_immutable()) {
+        let Some(member) = generation.commit.content.members.get(artifact_path) else {
+            ensure_generation_capture_current(artifact_dir, Some(generation))?;
+            return Ok("stage:analysis".to_string());
+        };
+        if member.sha256 != source_digest || member.byte_length != source_byte_length {
+            return Err(result_owner_mismatch());
+        }
+        validate_generation_producer(Some(generation), Some(captured_run_id), None)?;
+        let stage_id = generation
+            .commit
+            .content
+            .producer
+            .as_ref()
+            .map(|producer| producer.stage_id.clone())
+            .unwrap_or_else(|| "stage:analysis".to_string());
+        ensure_generation_capture_current(artifact_dir, Some(generation))?;
+        return Ok(stage_id);
+    }
     let canonical_root = artifact_dir
         .canonicalize()
         .map_err(|_| result_owner_mismatch())?;
@@ -2712,7 +2731,7 @@ fn build_gamma_projection(
     status: &AnalysisResultStatusFacets,
 ) -> BTreeMap<String, AnalysisResultProjectionResource> {
     let sample_id = "gamma-spectrum-sample-0000";
-    let psd_unit = format!("{}²", payload.trace_unit);
+    let psd_unit = format!("{}Â˛", payload.trace_unit);
     let response_points = finite_gamma_points(
         &payload.frequency_hz,
         &payload.response_psd,
@@ -3180,7 +3199,7 @@ fn legacy_dsf_provenance(payload: &DynamicStructureFactorResource) -> BTreeMap<S
         (
             "array_bounds".to_string(),
             format!(
-                "{} × {} cells; original {} × {}; {} invalid probes",
+                "{} Ă— {} cells; original {} Ă— {}; {} invalid probes",
                 payload.frequency_count,
                 payload.wavevector_count,
                 payload.original_frequency_count,
@@ -4194,25 +4213,34 @@ pub(crate) fn read_frequency_domain_field_payload_in_generation(
     generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<Option<(Vec<u8>, Option<fullmag_runner::artifact_generation::GenerationMember>)>, ApiError>
 {
-    let expected_member = if let Some(generation) = generation {
+    if let Some(generation) = generation {
         let Some(expected) = generation.commit.content.members.get(artifact_path).cloned() else {
             ensure_generation_capture_current(artifact_dir, Some(generation))?;
             return Ok(None);
         };
-        Some(expected)
-    } else {
-        None
-    };
+        let bytes = generation.read_member(artifact_dir, artifact_path).map_err(|error| {
+            if generation.ensure_current(artifact_dir).is_err() {
+                ApiError::conflict("frequency_domain_artifact_generation_stale")
+            } else {
+                match error.kind() {
+                    std::io::ErrorKind::NotFound => ApiError::conflict(
+                        "frequency_domain_artifact_generation_member_missing",
+                    ),
+                    std::io::ErrorKind::InvalidData => ApiError::conflict(format!(
+                        "frequency_domain_artifact_generation_member_mismatch: {artifact_path}: {error}"
+                    )),
+                    _ => ApiError::internal(format!(
+                        "failed to read committed frequency-domain field payload '{artifact_path}': {error}"
+                    )),
+                }
+            }
+        })?;
+        return Ok(Some((bytes, Some(expected))));
+    }
 
     let Some(path) = try_resolve_artifact_path(artifact_dir, artifact_path)? else {
-        return if expected_member.is_some() {
-            Err(ApiError::conflict(
-                "frequency_domain_artifact_generation_member_missing",
-            ))
-        } else {
-            ensure_generation_capture_current(artifact_dir, generation)?;
-            Ok(None)
-        };
+        ensure_generation_capture_current(artifact_dir, None)?;
+        return Ok(None);
     };
     let file = std::fs::File::open(path).map_err(|error| {
         ApiError::internal(format!(
@@ -4229,19 +4257,7 @@ pub(crate) fn read_frequency_domain_field_payload_in_generation(
             "frequency-domain field payload '{artifact_path}' is not a regular file"
         )));
     }
-    let byte_length = expected_member
-        .as_ref()
-        .map(|member| member.byte_length)
-        .unwrap_or_else(|| metadata.len());
-    if metadata.len() != byte_length {
-        return Err(if expected_member.is_some() {
-            ApiError::conflict("frequency_domain_artifact_generation_member_length_mismatch")
-        } else {
-            ApiError::internal(format!(
-                "frequency-domain field payload '{artifact_path}' changed while being read"
-            ))
-        });
-    }
+    let byte_length = metadata.len();
     let read_limit = byte_length.checked_add(1).ok_or_else(|| {
         ApiError::internal(format!(
             "frequency-domain field payload '{artifact_path}' length cannot be bounded"
@@ -4259,7 +4275,6 @@ pub(crate) fn read_frequency_domain_field_payload_in_generation(
         ))
     })?;
     let mut reader = file.take(read_limit);
-    let mut hasher = Sha256::new();
     let mut measured_length = 0u64;
     let mut buffer = [0u8; 65536];
     loop {
@@ -4277,36 +4292,19 @@ pub(crate) fn read_frequency_domain_field_payload_in_generation(
             ))
         })?;
         if measured_length > byte_length {
-            return Err(if expected_member.is_some() {
-                ApiError::conflict("frequency_domain_artifact_generation_member_length_mismatch")
-            } else {
-                ApiError::internal(format!(
-                    "frequency-domain field payload '{artifact_path}' grew while being read"
-                ))
-            });
+            return Err(ApiError::internal(format!(
+                "frequency-domain field payload '{artifact_path}' grew while being read"
+            )));
         }
-        hasher.update(&buffer[..count]);
         bytes.extend_from_slice(&buffer[..count]);
     }
     if measured_length != byte_length {
-        return Err(if expected_member.is_some() {
-            ApiError::conflict("frequency_domain_artifact_generation_member_length_mismatch")
-        } else {
-            ApiError::internal(format!(
-                "frequency-domain field payload '{artifact_path}' changed while being read"
-            ))
-        });
+        return Err(ApiError::internal(format!(
+            "frequency-domain field payload '{artifact_path}' changed while being read"
+        )));
     }
-    if let Some(expected) = expected_member.as_ref() {
-        let digest = format!("sha256:{:x}", hasher.finalize());
-        if digest != expected.sha256 {
-            return Err(ApiError::conflict(
-                "frequency_domain_artifact_generation_member_mismatch",
-            ));
-        }
-    }
-    ensure_generation_capture_current(artifact_dir, generation)?;
-    Ok(Some((bytes, expected_member)))
+    ensure_generation_capture_current(artifact_dir, None)?;
+    Ok(Some((bytes, None)))
 }
 
 /// Fence both committed publications and the absence captured for legacy reads.
@@ -4391,6 +4389,59 @@ pub(crate) fn write_result_generation_for_test(
         serde_json::to_vec_pretty(&commit).expect("generation commit should serialize"),
     )
     .expect("generation commit should be written");
+}
+
+#[cfg(test)]
+pub(crate) fn write_immutable_result_generation_for_test(
+    root: &Path,
+    member_bytes: impl IntoIterator<Item = (String, Vec<u8>)>,
+    producer: Option<fullmag_runner::artifact_generation::PublicationOwner>,
+) -> fullmag_runner::artifact_generation::GenerationCapture {
+    use fullmag_runner::artifact_generation::{
+        GenerationBody, GenerationCommit, GenerationMember, IMMUTABLE_COMMIT_PATH,
+    };
+
+    let mut payloads = BTreeMap::new();
+    let mut members = BTreeMap::new();
+    for (relative, bytes) in member_bytes {
+        sanitize_artifact_relative_path(&relative)
+            .expect("immutable test member path should be safe");
+        let member = GenerationMember {
+            byte_length: bytes.len() as u64,
+            sha256: format!("sha256:{:x}", Sha256::digest(&bytes)),
+        };
+        assert!(members.insert(relative.clone(), member).is_none());
+        payloads.insert(relative, bytes);
+    }
+
+    let content = GenerationBody {
+        schema_version: "frequency_domain_artifact_generation.v2".to_string(),
+        producer,
+        members,
+    };
+    let generation_id = format!("sha256:{:x}", Sha256::digest(serde_json::to_vec(&content).unwrap()));
+    let commit = GenerationCommit {
+        generation_id: generation_id.clone(),
+        content,
+    };
+    let generation_name = generation_id.strip_prefix("sha256:").unwrap();
+    let generation_root = root
+        .join("frequency_domain/generations")
+        .join(generation_name);
+    for (relative, bytes) in payloads {
+        let path = generation_root.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    std::fs::create_dir_all(root.join("frequency_domain")).unwrap();
+    std::fs::write(
+        root.join(IMMUTABLE_COMMIT_PATH),
+        serde_json::to_vec_pretty(&commit).unwrap(),
+    )
+    .unwrap();
+    fullmag_runner::artifact_generation::capture(root)
+        .unwrap()
+        .expect("immutable fixture should publish a capture")
 }
 
 fn read_result_artifact_bytes(
@@ -4556,9 +4607,9 @@ fn bias_field_label(field: Option<[f64; 3]>) -> String {
         return "bias field unavailable".to_string();
     }
     if magnitude.abs() >= 1.0e-3 {
-        format!("μ₀H = {:.3} mT", magnitude * 1.0e3)
+        format!("ÎĽâ‚€H = {:.3} mT", magnitude * 1.0e3)
     } else {
-        format!("μ₀H = {:.6} T", magnitude)
+        format!("ÎĽâ‚€H = {:.6} T", magnitude)
     }
 }
 
@@ -5428,7 +5479,7 @@ mod tests {
         });
         let durable_mode = FrequencyDomainFieldSweepModePayload {
             mode_artifact_path: Some("eigen/modes/sample_0000/mode_0003.json".to_string()),
-            mode_field_id: Some(" field/1:α ".to_string()),
+            mode_field_id: Some(" field/1:Î± ".to_string()),
             mode_field_resource_key: None,
             ..FrequencyDomainFieldSweepModePayload {
                 sample_id: "sample/1".to_string(),
@@ -5465,7 +5516,7 @@ mod tests {
             mesh_ref.clone(),
         );
         assert_eq!(durable_item.status.completeness, "ready");
-        assert_eq!(durable_item.field_ref.as_ref().unwrap().field_id, " field/1:α ");
+        assert_eq!(durable_item.field_ref.as_ref().unwrap().field_id, " field/1:Î± ");
         assert_eq!(
             durable_item.field_ref.as_ref().unwrap().resource_key,
             "/v2/sessions/current/data/fields/%20field%2F1%3A%CE%B1%20/samples/vector?phase_rad=0&view=phase_rotated_real",
@@ -5787,7 +5838,7 @@ mod tests {
             "mode_id": "sample-0000/mode-0000",
             "raw_mode_index": 0,
             "frequency_hz": 1.0e9,
-            "mode_field_id": "analysis:eigen:field/α",
+            "mode_field_id": "analysis:eigen:field/Î±",
             "residual_relative_l2": 1.0e-8,
             "component_participation": {
                 "schema_version": "modal_component_participation.v1",
@@ -5811,7 +5862,7 @@ mod tests {
                 .is_err()
         );
         let item = spectrum_v3_item("run", "dataset", "sample", "revision", mode.clone(), None);
-        assert_eq!(item.field_ref.as_ref().unwrap().field_id, "analysis:eigen:field/α");
+        assert_eq!(item.field_ref.as_ref().unwrap().field_id, "analysis:eigen:field/Î±");
         assert_eq!(item.field_ref.as_ref().unwrap().resource_key,
             "/v2/sessions/current/data/fields/analysis%3Aeigen%3Afield%2F%CE%B1/samples/vector?phase_rad=0&view=phase_rotated_real");
         assert_eq!(serde_json::to_value(&mode).unwrap(), before);
@@ -6407,7 +6458,7 @@ mod tests {
 
         let response = &index.projections["response-spectrum"];
         assert_eq!(response.axis_units["x"], "Hz");
-        assert_eq!(response.axis_units["y"], "1²");
+        assert_eq!(response.axis_units["y"], "1Â˛");
         assert_eq!(response.selection_index[0].item_id, None);
         assert_eq!(
             serde_json::to_value(&response.selection_index[0]).expect("selection entry JSON")
@@ -6417,7 +6468,7 @@ mod tests {
         assert_eq!(response.series[0].points.len(), 3);
 
         let features = &index.projections["spectral-features"];
-        assert_eq!(features.axis_units["y"], "1²");
+        assert_eq!(features.axis_units["y"], "1Â˛");
         assert_eq!(
             features.selection_index[0].item_id.as_deref(),
             Some("legacy:gamma:peak:2")
@@ -6818,6 +6869,99 @@ mod generation_snapshot_tests {
     }
 
     #[test]
+    fn immutable_result_owner_uses_only_the_exact_commit_producer() {
+        let temporary = TempGenerationRoot::new();
+        let root = temporary.0.join("artifacts");
+        let artifact_path = "eigen/spectrum.v2.json";
+        let member = br#"{"schema_version":"eigen_spectrum.v2","samples":[]}"#;
+        let generation = write_immutable_result_generation_for_test(
+            &root,
+            [(artifact_path.to_string(), member.to_vec())],
+            Some(PublicationOwner {
+                run_id: "run:current".into(),
+                stage_id: "immutable-eigen-stage".into(),
+                stage_kind: "flat_eigenmodes".into(),
+            }),
+        );
+        assert!(generation.is_immutable());
+        assert!(!root.join(artifact_path).exists());
+
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                artifact_path,
+                "run:current",
+                &[],
+                Some(&generation),
+            )
+            .expect("immutable member should bind to the commit producer without a root alias"),
+            "immutable-eigen-stage"
+        );
+        assert!(result_artifact_stage_id(
+            &root,
+            artifact_path,
+            "run:other",
+            &[],
+            Some(&generation),
+        )
+        .is_err());
+        assert!(result_artifact_stage_id_with_identity(
+            &root,
+            artifact_path,
+            "run:current",
+            &[],
+            Some(&generation),
+            "sha256:wrong-content",
+            member.len() as u64,
+        )
+        .is_err());
+
+        let root_alias = root.join(artifact_path);
+        std::fs::create_dir_all(root_alias.parent().unwrap()).unwrap();
+        std::fs::write(&root_alias, b"stale mutable alias").unwrap();
+        let stale_root_reference = result_stage_record(
+            "stale-root-stage",
+            vec![artifact_path.to_string()],
+        );
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                artifact_path,
+                "run:current",
+                &[stale_root_reference],
+                Some(&generation),
+            )
+            .expect("mutable aliases and stage refs must not override a v2 producer"),
+            "immutable-eigen-stage"
+        );
+
+        let unbound_path = "eigen/unbound.json";
+        let unbound = write_immutable_result_generation_for_test(
+            &root,
+            [(unbound_path.to_string(), b"{}".to_vec())],
+            None,
+        );
+        let unbound_alias = root.join(unbound_path);
+        std::fs::create_dir_all(unbound_alias.parent().unwrap()).unwrap();
+        std::fs::write(&unbound_alias, b"stale root alias").unwrap();
+        let stale_unbound_reference = result_stage_record(
+            "must-not-bind",
+            vec![unbound_path.to_string()],
+        );
+        assert_eq!(
+            result_artifact_stage_id(
+                &root,
+                unbound_path,
+                "run:current",
+                &[stale_unbound_reference],
+                Some(&unbound),
+            )
+            .expect("missing v2 producer remains explicitly unbound"),
+            "stage:analysis"
+        );
+    }
+
+    #[test]
     fn result_owner_resolves_exact_file_and_safe_directory_references() {
         let temporary = TempGenerationRoot::new();
         let root = temporary.0.join("artifacts");
@@ -7025,6 +7169,74 @@ mod generation_snapshot_tests {
         .unwrap();
         assert_eq!(legacy.as_slice(), b"field-vector-generation-two");
         assert!(member.is_none(), "legacy reads stay explicitly unbound");
+    }
+
+    #[test]
+    fn immutable_field_reader_uses_generation_prefix_and_rejects_corruption() {
+        let root = TempGenerationRoot::new();
+        let artifact_path = "eigen/modes/sample_0000/mode_0000/vector.bin";
+        let payload = b"immutable complex field bytes";
+        let generation = write_immutable_result_generation_for_test(
+            &root.0,
+            [(artifact_path.to_string(), payload.to_vec())],
+            None,
+        );
+        assert!(generation.is_immutable());
+        assert!(!root.0.join(artifact_path).exists());
+        assert!(read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            "eigen/modes/sample_0000/mode_0001/vector.bin",
+            Some(&generation),
+        )
+        .unwrap()
+        .is_none());
+
+        let (served, member) = read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            artifact_path,
+            Some(&generation),
+        )
+        .unwrap()
+        .expect("immutable generation member should be served without a logical root file");
+        assert_eq!(served.as_slice(), payload.as_slice());
+        assert_eq!(
+            member.expect("immutable reader returns committed member identity").sha256,
+            format!("sha256:{:x}", Sha256::digest(payload))
+        );
+
+        let root_alias = root.0.join(artifact_path);
+        std::fs::create_dir_all(root_alias.parent().unwrap()).unwrap();
+        std::fs::write(&root_alias, b"stale root bytes").unwrap();
+        let (served, _) = read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            artifact_path,
+            Some(&generation),
+        )
+        .unwrap()
+        .expect("stale root alias must not shadow the immutable member");
+        assert_eq!(served.as_slice(), payload.as_slice());
+
+        let generation_name = generation
+            .commit
+            .generation_id
+            .strip_prefix("sha256:")
+            .unwrap();
+        let immutable_member = root
+            .0
+            .join("frequency_domain/generations")
+            .join(generation_name)
+            .join(artifact_path);
+        let mut corrupted = payload.to_vec();
+        corrupted[0] ^= 1;
+        std::fs::write(immutable_member, corrupted).unwrap();
+        let error = read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            artifact_path,
+            Some(&generation),
+        )
+        .expect_err("corrupt immutable member must not fall back to the stale root alias");
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        assert!(error.message.contains("frequency_domain_artifact_generation_member_mismatch"));
     }
 
     #[test]

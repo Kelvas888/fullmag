@@ -1555,57 +1555,38 @@ async fn response_progress_resource(
         return Ok(progress);
     }
 
-    let sweep_path = [
-        "response/magnetic_response_sweep.v2.json",
-        "response/magnetic_response_sweep.v1.json",
-    ]
-    .into_iter()
-    .find_map(|path| {
-        try_resolve_artifact_path(&artifact_dir, path)
-            .ok()
-            .flatten()
-            .map(|_| path)
-    });
-    let sweep_payload =
-        sweep_path.and_then(|path| read_json_artifact_value(&artifact_dir, path).ok());
+    let captured = capture_frequency_domain_artifact_set(
+        state,
+        &["response/magnetic_response_sweep.v2.json"],
+    )
+    .await?;
+    let artifact_dir = &captured.artifact_dir;
+    let generation = captured.generation.as_ref();
+    // Progress is intentionally mutable, but recheck after capturing the
+    // result generation so a newly written live progress file still wins.
+    if try_resolve_artifact_path(artifact_dir, "response/progress.v1.json")?.is_some() {
+        let progress = serde_json::from_value::<FrequencyDomainSweepProgressResource>(
+            read_json_artifact_value(artifact_dir, "response/progress.v1.json")?,
+        )
+        .map_err(|error| {
+            ApiError::internal(format!("invalid response progress artifact: {error}"))
+        })?;
+        validate_current_frequency_domain_artifact_set(state, &captured).await?;
+        return Ok(progress);
+    }
+
+    let artifacts = response_progress_artifact_snapshot(artifact_dir, generation)?;
+    let sweep_path = artifacts.sweep_path.as_deref();
+    let sweep_payload = artifacts.sweep_payload.as_ref();
     let frequency_range_hz = sweep_payload
-        .as_ref()
         .and_then(response_sweep_frequency_range_hz);
     let total_frequency_points = sweep_payload
-        .as_ref()
         .map(response_sweep_total_frequency_points)
         .unwrap_or(0);
-    let frequency_points = response_frequency_point_artifacts(&artifact_dir)?;
-    let completed_frequency_points = frequency_points.len() as u64;
-    let current_frequency_hz = frequency_points
-        .last()
-        .and_then(|path| read_json_artifact_value(&artifact_dir, path).ok())
-        .and_then(|payload| response_frequency_point_hz(&payload));
-    let frequency_domain_manifest_payload =
-        if try_resolve_artifact_path(&artifact_dir, "frequency_domain/manifest.v1.json")?.is_some()
-        {
-            read_json_artifact_value(&artifact_dir, "frequency_domain/manifest.v1.json").ok()
-        } else {
-            None
-        };
-    let legacy_manifest_payload =
-        if try_resolve_artifact_path(&artifact_dir, "response/artifact_manifest.json")?.is_some() {
-            read_json_artifact_value(&artifact_dir, "response/artifact_manifest.json").ok()
-        } else {
-            None
-        };
-    let manifest_payload = frequency_domain_manifest_payload
-        .as_ref()
-        .or(legacy_manifest_payload.as_ref());
-    let manifest_path = manifest_payload.map(|payload| {
-        if payload.get("schema_version").and_then(Value::as_str)
-            == Some("frequency_domain_manifest.v1")
-        {
-            "frequency_domain/manifest.v1.json".to_string()
-        } else {
-            "response/artifact_manifest.json".to_string()
-        }
-    });
+    let completed_frequency_points = artifacts.frequency_points.len() as u64;
+    let current_frequency_hz = artifacts.current_frequency_hz;
+    let manifest_payload = artifacts.manifest_payload.as_ref();
+    let manifest_path = artifacts.manifest_path.clone();
     let total_frequency_points = manifest_payload
         .and_then(|payload| {
             payload
@@ -1710,8 +1691,65 @@ async fn response_progress_resource(
         },
         progress_json: Some(progress_json),
     };
-    crate::validate_current_live_request_context(state, &request_context).await?;
+    validate_current_frequency_domain_artifact_set(state, &captured).await?;
     Ok(progress)
+}
+
+#[derive(Debug, Default)]
+struct ResponseProgressArtifactSnapshot {
+    sweep_path: Option<String>,
+    sweep_payload: Option<Value>,
+    frequency_points: Vec<String>,
+    current_frequency_hz: Option<f64>,
+    manifest_path: Option<String>,
+    manifest_payload: Option<Value>,
+}
+
+fn response_progress_artifact_snapshot(
+    artifact_dir: &FsPath,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<ResponseProgressArtifactSnapshot, ApiError> {
+    let mut snapshot = ResponseProgressArtifactSnapshot::default();
+    for artifact_path in [
+        "response/magnetic_response_sweep.v2.json",
+        "response/magnetic_response_sweep.v1.json",
+    ] {
+        if let Some((payload, _)) = super::results::read_result_artifact_snapshot_in_generation(
+            artifact_dir,
+            artifact_path,
+            generation,
+        )? {
+            snapshot.sweep_path = Some(artifact_path.to_string());
+            snapshot.sweep_payload = Some(payload);
+            break;
+        }
+    }
+    snapshot.frequency_points = response_frequency_point_artifacts(artifact_dir, generation)?;
+    if let Some(artifact_path) = snapshot.frequency_points.last() {
+        snapshot.current_frequency_hz = super::results::read_result_artifact_snapshot_in_generation(
+            artifact_dir,
+            artifact_path,
+            generation,
+        )?
+        .and_then(|(payload, _)| response_frequency_point_hz(&payload));
+    }
+
+    for artifact_path in [
+        "frequency_domain/manifest.v1.json",
+        "response/artifact_manifest.json",
+    ] {
+        if let Some((payload, _)) = super::results::read_result_artifact_snapshot_in_generation(
+            artifact_dir,
+            artifact_path,
+            generation,
+        )? {
+            snapshot.manifest_path = Some(artifact_path.to_string());
+            snapshot.manifest_payload = Some(payload);
+            break;
+        }
+    }
+    super::results::ensure_generation_capture_current(artifact_dir, generation)?;
+    Ok(snapshot)
 }
 
 #[utoipa::path(
@@ -3142,7 +3180,73 @@ fn response_frequency_point_hz(payload: &Value) -> Option<f64> {
 
 fn response_frequency_point_artifacts(
     artifact_dir: &std::path::Path,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<Vec<String>, ApiError> {
+    if let Some(generation) = generation {
+        if let Some((sweep, _)) = super::results::read_result_artifact_snapshot_in_generation(
+            artifact_dir,
+            "response/magnetic_response_sweep.v2.json",
+            Some(generation),
+        )? {
+            if let Some(raw_paths) = sweep.get("frequency_point_artifact_paths") {
+                let raw_paths = raw_paths.as_array().ok_or_else(|| {
+                    ApiError::conflict(
+                        "frequency_domain_response_sweep_point_links_malformed",
+                    )
+                })?;
+                let mut seen = BTreeSet::new();
+                let mut linked_paths = Vec::with_capacity(raw_paths.len());
+                for raw_path in raw_paths {
+                    let path = raw_path.as_str().ok_or_else(|| {
+                        ApiError::conflict(
+                            "frequency_domain_response_sweep_point_link_malformed",
+                        )
+                    })?;
+                    crate::artifacts::sanitize_artifact_relative_path(path).map_err(|_| {
+                        ApiError::conflict(
+                            "frequency_domain_response_sweep_point_link_unsafe",
+                        )
+                    })?;
+                    if !generation.commit.content.members.contains_key(path) {
+                        return Err(ApiError::conflict(
+                            "frequency_domain_response_sweep_point_link_not_in_generation",
+                        ));
+                    }
+                    if !seen.insert(path) {
+                        return Err(ApiError::conflict(
+                            "frequency_domain_response_sweep_point_link_duplicate",
+                        ));
+                    }
+                    linked_paths.push(path.to_string());
+                }
+                verify_response_frequency_point_members(
+                    artifact_dir,
+                    generation,
+                    &linked_paths,
+                )?;
+                return Ok(linked_paths);
+            }
+        }
+
+        const PREFIX: &str = "response/frequency_points/";
+        let mut paths = generation
+            .commit
+            .content
+            .members
+            .keys()
+            .filter_map(|path| {
+                let remainder = path.strip_prefix(PREFIX)?;
+                (!remainder.is_empty()
+                    && !remainder.contains('/')
+                    && remainder.ends_with(".json"))
+                .then(|| path.clone())
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        verify_response_frequency_point_members(artifact_dir, generation, &paths)?;
+        return Ok(paths);
+    }
+
     if try_resolve_artifact_path(artifact_dir, "response/magnetic_response_sweep.v2.json")?
         .is_some()
     {
@@ -3194,6 +3298,25 @@ fn response_frequency_point_artifacts(
     }
     paths.sort();
     Ok(paths)
+}
+
+fn verify_response_frequency_point_members(
+    artifact_dir: &std::path::Path,
+    generation: &fullmag_runner::artifact_generation::GenerationCapture,
+    paths: &[String],
+) -> Result<(), ApiError> {
+    for path in paths {
+        generation.verify_member(artifact_dir, path).map_err(|error| {
+            if generation.ensure_current(artifact_dir).is_err() {
+                ApiError::conflict("frequency_domain_artifact_generation_stale")
+            } else {
+                ApiError::conflict(format!(
+                    "frequency_domain_artifact_generation_member_mismatch: {path}: {error}"
+                ))
+            }
+        })?;
+    }
+    super::results::ensure_generation_capture_current(artifact_dir, Some(generation))
 }
 
 fn read_dispersion_path_metadata_resource(
@@ -4415,6 +4538,260 @@ mod spectrum_residual_tests {
         for invalid in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             parsed.samples[0].modes[0].residual_relative_l2 = Some(invalid);
             assert!(validate_frequency_domain_spectrum_v3(&parsed).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod response_progress_generation_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    struct TempArtifactRoot(PathBuf);
+
+    impl TempArtifactRoot {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "response-progress-generation-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&root).unwrap();
+            Self(root)
+        }
+    }
+
+    impl Drop for TempArtifactRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn json_bytes(value: Value) -> Vec<u8> {
+        serde_json::to_vec(&value).unwrap()
+    }
+
+    fn generation_with_two_frequency_points(
+        root: &TempArtifactRoot,
+        sweep: Value,
+    ) -> fullmag_runner::artifact_generation::GenerationCapture {
+        super::super::results::write_immutable_result_generation_for_test(
+            &root.0,
+            [
+                (
+                    "response/magnetic_response_sweep.v2.json".to_string(),
+                    json_bytes(sweep),
+                ),
+                (
+                    "response/frequency_points/frequency_0000.json".to_string(),
+                    json_bytes(serde_json::json!({"frequency_hz": 10.0})),
+                ),
+                (
+                    "response/frequency_points/frequency_0001.json".to_string(),
+                    json_bytes(serde_json::json!({"frequency_hz": 20.0})),
+                ),
+            ],
+            None,
+        )
+    }
+
+    fn assert_progress_snapshot_conflict(
+        result: Result<ResponseProgressArtifactSnapshot, ApiError>,
+    ) {
+        let error = match result {
+            Ok(_) => panic!("invalid generation-backed point set must fail closed"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn progress_fallback_reads_v2_snapshot_and_ignores_stale_root_aliases() {
+        let root = TempArtifactRoot::new();
+        let linked_point = "response/frequency_points/frequency_0001.json";
+        let generation = super::super::results::write_immutable_result_generation_for_test(
+            &root.0,
+            [
+                (
+                    "response/magnetic_response_sweep.v2.json".to_string(),
+                    json_bytes(serde_json::json!({
+                        "points": [{"frequency_hz": 10.0}, {"frequency_hz": 20.0}],
+                        "frequency_point_artifact_paths": [linked_point]
+                    })),
+                ),
+                (
+                    linked_point.to_string(),
+                    json_bytes(serde_json::json!({"frequency_hz": 20.0})),
+                ),
+                (
+                    "frequency_domain/manifest.v1.json".to_string(),
+                    json_bytes(serde_json::json!({
+                        "schema_version": "frequency_domain_manifest.v1",
+                        "requested_frequency_point_count": 3,
+                        "diagnostics": {
+                            "completed_frequency_point_count": 1,
+                            "written_frequency_point_artifacts": 1
+                        }
+                    })),
+                ),
+            ],
+            None,
+        );
+
+        let committed = response_progress_artifact_snapshot(&root.0, Some(&generation)).unwrap();
+        assert_eq!(
+            committed.sweep_path.as_deref(),
+            Some("response/magnetic_response_sweep.v2.json")
+        );
+        assert_eq!(
+            response_sweep_frequency_range_hz(committed.sweep_payload.as_ref().unwrap()),
+            Some((10.0, 20.0))
+        );
+        assert_eq!(committed.frequency_points, vec![linked_point]);
+        assert_eq!(committed.current_frequency_hz, Some(20.0));
+        assert_eq!(
+            committed.manifest_path.as_deref(),
+            Some("frequency_domain/manifest.v1.json")
+        );
+
+        for (path, value) in [
+            (
+                "response/magnetic_response_sweep.v2.json",
+                serde_json::json!({
+                    "points": [{"frequency_hz": 999.0}],
+                    "frequency_point_artifact_paths": [linked_point]
+                }),
+            ),
+            (linked_point, serde_json::json!({"frequency_hz": 999.0})),
+            (
+                "frequency_domain/manifest.v1.json",
+                serde_json::json!({"schema_version":"stale", "complete":true}),
+            ),
+            (
+                "response/frequency_points/frequency_9999.json",
+                serde_json::json!({"frequency_hz": 9999.0}),
+            ),
+        ] {
+            let path = root.0.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, json_bytes(value)).unwrap();
+        }
+
+        let still_committed =
+            response_progress_artifact_snapshot(&root.0, Some(&generation)).unwrap();
+        assert_eq!(still_committed.sweep_payload, committed.sweep_payload);
+        assert_eq!(still_committed.frequency_points, vec![linked_point]);
+        assert_eq!(still_committed.current_frequency_hz, Some(20.0));
+        assert_eq!(still_committed.manifest_payload, committed.manifest_payload);
+    }
+
+    #[test]
+    fn progress_fallback_enumerates_only_v2_members_and_keeps_v1_membership() {
+        let root = TempArtifactRoot::new();
+        let indexed_point = "response/frequency_points/frequency_0000.json";
+        let generation = super::super::results::write_immutable_result_generation_for_test(
+            &root.0,
+            [
+                (
+                    "response/magnetic_response_sweep.v2.json".to_string(),
+                    json_bytes(serde_json::json!({"points":[{"frequency_hz": 1.0}]})),
+                ),
+                (
+                    indexed_point.to_string(),
+                    json_bytes(serde_json::json!({"frequency_hz": 1.0})),
+                ),
+            ],
+            None,
+        );
+        let uncommitted_point = root.0.join("response/frequency_points/frequency_0001.json");
+        std::fs::create_dir_all(uncommitted_point.parent().unwrap()).unwrap();
+        std::fs::write(
+            &uncommitted_point,
+            json_bytes(serde_json::json!({"frequency_hz": 2.0})),
+        )
+        .unwrap();
+
+        let v2 = response_progress_artifact_snapshot(&root.0, Some(&generation)).unwrap();
+        assert_eq!(v2.frequency_points, vec![indexed_point]);
+        assert_eq!(v2.current_frequency_hz, Some(1.0));
+
+        let v1_root = TempArtifactRoot::new();
+        let v1_point = "response/frequency_points/frequency_0000.json";
+        let point_bytes = json_bytes(serde_json::json!({"frequency_hz": 3.0}));
+        super::super::results::write_result_generation_for_test(
+            &v1_root.0,
+            v1_point,
+            &point_bytes,
+            None,
+        );
+        let v1_generation = fullmag_runner::artifact_generation::capture(&v1_root.0)
+            .unwrap()
+            .expect("v1 fixture should capture");
+        let stale_extra = v1_root.0.join("response/frequency_points/frequency_0001.json");
+        std::fs::write(
+            &stale_extra,
+            json_bytes(serde_json::json!({"frequency_hz": 4.0})),
+        )
+        .unwrap();
+
+        let v1 = response_progress_artifact_snapshot(&v1_root.0, Some(&v1_generation)).unwrap();
+        assert_eq!(v1.frequency_points, vec![v1_point]);
+        assert_eq!(v1.current_frequency_hz, Some(3.0));
+    }
+
+    #[test]
+    fn progress_fallback_rejects_malformed_duplicate_and_unlisted_point_links() {
+        let valid_point = "response/frequency_points/frequency_0000.json";
+        let invalid_links = [
+            serde_json::json!("not-an-array"),
+            serde_json::json!([valid_point, 20]),
+            serde_json::json!(["../outside.json"]),
+            serde_json::json!(["response/frequency_points/not-published.json"]),
+            serde_json::json!([valid_point, valid_point]),
+        ];
+
+        for links in invalid_links {
+            let root = TempArtifactRoot::new();
+            let generation = generation_with_two_frequency_points(
+                &root,
+                serde_json::json!({
+                    "points": [{"frequency_hz": 10.0}, {"frequency_hz": 20.0}],
+                    "frequency_point_artifact_paths": links
+                }),
+            );
+            assert_progress_snapshot_conflict(response_progress_artifact_snapshot(
+                &root.0,
+                Some(&generation),
+            ));
+        }
+    }
+
+    #[test]
+    fn progress_fallback_verifies_every_enumerated_point_before_counting() {
+        for remove_member in [false, true] {
+            let root = TempArtifactRoot::new();
+            let generation = generation_with_two_frequency_points(
+                &root,
+                serde_json::json!({
+                    "points": [{"frequency_hz": 10.0}, {"frequency_hz": 20.0}]
+                }),
+            );
+            let first_point = root
+                .0
+                .join("frequency_domain/generations")
+                .join(generation.commit.generation_id.strip_prefix("sha256:").unwrap())
+                .join("response/frequency_points/frequency_0000.json");
+            if remove_member {
+                std::fs::remove_file(first_point).unwrap();
+            } else {
+                let mut corrupted = std::fs::read(&first_point).unwrap();
+                corrupted[0] ^= 1;
+                std::fs::write(first_point, corrupted).unwrap();
+            }
+
+            assert_progress_snapshot_conflict(response_progress_artifact_snapshot(
+                &root.0,
+                Some(&generation),
+            ));
         }
     }
 }
