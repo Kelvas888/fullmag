@@ -1033,7 +1033,7 @@ def _write_bundle(
         "requested_mode_count": requested_modes,
         "validation": {
             "dispersion_frequency_source": gate.NUMERIC_FREQUENCY_SOURCE,
-            "dynamic_demag_operator_source": "numeric_modal_solver",
+            "dynamic_demag_operator_source": None if case_dir.name == "c0" else "numeric_modal_solver",
         },
     })
     return _bundle_descriptor(case_dir, root)
@@ -1085,7 +1085,7 @@ def _evidence(
     return {
         "schema_version": gate.EVIDENCE_SCHEMA,
         "case_id": case,
-        "numeric_run": {"frequency_source": gate.NUMERIC_FREQUENCY_SOURCE, "analytic_solver_used_for_frequencies": False, "dynamic_demag_operator_source": "numeric_modal_solver"},
+        "numeric_run": {"frequency_source": gate.NUMERIC_FREQUENCY_SOURCE, "analytic_solver_used_for_frequencies": False, "dynamic_demag_operator_source": None if case == "c0" else "numeric_modal_solver"},
         "artifact_bindings": base_artifacts,
         "analytic_controls": controls,
         "convergence": convergence,
@@ -1206,7 +1206,7 @@ def _make_case(root: Path, case: str = "c1", *, primary_material=None, producer_
         "geometry": {"air_padding_each_side_m": 2.0e-6},
         "validation": {
             "dispersion_frequency_source": gate.NUMERIC_FREQUENCY_SOURCE,
-            "dynamic_demag_operator_source": "numeric_modal_solver",
+            "dynamic_demag_operator_source": None if case == "c0" else "numeric_modal_solver",
         },
     })
     _write_mode_fields(case_dir, samples)
@@ -1926,7 +1926,70 @@ class ScientificGateTests(unittest.TestCase):
             self.assertEqual(process.returncode, 0, process.stderr)
             report = json.loads(process.stdout)
             self.assertEqual(report["status"], "qualified")
+            self.assertEqual(report["checks"]["modal_field_phase"]["status"], "pass")
+            self.assertEqual(report["checks"]["modal_potential_phase"]["status"], "not_applicable")
             self.assertIn("eigen/spectrum.v2.json", report["artifact_bindings"])
+
+    def test_c0_modal_potential_phase_is_not_applicable_with_validated_demag_off_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = _make_case(Path(directory), "c0")
+            report = gate.validate_case(case_dir, "c0", parameters_path=PARAMETERS)
+            field_check = report["checks"]["modal_field_phase"]
+            potential_check = report["checks"]["modal_potential_phase"]
+
+            self.assertEqual(field_check["status"], "pass")
+            self.assertEqual(potential_check["status"], "not_applicable")
+            self.assertEqual(potential_check["phase_status"], "not_applicable")
+            self.assertEqual(potential_check["gauge_status"], "not_applicable")
+            self.assertEqual(potential_check["applicability_status"], "validated_demag_disabled")
+            self.assertIn("does not solve a dynamic scalar potential", potential_check["reason"])
+            self.assertEqual(report["status"], "qualified")
+
+    def test_c0_contradictory_demag_metadata_prevents_not_applicable_potential_status(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = _make_case(Path(directory), "c0")
+            metadata_path = case_dir / "metadata.json"
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            plan = metadata["execution_plan"]["backend_plan"]
+            plan["operator"]["include_demag"] = True
+            plan["enable_demag"] = True
+            _write_json(metadata_path, metadata)
+            evidence_path = case_dir / gate.EVIDENCE_RELATIVE_PATH
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["artifact_bindings"]["metadata_sha256"] = _sha256(metadata_path)
+            _write_json(evidence_path, evidence)
+
+            report = gate.validate_case(case_dir, "c0", parameters_path=PARAMETERS)
+            potential_check = report["checks"]["modal_potential_phase"]
+
+            self.assertNotEqual(potential_check["status"], "not_applicable")
+            self.assertEqual(potential_check["applicability_status"], "not_verified")
+            self.assertTrue(any("enable_demag does not match case c0" in reason for reason in report["reasons"]))
+            self.assertEqual(report["status"], "not_qualified")
+
+    def test_modal_potential_phase_rejects_mode_from_different_mesh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = _make_case(Path(directory), "c0")
+            manifest_path = case_dir / "frequency_domain/manifest.v1.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["validation"]["dynamic_demag_operator_source"] = "numeric_modal_solver"
+            _write_json(manifest_path, manifest)
+            evidence_path = case_dir / gate.EVIDENCE_RELATIVE_PATH
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["artifact_bindings"]["manifest_sha256"] = _sha256(manifest_path)
+            _write_json(evidence_path, evidence)
+            mode_path = case_dir / "eigen/modes/sample_0000/mode_0000.json"
+            mode = json.loads(mode_path.read_text(encoding="utf-8"))
+            mode["source_mesh_topology_sha256"] = "sha256:" + "f" * 64
+            _write_json(mode_path, mode)
+
+            report = gate.validate_case(case_dir, "c0", parameters_path=PARAMETERS)
+            potential_check = report["checks"]["modal_potential_phase"]
+
+            self.assertEqual(potential_check["mesh_identity_status"], "fail")
+            self.assertEqual(potential_check["status"], "fail")
+            self.assertTrue(any("topology differs from the numeric mesh" in reason
+                                for reason in potential_check["reasons"]))
 
     def test_rehashed_wrong_phase_is_not_qualified(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2197,6 +2260,9 @@ class ScientificGateTests(unittest.TestCase):
                     self.assertEqual(results[case]["status"], "qualified" if case == "c0" else "not_qualified")
                     self.assertEqual(results[case]["checks"]["primary_search_parameters"]["status"], "pass")
                     self.assertEqual(results[case]["checks"]["primary_window_completeness"]["status"], "pass")
+                    if case == "c0":
+                        self.assertEqual(results[case]["checks"]["modal_field_phase"]["status"], "pass")
+                        self.assertEqual(results[case]["checks"]["modal_potential_phase"]["status"], "not_applicable")
                     if case in gate.PATH_CASES:
                         self.assertEqual(results[case]["qualification"], "NOT VERIFIED")
                         # Full magnetic phase coverage does not prove consistency of

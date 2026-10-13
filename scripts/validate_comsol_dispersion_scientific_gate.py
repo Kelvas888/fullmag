@@ -2547,6 +2547,255 @@ def _validate_exported_mode_fields(
     return certificate
 
 
+def _c0_demag_disabled_contract(
+    metadata: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    evidence: Mapping[str, Any] | None,
+) -> tuple[bool, list[str]]:
+    """Validate the published C0 contract before skipping dynamic-potential replay."""
+    reasons: list[str] = []
+    plan = _nested(metadata, "execution_plan", "backend_plan")
+    if not isinstance(plan, Mapping):
+        reasons.append("metadata.execution_plan.backend_plan is missing or malformed")
+        plan = {}
+    operator = plan.get("operator")
+    if not isinstance(operator, Mapping) or operator.get("kind") != "full_2x2" or operator.get("include_demag") is not False:
+        reasons.append("C0 backend_plan.operator does not prove full_2x2 with include_demag=false")
+    if plan.get("enable_demag") is not False:
+        reasons.append("C0 backend_plan.enable_demag does not prove dynamic demagnetization is disabled")
+    spin_wave_bc = plan.get("spin_wave_bc")
+    if not isinstance(spin_wave_bc, Mapping) or spin_wave_bc.get("kind") not in ("periodic", "periodic_bc"):
+        reasons.append("C0 backend_plan.spin_wave_bc does not prove the periodic no-demag contract")
+    if plan.get("demag_realization") is not None:
+        reasons.append("C0 backend_plan declares a demagnetization realization")
+    guide = _nested(metadata, "problem_meta", "runtime_metadata", "comsol_nonzero_k_dispersion")
+    if not isinstance(guide, Mapping) or _nested(guide, "eigensolve", "magnetostatic_bc") != "open":
+        reasons.append("C0 metadata does not declare the open, no-dynamic-demag magnetostatic boundary contract")
+
+    manifest_validation = manifest.get("validation")
+    if isinstance(manifest_validation, Mapping) and manifest_validation.get("dynamic_demag_operator_source") is not None:
+        reasons.append("C0 frequency-domain manifest declares a dynamic-demagnetization source")
+    numeric_run = evidence.get("numeric_run") if isinstance(evidence, Mapping) else None
+    if not isinstance(numeric_run, Mapping):
+        reasons.append("C0 scientific evidence does not expose numeric_run provenance for applicability")
+    elif numeric_run.get("dynamic_demag_operator_source") is not None:
+        reasons.append("C0 scientific evidence declares a dynamic-demagnetization source")
+    return not reasons, reasons
+
+
+def _validate_exported_mode_potentials(
+    case_dir: Path,
+    case: str,
+    branches: Sequence[Mapping[str, Any]],
+    sample_map: Mapping[int, Mapping[str, Any]],
+    *,
+    metadata: Mapping[str, Any] | None = None,
+    manifest: Mapping[str, Any] | None = None,
+    evidence: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Replay full physical phi for the exact branch-selected modes.
+
+    The scalar seam check is kept separate from the magnetic `vector.bin`
+    certificate. A seam pass alone cannot verify the Poisson equation or its
+    gauge policy, so missing independently replayable gauge evidence remains
+    NOT VERIFIED and cannot close the scientific gate.
+    """
+    if case == "c0":
+        demag_disabled, applicability_reasons = _c0_demag_disabled_contract(
+            metadata or {}, manifest or {}, evidence,
+        )
+        if demag_disabled:
+            return _new_check(
+                "not_applicable",
+                applicability_status="validated_demag_disabled",
+                phase_status="not_applicable",
+                gauge_status="not_applicable",
+                reason=(
+                    "C0's validated full_2x2 backend contract disables dynamic demagnetization; "
+                    "it does not solve a dynamic scalar potential"
+                ),
+            )
+    else:
+        applicability_reasons = []
+
+    from comsol_modal_field_certificate import validate_modal_potential_phase_certificate
+
+    required_sample_indices = {0} if case == "c0" else set(range(EXPECTED_PATH_SAMPLE_COUNT))
+    expected_modes_per_sample = 1 if case == "c0" else EXPECTED_TARGET_BANDS
+    expected_count = len(required_sample_indices) * expected_modes_per_sample
+    selections: list[tuple[int, int]] = []
+    raw_modes_by_sample = {index: [] for index in sorted(required_sample_indices)}
+    for branch in branches:
+        points = branch.get("points", [])
+        if not isinstance(points, list):
+            continue
+        for point in points:
+            if not isinstance(point, Mapping):
+                continue
+            sample = point.get("sample_index")
+            raw = point.get("raw_mode_index")
+            if (
+                isinstance(sample, int)
+                and not isinstance(sample, bool)
+                and sample in required_sample_indices
+                and isinstance(raw, int)
+                and not isinstance(raw, bool)
+                and raw >= 0
+            ):
+                selections.append((sample, raw))
+                raw_modes_by_sample[sample].append(raw)
+    selected_pairs = set(selections)
+    selection_complete = (
+        len(branches) == expected_modes_per_sample
+        and len(selections) == expected_count
+        and len(selected_pairs) == expected_count
+        and all(
+            len(raw_modes_by_sample[index]) == expected_modes_per_sample
+            and len(set(raw_modes_by_sample[index])) == expected_modes_per_sample
+            for index in required_sample_indices
+        )
+    )
+    if not selection_complete:
+        message = (
+            "full-potential phase replay requires exactly one selected raw mode "
+            "per branch and required sample"
+        )
+        return _new_check(
+            "not_verified",
+            qualification="NOT VERIFIED",
+            phase_status="not_verified",
+            gauge_status="not_verified",
+            expected_mode_count=expected_count,
+            selected_mode_count=len(selections),
+            unique_selected_mode_count=len(selected_pairs),
+            selection_complete=False,
+            modes=[],
+            file_hashes=[],
+            reasons=[message],
+        )
+
+    certificate = validate_modal_potential_phase_certificate(
+        case_dir,
+        mode_selections=sorted(selected_pairs),
+        phase_tolerance=MAX_PHASE_RESIDUAL,
+    )
+    if case == "c0":
+        certificate["applicability_status"] = "not_verified"
+        certificate.setdefault("reasons", []).insert(
+            0,
+            "C0 demagnetization-disabled applicability was not established: "
+            + "; ".join(applicability_reasons),
+        )
+    certificate["expected_mode_count"] = expected_count
+    certificate["selection_coverage"] = {
+        "expected_mode_count": expected_count,
+        "selected_mode_count": len(selections),
+        "unique_selected_mode_count": len(selected_pairs),
+        "selection_complete": selection_complete,
+    }
+    reported_modes = certificate.get("modes")
+    reported_pairs: set[tuple[int, int]] = set()
+    if isinstance(reported_modes, list):
+        for mode in reported_modes:
+            if not isinstance(mode, Mapping):
+                continue
+            sample = mode.get("sample_index")
+            raw = mode.get("raw_mode_index")
+            if (
+                isinstance(sample, int)
+                and not isinstance(sample, bool)
+                and isinstance(raw, int)
+                and not isinstance(raw, bool)
+                and raw >= 0
+            ):
+                reported_pairs.add((sample, raw))
+    if (
+        not isinstance(reported_modes, list)
+        or len(reported_modes) != expected_count
+        or reported_pairs != selected_pairs
+        or certificate.get("mode_count") != expected_count
+    ):
+        certificate.setdefault("reasons", []).append(
+            "full-potential certificate does not contain exactly one result for every selected sample/raw-mode pair"
+        )
+        certificate["status"] = "fail"
+        certificate["phase_status"] = "fail"
+
+    identity_reasons: list[str] = []
+    mesh_identity_reasons: list[str] = []
+    mesh_signature = None
+    try:
+        from comsol_mesh_identity import mesh_topology_fingerprint_v3
+
+        metadata_path = _safe_relative_path(
+            case_dir, "metadata.json", "full-potential mesh metadata", mesh_identity_reasons
+        )
+        if metadata_path is None:
+            raise ValueError("unsafe or missing mesh metadata")
+        metadata_bytes = metadata_path.read_bytes()
+        certified_hashes = {
+            item.get("path"): item.get("sha256")
+            for item in certificate.get("file_hashes", [])
+            if isinstance(item, Mapping)
+        }
+        metadata_digest = "sha256:" + hashlib.sha256(metadata_bytes).hexdigest()
+        if metadata_digest != certified_hashes.get("metadata.json"):
+            raise ValueError("metadata changed after potential phase certification")
+        mesh_metadata = json.loads(metadata_bytes)
+        mesh = mesh_metadata["execution_plan"]["backend_plan"]["mesh"]
+        mesh_signature = mesh_topology_fingerprint_v3(mesh)
+    except (OSError, ValueError, TypeError, KeyError, SystemExit) as error:
+        mesh_identity_reasons.append(f"full-potential mesh identity could not be verified: {error}")
+
+    mesh_identity_matches = (
+        mesh_signature is not None
+        and isinstance(reported_modes, list)
+        and len(reported_modes) == expected_count
+    )
+    for mode in reported_modes if isinstance(reported_modes, list) else []:
+        if not isinstance(mode, Mapping):
+            continue
+        index = mode.get("sample_index")
+        if mesh_signature is None or mode.get("source_mesh_topology_sha256") != mesh_signature:
+            mesh_identity_reasons.append(
+                f"full potential sample {index} topology differs from the numeric mesh"
+            )
+            mesh_identity_matches = False
+        if not _modal_frequency_matches_spectrum(
+            mode,
+            sample_map.get(index, {}),
+            f"full potential sample {index}",
+            identity_reasons,
+        ):
+            continue
+        actual = mode.get("k_vector_rad_per_m")
+        expected = sample_map.get(index, {}).get("k_vector")
+        if (
+            not isinstance(actual, list)
+            or not isinstance(expected, list)
+            or len(actual) != 3
+            or len(expected) != 3
+            or any(
+                not _finite(a)
+                or not _finite(b)
+                or abs(float(a) - float(b)) > 1e-8 * max(1.0, abs(float(b)))
+                for a, b in zip(actual, expected)
+            )
+        ):
+            identity_reasons.append(
+                f"full potential sample {index} wavevector differs from the numeric spectrum"
+            )
+    identity_reasons.extend(mesh_identity_reasons)
+    if identity_reasons:
+        certificate.setdefault("reasons", []).extend(identity_reasons)
+        certificate["status"] = "fail"
+        certificate["phase_status"] = "fail"
+    certificate["mesh_identity_status"] = (
+        "pass" if mesh_identity_matches and not mesh_identity_reasons else "fail"
+    )
+    return certificate
+
+
 def _validate_spectrum(
     spectrum: Mapping[str, Any],
     case: str,
@@ -3171,6 +3420,8 @@ def _validate_numeric_source(
         reasons.append(f"solver_model {solver_model!r} is not the managed production SLEPc modal solver")
     if case in {"c1", "a1"} and dynamic_source != "numeric_modal_solver":
         reasons.append("dynamic demagnetization source is not declared as numeric_modal_solver")
+    if case == "c0" and dynamic_source is not None:
+        reasons.append("C0 dynamic-demagnetization source contradicts the disabled backend contract")
     return _new_check(
         "pass" if len(reasons) == before else "fail",
         frequency_source=source,
@@ -4306,6 +4557,8 @@ def _validate_evidence_binding(
             reasons.append("scientific evidence does not prove that the analytic solver was excluded from FEM frequencies")
         if case in {"c1", "a1"} and numeric.get("dynamic_demag_operator_source") != "numeric_modal_solver":
             reasons.append("scientific evidence does not identify numeric_modal_solver as dynamic-demag source")
+        if case == "c0" and numeric.get("dynamic_demag_operator_source") is not None:
+            reasons.append("C0 scientific evidence contradicts the disabled dynamic-demagnetization contract")
     bindings = evidence.get("artifact_bindings")
     if not isinstance(bindings, Mapping):
         reasons.append("scientific evidence is missing artifact_bindings")
@@ -4607,6 +4860,13 @@ def validate_case(
             selected_branches,
             reasons,
         )
+    evidence: dict[str, Any] | None = None
+    evidence_path = case_dir / EVIDENCE_RELATIVE_PATH
+    if evidence_path.is_file():
+        evidence, error = _load_json(evidence_path)
+        if error:
+            reasons.append(error)
+            evidence = None
     analytic_columns_check = _new_check("not_applicable")
     if case == "c1" and Path("eigen/dispersion.csv") in artifacts and parameters:
         analytic_columns_check = _validate_primary_analytic_columns(
@@ -4628,6 +4888,15 @@ def validate_case(
             require_uniform_slab=case == "c1",
         )
     field_check = _validate_exported_mode_fields(case_dir, case, selected_branches, sample_map, reasons)
+    potential_phase_check = _validate_exported_mode_potentials(
+        case_dir,
+        case,
+        selected_branches,
+        sample_map,
+        metadata=metadata,
+        manifest=manifest,
+        evidence=evidence,
+    )
     primary_equilibrium_check = _validate_primary_equilibrium(
         case_dir,
         case,
@@ -4638,13 +4907,6 @@ def validate_case(
         diagnostics,
         reasons,
     )
-    evidence: dict[str, Any] | None = None
-    evidence_path = case_dir / EVIDENCE_RELATIVE_PATH
-    if evidence_path.is_file():
-        evidence, error = _load_json(evidence_path)
-        if error:
-            reasons.append(error)
-            evidence = None
     evidence_check = _validate_evidence_binding(case_dir, evidence, artifacts, case, reasons)
     kittel_check = _validate_kittel(case, selected_branches, parameters or {}, reasons) if parameters else _new_check("missing")
     ks_check = _validate_ks(case_dir, case, evidence, parameters or {}, reasons, primary_metadata=metadata or None) if parameters else _new_check("missing")
@@ -4722,6 +4984,7 @@ def validate_case(
         "primary_search_parameters": primary_search_check,
         "primary_window_completeness": primary_window_check,
         "modal_field_phase": field_check,
+        "modal_potential_phase": potential_phase_check,
         "primary_equilibrium": primary_equilibrium_check,
         "finite_values": finite_check,
         "spectrum_samples": _new_check("pass" if len(sample_map) == (1 if case == "c0" else EXPECTED_PATH_SAMPLE_COUNT) else "fail", sample_count=len(sample_map)),

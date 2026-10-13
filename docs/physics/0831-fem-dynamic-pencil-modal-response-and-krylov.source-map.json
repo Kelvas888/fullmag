@@ -840,6 +840,20 @@
         "source-floquet-neumann-invertibility",
         "source-r2-gilbert-energy-balance-oracle"
       ]
+    },
+    {
+      "id": "eq-g6-full-potential-seam",
+      "symbols": [
+        "g6_full_phi",
+        "g6_signed_k",
+        "g6_translation",
+        "g6_phi_seam_residual",
+        "g6_imaginary_unit"
+      ],
+      "sources": [
+        "source-g6-full-potential-replay",
+        "source-g6-full-potential-binding"
+      ]
     }
   ],
   "symbols": [
@@ -1928,6 +1942,36 @@
       "latex": "$E$",
       "meaning": "Quadratic perturbation energy of the reduced conservative pencil",
       "si_unit": "$\\mathrm{J}$"
+    },
+    {
+      "id": "g6_full_phi",
+      "latex": "$\\phi_a,\\phi_b,\\phi_j$",
+      "meaning": "Fizyczny zespolony potencjał w węzłach pełnej domeny",
+      "si_unit": "$\\mathrm{A}$"
+    },
+    {
+      "id": "g6_signed_k",
+      "latex": "$\\mathbf{k}$",
+      "meaning": "Podpisany wektor falowy",
+      "si_unit": "$\\mathrm{rad\\,m^{-1}}$"
+    },
+    {
+      "id": "g6_translation",
+      "latex": "$\\mathbf{R}$",
+      "meaning": "Zweryfikowana translacja pary okresowej",
+      "si_unit": "$\\mathrm{m}$"
+    },
+    {
+      "id": "g6_phi_seam_residual",
+      "latex": "$r_\\phi$",
+      "meaning": "Residual seam normalizowany całym polem",
+      "si_unit": "$1$"
+    },
+    {
+      "id": "g6_imaginary_unit",
+      "latex": "$\\mathrm{i}$",
+      "meaning": "Jednostka urojona",
+      "si_unit": "$1$"
     }
   ],
   "sources": [
@@ -4220,6 +4264,24 @@
       "path": "backends/fem/cpu/frequency_domain/modal/shifted_ksp_true_convergence.hpp",
       "symbol": "floquet_shifted_true_convergence_test",
       "responsibility": "Retain independently owned completed probe with attempt and iteration provenance"
+    },
+    {
+      "id": "source-g6-full-potential-replay",
+      "path": "scripts/comsol_modal_field_certificate.py",
+      "symbol": "validate_modal_potential_phase_certificate",
+      "responsibility": "Full-node potential byte and phase replay; gauge remains unverified"
+    },
+    {
+      "id": "source-g6-full-potential-binding",
+      "path": "scripts/validate_comsol_dispersion_scientific_gate.py",
+      "symbol": "_validate_exported_mode_potentials",
+      "responsibility": "Exact sample mode selection and mesh/spectrum identity"
+    },
+    {
+      "id": "source-g6-c0-potential-applicability",
+      "path": "scripts/validate_comsol_dispersion_scientific_gate.py",
+      "symbol": "_c0_demag_disabled_contract",
+      "responsibility": "Validated disabled dynamic demag before not_applicable"
     }
   ],
   "public_api": {

@@ -5697,3 +5697,59 @@ jednostek, requested execution ani statusu FEM GPU/FDM/BEM/A1.
 | `docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md` | `DOC-ANCHOR:g5-owned-same-attempt-candidate` | Kontrakt same-attempt copy; kwalifikacja NOT VERIFIED |
 | `backends/fem/cpu/frequency_domain/modal/shifted_ksp_true_convergence.hpp` | `floquet_shifted_true_convergence_test` | Completed probe i owned copy, w trakcie poprawki |
 | `backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp` | `floquet_shifted_certified_recovery_shell_apply` | Owner recompute, wybór candidate i pełne rozliczenie budget |
+
+
+(g6-full-potential-disk-replay)=
+## G6 — niezależny replay pełnego potencjału
+
+C1/A1 wymagają rzeczywistych bajtów `potential_full.bin` w pełnym porządku
+węzłów oraz `physical_potential.v1.json`. Zredukowane współczynniki real-split
+nie zastępują pola fizycznego. Selekcja obejmuje każdy wymagany sample/raw mode;
+częstotliwości i podpisane $\mathbf{k}$ są porównywane z widmem tego samego runu,
+a topology hash jest odtwarzany z faktycznej geometrii metadata.
+
+```{math}
+:label: eq-g6-full-potential-seam
+\phi_b=\exp(-\mathrm{i}\mathbf{k}\cdot\mathbf{R})\phi_a,
+\qquad
+r_\phi=\frac{|\phi_b-\exp(-\mathrm{i}\mathbf{k}\cdot\mathbf{R})\phi_a|}
+{\max_j|\phi_j|}.
+```
+
+| Symbol | Znaczenie | SI |
+|---|---|---|
+| $\phi_a,\phi_b,\phi_j$ | Fizyczny zespolony potencjał w węzłach pełnej domeny | $\mathrm{A}$ |
+| $\mathbf{k}$ | Podpisany wektor falowy | $\mathrm{rad\,m^{-1}}$ |
+| $\mathbf{R}$ | Zweryfikowana translacja pary okresowej | $\mathrm{m}$ |
+| $r_\phi$ | Residual seam normalizowany całym polem | $1$ |
+| $\mathrm{i}$ | Jednostka urojona | $1$ |
+
+Próg pozostaje istniejącym `MAX_PHASE_RESIDUAL`. Zerowe pole lub ślad na parze
+spełniają równanie trywialnie, ale nie identyfikują znaku fazy: status
+`not_verified`, bez błędu fizycznego. Wymagana jest pełna pokryta lista par
+użytych przez scalar map. Hash payloadu, dokładna długość i jednostka są
+sprawdzane; sam hash lub producer flag nie dowodzi równania Poissona ani gauge.
+Obecny manifest nie udostępnia niezależnego gauge/operator replay, dlatego
+nawet phase PASS pozostawia gauge i końcową kwalifikację NOT VERIFIED.
+
+C0 jest no-demag control: nie rozwiązuje dynamicznego potencjału. `not_applicable`
+wymaga zgodnego operator/full_2x2/include_demag=false/enable_demag=false,
+okresowej BC i braku dynamic-demag source. Sprzeczne metadata są odrzucane;
+nazwa przypadku sama nie uprawnia do pominięcia bramki.
+
+| Realizacja | Zakres tej korekty | Dowód |
+|---|---|---|
+| FEM CPU | Disk replay istniejącego physical-potential export | Source implemented; hosted tests pending, science NOT VERIFIED |
+| FEM GPU | Brak nowej implementacji lub kwalifikacji | NOT VERIFIED |
+| FDM CPU | Helper dotyczy FEM nodal potential | Not applicable |
+| FDM GPU | Helper dotyczy FEM nodal potential | Not applicable |
+
+Nie zmieniamy Python DSL, ProblemIR, fizycznego operatora ani normalizacji
+producenta. Jest to niezależna bramka konsumenta istniejącego eksportu.
+
+| Źródło | Symbol | Odpowiedzialność |
+|---|---|---|
+| `scripts/comsol_modal_field_certificate.py` | `validate_modal_potential_phase_certificate` | Actual-byte phase replay, zero-trace classification, unknown gauge |
+| `scripts/validate_comsol_dispersion_scientific_gate.py` | `_validate_exported_mode_potentials` | Pełna selekcja, topology/spectrum binding |
+| `scripts/validate_comsol_dispersion_scientific_gate.py` | `_c0_demag_disabled_contract` | Weryfikacja applicability C0 |
+| `scripts/test_comsol_modal_field_certificate.py` | `test_full_physical_potential_replays_phase_but_does_not_claim_gauge` | Niezależny phase fixture bez producer-gauge trust |
