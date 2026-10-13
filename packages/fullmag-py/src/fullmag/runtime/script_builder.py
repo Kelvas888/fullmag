@@ -1085,6 +1085,17 @@ def _render_scene_document_bootstrap(
             anis_u = material.get("anisU") or material.get("anis_u")
             if isinstance(anis_u, (list, tuple)) and len(anis_u) == 3:
                 lines.append(f"{handle}.anisU = {_python_literal(tuple(anis_u))}")
+        # Match the final renderer before stage capture validates the Problem.
+        # Explicit object anisotropy is already authored physics, not a fallback.
+        normalized_stack = _ensure_geometry_physics_stack(
+            physics_stack,
+            material_dind=material.get("Dind") if isinstance(material, Mapping) else None,
+            material_dbulk=material.get("Dbulk") if isinstance(material, Mapping) else None,
+        )
+        uniaxial = _physics_stack_uniaxial_params(normalized_stack)
+        if uniaxial is not None:
+            lines.append(f"{handle}.Ku1 = {_python_literal(uniaxial['ku1'])}")
+            lines.append(f"{handle}.anisU = {_python_literal(tuple(uniaxial['axis']))}")
         magnetization = raw_object.get("magnetization")
         if isinstance(magnetization, Mapping):
             texture_expression = _render_texture_expression(magnetization)
