@@ -2524,6 +2524,10 @@ fn write_material_field_artifacts(
     output_dir: &Path,
     plan: &fullmag_ir::ExecutionPlanIR,
 ) -> std::io::Result<Vec<serde_json::Value>> {
+    if let BackendPlanIR::FdmMultilayer(multilayer) = &plan.backend_plan {
+        return write_fdm_multilayer_material_field_artifacts(output_dir, multilayer);
+    }
+
     let prepared = build_material_field_artifacts(plan)?;
     write_artifact_bytes(output_dir, &prepared.files)?;
     Ok(prepared.metadata_assets)
@@ -2747,6 +2751,15 @@ fn build_fdm_multilayer_material_field_artifacts(
     }
 
     Ok(prepared)
+}
+
+fn write_fdm_multilayer_material_field_artifacts(
+    output_dir: &Path,
+    multilayer: &fullmag_ir::FdmMultilayerPlanIR,
+) -> std::io::Result<Vec<serde_json::Value>> {
+    let prepared = build_fdm_multilayer_material_field_artifacts(multilayer)?;
+    write_artifact_bytes(output_dir, &prepared.files)?;
+    Ok(prepared.metadata_assets)
 }
 
 fn fdm_multilayer_layer_artifact_descriptor(
