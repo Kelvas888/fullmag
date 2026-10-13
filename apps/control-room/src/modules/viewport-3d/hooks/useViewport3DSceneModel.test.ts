@@ -847,7 +847,7 @@ describe("useViewport3DSceneModel", () => {
   it("reports FDM field mismatches only while the FDM lane is active", () => {
     const source = readFileSync(sceneModelSourceUrl, "utf8");
     const expression = source.match(
-      /fieldVector\.error\?\.message \?\?\s*([\s\S]*?)\s*\?\?\s*magneticPartFieldVectors/,
+      /fieldVector\.error\?\.message \?\?\s*([\s\S]*?)\s*\?\?\s*\(femLaneActive \? magneticPartFieldVectors/,
     )?.[1];
     expect(expression).toBeDefined();
     const resolveWarning = new Function(

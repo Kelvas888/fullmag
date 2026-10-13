@@ -201,7 +201,9 @@ describe("AirboxInspectorLanePanel", () => {
 
     expect(testState.calls).toEqual([false, false]);
     expect(html).not.toContain("Airbox · FDM structured universe");
-    expect(html).toContain("FEM Airbox child");
+    expect(html).not.toContain("FEM Airbox child");
+    expect(html).toContain("The current session discretization is unresolved.");
+    expect(html).not.toContain("runtime lane conflict");
   });
 
   it("uses the current runtime lane despite a legacy FDM Airbox selection", () => {

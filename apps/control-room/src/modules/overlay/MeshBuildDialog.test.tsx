@@ -5,11 +5,13 @@ import {
 } from "@/kernel/authoring/geometryLifecycleCommandContributions";
 import {
   meshBuildDialogUnavailableMessage,
-  meshBuildDialogRuntimeStatusEquals,
   resolveMeshBuildDialogLane,
-  selectMeshBuildDialogRuntimeStatus,
   shouldLoadMeshBuildDialogFemResources,
 } from "./MeshBuildDialog";
+import {
+  meshBuildDialogRuntimeStatusEquals,
+  selectMeshBuildDialogRuntimeStatus,
+} from "./MeshBuildDialogRuntimeStatus";
 import { openMeshBuildDiagnostics } from "./meshBuildDiagnosticsNavigation";
 
 describe("MeshBuildDialog", () => {

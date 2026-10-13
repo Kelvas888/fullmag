@@ -12053,6 +12053,9 @@ async fn fdm_grid_refresh_uses_active_plan_or_explicit_request_without_resolved_
     for (case, requested_backend, explicit_selection, metadata) in cases {
         let state = test_app_state_with_live_session().await;
         if let Some(snapshot) = state.current_live_state.write().await.as_mut() {
+            snapshot.session.status = "awaiting_command".into();
+            snapshot.live_state = None;
+            snapshot.stage_execution = None;
             snapshot.session.resolved_backend = None;
             snapshot.session.requested_backend = requested_backend.into();
             snapshot.session.explicit_selection = explicit_selection;
@@ -12063,6 +12066,7 @@ async fn fdm_grid_refresh_uses_active_plan_or_explicit_request_without_resolved_
             scene.study.requested_backend = "fdm".into();
             snapshot.scene_document = Some(scene);
             snapshot.metadata = Some(metadata);
+            crate::session::refresh_runtime_status(snapshot);
         }
         let app = build_v2_router().with_state(state.clone());
 

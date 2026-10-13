@@ -33,6 +33,16 @@ export interface StatusBarMethodModel {
   title: string;
 }
 
+export function statusBarMethodModelsEqual(
+  previous: StatusBarMethodModel,
+  next: StatusBarMethodModel,
+): boolean {
+  return previous.label === next.label
+    && previous.method === next.method
+    && previous.state === next.state
+    && previous.title === next.title;
+}
+
 export function buildStatusBarMethodModel(
   status: StatusBarMethodReadback | null | undefined,
 ): StatusBarMethodModel {

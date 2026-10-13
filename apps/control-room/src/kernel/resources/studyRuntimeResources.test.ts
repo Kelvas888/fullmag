@@ -1295,7 +1295,7 @@ describe("study runtime command resource bundles", () => {
     ).toBe(true);
   });
 
-  it("loads shared-domain manifest when FEM or explicit topology has a mesh or domain revision", () => {
+  it("loads shared-domain manifest for FEM with a mesh or domain revision", () => {
     expect(
       shouldLoadRuntimeMeshManifest(
         true,
@@ -1337,7 +1337,7 @@ describe("study runtime command resource bundles", () => {
           resources: { mesh_revision: 5 },
         }),
       ),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("uses the active FEM lane when the legacy domain field still says FDM", () => {

@@ -24,12 +24,8 @@ import {
   useMeshSummaryResource,
 } from "@/kernel/resources/geometryLifecycleResources";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
-import {
-  projectFlatActiveLaneDiscretization,
-  resolveSessionDiscretization,
-  type SessionDiscretizationCapabilitiesProjection,
-} from "@/kernel/resources/sessionDiscretization";
-import type { JsonObject, LiveStatusResource } from "@/kernel/api/apiTypes";
+import { resolveSessionDiscretization } from "@/kernel/resources/sessionDiscretization";
+import type { JsonObject } from "@/kernel/api/apiTypes";
 import type { KernelApi } from "@/kernel/types";
 import { diffMeshPolicies } from "@/shared/domain/mesh/meshPolicyDiff";
 import { buildMeshSnapshotRows } from "@/shared/domain/mesh/meshBuildSnapshots";
@@ -44,6 +40,10 @@ import { Button } from "@/shared/ui/Button";
 import { MeshBuildConfirmDialogContent } from "./mesh-build/MeshBuildConfirmDialog";
 import { buildRegionMeshBuildReasonRows } from "./mesh-build/meshBuildRegionReasons";
 import { openMeshBuildDiagnostics } from "./meshBuildDiagnosticsNavigation";
+import {
+  meshBuildDialogRuntimeStatusEquals,
+  selectMeshBuildDialogRuntimeStatus,
+} from "./MeshBuildDialogRuntimeStatus";
 
 function asRecord(value: unknown): JsonObject | null {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -58,18 +58,6 @@ function text(value: unknown, fallback = "unknown"): string {
   return JSON.stringify(value);
 }
 
-type MeshBuildDialogRuntimeStatus = {
-  capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology"> &
-    SessionDiscretizationCapabilitiesProjection & {
-      active_lane?: LiveStatusResource["capabilities"]["active_lane"] | null;
-    };
-  domain: Pick<LiveStatusResource["domain"], "discretization">;
-  resources: Pick<
-    LiveStatusResource["resources"],
-    "mesh_build_revision" | "mesh_revision"
-  >;
-};
-
 type MeshBuildDialogSnapshot = {
   requestId: string;
   sceneRevision: number;
@@ -83,71 +71,6 @@ type MeshBuildDialogSnapshot = {
     quality: JsonObject | null;
   };
 };
-
-export function selectMeshBuildDialogRuntimeStatus(status: {
-  data: LiveStatusResource | null;
-}): MeshBuildDialogRuntimeStatus | null {
-  if (!status.data) return null;
-  const sourceCapabilities = status.data.capabilities;
-  const flatLane = projectFlatActiveLaneDiscretization(sourceCapabilities);
-  const capabilities: MeshBuildDialogRuntimeStatus["capabilities"] = {
-    explicit_topology: sourceCapabilities?.explicit_topology ?? false,
-  };
-  if (
-    Object.prototype.hasOwnProperty.call(sourceCapabilities ?? {}, "active_lane")
-  ) {
-    capabilities.active_lane = sourceCapabilities?.active_lane ?? null;
-  }
-  if (flatLane) capabilities.active_lane_discretization = flatLane.value;
-  return {
-    capabilities,
-    domain: {
-      discretization: status.data.domain.discretization,
-    },
-    resources: {
-      mesh_build_revision: status.data.resources.mesh_build_revision,
-      mesh_revision: status.data.resources.mesh_revision,
-    },
-  };
-}
-
-export function meshBuildDialogRuntimeStatusEquals(
-  previous: MeshBuildDialogRuntimeStatus | null,
-  next: MeshBuildDialogRuntimeStatus | null,
-): boolean {
-  if (previous === next) return true;
-  if (!previous || !next) return previous === next;
-  const previousActiveLane = previous.capabilities.active_lane;
-  const nextActiveLane = next.capabilities.active_lane;
-  return (
-    previous.capabilities.explicit_topology ===
-      next.capabilities.explicit_topology &&
-    Object.prototype.hasOwnProperty.call(
-      previous.capabilities,
-      "active_lane",
-    ) === Object.prototype.hasOwnProperty.call(next.capabilities, "active_lane") &&
-    previousActiveLane?.resolved?.discretization ===
-      nextActiveLane?.resolved?.discretization &&
-    Object.prototype.hasOwnProperty.call(
-      previous.capabilities,
-      "active_lane_discretization",
-    ) ===
-      Object.prototype.hasOwnProperty.call(
-        next.capabilities,
-        "active_lane_discretization",
-      ) &&
-    previous.capabilities.active_lane_discretization ===
-      next.capabilities.active_lane_discretization &&
-    previousActiveLane?.operations?.grid_build?.reason ===
-      nextActiveLane?.operations?.grid_build?.reason &&
-    previousActiveLane?.operations?.grid_build?.state ===
-      nextActiveLane?.operations?.grid_build?.state &&
-    previous.domain.discretization === next.domain.discretization &&
-    previous.resources.mesh_build_revision ===
-      next.resources.mesh_build_revision &&
-    previous.resources.mesh_revision === next.resources.mesh_revision
-  );
-}
 
 export function resolveMeshBuildDialogLane(
   discretization: unknown,

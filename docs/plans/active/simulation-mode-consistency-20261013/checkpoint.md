@@ -29,16 +29,26 @@ Source architecture hygiene i API hygiene PASS dla pierwszego spójnego zakresu;
 ## Etap komend i analizy
 
 Commit: `c4a4b0344470cfef8df407eebd4d406941d4a77b`.
-Review �r�d�owy niezale�nego agenta i scoped diff-check PASS. Regresje czekaj� na CI. Guard FDM commands opiera si� na active execution, nie retained artifacts. Topological charge zachowuje FDM field topology mimo retained FEM mesh; istniej�ca nota 0940 pozostaje kontraktem.
+Review źródłowy niezależnego agenta i scoped diff-check PASS. Regresje czekają na CI. Guard FDM commands opiera się na active execution, nie retained artifacts. Topological charge zachowuje FDM field topology mimo retained FEM mesh; istniejąca nota 0940 pozostaje kontraktem.
 
-Root rozszerzy� zakres o StudyInspectorPanelModel provenance i testy dla CPU preview vs GPU run. Nie zmienia requested device ani legacy/per-step stage legality.
+Root rozszerzył zakres o StudyInspectorPanelModel provenance i testy dla CPU preview vs GPU run. Nie zmienia requested device ani legacy/per-step stage legality.
 
-## Ko�cowy review UI
+## Końcowy review UI
 
-Poprawiono: brak capabilities w adapterach, jawne unresolved Airbox, equality zachowuj�ce lane i presence, stale explicit_topology flags, zale�no�ci callbacku wizualizacji obiektu, stale lane-specific errors viewportu. Independent review P2 wsp�lnego targetQuantity field poprawiony przez gating aktualnego demandu FDM/FEM; P2 metadata run poprawiony przez unavailable/not loaded zamiast domniemania not started w Inspectorze. Status bar nadal rozr�nia running + brak metadata od potwierdzonego stanu przed run.
+Poprawiono: brak capabilities w adapterach, jawne unresolved Airbox, equality zachowujące lane i presence, stale explicit_topology flags, zależności callbacku wizualizacji obiektu, stale lane-specific errors viewportu. Independent review P2 wspólnego targetQuantity field poprawiony przez gating aktualnego demandu FDM/FEM; P2 metadata run poprawiony przez unavailable/not loaded zamiast domniemania not started w Inspectorze. Status bar nadal rozróżnia running + brak metadata od potwierdzonego stanu przed run.
 
-Architecture hygiene, API hygiene, diff-check i smoke script syntax-check PASS; lokalne testy/typecheck/build/browser niewykonane. Ko�cowy CI b�dzie �r�d�em dowodu wykonania.
+Architecture hygiene, API hygiene, diff-check i smoke script syntax-check PASS; lokalne testy/typecheck/build/browser niewykonane. Końcowy CI będzie źródłem dowodu wykonania.
 
 ## CI pierwszego head
 
-Head a20c9cf08d1f4d3b3fdba4f6aed72ee3669e64a7, PR #155. Control Room typecheck wykry� brak deklaracji readback metody w Viewport3DFrameProps oraz nullable status po gatingu lane. Naprawa zachowuje neutralny status idle i przekazuje metod� jako jawny prop frame, nie rozszerza kontraktu sceny Three.js. Pozosta�e CI trwa; wynik ko�cowy jeszcze niepotwierdzony. React Doctor CI PASS; local commit hook zg�osi� 13 warnings na niezmienionych liniach, nie traktowa� hook score jako wyniku CI dla diff.
+Head a20c9cf08d1f4d3b3fdba4f6aed72ee3669e64a7, PR #155. Control Room typecheck wykrył brak deklaracji readback metody w Viewport3DFrameProps oraz nullable status po gatingu lane. Naprawa zachowuje neutralny status idle i przekazuje metodę jako jawny prop frame, nie rozszerza kontraktu sceny Three.js. Pozostałe CI trwa; wynik końcowy jeszcze niepotwierdzony. React Doctor CI PASS; local commit hook zgłosił 13 warnings na niezmienionych liniach, nie traktować hook score jako wyniku CI dla diff.
+
+## Triage React Doctor
+
+CI advisory PASS zgłosiło dwa nowe non-component export warnings dla adaptera/equality MeshBuildDialog oraz complexity statusbara. Pure adaptery przenosimy do modułu .ts, comparator statusbara do modelu. Pięć await-in-loop ostrzeżeń dotyczy niezmienionych sekwencyjnych operacji browser smoke (dodanie proof przesunęło linie o16); kolejność służy synchronizacji mutacji/screenshotów i nie będzie równoleglona dla wyniku narzędzia. Te warningi nie dowodzą regresji ani wyniku 0 warnings.
+
+## CI drugiego head
+
+Head 5ea1b4b7256ccb68fa24d0b3f98f84f4564383d9. Browser fixture i Inspector actions PASS. Typecheck i lint PASS, unit suite 7774 PASS / 3 FAIL / 13 skipped: stare expectation explicit topology przy active FDM, domyślny FEM child przy unresolved Airbox oraz source regex FDM warning po nowym FEM error gate. Poprawiono te trzy oczekiwania bez osłabiania kontraktu, legacy manifest fallback nadal ma pozytywną regresję. Python meshing testy przeszły, dalsza repo consistency przerwana przez invalid UTF-8 w nowych notach; oba dokumenty naprawione i repo consistency źródłowo PASS.
+
+Rust CI: 974 PASS / 1 FAIL / 3 ignored. Nowy test fallbacku FDM pozostawiał bazowy fixture w stanie running, więc istniejąca bramka remesh_admission prawidłowo zwracała 409 (Stop the running stage before rebuilding the mesh). Fixture ustawiono w awaiting_command, bez live_state/stage_execution, jak istniejący pozytywny test komendy. Bramka runtime pozostaje bez zmian. Wynik naprawy wymaga kolejnego CI.

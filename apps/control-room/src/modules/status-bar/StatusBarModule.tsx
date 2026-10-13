@@ -20,6 +20,7 @@ import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 import {
   buildStatusBarEngineModel,
   buildStatusBarMethodModel,
+  statusBarMethodModelsEqual,
   buildStatusBarMeshModel,
   formatRuntimeBundleVersionLabel,
 } from "./statusBarModel";
@@ -86,10 +87,7 @@ export default function StatusBarModule() {
     (status) => buildStatusBarMethodModel(status.data),
     {
       enabled: mounted,
-      isEqual: (previous, next) => previous.label === next.label
-        && previous.method === next.method
-        && previous.state === next.state
-        && previous.title === next.title,
+      isEqual: statusBarMethodModelsEqual,
     },
   );
   const currentRun = useCurrentRunResource({ enabled: mounted });
