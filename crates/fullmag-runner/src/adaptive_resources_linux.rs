@@ -219,6 +219,24 @@ fn memory_headroom_bytes(limit_bytes: u64, used_bytes: u64) -> u64 {
     limit_bytes.saturating_sub(used_bytes)
 }
 
+fn slurm_job_finite_memory_scope(
+    job_scope_index: usize,
+    mount_root_index: usize,
+    finite_memory_scopes: &[(usize, u64, u64)],
+) -> Option<(usize, u64, u64)> {
+    // Cgroup paths are ordered leaf-to-root. A finite job limit or one of its
+    // ancestors bounds the whole job; a task/step descendant cannot stand in
+    // for sibling usage when no Slurm memory hint is available. An unverified
+    // mount root is not allocation authority, unless it is the exact job scope.
+    finite_memory_scopes
+        .iter()
+        .copied()
+        .filter(|(index, _, _)| {
+            *index >= job_scope_index && (*index == job_scope_index || *index < mount_root_index)
+        })
+        .min_by_key(|(index, _, _)| *index)
+}
+
 fn cpu_quota_cores(value: &str) -> Result<Option<f64>, String> {
     let fields: Vec<_> = value.split_whitespace().collect();
     if fields.len() != 2 {
@@ -337,7 +355,7 @@ impl ResourceSampler {
                 if let Some(maximum) = read_u64(&directory.join("memory.max"))? {
                     let used = read_u64(&directory.join("memory.current"))?
                         .ok_or("invalid cgroup memory.current")?;
-                    finite_memory_scopes.push(index);
+                    finite_memory_scopes.push((index, maximum, used));
                     limit = limit.min(maximum);
                     available = available.min(memory_headroom_bytes(maximum, used));
                     sources.push("cgroup_v2_memory_max".into());
@@ -375,16 +393,7 @@ impl ResourceSampler {
             // Inherited settings outside a Slurm job are not an allocation.
             (None, None)
         };
-        if finite_memory_scopes.is_empty() && slurm_memory.is_none() {
-            return Err("finite cgroup or scheduler memory allocation unavailable".into());
-        }
-        if let Some(mib) = slurm_memory {
-            let scheduler_limit = mib
-                .checked_mul(1024 * 1024)
-                .ok_or("Slurm memory allocation overflow")?;
-            if scheduler_limit == 0 {
-                return Err("zero scheduler memory allocation".into());
-            }
+        if std::env::var_os("SLURM_JOB_ID").is_some() {
             let job_id = std::env::var("SLURM_JOB_ID")
                 .map_err(|_| "invalid SLURM_JOB_ID for memory accounting")?;
             if job_id.trim().is_empty() {
@@ -397,15 +406,43 @@ impl ResourceSampler {
                 step_id.as_deref(),
             )
             .ok_or("Slurm memory allocation cgroup scope unavailable; refusing unverified job usage")?;
-            let job_usage = read_u64(&self.group_dirs[scope_index].join("memory.current"))?
-                .ok_or("invalid Slurm job cgroup memory.current")?;
-            available = available.min(memory_headroom_bytes(scheduler_limit, job_usage));
-            limit = limit.min(scheduler_limit);
-            sources.push("slurm_memory_allocation".into());
-            sources.push(
-                slurm_memory_source.ok_or("Slurm memory allocation source unavailable")?.into(),
-            );
+            if let Some(mib) = slurm_memory {
+                let scheduler_limit = mib
+                    .checked_mul(1024 * 1024)
+                    .ok_or("Slurm memory allocation overflow")?;
+                if scheduler_limit == 0 {
+                    return Err("zero scheduler memory allocation".into());
+                }
+                let job_usage = read_u64(&self.group_dirs[scope_index].join("memory.current"))?
+                    .ok_or("invalid Slurm job cgroup memory.current")?;
+                available = available.min(memory_headroom_bytes(scheduler_limit, job_usage));
+                limit = limit.min(scheduler_limit);
+                sources.push("slurm_memory_allocation".into());
+                sources.push(
+                    slurm_memory_source
+                        .ok_or("Slurm memory allocation source unavailable")?
+                        .into(),
+                );
+            } else {
+                let (limit_scope_index, cgroup_limit, used) =
+                    slurm_job_finite_memory_scope(
+                        scope_index,
+                        self.group_dirs.len().saturating_sub(1),
+                        &finite_memory_scopes,
+                    )
+                        .ok_or("Slurm job memory allocation unavailable; require finite job cgroup memory.max or a finite ancestor")?;
+                available = available.min(memory_headroom_bytes(cgroup_limit, used));
+                limit = limit.min(cgroup_limit);
+                sources.push("slurm_job_memory_cgroup_allocation".into());
+                sources.push(if limit_scope_index == scope_index {
+                    "slurm_memory_limit_scope_job_cgroup".into()
+                } else {
+                    "slurm_memory_limit_scope_job_ancestor".into()
+                });
+            }
             sources.push(scope_source.into());
+        } else if finite_memory_scopes.is_empty() {
+            return Err("finite cgroup or scheduler memory allocation unavailable".into());
         }
         let current = proc_cpu(&self.affinity_ids)?;
         let previous = self
@@ -651,6 +688,7 @@ mod tests {
             PathBuf::from("/sys/fs/cgroup/slurm/uid_7/job_42/step_0"),
             PathBuf::from("/sys/fs/cgroup/slurm/uid_7/job_42"),
             PathBuf::from("/sys/fs/cgroup/slurm/uid_7"),
+            PathBuf::from("/sys/fs/cgroup/slurm"),
         ];
         let scope = super::slurm_job_memory_scope_index(&directories, "42", Some("0"))
             .expect("current cgroup ancestry includes the exact Slurm job");
@@ -668,6 +706,67 @@ mod tests {
             super::memory_headroom_bytes(allocation, current_by_scope[0]),
             5,
             "the task leaf must not be subtracted from a job-wide allocation"
+        );
+    }
+
+    #[test]
+    fn slurm_without_memory_environment_rejects_leaf_limit_but_accepts_job_limit() {
+        let directories = vec![
+            PathBuf::from("/sys/fs/cgroup/slurm/uid_7/job_42/step_0/task_0"),
+            PathBuf::from("/sys/fs/cgroup/slurm/uid_7/job_42/step_0"),
+            PathBuf::from("/sys/fs/cgroup/slurm/uid_7/job_42"),
+            PathBuf::from("/sys/fs/cgroup/slurm/uid_7"),
+            PathBuf::from("/sys/fs/cgroup/slurm"),
+        ];
+        let (job_scope_index, _) =
+            super::slurm_job_memory_scope_index(&directories, "42", Some("0"))
+                .expect("the process belongs to the exact Slurm job cgroup");
+        assert_eq!(super::slurm_memory_limit_mib(None, None, None).unwrap(), None);
+
+        let leaf_only = [(0, 64_u64 << 20, 16_u64 << 20)];
+        assert_eq!(
+            super::slurm_job_finite_memory_scope(
+                job_scope_index,
+                directories.len() - 1,
+                &leaf_only
+            ),
+            None,
+            "a finite task leaf cannot stand in for the Slurm job allocation"
+        );
+
+        let job_scope_limit = [
+            (0, 64_u64 << 20, 16_u64 << 20),
+            (job_scope_index, 128_u64 << 20, 96_u64 << 20),
+        ];
+        let (limit_index, limit, used) =
+            super::slurm_job_finite_memory_scope(
+                job_scope_index,
+                directories.len() - 1,
+                &job_scope_limit,
+            )
+            .expect("finite job memory.max is an allocation authority");
+        assert_eq!(limit_index, job_scope_index);
+        assert_eq!(super::memory_headroom_bytes(limit, used), 32_u64 << 20);
+
+        let ancestor_only = [(3, 256_u64 << 20, 224_u64 << 20)];
+        assert_eq!(
+            super::slurm_job_finite_memory_scope(
+                job_scope_index,
+                directories.len() - 1,
+                &ancestor_only,
+            ),
+            Some((3, 256_u64 << 20, 224_u64 << 20)),
+            "a finite cgroup ancestor above the verified job cgroup covers it"
+        );
+        let mount_root_only = [(directories.len() - 1, 512_u64 << 20, 128_u64 << 20)];
+        assert_eq!(
+            super::slurm_job_finite_memory_scope(
+                job_scope_index,
+                directories.len() - 1,
+                &mount_root_only,
+            ),
+            None,
+            "an unverified mount root cannot stand in for a Slurm allocation"
         );
     }
 
