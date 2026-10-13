@@ -113,3 +113,19 @@ brak nowych actionable; źródła regresji dodane, wykonanie w CI jeszcze pendin
 
 Rejestr rodzin i rzeczywistych handlerów znajduje się w
 `docs/reports/2026-10-13/inspector-panel-actions-ledger.md`.
+
+## Poprawki po pierwszym CI PR #150
+
+Pierwszy przebieg na bbc8df331552cbee52d0b93e47ee4a4a6eb55ca6 wykrył
+2 błędy TypeScript w mockach testów i 13 nowych przypisań ref.current
+podczas renderowania. Poprawiono typowanie oraz przeniesiono synchronizację
+refów do useLayoutEffect, zachowując synchroniczne zapisy ze zdarzeń i ACK.
+
+Istniejący browser smoke oczekiwał starej nazwy Focus; selektor aktualizuje się
+do Fit view. Nowy smoke wymaga normalizacji absolutnej ścieżki uploadu
+artefaktów i drukuje ograniczone logi po błędzie. Dodano kontrolę niezmienionych
+disabled/opacity pola, limit commitów React i licznik mutacji API. Fixture używa
+syntetycznych callbacków: nie stanowi dowodu rzeczywistego API end-to-end.
+
+Kontrole parserów i git diff --check: PASS. Ponowne CI, browser i pełny
+przebieg mutacji z backendem: NOT VERIFIED do uzyskania aktualnych wyników.

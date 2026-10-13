@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import {
   acknowledgedAuthoringSceneRevision,
   invalidateAuthoringMutationDependents,
@@ -119,7 +119,9 @@ export function ObjectRegionTexturePanel({
     }),
   );
   const draftStateRef = useRef(draftState);
-  draftStateRef.current = draftState;
+  useLayoutEffect(() => {
+    draftStateRef.current = draftState;
+  }, [draftState]);
   const [feedback, setFeedback] = useState<MagneticTextureFeedback>(null);
   const [pendingOperation, setPendingOperation] = useState<{
     id: number;
@@ -442,9 +444,11 @@ export function ObjectRegionTexturePanel({
     }
   }
   const saveTextureRef = useRef(saveTexture);
-  saveTextureRef.current = saveTexture;
   const auxiliaryResetRef = useRef(resetDraft);
-  auxiliaryResetRef.current = resetDraft;
+  useLayoutEffect(() => {
+    saveTextureRef.current = saveTexture;
+    auxiliaryResetRef.current = resetDraft;
+  }, [resetDraft, saveTexture]);
   const applyAuxiliaryDraft = useCallback(
     () => saveTextureRef.current(draft),
     [draft],

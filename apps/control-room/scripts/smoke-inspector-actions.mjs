@@ -19,7 +19,16 @@ const report = {
   started_at: new Date().toISOString(),
   fixture_url: fixtureUrl,
   browser_channel: browserChannel || "playwright_chromium",
-  qualification: "fixture_only_not_backend_runtime_or_science",
+  qualification: "fixture_callback_only_not_api_end_to_end_or_backend_runtime_or_science",
+  backend_api_end_to_end: false,
+  fixture_callback_coverage: "production Inspector controls call controlled synthetic fixture callbacks",
+  backend_mutation_requests: {
+    count: 0,
+    path_scope: "/api/v2 mutation requests (POST, PUT, PATCH, DELETE)",
+    qualification: "fixture callback coverage only; not API end-to-end",
+  },
+  react_commit_limit_per_apply_transaction: 32,
+  react_commit_observations: [],
   unit_tests: "not_compiled_not_run",
   steps: [],
   screenshots: [],
@@ -27,6 +36,8 @@ const report = {
 let browser;
 let page;
 let failure = null;
+const backendMutationRequests = [];
+const mutatingMethods = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 async function capture(name) {
   const path = resolve(reportDirectory, name);
@@ -44,6 +55,33 @@ async function snapshot() {
     const driver = window.__fullmagInspectorActionsFixture;
     return driver ? driver.read() : null;
   });
+}
+
+async function beginApplyTransaction(label) {
+  const baseline = await page.evaluate(() => {
+    const state = window.__fullmagInspectorActionsFixture?.read();
+    if (!state) throw new Error("Inspector fixture driver is unavailable.");
+    return state.reactCommits;
+  });
+  const observation = { label, baseline, observed: baseline, delta: 0 };
+  report.react_commit_observations.push(observation);
+  return observation;
+}
+
+async function assertApplyCommitBound(observation, label) {
+  const observed = await page.evaluate(() => {
+    const state = window.__fullmagInspectorActionsFixture?.read();
+    if (!state) throw new Error("Inspector fixture driver is unavailable.");
+    return state.reactCommits;
+  });
+  const delta = observed - observation.baseline;
+  observation.observed = observed;
+  observation.delta = delta;
+  assert.ok(delta >= 0, label + " reported a decreasing React commit count");
+  assert.ok(
+    delta < report.react_commit_limit_per_apply_transaction,
+    label + " exceeded the bounded React commit count for one Apply transaction",
+  );
 }
 
 async function setMode(mode) {
@@ -106,6 +144,8 @@ async function pinIdentity() {
     window.__inspectorActionsIdentity = {
       apply,
       field,
+      fieldDisabled: field.disabled,
+      fieldOpacity: getComputedStyle(field).opacity,
       fieldValue: field.value,
       target,
       owner: root.getAttribute("data-inspector-owner"),
@@ -125,6 +165,10 @@ async function assertPinnedIdentity(label) {
       activeField: Boolean(before && document.activeElement === before.field),
       applySame: Boolean(before && before.apply === root?.querySelector(".fm-inspector__action-btn--apply")),
       fieldSame: Boolean(before && before.field === root?.querySelector('[data-testid="inspector-actions-stable-field"]')),
+      fieldDisabled: Boolean(before?.fieldDisabled),
+      fieldDisabledSame: Boolean(before && before.field instanceof HTMLInputElement && before.field.disabled === before.fieldDisabled),
+      fieldOpacity: before?.fieldOpacity ?? null,
+      fieldOpacitySame: Boolean(before && before.field instanceof HTMLInputElement && getComputedStyle(before.field).opacity === before.fieldOpacity),
       fieldValueSame: Boolean(before && before.field instanceof HTMLInputElement && before.field.value === before.fieldValue),
       ownerSame: Boolean(before && before.owner === root?.getAttribute("data-inspector-owner")),
       rootSame: Boolean(before && before.root === root),
@@ -140,6 +184,9 @@ async function assertPinnedIdentity(label) {
   assert.equal(identity.applySame, true, label + " remounted the staged Apply control");
   assert.equal(identity.scrollTopSame, true, label + " changed the Inspector scroll position");
   assert.equal(identity.fieldSame, true, label + " replaced the unrelated Inspector field");
+  assert.equal(identity.fieldDisabled, false, label + " began with an unrelated field already disabled");
+  assert.equal(identity.fieldDisabledSame, true, label + " changed the unrelated field disabled state");
+  assert.equal(identity.fieldOpacitySame, true, label + " changed the unrelated field computed opacity");
   assert.equal(identity.activeField, true, label + " moved focus away from the unrelated Inspector field");
   assert.equal(identity.fieldValueSame, true, label + " changed the unrelated Inspector field value");
 }
@@ -147,6 +194,12 @@ async function assertPinnedIdentity(label) {
 try {
   browser = await chromium.launch({ channel: browserChannel, headless: true });
   page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (/^\/api\/v2(?:\/|$)/.test(url.pathname) && mutatingMethods.has(request.method())) {
+      backendMutationRequests.push({ method: request.method(), path: url.pathname });
+    }
+  });
   page.setDefaultTimeout(12_000);
   await page.goto(fixtureUrl, { waitUntil: "domcontentloaded" });
   await page.waitForFunction(() => Boolean(window.__fullmagInspectorActionsFixture));
@@ -207,6 +260,7 @@ try {
     const stableField = inspector.getByRole("textbox", { name: "Unchanged fixture field", exact: true });
     await stableField.evaluate((element) => element.focus({ preventScroll: true }));
     await pinIdentity();
+    const rejectedTransaction = await beginApplyTransaction("rejected-ack");
     await page.evaluate(() => {
       const button = document.querySelector(".fm-inspector__action-btn--apply");
       if (!(button instanceof HTMLButtonElement)) throw new Error("Production Apply button is unavailable.");
@@ -221,6 +275,7 @@ try {
     assert.equal((await snapshot()).applyCalls, 1);
     assert.equal((await snapshot()).pending, true);
     await assertPinnedIdentity("pending Apply");
+    await assertApplyCommitBound(rejectedTransaction, "pending Apply");
     await assertNoOpacityTransitions(inspector, "pending Apply");
     await capture("inspector-actions-object-wide-pending.png");
 
@@ -237,9 +292,11 @@ try {
     assert.equal((await snapshot()).lastApplyAck, false);
     assert.equal((await snapshot()).dirty, true);
     await assertPinnedIdentity("rejected Apply ACK");
+    await assertApplyCommitBound(rejectedTransaction, "rejected Apply ACK");
     await assertNoOpacityTransitions(inspector, "rejected Apply ACK");
     await capture("inspector-actions-object-wide-rejected-ack.png");
 
+    const acceptedTransaction = await beginApplyTransaction("accepted-ack");
     await page.evaluate(() => {
       const button = document.querySelector(".fm-inspector__action-btn--apply");
       if (!(button instanceof HTMLButtonElement)) throw new Error("Production Apply button is unavailable.");
@@ -251,6 +308,8 @@ try {
       return state?.applyCalls === 2 && state.pending;
     });
     assert.equal((await snapshot()).applyCalls, 2);
+    await assertPinnedIdentity("second pending Apply");
+    await assertApplyCommitBound(acceptedTransaction, "second pending Apply");
     await page.evaluate(() => {
       const driver = window.__fullmagInspectorActionsFixture;
       if (!driver) throw new Error("Inspector fixture driver is unavailable.");
@@ -264,6 +323,7 @@ try {
     assert.equal((await snapshot()).lastApplyAck, true);
     assert.equal((await snapshot()).dirty, false);
     await assertPinnedIdentity("accepted Apply ACK");
+    await assertApplyCommitBound(acceptedTransaction, "accepted Apply ACK");
     await capture("inspector-actions-object-wide-accepted-ack.png");
   });
 
@@ -356,6 +416,14 @@ try {
   });
 
   report.final_snapshot = await snapshot();
+  report.fixture_callback_counts = {
+    apply_calls: report.final_snapshot.applyCalls,
+    reset_calls: report.final_snapshot.resetCalls,
+    focus_calls: report.final_snapshot.focusCalls,
+  };
+  report.backend_mutation_requests.count = backendMutationRequests.length;
+  report.backend_mutation_requests.observed = backendMutationRequests;
+  assert.deepEqual(backendMutationRequests, [], "fixture unexpectedly sent a backend /api/v2 mutation request");
   report.state = "passed";
 } catch (error) {
   failure = error;
@@ -370,6 +438,8 @@ try {
   }
 } finally {
   report.finished_at = new Date().toISOString();
+  report.backend_mutation_requests.count = backendMutationRequests.length;
+  report.backend_mutation_requests.observed = backendMutationRequests;
   if (browser) await browser.close();
   await writeFile(reportPath, JSON.stringify(report, null, 2) + "\n", "utf8");
 }
@@ -377,6 +447,10 @@ try {
 console.log(JSON.stringify({
   report: reportPath,
   screenshots: report.screenshots,
+  backend_mutation_requests: report.backend_mutation_requests,
+  backend_api_end_to_end: report.backend_api_end_to_end,
+  react_commit_limit_per_apply_transaction: report.react_commit_limit_per_apply_transaction,
+  react_commit_observations: report.react_commit_observations,
   state: report.state,
 }));
 if (failure) {

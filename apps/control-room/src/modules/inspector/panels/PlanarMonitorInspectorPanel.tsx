@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import {
   MODEL_PLANAR_MONITORS_PATH,
@@ -98,7 +98,9 @@ function CommittedPlanarMonitorEditor({
       : { monitor, revision: sceneRevision };
   const [draft, setDraft] = useState<PlanarMonitorDraft>(() => planarMonitorDraftFromMonitor(monitor));
   const draftRef = useRef(draft);
-  draftRef.current = draft;
+  useLayoutEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
   const [feedback, setFeedback] = useState<string | null>(null);
   const [conflict, setConflict] = useState(false);
   const [pendingOperation, setPendingOperation] = useState<{

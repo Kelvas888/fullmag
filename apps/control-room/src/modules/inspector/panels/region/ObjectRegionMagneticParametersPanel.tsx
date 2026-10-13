@@ -1,7 +1,7 @@
 "use client";
 
 import type { ChangeEvent } from "react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { MaterialParameterFieldListResource, SceneResource } from "@/kernel/api/apiTypes";
 import {
   authoringWriteOptions,
@@ -194,7 +194,9 @@ function useObjectRegionMagneticParametersPanelView({
       ? fieldDraftState.fields
       : baseFieldDrafts;
   const fieldDraftRef = useRef(fieldDrafts);
-  fieldDraftRef.current = fieldDrafts;
+  useLayoutEffect(() => {
+    fieldDraftRef.current = fieldDrafts;
+  }, [fieldDrafts]);
   const resourceRevision = sceneData?.revision ?? model.revision ?? -1;
   const [acknowledgedFieldBaseline, setAcknowledgedFieldBaseline] = useState<{
     fields: MaterialFieldDraft[];
@@ -383,9 +385,11 @@ function useObjectRegionMagneticParametersPanelView({
   );
   const fieldDraftValid = canWriteRegion && Boolean(sessionScopeKey) && !fieldDraftErrors;
   const auxiliaryApplyRef = useRef(applyMaterialFields);
-  auxiliaryApplyRef.current = applyMaterialFields;
   const auxiliaryResetRef = useRef(resetMaterialFields);
-  auxiliaryResetRef.current = resetMaterialFields;
+  useLayoutEffect(() => {
+    auxiliaryApplyRef.current = applyMaterialFields;
+    auxiliaryResetRef.current = resetMaterialFields;
+  }, [applyMaterialFields, resetMaterialFields]);
   const applyAuxiliaryDraft = useCallback(
     () => auxiliaryApplyRef.current(fieldDrafts),
     [fieldDrafts],

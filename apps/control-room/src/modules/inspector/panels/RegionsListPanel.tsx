@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { useKernel } from "@/kernel/KernelContext";
 import {
@@ -111,7 +111,9 @@ export function RegionsListPanel({ selection }: InspectorPanelProps) {
   const [adding, setAdding] = useState(false);
   const [draft, setDraft] = useState<NewRegionDraft>(defaultNewRegionDraft);
   const draftRef = useRef(draft);
-  draftRef.current = draft;
+  useLayoutEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
   const [feedback, setFeedback] = useState<Feedback>(null);
   const [pending, setPending] = useState(false);
   const createInFlight = useRef(false);

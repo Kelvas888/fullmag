@@ -1418,8 +1418,8 @@ async function selectInspectorNode(page, inspector, nodeId, { owner, label }) {
     `No placeholder Inspector may own ${label} selection: ${identityText}`,
   );
   assert(breadcrumbs.length > 0, `${label} selection has no breadcrumb identity.`);
-  const focus = inspector.getByRole("button", { name: "Focus", exact: true });
-  assert(await focus.isVisible(), `${label} selection has no visible primary Inspector action.`);
+  const fitView = inspector.getByRole("button", { name: "Fit view", exact: true });
+  assert(await fitView.isVisible(), `${label} selection has no visible Fit view action.`);
 }
 
 async function ensureModelNodeVisible(page, nodeId) {

@@ -15,7 +15,10 @@ const mocks = vi.hoisted(() => ({
   patchObject: vi.fn(),
   readScene: vi.fn(),
   recordHistory: vi.fn(),
-  sceneData: { objects: [{ id: "object-a" }], revision: 10 },
+  sceneData: {
+    objects: [] as Array<{ id: string; absorbing_boundary?: unknown }>,
+    revision: 10,
+  },
 }));
 
 vi.mock("@/kernel/KernelContext", async (importOriginal) => {

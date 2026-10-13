@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { useKernel } from "@/kernel/KernelContext";
 import {
@@ -246,9 +246,11 @@ function useObjectRegionsPanelView({ selection }: InspectorPanelProps) {
     ? auxiliaryDraftState.session
     : null;
   const auxiliaryDraftSessionRef = useRef(auxiliaryDraftSession);
-  auxiliaryDraftSessionRef.current = auxiliaryDraftSession;
   const auxiliaryDraftOwnerKeyRef = useRef(auxiliaryDraftOwnerKey);
-  auxiliaryDraftOwnerKeyRef.current = auxiliaryDraftOwnerKey;
+  useLayoutEffect(() => {
+    auxiliaryDraftSessionRef.current = auxiliaryDraftSession;
+    auxiliaryDraftOwnerKeyRef.current = auxiliaryDraftOwnerKey;
+  }, [auxiliaryDraftOwnerKey, auxiliaryDraftSession]);
   const reportAuxiliaryDraftSession = useCallback(
     (ownerKey: string, session: RegionAuxiliaryDraftSession | null) => {
       setAuxiliaryDraftState((current) => {

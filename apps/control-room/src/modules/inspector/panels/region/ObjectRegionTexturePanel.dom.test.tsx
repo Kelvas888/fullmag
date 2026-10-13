@@ -138,7 +138,7 @@ vi.mock("../ObjectMagneticTexturePanel", () => ({
 }));
 
 import { ObjectRegionTexturePanel } from "./ObjectRegionTexturePanel";
-import type { RegionSubPanelProps } from "./shared";
+import type { RegionAuxiliaryDraftSession, RegionSubPanelProps } from "./shared";
 
 describe("ObjectRegionTexturePanel session fence", () => {
   beforeEach(() => {
@@ -187,14 +187,13 @@ describe("ObjectRegionTexturePanel session fence", () => {
   });
 
   it("applies the reported click-time texture draft and keeps edits made while the parent waits", async () => {
-    let reportedSession: {
-      dirty: boolean;
-      apply: () => Promise<boolean>;
-    } | null = null;
+    const reportedSession: { current: RegionAuxiliaryDraftSession | null } = {
+      current: null,
+    };
     const reportAuxiliaryDraftSession: NonNullable<
       RegionSubPanelProps["reportAuxiliaryDraftSession"]
     > = (_ownerKey, session) => {
-      if (session) reportedSession = session;
+      if (session) reportedSession.current = session;
     };
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
@@ -210,13 +209,13 @@ describe("ObjectRegionTexturePanel session fence", () => {
         />,
       ));
       await act(async () => findButton(container, "Set click-time texture").click());
-      const clickTimeSession = reportedSession;
+      const clickTimeSession = reportedSession.current;
       expect(clickTimeSession?.dirty).toBe(true);
 
       await act(async () =>
         findButton(container, "Edit texture after Apply starts").click(),
       );
-      expect(reportedSession).not.toBe(clickTimeSession);
+      expect(reportedSession.current).not.toBe(clickTimeSession);
 
       await act(async () => {
         expect(await clickTimeSession?.apply()).toBe(true);
@@ -230,7 +229,7 @@ describe("ObjectRegionTexturePanel session fence", () => {
         },
         { baseRevision: 10, sessionScopeKey: sessionAScopeKey },
       );
-      expect(reportedSession?.dirty).toBe(true);
+      expect(reportedSession.current?.dirty).toBe(true);
     } finally {
       await act(async () => root.unmount());
       dom.restore();

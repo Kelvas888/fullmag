@@ -239,6 +239,17 @@ jobs:
       - name: Install Chromium for Inspector browser fixture
         run: pnpm --dir apps/control-room exec playwright install --with-deps chromium
 
+      - name: Resolve absolute Inspector fixture artifact root
+        id: inspector-artifacts
+        shell: bash
+        run: |
+          artifact_root="$(realpath -m -- "$GITHUB_WORKSPACE/../storage/builds")"
+          if [[ "$artifact_root" != /* || "$artifact_root" == *"/../"* || "$artifact_root" == */.. ]]; then
+            echo "Artifact root is not an absolute normalized path: $artifact_root" >&2
+            exit 1
+          fi
+          echo "build_root=$artifact_root" >> "$GITHUB_OUTPUT"
+
       - name: Run production Inspector actions browser fixture
         run: python3 scripts/verify_pinned_dataset_browser.py --repo-root "$GITHUB_WORKSPACE" --port 3257 --scenario inspector-actions
 
@@ -248,10 +259,10 @@ jobs:
         with:
           name: inspector-actions-browser-fixture
           path: |
-            ../storage/builds/**/inspector-actions-browser/*/receipt.json
-            ../storage/builds/**/inspector-actions-browser/*/next.log
-            ../storage/builds/**/inspector-actions-browser/*/browser.log
-            ../storage/builds/**/inspector-actions-browser/*/browser/**
+            ${{ steps.inspector-artifacts.outputs.build_root }}/**/inspector-actions-browser/*/receipt.json
+            ${{ steps.inspector-artifacts.outputs.build_root }}/**/inspector-actions-browser/*/next.log
+            ${{ steps.inspector-artifacts.outputs.build_root }}/**/inspector-actions-browser/*/browser.log
+            ${{ steps.inspector-artifacts.outputs.build_root }}/**/inspector-actions-browser/*/browser/**
           if-no-files-found: error
 
   fdm-relaxation-qualification:

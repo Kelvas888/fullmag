@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { SCENE_RESOURCE_KEY, useSceneResource } from "@/kernel/resources/geometryLifecycleResources";
 import {
@@ -64,7 +64,9 @@ export function ObjectAbsorbingBoundaryPanel({
   });
   const draft = draftState.key === baseKey ? draftState.draft : effectiveBaseDraft;
   const draftRef = useRef(draft);
-  draftRef.current = draft;
+  useLayoutEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
   const [pending, setPending] = useState(false);
   const applyInFlight = useRef(false);
   const [feedback, setFeedback] = useState<Feedback>(null);

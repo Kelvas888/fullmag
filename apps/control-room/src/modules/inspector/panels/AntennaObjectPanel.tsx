@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { MODEL_READINESS_PATH, MODEL_SCENE_PATH } from "@/kernel/api/apiPaths";
 import type { JsonObject, RegionalFieldDriveResource } from "@/kernel/api/apiTypes";
@@ -84,7 +84,9 @@ export function AntennaObjectPanel({ selection }: InspectorPanelProps) {
   const applyInFlight = useRef(false);
   const draft = draftState.key === draftKey ? draftState.draft : baselineDraft;
   const draftRef = useRef(draft);
-  draftRef.current = draft;
+  useLayoutEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
   const dirty = JSON.stringify(draft) !== JSON.stringify(baselineDraft);
   const validation = model.mode === "canonical"
     ? buildAntennaCanonicalFieldDrive(selection, scene.data, draft)

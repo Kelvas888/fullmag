@@ -14,6 +14,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import time
 import urllib.request
 import uuid
@@ -84,6 +85,32 @@ def port_is_open(port: int):
     with socket.socket() as probe:
         probe.settimeout(1)
         return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def print_fixture_log_tails(run_root: Path):
+    max_bytes = 12_000
+    max_lines = 80
+    for name in ("browser.log", "next.log"):
+        path = run_root / name
+        print(f"--- fixture-owned {name} tail (at most {max_bytes} bytes) ---",
+              file=sys.stderr, flush=True)
+        try:
+            if not path.is_file():
+                print("(log not created)", file=sys.stderr, flush=True)
+                continue
+            with path.open("rb") as log:
+                log.seek(0, os.SEEK_END)
+                size = log.tell()
+                log.seek(max(0, size - max_bytes), os.SEEK_SET)
+                tail = log.read(max_bytes).decode("utf-8", errors="replace")
+            if size > max_bytes:
+                print("[earlier log bytes omitted]", file=sys.stderr)
+            lines = tail.splitlines()[-max_lines:]
+            print("\n".join(lines) if lines else "(empty log)",
+                  file=sys.stderr, flush=True)
+        except OSError as error:
+            print(f"(cannot read fixture-owned log: {error})",
+                  file=sys.stderr, flush=True)
 
 
 def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
@@ -269,6 +296,11 @@ def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
                 receipt["browser_artifacts"] = artifacts
             receipt["finished_at"] = timestamp()
             storage.atomic_json(receipt_path, receipt)
+        if scenario == "inspector-actions" and receipt["state"] != "passed":
+            for key in ("error", "cleanup_error"):
+                if receipt.get(key):
+                    print(f"{key}: {str(receipt[key])[:2000]}", file=sys.stderr, flush=True)
+            print_fixture_log_tails(run_root)
         print(json.dumps({"receipt": str(receipt_path), "state": receipt["state"]}))
         return receipt["exit_code"]
 

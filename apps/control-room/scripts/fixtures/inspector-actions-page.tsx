@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Profiler, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { EMPTY_SELECTION, type Selection } from "@/kernel/selection/selectionTypes";
 import {
@@ -28,6 +28,7 @@ interface Snapshot {
   lastResetMode: Mode;
   mode: Mode;
   pending: boolean;
+  reactCommits: number;
   resetCalls: number;
   target: Target;
   valid: boolean;
@@ -130,7 +131,12 @@ export default function InspectorActionsPage() {
   const [focusCalls, setFocusCalls] = useState(0);
   const [lastApplyAck, setLastApplyAck] = useState<boolean | null>(null);
   const [lastResetMode, setLastResetMode] = useState<Mode>(null);
+  const reactCommitCount = useRef(0);
   const pendingResolve = useRef<((accepted: boolean) => void) | null>(null);
+
+  const recordReactCommit = useCallback(() => {
+    reactCommitCount.current += 1;
+  }, []);
 
   const selection = useMemo<Selection>(
     () => ({
@@ -156,6 +162,7 @@ export default function InspectorActionsPage() {
       lastResetMode,
       mode,
       pending: pendingResolve.current !== null,
+      reactCommits: reactCommitCount.current,
       resetCalls,
       target,
       valid,
@@ -246,19 +253,21 @@ export default function InspectorActionsPage() {
           {mode ?? "noSession"}
         </span>
       </aside>
-      <InspectorEditSessionProvider>
-        <InspectorActionsPanel
-          applying={applying}
-          dirty={dirty}
-          mode={mode}
-          onApply={apply}
-          onBreadcrumb={selectBreadcrumb}
-          onFocus={focus}
-          onReset={reset}
-          selection={selection}
-          valid={valid}
-        />
-      </InspectorEditSessionProvider>
+      <Profiler id="inspector-actions-production-panel" onRender={recordReactCommit}>
+        <InspectorEditSessionProvider>
+          <InspectorActionsPanel
+            applying={applying}
+            dirty={dirty}
+            mode={mode}
+            onApply={apply}
+            onBreadcrumb={selectBreadcrumb}
+            onFocus={focus}
+            onReset={reset}
+            selection={selection}
+            valid={valid}
+          />
+        </InspectorEditSessionProvider>
+      </Profiler>
       <output
         aria-label="Fixture action state"
         data-testid="inspector-actions-state"

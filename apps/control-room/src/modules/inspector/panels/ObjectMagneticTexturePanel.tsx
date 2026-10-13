@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import {
   acknowledgedAuthoringSceneRevision,
@@ -818,7 +818,9 @@ export function ObjectMagneticTexturePanel({
     }),
   );
   const draftStateRef = useRef(draftState);
-  draftStateRef.current = draftState;
+  useLayoutEffect(() => {
+    draftStateRef.current = draftState;
+  }, [draftState]);
   const [feedback, setFeedback] = useState<MagneticTextureFeedback>(null);
   const [pending, setPending] = useState(false);
   const { draft } = resolveInspectorDraftState({
