@@ -1806,7 +1806,6 @@ function checkAnalysisPlotsStableResourceInputs() {
     "AnalysisPlotsView",
     "{...controller}",
     "onDatasetRefChange={controller.setSelectedDatasetRef}",
-    "onSurfaceChange={controller.setActiveSurface}",
   ]);
   requireTokens(controllerSource, "analysis plots stable resource inputs", [
     "useAnalysisDatasetData",

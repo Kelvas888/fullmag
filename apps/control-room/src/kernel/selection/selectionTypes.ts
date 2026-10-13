@@ -296,6 +296,13 @@ export type SelectionRef =
       type: "observation-frame";
     }
   | {
+      kind: "results.pinned_visualizations.root";
+      moduleId: string;
+      nodeId: string;
+      runId: string;
+      type: "analysis-pinned-group";
+    }
+  | {
       constraintId: string;
       kind: "object.frozen-spins";
       nodeId: string;
@@ -699,6 +706,8 @@ export type SelectionRef =
       analysisRunId?: string;
       analysisStageId?: string;
       artifactRevision?: number | string;
+      datasetId?: string;
+      datasetRevision?: string;
       availability?: ResourceAvailability;
       contractGap?: string | null;
       equilibriumId?: string;
@@ -902,6 +911,14 @@ export function selectionRefEquals(
         left.runtimeEpoch === right.runtimeEpoch &&
         left.stageId === right.stageId &&
         left.stateDigest === right.stateDigest
+      );
+    case "analysis-pinned-group":
+      return (
+        right.type === "analysis-pinned-group" &&
+        left.kind === right.kind &&
+        left.moduleId === right.moduleId &&
+        left.nodeId === right.nodeId &&
+        left.runId === right.runId
       );
     case "analysis-result":
       return (
@@ -1357,6 +1374,8 @@ export function selectionRefEquals(
         nullableStringEquals(left.contractGap, right.contractGap) &&
         nullableStringEquals(left.analysisRunId, right.analysisRunId) &&
         nullableStringEquals(left.analysisStageId, right.analysisStageId) &&
+        nullableStringEquals(left.datasetId, right.datasetId) &&
+        nullableStringEquals(left.datasetRevision, right.datasetRevision) &&
         nullableStringEquals(left.artifactPath, right.artifactPath) &&
         nullableStringEquals(left.branchId, right.branchId) &&
         nullableStringEquals(left.calculationMode, right.calculationMode) &&

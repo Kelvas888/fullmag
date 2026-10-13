@@ -1248,6 +1248,7 @@ dependencies = [
  "fullmag-engine",
  "fullmag-ir",
  "fullmag-plan",
+ "fullmag-quantities",
  "fullmag-runner",
  "fullmag-runtime-control",
  "fullmag-session",
@@ -1324,6 +1325,7 @@ name = "fullmag-ir"
 version = "0.1.0"
 dependencies = [
  "fullmag-quantities",
+ "num-bigint",
  "rayon",
  "serde",
  "serde_json",
@@ -1384,6 +1386,7 @@ dependencies = [
  "fullmag-ir",
  "fullmag-plan",
  "fullmag-quantities",
+ "fullmag-session",
  "hdf5",
  "libc",
  "nalgebra",
@@ -1454,6 +1457,7 @@ name = "fullmag-workspace-inspect"
 version = "0.1.0"
 dependencies = [
  "fullmag-application",
+ "fullmag-session",
  "fullmag-workspace",
  "serde",
  "serde_json",

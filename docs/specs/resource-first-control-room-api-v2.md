@@ -844,7 +844,16 @@ Current object-authoring routes:
 region endpoint references the deleted object, so the committed scene cannot
 retain dangling coupling endpoints. The response includes `transaction_kind`,
 `scene_revision`, and `committed_scene`. Direct object and region mutation
-routes also return the committed scene. Material mutation returns the committed
+routes also return the committed scene.
+
+Pole `committed_scene` jest typowanym `SceneResource`, identycznym z projekcją
+`GET model/scene` dla tej samej rewizji; `scene_revision` musi odpowiadać
+`committed_scene.revision`. Nie zastępuje prywatnego `SceneDocument` w storage.
+Klient może opublikować ten zasób przez centralnego właściciela cache przed
+unieważnieniem zależności, pod warunkiem związania z sesją, klientem i rewizją.
+Starszy ACK nie może zastąpić nowszego zasobu ani przerwać jego odczytu.
+Odczyt sceny przed mutacją potrzebny do historii pozostaje wymagany.
+Material mutation returns the committed
 material asset and must invalidate `model/scene` because material changes can
 synchronize interaction state such as interfacial DMI. There is currently no
 `GET /v2/sessions/current/model/objects/{object_id}` read route; browser
@@ -1561,3 +1570,70 @@ uszkodzony CAS albo niepoprawny scalar 500.
 Status implementacji: backend source i rejestracja OpenAPI. Managed export,
 generated transport, facade/hook i UI pozostają NOT VERIFIED; nie edytujemy
 ręcznie wygenerowanego kontraktu przed odbiorem buildu.
+
+
+## Proponowane rozszerzenie FMVP v5: pelna tozsamosc pola
+
+Status: implementacja w toku, runtime/browser NOT VERIFIED. Decyzja i dokladny
+layout: [ADR0053](../adr/0053-fmvp-full-field-identity.md). FMVPv5/FMMIv4
+zachowuje48-bajtowy header oraztopology/indexing/scope;88-bajtowa stala czesc
+metadata rozszerza FMMIv3 o dlugosc pelnego UTF-8quantityID podoffsetem80.
+Pelne ID pochodzi z binarnego payloadu;prefix16bajtow zheadera jest sprawdzany
+bajtowo, nie nadpisywany HTTP. Reader v2/v3/v4 pozostaje zgodny.
+
+Brak topologii dla headless artifact reads jest jawny: LegacyCountOnly,
+puste indices, revision0/hashzero, decoder null topologyidentity. Taki payload
+nie spelnia wymagania full_domain dla overlay. Sourcequalification pozostaje
+odrebna: calkowicie nieobecna albo kompletna jak w v4; nigdy fikcyjne live.
+
+Rollout producer/codec/overlay jest jednym etapem; standardowe modalne i
+response field IDs musza przejsc API orazbrowserproof bezskracania nazw.
+
+
+### R2: wybor magnetyzacji razem z fizycznym zrodlem
+
+Dla `m` bieżąca kwalifikowana magnetyzacja live ma pierwszenstwo nad
+Latest/Preview tylko wtedy, gdy jej rzeczywisty payload source step jest
+scisle nowszy. Rowne lub nowsze cached source zachowuje pierwszenstwo.
+Regula nie zmienia pozostalych quantities ani provenance/domain guards.
+Wartosci, meta/catalog freshness, observation frame, bundle i command
+readiness musza odnosic sie do tego samego wybranego zrodla. Nie laczymy
+wartosci kroku 8 z frame kroku 7. Quantity/resource revision i source
+request revision pozostaja odrebnymi znaczeniami; brak scientific identity
+nie moze byc uzupelniony resource counterem.
+
+Bare magnetization poprzedniego physical step nie jest kopiowana do nowego
+kroku bez payloadu. Przed zmiana state/mesh mozna zachowac ja w istniejacym
+cache Latest, przez canonical binder i accepted-source registry, z oryginalnym
+step/time/frame oraz historyczna projekcja revision/timestamp. Snapshotujemy
+wylacznie wybrane qualified live values; istniejący wybrany cache pozostaje.
+Nowy progress nie staje sie scientific observation. Nie dodajemy publicznego
+schematu ani drugiego store. Zachowanie dotyczy atomowego runtime candidate;
+przy zmianie run/session epoch nie przenosimy bare payloadu do nowej pracy.
+Stary bufor moze byc current field wylacznie przy zgodnej frame epoch, domain
+generation i topology revision. Sama liczba wezlow/komorek nie wystarcza.
+
+Materializer pending/error dotyczacy scisle starszego source step nie moze
+degradowac wybranej nowszej kwalifikowanej fizycznej magnetyzacji, także zachowanej
+w Latest/Preview. Brak accepted frame nie pozwala pominąć statusu. Status dotyczacy tego samego
+lub nowszego zrodla zachowuje dotychczasowe ograniczenia. Exact scope,
+generation i carrier guards nadal obowiazuja. Bundle jest tworzone tylko
+gdy wybrana frame odpowiada przyjetej physical scalar row i carrierowi;
+w przeciwnym razie pozostaje unavailable.
+
+Wymagana regresja obejmuje vector/meta/catalog/frame/bundle/readiness,
+Latest i Preview precedence, rowne/nowsze cached step, brak live payloadu,
+progress/nonfinite/bad cardinality, same-cardinality mesh change oraz status
+pending/error starszego i tego samego kroku. Source code nie jest dowodem
+wykonania; testy wykonujemy tylko w GHA.
+
+
+Doprecyzowanie R2 po review: w tej samej session/run i niezmienionej
+siatce zachowujemy także wybraną magnetyzację live przed nadejściem
+ściśle starszego fizycznego payloadu. Runtime frame nie zmienia run;
+nie przenosimy tej reguły na reset epoch lub zmianę ownership.
+Registered m frame jest sprawdzana również w actual binderach, zanim
+nowy current step mógłby ponownie certyfikować stare dane. Stary m preview
+nie jest kopiowany przez zmianę domain/topology. Dowód bundle wymaga
+obowiązkowego nonnull carrier/frame/physical-row match w positive fixture;
+warunkowe sprawdzenie tylko gdy bundle istnieje jest niewystarczające.

@@ -19,6 +19,8 @@ import {
 } from "./fullmagChartTokens";
 import type { ChartScientificTrust } from "./chartScientificTrust";
 
+const MAX_TOTAL_INTERACTIVE_LINE_POINTS = 5_000;
+
 export type ChartRenderStatus =
   | "loading"
   | "ready"
@@ -31,6 +33,7 @@ export type ChartRenderStatus =
 
 export interface ChartRenderPoint {
   branchId?: string | null;
+  breakBefore?: boolean;
   itemId?: string | null;
   rowIndex: number;
   sampleId?: string | null;
@@ -60,6 +63,8 @@ export interface ChartRenderSeries {
   kind: "line" | "scatter";
   label: string;
   points: readonly ChartRenderPoint[];
+  /** Whether points may be used as semantic selection targets; defaults to true. */
+  selectable?: boolean;
   unit: string;
   yAxis: number;
 }
@@ -122,7 +127,10 @@ export interface ChartRendererInstance {
   off?(name: ChartRendererEventName, listener: (event: unknown) => void): void;
   on?(name: ChartRendererEventName, listener: (event: unknown) => void): void;
   resize(): void;
-  setOption(option: EChartsOption, notMerge?: boolean): void;
+  setOption(
+    option: EChartsOption,
+    options?: boolean | { notMerge?: boolean; replaceMerge?: string | string[] },
+  ): void;
 }
 
 export interface ChartRendererEngine {
@@ -191,7 +199,10 @@ export function createChartRendererOwner(
     },
     update(model, tokens) {
       if (!disposed && chart)
-        chart.setOption(chartRenderModelToEChartsOption(model, tokens), false);
+        chart.setOption(chartRenderModelToEChartsOption(model, tokens), {
+          notMerge: false,
+          replaceMerge: ["series"],
+        });
     },
   };
 }
@@ -282,6 +293,15 @@ export function chartRenderModelToEChartsOption(
   // Compute Y-axis count from series
   const yAxisCount = chartYAxisCount(model.series);
   const yAxes = model.yAxes.length > 0 ? model.yAxes : [{ label: "", unit: "" }];
+  const selectableLinePointCount = model.series.reduce(
+    (count, series) =>
+      count + (series.kind === "line" && series.selectable !== false
+        ? series.points.length
+        : 0),
+    0,
+  );
+  const linePointTargetsWithinBudget =
+    selectableLinePointCount <= MAX_TOTAL_INTERACTIVE_LINE_POINTS;
 
   // Auto-scale axes
   const xScale = computeXScale(model);
@@ -327,27 +347,49 @@ export function chartRenderModelToEChartsOption(
 
     series: model.series.map((series, visibleIndex) => {
       const color = chartSeriesColor(series, visibleIndex, palette);
+      const linePointHitTargets =
+        series.kind === "line" &&
+        series.selectable !== false &&
+        linePointTargetsWithinBudget;
       return {
         // NOTE: No `sampling` property — data is already server-decimated.
         connectNulls: false,
-        data: series.points.map((point) => [point.x, point.y, point.rowIndex]),
+        data: series.points.flatMap((point) => [
+          ...(series.kind === "line" && point.breakBefore
+            ? [[point.x, null, null]]
+            : []),
+          [point.x, point.y, point.rowIndex],
+        ]),
         emphasis: {
+          itemStyle: linePointHitTargets && color ? { color } : undefined,
           lineStyle: { color, width: 3 },
           scale: false,
         },
-        itemStyle: color ? { color } : undefined,
+        // `showSymbol: false` removes LineView's per-datum event targets. Keep
+        // bounded lines point-selectable with transparent (but hit-testable)
+        // fills; opacity zero is culled by ZRender and cannot receive clicks.
+        itemStyle: linePointHitTargets
+          ? { color: "transparent" }
+          : color
+            ? { color }
+            : undefined,
         lineStyle: { color, width: 1.5 },
+        id: series.id,
         name: seriesDisplayName(series, yScales),
         progressive: 0,
-        showSymbol: series.kind === "scatter",
-        symbol: series.kind === "scatter" ? "circle" : "none",
-        symbolSize: 4,
+        // Selectable line points share one chart-wide 5,000-point budget.
+        // Transparent circles provide dataIndex click targets without visible markers.
+        silent: series.selectable === false,
+        showSymbol: series.kind === "scatter" || linePointHitTargets,
+        symbol: "circle",
+        symbolSize: series.kind === "line" ? 2 : 4,
         type: series.kind,
         yAxisIndex: series.yAxis,
       };
     }),
 
     tooltip: {
+      className: "fm-chart-tooltip",
       backgroundColor: bgSurface,
       borderColor: borderStrong,
       borderWidth: 1,

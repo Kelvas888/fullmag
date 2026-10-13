@@ -52,7 +52,13 @@ pub(crate) fn build_quantities(
     let dynamic_available =
         |quantity_id: &str| dynamic_supported.iter().any(|id| id == quantity_id);
     let scalar_available = |run_value: Option<f64>| {
-        !scalar_rows.is_empty() || live_state.is_some() || run_value.is_some()
+        scalar_rows
+            .iter()
+            .any(ScalarRow::is_physical_observation)
+            || live_state.is_some_and(|state| {
+                state.latest_step.is_physical_observation()
+            })
+            || run_value.is_some()
     };
 
     quantity_specs()
@@ -280,7 +286,9 @@ pub(crate) fn extract_fem_mesh_from_metadata(metadata: &Value) -> Option<FemMesh
 #[cfg(test)]
 mod tests {
     use super::{build_quantities, run_manifest_scalar_value, scalar_metric_is_active};
-    use crate::types::{CachedPreviewFields, LatestFields, LiveState, RunManifest, StepUpdateView};
+    use crate::types::{
+        CachedPreviewFields, LatestFields, LiveState, RunManifest, ScalarRow, StepUpdateView,
+    };
     use fullmag_ir::{
         BackendPlanIR, BackendTarget, CommonPlanMeta, ExchangeBoundaryCondition, ExecutionMode,
         ExecutionPlanIR, ExecutionPrecision, FdmLayerPlanIR, FdmMaterialIR, FdmMultilayerPlanIR,
@@ -288,12 +296,141 @@ mod tests {
         OutputPlanIR, ProvenancePlanIR,
     };
 
+    fn modal_latest_live_state() -> LiveState {
+        serde_json::from_value(serde_json::json!({
+            "status": "running",
+            "updated_at_unix_ms": 1,
+            "latest_step": {
+                "kind": "solver_progress",
+                "solver_progress": {
+                    "kind": "fem_eigen",
+                    "metrics": { "progress_fraction": 0.5 }
+                },
+                "step": 2,
+                "time": 0.0,
+                "dt": 1.0e-12,
+                "e_ex": 1.0,
+                "e_demag": 2.0,
+                "e_ext": 3.0,
+                "e_total": 6.0,
+                "max_dm_dt": 0.0,
+                "max_h_eff": 0.0,
+                "wall_time_ns": 2,
+                "grid": [1, 1, 1],
+                "per_object_scalars": {},
+                "finished": false
+            }
+        }))
+        .expect("valid modal live-state fixture")
+    }
+
+    fn scalar_row(step: u64, modal_progress: bool) -> ScalarRow {
+        serde_json::from_value(serde_json::json!({
+            "kind": if modal_progress { "legacy_unclassified" } else { "physical_observation" },
+            "step": step,
+            "time": 0.0,
+            "solver_dt": 1.0e-12,
+            "mx": 1.0,
+            "my": 0.0,
+            "mz": 0.0,
+            "e_ex": 1.0,
+            "e_demag": 2.0,
+            "e_ext": 3.0,
+            "e_total": 6.0,
+            "max_dm_dt": 0.0,
+            "max_h_eff": 0.0,
+            "max_h_demag": 0.0,
+            "per_object_scalars": if modal_progress {
+                serde_json::json!({
+                    "fem_eigen_progress": { "progress_fraction": 0.5 }
+                })
+            } else {
+                serde_json::json!({})
+            }
+        }))
+        .expect("valid scalar-row fixture")
+    }
+
+    fn total_energy_available(
+        live_state: Option<&LiveState>,
+        run: Option<&RunManifest>,
+        scalar_rows: &[ScalarRow],
+    ) -> bool {
+        let plan = completed_run_plan(BackendPlanIR::Fdm(FdmPlanIR::default()));
+        let metadata = serde_json::json!({ "execution_plan": plan });
+        build_quantities(
+            &LatestFields::default(),
+            &CachedPreviewFields::default(),
+            live_state,
+            run,
+            Some(&metadata),
+            scalar_rows,
+            "cell",
+        )
+        .into_iter()
+        .find(|quantity| quantity.id == "E_total")
+        .expect("missing total-energy descriptor")
+        .available
+    }
+
+    #[test]
+    fn total_energy_remains_available_from_physical_history_when_modal_step_is_latest() {
+        let live_state = modal_latest_live_state();
+        let scalar_rows = [scalar_row(1, false), scalar_row(2, true)];
+
+        assert!(total_energy_available(
+            Some(&live_state),
+            None,
+            &scalar_rows
+        ));
+    }
+
+    #[test]
+    fn modal_only_progress_does_not_make_physical_scalar_available() {
+        let live_state = modal_latest_live_state();
+        let scalar_rows = [scalar_row(2, true)];
+
+        assert!(!total_energy_available(
+            Some(&live_state),
+            None,
+            &scalar_rows
+        ));
+    }
+
+    #[test]
+    fn physical_quantity_with_legal_progress_named_object_remains_available() {
+        let mut row = scalar_row(1, false);
+        row.per_object_scalars.insert(
+            "fem_eigen_progress".into(),
+            std::collections::HashMap::from([("measured_value".into(), 1.0)]),
+        );
+
+        assert!(row.is_physical_observation());
+        assert!(total_energy_available(None, None, &[row]));
+    }
+
+    #[test]
+    fn run_manifest_scalar_remains_available_during_latest_modal_step() {
+        let live_state = modal_latest_live_state();
+        let mut run = completed_run_manifest();
+        run.final_e_total = Some(6.0);
+        let plan = completed_run_plan(BackendPlanIR::Fdm(FdmPlanIR::default()));
+
+        assert_eq!(
+            run_manifest_scalar_value(Some(&run), "e_total", Some(&plan)),
+            Some(6.0)
+        );
+        assert!(total_energy_available(Some(&live_state), Some(&run), &[]));
+    }
+
     #[test]
     fn magnetization_is_marked_available_from_live_step_magnetization() {
         let live_state = LiveState {
             status: "running".to_string(),
             updated_at_unix_ms: 1,
             latest_step: StepUpdateView {
+                kind: fullmag_quantities::StepDataKind::PhysicalObservation,
+                solver_progress: None,
                 step: 1,
                 time: 0.0,
                 dt: 1.0e-12,

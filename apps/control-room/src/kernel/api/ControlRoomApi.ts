@@ -166,6 +166,9 @@ import {
   MODEL_OBJECT_REGIONS_PATH,
   MODEL_OBJECTS_PATH,
   MODEL_PHYSICS_GRAPH_PATH,
+  ANALYSIS_POSTPROCESSING_DEFINITION_PATH,
+  ANALYSIS_ANALYTIC_REFERENCE_MODELS_PATH,
+  ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH,
   MODEL_PLANAR_MONITOR_DUPLICATE_PATH,
   MODEL_PLANAR_MONITOR_PATH,
   MODEL_PLANAR_MONITORS_PATH,
@@ -346,6 +349,12 @@ import type {
   PlanarFieldProbeResource,
   PlanarFieldQuery,
   PlanarFieldSource,
+  AnalyticReferenceModelCollectionResource,
+  PostprocessingDefinitionCollectionResource,
+  PostprocessingDefinitionCreateRequest,
+  PostprocessingDefinitionDeleteRequest,
+  PostprocessingDefinitionPatchRequest,
+  PostprocessingDefinitionResource,
   PlanarMonitorCollectionResource,
   PlanarMonitorCreateRequest,
   PlanarMonitorDeleteRequest,
@@ -583,6 +592,7 @@ export function parseFieldVectorResponseMetadata(
   return {
     component: headers.get("x-fullmag-component"),
     domainGenerationId: headers.get("x-fullmag-domain-generation-id"),
+    artifactGenerationId: headers.get("x-fullmag-artifact-generation-id"),
     encoding: headers.get("x-fullmag-encoding"),
     fieldIndexing: headers.get("x-fullmag-field-indexing"),
     fieldGenerationId: headers.get("x-fullmag-field-generation-id"),
@@ -621,7 +631,11 @@ export function collectFieldVectorIdentityIssues(
   compare("pointCount", metadata.pointCount, payload.pointCount);
   compare("valueCount", metadata.valueCount, payload.valueCount);
   compare("nComp", metadata.nComp, payload.nComp);
-  if (payload.formatVersion === 3 || payload.formatVersion === 4) {
+  if (
+    payload.formatVersion === 3 ||
+    payload.formatVersion === 4 ||
+    payload.formatVersion === 5
+  ) {
     compare("scopeKind", metadata.scopeKind, payload.scopeKind ?? null);
     compare("scopeId", metadata.scopeId, payload.scopeId ?? null);
     const payloadMeshTopologyHash = payload.meshTopologyHash ?? null;
@@ -648,7 +662,7 @@ export function collectFieldVectorIdentityIssues(
       payload.domainGenerationId ?? null,
     );
   }
-  if (payload.formatVersion === 4) {
+  if (payload.formatVersion === 4 || payload.formatVersion === 5) {
     compare("sourceKind", metadata.sourceKind ?? null, payload.sourceKind ?? null);
     compare("sourceId", metadata.sourceId ?? null, payload.sourceId ?? null);
     compare(
@@ -1307,6 +1321,58 @@ export class ControlRoomApi {
   };
 
   readonly analysis = {
+    /** Analytic reference models with their declared assumptions (spec 32 §9). */
+    references: {
+      analyticModels: (options?: RequestOptions) =>
+        this.requestJson<AnalyticReferenceModelCollectionResource>(
+          ANALYSIS_ANALYTIC_REFERENCE_MODELS_PATH,
+          options,
+        ),
+    },
+    /** User-created Results nodes saved with the project (ADR 0054, spec 32 §8). */
+    postprocessing: {
+      definitions: {
+        list: (options?: RequestOptions) =>
+          this.requestJson<PostprocessingDefinitionCollectionResource>(
+            ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH,
+            options,
+          ),
+        get: (definitionId: string, options?: RequestOptions) =>
+          this.requestJson<PostprocessingDefinitionResource>(
+            ANALYSIS_POSTPROCESSING_DEFINITION_PATH,
+            options,
+            { path: { definition_id: definitionId } },
+          ),
+        create: (request: PostprocessingDefinitionCreateRequest, options?: RequestOptions) =>
+          this.postJson<PostprocessingDefinitionResource, PostprocessingDefinitionCreateRequest>(
+            ANALYSIS_POSTPROCESSING_DEFINITIONS_PATH,
+            request,
+            options,
+          ),
+        patch: (
+          definitionId: string,
+          request: PostprocessingDefinitionPatchRequest,
+          options?: RequestOptions,
+        ) =>
+          this.patchJson<PostprocessingDefinitionResource, PostprocessingDefinitionPatchRequest>(
+            ANALYSIS_POSTPROCESSING_DEFINITION_PATH,
+            request,
+            options,
+            { path: { definition_id: definitionId } },
+          ),
+        remove: (
+          definitionId: string,
+          request: PostprocessingDefinitionDeleteRequest,
+          options?: RequestOptions,
+        ) =>
+          this.deleteJsonWithBody<
+            PostprocessingDefinitionCollectionResource,
+            PostprocessingDefinitionDeleteRequest
+          >(ANALYSIS_POSTPROCESSING_DEFINITION_PATH, request, options, {
+            path: { definition_id: definitionId },
+          }),
+      },
+    },
     spinWave: {
       gamma: (options?: RequestOptions) =>
         this.requestJson<SpinWaveGammaResource>(
@@ -4671,6 +4737,19 @@ export class ControlRoomApi {
       query,
       (response, data) => {
         const metadata = parseFieldVectorResponseMetadata(response.headers);
+        const expectedArtifactGenerationId = query[
+          "expected_artifact_generation_id"
+        ];
+        if (
+          typeof expectedArtifactGenerationId === "string" &&
+          expectedArtifactGenerationId.trim().length > 0 &&
+          metadata.artifactGenerationId !== expectedArtifactGenerationId
+        ) {
+          throw new ControlRoomApiError(
+            "Field vector artifact generation did not match the requested generation.",
+            409,
+          );
+        }
         return {
           ...metadata,
           identityIssues: collectFieldVectorIdentityIssues(data, metadata),

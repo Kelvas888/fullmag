@@ -1253,29 +1253,39 @@ mod tests {
         assert_eq!(
             rows,
             vec![EigenDispersionRow {
+                sample_id: None,
+                mode_id: None,
                 mode_index: 0,
                 kx: 0.0,
                 ky: 1.0,
                 kz: 2.0,
                 frequency_hz: 3.0,
                 angular_frequency_rad_per_s: 4.0,
+                mode_field_available: None,
+                mode_field_id: None,
+                mode_field_resource_key: None,
             }]
         );
     }
 
     #[test]
     fn parse_eigen_dispersion_csv_decodes_canonical_v2_rows() {
-        let csv = "sample_index,path_s_rad_per_m,kx_rad_per_m,ky_rad_per_m,kz_rad_per_m,label,raw_mode_index,branch_id,frequency_hz,omega_rad_s,line_width_hz,residual_norm,overlap_score\n3,1.0,1.0,2.0,3.0,X,7,4,1500000000.0,9424777960.77,0.0,1e-9,0.99\n";
+        let csv = "sample_index,sample_id,path_s_rad_per_m,kx_rad_per_m,ky_rad_per_m,kz_rad_per_m,label,raw_mode_index,mode_id,branch_id,frequency_hz,omega_rad_s,line_width_hz,residual_norm,overlap_score,tracking_score_source,mode_field_available,mode_field_id,mode_field_resource_key\n3,k-path-sample-0003,1.0,1.0,2.0,3.0,X,7,sample-0003/mode-0007,4,1500000000.0,9424777960.77,0.0,1e-9,0.99,seed,false,stable-field,field-resource\n";
         let rows = parse_eigen_dispersion_csv(csv).expect("csv should parse");
         assert_eq!(
             rows,
             vec![EigenDispersionRow {
+                sample_id: Some("k-path-sample-0003".to_string()),
+                mode_id: Some("sample-0003/mode-0007".to_string()),
                 mode_index: 7,
                 kx: 1.0,
                 ky: 2.0,
                 kz: 3.0,
                 frequency_hz: 1.5e9,
                 angular_frequency_rad_per_s: 9424777960.77,
+                mode_field_available: Some(false),
+                mode_field_id: Some("stable-field".to_string()),
+                mode_field_resource_key: Some("field-resource".to_string()),
             }]
         );
     }
@@ -1367,6 +1377,85 @@ mod tests {
         );
         assert!(overrides["planar_monitors"][0].get("quantity").is_none());
         assert!(overrides["planar_monitors"][0].get("resolution").is_none());
+    }
+
+    #[test]
+    fn scene_pbc_overrides_roundtrip_via_python_helper() {
+        let root = repo_root();
+        let workspace = tempfile::tempdir().expect("create PBC round-trip workspace");
+        let source_path = workspace.path().join("periodic_source.py");
+        let source = r#"import fullmag as fm
+
+study = fm.study("periodic_roundtrip")
+study.engine("fdm")
+film = study.geometry(fm.Box(80e-9, 60e-9, 20e-9), name="film")
+film.Ms = 800e3
+film.Aex = 13e-12
+film.alpha = 0.01
+study.pbc(x=True, y=True, demag="truncated_images", images=(2, 3, 0))
+"#;
+        std::fs::write(&source_path, source).expect("write periodic source");
+        let original = load_scene_document_state(&root, workspace.path(), &source_path)
+            .expect("export periodic source through Python");
+        let original_policy = original
+            .study
+            .pbc
+            .clone()
+            .flatten()
+            .expect("fixture exports explicit periodic policy");
+        assert_eq!(original_policy.image_counts, Some([2, 3, 0]));
+        let changed_policy = fullmag_ir::FdmPeriodicityIR {
+            axes: [
+                fullmag_ir::AxisBoundary::Periodic,
+                fullmag_ir::AxisBoundary::Open,
+                fullmag_ir::AxisBoundary::Periodic,
+            ],
+            demag: fullmag_ir::FdmDemagPeriodicityIR::TruncatedImages,
+            image_counts: Some([5, 0, 7]),
+        };
+
+        for case in ["missing", "null", "value"] {
+            let mut encoded = serde_json::to_value(&original).expect("serialize original scene");
+            let study = encoded["study"].as_object_mut().expect("scene study is an object");
+            let expected = match case {
+                "missing" => {
+                    study.remove("pbc");
+                    Some(original_policy.clone())
+                }
+                "null" => {
+                    study.insert("pbc".to_string(), Value::Null);
+                    None
+                }
+                "value" => {
+                    study.insert(
+                        "pbc".to_string(),
+                        serde_json::to_value(&changed_policy).expect("serialize changed policy"),
+                    );
+                    Some(changed_policy.clone())
+                }
+                _ => unreachable!(),
+            };
+            let scene: SceneDocument = serde_json::from_value(encoded).expect("decode scene case");
+            let overrides = scene_document_overrides(&scene).expect("project Rust overrides");
+            assert_eq!(overrides.get("pbc").is_none(), case == "missing");
+            let export_copy = workspace.path().join(format!("export_{case}.py"));
+            rewrite_script_via_python_helper(
+                &root,
+                workspace.path(),
+                &source_path,
+                Some(&overrides),
+                Some(&export_copy),
+            )
+            .expect("rewrite managed copy through Python with Rust overrides");
+            let restored = load_scene_document_state(&root, workspace.path(), &export_copy)
+                .expect("export rewritten copy through Python");
+            assert_eq!(restored.study.pbc, Some(expected), "PBC case {case}");
+            assert_eq!(
+                std::fs::read(&source_path).expect("read original source"),
+                source.as_bytes(),
+                "source remains unchanged for PBC case {case}",
+            );
+        }
     }
 
     #[test]

@@ -1808,6 +1808,7 @@ mod tests {
             study: SceneStudyState::default(),
             outputs: SceneOutputsState::default(),
             editor: SceneEditorState::default(),
+            analysis: Default::default(),
         }
     }
 

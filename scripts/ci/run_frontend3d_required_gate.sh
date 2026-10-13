@@ -26,6 +26,7 @@ run_gate() {
       cargo test -p fullmag-quantities --no-fail-fast
       cargo test -p fullmag-plan --test magnetization_textures_v2_parity --test mumax3_texture_compatibility --no-fail-fast
       cargo test -p fullmag-runner quantities --no-fail-fast
+      cargo test -p fullmag-api --bin fullmag-api quantities::tests --no-fail-fast
       # Keep cross-layer rDMI regressions in the standard source/unit gate;
       # these do not claim managed FEM or CUDA physics qualification.
       cargo test -p fullmag-plan -p fullmag-engine -p fullmag-runner -p fullmag-api -p fullmag-authoring rotated --no-fail-fast
@@ -83,12 +84,15 @@ run_gate() {
     browser-fixture-proof-manifest)
       node apps/control-room/scripts/write-browser-fixture-proof-manifest.mjs
       ;;
-    browser-fixture-smoke)
+    browser-fixture-pre-proof)
       run_gate browser-fixture-proof-identity
       run_gate browser-fixture-source-snapshot
       pnpm --dir apps/control-room run audit:viewport-3d-memory-churn
       pnpm --dir apps/control-room run audit:viewport-3d-fem-topology-uploads
       run_gate browser-fixture-source-verify
+      ;;
+    browser-fixture-smoke)
+      run_gate browser-fixture-pre-proof
       run_gate browser-fixture-proof-manifest
       run_gate browser-fixture-source-verify-post-write
       ;;

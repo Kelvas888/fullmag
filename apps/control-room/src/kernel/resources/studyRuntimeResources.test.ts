@@ -42,7 +42,10 @@ import {
   DATA_TABLE_ROWS_PATH,
   DATA_TABLES_PATH,
 } from "../api/apiPaths";
-import type { LiveStatusResource } from "../api/apiTypes";
+import type {
+  LiveStatusResource,
+  StageExecutionResource,
+} from "../api/apiTypes";
 import { ControlRoomApiError } from "../api/ControlRoomApi";
 import { activeLaneCapabilityFixture } from "./activeLaneCapabilityFixture.testSupport";
 
@@ -67,6 +70,9 @@ import {
   shouldLoadRuntimeMeshSummary,
   shouldLoadRuntimeScalars,
   shouldLoadRuntimeStageExecution,
+  selectStageExecutionSessionIdentity,
+  stageExecutionMatchesSessionIdentity,
+  stageExecutionSessionIdentityEquals,
   studyRuntimeCommandSessionStatusEquals,
 } from "./studyRuntimeResources";
 
@@ -213,10 +219,7 @@ function statusWith({
   run?: LiveStatusResource["run"];
   sessionEpoch?: string;
   sessionId?: string;
-} = {}): Pick<
-  LiveStatusResource,
-  "capabilities" | "domain" | "resources" | "run" | "session"
-> {
+} = {}): LiveStatusResource {
   const activeLane = activeLaneCapabilityFixture();
   activeLane.authored = { ...activeLane.authored, discretization };
   activeLane.requested = { ...activeLane.requested, discretization };
@@ -225,6 +228,31 @@ function statusWith({
     discretization,
   };
   return {
+    api_contract_version: "2.0.0",
+    runtime_bundle_version: "test-fixture",
+    display: {
+      active_quantity_id: "magnetization",
+      auto_contrast: true,
+      colormap: "viridis",
+      field_component: "magnitude",
+      max_points: 1000,
+      slice_layer: 0,
+      slice_mode: "xy",
+      vector_density: 1,
+      vector_glyphs: false,
+      view_mode: "2d",
+      x_chosen_size: 1,
+      y_chosen_size: 1,
+    },
+    energies: {},
+    lifecycle: {
+      commandability: "allowed",
+      connectivity: "connected",
+      session_resource: "active",
+      solver: "idle",
+    },
+    metrics: { total_steps: 0, uptime_seconds: 0 },
+    solver: { state: "idle" },
     capabilities: {
       active_lane: activeLane,
       algorithms_available: [],
@@ -756,6 +784,85 @@ describe("study runtime command resource bundles", () => {
     ).toBe(true);
   });
 
+  it("revises identical frequency-domain bytes when artifact ownership changes", () => {
+    const base = {
+      schema_version: "frequency_domain_text_artifact.v1", status: "ready",
+      artifact_path: "eigen/dispersion.csv", resource_key: ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
+      content_type: "text/csv; charset=utf-8", text: "sample_index,frequency_hz\n0,1e9\n",
+      missing_reason: null, session_id: "session-a", run_id: "run-a", stage_id: "stage-a",
+      mesh_generation_id: "mesh-a", artifact_set_id: "set-a", revision: "same-revision", content_digest: "same-digest",
+    };
+    const textRevision = frequencyDomainTextArtifactRevision(base);
+    const jsonRevision = frequencyDomainJsonArtifactRevision(base);
+    for (const key of ["session_id", "run_id", "stage_id", "mesh_generation_id", "artifact_set_id"] as const) {
+      expect(frequencyDomainTextArtifactRevision({ ...base, [key]: "other" })).not.toBe(textRevision);
+      expect(frequencyDomainJsonArtifactRevision({ ...base, [key]: "other" })).not.toBe(jsonRevision);
+    }
+    expect(frequencyDomainTextArtifactRevision({ ...base, revision: "new-revision" })).not.toBe(textRevision);
+    expect(frequencyDomainTextArtifactRevision({ ...base, content_digest: "new-digest" })).not.toBe(textRevision);
+    expect(frequencyDomainTextArtifactRevision({ ...base, session_id: "a|b", run_id: "c" })).not.toBe(
+      frequencyDomainTextArtifactRevision({ ...base, session_id: "a", run_id: "b|c" }),
+    );
+    expect(frequencyDomainJsonArtifactRevision({ ...base, session_id: "a:b", run_id: "c" })).not.toBe(
+      frequencyDomainJsonArtifactRevision({ ...base, session_id: "a", run_id: "b:c" }),
+    );
+  });
+
+  it("revises frequency-domain artifacts when generation membership changes and distinguishes legacy omission", () => {
+    const base = {
+      schema_version: "frequency_domain_text_artifact.v1",
+      status: "ready",
+      artifact_path: "eigen/dispersion.csv",
+      resource_key: ANALYSIS_FREQUENCY_DOMAIN_EIGEN_DISPERSION_PATH,
+      content_type: "text/csv; charset=utf-8",
+      text: "sample_index,frequency_hz\n0,1e9\n",
+      missing_reason: null,
+      session_id: "session-a",
+      run_id: "run-a",
+      stage_id: "stage-a",
+      mesh_generation_id: "mesh-a",
+      artifact_set_id: "same-artifact-folder",
+      revision: "same-revision",
+      content_digest: "same-payload-hash",
+    };
+    const generationA = {
+      ...base,
+      generation_id: "generation-a",
+      generation_status: "member_verified_owner_bound" as const,
+    };
+    const generationB = { ...generationA, generation_id: "generation-b" };
+
+    expect(frequencyDomainTextArtifactRevision(generationB)).not.toBe(
+      frequencyDomainTextArtifactRevision(generationA),
+    );
+    expect(frequencyDomainJsonArtifactRevision(generationB)).not.toBe(
+      frequencyDomainJsonArtifactRevision(generationA),
+    );
+    expect(
+      frequencyDomainTextArtifactRevision({
+        ...generationA,
+        generation_status: "member_verified_unbound",
+      }),
+    ).not.toBe(frequencyDomainTextArtifactRevision(generationA));
+
+    const missingGenerationStatus = {
+      ...base,
+      generation_id: undefined,
+      generation_status: undefined,
+    };
+    const explicitlyLegacy = {
+      ...base,
+      generation_id: undefined,
+      generation_status: "legacy_unverified" as const,
+    };
+    expect(frequencyDomainTextArtifactRevision(missingGenerationStatus)).not.toBe(
+      frequencyDomainTextArtifactRevision(explicitlyLegacy),
+    );
+    expect(frequencyDomainJsonArtifactRevision(missingGenerationStatus)).not.toBe(
+      frequencyDomainJsonArtifactRevision(explicitlyLegacy),
+    );
+  });
+
   it("changes frequency-domain text artifact revision when dispersion CSV contents change", () => {
     const baseArtifact = {
       artifact_path: "eigen/dispersion.csv",
@@ -1242,6 +1349,126 @@ describe("study runtime command resource bundles", () => {
 
     expect(hookSource).not.toContain(frequencyDomainFamilyPath);
   });
+
+  it("retains identity from stale status data and accepts an explicit no-run identity", () => {
+    const statusData = statusWith({
+      run: null,
+      sessionEpoch: "epoch-current",
+      sessionId: "session-current",
+    });
+    const identity = selectStageExecutionSessionIdentity({
+      data: statusData,
+      status: "ready",
+    });
+
+    expect(identity).toEqual({
+      runId: null,
+      sessionEpoch: "epoch-current",
+      sessionId: "session-current",
+    });
+    expect(
+      selectStageExecutionSessionIdentity({
+        data: statusData,
+        status: "stale",
+      }),
+    ).toEqual(identity);
+    expect(
+      selectStageExecutionSessionIdentity({
+        data: statusData,
+        status: "error",
+      }),
+    ).toEqual(identity);
+    expect(
+      selectStageExecutionSessionIdentity({
+        data: null,
+        status: "error",
+      }),
+    ).toBeNull();
+    expect(
+      selectStageExecutionSessionIdentity({
+        data: statusData,
+        status: "loading",
+      }),
+    ).toBeNull();
+    expect(
+      selectStageExecutionSessionIdentity({
+        data: statusWith({ sessionId: "  " }),
+        status: "ready",
+      }),
+    ).toBeNull();
+
+    const activeRun = {
+      run_id: "run-current",
+    } as NonNullable<LiveStatusResource["run"]>;
+    expect(
+      selectStageExecutionSessionIdentity({
+        data: statusWith({ run: activeRun }),
+        status: "ready",
+      })?.runId,
+    ).toBe("run-current");
+  });
+
+  it(
+    "matches stage execution only to the exact session, epoch, and run tuple",
+    () => {
+      const identity = {
+        runId: "run-current",
+        sessionEpoch: "epoch-current",
+        sessionId: "session-current",
+      };
+      const execution: StageExecutionResource = {
+        active_stage_index: null,
+        active_stage_kind: null,
+        completed_stage_indexes: [],
+        revision: 4,
+        run_id: "run-current",
+        runtime_state: "running",
+        session_epoch: "epoch-current",
+        session_id: "session-current",
+        stage_statuses: [],
+        stages: [],
+        total_stages: 0,
+      };
+
+      expect(stageExecutionMatchesSessionIdentity(execution, identity)).toBe(
+        true,
+      );
+      expect(
+        stageExecutionMatchesSessionIdentity(
+          { ...execution, session_id: "session-old" },
+          identity,
+        ),
+      ).toBe(false);
+      expect(
+        stageExecutionMatchesSessionIdentity(
+          { ...execution, session_epoch: "epoch-old" },
+          identity,
+        ),
+      ).toBe(false);
+      expect(
+        stageExecutionMatchesSessionIdentity(
+          { ...execution, run_id: "run-old" },
+          identity,
+        ),
+      ).toBe(false);
+      const noRunIdentity = { ...identity, runId: null };
+      expect(
+        stageExecutionMatchesSessionIdentity(
+          { ...execution, run_id: null },
+          noRunIdentity,
+        ),
+      ).toBe(true);
+      expect(
+        stageExecutionMatchesSessionIdentity(execution, noRunIdentity),
+      ).toBe(false);
+      expect(
+        stageExecutionSessionIdentityEquals(identity, {
+          ...identity,
+          sessionEpoch: "epoch-old",
+        }),
+      ).toBe(false);
+    },
+  );
 
   it("does not load stage execution for idle command controls", () => {
     expect(

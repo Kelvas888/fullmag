@@ -297,6 +297,7 @@ describe("field vector response metadata", () => {
   it("parses every documented response header and reports invalid numbers", () => {
     const headers = new Headers({
       "x-fullmag-component": "full",
+      "x-fullmag-artifact-generation-id": "artifact-generation-8",
       "x-fullmag-domain-generation-id": "12",
       "x-fullmag-encoding": "FMVP;version=3",
       "x-fullmag-field-indexing": "explicit_node_indices",
@@ -313,6 +314,7 @@ describe("field vector response metadata", () => {
     });
     expect(parseFieldVectorResponseMetadata(headers)).toMatchObject({
       component: "full",
+      artifactGenerationId: "artifact-generation-8",
       domainGenerationId: "12",
       encoding: "FMVP;version=3",
       fieldIndexing: "explicit_node_indices",
@@ -328,6 +330,7 @@ describe("field vector response metadata", () => {
       valueCount: null,
     });
     expect(parseFieldVectorResponseMetadata(new Headers())).toMatchObject({
+      artifactGenerationId: null,
       pointCount: null,
       quantityId: null,
     });
@@ -336,6 +339,7 @@ describe("field vector response metadata", () => {
   it("returns null independently for every absent response header", () => {
     const mappings = [
       ["x-fullmag-component", "component"],
+      ["x-fullmag-artifact-generation-id", "artifactGenerationId"],
       ["x-fullmag-domain-generation-id", "domainGenerationId"],
       ["x-fullmag-encoding", "encoding"],
       ["x-fullmag-field-indexing", "fieldIndexing"],
@@ -2521,6 +2525,51 @@ describe("ControlRoomApi", () => {
     expect(observedUrl).toBe(
       "http://127.0.0.1:8765/v2/sessions/current/data/fields/m/samples/vector?component=full&scope_id=permalloy_layer&scope_kind=object",
     );
+  });
+
+  it("sends the artifact generation precondition and rejects missing or mismatched response headers", async () => {
+    let observedUrl = "";
+    const api = new ControlRoomApi({
+      baseUrl: "http://127.0.0.1:8765",
+      fetchImpl: async (url) => {
+        observedUrl = String(url);
+        return binaryResponse(makeFieldVectorBuffer(), {
+          headers: {
+            ...contractHeaders,
+            "x-fullmag-artifact-generation-id": "publication-14",
+          },
+        });
+      },
+    });
+
+    const result = await api.data.fields.vector("m", {
+      expected_artifact_generation_id: "publication-14",
+    });
+    expect(observedUrl).toContain("expected_artifact_generation_id=publication-14");
+    expect(result).toMatchObject({
+      responseMetadata: { artifactGenerationId: "publication-14" },
+      status: "ready",
+    });
+
+    for (const responseGenerationId of [null, "publication-stale"]) {
+      const headers: Record<string, string> = { ...contractHeaders };
+      if (responseGenerationId !== null) {
+        headers["x-fullmag-artifact-generation-id"] = responseGenerationId;
+      }
+      const rejectingApi = new ControlRoomApi({
+        baseUrl: "http://127.0.0.1:8765",
+        fetchImpl: async () =>
+          binaryResponse(makeFieldVectorBuffer(), { headers }),
+      });
+      await expect(
+        rejectingApi.data.fields.vector("m", {
+          expected_artifact_generation_id: "publication-14",
+        }),
+      ).rejects.toMatchObject({
+        message: "Field vector artifact generation did not match the requested generation.",
+        status: 409,
+      });
+    }
   });
 
   it.each([

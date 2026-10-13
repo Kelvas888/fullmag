@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { init } from "echarts";
 import { describe, expect, it, vi } from "vitest";
 import { chartRenderModelToEChartsOption, createChartRendererOwner, type ChartRendererEngine, type ChartRenderModel } from "./chartRenderer";
 import { DEFAULT_CHART_TOKENS } from "./fullmagChartTokens";
@@ -34,19 +35,74 @@ describe("chart renderer owner", () => {
     expect(chart.dispose).toHaveBeenCalledTimes(1);
   });
 
+  it("removes unpinned reference series in real ECharts while retaining the zoom", () => {
+    const chart = init(null, undefined, {
+      height: 320,
+      renderer: "svg",
+      ssr: true,
+      width: 640,
+    });
+    const owner = createChartRendererOwner({ init: () => chart });
+    const seriesIds = () => {
+      const option = chart.getOption() as { series: { id: string }[] };
+      return option.series.filter(Boolean).map((series) => series.id);
+    };
+    try {
+      owner.mount({} as HTMLElement);
+      owner.update({
+        ...model,
+        series: [
+          ...model.series,
+          { ...model.series[0]!, id: "reference", label: "Reference", selectable: false },
+          { ...model.series[0]!, id: "mz", label: "mz" },
+        ],
+      });
+      expect(seriesIds()).toEqual(["mx", "reference", "mz"]);
+      chart.dispatchAction({ type: "dataZoom", start: 20, end: 80 });
+
+      owner.update({
+        ...model,
+        series: [...model.series, { ...model.series[0]!, id: "mz", label: "mz" }],
+      });
+      expect(seriesIds()).toEqual(["mx", "mz"]);
+      const zoom = chart.getOption().dataZoom as { start: number; end: number }[];
+      expect(zoom[0]).toMatchObject({ start: 20, end: 80 });
+
+      owner.update({ ...model, series: [], status: "empty" });
+      expect(seriesIds()).toEqual([]);
+    } finally {
+      owner.dispose();
+    }
+  });
+
+  it("keeps reference scatter markers visible without interaction targets", () => {
+    const option = chartRenderModelToEChartsOption({
+      ...model,
+      series: [
+        { ...model.series[0]!, kind: "scatter", id: "computed" },
+        { ...model.series[0]!, kind: "scatter", id: "reference", selectable: false },
+      ],
+    });
+    expect(option.series).toEqual([
+      expect.objectContaining({ id: "computed", silent: false, showSymbol: true, symbolSize: 4 }),
+      expect.objectContaining({ id: "reference", silent: true, showSymbol: true, symbolSize: 4 }),
+    ]);
+  });
+
   it("encodes stable semantic row identity in renderer data", () => {
     const chart = { dispose: vi.fn(), getDataURL: vi.fn(), resize: vi.fn(), setOption: vi.fn() };
     const owner = createChartRendererOwner({ init: () => chart });
     owner.mount({} as HTMLElement);
     owner.update(model);
     expect(chart.setOption).toHaveBeenCalledWith(expect.objectContaining({
-      series: [expect.objectContaining({ data: [[1, 0.25, 7]] })],
-    }), false);
+      series: [expect.objectContaining({ id: "mx", data: [[1, 0.25, 7]] })],
+    }), { notMerge: false, replaceMerge: ["series"] });
   });
 
   it("keeps dimensionless axes unscaled, enables ECharts aria and removes the bottom slider", () => {
     const option = chartRenderModelToEChartsOption(model);
     expect(option.aria).toMatchObject({ enabled: true });
+    expect(option.tooltip).toMatchObject({ className: "fm-chart-tooltip" });
     expect(option.dataZoom).toEqual([{ filterMode: "none", type: "inside", zoomOnMouseWheel: "ctrl" }]);
     expect(option.xAxis).toMatchObject({ name: "time [s]" });
     expect(option.yAxis).toEqual(expect.arrayContaining([expect.objectContaining({ name: "magnetization" })]));
@@ -71,21 +127,103 @@ describe("chart renderer owner", () => {
     expect(option.yAxis).toEqual(expect.arrayContaining([expect.objectContaining({ name: "Period [ns]" })]));
   });
 
-  it("keeps explicit invalid points as visual gaps instead of connecting branches", () => {
+  it("renders explicit branch gaps as null sentinels instead of connecting points", () => {
     const option = chartRenderModelToEChartsOption({
       ...model,
       series: [{
         ...model.series[0]!,
         points: [
           { rowIndex: 0, x: 1, y: 0.25 },
-          { rowIndex: 1, x: Number.NaN, y: Number.NaN },
-          { rowIndex: 2, x: 3, y: 0.5 },
+          { breakBefore: true, rowIndex: 2, x: 3, y: 0.5 },
         ],
       }],
     });
 
     expect(option.series).toEqual([
-      expect.objectContaining({ connectNulls: false }),
+      expect.objectContaining({
+        connectNulls: false,
+        data: [[1, 0.25, 0], [3, null, null], [3, 0.5, 2]],
+        emphasis: expect.objectContaining({
+          itemStyle: { color: expect.any(String) },
+        }),
+        itemStyle: { color: "transparent" },
+        showSymbol: true,
+        symbol: "circle",
+        symbolSize: 2,
+        type: "line",
+      }),
+    ]);
+  });
+
+  it("limits selectable line symbols to a chart-wide budget of 5,000 points", () => {
+    const lineSeries = (
+      id: string,
+      pointCount: number,
+      selectable = true,
+    ) => ({
+      ...model.series[0]!,
+      id,
+      label: id,
+      selectable,
+      points: Array.from({ length: pointCount }, (_, rowIndex) => ({
+        rowIndex,
+        x: rowIndex,
+        y: rowIndex / 10,
+      })),
+    });
+    const boundedOption = chartRenderModelToEChartsOption({
+      ...model,
+      series: [lineSeries("branch-a", 2_500), lineSeries("branch-b", 2_500)],
+    });
+    expect(boundedOption.series).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        data: expect.arrayContaining([[2_499, 249.9, 2_499]]),
+        id: "branch-a",
+        itemStyle: { color: "transparent" },
+        showSymbol: true,
+        symbolSize: 2,
+      }),
+      expect.objectContaining({
+        data: expect.arrayContaining([[2_499, 249.9, 2_499]]),
+        id: "branch-b",
+        itemStyle: { color: "transparent" },
+        showSymbol: true,
+        symbolSize: 2,
+      }),
+    ]));
+
+    const overBudgetOption = chartRenderModelToEChartsOption({
+      ...model,
+      series: [lineSeries("branch-a", 2_500), lineSeries("branch-b", 2_501)],
+    });
+    expect(overBudgetOption.series).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "branch-a", showSymbol: false, type: "line" }),
+      expect.objectContaining({ id: "branch-b", showSymbol: false, type: "line" }),
+    ]));
+
+    const computedAndReference = chartRenderModelToEChartsOption({
+      ...model,
+      series: [lineSeries("computed", 2_500), lineSeries("reference", 4_000, false)],
+    });
+    expect(computedAndReference.series).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "computed", showSymbol: true }),
+      expect.objectContaining({ id: "reference", showSymbol: false }),
+    ]));
+  });
+
+  it("renders requested scatter series with symbols and without a connecting line", () => {
+    const option = chartRenderModelToEChartsOption({
+      ...model,
+      series: [{ ...model.series[0]!, kind: "scatter", selectable: false }],
+    });
+
+    expect(option.series).toEqual([
+      expect.objectContaining({
+        data: [[1, 0.25, 7]],
+        showSymbol: true,
+        symbol: "circle",
+        type: "scatter",
+      }),
     ]);
   });
 
@@ -103,7 +241,10 @@ describe("chart renderer owner", () => {
 
     expect(option.series).toEqual([
       expect.objectContaining({
-        itemStyle: { color: "green" },
+        emphasis: expect.objectContaining({
+          itemStyle: { color: "green" },
+        }),
+        itemStyle: { color: "transparent" },
         lineStyle: { color: "green", width: 1.5 },
       }),
     ]);

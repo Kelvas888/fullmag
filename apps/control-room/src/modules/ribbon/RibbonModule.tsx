@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState, useSyncExternalStore } from "react";
+import { useCallback, useMemo, useState, useSyncExternalStore } from "react";
 
 import type { LiveStatusResource } from "@/kernel/api/apiTypes";
 import {
@@ -49,7 +49,10 @@ import {
   useSessionStatusSelector,
 } from "@/kernel/resources/useSessionStatus";
 import { useSelectionSelector } from "@/kernel/selection/useSelection";
-import { EMPTY_SELECTION } from "@/kernel/selection/selectionTypes";
+import { EMPTY_SELECTION, type Selection } from "@/kernel/selection/selectionTypes";
+import { useAnalysisFieldOverlay } from "@/kernel/visualization/AnalysisFieldOverlayController";
+import { analysisModuleIdForNodeKind } from "@/kernel/analysis-modules/analysisSurfaceRouting";
+import { ANALYSIS_FEATURE_MANIFESTS } from "@/kernel/analysis-modules/analysisModuleManifests";
 import {
   EMPTY_OBJECT_VISUALIZATION_SNAPSHOT,
   useObjectVisualizationController,
@@ -70,6 +73,7 @@ import {
 } from "@/shared/ui/Dialog";
 
 import {
+  buildAnalysisContextTabContent,
   buildRibbonTabContent,
   resolveRibbonVisualizationTarget,
 } from "./ribbonContributions";
@@ -83,7 +87,12 @@ import {
 } from "./ribbonResourcePolicy";
 import { RibbonGroupsRow } from "./RibbonGroupsRow";
 import { RibbonTabStrip } from "./RibbonTabStrip";
-import { RIBBON_TABS } from "./ribbonTypes";
+import {
+  ANALYSIS_CONTEXT_TAB_ID,
+  RIBBON_TABS,
+  type RibbonStripTabDef,
+  type RibbonStripTabId,
+} from "./ribbonTypes";
 
 type RibbonRuntimeStatus = {
   capabilities: Pick<
@@ -169,6 +178,12 @@ export default function RibbonModule({ kernel }: ModuleProps) {
   const [pendingGlobalQuantity, setPendingGlobalQuantity] =
     useState<ApplyGlobalQuantityInput | null>(null);
   const activeTab = useLayoutSelector((layout) => layout.activeModuleTab);
+  const activeViewportMainModuleId = useLayoutSelector(
+    (layout) => layout.activeViewportMainModuleId,
+  );
+  const viewportCompanion = useLayoutSelector(
+    (layout) => layout.viewportCompanion ?? null,
+  );
   const { setActiveTab } = useLayoutActions();
   const selection = useSelectionSelector((currentSelection) =>
     activeTab === "view" || activeTab === "geometry" || activeTab === "mesh"
@@ -368,11 +383,76 @@ export default function RibbonModule({ kernel }: ModuleProps) {
     ],
   );
 
+  const activeOverlay = useAnalysisFieldOverlay(kernel.analysisFieldOverlay);
+  const activeAnalysisFieldId = activeOverlay?.fieldId ?? null;
+  const activeAnalysisFieldLabel = activeOverlay?.label ?? null;
+  const activeAnalysisField = useMemo(
+    () =>
+      activeAnalysisFieldId
+        ? { fieldId: activeAnalysisFieldId, label: activeAnalysisFieldLabel ?? activeAnalysisFieldId }
+        : null,
+    [activeAnalysisFieldId, activeAnalysisFieldLabel],
+  );
+
+  // Contextual tab of the analysis module that owns the selected Results node
+  // (ADR 0054). It is shown, and active, whenever such a node is selected;
+  // choosing another tab dismisses it until a different module's node is selected.
+  // Read independently of `selection`, which is only populated on the View and
+  // Geometry tabs; the contextual tab must follow every Results selection.
+  const contextModuleId = useSelectionSelector(contextualAnalysisModuleIdForSelection);
+  const contextModuleTitle = contextModuleId
+    ? ANALYSIS_FEATURE_MANIFESTS.find((manifest) => manifest.id === contextModuleId)?.title ?? null
+    : null;
+  const [contextualTabDismissal, setContextualTabDismissal] =
+    useState<ContextualTabDismissalState>(() => ({
+      contextModuleId,
+      dismissed: false,
+    }));
+  if (contextualTabDismissal.contextModuleId !== contextModuleId) {
+    setContextualTabDismissal((state) =>
+      contextualTabDismissalForModuleChange(state, contextModuleId)
+    );
+  }
+  const contextTabActive = contextualRibbonTabIsActive(
+    contextualTabDismissal,
+    contextModuleId,
+    Boolean(contextModuleTitle),
+  );
+  const stripActiveTab: RibbonStripTabId = contextTabActive ? ANALYSIS_CONTEXT_TAB_ID : activeTab;
+  const stripTabs = useMemo<readonly RibbonStripTabDef[]>(() => {
+    if (!contextModuleTitle) return RIBBON_TABS;
+    const resultsIndex = RIBBON_TABS.findIndex((tab) => tab.id === "results");
+    return [
+      ...RIBBON_TABS.slice(0, resultsIndex + 1),
+      { contextual: true, id: ANALYSIS_CONTEXT_TAB_ID, label: contextModuleTitle },
+      ...RIBBON_TABS.slice(resultsIndex + 1),
+    ];
+  }, [contextModuleTitle]);
+  const handleTabClick = useCallback(
+    (tabId: RibbonStripTabId) => {
+      if (tabId === ANALYSIS_CONTEXT_TAB_ID) {
+        setContextualTabDismissal({ contextModuleId, dismissed: false });
+        return;
+      }
+      setContextualTabDismissal({
+        contextModuleId,
+        dismissed: contextModuleId !== null,
+      });
+      setActiveTab(tabId);
+    },
+    [contextModuleId, setActiveTab],
+  );
+
   const tabContent = useMemo(
     () => {
       void commandVersion;
       void objectMoveToolState;
-      return buildRibbonTabContent(activeTab, {
+      // Active command state reads the live layout from commandContext.
+      // These narrow subscriptions invalidate this memo when the composition changes.
+      void activeViewportMainModuleId;
+      void viewportCompanion;
+      const buildContext = {
+        activeAnalysisField,
         api: kernel.api,
         commandContext,
         commands: kernel.commands,
@@ -391,10 +471,16 @@ export default function RibbonModule({ kernel }: ModuleProps) {
         visualization,
         visualizationSnapshot,
         visualizationState: visualizationState.data,
-      });
+      };
+      return contextTabActive
+        ? buildAnalysisContextTabContent(buildContext)
+        : buildRibbonTabContent(activeTab, buildContext);
     },
     [
+      activeAnalysisField,
+      activeViewportMainModuleId,
       activeTab,
+      contextTabActive,
       commandContext,
       commandVersion,
       objectMoveToolState,
@@ -415,6 +501,7 @@ export default function RibbonModule({ kernel }: ModuleProps) {
       visualization,
       visualizationSnapshot,
       visualizationState.data,
+      viewportCompanion,
     ],
   );
   const groups = tabContent?.groups ?? [];
@@ -448,13 +535,13 @@ export default function RibbonModule({ kernel }: ModuleProps) {
     <WorkspaceRenderProfiler id="RibbonModule">
       <div className="fm-ribbon">
       <RibbonTabStrip
-        activeTabId={activeTab}
-        tabs={RIBBON_TABS}
-        onTabClick={setActiveTab}
+        activeTabId={stripActiveTab}
+        tabs={stripTabs}
+        onTabClick={handleTabClick}
       />
       <RibbonGroupsRow
         groups={groups}
-        activeTabId={activeTab}
+        activeTabId={stripActiveTab}
         onAction={handleAction}
         onCommandDetail={setSelectedCommandId}
       />
@@ -508,7 +595,43 @@ export default function RibbonModule({ kernel }: ModuleProps) {
 export const __ribbonModuleTestUtils = {
   ribbonRuntimeStatusEquals,
   selectRibbonRuntimeStatus,
+  contextualAnalysisModuleIdForSelection,
+  contextualRibbonTabIsActive,
+  contextualTabDismissalForModuleChange,
 };
+
+interface ContextualTabDismissalState {
+  contextModuleId: string | null;
+  dismissed: boolean;
+}
+
+function contextualAnalysisModuleIdForSelection(
+  selection: Pick<Selection, "kind" | "ref">,
+): string | null {
+  const ref = selection.ref;
+  if (ref?.type === "analysis-pinned-group") {
+    return ANALYSIS_FEATURE_MANIFESTS.find((manifest) => manifest.id === ref.moduleId)?.id ?? null;
+  }
+  return analysisModuleIdForNodeKind(selection.kind ?? "");
+}
+
+function contextualTabDismissalForModuleChange(
+  state: ContextualTabDismissalState,
+  contextModuleId: string | null,
+): ContextualTabDismissalState {
+  return state.contextModuleId === contextModuleId
+    ? state
+    : { contextModuleId, dismissed: false };
+}
+
+function contextualRibbonTabIsActive(
+  state: ContextualTabDismissalState,
+  contextModuleId: string | null,
+  hasContextModuleTitle: boolean,
+): boolean {
+  return hasContextModuleTitle &&
+    (state.contextModuleId !== contextModuleId || !state.dismissed);
+}
 
 function isGlobalQuantityConfirmationInput(
   input: unknown,

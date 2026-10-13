@@ -1200,7 +1200,7 @@ pub(crate) fn validate_antenna_composition(problem: &ProblemIRV04, errors: &mut 
 
     let pipeline_stage_ids =
         crate::validation::declared_pipeline_stage_ids(&problem.problem_meta.runtime_metadata);
-    let study_kind = problem.study.kind();
+    let study_kind = problem.study.legacy_validation_view().kind();
     let active_stage_id = problem
         .problem_meta
         .runtime_metadata

@@ -162,6 +162,7 @@ pub(crate) fn create_empty_scene_document(
         },
         outputs: Default::default(),
         editor: Default::default(),
+        analysis: Default::default(),
     })
 }
 

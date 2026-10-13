@@ -4,6 +4,7 @@ use axum::{extract::State, Json};
 use std::sync::Arc;
 
 use crate::schemas::quantities::QuantityCatalogResponse;
+use crate::session::relevant_field_materialization_status;
 use crate::types::{AppState, SessionStateResponse};
 use fullmag_quantities::{quantity_spec, QuantitySpec};
 use fullmag_runner::{
@@ -76,28 +77,15 @@ fn annotate_runtime_quantity_state(
         let supported =
             preliminary.provider == fullmag_runner::QuantityProviderCapability::Available;
 
-        let status = snapshot.live_state.as_ref().and_then(|state| {
-            state
-                .latest_step
-                .field_materialization_states
-                .iter()
-                .find(|status| status.quantity == entry.id)
-        });
-        let source_is_present = snapshot.latest_fields.get(&entry.id).is_some()
-            || snapshot.preview_cache.get(&entry.id).is_some()
-            || (entry.id == "m"
-                && snapshot
-                    .live_state
-                    .as_ref()
-                    .and_then(|state| state.latest_step.magnetization.as_ref())
-                    .is_some());
-        let resolved_field = source_is_present
-            .then(|| resolve_current_spatial_field(snapshot, &entry.id, usize::from(spec.n_comp)))
-            .transpose()
-            .ok()
-            .flatten()
-            .flatten()
-            .filter(|field| !field.values.is_empty());
+        let status = relevant_field_materialization_status(snapshot, &entry.id);
+        let resolved_field = resolve_current_spatial_field(
+            snapshot,
+            &entry.id,
+            usize::from(spec.n_comp),
+        )
+        .ok()
+        .flatten()
+        .filter(|field| !field.values.is_empty());
         let has_payload = resolved_field.is_some();
         let unavailable_payload_state = || {
             if supported {

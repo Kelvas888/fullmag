@@ -208,7 +208,7 @@ fn main() -> Result<()> {
         Command::Runtime(RuntimeCommand::FemAvailability { json }) => {
             let gpu = fullmag_runner::native_fem_gpu_status();
             let payload = serde_json::json!({
-                "native_fem_cpu_available": fullmag_runner::is_native_fem_cpu_available(),
+                "native_fem_cpu_available": gpu.cpu_available,
                 "native_fem_gpu_available": gpu.available,
                 "visible_cuda_device_count": gpu.visible_cuda_device_count,
                 "requested_gpu_index": gpu.requested_gpu_index,
@@ -454,6 +454,10 @@ fn main() -> Result<()> {
             } else {
                 println!("{}", serde_json::to_string(&resolution)?);
             }
+        }
+        Command::EigenKWorker { request } => {
+            fullmag_runner::run_eigen_k_worker_request_file(&request)
+                .map_err(|error| anyhow!(error.message))?;
         }
         Command::Project(cmd) => handle_project(cmd)?,
         Command::Script(cmd) => script_inspect::handle_script(cmd)?,
@@ -935,6 +939,7 @@ fn is_script_mode(raw_args: &[OsString]) -> bool {
         "run-problem-json-direct",
         "resume-json",
         "resolve-runtime-invocation",
+        "__eigen-k-worker",
         "session",
         "project",
         "script",
@@ -2163,6 +2168,7 @@ mod tests {
                 stage_autosave: None,
                 outputs: vec![fullmag_ir::OutputIR::EigenSpectrum {
                     quantity: "eigenfrequency".to_string(),
+                    scope: None,
                 }],
             },
         };

@@ -17,7 +17,8 @@ use crate::schemas::authoring::{
     GeometryRealizationRequest, MagnetizationAssetPatchRequest, MagnetizationAssetResource,
     MaterialParameterFieldListResource, MaterialParameterFieldResource, MaterialPatchRequest,
     MaterialPropertiesResource, MaterialReferenceResource, MaterialResource, NullableF64PatchValue,
-    NullableStringPatchValue, NullableU32PatchValue, ObjectCreateRequest,
+    NullableParallelExecutionPatchValue, NullableStringPatchValue, NullableU32PatchValue,
+    ObjectCreateRequest,
     ObjectGeometryPatchRequest, ObjectInteractionPatchRequest, ObjectInteractionResource,
     ObjectPatchRequest, ObjectRegionCreateRequest, ObjectRegionDuplicateRequest,
     ObjectRegionPatchRequest, ObjectRegionReorderRequest, OerstedFieldCommitResource,
@@ -3018,6 +3019,16 @@ pub async fn patch_authoring_study_runtime(
             NullableU32PatchValue::Null => None,
         };
     }
+    if let Some(value) = req.parallel_execution {
+        scene.study.parallel_execution = match value {
+            NullableParallelExecutionPatchValue::Value(value) => value
+                .try_into()
+                .map_err(|error: String| ApiError::bad_request(error))?,
+            NullableParallelExecutionPatchValue::Null => {
+                fullmag_ir::ParallelExecutionPolicyIR::default()
+            }
+        };
+    }
 
     let committed =
         crate::commit_current_live_scene_document_for_context(&state, &request_context, scene)
@@ -3646,13 +3657,14 @@ fn authoring_transaction_response(
     transaction_kind: &str,
     committed: SceneDocument,
 ) -> Result<Json<AuthoringTransactionResponse>, ApiError> {
-    let committed_scene = serde_json::to_value(&committed).map_err(|error| {
-        ApiError::internal(format!("failed to serialize scene document: {error}"))
+    let scene_revision = committed.revision;
+    let committed_scene = SceneResource::from_scene_document(committed).map_err(|error| {
+        ApiError::internal(format!("failed to project committed scene resource: {error}"))
     })?;
 
     Ok(Json(AuthoringTransactionResponse {
         transaction_kind: transaction_kind.to_string(),
-        scene_revision: committed.revision,
+        scene_revision,
         committed_scene,
     }))
 }
@@ -3831,6 +3843,7 @@ fn build_study_runtime_resource(scene: &SceneDocument) -> StudyRuntimeResource {
         requested_precision: scene.study.requested_precision.clone(),
         requested_mode: scene.study.requested_mode.clone(),
         requested_cpu_threads: scene.study.requested_cpu_threads,
+        parallel_execution: (&scene.study.parallel_execution).into(),
     }
 }
 

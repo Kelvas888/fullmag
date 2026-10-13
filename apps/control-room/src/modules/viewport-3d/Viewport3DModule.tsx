@@ -1378,6 +1378,8 @@ interface Viewport3DFrameProps
   onRegionOverlayVisibilityChange: (visible: boolean) => void;
   regionDiagnosticOverlayState: RegionDiagnosticOverlayState;
   quantityId: string;
+  /** Human label for the HUD: the mode while a mode field is the viewport quantity. */
+  quantityLabel: string;
   renderedMeshRevision: number | string | null;
   scalarColorPalette: string;
   savedViewportActive: boolean;
@@ -1976,6 +1978,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   onRegionOverlayVisibilityChange,
   regionDiagnosticOverlayState,
   quantityId,
+  quantityLabel,
   savedViewportActive,
   sessionIdentity,
   sessionDiscretization,
@@ -2670,7 +2673,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             </Button>
           </fieldset>
         ) : null}
-        <span>{antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityId}</span>
+        <span data-quantity-id={quantityId}>{antennaFieldOverlay ? antennaFieldDisplayLabel(antennaFieldOverlay.intent) : quantityLabel}</span>
         <span>{antennaFieldSourceLabel ?? selectedLabel}</span>
         {hysteresisReplayLabel ? <span>{hysteresisReplayLabel}</span> : null}
         <span>{antennaFieldOverlay ? `${antennaFieldOverlay.count} samples` : domainSummary}</span>

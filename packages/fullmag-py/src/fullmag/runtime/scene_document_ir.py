@@ -43,6 +43,8 @@ _SCENE_DOCUMENT_FIELDS = frozenset(
         "study",
         "outputs",
         "editor",
+        # Rust authoring validates this non-physical Results metadata before lowering.
+        "analysis",
         "selections",
         "magnetization_constraints",
         "spin_torques",
@@ -60,6 +62,8 @@ _STUDY_FIELDS = frozenset(
         "requested_precision",
         "requested_mode",
         "requested_cpu_threads",
+        "parallel_execution",
+        "pbc",
         "execution_profile",
         "execution_layers",
         "compute_resources",
@@ -253,7 +257,9 @@ def _scene_capture_to_ir(
     runtime_metadata = result.get("problem_meta", {}).get("runtime_metadata")
     if isinstance(runtime_metadata, dict):
         runtime_metadata["output_storage_source_dir"] = str(capture.source_root)
-        runtime_metadata["output_storage_source_stem"] = capture.source_stem
+        # The capture bootstrap is synthetic, not an authored script filename.
+        # Preserve the Problem-name fallback used by output storage.
+        runtime_metadata.pop("output_storage_source_stem", None)
         study_pipeline = _scene_capture_study_pipeline(capture)
         if study_pipeline is not None:
             runtime_metadata["study_pipeline"] = copy.deepcopy(study_pipeline)
@@ -283,7 +289,12 @@ def scene_document_to_problem_ir(
     requested_mode: str,
     source_root: str | Path | None = None,
 ) -> dict[str, object]:
-    """Return the canonical, geometry-light ProblemIR for a SceneDocument."""
+    """Return the canonical, geometry-light ProblemIR for a SceneDocument.
+
+    The caller must pass a SceneDocument validated by Rust authoring. Its
+    non-physical analysis Results metadata is intentionally excluded from
+    ProblemIR.
+    """
 
     with _capture_scene_document(
         scene_document,

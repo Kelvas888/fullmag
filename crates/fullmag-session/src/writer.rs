@@ -88,6 +88,11 @@ impl Writer {
             .lock()
             .map_err(|_| anyhow::anyhow!("writer mutex poisoned"))?;
         if let Some(active) = held.as_mut() {
+            if active.depth == 0 {
+                // A failed explicit unlock leaves a depth-zero sentinel and
+                // keeps the native descriptor open until this Writer drops.
+                return Err(StoreWriterBusy.into());
+            }
             if active.thread != std::thread::current().id() {
                 return Err(StoreWriterBusy.into());
             }
@@ -157,14 +162,23 @@ impl Drop for WriteTransaction {
             tracing::error!("refusing release of a different writer owner token");
             return;
         }
+        if active.depth == 0 {
+            tracing::error!("refusing release after writer lease depth already reached zero");
+            return;
+        }
         active.depth -= 1;
         if active.depth == 0 {
             active.record.released = true;
             active.record.heartbeat_at = chrono::Utc::now();
             if let Err(error) = write_owner_record(&self.writer.root, &active.record) {
-                tracing::error!(%error, "could not persist writer release; native unlock still attempted");
+                tracing::error!(%error, "could not persist writer release before native unlock");
             }
-            // Dropping the final matching lease explicitly unlocks its own descriptor.
+            // Unlock the shared open-file-description lock before closing our
+            // descriptor. Cloned/inherited descriptors can outlive this token.
+            if let Err(error) = active.lock.file.unlock() {
+                tracing::error!(%error, "could not unlock native writer descriptor; retaining it fail-closed");
+                return;
+            }
             *held = None;
         }
     }

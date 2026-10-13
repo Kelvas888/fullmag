@@ -920,28 +920,31 @@ fn apply_fem_gpu_plan_constraints(
         }
     }
 
-    if let Some(min_nodes) = should_fallback_to_cpu_for_small_fem_gpu(plan) {
-        if forced_gpu {
-            return Err(RunError {
-                message: format!(
-                    "native FEM GPU execution was requested, but plan has {} nodes below FULLMAG_FEM_GPU_MIN_NODES={} (fallback_reason=fem_gpu_small_mesh_policy)",
-                    plan.mesh.nodes.len(),
-                    min_nodes
-                ),
-            });
+    // GPU admission policy must not invent or overwrite an already resolved CPU fallback.
+    if resolution.engine == FemEngine::NativeGpu {
+        if let Some(min_nodes) = should_fallback_to_cpu_for_small_fem_gpu(plan) {
+            if forced_gpu {
+                return Err(RunError {
+                    message: format!(
+                        "native FEM GPU execution was requested, but plan has {} nodes below FULLMAG_FEM_GPU_MIN_NODES={} (fallback_reason=fem_gpu_small_mesh_policy)",
+                        plan.mesh.nodes.len(),
+                        min_nodes
+                    ),
+                });
+            }
+            let message = format!(
+                "FEM plan has {} nodes, below FULLMAG_FEM_GPU_MIN_NODES={} — falling back to MFEM/libCEED/hypre CPU FEM engine",
+                plan.mesh.nodes.len(),
+                min_nodes
+            );
+            resolution.engine = FemEngine::CpuNative;
+            resolution.fallback = Some(runtime_fallback(
+                fem_engine_id(FemEngine::NativeGpu),
+                fem_engine_id(FemEngine::CpuNative),
+                "fem_gpu_small_mesh_policy",
+                message,
+            ));
         }
-        let message = format!(
-            "FEM plan has {} nodes, below FULLMAG_FEM_GPU_MIN_NODES={} — falling back to MFEM/libCEED/hypre CPU FEM engine",
-            plan.mesh.nodes.len(),
-            min_nodes
-        );
-        resolution.engine = FemEngine::CpuNative;
-        resolution.fallback = Some(runtime_fallback(
-            fem_engine_id(FemEngine::NativeGpu),
-            fem_engine_id(FemEngine::CpuNative),
-            "fem_gpu_small_mesh_policy",
-            message,
-        ));
     }
 
     Ok(FemPlanEngineResolution {
@@ -1161,6 +1164,16 @@ pub(crate) fn resolve_planned_fem_eigen_execution<'a>(
         crate::fem::eigen_execution_resolution::resolve_planned_fem_eigen_execution(plan, fem)?
     {
         return Ok(execution);
+    }
+    // The nonzero-k Floquet airbox provider is CPU-only. Pin an otherwise
+    // automatic request to that lane so registry GPU availability cannot
+    // silently select an unsupported implementation. Explicit GPU requests
+    // are rejected by the planner/runner guards instead.
+    if crate::fem::eigen_capability::native_cpu_modal_window_has_floquet_dynamic_demag_path(fem)
+        && !strict_fem_gpu_requested(problem)
+        && !fem_gpu_execution_forced()
+    {
+        return Ok(PlannedFemEigenExecution::legacy(FemEigenExecutionLane::Cpu));
     }
     let lane = match resolve_fem_engine(problem)? {
         FemEngine::CpuNative => FemEigenExecutionLane::Cpu,
@@ -2769,6 +2782,37 @@ pub(crate) fn execute_fem_eigen(
     plan: &FemEigenPlanIR,
     outputs: &[OutputIR],
 ) -> Result<ExecutedRun, RunError> {
+    execute_fem_eigen_with_producer_identity(execution, plan, outputs, None)
+}
+
+pub(crate) fn execute_fem_eigen_with_producer_identity(
+    execution: PlannedFemEigenExecution<'_>,
+    plan: &FemEigenPlanIR,
+    outputs: &[OutputIR],
+    producer_identity: Option<&fem_eigen::FemRelaxationProducerStageIdentity>,
+) -> Result<ExecutedRun, RunError> {
+    execute_fem_eigen_with_producer_identity_and_parallel_policy(
+        execution,
+        plan,
+        outputs,
+        producer_identity,
+        &fullmag_ir::ParallelExecutionPolicyIR::default(),
+        None,
+    )
+}
+
+pub(crate) fn execute_fem_eigen_with_producer_identity_and_parallel_policy(
+    execution: PlannedFemEigenExecution<'_>,
+    plan: &FemEigenPlanIR,
+    outputs: &[OutputIR],
+    producer_identity: Option<&fem_eigen::FemRelaxationProducerStageIdentity>,
+    parallel_policy: &fullmag_ir::ParallelExecutionPolicyIR,
+    process_root: Option<&std::path::Path>,
+) -> Result<ExecutedRun, RunError> {
+    // Adaptive policy is meaningful for independent Path points.  A Single
+    // (or legacy no-sampling) plan remains one serial work item while the
+    // requested policy stays in the execution provenance; rejecting it here
+    // would make GUI/API single-point previews needlessly illegal.
     // Route Path k-sampling through the multi-k orchestrator, which calls
     // the single-k solver for each sample point and then performs branch
     // tracking and writes V2 artifacts.
@@ -2784,17 +2828,40 @@ pub(crate) fn execute_fem_eigen(
     } {
         executed
     } else if matches!(plan.k_sampling, Some(fullmag_ir::KSamplingIR::Path { .. })) {
-        crate::fem::execute_fem_eigen_path(execution, plan, outputs)?
+        crate::fem::execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
+            execution,
+            plan,
+            outputs,
+            None,
+            None,
+            producer_identity,
+            parallel_policy,
+            process_root,
+        )?
     } else if execution.resolution().is_some() {
-        fem_eigen::execute_planned_fem_eigen(execution, plan, outputs)?
+        fem_eigen::execute_planned_fem_eigen_with_producer_identity(
+            execution,
+            plan,
+            outputs,
+            producer_identity,
+        )?
     } else {
         match execution.lane() {
-            FemEigenExecutionLane::Cpu => fem_eigen::execute_cpu_fem_eigen(plan, outputs)?,
+            FemEigenExecutionLane::Cpu => fem_eigen::execute_cpu_fem_eigen_with_producer_identity(
+                plan,
+                outputs,
+                producer_identity,
+            )?,
             FemEigenExecutionLane::Gpu => {
                 // GPU-accelerated dense eigensolver (Etap A4) — TRANSITIONAL.
                 // `execute_gpu_fem_eigen` uses cuSolverDN; returns error if GPU
                 // is unavailable (no silent fallback to CPU).
-                fem_eigen::execute_gpu_fem_eigen(plan, outputs, None)?
+                fem_eigen::execute_gpu_fem_eigen_with_producer_identity(
+                    plan,
+                    outputs,
+                    None,
+                    producer_identity,
+                )?
             }
         }
     };
@@ -2808,6 +2875,42 @@ pub(crate) fn execute_fem_eigen_with_progress(
     outputs: &[OutputIR],
     progress: &mut fem_eigen::FemEigenProgressCallback<'_>,
 ) -> Result<ExecutedRun, RunError> {
+    execute_fem_eigen_with_progress_and_producer_identity(
+        execution,
+        plan,
+        outputs,
+        progress,
+        None,
+    )
+}
+
+pub(crate) fn execute_fem_eigen_with_progress_and_producer_identity(
+    execution: PlannedFemEigenExecution<'_>,
+    plan: &FemEigenPlanIR,
+    outputs: &[OutputIR],
+    progress: &mut fem_eigen::FemEigenProgressCallback<'_>,
+    producer_identity: Option<&fem_eigen::FemRelaxationProducerStageIdentity>,
+) -> Result<ExecutedRun, RunError> {
+    execute_fem_eigen_with_progress_and_producer_identity_and_parallel_policy(
+        execution,
+        plan,
+        outputs,
+        progress,
+        producer_identity,
+        &fullmag_ir::ParallelExecutionPolicyIR::default(),
+        None,
+    )
+}
+
+pub(crate) fn execute_fem_eigen_with_progress_and_producer_identity_and_parallel_policy(
+    execution: PlannedFemEigenExecution<'_>,
+    plan: &FemEigenPlanIR,
+    outputs: &[OutputIR],
+    progress: &mut fem_eigen::FemEigenProgressCallback<'_>,
+    producer_identity: Option<&fem_eigen::FemRelaxationProducerStageIdentity>,
+    parallel_policy: &fullmag_ir::ParallelExecutionPolicyIR,
+    process_root: Option<&std::path::Path>,
+) -> Result<ExecutedRun, RunError> {
     let mut executed = if let Some(executed) = {
         #[cfg(test)]
         {
@@ -2820,16 +2923,41 @@ pub(crate) fn execute_fem_eigen_with_progress(
     } {
         executed
     } else if matches!(plan.k_sampling, Some(fullmag_ir::KSamplingIR::Path { .. })) {
-        crate::fem::execute_fem_eigen_path(execution, plan, outputs)?
+        crate::fem::execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
+            execution,
+            plan,
+            outputs,
+            None,
+            Some(progress),
+            producer_identity,
+            parallel_policy,
+            process_root,
+        )?
     } else if execution.resolution().is_some() {
-        fem_eigen::execute_planned_fem_eigen_with_progress(execution, plan, outputs, progress)?
+        fem_eigen::execute_planned_fem_eigen_with_progress_and_producer_identity(
+            execution,
+            plan,
+            outputs,
+            progress,
+            producer_identity,
+        )?
     } else {
         match execution.lane() {
             FemEigenExecutionLane::Cpu => {
-                fem_eigen::execute_cpu_fem_eigen_with_progress(plan, outputs, progress)?
+                fem_eigen::execute_cpu_fem_eigen_with_progress_and_producer_identity(
+                    plan,
+                    outputs,
+                    progress,
+                    producer_identity,
+                )?
             }
             FemEigenExecutionLane::Gpu => {
-                fem_eigen::execute_gpu_fem_eigen(plan, outputs, Some(progress))?
+                fem_eigen::execute_gpu_fem_eigen_with_producer_identity(
+                    plan,
+                    outputs,
+                    Some(progress),
+                    producer_identity,
+                )?
             }
         }
     };
@@ -2844,10 +2972,59 @@ pub(crate) fn execute_fem_eigen_with_progress_and_stage_handoff(
     progress: &mut fem_eigen::FemEigenProgressCallback<'_>,
     handoff: &fem_eigen::AcceptedFemRelaxStageHandoff,
 ) -> Result<ExecutedRun, RunError> {
+    execute_fem_eigen_with_progress_and_stage_handoff_and_producer_identity(
+        execution,
+        plan,
+        outputs,
+        progress,
+        handoff,
+        None,
+    )
+}
+
+pub(crate) fn execute_fem_eigen_with_progress_and_stage_handoff_and_producer_identity(
+    execution: PlannedFemEigenExecution<'_>,
+    plan: &FemEigenPlanIR,
+    outputs: &[OutputIR],
+    progress: &mut fem_eigen::FemEigenProgressCallback<'_>,
+    handoff: &fem_eigen::AcceptedFemRelaxStageHandoff,
+    producer_identity: Option<&fem_eigen::FemRelaxationProducerStageIdentity>,
+) -> Result<ExecutedRun, RunError> {
+    execute_fem_eigen_with_progress_and_stage_handoff_and_producer_identity_and_parallel_policy(
+        execution,
+        plan,
+        outputs,
+        progress,
+        handoff,
+        producer_identity,
+        &fullmag_ir::ParallelExecutionPolicyIR::default(),
+        None,
+    )
+}
+
+pub(crate) fn execute_fem_eigen_with_progress_and_stage_handoff_and_producer_identity_and_parallel_policy(
+    execution: PlannedFemEigenExecution<'_>,
+    plan: &FemEigenPlanIR,
+    outputs: &[OutputIR],
+    progress: &mut fem_eigen::FemEigenProgressCallback<'_>,
+    handoff: &fem_eigen::AcceptedFemRelaxStageHandoff,
+    producer_identity: Option<&fem_eigen::FemRelaxationProducerStageIdentity>,
+    parallel_policy: &fullmag_ir::ParallelExecutionPolicyIR,
+    process_root: Option<&std::path::Path>,
+) -> Result<ExecutedRun, RunError> {
     if matches!(plan.k_sampling, Some(fullmag_ir::KSamplingIR::Path { .. })) {
-        return Err(RunError {
-            message: "relax_stage_handoff_requires_single_k_target".to_string(),
-        });
+        let mut executed = crate::fem::execute_fem_eigen_path_with_producer_identity_and_parallel_policy(
+            execution,
+            plan,
+            outputs,
+            Some(handoff),
+            Some(progress),
+            producer_identity,
+            parallel_policy,
+            process_root,
+        )?;
+        execution.bind_execution_provenance(&mut executed.provenance);
+        return Ok(executed);
     }
     let mut executed = if let Some(executed) = {
         #[cfg(test)]
@@ -2865,22 +3042,38 @@ pub(crate) fn execute_fem_eigen_with_progress_and_stage_handoff(
     } {
         executed
     } else if execution.resolution().is_some() {
-        fem_eigen::execute_planned_fem_eigen_with_progress_and_stage_handoff(
-            execution, plan, outputs, progress, handoff,
+        fem_eigen::execute_planned_fem_eigen_with_progress_and_stage_handoff_and_producer_identity(
+            execution,
+            plan,
+            outputs,
+            progress,
+            handoff,
+            0,
+            None,
+            producer_identity,
         )?
     } else {
         match execution.lane() {
             FemEigenExecutionLane::Cpu => {
-                fem_eigen::execute_cpu_fem_eigen_with_progress_and_stage_handoff(
-                    plan, outputs, progress, handoff,
+                fem_eigen::execute_cpu_fem_eigen_with_progress_and_stage_handoff_and_producer_identity(
+                    plan,
+                    outputs,
+                    progress,
+                    handoff,
+                    0,
+                    None,
+                    producer_identity,
                 )?
             }
             FemEigenExecutionLane::Gpu => {
-                fem_eigen::execute_gpu_fem_eigen_with_progress_and_stage_handoff(
+                fem_eigen::execute_gpu_fem_eigen_with_progress_and_stage_handoff_and_producer_identity(
                     plan,
                     outputs,
                     Some(progress),
                     handoff,
+                    0,
+                    None,
+                    producer_identity,
                 )?
             }
         }
@@ -3856,6 +4049,10 @@ mod tests {
             "sha256:topology"
         );
         assert_eq!(
+            diagnostics["relax_to_eigen_source_mesh_topology_sha256"],
+            "sha256:topology"
+        );
+        assert_eq!(
             diagnostics["sample_solver_diagnostics"][0]["diagnostics"]
                 ["relax_to_eigen_handoff_sha256"],
             "sha256:handoff"
@@ -3863,6 +4060,11 @@ mod tests {
         assert_eq!(
             diagnostics["sample_solver_diagnostics"][0]["diagnostics"]
                 ["source_mesh_topology_sha256"],
+            "sha256:topology"
+        );
+        assert_eq!(
+            diagnostics["sample_solver_diagnostics"][0]["diagnostics"]
+                ["relax_to_eigen_source_mesh_topology_sha256"],
             "sha256:topology"
         );
         assert!(diagnostics["sample_solver_diagnostics"][1]["diagnostics"]
@@ -4109,6 +4311,7 @@ mod tests {
     fn k0_multi_sample_path_is_not_classified_as_dispersion() {
         let solver_model = EigenSolverModel::ReferenceScalarTangent;
         let result = crate::eigen::PathSolveResult {
+            gamma0_rad_s_per_a_m: 2.211e5, // Explicit fixture parameter.
             samples: (0..3)
                 .map(|sample_index| crate::eigen::SingleKSolveResult {
                     sample: crate::eigen::KSampleDescriptor {
@@ -4132,6 +4335,7 @@ mod tests {
             include_demag: true,
             dispersion_validation: None,
             k0_kittel_validation: None,
+            solver_policy: None,
             dispersion_analytic_reference: None,
             k0_kittel_periodic_airbox_demag: None,
         };
@@ -4776,6 +4980,7 @@ mod tests {
             mode_tracking: None,
             dispersion_validation: None,
             k0_kittel_validation: None,
+            solver_policy: None,
         }
     }
 
@@ -6443,6 +6648,7 @@ mod tests {
             &plan,
             &[OutputIR::DispersionCurve {
                 name: "dispersion".to_string(),
+                include_branch_table: true,
             }],
         );
 
@@ -6459,6 +6665,7 @@ mod tests {
     fn k_path_public_mode_indices_follow_requested_dispersion_outputs() {
         let no_dispersion = vec![OutputIR::EigenSpectrum {
             quantity: "eigenfrequency".to_string(),
+            scope: None,
         }];
         assert_eq!(
             eigen_path_public_mode_indices(&no_dispersion, 2),
@@ -6467,6 +6674,7 @@ mod tests {
 
         let dispersion_only = vec![OutputIR::DispersionCurve {
             name: "dispersion".to_string(),
+            include_branch_table: true,
         }];
         assert_eq!(
             eigen_path_public_mode_indices(&dispersion_only, 2),
@@ -6476,10 +6684,14 @@ mod tests {
         let explicit_mode_subset = vec![
             OutputIR::DispersionCurve {
                 name: "dispersion".to_string(),
+                include_branch_table: true,
             },
             OutputIR::EigenMode {
                 field: "mode".to_string(),
+                all_modes: false,
                 indices: vec![1],
+                branches: vec![],
+                sample_selector: None,
             },
         ];
         assert_eq!(
@@ -6531,7 +6743,8 @@ mod tests {
             legacy_fem_eigen_execution(FemEngine::CpuNative),
             &plan,
             &[OutputIR::EigenSpectrum {
-                quantity: "frequency_hz".to_string(),
+                quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         )
         .expect_err("provided equilibrium without a certified handoff must fail closed");
@@ -6810,7 +7023,18 @@ mod tests {
             frequency_min_hz: 1.0,
             frequency_max_hz: 1.0e13,
         };
+        let mut sample_plan = plan.clone();
+        sample_plan.k_sampling = Some(fullmag_ir::KSamplingIR::Single {
+            k_vector: [0.0, 0.0, 0.0],
+        });
+        let native_summary = crate::fem::test_support::
+            canonical_production_shift_invert_summary_for_path_test(&sample_plan);
+        let sample_solver_diagnostics = native_summary
+            .get("solver_diagnostics")
+            .cloned()
+            .expect("canonical native spectrum summary must include solver diagnostics");
         let path_result = crate::eigen::PathSolveResult {
+            gamma0_rad_s_per_a_m: 2.211e5, // Explicit fixture parameter.
             samples: vec![crate::eigen::SingleKSolveResult {
                 sample: crate::eigen::KSampleDescriptor {
                     sample_index: 0,
@@ -6831,6 +7055,7 @@ mod tests {
                     norm: 1.0,
                     mass_norm: Some(1.0),
                     max_amplitude: 1.0,
+                    residual_relative_l2: None,
                     residual_norm: Some(1.0e-9),
                     residual_linf: Some(1.0e-10),
                     tangent_leakage_mean_abs: Some(0.0),
@@ -6843,6 +7068,7 @@ mod tests {
                     amplitude: None,
                     phase: None,
                     node_mass_weights: Some(vec![2.0, 3.0]),
+                    consistent_p1_metric: None,
                     component_participation:
                         crate::eigen::ModalParticipationObservable::unavailable_without_context(
                             "cpu",
@@ -6851,14 +7077,7 @@ mod tests {
                 relaxation_steps: 0,
                 solver_model: EigenSolverModel::ProductionCpuShiftInvert,
                 solver_notes: vec!["production sample".to_string()],
-                solver_diagnostics: Some(serde_json::json!({
-                    "solver_adapter": "k0_poisson_airbox_cpu_schur_slepc",
-                    "slepc": {
-                        "converged_eigenpair_count": 7,
-                        "accepted_mode_count": 2,
-                        "outer_iterations": 19,
-                    },
-                })),
+                solver_diagnostics: Some(sample_solver_diagnostics.clone()),
             }],
             branches: Vec::new(),
             solver_model: EigenSolverModel::ProductionCpuShiftInvert,
@@ -6866,6 +7085,7 @@ mod tests {
             include_demag: plan.operator.include_demag,
             dispersion_validation: None,
             k0_kittel_validation: None,
+            solver_policy: None,
             dispersion_analytic_reference: None,
             k0_kittel_periodic_airbox_demag: None,
         };
@@ -7059,7 +7279,7 @@ mod tests {
         );
         assert_eq!(nested_manifest["validation_state"], "unvalidated");
         assert!(
-            nested_manifest.get("validated_scope").is_none(),
+            nested_manifest.get("validated_scope").is_none_or(serde_json::Value::is_null),
             "unvalidated diagnostics must not publish a validated scope"
         );
         assert_eq!(
@@ -7102,6 +7322,7 @@ mod tests {
             frequency_max_hz: 1.0e13,
         };
         let path_result = crate::eigen::PathSolveResult {
+            gamma0_rad_s_per_a_m: 2.211e5, // Explicit fixture parameter.
             samples: Vec::new(),
             branches: Vec::new(),
             solver_model: EigenSolverModel::ProductionCpuShiftInvert,
@@ -7109,6 +7330,7 @@ mod tests {
             include_demag: true,
             dispersion_validation: None,
             k0_kittel_validation: None,
+            solver_policy: None,
             dispersion_analytic_reference: None,
             k0_kittel_periodic_airbox_demag: None,
         };
@@ -7120,14 +7342,13 @@ mod tests {
             &plan,
         );
 
-        assert_eq!(
-            manifest["resolved_execution"]["reference_or_production"],
-            "reference"
-        );
-        assert_eq!(
-            manifest["resolved_execution"]["native_backend"],
-            "runner_validation"
-        );
+        assert_eq!(manifest["sample_execution_provenance"]["status"], "missing");
+        assert_eq!(manifest["sample_execution_provenance"]["sample_count"], 0);
+        assert!(manifest["resolved_execution"]["reference_or_production"].is_null());
+        assert!(manifest["resolved_execution"]["native_backend"].is_null());
+        assert!(manifest["resolved_execution"]["device"].is_null());
+        assert!(manifest["resolved_execution"]["engine"].is_null());
+        assert!(manifest["physics"]["phase_convention"].is_null());
         assert_eq!(
             manifest["capabilities"]["production_native_solver_available"],
             false
@@ -7197,6 +7418,7 @@ mod tests {
             frequency_max_hz: 1.0e13,
         };
         let path_result = crate::eigen::PathSolveResult {
+            gamma0_rad_s_per_a_m: 2.211e5, // Explicit fixture parameter.
             samples: Vec::new(),
             branches: Vec::new(),
             solver_model: EigenSolverModel::ReferenceFull2x2Tangent,
@@ -7204,6 +7426,7 @@ mod tests {
             include_demag: true,
             dispersion_validation: None,
             k0_kittel_validation: None,
+            solver_policy: None,
             dispersion_analytic_reference: None,
             k0_kittel_periodic_airbox_demag: None,
         };
@@ -7215,10 +7438,13 @@ mod tests {
             &plan,
         );
 
-        assert_eq!(
-            manifest["resolved_execution"]["reference_or_production"],
-            "reference"
-        );
+        assert_eq!(manifest["sample_execution_provenance"]["status"], "missing");
+        assert_eq!(manifest["sample_execution_provenance"]["sample_count"], 0);
+        assert!(manifest["resolved_execution"]["reference_or_production"].is_null());
+        assert!(manifest["resolved_execution"]["native_backend"].is_null());
+        assert!(manifest["resolved_execution"]["device"].is_null());
+        assert!(manifest["resolved_execution"]["engine"].is_null());
+        assert!(manifest["physics"]["phase_convention"].is_null());
         assert_eq!(
             manifest["diagnostics"]["production_cpu_rejection_reason"],
             "production_cpu_modal_dynamic_demag_k_operator_missing"
@@ -7339,6 +7565,7 @@ mod tests {
             }],
         });
         let path_result = crate::eigen::PathSolveResult {
+            gamma0_rad_s_per_a_m: 2.211e5, // Explicit fixture parameter.
             samples: Vec::new(),
             branches: Vec::new(),
             solver_model: EigenSolverModel::ReferenceFull2x2Tangent,
@@ -7346,6 +7573,7 @@ mod tests {
             include_demag: true,
             dispersion_validation: None,
             k0_kittel_validation: plan.k0_kittel_validation.clone(),
+            solver_policy: None,
             dispersion_analytic_reference: None,
             k0_kittel_periodic_airbox_demag: Some(
                 crate::eigen::K0KittelPeriodicAirboxDemagMetrics {
@@ -7806,6 +8034,7 @@ mod tests {
                     norm: 1.0,
                     mass_norm: Some(1.0),
                     max_amplitude: 1.0,
+                    residual_relative_l2: None,
                     residual_norm: Some(1.0e-9),
                     residual_linf: Some(1.0e-10),
                     tangent_leakage_mean_abs: Some(0.0),
@@ -7821,6 +8050,7 @@ mod tests {
                     amplitude: None,
                     phase: None,
                     node_mass_weights: None,
+                    consistent_p1_metric: None,
                     component_participation:
                         crate::eigen::ModalParticipationObservable::unavailable_without_context(
                             "cpu",
@@ -7838,10 +8068,12 @@ mod tests {
                 frequency_imag_hz: 0.0,
                 tracking_confidence: 1.0,
                 overlap_prev: (sample_index > 0).then_some(1.0),
+                tracking_edge: None,
             });
         }
 
         let path_result = crate::eigen::PathSolveResult {
+            gamma0_rad_s_per_a_m: 2.211e5, // Explicit fixture parameter.
             samples,
             branches: vec![crate::eigen::TrackedBranch {
                 branch_id: 0,
@@ -7874,6 +8106,7 @@ mod tests {
                     })
                     .collect(),
             }),
+            solver_policy: None,
             dispersion_analytic_reference: None,
             k0_kittel_periodic_airbox_demag: None,
         };
@@ -8337,7 +8570,8 @@ mod tests {
             legacy_fem_eigen_execution(FemEngine::CpuNative),
             &plan,
             &[OutputIR::EigenSpectrum {
-                quantity: "frequency_hz".to_string(),
+                quantity: "eigenfrequency".to_string(),
+                scope: None,
             }],
         )
         .expect("K0-3a synthetic demag factor path should bypass Floquet dynamic-demag guard");
@@ -8346,6 +8580,25 @@ mod tests {
             .auxiliary_artifacts
             .iter()
             .any(|artifact| artifact.relative_path == "eigen/spectrum.v2.json"));
+        let summary_bytes = &run.auxiliary_artifacts.iter()
+            .find(|artifact| artifact.relative_path == "validation/kittel_k0_pbc/summary.v1.json")
+            .expect("synthetic K0 sweep must publish the selected three-point branch")
+            .bytes;
+        let summary: serde_json::Value = serde_json::from_slice(summary_bytes)
+            .expect("synthetic summary must be valid JSON");
+        assert_eq!(summary["sweep_point_count"], 3);
+        assert_eq!(summary["status"], "partial");
+        assert_eq!(summary["qualification"], "NOT VERIFIED");
+        assert_eq!(summary["solver"]["execution_lane"], "reference");
+        assert_eq!(summary["demag"]["production_periodic_airbox_claim"], false);
+        let uniformity = summary["mode_selection"]["minimum_uniformity_score"]
+            .as_f64().expect("synthetic XYZ must have a valid uniformity score");
+        assert!((uniformity - 1.0).abs() < 1.0e-12);
+        let points = run.auxiliary_artifacts.iter()
+            .find(|artifact| artifact.relative_path == "validation/kittel_k0_pbc/points.v1.csv")
+            .expect("all three synthetic field points must be published");
+        assert_eq!(std::str::from_utf8(&points.bytes).unwrap().lines().count(), 4);
+
     }
 
     #[test]
@@ -8381,6 +8634,7 @@ mod tests {
             frequency_max_hz: 1.0e13,
         };
         let path_result = crate::eigen::PathSolveResult {
+            gamma0_rad_s_per_a_m: 2.211e5, // Explicit fixture parameter.
             samples: Vec::new(),
             branches: Vec::new(),
             solver_model: EigenSolverModel::ProductionCpuShiftInvert,
@@ -8388,6 +8642,7 @@ mod tests {
             include_demag: plan.operator.include_demag,
             dispersion_validation: None,
             k0_kittel_validation: None,
+            solver_policy: None,
             dispersion_analytic_reference: None,
             k0_kittel_periodic_airbox_demag: None,
         };
@@ -8453,6 +8708,7 @@ mod tests {
             frequency_max_hz: 1.0e13,
         };
         let path_result = crate::eigen::PathSolveResult {
+            gamma0_rad_s_per_a_m: 2.211e5, // Explicit fixture parameter.
             samples: Vec::new(),
             branches: Vec::new(),
             solver_model: EigenSolverModel::ProductionCpuShiftInvert,
@@ -8460,6 +8716,7 @@ mod tests {
             include_demag: plan.operator.include_demag,
             dispersion_validation: None,
             k0_kittel_validation: None,
+            solver_policy: None,
             dispersion_analytic_reference: None,
             k0_kittel_periodic_airbox_demag: None,
         };
@@ -8549,6 +8806,7 @@ mod tests {
             frequency_max_hz: 1.0e13,
         };
         let path_result = crate::eigen::PathSolveResult {
+            gamma0_rad_s_per_a_m: 2.211e5, // Explicit fixture parameter.
             samples: Vec::new(),
             branches: Vec::new(),
             solver_model: EigenSolverModel::ProductionCpuShiftInvert,
@@ -8556,6 +8814,7 @@ mod tests {
             include_demag: plan.operator.include_demag,
             dispersion_validation: None,
             k0_kittel_validation: None,
+            solver_policy: None,
             dispersion_analytic_reference: None,
             k0_kittel_periodic_airbox_demag: None,
         };
@@ -8612,10 +8871,16 @@ mod tests {
             &[],
             &plan,
         );
+        assert_eq!(manifest["sample_execution_provenance"]["status"], "missing");
+        assert_eq!(manifest["sample_execution_provenance"]["sample_count"], 0);
         assert_eq!(
-            manifest["resolved_execution"]["reference_or_production"],
-            "production"
+            manifest["sample_execution_provenance"]["diagnostics_available_count"],
+            0
         );
+        assert!(manifest["resolved_execution"]["reference_or_production"].is_null());
+        assert!(manifest["resolved_execution"]["device"].is_null());
+        assert!(manifest["resolved_execution"]["engine"].is_null());
+        assert!(manifest["physics"]["phase_convention"].is_null());
         assert_eq!(
             manifest["diagnostics"]["periodic_mesh_certificate"],
             diagnostics["periodic_mesh_certificate"]
@@ -8623,7 +8888,7 @@ mod tests {
     }
 
     #[test]
-    fn de_bv_low_k_dispersion_validation_uses_analytic_reference_solver() {
+    fn de_bv_validation_does_not_select_an_analytic_solver() {
         let mut plan = tiny_fem_eigen_plan(Some(fullmag_ir::KSamplingIR::Path {
             points: vec![
                 fullmag_ir::KPointIR {
@@ -8692,78 +8957,28 @@ mod tests {
             ],
         });
 
-        let run = execute_fem_eigen(
+        let error = execute_fem_eigen(
             legacy_fem_eigen_execution(FemEngine::CpuNative),
             &plan,
             &[
                 OutputIR::EigenSpectrum {
-                    quantity: "frequency_hz".to_string(),
+                    quantity: "eigenfrequency".to_string(),
+                    scope: None,
                 },
                 OutputIR::DispersionCurve {
                     name: "dispersion".to_string(),
+                    include_branch_table: true,
                 },
             ],
         )
-        .expect("DE/BV low-k validation target should use the analytic reference solver");
-
-        let spectrum = run
-            .auxiliary_artifacts
-            .iter()
-            .find(|artifact| artifact.relative_path == "eigen/spectrum.v2.json")
-            .expect("analytic reference solver must publish spectrum.v2");
-        let spectrum_json: serde_json::Value =
-            serde_json::from_slice(&spectrum.bytes).expect("spectrum.v2 must be JSON");
-        assert_eq!(
-            spectrum_json["solver_id"],
-            "reference_thin_film_de_bv_kalinikos_n0"
+        .expect_err("DE/BV validation metadata must not select an analytic solver");
+        assert!(
+            error.message.contains("dynamic demag")
+                || error.message.contains("Floquet")
+                || error.message.contains("airbox"),
+            "unexpected error: {}",
+            error.message
         );
-        assert_eq!(spectrum_json["sample_count"], 6);
-        let manifest = run
-            .auxiliary_artifacts
-            .iter()
-            .find(|artifact| artifact.relative_path == "frequency_domain/manifest.v1.json")
-            .expect("analytic reference solver must publish frequency-domain manifest");
-        let manifest_json: serde_json::Value =
-            serde_json::from_slice(&manifest.bytes).expect("manifest must be JSON");
-        assert_eq!(
-            manifest_json["validation"]["dispersion_validation"]["kind"],
-            "thin_film_de_bv_low_k"
-        );
-        assert_eq!(
-            manifest_json["validation"]["dispersion_frequency_source"],
-            "analytic_reference_model"
-        );
-        assert_eq!(
-            manifest_json["validation"]["dispersion_reference_model"],
-            "kalinikos_slab_n0"
-        );
-        assert_eq!(
-            manifest_json["validation"]["dynamic_demag_operator_source"],
-            "analytic_thin_film_de_bv_reference_not_fem_demag_k"
-        );
-        assert_eq!(manifest_json["requested_execution"]["include_demag"], true);
-        assert_eq!(manifest_json["capabilities"]["validation_artifact"], true);
-
-        let mode_error = execute_fem_eigen(
-            legacy_fem_eigen_execution(FemEngine::CpuNative),
-            &plan,
-            &[
-                OutputIR::EigenSpectrum {
-                    quantity: "frequency_hz".to_string(),
-                },
-                OutputIR::DispersionCurve {
-                    name: "dispersion".to_string(),
-                },
-                OutputIR::EigenMode {
-                    field: "mode".to_string(),
-                    indices: vec![0],
-                },
-            ],
-        )
-        .expect_err("analytic reference mode fields must fail closed without mesh identity");
-        assert!(mode_error
-            .message
-            .contains("mode field publication requires valid source mesh identity"));
     }
 
     #[test]
@@ -8988,6 +9203,39 @@ mod tests {
     }
 
     #[test]
+    fn small_mesh_gpu_policy_preserves_existing_cpu_resolution_and_provenance() {
+        let _guard = env_lock().lock().expect("env mutex");
+        let previous_threshold = std::env::var_os("FULLMAG_FEM_GPU_MIN_NODES");
+        unsafe {
+            std::env::set_var("FULLMAG_FEM_GPU_MIN_NODES", "1000000");
+        }
+        // Restore the environment before asserting so failed checks do not leak policy.
+        let outcomes = [None, Some(super::runtime_fallback(
+            "fem_native_gpu", "fem_cpu_native", "earlier_cpu_resolution", "previous decision".into(),
+        ))].into_iter().map(|fallback| {
+            let expected_reason = fallback.as_ref().map(|value| value.reason.clone());
+            let result = apply_fem_gpu_plan_constraints(
+                &canonical_stt_fem_plan("zhang_li.fullmag.v1"),
+                EngineResolution { engine: FemEngine::CpuNative, fallback },
+                false,
+                None,
+            );
+            (expected_reason, result)
+        }).collect::<Vec<_>>();
+        unsafe {
+            match previous_threshold {
+                Some(value) => std::env::set_var("FULLMAG_FEM_GPU_MIN_NODES", value),
+                None => std::env::remove_var("FULLMAG_FEM_GPU_MIN_NODES"),
+            }
+        }
+        for (expected_reason, result) in outcomes {
+            let resolution = result.expect("CPU plan bypasses GPU admission policy");
+            assert_eq!(resolution.engine, FemEngine::CpuNative);
+            assert_eq!(resolution.fallback.as_ref().map(|value| value.reason.as_str()), expected_reason.as_deref());
+        }
+    }
+
+    #[test]
     fn explicit_cpu_zhang_li_plan_reaches_cpu_preflight() {
         let resolution = apply_fem_gpu_plan_constraints(
             &canonical_stt_fem_plan("zhang_li.fullmag.v1"),
@@ -9042,31 +9290,60 @@ mod tests {
 
     #[test]
     fn strict_fem_canonical_slonczewski_v2_reaches_native_runtime_validation() {
+        let _guard = env_lock().lock().expect("env mutex");
+        let plan = canonical_stt_fem_plan("slonczewski.fullmag.v2");
+        let previous_threshold = std::env::var_os("FULLMAG_FEM_GPU_MIN_NODES");
+        let threshold = plan.mesh.nodes.len().to_string();
+        unsafe {
+            std::env::set_var("FULLMAG_FEM_GPU_MIN_NODES", threshold);
+        }
         let resolution = apply_fem_gpu_plan_constraints(
-            &canonical_stt_fem_plan("slonczewski.fullmag.v2"),
+            &plan,
             EngineResolution {
                 engine: FemEngine::NativeGpu,
                 fallback: None,
             },
             true,
             None,
-        )
-        .expect("strict canonical Slonczewski v2 should reach native runtime validation");
+        );
+        unsafe {
+            match previous_threshold {
+                Some(value) => std::env::set_var("FULLMAG_FEM_GPU_MIN_NODES", value),
+                None => std::env::remove_var("FULLMAG_FEM_GPU_MIN_NODES"),
+            }
+        }
+        let resolution =
+            resolution.expect("strict canonical Slonczewski v2 should reach native runtime validation");
         assert_eq!(resolution.engine, FemEngine::NativeGpu);
+        assert!(resolution.fallback.is_none());
     }
 
     #[test]
     fn strict_fem_canonical_zhang_li_reaches_native_runtime_validation() {
+        let _guard = env_lock().lock().expect("env mutex");
+        let plan = canonical_stt_fem_plan("zhang_li.fullmag.v1");
+        let previous_threshold = std::env::var_os("FULLMAG_FEM_GPU_MIN_NODES");
+        let threshold = plan.mesh.nodes.len().to_string();
+        unsafe {
+            std::env::set_var("FULLMAG_FEM_GPU_MIN_NODES", threshold);
+        }
         let resolution = apply_fem_gpu_plan_constraints(
-            &canonical_stt_fem_plan("zhang_li.fullmag.v1"),
+            &plan,
             EngineResolution {
                 engine: FemEngine::NativeGpu,
                 fallback: None,
             },
             true,
             None,
-        )
-        .expect("strict canonical Zhang-Li GPU should reach native runtime validation");
+        );
+        unsafe {
+            match previous_threshold {
+                Some(value) => std::env::set_var("FULLMAG_FEM_GPU_MIN_NODES", value),
+                None => std::env::remove_var("FULLMAG_FEM_GPU_MIN_NODES"),
+            }
+        }
+        let resolution =
+            resolution.expect("strict canonical Zhang-Li GPU should reach native runtime validation");
 
         assert_eq!(resolution.engine, FemEngine::NativeGpu);
         assert!(resolution.fallback.is_none());
