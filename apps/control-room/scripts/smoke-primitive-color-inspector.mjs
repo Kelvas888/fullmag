@@ -49,9 +49,9 @@ try {
       scroll.scrollTop = 70;
       if (scroll.scrollTop !== 70) throw new Error("Fixture has no actual scroll overflow");
       const focus = document.activeElement;
-      const changedFieldLabels = label.endsWith(" value") ? [label, label.replace(/ value$/, " picker")] : [label];
-      const changedInputs = [...root.querySelectorAll("input")].filter(element => changedFieldLabels.includes(element.getAttribute("aria-label")));
-      const controls = [...root.querySelectorAll("input,textarea,select,button"), document.querySelector('[data-testid="primitive-unrelated"]')].filter(element => !changedInputs.includes(element)).map(element => ({ element, disabled: element.disabled, opacity: getComputedStyle(element).opacity }));
+      const changedFieldLabels = new Set(label.endsWith(" value") ? [label, label.replace(/ value$/, " picker")] : [label]);
+      const changedInputs = new Set([...root.querySelectorAll("input")].filter(element => changedFieldLabels.has(element.getAttribute("aria-label"))));
+      const controls = [...root.querySelectorAll("input,textarea,select,button"), document.querySelector('[data-testid="primitive-unrelated"]')].filter(element => !changedInputs.has(element)).map(element => ({ element, disabled: element.disabled, opacity: getComputedStyle(element).opacity }));
       const opacityElements = new Set([root]);
       for (const { element } of controls) {
         for (let ancestor = element.parentElement; ancestor; ancestor = ancestor.parentElement) {

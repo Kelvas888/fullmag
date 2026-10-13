@@ -28,6 +28,9 @@ try {
   const readyScenarios = ["ready", "ready-vector", "ready-unitary"];
   const malformedMetadata = ["wrong-layout", "wrong-unit", "wrong-scalar", "wrong-count", "wrong-summary-count", "unsafe-grid", "wrong-sha"];
   const malformedBytes = ["truncated-payload", "nonfinite-payload", "inconsistent-power", "wrong-etag", "oversized-body", "oversized-stream"];
+  const readyScenarioSet = new Set(readyScenarios);
+  const malformedMetadataSet = new Set(malformedMetadata);
+  const malformedBytesSet = new Set(malformedBytes);
   const binaryDiagnostics = {
     "truncated-payload": "power count 3 ≠ manifest 4",
     "nonfinite-payload": "amplitude payload contains a non-finite value",
@@ -40,19 +43,19 @@ try {
     const location = new URL(url); location.searchParams.set("scenario", scenario);
     await page.goto(location.href, { waitUntil: "domcontentloaded", timeout: 60_000 });
     await page.waitForFunction(() => window.__antennaSpectrumFixture?.read().calls.some((call) => call.path.endsWith("/output-catalog")) && window.__antennaSpectrumFixture.read().calls.some((call) => call.path.endsWith("/source-spectra/fft")), undefined, { timeout: 60_000 });
-    if (malformedMetadata.includes(scenario)) {
+    if (malformedMetadataSet.has(scenario)) {
       await page.waitForFunction(() => document.querySelector("main")?.textContent.includes("Antenna spectrum"), undefined, { timeout: 60_000 });
-    } else if (!readyScenarios.includes(scenario) && !malformedBytes.includes(scenario)) {
+    } else if (!readyScenarioSet.has(scenario) && !malformedBytesSet.has(scenario)) {
       await page.waitForTimeout(500);
     }
-    if (readyScenarios.includes(scenario)) await page.getByRole("grid").waitFor({ timeout: 60_000 });
-    if (malformedBytes.includes(scenario)) await page.locator('section[aria-label="Antenna source spectrum payload"]').getByRole("alert").waitFor({ timeout: 60_000 });
+    if (readyScenarioSet.has(scenario)) await page.getByRole("grid").waitFor({ timeout: 60_000 });
+    if (malformedBytesSet.has(scenario)) await page.locator('section[aria-label="Antenna source spectrum payload"]').getByRole("alert").waitFor({ timeout: 60_000 });
     const before = await page.evaluate(() => window.__antennaSpectrumFixture.read());
     const sectionCount = await page.locator('section[aria-label="Antenna source spectrum payload"]').count();
     const payloads = before.calls.filter((call) => call.path.includes("/payloads/"));
     const text = await page.locator("main").textContent();
     const gridCells = await page.getByRole("gridcell").count();
-    const ready = readyScenarios.includes(scenario), bytesFailure = malformedBytes.includes(scenario);
+    const ready = readyScenarioSet.has(scenario), bytesFailure = malformedBytesSet.has(scenario);
     if (bytesFailure) assert.ok(text.includes(binaryDiagnostics[scenario]), `${scenario} did not report the intended rejection: ${text}`);
     if (ready) {
       const unit = scenario === "ready-unitary" ? "(A/m/A)^2" : "(A*m/A)^2";
@@ -61,7 +64,7 @@ try {
     }
     const passed = ready ? payloads.length === 4 && sectionCount === 1 && gridCells === 4
       : bytesFailure ? payloads.length > 0 && payloads.length <= 4 && gridCells === 0 && text.includes("FFT payload")
-        : payloads.length === 0 && gridCells === 0 && (malformedMetadata.includes(scenario) ? text.includes("Antenna spectrum") : sectionCount === 0);
+        : payloads.length === 0 && gridCells === 0 && (malformedMetadataSet.has(scenario) ? text.includes("Antenna spectrum") : sectionCount === 0);
     checks.push({ name: `${scenario}: ${ready ? "matched metadata renders four scoped carriers" : bytesFailure ? "refuses corrupt binary grid" : "refuses binary reads and payload view"}`, passed, payloadRequests: payloads.length, sectionCount, gridCells });
     if (scenario === "oversized-body" || scenario === "oversized-stream") assert.ok(text.includes("byte budget"), "Oversized response was not rejected by transport before decoding");
     if (scenario === "oversized-stream") assert.equal(before.streamCancelled, true, "Over-budget stream was not cancelled");

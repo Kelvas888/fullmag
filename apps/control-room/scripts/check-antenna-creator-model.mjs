@@ -16,7 +16,7 @@ function evaluateRange(source, startText, endText) {
 evaluateRange(commandSource, "function defaultMicrostripAntennaObject(", "function selectCommittedObject(");
 evaluateRange(panelSource, "function recordValue(", "function executionValue(");
 evaluateRange(panelSource, "function conductorDetails(", "export function AntennaConductorDetails(");
-const plain = (value) => JSON.parse(JSON.stringify(value));
+const plain = (value) => structuredClone(value);
 let checks = 0;
 function check(name, run) { run(); checks++; console.log(`PASS ${name}`); }
 const object = vm.runInContext('defaultCpwAntennaObject("immutable-cpw")', context);
@@ -69,9 +69,12 @@ check("CPW port weights and all six outward terminals agree with explicit curren
   assert.equal(transport.materials[0].material.sigma_Spm, params.conductivity_s_per_m);
   assert.equal(transport.conservative_current_view, undefined);
   const terminals = new Set();
+  const boundariesById = new Map(transport.boundaries.map((entry) => [entry.id, entry]));
+  assert.equal(boundariesById.size, transport.boundaries.length, "Terminal boundary IDs must be unique");
   for (const branch of port.branches) for (const [key, face, y] of [["inlet_terminal_ref", "min", -1], ["outlet_terminal_ref", "max", 1]]) {
     terminals.add(branch[key]);
-    const boundary = transport.boundaries.find((entry) => entry.id === branch[key]);
+    const boundary = boundariesById.get(branch[key]);
+    assert.ok(boundary, `Missing terminal boundary: ${branch[key]}`);
     assert.equal(boundary.kind, "equipotential_current_terminal");
     assert.equal(boundary.surfaces[0].surface_id, `antenna_terminal:${branch.id}:local_u_${face}`);
     assert.deepEqual(plain(boundary.surfaces[0].orientation), [0, y, 0]);
@@ -83,8 +86,10 @@ check("CPW Inspector shows all five station dimensions without microstrip return
   const details = vm.runInContext('conductorDetails("immutable-cpw", scene)', context);
   assert.ok(details.rows.some((row) => row.label === "Length"));
   assert.ok(!details.rows.some((row) => row.label === "Return width" || row.label === "Return offset"));
+  const rowsByLabel = new Map(details.rows.map((row) => [row.label, row]));
+  assert.equal(rowsByLabel.size, details.rows.length, "Inspector detail labels must be unique");
   for (const label of ["Signal width", "Left gap", "Right gap", "Left ground", "Right ground"]) {
-    const row = details.rows.find((entry) => entry.label === `1 · ${label}`);
+    const row = rowsByLabel.get(`1 · ${label}`);
     assert.ok(row && !row.value.includes("unavailable") && row.value.endsWith(" m"));
   }
 });
@@ -94,6 +99,8 @@ check("microstrip default port and Inspector remain compatible", () => {
   context.scene = { objects: [plain(vm.runInContext('defaultMicrostripAntennaObject("microstrip")', context))] };
   const details = vm.runInContext('conductorDetails("microstrip", scene)', context);
   assert.ok(details.rows.some((row) => row.label === "Return width"));
-  assert.ok(!details.rows.find((row) => row.label === "Station 1").value.includes("left gap"));
+  const station = details.rows.find((row) => row.label === "Station 1");
+  assert.ok(station, "Microstrip Inspector must include Station 1");
+  assert.ok(!station.value.includes("left gap"));
 });
 console.log(`PASS ${checks} production creator/detail checks; no backend or physics qualification`);

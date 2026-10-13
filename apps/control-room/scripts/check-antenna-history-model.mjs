@@ -16,7 +16,14 @@ const source = reference ? execFileSync("git", ["show", `${reference}:${relative
 const context = vm.createContext({ console });
 const controllerModule = new vm.SourceTextModule(stripTypeScriptTypes(source, { mode: "transform" }), { context });
 const invalidations = [];
+const payloadRelative = "apps/control-room/src/kernel/authoring/sceneDocumentPayload.ts";
+const payloadSource = reference ? execFileSync("git", ["show", `${reference}:${payloadRelative}`], { cwd: root, encoding: "utf8" })
+  : readFileSync(resolve(root, "src/kernel/authoring/sceneDocumentPayload.ts"), "utf8");
+const payloadModule = new vm.SourceTextModule(stripTypeScriptTypes(payloadSource), { context });
+await payloadModule.link(() => { throw new Error("Unexpected scene payload dependency"); });
+await payloadModule.evaluate();
 await controllerModule.link((specifier) => {
+  if (specifier === "./sceneDocumentPayload") return payloadModule;
   let exports;
   if (specifier === "../api/apiPaths") exports = { MODEL_SCENE_PATH: "/v2/sessions/current/model/scene" };
   else if (specifier === "./authoringMutationInvalidation") exports = { invalidateAuthoringMutationDependents: (...args) => invalidations.push(args) };
@@ -36,7 +43,7 @@ const before = { revision: 3, scene: { id: "placement-session" }, objects: [{ id
 const after = structuredClone(before);
 after.revision = 4;
 after.objects[0].transform.translation[2] = 100e-9;
-const json = (value) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+const json = (value) => structuredClone(value);
 const payload = sceneDocumentPayload(before);
 for (const name of collections) assert.deepEqual(json(payload[name]), before[name], `${name} must survive canonical scene snapshots`);
 assert.equal(payload.runtime_only, undefined);

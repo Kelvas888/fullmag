@@ -16,8 +16,8 @@ const end = commandSource.indexOf("\nfunction selectCommittedObject(", start);
 assert.ok(start >= 0 && end > start, "Default factory source boundaries must be explicit");
 vm.runInContext(stripTypeScriptTypes(commandSource.slice(start, end)), context);
 const created = vm.runInContext('defaultMicrostripFieldSolveStage("immutable-antenna")', context);
-assert.deepEqual(JSON.parse(JSON.stringify(created.target_refs)), [{ kind: "global" }]);
-assert.deepEqual(JSON.parse(JSON.stringify(created.field_sampling_domain)), { kind: "global" });
+assert.deepEqual(structuredClone(created.target_refs), [{ kind: "global" }]);
+assert.deepEqual(structuredClone(created.field_sampling_domain), { kind: "global" });
 assert.equal(created.source_object_id, "immutable-antenna");
 assert.ok(!validate(created, null).some((message) => message.includes("target")));
 const stage = { source_object_id: "conductor", current_transport_id: "current", port_mode_ids: ["port"],
