@@ -36,7 +36,7 @@ fn failure(message: impl Into<String>) -> crate::PreparationReceiptError {
     crate::PreparationReceiptError::Contract(message.into())
 }
 fn fingerprint(value: &impl Serialize) -> Result<String, crate::PreparationReceiptError> {
-    crate::preparation::fingerprint_json(value)
+    crate::preparation::fingerprint_json(value).map_err(|error| failure(error.to_string()))
 }
 
 /// The session owner supplies its canonical task identity; application does not derive store IDs.
