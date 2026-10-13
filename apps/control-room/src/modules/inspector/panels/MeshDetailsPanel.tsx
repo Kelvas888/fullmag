@@ -218,6 +218,8 @@ export function MeshDetailsPanel({ selection }: InspectorPanelProps) {
           fallbacks={model.fallbacks}
           lastBuildError={model.lastBuildError}
           latestSuccessAvailable={model.latestSuccessAvailable}
+          retainedArtifact={model.retainedArtifact}
+          sharedDomainBuildDisabledReason={model.sharedDomainBuildDisabledReason}
           sizeFieldKinds={model.sizeFieldKinds}
           onBuildSharedDomain={model.onBuildSharedDomain}
           onOpenBuildDetails={model.onOpenBuildDetails}
@@ -227,7 +229,10 @@ export function MeshDetailsPanel({ selection }: InspectorPanelProps) {
         <MixedTopologyProvenanceSection model={model.mixedTopology} />
       ) : null}
       {showSection("build-history") ? (
-        <MeshBuildHistorySection entries={model.buildHistoryEntries} />
+        <MeshBuildHistorySection
+          entries={model.buildHistoryEntries}
+          onRestore={model.onRestoreBuildToDraft}
+        />
       ) : null}
       {showSection("policy-comparison") ? (
         <MeshPolicyComparisonSection rows={model.policyDiffRows} />

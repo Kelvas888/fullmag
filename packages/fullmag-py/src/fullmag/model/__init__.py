@@ -1,5 +1,6 @@
 from .discretization import DiscretizationHints, FDM, FDMDemag, FDMGrid, FEM, FemLinearSolverPolicy, Hybrid, MeshOperation, MeshSizeControls, PerObjectMeshRecipe, SharedMeshAssemblyPolicy, SweepDistribution, SweptMeshControls
 from .absorbing_boundary import AbsorbingBoundaryLayer
+from .output_storage import OutputStorage
 from .antenna import (
     AntennaFieldSource,
     CPWAntenna,
@@ -69,6 +70,7 @@ from .energy import (
     Demag,
     Exchange,
     InterfacialDMI,
+    RotatedInterfacialDMI,
     Magnetoelastic,
     OerstedField,
     OerstedCylinder,
@@ -124,6 +126,8 @@ from .physics_scope import (
     build_physics_graph,
 )
 from .selection import Selection, SelectionDefinition, SelectionScalar
+from .parameters import ParameterDefinition, ParameterExpression, ParameterLibrary, ParameterValue
+from .authoring import ComponentDefinition, ModelDefinition, PhysicsConfiguration
 from .spin_torque import (
     ConstantEnvelope,
     InterfaceCppSTT,
@@ -189,10 +193,18 @@ __all__ = [
     "Selection",
     "SelectionDefinition",
     "SelectionScalar",
+    "ParameterDefinition",
+    "ParameterExpression",
+    "ParameterLibrary",
+    "ParameterValue",
+    "ComponentDefinition",
+    "ModelDefinition",
+    "PhysicsConfiguration",
     "BackendTarget",
     "CubicAnisotropy",
     "ThermalNoise",
     "FieldAutosave",
+    "OutputStorage",
     "StageAutosave",
     "TableAutosave",
     "GammaResponseAnalysis",

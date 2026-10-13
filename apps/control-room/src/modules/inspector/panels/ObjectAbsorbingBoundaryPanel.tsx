@@ -1,11 +1,16 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { SCENE_RESOURCE_KEY, useSceneResource } from "@/kernel/resources/geometryLifecycleResources";
+import {
+  authoringWriteOptions,
+  runAuthoringMutationWithHistory,
+} from "@/kernel/authoring/authoringHistoryMutation";
 import { useKernel } from "@/kernel/KernelContext";
 import { Button } from "@/shared/ui/Button";
 
+import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { FormField } from "../primitives/FormField";
 import { InspectorGroup } from "../primitives/InspectorGroup";
@@ -30,7 +35,7 @@ export function ObjectAbsorbingBoundaryPanel({
   objectId,
   baseRevision,
 }: ObjectAbsorbingBoundaryPanelProps) {
-  const { api, resources } = useKernel();
+  const { api, authoringHistory, commands, resources } = useKernel();
   const scene = useSceneResource();
   const object = useMemo(
     () => scene.data?.objects?.find((candidate) => candidate.id === objectId) ?? null,
@@ -40,16 +45,74 @@ export function ObjectAbsorbingBoundaryPanel({
     () => absorbingBoundaryDraftFromObject(object),
     [object],
   );
-  const baseKey = absorbingBoundaryDraftKey(baseDraft);
+  const [acknowledgedBase, setAcknowledgedBase] = useState<{
+    draft: AbsorbingBoundaryDraft;
+    objectId: string;
+    revision: number;
+  } | null>(null);
+  const resourceRevision = scene.data?.revision ?? baseRevision ?? -1;
+  const hasPendingAcknowledgedBase =
+    acknowledgedBase?.objectId === objectId &&
+    resourceRevision < acknowledgedBase.revision;
+  const effectiveBaseDraft = hasPendingAcknowledgedBase
+    ? acknowledgedBase.draft
+    : baseDraft;
+  const baseKey = `${objectId}:${absorbingBoundaryDraftKey(effectiveBaseDraft)}`;
   const [draftState, setDraftState] = useState<{ key: string; draft: AbsorbingBoundaryDraft }>({
     key: baseKey,
-    draft: baseDraft,
+    draft: effectiveBaseDraft,
   });
-  const draft = draftState.key === baseKey ? draftState.draft : baseDraft;
+  const draft = draftState.key === baseKey ? draftState.draft : effectiveBaseDraft;
+  const draftRef = useRef(draft);
+  useLayoutEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
   const [pending, setPending] = useState(false);
+  const applyInFlight = useRef(false);
   const [feedback, setFeedback] = useState<Feedback>(null);
-  const update = (patch: Partial<AbsorbingBoundaryDraft>) =>
-    setDraftState({ key: baseKey, draft: { ...draft, ...patch } });
+  const update = (patch: Partial<AbsorbingBoundaryDraft>) => {
+    const next = { ...draftRef.current, ...patch };
+    draftRef.current = next;
+    setDraftState({ key: baseKey, draft: next });
+  };
+  const dirty =
+    absorbingBoundaryDraftKey(draft) !==
+    absorbingBoundaryDraftKey(effectiveBaseDraft);
+  const validation = buildAbsorbingBoundaryPatch(draft, baseRevision);
+  const valid = object !== null && baseRevision !== null && !("error" in validation);
+
+  const acknowledgeAppliedDraft = useRegisterInspectorEditSession(
+    object ? "staged" : null,
+    pending,
+    dirty,
+    valid,
+    undefined,
+    apply,
+    resetDraft,
+    {
+      applyBlockReason:
+        object && baseRevision === null
+          ? "The canonical scene revision is unavailable. Refetch the scene before applying."
+          : undefined,
+      historyMode: "mutation-owned",
+    },
+  );
+
+  function createHistoryMutationContext() {
+    const sessionScopeKey = commands.getSessionScopeKey();
+    const historyGeneration = authoringHistory?.getGeneration?.();
+    return {
+      api,
+      authoringHistory,
+      resourceData: { [SCENE_RESOURCE_KEY]: scene.data },
+      sessionScopeKey: sessionScopeKey ?? null,
+      isCurrentSessionScope: () =>
+        commands.getSessionScopeKey() === sessionScopeKey &&
+        (historyGeneration === undefined ||
+          authoringHistory?.getGeneration?.() === historyGeneration),
+    };
+  }
+
   const toggleFace = (face: string) =>
     update({
       faces: draft.faces.includes(face)
@@ -57,24 +120,78 @@ export function ObjectAbsorbingBoundaryPanel({
         : [...draft.faces, face],
     });
 
-  async function apply(): Promise<void> {
-    const result = buildAbsorbingBoundaryPatch(draft, baseRevision);
+  function resetDraft(): void {
+    draftRef.current = effectiveBaseDraft;
+    setDraftState({ key: baseKey, draft: effectiveBaseDraft });
+    setFeedback(null);
+  }
+
+  async function apply(): Promise<boolean> {
+    if (applyInFlight.current) return false;
+    if (!object) {
+      setFeedback({ kind: "error", message: "The selected object is not available." });
+      return false;
+    }
+    const submittedDraft = draft;
+    const result = buildAbsorbingBoundaryPatch(submittedDraft, baseRevision);
     if ("error" in result) {
       setFeedback({ kind: "error", message: result.error });
-      return;
+      return false;
     }
+    const historyContext = createHistoryMutationContext();
+    if (!historyContext.sessionScopeKey) {
+      setFeedback({ kind: "error", message: "Session identity is not ready. Try again after it loads." });
+      return false;
+    }
+    applyInFlight.current = true;
     setPending(true);
     try {
-      const response = await api.model.patchObject(objectId, result.patch);
+      const response = await runAuthoringMutationWithHistory(
+        historyContext,
+        `Update absorbing boundary ${objectId}`,
+        async ({ baseRevision: capturedRevision }) => {
+          const commitRevision = capturedRevision ?? baseRevision;
+          if (typeof commitRevision !== "number" || !Number.isFinite(commitRevision)) {
+            throw new Error("The canonical scene revision is unavailable. Refetch the scene before applying.");
+          }
+          const next = buildAbsorbingBoundaryPatch(
+            submittedDraft,
+            commitRevision,
+          );
+          if ("error" in next) throw new Error(next.error);
+          return api.model.patchObject(
+            objectId,
+            next.patch,
+            authoringWriteOptions(commitRevision, historyContext.sessionScopeKey),
+          );
+        },
+      );
+      if (historyContext.isCurrentSessionScope() === false) return false;
       const revision = typeof response.revision === "number" ? response.revision : (baseRevision ?? 0) + 1;
+      const acknowledgedDraft = { ...submittedDraft };
+      setAcknowledgedBase({ objectId, revision, draft: acknowledgedDraft });
+      const latestDraft = draftRef.current;
+      const rebasedDraft = latestDraft === submittedDraft
+        ? acknowledgedDraft
+        : latestDraft;
+      draftRef.current = rebasedDraft;
+      setDraftState({
+        key: `${objectId}:${absorbingBoundaryDraftKey(acknowledgedDraft)}`,
+        draft: rebasedDraft,
+      });
+      if (latestDraft === submittedDraft && !acknowledgeAppliedDraft()) return false;
       resources.invalidate(SCENE_RESOURCE_KEY, revision);
       setFeedback({ kind: "success", message: "Absorbing boundary updated." });
+      return true;
     } catch (error) {
+      if (historyContext.isCurrentSessionScope() === false) return false;
       setFeedback({
         kind: "error",
         message: error instanceof Error ? error.message : String(error),
       });
+      return false;
     } finally {
+      applyInFlight.current = false;
       setPending(false);
     }
   }

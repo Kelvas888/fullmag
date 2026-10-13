@@ -38,6 +38,7 @@ import {
   buildViewport3DTargetFieldBuffer as buildViewport3DTargetFieldBufferWithResourceKey,
 } from "./model/viewport3DTargetFieldBuffer";
 import { buildViewport3DTopologyIndexBundle } from "./viewport3dTopologyIndexModel";
+import { srgbToLinearChannel } from "./viewport3dColorSpace";
 import { magnitudeColorRgb } from "./viewport3dVectorColoring";
 
 type TargetFieldBufferOptions = Parameters<
@@ -52,7 +53,7 @@ function buildViewport3DTargetFieldBuffer(
     sessionIdentity:
       "sessionIdentity" in options
         ? options.sessionIdentity
-        : { sessionEpoch: "test-session@1000", sessionId: "test-session" },
+        : { sessionEpoch: "test-session@1000", sessionId: "test-session", requestScopeEpoch: "test-api:1" },
     resourceKey: serializeCanonicalFieldVectorResourceKey(
       canonicalFieldVectorQuery(options.fieldVector.quantityId, options.query),
     ),
@@ -1389,10 +1390,20 @@ describe("viewport3dRenderModel", () => {
 
     expect(
       Array.from(phaseZero?.scalarColorsByMode.get("x")?.scalarValues ?? []),
-    ).toEqual([1, 3, 5, 7]);
+    ).toEqual([
+      0,
+      expect.closeTo(1 / 3, 4),
+      expect.closeTo(2 / 3, 4),
+      1,
+    ]);
     expect(
       Array.from(phaseQuarter?.scalarColorsByMode.get("x")?.scalarValues ?? []),
-    ).toEqual([-2, -4, -6, -8]);
+    ).toEqual([
+      1,
+      expect.closeTo(2 / 3, 4),
+      expect.closeTo(1 / 3, 4),
+      0,
+    ]);
     expect(
       Array.from(
         phaseQuarter?.scalarColorsByMode.get("x")?.complexRealValues ?? [],
@@ -2428,7 +2439,7 @@ describe("viewport3dRenderModel", () => {
       rangeSource: "face_values",
     });
     expect(Array.from(surface?.scalarColors?.scalarValues ?? [])).toEqual([
-      3, 3, 3,
+      0.5, 0.5, 0.5,
     ]);
   });
 
@@ -2901,11 +2912,11 @@ describe("viewport3dRenderModel", () => {
     expect(colors).toBeDefined();
     expect(Array.from(colors!.slice(0, 6))).toEqual([0, 0, 0, 0, 0, 0]);
     expect(Array.from(colors!.slice(6, 9))).toEqual(
-      Array.from(Float32Array.from(magnitudeColorRgb(0))),
+      Array.from(Float32Array.from(magnitudeColorRgb(0).map(srgbToLinearChannel))),
     );
     expect(Array.from(colors!.slice(9, 12))).toEqual([0, 0, 0]);
     expect(Array.from(colors!.slice(12, 15))).toEqual(
-      Array.from(Float32Array.from(magnitudeColorRgb(1))),
+      Array.from(Float32Array.from(magnitudeColorRgb(1).map(srgbToLinearChannel))),
     );
   });
 
@@ -2962,7 +2973,7 @@ describe("viewport3dRenderModel", () => {
         model?.scalarColorsByPartAndMode.get("part-a")?.get("x")?.scalarValues ??
           [],
       ),
-    ).toEqual([1, 0.5, -0.5, -1]);
+    ).toEqual([1, 0.75, 0.25, 0]);
   });
 
   it("rejects scoped per-part scalar colors without explicit node indices", () => {

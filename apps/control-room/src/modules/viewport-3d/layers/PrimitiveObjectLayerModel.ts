@@ -117,7 +117,9 @@ export function createPrimitiveObjectGeometry(
     return new SphereGeometry(Math.max(x, y, z) / 2, 32, 16);
   }
   if (object.kind === "cylinder") {
-    return new CylinderGeometry(x / 2, x / 2, y, 32, 1);
+    const geometry = new CylinderGeometry(x / 2, x / 2, z, 32, 1);
+    geometry.rotateX(Math.PI / 2);
+    return geometry;
   }
   return new BoxGeometry(x, y, z);
 }

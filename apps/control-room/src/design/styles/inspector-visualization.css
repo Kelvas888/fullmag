@@ -584,19 +584,7 @@
    MICRO-ANIMATIONS & INTERACTION POLISH
 ────────────────────────────────────────────── */
 
-/* InspectorGroup content: animate open/close */
-[data-slot="inspector-group-content"] {
-  transition: opacity var(--fm-duration-moderate) ease;
-}
-
-[data-collapsible="true"][data-open="false"] [data-slot="inspector-group-content"] {
-  opacity: 0;
-}
-
-[data-collapsible="true"][data-open="true"] [data-slot="inspector-group-content"] {
-  opacity: 1;
-}
-
+/* Inspector controls stay opaque through disclosure and resource updates. */
 /* Nav row: subtle lift on hover */
 .fm-inspector-group-nav-trigger {
   transition:

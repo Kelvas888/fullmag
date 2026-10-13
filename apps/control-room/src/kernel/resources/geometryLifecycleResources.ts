@@ -108,6 +108,10 @@ import {
   type DecodedTopology,
 } from "../api/codecs";
 import { ControlRoomApiError } from "../api/ControlRoomApi";
+import {
+  resolveArtifactAssessment,
+  type ArtifactAssessment,
+} from "@/shared/domain/mesh/artifactAssessment";
 import { useKernel } from "../KernelContext";
 import type { ResourceInvalidationController } from "./ResourceInvalidationController";
 import {
@@ -115,6 +119,7 @@ import {
   type ResourceRuntimeStore,
 } from "./ResourceRuntimeStore";
 import { ResourceCache } from "./ResourceCache";
+import { resourceRuntimeKeyForClientScope } from "./resourceClientScope";
 export {
   VISUALIZATION_STATE_RESOURCE_KEY,
   resolveVisualizationStateRevision,
@@ -122,6 +127,8 @@ export {
 } from "../visualization/useVisualizationStateResource";
 
 import { useResource } from "./useResource";
+import { sessionScopedResourceKey } from "./sessionResourceIdentity";
+import { useSessionScopedResourceKey } from "./useSessionScopedResourceKey";
 import type { ResourceResult, ResourceStatus } from "./resourceTypes";
 
 interface ResourceHookOptions {
@@ -222,6 +229,29 @@ export const MESH_SHARED_DOMAIN_QUALITY_GATES_RESOURCE_KEY =
   MESHING_SHARED_DOMAIN_QUALITY_GATES_PATH;
 export const MESH_SHARED_DOMAIN_REALIZED_SIZE_FIELDS_RESOURCE_KEY =
   MESHING_SHARED_DOMAIN_REALIZED_SIZE_FIELDS_PATH;
+
+/** Invalidate every resource published by an FDM grid/membership replan. */
+export function invalidateFdmGridResources(
+  resources: Pick<ResourceInvalidationController, "invalidate">,
+  revision: ResourceRevision,
+): void {
+  for (const resourceKey of [
+    MESHING_BUILDS_PATH,
+    MESHING_BUILDS_CURRENT_PATH,
+    MESHING_BUILDS_LATEST_SUCCESSFUL_PATH,
+    MESHING_SUMMARY_PATH,
+    MESHING_SEMANTICS_PATH,
+    MESHING_SHARED_DOMAIN_MANIFEST_PATH,
+    MESHING_SHARED_DOMAIN_REPORT_PATH,
+    MESHING_SHARED_DOMAIN_QUALITY_PATH,
+    MESHING_SHARED_DOMAIN_QUALITY_DATA_PATH,
+    MESHING_SHARED_DOMAIN_QUALITY_GATES_PATH,
+    MESHING_SHARED_DOMAIN_REALIZED_SIZE_FIELDS_PATH,
+  ]) {
+    resources.invalidate(resourceKey, revision);
+  }
+}
+
 export const FDM_REGION_MEMBERSHIPS_RESOURCE_KEY =
   DATA_FDM_REGION_MEMBERSHIPS_PATH;
 export const FDM_REGION_MEMBERSHIP_BINARY_RESOURCE_KEY =
@@ -512,23 +542,57 @@ export function publishCommittedSceneResource(
   runtimeStore: ResourceRuntimeStore<SceneResource> =
     sharedResourceRuntimeStore as ResourceRuntimeStore<SceneResource>,
   invalidate = true,
+  sessionScopeKey?: string | null,
+  resourceCacheScope?: string | null,
 ): void {
-  runtimeStore.updateData(SCENE_RESOURCE_KEY, scene, revision);
-  if (invalidate) resources.invalidate(SCENE_RESOURCE_KEY, revision);
+  const publish = resourceCacheScope
+    ? runtimeStore.updateObservedData.bind(runtimeStore)
+    : runtimeStore.updateData.bind(runtimeStore);
+  publish(
+    resourceRuntimeKeyForClientScope(SCENE_RESOURCE_KEY, resourceCacheScope),
+    scene,
+    revision,
+  );
+  // Client-owned publications must not create unobserved aliases or resurrect
+  // a disposed owner's snapshots. Canonical invalidation lets future observers
+  // fetch authoritative data through their own session and client scope.
+  if (sessionScopeKey) {
+    publish(
+      resourceRuntimeKeyForClientScope(
+        `${sessionScopeKey}|${SCENE_RESOURCE_KEY}`,
+        resourceCacheScope,
+      ),
+      scene,
+      revision,
+    );
+  }
+  if (invalidate) {
+    if (sessionScopeKey) {
+      resources.invalidate(
+        `${sessionScopeKey}|${SCENE_RESOURCE_KEY}`,
+        revision,
+      );
+    } else {
+      resources.invalidate(SCENE_RESOURCE_KEY, revision);
+    }
+  }
 }
 
 export function useSceneResource(options: ResourceHookOptions = {}) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    SCENE_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) => api.model.scene({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => api.model.scene({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<SceneResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveSceneResourceRevision,
-    resourceKey: SCENE_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -536,17 +600,20 @@ export function useGeometryDiagnosticsResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    GEOMETRY_DIAGNOSTICS_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.model.geometry.diagnostics({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.model.geometry.diagnostics({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<GeometryDiagnosticsResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: GEOMETRY_DIAGNOSTICS_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -554,17 +621,20 @@ export function useGeometryCapabilitiesResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    GEOMETRY_CAPABILITIES_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.model.geometry.capabilities({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.model.geometry.capabilities({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<GeometryCapabilitiesResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: GEOMETRY_CAPABILITIES_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -572,34 +642,41 @@ export function useGeometryValidationResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    GEOMETRY_VALIDATION_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.model.geometry.validation({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.model.geometry.validation({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<GeometryValidationResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveSceneResourceRevision,
-    resourceKey: GEOMETRY_VALIDATION_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
 export function useMaterialResource(materialId: string | null | undefined) {
   const { api } = useKernel();
-  const resourceKey = materialId
+  const unscopedResourceKey = materialId
     ? resolveMaterialResourceKey(materialId)
     : MODEL_MATERIAL_PATH;
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) => {
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => {
       if (!materialId) return Promise.resolve(null);
-      return api.model.material(materialId, { signal });
+      return api.model.material(materialId, { sessionScopeKey, signal });
     },
     [api, materialId],
   );
 
   return useResource<MaterialResource | null>({
+    enabled: Boolean(materialId) && sessionIdentity !== null,
     load,
     resolveRevision: resolveRegionCoefficientsRevision,
     resourceKey,
@@ -611,19 +688,25 @@ export function useMagnetizationAssetResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
-  const resourceKey = assetId
+  const unscopedResourceKey = assetId
     ? resolveMagnetizationAssetResourceKey(assetId)
     : MODEL_MAGNETIZATION_ASSET_PATH;
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) => {
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => {
       if (!assetId) return Promise.resolve(null);
-      return api.model.magnetizationAsset(assetId, { signal });
+      return api.model.magnetizationAsset(assetId, { sessionScopeKey, signal });
     },
     [api, assetId],
   );
 
   return useResource<MagnetizationAssetResource | null>({
-    enabled: options.enabled,
+    enabled:
+      options.enabled !== false &&
+      Boolean(assetId) &&
+      sessionIdentity !== null,
     load,
     resolveRevision: resolveMagnetizationAssetResourceRevision,
     resourceKey,
@@ -632,16 +715,19 @@ export function useMagnetizationAssetResource(
 
 export function useModelRegionsResource(options: ResourceHookOptions = {}) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MODEL_REGIONS_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) => api.model.regions({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => api.model.regions({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<RegionListResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveRegionRealizationRevision,
-    resourceKey: MODEL_REGIONS_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -649,17 +735,20 @@ export function useModelRealizedRegionsResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MODEL_REALIZED_REGIONS_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.model.realizedRegions({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.model.realizedRegions({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<RegionListResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveRegionRealizationRevision,
-    resourceKey: MODEL_REALIZED_REGIONS_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -667,17 +756,20 @@ export function useModelRegionDiagnosticsResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MODEL_REGION_DIAGNOSTICS_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.model.regionDiagnostics({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.model.regionDiagnostics({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<RegionDiagnosticsResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveRegionRealizationRevision,
-    resourceKey: MODEL_REGION_DIAGNOSTICS_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -685,17 +777,20 @@ export function useModelMaterialFieldsResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MODEL_MATERIAL_FIELDS_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.model.materialFields({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.model.materialFields({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MaterialParameterFieldListResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveRegionCoefficientsRevision,
-    resourceKey: MODEL_MATERIAL_FIELDS_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -703,32 +798,38 @@ export function useModelCouplingsResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MODEL_COUPLINGS_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) => api.model.couplings({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => api.model.couplings({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<CouplingListResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: (data) => data?.scene_revision ?? null,
-    resourceKey: MODEL_COUPLINGS_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
 export function useMeshBuildCurrent(options: ResourceHookOptions = {}) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_BUILD_CURRENT_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.builds.current({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.builds.current({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshActiveBuildResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_BUILD_CURRENT_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -736,17 +837,20 @@ export function useMeshBuildLatestSuccessful(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.builds.latestSuccessful({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.builds.latestSuccessful({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshLastSuccessfulBuildResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_BUILD_LATEST_SUCCESSFUL_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -754,64 +858,76 @@ export function useMeshBuildHistoryResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_BUILD_HISTORY_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.builds.history({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.builds.history({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshBuildHistoryResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_BUILD_HISTORY_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
 export function useMeshSummaryResource(options: ResourceHookOptions = {}) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_SUMMARY_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) => api.meshing.summary({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => api.meshing.summary({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshSummaryResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_SUMMARY_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
 export function useMeshCapabilitiesResource(options: ResourceHookOptions = {}) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_CAPABILITIES_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.capabilities({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.capabilities({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshCapabilitiesResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_CAPABILITIES_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
 export function useMeshSemanticsResource(options: ResourceHookOptions = {}) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_SEMANTICS_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.semantics({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.semantics({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshSemanticsResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_SEMANTICS_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -819,32 +935,39 @@ export function useMeshSharedDomainManifestResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_SHARED_DOMAIN_MANIFEST_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.sharedDomain.manifest({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.sharedDomain.manifest({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshSharedDomainManifestResource | null>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveMeshSharedDomainManifestRevision,
-    resourceKey: MESH_SHARED_DOMAIN_MANIFEST_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
-export function useMeshSharedDomainPolicyResource() {
+export function useMeshSharedDomainPolicyResource(options: ResourceHookOptions = {}) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_SHARED_DOMAIN_POLICY_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.sharedDomain.policy({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.sharedDomain.policy({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshSharedDomainConfigResource>({
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_SHARED_DOMAIN_POLICY_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -852,17 +975,20 @@ export function useMeshSharedDomainReportResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_SHARED_DOMAIN_REPORT_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.sharedDomain.report({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.sharedDomain.report({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshSharedDomainReportResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_SHARED_DOMAIN_REPORT_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -870,17 +996,20 @@ export function useMeshSharedDomainQualityResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_SHARED_DOMAIN_QUALITY_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.sharedDomain.quality({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.sharedDomain.quality({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshSharedDomainQualityResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_SHARED_DOMAIN_QUALITY_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -888,9 +1017,12 @@ export function useMeshSharedDomainQualityDataResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_SHARED_DOMAIN_QUALITY_DATA_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.sharedDomain.qualityData({ signal }).then((result) => {
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.sharedDomain.qualityData({ sessionScopeKey, signal }).then((result) => {
         if (result.status === "ready") return result.data;
         return null;
       }),
@@ -898,9 +1030,9 @@ export function useMeshSharedDomainQualityDataResource(
   );
 
   return useResource<DecodedMeshQualityData | null>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
-    resourceKey: MESH_SHARED_DOMAIN_QUALITY_DATA_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -908,9 +1040,12 @@ export function useMeshSharedDomainTopologyResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_SHARED_DOMAIN_TOPOLOGY_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.sharedDomain.topology({ signal }).then((result) => {
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.sharedDomain.topology({ sessionScopeKey, signal }).then((result) => {
         if (result.status === "ready") return result.data;
         return null;
       }),
@@ -918,9 +1053,9 @@ export function useMeshSharedDomainTopologyResource(
   );
 
   return useResource<DecodedTopology | null>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
-    resourceKey: MESH_SHARED_DOMAIN_TOPOLOGY_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -929,14 +1064,20 @@ export function useMeshHistogramBinElementsResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
-  const enabled = options.enabled !== false && query !== null;
-  const resourceKey = query
+  const unscopedResourceKey = query
     ? resolveMeshHistogramBinElementsResourceKey(query)
     : `${MESHING_HISTOGRAM_BIN_ELEMENTS_PATH}:none`;
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
+  );
+  const enabled =
+    options.enabled !== false &&
+    query !== null &&
+    sessionIdentity !== null;
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
       query
-        ? api.meshing.histogramBinElements(query, { signal })
+        ? api.meshing.histogramBinElements(query, { sessionScopeKey, signal })
         : Promise.resolve(null),
     [api, query],
   );
@@ -953,17 +1094,20 @@ export function useMeshSharedDomainQualityGatesResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_SHARED_DOMAIN_QUALITY_GATES_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.sharedDomain.qualityGates({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.sharedDomain.qualityGates({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshQualityGatesResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_SHARED_DOMAIN_QUALITY_GATES_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -971,17 +1115,20 @@ export function useMeshSharedDomainRealizedSizeFieldsResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_SHARED_DOMAIN_REALIZED_SIZE_FIELDS_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.sharedDomain.realizedSizeFields({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.sharedDomain.realizedSizeFields({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshRealizedSizeFieldsResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_SHARED_DOMAIN_REALIZED_SIZE_FIELDS_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -991,14 +1138,20 @@ export function useMeshRegionMembershipResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
-  const enabled = options.enabled !== false && Boolean(ownerObjectId && regionId);
-  const resourceKey = ownerObjectId && regionId
+  const unscopedResourceKey = ownerObjectId && regionId
     ? meshRegionMembershipResourceKey(ownerObjectId, regionId)
     : `${DATA_MESH_REGION_MEMBERSHIP_PATH}:none`;
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
+  );
+  const enabled =
+    options.enabled !== false &&
+    Boolean(ownerObjectId && regionId) &&
+    sessionIdentity !== null;
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
       ownerObjectId && regionId
-        ? api.data.meshRegionMembership(ownerObjectId, regionId, { signal })
+        ? api.data.meshRegionMembership(ownerObjectId, regionId, { sessionScopeKey, signal })
         : Promise.resolve(null),
     [api, ownerObjectId, regionId],
   );
@@ -1020,13 +1173,21 @@ export function useMeshRegionMembershipsResource(
     () => normalizeMeshRegionMembershipIds(regionIds),
     [regionIds],
   );
-  const enabled = options.enabled !== false && normalizedRegionIds.length > 0;
-  const resourceKey = resolveMeshRegionMembershipsResourceKey(normalizedRegionIds);
+  const unscopedResourceKey = resolveMeshRegionMembershipsResourceKey(
+    normalizedRegionIds,
+  );
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
+  );
+  const enabled =
+    options.enabled !== false &&
+    normalizedRegionIds.length > 0 &&
+    sessionIdentity !== null;
   const load = useCallback(
-    async ({ signal }: { signal: AbortSignal }) => {
+    async ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => {
       if (normalizedRegionIds.length === 0) return [];
       const regionIdSet = new Set(normalizedRegionIds);
-      const memberships = await api.data.meshRegionMemberships({ signal });
+      const memberships = await api.data.meshRegionMemberships({ sessionScopeKey, signal });
       return memberships.memberships.filter((membership) =>
         regionIdSet.has(membership.region_id),
       );
@@ -1046,12 +1207,15 @@ export function useFdmRegionMembershipResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    FDM_REGION_MEMBERSHIPS_RESOURCE_KEY,
+  );
   const multilayerLayout = useFdmMultilayerLayoutResource({
     enabled: options.enabled,
   });
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.data.fdmRegionMemberships({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.data.fdmRegionMemberships({ sessionScopeKey, signal }),
     [api],
   );
 
@@ -1060,13 +1224,13 @@ export function useFdmRegionMembershipResource(
       options.enabled === true,
       multilayerLayout.status,
       multilayerLayout.data,
-    ),
+    ) && sessionIdentity !== null,
     load,
     resolveRevision: (result) =>
       result.status === "ready"
         ? resolveFdmRegionMembershipRevision(result.data)
         : null,
-    resourceKey: FDM_REGION_MEMBERSHIPS_RESOURCE_KEY,
+    resourceKey,
   });
 
   return resolveFdmRegionMembershipDescriptorResult(resource);
@@ -1129,15 +1293,18 @@ function resolveDomainMetaRevision(meta: DomainMetaResource | null): ResourceRev
 /** Shared DomainMeta ownership for Explorer and other non-viewport consumers. */
 export function useDomainMetaResource(options: ResourceHookOptions = {}) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    DATA_DOMAIN_META_PATH,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) => api.data.domain.meta({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => api.data.domain.meta({ sessionScopeKey, signal }),
     [api],
   );
   return useResource<DomainMetaResource | null>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveDomainMetaRevision,
-    resourceKey: DATA_DOMAIN_META_PATH,
+    resourceKey,
   });
 }
 
@@ -1153,16 +1320,19 @@ export function useFdmMultilayerLayoutResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    DATA_DOMAIN_FDM_MULTILAYER_LAYOUT_PATH,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.data.domain.fdmMultilayerLayout({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.data.domain.fdmMultilayerLayout({ sessionScopeKey, signal }),
     [api],
   );
   return useResource<FdmMultilayerLayoutResource | null>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveFdmMultilayerLayoutRevision,
-    resourceKey: DATA_DOMAIN_FDM_MULTILAYER_LAYOUT_PATH,
+    resourceKey,
   });
 }
 
@@ -1192,13 +1362,16 @@ export function useFdmMultilayerLayerActiveMasksResource(
         : [],
     [layout],
   );
-  const resourceKey = useMemo(
+  const unscopedResourceKey = useMemo(
     () =>
       `${DATA_DOMAIN_FDM_MULTILAYER_LAYER_ACTIVE_MASK_PATH}:layout:${layout?.layout_revision ?? "none"}:${maskedLayers.map((layer) => `${layer.layer_id}:${layer.active_mask_hash ?? "missing"}`).join("|")}`,
     [layout?.layout_revision, maskedLayers],
   );
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
+  );
   const load = useCallback(
-    async ({ signal }: { signal: AbortSignal }) => {
+    async ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => {
       if (!layout?.available) {
         return {
           incompatibleLayerIds: [] as string[],
@@ -1213,15 +1386,18 @@ export function useFdmMultilayerLayerActiveMasksResource(
             incompatibleLayerIds.push(layer.layer_id);
             return;
           }
-          const cacheKey = fdmMultilayerLayerActiveMaskResourceKey(
+          const unscopedCacheKey = fdmMultilayerLayerActiveMaskResourceKey(
             layer.layer_id,
             layout.layout_revision,
             layer.active_mask_hash,
           );
+          const cacheKey = sessionIdentity
+            ? sessionScopedResourceKey(sessionIdentity, unscopedCacheKey)
+            : unscopedCacheKey;
           const cached = fdmMultilayerActiveMaskCache.peek(cacheKey);
           const response = await api.data.domain.fdmMultilayerLayerActiveMaskBytes(
             layer.layer_id,
-            { etag: cached?.etag, signal },
+            { etag: cached?.etag, sessionScopeKey, signal },
           );
           let decoded: DecodedFdmMultilayerActiveMask;
           if (response.status === "not-modified") {
@@ -1260,14 +1436,15 @@ export function useFdmMultilayerLayerActiveMasksResource(
       );
       return { incompatibleLayerIds, masks };
     },
-    [api, layout, maskedLayers],
+    [api, layout, maskedLayers, sessionIdentity],
   );
   return useResource<FdmMultilayerLayerActiveMasksData>({
     abortStaleInflight: true,
     enabled:
       options.enabled !== false &&
       Boolean(layout?.available) &&
-      maskedLayers.length > 0,
+      maskedLayers.length > 0 &&
+      sessionIdentity !== null,
     load,
     resolveRevision: () => layout?.layout_revision ?? null,
     resourceKey,
@@ -1292,10 +1469,13 @@ export function useFdmRegionMembershipBinaryResource(
           options.expectedGridFingerprint ?? "descriptor",
         ].join(":")
       : options.revision;
-  const resourceKey = resolveFdmRegionMembershipBinaryResourceKey(
+  const unscopedResourceKey = resolveFdmRegionMembershipBinaryResourceKey(
     normalizedRegionId,
     contractRevision,
     normalizedOwnerObjectId,
+  );
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
   );
   const prerequisite: FdmRegionMembershipAvailability =
     descriptor.availability.status !== "ready"
@@ -1319,7 +1499,7 @@ export function useFdmRegionMembershipBinaryResource(
               };
   const contractReady = prerequisite.status === "ready";
   const load = useCallback(
-    async ({ signal }: { signal: AbortSignal }) => {
+    async ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => {
       if (!descriptor.data || !domain.data) {
         return { reason: "not-materialized", status: "pending" } as const;
       }
@@ -1327,10 +1507,12 @@ export function useFdmRegionMembershipBinaryResource(
       const result = await (normalizedRegionId
         ? api.data.fdmRegionMembershipRegionBytes(normalizedOwnerObjectId, normalizedRegionId, {
             etag: cached?.etag,
+            sessionScopeKey,
             signal,
           })
         : api.data.fdmRegionMembershipBytes({
             etag: cached?.etag,
+            sessionScopeKey,
             signal,
           }));
 
@@ -1391,7 +1573,10 @@ export function useFdmRegionMembershipBinaryResource(
 
   const resource = useResource<FdmRegionMembershipBinaryLoadResult>({
     abortStaleInflight: true,
-    enabled: options.enabled !== false && contractReady,
+    enabled:
+      options.enabled !== false &&
+      contractReady &&
+      sessionIdentity !== null,
     load,
     resolveRevision,
     resourceKey,
@@ -1449,17 +1634,20 @@ export function useMeshUniverseReportResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_UNIVERSE_REPORT_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.universeReport({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.universeReport({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshUniverseReportResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_UNIVERSE_REPORT_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -1467,17 +1655,20 @@ export function useMeshUniverseQualityResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_UNIVERSE_QUALITY_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.universeQuality({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.universeQuality({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshUniverseQualityResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_UNIVERSE_QUALITY_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -1486,14 +1677,20 @@ export function useObjectTopologyResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
-  const enabled = options.enabled !== false && Boolean(objectId);
-  const resourceKey = objectId
+  const unscopedResourceKey = objectId
     ? resolveObjectTopologyResourceKey(objectId)
     : MESHING_OBJECT_TOPOLOGY_PATH;
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
+  );
+  const enabled =
+    options.enabled !== false &&
+    Boolean(objectId) &&
+    sessionIdentity !== null;
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) => {
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => {
       if (!objectId) return Promise.resolve(null);
-      return api.meshing.objectTopology(objectId, { signal }).then((result) => {
+      return api.meshing.objectTopology(objectId, { sessionScopeKey, signal }).then((result) => {
         if (result.status === "ready") return result.data;
         return null;
       });
@@ -1513,14 +1710,20 @@ export function useObjectMeshReportResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
-  const enabled = options.enabled !== false && Boolean(objectId);
-  const resourceKey = objectId
+  const unscopedResourceKey = objectId
     ? resolveObjectMeshReportResourceKey(objectId)
     : MESHING_OBJECT_REPORT_PATH;
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
+  );
+  const enabled =
+    options.enabled !== false &&
+    Boolean(objectId) &&
+    sessionIdentity !== null;
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) => {
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => {
       if (!objectId) return Promise.resolve(null);
-      return api.meshing.objectReport(objectId, { signal });
+      return api.meshing.objectReport(objectId, { sessionScopeKey, signal });
     },
     [api, objectId],
   );
@@ -1538,14 +1741,20 @@ export function useObjectMeshQualityResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
-  const enabled = options.enabled !== false && Boolean(objectId);
-  const resourceKey = objectId
+  const unscopedResourceKey = objectId
     ? resolveObjectMeshQualityResourceKey(objectId)
     : MESHING_OBJECT_QUALITY_PATH;
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
+  );
+  const enabled =
+    options.enabled !== false &&
+    Boolean(objectId) &&
+    sessionIdentity !== null;
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) => {
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => {
       if (!objectId) return Promise.resolve(null);
-      return api.meshing.objectQuality(objectId, { signal });
+      return api.meshing.objectQuality(objectId, { sessionScopeKey, signal });
     },
     [api, objectId],
   );
@@ -1563,14 +1772,20 @@ export function useMeshRegionQualityResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
-  const enabled = options.enabled !== false && Boolean(regionId);
-  const resourceKey = regionId
+  const unscopedResourceKey = regionId
     ? resolveMeshRegionQualityResourceKey(regionId)
     : MESHING_REGION_QUALITY_PATH;
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
+  );
+  const enabled =
+    options.enabled !== false &&
+    Boolean(regionId) &&
+    sessionIdentity !== null;
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) => {
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => {
       if (!regionId) return Promise.resolve(null);
-      return api.meshing.regionQuality(regionId, { signal });
+      return api.meshing.regionQuality(regionId, { sessionScopeKey, signal });
     },
     [api, regionId],
   );
@@ -1588,17 +1803,23 @@ export function useObjectMeshSizeFieldResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
-  const enabled = options.enabled !== false && Boolean(objectId);
-  const resourceKey = objectId
+  const unscopedResourceKey = objectId
     ? MESHING_OBJECT_SIZE_FIELD_PATH.replace(
         "{object_id}",
         encodeURIComponent(objectId),
       )
     : MESHING_OBJECT_SIZE_FIELD_PATH;
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
+  );
+  const enabled =
+    options.enabled !== false &&
+    Boolean(objectId) &&
+    sessionIdentity !== null;
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) => {
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => {
       if (!objectId) return Promise.resolve(null);
-      return api.meshing.objectSizeField(objectId, { signal });
+      return api.meshing.objectSizeField(objectId, { sessionScopeKey, signal });
     },
     [api, objectId],
   );
@@ -1616,14 +1837,20 @@ export function useObjectMeshPolicyResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
-  const enabled = options.enabled !== false && Boolean(objectId);
-  const resourceKey = objectId
+  const unscopedResourceKey = objectId
     ? resolveObjectMeshPolicyResourceKey(objectId)
     : MESHING_OBJECT_POLICY_PATH;
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
+  );
+  const enabled =
+    options.enabled !== false &&
+    Boolean(objectId) &&
+    sessionIdentity !== null;
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) => {
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => {
       if (!objectId) return Promise.resolve(defaultObjectMeshPolicyResource(""));
-      return api.meshing.objectPolicy(objectId, { signal });
+      return api.meshing.objectPolicy(objectId, { sessionScopeKey, signal });
     },
     [api, objectId],
   );
@@ -1638,17 +1865,20 @@ export function useObjectMeshPolicyResource(
 
 export function useUniverseMeshPolicyResource(options: ResourceHookOptions = {}) {
   const { api } = useKernel();
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    MESH_UNIVERSE_POLICY_RESOURCE_KEY,
+  );
   const load = useCallback(
-    ({ signal }: { signal: AbortSignal }) =>
-      api.meshing.universePolicy({ signal }),
+    ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) =>
+      api.meshing.universePolicy({ sessionScopeKey, signal }),
     [api],
   );
 
   return useResource<MeshUniverseConfigResource>({
-    enabled: options.enabled,
+    enabled: options.enabled !== false && sessionIdentity !== null,
     load,
     resolveRevision: resolveJsonResourceRevision,
-    resourceKey: MESH_UNIVERSE_POLICY_RESOURCE_KEY,
+    resourceKey,
   });
 }
 
@@ -1658,17 +1888,21 @@ export function useObjectInteractionResource(
   options: ResourceHookOptions = {},
 ) {
   const { api } = useKernel();
-  const resourceKey = objectId
+  const unscopedResourceKey = objectId
     ? resolveObjectInteractionResourceKey(objectId, interactionKind)
     : MODEL_OBJECT_INTERACTION_PATH;
+  const { resourceKey, sessionIdentity } = useSessionScopedResourceKey(
+    unscopedResourceKey,
+  );
   const load = useCallback(
-    async ({ signal }: { signal: AbortSignal }) => {
+    async ({ sessionScopeKey, signal }: { sessionScopeKey?: string; signal: AbortSignal }) => {
       if (!objectId) {
         return defaultObjectInteractionResource("", interactionKind);
       }
 
       try {
         return await api.model.objectInteraction(objectId, interactionKind, {
+          sessionScopeKey,
           signal,
         });
       } catch (error) {
@@ -1686,7 +1920,10 @@ export function useObjectInteractionResource(
   );
 
   return useResource<ObjectInteractionResource>({
-    enabled: options.enabled,
+    enabled:
+      options.enabled !== false &&
+      Boolean(objectId) &&
+      sessionIdentity !== null,
     load,
     resourceKey,
   });
@@ -1732,3 +1969,36 @@ function resolveRevisionProperty(
 
   return null;
 }
+
+/**
+ * Single shared artifact assessment selector across Control Room (PR08/PR10/D06).
+ */
+export function useMeshArtifactAssessment(
+  options: ResourceHookOptions = {},
+): ArtifactAssessment {
+  const scene = useSceneResource(options);
+  const manifest = useMeshSharedDomainManifestResource(options);
+  const activeBuild = useMeshBuildCurrent(options);
+  const latestBuild = useMeshBuildLatestSuccessful(options);
+  const summary = useMeshSummaryResource(options);
+
+  return useMemo(() => {
+    return resolveArtifactAssessment({
+      activeBuild: activeBuild.data?.active_build,
+      latestBuild: latestBuild.data?.last_success,
+      manifest: manifest.data as Record<string, unknown> | null | undefined,
+      resourceLoadState: manifest.status,
+      sceneRevision: scene.data?.revision ?? scene.data?.scene_revision,
+      statusMeshRevision: summary.data?.revision,
+    });
+  }, [
+    activeBuild.data?.active_build,
+    latestBuild.data?.last_success,
+    manifest.data,
+    manifest.status,
+    scene.data?.revision,
+    scene.data?.scene_revision,
+    summary.data?.revision,
+  ]);
+}
+

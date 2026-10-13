@@ -1,0 +1,99 @@
+{
+  "scope": "independent specification algebra; not production tests",
+  "status": "pass",
+  "checks": [
+    {
+      "name": "TRS linear and affine matrix",
+      "passed": true,
+      "details": {
+        "computed_offset_m": [
+          1.7000000000000001e-07,
+          2e-07,
+          3e-07
+        ]
+      }
+    },
+    {
+      "name": "TRS control points",
+      "passed": true,
+      "details": null
+    },
+    {
+      "name": "TRS AABB of box corners",
+      "passed": true,
+      "details": {
+        "computed_min_m": [
+          1.0999999999999999e-07,
+          1.7999999999999997e-07,
+          2.95e-07
+        ],
+        "computed_max_m": [
+          2.3000000000000002e-07,
+          2.2e-07,
+          3.05e-07
+        ]
+      }
+    },
+    {
+      "name": "Pivot-only invariant",
+      "passed": true,
+      "details": null
+    },
+    {
+      "name": "Future hierarchy shear counterexample",
+      "passed": true,
+      "details": {
+        "column_dot": -1.5000000000000004,
+        "production_status": "unsupported in proposed R1/R2"
+      }
+    },
+    {
+      "name": "Tetra plane intersection",
+      "passed": true,
+      "details": {
+        "computed_vertices_m": [
+          [
+            0.0,
+            0.0,
+            2.5e-08
+          ],
+          [
+            7.5e-08,
+            0.0,
+            2.5e-08
+          ],
+          [
+            0.0,
+            7.5e-08,
+            2.5e-08
+          ]
+        ]
+      }
+    },
+    {
+      "name": "Tetra intersection area",
+      "passed": true,
+      "details": {
+        "computed_area_m2": 2.8125e-15
+      }
+    },
+    {
+      "name": "Numeric grammar fixture reference only",
+      "passed": true,
+      "details": null
+    },
+    {
+      "name": "1pm is not a no-op at 100nm characteristic size",
+      "passed": true,
+      "details": {
+        "epsilon_m": 1.0587911840678754e-22
+      }
+    },
+    {
+      "name": "Symmetric snap half ties",
+      "passed": true,
+      "details": null
+    }
+  ],
+  "fullmag_executed": false
+}

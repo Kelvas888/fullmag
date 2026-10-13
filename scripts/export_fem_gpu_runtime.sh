@@ -12,9 +12,11 @@ SOURCE_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="${FULLMAG_RUNTIME_PUBLICATION_REPO_ROOT:-${SOURCE_ROOT}}"
 source "${SOURCE_ROOT}/scripts/lib/managed_fem_image_identity.sh"
 source "${SOURCE_ROOT}/scripts/lib/managed_fem_runtime_storage.sh"
+source "${SOURCE_ROOT}/scripts/lib/managed_fem_native_storage.sh"
 source "${SOURCE_ROOT}/scripts/lib/managed_fem_build_policy.sh"
 : "${FULLMAG_NATIVE_STORAGE_PROFILE:=canonical}"
-resolve_managed_fem_native_storage_profile
+export FULLMAG_REPO_ROOT="${REPO_ROOT}"
+resolve_managed_fem_native_storage
 readonly FULLMAG_NATIVE_STORAGE_PROFILE FULLMAG_NATIVE_BUILD_STORAGE_ROOT
 readonly FULLMAG_NATIVE_BUILD_IMAGE FULLMAG_NATIVE_MOUNT_VIEW
 RUNTIME_PARENT="${REPO_ROOT}/.fullmag/runtimes"
@@ -485,7 +487,7 @@ FULLMAG_FEM_GPU_IMAGE="${docker_image_id}" docker compose --profile fem-gpu run 
   -e FULLMAG_SOURCE_GIT_COMMIT="${FULLMAG_SOURCE_GIT_COMMIT}" \
   -e FULLMAG_SOURCE_WORKTREE_STATE="${FULLMAG_SOURCE_WORKTREE_STATE}" \
   -e FULLMAG_SOURCE_SNAPSHOT_SHA256="${FULLMAG_SOURCE_SNAPSHOT_SHA256}" \
-  -e TMPDIR="/tmp/fullmag-runtime-export" \
+  -e TMPDIR="/workspace/target/tmp/runtime-export" \
   -e CARGO_HOME="/workspace/target/cargo-home" \
   -e FULLMAG_BUILD_LOG="/workspace/target/tmp/fullmag-build.log" \
   -e FULLMAG_FEM_RUNTIME_REUSE_BUILD="${FULLMAG_FEM_RUNTIME_REUSE_BUILD}" \
@@ -584,7 +586,7 @@ echo "[export_fem_gpu_runtime] cargo build jobs: ${cargo_jobs}"
 if [ "${FULLMAG_ENABLE_NVTX}" = "1" ]; then
   export RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }--cfg fullmag_enable_nvtx --check-cfg=cfg(fullmag_enable_nvtx)"
 fi
-FULLMAG_CUDA_ARCHITECTURES="${FULLMAG_CUDA_ARCHITECTURES}" FULLMAG_USE_MFEM_STACK=ON cargo +nightly -Z checksum-freshness build -j "$cargo_jobs" -p fullmag-cli -p fullmag-api -p fullmag-py-core --features "fullmag-cli/cuda fullmag-cli/fem-gpu fullmag-cli/stage-autosave-hdf5 fullmag-api/cuda fullmag-api/fem-gpu fullmag-api/stage-autosave-hdf5" --release 2>&1 | tee "${build_log}"
+FULLMAG_CUDA_ARCHITECTURES="${FULLMAG_CUDA_ARCHITECTURES}" FULLMAG_USE_MFEM_STACK=ON FULLMAG_FEM_ENABLE_CUDA=ON FULLMAG_FEM_REQUIRE_GPU=1 cargo +nightly -Z checksum-freshness build -j "$cargo_jobs" -p fullmag-cli -p fullmag-api -p fullmag-py-core --features "fullmag-cli/cuda fullmag-cli/fem-gpu fullmag-cli/stage-autosave-hdf5 fullmag-api/cuda fullmag-api/fem-gpu fullmag-api/stage-autosave-hdf5" --release 2>&1 | tee "${build_log}"
 printf "%s\n" "${native_build_fingerprint}" > "${native_build_stamp_tmp}"
 mv "${native_build_stamp_tmp}" "${native_build_stamp}"
 echo "[export_fem_gpu_runtime] clearing previous runtime bundle contents"

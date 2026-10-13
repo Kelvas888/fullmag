@@ -1,3 +1,6 @@
+import type { RuntimeCommandPrecondition } from "../api/apiTypes";
+import type { CommandContext } from "../commands/commandTypes";
+import type { MeshBuildConfirmCommandId } from "../authoring/meshBuildConfirmation";
 import type { ModuleId, SlotId } from "../types";
 import type { LayoutState } from "../layout/layoutTypes";
 
@@ -61,6 +64,8 @@ export interface KernelEventMap {
   };
   "workspace:new-problem-requested": {
     source: "menu" | "shortcut" | "workspace";
+    /** Preselects the discretization; absent keeps the dialog default. */
+    solver?: "FDM" | "FEM";
   };
   "explorer:texture-load-node-requested": {
     objectId: string;
@@ -72,18 +77,47 @@ export interface KernelEventMap {
   };
   "footer:tab-requested": {
     reason?: string;
-    tab: "diagnostics" | "engine" | "logs" | "mesh" | "quick-chart" | "telemetry";
+    tab: "diagnostics" | "engine" | "logs" | "operations" | "problems" | "quick-chart" | "telemetry";
   };
   "diagnostics:recorder-open-requested": {
     source: string;
   };
   "mesh:build-confirm-requested": {
-    commandId: "mesh.build-selected" | "mesh.build-shared-domain";
+    commandId: MeshBuildConfirmCommandId;
+    requestId?: string;
     input?: unknown;
-    source: "inspector" | "palette" | "ribbon" | "test";
+    source: CommandContext["source"];
     sourceDetail?: string;
   };
+  "mesh:build-confirm-resolved": {
+    requestId: string;
+    confirmed: boolean;
+    precondition?: RuntimeCommandPrecondition;
+  };
+  "mesh:build-observation-requested": {
+    commandId: string;
+    requestId: string;
+    objectId?: string;
+    targetKind: "object_mesh" | "study_domain";
+  };
+  "mesh:build-observed": {
+    commandId?: string;
+    requestId?: string;
+    status: "completed" | "failed" | "cancelled" | "pending";
+    observation?: "waiting" | "disconnected" | "publication-unconfirmed";
+    message?: string;
+    meshRevision?: number;
+  };
+  "mesh:build-history-editor-ready": { target: string };
+  "mesh:build-history-restore-requested": {
+    buildId?: string;
+    commandId?: string;
+    entryId: string;
+    meshTarget: string | null;
+    snapshot: Record<string, unknown>;
+  };
   "mesh:build-submitted": {
+    requestId?: string;
     commandId: string;
     objectId?: string;
     reason: string;
@@ -98,7 +132,7 @@ export interface KernelEventMap {
   };
   "command:completed": {
     commandId: string;
-    status: "completed" | "failed" | "cancelled";
+    status: "completed" | "failed" | "cancelled" | "pending";
   };
   "resource:invalidated": {
     resourceKey: string;
@@ -124,6 +158,7 @@ export interface KernelEventMap {
   "analysis-plots:export-requested": {
     chartId: string;
     format: "csv" | "tsv" | "png";
+    requestId?: string;
     source: ModuleId;
   };
   "analysis-plots:add-series-requested": {
