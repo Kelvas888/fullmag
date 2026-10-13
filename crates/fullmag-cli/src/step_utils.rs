@@ -1139,7 +1139,7 @@ pub(crate) fn continuation_source_from_backend_plan(
     backend_plan: &BackendPlanIR,
 ) -> ContinuationSource {
     match backend_plan {
-        BackendPlanIR::AntennaFieldOnly(_) => ContinuationSource::Unsupported("field_only has no magnetic continuation state"),
+        BackendPlanIR::AntennaFieldOnly(_) => ContinuationSource::Unsupported("field_only has no magnetic continuation state".to_string()),
         BackendPlanIR::Fdm(plan) => match fdm_continuation_identity(plan) {
             Ok(identity) => ContinuationSource::Fdm(identity),
             Err(error) => ContinuationSource::Unsupported(error.to_string()),
