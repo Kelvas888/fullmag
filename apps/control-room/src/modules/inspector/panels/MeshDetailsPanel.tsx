@@ -24,7 +24,9 @@ import {
 import { MeshEditorCapabilitiesSection } from "./mesh-details/MeshEditorCapabilitiesSection";
 import { MeshViewportDeliverySection } from "./mesh-details/MeshViewportDeliverySection";
 import { MixedTopologyProvenanceSection } from "./mesh-details/MixedTopologyProvenanceSection";
+import { SharedDomainMeshPolicySection } from "./mesh-details/SharedDomainMeshPolicySection";
 import { FdmGridInspectorPanel } from "./fdm-grid/FdmGridInspectorPanel";
+import { FemMeshReadinessGuideCard } from "./mesh-guide/FemMeshReadinessGuideCard";
 import {
   type MeshDetailsLane,
   useMeshDetailsModel,
@@ -73,6 +75,7 @@ function meshDetailsInspectorSections(selectionKind: string | null): string[] {
     case "mesh.root":
       return [
         "overview",
+        "shared-policy",
         "identity",
         "pipeline",
         "mixed-topology",
@@ -86,6 +89,7 @@ function meshDetailsInspectorSections(selectionKind: string | null): string[] {
     case "mesh.shared-domain":
       return [
         "overview",
+        "shared-policy",
         "identity",
         "counts",
         "mixed-topology",
@@ -129,6 +133,7 @@ function meshDetailsInspectorSections(selectionKind: string | null): string[] {
     default:
       return [
         "overview",
+        "shared-policy",
         "identity",
         "counts",
         "pipeline",
@@ -181,6 +186,7 @@ export function MeshDetailsPanel({ selection }: InspectorPanelProps) {
       key={selection.kind ?? "default"}
       className="fm-inspector-panel grid min-w-0 gap-fm-inspector-group"
     >
+      <FemMeshReadinessGuideCard />
       {showSection("overview") ? (
         <MeshOverviewSection
           activeBuildRevision={model.activeBuildRevision}
@@ -197,6 +203,7 @@ export function MeshDetailsPanel({ selection }: InspectorPanelProps) {
           title={model.title}
         />
       ) : null}
+      {showSection("shared-policy") ? <SharedDomainMeshPolicySection /> : null}
       {showSection("identity") ? (
         <SolverMeshIdentitySection
           badge={model.manifestStatus}
