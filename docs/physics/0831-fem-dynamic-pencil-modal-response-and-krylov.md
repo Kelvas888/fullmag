@@ -5733,6 +5733,33 @@ Regresja4vs5 z niepoprawnym committed vector oraz oba oryginalne full/mixed
 przypadki wymagają nowego hosted receipt. Nie zmienia się Python→IR,
 jednostek, requested execution ani statusu FEM GPU/FDM/BEM/A1.
 
+Kontrolowana regresja breakdown nie jest dowodem naturalnego breakdownu w
+solverze FEM. Hosted GHA38424106329 wykazało, że poprzednia konfiguracja nie
+dostarczyła bieżącego strict-progress probe, więc test nie wstrzyknął awarii.
+Poprawiony wrapper testowy tworzy jawny przypadek fałszywej akceptacji
+domyślnego kryterium: tylko podczas pierwszej próby, przed wywołaniem
+rzeczywistego callbacku produkcyjnego, chwilowo ustawia jego domyślne `rtol`
+na `0.5`, a po callbacku przywraca zapamiętane wartości tolerancji KSP.
+PETSc3.24.6 wylicza `ttol=max(rtol*rnorm0,abstol)` przy iteracji zero; test
+wykorzystuje tę regułę do uzyskania dodatniego default reason, po którym
+produkcja nadal buduje bieżący kandydat i mierzy `b-Ax` własną, niezależną
+bramką `rtol=atol=1e-12`. Wstrzyknięcie `BREAKDOWN` następuje dopiero, gdy
+zarejestrowany probe z tej samej próby i callbacku pozostaje ponad ścisłym
+progiem, lecz poniżej normy RHS. Prawdziwy recovery owner zachowuje swój
+oryginalny próg i budżet ośmiu iteracji; ponowna próba używa callbacku
+produkcyjnego bez testowej zmiany `rtol`. Test sprawdza przywrócenie pól
+tolerancji KSP i niezależny końcowy residual, ale nie twierdzi, że usuwa
+wszystkie wewnętrzne wartości PETSc ani że obserwuje naturalne breakdown.
+Jest to wyłącznie deterministyczny fault injection dla ścieżki ownera, nie
+walidacja fizyczna ani kwalifikacja solvera.
+
+Dokładny kontrakt PETSc: [`KSPConvergedDefault` 3.24.6](https://github.com/petsc/petsc/blob/v3.24.6/src/ksp/ksp/interface/iterativ.c)
+wyznacza początkowy próg `ttol` z tolerancji i normy początkowej, a
+[`KSPSetTolerances` 3.24.6](https://github.com/petsc/petsc/blob/v3.24.6/src/ksp/ksp/interface/itfunc.c)
+zmienia tolerancje używane przez domyślny test. Dlatego dowodem kandydata jest
+obserwacja prawdziwego callbacku i niezależny pomiar ownera, a nie sam dodatni
+default reason.
+
 | Ścieżka | Symbol / anchor | Odpowiedzialność i dowód |
 |---|---|---|
 | `docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md` | `DOC-ANCHOR:g5-owned-same-attempt-candidate` | Kontrakt same-attempt copy; kwalifikacja NOT VERIFIED |

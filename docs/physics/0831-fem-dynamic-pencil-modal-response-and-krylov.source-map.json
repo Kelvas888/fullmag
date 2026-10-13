@@ -4616,7 +4616,7 @@
       "id": "source-g5-controlled-sparse-recovery-test",
       "path": "backends/fem/tests/frequency_domain/modal_eigen_contract_test.cpp",
       "symbol": "void modal_certified_recovery_controlled_breakdown_contract",
-      "responsibility": "Test-only measured breakdown, actual sparse-owner recovery in the original iteration budget, and independent final b-Ax; not evidence of incidental FEM breakdown"
+      "responsibility": "Test-only false default-convergence scenario with a measured same-attempt strict-progress probe, one injected BREAKDOWN, actual sparse-owner recovery under the original strict rtol/atol and eight-iteration budget, and independent final b-Ax; not evidence of natural FEM breakdown or solver qualification"
     }
   ],
   "public_api": {

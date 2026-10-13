@@ -10352,6 +10352,48 @@ struct ControlledRecoveryBreakdownTrigger {
     PetscReal rhs_norm = std::numeric_limits<PetscReal>::quiet_NaN();
     PetscReal residual_norm = std::numeric_limits<PetscReal>::quiet_NaN();
     PetscReal threshold = std::numeric_limits<PetscReal>::quiet_NaN();
+    PetscReal test_default_rtol = 0.5;
+
+    struct CallbackObservation {
+        bool available = false;
+        PetscInt iteration = -1;
+        PetscReal recursive_residual_norm = std::numeric_limits<PetscReal>::quiet_NaN();
+        PetscErrorCode tolerance_read_error = PETSC_SUCCESS;
+        PetscErrorCode temporary_tolerance_error = PETSC_SUCCESS;
+        PetscErrorCode callback_error = PETSC_SUCCESS;
+        PetscErrorCode tolerance_restore_error = PETSC_SUCCESS;
+        PetscErrorCode restored_tolerance_read_error = PETSC_SUCCESS;
+        PetscReal ksp_rtol_before = std::numeric_limits<PetscReal>::quiet_NaN();
+        PetscReal ksp_atol_before = std::numeric_limits<PetscReal>::quiet_NaN();
+        PetscReal ksp_dtol_before = std::numeric_limits<PetscReal>::quiet_NaN();
+        PetscInt ksp_max_iterations_before = -1;
+        PetscReal ksp_rtol_after = std::numeric_limits<PetscReal>::quiet_NaN();
+        PetscReal ksp_atol_after = std::numeric_limits<PetscReal>::quiet_NaN();
+        PetscReal ksp_dtol_after = std::numeric_limits<PetscReal>::quiet_NaN();
+        PetscInt ksp_max_iterations_after = -1;
+        PetscReal true_gate_rtol = std::numeric_limits<PetscReal>::quiet_NaN();
+        PetscReal true_gate_atol = std::numeric_limits<PetscReal>::quiet_NaN();
+        bool callback_reason_available = false;
+        int callback_reason = 0;
+        std::uint64_t callback_ordinal = 0;
+        std::uint64_t inner_attempt_id = 0;
+        bool default_reason_available = false;
+        int default_reason = 0;
+        bool true_probe_available = false;
+        bool true_probe_default_reason_available = false;
+        int true_probe_default_reason = 0;
+        bool true_probe_gate_reason_available = false;
+        int true_probe_gate_reason = 0;
+        PetscInt true_probe_iteration = -1;
+        std::uint64_t true_probe_callback_ordinal = 0;
+        bool owned_probe_available = false;
+        std::uint64_t owned_probe_attempt_id = 0;
+        std::uint64_t owned_probe_callback_ordinal = 0;
+        PetscInt owned_probe_iteration = -1;
+        PetscReal true_rhs_norm = std::numeric_limits<PetscReal>::quiet_NaN();
+        PetscReal true_residual_norm = std::numeric_limits<PetscReal>::quiet_NaN();
+        PetscReal true_threshold = std::numeric_limits<PetscReal>::quiet_NaN();
+    } last_observation{}, injection_observation{};
 };
 
 thread_local ControlledRecoveryBreakdownTrigger *g_controlled_recovery_breakdown = nullptr;
@@ -10363,22 +10405,112 @@ PetscErrorCode controlled_recovery_breakdown_convergence_test(
     KSPConvergedReason *reason,
     void *raw_context)
 {
-    const PetscErrorCode error = fd::detail::floquet_shifted_true_convergence_test(
-        ksp, iteration, recursive_residual_norm, reason, raw_context);
-    if (error != PETSC_SUCCESS) {
-        return error;
-    }
     auto *trigger = g_controlled_recovery_breakdown;
     auto *context =
         static_cast<fd::detail::FloquetShiftedKspTrueConvergenceContext *>(raw_context);
-    if (trigger == nullptr || context == nullptr ||
-        trigger->true_context != context || trigger->injected || reason == nullptr) {
+    if (trigger == nullptr || context == nullptr || trigger->true_context != context) {
+        return fd::detail::floquet_shifted_true_convergence_test(
+            ksp, iteration, recursive_residual_norm, reason, raw_context);
+    }
+
+    auto &observation = trigger->last_observation;
+    observation = ControlledRecoveryBreakdownTrigger::CallbackObservation{};
+    observation.available = true;
+    observation.iteration = iteration;
+    observation.recursive_residual_norm = recursive_residual_norm;
+
+    const PetscErrorCode tolerance_read_error = KSPGetTolerances(
+        ksp,
+        &observation.ksp_rtol_before,
+        &observation.ksp_atol_before,
+        &observation.ksp_dtol_before,
+        &observation.ksp_max_iterations_before);
+    observation.tolerance_read_error = tolerance_read_error;
+    if (tolerance_read_error != PETSC_SUCCESS) {
+        return tolerance_read_error;
+    }
+
+    // Test-only provisional convergence criterion: the actual KSP candidate
+    // and production true-residual gate remain untouched. PETSc's default
+    // convergence test sees this temporary rtol; the saved KSP tolerance
+    // values are restored before this wrapper returns on every callback path.
+    const bool apply_loose_default = !trigger->injected;
+    if (apply_loose_default) {
+        observation.temporary_tolerance_error = KSPSetTolerances(
+            ksp,
+            trigger->test_default_rtol,
+            PETSC_CURRENT,
+            PETSC_CURRENT,
+            PETSC_CURRENT);
+    }
+    PetscErrorCode callback_error = observation.temporary_tolerance_error;
+    if (callback_error == PETSC_SUCCESS) {
+        callback_error = fd::detail::floquet_shifted_true_convergence_test(
+            ksp, iteration, recursive_residual_norm, reason, raw_context);
+    }
+    observation.callback_error = callback_error;
+
+    if (apply_loose_default) {
+        observation.tolerance_restore_error = KSPSetTolerances(
+            ksp,
+            observation.ksp_rtol_before,
+            observation.ksp_atol_before,
+            observation.ksp_dtol_before,
+            observation.ksp_max_iterations_before);
+    }
+    observation.restored_tolerance_read_error = KSPGetTolerances(
+        ksp,
+        &observation.ksp_rtol_after,
+        &observation.ksp_atol_after,
+        &observation.ksp_dtol_after,
+        &observation.ksp_max_iterations_after);
+
+    observation.true_gate_rtol = context->rtol;
+    observation.true_gate_atol = context->atol;
+    observation.callback_reason_available = reason != nullptr;
+    observation.callback_reason = reason == nullptr ? 0 : static_cast<int>(*reason);
+    observation.callback_ordinal = context->callback_count;
+    observation.inner_attempt_id = context->current_inner_attempt_id;
+    observation.default_reason_available = context->last_default_reason_available;
+    observation.default_reason = context->last_default_reason;
+    observation.true_probe_available = context->last_true_probe_available;
+    observation.true_probe_default_reason_available =
+        context->last_true_probe_default_reason_available;
+    observation.true_probe_default_reason = context->last_true_probe_default_reason;
+    observation.true_probe_gate_reason_available =
+        context->last_true_probe_reason_after_gate_available;
+    observation.true_probe_gate_reason = context->last_true_probe_reason_after_gate;
+    observation.true_probe_iteration = context->last_true_probe_iteration;
+    observation.true_probe_callback_ordinal = context->last_true_probe_callback_ordinal;
+    observation.owned_probe_available = context->owned_true_probe_solution_available;
+    observation.owned_probe_attempt_id = context->owned_true_probe_attempt_id;
+    observation.owned_probe_callback_ordinal =
+        context->owned_true_probe_callback_ordinal;
+    observation.owned_probe_iteration = context->owned_true_probe_iteration;
+    observation.true_rhs_norm = context->last_true_rhs_norm;
+    observation.true_residual_norm = context->last_true_residual_norm;
+    observation.true_threshold = context->last_true_residual_threshold;
+
+    // Preserve the callback failure as primary while still attempting to
+    // restore the saved settings. A failed restoration is itself a test error.
+    if (callback_error != PETSC_SUCCESS) {
+        return callback_error;
+    }
+    if (observation.tolerance_restore_error != PETSC_SUCCESS) {
+        return observation.tolerance_restore_error;
+    }
+    if (observation.restored_tolerance_read_error != PETSC_SUCCESS) {
+        return observation.restored_tolerance_read_error;
+    }
+    if (trigger->injected || reason == nullptr) {
         return PETSC_SUCCESS;
     }
 
     const bool current_measured_progress =
         iteration > 0 && *reason == KSP_CONVERGED_ITERATING &&
         context->last_true_probe_available &&
+        context->last_true_probe_default_reason_available &&
+        context->last_true_probe_default_reason > 0 &&
         context->last_true_probe_reason_after_gate_available &&
         context->last_true_probe_reason_after_gate == KSP_CONVERGED_ITERATING &&
         context->last_true_probe_iteration == iteration &&
@@ -10397,6 +10529,7 @@ PetscErrorCode controlled_recovery_breakdown_convergence_test(
         return PETSC_SUCCESS;
     }
 
+    trigger->injection_observation = observation;
     trigger->attempt_id = context->owned_true_probe_attempt_id;
     trigger->callback_ordinal = context->owned_true_probe_callback_ordinal;
     trigger->iteration = context->owned_true_probe_iteration;
@@ -10426,7 +10559,9 @@ struct AlgebraicCertifiedRecoveryFixture {
 };
 
 void initialize_algebraic_certified_recovery_fixture(
-    AlgebraicCertifiedRecoveryFixture &fixture, PetscInt budget)
+    AlgebraicCertifiedRecoveryFixture &fixture,
+    PetscInt budget,
+    PetscReal absolute_tolerance = 0.0)
 {
     // Algebraic contract only: diagonal A is nonsingular, P=I is approximate,
     // and b=(1,1,1,1) needs more than one GMRES direction. No physical fixture
@@ -10458,7 +10593,7 @@ void initialize_algebraic_certified_recovery_fixture(
               KSPGMRESSetRestart(fixture.inner, 4) == PETSC_SUCCESS &&
               KSPGetPC(fixture.inner, &inner_pc) == PETSC_SUCCESS &&
               PCSetType(inner_pc, PCLU) == PETSC_SUCCESS &&
-              KSPSetTolerances(fixture.inner, 1.0e-12, 0.0, PETSC_DEFAULT,
+              KSPSetTolerances(fixture.inner, 1.0e-12, absolute_tolerance, PETSC_DEFAULT,
                                budget) == PETSC_SUCCESS &&
               KSPSetUp(fixture.inner) == PETSC_SUCCESS,
           "configure the separate algebraic GMRES with the original bounded budget");
@@ -10761,15 +10896,75 @@ void modal_certified_recovery_controlled_breakdown_contract()
     ControlledRecoveryBreakdownTrigger trigger{};
     g_controlled_recovery_breakdown = &trigger;
     AlgebraicCertifiedRecoveryFixture fixture{};
-    initialize_algebraic_certified_recovery_fixture(fixture, 8);
+    // This is a controlled false-default-convergence scenario, not a claim
+    // that a natural breakdown occurs. The wrapper temporarily loosens only
+    // the default convergence-test rtol on the first attempt; the true gate
+    // and recovery owner retain rtol=atol=1e-12 and the full eight-iteration
+    // budget, and the retry uses the unmodified production callback.
+    initialize_algebraic_certified_recovery_fixture(fixture, 8, 1.0e-12);
     trigger.true_context = fixture.true_context.get();
 
-    check(KSPSolve(fixture.outer, fixture.rhs, fixture.solution) == PETSC_SUCCESS,
-          "the recovery owner resumes after one measured test-triggered breakdown");
+    const PetscErrorCode solve_error =
+        KSPSolve(fixture.outer, fixture.rhs, fixture.solution);
     g_controlled_recovery_breakdown = nullptr;
 
     const auto *snapshot =
         fd::detail::floquet_shifted_ksp_certified_recovery_snapshot(fixture.owner);
+    const auto &diagnostic = trigger.injected
+        ? trigger.injection_observation
+        : trigger.last_observation;
+    std::printf(
+        "INFO: controlled recovery observation injected=%s solve_error=%d test_default_rtol=%.17g callback_available=%s callback_count=%llu attempt=%llu iteration=%d recursive_rnorm=%.17g callback_reason_available=%s callback_reason=%d default_available=%s default_reason=%d probe_available=%s probe_default_available=%s probe_default_reason=%d probe_gate_available=%s probe_gate_reason=%d probe_iteration=%d probe_callback=%llu owned_probe=%s owned_attempt=%llu owned_callback=%llu owned_iteration=%d rhs=%.17g true_residual=%.17g true_threshold=%.17g gate_rtol=%.17g gate_atol=%.17g ksp_before=(%.17g,%.17g,%.17g,%d) ksp_after=(%.17g,%.17g,%.17g,%d) read_before_error=%d setup_error=%d callback_error=%d restore_error=%d read_after_error=%d owner=(rtol=%.17g,atol=%.17g,max_it=%d)\n",
+        trigger.injected ? "true" : "false",
+        static_cast<int>(solve_error),
+        static_cast<double>(trigger.test_default_rtol),
+        diagnostic.available ? "true" : "false",
+        static_cast<unsigned long long>(diagnostic.callback_ordinal),
+        static_cast<unsigned long long>(diagnostic.inner_attempt_id),
+        static_cast<int>(diagnostic.iteration),
+        static_cast<double>(diagnostic.recursive_residual_norm),
+        diagnostic.callback_reason_available ? "true" : "false",
+        diagnostic.callback_reason,
+        diagnostic.default_reason_available ? "true" : "false",
+        diagnostic.default_reason,
+        diagnostic.true_probe_available ? "true" : "false",
+        diagnostic.true_probe_default_reason_available ? "true" : "false",
+        diagnostic.true_probe_default_reason,
+        diagnostic.true_probe_gate_reason_available ? "true" : "false",
+        diagnostic.true_probe_gate_reason,
+        static_cast<int>(diagnostic.true_probe_iteration),
+        static_cast<unsigned long long>(diagnostic.true_probe_callback_ordinal),
+        diagnostic.owned_probe_available ? "true" : "false",
+        static_cast<unsigned long long>(diagnostic.owned_probe_attempt_id),
+        static_cast<unsigned long long>(diagnostic.owned_probe_callback_ordinal),
+        static_cast<int>(diagnostic.owned_probe_iteration),
+        static_cast<double>(diagnostic.true_rhs_norm),
+        static_cast<double>(diagnostic.true_residual_norm),
+        static_cast<double>(diagnostic.true_threshold),
+        static_cast<double>(diagnostic.true_gate_rtol),
+        static_cast<double>(diagnostic.true_gate_atol),
+        static_cast<double>(diagnostic.ksp_rtol_before),
+        static_cast<double>(diagnostic.ksp_atol_before),
+        static_cast<double>(diagnostic.ksp_dtol_before),
+        static_cast<int>(diagnostic.ksp_max_iterations_before),
+        static_cast<double>(diagnostic.ksp_rtol_after),
+        static_cast<double>(diagnostic.ksp_atol_after),
+        static_cast<double>(diagnostic.ksp_dtol_after),
+        static_cast<int>(diagnostic.ksp_max_iterations_after),
+        static_cast<int>(diagnostic.tolerance_read_error),
+        static_cast<int>(diagnostic.temporary_tolerance_error),
+        static_cast<int>(diagnostic.callback_error),
+        static_cast<int>(diagnostic.tolerance_restore_error),
+        static_cast<int>(diagnostic.restored_tolerance_read_error),
+        snapshot == nullptr ? std::numeric_limits<double>::quiet_NaN()
+                            : static_cast<double>(snapshot->original_rtol),
+        snapshot == nullptr ? std::numeric_limits<double>::quiet_NaN()
+                            : static_cast<double>(snapshot->original_atol),
+        snapshot == nullptr ? -1 : static_cast<int>(snapshot->original_max_iterations));
+    std::fflush(stdout);
+    check(solve_error == PETSC_SUCCESS,
+          "the recovery owner resumes after one measured test-triggered breakdown");
+
     Vec independent_residual = nullptr;
     PetscReal rhs_norm = std::numeric_limits<PetscReal>::quiet_NaN();
     PetscReal residual_norm = std::numeric_limits<PetscReal>::quiet_NaN();
@@ -10781,7 +10976,8 @@ void modal_certified_recovery_controlled_breakdown_contract()
                       fixture.rhs) == PETSC_SUCCESS &&
               VecNorm(independent_residual, NORM_2, &residual_norm) == PETSC_SUCCESS,
           "independently recompute b-Ax from the returned algebraic solution");
-    const PetscReal unchanged_threshold = 1.0e-12 * rhs_norm;
+    const PetscReal unchanged_threshold =
+        std::max<PetscReal>(1.0e-12 * rhs_norm, 1.0e-12);
     const bool recognized_certificate =
         snapshot != nullptr &&
         (std::strcmp(snapshot->certificate_source,
@@ -10795,6 +10991,41 @@ void modal_certified_recovery_controlled_breakdown_contract()
          std::strcmp(snapshot->last_candidate_source,
                      "committed_inner_solution") == 0);
     check(trigger.injected && trigger.candidate_provenance_valid &&
+              trigger.injection_observation.available &&
+              trigger.injection_observation.tolerance_read_error == PETSC_SUCCESS &&
+              trigger.injection_observation.temporary_tolerance_error == PETSC_SUCCESS &&
+              trigger.injection_observation.callback_error == PETSC_SUCCESS &&
+              trigger.injection_observation.tolerance_restore_error == PETSC_SUCCESS &&
+              trigger.injection_observation.restored_tolerance_read_error == PETSC_SUCCESS &&
+              trigger.injection_observation.ksp_rtol_before == 1.0e-12 &&
+              trigger.injection_observation.ksp_atol_before == 1.0e-12 &&
+              trigger.injection_observation.ksp_dtol_before ==
+                  trigger.injection_observation.ksp_dtol_after &&
+              trigger.injection_observation.ksp_rtol_after == 1.0e-12 &&
+              trigger.injection_observation.ksp_atol_after == 1.0e-12 &&
+              trigger.injection_observation.ksp_max_iterations_before == 8 &&
+              trigger.injection_observation.ksp_max_iterations_after == 8 &&
+              trigger.injection_observation.true_gate_rtol == 1.0e-12 &&
+              trigger.injection_observation.true_gate_atol == 1.0e-12 &&
+              trigger.injection_observation.true_threshold == unchanged_threshold &&
+              trigger.injection_observation.default_reason_available &&
+              trigger.injection_observation.default_reason > 0 &&
+              trigger.injection_observation.callback_reason_available &&
+              trigger.injection_observation.callback_reason ==
+                  KSP_CONVERGED_ITERATING &&
+              trigger.injection_observation.true_probe_available &&
+              trigger.injection_observation.true_probe_default_reason_available &&
+              trigger.injection_observation.true_probe_default_reason > 0 &&
+              trigger.injection_observation.true_probe_gate_reason_available &&
+              trigger.injection_observation.true_probe_gate_reason ==
+                  KSP_CONVERGED_ITERATING &&
+              trigger.injection_observation.true_probe_iteration ==
+                  trigger.injection_observation.iteration &&
+              trigger.injection_observation.true_probe_callback_ordinal ==
+                  trigger.injection_observation.callback_ordinal &&
+              snapshot != nullptr && snapshot->original_rtol == 1.0e-12 &&
+              snapshot->original_atol == 1.0e-12 &&
+              snapshot->original_max_iterations == 8 &&
               trigger.attempt_id == 1u && trigger.callback_ordinal > 0u &&
               trigger.iteration > 0 &&
               std::isfinite(static_cast<double>(trigger.rhs_norm)) &&
@@ -10846,7 +11077,7 @@ void modal_certified_recovery_controlled_breakdown_contract()
               "finalize PETSc only when this test initialized it and the runtime permits finalization");
     }
     std::printf(
-        "PASS: algebraic_certified_recovery_controlled_breakdown attempt=%llu iteration=%d residual=%.17g threshold=%.17g\n",
+        "PASS: algebraic_certified_recovery_controlled_breakdown mode=test_only_default_candidate_rejected_by_true_gate attempt=%llu iteration=%d residual=%.17g threshold=%.17g\n",
         static_cast<unsigned long long>(trigger.attempt_id),
         static_cast<int>(trigger.iteration),
         static_cast<double>(trigger.residual_norm),
