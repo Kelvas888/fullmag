@@ -84,6 +84,8 @@ const INSPECTOR_REQUEST_LIMITS = new Map([
   ],
 ]);
 const INSPECTOR_MODAL_BRANCH_OWNER = {
+  generation_id: `sha256:${"e".repeat(64)}`,
+  generation_status: "member_verified_owner_bound",
   artifact_set_id: "inspector-modal-artifact-set-run-b",
   content_digest: "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
   mesh_generation_id: INSPECTOR_MODAL_DOMAIN_GENERATION_ID,
@@ -93,6 +95,8 @@ const INSPECTOR_MODAL_BRANCH_OWNER = {
   stage_id: "eigen-dispersion",
 };
 const INSPECTOR_MODAL_RESULT_OWNER = {
+  generation_id: INSPECTOR_MODAL_BRANCH_OWNER.generation_id,
+  generation_status: INSPECTOR_MODAL_BRANCH_OWNER.generation_status,
   artifact_set_id: INSPECTOR_MODAL_BRANCH_OWNER.artifact_set_id,
   content_digest: "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
   mesh_generation_id: INSPECTOR_MODAL_DOMAIN_GENERATION_ID,
@@ -102,6 +106,8 @@ const INSPECTOR_MODAL_RESULT_OWNER = {
   stage_id: INSPECTOR_MODAL_BRANCH_OWNER.stage_id,
 };
 const INSPECTOR_MODAL_DISPERSION_OWNER_A = {
+  generation_id: `sha256:${"f".repeat(64)}`,
+  generation_status: "member_verified_owner_bound",
   artifact_set_id: "inspector-modal-artifact-set-run-a",
   content_digest: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   mesh_generation_id: INSPECTOR_MODAL_DOMAIN_GENERATION_ID,
@@ -111,6 +117,8 @@ const INSPECTOR_MODAL_DISPERSION_OWNER_A = {
   stage_id: "eigen-dispersion",
 };
 const INSPECTOR_MODAL_DISPERSION_OWNER_B = {
+  generation_id: INSPECTOR_MODAL_BRANCH_OWNER.generation_id,
+  generation_status: INSPECTOR_MODAL_BRANCH_OWNER.generation_status,
   artifact_set_id: "inspector-modal-artifact-set-run-b",
   content_digest: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
   mesh_generation_id: INSPECTOR_MODAL_DOMAIN_GENERATION_ID,
