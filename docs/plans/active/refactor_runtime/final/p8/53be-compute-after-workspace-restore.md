@@ -3,6 +3,15 @@
 Status: **OPEN**, checkpoint 13.10.2026. Kontynuacja P8-53 po zamknięciu
 [P8-53BD](53bd-incomplete-physics-project-persistence.md).
 
+Najnowszy stan: build H zakończył się exit 0. Próba F→H
+`11caba0f12ac4e7c8ba39ca7ee4ae342` potwierdziła odtworzenie sceny i dokumentu,
+oba normalne Grid, wykonanie Run 1 ps i zachowanie timestampu sesji przy
+starcie child. Brakuje kompletnego command/stage/execution provenance;
+status po zakończeniu etapu błędnie przedstawia interaktywną sesję jako
+tombstone. Normalnego zamknięcia child nie zaliczono; próbę zakończono
+kontrolowanym cancel z terminalnym wait wszystkich procesów. Szczegóły
+i granice dowodów w [checkpointcie BG](53bg-acquisition-refusal-diagnostics.md).
+
 ## Synchronizacja modelu — kolejny wykryty blocker
 
 Próba browser `52a8ef28d5f44de689a58879ef962ee9` zakończyła się

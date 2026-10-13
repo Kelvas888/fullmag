@@ -21,6 +21,36 @@ struct GridSessionScope {
     request_scope_epoch: String,
 }
 
+impl GridSessionScope {
+    fn started_at_unix_ms(&self) -> anyhow::Result<u128> {
+        let prefix = format!("{}@", self.session_id);
+        let timestamp = self.session_epoch.strip_prefix(&prefix)
+            .ok_or_else(|| anyhow::anyhow!("attached session epoch does not match its session ID"))?;
+        let value = timestamp.parse::<u128>()?;
+        anyhow::ensure!(value > 0 && value.to_string() == timestamp, "invalid attached session timestamp");
+        Ok(value)
+    }
+}
+
+#[cfg(test)]
+mod session_scope_tests {
+    use super::GridSessionScope;
+
+    #[test]
+    fn attached_timestamp_requires_exact_session_and_canonical_positive_time() {
+        let mut scope = GridSessionScope {
+            api_instance_id: "api".into(), session_id: "session-a".into(),
+            session_epoch: "session-a@1700000000000".into(), request_scope_epoch: "api:1".into(),
+        };
+        assert_eq!(scope.started_at_unix_ms().unwrap(), 1_700_000_000_000);
+        for invalid in ["session-b@1700000000000", "session-a@0", "session-a@01",
+                        "session-a@+1", "session-a@invalid"] {
+            scope.session_epoch = invalid.into();
+            assert!(scope.started_at_unix_ms().is_err(), "{invalid}");
+        }
+    }
+}
+
 struct GridCommandCustody {
     command_id: String,
     scope: GridSessionScope,
@@ -652,6 +682,10 @@ fn run(
                     if let Some((command_id, grid_refresh_only, command_kind)) = pending_compute_command(&client, &api_base) {
                         let proof_scope = current_grid_scope(&client, &api_base, &expected_api_instance_id)
                             .filter(|scope| scope.session_id == session_id);
+                        let Some(attached_scope) = proof_scope.as_ref() else {
+                            control.wait_poll_interval(POLL_INTERVAL);
+                            continue;
+                        };
                         let grid_scope = if grid_refresh_only {
                             let Some(scope) = proof_scope.clone() else {
                                 control.wait_poll_interval(POLL_INTERVAL);
@@ -676,7 +710,7 @@ fn run(
                                         &session_id,
                                         &backend,
                                         scene_revision,
-                                    ) && (!grid_refresh_only || current_grid_scope(&client, &api_base, &expected_api_instance_id) == grid_scope) {
+                                    ) && current_grid_scope(&client, &api_base, &expected_api_instance_id).as_ref() == Some(attached_scope) {
                                         match spawn_attached_runtime(
                                             &executable,
                                             api_port,
@@ -684,6 +718,7 @@ fn run(
                                             &backend,
                                             &script_path,
                                             grid_refresh_only.then_some(command_id.as_str()),
+                                            attached_scope,
                                         ) {
                                             Ok(next_child) => {
                                                 child_proof = proof_scope.map(|scope| ScratchChildProof {
@@ -1012,7 +1047,10 @@ fn spawn_attached_runtime(
     backend: &str,
     script_path: &PathBuf,
     grid_refresh_command_id: Option<&str>,
+    session_scope: &GridSessionScope,
 ) -> anyhow::Result<Child> {
+    anyhow::ensure!(session_scope.session_id == session_id, "attached runtime session scope mismatch");
+    let started_at_unix_ms = session_scope.started_at_unix_ms()?;
     let mut command = Command::new(executable);
     command
         .arg(script_path)
@@ -1025,6 +1063,7 @@ fn spawn_attached_runtime(
         .arg("double")
         .env("FULLMAG_API_PORT", api_port.to_string())
         .env("FULLMAG_ATTACHED_SESSION_ID", session_id)
+        .env("FULLMAG_ATTACHED_SESSION_STARTED_AT_UNIX_MS", started_at_unix_ms.to_string())
         .env("FULLMAG_ATTACHED_WAIT_FOR_SOLVE", "1")
         .env("FULLMAG_SKIP_CONTROL_ROOM", "1")
         .stdin(Stdio::null())

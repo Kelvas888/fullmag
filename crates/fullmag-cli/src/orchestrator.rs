@@ -221,6 +221,19 @@ fn attached_session_id_or(generated: String) -> String {
         .unwrap_or(generated)
 }
 
+fn attached_session_started_at_or(generated: u128) -> Result<u128> {
+    if std::env::var("FULLMAG_ATTACHED_SESSION_ID")
+        .ok().is_none_or(|value| value.trim().is_empty())
+    {
+        return Ok(generated);
+    }
+    let raw = std::env::var("FULLMAG_ATTACHED_SESSION_STARTED_AT_UNIX_MS")
+        .context("attached session requires its authoritative start timestamp")?;
+    let timestamp = raw.parse::<u128>().context("invalid attached session start timestamp")?;
+    anyhow::ensure!(timestamp > 0 && timestamp.to_string() == raw, "invalid attached session start timestamp");
+    Ok(timestamp)
+}
+
 fn control_room_bootstrap_disabled() -> bool {
     std::env::var("FULLMAG_SKIP_CONTROL_ROOM")
         .ok()
@@ -6877,7 +6890,7 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
     }
     crate::live_workspace::init_feature_flags(feature_flags);
 
-    let started_at_unix_ms = unix_time_millis()?;
+    let started_at_unix_ms = attached_session_started_at_or(unix_time_millis()?)?;
     let script_path = args
         .script
         .canonicalize()
@@ -8655,7 +8668,8 @@ pub(crate) fn run_script_mode(raw_args: Vec<OsString>) -> Result<()> {
                                     continue;
                                 }
                             };
-                        let Some(mut command_stage) = (match build_interactive_command_stage(
+                        let Some(mut command_stage) = (match crate::step_utils::build_initial_interactive_command_stage(
+                            &stages[0],
                             &command_base_ir,
                             &cmd,
                         ) {
@@ -16003,7 +16017,7 @@ mod tests {
             .find("problem_with_frozen_spins_runtime_plan_binding(")
             .expect("initial solver command must consume the Frozen Spins binding");
         let stage_index = branch
-            .find("build_interactive_command_stage(")
+            .find("build_initial_interactive_command_stage(")
             .expect("initial solver command must build a stage");
 
         assert!(
