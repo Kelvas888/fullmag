@@ -889,7 +889,7 @@ W równaniach `eq-0828-full-bloch-demag` i `eq-0828-full-bloch-weak` materiałow
 
 Korekta źródłowa `floquet_bloch_scalar.cpp::assemble_floquet_bloch_scalar_tangent_source`: interpolować Ms ze wszystkich lokalnych DOF jeden raz w punkcie kwadratury i użyć tej wartości w każdej kolumnie źródła, zachowując ramy, orientacje, maskę, redukcję i znak operatora. Redukcja amplitud nie redukuje pola materiałowego. Dla nodalnego Ms zastosować co najmniej istniejącą politykę shared-domain: tet4 order5, prism6 order4; shifted-envelope zawiera dodatkowy iloczyn funkcji kształtu i wymaga wyższego stopnia niż dawny order2. Uniform Ms zachowuje dotychczasowy kontrakt. Request nie przyjmuje DG0; nie dodaje się ani nie deklaruje jego obsługi.
 
-Korekta dotyczy S i pochodnych bloków sprzężeń/Schur, nie zmienia bezpośrednio P, Aqq ani Bqq. Niezależne regresje muszą objąć momenty heterogenicznego źródła (real/imaginary, tet4/prism6, obie reprezentacje) i limit k=0 względem istniejącego assemblera. Wyższe rzędy/zakrzywiona geometria oraz runtime/naukowa kwalifikacja pozostają NOT VERIFIED. Implementacja i regresje źródłowe przygotowane; natywny profil CI `floquet-source-moments` musi wykonać istniejący selector `fem_floquet_bloch_scalar_contract`. Ta nota nie dowodzi wykonania solvera.
+Korekta dotyczy S i pochodnych bloków sprzężeń/Schur, nie zmienia bezpośrednio P, Aqq ani Bqq. Niezależne regresje muszą objąć momenty heterogenicznego źródła (real/imaginary, tet4/prism6, obie reprezentacje) i limit k=0 względem istniejącego assemblera. Wyższe rzędy/zakrzywiona geometria oraz runtime/naukowa kwalifikacja pozostają NOT VERIFIED. Implementacja i regresje assembly przeszły natywny profil `floquet-source-moments`, GHA38298716226, selector `fem_floquet_bloch_scalar_contract`. Pełny modal eigensolve i kwalifikacja dyspersji pozostają NOT VERIFIED.
 
 
 ### Indeks źródeł korekty nodalnego Ms
@@ -897,7 +897,31 @@ Korekta dotyczy S i pochodnych bloków sprzężeń/Schur, nie zmienia bezpośred
 | ID | Path + symbol | Dowód |
 |---|---|---|
 | source-nodal-ms-floquet-contract | `docs/physics/0828-fem-frequency-domain-floquet-demag.md` + `DOC-ANCHOR:nodal-ms-floquet-source` | plan korekty, nie kwalifikacja |
-| source-nodal-ms-floquet-assembly | `backends/fem/cpu/frequency_domain/floquet_bloch_scalar.cpp` + `assemble_floquet_bloch_scalar_tangent_source` | implementacja/regresje w toku, runtime NOT VERIFIED |
+| source-nodal-ms-floquet-assembly | `backends/fem/cpu/frequency_domain/floquet_bloch_scalar.cpp` + `assemble_floquet_bloch_scalar_tangent_source` | native CPU/MFEM assembly GHA38298716226 PASS; full eigen/GPU/science NOT VERIFIED |
 
 | source-nodal-ms-floquet-moments | `backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp` + `floquet_bloch_scalar_heterogeneous_source_moment_contract` | source prepared, native CI pending |
-| source-nodal-ms-floquet-gamma | `backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp` + `floquet_bloch_scalar_heterogeneous_source_k0_consistency` | source prepared, native CI pending |
+| source-nodal-ms-floquet-gamma | `backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp` + `floquet_bloch_scalar_heterogeneous_source_k0_consistency` | native CPU/MFEM assembly GHA38298716226 PASS; full eigen/GPU/science NOT VERIFIED |
+
+
+(a1-external-frequency-gate)=
+## Obowiązkowa zewnętrzna referencja A1 — PR97/4248159355
+
+A1 nie ma obowiązującej kontroli slabowej Kittela/KS. `validate_comsol_dispersion_scientific_gate.py::_validate_a1_comsol_reference` musi odrębnie wymagać hash-bound referencji, zamiast uznawać brak zastosowania analityki za zgodność z COMSOL. Zestawy częstotliwości porównuje się lokalnie przy każdym kanonicznym k: 61 próbek i 8 najniższych dodatnich modów, 488 par, zachowując degeneracje i obie próbki Gamma. Błąd każdej pary to bezwzględna różnica podzielona przez częstotliwość referencyjną. Nie używa się branch_id jako rankingu referencji ani korzystnego podzbioru modów. Hash raportu lub deklaracja pass nie zastępują przeliczenia rzeczywistych CSV.
+
+Próg znajduje się w `parameters.json.external_frequency_comparison.max_relative_error`; użytkownik zatwierdził 2026-10-12 wstępny próg 0.005 (0.5%) dla każdej pary częstotliwości. Null/brak/niefinityczna/niedodatnia wartość blokuje kwalifikację. Próg porównania został ustalony osobno od budżetu 0.5% zbieżności airboxu; równe wartości nie łączą tych kontroli.
+
+Evidence v2 otrzymuje addytywny blok `external_frequency_reference` z `schema_version=fullmag.comsol-a1-reference.v1`, `manifest_path` i `manifest_sha256`. Manifest wiąże względnymi path/sha256 CSV częstotliwości, oryginalny eksport, mph, resolved-model export, provenance wykonania, równowagę, fazy brzegowe i wybór najniższych modów. Ścieżki escape/symlink/junction i zmiany bajtów przy starym hashu blokują odczyt. Istniejący numeric artifact binding Fullmag nadal obowiązuje.
+
+Nie ma jeszcze wspieranego wykonawczego walidatora równoważności eksportu COMSOL. Dostarczony handoff opisuje mieszane znaki faz, a dawny comparator uczciwie raportuje frequency_only_unqualified. Pierwsza korekta może przeliczyć i opisać różnice, lecz także przy zerowym błędzie musi odrzucić nieobsługiwany dowód równoważności; nie przyjmuje samego JSON status=verified. Dodatnia kwalifikacja wymaga odrębnego, sprawdzalnego kontraktu rzeczywistego resolved model i danych zewnętrznych. Stan source/CI oraz kwalifikacja fizyczna są osobnymi dowodami.
+
+
+### Indeks bramki zewnętrznej referencji A1
+
+| ID | Path + symbol | Dowód |
+|---|---|---|
+| source-a1-external-reference-contract | `docs/physics/0828-fem-frequency-domain-floquet-demag.md` + `DOC-ANCHOR:a1-external-frequency-gate` | kontrakt, external equivalence NOT VERIFIED |
+| source-a1-external-reference-gate | `scripts/validate_comsol_dispersion_scientific_gate.py` + `_validate_a1_comsol_reference` | source prepared, CI pending |
+| source-a1-external-reference-regression | `scripts/test_validate_comsol_dispersion_scientific_gate.py` + `test_zero_error_and_declared_verified_proof_still_cannot_qualify` | source prepared, CI pending |
+
+
+Native CPU/MFEM assembly korekty nodalnego Ms: GHA38298716226 PASS, clean090c13b,1/1CTest i marker hetero moments/Gamma observed. SLEPc OFF; dowód nie obejmuje pełnego eigensolve, GPU ani naukowej kwalifikacji dyspersji. Receipt d6b173bb /native log1ea7cf63, pełne SHA w ci-evidence-20261010.json.

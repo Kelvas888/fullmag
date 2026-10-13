@@ -3289,5 +3289,196 @@ class ScientificGateTests(unittest.TestCase):
         self.assertIn("requires cases c0,c1,a1", result["reasons"][0])
 
 
+class A1ExternalFrequencyGateTests(unittest.TestCase):
+    """Synthetic comparison fixtures never attest execution or COMSOL equivalence."""
+
+    def _fixture(self, root):
+        reference_dir = root / "validation/comsol"
+        reference_dir.mkdir(parents=True)
+        path, path_check, reasons = gate._canonical_path_rows(KPATH)
+        self.assertEqual(reasons, [])
+        self.assertEqual(path_check["status"], "pass")
+        frequency_csv = reference_dir / "frequencies.csv"
+        with frequency_csv.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(("jpath", "kx_rad_per_um", "ky_rad_per_um", "frequency_order", "frequency_GHz"))
+            for sample, vector in sorted(path.items()):
+                for rank in range(1, 25):
+                    # The first two independent modes are exactly degenerate.
+                    frequency = 9.0 if rank <= 2 else float(7 + rank)
+                    writer.writerow((sample, vector[0] / 1e6, vector[1] / 1e6, rank, frequency))
+        artifacts = {}
+        for key in ("frequency_csv", "original_export", "model_mph", "resolved_model",
+                    "execution_provenance", "equilibrium", "boundary_phase", "lowest_mode_selection"):
+            artifact = frequency_csv if key == "frequency_csv" else reference_dir / (key + ".fixture")
+            if key != "frequency_csv":
+                artifact.write_text('{"status":"verified","equivalence_status":"pass"}\n', encoding="utf-8")
+            artifacts[key] = {"path": artifact.relative_to(root).as_posix(), "sha256": _sha256(artifact)}
+        manifest = {"schema_version": "fullmag.comsol-a1-reference.v1", "artifacts": artifacts,
+                    "status": "pass", "equivalence_status": "verified"}
+        manifest_path = reference_dir / "reference.v1.json"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        evidence = {"external_frequency_reference": {
+            "schema_version": "fullmag.comsol-a1-reference.v1",
+            "manifest_path": manifest_path.relative_to(root).as_posix(),
+            "manifest_sha256": _sha256(manifest_path), "status": "pass"}}
+        parameters = {"external_frequency_comparison": {
+            "policy": "lowest_positive_frequency_multiset_at_each_k",
+            "target_modes_per_sample": 8, "max_relative_error": 1e-3}}
+        samples = {sample: {"sample_index": sample, "k_vector": list(vector), "modes": [
+            {"raw_mode_index": 100 - rank, "branch_id": 999 - rank,
+             "frequency_real_hz": (9.0 if rank <= 2 else float(7 + rank)) * 1e9}
+            for rank in range(8, 0, -1)]} for sample, vector in path.items()}
+        return evidence, parameters, samples, manifest_path, manifest, frequency_csv
+
+    def _validate(self, root, evidence, parameters, samples):
+        reasons = []
+        result = gate._validate_a1_comsol_reference(root, evidence, parameters, samples, reasons)
+        self.assertEqual(result["qualification"], "NOT VERIFIED")
+        self.assertNotEqual(result["status"], "pass")
+        self.assertTrue(reasons)
+        return result
+
+    def test_zero_error_and_declared_verified_proof_still_cannot_qualify(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence, parameters, samples, *_ = self._fixture(root)
+            result = self._validate(root, evidence, parameters, samples)
+        self.assertEqual(result["status"], "not_verified")
+        self.assertEqual(result["frequency_comparison_status"], "pass")
+        self.assertEqual(result["compared_pair_count"], 488)
+        self.assertEqual(result["measured_max_relative_error"], 0.0)
+        self.assertEqual(len(result["pairs"]), 488)
+        self.assertEqual(result["pairs"][0]["reference_frequency_hz"], result["pairs"][1]["reference_frequency_hz"])
+        self.assertEqual(result["external_equivalence_status"], "not_verified_verifier_unavailable")
+
+    def test_missing_reference_and_unset_threshold_fail_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence, parameters, samples, *_ = self._fixture(root)
+            missing = self._validate(root, {}, parameters, samples)
+            self.assertEqual(missing["compared_pair_count"], 0)
+            for config in ({}, {"external_frequency_comparison": {
+                    **parameters["external_frequency_comparison"], "max_relative_error": None}}):
+                result = self._validate(root, evidence, config, samples)
+                self.assertEqual(result["status"], "not_verified")
+                self.assertEqual(result["frequency_comparison_status"], "not_verified")
+                self.assertEqual(result["compared_pair_count"], 488)
+                self.assertTrue(all(pair["within_threshold"] is None for pair in result["pairs"]))
+
+    def test_malformed_threshold_and_descriptor_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence, parameters, samples, *_ = self._fixture(root)
+            for value in (True, False, 0, -1, float("nan"), float("inf"), 10 ** 400, "0.001"):
+                with self.subTest(value=value):
+                    config = copy.deepcopy(parameters)
+                    config["external_frequency_comparison"]["max_relative_error"] = value
+                    self.assertEqual(self._validate(root, evidence, config, samples)["status"], "fail")
+            for descriptor in ({"schema_version": "frequency_only_unqualified"},
+                               {**evidence["external_frequency_reference"], "manifest_path": "../reference.json"},
+                               {**evidence["external_frequency_reference"], "manifest_sha256": "0" * 64}):
+                result = self._validate(root, {"external_frequency_reference": descriptor}, parameters, samples)
+                self.assertEqual(result["status"], "fail")
+
+    def test_changed_csv_and_rehashed_malformed_reference_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence, parameters, samples, manifest_path, manifest, frequency_csv = self._fixture(root)
+            rows = frequency_csv.read_text(encoding="utf-8").splitlines()
+            frequency_csv.write_text("\n".join(rows[:-1]) + "\n", encoding="utf-8")
+            stale = self._validate(root, evidence, parameters, samples)
+            self.assertTrue(any("frequency_csv SHA256" in reason for reason in stale["reasons"]))
+            manifest["artifacts"]["frequency_csv"]["sha256"] = _sha256(frequency_csv)
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            evidence["external_frequency_reference"]["manifest_sha256"] = _sha256(manifest_path)
+            malformed = self._validate(root, evidence, parameters, samples)
+            self.assertTrue(any("frequency CSV is invalid" in reason for reason in malformed["reasons"]))
+
+    def test_missing_artifact_and_unsafe_member_path_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence, parameters, samples, manifest_path, manifest, _ = self._fixture(root)
+            for mutation in ("missing", "path", "hash"):
+                altered = copy.deepcopy(manifest)
+                if mutation == "missing":
+                    del altered["artifacts"]["model_mph"]
+                elif mutation == "path":
+                    altered["artifacts"]["boundary_phase"]["path"] = "../foreign.json"
+                else:
+                    altered["artifacts"]["execution_provenance"]["sha256"] = "0" * 64
+                manifest_path.write_text(json.dumps(altered), encoding="utf-8")
+                evidence["external_frequency_reference"]["manifest_sha256"] = _sha256(manifest_path)
+                self.assertEqual(self._validate(root, evidence, parameters, samples)["status"], "fail")
+
+    def test_native_coverage_identity_k_and_single_outlier_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evidence, parameters, samples, *_ = self._fixture(root)
+            for mutation in ("sample", "sample_bool", "mode", "raw_bool", "duplicate", "k", "nonfinite", "outlier"):
+                with self.subTest(mutation=mutation):
+                    altered = copy.deepcopy(samples)
+                    if mutation == "sample":
+                        del altered[60]
+                    elif mutation == "sample_bool":
+                        altered[1]["sample_index"] = True
+                    elif mutation == "mode":
+                        altered[20]["modes"].pop()
+                    elif mutation == "raw_bool":
+                        altered[20]["modes"][0]["raw_mode_index"] = True
+                    elif mutation == "duplicate":
+                        altered[20]["modes"][0]["raw_mode_index"] = altered[20]["modes"][1]["raw_mode_index"]
+                    elif mutation == "k":
+                        altered[20]["k_vector"][0] += 1e5
+                    elif mutation == "nonfinite":
+                        altered[20]["modes"][0]["frequency_real_hz"] = float("nan")
+                    else:
+                        altered[20]["modes"][0]["frequency_real_hz"] *= 1.1
+                    result = self._validate(root, evidence, parameters, altered)
+                    self.assertEqual(result["status"], "fail")
+                    if mutation == "outlier":
+                        self.assertEqual(result["compared_pair_count"], 488)
+                        self.assertEqual(sum(pair["within_threshold"] is False for pair in result["pairs"]), 1)
+                        self.assertGreater(result["measured_max_relative_error"], 0.09)
+
+    def test_reference_replacement_during_read_invalidates_bound_comparison(self):
+        from compare_comsol_a1_frequency_reference import read_reference
+        for changed_input in ("frequency_csv", "manifest"):
+            with self.subTest(changed_input=changed_input), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                evidence, parameters, samples, manifest_path, _, frequency_csv = self._fixture(root)
+
+                def replacing_read(path):
+                    parsed = read_reference(path)
+                    changed = frequency_csv if changed_input == "frequency_csv" else manifest_path
+                    changed.write_bytes(changed.read_bytes() + b"\n")
+                    return parsed
+
+                with mock.patch("compare_comsol_a1_frequency_reference.read_reference", side_effect=replacing_read):
+                    result = self._validate(root, evidence, parameters, samples)
+                self.assertEqual(result["status"], "fail")
+                self.assertEqual(result["frequency_comparison_status"], "fail")
+                self.assertEqual(result["compared_pair_count"], 488)
+                self.assertTrue(any("after comparison SHA256" in reason for reason in result["reasons"]))
+                self.assertEqual(result["binding_observation"], "before_and_after_comparison_hash_checks_no_atomic_snapshot")
+                if changed_input == "frequency_csv":
+                    self.assertNotIn("frequency_csv", result["external_artifact_hashes"])
+                else:
+                    self.assertIsNone(result["external_reference_manifest_sha256"])
+
+    def test_gate_check_is_mandatory_only_for_a1(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for case in ("c0", "c1", "a1"):
+                case_dir = _make_case(Path(directory), case)
+                with mock.patch.object(gate, "_validate_a1_comsol_reference", return_value={"status": "not_verified"}) as external:
+                    result = gate.validate_case(case_dir, case, parameters_path=PARAMETERS, kpath_path=KPATH)
+                self.assertEqual(external.call_count, 1 if case == "a1" else 0)
+                self.assertEqual(result["checks"]["comsol_a1_reference"]["status"],
+                                 "not_verified" if case == "a1" else "not_applicable")
+                self.assertEqual(result["campaign_contract_status"], "pass", result["reasons"][:8])
+                if case == "a1":
+                    self.assertEqual(result["qualification"], "NOT VERIFIED")
+                    self.assertTrue(any("required scientific check comsol_a1_reference" in reason for reason in result["reasons"]))
+
 if __name__ == "__main__":
     unittest.main()

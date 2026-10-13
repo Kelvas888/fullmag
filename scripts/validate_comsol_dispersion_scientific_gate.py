@@ -4325,6 +4325,201 @@ def _validate_evidence_binding(
     return _new_check("pass" if not any("scientific evidence" in reason or "binding" in reason for reason in reasons) else "fail", path=EVIDENCE_RELATIVE_PATH.as_posix())
 
 
+def _validate_a1_comsol_reference(
+    case_dir: Path,
+    evidence: Mapping[str, Any] | None,
+    parameters: Mapping[str, Any],
+    sample_map: Mapping[int, Mapping[str, Any]],
+    reasons: list[str],
+) -> dict[str, Any]:
+    """Recompute A1 frequency evidence without pretending to verify COMSOL physics.
+
+    Hash binding and numerical agreement are necessary, but do not prove the
+    external operator/equilibrium/phase equivalence. That verifier is pending.
+    """
+    from compare_comsol_a1_frequency_reference import read_reference
+
+    local_reasons: list[str] = []
+    pending: list[str] = []
+    schema = "fullmag.comsol-a1-reference.v1"
+    policy = "lowest_positive_frequency_multiset_at_each_k"
+    config = parameters.get("external_frequency_comparison")
+    threshold = None
+    if not isinstance(config, Mapping):
+        pending.append("A1 COMSOL comparison threshold/configuration is missing")
+    else:
+        if config.get("policy") != policy or type(config.get("target_modes_per_sample")) is not int \
+                or config.get("target_modes_per_sample") != EXPECTED_TARGET_BANDS:
+            local_reasons.append("A1 COMSOL comparison requires the canonical policy and eight modes per sample")
+        value = config.get("max_relative_error")
+        try:
+            valid_threshold = _finite_positive(value)
+        except (OverflowError, ValueError):
+            valid_threshold = False
+        if value is None:
+            pending.append("A1 COMSOL max_relative_error is unset; no comparison tolerance is assumed")
+        elif not valid_threshold:
+            local_reasons.append("A1 COMSOL max_relative_error must be finite, positive and non-boolean")
+        else:
+            threshold = float(value)
+
+    descriptor = evidence.get("external_frequency_reference") if isinstance(evidence, Mapping) else None
+    manifest_path = None
+    if not isinstance(descriptor, Mapping):
+        pending.append("A1 requires hash-bound external_frequency_reference evidence")
+    elif descriptor.get("schema_version") != schema:
+        local_reasons.append("A1 COMSOL reference descriptor has an unsupported schema_version")
+    else:
+        manifest_path = _safe_relative_path(
+            case_dir, descriptor.get("manifest_path"), "A1 COMSOL reference manifest", local_reasons,
+        )
+
+    def bound_hash(path: Path, declared: object, label: str) -> bool:
+        if not isinstance(declared, str) or len(declared) != 64 \
+                or any(character not in "0123456789abcdef" for character in declared):
+            local_reasons.append(f"{label} requires a lowercase SHA256 digest")
+            return False
+        try:
+            actual = _sha256(path)
+        except OSError as error:
+            local_reasons.append(f"{label} cannot be read: {error}")
+            return False
+        if actual != declared:
+            local_reasons.append(f"{label} SHA256 does not match the current artifact")
+            return False
+        return True
+
+    manifest: Mapping[str, Any] = {}
+    manifest_bound = False
+    if manifest_path is not None and bound_hash(
+            manifest_path, descriptor.get("manifest_sha256"), "A1 COMSOL reference manifest"):
+        manifest_bound = True
+        loaded, error = _load_json(manifest_path)
+        if error:
+            local_reasons.append(error)
+        elif not isinstance(loaded, Mapping) or loaded.get("schema_version") != schema:
+            local_reasons.append("A1 COMSOL reference manifest has an unsupported schema_version")
+        else:
+            manifest = loaded
+    required_artifacts = (
+        "frequency_csv", "original_export", "model_mph", "resolved_model",
+        "execution_provenance", "equilibrium", "boundary_phase", "lowest_mode_selection",
+    )
+    paths: dict[str, Path] = {}
+    artifact_hashes: dict[str, str] = {}
+    if manifest:
+        artifacts = manifest.get("artifacts")
+        if not isinstance(artifacts, Mapping) or set(artifacts) != set(required_artifacts):
+            local_reasons.append("A1 COMSOL manifest requires the exact external artifact set")
+        if isinstance(artifacts, Mapping):
+            for key in required_artifacts:
+                record = artifacts.get(key)
+                if not isinstance(record, Mapping):
+                    local_reasons.append(f"A1 COMSOL {key} artifact descriptor is missing")
+                    continue
+                path = _safe_relative_path(case_dir, record.get("path"), f"A1 COMSOL {key}", local_reasons)
+                if path is not None and bound_hash(path, record.get("sha256"), f"A1 COMSOL {key}"):
+                    paths[key] = path
+                    artifact_hashes[key] = record["sha256"]
+
+    reference: dict[int, list[float]] = {}
+    if "frequency_csv" in paths:
+        try:
+            reference = read_reference(paths["frequency_csv"])
+            if any(not _finite_positive(frequency) for modes in reference.values() for frequency in modes):
+                raise ValueError("COMSOL converted frequencies must be finite and positive")
+        except (OSError, UnicodeError, ValueError, csv.Error, OverflowError) as error:
+            local_reasons.append(f"A1 COMSOL frequency CSV is invalid: {error}")
+            reference = {}
+    expected_path, _path_check, path_reasons = _canonical_path_rows(CANONICAL_KPATH)
+    local_reasons.extend(path_reasons)
+    if any(type(index) is not int for index in sample_map) or set(sample_map) != set(range(EXPECTED_PATH_SAMPLE_COUNT)):
+        local_reasons.append("A1 COMSOL comparison requires all 61 native spectrum samples")
+    pairs: list[dict[str, Any]] = []
+    for index in range(EXPECTED_PATH_SAMPLE_COUNT):
+        sample = sample_map.get(index)
+        if not isinstance(sample, Mapping) or type(sample.get("sample_index")) is not int or sample.get("sample_index") != index:
+            local_reasons.append(f"A1 COMSOL native sample {index} is missing or has inconsistent identity")
+            continue
+        vector = sample.get("k_vector")
+        expected = expected_path.get(index)
+        if not isinstance(vector, list) or len(vector) != 3 or not all(_finite(value) for value in vector) \
+                or expected is None or any(abs(float(value) - wanted) > 1.0e-8 * max(1.0, abs(wanted))
+                                          for value, wanted in zip(vector, expected)):
+            local_reasons.append(f"A1 COMSOL native sample {index} does not match canonical k")
+            continue
+        modes = sample.get("modes")
+        if not isinstance(modes, list):
+            local_reasons.append(f"A1 COMSOL native sample {index} has no mode array")
+            continue
+        numeric: list[tuple[float, int]] = []
+        raw_ids: set[int] = set()
+        invalid = False
+        for mode in modes:
+            if not isinstance(mode, Mapping):
+                invalid = True
+                continue
+            raw = mode.get("raw_mode_index", mode.get("index"))
+            frequency = mode.get("frequency_real_hz", mode.get("frequency_hz"))
+            if type(raw) is not int or raw < 0 or raw in raw_ids or not _finite(frequency):
+                invalid = True
+                continue
+            raw_ids.add(raw)
+            if float(frequency) > 0.0:
+                numeric.append((float(frequency), raw))
+        if invalid or len(numeric) < EXPECTED_TARGET_BANDS:
+            local_reasons.append(f"A1 COMSOL native sample {index} requires eight finite positive modes with unique raw IDs")
+            continue
+        if index not in reference:
+            continue
+        # Sorting preserves multiplicity; never infer physical band identity or
+        # choose a better matching subset of the reference spectrum.
+        for rank, (frequency, raw) in enumerate(sorted(numeric)[:EXPECTED_TARGET_BANDS], 1):
+            frequency_reference = reference[index][rank - 1]
+            relative_error = abs(frequency - frequency_reference) / frequency_reference
+            passed = math.isfinite(relative_error) and threshold is not None and relative_error <= threshold
+            pairs.append({
+                "sample_index": index, "frequency_order": rank, "raw_mode_index": raw,
+                "numeric_frequency_hz": frequency, "reference_frequency_hz": frequency_reference,
+                "absolute_difference_hz": abs(frequency - frequency_reference),
+                "relative_error": relative_error if math.isfinite(relative_error) else None,
+                "within_threshold": passed if threshold is not None else None,
+            })
+            if not math.isfinite(relative_error) or (threshold is not None and not passed):
+                local_reasons.append(f"A1 COMSOL sample {index} rank {rank} exceeds max_relative_error")
+    expected_pairs = EXPECTED_PATH_SAMPLE_COUNT * EXPECTED_TARGET_BANDS
+    if reference and len(pairs) != expected_pairs:
+        local_reasons.append(f"A1 COMSOL comparison requires all {expected_pairs} frequency pairs")
+    # Recapture after parsing/comparison so changed inputs cannot yield a bound
+    # comparison verdict. This detects endpoint changes, not an atomic snapshot
+    # or a transient replacement restored between the two observations.
+    if "frequency_csv" in paths and not bound_hash(
+            paths["frequency_csv"], artifact_hashes["frequency_csv"], "A1 COMSOL frequency_csv after comparison"):
+        artifact_hashes.pop("frequency_csv", None)
+    if manifest_bound:
+        manifest_bound = bound_hash(
+            manifest_path, descriptor.get("manifest_sha256"), "A1 COMSOL reference manifest after comparison")
+    pending.append("A1 COMSOL external operator/equilibrium/phase equivalence verifier is not implemented; "
+                   "hashes, frequency agreement and declared verified/pass statuses cannot establish equivalence")
+    reasons.extend(local_reasons + pending)
+    finite_errors = [pair["relative_error"] for pair in pairs if pair["relative_error"] is not None]
+    comparison_pass = len(pairs) == expected_pairs and threshold is not None and all(
+        pair["within_threshold"] is True for pair in pairs
+    )
+    return _new_check(
+        "fail" if local_reasons else "not_verified", qualification="NOT VERIFIED",
+        comparison_policy=policy, max_relative_error=threshold,
+        required_sample_count=EXPECTED_PATH_SAMPLE_COUNT, required_modes_per_sample=EXPECTED_TARGET_BANDS,
+        expected_pair_count=expected_pairs, compared_pair_count=len(pairs), pairs=pairs,
+        measured_max_relative_error=max(finite_errors) if finite_errors else None,
+        frequency_comparison_status="pass" if comparison_pass and not local_reasons else
+            ("fail" if local_reasons else "not_verified"),
+        external_equivalence_status="not_verified_verifier_unavailable",
+        binding_observation="before_and_after_comparison_hash_checks_no_atomic_snapshot",
+        external_reference_manifest_sha256=descriptor.get("manifest_sha256") if manifest_bound else None,
+        external_artifact_hashes=artifact_hashes, reasons=local_reasons + pending,
+    )
+
 def validate_case(
     case_dir: Path,
     case: str,
@@ -4481,6 +4676,11 @@ def validate_case(
         mode_count=len(mode_map),
     )
     campaign_contract_status = "pass" if not reasons else "fail"
+    # External COMSOL proof is a scientific gate after the source/campaign contract.
+    comsol_reference_check = (
+        _validate_a1_comsol_reference(case_dir, evidence, parameters or {}, sample_map, reasons)
+        if case == "a1" else _new_check("not_applicable")
+    )
     # Execute from actual disk inputs; never trust a supplied replay verdict.
     # Assignment has its own executed, full-path certificate.
     tracking_replay = _new_check("not_applicable")
@@ -4530,6 +4730,7 @@ def validate_case(
         "tracking_assignment_replay": assignment_replay,
         "dispersion_csv": csv_check,
         "postsolve_analytic_columns": analytic_columns_check,
+        "comsol_a1_reference": comsol_reference_check,
         "kittel": kittel_check,
         "kalinikos_slab_n0": ks_check,
         "dispersion_analytic_coverage": dispersion_analytic_check,

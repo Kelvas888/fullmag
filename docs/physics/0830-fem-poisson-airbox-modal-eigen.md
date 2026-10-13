@@ -2107,7 +2107,10 @@ znaczenia NEV/NCV/MPD: [dokumentacja SLEPc EPSGetDimensions](https://slepc.upv.e
 | ID | Path + symbol | Dowód |
 |---|---|---|
 | source-nodal-ms-floquet-contract | `docs/physics/0828-fem-frequency-domain-floquet-demag.md` + `DOC-ANCHOR:nodal-ms-floquet-source` | plan korekty, nie kwalifikacja |
-| source-nodal-ms-floquet-assembly | `backends/fem/cpu/frequency_domain/floquet_bloch_scalar.cpp` + `assemble_floquet_bloch_scalar_tangent_source` | implementacja/regresje w toku, runtime NOT VERIFIED |
+| source-nodal-ms-floquet-assembly | `backends/fem/cpu/frequency_domain/floquet_bloch_scalar.cpp` + `assemble_floquet_bloch_scalar_tangent_source` | native CPU/MFEM assembly GHA38298716226 PASS; full eigen/GPU/science NOT VERIFIED |
 
 | source-nodal-ms-floquet-moments | `backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp` + `floquet_bloch_scalar_heterogeneous_source_moment_contract` | source prepared, native CI pending |
-| source-nodal-ms-floquet-gamma | `backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp` + `floquet_bloch_scalar_heterogeneous_source_k0_consistency` | source prepared, native CI pending |
+| source-nodal-ms-floquet-gamma | `backends/fem/tests/frequency_domain/floquet_bloch_scalar_test.cpp` + `floquet_bloch_scalar_heterogeneous_source_k0_consistency` | native CPU/MFEM assembly GHA38298716226 PASS; full eigen/GPU/science NOT VERIFIED |
+
+
+Native CPU/MFEM assembly korekty nodalnego Ms: GHA38298716226 PASS, clean090c13b,1/1CTest i marker hetero moments/Gamma observed. SLEPc OFF; dowód nie obejmuje pełnego eigensolve, GPU ani naukowej kwalifikacji dyspersji. Receipt d6b173bb /native log1ea7cf63, pełne SHA w ci-evidence-20261010.json.

@@ -49,8 +49,16 @@
   "analytic_controls": {
     "kalinikos_slab_n0": {
       "control_k_rad_per_m": 10000000.0,
-      "backward_volume_k_vector_rad_per_m": [10000000.0, 0.0, 0.0],
-      "damon_eshbach_k_vector_rad_per_m": [0.0, 10000000.0, 0.0],
+      "backward_volume_k_vector_rad_per_m": [
+        10000000.0,
+        0.0,
+        0.0
+      ],
+      "damon_eshbach_k_vector_rad_per_m": [
+        0.0,
+        10000000.0,
+        0.0
+      ],
       "required_geometries": [
         "backward_volume",
         "damon_eshbach"
@@ -61,7 +69,10 @@
     "initial_shift_hz": 1000000000.0,
     "initial_requested_modes": 24,
     "gamma_requested_modes": 1,
-    "frequency_window_hz": [1000000.0, 30000000000.0],
+    "frequency_window_hz": [
+      1000000.0,
+      30000000000.0
+    ],
     "count_check_requested_modes": 48,
     "target_positive_physical_bands": 8,
     "relative_tolerance": 1e-08,
@@ -76,5 +87,10 @@
   "ks_n0_profile": {
     "max_projection_residual": 0.01,
     "max_longitudinal_leakage_fraction": 1e-08
+  },
+  "external_frequency_comparison": {
+    "policy": "lowest_positive_frequency_multiset_at_each_k",
+    "target_modes_per_sample": 8,
+    "max_relative_error": 0.005
   }
 }

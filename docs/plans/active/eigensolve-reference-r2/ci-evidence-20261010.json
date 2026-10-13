@@ -1187,6 +1187,19 @@
       "scope": "complete_spectrum_scope_source_contracts",
       "conclusion": "success",
       "evidence": "Scoped contract CI verified; native GPU/browser/scientific qualification remains separate."
+    },
+    {
+      "run_id": 38298716226,
+      "sha": "090c13bdd5b667d082dadceb2969f88bd522844f",
+      "conclusion": "success",
+      "scope": "mfem_cpu_nodal_material_source_assembly_contract_only",
+      "passed": 1,
+      "failed": 0,
+      "mfem_compile_gate_observed": true,
+      "slepc_compile_gate_observed": false,
+      "receipt_sha256": "d6b173bba0df6f2876b757f4d61df962214a1716e4a2964e82b6354b5b195e4c",
+      "native_log_sha256": "1ea7cf63c8c75c230346e50f696aacb354976d991f70b805ef0b1f0bad9874cc",
+      "evidence": "Actual analytic heterogeneous tet/prism source moments, full/shifted representations, uniform equivalence, tangent reduction and K0 descriptor/reciprocal feedback; full eigen/GPU/science unverified."
     }
   ]
 }
