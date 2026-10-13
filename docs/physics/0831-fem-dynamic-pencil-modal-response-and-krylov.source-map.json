@@ -4207,6 +4207,19 @@
       "path": "backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp",
       "symbol": "floquet_cached_true_gate_rejected_current_candidate",
       "responsibility": "Retry only for the same-cycle rejected true residual, never generic divergence"
+    },
+    {
+      "id": "source-g5-owned-candidate-contract",
+      "path": "docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md",
+      "symbol": "DOC-ANCHOR:g5-owned-same-attempt-candidate",
+      "responsibility": "Same-attempt candidate contract and explicit unverified runtime boundary",
+      "evidence_status": "planned_contract"
+    },
+    {
+      "id": "source-g5-owned-candidate-probe",
+      "path": "backends/fem/cpu/frequency_domain/modal/shifted_ksp_true_convergence.hpp",
+      "symbol": "floquet_shifted_true_convergence_test",
+      "responsibility": "Retain independently owned completed probe with attempt and iteration provenance"
     }
   ],
   "public_api": {

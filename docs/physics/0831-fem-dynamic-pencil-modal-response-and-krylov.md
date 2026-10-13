@@ -5619,8 +5619,9 @@ real-split lub kryteriów original-pencil/full-descriptor.
 
 Planowana realizacja CPU Floquet zachowuje STSINVERT. Publiczny owner solve
 (KSPPREONLY/PCSHELL outer) posiada oddzielny inner GMRES/PCLU. Inner ma
-error-if-not-converged=false, aby otrzymać committed candidate i reason;
-wrapper ponownie oblicza true residual. Jedynie odrzucony happy breakdown
+error-if-not-converged=false, aby odczytać terminalny reason bez API error;
+nie gwarantuje to zapisania finalnego candidate. Wrapper ponownie oblicza
+true residual wybranego, jawnie zidentyfikowanego wektora. Jedynie odrzucony happy breakdown
 może uruchomić ponowienie z niezerowym initial guess. Sumaryczna liczba
 iteracji wszystkich cykli nie przekracza pierwotnego requested budget.
 Threshold odnosi się zawsze do pierwotnego RHS, również w następnych cyklach.
@@ -5665,3 +5666,34 @@ log SHA256 `db05b54dbe361a6ba77273e79721f60dd9ab233af3edee5c30a0a0ecb626ffd0`.
 | `backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp` | `floquet_shifted_certified_recovery_shell_apply` | Original RHS threshold i cumulative requested budget |
 | `backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp` | `destroy_floquet_shifted_ksp_certified_recovery_shell` | Checked destruction/quarantine; first/cleanup errors oddzielne |
 | `backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp` | `floquet_cached_true_gate_rejected_current_candidate` | Recovery eligibility wymaga cached rejection z bieżącego cyklu |
+
+
+(g5-owned-same-attempt-candidate)=
+<!-- DOC-ANCHOR:g5-owned-same-attempt-candidate -->
+### G5 — własna kopia poprawnego probe i terminalny breakdown
+
+Hosted GHA38374719458 dla source6c64b2fb: kompilacja sukces,14/17 CTest PASS,
+trzy FAIL. Pierwszy failed scope ma ukończony true probe z iteracji4,
+terminalny BREAKDOWN z iteracji5 oraz finalny owner residual równy normie
+RHS. [PETSc3.24.6 BuildSoln](https://github.com/petsc/petsc/blob/v3.24.6/src/ksp/ksp/impls/gmres/gmres.c)
+może zakończyć się bez zapisania destination przy zerowym elemencie HH;
+wejście właśnie w tę gałąź pozostaje **NOT VERIFIED** w tym logu.
+
+Kontrakt korekty: osobna owned copy z poprawnie zakończonego true probe
+przechowuje identity bieżącej próby inner solve, callback i numer iteracji.
+Po terminalnym BREAKDOWN bez API error owner może rozważyć tę kopię, również
+przy wcześniejszym numerze probe, lecz niezależnie przelicza jej residual
+przed wyborem i certyfikacją. Wszystkie terminalne iteracje obciążają
+pierwotny sumaryczny budget. Zachowuje się oryginalny RHS/próg oraz strict
+progress. Cache poprzedniej próby, nieudany/ujemny BuildSolution, quarantine,
+inne ujemne reasons i niewystarczający budget nie uprawniają do recovery.
+Provenance rozróżnia committed vector, cached candidate i terminal iteration.
+Regresja4vs5 z niepoprawnym committed vector oraz oba oryginalne full/mixed
+przypadki wymagają nowego hosted receipt. Nie zmienia się Python→IR,
+jednostek, requested execution ani statusu FEM GPU/FDM/BEM/A1.
+
+| Ścieżka | Symbol / anchor | Odpowiedzialność i dowód |
+|---|---|---|
+| `docs/physics/0831-fem-dynamic-pencil-modal-response-and-krylov.md` | `DOC-ANCHOR:g5-owned-same-attempt-candidate` | Kontrakt same-attempt copy; kwalifikacja NOT VERIFIED |
+| `backends/fem/cpu/frequency_domain/modal/shifted_ksp_true_convergence.hpp` | `floquet_shifted_true_convergence_test` | Completed probe i owned copy, w trakcie poprawki |
+| `backends/fem/cpu/frequency_domain/modal/shifted_ksp_certified_recovery.hpp` | `floquet_shifted_certified_recovery_shell_apply` | Owner recompute, wybór candidate i pełne rozliczenie budget |
