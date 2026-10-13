@@ -252,7 +252,7 @@ jobs:
             ../storage/builds/**/inspector-actions-browser/*/next.log
             ../storage/builds/**/inspector-actions-browser/*/browser.log
             ../storage/builds/**/inspector-actions-browser/*/browser/**
-          if-no-files-found: warn
+          if-no-files-found: error
 
   fdm-relaxation-qualification:
     runs-on: ubuntu-latest

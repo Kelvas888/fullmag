@@ -214,6 +214,10 @@ try {
     });
     await page.getByRole("button", { name: "Applying…", exact: true }).waitFor();
     assert.equal(await apply.isDisabled(), true);
+    await page.waitForFunction(() => {
+      const state = window.__fullmagInspectorActionsFixture?.read();
+      return state?.applyCalls === 1 && state.pending;
+    });
     assert.equal((await snapshot()).applyCalls, 1);
     assert.equal((await snapshot()).pending, true);
     await assertPinnedIdentity("pending Apply");
@@ -227,6 +231,9 @@ try {
     });
     await inspector.getByRole("alert").waitFor();
     assert.match((await inspector.getByRole("alert").textContent()) || "", /Changes were not applied/);
+    await page.waitForFunction(() =>
+      window.__fullmagInspectorActionsFixture?.read().lastApplyAck === false,
+    );
     assert.equal((await snapshot()).lastApplyAck, false);
     assert.equal((await snapshot()).dirty, true);
     await assertPinnedIdentity("rejected Apply ACK");
@@ -239,6 +246,10 @@ try {
       button.click();
     });
     await page.getByRole("button", { name: "Applying…", exact: true }).waitFor();
+    await page.waitForFunction(() => {
+      const state = window.__fullmagInspectorActionsFixture?.read();
+      return state?.applyCalls === 2 && state.pending;
+    });
     assert.equal((await snapshot()).applyCalls, 2);
     await page.evaluate(() => {
       const driver = window.__fullmagInspectorActionsFixture;
@@ -246,6 +257,10 @@ try {
       driver.settleApply(true);
     });
     await inspector.getByRole("button", { name: "Apply", exact: true }).waitFor();
+    await page.waitForFunction(() => {
+      const state = window.__fullmagInspectorActionsFixture?.read();
+      return state?.lastApplyAck === true && !state.dirty;
+    });
     assert.equal((await snapshot()).lastApplyAck, true);
     assert.equal((await snapshot()).dirty, false);
     await assertPinnedIdentity("accepted Apply ACK");
