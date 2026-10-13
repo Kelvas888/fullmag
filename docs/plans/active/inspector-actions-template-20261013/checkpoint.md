@@ -150,3 +150,23 @@ receiptów. Root potwierdził limit 8 w reconcileMeshSubmission i dopuszczenie
 current/runAllowed na samym source_scene_revision. Te elementy należy
 naprawić w kolejnych oddzielnych etapach, bez traktowania PR150 jako pełnego
 zakończenia oryginalnego celu R0/R1.
+
+## Aktualne dowody browser CI
+
+Na PR head 2580023c1ca341362008de4d79df7ae8749b1205, run38381032834,
+inspector-actions-browser-smoke: PASS. Receipt wskazuje merge-ref
+c5173116a0a3fc3d981a6bdb1a0e797659e15bea; jego rodzice to
+499c7c902b40ad7a69e3e03108f26caecb28d3ca oraz powyższy PR head.
+Source digest before/after identyczny: cd42024878db363c475597c457be3d5a1bfbf44bffef3c6a2fd53d669433bb5a.
+Pobrane 11 artefaktów mają zgodne SHA256/size z receipt. Obejrzano zrzuty
+Object wide invalid i Airbox narrow live; stopka pokazuje właściwe tryby.
+7 scenariuszy PASS, transakcje ACK: 4 i 5 commitów React (limit <32);
+0 mutacji API zgodnie z syntetycznym fixture. Backend end-to-end pozostaje
+NOT VERIFIED. Owned server terminal=true, source_changed_during_run=false.
+
+control-room-contracts: typecheck i brak błędów ESLint, lecz FAIL przez
+4 ostrzeżenia exhaustive-deps najnowszych callbacków regionów. Efekty te
+synchronizują refs po każdym commitcie, więc usunięto pozornie stabilne
+deps arrays, zachowując semantykę i threshold max-warnings=0.
+React Doctor CI: 22 warnings, score84, bez nowych error findings; wynik
+advisory nie jest deklaracją zero warnings. Nie tłumiono reguł ani diagnostyk.

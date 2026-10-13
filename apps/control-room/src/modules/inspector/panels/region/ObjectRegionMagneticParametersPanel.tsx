@@ -386,10 +386,11 @@ function useObjectRegionMagneticParametersPanelView({
   const fieldDraftValid = canWriteRegion && Boolean(sessionScopeKey) && !fieldDraftErrors;
   const auxiliaryApplyRef = useRef(applyMaterialFields);
   const auxiliaryResetRef = useRef(resetMaterialFields);
+  // Publish the latest handler closures after every committed render.
   useLayoutEffect(() => {
     auxiliaryApplyRef.current = applyMaterialFields;
     auxiliaryResetRef.current = resetMaterialFields;
-  }, [applyMaterialFields, resetMaterialFields]);
+  });
   const applyAuxiliaryDraft = useCallback(
     () => auxiliaryApplyRef.current(fieldDrafts),
     [fieldDrafts],

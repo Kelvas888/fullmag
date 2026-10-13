@@ -445,10 +445,11 @@ export function ObjectRegionTexturePanel({
   }
   const saveTextureRef = useRef(saveTexture);
   const auxiliaryResetRef = useRef(resetDraft);
+  // Publish the latest handler closures after every committed render.
   useLayoutEffect(() => {
     saveTextureRef.current = saveTexture;
     auxiliaryResetRef.current = resetDraft;
-  }, [resetDraft, saveTexture]);
+  });
   const applyAuxiliaryDraft = useCallback(
     () => saveTextureRef.current(draft),
     [draft],
