@@ -5814,7 +5814,7 @@ mod tests {
         fem.mesh.boundary_markers = vec![27];
         let part = FemMeshPartIR {
             id: "part:interface:0:1".into(),
-            label: "Air â†” film".into(),
+            label: "Air ↔ film".into(),
             role: FemMeshPartRole::Interface,
             object_id: Some("film".into()),
             geometry_id: Some("film".into()),
@@ -5908,7 +5908,7 @@ mod tests {
         assert_eq!(field_unit("H_dmi_bulk.z"), "A/m");
         assert_eq!(field_unit("H_rotated_dmi"), "A/m");
         assert_eq!(field_unit("H_rotated_dmi.y"), "A/m");
-        assert_eq!(field_unit("eden_rotated_dmi"), "J/mÂł");
+        assert_eq!(field_unit("eden_rotated_dmi"), "J/m³");
     }
 
     #[test]

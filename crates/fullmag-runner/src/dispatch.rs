@@ -9082,31 +9082,60 @@ mod tests {
 
     #[test]
     fn strict_fem_canonical_slonczewski_v2_reaches_native_runtime_validation() {
+        let _guard = env_lock().lock().expect("env mutex");
+        let plan = canonical_stt_fem_plan("slonczewski.fullmag.v2");
+        let previous_threshold = std::env::var_os("FULLMAG_FEM_GPU_MIN_NODES");
+        let threshold = plan.mesh.nodes.len().to_string();
+        unsafe {
+            std::env::set_var("FULLMAG_FEM_GPU_MIN_NODES", threshold);
+        }
         let resolution = apply_fem_gpu_plan_constraints(
-            &canonical_stt_fem_plan("slonczewski.fullmag.v2"),
+            &plan,
             EngineResolution {
                 engine: FemEngine::NativeGpu,
                 fallback: None,
             },
             true,
             None,
-        )
-        .expect("strict canonical Slonczewski v2 should reach native runtime validation");
+        );
+        unsafe {
+            match previous_threshold {
+                Some(value) => std::env::set_var("FULLMAG_FEM_GPU_MIN_NODES", value),
+                None => std::env::remove_var("FULLMAG_FEM_GPU_MIN_NODES"),
+            }
+        }
+        let resolution =
+            resolution.expect("strict canonical Slonczewski v2 should reach native runtime validation");
         assert_eq!(resolution.engine, FemEngine::NativeGpu);
+        assert!(resolution.fallback.is_none());
     }
 
     #[test]
     fn strict_fem_canonical_zhang_li_reaches_native_runtime_validation() {
+        let _guard = env_lock().lock().expect("env mutex");
+        let plan = canonical_stt_fem_plan("zhang_li.fullmag.v1");
+        let previous_threshold = std::env::var_os("FULLMAG_FEM_GPU_MIN_NODES");
+        let threshold = plan.mesh.nodes.len().to_string();
+        unsafe {
+            std::env::set_var("FULLMAG_FEM_GPU_MIN_NODES", threshold);
+        }
         let resolution = apply_fem_gpu_plan_constraints(
-            &canonical_stt_fem_plan("zhang_li.fullmag.v1"),
+            &plan,
             EngineResolution {
                 engine: FemEngine::NativeGpu,
                 fallback: None,
             },
             true,
             None,
-        )
-        .expect("strict canonical Zhang-Li GPU should reach native runtime validation");
+        );
+        unsafe {
+            match previous_threshold {
+                Some(value) => std::env::set_var("FULLMAG_FEM_GPU_MIN_NODES", value),
+                None => std::env::remove_var("FULLMAG_FEM_GPU_MIN_NODES"),
+            }
+        }
+        let resolution =
+            resolution.expect("strict canonical Zhang-Li GPU should reach native runtime validation");
 
         assert_eq!(resolution.engine, FemEngine::NativeGpu);
         assert!(resolution.fallback.is_none());

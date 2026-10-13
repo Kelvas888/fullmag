@@ -2731,7 +2731,7 @@ fn build_gamma_projection(
     status: &AnalysisResultStatusFacets,
 ) -> BTreeMap<String, AnalysisResultProjectionResource> {
     let sample_id = "gamma-spectrum-sample-0000";
-    let psd_unit = format!("{}Â˛", payload.trace_unit);
+    let psd_unit = format!("{}²", payload.trace_unit);
     let response_points = finite_gamma_points(
         &payload.frequency_hz,
         &payload.response_psd,
@@ -3199,7 +3199,7 @@ fn legacy_dsf_provenance(payload: &DynamicStructureFactorResource) -> BTreeMap<S
         (
             "array_bounds".to_string(),
             format!(
-                "{} Ă— {} cells; original {} Ă— {}; {} invalid probes",
+                "{} × {} cells; original {} × {}; {} invalid probes",
                 payload.frequency_count,
                 payload.wavevector_count,
                 payload.original_frequency_count,
@@ -4607,9 +4607,9 @@ fn bias_field_label(field: Option<[f64; 3]>) -> String {
         return "bias field unavailable".to_string();
     }
     if magnitude.abs() >= 1.0e-3 {
-        format!("ÎĽâ‚€H = {:.3} mT", magnitude * 1.0e3)
+        format!("μ₀H = {:.3} mT", magnitude * 1.0e3)
     } else {
-        format!("ÎĽâ‚€H = {:.6} T", magnitude)
+        format!("μ₀H = {:.6} T", magnitude)
     }
 }
 
@@ -5479,7 +5479,7 @@ mod tests {
         });
         let durable_mode = FrequencyDomainFieldSweepModePayload {
             mode_artifact_path: Some("eigen/modes/sample_0000/mode_0003.json".to_string()),
-            mode_field_id: Some(" field/1:Î± ".to_string()),
+            mode_field_id: Some(" field/1:α ".to_string()),
             mode_field_resource_key: None,
             ..FrequencyDomainFieldSweepModePayload {
                 sample_id: "sample/1".to_string(),
@@ -5516,7 +5516,7 @@ mod tests {
             mesh_ref.clone(),
         );
         assert_eq!(durable_item.status.completeness, "ready");
-        assert_eq!(durable_item.field_ref.as_ref().unwrap().field_id, " field/1:Î± ");
+        assert_eq!(durable_item.field_ref.as_ref().unwrap().field_id, " field/1:α ");
         assert_eq!(
             durable_item.field_ref.as_ref().unwrap().resource_key,
             "/v2/sessions/current/data/fields/%20field%2F1%3A%CE%B1%20/samples/vector?phase_rad=0&view=phase_rotated_real",
@@ -5838,7 +5838,7 @@ mod tests {
             "mode_id": "sample-0000/mode-0000",
             "raw_mode_index": 0,
             "frequency_hz": 1.0e9,
-            "mode_field_id": "analysis:eigen:field/Î±",
+            "mode_field_id": "analysis:eigen:field/α",
             "residual_relative_l2": 1.0e-8,
             "component_participation": {
                 "schema_version": "modal_component_participation.v1",
@@ -5862,7 +5862,7 @@ mod tests {
                 .is_err()
         );
         let item = spectrum_v3_item("run", "dataset", "sample", "revision", mode.clone(), None);
-        assert_eq!(item.field_ref.as_ref().unwrap().field_id, "analysis:eigen:field/Î±");
+        assert_eq!(item.field_ref.as_ref().unwrap().field_id, "analysis:eigen:field/α");
         assert_eq!(item.field_ref.as_ref().unwrap().resource_key,
             "/v2/sessions/current/data/fields/analysis%3Aeigen%3Afield%2F%CE%B1/samples/vector?phase_rad=0&view=phase_rotated_real");
         assert_eq!(serde_json::to_value(&mode).unwrap(), before);
@@ -6458,7 +6458,7 @@ mod tests {
 
         let response = &index.projections["response-spectrum"];
         assert_eq!(response.axis_units["x"], "Hz");
-        assert_eq!(response.axis_units["y"], "1Â˛");
+        assert_eq!(response.axis_units["y"], "1²");
         assert_eq!(response.selection_index[0].item_id, None);
         assert_eq!(
             serde_json::to_value(&response.selection_index[0]).expect("selection entry JSON")
@@ -6468,7 +6468,7 @@ mod tests {
         assert_eq!(response.series[0].points.len(), 3);
 
         let features = &index.projections["spectral-features"];
-        assert_eq!(features.axis_units["y"], "1Â˛");
+        assert_eq!(features.axis_units["y"], "1²");
         assert_eq!(
             features.selection_index[0].item_id.as_deref(),
             Some("legacy:gamma:peak:2")
