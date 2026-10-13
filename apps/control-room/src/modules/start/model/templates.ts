@@ -36,9 +36,10 @@ export function templateScript(template: StudyTemplate): string | null {
 export const templateScriptFileName = (template: StudyTemplate): string => `${template.id}.py`;
 
 /**
- * The shipped set. Descriptions follow the design spec; estimates are
- * calibrated on the reference machine and rescaled to the detected one by
- * `estimateFor`, so they are indications, not promises.
+ * The shipped set. Descriptions follow the design spec; estimates use a
+ * matching available runtime lane and hardware reading when both exist, and
+ * otherwise remain on the labelled reference machine. They are indications,
+ * not promises or device selection.
  */
 export const STUDY_TEMPLATES: readonly StudyTemplate[] = [
   {
@@ -161,39 +162,65 @@ function duration(minutes: number): string {
 
 const vram = (gb: number) => `${gb % 1 === 0 ? gb : gb.toFixed(1)} GB VRAM`;
 
+function referenceEstimate(template: StudyTemplate, note: string): EstimateLabel {
+  return {
+    text: `${duration(template.estimate.gpuMinutes)} · ${vram(template.estimate.vramGb)}`,
+    basis: "reference",
+    note,
+  };
+}
+
 /**
- * Calibrate against the detected device so the same card reads "~25 min · 6 GB
- * VRAM" on a GPU host and "~7 h · CPU ×32" on a machine without one. A probe
- * that has not answered, or cannot, falls back to the reference figures and says so.
+ * Calibrate only against a hardware reading and a matching available solver
+ * lane. Hardware presence alone never implies that the selected solver can run.
  */
 export function estimateFor(template: StudyTemplate, compute: ComputeProbeState): EstimateLabel {
   const { gpuMinutes, vramGb, cpuMinutes } = template.estimate;
-  if (!compute || (compute.gpus.length === 0 &&
-    (compute.gpuProbeStatus === "unavailable" || compute.cpuThreads < 1))) {
-    return {
-      text: `${duration(gpuMinutes)} · ${vram(vramGb)}`,
-      basis: "reference",
-      note: compute
-        ? "Reference figure on an RTX 4090; GPU availability on this host has not been confirmed."
-        : "Reference figure on an RTX 4090; this machine has not been probed.",
-    };
+  if (!compute) {
+    return referenceEstimate(
+      template,
+      compute === undefined
+        ? "Reference figure on an RTX 4090; this machine has not been probed."
+        : "Reference figure on an RTX 4090; no host compute probe is available.",
+    );
   }
-  const gpu = compute.gpus[0];
-  const fits = gpu !== undefined && gpu.vramTotalBytes >= vramGb * 1e9;
-  if (gpu && fits) {
+
+  const gpuLane = compute.runtimeLanes?.find(
+    (lane) => lane.backend === template.solver && lane.device === "GPU",
+  );
+  const cpuLane = compute.runtimeLanes?.find(
+    (lane) => lane.backend === template.solver && lane.device === "CPU",
+  );
+  const gpu = compute.gpuProbeStatus === "unavailable" ? undefined : compute.gpus[0];
+  const fits = gpu !== undefined && Number.isFinite(gpu.vramTotalBytes) &&
+    gpu.vramTotalBytes > 0 && gpu.vramTotalBytes >= vramGb * 1e9;
+  if (gpuLane?.availability === "available" && gpu && fits) {
     return {
       text: `${duration(gpuMinutes)} · ${vram(vramGb)}`,
       basis: "gpu",
-      note: `Estimated for ${gpu.name}.`,
+      note: `Estimated for ${gpu.name}; the exact device is resolved for the run.`,
     };
   }
-  const threads = Math.max(1, compute.cpuThreads);
-  const scaled = (cpuMinutes * CPU_REFERENCE_THREADS) / threads;
-  return {
-    text: `${duration(scaled)} · CPU ×${threads}`,
-    basis: "cpu",
-    note: gpu
-      ? `${gpu.name} has less than the ${vram(vramGb)} this study needs, so the CPU figure is shown.`
-      : "No GPU was detected, so the CPU figure is shown.",
-  };
+
+  const threads = Number.isFinite(compute.cpuThreads) ? Math.floor(compute.cpuThreads) : 0;
+  if (cpuLane?.availability === "available" && threads > 0) {
+    const scaled = (cpuMinutes * CPU_REFERENCE_THREADS) / threads;
+    const note = gpu && gpuLane?.availability === "available"
+      ? `${gpu.name} has less than the ${vram(vramGb)} this study needs; the estimate uses the available ${template.solver} CPU lane.`
+      : `Estimated on the available ${template.solver} CPU lane using ${threads} reported logical CPUs; allocation is resolved for the run.`;
+    return {
+      text: `${duration(scaled)} · CPU ×${threads}`,
+      basis: "cpu",
+      note,
+    };
+  }
+
+  const lane = gpuLane ?? cpuLane;
+  const reason = lane?.reason ? `: ${lane.reason}` : "";
+  const status = lane?.availability ?? "not reported";
+  const device = lane?.device ?? "GPU";
+  return referenceEstimate(
+    template,
+    `${template.solver} ${device} runtime lane is ${status}${reason}; showing the reference estimate.`,
+  );
 }

@@ -4,6 +4,7 @@ import { Activity, Cpu, HardDrive, RefreshCw } from "lucide-react";
 
 import { Button } from "@/shared/ui/Button";
 
+import { formatTelemetrySampleTime } from "../model/computeTelemetry";
 import type {
   ComputeEnvironment,
   ComputeProbeState,
@@ -40,6 +41,7 @@ export function ComputeEnvironmentSettings({
   error = null,
   onRefresh,
 }: ComputeEnvironmentSettingsProps) {
+  const sampleTime = formatTelemetrySampleTime(compute?.sampledAt);
   return (
     <section
       aria-labelledby="fm-start-compute-settings-title"
@@ -71,15 +73,31 @@ export function ComputeEnvironmentSettings({
       </div>
 
       {compute === undefined ? (
-        <p aria-live="polite" className="fm-start-compute-settings__notice">
-          {error ? "The compute probe failed. Try refreshing the environment." : "Reading compute environment…"}
-        </p>
+        <div aria-live="polite" className="fm-start-compute-settings__notice">
+          <p>
+            {error
+              ? "The compute probe failed. Try refreshing the environment."
+              : "Not probed"}
+          </p>
+          {!error ? (
+            <p>
+              {refreshing
+                ? "Reading compute environment…"
+                : "The desktop host supplies the probe. A concrete device is resolved when a run starts."}
+            </p>
+          ) : null}
+        </div>
       ) : compute === null ? (
         <p className="fm-start-compute-settings__notice" role={error ? "alert" : undefined}>
           {error ? "The compute probe could not return a reading. Try refreshing the environment." : "No compute probe is available on this host."}
         </p>
       ) : (
         <>
+          {sampleTime ? (
+            <p className="fm-start-compute-settings__policy">
+              Latest available telemetry sample: <time dateTime={sampleTime.dateTime}>{sampleTime.label}</time>
+            </p>
+          ) : null}
           {stale ? (
             <p className="fm-start-compute-settings__notice" role="status">
               Showing the last successful reading. Values may have changed since it was sampled.
@@ -96,7 +114,7 @@ export function ComputeEnvironmentSettings({
       ) : null}
 
       <p className="fm-start-compute-settings__policy">
-        Choose backend, device, and precision in each study&apos;s execution settings.
+        Choose backend, device, and precision in each study&apos;s execution settings. A concrete device is resolved when a run starts.
       </p>
     </section>
   );
@@ -192,11 +210,11 @@ function ComputeDetails({ compute }: { readonly compute: ComputeEnvironment }) {
           </p>
         ) : null}
         {compute.gpus.length > 0 ? (
-          <div aria-label="GPU device readings" className="fm-start-compute-settings__gpu-list" role="list">
+          <ul aria-label="GPU device readings" className="fm-start-compute-settings__gpu-list">
             {compute.gpus.map((gpu, index) => (
-              <GpuCard gpu={gpu} key={`${gpu.index ?? "gpu"}-${index}`} position={index + 1} />
+              <GpuCard gpu={gpu} key={gpu.index ?? gpu.name} position={index + 1} />
             ))}
-          </div>
+          </ul>
         ) : compute.gpuProbeStatus === "ready" ? (
           <p className="fm-start-compute-settings__notice">
             No GPU was reported by the probe. Runtime availability is listed below.
@@ -235,7 +253,7 @@ function GpuCard({ gpu, position }: { readonly gpu: GpuInfo; readonly position: 
       : null;
 
   return (
-    <article className="fm-start-compute-settings__gpu-card" role="listitem">
+    <li className="fm-start-compute-settings__gpu-card">
       <div className="fm-start-compute-settings__gpu-head">
         <div>
           <h4>{gpu.name}</h4>
@@ -275,7 +293,7 @@ function GpuCard({ gpu, position }: { readonly gpu: GpuInfo; readonly position: 
       {gpu.busyWithRun ? (
         <p className="fm-start-compute-settings__run">Reported active run: {gpu.busyWithRun}</p>
       ) : null}
-    </article>
+    </li>
   );
 }
 

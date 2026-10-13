@@ -1,5 +1,79 @@
 # Status realizacji całego planu refaktoryzacji
 
+Kontynuacja P8-53: [53BH — szkic materiału po odświeżeniu](p8/53bh-inspector-first-edit-after-resource-refresh.md).
+Realny browser potwierdził odmowę restartu przy szkicu nazwy i jawny Apply
+(rewizja 1→2), następnie odtworzył błąd pierwszej edycji materiału:
+zmiana alpha wyczyściła nietknięte pola. Próba diagnostyczna została jawnie
+anulowana, wszystkie 19 procesów odebrane; nie jest to PASS restartu.
+Poprawka źródeł, 20 interpretowanych przypadków i production typecheck PASS;
+ponowny browser proof w toku. Procenty planu bez zmiany.
+
+Najnowszy checkpoint 13.10.2026: **P8-53BE CLOSED — pierwsza bramka FDM CPU**.
+Build K completed exit 0, frozen-native API gate 296 kontroli PASS,
+OpenAPI/client generation i import checks PASS. Browser F→K
+`01ad57bafdca4a89881a4138c1fdbfcd`: completed exit 0, 9 kontroli;
+identyczna scena i dirty document po restore, normalne Grid, Compute
+Study 10 kroków / 1 ps, requested/resolved FDM CPU strict double,
+jawny Close i normalny solver wait exit 0 bez kill. Pozostałe bramki
+P8-53 oraz publiczny restart pozostają otwarte. Procentów całego planu
+nie przeliczono na podstawie tego pojedynczego dowodu. Poniższe wpisy
+są wcześniejszymi checkpointami. [Dowody](p8/53bg-acquisition-refusal-diagnostics.md).
+
+Checkpoint po próbie `523affb9b5dd4a13820b33e52171b550`: dziesięć
+produkcyjnych przypadków plannera oraz Grid 4×4×1 PASS, normalny child wait
+exit 0. Poprawka admission jest na lokalnym i remote master:
+`c5ea6a74119b69ce529cee6911815302db7f004c` ([P8-53BF](p8/53bf-fdm-material-anisotropy-admission.md)).
+Acquisition przed restore odmówiła; obserwowany scratch ma disconnected/
+forbidden mimo awaiting_command. Próba terminalna failed, exit 1,
+20/20 procesów i frontend odebrane. Restore/Compute i publiczny restart
+pozostają otwarte. Procenty całego planu bez zmian.
+
+Najnowszy przyrost 13.10.2026: poprawka admission lokalnej anizotropii
+w plannerze single-grid/multilayer FDM jest **WIP**. Scoped review po
+korektach współczynników/osi bez findings, parser/format check PASS.
+Rust regression source dodane, **NOT RUN**. Nowy managed build nie
+rozpoczął kompilacji: bounded wait na heavy slot wygasł po 120 s,
+session 51935 terminalna exit 1. Po zwolnieniu slotu nowy build
+`native-build-512469b6d89f42708b86926e2f540f2e.log` zakończył się
+completed, exit 0, manifest
+`fe245a03ab381c0d6a8eea5560a157fe4ca2e20fd2915b514487833e6eb9f730`.
+Managed handoff `80afe98f862447cca0045d1706fe05c1`: 158 testów PASS,
+completed, exit 0. Bramka produkcyjnego plannera i końcowe Grid/restore/Compute
+są w toku. Szczegóły w P8-53BE poniżej; procenty bez zmian.
+
+Checkpoint 13.10.2026: P8-53BE nadal **IN PROGRESS**. Rzeczywista próba
+`52a8ef28d5f44de689a58879ef962ee9` zakończyła się failed, exit 1;
+wykryto zbyt krótki timeout synchronizacji modelu (1 s). Przygotowana
+poprawka ogranicza helper API do 30 s, daje żądaniu sync 45 s i blokuje
+automatyczny replay/idle przy nieznanym wyniku. Managed build
+`native-build-61cc793f80324a4bb055e566ebc70758.log` zakończył się exit 0.
+Kolejna próba browserowa `25b8fb06696c4ebcb7d4a96cfb35629b` zakończyła
+się failed: synchronizacja ujawniła pominięcie jawnej anizotropii obiektu
+w bootstrapie eksportu Python. Poprawka jest na lokalnym i remote master
+(`27c43be1315bb70018a24b42aa15eec3cec6bc3e`); managed regresje
+`97f8c84e2ff9469a9636ca5156a4be77` zakończyły się exit 0, 156/156 PASS.
+Build pakietu `native-build-b5ff76c94cfe478d9252d8959b6c0e07.log`
+zakończył się completed, exit 0; manifest
+`9e8e0d5f95aa47dd0fdb35db28c7779e15be7ff70e3280b47adb467e7a4d7832`.
+Końcowe Grid/Compute po restore nie są jeszcze zaliczone. Procenty całego planu
+pozostają bez zmian. Próba `0aec17ea7b3c40b9900e92d70948ba85` zakończyła
+się failed, exit 1: eksport i materializacja przeszły, lecz planner FDM
+odrzucił model z samą anizotropią. Grid child odebrany normalnie, exit 1;
+wszystkie dziewięć procesów oraz frontend odebrane. Następny krok to
+rozstrzygnięcie warunku wymagającego globalnego energy term w plannerze.
+Procenty całego planu
+pozostają bez zmian. [Dowody i następna bramka](p8/53be-compute-after-workspace-restore.md).
+
+Aktualny przyrost P8-53BE: grid-only custody zaimplementowane i zbudowane
+w produkcyjnym native build F (exit 0); końcowy review bez findings.
+Managed handoff `34f25d27bbdd424283cdbfea0ef30a36`: 151/151 PASS,
+completed, exit 0. Managed API/archive
+`45e1ec45441a47eda950e2e0ea57f7b3`: 33 kontrole PASS, completed, exit 0;
+zachowano pakiet A do testu restartu. Dowody parsera i kompilacji nie
+zamykają wykonania Grid/Compute po restore. Nowy probe oraz rzeczywisty
+solver/browser pozostają IN PROGRESS; publiczny restart wyłączony,
+procenty P0–P8 bez zmian. [Szczegóły](p8/53be-compute-after-workspace-restore.md).
+
 Checkpoint P8-53BE, 07.10.2026: [Compute po restore](p8/53be-compute-after-workspace-restore.md)
 **IN PROGRESS**. Real browser `bb551f895a854177939cd55e9fc1f54f`
 odtworzył błąd zapisu Run: numeric until_seconds trafiał do tekstowego

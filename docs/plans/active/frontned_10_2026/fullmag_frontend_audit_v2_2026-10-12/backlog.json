@@ -24,16 +24,10 @@
       "acceptance": "T01/T03–T07/T53–T55"
     },
     {
-      "feature": "Move myszą, single object — immediate commit safety",
-      "release": "R0",
-      "dependencies": "PR03",
-      "acceptance": "T18 (R0)/T19 (R0)/T20 (R0)/T21/T22/T26 (R0)"
-    },
-    {
-      "feature": "Move numeryczny i myszą, single object — staged draft + Apply",
+      "feature": "Move numeryczny i myszą, single object",
       "release": "R1",
-      "dependencies": "PR04/07",
-      "acceptance": "T18 (R1)/T19 (R1)/T20 (R1)/T21/T22/T25/T26 (R1)/T56"
+      "dependencies": "PR03/07",
+      "acceptance": "T18–T22/T25"
     },
     {
       "feature": "First-build, wspólna aktualność, Build Selected scope",
@@ -57,7 +51,7 @@
       "feature": "Snap translation/rotation/scale",
       "release": "R2-T",
       "dependencies": "PR15",
-      "acceptance": "T24; OFF domyślnie"
+      "acceptance": "T24/T56; OFF domyślnie"
     },
     {
       "feature": "Anchor center/bottom/custom i ustawienie Position",
@@ -225,7 +219,9 @@
         "T20",
         "T21",
         "T22",
-        "T26"
+        "T25",
+        "T26",
+        "T56"
       ],
       "files": [
         "modules/viewport-3d/MoveObjectGizmo.tsx",
@@ -289,8 +285,7 @@
         "T53",
         "T61",
         "T63",
-        "T65",
-        "T06"
+        "T65"
       ],
       "files": [
         "crates/fullmag-api/src/schemas/authoring.rs",
@@ -366,17 +361,12 @@
         "T05",
         "T06",
         "T18",
-        "T19",
         "T20",
-        "T21",
-        "T22",
         "T25",
-        "T26",
         "T34",
         "T50",
         "T54",
         "T55",
-        "T56",
         "T57",
         "T67"
       ],
@@ -683,7 +673,8 @@
         "T23",
         "T24",
         "T50",
-        "T55"
+        "T55",
+        "T56"
       ],
       "files": [
         "viewport-3d transform tool adapter [nowy]",

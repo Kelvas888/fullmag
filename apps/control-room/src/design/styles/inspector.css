@@ -937,3 +937,22 @@
   overflow-wrap: anywhere;
 }
 .fm-inspector__action-error { color: var(--fm-danger); }
+
+
+/* Quantity units share the field owner; invalid raw disables only this selector. */
+.fm-inspector-quantity-unit {
+  width: 4.5rem;
+  min-width: 3.5rem;
+  flex: 0 0 auto;
+  font-size: var(--fm-font-size-xs);
+  padding-inline: var(--fm-space-1);
+}
+
+.fm-inspector-vector3:has(.fm-inspector-quantity-unit) {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.fm-inspector-vector3-item select.fm-inspector-quantity-unit {
+  flex: 0 0 4.5rem;
+  border-left: 1px solid var(--fm-border-subtle);
+}

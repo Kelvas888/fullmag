@@ -55,7 +55,7 @@ type FdmProvenance = CommonProvenance & {
 
 Autorytatywne digesty oblicza backend z rozwiązanego inputu i wersją algorytmu, nie każdy panel osobno. Propozycja `mesh-input-v1`: SHA256 nad wersjonowaną reprezentacją canonical input. Implementacja serializer-a ma golden bytes fixtures wspólne z Pythonem/IR. Deterministyczne reguły: UTF-8, klucze map uporządkowane leksykograficznie według bajtów, liczby skończone f64 w SI, −0 normalizowane do +0, jawne typy i długości pól. Listy zachowują semantyczną kolejność (np. operacje CSG/region priority); jedynie zbiory sortujemy po immutable ID. Quaternion normalizowany i kanonizowany znakowo według D13. Nie używać locale ani JSON pretty-print jako algorytmu hasha.
 
-Dokładna implementacja binary canonical encoder należy do PR09 i wymaga wersjonowanych golden vectors przed pierwszą publikacją. Alternatywnie można wybrać istniejący repo serializer, ale nie mieszać dwóch kanonizacji pod tym samym `digestSchema`. Nieznany klucz wpływający na geometrię nie może zostać po cichu pominięty. Descriptor geometry zachowuje rozszerzenia albo staje się unsupported.
+Dokładna implementacja binary canonical encoder należy do PR08 i wymaga wersjonowanych golden vectors przed pierwszą publikacją. Alternatywnie można wybrać istniejący repo serializer, ale nie mieszać dwóch kanonizacji pod tym samym `digestSchema`. Nieznany klucz wpływający na geometrię nie może zostać po cichu pominięty. Descriptor geometry zachowuje rozszerzenia albo staje się unsupported.
 
 | Zmiana | Geometry digest | Recipe / input digest | Konsekwencja |
 |---|---|---|---|
@@ -73,8 +73,6 @@ Wykluczenie nazwy z digestu wymaga uprzedniego usunięcia semantycznych zależno
 ## 3. Jeden resolver
 
 Dwa orthogonal modele: `ArtifactPresence = not-built | present`; `ResourceLoadState = idle | loading | ready | error`. Dla obecnego artefaktu wynik `ArtifactAssessment.state` jest dokładnie jednym z **current/stale/incompatible/unknown/loading/inconsistent**. `not-built` nie jest synonimem error ani dodatkowym rodzajem freshness. Dla not-built assessment może być null i Run zabroniony.
-
-Warstwa kodu: shared/domain/mesh/artifactAssessment.ts jest czystym resolverem nad dostarczonymi snapshotami, bez ładowania ani subskrypcji. kernel/resources jest jedynym właścicielem pobierania, stanu loading i subskrypcji zasobów; selector udostępnia wyliczony stan konsumentom. Reguły aktualności nie są powielane w zasobach ani panelach.
 
 | Warunek, w tej kolejności | Wynik | Run |
 |---|---|---|

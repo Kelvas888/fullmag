@@ -1339,6 +1339,8 @@ interface Viewport3DFrameProps
     | "moveToolObjectId"
     | "onOrbitDebugAnglesChange"
     | "onMoveCommit"
+    | "onBeginGesture"
+    | "onMoveGestureActiveChange"
     | "onVisualizationFrameCommitted"
     | "orbitDebugAngles"
     | "orbitDebugCommitRevision"
@@ -1982,6 +1984,11 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
   ...sceneProps
 }: Viewport3DFrameProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const createCanvasEvents = useCallback(
+    (store: Parameters<typeof createViewport3DEventManager>[0]) =>
+      createViewport3DEventManager(store, () => kernel.objectMoveTool.getSnapshot() !== null),
+    [kernel.objectMoveTool],
+  );
   const pendingCaptureRevisionRef = useRef<number | null>(null);
   const primitiveObjectIds =
     sceneProps.primitiveModel?.objects
@@ -2799,7 +2806,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
           camera={canvasCamera}
           className="fm-viewport-3d__canvas"
           dpr={canvasDpr}
-          events={createViewport3DEventManager}
+          events={createCanvasEvents}
           frameloop={VIEWPORT_3D_FRAMELOOP}
           gl={canvasGlOptions}
           key={canvasContextKey}
@@ -2828,6 +2835,8 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             onInspectClear={clearInspectHover}
             onInspectSample={updateInspectHover}
             onMoveCommit={moveInteraction.commitMove}
+            onBeginGesture={moveInteraction.onBeginGesture}
+            onMoveGestureActiveChange={moveInteraction.onGestureActiveChange}
             moveToolObjectId={moveInteraction.moveToolObjectId}
             moveDraftResetRevision={moveInteraction.moveDraftResetRevision}
             onVisualizationFrameCommitted={onVisualizationFrameCommitted}

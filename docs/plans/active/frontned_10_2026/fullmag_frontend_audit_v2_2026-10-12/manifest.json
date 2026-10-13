@@ -54,8 +54,8 @@
     },
     {
       "path": "backlog.json",
-      "bytes": 28000,
-      "sha256": "7249127fbd445b498ec72bfe66ce7a4190af28c1bdcb7cda7ce81fa2eb117947"
+      "bytes": 27689,
+      "sha256": "135028b0ed5166fd216db3da8a2445d5a58bc5fb9b82f5a46320144f391beb77"
     },
     {
       "path": "benchmark_plan.json",
@@ -149,8 +149,8 @@
     },
     {
       "path": "docs/04_ARCHITEKTURA_DOCELOWA_I_TRANSFORMACJE.md",
-      "bytes": 21526,
-      "sha256": "0bc41df57aee3dfa2de943dc20f7df7d72e67586d545d281eb88349a941175ec"
+      "bytes": 20929,
+      "sha256": "47c682aba0a783f40e5d257a6ccfb2d08c2dc6d417918cbf6721006c7ed688d7"
     },
     {
       "path": "docs/05_SPECYFIKACJA_UI_I_INSPEKTOROW.md",
@@ -159,18 +159,18 @@
     },
     {
       "path": "docs/06_MESH_WORKFLOW_I_JAKOSC.md",
-      "bytes": 16273,
-      "sha256": "10d7dfcf5fa4046d4680c6cf188e7da0bc047e7f015a9b5095e4a9bd7b5918e5"
+      "bytes": 15922,
+      "sha256": "c2534e9b5bcfec2e3cc349f695e8fa522c49c7a5e512db6a45c111e113e81bab"
     },
     {
       "path": "docs/07_PLAN_WDROZENIA.md",
-      "bytes": 37635,
-      "sha256": "099943d8cf4543d3b43e5b8568567bdda19addeadbbbb1c72375149c5f138344"
+      "bytes": 36722,
+      "sha256": "a8de84deab871fea62adfbd536cfb2eb1eaa6b0cc489e353a15a870dce8dcb93"
     },
     {
       "path": "docs/08_TESTY_I_REPRODUKCJE.md",
-      "bytes": 25250,
-      "sha256": "3e6bab3cc26572aac8ee5c1aeadd9169cf66135e7e729c0aa1df2a92b126a6e5"
+      "bytes": 24576,
+      "sha256": "6509a86bca0bbaa3199f44f86c422794afb1d0a22a5a1b23ac532d93fa24ca8b"
     },
     {
       "path": "docs/09_BENCHMARKI_I_DECYZJE_PROJEKTOWE.md",
@@ -194,8 +194,8 @@
     },
     {
       "path": "docs/13_TRANSFORMACJE_I_KWALIFIKACJA_FIZYCZNA.md",
-      "bytes": 11662,
-      "sha256": "b86a8819b7e25340e1ce4bdd08ebeb9877b06244d3e2c84b5bb36d46a9819c48"
+      "bytes": 11612,
+      "sha256": "947159c4bda896dc54035c64762ea5c2374a21fa06058119dc5f06c8d1beacb3"
     },
     {
       "path": "docs/14_BASELINE_I_BUDZETY_WYDAJNOSCIOWE.md",
@@ -204,13 +204,13 @@
     },
     {
       "path": "findings.json",
-      "bytes": 38616,
-      "sha256": "6bf9831b9312e259c4b0975ae8c79aca9276012a7f74d174a24a97fa35a450b1"
+      "bytes": 38604,
+      "sha256": "a176b3352c962fe26b38ef1787b2677cd2c74660b1b35242c6258eca5089b93c"
     },
     {
       "path": "fixtures/authoring_sequences.json",
-      "bytes": 5903,
-      "sha256": "39031fa99dd3bf01bf60aa2ea515ebd4cbb300d2780779c5d0025448a52a3ca5"
+      "bytes": 2184,
+      "sha256": "74ad49c49fc02c7109abd7513323cca969a718e6826453d5c2cc2e0e94dfc133"
     },
     {
       "path": "fixtures/import_cases.json",
@@ -369,8 +369,8 @@
     },
     {
       "path": "review_traceability.json",
-      "bytes": 5804,
-      "sha256": "6ad924fb426bd616e9f9bda232d1a9f6a4e86ae3251ecaf16609b8d25f4771c7"
+      "bytes": 5790,
+      "sha256": "6c96a10c596eb15a71051e8b765586d501615ab913ce6f770b9aa780c41b4d41"
     },
     {
       "path": "sources.json",
@@ -384,23 +384,23 @@
     },
     {
       "path": "tests.json",
-      "bytes": 71391,
-      "sha256": "5ba09c0722de39c641f297c8a2fa09d96a41977289122f50c137c2727a1e4925"
+      "bytes": 68176,
+      "sha256": "1a07a9c2c491713da81958be60e232f33a5c0dceb13e74ecad8bdd24deecfa2c"
     },
     {
       "path": "verification/README.md",
-      "bytes": 842,
-      "sha256": "ff461285e0c4f997e3cfaacb1f112dcc3165eb7de29dab77779d263ae84b941c"
+      "bytes": 559,
+      "sha256": "8022c51cb774d1dfdd052a012e4ae0e4e1971e82b4b25612dd14caed16e854eb"
     },
     {
       "path": "verification/check_package.py",
-      "bytes": 5377,
-      "sha256": "569666a9de2455500798647ec975e9692c9ff5546bad682c5b7501412631e08c"
+      "bytes": 5291,
+      "sha256": "a1a5c72eeaf7f21a5d2146e324184aab02cdb6f8c68f486f904151c932615505"
     },
     {
       "path": "verification/check_spec_oracles.py",
-      "bytes": 4880,
-      "sha256": "40da160ecb30d423c11c4da546954f190fd686ea3e62866508d24b835e8451e2"
+      "bytes": 4832,
+      "sha256": "b1a18903ac6d1aa7483fde7704f7feafa05462ee96ede93c9387201a8fc2806f"
     },
     {
       "path": "verification/gallery_browser_check.json",

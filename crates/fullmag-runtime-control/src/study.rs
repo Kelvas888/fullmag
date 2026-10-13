@@ -1,18 +1,18 @@
 //! Resolve accepted study inputs without mutable session state.
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use fullmag_application::{
-    COORDINATOR_TRANSITION_SCHEMA, CoordinatorError, CoordinatorMessage, CoordinatorTransition,
-    DurableWorkerCoordinator, PreparationBinding, PreparationReceipt, ProjectId, ResolvedInput,
-    ResolvedStudyArtifact, ResolvedTaskInput, RunId, RunSpecification, TaskClaim, TaskRecord,
-    WorkerCommand, WorkerCommandEnvelope,
+    CoordinatorError, CoordinatorMessage, CoordinatorTransition, DurableWorkerCoordinator,
+    PreparationBinding, PreparationReceipt, ProjectId, ResolvedInput, ResolvedStudyArtifact,
+    ResolvedTaskInput, RunId, RunSpecification, TaskClaim, TaskRecord, WorkerCommand,
+    WorkerCommandEnvelope, COORDINATOR_TRANSITION_SCHEMA,
 };
 use fullmag_authoring::{
     StudyInputPort, StudyInputSource, StudyPlan, StudyPortDataKind, StudyStep,
 };
 use fullmag_ir::{ExecutionDevice, ExecutionMode, ExecutionPlanIR, ExecutionPrecision, ProblemIR};
 use fullmag_plan::{
-    PreparationMaterialization, PreparationPlanSource, StudyExecutionPlan, StudyProblemCatalog,
-    StudyStepLoweringStatus, lower_study_plan_with_catalog,
+    lower_study_plan_with_catalog, PreparationMaterialization, PreparationPlanSource,
+    StudyExecutionPlan, StudyProblemCatalog, StudyStepLoweringStatus,
 };
 use fullmag_session::SessionStore;
 use serde::Deserialize;
@@ -2262,7 +2262,9 @@ fn validate_study_input_dependencies(
     Ok(())
 }
 
-fn resolve_accepted_study_inputs(
+/// Resolve the exact accepted step's declared inputs from durable artifact and
+/// run catalogs. This read-only projection does not create or claim a task.
+pub fn resolve_accepted_study_inputs(
     store: &SessionStore,
     run_id: &str,
     accepted_steps: &[StudyStep],
@@ -2307,9 +2309,9 @@ mod dependency_tests {
     use super::*;
     use fullmag_authoring::StudyPortDataKind;
     use fullmag_session::{
-        FMS_ARTIFACT_CATALOG_SCHEMA, FMS_RUN_CATALOG_SCHEMA, FmsArtifactCatalog,
-        FmsArtifactCatalogEntry, FmsArtifactStatus, FmsObservationState, FmsRunCatalog,
-        FmsStudyArtifactOutput, FmsTaskCatalogEntry, FmsTaskLifecycle, FmsTaskReadiness,
+        FmsArtifactCatalog, FmsArtifactCatalogEntry, FmsArtifactStatus, FmsObservationState,
+        FmsRunCatalog, FmsStudyArtifactOutput, FmsTaskCatalogEntry, FmsTaskLifecycle,
+        FmsTaskReadiness, FMS_ARTIFACT_CATALOG_SCHEMA, FMS_RUN_CATALOG_SCHEMA,
     };
     use std::collections::BTreeMap;
 
@@ -2440,26 +2442,22 @@ mod dependency_tests {
     fn study_dispatch_requires_declared_inputs_and_succeeded_step_outputs() {
         let inputs = ports();
         let run_catalog = catalog(FmsTaskLifecycle::Succeeded);
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &resolved_inputs(),
-                &run_catalog,
-                Some(&artifact_catalog()),
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &BTreeMap::new(),
-                &run_catalog,
-                Some(&artifact_catalog()),
-            )
-            .is_err()
-        );
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &resolved_inputs(),
+            &run_catalog,
+            Some(&artifact_catalog()),
+        )
+        .is_ok());
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &BTreeMap::new(),
+            &run_catalog,
+            Some(&artifact_catalog()),
+        )
+        .is_err());
         let mut extra = resolved_inputs();
         extra.insert(
             "undeclared".into(),
@@ -2469,58 +2467,50 @@ mod dependency_tests {
                 study_artifact: None,
             },
         );
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &extra,
-                &run_catalog,
-                Some(&artifact_catalog()),
-            )
-            .is_err()
-        );
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &resolved_inputs(),
-                &catalog(FmsTaskLifecycle::Running),
-                Some(&artifact_catalog()),
-            )
-            .is_err()
-        );
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &extra,
+            &run_catalog,
+            Some(&artifact_catalog()),
+        )
+        .is_err());
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &resolved_inputs(),
+            &catalog(FmsTaskLifecycle::Running),
+            Some(&artifact_catalog()),
+        )
+        .is_err());
 
         let mut wrong_digest = resolved_inputs();
         wrong_digest
             .get_mut("initial_state")
             .expect("resolved input")
             .content_sha256 = "d".repeat(64);
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &wrong_digest,
-                &catalog(FmsTaskLifecycle::Succeeded),
-                Some(&artifact_catalog()),
-            )
-            .is_err()
-        );
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &wrong_digest,
+            &catalog(FmsTaskLifecycle::Succeeded),
+            Some(&artifact_catalog()),
+        )
+        .is_err());
 
         let mut wrong_artifact = resolved_inputs();
         wrong_artifact
             .get_mut("initial_state")
             .expect("resolved input")
             .source = "another-artifact".into();
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &wrong_artifact,
-                &catalog(FmsTaskLifecycle::Succeeded),
-                Some(&artifact_catalog()),
-            )
-            .is_err()
-        );
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &wrong_artifact,
+            &catalog(FmsTaskLifecycle::Succeeded),
+            Some(&artifact_catalog()),
+        )
+        .is_err());
 
         let mut wrong_output = artifact_catalog();
         wrong_output.entries[1]
@@ -2528,16 +2518,14 @@ mod dependency_tests {
             .as_mut()
             .expect("study output")
             .case_id = "other-case".into();
-        assert!(
-            validate_study_input_dependencies(
-                "run-study-dependency",
-                &inputs,
-                &resolved_inputs(),
-                &catalog(FmsTaskLifecycle::Succeeded),
-                Some(&wrong_output),
-            )
-            .is_err()
-        );
+        assert!(validate_study_input_dependencies(
+            "run-study-dependency",
+            &inputs,
+            &resolved_inputs(),
+            &catalog(FmsTaskLifecycle::Succeeded),
+            Some(&wrong_output),
+        )
+        .is_err());
     }
 
     #[test]
@@ -2560,16 +2548,14 @@ mod dependency_tests {
             .get_mut("initial_state")
             .expect("resolved input")
             .content_sha256 = "f".repeat(64);
-        assert!(
-            resolve_step_output_inputs(
-                "run-study-dependency",
-                &ports,
-                &forged,
-                &run_catalog,
-                Some(&artifact_catalog),
-            )
-            .is_err()
-        );
+        assert!(resolve_step_output_inputs(
+            "run-study-dependency",
+            &ports,
+            &forged,
+            &run_catalog,
+            Some(&artifact_catalog),
+        )
+        .is_err());
 
         let mut missing_case = artifact_catalog;
         missing_case.entries[1]
@@ -2577,16 +2563,14 @@ mod dependency_tests {
             .as_mut()
             .expect("study output")
             .case_id = "other-case".into();
-        assert!(
-            resolve_step_output_inputs(
-                "run-study-dependency",
-                &ports,
-                &BTreeMap::new(),
-                &run_catalog,
-                Some(&missing_case),
-            )
-            .is_err()
-        );
+        assert!(resolve_step_output_inputs(
+            "run-study-dependency",
+            &ports,
+            &BTreeMap::new(),
+            &run_catalog,
+            Some(&missing_case),
+        )
+        .is_err());
     }
 }
 

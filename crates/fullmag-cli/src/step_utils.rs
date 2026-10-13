@@ -1547,6 +1547,23 @@ fn resolve_interactive_llg_policy(
     Ok(())
 }
 
+pub(crate) fn build_initial_interactive_command_stage(
+    authored_stage: &ResolvedScriptStage,
+    bound_problem: &ProblemIR,
+    command: &crate::types::SessionCommand,
+) -> Result<Option<ResolvedScriptStage>> {
+    let mut effective_command = command.clone();
+    // Compute solves the already materialized study; TimeEvolution IR keeps
+    // its duration in ResolvedScriptStage rather than in StudyIR.
+    if command.kind == "solve"
+        && command.until_seconds.is_none()
+        && matches!(&bound_problem.study, fullmag_ir::StudyIR::TimeEvolution { .. })
+    {
+        effective_command.until_seconds = Some(authored_stage.until_seconds);
+    }
+    build_interactive_command_stage(bound_problem, &effective_command)
+}
+
 pub(crate) fn build_interactive_command_stage(
     base_problem: &ProblemIR,
     command: &crate::types::SessionCommand,
@@ -2040,6 +2057,29 @@ mod tests {
             "until_seconds": 1e-12
         }))
         .expect("minimal solver command")
+    }
+
+    #[test]
+    fn initial_solve_uses_authored_run_duration_and_preserves_explicit_override() {
+        let problem = sample_problem_ir();
+        let authored = ResolvedScriptStage::solver(problem.clone(), 7e-12, "flat_run");
+        let mut command = solver_command("solve");
+        command.until_seconds = None;
+        let stage = build_initial_interactive_command_stage(&authored, &problem, &command)
+            .expect("authored solve should build")
+            .expect("solve should produce a stage");
+        assert_eq!(stage.until_seconds, 7e-12);
+        assert_eq!(command.until_seconds, None);
+
+        command.until_seconds = Some(2e-12);
+        let overridden = build_initial_interactive_command_stage(&authored, &problem, &command)
+            .expect("explicit solve duration should build")
+            .expect("solve should produce a stage");
+        assert_eq!(overridden.until_seconds, 2e-12);
+
+        command.kind = "run".to_string();
+        command.until_seconds = None;
+        assert!(build_initial_interactive_command_stage(&authored, &problem, &command).is_err());
     }
 
     fn frozen_spins_binding_command(source_scene_revision: u64) -> crate::types::SessionCommand {

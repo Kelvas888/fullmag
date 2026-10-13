@@ -500,6 +500,9 @@ pub(crate) struct CurrentLiveStageExecutionRecord {
     pub started_at_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_step: Option<u64>,
+    /// Last solver step observed for this stage, in the run's step coordinates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_step: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied_time_seconds: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

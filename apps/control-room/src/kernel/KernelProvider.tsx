@@ -146,6 +146,7 @@ function createKernel(options: DevelopmentKernelFactoryOptions, developmentWorks
   const pendingForms = new PendingFormRegistry();
   authoringHistory.subscribe(() => commands.refresh());
   pendingForms.subscribe(() => commands.refresh());
+  objectEditSession.subscribe(() => commands.refresh());
   const selection = new SelectionController(bus);
   const layout = new LayoutController(bus);
   const objectMoveTool = new ObjectMoveToolController();

@@ -99,17 +99,18 @@
     "observation": "Inspektor opakowuje translację w runAuthoringMutationWithHistory. Produkcyjny commitMove wywołuje commitObjectMoveWorkflow→commitObjectTranslation bez tego wrappera. Niskopoziomowa transakcja nie rejestruje historii.",
     "impact": "Znaczenie Undo zależy od tego, czy identyczny ruch wykonano myszą, czy wpisując liczby. Samo uruchomienie narzędzia przez CommandRegistry nie zapisuje późniejszego gestu.",
     "reproduction": "W czystej historii wykonaj Move przez gizmo, następnie Undo; porównaj z translacją przez inspektor. Reprodukcja integracyjna pozostaje do uruchomienia w aplikacji.",
-    "fix": "PR03 zabezpiecza wyłącznie obecny immediate Move w R0 i nie zamyka tej luki historii w R1. PR07 przenosi Move do kernelowego draftu: pointerup nie zapisuje, a Apply używa wspólnej mutacji i historii.",
+    "fix": "Przed publikacją R1 przenieść Move do kernelowego draftu. Pointerup nie zapisuje. Apply używa wspólnej mutacji i historii. Minimalny wewnętrzny hotfix starego pointerup może istnieć tylko jako niewydawany etap przejściowy.",
     "acceptance": "T25: jeden Apply po dowolnej liczbie gestów daje jeden wpis Undo; same gesty dają zero zapisów i zero wpisów historii serwerowego modelu.",
     "status": "not_retested_in_production",
     "classification_origin": "v1",
     "v2_notes": [],
     "pull_requests": [
-      "PR07",
-      "PR12"
+      "PR03",
+      "PR07"
     ],
     "acceptance_tests": [
-      "T25"
+      "T25",
+      "T26"
     ]
   },
   {
@@ -239,8 +240,7 @@
     "classification_origin": "v1",
     "v2_notes": [],
     "pull_requests": [
-      "PR04",
-      "PR07"
+      "PR04"
     ],
     "acceptance_tests": [
       "T08",
@@ -431,17 +431,18 @@
     "observation": "end zawsze wywołuje onCommit po begin, nawet jeśli translation==origin. Nie ma progu ruchu ani porównania wartości.",
     "impact": "Niepotrzebny request, potencjalne zwiększenie rewizji i unieważnienie meshu. To, czy backend eliminuje no-op, nie zostało zbadane; frontend go wysyła.",
     "reproduction": "Pointerdown/pointerup w tej samej pozycji. R02 pokazuje jeden commit z niezmienioną translacją.",
-    "fix": "R0 PR03 tłumi no-op click w immediate path; R1 PR07 pozostawia pointerup jako czystą zmianę draftu. Numeryczna klasyfikacja no-op w SI należy do PR04/PR07 i jest sprawdzana osobno w T56/F09.",
+    "fix": "Próg rozpoczęcia gestu w pikselach i semantyczny no-op check w jednostkach SI. Nie używać stałego tolerancji 1e-6 m w skali nanometrowej.",
     "acceptance": "Klik bez ruchu, cancel oraz ruch powrotny do punktu startowego nie mutują sceny i nie tworzą Undo; sensowny ruch poniżej 1 nm nie jest gubiony.",
     "status": "not_retested_in_production",
     "classification_origin": "v1",
     "v2_notes": [],
     "pull_requests": [
       "PR03",
-      "PR07"
+      "PR04"
     ],
     "acceptance_tests": [
-      "T19"
+      "T19",
+      "T56"
     ]
   },
   {

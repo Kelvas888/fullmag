@@ -88,6 +88,7 @@ interface PreparedDraft {
   readonly ready_build_id: string;
   readonly ready_source_sha256: string;
   readonly project_document: ProjectDocumentProof;
+  readonly project_document_after_grid: ProjectDocumentProof;
   readonly scene_summary: SceneSummary;
 }
 
@@ -95,7 +96,7 @@ interface BrowserBaseline extends PreparedDraft {
   readonly nonce: string;
 }
 
-type FixtureOperation = "idle" | "preparing" | "finishing";
+type FixtureOperation = "idle" | "preparing" | "finishing" | "closing";
 type ProofState = "waiting" | "eligible" | "unavailable" | "scope-mismatch";
 
 interface FixtureSnapshot {
@@ -108,6 +109,7 @@ interface FixtureSnapshot {
   readonly baseline: BrowserBaseline | null;
   readonly beforeAttempted: boolean;
   readonly finishAttempted: boolean;
+  readonly closeAttempted: boolean;
   readonly finished: boolean;
   readonly finishResponse: unknown | null;
 }
@@ -122,6 +124,7 @@ const INITIAL_FIXTURE_SNAPSHOT: FixtureSnapshot = {
   baseline: null,
   beforeAttempted: false,
   finishAttempted: false,
+  closeAttempted: false,
   finished: false,
   finishResponse: null,
 };
@@ -246,6 +249,13 @@ class NativeWorkspaceRestartFixture {
     this.patch({ finishAttempted: true });
   }
 
+  claimSolverClose(): void {
+    if (this.snapshot.closeAttempted) {
+      throw new Error("Close was already submitted; observe its outcome without submitting again.");
+    }
+    this.patch({ closeAttempted: true });
+  }
+
   completeFinish(response: unknown): void {
     this.patch({
       finished: true,
@@ -298,6 +308,22 @@ class NativeWorkspaceRestartFixture {
     if (!response.ok || !isRecord(payload)) {
       const detail = isRecord(payload) && typeof payload.error === "string" ? payload.error : text;
       throw new Error("The private browser proof was not confirmed: " + detail);
+    }
+    return payload;
+  }
+
+  async confirmExecution(resource: "execution" | "completed-stage" = "execution"): Promise<Record<string, unknown>> {
+    const response = await this.originalFetch(new Request(
+      new URL(PRIVATE_PROBE_PATH + "/" + resource, window.location.origin),
+      { cache: "no-store", credentials: "same-origin", headers: { Accept: "application/json" } },
+    ));
+    const payload: unknown = JSON.parse(await boundedResponseText(response));
+    const confirmed = isRecord(payload) && (resource === "execution"
+      ? payload.verified === true : payload.ready_to_close === true);
+    if (!response.ok || !confirmed || !isRecord(payload)) {
+      const detail = isRecord(payload) && typeof payload.error === "string"
+        ? payload.error : "Build Grid and Compute Study have not both completed after restore.";
+      throw new Error(detail);
     }
     return payload;
   }
@@ -486,6 +512,18 @@ function assertUsefulScene(scene: SceneResource): SceneSummary {
     throw new Error("Add a region and an assigned existing material to the same authored object before preparing the draft.");
   }
   return summary;
+}
+
+function sceneAfterSuccessfulGrid(scene: SceneResource): SceneResource {
+  const expected = JSON.parse(JSON.stringify(scene)) as SceneResource;
+  for (const object of expected.objects ?? []) {
+    if (object.tags?.includes("mesh:dirty")) {
+      const remaining = object.tags.filter((tag) => tag !== "mesh:dirty");
+      if (remaining.length > 0) object.tags = remaining;
+      else delete object.tags;
+    }
+  }
+  return expected;
 }
 
 async function projectDocumentProof(
@@ -706,7 +744,8 @@ function NativeWorkspaceRestartFixtureBody() {
   const visibleScene = sceneResource.data ? summarizeScene(sceneResource.data) : null;
   const currentProofMatches = baseline !== null
     && documentPreview !== null
-    && canonicalJson(documentPreview) === canonicalJson(baseline.project_document);
+    && (canonicalJson(documentPreview) === canonicalJson(baseline.project_document)
+      || canonicalJson(documentPreview) === canonicalJson(baseline.project_document_after_grid));
   const currentIdentityMatches = baseline !== null
     && currentPin !== null && currentPin !== baseline.api_instance_id
     && hostSnapshot.kernel === kernel
@@ -788,6 +827,9 @@ function NativeWorkspaceRestartFixtureBody() {
           ready_build_id: eligibilityBefore.ready_build_id,
           ready_source_sha256: eligibilityBefore.ready_source_sha256,
           project_document: projectDocument,
+          project_document_after_grid: await projectDocumentProof(
+            kernel.projectDocument.getSnapshot(), sceneAfterSuccessfulGrid(sceneAfter),
+          ),
           scene_summary: assertUsefulScene(sceneAfter),
         };
         fixture.setPreparedDraft(prepared);
@@ -855,6 +897,7 @@ function NativeWorkspaceRestartFixtureBody() {
         nonce: freshProof.nonce,
         api_instance_id: prepared.api_instance_id,
         project_document_before: prepared.project_document,
+        project_document_after_grid: prepared.project_document_after_grid,
       });
       if (captured.captured !== true || captured.object_count !== prepared.project_document.scene_object_count) {
         throw new Error("The parent did not confirm capture of the same nonempty real scene.");
@@ -907,17 +950,20 @@ function NativeWorkspaceRestartFixtureBody() {
         throw new Error("The real replacement API does not report the applied ready build and new workspace.");
       }
       const restoredDocument = await projectDocumentProof(kernel.projectDocument!.getSnapshot(), sceneAfter);
-      if (canonicalJson(restoredDocument) !== canonicalJson(captured.project_document)) {
+      if (canonicalJson(restoredDocument) !== canonicalJson(captured.project_document_after_grid)) {
         throw new Error("The restored dirty project document differs from its captured before state.");
       }
       const sceneHash = await sha256Text(canonicalJson(sceneAfter));
-      if (sceneHash !== captured.project_document.scene_resource_sha256) {
+      if (sceneHash !== captured.project_document_after_grid.scene_resource_sha256) {
         throw new Error("The replacement API scene differs from the before-restart canonical scene.");
       }
       const viewportAfter = readViewportProof();
       if (!viewportAfter.ready) {
         throw new Error("The replacement workspace does not have a visible WebGL canvas with a live drawing buffer.");
       }
+      // Observation is read-only and can be repeated while the solver runs.
+      // Do not consume the immutable finish submission until execution passes.
+      await fixture.confirmExecution();
       fixture.claimFinish();
       const response = await fixture.postPrivate("finish", {
         schema: FINISH_SCHEMA,
@@ -941,6 +987,36 @@ function NativeWorkspaceRestartFixtureBody() {
     archive_base64_bytes: projectSnapshot.resource.archive_base64.length,
   } : { state: projectSnapshot.state, error: projectSnapshot.error });
 
+  const closeCompletedSolver = async () => {
+    fixture.begin("closing");
+    try {
+      const readiness = await fixture.confirmExecution("completed-stage");
+      const precondition = readiness.close_precondition;
+      if (!isRecord(precondition) || precondition.runtime_state !== "awaiting_command"
+        || typeof precondition.command_revision !== "number" || !Number.isSafeInteger(precondition.command_revision)
+        || precondition.command_revision < 0
+        || typeof precondition.stage_execution_revision !== "number"
+        || !Number.isSafeInteger(precondition.stage_execution_revision) || precondition.stage_execution_revision < 0) {
+        throw new Error("Graceful Close readiness has no atomic runtime and command preconditions.");
+      }
+      if (host.getSnapshot().kernel !== kernel || host.getSnapshot().paused
+        || kernel.api.getExpectedApiInstance() !== currentPin || !sessionIdentity) {
+        throw new Error("Workspace ownership changed before graceful Close.");
+      }
+      const currentStatus = await kernel.api.sessions.current.status();
+      assertSessionResourceIdentity(currentStatus, sessionIdentity);
+      fixture.claimSolverClose();
+      await kernel.api.commands.submit({ kind: "close", precondition: {
+        runtime_state: precondition.runtime_state,
+        command_revision: precondition.command_revision,
+        stage_execution_revision: precondition.stage_execution_revision,
+      } });
+      fixture.failOperation("Graceful Close submitted. Wait for the solver exit, then finish the proof.");
+    } catch (error) {
+      fixture.failOperation(errorMessage(error));
+    }
+  };
+
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-fm-background text-fm-primary">
       <section className="max-h-[35vh] shrink-0 overflow-auto border-b border-fm-border bg-fm-surface px-5 py-4" data-testid="native-workspace-restart-proof">
@@ -950,9 +1026,21 @@ function NativeWorkspaceRestartFixtureBody() {
           <p className="mb-3 max-w-4xl text-fm-sm text-fm-secondary">
             Use the workspace below to author a real object, region, and material. “Prepare draft” keeps an open project document,
             or creates one from the current session if none is open. Then use the normal backend restart action in the workspace
-            banner. When the new workspace is ready, inspect the scene and viewport here and select “Finish proof”.
+            banner. In the restored workspace, run Build Grid and then Compute Study with a finite Run stage.
+            After the finite stage completes, select “Close completed solver” to end its interactive wait normally.
+            Then inspect the scene and viewport here and select “Finish proof”.
           </p>
           <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              className="rounded border border-fm-border bg-fm-elevated px-3 py-2 text-fm-sm disabled:cursor-not-allowed disabled:opacity-50"
+              data-testid="native-workspace-close-solver"
+              disabled={!currentIdentityMatches || fixtureSnapshot.operation !== "idle"
+                || fixtureSnapshot.closeAttempted || fixtureSnapshot.finished}
+              onClick={() => { void closeCompletedSolver(); }}
+            >
+              Close completed solver
+            </button>
             <button
               type="button"
               className="rounded border border-fm-border bg-fm-elevated px-3 py-2 text-fm-sm disabled:cursor-not-allowed disabled:opacity-50"

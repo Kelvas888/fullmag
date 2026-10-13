@@ -28,6 +28,8 @@ interface BaseFieldProps {
   label: string;
   /** Shown to the right of numeric inputs. */
   unit?: string;
+  /** Optional interactive unit control owned by the caller. */
+  unitControl?: ReactNode;
   /** Muted hint text below the control. */
   hint?: string;
   /** Error text below the control. Takes precedence over hint. */
@@ -75,6 +77,7 @@ const FORM_FIELD_WRAPPER_PROP_KEYS = [
   "invalid",
   "label",
   "unit",
+  "unitControl",
 ] as const;
 
 function controlRestProps(
@@ -166,7 +169,7 @@ function FormFieldHelpButton({
  * classes remain temporarily for unmigrated domain selectors during the gated rollout.
  */
 export function FormField(props: FormFieldProps) {
-  const { label, unit, hint, error, help, inline = true, disabled, invalid } =
+  const { label, unit, unitControl, hint, error, help, inline = true, disabled, invalid } =
     props;
   const fieldId = useId();
   const hintText = error ?? hint;
@@ -325,18 +328,18 @@ export function FormField(props: FormFieldProps) {
     mono === true ? "fm-inspector-input--mono font-fm-mono" : "font-fm-ui",
     controlVariants({ invalid: Boolean(invalid) }),
   );
-  const inputType = type === "number" && unit ? "text" : type ?? "text";
+  const inputType = type === "number" && (unit || unitControl) ? "text" : type ?? "text";
   const resolvedInputMode =
-    inputMode ?? (type === "number" || unit ? "decimal" : undefined);
+    inputMode ?? (type === "number" || unit || unitControl ? "decimal" : undefined);
   return (
     <InspectorPropertyRow
       className={wrapClass}
       label={labelNode}
       layout={layout}
       unit={
-        unit ? (
+        unitControl ?? (unit ? (
           <span className="fm-inspector-form-field__unit">{unit}</span>
-        ) : undefined
+        ) : undefined)
       }
     >
       <div className="fm-inspector-form-field__control flex w-full flex-col items-stretch gap-1">

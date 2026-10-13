@@ -6,7 +6,11 @@ import { usePlatformCapabilitiesResource } from "@/kernel/resources/runtimeExplo
 import { useCpuTelemetryResource, useGpuTelemetryResource } from "@/kernel/resources/studyRuntimeResources";
 
 import { probeCompute } from "./computeProbe";
-import { computeFromTelemetry, describeRuntimeLanes } from "./computeTelemetry";
+import {
+  computeFromTelemetry,
+  describeRuntimeLanes,
+  isTelemetrySampleStale,
+} from "./computeTelemetry";
 import type { ComputeProbeController, ComputeProbeState } from "./types";
 
 export const COMPUTE_POLL_MS = 5000;
@@ -20,6 +24,7 @@ export function useComputeProbe(): ComputeProbeController {
   const [desktopRefreshing, setDesktopRefreshing] = useState(false);
   const [desktopFailed, setDesktopFailed] = useState(false);
   const [desktopRefreshId, setDesktopRefreshId] = useState(0);
+  const [freshnessNow, setFreshnessNow] = useState<number | undefined>(undefined);
   const needsDesktop = cpu.status === "error" && gpu.status === "error" && !cpu.data && !gpu.data;
 
   useEffect(() => {
@@ -54,6 +59,7 @@ export function useComputeProbe(): ComputeProbeController {
   const { refetch: refetchGpu } = gpu;
   const { refetch: refetchCapabilities } = capabilities;
   const refresh = useCallback(() => {
+    setFreshnessNow(Date.now());
     refetchCpu();
     refetchGpu();
     refetchCapabilities();
@@ -64,6 +70,7 @@ export function useComputeProbe(): ComputeProbeController {
   useEffect(() => {
     const sample = () => {
       if (document.hidden) return;
+      setFreshnessNow(Date.now());
       if (cpu.data?.status === "available" && cpu.status === "ready") refetchCpu();
       if (gpu.data?.status === "available" && gpu.status === "ready") refetchGpu();
     };
@@ -94,8 +101,17 @@ export function useComputeProbe(): ComputeProbeController {
   const resources = [cpu, gpu, capabilities];
   const usingDesktop = needsDesktop && Boolean(desktop);
   const observedResources = usingDesktop ? [capabilities] : resources;
-  const stale = observedResources.some((resource) => resource.data &&
-    (resource.status === "error" || resource.refreshError)) || (usingDesktop && desktopFailed);
+  const sampleTimes = usingDesktop
+    ? [desktop?.sampledAt]
+    : [
+        cpu.data?.status === "available" ? cpu.data.sample_time_unix_ms : undefined,
+        gpu.data?.status === "available" ? gpu.data.sample_time_unix_ms : undefined,
+      ];
+  const staleByAge = freshnessNow !== undefined &&
+    sampleTimes.some((timestamp) => isTelemetrySampleStale(timestamp, freshnessNow));
+  const stale = staleByAge ||
+    observedResources.some((resource) => resource.data &&
+      (resource.status === "error" || resource.refreshError)) || (usingDesktop && desktopFailed);
   const failed = observedResources.some((resource) => resource.status === "error" || resource.refreshError) ||
     (usingDesktop && desktopFailed);
   return {

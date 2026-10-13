@@ -134,6 +134,7 @@ pub(crate) fn create_private_attempt_output_dir(
     store: &SessionStore,
     claim: &fullmag_application::TaskClaim,
 ) -> Result<PathBuf> {
+    verify_host_worker_launch(store, claim.run_id.as_str(), claim.task_id.as_str())?;
     for (value, label) in [
         (claim.run_id.as_str(), "run_id"),
         (claim.task_id.as_str(), "task_id"),
@@ -175,6 +176,39 @@ pub(crate) fn create_private_attempt_output_dir(
             )
         }),
     }
+}
+
+/// The durable lease is authoritative; omitting a CLI flag cannot downgrade a
+/// host-bound attempt into the legacy execution path. Lock order is host→store.
+fn verify_host_worker_launch(store: &SessionStore, run_id: &str, task_id: &str) -> Result<()> {
+    let lease = store
+        .read_active_resource_lease_for_task(run_id, task_id)?
+        .context("worker execution requires its active local lease")?;
+    let Some(binding) = lease.host_launch_binding.as_ref() else {
+        return Ok(());
+    };
+    let token = std::env::var("FULLMAG_HOST_LAUNCH_TOKEN")
+        .context("host-bound worker requires its supervisor launch permit")?;
+    let ledger = fullmag_session::host_resource_ledger::HostResourceLedger::open(
+        &binding.ledger_root,
+        binding.policy.clone(),
+    )?;
+    let reservation = ledger.validate_worker_launch(store, &lease, &token)?;
+    if lease.kind == fullmag_session::FmsResourceKind::Gpu {
+        let uuid = reservation
+            .exclusive_gpu_uuids
+            .iter()
+            .next()
+            .context("host GPU worker has no physical allocation")?;
+        if reservation.exclusive_gpu_uuids.len() != 1
+            || std::env::var("CUDA_VISIBLE_DEVICES").ok().as_ref() != Some(uuid)
+            || std::env::var("FULLMAG_FDM_GPU_INDEX").ok().as_deref() != Some("0")
+            || std::env::var("FULLMAG_FEM_GPU_INDEX").ok().as_deref() != Some("0")
+        {
+            bail!("host GPU worker environment differs from its exact single-device allocation");
+        }
+    }
+    Ok(())
 }
 
 fn require_real_directory(path: &Path) -> Result<PathBuf> {
@@ -974,11 +1008,15 @@ pub(crate) fn execute_accepted_worker_start(
     }
 
     let specification = &accepted.run.specification;
-    let immutable_problem = accepted.catalog.entries().iter()
+    let immutable_problem = accepted
+        .catalog
+        .entries()
+        .iter()
         .find(|entry| entry.step_id() == accepted_step.step_id)
         .context("accepted worker step has no immutable catalog entry")?
         .problem();
-    accepted_step.resolved_input
+    accepted_step
+        .resolved_input
         .validate_execution_for_problem(specification, immutable_problem)
         .context("validate accepted task execution before dispatch")?;
     let request = &accepted_step.resolved_input.requested_execution;
@@ -1548,6 +1586,7 @@ pub(crate) fn run_pending_accepted_start(
         .context("accepted worker run id is invalid")?;
     fullmag_session::repository_path::validate_store_id(task_id)
         .context("accepted worker task id is invalid")?;
+    verify_host_worker_launch(store, run_id, task_id)?;
     let run_id = fullmag_application::RunId::parse(run_id.to_owned())
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     let intent = store

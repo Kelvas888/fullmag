@@ -13,8 +13,8 @@ use crate::live_workspace::LocalLiveWorkspace;
 use crate::terminal_logs::{terminal_logger, TerminalLogSource};
 use crate::types::*;
 
-mod development_consumer_probe;
 mod development_active_run_probe;
+mod development_consumer_probe;
 mod development_workspace_probe;
 
 pub(crate) const LOCALHOST_HTTP_HOST: &str = "localhost";
@@ -3484,8 +3484,7 @@ fn verify_owned_restart_consumer(
     let token_sha = fullmag_session::hex_sha256(token.as_bytes());
     let result_deadline = Instant::now() + Duration::from_secs(145);
     let result = loop {
-        if let Some(result) =
-            transport::read_result(&storage, &worktree, &request_id, &token_sha)?
+        if let Some(result) = transport::read_result(&storage, &worktree, &request_id, &token_sha)?
         {
             break result;
         }
