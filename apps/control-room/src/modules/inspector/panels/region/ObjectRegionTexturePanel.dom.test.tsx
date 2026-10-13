@@ -74,12 +74,14 @@ vi.mock("@/kernel/resources/useActiveLaneCapabilities", () => ({
 }));
 
 vi.mock("../ObjectMagneticTexturePanelModel", () => ({
-  buildMagnetizationTransactionRequest: (_model: unknown, draft: { magnetizationRef: string }) => ({
+  buildMagnetizationTransactionRequest: (_model: unknown, _asset: unknown, magnetizationRef: string | null) => ({
     base_revision: 8,
     kind: "patch_magnetization",
-    textureRef: draft.magnetizationRef,
+    textureRef: magnetizationRef,
   }),
-  buildObjectMagneticTextureAssetDraft: () => ({ id: "texture-a" }),
+  buildObjectMagneticTextureAssetDraft: (_model: unknown, draft: { magnetizationRef: string }) => ({
+    id: draft.magnetizationRef || "texture-a",
+  }),
   objectMagneticTextureDraftDirty: (draft: unknown, baseline: unknown) =>
     JSON.stringify(draft) !== JSON.stringify(baseline),
   objectMagneticTextureDraftFromModel: () => ({
@@ -170,7 +172,7 @@ describe("ObjectRegionTexturePanel session fence", () => {
 
       expect(mocks.readScene).toHaveBeenCalledWith({ sessionScopeKey: sessionAScopeKey });
       expect(mocks.commitTransaction).toHaveBeenCalledWith(
-        { base_revision: 10, kind: "patch_magnetization", textureRef: "" },
+        { base_revision: 10, kind: "patch_magnetization", textureRef: "texture-a" },
         { baseRevision: 10, sessionScopeKey: sessionAScopeKey },
       );
       expect(mocks.recordHistory).toHaveBeenCalledOnce();

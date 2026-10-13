@@ -192,3 +192,17 @@ wcześniej zweryfikowanym wąskim fixture. git diff --check PASS; lokalnych
 testów/kompilacji nie uruchamiano. Wykonanie poprawionych testów pozostaje
 NOT VERIFIED do następnego CI. Pozostałe błędy Frozen Spins/regionów diagnozuje
 oddzielny worker; zakres R0/R1 nadal nieukończony.
+
+Pierwszy fragment powyższych poprawek zapisano jako
+14773b8feec0c7ef3002088131c281cf4565c44b. Kolejny fragment obejmuje wyłącznie
+testy Frozen Spins/regionów: pełne requestScopeEpoch i commands scope,
+rzeczywistą dirty edit przed Apply, kontrolę przekazanego payloadu oraz
+regresje czystego Apply bez mutacji. Mock buildera tekstury odpowiada obecnej
+sygnaturze (model, asset, ref); zachowano click-time/newer-edit assertions.
+
+Review Rust: ten sam test przeszedł w run38381032834 job115241202156
+(968 PASS, 0 FAIL, 3 ignored). Diff fullmag-api/session/runner od2580023
+do c496af jest pusty, a PR150 nie zmienia backendu. Obecny log nie zawiera
+response body błędu500, więc dokładna przyczyna nadal NOT VERIFIED.
+Nie zmieniono backendu ani asercji Rust; kolejny automatyczny przebieg CI
+zweryfikuje poprawione testy frontendu i dostarczy nowej obserwacji tej bramki.
