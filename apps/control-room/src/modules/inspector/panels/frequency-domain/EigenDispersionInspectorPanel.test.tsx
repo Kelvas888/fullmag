@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import type { Selection, SelectionRef } from "@/kernel/selection/selectionTypes";
 import type { EigenDispersionPoint } from "@/shared/domain/analysis/frequencyDomainChartModels";
 
 import {
@@ -27,24 +28,30 @@ const point: EigenDispersionPoint = {
 
 describe("EigenDispersionInspectorPanel point model", () => {
   it("carries only the selected canonical dataset identity into point handoff", () => {
+    const frequencyDomainRef = {
+      analysisRunId: "run-canonical",
+      analysisStageId: "stage-canonical",
+      artifactPath: "frequency-domain/dispersion.v2.json",
+      artifactRevision: "sha256:artifact-revision",
+      datasetId: "dataset-canonical",
+      datasetRevision: "sha256:dataset-revision",
+      kind: "results.eigen.dispersion",
+      nodeId: "results:eigen:dispersion",
+      type: "frequency-domain",
+    } satisfies Extract<SelectionRef, { type: "frequency-domain" }>;
     const datasetSelection = {
       kind: "results.eigen.dispersion",
       label: "Dispersion",
       moduleSource: "frequency-domain",
       nodeId: "results:eigen:dispersion",
       objectId: null,
-      ref: {
-        analysisRunId: "run-canonical",
-        analysisStageId: "stage-canonical",
-        artifactPath: "frequency-domain/dispersion.v2.json",
-        artifactRevision: "sha256:artifact-revision",
-        datasetId: "dataset-canonical",
-        datasetRevision: "sha256:dataset-revision",
-        kind: "results.eigen.dispersion",
-        nodeId: "results:eigen:dispersion",
-        type: "frequency-domain",
-      },
-    } as Parameters<typeof buildEigenDispersionPointHandoffContext>[0];
+      ref: frequencyDomainRef,
+    } satisfies Selection;
+    const withoutDatasetIdentity = {
+      ...frequencyDomainRef,
+      datasetId: undefined,
+      datasetRevision: undefined,
+    } satisfies Extract<SelectionRef, { type: "frequency-domain" }>;
 
     expect(buildEigenDispersionPointHandoffContext(datasetSelection)).toMatchObject({
       analysisRunId: "run-canonical",
@@ -58,11 +65,7 @@ describe("EigenDispersionInspectorPanel point model", () => {
     expect(
       buildEigenDispersionPointHandoffContext({
         ...datasetSelection,
-        ref: {
-          ...datasetSelection.ref,
-          datasetId: undefined,
-          datasetRevision: undefined,
-        },
+        ref: withoutDatasetIdentity,
       }).datasetId,
     ).toBeUndefined();
   });

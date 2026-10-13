@@ -18,7 +18,7 @@ import {
 
 const fieldId = "analysis:eigen:sample-0001:mode-0000";
 
-function modeSelection() {
+function modeSelection(includeCanonicalDatasetIdentity = true) {
   return {
     kind: "results.dispersion.modal.mode_at_k",
     label: "Mode 1",
@@ -26,6 +26,9 @@ function modeSelection() {
       analysisRunId: "run-1",
       analysisStageId: "stage-1",
       artifactRevision: 7,
+      ...(includeCanonicalDatasetIdentity
+        ? { datasetId: "stage-1", datasetRevision: "7" }
+        : {}),
       fieldId,
       sampleId: "sample-0001",
       modeId: "mode-0000",
@@ -69,13 +72,14 @@ function commandContext(
   definitions: readonly ReturnType<typeof savedModeDefinition>[],
   create = vi.fn(),
   authoringHistory?: AuthoringHistoryController,
+  selectedMode = modeSelection(),
 ) {
   const list = vi.fn().mockResolvedValue({ definitions, scene_revision: 11 });
   const invalidate = vi.fn();
   return {
     context: {
       api: { analysis: { postprocessing: { definitions: { list, create } } } },
-      selection: { get: () => modeSelection() },
+      selection: { get: () => selectedMode },
       resources: { invalidate },
       authoringHistory,
     } as never,
@@ -125,6 +129,23 @@ function referenceCommand() {
 }
 
 describe("pin mode visualization command owner deduplication", () => {
+  it("refuses to pin a field without canonical published dataset identity", async () => {
+    const command = pinCommand();
+    expect(command).toBeDefined();
+    if (!command) return;
+    const fixture = commandContext([], vi.fn(), undefined, modeSelection(false));
+
+    const result = await command.run(fixture.context);
+
+    expect(result).toEqual({
+      message: "The selected field has no canonical published dataset identity.",
+      status: "failed",
+    });
+    expect(fixture.list).not.toHaveBeenCalled();
+    expect(fixture.create).not.toHaveBeenCalled();
+    expect(fixture.invalidate).not.toHaveBeenCalled();
+  });
+
   it("recognizes an existing field-only ID by its complete stored owner", async () => {
     const command = pinCommand();
     expect(command).toBeDefined();
