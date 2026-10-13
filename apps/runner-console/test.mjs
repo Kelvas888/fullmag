@@ -494,6 +494,129 @@ for (const v of views) {
   console.log(`  ✓ View ${v.name} rendered and verified`);
 }
 
+// 7b. Test backend-advertised automatic and runtime retention capabilities
+const originalPolicyApi = {
+  get: api.getRetentionPolicy,
+  update: api.updateRetentionPolicy,
+};
+const originalPolicyAlert = globalThis.alert;
+const policyAlerts = [];
+const policyUpdatePayloads = [];
+const policyViewModule = await import('./src/views/PoliciesView.js');
+
+globalThis.alert = (message) => policyAlerts.push(message);
+api.updateRetentionPolicy = async (payload) => {
+  policyUpdatePayloads.push(payload);
+  return {};
+};
+
+function makePolicyViewFixture(mode = 'preview') {
+  const container = new MockElement('div');
+  const card = new MockElement('div');
+  const saveButton = new MockElement('button');
+  const form = new MockElement('form');
+  container._elements.set('#policy-card', card);
+  container._elements.set('#btn-save-policy', saveButton);
+  card._elements.set('#policy-form', form);
+
+  const values = {
+    '#pol-mode': mode,
+    '#pol-ttl-success': '48',
+    '#pol-ttl-failure': '240',
+    '#pol-warn-gib': '40',
+    '#pol-crit-gib': '12',
+    '#pol-min-free': '9',
+    '#pol-min-artifacts': '5',
+  };
+  for (const [selector, value] of Object.entries(values)) {
+    const input = new MockElement('input');
+    input.value = value;
+    if (selector === '#pol-min-artifacts') {
+      input.checkValidity = () => true;
+      input.reportValidity = () => {};
+    }
+    card._elements.set(selector, input);
+  }
+  const runtimeToggle = new MockElement('input');
+  runtimeToggle.checked = true;
+  card._elements.set('#pol-runtime-enabled', runtimeToggle);
+  return { container, card, saveButton };
+}
+
+try {
+  const availablePolicy = {
+    mode: 'preview',
+    automatic_mode_available: true,
+    runtime_available: true,
+    runtime_retention_enabled: false,
+    min_artifacts_to_keep: 4,
+    ttl_success_hours: 24,
+    ttl_failure_hours: 168,
+    notice: 'Execution retention is available; sources and results are preserved.',
+  };
+  api.getRetentionPolicy = async () => availablePolicy;
+  const availableView = makePolicyViewFixture('automatic');
+  policyViewModule.renderPoliciesView(availableView.container);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert(availableView.card.innerHTML.includes(availablePolicy.notice),
+    'PoliciesView must render the backend capability notice');
+  assert.match(availableView.card.innerHTML, /<option value="automatic"[^>]*>/,
+    'PoliciesView must render the automatic mode option');
+  assert(!/<option value="automatic"[^>]*disabled/.test(availableView.card.innerHTML),
+    'PoliciesView must enable automatic mode when the backend advertises it');
+  assert(!/<input type="checkbox" id="pol-runtime-enabled"[^>]*disabled/.test(availableView.card.innerHTML),
+    'PoliciesView must enable runtime retention when the backend advertises it');
+  await availableView.saveButton.listeners.click[0]();
+  assert.deepStrictEqual(policyUpdatePayloads[0], {
+    mode: 'automatic',
+    ttl_success_hours: 48,
+    ttl_failure_hours: 240,
+    disk_warning_threshold_gib: 40,
+    disk_critical_threshold_gib: 12,
+    min_free_space_gib: 9,
+    runtime_retention_enabled: true,
+    min_artifacts_to_keep: 5,
+  }, 'PoliciesView must submit selected automatic/runtime settings through the existing API');
+
+  const unavailablePolicy = {
+    ...availablePolicy,
+    automatic_mode_available: false,
+    runtime_available: false,
+    runtime_retention_enabled: false,
+    notice: 'Only preview is available; protected artifacts are preserved.',
+  };
+  api.getRetentionPolicy = async () => unavailablePolicy;
+  const unavailableView = makePolicyViewFixture('preview');
+  policyViewModule.renderPoliciesView(unavailableView.container);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert(/<option value="automatic"[^>]*disabled/.test(unavailableView.card.innerHTML),
+    'PoliciesView must disable automatic mode when unavailable');
+  assert(/<input type="number" id="pol-min-artifacts"[^>]*disabled/.test(unavailableView.card.innerHTML),
+    'PoliciesView must disable runtime artifact retention when unavailable');
+  assert(/<input type="checkbox" id="pol-runtime-enabled"[^>]*disabled/.test(unavailableView.card.innerHTML),
+    'PoliciesView must disable runtime cleanup when unavailable');
+  unavailableView.card.querySelector('#pol-mode').value = 'automatic';
+  const updateCountBeforeRejectedMode = policyUpdatePayloads.length;
+  await unavailableView.saveButton.listeners.click[0]();
+  assert.strictEqual(policyUpdatePayloads.length, updateCountBeforeRejectedMode,
+    'PoliciesView must reject automatic mode client-side when the backend says it is unavailable');
+  assert(policyAlerts.some((message) => message.includes('Tryb automatyczny niedostępny')),
+    'PoliciesView must explain why unavailable automatic mode was rejected');
+
+  unavailableView.card.querySelector('#pol-mode').value = 'preview';
+  await unavailableView.saveButton.listeners.click[0]();
+  const previewPayload = policyUpdatePayloads.at(-1);
+  assert.strictEqual(previewPayload.mode, 'preview');
+  assert(!Object.hasOwn(previewPayload, 'runtime_retention_enabled'),
+    'PoliciesView must omit the runtime-retention flag when unavailable');
+  assert(!Object.hasOwn(previewPayload, 'min_artifacts_to_keep'),
+    'PoliciesView must omit the runtime artifact count when unavailable');
+  console.log('✓ PoliciesView follows advertised automatic/runtime retention capabilities');
+} finally {
+  api.getRetentionPolicy = originalPolicyApi.get;
+  api.updateRetentionPolicy = originalPolicyApi.update;
+  globalThis.alert = originalPolicyAlert;
+}
 // 8. Test dynamic port override in TopBar and DiagnosticsView
 globalThis.window.location.port = '54321';
 globalThis.window.location.host = '127.0.0.1:54321';
