@@ -88,11 +88,14 @@ export function useViewport3DObjectMoveInteraction({
   const [, forceSelectionRender] = useState(0);
   const [moveStatus, setMoveStatus] = useState<{
     error: string | null;
+    objectId: string | null;
     sessionIdentityKey: string | null;
-  }>({ error: null, sessionIdentityKey: null });
-  const moveError = moveStatus.sessionIdentityKey === sessionIdentityKey
-    ? moveStatus.error
-    : null;
+  }>({ error: null, objectId: null, sessionIdentityKey: null });
+  const moveError =
+    moveStatus.sessionIdentityKey === sessionIdentityKey &&
+    moveStatus.objectId === selectedObjectId
+      ? moveStatus.error
+      : null;
 
   useEffect(() => {
     sceneSnapshotRef.current = { data: scene.data, status: scene.status };
@@ -267,7 +270,11 @@ export function useViewport3DObjectMoveInteraction({
 
     const reportError = (message: string) => {
       if (isMoveRequestCurrent(fence)) {
-        setMoveStatus({ error: message, sessionIdentityKey: fence.sessionIdentityKey });
+        setMoveStatus({
+          error: message,
+          objectId: fence.objectId,
+          sessionIdentityKey: fence.sessionIdentityKey,
+        });
       }
     };
 
@@ -319,7 +326,11 @@ export function useViewport3DObjectMoveInteraction({
       ];
       const nextDraft = { ...currentDraft, translation: nextTranslation };
       if (geometryDraftTranslationEquals(currentDraft, nextDraft)) {
-        setMoveStatus({ error: null, sessionIdentityKey: fence.sessionIdentityKey });
+        setMoveStatus({
+          error: null,
+          objectId: fence.objectId,
+          sessionIdentityKey: fence.sessionIdentityKey,
+        });
         return true;
       }
       if (!isMoveRequestCurrent(fence)) return true;
@@ -332,7 +343,11 @@ export function useViewport3DObjectMoveInteraction({
         reportError("The object draft changed before the move could be staged. Try the move again.");
         return true;
       }
-      setMoveStatus({ error: null, sessionIdentityKey: fence.sessionIdentityKey });
+      setMoveStatus({
+        error: null,
+        objectId: fence.objectId,
+        sessionIdentityKey: fence.sessionIdentityKey,
+      });
       return true;
     } catch (error) {
       reportError(error instanceof Error ? error.message : String(error));

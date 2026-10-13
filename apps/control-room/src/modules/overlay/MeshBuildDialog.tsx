@@ -223,12 +223,12 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
     const isReadyOrNotBuilt = (resource: { status: string; error?: unknown }) => {
       if (resource.status === "ready") return true;
       if (resource.status === "error") {
-        const err = resource.error as { status?: number; code?: string; message?: string } | null;
+        const err = resource.error as { code?: string } | null;
+        const code = typeof err?.code === "string" ? err.code.toLowerCase() : "";
         if (
-          err?.status === 404 ||
-          err?.code === "NOT_FOUND" ||
-          err?.code === "NO_MESH_YET" ||
-          err?.message?.toLowerCase().includes("not found")
+          code === "no_mesh_yet" ||
+          code === "mesh_not_built" ||
+          code === "mesh_not_found"
         ) {
           return true;
         }

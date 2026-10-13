@@ -603,7 +603,7 @@ export function withObjectPlacementDraftPreview(
 
   return {
     ...model,
-    draftOverlay: object.meshState === "mesh-ready" ? preview : model.draftOverlay,
+    draftOverlay: preview,
     objects: model.objects.map((candidate) =>
       candidate.objectId === draft.objectId ? preview : candidate,
     ),

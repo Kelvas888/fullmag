@@ -47,6 +47,8 @@ export type AuthoringMutationSceneResolver<T> = (
 export interface RunAuthoringMutationWithHistoryOptions {
   /** Capture UI state changed by the mutation itself after its successful ACK. */
   captureWorkspaceStateAfter?: boolean | ((result: unknown) => boolean);
+  /** Callback fired when the mutation succeeded on the server, but local history recording was degraded. */
+  onHistoryDegraded?: (reason?: string) => void;
 }
 
 export function authoringWriteOptions(
@@ -155,20 +157,26 @@ export async function recordAuthoringMutationHistory(
   preparation: AuthoringMutationPreparation,
   committedScene?: SceneResource | null,
   workspaceStateAfter?: AuthoringHistoryWorkspaceState | null,
-): Promise<void> {
+): Promise<{ recorded: boolean; reason?: string }> {
   const history = context.authoringHistory;
-  if (!history || !preparation.before) return;
+  if (!history || !preparation.before) {
+    return { recorded: false, reason: "history unavailable or initial scene snapshot missing" };
+  }
   const isCurrentGeneration = () =>
     context.isCurrentSessionScope?.() !== false &&
     (preparation.historyGeneration === undefined ||
       history.getGeneration?.() === preparation.historyGeneration);
-  if (!isCurrentGeneration()) return;
+  if (!isCurrentGeneration()) {
+    return { recorded: false, reason: "session or history generation changed" };
+  }
 
   let after = committedScene ?? null;
   if (sceneRevision(after) === null) {
     after = await captureAuthoringHistoryScene(context);
   }
-  if (!isCurrentGeneration()) return;
+  if (!isCurrentGeneration()) {
+    return { recorded: false, reason: "session or history generation changed" };
+  }
 
   const beforeRevision = preparation.baseRevision;
   const afterRevision = sceneRevision(after);
@@ -178,7 +186,7 @@ export async function recordAuthoringMutationHistory(
     afterRevision === null ||
     afterRevision <= beforeRevision
   ) {
-    return;
+    return { recorded: false, reason: "authoritative scene revision did not advance" };
   }
 
   try {
@@ -194,6 +202,7 @@ export async function recordAuthoringMutationHistory(
       committedRevision: afterRevision,
       label,
     });
+    return { recorded: true };
   } catch (error) {
     // History is an observability layer; a valid authoring ACK must survive a
     // malformed or unavailable local history snapshot. We surface degradation in diagnostics.
@@ -201,6 +210,10 @@ export async function recordAuthoringMutationHistory(
       "[authoringHistory] Failed to record mutation history entry (history degraded):",
       error,
     );
+    return {
+      recorded: false,
+      reason: error instanceof Error ? error.message : String(error),
+    };
   }
 }
 
@@ -230,12 +243,15 @@ export async function runAuthoringMutationWithHistory<T>(
   const after = resolveAfter
     ? await resolveAfter(result)
     : sceneFromMutationResult(result);
-  await recordAuthoringMutationHistory(
+  const historyResult = await recordAuthoringMutationHistory(
     context,
     label,
     preparation,
     after,
     workspaceStateAfter,
   );
+  if (!historyResult.recorded && historyResult.reason && options.onHistoryDegraded) {
+    options.onHistoryDegraded(historyResult.reason);
+  }
   return result;
 }

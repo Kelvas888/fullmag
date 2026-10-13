@@ -21,9 +21,13 @@ export class ObjectEditSessionController<TDraft> {
   private epochSequence = 0;
   private operationSequence = 0;
   private pendingOperations = new Map<
-    string | null,
+    string,
     ObjectEditApplyOperation<TDraft>
   >();
+  private pendingOperationKey(target: { sessionScopeKey: string | null; objectId?: string | null }): string {
+    const scope = target.sessionScopeKey ?? "default";
+    return target.objectId ? `${scope}:${target.objectId}` : scope;
+  }
   private snapshot: ObjectEditSessionSnapshot<TDraft> = EMPTY_SNAPSHOT;
 
   readonly getSnapshot = (): ObjectEditSessionSnapshot<TDraft> => this.snapshot;
@@ -55,7 +59,7 @@ export class ObjectEditSessionController<TDraft> {
       epoch: ++this.epochSequence,
     });
     this.publish({
-      applyOperationId: this.pendingOperations.get(target.sessionScopeKey)?.id ?? null,
+      applyOperationId: this.pendingOperations.get(this.pendingOperationKey(target))?.id ?? null,
       dirty: false,
       draft: initialDraft,
       editVersion: 0,
@@ -84,7 +88,7 @@ export class ObjectEditSessionController<TDraft> {
     if (
       !this.matches(identity) ||
       this.snapshot.dirty ||
-      this.pendingOperations.has(identity.sessionScopeKey) ||
+      this.pendingOperations.has(this.pendingOperationKey(identity)) ||
       Object.is(this.snapshot.draft, canonicalDraft)
     ) {
       return this.matches(identity);
@@ -107,7 +111,7 @@ export class ObjectEditSessionController<TDraft> {
     if (
       !this.matches(identity) ||
       this.snapshot.draft === null ||
-      this.pendingOperations.has(identity.sessionScopeKey)
+      this.pendingOperations.has(this.pendingOperationKey(identity))
     ) {
       return null;
     }
@@ -117,7 +121,7 @@ export class ObjectEditSessionController<TDraft> {
       submittedDraft: this.snapshot.draft,
       submittedVersion: this.snapshot.editVersion,
     });
-    this.pendingOperations.set(identity.sessionScopeKey, operation);
+    this.pendingOperations.set(this.pendingOperationKey(identity), operation);
     this.publish({ ...this.snapshot, applyOperationId: operation.id });
     return operation;
   }
@@ -131,10 +135,11 @@ export class ObjectEditSessionController<TDraft> {
       canonicalDraft: TDraft,
     ) => { dirty: boolean; draft: TDraft },
   ): boolean {
-    const pending = this.pendingOperations.get(operation.identity.sessionScopeKey);
+    const opKey = this.pendingOperationKey(operation.identity);
+    const pending = this.pendingOperations.get(opKey);
     const ownsPending = pending?.id === operation.id;
     if (ownsPending) {
-      this.pendingOperations.delete(operation.identity.sessionScopeKey);
+      this.pendingOperations.delete(opKey);
     }
     const ownsCurrentDraft =
       this.matches(operation.identity) &&
@@ -168,10 +173,11 @@ export class ObjectEditSessionController<TDraft> {
   }
 
   reject(operation: ObjectEditApplyOperation<TDraft>): boolean {
-    const pending = this.pendingOperations.get(operation.identity.sessionScopeKey);
+    const opKey = this.pendingOperationKey(operation.identity);
+    const pending = this.pendingOperations.get(opKey);
     const ownsPending = pending?.id === operation.id;
     if (ownsPending) {
-      this.pendingOperations.delete(operation.identity.sessionScopeKey);
+      this.pendingOperations.delete(opKey);
     }
     const ownsCurrentDraft =
       this.matches(operation.identity) &&
@@ -189,7 +195,7 @@ export class ObjectEditSessionController<TDraft> {
   reset(identity: ObjectEditSessionIdentity, initialDraft: TDraft): boolean {
     if (
       !this.matches(identity) ||
-      this.pendingOperations.has(identity.sessionScopeKey)
+      this.pendingOperations.has(this.pendingOperationKey(identity))
     ) {
       return false;
     }

@@ -8,6 +8,12 @@ import {
   TestNode,
 } from "@/kernel/layout/simulationPreparationTestDom.test-support";
 import {
+  geometryObjectEditSessionTargetKey,
+  resolveCommittedGeometryObjectDraft,
+} from "@/kernel/authoring/object-edit/objectEditDraftModel";
+import type { ObjectEditSessionController } from "@/kernel/authoring/object-edit/ObjectEditSessionController";
+import type { GeometryObjectDraft } from "@/kernel/authoring/object-edit/objectEditTypes";
+import {
   InspectorEditSessionProvider,
   inspectorActionState,
   useInspectorEditSession,
@@ -17,9 +23,11 @@ import type { Selection } from "@/kernel/selection/selectionTypes";
 import { ObjectGeneralPanel } from "./ObjectGeneralPanel";
 
 const mocks = vi.hoisted(() => ({
+  commitTransaction: vi.fn(),
   getSessionScopeKey: vi.fn(() => "session=A&epoch=1" as string | null),
   historyGeneration: 0,
   invalidate: vi.fn(),
+  objectEditSession: null as ObjectEditSessionController<GeometryObjectDraft> | null,
   patchObject: vi.fn(),
   publishCommittedScene: vi.fn(),
   readScene: vi.fn(),
@@ -39,15 +47,26 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@/kernel/KernelContext", async () => {
   const React = await import("react");
+  const { ObjectEditSessionController } = await import(
+    "@/kernel/authoring/object-edit/ObjectEditSessionController"
+  );
+  mocks.objectEditSession ??= new ObjectEditSessionController();
   return {
     KernelContext: React.createContext(null),
     useKernel: () => ({
-      api: { model: { patchObject: mocks.patchObject, scene: mocks.readScene } },
+      api: {
+        model: {
+          commitTransaction: mocks.commitTransaction,
+          patchObject: mocks.patchObject,
+          scene: mocks.readScene,
+        },
+      },
       authoringHistory: {
         getGeneration: () => mocks.historyGeneration,
         record: mocks.recordHistory,
       },
-      commands: { getSessionScopeKey: mocks.getSessionScopeKey },
+      commands: { execute: vi.fn(), getSessionScopeKey: mocks.getSessionScopeKey },
+      objectEditSession: mocks.objectEditSession,
       resources: { invalidate: mocks.invalidate },
       selection: { get: () => null, set: vi.fn(), clear: vi.fn() },
     }),
@@ -114,6 +133,21 @@ describe("ObjectGeneralPanel staged identity edits", () => {
       scene_revision: 10,
     };
     mocks.readScene.mockResolvedValue(mocks.sceneData);
+    mocks.objectEditSession?.clear();
+    mocks.commitTransaction.mockResolvedValue({
+      committed_scene: {
+        objects: [{
+          geometry: { geometry_kind: "Box", geometry_params: { size: [1e-7, 1e-7, 1e-8] } },
+          id: "object-a",
+          name: "Magnet",
+          notes: "Original notes",
+          transform: { translation: [1e-7, 0, 0] },
+        }],
+        revision: 11,
+        scene_revision: 11,
+      },
+      scene_revision: 11,
+    });
     mocks.patchObject.mockResolvedValue({
       objects: [{ id: "object-a", name: "Updated magnet", notes: "Original notes" }],
       revision: 11,
@@ -191,6 +225,92 @@ describe("ObjectGeneralPanel staged identity edits", () => {
       expect(mocks.recordHistory).not.toHaveBeenCalled();
       expect(mocks.invalidate).not.toHaveBeenCalled();
       expect(container.textContent).not.toContain("Object identity committed.");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("reflects dirty objectEditSession in inspector action state, shows warning banner, and commits 3D placement via Apply", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <InspectorEditSessionProvider>
+          <ObjectGeneralPanel selection={selection} />
+          <InspectorSessionProbe />
+        </InspectorEditSessionProvider>,
+      ));
+
+      expect(findButton(container, "Global Apply").disabled).toBe(true);
+      expect(container.textContent).not.toContain("Uncommitted 3D placement changes are pending for this object");
+
+      const baseDraft = resolveCommittedGeometryObjectDraft(mocks.sceneData as never, "object-a");
+      if (!baseDraft) throw new Error("Expected base draft");
+      const identity = mocks.objectEditSession!.activate({
+        objectId: "object-a",
+        sessionScopeKey: "session=A&epoch=1",
+        targetKey: geometryObjectEditSessionTargetKey("session=A&epoch=1", baseDraft),
+      }, baseDraft);
+
+      await act(async () => {
+        mocks.objectEditSession!.updateDraft(identity, (draft: GeometryObjectDraft) => ({
+          ...draft,
+          translation: ["1e-7", "0", "0"],
+        }));
+      });
+
+      expect(findButton(container, "Global Apply").disabled).toBe(false);
+      expect(container.textContent).toContain("Uncommitted 3D placement changes are pending for this object");
+
+      await act(async () => findButton(container, "Global Apply").click());
+
+      expect(mocks.commitTransaction).toHaveBeenCalledOnce();
+      expect(mocks.objectEditSession!.getSnapshot().dirty).toBe(false);
+      expect(container.textContent).toContain("Object placement committed.");
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
+  it("reverts 3D placement changes and clears objectEditSession on Global Reset", async () => {
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(
+        <InspectorEditSessionProvider>
+          <ObjectGeneralPanel selection={selection} />
+          <InspectorSessionProbe />
+        </InspectorEditSessionProvider>,
+      ));
+
+      const baseDraft = resolveCommittedGeometryObjectDraft(mocks.sceneData as never, "object-a");
+      if (!baseDraft) throw new Error("Expected base draft");
+      const identity = mocks.objectEditSession!.activate({
+        objectId: "object-a",
+        sessionScopeKey: "session=A&epoch=1",
+        targetKey: geometryObjectEditSessionTargetKey("session=A&epoch=1", baseDraft),
+      }, baseDraft);
+
+      await act(async () => {
+        mocks.objectEditSession!.updateDraft(identity, (draft: GeometryObjectDraft) => ({
+          ...draft,
+          translation: ["1e-7", "0", "0"],
+        }));
+      });
+
+      expect(findButton(container, "Global Reset").disabled).toBe(false);
+
+      await act(async () => findButton(container, "Global Reset").click());
+
+      expect(mocks.objectEditSession!.getSnapshot().dirty).toBe(false);
+      expect(findButton(container, "Global Reset").disabled).toBe(true);
+      expect(container.textContent).not.toContain("Uncommitted 3D placement changes are pending for this object");
     } finally {
       await act(async () => root.unmount());
       dom.restore();

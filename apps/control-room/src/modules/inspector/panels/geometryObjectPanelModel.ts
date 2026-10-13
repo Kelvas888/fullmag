@@ -48,6 +48,35 @@ export function isPrimitiveDraftRevisionConflict(error: unknown): boolean {
     (error.code === "revision_conflict" || error.code === "scene_revision_conflict");
 }
 
+function rebaseVector3(
+  draftVec: readonly [string, string, string] | readonly string[],
+  targetVec: readonly [string, string, string] | readonly string[],
+  baseVec: readonly [string, string, string] | readonly string[],
+): [string, string, string] {
+  const result: [string, string, string] = [
+    targetVec[0] ?? "0",
+    targetVec[1] ?? "0",
+    targetVec[2] ?? "0",
+  ];
+  for (let i = 0; i < 3; i++) {
+    const d = draftVec[i] ?? "";
+    const b = baseVec[i] ?? "";
+    const t = targetVec[i] ?? "";
+    const draftChanged = d !== b;
+    const targetChanged = t !== b;
+    if (draftChanged && !targetChanged) {
+      result[i] = d;
+    } else if (!draftChanged && targetChanged) {
+      result[i] = t;
+    } else if (draftChanged && targetChanged) {
+      result[i] = d;
+    } else {
+      result[i] = t;
+    }
+  }
+  return result;
+}
+
 export function rebaseGeometryObjectDraft(
   draft: GeometryObjectDraft,
   target: GeometryObjectDraft | number | null,
@@ -63,12 +92,34 @@ export function rebaseGeometryObjectDraft(
   if (!baseline) {
     return { ...draft, baseRevision: target.baseRevision };
   }
+  const vectorFields = new Set([
+    "size",
+    "translation",
+    "rotation",
+    "scale",
+    "bounds_min",
+    "bounds_max",
+  ]);
   const fields = Object.keys(draft) as (keyof GeometryObjectDraft)[];
   for (const field of fields) {
     if (field === "baseRevision") continue;
     const draftVal = draft[field];
     const baseVal = baseline[field];
     const targetVal = target[field];
+    if (
+      vectorFields.has(field) &&
+      Array.isArray(draftVal) &&
+      Array.isArray(targetVal) &&
+      Array.isArray(baseVal)
+    ) {
+      const mergedVec = rebaseVector3(
+        draftVal as readonly string[],
+        targetVal as readonly string[],
+        baseVal as readonly string[],
+      );
+      Object.assign(merged, { [field]: mergedVec });
+      continue;
+    }
     const isDirty = Array.isArray(draftVal)
       ? JSON.stringify(draftVal) !== JSON.stringify(baseVal)
       : draftVal !== baseVal;
@@ -238,7 +289,11 @@ export function resolveGeometryObjectDraft(
 }
 
 function parseFiniteNumber(value: string, label: string): { error: string | null; value: number } {
-  const parsed = Number(value);
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    return { error: `${label} is required.`, value: 0 };
+  }
+  const parsed = Number(trimmed);
   if (!Number.isFinite(parsed)) {
     return { error: `${label} must be a finite SI value.`, value: 0 };
   }
@@ -285,7 +340,11 @@ function parseDraftComponent(
   label: string,
   positive: boolean,
 ): { error: string | null; value: number | null } {
-  const parsed = Number(value);
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    return { error: `${label} is required.`, value: null };
+  }
+  const parsed = Number(trimmed);
   if (!Number.isFinite(parsed)) {
     return { error: `${label} must be a finite SI value.`, value: null };
   }
@@ -594,5 +653,23 @@ export function resolveGeometryObjectPanelModel(
       asString(geometry?.kind) ??
       "object",
     source: "SceneDocument",
+  };
+}
+
+export function mergeGeometryDescriptor(
+  existing: JsonObject,
+  edited: JsonObject,
+): JsonObject {
+  const existingParams = existing.geometry_params;
+  const editedParams = edited.geometry_params;
+  const mergedParams =
+    existingParams && typeof existingParams === "object" && !Array.isArray(existingParams) &&
+    editedParams && typeof editedParams === "object" && !Array.isArray(editedParams)
+      ? { ...existingParams, ...editedParams }
+      : editedParams;
+  return {
+    ...existing,
+    ...edited,
+    ...(mergedParams ? { geometry_params: mergedParams as JsonObject } : {}),
   };
 }

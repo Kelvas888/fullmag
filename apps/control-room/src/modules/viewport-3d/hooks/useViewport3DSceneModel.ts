@@ -3721,6 +3721,7 @@ export function useViewport3DSceneModel({
         bounds,
         fdmSelectionGrid,
         fdmUniverseOutsideSupport,
+        sharedDomainManifest.data?.generation_id,
       ),
     [
       selection,
@@ -3730,6 +3731,7 @@ export function useViewport3DSceneModel({
       bounds,
       fdmSelectionGrid,
       fdmUniverseOutsideSupport,
+      sharedDomainManifest.data?.generation_id,
     ],
   );
   const globalLayers = renderingState?.layers;
