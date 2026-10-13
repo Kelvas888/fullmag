@@ -604,3 +604,20 @@ Uruchomiono managed browser proof D→F: sesja 89785, receipt
 Współdzielony checkout przeszedł na HEAD
 `a227bea56dc94109edb6b72826d55e65e8e19e6d`; nie przypisywać temu HEAD
 frozen builda F, którego recorded head pozostaje 9112d38880f4.
+
+## D→F odmowa na typecheck przed browserem
+
+Sesja 89785 terminal exit 1; recipe exit 2, receipt
+`864d2e68606c4b1caa259f93e8556e22` failed. Typecheck exit 2:
+trzy TS2339 (`failure_policy`) i jeden TS2367 (`stopped`) w
+projectBatchResources.ts / ProjectBatchesSection.tsx. Każdy proces receipt
+ma terminalny wait; CLI/API zakończyły się exit 1, helpery exit 0.
+Próba nie doszła do rzeczywistej sceny/browsera ani Compute.
+
+Backend ProjectBatchSummaryResource ma failure_policy, a session expansion
+obsługuje Stopped; obecny generated OpenAPI JSON i types nie zawierają
+tych elementów. Nie zmieniono guards ani ręcznie wygenerowanych typów.
+Rozpoczęto managed `archive-windows-native-build` dla manifestu F,
+sesja 41147, w celu uzyskania kanonicznego eksportu z receipt. Następnie
+wymagana jest regeneracja i weryfikacja typów oraz nowy zgodny frozen
+pakiet frontendu. Restore→Compute i publiczny restart pozostają OPEN.
