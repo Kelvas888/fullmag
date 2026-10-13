@@ -5991,3 +5991,40 @@ Publiczny DSL/ProblemIR i fizyczny solver nie zmieniają się.
 
 | `scripts/validate_comsol_dispersion_scientific_gate.py` | `_load_numeric_bundle` | SHA i JSON tych samych bajtów, bez TOCTOU drugiego odczytu |
 | `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_numeric_bundle_parses_the_exact_bytes_that_passed_hash_binding` | Deterministyczna regresja podmiany loadera |
+
+
+(g6-cross-run-gate-field-binding)=
+## G6 — pola cross-run w diagnostyce zbieżności
+
+Opcjonalne `convergence.<section>.cross_run_fields` zawiera jawne progi
+`policy` oraz kompletne partycje `baseline_clusters` i `check_clusters`
+w postaci list `{sample_index, groups}`. Brak dowodu nie uruchamia
+fallbacku przez częstotliwość. Lewa selekcja pochodzi z ośmiu istniejących
+run-local selectors dla każdej próbki kontrolnej; prawa obejmuje wszystkie
+rzeczywiście opublikowane, jakościowo dopuszczone dodatnie mody tych próbek.
+Żądane 48 modów nie oznacza, że opublikowano 48 dodatnich stanów.
+
+Loader odczytuje rzeczywiste pola z descriptor-bound roots, sprawdza fazę,
+geometrię i spójną masę Tet4. Gate porównuje dokładny hash `metadata.json`
+z hashem oryginalnego numeric descriptoru, wiąże signed k i zespoloną
+częstotliwość każdego pola z hash-bound widmem oraz przekazuje oba inventory
+do matchera. Podmiana metadanych pomiędzy loaderami, brak pola, niekompletna
+partycja, zmiana siatki lub niejednoznaczne przypisanie nie dają PASS.
+
+`cross_run_field_match` jest odrębną diagnostyką. Istniejące wiersze zmian
+częstotliwości według lokalnych branch ID pozostają numeric-only i nie
+ustanawiają tożsamości fizycznej. Nawet podobieństwo pól PASS zachowuje
+`physical_identity_status=not_verified` oraz `qualification=NOT VERIFIED`.
+Zastąpienie lokalnych selektorów porównaniem częstości przypisanych klastrów,
+transfer między siatkami, polityka degeneracji i kompletność oczekiwanego
+widma wymagają dalszych etapów. Progi solvera i Fullmag–COMSOL nie zmieniają się.
+
+FEM CPU: source implemented, hosted contracts pending; managed runtime
+oraz scientific qualification NOT VERIFIED. FEM GPU bez nowej kwalifikacji;
+FDM CPU/GPU nie dotyczy. Publiczny Python DSL, ProblemIR i operator bez zmian.
+
+| Źródło | Symbol | Zakres |
+|---|---|---|
+| `scripts/validate_comsol_dispersion_scientific_gate.py` | `_cross_run_field_match_diagnostic` | Rzeczywiste pola, inventory i descriptor-bound metadane |
+| `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_convergence_field_match_rejects_loader_metadata_hash_rebound` | Odrzucenie podmiany metadata pomiędzy loaderami |
+| `scripts/test_validate_comsol_dispersion_scientific_gate.py` | `test_convergence_field_match_uses_fields_across_swapped_raw_ids_and_rejects_orthogonal_loss` | Zamienione raw IDs i utrata tożsamości pola |

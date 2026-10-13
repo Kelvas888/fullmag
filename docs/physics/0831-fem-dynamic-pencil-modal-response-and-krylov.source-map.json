@@ -4485,6 +4485,24 @@
       "path": "scripts/test_validate_comsol_dispersion_scientific_gate.py",
       "symbol": "test_numeric_bundle_parses_the_exact_bytes_that_passed_hash_binding",
       "responsibility": "Reject second-loader substitution after hash binding"
+    },
+    {
+      "id": "source-g6-cross-run-gate-binding",
+      "path": "scripts/validate_comsol_dispersion_scientific_gate.py",
+      "symbol": "_cross_run_field_match_diagnostic",
+      "responsibility": "Replay bound actual fields as diagnostic while preserving scientific refusal"
+    },
+    {
+      "id": "source-g6-cross-run-gate-metadata-regression",
+      "path": "scripts/test_validate_comsol_dispersion_scientific_gate.py",
+      "symbol": "test_convergence_field_match_rejects_loader_metadata_hash_rebound",
+      "responsibility": "Reject metadata rebinding between numeric and modal field loaders"
+    },
+    {
+      "id": "source-g6-cross-run-gate-field-regression",
+      "path": "scripts/test_validate_comsol_dispersion_scientific_gate.py",
+      "symbol": "test_convergence_field_match_uses_fields_across_swapped_raw_ids_and_rejects_orthogonal_loss",
+      "responsibility": "Use actual fields across raw IDs and reject lost field inventory"
     }
   ],
   "public_api": {

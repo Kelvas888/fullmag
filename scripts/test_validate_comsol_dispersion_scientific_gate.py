@@ -11,6 +11,7 @@ import itertools
 import math
 import struct
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 import sys
 import tempfile
@@ -1279,6 +1280,120 @@ def _make_case(root: Path, case: str = "c1", *, primary_material=None, producer_
     return case_dir
 
 
+def _install_cross_run_field_inputs(case_dir: Path, *, check_source_raw=None, check_mesh_shift=False):
+    """Create real loader-bound field bytes for synthetic convergence bundles."""
+    from comsol_magnetic_support import magnetic_element_indices, tet4_cells
+    from comsol_mesh_identity import mesh_topology_fingerprint_v3
+    from comsol_tracking_metric import Tet4TrackingMetric
+
+    evidence_path = case_dir / gate.EVIDENCE_RELATIVE_PATH
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    section = evidence["convergence"]["mode_count"]
+    samples_expected = gate.EXPECTED_CONTROL_SAMPLES
+    bundle_roots = {
+        "baseline": section["runs"]["baseline"]["root"],
+        "check": section["runs"]["check"]["root"],
+    }
+    if check_mesh_shift:
+        root = case_dir / bundle_roots["check"]
+        metadata_path = root / "metadata.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        nodes = metadata["execution_plan"]["backend_plan"]["mesh"]["nodes"]
+        for node in nodes:
+            node[0] += 3.0e-9
+        _write_json(metadata_path, metadata)
+        section["runs"]["check"] = _bundle_descriptor(case_dir, bundle_roots["check"])
+
+    branch_selectors: dict[int, list[int]] = {sample: [] for sample in samples_expected}
+    for comparison in section["comparisons"]:
+        sample_index, branch_id = comparison["sample_index"], comparison["branch_id"]
+        root = case_dir / bundle_roots["baseline"]
+        branch_doc = json.loads((root / "eigen/branches.v2.json").read_text(encoding="utf-8"))
+        branch = next(item for item in branch_doc["branches"] if item["branch_id"] == branch_id)
+        point = next(item for item in branch["points"] if item["sample_index"] == sample_index)
+        branch_selectors[sample_index].append(point["raw_mode_index"])
+
+    candidate_raw_by_sample: dict[int, list[int]] = {}
+    for name, relative_root in bundle_roots.items():
+        root = case_dir / relative_root
+        spectrum = json.loads((root / "eigen/spectrum.v2.json").read_text(encoding="utf-8"))
+        selected_samples = [sample for sample in spectrum["samples"]
+                            if sample["sample_index"] in samples_expected]
+        _write_mode_fields(root, selected_samples)
+        metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+        plan = metadata["execution_plan"]["backend_plan"]
+        mesh = plan["mesh"]
+        fingerprint = mesh_topology_fingerprint_v3(mesh)
+        metric = Tet4TrackingMetric(
+            mesh["nodes"], tet4_cells(mesh), magnetic_element_indices(mesh, plan.get("mesh_parts")),
+        )
+        support = metric.support.tolist()
+        support_index = {int(node): index for index, node in enumerate(support)}
+        metric_record = {
+            "schema": "fullmag.tracking_consistent_p1_metric.v1",
+            "definition_id": "consistent_p1_tet4_cartesian_nodal_envelope.v1",
+            "source_mesh_topology_sha256": fingerprint,
+            "physical_node_indices": support,
+            "tetra": [[support_index[int(node)] for node in cell] for cell in metric.cells.tolist()],
+            "volumes_m3": metric.volumes_m3.tolist(),
+        }
+        for sample in selected_samples:
+            sample_index = sample["sample_index"]
+            candidate_raw_by_sample[sample_index] = [mode["raw_mode_index"] for mode in sample["modes"]]
+            for mode in sample["modes"]:
+                raw = mode["raw_mode_index"]
+                mode_path = root / f"eigen/modes/sample_{sample_index:04d}/mode_{raw:04d}.json"
+                mode_metadata = json.loads(mode_path.read_text(encoding="utf-8"))
+                mode_metadata["tracking_consistent_p1_metric"] = metric_record
+                _write_json(mode_path, mode_metadata)
+                source_raw = raw
+                if name == "check" and isinstance(check_source_raw, Mapping):
+                    source_raw = check_source_raw.get(raw, raw)
+                source_raw = int(source_raw)
+                plane_levels = sorted({float(node[2]) for node in mesh["nodes"]})
+                if len(plane_levels) != 2:
+                    raise AssertionError("synthetic field matcher fixture requires two z planes")
+                pattern = [0.0] * 6
+                if source_raw < 6:
+                    pattern[source_raw] = 1.0
+                elif source_raw == 6:
+                    pattern[0] = pattern[1] = 1.0 / math.sqrt(2.0)
+                else:
+                    pattern[2] = pattern[3] = 1.0 / math.sqrt(2.0)
+                values = []
+                k_vector = sample["k_vector"]
+                for node in mesh["nodes"]:
+                    plane = 0 if float(node[2]) == plane_levels[0] else 1
+                    argument = sum(a * b for a, b in zip(k_vector, node))
+                    phase = complex(math.cos(argument), -math.sin(argument))
+                    for component in range(3):
+                        value = pattern[plane * 3 + component] * phase
+                        values.extend((value.real, value.imag))
+                data = struct.pack(f"<{len(values)}d", *values)
+                vector_path = root / f"eigen/mode_fields/sample_{sample_index:04d}/mode_{raw:04d}/vector.bin"
+                vector_path.write_bytes(data)
+                mode_metadata = json.loads(mode_path.read_text(encoding="utf-8"))
+                mode_metadata["payload_sha256"] = "sha256:" + hashlib.sha256(data).hexdigest()
+                _write_json(mode_path, mode_metadata)
+
+    section["cross_run_fields"] = {
+        "policy": {
+            "overlap_floor": 0.99,
+            "ambiguity_tolerance": 1.0e-6,
+            "degeneration_relative_tolerance": 1.0e-12,
+        },
+        "baseline_clusters": [
+            {"sample_index": sample, "groups": [[raw] for raw in branch_selectors[sample]]}
+            for sample in samples_expected
+        ],
+        "check_clusters": [
+            {"sample_index": sample, "groups": [[raw] for raw in candidate_raw_by_sample[sample]]}
+            for sample in samples_expected
+        ],
+    }
+    _write_json(evidence_path, evidence)
+
+
 class ScientificGateTests(unittest.TestCase):
     def test_benchmark_config_consumes_canonical_search_sheet(self):
         parameters = json.loads(PARAMETERS.read_text(encoding="utf-8"))
@@ -2234,7 +2349,126 @@ class ScientificGateTests(unittest.TestCase):
                 self.assertEqual(check["physical_identity_status"], "not_verified")
                 self.assertEqual(check["status"], "not_verified")
                 self.assertIn("run-local branch_id and frequency", check["physical_identity_reason"])
+                cross_run = check["cross_run_field_match"]
+                self.assertEqual(cross_run["status"], "not_verified")
+                self.assertTrue(cross_run["diagnostic_only"])
+                self.assertIn("no explicit cross_run_fields", cross_run["reasons"][0])
                 self.assertEqual(report["status"], "not_qualified")
+
+    def test_convergence_cross_run_fields_use_bound_loader_and_report_requested_vs_published(self):
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = _make_case(Path(directory), "c1")
+            _install_cross_run_field_inputs(case_dir)
+            report = gate.validate_case(case_dir, "c1", parameters_path=PARAMETERS, kpath_path=KPATH)
+
+            check = report["checks"]["mode_count_convergence"]
+            diagnostic = check["cross_run_field_match"]
+            self.assertEqual(check["numeric_status"], "pass", report["reasons"][:12])
+            self.assertEqual(check["physical_identity_status"], "not_verified")
+            self.assertEqual(diagnostic["status"], "pass", diagnostic["reasons"])
+            self.assertTrue(diagnostic["diagnostic_only"])
+            self.assertEqual(diagnostic["qualification"], "NOT VERIFIED")
+            self.assertEqual(diagnostic["physical_identity_status"], "not_verified")
+            self.assertEqual(diagnostic["inventory"]["baseline_requested_mode_count"], 24)
+            self.assertEqual(diagnostic["inventory"]["baseline_diagnostics_requested_mode_count"], 24)
+            self.assertEqual(diagnostic["inventory"]["check_requested_mode_count"], 48)
+            self.assertEqual(diagnostic["inventory"]["check_diagnostics_requested_mode_count"], 48)
+            self.assertEqual(len(diagnostic["inventory"]["per_sample"]), 7)
+            self.assertTrue(all(item["baseline_selected_target_count"] == 8
+                                for item in diagnostic["inventory"]["per_sample"]))
+            self.assertTrue(all(item["check_published_mode_count"] == 8
+                                and item["check_quality_admitted_positive_frequency_mode_count"] == 8
+                                for item in diagnostic["inventory"]["per_sample"]))
+            check_evidence = json.loads((case_dir / gate.EVIDENCE_RELATIVE_PATH).read_text(encoding="utf-8"))
+            check_spectrum_descriptor_hash = check_evidence["convergence"]["mode_count"]["runs"]["check"]["artifacts"]["spectrum"]["sha256"]
+            baseline_spectrum_descriptor_hash = check_evidence["convergence"]["mode_count"]["runs"]["baseline"]["artifacts"]["spectrum"]["sha256"]
+            self.assertEqual(diagnostic["spectrum_bindings"]["check"]["sha256"], check_spectrum_descriptor_hash)
+            self.assertEqual(diagnostic["spectrum_bindings"]["baseline"]["sha256"], baseline_spectrum_descriptor_hash)
+            self.assertEqual(len(diagnostic["field_match"]["samples"]), 7)
+            self.assertTrue(all(sample["status"] == "pass" for sample in diagnostic["field_match"]["samples"]))
+
+    def test_convergence_field_match_uses_fields_across_swapped_raw_ids_and_rejects_orthogonal_loss(self):
+        for check_source_raw, expected_status in (({0: 1, 1: 0}, "pass"), ({0: 1}, "not_verified")):
+            with self.subTest(check_source_raw=check_source_raw), tempfile.TemporaryDirectory() as directory:
+                case_dir = _make_case(Path(directory), "c1")
+                _install_cross_run_field_inputs(case_dir, check_source_raw=check_source_raw)
+                report = gate.validate_case(case_dir, "c1", parameters_path=PARAMETERS, kpath_path=KPATH)
+                check = report["checks"]["mode_count_convergence"]
+                diagnostic = check["cross_run_field_match"]
+                self.assertEqual(check["numeric_status"], "pass", report["reasons"][:12])
+                self.assertEqual(check["physical_identity_status"], "not_verified")
+                self.assertEqual(diagnostic["status"], expected_status, diagnostic["reasons"])
+                if expected_status == "pass":
+                    first_sample = diagnostic["field_match"]["samples"][0]
+                    pairs = first_sample["assignment"]["assigned_pairs"]
+                    raw_mapping = {
+                        pair["left_raw_mode_indices"][0]: pair["right_raw_mode_indices"][0]
+                        for pair in pairs
+                    }
+                    self.assertEqual(raw_mapping[0], 1)
+                    self.assertEqual(raw_mapping[1], 0)
+                else:
+                    self.assertTrue(any("overlap_floor" in reason for reason in diagnostic["field_match"]["samples"][0]["reasons"]))
+
+    def test_convergence_field_match_rejects_loader_metadata_hash_rebound(self):
+        from comsol_tracking_fields import load_tracking_fields as actual_load_tracking_fields
+
+        with tempfile.TemporaryDirectory() as directory:
+            case_dir = _make_case(Path(directory), "c1")
+            _install_cross_run_field_inputs(case_dir)
+            calls = 0
+
+            def loader_with_rebound_metadata(*args, **kwargs):
+                nonlocal calls
+                context = actual_load_tracking_fields(*args, **kwargs)
+                calls += 1
+                if calls == 2:
+                    metadata_path = Path(args[0]) / "metadata.json"
+                    modified_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    modified_metadata["test_unrelated_metadata_marker"] = "same physical context, new bound document"
+                    modified_bytes = json.dumps(
+                        modified_metadata, sort_keys=True, separators=(",", ":"),
+                    ).encode("utf-8")
+                    rebound_digest = "sha256:" + hashlib.sha256(modified_bytes).hexdigest()
+                    file_hashes = [dict(entry) for entry in context["file_hashes"]]
+                    metadata_entries = [entry for entry in file_hashes if entry.get("path") == "metadata.json"]
+                    self.assertEqual(len(metadata_entries), 1)
+                    metadata_entries[0]["sha256"] = rebound_digest
+                    context = dict(context)
+                    context["file_hashes"] = file_hashes
+                return context
+
+            with mock.patch("comsol_tracking_fields.load_tracking_fields", side_effect=loader_with_rebound_metadata):
+                report = gate.validate_case(case_dir, "c1", parameters_path=PARAMETERS, kpath_path=KPATH)
+
+            check = report["checks"]["mode_count_convergence"]
+            diagnostic = check["cross_run_field_match"]
+            self.assertEqual(calls, 2)
+            self.assertEqual(check["numeric_status"], "pass", report["reasons"][:12])
+            self.assertEqual(diagnostic["status"], "fail")
+            self.assertTrue(any("metadata hash differs from numeric bundle descriptor" in reason
+                                for reason in diagnostic["reasons"]))
+            self.assertEqual(diagnostic["physical_identity_status"], "not_verified")
+
+    def test_convergence_field_match_fails_closed_on_mesh_change_and_missing_field_bytes(self):
+        for change in ("mesh", "missing_vector"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                case_dir = _make_case(Path(directory), "c1")
+                _install_cross_run_field_inputs(case_dir, check_mesh_shift=change == "mesh")
+                section = json.loads((case_dir / gate.EVIDENCE_RELATIVE_PATH).read_text(encoding="utf-8"))["convergence"]["mode_count"]
+                check_root = case_dir / section["runs"]["check"]["root"]
+                if change == "missing_vector":
+                    (check_root / "eigen/mode_fields/sample_0000/mode_0000/vector.bin").unlink()
+                report = gate.validate_case(case_dir, "c1", parameters_path=PARAMETERS, kpath_path=KPATH)
+                check = report["checks"]["mode_count_convergence"]
+                diagnostic = check["cross_run_field_match"]
+                self.assertNotEqual(diagnostic["status"], "pass")
+                self.assertEqual(diagnostic["physical_identity_status"], "not_verified")
+                if change == "mesh":
+                    self.assertTrue(any("topology fingerprints differ" in reason for reason in diagnostic["reasons"]))
+                else:
+                    self.assertEqual(check["numeric_status"], "pass", report["reasons"][:12])
+                    self.assertTrue(any("phase certificate failed" in reason for reason in diagnostic["reasons"]))
 
     def test_signed_k_missing_evidence_is_a1_not_verified_and_c0_not_applicable(self):
         a1 = gate._validate_signed_k_replay(

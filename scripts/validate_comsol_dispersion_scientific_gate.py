@@ -4570,10 +4570,364 @@ def _validate_convergence_path(bundle, primary, label, reasons):
 
 
 _CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON = (
-    "Cross-run physical mode identity is NOT VERIFIED: the gate has no independently "
-    "replayed, hash-bound mode-field matcher and no validated policy for identical- or cross-mesh matching. "
-    "Equal run-local branch_id and frequency are numeric diagnostics, not physical identity."
+    "Cross-run physical mode identity is NOT VERIFIED: field-similarity replay is "
+    "diagnostic-only until policy, physics applicability, and complete expected inventories "
+    "are independently established. Equal run-local branch_id and frequency are numeric "
+    "diagnostics, not physical identity."
 )
+
+
+def _cross_run_field_not_verified(reason: str, *, inventory=None, policy=None) -> dict[str, Any]:
+    return {
+        "status": "not_verified",
+        "diagnostic_only": True,
+        "qualification": "NOT VERIFIED",
+        "physical_identity_status": "not_verified",
+        "policy": policy,
+        "inventory": inventory or {},
+        "reasons": [reason],
+        "field_match": None,
+    }
+
+
+def _cross_run_cluster_map(value: object, sample_indices: set[int], label: str) -> dict[int, list[list[int]]]:
+    if not isinstance(value, list):
+        raise ValueError(f"cross_run_fields.{label} must be a list of sample/group entries")
+    result: dict[int, list[list[int]]] = {}
+    for index, entry in enumerate(value):
+        if not isinstance(entry, Mapping) or set(entry) != {"sample_index", "groups"}:
+            raise ValueError(f"cross_run_fields.{label}[{index}] must contain only sample_index and groups")
+        sample = entry.get("sample_index")
+        groups = entry.get("groups")
+        if type(sample) is not int or sample < 0 or sample in result:
+            raise ValueError(f"cross_run_fields.{label}[{index}] has an invalid or duplicate sample_index")
+        if not isinstance(groups, list) or not groups:
+            raise ValueError(f"cross_run_fields.{label}[{index}].groups must be a non-empty list")
+        normalized: list[list[int]] = []
+        for group_index, group in enumerate(groups):
+            if not isinstance(group, list) or not group:
+                raise ValueError(f"cross_run_fields.{label}[{index}].groups[{group_index}] must be non-empty")
+            if any(type(raw) is not int or raw < 0 for raw in group):
+                raise ValueError(f"cross_run_fields.{label}[{index}].groups[{group_index}] has an invalid raw mode ID")
+            normalized.append(list(group))
+        result[sample] = normalized
+    if set(result) != sample_indices:
+        raise ValueError(f"cross_run_fields.{label} sample coverage differs from the comparison samples")
+    return result
+
+
+def _cross_run_comparison_raw_mode(
+    bundle: Mapping[str, Any], sample_index: int, branch_id: int, label: str,
+) -> int:
+    branches = bundle.get("branches", {}).get("branches") if isinstance(bundle.get("branches"), Mapping) else None
+    if not isinstance(branches, list):
+        raise ValueError(f"{label} branches are unavailable for a run-local comparison selector")
+    branch_matches = [branch for branch in branches if isinstance(branch, Mapping) and branch.get("branch_id") == branch_id]
+    if len(branch_matches) != 1 or not isinstance(branch_matches[0].get("points"), list):
+        raise ValueError(f"{label} comparison selector does not resolve to exactly one local branch")
+    points = [point for point in branch_matches[0]["points"]
+              if isinstance(point, Mapping) and point.get("sample_index") == sample_index]
+    if len(points) != 1:
+        raise ValueError(f"{label} comparison selector does not resolve to exactly one sample point")
+    raw = points[0].get("raw_mode_index")
+    if type(raw) is not int or raw < 0:
+        raise ValueError(f"{label} selected branch point has no valid raw_mode_index")
+    modes = bundle.get("spectrum", {}).get("samples") if isinstance(bundle.get("spectrum"), Mapping) else None
+    sample_matches = [sample for sample in modes or []
+                      if isinstance(sample, Mapping) and sample.get("sample_index") == sample_index]
+    if len(sample_matches) != 1 or not isinstance(sample_matches[0].get("modes"), list):
+        raise ValueError(f"{label} comparison sample is absent or duplicated in its spectrum")
+    raw_matches = [mode for mode in sample_matches[0]["modes"]
+                   if isinstance(mode, Mapping) and mode.get("raw_mode_index") == raw]
+    if len(raw_matches) != 1:
+        raise ValueError(f"{label} run-local branch selector does not resolve to one published raw mode")
+    point_frequency = points[0].get("frequency_real_hz", points[0].get("frequency_hz"))
+    mode_frequency = raw_matches[0].get("frequency_real_hz", raw_matches[0].get("frequency_hz"))
+    if not _finite_positive(point_frequency) or not _finite_positive(mode_frequency) or abs(
+        float(point_frequency) - float(mode_frequency)
+    ) > 1.0e-9 * max(1.0, abs(float(point_frequency)), abs(float(mode_frequency))):
+        raise ValueError(f"{label} selected branch point frequency differs from its published raw mode")
+    return raw
+
+
+def _cross_run_bundle_artifact(descriptor: object, logical: str) -> tuple[str, str]:
+    if not isinstance(descriptor, Mapping):
+        raise ValueError("cross-run numeric descriptor is missing")
+    root = descriptor.get("root")
+    artifacts = descriptor.get("artifacts")
+    if not isinstance(root, str) or not root or not isinstance(artifacts, Mapping):
+        raise ValueError("cross-run numeric descriptor lacks root/artifacts")
+    spec = artifacts.get(logical)
+    if not isinstance(spec, Mapping):
+        raise ValueError(f"cross-run descriptor is missing {logical} artifact binding")
+    relative = spec.get("path", f"{root.rstrip('/')}/{ {'metadata': 'metadata.json', 'spectrum': 'eigen/spectrum.v2.json', 'branches': 'eigen/branches.v2.json'}[logical] }")
+    digest = spec.get("sha256")
+    if not isinstance(relative, str) or not relative or not isinstance(digest, str) or len(digest) != 64 \
+            or any(character not in "0123456789abcdef" for character in digest):
+        raise ValueError(f"cross-run {logical} artifact binding is malformed")
+    return relative, digest
+
+
+def _cross_run_field_match_diagnostic(
+    case_dir: Path,
+    section: Mapping[str, Any],
+    left: Mapping[str, Any],
+    right: Mapping[str, Any],
+    left_descriptor: object,
+    right_descriptor: object,
+    comparisons: list[Any],
+    case: str,
+) -> dict[str, Any]:
+    """Replay optional hash-bound same-mesh field matching without changing numeric rows."""
+    supplied = section.get("cross_run_fields")
+    if supplied is None:
+        return _cross_run_field_not_verified("convergence section has no explicit cross_run_fields evidence")
+    if not isinstance(supplied, Mapping) or set(supplied) != {
+        "policy", "baseline_clusters", "check_clusters",
+    }:
+        return _cross_run_field_not_verified(
+            "cross_run_fields must contain only policy, baseline_clusters, and check_clusters"
+        )
+
+    policy = supplied.get("policy")
+    if not isinstance(policy, Mapping) or set(policy) != {
+        "overlap_floor", "ambiguity_tolerance", "degeneration_relative_tolerance",
+    }:
+        return _cross_run_field_not_verified("cross_run_fields.policy is missing explicit matcher thresholds")
+    floor = policy.get("overlap_floor")
+    ambiguity = policy.get("ambiguity_tolerance")
+    degeneration = policy.get("degeneration_relative_tolerance")
+    if not all(_finite(value) for value in (floor, ambiguity, degeneration)) \
+            or float(floor) <= 0.0 or float(floor) > 1.0 \
+            or float(ambiguity) < 0.0 or float(degeneration) < 0.0:
+        return _cross_run_field_not_verified("cross_run_fields.policy thresholds are outside the matcher's explicit domain")
+    normalized_policy = {
+        "overlap_floor": float(floor),
+        "ambiguity_tolerance": float(ambiguity),
+        "degeneration_relative_tolerance": float(degeneration),
+    }
+
+    sample_indices = set(EXPECTED_CONTROL_SAMPLES if case in PATH_CASES else (0,))
+    expected_per_sample = EXPECTED_TARGET_BANDS if case in PATH_CASES else 1
+    expected_pairs = {
+        (sample, band)
+        for sample in sample_indices
+        for band in range(expected_per_sample)
+    }
+    selected_raw: dict[int, list[int]] = {sample: [] for sample in sample_indices}
+    selection_errors: list[str] = []
+    observed_pairs: set[tuple[int, int]] = set()
+    for index, comparison in enumerate(comparisons):
+        if not isinstance(comparison, Mapping):
+            selection_errors.append(f"comparison {index} is not an object")
+            continue
+        sample, band = comparison.get("sample_index"), comparison.get("branch_id")
+        if type(sample) is not int or type(band) is not int:
+            selection_errors.append(f"comparison {index} has no integer sample/selector")
+            continue
+        pair = (sample, band)
+        if pair not in expected_pairs or pair in observed_pairs:
+            selection_errors.append(f"comparison {index} is outside or duplicates the expected target inventory")
+            continue
+        observed_pairs.add(pair)
+        try:
+            selected_raw[sample].append(
+                _cross_run_comparison_raw_mode(left, sample, band, "baseline")
+            )
+        except (ValueError, TypeError, KeyError, IndexError) as error:
+            selection_errors.append(str(error))
+    if observed_pairs != expected_pairs or any(
+        len(raws) != expected_per_sample or len(set(raws)) != expected_per_sample
+        for raws in selected_raw.values()
+    ):
+        selection_errors.append("baseline comparison selectors do not resolve to the complete unique target inventory")
+
+    left_quality = left.get("_quality_admitted_mode_map")
+    right_quality = right.get("_quality_admitted_mode_map")
+    if not isinstance(left_quality, Mapping) or not isinstance(right_quality, Mapping):
+        selection_errors.append("numeric bundle quality-admitted mode maps are unavailable")
+        left_quality, right_quality = {}, {}
+    left_selections = sorted(
+        (sample, raw)
+        for sample, raws in selected_raw.items()
+        for raw in raws
+        if (sample, raw) in left_quality
+    )
+    if len(left_selections) != sum(len(raws) for raws in selected_raw.values()):
+        selection_errors.append("a selected baseline target is not quality-admitted with a positive published frequency")
+    right_selections = sorted(
+        (sample, raw)
+        for sample in sample_indices
+        for candidate_sample, raw in right_quality
+        if candidate_sample == sample
+    )
+
+    def sample_counts(bundle: Mapping[str, Any], quality: Mapping[Any, Any], sample_index: int) -> dict[str, Any]:
+        samples = bundle.get("spectrum", {}).get("samples") if isinstance(bundle.get("spectrum"), Mapping) else None
+        matches = [item for item in samples or []
+                   if isinstance(item, Mapping) and item.get("sample_index") == sample_index]
+        published_modes = matches[0].get("modes") if len(matches) == 1 else None
+        published_count = len(published_modes) if isinstance(published_modes, list) else 0
+        quality_count = sum(1 for candidate_sample, _raw in quality if candidate_sample == sample_index)
+        return {
+            "published_mode_count": published_count,
+            "quality_admitted_positive_frequency_mode_count": quality_count,
+        }
+
+    left_requested = _bundle_identity(left, "mode_count")
+    right_requested = _bundle_identity(right, "mode_count")
+    inventory = {
+        "target_samples": sorted(sample_indices),
+        "target_count_per_sample": expected_per_sample,
+        "baseline_requested_mode_count": left_requested[0] if isinstance(left_requested, tuple) else None,
+        "baseline_diagnostics_requested_mode_count": left_requested[1] if isinstance(left_requested, tuple) and len(left_requested) > 1 else None,
+        "check_requested_mode_count": right_requested[0] if isinstance(right_requested, tuple) else None,
+        "check_diagnostics_requested_mode_count": right_requested[1] if isinstance(right_requested, tuple) and len(right_requested) > 1 else None,
+        "per_sample": [],
+    }
+    for sample in sorted(sample_indices):
+        left_counts = sample_counts(left, left_quality, sample)
+        right_counts = sample_counts(right, right_quality, sample)
+        inventory["per_sample"].append({
+            "sample_index": sample,
+            "baseline_selected_target_count": len(selected_raw[sample]),
+            "baseline_selected_quality_admitted_count": sum((sample, raw) in left_quality for raw in selected_raw[sample]),
+            **{f"baseline_{name}": value for name, value in left_counts.items()},
+            "check_candidate_count": right_counts["quality_admitted_positive_frequency_mode_count"],
+            **{f"check_{name}": value for name, value in right_counts.items()},
+        })
+
+    if selection_errors:
+        return _cross_run_field_not_verified(
+            "; ".join(selection_errors), inventory=inventory, policy=normalized_policy,
+        )
+    if not left_selections or not right_selections:
+        return _cross_run_field_not_verified(
+            "cross-run field selection produced an empty quality-admitted inventory",
+            inventory=inventory, policy=normalized_policy,
+        )
+
+    try:
+        baseline_metadata_path, baseline_metadata_hash = _cross_run_bundle_artifact(left_descriptor, "metadata")
+        baseline_spectrum_path, baseline_spectrum_hash = _cross_run_bundle_artifact(left_descriptor, "spectrum")
+        check_metadata_path, check_metadata_hash = _cross_run_bundle_artifact(right_descriptor, "metadata")
+        check_spectrum_path, check_spectrum_hash = _cross_run_bundle_artifact(right_descriptor, "spectrum")
+        left_root_value = left_descriptor.get("root") if isinstance(left_descriptor, Mapping) else None
+        right_root_value = right_descriptor.get("root") if isinstance(right_descriptor, Mapping) else None
+        left_root = _safe_relative_path(case_dir, left_root_value, "cross_run_fields.baseline.root", [], directory=True)
+        right_root = _safe_relative_path(case_dir, right_root_value, "cross_run_fields.check.root", [], directory=True)
+        if left_root is None or right_root is None:
+            raise ValueError("cross-run field bundle root is unavailable")
+        expected_left_metadata = f"{str(left_root_value).rstrip('/')}/metadata.json"
+        expected_right_metadata = f"{str(right_root_value).rstrip('/')}/metadata.json"
+        if baseline_metadata_path != expected_left_metadata or check_metadata_path != expected_right_metadata:
+            raise ValueError("load_tracking_fields requires the exact descriptor-bound root metadata.json")
+
+        baseline_clusters = _cross_run_cluster_map(
+            supplied["baseline_clusters"], sample_indices, "baseline_clusters",
+        )
+        check_clusters = _cross_run_cluster_map(
+            supplied["check_clusters"], sample_indices, "check_clusters",
+        )
+        from comsol_tracking_fields import load_tracking_fields
+        from comsol_cross_run_matching import match_cross_run_modes
+
+        left_fields = load_tracking_fields(left_root, left_selections, phase_tolerance=MAX_PHASE_RESIDUAL)
+        right_fields = load_tracking_fields(right_root, right_selections, phase_tolerance=MAX_PHASE_RESIDUAL)
+
+        def bind_loaded_metadata_hash(context: Mapping[str, Any], expected_hash: str, label: str) -> None:
+            file_hashes = context.get("file_hashes")
+            if not isinstance(file_hashes, list):
+                raise ValueError(f"{label} field loader did not return certificate file hashes")
+            metadata_entries = [
+                entry for entry in file_hashes
+                if isinstance(entry, Mapping) and entry.get("path") == "metadata.json"
+            ]
+            if len(metadata_entries) != 1:
+                raise ValueError(f"{label} field loader must return exactly one metadata.json hash")
+            if metadata_entries[0].get("sha256") != f"sha256:{expected_hash}":
+                raise ValueError(f"{label} field loader metadata hash differs from numeric bundle descriptor")
+
+        bind_loaded_metadata_hash(left_fields, baseline_metadata_hash, "baseline")
+        bind_loaded_metadata_hash(right_fields, check_metadata_hash, "check")
+
+        def bind_loaded_modes(bundle: Mapping[str, Any], context: Mapping[str, Any], selected: list[tuple[int, int]], label: str) -> None:
+            spectrum = bundle.get("spectrum")
+            samples = spectrum.get("samples") if isinstance(spectrum, Mapping) else None
+            if not isinstance(samples, list):
+                raise ValueError(f"{label} hash-bound spectrum samples are unavailable")
+            sample_map = {item.get("sample_index"): item for item in samples if isinstance(item, Mapping)}
+            context_modes = context.get("modes")
+            if not isinstance(context_modes, Mapping) or set(context_modes) != set(selected):
+                raise ValueError(f"{label} loaded field identity set differs from its explicit selection")
+            for sample_index, raw in selected:
+                sample = sample_map.get(sample_index)
+                modes = sample.get("modes") if isinstance(sample, Mapping) else None
+                candidates = [item for item in modes or []
+                              if isinstance(item, Mapping) and item.get("raw_mode_index") == raw]
+                if len(candidates) != 1:
+                    raise ValueError(f"{label} selected field is absent or duplicated in bound spectrum")
+                spectrum_mode = candidates[0]
+                loaded_mode = context_modes[(sample_index, raw)]
+                if not _finite_positive(loaded_mode.get("frequency_real_hz")) \
+                        or not _finite(loaded_mode.get("frequency_imag_hz")):
+                    raise ValueError(f"{label} loaded field lacks finite complex frequency metadata")
+                real = spectrum_mode.get("frequency_real_hz", spectrum_mode.get("frequency_hz"))
+                imaginary = spectrum_mode.get("frequency_imag_hz")
+                if not _finite_positive(real) or not _finite(imaginary) \
+                        or abs(float(loaded_mode["frequency_real_hz"]) - float(real)) > 1.0e-9 * max(1.0, abs(float(real))) \
+                        or abs(float(loaded_mode["frequency_imag_hz"]) - float(imaginary)) > 1.0e-9 * max(1.0, abs(float(imaginary))):
+                    raise ValueError(f"{label} loaded field frequency differs from its quality-admitted bound spectrum")
+                sample_k = sample.get("k_vector")
+                loaded_k = loaded_mode.get("k_vector_rad_per_m")
+                if not isinstance(sample_k, list) or len(sample_k) != 3 or not all(_finite(item) for item in sample_k) \
+                        or not isinstance(loaded_k, (list, tuple)) or tuple(float(item) for item in sample_k) != tuple(float(item) for item in loaded_k):
+                    raise ValueError(f"{label} loaded field signed k differs from its bound spectrum")
+
+        bind_loaded_modes(left, left_fields, left_selections, "baseline")
+        bind_loaded_modes(right, right_fields, right_selections, "check")
+        match = match_cross_run_modes(
+            left_fields,
+            right_fields,
+            left_clusters=baseline_clusters,
+            right_clusters=check_clusters,
+            overlap_floor=normalized_policy["overlap_floor"],
+            ambiguity_tolerance=normalized_policy["ambiguity_tolerance"],
+            degeneration_relative_tolerance=normalized_policy["degeneration_relative_tolerance"],
+        )
+        return {
+            "status": match.get("status") if match.get("status") == "pass" else "not_verified",
+            "diagnostic_only": True,
+            "qualification": "NOT VERIFIED",
+            "physical_identity_status": "not_verified",
+            "policy": normalized_policy,
+            "inventory": inventory,
+            "spectrum_bindings": {
+                "baseline": {"path": baseline_spectrum_path, "sha256": baseline_spectrum_hash},
+                "check": {"path": check_spectrum_path, "sha256": check_spectrum_hash},
+            },
+            "field_match": match,
+            "reasons": list(match.get("reasons", [])) if isinstance(match.get("reasons"), list) else [],
+        }
+    except (OSError, ValueError, TypeError, KeyError, IndexError, OverflowError, RuntimeError, AttributeError) as error:
+        message = str(error)
+        status = "not_verified" if any(token in message.lower() for token in ("mesh", "metric", "topology", "signed k")) else "fail"
+        return {
+            "status": status,
+            "diagnostic_only": True,
+            "qualification": "NOT VERIFIED",
+            "physical_identity_status": "not_verified",
+            "policy": normalized_policy,
+            "inventory": inventory,
+            "spectrum_bindings": {
+                "baseline": {"path": baseline_spectrum_path, "sha256": baseline_spectrum_hash}
+                if "baseline_spectrum_path" in locals() else None,
+                "check": {"path": check_spectrum_path, "sha256": check_spectrum_hash}
+                if "check_spectrum_path" in locals() else None,
+            },
+            "field_match": None,
+            "reasons": [f"cross-run field evidence could not be replayed: {message}"],
+        }
 
 
 def _validate_convergence_pair(
@@ -4754,11 +5108,22 @@ def _validate_convergence_pair(
     )
     physical_identity_status = "not_verified"
     status = numeric_status if numeric_status != "pass" else physical_identity_status
+    cross_run_field_match = _cross_run_field_match_diagnostic(
+        case_dir,
+        section,
+        left,
+        right,
+        runs.get(left_name),
+        runs.get(right_name),
+        comparisons,
+        case,
+    )
     return _new_check(
         status,
         numeric_status=numeric_status,
         physical_identity_status=physical_identity_status,
         physical_identity_reason=_CROSS_RUN_IDENTITY_NOT_VERIFIED_REASON,
+        cross_run_field_match=cross_run_field_match,
         relative_changes=changes,
         comparison_count=len(comparisons),
         expected_comparison_count=len(expected_pairs),
