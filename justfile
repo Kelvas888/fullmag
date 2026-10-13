@@ -549,6 +549,10 @@ verify-antenna-microstrip-stations-browser:
 verify-antenna-drive-editor-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3265 --scenario antenna-drive-editor
 
+# Production Object material scope/ACK lifecycle with controlled HTTP.
+verify-object-material-editor-browser:
+    {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3266 --scenario object-material-editor
+
 # Production transport draft/conflict lifecycle; controlled HTTP, no native solve.
 verify-antenna-transport-drafts-browser:
     {{storage_python}} "{{repo_root}}/scripts/verify_pinned_dataset_browser.py" --repo-root "{{repo_root}}" --port 3254 --scenario antenna-transport-drafts

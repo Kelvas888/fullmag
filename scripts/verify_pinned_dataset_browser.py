@@ -24,6 +24,7 @@ from verify_control_room_sources import fingerprint, timestamp
 PROFILE = "windows-control-room-browser-fixture"
 BROWSER_CHANNEL = "chrome" if os.name == "nt" else None
 SCENARIOS = {
+    "object-material-editor": ("smoke-object-material-editor.mjs", "fullmag_object_material_editor_browser_fixture_v1", "object-material-editor", "FULLMAG_OBJECT_MATERIAL_EDITOR"),
     "antenna-drive-editor": ("smoke-antenna-drive-editor.mjs", "fullmag_antenna_drive_editor_browser_fixture_v1", "antenna-drive-editor", "FULLMAG_ANTENNA_DRIVE_EDITOR"),
     "antenna-source-spectrum": ("smoke-antenna-source-spectrum.mjs", "fullmag_antenna_source_spectrum_browser_fixture_v1", "antenna-source-spectrum", "FULLMAG_ANTENNA_SOURCE_SPECTRUM"),
     "antenna-port-editor": ("smoke-antenna-port-editor.mjs", "fullmag_antenna_port_editor_browser_fixture_v1", "antenna-port-editor", "FULLMAG_ANTENNA_PORT_EDITOR"),
@@ -85,6 +86,8 @@ def port_is_open(port: int):
 def run(repo: Path, port: int, scenario: str = "pinned-dataset"):
     if scenario not in SCENARIOS:
         raise storage.StorageError("Unknown fixed browser fixture scenario")
+    if scenario == "object-material-editor" and port != 3266:
+        raise storage.StorageError("Object material editor browser fixture uses fixed port 3266")
     if scenario == "antenna-drive-editor" and port != 3265:
         raise storage.StorageError("Antenna drive editor browser fixture uses fixed port 3265")
     if scenario == "antenna-port-editor" and port != 3264:
