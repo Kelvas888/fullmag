@@ -1339,6 +1339,8 @@ interface Viewport3DFrameProps
     | "moveToolObjectId"
     | "onOrbitDebugAnglesChange"
     | "onMoveCommit"
+    | "onBeginGesture"
+    | "onMoveGestureActiveChange"
     | "onVisualizationFrameCommitted"
     | "orbitDebugAngles"
     | "orbitDebugCommitRevision"
@@ -2828,6 +2830,8 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
             onInspectClear={clearInspectHover}
             onInspectSample={updateInspectHover}
             onMoveCommit={moveInteraction.commitMove}
+            onBeginGesture={moveInteraction.onBeginGesture}
+            onMoveGestureActiveChange={moveInteraction.onGestureActiveChange}
             moveToolObjectId={moveInteraction.moveToolObjectId}
             moveDraftResetRevision={moveInteraction.moveDraftResetRevision}
             onVisualizationFrameCommitted={onVisualizationFrameCommitted}

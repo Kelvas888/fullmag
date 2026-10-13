@@ -48,6 +48,110 @@ describe("MoveObjectGizmo", () => {
     expect(onDraftChange).toHaveBeenLastCalledWith(null);
   });
 
+  it("does not capture or publish a preview when the session rejects a gesture reservation", () => {
+    const onBeginGesture = vi.fn(() => false);
+    const onDraftChange = vi.fn();
+    const onGestureActiveChange = vi.fn();
+    const capture = vi.fn();
+    const onCommit = vi.fn();
+    const controller = createMoveGestureController({
+      baseRevision: 12,
+      objectId: "pending-magnet",
+      onBeginGesture,
+      onCommit,
+      onDraftChange,
+      onGestureActiveChange,
+      origin: [0, 0, 0],
+    });
+
+    controller.begin("x", 13, [0, 0, 0], capture, vi.fn());
+    controller.move(13, [2e-9, 0, 0]);
+
+    expect(onBeginGesture).toHaveBeenCalledOnce();
+    expect(capture).not.toHaveBeenCalled();
+    expect(onDraftChange).not.toHaveBeenCalled();
+    expect(onGestureActiveChange).not.toHaveBeenCalled();
+    expect(onCommit).not.toHaveBeenCalled();
+  });
+
+  it("releases a reservation after pointer capture throws and permits the next gesture", async () => {
+    let reserved = false;
+    const onBeginGesture = vi.fn(() => {
+      if (reserved) return false;
+      reserved = true;
+      return true;
+    });
+    const onGestureActiveChange = vi.fn((active: boolean) => { if (!active) reserved = false; });
+    const onDraftChange = vi.fn();
+    const onCommit = vi.fn().mockResolvedValue(true);
+    const release = vi.fn();
+    const controller = createMoveGestureController({
+      baseRevision: 12,
+      objectId: "capture-magnet",
+      onBeginGesture,
+      onGestureActiveChange,
+      onDraftChange,
+      onCommit,
+      origin: [0, 0, 0],
+    });
+    expect(() => controller.begin("x", 1, [0, 0, 0], () => { throw new Error("capture rejected"); }, release)).not.toThrow();
+    controller.move(1, [2e-9, 0, 0]);
+    await controller.end(1);
+    expect(reserved).toBe(false);
+    expect(onGestureActiveChange).toHaveBeenCalledExactlyOnceWith(false);
+    expect(onDraftChange).not.toHaveBeenCalled();
+    expect(onCommit).not.toHaveBeenCalled();
+    expect(release).not.toHaveBeenCalled();
+    controller.begin("x", 2, [0, 0, 0], vi.fn(), release);
+    controller.move(2, [3e-9, 0, 0]);
+    await controller.end(2);
+    expect(onBeginGesture).toHaveBeenCalledTimes(2);
+    expect(onCommit).toHaveBeenCalledOnce();
+    expect(reserved).toBe(false);
+  });
+
+  it("reserves before capture, ignores a duplicate pointer, and releases before staging", async () => {
+    const events: string[] = [];
+    const onBeginGesture = vi.fn(() => {
+      events.push("reserved");
+      return true;
+    });
+    const onCommit = vi.fn(() => {
+      events.push("stage");
+      return true;
+    });
+    const onDraftChange = vi.fn();
+    const onGestureActiveChange = vi.fn((active: boolean) => {
+      events.push(active ? "orbit-blocked" : "reservation-released");
+    });
+    const capture = vi.fn(() => events.push("capture"));
+    const release = vi.fn(() => events.push("capture-released"));
+    const duplicateCapture = vi.fn();
+    const controller = createMoveGestureController({
+      baseRevision: 13,
+      objectId: "gesture-magnet",
+      onBeginGesture,
+      onCommit,
+      onDraftChange,
+      onGestureActiveChange,
+      origin: [0, 0, 0],
+    });
+
+    controller.begin("x", 14, [0, 0, 0], capture, release);
+    controller.begin("y", 14, [0, 0, 0], duplicateCapture, vi.fn());
+    controller.move(14, [4e-9, 0, 0]);
+    await controller.end(14);
+
+    expect(onBeginGesture).toHaveBeenCalledOnce();
+    expect(capture).toHaveBeenCalledOnce();
+    expect(duplicateCapture).not.toHaveBeenCalled();
+    expect(release).toHaveBeenCalledOnce();
+    expect(onGestureActiveChange.mock.calls).toEqual([[true], [false]]);
+    expect(events.indexOf("reserved")).toBeLessThan(events.indexOf("capture"));
+    expect(events.indexOf("reservation-released")).toBeLessThan(events.indexOf("stage"));
+    expect(onDraftChange).toHaveBeenLastCalledWith(null);
+  });
+
   it("preserves the final draft when the commit reports a revision conflict", async () => {
     const onDraftChange = vi.fn();
     const controller = createMoveGestureController({
@@ -125,11 +229,13 @@ describe("MoveObjectGizmo", () => {
     const onDraftChange = vi.fn();
     const onCommit = vi.fn();
     const onGestureActiveChange = vi.fn();
+    const onBeginGesture = vi.fn(() => true);
     const release = vi.fn();
     const controller = createMoveGestureController({
       baseRevision: 9,
       objectId: "magnet-y",
       onCommit,
+      onBeginGesture,
       onDraftChange,
       onGestureActiveChange,
       origin: [0, 0, 0],
@@ -143,6 +249,7 @@ describe("MoveObjectGizmo", () => {
     expect(release).toHaveBeenCalledOnce();
     expect(release).toHaveBeenCalledWith(2);
     expect(onDraftChange).toHaveBeenLastCalledWith(null);
+    expect(onBeginGesture).toHaveBeenCalledOnce();
     expect(onGestureActiveChange.mock.calls).toEqual([[true], [false]]);
     expect(onCommit).not.toHaveBeenCalled();
   });
@@ -154,10 +261,12 @@ describe("MoveObjectGizmo", () => {
       const release = vi.fn();
       const onDraftChange = vi.fn();
       const onGestureActiveChange = vi.fn();
+      const onBeginGesture = vi.fn(() => true);
       const controller = createMoveGestureController({
         baseRevision: 9,
         objectId: "lifecycle-magnet",
         onCommit,
+        onBeginGesture,
         onDraftChange,
         onGestureActiveChange,
         origin: [0, 0, 0],
@@ -183,6 +292,7 @@ describe("MoveObjectGizmo", () => {
 
       expect(release).toHaveBeenCalledOnce();
       expect(onDraftChange).toHaveBeenLastCalledWith(null);
+      expect(onBeginGesture).toHaveBeenCalledOnce();
       expect(onGestureActiveChange.mock.calls).toEqual([[true], [false]]);
       expect(onCommit).not.toHaveBeenCalled();
       cleanup();

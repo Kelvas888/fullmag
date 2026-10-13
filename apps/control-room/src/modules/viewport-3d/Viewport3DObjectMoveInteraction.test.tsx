@@ -66,7 +66,7 @@ describe("viewport object move staged draft", () => {
 
       await activateMove(fixture, SCENE_A_41);
       const axis = moveAxis(mounted.container, "x", "magnet-a");
-      const release = installPointerCapture(axis);
+      const { release } = installPointerCapture(axis);
       await act(async () => {
         axis.dispatchEvent(pointerEvent("pointerdown", 7, [0, 0, 0]));
         axis.dispatchEvent(pointerEvent("pointermove", 7, [4e-9, 0, 0]));
@@ -110,6 +110,154 @@ describe("viewport object move staged draft", () => {
         draft: null,
         identity: null,
       });
+      expect(fixture.commitTransaction).not.toHaveBeenCalled();
+      expect(fixture.invalidate).not.toHaveBeenCalled();
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("blocks pointer capture and preview while a same-scope Apply is pending", async () => {
+    const fixture = createFixture();
+    selectObject(fixture.selection, "magnet-a");
+    const mounted = await hydrateFixture(fixture);
+    try {
+      await activateMove(fixture, SCENE_A_41);
+      const baseDraft = resolveCommittedGeometryObjectDraft(SCENE_A_41, "magnet-a");
+      if (!baseDraft) throw new Error("Expected canonical test object draft");
+      const identity = fixture.objectEditSession.activate({
+        objectId: "magnet-a",
+        sessionScopeKey: SESSION_A_SCOPE_KEY,
+        targetKey: geometryObjectEditSessionTargetKey(SESSION_A_SCOPE_KEY, baseDraft),
+      }, baseDraft);
+      let pendingApply: ReturnType<typeof fixture.objectEditSession.beginApply> = null;
+      act(() => {
+        pendingApply = fixture.objectEditSession.beginApply(identity);
+      });
+      expect(pendingApply).not.toBeNull();
+      const pendingSnapshot = fixture.objectEditSession.getSnapshot();
+      const beginGesture = vi.spyOn(fixture.objectEditSession, "beginGesture");
+      const axis = moveAxis(mounted.container, "x", "magnet-a");
+      const { capture, release } = installPointerCapture(axis);
+
+      await act(async () => {
+        axis.dispatchEvent(pointerEvent("pointerdown", 31, [0, 0, 0]));
+        axis.dispatchEvent(pointerEvent("pointermove", 31, [4e-9, 0, 0]));
+        axis.dispatchEvent(pointerEvent("pointerup", 31, [4e-9, 0, 0]));
+        await Promise.resolve();
+      });
+
+      expect(beginGesture).toHaveBeenCalledWith(SESSION_A_SCOPE_KEY, "magnet-a");
+      expect(capture).not.toHaveBeenCalled();
+      expect(release).not.toHaveBeenCalled();
+      expect(fixture.objectEditSession.hasActiveGesture(SESSION_A_SCOPE_KEY)).toBe(false);
+      expect(fixture.objectEditSession.getSnapshot()).toMatchObject({
+        applyOperationId: pendingApply?.id,
+        draft: pendingSnapshot.draft,
+        editVersion: pendingSnapshot.editVersion,
+      });
+      expect(surface(mounted.container).getAttribute("data-orbit-blocked")).toBe("false");
+      expect(fixture.commitTransaction).not.toHaveBeenCalled();
+      expect(fixture.invalidate).not.toHaveBeenCalled();
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("blocks Apply during a gesture, then stages pointerup locally and releases the reservation", async () => {
+    const fixture = createFixture();
+    selectObject(fixture.selection, "magnet-a");
+    const mounted = await hydrateFixture(fixture);
+    try {
+      const baseDraft = resolveCommittedGeometryObjectDraft(SCENE_A_41, "magnet-a");
+      if (!baseDraft) throw new Error("Expected canonical test object draft");
+      const identity = fixture.objectEditSession.activate({
+        objectId: "magnet-a",
+        sessionScopeKey: SESSION_A_SCOPE_KEY,
+        targetKey: geometryObjectEditSessionTargetKey(SESSION_A_SCOPE_KEY, baseDraft),
+      }, baseDraft);
+      act(() => {
+        fixture.objectEditSession.updateDraft(identity, (draft) => ({
+          ...draft,
+          length: "7e-9",
+        }));
+      });
+      await activateMove(fixture, SCENE_A_41);
+
+      const beginGesture = vi.spyOn(fixture.objectEditSession, "beginGesture");
+      const endGesture = vi.spyOn(fixture.objectEditSession, "endGesture");
+      const axis = moveAxis(mounted.container, "x", "magnet-a");
+      const { capture, release } = installPointerCapture(axis);
+      let blockedApply: ReturnType<typeof fixture.objectEditSession.beginApply> = null;
+      await act(async () => {
+        axis.dispatchEvent(pointerEvent("pointerdown", 32, [0, 0, 0]));
+        blockedApply = fixture.objectEditSession.beginApply(identity);
+        axis.dispatchEvent(pointerEvent("pointermove", 32, [4e-9, 0, 0]));
+        axis.dispatchEvent(pointerEvent("pointerup", 32, [4e-9, 0, 0]));
+        await Promise.resolve();
+      });
+
+      expect(blockedApply).toBeNull();
+      expect(beginGesture).toHaveBeenCalledOnce();
+      expect(endGesture).toHaveBeenCalledWith(beginGesture.mock.results[0]?.value);
+      expect(fixture.objectEditSession.hasActiveGesture(SESSION_A_SCOPE_KEY)).toBe(false);
+      expect(capture).toHaveBeenCalledWith(32);
+      expect(release).toHaveBeenCalledWith(32);
+      expect(fixture.objectEditSession.getSnapshot()).toMatchObject({
+        dirty: true,
+        draft: {
+          length: "7e-9",
+          objectId: "magnet-a",
+          translation: ["5e-9", "0", "0"],
+        },
+      });
+      expect(surface(mounted.container).getAttribute("data-orbit-blocked")).toBe("false");
+      expect(fixture.commitTransaction).not.toHaveBeenCalled();
+      expect(fixture.invalidate).not.toHaveBeenCalled();
+
+      let nextApply: ReturnType<typeof fixture.objectEditSession.beginApply> = null;
+      act(() => {
+        nextApply = fixture.objectEditSession.beginApply(identity);
+      });
+      expect(nextApply).not.toBeNull();
+    } finally {
+      await mounted.cleanup();
+    }
+  });
+
+  it("ignores a duplicate pointer, releases on cancel, and admits a newer gesture", async () => {
+    const fixture = createFixture();
+    selectObject(fixture.selection, "magnet-a");
+    const mounted = await hydrateFixture(fixture);
+    try {
+      await activateMove(fixture, SCENE_A_41);
+      const beginGesture = vi.spyOn(fixture.objectEditSession, "beginGesture");
+      const endGesture = vi.spyOn(fixture.objectEditSession, "endGesture");
+      const axis = moveAxis(mounted.container, "x", "magnet-a");
+      const { capture, release } = installPointerCapture(axis);
+
+      await act(async () => {
+        axis.dispatchEvent(pointerEvent("pointerdown", 41, [0, 0, 0]));
+        axis.dispatchEvent(pointerEvent("pointerdown", 41, [0, 0, 0]));
+        axis.dispatchEvent(pointerEvent("pointercancel", 41, [0, 0, 0]));
+        await Promise.resolve();
+      });
+      expect(beginGesture).toHaveBeenCalledOnce();
+      expect(endGesture).toHaveBeenCalledWith(beginGesture.mock.results[0]?.value);
+      expect(fixture.objectEditSession.hasActiveGesture(SESSION_A_SCOPE_KEY)).toBe(false);
+
+      await act(async () => {
+        axis.dispatchEvent(pointerEvent("pointerdown", 43, [0, 0, 0]));
+        axis.dispatchEvent(pointerEvent("pointercancel", 43, [0, 0, 0]));
+        await Promise.resolve();
+      });
+
+      expect(beginGesture).toHaveBeenCalledTimes(2);
+      expect(endGesture).toHaveBeenCalledTimes(2);
+      expect(endGesture).toHaveBeenNthCalledWith(2, beginGesture.mock.results[1]?.value);
+      expect(fixture.objectEditSession.hasActiveGesture(SESSION_A_SCOPE_KEY)).toBe(false);
+      expect(capture).toHaveBeenCalledTimes(2);
+      expect(release).toHaveBeenCalledTimes(2);
       expect(fixture.commitTransaction).not.toHaveBeenCalled();
       expect(fixture.invalidate).not.toHaveBeenCalled();
     } finally {
@@ -312,10 +460,11 @@ function pointerEvent(
 }
 
 function installPointerCapture(element: TestElement) {
+  const capture = vi.fn();
   const release = vi.fn();
   Object.assign(element, {
     releasePointerCapture: release,
-    setPointerCapture: vi.fn(),
+    setPointerCapture: capture,
   });
-  return release;
+  return { capture, release };
 }

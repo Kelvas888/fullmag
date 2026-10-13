@@ -40,6 +40,7 @@ interface MoveGestureControllerOptions {
   baseRevision: number;
   objectId: string;
   onCommit: MoveCommitHandler;
+  onBeginGesture?: () => boolean;
   onDraftChange: (draft: MoveDraft | null) => void;
   onGestureActiveChange?: (active: boolean) => void;
   origin: Translation3;
@@ -49,6 +50,7 @@ export function createMoveGestureController({
   baseRevision,
   objectId,
   onCommit,
+  onBeginGesture,
   onDraftChange,
   onGestureActiveChange,
   origin,
@@ -74,11 +76,16 @@ export function createMoveGestureController({
       setPointerCapture: (pointerId: number) => void,
       releasePointerCapture: (pointerId: number) => void,
     ): void {
-      if (isMoveCommitPending(onCommit)) return;
-      if (active) cancelActive(false);
+      if (active || isMoveCommitPending(onCommit)) return;
+      if (onBeginGesture && !onBeginGesture()) return;
+      try {
+        setPointerCapture(pointerId);
+      } catch {
+        if (onBeginGesture) onGestureActiveChange?.(false);
+        return;
+      }
       active = { axis, pointerId, releasePointerCapture, start: [...point] };
       translation = [...origin];
-      setPointerCapture(pointerId);
       onGestureActiveChange?.(true);
       publish();
     },
@@ -137,12 +144,14 @@ export function MoveObjectGizmo({
   baseRevision,
   object,
   onCommit,
+  onBeginGesture,
   onDraftChange,
   onGestureActiveChange,
 }: {
   baseRevision: number;
   object: Viewport3DPrimitiveObject;
   onCommit: MoveGestureControllerOptions["onCommit"];
+  onBeginGesture?: () => boolean;
   onDraftChange?: (draft: MoveDraft | null) => void;
   onGestureActiveChange?: (active: boolean) => void;
 }) {
@@ -157,6 +166,7 @@ export function MoveObjectGizmo({
         baseRevision,
         objectId: object.objectId,
         origin: [originX, originY, originZ],
+        onBeginGesture,
         onCommit,
         onDraftChange: (next) => {
           setDraft(next);
@@ -168,6 +178,7 @@ export function MoveObjectGizmo({
       baseRevision,
       object.objectId,
       onCommit,
+      onBeginGesture,
       onDraftChange,
       onGestureActiveChange,
       originX,
@@ -255,6 +266,7 @@ export function Viewport3DMoveToolLayer({
   moveDraftResetRevision,
   moveToolObjectId,
   onCommit,
+  onBeginGesture,
   onGestureActiveChange,
   primitiveModel,
   selectedObjectId,
@@ -262,6 +274,7 @@ export function Viewport3DMoveToolLayer({
   moveDraftResetRevision: number;
   moveToolObjectId: string | null;
   onCommit: MoveGestureControllerOptions["onCommit"];
+  onBeginGesture?: () => boolean;
   onGestureActiveChange?: (active: boolean) => void;
   primitiveModel: Viewport3DPrimitiveRenderModel | null;
   selectedObjectId: string | null;
@@ -282,6 +295,7 @@ export function Viewport3DMoveToolLayer({
           baseRevision={primitiveModel.sceneRevision as number}
           object={object}
           onCommit={onCommit}
+          onBeginGesture={onBeginGesture}
           onGestureActiveChange={onGestureActiveChange}
         />
       </group>

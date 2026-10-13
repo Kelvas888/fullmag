@@ -59,3 +59,17 @@ Bieżący etap nie zamyka całego R0/R1; audyt pozostaje w dokumentacji PR150.
   kombinacji identity + geometry i nowszych zmian po create ACK.
 - Unit/DOM, browser Object/Airbox/WebGL oraz rzeczywiste API/runtime pozostają
   NOT VERIFIED dla tego etapu. Nie zamyka on reszty audytu R0/R1.
+
+## Checkpoint — gesty viewportu
+
+- Kontroler i komendy zapisane w 53ea1b4bb8d507408f554370da5c1106497d0f37.
+- MoveObjectGizmo rezerwuje gest przed pointer capture/preview. Pointerup,
+  cancel, lost capture i cleanup zwalniają dokładny token; dopiero potem
+  pointerup aktualizuje lokalny kernel-owned draft. Gest odrzucony nie tworzy
+  preview ani mutacji. Pending write blokuje ponownie commitMove.
+- Prop jest przekazany przez Viewport3DModule, Viewport3DScene i model layer
+  stack. Review wykrył brak destructuring w stacku; poprawiono przed zapisem.
+- Dodano pure/DOM regresje odmowy, duplicate pointer, cancel, capture error,
+  zwalniania przed staging i pointerup bez HTTP. Lokalnie nie uruchomiono.
+- Scope review viewportu: jedna P1 poprawiona; wykonanie i browser/WebGL
+  NOT VERIFIED. Następny dowód musi użyć produkcyjnego canvas/ścieżki Apply.
