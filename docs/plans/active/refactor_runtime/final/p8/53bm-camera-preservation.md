@@ -190,3 +190,29 @@ poprawce przeszła: `4d5cb65a806c4521b49ef378bd4803d8`, exit 0, PASS.
 Nie poprawiano zamrożonej kapsuły ani nie pomijano jej kontroli.
 Próba restartu wymaga nowego pakietu zawierającego poprawiony frontend;
 wynik natywnego restartu z zachowaniem kamery nadal NOT VERIFIED.
+
+### Kolejny pakiet i próba przeglądarkowa
+
+Równoległy build workspace zakończył się `completed`, exit 0,
+`2026-10-13T19:18:23.012310+00:00`. Jego kapsuła
+`b7717905b6f3ccd0f9a77a36a2f1f7c0a0b3bbd016d938e3e3a455e00d4eb6ac`
+zawiera poprawiony guard compute inventory i poprawkę ownera kamery.
+SHA-256 manifestu:
+`f72044f8f8ecb465504db38eec79850e1fb32564e23b73716cc088cc478d286b`;
+snapshot źródeł:
+`30ad419872263b72330c5d54f6c6d72007453ef5b64d88c5ff1df37637a23aef`.
+API SHA-256:
+`d40f262ac4e29e5e75d9511ac4c710cbed227da21df1b94605984c84872e24e5`.
+
+Próba `7b9184b3b1a4452dbe359867c0d98245` przeszła typecheck i lint
+zamrożonego frontendu (oba exit 0) i udostępniła prywatny browser-ready.
+Przez Chrome utworzono projekt i pudełko; canvas był widoczny,
+`context_lost=false`, drawing buffer 1183×518 oraz 1183×565.
+Nie wykonano restartu ani capture kamery. Odczyty gotowości następnie
+utraciły potwierdzenie (`readiness_observation_unconfirmed`), a sterowanie
+Chrome kończyło się timeoutem. Nie ustalono wspólnej przyczyny tych zdarzeń.
+
+Próba jest terminalnie FAILED, exit 1; wszystkie 19 procesów ma
+`waited=true`. Nie należy ponawiać jej jako żywego procesu ani uznawać za
+PASS. Diagnoza obserwacji gotowości i rzeczywisty restart kamery pozostają
+otwarte; żadna sesja użytkownika na 3197 nie została zatrzymana.
