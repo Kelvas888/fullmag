@@ -2382,7 +2382,7 @@ mod tests {
         let pool = serial_test_pool(&stop_fixture.0);
         let cancel = Arc::new(AtomicBool::new(false));
         let calls = Cell::new(0usize);
-        let mut pause_then_stop = move |_: Option<&super::ProcessAdmissionEventV1>| {
+        let mut pause_then_stop = |_: Option<&super::ProcessAdmissionEventV1>| {
             let call = calls.get();
             calls.set(call + 1);
             if call == 0 {
