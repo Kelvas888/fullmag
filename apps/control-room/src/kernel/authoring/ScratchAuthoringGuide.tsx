@@ -24,7 +24,7 @@ export function ScratchAuthoringGuide({
   const checks = readiness.data ? toChecklist(readiness.data) : [];
   const incompleteCount = checks.filter((check) => check.state !== "complete").length;
   const extraBlockers = readiness.data
-    ? readiness.data.blockers.filter(
+    ? Array.from(new Set(readiness.data.blockers)).filter(
         (blocker) =>
           !checks.some(
             (check) =>
@@ -119,7 +119,7 @@ export function ScratchAuthoringGuide({
               aria-label="Model readiness checklist"
               className="m-0 grid max-h-[36vh] list-none gap-2 overflow-y-auto overscroll-contain p-0 md:grid-cols-2 xl:grid-cols-3"
             >
-              {checks.map((check, index) => {
+              {checks.map((check) => {
                 const resolvedAction = resolveScratchAuthoringAction(check);
                 const canEditWhenComplete =
                   ["method", "domain", "study", "execution"].includes(check.id) ||
@@ -143,7 +143,7 @@ export function ScratchAuthoringGuide({
                     className="flex min-w-0 items-start justify-between gap-3 rounded-md border border-fm-border bg-fm-base px-3 py-2"
                     data-check-id={check.id}
                     data-check-state={check.state}
-                    key={`${check.id}:${index}`}
+                    key={check.id}
                   >
                     <div className="min-w-0">
                       <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
@@ -205,10 +205,10 @@ export function ScratchAuthoringGuide({
                 Additional server blockers
               </h3>
               <ul className="m-0 grid list-none gap-2 p-0">
-                {extraBlockers.map((blocker, index) => (
+                {extraBlockers.map((blocker) => (
                   <li
                     className="flex flex-wrap items-center justify-between gap-2 text-sm text-fm-secondary"
-                    key={`${blocker}:${index}`}
+                    key={blocker}
                   >
                     <span>{blocker}</span>
                     <Button
