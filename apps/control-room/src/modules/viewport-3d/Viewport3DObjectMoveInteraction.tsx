@@ -7,11 +7,11 @@ import { useObjectMoveTool } from "@/kernel/authoring/ObjectMoveToolController";
 import { useObjectEditSelector } from "@/kernel/authoring/object-edit/useObjectEditSelector";
 import type { ObjectTranslation } from "@/kernel/authoring/objectTranslationMutation";
 import {
-  formatObjectEditNumber,
   geometryDraftTranslationEquals,
   geometryObjectEditSessionTargetKey,
   resolveCommittedGeometryObjectDraft,
 } from "@/kernel/authoring/object-edit/objectEditDraftModel";
+import { updateQuantityFieldSI } from "@/kernel/authoring/object-edit/quantityDraftFields";
 import type { GeometryObjectDraft } from "@/kernel/authoring/object-edit/objectEditTypes";
 import { useSceneResource } from "@/kernel/resources/geometryLifecycleResources";
 import {
@@ -371,12 +371,10 @@ export function useViewport3DObjectMoveInteraction({
         return true;
       }
 
-      const nextTranslation: GeometryObjectDraft["translation"] = [
-        formatObjectEditNumber(translation[0]),
-        formatObjectEditNumber(translation[1]),
-        formatObjectEditNumber(translation[2]),
-      ];
-      const nextDraft = { ...currentDraft, translation: nextTranslation };
+      const withMoveTranslation = (draft: GeometryObjectDraft) =>
+        ([0, 1, 2] as const).reduce((next, axis) =>
+          updateQuantityFieldSI(next, `translation.${axis}`, translation[axis]), draft);
+      const nextDraft = withMoveTranslation(currentDraft);
       if (geometryDraftTranslationEquals(currentDraft, nextDraft)) {
         setMoveStatus({
           error: null,
@@ -390,10 +388,7 @@ export function useViewport3DObjectMoveInteraction({
         kernel.objectEditSession.hasPendingWrite(fence.sessionScopeKey)
       ) return true;
 
-      const updated = kernel.objectEditSession.updateDraft(identity, (draft) => ({
-        ...draft,
-        translation: nextTranslation,
-      }));
+      const updated = kernel.objectEditSession.updateDraft(identity, withMoveTranslation);
       if (!updated) {
         reportError("The object draft changed before the move could be staged. Try the move again.");
         return true;

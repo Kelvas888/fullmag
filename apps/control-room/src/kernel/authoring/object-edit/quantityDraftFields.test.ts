@@ -8,6 +8,7 @@ import {
   parseDraftQuantityField,
   setRawQuantityField,
   updateRawQuantityField,
+  updateQuantityFieldSI,
 } from "./quantityDraftFields";
 
 function draft(overrides: Partial<GeometryObjectDraft> = {}): GeometryObjectDraft {
@@ -63,6 +64,17 @@ describe("quantityDraftFields", () => {
     if (!meterChange.ok) return;
     expect(Number(getRawQuantityField(meterChange.draft, "size.0"))).toBeCloseTo(1e-7, 22);
     expect(parseDraftQuantityField(meterChange.draft, "size.0").parsedSI).toBeCloseTo(1e-7, 22);
+  });
+
+  it("stages gesture SI in the translation axis's selected unit", () => {
+    const original = draft({ translation: ["20", "0", "0"], quantityFields: {
+      "translation.0": { unit: "nm", lastValidSI: 20e-9 },
+    } });
+    const moved = updateQuantityFieldSI(original, "translation.0", 35e-9);
+    expect(Number(moved.translation[0])).toBeCloseTo(35, 12);
+    expect(moved.quantityFields?.["translation.0"]?.unit).toBe("nm");
+    expect(parseDraftQuantityField(moved, "translation.0").parsedSI).toBeCloseTo(35e-9, 22);
+    expect(original.translation[0]).toBe("20");
   });
 
   it("changes only the selected field's unit and raw representation", () => {

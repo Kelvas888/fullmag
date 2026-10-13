@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { ControlRoomApiError } from "@/kernel/api/ControlRoomApi";
 
 import type { Selection } from "@/kernel/selection/selectionTypes";
+import { parseDraftQuantityField } from "@/kernel/authoring/object-edit/quantityDraftFields";
 
 import {
   buildGeometryDraftPatch,
@@ -16,6 +17,22 @@ import {
   rebaseGeometryObjectDraft,
   summarizeGeometryValidationMessages,
 } from "./geometryObjectPanelModel";
+import { geometryDraftLengthValuesEqual } from "@/kernel/authoring/object-edit/objectEditDraftModel";
+
+function expectLengthClose(actual: number | null | undefined, expected: number): void {
+  expect(typeof actual).toBe("number");
+  if (typeof actual === "number") {
+    expect(geometryDraftLengthValuesEqual(actual, expected)).toBe(true);
+  }
+}
+
+function expectLengthVectorClose(
+  actual: readonly number[] | null | undefined,
+  expected: readonly number[],
+): void {
+  expect(actual).toHaveLength(expected.length);
+  expected.forEach((value, index) => expectLengthClose(actual?.[index], value));
+}
 
 const baseSelection: Selection = {
   kind: "object.root",
@@ -115,6 +132,57 @@ describe("resolveGeometryObjectPanelModel", () => {
       size: ["1.2e-7", "6e-8", baseline.size[2]],
       translation: ["1e-8", "2e-8", baseline.translation[2]],
     });
+  });
+
+  it("rebases lengths by SI per axis while retaining local raw text and selected units", () => {
+    const baseline = resolveGeometryObjectDraft(baseSelection, {
+      objects: [{
+        geometry: {
+          geometry_kind: "Box",
+          geometry_params: { size: [1e-7, 1e-7, 1e-8] },
+        },
+        id: "box",
+        transform: { translation: [1e-7, 0, 0] },
+      }],
+      revision: 12,
+    });
+    const local = {
+      ...baseline,
+      quantityFields: {
+        "size.0": { unit: "nm" as const, lastValidSI: 1e-7 },
+        "size.1": { unit: "um" as const, lastValidSI: 3e-7 },
+        "translation.0": { unit: "um" as const, lastValidSI: 1e-7 },
+      },
+      size: ["100", "0.3", baseline.size[2]] as [string, string, string],
+      translation: ["0.1", "0", "0"] as [string, string, string],
+    };
+    const target = {
+      ...baseline,
+      baseRevision: 13,
+      size: ["2e-7", "2e-7", baseline.size[2]] as [string, string, string],
+      translation: ["2e-7", "0", "0"] as [string, string, string],
+    };
+
+    const rebased = rebaseGeometryObjectDraft(local, target, baseline);
+
+    expect(rebased.baseRevision).toBe(13);
+    expect(Number(rebased.size[0])).toBeCloseTo(200, 12);
+    expect(rebased.quantityFields?.["size.0"]).toEqual({
+      unit: "nm",
+      lastValidSI: 2e-7,
+    });
+    expect(rebased.size[1]).toBe("0.3");
+    expect(rebased.quantityFields?.["size.1"]).toEqual({
+      unit: "um",
+      lastValidSI: 3e-7,
+    });
+    expect(Number(rebased.translation[0])).toBeCloseTo(0.2, 12);
+    expect(rebased.quantityFields?.["translation.0"]).toEqual({
+      unit: "um",
+      lastValidSI: 2e-7,
+    });
+    expect(parseDraftQuantityField(rebased, "size.0").parsedSI).toBeCloseTo(2e-7, 22);
+    expect(parseDraftQuantityField(rebased, "translation.0").parsedSI).toBeCloseTo(2e-7, 22);
   });
 
   it("rejects empty strings as required instead of converting to 0", () => {
@@ -478,18 +546,145 @@ describe("resolveGeometryObjectPanelModel", () => {
       translation: ["-10 nm", "1e-8", "0"] as [string, string, string],
     };
 
-    expect(resolvePrimitiveDraft(edited)).toEqual({
-      dimensions: [1e-7, 2e-7, 3e-8],
-      errors: {},
-      kind: "Box",
-      translation: [-1e-8, 1e-8, 0],
-    });
-    expect(buildGeometryDraftPatch(edited)).toEqual({
-      error: null,
-      geometry: {
-        geometry_kind: "Box",
-        geometry_params: { size: [1e-7, 2e-7, 3e-8] },
+    const preview = resolvePrimitiveDraft(edited);
+    expect(preview.errors).toEqual({});
+    expect(preview.kind).toBe("Box");
+    expectLengthVectorClose(preview.dimensions, [1e-7, 2e-7, 3e-8]);
+    expectLengthVectorClose(preview.translation, [-1e-8, 1e-8, 0]);
+
+    const geometry = buildGeometryDraftPatch(edited);
+    expect(geometry.error).toBeNull();
+    expect(geometry.geometry).toMatchObject({ geometry_kind: "Box" });
+    const geometryParams = geometry.geometry?.geometry_params as { size?: number[] } | undefined;
+    expectLengthVectorClose(geometryParams?.size, [1e-7, 2e-7, 3e-8]);
+  });
+
+  it("uses selected units for raw lengths in preview and SI payloads", () => {
+    const draft = resolveGeometryObjectDraft(
+      { ...baseSelection, kind: "builder.primitive", nodeId: "geometry:draft:box", objectId: null, ref: null },
+      { objects: [], revision: 12 },
+    );
+    const edited = {
+      ...draft,
+      quantityFields: {
+        "size.0": { unit: "nm" as const, lastValidSI: 1e-7 },
+        "size.1": { unit: "um" as const, lastValidSI: 2e-7 },
+        "size.2": { unit: "nm" as const, lastValidSI: 3e-8 },
+        "translation.0": { unit: "um" as const, lastValidSI: -1e-8 },
+        "translation.2": { unit: "nm" as const, lastValidSI: 0 },
       },
+      size: ["100", "0.2", "30"] as [string, string, string],
+      translation: ["-0.01", "1e-8", "0"] as [string, string, string],
+    };
+
+    const preview = resolvePrimitiveDraft(edited);
+    expect(preview.errors).toEqual({});
+    expectLengthVectorClose(preview.dimensions, [1e-7, 2e-7, 3e-8]);
+    expectLengthVectorClose(preview.translation, [-1e-8, 1e-8, 0]);
+
+    const geometry = buildGeometryDraftPatch(edited);
+    expect(geometry.error).toBeNull();
+    expect(geometry.geometry).toMatchObject({ geometry_kind: "Box" });
+    const params = geometry.geometry?.geometry_params as { size?: number[] } | undefined;
+    expectLengthVectorClose(params?.size, [1e-7, 2e-7, 3e-8]);
+    const transform = buildTransformDraftPatch(edited);
+    expect(transform.error).toBeNull();
+    expectLengthVectorClose(
+      transform.transform?.translation as number[] | undefined,
+      [-1e-8, 1e-8, 0],
+    );
+  });
+
+  it("parses all ArchWaveguide scalar lengths in their selected units", () => {
+    const selection: Selection = {
+      ...baseSelection,
+      label: "Arch waveguide",
+      nodeId: "model:object:box",
+    };
+    const draft = resolveGeometryObjectDraft(selection, {
+      objects: [{
+        geometry: {
+          geometry_kind: "ArchWaveguide",
+          geometry_params: {
+            arch_height: 5e-8,
+            height: 2e-9,
+            length: 2.5e-6,
+            width: 1e-6,
+            z0: -2.5e-8,
+          },
+        },
+        id: "box",
+      }],
+      revision: 4,
+    });
+    const edited = {
+      ...draft,
+      quantityFields: {
+        length: { unit: "nm" as const, lastValidSI: 2.5e-6 },
+        width: { unit: "um" as const, lastValidSI: 1e-6 },
+        height: { unit: "nm" as const, lastValidSI: 2e-9 },
+        archHeight: { unit: "nm" as const, lastValidSI: 5e-8 },
+        z0: { unit: "nm" as const, lastValidSI: -2.5e-8 },
+      },
+      length: "2500",
+      width: "1",
+      height: "2",
+      archHeight: "50",
+      z0: "-25",
+    };
+
+    const geometry = buildGeometryDraftPatch(edited);
+    expect(geometry.error).toBeNull();
+    expect(geometry.geometry).toMatchObject({ geometry_kind: "ArchWaveguide" });
+    const params = geometry.geometry?.geometry_params as
+      | {
+          arch_height?: number;
+          height?: number;
+          length?: number;
+          width?: number;
+          z0?: number;
+        }
+      | undefined;
+    expectLengthClose(params?.length, 2.5e-6);
+    expectLengthClose(params?.width, 1e-6);
+    expectLengthClose(params?.height, 2e-9);
+    expectLengthClose(params?.arch_height, 5e-8);
+    expectLengthClose(params?.z0, -2.5e-8);
+  });
+
+  it("previews the last valid SI value for invalid raw while keeping errors and payloads blocked", () => {
+    const draft = resolveGeometryObjectDraft(
+      { ...baseSelection, kind: "builder.primitive", nodeId: "geometry:draft:box", objectId: null, ref: null },
+      { objects: [], revision: 12 },
+    );
+    const edited = {
+      ...draft,
+      quantityFields: {
+        "size.0": { unit: "nm" as const, lastValidSI: 1e-7 },
+        "size.1": { unit: "nm" as const, lastValidSI: 2e-7 },
+        "size.2": { unit: "nm" as const, lastValidSI: 3e-8 },
+        "translation.0": { unit: "nm" as const, lastValidSI: 7e-9 },
+        "translation.1": { unit: "nm" as const, lastValidSI: 0 },
+        "translation.2": { unit: "nm" as const, lastValidSI: 0 },
+      },
+      size: ["1e-", "200", "30"] as [string, string, string],
+      translation: ["1e-", "0", "0"] as [string, string, string],
+    };
+
+    const preview = resolvePrimitiveDraft(edited);
+    expect(preview.errors).toEqual({
+      "size.0": "Box size X is incomplete.",
+      "translation.0": "Translation X is incomplete.",
+    });
+    expectLengthVectorClose(preview.dimensions, [1e-7, 2e-7, 3e-8]);
+    expectLengthVectorClose(preview.translation, [7e-9, 0, 0]);
+    expect(buildGeometryDraftPatch(edited)).toEqual({
+      error: "Box size 1 is incomplete.",
+      geometry: null,
+    });
+    expect(buildTransformDraftPatch(edited)).toEqual({
+      error: "Translation 1 is incomplete.",
+      transform: null,
     });
   });
 
@@ -500,9 +695,16 @@ describe("resolveGeometryObjectPanelModel", () => {
     );
     const edited = {
       ...draft,
-      height: "0.1 um",
-      radius: "50 nm",
-      translation: ["-10 nm", "20 nm", "30 nm"] as [string, string, string],
+      quantityFields: {
+        radius: { unit: "nm" as const, lastValidSI: 5e-8 },
+        height: { unit: "um" as const, lastValidSI: 1e-7 },
+        "translation.0": { unit: "nm" as const, lastValidSI: -1e-8 },
+        "translation.1": { unit: "nm" as const, lastValidSI: 2e-8 },
+        "translation.2": { unit: "nm" as const, lastValidSI: 3e-8 },
+      },
+      height: "0.1",
+      radius: "50",
+      translation: ["-10", "20", "30"] as [string, string, string],
     };
     const existingTransform = {
       pivot: [1e-9, 2e-9, 3e-9],
@@ -511,22 +713,24 @@ describe("resolveGeometryObjectPanelModel", () => {
       translation: [0, 0, 0],
     };
 
-    expect(buildGeometryDraftPatch(edited)).toEqual({
-      error: null,
-      geometry: {
-        geometry_kind: "Cylinder",
-        geometry_params: { height: 1e-7, radius: 5e-8 },
-      },
+    const geometry = buildGeometryDraftPatch(edited);
+    expect(geometry.error).toBeNull();
+    expect(geometry.geometry).toMatchObject({ geometry_kind: "Cylinder" });
+    const params = geometry.geometry?.geometry_params as
+      | { height?: number; radius?: number }
+      | undefined;
+    expectLengthClose(params?.height, 1e-7);
+    expectLengthClose(params?.radius, 5e-8);
+
+    const transform = buildTransformDraftPatch(edited, existingTransform);
+    expect(transform.error).toBeNull();
+    expect(transform.transform).toMatchObject({
+      pivot: [1e-9, 2e-9, 3e-9],
+      rotation_quat: [0, 0, 0.3826834323650898, 0.9238795325112867],
+      scale: [2, 3, 4],
     });
-    expect(buildTransformDraftPatch(edited, existingTransform)).toEqual({
-      error: null,
-      transform: {
-        pivot: [1e-9, 2e-9, 3e-9],
-        rotation_quat: [0, 0, 0.3826834323650898, 0.9238795325112867],
-        scale: [2, 3, 4],
-        translation: [-1e-8, 2e-8, 3e-8],
-      },
-    });
+    const transformTranslation = transform.transform?.translation as number[] | undefined;
+    expectLengthVectorClose(transformTranslation, [-1e-8, 2e-8, 3e-8]);
   });
 
   it("keeps incomplete lengths out of preview and geometry payloads", () => {

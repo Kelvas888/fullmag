@@ -1,6 +1,8 @@
+import type { ReactNode } from "react";
 import type { GeometryObjectDraft } from "@/kernel/authoring/object-edit/objectEditTypes";
 import { PROBLEM_IR_03_RIGID_TRANSFORM_REASON } from "@/kernel/authoring/objectTranslationMutation";
 
+import { DraftQuantityUnitSelect, type DraftUnitUpdater } from "../primitives/DraftQuantityUnitSelect";
 import { FieldRow } from "../primitives/FieldRow";
 import { InspectorGroup } from "../primitives/InspectorGroup";
 import { Vector3Field } from "../primitives/Vector3Field";
@@ -11,8 +13,10 @@ export function ObjectPlacementPanel({
   draft,
   errors,
   onVectorChange,
+  onUnitChange,
 }: {
   draft: GeometryObjectDraft;
+  onUnitChange: DraftUnitUpdater;
   errors: Readonly<Record<string, string>>;
   onVectorChange: (
     field: PlacementVectorField,
@@ -29,7 +33,10 @@ export function ObjectPlacementPanel({
           errors["translation.2"],
         ]}
         label="Translation"
-        unit="m"
+        unitControls={([0, 1, 2] as const).map((axis) => (
+          <DraftQuantityUnitSelect key={axis} draft={draft} field={`translation.${axis}`}
+            label={`Translation ${["X", "Y", "Z"][axis]}`} onChange={onUnitChange} />
+        )) as [ReactNode, ReactNode, ReactNode]}
         values={draft.translation}
         onChange={(index, value) => onVectorChange("translation", index, value)}
       />

@@ -111,6 +111,44 @@ describe("GeometryObjectPanel primitive transaction", () => {
     mocks.refetch.mockImplementation(() => undefined);
   });
 
+  it("keeps unit-only changes local and blocks only the invalid field's unit selector", async () => {
+    mocks.sceneResource.data = { revision: 12, objects: [committedObject("unit-box", "Unit box")] };
+    const dom = installSimulationPreparationTestDom();
+    const container = dom.document.createElement("div");
+    const { createRoot } = await import("react-dom/client");
+    const root = createRoot(container as unknown as Element);
+    try {
+      await act(async () => root.render(<InspectorEditSessionProvider>
+        <GeometryObjectPanel selection={committedSelection("unit-box", "Unit box")} />
+        <InspectorSessionProbe />
+      </InspectorEditSessionProvider>));
+      const selector = findElements(container, (element) =>
+        element.tagName === "SELECT" && element.getAttribute("aria-label") === "Size X unit")[0];
+      expect(selector).toBeTruthy();
+      await act(async () => {
+        selector.value = "nm";
+        selector.dispatchEvent(new TestEvent("change", { bubbles: true }));
+      });
+      expect(Number(findInput(container, "Size X").value)).toBeCloseTo(100, 10);
+      expect(mocks.objectEditSession!.getSnapshot().draft?.quantityFields?.["size.0"]?.unit).toBe("nm");
+      expect(findButton(container, "Global Apply").disabled).toBe(true);
+      expect(mocks.commitTransaction).not.toHaveBeenCalled();
+      expect(mocks.recordHistory).not.toHaveBeenCalled();
+      await act(async () => changeInput(container, "Size X", "1e-"));
+      expect(findInput(container, "Size X").value).toBe("1e-");
+      expect(selector.disabled).toBe(true);
+      const otherSelector = findElements(container, (element) =>
+        element.tagName === "SELECT" && element.getAttribute("aria-label") === "Size Y unit")[0];
+      expect(otherSelector.disabled).toBe(false);
+      expect(findInput(container, "Size Y").disabled).toBe(false);
+      expect(findButton(container, "Global Apply").disabled).toBe(true);
+      expect(mocks.objectEditSession!.getSnapshot().draft?.quantityFields?.["size.0"]?.lastValidSI).toBeCloseTo(1e-7, 22);
+    } finally {
+      await act(async () => root.unmount());
+      dom.restore();
+    }
+  });
+
   it("pins the write and drops local history effects when the session changes before ACK", async () => {
     let finishCommit: ((value: unknown) => void) | null = null;
     const commitResult = new Promise((resolve) => {
@@ -162,9 +200,9 @@ describe("GeometryObjectPanel primitive transaction", () => {
       objects: [{ id: "new-box" }],
       revision: 13,
     };
-    mocks.commitTransaction.mockResolvedValueOnce({
-      committed_scene: after,
-      scene_revision: 13,
+    mocks.commitTransaction.mockImplementationOnce(async (request) => {
+      after.objects[0]!.id = request.object_id;
+      return { committed_scene: after, scene_revision: 13 };
     });
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
@@ -319,10 +357,10 @@ describe("GeometryObjectPanel primitive transaction", () => {
   });
 
   it("acknowledges a dirty primitive before the selection guard reads its form", async () => {
-    mocks.commitTransaction.mockResolvedValueOnce({
-      committed_scene: { objects: [{ id: "new-box" }], revision: 13 },
+    mocks.commitTransaction.mockImplementationOnce(async (request) => ({
+      committed_scene: { objects: [{ id: request.object_id }], revision: 13 },
       scene_revision: 13,
-    });
+    }));
     const activeFormRef = { current: null as ReturnType<typeof useInspectorEditSession> };
     function CaptureForm() {
       const form = useInspectorEditSession();
@@ -363,10 +401,10 @@ describe("GeometryObjectPanel primitive transaction", () => {
       .mockRejectedValueOnce(
         new ControlRoomApiError("scene changed", 409, "request-1", "revision_conflict"),
       )
-      .mockResolvedValueOnce({
-        committed_scene: { objects: [{ id: "dirty-box" }], revision: 14 },
+      .mockImplementationOnce(async (request) => ({
+        committed_scene: { objects: [{ id: request.object_id }], revision: 14 },
         scene_revision: 14,
-      });
+      }));
     const dom = installSimulationPreparationTestDom();
     const container = dom.document.createElement("div");
     const { createRoot } = await import("react-dom/client");

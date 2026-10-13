@@ -1,4 +1,5 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { canonicalDraftInSelectedUnits, changeDraftQuantityUnit, updateRawQuantityField } from "@/kernel/authoring/object-edit/quantityDraftFields";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 
 import type { AuthoringTransactionResponse, JsonObject, SceneResource } from "@/kernel/api/apiTypes";
 import { MODEL_SCENE_PATH } from "@/kernel/api/apiPaths";
@@ -30,6 +31,8 @@ import type { InspectorPanelProps } from "../inspectorTypes";
 import { useRegisterInspectorEditSession } from "../InspectorEditSession";
 import { FeedbackBanner } from "../primitives/FeedbackBanner";
 import { FieldRow } from "../primitives/FieldRow";
+import { DraftQuantityUnitSelect, type DraftUnitUpdater } from "../primitives/DraftQuantityUnitSelect";
+import type { QuantityDraftField } from "@/kernel/authoring/object-edit/objectEditTypes";
 import { FormField } from "../primitives/FormField";
 import { InspectorGroup } from "../primitives/InspectorGroup";
 import { useInspectorActiveTab } from "../InspectorTabState";
@@ -96,32 +99,6 @@ function optionalRef(value: string): string | undefined {
   const trimmed = value.trim();
   return trimmed && trimmed !== "unassigned" ? trimmed : undefined;
 }
-
-function sameDraftFields(
-  left: GeometryObjectDraft,
-  right: GeometryObjectDraft,
-  fields: readonly (keyof GeometryObjectDraft)[],
-): boolean {
-  return fields.every((field) => JSON.stringify(left[field]) === JSON.stringify(right[field]));
-}
-
-function sameDraftValues(left: GeometryObjectDraft, right: GeometryObjectDraft): boolean {
-  return sameDraftFields(left, right, [
-    "archHeight",
-    "geometryKind",
-    "height",
-    "length",
-    "material",
-    "name",
-    "radius",
-    "region",
-    "size",
-    "translation",
-    "width",
-    "z0",
-  ]);
-}
-
 
 function invalidateAuthoringResources(
   resources: ReturnType<typeof useKernel>["resources"],
@@ -230,7 +207,7 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
     // Publishing the same confirmed revision must not normalize that text away.
     const currentDraft = objectEditSession.getSnapshot().draft;
     if (!Number.isFinite(baseDraft.baseRevision) || currentDraft?.baseRevision !== baseDraft.baseRevision) {
-      objectEditSession.refreshCanonical(identity, baseDraft);
+      objectEditSession.refreshCanonical(identity, canonicalDraftInSelectedUnits(baseDraft, currentDraft ?? baseDraft));
     }
   }, [baseDraft, currentSessionScopeKey, objectEditSession, targetKey]);
 
@@ -338,7 +315,12 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
   }
 
   function updateField(field: DraftField, value: string): void {
-    updateDraft((current) => ({ ...current, [field]: value }));
+    updateDraft((current) => {
+      if (field === "name" || field === "notes" || field === "material" || field === "region") {
+        return { ...current, [field]: value };
+      }
+      return updateRawQuantityField(current, field, value);
+    });
   }
 
   function updateVector(
@@ -347,17 +329,31 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
     value: string,
   ): void {
     updateDraft((current) => {
+      if (field === "size" || field === "translation") {
+        return updateRawQuantityField(current, `${field}.${index}`, value);
+      }
       const next = [...current[field]] as [string, string, string];
       next[index] = value;
       return { ...current, [field]: next };
     });
   }
 
+  const updateUnit: DraftUnitUpdater = (field, unit) => {
+    updateDraft((current) => {
+      const result = changeDraftQuantityUnit(current, field, unit);
+      return result.ok ? result.draft : current;
+    });
+  };
+
   const geometryDraftChanged =
     draft.mode === "committed" && !geometryDraftGeometryEquals(draft, baseDraft);
   const transformDraftChanged =
     draft.mode === "committed" && !geometryDraftTranslationEquals(draft, baseDraft);
-  const newObjectDraftChanged = draft.mode === "draft-new" && !sameDraftValues(draft, baseDraft);
+  const newObjectDraftChanged = draft.mode === "draft-new" && (
+    !geometryDraftGeometryEquals(draft, baseDraft) ||
+    !geometryDraftTranslationEquals(draft, baseDraft) ||
+    !objectEditMetadataEquals(draft, baseDraft)
+  );
   const metadataDraftChanged = draft.mode === "committed" && !objectEditMetadataEquals(draft, baseDraft);
   const inspectorDirty = geometryDraftChanged || transformDraftChanged || metadataDraftChanged || newObjectDraftChanged;
   const geometryPatch = buildGeometryDraftPatch(draft);
@@ -480,6 +476,12 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
               submittedDraft,
               createdDraft,
             );
+            // Publish the ACK before selecting its object. A selection render
+            // against the old scene would activate a missing target and reset
+            // edits made while create was pending.
+            publishCommittedSceneResource(resources, created.committed_scene,
+              acknowledgedAuthoringSceneRevision(created), undefined, false,
+              historyContext.sessionScopeKey, api.resourceCacheScope);
             const committedIdentity = objectEditSession.activate({
               objectId,
               sessionScopeKey: historyContext.sessionScopeKey,
@@ -487,7 +489,7 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
                 historyContext.sessionScopeKey,
                 createdDraft,
               ),
-            }, createdDraft);
+            }, rebased.draft);
             if (rebased.dirty) {
               objectEditSession.updateDraft(committedIdentity, () => rebased.draft);
               objectEditSession.setDirty(committedIdentity, rebased.dirty);
@@ -521,7 +523,7 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
       invalidateAuthoringResources(
         resources,
         revision,
-        response.committed_scene,
+        undefined,
         historyContext.sessionScopeKey,
         api.resourceCacheScope,
       );
@@ -692,6 +694,7 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
         operation,
         canonicalDraft,
         reconcileObjectEditAck,
+        { reconcileUnchangedDraft: true },
       );
       if (!acknowledgedCurrentDraft) return false;
       invalidateAuthoringResources(
@@ -748,7 +751,7 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
       objectEditSession.hasPendingWrite(currentSessionScopeKey) ||
       objectEditSession.hasActiveGesture(currentSessionScopeKey)
     ) return;
-    if (editIdentity && !objectEditSession.reset(editIdentity, baseDraft)) return;
+    if (editIdentity && !objectEditSession.reset(editIdentity, canonicalDraftInSelectedUnits(baseDraft, draft))) return;
     setRevisionConflictPhase(null);
     preConflictBaselineRef.current = null;
     setFeedback(null);
@@ -770,6 +773,7 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
           draft={draft}
           errors={primitiveDraft.errors}
           onVectorChange={updateVector}
+          onUnitChange={updateUnit}
         />
       ) : activeTab === "geometry" ? (
         <PrimitiveGeometrySection
@@ -777,6 +781,7 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
           errors={primitiveDraft.errors}
           onFieldChange={updateField}
           onVectorChange={updateVector}
+          onUnitChange={updateUnit}
         />
       ) : (
         <>
@@ -785,14 +790,20 @@ export function GeometryObjectPanel({ selection }: InspectorPanelProps) {
             errors={primitiveDraft.errors}
             onFieldChange={updateField}
             onVectorChange={updateVector}
+            onUnitChange={updateUnit}
           />
           <ObjectPlacementPanel
             draft={draft}
             errors={primitiveDraft.errors}
             onVectorChange={updateVector}
+            onUnitChange={updateUnit}
           />
         </>
       )}
+      {Object.keys(primitiveDraft.errors).length > 0 && draft.quantityFields &&
+        Object.values(draft.quantityFields).some((field) => field && field.lastValidSI !== null) ? (
+        <FeedbackBanner kind="warning" message="Preview retains the last valid values. Complete or revert invalid fields before applying." />
+      ) : null}
       <DraftIdentitySection draft={draft} onFieldChange={updateField} showCommitted={draft.mode === "committed"} />
       <ActionsSection
         draft={draft}
@@ -820,11 +831,13 @@ function PrimitiveGeometrySection({
   errors,
   onFieldChange,
   onVectorChange,
+  onUnitChange,
 }: {
   draft: GeometryObjectDraft;
   errors: Readonly<Record<string, string>>;
   onFieldChange: DraftFieldUpdater;
   onVectorChange: VectorDraftUpdater;
+  onUnitChange: DraftUnitUpdater;
 }) {
   return (
     <InspectorGroup title="Primitive Geometry" collapsible defaultOpen>
@@ -834,6 +847,7 @@ function PrimitiveGeometrySection({
         errors={errors}
         onFieldChange={onFieldChange}
         onVectorChange={onVectorChange}
+        onUnitChange={onUnitChange}
       />
     </InspectorGroup>
   );
@@ -844,11 +858,13 @@ function PrimitiveGeometryFields({
   errors,
   onFieldChange,
   onVectorChange,
+  onUnitChange,
 }: {
   draft: GeometryObjectDraft;
   errors: Readonly<Record<string, string>>;
   onFieldChange: DraftFieldUpdater;
   onVectorChange: VectorDraftUpdater;
+  onUnitChange: DraftUnitUpdater;
 }) {
   const geometryKind = draft.geometryKind.toLowerCase();
   if (geometryKind === "cylinder") {
@@ -858,7 +874,7 @@ function PrimitiveGeometryFields({
           error={errors.radius}
           label="Radius"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="radius" label="Radius" onChange={onUnitChange} />}
           value={draft.radius}
           onChange={(event) => onFieldChange("radius", event.target.value)}
         />
@@ -866,7 +882,7 @@ function PrimitiveGeometryFields({
           error={errors.height}
           label="Height"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="height" label="Height" onChange={onUnitChange} />}
           value={draft.height}
           onChange={(event) => onFieldChange("height", event.target.value)}
         />
@@ -880,7 +896,7 @@ function PrimitiveGeometryFields({
         error={errors.radius}
         label="Radius"
         type="number"
-        unit="m"
+        unitControl={<DraftQuantityUnitSelect draft={draft} field="radius" label="Radius" onChange={onUnitChange} />}
         value={draft.radius}
         onChange={(event) => onFieldChange("radius", event.target.value)}
       />
@@ -893,35 +909,35 @@ function PrimitiveGeometryFields({
         <FormField
           label="Length"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="length" label="Length" onChange={onUnitChange} />}
           value={draft.length}
           onChange={(event) => onFieldChange("length", event.target.value)}
         />
         <FormField
           label="Width"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="width" label="Width" onChange={onUnitChange} />}
           value={draft.width}
           onChange={(event) => onFieldChange("width", event.target.value)}
         />
         <FormField
           label="Height"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="height" label="Height" onChange={onUnitChange} />}
           value={draft.height}
           onChange={(event) => onFieldChange("height", event.target.value)}
         />
         <FormField
           label="Arch height"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="archHeight" label="Arch height" onChange={onUnitChange} />}
           value={draft.archHeight}
           onChange={(event) => onFieldChange("archHeight", event.target.value)}
         />
         <FormField
           label="z0"
           type="number"
-          unit="m"
+          unitControl={<DraftQuantityUnitSelect draft={draft} field="z0" label="z0" onChange={onUnitChange} />}
           value={draft.z0}
           onChange={(event) => onFieldChange("z0", event.target.value)}
         />
@@ -933,7 +949,9 @@ function PrimitiveGeometryFields({
     <DraftVectorFormField
       errors={[errors["size.0"], errors["size.1"], errors["size.2"]]}
       label="Size"
-      unit="m"
+      draft={draft}
+      field="size"
+      onUnitChange={onUnitChange}
       values={draft.size}
       onChange={(index, value) => onVectorChange("size", index, value)}
     />
@@ -1094,12 +1112,18 @@ function DraftVectorFormField({
   onChange,
   unit,
   values,
+  draft,
+  field,
+  onUnitChange,
 }: {
+  draft?: GeometryObjectDraft;
+  field?: "size" | "translation";
+  onUnitChange?: DraftUnitUpdater;
   disabled?: boolean;
   errors?: readonly (string | undefined)[];
   label: string;
   onChange: (index: 0 | 1 | 2, value: string) => void;
-  unit: string;
+  unit?: string;
   values: readonly [string, string, string];
 }) {
   return (
@@ -1108,6 +1132,12 @@ function DraftVectorFormField({
       errors={errors}
       label={label}
       unit={unit}
+      unitControls={draft && field && onUnitChange
+        ? ([0, 1, 2] as const).map((axis) => (
+            <DraftQuantityUnitSelect key={axis} draft={draft} field={`${field}.${axis}` as QuantityDraftField}
+              label={`${label} ${["X", "Y", "Z"][axis]}`} onChange={onUnitChange} />
+          )) as [ReactNode, ReactNode, ReactNode]
+        : undefined}
       values={values}
       onChange={onChange}
     />

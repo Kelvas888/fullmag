@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 
 import type { MeshSharedDomainManifestResource } from "@/kernel/api/apiTypes";
 import {
+  geometryDraftLengthValuesEqual,
   resolveCommittedGeometryObjectDraft,
 } from "@/kernel/authoring/object-edit/objectEditDraftModel";
 import type { Selection } from "@/kernel/selection/selectionTypes";
@@ -192,6 +193,69 @@ describe("viewport3dPrimitiveModel", () => {
         "box",
       ),
     ).toBe(model);
+  });
+
+  it("treats mixed selected-unit translations as an SI no-op", () => {
+    const scene = {
+      objects: [{
+        geometry: {
+          geometry_kind: "Box",
+          geometry_params: { size: [1e-7, 1e-7, 1e-8] },
+        },
+        id: "box",
+        name: "Box",
+        transform: { translation: [1e-7, 0.2e-6, 3e-7] },
+      }],
+      revision: 7,
+    };
+    const model = buildViewport3DPrimitiveRenderModel(scene as never, null);
+    const canonicalDraft = resolveCommittedGeometryObjectDraft(scene as never, "box")!;
+    const selectedUnitsDraft = {
+      ...canonicalDraft,
+      quantityFields: {
+        "translation.0": { unit: "nm" as const, lastValidSI: 1e-7 },
+        "translation.1": { unit: "um" as const, lastValidSI: 0.2e-6 },
+      },
+      translation: ["100", "0.2", "3e-7"] as [string, string, string],
+    };
+
+    expect(
+      withObjectPlacementDraftPreview(model, selectedUnitsDraft, "box"),
+    ).toBe(model);
+    expect(geometryDraftLengthValuesEqual(1.0000000000000001e-7, 1e-7)).toBe(true);
+  });
+
+  it("uses last-valid SI for an invalid raw placement preview", () => {
+    const scene = {
+      objects: [{
+        geometry: {
+          geometry_kind: "Box",
+          geometry_params: { size: [1e-7, 1e-7, 1e-8] },
+        },
+        id: "box",
+        name: "Box",
+        transform: { translation: [1e-8, 2e-8, 3e-8] },
+      }],
+      revision: 7,
+    };
+    const model = buildViewport3DPrimitiveRenderModel(scene as never, null);
+    const canonicalDraft = resolveCommittedGeometryObjectDraft(scene as never, "box")!;
+    const invalidRawDraft = {
+      ...canonicalDraft,
+      quantityFields: {
+        "translation.0": { unit: "nm" as const, lastValidSI: 7e-8 },
+        "translation.1": { unit: "um" as const, lastValidSI: 2e-8 },
+      },
+      translation: ["1e-", "0.02", "3e-8"] as [string, string, string],
+    };
+
+    const preview = withObjectPlacementDraftPreview(model, invalidRawDraft, "box");
+    expect(preview).not.toBe(model);
+    expect(preview?.objects[0]?.translation).toBeDefined();
+    const translation = preview?.objects[0]?.translation;
+    expect(geometryDraftLengthValuesEqual(translation?.[0] ?? NaN, 7e-8)).toBe(true);
+    expect(geometryDraftLengthValuesEqual(translation?.[1] ?? NaN, 2e-8)).toBe(true);
+    expect(geometryDraftLengthValuesEqual(translation?.[2] ?? NaN, 3e-8)).toBe(true);
   });
 
   it.each(["", "1e-", "not-a-number"])(

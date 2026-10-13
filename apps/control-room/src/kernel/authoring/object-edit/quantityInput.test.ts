@@ -17,14 +17,17 @@ describe("parseQuantityInput", () => {
     ["0,1 um", 1e-7],
     ["1e-7 m", 1e-7],
   ] as const)("parses a length scalar %s into SI", (rawText, parsedSI) => {
-    expect(parseQuantityInput(rawText, "length", "m")).toMatchObject({
+    const parsed = parseQuantityInput(rawText, "length", "m");
+    expect(parsed).toMatchObject({
       dimension: "length",
-      lastValidSI: parsedSI,
-      parsedSI,
       parseStatus: "valid",
       rawText,
       unit: "m",
     });
+    expect(Math.abs(parsed.parsedSI! - parsedSI)).toBeLessThanOrEqual(
+      8 * Number.EPSILON * Math.max(Math.abs(parsedSI), Number.MIN_VALUE),
+    );
+    expect(parsed.lastValidSI).toBe(parsed.parsedSI);
   });
 
   it.each([
@@ -96,7 +99,7 @@ describe("parseQuantityInput", () => {
   });
 
   it("accepts one outer-trimmed space before a compatible suffix only", () => {
-    expect(parseQuantityInput(" 100 nm ", "length").parsedSI).toBe(1e-7);
+    expect(parseQuantityInput(" 100 nm ", "length").parsedSI).toBeCloseTo(1e-7, 22);
     expect(parseQuantityInput("100  nm", "length").parseStatus).toBe("invalid");
     expect(parseQuantityInput("100\tnm", "length").parseStatus).toBe("invalid");
     expect(parseQuantityInput("100 rad", "length").parseStatus).toBe("invalid");

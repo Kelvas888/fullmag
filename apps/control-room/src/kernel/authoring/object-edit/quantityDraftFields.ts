@@ -178,6 +178,19 @@ export function updateRawQuantityField(
   );
 }
 
+/** Writes a canonical SI value without changing the editor's selected unit. */
+export function updateQuantityFieldSI(
+  draft: GeometryObjectDraft,
+  field: QuantityDraftField,
+  value: number,
+): GeometryObjectDraft {
+  const unit = fieldMetadata(draft, field)?.unit ?? DEFAULT_LENGTH_UNIT;
+  const input = parseQuantityInput(String(value), "length", "m");
+  const converted = changeQuantityInputUnit(input, unit);
+  return updateRawQuantityField(draft, field,
+    converted.ok ? converted.input.rawText : `${String(value)} m`);
+}
+
 export type DraftQuantityUnitChangeResult =
   | { ok: true; draft: GeometryObjectDraft }
   | {

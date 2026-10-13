@@ -26,6 +26,29 @@ const canonicalDraft: GeometryObjectDraft = {
 };
 
 describe("reconcileObjectEditAck", () => {
+  it("keeps the selected unit after an ACK with no newer semantic edit", () => {
+    const submitted: GeometryObjectDraft = {
+      ...canonicalDraft, size: ["200", "1e-7", "1e-8"],
+      quantityFields: { "size.0": { unit: "nm", lastValidSI: 2e-7 } },
+    };
+    const result = reconcileObjectEditAck(submitted, submitted, canonicalDraft);
+    expect(result.draft.quantityFields?.["size.0"]?.unit).toBe("nm");
+    expect(Number(result.draft.size[0])).toBeCloseTo(200, 10);
+    expect(result.dirty).toBe(false);
+  });
+
+  it("retains a post-submit unit change and incomplete raw with its last-valid preview", () => {
+    const submitted = { ...canonicalDraft };
+    const current: GeometryObjectDraft = {
+      ...submitted, size: ["1e-", "1e-7", "1e-8"],
+      quantityFields: { "size.0": { unit: "nm", lastValidSI: 3e-7 } },
+    };
+    const result = reconcileObjectEditAck(current, submitted, canonicalDraft);
+    expect(result.draft.size[0]).toBe("1e-");
+    expect(result.draft.quantityFields?.["size.0"]).toEqual({ unit: "nm", lastValidSI: 3e-7 });
+    expect(result.dirty).toBe(true);
+  });
+
   it("rebases newer raw geometry and metadata while keeping disabled transform fields canonical", () => {
     const submitted: GeometryObjectDraft = {
       ...canonicalDraft,

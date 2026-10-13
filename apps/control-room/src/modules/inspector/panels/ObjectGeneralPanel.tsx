@@ -1,3 +1,4 @@
+import { canonicalDraftInSelectedUnits } from "@/kernel/authoring/object-edit/quantityDraftFields";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -267,7 +268,7 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
       Number.isFinite(canonicalGeometryDraft.baseRevision) &&
       currentDraft.baseRevision === canonicalGeometryDraft.baseRevision
     ) return;
-    kernel.objectEditSession.refreshCanonical(identity, canonicalGeometryDraft);
+    kernel.objectEditSession.refreshCanonical(identity, canonicalDraftInSelectedUnits(canonicalGeometryDraft, currentDraft ?? canonicalGeometryDraft));
   }, [
     canonicalGeometryDraft,
     currentSessionScopeKey,
@@ -756,7 +757,7 @@ export function ObjectGeneralPanel({ selection }: InspectorPanelProps) {
     const editState = currentMatchedObjectEditDraft();
     const canonicalDraft = resolveCommittedGeometryObjectDraft(scene.data, object.objectId);
     if (editState && canonicalDraft) {
-      kernel.objectEditSession.reset(editState.identity, canonicalDraft);
+      kernel.objectEditSession.reset(editState.identity, canonicalDraftInSelectedUnits(canonicalDraft, editState.draft));
     }
   }
 

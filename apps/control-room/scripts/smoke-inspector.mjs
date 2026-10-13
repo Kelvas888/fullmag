@@ -657,7 +657,7 @@ try {
     const originalSizeFactor = await sizeFactor.inputValue();
     await sizeFactor.fill(originalSizeFactor === "1" ? "1.01" : "1");
     assert(
-      !(await inspector.getByRole("button", { name: "Apply", exact: true }).isDisabled()),
+      !(await inspector.locator(".fm-inspector__action-bar").getByRole("button", { name: "Apply", exact: true }).isDisabled()),
       "A valid object-mesh draft did not enable Apply.",
     );
     assert(
@@ -1011,7 +1011,7 @@ async function qualifyObjectMoveGestureAndSharedApply(page, inspector, fixture, 
     }, null, 2) + "\n");
     throw error;
   }
-  const applyButton = inspector.getByRole("button", { name: "Apply", exact: true });
+  const applyButton = inspector.locator(".fm-inspector__action-bar").getByRole("button", { name: "Apply", exact: true });
   assert(
     await applyButton.isEnabled(),
     "A real viewport drag did not stage an Inspector draft for the shared Apply action.",
