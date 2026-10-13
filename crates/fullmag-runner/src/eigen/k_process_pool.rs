@@ -331,6 +331,18 @@ fn pool_control_can_finish(action: StepAction, active_workers: usize) -> bool {
     action == StepAction::Stop || (action == StepAction::Pause && active_workers == 0)
 }
 
+fn clean_stop_cancellation_response(
+    action: Option<StepAction>,
+    response: &EigenKWorkerResponseV1,
+) -> bool {
+    action == Some(StepAction::Stop)
+        && response.ok
+        && response.error.is_none()
+        && response.run.as_ref().is_some_and(|run| {
+            matches!(run.status, crate::types::RunStatus::Cancelled)
+        })
+}
+
 fn adaptive_pool_outcome(
     action: Option<StepAction>,
     mut responses: Vec<(usize, EigenKWorkerResponseV1)>,
@@ -1142,25 +1154,36 @@ impl EigenKProcessPool {
         })
     }
 
+    fn finish_child_at_status(
+        &self,
+        worker: ActiveWorker,
+        status: std::process::ExitStatus,
+    ) -> Result<EigenKWorkerResponseV1, String> {
+        let request_index = worker.request_index;
+        Self::cap_worker_logs(&worker);
+        let response = self.read_response(request_index);
+        match response {
+            Ok(response) if status.success() => Ok(response),
+            Ok(response) if response.error.is_some() => Err(format!(
+                "eigen k worker {request_index} exited with {status}: {}",
+                response.error.as_deref().unwrap_or_default()
+            )),
+            Ok(_) => Err(format!(
+                "eigen k worker {request_index} exited with {status} despite publishing a response"
+            )),
+            Err(error) if !status.success() => Err(format!(
+                "eigen k worker {request_index} exited with {status} without a response: {error}"
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
     fn finish_child(&self, mut worker: ActiveWorker) -> Result<EigenKWorkerResponseV1, String> {
         let status = worker
             .child
             .wait()
             .map_err(|error| format!("wait eigen k worker {}: {error}", worker.request_index))?;
-        Self::cap_worker_logs(&worker);
-        let response = self.read_response(worker.request_index);
-        match response {
-            Ok(response) if status.success() => Ok(response),
-            Ok(_) => Err(format!(
-                "eigen k worker {} exited with {status} despite publishing a response",
-                worker.request_index
-            )),
-            Err(error) if !status.success() => Err(format!(
-                "eigen k worker {} exited with {status} without a response: {error}",
-                worker.request_index
-            )),
-            Err(error) => Err(error),
-        }
+        self.finish_child_at_status(worker, status)
     }
 
     fn finish_child_with_cancel(
@@ -1172,19 +1195,90 @@ impl EigenKProcessPool {
     ) -> Result<WorkerWaitOutcome, String> {
         let mut pause_requested = false;
         loop {
-            if let Some(action) = requested_control_action(
-                cancel,
-                pending_action,
-                check_control,
-                None,
-            ) {
+            if let Some(action) =
+                requested_control_action(cancel, pending_action, check_control, None)
+            {
                 match action {
                     StepAction::Stop => {
-                        let _ = fs::write(&worker.cancel_path, b"cancelled");
-                        let _ = worker.child.kill();
-                        let _ = worker.child.wait();
-                        Self::cap_worker_logs(&worker);
-                        return Ok(WorkerWaitOutcome::Interrupted(action));
+                        // Stop is latched, but collect an already-terminal child before signaling it.
+                        match worker.child.try_wait() {
+                            Ok(Some(status)) => {
+                                let response = self.finish_child_at_status(worker, status)?;
+                                return Ok(WorkerWaitOutcome::CompletedInterrupted {
+                                    action: StepAction::Stop,
+                                    response,
+                                });
+                            }
+                            Ok(None) => {
+                                let _ = fs::write(&worker.cancel_path, b"cancelled");
+                            }
+                            Err(error) => {
+                                let request_index = worker.request_index;
+                                let _ = fs::write(&worker.cancel_path, b"cancelled");
+                                let _ = worker.child.kill();
+                                let _ = worker.child.wait();
+                                Self::cap_worker_logs(&worker);
+                                return Err(format!(
+                                    "poll eigen k worker {request_index}: {error}"
+                                ));
+                            }
+                        }
+
+                        match worker.child.kill() {
+                            Ok(()) => {
+                                let status = worker.child.wait().map_err(|error| {
+                                    format!(
+                                        "wait for stopped eigen k worker {}: {error}",
+                                        worker.request_index
+                                    )
+                                })?;
+                                if status.success() {
+                                    let response = self.finish_child_at_status(worker, status)?;
+                                    return Ok(WorkerWaitOutcome::CompletedInterrupted {
+                                        action: StepAction::Stop,
+                                        response,
+                                    });
+                                }
+                                Self::cap_worker_logs(&worker);
+                                if let Ok(response) = self.read_response(worker.request_index) {
+                                    if !response.ok || response.error.is_some() {
+                                        let error = response.error.unwrap_or_else(|| {
+                                            "worker response was not accepted".into()
+                                        });
+                                        return Err(format!(
+                                            "eigen k worker {} reported an error while Stop was pending: {error}",
+                                            worker.request_index
+                                        ));
+                                    }
+                                }
+                                return Ok(WorkerWaitOutcome::Interrupted(StepAction::Stop));
+                            }
+                            Err(kill_error) => match worker.child.try_wait() {
+                                Ok(Some(status)) => {
+                                    let response = self.finish_child_at_status(worker, status)?;
+                                    return Ok(WorkerWaitOutcome::CompletedInterrupted {
+                                        action: StepAction::Stop,
+                                        response,
+                                    });
+                                }
+                                Ok(None) => {
+                                    Self::cap_worker_logs(&worker);
+                                    return Err(format!(
+                                        "kill eigen k worker {} after Stop: {kill_error}",
+                                        worker.request_index
+                                    ));
+                                }
+                                Err(poll_error) => {
+                                    let request_index = worker.request_index;
+                                    let _ = worker.child.kill();
+                                    let _ = worker.child.wait();
+                                    Self::cap_worker_logs(&worker);
+                                    return Err(format!(
+                                        "kill eigen k worker {request_index} after Stop: {kill_error}; poll child: {poll_error}"
+                                    ));
+                                }
+                            },
+                        }
                     }
                     StepAction::Pause => pause_requested = true,
                     StepAction::Continue => {}
@@ -1192,28 +1286,14 @@ impl EigenKProcessPool {
             }
             match worker.child.try_wait() {
                 Ok(Some(status)) => {
-                    Self::cap_worker_logs(&worker);
-                    let response = self.read_response(worker.request_index);
-                    return match response {
-                        Ok(response) if status.success() => {
-                            if pause_requested {
-                                Ok(WorkerWaitOutcome::CompletedInterrupted {
-                                    action: StepAction::Pause,
-                                    response,
-                                })
-                            } else {
-                                Ok(WorkerWaitOutcome::Completed(response))
-                            }
-                        }
-                        Ok(_) => Err(format!(
-                            "eigen k worker {} exited with {status} despite publishing a response",
-                            worker.request_index
-                        )),
-                        Err(error) if !status.success() => Err(format!(
-                            "eigen k worker {} exited with {status} without a response: {error}",
-                            worker.request_index
-                        )),
-                        Err(error) => Err(error),
+                    let response = self.finish_child_at_status(worker, status)?;
+                    return if pause_requested {
+                        Ok(WorkerWaitOutcome::CompletedInterrupted {
+                            action: StepAction::Pause,
+                            response,
+                        })
+                    } else {
+                        Ok(WorkerWaitOutcome::Completed(response))
                     };
                 }
                 Ok(None) => std::thread::sleep(Duration::from_millis(50)),
@@ -1354,6 +1434,15 @@ impl EigenKProcessPool {
                         });
                     }
                 };
+                // A cooperative worker may publish its Cancelled result after seeing Stop.
+                // Keep that as an interruption rather than validating it as a completed sample.
+                if clean_stop_cancellation_response(after_response_action, &response) {
+                    journal.finish(&report, pool_terminal_state(StepAction::Stop));
+                    return Ok(ProcessPoolOutcome::Interrupted {
+                        action: StepAction::Stop,
+                        partial: ProcessPoolResult { responses, report },
+                    });
+                }
                 self.validate_terminal_response(request, &response)?;
                 responses.push(response);
                 journal.update(&report);
@@ -1848,6 +1937,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
 
     fn adaptive_policy() -> ParallelExecutionPolicyIR {
@@ -1898,6 +1988,79 @@ mod tests {
         }
     }
 
+    fn serial_policy() -> ParallelExecutionPolicyIR {
+        ParallelExecutionPolicyIR {
+            mode: ParallelExecutionModeIR::Serial,
+            ..Default::default()
+        }
+    }
+
+    fn serial_test_pool(root: &Path) -> EigenKProcessPool {
+        EigenKProcessPool {
+            root: root.to_path_buf(),
+            executable: std::env::current_exe().expect("resolve test executable"),
+            worker_executable_sha256: String::new(),
+            worker_build_identity: serde_json::Value::Null,
+            policy: serial_policy(),
+        }
+    }
+
+    fn spawn_serial_control_child(root: &Path, mode: &str) -> (ActiveWorker, PathBuf) {
+        let current_exe = std::env::current_exe().expect("resolve test executable");
+        let namespace = root.join("worker-000000");
+        std::fs::create_dir_all(&namespace).expect("create serial child namespace");
+        let ready_path = root.join("serial-child.ready");
+        let release_path = root.join("serial-child.release");
+        let response_path = namespace.join("response.json");
+        let child = Command::new(current_exe)
+            .arg("stop_harvest_child_helper")
+            .arg("--nocapture")
+            .env("FULLMAG_K_POOL_SERIAL_CHILD_MODE", mode)
+            .env("FULLMAG_K_POOL_SERIAL_CHILD_READY", &ready_path)
+            .env("FULLMAG_K_POOL_SERIAL_CHILD_RELEASE", &release_path)
+            .env("FULLMAG_K_POOL_SERIAL_CHILD_RESPONSE", &response_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn serial control fixture child");
+        let mut worker = test_active_worker(root, 0, child);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "serial child readiness timed out"
+            );
+            assert!(
+                worker
+                    .child
+                    .try_wait()
+                    .expect("poll serial child before readiness")
+                    .is_none(),
+                "serial child exited before publishing readiness"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            worker
+                .child
+                .try_wait()
+                .expect("confirm serial child is live")
+                .is_none(),
+            "serial child must remain active at the ready barrier"
+        );
+        (worker, release_path)
+    }
+
+    fn wait_for_child_exit(worker: &mut ActiveWorker) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = worker.child.try_wait().expect("poll fixture child exit") {
+                return status;
+            }
+            assert!(Instant::now() < deadline, "fixture child exit timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     #[test]
     fn stop_harvests_terminal_child_and_kills_active_child_without_response() {
         let fixture = StopHarvestTempDir::new();
@@ -1985,11 +2148,269 @@ mod tests {
 
     #[test]
     fn stop_harvest_child_helper() {
+        if let Some(mode) = std::env::var_os("FULLMAG_K_POOL_SERIAL_CHILD_MODE") {
+            let mode = mode.to_string_lossy();
+            let ready_path = PathBuf::from(
+                std::env::var_os("FULLMAG_K_POOL_SERIAL_CHILD_READY")
+                    .expect("serial fixture ready path"),
+            );
+            let release_path = PathBuf::from(
+                std::env::var_os("FULLMAG_K_POOL_SERIAL_CHILD_RELEASE")
+                    .expect("serial fixture release path"),
+            );
+            let response_path = PathBuf::from(
+                std::env::var_os("FULLMAG_K_POOL_SERIAL_CHILD_RESPONSE")
+                    .expect("serial fixture response path"),
+            );
+            std::fs::write(&ready_path, b"ready").expect("publish serial child readiness");
+            if mode == "live" {
+                loop {
+                    std::thread::sleep(Duration::from_secs(60));
+                }
+            }
+            assert!(
+                mode == "success" || mode == "error",
+                "unsupported serial fixture mode"
+            );
+            let deadline = Instant::now() + Duration::from_secs(15);
+            while !release_path.exists() {
+                assert!(Instant::now() < deadline, "serial fixture release timed out");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let is_error = mode == "error";
+            let run = if is_error {
+                None
+            } else {
+                Some(serde_json::json!({
+                    "status": "completed",
+                    "final_magnetization": [[1.0, 0.0, 0.0]],
+                    "plan_sha256": "fixture-plan",
+                    "equilibrium_artifact_sha256": "fixture-equilibrium",
+                    "thread_budget": {
+                        "requested_threads": 1,
+                        "resolved_threads": 1,
+                        "cap_reason": "fixture",
+                        "allocation_cpu_cores": 1.0,
+                        "host_cpu_cores": 1
+                    },
+                    "artifacts": []
+                }))
+            };
+            let response = serde_json::json!({
+                "protocol": super::EIGEN_K_WORKER_PROTOCOL_V2,
+                "sample_index": 17,
+                "worker_request_index": 0,
+                "ok": !is_error,
+                "run": run,
+                "error": if is_error { Some("fixture worker error") } else { None },
+            });
+            std::fs::write(
+                response_path,
+                serde_json::to_vec(&response).expect("encode serial fixture response"),
+            )
+            .expect("publish serial fixture response");
+            if is_error {
+                panic!("exit after publishing the fixture worker error");
+            }
+            return;
+        }
+
         let Some(ready_path) = std::env::var_os("FULLMAG_K_POOL_STOP_HARVEST_READY") else {
             return;
         };
         std::fs::write(PathBuf::from(ready_path), b"ready").expect("publish child readiness");
         std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[test]
+    fn serial_stop_harvests_terminal_success_before_killing() {
+        let fixture = StopHarvestTempDir::new();
+        let (mut worker, release_path) = spawn_serial_control_child(&fixture.0, "success");
+        std::fs::write(&release_path, b"release").expect("release successful child");
+        let status = wait_for_child_exit(&mut worker);
+        assert!(
+            status.success(),
+            "successful fixture must be terminal before Stop"
+        );
+        let cancel_path = worker.cancel_path.clone();
+        let pool = serial_test_pool(&fixture.0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut callback = |_: Option<&super::ProcessAdmissionEventV1>| StepAction::Stop;
+        let mut check_control = Some(
+            &mut callback
+                as &mut dyn FnMut(Option<&super::ProcessAdmissionEventV1>) -> StepAction,
+        );
+        let mut pending_action = None;
+
+        let outcome = pool
+            .finish_child_with_cancel(
+                worker,
+                &cancel,
+                &mut pending_action,
+                &mut check_control,
+            )
+            .expect("harvest completed worker after Stop");
+        let super::WorkerWaitOutcome::CompletedInterrupted { action, response } = outcome else {
+            panic!("terminal success must be retained as a Stop-interrupted completion");
+        };
+        assert_eq!(action, StepAction::Stop);
+        assert_eq!(pending_action, Some(StepAction::Stop));
+        assert_eq!(response.sample_index, 17);
+        assert!(response.run.as_ref().is_some_and(|run| {
+            matches!(run.status, crate::types::RunStatus::Completed)
+        }));
+        assert!(
+            !cancel_path.exists(),
+            "terminal success must not be cancelled"
+        );
+    }
+
+    #[test]
+    fn serial_stop_preserves_terminal_worker_error_before_killing() {
+        let fixture = StopHarvestTempDir::new();
+        let (mut worker, release_path) = spawn_serial_control_child(&fixture.0, "error");
+        std::fs::write(&release_path, b"release").expect("release failed child");
+        let status = wait_for_child_exit(&mut worker);
+        assert!(
+            !status.success(),
+            "error fixture must be terminal before Stop"
+        );
+        let cancel_path = worker.cancel_path.clone();
+        let pool = serial_test_pool(&fixture.0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut callback = |_: Option<&super::ProcessAdmissionEventV1>| StepAction::Stop;
+        let mut check_control = Some(
+            &mut callback
+                as &mut dyn FnMut(Option<&super::ProcessAdmissionEventV1>) -> StepAction,
+        );
+        let mut pending_action = None;
+
+        let error = pool
+            .finish_child_with_cancel(
+                worker,
+                &cancel,
+                &mut pending_action,
+                &mut check_control,
+            )
+            .expect_err("terminal worker failure must not become an ordinary Stop");
+        assert!(error.contains("fixture worker error"), "{error}");
+        assert!(
+            !cancel_path.exists(),
+            "terminal failure must not be cancelled"
+        );
+    }
+
+    #[test]
+    fn serial_stop_kills_a_live_child_with_bounded_wait() {
+        let fixture = StopHarvestTempDir::new();
+        let (worker, _) = spawn_serial_control_child(&fixture.0, "live");
+        let cancel_path = worker.cancel_path.clone();
+        let response_path = fixture.0.join("worker-000000/response.json");
+        let pool = serial_test_pool(&fixture.0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut callback = |_: Option<&super::ProcessAdmissionEventV1>| StepAction::Stop;
+        let mut check_control = Some(
+            &mut callback
+                as &mut dyn FnMut(Option<&super::ProcessAdmissionEventV1>) -> StepAction,
+        );
+        let mut pending_action = None;
+        let started = Instant::now();
+
+        let outcome = pool
+            .finish_child_with_cancel(
+                worker,
+                &cancel,
+                &mut pending_action,
+                &mut check_control,
+            )
+            .expect("Stop should terminate the live fixture child");
+        assert!(matches!(
+            outcome,
+            super::WorkerWaitOutcome::Interrupted(StepAction::Stop)
+        ));
+        assert!(
+            cancel_path.exists(),
+            "live child must receive cancellation first"
+        );
+        assert!(
+            !response_path.exists(),
+            "live child must not fabricate a response"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "Stop must kill the active child instead of waiting for its blocked work"
+        );
+    }
+
+    #[test]
+    fn serial_pause_drains_current_child_before_interrupting() {
+        let pause_fixture = StopHarvestTempDir::new();
+        let (worker, release_path) = spawn_serial_control_child(&pause_fixture.0, "success");
+        let cancel_path = worker.cancel_path.clone();
+        let pool = serial_test_pool(&pause_fixture.0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut pause_callback = move |_: Option<&super::ProcessAdmissionEventV1>| {
+            std::fs::write(&release_path, b"release")
+                .expect("release child during Pause drain");
+            StepAction::Pause
+        };
+        let mut pause_control = Some(
+            &mut pause_callback
+                as &mut dyn FnMut(Option<&super::ProcessAdmissionEventV1>) -> StepAction,
+        );
+        let mut pending_action = None;
+        let outcome = pool
+            .finish_child_with_cancel(worker, &cancel, &mut pending_action, &mut pause_control)
+            .expect("Pause should drain the current sample");
+        let super::WorkerWaitOutcome::CompletedInterrupted { action, response } = outcome else {
+            panic!("Pause must keep the completed current sample");
+        };
+        assert_eq!(action, StepAction::Pause);
+        assert_eq!(pending_action, Some(StepAction::Pause));
+        assert_eq!(response.sample_index, 17);
+        assert!(
+            !cancel_path.exists(),
+            "Pause drain must not cancel its active child"
+        );
+    }
+
+    #[test]
+    fn serial_stop_upgrades_a_pending_pause_and_kills_live_child() {
+        let stop_fixture = StopHarvestTempDir::new();
+        let (worker, _) = spawn_serial_control_child(&stop_fixture.0, "live");
+        let stop_cancel_path = worker.cancel_path.clone();
+        let pool = serial_test_pool(&stop_fixture.0);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let calls = Cell::new(0usize);
+        let mut pause_then_stop = move |_: Option<&super::ProcessAdmissionEventV1>| {
+            let call = calls.get();
+            calls.set(call + 1);
+            if call == 0 {
+                StepAction::Pause
+            } else {
+                StepAction::Stop
+            }
+        };
+        let mut stop_control = Some(
+            &mut pause_then_stop
+                as &mut dyn FnMut(Option<&super::ProcessAdmissionEventV1>) -> StepAction,
+        );
+        let mut pending_action = None;
+        let started = Instant::now();
+        let outcome = pool
+            .finish_child_with_cancel(worker, &cancel, &mut pending_action, &mut stop_control)
+            .expect("Stop must upgrade a pending Pause and terminate the live child");
+        assert!(matches!(
+            outcome,
+            super::WorkerWaitOutcome::Interrupted(StepAction::Stop)
+        ));
+        assert_eq!(calls.get(), 2, "the fixture must exercise Pause then Stop");
+        assert_eq!(pending_action, Some(StepAction::Stop));
+        assert!(stop_cancel_path.exists());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "Pause→Stop must not wait for the blocked child to finish"
+        );
     }
 
     #[test]
@@ -2588,6 +3009,56 @@ mod tests {
 
         let active = AtomicBool::new(false);
         assert!(admission_may_spawn_worker(&active, None));
+    }
+
+    #[test]
+    fn only_a_clean_cancelled_response_after_stop_is_an_interruption() {
+        let response = super::EigenKWorkerResponseV1 {
+            protocol: super::EIGEN_K_WORKER_PROTOCOL_V2.into(),
+            sample_index: 17,
+            worker_request_index: 0,
+            ok: true,
+            worker_executable_sha256: None,
+            worker_build_identity: None,
+            terminal_peak: None,
+            run: Some(crate::fem::eigen_k_worker::EigenKWorkerRunV1 {
+                status: crate::types::RunStatus::Cancelled,
+                final_magnetization: Vec::new(),
+                plan_sha256: "fixture-plan".into(),
+                equilibrium_artifact_sha256: "fixture-equilibrium".into(),
+                thread_budget: crate::fem::eigen_k_worker::EigenKWorkerThreadBudgetV1 {
+                    requested_threads: 1,
+                    resolved_threads: 1,
+                    cap_reason: "fixture".into(),
+                    allocation_cpu_cores: 1.0,
+                    host_cpu_cores: 1,
+                },
+                artifacts: Vec::new(),
+            }),
+            error: None,
+        };
+        assert!(super::clean_stop_cancellation_response(
+            Some(StepAction::Stop),
+            &response
+        ));
+        assert!(!super::clean_stop_cancellation_response(
+            Some(StepAction::Pause),
+            &response
+        ));
+
+        let mut worker_error = response.clone();
+        worker_error.error = Some("fixture worker error".into());
+        assert!(!super::clean_stop_cancellation_response(
+            Some(StepAction::Stop),
+            &worker_error
+        ));
+
+        let mut failed_run = response.clone();
+        failed_run.run.as_mut().unwrap().status = crate::types::RunStatus::Failed;
+        assert!(!super::clean_stop_cancellation_response(
+            Some(StepAction::Stop),
+            &failed_run
+        ));
     }
 
     #[test]
