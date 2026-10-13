@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { FrequencyDomainFieldResource } from "../api/apiTypes";
 import { createModeFieldOverlayIntent } from "../visualization/ModeFieldOverlayIntent";
 import {
+  modeFieldOverlayArtifactGenerationMatches,
   resolveModeFieldOverlayMetadataRevision,
   resolveModeFieldOverlayResource,
 } from "./modeFieldOverlayResources";
@@ -69,6 +70,70 @@ describe("mode field overlay resource", () => {
     ).toMatchObject({ binaryResourceKey: null, status: "error" });
   });
 
+  it("requests only owner-bound committed generations and rejects unbound members", () => {
+    const ownerBound = resolveModeFieldOverlayResource(intent, {
+      data: {
+        ...metadata,
+        generation_id: "publication-14",
+        generation_status: "member_verified_owner_bound",
+      },
+      error: null,
+      revision: "sha256:field-v1",
+      status: "ready",
+    });
+    expect(ownerBound).toMatchObject({
+      metadata: {
+        artifactGenerationId: "publication-14",
+        artifactGenerationStatus: "member_verified_owner_bound",
+        binaryQuery: {
+          expected_artifact_generation_id: "publication-14",
+        },
+      },
+      status: "ready",
+    });
+
+    const unbound = resolveModeFieldOverlayResource(intent, {
+      data: {
+        ...metadata,
+        generation_id: "publication-14",
+        generation_status: "member_verified_unbound",
+      },
+      error: null,
+      revision: "sha256:field-v1",
+      status: "ready",
+    });
+    expect(unbound).toMatchObject({
+      binaryResourceKey: null,
+      error: expect.objectContaining({ message: expect.stringContaining("member_verified_unbound") }),
+      status: "error",
+    });
+  });
+
+  it("requires an exact binary generation header for verified members and preserves legacy solo fields", () => {
+    const ownerBound = resolveModeFieldOverlayResource(intent, {
+      data: {
+        ...metadata,
+        generation_id: "publication-14",
+        generation_status: "member_verified_owner_bound",
+      },
+      error: null,
+      revision: "sha256:field-v1",
+      status: "ready",
+    }).metadata!;
+    expect(modeFieldOverlayArtifactGenerationMatches(ownerBound, "publication-14")).toBe(true);
+    expect(modeFieldOverlayArtifactGenerationMatches(ownerBound, null)).toBe(false);
+    expect(modeFieldOverlayArtifactGenerationMatches(ownerBound, "publication-stale")).toBe(false);
+
+    const legacy = resolveModeFieldOverlayResource(intent, {
+      data: metadata,
+      error: null,
+      revision: "sha256:field-v1",
+      status: "ready",
+    }).metadata!;
+    expect(legacy.artifactGenerationStatus).toBe("legacy_unverified");
+    expect(modeFieldOverlayArtifactGenerationMatches(legacy, null)).toBe(true);
+  });
+
   it("changes the field build revision when an artifact revision changes at the same metadata path", () => {
     const nextIntent = createModeFieldOverlayIntent({
       analysisRunId: "run-k0",
@@ -116,5 +181,21 @@ describe("mode field overlay resource", () => {
 
     expect(next).not.toBe(first);
     expect(next).toContain("sha256:field-v2");
+  });
+
+  it("invalidates the metadata revision when committed artifact generation changes", () => {
+    const first = resolveModeFieldOverlayMetadataRevision(intent, {
+      ...metadata,
+      generation_id: "publication-14",
+      generation_status: "member_verified_owner_bound",
+    });
+    const next = resolveModeFieldOverlayMetadataRevision(intent, {
+      ...metadata,
+      generation_id: "publication-15",
+      generation_status: "member_verified_owner_bound",
+    });
+
+    expect(next).not.toBe(first);
+    expect(next).toContain("publication-15");
   });
 });

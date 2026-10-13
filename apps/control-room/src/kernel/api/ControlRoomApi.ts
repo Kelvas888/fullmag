@@ -568,6 +568,7 @@ export function parseFieldVectorResponseMetadata(
   return {
     component: headers.get("x-fullmag-component"),
     domainGenerationId: headers.get("x-fullmag-domain-generation-id"),
+    artifactGenerationId: headers.get("x-fullmag-artifact-generation-id"),
     encoding: headers.get("x-fullmag-encoding"),
     fieldIndexing: headers.get("x-fullmag-field-indexing"),
     fieldGenerationId: headers.get("x-fullmag-field-generation-id"),
@@ -4603,6 +4604,19 @@ export class ControlRoomApi {
       query,
       (response, data) => {
         const metadata = parseFieldVectorResponseMetadata(response.headers);
+        const expectedArtifactGenerationId = query[
+          "expected_artifact_generation_id"
+        ];
+        if (
+          typeof expectedArtifactGenerationId === "string" &&
+          expectedArtifactGenerationId.trim().length > 0 &&
+          metadata.artifactGenerationId !== expectedArtifactGenerationId
+        ) {
+          throw new ControlRoomApiError(
+            "Field vector artifact generation did not match the requested generation.",
+            409,
+          );
+        }
         return {
           ...metadata,
           identityIssues: collectFieldVectorIdentityIssues(data, metadata),

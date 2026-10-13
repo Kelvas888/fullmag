@@ -820,6 +820,65 @@ describe("viewport3dResources", () => {
     ).toEqual({ matches: false, reason: "snapshot" });
   });
 
+  it("requires an exact committed artifact-generation response header when requested", () => {
+    const envelope: Viewport3DFieldVectorEnvelope = {
+      data: {
+        dtype: "float64",
+        formatVersion: 3,
+        domainGenerationId: "gen-1",
+        grid: [1, 1, 1],
+        indexing: "full_domain",
+        meshTopologyHash: "top-1",
+        nComp: 3,
+        pointCount: 1,
+        quantityId: "m",
+        scopeId: null,
+        scopeKind: "full",
+        valueCount: 3,
+        values: new Float64Array([1, 0, 0]),
+      },
+      etag: '"field-1"',
+      resourceKey: fieldVectorResourceKey("component=full"),
+      responseMetadata: fieldResponseMetadata({
+        artifactGenerationId: "publication-14",
+        domainGenerationId: "gen-1",
+        meshTopologyHash: "top-1",
+        quantityId: "m",
+        scopeId: null,
+        scopeKind: "full",
+      }),
+    };
+    const request = {
+      quantityId: "m",
+      query: { expected_artifact_generation_id: "publication-14" },
+    };
+
+    expect(resolveViewport3DFieldVectorIdentityMatch(envelope, request)).toEqual({
+      matches: true,
+    });
+    expect(
+      resolveViewport3DFieldVectorIdentityMatch(envelope, {
+        ...request,
+        query: { expected_artifact_generation_id: "publication-stale" },
+      }),
+    ).toEqual({ matches: false, reason: "artifact_generation" });
+    expect(
+      resolveViewport3DFieldVectorIdentityMatch(
+        {
+          ...envelope,
+          responseMetadata: fieldResponseMetadata({
+            domainGenerationId: "gen-1",
+            meshTopologyHash: "top-1",
+            quantityId: "m",
+            scopeId: null,
+            scopeKind: "full",
+          }),
+        },
+        request,
+      ),
+    ).toEqual({ matches: false, reason: "artifact_generation" });
+  });
+
   it("retains last good frame with retained: true across mismatched ready response (LR-03)", () => {
     const tracker = new Viewport3DResourceTracker();
     const frameA: Viewport3DFieldVectorEnvelope = {

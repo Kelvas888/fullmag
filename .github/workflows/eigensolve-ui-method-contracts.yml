@@ -24,6 +24,17 @@ on:
       - 'apps/control-room/src/kernel/resources/postprocessingDefinitionResources*'
       - 'apps/control-room/src/kernel/resources/studyRuntimeResources*'
       - 'apps/control-room/src/kernel/api/generated/openapi-v2*'
+      - 'apps/control-room/src/kernel/api/apiTypes.ts'
+      - 'apps/control-room/src/kernel/api/ControlRoomApi*'
+      - 'apps/control-room/src/kernel/api/fieldQueryIdentity*'
+      - 'apps/control-room/src/kernel/resources/frequencyDomainResourceKeys*'
+      - 'apps/control-room/src/kernel/resources/modeCompositionFieldLayerResources*'
+      - 'apps/control-room/src/kernel/visualization/ModeCompositionFieldLayerController*'
+      - 'apps/control-room/src/kernel/visualization/ModeFieldOverlayIntent*'
+      - 'apps/control-room/src/kernel/resources/modeFieldOverlayResources*'
+      - 'apps/control-room/src/modules/viewport-3d/viewport3dResources*'
+      - 'apps/control-room/src/modules/viewport-3d/model/modeCompositionViewportProjection*'
+      - 'apps/control-room/src/modules/viewport-3d/layers/MeshPartLayer*'
       - 'apps/control-room/src/modules/analysis-plots/referenceOverlaySeries.test.ts'
       - 'apps/control-room/src/modules/analysis-plots/useAnalysisPlotsController.ts'
       - 'apps/control-room/src/modules/analysis-plots/referenceChartQuantity.test.ts'
@@ -59,6 +70,17 @@ on:
       - 'apps/control-room/src/kernel/resources/postprocessingDefinitionResources*'
       - 'apps/control-room/src/kernel/resources/studyRuntimeResources*'
       - 'apps/control-room/src/kernel/api/generated/openapi-v2*'
+      - 'apps/control-room/src/kernel/api/apiTypes.ts'
+      - 'apps/control-room/src/kernel/api/ControlRoomApi*'
+      - 'apps/control-room/src/kernel/api/fieldQueryIdentity*'
+      - 'apps/control-room/src/kernel/resources/frequencyDomainResourceKeys*'
+      - 'apps/control-room/src/kernel/resources/modeCompositionFieldLayerResources*'
+      - 'apps/control-room/src/kernel/visualization/ModeCompositionFieldLayerController*'
+      - 'apps/control-room/src/kernel/visualization/ModeFieldOverlayIntent*'
+      - 'apps/control-room/src/kernel/resources/modeFieldOverlayResources*'
+      - 'apps/control-room/src/modules/viewport-3d/viewport3dResources*'
+      - 'apps/control-room/src/modules/viewport-3d/model/modeCompositionViewportProjection*'
+      - 'apps/control-room/src/modules/viewport-3d/layers/MeshPartLayer*'
       - 'apps/control-room/src/modules/analysis-plots/referenceOverlaySeries.test.ts'
       - 'apps/control-room/src/modules/analysis-plots/useAnalysisPlotsController.ts'
       - 'apps/control-room/src/modules/analysis-plots/referenceChartQuantity.test.ts'
@@ -130,6 +152,14 @@ jobs:
           src/kernel/analysis-modules/postprocessingDefinitions.test.ts
           src/kernel/resources/postprocessingDefinitionResources.test.tsx
           src/kernel/resources/studyRuntimeResources.test.ts
+          src/kernel/api/ControlRoomApi.test.ts
+          src/kernel/api/fieldQueryIdentity.test.ts
+          src/kernel/resources/frequencyDomainResourceKeys.test.ts
+          src/kernel/visualization/ModeCompositionFieldLayerController.test.ts
+          src/kernel/visualization/ModeFieldOverlayIntent.test.ts
+          src/kernel/visualization/ModeFieldOverlayIntentController.test.ts
+          src/kernel/resources/modeFieldOverlayResources.test.ts
+          src/modules/viewport-3d/viewport3dResources.test.ts src/modules/viewport-3d/model/modeCompositionViewportProjection.test.ts src/modules/viewport-3d/layers/MeshPartLayer.test.ts
           src/modules/analysis-plots/referenceOverlaySeries.test.ts
           src/modules/analysis-plots/referenceChartQuantity.test.ts
           src/shared/domain/analysis/modalDampingObservables.test.ts

@@ -22,6 +22,10 @@ type FrequencyDomainSelectionRef = Extract<
   { type: "frequency-domain" }
 >;
 
+type ModeFieldArtifactGenerationStatus = NonNullable<
+  FrequencyDomainFieldResource["generation_status"]
+>;
+
 export interface ModeFieldOverlayIntent {
   readonly analysisRunId: string;
   readonly analysisStageId: string;
@@ -37,6 +41,8 @@ export interface ModeFieldOverlayIntent {
 
 export interface ResolvedModeFieldOverlayMetadata {
   readonly analysisResultFieldRef?: AnalysisResultFieldRef;
+  readonly artifactGenerationId: string | null;
+  readonly artifactGenerationStatus: ModeFieldArtifactGenerationStatus;
   readonly artifactPath: string;
   readonly availableViews: readonly string[];
   readonly binaryQuery: FieldVectorQuery;
@@ -117,7 +123,14 @@ export function resolveModeFieldOverlayMetadata(
 ): ResolvedModeFieldOverlayMetadata | null {
   if (isAnalysisResultFieldOverlayIntent(intent)) {
     if (!("field_revision" in metadata)) return null;
-    return resolveAnalysisResultFieldOverlayMetadata(intent);
+    const analysisResultMetadata = resolveAnalysisResultFieldOverlayMetadata(intent);
+    return analysisResultMetadata
+      ? Object.freeze({
+          ...analysisResultMetadata,
+          artifactGenerationId: null,
+          artifactGenerationStatus: "legacy_unverified" as const,
+        })
+      : null;
   }
   const legacyMetadata = metadata as FrequencyDomainFieldResource;
   const fieldId = requiredString(legacyMetadata.field_id);
@@ -126,6 +139,19 @@ export function resolveModeFieldOverlayMetadata(
   const payloadValueCount = positiveInteger(legacyMetadata.payload_value_count);
   const complexPairCount = positiveInteger(legacyMetadata.complex_pair_count);
   const defaultPhaseRad = finiteNumber(legacyMetadata.default_phase_rad);
+  const rawArtifactGenerationId = legacyMetadata.generation_id;
+  const artifactGenerationId = requiredString(rawArtifactGenerationId);
+  const artifactGenerationStatus =
+    legacyMetadata.generation_status ?? "legacy_unverified";
+  const malformedArtifactGenerationId =
+    rawArtifactGenerationId !== undefined &&
+    rawArtifactGenerationId !== null &&
+    artifactGenerationId === null;
+  const admissibleArtifactGeneration =
+    (artifactGenerationStatus === "legacy_unverified" &&
+      artifactGenerationId === null) ||
+    (artifactGenerationStatus === "member_verified_owner_bound" &&
+      artifactGenerationId !== null);
 
   if (
     legacyMetadata.status !== "ready" ||
@@ -146,6 +172,8 @@ export function resolveModeFieldOverlayMetadata(
     payloadValueCount !== complexPairCount * 2 ||
     payloadValueCount % 6 !== 0 ||
     defaultPhaseRad === null ||
+    malformedArtifactGenerationId ||
+    !admissibleArtifactGeneration ||
     !containsRequiredViews(legacyMetadata.available_views) ||
     !legacyMetadata.available_views.includes(legacyMetadata.default_view)
   ) {
@@ -154,9 +182,14 @@ export function resolveModeFieldOverlayMetadata(
 
   return Object.freeze({
     artifactPath,
+    artifactGenerationId,
+    artifactGenerationStatus,
     availableViews: Object.freeze([...legacyMetadata.available_views]),
     binaryQuery: Object.freeze({
       component: "full",
+      ...(artifactGenerationId
+        ? { expected_artifact_generation_id: artifactGenerationId }
+        : {}),
       scope_kind: "full",
       view: "complex",
     }),
@@ -166,6 +199,28 @@ export function resolveModeFieldOverlayMetadata(
     payloadValueCount,
     resourceRevision: revision,
   });
+}
+
+/**
+ * A verified field member must return the exact committed generation requested
+ * by its metadata. Legacy fields remain available through their existing solo
+ * path and do not acquire a synthetic generation identity.
+ */
+export function modeFieldOverlayArtifactGenerationMatches(
+  metadata: ResolvedModeFieldOverlayMetadata,
+  responseArtifactGenerationId: string | null | undefined,
+): boolean {
+  if (
+    metadata.artifactGenerationStatus === "legacy_unverified" &&
+    metadata.artifactGenerationId === null
+  ) {
+    return true;
+  }
+  return (
+    metadata.artifactGenerationStatus === "member_verified_owner_bound" &&
+    metadata.artifactGenerationId !== null &&
+    responseArtifactGenerationId === metadata.artifactGenerationId
+  );
 }
 
 /**

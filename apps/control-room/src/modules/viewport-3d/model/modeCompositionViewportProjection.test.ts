@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { DecodedComplexFieldVector } from "@/kernel/api/codecs";
+import type { ModeFieldComplexBinaryIdentity } from "@/kernel/resources/frequencyDomainResourceKeys";
 import type { ModeCompositionLayer } from "@/kernel/visualization/ModeCompositionController";
 
 import {
@@ -78,6 +79,27 @@ function layer(
   };
 }
 
+function identity(
+  artifactGenerationId: string,
+  fieldRevision: string,
+): ModeFieldComplexBinaryIdentity {
+  return {
+    artifactGenerationId,
+    artifactRevision: "artifact-3",
+    binaryEncoding: "FMVP;version=3",
+    fieldId: "analysis:eigen:sample-a:mode-a",
+    fieldRevision,
+    generationId: "generation-7",
+    modeId: "mode-a",
+    runId: "run-a",
+    sampleId: "sample-a",
+    scopeId: "film",
+    scopeKind: "object",
+    stageId: "stage-a",
+    topologyHash: "topology-a",
+  };
+}
+
 describe("modeCompositionViewportProjection", () => {
   it("maps an object-scoped complex field onto the shared indexed topology", () => {
     const buffer = buildModeCompositionScalarColorBuffer({
@@ -142,6 +164,33 @@ describe("modeCompositionViewportProjection", () => {
       complexPhaseRad: 1.75,
       complexRepresentation: "imag",
     });
+  });
+
+  it("keys derived buffers by the committed artifact generation and field revision", () => {
+    const common = {
+      field: field(),
+      layer: layer(),
+      requiredSurfaceNodeIndices: new Uint32Array([1, 3]),
+      topologyNodeCount: 5,
+    };
+    const publicationA = buildModeCompositionScalarColorBuffer({
+      ...common,
+      identity: identity("publication-a", "field-a"),
+    });
+    const publicationB = buildModeCompositionScalarColorBuffer({
+      ...common,
+      identity: identity("publication-b", "field-a"),
+    });
+    const updatedField = buildModeCompositionScalarColorBuffer({
+      ...common,
+      identity: identity("publication-a", "field-b"),
+    });
+
+    expect(publicationA).not.toBeNull();
+    expect(publicationB?.buildKey).not.toBe(publicationA?.buildKey);
+    expect(updatedField?.buildKey).not.toBe(publicationA?.buildKey);
+    expect(publicationB?.sourceFieldBufferId).not.toBe(publicationA?.sourceFieldBufferId);
+    expect(updatedField?.targetRevision).not.toBe(publicationA?.targetRevision);
   });
 
   it("projects scoped values onto expanded surface-face vertices", () => {

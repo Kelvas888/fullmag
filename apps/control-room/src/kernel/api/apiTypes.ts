@@ -990,6 +990,7 @@ export interface FieldVectorIdentityIssue {
 export interface FieldVectorResponseMetadata {
   component: string | null;
   domainGenerationId: string | null;
+  artifactGenerationId?: string | null;
   encoding: string | null;
   fieldIndexing: string | null;
   fieldGenerationId?: string | null;

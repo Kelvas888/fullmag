@@ -731,6 +731,7 @@ export const MeshPartLayer = memo(function MeshPartLayer({
     return buildModeCompositionScalarColorBuffer({
       field: modal.buffer.field,
       geometryNodeIndices: expandSurfaceFaces ? surfaceIndices : null,
+      identity: modal.buffer.identity,
       layer: modal.buffer.layer,
       phaseRad: modeCompositionPhaseRad,
       projectionKey: [
@@ -758,6 +759,7 @@ export const MeshPartLayer = memo(function MeshPartLayer({
     if (modal?.owner !== "modal" || !topologyModel) return null;
     return buildModeCompositionVectorLayerInput({
       field: modal.buffer.field,
+      identity: modal.buffer.identity,
       layer: modal.buffer.layer,
       phaseRad: modeCompositionPhaseRad,
       topologyNodeCount,

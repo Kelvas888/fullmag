@@ -7149,6 +7149,11 @@ export interface components {
              *     - `x`/`y`/`z`/`cN` → single component by index (nComp=1)
              */
             component?: string | null;
+            /**
+             * @description Optional optimistic-concurrency precondition for a committed analysis artifact generation.
+             *     This is distinct from `expected_generation_id`, which identifies the mesh/domain generation.
+             */
+            expected_artifact_generation_id?: string | null;
             /** @description Optional optimistic-concurrency precondition for the resolved field carrier. */
             expected_carrier_revision?: string | null;
             /** @description Optional optimistic-concurrency precondition for the domain generation. */
@@ -7385,19 +7390,22 @@ export interface components {
             /** Format: int64 */
             component_count?: number | null;
             components: string[];
-            /** @description SHA-256 digest of the immutable field payload bytes. */
+            /** @description SHA-256 digest of the field metadata and exact payload member identity. */
             content_digest?: string | null;
             /** Format: double */
             default_phase_rad?: number | null;
             default_view: string;
             field_id: string;
+            /** @description Committed publication containing this exact field member; absent for legacy artifacts. */
+            generation_id?: string | null;
+            generation_status?: null | components["schemas"]["FrequencyDomainArtifactGenerationStatus"];
             missing_reason?: string | null;
             payload_encoding?: string | null;
             /** Format: int64 */
             payload_value_count?: number | null;
             quantity: string;
             resource_key: string;
-            /** @description Content-addressed revision of the immutable field payload bytes. */
+            /** @description Content-addressed revision of the returned field metadata and immutable payload member. */
             revision?: string | null;
             schema_version: string;
             source_family: string;
@@ -21808,6 +21816,11 @@ export interface operations {
                 phase_rad?: number | null;
                 /** @description Optional optimistic-concurrency precondition for the domain generation. */
                 expected_generation_id?: string | null;
+                /**
+                 * @description Optional optimistic-concurrency precondition for a committed analysis artifact generation.
+                 *     This is distinct from `expected_generation_id`, which identifies the mesh/domain generation.
+                 */
+                expected_artifact_generation_id?: string | null;
                 /** @description Optional optimistic-concurrency precondition for the resolved field carrier. */
                 expected_carrier_revision?: string | null;
             };
@@ -21828,6 +21841,8 @@ export interface operations {
             /** @description Binary FMVP field vector. Analysis response and eigen-mode vectors use FMVP v5 metadata with the full quantity ID and domain generation identity; when a mesh carrier is available they also include topology, scope, and indexing metadata. Analysis vectors without a mesh use the explicit legacy_count_only absent-topology sentinel and cannot establish topology-bound overlay compatibility. Other scoped FEM and FDM payloads use FMVP v3 metadata with domain_generation_id, carrier topology revision/hash, scope kind/id, indexing, and optional node_indices. Multilayer FDM layer/object scopes identify their native grid carrier. Full-domain regular-grid FDM uses FMVP v3 sampled indices when max_samples is supplied and may use FMVP v2 for an uncapped complete payload. */
             200: {
                 headers: {
+                    /** @description Committed analysis artifact generation identity; present only when the served field member is verified */
+                    "x-fullmag-artifact-generation-id"?: string;
                     /** @description Resolved component projection */
                     "x-fullmag-component"?: string;
                     /** @description Domain generation identity */

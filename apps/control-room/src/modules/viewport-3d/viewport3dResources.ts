@@ -271,6 +271,7 @@ export type Viewport3DFieldIdentityMismatchReason =
   | "quantity"
   | "scope"
   | "generation"
+  | "artifact_generation"
   | "carrier"
   | "component"
   | "snapshot"
@@ -324,6 +325,18 @@ export function resolveViewport3DFieldVectorIdentityMatch(
   const responseScopeId = field.scopeId ?? envelope.responseMetadata?.scopeId ?? null;
   const responseGenerationId =
     field.domainGenerationId ?? envelope.responseMetadata?.domainGenerationId ?? null;
+  const expectedArtifactGenerationId = normalizeStringIdentity(
+    request.query.expected_artifact_generation_id,
+  );
+  const responseArtifactGenerationId = normalizeStringIdentity(
+    envelope.responseMetadata?.artifactGenerationId,
+  );
+  if (
+    expectedArtifactGenerationId !== null &&
+    responseArtifactGenerationId !== expectedArtifactGenerationId
+  ) {
+    return { matches: false, reason: "artifact_generation" };
+  }
   const responseCarrierRevision =
     field.meshTopologyHash ?? envelope.responseMetadata?.meshTopologyHash ?? null;
   const expectedGenerationId = normalizeStringIdentity(request.query.expected_generation_id);

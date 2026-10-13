@@ -11,6 +11,7 @@ import {
   type ModeFieldOverlayIntent,
   type ModeFieldOverlayTopologyIdentity,
   type ResolvedModeFieldOverlayMetadata,
+  modeFieldOverlayArtifactGenerationMatches,
   resolveModeFieldOverlayMetadata,
 } from "../visualization/ModeFieldOverlayIntent";
 import {
@@ -34,6 +35,30 @@ const MODE_FIELD_METADATA_INVALID = new Error(
   "Mode-field metadata is incomplete, stale, or not a global complex XYZ field.",
 );
 
+function modeFieldArtifactGenerationError(
+  metadata: FrequencyDomainFieldResource,
+): Error | null {
+  const generationId =
+    typeof metadata.generation_id === "string" &&
+    metadata.generation_id.trim().length > 0
+      ? metadata.generation_id
+      : null;
+  const status = metadata.generation_status ?? "legacy_unverified";
+  if (status === "member_verified_unbound") {
+    return new Error(
+      "Mode-field artifact is member_verified_unbound and cannot be joined to the viewport.",
+    );
+  }
+  if (
+    (status === "member_verified_owner_bound" && generationId === null) ||
+    (status === "legacy_unverified" && generationId !== null) ||
+    (status !== "member_verified_owner_bound" && status !== "legacy_unverified")
+  ) {
+    return new Error("Mode-field artifact generation identity is incomplete or inconsistent.");
+  }
+  return null;
+}
+
 export function resolveModeFieldOverlayMetadataRevision(
   intent: ModeFieldOverlayIntent,
   metadata: FrequencyDomainFieldResource,
@@ -41,6 +66,8 @@ export function resolveModeFieldOverlayMetadataRevision(
   return JSON.stringify({
     artifactRevision: intent.artifactRevision,
     artifactPath: metadata.artifact_path,
+    artifactGenerationId: metadata.generation_id ?? null,
+    artifactGenerationStatus: metadata.generation_status ?? null,
     contentDigest: metadata.content_digest ?? null,
     metadataRevision: metadata.revision ?? null,
     metadataStatus: metadata.status,
@@ -76,6 +103,17 @@ export function resolveModeFieldOverlayResource(
       metadata: null,
       metadataStatus: resource.status,
       status: resource.status,
+    };
+  }
+
+  const generationError = modeFieldArtifactGenerationError(resource.data);
+  if (generationError) {
+    return {
+      binaryResourceKey: null,
+      error: generationError,
+      metadata: null,
+      metadataStatus: resource.status,
+      status: "error",
     };
   }
 
@@ -281,6 +319,16 @@ export function useModeFieldOverlayIntentResource({
           ) {
             throw new Error(
               "Analysis result field binary revision failed validation.",
+            );
+          }
+          if (
+            !modeFieldOverlayArtifactGenerationMatches(
+              metadata,
+              response.responseMetadata.artifactGenerationId,
+            )
+          ) {
+            throw new Error(
+              "Mode-field artifact generation header is missing or does not match its committed member.",
             );
           }
           return response.data;
