@@ -20,7 +20,11 @@ class RunnerAPI {
 
   async request(path, options = {}) {
     const url = `${this.baseUrl}${path}`;
-    const timeoutMs = Number.isFinite(options.timeoutMs) ? Math.max(0, options.timeoutMs) : 15000;
+    // Elapsed timeout defaults to 15 seconds; explicitly passing null disables
+    // only that timer and still honors any caller-provided AbortSignal.
+    const timeoutMs = options.timeoutMs === null
+      ? null
+      : Number.isFinite(options.timeoutMs) ? Math.max(0, options.timeoutMs) : 15000;
     const retries = Number.isInteger(options.retries) ? Math.max(0, options.retries) : 0;
     const {
       timeoutMs: _timeoutMs,
@@ -39,19 +43,30 @@ class RunnerAPI {
     for (let attempt = 0; attempt <= retries; attempt += 1) {
       const controller = typeof AbortController === 'function' ? new AbortController() : null;
       const externalSignal = fetchOptions.signal;
+      let externalAbortRequested = Boolean(externalSignal?.aborted);
+      let timeoutTriggered = false;
       let timeoutHandle = null;
       let removeExternalAbortListener = null;
       if (controller) {
         if (externalSignal) {
           if (externalSignal.aborted) {
+            externalAbortRequested = true;
             controller.abort();
           } else {
-            const onExternalAbort = () => controller.abort();
+            const onExternalAbort = () => {
+              externalAbortRequested = true;
+              controller.abort();
+            };
             externalSignal.addEventListener('abort', onExternalAbort, { once: true });
             removeExternalAbortListener = () => externalSignal.removeEventListener('abort', onExternalAbort);
           }
         }
-        timeoutHandle = setTimeout(() => controller.abort(), timeoutMs);
+        if (timeoutMs !== null && !externalAbortRequested) {
+          timeoutHandle = setTimeout(() => {
+            timeoutTriggered = true;
+            controller.abort();
+          }, timeoutMs);
+        }
       }
       const config = {
         ...fetchOptions,
@@ -96,20 +111,27 @@ class RunnerAPI {
         }
         return await res.text();
       } catch (error) {
-        const timedOut = error?.name === 'AbortError';
-        if (timedOut) {
+        const externalAbort = externalAbortRequested || externalSignal?.aborted === true;
+        const timedOut = timeoutTriggered && !externalAbort;
+        if (externalAbort && error?.name !== 'AbortError') {
+          const abortError = new Error(error?.message || `Żądanie ${path} anulowano`);
+          abortError.name = 'AbortError';
+          abortError.cause = error;
+          error = abortError;
+        } else if (timedOut) {
           const timeoutError = new Error(`Przekroczono limit ${timeoutMs} ms dla żądania ${path}`);
           timeoutError.status = 408;
           timeoutError.code = 'REQUEST_TIMEOUT';
           timeoutError.cause = error;
           error = timeoutError;
-        } else if (error.name === 'TypeError' && error.message.includes('fetch')) {
+        } else if (error?.name === 'TypeError' && error.message.includes('fetch')) {
           const netErr = new Error('Brak połączenia z koordynatorem Fullmag runner');
           netErr.status = 0;
           error = netErr;
         }
 
-        const retryable = error.status === 0 || error.status === 408 || error.code === 'REQUEST_TIMEOUT';
+        const retryable = !externalAbort && error?.name !== 'AbortError' &&
+          (error?.status === 0 || error?.status === 408 || error?.code === 'REQUEST_TIMEOUT');
         if (retryable && attempt < retries) {
           continue;
         }

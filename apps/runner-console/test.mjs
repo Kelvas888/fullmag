@@ -168,6 +168,104 @@ try {
 }
 console.log('✓ api.js timeout abort and retry verified');
 
+// A null timeout disables only the elapsed timer; a recursive inventory read
+// can outlast the old 7-second client deadline while remaining externally cancellable.
+const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
+const realFetchForResourceTimeout = globalThis.fetch;
+let fakeClockNow = 0;
+let nextFakeTimerId = 1;
+const fakeTimers = new Map();
+globalThis.setTimeout = (callback, delay = 0) => {
+  const id = nextFakeTimerId++;
+  fakeTimers.set(id, { dueAt: fakeClockNow + Math.max(0, Number(delay) || 0), callback });
+  return id;
+};
+globalThis.clearTimeout = (id) => { fakeTimers.delete(id); };
+const advanceFakeClock = async (milliseconds) => {
+  fakeClockNow += milliseconds;
+  const dueTimers = [...fakeTimers.entries()]
+    .filter(([, timer]) => timer.dueAt <= fakeClockNow)
+    .sort((left, right) => left[1].dueAt - right[1].dueAt);
+  for (const [id, timer] of dueTimers) {
+    if (!fakeTimers.delete(id)) continue;
+    timer.callback();
+    await Promise.resolve();
+  }
+};
+try {
+  let resolveInventoryFetch;
+  let inventoryFetchAttempts = 0;
+  let inventoryFetchSignal = null;
+  globalThis.fetch = (_url, options = {}) => {
+    inventoryFetchAttempts += 1;
+    inventoryFetchSignal = options.signal;
+    return new Promise(resolve => { resolveInventoryFetch = resolve; });
+  };
+  const inventoryAbortController = new AbortController();
+  let inventorySettled = false;
+  const slowInventory = api.getStorageResources({
+    timeoutMs: null,
+    retries: 1,
+    signal: inventoryAbortController.signal,
+  }).then(value => {
+    inventorySettled = true;
+    return value;
+  }, error => {
+    inventorySettled = true;
+    throw error;
+  });
+  await Promise.resolve();
+  assert.strictEqual(inventoryFetchAttempts, 1, 'resource inventory must start one pending fetch');
+  assert(inventoryFetchSignal, 'resource inventory must retain an AbortController signal');
+  assert.strictEqual(fakeTimers.size, 0, 'timeoutMs:null must not schedule an elapsed timer');
+  await advanceFakeClock(8001);
+  assert.strictEqual(inventorySettled, false, 'a valid inventory read must remain pending beyond seven seconds');
+  assert.strictEqual(inventoryFetchAttempts, 1, 'a slow inventory read must not be retried');
+  assert.strictEqual(inventoryFetchSignal.aborted, false, 'elapsed time must not abort an untimed inventory read');
+  resolveInventoryFetch({
+    ok: true,
+    status: 200,
+    headers: { get: () => 'application/json' },
+    json: async () => ({ resources: ['complete inventory'] }),
+  });
+  assert.deepStrictEqual(await slowInventory, { resources: ['complete inventory'] });
+
+  let externallyAbortedMutationAttempts = 0;
+  globalThis.fetch = (_url, options = {}) => {
+    externallyAbortedMutationAttempts += 1;
+    return new Promise((_, reject) => {
+      options.signal.addEventListener('abort', () => {
+        const error = new Error('aborted by caller');
+        error.name = 'AbortError';
+        reject(error);
+      }, { once: true });
+    });
+  };
+  const externalAbortController = new AbortController();
+  const abortedMutation = api.request('/external-abort-mutation', {
+    method: 'POST',
+    body: '{}',
+    timeoutMs: null,
+    retries: 1,
+    signal: externalAbortController.signal,
+  });
+  const abortExpectation = assert.rejects(
+    abortedMutation,
+    error => error?.name === 'AbortError' && error.status === undefined && error.code === undefined,
+    'external cancellation must remain AbortError rather than becoming HTTP 408',
+  );
+  await Promise.resolve();
+  externalAbortController.abort();
+  await abortExpectation;
+  assert.strictEqual(externallyAbortedMutationAttempts, 1, 'an externally aborted mutation must never retry');
+} finally {
+  globalThis.fetch = realFetchForResourceTimeout;
+  globalThis.setTimeout = realSetTimeout;
+  globalThis.clearTimeout = realClearTimeout;
+}
+console.log('✓ untimed resource inventory and non-retryable external cancellation verified');
+
 // 5. Setup synthetic DOM environment to test component and view renders
 class MockElement {
   constructor(tag = 'div', id = '') {
@@ -431,9 +529,13 @@ state.closeJobDetails();
 console.log('✓ BuildDetailsModal honest empty states, peak/avg metrics and dynamic retention verified');
 
 // 11. Test StorageView completeness badge and error handling
-api.getStorageVolumes = async () => [
-  { name: 'Root Volume', mount_point: '/storage', total_bytes: 100e9, used_bytes: 20e9, free_bytes: 80e9, reserved_bytes: 10e9, warning_threshold_bytes: 15e9, status: 'healthy' }
-];
+let observedStorageVolumeOptions = null;
+api.getStorageVolumes = async (options = {}) => {
+  observedStorageVolumeOptions = options;
+  return [
+    { name: 'Root Volume', mount_point: '/storage', total_bytes: 100e9, used_bytes: 20e9, free_bytes: 80e9, reserved_bytes: 10e9, warning_threshold_bytes: 15e9, status: 'healthy' }
+  ];
+};
 api.getStorageResources = async () => ({
   total_measured_bytes: 20e9,
   measured_at: new Date().toISOString(),
@@ -450,30 +552,41 @@ const storageMod = await import('./src/views/StorageView.js');
 // A slow resources scan must not hold back the fast volumes response.
 let resolveStorageResources;
 let pendingStorageRequests = 0;
-api.getStorageResources = () => new Promise(resolve => {
+let deferredStorageOptions = null;
+api.getStorageResources = (options = {}) => new Promise(resolve => {
   pendingStorageRequests += 1;
+  deferredStorageOptions = options;
   resolveStorageResources = resolve;
 });
 const deferredStorageContainer = new MockElement('div');
 const deferredStorageHandle = storageMod.renderStorageView(deferredStorageContainer);
-deferredStorageHandle.update();
-deferredStorageHandle.update();
+const deferredLoadPromise = deferredStorageHandle.update();
+assert.strictEqual(deferredStorageHandle.update(), deferredLoadPromise,
+  'repeated StorageView updates must share one in-flight load promise');
 await new Promise(r => setTimeout(r, 20));
 const deferredVolumesEl = deferredStorageContainer.querySelector('#volumes-table-container');
 const deferredCategoriesEl = deferredStorageContainer.querySelector('#categories-breakdown-container');
 assert(deferredVolumesEl.innerHTML.includes('Root Volume'), 'StorageView must render volumes before resource scan completes');
 assert(deferredCategoriesEl.innerHTML.includes('Wczytywanie podziału klas storage'), 'StorageView must keep resource sections loading independently');
 assert.strictEqual(pendingStorageRequests, 1, 'Repeated updates must share the pending storage request');
+assert.strictEqual(observedStorageVolumeOptions.timeoutMs, 5000,
+  'the independent storage-volume request must retain its bounded five-second timeout');
+assert.strictEqual(deferredStorageOptions.timeoutMs, null,
+  'StorageView must opt the potentially long resource inventory out of elapsed timeout');
+assert(deferredStorageOptions.signal && typeof deferredStorageOptions.signal.aborted === 'boolean',
+  'StorageView must pass a lifecycle AbortSignal to the resource inventory request');
 resolveStorageResources({ total_measured_bytes: 1, categories: [], resources: [] });
-await new Promise(r => setTimeout(r, 20));
+await deferredLoadPromise;
 assert(deferredCategoriesEl.innerHTML.includes('Brak danych inwentaryzacji klas storage'), 'StorageView must render resource response after deferred scan resolves');
 deferredStorageHandle.destroy();
 
 // Leaving the view must prevent a late response from writing into its old DOM.
 let resolveLateStorageResources;
 let lateStorageRequests = 0;
-api.getStorageResources = () => new Promise(resolve => {
+let lateStorageOptions = null;
+api.getStorageResources = (options = {}) => new Promise(resolve => {
   lateStorageRequests += 1;
+  lateStorageOptions = options;
   resolveLateStorageResources = resolve;
 });
 const lateStorageContainer = new MockElement('div');
@@ -481,10 +594,15 @@ const lateStorageHandle = storageMod.renderStorageView(lateStorageContainer);
 await new Promise(r => setTimeout(r, 20));
 const lateCategoriesEl = lateStorageContainer.querySelector('#categories-breakdown-container');
 const beforeDestroy = lateCategoriesEl.innerHTML;
+const lateStorageLoad = lateStorageHandle.update();
+assert.strictEqual(lateStorageOptions.timeoutMs, null,
+  'destroy-lifecycle inventory request must not use an elapsed timeout');
 lateStorageHandle.destroy();
+assert.strictEqual(lateStorageOptions.signal.aborted, true,
+  'destroying StorageView must abort its pending inventory request');
 lateStorageHandle.update();
 resolveLateStorageResources({ total_measured_bytes: 1, categories: [], resources: [] });
-await new Promise(r => setTimeout(r, 20));
+await lateStorageLoad;
 assert.strictEqual(lateCategoriesEl.innerHTML, beforeDestroy, 'Destroyed StorageView must discard late resource response');
 assert.strictEqual(lateStorageRequests, 1, 'Destroyed StorageView must not start new requests');
 
@@ -504,6 +622,50 @@ await new Promise(r => setTimeout(r, 20));
 const catEl = storageContainer.querySelector('#categories-breakdown-container');
 assert(catEl.innerHTML.includes('Częściowy'), 'StorageView must render Częściowy badge for partial completeness');
 assert(catEl.innerHTML.includes('Pełny (100%)'), 'StorageView must render Pełny badge for complete completeness');
+
+const storageResourcesBeforeStaleCheck = api.getStorageResources;
+const lastGoodInventory = {
+  total_measured_bytes: 15,
+  measured_at: new Date().toISOString(),
+  categories: [
+    { name: 'Last good category', logical_bytes: 15, file_count: 1, completeness: 'complete', eligible_cleanup_bytes: 0, reclaimable_bytes: 0 },
+  ],
+  resources: [
+    { resource_id: 'last-good-resource', name: 'Last good item', path: '/storage/last-good', category: 'sources', size_bytes: 15, file_count: 1, pinned: false, why_retained: 'active' },
+  ],
+};
+api.getStorageResources = async () => lastGoodInventory;
+const staleInventoryContainer = new MockElement('div');
+const staleInventoryHandle = storageMod.renderStorageView(staleInventoryContainer);
+await staleInventoryHandle.update();
+const staleInventoryCategories = staleInventoryContainer.querySelector('#categories-breakdown-container');
+const staleInventoryResources = staleInventoryContainer.querySelector('#resources-table-container');
+assert(staleInventoryCategories.innerHTML.includes('Last good category'),
+  'the last successful category inventory must be visible before a failed refresh');
+assert(staleInventoryResources.innerHTML.includes('Last good item'),
+  'the last successful resource inventory must be visible before a failed refresh');
+api.getStorageResources = async () => { throw new Error('Inventory refresh unavailable'); };
+await staleInventoryHandle.update();
+assert(staleInventoryCategories.innerHTML.includes('Last good category') &&
+  staleInventoryCategories.innerHTML.includes('Inventory refresh unavailable') &&
+  staleInventoryCategories.innerHTML.includes('stale'),
+  'a refresh failure must preserve category data and visibly identify it as stale');
+assert(staleInventoryResources.innerHTML.includes('Last good item') &&
+  staleInventoryResources.innerHTML.includes('Inventory refresh unavailable') &&
+  staleInventoryResources.innerHTML.includes('stale'),
+  'a refresh failure must preserve detailed resources and visibly identify them as stale');
+staleInventoryHandle.destroy();
+
+api.getStorageResources = async () => { throw new Error('Initial inventory unavailable'); };
+const firstLoadErrorContainer = new MockElement('div');
+const firstLoadErrorHandle = storageMod.renderStorageView(firstLoadErrorContainer);
+await firstLoadErrorHandle.update();
+assert(firstLoadErrorContainer.querySelector('#categories-breakdown-container').innerHTML.includes('Initial inventory unavailable'),
+  'an initial category inventory failure must be visible instead of leaving a spinner');
+assert(firstLoadErrorContainer.querySelector('#resources-table-container').innerHTML.includes('Initial inventory unavailable'),
+  'an initial detailed inventory failure must be visible instead of leaving a spinner');
+firstLoadErrorHandle.destroy();
+api.getStorageResources = storageResourcesBeforeStaleCheck;
 
 const originalRetentionMethods = {
   create: api.createRetentionPlan,

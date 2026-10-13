@@ -8,8 +8,10 @@ export function renderStorageView(container) {
   let activePlan = null;
   let volumesError = null;
   let resourcesError = null;
+  let resourcesRefreshing = false;
   let storageLoadGeneration = 0;
   let storageLoadPromise = null;
+  let resourcesAbortController = null;
   let destroyed = false;
   let planObservation = 0;
   let planRequestGeneration = 0;
@@ -416,6 +418,7 @@ export function renderStorageView(container) {
     const generation = ++storageLoadGeneration;
     volumesError = null;
     resourcesError = null;
+    resourcesRefreshing = resourcesData !== null;
 
     // Keep the last good response visible during a refresh. On the initial
     // load the null values leave the individual sections on their own spinner.
@@ -441,25 +444,58 @@ export function renderStorageView(container) {
         renderVolumes(null, volumesError);
       });
 
+    const requestController = typeof AbortController === 'function'
+      ? new AbortController()
+      : null;
+    resourcesAbortController = requestController;
     const resourcesRequest = Promise.resolve()
-      .then(() => api.getStorageResources({ timeoutMs: 7000, retries: 1 }))
+      .then(() => api.getStorageResources({
+        timeoutMs: null,
+        retries: 1,
+        ...(requestController ? { signal: requestController.signal } : {}),
+      }))
       .then((value) => {
         if (generation !== storageLoadGeneration) return;
         resourcesData = value;
         resourcesError = null;
+        resourcesRefreshing = false;
         renderCategories(resourcesData, resourcesError);
         renderResourcesTable(resourcesData, resourcesError);
       })
       .catch((err) => {
         if (generation !== storageLoadGeneration) return;
-        resourcesData = null;
         resourcesError = err;
-        renderCategories(null, resourcesError);
-        renderResourcesTable(null, resourcesError);
+        resourcesRefreshing = false;
+        renderCategories(resourcesData, resourcesError);
+        renderResourcesTable(resourcesData, resourcesError);
+      })
+      .finally(() => {
+        if (resourcesAbortController === requestController) {
+          resourcesAbortController = null;
+        }
       });
     storageLoadPromise = Promise.allSettled([volumesRequest, resourcesRequest])
       .finally(() => { storageLoadPromise = null; });
     return storageLoadPromise;
+  }
+
+  function renderResourceSnapshotNotice(err) {
+    if (resourcesRefreshing) {
+      return `
+        <div class="loading-spinner storage-stale-notice" role="status">
+          Odświeżanie inwentarza; widoczne dane pochodzą z poprzedniego odczytu.
+        </div>
+      `;
+    }
+    if (err) {
+      return `
+        <div class="error-box storage-stale-notice" role="status">
+          <strong>Nie udało się odświeżyć inwentarza; wyświetlane dane są nieaktualne (stale):</strong>
+          ${escapeHtml(err.message || 'Nie udało się pobrać danych inwentaryzacji storage.')}
+        </div>
+      `;
+    }
+    return '';
   }
 
   function renderVolumes(vols, err = null) {
@@ -527,7 +563,7 @@ export function renderStorageView(container) {
     const el = container.querySelector('#categories-breakdown-container');
     if (!el) return;
 
-    if (err) {
+    if (err && resData === null) {
       const statusLabel = state.connectionStatus === 'disconnected' ? 'Rozłączono z koordynatorem' : 'Błąd inwentaryzacji zasobów';
       el.innerHTML = `
         <div class="error-box">
@@ -542,18 +578,20 @@ export function renderStorageView(container) {
       return;
     }
 
+    const staleNotice = renderResourceSnapshotNotice(err);
     if (!resData || !resData.categories || resData.categories.length === 0) {
-      el.innerHTML = '<p class="empty-hint">Brak danych inwentaryzacji klas storage.</p>';
+      el.innerHTML = `${staleNotice}<p class="empty-hint">Brak danych inwentaryzacji klas storage.</p>`;
       return;
     }
 
     const cats = resData.categories;
     const totalBytes = resData.total_measured_bytes || 1;
     const measuredAt = resData.measured_at ? new Date(resData.measured_at).getTime() : null;
-    const isStale = state.connectionStatus === 'stale' || (measuredAt !== null && !Number.isNaN(measuredAt) && (Date.now() - measuredAt > 120000));
+    const isStale = Boolean(err) || resourcesRefreshing || state.connectionStatus === 'stale' ||
+      (measuredAt !== null && !Number.isNaN(measuredAt) && (Date.now() - measuredAt > 120000));
 
     function getCompletenessBadge(cat) {
-      if (err || cat.error) {
+      if (cat.error) {
         return '<span class="badge badge-danger">Błąd skanu</span>';
       }
       if (state.connectionStatus === 'disconnected') {
@@ -581,6 +619,7 @@ export function renderStorageView(container) {
     }
 
     el.innerHTML = `
+      ${staleNotice}
       <div class="storage-bar-wrapper">
         <div class="storage-bar">
           ${cats.map((c, i) => {
@@ -779,7 +818,7 @@ export function renderStorageView(container) {
     const el = container.querySelector('#resources-table-container');
     if (!el) return;
 
-    if (err) {
+    if (err && resData === null) {
       el.innerHTML = `
         <div class="error-box">
           <strong>Błąd inwentarza zasobów:</strong> ${escapeHtml(err.message || 'Nie udało się pobrać szczegółowych zasobów storage.')}
@@ -793,14 +832,16 @@ export function renderStorageView(container) {
       return;
     }
 
+    const staleNotice = renderResourceSnapshotNotice(err);
     if (!resData || !resData.resources || resData.resources.length === 0) {
-      el.innerHTML = '<p class="empty-hint">Brak zarejestrowanych zasobów w storage.</p>';
+      el.innerHTML = `${staleNotice}<p class="empty-hint">Brak zarejestrowanych zasobów w storage.</p>`;
       return;
     }
 
     const items = resData.resources;
 
     el.innerHTML = `
+      ${staleNotice}
       <div class="table-responsive">
         <table class="data-table">
           <thead>
@@ -884,12 +925,12 @@ export function renderStorageView(container) {
   } catch (_) { /* Browser storage availability does not gate the API. */ }
 
   return {
-    update: () => {
-      loadStorageData();
-    },
+    update: () => loadStorageData(),
     destroy: () => {
       destroyed = true;
       storageLoadGeneration += 1;
+      if (resourcesAbortController) resourcesAbortController.abort();
+      resourcesAbortController = null;
       planObservation += 1;
       planRequestGeneration += 1;
       planSnapshotGeneration += 1;
