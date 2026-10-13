@@ -3814,7 +3814,7 @@ pub(super) fn read_result_artifact_snapshot(
 
 /// Read an artifact from the captured publication when one is available.
 /// A missing member is not read from the mutable directory as a fallback.
-pub(super) fn read_result_artifact_snapshot_in_generation(
+pub(crate) fn read_result_artifact_snapshot_in_generation(
     artifact_dir: &Path,
     artifact_path: &str,
     generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
@@ -3880,8 +3880,133 @@ pub(super) fn read_result_artifact_bytes_snapshot_in_generation(
     Ok(Some((bytes, digest)))
 }
 
+/// Read the exact field payload bytes bounded by the captured member length.
+/// `try_reserve` reports address-space/allocation failure without an arbitrary
+/// scientific-size cutoff; this adapter has no independent field-size ceiling.
+/// The returned bytes are the ones whose digest and generation fence were checked.
+pub(crate) fn read_frequency_domain_field_payload_in_generation(
+    artifact_dir: &Path,
+    artifact_path: &str,
+    generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
+) -> Result<Option<(Vec<u8>, Option<fullmag_runner::artifact_generation::GenerationMember>)>, ApiError>
+{
+    let expected_member = if let Some(generation) = generation {
+        let Some(expected) = generation.commit.content.members.get(artifact_path).cloned() else {
+            ensure_generation_capture_current(artifact_dir, Some(generation))?;
+            return Ok(None);
+        };
+        Some(expected)
+    } else {
+        None
+    };
+
+    let Some(path) = try_resolve_artifact_path(artifact_dir, artifact_path)? else {
+        return if expected_member.is_some() {
+            Err(ApiError::conflict(
+                "frequency_domain_artifact_generation_member_missing",
+            ))
+        } else {
+            ensure_generation_capture_current(artifact_dir, generation)?;
+            Ok(None)
+        };
+    };
+    let file = std::fs::File::open(path).map_err(|error| {
+        ApiError::internal(format!(
+            "failed to open frequency-domain field payload '{artifact_path}': {error}"
+        ))
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        ApiError::internal(format!(
+            "failed to inspect frequency-domain field payload '{artifact_path}': {error}"
+        ))
+    })?;
+    if !metadata.is_file() {
+        return Err(ApiError::internal(format!(
+            "frequency-domain field payload '{artifact_path}' is not a regular file"
+        )));
+    }
+    let byte_length = expected_member
+        .as_ref()
+        .map(|member| member.byte_length)
+        .unwrap_or_else(|| metadata.len());
+    if metadata.len() != byte_length {
+        return Err(if expected_member.is_some() {
+            ApiError::conflict("frequency_domain_artifact_generation_member_length_mismatch")
+        } else {
+            ApiError::internal(format!(
+                "frequency-domain field payload '{artifact_path}' changed while being read"
+            ))
+        });
+    }
+    let read_limit = byte_length.checked_add(1).ok_or_else(|| {
+        ApiError::internal(format!(
+            "frequency-domain field payload '{artifact_path}' length cannot be bounded"
+        ))
+    })?;
+    let reserve = usize::try_from(read_limit).map_err(|_| {
+        ApiError::internal(format!(
+            "frequency-domain field payload '{artifact_path}' exceeds addressable memory"
+        ))
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(reserve).map_err(|error| {
+        ApiError::internal(format!(
+            "cannot allocate bounded frequency-domain field payload '{artifact_path}': {error}"
+        ))
+    })?;
+    let mut reader = file.take(read_limit);
+    let mut hasher = Sha256::new();
+    let mut measured_length = 0u64;
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = reader.read(&mut buffer).map_err(|error| {
+            ApiError::internal(format!(
+                "failed to read frequency-domain field payload '{artifact_path}': {error}"
+            ))
+        })?;
+        if count == 0 {
+            break;
+        }
+        measured_length = measured_length.checked_add(count as u64).ok_or_else(|| {
+            ApiError::internal(format!(
+                "frequency-domain field payload '{artifact_path}' length overflow"
+            ))
+        })?;
+        if measured_length > byte_length {
+            return Err(if expected_member.is_some() {
+                ApiError::conflict("frequency_domain_artifact_generation_member_length_mismatch")
+            } else {
+                ApiError::internal(format!(
+                    "frequency-domain field payload '{artifact_path}' grew while being read"
+                ))
+            });
+        }
+        hasher.update(&buffer[..count]);
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    if measured_length != byte_length {
+        return Err(if expected_member.is_some() {
+            ApiError::conflict("frequency_domain_artifact_generation_member_length_mismatch")
+        } else {
+            ApiError::internal(format!(
+                "frequency-domain field payload '{artifact_path}' changed while being read"
+            ))
+        });
+    }
+    if let Some(expected) = expected_member.as_ref() {
+        let digest = format!("sha256:{:x}", hasher.finalize());
+        if digest != expected.sha256 {
+            return Err(ApiError::conflict(
+                "frequency_domain_artifact_generation_member_mismatch",
+            ));
+        }
+    }
+    ensure_generation_capture_current(artifact_dir, generation)?;
+    Ok(Some((bytes, expected_member)))
+}
+
 /// Fence both committed publications and the absence captured for legacy reads.
-pub(super) fn ensure_generation_capture_current(
+pub(crate) fn ensure_generation_capture_current(
     root: &Path,
     generation: Option<&fullmag_runner::artifact_generation::GenerationCapture>,
 ) -> Result<(), ApiError> {
@@ -6293,6 +6418,67 @@ mod generation_snapshot_tests {
             "eigen/dispersion.csv",
             Some(&generation),
             csv.len() as u64 - 1,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn committed_field_reader_returns_only_digest_verified_generation_bytes() {
+        let root = TempGenerationRoot::new();
+        let payload = b"field-vector-generation-one";
+        let generation = publish_one_member(&root.0, "eigen/field.bin", payload, None);
+
+        let (served, member) = read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            "eigen/field.bin",
+            Some(&generation),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(served.as_slice(), payload.as_slice());
+        let member = member.expect("committed reader must return the member identity");
+        assert_eq!(member.byte_length, payload.len() as u64);
+        assert_eq!(member.sha256, format!("sha256:{:x}", Sha256::digest(payload)));
+
+        std::fs::write(root.0.join("eigen/field.bin"), b"field-vector-generation-two").unwrap();
+        assert!(read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            "eigen/field.bin",
+            Some(&generation),
+        )
+        .is_err());
+
+        std::fs::remove_file(root.0.join(COMMIT_PATH)).unwrap();
+        let (legacy, member) = read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            "eigen/field.bin",
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(legacy.as_slice(), b"field-vector-generation-two");
+        assert!(member.is_none(), "legacy reads stay explicitly unbound");
+    }
+
+    #[test]
+    fn legacy_field_reader_rejects_a_receipt_published_after_absence_capture() {
+        let root = TempGenerationRoot::new();
+        let field_path = "eigen/field.bin";
+        let earlier_bytes = b"legacy field";
+        std::fs::create_dir_all(root.0.join("eigen")).unwrap();
+        std::fs::write(root.0.join(field_path), earlier_bytes).unwrap();
+        assert!(fullmag_runner::artifact_generation::capture(&root.0)
+            .unwrap()
+            .is_none());
+
+        // The caller passes None because it captured an earlier absence. A
+        // publication arriving before the read returns must invalidate it.
+        let published_bytes = b"published field";
+        publish_one_member(&root.0, field_path, published_bytes, None);
+        assert!(read_frequency_domain_field_payload_in_generation(
+            &root.0,
+            field_path,
+            None,
         )
         .is_err());
     }

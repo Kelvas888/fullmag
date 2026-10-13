@@ -3020,3 +3020,25 @@ z ich SHA-256. Współdzielenie blobu nie znosi odrębności selektorów.
 ## Addytywna generacja treści — C03 (ADR 0058)
 
 Kontrakt publikacji `frequency_domain_artifact_generation.v1` określa [ADR 0058](../adr/0058-frequency-domain-content-generation.md). Marker `frequency_domain/generation.v1.json` wiąże finalne length/SHA256 członków i jawnego publishera. Nie zastępuje spectrum schema, jednostek SI, certificate, scientific qualification ani directory artifact_set_id. Brak markera oznacza legacy_unverified, a brak producer — unbound. Zużyte bajty i końcowy marker muszą zgadzać się z jednym capture; mismatch nie może dawać ready ani verified multi-artifact join. Implementacja API/typed transport/UI w toku, runtime NOT VERIFIED.
+
+
+### C03 — metadane pola i binarny data plane
+
+`FieldResource.generation_id` i `generation_status` są addytywne i dotyczą
+publikacji treści frequency-domain. Nie zastępują generacji siatki.
+Zapytanie wektora dla committed member wymaga `expected_artifact_generation_id`
+z metadanych; istniejące `expected_generation_id` pozostaje warunkiem siatki.
+Brak lub niezgodne artifact ID daje conflict, aby dwa oddzielne żądania HTTP
+nie mogły przypadkowo połączyć metadanych z kolejną publikacją w tym samym folderze.
+Po sprawdzeniu pointer JSON, długości, SHA-256 faktycznie odczytanych bajtów,
+producenta i końcowego markera odpowiedź zwraca osobny nagłówek
+`x-fullmag-artifact-generation-id`. Klient musi porównać go z przypiętym ID;
+nagłówek generacji siatki zachowuje dotychczasowe znaczenie.
+
+Legacy bez markera pozostaje dostępne jako pojedynczy odczyt, bez dowodu
+spójności generacji i bez artifact-generation header. Nowy marker pojawiający
+się w trakcie takiego odczytu unieważnia capture. Payload jest ograniczony
+deklarowaną długością (legacy: długością otwartego pliku), sprawdzeniem zakresu
+adresowego i kontrolowanym błędem rezerwacji pamięci. Nie ma niezależnego limitu
+pamięci całego przekształcenia pola; dekodowanie/projekcja mogą wymagać kolejnych
+buforów. Pozostaje to długiem wydajnościowym, nie dowodem kwalifikacji runtime.

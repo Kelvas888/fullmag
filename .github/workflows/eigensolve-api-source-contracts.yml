@@ -12,6 +12,9 @@ on:
       - 'crates/fullmag-api/src/router_v2/handlers/data/fields.rs'
       - 'crates/fullmag-api/src/router_v2/handlers/data/quantities.rs'
       - 'crates/fullmag-api/src/router_v2/handlers/analysis/results.rs'
+      - 'crates/fullmag-api/src/router_v2/handlers/analysis/frequency_domain.rs'
+      - 'crates/fullmag-api/src/schemas/fields.rs'
+      - 'crates/fullmag-runner/src/artifact_generation.rs'
       - 'crates/fullmag-api/src/router_v2/handlers/analysis/postprocessing.rs'
       - 'crates/fullmag-api/src/router_v2/tests/postprocessing_definitions.rs'
 
@@ -40,6 +43,16 @@ jobs:
           cargo test --locked -p fullmag-api --bin fullmag-api router_v2::handlers::analysis::results::tests -- --nocapture | tee "$RUNNER_TEMP/result-datasets.log"
           grep -F "multi_stage_hysteresis_manifests_preserve_resolved_source_paths_and_revisions ... ok" "$RUNNER_TEMP/result-datasets.log"
           grep -F "resolved_hysteresis_source_ref_rejects_parent_components ... ok" "$RUNNER_TEMP/result-datasets.log"
+      - name: Run captured artifact generation and field binary contracts
+        run: |
+          set -o pipefail
+          cargo test --locked -p fullmag-runner --lib artifact_generation::tests -- --nocapture
+          cargo test --locked -p fullmag-api --bin fullmag-api router_v2::handlers::analysis::frequency_domain::tests::artifact_generation_status_uses_explicit_wire_values -- --exact
+          cargo test --locked -p fullmag-api --bin fullmag-api router_v2::handlers::analysis::results::generation_snapshot_tests -- --nocapture | tee "$RUNNER_TEMP/artifact-generations.log"
+          grep -F "committed_field_reader_returns_only_digest_verified_generation_bytes ... ok" "$RUNNER_TEMP/artifact-generations.log"
+          grep -F "legacy_capture_fence_rejects_a_new_publication ... ok" "$RUNNER_TEMP/artifact-generations.log"
+          cargo test --locked -p fullmag-api --bin fullmag-api router_v2::handlers::data::fields::tests::analysis_artifact_generation_precondition_requires_metadata_binding -- --exact
+          cargo test --locked -p fullmag-api --bin fullmag-api router_v2::handlers::data::fields::tests::artifact_generation_header_is_emitted_only_for_a_verified_member -- --exact
       - name: Run older callback magnetization publication contract
         run: cargo test --locked -p fullmag-api --bin fullmag-api router_v2::tests::v2_older_runtime_m_frame_preserves_newer_selected_source_and_bundle -- --exact
       - name: Run physical row and bundle consistency contract

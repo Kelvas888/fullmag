@@ -98,7 +98,11 @@ fn is_reparse_point(metadata: &fs::Metadata) -> bool {
 fn is_reparse_point(_: &fs::Metadata) -> bool { false }
 
 fn hash_file(path: &Path) -> io::Result<GenerationMember> {
-    let mut file = fs::File::open(path)?;
+    hash_file_with_budget(path, fs::metadata(path)?.len())
+}
+
+fn hash_file_with_budget(path: &Path, byte_budget: u64) -> io::Result<GenerationMember> {
+    let mut file = fs::File::open(path)?.take(byte_budget.saturating_add(1));
     let mut hasher = Sha256::new();
     let mut byte_length = 0u64;
     let mut buffer = [0u8; 65536];
@@ -107,6 +111,7 @@ fn hash_file(path: &Path) -> io::Result<GenerationMember> {
         if count == 0 { break; }
         byte_length = byte_length.checked_add(count as u64)
             .ok_or_else(|| invalid("generation member length overflow"))?;
+        if byte_length > byte_budget { return Err(invalid("generation member grew during hashing")); }
         hasher.update(&buffer[..count]);
     }
     Ok(GenerationMember { byte_length, sha256: format!("sha256:{:x}", hasher.finalize()) })
@@ -218,6 +223,23 @@ impl GenerationCapture {
         Ok(())
     }
 
+    /// Streaming membership check for metadata endpoints. This does not pin a
+    /// later data-plane request; that request must verify its own served bytes.
+    pub fn verify_member(&self, root: &Path, relative: &str) -> io::Result<GenerationMember> {
+        let expected = self.commit.content.members.get(relative)
+            .ok_or_else(|| invalid("artifact is not a member of the captured generation"))?;
+        let path = checked_path(root, relative)?;
+        if fs::metadata(&path)?.len() != expected.byte_length {
+            return Err(invalid("frequency-domain generation member length changed"));
+        }
+        let measured = hash_file_with_budget(&path, expected.byte_length)?;
+        if measured != *expected {
+            return Err(invalid("frequency-domain generation member changed"));
+        }
+        self.ensure_current(root)?;
+        Ok(measured)
+    }
+
     /// Returns the very bytes whose membership was verified, not a second read.
     pub fn read_member(&self, root: &Path, relative: &str) -> io::Result<Vec<u8>> {
         let maximum = self.commit.content.members.get(relative)
@@ -237,8 +259,14 @@ impl GenerationCapture {
         if file.metadata()?.len() != expected.byte_length {
             return Err(invalid("frequency-domain generation member length changed"));
         }
+        let read_limit = expected.byte_length.checked_add(1)
+            .ok_or_else(|| invalid("generation member length cannot be bounded"))?;
+        let reserve = usize::try_from(read_limit)
+            .map_err(|_| invalid("generation member exceeds addressable memory"))?;
         let mut bytes = Vec::new();
-        file.take(expected.byte_length.saturating_add(1)).read_to_end(&mut bytes)?;
+        bytes.try_reserve_exact(reserve)
+            .map_err(|error| invalid(format!("cannot allocate bounded generation member: {error}")))?;
+        file.take(read_limit).read_to_end(&mut bytes)?;
         if bytes.len() as u64 != expected.byte_length || digest(&bytes) != expected.sha256 {
             return Err(invalid("frequency-domain generation member changed"));
         }
@@ -270,6 +298,7 @@ mod tests {
         let tmp = Temp::new(); fixture(&tmp.0);
         let old = capture(&tmp.0).unwrap().unwrap();
         assert_eq!(old.read_member(&tmp.0, "eigen/dispersion.csv").unwrap(), b"two");
+        assert_eq!(old.verify_member(&tmp.0, "eigen/dispersion.csv").unwrap().byte_length, 3);
         assert!(old.read_member_bounded(&tmp.0, "eigen/dispersion.csv", 2).is_err());
         assert_eq!(old.read_member_bounded(&tmp.0, "eigen/dispersion.csv", 3).unwrap(), b"two");
         let mut tampered = old.clone();
@@ -279,6 +308,7 @@ mod tests {
         assert!(tampered.ensure_current(&tmp.0).is_err());
         fs::write(tmp.0.join("eigen/dispersion.csv"), b"new").unwrap();
         assert!(old.read_member(&tmp.0, "eigen/dispersion.csv").is_err());
+        assert!(old.verify_member(&tmp.0, "eigen/dispersion.csv").is_err());
         publish(&tmp.0, None, ["eigen/spectrum.json".into(), "eigen/dispersion.csv".into()]).unwrap();
         let new = capture(&tmp.0).unwrap().unwrap();
         assert_ne!(old.commit.generation_id, new.commit.generation_id);
