@@ -1218,6 +1218,23 @@
       "subtests_passed": 147,
       "conclusion": "success",
       "evidence": "Eight explicit A1 gate regressions PASS; external model equivalence and scientific qualification NOT VERIFIED."
+    },
+    {
+      "run_id": 38351063325,
+      "sha": "4a80754b8b5531f86c04730f5f475ddc267a20f5",
+      "scope": "scoped_ui_source_contracts_with_indexed_fmvp5",
+      "passed": 325,
+      "test_files": 27,
+      "conclusion": "success",
+      "evidence": "Typecheck, architecture, React Doctor85 PASS. Explicit FMVP5 node map preserved and mismatched versions/indices/topology rejected. Browser/WebGL NOT VERIFIED."
+    },
+    {
+      "run_id": 38351275794,
+      "sha": "754f07787dfe40a707b8a7c4aa569433b90dee76",
+      "scope": "tetra_only_eigen_tracking_planner_admission",
+      "passed": 3,
+      "conclusion": "success",
+      "evidence": "Named negative prism/mixed and positive tetra planner guards PASS. Production unchanged; native mixed tracking and scientific qualification NOT VERIFIED."
     }
   ]
 }
