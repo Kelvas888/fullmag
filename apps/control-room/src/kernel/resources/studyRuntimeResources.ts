@@ -76,6 +76,12 @@ import {
   SIMULATION_STAGES_EXECUTION_PATH,
 } from "../api/apiPaths";
 import { ControlRoomApiError } from "../api/ControlRoomApi";
+import {
+  hasSessionActiveLaneDeclaration,
+  projectFlatActiveLaneDiscretization,
+  resolveSessionDiscretization,
+  type SessionDiscretizationCapabilitiesProjection,
+} from "./sessionDiscretization";
 import type {
   BinaryResourceResult,
   ArtifactResource,
@@ -259,7 +265,7 @@ type StudyRuntimeCommandSessionStatus = {
   capabilities: Pick<
     LiveStatusResource["capabilities"],
     "binary_fields" | "explicit_topology"
-  >;
+  > & SessionDiscretizationCapabilitiesProjection;
   domain: Pick<LiveStatusResource["domain"], "discretization">;
   resources: Pick<
     LiveStatusResource["resources"],
@@ -281,11 +287,23 @@ export function selectStudyRuntimeCommandSessionStatus(status: {
   data: LiveStatusResource | null;
 }): StudyRuntimeCommandSessionStatus | null {
   if (!status.data) return null;
+  const capabilities: StudyRuntimeCommandSessionStatus["capabilities"] = {
+    binary_fields: status.data.capabilities?.binary_fields ?? false,
+    explicit_topology: status.data.capabilities?.explicit_topology ?? false,
+  };
+  const sourceCapabilities = status.data.capabilities;
+  const flatLane = projectFlatActiveLaneDiscretization(sourceCapabilities);
+  if (
+    Object.prototype.hasOwnProperty.call(
+      sourceCapabilities ?? {},
+      "active_lane",
+    )
+  ) {
+    capabilities.active_lane = sourceCapabilities?.active_lane ?? null;
+  }
+  if (flatLane) capabilities.active_lane_discretization = flatLane.value;
   return {
-    capabilities: {
-      binary_fields: status.data.capabilities.binary_fields,
-      explicit_topology: status.data.capabilities.explicit_topology,
-    },
+    capabilities,
     domain: {
       discretization: status.data.domain.discretization,
     },
@@ -316,6 +334,20 @@ export function studyRuntimeCommandSessionStatusEquals(
   if (previous === next) return true;
   if (!previous || !next) return previous === next;
   return (
+    Object.prototype.hasOwnProperty.call(previous.capabilities, "active_lane") ===
+      Object.prototype.hasOwnProperty.call(next.capabilities, "active_lane") &&
+    previous.capabilities.active_lane?.resolved?.discretization ===
+      next.capabilities.active_lane?.resolved?.discretization &&
+    Object.prototype.hasOwnProperty.call(
+      previous.capabilities,
+      "active_lane_discretization",
+    ) ===
+      Object.prototype.hasOwnProperty.call(
+        next.capabilities,
+        "active_lane_discretization",
+      ) &&
+    previous.capabilities.active_lane_discretization ===
+      next.capabilities.active_lane_discretization &&
     previous.capabilities.binary_fields === next.capabilities.binary_fields &&
     previous.capabilities.explicit_topology ===
       next.capabilities.explicit_topology &&
@@ -350,6 +382,30 @@ export function runtimeCommandControlSessionStatusEquals(
 ): boolean {
   if (previous === next) return true;
   if (!previous || !next) return previous === next;
+  const previousCapabilities = previous.capabilities as
+    LiveStatusResource["capabilities"] & SessionDiscretizationCapabilitiesProjection;
+  const nextCapabilities = next.capabilities as
+    LiveStatusResource["capabilities"] & SessionDiscretizationCapabilitiesProjection;
+  if (
+    Object.prototype.hasOwnProperty.call(
+      previousCapabilities,
+      "active_lane",
+    ) !==
+      Object.prototype.hasOwnProperty.call(nextCapabilities, "active_lane") ||
+    resolveSessionDiscretization(previous) !==
+      resolveSessionDiscretization(next)
+  ) {
+    return false;
+  }
+  const previousFlatLane =
+    projectFlatActiveLaneDiscretization(previousCapabilities);
+  const nextFlatLane = projectFlatActiveLaneDiscretization(nextCapabilities);
+  if (
+    Boolean(previousFlatLane) !== Boolean(nextFlatLane) ||
+    previousFlatLane?.value !== nextFlatLane?.value
+  ) {
+    return false;
+  }
   if (previous.capabilities.binary_fields !== next.capabilities.binary_fields) {
     return false;
   }
@@ -451,10 +507,7 @@ export function shouldLoadRuntimeMeshManifest(
         capabilities: Pick<
           LiveStatusResource["capabilities"],
           "explicit_topology"
-        > & {
-          active_lane_discretization?: string | null;
-          active_lane?: LiveStatusResource["capabilities"]["active_lane"] | null;
-        };
+        > & SessionDiscretizationCapabilitiesProjection;
         domain: Pick<LiveStatusResource["domain"], "discretization">;
         resources: Pick<LiveStatusResource["resources"], "mesh_revision"> &
           Partial<
@@ -465,26 +518,11 @@ export function shouldLoadRuntimeMeshManifest(
     | undefined,
 ): boolean {
   if (!enabled || !status) return false;
-  const hasActiveLaneDiscretization = Object.prototype.hasOwnProperty.call(
-    status.capabilities,
-    "active_lane_discretization",
-  );
-  const hasActiveLane = Object.prototype.hasOwnProperty.call(
-    status.capabilities,
-    "active_lane",
-  );
-  const activeLaneDiscretization = hasActiveLaneDiscretization
-    ? status.capabilities.active_lane_discretization
-    : hasActiveLane
-      ? status.capabilities.active_lane?.resolved?.discretization ?? null
-      : undefined;
-  const laneDiscretization =
-    activeLaneDiscretization !== undefined
-      ? activeLaneDiscretization
-      : status.domain.discretization;
-  const requiresSharedDomain =
-    status.capabilities.explicit_topology ||
-    laneDiscretization?.toLowerCase() === "fem";
+  const laneDeclared = hasSessionActiveLaneDeclaration(status);
+  const lane = resolveSessionDiscretization(status);
+  const requiresSharedDomain = laneDeclared
+    ? lane === "fem"
+    : status.capabilities.explicit_topology || lane === "fem";
   return (
     requiresSharedDomain &&
     (hasPositiveRevision(status.resources.mesh_revision) ||

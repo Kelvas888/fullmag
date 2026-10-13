@@ -139,6 +139,22 @@ describe("airboxInspectorRuntimeStatus", () => {
     expect(isExplicitFemAirboxRuntime(status)).toBe(false);
   });
 
+  it("keeps a selected FDM Airbox target unresolved when live mode is unresolved", () => {
+    const selection = {
+      kind: "airbox.multilayer.target",
+      ref: { type: "airbox", visualizationTargetId: "airbox" },
+    } as never;
+    const status = selectAirboxInspectorRuntimeStatus({
+      data: {
+        capabilities: { explicit_topology: false, active_lane: null },
+        domain: { discretization: "fdm" },
+        resources: { mesh_build_revision: 0, mesh_revision: 0 },
+      } as never,
+    });
+
+    expect(resolveAirboxInspectorLane(selection, status)).toBe("unresolved");
+  });
+
   it("keeps the multilayer target on the FDM lane even though its display target is Airbox", () => {
     const selection = {
       kind: "airbox.multilayer.target",

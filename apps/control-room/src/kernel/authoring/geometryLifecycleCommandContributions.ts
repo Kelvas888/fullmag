@@ -60,6 +60,7 @@ import {
 } from "./authoringHistoryMutation";
 import { awaitMeshBuildConfirmation, type MeshBuildConfirmCommandId } from "./meshBuildConfirmation";
 import { SESSION_STATUS_RESOURCE_KEY } from "../resources/useSessionStatus";
+import { resolveSessionDiscretization } from "../resources/sessionDiscretization";
 
 function deleteObjectBlockedReason(context: CommandContext, ignoreReservation = false): string | null {
   const controller = context.objectEditSession;
@@ -258,7 +259,8 @@ export function resolveMeshCommandLane(
 
 function meshCommandLane(context: CommandContext): MeshCommandLane {
   const status = asRecord(resourceData(context, SESSION_STATUS_RESOURCE_KEY));
-  return resolveMeshCommandLane(asRecord(status?.domain)?.discretization);
+  const payload = asRecord(status?.data ?? status);
+  return resolveMeshCommandLane(resolveSessionDiscretization(payload));
 }
 
 function femMeshCommandDisabledReason(context: CommandContext): string | null {

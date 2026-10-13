@@ -2107,11 +2107,7 @@ const Viewport3DFrame = memo(function Viewport3DFrame({
     }),
     [initialCameraFit.far, initialCameraFit.near],
   );
-  const discretizationKind = sceneProps.fdmDomain
-    ? "FDM"
-    : sceneProps.femDomain.magneticParts.length > 0
-      ? "FEM"
-      : null;
+  const discretizationKind = sceneProps.sessionDiscretization?.toUpperCase() ?? null;
   const meshQualityLegend = resolveViewport3DMeshQualityLegend(
     sceneProps.meshQualityOverlayVisible,
     meshQualityMetric,

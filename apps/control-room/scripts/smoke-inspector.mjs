@@ -139,6 +139,22 @@ try {
     );
   }
   const screenshotFiles = [];
+  const simulationMethod = page.getByLabel("Simulation method", { exact: true });
+  await simulationMethod.waitFor({ state: "visible", timeout: 30_000 });
+  await page.waitForFunction(() =>
+    document.querySelector('[aria-label="Simulation method"]')?.getAttribute("data-method") === "fem",
+  );
+  assert((await simulationMethod.innerText()).trim() === "FEM", "The bottom-right method indicator must identify the FEM session.");
+  const methodScreenshot = "simulation-method-status-bar.png";
+  await page.locator(".fm-status-bar").screenshot({ path: resolve(outputDir, methodScreenshot) });
+  screenshotFiles.push(methodScreenshot);
+  await writeFile(resolve(outputDir, "simulation-method-status-bar-proof.json"), JSON.stringify({
+    schema: "fullmag_simulation_method_browser_proof_v1",
+    method: await simulationMethod.getAttribute("data-method"),
+    visibleLabel: await simulationMethod.innerText(),
+    qualification: "production_status_bar_with_mock_api_legacy_fem_status",
+    real_backend_verified: false,
+  }, null, 2));
   await qualifyExplorerKeyboardNavigation(page);
   await qualifyInspectorRoutingMatrix(page, inspector, screenshotFiles, fixture);
   await qualifyMagneticTextureMutationStability(page, inspector, fixture);

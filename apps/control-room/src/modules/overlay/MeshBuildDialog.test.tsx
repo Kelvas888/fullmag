@@ -5,12 +5,37 @@ import {
 } from "@/kernel/authoring/geometryLifecycleCommandContributions";
 import {
   meshBuildDialogUnavailableMessage,
+  meshBuildDialogRuntimeStatusEquals,
   resolveMeshBuildDialogLane,
+  selectMeshBuildDialogRuntimeStatus,
   shouldLoadMeshBuildDialogFemResources,
 } from "./MeshBuildDialog";
 import { openMeshBuildDiagnostics } from "./meshBuildDiagnosticsNavigation";
 
 describe("MeshBuildDialog", () => {
+  it("re-renders when the resolved lane changes even if mesh revisions are stable", () => {
+    const statusForLane = (lane: string) =>
+      selectMeshBuildDialogRuntimeStatus({
+        data: {
+          capabilities: {
+            active_lane: {
+              resolved: { discretization: lane },
+              operations: {
+                grid_build: { reason: "shared gate", state: "available" },
+              },
+            },
+            explicit_topology: true,
+          },
+          domain: { discretization: "fdm" },
+          resources: { mesh_build_revision: 4, mesh_revision: 5 },
+        } as never,
+      });
+
+    expect(
+      meshBuildDialogRuntimeStatusEquals(statusForLane("fdm"), statusForLane("fem")),
+    ).toBe(false);
+  });
+
   it("requires an explicit FEM lane before loading FEM mesh resources", () => {
     expect(resolveMeshBuildDialogLane("fem")).toBe("fem");
     expect(resolveMeshBuildDialogLane("FDM")).toBe("fdm");

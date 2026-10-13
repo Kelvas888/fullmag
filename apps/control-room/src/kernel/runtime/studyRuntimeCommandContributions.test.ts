@@ -50,7 +50,10 @@ import {
   resolveViewport3DFieldVectorResourceKey,
 } from "@/modules/viewport-3d/viewport3dResources";
 
-import { STUDY_RUNTIME_COMMANDS } from "./studyRuntimeCommandContributions";
+import {
+  requiresExplicitMesh,
+  STUDY_RUNTIME_COMMANDS,
+} from "./studyRuntimeCommandContributions";
 
 
 function registryWithStudyRuntimeCommands(): CommandRegistry {
@@ -347,6 +350,31 @@ function runtimeResourceData({
 }
 
 describe("study runtime command contributions", () => {
+  it("uses active lane ahead of explicit-topology compatibility flags", () => {
+    const activeFdm = {
+      capabilities: {
+        explicit_topology: true,
+        active_lane: {
+          ...activeLaneCapabilityFixture(),
+          resolved: { discretization: "fdm" },
+        },
+      },
+      domain: { discretization: "fem" },
+    } as never;
+    const unresolved = {
+      capabilities: { explicit_topology: true, active_lane: null },
+      domain: { discretization: "fem" },
+    } as never;
+    const legacy = {
+      capabilities: { explicit_topology: true },
+      domain: { discretization: "fdm" },
+    } as never;
+
+    expect(requiresExplicitMesh(activeFdm)).toBe(false);
+    expect(requiresExplicitMesh(unresolved)).toBe(false);
+    expect(requiresExplicitMesh(legacy)).toBe(true);
+  });
+
   it("selects Study root and stages nodes from local navigation commands", async () => {
     const registry = registryWithStudyRuntimeCommands();
     const selection = selectionController();

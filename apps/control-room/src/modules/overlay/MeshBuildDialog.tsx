@@ -24,6 +24,11 @@ import {
   useMeshSummaryResource,
 } from "@/kernel/resources/geometryLifecycleResources";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
+import {
+  projectFlatActiveLaneDiscretization,
+  resolveSessionDiscretization,
+  type SessionDiscretizationCapabilitiesProjection,
+} from "@/kernel/resources/sessionDiscretization";
 import type { JsonObject, LiveStatusResource } from "@/kernel/api/apiTypes";
 import type { KernelApi } from "@/kernel/types";
 import { diffMeshPolicies } from "@/shared/domain/mesh/meshPolicyDiff";
@@ -54,10 +59,10 @@ function text(value: unknown, fallback = "unknown"): string {
 }
 
 type MeshBuildDialogRuntimeStatus = {
-  capabilities: Pick<
-    LiveStatusResource["capabilities"],
-    "active_lane" | "explicit_topology"
-  >;
+  capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology"> &
+    SessionDiscretizationCapabilitiesProjection & {
+      active_lane?: LiveStatusResource["capabilities"]["active_lane"] | null;
+    };
   domain: Pick<LiveStatusResource["domain"], "discretization">;
   resources: Pick<
     LiveStatusResource["resources"],
@@ -79,15 +84,23 @@ type MeshBuildDialogSnapshot = {
   };
 };
 
-function selectMeshBuildDialogRuntimeStatus(status: {
+export function selectMeshBuildDialogRuntimeStatus(status: {
   data: LiveStatusResource | null;
 }): MeshBuildDialogRuntimeStatus | null {
   if (!status.data) return null;
+  const sourceCapabilities = status.data.capabilities;
+  const flatLane = projectFlatActiveLaneDiscretization(sourceCapabilities);
+  const capabilities: MeshBuildDialogRuntimeStatus["capabilities"] = {
+    explicit_topology: sourceCapabilities?.explicit_topology ?? false,
+  };
+  if (
+    Object.prototype.hasOwnProperty.call(sourceCapabilities ?? {}, "active_lane")
+  ) {
+    capabilities.active_lane = sourceCapabilities?.active_lane ?? null;
+  }
+  if (flatLane) capabilities.active_lane_discretization = flatLane.value;
   return {
-    capabilities: {
-      active_lane: status.data.capabilities.active_lane,
-      explicit_topology: status.data.capabilities.explicit_topology,
-    },
+    capabilities,
     domain: {
       discretization: status.data.domain.discretization,
     },
@@ -98,19 +111,37 @@ function selectMeshBuildDialogRuntimeStatus(status: {
   };
 }
 
-function meshBuildDialogRuntimeStatusEquals(
+export function meshBuildDialogRuntimeStatusEquals(
   previous: MeshBuildDialogRuntimeStatus | null,
   next: MeshBuildDialogRuntimeStatus | null,
 ): boolean {
   if (previous === next) return true;
   if (!previous || !next) return previous === next;
+  const previousActiveLane = previous.capabilities.active_lane;
+  const nextActiveLane = next.capabilities.active_lane;
   return (
     previous.capabilities.explicit_topology ===
       next.capabilities.explicit_topology &&
-    previous.capabilities.active_lane.operations.grid_build.reason ===
-      next.capabilities.active_lane.operations.grid_build.reason &&
-    previous.capabilities.active_lane.operations.grid_build.state ===
-      next.capabilities.active_lane.operations.grid_build.state &&
+    Object.prototype.hasOwnProperty.call(
+      previous.capabilities,
+      "active_lane",
+    ) === Object.prototype.hasOwnProperty.call(next.capabilities, "active_lane") &&
+    previousActiveLane?.resolved?.discretization ===
+      nextActiveLane?.resolved?.discretization &&
+    Object.prototype.hasOwnProperty.call(
+      previous.capabilities,
+      "active_lane_discretization",
+    ) ===
+      Object.prototype.hasOwnProperty.call(
+        next.capabilities,
+        "active_lane_discretization",
+      ) &&
+    previous.capabilities.active_lane_discretization ===
+      next.capabilities.active_lane_discretization &&
+    previousActiveLane?.operations?.grid_build?.reason ===
+      nextActiveLane?.operations?.grid_build?.reason &&
+    previousActiveLane?.operations?.grid_build?.state ===
+      nextActiveLane?.operations?.grid_build?.state &&
     previous.domain.discretization === next.domain.discretization &&
     previous.resources.mesh_build_revision ===
       next.resources.mesh_build_revision &&
@@ -158,14 +189,16 @@ export function MeshBuildDialog({ kernel }: { kernel: KernelApi }) {
     selectMeshBuildDialogRuntimeStatus,
     { enabled: state.open, isEqual: meshBuildDialogRuntimeStatusEquals },
   );
-  const lane = resolveMeshBuildDialogLane(runtimeStatus?.domain.discretization);
+  const lane = resolveMeshBuildDialogLane(
+    resolveSessionDiscretization(runtimeStatus),
+  );
   const explicitFemLane = shouldLoadMeshBuildDialogFemResources(
     state.open,
     lane,
   );
   const unavailableMessage = meshBuildDialogUnavailableMessage(
     lane,
-    runtimeStatus?.capabilities.active_lane.operations.grid_build.reason,
+    runtimeStatus?.capabilities.active_lane?.operations.grid_build.reason,
   );
   const activeBuild = useMeshBuildCurrent({
     enabled: explicitFemLane,

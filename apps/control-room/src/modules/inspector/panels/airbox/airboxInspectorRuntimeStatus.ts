@@ -1,11 +1,16 @@
 import type { LiveStatusResource } from "@/kernel/api/apiTypes";
+import {
+  projectFlatActiveLaneDiscretization,
+  resolveSessionDiscretization,
+  type SessionDiscretizationCapabilitiesProjection,
+} from "@/kernel/resources/sessionDiscretization";
 import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 import type { Selection } from "@/kernel/selection/selectionTypes";
 import { isExplicitFdmStudy } from "../StudyGlobalAuthoringModel";
 
 export type AirboxInspectorRuntimeStatus = {
-  activeLaneDiscretization?: string | null;
-  capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology">;
+  capabilities: Pick<LiveStatusResource["capabilities"], "explicit_topology"> &
+    SessionDiscretizationCapabilitiesProjection;
   domain: Pick<LiveStatusResource["domain"], "discretization">;
   resources: Pick<
     LiveStatusResource["resources"],
@@ -17,17 +22,19 @@ export function selectAirboxInspectorRuntimeStatus(status: {
   data: LiveStatusResource | null;
 }): AirboxInspectorRuntimeStatus | null {
   if (!status.data) return null;
-  const activeLane = status.data.capabilities?.active_lane;
+  const sourceCapabilities = status.data.capabilities;
+  const flatLane = projectFlatActiveLaneDiscretization(sourceCapabilities);
   const hasActiveLane = Object.prototype.hasOwnProperty.call(
-    status.data.capabilities,
+    sourceCapabilities ?? {},
     "active_lane",
   );
   return {
-    ...(hasActiveLane
-      ? { activeLaneDiscretization: activeLane?.resolved?.discretization ?? null }
-      : {}),
     capabilities: {
       explicit_topology: status.data.capabilities?.explicit_topology ?? false,
+      ...(hasActiveLane
+        ? { active_lane: sourceCapabilities?.active_lane ?? null }
+        : {}),
+      ...(flatLane ? { active_lane_discretization: flatLane.value } : {}),
     },
     domain: {
       discretization: status.data.domain?.discretization ?? "",
@@ -46,7 +53,22 @@ export function airboxInspectorRuntimeStatusEquals(
   if (previous === next) return true;
   if (!previous || !next) return previous === next;
   return (
-    previous.activeLaneDiscretization === next.activeLaneDiscretization &&
+    Object.prototype.hasOwnProperty.call(
+      previous.capabilities,
+      "active_lane",
+    ) === Object.prototype.hasOwnProperty.call(next.capabilities, "active_lane") &&
+    previous.capabilities.active_lane?.resolved?.discretization ===
+      next.capabilities.active_lane?.resolved?.discretization &&
+    Object.prototype.hasOwnProperty.call(
+      previous.capabilities,
+      "active_lane_discretization",
+    ) ===
+      Object.prototype.hasOwnProperty.call(
+        next.capabilities,
+        "active_lane_discretization",
+      ) &&
+    previous.capabilities.active_lane_discretization ===
+      next.capabilities.active_lane_discretization &&
     previous.capabilities.explicit_topology ===
       next.capabilities.explicit_topology &&
     previous.domain.discretization === next.domain.discretization &&
@@ -57,17 +79,13 @@ export function airboxInspectorRuntimeStatusEquals(
 }
 
 /**
- * Airbox mesh controls are FEM-only. FDM is selected only from an explicit
- * current-session lane; missing or errored status must not be interpreted as
- * FDM (or as a reason to hide FEM controls).
+ * Airbox mesh controls are lane-specific. Missing or unresolved session mode
+ * remains unresolved instead of inferring a solver lane from DomainMeta.
  */
 export function isExplicitFdmAirboxRuntime(
   status: AirboxInspectorRuntimeStatus | null | undefined,
 ): boolean {
-  const discretization =
-    status && "activeLaneDiscretization" in status
-      ? status.activeLaneDiscretization
-      : status?.domain.discretization;
+  const discretization = resolveSessionDiscretization(status);
   return isExplicitFdmStudy({
     sessionDiscretization: discretization,
   });
@@ -76,15 +94,10 @@ export function isExplicitFdmAirboxRuntime(
 export function isExplicitFemAirboxRuntime(
   status: AirboxInspectorRuntimeStatus | null | undefined,
 ): boolean {
-  const discretization = (
-    (status && "activeLaneDiscretization" in status
-      ? status.activeLaneDiscretization
-      : status?.domain.discretization) ?? ""
-  ).trim().toLowerCase();
-  return discretization === "fem";
+  return resolveSessionDiscretization(status) === "fem";
 }
 
-export type AirboxInspectorLane = "conflict" | "fdm" | "fem";
+export type AirboxInspectorLane = "conflict" | "fdm" | "fem" | "unresolved";
 
 export function resolveAirboxInspectorLane(
   selection: Selection,
@@ -97,20 +110,13 @@ export function resolveAirboxInspectorLane(
         ? "fdm"
         : null
       : null;
-  const activeLaneDiscretization =
-    status && "activeLaneDiscretization" in status
-      ? status.activeLaneDiscretization
-      : status?.domain.discretization;
-  const discretization = (activeLaneDiscretization ?? "").trim().toLowerCase();
-  const runtimeLane =
-    discretization === "fdm" || discretization === "fem"
-      ? discretization
-      : null;
+  const runtimeLane = resolveSessionDiscretization(status);
+  if (runtimeLane === null) return "unresolved";
 
   if (selectionLane && runtimeLane && selectionLane !== runtimeLane) {
     return "conflict";
   }
-  return selectionLane ?? runtimeLane ?? "fem";
+  return runtimeLane;
 }
 
 export function useAirboxInspectorRuntimeStatus() {

@@ -70,6 +70,37 @@ describe("StudyInspectorPanelModel", () => {
     });
   });
 
+  it("uses per-run GPU execution instead of the session CPU capability preview", () => {
+    const activeLane = activeLaneCapabilityFixture();
+    activeLane.requested.device = "cpu";
+    if (activeLane.resolved) activeLane.resolved.device = "cpu";
+    const provenance = studyRuntimeProvenanceFromCurrentRun({
+      requested_backend: "fem",
+      requested_device: "gpu",
+      requested_mode: "strict",
+      requested_precision: "double",
+      resolved_backend: "fem",
+      resolved_device: "gpu",
+      resolved_mode: "strict",
+      resolved_precision: "double",
+      resolved_engine_id: "fem_gpu_native",
+      resolved_runtime_family: "fem_gpu_native",
+    } as never, activeLane);
+
+    expect(provenance.effective.device).toBe("gpu");
+    expect(provenance.resolved.device).toBe("gpu");
+    expect(provenance.resolved.backend).toBe("fem");
+    expect(provenance.resolved.engine).toBe("fem_gpu_native");
+  });
+
+  it("does not present a scratch CPU preview as an executed device without run metadata", () => {
+    const provenance = studyRuntimeProvenanceFromCurrentRun(
+      null,
+      activeLaneCapabilityFixture(),
+    );
+    expect(provenance.resolved.device).toBe("not loaded");
+  });
+
   it("keeps runtime provenance explicitly unavailable while the current run is not loaded", () => {
     expect(studyRuntimeProvenanceFromCurrentRun(null)).toEqual({
       authored: {

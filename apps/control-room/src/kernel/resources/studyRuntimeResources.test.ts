@@ -449,6 +449,21 @@ describe("study runtime command resource bundles", () => {
     expect(runtimeCommandControlSessionStatusEquals(previous, next)).toBe(false);
   });
 
+  it("treats resolved lane changes as runtime command control changes with stale DomainMeta", () => {
+    const previous = statusWith({ discretization: "fdm" }) as LiveStatusResource;
+    const next = statusWith({ discretization: "fdm" }) as LiveStatusResource;
+    next.capabilities.active_lane = {
+      ...next.capabilities.active_lane,
+      resolved: {
+        ...next.capabilities.active_lane.requested,
+        discretization: "fem",
+      },
+    };
+    next.domain.discretization = "fdm";
+
+    expect(runtimeCommandControlSessionStatusEquals(previous, next)).toBe(false);
+  });
+
   it("treats a new epoch of the same session id as a runtime command control change", () => {
     const previous = statusWith({ sessionEpoch: "session-1@1000" }) as LiveStatusResource;
     const next = statusWith({ sessionEpoch: "session-1@2000" }) as LiveStatusResource;
@@ -1363,6 +1378,35 @@ describe("study runtime command resource bundles", () => {
     } as unknown as typeof status.capabilities;
 
     expect(shouldLoadRuntimeMeshManifest(true, status)).toBe(false);
+  });
+
+  it("lets a declared lane override stale explicit-topology flags", () => {
+    const activeFdm = statusWith({
+      discretization: "fdm",
+      explicitTopology: true,
+      resources: { mesh_revision: 5 },
+    });
+    activeFdm.domain.discretization = "fem";
+    expect(shouldLoadRuntimeMeshManifest(true, activeFdm)).toBe(false);
+
+    const unresolved = statusWith({
+      discretization: "fem",
+      explicitTopology: true,
+      resources: { mesh_revision: 5 },
+    });
+    unresolved.capabilities.active_lane = null as never;
+    expect(shouldLoadRuntimeMeshManifest(true, unresolved)).toBe(false);
+  });
+
+  it("keeps the legacy explicit-topology gate only when no lane was projected", () => {
+    const legacy = statusWith({
+      discretization: "fem",
+      explicitTopology: true,
+      resources: { mesh_revision: 5 },
+    });
+    delete (legacy.capabilities as unknown as Record<string, unknown>).active_lane;
+
+    expect(shouldLoadRuntimeMeshManifest(true, legacy)).toBe(true);
   });
 
   it("loads current run and scalar resources only after status points at data", () => {

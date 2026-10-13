@@ -19,6 +19,7 @@ import { useSessionStatusSelector } from "@/kernel/resources/useSessionStatus";
 
 import {
   buildStatusBarEngineModel,
+  buildStatusBarMethodModel,
   buildStatusBarMeshModel,
   formatRuntimeBundleVersionLabel,
 } from "./statusBarModel";
@@ -81,10 +82,21 @@ export default function StatusBarModule() {
     (status) => status.data?.resources.scene_revision ?? null,
     { enabled: mounted },
   );
+  const method = useSessionStatusSelector(
+    (status) => buildStatusBarMethodModel(status.data),
+    {
+      enabled: mounted,
+      isEqual: (previous, next) => previous.label === next.label
+        && previous.method === next.method
+        && previous.state === next.state
+        && previous.title === next.title,
+    },
+  );
   const currentRun = useCurrentRunResource({ enabled: mounted });
   const solverStatus = useSolverStatusResource({ enabled: mounted });
-  const meshManifest = useMeshSharedDomainManifestResource({ enabled: mounted });
-  const meshBuildCurrent = useMeshBuildCurrent({ enabled: mounted });
+  const femMeshActive = mounted && method.method === "fem";
+  const meshManifest = useMeshSharedDomainManifestResource({ enabled: femMeshActive });
+  const meshBuildCurrent = useMeshBuildCurrent({ enabled: femMeshActive });
   const runtimeState = resolveEffectiveRuntimeState({
     detailedRuntimeState: mounted ? solverStatus.data?.runtime_state : null,
     sessionSolverState: mounted ? solverState : null,
@@ -99,11 +111,13 @@ export default function StatusBarModule() {
   const sessionName = mounted
     ? readString(sessionStatusName, "session unavailable")
     : "—";
-  const activeBuild = readRecord(meshBuildCurrent.data?.active_build);
+  const activeBuild = femMeshActive
+    ? readRecord(meshBuildCurrent.data?.active_build)
+    : null;
   const mesh = buildStatusBarMeshModel({
     activeBuildStatus:
       typeof activeBuild?.status === "string" ? activeBuild.status : null,
-    manifestSourceSceneRevision: mounted
+    manifestSourceSceneRevision: femMeshActive
       ? meshManifest.data?.source_scene_revision
       : null,
     meshBuildRevision: mounted ? meshBuildRevision : null,
@@ -182,6 +196,15 @@ export default function StatusBarModule() {
           {" | "}
         </span>
         <span className="fm-status-bar__engine-detail">{engine.detail}</span>
+      </span>
+      <span
+        className="fm-status-bar__engine"
+        data-state={method.state}
+        data-method={method.method ?? "unresolved"}
+        aria-label="Simulation method"
+        title={method.title}
+      >
+        <span className="fm-status-bar__engine-label">{method.label}</span>
       </span>
     </div>
   );

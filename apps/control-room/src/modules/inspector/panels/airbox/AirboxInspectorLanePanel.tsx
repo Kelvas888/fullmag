@@ -90,6 +90,13 @@ function AirboxInspectorLanePanel({
         <p>The selected Airbox target does not match the current runtime lane.</p>
       </div>
     );
+  } else if (lane === "unresolved") {
+    content = (
+      <div className="fm-inspector-panel" role="status">
+        <p>Airbox mesh controls are unavailable</p>
+        <p>The current session discretization is unresolved.</p>
+      </div>
+    );
   } else if (explicitFdm) {
     if (FdmPanel) {
       content = <FdmPanel lane="fdm" selection={selection} />;

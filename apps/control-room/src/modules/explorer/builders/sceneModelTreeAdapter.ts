@@ -89,14 +89,25 @@ export function modelTreeSnapshotFromScene(
     materialFieldsByObject,
     resources.regionMemberships,
   );
-  return {
-    domainMeta: resources.domainMeta ?? null,
-    domainPresentationStatus: resources.domainPresentationStatus ?? "idle",
-    domainDiscretization: resources.domainDiscretization ?? (resources.domainMeta?.discretization?.toLowerCase() === "fdm"
+  const hasResolvedDiscretization = Object.prototype.hasOwnProperty.call(
+    resources,
+    "domainDiscretization",
+  );
+  const legacyDomainDiscretization =
+    resources.domainMeta?.discretization?.toLowerCase() === "fdm"
       ? "fdm"
       : resources.domainMeta?.discretization?.toLowerCase() === "fem"
         ? "fem"
-        : null),
+        : null;
+  const hasLegacyDomainMeta = resources.domainMeta != null;
+  return {
+    domainMeta: resources.domainMeta ?? null,
+    domainPresentationStatus: resources.domainPresentationStatus ?? "idle",
+    ...(hasResolvedDiscretization
+      ? { domainDiscretization: resources.domainDiscretization ?? null }
+      : hasLegacyDomainMeta
+        ? { domainDiscretization: legacyDomainDiscretization }
+        : {}),
     domainPresentation: resources.domainPresentation ?? null,
     fdmMultilayerLayout: resources.fdmMultilayerLayout ?? null,
     ...(resources.fdmMultilayerLayoutStatus !== undefined
